@@ -5,3 +5,4 @@
 8884f8314ce8ea96d62cd602b6bbf7fc25758a09:tools/server/README.md:curl-auth-header:1412
 # Reviewed source-file SHA-256 in the frozen C0 oracle extraction receipt.
 fdb8fca8b6bb75972ea83fe565ee9064c0be54ac:experiments/c0-store/oracle/extraction.json:generic-api-key:7
+9f5c8c56bf0c848809b0329e5b26249d971f2d2f:experiments/c0-store/oracle/extraction.json:generic-api-key:7
