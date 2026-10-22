@@ -54,3 +54,27 @@ semantics; a zero readiness share is distinct from an absent share, and an
 explicit null share fails only if the uncapped fallback uses it. Zero-priced
 outputs still fail instead of becoming a default estimate. No device or full
 planner-equivalence claim follows from these checks.
+
+## Routing replay leaf
+
+`ssdash.model.routing_replay` exposes `Tier`, `RamCache`, `Replay` and `simulate`.
+It consumes already parsed integer expert IDs in ordered segments, tokens and
+layers. It keeps F's mutable state, arithmetic and update order; it does not read
+files, inspect a device, validate a top-level trace artifact or select a plan.
+The production adaptive modules and launchers still use their existing code.
+
+F's verbatim `sim_f.py` also supplies fifteen frozen state transcripts, generated
+before the new implementation. Every step records score/count `float.hex()`
+values, the original heap order, residents, clocks, rows, segment bounds and
+behind-cache state. They cover zero/negative capacity, admission thresholds,
+decay, locked ties, stale heap entries, repeated expert IDs, incremental segments,
+skip prefixes, empty segments and behind-query invalidation. Composing these rows
+with the extracted decode cost leaf also matches F.
+
+This extraction deliberately adds no normalization or input-range validation.
+Tier score bumps deduplicate keys, but repeated resident IDs still count as
+repeated hits and RAM clock touches. Replay accepts a previously seen segment
+with changed contents when its length is unchanged, just as F does; it only
+replays appended segments. `behind_hits` requires `behind=True`; calls without
+tracking retain the old failure. Zero half-life still fails. These boundaries
+are retained for equivalence, not promoted as new artifact-validation rules.
