@@ -173,6 +173,11 @@ license_add_file("llama.cpp" "LICENSE")
 # 3rd-party
 #
 
+option(LLAMA_C0_LINKED_STORE_PROTOTYPE "Link the private shared CPU/CUDA catalog prototype" OFF)
+if (LLAMA_C0_LINKED_STORE_PROTOTYPE AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR LLAMA_USE_SYSTEM_GGML))
+    message(FATAL_ERROR "C0 shared store prototype requires Linux and the bundled ggml")
+endif()
+
 if (LLAMA_USE_SYSTEM_GGML)
     message(STATUS "Using system-provided libggml, skipping ggml build")
     find_package(ggml REQUIRED)

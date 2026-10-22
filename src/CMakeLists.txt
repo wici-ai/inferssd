@@ -63,13 +63,8 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
 
-# Private C0 feasibility switch; keep all regular builds on the existing path.
-option(LLAMA_C0_LINKED_STORE_PROTOTYPE "Link the experimental Linux CPU-only v1/alias store" OFF)
+# Private C0 feasibility switch; ordinary builds retain the existing path.
 if (LLAMA_C0_LINKED_STORE_PROTOTYPE)
-    if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR GGML_CUDA)
-        message(FATAL_ERROR "C0 linked store prototype requires Linux with GGML_CUDA=OFF; CUDA shared-index integration is not implemented")
-    endif()
-    add_subdirectory(../ggml/src/ggml-ssd/store ${CMAKE_CURRENT_BINARY_DIR}/c0-store)
     target_link_libraries(llama PRIVATE ggml-ssd-c0-store)
     target_compile_definitions(llama PRIVATE LLAMA_C0_LINKED_STORE_PROTOTYPE=1)
 endif()

@@ -15,36 +15,15 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include "catalog.h"
 
 namespace c0 {
-#include "types.inc"
-
 struct description {
     std::vector<std::string> packs;
     std::vector<std::string> aliases;
     std::vector<std::string> page_cache_packs;
     bool replace_duplicates = false;
     int io_backend = 0;
-};
-
-// The transport statistics, mmap state, CUDA state and liburing rings do not
-// participate in parser behavior. Source handles have one owner here.
-struct parser_state {
-    std::vector<expert_pack_source> sources;
-    std::vector<expert_pack_entry> entries;
-    bool inited = false;
-    bool enabled = false;
-    int io_backend = 0;
-    uint64_t page_cache_sources = 0;
-    parser_state() = default;
-    parser_state(const parser_state &) = delete;
-    parser_state & operator=(const parser_state &) = delete;
-    ~parser_state() {
-        for (auto & source : sources) {
-            if (source.file) { std::fclose(source.file); }
-            if (source.fd_direct >= 0) { ::close(source.fd_direct); }
-        }
-    }
 };
 
 struct source_identity {
