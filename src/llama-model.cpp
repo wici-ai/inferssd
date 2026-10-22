@@ -12,7 +12,6 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsv4.h"
-#include "llama-memory-deepseek4.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -2157,29 +2156,6 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     case 12: type = LLM_TYPE_3B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
-            } break;
-        case LLM_ARCH_DEEPSEEK4:
-            {
-                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
-                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
-                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
-                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
-                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale);
-                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
-                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head, false);
-                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
-                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k, false);
-                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,     hparams.n_swa);
-                hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
-                hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
-                ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
-                if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP, hparams.swiglu_clamp_exp, hparams.n_layer, false)) {
-                    std::fill_n(hparams.swiglu_clamp_exp.begin(), hparams.n_layer, 10.0f);
-                }
-                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp, hparams.n_layer, false);
-
-                type = LLM_TYPE_UNKNOWN;
             } break;
         case LLM_ARCH_DEEPSEEK41:
             {
@@ -5975,144 +5951,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         }
                     }
                 } break;
-            case LLM_ARCH_DEEPSEEK4:
-                {
-                    const int64_t q_lora_rank = hparams.n_lora_q;
-                    const int64_t n_ff_exp = hparams.n_ff_exp;
-                    const int64_t n_expert_shared = hparams.n_expert_shared;
-                    const int64_t n_embd_head = hparams.n_embd_head_k();
-
-                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
-
-                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
-                    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-                    if (!output) {
-                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
-                    }
-
-                    int64_t hc_mult = 0;
-                    {
-                        const auto * meta_base  = ml.get_tensor_meta(tn(LLM_TENSOR_HC_HEAD_BASE).str().c_str());
-                        const auto * meta_fn    = ml.get_tensor_meta(tn(LLM_TENSOR_HC_HEAD_FN).str().c_str());
-                        const auto * meta_scale = ml.get_tensor_meta(tn(LLM_TENSOR_HC_HEAD_SCALE).str().c_str());
-
-                        hc_mult = meta_base ? meta_base->ne[0] : (meta_fn ? meta_fn->ne[1] : 4);
-                        const int64_t hc_fn_in     = meta_fn    ? meta_fn->ne[0]    : n_embd * hc_mult;
-                        const int64_t hc_fn_out    = meta_fn    ? meta_fn->ne[1]    : hc_mult;
-                        const int64_t hc_scale_len = meta_scale ? meta_scale->ne[0] : 1;
-
-                        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE),  { hc_mult }, 0);
-                        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN),    { hc_fn_in, hc_fn_out }, 0);
-                        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE), { hc_scale_len }, 0);
-                    }
-
-                    for (int i = 0; i < n_layer; ++i) {
-                        auto & layer = layers[i];
-
-                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), { n_embd }, 0);
-                        layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), { q_lora_rank }, 0);
-                        layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), { n_embd_head }, 0);
-
-                        layer.wq_a = create_tensor(tn(LLM_TENSOR_ATTN_Q_A, "weight", i), { n_embd, q_lora_rank }, 0);
-                        layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), { q_lora_rank, n_head * n_embd_head }, 0);
-                        layer.attn_kv_latent = create_tensor(tn(LLM_TENSOR_ATTN_KV_LATENT, "weight", i), { n_embd, n_embd_head }, 0);
-
-                        {
-                            const auto * meta_wo_a = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_OUT_A, "weight", i).str().c_str());
-                            const auto * meta_wo_b = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_OUT_B, "weight", i).str().c_str());
-                            const int64_t group_dim = n_embd_head;
-                            const int64_t n_groups = n_head * n_embd_head / group_dim;
-                            const int64_t o_rank = std::max<int64_t>(1, group_dim / 2);
-                            const int64_t wo_a_ne0 = meta_wo_a ? meta_wo_a->ne[0] : group_dim;
-                            const int64_t wo_a_ne1 = meta_wo_a ? meta_wo_a->ne[1] : n_groups * o_rank;
-                            const int64_t wo_b_ne0 = meta_wo_b ? meta_wo_b->ne[0] : n_groups * o_rank;
-                            const int64_t wo_b_ne1 = meta_wo_b ? meta_wo_b->ne[1] : n_embd;
-                            layer.attn_out_a = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A, "weight", i), { wo_a_ne0, wo_a_ne1 }, 0);
-                            layer.attn_out_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT_B, "weight", i), { wo_b_ne0, wo_b_ne1 }, 0);
-                        }
-
-                        layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, i), { n_head }, 0);
-
-                        if (const auto * meta_ape = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_COMPRESS_APE, i).str().c_str())) {
-                            layer.attn_compress_ape = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESS_APE, i), { meta_ape->ne[0], meta_ape->ne[1] }, 0);
-                            layer.attn_compress_norm = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESS_NORM, "weight", i), { n_embd_head }, 0);
-                            layer.attn_compress_kv = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESS_KV, "weight", i), { n_embd, meta_ape->ne[0] }, 0);
-                            layer.attn_compress_gate = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESS_GATE, "weight", i), { n_embd, meta_ape->ne[0] }, 0);
-                        }
-
-                        if (const auto * meta_indexer_proj = ml.get_tensor_meta(tn(LLM_TENSOR_INDEXER_PROJ, "weight", i).str().c_str())) {
-                            layer.indexer_proj = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ, "weight", i), { meta_indexer_proj->ne[0], meta_indexer_proj->ne[1] }, 0);
-                            layer.indexer_attn_q_b = create_tensor(
-                                tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i),
-                                { q_lora_rank, hparams.indexer_n_head * hparams.indexer_head_size },
-                                0);
-
-                            const auto * meta_ape = ml.require_tensor_meta(tn(LLM_TENSOR_INDEXER_COMPRESS_APE, i).str());
-                            layer.indexer_compress_ape = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESS_APE, i), { meta_ape->ne[0], meta_ape->ne[1] }, 0);
-                            layer.indexer_compress_norm = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESS_NORM, "weight", i), { hparams.indexer_head_size }, 0);
-                            layer.indexer_compress_kv = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESS_KV, "weight", i), { n_embd, meta_ape->ne[0] }, 0);
-                            layer.indexer_compress_gate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESS_GATE, "weight", i), { n_embd, meta_ape->ne[0] }, 0);
-                        }
-
-                        {
-                            const auto * meta_hc_attn_base  = ml.get_tensor_meta(tn(LLM_TENSOR_HC_ATTN_BASE, i).str().c_str());
-                            const auto * meta_hc_attn_fn    = ml.get_tensor_meta(tn(LLM_TENSOR_HC_ATTN_FN, i).str().c_str());
-                            const auto * meta_hc_attn_scale = ml.get_tensor_meta(tn(LLM_TENSOR_HC_ATTN_SCALE, i).str().c_str());
-                            const auto * meta_hc_ffn_base   = ml.get_tensor_meta(tn(LLM_TENSOR_HC_FFN_BASE, i).str().c_str());
-                            const auto * meta_hc_ffn_fn     = ml.get_tensor_meta(tn(LLM_TENSOR_HC_FFN_FN, i).str().c_str());
-                            const auto * meta_hc_ffn_scale  = ml.get_tensor_meta(tn(LLM_TENSOR_HC_FFN_SCALE, i).str().c_str());
-                            const int64_t hc_pre_out = 2 * hc_mult + hc_mult * hc_mult;
-                            const int64_t hc_attn_base_ne  = meta_hc_attn_base  ? meta_hc_attn_base->ne[0]  : hc_pre_out;
-                            const int64_t hc_attn_fn_ne0   = meta_hc_attn_fn    ? meta_hc_attn_fn->ne[0]    : n_embd * hc_mult;
-                            const int64_t hc_attn_fn_ne1   = meta_hc_attn_fn    ? meta_hc_attn_fn->ne[1]    : hc_pre_out;
-                            const int64_t hc_attn_scale_ne = meta_hc_attn_scale ? meta_hc_attn_scale->ne[0] : 3;
-                            const int64_t hc_ffn_base_ne   = meta_hc_ffn_base   ? meta_hc_ffn_base->ne[0]   : hc_pre_out;
-                            const int64_t hc_ffn_fn_ne0    = meta_hc_ffn_fn     ? meta_hc_ffn_fn->ne[0]     : n_embd * hc_mult;
-                            const int64_t hc_ffn_fn_ne1    = meta_hc_ffn_fn     ? meta_hc_ffn_fn->ne[1]     : hc_pre_out;
-                            const int64_t hc_ffn_scale_ne  = meta_hc_ffn_scale  ? meta_hc_ffn_scale->ne[0]  : 3;
-
-                            layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE, i),  { hc_attn_base_ne }, 0);
-                            layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN, i),    { hc_attn_fn_ne0, hc_attn_fn_ne1 }, 0);
-                            layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, i), { hc_attn_scale_ne }, 0);
-                            layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE, i),   { hc_ffn_base_ne }, 0);
-                            layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN, i),     { hc_ffn_fn_ne0, hc_ffn_fn_ne1 }, 0);
-                            layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE, i),  { hc_ffn_scale_ne }, 0);
-                        }
-
-                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
-                        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), { n_embd, n_expert }, 0);
-                        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), { n_expert }, TENSOR_NOT_REQUIRED);
-
-                        {
-                            const LLM_TN_IMPL tid2eid_tn = tn(LLM_TENSOR_FFN_GATE_TID2EID, i);
-                            const LLM_TN_IMPL tid2eid_weight_tn = tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i);
-                            const char * alias_env = std::getenv("LLAMA_DEEPSEEK4_TID2EID_WEIGHT_ALIAS");
-                            const bool use_weight_alias = alias_env && alias_env[0] && alias_env[0] != '0';
-                            const auto * meta_tid2eid = ml.get_tensor_meta(tid2eid_tn.str().c_str());
-                            const bool use_alias = !meta_tid2eid && use_weight_alias &&
-                                ml.get_tensor_meta(tid2eid_weight_tn.str().c_str());
-                            if (meta_tid2eid || use_alias) {
-                                const LLM_TN_IMPL & selected_tid2eid_tn = use_alias ? tid2eid_weight_tn : tid2eid_tn;
-                                const auto * selected_meta = use_alias ? ml.get_tensor_meta(tid2eid_weight_tn.str().c_str()) : meta_tid2eid;
-                                layer.ffn_gate_tid2eid = create_tensor(selected_tid2eid_tn, { selected_meta->ne[0], selected_meta->ne[1] }, 0);
-                            }
-                        }
-
-                        if (n_expert == 0) {
-                            throw std::runtime_error("n_expert must be > 0");
-                        }
-                        if (n_expert_used == 0) {
-                            throw std::runtime_error("n_expert_used must be > 0");
-                        }
-
-                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
-                        create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
-
-                        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), { n_embd, n_ff_exp * n_expert_shared }, 0);
-                        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), { n_ff_exp * n_expert_shared, n_embd }, 0);
-                        layer.ffn_up_shexp = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "weight", i), { n_embd, n_ff_exp * n_expert_shared }, 0);
-                    }
-                } break;
             case LLM_ARCH_DEEPSEEK41:
                 {
                     // ported from upstream llama_model_deepseek41::load_arch_tensors
@@ -9777,15 +9615,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             {
                 res = nullptr;
             } break;
-        case LLM_ARCH_DEEPSEEK4:
-            {
-                res = new llama_memory_deepseek4(
-                        *this,
-                        params.type_k,
-                        cparams.offload_kqv,
-                        cparams.n_ctx_seq,
-                        cparams.n_seq_max);
-            } break;
         case LLM_ARCH_DEEPSEEK41:
             {
                 // the latent cache stores one tensor per position, so K and V must share a type
@@ -10214,10 +10043,6 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_deepseek2>(*this, params);
             } break;
-        case LLM_ARCH_DEEPSEEK4:
-            {
-                llm = std::make_unique<llm_build_deepseek4>(*this, params);
-            } break;
         case LLM_ARCH_DEEPSEEK41:
             {
                 llm = std::make_unique<llm_build_deepseek41>(*this, params);
@@ -10629,7 +10454,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK2OCR:
-        case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_MUSE_SPARK:
         case LLM_ARCH_PLM:

@@ -25,8 +25,7 @@
 // DeepSeek-V4.1.
 //
 // Ported from vcruz305/llama.cpp runtime/deepseek41 @ 5210c7c: src/models/deepseek41.cpp plus the
-// DeepSeek-V4 helpers it inherits from upstream src/models/deepseek4.cpp. This fork's own
-// LLM_ARCH_DEEPSEEK4 port is a different design and is not used here.
+// DeepSeek-V4 helpers it inherits from upstream src/models/deepseek4.cpp.
 //
 // Shares almost everything with DeepSeek-V4: the hyper-connection stream, the MoE, the latent
 // attention and the compressed KV cache. Three things differ.

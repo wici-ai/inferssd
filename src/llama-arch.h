@@ -80,8 +80,8 @@ enum llm_arch {
     LLM_ARCH_DEEPSEEK,
     LLM_ARCH_DEEPSEEK2,
     LLM_ARCH_DEEPSEEK2OCR,
-    LLM_ARCH_DEEPSEEK4,
-    LLM_ARCH_DEEPSEEK41,
+    // Value 69 is reserved for the retired DeepSeek V4.0 architecture.
+    LLM_ARCH_DEEPSEEK41 = 70,
     LLM_ARCH_CHATGLM,
     LLM_ARCH_GLM4,
     LLM_ARCH_GLM4_MOE,
