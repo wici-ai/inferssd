@@ -92,6 +92,8 @@ for 256/384 experts, 1/32/512 token rows, F32/Q8_0 weights, and read depths 0/2/
 Each case compares both broadcast and per-route inputs against a resident graph,
 then zeroes the resident weights before the alias computation. All output bytes
 must match, so a bypassed source hook cannot pass accidentally.
+`test-llama-mmap-dontneed` separately verifies Apple's mapping advice with a tiny
+temporary file; production memory/performance effects still require model runs.
 
 The Mac CI build enables Metal, runs that portable cache test, exercises Muse
 rendering with `test-chat --template muse-spark`, and checks the Q4_K/Q5_K/Q8_0

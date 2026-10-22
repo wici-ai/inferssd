@@ -66,3 +66,5 @@ They are applied as separate patches to the new history. The CPU hooks preserve
 the new engine's Apple-only path; the portable testing guard and prior malformed
 pack checks remain. The alias-index generator is included as part of this feature.
 Default changes and performance claims require validation of this integrated build.
+The Apple mapping-advice correction from `9f00b1ab` is included independently;
+its synthetic test verifies the advice path, not a measured memory reduction.

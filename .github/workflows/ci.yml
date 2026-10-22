@@ -103,7 +103,7 @@ jobs:
         run: SSD_LLAMA_BUILD_JOBS=3 bash scripts/build-macos-metal.sh
       - name: Cache and Muse rendering tests
         run: |
-          ctest --test-dir build-mac --output-on-failure --no-tests=error -R '^(mac_expert_pack_cache|mac_expert_operator_.*)$'
+          ctest --test-dir build-mac --output-on-failure --no-tests=error -R '^(mac_expert_pack_cache|mac_expert_operator_.*|test-llama-mmap-dontneed)$'
           python3 tests/test-mac-expert-source.py build-mac/bin/test-mac-expert-source
           build-mac/bin/test-chat --template muse-spark
       - name: Quantized CPU operator checks on Apple Silicon
