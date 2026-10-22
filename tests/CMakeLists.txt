@@ -828,8 +828,20 @@ if (APPLE AND TARGET ggml-cpu)
                 foreach(type f32 q8_0)
                     add_test(NAME mac_expert_operator_${experts}_${rows}_${depth}_${type}
                         COMMAND test-mac-expert-operator ${experts} ${rows} ${depth} ${type})
+                    set_tests_properties(mac_expert_operator_${experts}_${rows}_${depth}_${type}
+                        PROPERTIES PROCESSORS 4 TIMEOUT 180)
                 endforeach()
             endforeach()
         endforeach()
     endforeach()
+    foreach(threads 1 2 12)
+        add_test(NAME mac_expert_operator_threads_${threads}
+            COMMAND test-mac-expert-operator 384 512 2 q8_0 ${threads})
+        set_tests_properties(mac_expert_operator_threads_${threads}
+            PROPERTIES PROCESSORS ${threads} TIMEOUT 180 RUN_SERIAL TRUE)
+    endforeach()
+    add_test(NAME mac_expert_operator_vary_threads
+        COMMAND test-mac-expert-operator 256 32 2 f32 4 vary)
+    set_tests_properties(mac_expert_operator_vary_threads
+        PROPERTIES PROCESSORS 12 TIMEOUT 180 RUN_SERIAL TRUE)
 endif()

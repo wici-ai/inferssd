@@ -37,8 +37,12 @@ struct temporary_source {
 
 int main(int argc, char ** argv) {
     try {
-        require(argc == 5, "usage: test-mac-expert-operator EXPERTS ROWS DEPTH f32|q8_0");
+        require(argc >= 5 && argc <= 7, "usage: test-mac-expert-operator EXPERTS ROWS DEPTH f32|q8_0 [THREADS] [vary]");
         const int experts = std::stoi(argv[1]), rows = std::stoi(argv[2]), depth = std::stoi(argv[3]);
+        const int threads = argc >= 6 ? std::stoi(argv[5]) : 4;
+        const bool vary_threads = argc == 7;
+        require(!vary_threads || std::strcmp(argv[6], "vary") == 0, "invalid lifecycle mode");
+        require(threads == 1 || threads == 2 || threads == 4 || threads == 12, "invalid fixture thread count");
         require((experts == 384 || experts == 256) && (rows == 1 || rows == 32 || rows == 512) &&
                 (depth == 0 || depth == 2 || depth == 4), "invalid fixture dimensions");
         const ggml_type type = std::strcmp(argv[4], "f32") == 0 ? GGML_TYPE_F32 : GGML_TYPE_Q8_0;
@@ -78,9 +82,16 @@ int main(int argc, char ** argv) {
             std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init({
                     ggml_tensor_overhead() * nodes + ggml_graph_overhead_custom(nodes, false), nullptr, true}), ggml_free);
             require(bool(ctx), "create graph context");
+            auto pool_params = ggml_threadpool_params_default(vary_threads ? 12 : threads);
+            pool_params.paused = true;
+            pool_params.poll = 0;
+            std::unique_ptr<ggml_threadpool, decltype(&ggml_threadpool_free)> pool(
+                    ggml_threadpool_new(&pool_params), ggml_threadpool_free);
+            require(bool(pool), "create paused threadpool");
             std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu(ggml_backend_cpu_init(), ggml_backend_free);
             require(bool(cpu), "create CPU backend");
-            ggml_backend_cpu_set_n_threads(cpu.get(), 4);
+            ggml_backend_cpu_set_n_threads(cpu.get(), threads);
+            ggml_backend_cpu_set_threadpool(cpu.get(), pool.get());
             auto * a = ggml_new_tensor_3d(ctx.get(), type, width, height, experts);
             ggml_set_name(a, name);
             auto * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, width, lanes, rows);
@@ -110,12 +121,36 @@ int main(int argc, char ** argv) {
             std::vector<char> zero(packed.size(), 0);
             ggml_backend_tensor_set(a, zero.data(), 0, zero.size());
             setenv("GGML_MOE_EXPERT_GGUF_ALIAS_TSV", source.alias.c_str(), 1);
-            require(ggml_backend_graph_compute(cpu.get(), graph) == GGML_STATUS_SUCCESS, "compute alias graph");
+            for (int repeat = 0; repeat < 4; ++repeat) {
+                ggml_threadpool_pause(pool.get());
+                require(ggml_backend_graph_compute(cpu.get(), graph) == GGML_STATUS_SUCCESS, "compute alias graph after pause");
+                ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
+                require(std::memcmp(expected.data(), actual.data(), ggml_nbytes(result)) == 0, "MUL_MAT_ID alias output differs bitwise");
+            }
+            // Abort is observed between graph nodes, after all participants
+            // leave the operator. The next graph must reuse the pool safely.
+            ggml_backend_cpu_set_abort_callback(cpu.get(), [](void *) { return true; }, nullptr);
+            require(ggml_backend_graph_compute(cpu.get(), graph) == GGML_STATUS_ABORTED, "abort alias graph");
+            ggml_backend_cpu_set_abort_callback(cpu.get(), nullptr, nullptr);
+            ggml_threadpool_pause(pool.get());
+            require(ggml_backend_graph_compute(cpu.get(), graph) == GGML_STATUS_SUCCESS, "compute after abort and pause");
             ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
-            require(std::memcmp(expected.data(), actual.data(), ggml_nbytes(result)) == 0, "MUL_MAT_ID alias output differs bitwise");
+            require(std::memcmp(expected.data(), actual.data(), ggml_nbytes(result)) == 0, "output differs after abort");
+            if (vary_threads) {
+                for (int active_threads : {1, 4, 12, 4, 1}) {
+                    ggml_threadpool_pause(pool.get());
+                    ggml_backend_cpu_set_n_threads(cpu.get(), active_threads);
+                    require(ggml_backend_graph_compute(cpu.get(), graph) == GGML_STATUS_SUCCESS,
+                            "compute with changed active thread count");
+                    ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
+                    require(std::memcmp(expected.data(), actual.data(), ggml_nbytes(result)) == 0,
+                            "output differs with changed active thread count");
+                }
+                std::printf("MAC_EXPERT_POOL_REUSE_OK capacity=12 active=1,4,12,4,1 lanes=%d\n", lanes);
+            }
         }
-        std::printf("MAC_EXPERT_OPERATOR_OK experts=%d rows=%d depth=%d type=%s broadcast=PASS routed=PASS\n",
-                    experts, rows, depth, argv[4]);
+        std::printf("MAC_EXPERT_OPERATOR_OK experts=%d rows=%d depth=%d type=%s threads=%d broadcast=PASS routed=PASS lifecycle=PASS\n",
+                    experts, rows, depth, argv[4], threads);
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "MAC_EXPERT_OPERATOR_FAILED: %s\n", error.what());
