@@ -24,11 +24,14 @@ continues to refer to the same array.
 The CUDA provider registers before any lookup and supplies its existing
 initializer and miss-handling lookup. Pack/alias/list/overlay parsing order,
 page-cache mode and existing initialization side effects stay in that callback.
-CPU-only builds use the portable parser instead. The oracle fragments were
-frozen from the original source before changing the CUDA adapter; their source
-blob and SHA-256 are in `oracle/extraction.json`. The extractor only copies this
-frozen material and never derives its reference from the implementation under
-test.
+CPU-only and CUDA builds call the same production v1/alias parser in the store.
+The production target does not run Python or include generated oracle files.
+CUDA supplies narrow source-open hooks for its compiled io_uring capability and
+page-cache accounting; their calls stay at the original per-source points.
+The oracle fragments were frozen from the original source before changing the
+CUDA adapter; their source blob and SHA-256 are in `oracle/extraction.json`.
+Only tests materialize this fixed reference, independently of the production
+implementation under test.
 
 V2 indexes, Colibri object metadata and lossless sidecar ownership stay in their
 original transport state. In particular, the lossless source descriptor is an

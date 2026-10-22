@@ -4,6 +4,7 @@
 #include "moe-common-device-descriptor.h"
 #if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
 #include "catalog.h"
+#include "parser.h"
 #endif
 
 #ifndef GGML_CUDA_MOE_STREAM_BATCH
@@ -5520,6 +5521,7 @@ static bool expert_pack_read_exact(FILE *file, void *dst, size_t sz) {
     return true;
 }
 
+#if !defined(GGML_C0_SHARED_STORE_PROTOTYPE)
 static std::string expert_pack_key_string(const char *tensor_name, int expert_idx, uint64_t nbytes) {
     std::string key = tensor_name ? tensor_name : "";
     key.push_back('\n');
@@ -5528,6 +5530,7 @@ static std::string expert_pack_key_string(const char *tensor_name, int expert_id
     key += std::to_string((unsigned long long)nbytes);
     return key;
 }
+#endif
 
 static expert_pack_source * expert_pack_source_for_entry(const expert_pack_entry *entry) {
 #if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
@@ -5540,6 +5543,23 @@ static expert_pack_source * expert_pack_source_for_entry(const expert_pack_entry
     return &g_expert_pack.sources[(size_t)entry->source_idx];
 }
 
+#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+static c0::source_open_hooks expert_pack_source_open_hooks() {
+    c0::source_open_hooks hooks;
+#if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
+    hooks.report_iouring_enabled = [](const char * label, const char * path) {
+        std::fprintf(stderr, "[moe_stream_batch] %s: io_uring direct reads enabled: %s io_bytes=%zu depth=%zu\n",
+                     label, path, expert_pack_io_bytes(), expert_pack_io_depth());
+    };
+#endif
+    hooks.page_cache_source_opened = [] { ++g_expert_pack.page_cache_sources; };
+    return hooks;
+}
+static bool expert_pack_open_data_source(const char * path, const char * label,
+        bool page_cache_source = false, bool direct_required = false) {
+    return c0::open_data_source(c0::shared_catalog(), path, label, page_cache_source, direct_required, expert_pack_source_open_hooks());
+}
+#else
 static bool expert_pack_open_data_source(
         const char *path,
         const char *label,
@@ -5611,7 +5631,9 @@ static bool expert_pack_open_data_source(
     g_expert_pack.sources.push_back(source);
     return true;
 }
+#endif
 
+#if !defined(GGML_C0_SHARED_STORE_PROTOTYPE)
 static bool expert_pack_load_source(const char *path, int32_t source_idx, std::vector<expert_pack_entry> &entries, bool page_cache_source = false) {
     if (!path || !path[0]) return false;
 
@@ -5673,6 +5695,7 @@ static bool expert_pack_load_source(const char *path, int32_t source_idx, std::v
                  (unsigned long)n_entries, path);
     return true;
 }
+#endif
 
 static bool expert_pack_v2_full_cover_down_iouring_enabled();
 
@@ -5807,6 +5830,7 @@ static int expert_pack_tsv_column(const std::vector<char *> &header, const char 
 
 // one alias index of GGML_MOE_EXPERT_GGUF_ALIAS_TSV (a ':'-separated list: the experts', then e.g. the dense weights
 // homed on the drive); alias_sources: the data files the list's indexes opened so far, shared across them
+#if !defined(GGML_C0_SHARED_STORE_PROTOTYPE)
 static bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_entry> &entries,
                                             std::unordered_map<std::string, int32_t> &alias_sources) {
     if (!path || !path[0]) return true;
@@ -5911,6 +5935,7 @@ static bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert
             (unsigned long)skipped_duplicates, (unsigned long)bad_rows, (unsigned long)rows);
     return bad_rows == 0;
 }
+#endif
 
 static bool expert_pack_open_alias_source(const char *path, int32_t source_idx) {
     if (!path || !path[0]) return false;
@@ -7963,6 +7988,11 @@ static void expert_pack_init_once() {
         }
     }
 
+#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+    const auto source_desc = c0::source_description_from_env();
+    const auto & source_paths = source_desc.packs;
+    const auto & page_cache_paths = source_desc.page_cache_packs;
+#else
     std::vector<std::string> source_paths;
     const char *path = std::getenv("GGML_MOE_EXPERT_PACK");
     if (path && path[0]) {
@@ -7983,6 +8013,7 @@ static void expert_pack_init_once() {
         page_cache_paths.emplace_back(page_cache_path);
     }
     expert_pack_append_env_list(page_cache_paths, "GGML_MOE_PAGECACHE_PACK_LIST");
+#endif
     const char *gguf_alias_tsv = std::getenv("GGML_MOE_EXPERT_GGUF_ALIAS_TSV");
     const bool has_gguf_alias = gguf_alias_tsv && gguf_alias_tsv[0];
 
@@ -8019,6 +8050,12 @@ static void expert_pack_init_once() {
             glm52_colibri_requested ? glm52_colibri_pack : q4_colibri_pack,
             entries);
     }
+#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+    if (!c0::append_sources(c0::shared_catalog(), source_desc, entries, expert_pack_source_open_hooks())) {
+        g_expert_pack.inited = true;
+        return;
+    }
+#else
     for (const std::string &source_path : source_paths) {
         if (!expert_pack_load_source(source_path.c_str(), (int32_t)g_expert_pack.sources.size(), entries, false)) {
             g_expert_pack.inited = true;
@@ -8043,12 +8080,22 @@ static void expert_pack_init_once() {
         }
     }
 
+#endif
+
 
     if (entries.empty()) {
         g_expert_pack.inited = true;
         return;
     }
 
+#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+    const bool replace_duplicates = source_desc.replace_duplicates ||
+        !page_cache_paths.empty() || q4_colibri_overlay_requested;
+    if (!c0::finalize_entries(entries, replace_duplicates)) {
+        g_expert_pack.inited = true;
+        return;
+    }
+#else
     std::sort(entries.begin(), entries.end(),
         [](const expert_pack_entry &a, const expert_pack_entry &b) {
             const int name_cmp = std::strcmp(a.tensor, b.tensor);
@@ -8090,6 +8137,8 @@ static void expert_pack_init_once() {
             return;
         }
     }
+
+#endif
 
     g_expert_pack.file = g_expert_pack.sources.empty() ? nullptr : g_expert_pack.sources[0].file;
 #if !defined(_WIN32)

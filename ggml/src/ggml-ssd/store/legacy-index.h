@@ -15,16 +15,9 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-#include "catalog.h"
+#include "parser.h"
 
 namespace c0 {
-struct description {
-    std::vector<std::string> packs;
-    std::vector<std::string> aliases;
-    std::vector<std::string> page_cache_packs;
-    bool replace_duplicates = false;
-    int io_backend = 0;
-};
 
 struct source_identity {
     uint64_t device = 0;
@@ -102,31 +95,18 @@ public:
     std::unique_ptr<parser_state> build(const description & desc) {
         g_expert_pack.io_backend = desc.io_backend;
         std::vector<expert_pack_entry> entries;
-        for (const auto & path : desc.packs) {
-            if (!expert_pack_load_source(path.c_str(), int32_t(g_expert_pack.sources.size()), entries, false)) { return {}; }
-        }
-        std::unordered_map<std::string, int32_t> aliases;
-        for (const auto & path : desc.aliases) {
-            if (!expert_pack_load_gguf_alias_tsv(path.c_str(), entries, aliases)) { return {}; }
-        }
-        for (const auto & path : desc.page_cache_packs) {
-            if (!expert_pack_load_source(path.c_str(), int32_t(g_expert_pack.sources.size()), entries, true)) { return {}; }
-        }
+        if (!append_sources(g_expert_pack, desc, entries)) { return {}; }
         if (entries.empty()) { return {}; }
-        finalize(entries, desc.replace_duplicates || !desc.page_cache_packs.empty());
-        if (!g_expert_pack.enabled) { return {}; }
+        if (!finalize_entries(entries, desc.replace_duplicates || !desc.page_cache_packs.empty())) { return {}; }
+        g_expert_pack.enabled = true;
+        g_expert_pack.inited = true;
         g_expert_pack.entries = std::move(entries);
         return std::move(owned_);
     }
 private:
     std::unique_ptr<parser_state> owned_;
     parser_state & g_expert_pack;
-#include "member-parsers.inc"
-    void finalize(std::vector<expert_pack_entry> & entries, bool replace_duplicates) {
-#include "finalize.inc"
-        g_expert_pack.enabled = true;
-        g_expert_pack.inited = true;
-    }
+
 };
 } // namespace detail
 
