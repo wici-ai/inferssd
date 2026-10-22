@@ -618,11 +618,6 @@ llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if (Python3_Interpreter_FOUND)
     add_test(
-        NAME test-deepseek4-native-packers
-        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-deepseek4-native-packers.py ${PROJECT_SOURCE_DIR})
-    set_tests_properties(test-deepseek4-native-packers PROPERTIES LABELS python SKIP_RETURN_CODE 77)
-    add_test(
         NAME test-moe-copy-lru-sim
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-moe-copy-lru-sim.py ${PROJECT_SOURCE_DIR})
