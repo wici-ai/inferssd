@@ -68,6 +68,14 @@ omitting it retains the server default. Use the same prompt, output length and
 parameters for each comparison. One-second memory samples within recorded requests
 exclude loading and later `vmmap` inspection, and can miss shorter peaks.
 
+`--ctx-checkpoints` optionally overrides the server checkpoint count; omitting it
+preserves the server default. Across engine revisions, checkpoint support can
+change the actual prefill batch boundaries even with the same prompt and `--batch`.
+For a numerical comparison, verify those boundaries; `--ctx-checkpoints 0` on both
+sides can remove checkpoint-induced splits. Keep this controlled comparison
+separate from default-configuration validation, and record the effective arguments.
+Different batch shapes can select different floating-point operation orders.
+
 `--teacher-reference /path/to/results.json --runs 1` evaluates fixed continuation
 prefixes from a prior run and records conditional raw top-5 log probabilities.
 It binds the reference results and prompt file by SHA256 and validates each request
