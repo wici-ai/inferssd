@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve the upstream snapshot
+        run: git fetch origin upstream:refs/heads/upstream
+      - name: Public content
+        env:
+          PROPOSED_REF: ${{ github.head_ref || github.ref_name }}
+        run: python3 scripts/public-scan.py --skip upstream --ref "$PROPOSED_REF"
+      - name: Shell and Python syntax
+        run: |
+          shellcheck scripts/check-import.sh scripts/upstream-snapshot.sh
+          python3 -m py_compile scripts/public-scan.py
+      - name: Install pinned secret scanner
+        run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
+      - name: Secret scan
+        run: $(go env GOPATH)/bin/gitleaks git --redact=100 --log-opts="--all"
+
+  python:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install test dependencies
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install pytest==9.1.1
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+      - name: Framework tests
+        run: python3 -m pytest -q tools/adaptive/tests
+      - name: Launcher tests
+        shell: bash
+        run: |
+          set -o pipefail
+          bash tools/adaptive/tests/test_launcher_settings.sh | tee launcher-settings.log
+          bash tools/adaptive/tests/test_launcher_replica.sh | tee launcher-replica.log
+          ! grep -E '\bSKIP\b' launcher-settings.log launcher-replica.log
+
+  cpu-unit:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF
+      - name: Build
+        run: cmake --build build --parallel 2 --target llama-server test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan test-reasoning-budget test-server-expert-guard
+      - name: Synthetic tests
+        shell: bash
+        run: |
+          set -o pipefail
+          ctest --test-dir build --output-on-failure --no-tests=error -R '^(test-dsv41-engram|kimi_prefill_cost|moe_pack_copy_plan|test-reasoning-budget|server_expert_guard)$' | tee cpu-tests.log
+          ! grep -E '\bSKIP\b|\*\*\*Not Run|\*\*\*Skipped' cpu-tests.log
+
+  macos:
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=OFF -DGGML_METAL=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF
+      - run: cmake --build build --parallel 3 --target llama-server test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan
+      - run: ctest --test-dir build --output-on-failure --no-tests=error -R '^(test-dsv41-engram|kimi_prefill_cost|moe_pack_copy_plan)$'
+
+  cuda-compile:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container: nvidia/cuda:13.0.2-devel-ubuntu24.04
+    strategy:
+      matrix:
+        arch: [120a, 121a]
+    steps:
+      - run: apt-get update && apt-get install -y cmake ninja-build git liburing-dev libssl-dev
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Configure CUDA
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }} -DGGML_CUDA_MOE_STREAM_BATCH=ON -DGGML_CUDA_KIMI_VRAM_TIER=ON -DCMAKE_CXX_FLAGS=-ffp-contract=off -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_WEBUI=OFF
+      - run: cmake --build build --parallel 2 --target llama-server kimi-vram-tier kimi-mxfp4-parity

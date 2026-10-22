@@ -1,0 +1,522 @@
+# SSDash import manifest (2026-10-22 execution revision: lowercase repository; first release v0.1.0; automatic notification workflow excluded). Seed: wici-ai/ssd-llama e79cddaa3a76730fa953b969b7f8c19693867fec (adaptive-derived-settings head on 10-22; re-checked at freeze); upstream base: ggml-org/llama.cpp f42e29fdf199481effd31f281bf095ec6067757b.
+# Rows list every path the seed adds (A) or modifies (M) relative to upstream, plus upstream paths excluded from the snapshot and new files.
+# disposition: keep = byte-identical to seed; carry-p6 = byte-identical now, removed or moved by the curation (phase P6) before v0.1.0; keep-edit / restore-upstream / replace / add = planned changes; drop = not imported; exclude = upstream file left out of the snapshot.
+# path	status	disposition	reason
+.Agent/**	A	drop	agent run outputs, 4,870 files, 479.8 MiB; not imported
+.gemini/**	upstream	exclude	upstream project-process file; excluded by scripts/upstream-snapshot.sh (SSDash writes its own where needed)
+.github/**	upstream	exclude	upstream project-process file; excluded by scripts/upstream-snapshot.sh (SSDash writes its own where needed)
+.github/ISSUE_TEMPLATE/bug.yml	new	add	commit 4: issue template
+.github/ISSUE_TEMPLATE/config.yml	new	add	commit 4: issue template chooser; security reports go to private reporting
+.github/ISSUE_TEMPLATE/perf.yml	new	add	commit 4: issue template
+.github/pull_request_template.md	new	add	commit 4: pull request template (review checklist)
+.github/workflows/ci.yml	new	add	commit 4: lint, python, cpu-unit (every PR); cuda-compile, macos (manual while private, by path once public)
+.github/workflows/lark-notify.yml	ssdash	drop	Auto-generated notification workflow removed; do not import or restore.
+.gitleaksignore	new	add	commit 4: reviewed gitleaks findings by fingerprint (upstream snapshot and import false positives)
+.pi/**	upstream	exclude	upstream project-process file; excluded by scripts/upstream-snapshot.sh (SSDash writes its own where needed)
+.pre-commit-config.yaml	upstream	exclude	upstream project-process file; excluded by scripts/upstream-snapshot.sh (SSDash writes its own where needed)
+AGENTS.md	upstream	exclude	upstream project-process file; excluded by scripts/upstream-snapshot.sh (SSDash writes its own where needed)
+BASELINE.md	A	drop	campaign report; stays in ssd-llama
+CHANGELOG.md	new	add	commit 4
+CLAUDE.md	upstream	exclude	upstream project-process file; excluded by scripts/upstream-snapshot.sh (SSDash writes its own where needed)
+CODEOWNERS	upstream	exclude	upstream project-process file; excluded by scripts/upstream-snapshot.sh (SSDash writes its own where needed)
+CONTRIBUTING.md	new	add	commit 4: SSDash contribution rules (replaces the excluded upstream file)
+CONTRIBUTING.md	upstream	exclude	upstream project-process file; excluded by scripts/upstream-snapshot.sh (SSDash writes its own where needed)
+LICENSE	upstream	keep-edit	commit 4: add the ik_llama.cpp and SSDash copyright lines
+NOTICE	new	add	commit 4: third-party notices
+PROVENANCE.md	new	add	commit 4: seeds, old->new map, contributors, module origins
+README.md	M	replace	replace: new SSDash README (commit 4)
+README.md	upstream	exclude	upstream README left out of the snapshot; SSDash README replaces it and links the pinned upstream README
+SECURITY.md	upstream	exclude	upstream project-process file; excluded by scripts/upstream-snapshot.sh (SSDash writes its own where needed)
+SECURITY.md	new	add	commit 4: security policy (replaces the excluded upstream file)
+common/arg.cpp	M	keep	edits to upstream files
+common/chat-auto-parser-generator.cpp	M	keep	edits to upstream files
+common/chat-peg-parser.cpp	M	keep	edits to upstream files
+common/chat-peg-parser.h	M	keep	edits to upstream files
+common/chat.cpp	M	keep	edits to upstream files
+common/chat.h	M	keep	edits to upstream files
+common/common.cpp	M	keep	edits to upstream files
+common/common.h	M	keep	edits to upstream files
+common/debug.cpp	M	keep	edits to upstream files
+common/jinja/caps.cpp	M	keep	edits to upstream files
+common/jinja/parser.cpp	M	keep	edits to upstream files
+common/jinja/runtime.cpp	M	keep	edits to upstream files
+common/jinja/string.cpp	M	keep	edits to upstream files
+common/jinja/string.h	M	keep	edits to upstream files
+common/jinja/value.cpp	M	keep	edits to upstream files
+common/jinja/value.h	M	keep	edits to upstream files
+common/peg-parser.cpp	M	keep	edits to upstream files
+common/peg-parser.h	M	keep	edits to upstream files
+common/reasoning-budget.cpp	M	keep	edits to upstream files
+common/reasoning-budget.h	M	keep	edits to upstream files
+common/sampling.cpp	M	keep	edits to upstream files
+common/sampling.h	M	keep	edits to upstream files
+common/speculative.cpp	M	keep	edits to upstream files
+common/speculative.h	M	keep	edits to upstream files
+configs/**	A	drop	experiment configs and evidence (DSV4.1 local-5090, Q2, Kimi K3); not imported
+convert_hf_to_gguf.py	M	keep	edits to upstream files
+create-moe-expert-pack.py	A	keep	launchers/configs
+docs/deepseek-v41-flash-hermes-agent-changes.md	A	keep	docs/results/baselines
+docs/deepseek-v41-flash-hermes-agent.md	A	keep-edit	edit: hardware description instead of deployment details (line 87)
+docs/deepseek-v41-flash-mxfp4-local-5090.md	A	drop	older engineering notes; the link in tools/adaptive/baselines/README.md is removed; not imported
+docs/deepseek-v41-flash-prefill-decode-report-20260920.zh-CN.md	A	drop	campaign report; stays in ssd-llama
+docs/deepseek-v41-flash-q2-local-5090.md	A	drop	campaign report; stays in ssd-llama
+docs/development/kimi-cache-trace.md	A	drop	campaign report; stays in ssd-llama
+docs/development/kimi-cpu-cache-policy.md	A	drop	campaign report; stays in ssd-llama
+docs/development/kimi-moe-split-pool-optimization.md	A	drop	campaign report; stays in ssd-llama
+docs/kimi-external-repo-optimization-survey.md	A	drop	campaign report; stays in ssd-llama
+docs/kimi-k3-q3ks-sota-153.md	A	drop	campaign report; stays in ssd-llama
+docs/ssdash/import-manifest.tsv	new	add	commit 4: this file
+examples/CMakeLists.txt	M	keep	edits to upstream files
+examples/ds4-expert-profile/CMakeLists.txt	A	carry-p6	referenced by build/test: experiment scripts/sims
+examples/ds4-expert-profile/ds4-expert-profile.cpp	A	carry-p6	referenced by build/test: experiment scripts/sims
+examples/simple/simple.cpp	M	restore-upstream	restore-upstream: DS4 demo with hard-coded local model paths; not used by build, tests or launcher
+ggml/CMakeLists.txt	M	keep	edits to upstream files
+ggml/include/ggml-backend.h	M	keep	edits to upstream files
+ggml/include/ggml-cuda.h	M	keep	edits to upstream files
+ggml/include/ggml-kimi-q3k-chain.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/include/ggml-kimi-q3k-parity.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/include/ggml-rpc.h	M	keep	edits to upstream files
+ggml/include/ggml.h	M	keep	edits to upstream files
+ggml/src/ggml-backend-impl.h	M	keep	edits to upstream files
+ggml/src/ggml-backend-meta.cpp	M	keep	edits to upstream files
+ggml/src/ggml-backend.cpp	M	keep	edits to upstream files
+ggml/src/ggml-blas/ggml-blas.cpp	M	keep	edits to upstream files
+ggml/src/ggml-cann/ggml-cann.cpp	M	keep	edits to upstream files
+ggml/src/ggml-common.h	M	keep	edits to upstream files
+ggml/src/ggml-cpu/CMakeLists.txt	M	keep	edits to upstream files
+ggml/src/ggml-cpu/arch/arm/quants.c	M	keep	edits to upstream files
+ggml/src/ggml-cpu/arch/powerpc/quants.c	M	keep	edits to upstream files
+ggml/src/ggml-cpu/arch/riscv/quants.c	M	keep	edits to upstream files
+ggml/src/ggml-cpu/arch/s390/quants.c	M	keep	edits to upstream files
+ggml/src/ggml-cpu/arch/x86/quants.c	M	keep	edits to upstream files
+ggml/src/ggml-cpu/ggml-cpu copy.c	A	drop	accidental copy; not built
+ggml/src/ggml-cpu/ggml-cpu.c	M	keep	edits to upstream files
+ggml/src/ggml-cpu/ggml-cpu.cpp	M	keep	edits to upstream files
+ggml/src/ggml-cpu/kimi-cache-location-api.h	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-common-adapter.inc	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-cpu-cache-executor.inc	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-cpu-cache-policy.cpp	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-cpu-cache-policy.h	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-cpu-prefill.cpp	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-cpu-prefill.h	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-cpu-sink-internal.h	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-cpu-sink.cpp	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-cpu-sink.h	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-host-ledger.h	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-host-lock.h	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-prefill-cost.h	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-vram-location-api.h	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi-vram-tier-api.h	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-cpu/kimi.c	A	carry-p6	referenced by build/test: kimi K3 CPU path (kimi.c, included by ggml-cpu.c)
+ggml/src/ggml-cpu/ops.cpp	M	keep	edits to upstream files
+ggml/src/ggml-cpu/ops.h	M	keep	edits to upstream files
+ggml/src/ggml-cpu/quants.c	M	keep	edits to upstream files
+ggml/src/ggml-cpu/quants.h	M	keep	edits to upstream files
+ggml/src/ggml-cpu/unary-ops.cpp	M	keep	edits to upstream files
+ggml/src/ggml-cpu/unary-ops.h	M	keep	edits to upstream files
+ggml/src/ggml-cuda/CMakeLists.txt	M	keep	edits to upstream files
+ggml/src/ggml-cuda/activation-quant-reuse.cu	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/activation-quant-reuse.cuh	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/argsort.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/argsort.cuh	M	keep	edits to upstream files
+ggml/src/ggml-cuda/binbcast.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/common.cuh	M	keep	edits to upstream files
+ggml/src/ggml-cuda/concat.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/convert.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/cpu-parity.cuh	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/cpy.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/dense-parity.cuh	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/dsv4-hc.cu	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/dsv4-hc.cuh	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/fattn-common.cuh	M	keep	edits to upstream files
+ggml/src/ggml-cuda/fattn.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/fattn.cuh	M	keep	edits to upstream files
+ggml/src/ggml-cuda/gated_delta_net.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/ggml-cuda.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/hc-weighted-sum.cu	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/hc-weighted-sum.cuh	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/kimi-dense-stream.cu	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/kimi-q3k-chain.cu	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/kimi-q3k-parity.cu	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/kimi-q3k-reference-math.cuh	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/kimi-vram-tier/CMakeLists.txt	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/COPYING.LIB	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/README.md	A	keep	docs/results/baselines
+ggml/src/ggml-cuda/kimi-vram-tier/THIRD_PARTY.md	A	keep	docs/results/baselines
+ggml/src/ggml-cuda/kimi-vram-tier/build_component.sh	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/build_mxfp4_component.sh	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/ggml-kimi-mxfp4-chain.h	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/ggml-kimi-mxfp4-parity.h	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/group-compute-adapter.cu	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/kimi-mxfp4-batch.cu	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/kimi-mxfp4-batch.h	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/kimi-mxfp4-chain.cu	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/kimi-mxfp4-parity.cu	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/mxfp4-compute-adapter.cpp	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/q2-compute-adapter.cu	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/test2-compute-adapter.cpp	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/vram-activation.cuh	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/vram-compute-api.h	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/vram-location-provider.inc	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/vram-slot-table.h	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/kimi-vram-tier/vram-tier.cpp	A	keep	vram tier (ggml-cuda/kimi-vram-tier)
+ggml/src/ggml-cuda/lightning-indexer.cu	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/lightning-indexer.cuh	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/mmq.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/mmq.cuh	M	keep	edits to upstream files
+ggml/src/ggml-cuda/mmvf-f16-cpu.cu	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/mmvf-f16-cpu.cuh	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/mmvf-f32-cpu.cu	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/mmvf-f32-cpu.cuh	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/mmvf.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/mmvq-q8k.cu	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/mmvq-q8k.cuh	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/mmvq.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/mmvq.cuh	M	keep	edits to upstream files
+ggml/src/ggml-cuda/moe-adapter-dispatch.cu	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-adapter-dispatch.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-adapter-symbols.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-cross-role.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-cross-role.inc	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-device-descriptor.cu	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-device-descriptor.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-dynamic-tier.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-dynamic-tier.inc	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-io-submit.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-lossless-format.cu	A	carry-p6	compiled by file(GLOB *.cu): kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-common-lossless-format.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-common-lossless-nvcomp.cu	A	carry-p6	compiled by file(GLOB *.cu): kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-common-lossless-nvcomp.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-common-lossless-rans.cu	A	carry-p6	compiled by file(GLOB *.cu): kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-common-lossless-rans.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-common-object-cache.cu	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-object-cache.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-object-engine.cu	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-object-engine.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-object-pipeline-runtime.cu	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-object-pipeline-runtime.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-object-pipeline.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-object-transport.cu	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-object-transport.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-role-cache.cu	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-role-cache.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-common-transfer-planner.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-device-descriptor.cu	A	carry-p6	compiled by file(GLOB *.cu): kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-device-descriptor.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-expert-descriptor.h	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe-object-cache.cu	A	carry-p6	compiled by file(GLOB *.cu): kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-object-cache.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-object-engine.cu	A	carry-p6	compiled by file(GLOB *.cu): kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-object-engine.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-object-pipeline-runtime.cu	A	carry-p6	compiled by file(GLOB *.cu): kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-object-pipeline-runtime.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-object-pipeline.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-object-transport.cu	A	carry-p6	compiled by file(GLOB *.cu): kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-object-transport.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-role-cache.cu	A	carry-p6	compiled by file(GLOB *.cu): kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-role-cache.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe-transfer-planner.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/moe_stream.cu	A	carry-p6	expert transport copy used only by K3-shaped models; compiled by the CUDA glob and ~200 lines of forwarding wrappers run, so carried unchanged and removed in curation step C1
+ggml/src/ggml-cuda/moe_stream_batch.cu	A	carry-p6	expert transport copy used only by K3-shaped models; compiled by the CUDA glob and ~200 lines of forwarding wrappers run, so carried unchanged and removed in curation step C1
+ggml/src/ggml-cuda/moe_stream_batch_common.cu	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe_stream_common.cu	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe_stream_decode_batch.cu	A	carry-p6	expert transport copy used only by K3-shaped models; compiled by the CUDA glob and ~200 lines of forwarding wrappers run, so carried unchanged and removed in curation step C1
+ggml/src/ggml-cuda/moe_stream_decode_batch_common.cu	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/moe_stream_mm.cu	A	keep	expert transport / moe stream (ggml-cuda moe*)
+ggml/src/ggml-cuda/norm.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/q4-colibri-worker-state-common.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/q4-colibri-worker-state.h	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+ggml/src/ggml-cuda/quantize.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/quantize.cuh	M	keep	edits to upstream files
+ggml/src/ggml-cuda/rope.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/row-mask.cu	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/row-mask.cuh	A	keep	new CUDA kernels (dsv4/hc/indexer/mmv*)
+ggml/src/ggml-cuda/scale.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/set-rows.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/softmax.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/ssm-conv.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/sumrows.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/top-k.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/top-k.cuh	M	keep	edits to upstream files
+ggml/src/ggml-cuda/unary.cu	M	keep	edits to upstream files
+ggml/src/ggml-cuda/unary.cuh	M	keep	edits to upstream files
+ggml/src/ggml-cuda/vecdotq.cuh	M	keep	edits to upstream files
+ggml/src/ggml-hexagon/ggml-hexagon.cpp	M	keep	edits to upstream files
+ggml/src/ggml-metal/ggml-metal-device.m	M	keep	edits to upstream files
+ggml/src/ggml-metal/ggml-metal.cpp	M	keep	edits to upstream files
+ggml/src/ggml-moe-pack-plan.h	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+ggml/src/ggml-opencl/ggml-opencl.cpp	M	keep	edits to upstream files
+ggml/src/ggml-openvino/ggml-openvino.cpp	M	keep	edits to upstream files
+ggml/src/ggml-quants.c	M	keep	edits to upstream files
+ggml/src/ggml-quants.h	M	keep	edits to upstream files
+ggml/src/ggml-rpc/ggml-rpc.cpp	M	keep	edits to upstream files
+ggml/src/ggml-sycl/ggml-sycl.cpp	M	keep	edits to upstream files
+ggml/src/ggml-virtgpu/ggml-backend.cpp	M	keep	edits to upstream files
+ggml/src/ggml-vulkan/ggml-vulkan.cpp	M	keep	edits to upstream files
+ggml/src/ggml-webgpu/ggml-webgpu.cpp	M	keep	edits to upstream files
+ggml/src/ggml-zdnn/ggml-zdnn.cpp	M	keep	edits to upstream files
+ggml/src/ggml-zendnn/ggml-zendnn.cpp	M	keep	edits to upstream files
+ggml/src/ggml.c	M	keep	edits to upstream files
+ggml/src/kimi-memory-boost.h	A	keep	cpu sink / ledger / cost model (ggml-cpu kimi-*)
+gguf-py/gguf/constants.py	M	keep	edits to upstream files
+gguf-py/gguf/gguf_writer.py	M	keep	edits to upstream files
+gguf-py/gguf/quants.py	M	keep	edits to upstream files
+gguf-py/gguf/tensor_mapping.py	M	keep	edits to upstream files
+gguf-py/tests/test_dspark_mapping.py	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+include/llama.h	M	keep	edits to upstream files
+models/templates/Kimi-K3.jinja	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+models/templates/deepseek-ai-DeepSeek-V4.1.jinja	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+models/templates/deepseek-ai-DeepSeek-V4.jinja	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+models/templates/muse-spark.jinja	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+run-deepseek-v41-flash-mxfp4.sh	A	keep	launchers/configs
+run-kimi-k3-iq1s-top2.sh	A	drop	experiment scripts/sims
+run-llama-server-ds4.sh	A	drop	experiment scripts/sims
+run-ssd-llama.sh	A	keep	launchers/configs
+scripts/check-import.sh	new	add	commit 4: checks the tree against this manifest
+scripts/check-performance.py	A	keep	launchers/configs
+scripts/compare-kimi-logits.py	A	drop	experiment scripts/sims
+scripts/demo-vendor-ds4-gate-hotpool-sota.sh	A	drop	experiment scripts/sims
+scripts/demo-vendor-ds4-general-sota.sh	A	drop	experiment scripts/sims
+scripts/ds4-expert-pack-direct-manifest.py	A	drop	experiment scripts/sims
+scripts/ds4-route-hotset-bound.py	A	drop	experiment scripts/sims
+scripts/k3.slice	A	drop	experiment scripts/sims
+scripts/kimi-build-expert-pack-from-gguf.py	A	drop	experiment scripts/sims
+scripts/kimi-build-gguf-expert-alias-tsv.py	A	drop	experiment scripts/sims
+scripts/kimi-build-missing-down-overlay.py	A	drop	experiment scripts/sims
+scripts/kimi-build-remote-pack-from-manifest.py	A	drop	experiment scripts/sims
+scripts/kimi-build-trace-overlay-pack.py	A	drop	experiment scripts/sims
+scripts/kimi-cache-policy-sim.py	A	drop	experiment scripts/sims
+scripts/kimi-cpu-cache-policy-sim.py	A	drop	experiment scripts/sims
+scripts/kimi-hf-fp4-asset-audit.py	A	drop	experiment scripts/sims
+scripts/kimi-k3-q2k-16g-server.sh	A	drop	experiment scripts/sims
+scripts/kimi-k3-q2k-16g.service	A	drop	experiment scripts/sims
+scripts/kimi-make-remote-pack-manifest.py	A	drop	experiment scripts/sims
+scripts/kimi-no-mmap-prefetch.c	A	keep	launchers/configs
+scripts/kimi-pack-layout-sim.py	A	drop	experiment scripts/sims
+scripts/kimi-partition-remote-pack-manifest.py	A	drop	experiment scripts/sims
+scripts/kimi-phase7fb-min-profile-repro.sh	A	drop	experiment scripts/sims
+scripts/kimi-phase7og-priority-repro.sh	A	drop	experiment scripts/sims
+scripts/kimi-plan-hotkey-remote-pack.py	A	drop	experiment scripts/sims
+scripts/kimi-q3ks-sota.py	A	drop	K3 legacy launcher; test registration removed
+scripts/kimi-reorder-expert-pack.py	A	drop	experiment scripts/sims
+scripts/moe-copy-lru-sim.py	A	carry-p6	referenced by build/test: experiment scripts/sims
+scripts/moe-route-cache-sim.py	A	drop	experiment scripts/sims
+scripts/moe-size-class-cache-sim.py	A	drop	experiment scripts/sims
+scripts/public-scan.py	new	add	commit 4: public-text scan of diffs, commit messages, ref names and exported text (personal paths and remote login identifiers block; internal wording is reported)
+scripts/ssd-temperature-chart.py	A	drop	experiment scripts/sims
+scripts/upstream-snapshot.sh	new	add	commit 4: the one way to write an upstream snapshot (exclusion list)
+src/CMakeLists.txt	M	keep	edits to upstream files
+src/llama-arch.cpp	M	keep	edits to upstream files
+src/llama-arch.h	M	keep	edits to upstream files
+src/llama-context.cpp	M	keep	edits to upstream files
+src/llama-context.h	M	keep	edits to upstream files
+src/llama-cparams.h	M	keep	edits to upstream files
+src/llama-cpu-prefill.h	A	keep	llama-side glue headers
+src/llama-cpu-sink.h	A	keep	llama-side glue headers
+src/llama-deepseek4-hot.cpp	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+src/llama-deepseek4-hot.h	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+src/llama-engram.h	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+src/llama-ext.h	M	keep	edits to upstream files
+src/llama-graph.cpp	M	keep	edits to upstream files
+src/llama-graph.h	M	keep	edits to upstream files
+src/llama-hparams.cpp	M	keep	edits to upstream files
+src/llama-hparams.h	M	keep	edits to upstream files
+src/llama-impl.h	M	keep	edits to upstream files
+src/llama-kimi-compat.h	A	keep	llama-side glue headers
+src/llama-kimi-runtime.h	A	keep	llama-side glue headers
+src/llama-kv-cache-dsv4.cpp	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+src/llama-kv-cache-dsv4.h	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+src/llama-kv-cache-iswa.cpp	M	keep	edits to upstream files
+src/llama-kv-cache-iswa.h	M	keep	edits to upstream files
+src/llama-kv-cache.cpp	M	keep	edits to upstream files
+src/llama-kv-cache.h	M	keep	edits to upstream files
+src/llama-kv-cells.h	M	keep	edits to upstream files
+src/llama-memory-deepseek4.cpp	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+src/llama-memory-deepseek4.h	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+src/llama-memory-recurrent.cpp	M	keep	edits to upstream files
+src/llama-memory.h	M	keep	edits to upstream files
+src/llama-mmap.cpp	M	keep	edits to upstream files
+src/llama-mmap.h	M	keep	edits to upstream files
+src/llama-model-loader.cpp	M	keep	edits to upstream files
+src/llama-model-loader.h	M	keep	edits to upstream files
+src/llama-model-saver.cpp	M	keep	edits to upstream files
+src/llama-model.cpp	M	keep	edits to upstream files
+src/llama-model.h	M	keep	edits to upstream files
+src/llama-quant.cpp	M	keep	edits to upstream files
+src/llama-sampler.cpp	M	keep	edits to upstream files
+src/llama-vocab.cpp	M	keep	edits to upstream files
+src/llama-vocab.h	M	keep	edits to upstream files
+src/llama.cpp	M	keep	edits to upstream files
+src/models/deepseek2.cpp	M	keep	edits to upstream files
+src/models/deepseek4.cpp	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+src/models/deepseek41-candidate.h	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+src/models/deepseek41.cpp	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+src/models/dflash.cpp	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+src/models/kimi-k3.cpp	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+src/models/kimi-linear.cpp	M	keep	edits to upstream files
+src/models/models.h	M	keep	edits to upstream files
+src/models/muse-spark.cpp	A	keep	model support (DSV4/4.1, Muse, K3, templates)
+tests/CMakeLists.txt	M	keep-edit	edit: remove the test-kimi-sota-launcher registration (K3 legacy launcher; its script and config are not carried)
+tests/kimi-host-jobs-test.inc	A	keep	tests (own)
+tests/test-arg-parser.cpp	M	keep	edits to upstream files
+tests/test-backend-ops.cpp	M	keep	edits to upstream files
+tests/test-chat-literal.cpp	A	keep	tests (own)
+tests/test-chat.cpp	M	keep	edits to upstream files
+tests/test-check-performance.py	A	keep	tests (own)
+tests/test-cuda-memory-reserve.cpp	A	keep	tests (own)
+tests/test-deepseek4-native-packers.py	A	keep	tests (own)
+tests/test-dsv41-candidate.cpp	A	keep	tests (own)
+tests/test-dsv41-engram.cpp	A	keep	tests (own)
+tests/test-dsv41-q2-pack.cpp	A	keep	tests (own)
+tests/test-jinja.cpp	M	keep	edits to upstream files
+tests/test-kimi-cache-lease.cpp	A	keep	tests (own)
+tests/test-kimi-cpu-cache-policy-sim.py	A	drop	experiment scripts/sims
+tests/test-kimi-cpu-cache-policy.cpp	A	keep	tests (own)
+tests/test-kimi-cpu-prefill-graph.cpp	A	keep	tests (own)
+tests/test-kimi-cpu-prefill.cpp	A	keep	tests (own)
+tests/test-kimi-cpu-sink.cpp	A	keep	tests (own)
+tests/test-kimi-deepseek2-guards.cpp	A	keep	tests (own)
+tests/test-kimi-dense-stream.cpp	A	keep	tests (own)
+tests/test-kimi-host-lock.cpp	A	keep	tests (own)
+tests/test-kimi-mxfp4-chain.cpp	A	keep	tests (own)
+tests/test-kimi-mxfp4-gemm.cpp	A	keep	tests (own)
+tests/test-kimi-mxfp4-parity.cpp	A	keep	MXFP4 parity DSO component check (tests/CMakeLists.txt:174 loop)
+tests/test-kimi-prefetch-tier.cpp	A	keep	tests (own)
+tests/test-kimi-prefill-cost.cpp	A	keep	tests (own)
+tests/test-kimi-prefill-crossover.cpp	A	keep	tests (own)
+tests/test-kimi-prefill-scratch.cpp	A	keep	tests (own)
+tests/test-kimi-q3k-parity.cpp	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+tests/test-kimi-runtime-routing.cpp	A	keep	tests (own)
+tests/test-kimi-sota-launcher.py	A	drop	K3 legacy launcher test; registration removed
+tests/test-kimi-vram-async.cpp	A	keep	tests (own)
+tests/test-kimi-vram-component-error.cpp	A	keep	tests (own)
+tests/test-kimi-vram-deferred.cpp	A	keep	tests (own)
+tests/test-kimi-vram-elastic.cpp	A	keep	tests (own)
+tests/test-kimi-vram-exclusive.cpp	A	keep	tests (own)
+tests/test-kimi-vram-group.cpp	A	keep	tests (own)
+tests/test-kimi-vram-location-lifecycle.cpp	A	keep	tests (own)
+tests/test-kimi-vram-location.cpp	A	keep	tests (own)
+tests/test-kimi-vram-mm.cpp	A	keep	tests (own)
+tests/test-kimi-vram-mxfp4.cpp	A	keep	tests (own)
+tests/test-kimi-vram-native.cpp	A	keep	tests (own)
+tests/test-kimi-vram-pool-cuda.cpp	A	keep	tests (own)
+tests/test-kimi-vram-pool.cpp	A	keep	tests (own)
+tests/test-kimi-vram-q2.cpp	A	keep	tests (own)
+tests/test-kimi-vram-ready.cpp	A	keep	tests (own)
+tests/test-kimi-vram-reclaim.cpp	A	keep	tests (own)
+tests/test-kv-cache-iswa-state-at.cpp	A	keep	tests (own)
+tests/test-llama-archs.cpp	M	keep	edits to upstream files
+tests/test-llama-mmap-random.cpp	A	keep	tests (own)
+tests/test-moe-common-cross-role.cpp	A	keep	tests (own)
+tests/test-moe-common-dynamic-tier.cpp	A	keep	tests (own)
+tests/test-moe-common-io-submit.cpp	A	keep	tests (own)
+tests/test-moe-copy-lru-sim.py	A	carry-p6	referenced by build/test: experiment scripts/sims
+tests/test-moe-object-engine.cpp	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+tests/test-moe-pack-copy-plan.cpp	A	keep	tests (own)
+tests/test-q2-vecdot-bench.cpp	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+tests/test-q4-colibri-worker.cpp	A	carry-p6	referenced by build/test: kimi/q3k/colibri/lossless experiments
+tests/test-quant-type-selection.cpp	M	keep	edits to upstream files
+tests/test-reasoning-budget.cpp	M	keep	edits to upstream files
+tests/test-server-chat-literal.cpp	A	keep	tests (own)
+tests/test-server-chat-output-source.cpp	A	keep	tests (own)
+tests/test-server-control-token-delivery.cpp	A	keep	tests (own)
+tests/test-server-expert-guard.cpp	A	keep	tests (own)
+tests/test-server-output-parser-delivery.cpp	A	keep	tests (own)
+tests/test-server-prompt-cache.cpp	A	keep	tests (own)
+tests/test-server-runtime-routing.cpp	A	keep	tests (own)
+tests/test-server-sampler-struct-top1.cpp	A	carry-p6	referenced by build/test: k3/server protocol experiments
+tests/test-server-text-reuse.cpp	A	keep	tests (own)
+tests/test-server-tooluse-delivery.cpp	A	keep	tests (own)
+tools/CMakeLists.txt	M	keep-edit	edit: build q4-colibri-direct-reader only if Linux AND GGML_CUDA (from Support-Mac-ssd-llama)
+tools/adaptive/README.md	A	keep	docs/results/baselines
+tools/adaptive/adaptive.sh	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/arm.sh	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/baselines/README.md	A	keep-edit	edit: drop the mentions of the dropped prompt (lines 142, 245) and the link to the dropped doc (line 144); hardware description instead of deployment details (line 58)
+tools/adaptive/baselines/arm.sh	A	keep	docs/results/baselines
+tools/adaptive/baselines/build-colibri.sh	A	keep	docs/results/baselines
+tools/adaptive/baselines/colibri-arm.sh	A	keep	docs/results/baselines
+tools/adaptive/baselines/colibri-prepare.sh	A	keep	docs/results/baselines
+tools/adaptive/baselines/colibri-replay.py	A	keep	docs/results/baselines
+tools/adaptive/baselines/default-config-20261020.md	A	keep-edit	edit (line numbers at seed e79cdda): user names in paths (lines 396-402, /home/<name>/ -> ~/); hardware description instead of deployment details and process notes (lines 48, 58, 63, 76, 245; "user decision" wording at 313, 331, 334)
+tools/adaptive/baselines/dl2.py	A	keep	docs/results/baselines
+tools/adaptive/baselines/dsv41-official-manifest.json	A	keep	docs/results/baselines
+tools/adaptive/baselines/hfdl.py	A	keep	docs/results/baselines
+tools/adaptive/baselines/mac-arm-pr.sh	A	keep	docs/results/baselines
+tools/adaptive/baselines/mac-colibri-arm.sh	A	keep	docs/results/baselines
+tools/adaptive/baselines/official-small.sha256	A	keep	docs/results/baselines
+tools/adaptive/baselines/prompts/replay-real-code-3p6k-cold-hot.json	A	keep	docs/results/baselines
+tools/adaptive/baselines/prompts/replay-real-doc-en-8k-cold-hot.json	A	keep	docs/results/baselines
+tools/adaptive/baselines/prompts/replay-real-zh-600-cold-hot.json	A	drop	working notes used as a prompt; not referenced by any script; not imported
+tools/adaptive/baselines/replay-stream.py	A	keep	docs/results/baselines
+tools/adaptive/baselines/run-llamacpp-pr.sh	A	keep	docs/results/baselines
+tools/adaptive/baselines/session-pr-baselines.sh	A	keep	docs/results/baselines
+tools/adaptive/boot_client.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/build.sh	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/client.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/compare_online.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/controller.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/converse.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/coresets.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/device_profile.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/expert_source.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/gguf_header.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/insitu.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/logparse.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/machine.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/models/dsv41.conf	A	keep	launchers/configs
+tools/adaptive/models/examples/muse-spark-gb10.settings	A	keep	launchers/configs
+tools/adaptive/models/launch-qwen38.sh	A	carry-p6	Qwen3.8 port conf; documented in tools/adaptive/README; decide in P6
+tools/adaptive/models/muse-spark.conf	A	keep	launchers/configs
+tools/adaptive/models/qwen38.conf	A	carry-p6	Qwen3.8 port conf; documented in tools/adaptive/README; decide in P6
+tools/adaptive/online.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/placement.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/plan.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/prefill.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/probe.sh	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/probe/ioreplay.c	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/probe/memprobe.cu	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/prompts/boot-en-doc.json	A	keep	launchers/configs
+tools/adaptive/prompts/work-4turn.json	A	keep	launchers/configs
+tools/adaptive/prompts/work-long.json	A	keep	launchers/configs
+tools/adaptive/reads.sh	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/results-bytes-20261022.md	A	keep-edit	edit: user name in a path (line 328, /home/<name>/ -> ~/)
+tools/adaptive/results-final1-spark-20261022.md	A	keep-edit	edit: user name in a path (line 94); drop a process note (lines 42-43)
+tools/adaptive/results-floor-20261022.md	A	keep	docs/results/baselines
+tools/adaptive/results-spark-20261021.md	A	keep-edit	edit: user name in paths (lines 77, 270, 294, 305, 597)
+tools/adaptive/serve.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/settings.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/sim.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/tests/fixtures/run-deepseek-v41-flash-mxfp4.golden-1f174b4.sh	new	add	golden launcher, 254 lines, verbatim from ssd-llama 1f174b4 (scanned clean)
+tools/adaptive/tests/test_expert_source.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/tests/test_launcher_replica.sh	A	keep-edit	edit: read the golden launcher from tests/fixtures instead of git object 1f174b4; missing fixture = FAIL, not SKIP
+tools/adaptive/tests/test_launcher_settings.sh	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/tests/test_logparse_place.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/tests/test_settings.py	A	keep	adaptive framework (tools/adaptive)
+tools/adaptive/ubprobe.py	A	keep	adaptive framework (tools/adaptive)
+tools/cli/README.md	M	keep	edits to upstream files
+tools/cli/cli.cpp	M	keep	edits to upstream files
+tools/completion/README.md	M	keep	edits to upstream files
+tools/completion/completion.cpp	M	keep	edits to upstream files
+tools/kimi-pipelined-decode-spike/CMakeLists.txt	A	carry-p6	referenced by build/test: one-off tools
+tools/kimi-pipelined-decode-spike/kimi-pipelined-decode-spike.cpp	A	carry-p6	referenced by build/test: one-off tools
+tools/kimi-verify-bench/CMakeLists.txt	A	carry-p6	referenced by build/test: one-off tools
+tools/kimi-verify-bench/kimi-rollback-check.cpp	A	carry-p6	referenced by build/test: one-off tools
+tools/kimi-verify-bench/kimi-verify-bench.cpp	A	carry-p6	referenced by build/test: one-off tools
+tools/mtmd/mtmd.cpp	M	keep	edits to upstream files
+tools/mtmd/mtmd.h	M	keep	edits to upstream files
+tools/q4-colibri-direct-reader/CMakeLists.txt	A	carry-p6	referenced by build/test: one-off tools
+tools/q4-colibri-direct-reader/q4-colibri-direct-reader.cpp	A	carry-p6	referenced by build/test: one-off tools
+tools/quantize/quantize.cpp	M	keep	edits to upstream files
+tools/results/README.md	M	keep	edits to upstream files
+tools/results/results.cpp	M	keep	edits to upstream files
+tools/server/README.md	M	keep	edits to upstream files
+tools/server/server-chat.cpp	M	keep	edits to upstream files
+tools/server/server-common.cpp	M	keep	edits to upstream files
+tools/server/server-common.h	M	keep	edits to upstream files
+tools/server/server-context.cpp	M	keep	edits to upstream files
+tools/server/server-expert-guard.h	A	keep	server additions
+tools/server/server-k3-protocol.h	A	carry-p6	referenced by build/test: k3/server protocol experiments
+tools/server/server-sampler-struct-top1.h	A	carry-p6	referenced by build/test: k3/server protocol experiments
+tools/server/server-task.cpp	M	keep	edits to upstream files
+tools/server/server-task.h	M	keep	edits to upstream files

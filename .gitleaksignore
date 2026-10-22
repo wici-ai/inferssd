@@ -1,0 +1,5 @@
+# Reviewed upstream false positives: xxhash SIMD variable names (2), test PNG data, and an API-key placeholder.
+8884f8314ce8ea96d62cd602b6bbf7fc25758a09:examples/gguf-hash/deps/xxhash/xxhash.h:generic-api-key:4905
+8884f8314ce8ea96d62cd602b6bbf7fc25758a09:examples/gguf-hash/deps/xxhash/xxhash.h:generic-api-key:4954
+8884f8314ce8ea96d62cd602b6bbf7fc25758a09:tools/server/tests/unit/test_completion.py:generic-api-key:253
+8884f8314ce8ea96d62cd602b6bbf7fc25758a09:tools/server/README.md:curl-auth-header:1412

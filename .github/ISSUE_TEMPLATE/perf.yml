@@ -1,0 +1,17 @@
+name: Performance report
+description: Provide a controlled comparison on real hardware.
+body:
+  - type: textarea
+    id: versions
+    attributes:
+      label: Compared versions and hardware
+      description: Include exact commits, build flags, model revision and checksums, hardware and host settings.
+    validations:
+      required: true
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload and measurements
+      description: Prompt hash, token count, sampling, cold/warm state, first-token latency, decode windows, repetitions and raw results.
+    validations:
+      required: true

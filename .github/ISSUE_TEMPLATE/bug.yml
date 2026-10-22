@@ -1,0 +1,23 @@
+name: Bug report
+description: Report a reproducible runtime or framework failure.
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Version and environment
+      description: Commit, CPU, RAM, GPU, PCIe link, storage, OS, driver, CUDA and compiler.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Model repository and revision, command, configuration and sanitized logs. Remove credentials and personal paths.
+    validations:
+      required: true
