@@ -171,6 +171,15 @@ def summarize(records, start_ns, end_ns, prompt_ids, output_tokens):
 def run(args):
     if not 1 <= args.input_tokens <= 1024 or not 1 <= args.output_tokens <= 512:
         raise ValueError("short protocol requires 1..1024 input and 1..512 output tokens")
+    def validate_input(prompt_ids, _base):
+        if not token_list(prompt_ids) or len(prompt_ids) != args.input_tokens:
+            raise ValueError("rendered prompt token count differs from the fixed protocol")
+        return {}
+    return record_chat(args, validate_input)
+
+
+def record_chat(args, validate_input, protocol_extra=None, validate_result=None):
+    """Shared recorder; each entry point supplies its own input-size contract."""
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         raise ValueError("timeout must be finite and positive")
     raw = args.prompt.read_bytes()
@@ -188,6 +197,7 @@ def run(args):
                 "base_url": args.url.rstrip("/"), "cache_prompt": False,
                 "clock": "time.monotonic_ns", "mode": "native-completion-of-rendered-chat",
                 "timeout_s": args.timeout}
+    protocol.update(protocol_extra or {})
     result = {"status": "failed", "prompt_sha256": digest(raw)}
     try:
         with deadline(args.timeout):
@@ -202,8 +212,8 @@ def run(args):
             # Re-tokenizing flattened text could interpret user text as control tokens.
             if not isinstance(rendered, str):
                 raise ValueError("template response must contain rendered text")
-            if not token_list(prompt_ids) or len(prompt_ids) != args.input_tokens:
-                raise ValueError("rendered prompt token count differs from the fixed protocol")
+            protocol.update(validate_input(prompt_ids, base))
+            protocol["input_tokens"] = len(prompt_ids)
             body = {"prompt": prompt_ids, "n_predict": args.output_tokens, "stream": True,
                     "temperature": 0, "top_k": 1, "samplers": ["top_k"],
                     "seed": 0, "n_probs": 5, "post_sampling_probs": False,
@@ -223,7 +233,10 @@ def run(args):
                     raw_events.flush()
                     records.append(row)
             end_ns = time.monotonic_ns()
-            result.update(summarize(records, start_ns, end_ns, prompt_ids, args.output_tokens))
+            summary = summarize(records, start_ns, end_ns, prompt_ids, args.output_tokens)
+            if validate_result is not None:
+                validate_result(summary)
+            result.update(summary)
             result.update({"status": "passed", "rendered_prompt_sha256": protocol["rendered_prompt_sha256"],
                            "prompt_ids": prompt_ids})
     except Exception as error:  # noqa: BLE001 - retain failed measurement evidence for all request errors

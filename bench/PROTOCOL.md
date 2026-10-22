@@ -25,17 +25,24 @@ Record these fields alongside the raw output:
   Declare direct GGUF reads and unrestricted transfers when that is the protocol.
 
 Use one user message, thinking disabled, temperature zero/top-k one, a fixed
-output count, EOS ignored and prompt caching disabled for the short comparison.
+output count, EOS ignored and prompt caching disabled.
 The template endpoint's authoritative token IDs preserve message provenance;
 re-tokenizing flattened text can interpret literal user text as control tokens.
 The client verifies counts before generation and keeps the exact request.
 
 ## Runs and clocks
 
-For a final short comparison, use one locked ABBA cycle with an explicit baseline
-and candidate. Each arm starts a fresh owned server process and records its first
-request. Preserve A1, B1, B2 and A2 separately; report all values, their mean and
-dispersion. A diagnostic single pair is labeled as such and is not an ABBA result.
+Final performance acceptance runs the fixed 512 and 4K prompt files exactly once
+each per supported device/model on the final source, generating all 256 output
+tokens. Each tier starts a fresh owned server and records its first completion.
+Record the actual authoritative template token count: the 4K label can exceed
+4096 tokens. Do not change prompt bytes to equalize token counts between models.
+Keep every failed attempt; no automatic retries, averaging or best-run selection.
+See [the formal driver contract](FINAL.md) for deadlines and required receipts.
+
+ABBA remains an optional short diagnostic comparison with an explicit baseline
+and candidate. Preserve its A1, B1, B2 and A2 separately and label it as a
+diagnostic; it does not replace either final performance sample.
 
 A fresh server may make initialization or warm-up reads before the measured
 request. It does not imply an empty application cache, and it never establishes
@@ -51,7 +58,7 @@ starting at token 128. A shorter request does not establish either full window.
 Server-reported prefill/compute timings are separate metrics and must retain
 their own count and time definitions.
 
-The short driver accepts 1--1,024 input and 1--512 output tokens, with an explicit
+The separate short driver accepts 1--1,024 input and 1--512 output tokens, with an explicit
 per-arm timeout. An archived longer prompt does not expand these bounds or
 schedule a run. STOP, timeout, OOM, early EOS, truncation, protocol mismatch and
 incomplete output remain failures in the record; do not discard them as outliers
