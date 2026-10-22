@@ -40,6 +40,7 @@
 #include <sys/vfs.h>
 #include <sys/wait.h>
 #include "kimi-host-ledger.h"
+#include "linux-test-resources.h"
 
 static void require(bool ok, const std::string & what) { if (!ok) { throw std::runtime_error(what); } }
 static size_t aligned(size_t n) { return (n + 4095) & ~size_t(4095); }
@@ -212,7 +213,7 @@ static void make_synthetic(fixture & f, uint32_t seed = 20260908) {
     pad_to(data_start);
     for (const auto & kv : f.entries) { pad_to(kv.second.offset); put_bytes(file, kv.second.data.data(), kv.second.raw_bytes); pad_to(kv.second.offset + kv.second.read_bytes); }
     file.close(); require(bool(file), "fixture close failed");
-    f.fd = open(f.path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC); require(f.fd >= 0, "O_DIRECT fixture open failed");
+    f.fd = test_resources::open_direct(f.path);
 }
 
 struct tensors {
@@ -273,6 +274,7 @@ static std::vector<float> reference(const fixture & f, int layer, const std::vec
 
 using sink_ptr = std::unique_ptr<kimi_cpu_sink, decltype(&kimi_cpu_sink_destroy)>;
 static sink_ptr make_sink(fixture & f, int threads, int depth) {
+    test_resources::cpu_threads(threads - 1, 1);
     char error[512] = {};
     auto * sink = kimi_cpu_sink_create(threads, depth, fixture::resolve, &f, error, sizeof(error));
     require(sink, std::string("create: ") + error);
@@ -526,11 +528,7 @@ static void make_resident_copy(fixture & f, const std::string & directory) {
         offset += e.read_bytes;
     }
     file.close(); require(bool(file), "resident copy failed");
-    f.fd = open(f.path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
-    if (f.fd < 0) { throw unsupported_resident("tmpfs rejected O_DIRECT open; no buffered fallback"); }
-    void * probe = nullptr; require(posix_memalign(&probe, 4096, 4096) == 0, "resident probe allocation failed");
-    const ssize_t got = pread(f.fd, probe, 4096, 0); std::free(probe);
-    if (got != 4096) { throw unsupported_resident("tmpfs rejected actual aligned O_DIRECT read; no buffered fallback"); }
+    f.fd = test_resources::open_direct(f.path);
     std::printf("resident_control=tmpfs_O_DIRECT_accepted note=RAM_file_read_path_not_zero_IO_compute_control bytes=%llu\n", (unsigned long long) offset);
 }
 
@@ -593,7 +591,7 @@ static void real_test(const std::string & pack, const std::string & prefix, cons
         auto & item = kv.second; item.data.resize(item.raw_bytes);
         file.seekg(item.offset); file.read(reinterpret_cast<char *>(item.data.data()), item.raw_bytes); require(bool(file), "short reference pack read");
     }
-    file.close(); f.path = pack; f.fd = open(pack.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC); require(f.fd >= 0, "real O_DIRECT pack open failed");
+    file.close(); f.path = pack; f.fd = test_resources::open_direct(f.path);
     if (!options.resident_dir.empty()) { make_resident_copy(f, options.resident_dir); }
     const auto reference_begin = std::chrono::steady_clock::now();
     const auto expected = reference(f, layer, input, ids, weights, 4.0f, 25.0f);
@@ -1657,7 +1655,7 @@ static void cache_auto_ring_test(int threads, int depth) {
     }
     uint64_t limit = 0;
     std::ifstream maximum(path + "/memory.max");
-    require(bool(maximum >> limit) && limit == 1024ull * 1024 * 1024,
+    test_resources::need(bool(maximum >> limit) && limit == 1024ull * 1024 * 1024,
             "--auto-cache-ring-test requires an independent 1 GiB scope");
     require(depth == 8, "cold-ring regression uses eight staging slots");
     const uint64_t reserve = 512ull * 1024 * 1024;
@@ -1811,7 +1809,7 @@ static void cache_pressure_transition_test(int threads, int depth) {
     // cache guard without OOM or pressure ballast. The same test supports an
     // unlimited child below this finite ancestor to verify ancestor accounting.
     const char * owned = std::getenv("GGML_KIMI_CPU_SINK_TEST_CGROUP");
-    require(owned && std::string(owned).find("/sys/fs/cgroup/") == 0 &&
+    test_resources::need(owned && std::string(owned).find("/sys/fs/cgroup/") == 0 &&
             std::string(owned).find("/q3ks-cache-policy-large-") != std::string::npos,
             "pressure transition requires an explicitly owned q3ks-cache-policy-large-* cgroup");
     std::ifstream groups("/proc/self/cgroup"); std::string line, actual;
@@ -1822,7 +1820,7 @@ static void cache_pressure_transition_test(int threads, int depth) {
     require(actual == path || actual.compare(0, path.size() + 1, path + "/") == 0,
             "pressure scope must contain this process");
     std::ifstream max_file(path + "/memory.max"); std::string original;
-    require(bool(max_file >> original) && original != "max" && std::stoull(original) >= 8ull * 1024 * 1024 * 1024,
+    test_resources::need(bool(max_file >> original) && original != "max" && std::stoull(original) >= 8ull * 1024 * 1024 * 1024,
             "pressure transition requires an initially large finite limit");
     auto write_limit = [&](const std::string & value) {
         std::ofstream file(path + "/memory.max"); file << value << '\n'; file.flush();
@@ -1910,7 +1908,7 @@ static void cache_pressure_test(int threads, int depth, bool unbounded = false) 
         if (slash == std::string::npos) { break; }
         path.resize(slash);
     }
-    require(unbounded ? !finite : constrained, unbounded ? "--cache-unbounded requires no finite cgroup ancestor" :
+    test_resources::need(unbounded ? !finite : constrained, unbounded ? "--cache-unbounded requires no finite cgroup ancestor" :
             "--cache-pressure requires a cgroup memory.max <= 2 GiB (use an independent 1 GiB scope)");
     fixture f; make_synthetic(f); auto sink = make_sink(f, threads, depth);
     std::vector<float> input(f.latent, .13f);
@@ -2612,7 +2610,7 @@ static void cache_load_tests(int threads, int depth) {
         const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096, slot = 3 * role;
         const uint64_t cost = slot + slot / 128; // a slot and its page tables, until geometry's receipt prices it
         const uint64_t ring = uint64_t(depth) * slot, room = host_room();
-        require(room > ring + 7 * cost + (1ull << 30), "the owed slots' case needs a finite cgroup with room");
+        test_resources::need(room > ring + 7 * cost + (1ull << 30), "the owed slots' case needs a finite cgroup with room");
         // geometry sees 6.5 slots of room, after the read ring the load step resizes first
         activation_env_guard reserve_env("GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES",
             std::to_string(room - ring - 13 * cost / 2).c_str());
@@ -2926,7 +2924,7 @@ static void muse_expert_norm_test(int threads, int depth, ggml_type type, bool n
             end = kv.second.offset + kv.second.data.size();
         }
         file.close();
-        f.fd = open(f.path.c_str(), O_RDONLY | O_DIRECT); require(f.fd >= 0, "native fixture O_DIRECT open");
+        f.fd = test_resources::open_direct(f.path);
         f.native_ranges = true;
     }
     auto sink = make_sink(f, threads, depth);
@@ -3363,7 +3361,19 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--q2-activation-test")) { q2_activation_mode = true; }
             else { throw std::runtime_error("usage: test-kimi-cpu-sink [--registered-lifecycle|--cache-tests|--cache-pressure] [--threads N] [--real-pack FILE --fixture-prefix PREFIX --ring-experts N --repeats N --warmup N --policy fixture|top16|top8|mass085 --jsonl FILE --resident-dir TMPFS]"); }
         }
+        require(options.threads >= 2 && options.threads <= 128 && options.ring_experts >= 1 && options.ring_experts <= 32, "invalid thread/ring count");
         require(options.repeats >= 1 && options.repeats <= 10000 && options.warmup >= 0 && options.warmup <= 10000, "invalid repeat/warmup count");
+        if (!schedule_invalid_mode) {
+            const int required = registered_lifecycle || expert_job_first_call ? 4 : options.threads;
+            test_resources::cpu_threads(required - 1, 1);
+            test_resources::io_uring();
+        }
+        if (cache_mode || hitrate_mode || elastic_cache_mode || cache_load_mode || max_cache_mode ||
+                expert_job_mode || cache_location_mode || cache_compute_mode || early_up_gate_mode ||
+                role_major_mode || nonblocking_down_mode || poll_mode || poll_early_mode || schedules_mode ||
+                prefetch_mode || cache_policy_mode || cache_large_mode || activation_mode || muse_q8_mode || muse_bf16_mode) {
+            test_resources::finite_cgroup();
+        }
         if (expert_job_first_call) { expert_job_first_call_test(); return 0; }
         if (auto_ring_mode) { cache_auto_ring_test(options.threads, ring_set ? options.ring_experts : 8); return 0; }
         if (muse_q8_mode) { muse_expert_norm_test(options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_Q8_0); return 0; }
@@ -3405,7 +3415,7 @@ int main(int argc, char ** argv) {
         else { require(!prefix.empty(), "real pack requires fixture prefix"); real_test(pack, prefix, options); }
         std::printf("CPU_SINK_TEST_OK\n"); return 0;
     } catch (const unsupported_resident & e) { std::fprintf(stderr, "CPU_SINK_RESIDENT_UNSUPPORTED: %s\n", e.what()); return 77; }
-      catch (const std::exception & e) { std::fprintf(stderr, "CPU_SINK_TEST_FAILED: %s\n", e.what()); return 1; }
+      catch (const std::exception & e) { return test_resources::report("CPU_SINK_TEST", e); }
 #else
     (void) argc; (void) argv;
     std::printf("SKIP: CPU sink requires Linux io_uring/O_DIRECT\n"); return 77;

@@ -52,6 +52,7 @@ extern "C" const kimi_vram_residency_api * kimi_vram_residency_get_api() {
 // (skip_vram_lost), read on demand like 7. The read of 5 has finished by then (the test waits), so the RAM cache
 // publishes it and the run takes 5 from there, and no read ran past the window (no spill).
 int main() { try {
+    test_resources::finite_cgroup();
     for (const auto & kv : { std::pair<const char *, const char *>{ "GGML_KIMI_CPU_SINK_READY_FIRST", "1" },
             { "GGML_KIMI_CPU_SINK_EXPERT_JOB", "0" }, { "GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "1" },
             { "GGML_KIMI_CPU_SINK_ROLE_MAJOR", "1" }, { "GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", "1" },
@@ -106,4 +107,4 @@ int main() { try {
             field("spill_us_r") == "0,0,0,0", "a read inside its window was counted as a spill: " + report);
     std::printf("PREFETCH_TIER_OK %s\n", report.c_str());
     return 0;
-} catch (const std::exception & e) { std::fprintf(stderr, "PREFETCH_TIER_FAIL: %s\n", e.what()); return 1; } }
+} catch (const std::exception & e) { return test_resources::report("PREFETCH_TIER", e); } }
