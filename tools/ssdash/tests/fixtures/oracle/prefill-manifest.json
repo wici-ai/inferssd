@@ -14,6 +14,14 @@
     "pass_seconds:244-263",
     "seconds:274-284",
     "break_even:287-338",
-    "threshold:372-397"
+    "threshold:372-397",
+    "union_points:114-131",
+    "rest_fit:134-146",
+    "build:149-219",
+    "graph_line:400-416",
+    "graph_pass_max:419-430",
+    "drive_factor:433-443",
+    "feedback:446-472",
+    "check:475-493"
   ]
 }
