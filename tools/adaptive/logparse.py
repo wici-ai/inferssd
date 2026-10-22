@@ -7,6 +7,11 @@ from collections import defaultdict
 
 from prefill import OFFLOAD_MIN
 
+# the cost table's terms the engine's calibrated line prints ([kimi_cpu_prefill_cost], kimi-cpu-sink-vram.inc), by the
+# names GGML_KIMI_CPU_PREFILL_COST takes
+COST_TERMS = ('cpu_fixed_us', 'cpu_route_us', 'gpu_fixed_us', 'gpu_route_us', 'gpu_host_fixed_us', 'gpu_host_route_us',
+              'link_gbps', 'pageable_gbps', 'drive_gbps', 'drive_fixed_us', 'gpu_token_us')
+
 
 def _lines(path):
     op = gzip.open if path.endswith('.gz') else open
@@ -53,6 +58,9 @@ class ArmParser:
         self.ram_slot_bytes = self.ram_costed = None
         self.decode_place = None             # the decode plan's summary at destroy (kimi-cpu-sink.cpp place_report)
         self.host_register = None            # the RAM cache's page-locking at destroy (the decode registrar)
+        self.pf_cost = None                  # the last calibrated cost line, for the next prefill layer record
+        self.prefill_engine = None           # the GPU lane's receipt ([kimi_vram_prefill_engine]): its engine and geometry
+        self.prefill_ring = {}               # the read ring the lane's passes stream through: its reads, page-locked or not
 
     def decode_key(self, kind, r):
         """The key of the decode token of trace or profile record r.  The engine numbers a token by its position in
@@ -126,7 +134,7 @@ class ArmParser:
             self.decode_place = {k: _kv(line, k) for k in (
                 'layers', 'tokens', 'gpu_experts', 'gpu_per_token', 'planned', 'candidates', 'refused', 'wanted',
                 'error_p50_pct', 'error_p90_pct', 'predicted_ms', 'measured_ms', 'cpu_only_ms', 'cpu_expert_us', 'early',
-                'fixed_us', 'decode_read_gbs', 'cpu_alone_us', 'cpu_shared_us', 'cpu_moved')}
+                'fixed_us', 'decode_read_gbs', 'cpu_alone_us', 'cpu_shared_us', 'cpu_moved', 'pending', 'pending_planned')}
         elif line.startswith('[kimi_host_register] reason=destroy'):
             self.host_register = {k: _kv(line, k) for k in ('registered', 'failures', 'unregistered', 'signals', 'wanted',
                                                             'us_mean', 'us_max', 'us_total')}
@@ -176,9 +184,21 @@ class ArmParser:
             self.pf_graphs.append({'n_tokens': int(_kv(line, 'requested_tokens') or 0),
                                    'ubatch': int(_kv(line, 'configured_max') or 0), 'cpu_s': 0.0, 'sink_bytes': 0.0,
                                    'graph_bytes': 0.0, 'graph_read_us': 0.0, 'graph_passes': 0, 'graph_tokens': 0})
+        elif line.startswith(('[kimi_cpu_prefill_cost] calibrated=', '[kimi_cpu_prefill_mxfp4_cost] calibrated=')):
+            # after each grouped-prefill layer, before its layer record: the table refit over the pass so far, and the
+            # layer's time in the sink (measured_us) against its prediction
+            self.pf_cost = {k: _kv(line, k) for k in COST_TERMS + ('measured_us', 'predicted_us', 'tokens')}
+        elif line.startswith('[kimi_vram_prefill_engine] format='):
+            e = {k: _kv(line, k) for k in ('in_place', 'route_bytes', 'token_bytes', 'output_bytes', 'fixed_bytes',
+                                           'bytes_per_token', 'reserved_rows')}
+            m = re.search(r'\bformat=(\S+) engine=(\S+)', line)
+            self.prefill_engine = dict(e, format=m.group(1) if m else None, engine=m.group(2) if m else None)
+        elif line.startswith('[kimi_cpu_prefill_schedule] ') and ' ring=' in line:
+            self.prefill_ring = {k: int(_kv(line, k)) for k in ('ring', 'ring_locked') if _kv(line, k) is not None}
         elif line.startswith('[kimi_cpu_prefill_layer] '):
             self.pf_layers.append({k: _kv(line, k) for k in ('layer', 'n_tokens', 'unique_experts', 'routed_slots', 'gpu_experts',
                                                          'gpu_ssd_transient_experts', 'ssd_experts', 'ssd_bytes')})
+            self.pf_layers[-1]['cost'], self.pf_cost = self.pf_cost, None
             if self.pf_graphs:
                 self.pf_graphs[-1]['sink_bytes'] += self.pf_layers[-1]['ssd_bytes'] or 0.0   # what the sink read
         elif line.startswith('[kimi_prefill_route] '):
@@ -288,6 +308,13 @@ class ArmParser:
                             'unique': sum(r['unique_experts'] for r in ps), 'tier': sum(r['gpu_experts'] for r in ps),
                             'routes': sum(r['routed_slots'] for r in ps), 'ssd_bytes': sum(r['ssd_bytes'] for r in ps),
                             'unique_per_layer': [int(r['unique_experts']) for r in ps]})
+            # the pass with the GPU lane (an engine that reports its receipt): the table its last layer refit, and its
+            # layers' time in the sink (the rest of the pass is its time a token besides)
+            costed = [r['cost'] for r in ps if r.get('cost') and r['cost'].get('measured_us') is not None]
+            if self.prefill_engine and costed:
+                prefill[-1]['lane'] = {k: v for k, v in costed[-1].items() if k in COST_TERMS and v is not None}
+                prefill[-1]['layers_s'] = sum(c['measured_us'] for c in costed) / 1e6
+                prefill[-1]['layers_costed'] = len(costed)
         return {'cache_load': self.cache_load, 'new_slot_bytes': self.new_slot_bytes, 'new_slot_windows': new_slot,
                 'load_s': float(load_s.group(1)) if load_s else None,
                 'segments': segments, 'groups': groups, 'window': window, 'lprof': self.lprof, 'prefill': prefill, 'trace': self.trace, 'prof': self.prof, 'admission': self.adm,
@@ -295,7 +322,8 @@ class ArmParser:
                 'client': clients, 'pf_graphs': [g for g in self.pf_graphs if g['n_tokens'] >= 64],
                 'memory': {k: v for k, v in self.memory.items() if k != 'compute'},
                 'checkpoint_align': self.checkpoint_align, 'ledger': self.ledger, 'prefetch': self.prefetch,
-                'ram_slots': self.ram_slots, 'decode_place': self.decode_place, 'host_register': self.host_register}
+                'ram_slots': self.ram_slots, 'decode_place': self.decode_place, 'host_register': self.host_register,
+                'prefill_engine': dict(self.prefill_engine, **self.prefill_ring) if self.prefill_engine else None}
 
 
 def read_arm(run_dir, skip=128, parser=None):

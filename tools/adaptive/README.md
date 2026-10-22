@@ -43,7 +43,11 @@ engine for the machine it runs on (CUDA architecture, Arm extensions and liburin
    host link (`probe/memprobe.cu`), the drive at the queue depths a decode layer issues and beyond, read the
    engine's way (`reads.sh`, `probe/ioreplay.c`: O_DIRECT reads of whole widened expert roles through raw io_uring
    syscalls); `device_profile.py` records the knee QD*, the smallest depth as fast as the fastest within the
-   repeat spread.
+   repeat spread. With the build's `test-kimi-vram-group` (`GROUP_TIMER`), the grouped-prefill lanes at the model's
+   expert shape and types, each timed busy beside the others: the GPU's batched engine from device memory and, where
+   the GPU reads host memory in place, from there; the CPU's grouped path; one page-locked copy (`lanes.txt`,
+   `device.json` `lanes`). `settings.py` writes them, with the link and the drive, as the engine's start values
+   (`GGML_KIMI_CPU_PREFILL_COST`, source=measured), which the engine replaces with its own measures as it runs.
 2. **Bootstrap** per CPU placement (`arm.sh`, `boot_client.py`): one real-text turn with 512 decode tokens and the
    engine's per-token trace and profile on, then the same prompt and reply prefilled again on the warm tier; the
    client counts what the drives of the expert files read in decode (`/proc/diskstats`). Then the GPU graph's
@@ -114,6 +118,14 @@ cache slots the engine page-locked and the copy rate it measured (flagged below 
   warm tier's. `settings.py` writes it with the ubatch when a graph pass larger than it
   fits the GPU's memory, and otherwise keeps every pass on the sink. Without graph prefills the graph is priced
   from the probe's rate and the sink's time a token, and the receipt says it is provisional.
+  A bootstrap whose engine reports its GPU lane (`[kimi_vram_prefill_engine]`) prices the sink pass with the lane:
+  each layer as the engine places it (`lane_layer`, the streamed form of `kimi_place_layer`: the CPU, the GPU's
+  chains and their copies over two device slots, the link and the drive coupled through the ring, the experts moved
+  as the engine chooses), on the table the bootstrap's pass calibrated (`[kimi_cpu_prefill_cost] calibrated=`), plus
+  the pass's time a token outside its layers. Its threshold is "every pass" only from a measured graph arm, and
+  `settings.py` carries that table to the servers as the engine's start values (source=derived; the probe's lanes,
+  source=measured, before a bootstrap). `prefill.py check RUN` prices each bootstrap pass in sample and from the other
+  pass's table. A bootstrap without the lane (every stored run) keeps the model above, and its settings.
 - **Prefetch depth** (`settings.py`). The graph hands the sink the next layer's router output on this layer's
   input, best first; at depth k the sink reads the first k novel experts (neither held by the GPU tier now nor in
   the RAM cache) while the drive would idle, from the end of the layer's own reads to the start of the next layer.

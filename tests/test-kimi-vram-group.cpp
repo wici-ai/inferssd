@@ -59,7 +59,7 @@ const vram_group_compute_api * engine_api() {
     }
     require(get, "kimi_vram_group_compute_get_api is missing from the tier DSO");
     const auto * api = get();
-    require(api && api->version == 1 && api->size == sizeof(vram_group_compute_api), "grouped engine API version");
+    require(api && api->version == 2 && api->size == sizeof(vram_group_compute_api), "grouped engine API version");
     return api;
 }
 
@@ -299,10 +299,17 @@ std::vector<float> run_engine(const vram_group_compute_api * api, engine_ptr & e
     }
     const float * rows_out = nullptr;
     vram_group_layer_stats stats = {};
-    engine.check(api->finish_layer(engine.p, &rows_out, &stats, error, sizeof(error)), error);
+    std::vector<double> group_us(group_expert.size(), -1.0);
+    engine.check(api->finish_layer(engine.p, &rows_out, &stats, group_us.data(), error, sizeof(error)), error);
     require(rows_out, "finish returned no rows");
     require(stats.experts == double(group_expert.size()) && stats.routes == double(routes.size()) && stats.us > 0 &&
         stats.begin_us > 0 && stats.finish_us > 0, "engine stats do not count the layer");
+    // each group's own time (API v2) adds up to the stats' sum; the span holds every chain, one after another, and
+    // whatever the stream waited for between them (an arena upload)
+    double group_sum = 0;
+    for (double us : group_us) { require(us >= 0, "a group's time is missing"); group_sum += us; }
+    require(std::fabs(group_sum - stats.us) <= 1e-6 * std::max(1.0, stats.us) && stats.span_us + 1e-3 >= stats.us,
+        "the groups' times are not the layer's");
     require(api->device_bytes(engine.p) == reserved, "the engine's device memory grew after reserve");
     const size_t free_finished = device_free();
     for (int r = 0; r < rows; ++r) {
@@ -478,13 +485,109 @@ void run_numerics(size_t & checks, double & worst) {
         "1e-3 against it, or the lanes are 1.5e-3 apart");
 }
 
-// least-squares line y = a + b x
+// The lane through the sink and the tier (B5): a Muse-shaped model (Q4_K/Q5_K, a per-expert post norm) whose grouped
+// prefill runs on the tier's batched engine, the residents a decode step left and transients (from the ring, or in
+// place where the GPU reads host memory so), against the same sink without a GPU tier. A pass of one token runs the
+// vector engine with the post norm applied by the tier, as decode's rows are normalized by the CPU. Start values that
+// make the GPU cheap move transients; the CPU still computes the experts the planner leaves it.
+void run_tier_lane(size_t & checks, double & worst) {
+    fixture f;
+    f.type = GGML_TYPE_Q4_K; f.down_type = GGML_TYPE_Q5_K;
+    f.latent = 512; f.hidden = 512; f.experts = 16;
+    make_synthetic(f, 20261023);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", "0", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "0", 1);
+    auto cpu = make_sink(f, 8, 4);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", std::to_string(uint64_t(4) * triplet_bytes(f)).c_str(), 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", "1", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "1", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "1", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
+    setenv("GGML_KIMI_CPU_PREFILL_COST", "gpu_fixed_us=1,gpu_route_us=0.01,gpu_host_fixed_us=1,gpu_host_route_us=0.01", 1);
+    auto mixed = make_sink(f, 8, 4);
+    configure_cache(cpu.get(), 0, {1, 2}, f.experts);
+    configure_cache(mixed.get(), 0, {1, 2}, f.experts);
+    tensors meta(f, 1);
+    std::vector<float> norm(size_t(f.latent));
+    std::mt19937 rng(20261024);
+    std::uniform_real_distribution<float> unit(0.5f, 1.5f);
+    for (auto & v : norm) { v = unit(rng); }
+    const kimi_cpu_sink_activation activation = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f,
+        std::numeric_limits<float>::infinity(), norm.data(), 1e-5f };
+    // a decode step gives the tier its format and four residents
+    {
+        std::vector<int32_t> ids = { 0, 1, 2, 3 };
+        std::vector<float> w(4, 0.25f), in(size_t(f.latent), 0.125f), out(size_t(f.latent));
+        begin_cache(mixed.get(), 93, 1);
+        kimi_cpu_sink_stats st = {}; char error[512] = {};
+        require(kimi_cpu_sink_run_activation(mixed.get(), meta.role[0], meta.role[1], meta.role[2], in.data(), ids.data(),
+            w.data(), 4, &activation, out.data(), &st, error, sizeof(error)), error);
+        require(kimi_cpu_sink_vram_phase_complete(mixed.get(), true, error, sizeof(error)), error);
+    }
+    char error[512] = {};
+    std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)> cpu_prefill(
+        kimi_cpu_prefill_create(cpu.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+    require(cpu_prefill != nullptr, error);
+    std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)> gpu_prefill(
+        kimi_cpu_prefill_create(mixed.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+    require(gpu_prefill != nullptr, error);
+    constexpr int nslots = 8;
+    for (const int tokens : { 48, 1, 48 }) {
+        std::normal_distribution<float> sample(0.0f, 1.0f);
+        std::vector<float> input(size_t(tokens) * f.latent);
+        for (auto & v : input) { v = sample(rng); }
+        std::vector<int32_t> ids(size_t(tokens) * nslots);
+        std::vector<float> weights(ids.size());
+        for (int t = 0; t < tokens; ++t) {
+            std::vector<int32_t> order(size_t(f.experts));
+            for (int e = 0; e < f.experts; ++e) { order[size_t(e)] = e; }
+            std::shuffle(order.begin(), order.end(), rng);
+            // every token takes resident expert 0 (the one-token pass too)
+            if (std::find(order.begin(), order.begin() + nslots, 0) == order.begin() + nslots) { order[0] = 0; }
+            float sum = 0.0f;
+            for (int k = 0; k < nslots; ++k) {
+                ids[size_t(t) * nslots + k] = order[size_t(k)];
+                sum += weights[size_t(t) * nslots + k] = unit(rng);
+            }
+            for (int k = 0; k < nslots; ++k) { weights[size_t(t) * nslots + k] /= sum; }
+        }
+        std::vector<float> expected(input.size()), got(input.size());
+        kimi_cpu_prefill_stats cs = {}, gs = {};
+        require(kimi_cpu_prefill_run_activation(cpu_prefill.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+            ids.data(), weights.data(), nslots, tokens, &activation, expected.data(), &cs, error, sizeof(error)), error);
+        require(kimi_cpu_prefill_run_activation(gpu_prefill.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+            ids.data(), weights.data(), nslots, tokens, &activation, got.data(), &gs, error, sizeof(error)), error);
+        double lanes = 0.0;
+        for (int t = 0; t < tokens; ++t) {
+            for (int i = 0; i < f.latent; ++i) { require(std::isfinite(got[size_t(t) * f.latent + i]), "non-finite lane output"); }
+            lanes = std::max(lanes, token_nmse(got.data() + size_t(t) * f.latent, expected.data() + size_t(t) * f.latent, f.latent));
+        }
+        worst = std::max(worst, lanes);
+        const uint64_t moved = gs.gpu_transient_experts + gs.gpu_ssd_transient_experts;
+        std::printf("[kimi_vram_group_lane] tokens=%d residents=%llu moved=%llu (ram %llu ssd %llu) cpu_ssd=%llu "
+            "lanes_worst_token_nmse=%.3g\n", tokens, (unsigned long long) gs.gpu_experts, (unsigned long long) moved,
+            (unsigned long long) gs.gpu_transient_experts, (unsigned long long) gs.gpu_ssd_transient_experts,
+            (unsigned long long) gs.ssd_experts, lanes);
+        require(lanes <= 1.5e-3, "the tier's lane is more than 1.5e-3 from the CPU lane");
+        require(gs.gpu_experts > 0, "the residents did not compute on the GPU");
+        if (tokens > 1) { require(moved > 0, "no transient moved at a cheap GPU"); }
+        require(gs.stream.pending_reads == 0, "the lane returned with live reads");
+        checks += 4;
+    }
+    unsetenv("GGML_KIMI_CPU_PREFILL_COST");
+    setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "0", 1);
+}
+
+// least-squares line y = a + b x with both terms >= 0 (the engine's start values take no negative term): a line
+// through the origin where the intercept would be negative, a constant where the slope would
 void fit(const std::vector<double> & x, const std::vector<double> & y, double & a, double & b) {
     const double n = double(x.size());
     double sx = 0, sy = 0, sxx = 0, sxy = 0;
     for (size_t i = 0; i < x.size(); ++i) { sx += x[i]; sy += y[i]; sxx += x[i] * x[i]; sxy += x[i] * y[i]; }
     b = (n * sxy - sx * sy) / (n * sxx - sx * sx);
     a = (sy - b * sx) / n;
+    if (a < 0) { a = 0; b = sxx > 0 ? sxy / sxx : 0; }
+    else if (b < 0) { b = 0; a = sy / n; }
 }
 
 std::vector<int> parse_counts(const std::string & s) {
@@ -603,7 +706,7 @@ struct gpu_lane {
         }
         const float * rows = nullptr;
         vram_group_layer_stats stats = {};
-        engine->check(api->finish_layer(engine->p, &rows, &stats, error, sizeof(error)), error);
+        engine->check(api->finish_layer(engine->p, &rows, &stats, nullptr, error, sizeof(error)), error);
         return stats.us / stats.experts;
     }
     // the mean of a second layer at each count (the first warms up)
@@ -819,9 +922,11 @@ int main(int argc, char ** argv) {
             return 0;
         }
         size_t checks = 0;
-        double worst = 0.0;
+        double worst = 0.0, lane_worst = 0.0;
         run_numerics(checks, worst);
-        std::printf("KIMI_VRAM_GROUP_PASS checks=%zu worst_token_nmse_against_exact=%.3g\n", checks, worst);
+        run_tier_lane(checks, lane_worst);
+        std::printf("KIMI_VRAM_GROUP_PASS checks=%zu worst_token_nmse_against_exact=%.3g lane_against_cpu=%.3g\n", checks,
+            worst, lane_worst);
         return 0;
     } catch (const std::exception & e) {
         std::fprintf(stderr, "KIMI_VRAM_GROUP_FAIL: %s\n", e.what());

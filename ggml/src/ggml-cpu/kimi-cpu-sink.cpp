@@ -1792,6 +1792,9 @@ struct kimi_cpu_sink {
     std::mutex run_mutex;
     sink_ring ring;
     std::vector<sink_slot> slots;
+    // The read ring's buffers page-locked for the GPU tier's copies (ring_lock, kimi-host-lock.h): once per
+    // allocation, undone before the buffers are reallocated or freed.
+    kimi_ring_lock ring_pages;
     std::vector<sink_prefill_staging> prefill_ssd_staging;
     std::vector<sink_request> requests;
     std::vector<size_t> io_requests;
@@ -1934,6 +1937,7 @@ struct kimi_cpu_sink {
         std::vector<uint8_t> gpu;          // per request: the GPU computes it
         double predicted_us = 0, cpu_only_us = 0;
         size_t residents = 0, ram = 0, misses = 0, candidates = 0, moves = 0, locked = 0;
+        size_t pending = 0, pending_moves = 0; // RAM hits a prefetch still read at the plan, and of them those moved
         sink_clock::time_point start;      // the layer's reads are issued
     } plan;
     // Decode's lines beyond the CPU's time per expert and the tier's: the drive per layer (read time against MB, the
@@ -1953,6 +1957,7 @@ struct kimi_cpu_sink {
     // error of the predicted lanes' time against the measured one, in 1% bins (the last bin is 100% and more).
     struct decode_place_stats {
         uint64_t layers = 0, tokens = 0, gpu_experts = 0, refused = 0, moves_planned = 0, candidates = 0, wanted = 0;
+        uint64_t pending = 0, pending_moves = 0;
         uint64_t last_token = UINT64_MAX;
         std::array<uint64_t, 101> error = {};
         double predicted_us = 0, measured_us = 0, cpu_only_us = 0;
@@ -2551,6 +2556,7 @@ struct kimi_cpu_sink {
         cache.before_unmap = nullptr;
         cache.before_release = nullptr; // vram is destroyed before cache
         stop_threads();
+        ring_unlock(); // the tier is still here, and the ring's buffers too
         // Explicit unregister is synchronous. Do this before member destruction
         // frees slots; closing only in sink_ring's destructor would be too late.
         ring.close_ring();
@@ -2847,15 +2853,77 @@ struct kimi_cpu_sink {
                 before, cache.enabled_slots(), (unsigned long long) (committed - std::min(committed, cache.stats.committed_bytes)));
         return fits;
     }
-    // The layer's plan, once its reads are issued. Lanes (kimi_place_ring_time): the CPU at the measured time per
-    // decode expert, of which the up/gate share may start once an expert's first two roles are in; the tier's
-    // residents' call, then host calls (its measured lines); on a discrete GPU each moved expert's copy at the measured
-    // page-locked rate, behind the copies already queued; the reads landing in issue order (role-major) on the drive's
-    // decode line. Candidates: host-ready RAM hits, then misses by landing; on a discrete GPU only experts whose RAM
-    // slot is page-locked and that have a device target (their admission reservation, else one of the tier's free
-    // scratch slots). The choice: the fewest moves with the lowest
-    // predicted time (kimi_place_ring_best_prefix, the list schedule's choice for prefill too). A RAM hit the plan
-    // would have moved had its slot been page-locked goes to the front of the registrar's queue.
+    // The cost table a layer of `ntokens` tokens is placed from (kimi-prefill-cost.h, kimi_place_table), the same for a
+    // decode token and a grouped-prefill pass: the CPU's time for a one-token expert (decode's experts and a one-token
+    // pass's, their running mean) and the grouped path's line (the sink's prefill calibration); the tier's
+    // vector-engine lines and copy rates (host API costs2: every call and copy it makes); the batched engine's lines
+    // (the prefill calibration); the drive's line over decode's last 64 layers with reads and the last pass's layers.
+    // route_bytes: what the pass's engine sends over the link for a GPU route (its lane: the batched engine's route
+    // list, the hand engine's input row a route; a token's input row is in the batched engine's time a token). A
+    // page-locked copy is priced only once the tier has measured one; a pageable one, and the rows, at the start
+    // values until then. In place: wherever the GPU reads host memory so for one token (decode's rule), and for a
+    // longer pass where its engine can (the batched engine), the evaluator then choosing per layer.
+    kimi_place_table place_table(int ntokens, double route_bytes = 0.0) {
+        kimi_place_table t;
+        const auto & s = vram.cost;
+        t.cpu_fixed_us = s.cpu_fixed_us; t.cpu_route_us = s.cpu_route_us;
+        t.cpu_one_us = cpu_expert_us > 0 ? cpu_expert_us : s.cpu_fixed_us + s.cpu_route_us;
+        t.cpu_early = std::clamp(decode_lines.early, 0.0, 1.0);
+        t.cpu_moved = decode_lines.cpu_moved();
+        kimi_vram_host_costs c = {};
+        if (vram.context && vram.host_api) { vram.host_api->costs2(vram.context, &c); }
+        t.vector.device = { c.resident_call_us, c.resident_expert_us, 0.0 };
+        t.vector.moved = { c.host_call_us > 0 ? c.host_call_us : c.resident_call_us,
+            c.host_expert_us > 0 ? c.host_expert_us : c.resident_expert_us, 0.0 };
+        t.vector_tokens = c.vector_tokens > 0 ? c.vector_tokens : 1;
+        t.batched.device = { 0.0, s.gpu_fixed_us, s.gpu_route_us };
+        if (s.gpu_host_fixed_us > 0 || s.gpu_host_route_us > 0) { t.batched.moved = { 0.0, s.gpu_host_fixed_us, s.gpu_host_route_us }; }
+        t.locked_us_per_mb = c.copy_us_per_mb;
+        const double rows_us_per_mb = c.copy_us_per_mb > 0 ? c.copy_us_per_mb : 1e3 / s.link_gbps;
+        t.pageable_us_per_mb = c.pageable_us_per_mb > 0 ? c.pageable_us_per_mb :
+            1e3 / (s.pageable_gbps > 0 ? s.pageable_gbps : s.link_gbps);
+        t.link_busy_us = c.link_busy_us;
+        t.in_place = c.in_place != 0 && (t.one(ntokens) ||
+            (vram.prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_BATCHED && vram.prefill_lane.in_place));
+        t.route_us = t.one(ntokens) ? 0.0 : route_bytes / 1e6 * rows_us_per_mb;
+        t.token_us = s.gpu_token_us >= 0 ? s.gpu_token_us : double(latent) * sizeof(float) / 1e6 * rows_us_per_mb;
+        // the drive: one line through decode's layers and prefill's, from the start values' shape (else decode's
+        // running rate, else a line through the origin) scaled to the samples
+        kimi_prefill_fit drive;
+        for (const auto & x : decode_lines.reads) { drive.add(x.first, x.second); }
+        vram.prefill_reads(drive);
+        double fixed = s.drive_fixed_us, slope = s.drive_gbps > 0 ? 1e3 / s.drive_gbps :
+            decode_read_bytes_per_us > 0 ? 1e6 / decode_read_bytes_per_us : 0.0;
+        if (drive.n > 0) { kimi_prefill_fit_line(drive, s.drive_fixed_us, slope > 0 ? slope : 1.0, fixed, slope); }
+        t.drive_fixed_us = fixed; t.drive_us_per_mb = slope;
+        return t;
+    }
+    // For the decode plan: the MB still to land of each request whose RAM hit a prefetch still reads (the roles not
+    // read yet, taken in their read order; a role being read counts whole), 0 for every other request.
+    std::vector<double> prefetch_pending_mb() {
+        std::vector<double> mb(requests.size(), 0.0);
+        if (prefetch.pending.empty()) { return mb; }
+        std::lock_guard<std::mutex> lock(prefetch.mutex);
+        for (const auto & p : prefetch.pending) {
+            const prefetch_job & job = *p.second;
+            if (job.state.load() != 0) { continue; }
+            uint64_t bytes = 0;
+            for (int role = std::max(0, job.done); role < 3; ++role) { bytes += job.role[role].nbytes; }
+            for (size_t i = 0; i < requests.size(); ++i) {
+                if (requests[i].cache_hit == p.first) { mb[i] = double(bytes) / 1e6; }
+            }
+        }
+        return mb;
+    }
+    // The layer's plan, once its reads are issued: the cost table's choice for a one-token layer (place_table,
+    // kimi_place_layer), the experts as grouped prefill describes its own (sink_vram::place_items). Every expert the
+    // GPU could take this layer is a candidate, priced with when its bytes are in host memory: a RAM hit at once, one
+    // its prefetch still reads at that read's landing (its rest is read at once when the layer starts, ahead of the
+    // layer's reads), a miss at its own; the executor hands a planned expert to the GPU once it has landed
+    // (run_nonblocking_down_schedule). On a discrete GPU only from page-locked memory (the RAM slot, or the ring once
+    // registered) at a measured copy rate, and with a device target (the expert's admission reservation, else one of
+    // the tier's free scratch slots). A RAM hit the plan would have moved had its slot been page-locked goes to the
+    // front of the registrar's queue.
     void plan_decode_layer() {
         plan.valid = false;
         plan.gpu.assign(requests.size(), 0);
@@ -2865,81 +2933,34 @@ struct kimi_cpu_sink {
         vram.host_api->costs2(vram.context, &c);
         const bool in_place = c.in_place != 0;
         if (!in_place) { host_lock_decide(); }
-        // On a discrete GPU an expert can move only from a page-locked slot, and only once a page-locked copy has been
-        // measured (the first page-locked slots' admissions and copies measure it).
-        const bool copies = !in_place && host_lock.enabled && c.copy_us_per_mb > 0;
         if (!in_place && !host_lock.enabled) { return; }
-        double d0 = 0, us_per_mb = decode_read_bytes_per_us > 0 ? 1e6 / decode_read_bytes_per_us : 0;
-        if (decode_lines.reads.size() >= 2 && us_per_mb > 0) {
-            kimi_prefill_fit fit;
-            for (const auto & x : decode_lines.reads) { fit.add(x.first, x.second); }
-            kimi_prefill_fit_line(fit, 0.0, us_per_mb, d0, us_per_mb);
-        }
-        const double cpu = cpu_expert_us, early = std::clamp(decode_lines.early, 0.0, 1.0) * cpu_expert_us;
-        const double resident_b = c.resident_expert_us, host_b = c.host_expert_us > 0 ? c.host_expert_us : c.resident_expert_us;
-        auto bytes = [&](const sink_request & r, int role) { return double(r.role[role].nbytes); };
-        auto expert_mb = [&](const sink_request & r) { return (bytes(r, 0) + bytes(r, 1) + bytes(r, 2)) / 1e6; };
-        std::vector<double> gate_land(requests.size(), 0.0), down_land(requests.size(), 0.0);
-        double mb = 0, reads_end = 0;
-        for (size_t i : io_requests) { mb += (bytes(requests[i], 0) + bytes(requests[i], 1)) / 1e6; gate_land[i] = d0 + mb * us_per_mb; }
-        for (size_t i : io_requests) { mb += bytes(requests[i], 2) / 1e6; down_land[i] = d0 + mb * us_per_mb; }
-        if (!io_requests.empty()) { reads_end = d0 + mb * us_per_mb; }
-        std::vector<kimi_place_expert> experts(requests.size());
-        std::vector<size_t> hits, misses, unlocked;
-        std::vector<uint8_t> locked;
-        if (!in_place) { locked = host_lock.snapshot(); }
-        plan.residents = plan.ram = plan.misses = plan.locked = 0;
+        auto reserved = [&](size_t i) { return i < 64 && ((c.reserved_rows >> i) & 1u); };
+        auto items = vram.place_items(requests, [&](size_t i) { return requests[i].cache_only ? 0 : 1; },
+            [](size_t) { return true; }, [&](size_t i) { return !reserved(i); });
+        const auto pending = prefetch_pending_mb();
+        plan.residents = plan.ram = plan.misses = plan.locked = plan.pending = plan.pending_moves = 0;
         for (size_t i = 0; i < requests.size(); ++i) {
-            const auto & r = requests[i];
-            auto & x = experts[i];
-            if (r.vram_slot >= 0) { x.resident = true; x.gpu = resident_b; ++plan.residents; continue; }
-            if (r.cache_only) { continue; }
-            x.cpu = cpu; x.early = early; x.gpu = host_b;
-            x.link = in_place ? 0.0 : expert_mb(r) * c.copy_us_per_mb;
-            if (r.cache_hit >= 0) {
-                ++plan.ram;
-                if (prefetch_hit_state(r.cache_hit) != 1) { continue; } // still reading: the CPU's, whenever it lands
-                const bool page_locked = size_t(r.cache_hit) < locked.size() && locked[size_t(r.cache_hit)];
-                plan.locked += page_locked;
-                if (in_place || (page_locked && copies)) { hits.push_back(i); }
-                else if (!page_locked) { unlocked.push_back(i); }
-                continue;
+            auto & x = items[i];
+            if (x.resident) { ++plan.residents; continue; }
+            if (requests[i].cache_only) { continue; }
+            if (!x.read) {
+                ++plan.ram; plan.locked += x.movable && x.locked;
+                x.pending_mb = pending[i];
+                plan.pending += pending[i] > 0.0;
+            } else {
+                ++plan.misses;
             }
-            ++plan.misses;
-            x.early_ready = gate_land[i]; x.ready = down_land[i];
-            const bool page_locked = r.cache_admit >= 0 && size_t(r.cache_admit) < locked.size() && locked[size_t(r.cache_admit)];
-            if (in_place || (page_locked && copies)) { misses.push_back(i); }
         }
-        std::stable_sort(misses.begin(), misses.end(), [&](size_t a, size_t b) { return down_land[a] < down_land[b]; });
-        // On a discrete GPU a moved expert needs a device target: its admission reservation, else a scratch slot.
-        auto targets = [&](std::vector<size_t> & list) {
-            if (in_place) { return; }
-            size_t scratch = size_t(std::max(0, c.slots));
-            std::vector<size_t> kept;
-            for (size_t i : list) {
-                if (i < 64 && (c.reserved_rows >> i) & 1u) { kept.push_back(i); }
-                else if (scratch) { --scratch; kept.push_back(i); }
-            }
-            list.swap(kept);
-        };
-        std::vector<size_t> candidates(hits);
-        candidates.insert(candidates.end(), misses.begin(), misses.end());
-        targets(candidates);
-        kimi_place_lanes lanes = {};
-        lanes.resident_call = c.resident_call_us;
-        lanes.host_call = c.host_call_us > 0 ? c.host_call_us : c.resident_call_us;
-        lanes.reads_end = reads_end;
-        lanes.link_free = c.link_busy_us;
-        lanes.cpu_moved = decode_lines.cpu_moved();
-        double time = 0;
-        const size_t moves = kimi_place_ring_best_prefix(lanes, experts.data(), experts.size(), candidates.data(),
-            candidates.size(), &time);
-        for (size_t k = 0; k < moves; ++k) { plan.gpu[candidates[k]] = 1; }
-        std::vector<uint8_t> none(requests.size(), 0);
-        plan.cpu_only_us = kimi_place_ring_time(lanes, experts.data(), experts.size(), none.data());
-        plan.predicted_us = time;
-        plan.candidates = candidates.size();
-        plan.moves = moves;
+        kimi_place_limits limits;
+        limits.slots = size_t(std::max(0, c.slots));
+        const kimi_place_table table = place_table(1);
+        const auto placed = kimi_place_layer(table, 1, slots.size(), items.data(), items.size(), limits);
+        plan.gpu = placed.gpu;
+        for (size_t i : placed.moved) { plan.pending_moves += items[i].pending_mb > 0.0; }
+        plan.cpu_only_us = placed.time_none;
+        plan.predicted_us = placed.time;
+        plan.candidates = placed.candidates;
+        plan.moves = placed.moved.size();
         plan.valid = true;
         // Page-locking a slot is bought once, the move it allows pays per use: rent or buy (kimi_host_lock::missed). The
         // plan prices the moves it would make were the unlocked RAM hits' slots page-locked; each such slot accrues its
@@ -2949,24 +2970,30 @@ struct kimi_cpu_sink {
         // from is locked, whose registration measures the copy (the tier times one copy of the first range). On 125 a
         // registration in the server takes 2-8 ms against a move's 0.1-0.4 ms: only slots the plan keeps wanting are
         // locked, and a short decode locks few.
-        if (!in_place && !unlocked.empty()) {
-            std::vector<size_t> all(hits);
-            all.insert(all.end(), unlocked.begin(), unlocked.end());
-            targets(all);
-            double would_time = 0;
-            const size_t would = kimi_place_ring_best_prefix(lanes, experts.data(), experts.size(), all.data(), all.size(), &would_time);
-            std::vector<size_t> missed;
-            std::vector<uint64_t> occupants;
-            for (size_t k = 0; k < would; ++k) {
-                if (std::find(unlocked.begin(), unlocked.end(), all[k]) == unlocked.end()) { continue; }
-                const size_t entry = size_t(requests[all[k]].cache_hit);
-                missed.push_back(entry);
-                const auto & e = cache.entries[entry];
-                occupants.push_back(uint64_t(e.layer_index) << 32 | uint32_t(e.id));
-            }
-            place.wanted += host_lock.missed(missed, occupants, time - would_time, double(cache.stride) / 13600.0,
-                cache.entries.size(), c.copy_us_per_mb > 0);
+        if (in_place) { return; }
+        std::vector<size_t> unlocked;
+        auto would = items;
+        for (size_t i = 0; i < requests.size(); ++i) {
+            auto & x = would[i];
+            if (x.resident || x.routes <= 0) { continue; }
+            if (x.read) { x.movable = false; continue; }     // the RAM hits alone, page-locked or not
+            if (x.movable && !x.locked) { x.locked = true; unlocked.push_back(i); }
         }
+        if (unlocked.empty()) { return; }
+        kimi_place_table free_copy = table;
+        if (!(free_copy.locked_us_per_mb > 0)) { free_copy.locked_us_per_mb = 1e-12; }
+        const auto alt = kimi_place_layer(free_copy, 1, slots.size(), would.data(), would.size(), limits);
+        std::vector<size_t> missed;
+        std::vector<uint64_t> occupants;
+        for (size_t i : alt.moved) {
+            if (std::find(unlocked.begin(), unlocked.end(), i) == unlocked.end()) { continue; }
+            const size_t entry = size_t(requests[i].cache_hit);
+            missed.push_back(entry);
+            const auto & e = cache.entries[entry];
+            occupants.push_back(uint64_t(e.layer_index) << 32 | uint32_t(e.id));
+        }
+        place.wanted += host_lock.missed(missed, occupants, placed.time - alt.time, double(cache.stride) / 13600.0,
+            cache.entries.size(), c.copy_us_per_mb > 0);
     }
     // After the layer: its measured lanes' time (reads issued to the tier's finish) against the plan's, the drive's
     // and the layer's fixed time as samples, the receipts.
@@ -2982,6 +3009,7 @@ struct kimi_cpu_sink {
         if (vram.token != place.last_token) { ++place.tokens; place.last_token = vram.token; }
         place.moves_planned += plan.moves;
         place.candidates += plan.candidates;
+        place.pending += plan.pending; place.pending_moves += plan.pending_moves;
         place.predicted_us += plan.predicted_us; place.measured_us += lanes_us; place.cpu_only_us += plan.cpu_only_us;
         if (lanes_us > 0) {
             const double error = std::fabs(plan.predicted_us - lanes_us) / lanes_us;
@@ -2989,10 +3017,11 @@ struct kimi_cpu_sink {
         }
         if (profile_enabled) {
             std::fprintf(stderr, "[kimi_decode_place] token=%llu layer=%d resident=%zu ram=%zu miss=%zu locked=%zu candidates=%zu "
-                "planned=%zu predicted_us=%.1f cpu_only_us=%.1f measured_us=%.1f fixed_us=%.1f total_us=%.1f\n",
+                "planned=%zu predicted_us=%.1f cpu_only_us=%.1f measured_us=%.1f fixed_us=%.1f total_us=%.1f pending=%zu "
+                "pending_planned=%zu\n",
                 (unsigned long long) vram.token, vram.requests.empty() ? -1 : vram.requests[0].layer,
                 plan.residents, plan.ram, plan.misses, plan.locked, plan.candidates, plan.moves, plan.predicted_us,
-                plan.cpu_only_us, lanes_us, fixed, total_us);
+                plan.cpu_only_us, lanes_us, fixed, total_us, plan.pending, plan.pending_moves);
         }
     }
     void place_report(const char * reason) {
@@ -3005,13 +3034,48 @@ struct kimi_cpu_sink {
         };
         std::fprintf(stderr, "[kimi_decode_place] reason=%s layers=%llu tokens=%llu gpu_experts=%llu gpu_per_token=%.2f planned=%llu "
             "candidates=%llu refused=%llu wanted=%llu error_p50_pct=%.0f error_p90_pct=%.0f predicted_ms=%.1f measured_ms=%.1f cpu_only_ms=%.1f "
-            "cpu_expert_us=%.1f early=%.3f fixed_us=%.1f decode_read_gbs=%.2f cpu_alone_us=%.1f cpu_shared_us=%.1f cpu_moved=%.3f\n",
+            "cpu_expert_us=%.1f early=%.3f fixed_us=%.1f decode_read_gbs=%.2f cpu_alone_us=%.1f cpu_shared_us=%.1f cpu_moved=%.3f "
+            "pending=%llu pending_planned=%llu\n",
             reason, (unsigned long long) place.layers, (unsigned long long) place.tokens, (unsigned long long) place.gpu_experts,
             place.tokens ? double(place.gpu_experts) / double(place.tokens) : 0.0, (unsigned long long) place.moves_planned,
             (unsigned long long) place.candidates, (unsigned long long) place.refused, (unsigned long long) place.wanted,
             quantile(0.5), quantile(0.9), place.predicted_us / 1e3, place.measured_us / 1e3, place.cpu_only_us / 1e3,
             cpu_expert_us, decode_lines.early, decode_lines.fixed_us, decode_read_bytes_per_us / 1e3, decode_lines.cpu_alone_us,
-            decode_lines.cpu_shared_us, decode_lines.cpu_moved());
+            decode_lines.cpu_shared_us, decode_lines.cpu_moved(), (unsigned long long) place.pending,
+            (unsigned long long) place.pending_moves);
+    }
+    // B3: the read ring page-locked when a GPU lane copies from it (a grouped-prefill tier with transient device slots
+    // on a GPU that does not read host memory in place). A streamed transient's upload is then DMA on the tier's upload
+    // stream, which returns at once: the next upload overlaps the current computation, and the cost table prices the
+    // copy on the link (kimi_place_layer). Each role buffer is one range, registered once per allocation of the ring, at
+    // a quiescent point (a prefill layer before its reads and its launch; about 1.1-1.9 ms per 19-30 MB buffer, holding
+    // the driver), and unregistered before the ring reallocates or frees it (reserve_ring, the destructor). A refused
+    // registration leaves the ring pageable and is not retried before the next allocation.
+    void ring_lock() {
+        if (ring_pages.tried || !vram.context || !vram.prefill_enabled || !vram.host_api || !vram.prefill_api ||
+                !vram.prefill_api->transient_available(vram.context) || slots.empty()) { return; }
+        kimi_vram_host_costs c = {};
+        vram.host_api->costs2(vram.context, &c);
+        if (c.in_place) { return; }  // the GPU reads the ring in place: nothing to page-lock
+        if (!ring_pages.lock_pages) {
+            ring_pages.lock_pages = [this](const void * p, size_t bytes, std::string * why) { return vram.register_host(p, bytes, why); };
+            ring_pages.unlock_pages = [this](const void * p) { return vram.unregister_host(p); };
+        }
+        std::vector<std::pair<const void *, size_t>> buffers;
+        size_t bytes = 0;
+        for (const auto & slot : slots) {
+            for (const auto & buffer : slot.role) { buffers.push_back({ buffer.data, buffer.size }); bytes += buffer.size; }
+        }
+        const auto start = sink_clock::now();
+        std::string why;
+        vram.ring_locked = ring_pages.lock(buffers, &why);
+        std::fprintf(stderr, "[kimi_cpu_sink_io] ring_locked=%d ranges=%zu bytes=%zu us=%.0f%s%s\n", int(vram.ring_locked),
+            ring_pages.ranges.size(), vram.ring_locked ? bytes : size_t(0), elapsed_us(start), why.empty() ? "" : " reason=",
+            why.c_str());
+    }
+    void ring_unlock() {
+        if (ring_pages.unlock_pages) { ring_pages.unlock(); }
+        vram.ring_locked = false;
     }
     // Whether the registrar runs: a GPU tier whose host path copies (not in place), the host path on
     // (GGML_KIMI_CPU_SINK_HOST_GPU), a page-aligned slot stride, a mapped arena. Decided once the arena exists.
@@ -3546,7 +3610,7 @@ struct kimi_cpu_sink {
         }
         // Serialized runs drain previous consumers before reusing these slots.
         if (ring.pending) { throw std::runtime_error("CPU sink reserve with pending ring I/O"); }
-        if (needs_resize) { ring.unregister_buffers(); }
+        if (needs_resize) { ring.unregister_buffers(); ring_unlock(); }
         for (auto & slot : slots) {
             for (int role = 0; role < 3; ++role) {
                 slot.role[role].reserve(max_bytes[role]);
@@ -4043,16 +4107,6 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
     sink->current = {};
     sink->requests.clear();
     sink->begin_observation(up, false);
-    // The tier's grouped API reduces routed outputs before returning them. A
-    // per-expert normalization must happen before that reduction, so retain
-    // native CPU grouped computation for that capability, even when the caller
-    // enables GPU prefill globally. Decode's per-expert tier API remains usable.
-    struct restore_prefill_flag {
-        bool & flag;
-        bool saved;
-        ~restore_prefill_flag() { flag = saved; }
-    } restore { sink->vram.prefill_enabled, sink->vram.prefill_enabled };
-    if (batch && batch->activation.post_exp_norm) { sink->vram.prefill_enabled = false; }
     try {
         sink_caller_affinity affinity(sink->compute_cpus);
         // The default remains ring-only. CACHE_PREFILL_READ may borrow retained
@@ -4094,6 +4148,9 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
             throw std::runtime_error("CPU expert stream requires nonnegative expert IDs");
         }
         std::vector<size_t> ssd_transient_requests;
+        // A GPU route's activation rows over the link: one row of the engine's input type, its token index and weight
+        // (set once prepare_prefill has seen the layer's format).
+        double route_bytes = 0.0;
         // Set once prepare_prefill has seen this layer's format: before it, the first MXFP4 call of a
         // process would still see no format and stage its transients the Q2 way.
         bool streaming_ssd = false;
@@ -4126,9 +4183,17 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
             std::vector<int32_t> vram_layers;
             vram_layers.reserve(sink->cache.layers.size());
             for (const auto & layer : sink->cache.layers) { vram_layers.push_back(layer.id); }
-            batch->gpu_experts = sink->vram.prepare_prefill(
-                sink->requests, up, down, sink->latent, sink->hidden, vram_layers);
-            streaming_ssd = sink->vram.format_mxfp4_input && sink->vram.mxfp4_batch_enabled;
+            // Kimi-K3's Q3_K SiTU experts keep the tier's transport ABI 2 (no grouped prefill); a per-expert post norm
+            // (Muse) is applied by the batched engine and by a one-token pass's vector path, per expert before the sum
+            const bool legacy = up->type == GGML_TYPE_Q3_K && down->type == GGML_TYPE_Q3_K &&
+                batch->activation.kind == KIMI_CPU_SINK_ACTIVATION_SITU;
+            batch->gpu_experts = sink->vram.prepare_prefill(sink->requests, up, down, sink->latent, sink->hidden,
+                vram_layers, batch->ntokens, batch->activation.post_exp_norm != nullptr, legacy);
+            // the batched lanes stream their SSD transients through the ring (MXFP4's hand engine, the batched engine)
+            streaming_ssd = sink->vram.prefill_batched;
+            route_bytes = double(sink->vram.prefill_lane.route_bytes);
+            // no read of this layer has started and the tier is idle: a quiescent point to page-lock the ring
+            if (streaming_ssd) { sink->ring_lock(); }
             if (batch->gpu_experts) {
                 const size_t route_count = size_t(batch->nslots) * size_t(batch->ntokens);
                 for (size_t route = 0; route < route_count; ++route) {
@@ -4143,9 +4208,9 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
             // RAM entry, then O_DIRECT. This lookup does not train or admit the
             // decode cache and an SSD miss never receives a duplicate RAM slot.
             sink->cache.prepare_prefill_read(sink->requests, up, gate, down, sink->current);
-            // Streamed MXFP4 transients hold a ring slot and a device slot each, whatever their number, so
-            // only the optional cap limits them; Q2 staging owns one host buffer per transient.
-            const int streaming_cap = sink->vram.mxfp4_prefill_ssd_gpu_max_experts_per_layer;
+            // Streamed transients hold a ring slot and a device slot each (in place, a ring slot alone), whatever their
+            // number, so only the optional cap limits them; Q2 staging owns one host buffer per transient.
+            const int streaming_cap = sink->vram.prefill_ssd_gpu_max_experts_per_layer;
             const size_t staging_limit = !streaming_ssd ? sink->slots.size() :
                 streaming_cap < 0 ? sink->requests.size() : size_t(streaming_cap);
             if (streaming_ssd) {
@@ -4154,7 +4219,8 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
                     staging_limit, sink->slots.size());
             }
             sink->vram.select_prefill_transient(
-                sink->requests, *batch, sink->cache, staging_limit, sink->slots.size());
+                sink->requests, *batch, sink->cache, staging_limit, sink->slots.size(),
+                sink->place_table(batch->ntokens, route_bytes));
 
             size_t ssd_transient_count = 0;
             for (const auto & request : sink->requests) {
@@ -4217,7 +4283,7 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
                     cpu_ssd_requests.push_back(i);
                 }
             }
-            if (streaming_ssd && !sink->vram.mxfp4_prefill_legacy_schedule) {
+            if (streaming_ssd && !sink->vram.prefill_legacy_schedule) {
                 // Issue the reads in the order the two consumers need them: by each expert's predicted start
                 // on its lane (the makespan rule's lane_start_us), so that both lanes run through the whole
                 // layer. Each consumer keeps its own order, so a ring credit is always returned by an earlier
@@ -4352,6 +4418,7 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
             }
             const double compute_us = elapsed_us(compute_start);
             sink->current.compute_us += compute_us;
+            // the grouped path's line, from the passes of the batched engine (a one-token pass is priced as decode)
             if (batch) { sink->vram.observe_prefill_cpu(request.prefill_routes, compute_us); }
             if (sink->profile_enabled) { sink->current.compute_cpu_us += sink_thread_cpu_us() - cpu_start; }
             // A cold admission copies synchronously before this O_DIRECT ring
@@ -4378,7 +4445,8 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
         }
         if (batch) {
             sink->vram.calibrate_prefill(sink->current.compute_us, *batch, sink->current.read_bytes,
-                sink->current.io_us - sink->current.io_credit_wait_us, elapsed_us(start));
+                sink->current.io_us - sink->current.io_credit_wait_us, elapsed_us(start),
+                [&] { return sink->place_table(batch->ntokens, route_bytes); });
         }
         if (!sink->requests.empty()) {
             const auto & r = sink->requests.front();
@@ -4394,7 +4462,8 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
                 "ram_gpu_experts=%llu ram_gpu_routes=%llu ram_gpu_upload_bytes=%llu ram_gpu_upload_us=%.3f "
                 "ssd_gpu_candidates=%llu ssd_gpu_experts=%llu ssd_gpu_routes=%llu "
                 "ssd_gpu_upload_bytes=%llu ssd_gpu_upload_us=%.3f gpu_worker_us=%.3f "
-                "gpu_expert_us=%.3f gpu_read_wait_us=%.3f cold_admit_candidates=%llu cold_admit_experts=%llu "
+                "gpu_expert_us=%.3f gpu_read_wait_us=%.3f gpu_dma_us=%.3f gpu_upload_wait_us=%.3f ring_locked=%d "
+                "cold_admit_candidates=%llu cold_admit_experts=%llu "
                 "cold_admit_routes=%llu cold_admit_upload_bytes=%llu cold_admit_upload_us=%.3f "
                 "ram_experts=%llu ram_routes=%llu ram_bytes=%llu "
                 "ssd_experts=%llu ssd_routes=%llu ssd_bytes=%llu ssd_read_us=%.1f\n",
@@ -4409,7 +4478,8 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
                 (unsigned long long) batch->gpu_ssd_transient_routes,
                 (unsigned long long) batch->gpu_ssd_transient_upload_bytes,
                 batch->gpu_ssd_transient_upload_us,batch->gpu_worker_us,
-                batch->gpu_expert_us,batch->gpu_read_wait_us,
+                batch->gpu_expert_us,batch->gpu_read_wait_us,sink->vram.prefill_stats.transient_dma_us,
+                sink->vram.prefill_stats.transient_wait_us,int(sink->vram.ring_locked),
                 (unsigned long long) batch->gpu_cold_admit_candidates,
                 (unsigned long long) batch->gpu_cold_admit_experts,
                 (unsigned long long) batch->gpu_cold_admit_routes,

@@ -7,8 +7,16 @@
 #include "test-kimi-cpu-sink.cpp"
 #undef main
 #include "kimi-host-jobs-test.inc"
+#include <cuda_runtime.h>
 
 namespace {
+// Where the GPU reads pageable host memory in place (its page tables), the tier computes a prefill transient there, as
+// a decode host job, and uploads nothing; elsewhere it copies the expert into its scratch slot first.
+bool gpu_reads_host_in_place() {
+    int value = 0;
+    return cudaDeviceGetAttribute(&value, cudaDevAttrPageableMemoryAccessUsesHostPageTables, 0) == cudaSuccess && value;
+}
+
 double relative_l2(const std::vector<float> & got, const std::vector<float> & expected) {
     double error = 0.0;
     double norm = 0.0;
@@ -201,7 +209,8 @@ void run_ram_prefill_scheduler(size_t & checks, double & worst_rel) {
     const double rel = relative_l2(actual, expected);
     worst_rel = std::max(worst_rel, rel);
     require(rel <= 2e-2 && gpu_stats.gpu_transient_experts == 1 &&
-        gpu_stats.gpu_transient_routes == tokens && gpu_stats.gpu_transient_upload_bytes == unit &&
+        gpu_stats.gpu_transient_routes == tokens &&
+        gpu_stats.gpu_transient_upload_bytes == (gpu_reads_host_in_place() ? 0 : unit) &&
         gpu_stats.ram_experts == 1 && gpu_stats.ram_routes == tokens &&
         gpu_stats.ssd_experts == 0 && gpu_stats.ssd_routes == 0 && gpu_stats.ssd_bytes == 0,
         "Q2 RAM-to-GPU grouped-prefill selection or result differs");
@@ -285,7 +294,7 @@ void run_ssd_prefill_scheduler(size_t & checks, double & worst_rel) {
     worst_rel = std::max(worst_rel, rel);
     require(rel <= 2e-2 && gpu_stats.gpu_ssd_transient_candidates == 1 &&
         gpu_stats.gpu_ssd_transient_experts == 1 && gpu_stats.gpu_ssd_transient_routes == tokens &&
-        gpu_stats.gpu_ssd_transient_upload_bytes == unit &&
+        gpu_stats.gpu_ssd_transient_upload_bytes == (gpu_reads_host_in_place() ? 0 : unit) &&
         gpu_stats.gpu_transient_experts == 0 && gpu_stats.ram_experts == 0 &&
         gpu_stats.ssd_experts == 1 && gpu_stats.ssd_routes == tokens && gpu_stats.ssd_bytes == unit,
         "Q2 SSD-to-GPU grouped-prefill selection, accounting, or result differs");

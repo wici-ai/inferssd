@@ -62,6 +62,14 @@ class Index(unittest.TestCase):
             expert_source.index(self.model, None, self.d)
         return json.load(open(f'{self.d}/experts.json'))
 
+    def test_the_lane_timings_arguments(self):
+        # the probe's lane timing at the experts' shape (up: latent x hidden) and each role's type
+        self.index()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            expert_source.lane_args(self.d)
+        self.assertEqual(out.getvalue().strip(), '--latent 512 --hidden 256 --up Q4_K --down Q4_K')
+
     def test_the_dense_weights_and_their_blocks(self):
         info = self.index()
         role = 1024 * 256 // 256 * 144                                  # the down slice: 147456 B

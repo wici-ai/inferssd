@@ -2,6 +2,7 @@
 // of the drive with the lanes, and the choice of the experts that move to the GPU.
 #include "kimi-prefill-cost.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -393,6 +394,442 @@ static void test_ring_prefix_fold() {
     std::printf("ring fold: %zu of %zu random prefill layers (%zu move experts)\n", same, total, moved);
 }
 
+
+// The GPU lane as a two-stage pipeline (B3): copies on the link into two device slots, computations on the GPU.
+static void test_pipeline() {
+    // link-bound (c < d): every copy back to back, the last computation after the last copy
+    const double c1[4] = { 300, 350, 320, 340 }, d1[4] = { 4400, 4400, 4400, 4400 };
+    check(kimi_place_pipeline(c1, d1, 4) == 4 * 4400.0 + 340, "link-bound pipeline: the copies and the last computation");
+    // compute-bound (c > d): the first copy, then every computation back to back
+    const double c2[4] = { 4000, 4100, 3900, 4050 }, d2[4] = { 2700, 2700, 2700, 2700 };
+    check(kimi_place_pipeline(c2, d2, 4) == 2700 + 4000 + 4100 + 3900 + 4050, "compute-bound pipeline");
+    // one slot: no overlap, the sum of both stages
+    check(kimi_place_pipeline(c2, d2, 4, 1) == 2700 * 4 + 4000 + 4100 + 3900 + 4050, "one slot: serial");
+    // in place (no copy): the computations alone
+    const double d0[4] = {};
+    check(kimi_place_pipeline(c1, d0, 4) == 300 + 350 + 320 + 340, "in place: compute only");
+    // Mixed stages, random: between the longer stage's sum and the serial sum; the streamed form's estimate, the longer
+    // sum plus min(c, d) of the first expert, is within one stage of the exact end.
+    uint64_t state = 99;
+    auto unit = [&] { state = state * 6364136223846793005ull + 1442695040888963407ull; return double(state >> 11) / double(1ull << 53); };
+    // Random layers: between the longer stage's sum and the serial sum. Where one stage is the longer of every pair
+    // (the runs: Muse's copies on 233 and 125 against its chain, DeepSeek's hand kernel against its copies), the
+    // streamed form's estimate, the longer sum plus min(c, d) of the first expert, is within one stage of the exact
+    // end; where they alternate the pipeline idles, and the estimate's shortfall is printed.
+    size_t bounded = 0, close = 0, total = 0;
+    double worst_mixed = 0;
+    for (int trial = 0; trial < 3000; ++trial) {
+        const size_t n = 1 + size_t(unit() * 200);
+        const int kind = trial % 3;               // 0: link-bound, 1: compute-bound, 2: mixed
+        std::vector<double> c(n), d(n);
+        double sc = 0, sd = 0, top = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double a = 100 + 2400 * unit(), b = 2600 + 2400 * unit();
+            c[i] = kind == 0 ? a : kind == 1 ? b : 100 + 4900 * unit();
+            d[i] = kind == 0 ? b : kind == 1 ? a : 100 + 4900 * unit();
+            sc += c[i]; sd += d[i]; top = std::max(top, std::max(c[i], d[i]));
+        }
+        const double exact = kimi_place_pipeline(c.data(), d.data(), n);
+        const double estimate = std::max(sc, sd) + std::min(c[0], d[0]);
+        bounded += exact >= std::max(sc, sd) - 1e-6 && exact <= sc + sd + 1e-6;
+        if (kind < 2) { close += std::fabs(exact - estimate) <= top + 1e-6; }
+        else { worst_mixed = std::max(worst_mixed, (exact - estimate) / exact); }
+        total += kind < 2;
+    }
+    check(bounded == 3000, "the pipeline lies between its longer stage and the serial sum");
+    check(close == total, "one stage longer for every pair: the streamed estimate is within one stage of the pipeline");
+    std::printf("pipeline: link-bound, compute-bound, serial, in place; %zu/3000 bounded, %zu/%zu estimates within a stage, "
+        "alternating stages: the estimate short by at most %.1f%%\n", bounded, close, total, 100 * worst_mixed);
+}
+
+// A table and a layer's items for the planner tests: 233-like DeepSeek terms (us; MB).
+static kimi_place_table table_233() {
+    kimi_place_table t;
+    t.cpu_one_us = 900; t.cpu_fixed_us = 520; t.cpu_route_us = 297; t.cpu_early = 0.65;
+    t.vector.device = { 150, 20, 0 }; t.vector.moved = { 150, 25, 0 };
+    t.batched.device = { 0, 60, 25 };
+    t.token_us = 7.0;
+    t.locked_us_per_mb = 1e3 / 6.91; t.pageable_us_per_mb = 1e3 / 5.83;
+    t.route_us = 5448e-6 * t.locked_us_per_mb;
+    t.drive_fixed_us = 12000; t.drive_us_per_mb = 1e3 / 7.0;
+    return t;
+}
+
+static std::vector<kimi_place_item> layer_items(uint64_t & state, size_t n, int ntokens, double resident_share,
+        double ram_share, bool locked_ring) {
+    auto unit = [&] { state = state * 6364136223846793005ull + 1442695040888963407ull; return double(state >> 11) / double(1ull << 53); };
+    std::vector<kimi_place_item> items(n);
+    for (auto & x : items) {
+        x.routes = ntokens == 1 ? 1 : 1 + int(ntokens * 0.1 * std::pow(unit(), 3.0));
+        x.mb = 18.8; x.mb_early = 12.5;
+        const double u = unit();
+        if (u < resident_share) { x.resident = true; continue; }
+        x.read = u >= resident_share + ram_share;
+        x.locked = x.read ? locked_ring : unit() < 0.3;
+        x.movable = true;
+    }
+    return items;
+}
+
+// One token: the vector engine, the one-token CPU time, page-locked copies only. The grouped path's lines and the
+// pageable rate do not change the answer; a pass of one token and a decode token of the same layer are the same call.
+static void test_place_one_token() {
+    uint64_t state = 31337;
+    size_t same = 0, no_pageable = 0, total = 0, moved = 0;
+    for (int trial = 0; trial < 2000; ++trial) {
+        auto t = table_233();
+        if (trial % 3 == 0) { t.locked_us_per_mb = 1e3 / 40.0; t.cpu_one_us = 470; }   // 125-like
+        if (trial % 3 == 1) { t.in_place = true; t.cpu_one_us = 1300; t.vector.moved = { 150, 219, 0 }; } // Spark-like
+        const auto items = layer_items(state, 1 + size_t(state % 16), 1, 0.4, 0.4, trial % 2 == 0);
+        const auto a = kimi_place_layer(t, 1, 8, items.data(), items.size());
+        auto u = t;
+        u.cpu_fixed_us *= 3; u.cpu_route_us *= 0.1; u.batched.device = { 0, 1, 1 }; u.batched.moved = { 0, 2, 2 };
+        u.token_us = 1000; u.pageable_us_per_mb = 1e-3; u.route_us = 1e3;
+        const auto b = kimi_place_layer(u, 1, 8, items.data(), items.size());
+        same += a.gpu == b.gpu && a.time == b.time && a.time_none == b.time_none;
+        bool pageable = false;
+        for (size_t i = 0; i < items.size(); ++i) { pageable = pageable || (a.gpu[i] && !items[i].locked && !t.in_place); }
+        no_pageable += !pageable;
+        moved += !a.moved.empty();
+        ++total;
+    }
+    check(same == total, "one token: only the vector engine's and the one-token CPU's lines count");
+    check(no_pageable == total, "one token: no pageable source moves");
+    std::printf("one token: %zu/%zu same answer under other grouped lines, %zu with moves\n", same, total, moved);
+}
+
+// The decode plan as it was built before the table (eb03f96..fed8444, kimi-cpu-sink.cpp plan_decode_layer), from the
+// same terms: the table's one-token answer is the same, bit for bit.
+static void test_place_decode_same() {
+    uint64_t state = 2718;
+    auto unit = [&] { state = state * 6364136223846793005ull + 1442695040888963407ull; return double(state >> 11) / double(1ull << 53); };
+    size_t same = 0, total = 0, moved = 0;
+    for (int trial = 0; trial < 3000; ++trial) {
+        const bool in_place = trial % 4 == 0;
+        const size_t n = 1 + size_t(unit() * 12);
+        const double cpu = 300 + 900 * unit(), early_share = 0.5 + 0.3 * unit();
+        const double resident_call = 100 + 100 * unit(), resident_b = 10 + 30 * unit();
+        const double host_call = unit() < 0.5 ? 0.0 : 100 + 100 * unit(), host_b = unit() < 0.5 ? 0.0 : 20 + 300 * unit();
+        const double copy_us_per_mb = in_place ? 0.0 : 10 + 150 * unit(), link_busy = unit() < 0.7 ? 0.0 : 2000 * unit();
+        const double d0 = unit() < 0.3 ? 0.0 : 500 * unit(), us_per_mb = 50 + 150 * unit();
+        const double cpu_moved = unit() < 0.5 ? 1.0 : 1.0 + unit();
+        const int scratch = int(unit() * 3);
+        std::vector<kimi_place_item> items(n);
+        std::vector<uint8_t> reserved(n, 0);
+        for (size_t i = 0; i < n; ++i) {
+            auto & x = items[i];
+            x.routes = 1; x.mb = 10 + 20 * unit(); x.mb_early = x.mb * 2 / 3;
+            const double u = unit();
+            if (u < 0.35) { x.resident = true; continue; }
+            x.read = u > 0.7;
+            x.locked = unit() < 0.6;
+            x.movable = x.read || unit() < 0.85;   // the caller's movable flag (the old plan's prefetch filter)
+            reserved[i] = unit() < 0.2;
+            x.needs_slot = !reserved[i];
+        }
+        // before: the list schedule's inputs as plan_decode_layer built them
+        std::vector<kimi_place_expert> e(n);
+        std::vector<double> gate_land(n, 0), down_land(n, 0);
+        double mb = 0, reads_end = 0;
+        bool any_read = false;
+        for (size_t i = 0; i < n; ++i) { if (!items[i].resident && items[i].read) { mb += items[i].mb_early; gate_land[i] = d0 + mb * us_per_mb; any_read = true; } }
+        for (size_t i = 0; i < n; ++i) { if (!items[i].resident && items[i].read) { mb += items[i].mb - items[i].mb_early; down_land[i] = d0 + mb * us_per_mb; } }
+        if (any_read) { reads_end = d0 + mb * us_per_mb; }
+        std::vector<size_t> hits, misses;
+        const double hb = host_b > 0 ? host_b : resident_b;
+        for (size_t i = 0; i < n; ++i) {
+            const auto & x = items[i];
+            auto & y = e[i];
+            if (x.resident) { y.resident = true; y.gpu = resident_b; continue; }
+            y.cpu = cpu; y.early = early_share * cpu; y.gpu = hb;
+            y.link = in_place ? 0.0 : x.mb * copy_us_per_mb;
+            if (!x.read) { if (x.movable && (in_place || x.locked)) { hits.push_back(i); } continue; }
+            y.early_ready = gate_land[i]; y.ready = down_land[i];
+            if (in_place || x.locked) { misses.push_back(i); }
+        }
+        std::stable_sort(misses.begin(), misses.end(), [&](size_t a, size_t b) { return down_land[a] < down_land[b]; });
+        std::vector<size_t> candidates(hits);
+        candidates.insert(candidates.end(), misses.begin(), misses.end());
+        if (!in_place) {
+            size_t left = size_t(scratch);
+            std::vector<size_t> kept;
+            for (size_t i : candidates) { if (reserved[i]) { kept.push_back(i); } else if (left) { --left; kept.push_back(i); } }
+            candidates.swap(kept);
+        }
+        kimi_place_lanes lanes = {};
+        lanes.resident_call = resident_call; lanes.host_call = host_call > 0 ? host_call : resident_call;
+        lanes.reads_end = reads_end; lanes.link_free = link_busy; lanes.cpu_moved = cpu_moved;
+        double t_old = 0;
+        const size_t k_old = kimi_place_ring_best_prefix(lanes, e.data(), n, candidates.data(), candidates.size(), &t_old);
+        std::vector<uint8_t> none(n, 0);
+        const double none_old = kimi_place_ring_time(lanes, e.data(), n, none.data());
+        // now: the table
+        kimi_place_table t;
+        t.cpu_one_us = cpu; t.cpu_early = early_share; t.cpu_moved = cpu_moved;
+        t.vector.device = { resident_call, resident_b, 0 };
+        t.vector.moved = { host_call > 0 ? host_call : resident_call, hb, 0 };
+        t.locked_us_per_mb = copy_us_per_mb; t.link_busy_us = link_busy; t.in_place = in_place;
+        t.drive_fixed_us = d0; t.drive_us_per_mb = us_per_mb;
+        t.batched.device = { 0, 1e6, 1e6 }; t.pageable_us_per_mb = 1.0;   // not a one-token layer's
+        kimi_place_limits limits;
+        limits.slots = size_t(scratch);
+        if (copy_us_per_mb <= 0 && !in_place) { continue; }
+        size_t reads = 0;
+        for (const auto & x : items) { reads += !x.resident && x.read; }
+        if (reads > 8) { continue; }    // decode plans a layer whose reads fit the ring (8 slots)
+        const auto r = kimi_place_layer(t, 1, 8, items.data(), n, limits);
+        bool ok = r.moved.size() == k_old && r.time == t_old && r.time_none == none_old;
+        for (size_t j = 0; ok && j < k_old; ++j) { ok = r.moved[j] == candidates[j]; }
+        same += ok;
+        moved += k_old > 0;
+        ++total;
+    }
+    check(same == total, "one token: the decode plan's choice and time, bit for bit");
+    std::printf("decode same: %zu of %zu random decode layers (%zu move experts)\n", same, total, moved);
+}
+
+// The streamed form of a longer pass is M8's evaluator (kimi_prefill_best_prefix) over M8's moves with B3's transport:
+// each copy the pipeline's first stage on the link, page-locked DMA or pageable staging by the GPU's worker (which
+// blocks the worker, not the chains it launched), the GPU lane the chains alone; on random 233-like layers with a
+// pageable ring and RAM cache (M8's sources).
+static void test_place_m8_same() {
+    uint64_t state = 1618;
+    auto unit = [&] { state = state * 6364136223846793005ull + 1442695040888963407ull; return double(state >> 11) / double(1ull << 53); };
+    size_t same = 0, total = 0, moved = 0;
+    for (int trial = 0; trial < 1000; ++trial) {
+        const int ntokens = 64 + int(unit() * 4096);
+        const size_t n = 20 + size_t(unit() * 230);
+        auto items = layer_items(state, n, ntokens, 0.2 * unit(), 0.3 * unit(), false);
+        for (auto & x : items) { x.locked = false; }   // M8's ring and RAM cache: pageable
+        auto t = table_233();
+        t.locked_us_per_mb = t.pageable_us_per_mb;   // M8 priced every copy and row at its one link rate
+        t.route_us = 5448e-6 * t.locked_us_per_mb;
+        // M8, as select_prefill_transient built it (bytes, us)
+        const double link = 1e3 / t.pageable_us_per_mb * 1000.0; // bytes per us
+        kimi_prefill_layer l = {};
+        double drive_bytes = 0, first = 0;
+        for (const auto & x : items) {
+            const double bytes = x.mb * 1e6;
+            if (x.resident) { l.gpu += 60 + 25.0 * x.routes; l.link += (5448.0 * x.routes) / link; l.gpu_work = true; continue; }
+            l.cpu += 520 + 297.0 * x.routes;
+            if (x.read) { drive_bytes += bytes; if (first == 0) { first = bytes; } }
+        }
+        const double drive_rate = 7.0 * 1000.0;
+        if (drive_bytes > 0) { l.drive = 12000 + drive_bytes / drive_rate; l.fill = first / drive_rate; }
+        l.ring = 8; l.gpu_overhead = ntokens * 7.0;
+        std::vector<size_t> c;
+        for (size_t i = 0; i < n; ++i) { if (!items[i].resident) { c.push_back(i); } }
+        std::stable_sort(c.begin(), c.end(), [&](size_t a, size_t b) {
+            if (items[a].routes != items[b].routes) { return items[a].routes > items[b].routes; }
+            return items[a].read < items[b].read;
+        });
+        std::vector<kimi_prefill_move> moves;
+        for (size_t i : c) {
+            const auto & x = items[i];
+            const double bytes = x.mb * 1e6;
+            moves.push_back({ 520 + 297.0 * x.routes, 60 + 25.0 * x.routes, (bytes + 5448.0 * x.routes) / link, bytes / link });
+        }
+        double t_old = 0;
+        const size_t k_old = kimi_prefill_best_prefix(l, moves.data(), moves.size(), &t_old);
+        const auto r = kimi_place_layer(t, ntokens, 8, items.data(), n);
+        bool ok = !r.ring && r.moved.size() == k_old && near(r.time, t_old, 1e-9);
+        for (size_t j = 0; ok && j < k_old; ++j) { ok = r.moved[j] == c[j]; }
+        same += ok;
+        moved += k_old > 0;
+        ++total;
+    }
+    check(same == total, "a streamed pass with a pageable ring: M8's evaluator, the copies pipelined");
+    std::printf("m8 same: %zu of %zu random streamed layers (%zu move experts)\n", same, total, moved);
+}
+
+// The lanes of a longer pass: a page-locked copy on the link alone, the GPU lane its compute (B3), the pipeline's fill
+// once; a pageable copy on both; in place no copy at all.
+static void test_place_lanes() {
+    kimi_place_table t = table_233();
+    t.batched.device = { 0, 120, 1.7 };        // Muse's chain on 233, B2
+    t.cpu_fixed_us = 175; t.cpu_route_us = 409;
+    t.route_us = 8e-6 * t.locked_us_per_mb; t.token_us = 2.3;
+    // 30 cold experts of 30.4 MB at 150 routes, a page-locked ring: every move's copy 4399 us on the link, its chain 375
+    std::vector<kimi_place_item> items(30);
+    for (auto & x : items) { x.routes = 150; x.mb = 30.4; x.mb_early = 20.3; x.read = true; x.locked = true; x.movable = true; }
+    auto r = kimi_place_layer(t, 4221, 8, items.data(), items.size());
+    const double c = 120 + 1.7 * 150, d = 30.4 * t.locked_us_per_mb;
+    check(!r.ring && !r.moved.empty(), "locked: a streamed layer moves experts");
+    {
+        std::vector<double> cs(r.moved.size(), c), ds(r.moved.size(), d);
+        check(near(r.gpu_lane, kimi_place_pipeline(cs.data(), ds.data(), cs.size()), 1e-12),
+            "locked: the GPU lane is the pipeline of the copies and the chains");
+        check(near(r.gpu_lane, double(r.moved.size()) * d + c, 1e-12), "locked: link-bound, the copies and the last chain");
+    }
+    check(near(r.link, double(r.moved.size()) * (d + 150 * 8e-6 * t.locked_us_per_mb), 1e-9), "locked: the link carries the copies");
+    // the same with a pageable ring: each copy staged by the GPU's worker at the pageable rate, the pipeline's first
+    // stage as a DMA copy is (the chains it launched run on); fewer moves
+    for (auto & x : items) { x.locked = false; }
+    auto p = kimi_place_layer(t, 4221, 8, items.data(), items.size());
+    const double s = 30.4 * t.pageable_us_per_mb;
+    {
+        std::vector<double> cs(p.moved.size(), c), ss(p.moved.size(), s);
+        check(!p.moved.empty() && near(p.gpu_lane, kimi_place_pipeline(cs.data(), ss.data(), cs.size()), 1e-9) && p.fill > 0.0,
+            "pageable: the staging pipelined with the chains");
+    }
+    check(p.moved.size() <= r.moved.size(), "pageable: no more moves than page-locked");
+    // in place where the GPU can: the in-place line (504 us at 150 routes) against the device line plus a copy
+    // (375 + 5214 us): no link, no fill, the moved line
+    t.in_place = true; t.batched.moved = { 0, 174, 2.2 };
+    auto q = kimi_place_layer(t, 4221, 8, items.data(), items.size());
+    check(q.in_place && q.link == 0.0 && near(q.fill, 0.0, 1e-9) &&
+        near(q.gpu_lane, double(q.moved.size()) * (174 + 2.2 * 150), 1e-9), "in place: compute from host memory, nothing on the link");
+    check(q.moved.size() >= r.moved.size(), "in place: at least as many moves as with copies");
+    // where the GPU reads in place slower than it copies and computes from device memory: the copies, each move on the
+    // device line (not the in-place one) after its copy
+    t.batched.moved = { 0, 9000, 60 };
+    for (auto & x : items) { x.locked = true; }
+    auto v = kimi_place_layer(t, 4221, 8, items.data(), items.size());
+    {
+        std::vector<double> cs(v.moved.size(), c), ds(v.moved.size(), d);
+        check(!v.in_place && !v.moved.empty() && near(v.gpu_lane, kimi_place_pipeline(cs.data(), ds.data(), cs.size()), 1e-9),
+            "in place slower: copied, on the device line");
+    }
+    std::printf("lanes: locked %zu moves (GPU %.0f link %.0f fill %.0f), pageable %zu, in place %zu, in place slower %zu of %zu\n",
+        r.moved.size(), r.gpu_lane, r.link, r.fill, p.moved.size(), q.moved.size(), v.moved.size(), items.size());
+
+    // a longer pass's CPU line is its own calibration: decode's DRAM-sharing ratio does not price it (ring form)
+    {
+        kimi_place_table w = table_233();
+        w.cpu_fixed_us = 3000;
+        std::vector<kimi_place_item> few(4);
+        for (auto & x : few) { x.routes = 40; x.mb = 18.8; x.read = true; x.locked = true; x.movable = true; }
+        const auto a = kimi_place_layer(w, 64, 8, few.data(), few.size());
+        w.cpu_moved = 3.0;
+        const auto b = kimi_place_layer(w, 64, 8, few.data(), few.size());
+        check(a.ring && !a.moved.empty() && a.gpu == b.gpu && a.time == b.time, "a longer pass: no decode DRAM ratio");
+    }
+
+    // The candidates' order: most routes first, then host memory before reads, then the items' order; limits.
+    std::vector<kimi_place_item> o(6);
+    const int routes[6] = { 3, 9, 9, 1, 9, 3 };
+    for (size_t i = 0; i < 6; ++i) { o[i].routes = routes[i]; o[i].mb = 18.8; o[i].movable = true; o[i].locked = true; }
+    o[1].read = true; o[2].read = true;      // two reads among the 9-route experts, 4 in host memory
+    kimi_place_table u = table_233();
+    u.cpu_fixed_us = 1e5;                    // every move pays
+    auto all = kimi_place_layer(u, 64, 8, o.data(), o.size());
+    const std::vector<size_t> want = { 4, 1, 2, 0, 5, 3 };
+    check(all.moved == want, "candidates: by routes, host memory first, then in order");
+    kimi_place_limits lim; lim.reads = 1;
+    o[0].needs_slot = o[5].needs_slot = true; lim.slots = 1;
+    auto limited = kimi_place_layer(u, 64, 8, o.data(), o.size(), lim);
+    const std::vector<size_t> want2 = { 4, 1, 0, 3 };
+    check(limited.moved == want2, "candidates: a read limit and a slot limit");
+}
+
+// Decode's candidates: every expert the GPU could take, a RAM hit its prefetch still reads among them, priced with its
+// landing (its bytes yet to come, on the drive's line ahead of the layer's reads); before, such a hit was the CPU's.
+static void test_place_pending() {
+    // one token, in place (the Spark): 2 residents, a RAM hit in memory (H), a hit still landing (P, 10 MB to come),
+    // two misses (M1, M2)
+    kimi_place_table t;
+    t.cpu_one_us = 1600; t.cpu_early = 0.6;
+    t.vector.device = { 150, 20, 0 }; t.vector.moved = { 150, 300, 0 };
+    t.in_place = true;
+    t.drive_fixed_us = 500; t.drive_us_per_mb = 1e3 / 7.0;
+    std::vector<kimi_place_item> items(6);
+    for (auto & x : items) { x.routes = 1; x.mb = 18.8; x.mb_early = 12.5; x.movable = true; }
+    items[0].resident = items[1].resident = true;
+    const size_t H = 2, P = 3, M1 = 4, M2 = 5;
+    items[P].pending_mb = 10.0;
+    items[M1].read = items[M2].read = true;
+    const auto a = kimi_place_layer(t, 1, 8, items.data(), items.size());
+    // the landings: P first, then the misses' up/gate roles, then their downs
+    const double r = t.drive_us_per_mb, d0 = t.drive_fixed_us;
+    std::vector<kimi_place_expert> e(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (items[i].resident) { e[i].resident = true; e[i].gpu = 20; continue; }
+        e[i].cpu = 1600; e[i].early = 0.6 * 1600; e[i].gpu = 300;
+    }
+    e[P].early_ready = e[P].ready = d0 + 10 * r;
+    e[M1].early_ready = d0 + (10 + 12.5) * r; e[M2].early_ready = d0 + (10 + 25) * r;
+    e[M1].ready = d0 + (35 + 6.3) * r; e[M2].ready = d0 + (35 + 12.6) * r;
+    kimi_place_lanes lanes = {};
+    lanes.resident_call = 150; lanes.host_call = 150; lanes.reads_end = e[M2].ready;
+    std::vector<uint8_t> none(items.size(), 0);
+    check(near(a.time_none, kimi_place_ring_time(lanes, e.data(), e.size(), none.data()), 1e-12),
+        "pending: the hit lands ahead of the layer's reads, the reads after it");
+    check(a.candidates == 4, "pending: the landing hit is a candidate");
+    const std::vector<size_t> order = { H, P, M1, M2 };
+    check(a.moved == order, "pending: every candidate moves when the CPU is the slow lane, in landing order");
+    // the caller's flag still rules: a hit it keeps on the CPU is no candidate
+    auto kept = items;
+    kept[P].movable = false;
+    const auto b = kimi_place_layer(t, 1, 8, kept.data(), kept.size());
+    check(b.candidates == 3 && std::find(b.moved.begin(), b.moved.end(), P) == b.moved.end(), "pending: not movable, not moved");
+    check(near(b.time_none, a.time_none, 1e-12), "pending: its landing prices the CPU too");
+    check(a.time <= b.time, "pending: moving the landing hit is no slower (here the misses' last landing ends the layer)");
+    {
+        // without the misses the landing hit's CPU time ends the layer: moving it shortens it
+        auto two = items;
+        two[M1].read = two[M2].read = false; two[M1].resident = two[M2].resident = true;
+        const auto x = kimi_place_layer(t, 1, 8, two.data(), two.size());
+        two[P].movable = false;
+        const auto y = kimi_place_layer(t, 1, 8, two.data(), two.size());
+        check(std::find(x.moved.begin(), x.moved.end(), P) != x.moved.end() && x.time < y.time &&
+            near(x.time, d0 + 10 * r + 150 + 300, 1e-12), "pending: the GPU takes the hit once it lands, at the host call");
+    }
+    // without a drive line nothing is known of its landing: in host memory, as a RAM hit
+    auto u = t;
+    u.drive_us_per_mb = 0;
+    const auto c = kimi_place_layer(u, 1, 8, items.data(), items.size());
+    auto plain = items;
+    plain[P].pending_mb = 0;
+    const auto d = kimi_place_layer(u, 1, 8, plain.data(), plain.size());
+    check(c.moved == d.moved && c.time == d.time, "pending: no drive line, a RAM hit");
+    // a discrete GPU: the landing hit moves from its page-locked RAM slot at the measured rate only, with a device target
+    auto g = t;
+    g.in_place = false; g.locked_us_per_mb = 1e3 / 40.0;
+    auto disc = items;
+    for (auto & x : disc) { x.locked = true; x.needs_slot = true; }
+    disc[P].locked = false;
+    kimi_place_limits lim; lim.slots = 8;
+    const auto f = kimi_place_layer(g, 1, 8, disc.data(), disc.size(), lim);
+    check(std::find(f.moved.begin(), f.moved.end(), P) == f.moved.end() && f.candidates == 3, "pending: pageable slot, no move at one token");
+    disc[P].locked = true;
+    lim.slots = 1;
+    const auto h = kimi_place_layer(g, 1, 8, disc.data(), disc.size(), lim);
+    check(h.candidates == 1 && h.moved.size() <= 1, "pending: a device target a move");
+    // random Spark-like decode layers: the candidates gain the landing hits; the moves and the predicted time with them
+    // against the old rule's (the same landings, the hits the CPU's)
+    uint64_t state = 4242;
+    auto unit = [&] { state = state * 6364136223846793005ull + 1442695040888963407ull; return double(state >> 11) / double(1ull << 53); };
+    size_t layers = 0, gained = 0, more = 0, fewer = 0, faster = 0, slower = 0;
+    double moves_old = 0, moves_new = 0;
+    for (int trial = 0; trial < 3000; ++trial) {
+        const size_t n = 4 + size_t(unit() * 10);
+        std::vector<kimi_place_item> x(n);
+        size_t landing = 0;
+        for (auto & y : x) {
+            y.routes = 1; y.mb = 18.8; y.mb_early = 12.5; y.movable = true;
+            const double v = unit();
+            if (v < 0.45) { y.resident = true; continue; }
+            if (v < 0.7) { y.read = true; continue; }
+            if (unit() < 0.4) { y.pending_mb = 18.8 * (1 + int(unit() * 3)) / 3.0; ++landing; }
+        }
+        auto old = x;
+        for (auto & y : old) { if (y.pending_mb > 0) { y.movable = false; } }
+        auto tt = t;
+        tt.cpu_one_us = 1200 + 800 * unit(); tt.vector.moved.expert_us = 200 + 200 * unit();
+        const auto now = kimi_place_layer(tt, 1, 8, x.data(), n);
+        const auto was = kimi_place_layer(tt, 1, 8, old.data(), n);
+        ++layers;
+        gained += now.candidates == was.candidates + landing;
+        moves_new += double(now.moved.size()); moves_old += double(was.moved.size());
+        more += now.moved.size() > was.moved.size(); fewer += now.moved.size() < was.moved.size();
+        faster += now.time < was.time; slower += now.time > was.time;
+    }
+    check(gained == layers, "pending: every landing hit is a candidate");
+    check(moves_new >= moves_old, "pending: at least the old rule's moves on CPU-bound layers");
+    std::printf("pending: %zu random layers, moves %.2f against %.2f a layer (more %zu, fewer %zu), predicted faster %zu, slower %zu\n",
+        layers, moves_new / double(layers), moves_old / double(layers), more, fewer, faster, slower);
+}
+
 int main() {
     test_fit();
     test_coupled();
@@ -401,6 +838,12 @@ int main() {
     test_ring();
     test_ring_same();
     test_ring_prefix_fold();
+    test_pipeline();
+    test_place_one_token();
+    test_place_decode_same();
+    test_place_m8_same();
+    test_place_lanes();
+    test_place_pending();
     if (failures) { std::fprintf(stderr, "%d failures\n", failures); return 1; }
     std::printf("KIMI_PREFILL_COST_OK\n");
     return 0;

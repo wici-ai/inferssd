@@ -1,4 +1,4 @@
-// The tier's host path (kimi_vram_host_api v2) through its C API, shared by test-kimi-vram-q2 (Q8_0, the generic
+// The tier's host path (kimi_vram_host_api v3) through its C API, shared by test-kimi-vram-q2 (Q8_0, the generic
 // engine) and test-kimi-vram-mxfp4 (MXFP4, DeepSeek's engine). Included after test-kimi-cpu-sink.cpp (require, ggml).
 #pragma once
 #include "kimi-vram-tier-api.h"
@@ -6,7 +6,7 @@
 #include <functional>
 #include <sys/mman.h>
 
-// The host path of the tier (kimi_vram_host_api v2) through its C API, on experts of one type (Q8_0: the generic
+// The host path of the tier (kimi_vram_host_api v3) through its C API, on experts of one type (Q8_0: the generic
 // engine; MXFP4: DeepSeek's own engine, with libkimi-mxfp4-parity.so preloaded):
 // a host job computes the same rows as the same expert resident (same kernel, same bytes, bit for bit); on a discrete
 // GPU a pageable source is refused, a page-locked one is copied into the expert's admission reservation, which finish
@@ -17,7 +17,7 @@ inline void run_host_jobs(ggml_type type, size_t & checks) {
     const auto * tier_api = reinterpret_cast<kimi_vram_tier_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_tier_get_api"))();
     const auto * format_api = reinterpret_cast<kimi_vram_format_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_format_get_api"))();
     const auto * host_api = reinterpret_cast<kimi_vram_host_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_host_get_api"))();
-    require(tier_api && format_api && host_api && host_api->version == 2 && host_api->costs2 && host_api->register_host,
+    require(tier_api && format_api && host_api && host_api->version == 3 && host_api->costs2 && host_api->register_host,
         "host API v2 missing from the tier DSO");
     const int latent = 512, hidden = 256, n_experts = 8;
     auto pad = [](size_t b) { return (b + 4095) & ~size_t(4095); };

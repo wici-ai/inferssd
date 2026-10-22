@@ -17,38 +17,51 @@ struct sink_vram {
     bool format_f32_input = false;
     bool format_mxfp4_input = false;
     bool mxfp4_batch_enabled = true;
+    // The format's grouped-prefill lane (the tier's, prefill API v7): which engine its passes run on, and this layer's
+    // use of it: a batched engine (MXFP4's hand engine or the batched engine of any other format), Q2's per-token
+    // path, and whether this pass's streamed transients are read in place.
+    kimi_vram_prefill_lane prefill_lane = {};
+    bool prefill_batched = false, prefill_q2 = false, prefill_in_place = false;
     bool exclusive = false, decode = false, prefill_open = false, async_upload = false, prefill_enabled = false;
     bool prefill_job_active = false;
     int q2_prefill_ram_gpu_min_routes = 0;
     int q2_prefill_ssd_gpu_min_routes = 0;
     int q2_prefill_ssd_gpu_max_experts_per_layer = 0;
     int q2_prefill_cold_admit_per_layer = 0;
-    // MXFP4 transient candidates and the per-layer SSD transient cap: the makespan decides by default
+    // The batched lanes' transient candidates and the per-layer SSD transient cap: the makespan decides by default
     // (1 route, no cap: a streamed transient holds only a ring slot and a device slot, whatever the count);
-    // the environment keeps them as A/B switches, and the legacy selector keeps 16/16/64.
-    int mxfp4_prefill_ram_gpu_min_routes = 1;
-    int mxfp4_prefill_ssd_gpu_min_routes = 1;
-    int mxfp4_prefill_ssd_gpu_max_experts_per_layer = -1; // -1: no cap
-    bool mxfp4_prefill_legacy_schedule = false;
-    // The MXFP4 cost model's terms (kimi-prefill-cost.h; select_prefill_transient). GGML_KIMI_CPU_PREFILL_MXFP4_COST
-    // sets any of them by name (cpu_fixed_us=..,link_gbps=..), and each calibrated line prints them by the same names.
-    struct mxfp4_prefill_costs {
-        // Start values only: 166, 10 CPU threads, a2f1fbb5e, 2026-09-26; see
-        // 20260925-deepseek-prefill-sched-assets/{cpu-calibration.txt,gpu-micro.jsonl}.
-        double cpu_fixed_us = 204.0, cpu_route_us = 87.0; // the CPU's time per expert, and per route of it
-        double gpu_fixed_us = 25.0, gpu_route_us = 8.2;   // the GPU worker's time per expert, and per route of it
-        double link_gbps = 6.74;  // a transient's upload from the ring
-        double drive_gbps = 0.0;  // the drive while reads are in flight; 0: unknown until measured
+    // the environment keeps them as A/B switches (GGML_KIMI_CPU_PREFILL_RAM_GPU_MIN_ROUTES, _SSD_GPU_MIN_ROUTES,
+    // _SSD_GPU_MAX_EXPERTS_PER_LAYER, _SCHED_LEGACY; their MXFP4_ spellings are still read), and the legacy selector
+    // keeps 16/16/64.
+    int prefill_ram_gpu_min_routes = 1;
+    int prefill_ssd_gpu_min_routes = 1;
+    int prefill_ssd_gpu_max_experts_per_layer = -1; // -1: no cap
+    bool prefill_legacy_schedule = false;
+    // The start values of the cost table's lines the sink fits (kimi-prefill-cost.h, kimi_place_table) and the fitted
+    // lines. GGML_KIMI_CPU_PREFILL_COST (or its MXFP4_ spelling) sets any of them by name (cpu_fixed_us=..,link_gbps=..);
+    // each calibrated line prints the table by the same names.
+    struct prefill_costs {
+        // Start values only: 166, 10 CPU threads, a2f1fbb5e, 2026-09-26, MXFP4; see
+        // 20260925-deepseek-prefill-sched-assets/{cpu-calibration.txt,gpu-micro.jsonl}. The framework's probe gives
+        // the machine's own (tools/adaptive, device_profile.py).
+        double cpu_fixed_us = 204.0, cpu_route_us = 87.0; // the CPU's time per expert of a pass, and per route of it
+        double gpu_fixed_us = 25.0, gpu_route_us = 8.2;   // the batched engine's time per expert in device memory
+        double gpu_host_fixed_us = 0.0, gpu_host_route_us = 0.0; // the same, read in place from host memory (0: as
+                                                                 // in device memory)
+        double link_gbps = 6.74;     // a copy from page-locked memory, until the tier measures one
+        double pageable_gbps = 0.0;  // a copy from pageable memory, until the tier measures one (0: link_gbps)
+        double drive_gbps = 0.0;     // the drive while reads are in flight; 0: unknown until measured
         double drive_fixed_us = 0.0; // the drive's time per layer beyond its bytes: the read queue filling and draining
-        double gpu_token_us = -1.0; // the GPU work's time per token outside its experts; -1: the output row over the link
-    } mxfp4_cost, mxfp4_prior;
-    // Calibration: every grouped-prefill layer adds one sample, and the terms are refit over the samples of the last
-    // forward pass (one per layer of the sink): the CPU and GPU lines by least squares over each expert's time against
-    // its routes, the drive's line over each layer's read time against its bytes, the link and the GPU overhead as
-    // ratios of their sums.
+        double gpu_token_us = -1.0;  // the batched engine's time per token outside its experts; -1: the output row
+                                     // over the link
+    } cost, prior;
+    // Calibration: every grouped-prefill layer adds one sample, and the batched lanes' terms are refit over the
+    // samples of the last forward pass (one per layer of the sink): the CPU and GPU lines by least squares over each
+    // expert's time against its routes, the GPU overhead as a ratio of sums. The drive's line is fitted with
+    // decode's layers when the table is built (kimi_cpu_sink::place_table), the copy rates are the tier's.
     struct prefill_sample {
-        kimi_prefill_fit cpu, gpu;
-        double link_bytes, link_us, read_bytes, read_us; // link: pageable copies only
+        kimi_prefill_fit cpu, gpu, gpu_host;
+        double read_bytes, read_us;
         double gpu_overhead_us, gpu_tokens; // gpu_tokens: the layer's tokens when it had GPU work, else 0
     };
     kimi_prefill_fit prefill_cpu_fit; // this layer's CPU experts, from observe_prefill_cpu
@@ -56,15 +69,16 @@ struct sink_vram {
     std::vector<prefill_sample> prefill_samples;
     size_t prefill_sample_next = 0;
     uint64_t cost_calibrations = 0;
-    // This layer's plan, set by select_prefill_transient for the makespan rule.
+    // This layer's plan, set by select_prefill_transient for the makespan rule: its predicted lanes.
     struct prefill_plan_state {
         bool valid;
         int ntokens;
         double cpu_us, gpu_us, link_us, drive_us, fill_us, gpu_overhead_us, layer_us;
-        bool ram_locked; // a RAM transient of the layer comes from a page-locked slot
     } prefill_plan = {};
-    // Whether a RAM cache slot is page-locked (the sink's decode registrar; unset: none is).
+    // Whether a RAM cache slot is page-locked (the sink's decode registrar; unset: none is), and whether the read
+    // ring is (B3: registered when a GPU lane copies from it).
     std::function<bool(int)> ram_slot_locked;
+    bool ring_locked = false;
     int prefill_latent = 0;
     std::vector<kimi_vram_prefill_transient> prefill_transient;
     kimi_vram_prefill_stats prefill_stats = {};
@@ -83,31 +97,34 @@ struct sink_vram {
     uint64_t host_experts = 0;
     const kimi_vram_policy_api * policy_api = nullptr; // optional: miss cost, host demand and floor, host reclaim
 
-    // "name=value" items separated by commas or spaces, names as in mxfp4_prefill_costs; the others keep their values.
-    static void parse_mxfp4_costs(const char * spec, mxfp4_prefill_costs & cost) {
-        static const struct { const char * name; double mxfp4_prefill_costs::* field; } terms[] = {
-            { "cpu_fixed_us", &mxfp4_prefill_costs::cpu_fixed_us }, { "cpu_route_us", &mxfp4_prefill_costs::cpu_route_us },
-            { "gpu_fixed_us", &mxfp4_prefill_costs::gpu_fixed_us }, { "gpu_route_us", &mxfp4_prefill_costs::gpu_route_us },
-            { "link_gbps", &mxfp4_prefill_costs::link_gbps }, { "drive_gbps", &mxfp4_prefill_costs::drive_gbps },
-            { "drive_fixed_us", &mxfp4_prefill_costs::drive_fixed_us }, { "gpu_token_us", &mxfp4_prefill_costs::gpu_token_us },
+    // "name=value" items separated by commas or spaces, names as in prefill_costs; the others keep their values.
+    static void parse_costs(const char * name, const char * spec, prefill_costs & cost) {
+        static const struct { const char * name; double prefill_costs::* field; } terms[] = {
+            { "cpu_fixed_us", &prefill_costs::cpu_fixed_us }, { "cpu_route_us", &prefill_costs::cpu_route_us },
+            { "gpu_fixed_us", &prefill_costs::gpu_fixed_us }, { "gpu_route_us", &prefill_costs::gpu_route_us },
+            { "gpu_host_fixed_us", &prefill_costs::gpu_host_fixed_us },
+            { "gpu_host_route_us", &prefill_costs::gpu_host_route_us },
+            { "link_gbps", &prefill_costs::link_gbps }, { "pageable_gbps", &prefill_costs::pageable_gbps },
+            { "drive_gbps", &prefill_costs::drive_gbps },
+            { "drive_fixed_us", &prefill_costs::drive_fixed_us }, { "gpu_token_us", &prefill_costs::gpu_token_us },
         };
         auto separator = [](char c) { return c == ',' || c == ' ' || c == '\t' || c == '\n'; };
         for (const char * cursor = spec; *cursor;) {
             if (separator(*cursor)) { ++cursor; continue; }
             const char * equals = cursor;
             while (*equals && *equals != '=' && !separator(*equals)) { ++equals; }
-            const std::string name(cursor, equals);
+            const std::string item(cursor, equals);
             auto term = std::find_if(std::begin(terms), std::end(terms),
-                [&](const auto & t) { return name == t.name; });
+                [&](const auto & t) { return item == t.name; });
             if (*equals != '=' || term == std::end(terms)) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_MXFP4_COST: unknown item " + name);
+                throw std::runtime_error(std::string(name) + ": unknown item " + item);
             }
             char * end = nullptr;
             errno = 0;
             const double value = std::strtod(equals + 1, &end);
             if (errno || end == equals + 1 || (*end && !separator(*end)) || !std::isfinite(value) || value < 0.0 ||
-                    value > 1e6 || (term->field == &mxfp4_prefill_costs::link_gbps && value == 0.0)) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_MXFP4_COST: invalid value of " + name);
+                    value > 1e6 || (term->field == &prefill_costs::link_gbps && value == 0.0)) {
+                throw std::runtime_error(std::string(name) + ": invalid value of " + item);
             }
             cost.*(term->field) = value;
             cursor = end;
@@ -142,39 +159,48 @@ struct sink_vram {
             }
             mxfp4_batch_enabled = !std::strcmp(flag, "1");
         }
-        auto mxfp4_setting = [](const char * name, int fallback, long minimum, long maximum) {
-            const char * value = std::getenv(name);
+        // a selector switch by its format-neutral name, or by its MXFP4_ spelling of before; not both
+        auto spelled = [](const char * name, const char * old_name) -> const char * {
+            const char * value = std::getenv(name), * old_value = std::getenv(old_name);
+            if (value && old_value) {
+                throw std::runtime_error(std::string(name) + " and " + old_name + " are both given: set " + name);
+            }
+            return value ? name : old_name;
+        };
+        auto setting = [&](const char * name, const char * old_name, int fallback, long minimum, long maximum) {
+            const char * key = spelled(name, old_name);
+            const char * value = std::getenv(key);
             if (!value) { return fallback; }
             char * end = nullptr;
             errno = 0;
             const long parsed = std::strtol(value, &end, 10);
             if (errno || end == value || *end || parsed < minimum || parsed > maximum) {
-                throw std::runtime_error(std::string(name) + " is out of range");
+                throw std::runtime_error(std::string(key) + " is out of range");
             }
             return int(parsed);
         };
-        mxfp4_prefill_legacy_schedule = mxfp4_setting(
+        prefill_legacy_schedule = setting("GGML_KIMI_CPU_PREFILL_SCHED_LEGACY",
             "GGML_KIMI_CPU_PREFILL_MXFP4_SCHED_LEGACY", 0, 0, 1) != 0;
-        mxfp4_prefill_ram_gpu_min_routes = mxfp4_setting(
-            "GGML_KIMI_CPU_PREFILL_MXFP4_RAM_GPU_MIN_ROUTES", mxfp4_prefill_legacy_schedule ? 16 : 1, 0, 2048);
-        mxfp4_prefill_ssd_gpu_min_routes = mxfp4_setting(
-            "GGML_KIMI_CPU_PREFILL_MXFP4_SSD_GPU_MIN_ROUTES", mxfp4_prefill_legacy_schedule ? 16 : 1, 0, 2048);
-        mxfp4_prefill_ssd_gpu_max_experts_per_layer = mxfp4_setting(
-            "GGML_KIMI_CPU_PREFILL_MXFP4_SSD_GPU_MAX_EXPERTS_PER_LAYER",
-            mxfp4_prefill_legacy_schedule ? 64 : -1, -1, 65536);
-        if (const char * spec = std::getenv("GGML_KIMI_CPU_PREFILL_MXFP4_COST")) {
-            parse_mxfp4_costs(spec, mxfp4_cost);
+        prefill_ram_gpu_min_routes = setting("GGML_KIMI_CPU_PREFILL_RAM_GPU_MIN_ROUTES",
+            "GGML_KIMI_CPU_PREFILL_MXFP4_RAM_GPU_MIN_ROUTES", prefill_legacy_schedule ? 16 : 1, 0, 2048);
+        prefill_ssd_gpu_min_routes = setting("GGML_KIMI_CPU_PREFILL_SSD_GPU_MIN_ROUTES",
+            "GGML_KIMI_CPU_PREFILL_MXFP4_SSD_GPU_MIN_ROUTES", prefill_legacy_schedule ? 16 : 1, 0, 2048);
+        prefill_ssd_gpu_max_experts_per_layer = setting("GGML_KIMI_CPU_PREFILL_SSD_GPU_MAX_EXPERTS_PER_LAYER",
+            "GGML_KIMI_CPU_PREFILL_MXFP4_SSD_GPU_MAX_EXPERTS_PER_LAYER", prefill_legacy_schedule ? 64 : -1, -1, 65536);
+        {
+            const char * key = spelled("GGML_KIMI_CPU_PREFILL_COST", "GGML_KIMI_CPU_PREFILL_MXFP4_COST");
+            if (const char * spec = std::getenv(key)) { parse_costs(key, spec, cost); }
         }
-        mxfp4_prior = mxfp4_cost;
+        prior = cost;
         std::fprintf(stderr,
-            "[kimi_cpu_prefill_mxfp4_cost] rule=%s cpu_fixed_us=%.3f cpu_route_us=%.3f gpu_fixed_us=%.3f "
-            "gpu_route_us=%.3f link_gbps=%.3f drive_gbps=%.3f drive_fixed_us=%.3f gpu_token_us=%.3f ram_min_routes=%d "
-            "ssd_min_routes=%d ssd_limit=%d\n",
-            mxfp4_prefill_legacy_schedule ? "legacy" : "makespan",
-            mxfp4_cost.cpu_fixed_us, mxfp4_cost.cpu_route_us, mxfp4_cost.gpu_fixed_us, mxfp4_cost.gpu_route_us,
-            mxfp4_cost.link_gbps, mxfp4_cost.drive_gbps, mxfp4_cost.drive_fixed_us, mxfp4_cost.gpu_token_us,
-            mxfp4_prefill_ram_gpu_min_routes,
-            mxfp4_prefill_ssd_gpu_min_routes, mxfp4_prefill_ssd_gpu_max_experts_per_layer);
+            "[kimi_cpu_prefill_cost] rule=%s cpu_fixed_us=%.3f cpu_route_us=%.3f gpu_fixed_us=%.3f "
+            "gpu_route_us=%.3f gpu_host_fixed_us=%.3f gpu_host_route_us=%.3f link_gbps=%.3f pageable_gbps=%.3f "
+            "drive_gbps=%.3f drive_fixed_us=%.3f gpu_token_us=%.3f ram_min_routes=%d ssd_min_routes=%d ssd_limit=%d\n",
+            prefill_legacy_schedule ? "legacy" : "makespan",
+            cost.cpu_fixed_us, cost.cpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us, cost.gpu_host_fixed_us,
+            cost.gpu_host_route_us, cost.link_gbps, cost.pageable_gbps, cost.drive_gbps, cost.drive_fixed_us,
+            cost.gpu_token_us, prefill_ram_gpu_min_routes, prefill_ssd_gpu_min_routes,
+            prefill_ssd_gpu_max_experts_per_layer);
         if (const char * threshold = std::getenv("GGML_KIMI_CPU_PREFILL_Q2_RAM_GPU_MIN_ROUTES")) {
             char * threshold_end = nullptr;
             errno = 0;
@@ -255,10 +281,10 @@ struct sink_vram {
             auto get_prefill = reinterpret_cast<kimi_vram_prefill_get_api_fn>(
                 dlsym(RTLD_DEFAULT, "kimi_vram_prefill_get_api"));
             prefill_api = get_prefill ? get_prefill() : nullptr;
-            if (!prefill_api || prefill_api->version != 5 || prefill_api->size != sizeof(*prefill_api) ||
+            if (!prefill_api || prefill_api->version != 7 || prefill_api->size != sizeof(*prefill_api) ||
                     !prefill_api->prepare || !prefill_api->transient_available || !prefill_api->launch ||
                     !prefill_api->finish || !prefill_api->cancel || !prefill_api->cold_admission_active ||
-                    !prefill_api->admit_cold) {
+                    !prefill_api->admit_cold || !prefill_api->lane) {
                 throw std::runtime_error("GPU tier grouped-prefill ABI missing or incompatible; no fallback");
             }
             if (!format) { throw std::runtime_error("GPU tier grouped prefill requires the explicit-format ABI"); }
@@ -303,7 +329,7 @@ struct sink_vram {
         }
         if (auto get_host = reinterpret_cast<kimi_vram_host_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_host_get_api"))) {
             host_api = get_host();
-            if (!host_api || host_api->version != 2 || host_api->size != sizeof(*host_api) ||
+            if (!host_api || host_api->version != 3 || host_api->size != sizeof(*host_api) ||
                     !host_api->available || !host_api->launch || !host_api->costs || !host_api->register_host ||
                     !host_api->unregister_host || !host_api->costs2) {
                 throw std::runtime_error("GPU tier host-memory ABI mismatch");
@@ -354,8 +380,9 @@ struct sink_vram {
         this->token = token;
         have_token = decode;
     }
+    // A pass's engine buffers, announced before its reads (none without the GPU's grouped prefill).
     void reserve_accumulate(int tokens) {
-        if (!context || !elastic) { return; }
+        if (!context || !elastic || !prefill_enabled) { return; }
         char error[512] = {};
         check(elastic->reserve_accumulate(context, tokens, error, sizeof(error)), error);
     }
@@ -532,13 +559,18 @@ struct sink_vram {
         drop_ready(cache,source);
         if (deferred_upload) { collect_deferred(cache, -2); }
     }
+    // The layer's grouped prefill on the tier: every format the tier has a lane for (it initializes the format on a cold
+    // prefill, its decode arena deferred to the first decode token). legacy: Kimi-K3's Q3_K SiTU experts, which keep
+    // transport ABI 2 and no grouped prefill. A pass the format's engine cannot take (a per-expert post norm on MXFP4's
+    // hand engine) stays the CPU's.
     int prepare_prefill(std::vector<sink_request> & source, const ggml_tensor * up, const ggml_tensor * down,
-            int latent, int hidden, const std::vector<int32_t> & layer_ids) {
+            int latent, int hidden, const std::vector<int32_t> & layer_ids, int ntokens, bool post_norm, bool legacy) {
         hits = 0;
         prefill_plan.valid = false;
         prefill_cpu_fit = {};
         prefill_stats = {};
-        if (!context || !prefill_enabled || source.empty()) { return 0; }
+        prefill_batched = prefill_q2 = prefill_in_place = false;
+        if (!context || !prefill_enabled || source.empty() || legacy) { return 0; }
         int layer = -1, consumed = 0;
         const char * tensor_name = up->name;
         if (std::sscanf(tensor_name, "blk.%d.ffn_up_exps.weight%n", &layer, &consumed) != 1 ||
@@ -546,9 +578,6 @@ struct sink_vram {
                 source.size() > static_cast<size_t>(up->ne[2])) {
             throw std::runtime_error("GPU grouped prefill requires a canonical routed layer and a distinct expert union");
         }
-        const bool q2 = up->type == GGML_TYPE_IQ2_XXS && down->type == GGML_TYPE_Q2_K;
-        const bool mxfp4 = up->type == GGML_TYPE_MXFP4 && down->type == GGML_TYPE_MXFP4;
-        if (!q2 && !mxfp4) { return 0; }
         prefill_latent = latent;
         if (!prefill_window) { prefill_window = std::max<size_t>(1, layer_ids.size()); }
         requests.resize(source.size()); slots.assign(source.size(), -1);
@@ -565,16 +594,55 @@ struct sink_vram {
         char error[512] = {};
         check(prefill_api->prepare(context, requests.data(), int(requests.size()), &f,
                 slots.data(), error, sizeof(error)), error);
-        format_f32_input = q2;
-        format_mxfp4_input = mxfp4;
+        prefill_lane = {};
+        prefill_api->lane(context, &prefill_lane);
+        const bool batched_pass = ntokens > prefill_lane.vector_tokens;
+        if (prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_NONE || (post_norm && batched_pass && !prefill_lane.post_norm)) {
+            // the tier pinned the layer's residents only where it has a lane: give them back
+            if (std::any_of(slots.begin(), slots.end(), [](int slot) { return slot >= 0; })) {
+                check(prefill_api->cancel(context, error, sizeof(error)), error);
+            }
+            std::fill(slots.begin(), slots.end(), -1);
+            return 0;
+        }
+        format_f32_input = prefill_lane.f32_input != 0;
+        format_mxfp4_input = prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_MXFP4;
+        prefill_batched = prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_MXFP4 ||
+            prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_BATCHED;
+        prefill_q2 = prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_TOKENS && prefill_lane.f32_input;
         for (size_t i = 0; i < source.size(); ++i) {
             source[i].vram_slot = slots[i];
             hits += slots[i] >= 0;
         }
         return hits;
     }
+    // The layer's experts as the cost table's planner takes them (kimi_place_item), for decode and grouped prefill
+    // alike: routes(i) its tokens in the layer (0: no work), movable(i) whether the caller can hand it to the GPU,
+    // needs_slot(i) whether a move takes one of the tier's free device slots. Its host memory is page-locked where its
+    // RAM cache slot is (the decode registrar), or, for a read into the ring, where the ring is.
+    template <class Routes, class Movable, class NeedsSlot>
+    std::vector<kimi_place_item> place_items(const std::vector<sink_request> & source, Routes routes, Movable movable,
+            NeedsSlot needs_slot) const {
+        std::vector<kimi_place_item> items(source.size());
+        auto locked = [&](int entry) { return entry >= 0 && ram_slot_locked && ram_slot_locked(entry); };
+        for (size_t i = 0; i < source.size(); ++i) {
+            const auto & r = source[i];
+            auto & x = items[i];
+            x.routes = routes(i);
+            x.mb = double(r.role[0].nbytes + r.role[1].nbytes + r.role[2].nbytes) / 1e6;
+            x.mb_early = double(r.role[0].nbytes + r.role[1].nbytes) / 1e6;
+            x.resident = r.vram_slot >= 0;
+            if (x.resident || x.routes <= 0) { continue; }
+            x.read = r.cache_hit < 0;
+            x.locked = r.cache_hit >= 0 ? locked(r.cache_hit) : r.cache_admit >= 0 ? locked(r.cache_admit) : ring_locked;
+            x.movable = movable(i);
+            x.needs_slot = needs_slot(i);
+        }
+        return items;
+    }
     void select_prefill_transient(std::vector<sink_request> & source,
-            kimi_cpu_sink_prefill_batch & batch, sink_cache & cache, size_t ssd_staging_limit, size_t ring_slots) {
+            kimi_cpu_sink_prefill_batch & batch, sink_cache & cache, size_t ssd_staging_limit, size_t ring_slots,
+            const kimi_place_table & table) {
         prefill_transient.clear();
         for (auto & request : source) {
             request.vram_transient = false;
@@ -586,14 +654,14 @@ struct sink_vram {
             request.lane_start_us = 0.0;
             request.prefill_routes = 0;
         }
-        const bool mxfp4 = format_mxfp4_input && mxfp4_batch_enabled;
-        if (!context || !prefill_enabled || (!format_f32_input && !mxfp4) || source.empty()) { return; }
-        const int ram_threshold = mxfp4 ? mxfp4_prefill_ram_gpu_min_routes : q2_prefill_ram_gpu_min_routes;
-        const int ssd_threshold = mxfp4 ? mxfp4_prefill_ssd_gpu_min_routes : q2_prefill_ssd_gpu_min_routes;
-        const int ssd_cap = mxfp4 ? mxfp4_prefill_ssd_gpu_max_experts_per_layer : q2_prefill_ssd_gpu_max_experts_per_layer;
+        const bool batched = prefill_batched;
+        if (!context || !prefill_enabled || (!prefill_q2 && !batched) || source.empty()) { return; }
+        const int ram_threshold = batched ? prefill_ram_gpu_min_routes : q2_prefill_ram_gpu_min_routes;
+        const int ssd_threshold = batched ? prefill_ssd_gpu_min_routes : q2_prefill_ssd_gpu_min_routes;
+        const int ssd_cap = batched ? prefill_ssd_gpu_max_experts_per_layer : q2_prefill_ssd_gpu_max_experts_per_layer;
         const bool transient_ready = (ram_threshold || ssd_threshold) &&
             prefill_api->transient_available(context);
-        const bool cold_admission_ready = format_f32_input && q2_prefill_cold_admit_per_layer &&
+        const bool cold_admission_ready = prefill_q2 && q2_prefill_cold_admit_per_layer &&
             prefill_api->cold_admission_active(context);
         if (!transient_ready && !cold_admission_ready) { return; }
 
@@ -613,79 +681,37 @@ struct sink_vram {
         for (size_t i = 0; i < source.size(); ++i) { source[i].prefill_routes = token_routes[i]; }
 
         if (transient_ready) {
-            // Q2 and the legacy MXFP4 selector keep their fixed 2026-09 fits and serial greedy rule. The makespan rule
-            // uses the calibrated MXFP4 cost model (calibrate_prefill, kimi-prefill-cost.h), per layer:
-            //   CPU lane  C = sum over CPU experts of cpu_fixed + cpu_route * routes
-            //   GPU lane  G = sum over GPU experts of gpu_fixed + gpu_route * routes (the worker's time per expert),
-            //                 plus each transient's upload, bytes / link: the worker copies it from the pageable ring
-            //   link      L = (transient bytes + routed input rows) / link
-            //   drive     D = the layer's SSD reads, for both lanes, / drive rate
-            //   layer     T = fill + coupled(D, max(C, G, L), ring) + the GPU overhead once the layer has GPU work.
-            //             The drive and the lanes hand the reads over through the ring, and the closer their times
-            //             the more each waits for the other (kimi_prefill_coupled), so balanced lanes below D still
-            //             gain, and lanes far below D (a short batch) gain nothing worth the GPU overhead.
-            // The candidates move to the GPU in order of routes, and the selector takes the number of them that gives
-            // the lowest T. The reads are then issued in the order the lanes need them (lane_start_us), so that the
-            // lanes overlap.
-            const bool makespan = mxfp4 && !mxfp4_prefill_legacy_schedule;
-            auto cpu_cost = [this, mxfp4, makespan](int routes) {
-                return routes ? (makespan ? mxfp4_cost.cpu_fixed_us + mxfp4_cost.cpu_route_us * routes :
-                    mxfp4 ? 70.0 + 95.0 * routes : 70.0 + 184.0 * routes) : 0.0;
+            // The makespan rule (every batched lane, unless the legacy switch): the layer is placed from the cost
+            // table (kimi-prefill-cost.h, kimi_place_layer), as a decode layer is: the CPU and the GPU at their
+            // measured lines for this pass's size, the copies at the measured rate of their transport (from the
+            // page-locked ring or RAM slot: DMA on the link while the GPU computes; pageable: staged by the GPU's
+            // worker), the drive's line, and the form the reads take (the list schedule when they fit the ring,
+            // the coupled streamed form otherwise). The candidates move in order of routes, and the planner keeps the
+            // fewest within its form's resolution of the lowest time. The reads are then issued in the order the
+            // lanes need them (lane_start_us), so that the lanes overlap. Q2 and the legacy selector keep their
+            // fixed 2026-09 fits and serial greedy rule.
+            const bool makespan = batched && !prefill_legacy_schedule;
+            auto cpu_cost = [batched](int routes) {
+                return routes ? (batched ? 70.0 + 95.0 * routes : 70.0 + 184.0 * routes) : 0.0;
             };
-            auto gpu_cost = [this, mxfp4, makespan](int routes) {
-                return routes ? (makespan ? mxfp4_cost.gpu_fixed_us + mxfp4_cost.gpu_route_us * routes :
-                    mxfp4 ? 55.0 + 7.0 * routes : 15.0 + 39.0 * routes) : 0.0;
+            auto gpu_cost = [batched](int routes) {
+                return routes ? (batched ? 55.0 + 7.0 * routes : 15.0 + 39.0 * routes) : 0.0;
             };
-            const double link_bytes_per_us = mxfp4_cost.link_gbps * 1000.0;
-            const double drive_bytes_per_us = mxfp4_cost.drive_gbps * 1000.0;
-            // One routed input row as the tier copies it: the row, its token index and its weight.
-            const double activation_bytes_per_route = double(format_f32_input ? batch.f32_stride :
-                batch.quantized_stride) + sizeof(int32_t) + sizeof(float);
             auto expert_bytes = [&source](size_t i) {
                 return source[i].role[0].nbytes + source[i].role[1].nbytes + source[i].role[2].nbytes;
             };
-            auto upload_cost = [&](uint64_t bytes) {
-                return makespan ? double(bytes) / link_bytes_per_us : double(bytes) / (mxfp4 ? 6740.0 : 7000.0) + 10.0;
-            };
-            auto link_cost = [&](uint64_t bytes, int routes) {
-                return makespan ? (double(bytes) + activation_bytes_per_route * routes) / link_bytes_per_us : 0.0;
-            };
-            kimi_prefill_layer layer = {};
-            double drive_bytes = 0.0, first_read_bytes = 0.0;
-            for (size_t i = 0; i < source.size(); ++i) {
-                if (source[i].vram_slot >= 0) {
-                    layer.gpu += gpu_cost(token_routes[i]);
-                    layer.link += link_cost(0, token_routes[i]);
-                    layer.gpu_work = true;
-                    continue;
-                }
-                layer.cpu += cpu_cost(token_routes[i]);
-                if (source[i].cache_hit < 0) {
-                    drive_bytes += double(expert_bytes(i));
-                    if (first_read_bytes == 0.0) { first_read_bytes = double(expert_bytes(i)); }
-                }
-            }
-            if (makespan && drive_bytes_per_us > 0.0 && drive_bytes > 0.0) {
-                layer.drive = mxfp4_cost.drive_fixed_us + drive_bytes / drive_bytes_per_us;
-                layer.fill = first_read_bytes / drive_bytes_per_us;
-            }
-            layer.ring = double(ring_slots);
-            layer.gpu_overhead = !makespan ? 0.0 : double(batch.ntokens) * (mxfp4_cost.gpu_token_us >= 0.0 ?
-                mxfp4_cost.gpu_token_us : double(prefill_latent) * sizeof(float) / link_bytes_per_us);
+            auto upload_cost = [batched](uint64_t bytes) { return double(bytes) / (batched ? 6740.0 : 7000.0) + 10.0; };
             struct candidate { size_t index; int source; };
             std::vector<candidate> candidates;
             size_t ram_candidates = 0, ssd_candidates = 0;
+            auto ram_movable = [&](size_t i) {
+                return ram_threshold && source[i].cache_hit >= 0 && source[i].cache_lease && token_routes[i] >= ram_threshold;
+            };
+            auto ssd_movable = [&](size_t i) { return ssd_threshold && source[i].cache_hit < 0 && token_routes[i] >= ssd_threshold; };
             for (size_t i = 0; i < source.size(); ++i) {
                 if (source[i].vram_slot >= 0) { continue; }
-                if (ram_threshold && source[i].cache_hit >= 0 && source[i].cache_lease &&
-                        token_routes[i] >= ram_threshold) {
-                    candidates.push_back({i, KIMI_VRAM_PREFILL_TRANSIENT_RAM});
-                    ++ram_candidates;
-                } else if (ssd_threshold && source[i].cache_hit < 0 &&
-                        token_routes[i] >= ssd_threshold) {
-                    candidates.push_back({i, KIMI_VRAM_PREFILL_TRANSIENT_SSD});
-                    ++ssd_candidates;
-                }
+                if (ram_movable(i)) { candidates.push_back({i, KIMI_VRAM_PREFILL_TRANSIENT_RAM}); ++ram_candidates; }
+                else if (ssd_movable(i)) { candidates.push_back({i, KIMI_VRAM_PREFILL_TRANSIENT_SSD}); ++ssd_candidates; }
             }
             batch.gpu_ssd_transient_candidates = ssd_candidates;
             std::stable_sort(candidates.begin(), candidates.end(), [&](const candidate & a, const candidate & b) {
@@ -699,53 +725,34 @@ struct sink_vram {
                 std::min(ssd_staging_limit, size_t(ssd_cap));
             std::vector<candidate> chosen;
             double time_before = 0.0, time_after = 0.0;
-            // The layer's reads: every expert neither resident nor in the RAM cache, on either lane.
-            size_t reads = 0;
-            for (size_t i = 0; i < source.size(); ++i) { reads += source[i].vram_slot < 0 && source[i].cache_hit < 0; }
-            const bool in_ring = reads <= ring_slots;
+            double cpu_before = 0.0, gpu_before = 0.0, cpu_after = 0.0, gpu_after = 0.0, link_after = 0.0;
+            bool in_ring = false;
+            kimi_place_result placed;
             if (makespan) {
-                std::vector<kimi_prefill_move> moves;
-                std::vector<candidate> movable;
-                size_t ssd_movable = 0;
-                for (const candidate & item : candidates) {
-                    if (item.source == KIMI_VRAM_PREFILL_TRANSIENT_SSD && ssd_movable++ >= ssd_limit) { continue; }
-                    const int routes = token_routes[item.index];
-                    const uint64_t bytes = expert_bytes(item.index);
-                    moves.push_back({ cpu_cost(routes), gpu_cost(routes) + upload_cost(bytes), link_cost(bytes, routes) });
-                    movable.push_back(item);
+                const auto items = place_items(source, [&](size_t i) { return token_routes[i]; },
+                    [&](size_t i) { return ram_movable(i) || ssd_movable(i); }, [](size_t) { return false; });
+                kimi_place_limits limits;
+                limits.reads = ssd_limit;
+                // The batched engine of a GPU that reads host memory in place reads this pass's transients there when
+                // the evaluator finds it no slower than their copies (kimi_place_layer's in_place); a one-token pass
+                // is the decode shape (the vector engine, in place wherever the GPU can).
+                placed = kimi_place_layer(table, batch.ntokens, ring_slots, items.data(), items.size(), limits);
+                prefill_in_place = !table.one(batch.ntokens) && placed.in_place;
+                for (size_t i : placed.moved) {
+                    chosen.push_back({ i, source[i].cache_hit >= 0 ? KIMI_VRAM_PREFILL_TRANSIENT_RAM :
+                        KIMI_VRAM_PREFILL_TRANSIENT_SSD });
                 }
-                size_t best = 0;
-                if (in_ring) {
-                    // Every read is in flight at once: the list schedule over the reads' landing times (in request
-                    // order), the same evaluator as decode's. A transient's upload is the worker's own time.
-                    std::vector<kimi_place_expert> experts(source.size());
-                    kimi_place_lanes lanes = {};
-                    lanes.gpu_overhead = layer.gpu_overhead;
-                    double landed = 0.0;
-                    for (size_t i = 0; i < source.size(); ++i) {
-                        auto & x = experts[i];
-                        if (source[i].vram_slot >= 0) { x.resident = true; x.gpu = gpu_cost(token_routes[i]); continue; }
-                        x.cpu = cpu_cost(token_routes[i]);
-                        x.gpu = gpu_cost(token_routes[i]) + upload_cost(expert_bytes(i));
-                        if (source[i].cache_hit < 0 && drive_bytes_per_us > 0.0) {
-                            landed += double(expert_bytes(i)) / drive_bytes_per_us;
-                            x.ready = landed;
-                        }
-                    }
-                    lanes.reads_end = layer.drive;
-                    std::vector<size_t> order;
-                    for (const candidate & item : movable) { order.push_back(item.index); }
-                    std::vector<uint8_t> none(source.size(), 0);
-                    time_before = kimi_place_ring_time(lanes, experts.data(), experts.size(), none.data());
-                    best = kimi_place_ring_best_prefix(lanes, experts.data(), experts.size(), order.data(), order.size(),
-                        &time_after);
-                } else {
-                    time_before = kimi_prefill_time(layer, layer.cpu, layer.gpu, layer.link, layer.gpu_work);
-                    best = kimi_prefill_best_prefix(layer, moves.data(), moves.size(), &time_after);
+                time_before = placed.time_none; time_after = placed.time; in_ring = placed.ring;
+                for (size_t i = 0; i < source.size(); ++i) {
+                    if (source[i].vram_slot < 0) { cpu_before += table.cpu(batch.ntokens, token_routes[i]); }
                 }
-                chosen.assign(movable.begin(), movable.begin() + best);
+                cpu_after = placed.cpu; gpu_after = placed.gpu_lane; link_after = placed.link;
             } else {
-                double cpu_backlog = layer.cpu, gpu_backlog = layer.gpu;
+                for (size_t i = 0; i < source.size(); ++i) {
+                    if (source[i].vram_slot >= 0) { gpu_before += gpu_cost(token_routes[i]); }
+                    else { cpu_before += cpu_cost(token_routes[i]); }
+                }
+                double cpu_backlog = cpu_before, gpu_backlog = gpu_before;
                 time_before = std::max(cpu_backlog, gpu_backlog);
                 size_t ssd_selected = 0;
                 for (const candidate & item : candidates) {
@@ -760,11 +767,11 @@ struct sink_vram {
                     chosen.push_back(item);
                 }
                 time_after = std::max(cpu_backlog, gpu_backlog);
+                cpu_after = cpu_backlog; gpu_after = gpu_backlog;
             }
             size_t ram_selected = 0, ssd_selected = 0;
             uint64_t ram_selected_routes = 0, ssd_selected_routes = 0;
             uint64_t ram_selected_bytes = 0, ssd_selected_bytes = 0;
-            double cpu_after = layer.cpu, gpu_after = layer.gpu, link_after = layer.link;
             for (const candidate & item : chosen) {
                 const size_t index = item.index;
                 const int routes = token_routes[index];
@@ -787,49 +794,30 @@ struct sink_vram {
                 }
                 prefill_transient.push_back(selected);
                 source[index].vram_transient = true;
-                cpu_after -= cpu_cost(routes);
-                gpu_after += gpu_cost(routes) + upload_cost(bytes);
-                link_after += link_cost(bytes, routes);
             }
-            const bool gpu_work = layer.gpu_work || !chosen.empty();
             if (makespan) {
-                bool ram_locked = false;
-                for (const candidate & item : chosen) {
-                    ram_locked = ram_locked || (item.source == KIMI_VRAM_PREFILL_TRANSIENT_RAM && ram_slot_locked &&
-                        ram_slot_locked(source[item.index].cache_hit));
-                }
-                prefill_plan = { true, batch.ntokens, cpu_after, gpu_after, link_after, layer.drive, layer.fill,
-                    gpu_work ? layer.gpu_overhead : 0.0, time_after, ram_locked };
-                // Each lane's predicted start of its experts, in the order the lane takes them: the GPU worker
-                // its transients in selection order, the CPU the rest in request order.
-                double gpu_clock = 0.0, cpu_clock = 0.0;
-                for (const auto & item : prefill_transient) {
-                    const size_t index = size_t(item.request_index);
-                    source[index].lane_start_us = gpu_clock;
-                    gpu_clock += gpu_cost(token_routes[index]) + upload_cost(expert_bytes(index));
-                }
-                for (size_t i = 0; i < source.size(); ++i) {
-                    if (source[i].vram_slot >= 0 || source[i].vram_transient) { continue; }
-                    source[i].lane_start_us = cpu_clock;
-                    cpu_clock += cpu_cost(token_routes[i]);
-                }
+                prefill_plan = { true, batch.ntokens, placed.cpu, placed.gpu_lane, placed.link, placed.drive,
+                    placed.fill, placed.overhead, placed.time };
+                // Each lane's predicted start of its experts (the GPU's in selection order, a page-locked copy at its
+                // place on the link; the CPU's in request order), for the reads' issue order.
+                for (size_t i = 0; i < source.size(); ++i) { source[i].lane_start_us = placed.start[i]; }
             }
             std::fprintf(stderr,
                 "[kimi_cpu_prefill_schedule] format=%s rule=%s ram_threshold=%d ssd_threshold=%d ssd_limit=%zu "
                 "ram_candidates=%zu ram_selected=%zu ram_selected_routes=%llu ram_upload_bytes=%llu "
                 "ssd_candidates=%zu ssd_selected=%zu ssd_selected_routes=%llu ssd_upload_bytes=%llu "
                 "cpu_backlog_before_us=%.1f cpu_backlog_after_us=%.1f gpu_backlog_before_us=%.1f "
-                "gpu_backlog_after_us=%.1f link_backlog_before_us=%.1f link_backlog_us=%.1f "
-                "drive_us=%.1f fill_us=%.1f gpu_overhead_us=%.1f ring=%zu form=%s "
+                "gpu_backlog_after_us=%.1f link_backlog_us=%.1f "
+                "drive_us=%.1f fill_us=%.1f gpu_overhead_us=%.1f ring=%zu form=%s ring_locked=%d in_place=%d "
                 "makespan_before_us=%.1f makespan_after_us=%.1f scratch_available=1 displacement_slots=0\n",
-                mxfp4?"mxfp4":"q2",makespan?"makespan":"legacy",
+                batched ? "batched" : "q2", makespan ? "makespan" : "legacy",
                 ram_threshold,ssd_threshold,ssd_limit,
                 ram_candidates,ram_selected,(unsigned long long)ram_selected_routes,
                 (unsigned long long)ram_selected_bytes,ssd_candidates,ssd_selected,
                 (unsigned long long)ssd_selected_routes,(unsigned long long)ssd_selected_bytes,
-                layer.cpu,cpu_after,layer.gpu,gpu_after,layer.link,link_after,
-                layer.drive,layer.fill,gpu_work?layer.gpu_overhead:0.0,ring_slots,in_ring?"ring":"streamed",
-                time_before,time_after);
+                cpu_before,cpu_after,gpu_before,gpu_after,link_after,
+                placed.drive,placed.fill,placed.overhead,ring_slots,in_ring?"ring":"streamed",int(ring_locked),
+                int(prefill_in_place),time_before,time_after);
         }
 
         if (cold_admission_ready) {
@@ -902,14 +890,15 @@ struct sink_vram {
             const int32_t * route_requests, const float * weights, int nslots, int ntokens,
             const kimi_cpu_sink_activation & activation) {
         if (!context || !prefill_enabled || (!hits && prefill_transient.empty())) { return; }
-        const kimi_vram_activation a = {
-            activation.kind, activation.situ_beta, activation.situ_linear_beta, activation.swiglu_limit,
+        const kimi_vram_prefill_launch options = {
+            { activation.kind, activation.situ_beta, activation.situ_linear_beta, activation.swiglu_limit },
+            activation.post_exp_norm, activation.post_exp_norm_eps, int32_t(prefill_in_place),
         };
         const void * input = format_f32_input ? static_cast<const void *>(f32) : quantized;
         const size_t stride = format_f32_input ? f32_stride : quantized_stride;
         char error[512] = {};
         check(prefill_api->launch(context, input, stride, route_requests, weights, nslots, ntokens,
-                prefill_transient.data(), int(prefill_transient.size()), &a, error, sizeof(error)), error);
+                prefill_transient.data(), int(prefill_transient.size()), &options, error, sizeof(error)), error);
         prefill_job_active = true;
     }
     void finish_prefill(float * output, size_t stride, kimi_cpu_sink_prefill_batch & batch) {
@@ -934,70 +923,74 @@ struct sink_vram {
     void observe_prefill_cpu(int routes, double us) {
         if (prefill_plan.valid && routes > 0) { prefill_cpu_fit.add(double(routes), us); }
     }
-    // After each grouped-prefill layer: read_us is the I/O time with reads in flight, layer_us the layer so far.
+    // After each grouped-prefill layer: read_us is the I/O time with reads in flight, layer_us the layer so far. The
+    // batched lanes' lines are refit over the last pass's layers; table() then builds the cost table from them (with
+    // decode's lines and the tier's copy rates), and the calibrated line prints it by the names the start values take,
+    // with this layer's prediction (made before it ran, on the terms of then) against what it measured.
+    template <class Table>
     void calibrate_prefill(double cpu_us, const kimi_cpu_sink_prefill_batch & batch, uint64_t read_bytes,
-            double read_us, double layer_us) {
-        if (!format_mxfp4_input || mxfp4_prefill_legacy_schedule || !prefill_plan.valid) { return; }
+            double read_us, double layer_us, Table table) {
+        if (!prefill_batched || prefill_legacy_schedule || !prefill_plan.valid) { return; }
         const prefill_plan_state plan = prefill_plan;
         prefill_plan.valid = false;
-        // The link term is the rate of pageable copies (their enqueue stages the whole copy, so the worker's time is
-        // the copy's): the ring's, and the RAM cache's unless a RAM transient of the layer comes from a page-locked
-        // slot (the decode registrar): its enqueue returns at once and the worker's time is only what the copy left
-        // after one computation, not a rate. That layer's RAM transient time stays in the GPU lane, where the worker
-        // spent it.
-        const double link_bytes = double(batch.gpu_ssd_transient_upload_bytes) +
-            (plan.ram_locked ? 0.0 : double(batch.gpu_transient_upload_bytes));
-        const double link_us = batch.gpu_ssd_transient_upload_us + (plan.ram_locked ? 0.0 : batch.gpu_transient_upload_us);
+        // the batched lanes' lines: a one-token pass ran the vector engine and is priced as decode
+        if (plan.ntokens <= prefill_lane.vector_tokens) { return; }
         const double upload_us = batch.gpu_transient_upload_us + batch.gpu_ssd_transient_upload_us;
-        const bool gpu_work = prefill_stats.gpu_fit_experts > 0.0;
-        // The GPU lane as predicted: its experts and uploads. Outside them, the worker's time less its read waits (the
-        // output's zeroing, the routes' grouping, the output's copy back) and the output's addition at finish.
-        const double gpu_lane_us = prefill_stats.gpu_fit_us + upload_us;
-        const double gpu_overhead_us = !gpu_work ? 0.0 : prefill_stats.output_add_us +
-            std::max(0.0, prefill_stats.total_worker_us - prefill_stats.read_wait_us - gpu_lane_us);
-        kimi_prefill_fit gpu_experts;
+        const bool gpu_work = prefill_stats.gpu_fit_experts + prefill_stats.host_fit_experts > 0.0;
+        const bool engine = prefill_stats.engine_overhead_us > 0.0; // the batched engine, asynchronous, timed by events
+        // The GPU lane as predicted: its chains and the waits for their copies (the batched engine: the stall its
+        // events show; the MXFP4 engine: its uploads in the worker's time). Outside them, the batched engine's own
+        // time from its events (else the worker's time less its read waits: the output's zeroing, the routes'
+        // grouping, the output's copy back), and the output's addition at finish.
+        const double gpu_lane_us = prefill_stats.gpu_fit_us + prefill_stats.host_fit_us +
+            (engine ? prefill_stats.transient_wait_us : upload_us);
+        const double gpu_overhead_us = !gpu_work ? 0.0 : prefill_stats.output_add_us + (engine ? prefill_stats.engine_overhead_us :
+            std::max(0.0, prefill_stats.total_worker_us - prefill_stats.read_wait_us - gpu_lane_us));
+        kimi_prefill_fit gpu_experts, host_experts;
         gpu_experts.n = prefill_stats.gpu_fit_experts; gpu_experts.x = prefill_stats.gpu_fit_routes;
         gpu_experts.xx = prefill_stats.gpu_fit_routes_sq; gpu_experts.t = prefill_stats.gpu_fit_us;
         gpu_experts.xt = prefill_stats.gpu_fit_route_us;
-        const prefill_sample sample = { prefill_cpu_fit, gpu_experts, link_bytes, link_us, double(read_bytes),
-            read_us, gpu_overhead_us, gpu_work ? double(plan.ntokens) : 0.0 };
+        host_experts.n = prefill_stats.host_fit_experts; host_experts.x = prefill_stats.host_fit_routes;
+        host_experts.xx = prefill_stats.host_fit_routes_sq; host_experts.t = prefill_stats.host_fit_us;
+        host_experts.xt = prefill_stats.host_fit_route_us;
+        const prefill_sample sample = { prefill_cpu_fit, gpu_experts, host_experts, double(read_bytes), read_us,
+            gpu_overhead_us, gpu_work ? double(plan.ntokens) : 0.0 };
         if (prefill_samples.size() < prefill_window) { prefill_samples.push_back(sample); }
         else { prefill_samples[prefill_sample_next] = sample; }
         prefill_sample_next = (prefill_sample_next + 1) % prefill_window;
-        kimi_prefill_fit cpu, gpu, drive; // drive: per layer, its read time (us) against its bytes (MB)
-        double window_link_bytes = 0, window_link_us = 0, overhead_us = 0, gpu_tokens = 0;
+        kimi_prefill_fit cpu, gpu, gpu_host;
+        double overhead_us = 0, gpu_tokens = 0;
         for (const auto & s : prefill_samples) {
-            cpu.add(s.cpu); gpu.add(s.gpu);
-            window_link_bytes += s.link_bytes; window_link_us += s.link_us;
-            if (s.read_bytes > 0.0 && s.read_us > 0.0) { drive.add(s.read_bytes / 1e6, s.read_us); }
+            cpu.add(s.cpu); gpu.add(s.gpu); gpu_host.add(s.gpu_host);
             overhead_us += s.gpu_overhead_us; gpu_tokens += s.gpu_tokens;
         }
-        kimi_prefill_fit_line(cpu, mxfp4_prior.cpu_fixed_us, mxfp4_prior.cpu_route_us,
-            mxfp4_cost.cpu_fixed_us, mxfp4_cost.cpu_route_us);
-        kimi_prefill_fit_line(gpu, mxfp4_prior.gpu_fixed_us, mxfp4_prior.gpu_route_us,
-            mxfp4_cost.gpu_fixed_us, mxfp4_cost.gpu_route_us);
-        if (window_link_bytes > 0.0 && window_link_us > 0.0) { mxfp4_cost.link_gbps = window_link_bytes / window_link_us / 1000.0; }
-        if (drive.n > 0.0) {
-            // Without a start rate the prior is a line through the origin, which the fit scales to the samples' rate.
-            double us_per_mb = 0.0;
-            kimi_prefill_fit_line(drive, mxfp4_prior.drive_fixed_us,
-                mxfp4_prior.drive_gbps > 0.0 ? 1e3 / mxfp4_prior.drive_gbps : 1.0, mxfp4_cost.drive_fixed_us, us_per_mb);
-            if (us_per_mb > 0.0) { mxfp4_cost.drive_gbps = 1e3 / us_per_mb; }
-        }
-        if (gpu_tokens > 0.0) { mxfp4_cost.gpu_token_us = overhead_us / gpu_tokens; }
+        kimi_prefill_fit_line(cpu, prior.cpu_fixed_us, prior.cpu_route_us, cost.cpu_fixed_us, cost.cpu_route_us);
+        kimi_prefill_fit_line(gpu, prior.gpu_fixed_us, prior.gpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us);
+        kimi_prefill_fit_line(gpu_host, prior.gpu_host_fixed_us > 0 || prior.gpu_host_route_us > 0 ? prior.gpu_host_fixed_us :
+            prior.gpu_fixed_us, prior.gpu_host_fixed_us > 0 || prior.gpu_host_route_us > 0 ? prior.gpu_host_route_us :
+            prior.gpu_route_us, cost.gpu_host_fixed_us, cost.gpu_host_route_us);
+        if (gpu_tokens > 0.0) { cost.gpu_token_us = overhead_us / gpu_tokens; }
         ++cost_calibrations;
-        // The terms by the names GGML_KIMI_CPU_PREFILL_MXFP4_COST takes, then this layer's prediction (made before it
-        // ran, on the terms of then) against what it measured.
+        const kimi_place_table t = table();
         std::fprintf(stderr,
-            "[kimi_cpu_prefill_mxfp4_cost] calibrated=%llu tokens=%d samples=%zu cpu_fixed_us=%.3f cpu_route_us=%.3f "
-            "gpu_fixed_us=%.3f gpu_route_us=%.3f link_gbps=%.3f drive_gbps=%.3f drive_fixed_us=%.3f gpu_token_us=%.3f "
+            "[kimi_cpu_prefill_cost] calibrated=%llu tokens=%d samples=%zu cpu_fixed_us=%.3f cpu_route_us=%.3f "
+            "gpu_fixed_us=%.3f gpu_route_us=%.3f gpu_host_fixed_us=%.3f gpu_host_route_us=%.3f link_gbps=%.3f "
+            "pageable_gbps=%.3f drive_gbps=%.3f drive_fixed_us=%.3f gpu_token_us=%.3f cpu_one_us=%.1f "
             "predicted_us=%.1f measured_us=%.1f cpu_predicted_us=%.1f cpu_us=%.1f gpu_predicted_us=%.1f gpu_us=%.1f "
             "drive_predicted_us=%.1f drive_us=%.1f gpu_overhead_predicted_us=%.1f gpu_overhead_us=%.1f\n",
             (unsigned long long) cost_calibrations, plan.ntokens, prefill_samples.size(),
-            mxfp4_cost.cpu_fixed_us, mxfp4_cost.cpu_route_us, mxfp4_cost.gpu_fixed_us, mxfp4_cost.gpu_route_us,
-            mxfp4_cost.link_gbps, mxfp4_cost.drive_gbps, mxfp4_cost.drive_fixed_us, mxfp4_cost.gpu_token_us,
+            cost.cpu_fixed_us, cost.cpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us, cost.gpu_host_fixed_us,
+            cost.gpu_host_route_us, t.locked_us_per_mb > 0 ? 1e3 / t.locked_us_per_mb : 0.0,
+            t.pageable_us_per_mb > 0 ? 1e3 / t.pageable_us_per_mb : 0.0, t.drive_us_per_mb > 0 ? 1e3 / t.drive_us_per_mb : 0.0,
+            t.drive_fixed_us, cost.gpu_token_us, t.cpu_one_us,
             plan.layer_us, layer_us, plan.cpu_us, cpu_us, plan.gpu_us, gpu_lane_us,
             plan.drive_us, read_us, plan.gpu_overhead_us, gpu_overhead_us);
+    }
+    // The prefill window's drive samples (MB, us), for the table's drive line (fitted with decode's layers).
+    void prefill_reads(kimi_prefill_fit & drive) const {
+        for (const auto & s : prefill_samples) {
+            if (s.read_bytes > 0.0 && s.read_us > 0.0) { drive.add(s.read_bytes / 1e6, s.read_us); }
+        }
     }
     void cancel_prefill() {
         if (!context || !prefill_enabled ||
