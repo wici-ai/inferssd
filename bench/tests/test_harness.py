@@ -258,3 +258,31 @@ def test_reader_rejects_zero_unknown_and_duplicate_results(tmp_path, rows):
     path.write_text(json.dumps({"tests": rows}))
     with pytest.raises(ValueError):
         gate.read_results(path)
+
+
+def test_real_ctest_return77_is_skipped_not_passed(tmp_path):
+    # Exercise CTest's real JUnit contract, not a hand-written <skipped> fixture.
+    import shutil
+    cmake, ctest = shutil.which("cmake"), shutil.which("ctest")
+    if not cmake or not ctest:
+        pytest.skip("CMake/CTest unavailable for the JUnit integration fixture")
+    (tmp_path / "CMakeLists.txt").write_text(
+        'cmake_minimum_required(VERSION 3.16)\nproject(skip_contract NONE)\nenable_testing()\n'
+        f'add_test(NAME resource COMMAND "{sys.executable}" -c "raise SystemExit(77)")\n'
+        'set_tests_properties(resource PROPERTIES SKIP_RETURN_CODE 77)\n'
+        f'add_test(NAME ordinary_failure COMMAND "{sys.executable}" -c "raise SystemExit(1)")\n')
+    build = tmp_path / "build"
+    subprocess.run([cmake, "-S", str(tmp_path), "-B", str(build)], check=True, capture_output=True)
+    junit = tmp_path / "results.xml"
+    result = subprocess.run([ctest, "--test-dir", str(build), "--output-junit", str(junit)],
+                            check=False, capture_output=True, timeout=20)
+    assert result.returncode != 0  # the ordinary failure is never swallowed
+    actual = gate.read_results(junit)
+    assert actual == {"resource": "skipped", "ordinary_failure": "failed"}
+    report = gate.compare(actual, {"tests": {
+        "resource": {"expect": "passed"},
+        "ordinary_failure": {"expect": "failed", "reason": "negative control"}}})
+    assert not report["passed"] and report["counts"]["skipped"] == 1
+    all_skipped = gate.compare({"resource": actual["resource"]}, {"tests": {
+        "resource": {"expect": "skipped", "reason": "missing runtime prerequisite"}}})
+    assert not all_skipped["passed"] and {"error": "zero executed tests"} in all_skipped["differences"]
