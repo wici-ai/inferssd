@@ -631,6 +631,15 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
                            "{%- if false %}");
     }
 
+    // Muse defaults effort to none. Guard membership before the older Jinja
+    // evaluator sees it, including capability detection before parser selection.
+    for (auto * source : { &default_template_src, &template_tool_use_src }) {
+        if (source->find("to=commentary") != std::string::npos && source->find("<|eom|>") != std::string::npos) {
+            string_replace_all(*source, "reasoning_effort in reasoning_effort_map",
+                               "(reasoning_effort is not none and reasoning_effort in reasoning_effort_map)");
+        }
+    }
+
     std::string token_bos = bos_token_override;
     std::string token_eos = eos_token_override;
     bool        add_bos   = false;
@@ -672,6 +681,17 @@ common_chat_templates_ptr common_chat_templates_init(const struct llama_model * 
             tmpls->template_tool_use = std::make_unique<common_chat_template>(template_tool_use_src, token_bos, token_eos);
         } catch (const std::exception & e) {
             LOG_ERR("%s: failed to parse tool use chat template (ignoring it): %s\n", __func__, e.what());
+        }
+    }
+    for (auto * tmpl : { tmpls->template_default.get(), tmpls->template_tool_use.get() }) {
+        if (tmpl && tmpl->source().find("to=commentary") != std::string::npos &&
+                tmpl->source().find("<|eom|>") != std::string::npos) {
+            // Macro-heavy Muse templates defeat this fork's dynamic capability
+            // probe. These capabilities are exercised in the Muse chat tests.
+            auto & caps = tmpl->caps;
+            caps.supports_string_content = caps.supports_typed_content = true;
+            caps.supports_tools = caps.supports_tool_calls = caps.supports_parallel_tool_calls = true;
+            caps.supports_system_role = caps.supports_preserve_reasoning = caps.supports_object_arguments = true;
         }
     }
     return tmpls;
@@ -2246,7 +2266,11 @@ static common_chat_params common_chat_params_init_muse_spark(const common_chat_t
                                                                const autoparser::generation_params & inputs) {
     common_chat_params data;
 
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_input_spans);
+    json context = json::object();
+    if (!inputs.extra_context.is_object() || !inputs.extra_context.contains("disable_reasoning")) {
+        context["disable_reasoning"] = !inputs.enable_thinking;
+    }
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, context, &data.prompt_input_spans);
     data.generation_prompt = "<|start|>assistant";
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
@@ -2263,6 +2287,19 @@ static common_chat_params common_chat_params_init_muse_spark(const common_chat_t
     auto has_tools = inputs.tools.is_array() && !inputs.tools.empty();
     // Constrained grammar whenever tools are offered.
     auto include_grammar = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+
+    const bool disable_reasoning = inputs.extra_context.is_object() && inputs.extra_context.contains("disable_reasoning")
+        ? inputs.extra_context.at("disable_reasoning").get<bool>() : !inputs.enable_thinking;
+    if (disable_reasoning && !include_grammar) {
+        // The template only removes "self" from its recipient instructions.
+        // Prefill the final-answer header so a text-only non-thinking request
+        // cannot spend its entire generation budget choosing the self channel.
+        const std::string final_header = " to=user<|message|>";
+        if (inputs.add_generation_prompt && string_ends_with(data.prompt, data.generation_prompt)) {
+            data.prompt += final_header;
+        }
+        data.generation_prompt += final_header;
+    }
 
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto start = p.rule("start", p.literal("<|start|>assistant"));
@@ -2557,7 +2594,10 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     }
 
     if (auto result = common_chat_try_specialized_template(tmpl, src, params)) {
-        result->generation_prompt = params.generation_prompt;
+        // Muse can extend its generation prefix for a non-thinking request.
+        if (result->generation_prompt.empty()) {
+            result->generation_prompt = params.generation_prompt;
+        }
         return *result;
     }
 
