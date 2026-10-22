@@ -110,14 +110,29 @@ def observe(module, case):
 
 
 GOLDENS = json.loads((FIXTURES / "prefill-model-goldens.json").read_text())
+OLDER_GOLDENS = json.loads((FIXTURES / "prefill-model-python39.json").read_text())
+
+
+def frozen_expected(case):
+    # Select only measured runtimes; future arithmetic is not inferred from a range.
+    if sys.version_info[:2] == (3, 9):
+        return OLDER_GOLDENS["overrides"].get(case["name"], case["expected"])
+    if sys.version_info[:2] == (3, 12):
+        return case["expected"]
+    pytest.skip("Frozen runtime transcripts were recorded on Python 3.9 and 3.12")
 
 
 def test_frozen_oracle_identity():
     manifest = json.loads((FIXTURES / "oracle/prefill-manifest.json").read_text())
     assert hashlib.sha256(ORACLE_PATH.read_bytes()).hexdigest() == manifest["sha256"]
     assert manifest["revision"] == "8b12192920b339a4ef31c9006d1ebe20304ce45a"
+    assert OLDER_GOLDENS["oracle_sha256"] == GOLDENS["oracle_sha256"]
+    assert (
+        OLDER_GOLDENS["base_goldens_sha256"]
+        == hashlib.sha256((FIXTURES / "prefill-model-goldens.json").read_bytes()).hexdigest()
+    )
 
 
 @pytest.mark.parametrize("case", GOLDENS["cases"], ids=lambda case: case["name"])
 def test_frozen_prefill_model(case):
-    assert observe(ORACLE, case) == case["expected"]
+    assert observe(ORACLE, case) == frozen_expected(case)
