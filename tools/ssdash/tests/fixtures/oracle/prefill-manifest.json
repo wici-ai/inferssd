@@ -1,0 +1,10 @@
+{
+  "revision": "8b12192920b339a4ef31c9006d1ebe20304ce45a",
+  "source": "tools/adaptive/prefill.py",
+  "blob": "8bd2d6f65a254c32d13a63673382e0753ed73fb8",
+  "sha256": "72215b6b10d796096feddf7eb5cd81f0321de0b9ce5a102de5156979f1e21ccd",
+  "extraction_scope": [
+    "coupled:46-56",
+    "lane_layer:59-111"
+  ]
+}
