@@ -279,6 +279,33 @@ static sink_ptr make_sink(fixture & f, int threads, int depth) {
     return sink_ptr(sink, kimi_cpu_sink_destroy);
 }
 
+// A fresh expert-job sink must publish its row participants before dispatch.
+// Compare one expert with the ordinary phase path, without a model or cache.
+static void expert_job_first_call_test() {
+    setenv("GGML_KIMI_CPU_SINK_READ_FIXED", "0", 1);
+    setenv("GGML_KIMI_CPU_SINK_SPLIT_CV", "1", 1);
+    setenv("GGML_KIMI_CPU_SINK_DYNAMIC_ROWS", "0", 1);
+    unsetenv("GGML_KIMI_CPU_SINK_ROW_WEIGHTS");
+    fixture f; make_synthetic(f);
+    tensors meta(f, 1);
+    std::vector<float> input(f.latent, .125f), baseline(f.latent), actual(f.latent);
+    const int32_t id = 3;
+    const float weight = 1;
+    for (int threads : { 2, 4 }) {
+        for (int job = 0; job <= 1; ++job) {
+            setenv("GGML_KIMI_CPU_SINK_EXPERT_JOB", job ? "1" : "0", 1);
+            auto sink = make_sink(f, threads, 1);
+            char error[512] = {};
+            require(kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
+                    input.data(), &id, &weight, 1, 4, 25, job ? actual.data() : baseline.data(),
+                    nullptr, error, sizeof(error)), error);
+        }
+        require(std::memcmp(baseline.data(), actual.data(), baseline.size() * sizeof(float)) == 0,
+                "expert job first call differs from ordinary compute phase");
+    }
+    std::puts("EXPERT_JOB_FIRST_CALL_OK threads=2,4 experts=1");
+}
+
 struct sample_result {
     kimi_cpu_sink_stats stats = {};
     double max_abs = 0, rel_l2 = 0, wall_us = 0, user_us = 0, system_us = 0;
@@ -3287,7 +3314,7 @@ int main(int argc, char ** argv) {
     try {
         real_options options; bool ring_set = false, registered_lifecycle = false, cache_mode = false, cache_pressure = false;
         bool trace_profile_mode = false, max_cache_mode = false, hitrate_mode = false, elastic_cache_mode = false;
-        bool expert_job_mode = false, schedules_mode = false, schedule_invalid_mode = false, early_up_gate_mode = false;
+        bool expert_job_first_call = false, expert_job_mode = false, schedules_mode = false, schedule_invalid_mode = false, early_up_gate_mode = false;
         bool role_major_mode = false, nonblocking_down_mode = false;
         bool poll_mode = false, poll_early_mode = false, cache_compute_mode = false, cache_location_mode = false;
         bool cache_policy_mode = false, cache_large_mode = false, cache_pressure_transition = false, cache_unbounded = false;
@@ -3308,6 +3335,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--trace-profile")) { trace_profile_mode = true; }
             else if (!std::strcmp(argv[i], "--prefetch-tests")) { prefetch_mode = true; }
             else if (!std::strcmp(argv[i], "--registered-lifecycle")) { registered_lifecycle = true; }
+            else if (!std::strcmp(argv[i], "--expert-job-first-call")) { expert_job_first_call = true; }
             else if (!std::strcmp(argv[i], "--expert-job-tests")) { expert_job_mode = true; }
             else if (!std::strcmp(argv[i], "--early-up-gate-tests")) { early_up_gate_mode = true; }
             else if (!std::strcmp(argv[i], "--role-major-tests")) { role_major_mode = true; }
@@ -3336,6 +3364,7 @@ int main(int argc, char ** argv) {
             else { throw std::runtime_error("usage: test-kimi-cpu-sink [--registered-lifecycle|--cache-tests|--cache-pressure] [--threads N] [--real-pack FILE --fixture-prefix PREFIX --ring-experts N --repeats N --warmup N --policy fixture|top16|top8|mass085 --jsonl FILE --resident-dir TMPFS]"); }
         }
         require(options.repeats >= 1 && options.repeats <= 10000 && options.warmup >= 0 && options.warmup <= 10000, "invalid repeat/warmup count");
+        if (expert_job_first_call) { expert_job_first_call_test(); return 0; }
         if (auto_ring_mode) { cache_auto_ring_test(options.threads, ring_set ? options.ring_experts : 8); return 0; }
         if (muse_q8_mode) { muse_expert_norm_test(options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_Q8_0); return 0; }
         if (muse_bf16_mode) {
