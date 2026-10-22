@@ -1788,6 +1788,15 @@ void llama_model_loader::done_getting_tensors() const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+#if defined(__APPLE__)
+    // SSD-backed models can be much larger than unified memory. Allow the
+    // macOS profile to fault in only the pages that inference actually uses.
+    const char * mmap_prefetch = std::getenv("LLAMA_MMAP_PREFETCH");
+    if (mmap_prefetch && std::strcmp(mmap_prefetch, "0") == 0) {
+        prefetch = false;
+        LLAMA_LOG_INFO("%s: mmap prefetch disabled by LLAMA_MMAP_PREFETCH=0\n", __func__);
+    }
+#endif
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
