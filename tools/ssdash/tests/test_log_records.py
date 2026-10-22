@@ -232,3 +232,23 @@ def test_f_log_source_identity():
             hashlib.sha256((FIXTURES / "oracle" / item["file"]).read_bytes()).hexdigest()
             == item["sha256"]
         )
+
+
+@contextlib.contextmanager
+def candidate_api(files):
+    from ssdash.telemetry import legacy, recorded
+
+    yield SimpleNamespace(
+        ArmParser=legacy.ArmParser,
+        result=lambda p, d, s: p.result(d, s, files=files),
+        read_arm=lambda d, s=128, p=None: recorded.read_arm(d, s, p, files=files),
+        ledger=lambda d: recorded.ledger(d, files=files),
+        hits=legacy.hits,
+        window_rate=legacy.window_rate,
+        median=legacy.median,
+    )
+
+
+@pytest.mark.parametrize("case", DATA["cases"], ids=lambda c: c["name"])
+def test_candidate_log_records(case):
+    assert observe(case, candidate_api) == case["expected"][runtime_key()]
