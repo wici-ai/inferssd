@@ -160,6 +160,7 @@ def test_guardian_normal_cleanup_releases_same_lease(tmp_path):
 def test_controller_sigkill_worker_cleans_child_before_lock_release(tmp_path):
     controller = guardian_fixture(tmp_path, "disconnect")
     identities = None
+    verified = False
     try:
         wait_for(lambda: (tmp_path / "active.json").exists())
         identities = json.loads((tmp_path / "active.json").read_text())
@@ -171,14 +172,15 @@ def test_controller_sigkill_worker_cleans_child_before_lock_release(tmp_path):
         assert json.loads((tmp_path / "receipt.json").read_text())["status"] == "failed"
         with pytest.raises(ProcessLookupError):
             os.kill(identities["child"], 0)
+        verified = True
     finally:
         if controller.poll() is None:
             controller.kill(); controller.wait()
-        if identities:
+        if identities and not verified:
             for pid in identities.values():
                 try:
                     os.killpg(pid, signal.SIGKILL)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
                     pass
 
 
