@@ -7436,7 +7436,8 @@ void ggml_build_backward_expand(
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     void * ptr = *p;
     ptr = (void *) GGML_PAD((uintptr_t) ptr, align);
-    *p = (void *) ((char *) ptr + size);
+    // Also used to measure a layout from address zero; do not add to a null pointer.
+    *p = (void *) ((uintptr_t) ptr + size);
     return ptr;
 }
 
