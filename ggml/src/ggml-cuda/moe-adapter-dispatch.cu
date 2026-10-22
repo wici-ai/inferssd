@@ -3,6 +3,16 @@
 #include <atomic>
 #include <cstdio>
 
+#if defined(GGML_SSD_STORE)
+#include "store.h"
+namespace ggml_moe {
+void adapter_select_model_shape(int64_t experts, size_t bytes, const char * source) {
+    ggml_ssd_c0_select_model_shape(experts, bytes, source);
+}
+bool adapter_uses_common() { return ggml_ssd_c0_uses_common(); }
+bool adapter_is_selected() { return ggml_ssd_c0_shape_selected(); }
+} // namespace ggml_moe
+#else
 namespace ggml_moe {
 
 enum adapter_kind : int {
@@ -75,6 +85,8 @@ bool adapter_is_selected() {
 }
 
 } // namespace ggml_moe
+
+#endif
 
 extern "C" void ggml_cuda_moe_adapter_select_model_shape(
         int64_t n_experts,

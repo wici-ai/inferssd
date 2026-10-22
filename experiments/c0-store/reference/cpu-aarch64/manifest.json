@@ -1,0 +1,723 @@
+{
+  "schema_version": 1,
+  "protocol": "cpu-raw-phase-v2",
+  "baseline_revision": "8b12192920b339a4ef31c9006d1ebe20304ce45a",
+  "recording_source_revision": "3e100e7a5f738cc7df1aaa6c65d066e8657b276c",
+  "architecture": "aarch64",
+  "compiler": "GCC 13.3.0",
+  "engine_build": "Release O3, native OFF, ffp-contract OFF, OpenMP ON, LLAMAFILE ON, CPU-only shared store",
+  "runner_source_sha256": "7d70ff1dd0446bcd199f851e003de1f7c192b2cacce902ace4a9442498038f74",
+  "generator": {
+    "path": "experiments/c0-store/make-tiny.py",
+    "sha256": "637c2d8219ca9a506dc2a773700cc074fa8cb689f128839b303021bcfe2c41bc",
+    "seed": 20261022,
+    "numpy": "2.0.2",
+    "gguf_source_revision": "df95487f8c1b48054a8136f6655cba399e24c299"
+  },
+  "model_params": {
+    "n_gpu_layers": 0,
+    "use_mmap": true,
+    "use_extra_bufts": true,
+    "defer_experts": false,
+    "remaining": "llama_model_default_params at pinned engine source"
+  },
+  "context_params": {
+    "n_ctx": 128,
+    "n_batch": 16,
+    "n_ubatch": 16,
+    "n_seq_max": 1,
+    "n_threads": 2,
+    "n_threads_batch": 2,
+    "op_offload": false,
+    "offload_kqv": false,
+    "flash_attn_type": "DISABLED",
+    "type_k": "F16",
+    "type_v": "F16",
+    "swa_full": true,
+    "kv_unified": false,
+    "samplers": null,
+    "n_samplers": 0,
+    "remaining": "llama_context_default_params at pinned engine source"
+  },
+  "input_tokens": [
+    3,
+    4,
+    5,
+    6
+  ],
+  "output_tokens": 4,
+  "requests_per_process": 2,
+  "selection": "argmax on raw finite logits, lowest token ID tie, ignore EOS",
+  "phase_lifecycle": {
+    "api": "llama_moe_prefill_phase_workspace_sized_ex",
+    "existing_export_in_both_fixed_libraries": true,
+    "sequence": [
+      [
+        1,
+        4,
+        4
+      ],
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ]
+    ],
+    "boundaries": [
+      "after KV clear, before prompt decode",
+      "after first full raw row synchronized and copied",
+      "after final full raw row synchronized and copied"
+    ],
+    "require_bool_success": true,
+    "not_numerically_comparable_to_version1_protocol": true
+  },
+  "recorded_libraries": [
+    {
+      "file": "libggml-base.so.0.10.0",
+      "sha256": "8a41739e648faca5740beaeaba23a291e4a0cc66fe2a7af1fa73bac79e251cdd"
+    },
+    {
+      "file": "libggml.so.0.10.0",
+      "sha256": "558ced5700c809f1c085345afd8892c52bce9831db3246b1702ce1a1571fcff3"
+    },
+    {
+      "file": "libggml-cpu.so.0.10.0",
+      "sha256": "19f69172bdb020e6db3cc62542e815a810c15b28d2326b4d63648c1687e4cb64"
+    },
+    {
+      "file": "libllama.so.0.0.0",
+      "sha256": "c43197e021dc7e8f95b81b5af0b88304758522700aa37ecfd03e446842f3a84c"
+    },
+    {
+      "file": "libggml-ssd-c0-store.so",
+      "sha256": "52327f72fe85a5914a5e3768ec140c2ef373d33b427ba168d3a4f2da361d2b55"
+    }
+  ],
+  "verification": {
+    "processes": 18,
+    "requests": 36,
+    "full_raw_rows": 144,
+    "comparison": "six F / CPU-only / CPU-only triplets, each with two KV-cleared requests; all output bytes and token IDs exact",
+    "same_process_repeat_exact": true,
+    "positive_grouped_prefill_and_cache_coverage": true,
+    "normal_cleanup": true,
+    "cross_architecture_golden": false,
+    "performance_benchmark": false
+  },
+  "cases": [
+    {
+      "model": "deepseek41-mxfp4",
+      "source_mode": "pack",
+      "generated_input": "deepseek41-mxfp4.gguf",
+      "source_payloads": {
+        "gguf": {
+          "file": "deepseek41-mxfp4.gguf",
+          "bytes": 6807552,
+          "sha256": "bd3cfff70645ffc93391779b14b00075b66aa7de4e8bbf0b019eadbc8fbcc9d9"
+        },
+        "pack": {
+          "file": "deepseek41-mxfp4.pack",
+          "bytes": 3555328,
+          "sha256": "e4614151ed2074d9a79c8a1e0ba547a5bd9082496c4ef69e28a1fe60ad18144c"
+        }
+      },
+      "settings": {
+        "GGML_KIMI_CPU_SINK": "1",
+        "GGML_KIMI_CPU_SINK_THREADS": "2",
+        "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+        "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "16",
+        "GGML_KIMI_CPU_SINK_CACHE_BYTES": "16777216",
+        "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "1",
+        "GGML_KIMI_CPU_SINK_CACHE_POLICY": "count_decay2",
+        "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+        "GGML_KIMI_CPU_SINK_PREFETCH": "0",
+        "GGML_MOE_IO_BACKEND": "direct",
+        "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+        "GGML_KIMI_CPU_SINK_TRACE": "1"
+      },
+      "selected_ids": [
+        137,
+        97,
+        208,
+        159
+      ],
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 16,
+        "effective_n_ubatch": 16
+      },
+      "rows": [
+        {
+          "step": 0,
+          "position": 3,
+          "batch_tokens": 4,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "12176ec5a3e4fbca588e2a536314dc804a1f2f5ddbb1457a15fac67a5b9ac92b",
+          "selected_id": 137,
+          "file": "deepseek41-mxfp4/pack/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 4,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "aac57b808340961be30b2264eaf96465427177f700b41d18a6d0bb0bccb705d0",
+          "selected_id": 97,
+          "file": "deepseek41-mxfp4/pack/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 5,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "3fd52ccef0c4b4c563b5c310878344c8a6fb9c4b2301fcf728a5c6b25558cc4b",
+          "selected_id": 208,
+          "file": "deepseek41-mxfp4/pack/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 6,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "496a0b2e027f414c255ca7e3927361808d37afeda166a13b74d681f035113b98",
+          "selected_id": 159,
+          "file": "deepseek41-mxfp4/pack/step-3.f32"
+        }
+      ],
+      "source_selection": {
+        "environment_key": "GGML_MOE_EXPERT_PACK",
+        "file": "deepseek41-mxfp4.pack"
+      }
+    },
+    {
+      "model": "deepseek41-mxfp4",
+      "source_mode": "alias",
+      "generated_input": "deepseek41-mxfp4.gguf",
+      "source_payloads": {
+        "gguf": {
+          "file": "deepseek41-mxfp4.gguf",
+          "bytes": 6807552,
+          "sha256": "bd3cfff70645ffc93391779b14b00075b66aa7de4e8bbf0b019eadbc8fbcc9d9"
+        },
+        "pack": {
+          "file": "deepseek41-mxfp4.pack",
+          "bytes": 3555328,
+          "sha256": "e4614151ed2074d9a79c8a1e0ba547a5bd9082496c4ef69e28a1fe60ad18144c"
+        }
+      },
+      "settings": {
+        "GGML_KIMI_CPU_SINK": "1",
+        "GGML_KIMI_CPU_SINK_THREADS": "2",
+        "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+        "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "16",
+        "GGML_KIMI_CPU_SINK_CACHE_BYTES": "16777216",
+        "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "1",
+        "GGML_KIMI_CPU_SINK_CACHE_POLICY": "count_decay2",
+        "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+        "GGML_KIMI_CPU_SINK_PREFETCH": "0",
+        "GGML_MOE_IO_BACKEND": "direct",
+        "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+        "GGML_KIMI_CPU_SINK_TRACE": "1"
+      },
+      "selected_ids": [
+        137,
+        97,
+        208,
+        159
+      ],
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 16,
+        "effective_n_ubatch": 16
+      },
+      "rows": [
+        {
+          "step": 0,
+          "position": 3,
+          "batch_tokens": 4,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "12176ec5a3e4fbca588e2a536314dc804a1f2f5ddbb1457a15fac67a5b9ac92b",
+          "selected_id": 137,
+          "file": "deepseek41-mxfp4/alias/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 4,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "aac57b808340961be30b2264eaf96465427177f700b41d18a6d0bb0bccb705d0",
+          "selected_id": 97,
+          "file": "deepseek41-mxfp4/alias/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 5,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "3fd52ccef0c4b4c563b5c310878344c8a6fb9c4b2301fcf728a5c6b25558cc4b",
+          "selected_id": 208,
+          "file": "deepseek41-mxfp4/alias/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 6,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "496a0b2e027f414c255ca7e3927361808d37afeda166a13b74d681f035113b98",
+          "selected_id": 159,
+          "file": "deepseek41-mxfp4/alias/step-3.f32"
+        }
+      ],
+      "source_selection": {
+        "environment_key": "GGML_MOE_EXPERT_GGUF_ALIAS_TSV",
+        "file": "deepseek41-mxfp4.alias.tsv",
+        "range_count": 96,
+        "normalized_sha256": "baa72a29af2bcfb2f09e91c8681fa976735e3d4f27a669e6023edd4e905519af",
+        "normalization": "Replace only source_path column with its basename; retain header/rows/column text/order, tab separators and LF after every row. Valid only for this one-GGUF fixture."
+      }
+    },
+    {
+      "model": "muse-spark-q4_k",
+      "source_mode": "pack",
+      "generated_input": "muse-spark-q4_k.gguf",
+      "source_payloads": {
+        "gguf": {
+          "file": "muse-spark-q4_k.gguf",
+          "bytes": 7102464,
+          "sha256": "e749313c15c251efd37a14b9317903cf9b0a848f22bc571e5512d971011a07a3"
+        },
+        "pack": {
+          "file": "muse-spark-q4_k.pack",
+          "bytes": 3555328,
+          "sha256": "c1ebb08932880f804484bf48114cc73d7179c62bd2229069e4959bb8c62e5f4d"
+        }
+      },
+      "settings": {
+        "GGML_KIMI_CPU_SINK": "1",
+        "GGML_KIMI_CPU_SINK_THREADS": "2",
+        "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+        "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "16",
+        "GGML_KIMI_CPU_SINK_CACHE_BYTES": "16777216",
+        "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "1",
+        "GGML_KIMI_CPU_SINK_CACHE_POLICY": "count_decay2",
+        "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+        "GGML_KIMI_CPU_SINK_PREFETCH": "0",
+        "GGML_MOE_IO_BACKEND": "direct",
+        "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+        "GGML_KIMI_CPU_SINK_TRACE": "1"
+      },
+      "selected_ids": [
+        228,
+        246,
+        55,
+        245
+      ],
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 16,
+        "effective_n_ubatch": 16
+      },
+      "rows": [
+        {
+          "step": 0,
+          "position": 3,
+          "batch_tokens": 4,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "bdc4de7cecf8715c2fcd93a1012390907509fb15920f4bc41115638232ffde55",
+          "selected_id": 228,
+          "file": "muse-spark-q4_k/pack/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 4,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "4317aa2e2ccc34c993369da06f2598ee3786ac4c2c60ad02d9a83bfd4b2fd08b",
+          "selected_id": 246,
+          "file": "muse-spark-q4_k/pack/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 5,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "0fc8df08caec4e24d3930a4f3c501444524f872a37782b4c7c66c699dca5025a",
+          "selected_id": 55,
+          "file": "muse-spark-q4_k/pack/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 6,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "2ad9c488fbc4fd73265fc326b0b6969b8ceb0997e4d6b8ab74892dd0cf8548b7",
+          "selected_id": 245,
+          "file": "muse-spark-q4_k/pack/step-3.f32"
+        }
+      ],
+      "source_selection": {
+        "environment_key": "GGML_MOE_EXPERT_PACK",
+        "file": "muse-spark-q4_k.pack"
+      }
+    },
+    {
+      "model": "muse-spark-q4_k",
+      "source_mode": "alias",
+      "generated_input": "muse-spark-q4_k.gguf",
+      "source_payloads": {
+        "gguf": {
+          "file": "muse-spark-q4_k.gguf",
+          "bytes": 7102464,
+          "sha256": "e749313c15c251efd37a14b9317903cf9b0a848f22bc571e5512d971011a07a3"
+        },
+        "pack": {
+          "file": "muse-spark-q4_k.pack",
+          "bytes": 3555328,
+          "sha256": "c1ebb08932880f804484bf48114cc73d7179c62bd2229069e4959bb8c62e5f4d"
+        }
+      },
+      "settings": {
+        "GGML_KIMI_CPU_SINK": "1",
+        "GGML_KIMI_CPU_SINK_THREADS": "2",
+        "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+        "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "16",
+        "GGML_KIMI_CPU_SINK_CACHE_BYTES": "16777216",
+        "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "1",
+        "GGML_KIMI_CPU_SINK_CACHE_POLICY": "count_decay2",
+        "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+        "GGML_KIMI_CPU_SINK_PREFETCH": "0",
+        "GGML_MOE_IO_BACKEND": "direct",
+        "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+        "GGML_KIMI_CPU_SINK_TRACE": "1"
+      },
+      "selected_ids": [
+        228,
+        246,
+        55,
+        245
+      ],
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 16,
+        "effective_n_ubatch": 16
+      },
+      "rows": [
+        {
+          "step": 0,
+          "position": 3,
+          "batch_tokens": 4,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "bdc4de7cecf8715c2fcd93a1012390907509fb15920f4bc41115638232ffde55",
+          "selected_id": 228,
+          "file": "muse-spark-q4_k/alias/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 4,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "4317aa2e2ccc34c993369da06f2598ee3786ac4c2c60ad02d9a83bfd4b2fd08b",
+          "selected_id": 246,
+          "file": "muse-spark-q4_k/alias/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 5,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "0fc8df08caec4e24d3930a4f3c501444524f872a37782b4c7c66c699dca5025a",
+          "selected_id": 55,
+          "file": "muse-spark-q4_k/alias/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 6,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "2ad9c488fbc4fd73265fc326b0b6969b8ceb0997e4d6b8ab74892dd0cf8548b7",
+          "selected_id": 245,
+          "file": "muse-spark-q4_k/alias/step-3.f32"
+        }
+      ],
+      "source_selection": {
+        "environment_key": "GGML_MOE_EXPERT_GGUF_ALIAS_TSV",
+        "file": "muse-spark-q4_k.alias.tsv",
+        "range_count": 96,
+        "normalized_sha256": "6766971c34b1e8f65261c3d1a076299ebed1596ccce1cae64761df70d12a03b0",
+        "normalization": "Replace only source_path column with its basename; retain header/rows/column text/order, tab separators and LF after every row. Valid only for this one-GGUF fixture."
+      }
+    },
+    {
+      "model": "muse-spark-q5_k",
+      "source_mode": "pack",
+      "generated_input": "muse-spark-q5_k.gguf",
+      "source_payloads": {
+        "gguf": {
+          "file": "muse-spark-q5_k.gguf",
+          "bytes": 7888896,
+          "sha256": "eb95c04f7972be265884a01100425cb16cc7ca51aa2b7e708589b99531d76ddb"
+        },
+        "pack": {
+          "file": "muse-spark-q5_k.pack",
+          "bytes": 4341760,
+          "sha256": "085bd690491b35486cb246226de1683817a44d8403546e919787cb4b652b7ee3"
+        }
+      },
+      "settings": {
+        "GGML_KIMI_CPU_SINK": "1",
+        "GGML_KIMI_CPU_SINK_THREADS": "2",
+        "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+        "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "16",
+        "GGML_KIMI_CPU_SINK_CACHE_BYTES": "16777216",
+        "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "1",
+        "GGML_KIMI_CPU_SINK_CACHE_POLICY": "count_decay2",
+        "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+        "GGML_KIMI_CPU_SINK_PREFETCH": "0",
+        "GGML_MOE_IO_BACKEND": "direct",
+        "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+        "GGML_KIMI_CPU_SINK_TRACE": "1"
+      },
+      "selected_ids": [
+        22,
+        203,
+        183,
+        195
+      ],
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 16,
+        "effective_n_ubatch": 16
+      },
+      "rows": [
+        {
+          "step": 0,
+          "position": 3,
+          "batch_tokens": 4,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "9337f362f52fd8c32a417fdc53f2f2c4811e1d4cf9935115b216cf1e819010b1",
+          "selected_id": 22,
+          "file": "muse-spark-q5_k/pack/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 4,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "7c6c9deec108c58ccff40a8a336f3461b877c0656a1803827fe3d0a9b373479f",
+          "selected_id": 203,
+          "file": "muse-spark-q5_k/pack/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 5,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "217fd0bacab7dcd4ee9139df4f042c750ad20c8a12f246ba230b124a9b034c01",
+          "selected_id": 183,
+          "file": "muse-spark-q5_k/pack/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 6,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "eca06010ee4d810686be0c07e1e41e828b0b0bef3b91e1e3c7520ac39b791268",
+          "selected_id": 195,
+          "file": "muse-spark-q5_k/pack/step-3.f32"
+        }
+      ],
+      "source_selection": {
+        "environment_key": "GGML_MOE_EXPERT_PACK",
+        "file": "muse-spark-q5_k.pack"
+      }
+    },
+    {
+      "model": "muse-spark-q5_k",
+      "source_mode": "alias",
+      "generated_input": "muse-spark-q5_k.gguf",
+      "source_payloads": {
+        "gguf": {
+          "file": "muse-spark-q5_k.gguf",
+          "bytes": 7888896,
+          "sha256": "eb95c04f7972be265884a01100425cb16cc7ca51aa2b7e708589b99531d76ddb"
+        },
+        "pack": {
+          "file": "muse-spark-q5_k.pack",
+          "bytes": 4341760,
+          "sha256": "085bd690491b35486cb246226de1683817a44d8403546e919787cb4b652b7ee3"
+        }
+      },
+      "settings": {
+        "GGML_KIMI_CPU_SINK": "1",
+        "GGML_KIMI_CPU_SINK_THREADS": "2",
+        "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+        "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "16",
+        "GGML_KIMI_CPU_SINK_CACHE_BYTES": "16777216",
+        "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "1",
+        "GGML_KIMI_CPU_SINK_CACHE_POLICY": "count_decay2",
+        "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+        "GGML_KIMI_CPU_SINK_PREFETCH": "0",
+        "GGML_MOE_IO_BACKEND": "direct",
+        "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+        "GGML_KIMI_CPU_SINK_TRACE": "1"
+      },
+      "selected_ids": [
+        22,
+        203,
+        183,
+        195
+      ],
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 16,
+        "effective_n_ubatch": 16
+      },
+      "rows": [
+        {
+          "step": 0,
+          "position": 3,
+          "batch_tokens": 4,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "9337f362f52fd8c32a417fdc53f2f2c4811e1d4cf9935115b216cf1e819010b1",
+          "selected_id": 22,
+          "file": "muse-spark-q5_k/alias/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 4,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "7c6c9deec108c58ccff40a8a336f3461b877c0656a1803827fe3d0a9b373479f",
+          "selected_id": 203,
+          "file": "muse-spark-q5_k/alias/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 5,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "217fd0bacab7dcd4ee9139df4f042c750ad20c8a12f246ba230b124a9b034c01",
+          "selected_id": 183,
+          "file": "muse-spark-q5_k/alias/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 6,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "eca06010ee4d810686be0c07e1e41e828b0b0bef3b91e1e3c7520ac39b791268",
+          "selected_id": 195,
+          "file": "muse-spark-q5_k/alias/step-3.f32"
+        }
+      ],
+      "source_selection": {
+        "environment_key": "GGML_MOE_EXPERT_GGUF_ALIAS_TSV",
+        "file": "muse-spark-q5_k.alias.tsv",
+        "range_count": 96,
+        "normalized_sha256": "17fa14fb8f5c0a1a1d5355b516f02adda0463155009fea20f1cd796912f7adf9",
+        "normalization": "Replace only source_path column with its basename; retain header/rows/column text/order, tab separators and LF after every row. Valid only for this one-GGUF fixture."
+      }
+    }
+  ]
+}

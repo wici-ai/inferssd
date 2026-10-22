@@ -2,6 +2,10 @@
 #include "moe-adapter-dispatch.h"
 #include "moe-expert-descriptor.h"
 #include "moe-common-device-descriptor.h"
+#if defined(GGML_SSD_STORE)
+#include "catalog.h"
+#include "parser.h"
+#endif
 
 #ifndef GGML_CUDA_MOE_STREAM_BATCH
 #include <cstdint>
@@ -790,6 +794,10 @@ struct current_down_overlap_tensor_profile {
 static std::mutex g_current_down_overlap_tensor_profile_mu;
 static std::unordered_map<std::string, current_down_overlap_tensor_profile> g_current_down_overlap_tensor_profile;
 
+#if defined(GGML_SSD_STORE)
+using expert_pack_entry = c0::expert_pack_entry;
+using expert_pack_source = c0::expert_pack_source;
+#else
 struct expert_pack_entry {
     char tensor[128] = {};
     int32_t expert_idx = -1;
@@ -818,6 +826,8 @@ struct expert_pack_source {
     char path[512] = {};
 };
 
+#endif
+
 struct expert_pack_adjacent_op_stats {
     std::atomic<uint64_t> groups{0};
     std::atomic<uint64_t> slices{0};
@@ -835,17 +845,29 @@ enum class q4_lossless_transport_mode : uint8_t {
 };
 
 struct expert_pack_state {
+#if defined(GGML_SSD_STORE)
+    FILE * & file = c0::shared_catalog().file;
+    int & fd_direct = c0::shared_catalog().fd_direct;
+    std::vector<expert_pack_source> & sources = c0::shared_catalog().sources;
+    std::vector<expert_pack_entry> & entries = c0::shared_catalog().entries;
+#else
     FILE *file = nullptr;
 #if !defined(_WIN32)
     int fd_direct = -1;
 #endif
     std::vector<expert_pack_source> sources;
     std::vector<expert_pack_entry> entries;
+#endif
     std::atomic<uint64_t> mmap_hits{0};
     std::atomic<uint64_t> mmap_misses{0};
     std::atomic<uint64_t> mmap_bytes{0};
+#if defined(GGML_SSD_STORE)
+    bool & inited = c0::shared_catalog().inited;
+    bool & enabled = c0::shared_catalog().enabled;
+#else
     bool inited = false;
     bool enabled = false;
+#endif
     bool q4_colibri = false;
     bool glm52_colibri = false;
     q4_lossless_transport_mode lossless_mode = q4_lossless_transport_mode::disabled;
@@ -1020,7 +1042,11 @@ struct expert_pack_state {
     std::atomic<uint64_t> q4_host_object_read_admit_evictions{0};
     std::atomic<uint64_t> q4_host_object_read_admit_alloc_failures{0};
     bool reported_io_backend = false;
+#if defined(GGML_SSD_STORE)
+    int & io_backend = c0::shared_catalog().io_backend;
+#else
     int io_backend = 0; // 0=buffered, 1=direct, 2=io_uring
+#endif
     std::mutex mu;
     std::atomic<uint64_t> hits{0};
     std::atomic<uint64_t> misses{0};
@@ -1074,6 +1100,22 @@ struct expert_pack_state {
 };
 
 static expert_pack_state g_expert_pack;
+
+static bool expert_pack_catalog_ready() {
+#if defined(GGML_SSD_STORE)
+    return c0::catalog_available();
+#else
+    return g_expert_pack.enabled;
+#endif
+}
+
+static size_t expert_pack_published_entry_count() {
+#if defined(GGML_SSD_STORE)
+    if (!c0::catalog_available()) return 0;
+#endif
+    return g_expert_pack.entries.size();
+}
+
 
 static void q4_object_layer_add(std::atomic<uint64_t> (&counters)[64], int layer, uint64_t value) {
     if (value == 0 || layer < 0 || layer >= 64) return;
@@ -5131,7 +5173,7 @@ static void current_down_overlap_report_atexit() {
 }
 
 static void expert_pack_report_atexit() {
-    if (!g_expert_pack.enabled) return;
+    if (!expert_pack_catalog_ready()) return;
     if (const char *direct_path = direct_read_site_profile_path()) {
         std::lock_guard<std::mutex> lk(g_direct_read_site_mu);
         std::fprintf(stderr,
@@ -5148,7 +5190,7 @@ static void expert_pack_report_atexit() {
                  g_expert_pack.direct_fallbacks.load(),
                  io_stats.reads, io_stats.bytes, io_stats.fallbacks, io_stats.submit_us,
                  io_stats.wait_us, g_expert_pack.iouring_h2d_enqueues.load(),
-                 g_expert_pack.entries.size());
+                 expert_pack_published_entry_count());
     if (g_expert_pack.q4_colibri) {
         std::fprintf(stderr,
                      "[moe_stream_batch] q4 colibri pack: partial_fallback_lookups=%lu partial_fallback_tensors=%lu debug_partial_fallback=%d\n",
@@ -5402,7 +5444,7 @@ extern "C" void ggml_cuda_moe_stream_batch_phase_report(const char *label) {
         cur.pack_iouring_submit_calls, moe_phase_delta_u64(cur.pack_iouring_submit_calls, prev.pack_iouring_submit_calls),
         cur.pack_iouring_wait_calls, moe_phase_delta_u64(cur.pack_iouring_wait_calls, prev.pack_iouring_wait_calls),
         cur.pack_iouring_cqes, moe_phase_delta_u64(cur.pack_iouring_cqes, prev.pack_iouring_cqes),
-        g_expert_pack.entries.size());
+        expert_pack_published_entry_count());
 
     for (int i = 0; i < 2; ++i) {
         const char *cache_label = i == 1 ? "upgate" : "down";
@@ -5479,6 +5521,7 @@ static bool expert_pack_read_exact(FILE *file, void *dst, size_t sz) {
     return true;
 }
 
+#if !defined(GGML_SSD_STORE)
 static std::string expert_pack_key_string(const char *tensor_name, int expert_idx, uint64_t nbytes) {
     std::string key = tensor_name ? tensor_name : "";
     key.push_back('\n');
@@ -5487,8 +5530,12 @@ static std::string expert_pack_key_string(const char *tensor_name, int expert_id
     key += std::to_string((unsigned long long)nbytes);
     return key;
 }
+#endif
 
 static expert_pack_source * expert_pack_source_for_entry(const expert_pack_entry *entry) {
+#if defined(GGML_SSD_STORE)
+    if (!c0::catalog_available()) return nullptr;
+#endif
     if (!entry || entry->source_idx < 0 ||
             (size_t)entry->source_idx >= g_expert_pack.sources.size()) {
         return nullptr;
@@ -5496,6 +5543,23 @@ static expert_pack_source * expert_pack_source_for_entry(const expert_pack_entry
     return &g_expert_pack.sources[(size_t)entry->source_idx];
 }
 
+#if defined(GGML_SSD_STORE)
+static c0::source_open_hooks expert_pack_source_open_hooks() {
+    c0::source_open_hooks hooks;
+#if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
+    hooks.report_iouring_enabled = [](const char * label, const char * path) {
+        std::fprintf(stderr, "[moe_stream_batch] %s: io_uring direct reads enabled: %s io_bytes=%zu depth=%zu\n",
+                     label, path, expert_pack_io_bytes(), expert_pack_io_depth());
+    };
+#endif
+    hooks.page_cache_source_opened = [] { ++g_expert_pack.page_cache_sources; };
+    return hooks;
+}
+static bool expert_pack_open_data_source(const char * path, const char * label,
+        bool page_cache_source = false, bool direct_required = false) {
+    return c0::open_data_source(c0::shared_catalog(), path, label, page_cache_source, direct_required, expert_pack_source_open_hooks());
+}
+#else
 static bool expert_pack_open_data_source(
         const char *path,
         const char *label,
@@ -5567,7 +5631,9 @@ static bool expert_pack_open_data_source(
     g_expert_pack.sources.push_back(source);
     return true;
 }
+#endif
 
+#if !defined(GGML_SSD_STORE)
 static bool expert_pack_load_source(const char *path, int32_t source_idx, std::vector<expert_pack_entry> &entries, bool page_cache_source = false) {
     if (!path || !path[0]) return false;
 
@@ -5629,6 +5695,7 @@ static bool expert_pack_load_source(const char *path, int32_t source_idx, std::v
                  (unsigned long)n_entries, path);
     return true;
 }
+#endif
 
 static bool expert_pack_v2_full_cover_down_iouring_enabled();
 
@@ -5763,6 +5830,7 @@ static int expert_pack_tsv_column(const std::vector<char *> &header, const char 
 
 // one alias index of GGML_MOE_EXPERT_GGUF_ALIAS_TSV (a ':'-separated list: the experts', then e.g. the dense weights
 // homed on the drive); alias_sources: the data files the list's indexes opened so far, shared across them
+#if !defined(GGML_SSD_STORE)
 static bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_entry> &entries,
                                             std::unordered_map<std::string, int32_t> &alias_sources) {
     if (!path || !path[0]) return true;
@@ -5867,6 +5935,7 @@ static bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert
             (unsigned long)skipped_duplicates, (unsigned long)bad_rows, (unsigned long)rows);
     return bad_rows == 0;
 }
+#endif
 
 static bool expert_pack_open_alias_source(const char *path, int32_t source_idx) {
     if (!path || !path[0]) return false;
@@ -7854,7 +7923,11 @@ static bool q4_colibri_load_manifest(
     }
 }
 
+#if defined(GGML_SSD_STORE)
+static void expert_pack_initialize_legacy() {
+#else
 static void expert_pack_init_once() {
+#endif
     std::lock_guard<std::mutex> lk(g_expert_pack.mu);
     if (g_expert_pack.inited) return;
 
@@ -7915,6 +7988,11 @@ static void expert_pack_init_once() {
         }
     }
 
+#if defined(GGML_SSD_STORE)
+    const auto source_desc = c0::source_description_from_env();
+    const auto & source_paths = source_desc.packs;
+    const auto & page_cache_paths = source_desc.page_cache_packs;
+#else
     std::vector<std::string> source_paths;
     const char *path = std::getenv("GGML_MOE_EXPERT_PACK");
     if (path && path[0]) {
@@ -7935,6 +8013,7 @@ static void expert_pack_init_once() {
         page_cache_paths.emplace_back(page_cache_path);
     }
     expert_pack_append_env_list(page_cache_paths, "GGML_MOE_PAGECACHE_PACK_LIST");
+#endif
     const char *gguf_alias_tsv = std::getenv("GGML_MOE_EXPERT_GGUF_ALIAS_TSV");
     const bool has_gguf_alias = gguf_alias_tsv && gguf_alias_tsv[0];
 
@@ -7971,6 +8050,12 @@ static void expert_pack_init_once() {
             glm52_colibri_requested ? glm52_colibri_pack : q4_colibri_pack,
             entries);
     }
+#if defined(GGML_SSD_STORE)
+    if (!c0::append_sources(c0::shared_catalog(), source_desc, entries, expert_pack_source_open_hooks())) {
+        g_expert_pack.inited = true;
+        return;
+    }
+#else
     for (const std::string &source_path : source_paths) {
         if (!expert_pack_load_source(source_path.c_str(), (int32_t)g_expert_pack.sources.size(), entries, false)) {
             g_expert_pack.inited = true;
@@ -7995,12 +8080,22 @@ static void expert_pack_init_once() {
         }
     }
 
+#endif
+
 
     if (entries.empty()) {
         g_expert_pack.inited = true;
         return;
     }
 
+#if defined(GGML_SSD_STORE)
+    const bool replace_duplicates = source_desc.replace_duplicates ||
+        !page_cache_paths.empty() || q4_colibri_overlay_requested;
+    if (!c0::finalize_entries(entries, replace_duplicates)) {
+        g_expert_pack.inited = true;
+        return;
+    }
+#else
     std::sort(entries.begin(), entries.end(),
         [](const expert_pack_entry &a, const expert_pack_entry &b) {
             const int name_cmp = std::strcmp(a.tensor, b.tensor);
@@ -8043,6 +8138,8 @@ static void expert_pack_init_once() {
         }
     }
 
+#endif
+
     g_expert_pack.file = g_expert_pack.sources.empty() ? nullptr : g_expert_pack.sources[0].file;
 #if !defined(_WIN32)
     g_expert_pack.fd_direct = g_expert_pack.sources.empty() ? -1 : g_expert_pack.sources[0].fd_direct;
@@ -8056,11 +8153,17 @@ static void expert_pack_init_once() {
                  g_expert_pack.entries.size(), g_expert_pack.sources.size());
 }
 
+#if defined(GGML_SSD_STORE)
+static void expert_pack_init_once() {
+    (void)c0::initialize_shared_catalog();
+}
+#endif
+
 static const expert_pack_entry * expert_pack_lookup_impl(const char *tensor_name, int expert_idx, size_t nbytes, bool count_stats) {
     expert_pack_init_once();
     const char *disable_env = std::getenv("GGML_MOE_EXPERT_PACK_RUNTIME_DISABLE");
     if (disable_env && disable_env[0] && disable_env[0] != '0') return nullptr;
-    if (!g_expert_pack.enabled || !tensor_name || !tensor_name[0]) return nullptr;
+    if (!expert_pack_catalog_ready() || !tensor_name || !tensor_name[0]) return nullptr;
 
     size_t lo = 0;
     size_t hi = g_expert_pack.entries.size();
@@ -8094,6 +8197,27 @@ static const expert_pack_entry * expert_pack_lookup_impl(const char *tensor_name
     return nullptr;
 }
 
+#if defined(GGML_SSD_STORE)
+static const expert_pack_entry * c0_provider_lookup(const char * name, int expert, size_t bytes) {
+    return expert_pack_lookup_impl(name, expert, bytes, false);
+}
+static const c0::provider c0_cuda_provider = {expert_pack_initialize_legacy, c0_provider_lookup};
+struct c0_provider_registration {
+    c0_provider_registration() {
+        if (!c0::register_provider(&c0_cuda_provider)) {
+            std::fprintf(stderr, "[c0_store_prototype] duplicate or late CUDA provider registration\n");
+            std::abort();
+        }
+    }
+    ~c0_provider_registration() {
+        // Backend unload requires all readers to have stopped. Retire its
+        // callbacks before this module disappears; never fall back to a new owner.
+        if (!c0::unregister_provider(&c0_cuda_provider)) { std::abort(); }
+    }
+};
+static c0_provider_registration c0_cuda_registration;
+#endif
+
 static const expert_pack_entry * expert_pack_lookup(const char *tensor_name, int expert_idx, size_t nbytes) {
     return expert_pack_lookup_impl(tensor_name, expert_idx, nbytes, true);
 }
@@ -8102,7 +8226,7 @@ static const expert_pack_entry * expert_pack_lookup_any_size(const char *tensor_
     expert_pack_init_once();
     const char *disable_env = std::getenv("GGML_MOE_EXPERT_PACK_RUNTIME_DISABLE");
     if (disable_env && disable_env[0] && disable_env[0] != '0') return nullptr;
-    if (!g_expert_pack.enabled || !tensor_name || !tensor_name[0]) return nullptr;
+    if (!expert_pack_catalog_ready() || !tensor_name || !tensor_name[0]) return nullptr;
 
     expert_pack_entry probe = {};
     std::snprintf(probe.tensor, sizeof(probe.tensor), "%s", tensor_name);
@@ -8161,7 +8285,7 @@ static void current_down_missing_profile_record(
     std::unordered_set<size_t> unique_bytes;
     std::unordered_set<int> active_present;
 
-    if (g_expert_pack.enabled) {
+    if (expert_pack_catalog_ready()) {
         for (const expert_pack_entry &entry : g_expert_pack.entries) {
             if (std::strcmp(entry.tensor, tensor_name) != 0) continue;
             ++pack_entries;
@@ -8211,7 +8335,7 @@ static void current_down_missing_profile_record(
 static expert_pack_source * expert_pack_mmap_ensure(const expert_pack_entry * entry) {
     expert_pack_init_once();
     expert_pack_source * source = expert_pack_source_for_entry(entry);
-    if (!g_expert_pack.enabled || !source) {
+    if (!expert_pack_catalog_ready() || !source) {
         return nullptr;
     }
     if (source->mmap_base) {
@@ -8300,7 +8424,7 @@ extern "C" const void * ggml_cuda_moe_expert_pack_mmap_ptr_debug(
         return nullptr;
     }
     expert_pack_init_once();
-    if (!g_expert_pack.enabled) {
+    if (!expert_pack_catalog_ready()) {
         if (reason) {
             *reason = "mmap_unavailable";
         }
@@ -8386,7 +8510,7 @@ extern "C" const void * ggml_cuda_moe_expert_pack_mmap_ptr_source_debug(
         return nullptr;
     }
     expert_pack_init_once();
-    if (!g_expert_pack.enabled) {
+    if (!expert_pack_catalog_ready()) {
         if (reason) {
             *reason = "mmap_unavailable";
         }
@@ -9159,7 +9283,7 @@ static std::once_flag g_ram_tier_once;
 static bool expert_pack_direct_read_entry_to_host(const expert_pack_entry *entry, void *dst, size_t sz);
 
 static void ram_tier_init() {
-    if (!g_expert_pack.enabled) return;
+    if (!expert_pack_catalog_ready()) return;
     const char *ram_tier_env = std::getenv("GGML_MOE_RAM_TIER_MIB");
     if (!ram_tier_env || !ram_tier_env[0] || ram_tier_env[0] == '0') return;
     const size_t budget = (size_t)std::atol(ram_tier_env) * 1024ULL * 1024ULL;
@@ -19645,7 +19769,7 @@ static void q4_colibri_pipe_shutdown() {
         g_expert_pack.q4_object_ram_hits.load() + g_expert_pack.q4_object_ram_misses.load() > 0 ?
             100.0 * (double)g_expert_pack.q4_object_ram_hits.load() /
                 (double)(g_expert_pack.q4_object_ram_hits.load() + g_expert_pack.q4_object_ram_misses.load()) : 0.0,
-        (unsigned long)(stage_pinned_slot_count() * (g_expert_pack.entries.empty() ? 0 :
+        (unsigned long)(stage_pinned_slot_count() * (expert_pack_published_entry_count() == 0 ? 0 :
             g_expert_pack.entries.front().object_nbytes)),
         (unsigned long)g_expert_pack.q4_object_ram_evictions.load(),
         (unsigned long)g_expert_pack.q4_object_ram_admissions.load(),
@@ -21331,7 +21455,7 @@ static size_t dense_index_blocks(const char *tensor_name, size_t nbytes, size_t 
     if (!tensor_name || !tensor_name[0] || nbytes == 0) return 0;
     expert_pack_init_once();
     const char *disable_env = std::getenv("GGML_MOE_EXPERT_PACK_RUNTIME_DISABLE");
-    if (!g_expert_pack.enabled || (disable_env && disable_env[0] && disable_env[0] != '0')) return 0;
+    if (!expert_pack_catalog_ready() || (disable_env && disable_env[0] && disable_env[0] != '0')) return 0;
     const auto &entries = g_expert_pack.entries;
     size_t lo = 0, hi = entries.size();
     while (lo < hi) {                   // the first entry of the tensor (block 0 sorts first)

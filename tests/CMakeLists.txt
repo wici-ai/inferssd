@@ -845,3 +845,8 @@ if (APPLE AND TARGET ggml-cpu)
     set_tests_properties(mac_expert_operator_vary_threads
         PROPERTIES PROCESSORS 12 TIMEOUT 180 RUN_SERIAL TRUE)
 endif()
+
+if(TARGET ggml-ssd-c0-store)
+    # The frozen extraction oracle is test-only and never a production input.
+    add_subdirectory(../experiments/c0-store ${CMAKE_CURRENT_BINARY_DIR}/ssd-store)
+endif()
