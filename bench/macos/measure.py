@@ -364,8 +364,10 @@ def main():
            "-ngl", "99", "--cpu-moe", "--no-op-offload", "-c", "8192", "-b", str(args.batch), "-ub", str(args.batch),
            "-t", str(args.threads), "-tb", str(args.prefill_threads), "--cache-ram", "0", "--parallel", "1",
            "--host", "127.0.0.1", "--port", str(port)]
-    if args.model == "muse":
-        cmd += ["--chat-template-file", str(repo / "models/templates/muse-spark.jinja")]
+    template = "deepseek-ai-DeepSeek-V4.1.jinja" if args.model == "dsv" else "muse-spark.jinja"
+    cmd += ["--chat-template-file", str(repo / "models/templates" / template), "--reasoning", "off"]
+    if args.model == "dsv":
+        cmd += ["-ot", r"blk\.[0-9]+\.engram_embd\.weight=CPU"]
     if args.poll is not None:
         cmd += ["--poll", str(args.poll), "--poll-batch", str(args.poll)]
     save(args.out / "config.json", {"argv": cmd, "env": overrides, "git": command(["git", "-C", str(repo), "rev-parse", "HEAD"]).strip(),
