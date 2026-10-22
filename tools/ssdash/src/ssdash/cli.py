@@ -1,4 +1,4 @@
-"""Offline entry points for the first framework extraction batch."""
+"""Opt-in recorded framework and source artifact commands."""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ from ssdash.plan.settings_recorded import write_settings
 from ssdash.probe.calibrate import CalibrationArguments, run_calibration
 from ssdash.probe.device_profile import aggregate
 from ssdash.probe.recorded import load_reports
+from ssdash.source.command import add_commands as add_source_commands
+from ssdash.source.command import run_source
 from ssdash.telemetry.recorded import ledger, read_arm
 
 
@@ -27,6 +29,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         description="SSDash recorded-device tools (no hardware probes)"
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    add_source_commands(commands)
     probe = commands.add_parser("probe", help="aggregate existing report files only")
     probe.add_argument("--from-reports", required=True, type=Path)
     probe.add_argument("--experts", required=True, type=Path)
@@ -64,6 +67,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     fit.add_argument("--profile", required=True)
     fit.add_argument("-o", "--out", required=True)
     args = parser.parse_args(argv)
+    if args.command == "source":
+        run_source(args)
+        return 0
     if args.command == "fit":
         run_calibration(
             CalibrationArguments(
