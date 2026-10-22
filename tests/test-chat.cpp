@@ -1628,6 +1628,48 @@ static void test_convert_responses_to_chatcmpl() {
 }
 
 static void test_muse_spark_peg_parsers(bool detailed_debug) {
+    // Exercise prompt rendering as well as output parsing: the old capability
+    // detector cannot discover these features through Muse's Jinja macros.
+    {
+        auto tmpls = read_templates("models/templates/muse-spark.jinja");
+        common_chat_templates_inputs inputs;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+        inputs.enable_thinking = false;
+        common_chat_msg system;
+        system.role = "system";
+        system.content = "Answer concisely.";
+        inputs.messages = { system, message_user_parts };
+        auto prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        assert_equals(true, prompt.find("Answer concisely.") != std::string::npos);
+        assert_equals(true, prompt.find("<|start|>user<|message|>Heythere<|eot|>") != std::string::npos);
+        assert_equals(true, string_ends_with(prompt, "<|start|>assistant to=user<|message|>"));
+        assert_equals(false, prompt.find("private reasoning and tool planning") != std::string::npos);
+
+        inputs.enable_thinking = true;
+        inputs.tools = { special_function_tool };
+        inputs.parallel_tool_calls = true;
+        common_chat_msg call;
+        call.role = "assistant";
+        call.content = "Checking.";
+        call.reasoning_content = "Need a tool.";
+        call.tool_calls = { { "special_function", "{\"arg1\":1}", "call_1" },
+                            { "special_function", "{\"arg1\":2}", "call_2" } };
+        common_chat_msg reply;
+        reply.role = "tool";
+        reply.content = "Found it.";
+        reply.tool_call_id = "call_1";
+        inputs.messages = { system, message_user, call, reply };
+        prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        for (const char * expected : {
+                "private reasoning and tool planning",
+                "<|start|>assistant to=self<|message|>Need a tool.<|eom|>",
+                "<|start|>assistant to=commentary<|message|>Checking.<|eom|>",
+                "<atem:parameter name=\"arg1\">1</atem:parameter>",
+                "<atem:parameter name=\"arg1\">2</atem:parameter>",
+                "<|start|>tool special_function<|message|><tool_output name=\"special_function\">\nFound it." }) {
+            assert_equals(true, prompt.find(expected) != std::string::npos);
+        }
+    }
     // Muse Spark format tests
     {
         auto tst = peg_tester("models/templates/muse-spark.jinja", detailed_debug);
