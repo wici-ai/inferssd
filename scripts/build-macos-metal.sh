@@ -17,4 +17,4 @@ cmake -S "$repo_dir" -B "$build_dir" -G Ninja \
     -DGGML_OPENMP=OFF -DLLAMA_BUILD_TESTS=ON \
     -DLLAMA_BUILD_WEBUI=OFF -DLLAMA_BUILD_EXAMPLES=OFF
 cmake --build "$build_dir" \
-    --target llama-cli llama-server test-backend-ops test-mac-expert-pack-cache -j "${SSD_LLAMA_BUILD_JOBS:-8}"
+    --target llama-cli llama-server test-chat test-backend-ops test-mac-expert-pack-cache -j "${SSD_LLAMA_BUILD_JOBS:-8}"
