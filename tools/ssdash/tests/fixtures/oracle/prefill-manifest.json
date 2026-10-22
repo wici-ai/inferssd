@@ -5,6 +5,10 @@
   "sha256": "72215b6b10d796096feddf7eb5cd81f0321de0b9ce5a102de5156979f1e21ccd",
   "extraction_scope": [
     "coupled:46-56",
-    "lane_layer:59-111"
+    "lane_layer:59-111",
+    "cut:266-271",
+    "served:341-357",
+    "offloaded:360-363",
+    "cold_share:366-369"
   ]
 }
