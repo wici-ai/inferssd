@@ -1887,7 +1887,7 @@ bool llama_model_loader::load_all_data(
         const char * env = std::getenv("LLAMA_DROP_MMAP_TENSOR_AFTER_UPLOAD");
         return env && env[0] && env[0] != '0';
     }();
-    size_t mmap_upload_drop_bytes = 0;
+    size_t mmap_upload_advised_bytes = 0;
     size_t mmap_upload_drop_ranges = 0;
     size_t mmap_upload_drop_failures = 0;
 
@@ -2050,9 +2050,10 @@ bool llama_model_loader::load_all_data(
                     size_t dropped = 0;
                     const bool ok = mapping->dontneed_fragment(
                             weight->offs, weight->offs + n_size, &dropped);
-                    mmap_upload_drop_bytes += dropped;
                     ++mmap_upload_drop_ranges;
-                    if (!ok) {
+                    if (ok) {
+                        mmap_upload_advised_bytes += dropped;
+                    } else {
                         ++mmap_upload_drop_failures;
                     }
                 }
@@ -2139,9 +2140,9 @@ bool llama_model_loader::load_all_data(
 
     if (drop_mmap_tensor_after_upload && mmap_upload_drop_ranges > 0) {
         LLAMA_LOG_INFO(
-                "%s: immediate mmap upload dontneed bytes=%.2f MiB ranges=%zu failures=%zu\n",
+                "%s: immediate mmap upload dontneed advised=%.2f MiB ranges=%zu failures=%zu (not reclaimed bytes)\n",
                 __func__,
-                mmap_upload_drop_bytes / 1024.0 / 1024.0,
+                mmap_upload_advised_bytes / 1024.0 / 1024.0,
                 mmap_upload_drop_ranges,
                 mmap_upload_drop_failures);
     }

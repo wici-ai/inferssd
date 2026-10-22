@@ -52,6 +52,8 @@ struct llama_mmap {
     // Unlike dontneed_fragment(), this expands to page boundaries because
     // dropping readahead for any byte in the requested range is required.
     bool advise_random_fragment(size_t first, size_t last, size_t * len_out = nullptr);
+    // Advise only whole pages contained in [first, last), preserving the mapping.
+    // Success reports accepted advice, not an amount of physical memory reclaimed.
     bool dontneed_fragment(size_t first, size_t last, size_t * len_out = nullptr);
     void unmap_fragment(size_t first, size_t last);
 

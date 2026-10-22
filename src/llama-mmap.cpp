@@ -606,12 +606,13 @@ struct llama_mmap::impl {
         GGML_ASSERT(last % page_size == 0);
         GGML_ASSERT(last >= first);
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
         bool ok = true;
         if (madvise((uint8_t *) addr + first, len, MADV_DONTNEED)) {
             LLAMA_LOG_WARN("warning: madvise(..., MADV_DONTNEED) failed: %s\n", strerror(errno));
             ok = false;
         }
+#ifdef __linux__
         if (fadvise_fd != -1) {
             const int rc = posix_fadvise(fadvise_fd, (off_t) first, (off_t) len, POSIX_FADV_DONTNEED);
             if (rc != 0) {
@@ -619,6 +620,7 @@ struct llama_mmap::impl {
                 ok = false;
             }
         }
+#endif
         return ok;
 #endif
         return true;
