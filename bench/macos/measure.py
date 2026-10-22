@@ -15,6 +15,12 @@ import time
 import urllib.request
 
 
+def monotonic():
+    # Apple Python 3.9's time.monotonic() has a process-local origin. libc++
+    # steady_clock uses CLOCK_MONOTONIC_RAW; use it to align native I/O traces.
+    return time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
+
+
 def save(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
@@ -35,7 +41,7 @@ def system_sample(pid):
     page_size = int(re.search(r"page size of (\d+)", vm).group(1))
     memory = {key.strip(): int(value) for key, value in re.findall(r"^([^:\n]+):\s*(\d+)\.", vm, re.M)}
     memory["page_size"] = page_size
-    return {"t": time.monotonic(), "time": time.time(), "disks": disks, "vm": memory,
+    return {"t": monotonic(), "time": time.time(), "disks": disks, "vm": memory,
             "rss_kib": int(command(["ps", "-o", "rss=", "-p", str(pid)]).strip() or "0"),
             "swap": command(["sysctl", "-n", "vm.swapusage"]).strip()}
 
@@ -57,6 +63,7 @@ def main():
     parser.add_argument("--alias", type=Path)
     parser.add_argument("--source", choices=("alias", "mmap"), default="alias")
     parser.add_argument("--depth", type=int, default=0)
+    parser.add_argument("--read-alignment", type=int, choices=(1, 4096, 16384), default=1)
     parser.add_argument("--cache-mib", type=int, default=8192)
     parser.add_argument("--policy", choices=("lfu", "lru"), default="lfu")
     parser.add_argument("--threads", type=int, default=8)
@@ -68,6 +75,7 @@ def main():
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--binary", type=Path)
+    parser.add_argument("--pause-pid", type=int, help="Temporarily pause this user's screenpipe process during this run")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     binary = args.binary or repo / "build-mac-pipeline/bin/llama-server"
@@ -80,7 +88,8 @@ def main():
     overrides = {"LLAMA_MMAP_PREFETCH": "0", "LLAMA_DSV41_TOPK_REUSE": "0", "LLAMA_MAC_COMPACT_METAL": "1",
                  "LLAMA_DROP_MMAP_TENSOR_AFTER_UPLOAD": "1", "LLAMA_MAC_ADAPTIVE_PREFILL": "0",
                  "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": str(args.cache_mib), "SSD_LLAMA_MAC_EXPERT_CACHE_POLICY": args.policy,
-                 "SSD_LLAMA_MAC_EXPERT_READ_AHEAD": str(args.depth)}
+                 "SSD_LLAMA_MAC_EXPERT_READ_AHEAD": str(args.depth),
+                 "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": str(args.read_alignment)}
     if args.source == "alias":
         overrides["GGML_MOE_EXPERT_GGUF_ALIAS_TSV"] = str(args.alias.resolve())
     if args.trace:
@@ -88,6 +97,7 @@ def main():
     env.update(overrides)
     port = 18122
     with socket.socket() as check:
+        check.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         check.bind(("127.0.0.1", port))
     url = f"http://127.0.0.1:{port}"
     cmd = [str(binary), "-m", str(model), "--mmap", "--no-warmup", "--fit", "off", "--no-repack", "--no-host",
@@ -101,6 +111,7 @@ def main():
     samples = []
     stop_monitor = threading.Event()
     server = None
+    paused_pid = None
 
     def post(route, payload):
         request = urllib.request.Request(url + route, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
@@ -112,8 +123,15 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGINT, interrupted)
     try:
+        if args.pause_pid is not None:
+            process = command(["ps", "-o", "uid=,stat=,comm=", "-p", str(args.pause_pid)]).strip().split(None, 2)
+            if len(process) != 3 or int(process[0]) != os.getuid() or Path(process[2]).name != "screenpipe":
+                raise RuntimeError("pause-pid must identify this user's screenpipe process")
+            if "T" not in process[1]:
+                os.kill(args.pause_pid, signal.SIGSTOP)
+                paused_pid = args.pause_pid
         log = (args.out / "server.log").open("w")
-        started = time.monotonic()
+        started = monotonic()
         server = subprocess.Popen(cmd, env=env, cwd=repo, stdout=log, stderr=subprocess.STDOUT)
         save(args.out / "pid.json", {"driver": os.getpid(), "server": server.pid})
 
@@ -125,14 +143,14 @@ def main():
                         samples.append(value)
                         output.write(json.dumps(value) + "\n")
                     except Exception as exc:
-                        output.write(json.dumps({"error": str(exc), "t": time.monotonic()}) + "\n")
+                        output.write(json.dumps({"error": str(exc), "t": monotonic()}) + "\n")
                     stop_monitor.wait(1)
         thread = threading.Thread(target=monitor)
         thread.start()
         while True:
             if server.poll() is not None:
                 raise RuntimeError(f"server exited {server.returncode}")
-            if time.monotonic() - started > 600:
+            if monotonic() - started > 600:
                 raise TimeoutError("model load exceeded 600 seconds")
             try:
                 with urllib.request.urlopen(url + "/health", timeout=2) as response:
@@ -140,7 +158,7 @@ def main():
                         break
             except Exception:
                 time.sleep(0.5)
-        load_s = time.monotonic() - started
+        load_s = monotonic() - started
         prompt = args.prompt_file.read_text()
         with post("/tokenize", {"content": prompt, "add_special": True}) as response:
             prompt_ids = json.load(response)["tokens"][:args.prompt_tokens]
@@ -150,11 +168,12 @@ def main():
         results = []
         for run in range(args.runs):
             before = system_sample(server.pid)
-            before_stats = parse_stats((args.out / "server.log").read_text())
+            before_stats = parse_stats((args.out / "server.log").read_text(errors="replace"))
             payload = {"prompt": prompt_ids, "n_predict": args.tokens, "temperature": 0, "seed": 42, "ignore_eos": True,
                        "cache_prompt": False, "return_tokens": True, "n_probs": 5, "stream": True, "timings_per_token": True}
-            begin = time.monotonic()
+            begin = monotonic()
             first = None
+            first_sample = None
             tokens, probabilities, events = [], [], []
             final = None
             with post("/completion", payload) as response:
@@ -165,16 +184,17 @@ def main():
                     if text == b"[DONE]":
                         break
                     event = json.loads(text)
-                    now = time.monotonic()
+                    now = monotonic()
                     events.append({"t": now, "event": event})
                     if event.get("tokens") or event.get("completion_probabilities") or event.get("content"):
                         if first is None:
                             first = now
+                            first_sample = system_sample(server.pid)
                         tokens.extend(event.get("tokens", []))
                         probabilities.extend(event.get("completion_probabilities", []))
                     if event.get("stop"):
                         final = event
-            end = time.monotonic()
+            end = monotonic()
             after = system_sample(server.pid)
             if not tokens:
                 tokens = [item["id"] for item in probabilities]
@@ -185,10 +205,21 @@ def main():
                       "begin": begin, "first": first, "end": end, "wall_s": end - begin, "ttft_s": first - begin,
                       "tokens": tokens, "probabilities": probabilities, "timings": final.get("timings"),
                       "before": before, "after": after, "stats_before": before_stats[-1] if before_stats else {}}
+            result["first_sample"] = first_sample
             results.append(result)
             save(args.out / "results.json", results)
             print(json.dumps({key: result[key] for key in ("run", "cache", "wall_s", "ttft_s", "timings")}), flush=True)
+        try:
+            (args.out / "vmmap-summary.txt").write_text(command(["vmmap", "-summary", str(server.pid)]))
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            (args.out / "vmmap-summary.txt").write_text(str(exc) + "\n")
     finally:
+        if paused_pid is not None:
+            try:
+                if Path(command(["ps", "-o", "comm=", "-p", str(paused_pid)]).strip()).name == "screenpipe":
+                    os.kill(paused_pid, signal.SIGCONT)
+            except (ProcessLookupError, subprocess.CalledProcessError):
+                pass
         stop_monitor.set()
         if "thread" in locals():
             thread.join(timeout=20)
@@ -202,7 +233,7 @@ def main():
         if "log" in locals():
             log.close()
         if (args.out / "server.log").exists():
-            save(args.out / "stats.json", parse_stats((args.out / "server.log").read_text()))
+            save(args.out / "stats.json", parse_stats((args.out / "server.log").read_text(errors="replace")))
         if samples:
             save(args.out / "memory-summary.json", {"peak_rss_kib": max(s["rss_kib"] for s in samples),
                  "first": samples[0], "last": samples[-1],

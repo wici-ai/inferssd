@@ -37,7 +37,10 @@ int main(int argc, char ** argv) {
             if (expected.size() != bytes) { return 3; }
             const auto * data = static_cast<const char *>(ggml_mac_expert_pack_acquire_batch(batch, argv[i], expert, bytes));
             const void * pinned = ggml_mac_expert_pack_acquire(argv[i], expert, bytes);
-            if (data != pinned || uintptr_t(data) % 4096 != 0 || !std::equal(expected.begin(), expected.end(), data)) { return 4; }
+            const char * alignment = std::getenv("SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT");
+            const bool page_aligned_payload = !alignment || std::strcmp(alignment, "1") == 0 || std::getenv("SSD_LLAMA_MAC_EXPERT_PACK");
+            if (data != pinned || (page_aligned_payload && uintptr_t(data) % 4096 != 0) ||
+                    !std::equal(expected.begin(), expected.end(), data)) { return 4; }
             ggml_mac_expert_pack_release(pinned);
             if (!std::equal(expected.begin(), expected.end(), data)) { return 5; }
             ggml_mac_expert_pack_release(data);

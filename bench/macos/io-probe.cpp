@@ -11,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
 #include <unistd.h>
@@ -19,9 +20,11 @@
 struct request { int fd; uint64_t offset; size_t bytes; };
 int main(int argc, char ** argv) {
     try {
-        if (argc != 5) { throw std::runtime_error("usage: io-probe sequential|trace FILE DEPTH MAX_BYTES"); }
+        if (argc != 5 && argc != 6) { throw std::runtime_error("usage: io-probe sequential|trace FILE DEPTH MAX_BYTES [READ_ALIGNMENT]"); }
         const int depth = std::stoi(argv[3]);
         const uint64_t maximum = std::stoull(argv[4]);
+        const uint64_t alignment = argc == 6 ? std::stoull(argv[5]) : 1;
+        if (alignment != 1 && alignment != 4096 && alignment != 16384) { throw std::runtime_error("invalid read alignment"); }
         if (depth < 1 || depth > 4 || maximum == 0) { throw std::runtime_error("invalid limits"); }
         std::unordered_map<std::string, int> files;
         auto open_source = [&](const std::string & path) {
@@ -62,6 +65,17 @@ int main(int argc, char ** argv) {
             }
         } else { throw std::runtime_error("unknown probe mode"); }
         if (requests.empty()) { throw std::runtime_error("no read requests"); }
+        uint64_t read_total = 0;
+        for (auto & item : requests) {
+            struct stat st{};
+            if (fstat(item.fd, &st) != 0 || st.st_size < 0 || item.offset > uint64_t(st.st_size) || item.bytes > uint64_t(st.st_size) - item.offset) {
+                throw std::runtime_error("read extent beyond EOF");
+            }
+            const uint64_t end = std::min((item.offset + item.bytes + alignment - 1) / alignment * alignment, uint64_t(st.st_size));
+            item.offset = item.offset / alignment * alignment;
+            item.bytes = size_t(end - item.offset);
+            read_total += item.bytes;
+        }
         size_t largest = 0;
         for (const auto & item : requests) { largest = std::max(largest, item.bytes); }
         std::atomic<size_t> next{0};
@@ -72,7 +86,7 @@ int main(int argc, char ** argv) {
         for (int i = 0; i < depth; ++i) {
             workers.emplace_back([&] {
                 void * memory = nullptr;
-                if (posix_memalign(&memory, 4096, largest) != 0) { failed = true; return; }
+                if (posix_memalign(&memory, std::max(uint64_t(4096), alignment), largest) != 0) { failed = true; return; }
                 while (!failed.load()) {
                     const size_t index = next.fetch_add(1);
                     if (index >= requests.size()) { break; }
@@ -98,8 +112,8 @@ int main(int argc, char ** argv) {
         double sum = 0;
         for (double value : elapsed) { sum += value; }
         auto percentile = [&](double p) { return elapsed[size_t(p * (elapsed.size() - 1))]; };
-        std::printf("{\"mode\":\"%s\",\"depth\":%d,\"requests\":%zu,\"bytes\":%llu,\"seconds\":%.9f,\"logical_gbps\":%.6f,\"read_call_ms\":%.3f,\"p50_us\":%.3f,\"p95_us\":%.3f,\"p99_us\":%.3f}\n",
-                argv[1], depth, requests.size(), (unsigned long long)total, seconds, total / seconds / 1e9,
+        std::printf("{\"mode\":\"%s\",\"depth\":%d,\"requests\":%zu,\"bytes\":%llu,\"read_bytes\":%llu,\"alignment\":%llu,\"seconds\":%.9f,\"logical_gbps\":%.6f,\"read_call_ms\":%.3f,\"p50_us\":%.3f,\"p95_us\":%.3f,\"p99_us\":%.3f}\n",
+                argv[1], depth, requests.size(), (unsigned long long)total, (unsigned long long)read_total, (unsigned long long)alignment, seconds, total / seconds / 1e9,
                 sum / 1000, percentile(.5), percentile(.95), percentile(.99));
     } catch (const std::exception & error) {
         std::fprintf(stderr, "%s\n", error.what());

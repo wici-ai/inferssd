@@ -56,6 +56,7 @@ struct source_entry {
     uint64_t offset;
     size_t bytes;
     size_t read_bytes;
+    size_t prefix = 0;
 };
 
 struct source_file {
@@ -106,16 +107,18 @@ struct key_hash {
 struct slot {
     void * data = nullptr;
     size_t allocated = 0;
+    size_t prefix = 0;
     uint64_t last_use = 0;
     unsigned pins = 0;
     bool admitted = false;
     slot() = default;
     slot(const slot &) = delete;
     slot & operator=(const slot &) = delete;
-    slot(slot && other) noexcept : data(other.data), allocated(other.allocated),
+    slot(slot && other) noexcept : data(other.data), allocated(other.allocated), prefix(other.prefix),
             last_use(other.last_use), pins(other.pins), admitted(other.admitted) { other.data = nullptr; }
     slot & operator=(slot &&) = delete;
     ~slot() { free(data); }
+    const void * payload() const { return static_cast<const char *>(data) + prefix; }
 };
 
 static size_t round_up(size_t value) {
@@ -167,6 +170,12 @@ struct io_trace_entry {
     uint64_t offset, bytes, logical_bytes, begin_ns, duration_ns;
 };
 
+struct phase_trace_entry {
+    uint64_t end_ns, requests;
+    double acquire_us, read_wait_us, compute_us, barrier_us, lookup_us, policy_us;
+    double allocation_us, release_us, lock_wait_us;
+};
+
 struct elapsed_counter {
     double & total;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
@@ -179,6 +188,12 @@ class pack_cache {
 public:
     explicit pack_cache(const char * path, bool alias) {
         if (const char * value = std::getenv("SSD_LLAMA_MAC_EXPERT_TRACE")) { trace_path = value; }
+        if (const char * value = std::getenv("SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT")) {
+            read_alignment = size_t(parse_uint(value));
+            if (read_alignment != 1 && read_alignment != 4096 && read_alignment != 16384) {
+                throw std::runtime_error("expert read alignment must be 1, 4096 or 16384");
+            }
+        }
         if (alias) { load_alias(path); } else { load_pack(path); }
         const char * budget_env = std::getenv("SSD_LLAMA_MAC_EXPERT_CACHE_MIB");
         char * end = nullptr;
@@ -204,8 +219,8 @@ public:
             stop_readers();
             throw;
         }
-        std::fprintf(stderr, "[mac_expert_pack] path=%s entries=%zu cache_budget_mib=%llu cache_policy=%s source=%s read_ahead=%zu F_NOCACHE=1\n",
-                     path, index.size(), mib, policy.c_str(), alias ? "gguf-alias" : "pack", read_ahead);
+        std::fprintf(stderr, "[mac_expert_pack] path=%s entries=%zu cache_budget_mib=%llu cache_policy=%s source=%s read_ahead=%zu read_alignment=%zu F_NOCACHE=1\n",
+                     path, index.size(), mib, policy.c_str(), alias ? "gguf-alias" : "pack", read_ahead, read_alignment);
     }
 
     ~pack_cache() {
@@ -235,6 +250,16 @@ public:
                             (unsigned long long)item.offset, (unsigned long long)item.bytes,
                             (unsigned long long)item.logical_bytes, (unsigned long long)item.begin_ns,
                             (unsigned long long)item.duration_ns);
+                }
+                std::fclose(output);
+            }
+            if (FILE * output = std::fopen((trace_path + ".phases.tsv").c_str(), "w")) {
+                std::fprintf(output, "end_ns\trequests\tacquire_us\tread_wait_us\tcompute_us\tbarrier_us\tlookup_us\tpolicy_us\tallocation_us\trelease_us\tlock_wait_us\n");
+                for (const auto & item : phase_trace) {
+                    std::fprintf(output, "%llu\t%llu\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
+                            (unsigned long long)item.end_ns, (unsigned long long)item.requests,
+                            item.acquire_us, item.read_wait_us, item.compute_us, item.barrier_us,
+                            item.lookup_us, item.policy_us, item.allocation_us, item.release_us, item.lock_wait_us);
                 }
                 std::fclose(output);
             }
@@ -278,11 +303,11 @@ public:
                 schedule(*batch);
             }
             maybe_log_stats();
-            return hit->second.data;
+            return hit->second.payload();
         }
         ++misses;
         const auto policy_start = std::chrono::steady_clock::now();
-        const size_t allocation = round_up(logical_bytes);
+        const size_t allocation = round_up(source->second.read_bytes);
         bool admit = budget >= allocation && !tensor_names.empty();
         const size_t per_tensor_slots = admit ? budget / tensor_names.size() / allocation : 0;
         admit = admit && per_tensor_slots > 0;
@@ -345,6 +370,7 @@ public:
             read_source(source->second, fresh.data);
         }
         fresh.allocated = allocation;
+        fresh.prefix = source->second.prefix;
         fresh.admitted = admit;
         fresh.pins = 1;
         fresh.last_use = ++clock;
@@ -353,14 +379,14 @@ public:
         peak_bytes = std::max(peak_bytes, allocated_bytes);
         if (batch) { schedule(*batch); }
         maybe_log_stats();
-        return inserted.first->second.data;
+        return inserted.first->second.payload();
     }
 
     void release(const void * data) {
         std::lock_guard<std::mutex> lock(mutex);
         elapsed_counter elapsed{release_us};
         for (auto it = slots.begin(); it != slots.end(); ++it) {
-            if (it->second.data != data) { continue; }
+            if (it->second.payload() != data) { continue; }
             if (it->second.pins == 0) { throw std::runtime_error("expert-pack slice released twice"); }
             --it->second.pins;
             if (!it->second.admitted && it->second.pins == 0) {
@@ -403,6 +429,12 @@ public:
         compute_us += us;
         barrier_us += barriers;
         ++computed_experts;
+        if (!trace_path.empty()) {
+            phase_trace.push_back({uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count()), hits + misses,
+                    acquire_us, read_wait_us, double(compute_us), double(barrier_us), lookup_us, policy_us,
+                    allocation_us, release_us, lock_wait_us});
+        }
     }
 
 private:
@@ -416,7 +448,7 @@ private:
             buffer.data = scratch_data;
             scratch_data = nullptr;
             ++scratch_reuses;
-        } else if (posix_memalign(&buffer.data, alignment, allocation) != 0) {
+        } else if (posix_memalign(&buffer.data, std::max(alignment, read_alignment), allocation) != 0) {
             throw std::runtime_error("cannot allocate expert read buffer");
         }
         buffer.allocated = allocation;
@@ -486,7 +518,7 @@ private:
             if (source == index.end() || source->second.bytes != batch.logical_bytes) {
                 throw std::runtime_error("expert batch missing/mismatched source");
             }
-            const auto allocation = round_up(batch.logical_bytes);
+            const auto allocation = round_up(source->second.read_bytes);
             if (allocation > staging_limit - batch.pending_bytes) { continue; }
             auto job = std::make_shared<pending_read>();
             job->id = id;
@@ -575,9 +607,11 @@ private:
             if (offset > file.bytes || bytes > file.bytes - offset) {
                 throw std::runtime_error("expert alias slice exceeds source file");
             }
-            // GGUF slices need not be page aligned. Unlike padded packs, read exactly
-            // the logical extent; in particular, never read beyond the final tensor.
-            add_entry(name, int32_t(expert), {file.fd, offset, size_t(bytes), size_t(bytes)});
+            // Include surrounding source bytes only for I/O alignment. The kernel
+            // receives the original logical slice; the last read stops at EOF.
+            const uint64_t read_offset = offset / read_alignment * read_alignment;
+            const uint64_t read_end = std::min((offset + bytes + read_alignment - 1) / read_alignment * read_alignment, file.bytes);
+            add_entry(name, int32_t(expert), {file.fd, read_offset, size_t(bytes), size_t(read_end - read_offset), size_t(offset - read_offset)});
         }
         if (!input.eof() || index.empty()) { throw std::runtime_error("invalid expert alias index"); }
     }
@@ -618,7 +652,7 @@ private:
     double allocation_us = 0.0, release_us = 0.0, lock_wait_us = 0.0;
     uint64_t compute_us = 0, barrier_us = 0, computed_experts = 0;
     uint64_t prefetch_submitted = 0, prefetch_used = 0, prefetch_unused = 0;
-    size_t read_ahead = 0, peak_staging_bytes = 0;
+    size_t read_ahead = 0, peak_staging_bytes = 0, read_alignment = 1;
     std::mutex queue_mutex;
     std::condition_variable queue_ready;
     std::deque<std::shared_ptr<pending_read>> queue;
@@ -634,6 +668,7 @@ private:
     std::vector<request_trace_entry> access_trace;
     std::mutex trace_mutex;
     std::vector<io_trace_entry> io_trace;
+    std::vector<phase_trace_entry> phase_trace;
     void * scratch_data = nullptr;
     size_t scratch_allocated = 0;
 };
