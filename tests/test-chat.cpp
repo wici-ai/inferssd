@@ -2917,11 +2917,11 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             common_chat_templates_inputs inputs;
             inputs.messages = { message_user };
             inputs.enable_thinking = true;
-            inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+            inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
             auto parser = make_peg_parser(tmpls.get(), inputs, detailed_debug);
             common_chat_parser_params parser_params(parser.params_);
             parser_params.parser.load(parser.params_.parser);
-            parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+            parser_params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
 
             const std::string reasoning = "The user requested a short update.";
             const std::string response = "Updated.";
