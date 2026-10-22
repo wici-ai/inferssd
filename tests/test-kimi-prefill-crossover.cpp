@@ -294,8 +294,8 @@ struct gpu_runner {
     std::unique_ptr<tier> cache;
     std::array<int32_t, 1> layers = { 1 };
     kimi_vram_expert_format format = {};
-    kimi_vram_activation activation = {
-        KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 10.0f,
+    kimi_vram_prefill_launch activation = {
+        { KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 10.0f }, nullptr, 0.0f, 0,
     };
     std::vector<float> & f32;
     aligned_bytes quantized;
@@ -405,7 +405,7 @@ struct gpu_runner {
         const auto start = steady::now();
         require(batch_api->compute(batch, base, base + expert.role_bytes[0],
                 base + expert.role_bytes[0] + expert.role_bytes[1],
-                input_data(), multiplicity, activation.swiglu_limit, output.data(), error, sizeof(error)),
+                input_data(), multiplicity, activation.activation.swiglu_limit, output.data(), error, sizeof(error)),
                 std::string("MXFP4 batch compute: ") + error);
         sample result;
         result.internal_us = std::chrono::duration<double, std::micro>(steady::now() - start).count();

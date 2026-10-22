@@ -412,7 +412,7 @@ struct group_engine {
         }
     }
 
-    void finish_layer(const float ** output, vram_group_layer_stats * stats) {
+    void finish_layer(const float ** output, vram_group_layer_stats * stats, double * group_us) {
         if (!output) {
             throw std::runtime_error("grouped VRAM engine null output");
         }
@@ -427,20 +427,29 @@ struct group_engine {
         cuda_check(cudaEventRecord(finish_end, stream), "event");
         cuda_check(cudaEventSynchronize(finish_end), "grouped engine finish");
         *output = host_output;
-        if (stats) {
-            *stats = {};
-            float ms = 0.0f;
+        float ms = 0.0f;
+        if (stats || group_us) {
+            vram_group_layer_stats local = {};
+            vram_group_layer_stats & st = stats ? *stats : local;
+            st = {};
             for (size_t i = 0; i < computed.size(); ++i) {
                 const int g = computed[i];
                 const double routes = double(first[size_t(g) + 1] - first[size_t(g)]);
                 cuda_check(cudaEventElapsedTime(&ms, events[2 * i], events[2 * i + 1]), "event time");
                 const double us = 1e3 * double(ms);
-                stats->experts += 1;
-                stats->routes += routes;
-                stats->routes_sq += routes * routes;
-                stats->us += us;
-                stats->route_us += routes * us;
+                if (group_us) { group_us[g] = us; }
+                st.experts += 1;
+                st.routes += routes;
+                st.routes_sq += routes * routes;
+                st.us += us;
+                st.route_us += routes * us;
             }
+            if (!computed.empty()) {
+                cuda_check(cudaEventElapsedTime(&ms, events[0], events[2 * computed.size() - 1]), "event time");
+                st.span_us = 1e3 * double(ms);
+            }
+        }
+        if (stats) {
             cuda_check(cudaEventElapsedTime(&ms, begin_start, begin_end), "event time");
             stats->begin_us = 1e3 * double(ms);
             cuda_check(cudaEventElapsedTime(&ms, finish_start, finish_end), "event time");
@@ -522,10 +531,11 @@ int compute(void * context, int group, const vram_compute_expert * weights, CUev
     } catch (const std::exception & e) { return fail(e, error, error_size); }
 }
 
-int finish_layer(void * context, const float ** output, vram_group_layer_stats * stats, char * error, size_t error_size) {
+int finish_layer(void * context, const float ** output, vram_group_layer_stats * stats, double * group_us,
+        char * error, size_t error_size) {
     try {
         if (!context) { throw std::runtime_error("null grouped VRAM engine"); }
-        static_cast<group_engine *>(context)->finish_layer(output, stats);
+        static_cast<group_engine *>(context)->finish_layer(output, stats, group_us);
         return 0;
     } catch (const std::exception & e) { return fail(e, error, error_size); }
 }
@@ -543,7 +553,7 @@ size_t host_bytes(void * context) { return context ? static_cast<group_engine *>
 extern "C" __attribute__((visibility("default")))
 const vram_group_compute_api * kimi_vram_group_compute_get_api() {
     static const vram_group_compute_api api = {
-        1, sizeof(vram_group_compute_api), create, destroy, reserve, release, input_rows, begin_layer, compute,
+        2, sizeof(vram_group_compute_api), create, destroy, reserve, release, input_rows, begin_layer, compute,
         finish_layer, geometry, device_bytes, host_bytes
     };
     return &api;

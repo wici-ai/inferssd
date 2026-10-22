@@ -88,6 +88,8 @@ MEMPROBE=${MEMPROBE:-$ROOT/probe/memprobe}
 if [[ ! -x $MEMPROBE ]] && command -v nvcc > /dev/null; then
   mkdir -p "$(dirname "$MEMPROBE")" && nvcc -O2 -o "$MEMPROBE" $FW/probe/memprobe.cu >> "$out/pipeline.log" 2>&1
 fi
+# the grouped-prefill lanes are timed by the build's test-kimi-vram-group (BUILD_TESTS=1), when the engine has one
+export GROUP_TIMER=${GROUP_TIMER:-$(dirname "$SERVER_BIN")/test-kimi-vram-group}
 if [[ ! -s $out/probe/device.json ]]; then
   log "step 1: device probe"
   bash $FW/probe.sh "$out/probe" "$EXPERT_SOURCE" "$MEMPROBE" >> "$out/pipeline.log" 2>&1 ||

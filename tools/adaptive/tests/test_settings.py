@@ -923,6 +923,207 @@ class Prefetch(unittest.TestCase):
         self.assertIn('GGML_KIMI_CPU_SINK_PREFETCH', next(x for x in conf.splitlines() if x.startswith('PENDING=')))
 
 
+class LaneModel(unittest.TestCase):
+    """The sink pass with the GPU lane (B6): prefill.lane_layer is kimi_place_layer's streamed form (kimi-prefill-cost.h);
+    the golden values are the C++ header's on the same layers (scratchpad lane-vm/golden.cpp at the lane branch): a
+    page-locked ring, a pageable one (the staging pipelined), in place where the GPU reads host memory and that is
+    no slower, copies where it is, and a page-locked ring without a measured copy (nothing priced)."""
+    GOLDEN = [
+        {'n': 4221, 'U': 220, 'R': 0, 'routes': 150, 'mb': 30.408704, 'in_place': False, 'ring_locked': True, 'route_bytes': 8, 'lane': {'cpu_fixed_us': 175, 'cpu_route_us': 409, 'gpu_fixed_us': 121.5, 'gpu_route_us': 1.664, 'gpu_host_fixed_us': 0, 'gpu_host_route_us': 0, 'link_gbps': 6.91, 'pageable_gbps': 5, 'drive_gbps': 7, 'drive_fixed_us': 12000, 'gpu_token_us': 2.3}, 'us': 1071099.049515, 'moves': 206, 'chosen_in_place': False},
+        {'n': 4221, 'U': 220, 'R': 40, 'routes': 150, 'mb': 30.408704, 'in_place': False, 'ring_locked': True, 'route_bytes': 8, 'lane': {'cpu_fixed_us': 175, 'cpu_route_us': 409, 'gpu_fixed_us': 121.5, 'gpu_route_us': 1.664, 'gpu_host_fixed_us': 0, 'gpu_host_route_us': 0, 'link_gbps': 6.91, 'pageable_gbps': 5, 'drive_gbps': 7, 'drive_fixed_us': 12000, 'gpu_token_us': 2.3}, 'us': 882266.328414, 'moves': 168, 'chosen_in_place': False},
+        {'n': 669, 'U': 205, 'R': 0, 'routes': 26, 'mb': 30.408704, 'in_place': True, 'ring_locked': False, 'route_bytes': 8, 'lane': {'cpu_fixed_us': 1046, 'cpu_route_us': 118, 'gpu_fixed_us': 212, 'gpu_route_us': 2.527, 'gpu_host_fixed_us': 173.6, 'gpu_host_route_us': 2.186, 'link_gbps': 0, 'pageable_gbps': 52.6, 'drive_gbps': 12.14, 'drive_fixed_us': 3000, 'gpu_token_us': 0.4}, 'us': 521636.539794, 'moves': 134, 'chosen_in_place': True},
+        {'n': 4104, 'U': 300, 'R': 10, 'routes': 80, 'mb': 18.812928, 'in_place': False, 'ring_locked': True, 'route_bytes': 5448, 'lane': {'cpu_fixed_us': 520, 'cpu_route_us': 297, 'gpu_fixed_us': 60, 'gpu_route_us': 25, 'gpu_host_fixed_us': 0, 'gpu_host_route_us': 0, 'link_gbps': 6.91, 'pageable_gbps': 5, 'drive_gbps': 7, 'drive_fixed_us': 12000, 'gpu_token_us': 7}, 'us': 889702.502788, 'moves': 260, 'chosen_in_place': False},
+        {'n': 4221, 'U': 220, 'R': 0, 'routes': 150, 'mb': 30.408704, 'in_place': False, 'ring_locked': True, 'route_bytes': 8, 'lane': {'cpu_fixed_us': 1, 'cpu_route_us': 0.01, 'gpu_fixed_us': 121.5, 'gpu_route_us': 1.664, 'gpu_host_fixed_us': 0, 'gpu_host_route_us': 0, 'link_gbps': 6.91, 'pageable_gbps': 5, 'drive_gbps': 7, 'drive_fixed_us': 12000, 'gpu_token_us': 2.3}, 'us': 972046.226286, 'moves': 0, 'chosen_in_place': False},
+        {'n': 4221, 'U': 220, 'R': 0, 'routes': 150, 'mb': 30.408704, 'in_place': False, 'ring_locked': False, 'route_bytes': 8, 'lane': {'cpu_fixed_us': 175, 'cpu_route_us': 409, 'gpu_fixed_us': 121.5, 'gpu_route_us': 1.664, 'gpu_host_fixed_us': 0, 'gpu_host_route_us': 0, 'link_gbps': 6.91, 'pageable_gbps': 5.83, 'drive_gbps': 7, 'drive_fixed_us': 12000, 'gpu_token_us': 2.3}, 'us': 1159561.621193, 'moves': 203, 'chosen_in_place': False},
+        {'n': 4221, 'U': 220, 'R': 20, 'routes': 150, 'mb': 30.408704, 'in_place': True, 'ring_locked': False, 'route_bytes': 8, 'lane': {'cpu_fixed_us': 175, 'cpu_route_us': 409, 'gpu_fixed_us': 121.5, 'gpu_route_us': 1.664, 'gpu_host_fixed_us': 4000, 'gpu_host_route_us': 30, 'link_gbps': 0, 'pageable_gbps': 52.6, 'drive_gbps': 12.14, 'drive_fixed_us': 3000, 'gpu_token_us': 0.4}, 'us': 508996.875476, 'moves': 196, 'chosen_in_place': False},
+        {'n': 4221, 'U': 220, 'R': 0, 'routes': 150, 'mb': 30.408704, 'in_place': False, 'ring_locked': True, 'route_bytes': 8, 'lane': {'cpu_fixed_us': 175, 'cpu_route_us': 409, 'gpu_fixed_us': 121.5, 'gpu_route_us': 1.664, 'gpu_host_fixed_us': 0, 'gpu_host_route_us': 0, 'link_gbps': 0, 'pageable_gbps': 5.83, 'drive_gbps': 7, 'drive_fixed_us': 12000, 'gpu_token_us': 2.3}, 'us': 13539844.109150, 'moves': 0, 'chosen_in_place': False},
+    ]
+
+    def test_the_port_is_the_engines_choice(self):
+        for g in self.GOLDEN:
+            us, _, moves = prefill.lane_layer(g['lane'], g['n'], g['U'], g['routes'], g['R'] / g['U'], g['mb'] * 1e6,
+                                              g['in_place'], g['route_bytes'], ring_locked=g['ring_locked'])
+            self.assertEqual(moves, g['moves'])
+            self.assertAlmostEqual(us / g['us'], 1.0, places=9)
+
+    def test_coupled_is_the_headers(self):
+        self.assertEqual(prefill.coupled(1000.0, 0.0, 8), 1000.0)
+        self.assertAlmostEqual(prefill.coupled(1000.0, 1000.0, 8), 1125.0)
+        self.assertAlmostEqual(prefill.coupled(1000.0, 100.0, 8), 1000.0, places=4)
+
+    def lane_model(self, d_s=1.9e-3, graph=None):
+        # the Spark with Muse: the lane in place, the drive 12.14 GB/s, the CPU 1046 + 118 us a route
+        m = model(c=150e-6, rate=12.14e9, d=d_s, B_e=30408704)
+        lane = dict(self.GOLDEN[2]['lane'])
+        for s in ('cold', 'warm'):
+            m['pass']['all'][s] = dict(m['pass']['all'][s], lane=lane, d=d_s)
+        m['lane'] = {'in_place': True, 'route_bytes': 8, 'engine': 'batched'}
+        m['graph'] = graph
+        return m
+
+    def test_the_sink_pass_with_the_lane(self):
+        # far below the CPU-only sink at 4221 tokens: the GPU takes the most-routed experts; reads stay the floor
+        m = self.lane_model()
+        lane_s, cpu_s, read = prefill.pass_seconds(m, 'all', 4221, False, True, 0)
+        plain = model(c=150e-6, rate=12.14e9, d=1.9e-3, B_e=30408704)
+        plain_s = prefill.pass_seconds(plain, 'all', 4221, False, True, 0)[0]
+        self.assertLess(lane_s, 0.5 * plain_s)
+        self.assertGreaterEqual(lane_s, read / 12.14e9 + 4221 * 1.9e-3)
+        self.assertLess(cpu_s, prefill.pass_seconds(plain, 'all', 4221, False, True, 0)[1])
+
+    def test_the_break_even_needs_a_graph_arm(self):
+        self.assertIsNone(prefill.break_even(self.lane_model(), 'all'))
+
+    def test_a_graph_slower_a_token_never_wins_against_the_lane(self):
+        # the graph's copy at the drive's rate and 3.5 ms a token besides (its serialized compute): never faster
+        m = self.lane_model(graph={'R': 12.0e9, 'a': 0.5, 'd': 3.5e-3, 'n': [669, 4221]})
+        self.assertEqual(prefill.break_even(m, 'all'), math.inf)
+
+    def test_the_crossing_with_the_lane(self):
+        # a graph whose time a token besides is far below the sink's: it wins from some pass size on, and the
+        # break-even is where the two routes cross
+        m = self.lane_model(d_s=6e-3, graph={'R': 12.0e9, 'a': 0.5, 'd': 0.5e-3, 'n': [669, 4221]})
+        t = prefill.break_even(m, 'all')
+        self.assertTrue(0 < t < 1 << 20)
+        at = lambda n, g: prefill.pass_seconds(m, 'all', n, g, False, m['tier_at_warm'])[0]   # noqa: E731
+        self.assertLessEqual(at(t, False), at(t, True))
+        self.assertGreater(at(t + 1, False), at(t + 1, True))
+
+    def test_the_check_prices_each_pass_with_the_lane(self):
+        # prefill.py check: each pass with the lane, in sample and from the other state's table
+        m = self.lane_model()
+        for st in m['pass']['all'].values():
+            st['prompt_s'] = 40.0
+        rows = prefill.check(m)
+        self.assertEqual([r[:3] for r in rows], [('all', 'cold', 4000), ('all', 'warm', 4000)])
+        self.assertTrue(all(r[4] > 0 and r[5] is not None for r in rows))
+        self.assertEqual(prefill.check(model()), [])          # no lane: nothing to check
+
+    def test_the_bootstraps_table_is_carried(self):
+        lane = {'cpu_fixed_us': 1046.0, 'cpu_route_us': 118.0, 'gpu_fixed_us': 212.0, 'gpu_route_us': 2.527,
+                'gpu_host_fixed_us': 0.0, 'gpu_host_route_us': 0.0, 'link_gbps': 0.0, 'drive_gbps': 12.14,
+                'drive_fixed_us': 3000.0, 'gpu_token_us': -1.0}
+        m = machine(P={'all': {'prefill': [{'n_tokens': 4221, 'tier': 0}, {'n_tokens': 4221, 'tier': 900, 'lane': lane,
+                                                                          'layers_costed': 61}]}})
+        s = settings.prefill_carried(m, 'all')
+        self.assertEqual((s.name, s.source), ('GGML_KIMI_CPU_PREFILL_COST', 'derived'))
+        t = dict(x.split('=') for x in s.value.split(','))
+        self.assertEqual(sorted(t), ['cpu_fixed_us', 'cpu_route_us', 'drive_fixed_us', 'drive_gbps', 'gpu_fixed_us',
+                                     'gpu_route_us'])   # no zero rate, no uncalibrated overhead
+        self.assertIsNone(settings.prefill_carried(machine(P={'all': {'prefill': [{'n_tokens': 4221, 'tier': 0}]}}), 'all'))
+
+    def test_the_log_gives_each_pass_its_table(self):
+        lines = ['[kimi_vram_prefill_engine] format=q4_K/q5_K engine=batched in_place=1 route_bytes=8 token_bytes=16384 '
+                 'output_bytes=16384 fixed_bytes=23400000 bytes_per_token=32768 reserved_rows=4221 device_bytes=1 host_bytes=1']
+        for layer in range(3):
+            lines.append(f'[kimi_cpu_prefill_cost] calibrated={layer + 1} tokens=4221 samples={layer + 1} cpu_fixed_us=1046.0 '
+                         f'cpu_route_us=118.0 gpu_fixed_us=212.0 gpu_route_us=2.5 gpu_host_fixed_us=173.6 gpu_host_route_us=2.2 '
+                         f'link_gbps=0.000 pageable_gbps=52.600 drive_gbps=12.140 drive_fixed_us=3000.0 gpu_token_us=0.4 '
+                         f'cpu_one_us=1300.0 predicted_us=600000.0 measured_us=610000.0')
+            lines.append('[kimi_cpu_prefill_schedule] format=batched rule=makespan drive_us=1.0 fill_us=1.0 gpu_overhead_us=1.0 '
+                         'ring=12 form=streamed ring_locked=0 in_place=1 makespan_before_us=1.0 makespan_after_us=1.0')
+            lines.append(f'[kimi_cpu_prefill_layer] layer={layer} n_tokens=4221 slots=8 unique_experts=200 routed_slots=33768 '
+                         'gpu_experts=0 gpu_ssd_transient_experts=150 ssd_experts=200 ssd_bytes=6000000000')
+        a = logparse.ArmParser()
+        for line in lines:
+            a.feed(line)
+        with tempfile.TemporaryDirectory() as d:
+            r = a.result(d)
+        (p,) = r['prefill']
+        self.assertEqual(p['lane']['drive_gbps'], 12.14)
+        self.assertAlmostEqual(p['layers_s'], 1.83)
+        self.assertEqual(p['layers_costed'], 3)
+        self.assertEqual(r['prefill_engine']['engine'], 'batched')
+        self.assertEqual((r['prefill_engine']['ring'], r['prefill_engine']['ring_locked']), (12, 0))   # the schedule's ring
+        # an engine without the receipt (every stored run): no lane, the old model
+        b = logparse.ArmParser()
+        for line in lines[1:]:
+            b.feed(line)
+        with tempfile.TemporaryDirectory() as d:
+            self.assertNotIn('lane', b.result(d)['prefill'][0])
+
+
+class PrefillStart(unittest.TestCase):
+    """The cost table's start values from the probe's lanes (B4)."""
+    # GB10 (ysy9) at Muse's shape, run 2 of results-bytes-20261022.md: busy lines, the copy, the drive at its knee
+    LANES = {'format': 'q4_K/q5_K', 'latent': 4096, 'hidden': 4096, 'threads': 20,
+             'gpu': {'fixed_us': 212.0, 'per_route_us': 2.527, 'at150_us': 591.0, 'load': 'busy'},
+             'gpu_host': {'fixed_us': 173.6, 'per_route_us': 2.186, 'at150_us': 501.6, 'load': 'busy'},
+             'cpu': {'fixed_us': 1045.9, 'per_route_us': 118.1, 'at150_us': 18755.0, 'load': 'busy'},
+             'copy_gbps': 58.82}
+    SSD = {'ssd': {'3': {'gibs': 11.307, 'lat_ms': 1.0, 'gibs_runs': [11.279, 11.335]}}, 'ssd_knee_qd': 3}
+
+    def terms(self, s):
+        return dict(x.split('=') for x in s.value.split(','))
+
+    def test_the_lanes_give_the_start_values(self):
+        dev = {**DEV, **self.SSD, 'lanes': self.LANES, 'gpu': {'integrated': True, 'h2d_pinned_gbs': 52.6}}
+        (s,) = settings.prefill_start(machine(dev=dev))
+        self.assertEqual((s.name, s.source), ('GGML_KIMI_CPU_PREFILL_COST', 'measured'))
+        t = self.terms(s)
+        self.assertEqual((t['cpu_fixed_us'], t['cpu_route_us'], t['gpu_fixed_us'], t['gpu_route_us']),
+                         ('1045.9', '118.1', '212', '2.527'))
+        self.assertEqual((t['gpu_host_fixed_us'], t['gpu_host_route_us']), ('173.6', '2.186'))
+        self.assertNotIn('link_gbps', t)                   # unified memory: no link
+        self.assertEqual(t['pageable_gbps'], '58.82')      # the copy the in-place choice weighs: the probe's
+        self.assertAlmostEqual(float(t['drive_gbps']), 12.14, places=2)
+        self.assertRegex(settings.render([s]).strip(), LINE)
+
+    def test_a_discrete_gpu_takes_the_copies(self):
+        lanes = {k: v for k, v in self.LANES.items() if k != 'gpu_host'}
+        dev = {**DEV, 'lanes': lanes, 'gpu': {'integrated': False, 'h2d_pinned_gbs': 6.91, 'h2d_pageable_gbs': 5.83}}
+        t = self.terms(settings.prefill_start(machine(dev=dev))[0])
+        self.assertEqual((t['link_gbps'], t['pageable_gbps']), ('58.82', '5.83'))
+        self.assertNotIn('gpu_host_fixed_us', t)
+        self.assertNotIn('drive_gbps', t)                  # no drive measured
+
+    def test_a_format_on_its_own_engine_has_no_gpu_line(self):
+        dev = {**DEV, 'lanes': {**self.LANES, 'format': 'mxfp4/mxfp4'}, 'gpu': {'integrated': False}}
+        t = self.terms(settings.prefill_start(machine(dev=dev))[0])
+        self.assertIn('cpu_fixed_us', t)
+        self.assertFalse(any(k.startswith('gpu_') for k in t))
+
+    def test_no_lanes_no_start_values(self):
+        # a probe before the lane timing (every stored run's): nothing written, the settings as they were
+        dev = {**DEV, **self.SSD, 'gpu': {'integrated': False, 'h2d_pinned_gbs': 6.91}}
+        self.assertEqual(settings.prefill_start(machine(dev=dev)), [])
+
+    def test_the_probe_parses_the_lanes(self):
+        # device_profile.py on a probe directory with the timing's output (the busy line of each lane)
+        here = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+        with tempfile.TemporaryDirectory() as d:
+            def write(name, text):
+                with open(f'{d}/{name}', 'w') as f:
+                    f.write(text)
+            write('cpus.txt', '0 0 3000000 0\n1 0 3000000 1\n')
+            write('meminfo.txt', 'MemTotal: 131072000 kB\nMemAvailable: 120000000 kB\n')
+            write('memprobe.txt', 'integrated=1 gpu_read_bw=200.0 pinned=52.6 pageable=40.1\n')
+            write('coresets.txt', 'all 0,1\n')
+            write('experts.json', '{"expert_read_bytes": 30408704, "bytes_per_role": {}}')
+            fit = ('[kimi_vram_group_fit] lane={} source={} load={} threads=20 participants=19 format=q4_K/q5_K '
+                   'latent=4096 hidden=4096 points_us=8:230 fixed_us={} per_route_us={} at150_us={}\n')
+            lanes_txt = (
+                  fit.format('gpu', 'device', 'idle', 184.2, 2.022, 487.5) + fit.format('gpu', 'device', 'busy', 212.0, 2.527, 591.0) +
+
+                  '[kimi_vram_group_copy] bytes=30408704 idle_us=516.6 idle_gbps=58.86 busy_us=517.0 busy_gbps=58.82\n' +
+                  fit.format('gpu', 'host', 'idle', 180.4, 2.017, 483.0) + fit.format('gpu', 'host', 'busy', 173.6, 2.186, 501.6) +
+                  fit.format('cpu', 'host', 'idle', 1617.4, 100.7, 16722) + fit.format('cpu', 'host', 'busy', 1045.9, 118.1, 18755) +
+                  'KIMI_VRAM_GROUP_TIME_DONE\n')
+            write('lanes.txt', lanes_txt)
+            import json
+            import subprocess
+            profile = lambda: json.loads(subprocess.run(   # noqa: E731
+                [sys.executable, '-B', os.path.join(here, 'device_profile.py'), d, d],
+                capture_output=True, text=True, check=True).stdout)['lanes']
+            lanes = profile()
+            # a negative term never reaches the engine (it stops on one): a busy line of -3.2 us is read as 0
+            write('lanes.txt', lanes_txt + fit.format('cpu', 'host', 'busy', -3.2, 120.0, 17997))
+            self.assertEqual(profile()['cpu']['fixed_us'], 0.0)
+        self.assertEqual((lanes['gpu']['fixed_us'], lanes['gpu']['load']), (212.0, 'busy'))
+        self.assertEqual((lanes['gpu_host']['per_route_us'], lanes['cpu']['fixed_us']), (2.186, 1045.9))
+        self.assertEqual((lanes['format'], lanes['threads'], lanes['copy_gbps']), ('q4_K/q5_K', 20, 58.82))
+
+
 class Render(unittest.TestCase):
     def test_every_value_line_has_a_source_and_an_input(self):
         text = settings.render(settings.configuration(machine(), 84, 'split'), ['a header'])

@@ -69,4 +69,31 @@ dev['slow_files'] = [p for p, g in files.items() if g < 0.5 * median]
 
 dev['coresets'] = {name: {'cpus': [int(c) for c in s.split(',')]}
                    for name, s in (line.split() for line in open(f'{d}/coresets.txt'))}
+
+
+def lanes(path):
+    """The grouped-prefill lanes of probe.sh's lanes.txt (test-kimi-vram-group --time): per lane, the busy line (each
+    lane timed beside the others, as a pass runs them; the GPU's from device memory, and from host memory where it
+    reads it in place) as fixed + per route microseconds, the format and shape, the threads, and one page-locked
+    copy's rate; None without the timing."""
+    if not os.path.exists(path):
+        return None
+    out = {}
+    for line in open(path):
+        if line.startswith('[kimi_vram_group_fit] ') and 'fixed_us=' in line:
+            # each lane idle, then busy (or beside the link alone): the last line of a lane is its busy one
+            kv = dict(x.split('=', 1) for x in line.split()[1:] if '=' in x)
+            key = 'cpu' if kv['lane'] == 'cpu' else 'gpu_host' if kv['source'] == 'host' else 'gpu'
+            # the engine takes no negative term (a least-squares line of an older timing could have one)
+            out[key] = {'fixed_us': max(0.0, float(kv['fixed_us'])), 'per_route_us': max(0.0, float(kv['per_route_us'])),
+                        'at150_us': float(kv['at150_us']), 'load': kv['load']}
+            out.update(format=kv['format'], latent=int(kv['latent']), hidden=int(kv['hidden']), threads=int(kv['threads']))
+        elif line.startswith('[kimi_vram_group_copy] '):
+            kv = dict(x.split('=', 1) for x in line.split()[1:] if '=' in x)
+            busy = float(kv.get('busy_gbps', 0) or 0)
+            out['copy_gbps'] = busy if busy > 0 else float(kv['idle_gbps'])
+    return out if 'gpu' in out or 'cpu' in out else None
+
+
+dev['lanes'] = lanes(f'{d}/lanes.txt')
 json.dump(dev, sys.stdout, indent=1)

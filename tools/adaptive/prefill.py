@@ -11,7 +11,10 @@ most the prefill threshold T (GGML_KIMI_CPU_PREFILL_MAX_TOKENS; none: every pass
          n * r * c, plus n * d: r the routes a prompt token takes, c the sink's compute per route and d its time per
          token besides (attention, dense layers, what its reads and compute do not overlap), all from the
          bootstrap's prefill in the same tier state (cold: a server's first prefill; warm: after decode, the state a
-         serving server is in)
+         serving server is in).  With the GPU lane (a bootstrap whose engine reported it), each layer as the engine
+         places it (lane_layer: the CPU, the GPU's chains and their copies, the link and the drive coupled through the
+         ring, the experts moved to the GPU chosen as the engine chooses them) on the table the bootstrap's pass
+         calibrated, plus n * d with d the pass's time a token outside its layers' sink time
   graph  its reads at the rate its expert copy read in the bootstrap's graph prefills, plus a + n * d_g, the time
          of those prefills beyond their reads, a per pass and d_g per token (a cut of the text and the whole text
          give both).  Without graph prefills (provisional): the reads at the rate the GPU gets them (the drive's, or
@@ -35,6 +38,77 @@ GiB = 2 ** 30
 # the scheduler offloads MUL_MAT_ID to the GPU from this many tokens (GGML_OP_OFFLOAD_MIN_BATCH's default): a smaller
 # pass takes the sink whatever the threshold
 OFFLOAD_MIN = 32
+# the reads the sink's ring holds between the drive and the lanes (run-ssd-llama.sh: GGML_KIMI_CPU_SINK_RING_EXPERTS),
+# where a run's schedule receipt does not say
+RING = 8
+
+
+def coupled(a, b, n):
+    """kimi_prefill_coupled (kimi-prefill-cost.h): a producer busy for a and a consumer busy for b handing the work
+    over through a ring of n buffers."""
+    high, low = max(a, b), max(0.0, min(a, b))
+    if high <= 0:
+        return 0.0
+    n = max(1.0, n)
+    r = low / high
+    if r > 1.0 - 1e-9:
+        return high * (n + 1.0) / n
+    return high * (1.0 - r ** (n + 1.0)) / (1.0 - r ** n)
+
+
+def lane_layer(lane, n, U, routes, cov, b_e, in_place=False, route_bytes=0.0, ring=RING, ring_locked=True, k_cpu=1.0,
+               k_drive=1.0):
+    """One grouped-prefill layer of n tokens with the GPU lane, as the engine places it (kimi_place_layer's streamed
+    form, kimi-prefill-cost.h): U experts touched, `routes` routes each (their mean), a share cov of them resident in
+    the tier and the rest read from the drive (B_e bytes each) into the ring (`ring` reads; page-locked or not); lane:
+    the table a bootstrap pass calibrated (the engine's names: the CPU's line, the batched engine's device and
+    in-place lines, the page-locked and pageable copies, the drive, the GPU's time a token outside its chains);
+    in_place: the GPU can read host memory in place (the engine's receipt), and the layer then reads its moves there
+    when the in-place line is no longer than the device line plus a copy.  The moves: the read experts, most routes
+    first (all alike here), each off the CPU and onto the GPU (its chain after its copy into one of two device slots
+    on the link, page-locked DMA or pageable staging, or in place); the GPU lane the pipeline of the residents'
+    chains and the moves' copies and chains; the engine keeps the fewest moves within one read of the lowest time.
+    Returns (us, the CPU's us, moves)."""
+    t = lambda k: lane.get(k) or 0.0                                       # noqa: E731
+    N = max(0, int(round(U * (1.0 - cov))))
+    R = max(0, int(round(U * cov)))
+    c = k_cpu * (t('cpu_fixed_us') + t('cpu_route_us') * routes)
+    g_dev = t('gpu_fixed_us') + t('gpu_route_us') * routes
+    measured_host = t('gpu_host_fixed_us') > 0 or t('gpu_host_route_us') > 0
+    g_host = t('gpu_host_fixed_us') + t('gpu_host_route_us') * routes if measured_host else g_dev
+    locked_us = 1e3 / t('link_gbps') if t('link_gbps') > 0 else 0.0
+    pageable_us = 1e3 / t('pageable_gbps') if t('pageable_gbps') > 0 else 0.0
+    mb = b_e / 1e6
+    # a read's copy: from the page-locked ring at the measured rate (none measured: no price), else pageable staging
+    copy_us = locked_us if ring_locked else pageable_us
+    chosen = in_place and (N == 0 or g_host <= g_dev + mb * (locked_us if ring_locked and locked_us > 0 else pageable_us))
+    priced = chosen or copy_us > 0
+    g_mov = g_host if chosen else g_dev
+    d = 0.0 if chosen else mb * copy_us
+    rows = 0.0 if in_place else route_bytes * routes / 1e6 * (locked_us or pageable_us)
+    drive_us_per_mb = k_drive * 1e3 / t('drive_gbps') if t('drive_gbps') > 0 else 0.0
+    drive = k_drive * t('drive_fixed_us') + N * b_e / 1e6 * drive_us_per_mb if drive_us_per_mb and N else 0.0
+    fill = b_e / 1e6 * drive_us_per_mb if drive else 0.0
+    overhead = n * t('gpu_token_us')
+    times, cpus = [], []
+    copied, gpu = 0.0, [R * g_dev]
+    for m in range((N if priced else 0) + 1):
+        if m:
+            # the pipeline: copy m waits for the one before it and for the chain that last used its slot (two slots)
+            i = m - 1
+            if d > 0:
+                copied = max(copied, gpu[i - 1] if i >= 2 else 0.0) + d
+                gpu.append(max(gpu[i], copied) + g_mov)
+            else:
+                gpu.append(gpu[i] + g_mov)
+        cpu = (N - m) * c
+        link = (R + m) * rows + m * d
+        work = m > 0 or R > 0
+        times.append(fill + coupled(drive, max(cpu, gpu[m], link), ring) + (overhead if work else 0.0))
+        cpus.append(cpu)
+    lowest = min(times)
+    m = next(i for i, x in enumerate(times) if x <= lowest + fill)
+    return times[m], cpus[m], m
 
 
 def union_points(segments):
@@ -120,14 +194,22 @@ def build(ins, dev, routing=()):
         c = cpu / x['routes'] if cpu and x.get('routes') else 0.0
         r = x['routes'] / x['n_tokens'] if x.get('routes') else k * L
         read = x['ssd_gb'] * 1e9 / r_d if r_d else 0.0
-        return {'n': x['n_tokens'], 'c': c, 'r': r,
-                'd': max(0.0, (x['prompt_ms'] / 1e3 - max(read, cpu or 0.0)) / x['n_tokens'])}
+        out = {'n': x['n_tokens'], 'c': c, 'r': r, 'prompt_s': x['prompt_ms'] / 1e3,
+               'd': max(0.0, (x['prompt_ms'] / 1e3 - max(read, cpu or 0.0)) / x['n_tokens'])}
+        if x.get('lane') and x.get('layers_s') is not None:
+            # the pass with the GPU lane: its calibrated table, and its time a token outside its layers' sink time
+            out.update(lane=x['lane'], d=max(0.0, (x['prompt_ms'] / 1e3 - x['layers_s']) / x['n_tokens']))
+        return out
 
     passes = {}
     for p in P:
         mine = sorted(P[p]['prefill'], key=lambda x: x['tier'])
         passes[p] = {'cold': state(mine[0]), 'warm': state(mine[-1])}
+    engine = ins['placements'][ref].get('prefill_engine') or {}
     return {'E': E, 'k': k, 'L': L, 'B_e': b_e, 'R_d': r_d, 'R_io': min(rates) if rates else None, 'union': union,
+            'lane': {'in_place': bool(engine.get('in_place')), 'route_bytes': engine.get('route_bytes') or 0.0,
+                     'engine': engine.get('engine'), 'ring': engine.get('ring') or RING,
+                     'ring_locked': bool(engine.get('ring_locked', 1))} if engine else None,
             'union_scale': scale, 'graph': graph, 'graph_memory': g.get('memory') if gp else None,
             'role_mib': role / 2 ** 20,
             'integrated': bool(gpu.get('integrated')),
@@ -167,8 +249,17 @@ def pass_seconds(m, p, n, graph, first, tier, k_bytes=1.0, k_cpu=1.0, k_drive=1.
         g = m.get('graph') or {'R': m['R_io'], 'a': 0.0, 'd': st['d']}
         return k_drive * b / g['R'] + g['a'] + n * g['d'], 0.0, b
     cov = 0.0 if first else min(1.0, m['cov_warm'] * tier / m['tier_at_warm'])
-    cpu = k_cpu * n * st['r'] * st['c']
     read = b * (1 - cov)
+    if st.get('lane'):
+        # the sink with the GPU lane: every layer alike (the union's mean experts and routes), as the engine places it
+        geo = m.get('lane') or {}
+        U = coverage(m, n) * k_bytes
+        routes = n * st['r'] / m['L'] / U if U > 0 else 0.0
+        us, cpu_us, _ = lane_layer(st['lane'], n, U, routes, cov, m['B_e'], geo.get('in_place', False),
+                                   geo.get('route_bytes', 0.0), geo.get('ring', RING), geo.get('ring_locked', True),
+                                   k_cpu=k_cpu, k_drive=k_drive)
+        return m['L'] * us / 1e6 + n * st['d'], m['L'] * cpu_us / 1e6, read
+    cpu = k_cpu * n * st['r'] * st['c']
     return max(k_drive * read / m['R_d'] if m['R_d'] else 0.0, cpu) + n * st['d'], cpu, read
 
 
@@ -205,17 +296,37 @@ def break_even(m, p, cold=0.0):
     (and the link's on a discrete GPU), the bytes of an expert."""
     states = [(w, s == 'cold') for w, s in ((cold, 'cold'), (1.0 - cold, 'warm')) if w > 0]
     sts = [(w, m['pass'][p]['cold' if first else 'warm']) for w, first in states]
-    if not (all(st['c'] > 0 for _, st in sts) and m['R_d'] and m['R_io'] and m['B_e']):
-        return None
-    g = m.get('graph')
-    R, a = (g['R'], g['a']) if g else (m['R_io'], 0.0)
-    slope = sum(w * (st['r'] * st['c'] + st['d'] - (g['d'] if g else st['d'])) for w, st in sts)
-    if slope <= 0:
-        return math.inf
 
     def graph_faster(n):
         return sum(w * (pass_seconds(m, p, n, False, first, m['tier_at_warm'])[0] -
                         pass_seconds(m, p, n, True, first, m['tier_at_warm'])[0]) for w, first in states) > 0
+
+    g = m.get('graph')
+    if any(st.get('lane') for _, st in sts):
+        # the sink with the GPU lane: its time is not linear in n (moves follow the routes), so the crossing is found
+        # by doubling from the offload minimum, then by bisection; none up to 2^20 tokens: the graph is never faster.
+        # Only from a measured graph arm: without one the graph's time is a guess, and no threshold is written.
+        if not (g and m['B_e']):
+            return None
+        hi = OFFLOAD_MIN
+        while not graph_faster(hi):
+            hi *= 2
+            if hi > 1 << 20:
+                return math.inf
+        lo = hi // 2 if hi > OFFLOAD_MIN else 0
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if graph_faster(mid):
+                hi = mid
+            else:
+                lo = mid
+        return lo
+    if not (all(st['c'] > 0 for _, st in sts) and m['R_d'] and m['R_io'] and m['B_e']):
+        return None
+    R, a = (g['R'], g['a']) if g else (m['R_io'], 0.0)
+    slope = sum(w * (st['r'] * st['c'] + st['d'] - (g['d'] if g else st['d'])) for w, st in sts)
+    if slope <= 0:
+        return math.inf
 
     lo, hi = 0, int((m['E'] * m['L'] * m['B_e'] / R + a) / slope) + 2
     while hi - lo > 1:
@@ -359,3 +470,36 @@ def feedback(m, turns, how, recent=1):
     if fs:
         out['pf_drive'] = statistics.mean(fs)
     return out
+
+
+def check(m):
+    """Each bootstrap prefill against the model (B6's offline gate): per placement and tier state, the measured prompt
+    time against the sink pass the model prices from the same state (in sample) and from the other state's table
+    (the other prompt: a cold pass priced with the warm pass's lines and the reverse).  Rows (placement, state,
+    tokens, measured s, in-sample s, other s), the passes with the GPU lane only."""
+    rows = []
+    for p in m['pass']:
+        for s, other in (('cold', 'warm'), ('warm', 'cold')):
+            st = m['pass'][p][s]
+            if not st.get('lane') or not st.get('prompt_s'):
+                continue
+            first = s == 'cold'
+            own = pass_seconds(m, p, st['n'], False, first, m['tier_at_warm'])[0]
+            ot, cross = m['pass'][p][other], None
+            if ot.get('lane'):
+                alt = {**m, 'pass': {**m['pass'], p: {**m['pass'][p], s: dict(st, lane=ot['lane'], d=ot['d'])}}}
+                cross = pass_seconds(alt, p, st['n'], False, first, m['tier_at_warm'])[0]
+            rows.append((p, s, st['n'], st['prompt_s'], own, cross))
+    return rows
+
+
+if __name__ == '__main__':
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from machine import Machine
+    if len(sys.argv) != 3 or sys.argv[1] != 'check':
+        sys.exit('usage: prefill.py check RUN   (a framework run directory: insitu.json, probe/device.json, model.json)')
+    for p, s, n, measured, own, cross in check(Machine(sys.argv[2], pending=()).PF):
+        print(f"{p} {s} {n} tokens: measured {measured:.2f} s, model {own:.2f} s ({100 * (own / measured - 1):+.1f}%)"
+              + (f", from the other pass's table {cross:.2f} s ({100 * (cross / measured - 1):+.1f}%)" if cross else ''))
