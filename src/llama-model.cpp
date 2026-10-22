@@ -770,18 +770,6 @@ void llama_model::load_hparams(llama_model_loader & ml) {
         }
     }
 
-    if (arch == LLM_ARCH_KIMI_K3 && hparams.n_expert_used > 0) {
-        const char * expert_used_env = std::getenv("LLAMA_K3_EXPERT_USED_OVERRIDE");
-        if (expert_used_env && expert_used_env[0]) {
-            const long expert_used = std::strtol(expert_used_env, nullptr, 10);
-            if (expert_used > 0 && expert_used <= hparams.n_expert_used) {
-                LLAMA_LOG_WARN("%s: overriding Kimi K3 active experts from %u to %ld\n",
-                        __func__, hparams.n_expert_used, expert_used);
-                hparams.n_expert_used = (uint32_t) expert_used;
-            }
-        }
-    }
-
     if (arch == LLM_ARCH_WAVTOKENIZER_DEC) {
         ml.get_key(LLM_KV_FEATURES_LENGTH,  hparams.n_embd);
         ml.get_key(LLM_KV_EMBEDDING_LENGTH, hparams.n_embd_out_impl);
@@ -3280,36 +3268,6 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     case 27: type = LLM_TYPE_48B_A3B; break; // Kimi-Linear-48B-A3B
                     default: type = LLM_TYPE_UNKNOWN;
                 }
-            } break;
-        case LLM_ARCH_KIMI_K3:
-            {
-                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl);
-                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,  hparams.n_embd_head_v_mla_impl);
-                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q, false);
-                ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
-                ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
-                ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.n_embd_head_kda);
-                ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND,        hparams.kda_gate_lower_bound, false);
-
-                // n_head_kv == 0 marks KDA (recurrent) layers.
-                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
-                    hparams.recurrent_layer_arr[i] = hparams.n_head_kv(i) == 0;
-                }
-
-                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
-                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,        hparams.n_expert_shared);
-                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,  hparams.n_layer_dense_lead, false);
-                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,       hparams.expert_weights_scale, false);
-                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,        hparams.expert_weights_norm, false);
-                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,         hparams.expert_gating_func);
-                ml.get_key(LLM_KV_EXPERT_LATENT_LENGTH,       hparams.n_expert_latent, false);
-
-                ml.get_key(LLM_KV_ATTN_RES_BLOCK_SIZE,         hparams.attn_res_block_size, false);
-                ml.get_key(LLM_KV_ACTIVATION_SITU_BETA,        hparams.situ_beta, false);
-                ml.get_key(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, hparams.situ_linear_beta, false);
-
-                type = LLM_TYPE_UNKNOWN;
             } break;
         case LLM_ARCH_STEP35:
             {
@@ -8091,210 +8049,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         }
                     }
                 } break;
-            case LLM_ARCH_KIMI_K3:
-                {
-                    const int64_t n_embd_latent =
-                        hparams.n_expert_latent > 0 ? hparams.n_expert_latent : n_embd;
-
-                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
-
-                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
-                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
-
-                    if (hparams.attn_res_block_size > 0) {
-                        output_res_score =
-                            create_tensor(tn(LLM_TENSOR_OUTPUT_RES_SCORE, "weight"), {n_embd}, 0);
-                    }
-
-                    for (int i = 0; i < n_layer; ++i) {
-                        auto & layer = layers[i];
-
-                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
-                        layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, 0);
-
-                        if (hparams.attn_res_block_size > 0) {
-                            layer.attn_res_score =
-                                create_tensor(tn(LLM_TENSOR_ATTN_RES_SCORE, "weight", i), {n_embd}, 0);
-                            layer.ffn_res_score =
-                                create_tensor(tn(LLM_TENSOR_FFN_RES_SCORE, "weight", i), {n_embd}, 0);
-                        }
-
-                        const int64_t head_dim = hparams.n_embd_head_kda;
-                        const int64_t d_conv   = hparams.ssm_d_conv;
-                        const int64_t d_inner  = head_dim * n_head;
-
-                        if (hparams.is_recurrent(i)) {
-                            auto conv = [&](llm_tensor tid) {
-                                ggml_tensor * tensor = create_tensor(
-                                    tn(tid, "weight", i),
-                                    {d_conv, 1, d_inner, 1},
-                                    TENSOR_NOT_REQUIRED);
-                                return tensor
-                                    ? tensor
-                                    : create_tensor(tn(tid, "weight", i), {d_conv, 1, d_inner}, 0);
-                            };
-
-                            layer.ssm_q_conv = conv(LLM_TENSOR_SSM_CONV1D_Q);
-                            layer.ssm_k_conv = conv(LLM_TENSOR_SSM_CONV1D_K);
-                            layer.ssm_v_conv = conv(LLM_TENSOR_SSM_CONV1D_V);
-
-                            create_tensor_qkv(layer, i, n_embd, d_inner, d_inner, d_inner, 0);
-
-                            layer.ssm_f_a =
-                                create_tensor(tn(LLM_TENSOR_SSM_F_A, "weight", i), {n_embd, head_dim}, 0);
-                            layer.ssm_f_b =
-                                create_tensor(tn(LLM_TENSOR_SSM_F_B, "weight", i), {head_dim, d_inner}, 0);
-                            layer.ssm_beta =
-                                create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head}, 0);
-
-                            layer.ssm_a =
-                                create_tensor(tn(LLM_TENSOR_SSM_A, i), {n_head}, TENSOR_NOT_REQUIRED);
-                            if (!layer.ssm_a) {
-                                layer.ssm_a = create_tensor(
-                                    tn(LLM_TENSOR_SSM_A, i),
-                                    {1, n_head, 1, 1},
-                                    TENSOR_NOT_REQUIRED);
-                            }
-                            if (!layer.ssm_a) {
-                                layer.ssm_a =
-                                    create_tensor(tn(LLM_TENSOR_SSM_A, i), {1, n_head}, 0);
-                            }
-
-                            layer.ssm_dt_b =
-                                create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {d_inner}, 0);
-                            layer.ssm_g =
-                                create_tensor(tn(LLM_TENSOR_SSM_G, "weight", i), {n_embd, d_inner}, 0);
-                            layer.ssm_o_norm =
-                                create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {head_dim}, 0);
-                            layer.wo =
-                                create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {d_inner, n_embd}, 0);
-                        } else {
-                            const int64_t q_lora_rank      = hparams.n_lora_q;
-                            const int64_t kv_lora_rank     = hparams.n_lora_kv;
-                            const int64_t n_embd_head_k_mla = hparams.n_embd_head_k_mla();
-                            const int64_t n_embd_head_v_mla = hparams.n_embd_head_v_mla();
-                            const int64_t qk_rope_head_dim = hparams.n_rot();
-                            const int64_t qk_nope_head_dim =
-                                n_embd_head_k_mla - qk_rope_head_dim;
-
-                            layer.attn_q_a_norm = create_tensor(
-                                tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i),
-                                {q_lora_rank},
-                                TENSOR_NOT_REQUIRED);
-                            layer.attn_kv_a_norm = create_tensor(
-                                tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i),
-                                {kv_lora_rank},
-                                0);
-
-                            if (layer.attn_q_a_norm) {
-                                layer.wq_a = create_tensor(
-                                    tn(LLM_TENSOR_ATTN_Q_A, "weight", i),
-                                    {n_embd, q_lora_rank},
-                                    0);
-                                layer.wq_b = create_tensor(
-                                    tn(LLM_TENSOR_ATTN_Q_B, "weight", i),
-                                    {q_lora_rank, n_head * n_embd_head_k_mla},
-                                    0);
-                            } else {
-                                layer.wq = create_tensor(
-                                    tn(LLM_TENSOR_ATTN_Q, "weight", i),
-                                    {n_embd, n_head * n_embd_head_k_mla},
-                                    0);
-                            }
-
-                            layer.wkv_a_mqa = create_tensor(
-                                tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i),
-                                {n_embd, kv_lora_rank + qk_rope_head_dim},
-                                0);
-                            layer.wkv_b = create_tensor(
-                                tn(LLM_TENSOR_ATTN_KV_B, "weight", i),
-                                {kv_lora_rank, n_head * (qk_nope_head_dim + n_embd_head_v_mla)},
-                                TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
-                            if (!layer.wkv_b) {
-                                layer.wk_b = create_tensor(
-                                    tn(LLM_TENSOR_ATTN_K_B, "weight", i),
-                                    {qk_nope_head_dim, kv_lora_rank, n_head},
-                                    0);
-                                layer.wv_b = create_tensor(
-                                    tn(LLM_TENSOR_ATTN_V_B, "weight", i),
-                                    {kv_lora_rank, n_embd_head_v_mla, n_head},
-                                    0);
-                            }
-
-                            layer.wqkv_gate = create_tensor(
-                                tn(LLM_TENSOR_ATTN_GATE, "weight", i),
-                                {n_embd, n_head * n_embd_head_v_mla},
-                                TENSOR_NOT_REQUIRED);
-                            layer.wo = create_tensor(
-                                tn(LLM_TENSOR_ATTN_OUT, "weight", i),
-                                {n_head * n_embd_head_v_mla, n_embd},
-                                0);
-                        }
-
-                        if (i < (int) hparams.n_layer_dense_lead) {
-                            layer.ffn_gate =
-                                create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
-                            layer.ffn_down =
-                                create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
-                            layer.ffn_up =
-                                create_tensor(tn(LLM_TENSOR_FFN_UP, "weight", i), {n_embd, n_ff}, 0);
-                        } else {
-                            const int64_t n_ff_exp = hparams.n_ff_exp;
-
-                            layer.ffn_gate_inp = create_tensor(
-                                tn(LLM_TENSOR_FFN_GATE_INP, "weight", i),
-                                {n_embd, n_expert},
-                                0);
-                            layer.ffn_exp_probs_b = create_tensor(
-                                tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i),
-                                {n_expert},
-                                0);
-
-                            layer.ffn_gate_exps = create_tensor(
-                                tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i),
-                                {n_embd_latent, n_ff_exp, n_expert},
-                                0);
-                            layer.ffn_down_exps = create_tensor(
-                                tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i),
-                                {n_ff_exp, n_embd_latent, n_expert},
-                                0);
-                            layer.ffn_up_exps = create_tensor(
-                                tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i),
-                                {n_embd_latent, n_ff_exp, n_expert},
-                                0);
-
-                            if (hparams.n_expert_latent > 0) {
-                                layer.ffn_routed_down = create_tensor(
-                                    tn(LLM_TENSOR_FFN_ROUTED_DOWN, "weight", i),
-                                    {n_embd, n_embd_latent},
-                                    0);
-                                layer.ffn_routed_up = create_tensor(
-                                    tn(LLM_TENSOR_FFN_ROUTED_UP, "weight", i),
-                                    {n_embd_latent, n_embd},
-                                    0);
-                                layer.ffn_routed_norm = create_tensor(
-                                    tn(LLM_TENSOR_FFN_ROUTED_NORM, "weight", i),
-                                    {n_embd_latent},
-                                    TENSOR_NOT_REQUIRED);
-                            }
-
-                            const int64_t n_ff_shexp =
-                                n_ff_exp * (hparams.n_expert_shared > 0 ? hparams.n_expert_shared : 1);
-                            layer.ffn_gate_shexp = create_tensor(
-                                tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i),
-                                {n_embd, n_ff_shexp},
-                                TENSOR_NOT_REQUIRED);
-                            layer.ffn_down_shexp = create_tensor(
-                                tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i),
-                                {n_ff_shexp, n_embd},
-                                TENSOR_NOT_REQUIRED);
-                            layer.ffn_up_shexp = create_tensor(
-                                tn(LLM_TENSOR_FFN_UP_SHEXP, "weight", i),
-                                {n_embd, n_ff_shexp},
-                                TENSOR_NOT_REQUIRED);
-                        }
-                    }
-                } break;
             case LLM_ARCH_COGVLM:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -10269,10 +10023,6 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_KIMI_LINEAR:
             {
                 llm = std::make_unique<llm_build_kimi_linear>(*this, params);
-            } break;
-        case LLM_ARCH_KIMI_K3:
-            {
-                llm = std::make_unique<llm_build_kimi_k3>(*this, params);
             } break;
         case LLM_ARCH_STEP35:
             {
