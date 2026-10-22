@@ -240,7 +240,7 @@ class TraceTests(unittest.TestCase):
 
 
 class MainProtocolTests(unittest.TestCase):
-    def run_driver(self, mode, *, teacher=False, cleanup_failure=False, stop_delay=0, async_sample=False, bad_reference=False):
+    def run_driver(self, mode, *, teacher=False, cleanup_failure=False, stop_delay=0, async_sample=False, bad_reference=False, checkpoints=None):
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
         binary = root / 'llama-server'; binary.write_bytes(b'fixture executable')
@@ -248,6 +248,8 @@ class MainProtocolTests(unittest.TestCase):
         out = root / 'result'
         args = ['measure.py', '--model', 'dsv', '--model-file', str(root / 'model.gguf'), '--prompt-file', str(prompt),
                 '--source', 'mmap', '--binary', str(binary), '--prompt-tokens', '1', '--tokens', '2', '--runs', '1', '--out', str(out)]
+        if checkpoints is not None:
+            args += ['--ctx-checkpoints', str(checkpoints)]
         if teacher:
             ref = root / 'reference'; ref.mkdir()
             (ref / 'results.json').write_text(json.dumps([{'tokens': [1, True] if bad_reference else [1, 2]}]))
@@ -320,6 +322,18 @@ class MainProtocolTests(unittest.TestCase):
         self.assertEqual(result['decode_evaluations'], 1)
         self.assertEqual(result['output_tokens'], 2)
         self.assertTrue(receipt['performance_eligible'])
+
+    def test_checkpoint_override_is_explicit_and_default_is_preserved(self):
+        for checkpoints in (None, 0, 3):
+            with self.subTest(checkpoints=checkpoints):
+                _, out = self.run_driver('valid', checkpoints=checkpoints)
+                config = json.loads((out / 'config.json').read_text())
+                self.assertEqual(config['driver']['ctx_checkpoints'], checkpoints)
+                if checkpoints is None:
+                    self.assertNotIn('--ctx-checkpoints', config['argv'])
+                else:
+                    i = config['argv'].index('--ctx-checkpoints')
+                    self.assertEqual(config['argv'][i + 1], str(checkpoints))
 
     def test_delayed_final_stop_does_not_extend_token_interval(self):
         _, out = self.run_driver('valid', stop_delay=0.03)
