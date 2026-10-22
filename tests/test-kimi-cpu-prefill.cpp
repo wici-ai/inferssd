@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include "linux-test-resources.h"
 
 static void require(bool ok, const std::string & what) { if (!ok) { throw std::runtime_error(what); } }
 static size_t aligned(size_t n) { return (n + 4095) & ~size_t(4095); }
@@ -124,7 +125,7 @@ static void make_synthetic(fixture & f) {
     pad_to(data_start);
     for (const auto & kv : f.entries) { pad_to(kv.second.offset); put_bytes(file, kv.second.data.data(), kv.second.raw_bytes); pad_to(kv.second.offset + kv.second.read_bytes); }
     file.close(); require(bool(file), "fixture close failed");
-    f.fd = open(f.path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC); require(f.fd >= 0, "O_DIRECT fixture open failed");
+    f.fd = test_resources::open_direct(f.path);
 }
 
 struct tensors {
@@ -195,6 +196,7 @@ struct executor {
     }
     executor(fixture & f, int threads, int depth) : active(&f), sink(nullptr, kimi_cpu_sink_destroy),
             prefill(nullptr, kimi_cpu_prefill_destroy) {
+        test_resources::cpu_threads(threads - 1, 1);
         char error[512] = {};
         sink.reset(kimi_cpu_sink_create(threads, depth, resolve, this, error, sizeof(error)));
         require(bool(sink), std::string("sink create: ") + error);
@@ -888,8 +890,7 @@ static batch load_real(fixture & f, int & layer, const options & o) {
         }
     }
     require(f.entries.size() == 3 * live.size(), "missing real expert roles");
-    f.path = o.pack; f.fd = open(o.pack.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
-    require(f.fd >= 0, "real O_DIRECT pack open failed");
+    f.path = o.pack; f.fd = test_resources::open_direct(f.path);
     return b;
 }
 
@@ -967,6 +968,9 @@ int main(int argc, char ** argv) {
         require(o.threads >= 2 && o.threads <= 128 && o.ring >= 1 && o.ring <= 32 &&
                 o.repeats >= 1 && o.repeats <= 1000 && o.warmup >= 0 && o.warmup <= 1000, "invalid thread/ring/repeat count");
         require(o.mode == "both" || o.mode == "grouped" || o.mode == "per-token", "invalid benchmark mode");
+        test_resources::cpu_threads(o.threads - 1, 1);
+        test_resources::io_uring();
+        if (cache_lifecycle || cache_retention || cache_prefill_read) { test_resources::finite_cgroup(); }
         if (cache_prefill_read) {
             cache_prefill_read_tests(o.threads, ring_set ? o.ring : 2);
         } else if (cache_retention) {
@@ -978,8 +982,11 @@ int main(int argc, char ** argv) {
             require(o.prefix.empty() && o.jsonl.empty(), "real fixture/JSONL requires --real-pack");
             synthetic_tests(o.threads, ring_set ? o.ring : 2);
         } else { require(!o.prefix.empty(), "real pack requires fixture prefix"); real_test(o); }
+        if (cache_lifecycle && address_sanitizer_build()) {
+            throw test_resources::unavailable("physical-release RSS oracle unavailable under ASan; other cache assertions executed");
+        }
         std::printf("CPU_PREFILL_TEST_OK\n"); return 0;
-    } catch (const std::exception & e) { std::fprintf(stderr, "CPU_PREFILL_TEST_FAILED: %s\n", e.what()); return 1; }
+    } catch (const std::exception & e) { return test_resources::report("CPU_PREFILL_TEST", e); }
 #else
     (void) argc; (void) argv;
     std::printf("SKIP: CPU grouped prefill requires Linux io_uring/O_DIRECT\n"); return 77;

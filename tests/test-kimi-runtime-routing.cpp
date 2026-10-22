@@ -7,6 +7,9 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-cpp.h"
+#if defined(__linux__)
+#include "linux-test-resources.h"
+#endif
 
 #include <cmath>
 #include <cstdio>
@@ -484,6 +487,11 @@ static void graph_identity_tests(const llama_k3_runtime_config & cfg) {
 
 int main() {
     try {
+#if defined(__linux__)
+        const auto sink_threads = llama_kimi_cpu_sink_runtime::unsigned_env("GGML_KIMI_CPU_SINK_THREADS", 16, 256);
+        test_resources::cpu_threads(int(sink_threads) - 1, 1);
+        test_resources::io_uring();
+#endif
         cache_launch_tests();
         prefill_route_tests();
         prefill_search_tests();
@@ -724,7 +732,11 @@ int main() {
             "full_model_kv_kda=not_run gpu=not_run\n");
         return 0;
     } catch (const std::exception & e) {
+#if defined(__linux__)
+        return test_resources::report("KIMI_RUNTIME_ROUTING", e);
+#else
         std::fprintf(stderr, "KIMI_RUNTIME_ROUTING_FAILED: %s\n", e.what());
         return 1;
+#endif
     }
 }
