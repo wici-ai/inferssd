@@ -26,9 +26,6 @@ ROOT=/data tools/adaptive/adaptive.sh validate              # the four-conversat
 # until a stress run passes a margin the ledger learned
 SETTINGS=tools/adaptive/models/examples/muse-spark-gb10.settings MODEL_CONF=tools/adaptive/models/muse-spark.conf \
   MODEL_DIR=/data/models ./run-ssd-llama.sh
-
-# Qwen3.8-Flash-Next on its port's engine (branch deepseek2/qwen38, built in its own build-cuda130)
-ROOT=/data MODEL_CONF=tools/adaptive/models/qwen38.conf QWEN_SRC=/src/qwen38 tools/adaptive/adaptive.sh serve
 ```
 
 `adaptive.sh serve|validate [OUT] [-- llama-server args]` writes everything to `OUT` (default
@@ -173,7 +170,6 @@ when the best beats staying by 5 % (at least 15 s).
 | `online.py`, `controller.py`, `serve.py`, `converse.py`, `compare_online.py` | the loop, its two front ends, the check |
 | `../../run-ssd-llama.sh` | the launcher of every model on this engine (`run-deepseek-v41-flash-mxfp4.sh` wraps it) |
 | `models/*.conf`, `models/examples/` | one data-only file per model; SETTINGS files of measured configurations |
-| `models/qwen38.conf`, `models/launch-qwen38.sh` | the Qwen port: its own engine and launcher, for any machine |
 | `tests/test_launcher_replica.sh`, `tests/test_launcher_settings.sh`, `tests/test_settings.py` | the wrapped DeepSeek launcher starts the server exactly as the old one (1f174b4, from git) did; the launcher's own rules; settings.py's |
 | `prompts/` | real texts: the bootstrap turn and the validation conversations (`source` says where each is from) |
 | `baselines/` | llama.cpp (PR #28696) and colibri on the Spark, a 255H + RTX 5090, a 16 GB M1 and a 100U + RTX 5060 Ti, with ssd-llama for reference: settings, the changes that made them run, results, scripts |
@@ -193,8 +189,9 @@ and arguments the server would get, and every engine variable is logged with its
 none of them gives comes from the launcher's legacy profile: the DeepSeek launcher's values for an RTX 5090 with
 16 GiB of RAM (131072 tokens of context, 8 checkpoints, the CPU sink's grouped prefill, ...), the same for every
 model and machine until each value moves to the source that derives or decides it.
-`qwen38.conf` is a script with its own launcher (`LAUNCH`, `KNOBS_VIA=extra_env`, `SWITCH_KEEPS_HISTORY=0`):
-`adaptive.sh` sources a conf only when it names a `LAUNCH`.
+An external-engine conf may name its own launcher (`LAUNCH`), knob interface (`KNOBS_VIA`), and history
+behavior (`SWITCH_KEEPS_HISTORY`). `adaptive.sh` sources a conf only when it names a `LAUNCH`; otherwise the
+conf is data-only.
 
 The engine reports what the framework reads in default-off log lines: `GGML_KIMI_CPU_SINK_TRACE=1` and
 `GGML_KIMI_CPU_SINK_PROFILE=1` (every decode token's routing and the sink's costs), `GGML_KIMI_CPU_SINK_MRC=1`
@@ -205,6 +202,9 @@ The engine reports what the framework reads in default-off log lines: `GGML_KIMI
 
 From nothing, the workload not given (the plan assumes four turns the size of the bootstrap text), each
 conversation four turns of real text with 512-token replies. RTX 5090 on both machines.
+The Qwen3.8 rows are historical results from a retired external port; its profile and launcher are no longer
+shipped. That port had no per-phase pools or disk prompt cache and used a fixed ubatch, so its configurations
+were the tier and `all`/`pin`.
 
 | machine | model | plan | the other placement | plan predicted / measured | loop from the other placement |
 |---|---|---|---|---|---|
@@ -215,7 +215,7 @@ conversation four turns of real text with 512-token replies. RTX 5090 on both ma
 | Core Ultra 7 255H | Qwen3.8-Flash-Next | `pin` | `all`, 13.7 % slower | 354 / 346 s | stayed, as above |
 
 Time from nothing to the decision: 3–12 minutes (two placements; the slower drive and machine take longer). The
-last row is this directory's code on a machine and model pair it had not seen (the plan predicted the other
+last row records the earlier framework on a machine and model pair it had not seen (the plan predicted the other
 placement 13.8 % slower), followed by `serve` with the same conversation through the front end.  On the 230F
 machine `serve` with the 32k conversation switched to `all@16384` when the 32k request arrived (7.7 s; the history
 came back from the disk prompt cache) and stayed there. The rows above
@@ -240,8 +240,6 @@ DeepSeek-V4.1-Flash-1017, it ties the manual best's TTFT and decodes 3-11 % fast
   (DeepSeek, 30 GB: 232-294 s against 167-171 s on a fresh server, with 1.5 million major page faults against 2.6
   thousand).  The prefill model's rates are the bootstrap's (one prompt of 3-4K tokens), so such prompts are
   predicted too fast.
-- The Qwen port's engine has no per-phase pools, no disk prompt cache and a fixed ubatch, so its configurations
-  are the tier and `all`/`pin`.
 - The graph's time beyond its reads is fitted on two prefills of the bootstrap text (the cut and the whole), and
   U(n) below the cut is the decode trace's shape scaled to it, so prompts far from those sizes (16K tokens and
   more) are extrapolated. The slots the graph's workspace takes from the tier, which decode refills afterwards
