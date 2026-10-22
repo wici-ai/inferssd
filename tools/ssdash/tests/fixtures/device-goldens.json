@@ -190,6 +190,124 @@
         "stdout": "{\n \"schema\": 2,\n \"expert_read_bytes\": 123456,\n \"bytes_per_role\": {\n  \"up\": 4096,\n  \"gate\": 8192,\n  \"down\": 16384\n },\n \"cpus\": {\n  \"0\": {\n   \"capacity\": NaN,\n   \"max_khz\": 1.0\n  }\n },\n \"mem_gib\": {\n  \"total\": 8.0,\n  \"available\": 4.0\n },\n \"gpu\": {\n  \"integrated\": false,\n  \"read_gbs\": 427.25,\n  \"h2d_pinned_gbs\": 6.91,\n  \"h2d_pageable_gbs\": 3.25\n },\n \"ssd\": {},\n \"expert_files\": {},\n \"slow_files\": [],\n \"coresets\": {\n  \"all\": {\n   \"cpus\": [\n    0,\n    2\n   ]\n  },\n  \"split\": {\n   \"cpus\": [\n    2\n   ]\n  }\n },\n \"lanes\": null\n}",
         "error": null
       }
+    },
+    {
+      "name": "malformed_missing_bw",
+      "probe_files": {
+        "cpus.txt": "",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "timing unavailable\n",
+        "coresets.txt": "",
+        "reads-qd1.json": "{\"jobs\":[{\"read\":{\"lat_ns\":{\"mean\":1}}}]}"
+      },
+      "experts": {
+        "expert_read_bytes": 0,
+        "bytes_per_role": {}
+      },
+      "legacy": {
+        "returncode": 1,
+        "stdout": "",
+        "error": "KeyError"
+      },
+      "new_error": "KeyError"
+    },
+    {
+      "name": "malformed_jobs_null",
+      "probe_files": {
+        "cpus.txt": "",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "timing unavailable\n",
+        "coresets.txt": "",
+        "reads-qd1.json": "{\"jobs\":null}"
+      },
+      "experts": {
+        "expert_read_bytes": 0,
+        "bytes_per_role": {}
+      },
+      "legacy": {
+        "returncode": 1,
+        "stdout": "",
+        "error": "TypeError"
+      },
+      "new_error": "TypeError"
+    },
+    {
+      "name": "malformed_read_nonempty_list",
+      "probe_files": {
+        "cpus.txt": "",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "timing unavailable\n",
+        "coresets.txt": "",
+        "reads-qd1.json": "{\"jobs\":[{\"read\":[1]}]}"
+      },
+      "experts": {
+        "expert_read_bytes": 0,
+        "bytes_per_role": {}
+      },
+      "legacy": {
+        "returncode": 1,
+        "stdout": "",
+        "error": "TypeError"
+      },
+      "new_error": "TypeError"
+    },
+    {
+      "name": "malformed_read_empty_list",
+      "probe_files": {
+        "cpus.txt": "",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "timing unavailable\n",
+        "coresets.txt": "",
+        "reads-qd1.json": "{\"jobs\":[{\"read\":[]}]}"
+      },
+      "experts": {
+        "expert_read_bytes": 0,
+        "bytes_per_role": {}
+      },
+      "legacy": {
+        "returncode": 0,
+        "stdout": "{\n \"schema\": 2,\n \"expert_read_bytes\": 0,\n \"bytes_per_role\": {},\n \"cpus\": {},\n \"mem_gib\": {\n  \"total\": 8.0,\n  \"available\": 4.0\n },\n \"gpu\": {\n  \"integrated\": null,\n  \"read_gbs\": null,\n  \"h2d_pinned_gbs\": null,\n  \"h2d_pageable_gbs\": null\n },\n \"ssd\": {},\n \"expert_files\": {},\n \"slow_files\": [],\n \"coresets\": {},\n \"lanes\": null\n}",
+        "error": null
+      }
+    },
+    {
+      "name": "malformed_jobs_wrong_object",
+      "probe_files": {
+        "cpus.txt": "",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "timing unavailable\n",
+        "coresets.txt": "",
+        "reads-qd1.json": "{\"jobs\":{\"0\":{\"read\":{\"bw_bytes\":1}}}}"
+      },
+      "experts": {
+        "expert_read_bytes": 0,
+        "bytes_per_role": {}
+      },
+      "legacy": {
+        "returncode": 0,
+        "stdout": "{\n \"schema\": 2,\n \"expert_read_bytes\": 0,\n \"bytes_per_role\": {},\n \"cpus\": {},\n \"mem_gib\": {\n  \"total\": 8.0,\n  \"available\": 4.0\n },\n \"gpu\": {\n  \"integrated\": null,\n  \"read_gbs\": null,\n  \"h2d_pinned_gbs\": null,\n  \"h2d_pageable_gbs\": null\n },\n \"ssd\": {},\n \"expert_files\": {},\n \"slow_files\": [],\n \"coresets\": {},\n \"lanes\": null\n}",
+        "error": null
+      }
+    },
+    {
+      "name": "queue_depth_in_parent_path",
+      "probe_files": {
+        "cpus.txt": "",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "timing unavailable\n",
+        "coresets.txt": "",
+        "reads-qd1.json": "{\"jobs\":[{\"read\":{\"bw_bytes\":1073741824,\"lat_ns\":{\"mean\":1000000}}}]}"
+      },
+      "experts": {
+        "expert_read_bytes": 0,
+        "bytes_per_role": {}
+      },
+      "legacy": {
+        "returncode": 0,
+        "stdout": "{\n \"schema\": 2,\n \"expert_read_bytes\": 0,\n \"bytes_per_role\": {},\n \"cpus\": {},\n \"mem_gib\": {\n  \"total\": 8.0,\n  \"available\": 4.0\n },\n \"gpu\": {\n  \"integrated\": null,\n  \"read_gbs\": null,\n  \"h2d_pinned_gbs\": null,\n  \"h2d_pageable_gbs\": null\n },\n \"ssd\": {\n  \"8\": {\n   \"gibs\": 1.0,\n   \"lat_ms\": 1.0,\n   \"gibs_runs\": [\n    1.0\n   ]\n  }\n },\n \"ssd_knee_qd\": 8,\n \"expert_files\": {},\n \"slow_files\": [],\n \"coresets\": {},\n \"lanes\": null\n}",
+        "error": null
+      },
+      "probe_dir_name": "qd8"
     }
   ]
 }
