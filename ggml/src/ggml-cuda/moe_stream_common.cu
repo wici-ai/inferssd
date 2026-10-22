@@ -12125,7 +12125,7 @@ static bool moe_stream_one_type_allowed(ggml_type type, const char * name) {
     if (!moe_stream_one_experimental_ds4_enabled()) {
         return false;
     }
-    if (type != GGML_TYPE_MXFP4 && type != GGML_TYPE_F8_E4M3_B128) {
+    if (type != GGML_TYPE_MXFP4) {
         return false;
     }
     return moe_stream_one_name_filter_allows(name);
@@ -12465,7 +12465,7 @@ extern "C" bool ggml_cuda_moe_stream_one(
             release_slot(s); return false;
         }
     } else if ((t0 == GGML_TYPE_Q8_0 && q8_batch_rows && cne1 > 1) ||
-            ((t0 == GGML_TYPE_MXFP4 || t0 == GGML_TYPE_F8_E4M3_B128) &&
+            (t0 == GGML_TYPE_MXFP4 &&
             moe_stream_one_experimental_ds4_enabled() &&
             !moe_stream_one_ds4_nonids_enabled())) {
             //会走这部分,此处有**cudaMemsetAsync**的调用
