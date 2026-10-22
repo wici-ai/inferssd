@@ -76,7 +76,7 @@ public:
     // False means an absent key or a logical range beyond the opened file.
     // There is no transport padding here. No tensor type is inferred: pack v1
     // does not store it; the caller's tensor context supplies that information.
-    bool locate(const char * name, int expert, size_t bytes, extent & result) const {
+    bool locate(const char * name, int expert, size_t bytes, extent & result, bool include_identity = true) const {
         if (!state_->enabled || !name || !name[0] || expert < 0 || !bytes) { return false; }
         size_t lo = 0;
         size_t hi = state_->entries.size();
@@ -94,7 +94,7 @@ public:
             item.source_idx < 0 || size_t(item.source_idx) >= state_->sources.size()) { return false; }
         const auto & source = state_->sources[size_t(item.source_idx)];
         if (item.offset > source.file_size || bytes > source.file_size - item.offset) { return false; }
-        result = {item.source_idx, item.offset, item.nbytes, item.alias_source, identity(source)};
+        result = {item.source_idx, item.offset, item.nbytes, item.alias_source, include_identity ? identity(source) : source_identity{}};
         return true;
     }
     // Borrowed descriptor, valid until this index is destroyed; never close it.

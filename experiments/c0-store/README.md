@@ -11,10 +11,13 @@ without `LD_PRELOAD`. This is not production C0 or a frozen F-prime.
 The portable index now lives at `ggml/src/ggml-ssd/store/legacy-index.h`; the
 649-check oracle includes that same implementation. A separate configuration
 fixture checks legacy single-path versus colon-list, overlay order, IO-backend
-and first-character boolean semantics. The linked adapter owns a process-fixed
+and first-character boolean semantics. The linked adapter preserves the per-lookup runtime-disable switch, rejects active
+lossless transport, and owns a process-fixed
 immutable index and borrows its O_DIRECT descriptors to the unchanged sink.
 The existing two-stage alignment, io_uring, ledger/cache and arithmetic stay in
-place. Unsupported colibri source configuration is explicitly refused.
+place. Unsupported colibri source configuration is explicitly refused. The raw resolver
+skips the test-only identity snapshot, retaining the old fcntl check without
+adding a per-expert fstat syscall.
 
 Example build (prototype only):
 

@@ -6,6 +6,17 @@ namespace config_detail {
 #include "config-helpers.inc"
 }
 
+// Match mode/sidecar precedence only to refuse active unsupported transport.
+// Explicit 0/off/disabled remains inert even when a sidecar path is present.
+inline bool lossless_requested() {
+    const char * path = std::getenv("GGML_MOE_LOSSLESS_PACK");
+    if (!path || !path[0]) { path = std::getenv("GGML_MOE_GLM52_LOSSLESS_PACK"); }
+    const char * mode = std::getenv("GGML_MOE_LOSSLESS_MODE");
+    if (!mode || !mode[0]) { mode = std::getenv("GGML_MOE_GLM52_LOSSLESS_MODE"); }
+    if (!mode || !mode[0]) { return path && path[0]; }
+    return std::strcmp(mode, "0") != 0 && std::strcmp(mode, "off") != 0 && std::strcmp(mode, "disabled") != 0;
+}
+
 // Keep the legacy initializer's order and distinction between a single path
 // and a colon-separated *_LIST. In particular, overlays require a base PACK.
 inline description description_from_env() {

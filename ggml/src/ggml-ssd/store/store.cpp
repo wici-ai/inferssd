@@ -8,10 +8,10 @@
 namespace {
 // Match the existing process-wide first-shape choice without importing CUDA
 // transport. CUDA builds cannot enable this prototype: they still own the
-// original dispatch and index until the shared-owner cut is independently gated.
+// original dispatch and process_index until the shared-owner cut is independently gated.
 std::atomic<int> selected_shape{0};
 std::once_flag initialized;
-std::unique_ptr<c0::expert_index> index;
+std::unique_ptr<c0::expert_index> process_index;
 
 bool common_shape(int64_t experts, size_t bytes) {
     const int requested = experts == 896 && (bytes == 3612672 || bytes == 2150400) ? 2 : 1;
@@ -31,9 +31,13 @@ void initialize() {
             return;
         }
     }
-    index = c0::expert_index::open(c0::description_from_env());
+    if (c0::lossless_requested()) {
+        std::fprintf(stderr, "[c0_store_prototype] unsupported source family: active lossless transport\n");
+        return;
+    }
+    process_index = c0::expert_index::open(c0::description_from_env());
     std::fprintf(stderr, "[c0_store_prototype] directly_linked=1 initialized=%d sources=%zu\n",
-            index ? 1 : 0, index ? index->source_count() : 0);
+            process_index ? 1 : 0, process_index ? process_index->source_count() : 0);
 }
 } // namespace
 
@@ -53,10 +57,14 @@ extern "C" bool ggml_ssd_c0_resolve_raw_direct_shape(
             }
             catch (...) { std::fprintf(stderr, "[c0_store_prototype] initialization failed\n"); }
         });
+        // The legacy lookup initializes first, then observes this runtime
+        // disable switch on every call, rather than caching it as a setting.
+        const char * disabled = std::getenv("GGML_MOE_EXPERT_PACK_RUNTIME_DISABLE");
+        if (disabled && disabled[0] && disabled[0] != '0') { return false; }
 #if defined(__linux__)
         c0::extent range;
-        if (!index || !index->locate(name, expert, bytes, range)) { return false; }
-        const int source = index->borrowed_direct_fd(range.source_id);
+        if (!process_index || !process_index->locate(name, expert, bytes, range, false)) { return false; }
+        const int source = process_index->borrowed_direct_fd(range.source_id);
         const int flags = source < 0 ? -1 : ::fcntl(source, F_GETFL);
         if (flags < 0 || !(flags & O_DIRECT)) { return false; }
         *fd = source;
