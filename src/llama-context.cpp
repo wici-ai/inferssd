@@ -979,13 +979,6 @@ llama_context::llama_context(
     embd_layer_inp.resize(hparams.n_layer + 1);
     cparams.ctx_other = nullptr;
 
-    if (model.arch == LLM_ARCH_DFLASH) {
-        if (params.ctx_other == nullptr) {
-            throw std::runtime_error("DFlash/DSpark requires ctx_other to pair the draft with its target context");
-        }
-        cparams.ctx_other = params.ctx_other;
-    }
-
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;

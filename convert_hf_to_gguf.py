@@ -97,7 +97,6 @@ class ModelBase:
     metadata_override: Path | None
     dir_model_card: Path
     remote_hf_model_id: str | None
-    target_model_dir: Path | None
 
     # subclasses should define this!
     model_arch: gguf.MODEL_ARCH
@@ -118,7 +117,6 @@ class ModelBase:
                  small_first_shard: bool = False, hparams: dict[str, Any] | None = None, remote_hf_model_id: str | None = None,
                  disable_mistral_community_chat_template: bool = False,
                  sentence_transformers_dense_modules: bool = False,
-                 target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
                  glm52_external_experts: bool = False):
         if type(self) is ModelBase or \
@@ -139,7 +137,6 @@ class ModelBase:
         self.dry_run = dry_run
         self.remote_hf_model_id = remote_hf_model_id
         self.sentence_transformers_dense_modules = sentence_transformers_dense_modules
-        self.target_model_dir = target_model_dir
         self.fuse_gate_up_exps = fuse_gate_up_exps
         self.glm52_external_experts = glm52_external_experts
         self._gate_exp_buffer: dict[int, Tensor] = {}
@@ -4752,141 +4749,6 @@ class Qwen3Model(Qwen2Model):
                     yield from super().modify_tensors(data_torch, name, bid)
                 return
 
-        yield from super().modify_tensors(data_torch, name, bid)
-
-
-@ModelBase.register("DFlashDraftModel")
-class DFlashModel(Qwen3Model):
-    model_arch = gguf.MODEL_ARCH.DFLASH
-
-    def set_vocab(self):
-        if self.target_model_dir is None:
-            raise ValueError(
-                "DFlash draft model requires --target-model-dir to be specified. "
-                "Provide the target model directory containing its tokenizer files."
-            )
-
-        logger.info(f"DFlash: using tokenizer from target model: {self.target_model_dir}")
-        original_dir = self.dir_model
-        try:
-            self.dir_model = self.target_model_dir
-            if (self.dir_model / "tiktoken.model").is_file():
-                self._set_vocab_kimi_target()
-            else:
-                Qwen2Model.set_vocab(self)
-        finally:
-            self.dir_model = original_dir
-
-    def _set_vocab_kimi_target(self):
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model, trust_remote_code=True)
-        mergeable_ranks = tokenizer.model._mergeable_ranks  # ty: ignore[unresolved-attribute]
-        special_tokens = tokenizer.special_tokens  # ty: ignore[unresolved-attribute]
-
-        merges = []
-        vocab = {}
-        for token, rank in mergeable_ranks.items():
-            vocab[QwenModel.token_bytes_to_string(token)] = rank
-            if len(token) == 1:
-                continue
-            merged = QwenModel.bpe(mergeable_ranks, token, max_rank=rank)
-            if len(merged) == 2:
-                merges.append(" ".join(map(QwenModel.token_bytes_to_string, merged)))
-
-        reverse_vocab = {
-            token_id: encoded_token
-            for encoded_token, token_id in {**vocab, **special_tokens}.items()
-        }
-        special_token_ids = set(special_tokens.values())
-        vocab_size = self.hparams["vocab_size"]
-        tokens = []
-        token_types = []
-        for token_id in range(vocab_size):
-            if token_id not in reverse_vocab:
-                tokens.append(f"[PAD{token_id}]")
-                token_types.append(gguf.TokenType.UNUSED)
-            else:
-                tokens.append(reverse_vocab[token_id])
-                token_types.append(
-                    gguf.TokenType.CONTROL
-                    if token_id in special_token_ids
-                    else gguf.TokenType.NORMAL
-                )
-
-        self.gguf_writer.add_tokenizer_model("gpt2")
-        # K3 uses the same byte-level pre-tokenization contract as Kimi K2.
-        self.gguf_writer.add_tokenizer_pre("kimi-k2")
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(token_types)
-        self.gguf_writer.add_token_merges(merges)
-
-        self.gguf_writer.add_bos_token_id(tokenizer.bos_token_id)
-        self.gguf_writer.add_eos_token_id(tokenizer.eos_token_id)
-        self.gguf_writer.add_pad_token_id(tokenizer.pad_token_id)
-        self.gguf_writer.add_unk_token_id(tokenizer.unk_token_id)
-        self.gguf_writer.add_eom_token_id(special_tokens["<|end_of_msg|>"])
-        self.gguf_writer.add_eot_token_id(special_tokens["[EOT]"])
-        self.gguf_writer.add_add_bos_token(False)
-        self.gguf_writer.add_add_eos_token(False)
-
-    def set_gguf_parameters(self):
-        super().set_gguf_parameters()
-
-        block_size = self.hparams.get("block_size", 16)
-        self.gguf_writer.add_uint32(f"{self.gguf_writer.arch}.block_size", block_size)
-
-        dflash_config = self.hparams.get("dflash_config", {})
-        target_layer_ids = dflash_config.get("target_layer_ids", [])
-        if target_layer_ids:
-            # Transformers returns hidden_states[0] before layer 0, so an HF
-            # target layer id maps to the following llama.cpp hidden-state slot.
-            self.gguf_writer.add_array(
-                f"{self.gguf_writer.arch}.target_layers",
-                [layer_id + 1 for layer_id in target_layer_ids],
-            )
-
-        mask_token_id = dflash_config.get("mask_token_id")
-        if mask_token_id is not None:
-            self.gguf_writer.add_uint32(gguf.Keys.Tokenizer.MASK_ID, mask_token_id)
-
-        use_sliding_window = self.hparams.get("use_sliding_window", False)
-        sliding_window = self.hparams.get("sliding_window")
-        layer_types = self.hparams.get("layer_types")
-        if use_sliding_window and sliding_window and layer_types:
-            is_swa = [layer_type == "sliding_attention" for layer_type in layer_types]
-            self.gguf_writer.add_sliding_window(sliding_window)
-            self.gguf_writer.add_sliding_window_pattern(is_swa)
-
-    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        if name == "fc.weight":
-            yield (name, data_torch)
-            return
-        if name == "hidden_norm.weight":
-            yield (self.format_tensor_name(gguf.MODEL_TENSOR.ENC_OUTPUT_NORM), data_torch)
-            return
-        if not name.startswith("model."):
-            name = "model." + name
-        yield from super().modify_tensors(data_torch, name, bid)
-
-
-@ModelBase.register("Qwen3DSparkModel", "DSparkDraftModel")
-class DSparkModel(DFlashModel):
-    model_arch = gguf.MODEL_ARCH.DFLASH
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # DeepSpec also publishes a flat schema; normalize it for DFlash.
-        self.hparams.setdefault("dflash_config", {
-            key: self.hparams[key]
-            for key in ("target_layer_ids", "mask_token_id")
-            if key in self.hparams
-        })
-
-    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # DSpark shares these large tensors with its paired target.
-        if name.endswith(("embed_tokens.weight", "lm_head.weight")):
-            return
         yield from super().modify_tensors(data_torch, name, bid)
 
 
@@ -13580,13 +13442,6 @@ def parse_args() -> argparse.Namespace:
         "--glm52-external-experts", action="store_true",
         help="For GLM_MOE_DSA exports, omit routed expert tensors that will be served from a GLM5.2 colibri expert pack at runtime.",
     )
-    parser.add_argument(
-        "--target-model-dir", type=Path,
-        help=(
-            "path to the paired target model directory; required for standalone "
-            "DFlash/DSpark drafts that reuse the target tokenizer"
-        ),
-    )
 
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
@@ -13739,7 +13594,6 @@ def main() -> None:
                                      small_first_shard=args.no_tensor_first_split,
                                      remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
                                      sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
-                                     target_model_dir=args.target_model_dir,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      glm52_external_experts=args.glm52_external_experts
                                      )

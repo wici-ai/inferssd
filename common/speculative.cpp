@@ -23,8 +23,6 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NONE,
     COMMON_SPECULATIVE_TYPE_DRAFT,
     COMMON_SPECULATIVE_TYPE_EAGLE3,
-    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
-    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
@@ -36,8 +34,6 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT},
     {"eagle3",        COMMON_SPECULATIVE_TYPE_EAGLE3},
-    {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
-    {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
     {"ngram_simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
     {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
@@ -586,286 +582,6 @@ struct common_speculative_state_draft : public common_speculative_state {
     }
 };
 
-// DFlash/DSpark use live target hidden states to seed a small Qwen3-style
-// decoder. The local speculative API owns one draft context per server slot,
-// hence process() filters the shared target batch by the slot's sequence id
-// and always writes draft KV to sequence 0.
-struct common_speculative_state_dflash : public common_speculative_state {
-    llama_context * ctx_tgt;
-    llama_context * ctx_dft;
-
-    common_sampler * smpl = nullptr;
-
-    llama_batch batch;
-    llama_batch batch_inject;
-
-    int32_t n_embd_dec = 0;
-    int32_t n_embd_enc = 0;
-    int32_t n_embd_tgt = 0;
-
-    int32_t block_size = 0;
-    int32_t n_draft_max = 0;
-    llama_token mask_token_id = LLAMA_TOKEN_NULL;
-
-    const bool is_dspark;
-
-    const int32_t * target_layer_ids = nullptr;
-    uint32_t target_layer_ids_n = 0;
-
-    std::vector<float> features_buf;
-    std::vector<int32_t> batch_rows;
-
-    common_speculative_state_dflash(
-            enum common_speculative_type type,
-            llama_context * ctx_tgt,
-            llama_context * ctx_dft)
-        : common_speculative_state(type)
-        , ctx_tgt(ctx_tgt)
-        , ctx_dft(ctx_dft)
-        , is_dspark(type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
-        GGML_ASSERT(ctx_tgt && ctx_dft);
-
-        const llama_model * model_dft = llama_get_model(ctx_dft);
-        const llama_model * model_tgt = llama_get_model(ctx_tgt);
-
-        if (!common_speculative_are_compatible(model_tgt, model_dft)) {
-            throw std::runtime_error("DFlash/DSpark requires a vocabulary identical to its paired target");
-        }
-
-        target_layer_ids = llama_model_target_layer_ids(model_dft);
-        target_layer_ids_n = llama_model_target_layer_ids_n(model_dft);
-        if (target_layer_ids_n == 0) {
-            throw std::runtime_error("DFlash/DSpark model has no target layer metadata");
-        }
-
-        n_embd_tgt = llama_model_n_embd(model_tgt);
-        n_embd_dec = llama_model_n_embd(model_dft);
-        n_embd_enc = (int32_t) target_layer_ids_n * n_embd_tgt;
-
-        block_size = 16;
-        char buf[32] = {};
-        if (llama_model_meta_val_str(model_dft, "dflash.block_size", buf, sizeof(buf)) >= 0) {
-            block_size = std::atoi(buf);
-        }
-        if (block_size <= 0) {
-            throw std::runtime_error("DFlash/DSpark block size must be positive");
-        }
-
-        mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
-        n_draft_max = is_dspark ? block_size : block_size - 1;
-
-        batch = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
-        batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, 1);
-
-        common_params_sampling sparams;
-        sparams.no_perf = false;
-        sparams.top_k = 10;
-        sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
-        smpl = common_sampler_init(model_dft, sparams);
-
-        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-            llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
-        }
-
-        llama_set_embeddings_nextn(ctx_dft, true, true);
-        llama_set_causal_attn(ctx_dft, false);
-
-        LOG_INF("%s: type=%s, block_size=%d, n_extract=%u, n_draft_max=%d\n",
-                __func__, common_speculative_type_to_str(type).c_str(), block_size,
-                target_layer_ids_n, n_draft_max);
-    }
-
-    ~common_speculative_state_dflash() override {
-        llama_perf_context_print(ctx_dft);
-        llama_free(ctx_dft);
-        common_sampler_free(smpl);
-        llama_batch_free(batch);
-        llama_batch_free(batch_inject);
-    }
-
-    void begin(const llama_tokens & prompt) override {
-        if (prompt.empty()) {
-            return;
-        }
-
-        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), 0);
-        if (pos_max < (llama_pos) prompt.size() - 1) {
-            LOG_WRN("%s: draft pos_max=%d < prompt end=%d; target feature injection missed a batch\n",
-                    __func__, (int) pos_max, (int) prompt.size() - 1);
-        }
-    }
-
-    bool process(const llama_batch & batch_in, llama_seq_id target_seq_id) override {
-        if (batch_in.n_tokens <= 0) {
-            return true;
-        }
-
-        const bool has_tokens = batch_in.token != nullptr;
-        const bool has_embeddings = batch_in.embd != nullptr;
-        if (has_tokens == has_embeddings) {
-            return true;
-        }
-
-        batch_rows.clear();
-        for (int32_t i = 0; i < batch_in.n_tokens; ++i) {
-            for (int32_t j = 0; j < batch_in.n_seq_id[i]; ++j) {
-                if (batch_in.seq_id[i][j] == target_seq_id) {
-                    batch_rows.push_back(i);
-                    break;
-                }
-            }
-        }
-        if (batch_rows.empty()) {
-            return true;
-        }
-
-        // The previous draft call left its anchor/noise block in the draft KV
-        // cache at these positions. Target verification now supplies the real
-        // hidden states for the same range, so discard the speculative tail
-        // before injecting the fused target features. On partial acceptance the
-        // server replays the accepted prefix; this same truncation also removes
-        // features from rejected verification rows before the replay is seeded.
-        if (batch_in.pos == nullptr) {
-            LOG_ERR("%s: target-conditioned batch has no positions\n", __func__);
-            return false;
-        }
-        const llama_pos pos_first = batch_in.pos[batch_rows.front()];
-        if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, pos_first, -1)) {
-            LOG_ERR("%s: failed to discard stale draft KV from position %d\n", __func__, (int) pos_first);
-            return false;
-        }
-
-        const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
-        for (int32_t offset = 0; offset < (int32_t) batch_rows.size(); offset += n_ubatch) {
-            const int32_t n_chunk = std::min(n_ubatch, (int32_t) batch_rows.size() - offset);
-            features_buf.resize((size_t) n_chunk * n_embd_enc);
-
-            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                if (!layer) {
-                    LOG_ERR("%s: target layer %d was not extracted\n", __func__, target_layer_ids[k]);
-                    return false;
-                }
-                for (int32_t i = 0; i < n_chunk; ++i) {
-                    const int32_t row = batch_rows[offset + i];
-                    float * dst = features_buf.data() + (size_t) i * n_embd_enc + (size_t) k * n_embd_tgt;
-                    const float * src = layer + (size_t) row * n_embd_tgt;
-                    std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
-                }
-            }
-
-            llama_batch enc_batch = {
-                n_chunk,
-                nullptr,
-                features_buf.data(),
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr,
-            };
-            int32_t rc = llama_encode(ctx_dft, enc_batch);
-            if (rc != 0) {
-                LOG_ERR("%s: draft encoder failed rc=%d\n", __func__, rc);
-                return false;
-            }
-
-            const float * fused = llama_get_embeddings_nextn(ctx_dft);
-            if (!fused) {
-                LOG_ERR("%s: draft encoder returned no fused features\n", __func__);
-                return false;
-            }
-
-            batch_inject.n_tokens = n_chunk;
-            std::memcpy(batch_inject.embd, fused, (size_t) n_chunk * n_embd_dec * sizeof(float));
-            for (int32_t i = 0; i < n_chunk; ++i) {
-                const int32_t row = batch_rows[offset + i];
-                batch_inject.pos[i] = batch_in.pos[row];
-                batch_inject.n_seq_id[i] = 1;
-                batch_inject.seq_id[i][0] = 0;
-                batch_inject.logits[i] = false;
-            }
-
-            rc = llama_decode(ctx_dft, batch_inject);
-            if (rc != 0) {
-                LOG_ERR("%s: draft KV injection failed rc=%d\n", __func__, rc);
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    void draft(
-            const common_params_speculative & params,
-            const llama_tokens & prompt_tgt,
-            llama_token id_last,
-            llama_tokens & result) override {
-        result.clear();
-
-        const int32_t n_draft = std::min(n_draft_max, params.draft.n_max);
-        if (n_draft <= 0) {
-            return;
-        }
-
-        common_batch_clear(batch);
-        common_sampler_reset(smpl);
-
-        const llama_pos n_past = (llama_pos) prompt_tgt.size();
-        const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
-        for (int32_t i = 0; i < n_block_tokens; ++i) {
-            common_batch_add(batch, i == 0 ? id_last : mask_token_id, n_past + i, { 0 }, true);
-        }
-
-        const int32_t rc = llama_decode(ctx_dft, batch);
-        if (rc != 0) {
-            LOG_WRN("%s: draft decode failed rc=%d\n", __func__, rc);
-            return;
-        }
-
-        const float p_min = params.draft.p_min;
-        if (is_dspark) {
-            const float * confidence = p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
-            for (int32_t i = 0; i < n_block_tokens; ++i) {
-                if (confidence && confidence[(size_t) i * n_embd_dec] < p_min) {
-                    break;
-                }
-                common_sampler_sample(smpl, ctx_dft, i, true);
-                const auto * candidates = common_sampler_get_candidates(smpl, true);
-                const llama_token id = candidates->data[0].id;
-                common_sampler_accept(smpl, id, true);
-                result.push_back(id);
-            }
-        } else {
-            for (int32_t i = 1; i < n_block_tokens; ++i) {
-                common_sampler_sample(smpl, ctx_dft, i, true);
-                const auto * candidates = common_sampler_get_candidates(smpl, true);
-                if (candidates->data[0].p < p_min) {
-                    break;
-                }
-                const llama_token id = candidates->data[0].id;
-                common_sampler_accept(smpl, id, true);
-                result.push_back(id);
-            }
-        }
-
-        if (result.size() < (size_t) params.draft.n_min) {
-            result.clear();
-        }
-    }
-
-    void accept(uint16_t n_accepted) override {
-        GGML_UNUSED(n_accepted);
-    }
-
-    int32_t n_max(const common_params_speculative & params) const override {
-        return std::min(n_draft_max, params.draft.n_max);
-    }
-
-    int32_t n_min(const common_params_speculative & params) const override {
-        return std::min(n_draft_max, params.draft.n_min);
-    }
-};
-
 struct common_speculative_state_eagle3 : public common_speculative_state {
     common_speculative_state_eagle3(enum common_speculative_type type) : common_speculative_state(type) {}
 
@@ -1254,8 +970,6 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
         case COMMON_SPECULATIVE_TYPE_DRAFT:         return "draft";
         case COMMON_SPECULATIVE_TYPE_EAGLE3:        return "eagle3";
-        case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
-        case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram_simple";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return "ngram_map_k";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
@@ -1334,11 +1048,7 @@ common_speculative * common_speculative_init(
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
         }
         if (has_draft) {
-            const auto type = params.type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
-                              params.type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK
-                ? params.type
-                : COMMON_SPECULATIVE_TYPE_DRAFT;
-            configs.push_back(common_speculative_config(type, params));
+            configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
         }
         if (has_draft_eagle3) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_EAGLE3, params));
@@ -1361,12 +1071,6 @@ common_speculative * common_speculative_init(
                     /* .replacements = */ params.draft.replacements,
                     /* .use_ckpt     = */ use_ckpt
                 ));
-                break;
-            }
-            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
-            case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
-                impls.push_back(std::make_unique<common_speculative_state_dflash>(
-                    config.type, ctx_tgt, ctx_dft));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {

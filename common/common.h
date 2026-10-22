@@ -159,9 +159,8 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
     COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
-    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash draft model
-    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark draft model
-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
+    // 3 and 4 are reserved for retired draft modes.
+    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE = 5, // simple self-speculative decoding
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,

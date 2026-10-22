@@ -141,8 +141,8 @@ enum llm_arch {
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
     LLM_ARCH_KIMI_K3,
-    LLM_ARCH_DFLASH,
-    LLM_ARCH_UNKNOWN,
+    // 130 is reserved for the retired draft architecture.
+    LLM_ARCH_UNKNOWN = 131,
 };
 
 enum llm_kv {
