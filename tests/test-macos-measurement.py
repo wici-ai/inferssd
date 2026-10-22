@@ -259,6 +259,7 @@ class MainProtocolTests(unittest.TestCase):
         def response(url, timeout=None):
             route = url if isinstance(url, str) else url.full_url
             if route.endswith('/health'):
+                if mode == 'health_interrupt': os.kill(os.getpid(), signal.SIGTERM)
                 result = io.BytesIO(b'{}'); result.status = 200; return result
             payload = json.loads(url.data)
             if route.endswith('/tokenize'): return io.BytesIO(b'{"tokens":[11]}')
@@ -298,7 +299,7 @@ class MainProtocolTests(unittest.TestCase):
                  mock.patch.object(m, 'command', return_value='fixture'), mock.patch.object(m, 'snapshot_images', return_value={'images': []}, create=True), \
                  mock.patch.object(m, 'verify_image_continuity', return_value={}, create=True):
                 if mode != 'valid' or cleanup_failure or bad_reference:
-                    with self.assertRaises((ValueError, RuntimeError)): m.main()
+                    with self.assertRaises((ValueError, RuntimeError, InterruptedError)): m.main()
                 else:
                     m.main()
         finally:
@@ -307,6 +308,11 @@ class MainProtocolTests(unittest.TestCase):
         receipt = json.loads((out / 'receipt.json').read_text())
         self.assertEqual(receipt['status'], 'complete' if mode == 'valid' and not cleanup_failure and not bad_reference else 'failed')
         return receipt, out
+
+    def test_health_termination_cannot_continue_to_requests(self):
+        receipt, out = self.run_driver('health_interrupt')
+        self.assertEqual(receipt['validated_requests'], [])
+        self.assertIn(signal.SIGTERM, receipt['pending_signals'])
 
     def test_valid_generation_receipt(self):
         receipt, out = self.run_driver('valid')

@@ -15,6 +15,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 
 from measurement_images import snapshot_images, verify_image_continuity
@@ -431,7 +432,9 @@ def main():
                 with urllib.request.urlopen(url + "/health", timeout=2) as response:
                     if response.status == 200:
                         break
-            except Exception:
+            except (urllib.error.URLError, TimeoutError, ConnectionError):
+                if signals.pending:
+                    raise
                 time.sleep(0.5)
         load_s = monotonic() - started
         expected_images = json.loads((args.out / "config.json").read_text())
@@ -517,7 +520,8 @@ def main():
                             last_token_event = now
                             if first is None:
                                 first = now
-                                first_future = sampler.submit(system_sample, server.pid)
+                                with signals.defer():
+                                    first_future = sampler.submit(system_sample, server.pid)
                                 profile(f"profile-{run}-decode.txt")
                     completion.validate(expected_prompt=len(payload["prompt"]), teacher=teacher_ids is not None)
                     validated_requests.append({"run": run, "step": step, "output_tokens": expected,
