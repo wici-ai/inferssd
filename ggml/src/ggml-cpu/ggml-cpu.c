@@ -603,8 +603,6 @@ struct ggml_moe_fallback_reason_profile_entry {
 };
 
 struct ggml_moe_fallback_reason_profile_state {
-    bool initialized;
-    bool registered;
     bool enabled;
     const char * out;
     struct ggml_moe_fallback_reason_profile_entry entries[GGML_MOE_FALLBACK_REASON_PROFILE_MAX];
@@ -759,22 +757,7 @@ static void ggml_moe_fallback_reason_profile_report(void) {
             ggml_moe_fallback_reason_profile.dropped);
 }
 
-static bool ggml_moe_fallback_reason_profile_enabled(void) {
-    if (!ggml_moe_fallback_reason_profile.initialized) {
-        ggml_moe_fallback_reason_profile.initialized = true;
-        ggml_moe_fallback_reason_profile.out = getenv("GGML_MOE_FALLBACK_REASON_PROFILE_OUT");
-        ggml_moe_fallback_reason_profile.enabled =
-            ggml_moe_fallback_reason_profile.out &&
-            ggml_moe_fallback_reason_profile.out[0];
-        if (ggml_moe_fallback_reason_profile.enabled &&
-                !ggml_moe_fallback_reason_profile.registered) {
-            ggml_moe_fallback_reason_profile.registered = true;
-            atexit(ggml_moe_fallback_reason_profile_report);
-        }
-    }
-
-    return ggml_moe_fallback_reason_profile.enabled;
-}
+static bool ggml_moe_fallback_reason_profile_enabled(void);
 
 static void ggml_moe_fallback_reason_profile_record(
         const char * role,
@@ -1164,11 +1147,29 @@ typedef void * thread_ret_t;
 
 typedef pthread_t ggml_thread_t;
 
+static void ggml_moe_fallback_reason_profile_init(void) {
+    ggml_moe_fallback_reason_profile.out = getenv("GGML_MOE_FALLBACK_REASON_PROFILE_OUT");
+    ggml_moe_fallback_reason_profile.enabled =
+        ggml_moe_fallback_reason_profile.out &&
+        ggml_moe_fallback_reason_profile.out[0];
+    if (ggml_moe_fallback_reason_profile.enabled) {
+        atexit(ggml_moe_fallback_reason_profile_report);
+    }
+}
+
+static bool ggml_moe_fallback_reason_profile_enabled(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, ggml_moe_fallback_reason_profile_init);
+    return ggml_moe_fallback_reason_profile.enabled;
+}
+
 static bool ggml_moe_cpu_chunk_trace_enabled(void) {
-    static int enabled = -1;
+    static atomic_int cached = -1;
+    int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
     if (enabled < 0) {
         const char * env = getenv("GGML_MOE_CPU_CHUNK_TRACE_OUT");
         enabled = env && env[0] ? 1 : 0;
+        atomic_store_explicit(&cached, enabled, memory_order_relaxed);
     }
     return enabled != 0;
 }
@@ -1784,10 +1785,12 @@ static uint64_t ggml_moe_cpu_touch_pages_us(const void * ptr, size_t size) {
 }
 
 static bool ggml_moe_cpu_willneed_enabled(void) {
-    static int enabled = -1;
+    static atomic_int cached = -1;
+    int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
     if (enabled < 0) {
         const char * env = getenv("GGML_MOE_CPU_WILLNEED");
         enabled = env && env[0] && env[0] != '0' ? 1 : 0;
+        atomic_store_explicit(&cached, enabled, memory_order_relaxed);
     }
     return enabled != 0;
 }
@@ -1854,9 +1857,8 @@ static int ggml_moe_tensor_layer(const char * name) {
 #define GGML_DS4_SPARSE_FUSED_MMVQ_MAX_EXPERTS 512
 
 struct ggml_ds4_sparse_fused_mmvq_membership_state {
-    bool initialized;
+    pthread_once_t once;
     bool enabled;
-    bool registered;
     bool profile_load_attempted;
     bool profile_loaded;
     const char * out;
@@ -1884,6 +1886,7 @@ struct ggml_ds4_sparse_fused_mmvq_membership_state {
 };
 
 static struct ggml_ds4_sparse_fused_mmvq_membership_state ggml_ds4_sparse_fused_mmvq_membership = {
+    .once = PTHREAD_ONCE_INIT,
     .mutex = PTHREAD_MUTEX_INITIALIZER,
 };
 
@@ -2022,20 +2025,20 @@ static void ggml_ds4_sparse_fused_mmvq_membership_report(void) {
             ggml_ds4_sparse_fused_mmvq_membership.hit_touch_us);
 }
 
-static bool ggml_ds4_sparse_fused_mmvq_membership_enabled(void) {
-    if (!ggml_ds4_sparse_fused_mmvq_membership.initialized) {
-        ggml_ds4_sparse_fused_mmvq_membership.initialized = true;
-        ggml_ds4_sparse_fused_mmvq_membership.out =
-            getenv("GGML_DS4_SPARSE_FUSED_MMVQ_MEMBERSHIP_OUT");
-        ggml_ds4_sparse_fused_mmvq_membership.enabled =
-            ggml_ds4_sparse_fused_mmvq_membership.out &&
-            ggml_ds4_sparse_fused_mmvq_membership.out[0];
-        if (ggml_ds4_sparse_fused_mmvq_membership.enabled &&
-                !ggml_ds4_sparse_fused_mmvq_membership.registered) {
-            ggml_ds4_sparse_fused_mmvq_membership.registered = true;
-            atexit(ggml_ds4_sparse_fused_mmvq_membership_report);
-        }
+static void ggml_ds4_sparse_fused_mmvq_membership_init(void) {
+    ggml_ds4_sparse_fused_mmvq_membership.out =
+        getenv("GGML_DS4_SPARSE_FUSED_MMVQ_MEMBERSHIP_OUT");
+    ggml_ds4_sparse_fused_mmvq_membership.enabled =
+        ggml_ds4_sparse_fused_mmvq_membership.out &&
+        ggml_ds4_sparse_fused_mmvq_membership.out[0];
+    if (ggml_ds4_sparse_fused_mmvq_membership.enabled) {
+        atexit(ggml_ds4_sparse_fused_mmvq_membership_report);
     }
+}
+
+static bool ggml_ds4_sparse_fused_mmvq_membership_enabled(void) {
+    pthread_once(&ggml_ds4_sparse_fused_mmvq_membership.once,
+                 ggml_ds4_sparse_fused_mmvq_membership_init);
     return ggml_ds4_sparse_fused_mmvq_membership.enabled;
 }
 
@@ -2324,46 +2327,56 @@ static bool ggml_moe_stream_compare_cpu_enabled(void) {
 }
 
 static bool ggml_moe_stream_q80_probe_enabled(void) {
-    static int enabled = -1;
+    static atomic_int cached = -1;
+    int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
     if (enabled < 0) {
         const char * env = getenv("GGML_MOE_STREAM_Q80_PROBE_OUT");
         enabled = env && env[0] ? 1 : 0;
+        atomic_store_explicit(&cached, enabled, memory_order_relaxed);
     }
     return enabled != 0;
 }
 
 static bool ggml_moe_stream_q80_write_enabled(void) {
-    static int enabled = -1;
+    static atomic_int cached = -1;
+    int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
     if (enabled < 0) {
         const char * env = getenv("GGML_MOE_STREAM_Q80_WRITE_NAME_FILTER");
         enabled = env && env[0] ? 1 : 0;
+        atomic_store_explicit(&cached, enabled, memory_order_relaxed);
     }
     return enabled != 0;
 }
 
 static bool ggml_moe_stream_q80_skip_enabled(void) {
-    static int enabled = -1;
+    static atomic_int cached = -1;
+    int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
     if (enabled < 0) {
         const char * env = getenv("GGML_MOE_STREAM_Q80_SKIP_NAME_FILTER");
         enabled = env && env[0] ? 1 : 0;
+        atomic_store_explicit(&cached, enabled, memory_order_relaxed);
     }
     return enabled != 0;
 }
 
 static bool ggml_moe_stream_q80_hot_batch_probe_enabled(void) {
-    static int enabled = -1;
+    static atomic_int cached = -1;
+    int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
     if (enabled < 0) {
         const char * env = getenv("GGML_MOE_STREAM_Q80_HOT_BATCH_PROBE_OUT");
         enabled = env && env[0] ? 1 : 0;
+        atomic_store_explicit(&cached, enabled, memory_order_relaxed);
     }
     return enabled != 0;
 }
 
 static bool ggml_moe_cpu_batch_microprobe_enabled(void) {
-    static int enabled = -1;
+    static atomic_int cached = -1;
+    int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
     if (enabled < 0) {
         const char * env = getenv("GGML_MOE_CPU_BATCH_MICROPROBE_OUT");
         enabled = env && env[0] ? 1 : 0;
+        atomic_store_explicit(&cached, enabled, memory_order_relaxed);
     }
     return enabled != 0;
 }
