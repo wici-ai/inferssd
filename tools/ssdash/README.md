@@ -146,3 +146,36 @@ iterator consumed while constructing offloaded passes remains consumed when the
 threshold code later asks for served forms. Model fitting, memory sizing,
 feedback, artifact loading, planner integration and device measurements remain
 outside this batch.
+
+## Prefill calibration, memory and feedback
+
+The remaining pure prefill functions are grouped by their inputs and purpose:
+
+- `prefill_calibration`: `union_points`, `rest_fit`, `build`, and `check` consume
+  supplied routing, bootstrap observations and device facts to build and check
+  the cost model.
+- `prefill_memory`: `graph_line` and `graph_pass_max` price recorded graph-buffer
+  reserves and the largest pass that fits them.
+- `prefill_feedback`: `drive_factor` and `feedback` fit supplied observations,
+  using an explicit callback for the placement's threshold and ubatch.
+
+The mapping types describe the existing data without validating or copying it.
+`build` preserves borrowed nested observations, placement/tier ordering, unit
+conversions, union-point overwrite rules and rounding. Memory admission keeps
+the graph-versus-placement identity check, lexicographic reserve selection,
+unified-memory accounting and original zero/missing-input behavior. Feedback
+keeps callback order, exception timing and the existing `recent=0` slice of all
+turns. Singular fits and one-shot iterator behavior are unchanged.
+
+67 cases were frozen from F before implementation, separately on Python 3.9 and
+3.12. The two runtime records happen to agree for these cases; both are retained.
+They record exact results and selected intermediate values, input hashes,
+borrowed-object identities, ordered mapping accesses and callback traces. A
+composed case builds the model, prices passes, selects a threshold, applies the
+memory bound and checks the lane costs through F's complete call graph. Tests
+also compare each new implementation directly with F on the running interpreter.
+
+This completes extraction of the pure functions from the old prefill module.
+Artifact loading and frozen schema contracts, engine telemetry, settings
+derivation, planner/controller integration and production callers remain separate
+work. No device is queried by these modules.
