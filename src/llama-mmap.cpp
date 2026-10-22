@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <cstdlib>
+#include <mutex>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -54,6 +56,44 @@ static std::string llama_format_win_err(DWORD err) {
     return ret;
 }
 #endif
+
+static bool llama_mmap_fadvise_dontneed_enabled() {
+#ifdef __linux__
+    static const bool enabled = []() {
+        const char * env = std::getenv("LLAMA_DROP_MMAP_FADVISE_DONTNEED");
+        return env && env[0] && env[0] != '0';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+static bool llama_mmap_phase1_reclaim_enabled() {
+#ifdef __linux__
+    static const bool enabled = []() {
+        const char * phase1 = std::getenv("GGML_MOE_PREFILL_PHASE1");
+        const char * reclaim = std::getenv("GGML_MOE_PHASE1_MMAP_RECLAIM");
+        return phase1 && phase1[0] && phase1[0] != '0' &&
+               reclaim && reclaim[0] && reclaim[0] != '0';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+static bool llama_mmap_kimi_dense_zero_copy_enabled() {
+#ifdef __linux__
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_KIMI_DENSE_STREAM_ZERO_COPY");
+        return env && env[0] && env[0] != '0';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
 
 // llama_file
 
@@ -433,11 +473,17 @@ void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+    int fadvise_fd = -1;
 
     impl(struct llama_file * file, size_t prefetch, bool numa) {
         size = file->size();
         int fd = file->file_id();
-        int flags = MAP_SHARED;
+        const bool kimi_dense_zero_copy = llama_mmap_kimi_dense_zero_copy_enabled();
+#ifdef __linux__
+        const bool phase1_reclaim = llama_mmap_phase1_reclaim_enabled();
+#endif
+        int flags = kimi_dense_zero_copy ? MAP_PRIVATE : MAP_SHARED;
+        int protection = PROT_READ | (kimi_dense_zero_copy ? PROT_WRITE : 0);
         if (numa) { prefetch = 0; }
 #ifdef __linux__
         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
@@ -446,10 +492,38 @@ struct llama_mmap::impl {
         }
         if (prefetch) { flags |= MAP_POPULATE; }
 #endif
-        addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
+        addr = mmap(NULL, file->size(), protection, flags, fd, 0);
+        if (addr == MAP_FAILED && kimi_dense_zero_copy) {
+            LLAMA_LOG_WARN(
+                "warning: private writable mmap for dense zero-copy failed: %s; retrying read-only mmap\n",
+                strerror(errno));
+            flags &= ~MAP_PRIVATE;
+            flags |= MAP_SHARED;
+            protection = PROT_READ;
+            addr = mmap(NULL, file->size(), protection, flags, fd, 0);
+        }
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
+#ifdef __linux__
+        if (kimi_dense_zero_copy) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LLAMA_LOG_INFO(
+                    "dense zero-copy mmap: requested private writable model mappings, active=%d\n",
+                    protection == (PROT_READ | PROT_WRITE) ? 1 : 0);
+            }
+        }
+#endif
+#ifdef __linux__
+        if (llama_mmap_fadvise_dontneed_enabled() || phase1_reclaim) {
+            fadvise_fd = dup(fd);
+            if (fadvise_fd == -1) {
+                LLAMA_LOG_WARN("warning: dup(..) for POSIX_FADV_DONTNEED failed: %s\n", strerror(errno));
+            }
+        }
+#endif
 
         if (prefetch > 0) {
             if (posix_madvise(addr, std::min(file->size(), prefetch), POSIX_MADV_WILLNEED)) {
@@ -477,6 +551,77 @@ struct llama_mmap::impl {
         if (*last <= *first) {
             *last = *first;
         }
+    }
+
+    bool advise_random_fragment(size_t first, size_t last, size_t * len_out) {
+        if (len_out) {
+            *len_out = 0;
+        }
+        if (first > last || last > size) {
+            LLAMA_LOG_WARN("warning: invalid mmap random advice range [%zu, %zu) for size %zu\n",
+                    first, last, size);
+            return false;
+        }
+        if (first == last) {
+            return true;
+        }
+
+        const long page_size_long = sysconf(_SC_PAGESIZE);
+        if (page_size_long <= 0) {
+            LLAMA_LOG_WARN("warning: sysconf(_SC_PAGESIZE) failed before POSIX_MADV_RANDOM\n");
+            return false;
+        }
+        const size_t page_size = (size_t) page_size_long;
+        first -= first % page_size;
+        const size_t tail = last % page_size;
+        if (tail != 0) {
+            last += page_size - tail;
+        }
+        const size_t len = last - first;
+
+        const int rc = posix_madvise((uint8_t *) addr + first, len, POSIX_MADV_RANDOM);
+        if (rc != 0) {
+            LLAMA_LOG_WARN("warning: posix_madvise(..., POSIX_MADV_RANDOM) failed: %s\n", strerror(rc));
+            return false;
+        }
+        if (len_out) {
+            *len_out = len;
+        }
+        return true;
+    }
+
+    bool dontneed_fragment(size_t first, size_t last, size_t * len_out) {
+        int page_size = sysconf(_SC_PAGESIZE);
+        align_range(&first, &last, page_size);
+        size_t len = last - first;
+        if (len_out) {
+            *len_out = len;
+        }
+
+        if (len == 0) {
+            return true;
+        }
+
+        GGML_ASSERT(first % page_size == 0);
+        GGML_ASSERT(last % page_size == 0);
+        GGML_ASSERT(last >= first);
+
+#ifdef __linux__
+        bool ok = true;
+        if (madvise((uint8_t *) addr + first, len, MADV_DONTNEED)) {
+            LLAMA_LOG_WARN("warning: madvise(..., MADV_DONTNEED) failed: %s\n", strerror(errno));
+            ok = false;
+        }
+        if (fadvise_fd != -1) {
+            const int rc = posix_fadvise(fadvise_fd, (off_t) first, (off_t) len, POSIX_FADV_DONTNEED);
+            if (rc != 0) {
+                LLAMA_LOG_WARN("warning: posix_fadvise(..., POSIX_FADV_DONTNEED) failed: %s\n", strerror(rc));
+                ok = false;
+            }
+        }
+        return ok;
+#endif
+        return true;
     }
 
     void unmap_fragment(size_t first, size_t last) {
@@ -521,6 +666,11 @@ struct llama_mmap::impl {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
             }
         }
+#ifdef __linux__
+        if (fadvise_fd != -1) {
+            close(fadvise_fd);
+        }
+#endif
     }
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
@@ -569,6 +719,24 @@ struct llama_mmap::impl {
         }
     }
 
+    bool dontneed_fragment(size_t first, size_t last, size_t * len_out) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        if (len_out) {
+            *len_out = 0;
+        }
+        return true;
+    }
+
+    bool advise_random_fragment(size_t first, size_t last, size_t * len_out) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        if (len_out) {
+            *len_out = 0;
+        }
+        return false;
+    }
+
     void unmap_fragment(size_t first, size_t last) {
         GGML_UNUSED(first);
         GGML_UNUSED(last);
@@ -597,6 +765,26 @@ struct llama_mmap::impl {
         throw std::runtime_error("mmap not supported");
     }
 
+    bool dontneed_fragment(size_t first, size_t last, size_t * len_out) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+
+        if (len_out) {
+            *len_out = 0;
+        }
+        throw std::runtime_error("mmap not supported");
+        return false;
+    }
+
+    bool advise_random_fragment(size_t first, size_t last, size_t * len_out) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        if (len_out) {
+            *len_out = 0;
+        }
+        return false;
+    }
+
     void unmap_fragment(size_t first, size_t last) {
         GGML_UNUSED(first);
         GGML_UNUSED(last);
@@ -609,13 +797,116 @@ struct llama_mmap::impl {
     size_t size;
 };
 
-llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {}
-llama_mmap::~llama_mmap() = default;
+static std::mutex g_llama_mmap_registry_mutex;
+static std::vector<llama_mmap *> g_llama_mmap_registry;
+
+llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa) : pimpl(std::make_unique<impl>(file, prefetch, numa)) {
+    std::lock_guard<std::mutex> lock(g_llama_mmap_registry_mutex);
+    g_llama_mmap_registry.push_back(this);
+}
+
+llama_mmap::~llama_mmap() {
+    std::lock_guard<std::mutex> lock(g_llama_mmap_registry_mutex);
+    g_llama_mmap_registry.erase(
+            std::remove(g_llama_mmap_registry.begin(), g_llama_mmap_registry.end(), this),
+            g_llama_mmap_registry.end());
+}
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
+bool llama_mmap::advise_random_fragment(size_t first, size_t last, size_t * len_out) { return pimpl->advise_random_fragment(first, last, len_out); }
+bool llama_mmap::dontneed_fragment(size_t first, size_t last, size_t * len_out) { return pimpl->dontneed_fragment(first, last, len_out); }
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+
+#if defined(__GNUC__) || defined(__clang__)
+#define LLAMA_MMAP_EXPORT __attribute__((visibility("default")))
+#else
+#define LLAMA_MMAP_EXPORT
+#endif
+
+static bool llama_mmap_is_expert_tensor_name(const char * name) {
+    if (!name || std::strncmp(name, "blk.", 4) != 0) {
+        return false;
+    }
+
+    const char * p = name + 4;
+    if (*p < '0' || *p > '9') {
+        return false;
+    }
+    while (*p >= '0' && *p <= '9') {
+        ++p;
+    }
+    if (std::strncmp(p, ".ffn_", 5) != 0) {
+        return false;
+    }
+    p += 5;
+
+    if (std::strncmp(p, "gate_up_", 8) == 0) {
+        p += 8;
+    } else if (std::strncmp(p, "down_", 5) == 0 || std::strncmp(p, "gate_", 5) == 0) {
+        p += 5;
+    } else if (std::strncmp(p, "up_", 3) == 0) {
+        p += 3;
+    } else {
+        return false;
+    }
+
+    if (std::strncmp(p, "ch", 2) == 0) {
+        p += 2;
+    }
+    return std::strncmp(p, "exps.", 5) == 0;
+}
+
+extern "C" LLAMA_MMAP_EXPORT bool llama_mmap_dontneed_expert_host_range(
+        const char * tensor_name, const void * addr, size_t size, size_t * advised_out) {
+    if (advised_out) {
+        *advised_out = 0;
+    }
+    if (!llama_mmap_is_expert_tensor_name(tensor_name)) {
+        return false;
+    }
+    if (!addr || size == 0) {
+        return true;
+    }
+
+    const uintptr_t first = (uintptr_t) addr;
+    if (size > UINTPTR_MAX - first) {
+        return false;
+    }
+    const uintptr_t last = first + size;
+    size_t covered = 0;
+    size_t advised = 0;
+    bool ok = true;
+
+    std::lock_guard<std::mutex> lock(g_llama_mmap_registry_mutex);
+    for (llama_mmap * mapping : g_llama_mmap_registry) {
+        const uintptr_t mapping_first = (uintptr_t) mapping->addr();
+        if (mapping->size() > UINTPTR_MAX - mapping_first) {
+            continue;
+        }
+        const uintptr_t mapping_last = mapping_first + mapping->size();
+        const uintptr_t overlap_first = std::max(first, mapping_first);
+        const uintptr_t overlap_last  = std::min(last, mapping_last);
+        if (overlap_last <= overlap_first) {
+            continue;
+        }
+
+        size_t fragment_advised = 0;
+        ok = mapping->dontneed_fragment(
+                overlap_first - mapping_first,
+                overlap_last - mapping_first,
+                &fragment_advised) && ok;
+        covered += overlap_last - overlap_first;
+        advised += fragment_advised;
+    }
+    if (advised_out) {
+        *advised_out = advised;
+    }
+    return ok && covered == size;
+}
+
+#undef LLAMA_MMAP_EXPORT
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;

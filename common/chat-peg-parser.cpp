@@ -274,7 +274,8 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
     bool is_arg_close  = node.tag == common_chat_peg_builder::TOOL_ARG_CLOSE;
     bool is_arg_name         = node.tag == common_chat_peg_builder::TOOL_ARG_NAME;
     bool is_arg_value        = node.tag == common_chat_peg_builder::TOOL_ARG_VALUE;
-    bool is_arg_string_value = node.tag == common_chat_peg_builder::TOOL_ARG_STRING_VALUE;
+    bool is_arg_raw_string_value = node.tag == common_chat_peg_builder::TOOL_ARG_RAW_STRING_VALUE;
+    bool is_arg_string_value = node.tag == common_chat_peg_builder::TOOL_ARG_STRING_VALUE || is_arg_raw_string_value;
 
     if (is_tool_open) {
         pending_tool_call     = common_chat_tool_call();
@@ -338,7 +339,8 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
     }
 
     if ((is_arg_value || is_arg_string_value) && current_tool) {
-        std::string value_content = std::string(trim_trailing_space(trim_leading_space(node.text, 1), 1));
+        std::string value_content = is_arg_raw_string_value ? std::string(node.text) :
+            std::string(trim_trailing_space(trim_leading_space(node.text, 1), 1));
 
         std::string value_to_add;
         if (value_content.empty() && is_arg_string_value) {

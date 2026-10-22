@@ -172,63 +172,30 @@ static void append_codepoint_as_ascii_json_escape(std::string & out, uint32_t co
     append_u16(0xDC00 + (codepoint & 0x3FF));
 }
 
-static std::string json_ensure_ascii_preserving_format(const std::string & json_str) {
-    std::string output;
-    output.reserve(json_str.size());
-
-    bool in_string = false;
-    bool escaped = false;
-
-    for (size_t pos = 0; pos < json_str.size();) {
-        const char ch = json_str[pos];
-        if (!in_string) {
-            output.push_back(ch);
-            if (ch == '"') {
-                in_string = true;
-            }
+static string json_ensure_ascii_preserving_format(const string & origin) {
+    const auto text = origin.str();
+    string output;
+    bool in_string = false, escaped = false;
+    for (size_t pos = 0; pos < text.size();) {
+        const char ch = text[pos];
+        if (!in_string || escaped || ch == '\\' || ch == '"' || static_cast<unsigned char>(ch) < 0x80) {
+            output.append(origin.substr(pos, 1));
+            if (escaped) escaped = false;
+            else if (in_string && ch == '\\') escaped = true;
+            else if (ch == '"') in_string = !in_string;
             ++pos;
-            continue;
+        } else {
+            const auto parsed = common_parse_utf8_codepoint(text, pos);
+            std::string converted;
+            size_t size = 1;
+            if (parsed.status == utf8_parse_result::SUCCESS) {
+                append_codepoint_as_ascii_json_escape(converted, parsed.codepoint);
+                size = parsed.bytes_consumed;
+            } else converted = "\\ufffd";
+            output.append(string(converted, origin.substr(pos, size).any_parts_are_input()));
+            pos += size;
         }
-
-        if (escaped) {
-            output.push_back(ch);
-            escaped = false;
-            ++pos;
-            continue;
-        }
-
-        if (ch == '\\') {
-            output.push_back(ch);
-            escaped = true;
-            ++pos;
-            continue;
-        }
-
-        if (ch == '"') {
-            output.push_back(ch);
-            in_string = false;
-            ++pos;
-            continue;
-        }
-
-        const unsigned char uch = static_cast<unsigned char>(ch);
-        if (uch < 0x80) {
-            output.push_back(ch);
-            ++pos;
-            continue;
-        }
-
-        auto parsed = common_parse_utf8_codepoint(json_str, pos);
-        if (parsed.status != utf8_parse_result::SUCCESS) {
-            output += "\\ufffd";
-            ++pos;
-            continue;
-        }
-
-        append_codepoint_as_ascii_json_escape(output, parsed.codepoint);
-        pos += parsed.bytes_consumed;
     }
-
     return output;
 }
 
@@ -252,12 +219,10 @@ static value tojson(const func_args & args) {
     }
     const bool ensure_ascii = val_ascii->as_bool(); // undefined == false
     auto separators = (is_val<value_array>(val_separators) ? val_separators : mk_val<value_array>())->as_array();
-    std::string item_sep = separators.size() > 0 ? separators[0]->as_string().str() : (indent < 0 ? ", " : ",");
-    std::string key_sep = separators.size() > 1 ? separators[1]->as_string().str() : ": ";
-    std::string json_str = value_to_json(args.get_pos(0), indent, item_sep, key_sep);
-    if (ensure_ascii) {
-        json_str = json_ensure_ascii_preserving_format(json_str);
-    }
+    const string item_sep = separators.size() > 0 ? separators[0]->as_string() : string(std::string(indent < 0 ? ", " : ","));
+    const string key_sep = separators.size() > 1 ? separators[1]->as_string() : string(std::string(": "));
+    auto json_str = value_to_json_origin(args.get_pos(0), indent, item_sep, key_sep);
+    if (ensure_ascii) json_str = json_ensure_ascii_preserving_format(json_str);
     return mk_val<value_string>(json_str);
 }
 
@@ -374,7 +339,29 @@ const func_builtins & global_builtins() {
             // TODO: make sure this is the same behavior as Python's strftime
             char buf[100];
             if (std::strftime(buf, sizeof(buf), format.c_str(), std::localtime(&args.ctx.current_time))) {
-                return mk_val<value_string>(std::string(buf));
+                const auto origin = args.get_pos(0)->as_string();
+                if (origin.all_parts_are_input()) return mk_val<value_string>(string(std::string(buf), true));
+                if (!origin.any_parts_are_input()) return mk_val<value_string>(std::string(buf));
+                string output;
+                for (size_t pos = 0; pos < format.size();) {
+                    const auto next = format.find('%', pos);
+                    if (next == std::string::npos) { output.append(origin.substr(pos)); break; }
+                    output.append(origin.substr(pos, next - pos));
+                    size_t end = next + 1;
+                    if (end < format.size() && format[end] == '%') ++end;
+                    else {
+                        while (end < format.size() && !std::isalpha(static_cast<unsigned char>(format[end]))) ++end;
+                        if (end < format.size() && (format[end] == 'E' || format[end] == 'O')) ++end;
+                        if (end < format.size()) ++end;
+                    }
+                    const auto directive = format.substr(next, end - next);
+                    char piece[100] = {};
+                    std::strftime(piece, sizeof(piece), directive.c_str(), std::localtime(&args.ctx.current_time));
+                    output.append(string(std::string(piece), origin.substr(next, end - next).any_parts_are_input()));
+                    pos = end;
+                }
+                if (output.str() != buf) throw raised_exception("strftime_now: cannot preserve mixed format origin");
+                return mk_val<value_string>(output);
             } else {
                 throw raised_exception("strftime_now: failed to format time");
             }
@@ -515,8 +502,28 @@ const func_builtins & global_builtins() {
         }},
         {"test_is_sameas", [](const func_args & args) -> value {
             // Check if an object points to the same memory address as another object
-            (void)args;
-            throw not_implemented_exception("sameas test not implemented");
+            args.ensure_count(2);
+            auto a = args.get_pos(0);
+            auto b = args.get_pos(1);
+            bool res = false;
+            if (!is_val<value_undefined>(a) && !is_val<value_undefined>(b)) {
+                if (is_val<value_none>(a) && is_val<value_none>(b)) {
+                    res = true;
+                } else if (is_val<value_bool>(a) && is_val<value_bool>(b)) {
+                    if (a->as_bool() == b->as_bool()) {
+                        res = true;
+                    }
+                } else if (is_val<value_int>(a) && is_val<value_int>(b)) {
+                    const int64_t x = a->as_int();
+                    // Allow comparison within small-int cache range
+                    if (x >= -5 && x <= 256 && x == b->as_int()) {
+                        res = true;
+                    }
+                } else if (a == b) {
+                    res = true;
+                }
+            }
+            return mk_val<value_bool>(res);
         }},
         {"test_is_escaped", [](const func_args & args) -> value {
             (void)args;
@@ -675,17 +682,15 @@ const func_builtins & value_string_t::get_builtins() const {
             std::string delim = (args.count() > 1) ? args.get_pos(1)->as_string().str() : " ";
             int64_t maxsplit = (args.count() > 2) ? args.get_pos(2)->as_int() : -1;
             auto result = mk_val<value_array>();
-            size_t pos = 0;
-            std::string token;
-            while ((pos = str.find(delim)) != std::string::npos && maxsplit != 0) {
-                token = str.substr(0, pos);
-                result->push_back(mk_val<value_string>(token));
-                str.erase(0, pos + delim.length());
+            if (delim.empty()) throw raised_exception("split() empty delimiter");
+            const auto origin = val_input->as_string();
+            size_t begin = 0, pos;
+            while (maxsplit != 0 && (pos = str.find(delim, begin)) != std::string::npos) {
+                result->push_back(mk_val<value_string>(origin.substr(begin, pos - begin)));
+                begin = pos + delim.length();
                 --maxsplit;
             }
-            auto res = mk_val<value_string>(str);
-            res->val_str.mark_input_based_on(args.get_pos(0)->val_str);
-            result->push_back(std::move(res));
+            result->push_back(mk_val<value_string>(origin.substr(begin)));
             return result;
         }},
         {"rsplit", [](const func_args & args) -> value {
@@ -699,17 +704,16 @@ const func_builtins & value_string_t::get_builtins() const {
             std::string delim = (args.count() > 1) ? args.get_pos(1)->as_string().str() : " ";
             int64_t maxsplit = (args.count() > 2) ? args.get_pos(2)->as_int() : -1;
             auto result = mk_val<value_array>();
-            size_t pos = 0;
-            std::string token;
-            while ((pos = str.rfind(delim)) != std::string::npos && maxsplit != 0) {
-                token = str.substr(pos + delim.length());
-                result->push_back(mk_val<value_string>(token));
-                str.erase(pos);
+            if (delim.empty()) throw raised_exception("rsplit() empty delimiter");
+            const auto origin = val_input->as_string();
+            size_t end = str.size(), pos;
+            while (maxsplit != 0 && end >= delim.size() &&
+                    (pos = str.rfind(delim, end - delim.size())) != std::string::npos) {
+                result->push_back(mk_val<value_string>(origin.substr(pos + delim.size(), end - pos - delim.size())));
+                end = pos;
                 --maxsplit;
             }
-            auto res = mk_val<value_string>(str);
-            res->val_str.mark_input_based_on(args.get_pos(0)->val_str);
-            result->push_back(std::move(res));
+            result->push_back(mk_val<value_string>(origin.substr(0, end)));
             result->reverse();
             return result;
         }},
@@ -722,14 +726,20 @@ const func_builtins & value_string_t::get_builtins() const {
             if (count > 0) {
                 throw not_implemented_exception("String replace with count argument not implemented");
             }
-            size_t pos = 0;
-            while ((pos = str.find(old_str, pos)) != std::string::npos) {
-                str.replace(pos, old_str.length(), new_str);
-                pos += new_str.length();
+            const auto origin = args.get_pos(0)->as_string();
+            const auto replacement = args.get_pos(2)->as_string();
+            if (old_str.empty()) throw raised_exception("replace() empty pattern is not supported");
+            jinja::string result;
+            size_t begin = 0, pos;
+            while ((pos = str.find(old_str, begin)) != std::string::npos) {
+                result.append(origin.substr(begin, pos - begin));
+                auto inserted = replacement;
+                if (origin.substr(pos, old_str.size()).any_parts_are_input()) inserted.mark_input();
+                result.append(inserted);
+                begin = pos + old_str.size();
             }
-            auto res = mk_val<value_string>(str);
-            res->val_str.mark_input_based_on(args.get_pos(0)->val_str);
-            return res;
+            result.append(origin.substr(begin));
+            return mk_val<value_string>(result);
         }},
         {"int", [](const func_args & args) -> value {
             value val_input   = args.get_pos(0);
@@ -803,10 +813,12 @@ const func_builtins & value_string_t::get_builtins() const {
                 throw raised_exception("slice step cannot be zero");
             }
             auto input = args.get_pos(0);
-            auto sliced = slice(input->as_string().str(), start, stop, step);
-            auto res = mk_val<value_string>(sliced);
-            res->val_str.mark_input_based_on(input->as_string());
-            return res;
+            const auto origin = input->as_string();
+            std::vector<size_t> positions(origin.length());
+            for (size_t i = 0; i < positions.size(); ++i) positions[i] = i;
+            jinja::string result;
+            for (size_t i : slice(positions, start, stop, step)) result.append(origin.substr(i, 1));
+            return mk_val<value_string>(result);
         }},
         {"safe", [](const func_args & args) -> value {
             // no-op for now
@@ -831,29 +843,24 @@ const func_builtins & value_string_t::get_builtins() const {
             } else {
                 indent = "    ";
             }
-            std::string indented;
-            std::string input = val_input->as_string().str();
-            std::istringstream iss = std::istringstream(input);
+            const auto origin = val_input->as_string();
+            const jinja::string padding = is_val<value_string>(val_width) ? val_width->as_string() : jinja::string(indent);
+            jinja::string indented;
+            const std::string input = origin.str();
+            std::istringstream iss(input);
             std::string line;
+            size_t offset = 0;
             while (std::getline(iss, line)) {
-                if (!indented.empty()) {
-                    indented.push_back('\n');
-                }
-                if ((indented.empty() ? first : (!line.empty() || blank))) {
-                    indented += indent;
-                }
-                indented += line;
+                if (indented.length()) indented.append(origin.substr(offset - 1, 1));
+                if ((indented.length() == 0 ? first : (!line.empty() || blank))) indented.append(padding);
+                indented.append(origin.substr(offset, line.size()));
+                offset += line.size() + 1;
             }
             if (!input.empty() && input.back() == '\n') {
-                indented.push_back('\n');
-                if (blank) {
-                    indented += indent;
-                }
+                indented.append(origin.substr(input.size() - 1, 1));
+                if (blank) indented.append(padding);
             }
-
-            auto res = mk_val<value_string>(indented);
-            res->val_str.mark_input_based_on(val_input->as_string());
-            return res;
+            return mk_val<value_string>(indented);
         }},
         {"join", string_join_not_implemented},
     };
@@ -969,8 +976,8 @@ const func_builtins & value_array_t::get_builtins() const {
                 throw raised_exception("join() attribute must be string or integer");
             }
             const int64_t attr_int = attr_is_int ? attribute->as_int() : 0;
-            const std::string delim = val_delim->is_undefined() ? "" : val_delim->as_string().str();
-            std::string result;
+            const auto delim = val_delim->is_undefined() ? string() : val_delim->as_string();
+            string result;
             for (size_t i = 0; i < arr.size(); ++i) {
                 value val_arr = arr[i];
                 if (!attribute->is_undefined()) {
@@ -983,9 +990,9 @@ const func_builtins & value_array_t::get_builtins() const {
                 if (!is_val<value_string>(val_arr) && !is_val<value_int>(val_arr) && !is_val<value_float>(val_arr)) {
                     throw raised_exception("join() can only join arrays of strings or numerics");
                 }
-                result += val_arr->as_string().str();
+                result.append(val_arr->as_string());
                 if (i < arr.size() - 1) {
-                    result += delim;
+                    result.append(delim);
                 }
             }
             return mk_val<value_string>(result);
@@ -1277,7 +1284,9 @@ static value from_json(const nlohmann::ordered_json & j, bool mark_input) {
     } else if (j.is_object()) {
         auto obj = mk_val<value_object>();
         for (auto it = j.begin(); it != j.end(); ++it) {
-            obj->insert(it.key(), from_json(it.value(), mark_input));
+            auto key = mk_val<value_string>(it.key());
+            if (mark_input) key->mark_input();
+            obj->insert(key, from_json(it.value(), mark_input));
         }
         return obj;
     } else {
@@ -1361,9 +1370,27 @@ void global_from_json(context & ctx, const nlohmann::ordered_json & json_obj, bo
     }
 }
 
+// Preserve provenance while keeping the existing ostream numeric formatting.
+struct origin_stream {
+    string output;
+    bool input = false;
+    origin_stream & operator<<(const string & value) {
+        for (const auto & part : value.parts) {
+            if (!output.parts.empty() && output.parts.back().is_input == part.is_input) output.parts.back().val += part.val;
+            else output.parts.push_back(part);
+        }
+        return *this;
+    }
+    template<class T> origin_stream & operator<<(const T & value) {
+        std::ostringstream text;
+        text << value;
+        return *this << string(text.str(), input);
+    }
+};
+
 // recursively convert value to JSON string
 // TODO: avoid circular references
-static void value_to_json_internal(std::ostringstream & oss, const value & val, int curr_lvl, int indent, const std::string_view item_sep, const std::string_view key_sep) {
+static void value_to_json_internal(origin_stream & oss, const value & val, int curr_lvl, int indent, const string & item_sep, const string & key_sep) {
     auto indent_str = [indent, curr_lvl]() -> std::string {
         return (indent > 0) ? std::string(curr_lvl * indent, ' ') : "";
     };
@@ -1381,7 +1408,10 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
         oss << val->as_float();
     } else if (is_val<value_string>(val)) {
         oss << "\"";
-        for (char c : val->as_string().str()) {
+        const auto source = val->as_string();
+        for (const auto & part : source.parts) {
+            oss.input = part.is_input;
+            for (char c : part.val) {
             switch (c) {
                 case '"': oss << "\\\""; break;
                 case '\\': oss << "\\\\"; break;
@@ -1400,6 +1430,8 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
                     }
             }
         }
+        }
+        oss.input = false;
         oss << "\"";
     } else if (is_val<value_array>(val)) {
         const auto & arr = val->as_array();
@@ -1425,7 +1457,7 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
             size_t i = 0;
             for (const auto & pair : obj) {
                 oss << indent_str() << (indent > 0 ? std::string(indent, ' ') : "");
-                value_to_json_internal(oss, mk_val<value_string>(pair.first->as_string().str()), curr_lvl + 1, indent, item_sep, key_sep);
+                value_to_json_internal(oss, mk_val<value_string>(pair.first->as_string()), curr_lvl + 1, indent, item_sep, key_sep);
                 oss << key_sep;
                 value_to_json_internal(oss, pair.second, curr_lvl + 1, indent, item_sep, key_sep);
                 if (i < obj.size() - 1) {
@@ -1442,26 +1474,31 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
     }
 }
 
-std::string value_to_json(const value & val, int indent, const std::string_view item_sep, const std::string_view key_sep) {
-    std::ostringstream oss;
+string value_to_json_origin(const value & val, int indent, const string & item_sep, const string & key_sep) {
+    origin_stream oss;
     value_to_json_internal(oss, val, 0, indent, item_sep, key_sep);
-    JJ_DEBUG("value_to_json: result=%s", oss.str().c_str());
-    return oss.str();
+    return oss.output;
 }
 
-// TODO: avoid circular references
-std::string value_to_string_repr(const value & val) {
-    if (is_val<value_string>(val)) {
-        const std::string val_str = val->as_string().str();
+std::string value_to_json(const value & val, int indent, const std::string_view item_sep, const std::string_view key_sep) {
+    return value_to_json_origin(val, indent, string(std::string(item_sep)), string(std::string(key_sep))).str();
+}
 
-        if (val_str.find('\'') != std::string::npos) {
-            return value_to_json(val);
-        } else {
-            return "'" + val_str + "'";
-        }
-    } else {
-        return val->as_repr();
+string value_to_string_repr_origin(const value & val) {
+    if (is_val<value_string>(val)) {
+        const auto source = val->as_string();
+        if (source.str().find('\'') != std::string::npos) return value_to_json_origin(val);
+        string result(std::string("'"));
+        result.append(source);
+        result.append(string(std::string("'")));
+        return result;
     }
+    if (is_val<value_array>(val) || is_val<value_object>(val)) return val->as_string();
+    return string(val->as_repr());
+}
+
+std::string value_to_string_repr(const value & val) {
+    return value_to_string_repr_origin(val).str();
 }
 
 // stats utility

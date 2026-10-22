@@ -159,6 +159,8 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
     COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
+    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash draft model
+    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark draft model
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
@@ -273,8 +275,9 @@ struct common_params_sampling {
     int32_t                  reasoning_budget_tokens   = -1;   // -1 = disabled, >= 0 = token budget
     std::vector<llama_token> reasoning_budget_start;           // start tag token sequence
     std::vector<llama_token> reasoning_budget_end;             // end tag token sequence
-    std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
+    std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag + suffix)
     std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
+    std::string              reasoning_budget_suffix;          // suffix injected after end tag when budget exhausted
 
     bool backend_sampling = false;
 
@@ -552,6 +555,7 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+    bool defer_experts     = false; // defer expert mmap residency on Linux
 
     bool single_turn       = false; // single turn chat conversation
 
@@ -592,6 +596,8 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_every_nt = 8192;  // make a checkpoint every n tokens during prefill
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string cache_disk      = "";    // keep the prompt cache in this directory instead of in memory // NOLINT
+    int32_t cache_disk_mib      = 16384; // size limit of the prompt cache on disk, 0 = no limit
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

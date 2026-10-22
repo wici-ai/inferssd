@@ -167,10 +167,15 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 item.at("type") == "function_call"
             ) {
                 // #responses_create-input-input_item_list-item-function_tool_call
+                // A call of a namespace tool carries the namespace apart; the prompt names it "namespace::name".
+                std::string name = item.at("name");
+                if (exists_and_is_string(item, "namespace") && !item.at("namespace").get<std::string>().empty()) {
+                    name = item.at("namespace").get<std::string>() + "::" + name;
+                }
                 json tool_call = {
                     {"function", json {
                         {"arguments", item.at("arguments")},
-                        {"name",      item.at("name")},
+                        {"name",      name},
                     }},
                     {"id",   item.at("call_id")},
                     {"type", "function"},
@@ -203,10 +208,17 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 } else {
                     json chatcmpl_outputs = item.at("output");
                     for (json & chatcmpl_output : chatcmpl_outputs) {
-                        if (!chatcmpl_output.contains("type") || chatcmpl_output.at("type") != "input_text") {
-                            throw std::invalid_argument("Output of tool call should be 'Input text'");
+                        const std::string part_type = json_value(chatcmpl_output, "type", std::string());
+                        if (part_type == "input_text" || part_type == "output_text") {
+                            chatcmpl_output["type"] = "text";
+                        } else {
+                            // A tool message holds text only; an image a tool returns (Codex's view_image) is
+                            // replaced by the placeholder DeepSeek-V4.1's encoding uses for unsupported blocks.
+                            chatcmpl_output = json {
+                                {"type", "text"},
+                                {"text", "[Unsupported " + part_type + "]"},
+                            };
                         }
-                        chatcmpl_output["type"] = "text";
                     }
                     chatcmpl_messages.push_back(json {
                         {"content",      chatcmpl_outputs},
@@ -218,15 +230,11 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 exists_and_is_string(item, "type") &&
                 item.at("type") == "reasoning") {
                 // #responses_create-input-input_item_list-item-reasoning
-
-                if (!exists_and_is_array(item, "content")) {
-                    throw std::invalid_argument("item['content'] is not an array");
-                }
-                if (item.at("content").empty()) {
-                    throw std::invalid_argument("item['content'] is empty");
-                }
-                if (!exists_and_is_string(item.at("content")[0], "text")) {
-                    throw std::invalid_argument("item['content']['text'] is not a string");
+                // Only the reasoning text can go back into the prompt; an item without it (a summary or
+                // encrypted content only) has nothing to carry over.
+                if (!exists_and_is_array(item, "content") || item.at("content").empty() ||
+                    !exists_and_is_string(item.at("content")[0], "text")) {
+                    continue;
                 }
 
                 if (merge_prev) {
@@ -257,8 +265,38 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         for (json resp_tool : response_body.at("tools")) {
             json chatcmpl_tool;
 
-            if (json_value(resp_tool, "type", std::string()) != "function") {
-                throw std::invalid_argument("'type' of tool must be 'function'");
+            const std::string type = json_value(resp_tool, "type", std::string());
+            if (type == "namespace") {
+                // A namespace groups function tools (Codex: sub-agents, one per MCP server). Offer each as
+                // "namespace::name", the qualified name DeepSeek-V4.1's encoding uses, with the namespace's
+                // description ahead of its own; the Responses output splits the name again.
+                const std::string ns      = json_value(resp_tool, "name", std::string());
+                const std::string ns_desc = json_value(resp_tool, "description", std::string());
+                for (json sub_tool : json_value(resp_tool, "tools", json::array())) {
+                    if (ns.empty() || json_value(sub_tool, "type", std::string()) != "function") {
+                        LOG_WRN("Responses request: ignoring a tool in namespace '%s'\n", ns.c_str());
+                        continue;
+                    }
+                    sub_tool.erase("type");
+                    sub_tool["name"] = ns + "::" + json_value(sub_tool, "name", std::string());
+                    if (!ns_desc.empty()) {
+                        sub_tool["description"] = ns_desc + "\n" + json_value(sub_tool, "description", std::string());
+                    }
+                    if (!sub_tool.contains("strict")) {
+                        sub_tool["strict"] = true;
+                    }
+                    chatcmpl_tools.push_back(json {
+                        {"type",     "function"},
+                        {"function", sub_tool},
+                    });
+                }
+                continue;
+            }
+            if (type != "function") {
+                // Hosted and grouped tools (web_search, namespace, custom, ...) have no chat-completions form.
+                // Clients such as Codex always send some; serve the request with its function tools.
+                LOG_WRN("Responses request: ignoring a tool of type '%s'\n", type.c_str());
+                continue;
             }
             resp_tool.erase("type");
             chatcmpl_tool["type"] = "function";
@@ -270,13 +308,25 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             chatcmpl_tools.push_back(chatcmpl_tool);
         }
         chatcmpl_body.erase("tools");
-        chatcmpl_body["tools"] = chatcmpl_tools;
+        if (!chatcmpl_tools.empty()) {
+            chatcmpl_body["tools"] = chatcmpl_tools;
+        } else {
+            chatcmpl_body.erase("tool_choice");
+            chatcmpl_body.erase("parallel_tool_calls");
+        }
     }
 
     if (response_body.contains("max_output_tokens")) {
         chatcmpl_body.erase("max_output_tokens");
         chatcmpl_body["max_tokens"] = response_body["max_output_tokens"];
     }
+
+    // reasoning.effort becomes the chat-completions field reasoning_effort, which switches thinking per request.
+    const json reasoning = json_value(response_body, "reasoning", json::object());
+    if (reasoning.is_object() && reasoning.contains("effort") && !reasoning.at("effort").is_null()) {
+        chatcmpl_body["reasoning_effort"] = reasoning.at("effort");
+    }
+    chatcmpl_body.erase("reasoning");
 
     return chatcmpl_body;
 }

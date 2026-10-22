@@ -7,6 +7,8 @@
 #include "chat.h"
 
 #include <clocale>
+#include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -30,6 +32,12 @@
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+extern "C" void ggml_cuda_moe_stream_batch_phase_report(const char * label) __attribute__((weak));
+#else
+extern "C" void ggml_cuda_moe_stream_batch_phase_report(const char * label);
 #endif
 
 static llama_context           ** g_ctx;
@@ -61,6 +69,132 @@ static bool file_is_empty(const std::string & path) {
     f.exceptions(std::ifstream::failbit | std::ifstream::badbit);
     f.open(path.c_str(), std::ios::in | std::ios::binary | std::ios::ate);
     return f.tellg() == 0;
+}
+
+static bool prompt_cache_full_state_enabled() {
+    const char * env = std::getenv("LLAMA_PROMPT_CACHE_FULL_STATE");
+    return env && env[0] && env[0] != '0';
+}
+
+static std::string prompt_cache_first_token_path(const std::string & path_session) {
+    return path_session + ".first-token";
+}
+
+static bool prompt_cache_write_first_token(const std::string & path_session, llama_token token) {
+    std::ofstream out(prompt_cache_first_token_path(path_session), std::ios::trunc);
+    if (!out.good()) {
+        return false;
+    }
+    out << token << '\n';
+    return out.good();
+}
+
+static bool prompt_cache_read_first_token(const std::string & path_session, llama_token & token) {
+    std::ifstream in(prompt_cache_first_token_path(path_session));
+    long long value = 0;
+    if (!(in >> value) || value < 0 || value > INT32_MAX) {
+        return false;
+    }
+    token = static_cast<llama_token>(value);
+    return true;
+}
+
+static bool kimi_phase_report_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("GGML_MOE_PHASE_REPORT");
+        return env && env[0] && env[0] != '0';
+    }();
+    return enabled;
+}
+
+static std::string kimi_read_text_file(const std::string & path) {
+    std::ifstream f(path);
+    if (!f.good()) {
+        return "";
+    }
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::string out = ss.str();
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) {
+        out.pop_back();
+    }
+    return out;
+}
+
+static std::string kimi_cgroup_path() {
+#if defined(__linux__)
+    std::ifstream f("/proc/self/cgroup");
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("0::", 0) == 0) {
+            std::string rel = line.substr(3);
+            if (rel.empty() || rel[0] != '/') {
+                rel.insert(rel.begin(), '/');
+            }
+            return "/sys/fs/cgroup" + rel;
+        }
+    }
+#endif
+    return "";
+}
+
+static long long kimi_read_ll(const std::string & path) {
+    const std::string text = kimi_read_text_file(path);
+    if (text.empty()) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long long value = std::strtoll(text.c_str(), &end, 10);
+    return end == text.c_str() ? -1 : value;
+}
+
+static long long kimi_read_memstat_key(const std::string & cgroup, const char * key) {
+    if (cgroup.empty()) {
+        return -1;
+    }
+    std::ifstream f(cgroup + "/memory.stat");
+    std::string name;
+    long long value = -1;
+    while (f >> name >> value) {
+        if (name == key) {
+            return value;
+        }
+    }
+    return -1;
+}
+
+static void kimi_phase_report(const char * label, int n_past, int n_consumed, int embd_size) {
+    if (!kimi_phase_report_enabled()) {
+        return;
+    }
+
+    const std::string cg = kimi_cgroup_path();
+    const long long current = kimi_read_ll(cg + "/memory.current");
+    const long long peak = kimi_read_ll(cg + "/memory.peak");
+    const long long file = kimi_read_memstat_key(cg, "file");
+    const long long active_file = kimi_read_memstat_key(cg, "active_file");
+    const long long inactive_file = kimi_read_memstat_key(cg, "inactive_file");
+    const long long anon = kimi_read_memstat_key(cg, "anon");
+    const long long pgmajfault = kimi_read_memstat_key(cg, "pgmajfault");
+    const long long pgfault = kimi_read_memstat_key(cg, "pgfault");
+    const long long refault_file = kimi_read_memstat_key(cg, "workingset_refault_file");
+    const long long pgscan_direct = kimi_read_memstat_key(cg, "pgscan_direct");
+    const long long pgsteal_direct = kimi_read_memstat_key(cg, "pgsteal_direct");
+
+    LOG_INF("[kimi_phase] label=%s n_past=%d n_consumed=%d embd=%d "
+            "memory_current=%lld memory_peak=%lld anon=%lld file=%lld active_file=%lld inactive_file=%lld "
+            "pgfault=%lld pgmajfault=%lld workingset_refault_file=%lld pgscan_direct=%lld pgsteal_direct=%lld\n",
+            label ? label : "unknown", n_past, n_consumed, embd_size,
+            current, peak, anon, file, active_file, inactive_file,
+            pgfault, pgmajfault, refault_file, pgscan_direct, pgsteal_direct);
+
+#if defined(__GNUC__) || defined(__clang__)
+    if (ggml_cuda_moe_stream_batch_phase_report) {
+        ggml_cuda_moe_stream_batch_phase_report(label);
+    }
+#else
+    ggml_cuda_moe_stream_batch_phase_report(label);
+#endif
 }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
@@ -248,6 +382,10 @@ int main(int argc, char ** argv) {
 
     std::string path_session = params.path_prompt_cache;
     std::vector<llama_token> session_tokens;
+    const bool prompt_cache_full_state = prompt_cache_full_state_enabled();
+    bool prompt_cache_save_first_token = false;
+    bool prompt_cache_force_first_token = false;
+    llama_token prompt_cache_first_token = LLAMA_TOKEN_NULL;
 
     if (!path_session.empty()) {
         LOG_INF("%s: attempting to load saved session from '%s'\n", __func__, path_session.c_str());
@@ -395,12 +533,22 @@ int main(int argc, char ** argv) {
         // Logits are not stored as part of the session state so we need to
         // "replay" the last token to get logits for sampling.
         if (!session_tokens.empty() && n_match > 0 && n_match == session_tokens.size()) {
-            if (!common_replay_last_token(ctx, session_tokens.back(), n_match)) {
-                return 1;
-            }
+            if (prompt_cache_full_state && n_match == embd_inp.size()) {
+                if (!prompt_cache_read_first_token(path_session, prompt_cache_first_token)) {
+                    LOG_ERR("%s: full-state prompt cache is missing a valid first-token sidecar\n", __func__);
+                    return 1;
+                }
+                prompt_cache_force_first_token = true;
+                session_do_save = false;
+                LOG_INF("%s: loaded full-state prompt cache; first generated token will be restored\n", __func__);
+            } else {
+                if (!common_replay_last_token(ctx, session_tokens.back(), n_match)) {
+                    return 1;
+                }
 
-            session_do_save = false;
-            LOG_INF("%s: replayed last token from session\n", __func__);
+                session_do_save = false;
+                LOG_INF("%s: replayed last token from session\n", __func__);
+            }
         }
     }
 
@@ -551,6 +699,8 @@ int main(int argc, char ** argv) {
     int n_remain           = params.n_predict;
     int n_consumed         = 0;
     int n_session_consumed = 0;
+    bool kimi_prompt_phase_started = false;
+    bool kimi_prompt_phase_reported = false;
 
     std::vector<int>   input_tokens;  g_input_tokens  = &input_tokens;
     std::vector<int>   output_tokens; g_output_tokens = &output_tokens;
@@ -691,9 +841,28 @@ int main(int argc, char ** argv) {
 
             if (!embd.empty()) {
                 const bool is_last_batch = (n_consumed >= (int) embd_inp.size());
-                const bool save_now = session_do_save && is_last_batch;
+                const bool save_now = session_do_save && is_last_batch && !prompt_cache_full_state;
+                if (!kimi_prompt_phase_started && n_past == 0) {
+                    kimi_phase_report("before_prompt_eval", n_past, n_consumed, (int) embd.size());
+                    kimi_prompt_phase_started = true;
+                }
                 if (!common_prompt_batch_decode(ctx, embd, n_past, params.n_batch, path_session, save_now)) {
                     return 1;
+                }
+                if (session_do_save && is_last_batch && prompt_cache_full_state) {
+                    if (!llama_state_save_file(
+                                ctx, path_session.c_str(), embd_inp.data(), embd_inp.size())) {
+                        LOG_ERR("%s: failed to save full-state prompt cache to '%s'\n",
+                                __func__, path_session.c_str());
+                        return 1;
+                    }
+                    prompt_cache_save_first_token = true;
+                    LOG_INF("%s: saved full prompt state to '%s', n_tokens = %zu\n",
+                            __func__, path_session.c_str(), embd_inp.size());
+                }
+                if (!kimi_prompt_phase_reported && n_consumed >= (int) embd_inp.size()) {
+                    kimi_phase_report("after_prompt_eval", n_past, n_consumed, (int) embd.size());
+                    kimi_prompt_phase_reported = true;
                 }
                 session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
                 n_session_consumed = session_tokens.size();
@@ -712,7 +881,24 @@ int main(int argc, char ** argv) {
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
 
-            const llama_token id = common_sampler_sample(smpl, ctx, -1);
+            llama_token id = LLAMA_TOKEN_NULL;
+            if (prompt_cache_force_first_token) {
+                id = prompt_cache_first_token;
+                prompt_cache_force_first_token = false;
+                LOG_INF("%s: restored first generated token from full-state prompt cache\n", __func__);
+            } else {
+                id = common_sampler_sample(smpl, ctx, -1);
+            }
+
+            if (prompt_cache_save_first_token) {
+                if (!prompt_cache_write_first_token(path_session, id)) {
+                    LOG_ERR("%s: failed to save first generated token sidecar for '%s'\n",
+                            __func__, path_session.c_str());
+                    return 1;
+                }
+                prompt_cache_save_first_token = false;
+                LOG_INF("%s: saved first generated token sidecar for full-state prompt cache\n", __func__);
+            }
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
 
@@ -992,6 +1178,7 @@ int main(int argc, char ** argv) {
     }
 
     LOG("\n\n");
+    kimi_phase_report("after_generation", n_past, n_consumed, 0);
     common_perf_print(ctx, smpl);
 
     llama_backend_free();

@@ -67,6 +67,10 @@ void string::hash_update(hasher & hash) const noexcept {
     }
 }
 
+bool string::any_parts_are_input() const {
+    return std::any_of(parts.begin(), parts.end(), [](const string_part & p) { return p.is_input; });
+}
+
 bool string::all_parts_are_input() const {
     for (const auto & part : parts) {
         if (!part.is_input) {
@@ -94,13 +98,20 @@ bool string::is_lowercase() const {
     return true;
 }
 
-// mark this string as input if other has ALL parts as input
-void string::mark_input_based_on(const string & other) {
-    if (other.all_parts_are_input()) {
-        for (auto & part : parts) {
-            part.is_input = true;
+string string::substr(size_t offset, size_t count) const {
+    string result;
+    for (const auto & part : parts) {
+        if (offset >= part.val.size()) {
+            offset -= part.val.size();
+        } else {
+            const size_t n = std::min(count, part.val.size() - offset);
+            if (n) result.parts.push_back({part.is_input, part.val.substr(offset, n)});
+            count -= n;
+            offset = 0;
         }
+        if (!count) break;
     }
+    return result;
 }
 
 string string::append(const string & other) {

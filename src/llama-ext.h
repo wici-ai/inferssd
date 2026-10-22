@@ -88,3 +88,19 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+// Draft-model staging APIs. These remain in llama-ext until the speculative API stabilizes.
+LLAMA_API void llama_set_embeddings_nextn(
+        struct llama_context * ctx, bool value, bool masked);
+LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
+LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
+
+LLAMA_API void llama_set_embeddings_layer_inp(
+        struct llama_context * ctx, uint32_t lid, bool value);
+LLAMA_API float * llama_get_embeddings_layer_inp(
+        struct llama_context * ctx, uint32_t lid);
+
+LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+
+LLAMA_API const int32_t * llama_model_target_layer_ids(const struct llama_model * model);
+LLAMA_API uint32_t llama_model_target_layer_ids_n(const struct llama_model * model);

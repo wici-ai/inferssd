@@ -23,6 +23,12 @@ void common_speculative_free(common_speculative * spec);
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, const llama_tokens & prompt);
 
+// Feed a successfully decoded target batch into target-conditioned drafters.
+bool common_speculative_process(
+        common_speculative * spec,
+        const llama_batch & batch,
+        llama_seq_id target_seq_id);
+
 // sample up to n_draft tokens and add them to the batch using the draft model
 llama_tokens common_speculative_draft(
                      common_speculative * spec,

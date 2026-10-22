@@ -328,6 +328,22 @@ llm_build_kimi_linear::llm_build_kimi_linear(const llama_model & model, const ll
             cb(cur, "ffn_out", il);
         } else {
             // MoE layer
+            if (moe_next_gate_shadow_enabled() &&
+                    il + 1 < n_layer &&
+                    (uint32_t) (il + 1) >= hparams.n_layer_dense_lead) {
+                const auto & next_layer = model.layers[il + 1];
+                build_moe_gate_topk_shadow(cur,
+                    next_layer.ffn_gate_inp,
+                    nullptr,
+                    next_layer.ffn_exp_probs_b,
+                    hparams.n_expert,
+                    hparams.n_expert_used,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il,
+                    il + 1,
+                    true);
+            }
+
             // Kimi uses moe_renormalize=True and routed_scaling_factor (stored as expert_weights_scale) = 2.446
             ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,

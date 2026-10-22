@@ -4,6 +4,7 @@
 
 #include "common.h"
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -42,15 +43,23 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 void common_sampler_free(struct common_sampler * gsmpl);
 
 // if accept_grammar is true, the token is accepted both by the sampling chain and the grammar
-void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool accept_grammar);
+void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool accept_grammar,
+                                              bool reasoning_end_token = false, bool reasoning_end_complete = false);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
+
+// loop_stop state, valid immediately after common_sampler_accept()
+bool    common_sampler_loop_stop_triggered(const struct common_sampler * gsmpl, int32_t * matched_len);
+int32_t common_sampler_loop_stop_min_len  (const struct common_sampler * gsmpl);
 
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
 
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
+
+bool common_sampler_is_budget_forcing(const struct common_sampler * gsmpl);
+void common_sampler_set_log_context(struct common_sampler * gsmpl, int32_t slot, int64_t task);
 
 // extended sampling implementation:
 //
@@ -62,7 +71,11 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 // if grammar_first is true, the grammar is applied before the samplers (slower)
 // useful in cases where all the resulting candidates (not just the sampled one) must fit the grammar
 //
-llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
+// Optional legality mask runs after budget/grammar, before the sampler chain.
+// It requires grammar_first and CPU sampling; empty intersections must throw.
+using common_sampler_pre_chain = std::function<void(llama_token_data_array &)>;
+llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx,
+                                 bool grammar_first = false, const common_sampler_pre_chain & pre_chain = {});
 
 // generalized version of common_sampler_sample
 //

@@ -1,5 +1,20 @@
 #include "reduce_rows.cuh"
 #include "sumrows.cuh"
+#include "cpu-parity.cuh"
+
+static __global__ void kimi_kda_sum_rows_cpu_parity_f32(
+        const float * x, float * dst, const int ncols) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    x += int64_t(blockIdx.x)*ncols;
+    double sum = 0.0;
+    for (int col = 0; col < ncols; ++col) {
+        sum = __dadd_rn(sum, (double) x[col]);
+    }
+    dst[blockIdx.x] = __double2float_rn(sum);
+}
 
 void sum_rows_f32_cuda(const float * x, float * dst, const int ncols, const int nrows, cudaStream_t stream) {
     const int  id  = ggml_cuda_get_device();
@@ -26,6 +41,14 @@ void ggml_cuda_op_sum_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int64_t ncols = src0->ne[0];
     const int64_t nrows = ggml_nrows(src0);
+
+    if (ncols == 7168 && ggml_cuda_kimi_kda_cpu_parity_enabled(dst)) {
+        const dim3 block_nums(nrows, 1, 1);
+        const dim3 block_dims(32, 1, 1);
+        kimi_kda_sum_rows_cpu_parity_f32<<<block_nums, block_dims, 0, stream>>>(
+            src0_d, dst_d, ncols);
+        return;
+    }
 
     const dim3 block_nums(nrows, 1, 1);
 

@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include "llama-kimi-compat.h"
+
 llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_graph_params & params) :
     llm_graph_context(params) {
     // lite variants include DeepSeek-V2-Lite, GigaChat3-10B-A1.8B
@@ -24,8 +26,11 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
     GGML_ASSERT(ext_factor >= 0.0f);
     const float attn_factor_org = attn_factor * (1.0f + 0.1f * logf(1.0f / freq_scale));
 
-    // use the original attn_factor to pre-scale the kq_scale
-    const float mscale   = attn_factor_org * (1.0f + 0.1f * hparams.rope_yarn_log_mul * logf(1.0f / freq_scale));
+    // Use the original attn_factor to pre-scale the kq_scale.
+    // Kimi K2 GGUFs report deepseek2 but use the stored yarn multiplier as-is;
+    // DeepSeek2 keeps the upstream fix that re-applies the convert factor here.
+    const float yarn_log_mul = llama_deepseek2_yarn_log_mul_for_graph(model.arch, hparams);
+    const float mscale   = attn_factor_org * (1.0f + yarn_log_mul * logf(1.0f / freq_scale));
     const float kq_scale = 1.0f * mscale * mscale / sqrtf(float(n_embd_head_k));
 
     ggml_tensor * cur;
@@ -43,7 +48,8 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    auto * inp_attn_kv = !is_mla ? build_attn_inp_kv() : nullptr;
+    const bool allow_unsplit_mla = model.arch == LLM_ARCH_GLM_DSA;
+    auto * inp_attn_kv = (!is_mla || allow_unsplit_mla) ? build_attn_inp_kv() : nullptr;
     auto * inp_attn_k  =  is_mla ? build_attn_inp_k()  : nullptr;
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
@@ -145,7 +151,7 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
             kv_cmpr = build_norm(kv_cmpr, model.layers[il].attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
             cb(kv_cmpr, "kv_cmpr", il);
 
-            if (is_mla) {
+            if (is_mla && model.layers[il].wk_b && model.layers[il].wv_b) {
                 // {n_embd_head_qk_nope, n_tokens, n_head}
                 q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
                 cb(q_nope, "q_nope_perm", il);
@@ -242,6 +248,22 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch
+            if (moe_next_gate_shadow_enabled() &&
+                    il + 1 < n_layer &&
+                    (uint32_t) (il + 1) >= hparams.n_layer_dense_lead) {
+                const auto & next_layer = model.layers[il + 1];
+                build_moe_gate_topk_shadow(cur,
+                    next_layer.ffn_gate_inp,
+                    nullptr,
+                    next_layer.ffn_exp_probs_b,
+                    hparams.n_expert,
+                    hparams.n_expert_used,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il,
+                    il + 1,
+                    true);
+            }
+
             ggml_tensor * moe_out = build_moe_ffn(cur,
                 model.layers[il].ffn_gate_inp,
                 model.layers[il].ffn_up_exps,

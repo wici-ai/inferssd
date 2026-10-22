@@ -1,5 +1,6 @@
 #include "unary.cuh"
 #include "convert.cuh"
+#include "cpu-parity.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -114,6 +115,140 @@ static __device__ __forceinline__ float op_trunc(float x) {
     return trunc(x);
 }
 
+static __device__ __forceinline__ float act_quant_pow2_scale(float amax, float max_inv, float min_amax) {
+    const float scaled = fmaxf(amax, min_amax) * max_inv;
+    return exp2f(ceilf(log2f(scaled)));
+}
+
+static __device__ __forceinline__ uint8_t fp32_to_fp8_e4m3fn(float x) {
+    if (isnan(x)) {
+        return 0x7F;
+    }
+
+    const uint8_t sign = signbit(x) ? 0x80 : 0x00;
+    const float ax = fabsf(x);
+
+    if (ax == 0.0f) {
+        return sign;
+    }
+
+    if (ax < 0x1p-6f) {
+        const int man = (int) roundf(ax * 512.0f);
+        if (man <= 0) {
+            return sign;
+        }
+        if (man >= 8) {
+            return sign | 0x08;
+        }
+        return sign | (uint8_t) man;
+    }
+
+    int exp_unbiased;
+    const float fr = frexpf(ax, &exp_unbiased);
+    exp_unbiased -= 1;
+
+    int exp = exp_unbiased + 7;
+    int man = (int) roundf((2.0f * fr - 1.0f) * 8.0f);
+    if (man == 8) {
+        man = 0;
+        exp++;
+    }
+
+    if (exp > 15 || (exp == 15 && man > 6)) {
+        return sign | 0x7E;
+    }
+
+    return sign | (uint8_t) ((exp << 3) | man);
+}
+
+static __device__ __forceinline__ float fp8_e4m3fn_to_fp32(uint8_t x) {
+    if ((x & 0x7F) == 0) {
+        return 0.0f;
+    }
+    if ((x & 0x7F) == 0x7F) {
+        return NAN;
+    }
+
+    const int sign = x >> 7;
+    const int exp  = (x >> 3) & 0x0F;
+    const int man  = x & 0x07;
+    const float val = exp == 0 ? ldexpf((float) man, -9) : ldexpf(1.0f + (float) man * 0.125f, exp - 7);
+
+    return sign ? -val : val;
+}
+
+static __device__ __forceinline__ float quant_dequant_fp8_e4m3(float x) {
+    return fp8_e4m3fn_to_fp32(fp32_to_fp8_e4m3fn(fminf(fmaxf(x, -448.0f), 448.0f)));
+}
+
+static __device__ __forceinline__ float quant_dequant_fp4_e2m1(float x) {
+    const float xc = fminf(fmaxf(x, -6.0f), 6.0f);
+    const float values[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        0.0f,-0.5f,-1.0f,-1.5f,-2.0f,-3.0f,-4.0f,-6.0f,
+    };
+
+    int best = 0;
+    float best_err = fabsf(values[0] - xc);
+#pragma unroll
+    for (int i = 1; i < 16; ++i) {
+        const float err = fabsf(values[i] - xc);
+        if (err < best_err) {
+            best = i;
+            best_err = err;
+        }
+    }
+
+    return values[best];
+}
+
+template <int mode>
+static __device__ __forceinline__ float act_quant_max_value() {
+    if constexpr (mode == 4) {
+        return 6.0f;
+    } else {
+        return 448.0f;
+    }
+}
+
+template <int mode>
+static __device__ __forceinline__ float act_quant_min_amax() {
+    if constexpr (mode == 4) {
+        return 0x1.8p-124f;
+    } else {
+        return 1.0e-4f;
+    }
+}
+
+template <int mode>
+static __device__ __forceinline__ float act_quant_dequant(float x) {
+    if constexpr (mode == 4) {
+        return quant_dequant_fp4_e2m1(x);
+    } else {
+        return quant_dequant_fp8_e4m3(x);
+    }
+}
+
+template <typename T>
+static __device__ __forceinline__ float act_quant_to_float(T x) {
+    return (float) x;
+}
+
+template <>
+__device__ __forceinline__ float act_quant_to_float<half>(half x) {
+    return __half2float(x);
+}
+
+template <typename T>
+static __device__ __forceinline__ T act_quant_from_float(float x) {
+    return (T) x;
+}
+
+template <>
+__device__ __forceinline__ half act_quant_from_float<half>(float x) {
+    return __float2half(x);
+}
+
 template <float (*op)(float), typename T>
 static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
@@ -125,10 +260,49 @@ static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
     dst[i] = (T)op((float)x[i]);
 }
 
+template <int block_size, int mode, typename T>
+static __global__ void act_quant_kernel(const T * x, T * dst, const int64_t ne0, const int64_t nrows) {
+    const int64_t groups_per_row = ne0 / block_size;
+    const int64_t group_idx = (int64_t) blockIdx.x;
+    const int64_t row = group_idx / groups_per_row;
+    const int64_t group = group_idx - row * groups_per_row;
+    const int64_t base = row * ne0 + group * block_size;
+    const int tid = threadIdx.x;
+
+    __shared__ float amax_s[64];
+    float amax = 0.0f;
+    if (tid < block_size && row < nrows) {
+        const float v = fabsf(act_quant_to_float(x[base + tid]));
+        amax = isfinite(v) ? v : 0.0f;
+    }
+    amax_s[tid] = amax;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            amax_s[tid] = fmaxf(amax_s[tid], amax_s[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float scale = act_quant_pow2_scale(amax_s[0], 1.0f / act_quant_max_value<mode>(), act_quant_min_amax<mode>());
+    const float iscale = 1.0f / scale;
+    if (tid < block_size && row < nrows) {
+        dst[base + tid] = act_quant_from_float<T>(act_quant_dequant<mode>(act_quant_to_float(x[base + tid]) * iscale) * scale);
+    }
+}
+
 template <float (*op)(float), typename T>
 static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
     unary_op_kernel<op><<<num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream>>>(x, dst, k);
+}
+
+template <int block_size, int mode, typename T>
+static void act_quant_cuda(const T * x, T * dst, const int64_t ne0, const int64_t nrows, cudaStream_t stream) {
+    GGML_ASSERT(ne0 % block_size == 0);
+    const int64_t num_groups = nrows * (ne0 / block_size);
+    act_quant_kernel<block_size, mode><<<num_groups, 64, 0, stream>>>(x, dst, ne0, nrows);
 }
 
 template <float (*op)(float)>
@@ -144,11 +318,145 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
     GGML_ASSERT(src0->type == dst->type);
 
+    if (src0->type == GGML_TYPE_F32 && ggml_cuda_kimi_kda_unary_shape(dst, src0)) {
+        if constexpr (op == op_silu) {
+            unary_cuda<ggml_cuda_kimi_silu_cpu>(
+                (const float *) src0_d, (float *) dst_d, ggml_nelements(src0), stream);
+            return;
+        }
+        if constexpr (op == op_sigmoid) {
+            unary_cuda<ggml_cuda_kimi_sigmoid_cpu>(
+                (const float *) src0_d, (float *) dst_d, ggml_nelements(src0), stream);
+            return;
+        }
+    }
+
     if (src0->type == GGML_TYPE_F16) {
         unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
     } else {
         unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
     }
+}
+
+template <int block_size, int mode>
+void ggml_cuda_op_act_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const void * src0_d = src0->data;
+    void * dst_d = dst->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(ggml_is_contiguous(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(src0->ne[0] % block_size == 0);
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == dst->type);
+
+    if (src0->type == GGML_TYPE_F16) {
+        act_quant_cuda<block_size, mode>((const half *)src0_d, (half *)dst_d, src0->ne[0], ggml_nrows(src0), stream);
+    } else {
+        act_quant_cuda<block_size, mode>((const float *)src0_d, (float *)dst_d, src0->ne[0], ggml_nrows(src0), stream);
+    }
+}
+
+static __global__ void sinkhorn_4x4_kernel(const float * src, float * dst, const int64_t n_batch) {
+    const int64_t b = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_batch) {
+        return;
+    }
+    src += 16 * b;
+    dst += 16 * b;
+    float x[4][4];
+
+    for (int r = 0; r < 4; ++r) {
+        float maxv = src[4*r + 0];
+#pragma unroll
+        for (int c = 1; c < 4; ++c) {
+            maxv = fmaxf(maxv, src[4*r + c]);
+        }
+
+        float sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            x[r][c] = expf(src[4*r + c] - maxv);
+            sum += x[r][c];
+        }
+
+        const float inv_sum = 1.0f / sum;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            x[r][c] = fmaxf(x[r][c] * inv_sum, 1e-6f);
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            sum += x[r][c];
+        }
+        const float inv_sum = 1.0f / fmaxf(sum, 1e-6f);
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            x[r][c] *= inv_sum;
+        }
+    }
+
+#pragma unroll
+    for (int it = 1; it < 20; ++it) {
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                sum += x[r][c];
+            }
+            const float inv_sum = 1.0f / fmaxf(sum, 1e-6f);
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                x[r][c] *= inv_sum;
+            }
+        }
+
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                sum += x[r][c];
+            }
+            const float inv_sum = 1.0f / fmaxf(sum, 1e-6f);
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                x[r][c] *= inv_sum;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            dst[4*r + c] = x[r][c];
+        }
+    }
+}
+
+void ggml_cuda_op_sinkhorn_4x4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->ne[0] == 4 && src0->ne[1] == 4 && src0->ne[3] == 1);
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+
+    const int64_t n_batch = src0->ne[2];
+    constexpr int block_size = 64;
+    const int64_t num_blocks = (n_batch + block_size - 1) / block_size;
+    sinkhorn_4x4_kernel<<<(unsigned int) num_blocks, block_size, 0, ctx.stream()>>>(
+            (const float *) src0->data, (float *) dst->data, n_batch);
 }
 
 void ggml_cuda_op_abs(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -245,6 +553,14 @@ void ggml_cuda_op_round(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
 void ggml_cuda_op_trunc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_trunc>(ctx, dst);
+}
+
+void ggml_cuda_op_fp4_act_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_act_quant<32, 4>(ctx, dst);
+}
+
+void ggml_cuda_op_fp8_act_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_op_act_quant<64, 8>(ctx, dst);
 }
 
 void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -419,6 +735,81 @@ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     }
 
     swiglu_oai_cuda(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), alpha, limit, stream);
+}
+
+// swiglu_clamp
+
+template <typename T>
+static __global__ void swiglu_clamp_kernel(const T * gate, const T * up, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, float limit) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t j0 = (i / n) * o0 + (i % n);
+    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+
+    dst[i] = (T) ggml_cuda_op_swiglu_clamp_single((float) gate[j0], (float) up[j1], limit);
+}
+
+template <typename T>
+static void swiglu_clamp_cuda(const T * gate, const T * up, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, const float limit, cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    swiglu_clamp_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(gate, up, dst, k, n, o0, o1, limit);
+}
+
+void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    void * src0_d = src0->data;
+    void * src1_d = src1 ? src1->data : src0->data;
+    const int64_t src0_o = src0->nb[1];
+    const int64_t src1_o = src1 ? src1->nb[1] : src0->nb[1];
+    void * dst_d = dst->data;
+    const int64_t nc = src1 ? src0->ne[0] : src0->ne[0] / 2;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(ggml_is_contiguous_1(src0));
+    GGML_ASSERT(src0->nb[0] == ggml_element_size(src0));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == dst->type);
+    GGML_ASSERT(dst->ne[0] == nc);
+    GGML_ASSERT(ggml_nrows(dst) == ggml_nrows(src0));
+
+    if (src1) {
+        GGML_ASSERT(ggml_is_contiguous_1(src1));
+        GGML_ASSERT(src1->nb[0] == ggml_element_size(src1));
+        GGML_ASSERT(src1->ne[0] == nc);
+        GGML_ASSERT(src0->type == src1->type);
+    }
+
+    const int32_t swapped = ggml_get_op_params_i32(dst, 1);
+    const float limit = ggml_get_op_params_f32(dst, 3);
+
+    if (src0->type == GGML_TYPE_F16) {
+        half * src0_p = (half *) src0_d;
+        half * src1_p = (half *) src1_d;
+
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+
+        swiglu_clamp_cuda(src0_p, src1_p, (half *) dst_d, ggml_nelements(dst), nc, src0_o / sizeof(half), src1_o / sizeof(half), limit, stream);
+    } else {
+        float * src0_p = (float *) src0_d;
+        float * src1_p = (float *) src1_d;
+
+        if (!src1) {
+            src0_p += swapped ? nc : 0;
+            src1_p += swapped ? 0 : nc;
+        }
+
+        swiglu_clamp_cuda(src0_p, src1_p, (float *) dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), limit, stream);
+    }
 }
 
 /* CUDA kernel + launcher for xIELU */
@@ -611,7 +1002,12 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
             ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node);
             break;
         case GGML_UNARY_OP_SIGMOID:
-            ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node);
+            if (unary_node->src[0]->type == GGML_TYPE_F32 &&
+                    ggml_cuda_kimi_kda_unary_shape(unary_node, unary_node->src[0])) {
+                ggml_cuda_op_unary_mul_impl<ggml_cuda_kimi_sigmoid_cpu>(ctx, unary_node, mul_node);
+            } else {
+                ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node);
+            }
             break;
         case GGML_UNARY_OP_SOFTPLUS:
             ggml_cuda_op_unary_mul_impl<op_softplus>(ctx, unary_node, mul_node);

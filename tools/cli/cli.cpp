@@ -112,7 +112,8 @@ struct cli_context {
                 task.params.sampling.reasoning_budget_end =
                     common_tokenize(vocab, chat_params.thinking_end_tag, false, true);
                 task.params.sampling.reasoning_budget_forced =
-                    common_tokenize(vocab, defaults.sampling.reasoning_budget_message + chat_params.thinking_end_tag, false, true);
+                    common_tokenize(vocab, defaults.sampling.reasoning_budget_message + chat_params.thinking_end_tag +
+                        defaults.sampling.reasoning_budget_suffix, false, true);
             }
 
             rd.post_task({std::move(task)});

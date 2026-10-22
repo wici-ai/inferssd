@@ -169,6 +169,10 @@ struct common_peg_parse_context {
     common_peg_parse_flags flags;
     common_peg_ast_arena ast;
 
+    // Optional token-origin constraint for protocol literals. Content/AST bytes
+    // are never rewritten. The callback also receives partial stream matches.
+    std::function<bool(size_t, std::string_view)> literal_allowed;
+
     int parse_depth;
 
     common_peg_parse_context(common_peg_parse_flags flags = COMMON_PEG_PARSE_FLAG_NONE)

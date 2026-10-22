@@ -9,10 +9,8 @@
 namespace jinja {
 
 // allow differentiate between user input strings and template strings
-// transformations should handle this information as follows:
-// - one-to-one (e.g., uppercase, lowercase): preserve is_input flag
-// - one-to-many (e.g., strip): if input string is marked as is_input, all resulting parts should be marked as is_input
-// - many-to-one (e.g., concat): if ALL input parts are marked as is_input, resulting part should be marked as is_input
+// Transformations retain the origin of copied bytes and transformed input.
+// Concatenation and slicing must not flatten mixed template/input provenance.
 struct string_part {
     bool is_input = false; // may skip parsing special tokens if true
     std::string val;
@@ -41,11 +39,12 @@ struct string {
     size_t length() const;
     void hash_update(hasher & hash) const noexcept;
     bool all_parts_are_input() const;
+    bool any_parts_are_input() const;
     bool is_uppercase() const;
     bool is_lowercase() const;
 
-    // mark this string as input if other has ALL parts as input
-    void mark_input_based_on(const string & other);
+    // Byte slice of a possibly mixed string; retain every source boundary.
+    string substr(size_t offset, size_t count = std::string::npos) const;
 
     string append(const string & other);
 

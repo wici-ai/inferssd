@@ -4,12 +4,15 @@
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-impl.h"
+#include "llama-kimi-compat.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-dsv4.h"
+#include "llama-memory-deepseek4.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -19,20 +22,27 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
-#include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <climits>
+#include <cinttypes>
 #include <cstdint>
-#include <cstring>
+#include <cstdlib>
 #include <cmath>
 #include <functional>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <dlfcn.h>
+#endif
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
@@ -472,6 +482,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_16x3_8B:       return "16x3.8B";
         case LLM_TYPE_10B_128x3_66B: return "10B+128x3.66B";
         case LLM_TYPE_57B_A14B:      return "57B.A14B";
+        case LLM_TYPE_816B_A42B:     return "816B.A42B";
         case LLM_TYPE_17B_16E:       return "17Bx16E (Scout)";
         case LLM_TYPE_17B_128E:      return "17Bx128E (Maverick)";
         case LLM_TYPE_A13B:          return "A13B";
@@ -655,6 +666,9 @@ struct llama_model::impl {
 
     // model memory mapped files
     llama_mmaps mappings;
+    std::vector<std::vector<llama_file_range>> expert_mmap_ranges;
+    std::vector<llama_file_range> mmap_used_ranges;
+    mutable bool expert_mmap_drop_after_prompt_done = false;
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -706,6 +720,11 @@ void llama_model::load_arch(llama_model_loader & ml) {
 void llama_model::load_hparams(llama_model_loader & ml) {
     const gguf_context * ctx = ml.metadata;
 
+    std::string dsv41_engram_encoding;
+    const bool dsv41_antirez_layout = arch == LLM_ARCH_DEEPSEEK41 &&
+        ml.get_key("deepseek41.engram.encoding", dsv41_engram_encoding, false) &&
+        dsv41_engram_encoding == "e4m3_e8m0_32_row264";
+
     // get metadata as string
     for (int i = 0; i < gguf_get_n_kv(ctx); i++) {
         gguf_type type = gguf_get_kv_type(ctx, i);
@@ -726,14 +745,22 @@ void llama_model::load_hparams(llama_model_loader & ml) {
         return;
     }
 
-    ml.get_key(LLM_KV_CONTEXT_LENGTH,          hparams.n_ctx_train);
-    ml.get_key(LLM_KV_EMBEDDING_LENGTH,        hparams.n_embd);
+    if (dsv41_antirez_layout) {
+        ml.get_key("deepseek41.max_position_embeddings", hparams.n_ctx_train);
+        ml.get_key("deepseek41.hidden_size",              hparams.n_embd);
+        ml.get_key("deepseek41.num_hidden_layers",        hparams.n_layer);
+        ml.get_key("deepseek41.n_routed_experts",         hparams.n_expert);
+        ml.get_key("deepseek41.num_experts_per_tok",      hparams.n_expert_used);
+    } else {
+        ml.get_key(LLM_KV_CONTEXT_LENGTH,   hparams.n_ctx_train);
+        ml.get_key(LLM_KV_EMBEDDING_LENGTH, hparams.n_embd);
+        ml.get_key(LLM_KV_BLOCK_COUNT,      hparams.n_layer);
+        ml.get_key(LLM_KV_EXPERT_COUNT,      hparams.n_expert,      false);
+        ml.get_key(LLM_KV_EXPERT_USED_COUNT, hparams.n_expert_used, false);
+    }
     ml.get_key(LLM_KV_EMBEDDING_LENGTH_OUT,    hparams.n_embd_out_impl, false);
     ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
-    ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer);
-    ml.get_key(LLM_KV_EXPERT_COUNT,            hparams.n_expert,        false);
-    ml.get_key(LLM_KV_EXPERT_USED_COUNT,       hparams.n_expert_used,   false);
     ml.get_key(LLM_KV_EXPERT_GROUP_COUNT,      hparams.n_expert_groups, false);
     ml.get_key(LLM_KV_EXPERT_GROUP_USED_COUNT, hparams.n_group_used,    false);
 
@@ -741,6 +768,18 @@ void llama_model::load_hparams(llama_model_loader & ml) {
         if (hparams.n_expert <= 1) {
             hparams.n_expert      = 0;
             hparams.n_expert_used = 0;
+        }
+    }
+
+    if (arch == LLM_ARCH_KIMI_K3 && hparams.n_expert_used > 0) {
+        const char * expert_used_env = std::getenv("LLAMA_K3_EXPERT_USED_OVERRIDE");
+        if (expert_used_env && expert_used_env[0]) {
+            const long expert_used = std::strtol(expert_used_env, nullptr, 10);
+            if (expert_used > 0 && expert_used <= hparams.n_expert_used) {
+                LLAMA_LOG_WARN("%s: overriding Kimi K3 active experts from %u to %ld\n",
+                        __func__, hparams.n_expert_used, expert_used);
+                hparams.n_expert_used = (uint32_t) expert_used;
+            }
         }
     }
 
@@ -788,34 +827,66 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     std::fill(hparams.swiglu_clamp_exp.begin(),   hparams.swiglu_clamp_exp.end(),   0.0f);
     std::fill(hparams.swiglu_clamp_shexp.begin(), hparams.swiglu_clamp_shexp.end(), 0.0f);
 
-    ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH,  hparams.n_ff_arr,   hparams.n_layer, false);
-    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer, false);
+    ml.get_key_or_arr(LLM_KV_FEED_FORWARD_LENGTH, hparams.n_ff_arr, hparams.n_layer, false);
+    if (dsv41_antirez_layout) {
+        uint32_t n_head = 0;
+        ml.get_key("deepseek41.num_attention_heads", n_head);
+        std::fill_n(hparams.n_head_arr.begin(), hparams.n_layer, n_head);
+    } else {
+        ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT, hparams.n_head_arr, hparams.n_layer, false);
+    }
 
     // n_head_kv is optional, default to n_head
     hparams.n_head_kv_arr = hparams.n_head_arr;
 
-    ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer, false);
+    if (dsv41_antirez_layout) {
+        uint32_t n_head_kv = 0;
+        ml.get_key("deepseek41.num_key_value_heads", n_head_kv);
+        std::fill_n(hparams.n_head_kv_arr.begin(), hparams.n_layer, n_head_kv);
+    } else {
+        ml.get_key_or_arr(LLM_KV_ATTENTION_HEAD_COUNT_KV, hparams.n_head_kv_arr, hparams.n_layer, false);
+    }
 
     bool rope_finetuned = false;
     ml.get_key(LLM_KV_ROPE_SCALING_FINETUNED, rope_finetuned, false);
     hparams.rope_finetuned = rope_finetuned;
 
     hparams.n_ctx_orig_yarn = hparams.n_ctx_train;
-    ml.get_key(LLM_KV_ROPE_SCALING_ORIG_CTX_LEN, hparams.n_ctx_orig_yarn, false);
+    if (dsv41_antirez_layout) {
+        float n_ctx_orig = 0.0f;
+        ml.get_key("deepseek41.rope_scaling.original_max_position_embeddings", n_ctx_orig);
+        if (!std::isfinite(n_ctx_orig) || n_ctx_orig < 1.0f || n_ctx_orig > (float) UINT32_MAX ||
+                std::floor(n_ctx_orig) != n_ctx_orig) {
+            throw std::runtime_error("antirez rope original context length is not an exact uint32");
+        }
+        hparams.n_ctx_orig_yarn = (uint32_t) n_ctx_orig;
+    } else {
+        ml.get_key(LLM_KV_ROPE_SCALING_ORIG_CTX_LEN, hparams.n_ctx_orig_yarn, false);
+    }
 
     // rope_freq_base (optional)
     hparams.rope_freq_base_train = 10000.0f;
-    ml.get_key(LLM_KV_ROPE_FREQ_BASE, hparams.rope_freq_base_train, false);
+    if (dsv41_antirez_layout) {
+        uint32_t rope_theta = 0;
+        ml.get_key("deepseek41.rope_theta", rope_theta);
+        hparams.rope_freq_base_train = (float) rope_theta;
+    } else {
+        ml.get_key(LLM_KV_ROPE_FREQ_BASE, hparams.rope_freq_base_train, false);
+    }
 
-    std::string rope_scaling("linear");
-    ml.get_key(LLM_KV_ROPE_SCALING_TYPE, rope_scaling, false);
+    std::string rope_scaling(dsv41_antirez_layout ? "yarn" : "linear");
+    if (!dsv41_antirez_layout) {
+        ml.get_key(LLM_KV_ROPE_SCALING_TYPE, rope_scaling, false);
+    }
     hparams.rope_scaling_type_train = llama_rope_scaling_type_from_string(rope_scaling);
     GGML_ASSERT(hparams.rope_scaling_type_train != LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED);
 
     // TODO: Handle SWA metadata similarly when models start implementing it
     // rope_freq_scale (inverse of the kv) is optional
     float ropescale = 0.0f;
-    if (!ml.get_key(LLM_KV_ROPE_SCALING_FACTOR, ropescale, false)) {
+    if (dsv41_antirez_layout) {
+        ml.get_key("deepseek41.rope_scaling.factor", ropescale);
+    } else if (!ml.get_key(LLM_KV_ROPE_SCALING_FACTOR, ropescale, false)) {
         // try the old key name
         ml.get_key(LLM_KV_ROPE_SCALE_LINEAR, ropescale, false);
     }
@@ -830,15 +901,25 @@ void llama_model::load_hparams(llama_model_loader & ml) {
         // gpt-j n_rot = rotary_dim
 
         hparams.n_embd_head_k_full = hparams.n_embd / hparams.n_head();
-        ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH, hparams.n_embd_head_k_full, false);
-
         hparams.n_embd_head_v_full = hparams.n_embd / hparams.n_head();
-        ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH, hparams.n_embd_head_v_full, false);
+        if (dsv41_antirez_layout) {
+            uint32_t head_dim = 0;
+            ml.get_key("deepseek41.head_dim", head_dim);
+            hparams.n_embd_head_k_full = head_dim;
+            hparams.n_embd_head_v_full = head_dim;
+        } else {
+            ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH,   hparams.n_embd_head_k_full, false);
+            ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH, hparams.n_embd_head_v_full, false);
+        }
 
         // sanity check for n_rot (optional)
         hparams.n_rot_full = hparams.n_embd_head_k_full;
 
-        ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT, hparams.n_rot_full, false);
+        if (dsv41_antirez_layout) {
+            ml.get_key("deepseek41.qk_rope_head_dim", hparams.n_rot_full);
+        } else {
+            ml.get_key(LLM_KV_ROPE_DIMENSION_COUNT, hparams.n_rot_full, false);
+        }
 
         if (arch == LLM_ARCH_LLAMA || arch == LLM_ARCH_DECI || arch == LLM_ARCH_FALCON || arch == LLM_ARCH_LLAMA_EMBED) {
             if (hparams.n_rot_full != hparams.n_embd_head_k_full) {
@@ -1355,6 +1436,24 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     case 64: type = LLM_TYPE_32B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
+            } break;
+        case LLM_ARCH_DFLASH:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false) || target_layer_ids.empty()) {
+                    throw std::runtime_error("DFlash model requires a non-empty target_layers array");
+                }
+                hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
+
+                if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
+                    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+                    ml.get_key_or_arr(
+                        LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+                    hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+                    hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+                }
+
+                type = LLM_TYPE_UNKNOWN;
             } break;
         case LLM_ARCH_MAINCODER:
             {
@@ -1879,6 +1978,28 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_MUSE_SPARK:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_POST_NORM_EPS,               hparams.f_post_norm_eps);
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
+                ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,          hparams.rope_freq_base_train_swa);
+                ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping);
+                ml.get_key(LLM_KV_LOGIT_SCALE,                 hparams.f_logit_scale);
+                ml.get_key(LLM_KV_MOE_LATENT_SIZE,             hparams.moe_latent_size);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
+
+                hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+                ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+
+                switch (hparams.n_layer) {
+                    case 62: type = LLM_TYPE_816B_A42B; break;
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_OPENELM:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -1994,9 +2115,12 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     }
                 }
 
-                if (ml.get_key(LLM_KV_ROPE_SCALING_YARN_LOG_MUL, hparams.rope_yarn_log_mul, 0.0f)) {
+                if (ml.get_key(LLM_KV_ROPE_SCALING_YARN_LOG_MUL, hparams.rope_yarn_log_mul, 0.0f) &&
+                        !llama_model_name_is_kimi(name)) {
                     // [TAG_DEEPSEEK2_YARN_LOG_MUL_FIX]
-                    // cancel the factor from the convert script
+                    // Cancel the factor from the convert script for DeepSeek2.
+                    // Kimi K2 GGUFs also report deepseek2, but their accepted
+                    // path uses the stored multiplier directly.
                     hparams.rope_yarn_log_mul /= 0.1f;
                 }
 
@@ -2033,6 +2157,254 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     case 12: type = LLM_TYPE_3B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
+            } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k, false);
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,     hparams.n_swa);
+                hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+                hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+                ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
+                if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP, hparams.swiglu_clamp_exp, hparams.n_layer, false)) {
+                    std::fill_n(hparams.swiglu_clamp_exp.begin(), hparams.n_layer, 10.0f);
+                }
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp, hparams.n_layer, false);
+
+                type = LLM_TYPE_UNKNOWN;
+            } break;
+        case LLM_ARCH_DEEPSEEK41:
+            {
+                // ported from upstream llama_model_deepseek4::load_arch_hparams and
+                // llama_model_deepseek41::load_arch_hparams (no MTP layers)
+                if (dsv41_antirez_layout) {
+                    ml.get_key("deepseek41.rms_norm_eps",             hparams.f_norm_rms_eps);
+                    ml.get_key("deepseek41.q_lora_rank",              hparams.n_lora_q);
+                    ml.get_key("deepseek41.sliding_window",           hparams.n_swa);
+                    ml.get_key("deepseek41.moe_intermediate_size",    hparams.n_ff_exp);
+                    ml.get_key("deepseek41.n_shared_experts",         hparams.n_expert_shared);
+                    ml.get_key("deepseek41.routed_scaling_factor",    hparams.expert_weights_scale);
+                    ml.get_key("deepseek41.norm_topk_prob",           hparams.expert_weights_norm);
+
+                    float swiglu_limit = 0.0f;
+                    ml.get_key("deepseek41.swiglu_limit", swiglu_limit);
+                    std::fill_n(hparams.swiglu_clamp_exp.begin(), hparams.n_layer, swiglu_limit);
+                    hparams.swiglu_clamp_shexp = hparams.swiglu_clamp_exp;
+
+                    ml.get_key("deepseek41.index_n_heads",   hparams.indexer_n_head);
+                    ml.get_key("deepseek41.index_head_dim",  hparams.indexer_head_size);
+                    ml.get_key("deepseek41.index_topk",      hparams.indexer_top_k);
+                    ml.get_key("deepseek41.o_groups",        hparams.dsv4_o_group_count);
+                    ml.get_key("deepseek41.o_lora_rank",     hparams.dsv4_o_lora_rank);
+                    ml.get_key("deepseek41.hc_mult",         hparams.dsv4_hc_mult);
+                    ml.get_key("deepseek41.hc_sinkhorn_iters", hparams.dsv4_hc_sinkhorn_iters);
+                    ml.get_key("deepseek41.hc_eps",          hparams.dsv4_hc_eps);
+
+                    uint32_t compress_rope_theta = 0;
+                    ml.get_key("deepseek41.compress_rope_theta", compress_rope_theta);
+                    hparams.dsv4_compress_rope_base = (float) compress_rope_theta;
+
+                    float yarn_beta_fast = 0.0f;
+                    float yarn_beta_slow = 0.0f;
+                    ml.get_key("deepseek41.rope_scaling.beta_fast", yarn_beta_fast);
+                    ml.get_key("deepseek41.rope_scaling.beta_slow", yarn_beta_slow);
+                    hparams.yarn_beta_fast = yarn_beta_fast;
+                    hparams.yarn_beta_slow = yarn_beta_slow;
+                } else {
+                    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                    ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
+                    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
+
+                    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                    ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,         hparams.n_expert_shared);
+                    ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale);
+                    ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm);
+                    ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,     hparams.swiglu_clamp_exp, hparams.n_layer);
+                    if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP, hparams.swiglu_clamp_shexp, hparams.n_layer, false)) {
+                        hparams.swiglu_clamp_shexp = hparams.swiglu_clamp_exp;
+                    }
+
+                    ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
+                    ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
+                    ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+
+                    ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         hparams.dsv4_o_group_count);
+                    ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           hparams.dsv4_o_lora_rank);
+                    ml.get_key(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,    hparams.dsv4_compress_rope_base);
+                    ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,               hparams.dsv4_hc_mult);
+                    ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+                    ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
+                }
+                // V4.1 routes every layer through the gate and writes 0 or omits the key
+                ml.get_key(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count, false);
+                if (hparams.dsv4_hash_layer_count != 0) {
+                    throw std::runtime_error("DeepSeek-V4.1 hash-routed layers are not supported");
+                }
+
+                uint32_t n_compress_ratios = 0;
+                if (dsv41_antirez_layout) {
+                    ml.get_arr_n("deepseek41.compress_ratios", n_compress_ratios);
+                } else {
+                    ml.get_arr_n(LLM_KV_ATTENTION_COMPRESS_RATIOS, n_compress_ratios);
+                }
+                if (n_compress_ratios < hparams.n_layer) {
+                    throw std::runtime_error("DeepSeek-V4.1 compress_ratios is shorter than block_count");
+                }
+                GGML_ASSERT(n_compress_ratios <= LLAMA_MAX_LAYERS);
+                if (dsv41_antirez_layout) {
+                    ml.get_arr("deepseek41.compress_ratios", hparams.dsv4_compress_ratios);
+                    std::string scoring_func;
+                    ml.get_key("deepseek41.scoring_func", scoring_func);
+                    if (scoring_func != "sqrtsoftplus") {
+                        throw std::runtime_error(format("unsupported antirez MoE scoring function: %s",
+                                                        scoring_func.c_str()));
+                    }
+                    hparams.expert_gating_func = LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS;
+                } else {
+                    ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios);
+                    ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func);
+                }
+                if (hparams.expert_gating_func != LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+                    throw std::runtime_error("DeepSeek-V4.1 expects sqrtsoftplus MoE scoring");
+                }
+
+                // every layer keeps a sliding window of raw KV; the compressed streams live in the dsv4 cache
+                hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+                hparams.set_swa_pattern(0);
+                hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+                hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+
+                ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, engram_n_layer);
+                if (engram_n_layer == 0 || engram_n_layer > LLAMA_MAX_LAYERS) {
+                    throw std::runtime_error(format("DeepSeek-V4.1 engram layer count %u is out of range", engram_n_layer));
+                }
+                ml.get_arr(LLM_KV_ENGRAM_LAYER_IDS, hparams.engram_layer_ids);
+
+                std::string engram_encoding;
+                if (ml.get_key(LLM_KV_ENGRAM_ENCODING, engram_encoding, false)) {
+                    if (engram_encoding != "e4m3_e8m0_32_row264") {
+                        throw std::runtime_error(format("unsupported DeepSeek-V4.1 engram encoding: %s",
+                                                        engram_encoding.c_str()));
+                    }
+                    hparams.engram_e4m3_e8m0_32_row264 = true;
+                    hparams.engram_n_head         = 8;
+                    hparams.engram_key_length     = 256;
+                    hparams.engram_max_ngram_size = 4;
+                    ml.get_key(LLM_KV_ENGRAM_COMPRESSED_VOCAB_SIZE, engram_compressed_vocab_size);
+                    std::vector<uint32_t> encoded_rows;
+                    ml.get_arr(LLM_KV_ENGRAM_ROWS, encoded_rows);
+                    engram_rows.assign(encoded_rows.begin(), encoded_rows.end());
+                    if (engram_n_layer != 2 || engram_rows.size() != engram_n_layer) {
+                        throw std::runtime_error("e4m3_e8m0_32_row264 Engram requires exactly two row counts");
+                    }
+                    if (engram_compressed_vocab_size == 0 ||
+                            engram_compressed_vocab_size > (uint32_t) INT32_MAX) {
+                        throw std::runtime_error("Engram compressed vocabulary is outside the int32 range");
+                    }
+                    for (uint64_t rows : engram_rows) {
+                        if (rows == 0 || rows > (uint64_t) INT32_MAX) {
+                            throw std::runtime_error("Engram row count is outside the int32 graph-index range");
+                        }
+                    }
+                } else {
+                    ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT,     hparams.engram_n_head);
+                    ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH,     hparams.engram_key_length);
+                    ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, hparams.engram_max_ngram_size);
+                }
+                ml.get_key(LLM_KV_ENGRAM_PAD_ID,         engram_pad_id);
+
+                if (hparams.engram_n_head == 0 || hparams.engram_max_ngram_size < 2) {
+                    throw std::runtime_error("DeepSeek-V4.1 engram needs at least one head and a 2-gram");
+                }
+                for (uint32_t e = 0; e < engram_n_layer; ++e) {
+                    if (hparams.engram_layer_ids[e] >= hparams.n_layer) {
+                        throw std::runtime_error(format("engram layer %u is out of range", hparams.engram_layer_ids[e]));
+                    }
+                }
+
+                ml.get_arr(LLM_KV_ENGRAM_MULTIPLIERS, engram_multipliers);
+                if (hparams.engram_e4m3_e8m0_32_row264) {
+                    // antirez stores these two arrays as U32. Keep the runtime
+                    // representation used by the existing DeepSeek-V4.1 graph,
+                    // but do not reinterpret their on-disk element types.
+                    std::vector<uint32_t> encoded_primes;
+                    std::vector<uint32_t> encoded_token_map;
+                    ml.get_arr(LLM_KV_ENGRAM_PRIMES,    encoded_primes);
+                    ml.get_arr(LLM_KV_ENGRAM_TOKEN_MAP, encoded_token_map);
+                    engram_primes.assign(encoded_primes.begin(), encoded_primes.end());
+                    engram_token_map.reserve(encoded_token_map.size());
+                    for (uint32_t token : encoded_token_map) {
+                        if (token > (uint32_t) INT32_MAX) {
+                            throw std::runtime_error("engram token map entry is outside the int32 graph-index range");
+                        }
+                        engram_token_map.push_back((int32_t) token);
+                    }
+                } else {
+                    ml.get_arr(LLM_KV_ENGRAM_PRIMES,    engram_primes);
+                    ml.get_arr(LLM_KV_ENGRAM_TOKEN_MAP, engram_token_map);
+                }
+
+                // the hash indexes straight into these, so a short array would read past the end
+                const size_t n_bucket = (size_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
+                if (engram_multipliers.size() != (size_t) engram_n_layer * hparams.engram_max_ngram_size) {
+                    throw std::runtime_error("engram multiplier count does not match layers * ngram size");
+                }
+                if (engram_primes.size() != (size_t) engram_n_layer * n_bucket) {
+                    throw std::runtime_error("engram prime count does not match layers * buckets");
+                }
+                if (hparams.engram_e4m3_e8m0_32_row264) {
+                    for (uint64_t multiplier : engram_multipliers) {
+                        if ((multiplier & 1u) == 0 ||
+                                multiplier > (uint64_t) INT64_MAX / engram_compressed_vocab_size) {
+                            throw std::runtime_error("Engram multiplier violates the antirez layout bounds");
+                        }
+                    }
+                    engram_offsets.resize(engram_primes.size());
+                    for (uint32_t e = 0; e < engram_n_layer; ++e) {
+                        uint64_t offset = 0;
+                        for (size_t b = 0; b < n_bucket; ++b) {
+                            const size_t k = (size_t) e*n_bucket + b;
+                            engram_offsets[k] = offset;
+                            if (engram_primes[k] > std::numeric_limits<uint64_t>::max() - offset) {
+                                throw std::runtime_error("engram row offsets overflow uint64");
+                            }
+                            offset += engram_primes[k];
+                        }
+                        if (offset != engram_rows[e]) {
+                            throw std::runtime_error(format(
+                                "engram layer %u prime sum (%" PRIu64 ") does not match row count (%" PRIu64 ")",
+                                e, offset, engram_rows[e]));
+                        }
+                    }
+                    if (engram_pad_id >= engram_compressed_vocab_size) {
+                        throw std::runtime_error("engram pad id is outside the compressed vocabulary");
+                    }
+                    for (int32_t token : engram_token_map) {
+                        if (token < 0 || (uint32_t) token >= engram_compressed_vocab_size) {
+                            throw std::runtime_error("engram token map entry is outside the compressed vocabulary");
+                        }
+                    }
+                } else {
+                    ml.get_arr(LLM_KV_ENGRAM_OFFSETS, engram_offsets);
+                    if (engram_offsets.size() != engram_primes.size()) {
+                        throw std::runtime_error("engram offset count does not match layers * buckets");
+                    }
+                }
+                for (uint64_t p : engram_primes) {
+                    if (p < (hparams.engram_e4m3_e8m0_32_row264 ? 2u : 1u)) {
+                        throw std::runtime_error("engram prime is below the supported minimum");
+                    }
+                }
+
+                type = LLM_TYPE_UNKNOWN;
             } break;
         case LLM_ARCH_PLM:
             {
@@ -2933,6 +3305,36 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_KIMI_K3:
+            {
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,  hparams.n_embd_head_v_mla_impl);
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q, false);
+                ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
+                ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
+                ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.n_embd_head_kda);
+                ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND,        hparams.kda_gate_lower_bound, false);
+
+                // n_head_kv == 0 marks KDA (recurrent) layers.
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    hparams.recurrent_layer_arr[i] = hparams.n_head_kv(i) == 0;
+                }
+
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,        hparams.n_expert_shared);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,  hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,       hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,        hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,         hparams.expert_gating_func);
+                ml.get_key(LLM_KV_EXPERT_LATENT_LENGTH,       hparams.n_expert_latent, false);
+
+                ml.get_key(LLM_KV_ATTN_RES_BLOCK_SIZE,         hparams.attn_res_block_size, false);
+                ml.get_key(LLM_KV_ACTIVATION_SITU_BETA,        hparams.situ_beta, false);
+                ml.get_key(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, hparams.situ_linear_beta, false);
+
+                type = LLM_TYPE_UNKNOWN;
+            } break;
         case LLM_ARCH_STEP35:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -2992,6 +3394,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
+    const llama_model_tensor_buft_override * original_tensor_buft_overrides = ml.tensor_buft_overrides;
+    std::vector<llama_model_tensor_buft_override> deferred_expert_buft_overrides;
+    std::vector<std::string> deferred_expert_buft_override_patterns;
 
     const bool use_mmap_buffer = true;
 
@@ -3071,6 +3476,63 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer);
+
+    bool defer_expert_mmap = ml.should_defer_expert_mmaps();
+    LLAMA_LOG_INFO("%s: defer expert mmap probe: defer_experts=%d use_mmap=%d expert_ranges=%zu dense=%.2f GiB deferred=%.2f GiB active=%d\n",
+            __func__,
+            ml.defer_experts ? 1 : 0,
+            ml.use_mmap ? 1 : 0,
+            ml.expert_tensor_index.file_ranges.size(),
+            ml.expert_tensor_index.dense_bytes / 1024.0 / 1024.0 / 1024.0,
+            ml.expert_tensor_index.deferred_bytes / 1024.0 / 1024.0 / 1024.0,
+            defer_expert_mmap ? 1 : 0);
+    if (defer_expert_mmap && use_mlock) {
+        LLAMA_LOG_WARN("%s: deferred expert loading disabled because mlock keeps mmap ranges resident\n", __func__);
+        defer_expert_mmap = false;
+    }
+    if (defer_expert_mmap && ml.check_tensors) {
+        LLAMA_LOG_WARN("%s: deferred expert loading disabled because tensor validation would fault expert pages eagerly\n", __func__);
+        defer_expert_mmap = false;
+    }
+    const bool defer_kimi_experts_on_gpu = llama_should_defer_kimi_experts_on_gpu(arch, name);
+    if (defer_expert_mmap && defer_kimi_experts_on_gpu && !devices.empty() && n_gpu_layers > 0) {
+        deferred_expert_buft_override_patterns.reserve(n_layer);
+        deferred_expert_buft_overrides.reserve(n_layer + 1);
+
+        for (int il = 0; il < n_layer; ++il) {
+            deferred_expert_buft_override_patterns.emplace_back(
+                    "blk\\." + std::to_string(il) + "\\.(ffn_(up|down|gate|gate_up)_(ch)?exps\\.(weight|scale|bias))");
+            deferred_expert_buft_overrides.push_back({
+                    deferred_expert_buft_override_patterns.back().c_str(),
+                    ggml_backend_cpu_buffer_type(),
+            });
+        }
+        if (original_tensor_buft_overrides) {
+            for (const llama_model_tensor_buft_override * override = original_tensor_buft_overrides; override->pattern != nullptr; ++override) {
+                deferred_expert_buft_overrides.push_back(*override);
+            }
+        }
+        deferred_expert_buft_overrides.push_back({ nullptr, nullptr });
+        ml.tensor_buft_overrides = deferred_expert_buft_overrides.data();
+
+        LLAMA_LOG_INFO("%s: keeping deferred expert tensors on CPU with %d overrides while applying %d GPU layers (arch=%s name='%s')\n",
+                __func__, n_layer, n_gpu_layers, llm_arch_name(arch), name.c_str());
+    }
+
+    // DeepSeek-V4.1 engram tables are about 100 GB each and a token reads only a few rows. Pin them
+    // to the plain CPU buffer type so they stay mmap-backed and never land in VRAM, pinned host
+    // memory or a repacked buffer. Listed first so it wins over any other override.
+    std::vector<llama_model_tensor_buft_override> engram_buft_overrides;
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        engram_buft_overrides.push_back({ "blk\\.[0-9]+\\.engram_embd\\.weight", ggml_backend_cpu_buffer_type() });
+        if (ml.tensor_buft_overrides) {
+            for (const llama_model_tensor_buft_override * override = ml.tensor_buft_overrides; override->pattern != nullptr; ++override) {
+                engram_buft_overrides.push_back(*override);
+            }
+        }
+        engram_buft_overrides.push_back({ nullptr, nullptr });
+        ml.tensor_buft_overrides = engram_buft_overrides.data();
+    }
 
     const auto TENSOR_DUPLICATED      = llama_model_loader::TENSOR_DUPLICATED;
     const auto TENSOR_NOT_REQUIRED    = llama_model_loader::TENSOR_NOT_REQUIRED;
@@ -4025,6 +4487,50 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
                         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+                    }
+                } break;
+            case LLM_ARCH_DFLASH:
+                {
+                    const int64_t n_embd_inp = hparams.n_embd_inp_enc();
+
+                    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), {n_embd_inp, n_embd}, 0);
+                    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,     "weight"), {n_embd}, 0);
+
+                    if (const auto * markov_meta = ml.get_tensor_meta("markov_w1.weight")) {
+                        const int64_t markov_rank = markov_meta->ne[0];
+                        dspark_markov_w1 = create_tensor(
+                            tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), {markov_rank, n_vocab}, 0);
+                        dspark_markov_w2 = create_tensor(
+                            tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), {markov_rank, n_vocab}, 0);
+                        dspark_conf_proj = create_tensor(
+                            tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), {n_embd + markov_rank, 1}, 0);
+                        dspark_conf_proj_b = create_tensor(
+                            tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"), {1}, TENSOR_NOT_REQUIRED);
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+                        layer.attn_norm = create_tensor(
+                            tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+                        create_tensor_qkv(
+                            layer, i, n_embd, n_embd_head_k * n_head,
+                            n_embd_gqa, n_embd_gqa, 0);
+                        layer.wo = create_tensor(
+                            tn(LLM_TENSOR_ATTN_OUT, "weight", i),
+                            {n_embd_head_k * n_head, n_embd}, 0);
+                        layer.attn_q_norm = create_tensor(
+                            tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.attn_k_norm = create_tensor(
+                            tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.ffn_norm = create_tensor(
+                            tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_gate = create_tensor(
+                            tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                        layer.ffn_down = create_tensor(
+                            tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+                        layer.ffn_up = create_tensor(
+                            tn(LLM_TENSOR_FFN_UP, "weight", i), {n_embd, n_ff}, 0);
                     }
                 } break;
             case LLM_ARCH_QWEN3MOE:
@@ -5129,6 +5635,58 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff,   n_expert}, 0);
                     }
                 } break;
+            case LLM_ARCH_MUSE_SPARK:
+                {
+
+                    const int64_t n_embd_moe = hparams.moe_latent_size;
+                    const int64_t n_ff_exp   = hparams.n_ff_exp;
+
+                    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        // Pre-attention norm. All block norms hold a delta folded at conversion time.
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+                        // Q/K/V/O projections.
+                        create_tensor_qkv(layer, i, n_embd, n_embd_head_k * n_head, n_embd_k_gqa, n_embd_v_gqa, 0);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head_k * n_head, n_embd}, 0);
+
+                        // QK-norm. Weights are synthesized at conversion to absorb the metap scale.
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
+                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
+
+                        // Attention output gate: sigmoid(gate) * attn_out before o_proj.
+                        layer.wqkv_gate = create_tensor(tn(LLM_TENSOR_ATTN_GATE, "weight", i), {n_embd, n_embd_head_k * n_head}, 0);
+
+                        // Norm preserving residual: alpha scales the stream, beta the branch.
+                        layer.attn_resid_alpha = create_tensor(tn(LLM_TENSOR_ATTN_RESID_ALPHA, "weight", i), {n_embd}, 0);
+                        layer.attn_resid_beta  = create_tensor(tn(LLM_TENSOR_ATTN_RESID_BETA,  "weight", i), {n_embd}, 0);
+
+                        layer.ffn_norm       = create_tensor(tn(LLM_TENSOR_FFN_NORM,       "weight", i), {n_embd}, 0);
+                        layer.ffn_post_norm  = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM,  "weight", i), {n_embd}, 0);
+                        layer.ffn_resid_alpha = create_tensor(tn(LLM_TENSOR_FFN_RESID_ALPHA, "weight", i), {n_embd}, 0);
+                        layer.ffn_resid_beta  = create_tensor(tn(LLM_TENSOR_FFN_RESID_BETA,  "weight", i), {n_embd}, 0);
+
+                        // Every layer routes. The router reads the full stream, the experts run
+                        // in a latent space entered by ffn_latent_down and left by ffn_latent_up.
+                        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,   "weight", i), {n_embd, n_expert}, 0);
+                        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
+
+                        layer.ffn_latent_down = create_tensor(tn(LLM_TENSOR_FFN_LATENT_DOWN, "weight", i), {n_embd, n_embd_moe}, 0);
+                        layer.ffn_latent_up   = create_tensor(tn(LLM_TENSOR_FFN_LATENT_UP,   "weight", i), {n_embd_moe, n_embd}, 0);
+
+                        layer.ffn_pre_exp_norm  = create_tensor(tn(LLM_TENSOR_FFN_PRE_EXP_NORM,  "weight", i), {n_embd_moe}, 0);
+                        layer.ffn_post_exp_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_EXP_NORM, "weight", i), {n_embd_moe}, 0);
+
+                        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd_moe, n_ff_exp, n_expert}, 0);
+                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd_moe, n_ff_exp, n_expert}, 0);
+                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd_moe, n_expert}, 0);
+                    }
+                } break;
             case LLM_ARCH_OPENELM:
                 {
                     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
@@ -5340,7 +5898,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
                         } else {
                             layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, TENSOR_NOT_REQUIRED);
+                            if (!layer.ffn_exp_probs_b) {
+                                layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                            }
 
                             if (n_expert == 0) {
                                 throw std::runtime_error("n_expert must be > 0");
@@ -5394,7 +5955,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
                         } else {
                             layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, TENSOR_NOT_REQUIRED);
 
                             if (n_expert == 0) {
                                 throw std::runtime_error("n_expert must be > 0");
@@ -5411,6 +5972,311 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
                             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {        n_ff_exp * n_expert_shared, n_embd}, 0);
                             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_exp * n_expert_shared}, 0);
+                        }
+                    }
+                } break;
+            case LLM_ARCH_DEEPSEEK4:
+                {
+                    const int64_t q_lora_rank = hparams.n_lora_q;
+                    const int64_t n_ff_exp = hparams.n_ff_exp;
+                    const int64_t n_expert_shared = hparams.n_expert_shared;
+                    const int64_t n_embd_head = hparams.n_embd_head_k();
+
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
+                    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+                    if (!output) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+                    }
+
+                    int64_t hc_mult = 0;
+                    {
+                        const auto * meta_base  = ml.get_tensor_meta(tn(LLM_TENSOR_HC_HEAD_BASE).str().c_str());
+                        const auto * meta_fn    = ml.get_tensor_meta(tn(LLM_TENSOR_HC_HEAD_FN).str().c_str());
+                        const auto * meta_scale = ml.get_tensor_meta(tn(LLM_TENSOR_HC_HEAD_SCALE).str().c_str());
+
+                        hc_mult = meta_base ? meta_base->ne[0] : (meta_fn ? meta_fn->ne[1] : 4);
+                        const int64_t hc_fn_in     = meta_fn    ? meta_fn->ne[0]    : n_embd * hc_mult;
+                        const int64_t hc_fn_out    = meta_fn    ? meta_fn->ne[1]    : hc_mult;
+                        const int64_t hc_scale_len = meta_scale ? meta_scale->ne[0] : 1;
+
+                        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE),  { hc_mult }, 0);
+                        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN),    { hc_fn_in, hc_fn_out }, 0);
+                        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE), { hc_scale_len }, 0);
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), { n_embd }, 0);
+                        layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i), { q_lora_rank }, 0);
+                        layer.attn_kv_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), { n_embd_head }, 0);
+
+                        layer.wq_a = create_tensor(tn(LLM_TENSOR_ATTN_Q_A, "weight", i), { n_embd, q_lora_rank }, 0);
+                        layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q_B, "weight", i), { q_lora_rank, n_head * n_embd_head }, 0);
+                        layer.attn_kv_latent = create_tensor(tn(LLM_TENSOR_ATTN_KV_LATENT, "weight", i), { n_embd, n_embd_head }, 0);
+
+                        {
+                            const auto * meta_wo_a = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_OUT_A, "weight", i).str().c_str());
+                            const auto * meta_wo_b = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_OUT_B, "weight", i).str().c_str());
+                            const int64_t group_dim = n_embd_head;
+                            const int64_t n_groups = n_head * n_embd_head / group_dim;
+                            const int64_t o_rank = std::max<int64_t>(1, group_dim / 2);
+                            const int64_t wo_a_ne0 = meta_wo_a ? meta_wo_a->ne[0] : group_dim;
+                            const int64_t wo_a_ne1 = meta_wo_a ? meta_wo_a->ne[1] : n_groups * o_rank;
+                            const int64_t wo_b_ne0 = meta_wo_b ? meta_wo_b->ne[0] : n_groups * o_rank;
+                            const int64_t wo_b_ne1 = meta_wo_b ? meta_wo_b->ne[1] : n_embd;
+                            layer.attn_out_a = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A, "weight", i), { wo_a_ne0, wo_a_ne1 }, 0);
+                            layer.attn_out_b = create_tensor(tn(LLM_TENSOR_ATTN_OUT_B, "weight", i), { wo_b_ne0, wo_b_ne1 }, 0);
+                        }
+
+                        layer.attn_sinks = create_tensor(tn(LLM_TENSOR_ATTN_SINKS, i), { n_head }, 0);
+
+                        if (const auto * meta_ape = ml.get_tensor_meta(tn(LLM_TENSOR_ATTN_COMPRESS_APE, i).str().c_str())) {
+                            layer.attn_compress_ape = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESS_APE, i), { meta_ape->ne[0], meta_ape->ne[1] }, 0);
+                            layer.attn_compress_norm = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESS_NORM, "weight", i), { n_embd_head }, 0);
+                            layer.attn_compress_kv = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESS_KV, "weight", i), { n_embd, meta_ape->ne[0] }, 0);
+                            layer.attn_compress_gate = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESS_GATE, "weight", i), { n_embd, meta_ape->ne[0] }, 0);
+                        }
+
+                        if (const auto * meta_indexer_proj = ml.get_tensor_meta(tn(LLM_TENSOR_INDEXER_PROJ, "weight", i).str().c_str())) {
+                            layer.indexer_proj = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ, "weight", i), { meta_indexer_proj->ne[0], meta_indexer_proj->ne[1] }, 0);
+                            layer.indexer_attn_q_b = create_tensor(
+                                tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i),
+                                { q_lora_rank, hparams.indexer_n_head * hparams.indexer_head_size },
+                                0);
+
+                            const auto * meta_ape = ml.require_tensor_meta(tn(LLM_TENSOR_INDEXER_COMPRESS_APE, i).str());
+                            layer.indexer_compress_ape = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESS_APE, i), { meta_ape->ne[0], meta_ape->ne[1] }, 0);
+                            layer.indexer_compress_norm = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESS_NORM, "weight", i), { hparams.indexer_head_size }, 0);
+                            layer.indexer_compress_kv = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESS_KV, "weight", i), { n_embd, meta_ape->ne[0] }, 0);
+                            layer.indexer_compress_gate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESS_GATE, "weight", i), { n_embd, meta_ape->ne[0] }, 0);
+                        }
+
+                        {
+                            const auto * meta_hc_attn_base  = ml.get_tensor_meta(tn(LLM_TENSOR_HC_ATTN_BASE, i).str().c_str());
+                            const auto * meta_hc_attn_fn    = ml.get_tensor_meta(tn(LLM_TENSOR_HC_ATTN_FN, i).str().c_str());
+                            const auto * meta_hc_attn_scale = ml.get_tensor_meta(tn(LLM_TENSOR_HC_ATTN_SCALE, i).str().c_str());
+                            const auto * meta_hc_ffn_base   = ml.get_tensor_meta(tn(LLM_TENSOR_HC_FFN_BASE, i).str().c_str());
+                            const auto * meta_hc_ffn_fn     = ml.get_tensor_meta(tn(LLM_TENSOR_HC_FFN_FN, i).str().c_str());
+                            const auto * meta_hc_ffn_scale  = ml.get_tensor_meta(tn(LLM_TENSOR_HC_FFN_SCALE, i).str().c_str());
+                            const int64_t hc_pre_out = 2 * hc_mult + hc_mult * hc_mult;
+                            const int64_t hc_attn_base_ne  = meta_hc_attn_base  ? meta_hc_attn_base->ne[0]  : hc_pre_out;
+                            const int64_t hc_attn_fn_ne0   = meta_hc_attn_fn    ? meta_hc_attn_fn->ne[0]    : n_embd * hc_mult;
+                            const int64_t hc_attn_fn_ne1   = meta_hc_attn_fn    ? meta_hc_attn_fn->ne[1]    : hc_pre_out;
+                            const int64_t hc_attn_scale_ne = meta_hc_attn_scale ? meta_hc_attn_scale->ne[0] : 3;
+                            const int64_t hc_ffn_base_ne   = meta_hc_ffn_base   ? meta_hc_ffn_base->ne[0]   : hc_pre_out;
+                            const int64_t hc_ffn_fn_ne0    = meta_hc_ffn_fn     ? meta_hc_ffn_fn->ne[0]     : n_embd * hc_mult;
+                            const int64_t hc_ffn_fn_ne1    = meta_hc_ffn_fn     ? meta_hc_ffn_fn->ne[1]     : hc_pre_out;
+                            const int64_t hc_ffn_scale_ne  = meta_hc_ffn_scale  ? meta_hc_ffn_scale->ne[0]  : 3;
+
+                            layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE, i),  { hc_attn_base_ne }, 0);
+                            layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN, i),    { hc_attn_fn_ne0, hc_attn_fn_ne1 }, 0);
+                            layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, i), { hc_attn_scale_ne }, 0);
+                            layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE, i),   { hc_ffn_base_ne }, 0);
+                            layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN, i),     { hc_ffn_fn_ne0, hc_ffn_fn_ne1 }, 0);
+                            layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE, i),  { hc_ffn_scale_ne }, 0);
+                        }
+
+                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), { n_embd }, 0);
+                        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), { n_embd, n_expert }, 0);
+                        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), { n_expert }, TENSOR_NOT_REQUIRED);
+
+                        {
+                            const LLM_TN_IMPL tid2eid_tn = tn(LLM_TENSOR_FFN_GATE_TID2EID, i);
+                            const LLM_TN_IMPL tid2eid_weight_tn = tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i);
+                            const char * alias_env = std::getenv("LLAMA_DEEPSEEK4_TID2EID_WEIGHT_ALIAS");
+                            const bool use_weight_alias = alias_env && alias_env[0] && alias_env[0] != '0';
+                            const auto * meta_tid2eid = ml.get_tensor_meta(tid2eid_tn.str().c_str());
+                            const bool use_alias = !meta_tid2eid && use_weight_alias &&
+                                ml.get_tensor_meta(tid2eid_weight_tn.str().c_str());
+                            if (meta_tid2eid || use_alias) {
+                                const LLM_TN_IMPL & selected_tid2eid_tn = use_alias ? tid2eid_weight_tn : tid2eid_tn;
+                                const auto * selected_meta = use_alias ? ml.get_tensor_meta(tid2eid_weight_tn.str().c_str()) : meta_tid2eid;
+                                layer.ffn_gate_tid2eid = create_tensor(selected_tid2eid_tn, { selected_meta->ne[0], selected_meta->ne[1] }, 0);
+                            }
+                        }
+
+                        if (n_expert == 0) {
+                            throw std::runtime_error("n_expert must be > 0");
+                        }
+                        if (n_expert_used == 0) {
+                            throw std::runtime_error("n_expert_used must be > 0");
+                        }
+
+                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
+                        create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
+
+                        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), { n_embd, n_ff_exp * n_expert_shared }, 0);
+                        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), { n_ff_exp * n_expert_shared, n_embd }, 0);
+                        layer.ffn_up_shexp = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP, "weight", i), { n_embd, n_ff_exp * n_expert_shared }, 0);
+                    }
+                } break;
+            case LLM_ARCH_DEEPSEEK41:
+                {
+                    // ported from upstream llama_model_deepseek41::load_arch_tensors
+                    const int64_t q_lora_rank     = hparams.n_lora_q;
+                    const int64_t n_ff_exp        = hparams.n_ff_exp;
+                    const int64_t n_expert_shared = hparams.n_expert_shared;
+
+                    const int64_t n_embd_head    = hparams.n_embd_head_k();
+                    const int64_t o_groups       = hparams.dsv4_o_group_count;
+                    const int64_t o_lora_rank    = hparams.dsv4_o_lora_rank;
+                    const int64_t hc_mult        = hparams.dsv4_hc_mult;
+                    const int64_t hc_dim         = hc_mult * n_embd;
+                    const int64_t hc_mix_dim     = (2 + hc_mult) * hc_mult;
+                    const int64_t n_embd_indexer = hparams.indexer_head_size;
+
+                    if ((size_t) n_vocab > engram_token_map.size()) {
+                        throw std::runtime_error(format("engram token map has %zu entries, too few for %" PRId64 " tokens",
+                                                        engram_token_map.size(), n_vocab));
+                    }
+
+                    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", i), {n_embd}, 0);
+                        layer.attn_sinks    = create_tensor(tn(LLM_TENSOR_ATTN_SINKS,     "weight", i), {n_head}, 0);
+                        layer.wq_a          = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,       "weight", i), {n_embd, q_lora_rank}, 0);
+                        layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,  "weight", i), {q_lora_rank}, 0);
+                        layer.wq_b          = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,       "weight", i), {q_lora_rank, n_head * n_embd_head}, 0);
+                        layer.wkv           = create_tensor(tn(LLM_TENSOR_ATTN_KV,        "weight", i), {n_embd, n_embd_head}, 0);
+                        layer.attn_kv_norm  = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i), {n_embd_head}, 0);
+                        // the file lays wo_a out as (n_head * n_embd_head / o_groups, o_lora_rank * o_groups);
+                        // upstream reshapes it at load, this loader keeps it 2D and the graph reshapes it
+                        layer.wo_a          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A,     "weight", i), {n_head * n_embd_head / o_groups, o_lora_rank * o_groups}, 0);
+                        layer.wo_b          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_B,     "weight", i), {o_groups * o_lora_rank, n_embd}, 0);
+
+                        layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix_dim}, 0);
+                        layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim}, 0);
+                        layer.hc_attn_scale = create_tensor(tn(LLM_TENSOR_HC_ATTN_SCALE, "weight", i), {3}, 0);
+                        layer.hc_ffn_fn     = create_tensor(tn(LLM_TENSOR_HC_FFN_FN,     "weight", i), {hc_dim, hc_mix_dim}, 0);
+                        layer.hc_ffn_base   = create_tensor(tn(LLM_TENSOR_HC_FFN_BASE,   "weight", i), {hc_mix_dim}, 0);
+                        layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, 0);
+
+                        // only the KV source layers carry a compressor, and only those with a ratio above 1 pool
+                        // with a gate, so both are optional rather than keyed off the ratio
+                        layer.attn_comp_wkv   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   "weight", i), {n_embd, n_embd_head}, TENSOR_NOT_REQUIRED);
+                        layer.attn_comp_wgate = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, "weight", i), {n_embd, n_embd_head}, TENSOR_NOT_REQUIRED);
+                        layer.attn_comp_norm  = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_NORM,  "weight", i), {n_embd_head}, TENSOR_NOT_REQUIRED);
+
+                        // an index source scores queries against shared index keys; only a layer that also
+                        // compresses its own KV builds those keys, the rest read what an earlier layer published
+                        layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * n_embd_indexer}, TENSOR_NOT_REQUIRED);
+                        layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, hparams.indexer_n_head}, TENSOR_NOT_REQUIRED);
+                        layer.indexer_attn_k   = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K,   "weight", i), {n_embd_head, n_embd_indexer}, TENSOR_NOT_REQUIRED);
+                        layer.indexer_k_norm   = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM,   "weight", i), {n_embd_indexer}, TENSOR_NOT_REQUIRED);
+
+                        layer.ffn_gate_inp       = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,       "weight", i), {n_embd, n_expert}, 0);
+                        layer.ffn_exp_probs_b    = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,    "bias",   i), {n_expert}, 0);
+                        // vision variant only: routing bias for image tokens
+                        layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_norm           = create_tensor(tn(LLM_TENSOR_FFN_NORM,           "weight", i), {n_embd}, 0);
+
+                        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, 0);
+                        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
+
+                        layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
+                        layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    }, 0);
+                        layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, 0);
+
+                        const int eg = engram_index(i);
+                        if (eg >= 0) {
+                            const int64_t n_cols  = (int64_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
+                            const int64_t key_len = hparams.engram_key_length;
+
+                            // hundreds of millions of rows, but each token touches only n_cols of them; the
+                            // table is pinned to a plain CPU buffer (see the override above) so rows page in on demand
+                            const std::string embd_name = tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i).str();
+                            const auto * embd_meta = ml.get_tensor_meta(embd_name.c_str());
+                            if (embd_meta == nullptr) {
+                                throw std::runtime_error(format("%s is missing", embd_name.c_str()));
+                            }
+                            const int64_t n_rows = embd_meta->ne[1];
+                            int64_t row_width = key_len;
+                            if (hparams.engram_e4m3_e8m0_32_row264) {
+                                row_width = 264;
+                                if (embd_meta->type != GGML_TYPE_I8 || embd_meta->ne[0] != row_width ||
+                                        embd_meta->ne[2] != 1 || embd_meta->ne[3] != 1) {
+                                    throw std::runtime_error(format(
+                                        "%s must be I8 [264, rows] for e4m3_e8m0_32_row264", embd_name.c_str()));
+                                }
+                                if ((uint64_t) n_rows != engram_rows[eg]) {
+                                    throw std::runtime_error(format(
+                                        "%s has %" PRId64 " rows, metadata declares %" PRIu64,
+                                        embd_name.c_str(), n_rows, engram_rows[eg]));
+                                }
+                            }
+
+                            // a row index is a bucket offset plus a hash, so the last bucket has to end inside
+                            uint64_t max_row = 0;
+                            for (int64_t b = 0; b < n_cols; ++b) {
+                                const size_t k = (size_t) eg*n_cols + b;
+                                max_row = std::max(max_row, engram_offsets[k] + engram_primes[k]);
+                            }
+                            if ((int64_t) max_row > n_rows) {
+                                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the engram buckets (%" PRIu64 ")",
+                                                                embd_name.c_str(), n_rows, max_row));
+                            }
+
+                            layer.engram_embd = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {row_width, n_rows}, 0);
+                            layer.engram_wkv  = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV,  "weight", i), {n_cols * key_len, n_embd * (hc_mult + 1)}, 0);
+                            layer.engram_q    = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,    "weight", i), {n_embd, hc_mult}, 0);
+                            layer.engram_k    = create_tensor(tn(LLM_TENSOR_ENGRAM_K,    "weight", i), {n_embd, hc_mult}, 0);
+                        }
+                    }
+
+                    // Work out which layer publishes the stream each layer reads. Only a source carries a
+                    // compressor, only an index key owner carries indexer_attn_k, and only an index source
+                    // carries indexer_attn_q_b, so the file itself says which layer plays which role.
+                    hparams.dsv41_kv_source.fill(-1);
+                    hparams.dsv41_index_key_source.fill(-1);
+                    hparams.dsv41_topk_source.fill(-1);
+
+                    int32_t last_kv_source    = -1;
+                    int32_t last_key_owner    = -1;
+                    int32_t last_index_source = -1;
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        const auto & layer = layers[i];
+
+                        if (layer.attn_comp_wkv)    { last_kv_source    = i; }
+                        if (layer.indexer_attn_k)   { last_key_owner    = i; }
+                        if (layer.indexer_attn_q_b) { last_index_source = i; }
+
+                        if (hparams.dsv4_compress_ratios[i] == 0) {
+                            // pure sliding window, no compressed stream to read
+                            continue;
+                        }
+
+                        if (last_kv_source < 0 || last_key_owner < 0 || last_index_source < 0) {
+                            throw std::runtime_error(format("layer %d reads a compressed stream before any layer publishes one", i));
+                        }
+
+                        // the row layout of a stream follows the ratio it was compressed at, so a reader that
+                        // disagrees with its source would index into rows that stand for different positions
+                        if (hparams.dsv4_compress_ratios[i] != hparams.dsv4_compress_ratios[last_kv_source]) {
+                            throw std::runtime_error(format("layer %d compresses at ratio %u but reads layer %d, compressed at %u",
+                                                            i, hparams.dsv4_compress_ratios[i],
+                                                            last_kv_source, hparams.dsv4_compress_ratios[last_kv_source]));
+                        }
+
+                        hparams.dsv41_kv_source[i]        = last_kv_source;
+                        hparams.dsv41_index_key_source[i] = last_key_owner;
+                        hparams.dsv41_topk_source[i]      = last_index_source;
+                    }
+
+                    // a compressor with no gate only makes sense where there is nothing to pool
+                    for (int i = 0; i < n_layer; ++i) {
+                        if (hparams.dsv41_is_kv_source(i) && !layers[i].attn_comp_wgate && hparams.dsv4_compress_ratios[i] != 1) {
+                            throw std::runtime_error(format("layer %d compresses %u tokens per row but has no pooling gate",
+                                                            i, hparams.dsv4_compress_ratios[i]));
                         }
                     }
                 } break;
@@ -5776,7 +6642,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             // MoE layers
                             layer.ffn_gate_inp =
                                 create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), { n_embd, n_expert }, flags);
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), { n_expert }, flags);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), { n_expert }, flags);
 
                             // MoE branch
                             const int64_t n_ff_exp = hparams.n_ff_exp ? hparams.n_ff_exp : n_ff / n_expert_used;
@@ -5888,7 +6754,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, flags);
                         } else {
                             layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, flags);
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, TENSOR_NOT_REQUIRED);
 
                             if (n_expert == 0) {
                                 throw std::runtime_error("n_expert must be > 0");
@@ -6016,7 +6882,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                 const int64_t n_ff_shexp = hparams.n_ff_shexp;
 
                                 layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert}, 0);
-                                layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert         }, 0);
+                                layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert         }, 0);
 
                                 // MoE branch
                                 layer.ffn_latent_down = create_tensor(tn(LLM_TENSOR_FFN_LATENT_DOWN, "weight", i), {n_embd, moe_n_embd}, TENSOR_NOT_REQUIRED);
@@ -6144,7 +7010,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff}, flags);
                         } else {
                             layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert}, flags);
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED | flags);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, TENSOR_NOT_REQUIRED | flags);
 
                             if (n_expert == 0) {
                                 throw std::runtime_error("n_expert must be > 0");
@@ -6638,7 +7504,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             const int64_t n_ff_shexp = (hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff_exp) * n_expert_shared;
 
                             layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, flags);
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED | flags);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, TENSOR_NOT_REQUIRED | flags);
 
                             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, flags);
                             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, flags);
@@ -6694,7 +7560,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
                         } else {
                             layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, TENSOR_NOT_REQUIRED);
 
                             if (n_expert == 0) {
                                 throw std::runtime_error("n_expert must be > 0");
@@ -6785,7 +7651,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         if (static_cast<uint32_t>(i) >= hparams.n_layer_dense_lead) {
                             // MoE layers
                             layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, 0);
 
                             // grouped expert weights
                             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
@@ -6838,7 +7704,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             int n_ff_exp = hparams.n_ff_exp;
 
                             layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), {n_embd, n_expert}, 0);
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, TENSOR_NOT_REQUIRED);
                             layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, TENSOR_NOT_REQUIRED);
                             layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {  n_ff_exp, n_embd, n_expert}, 0);
                             layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, 0);
@@ -7082,7 +7948,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_gate_exps   = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, hparams.n_ff_exp, n_expert}, 0);
                             layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {hparams.n_ff_exp,   n_embd, n_expert}, 0);
                             layer.ffn_up_exps     = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i),   {n_embd, hparams.n_ff_exp, n_expert}, 0);
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, 0);
                         } else {  // dense
                             layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
                             layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
@@ -7251,7 +8117,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff,   n_expert}, 0);
                         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff,   n_embd, n_expert}, 0);
                         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff,   n_expert}, 0);
-                        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
+                        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, 0);
                     }
                 } break;
             case LLM_ARCH_KIMI_LINEAR:
@@ -7383,7 +8249,211 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp_actual, n_embd}, TENSOR_NOT_REQUIRED);
                             layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp_actual}, TENSOR_NOT_REQUIRED);
 
-                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, 0);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, 0);
+                        }
+                    }
+                } break;
+            case LLM_ARCH_KIMI_K3:
+                {
+                    const int64_t n_embd_latent =
+                        hparams.n_expert_latent > 0 ? hparams.n_expert_latent : n_embd;
+
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
+
+                    if (hparams.attn_res_block_size > 0) {
+                        output_res_score =
+                            create_tensor(tn(LLM_TENSOR_OUTPUT_RES_SCORE, "weight"), {n_embd}, 0);
+                    }
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, 0);
+
+                        if (hparams.attn_res_block_size > 0) {
+                            layer.attn_res_score =
+                                create_tensor(tn(LLM_TENSOR_ATTN_RES_SCORE, "weight", i), {n_embd}, 0);
+                            layer.ffn_res_score =
+                                create_tensor(tn(LLM_TENSOR_FFN_RES_SCORE, "weight", i), {n_embd}, 0);
+                        }
+
+                        const int64_t head_dim = hparams.n_embd_head_kda;
+                        const int64_t d_conv   = hparams.ssm_d_conv;
+                        const int64_t d_inner  = head_dim * n_head;
+
+                        if (hparams.is_recurrent(i)) {
+                            auto conv = [&](llm_tensor tid) {
+                                ggml_tensor * tensor = create_tensor(
+                                    tn(tid, "weight", i),
+                                    {d_conv, 1, d_inner, 1},
+                                    TENSOR_NOT_REQUIRED);
+                                return tensor
+                                    ? tensor
+                                    : create_tensor(tn(tid, "weight", i), {d_conv, 1, d_inner}, 0);
+                            };
+
+                            layer.ssm_q_conv = conv(LLM_TENSOR_SSM_CONV1D_Q);
+                            layer.ssm_k_conv = conv(LLM_TENSOR_SSM_CONV1D_K);
+                            layer.ssm_v_conv = conv(LLM_TENSOR_SSM_CONV1D_V);
+
+                            create_tensor_qkv(layer, i, n_embd, d_inner, d_inner, d_inner, 0);
+
+                            layer.ssm_f_a =
+                                create_tensor(tn(LLM_TENSOR_SSM_F_A, "weight", i), {n_embd, head_dim}, 0);
+                            layer.ssm_f_b =
+                                create_tensor(tn(LLM_TENSOR_SSM_F_B, "weight", i), {head_dim, d_inner}, 0);
+                            layer.ssm_beta =
+                                create_tensor(tn(LLM_TENSOR_SSM_BETA, "weight", i), {n_embd, n_head}, 0);
+
+                            layer.ssm_a =
+                                create_tensor(tn(LLM_TENSOR_SSM_A, i), {n_head}, TENSOR_NOT_REQUIRED);
+                            if (!layer.ssm_a) {
+                                layer.ssm_a = create_tensor(
+                                    tn(LLM_TENSOR_SSM_A, i),
+                                    {1, n_head, 1, 1},
+                                    TENSOR_NOT_REQUIRED);
+                            }
+                            if (!layer.ssm_a) {
+                                layer.ssm_a =
+                                    create_tensor(tn(LLM_TENSOR_SSM_A, i), {1, n_head}, 0);
+                            }
+
+                            layer.ssm_dt_b =
+                                create_tensor(tn(LLM_TENSOR_SSM_DT, "bias", i), {d_inner}, 0);
+                            layer.ssm_g =
+                                create_tensor(tn(LLM_TENSOR_SSM_G, "weight", i), {n_embd, d_inner}, 0);
+                            layer.ssm_o_norm =
+                                create_tensor(tn(LLM_TENSOR_SSM_NORM, "weight", i), {head_dim}, 0);
+                            layer.wo =
+                                create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {d_inner, n_embd}, 0);
+                        } else {
+                            const int64_t q_lora_rank      = hparams.n_lora_q;
+                            const int64_t kv_lora_rank     = hparams.n_lora_kv;
+                            const int64_t n_embd_head_k_mla = hparams.n_embd_head_k_mla();
+                            const int64_t n_embd_head_v_mla = hparams.n_embd_head_v_mla();
+                            const int64_t qk_rope_head_dim = hparams.n_rot();
+                            const int64_t qk_nope_head_dim =
+                                n_embd_head_k_mla - qk_rope_head_dim;
+
+                            layer.attn_q_a_norm = create_tensor(
+                                tn(LLM_TENSOR_ATTN_Q_A_NORM, "weight", i),
+                                {q_lora_rank},
+                                TENSOR_NOT_REQUIRED);
+                            layer.attn_kv_a_norm = create_tensor(
+                                tn(LLM_TENSOR_ATTN_KV_A_NORM, "weight", i),
+                                {kv_lora_rank},
+                                0);
+
+                            if (layer.attn_q_a_norm) {
+                                layer.wq_a = create_tensor(
+                                    tn(LLM_TENSOR_ATTN_Q_A, "weight", i),
+                                    {n_embd, q_lora_rank},
+                                    0);
+                                layer.wq_b = create_tensor(
+                                    tn(LLM_TENSOR_ATTN_Q_B, "weight", i),
+                                    {q_lora_rank, n_head * n_embd_head_k_mla},
+                                    0);
+                            } else {
+                                layer.wq = create_tensor(
+                                    tn(LLM_TENSOR_ATTN_Q, "weight", i),
+                                    {n_embd, n_head * n_embd_head_k_mla},
+                                    0);
+                            }
+
+                            layer.wkv_a_mqa = create_tensor(
+                                tn(LLM_TENSOR_ATTN_KV_A_MQA, "weight", i),
+                                {n_embd, kv_lora_rank + qk_rope_head_dim},
+                                0);
+                            layer.wkv_b = create_tensor(
+                                tn(LLM_TENSOR_ATTN_KV_B, "weight", i),
+                                {kv_lora_rank, n_head * (qk_nope_head_dim + n_embd_head_v_mla)},
+                                TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+                            if (!layer.wkv_b) {
+                                layer.wk_b = create_tensor(
+                                    tn(LLM_TENSOR_ATTN_K_B, "weight", i),
+                                    {qk_nope_head_dim, kv_lora_rank, n_head},
+                                    0);
+                                layer.wv_b = create_tensor(
+                                    tn(LLM_TENSOR_ATTN_V_B, "weight", i),
+                                    {kv_lora_rank, n_embd_head_v_mla, n_head},
+                                    0);
+                            }
+
+                            layer.wqkv_gate = create_tensor(
+                                tn(LLM_TENSOR_ATTN_GATE, "weight", i),
+                                {n_embd, n_head * n_embd_head_v_mla},
+                                TENSOR_NOT_REQUIRED);
+                            layer.wo = create_tensor(
+                                tn(LLM_TENSOR_ATTN_OUT, "weight", i),
+                                {n_head * n_embd_head_v_mla, n_embd},
+                                0);
+                        }
+
+                        if (i < (int) hparams.n_layer_dense_lead) {
+                            layer.ffn_gate =
+                                create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
+                            layer.ffn_down =
+                                create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+                            layer.ffn_up =
+                                create_tensor(tn(LLM_TENSOR_FFN_UP, "weight", i), {n_embd, n_ff}, 0);
+                        } else {
+                            const int64_t n_ff_exp = hparams.n_ff_exp;
+
+                            layer.ffn_gate_inp = create_tensor(
+                                tn(LLM_TENSOR_FFN_GATE_INP, "weight", i),
+                                {n_embd, n_expert},
+                                0);
+                            layer.ffn_exp_probs_b = create_tensor(
+                                tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i),
+                                {n_expert},
+                                0);
+
+                            layer.ffn_gate_exps = create_tensor(
+                                tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i),
+                                {n_embd_latent, n_ff_exp, n_expert},
+                                0);
+                            layer.ffn_down_exps = create_tensor(
+                                tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i),
+                                {n_ff_exp, n_embd_latent, n_expert},
+                                0);
+                            layer.ffn_up_exps = create_tensor(
+                                tn(LLM_TENSOR_FFN_UP_EXPS, "weight", i),
+                                {n_embd_latent, n_ff_exp, n_expert},
+                                0);
+
+                            if (hparams.n_expert_latent > 0) {
+                                layer.ffn_routed_down = create_tensor(
+                                    tn(LLM_TENSOR_FFN_ROUTED_DOWN, "weight", i),
+                                    {n_embd, n_embd_latent},
+                                    0);
+                                layer.ffn_routed_up = create_tensor(
+                                    tn(LLM_TENSOR_FFN_ROUTED_UP, "weight", i),
+                                    {n_embd_latent, n_embd},
+                                    0);
+                                layer.ffn_routed_norm = create_tensor(
+                                    tn(LLM_TENSOR_FFN_ROUTED_NORM, "weight", i),
+                                    {n_embd_latent},
+                                    TENSOR_NOT_REQUIRED);
+                            }
+
+                            const int64_t n_ff_shexp =
+                                n_ff_exp * (hparams.n_expert_shared > 0 ? hparams.n_expert_shared : 1);
+                            layer.ffn_gate_shexp = create_tensor(
+                                tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i),
+                                {n_embd, n_ff_shexp},
+                                TENSOR_NOT_REQUIRED);
+                            layer.ffn_down_shexp = create_tensor(
+                                tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i),
+                                {n_ff_shexp, n_embd},
+                                TENSOR_NOT_REQUIRED);
+                            layer.ffn_up_shexp = create_tensor(
+                                tn(LLM_TENSOR_FFN_UP_SHEXP, "weight", i),
+                                {n_embd, n_ff_shexp},
+                                TENSOR_NOT_REQUIRED);
                         }
                     }
                 } break;
@@ -7687,7 +8757,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED);
                         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_NOT_REQUIRED);
                         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED);
-                        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, TENSOR_NOT_REQUIRED);
                     }
                 } break;
             case LLM_ARCH_STEP35:
@@ -7746,7 +8816,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_gate_exps     = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED);
                         layer.ffn_down_exps     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, TENSOR_NOT_REQUIRED);
                         layer.ffn_up_exps       = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp,   n_expert}, TENSOR_NOT_REQUIRED);
-                        layer.ffn_exp_probs_b   = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                        layer.ffn_exp_probs_b   = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, i), {n_expert}, TENSOR_NOT_REQUIRED);
 
                         // shared expert MLP
                         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, hparams.n_ff_shexp}, TENSOR_NOT_REQUIRED);
@@ -7927,8 +8997,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(!defer_expert_mmap, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
+    if (defer_expert_mmap) {
+        pimpl->expert_mmap_ranges = ml.expert_tensor_index.file_ranges;
+    }
 
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
@@ -7937,6 +9010,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
+    std::set<ggml_backend_buffer_t> mapped_bufs;   // the buffers over the mapping of the GGUF
 
     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
         ggml_context * ctx = ctx_ptr.get();
@@ -7984,6 +9058,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
+                mapped_bufs.insert(buf);
             }
         } else {
             ggml_backend_buffer_t buf;
@@ -8052,9 +9127,130 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+            ml.tensor_buft_overrides = original_tensor_buft_overrides;
             return false;
         }
     }
+
+    // Where the dense weights (the 2-D weights; the routed experts are 3-D) are homed: on a device; in RAM (a host
+    // buffer other than the mapping of the GGUF); on the drive: a matrix product's weight in the mapping that the
+    // expert transport's index holds in blocks, read through the transport and never through the page cache into a
+    // copy target of its size, through a pinned stage of two of the largest (allocated here: a plan it cannot hold
+    // stops the load).  A matrix product's weight in the mapping that the index does not hold is read through the page
+    // cache (paged).  Lookup tables in the mapping (token embeddings, GET_ROWS) are none of these.
+    {
+        using has_tensor_fn = bool (*)(const char *, size_t, size_t *);
+        using stage_prepare_fn = bool (*)(size_t *);
+#if !defined(_WIN32)
+        const auto has_tensor = reinterpret_cast<has_tensor_fn>(dlsym(RTLD_DEFAULT, "ggml_cuda_moe_dense_has_tensor"));
+        const auto stage_prepare = reinterpret_cast<stage_prepare_fn>(dlsym(RTLD_DEFAULT, "ggml_cuda_moe_dense_stage_prepare"));
+#else
+        const has_tensor_fn has_tensor = nullptr;
+        const stage_prepare_fn stage_prepare = nullptr;
+#endif
+        uint64_t gpu_bytes = 0, ram_bytes = 0, drive_bytes = 0, drive_tensors = 0, copy_target_bytes = 0;
+        uint64_t paged_bytes = 0, paged_tensors = 0;
+        for (auto & [ctx_ptr, _] : pimpl->ctxs_bufs) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx_ptr.get()); t; t = ggml_get_next_tensor(ctx_ptr.get(), t)) {
+                if (t->buffer == nullptr || ggml_n_dims(t) > 2) {
+                    continue;
+                }
+                const uint64_t nbytes = ggml_nbytes(t);
+                if (!ggml_backend_buffer_is_host(t->buffer)) {
+                    gpu_bytes += nbytes;
+                } else if (mapped_bufs.count(t->buffer) == 0) {
+                    ram_bytes += nbytes;
+                } else if (ml.mul_mat_weights.count(t) == 0) {
+                    continue;
+                } else if (has_tensor && has_tensor(t->name, nbytes, nullptr)) {
+                    drive_bytes += nbytes;
+                    drive_tensors += 1;
+                    copy_target_bytes = std::max(copy_target_bytes, nbytes);
+                } else {
+                    paged_bytes += nbytes;
+                    paged_tensors += 1;
+                }
+            }
+        }
+        size_t stage_bytes = 0;
+        if (drive_tensors > 0 && !(stage_prepare && stage_prepare(&stage_bytes))) {
+            throw std::runtime_error(format("the pinned stage for the %" PRIu64 " weights homed on the drive could not "
+                "be allocated", drive_tensors));
+        }
+        LLAMA_LOG_INFO("[dense_homes] gpu_bytes=%" PRIu64 " ram_bytes=%" PRIu64 " drive_bytes=%" PRIu64
+            " drive_tensors=%" PRIu64 " copy_target_bytes=%" PRIu64 " stage_bytes=%zu paged_bytes=%" PRIu64
+            " paged_tensors=%" PRIu64 "\n", gpu_bytes, ram_bytes, drive_bytes, drive_tensors, copy_target_bytes,
+            stage_bytes, paged_bytes, paged_tensors);
+    }
+
+    // DeepSeek-V4.1 Engram tables use random rows. Under a tight cgroup, mmap
+    // read-around can evict the pages prefetched for the next Engram layer.
+    // Enable random advice by default; =0 restores the previous behavior.
+    // Verify the tensor address against its source mapping so --no-mmap or a
+    // buffer override cannot apply this advice to unrelated storage.
+    const char * engram_random_env = std::getenv("LLAMA_DSV41_ENGRAM_MADV_RANDOM");
+    if (arch == LLM_ARCH_DEEPSEEK41 && (!engram_random_env || std::strcmp(engram_random_env, "0") != 0)) {
+        size_t advised_tensors = 0;
+        size_t advised_bytes = 0;
+        size_t tensor_bytes = 0;
+        size_t skipped_non_mmap = 0;
+        size_t failures = 0;
+
+        for (uint32_t eg = 0; eg < engram_n_layer; ++eg) {
+            const uint32_t il = hparams.engram_layer_ids[eg];
+            ggml_tensor * tensor = layers.at(il).engram_embd;
+            if (!tensor || !tensor->data) {
+                ++skipped_non_mmap;
+                continue;
+            }
+
+            const auto * weight = ml.get_weight(ggml_get_name(tensor));
+            const size_t nbytes = ggml_nbytes(tensor);
+            if (!weight || weight->idx >= ml.mappings.size()) {
+                ++skipped_non_mmap;
+                continue;
+            }
+
+            const auto & mapping = ml.mappings[weight->idx];
+            if (!mapping || weight->offs > mapping->size() || nbytes > mapping->size() - weight->offs ||
+                    tensor->data != (uint8_t *) mapping->addr() + weight->offs) {
+                ++skipped_non_mmap;
+                continue;
+            }
+
+            size_t bytes = 0;
+            tensor_bytes += nbytes;
+            if (!mapping->advise_random_fragment(weight->offs, weight->offs + nbytes, &bytes)) {
+                ++failures;
+            } else {
+                ++advised_tensors;
+            }
+            advised_bytes += bytes;
+        }
+
+        LLAMA_LOG_INFO("%s: engram MADV_RANDOM tensors=%zu tensor_bytes=%.2f GiB advised_bytes=%.2f GiB skipped_non_mmap=%zu failures=%zu\n",
+                __func__, advised_tensors,
+                tensor_bytes / 1024.0 / 1024.0 / 1024.0,
+                advised_bytes / 1024.0 / 1024.0 / 1024.0,
+                skipped_non_mmap, failures);
+    }
+
+    pimpl->mmap_used_ranges.clear();
+    pimpl->mmap_used_ranges.reserve(ml.mmaps_used.size());
+    for (const auto & range : ml.mmaps_used) {
+        pimpl->mmap_used_ranges.push_back({ range.first, range.second });
+    }
+
+    if (defer_expert_mmap) {
+        ml.drop_mmap_expert_pages();
+        LLAMA_LOG_INFO("%s: dense parameters loaded, expert mmap pages deferred/dropped (dense %.2f GiB, deferred %.2f GiB)\n",
+                __func__,
+                ml.expert_tensor_index.dense_bytes / 1024.0 / 1024.0 / 1024.0,
+                ml.expert_tensor_index.deferred_bytes / 1024.0 / 1024.0 / 1024.0);
+    }
+    ml.drop_mmap_used_pages_after_load();
+
+    ml.tensor_buft_overrides = original_tensor_buft_overrides;
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
@@ -8069,6 +9265,113 @@ std::string llama_model::arch_name() const {
     return llm_arch_name(arch);
 }
 
+void llama_model::drop_expert_mmap_pages_after_prompt() const {
+    const char * expert_env = std::getenv("LLAMA_DROP_EXPERT_MMAP_AFTER_PROMPT");
+    const char * dense_env  = std::getenv("LLAMA_DROP_DENSE_MMAP_AFTER_PROMPT");
+    const char * repeat_env = std::getenv("LLAMA_DROP_MMAP_EVERY_PROMPT_BATCH");
+    const char * phase1_env = std::getenv("GGML_MOE_PREFILL_PHASE1");
+    const bool drop_expert = expert_env && expert_env[0] && expert_env[0] != '0';
+    const bool phase1      = phase1_env && phase1_env[0] && phase1_env[0] != '0';
+    const bool dense_requested = dense_env && dense_env[0] && dense_env[0] != '0';
+    const bool drop_dense  = dense_requested && !phase1;
+    const bool repeat_drop = repeat_env && repeat_env[0] && repeat_env[0] != '0';
+    if (phase1 && dense_requested) {
+        LLAMA_LOG_WARN("%s: ignoring LLAMA_DROP_DENSE_MMAP_AFTER_PROMPT during Phase 1; "
+                "request-time reclaim is expert-only\n", __func__);
+    }
+    if (!drop_expert && !drop_dense) {
+        return;
+    }
+    if (pimpl->expert_mmap_drop_after_prompt_done && !repeat_drop) {
+        return;
+    }
+    pimpl->expert_mmap_drop_after_prompt_done = true;
+    if (pimpl->mappings.empty()) {
+        return;
+    }
+
+    if (drop_expert) {
+        const int64_t t_start_us = ggml_time_us();
+        size_t bytes = 0;
+        size_t ranges = 0;
+        size_t failures = 0;
+        const size_t n = std::min(pimpl->mappings.size(), pimpl->expert_mmap_ranges.size());
+        for (size_t i = 0; i < n; ++i) {
+            if (!pimpl->mappings[i]) {
+                continue;
+            }
+            for (const llama_file_range & range : pimpl->expert_mmap_ranges[i]) {
+                size_t len = 0;
+                const bool ok = pimpl->mappings[i]->dontneed_fragment(range.first, range.last, &len);
+                bytes += len;
+                ++ranges;
+                if (!ok) {
+                    ++failures;
+                }
+            }
+        }
+        const int64_t t_end_us = ggml_time_us();
+        LLAMA_LOG_INFO("%s: expert mmap dontneed after prompt bytes=%.2f MiB ranges=%zu failures=%zu wall_ms=%.3f\n",
+                __func__, bytes / 1024.0 / 1024.0, ranges, failures,
+                (double)(t_end_us - t_start_us) / 1000.0);
+    }
+
+    if (drop_dense) {
+        const int64_t t_start_us = ggml_time_us();
+        size_t bytes = 0;
+        size_t ranges = 0;
+        size_t failures = 0;
+        const size_t n = std::min(pimpl->mappings.size(), pimpl->mmap_used_ranges.size());
+        for (size_t idx = 0; idx < n; ++idx) {
+            if (!pimpl->mappings[idx]) {
+                continue;
+            }
+            const llama_file_range & used = pimpl->mmap_used_ranges[idx];
+            if (used.last <= used.first) {
+                continue;
+            }
+
+            size_t cursor = used.first;
+            const auto * expert_ranges = idx < pimpl->expert_mmap_ranges.size() ?
+                &pimpl->expert_mmap_ranges[idx] : nullptr;
+
+            auto drop_range = [&](size_t first, size_t last) {
+                if (last <= first) {
+                    return;
+                }
+                size_t len = 0;
+                const bool ok = pimpl->mappings[idx]->dontneed_fragment(first, last, &len);
+                bytes += len;
+                ++ranges;
+                if (!ok) {
+                    ++failures;
+                }
+            };
+
+            if (expert_ranges) {
+                for (const llama_file_range & range : *expert_ranges) {
+                    if (range.last <= used.first || range.first >= used.last) {
+                        continue;
+                    }
+                    const size_t expert_first = std::max(range.first, used.first);
+                    const size_t expert_last  = std::min(range.last, used.last);
+                    if (cursor < expert_first) {
+                        drop_range(cursor, expert_first);
+                    }
+                    cursor = std::max(cursor, expert_last);
+                }
+            }
+
+            if (cursor < used.last) {
+                drop_range(cursor, used.last);
+            }
+        }
+        const int64_t t_end_us = ggml_time_us();
+        LLAMA_LOG_INFO("%s: dense mmap dontneed after prompt bytes=%.2f MiB ranges=%zu failures=%zu wall_ms=%.3f\n",
+                __func__, bytes / 1024.0 / 1024.0, ranges, failures,
+                (double)(t_end_us - t_start_us) / 1000.0);
+    }
+}
 std::string llama_model::type_name() const {
     return llm_type_name(type);
 }
@@ -8444,6 +9747,39 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             {
                 res = nullptr;
             } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                res = new llama_memory_deepseek4(
+                        *this,
+                        params.type_k,
+                        cparams.offload_kqv,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max);
+            } break;
+        case LLM_ARCH_DEEPSEEK41:
+            {
+                // the latent cache stores one tensor per position, so K and V must share a type
+                if (params.type_k != params.type_v) {
+                    throw std::runtime_error("DeepSeek-V4.1 requires the same KV cache type for K and V");
+                }
+
+                // upstream also passes cparams.n_rs_seq (speculative rollback planes); this tree has
+                // no rollback, so the cache is built without them
+                res = new llama_kv_cache_dsv4(
+                        *this,
+                        params.type_k,
+                        params.type_v,
+                        !cparams.flash_attn,
+                        cparams.offload_kqv,
+                        params.swa_full,
+                        cparams.kv_unified,
+                        cparams.n_ctx_seq,
+                        cparams.n_seq_max,
+                        cparams.n_ubatch,
+                        1,
+                        nullptr,
+                        nullptr);
+            } break;
         // Models that need standard caching should rely on recurrent/hybrid
         // checks
         default:
@@ -8683,6 +10019,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_qwen3>(*this, params);
             } break;
+        case LLM_ARCH_DFLASH:
+            {
+                llm = std::make_unique<llm_build_dflash>(*this, params);
+            } break;
         case LLM_ARCH_QWEN3MOE:
             {
                 llm = std::make_unique<llm_build_qwen3moe>(*this, params);
@@ -8813,6 +10153,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
                     llm = std::make_unique<llm_build_olmo2<false>>(*this, params);
                 }
             } break;
+        case LLM_ARCH_MUSE_SPARK:
+            {
+                llm = std::make_unique<llm_build_muse_spark>(*this, params);
+            } break;
         case LLM_ARCH_OLMOE:
             {
                 llm = std::make_unique<llm_build_olmoe>(*this, params);
@@ -8839,6 +10183,14 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_MISTRAL4:
             {
                 llm = std::make_unique<llm_build_deepseek2>(*this, params);
+            } break;
+        case LLM_ARCH_DEEPSEEK4:
+            {
+                llm = std::make_unique<llm_build_deepseek4>(*this, params);
+            } break;
+        case LLM_ARCH_DEEPSEEK41:
+            {
+                llm = std::make_unique<llm_build_deepseek41>(*this, params);
             } break;
         case LLM_ARCH_CHATGLM:
             {
@@ -9063,6 +10415,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_kimi_linear>(*this, params);
             } break;
+        case LLM_ARCH_KIMI_K3:
+            {
+                llm = std::make_unique<llm_build_kimi_k3>(*this, params);
+            } break;
         case LLM_ARCH_STEP35:
             {
                 llm = std::make_unique<llm_build_step35_iswa>(*this, params);
@@ -9083,7 +10439,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // TODO: move reranking logic here and generalize
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
-    llm->res->set_outputs();
+    llm->res->set_outputs(params);
 
     return llm->res->get_gf();
 }
@@ -9111,6 +10467,7 @@ llama_model_params llama_model_default_params() {
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
+        /*.defer_experts               =*/ false,
         /*.no_alloc                    =*/ false,
     };
 
@@ -9158,6 +10515,11 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 }
 
 int32_t llama_model_n_swa(const llama_model * model) {
+    // the V4.1 cache keeps a sliding window, but its compressed streams make it unusable as a
+    // rollback window, so report none (upstream does the same for DeepSeek-V4)
+    if (model->arch == LLM_ARCH_DEEPSEEK41) {
+        return 0;
+    }
     return model->hparams.n_swa;
 }
 
@@ -9217,6 +10579,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_KIMI_K3:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
@@ -9236,6 +10599,9 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK2OCR:
+        case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
+        case LLM_ARCH_MUSE_SPARK:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GRANITE:
@@ -9273,6 +10639,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DREAM:
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3:
+        case LLM_ARCH_DFLASH:
         case LLM_ARCH_QWEN3MOE:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
@@ -9442,8 +10809,17 @@ bool llama_model_has_encoder(const llama_model * model) {
     switch (model->arch) {
         case LLM_ARCH_T5:        return true;
         case LLM_ARCH_T5ENCODER: return true;
+        case LLM_ARCH_DFLASH:    return true;
         default:                 return false;
     }
+}
+
+const int32_t * llama_model_target_layer_ids(const llama_model * model) {
+    return model->target_layer_ids.empty() ? nullptr : model->target_layer_ids.data();
+}
+
+uint32_t llama_model_target_layer_ids_n(const llama_model * model) {
+    return (uint32_t) model->target_layer_ids.size();
 }
 
 bool llama_model_has_decoder(const llama_model * model) {

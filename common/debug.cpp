@@ -130,6 +130,18 @@ static void common_debug_print_tensor(uint8_t * data, ggml_type type, const int6
     }
 }
 
+static bool common_debug_tensor_matches_filter(const ggml_tensor * t, const std::vector<std::regex> & filters) {
+    if (filters.empty()) {
+        return true;
+    }
+    for (const auto & filter : filters) {
+        if (std::regex_search(t->name, filter)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /**
  * GGML operations callback during the graph execution.
  *
@@ -144,23 +156,14 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     auto * cb_data = (common_debug_cb_user_data *) user_data;
     auto * pimpl = cb_data->pimpl.get();
 
-    const struct ggml_tensor * src0 = t->src[0];
-    const struct ggml_tensor * src1 = t->src[1];
+    const bool matches_filter = common_debug_tensor_matches_filter(t, pimpl->tensor_filters);
 
     if (ask) {
-        return true;  // Always retrieve data
+        return matches_filter;
     }
 
-    bool matches_filter = pimpl->tensor_filters.empty();
-
-    if (!matches_filter) {
-        for (const auto & filter : pimpl->tensor_filters) {
-            if (std::regex_search(t->name, filter)) {
-                matches_filter = true;
-                break;
-            }
-        }
-    }
+    const struct ggml_tensor * src0 = t->src[0];
+    const struct ggml_tensor * src1 = t->src[1];
 
     char src1_str[128] = { 0 };
     if (src1) {

@@ -137,6 +137,11 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph);
+
+        // (optional) size the backend's own scratch memory (e.g. a device memory pool) for computing these graphs one
+        // after another, so that it is neither allocated while they run nor kept unused; returns false if the memory
+        // cannot be obtained
+        bool                      (*graph_reserve)     (ggml_backend_t backend, struct ggml_cgraph * const * graphs, int n_graphs);
     };
 
     struct ggml_backend {

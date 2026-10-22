@@ -226,6 +226,17 @@ MTMD_API int32_t mtmd_tokenize(mtmd_context * ctx,
                                const mtmd_bitmap ** bitmaps,
                                size_t n_bitmaps);
 
+// Like mtmd_tokenize(), retaining the original prompt's input byte spans
+// through media splitting. Model-generated media delimiters remain special.
+// Returns 3 for invalid text ranges.
+MTMD_API int32_t mtmd_tokenize_with_input_spans(mtmd_context * ctx,
+                               mtmd_input_chunks * output,
+                               const mtmd_input_text * text,
+                               const mtmd_bitmap ** bitmaps,
+                               size_t n_bitmaps,
+                               const struct llama_tokenize_input_span * spans,
+                               int32_t n_spans);
+
 // returns 0 on success
 // TODO: deprecate
 MTMD_API int32_t mtmd_encode(mtmd_context * ctx,

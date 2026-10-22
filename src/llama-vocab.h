@@ -157,6 +157,11 @@ struct llama_vocab {
                          bool   add_special,
                          bool   parse_special = false) const;
 
+    int32_t tokenize_with_input_spans(
+            const char * text, int32_t text_len, llama_token * tokens,
+            int32_t n_tokens_max, bool add_special,
+            const llama_tokenize_input_span * spans, int32_t n_spans) const;
+
     // does not write null-terminator to buf
     int32_t token_to_piece(
                   llama_token   token,

@@ -155,6 +155,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_MXFP4_MOE     = 38, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
         LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_F8_E4M3_MXFP4 = 41, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
@@ -318,6 +319,7 @@ extern "C" {
         bool check_tensors;   // validate model tensor data
         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
         bool no_host;         // bypass host buffer allowing extra buffers to be used
+        bool defer_experts;   // defer expert mmap residency to avoid eager host RSS growth
         bool no_alloc;        // only load metadata and simulate memory allocations
     };
 
@@ -380,6 +382,9 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // A source/target context whose model tensors or runtime outputs may be shared.
+        struct llama_context * ctx_other;
     };
 
     struct llama_model_tensor_override {
@@ -885,6 +890,61 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // The state a sequence had after its first n_tokens tokens, for a memory that can rebuild it after processing
+    // more of the sequence (DeepSeek-V4.1: at compressor block boundaries inside the last batch), so that a prompt
+    // can be checkpointed without stopping its batch there. n_tokens = -1 is the current state. Earlier states are
+    // possible at multiples of llama_state_seq_at_align (0: none) where llama_state_seq_can_save_at says so; the
+    // data is restored with llama_state_seq_set_data_ext / llama_state_seq_fread_ext like the current state's.
+    LLAMA_API uint32_t llama_state_seq_at_align(struct llama_context * ctx);
+
+    LLAMA_API bool llama_state_seq_can_save_at(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                         int32_t   n_tokens);
+
+    // The first position of the sequence that its state after n_tokens tokens holds, once restored: the sequence can
+    // be truncated to any position from there on.  A sliding-window cache holds the window the position before
+    // n_tokens attends to; a memory that cannot be rolled back resumes only after its last position (n_tokens - 1).
+    LLAMA_API llama_pos llama_state_seq_pos_min_at(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                         int32_t   n_tokens);
+
+    // Room in host memory for `bytes` the caller is about to allocate (a checkpoint, a state read back from disk),
+    // from the SSD-streaming engine's host-memory ledger: both the memory limit (finite cgroup) and MemAvailable less
+    // the floor must still hold, and the expert caches give back what the allocation needs (on a unified-memory GPU
+    // the GPU tier too). Returns false when that is not possible; the caller should then not allocate.
+    LLAMA_API bool llama_host_reserve(struct llama_context * ctx, size_t bytes);
+
+    LLAMA_API size_t llama_state_seq_get_size_at(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+                         int32_t   n_tokens);
+
+    LLAMA_API size_t llama_state_seq_get_data_at(
+            struct llama_context * ctx,
+                         uint8_t * dst,
+                          size_t   size,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+                         int32_t   n_tokens);
+
+    // Write such a state to an open file at its current position, streamed tensor by tensor instead of through a
+    // buffer of the whole state, and read one back. Both return the number of bytes written or read, 0 on failure.
+    LLAMA_API size_t llama_state_seq_fwrite_at(
+            struct llama_context * ctx,
+                            FILE * fp,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags,
+                         int32_t   n_tokens);
+
+    LLAMA_API size_t llama_state_seq_fread_ext(
+            struct llama_context * ctx,
+                            FILE * fp,
+                    llama_seq_id   dest_seq_id,
+           llama_state_seq_flags   flags);
+
     //
     // Decoding
     //
@@ -1116,6 +1176,27 @@ extern "C" {
                          int32_t   n_tokens_max,
                             bool   add_special,
                             bool   parse_special);
+
+    // Byte ranges originating in message content. Special-token matches overlapping
+    // any range remain ordinary text. Ranges must be sorted, disjoint and in bounds.
+    struct llama_tokenize_input_span {
+        int32_t offset;
+        int32_t length;
+    };
+
+    // Like llama_tokenize(), but parses special tokens only outside input spans.
+    // Unlike separately tokenizing string pieces, this preserves normal BPE merges,
+    // whitespace handling and automatic BOS/EOS insertion across span boundaries.
+    // Returns INT32_MIN for invalid ranges or overflow.
+    LLAMA_API int32_t llama_tokenize_with_input_spans(
+        const struct llama_vocab * vocab,
+                      const char * text,
+                         int32_t   text_len,
+                     llama_token * tokens,
+                         int32_t   n_tokens_max,
+                            bool   add_special,
+        const struct llama_tokenize_input_span * spans,
+                         int32_t   n_spans);
 
     // Token Id -> Piece.
     // Uses the vocabulary in the provided context.
@@ -1386,6 +1467,28 @@ extern "C" {
                                float   penalty_present); // 0.0 = disabled
 
     ///  @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
+
+    // Force a phase transition or end-of-generation token once a degenerate
+    // repetition loop is detected. min_len is the shortest block considered;
+    // repeats is the number of prior occurrences required in the current phase.
+    // eog_override <= 0 means "pick automatically"; min_len/max_len/repeats <= 0
+    // fall back to the LLAMA_LOOP_STOP_* environment variables.
+    LLAMA_API struct llama_sampler * llama_sampler_init_loop_stop(
+            const struct llama_vocab * vocab,
+            int32_t   min_len,
+            int32_t   max_len,
+            int32_t   repeats,
+            llama_token eog_override,
+            bool      verbose);
+
+    // Inspect loop_stop immediately after accepting a token. The trigger remains
+    // valid until the sampler is applied for the next token.
+    LLAMA_API bool llama_sampler_loop_stop_triggered(
+            const struct llama_sampler * smpl,
+            int32_t * matched_len);
+
+    LLAMA_API int32_t llama_sampler_loop_stop_min_len(
+            const struct llama_sampler * smpl);
     LLAMA_API struct llama_sampler * llama_sampler_init_dry(
             const struct llama_vocab *  vocab,
                              int32_t    n_ctx_train,

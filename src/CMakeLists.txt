@@ -24,7 +24,10 @@ add_library(llama
             llama-io.cpp
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
+            llama-kv-cache-dsv4.cpp
             llama-memory.cpp
+            llama-memory-deepseek4.cpp
+            llama-deepseek4-hot.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
             llama-memory-recurrent.cpp
@@ -48,6 +51,7 @@ set_target_properties(llama PROPERTIES
 )
 
 target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE ../ggml/src/ggml-cpu)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

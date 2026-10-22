@@ -860,3 +860,25 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             return false;
     }
 }
+
+#ifdef GGML_CUDA_MOE_STREAM
+// Native floating weights for the streaming/tier bridge. Reuse ggml's MMVF
+// kernel with F32 accumulation and F32 input; weights are never requantized.
+extern "C" bool ggml_cuda_moe_stream_mmvf_dev(
+        int type, const void * weights, int64_t rows, int64_t columns, size_t row_bytes,
+        const float * input, float * output, int64_t ncols, cudaStream_t stream) {
+    if (!weights || !input || !output || rows <= 0 || columns <= 0 ||
+            columns % 2 || ncols < 1 || ncols > MMVF_MAX_BATCH_SIZE || rows > INT32_MAX || columns > INT32_MAX || row_bytes % 2) { return false; }
+    ggml_cuda_mm_fusion_args_device empty{};
+    if (type == GGML_TYPE_BF16) {
+        mul_mat_vec_f_cuda(static_cast<const nv_bfloat16 *>(weights), input, nullptr, empty, output,
+            columns, rows, ncols, row_bytes / 2, columns, rows,
+            1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, GGML_PREC_F32, stream);
+    } else if (type == GGML_TYPE_F16) {
+        mul_mat_vec_f_cuda(static_cast<const half *>(weights), input, nullptr, empty, output,
+            columns, rows, ncols, row_bytes / 2, columns, rows,
+            1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, GGML_PREC_F32, stream);
+    } else { return false; }
+    return cudaGetLastError() == cudaSuccess;
+}
+#endif

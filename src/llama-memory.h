@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <stdexcept>
 
 struct llama_ubatch;
 
@@ -86,6 +87,13 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // like init_full(), but the worst case only has to cover the first n_ctx_reserve positions;
+    // a module whose graph does not grow with the filled context keeps the full reserve
+    virtual llama_memory_context_ptr init_reserve(uint32_t n_ctx_reserve) {
+        (void) n_ctx_reserve;
+        return init_full();
+    }
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;
@@ -117,6 +125,32 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    // The state a sequence had after its first n_tokens tokens, saved after more of it has been processed, in the
+    // format of state_write(). A memory that can rebuild such an earlier state lets a caller checkpoint a prompt
+    // without stopping its batch there. Earlier states are possible at multiples of state_write_at_align() (0: none)
+    // where state_can_write_at() holds; n_tokens == seq_pos_max(seq_id) + 1 is the current state.
+    virtual uint32_t state_write_at_align() const {
+        return 0;
+    }
+
+    virtual bool state_can_write_at(llama_seq_id seq_id, llama_pos n_tokens) const {
+        return seq_id >= 0 && n_tokens == seq_pos_max(seq_id) + 1;
+    }
+
+    virtual void state_write_at(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos n_tokens) const {
+        if (!state_can_write_at(seq_id, n_tokens)) {
+            throw std::runtime_error("the memory cannot save this earlier state of the sequence");
+        }
+        state_write(io, seq_id, flags);
+    }
+
+    // The first position the state written at n_tokens holds once restored: the sequence can be truncated to any
+    // position from there on.  By default a state resumes only after its last position.
+    virtual llama_pos state_pos_min_at(llama_seq_id seq_id, llama_pos n_tokens) const {
+        GGML_UNUSED(seq_id);
+        return n_tokens - 1;
+    }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;

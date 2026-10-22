@@ -111,6 +111,7 @@ enum llm_type {
     LLM_TYPE_16x3_8B,
     LLM_TYPE_10B_128x3_66B,
     LLM_TYPE_57B_A14B,
+    LLM_TYPE_816B_A42B,
     LLM_TYPE_17B_16E, // llama4 Scout
     LLM_TYPE_17B_128E, // llama4 Maverick
     LLM_TYPE_A13B,
@@ -304,6 +305,12 @@ struct llama_layer {
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
     struct ggml_tensor * ffn_latent_up   = nullptr;
+    struct ggml_tensor * ffn_pre_exp_norm  = nullptr;
+    struct ggml_tensor * ffn_post_exp_norm = nullptr;
+    struct ggml_tensor * attn_resid_alpha = nullptr;
+    struct ggml_tensor * attn_resid_beta  = nullptr;
+    struct ggml_tensor * ffn_resid_alpha  = nullptr;
+    struct ggml_tensor * ffn_resid_beta   = nullptr;
 
     // ff shared expert (shexp)
     struct ggml_tensor * ffn_gate_inp_shexp = nullptr;
@@ -477,12 +484,54 @@ struct llama_layer {
     struct ggml_tensor * ssm_g_b    = nullptr;
     struct ggml_tensor * ssm_o_norm = nullptr;
 
+    // kimi-k3
+    struct ggml_tensor * ssm_g           = nullptr; // full-rank KDA gate (replaces ssm_g_a/ssm_g_b)
+    struct ggml_tensor * attn_res_score  = nullptr; // fused res_norm*res_proj, pre-attention
+    struct ggml_tensor * ffn_res_score   = nullptr; // fused res_norm*res_proj, pre-FFN
+    struct ggml_tensor * ffn_routed_down = nullptr; // latent MoE: n_embd -> n_expert_latent
+    struct ggml_tensor * ffn_routed_up   = nullptr; // latent MoE: n_expert_latent -> n_embd
+    struct ggml_tensor * ffn_routed_norm = nullptr;
+
     // DSA (deepseek sparse attention)
     struct ggml_tensor * indexer_k_norm   = nullptr;
     struct ggml_tensor * indexer_k_norm_b = nullptr;
     struct ggml_tensor * indexer_proj     = nullptr;
     struct ggml_tensor * indexer_attn_k   = nullptr;
     struct ggml_tensor * indexer_attn_q_b = nullptr; // note: for lora a/b, not bias
+
+    // DeepSeek V4
+    struct ggml_tensor * attn_kv_latent        = nullptr;
+    struct ggml_tensor * attn_out_a            = nullptr;
+    struct ggml_tensor * attn_out_b            = nullptr;
+    struct ggml_tensor * attn_compress_ape     = nullptr;
+    struct ggml_tensor * attn_compress_norm    = nullptr;
+    struct ggml_tensor * attn_compress_kv      = nullptr;
+    struct ggml_tensor * attn_compress_gate    = nullptr;
+    struct ggml_tensor * indexer_compress_ape  = nullptr;
+    struct ggml_tensor * indexer_compress_norm = nullptr;
+    struct ggml_tensor * indexer_compress_kv   = nullptr;
+    struct ggml_tensor * indexer_compress_gate = nullptr;
+    struct ggml_tensor * hc_attn_base          = nullptr;
+    struct ggml_tensor * hc_attn_fn            = nullptr;
+    struct ggml_tensor * hc_attn_scale         = nullptr;
+    struct ggml_tensor * hc_ffn_base           = nullptr;
+    struct ggml_tensor * hc_ffn_fn             = nullptr;
+    struct ggml_tensor * hc_ffn_scale          = nullptr;
+    struct ggml_tensor * ffn_gate_tid2eid      = nullptr;
+
+    // DeepSeek-V4.1 (upstream field names; attn_q_a_norm, wq_a/wq_b, wo_b, attn_sinks, hc_* and
+    // indexer_* above are shared)
+    struct ggml_tensor * wkv                = nullptr;
+    struct ggml_tensor * wo_a               = nullptr;
+    struct ggml_tensor * attn_kv_norm       = nullptr;
+    struct ggml_tensor * attn_comp_wkv      = nullptr;
+    struct ggml_tensor * attn_comp_wgate    = nullptr;
+    struct ggml_tensor * attn_comp_norm     = nullptr;
+    struct ggml_tensor * ffn_exp_probs_b_vl = nullptr;
+    struct ggml_tensor * engram_embd        = nullptr;
+    struct ggml_tensor * engram_wkv         = nullptr;
+    struct ggml_tensor * engram_q           = nullptr;
+    struct ggml_tensor * engram_k           = nullptr;
 
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
@@ -528,10 +577,21 @@ struct llama_model {
     struct ggml_tensor * tok_norm_b = nullptr;
 
     struct ggml_tensor * output_norm     = nullptr;
+    struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
+
+    // DFlash/DSpark feature fusion and semi-autoregressive heads.
+    struct ggml_tensor * fc                 = nullptr;
+    struct ggml_tensor * dspark_markov_w1   = nullptr;
+    struct ggml_tensor * dspark_markov_w2   = nullptr;
+    struct ggml_tensor * dspark_conf_proj   = nullptr;
+    struct ggml_tensor * dspark_conf_proj_b = nullptr;
+
+    // Target-model hidden-state indices consumed by a paired draft model.
+    std::vector<int32_t> target_layer_ids;
 
     // classifier
     struct ggml_tensor * cls       = nullptr;
@@ -549,6 +609,31 @@ struct llama_model {
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
+
+    // DeepSeek V4 hyper-connection head
+    struct ggml_tensor * hc_head_base  = nullptr;
+    struct ggml_tensor * hc_head_fn    = nullptr;
+    struct ggml_tensor * hc_head_scale = nullptr;
+
+    // DeepSeek-V4.1 engram hash constants (upstream keeps these on its per-model class)
+    uint32_t              engram_n_layer = 0;
+    uint32_t              engram_pad_id  = 0;
+    uint32_t              engram_compressed_vocab_size = 0;
+    std::vector<uint64_t> engram_multipliers; // [n_engram_layer * max_ngram_size]
+    std::vector<uint64_t> engram_primes;      // [n_engram_layer * (max_ngram_size - 1) * n_head]
+    std::vector<uint64_t> engram_offsets;     // same layout as engram_primes
+    std::vector<uint64_t> engram_rows;        // encoded table rows per engram layer
+    std::vector<int32_t>  engram_token_map;   // token id -> compressed id
+
+    // index of layer il among the engram layers, or -1
+    int engram_index(int il) const {
+        for (uint32_t e = 0; e < engram_n_layer; ++e) {
+            if (hparams.engram_layer_ids[e] == (uint32_t) il) {
+                return (int) e;
+            }
+        }
+        return -1;
+    }
 
     std::vector<llama_layer> layers;
 
@@ -585,6 +670,8 @@ struct llama_model {
     void load_hparams(llama_model_loader & ml);
     void load_vocab  (llama_model_loader & ml);
     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
+
+    void drop_expert_mmap_pages_after_prompt() const;
 
     std::string arch_name() const;
     std::string type_name() const;

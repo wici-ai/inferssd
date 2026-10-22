@@ -784,7 +784,10 @@ static __device__ __forceinline__ void ggml_cuda_memcpy_1(void * __restrict__ ds
 }
 
 static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32(uint8_t x) {
-#if CUDART_VERSION >= 12080
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    const uint32_t bits = x == 0 ? 0x00400000 : (uint32_t) x << 23;
+    return __uint_as_float(bits);
+#elif CUDART_VERSION >= 12080
     const nv_bfloat16 e = __nv_cvt_e8m0_to_bf16raw(x);
     return (float) e;
 #else
@@ -828,6 +831,21 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
     return static_cast<float>(raw / 2);
 #endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
 #endif // defined(GGML_USE_HIP) && defined(CDNA3) && defined(FP8_AVAILABLE) && HIP_VERSION >= 60200000
+}
+
+static __device__ __forceinline__ float ggml_cuda_f8_e4m3fn_to_fp32(uint8_t x) {
+    if ((x & 0x7F) == 0) {
+        return 0.0f;
+    }
+    if ((x & 0x7F) == 0x7F) {
+        return NAN;
+    }
+
+    const int exp = (x >> 3) & 0x0F;
+    const int man = x & 0x07;
+    const float val = exp == 0 ? ldexpf((float) man, -9) : ldexpf(1.0f + (float) man * 0.125f, exp - 7);
+
+    return (x & 0x80) ? -val : val;
 }
 
 __device__ __forceinline__ uint8_t ggml_cuda_float_to_fp4_e2m1(float x, float e) {
@@ -977,6 +995,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_NVFP4> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_F8_E4M3_B128> {
+    static constexpr int qk = QK_F8_E4M3_B128;
+    static constexpr int qr = QR_F8_E4M3_B128;
+    static constexpr int qi = QI_F8_E4M3_B128;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q2_K> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR2_K;
@@ -1107,7 +1132,32 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // Resizes the pool to hold `size` bytes of allocations beyond those in use, so that it neither gets device
+    // memory while a graph runs nor keeps memory the graph does not need; returns false if the memory cannot be
+    // obtained. Pools that allocate on demand may ignore this.
+    virtual bool reserve(size_t size) {
+        GGML_UNUSED(size);
+        return true;
+    }
+
+    // the bytes of device memory the pool holds, allocations in use included
+    virtual size_t capacity() const {
+        return SIZE_MAX;
+    }
+
+    // the most that has been allocated at once since the last reset_peak(), which a CUDA graph captured
+    // meanwhile relies on staying in the pool
+    virtual size_t peak() const {
+        return 0;
+    }
+    virtual void reset_peak() {}
 };
+
+// the bytes that an allocation of `size` bytes takes from a pool
+static constexpr size_t ggml_cuda_pool_alloc_size(size_t size) {
+    return (size + 127) & ~size_t(127);
+}
 
 template<typename T>
 struct ggml_cuda_pool_alloc {
@@ -1166,6 +1216,33 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+struct ggml_cuda_graph_key {
+    const void * first_node_ptr = nullptr;
+    uint64_t topology_hash_lo = 0;
+    uint64_t topology_hash_hi = 0;
+    uint64_t topology_ordinal = 0;
+    int phase = 0;
+
+    bool operator==(const ggml_cuda_graph_key & other) const {
+        return first_node_ptr == other.first_node_ptr &&
+            topology_hash_lo == other.topology_hash_lo &&
+            topology_hash_hi == other.topology_hash_hi &&
+            topology_ordinal == other.topology_ordinal &&
+            phase == other.phase;
+    }
+};
+
+struct ggml_cuda_graph_key_hash {
+    size_t operator()(const ggml_cuda_graph_key & key) const {
+        size_t hash = (size_t) key.first_node_ptr;
+        hash ^= (size_t) key.topology_hash_lo + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= (size_t) key.topology_hash_hi + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= (size_t) key.topology_ordinal + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        hash ^= (size_t) key.phase + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        return hash;
+    }
+};
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1175,15 +1252,34 @@ struct ggml_cuda_graph {
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
+        if (gap_trace_start_event != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(gap_trace_start_event));
+        }
+        if (gap_trace_router_event != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(gap_trace_router_event));
+        }
+        if (gap_trace_router_done_event != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(gap_trace_router_done_event));
+        }
+        if (gap_trace_end_event != nullptr) {
+            CUDA_CHECK(cudaEventDestroy(gap_trace_end_event));
+        }
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
+    size_t pool_end = 0; // how far into the memory pool the captured kernels reach
     size_t num_nodes = 0;
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    // after an out-of-memory instantiate/launch the graph runs eagerly for oom_skip_calls calls;
+    // the window doubles with every further failure (oom_backoff) and resets once a launch succeeds
+    uint32_t oom_skip_calls = 0;
+    uint32_t oom_backoff = 0;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    uint64_t last_phase_generation = 0;
+    uint64_t last_cgraph_uid = 0;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1191,6 +1287,37 @@ struct ggml_cuda_graph {
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
     };
     std::vector<node_properties> node_props;
+
+    struct gap_trace_pending_state {
+        bool valid = false;
+        bool has_router = false;
+        bool router_timing_valid = false;
+        int mode = 0;
+        int router_layer = -1;
+        int n_nodes = 0;
+        int kernel_nodes = 0;
+        uint64_t cpu_start_us = 0;
+        uint64_t cpu_end_us = 0;
+        uint64_t prepare_start_us = 0;
+        uint64_t prepare_end_us = 0;
+        uint64_t evaluate_start_us = 0;
+        uint64_t evaluate_end_us = 0;
+        uint64_t instantiate_start_us = 0;
+        uint64_t instantiate_end_us = 0;
+        uint64_t update_start_us = 0;
+        uint64_t update_end_us = 0;
+        uint64_t launch_start_us = 0;
+        uint64_t launch_end_us = 0;
+        char first[128] = {};
+        char last[128] = {};
+    };
+
+    cudaEvent_t gap_trace_start_event = nullptr;
+    cudaEvent_t gap_trace_router_event = nullptr;
+    cudaEvent_t gap_trace_router_done_event = nullptr;
+    cudaEvent_t gap_trace_end_event = nullptr;
+    int gap_trace_kernel_nodes = 0;
+    gap_trace_pending_state gap_trace_pending;
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
@@ -1360,21 +1487,66 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+    // the largest memory pool need that ggml_backend_cuda_graph_reserve has logged
+    size_t pool_reserve_logged = 0;
+
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // The default key remains first_node_ptr.  Phase-managed schedulers use a
+    // stable topology key so their executable graphs can survive graph metadata
+    // and scheduler reconstruction.
+    std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
+    std::unordered_map<uint64_t, ggml_cuda_graph_key> cuda_graph_keys_by_uid;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+    int graph_cache_phase = 0;
+    uint64_t graph_cache_generation = 0;
+    uint64_t graph_cache_next_ordinal = 0;
+    bool graph_cache_phase_swept = false;
+    bool graph_cache_phase_seen = false;
+
+    uint64_t graph_cache_topology_new = 0;
+    uint64_t graph_cache_topology_matched = 0;
+    uint64_t graph_cache_topology_invalidated = 0;
+    uint64_t graph_cache_signature_collisions = 0;
+    uint64_t graph_cache_reuse_candidates = 0;
+    uint64_t graph_cache_reuse_direct = 0;
+    uint64_t graph_cache_reuse_update = 0;
+    uint64_t graph_cache_reinstantiate = 0;
+
+    uint64_t graph_cache_capture_start = 0;
+    uint64_t graph_cache_instantiate_start = 0;
+    uint64_t graph_cache_update_start = 0;
+    uint64_t graph_cache_replay_start = 0;
+
+    uint64_t graph_compute_calls       = 0;
+    uint64_t graph_compatible_calls    = 0;
+    uint64_t graph_capture_calls       = 0;
+    uint64_t graph_instantiate_calls   = 0;
+    uint64_t graph_exec_update_calls   = 0;
+    uint64_t graph_launch_calls        = 0;
+    uint64_t graph_oom_fallbacks       = 0;
+    uint64_t graph_replay_calls        = 0;
+    uint64_t graph_fallback_calls      = 0;
+    uint64_t graph_fallback_disabled   = 0;
+    uint64_t graph_fallback_ineligible = 0;
+    uint64_t graph_fallback_warmup     = 0;
+    uint64_t graph_fallback_changed    = 0;
+
+    cudaEvent_t gap_trace_origin_event = nullptr;
+    uint64_t gap_trace_origin_cpu_us = 0;
+
+    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                // Phase-managed entries are retired explicitly.  In particular,
+                // decode graphs must remain pinned during a long prefill phase.
+                if (it->first.phase == 0 &&
+                        time_now - it->second->last_used_time >= 10'000'000) {
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -1382,12 +1554,53 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();
+    }
+
+    struct graph_lookup {
+        ggml_cuda_graph * graph = nullptr;
+        bool phase_reentry = false;
+        bool had_instance = false;
+    };
+
+    graph_lookup cuda_graph_begin(const ggml_cuda_graph_key & key, uint64_t cgraph_uid) {
+        ggml_cuda_graph * graph = cuda_graph(key);
+        graph_lookup result = { graph, false, graph->instance != nullptr };
+
+        if (key.phase == 0) {
+            return result;
+        }
+
+        graph_cache_phase_seen = true;
+        if (graph->last_phase_generation == 0) {
+            graph_cache_topology_new++;
+        } else if (graph->last_phase_generation != graph_cache_generation) {
+            graph_cache_topology_matched++;
+            result.phase_reentry = true;
+        } else if (graph->last_cgraph_uid == cgraph_uid && !graph_cache_phase_swept) {
+            // Seeing the first split for a second time means one complete phase
+            // topology has been observed.  Entries not seen in this generation
+            // represent topology that disappeared during reconstruction.
+            for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
+                if (it->first.phase == key.phase &&
+                        it->second->last_phase_generation != graph_cache_generation) {
+                    it = cuda_graphs.erase(it);
+                    graph_cache_topology_invalidated++;
+                } else {
+                    ++it;
+                }
+            }
+            graph_cache_phase_swept = true;
+        }
+
+        graph->last_phase_generation = graph_cache_generation;
+        graph->last_cgraph_uid = cgraph_uid;
+        return result;
     }
 
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know

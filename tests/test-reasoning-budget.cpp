@@ -9,6 +9,7 @@
 #endif
 
 #include <cmath>
+#include <climits>
 #include <cstddef>
 #include <cstdio>
 #include <string>
@@ -124,6 +125,70 @@ static void test_reasoning_budget(
     (void)sequence;
 }
 
+// Check every token across multiple reasoning blocks, including the complete
+// forced end/response suffix and the return to unchanged logits between blocks.
+static void test_reasoning_budget_windows(
+    const char * test_name,
+    const std::vector<llama_token> & sequence,
+    const std::vector<llama_token> & start_tokens,
+    const std::vector<llama_token> & end_tokens,
+    const std::vector<llama_token> & forced_tokens,
+    int32_t budget,
+    const std::vector<size_t> & force_starts
+) {
+    auto * sampler = common_reasoning_budget_init(
+        nullptr, start_tokens, end_tokens, forced_tokens, budget, REASONING_BUDGET_IDLE);
+
+    llama_token max_token = 1;
+    for (auto token : sequence)      max_token = std::max(max_token, token);
+    for (auto token : start_tokens)  max_token = std::max(max_token, token);
+    for (auto token : end_tokens)    max_token = std::max(max_token, token);
+    for (auto token : forced_tokens) max_token = std::max(max_token, token);
+
+    std::vector<llama_token_data> cur((size_t) max_token + 1);
+    for (size_t force_start : force_starts) {
+        GGML_ASSERT(!forced_tokens.empty());
+        GGML_ASSERT(force_start + forced_tokens.size() <= sequence.size());
+    }
+
+    // Include one apply after the last accepted token to catch late forcing or
+    // a suffix that fails to finish.
+    for (size_t i = 0; i <= sequence.size(); i++) {
+        llama_token expected_forced = -1;
+        for (size_t force_start : force_starts) {
+            if (i >= force_start && i - force_start < forced_tokens.size()) {
+                GGML_ASSERT(expected_forced == -1);
+                expected_forced = forced_tokens[i - force_start];
+            }
+        }
+
+        for (size_t j = 0; j < cur.size(); j++) {
+            cur[j] = { (llama_token) j, logf((float) (j + 1)), 0.0f };
+        }
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(sampler, &cur_p);
+
+        for (size_t j = 0; j < cur.size(); j++) {
+            const float expected = expected_forced == -1 || cur[j].id == expected_forced
+                ? logf((float) (j + 1)) : -INFINITY;
+            if (cur[j].logit != expected) {
+                fprintf(stderr, "Test '%s' FAILED: i=%zu, token=%d, expected_forced=%d, logit=%g, expected=%g\n",
+                    test_name, i, (int) cur[j].id, (int) expected_forced, cur[j].logit, expected);
+                GGML_ASSERT(false && "Unexpected reasoning budget logits");
+            }
+        }
+
+        if (i < sequence.size()) {
+            // During generation the accepted token must be the one apply forced.
+            GGML_ASSERT(expected_forced == -1 || sequence[i] == expected_forced);
+            llama_sampler_accept(sampler, sequence[i]);
+        }
+    }
+
+    llama_sampler_free(sampler);
+    fprintf(stderr, "  Test '%s' passed (%zu forcing windows)\n", test_name, force_starts.size());
+}
+
 // UTF-8 boundary detection unit test
 // Tests common_utf8_is_complete() from reasoning-budget.h
 static void test_utf8_boundary_detection() {
@@ -227,7 +292,80 @@ int main(void) {
             3);     // forcing continues through i=3
     }
 
-    printf("OK (5 tests passed)\n");
+    // Test 6: K3-style empty historical think blocks must not consume the budget
+    // for the current turn. The tags share the think token and separator; the
+    // response suffix shares the opening token but is not a new think block.
+    {
+        const std::vector<llama_token> start = {100, 101, 102};
+        const std::vector<llama_token> end = {103, 101, 102};
+        const std::vector<llama_token> forced = {104, 103, 101, 102, 100, 105, 102};
+        const std::vector<llama_token> sequence = {
+            100, 101, 102, 103, 101, 102, 100, 105, 102, 50, // empty history + response
+            100, 101, 102, 103, 101, 102, 100, 105, 102, 51, // empty history + response
+            100, 101, 102, 50, 51, 52,                     // current block uses budget=3
+            104, 103, 101, 102, 100, 105, 102, 53,
+        };
+        test_reasoning_budget_windows("empty historical blocks then budgeted turn",
+            sequence, start, end, forced, 3, {26});
+    }
+
+    // Test 7: A natural end after some reasoning must leave a fresh full budget
+    // for the next block, with response text in between left untouched.
+    {
+        const std::vector<llama_token> start = {100};
+        const std::vector<llama_token> end = {101};
+        const std::vector<llama_token> forced = {102, 101, 103};
+        const std::vector<llama_token> sequence = {
+            100, 50, 101, 51, 100, 52, 53, 54, 102, 101, 103, 55,
+        };
+        test_reasoning_budget_windows("natural end then full budget rearm",
+            sequence, start, end, forced, 3, {8});
+    }
+
+    // Test 8: Both forced transitions must start at the first forced token and
+    // complete the entire end tag plus response suffix before passing through.
+    {
+        const std::vector<llama_token> start = {100, 101, 102};
+        const std::vector<llama_token> end = {103, 101, 102};
+        const std::vector<llama_token> forced = {104, 103, 101, 102, 100, 105, 102};
+        const std::vector<llama_token> sequence = {
+            100, 101, 102, 50, 51, 104, 103, 101, 102, 100, 105, 102, 52,
+            100, 101, 102, 53, 54, 104, 103, 101, 102, 100, 105, 102, 55,
+        };
+        test_reasoning_budget_windows("forced end and response suffix then rearm",
+            sequence, start, end, forced, 2, {5, 18});
+    }
+
+    // Test 9: Zero budget must force immediately after every complete opening
+    // tag, including after an earlier forced transition.
+    {
+        const std::vector<llama_token> start = {100, 101, 102};
+        const std::vector<llama_token> end = {103, 101, 102};
+        const std::vector<llama_token> forced = {104, 103, 101, 102, 100, 105, 102};
+        const std::vector<llama_token> sequence = {
+            100, 101, 102, 104, 103, 101, 102, 100, 105, 102, 50,
+            100, 101, 102, 104, 103, 101, 102, 100, 105, 102, 51,
+        };
+        test_reasoning_budget_windows("zero budget rearms on each block",
+            sequence, start, end, forced, 0, {3, 14});
+    }
+
+    // Test 10: common_sampler_init maps an unlimited budget to INT_MAX when
+    // keeping this sampler for lazy grammar. Repeated blocks stay unforced.
+    {
+        const std::vector<llama_token> start = {100, 101, 102};
+        const std::vector<llama_token> end = {103, 101, 102};
+        const std::vector<llama_token> forced = {104, 103, 101, 102, 100, 105, 102};
+        const std::vector<llama_token> sequence = {
+            100, 101, 102, 103, 101, 102,
+            100, 101, 102, 50, 51, 52, 103, 101, 102,
+            100, 101, 102, 53, 54, 55, 56, 57, 103, 101, 102, 58,
+        };
+        test_reasoning_budget_windows("unlimited budget across repeated blocks",
+            sequence, start, end, forced, INT_MAX, {});
+    }
+
+    printf("OK (10 tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();

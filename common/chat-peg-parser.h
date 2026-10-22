@@ -63,6 +63,7 @@ class common_chat_peg_builder : public common_peg_parser_builder {
     static constexpr const char * TOOL_ARG_NAME         = "tool-arg-name";
     static constexpr const char * TOOL_ARG_VALUE        = "tool-arg-value";
     static constexpr const char * TOOL_ARG_STRING_VALUE = "tool-arg-string-value";  // For schema-declared string types
+    static constexpr const char * TOOL_ARG_RAW_STRING_VALUE = "tool-arg-raw-string-value";  // String taken exactly as written
 
     // Low-level tag methods (from former common_chat_peg_base_builder)
     common_peg_parser reasoning_block(const common_peg_parser & p) { return tag(REASONING_BLOCK, p); }
@@ -90,6 +91,8 @@ class common_chat_peg_builder : public common_peg_parser_builder {
 
     // Use for schema-declared string types - won't be treated as potential JSON container
     common_peg_parser tool_arg_string_value(const common_peg_parser & p) { return tag(TOOL_ARG_STRING_VALUE, p); }
+    // A string value whose surrounding whitespace belongs to it (DSML parameters sit between tags on one line)
+    common_peg_parser tool_arg_raw_string_value(const common_peg_parser & p) { return tag(TOOL_ARG_RAW_STRING_VALUE, p); }
     common_peg_parser tool_arg_json_value(const common_peg_parser & p) { return atomic(tag(TOOL_ARG_VALUE, p)); }
 
 

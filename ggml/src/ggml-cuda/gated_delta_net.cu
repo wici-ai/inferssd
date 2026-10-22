@@ -1,4 +1,5 @@
 #include "gated_delta_net.cuh"
+#include "cpu-parity.cuh"
 
 template <int S_v, bool KDA>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
@@ -145,6 +146,78 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+// Decode-only Kimi KDA path matching the production AVX-512 CPU oracle.  A
+// block owns one head and a thread owns one state column, preserving the CPU
+// operation order within that column without cross-thread reductions.
+static __global__ void gated_delta_net_kda_cpu_parity_128(
+        const float * q,
+        const float * k,
+        const float * v,
+        const float * g,
+        const float * beta,
+        const float * curr_state,
+        float *       dst,
+        int64_t       H,
+        int64_t       sq1,
+        int64_t       sq2,
+        int64_t       sq3,
+        int64_t       sv1,
+        int64_t       sv2,
+        int64_t       sv3,
+        int64_t       sb1,
+        int64_t       sb2,
+        int64_t       sb3,
+        const uint3   neqk1_magic,
+        const uint3   rq3_magic,
+        float         scale) {
+    constexpr int S_v = 128;
+
+    const int      col      = threadIdx.x;
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const uint32_t iq1      = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3      = fastdiv(sequence, rq3_magic);
+
+    const float * q_t = q + iq3*sq3 + iq1*sq1;
+    const float * k_t = k + iq3*sq3 + iq1*sq1;
+    const float * v_t = v + sequence*sv3 + h_idx*sv1;
+
+    const int64_t gb_offset = sequence*sb3 + h_idx*sb1;
+    const float * g_t       = g + gb_offset*S_v;
+    const float   beta_val  = beta[gb_offset];
+
+    const int64_t attn_score_elems = S_v*H;
+    float *       attn_data        = dst + h_idx*S_v;
+    float *       state            = dst + attn_score_elems + (sequence*H + h_idx)*S_v*S_v;
+    const float * state_in         = curr_state + (sequence*H + h_idx)*S_v*S_v;
+    float *       state_col        = state + col*S_v;
+    const float * state_in_col     = state_in + col*S_v;
+
+    GGML_UNUSED(sq2);
+    GGML_UNUSED(sv2);
+    GGML_UNUSED(sb2);
+
+    __shared__ float decay[S_v];
+    decay[col] = ggml_cuda_kimi_expf_cpu(g_t[col]);
+    __syncthreads();
+
+#pragma unroll
+    for (int i = 0; i < S_v; ++i) {
+        state_col[i] = __fmul_rn(state_in_col[i], decay[i]);
+    }
+
+    const float kv_col = ggml_cuda_kimi_dot_f32_avx512_128(state_col, k_t);
+    const float delta_col = __fmul_rn(__fsub_rn(v_t[col], kv_col), beta_val);
+
+#pragma unroll
+    for (int i = 0; i < S_v; ++i) {
+        state_col[i] = __fmaf_rn(k_t[i], delta_col, state_col[i]);
+    }
+
+    const float attn_col = ggml_cuda_kimi_dot_f32_avx512_128(state_col, q_t);
+    attn_data[col] = __fmul_rn(attn_col, scale);
+}
+
 template <bool KDA>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -261,7 +334,17 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     cudaStream_t stream = ctx.stream();
 
-    if (kda) {
+    if (kda && S_v == 128 && H == 96 && n_tokens == 1 && n_seqs == 1 &&
+            ggml_cuda_kimi_kda_cpu_parity_enabled(dst)) {
+        const uint3 neqk1_magic = init_fastdiv_values(neqk1);
+        const uint3 rq3_magic   = init_fastdiv_values(rq3);
+        const dim3  grid_dims(H, n_seqs, 1);
+        const dim3  block_dims(128, 1, 1);
+        gated_delta_net_kda_cpu_parity_128<<<grid_dims, block_dims, 0, stream>>>(
+            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
+            sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2, sb3,
+            neqk1_magic, rq3_magic, scale);
+    } else if (kda) {
         launch_gated_delta_net<true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
             S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
             sb1, sb2, sb3, neqk1, rq3, scale, stream);

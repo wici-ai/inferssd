@@ -108,6 +108,25 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
+    // same as above, but with explicit hparams instead of model.hparams
+    // note: the cache keeps a reference to hparams, so it must outlive the cache
+    //       (e.g. DSV4 passes per-sub-cache copies owned by llama_kv_cache_dsv4)
+    llama_kv_cache(
+            const llama_model & model,
+          const llama_hparams & hparams,
+                    ggml_type   type_k,
+                    ggml_type   type_v,
+                         bool   v_trans,
+                         bool   offload,
+                         bool   unified,
+                     uint32_t   kv_size,
+                     uint32_t   n_seq_max,
+                     uint32_t   n_pad,
+                     uint32_t   n_swa,
+               llama_swa_type   swa_type,
+        const layer_filter_cb & filter,
+        const  layer_reuse_cb & reuse);
+
     ~llama_kv_cache() = default;
 
     //
@@ -150,10 +169,22 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    // state_write() of only the cells at positions in [p0, p1], for an owner that saves part of what the cache holds
+    void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) const;
+
+    // whether the sequence has a cell at every position in [p0, p1]
+    bool seq_has_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
+
+    // model layer ids of the layers that own storage in this cache (layers that reuse another layer are not listed)
+    std::vector<uint32_t> get_layer_ids() const;
+
+    // the whole K tensor [n_embd_k_gqa, kv_size, n_stream] backing layer il
+    ggml_tensor * get_k_storage(int32_t il) const;
 
     //
     // graph_build API
@@ -207,6 +238,17 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    // true if llama_kv_cell_ext holds information that has to survive a state save/restore
+    bool has_cell_ext() const;
+
+    // for every token of the ubatch, the ids of the n tokens that precede it in its sequence
+    // example for M-RoPE image case: tokens A B X X X C, where X is a 3-token image at pos 2 spanning positions 2..4:
+    //   tok: A B X X X C
+    //   pos: 0 1 2 2 2 5
+    //   prev, n=2: A -> [NULL, NULL], B -> [NULL, A], 3rd X -> [X, X], C -> [X, X]
+    // note: used by n-gram input embeddings
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     const llama_model & model;
@@ -384,6 +426,9 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    // see llama_kv_cache::get_prev_tokens()
+    void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
 private:
     llama_memory_status status;

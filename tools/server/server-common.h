@@ -9,6 +9,7 @@
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <string>
 #include <vector>
 #include <cinttypes>
@@ -227,6 +228,18 @@ public:
     server_tokens clone() const;
 };
 
+// A prompt that continues, as text, the cached tokens it shares a prefix with takes their token ids for that text.
+// A reply rendered back into the next turn's history can give back other tokens than the ones generated (a text
+// does not tokenize back to the tokens it was generated as), so the prompt parts from the cache inside the reply;
+// the cached ids are the ones the model produced for that text, and their KV is what it computed. From where the
+// token ids part, the prompt's tokens that spell exactly the text of the cached ones up to a boundary where both
+// end a token are replaced by those cached ones, up to the furthest such boundary. `piece` gives a token's text,
+// or nothing for a token that stands for more than its spelling (a control or user-defined token) or has no text:
+// such a token matches only the same id at a boundary of both, so a control token never trades places with its
+// literal spelling and no token the prompt lacks is taken. Returns the common prefix of `cached` and `prompt` after.
+size_t server_tokens_reuse_text(const llama_tokens & cached, llama_tokens & prompt,
+                                const std::function<std::string(llama_token)> & piece);
+
 
 //
 // tokenizer and input processing utils
@@ -248,6 +261,8 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
  * - only string, example: "string"
  * - mixed string and tokens, example: [12, 34, "string", 56, 78]
  */
+llama_tokens tokenize_chat_prompt(const llama_vocab * vocab, const json & data, bool add_special = true);
+
 llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special);
 
 // return the last index of character that can form a valid string
@@ -256,7 +271,7 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 size_t validate_utf8(const std::string& text);
 
 // process mtmd prompt, return the server_tokens containing both text tokens and media chunks
-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files);
+server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files, const std::vector<llama_tokenize_input_span> & input_spans = {});
 
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
@@ -294,6 +309,7 @@ struct server_chat_params {
     bool enable_thinking = true;
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;
+    std::string reasoning_budget_suffix;
     std::string media_path;
     bool force_pure_content = false;
 };
@@ -302,6 +318,11 @@ struct server_chat_params {
 json oaicompat_completion_params_parse(const json & body);
 
 // used by /chat/completions endpoint
+// Recent assistant turns as this server generated them (content, reasoning, tool-call arguments). Clients send
+// earlier turns back re-serialized, often without the reasoning; oaicompat_chat_params_parse renders the turns it
+// recognizes as generated, so the prompt matches the cache and the model sees what it actually wrote.
+void server_turn_memory_record(const common_chat_msg & msg);
+
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,

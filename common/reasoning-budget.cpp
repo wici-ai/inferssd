@@ -50,6 +50,8 @@ struct common_reasoning_budget_ctx {
 
     // for forcing
     size_t force_pos;         // next position in forced_tokens to force
+    bool protocol_end_token = false, protocol_end_complete = false;
+    std::string log_prefix;
 };
 
 static const char * common_reasoning_budget_name(const struct llama_sampler * /*smpl*/) {
@@ -60,17 +62,22 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
     auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
 
     switch (ctx->state) {
+        case REASONING_BUDGET_DONE:
         case REASONING_BUDGET_IDLE:
         {
             if (ctx->start_matcher.advance(token)) {
+                // Prompt replay can contain completed reasoning blocks from earlier turns.
+                // Give each new block its own budget, including after a forced end.
                 ctx->state = REASONING_BUDGET_COUNTING;
                 ctx->remaining = ctx->budget;
-                LOG_INF("reasoning-budget: activated, budget=%d tokens\n", ctx->budget);
+                ctx->end_matcher.reset();
+                ctx->force_pos = 0;
+                LOG_INF("%sreasoning-budget: activated, budget=%d tokens\n", ctx->log_prefix.c_str(), ctx->budget);
 
                 if (ctx->remaining <= 0) {
                     ctx->state = REASONING_BUDGET_FORCING;
                     ctx->force_pos = 0;
-                    LOG_INF("reasoning-budget: budget=0, forcing immediately\n");
+                    LOG_INF("%sreasoning-budget: budget=0, forcing immediately\n", ctx->log_prefix.c_str());
                 }
             }
             break;
@@ -78,9 +85,15 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
         case REASONING_BUDGET_COUNTING:
         case REASONING_BUDGET_WAITING_UTF8:
         {
-            if (ctx->end_matcher.advance(token)) {
+            if (ctx->end_matcher.advance(token) || ctx->protocol_end_complete) {
                 ctx->state = REASONING_BUDGET_DONE;
-                LOG_INF("reasoning-budget: deactivated (natural end)\n");
+                LOG_INF("%sreasoning-budget: deactivated (natural end)\n", ctx->log_prefix.c_str());
+                break;
+            }
+
+            if (ctx->protocol_end_token) {
+                // Do not insert a second close/message inside a natural end.
+                if (ctx->state == REASONING_BUDGET_COUNTING) { --ctx->remaining; }
                 break;
             }
 
@@ -95,7 +108,7 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
                     ctx->state = REASONING_BUDGET_FORCING;
                     ctx->force_pos = 0;
                     ctx->end_matcher.reset();
-                    LOG_INF("reasoning-budget: UTF-8 complete, now forcing end sequence\n");
+                    LOG_INF("%sreasoning-budget: UTF-8 complete, now forcing end sequence\n", ctx->log_prefix.c_str());
                 }
             } else if (ctx->state == REASONING_BUDGET_COUNTING) {
                 ctx->remaining--;
@@ -104,11 +117,11 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
                         ctx->state = REASONING_BUDGET_FORCING;
                         ctx->force_pos = 0;
                         ctx->end_matcher.reset();
-                        LOG_INF("reasoning-budget: budget exhausted, forcing end sequence\n");
+                        LOG_INF("%sreasoning-budget: budget exhausted, forcing end sequence\n", ctx->log_prefix.c_str());
                     } else {
                         ctx->state = REASONING_BUDGET_WAITING_UTF8;
                         ctx->end_matcher.reset();
-                        LOG_INF("reasoning-budget: budget exhausted, waiting for UTF-8 completion\n");
+                        LOG_INF("%sreasoning-budget: budget exhausted, waiting for UTF-8 completion\n", ctx->log_prefix.c_str());
                     }
                 }
             }
@@ -118,12 +131,11 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
             ctx->force_pos++;
             if (ctx->force_pos >= ctx->forced_tokens.size()) {
                 ctx->state = REASONING_BUDGET_DONE;
-                LOG_INF("reasoning-budget: forced sequence complete, done\n");
+                LOG_INF("%sreasoning-budget: forced sequence complete, done\n", ctx->log_prefix.c_str());
             }
             break;
-        case REASONING_BUDGET_DONE:
-            break;
     }
+    ctx->protocol_end_token = ctx->protocol_end_complete = false;
 }
 
 static void common_reasoning_budget_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
@@ -165,13 +177,15 @@ static struct llama_sampler * common_reasoning_budget_init_state(
 
 static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl) {
     const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
-    return common_reasoning_budget_init_state(
+    auto * clone = common_reasoning_budget_init_state(
         ctx->vocab,
         ctx->start_matcher.tokens,
         ctx->end_matcher.tokens,
         ctx->forced_tokens,
         ctx->budget,
         ctx->state);
+    ((common_reasoning_budget_ctx *) clone->ctx)->log_prefix = ctx->log_prefix;
+    return clone;
 }
 
 static void common_reasoning_budget_free(struct llama_sampler * smpl) {
@@ -261,4 +275,17 @@ common_reasoning_budget_state common_reasoning_budget_get_state(const struct lla
         return REASONING_BUDGET_IDLE;
     }
     return ((const common_reasoning_budget_ctx *)smpl->ctx)->state;
+}
+
+void common_reasoning_budget_set_log_context(struct llama_sampler * smpl, int32_t slot, int64_t task) {
+    if (!smpl) { return; }
+    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+    ctx->log_prefix = "id " + std::to_string(slot) + " | task " + std::to_string(task) + " | ";
+}
+
+void common_reasoning_budget_set_protocol_end(struct llama_sampler * smpl, bool in_progress, bool complete) {
+    if (!smpl) { return; }
+    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+    ctx->protocol_end_token = in_progress;
+    ctx->protocol_end_complete = complete;
 }

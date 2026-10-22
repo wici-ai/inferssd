@@ -4,16 +4,18 @@
 
 #include <array>
 #include <cassert>
+#include <cmath>
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
-#define LLAMA_MAX_EXPERTS 512 // Qwen3 Next
+#define LLAMA_MAX_EXPERTS 1024 // Kimi K3 uses 896 experts
 
 enum llama_expert_gating_func_type {
     LLAMA_EXPERT_GATING_FUNC_TYPE_NONE           = 0,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX        = 1,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID        = 2,
     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT = 3, // applied to the router weights instead of the logits
+    LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS  = 4, // DeepSeek-V4.1: sqrt(softplus(logits))
 };
 
 enum llama_swa_type {
@@ -42,6 +44,7 @@ struct llama_hparams {
 
     uint32_t n_ctx_train; // context size the model was trained on
     uint32_t n_embd;
+    uint32_t n_embd_inp_enc_impl = 0;
     uint32_t n_layer;
     int32_t n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
     uint32_t n_expert = 0;
@@ -95,6 +98,7 @@ struct llama_hparams {
     float f_norm_eps;
     float f_norm_rms_eps;
     float f_norm_group_eps;
+    float f_post_norm_eps = 0.0f;
 
     float f_attn_logit_softcapping   = 50.0f;
     float f_router_logit_softcapping = 30.0f;
@@ -147,6 +151,13 @@ struct llama_hparams {
 
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
+
+    // Kimi K3
+    uint32_t n_expert_latent      = 0;
+    uint32_t attn_res_block_size  = 0;
+    float    kda_gate_lower_bound = -INFINITY;
+    float    situ_beta            = 1.0f;
+    float    situ_linear_beta     = 0.0f;
 
     // for hybrid state space models
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
@@ -207,6 +218,36 @@ struct llama_hparams {
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
 
+    // DeepSeek-V4.1 (LLM_ARCH_DEEPSEEK41). Field names follow upstream so the model code ports as is;
+    // this fork's own DEEPSEEK4 port does not read them.
+    uint32_t dsv4_o_group_count        = 0;
+    uint32_t dsv4_o_lora_rank          = 0;
+    uint32_t dsv4_hc_mult              = 0;
+    uint32_t dsv4_hc_sinkhorn_iters    = 0;
+    uint32_t dsv4_hash_layer_count     = 0;
+    float    dsv4_compress_rope_base   = 0.0f;
+    float    dsv4_hc_eps               = 0.0f;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
+
+    // Engram n-gram lookup tables
+    uint32_t engram_n_head          = 0;
+    uint32_t engram_key_length      = 0;
+    uint32_t engram_max_ngram_size  = 0;
+    bool     engram_e4m3_e8m0_32_row264 = false;
+    std::array<uint32_t, LLAMA_MAX_LAYERS> engram_layer_ids;
+
+    // V4.1 compresses KV on a few source layers and shares each stream with the layers that
+    // follow. For every layer these hold the layer that published what it reads, or -1 when it
+    // reads nothing; an entry equal to the layer itself marks a source. The KV cache aliases a
+    // reader's storage onto its source's, so the roles live here rather than on the model.
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_kv_source;
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_index_key_source;
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv41_topk_source;
+
+    bool dsv41_is_kv_source   (uint32_t il) const { return dsv41_kv_source[il]        == (int32_t) il; }
+    bool dsv41_owns_index_k   (uint32_t il) const { return dsv41_index_key_source[il] == (int32_t) il; }
+    bool dsv41_is_index_source(uint32_t il) const { return dsv41_topk_source[il]      == (int32_t) il; }
+
     // qwen3vl deepstack
     uint32_t n_deepstack_layers = 0;
 
@@ -263,6 +304,9 @@ struct llama_hparams {
 
     // dimension of main + auxiliary input embeddings
     uint32_t n_embd_inp() const;
+
+    // Encoder input width can differ from the decoder/token embedding width.
+    uint32_t n_embd_inp_enc() const;
 
     // dimension of output embeddings
     uint32_t n_embd_out() const;

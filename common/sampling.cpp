@@ -12,6 +12,8 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 #include <vector>
 
@@ -113,6 +115,7 @@ struct common_sampler {
 
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
+    struct llama_sampler * loop_stop; // non-owning; owned by chain
     struct llama_sampler * chain;
 
     ring_buffer<llama_token> prev;
@@ -184,8 +187,16 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
+static bool common_model_is_kimi_k3(const struct llama_model * model) {
+    char architecture[64] = {};
+    const int32_t n = llama_model_meta_val_str(
+            model, "general.architecture", architecture, sizeof(architecture));
+    return n >= 0 && std::strcmp(architecture, "kimi-k3") == 0;
+}
+
 struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
+    const bool is_kimi_k3 = common_model_is_kimi_k3(model);
 
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
@@ -193,6 +204,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;
+    llama_sampler * loop_stop = nullptr;
     llama_sampler * chain = llama_sampler_chain_init(lparams);
 
     std::vector<llama_sampler *> samplers;
@@ -308,6 +320,15 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
         bool use_adaptive_p = false; // see below
 
+        // Kimi-K3 uses model-specific reasoning markers and phase transitions.
+        // Never install this sampler for another architecture.
+        if (is_kimi_k3) {
+            // loop_stop must run before the filters so they cannot drop the
+            // forced phase-transition or EOG token (all other logits become -inf).
+            loop_stop = llama_sampler_init_loop_stop(vocab, 0, 0, 0, 0, false);
+            samplers.push_back(loop_stop);
+        }
+
         for (const auto & cnstr : params.samplers) {
             switch (cnstr) {
                 case COMMON_SAMPLER_TYPE_DRY:
@@ -393,9 +414,10 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     auto * result = new common_sampler {
         /* .params  = */ params,
-        /* .grmr    = */ grmr,
-        /* .rbudget = */ rbudget,
-        /* .chain   = */ chain,
+        /* .grmr      = */ grmr,
+        /* .rbudget   = */ rbudget,
+        /* .loop_stop = */ loop_stop,
+        /* .chain     = */ chain,
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
@@ -431,7 +453,8 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
     return true;
 }
 
-void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool accept_grammar) {
+void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool accept_grammar,
+                           bool reasoning_end_token, bool reasoning_end_complete) {
     if (!gsmpl) {
         return;
     }
@@ -441,6 +464,7 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     // grammar_should_apply() checks the reasoning budget state, so calculate this before we accept
     accept_grammar = accept_grammar && grammar_should_apply(gsmpl);
 
+    common_reasoning_budget_set_protocol_end(gsmpl->rbudget, reasoning_end_token, reasoning_end_complete);
     llama_sampler_accept(gsmpl->rbudget, token);
 
     if (gsmpl->grmr && accept_grammar) {
@@ -452,6 +476,28 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
     gsmpl->prev.push_back(token);
 }
 
+bool common_sampler_is_budget_forcing(const struct common_sampler * gsmpl) {
+    return gsmpl && gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING;
+}
+
+void common_sampler_set_log_context(struct common_sampler * gsmpl, int32_t slot, int64_t task) {
+    if (gsmpl) { common_reasoning_budget_set_log_context(gsmpl->rbudget, slot, task); }
+}
+
+bool common_sampler_loop_stop_triggered(const struct common_sampler * gsmpl, int32_t * matched_len) {
+    if (gsmpl == nullptr) {
+        if (matched_len != nullptr) {
+            *matched_len = 0;
+        }
+        return false;
+    }
+    return llama_sampler_loop_stop_triggered(gsmpl->loop_stop, matched_len);
+}
+
+int32_t common_sampler_loop_stop_min_len(const struct common_sampler * gsmpl) {
+    return gsmpl == nullptr ? 0 : llama_sampler_loop_stop_min_len(gsmpl->loop_stop);
+}
+
 void common_sampler_reset(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return;
@@ -461,14 +507,26 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
+    llama_sampler * chain = llama_sampler_clone(gsmpl->chain);
+    llama_sampler * loop_stop = nullptr;
+    const int n = llama_sampler_chain_n(chain);
+    for (int i = 0; i < n; ++i) {
+        llama_sampler * candidate = llama_sampler_chain_get(chain, i);
+        if (llama_sampler_loop_stop_min_len(candidate) > 0) {
+            loop_stop = candidate;
+            break;
+        }
+    }
+
     return new common_sampler {
-        /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .params    = */ gsmpl->params,
+        /* .grmr      = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget   = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .loop_stop = */ loop_stop,
+        /* .chain     = */ chain,
+        /* .prev      = */ gsmpl->prev,
+        /* .cur       = */ gsmpl->cur,
+        /* .cur_p     = */ gsmpl->cur_p,
     };
 }
 
@@ -517,6 +575,37 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
     }
 }
 
+static bool common_debug_sample_tokens_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("LLAMA_DEBUG_SAMPLE_TOKENS");
+        return env && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
+static void common_debug_sample_token(const struct llama_context * ctx, llama_token id) {
+    if (!common_debug_sample_tokens_enabled()) {
+        return;
+    }
+
+    const std::string piece = common_token_to_piece(ctx, id, true);
+    std::fprintf(stderr, "[sample_debug] id=%d piece=\"", id);
+    for (unsigned char c : piece) {
+        if (c == '\n') {
+            std::fprintf(stderr, "\\n");
+        } else if (c == '\r') {
+            std::fprintf(stderr, "\\r");
+        } else if (c == '\t') {
+            std::fprintf(stderr, "\\t");
+        } else if (std::isprint(c)) {
+            std::fputc(c, stderr);
+        } else {
+            std::fprintf(stderr, "\\x%02x", (unsigned)c);
+        }
+    }
+    std::fprintf(stderr, "\"\n");
+}
+
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return nullptr;
@@ -525,7 +614,11 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
-llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx,
+                                 bool grammar_first, const common_sampler_pre_chain & pre_chain) {
+    if (pre_chain && !grammar_first) {
+        throw std::invalid_argument("pre-chain constraints require grammar-first sampling");
+    }
     llama_synchronize(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
@@ -544,6 +637,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         id = llama_get_sampled_token_ith(ctx, idx);
 
         if (id != LLAMA_TOKEN_NULL) {
+            if (pre_chain) {
+                throw std::runtime_error("pre-chain constraints cannot use backend sampled tokens");
+            }
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
@@ -554,6 +650,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             gsmpl->cur[0] = { id, 0.0f, 1.0f };
             cur_p = { gsmpl->cur.data(), gsmpl->cur.size(), 0, true };
 
+            common_debug_sample_token(ctx, id);
             return id;
         }
     }
@@ -567,11 +664,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         llama_sampler_apply(grmr, &cur_p);
     }
 
+    if (pre_chain) { pre_chain(cur_p); }
+
     llama_sampler_apply(chain, &cur_p);
+
+    if (pre_chain && (cur_p.selected < 0 || size_t(cur_p.selected) >= cur_p.size ||
+            !std::isfinite(cur_p.data[cur_p.selected].logit))) {
+        throw std::runtime_error("constraint conflict: no legal selection after sampling transforms");
+    }
 
     id = cur_p.data[cur_p.selected].id;
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
+        common_debug_sample_token(ctx, id);
         return id;
     }
 
@@ -584,6 +689,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
         const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
         if (is_valid) {
+            common_debug_sample_token(ctx, id);
             return id;
         }
     }
@@ -604,6 +710,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     id = cur_p.data[cur_p.selected].id;
 
+    common_debug_sample_token(ctx, id);
     return id;
 }
 

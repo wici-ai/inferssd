@@ -43,6 +43,10 @@
 #include <TargetConditionals.h>
 #endif
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -375,6 +379,31 @@ void * ggml_aligned_malloc(size_t size) {
         GGML_LOG_ERROR("%s: %s (attempted to allocate %6.2f MB)\n", __func__, error_desc, size/(1024.0*1024.0));
         return NULL;
     }
+#if defined(__linux__) && !defined(GGML_USE_CPU_HBM) && !defined(TARGET_OS_OSX)
+    // For large allocations, hint the kernel to back this region with transparent
+    // huge pages. This dramatically reduces TLB pressure on memory-bandwidth-bound
+    // workloads such as large MoE expert matmuls where the working set is many GiB
+    // and the per-token weight read pattern walks millions of 4 KiB pages.
+    //
+    // The hint is best-effort: it only succeeds when the system THP policy is
+    // "always" or "madvise" and the allocation is mapped (large mallocs typically
+    // are), and silently does nothing otherwise.
+    //
+    // 2 MiB threshold avoids spending syscall time on small tensor metadata;
+    // madvise itself only operates at huge-page boundaries internally.
+    if (aligned_memory != NULL && size >= (2u << 20)) {
+        const uintptr_t hp_align = (1u << 21); // 2 MiB
+        uintptr_t       addr_v   = (uintptr_t) aligned_memory;
+        uintptr_t       addr_a   = (addr_v + hp_align - 1) & ~(hp_align - 1);
+        size_t          off      = (size_t) (addr_a - addr_v);
+        if (off < size) {
+            size_t hp_size = (size - off) & ~(hp_align - 1);
+            if (hp_size > 0) {
+                (void) madvise((void *) addr_a, hp_size, MADV_HUGEPAGE);
+            }
+        }
+    }
+#endif
     return aligned_memory;
 #endif
 }
@@ -744,6 +773,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
+    [GGML_TYPE_F8_E4M3_B128] = {
+        .type_name                = "f8_e4m3_b128",
+        .blck_size                = QK_F8_E4M3_B128,
+        .type_size                = sizeof(block_f8_e4m3_b128),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3_b128,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_f8_e4m3_b128_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1001,6 +1038,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "MOE_FUSED_UP_GATE",
     "OUT_PROD",
 
     "SCALE",
@@ -1073,9 +1111,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "HC_WEIGHTED_SUM",
+    "LIGHTNING_INDEXER",
+    "DSV4_HC_COMB",
+    "DSV4_HC_POST",
+    "ROW_MASK",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1111,6 +1154,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
+    "up[i]*act(gate[i])",
     "X*Y",
 
     "x*v",
@@ -1183,9 +1227,14 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "hc_weighted_sum(x,w)",
+    "lightning_indexer(q,k,weights,scale_embd,scale_heads)",
+    "dsv4_hc_comb(mixes, scale, base)",
+    "dsv4_hc_post(x, residual, post, comb)",
+    "row_mask(n_visible)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1212,9 +1261,12 @@ static const char * GGML_UNARY_OP_NAME[GGML_UNARY_OP_COUNT] = {
     "CEIL",
     "ROUND",
     "TRUNC",
+    "FP4_ACT_QUANT",
+    "FP8_ACT_QUANT",
+    "SINKHORN_4X4",
 };
 
-static_assert(GGML_UNARY_OP_COUNT == 22, "GGML_UNARY_OP_COUNT != 22");
+static_assert(GGML_UNARY_OP_COUNT == 25, "GGML_UNARY_OP_COUNT != 25");
 
 static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "REGLU",
@@ -1223,9 +1275,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "SWIGLU_OAI",
     "GEGLU_ERF",
     "GEGLU_QUICK",
+    "SWIGLU_CLAMP",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
+static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
 
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
@@ -1408,6 +1461,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
         case GGML_FTYPE_MOSTLY_MXFP4:         wtype = GGML_TYPE_MXFP4; break;
         case GGML_FTYPE_MOSTLY_NVFP4:         wtype = GGML_TYPE_NVFP4; break;
+        case GGML_FTYPE_MOSTLY_F8_E4M3_MXFP4: wtype = GGML_TYPE_F8_E4M3_B128; break;
         case GGML_FTYPE_MOSTLY_Q2_K:          wtype = GGML_TYPE_Q2_K;  break;
         case GGML_FTYPE_MOSTLY_Q3_K:          wtype = GGML_TYPE_Q3_K;  break;
         case GGML_FTYPE_MOSTLY_Q4_K:          wtype = GGML_TYPE_Q4_K;  break;
@@ -2942,6 +2996,28 @@ struct ggml_tensor * ggml_trunc_inplace(
     return ggml_unary_inplace(ctx, a, GGML_UNARY_OP_TRUNC);
 }
 
+struct ggml_tensor * ggml_fp4_act_quant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->ne[0] % 32 == 0);
+    return ggml_unary(ctx, a, GGML_UNARY_OP_FP4_ACT_QUANT);
+}
+
+struct ggml_tensor * ggml_fp8_act_quant(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->ne[0] % 64 == 0);
+    return ggml_unary(ctx, a, GGML_UNARY_OP_FP8_ACT_QUANT);
+}
+
+struct ggml_tensor * ggml_sinkhorn_4x4(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->ne[0] == 4 && a->ne[1] == 4);
+    return ggml_unary(ctx, a, GGML_UNARY_OP_SINKHORN_4X4);
+}
+
 struct ggml_tensor * ggml_glu(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -3071,6 +3147,17 @@ struct ggml_tensor * ggml_swiglu_oai(
         float                 limit) {
     struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU_OAI, false);
     ggml_set_op_params_f32(result, 2, alpha);
+    ggml_set_op_params_f32(result, 3, limit);
+
+    return result;
+}
+
+struct ggml_tensor * ggml_swiglu_clamp(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 limit) {
+    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU_CLAMP, false);
     ggml_set_op_params_f32(result, 3, limit);
 
     return result;
@@ -3249,6 +3336,134 @@ struct ggml_tensor * ggml_mul_mat(
     return result;
 }
 
+// ggml_hc_weighted_sum
+
+struct ggml_tensor * ggml_hc_weighted_sum(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(a->ne[1] == b->ne[0]);
+    GGML_ASSERT(a->ne[3] == 1);
+    GGML_ASSERT(b->ne[1] == a->ne[2] && b->ne[2] == 1 && b->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[2]);
+
+    result->op     = GGML_OP_HC_WEIGHTED_SUM;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
+// ggml_lightning_indexer
+
+struct ggml_tensor * ggml_lightning_indexer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        float                 scale_embd,
+        float                 scale_heads) {
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(q->ne[1] == weights->ne[0]);
+    GGML_ASSERT(k->ne[1] == 1);
+    GGML_ASSERT(q->ne[2] == weights->ne[1]);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(k->ne[3] == weights->ne[3]);
+
+    int64_t ne[4] = { k->ne[2], q->ne[2], 1, q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_f32(result, 0, scale_embd);
+    ggml_set_op_params_f32(result, 1, scale_heads);
+
+    result->op   = GGML_OP_LIGHTNING_INDEXER;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = weights;
+
+    return result;
+}
+
+// ggml_dsv4_hc_comb
+
+struct ggml_tensor * ggml_dsv4_hc_comb(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps,
+        int32_t               n_iter) {
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_iter > 0);
+
+    const int64_t hc         = 4;
+    const int64_t hc_mix_dim = (2 + hc)*hc;
+    const int64_t n_tokens   = mixes->ne[1];
+
+    GGML_ASSERT(mixes->ne[0] == hc_mix_dim);
+    GGML_ASSERT(mixes->ne[2] == 1 && mixes->ne[3] == 1);
+    GGML_ASSERT(scale->ne[0] >= 3);
+    GGML_ASSERT(scale->ne[1] == 1 && scale->ne[2] == 1 && scale->ne[3] == 1);
+    GGML_ASSERT(base->ne[0] == hc_mix_dim);
+    GGML_ASSERT(base->ne[1] == 1 && base->ne[2] == 1 && base->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, n_iter);
+
+    result->op     = GGML_OP_DSV4_HC_COMB;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+
+    return result;
+}
+
+// ggml_dsv4_hc_post
+
+struct ggml_tensor * ggml_dsv4_hc_post(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * residual,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * comb) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(residual->type == GGML_TYPE_F32);
+    GGML_ASSERT(post->type == GGML_TYPE_F32);
+    GGML_ASSERT(comb->type == GGML_TYPE_F32);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t hc       = residual->ne[1];
+
+    GGML_ASSERT(hc > 0);
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(residual->ne[0] == n_embd && residual->ne[2] == n_tokens && residual->ne[3] == 1);
+    GGML_ASSERT(post->ne[0] == hc && post->ne[1] == n_tokens && post->ne[2] == 1 && post->ne[3] == 1);
+    GGML_ASSERT(comb->ne[0] == hc && comb->ne[1] == hc && comb->ne[2] == n_tokens && comb->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+
+    result->op     = GGML_OP_DSV4_HC_POST;
+    result->src[0] = x;
+    result->src[1] = residual;
+    result->src[2] = post;
+    result->src[3] = comb;
+
+    return result;
+}
+
 void ggml_mul_mat_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
@@ -3257,6 +3472,41 @@ void ggml_mul_mat_set_prec(
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 0, prec_i32);
+}
+
+// same storage as ggml_mul_mat_set_prec() (op_params[0]) and ggml_flash_attn_ext_set_prec() (op_params[3])
+bool ggml_prec_set_acc(
+        struct ggml_tensor * a,
+        enum ggml_prec       prec) {
+    switch (a->op) {
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            {
+                const int32_t prec_i32 = (int32_t) prec;
+                ggml_set_op_params_i32(a, 0, prec_i32);
+            }
+            break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            {
+                const int32_t prec_i32 = (int32_t) prec;
+                ggml_set_op_params_i32(a, 3, prec_i32);
+            }
+            break;
+        default:
+            return false;
+    };
+
+    return true;
+}
+
+void ggml_mul_mat_set_hint(
+        struct ggml_tensor * a,
+        enum ggml_op_hint    hint) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
+
+    const int32_t hint_i32 = (int32_t) hint;
+
+    ggml_set_op_params_i32(a, 1, hint_i32);
 }
 
 // ggml_mul_mat_id
@@ -3295,6 +3545,87 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_moe_up_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as_up,
+        struct ggml_tensor  * as_gate,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        enum ggml_unary_op    op) {
+    return ggml_moe_up_gate_limit(ctx, as_up, as_gate, b, ids, op, 0.0f);
+}
+
+struct ggml_tensor * ggml_moe_up_gate_limit(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as_up,
+        struct ggml_tensor  * as_gate,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        enum ggml_unary_op    op,
+        float                 limit) {
+    const char * mixed_env = getenv("GGML_MOE_STREAM_FUSED_UP_GATE_MIXED_TYPES");
+    const bool mixed_enabled = mixed_env && mixed_env[0] && mixed_env[0] != '0';
+    const bool mixed_iq2_iq3 =
+        as_gate != NULL &&
+        ((as_up->type == GGML_TYPE_IQ2_S && as_gate->type == GGML_TYPE_IQ3_XXS) ||
+         (as_up->type == GGML_TYPE_IQ3_XXS && as_gate->type == GGML_TYPE_IQ2_S));
+    const bool same_or_scoped_mixed = as_gate != NULL &&
+        (as_up->type == as_gate->type || (mixed_enabled && mixed_iq2_iq3));
+    const char * force_explicit_env = getenv("GGML_MOE_UP_GATE_LIMIT_FORCE_EXPLICIT");
+    const bool force_explicit = force_explicit_env && force_explicit_env[0] && force_explicit_env[0] != '0';
+    const char * allow_limited_fused_env = getenv("GGML_MOE_UP_GATE_LIMIT_ALLOW_FUSED");
+    const bool allow_limited_fused = allow_limited_fused_env && allow_limited_fused_env[0] && allow_limited_fused_env[0] != '0';
+    const bool limited_requires_explicit = limit > 1.0e-6f && !allow_limited_fused;
+    if (force_explicit || limited_requires_explicit || as_gate == NULL || !same_or_scoped_mixed || !ggml_are_same_shape(as_up, as_gate)) {
+        struct ggml_tensor * up   = ggml_mul_mat_id(ctx, as_up, b, ids);
+        struct ggml_tensor * gate = as_gate ? ggml_mul_mat_id(ctx, as_gate, b, ids) : up;
+
+        if (op == GGML_UNARY_OP_SILU && as_gate && limit > 1.0e-6f) {
+            gate = ggml_clamp(ctx, gate, -INFINITY, limit);
+            up   = ggml_clamp(ctx, up,   -limit,   limit);
+        }
+
+        switch (op) {
+            case GGML_UNARY_OP_SILU:
+                return as_gate ? ggml_swiglu_split(ctx, gate, up) : ggml_swiglu(ctx, up);
+            case GGML_UNARY_OP_GELU:
+                return as_gate ? ggml_geglu_split(ctx, gate, up) : ggml_geglu(ctx, up);
+            case GGML_UNARY_OP_GELU_ERF:
+                return as_gate ? ggml_geglu_erf_split(ctx, gate, up) : ggml_geglu_erf(ctx, up);
+            case GGML_UNARY_OP_GELU_QUICK:
+                return as_gate ? ggml_geglu_quick_split(ctx, gate, up) : ggml_geglu_quick(ctx, up);
+            default:
+                GGML_ABORT("unsupported MoE fused up/gate op");
+        }
+    }
+
+    GGML_ASSERT(!ggml_is_transposed(as_up));
+    GGML_ASSERT(!ggml_is_transposed(as_gate));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(as_up->ne[3] == 1);
+    GGML_ASSERT(as_gate->ne[3] == 1);
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ids->ne[1] == b->ne[2]);
+    GGML_ASSERT(as_up->ne[0] == b->ne[0]);
+    GGML_ASSERT(ids->ne[0] % b->ne[1] == 0);
+
+    const int64_t ne[4] = { as_up->ne[1], ids->ne[0], b->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) op);
+    ggml_set_op_params_f32(result, 1, limit);
+
+    result->op     = GGML_OP_MOE_FUSED_UP_GATE;
+    result->src[0] = as_up;
+    result->src[1] = as_gate;
+    result->src[2] = b;
+    result->src[3] = ids;
 
     return result;
 }
@@ -3893,7 +4224,7 @@ struct ggml_tensor * ggml_set_rows(
     GGML_ASSERT(b->ne[2] % c->ne[1] == 0);
     GGML_ASSERT(b->ne[3] % c->ne[2] == 0);
     GGML_ASSERT(c->ne[3] == 1);
-    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    GGML_ASSERT(b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16);
     GGML_ASSERT(c->type == GGML_TYPE_I64 || c->type == GGML_TYPE_I32);
 
     GGML_ASSERT(ggml_is_contiguous_rows(a));
@@ -3987,6 +4318,26 @@ struct ggml_tensor * ggml_diag_mask_zero_inplace(
         struct ggml_tensor  * a,
         int                   n_past) {
     return ggml_diag_mask_zero_impl(ctx, a, n_past, true);
+}
+
+struct ggml_tensor * ggml_row_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * n_visible,
+        enum ggml_type       type,
+        int64_t              n_kv,
+        int64_t              n_stream) {
+    GGML_ASSERT(n_visible->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_vector(n_visible));
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(n_kv > 0 && n_stream > 0);
+    GGML_ASSERT(n_visible->ne[0] % n_stream == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type,
+            n_kv, n_visible->ne[0]/n_stream, 1, n_stream);
+    result->op     = GGML_OP_ROW_MASK;
+    result->src[0] = n_visible;
+
+    return result;
 }
 
 // ggml_soft_max
@@ -4147,7 +4498,7 @@ static struct ggml_tensor * ggml_rope_impl(
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
-    int32_t params[15] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
+    int32_t params[16] = { /*n_past*/ 0, n_dims, mode, /*n_ctx*/ 0, n_ctx_orig };
     memcpy(params +  5, &freq_base,    sizeof(float));
     memcpy(params +  6, &freq_scale,   sizeof(float));
     memcpy(params +  7, &ext_factor,   sizeof(float));
@@ -4159,6 +4510,8 @@ static struct ggml_tensor * ggml_rope_impl(
     } else {
         memset(params + 11, 0,         sizeof(int32_t) * GGML_MROPE_SECTIONS);
     }
+    params[15] = 0; // n_offs, set via ggml_rope_set_offset()
+
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_ROPE;
@@ -4369,6 +4722,20 @@ struct ggml_tensor * ggml_rope_multi_back(
     result->op = GGML_OP_ROPE_BACK;
     return result;
 }
+
+struct ggml_tensor * ggml_rope_set_offset(
+        struct ggml_tensor  * a,
+        int                   n_offs) {
+    GGML_ASSERT(a->op == GGML_OP_ROPE || a->op == GGML_OP_ROPE_BACK);
+    GGML_ASSERT(n_offs >= 0);
+
+    const int32_t mode = ggml_get_op_params_i32(a, 2);
+    GGML_ASSERT(mode != GGML_ROPE_TYPE_VISION);
+
+    ggml_set_op_params_i32(a, 15, n_offs);
+    return a;
+}
+
 // ggml_clamp
 
 struct ggml_tensor * ggml_clamp(
@@ -5208,7 +5575,7 @@ static struct ggml_tensor * ggml_fill_impl(
     struct ggml_tensor  * a,
     float                 c,
     bool                  inplace) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
     GGML_ASSERT(ggml_is_contiguous(a));
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
@@ -5372,6 +5739,15 @@ enum ggml_prec ggml_flash_attn_ext_get_prec(
     const int32_t prec_i32 = ggml_get_op_params_i32(a, 3);
 
     return (enum ggml_prec) prec_i32;
+}
+
+void ggml_flash_attn_ext_set_n_kv_max(
+        struct ggml_tensor * a,
+        int32_t              n_kv_max) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(n_kv_max >= 0);
+
+    ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
 void ggml_flash_attn_ext_add_sinks(
@@ -6554,6 +6930,21 @@ static void ggml_compute_backward(
                                 grad)));        // [m,p,qq,rr]
             }
         } break;
+        case GGML_OP_HC_WEIGHTED_SUM: {
+            if (src0_needs_grads || src1_needs_grads) {
+                struct ggml_tensor * grad_x = ggml_repeat(ctx, grad, src0);
+
+                if (src0_needs_grads) {
+                    struct ggml_tensor * src1_cont = ggml_is_contiguous(src1) ? src1 : ggml_cont(ctx, src1);
+                    struct ggml_tensor * weights = ggml_reshape_2d(ctx, src1_cont, 1, src1->ne[0]);
+                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad_x, weights));
+                }
+                if (src1_needs_grads) {
+                    struct ggml_tensor * weighted_grad = ggml_mul(ctx, src0, grad_x);
+                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_sum_rows(ctx, weighted_grad), src1));
+                }
+            }
+        } break;
         case GGML_OP_SCALE: {
             if (src0_needs_grads) {
                 float s;
@@ -7681,6 +8072,7 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_Q8_0:    result = quantize_q8_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_MXFP4:   result = quantize_mxfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_NVFP4:   result = quantize_nvfp4  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_F8_E4M3_B128: result = quantize_f8_e4m3_b128(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_K:    result = quantize_q2_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q3_K:    result = quantize_q3_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_K:    result = quantize_q4_K   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

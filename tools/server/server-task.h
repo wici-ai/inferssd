@@ -83,6 +83,7 @@ struct task_params {
 
     // per-request parameters for chat parsing
     common_chat_parser_params chat_parser_params;
+    bool tool_call_required = false; // tool_choice=required with declared tools
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
@@ -98,6 +99,7 @@ struct task_result_state {
     common_chat_parser_params chat_parser_params;
     common_chat_msg chat_msg;
     std::string generated_text; // append new chunks of generated text here
+    common_chat_output_source output_source;
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
 
@@ -105,6 +107,16 @@ struct task_result_state {
     // track output item / content block state across chunks
     bool thinking_block_started = false;
     bool text_block_started = false;
+
+    // Some chat templates (notably DeepSeek V4 with </think> injection)
+    // can have the model open with stray punctuation or a "filename" hint
+    // (e.g. " game.html") glued directly to a code fence, breaking the
+    // markdown render. Buffer the first few content bytes, decide once
+    // how much to strip, then commit. Stays empty/false until the strip
+    // decision is made; once made, prefix_strip_decided=true and
+    // prefix_strip_bytes is the stable number of leading bytes to drop.
+    bool prefix_strip_decided = false;
+    int  prefix_strip_bytes = 0;
 
     // for OpenAI Responses streaming API
     const std::string oai_resp_id;
@@ -123,7 +135,8 @@ struct task_result_state {
         const std::string & text_added,
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs,
-        bool filter_tool_calls = false);
+        bool filter_tool_calls = false,
+        const common_chat_output_source * source = nullptr);
 };
 
 struct server_task {
@@ -145,6 +158,10 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
+
+    // tokens of the prompt that other conversations with the same setup share: the leading system messages with
+    // the tools (0 if unknown); the server keeps a state there that later conversations start from
+    int64_t n_shared_prefix = 0;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -337,6 +354,7 @@ struct completion_token_output {
 struct server_task_result_cmpl_final : server_task_result {
     std::string content;
     llama_tokens tokens;
+    common_chat_output_source output_source;
 
     bool stream;
     bool include_usage;
@@ -381,7 +399,8 @@ struct server_task_result_cmpl_final : server_task_result {
 
     virtual void update(task_result_state & state) override {
         is_updated = true;
-        oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
+        oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs, false, &output_source);
+        server_turn_memory_record(oaicompat_msg);
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;
@@ -412,6 +431,7 @@ struct server_task_result_cmpl_final : server_task_result {
 struct server_task_result_cmpl_partial : server_task_result {
     std::string  content;
     llama_tokens tokens;
+    common_chat_output_source output_source;
 
     int32_t n_decoded;
     int32_t n_prompt_tokens;
@@ -513,6 +533,10 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_prompt_tokens_processed_total = 0;
     uint64_t t_prompt_processing_total       = 0;
     uint64_t n_tokens_predicted_total        = 0;
+    uint64_t n_sampler_struct_top1_replacements_total = 0;
+    uint64_t n_sampler_struct_mixed_samples_total = 0;
+    uint64_t n_k3_constraint_conflicts_total = 0;
+    uint64_t n_k3_protocol_forced_tokens_total = 0;
     uint64_t t_tokens_generation_total       = 0;
 
     uint64_t n_tokens_max = 0;
@@ -573,12 +597,16 @@ struct server_prompt_checkpoint {
 
     std::vector<uint8_t> data;
 
+    // a checkpoint of a prompt the cache keeps on disk has its data in the prompt's file instead
+    size_t file_offset = 0;
+    size_t file_size   = 0;
+
     size_t size() const {
-        return data.size();
+        return data.empty() ? file_size : data.size();
     }
 
     bool empty() const {
-        return data.empty();
+        return size() == 0;
     }
 
     void clear() {
@@ -586,6 +614,8 @@ struct server_prompt_checkpoint {
         pos_max = 0;
         n_tokens = 0;
         data.clear();
+        file_offset = 0;
+        file_size   = 0;
     }
 };
 
@@ -596,8 +626,13 @@ struct server_prompt {
 
     std::list<server_prompt_checkpoint> checkpoints;
 
+    // a prompt the cache keeps on disk: its state and its checkpoints' data are in this file instead
+    std::string file;
+    size_t      file_data_offset = 0;
+    size_t      file_data_size   = 0;
+
     size_t size() const {
-        size_t res = data.size();
+        size_t res = file.empty() ? data.size() : file_data_size;
 
         for (const auto & checkpoint : checkpoints) {
             res += checkpoint.size();
@@ -614,10 +649,34 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             data,
-            checkpoints
+            checkpoints,
+            file,
+            file_data_offset,
+            file_data_size,
         };
     }
 };
+
+// For a state that cannot be rolled back: how many tokens of `tokens_new` a prompt lets a slot skip, restoring its
+// whole state (when that is a prefix of tokens_new) or else its last checkpoint inside the common prefix, always
+// leaving a token of tokens_new to process for the logits; -1 if neither fits. *checkpoint is the checkpoint to
+// restore, nullptr for the whole state.
+int64_t server_prompt_reuse_full(
+        const server_prompt              & prompt,
+        const server_tokens              & tokens_new,
+        const server_prompt_checkpoint ** checkpoint);
+
+inline const server_prompt_checkpoint * server_prompt_find_checkpoint_before_pos(
+        const server_prompt & prompt,
+        llama_pos             p0) {
+    for (auto it = prompt.checkpoints.rbegin(); it != prompt.checkpoints.rend(); ++it) {
+        if (it->pos_max < p0 && it->n_tokens >= 0 && (size_t) it->n_tokens <= prompt.tokens.size()) {
+            return &*it;
+        }
+    }
+
+    return nullptr;
+}
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
@@ -625,21 +684,53 @@ struct server_prompt_cache {
         this->limit_tokens = limit_tokens;
     }
 
-    std::list<server_prompt> states;
+    // Keep the prompts in files under `dir` instead of in memory. They outlive the server: prompts saved by a server
+    // with the same fingerprint (model file, build) are found again on start, other files are removed. Loading a
+    // prompt leaves its file in place, so a shared prefix serves every conversation that starts with it.
+    void use_dir(const std::string & dir, const std::string & fingerprint);
+
+    bool on_disk() const {
+        return !dir.empty();
+    }
+
+    std::list<server_prompt> states; // least recently used first
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 
-    // in tokens, 0 = no limit
+    // in tokens, 0 = no limit (memory only)
     size_t limit_tokens = 0;
+
+    std::string dir;
+    std::string fingerprint;
 
     size_t size() const;
 
     size_t n_tokens() const;
 
-    server_prompt * alloc(const server_prompt & prompt, size_t state_size);
+    // Save the slot's state for `prompt`, with the prompt's checkpoints, unless the cache can already restore it.
+    // The state is the current one (current = true) or the one the sequence had after prompt.tokens, which needs a
+    // memory that can save an earlier state (llama_state_seq_can_save_at).
+    void save(
+            const server_prompt        & prompt,
+            bool                         current,
+            llama_context              * ctx,
+            int32_t                      id_slot,
+            common_context_seq_rm_type   seq_rm_type);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx, int32_t id_slot);
+    // Load into the slot the cached state that lets it skip the most of `tokens_new`, if that is more than
+    // `n_reuse_slot`, the number of tokens the slot can already reuse.
+    bool load(
+            server_prompt              & prompt,
+            const server_tokens        & tokens_new,
+            int64_t                      n_reuse_slot,
+            llama_context              * ctx,
+            int32_t                      id_slot,
+            common_context_seq_rm_type   seq_rm_type);
 
     void update();
+
+private:
+    bool contains(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type);
+    void remove(std::list<server_prompt>::iterator it);
 };

@@ -75,6 +75,12 @@ void ggml_cuda_op_round(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_trunc(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+void ggml_cuda_op_fp4_act_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+void ggml_cuda_op_fp8_act_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+void ggml_cuda_op_sinkhorn_4x4(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_op_reglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
@@ -82,6 +88,8 @@ void ggml_cuda_op_geglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_swiglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_geglu_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
@@ -111,4 +119,12 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_oai_single(float x, float g
     float out_glu = x / (1.0f + expf(-x * alpha));
     out_glu = out_glu * (1.0f + g);
     return out_glu;
+}
+
+// out = silu(min(gate, limit)) * clamp(up, -limit, limit)
+__device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, float up, float limit) {
+    gate = fminf(gate, limit);
+    up = fmaxf(fminf(up, limit), -limit);
+
+    return ggml_cuda_op_silu_single(gate) * up;
 }

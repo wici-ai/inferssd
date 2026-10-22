@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "cpu-parity.cuh"
 #include "ggml.h"
 #include "softmax.cuh"
 
@@ -44,6 +45,33 @@ struct soft_max_params {
     float m0;
     float m1;
 };
+
+static __global__ void kimi_kda_soft_max_cpu_parity_f32(
+        const float * x, float * dst, const int ncols, const float scale) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    x   += int64_t(blockIdx.x)*ncols;
+    dst += int64_t(blockIdx.x)*ncols;
+
+    float scaled[4];
+    float values[4];
+    float max_val = -INFINITY;
+    for (int col = 0; col < ncols; ++col) {
+        scaled[col] = __fmul_rn(x[col], scale);
+        max_val = max_val > scaled[col] ? max_val : scaled[col];
+    }
+    double sum = 0.0;
+    for (int col = 0; col < ncols; ++col) {
+        values[col] = ggml_cuda_kimi_expf_cpu(__fsub_rn(scaled[col], max_val));
+        sum = __dadd_rn(sum, (double) values[col]);
+    }
+    const float inv_sum = __double2float_rn(__ddiv_rn(1.0, sum));
+    for (int col = 0; col < ncols; ++col) {
+        dst[col] = ggml_cuda_kimi_mul_f32_cpu(values[col], inv_sum);
+    }
+}
 
 // When ncols_template == 0 the bounds for the loops in this function are not known and can't be unrolled.
 // As we want to keep pragma unroll for all other cases we suppress the clang transformation warning here.
@@ -435,6 +463,15 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     params.max_bias = max_bias;
     params.m0 = m0;
     params.m1 = m1;
+
+    if (ne00 >= 2 && ne00 <= 4 && src1 == nullptr && src2 == nullptr && max_bias == 0.0f &&
+            ggml_cuda_kimi_kda_cpu_parity_enabled(dst)) {
+        const dim3 block_nums(nrows_x, 1, 1);
+        const dim3 block_dims(32, 1, 1);
+        kimi_kda_soft_max_cpu_parity_f32<<<block_nums, block_dims, 0, stream>>>(
+            src0_d, dst_d, ne00, scale);
+        return;
+    }
 
     if (use_f16) {
         soft_max_f32_cuda(src0_d, (const half *) src1_d, (const float *) src2_d, dst_d, params, stream, ctx);

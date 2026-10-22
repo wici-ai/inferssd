@@ -913,6 +913,10 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// Set by ggml_cuda_flash_attn_ext_pool_size: launch_fattn then only adds up what it would take from the
+// memory pool, and launches nothing.
+extern thread_local size_t * ggml_cuda_fattn_pool_size_query;
+
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
@@ -946,6 +950,11 @@ void launch_fattn(
     const int cc  = ggml_cuda_info().devices[id].cc;
     const int nsm = ggml_cuda_info().devices[id].nsm;
 
+    size_t * pool_size_query = ggml_cuda_fattn_pool_size_query;
+    auto counted = [pool_size_query](size_t bytes) {
+        *pool_size_query += ggml_cuda_pool_alloc_size(bytes);
+    };
+
     ggml_cuda_pool_alloc<half>   K_f16(pool);
     ggml_cuda_pool_alloc<half>   V_f16(pool);
     ggml_cuda_pool_alloc<int>    KV_max(pool);
@@ -962,7 +971,9 @@ void launch_fattn(
     size_t nb22 = V->nb[2];
     size_t nb23 = V->nb[3];
 
-    if (need_f16_K && K->type != GGML_TYPE_F16) {
+    if (need_f16_K && K->type != GGML_TYPE_F16 && pool_size_query) {
+        counted(ggml_nelements(K)*sizeof(half));
+    } else if (need_f16_K && K->type != GGML_TYPE_F16) {
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
@@ -995,6 +1006,8 @@ void launch_fattn(
             nb21   = nb11;
             nb22   = nb12;
             nb23   = nb13;
+        } else if (pool_size_query) {
+            counted(ggml_nelements(V)*sizeof(half));
         } else {
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
@@ -1042,10 +1055,14 @@ void launch_fattn(
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
-        flash_attn_mask_to_KV_max<ncols1><<<blocks_num_KV_max, block_dim_KV_max, 0, main_stream>>>
-            ((const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
-        CUDA_CHECK(cudaGetLastError());
+        if (pool_size_query) {
+            counted(ne_KV_max*sizeof(int));
+        } else {
+            KV_max.alloc(ne_KV_max);
+            flash_attn_mask_to_KV_max<ncols1><<<blocks_num_KV_max, block_dim_KV_max, 0, main_stream>>>
+                ((const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
@@ -1086,7 +1103,11 @@ void launch_fattn(
         }
 
         if (ntiles_dst % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
-            dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
+            if (pool_size_query) {
+                counted(size_t(blocks_num.x) * ncols * (2 + DV/2) * sizeof(float2));
+            } else {
+                dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
+            }
         }
     } else {
         // parallel_blocks must not be larger than what the tensor size allows:
@@ -1118,10 +1139,17 @@ void launch_fattn(
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
 
-        if (parallel_blocks > 1) {
+        if (parallel_blocks > 1 && pool_size_query) {
+            counted(parallel_blocks*ggml_nelements(KQV)*sizeof(float));
+            counted(parallel_blocks*ggml_nrows(KQV)*sizeof(float2));
+        } else if (parallel_blocks > 1) {
             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
             dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
         }
+    }
+
+    if (pool_size_query) {
+        return;
     }
 
     float scale         = 1.0f;

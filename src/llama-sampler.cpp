@@ -3166,6 +3166,505 @@ static void llama_sampler_dry_free(struct llama_sampler * smpl) {
     delete (llama_sampler_dry *) smpl->ctx;
 }
 
+
+// ---------------------------------------------------------------------------
+// loop_stop: phase-aware repetition-loop termination
+// ---------------------------------------------------------------------------
+// On a detected degenerate repetition:
+//   * still inside the reasoning channel -> force the end-of-reasoning token
+//     sequence, then let the model produce the real answer;
+//   * already in the content channel    -> force EOG, ending the generation.
+//
+// Detection rule: the current suffix of `len` accepted tokens has appeared
+// `repeats` times earlier in the current phase, for the smallest such len in
+// [min_len, max_len]. Prompt, reasoning, and content histories are isolated by
+// clearing the history at the reasoning-start and reasoning-end markers.
+
+enum loop_stop_phase {
+    LOOP_STOP_PHASE_REASONING = 0,
+    LOOP_STOP_PHASE_CONTENT   = 1,
+};
+
+struct llama_sampler_loop_stop {
+    const llama_vocab * vocab;
+
+    const int32_t     min_len;
+    const int32_t     max_len;
+    const int32_t     repeats;
+    const llama_token eog_override;
+    const bool        verbose;
+
+    std::vector<llama_token> think_start;    // start-of-reasoning token sequence
+    std::vector<llama_token> think_end;      // end-of-reasoning token sequence
+    bool                     start_reasoning;
+
+    std::vector<llama_token> hist;
+    int32_t cap;
+
+    bool    triggered;
+    int32_t triggered_len;
+    int64_t n_triggered;
+    int64_t n_unforceable;
+    int64_t n_reason_end;
+    int64_t n_eog;
+
+    loop_stop_phase          phase;
+    std::vector<llama_token> pending;        // sequence currently being forced
+    size_t                   pending_pos;
+};
+
+static const char * llama_sampler_loop_stop_name(const struct llama_sampler * /*smpl*/) {
+    return "loop_stop";
+}
+
+static int32_t llama_loop_stop_env_int(const char * name, int32_t fallback) {
+    const char * v = std::getenv(name);
+    if (v == nullptr || v[0] == '\0') {
+        return fallback;
+    }
+    return (int32_t) std::strtol(v, nullptr, 10);
+}
+
+static std::string llama_loop_stop_token_to_piece(const llama_vocab * vocab, llama_token token) {
+    std::string piece(16, '\0');
+    int32_t n = llama_token_to_piece(vocab, token, piece.data(), (int32_t) piece.size(), 0, true);
+    if (n < 0) {
+        piece.resize(-n);
+        n = llama_token_to_piece(vocab, token, piece.data(), (int32_t) piece.size(), 0, true);
+    }
+    if (n < 0) {
+        return "<decode-error>";
+    }
+    piece.resize(n);
+    return piece;
+}
+
+static std::string llama_loop_stop_log_escape(const std::string & text) {
+    static const char hex[] = "0123456789abcdef";
+    std::string escaped;
+    escaped.reserve(text.size());
+    for (unsigned char c : text) {
+        switch (c) {
+            case '\\': escaped += "\\\\"; break;
+            case '"':    escaped += "\\\""; break;
+            case '\n':   escaped += "\\n";  break;
+            case '\r':   escaped += "\\r";  break;
+            case '\t':   escaped += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    escaped += "\\x";
+                    escaped += hex[c >> 4];
+                    escaped += hex[c & 0x0f];
+                } else {
+                    escaped += (char) c;
+                }
+                break;
+        }
+    }
+    return escaped;
+}
+
+static bool llama_loop_stop_tail_is(const std::vector<llama_token> & hist,
+                                    const std::vector<llama_token> & seq) {
+    if (seq.empty() || hist.size() < seq.size()) {
+        return false;
+    }
+    const size_t off = hist.size() - seq.size();
+    for (size_t i = 0; i < seq.size(); ++i) {
+        if (hist[off + i] != seq[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// mask every candidate except `forced`
+static bool llama_loop_stop_mask(llama_token_data_array * cur_p, llama_token forced) {
+    bool present = false;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        if (cur_p->data[i].id == forced) {
+            if (cur_p->data[i].logit > -INFINITY) {
+                present = true;
+            }
+            break;
+        }
+    }
+    if (!present) {
+        return false;
+    }
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        cur_p->data[i].logit = (cur_p->data[i].id == forced) ? 0.0f : -INFINITY;
+    }
+    return true;
+}
+
+static bool llama_sampler_loop_stop_pick_eog(
+        const llama_sampler_loop_stop * ctx,
+              llama_token_data_array  * cur_p,
+              llama_token             * out) {
+    if (ctx->eog_override > 0) {
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            if (cur_p->data[i].id == ctx->eog_override && cur_p->data[i].logit > -INFINITY) {
+                *out = ctx->eog_override;
+                return true;
+            }
+        }
+    }
+    const llama_token prefer[2] = { llama_vocab_eot(ctx->vocab), llama_vocab_eos(ctx->vocab) };
+    for (int k = 0; k < 2; ++k) {
+        if (prefer[k] < 0) {
+            continue;
+        }
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            if (cur_p->data[i].id == prefer[k] && cur_p->data[i].logit > -INFINITY) {
+                *out = prefer[k];
+                return true;
+            }
+        }
+    }
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        if (cur_p->data[i].logit > -INFINITY && llama_vocab_is_eog(ctx->vocab, cur_p->data[i].id)) {
+            *out = cur_p->data[i].id;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void llama_sampler_loop_stop_accept(struct llama_sampler * smpl, llama_token token) {
+    auto * ctx = (llama_sampler_loop_stop *) smpl->ctx;
+
+    ctx->hist.push_back(token);
+    if ((int32_t) ctx->hist.size() > ctx->cap) {
+        ctx->hist.erase(ctx->hist.begin(), ctx->hist.begin() + ((int32_t) ctx->hist.size() - ctx->cap));
+    }
+
+    // The prompt ends with the reasoning-start marker. Drop the complete prompt
+    // so repetition detection only compares model-generated reasoning tokens.
+    if (ctx->phase == LOOP_STOP_PHASE_REASONING && llama_loop_stop_tail_is(ctx->hist, ctx->think_start)) {
+        ctx->hist.clear();
+        ctx->triggered = false;
+        if (ctx->verbose) {
+            LLAMA_LOG_INFO("%s: reasoning-start observed, prompt history cleared\n", __func__);
+        }
+        return;
+    }
+
+    // currently forcing a sequence: advance the queue
+    if (!ctx->pending.empty()) {
+        if (ctx->pending_pos < ctx->pending.size() && token == ctx->pending[ctx->pending_pos]) {
+            ctx->pending_pos += 1;
+            if (ctx->pending_pos >= ctx->pending.size()) {
+                ctx->pending.clear();
+                ctx->pending_pos = 0;
+                if (ctx->phase == LOOP_STOP_PHASE_REASONING) {
+                    ctx->phase = LOOP_STOP_PHASE_CONTENT;
+                    ctx->hist.clear();
+                    if (ctx->verbose) {
+                        LLAMA_LOG_WARN("%s: reasoning channel closed, reasoning history cleared; generation continues in the content phase\n", __func__);
+                    }
+                }
+            }
+        } else {
+            // the forced token did not come back; drop the queue instead of wedging
+            if (ctx->verbose) {
+                LLAMA_LOG_WARN("%s: forced sequence desynchronised (got %d, expected %d); dropping it\n",
+                        __func__, (int) token,
+                        ctx->pending_pos < ctx->pending.size() ? (int) ctx->pending[ctx->pending_pos] : -1);
+            }
+            ctx->pending.clear();
+            ctx->pending_pos = 0;
+        }
+        ctx->triggered = false;
+        return;
+    }
+
+    // phase tracking: did we just observe the end-of-reasoning sequence?
+    if (ctx->phase == LOOP_STOP_PHASE_REASONING && llama_loop_stop_tail_is(ctx->hist, ctx->think_end)) {
+        ctx->phase = LOOP_STOP_PHASE_CONTENT;
+        ctx->hist.clear();
+        ctx->triggered = false;
+        if (ctx->verbose) {
+            LLAMA_LOG_INFO("%s: end-of-reasoning observed, reasoning history cleared; now in the content phase\n", __func__);
+        }
+        return;
+    }
+
+    ctx->triggered     = false;
+    ctx->triggered_len = 0;
+
+    const int32_t n = (int32_t) ctx->hist.size();
+    const int32_t n_blocks = ctx->repeats + 1;
+    if (n < ctx->min_len * n_blocks) {
+        return;
+    }
+
+    const int32_t max_l = std::min(ctx->max_len, n / n_blocks);
+    for (int32_t len = ctx->min_len; len <= max_l; ++len) {
+        const int32_t current_start = n - len;
+        std::vector<int32_t> matched_starts;
+        matched_starts.reserve(ctx->repeats);
+
+        // Look for earlier, non-overlapping occurrences of the current suffix.
+        // Occurrences may be adjacent to the suffix or separated by other tokens.
+        for (int32_t start = current_start - len; start >= 0 && (int32_t) matched_starts.size() < ctx->repeats; --start) {
+            bool same = true;
+            for (int32_t i = 0; i < len; ++i) {
+                if (ctx->hist[start + i] != ctx->hist[current_start + i]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) {
+                matched_starts.push_back(start);
+                start -= len - 1; // do not count overlapping earlier occurrences
+            }
+        }
+
+        if ((int32_t) matched_starts.size() >= ctx->repeats) {
+            ctx->triggered     = true;
+            ctx->triggered_len = len;
+            ctx->n_triggered  += 1;
+            if (ctx->verbose) {
+                std::string ids;
+                std::string text;
+                for (int32_t i = 0; i < len; ++i) {
+                    if (!ids.empty()) {
+                        ids += ",";
+                    }
+                    const llama_token repeated_token = ctx->hist[current_start + i];
+                    ids += std::to_string((int) repeated_token);
+                    text += llama_loop_stop_token_to_piece(ctx->vocab, repeated_token);
+                }
+
+                std::string prior_offsets;
+                for (int32_t start : matched_starts) {
+                    if (!prior_offsets.empty()) {
+                        prior_offsets += ",";
+                    }
+                    prior_offsets += std::to_string(start);
+                }
+
+                const std::string escaped_text = llama_loop_stop_log_escape(text);
+                LLAMA_LOG_WARN("%s: repetition loop detected phase=%s len=%d prior_offsets=[%s] current_offset=%d token_ids=[%s] text=\"%s\"\n",
+                        __func__,
+                        ctx->phase == LOOP_STOP_PHASE_REASONING ? "reasoning" : "content",
+                        len, prior_offsets.c_str(), current_start, ids.c_str(), escaped_text.c_str());
+            }
+            return;
+        }
+    }
+}
+
+static void llama_sampler_loop_stop_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (llama_sampler_loop_stop *) smpl->ctx;
+
+    // 1. a forced sequence is in flight
+    if (!ctx->pending.empty()) {
+        const llama_token want = ctx->pending[ctx->pending_pos];
+        if (!llama_loop_stop_mask(cur_p, want)) {
+            if (ctx->verbose) {
+                LLAMA_LOG_WARN("%s: cannot force reasoning-end token %d (not permitted); ending generation instead\n",
+                        __func__, (int) want);
+            }
+            ctx->pending.clear();
+            ctx->pending_pos = 0;
+            ctx->n_unforceable += 1;
+            llama_token eog = -1;
+            if (llama_sampler_loop_stop_pick_eog(ctx, cur_p, &eog)) {
+                llama_loop_stop_mask(cur_p, eog);
+            }
+            return;
+        }
+        return;
+    }
+
+    if (!ctx->triggered) {
+        return;
+    }
+    ctx->triggered = false; // one shot
+
+    // 2. still reasoning -> close the thinking channel and keep generating
+    if (ctx->phase == LOOP_STOP_PHASE_REASONING && !ctx->think_end.empty()) {
+        ctx->pending     = ctx->think_end;
+        ctx->pending_pos = 0;
+        ctx->n_reason_end += 1;
+        if (llama_loop_stop_mask(cur_p, ctx->pending[0])) {
+            return;
+        }
+        ctx->pending.clear();
+        ctx->pending_pos = 0;
+        ctx->n_unforceable += 1;
+        LLAMA_LOG_WARN("%s: reasoning-end sequence not forcible; falling back to EOG\n", __func__);
+    }
+
+    // 3. content phase (or no reasoning-end configured) -> end the generation
+    llama_token forced = -1;
+    if (!llama_sampler_loop_stop_pick_eog(ctx, cur_p, &forced)) {
+        ctx->n_unforceable += 1;
+        LLAMA_LOG_WARN("%s: loop detected but no permitted EOG token available; not stopping\n", __func__);
+        return;
+    }
+    llama_loop_stop_mask(cur_p, forced);
+    ctx->n_eog += 1;
+}
+
+static void llama_sampler_loop_stop_reset(struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_loop_stop *) smpl->ctx;
+    ctx->hist.clear();
+    ctx->triggered     = false;
+    ctx->triggered_len = 0;
+    ctx->n_triggered   = 0;
+    ctx->n_unforceable = 0;
+    ctx->n_reason_end  = 0;
+    ctx->n_eog         = 0;
+    ctx->phase         = ctx->start_reasoning ? LOOP_STOP_PHASE_REASONING : LOOP_STOP_PHASE_CONTENT;
+    ctx->pending.clear();
+    ctx->pending_pos   = 0;
+}
+
+static struct llama_sampler * llama_sampler_loop_stop_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const llama_sampler_loop_stop *) smpl->ctx;
+    return llama_sampler_init_loop_stop(ctx->vocab, ctx->min_len, ctx->max_len,
+            ctx->repeats, ctx->eog_override, ctx->verbose);
+}
+
+static void llama_sampler_loop_stop_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_loop_stop *) smpl->ctx;
+}
+
+static struct llama_sampler_i llama_sampler_loop_stop_i = {
+    /* .name  = */ llama_sampler_loop_stop_name,
+    /* .accept= */ llama_sampler_loop_stop_accept,
+    /* .apply = */ llama_sampler_loop_stop_apply,
+    /* .reset = */ llama_sampler_loop_stop_reset,
+    /* .clone = */ llama_sampler_loop_stop_clone,
+    /* .free  = */ llama_sampler_loop_stop_free,
+};
+
+struct llama_sampler * llama_sampler_init_loop_stop(
+        const struct llama_vocab * vocab,
+        int32_t min_len,
+        int32_t max_len,
+        int32_t repeats,
+        llama_token eog_override,
+        bool verbose) {
+    const char * disable = std::getenv("LLAMA_LOOP_STOP");
+    if (disable != nullptr && disable[0] == '0') {
+        return llama_sampler_init_empty("?loop_stop");
+    }
+
+    if (min_len <= 0) { min_len = llama_loop_stop_env_int("LLAMA_LOOP_STOP_MIN_LEN", 8); }
+    if (max_len <= 0) { max_len = llama_loop_stop_env_int("LLAMA_LOOP_STOP_MAX_LEN", 256); }
+    if (repeats <= 0) { repeats = llama_loop_stop_env_int("LLAMA_LOOP_STOP_REPEATS", 3); }
+    if (eog_override <= 0) {
+        eog_override = (llama_token) llama_loop_stop_env_int("LLAMA_LOOP_STOP_EOG", 0);
+    }
+    if (!verbose) {
+        verbose = llama_loop_stop_env_int("LLAMA_LOOP_STOP_LOG", 1) != 0;
+    }
+    if (min_len < 2)  { min_len = 2; }
+    if (max_len < min_len) { max_len = min_len; }
+    if (repeats < 1)  { repeats = 1; }
+
+    // reasoning markers (Kimi-K3: common/chat.cpp THINK_START / THINK_END)
+    std::vector<llama_token> think_start;
+    const char * start_env = std::getenv("LLAMA_LOOP_STOP_REASON_START");
+    const std::string start_str = (start_env != nullptr && start_env[0] != '\0')
+            ? std::string(start_env)
+            : std::string("<|open|>think<|sep|>");
+    if (!start_str.empty()) {
+        std::vector<llama_token> buf(start_str.size() + 8);
+        const int n = llama_tokenize(vocab, start_str.c_str(), (int32_t) start_str.size(),
+                buf.data(), (int32_t) buf.size(), false, true);
+        if (n > 0) {
+            buf.resize(n);
+            think_start = std::move(buf);
+        } else {
+            LLAMA_LOG_WARN("%s: could not tokenize reasoning-start marker %s\n", __func__, start_str.c_str());
+        }
+    }
+
+    std::vector<llama_token> think_end;
+    const char * end_env = std::getenv("LLAMA_LOOP_STOP_REASON_END");
+    const std::string end_str = (end_env != nullptr && end_env[0] != '\0')
+            ? std::string(end_env)
+            : std::string("<|close|>think<|sep|>");
+    if (!end_str.empty()) {
+        std::vector<llama_token> buf(end_str.size() + 8);
+        const int n = llama_tokenize(vocab, end_str.c_str(), (int32_t) end_str.size(),
+                buf.data(), (int32_t) buf.size(), false, true);
+        if (n > 0) {
+            buf.resize(n);
+            think_end = std::move(buf);
+        } else {
+            LLAMA_LOG_WARN("%s: could not tokenize reasoning-end marker %s\n", __func__, end_str.c_str());
+        }
+    }
+
+    const char * phase_env = std::getenv("LLAMA_LOOP_STOP_START_PHASE");
+    const bool start_reasoning = !(phase_env != nullptr && std::strcmp(phase_env, "content") == 0);
+
+    auto * ctx = new llama_sampler_loop_stop {
+        /* .vocab           = */ vocab,
+        /* .min_len         = */ min_len,
+        /* .max_len         = */ max_len,
+        /* .repeats         = */ repeats,
+        /* .eog_override    = */ eog_override,
+        /* .verbose         = */ verbose,
+        /* .think_start     = */ std::move(think_start),
+        /* .think_end       = */ std::move(think_end),
+        /* .start_reasoning = */ start_reasoning,
+        /* .hist            = */ {},
+        /* .cap             = */ max_len * (repeats + 1) + 8,
+        /* .triggered       = */ false,
+        /* .triggered_len   = */ 0,
+        /* .n_triggered     = */ 0,
+        /* .n_unforceable   = */ 0,
+        /* .n_reason_end    = */ 0,
+        /* .n_eog           = */ 0,
+        /* .phase           = */ start_reasoning ? LOOP_STOP_PHASE_REASONING : LOOP_STOP_PHASE_CONTENT,
+        /* .pending         = */ {},
+        /* .pending_pos     = */ 0,
+    };
+
+    std::string start_ids;
+    for (llama_token t : ctx->think_start) {
+        start_ids += " " + std::to_string((int) t);
+    }
+    std::string end_ids;
+    for (llama_token t : ctx->think_end) {
+        end_ids += " " + std::to_string((int) t);
+    }
+    LLAMA_LOG_INFO("%s: loop_stop active (min_len=%d max_len=%d repeats=%d eog_override=%d start_phase=%s reason_start_tokens=[%s] reason_end_tokens=[%s])\n",
+            __func__, min_len, max_len, repeats, (int) eog_override,
+            start_reasoning ? "reasoning" : "content", start_ids.c_str(), end_ids.c_str());
+
+    return llama_sampler_init(&llama_sampler_loop_stop_i, ctx);
+}
+
+bool llama_sampler_loop_stop_triggered(const struct llama_sampler * smpl, int32_t * matched_len) {
+    if (matched_len != nullptr) {
+        *matched_len = 0;
+    }
+    if (smpl == nullptr || smpl->iface != &llama_sampler_loop_stop_i) {
+        return false;
+    }
+    const auto * ctx = (const llama_sampler_loop_stop *) smpl->ctx;
+    if (matched_len != nullptr) {
+        *matched_len = ctx->triggered_len;
+    }
+    return ctx->triggered;
+}
+
+int32_t llama_sampler_loop_stop_min_len(const struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_loop_stop_i) {
+        return 0;
+    }
+    const auto * ctx = (const llama_sampler_loop_stop *) smpl->ctx;
+    return ctx->min_len;
+}
+
 static struct llama_sampler_i llama_sampler_dry_i = {
     /* .name              = */ llama_sampler_dry_name,
     /* .accept            = */ llama_sampler_dry_accept,

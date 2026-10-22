@@ -516,6 +516,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
+    auto handle_hc_weighted_sum = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
+        return src_ss[0];
+    };
+
     auto handle_concat = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         const ggml_backend_meta_split_axis concat_axis = ggml_backend_meta_split_axis(ggml_get_op_params_i32(tensor, 0));
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis >= 0 && src_ss[1].axis < GGML_MAX_DIMS) {
@@ -846,6 +852,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             case GGML_OP_MUL_MAT_ID: {
                 split_state = handle_mul_mat(src_ss);
             } break;
+            case GGML_OP_MOE_FUSED_UP_GATE: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
+            } break;
             case GGML_OP_OUT_PROD: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
@@ -956,6 +965,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             } break;
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
+            } break;
+            case GGML_OP_HC_WEIGHTED_SUM: {
+                split_state = handle_hc_weighted_sum(src_ss);
+            } break;
+            case GGML_OP_DSV4_HC_COMB:
+            case GGML_OP_DSV4_HC_POST: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
@@ -2095,6 +2111,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .event_record            = */ nullptr,
     /* .event_wait              = */ nullptr,
     /* .graph_optimize          = */ nullptr,
+    /* .graph_reserve           = */ nullptr,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {
@@ -2123,4 +2140,3 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     const ggml_backend_meta_context * backend_ctx = (const ggml_backend_meta_context *) meta_backend->context;
     return backend_ctx->backend_configs[index].backend;
 }
-

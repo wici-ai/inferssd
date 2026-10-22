@@ -8,6 +8,7 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-task.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
 #include "common.h"
@@ -1626,6 +1627,53 @@ static void test_convert_responses_to_chatcmpl() {
     }
 }
 
+static void test_muse_spark_peg_parsers(bool detailed_debug) {
+    // Muse Spark format tests
+    {
+        auto tst = peg_tester("models/templates/muse-spark.jinja", detailed_debug);
+
+        const std::string call_markup =
+            "<atem:function_calls>\n"
+            "<atem:invoke name=\"special_function\">\n"
+            "<atem:parameter name=\"arg1\">1</atem:parameter>\n"
+            "</atem:invoke>\n"
+            "</atem:function_calls>";
+
+        // A plain answer behaves as it does for Muse Glimmer
+        tst.test(" to=user<|message|>Hello, world!\nWhat's up?<|eot|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist)
+            .run();
+
+        // A commentary message is user facing content, not reasoning
+        tst.test(" to=commentary<|message|>Hello, world!\nWhat's up?<|eom|>"
+                 "<|start|>assistant to=user<|message|>Done!<|eot|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_content("Hello, world!\nWhat's up?Done!")
+            .run();
+
+        // Commentary announces the work, then the tool call follows in the same generation
+        tst.test(" to=commentary<|message|>Let me look that up.<|eom|>"
+                 "<|start|>assistant to=special_function<|message|>" +
+                 call_markup)
+            .tools({ special_function_tool })
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_with_content_and_tool_call("Let me look that up.", "special_function",
+                                                       "{\"arg1\":1}"))
+            .run();
+
+        // Reasoning still reaches the reasoning channel with commentary in the picture
+        tst.test(" to=self<|message|>Thinking.<|eom|>"
+                 "<|start|>assistant to=commentary<|message|>Working on it.<|eom|>"
+                 "<|start|>assistant to=user<|message|>Hello!<|eot|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("Thinking.")
+            .expect_content("Working on it.Hello!")
+            .run();
+    }
+
+}
+
 static void test_template_output_peg_parsers(bool detailed_debug) {
     LOG_DBG("%s\n", __func__);
 
@@ -2747,6 +2795,151 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             expect(simple_assist_msg("CONTENT", "")).run();
     }
 
+    // DeepSeek V4.1 tests - DSML with the V4.1 tag names (encoding/encoding.py of deepseek-ai/DeepSeek-V4.1-Flash):
+    //   <｜DSML｜ calls>
+    //   <｜DSML｜ invoke name="foo">
+    //   <｜DSML｜ parameter name="bar" string="true|false">value</｜DSML｜ parameter>
+    //   </｜DSML｜ invoke>
+    //   </｜DSML｜ calls>
+    // The first and every later system message start with <｜System｜>; the generation prompt ends in <think>
+    // (thinking mode) or </think> (chat mode).
+    {
+        auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V4.1.jinja", detailed_debug);
+
+        {
+            // Prompts as the official encoder renders them (without the BOS token, which needs a model).
+            auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.1.jinja");
+            auto without_bos = [](const std::string & prompt) {
+                const std::string bos = "<｜begin▁of▁sentence｜>";
+                return prompt.rfind(bos, 0) == 0 ? prompt.substr(bos.size()) : prompt;
+            };
+            auto msg = [](const std::string & role, const std::string & content, const std::string & reasoning = "") {
+                common_chat_msg m;
+                m.role              = role;
+                m.content           = content;
+                m.reasoning_content = reasoning;
+                return m;
+            };
+            common_chat_templates_inputs inputs;
+            inputs.messages = {
+                msg("system", "You are a helpful assistant."),
+                msg("user", "Hello"),
+                msg("assistant", "Hi there! How can I help you?", "The user said hello, I should greet back."),
+                msg("user", "What is the capital of France?"),
+            };
+            inputs.add_generation_prompt = true;
+            inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
+            inputs.enable_thinking       = false;
+            auto chat_params = common_chat_templates_apply(tmpls.get(), inputs);
+            assert_equals(true, chat_params.supports_thinking);
+            assert_equals(std::string("<｜System｜>You are a helpful assistant.<｜User｜>Hello<｜Assistant｜></think>Hi there! How can I help you?<｜end▁of▁sentence｜><｜User｜>What is the capital of France?<｜Assistant｜></think>"), without_bos(chat_params.prompt));
+            inputs.enable_thinking = true;
+            assert_equals(std::string("<｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are a helpful assistant.<｜User｜>Hello<｜Assistant｜></think>Hi there! How can I help you?<｜end▁of▁sentence｜><｜User｜>What is the capital of France?<｜Assistant｜><think>"), without_bos(common_chat_templates_apply(tmpls.get(), inputs).prompt));
+
+            // Earlier reasoning kept (drop_thinking false), and an OpenAI effort name on the encoder's scale
+            inputs.chat_template_kwargs["drop_thinking"] = "false";
+            assert_equals(std::string("<｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are a helpful assistant.<｜User｜>Hello<｜Assistant｜><think>The user said hello, I should greet back.</think>Hi there! How can I help you?<｜end▁of▁sentence｜><｜User｜>What is the capital of France?<｜Assistant｜><think>"), without_bos(common_chat_templates_apply(tmpls.get(), inputs).prompt));
+            inputs.chat_template_kwargs.erase("drop_thinking");
+            inputs.chat_template_kwargs["reasoning_effort"] = "\"xhigh\"";
+            assert_equals(std::string("<｜System｜>Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are a helpful assistant.<｜User｜>Hello<｜Assistant｜></think>Hi there! How can I help you?<｜end▁of▁sentence｜><｜User｜>What is the capital of France?<｜Assistant｜><think>"), without_bos(common_chat_templates_apply(tmpls.get(), inputs).prompt));
+            inputs.chat_template_kwargs.erase("reasoning_effort");
+
+            auto call = msg("assistant", "Let me check.");
+            call.tool_calls.push_back({ "get_weather", R"({"city": "Paris"})", "call_0" });
+            auto result         = msg("tool", "sunny");
+            result.tool_call_id = "call_0";
+            inputs.messages     = { msg("system", "You are a helpful assistant."), msg("user", "Weather in Paris?"), call, result };
+            inputs.tools        = { get_weather_tool };
+            inputs.enable_thinking = false;
+            assert_equals(std::string("<｜System｜>You are a helpful assistant.\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Get the current weather in a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}}, \"required\": [\"city\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Weather in Paris?<｜Assistant｜></think>Let me check.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>sunny</tool_result><｜Assistant｜></think>"), without_bos(common_chat_templates_apply(tmpls.get(), inputs).prompt));
+        }
+
+        // Pure content (chat mode)
+        tst.test("Hello, world!\nWhat's up?")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist)
+            .run();
+
+        // Thinking + content
+        tst.test("I'm\nthinking</think>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .run();
+
+        // Tool call in chat mode, as the model writes it: the block follows two newlines, integer param
+        tst.test(
+               "\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"special_function\">\n"
+               "<｜DSML｜ parameter name=\"arg1\" string=\"false\">1</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        // Thinking + tool call (string param)
+        tst.test(
+               "Let me check the time</think>\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_time\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .expect(message_with_tool_calls_and_reasoning("get_time", R"({"city": "Tokyo"})", "Let me check the time"))
+            .run();
+
+        // Content before the tool calls, and two parallel calls
+        tst.test(
+               "Checking both.\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_time\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "<｜DSML｜ invoke name=\"get_weather\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(true)
+            .tools({ get_time_tool, get_weather_tool })
+            .expect(message_with_reasoning_content_and_multiple_tool_calls(
+                "", "Checking both.",
+                { { "get_time", R"({"city": "Paris"})" }, { "get_weather", R"({"city": "Paris"})" } }))
+            .run();
+
+        // While streaming, newlines that may start the tool-call block are held back from the content
+        tst.test("Checking both.\n\n")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .is_partial(true)
+            .expect(simple_assist_msg("Checking both."))
+            .run();
+
+        // String parameters keep their surrounding whitespace
+        tst.test(
+               "\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_time\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\"> Paris\n</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .expect(message_with_tool_calls("get_time", R"({"city": " Paris\n"})"))
+            .run();
+    }
+
     // DeepSeek V3.2 tests - format uses DSML markup:
     //   <｜DSML｜function_calls>
     //   <｜DSML｜invoke name="foo">
@@ -2757,6 +2950,28 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
     // or <think></think> (non-thinking mode).
     {
         auto tst = peg_tester("models/templates/deepseek-ai-DeepSeek-V3.2.jinja", detailed_debug);
+
+        {
+            auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V3.2.jinja");
+            common_chat_templates_inputs inputs;
+            inputs.messages = { message_user };
+            inputs.add_generation_prompt = true;
+            inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+
+            inputs.enable_thinking = true;
+            auto thinking_params = common_chat_templates_apply(tmpls.get(), inputs);
+            assert_equals(true, thinking_params.supports_thinking);
+            if (!string_ends_with(thinking_params.prompt, "<think>")) {
+                throw std::runtime_error("DeepSeek V3.2 thinking prompt must end with <think>, got: " + thinking_params.prompt);
+            }
+
+            inputs.enable_thinking = false;
+            auto no_thinking_params = common_chat_templates_apply(tmpls.get(), inputs);
+            assert_equals(true, no_thinking_params.supports_thinking);
+            if (!string_ends_with(no_thinking_params.prompt, "<think></think>")) {
+                throw std::runtime_error("DeepSeek V3.2 non-thinking prompt must end with <think></think>, got: " + no_thinking_params.prompt);
+            }
+        }
 
         // Pure content (non-thinking mode)
         tst.test("Hello, world!\nWhat's up?")
@@ -3107,6 +3322,147 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             GGML_ASSERT(!got_out_of_range && "throw path crashed with out_of_range (input.substr in effective_input space)");
             GGML_ASSERT(got_runtime_error  && "throw path should produce std::runtime_error with parse position");
         }
+    }
+
+    // Kimi-K3 tests - XTML think/response parser
+    {
+        auto tst = peg_tester("models/templates/Kimi-K3.jinja", detailed_debug);
+
+        const std::string reasoning = "The user requested a short greeting.";
+        const std::string response  = "你好！";
+        const std::string full =
+            reasoning +
+            "<|close|>think<|sep|>"
+            "<|open|>response<|sep|>" +
+            response +
+            "<|close|>response<|sep|>"
+            "<|close|>message<|sep|>"
+            "<|end_of_msg|>";
+
+        tst.test(full)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg(response, reasoning))
+            .expect_reconstruction()
+            .run();
+
+        tst.test(
+               reasoning +
+               "<|close|>think<|sep|>"
+               "<|open|>response<|sep|>" +
+               response +
+               "<|close|>response<|sep|>"
+               "<|close|>message<|sep|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg(response, reasoning))
+            .run();
+
+        tst.test(
+               reasoning +
+               "<|close|>think<|sep|>"
+               "<|open|>response<|sep|>你")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .is_partial(true)
+            .expect(simple_assist_msg("你", reasoning))
+            .run();
+
+        // Regression: the second message closer used to fail the completed
+        // parse. Server fallback then replaced "Updated." with raw XTML text,
+        // and append-only diff generation threw. peg_tester checks every byte
+        // prefix, reconstructs via compute_diffs, and compares the final
+        // nonstreaming parse with the same message.
+        const std::string update_reasoning =
+            "We must answer exactly \"Updated.\" per user instruction. No extra content. Ensure final only Updated.";
+        const std::string update_prefix = update_reasoning +
+            "<|close|>think<|sep|><|open|>response<|sep|>";
+        const std::string response_end = "<|close|>response<|sep|>";
+        const std::string message_end = "<|close|>message<|sep|>";
+        const std::string repeated_tail = response_end + message_end + message_end;
+
+        tst.test(update_prefix + "Updated." + repeated_tail + "<|end_of_msg|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("Updated.", update_reasoning))
+            .run();
+        tst.test(update_prefix + "Updated." + repeated_tail)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("Updated.", update_reasoning))
+            .run();
+        tst.test(update_prefix + "Updated." + repeated_tail + "<|close|>mess")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .is_partial(true)
+            .expect(simple_assist_msg("Updated.", update_reasoning))
+            .run();
+        tst.test(update_prefix + repeated_tail + "<|end_of_msg|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("", update_reasoning))
+            .run();
+        const std::string literal_content = "原样保留 " + message_end + " 这个标记。";
+        tst.test(update_prefix + literal_content + repeated_tail + "<|end_of_msg|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg(literal_content, update_reasoning))
+            .run();
+
+        // Tolerance is limited to complete structural message closers; arbitrary
+        // trailing prose must not silently disappear from a successful parse.
+        auto tmpls = read_templates("models/templates/Kimi-K3.jinja");
+        common_chat_templates_inputs inputs;
+        inputs.messages = { message_user };
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+        auto parser = make_peg_parser(tmpls.get(), inputs, detailed_debug);
+
+        // Exercise the actual server accumulator, including its final empty
+        // reparse after all streamed bytes were already delivered.
+        const std::string exact = update_prefix + "Updated." + repeated_tail + "<|end_of_msg|>";
+        const auto expected = simple_assist_msg("Updated.", update_reasoning);
+        common_chat_parser_params parser_params(parser.params_);
+        parser_params.parser.load(parser.params_.parser);
+        parser_params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+        for (const size_t chunk_size : {size_t(1), size_t(7), size_t(31), exact.size()}) {
+            task_result_state state(parser_params);
+            std::string delivered;
+            std::vector<common_chat_msg_diff> diffs;
+            for (size_t pos = 0; pos < exact.size(); pos += chunk_size) {
+                diffs.clear(); // each production chunk owns a fresh result vector
+                state.update_chat_msg(exact.substr(pos, chunk_size), true, diffs);
+                for (const auto & diff : diffs) { delivered += diff.content_delta; }
+                assert_equals(true, std::string("Updated.").compare(0, delivered.size(), delivered) == 0);
+            }
+            assert_equals(std::string("Updated."), delivered);
+            diffs.clear();
+            assert_msg_equals(expected, state.update_chat_msg("", false, diffs), true);
+            for (const auto & diff : diffs) { assert_equals(std::string(), diff.content_delta); }
+            assert_equals(std::string("Updated."), delivered);
+        }
+        task_result_state nonstream(parser_params);
+        std::vector<common_chat_msg_diff> nonstream_diffs;
+        assert_msg_equals(expected, nonstream.update_chat_msg(exact, false, nonstream_diffs), true);
+
+        // Supply a canonical response-primed template explicitly. This tests
+        // the nonthinking grammar without changing launch-prefix metadata.
+        auto response_tmpls = common_chat_templates_ptr(common_chat_templates_init(nullptr,
+            "{%- set thinking = false -%}" + read_file("models/templates/Kimi-K3.jinja")));
+        test_peg_parser(response_tmpls.get(), [&](peg_test_case & tc) {
+            tc.input = "Updated." + repeated_tail + message_end + "<|end_of_msg|>";
+            tc.params.enable_thinking = false;
+            tc.params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+            tc.expect = simple_assist_msg("Updated.");
+        }, detailed_debug);
+
+        bool rejected = false;
+        try {
+            parser.parse(update_prefix + "Updated." + repeated_tail + "unexpected prose", false);
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        assert_equals(true, rejected);
+        bool invalid_diff = false;
+        try {
+            common_chat_msg_diff::compute_diffs(simple_assist_msg("Updated."), simple_assist_msg("replacement"));
+        } catch (const std::runtime_error &) {
+            invalid_diff = true;
+        }
+        assert_equals(true, invalid_diff);
+        std::printf("KIMI_K3_DUPLICATE_CLOSER_STREAM_OK exact_tail=PASS byte_prefixes=PASS "
+                    "server_chunk_sizes=1,7,31,full final_reparse=PASS nonstream=PASS strict_diff=PASS\n");
     }
 
     // Kimi-K2-Thinking tests - custom parser
@@ -3878,6 +4234,8 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         tst.test("Hello, world!\nWhat's up?").tools({ python_tool }).expect(message_assist).expect_reconstruction().run();
     }
 
+    test_muse_spark_peg_parsers(detailed_debug);
+
     // GPT-OSS format tests
     {
         auto tst = peg_tester("models/templates/openai-gpt-oss-120b.jinja", detailed_debug);
@@ -4457,7 +4815,8 @@ int main(int argc, char ** argv) {
     }
 
     if (only_run_filtered) {
-        test_template_output_peg_parsers(detailed_debug);
+        if (g_template_filter == "muse-spark") { test_muse_spark_peg_parsers(detailed_debug); }
+        else { test_template_output_peg_parsers(detailed_debug); }
         std::cout << "\n[chat] All template tests passed!" << '\n';
         return 0;
     }

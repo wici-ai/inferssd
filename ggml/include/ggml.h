@@ -429,13 +429,20 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_F8_E4M3_B128 = 42, // E4M3 FP8 values with one E8M0 scale per 128 values
+        GGML_TYPE_COUNT   = 43,
     };
 
     // precision
     enum ggml_prec {
         GGML_PREC_DEFAULT =  0, // stored as ggml_tensor.op_params, 0 by default
         GGML_PREC_F32     = 10,
+    };
+
+    // op hint
+    enum ggml_op_hint {
+        GGML_HINT_NONE             = 0,
+        GGML_HINT_SRC0_IS_HADAMARD = 1,
     };
 
     // model file types
@@ -467,6 +474,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_F8_E4M3_MXFP4 = 28, // except 1d tensors
     };
 
     // available tensor operations:
@@ -504,6 +512,7 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_MOE_FUSED_UP_GATE,
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -576,6 +585,11 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_HC_WEIGHTED_SUM,
+        GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_DSV4_HC_COMB,
+        GGML_OP_DSV4_HC_POST,
+        GGML_OP_ROW_MASK,
 
         GGML_OP_COUNT,
     };
@@ -603,6 +617,9 @@ extern "C" {
         GGML_UNARY_OP_CEIL,
         GGML_UNARY_OP_ROUND,
         GGML_UNARY_OP_TRUNC,
+        GGML_UNARY_OP_FP4_ACT_QUANT,
+        GGML_UNARY_OP_FP8_ACT_QUANT,
+        GGML_UNARY_OP_SINKHORN_4X4,
 
         GGML_UNARY_OP_COUNT,
     };
@@ -614,6 +631,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SWIGLU_CLAMP,
 
         GGML_GLU_OP_COUNT,
     };
@@ -640,6 +658,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_KIMI_KDA_CPU_PARITY = 32,
     };
 
     enum ggml_tri_type {
@@ -1246,7 +1265,18 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
 
+    // Blockwise activation quant-dequant simulation used by DeepSeek4 QAT paths.
+    GGML_API struct ggml_tensor * ggml_fp4_act_quant(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
 
+    GGML_API struct ggml_tensor * ggml_fp8_act_quant(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_sinkhorn_4x4(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
 
     // xIELU activation function
     // x = x * (c_a(alpha_n) + c_b(alpha_p, beta) * sigmoid(beta * x)) + eps * (x > 0)
@@ -1350,6 +1380,14 @@ extern "C" {
             float                 alpha,
             float                 limit);
 
+    // a: gate, b: up
+    // result = silu(min(a, limit)) * clamp(b, -limit, limit)
+    GGML_API struct ggml_tensor * ggml_swiglu_clamp(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 limit);
+
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
             struct ggml_context * ctx,
@@ -1413,11 +1451,73 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
+    // weighted sum over the HC dimension:
+    // a: [n_embd, hc_mult], b: [hc_mult] => result: [n_embd]
+    GGML_API struct ggml_tensor * ggml_hc_weighted_sum(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // Lightning indexer: fused sparse-attention scoring used by DeepSeek
+    // V3.2/V4. Computes
+    //   score[k, b, 1, s] = sum_h relu(<q[:, h, b, s], k[:, 0, k, s]> * scale_embd)
+    //                          * weights[h, b, 0, s] * scale_heads
+    //  q:       [n_embd, n_heads, n_batch, n_stream]  F32
+    //  k:       [n_embd, 1,       n_kv,    n_stream]  F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0
+    //  weights: [n_heads, n_batch, 1,      n_stream]  F32
+    //  result:  [n_kv,   n_batch,  1,      n_stream]  F32
+    // Replaces the explicit mul_mat -> relu -> mul(weights) -> sum_rows
+    // sequence with a single fused kernel.
+    GGML_API struct ggml_tensor * ggml_lightning_indexer(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * weights,
+            float                 scale_embd,
+            float                 scale_heads);
+
+    // DeepSeek-V4 hyper-connection Sinkhorn combination, hc = 4:
+    //   mixes [(2 + hc)*hc, n_tokens], scale [>= 3], base [(2 + hc)*hc] -> [hc, hc, n_tokens]
+    //   logits[dst, src, t] = mixes[2*hc + dst + hc*src, t]*scale[2] + base[2*hc + dst + hc*src]
+    // Softmax over dst, add eps, normalize over src, then repeat normalization over dst followed
+    // by src for iterations 1 through n_iter - 1. Each normalization divides by (sum + eps).
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_comb(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
+
+    // DeepSeek-V4 hyper-connection expansion:
+    //   x [n_embd, n_tokens], residual [n_embd, hc, n_tokens], post [hc, n_tokens],
+    //   comb [dst_hc, src_hc, n_tokens] -> [n_embd, hc, n_tokens]
+    //   result[i, dst, t] = x[i, t]*post[dst, t] + sum_src residual[i, src, t]*comb[dst, src, t]
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * residual,
+            struct ggml_tensor  * post,
+            struct ggml_tensor  * comb);
+
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
     GGML_API void ggml_mul_mat_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
+
+    // set the minimum required accumulator precision of MUL_MAT / MUL_MAT_ID (op_params[0])
+    // or FLASH_ATTN_EXT (op_params[3]); same storage as the ggml_*_set_prec() setters
+    // returns false if the op has no precision parameter
+    GGML_API bool ggml_prec_set_acc(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
+    // change the hint of a matrix multiplication (op_params[1])
+    // note: currently informational only, the kernels do not read it
+    GGML_API void ggml_mul_mat_set_hint(
+            struct ggml_tensor * a,
+            enum ggml_op_hint    hint);
 
     // indirect matrix multiplication
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
@@ -1425,6 +1525,23 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    GGML_API struct ggml_tensor * ggml_moe_up_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as_up,
+            struct ggml_tensor  * as_gate,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            enum ggml_unary_op    op);
+
+    GGML_API struct ggml_tensor * ggml_moe_up_gate_limit(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as_up,
+            struct ggml_tensor  * as_gate,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            enum ggml_unary_op    op,
+            float                 limit);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
@@ -1702,6 +1819,15 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   n_past);
 
+    // Build [n_kv, n_tokens/n_stream, 1, n_stream] from one visible count per token.
+    // Each row contains 0 for columns below the count and -inf elsewhere.
+    GGML_API struct ggml_tensor * ggml_row_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * n_visible,
+            enum ggml_type       type,
+            int64_t              n_kv,
+            int64_t              n_stream);
+
     GGML_API struct ggml_tensor * ggml_soft_max(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
@@ -1958,6 +2084,15 @@ extern "C" {
             float                 attn_factor,
             float                 beta_fast,
             float                 beta_slow);
+
+    // set the offset dims for RoPE (stored in op_params[15])
+    // a must be GGML_OP_ROPE or GGML_OP_ROPE_BACK
+    // vision RoPE is not supported
+    // example: (marking: x = rotated, 0 = unrotated)
+    //     n_embd = 10, n_dims = 4, offset = 2 --> [00xxxx0000]
+    GGML_API struct ggml_tensor * ggml_rope_set_offset(
+            struct ggml_tensor  * a,
+            int                   n_offs);
 
 
     // clamp
@@ -2400,6 +2535,13 @@ extern "C" {
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
+
+    // Use finite mask entries as a sparse K/V set. Set 0 to disable.
+    // n_kv_max must bound the number of finite entries in every mask row.
+    // stored in op_params[4]; note: currently informational only, the kernels do not read it
+    GGML_API void ggml_flash_attn_ext_set_n_kv_max(
+            struct ggml_tensor * a,
+            int32_t              n_kv_max);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

@@ -525,6 +525,16 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 }
 
+thread_local size_t * ggml_cuda_fattn_pool_size_query = nullptr;
+
+size_t ggml_cuda_flash_attn_ext_pool_size(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    size_t size = 0;
+    ggml_cuda_fattn_pool_size_query = &size;
+    ggml_cuda_flash_attn_ext(ctx, dst);
+    ggml_cuda_fattn_pool_size_query = nullptr;
+    return size;
+}
+
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }

@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "cpu-parity.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -270,6 +271,117 @@ static __global__ void l2_norm_f32(
     }
 }
 
+template <bool do_multiply>
+static __global__ void kimi_kda_rms_norm_cpu_parity_f32(
+        const float * x, const float * mul, float * dst, const int ncols,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
+        const int mul_ncols, const int mul_nrows, const int mul_nchannels, const int mul_nsamples,
+        const float eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    if constexpr (do_multiply) {
+        const int mul_row     = row     % mul_nrows;
+        const int mul_channel = channel % mul_nchannels;
+        const int mul_sample  = sample  % mul_nsamples;
+        mul += mul_sample*mul_stride_sample + mul_channel*mul_stride_channel + mul_row*mul_stride_row;
+    }
+
+    __shared__ float scale;
+    if (tid == 0) {
+        double sum = 0.0;
+        for (int col = 0; col < ncols; ++col) {
+            const float square = __fmul_rn(x[col], x[col]);
+            sum = __dadd_rn(sum, (double) square);
+        }
+        const float mean = __double2float_rn(__ddiv_rn(sum, (double) ncols));
+        scale = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(mean, eps)));
+    }
+    __syncthreads();
+
+    for (int col = tid; col < ncols; col += blockDim.x) {
+        const float normalized = __fmul_rn(x[col], scale);
+        if constexpr (do_multiply) {
+            dst[col] = ggml_cuda_kimi_mul_f32_cpu(normalized, mul[col % mul_ncols]);
+        } else {
+            dst[col] = normalized;
+        }
+    }
+}
+
+static __global__ void kimi_kda_l2_norm_cpu_parity_f32(
+        const float * x, float * dst, const int ncols,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const float eps) {
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+    const int row       = blockIdx.x;
+    const int channel   = blockIdx.y;
+    const int sample    = blockIdx.z;
+    const int tid       = threadIdx.x;
+
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    __shared__ float scale;
+    if (tid == 0) {
+        double sum = 0.0;
+#pragma unroll
+        for (int col = 0; col < 128; ++col) {
+            const float square = __fmul_rn(x[col], x[col]);
+            sum = __dadd_rn(sum, (double) square);
+        }
+        const float sum_f = __double2float_rn(sum);
+        const float norm = __fsqrt_rn(sum_f);
+        scale = __fdiv_rn(1.0f, fmaxf(norm, eps));
+    }
+    __syncthreads();
+
+    for (int col = tid; col < ncols; col += blockDim.x) {
+        dst[col] = __fmul_rn(x[col], scale);
+    }
+}
+
+static void kimi_kda_rms_norm_cpu_parity_f32_cuda(
+        const float * x, const float * mul, float * dst,
+        const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
+        const int mul_ncols, const int mul_nrows, const int mul_nchannels, const int mul_nsamples,
+        const float eps, cudaStream_t stream) {
+    const dim3 blocks(nrows, nchannels, nsamples);
+    const dim3 threads(128, 1, 1);
+    if (mul == nullptr) {
+        kimi_kda_rms_norm_cpu_parity_f32<false><<<blocks, threads, 0, stream>>>(
+            x, nullptr, dst, ncols, stride_row, stride_channel, stride_sample,
+            0, 0, 0, 1, 1, 1, 1, eps);
+    } else {
+        kimi_kda_rms_norm_cpu_parity_f32<true><<<blocks, threads, 0, stream>>>(
+            x, mul, dst, ncols, stride_row, stride_channel, stride_sample,
+            mul_stride_row, mul_stride_channel, mul_stride_sample,
+            mul_ncols, mul_nrows, mul_nchannels, mul_nsamples, eps);
+    }
+}
+
+static void kimi_kda_l2_norm_cpu_parity_f32_cuda(
+        const float * x, float * dst,
+        const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const float eps, cudaStream_t stream) {
+    const dim3 blocks(nrows, nchannels, nsamples);
+    const dim3 threads(128, 1, 1);
+    kimi_kda_l2_norm_cpu_parity_f32<<<blocks, threads, 0, stream>>>(
+        x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+}
+
 static void norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
@@ -301,6 +413,9 @@ static void rms_norm_f32_cuda(
     if (ncols < 1024) {
         const dim3 block_dims(256, 1, 1);
         rms_norm_f32<256, false><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+    } else if (ncols == 1024) {
+        const dim3 block_dims(512, 1, 1);
+        rms_norm_f32<512, false><<<blocks_num, block_dims, 32 * sizeof(float), stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
     } else {
         const dim3 block_dims(1024, 1, 1);
         rms_norm_f32<1024, false><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
@@ -349,6 +464,11 @@ static void rms_norm_mul_f32_cuda(const float *  x,
             rms_norm_f32<256, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
+        } else if (ncols == 1024) {
+            const dim3 block_dims(512, 1, 1);
+            rms_norm_f32<512, true><<<blocks_num, block_dims, 32 * sizeof(float), stream>>>(
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed);
         } else {
             const dim3 block_dims(1024, 1, 1);
             rms_norm_f32<1024, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
@@ -368,6 +488,13 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
             rms_norm_f32<256, true, true><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream>>>(
+                x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+                add_nchannels_packed, add_nsamples_packed);
+        } else if (ncols == 1024) {
+            const dim3 block_dims(512, 1, 1);
+            rms_norm_f32<512, true, true><<<blocks_num, block_dims, 32 * sizeof(float), stream>>>(
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
@@ -470,7 +597,13 @@ void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
-    rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    if (ggml_cuda_kimi_kda_unary_shape(dst, src0)) {
+        kimi_kda_rms_norm_cpu_parity_f32_cuda(
+            src0_d, nullptr, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03,
+            0, 0, 0, 1, 1, 1, 1, eps, stream);
+    } else {
+        rms_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    }
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
@@ -523,14 +656,21 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int mul_nchannels = mul_src->ne[2];
     const int mul_nsamples  = mul_src->ne[3];
 
-    rms_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
-                          ne00, ne01, ne02, ne03,
-                          /*s00*/ s01, s02, s03,
-                          /*mul_s00*/ mul_s01, mul_s02, mul_s03,
-                          mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
-                          /*add_s00*/ 0, 0, 0,
-                          0, 0, 0, 0,
-                          eps, stream);
+    if (ggml_cuda_kimi_kda_unary_shape(dst, rms_norm_src)) {
+        kimi_kda_rms_norm_cpu_parity_f32_cuda(
+            src0_d, mul_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03,
+            mul_s01, mul_s02, mul_s03,
+            mul_ncols, mul_nrows, mul_nchannels, mul_nsamples, eps, stream);
+    } else {
+        rms_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
+                              ne00, ne01, ne02, ne03,
+                              /*s00*/ s01, s02, s03,
+                              /*mul_s00*/ mul_s01, mul_s02, mul_s03,
+                              mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                              /*add_s00*/ 0, 0, 0,
+                              0, 0, 0, 0,
+                              eps, stream);
+    }
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
@@ -668,5 +808,10 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
-    l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    if (ne00 == 128 && ggml_cuda_kimi_kda_unary_shape(dst, src0)) {
+        kimi_kda_l2_norm_cpu_parity_f32_cuda(
+            src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    } else {
+        l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    }
 }

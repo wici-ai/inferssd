@@ -43,7 +43,7 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
                                                   const autoparser &              autoparser) {
     // Create the result structure
     common_chat_params data;
-    data.prompt           = common_chat_template_direct_apply(tmpl, inputs);
+    data.prompt           = common_chat_template_direct_apply(tmpl, inputs, &data.prompt_input_spans);
     data.format           = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.preserved_tokens = autoparser.preserved_tokens;
 

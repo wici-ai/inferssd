@@ -28,6 +28,23 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
+    // same as above, but with explicit hparams instead of model.hparams (must outlive the cache)
+    llama_kv_cache_iswa(
+            const llama_model & model,
+          const llama_hparams & hparams,
+                    ggml_type   type_k,
+                    ggml_type   type_v,
+                         bool   v_trans,
+                         bool   offload,
+                         bool   swa_full,
+                         bool   unified,
+                     uint32_t   kv_size,
+                     uint32_t   n_seq_max,
+                     uint32_t   n_ubatch,
+                     uint32_t   n_pad,
+        const layer_filter_cb & filter,
+        const  layer_reuse_cb & reuse);
+
     ~llama_kv_cache_iswa() = default;
 
     //
@@ -63,6 +80,11 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    uint32_t state_write_at_align() const override;
+    bool     state_can_write_at(llama_seq_id seq_id, llama_pos n_tokens) const override;
+    void     state_write_at(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos n_tokens) const override;
+    llama_pos state_pos_min_at(llama_seq_id seq_id, llama_pos n_tokens) const override;
+
     //
     // llama_kv_cache_iswa specific API
     //
@@ -71,6 +93,9 @@ public:
     llama_kv_cache * get_swa () const;
 
 private:
+    // the first position that the last position before n_tokens attends to in the SWA layers
+    llama_pos window_start(llama_pos n_tokens) const;
+
     const llama_hparams & hparams;
 
     const bool unified;

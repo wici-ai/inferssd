@@ -29,6 +29,15 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
+        ggml-cpu/kimi-cpu-cache-executor.inc
+        ggml-cpu/kimi-cpu-cache-policy.cpp
+        ggml-cpu/kimi-cpu-cache-policy.h
+        ggml-cpu/kimi-cpu-sink.cpp
+        ggml-cpu/kimi-cpu-sink.h
+        ggml-cpu/kimi-cpu-sink-internal.h
+        ggml-cpu/kimi-host-ledger.h
+        ggml-cpu/kimi-cpu-prefill.cpp
+        ggml-cpu/kimi-cpu-prefill.h
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp

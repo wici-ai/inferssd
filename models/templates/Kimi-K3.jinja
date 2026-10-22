@@ -1,0 +1,41 @@
+{%- macro open_tag(tag, attrs=[]) -%}
+{{- '<|open|>' + tag -}}
+{%- for attr in attrs -%}
+{{- ' ' + attr[0] + '="' + attr[1] + '"' -}}
+{%- endfor -%}
+{{- '<|sep|>' -}}
+{%- endmacro -%}
+
+{%- macro close_tag(tag) -%}
+{{- '<|close|>' + tag + '<|sep|>' -}}
+{%- endmacro -%}
+
+{%- if thinking is undefined -%}
+    {%- set thinking = true -%}
+{%- endif -%}
+
+{%- for message in messages -%}
+    {%- if message.role == 'assistant' -%}
+        {{- open_tag('message', [('role', 'assistant')]) -}}
+        {%- if thinking -%}
+            {{- open_tag('think') -}}
+            {{- message.get('reasoning_content', '') -}}
+            {{- close_tag('think') -}}
+        {%- endif -%}
+        {{- open_tag('response') -}}
+        {{- message.get('content', '') -}}
+        {{- close_tag('response') -}}
+        {{- close_tag('message') -}}
+        {{- '<|end_of_msg|>' -}}
+    {%- else -%}
+        {{- open_tag('message', [('role', message.role)]) -}}
+        {{- message.get('content', '') -}}
+        {{- close_tag('message') -}}
+        {{- '<|end_of_msg|>' -}}
+    {%- endif -%}
+{%- endfor -%}
+
+{%- if add_generation_prompt -%}
+    {{- open_tag('message', [('role', 'assistant')]) -}}
+    {{- open_tag('think' if thinking else 'response') -}}
+{%- endif -%}

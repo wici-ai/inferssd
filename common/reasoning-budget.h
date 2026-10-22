@@ -10,18 +10,19 @@ enum common_reasoning_budget_state {
     REASONING_BUDGET_COUNTING,     // counting down tokens
     REASONING_BUDGET_FORCING,      // forcing budget message + end sequence
     REASONING_BUDGET_WAITING_UTF8, // budget exhausted, waiting for UTF-8 completion
-    REASONING_BUDGET_DONE,         // passthrough forever
+    REASONING_BUDGET_DONE,         // passthrough, waiting for another start sequence
 };
 
 // Creates a reasoning budget sampler that limits token generation inside a
 // reasoning block (e.g. between <think> and </think>).
 //
 // State machine: IDLE -> COUNTING -> WAITING_UTF8 -> FORCING -> DONE
+// Each new start sequence in DONE re-arms COUNTING with the full budget.
 //   IDLE:         passthrough, watching for start_tokens sequence
 //   COUNTING:     counting down remaining tokens, watching for natural end_tokens
 //   WAITING_UTF8: budget exhausted, allowing tokens to complete a UTF-8 sequence
 //   FORCING:      forces forced_tokens token-by-token (all other logits -> -inf)
-//   DONE:         passthrough forever
+//   DONE:         passthrough, watching for the next start_tokens sequence
 //
 // Parameters:
 //   vocab          - vocabulary (used for UTF-8 boundary detection; can be nullptr)
@@ -53,3 +54,11 @@ struct llama_sampler * common_reasoning_budget_init(
         common_reasoning_budget_state    initial_state);
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);
+
+// Optional protocol evidence for the next accepted token's natural end span.
+// Used for multi-token end tags, including alternative tokenizations. Ignored
+// while FORCING: the existing forced sequence must finish unchanged.
+void common_reasoning_budget_set_protocol_end(struct llama_sampler * smpl, bool in_progress, bool complete);
+
+// Log attribution only; does not change the budget or sampler state.
+void common_reasoning_budget_set_log_context(struct llama_sampler * smpl, int32_t slot, int64_t task);

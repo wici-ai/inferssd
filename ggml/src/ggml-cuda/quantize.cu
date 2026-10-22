@@ -1,6 +1,177 @@
 #include "quantize.cuh"
-#include <cstdint>
 
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+static bool q8_K_parallel_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("GGML_CUDA_DENSE_Q8_K_QUANT_PARALLEL");
+        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+            std::strcmp(value, "false") != 0;
+    }();
+    return enabled;
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+static __device__ __forceinline__ int quantize_q8_K_nearest_int(float value) {
+    const int bits = __float_as_int(__fadd_rn(value, 12582912.0f));
+    return (bits & 0x007fffff) - 0x00400000;
+}
+
+// Match quantize_row_q8_K_ref(), including the sign and first-occurrence rule
+// for the maximum-magnitude value.  Decode vectors contain few 256-value
+// blocks, so a serial scan per block is preferable to changing CPU semantics
+// through a parallel reduction.
+static __global__ void quantize_q8_K_ref_cuda(
+        const float * __restrict__ x,
+        block_q8_K * __restrict__ y,
+        int nblocks) {
+    const int ib = blockIdx.x;
+    if (ib >= nblocks || threadIdx.x != 0) {
+        return;
+    }
+
+    const float * xb = x + (size_t) ib * QK_K;
+    block_q8_K * yb = y + ib;
+
+    float max_value = 0.0f;
+    float amax = 0.0f;
+    for (int j = 0; j < QK_K; ++j) {
+        const float ax = fabsf(xb[j]);
+        if (ax > amax) {
+            amax = ax;
+            max_value = xb[j];
+        }
+    }
+
+    if (amax == 0.0f) {
+        yb->d = 0.0f;
+        for (int j = 0; j < QK_K; ++j) {
+            yb->qs[j] = 0;
+        }
+        for (int j = 0; j < QK_K/16; ++j) {
+            yb->bsums[j] = 0;
+        }
+        return;
+    }
+
+    const float iscale = __fdiv_rn(-127.0f, max_value);
+    for (int j = 0; j < QK_K; ++j) {
+        const int q = quantize_q8_K_nearest_int(__fmul_rn(iscale, xb[j]));
+        yb->qs[j] = (int8_t) (q < 127 ? q : 127);
+    }
+    for (int j = 0; j < QK_K/16; ++j) {
+        int sum = 0;
+        for (int k = 0; k < 16; ++k) {
+            sum += yb->qs[16*j + k];
+        }
+        yb->bsums[j] = (int16_t) sum;
+    }
+    yb->d = __fdiv_rn(1.0f, iscale);
+}
+
+// Parallelize the reference scan without changing its winner.  The serial
+// implementation selects the first element whose absolute value is strictly
+// greater than every preceding value.  Reducing (absolute value, first index)
+// gives the same result, including signed ties, while NaNs remain ignored.
+__launch_bounds__(QK_K, 1)
+static __global__ void quantize_q8_K_ref_cuda_parallel(
+        const float * __restrict__ x,
+        block_q8_K * __restrict__ y,
+        int nblocks) {
+    const int ib = blockIdx.x;
+    const int j  = threadIdx.x;
+    if (ib >= nblocks) {
+        return;
+    }
+
+    const float * xb = x + (size_t) ib * QK_K;
+    block_q8_K * yb = y + ib;
+
+    __shared__ float candidate_abs[QK_K];
+    __shared__ int   candidate_index[QK_K];
+    __shared__ float iscale_shared;
+
+    const float ax = fabsf(xb[j]);
+    const bool candidate = ax > 0.0f;
+    candidate_abs[j] = candidate ? ax : 0.0f;
+    candidate_index[j] = candidate ? j : QK_K;
+    __syncthreads();
+
+    for (int stride = QK_K/2; stride > 0; stride /= 2) {
+        if (j < stride) {
+            const float other_abs = candidate_abs[j + stride];
+            const int other_index = candidate_index[j + stride];
+            if (other_abs > candidate_abs[j] ||
+                    (other_abs == candidate_abs[j] && other_index < candidate_index[j])) {
+                candidate_abs[j] = other_abs;
+                candidate_index[j] = other_index;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (candidate_abs[0] == 0.0f) {
+        yb->qs[j] = 0;
+        if (j < QK_K/16) {
+            yb->bsums[j] = 0;
+        }
+        if (j == 0) {
+            yb->d = 0.0f;
+        }
+        return;
+    }
+
+    if (j == 0) {
+        const float max_value = xb[candidate_index[0]];
+        iscale_shared = __fdiv_rn(-127.0f, max_value);
+        yb->d = __fdiv_rn(1.0f, iscale_shared);
+    }
+    __syncthreads();
+
+    const int q = quantize_q8_K_nearest_int(__fmul_rn(iscale_shared, xb[j]));
+    yb->qs[j] = (int8_t) (q < 127 ? q : 127);
+    __syncthreads();
+
+    if (j < QK_K/16) {
+        int sum = 0;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            sum += yb->qs[16*j + k];
+        }
+        yb->bsums[j] = (int16_t) sum;
+    }
+}
+
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
+void quantize_row_q8_K_cuda(
+        const float * x, block_q8_K * vy, int64_t ne0, cudaStream_t stream) {
+    GGML_ASSERT(ne0 > 0 && ne0 % QK_K == 0);
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(x);
+    GGML_UNUSED(vy);
+    GGML_UNUSED(stream);
+    GGML_ABORT("CPU-compatible Q8_K activation quantization is only implemented for CUDA");
+#else
+    const int nblocks = (int) (ne0 / QK_K);
+    if (q8_K_parallel_enabled()) {
+        quantize_q8_K_ref_cuda_parallel<<<nblocks, QK_K, 0, stream>>>(x, vy, nblocks);
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            std::fprintf(stderr, "ggml_cuda: byte-exact parallel Q8_K activation quantization active\n");
+        }
+    } else {
+        quantize_q8_K_ref_cuda<<<nblocks, 1, 0, stream>>>(x, vy, nblocks);
+    }
+#endif
+}
+
+template <bool need_sum, bool quantized_sums = false>
 __launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
 static __global__ void quantize_q8_1(
         const float * __restrict__ x, void * __restrict__ vy,
@@ -30,13 +201,21 @@ static __global__ void quantize_q8_1(
 
     const float xi = i0 < ne00 ? x[i03*s03 + i02*s02 + i01*s01 + i00] : 0.0f;
     float amax = fabsf(xi);
-    float sum = xi;
 
     amax = warp_reduce_max<QK8_1>(amax);
-    sum  = warp_reduce_sum<QK8_1>(sum);
 
-    const float  d = amax / 127.0f;
-    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    const float  d_inv = amax == 0.0f ? 0.0f : 127.0f / amax;
+    const float  d     = amax / 127.0f;
+    const int8_t q     = roundf(xi * d_inv);
+
+    float sum = 0.0f;
+    if constexpr (need_sum) {
+        // quantized_sums: the sum of the quantized values, so that a minimum's term sees the activations the scale's sees
+        sum = warp_reduce_sum<QK8_1>(quantized_sums ? float(q) : xi);
+        if constexpr (quantized_sums) {
+            sum *= d;
+        }
+    }
 
     y[ib].qs[iqs] = q;
 
@@ -44,7 +223,11 @@ static __global__ void quantize_q8_1(
         return;
     }
 
-    y[ib].ds = make_half2(d, sum);
+    if constexpr (need_sum) {
+        y[ib].ds = make_half2(d, sum);
+    } else {
+        ((half *) &y[ib].ds)[0] = __float2half(d);
+    }
 }
 
 __device__ __forceinline__ uint8_t compute_e8m0_scale(float amax) {
@@ -172,7 +355,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
     }
 }
 
-template <mmq_q8_1_ds_layout ds_layout>
+template <mmq_q8_1_ds_layout ds_layout, bool quantized_sums = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
@@ -217,23 +400,28 @@ static __global__ void quantize_mmq_q8_1(
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
     }
 
-    float sum;
-    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
-        sum = xi.x + xi.y + xi.z + xi.w;
-
-        // Calculate sums across vals_per_sum/4 threads.
-#pragma unroll
-        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
-        }
-    }
-
     const float d_inv = 127.0f / amax;
     char4 q;
     q.x = roundf(xi.x*d_inv);
     q.y = roundf(xi.y*d_inv);
     q.z = roundf(xi.z*d_inv);
     q.w = roundf(xi.w*d_inv);
+
+    float sum;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+        // quantized_sums: the sum of the quantized values (scaled below), so that a minimum's term sees the activations
+        // the scale's sees
+        sum = quantized_sums ? float(int(q.x) + int(q.y) + int(q.z) + int(q.w)) : xi.x + xi.y + xi.z + xi.w;
+
+        // Calculate sums across vals_per_sum/4 threads.
+#pragma unroll
+        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        }
+        if (quantized_sums) {
+            sum *= amax / 127.0f;
+        }
+    }
 
     // Write back 4 int8 values as a single 32 bit value for better memory bandwidth:
     char4 * yqs4 = (char4 *) y[ib].qs;
@@ -270,7 +458,8 @@ static __global__ void quantize_mmq_q8_1(
     }
 }
 
-void quantize_row_q8_1_cuda(
+template <bool quantized_sums>
+static void quantize_row_q8_1_launch(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
@@ -282,11 +471,30 @@ void quantize_row_q8_1_cuda(
     const int64_t block_num_x = (ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
     const dim3 num_blocks(block_num_x, ne1, ne2*ne3);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
-    quantize_q8_1<<<num_blocks, block_size, 0, stream>>>(x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
-    GGML_UNUSED(type_src0);
+    if (type_src0 == GGML_TYPE_F8_E4M3_B128 || type_src0 == GGML_TYPE_MXFP4 || type_src0 == GGML_TYPE_NVFP4 ||
+            type_src0 == GGML_TYPE_IQ4_XS) {
+        quantize_q8_1<false><<<num_blocks, block_size, 0, stream>>>(x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    } else {
+        quantize_q8_1<true, quantized_sums><<<num_blocks, block_size, 0, stream>>>(x, vy, ne00, s01, s02, s03, ne0, ne1, ne2_fastdiv);
+    }
 }
 
-void quantize_mmq_q8_1_cuda(
+void quantize_row_q8_1_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    quantize_row_q8_1_launch<false>(x, ids, vy, type_src0, ne00, s01, s02, s03, ne0, ne1, ne2, ne3, stream);
+}
+
+void quantize_row_q8_1_quantized_sums_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    quantize_row_q8_1_launch<true>(x, ids, vy, type_src0, ne00, s01, s02, s03, ne0, ne1, ne2, ne3, stream);
+}
+
+template <bool quantized_sums>
+static void quantize_mmq_q8_1_launch(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
         const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
@@ -299,21 +507,35 @@ void quantize_mmq_q8_1_cuda(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_src0)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4>
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, quantized_sums>
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4>
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, quantized_sums>
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6>
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, quantized_sums>
                 <<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
             break;
         default:
             GGML_ABORT("fatal error");
             break;
     }
+}
+
+void quantize_mmq_q8_1_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    quantize_mmq_q8_1_launch<false>(x, ids, vy, type_src0, ne00, s01, s02, s03, ne0, ne1, ne2, ne3, stream);
+}
+
+void quantize_mmq_q8_1_quantized_sums_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    quantize_mmq_q8_1_launch<true>(x, ids, vy, type_src0, ne00, s01, s02, s03, ne0, ne1, ne2, ne3, stream);
 }
 
 void quantize_mmq_mxfp4_cuda(const float *                    x,

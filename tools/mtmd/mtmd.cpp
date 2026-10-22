@@ -617,6 +617,7 @@ struct mtmd_tokenizer {
     std::vector<const mtmd_bitmap *> bitmaps;
 
     std::string input_text;
+    std::vector<llama_tokenize_input_span> input_spans;
     bool add_special;
     bool parse_special;
     const llama_vocab * vocab;
@@ -638,6 +639,7 @@ struct mtmd_tokenizer {
         cur.entries.clear();
         std::vector<std::string> parts = split_text(input_text, ctx->media_marker);
         size_t i_bm = 0; // index of the current bitmap
+        size_t text_offset = 0;
         for (auto & part : parts) {
             if (part == ctx->media_marker) {
                 // this is a marker, we should add the next bitmap
@@ -653,8 +655,26 @@ struct mtmd_tokenizer {
                 }
             } else {
                 // this is a text part, we should add it as text
-                add_text(part, parse_special);
+                std::vector<llama_tokenize_input_span> local;
+                for (const auto & span : input_spans) {
+                    const size_t begin = std::max(text_offset, size_t(span.offset));
+                    const size_t end = std::min(text_offset + part.size(), size_t(span.offset) + size_t(span.length));
+                    if (begin < end) local.push_back({int32_t(begin - text_offset), int32_t(end - begin)});
+                }
+                if (local.empty() || !parse_special) {
+                    add_text(part, parse_special);
+                } else {
+                    int32_t n = llama_tokenize_with_input_spans(vocab, part.data(), part.size(), nullptr, 0,
+                        false, local.data(), local.size());
+                    if (n == INT32_MIN) return 3;
+                    std::vector<llama_token> tokens(size_t(-n));
+                    n = llama_tokenize_with_input_spans(vocab, part.data(), part.size(), tokens.data(), tokens.size(),
+                        false, local.data(), local.size());
+                    if (n < 0) return 3;
+                    add_text(tokens);
+                }
             }
+            text_offset += part.size();
         }
 
         if (add_special && llama_vocab_get_add_bos(vocab)) {
@@ -1001,6 +1021,24 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
             const mtmd_bitmap ** bitmaps,
             size_t n_bitmaps) {
     mtmd_tokenizer tokenizer(ctx, text, bitmaps, n_bitmaps);
+    return tokenizer.tokenize(output);
+}
+
+int32_t mtmd_tokenize_with_input_spans(mtmd_context * ctx,
+        mtmd_input_chunks * output, const mtmd_input_text * text,
+        const mtmd_bitmap ** bitmaps, size_t n_bitmaps,
+        const llama_tokenize_input_span * spans, int32_t n_spans) {
+    if (!text || !text->text || n_spans < 0 || (n_spans && !spans)) return 3;
+    const size_t length = std::strlen(text->text);
+    if (length > size_t(INT32_MAX)) return 3;
+    int64_t previous_end = 0;
+    for (int32_t i = 0; i < n_spans; ++i) {
+        const int64_t end = int64_t(spans[i].offset) + spans[i].length;
+        if (spans[i].offset < previous_end || spans[i].length < 0 || end > int64_t(length)) return 3;
+        previous_end = end;
+    }
+    mtmd_tokenizer tokenizer(ctx, text, bitmaps, n_bitmaps);
+    if (n_spans) tokenizer.input_spans.assign(spans, spans + n_spans);
     return tokenizer.tokenize(output);
 }
 

@@ -208,6 +208,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         uint32_t(2)); // sigmoid
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,       1.0f);
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
     }
@@ -331,6 +332,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_ARCTIC:
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_EXAONE_MOE:
@@ -445,6 +447,9 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
         if (arch == LLM_ARCH_GEMMA4) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
+        if (arch == LLM_ARCH_DFLASH) {
+            continue; // Requires a paired target context and target-layer metadata.
+        }
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
                 continue;
@@ -529,6 +534,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
         if (arch == LLM_ARCH_GEMMA4) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
         }
+        if (arch == LLM_ARCH_DFLASH) {
+            continue; // Requires a paired target context and target-layer metadata.
+        }
 
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
         for (bool moe : {false, true}) {
@@ -549,6 +557,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
                 bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
+                if (arch == LLM_ARCH_DEEPSEEK4 && dc.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+                    skip = true; // FIXME synthetic DeepSeek4 fixture needs dedicated tensor-split coverage.
+                }
 #if defined(GGML_USE_WEBGPU)
                 skip = true; // FIXME
 #endif // GGML_USE_WEBGPU

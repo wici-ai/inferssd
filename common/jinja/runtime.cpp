@@ -167,6 +167,11 @@ value binary_expression::execute_impl(context & ctx) {
         }
         throw std::runtime_error("Cannot perform operation " + op.value + " on undefined values");
     } else if (is_val<value_none>(left_val) || is_val<value_none>(right_val)) {
+        if (!is_val<value_none>(right_val) && (op.value == "in" || op.value == "not in")) {
+            // A null left operand is a membership key, as in Python/Jinja.
+            const bool member = test_is_in();
+            return mk_val<value_bool>(op.value == "in" ? member : !member);
+        }
         if (op.value == "+" || op.value == "~") {
             value res = mk_val<value_undefined>();
             if (workaround_concat_null_with_str(res)) {
@@ -837,7 +842,7 @@ value member_expression::execute_impl(context & ctx) {
             } else { // value_string
                 auto str = object->as_string().str();
                 if (index >= 0 && index < static_cast<int64_t>(str.size())) {
-                    val = mk_val<value_string>(std::string(1, str[index]));
+                    val = mk_val<value_string>(object->as_string().substr(index, 1));
                 }
             }
 

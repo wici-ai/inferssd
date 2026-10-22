@@ -9,7 +9,10 @@
 
 #include "server-common.h"
 
+#include <deque>
+#include <mutex>
 #include <random>
+#include <unordered_map>
 #include <sstream>
 #include <fstream>
 
@@ -459,6 +462,74 @@ std::string server_tokens::detokenize(const llama_context * ctx, bool special) c
     return common_detokenize(ctx, text_tokens, special);
 }
 
+size_t server_tokens_reuse_text(const llama_tokens & cached, llama_tokens & prompt,
+                                const std::function<std::string(llama_token)> & piece) {
+    size_t n = 0;
+    while (n < cached.size() && n < prompt.size() && cached[n] == prompt[n]) {
+        n++;
+    }
+    if (n == cached.size() || n == prompt.size()) {
+        return n;
+    }
+    // Both sides from where the ids part. `ahead` is the text one side has spelled beyond the other; where it is
+    // empty both end a token, and the furthest such point is kept. A token without text matches only its own id
+    // there.
+    size_t ic = n, ip = n, n_cached = n, n_prompt = n;
+    std::string ahead;
+    bool cached_ahead = false;
+    while (true) {
+        if (ahead.empty()) {
+            n_cached = ic;
+            n_prompt = ip;
+            if (ic == cached.size() || ip == prompt.size()) {
+                break;
+            }
+            const std::string a = piece(cached[ic]), b = piece(prompt[ip]);
+            if (a.empty() || b.empty()) {
+                if (cached[ic] != prompt[ip]) {
+                    break;
+                }
+                ic++;
+                ip++;
+                continue;
+            }
+            const size_t m = std::min(a.size(), b.size());
+            if (a.compare(0, m, b, 0, m) != 0) {
+                break;
+            }
+            ic++;
+            ip++;
+            cached_ahead = a.size() > m;
+            ahead = cached_ahead ? a.substr(m) : b.substr(m);
+            continue;
+        }
+        // the side behind spells on: a token that ends inside `ahead` shortens it, one that goes past it leads
+        size_t & i = cached_ahead ? ip : ic;
+        const llama_tokens & side = cached_ahead ? prompt : cached;
+        if (i == side.size()) {
+            break;
+        }
+        const std::string p = piece(side[i]);
+        const size_t m = std::min(p.size(), ahead.size());
+        if (p.empty() || p.compare(0, m, ahead, 0, m) != 0) {
+            break;
+        }
+        i++;
+        if (p.size() > m) {
+            ahead = p.substr(m);
+            cached_ahead = !cached_ahead;
+        } else {
+            ahead.erase(0, m);
+        }
+    }
+    if (n_cached == n) {
+        return n;
+    }
+    prompt.erase(prompt.begin() + n, prompt.begin() + n_prompt);
+    prompt.insert(prompt.begin() + n, cached.begin() + n, cached.begin() + n_cached);
+    return n_cached;
+}
+
 size_t server_tokens::get_common_prefix(const server_tokens & b) const {
     const size_t max_idx = std::min(tokens.size(), b.tokens.size());
 
@@ -638,6 +709,41 @@ json json_get_nested_values(const std::vector<std::string> & paths, const json &
     return result;
 }
 
+llama_tokens tokenize_chat_prompt(const llama_vocab * vocab, const json & data, bool add_special) {
+    // Legacy fallback is allowed only when there is no special spelling to
+    // disambiguate. This keeps clean legacy requests byte-identical.
+    for (const auto & item : data.value("chat_untracked_content", json::array())) {
+        const auto text = item.get<std::string>();
+        if (text.size() > size_t(INT32_MAX)) throw std::invalid_argument("Chat content too large");
+        llama_tokenize_input_span span{0, int32_t(text.size())};
+        const auto old = common_tokenize(vocab, text, false, true);
+        int32_t count = llama_tokenize_with_input_spans(vocab, text.data(), text.size(), nullptr, 0, false, &span, 1);
+        if (count == INT32_MIN) throw std::invalid_argument("Invalid chat content");
+        llama_tokens plain(size_t(-count));
+        count = llama_tokenize_with_input_spans(vocab, text.data(), text.size(), plain.data(), plain.size(), false, &span, 1);
+        if (count < 0 || plain != old) {
+            throw std::invalid_argument("This legacy template cannot track literal control tokens; enable Jinja");
+        }
+    }
+    const auto text = data.at("prompt").get<std::string>();
+    std::vector<llama_tokenize_input_span> spans;
+    for (const auto & span : data.at("chat_input_spans")) {
+        spans.push_back({span.at(0).get<int32_t>(), span.at(1).get<int32_t>()});
+    }
+    if (text.size() > size_t(INT32_MAX) || spans.size() > size_t(INT32_MAX)) {
+        throw std::invalid_argument("Chat prompt exceeds tokenizer byte limit");
+    }
+    int32_t count = llama_tokenize_with_input_spans(vocab, text.data(), int32_t(text.size()),
+        nullptr, 0, add_special, spans.data(), int32_t(spans.size()));
+    if (count == INT32_MIN) throw std::invalid_argument("Invalid chat input spans");
+    llama_tokens tokens(size_t(-count));
+    count = llama_tokenize_with_input_spans(vocab, text.data(), int32_t(text.size()),
+        tokens.data(), int32_t(tokens.size()), add_special, spans.data(), int32_t(spans.size()));
+    if (count < 0) throw std::runtime_error("Chat tokenization failed");
+    tokens.resize(count);
+    return tokens;
+}
+
 llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special) {
     // If `add_bos` is true, we only add BOS, when json_prompt is a string,
     // or the first element of the json_prompt array is a string.
@@ -713,7 +819,8 @@ static std::string fnv_hash(const uint8_t * data, size_t len) {
     return std::to_string(hash);
 }
 
-server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files) {
+server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::vector<raw_buffer> files,
+        const std::vector<llama_tokenize_input_span> & input_spans) {
     mtmd::bitmaps bitmaps;
     for (auto & file : files) {
         mtmd::bitmap bmp(mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size()));
@@ -735,11 +842,11 @@ server_tokens process_mtmd_prompt(mtmd_context * mctx, std::string prompt, std::
     };
     mtmd::input_chunks chunks(mtmd_input_chunks_init());
     auto bitmaps_c_ptr = bitmaps.c_ptr();
-    int32_t tokenized = mtmd_tokenize(mctx,
+    int32_t tokenized = mtmd_tokenize_with_input_spans(mctx,
                                       chunks.ptr.get(),
                                       &inp_txt,
                                       bitmaps_c_ptr.data(),
-                                      bitmaps_c_ptr.size());
+                                      bitmaps_c_ptr.size(), input_spans.data(), input_spans.size());
     if (tokenized != 0) {
         throw std::runtime_error("Failed to tokenize prompt");
     }
@@ -908,6 +1015,124 @@ static void handle_media(
 }
 
 // used by /chat/completions endpoint
+namespace {
+
+// An assistant turn as this server generated it. Clients send earlier turns back re-serialized: content trimmed,
+// tool-call arguments re-encoded (sorted keys, other spacing and escaping), reasoning left out or an empty one
+// padded. The template then renders a history that differs from the tokens in the cache, and a cache that cannot
+// roll back processes the whole conversation again. A turn is found by what survives the re-serialization: its
+// trimmed content and its tool calls with arguments compared as JSON values.
+struct generated_turn {
+    std::string              content;
+    std::string              reasoning_content;
+    std::vector<std::string> arguments; // tool-call arguments as generated, in call order
+};
+
+struct turn_memory {
+    static constexpr size_t max_turns = 256;
+    std::mutex                                      mutex;
+    std::unordered_map<std::string, generated_turn> turns; // turn key -> turn
+    std::deque<std::string>                         order; // keys, oldest first
+};
+
+turn_memory g_turn_memory;
+
+std::string turn_trim(const std::string & s) {
+    const size_t begin = s.find_first_not_of(" \t\n\r");
+    if (begin == std::string::npos) {
+        return std::string();
+    }
+    return s.substr(begin, s.find_last_not_of(" \t\n\r") - begin + 1);
+}
+
+std::string turn_key(const std::string & content, const std::vector<std::pair<std::string, std::string>> & calls) {
+    std::string key = turn_trim(content);
+    for (const auto & [name, arguments] : calls) {
+        key += '\x1f';
+        key += name;
+        key += '\x1e';
+        try {
+            key += nlohmann::json::parse(arguments).dump(); // nlohmann::json orders object keys
+        } catch (const std::exception &) {
+            key += arguments;
+        }
+    }
+    return key;
+}
+
+void server_turn_memory_restore(json & messages) {
+    std::lock_guard<std::mutex> lock(g_turn_memory.mutex);
+    if (g_turn_memory.turns.empty()) {
+        return;
+    }
+    for (auto & msg : messages) {
+        if (json_value(msg, "role", std::string()) != "assistant") {
+            continue;
+        }
+        const json content = msg.contains("content") ? msg.at("content") : json();
+        if (!content.is_null() && !content.is_string()) {
+            continue;
+        }
+        json tool_calls = json_value(msg, "tool_calls", json::array());
+        std::vector<std::pair<std::string, std::string>> calls;
+        for (const auto & call : tool_calls) {
+            const json function  = json_value(call, "function", json::object());
+            const json arguments = json_value(function, "arguments", json());
+            calls.emplace_back(json_value(function, "name", std::string()),
+                               arguments.is_string() ? arguments.get<std::string>() : arguments.dump());
+        }
+        const auto found = g_turn_memory.turns.find(
+            turn_key(content.is_string() ? content.get<std::string>() : std::string(), calls));
+        if (found == g_turn_memory.turns.end()) {
+            continue;
+        }
+        const generated_turn & turn = found->second;
+
+        if (content.is_string() || !turn.content.empty()) {
+            msg["content"] = turn.content;
+        }
+        for (size_t i = 0; i < calls.size(); ++i) {
+            msg["tool_calls"][i]["function"]["arguments"] = turn.arguments[i];
+        }
+        // Reasoning the client left out, padded or sent back unchanged (up to whitespace) is the generated one;
+        // reasoning the client changed is kept. Whether earlier reasoning is rendered is up to the template.
+        const std::string sent = turn_trim(json_value(msg, "reasoning_content", std::string()));
+        if (sent.empty() || sent == turn_trim(turn.reasoning_content)) {
+            if (turn.reasoning_content.empty()) {
+                msg.erase("reasoning_content");
+            } else {
+                msg["reasoning_content"] = turn.reasoning_content;
+            }
+        }
+    }
+}
+
+} // namespace
+
+void server_turn_memory_record(const common_chat_msg & msg) {
+    // a turn without content and tool calls has no identity to find it by
+    if (turn_trim(msg.content).empty() && msg.tool_calls.empty()) {
+        return;
+    }
+    std::vector<std::pair<std::string, std::string>> calls;
+    generated_turn turn { msg.content, msg.reasoning_content, {} };
+    for (const auto & call : msg.tool_calls) {
+        calls.emplace_back(call.name, call.arguments);
+        turn.arguments.push_back(call.arguments);
+    }
+    std::string key = turn_key(msg.content, calls);
+    std::lock_guard<std::mutex> lock(g_turn_memory.mutex);
+    auto & memory = g_turn_memory;
+    if (memory.turns.find(key) == memory.turns.end()) {
+        memory.order.push_back(key);
+        if (memory.order.size() > turn_memory::max_turns) {
+            memory.turns.erase(memory.order.front());
+            memory.order.pop_front();
+        }
+    }
+    memory.turns[key] = std::move(turn);
+}
+
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
@@ -1031,6 +1256,9 @@ json oaicompat_chat_params_parse(
 
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
 
+    // Render the assistant turns this server generated as they were generated (see server_turn_memory_record).
+    server_turn_memory_restore(messages);
+
     common_chat_templates_inputs inputs;
     inputs.messages              = common_chat_msgs_parse_oaicompat(messages);
     inputs.tools                 = common_chat_tools_parse_oaicompat(tools);
@@ -1050,6 +1278,7 @@ json oaicompat_chat_params_parse(
             throw std::invalid_argument("Cannot use custom grammar constraints with tools.");
         }
         llama_params["parse_tool_calls"] = true;
+        llama_params["tool_call_required"] = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
     }
 
     // merge the template args provided from command line with the args provided in the user request
@@ -1057,6 +1286,20 @@ json oaicompat_chat_params_parse(
     inputs.chat_template_kwargs = opt.chat_template_kwargs;
     for (const auto & item : chat_template_kwargs_object.items()) {
         inputs.chat_template_kwargs[item.key()] = item.value().dump();
+    }
+
+    // reasoning_effort (the OpenAI chat-completions field): "none" turns thinking off for this request, any other
+    // effort turns it on and goes to the template as reasoning_effort, which interprets it (DeepSeek-V4.1 maps it to
+    // its 1-100 scale). Template kwargs given in the request take precedence.
+    if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null()) {
+        const json & effort = body.at("reasoning_effort");
+        const bool   off    = effort.is_string() && effort.get<std::string>() == "none";
+        if (!chat_template_kwargs_object.contains("enable_thinking")) {
+            inputs.chat_template_kwargs["enable_thinking"] = off ? "false" : "true";
+        }
+        if (!off && !chat_template_kwargs_object.contains("reasoning_effort")) {
+            inputs.chat_template_kwargs["reasoning_effort"] = effort.dump();
+        }
     }
 
     // parse the "enable_thinking" kwarg to override the default value
@@ -1096,19 +1339,54 @@ json oaicompat_chat_params_parse(
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
 
+    // The leading system messages with the tools: what every conversation with this setup starts with. Rendered on
+    // their own they must be a prefix of the prompt; their length tells the server where to keep a reusable state.
+    {
+        size_t n_system = 0;
+        while (n_system < inputs.messages.size() &&
+                (inputs.messages[n_system].role == "system" || inputs.messages[n_system].role == "developer")) {
+            ++n_system;
+        }
+        if (n_system > 0 && n_system < inputs.messages.size()) {
+            common_chat_templates_inputs prefix_inputs = inputs;
+            prefix_inputs.messages.resize(n_system);
+            prefix_inputs.add_generation_prompt = false;
+            try {
+                const auto prefix = common_chat_templates_apply(opt.tmpls.get(), prefix_inputs).prompt;
+                if (!prefix.empty() && chat_params.prompt.compare(0, prefix.size(), prefix) == 0) {
+                    llama_params["shared_prefix_chars"] = prefix.size();
+                }
+            } catch (const std::exception &) {
+                // a template that cannot render the system messages alone: no shared prefix
+            }
+        }
+    }
+
+    const auto append_input = [&](const std::string & text) {
+        if (chat_params.prompt.size() + text.size() > size_t(INT32_MAX)) {
+            throw std::invalid_argument("Chat prompt exceeds tokenizer byte limit");
+        }
+        chat_params.prompt_input_spans.push_back({int32_t(chat_params.prompt.size()), int32_t(text.size())});
+        chat_params.prompt += text;
+    };
     /* Append assistant prefilled message */
     if (prefill_assistant_message) {
         if (!last_message.content_parts.empty()) {
             for (auto & p : last_message.content_parts) {
-                chat_params.prompt += p.text;
+                append_input(p.text);
             }
         } else {
-            chat_params.prompt += last_message.content;
+            append_input(last_message.content);
         }
     }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
+    llama_params["chat_untracked_content"] = chat_params.untracked_content;
+    llama_params["chat_input_spans"] = json::array();
+    for (const auto & span : chat_params.prompt_input_spans) {
+        llama_params["chat_input_spans"].push_back({span.offset, span.length});
+    }
     if (!chat_params.grammar.empty()) {
         llama_params["grammar"]      = chat_params.grammar;
         llama_params["grammar_type"] = std::string("tool_calls");
@@ -1132,8 +1410,12 @@ json oaicompat_chat_params_parse(
     // Reasoning budget: pass parameters through to sampling layer
     {
         int reasoning_budget = opt.reasoning_budget;
+        std::string reasoning_budget_suffix = opt.reasoning_budget_suffix;
         if (reasoning_budget == -1 && body.contains("thinking_budget_tokens")) {
             reasoning_budget = json_value(body, "thinking_budget_tokens", -1);
+        }
+        if (body.contains("reasoning_budget_suffix")) {
+            reasoning_budget_suffix = json_value(body, "reasoning_budget_suffix", std::string());
         }
 
         if (!chat_params.thinking_end_tag.empty()) {
@@ -1141,6 +1423,7 @@ json oaicompat_chat_params_parse(
             llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
             llama_params["reasoning_budget_end_tag"] = chat_params.thinking_end_tag;
             llama_params["reasoning_budget_message"] = opt.reasoning_budget_message;
+            llama_params["reasoning_budget_suffix"] = reasoning_budget_suffix;
         }
     }
 

@@ -132,6 +132,12 @@ int main(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
 
+    common_params suffix_params;
+    assert(suffix_params.sampling.reasoning_budget_suffix.empty());
+    argv = {"binary_name", "--reasoning-budget-suffix", "<|open|>response<|sep|>"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), suffix_params, LLAMA_EXAMPLE_SERVER));
+    assert(suffix_params.sampling.reasoning_budget_suffix == "<|open|>response<|sep|>");
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

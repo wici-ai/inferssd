@@ -1,12 +1,18 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "kimi-cpu-sink.h"
+#include "kimi-cpu-prefill.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
 #include "amx/amx.h"
 
 #include <cctype>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -36,6 +42,126 @@
 #    include <sys/sysctl.h>
 #    include <sys/types.h>
 #endif
+
+extern "C" bool ggml_cpu_layer_gap_trace_enabled();
+extern "C" void ggml_cpu_layer_gap_trace_node(
+    uint64_t start_us,
+    uint64_t end_us,
+    int op,
+    const char * op_name,
+    const char * name);
+
+struct kimi_layer_gap_cpu_entry {
+    uint64_t start_us = 0;
+    uint64_t end_us = 0;
+    int op = 0;
+    char op_name[32] = {};
+    char name[GGML_MAX_NAME] = {};
+};
+
+struct kimi_layer_gap_cpu_buffer {
+    std::vector<kimi_layer_gap_cpu_entry> entries;
+};
+
+static const char * const g_kimi_layer_gap_cpu_prefix =
+    std::getenv("GGML_MOE_TRACE_LAYER_GAPS");
+static const bool g_kimi_layer_gap_cpu_enabled =
+    g_kimi_layer_gap_cpu_prefix != nullptr && g_kimi_layer_gap_cpu_prefix[0] != '\0';
+static std::once_flag g_kimi_layer_gap_cpu_init_once;
+
+static std::mutex & kimi_layer_gap_cpu_registry_mutex() {
+    static auto * mutex = new std::mutex();
+    return *mutex;
+}
+
+static std::vector<kimi_layer_gap_cpu_buffer *> & kimi_layer_gap_cpu_registry() {
+    static auto * registry = new std::vector<kimi_layer_gap_cpu_buffer *>();
+    return *registry;
+}
+
+static void kimi_layer_gap_cpu_copy_field(char * dst, size_t dst_size, const char * src) {
+    if (dst_size == 0) {
+        return;
+    }
+    size_t out = 0;
+    for (const char * p = src != nullptr ? src : ""; *p != '\0' && out + 1 < dst_size; ++p) {
+        const char ch = *p;
+        dst[out++] = ch == ',' || ch == '\n' || ch == '\r' ? ' ' : ch;
+    }
+    dst[out] = '\0';
+}
+
+static void kimi_layer_gap_cpu_report_atexit() {
+    if (!g_kimi_layer_gap_cpu_enabled) {
+        return;
+    }
+    const std::string path = std::string(g_kimi_layer_gap_cpu_prefix) + ".cpu.csv";
+    FILE * file = std::fopen(path.c_str(), "w");
+    if (file == nullptr) {
+        std::fprintf(stderr, "[kimi_layer_gap] CPU trace open failed: %s\n", path.c_str());
+        return;
+    }
+    std::fprintf(file, "start_us,end_us,op,op_name,name\n");
+    size_t rows = 0;
+    {
+        std::lock_guard<std::mutex> lock(kimi_layer_gap_cpu_registry_mutex());
+        for (const kimi_layer_gap_cpu_buffer * buffer : kimi_layer_gap_cpu_registry()) {
+            for (const kimi_layer_gap_cpu_entry & entry : buffer->entries) {
+                std::fprintf(
+                    file,
+                    "%" PRIu64 ",%" PRIu64 ",%d,%s,%s\n",
+                    entry.start_us,
+                    entry.end_us,
+                    entry.op,
+                    entry.op_name,
+                    entry.name);
+                ++rows;
+            }
+        }
+    }
+    std::fclose(file);
+    std::fprintf(stderr, "[kimi_layer_gap] CPU trace written: %s (%zu rows)\n", path.c_str(), rows);
+}
+
+static kimi_layer_gap_cpu_buffer & kimi_layer_gap_cpu_thread_buffer() {
+    static thread_local kimi_layer_gap_cpu_buffer * buffer = nullptr;
+    if (buffer == nullptr) {
+        std::call_once(g_kimi_layer_gap_cpu_init_once, []() {
+            std::atexit(kimi_layer_gap_cpu_report_atexit);
+            std::fprintf(
+                stderr,
+                "[kimi_layer_gap] CPU trace enabled: prefix=%s\n",
+                g_kimi_layer_gap_cpu_prefix);
+        });
+        buffer = new kimi_layer_gap_cpu_buffer();
+        buffer->entries.reserve(1U << 18);
+        std::lock_guard<std::mutex> lock(kimi_layer_gap_cpu_registry_mutex());
+        kimi_layer_gap_cpu_registry().push_back(buffer);
+    }
+    return *buffer;
+}
+
+extern "C" bool ggml_cpu_layer_gap_trace_enabled() {
+    return g_kimi_layer_gap_cpu_enabled;
+}
+
+extern "C" void ggml_cpu_layer_gap_trace_node(
+        uint64_t start_us,
+        uint64_t end_us,
+        int op,
+        const char * op_name,
+        const char * name) {
+    if (!g_kimi_layer_gap_cpu_enabled || end_us <= start_us) {
+        return;
+    }
+    kimi_layer_gap_cpu_entry entry;
+    entry.start_us = start_us;
+    entry.end_us = end_us;
+    entry.op = op;
+    kimi_layer_gap_cpu_copy_field(entry.op_name, sizeof(entry.op_name), op_name);
+    kimi_layer_gap_cpu_copy_field(entry.name, sizeof(entry.name), name);
+    kimi_layer_gap_cpu_thread_buffer().entries.push_back(entry);
+}
 
 // ggml-backend interface
 
@@ -207,6 +333,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .graph_optimize          = */ NULL,
+    /* .graph_reserve           = */ NULL,
 };
 
 static ggml_guid_t ggml_backend_cpu_guid(void) {
@@ -640,6 +767,44 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "kimi_cpu_prefill_create") == 0) {
+        return (void *) kimi_cpu_prefill_create;
+    }
+    if (strcmp(name, "kimi_cpu_prefill_run") == 0) {
+        return (void *) kimi_cpu_prefill_run;
+    }
+    if (strcmp(name, "kimi_cpu_prefill_run_activation") == 0) {
+        return (void *) kimi_cpu_prefill_run_activation;
+    }
+    if (strcmp(name, "kimi_cpu_prefill_destroy") == 0) {
+        return (void *) kimi_cpu_prefill_destroy;
+    }
+    if (strcmp(name, "kimi_cpu_sink_create") == 0) {
+        return (void *) kimi_cpu_sink_create;
+    }
+    if (strcmp(name, "kimi_cpu_sink_set_cache_locations") == 0) { return (void *) kimi_cpu_sink_set_cache_locations; }
+    if (strcmp(name, "kimi_cpu_sink_run_cache_compute") == 0) { return (void *) kimi_cpu_sink_run_cache_compute; }
+    if (strcmp(name, "kimi_cache_compute_config_from_env") == 0) { return (void *) kimi_cache_compute_config_from_env; }
+    if (strcmp(name, "kimi_cache_compute_plan_init") == 0) { return (void *) kimi_cache_compute_plan_init; }
+    if (strcmp(name, "kimi_cache_compute_plan_update") == 0) { return (void *) kimi_cache_compute_plan_update; }
+    if (strcmp(name, "kimi_cpu_sink_run") == 0) {
+        return (void *) kimi_cpu_sink_run;
+    }
+    if (strcmp(name, "kimi_cpu_sink_destroy") == 0) {
+        return (void *) kimi_cpu_sink_destroy;
+    }
+    if (strcmp(name, "kimi_cpu_sink_cache_configure") == 0) {
+        return (void *) kimi_cpu_sink_cache_configure;
+    }
+    if (strcmp(name, "kimi_cpu_sink_cache_begin") == 0) {
+        return (void *) kimi_cpu_sink_cache_begin;
+    }
+    if (strcmp(name, "kimi_cpu_sink_vram_phase_complete") == 0) {
+        return (void *) kimi_cpu_sink_vram_phase_complete;
+    }
+    if (strcmp(name, "kimi_cpu_sink_cache_get_stats") == 0) {
+        return (void *) kimi_cpu_sink_cache_get_stats;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

@@ -48,6 +48,11 @@ struct llama_mmap {
     size_t size() const;
     void * addr() const;
 
+    // Apply POSIX_MADV_RANDOM to every page touched by [first, last).
+    // Unlike dontneed_fragment(), this expands to page boundaries because
+    // dropping readahead for any byte in the requested range is required.
+    bool advise_random_fragment(size_t first, size_t last, size_t * len_out = nullptr);
+    bool dontneed_fragment(size_t first, size_t last, size_t * len_out = nullptr);
     void unmap_fragment(size_t first, size_t last);
 
     static const bool SUPPORTED;
@@ -56,6 +61,12 @@ private:
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
+
+// Internal weak bridge used by the strict-memory Kimi request path.  Returns
+// false unless tensor_name identifies a routed-expert weight and the complete
+// host range belongs to live model mappings.
+extern "C" bool llama_mmap_dontneed_expert_host_range(
+        const char * tensor_name, const void * addr, size_t size, size_t * advised_out);
 
 struct llama_mlock {
     llama_mlock();

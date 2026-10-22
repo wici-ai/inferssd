@@ -1090,6 +1090,30 @@ static void test_tests(testing & t) {
         "yes"
     );
 
+    test_template(t, "is sameas without parentheses",
+        "{{ 'yes' if x is not sameas false else 'no' }}",
+        {{"x", false}},
+        "no"
+    );
+
+    test_template(t, "is sameas integer",
+        "{{ 'yes' if x is sameas(1) }}",
+        {{"x", 1}},
+        "yes"
+    );
+
+    test_template(t, "is sameas distinct objects",
+        "{{ 'yes' if x is sameas(y) else 'no' }}",
+        {{"x", json::object()}, {"y", json::object()}},
+        "no"
+    );
+
+    test_template(t, "is divisibleby without parentheses",
+        "{{ 'yes' if x is divisibleby 2 and x is not eq 3 }}",
+        {{"x", 2}},
+        "yes"
+    );
+
     test_template(t, "is boolean",
         "{{ 'yes' if x is boolean }}",
         {{"x", true}},
@@ -1645,6 +1669,10 @@ static void test_array_methods(testing & t) {
 }
 
 static void test_object_methods(testing & t) {
+    test_template(t, "null membership in object",
+        "{{ none in {'low': 16} }}|{{ none not in {'low': 16} }}", json::object(), "False|True");
+    test_template(t, "null membership in array",
+        "{{ none in [1, none] }}|{{ none not in [1, 2] }}", json::object(), "True|True");
     test_template(t, "object.get() existing key",
         "{{ obj.get('a') }}",
         {{"obj", {{"a", 1}, {"b", 2}}}},

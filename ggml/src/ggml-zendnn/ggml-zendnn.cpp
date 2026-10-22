@@ -419,6 +419,7 @@ static struct ggml_backend_i ggml_backend_zendnn_i = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .graph_optimize          = */ NULL,
+    /* .graph_reserve           = */ NULL,
 };
 
 static ggml_guid_t ggml_backend_zendnn_guid(void) {

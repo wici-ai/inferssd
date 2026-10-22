@@ -378,6 +378,9 @@ struct parser_executor {
     }
 
     common_peg_parse_result operator()(const common_peg_literal_parser & p) {
+        if (ctx.literal_allowed && !ctx.literal_allowed(start_pos, p.literal)) {
+            return common_peg_parse_result(COMMON_PEG_PARSE_RESULT_FAIL, start_pos);
+        }
         auto pos = start_pos;
         for (auto i = 0u; i < p.literal.size(); ++i) {
             if (pos >= ctx.input.size()) {
@@ -796,6 +799,19 @@ struct parser_executor {
 
             // Check if a delimiter starts at this position
             auto match = matcher.check_at(ctx.input, pos);
+            if (match != trie::NO_MATCH && ctx.literal_allowed) {
+                // The trie optimizes byte matching; every possible delimiter,
+                // including a partial one, must also pass the origin check.
+                match = trie::NO_MATCH;
+                for (const auto & delimiter : p.delimiters) {
+                    const size_t n = std::min(delimiter.size(), ctx.input.size() - pos);
+                    if (ctx.input.compare(pos, n, delimiter, 0, n) == 0 &&
+                            ctx.literal_allowed(pos, delimiter)) {
+                        match = n == delimiter.size() ? trie::COMPLETE_MATCH : trie::PARTIAL_MATCH;
+                        break;
+                    }
+                }
+            }
 
             if (match == trie::COMPLETE_MATCH) {
                 // Found a complete delimiter, return everything before it

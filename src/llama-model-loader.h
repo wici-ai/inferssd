@@ -12,10 +12,26 @@
 #include <cstddef>
 #include <cstring>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <unordered_map>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
+
+struct llama_file_range {
+    size_t first = 0;
+    size_t last  = 0;
+};
+
+struct llama_expert_tensor_index {
+    size_t deferred_bytes = 0;
+    size_t dense_bytes = 0;
+    std::vector<std::vector<llama_file_range>> file_ranges;
+
+    bool empty() const {
+        return deferred_bytes == 0;
+    }
+};
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
@@ -71,6 +87,10 @@ struct llama_model_loader {
     int n_kv      = 0;
     int n_tensors = 0;
     int n_created = 0;
+    std::set<std::string> created_tensor_names;
+    // the weights created for a matrix product (the tensor table's op, GGML_OP_MUL_MAT): what a weight homed on the
+    // drive can be (the load receipt of the dense homes)
+    std::set<const ggml_tensor *> mul_mat_weights;
 
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
@@ -78,6 +98,7 @@ struct llama_model_loader {
     bool use_mmap = false;
     bool use_direct_io = false;
     bool check_tensors;
+    bool defer_experts = false;
     bool no_alloc;
 
     llama_files files;
@@ -98,6 +119,7 @@ struct llama_model_loader {
 
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
+    llama_expert_tensor_index expert_tensor_index;
 
     size_t size_done = 0;
     size_t size_data = 0;
@@ -129,6 +151,7 @@ struct llama_model_loader {
         bool use_mmap,
         bool use_direct_io,
         bool check_tensors,
+        bool defer_experts,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
@@ -185,6 +208,11 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
 
     void done_getting_tensors() const;
+
+    void build_expert_tensor_index(const llama_hparams & hparams);
+    bool should_defer_expert_mmaps() const;
+    void drop_mmap_expert_pages() const;
+    void drop_mmap_used_pages_after_load() const;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

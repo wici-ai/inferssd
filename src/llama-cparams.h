@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <vector>
 
 #define LLAMA_MAX_SEQ 256
 
@@ -27,6 +28,8 @@ struct llama_cparams {
     float yarn_beta_slow;
 
     bool embeddings;
+    bool embeddings_nextn;        // also extract the hidden state before the final output norm
+    bool embeddings_nextn_masked; // extract only rows where batch.logits != 0
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
@@ -40,8 +43,12 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    std::vector<bool> embeddings_layer_inp; // [n_layer + 1], extract layer input embeddings
+
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    llama_context * ctx_other;
 };

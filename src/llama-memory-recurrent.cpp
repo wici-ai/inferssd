@@ -8,6 +8,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -16,6 +19,54 @@
 //
 // llama_memory_recurrent
 //
+
+static bool llama_memory_recurrent_kimi_kda_gpu_layer_selected(int layer) {
+    const char * env = std::getenv("GGML_KIMI_KDA_GPU_LAYERS");
+    if (env == nullptr || env[0] == '\0' || std::strcmp(env, "0") == 0) {
+        return false;
+    }
+    if (std::strcmp(env, "all") == 0 || std::strcmp(env, "*") == 0) {
+        return true;
+    }
+
+    const char * p = env;
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t' || *p == ',') {
+            ++p;
+        }
+        if (*p == '\0') {
+            break;
+        }
+
+        errno = 0;
+        char * end = nullptr;
+        const long first = std::strtol(p, &end, 10);
+        if (errno != 0 || end == p || first < 0 || first > INT_MAX) {
+            return false;
+        }
+        long last = first;
+        p = end;
+        if (*p == '-') {
+            ++p;
+            errno = 0;
+            last = std::strtol(p, &end, 10);
+            if (errno != 0 || end == p || last < first || last > INT_MAX) {
+                return false;
+            }
+            p = end;
+        }
+        if (layer >= first && layer <= last) {
+            return true;
+        }
+        while (*p == ' ' || *p == '\t') {
+            ++p;
+        }
+        if (*p != '\0' && *p != ',') {
+            return false;
+        }
+    }
+    return false;
+}
 
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
@@ -80,6 +131,16 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         if (offload) {
             auto * dev = model.dev_layer(i);
+            if (model.arch == LLM_ARCH_KIMI_K3 &&
+                    llama_memory_recurrent_kimi_kda_gpu_layer_selected(i)) {
+                for (const llama_device & candidate : model.devices) {
+                    if (!candidate.is_meta &&
+                            ggml_backend_dev_type(candidate.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        dev = candidate.dev;
+                        break;
+                    }
+                }
+            }
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);

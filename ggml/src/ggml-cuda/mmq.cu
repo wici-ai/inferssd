@@ -74,6 +74,30 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+size_t ggml_cuda_mul_mat_q_fixup_pool_size() {
+    const int id  = ggml_cuda_get_device();
+    const int cc  = ggml_cuda_info().devices[id].cc;
+    const int nsm = ggml_cuda_info().devices[id].nsm;
+    // the stream-k fixup of mul_mat_q_case keeps at most one tile per SM
+    return ggml_cuda_pool_alloc_size(size_t(nsm) * get_mmq_x_max_host(cc) * get_mmq_y_host(cc) * sizeof(float));
+}
+
+size_t ggml_cuda_mul_mat_q_pool_size(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids) {
+    const int     cc          = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+
+    size_t  size = 0;
+    int64_t rows = src1->ne[1] * src1->ne[2] * src1->ne[3];
+    if (ids) {
+        rows = src1->ne[2] * ids->ne[0];
+        size += 2 * ggml_cuda_pool_alloc_size(rows * sizeof(int32_t)) +
+                ggml_cuda_pool_alloc_size((src0->ne[2] + 1) * sizeof(int32_t));
+    }
+    size += ggml_cuda_pool_alloc_size(rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
+                                      get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq));
+    return size + ggml_cuda_mul_mat_q_fixup_pool_size();
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -154,7 +178,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, nullptr, dst_d,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
@@ -214,7 +238,7 @@ void ggml_cuda_mul_mat_q(
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), nullptr, dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
@@ -222,6 +246,33 @@ void ggml_cuda_mul_mat_q(
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
+
+#ifdef GGML_CUDA_MOE_STREAM
+void ggml_cuda_moe_stream_mmq(
+        ggml_backend_cuda_context & ctx, ggml_type type, const char * x, int64_t ncols, int64_t nrows, int64_t stride_row_x,
+        const int * y, int64_t n, float * dst, cudaStream_t stream) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
+                            || GGML_CUDA_CC_IS_CDNA(cc);
+    const bool use_native_mxfp4 = blackwell_mma_available(cc) && type == GGML_TYPE_MXFP4;
+
+    // the operand's layout is that of ggml_cuda_mul_mat_q without ids: one channel and one sample of n columns
+    const int64_t ncols_padded = GGML_PAD(ncols, MATRIX_ROW_PADDING);
+    const int64_t s12 = use_native_mxfp4 ? n * ncols_padded * sizeof(block_fp4_mmq) / (8 * QK_MXFP4 * sizeof(int)) :
+                                           n * ncols_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s02 = stride_row_x * nrows;
+    const int64_t s2  = n * nrows;
+
+    const mmq_args args = {
+        x, type, y, nullptr, nullptr, nullptr, dst,
+        ncols, nrows, n, stride_row_x, n, nrows,
+        1, 1, s02, s12, s2,
+        1, 1, s02, s12, s2,
+        use_stream_k, n};
+    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+}
+#endif // GGML_CUDA_MOE_STREAM
 
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,
@@ -254,7 +305,7 @@ void ggml_cuda_op_mul_mat_q(
                             || GGML_CUDA_CC_IS_CDNA(cc))
                             && src1_ncols == ne11;
     const mmq_args args = {
-        src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, dst_dd_i,
+        src0_dd_i, src0->type, (const int *) src1_ddq_i, nullptr, nullptr, nullptr, dst_dd_i,
         ne00, row_diff, src1_ncols, stride01, ne11, nrows_dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,

@@ -342,6 +342,29 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
+    GGML_API void                 ggml_backend_sched_kimi_set_profile_phase(int phase);
+    GGML_API void                 ggml_backend_sched_kimi_set_dense_decode(ggml_backend_sched_t sched, bool decode);
+    GGML_API void                 ggml_backend_sched_kimi_set_kda_decode(ggml_backend_sched_t sched, bool decode);
+    // the expert copies of every scheduler of the process so far (GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE): expert
+    // slices (one expert of one expert tensor: gate, up, down or a fused gate-up) and bytes read from the expert
+    // source, the time those reads took, and the reads that fell back to a slower path (a failed batched read redone
+    // range by range, a range read left to the mmap'd tensor); and the copies of the weights homed on the drive:
+    // tensors, bytes, the time in the transport's copy (of it, in the copies not read ahead), the time waiting for
+    // the device before it, the copies whose blocks had been read ahead, the copies left to the mapped weight
+    struct ggml_backend_sched_kimi_copy_stats {
+        uint64_t expert_slices;
+        uint64_t bytes;
+        uint64_t read_us;
+        uint64_t fallbacks;
+        uint64_t dense_tensors;
+        uint64_t dense_bytes;
+        uint64_t dense_read_us;
+        uint64_t dense_first_us;
+        uint64_t dense_wait_us;
+        uint64_t dense_readahead;
+        uint64_t dense_fallbacks;
+    };
+    GGML_API void                 ggml_backend_sched_kimi_copy_stats_get(struct ggml_backend_sched_kimi_copy_stats * stats);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.

@@ -1,0 +1,268 @@
+// CUDA lifecycle test of the elastic GPU tier's unified-memory behaviour, on any CUDA device:
+//  - GGML_KIMI_CPU_SINK_VRAM_BYTES=auto starts from one block; a discrete GPU grows at once, a unified one at the
+//    token boundary after its first decode step;
+//  - an OOM reclaim while a layer is live is refused without poisoning the tier; with a deferred upload still
+//    copying it waits for the copy, gives the block back, and collect reports that upload as aborted;
+//  - reclaim_host gives blocks back for a host allocation until free memory covers it, keeping one block, and
+//    refuses while a layer is live;
+//  - auto is refused without an elastic tier and gives back on demand only;
+//  - with ggml's memory query replaced by a model of a unified DRAM (so this runs on any CUDA device): the
+//    host-memory ledger's floor and the RAM cache's demand, published before the first prepare, bound the base and
+//    the growth and are ggml's reserve; growth at the second decode boundary waits for a deferred upload still
+//    copying instead of skipping; a demand rise at a token boundary gives blocks back while an upload into them is
+//    in flight, and collect reports that upload as aborted.
+// The Q3_K legacy engine stands in for the expert format, as in test-kimi-vram-elastic.
+#include "ggml-backend.h"
+#include "ggml-cuda.h"
+#include "vram-tier.cpp"
+#include <future>
+
+namespace {
+std::mutex gate_mutex;
+std::condition_variable gate_cv;
+bool held = false, entered = false;
+bool upload_gate(void *) {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    entered = true; gate_cv.notify_all();
+    gate_cv.wait(lock, [] { return !held; });
+    return true;
+}
+void hold() { std::lock_guard<std::mutex> lock(gate_mutex); held = true; entered = false; }
+void open_gate() { std::lock_guard<std::mutex> lock(gate_mutex); held = false; gate_cv.notify_all(); }
+bool copy_started() {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    return gate_cv.wait_for(lock, std::chrono::seconds(5), [] { return entered; });
+}
+template <class T> bool done_within(std::future<T> & f, int ms) {
+    return f.wait_for(std::chrono::milliseconds(ms)) == std::future_status::ready;
+}
+// A unified DRAM: `pool` bytes are available before the modeled tier's blocks, which come out of it.
+size_t pool = 0, published = 0;
+const tier * modeled = nullptr;
+void model_get(int, size_t * free_bytes, size_t * total) {
+    const size_t used = modeled ? size_t(modeled->capacity_bytes) : 0;
+    *free_bytes = pool > used ? pool - used : 0; *total = pool + (size_t(64) << 30);
+}
+bool model_unified(int) { return true; }
+void model_reserve(int, size_t bytes) { published = bytes; }
+size_t model_free() { size_t free_bytes = 0, total = 0; model_get(0, &free_bytes, &total); return free_bytes; }
+int assertions = 0;
+void require(bool ok, const char * what) { ++assertions; if (!ok) throw std::runtime_error(what); }
+const size_t role = 28672, stride = 3 * role;
+kimi_vram_request key(int layer, int expert) {
+    kimi_vram_request r = {}; r.layer = layer; r.expert = expert; r.weight = .5f;
+    for (int i = 0; i < 3; ++i) { r.role[i] = {1, 2, 100000000, uint64_t(layer * 1000 + expert * 3 + i) * role, role, 3, 4, 5, 6}; }
+    return r;
+}
+}
+
+int main() { try {
+    setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", "1", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD", "1", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_GPU_HIDDEN", "0", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY", "lru", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "1", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", "1", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC", "1", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM", "1", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB", "0", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_WATERMARK", "0", 1);
+    unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_BLOCKS");
+    unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_MALLOC_AT");
+    unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_FREE_AT");
+    std::vector<unsigned char> payload(stride, 7);
+    const void * data[] = {payload.data(), payload.data() + role, payload.data() + 2 * role};
+    std::vector<float> out(256);
+    struct cleanup { ~cleanup() { open_gate(); } } cleanup_on_error;
+    // ggml's own answer; the tier finds the same through the CUDA backend it looks up at run time.
+    const bool unified = ggml_backend_cuda_device_is_unified(0);
+
+    // auto: one block first; growth at once on a discrete GPU, after the first decode step on unified memory.
+    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "40", 1);
+    {
+        tier t(tier::automatic_budget);
+        const auto k = key(1, 0);
+        int slot = -1;
+        t.begin(51, 1, true);
+        t.prepare(&k, 1, 256, 256, &slot);
+        require(t.unified == unified, "the tier and ggml disagree about unified memory");
+        require(t.elastic_active && t.base_slots == tier::elastic_block_slots && t.max_slots == 40,
+                "auto did not start from one block under the slot cap");
+        if (unified) {
+            require(t.slot_locations.size() == tier::elastic_block_slots && t.grow_events == 0,
+                    "unified memory grew before the first decode step ended");
+        } else {
+            require(t.slot_locations.size() == 40 && t.grow_events == 1, "a discrete GPU did not grow at once");
+        }
+        t.finish(out.data(), 256);
+        t.begin(51, 2, true);
+        require(t.slot_locations.size() == 40 && t.grow_events == 1, "the tier did not grow after the first decode step");
+    }
+
+    // OOM reclaim: refused inside a live layer, then waits for a deferred copy and aborts its reservation.
+    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "2", 1);
+    {
+        tier t(2 * stride); // one block of two slots
+        t.deferred_hook = upload_gate;
+        const auto g = key(2, 1);
+        int slot = -1, queued = 0;
+        hold();
+        t.begin(52, 1, true);
+        t.prepare(&g, 1, 256, 256, &slot);
+        require(t.elastic_active && t.blocks.size() == 1 && t.table->admissions[0] >= 0, "reclaim fixture has no admission");
+        t.reclaimer_armed = true; // armed at every decode token on unified memory
+        size_t freed = 0;
+        require(t.reclaim_one(4096, &freed) == 0 && !freed && !t.poisoned && t.blocks.size() == 1 && t.live_reclaim_refusals == 1,
+                "a reclaim inside a live layer was not refused cleanly");
+        t.admit_deferred(g, data, &queued);
+        require(queued == 1 && copy_started(), "the deferred upload did not start");
+        t.finish(out.data(), 256);
+        // the residency the next-layer prefetch asks: an upload in flight is held (the next prepare collects it)
+        const auto * residency = kimi_vram_residency_get_api();
+        uint8_t held = 0;
+        residency->held(&t, g.layer, &g.expert, 1, &held);
+        require(residency->version == 2 && held == 1, "a deferred upload in flight was not held");
+        auto reclaim = std::async(std::launch::async, [&] { return t.reclaim_one(4096, &freed); });
+        require(!done_within(reclaim, 150), "the reclaim did not wait for the deferred copy");
+        open_gate();
+        require(done_within(reclaim, 5000), "the reclaim did not return after the copy");
+        require(reclaim.get() == 1 && freed == 2 * stride && !t.poisoned && t.blocks.empty(),
+                "the reclaim did not give the block back");
+        residency->held(&t, g.layer, &g.expert, 1, &held);
+        require(held == 0, "an upload whose block was given back is still held");
+        kimi_vram_request collected[4] = {};
+        int32_t aborted[4] = {};
+        int count = -1;
+        t.collect(-1, collected, aborted, 4, &count);
+        require(count == 1 && aborted[0] == 1 && vram_slot_table::same(collected[0], g) &&
+                t.deferred_published == 0 && t.deferred_aborted == 1, "collect did not report the aborted upload");
+        t.begin(52, 2, true);
+        t.prepare(&g, 1, 256, 256, &slot);
+        require(slot < 0 && !t.poisoned, "an aborted upload served a hit");
+        t.finish(out.data(), 256);
+    }
+
+    // reclaim_host: blocks go until free memory covers the allocation, one stays, a live layer refuses.
+    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "40", 1);
+    {
+        tier t(40 * stride); // a base of three blocks: 16, 16 and 8 slots
+        const auto k = key(3, 2);
+        int slot = -1;
+        t.begin(53, 1, true); t.prepare(&k, 1, 256, 256, &slot); t.finish(out.data(), 256);
+        require(t.slot_locations.size() == 40 && t.blocks.size() == 3, "reclaim_host fixture has no three blocks");
+        // The arithmetic is the same on any device; on a discrete GPU this only lets the test exercise it.
+        t.unified = true;
+        size_t free_bytes = 0, total = 0;
+        t.mem_info(&free_bytes, &total);
+        const size_t low = t.watermark_low_mib << 20;
+        require(free_bytes > low, "no room above the low watermark");
+        const size_t before = t.slot_locations.size();
+        require(t.reclaim_host(free_bytes - low + 10 * stride, "test") && t.slot_locations.size() < before &&
+                !t.blocks.empty() && t.host_reclaims == 1, "reclaim_host did not give blocks back for an allocation");
+        require(!t.reclaim_host(SIZE_MAX / 2, "test") && t.blocks.size() == 1 && !t.poisoned,
+                "reclaim_host did not keep one block");
+        t.begin(53, 2, true);
+        t.prepare(&k, 1, 256, 256, &slot);
+        const size_t slots = t.slot_locations.size();
+        require(!t.reclaim_host(SIZE_MAX / 2, "test") && t.slot_locations.size() == slots && t.host_reclaim_refusals == 1,
+                "reclaim_host did not refuse inside a live layer");
+        t.finish(out.data(), 256);
+    }
+    // auto sizes an elastic tier only, and has no base to shrink to at a prefill: it gives back on demand.
+    {
+        setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC", "0", 1);
+        bool refused = false;
+        try { tier t(tier::automatic_budget); } catch (const std::exception &) { refused = true; }
+        require(refused, "auto was accepted without an elastic tier");
+        setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC", "1", 1);
+        setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM", "0", 1);
+        { tier t(tier::automatic_budget); require(t.elastic_demand_reclaim, "auto did not reclaim on demand"); }
+        { tier t(2 * stride); require(!t.elastic_demand_reclaim, "a byte budget changed its prefill policy"); }
+        setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM", "1", 1);
+    }
+
+    // The floor on a modeled unified DRAM. Low watermark 1 MiB, growth leaves 2 MiB, no fixed safety reserve.
+    auto & query = ggml_memory_query::instance();
+    query.get = model_get; query.unified = model_unified; query.set_reserve = model_reserve;
+    setenv("GGML_KIMI_CPU_SINK_VRAM_SAFETY_MIB", "0", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB", "2", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_WATERMARK_LOW_MIB", "1", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_WATERMARK_HIGH_MIB", "2", 1);
+    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "40", 1);
+    const size_t low = size_t(1) << 20, safety = size_t(2) << 20, floor = size_t(3) << 30, demand = size_t(1) << 30;
+    // Published before the first prepare (the sink does so at its first decode layer), floor and demand bound the base.
+    {
+        tier t(tier::automatic_budget);
+        modeled = &t; pool = floor + demand + low + 5 * stride + stride / 2; published = 0;
+        policy_set_host_floor(&t, floor); policy_set_host_demand(&t, demand);
+        const auto k = key(4, 0);
+        int slot = -1;
+        t.begin(61, 1, true); t.prepare(&k, 1, 256, 256, &slot);
+        require(t.unified && published == floor + demand, "ggml's reserve is not the floor plus the demand");
+        require(t.slot_locations.size() == 5 && t.grow_events == 0 && model_free() >= floor + demand + low,
+                "the base did not keep the floor and the demand free");
+        t.finish(out.data(), 256);
+        t.begin(61, 2, true);
+        require(t.grow_events == 1 && t.slot_locations.size() == 5 && model_free() >= floor + demand + low,
+                "growth ate into the floor or the demand");
+        modeled = nullptr;
+    }
+    // Growth at the second decode boundary waits for a copy still in flight; a demand rise gives blocks back.
+    {
+        tier t(tier::automatic_budget);
+        modeled = &t; pool = floor + demand + safety + 20 * stride + stride / 2; published = 0;
+        t.deferred_hook = upload_gate;
+        policy_set_host_floor(&t, floor); policy_set_host_demand(&t, demand);
+        kimi_vram_request keys[17];
+        for (int i = 0; i < 17; ++i) { keys[i] = key(4, i); }
+        int slots[16] = {}, queued = 0;
+        t.begin(62, 1, true); t.prepare(keys, 16, 256, 256, slots);
+        require(t.slot_locations.size() == 16 && t.grow_events == 0, "the auto base is not one block");
+        for (int i = 0; i < 15; ++i) { t.admit_deferred(keys[i], data, &queued); require(queued == 1, "an upload was not deferred"); }
+        t.drain_deferred();
+        hold();
+        t.admit_deferred(keys[15], data, &queued);
+        require(queued == 1 && copy_started(), "the held upload did not start");
+        t.finish(out.data(), 256);
+        auto grow = std::async(std::launch::async, [&] { t.begin(62, 2, true); });
+        require(!done_within(grow, 150), "growth did not wait for the copy in flight");
+        open_gate();
+        require(done_within(grow, 5000), "growth did not finish after the copy");
+        grow.get();
+        require(t.grow_events == 1 && t.slot_locations.size() == 20 && model_free() >= floor + demand + low,
+                "the tier did not grow at the second decode boundary while an upload was in flight");
+        kimi_vram_request collected[20] = {};
+        int32_t aborted[20] = {};
+        int count = -1;
+        t.collect(-1, collected, aborted, 20, &count);
+        require(count == 16 && std::none_of(aborted, aborted + count, [](int32_t a) { return a != 0; }),
+                "growth aborted an upload");
+        int slot = -1;
+        t.prepare(&keys[16], 1, 256, 256, &slot);
+        require(t.table->admissions[0] == 16, "the fixture's upload does not target the grown block");
+        hold();
+        t.admit_deferred(keys[16], data, &queued);
+        require(queued == 1 && copy_started(), "the second held upload did not start");
+        t.finish(out.data(), 256);
+        const size_t raised = demand + 13 * stride;
+        policy_set_host_demand(&t, raised);
+        require(published == floor + raised, "a demand rise was not published to ggml");
+        auto shrink = std::async(std::launch::async, [&] { t.begin(62, 3, true); });
+        require(!done_within(shrink, 150), "the host reclaim did not wait for the copy in flight");
+        open_gate();
+        require(done_within(shrink, 5000), "the host reclaim did not finish after the copy");
+        shrink.get();
+        require(t.slot_locations.size() == 16 && t.blocks.size() == 1 && t.host_reclaims == 1 && !t.poisoned &&
+                model_free() >= floor + raised + low, "the demand rise did not give the grown block back");
+        t.collect(-1, collected, aborted, 20, &count);
+        require(count == 1 && aborted[0] == 1 && vram_slot_table::same(collected[0], keys[16]) && t.deferred_aborted == 1,
+                "collect did not report the upload into the freed block as aborted");
+        t.prepare(&keys[16], 1, 256, 256, &slot);
+        require(slot < 0, "an aborted upload served a hit");
+        t.finish(out.data(), 256);
+        modeled = nullptr;
+    }
+    std::printf("REAL_CUDA_VRAM_RECLAIM_PASS assertions=%d unified=%d\n", assertions, int(unified));
+    return 0;
+} catch (const std::exception & e) { open_gate(); std::fprintf(stderr, "VRAM_RECLAIM_FAIL: %s\n", e.what()); return 1; } }

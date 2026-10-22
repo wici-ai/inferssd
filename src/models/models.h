@@ -2,6 +2,7 @@
 
 #include "llama-model.h"
 #include "llama-graph.h"
+#include "llama-kimi-compat.h"
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
@@ -188,6 +189,61 @@ struct llm_build_deci : public llm_graph_context {
 
 struct llm_build_deepseek2 : public llm_graph_context {
     llm_build_deepseek2(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_deepseek4 : public llm_graph_context {
+    llm_build_deepseek4(const llama_model & model, const llm_graph_params & params);
+};
+
+// DeepSeek-V4.1, ported from upstream; see src/models/deepseek41.cpp
+struct llm_build_deepseek41 : public llm_graph_context {
+    llm_build_deepseek41(const llama_model & model, const llm_graph_params & params);
+private:
+    struct rope_cfg {
+        float   base;
+        float   scale;
+        float   ext_factor;
+        float   attn_factor;
+        float   beta_fast;
+        float   beta_slow;
+        int32_t n_ctx_orig;
+    };
+
+    rope_cfg layer_rope_cfg(int il) const;
+
+    // hyper-connection stream
+    ggml_tensor * build_hc_pre(ggml_tensor * x, ggml_tensor * weights, int il) const;
+    ggml_tensor * build_hc_sinkhorn(ggml_tensor * comb, int il) const;
+    void          build_hc_mixes(ggml_tensor * x, ggml_tensor * hc_fn, ggml_tensor * hc_scale, ggml_tensor * hc_base,
+                                 ggml_tensor ** pre, ggml_tensor ** post, ggml_tensor ** comb, int il) const;
+    ggml_tensor * build_hc_post(ggml_tensor * x, ggml_tensor * residual, ggml_tensor * post, ggml_tensor * comb, int il) const;
+
+    // engram
+    ggml_tensor * build_inp_engram(int il);
+    ggml_tensor * build_engram(ggml_tensor * x, ggml_tensor * emb, int il) const;
+
+    // attention
+    ggml_tensor * build_compressed_kv_from_state(
+            ggml_tensor * kv_state, ggml_tensor * score_state, ggml_tensor * state_read_idxs, ggml_tensor * comp_pos,
+            ggml_tensor * norm, int64_t ratio, int64_t n_embd_head, const char * name, int il,
+            ggml_tensor ** pre_rope) const;
+    ggml_tensor * build_top_k_mask(ggml_tensor * kq_mask, ggml_tensor * top_k, const char * name, int il) const;
+    ggml_tensor * build_raw_attention(llm_graph_input_dsv4_raw * inp_attn, ggml_tensor * q, ggml_tensor * kv,
+                                      ggml_tensor * sinks, float kq_scale, int il) const;
+    ggml_tensor * build_attention_tail(ggml_tensor * out, ggml_tensor * inp_pos, int64_t nt, int il) const;
+    ggml_tensor * build_indexer_mask(llm_graph_input_dsv4 * inp_dsv4, const llm_graph_input_dsv4::comp_input & inp_comp,
+                                     ggml_tensor * qr, ggml_tensor * cur, ggml_tensor * inp_pos, int64_t * n_top_k,
+                                     int il) const;
+    ggml_tensor * build_attention_v41(llm_graph_input_dsv4 * inp_dsv4, ggml_tensor * cur, ggml_tensor * inp_pos, int il) const;
+
+    // top-k masks published by the index sources of this graph, for the layers that read them
+    mutable std::array<ggml_tensor *, LLAMA_MAX_LAYERS> top_k_masks = {};
+    mutable std::array<int64_t, LLAMA_MAX_LAYERS>       top_k_counts = {};
+    // the candidate source's block scores for all queries of the ubatch, and the candidate blocks picked from them
+    mutable ggml_tensor * candidate_scores = nullptr;
+    mutable ggml_tensor * candidate_blocks = nullptr;
+
+    const llama_model & model;
 };
 
 struct llm_build_deepseek : public llm_graph_context {
@@ -389,6 +445,60 @@ struct llm_build_kimi_linear : public llm_build_delta_net_base {
     const llama_model & model;
 };
 
+struct llm_build_kimi_k3 : public llm_build_delta_net_base {
+    llm_build_kimi_k3(const llama_model & model, const llm_graph_params & params);
+
+    const llama_model & model;
+    const llama_k3_decode_expert_policy decode_expert_policy;
+    const llama_k3_decode_expert_table decode_expert_table;
+
+    // Cross-layer residual checkpoints. Each checkpoint is kept as
+    // [n_embd, 1, n_tokens] and concatenated lazily when the bank changes.
+    std::vector<ggml_tensor *> ckpts;
+    ggml_tensor * stack_cache = nullptr;
+    int stack_cache_n = -1;
+
+    void res_push(ggml_tensor * cur, int64_t n_embd, int64_t n_tokens);
+    ggml_tensor * res_stack(int64_t n_embd, int64_t n_tokens);
+    ggml_tensor * res_mix(
+            ggml_tensor * cur,
+            ggml_tensor * score_w,
+                int64_t   n_embd,
+                int64_t   n_tokens,
+                    int   il);
+
+    ggml_tensor * build_kda_layer(
+            ggml_tensor * cur,
+      const llama_layer & layer,
+    llm_graph_input_rs * inp_rs,
+                int64_t   d_conv,
+                int64_t   head_dim,
+                int64_t   n_head_kda,
+                int64_t   d_inner,
+                int64_t   n_seq_tokens,
+                int64_t   n_seqs,
+                    int   il);
+
+    ggml_tensor * build_mla_layer(
+            ggml_tensor * cur,
+      const llama_layer & layer,
+    llm_graph_input_attn_k * inp_attn_k,
+    llm_graph_input_attn_kv * inp_attn_kv,
+                int64_t   n_embd_head_k_mla,
+                int64_t   n_embd_head_v_mla,
+                int64_t   kv_lora_rank,
+                int64_t   n_embd_head_qk_rope,
+                int64_t   n_embd_head_qk_nope,
+                  float   kq_scale,
+                    int   il);
+
+    ggml_tensor * build_latent_moe(
+            ggml_tensor * cur,
+      const llama_layer & layer,
+                int64_t   n_embd_latent,
+                    int   il);
+};
+
 template <bool iswa>
 struct llm_build_lfm2 : public llm_graph_context {
     llm_build_lfm2(const llama_model & model, const llm_graph_params & params);
@@ -468,6 +578,10 @@ struct llm_build_olmo2 : public llm_graph_context {
     llm_build_olmo2(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_muse_spark : public llm_graph_context {
+    llm_build_muse_spark(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_olmoe : public llm_graph_context {
     llm_build_olmoe(const llama_model & model, const llm_graph_params & params);
 };
@@ -536,6 +650,14 @@ struct llm_build_qwen2vl : public llm_graph_context {
 
 struct llm_build_qwen3 : public llm_graph_context {
     llm_build_qwen3(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_dflash : public llm_graph_context {
+    llm_build_dflash(const llama_model & model, const llm_graph_params & params);
+
+private:
+    void build_encoder(const llama_model & model);
+    void build_decoder(const llama_model & model);
 };
 
 struct llm_build_qwen3moe : public llm_graph_context {
