@@ -62,8 +62,8 @@ file-backed checks, not in-memory text hashes or a guarantee against later loadi
 the system dyld shared cache is outside their scope. Keep build files unchanged and
 preserve separate build directories for baseline and candidate binaries. The report
 also records alias/prompt hashes, driver source revision and uncommitted diff.
-For `--model muse`, the driver supplies `models/templates/muse-spark.jinja` from
-the same source tree. `--poll` overrides both decode and batch threadpool polling;
+The driver supplies the selected model's chat template, disables reasoning, and
+explicitly places DeepSeek Engram embeddings on CPU, matching the normal launcher. `--poll` overrides both decode and batch threadpool polling;
 omitting it retains the server default. Use the same prompt, output length and
 parameters for each comparison. One-second memory samples within recorded requests
 exclude loading and later `vmmap` inspection, and can miss shorter peaks.
