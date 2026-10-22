@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from ssdash.model import prefill_workload
+
 FIXTURES = Path(__file__).parent / "fixtures"
 ORACLE_PATH = FIXTURES / "oracle/prefill_f.py"
 SPEC = importlib.util.spec_from_file_location("prefill_workload_f_oracle", ORACLE_PATH)
@@ -54,3 +56,8 @@ def test_frozen_oracle_identity():
 @pytest.mark.parametrize("case", GOLDENS["cases"], ids=lambda case: case["name"])
 def test_frozen_prefill_workload(case):
     assert observe(ORACLE, case) == case["expected"]
+
+
+@pytest.mark.parametrize("case", GOLDENS["cases"], ids=lambda case: case["name"])
+def test_typed_prefill_workload(case):
+    assert observe(prefill_workload, case) == case["expected"]

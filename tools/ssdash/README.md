@@ -95,3 +95,21 @@ fewest moves within one read of the minimum time. Inputs are not normalized,
 arithmetic is not reordered, and the old prefill module and production callers
 remain unchanged. This extraction does not include pass sizing, thresholds,
 workload planning, calibration, or device measurements.
+
+## Prefill workload geometry
+
+`ssdash.model.prefill_workload` adds `cut`, `served`, `offloaded`, and `cold_share`.
+`PassSizing` describes only the existing optional `ubatch` and `ubatch_p` keys;
+it does not parse, validate, copy, or normalize a complete prefill artifact.
+
+The functions preserve F's explicit/placement/global ubatch fallback order,
+truthy zero/null handling, negative-batch remainder behavior, first-turn cold
+state, follow-up reply forms and half weights, and offload minimum of 32 tokens.
+`cold_share` still traverses its input twice: a one-shot iterator is consumed by
+the first sum. Zero or cancelling total weights return zero. These existing
+boundaries are recorded for equivalence, not recommended as valid workload data.
+
+32 frozen F cases cover the return values, order, integer values and exact float
+bits, including composed workload forms. The original source and oracle remain
+unchanged. Coverage estimation, pass timing, break-even search, threshold choice,
+feedback, artifact validation and production callers remain outside this leaf.
