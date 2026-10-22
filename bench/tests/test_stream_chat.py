@@ -4,6 +4,8 @@ import io
 import json
 import sys
 import threading
+import signal
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -12,6 +14,15 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import compare_outputs
 import stream_chat
+
+
+def test_whole_request_deadline_restores_the_signal_handler():
+    previous = signal.getsignal(signal.SIGALRM)
+    with pytest.raises(TimeoutError, match="whole request deadline"):
+        with stream_chat.deadline(0.02):
+            time.sleep(0.2)
+    assert signal.getsignal(signal.SIGALRM) == previous
+    assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
 
 
 def fixture(count=256):
