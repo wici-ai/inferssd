@@ -1339,6 +1339,14 @@ private:
     int slots_debug = 0;
     int n_empty_consecutive = 0;
 
+    // Opt-in bounded prefill sizing on Mac. The context's physical ubatch
+    // remains the hard ceiling; the server submits smaller physical work.
+    int32_t mac_prefill_task = -1;
+    int32_t mac_prefill_size = 0;
+    int32_t mac_prefill_previous_size = 0;
+    double mac_prefill_previous_ms_per_token = 0;
+    bool mac_prefill_settled = false;
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     // positions at which the memory can save a state it has gone past (llama_state_seq_at_align), 0 if it cannot
@@ -3392,6 +3400,32 @@ private:
         int32_t n_batch  = llama_n_batch(ctx);
         int32_t n_ubatch = llama_n_ubatch(ctx);
 
+        bool mac_adaptive_prefill = false;
+#if defined(__APPLE__)
+        const char * mac_adaptive = std::getenv("LLAMA_MAC_ADAPTIVE_PREFILL");
+        mac_adaptive_prefill = mac_adaptive && std::strcmp(mac_adaptive, "1") == 0 &&
+            params_base.n_parallel == 1 && batch.n_tokens == 0;
+#endif
+        if (mac_adaptive_prefill) {
+            for (const auto & slot : slots) {
+                if (!slot.is_processing() || !slot.task || slot.state == SLOT_STATE_GENERATING) {
+                    continue;
+                }
+                const int32_t ceiling = std::min(n_batch, n_ubatch);
+                if (mac_prefill_task != slot.task->id) {
+                    mac_prefill_task = slot.task->id;
+                    mac_prefill_size = std::min(256, ceiling);
+                    mac_prefill_previous_size = 0;
+                    mac_prefill_previous_ms_per_token = 0;
+                    mac_prefill_settled = false;
+                    SRV_INF("mac_adaptive_prefill task=%d initial=%d ceiling=%d\n",
+                            mac_prefill_task, mac_prefill_size, ceiling);
+                }
+                n_batch = std::min(n_batch, mac_prefill_size);
+                break;
+            }
+        }
+
         float  alora_scale       = -1.0f;
         size_t alora_disabled_id = 0;
 
@@ -4034,7 +4068,29 @@ private:
                 }
             }
 
+            const int64_t mac_batch_start = mac_adaptive_prefill ? ggml_time_us() : 0;
             const int ret = llama_decode(ctx, batch_view);
+            if (mac_adaptive_prefill && ret == 0 && n_tokens > 1) {
+                llama_synchronize(ctx);
+                const double elapsed_ms = double(ggml_time_us() - mac_batch_start) / 1000.0;
+                const double ms_per_token = elapsed_ms / n_tokens;
+                const int32_t used_size = mac_prefill_size;
+                // Exclude short checkpoint/tail batches from size comparisons.
+                if (n_tokens == used_size && !mac_prefill_settled) {
+                    if (mac_prefill_previous_size > 0 && used_size > mac_prefill_previous_size &&
+                            ms_per_token > 1.20 * mac_prefill_previous_ms_per_token) {
+                        mac_prefill_size = mac_prefill_previous_size;
+                        mac_prefill_settled = true;
+                    } else {
+                        mac_prefill_previous_size = used_size;
+                        mac_prefill_previous_ms_per_token = ms_per_token;
+                        const int32_t ceiling = std::min(llama_n_batch(ctx), llama_n_ubatch(ctx));
+                        mac_prefill_size = std::min(ceiling, used_size * 2);
+                    }
+                }
+                SRV_INF("mac_adaptive_prefill task=%d tokens=%d elapsed_ms=%.3f next=%d settled=%d\n",
+                        mac_prefill_task, n_tokens, elapsed_ms, mac_prefill_size, int(mac_prefill_settled));
+            }
 
             metrics.on_decoded(slots);
 
@@ -4118,6 +4174,9 @@ private:
 
             // on successful decode, restore the original batch size
             n_batch = llama_n_batch(ctx);
+            if (mac_adaptive_prefill && mac_prefill_size > 0) {
+                n_batch = std::min(n_batch, mac_prefill_size);
+            }
 
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
             for (auto & slot : slots) {
