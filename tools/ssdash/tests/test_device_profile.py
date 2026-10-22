@@ -149,6 +149,7 @@ os.getenv = denied
 sys.argv = ["unrelated", "/does-not-exist"]
 import ssdash, ssdash.cli, ssdash.contracts
 import ssdash.probe.device_profile, ssdash.probe.recorded
+import ssdash.model, ssdash.model.decode_cost
 """
     subprocess.run([sys.executable, "-c", program], check=True)
 

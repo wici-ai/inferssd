@@ -2085,6 +2085,92 @@
           }
         }
       }
+    },
+    {
+      "name": "null_share_empty_distribution",
+      "rows": [
+        [
+          [
+            0,
+            -1
+          ]
+        ]
+      ],
+      "costs": {
+        "layer_table": {
+          "0,0,2": [
+            4,
+            10.0,
+            3.0
+          ],
+          "0,1,1": [
+            5,
+            8.0,
+            2.0
+          ],
+          "0,2,0": [
+            20,
+            6.0,
+            4.0
+          ],
+          "1,0,1": [
+            5,
+            7.0,
+            2.0
+          ],
+          "1,1,0": [
+            5,
+            3.0,
+            1.0
+          ],
+          "2,0,0": [
+            5,
+            2.0,
+            0.5
+          ]
+        },
+        "layer_beta": [
+          0.75,
+          0.5,
+          1.0,
+          2.0,
+          0.25
+        ],
+        "prefetch_share": 0.25,
+        "pf_k": 1,
+        "t_out_ms": 1.0,
+        "ready_given_nx": {
+          "2": [
+            0,
+            0,
+            1
+          ]
+        },
+        "ready_share_all": null
+      },
+      "cpu_scale": 1.0,
+      "legacy": {
+        "value": {
+          "ms_per_token": 1.0,
+          "tok_s": 1000.0,
+          "sink_ms": 0.0,
+          "cpu_ms": 0.0
+        },
+        "exact": {
+          "ms_per_token": {
+            "float_hex": "0x1.0000000000000p+0"
+          },
+          "tok_s": {
+            "float_hex": "0x1.f400000000000p+9"
+          },
+          "sink_ms": {
+            "float_hex": "0x0.0p+0"
+          },
+          "cpu_ms": {
+            "float_hex": "0x0.0p+0"
+          }
+        }
+      }
     }
   ],
   "fit_cases": [
