@@ -218,6 +218,15 @@ GGML_BACKEND_API void kimi_cpu_sink_cache_get_stats(
 // GPU the GPU tier gives blocks back first, then RAM cache slots go. Returns false when either would still be
 // exceeded. With a null sink (before the first graph creates one) the ledger alone decides.
 GGML_BACKEND_API bool kimi_cpu_sink_cache_make_room(struct kimi_cpu_sink * sink, uint64_t host_bytes, uint64_t device_bytes);
+// Room for a prefill before it allocates anything: the ledger holds `pages` for the file pages of the weight rows its
+// graph gathers by index (they come into the page cache while it runs) from now until the first decode token, beside
+// the reserve and the floor, and makes room for its compute buffers (`host_bytes`, `device_bytes`, as
+// kimi_cpu_sink_cache_make_room) beside them: the RAM cache gives back what both need at once, and the first decode
+// token takes it back as far as the room allows then. A later call replaces the pages. Returns false when the room
+// would still be short. With a null sink the ledger alone decides; the load step (kimi_cpu_sink_vram_reserve) leaves
+// the pages held then uncommitted.
+GGML_BACKEND_API bool kimi_cpu_sink_cache_prefill_room(struct kimi_cpu_sink * sink, uint64_t pages, uint64_t host_bytes,
+        uint64_t device_bytes);
 // Explicit reset/errors always release, even when cross-request retention is on.
 GGML_BACKEND_API void kimi_cpu_sink_cache_reset(struct kimi_cpu_sink * sink);
 
