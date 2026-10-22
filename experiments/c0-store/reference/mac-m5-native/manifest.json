@@ -1,0 +1,546 @@
+{
+  "schema_version": 1,
+  "protocol": "mac-reader-raw-v1-resource-v2",
+  "baseline_revision": "8b12192920b339a4ef31c9006d1ebe20304ce45a",
+  "recording_engine_revision": "eef176ca3b9965aee53eeb05c78defb803a3b990",
+  "recording_platform": {
+    "architecture": "arm64",
+    "chip": "Apple M5 Max",
+    "model": "Mac17,6",
+    "logical_cpus": 18,
+    "physical_memory_bytes": 51539607552,
+    "os": "macOS 26.4 (25E246)",
+    "compiler": "Apple clang 21.0.0 (clang-2100.1.1.101)",
+    "sdk": "26.5"
+  },
+  "engine_build": {
+    "configuration": "Release -O3 -DNDEBUG",
+    "native": true,
+    "cpu_features": "-mcpu=native+dotprod+i8mm+nosve+sme; -U__ARM_FEATURE_SVE",
+    "metal": true,
+    "embedded_metal_library": true,
+    "metal_ndebug": false,
+    "accelerate": true,
+    "blas": "Apple",
+    "openmp": false,
+    "cuda": false,
+    "cpu_repack": true,
+    "llamafile": true,
+    "ffp_contract": "compiler default; no engine -ffp-contract=off option"
+  },
+  "runner": {
+    "file": "raw-logits-mac.cpp",
+    "sha256": "c5e7511256181d4f4cf964d8b911774e1fbc0a789503c229e1619b4ba67002e4",
+    "build_flags": [
+      "-std=c++17",
+      "-O2",
+      "-Wall",
+      "-Wextra",
+      "-Werror",
+      "-ffp-contract=off"
+    ],
+    "binary_sha256": "38e1da8fcfd238b6cdea293362d2274728d3d42081bda64aa0ff5b4e84866084"
+  },
+  "generator": {
+    "path": "experiments/c0-store/make-tiny.py",
+    "sha256": "637c2d8219ca9a506dc2a773700cc074fa8cb689f128839b303021bcfe2c41bc",
+    "recipe": "make-inputs.py",
+    "recipe_sha256": "adf87675c823a86c9f4725205e2cea6fe9cd4d2485b39514dc535b7cc0e795bd",
+    "original_executed_recipe_sha256": "22d256eb0ec3a563d44a199b4609d0fc0f795ffe9f6a0bf28fe616264edaa826",
+    "recipe_difference": "Only removes an unused, incorrect prompt_tokens metadata declaration; tensor generation unchanged. Actual input tokens are bound below.",
+    "seed": 20261022,
+    "numpy": "2.0.2",
+    "gguf_python_sources": {
+      "gguf-py/gguf/__init__.py": "3ccfc0104cd7ea88c6028743b7bf3f2c89b5f474425de03a217a6072320d7c2f",
+      "gguf-py/gguf/constants.py": "881913369bd917bb6ab94b5900ef1bc54737c653b463f919be90443cc88a9384",
+      "gguf-py/gguf/gguf.py": "f0c0eeedad0911784b52ffed8e162a0eb5ae6d535ce35705bc16196e46597a72",
+      "gguf-py/gguf/gguf_reader.py": "91cb9e81f1a67f5856f012cf3f526ad9ffdb6b887d2aa66e2593ee6f63764aad",
+      "gguf-py/gguf/gguf_writer.py": "53717c36b891881ebebd62283fa37d8f3bf4973708c5167ce11f8eb482c2c904",
+      "gguf-py/gguf/lazy.py": "ec35541320443e1bdc293e39c699fa5d1adb7fb594f3f87af093b4c756a4ebe2",
+      "gguf-py/gguf/metadata.py": "c871748f49f7fb8e67aa9a18867adf8a8ba862f0f1f4a89a0a0e285daa52a312",
+      "gguf-py/gguf/quants.py": "3837c531f9e7e2e6fcafa7a5de30b6627712e02ae6fdb4a653099d858558f2bd",
+      "gguf-py/gguf/scripts/gguf_convert_endian.py": "72e3085bb4e53a6fc8fa1f66ecdd9bcfb1227d5bef70aa777d2a31f488462901",
+      "gguf-py/gguf/scripts/gguf_dump.py": "d8b8fc28e96d15d8a4d6f05cdff4a747f5a06f31172efee9dfc971998ed0203f",
+      "gguf-py/gguf/scripts/gguf_editor_gui.py": "6e9d70e850268fff5d4108d9ecbc2b4d90e70b61f08e71f7d37ac20916d854bb",
+      "gguf-py/gguf/scripts/gguf_hash.py": "9f277c9338d12a73857a4e54683d7da4d5de01531751f14401267c9289e4197f",
+      "gguf-py/gguf/scripts/gguf_new_metadata.py": "972499d35957b4721b9243828d5547d1c84def8d4e6fc641887c6578bf765255",
+      "gguf-py/gguf/scripts/gguf_set_metadata.py": "c8612a7109428a677ea55976dd5eeed6088934ddef7ef01246a5bc7a6e585b3b",
+      "gguf-py/gguf/tensor_mapping.py": "e1784c2cd597157019ebc028c2931ce3df0e44491f93a479b25df4a34879190f",
+      "gguf-py/gguf/utility.py": "da920e2c62166ec9f30e407e9fb35ec29fda671310ffbf0f8ce856b62f1c70d7",
+      "gguf-py/gguf/vocab.py": "c3a6ddea051579d48e1a591c1cb481bddd4439b756952531a25c4cddf6382b97"
+    },
+    "dimensions": {
+      "D": 256,
+      "layers": 2,
+      "vocabulary": 259,
+      "selected_experts": 2,
+      "DeepSeek41_E": 384,
+      "Muse_E": 256
+    },
+    "auxiliary_pack": "generator also writes packs; no pack path was executed in the Mac gate",
+    "source_revision": "27a69e724e36d8c054e42f64913d24c02a89eb4d",
+    "source_revision_note": "F-prime contains the input generator and the exact recorded GGUF Python sources; the numerical baseline remains engine F."
+  },
+  "protocol_settings": {
+    "requests_per_process": 2,
+    "prompt_tokens": [
+      3,
+      4,
+      5,
+      6
+    ],
+    "output_rows": 4,
+    "n_vocab": 259,
+    "raw_dtype": "little-endian IEEE binary32",
+    "greedy_tie": "lowest ID",
+    "kv_clear_each_request": true,
+    "phase_begin": [
+      1,
+      4,
+      4
+    ],
+    "phase_after_first_row": [
+      0,
+      0,
+      0
+    ],
+    "phase_end": [
+      0,
+      0,
+      0
+    ],
+    "n_gpu_layers": 99,
+    "expert_cpu_override": true,
+    "engram_cpu_override": true,
+    "use_mmap": true,
+    "use_extra_bufts": false,
+    "use_direct_io": false,
+    "use_mlock": false,
+    "check_tensors": false,
+    "no_host": true,
+    "no_alloc": false,
+    "defer_experts": false,
+    "n_ctx_requested": 128,
+    "n_ctx_actual": "captured from READY; engine minimum may raise it",
+    "n_batch": 16,
+    "n_ubatch": 16,
+    "n_seq_max": 1,
+    "n_threads": 2,
+    "n_threads_batch": 2,
+    "op_offload": false,
+    "offload_kqv": true,
+    "flash_attention": "disabled",
+    "type_k": "F16",
+    "type_v": "F16",
+    "swa_full": true,
+    "kv_unified": false,
+    "samplers": false
+  },
+  "environment": {
+    "LLAMA_MMAP_PREFETCH": "0",
+    "LLAMA_DSV41_TOPK_REUSE": "0",
+    "LLAMA_MAC_COMPACT_METAL": "1",
+    "LLAMA_DROP_MMAP_TENSOR_AFTER_UPLOAD": "1",
+    "LLAMA_MAC_ADAPTIVE_PREFILL": "0",
+    "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "4",
+    "SSD_LLAMA_MAC_EXPERT_CACHE_POLICY": "lfu",
+    "SSD_LLAMA_MAC_EXPERT_READ_AHEAD": "2",
+    "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": "4096",
+    "SSD_LLAMA_MAC_EXPERT_PREFILL": "1",
+    "GGML_SCHED_DEBUG": "3"
+  },
+  "source_selector": {
+    "key": "GGML_MOE_EXPERT_GGUF_ALIAS_TSV",
+    "value": "absolute path to the case alias, validated against its GGUF"
+  },
+  "recorded_libraries": [
+    {
+      "file": "libggml-base.0.10.0.dylib",
+      "bytes": 947528,
+      "sha256": "a9a6484975dd60d9fe31890a76a0ac395a50d710d9fc6b3c1cdee29f66090840"
+    },
+    {
+      "file": "libggml-blas.0.10.0.dylib",
+      "bytes": 58776,
+      "sha256": "23dc9ca74c1f06a5b75ab7af2619234b4f1f6804a5a1b080e4c61a008e1e3329"
+    },
+    {
+      "file": "libggml-cpu.0.10.0.dylib",
+      "bytes": 1215184,
+      "sha256": "72da3839aa1894708ca58782b179285b099ece95edd4c2eb3ce67f2db02fd408"
+    },
+    {
+      "file": "libggml-metal.0.10.0.dylib",
+      "bytes": 815688,
+      "sha256": "c100f8cfb845b36995c82305ac2921d2441604be6c2c76e19d635537847ebf51"
+    },
+    {
+      "file": "libggml.0.10.0.dylib",
+      "bytes": 59808,
+      "sha256": "5a6003ad530ec93297f090a878fffa9dab022eca8a569cd3483a514416678061"
+    },
+    {
+      "file": "libllama.0.0.45.dylib",
+      "bytes": 3014832,
+      "sha256": "8e6755b5e16299c2ec400389b1b7d4b325182a9c0e7b1e066f9f10b5a8d1e1be"
+    }
+  ],
+  "verification": {
+    "stored_rows": "first request of the first original F recording for each model",
+    "processes_original_F": 6,
+    "requests_per_process": 2,
+    "original_rows_checked": 48,
+    "resource_supplement_processes": 6,
+    "supplement_rows_exact_to_original": 48,
+    "stored_raw_rows": 12,
+    "stored_raw_bytes": 12432,
+    "same_process_and_independent_recordings_exact": true,
+    "raw_events_retained": true,
+    "resources": "original numerical evidence had a loaded-RSS sampling gap; separately admitted v2 required two positive live-PID samples per process and matched all original rows",
+    "loaded_samples": 12,
+    "loaded_rss_range_bytes": [
+      47677440,
+      57589760
+    ],
+    "soft_rss_budget_bytes": 2147483648,
+    "free_inactive_reserve_bytes": 3221225472,
+    "hard_memory_limit": false,
+    "actual_source_library_coverage_cleanup_separately_verified": true,
+    "cross_architecture_golden": false,
+    "performance_benchmark": false
+  },
+  "cases": [
+    {
+      "model": "deepseek41-mxfp4",
+      "source_mode": "alias",
+      "architecture": "deepseek41",
+      "quantization": "MXFP4",
+      "experts": 384,
+      "layers": 2,
+      "embedding": 256,
+      "selected_experts": 2,
+      "source": {
+        "file": "deepseek41-mxfp4.gguf",
+        "bytes": 84434944,
+        "sha256": "a05707dd85915010cc974e68e5afb9fc0d66f7b6e49c55931394218d7afcf3e1"
+      },
+      "alias": {
+        "entries": 2304,
+        "normalized_sha256": "4c062d6d531757be41999869f05b2c3bb48da8a31a5026b8648d2a5398e9df71",
+        "normalization": "source_path column only -> <MODEL_DIR>/GGUF basename; original header/order/columns/tabs and trailing LF preserved"
+      },
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 16,
+        "effective_n_ubatch": 16
+      },
+      "selected_ids": [
+        221,
+        45,
+        184,
+        183
+      ],
+      "rows": [
+        {
+          "step": 0,
+          "position": 3,
+          "batch_tokens": 4,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "1949e3844431523b923b7e840f19665de49775bca4f2afc7df082d099d45e92d",
+          "selected_id": 221,
+          "file": "deepseek41-mxfp4/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 4,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "5622ede55ace2ecae7419560fc2efefad725c085fe6db7e2c610326c63e1be0d",
+          "selected_id": 45,
+          "file": "deepseek41-mxfp4/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 5,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "aa73e442684d27df88bb2f9dfd92f013968c97c5fc77110fb0a7c4d3cf751469",
+          "selected_id": 184,
+          "file": "deepseek41-mxfp4/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 6,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "9d5f41198208a4c85f97c4ee3889130a9c1cbd47866ac4ffe5d9c6d45af7f6f6",
+          "selected_id": 183,
+          "file": "deepseek41-mxfp4/step-3.f32"
+        }
+      ],
+      "coverage": {
+        "requests": [
+          {
+            "request": 1,
+            "grouped_prefill_cache_updates_0": 45,
+            "decode_cache_updates_1": 36,
+            "decode_hits": 0,
+            "cpu_mul_mat_id_nodes": 12,
+            "metal_mul_mat_nodes": 56
+          },
+          {
+            "request": 2,
+            "grouped_prefill_cache_updates_0": 45,
+            "decode_cache_updates_1": 36,
+            "decode_hits": 36,
+            "cpu_mul_mat_id_nodes": 12,
+            "metal_mul_mat_nodes": 56
+          }
+        ],
+        "prefetch_submitted": "123",
+        "prefetch_used": "123",
+        "cache_bytes": "1327104",
+        "peak_cache_bytes": "1363968"
+      }
+    },
+    {
+      "model": "muse-spark-q4_k",
+      "source_mode": "alias",
+      "architecture": "muse-spark",
+      "quantization": "Q4_K",
+      "experts": 256,
+      "layers": 2,
+      "embedding": 256,
+      "selected_experts": 2,
+      "source": {
+        "file": "muse-spark-q4_k.gguf",
+        "bytes": 60678144,
+        "sha256": "1225d7646fe68e820a01ad15f9607a3b61d7fd34127c54d81573a70ab3e218bb"
+      },
+      "alias": {
+        "entries": 1536,
+        "normalized_sha256": "11dba5dad823297a12d2a56e500021d5934a931620c85b5f492fdff734845ded",
+        "normalization": "source_path column only -> <MODEL_DIR>/GGUF basename; original header/order/columns/tabs and trailing LF preserved"
+      },
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 16,
+        "effective_n_ubatch": 16
+      },
+      "selected_ids": [
+        22,
+        207,
+        199,
+        194
+      ],
+      "rows": [
+        {
+          "step": 0,
+          "position": 3,
+          "batch_tokens": 4,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "1871f3573f8b2a597ad2b8f2b5ebd39f978f7233d19a7c010f6ba6cb2e5a1a6a",
+          "selected_id": 22,
+          "file": "muse-spark-q4_k/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 4,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "c7db40343df7f7d5284b535c61ad2673c31c35b78f4bf1edfcd370f351302b0d",
+          "selected_id": 207,
+          "file": "muse-spark-q4_k/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 5,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "05713e36129470c54f095488ee1a48c6bfcd628c8bc5d201a957594b148eac93",
+          "selected_id": 199,
+          "file": "muse-spark-q4_k/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 6,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "4e606f05f1e7631d6ea44a6d67749994eb7ea5631ddcc28a7230a72f9c8a067d",
+          "selected_id": 194,
+          "file": "muse-spark-q4_k/step-3.f32"
+        }
+      ],
+      "coverage": {
+        "requests": [
+          {
+            "request": 1,
+            "grouped_prefill_cache_updates_0": 6,
+            "decode_cache_updates_1": 42,
+            "decode_hits": 30,
+            "cpu_mul_mat_id_nodes": 12,
+            "metal_mul_mat_nodes": 42
+          },
+          {
+            "request": 2,
+            "grouped_prefill_cache_updates_0": 6,
+            "decode_cache_updates_1": 42,
+            "decode_hits": 42,
+            "cpu_mul_mat_id_nodes": 12,
+            "metal_mul_mat_nodes": 42
+          }
+        ],
+        "prefetch_submitted": "18",
+        "prefetch_used": "18",
+        "cache_bytes": "442368",
+        "peak_cache_bytes": "442368"
+      }
+    },
+    {
+      "model": "muse-spark-q5_k",
+      "source_mode": "alias",
+      "architecture": "muse-spark",
+      "quantization": "Q5_K",
+      "experts": 256,
+      "layers": 2,
+      "embedding": 256,
+      "selected_experts": 2,
+      "source": {
+        "file": "muse-spark-q5_k.gguf",
+        "bytes": 73261056,
+        "sha256": "3a76d98352db0555f5a315efbd5648c34ea38efe98f97981a7ea30ed3578bd15"
+      },
+      "alias": {
+        "entries": 1536,
+        "normalized_sha256": "2a0ea97325306659a7c987d74c6d91d6c5ecb6fab17a27f163be573422d09525",
+        "normalization": "source_path column only -> <MODEL_DIR>/GGUF basename; original header/order/columns/tabs and trailing LF preserved"
+      },
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 16,
+        "effective_n_ubatch": 16
+      },
+      "selected_ids": [
+        22,
+        203,
+        196,
+        214
+      ],
+      "rows": [
+        {
+          "step": 0,
+          "position": 3,
+          "batch_tokens": 4,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "5ec699c22f0018a5f41fa519b9f38146d8b2f4f5f8c287e2b52d5b6e6604a80e",
+          "selected_id": 22,
+          "file": "muse-spark-q5_k/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 4,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "144bd3be1a97ddbe4e0515ea6dbcb28bd3a9e42b3bba4f0f180dfc7c6a39e14a",
+          "selected_id": 203,
+          "file": "muse-spark-q5_k/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 5,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "73de7510701ecf4f3fe03050a9bc7cf7a9ed62626b3f6a0f1efee02acaec638e",
+          "selected_id": 196,
+          "file": "muse-spark-q5_k/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 6,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "5b17c49b8e31e1847af8b5a56ff6f00239dfbabfdc837958d0f6618c86ee0d66",
+          "selected_id": 214,
+          "file": "muse-spark-q5_k/step-3.f32"
+        }
+      ],
+      "coverage": {
+        "requests": [
+          {
+            "request": 1,
+            "grouped_prefill_cache_updates_0": 6,
+            "decode_cache_updates_1": 42,
+            "decode_hits": 30,
+            "cpu_mul_mat_id_nodes": 12,
+            "metal_mul_mat_nodes": 42
+          },
+          {
+            "request": 2,
+            "grouped_prefill_cache_updates_0": 6,
+            "decode_cache_updates_1": 42,
+            "decode_hits": 42,
+            "cpu_mul_mat_id_nodes": 12,
+            "metal_mul_mat_nodes": 42
+          }
+        ],
+        "prefetch_submitted": "18",
+        "prefetch_used": "18",
+        "cache_bytes": "540672",
+        "peak_cache_bytes": "540672"
+      }
+    }
+  ],
+  "limits": [
+    "Exact recorded M5 native build profile, not another Apple GPU/OS/compiler or Linux reference.",
+    "No DeepSeek compressed attention, LFU eviction, physical SSD bandwidth, failure recovery, or full-model quality/throughput claim.",
+    "Artifact comparison alone does not attest actual source, mapped libraries, coverage, resources or cleanup."
+  ]
+}
