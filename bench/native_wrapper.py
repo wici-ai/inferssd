@@ -197,16 +197,26 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", type=Path, required=True)
     args = parser.parse_args()
+    adapter_entered = False
     try:
         profile = common.validate_profile(json.loads(args.profile.read_text()))
         inputs(os.environ, profile)
         lock_fd = common.inherited_lock(os.environ)
         if profile["platform"] == "linux":
             from native_linux import run_scope
+            adapter_entered = True
             return run_scope(profile, os.environ.copy(), lock_fd)
-        from native_macos import MacRuntime
-        return run_native(profile, os.environ, MacRuntime(profile, Path(os.environ["SSDASH_RUN_DIR"])), lock_fd)
+        from native_macos import run_guardian
+        adapter_entered = True
+        return run_guardian(profile, os.environ.copy(), lock_fd)
     except (KeyError, ValueError, OSError, RuntimeError) as error:
+        # No child was started if input/platform validation failed before the
+        # adapter took ownership. The driver need not quarantine an empty arm.
+        out = Path(os.environ.get("SSDASH_RUN_DIR", ".")).resolve()
+        path = Path(os.environ.get("SSDASH_WRAPPER_RECEIPT", ".")).resolve()
+        if not adapter_entered and path.parent == out and out.is_dir() and not path.exists():
+            common.save(path, {"status": "failed", "error": f"{type(error).__name__}: {error}",
+                               "server": {"owned_processes_gone": True, "resource_scope_gone": True}})
         parser.exit(2, f"native wrapper: {error}\n")
 
 

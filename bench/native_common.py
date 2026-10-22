@@ -25,6 +25,11 @@ MANAGED_ARGS = {"-m", "--model", "-c", "--ctx-size", "-np", "--parallel", "--hos
                 "--chat-template-file", "--chat-template", "--reasoning", "--api-key", "--api-key-file",
                 "--model-url", "-mu", "--hf-repo", "-hf", "--hf-file", "-hff", "--docker-repo",
                 "--log-disable", "--log-file", "--verbosity", "--log-verbosity", "-lv"}
+LEGACY_SOURCES = {"GGML_MOE_EXPERT_PACK", "GGML_MOE_EXPERT_PACK_LIST", "GGML_MOE_EXPERT_PACK_OVERLAY",
+                  "GGML_MOE_EXPERT_PACK_OVERLAY_EXTRA", "GGML_MOE_EXPERT_PACK_V2", "GGML_MOE_PAGECACHE_PACK",
+                  "GGML_MOE_Q4_COLIBRI_PACK", "GGML_MOE_GLM52_COLIBRI_PACK", "GGML_MOE_Q4_COLIBRI_OVERLAY_PACK",
+                  "GGML_MOE_Q4_COLIBRI_OVERLAY_MANIFEST", "GGML_MOE_LOSSLESS_PACK", "GGML_MOE_GLM52_LOSSLESS_PACK",
+                  "GGML_MOE_DS4_LOSSLESS_PACK", "GGML_MOE_STREAM_DS4_TRIPLET_PACK", "SSD_LLAMA_MAC_EXPERT_PACK"}
 
 
 def save(path, value):
@@ -86,6 +91,10 @@ def file_spec(spec, *, model=False):
             positive(spec.get(name), name, 0 if name in ("dev", "mtime_ns", "ctime_ns") else 1)
 
 
+def aliases(profile):
+    return profile["aliases"] if "aliases" in profile else [profile["alias"]]
+
+
 def validate_profile(profile):
     if profile.get("schema_version") != 1 or profile.get("platform") not in ("linux", "macos"):
         raise ValueError("native profile schema 1 and linux/macos platform required")
@@ -116,7 +125,13 @@ def validate_profile(profile):
     elif len(shards) != 1 or not names[0].endswith(".gguf"):
         raise ValueError("unrecognized model shard set")
     file_spec(profile["template"])
-    file_spec(profile["alias"])
+    if "aliases" in profile and "alias" in profile:
+        raise ValueError("choose alias or aliases, not both")
+    sources = aliases(profile)
+    if not isinstance(sources, list) or not sources or (profile["platform"] == "macos" and len(sources) != 1):
+        raise ValueError("Linux needs a nonempty alias list; Mac needs exactly one alias")
+    for source in sources:
+        file_spec(source)
     args = profile.get("args")
     if not isinstance(args, list) or any(not isinstance(x, str) or not x for x in args):
         raise ValueError("args must be an explicit string list")
@@ -127,12 +142,16 @@ def validate_profile(profile):
         raise ValueError("explicit environment string mapping required")
     if any(k.startswith(("H2D_", "LLAMA_ARG_")) for k in env):
         raise ValueError("H2D caps and implicit CLI environment are not permitted")
-    if env.get("GGML_MOE_EXPERT_PACK") or env.get("GGML_MOE_EXPERT_PACK_LIST"):
+    if any(env.get(key) for key in LEGACY_SOURCES):
         raise ValueError("formal runs use direct GGUF, not legacy expert packs")
-    if env.get("GGML_MOE_EXPERT_GGUF_ALIAS_TSV") != profile["alias"]["path"]:
+    if env.get("GGML_MOE_EXPERT_GGUF_ALIAS_TSV") != ":".join(x["path"] for x in sources):
         raise ValueError("source environment must use the exact reviewed GGUF alias")
     if any(k.startswith("DYLD_") or k in ("LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG") for k in env):
         raise ValueError("wrapper owns runtime library search paths")
+    if env.get("LD_PRELOAD"):
+        preloads = env["LD_PRELOAD"].replace(":", " ").split()
+        if any(path not in {x["path"] for x in images} or "h2d" in Path(path).name.lower() for path in preloads):
+            raise ValueError("preloads must be pinned project images and must not cap H2D")
     resources = profile["resources"]
     for key in ("memory_budget_bytes", "host_reserve_bytes", "minimum_cpus"):
         positive(resources.get(key), key)
@@ -155,16 +174,17 @@ def validate_profile(profile):
 def verify_inputs(profile):
     build = [verify_file(x) for x in [profile["binary"], *profile["images"]]]
     shards = [verify_file(x, model=True) for x in profile["shards"]]
-    assets = [verify_file(profile[x]) for x in ("template", "alias")]
+    assets = [verify_file(x) for x in [profile["template"], *aliases(profile)]]
     sources = {x["path"]: x["bytes"] for x in shards}
     count = 0
-    with Path(profile["alias"]["path"]).open() as stream:
-        for row in csv.DictReader(stream, delimiter="\t"):
-            path = str(Path(row["source_path"]).resolve(strict=True))
-            offset, size = int(row["offset"]), int(row["nbytes"])
-            if path not in sources or offset < 0 or size <= 0 or offset + size > sources[path]:
-                raise ValueError("alias range is outside the verified GGUF shards")
-            count += 1
+    for alias in aliases(profile):
+        with Path(alias["path"]).open() as stream:
+            for row in csv.DictReader(stream, delimiter="\t"):
+                path = str(Path(row["source_path"]).resolve(strict=True))
+                offset, size = int(row["offset"]), int(row["nbytes"])
+                if path not in sources or offset < 0 or size <= 0 or offset + size > sources[path]:
+                    raise ValueError("alias range is outside the verified GGUF shards")
+                count += 1
     if not count:
         raise ValueError("empty expert alias")
     return {"build": build, "shards": shards, "assets": assets, "alias_entries": count}
@@ -180,13 +200,20 @@ def inherited_lock(environment):
 
 
 def clean_environment(profile):
-    env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("GGML_", "LLAMA_", "SSD_LLAMA_", "DYLD_", "H2D_"))
-           and k not in ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG")}
+    inherited = {"PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TMP", "TEMP", "TZ", "XDG_CACHE_HOME"}
+    env = {k: v for k, v in os.environ.items() if k in inherited}
     env.update(profile["environment"])
     key = "DYLD_LIBRARY_PATH" if profile["platform"] == "macos" else "LD_LIBRARY_PATH"
     env[key] = str(Path(profile["binary"]["path"]).resolve().parent)
     return env
+
+
+def effective_settings(profile):
+    # Bind every argv/env/threshold to cross-tier identity, including values
+    # whose runtime telemetry is dynamic (e.g. admitted cache capacity).
+    digest = hashlib.sha256(json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return dict(profile["effective_settings"], native_profile_sha256=digest,
+                native_resource_policy=profile["resources"])
 
 
 def server_argv(profile, port):
@@ -204,14 +231,9 @@ def group_exists(process):
     except ProcessLookupError:
         return False
     except PermissionError:
-        # Darwin can briefly retain an exited group leader until it is reaped.
-        if process.poll() is None:
-            raise
-        try:
-            os.killpg(process.pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
+        # Darwin may briefly report EPERM while an owned group exits, before
+        # waitpid reports completion. Unknown is still present, never clean.
+        return True
 
 
 def stop_owned(process, timeout):
@@ -220,7 +242,7 @@ def stop_owned(process, timeout):
     if group_exists(process):
         try:
             os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
     until = time.monotonic() + timeout
     while group_exists(process) and time.monotonic() < until:
@@ -229,7 +251,7 @@ def stop_owned(process, timeout):
     if forced:
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
     process.wait(timeout=5)
     until = time.monotonic() + 2

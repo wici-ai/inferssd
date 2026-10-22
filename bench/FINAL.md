@@ -27,6 +27,8 @@ server, load the intended model/template with fixed budgets/settings, wait for
 health, run **one completion only**, and stop/reap its owned processes before
 writing its receipt. Initialization reads are allowed; warm-up completions are
 not. Each tier invokes the same wrapper argv with a new artifact directory.
+The shared [native wrapper](NATIVE.md) provides Linux scope and Mac process
+adapters with an explicit, reviewed profile; it has no device presets.
 Use the intended current GGUF shards directly, with no legacy expert pack and no
 artificial H2D transfer cap. Keep host RAM budgets matched for any separately
 declared comparison and retain effective cache, VRAM and unified-memory budgets.
