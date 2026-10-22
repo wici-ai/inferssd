@@ -4490,7 +4490,7 @@ static void ggml_compute_forward_mul_mat_id_generic(
     const int n_as  = ne02;       // n_expert
 #if defined(__APPLE__)
     const bool mac_pack_source = ggml_mac_expert_pack_enabled() &&
-        (n_as == 384 || n_as == 256) && ids->ne[1] == 1 &&
+        (n_as == 384 || n_as == 256) && (ids->ne[1] == 1 || ggml_mac_expert_pack_prefill_enabled()) &&
         strstr(src0->name, ".ffn_") && strstr(src0->name, "_exps.weight");
 #endif
 
@@ -5085,7 +5085,7 @@ cpu_fallback:
 #if defined(__APPLE__)
     void * mac_read_batch = NULL;
     if (mac_pack_source && ith == 0) {
-        mac_read_batch = ggml_mac_expert_pack_begin_batch(src0->name, matrix_row_counts, n_as, (size_t) ne01 * nb01);
+        mac_read_batch = ggml_mac_expert_pack_begin_batch(src0->name, matrix_row_counts, n_as, (size_t) ne01 * nb01, ids->ne[1] == 1);
     }
     uint64_t mac_compute_start = 0, mac_compute_us = 0, mac_barrier_start = 0, mac_barrier_us = 0;
 #endif

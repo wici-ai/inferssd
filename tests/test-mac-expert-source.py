@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Small deterministic fixtures; never reads real model weights."""
+import csv
 import os
 import re
 from pathlib import Path
@@ -9,6 +10,7 @@ import sys
 import tempfile
 
 binary = Path(sys.argv[1]).resolve()
+prefill_only = "--prefill-only" in sys.argv[2:]
 with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
     root = Path(directory)
     shards = []
@@ -44,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
     content[40:40 + len(entries) * 152] = b"".join(entries)
     pack.write_bytes(content)
 
-    def run(source, cache, expected_error=None, both=False, commands=None, depth=0, alignment=1):
+    def run(source, cache, expected_error=None, both=False, commands=None, depth=0, alignment=1, trace=False):
         env = os.environ.copy()
         env.pop("GGML_MOE_EXPERT_GGUF_ALIAS_TSV", None)
         env.pop("SSD_LLAMA_MAC_EXPERT_PACK", None)
@@ -52,7 +54,7 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
         env["SSD_LLAMA_MAC_EXPERT_CACHE_MIB"] = str(cache)
         env["SSD_LLAMA_MAC_EXPERT_READ_AHEAD"] = str(depth)
         env["SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT"] = str(alignment)
-        if depth == 4:
+        if depth == 4 or trace:
             env["SSD_LLAMA_MAC_EXPERT_TRACE"] = str(root / "trace.txt")
         env["GGML_MOE_EXPERT_GGUF_ALIAS_TSV" if source.suffix == ".tsv" else "SSD_LLAMA_MAC_EXPERT_PACK"] = str(source)
         if both:
@@ -64,26 +66,40 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
             assert result.returncode == 0, (source, result.returncode, result.stderr)
             stats = dict(re.findall(r"([a-z_]+)=([0-9.]+)", result.stderr.split("reason=shutdown", 1)[-1]))
             assert int(stats.get("peak_staging_bytes", "0")) <= 64 * 1024**2
-            return {key: int(stats[key]) for key in ("requests", "hits", "misses", "read_requests", "read_bytes", "evictions")}
+            values = {key: int(stats[key]) for key in ("requests", "hits", "misses", "read_requests", "read_bytes", "evictions")}
+            if trace:
+                with (root / "trace.txt.requests.tsv").open() as traces:
+                    values["decode_hits"] = [(row["tensor"], row["expert"], row["hit"]) for row in csv.DictReader(traces, delimiter="\t") if row["cache_updates"] == "1"]
+            return values
 
+    if not prefill_only:
+        for source in (pack, alias):
+            for cache in (0, 1):
+                for alignment in (1, 4096, 16384):
+                    reference = run(source, cache, depth=0, alignment=alignment)
+                    for depth in (1, 2, 4):
+                        assert run(source, cache, depth=depth, alignment=alignment) == reference, (source, cache, depth, alignment)
     for source in (pack, alias):
-        for cache in (0, 1):
-            for alignment in (1, 4096, 16384):
-                reference = run(source, cache, depth=0, alignment=alignment)
-                for depth in (1, 2, 4):
-                    assert run(source, cache, depth=depth, alignment=alignment) == reference, (source, cache, depth, alignment)
-    bad = root / "bad.tsv"
-    for body, message in [
-        (header + "".join(rows) + rows[0], "duplicate"),
-        (header + rows[0].replace("\t33\n", "\t1400001\n"), "exceeds source"),
-        (header + rows[0].replace("\t614401\t", "\t-1\t"), "unsigned integer"),
-        ("bad header\n" + rows[0], "header"),
-        (header, "invalid expert alias index"),
-    ]:
-        bad.write_text(body)
-        run(bad, 1, message)
-    run(alias, 1, "select one expert source", both=True)
-    run(alias, 1, "short/failed expert-pack read", commands=args[:4] + ["--truncate", str(shards[1][0])] + args[4:8])
-    pack.write_bytes(content[:-4090])
-    run(pack, 1, "invalid expert-pack index")
-print("56 source, pipeline, alignment, bounds, short-read, duplicate, pin and cache cases passed")
+        for depth in (0, 2):
+            reference = run(source, 2, depth=depth, alignment=4096, trace=True)
+            mixed = run(source, 2, depth=depth, alignment=4096, trace=True,
+                        commands=["--prefill"] + args + ["--decode"] + args + ["--prefill"] + args + ["--decode"] + args)
+            assert mixed["decode_hits"] == reference["decode_hits"] and mixed["evictions"] == reference["evictions"], (source, depth, mixed, reference)
+    if not prefill_only:
+        bad = root / "bad.tsv"
+        for body, message in [
+            (header + "".join(rows) + rows[0], "duplicate"),
+            (header + rows[0].replace("\t33\n", "\t1400001\n"), "exceeds source"),
+            (header + rows[0].replace("\t614401\t", "\t-1\t"), "unsigned integer"),
+            ("bad header\n" + rows[0], "header"),
+            (header, "invalid expert alias index"),
+        ]:
+            bad.write_text(body)
+            run(bad, 1, message)
+        run(alias, 1, "select one expert source", both=True)
+        for alignment in (1, 4096, 16384):
+            shards[1][0].write_bytes(shards[1][1])
+            run(alias, 1, "short/failed expert-pack read", commands=args[:4] + ["--truncate", str(shards[1][0])] + args[4:8], alignment=alignment)
+        pack.write_bytes(content[:-4090])
+        run(pack, 1, "invalid expert-pack index")
+print(f"{8 if prefill_only else 66} source, pipeline, alignment, prefill-cache isolation, bounds, short-read, duplicate and pin cases passed")

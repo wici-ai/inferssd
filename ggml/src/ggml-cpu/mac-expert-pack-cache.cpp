@@ -156,6 +156,7 @@ struct expert_batch {
     size_t next = 0;
     size_t demand = 0;
     size_t pending_bytes = 0;
+    bool cache_updates = true;
     std::unordered_map<int32_t, std::shared_ptr<pending_read>> pending;
 };
 
@@ -163,6 +164,7 @@ struct request_trace_entry {
     key id;
     uint64_t bytes, begin_ns;
     bool hit;
+    bool cache_updates;
 };
 
 struct io_trace_entry {
@@ -234,10 +236,10 @@ public:
                 std::fclose(output);
             }
             if (FILE * output = std::fopen((trace_path + ".requests.tsv").c_str(), "w")) {
-                std::fprintf(output, "tensor\texpert\tlogical_bytes\tbegin_ns\thit\n");
+                std::fprintf(output, "tensor\texpert\tlogical_bytes\tbegin_ns\thit\tcache_updates\n");
                 for (const auto & item : access_trace) {
-                    std::fprintf(output, "%s\t%d\t%llu\t%llu\t%d\n", item.id.name.c_str(), item.id.expert,
-                            (unsigned long long)item.bytes, (unsigned long long)item.begin_ns, int(item.hit));
+                    std::fprintf(output, "%s\t%d\t%llu\t%llu\t%d\t%d\n", item.id.name.c_str(), item.id.expert,
+                            (unsigned long long)item.bytes, (unsigned long long)item.begin_ns, int(item.hit), int(item.cache_updates));
                 }
                 std::fclose(output);
             }
@@ -282,22 +284,27 @@ public:
         if (source == index.end() || source->second.bytes != logical_bytes) {
             throw std::runtime_error("expert pack missing/mismatched tensor " + id.name + "[" + std::to_string(expert) + "]");
         }
-        auto & frequency = heat[id];
-        if (frequency < UINT16_MAX) { ++frequency; }
-        if ((clock & 16383) == 0 && clock != 0) {
-            for (auto & item : heat) { item.second >>= 1; }
+        const bool cache_updates = !batch || batch->cache_updates;
+        uint16_t frequency = 0;
+        if (cache_updates) {
+            auto & current = heat[id];
+            if (current < UINT16_MAX) { ++current; }
+            if ((clock & 16383) == 0 && clock != 0) {
+                for (auto & item : heat) { item.second >>= 1; }
+            }
+            frequency = current;
         }
         auto hit = slots.find(id);
         if (!trace_path.empty()) {
             access_trace.push_back({id, logical_bytes,
                     uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(lookup_start.time_since_epoch()).count()),
-                    hit != slots.end()});
+                    hit != slots.end(), cache_updates});
         }
         lookup_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookup_start).count();
         if (hit != slots.end()) {
             ++hits;
             hit->second.pins++;
-            hit->second.last_use = ++clock;
+            if (cache_updates) { hit->second.last_use = ++clock; }
             if (batch) {
                 discard_pending(*batch, expert);
                 schedule(*batch);
@@ -308,7 +315,7 @@ public:
         ++misses;
         const auto policy_start = std::chrono::steady_clock::now();
         const size_t allocation = round_up(source->second.read_bytes);
-        bool admit = budget >= allocation && !tensor_names.empty();
+        bool admit = cache_updates && budget >= allocation && !tensor_names.empty();
         const size_t per_tensor_slots = admit ? budget / tensor_names.size() / allocation : 0;
         admit = admit && per_tensor_slots > 0;
         const bool use_lru = policy == "lru";
@@ -373,7 +380,7 @@ public:
         fresh.prefix = source->second.prefix;
         fresh.admitted = admit;
         fresh.pins = 1;
-        fresh.last_use = ++clock;
+        fresh.last_use = cache_updates ? ++clock : clock;
         auto inserted = slots.emplace(id, std::move(fresh));
         allocated_bytes += allocation;
         peak_bytes = std::max(peak_bytes, allocated_bytes);
@@ -403,11 +410,12 @@ public:
         throw std::runtime_error("unknown expert-pack slice released");
     }
 
-    expert_batch * begin(const char * name, const int64_t * counts, int n, size_t bytes) {
-        if (!read_ahead) { return nullptr; }
+    expert_batch * begin(const char * name, const int64_t * counts, int n, size_t bytes, bool cache_updates) {
+        if (!read_ahead && cache_updates) { return nullptr; }
         auto batch = std::make_unique<expert_batch>();
         batch->name = name;
         batch->logical_bytes = bytes;
+        batch->cache_updates = cache_updates;
         for (int i = 0; i < n; ++i) {
             if (counts[i] > 0) { batch->experts.push_back(i); }
         }
@@ -701,8 +709,16 @@ extern "C" const void * ggml_mac_expert_pack_acquire(const char * name, int32_t 
     }
 }
 
-extern "C" void * ggml_mac_expert_pack_begin_batch(const char * name, const int64_t * counts, int n, size_t bytes) {
-    try { return instance()->begin(name, counts, n, bytes); }
+extern "C" bool ggml_mac_expert_pack_prefill_enabled(void) {
+    static const bool enabled = [] {
+        const char * value = std::getenv("SSD_LLAMA_MAC_EXPERT_PREFILL");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+extern "C" void * ggml_mac_expert_pack_begin_batch(const char * name, const int64_t * counts, int n, size_t bytes, bool cache_updates) {
+    try { return instance()->begin(name, counts, n, bytes, cache_updates); }
     catch (const std::exception & e) {
         std::fprintf(stderr, "[mac_expert_pack] fatal: %s\n", e.what());
         std::abort();
