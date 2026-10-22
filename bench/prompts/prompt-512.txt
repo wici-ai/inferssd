@@ -1,0 +1,17 @@
+# Tessaline: Design and Operations of the Orrin Valley Rail Telemetry Store
+
+Revision 7, prepared by the Platform Storage Group of the Orrin Valley Transit Authority
+
+## 1. Background
+
+The Orrin Valley network runs 214 kilometres of double track between the port of Calder Reach and the upland towns around Mirrow Lake. Every one of its 61 electric trainsets carries roughly 1,900 sensors: axle-box thermometers, pantograph force gauges, door controllers, traction inverter monitors, brake cylinder pressure transducers and a few dozen accelerometers bolted to the bogie frames. Until the last refit, the readings were written to removable flash cards that depot staff collected once a week. A failing bearing therefore announced itself, at best, seven days after the first warning sign, and twice in that period the first sign anyone noticed was smoke.
+
+Tessaline is the storage service that replaced the flash cards. It receives a continuous stream from every trainset over the cellular modems fitted during the refit, keeps eighteen months of full-resolution history online, and answers the queries that maintenance planners, the control room and two external research partners send it. This document describes how the service is built, why the main decisions were made, what has gone wrong in its first two years of operation, and which problems remain open. It is written for engineers who will change the system, so it spends more time on trade-offs and failure behaviour than on configuration.
+
+The original requirements were short. Readings had to be durable within two seconds of leaving a train, because the control room wanted to act on brake faults before the next station. A planner had to be able to pull a year of axle temperatures for one bogie in under ten seconds. The system had to survive the loss of either of the authority's two data halls without losing acknowledged data. Finally, it had to fit within a hardware budget that the finance office described, not unkindly, as whatever the old ticketing servers had been costing.
+
+## 2. Data model
+
+A reading in Tessaline is a triple of a series key, a timestamp and a value. The series key names the physical source: trainset number, car position, subsystem, sensor and channel, packed into a 64-bit identifier by the onboard gateway. Timestamps are microseconds since the authority's epoch, taken from the satellite-disciplined clock in each gateway. Values are 32-bit floats for most analogue channels and small integers for door states, fault codes and counters.
+
+Summarize the text above in a few paragraphs.
