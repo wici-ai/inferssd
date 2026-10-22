@@ -129,6 +129,25 @@ int main() { try {
         t.phase_complete(false);
     }
 
+    // A base block that does not fit (device memory moved after the base's measure) ends the base at the blocks
+    // already allocated, and the table follows them; the first request is served from them, a discrete GPU's
+    // decode growth adds elastic blocks after them, and a prefill gives back to that base.
+    {
+        setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_MALLOC_AT", "2", 1);
+        tier t(20*stride);
+        unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_MALLOC_AT");
+        int slot = -1;
+        t.begin(19,1,true);t.prepare(&key,1,256,256,&slot);t.finish(output.data(),256);
+        require(t.elastic_active && t.base_slots==16 && t.blocks[0].slot_count==16 &&
+                t.table->slots.size()==t.slot_locations.size() && t.capacity_bytes==t.slot_locations.size()*stride,
+                "a base block that did not fit did not end the base at the blocks allocated");
+        t.phase_complete(true);
+        t.prepare_prefill_reclaim();
+        require(t.blocks.size()==1 && t.slot_locations.size()==16 && t.table->slots.size()==16,
+                "a prefill did not give back to the base the allocation ended at");
+        t.phase_complete(false);
+    }
+
     // A failed free retains the block/table mapping and poisons the tier. The
     // test clears only its injected fault so destruction can release the GPU.
     {
