@@ -1,9 +1,12 @@
 # SSDash
 
-SSDash runs large mixture-of-experts models by streaming experts from local SSD storage and assigning work
-between the CPU, host memory and an NVIDIA GPU. Its adaptive framework measures the machine and derives the
-runtime configuration. This repository is a hard fork of [llama.cpp](https://github.com/ggml-org/llama.cpp),
-based on commit `f42e29fdf199481effd31f281bf095ec6067757b`.
+SSDash is an SSD-backed inference framework for large mixture-of-experts models. It streams expert weights
+from local storage and manages execution across the CPU, host memory and GPU. The Linux adaptive framework
+measures the machine and derives the runtime configuration.
+
+SSDash builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) and ggml. This repository includes the
+engine source with SSDash's runtime extensions. The upstream baseline and component attribution are
+recorded in [PROVENANCE.md](PROVENANCE.md) and [NOTICE](NOTICE).
 
 The initial source import is under development toward **v0.1.0**. Published performance results and a complete
 platform support matrix will follow validation of the release candidate. Historical engineering logs describe
@@ -58,6 +61,11 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for checks and review requirements, [PROV
 for source history, and [the import manifest](docs/ssdash/import-manifest.tsv) for the origin of every changed
 path. The `upstream` branch contains the baseline snapshot. `git diff upstream main` exposes the downstream
 changes after integration.
+
+The current tree retains the imported engine layout. Work toward v0.1.0 will separate the SSD runtime into
+`ggml/src/ggml-ssd/`, its CPU and CUDA executors into backend-specific `ssd/` directories, and the adaptive
+framework into `tools/ssdash/`. These boundaries are not yet implemented in the release candidate; the
+engine and its upstream integration are still maintained together.
 
 Support is best effort and applies to the listed models on validated hardware. The first release will qualify
 the first request after server startup; concurrent serving and long-running conversation behavior need
