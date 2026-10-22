@@ -1,4 +1,5 @@
 #include "catalog.h"
+#include "mock-provider.h"
 #include "store.h"
 
 #include <atomic>

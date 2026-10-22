@@ -1,4 +1,5 @@
 #include "catalog.h"
+#include "mock-provider.h"
 #include "store.h"
 
 #include <cerrno>
@@ -85,18 +86,18 @@ int main(int argc, char ** argv) {
         ::setenv("GGML_MOE_EXPERT_GGUF_ALIAS_TSV", alias.c_str(), 1);
         ::setenv("GGML_MOE_IO_BACKEND", "mmap", 1);
         module plugin(argv[2]);
-        auto register_provider = plugin.symbol<bool (*)(const char *, int)>("mock_register");
-        auto catalog_address = plugin.symbol<const void * (*)()>("mock_catalog");
-        auto entries_address = plugin.symbol<const void * (*)()>("mock_entries");
-        auto sources_address = plugin.symbol<const void * (*)()>("mock_sources");
-        auto calls = plugin.symbol<unsigned (*)()>("mock_calls");
-        auto opened_fd = plugin.symbol<int (*)()>("mock_fd");
-        auto opened_direct = plugin.symbol<int (*)()>("mock_direct");
-        auto mapping = plugin.symbol<const void * (*)()>("mock_mapping");
-        auto half_ready = plugin.symbol<bool (*)()>("mock_half_ready");
-        auto finish_load = plugin.symbol<void (*)()>("mock_finish_load");
-        auto select_shape = plugin.symbol<void (*)(int64_t, size_t)>("mock_shape");
-        auto uses_common = plugin.symbol<bool (*)()>("mock_common");
+        auto register_provider = plugin.symbol<decltype(&mock_register)>("mock_register");
+        auto catalog_address = plugin.symbol<decltype(&mock_catalog)>("mock_catalog");
+        auto entries_address = plugin.symbol<decltype(&mock_entries)>("mock_entries");
+        auto sources_address = plugin.symbol<decltype(&mock_sources)>("mock_sources");
+        auto calls = plugin.symbol<decltype(&mock_calls)>("mock_calls");
+        auto opened_fd = plugin.symbol<decltype(&mock_fd)>("mock_fd");
+        auto opened_direct = plugin.symbol<decltype(&mock_direct)>("mock_direct");
+        auto mapping = plugin.symbol<decltype(&mock_mapping)>("mock_mapping");
+        auto half_ready = plugin.symbol<decltype(&mock_half_ready)>("mock_half_ready");
+        auto finish_load = plugin.symbol<decltype(&mock_finish_load)>("mock_finish_load");
+        auto select_shape = plugin.symbol<decltype(&mock_shape)>("mock_shape");
+        auto uses_common = plugin.symbol<decltype(&mock_common)>("mock_common");
         check(catalog_address() == &c0::shared_catalog(), "DSOs have distinct owners");
         if (mode == "late" || mode == "missing") {
             const bool initialized = c0::initialize_shared_catalog();
