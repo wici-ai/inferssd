@@ -6,10 +6,55 @@ models, choose settings, publish results, retry failures, discard slow values or
 start long-prompt runs. The default per-arm timeout is 300 seconds. A timeout is
 a failed arm retained in the record, not an outlier to remove.
 
-The model client and actual prompt assets are still being consolidated. Until
-those audited assets are imported, use an existing verified short-request arm
-command with the result contract below. Do not treat this harness alone as a
-reproducible public model benchmark or as a completed device acceptance gate.
+The client below accepts an operator-supplied plaintext prompt. The actual model
+and audited prompt assets are still being consolidated. Do not treat this harness
+alone as a reproducible public model benchmark or as a completed device acceptance
+gate.
+
+## Record one short chat
+
+Start an owned server with the intended model, template and device settings, then
+record one request:
+
+```sh
+python3 bench/stream_chat.py --url http://127.0.0.1:8080 \
+  --prompt prompt.txt --input-tokens 614 --output-tokens 256 \
+  --output run/result.json
+```
+
+The client calls `/apply-template` with one user message, then `/tokenize` with
+special-token handling enabled. The rendered token count must equal the declared
+input count. It sends those exact IDs to native `/completion` with greedy top-k
+sampling, a fixed output count, EOS ignored, prompt caching disabled, and five
+pre-sampling probabilities. It rejects a truncated request, an incomplete stream,
+missing token IDs, invalid top-five records or mismatched final counts. It accepts
+1--1024 input and 1--512 output tokens; the default whole-operation deadline is
+300 seconds. Each output path must be new.
+
+Alongside `result.json`, the client retains `result.protocol.json`, timestamped
+decoded `result.events.jsonl`, and the original SSE response bytes in
+`result.events.sse`. Partial evidence and a failed result survive request errors.
+Exact token IDs, unrounded parsed log probabilities, prompt hashes and request
+settings remain available for review. These files may contain private prompt text
+and generated content; inspect them before publication.
+
+TTFT starts immediately before the completion HTTP request. Decode throughput
+counts intervals between received token events: the first 128-token window has
+127 intervals and the second has 128. These are client-observed timings, not
+server kernel timings. The separate prefill rate uses the server's prompt time.
+Transport buffering and evidence recording can affect client-observed intervals.
+
+```sh
+python3 bench/compare_outputs.py run-a/result.json run-b/result.json \
+  --output comparison.json
+```
+
+Comparison requires complete validated records with identical prompt hashes,
+rendered IDs and token counts. It reports exact token/probability equality and
+the first differing token, without applying a numerical tolerance. Once greedy
+outputs diverge, later positions have different contexts; positional agreement
+does not substitute for a teacher-forced numerical comparison. The client does
+not establish binary provenance or device isolation; record those in the arm.
 
 ## One ABBA cycle
 
