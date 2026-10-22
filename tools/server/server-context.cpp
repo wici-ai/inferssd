@@ -12,6 +12,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "ggml-cpu.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -1316,6 +1317,13 @@ private:
 
     common_params params_base;
 
+    // The CPU backend borrows these pools. Keep them alive until all model
+    // context work has stopped, including when entering server sleep. Declare
+    // them before llama_init so implicit member destruction has the same order.
+    using threadpool_ptr = std::unique_ptr<ggml_threadpool, decltype(&ggml_threadpool_free)>;
+    threadpool_ptr threadpool       {nullptr, nullptr};
+    threadpool_ptr threadpool_batch {nullptr, nullptr};
+
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
 
@@ -1375,6 +1383,9 @@ private:
     void destroy() {
         llama_init.reset();
 
+        threadpool.reset();
+        threadpool_batch.reset();
+
         ctx = nullptr;
         model = nullptr;
 
@@ -1388,6 +1399,47 @@ private:
         }
 
         llama_batch_free(batch);
+    }
+
+    bool init_threadpools() {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        auto * reg = cpu_dev ? ggml_backend_dev_backend_reg(cpu_dev) : nullptr;
+        auto * new_fn = reg ? (decltype(ggml_threadpool_new) *)
+            ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_new") : nullptr;
+        auto * free_fn = reg ? (decltype(ggml_threadpool_free) *)
+            ggml_backend_reg_get_proc_address(reg, "ggml_threadpool_free") : nullptr;
+        if (!new_fn || !free_fn ||
+                !ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool")) {
+            SRV_WRN("%s", "CPU backend has no reusable threadpool interface; retaining backend-managed pools\n");
+            return true;
+        }
+
+        auto cpu = params_base.cpuparams;
+        auto cpu_batch = params_base.cpuparams_batch;
+        cpu.n_threads = llama_n_threads(ctx);
+        cpu_batch.n_threads = llama_n_threads_batch(ctx);
+        auto tpp = ggml_threadpool_params_from_cpu_params(cpu);
+        auto tpp_batch = ggml_threadpool_params_from_cpu_params(cpu_batch);
+        // The selected pool resumes on compute; the backend pauses the old
+        // pool on a prefill/decode switch. Do not spin both sets while idle.
+        tpp.paused = tpp_batch.paused = true;
+        if (!ggml_threadpool_params_match(&tpp, &tpp_batch)) {
+            threadpool_batch = threadpool_ptr(new_fn(&tpp_batch), free_fn);
+            if (!threadpool_batch) {
+                SRV_ERR("%s", "failed to create batch CPU threadpool\n");
+                return false;
+            }
+        }
+        threadpool = threadpool_ptr(new_fn(&tpp), free_fn);
+        if (!threadpool) {
+            threadpool_batch.reset();
+            SRV_ERR("%s", "failed to create decode CPU threadpool\n");
+            return false;
+        }
+        llama_attach_threadpool(ctx, threadpool.get(), threadpool_batch.get());
+        SRV_INF("reusing CPU threadpools: decode=%d, batch=%d, shared=%d\n",
+                tpp.n_threads, tpp_batch.n_threads, threadpool_batch ? 0 : 1);
+        return true;
     }
 
     // What a cached state on disk depends on besides its tokens: the model file and the build that computed it.
@@ -1463,6 +1515,10 @@ private:
 
         if (ctx == nullptr) {
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
+            return false;
+        }
+
+        if (!init_threadpools()) {
             return false;
         }
 
