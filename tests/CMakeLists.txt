@@ -766,3 +766,11 @@ foreach(unit_test moe_pack_copy_plan kimi_prefill_cost test-reasoning-budget
         set_property(TEST ${unit_test} APPEND PROPERTY LABELS unit)
     endif()
 endforeach()
+
+if (UNIX)
+    add_executable(test-mac-expert-pack-cache test-mac-expert-pack-cache.cpp)
+    target_compile_features(test-mac-expert-pack-cache PRIVATE cxx_std_17)
+    target_link_libraries(test-mac-expert-pack-cache PRIVATE Threads::Threads)
+    add_test(NAME mac_expert_pack_cache COMMAND test-mac-expert-pack-cache)
+    set_tests_properties(mac_expert_pack_cache PROPERTIES LABELS unit)
+endif()

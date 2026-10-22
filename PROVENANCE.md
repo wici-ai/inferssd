@@ -38,3 +38,21 @@ Retained literary prompt excerpts are from public-domain works, including Moby-D
 
 Full third-party copyright and permission notices are in [NOTICE](NOTICE). Existing upstream attribution in
 `AUTHORS`, `licenses/` and vendored directories remains in place.
+
+## Prefill and Mac integration
+
+The grouped prefill reservation changes originate in the internal prefill-room
+commits `d3b009f705` and `4b70845959`. Unified placement and cost accounting come
+from the lane integration ending at `bdd1530696`, followed by the partial base
+admission fix `6d8cb2b`. They were applied as reviewed net patches against the
+seed; their original repository history was not merged. The standalone earlier
+cost patch `ca8d4ba` is superseded by the lane accounting implementation.
+
+The initial Apple Silicon cache, launch scripts and historical benchmark assets
+come from ustc-sunny's Mac branch at `aee25da468cbdbb7c72d2293f86262d6933da657`.
+Unchanged imported files retain that author's GitHub noreply attribution. The
+integration adapts the CPU source hook to the current engine, keeps one Muse
+parser, preserves the Linux streaming paths, and adds portable cache validation.
+The historical benchmark documents describe that original branch, not a measured
+performance claim for this SSDash revision. The newer GGUF alias reader and I/O
+pipeline are separate work and require their own model validation.

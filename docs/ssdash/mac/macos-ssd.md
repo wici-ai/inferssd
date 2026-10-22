@@ -1,3 +1,6 @@
+> Historical engineering log from the pre-SSDash Mac branch. These results
+> have not been revalidated on the current SSDash integration.
+
 # Apple Silicon SSD-backed DeepSeek V4.1 baseline
 
 This profile preserves the working macOS implementation: routed experts and
@@ -33,17 +36,17 @@ export SSD_LLAMA_MODEL=/path/to/DeepSeek-V4.1-Flash-Q8_0-00001-of-00010.gguf
 ```
 
 The server binds to `127.0.0.1:8080` with one slot. Run one mode at a time to
-avoid loading two instances. If `SSD_LLAMA_MODEL` is unset, the launcher uses
-`~/Documents/ssd-llama-mac/model/DeepSeek-V4.1-Flash-Q8_0/`.
+avoid loading two instances. `SSD_LLAMA_MODEL` is required. The launcher stops if it is unset.
 
 Environment overrides:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SSD_LLAMA_MODEL` | first shard in the directory above | GGUF path |
+| `SSD_LLAMA_MODEL` | required | GGUF path |
 | `SSD_LLAMA_CTX` | `512` | context capacity |
 | `SSD_LLAMA_THREADS` | `8` | CPU threads |
 | `SSD_LLAMA_PORT` | `8080` | server port |
+| `SSD_LLAMA_BUILD_DIR` | `build-mac` under the checkout | build and launcher directory |
 | `SSD_LLAMA_BUILD_JOBS` | `8` | parallel build jobs |
 
 Additional llama arguments follow the mode. For the measured larger-prefill
@@ -68,12 +71,11 @@ SSD_LLAMA_CTX=8192 ./scripts/run-deepseek-v41-macos.sh server -b 512 -ub 512 -tb
   Removing `--cpu-moe` is not a substitute for a budgeted expert streaming path.
 
 The CUDA-only direct-reader tool is built only on Linux with CUDA enabled.
-Server CUDA MoE hooks are guarded by the CUDA build configuration. The CLI also
-renders final parser deltas so a short answer retained until EOS is displayed.
+Server CUDA MoE hooks are guarded by the CUDA build configuration. The independent CLI final-delta change is not included in this integration.
 
 ## Validation and retained baseline
 
-The eight adaptation source/script files match the previously tested baseline.
+The following describes the original branch validation, before integration.
 The baseline was built on the target Mac; CLI, streamed and non-streamed server
 responses were checked. Checks included a greeting, arithmetic, multi-turn
 recall, a batched input verification code and a short explanatory answer.
