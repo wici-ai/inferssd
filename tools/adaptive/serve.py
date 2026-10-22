@@ -33,7 +33,15 @@ lock = threading.Lock()
 def prompt_tokens(path, body):
     """Tokens of the prompt this request will run, by the engine's own template and tokenizer."""
     if 'chat' in path:
-        prompt = post(port, '/apply-template', body, timeout=60)['prompt']
+        templated = post(port, '/apply-template', body, timeout=60)
+        if not isinstance(templated, dict):
+            raise ValueError('apply-template returned an invalid response')
+        tokens = templated['tokens']
+        # Flattening the prompt loses which special-token spellings came from
+        # message text. Count the same provenance-aware tokens as chat inference.
+        if not isinstance(tokens, list) or any(type(token) is not int or token < 0 for token in tokens):
+            raise ValueError('apply-template returned invalid token IDs')
+        return len(tokens)
     else:
         prompt = body.get('prompt', '')
         if isinstance(prompt, list):
@@ -134,7 +142,7 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     timings = {}                            # the client went away: the engine stops, nothing to record
                 c.close()
-            if timings:
+            if timings and n_total is not None:
                 n = max(tok) if tok else 0
                 ctl.after(n_new, {'timings': timings, 'wall_s': time.time() - t0,
                                   'tok_s': [round(tok[i], 6) if i in tok else None for i in range(1, n + 1)]})
