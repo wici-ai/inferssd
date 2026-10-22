@@ -1,7 +1,7 @@
 # SSDash offline framework
 
-This package turns recorded probe reports and arm logs into calibration artifacts,
-a plan and legacy launcher settings. The commands are opt-in offline consumers;
+This package reads model headers to create source artifacts, and turns recorded
+probe reports and arm logs into calibration artifacts, a plan and legacy launcher settings. The commands are opt-in offline consumers;
 `tools/adaptive` and the existing launchers remain the production entry points.
 The package runtime uses only the Python standard library.
 
@@ -9,6 +9,7 @@ The package runtime uses only the Python standard library.
 
 | Command | Recorded input | Output |
 | --- | --- | --- |
+| `ssdash source` | GGUF headers, optional v1 pack index, dense placement text | Expert JSON/alias TSV, source facts, lane arguments or fio iolog text |
 | `ssdash probe` | Existing probe reports and expert metadata | Device schema-2 JSON on stdout |
 | `ssdash validate` | Device schema-2 JSON | Validation result; no rewritten artifact |
 | `ssdash fit` | Named arm directories, optional graph arm and ubatch JSON | Model schema-2 JSON, insitu schema-3 JSON and a report |
@@ -22,7 +23,26 @@ control an online session. Install from the repository root:
 python3 -m pip install ./tools/ssdash
 ```
 
-A complete offline path, assuming the destination directories already exist:
+Source artifacts can be generated without reading tensor payloads or running a probe:
+
+```sh
+ssdash source index models/model.gguf recorded/expert-index
+ssdash source facts models/model.gguf recorded/expert-index/experts.tsv
+ssdash source lane-args recorded/expert-index
+ssdash source dense models/model.gguf recorded/dense-homes.tsv recorded/dense.tsv
+ssdash source iolog recorded/expert-index 100 17 recorded/reads.iolog
+```
+
+`source index MODEL [PACK] DIR` optionally uses a v1 expert pack index.
+`source iolog DIR N SEED OUT [FILE]` optionally selects one source file; it writes
+fio input text and does not invoke fio or read the referenced payload ranges.
+`dense-homes.tsv` contains `tensor<TAB>ram|drive` lines. These commands retain the
+legacy artifact formats and consumed-input errors. The new CLI uses argparse
+for missing/invalid command arguments rather than the old script's usage text.
+A generated alias is not a payload-integrity
+certificate or a substitute for the Mac launcher's stricter alias validation.
+
+A complete recorded calibration path, assuming the destination directories already exist:
 
 ```sh
 ssdash probe --from-reports records/probe --experts records/expert-index \
@@ -98,6 +118,23 @@ still fails. Nonempty malformed observations are not silently defaulted.
 
 ### File and output ordering
 
+Source header reads retain the original mmap lifetime and decoding: metadata
+strings use replacement decoding, while textual artifacts and pack tensor names
+use strict decoding. Split-model discovery uses the original sorted glob and does
+not newly reject missing shards. Type 42 (`F8_E4M3_B128`) remains recognized as
+historical header metadata; this does not claim native execution support. Its
+metadata compatibility is separate from the C1 native format retirement work.
+
+`source index` retains mtime-based reuse, including the original set iteration over
+source paths. Frozen filesystem transcripts use `PYTHONHASHSEED=0` as a test
+condition; dynamic comparisons also check another seed. Production iteration is
+unchanged. GGUF alias output is closed and replaced before the expert JSON is
+written. Failure can leave a directory, temporary file or the already-published
+alias, as in F. Pack indexing does not create a GGUF alias. Dense placement keeps
+input order and validates each consumed line before writing its alias. No new
+whole-artifact validation, transaction, random seed default or filesystem probe
+is inserted into these paths.
+
 Legacy arm parsing prefers a readable gzip server log; corrupt gzip is an error,
 not a reason to retry the plain file. Server text uses replacement decoding,
 while client JSONL and metadata use strict decoding. A supplied incremental parser
@@ -129,6 +166,7 @@ the temporary file, as in F. With no `-o`, output goes to stdout.
 
 | Area | Modules and boundary |
 | --- | --- |
+| Source metadata | `source.header`, `source.experts`, `source.files`, `source.command`: header/parser and legacy artifact operations with explicit filesystem, output and random ports |
 | Device facts | `contracts`, `probe.device_profile`: frozen validated device records and pure report aggregation |
 | Recorded I/O | `probe.recorded`, `telemetry.files`, `telemetry.recorded`, `telemetry.legacy`: injectable file access and legacy arm observations |
 | Cost and replay | `model.decode_cost`, `model.routing_replay`: fitting/pricing and mutable tier/RAM/replay state |
@@ -139,7 +177,8 @@ the temporary file, as in F. With no `-o`, output goes to stdout.
 
 `Machine` borrows its input mappings and owns mutable replay/sink caches. Its
 artifact reader and host fallback are injected. Command functions take explicit
-read, output and clock ports as applicable. These interfaces preserve existing
+read, output and clock ports as applicable. Source operations borrow their filesystem ports; import and adapter construction
+perform no file or process work. These interfaces preserve existing
 semantics; they are not a claim that every legacy artifact now has a versioned,
 validated contract.
 
