@@ -60,9 +60,9 @@ jobs:
         run: python3 -m pytest -q tools/adaptive/tests bench/tests
       - name: Mac launcher and alias-index checks
         run: |
-          ruff check --isolated --select F scripts/run-macos-ssd.py scripts/kimi-build-gguf-expert-alias-tsv.py tests/test-macos-launcher.py
+          ruff check --isolated --select F scripts/run-macos-ssd.py scripts/kimi-build-gguf-expert-alias-tsv.py tests/test-macos-launcher.py bench/macos/measure.py bench/macos/measurement_images.py tests/test-macos-measurement.py tests/test-macos-measurement-images.py
           shellcheck scripts/run-macos-ssd.sh
-          python3 -m pytest -q tests/test-macos-launcher.py
+          python3 -m pytest -q tests/test-macos-launcher.py tests/test-macos-measurement.py tests/test-macos-measurement-images.py
       - name: Launcher tests
         shell: bash
         run: |
