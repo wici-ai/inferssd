@@ -78,3 +78,20 @@ with changed contents when its length is unchanged, just as F does; it only
 replays appended segments. `behind_hits` requires `behind=True`; calls without
 tracking retain the old failure. Zero half-life still fails. These boundaries
 are retained for equivalence, not promoted as new artifact-validation rules.
+
+## Prefill lane cost leaf
+
+`ssdash.model.prefill_lane` provides the original `coupled(a, b, n)` and
+`lane_layer(lane, n, U, routes, cov, b_e, ...)` pure functions. The lane input is a
+read-only mapping of numeric or null cost observations; no artifact loader or
+new validation boundary is introduced. Missing, null, zero, and negative rates
+retain F's behavior. The return remains `(time_us, cpu_us, moves)`.
+
+The frozen F `prefill.py` oracle and 31 cases preserve every output and selected
+intermediate float as `float.hex()`. They cover banker's rounding, ring clamping,
+the near-equal coupled branch, pageable versus locked copies, host-cost fallback,
+the two device slots, both existing drive scaling terms, route bytes, and the
+fewest moves within one read of the minimum time. Inputs are not normalized,
+arithmetic is not reordered, and the old prefill module and production callers
+remain unchanged. This extraction does not include pass sizing, thresholds,
+workload planning, calibration, or device measurements.
