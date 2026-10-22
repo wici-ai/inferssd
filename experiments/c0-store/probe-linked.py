@@ -171,14 +171,27 @@ def main() -> None:
                 runs.append(probe(server.resolve(), model, args.out, mode))
                 if runs[-1]['status'] != 'passed':
                     raise RuntimeError(f'failed arm: {runs[-1]["label"]}')
-            reference = json.loads((args.out / (model.stem + '-resident') / 'response.json').read_text())
-            for mode in ('alias', 'pack'):
-                candidate = json.loads((args.out / (model.stem + '-' + mode) / 'response.json').read_text())
-                comparison = {'model': model.name, 'candidate': mode,
+            values = {mode: json.loads((args.out / (model.stem + '-' + mode) / 'response.json').read_text())
+                      for mode in ('resident', 'alias', 'pack')}
+            for ref_mode, mode in (('resident', 'alias'), ('resident', 'pack'), ('alias', 'pack')):
+                reference, candidate = values[ref_mode], values[mode]
+                deltas = []
+                ids_exact = True
+                for left, right in zip(reference['completion_probabilities'], candidate['completion_probabilities']):
+                    for a, b in zip([left] + left['top_logprobs'], [right] + right['top_logprobs']):
+                        ids_exact &= a['id'] == b['id']
+                        deltas.append(abs(a['logprob'] - b['logprob']))
+                comparison = {'model': model.name, 'reference': ref_mode, 'candidate': mode,
                     'tokens_exact': reference['tokens'] == candidate['tokens'],
-                    'full_top5_exact': reference['completion_probabilities'] == candidate['completion_probabilities']}
+                    'full_top5_exact': reference['completion_probabilities'] == candidate['completion_probabilities'],
+                    'top5_ids_exact': ids_exact,
+                    'max_abs_logprob_difference': max(deltas),
+                    'changed_logprob_entries_including_sampled': sum(delta != 0 for delta in deltas)}
                 comparisons.append(comparison)
         summary['status'] = 'passed' if all(c['tokens_exact'] and c['full_top5_exact'] for c in comparisons) else 'different'
+    except Exception:
+        summary['status'] = 'failed'
+        raise
     finally:
         write(args.out / 'summary.json', summary)
         print(json.dumps(summary, indent=2))
