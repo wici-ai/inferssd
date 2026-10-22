@@ -281,33 +281,6 @@ static sink_ptr make_sink(fixture & f, int threads, int depth) {
     return sink_ptr(sink, kimi_cpu_sink_destroy);
 }
 
-// A fresh expert-job sink must publish its row participants before dispatch.
-// Compare one expert with the ordinary phase path, without a model or cache.
-static void expert_job_first_call_test() {
-    setenv("GGML_KIMI_CPU_SINK_READ_FIXED", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_SPLIT_CV", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_DYNAMIC_ROWS", "0", 1);
-    unsetenv("GGML_KIMI_CPU_SINK_ROW_WEIGHTS");
-    fixture f; make_synthetic(f);
-    tensors meta(f, 1);
-    std::vector<float> input(f.latent, .125f), baseline(f.latent), actual(f.latent);
-    const int32_t id = 3;
-    const float weight = 1;
-    for (int threads : { 2, 4 }) {
-        for (int job = 0; job <= 1; ++job) {
-            setenv("GGML_KIMI_CPU_SINK_EXPERT_JOB", job ? "1" : "0", 1);
-            auto sink = make_sink(f, threads, 1);
-            char error[512] = {};
-            require(kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
-                    input.data(), &id, &weight, 1, 4, 25, job ? actual.data() : baseline.data(),
-                    nullptr, error, sizeof(error)), error);
-        }
-        require(std::memcmp(baseline.data(), actual.data(), baseline.size() * sizeof(float)) == 0,
-                "expert job first call differs from ordinary compute phase");
-    }
-    std::puts("EXPERT_JOB_FIRST_CALL_OK threads=2,4 experts=1");
-}
-
 struct sample_result {
     kimi_cpu_sink_stats stats = {};
     double max_abs = 0, rel_l2 = 0, wall_us = 0, user_us = 0, system_us = 0;
@@ -781,7 +754,7 @@ struct location_fixture {
 };
 static void cache_location_tests(int threads,int depth){
     ggml_cpu_init(); // Initialize FP16 lookup tables before the raw-vector oracle.
-    setenv("GGML_KIMI_CPU_SINK_READY_FIRST","1",1);setenv("GGML_KIMI_CPU_SINK_EXPERT_JOB","0",1);
+    setenv("GGML_KIMI_CPU_SINK_READY_FIRST","1",1);
     setenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE","0",1);setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY","lru",1);
     setenv("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION","uniform",1);setenv("GGML_KIMI_CPU_SINK_READ_FIXED","0",1);
     fixture f;make_synthetic(f);tensors meta(f,1);char error[512]={};
@@ -821,7 +794,6 @@ static void cache_location_tests(int threads,int depth){
 
 static void cache_compute_tests(int threads, int depth) {
     setenv("GGML_KIMI_CPU_SINK_READY_FIRST","1",1);
-    setenv("GGML_KIMI_CPU_SINK_EXPERT_JOB","0",1);
     setenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE","0",1);
     setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY","lru",1);
     setenv("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION","uniform",1);
@@ -881,13 +853,13 @@ static void cache_compute_tests(int threads, int depth) {
     std::printf("CACHE_COMPUTE_EXECUTOR_PASS threads=%d depth=%d\n",threads,depth);
 }
 
-static void expert_job_tests(int threads, int depth, bool schedules = false, bool early_up_gate = false,
+static void schedule_tests(int threads, int depth, bool schedules = false, bool early_up_gate = false,
                              int poll = 0, bool role_major = false, bool nonblocking_down_sched = false) {
     fixture small, large;
     make_synthetic(small);
     large.latent = 512; large.hidden = 1024; make_synthetic(large);
     fixture_selector selector; selector.active = &small;
-    const char * names[] = { "GGML_KIMI_CPU_SINK_EXPERT_JOB", "GGML_KIMI_CPU_SINK_SPLIT_CV",
+    const char * names[] = { "GGML_KIMI_CPU_SINK_SPLIT_CV",
         "GGML_KIMI_CPU_SINK_READY_FIRST", "GGML_KIMI_CPU_SINK_ROW_WEIGHTS",
         "GGML_KIMI_CPU_SINK_COMPUTE_CPUS", "GGML_KIMI_CPU_SINK_IO_CPUS",
         "GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "GGML_KIMI_CPU_SINK_POLL_US",
@@ -900,42 +872,39 @@ static void expert_job_tests(int threads, int depth, bool schedules = false, boo
     std::vector<int> allowed;
     for (int i = 0; i < CPU_SETSIZE; ++i) { if (CPU_ISSET(i, &original_affinity)) { allowed.push_back(i); } }
     require(!schedules || int(allowed.size()) >= threads, "schedule fixture needs total_threads allowed CPUs");
-    std::string uniform, weighted, cpus;
+    std::string weighted, cpus;
     for (int i = 0; i < threads - 1; ++i) {
-        uniform += std::string(i ? "," : "") + "1";
         weighted += std::string(i ? "," : "") + (i < 4 ? "1" : "0.6");
         if (schedules) { cpus += std::string(i ? "," : "") + std::to_string(allowed[i]); }
     }
-    const int modes = schedules ? 9 : 2;
+    // Preserve original ordinary schedule IDs, independently of vector indices.
+    const std::vector<int> mode_ids = schedules ? std::vector<int>{ 0, 1, 6, 7 } : std::vector<int>{ 0, 1 };
+    const int modes = int(mode_ids.size());
     std::vector<sink_ptr> sinks;
     std::vector<bool> ready(modes, false);
-    for (int mode = 0; mode < modes; ++mode) {
-        setenv(names[0], !early_up_gate && !role_major && !nonblocking_down_sched && !poll &&
-            (schedules ? mode >= 2 && mode <= 5 : mode != 0) ? "1" : "0", 1);
-        setenv(names[6], role_major || nonblocking_down_sched || (early_up_gate && mode) ? "1" : "0", 1);
-        setenv(names[7], poll && mode ? std::to_string(poll).c_str() : "0", 1);
-        setenv(names[8], (role_major || nonblocking_down_sched) && mode ? "1" : "0", 1);
-        setenv(names[9], nonblocking_down_sched && mode ? "1" : "0", 1);
+    for (int index = 0; index < modes; ++index) {
+        const int mode = mode_ids[index];
+        setenv(names[5], role_major || nonblocking_down_sched || (early_up_gate && mode) ? "1" : "0", 1);
+        setenv(names[6], poll && mode ? std::to_string(poll).c_str() : "0", 1);
+        setenv(names[7], (role_major || nonblocking_down_sched) && mode ? "1" : "0", 1);
+        setenv(names[8], nonblocking_down_sched && mode ? "1" : "0", 1);
         const bool dynamic = schedules ? mode >= 7 : nonblocking_down_sched && mode;
-        setenv(names[10], dynamic ? "1" : "0", 1);
-        setenv(names[11], mode == 8 ? "32" : "16", 1);
+        setenv(names[9], dynamic ? "1" : "0", 1);
+        setenv(names[10], "16", 1);
         if (schedules) {
-            ready[mode] = (mode >= 1 && mode <= 4) || mode == 7;
-            setenv(names[1], mode == 1 || mode == 6 ? "1" : "0", 1);
-            setenv(names[2], ready[mode] ? "1" : "0", 1);
-            setenv(names[3], mode == 3 || mode == 5 ? uniform.c_str() :
-                mode == 4 || mode == 6 ? weighted.c_str() : "", 1);
-            setenv(names[4], mode >= 3 ? cpus.c_str() : "", 1);
-            setenv(names[5], mode >= 3 ? std::to_string(allowed[threads - 1]).c_str() : "", 1);
-            // Exercise dynamic rows both through normal compute_phase (mode 7)
-            // and the two-phase expert-job lifecycle (mode 8).
-            if (mode == 8) { setenv(names[0], "1", 1); }
+            ready[index] = mode == 1 || mode == 7;
+            setenv(names[0], mode == 1 || mode == 6 ? "1" : "0", 1);
+            setenv(names[1], ready[index] ? "1" : "0", 1);
+            setenv(names[2], mode == 6 ? weighted.c_str() : "", 1);
+            setenv(names[3], mode >= 3 ? cpus.c_str() : "", 1);
+            setenv(names[4], mode >= 3 ? std::to_string(allowed[threads - 1]).c_str() : "", 1);
+            // Mode 7 exercises dynamic rows through ordinary compute_phase.
         }
         char error[512] = {};
         sinks.emplace_back(kimi_cpu_sink_create(threads, depth, fixture_selector::resolve,
             &selector, error, sizeof(error)), kimi_cpu_sink_destroy);
-        require(bool(sinks[mode]), std::string("expert job create: ") + error);
-        configure_cache(sinks[mode].get(), 8 * triplet_bytes(large), { 1, 2 }, 4);
+        require(bool(sinks[index]), std::string("schedule create: ") + error);
+        configure_cache(sinks[index].get(), 8 * triplet_bytes(large), { 1, 2 }, 4);
     }
     for (const char * name : names) {
         if (original.count(name)) { setenv(name, original[name].c_str(), 1); }
@@ -960,37 +929,39 @@ static void expert_job_tests(int threads, int depth, bool schedules = false, boo
         const auto expected = reference(f, 1, input, ids, weights, 4, 25);
         std::vector<std::vector<float>> actual(modes);
         std::vector<sample_result> result(modes);
-        for (int mode = 0; mode < modes; ++mode) {
-            begin_cache(sinks[mode].get(), 99, token);
-            result[mode] = run_checked(name, f, sinks[mode].get(), meta, input, ids, weights,
-                expected, 1, 25, hits, -1, &actual[mode]);
+        for (int index = 0; index < modes; ++index) {
+            const int mode = mode_ids[index];
+            begin_cache(sinks[index].get(), 99, token);
+            result[index] = run_checked(name, f, sinks[index].get(), meta, input, ids, weights,
+                expected, 1, 25, hits, -1, &actual[index]);
             check_affinity();
             if (schedules) {
-                require(ready[mode] || result[mode].stats.ready_scratch_bytes == 0,
+                require(ready[index] || result[index].stats.ready_scratch_bytes == 0,
                     "disabled ready-first retained scratch");
-                if (ready[mode] && result[mode].stats.experts) {
-                    require(result[mode].stats.ready_scratch_bytes >= result[mode].stats.experts * f.latent * sizeof(float),
+                if (ready[index] && result[index].stats.experts) {
+                    require(result[index].stats.ready_scratch_bytes >= result[index].stats.experts * f.latent * sizeof(float),
                         "ready-first did not account scratch capacity");
                 }
             }
-            if (nonblocking_down_sched && mode && result[mode].stats.experts) {
+            if (nonblocking_down_sched && mode && result[index].stats.experts) {
                 const auto * down_traits = ggml_get_type_traits_cpu(f.down_type);
                 const size_t hidden_bytes = ggml_row_size(down_traits->vec_dot_type, f.hidden);
-                require(result[mode].stats.ready_scratch_bytes >= result[mode].stats.experts *
+                require(result[index].stats.ready_scratch_bytes >= result[index].stats.experts *
                         (size_t(f.latent) * sizeof(float) + hidden_bytes),
                     "nonblocking scheduler did not retain per-expert hidden scratch");
             }
         }
-        for (int mode = 1; mode < modes; ++mode) {
-            require(actual[0].size() == actual[mode].size() &&
-                std::memcmp(actual[0].data(), actual[mode].data(), actual[0].size() * sizeof(float)) == 0,
+        for (int index = 1; index < modes; ++index) {
+            const int mode = mode_ids[index];
+            require(actual[0].size() == actual[index].size() &&
+                std::memcmp(actual[0].data(), actual[index].data(), actual[0].size() * sizeof(float)) == 0,
                 std::string(name) + ": schedule changed output bits mode=" + std::to_string(mode));
-            require(result[0].stats.read_bytes == result[mode].stats.read_bytes &&
-                result[0].stats.cache_admitted == result[mode].stats.cache_admitted,
+            require(result[0].stats.read_bytes == result[index].stats.read_bytes &&
+                result[0].stats.cache_admitted == result[index].stats.cache_admitted,
                 "schedule changed IO/cache accounting");
             std::printf("case=%s mode=%d bit_exact=1 elements=%zu reorder=%llu scratch=%llu status=PASS\n",
-                name, mode, actual[0].size(), (unsigned long long) result[mode].stats.ready_out_of_order_experts,
-                (unsigned long long) result[mode].stats.ready_scratch_bytes);
+                name, mode, actual[0].size(), (unsigned long long) result[index].stats.ready_out_of_order_experts,
+                (unsigned long long) result[index].stats.ready_scratch_bytes);
         }
     };
     check("job_cold", small, { 3, 4 }, { .3f, .7f }, 0);
@@ -1020,16 +991,16 @@ static void expert_job_tests(int threads, int depth, bool schedules = false, boo
             char error[512] = {}; kimi_cpu_sink_stats stats = {};
             require(!kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
                 input.data(), ids, weights, 3, 4, 25, output.data(), &stats, error, sizeof(error)),
-                "expert job accepted short read");
+                "schedule accepted short read");
             require(error[0] && stats.read_errors && !stats.pending_reads && !stats.fallback_count,
-                "expert job failed to cancel and drain");
-            require(!cache_snapshot(sink.get()).valid_bytes, "expert job retained failed cache bytes");
+                "schedule failed to cancel and drain");
+            require(!cache_snapshot(sink.get()).valid_bytes, "schedule retained failed cache bytes");
             check_affinity();
         }
         small.fault = fixture::none; small.fault_expert = small.fault_role = -1;
         check("job_short_read_recovery", small, { 3, 7, 8 }, { .2f, .3f, .5f }, 0);
     }
-    std::printf("EXPERT_JOB_BIT_EXACT_OK threads=%d ring_experts=%d modes=%d early_up_gate=%d role_major=%d nonblocking_down_sched=%d poll_us=%d\n",
+    std::printf("SCHEDULE_BIT_EXACT_OK threads=%d ring_experts=%d modes=%d early_up_gate=%d role_major=%d nonblocking_down_sched=%d poll_us=%d\n",
                 threads, depth, modes, early_up_gate, role_major, nonblocking_down_sched, poll);
 }
 
@@ -1067,19 +1038,8 @@ static void schedule_invalid_tests() {
         unsetenv(item.first);
         require(!sink && error[0], std::string("invalid schedule accepted: ") + item.first + "=" + item.second);
     }
-    setenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_EXPERT_JOB", "1", 1);
     char error[512] = {};
-    sink_ptr incompatible(kimi_cpu_sink_create(4, 1, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
-    unsetenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE");
-    unsetenv("GGML_KIMI_CPU_SINK_EXPERT_JOB");
-    require(!incompatible && std::strstr(error, "EXPERT_JOB=0"), "early up/gate accepted expert-job lifecycle");
-    setenv("GGML_KIMI_CPU_SINK_POLL_US", "100", 1);
-    setenv("GGML_KIMI_CPU_SINK_EXPERT_JOB", "1", 1);
-    incompatible.reset(kimi_cpu_sink_create(4, 1, fixture::resolve, &f, error, sizeof(error)));
-    unsetenv("GGML_KIMI_CPU_SINK_POLL_US");
-    unsetenv("GGML_KIMI_CPU_SINK_EXPERT_JOB");
-    require(!incompatible && std::strstr(error, "EXPERT_JOB=0"), "polling accepted expert-job lifecycle");
+    sink_ptr incompatible(nullptr, kimi_cpu_sink_destroy);
     setenv("GGML_KIMI_CPU_SINK_DYNAMIC_ROWS", "1", 1);
     setenv("GGML_KIMI_CPU_SINK_ROW_WEIGHTS", "1,1,1", 1);
     incompatible.reset(kimi_cpu_sink_create(4, 1, fixture::resolve, &f, error, sizeof(error)));
@@ -1099,15 +1059,10 @@ static void schedule_invalid_tests() {
     setenv("GGML_KIMI_CPU_SINK_READY_FIRST", "0", 1);
     incompatible.reset(kimi_cpu_sink_create(4, 1, fixture::resolve, &f, error, sizeof(error)));
     require(!incompatible && std::strstr(error, "READY_FIRST=1"), "nonblocking scheduler accepted unordered reduction");
-    setenv("GGML_KIMI_CPU_SINK_READY_FIRST", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_EXPERT_JOB", "1", 1);
-    incompatible.reset(kimi_cpu_sink_create(4, 1, fixture::resolve, &f, error, sizeof(error)));
-    require(!incompatible && std::strstr(error, "EXPERT_JOB=0"), "nonblocking scheduler accepted expert jobs");
     unsetenv("GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED");
     unsetenv("GGML_KIMI_CPU_SINK_ROLE_MAJOR");
     unsetenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE");
     unsetenv("GGML_KIMI_CPU_SINK_READY_FIRST");
-    unsetenv("GGML_KIMI_CPU_SINK_EXPERT_JOB");
     std::printf("SCHEDULE_INVALID_SETTINGS_REJECTED cases=%zu\n", sizeof(invalid) / sizeof(invalid[0]));
 }
 
@@ -2045,7 +2000,7 @@ static void trace_profile_test(int threads, int depth) {
 static void prefetch_tests(int threads, int depth) {
     // the served scheduler (the launcher's profile), which the prefetch requires
     for (const auto & kv : { std::pair<const char *, const char *>{ "GGML_KIMI_CPU_SINK_READY_FIRST", "1" },
-            { "GGML_KIMI_CPU_SINK_EXPERT_JOB", "0" }, { "GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "1" },
+            { "GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "1" },
             { "GGML_KIMI_CPU_SINK_ROLE_MAJOR", "1" }, { "GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", "1" },
             { "GGML_KIMI_CPU_SINK_CACHE_POLICY", "lru" },
             { "GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", "uniform" }, { "GGML_KIMI_CPU_SINK_TRACE", "1" } }) {
@@ -3490,7 +3445,7 @@ int main(int argc, char ** argv) {
     try {
         real_options options; bool ring_set = false, registered_lifecycle = false, cache_mode = false, cache_pressure = false;
         bool trace_profile_mode = false, max_cache_mode = false, hitrate_mode = false, elastic_cache_mode = false;
-        bool expert_job_first_call = false, expert_job_mode = false, schedules_mode = false, schedule_invalid_mode = false, early_up_gate_mode = false;
+        bool schedules_mode = false, schedule_invalid_mode = false, early_up_gate_mode = false;
         bool role_major_mode = false, nonblocking_down_mode = false;
         bool poll_mode = false, poll_early_mode = false, cache_compute_mode = false, cache_location_mode = false;
         bool cache_policy_mode = false, cache_large_mode = false, cache_pressure_transition = false, cache_unbounded = false;
@@ -3511,8 +3466,6 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--trace-profile")) { trace_profile_mode = true; }
             else if (!std::strcmp(argv[i], "--prefetch-tests")) { prefetch_mode = true; }
             else if (!std::strcmp(argv[i], "--registered-lifecycle")) { registered_lifecycle = true; }
-            else if (!std::strcmp(argv[i], "--expert-job-first-call")) { expert_job_first_call = true; }
-            else if (!std::strcmp(argv[i], "--expert-job-tests")) { expert_job_mode = true; }
             else if (!std::strcmp(argv[i], "--early-up-gate-tests")) { early_up_gate_mode = true; }
             else if (!std::strcmp(argv[i], "--role-major-tests")) { role_major_mode = true; }
             else if (!std::strcmp(argv[i], "--nonblocking-down-tests")) { nonblocking_down_mode = true; }
@@ -3542,17 +3495,16 @@ int main(int argc, char ** argv) {
         require(options.threads >= 2 && options.threads <= 128 && options.ring_experts >= 1 && options.ring_experts <= 32, "invalid thread/ring count");
         require(options.repeats >= 1 && options.repeats <= 10000 && options.warmup >= 0 && options.warmup <= 10000, "invalid repeat/warmup count");
         if (!schedule_invalid_mode) {
-            const int required = registered_lifecycle || expert_job_first_call ? 4 : options.threads;
+            const int required = registered_lifecycle ? 4 : options.threads;
             test_resources::cpu_threads(required - 1, 1);
             test_resources::io_uring();
         }
         if (cache_mode || hitrate_mode || elastic_cache_mode || cache_load_mode || max_cache_mode ||
-                expert_job_mode || cache_location_mode || cache_compute_mode || early_up_gate_mode ||
+                cache_location_mode || cache_compute_mode || early_up_gate_mode ||
                 role_major_mode || nonblocking_down_mode || poll_mode || poll_early_mode || schedules_mode ||
                 prefetch_mode || cache_policy_mode || cache_large_mode || activation_mode || muse_q8_mode || muse_bf16_mode) {
             test_resources::finite_cgroup();
         }
-        if (expert_job_first_call) { expert_job_first_call_test(); return 0; }
         if (auto_ring_mode) { cache_auto_ring_test(options.threads, ring_set ? options.ring_experts : 8); return 0; }
         if (muse_q8_mode) { muse_expert_norm_test(options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_Q8_0); return 0; }
         if (muse_bf16_mode) {
@@ -3562,18 +3514,17 @@ int main(int argc, char ** argv) {
         }
         if (activation_mode) { activation_tests(options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (q2_activation_mode) { q2_activation_test(options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (expert_job_mode) { expert_job_tests(options.threads, options.ring_experts); return 0; }
         if (cache_location_mode) { cache_location_tests(options.threads, options.ring_experts); return 0; }
         if (cache_compute_mode) { cache_compute_tests(options.threads, options.ring_experts); return 0; }
         if (hitrate_mode) { cache_hitrate_tests(options.threads, options.ring_experts); return 0; }
         if (elastic_cache_mode) { elastic_cache_tests(options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (cache_load_mode) { cache_load_tests(options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (max_cache_mode) { max_cache_tests(options.threads, options.ring_experts); return 0; }
-        if (early_up_gate_mode) { expert_job_tests(options.threads, options.ring_experts, false, true); return 0; }
-        if (role_major_mode) { expert_job_tests(options.threads, options.ring_experts, false, false, 0, true); return 0; }
-        if (nonblocking_down_mode) { expert_job_tests(options.threads, options.ring_experts, false, false, 0, false, true); return 0; }
-        if (poll_mode || poll_early_mode) { expert_job_tests(options.threads, options.ring_experts, false, poll_early_mode, 100); return 0; }
-        if (schedules_mode) { expert_job_tests(options.threads, options.ring_experts, true); return 0; }
+        if (early_up_gate_mode) { schedule_tests(options.threads, options.ring_experts, false, true); return 0; }
+        if (role_major_mode) { schedule_tests(options.threads, options.ring_experts, false, false, 0, true); return 0; }
+        if (nonblocking_down_mode) { schedule_tests(options.threads, options.ring_experts, false, false, 0, false, true); return 0; }
+        if (poll_mode || poll_early_mode) { schedule_tests(options.threads, options.ring_experts, false, poll_early_mode, 100); return 0; }
+        if (schedules_mode) { schedule_tests(options.threads, options.ring_experts, true); return 0; }
         if (schedule_invalid_mode) { schedule_invalid_tests(); return 0; }
         if (trace_profile_mode) { trace_profile_test(options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (prefetch_mode) { prefetch_tests(options.threads, ring_set ? options.ring_experts : 2); return 0; }

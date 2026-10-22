@@ -1905,7 +1905,6 @@ struct kimi_cpu_sink {
     std::condition_variable compute_cv;
     std::condition_variable compute_done_cv;
     const bool split_cv;
-    const bool expert_job;
     const bool ready_first;
     bool cache_compute_active = false;
     kimi_cache_location_api locations = {};
@@ -1970,12 +1969,6 @@ struct kimi_cpu_sink {
     const bool host_gpu_enabled = sink_bool_env("GGML_KIMI_CPU_SINK_HOST_GPU", true);
     const bool decode_thread_choice = sink_bool_env("GGML_KIMI_CPU_SINK_DECODE_THREAD_CHOICE", true);
     std::vector<uint8_t> staged_quant_hidden;
-    bool compute_expert = false; // published with generation under compute_mutex
-    std::mutex expert_mutex;
-    std::condition_variable expert_ready_cv, expert_done_cv;
-    alignas(64) std::atomic<int> expert_up_pending{0};
-    alignas(64) std::atomic<int> expert_down_pending{0};
-    alignas(64) std::atomic<int> expert_hidden_pending{0};
     const bool profile_enabled;
     const bool trace_enabled;
     const bool timeline_enabled;
@@ -2029,7 +2022,6 @@ struct kimi_cpu_sink {
     kimi_cpu_sink(int threads, int depth, kimi_cpu_sink_resolver resolve, void * user) :
         compute_threads(threads - 1), ring_experts(depth), resolver(resolve), userdata(user), slots(depth),
         split_cv(sink_bool_env("GGML_KIMI_CPU_SINK_SPLIT_CV", false)),
-        expert_job(sink_bool_env("GGML_KIMI_CPU_SINK_EXPERT_JOB", false)),
         ready_first(sink_bool_env("GGML_KIMI_CPU_SINK_READY_FIRST", false)),
         early_up_gate(sink_bool_env("GGML_KIMI_CPU_SINK_EARLY_UP_GATE", false)),
         role_major(sink_bool_env("GGML_KIMI_CPU_SINK_ROLE_MAJOR", false)),
@@ -2057,14 +2049,6 @@ struct kimi_cpu_sink {
         cache.before_discard_arg = this;
         vram.ram_slot_locked = [this](int entry) { return entry >= 0 && host_lock.is_locked(size_t(entry)); };
         sink_location_provider_initialize(this);
-        // Expert jobs publish hidden readiness directly to the down workers.
-        // Keep that lifecycle unchanged until it has its own I/O error barrier.
-        if (nonblocking_down_sched && expert_job) {
-            throw std::runtime_error("NONBLOCKING_DOWN_SCHED requires EXPERT_JOB=0");
-        }
-        if (early_up_gate && expert_job) {
-            throw std::runtime_error("EARLY_UP_GATE requires EXPERT_JOB=0");
-        }
         if (early_up_gate && vram.location_api) {
             throw std::runtime_error("EARLY_UP_GATE cannot share the cache-location provider");
         }
@@ -2076,9 +2060,6 @@ struct kimi_cpu_sink {
         }
         if (nonblocking_down_sched && !ready_first) {
             throw std::runtime_error("NONBLOCKING_DOWN_SCHED requires READY_FIRST=1");
-        }
-        if (poll_us && expert_job) {
-            throw std::runtime_error("POLL_US requires EXPERT_JOB=0");
         }
         ring.init(static_cast<unsigned>(3 * depth), sink_read_fixed_from_env());
         // Reserve before starting threads so vector growth cannot strand a thread.
@@ -2725,19 +2706,9 @@ struct kimi_cpu_sink {
             }
             if (compute_stop) { return; }
             seen = generation;
-            const bool job = compute_expert;
             poll_next = poll_us && !parallel_fn;
-            if (!job && ith >= active_threads) { continue; }
+            if (ith >= active_threads) { continue; }
             lock.unlock();
-            if (job) {
-                compute_rows(ith, false);
-                expert_arrive(expert_up_pending);
-                expert_wait(expert_hidden_pending, expert_ready_cv);
-                compute_rows(ith, true);
-                expert_arrive(expert_down_pending);
-                lock.lock();
-                continue;
-            }
             compute_rows(ith, down_phase);
             lock.lock();
             if (--pending == 0) {
@@ -3164,7 +3135,6 @@ struct kimi_cpu_sink {
     void compute_phase(bool is_down) {
         {
             std::lock_guard<std::mutex> lock(compute_mutex);
-            compute_expert = false;
             down_phase = is_down;
             begin_dynamic_phase(is_down);
             // Row weights fix one bound per participant, so they keep every thread.
@@ -3182,10 +3152,6 @@ struct kimi_cpu_sink {
     }
 
     void wait_workers() {
-        if (compute_expert) {
-            expert_wait(expert_down_pending, expert_done_cv);
-            return;
-        }
         if (poll_us && !parallel_fn) {
             sink_poll(poll_us, [&] { return poll_pending.load(std::memory_order_acquire) == 0; });
             if (poll_pending.load(std::memory_order_acquire) == 0) { return; }
@@ -3193,78 +3159,6 @@ struct kimi_cpu_sink {
         std::unique_lock<std::mutex> lock(compute_mutex);
         if (split_cv) { compute_done_cv.wait(lock, [&] { return pending == 0; }); }
         else { compute_cv.wait(lock, [&] { return pending == 0; }); }
-    }
-
-    void expert_wait(std::atomic<int> & remaining, std::condition_variable & cv) {
-        // Bounded polling only within a ready expert. Idle workers still park
-        // on compute_cv throughout SSD waits, prefill and between requests.
-        for (int spin = 0; spin < 128; ++spin) {
-            if (remaining.load(std::memory_order_acquire) == 0) { return; }
-#if defined(__x86_64__) || defined(__i386__)
-            __builtin_ia32_pause();
-#elif defined(__aarch64__)
-            __asm__ __volatile__("yield" ::: "memory");
-#endif
-        }
-        std::unique_lock<std::mutex> lock(expert_mutex);
-        cv.wait(lock, [&] { return remaining.load(std::memory_order_acquire) == 0; });
-    }
-
-    void expert_arrive(std::atomic<int> & remaining) {
-        // The RMW release sequence publishes every worker's rows. Only the last
-        // worker takes the sleep mutex; locking also prevents a lost CV wakeup.
-        if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            std::lock_guard<std::mutex> lock(expert_mutex);
-            expert_done_cv.notify_one();
-        }
-    }
-
-    void quantize_activation() {
-        const auto start = sink_clock::now();
-        const double cpu_start = profile_enabled ? sink_thread_cpu_us() : 0.0;
-        quantize_hidden(activation.data(), quant_hidden.data(), hidden);
-        current.hidden_quantize_us += elapsed_us(start);
-        if (profile_enabled) { current.compute_cpu_us += sink_thread_cpu_us() - cpu_start; }
-    }
-
-    void compute_expert_job() {
-        auto * timing = timeline_active ? &timeline[timeline_expert] : nullptr;
-        auto phase_start = sink_clock::now();
-        if (timing) { timing->cpu[2] = ggml_time_us(); }
-        {
-            std::lock_guard<std::mutex> lock(compute_mutex);
-            compute_expert = true;
-            active_threads = compute_threads;
-            begin_dynamic_phase(false);
-            expert_up_pending.store(compute_threads - 1, std::memory_order_relaxed);
-            expert_down_pending.store(compute_threads - 1, std::memory_order_relaxed);
-            expert_hidden_pending.store(1, std::memory_order_relaxed);
-            if (profile_enabled) { phase_dispatch = phase_start; }
-            ++generation;
-        }
-        compute_cv.notify_all();
-        compute_rows(0, false);
-        expert_wait(expert_up_pending, expert_done_cv);
-        if (timing) { timing->cpu[3] = ggml_time_us(); }
-        current.up_gate_us += elapsed_us(phase_start);
-        if (timing) { timing->cpu[4] = ggml_time_us(); }
-        quantize_activation(); // complete up/gate output is required by Q8_K
-        if (timing) { timing->cpu[5] = ggml_time_us(); }
-        phase_start = sink_clock::now();
-        if (timing) { timing->cpu[6] = ggml_time_us(); }
-        if (profile_enabled) { phase_dispatch = phase_start; }
-        {
-            std::lock_guard<std::mutex> lock(expert_mutex);
-            begin_dynamic_phase(true);
-            expert_hidden_pending.store(0, std::memory_order_release);
-        }
-        expert_ready_cv.notify_all();
-        compute_rows(0, true);
-        expert_wait(expert_down_pending, expert_done_cv);
-        if (timing) { timing->cpu[7] = ggml_time_us(); }
-        current.down_reduce_us += elapsed_us(phase_start);
-        // Caller may now admit/release this expert's cache/ring slot. No worker
-        // retains weight/output pointers after its down completion publication.
     }
 
     void cancel_and_wait() {
@@ -3406,7 +3300,7 @@ struct kimi_cpu_sink {
                 trace_has_token ? "true" : "false", (unsigned long long) trace_epoch,
                 (unsigned long long) trace_token, trace_layer,
                 (unsigned long long) trace_call, success ? "true" : "false", (unsigned long long) current.experts,
-                compute_threads + 1, split_cv ? 1 : 0, expert_job ? 1 : 0, current.total_us, current.compute_us, current.wait_io_us,
+                compute_threads + 1, split_cv ? 1 : 0, 0, current.total_us, current.compute_us, current.wait_io_us,
                 current.other_us, current.io_us, current.io_wait_us, current.io_credit_wait_us,
                 current.compute_cpu_us, current.caller_cpu_us, current.io_cpu_us, current.input_quantize_us,
                 current.hidden_quantize_us, current.up_gate_us, current.down_reduce_us);
@@ -4837,35 +4731,31 @@ extern "C" bool kimi_cpu_sink_run_activation(
             sink->weight = request.weight;
             double down_wait_us = 0;
             if (sink->timeline_active) { sink->timeline_expert = expert; }
-            if (sink->expert_job) {
-                sink->compute_expert_job();
-            } else {
-                auto phase_start = sink_clock::now();
-                if (sink->timeline_active) { sink->timeline_expert = expert; sink->timeline[expert].cpu[2] = ggml_time_us(); }
-                sink->compute_phase(false);
-                if (sink->timeline_active) { sink->timeline[expert].cpu[3] = ggml_time_us(); }
-                sink->current.up_gate_us += elapsed_us(phase_start);
-                phase_start = sink_clock::now();
-                quant_cpu_start = sink->profile_enabled ? sink_thread_cpu_us() : 0.0;
-                if (sink->timeline_active) { sink->timeline[expert].cpu[4] = ggml_time_us(); }
-                sink->quantize_hidden(sink->activation.data(), sink->quant_hidden.data(), sink->hidden);
-                if (sink->timeline_active) { sink->timeline[expert].cpu[5] = ggml_time_us(); }
-                sink->current.hidden_quantize_us += elapsed_us(phase_start);
-                if (sink->profile_enabled) { sink->current.compute_cpu_us += sink_thread_cpu_us() - quant_cpu_start; }
-                down_wait_us = sink->wait_down(expert);
-                if (!upload_started && sink->vram.async_upload && borrow_upload) {
-                    // wait_down() returned only after a successful down CQE, so
-                    // the immutable three-role cache payload can now be borrowed
-                    // while CPU down computation reads it too.
-                    sink->vram.admit(expert, data, true);
-                    upload_started = true;
-                }
-                phase_start = sink_clock::now();
-                if (sink->timeline_active) { sink->timeline[expert].cpu[6] = ggml_time_us(); }
-                sink->compute_phase(true);
-                if (sink->timeline_active) { sink->timeline[expert].cpu[7] = ggml_time_us(); }
-                sink->current.down_reduce_us += elapsed_us(phase_start);
+            auto phase_start = sink_clock::now();
+            if (sink->timeline_active) { sink->timeline_expert = expert; sink->timeline[expert].cpu[2] = ggml_time_us(); }
+            sink->compute_phase(false);
+            if (sink->timeline_active) { sink->timeline[expert].cpu[3] = ggml_time_us(); }
+            sink->current.up_gate_us += elapsed_us(phase_start);
+            phase_start = sink_clock::now();
+            quant_cpu_start = sink->profile_enabled ? sink_thread_cpu_us() : 0.0;
+            if (sink->timeline_active) { sink->timeline[expert].cpu[4] = ggml_time_us(); }
+            sink->quantize_hidden(sink->activation.data(), sink->quant_hidden.data(), sink->hidden);
+            if (sink->timeline_active) { sink->timeline[expert].cpu[5] = ggml_time_us(); }
+            sink->current.hidden_quantize_us += elapsed_us(phase_start);
+            if (sink->profile_enabled) { sink->current.compute_cpu_us += sink_thread_cpu_us() - quant_cpu_start; }
+            down_wait_us = sink->wait_down(expert);
+            if (!upload_started && sink->vram.async_upload && borrow_upload) {
+                // wait_down() returned only after a successful down CQE, so
+                // the immutable three-role cache payload can now be borrowed
+                // while CPU down computation reads it too.
+                sink->vram.admit(expert, data, true);
+                upload_started = true;
             }
+            phase_start = sink_clock::now();
+            if (sink->timeline_active) { sink->timeline[expert].cpu[6] = ggml_time_us(); }
+            sink->compute_phase(true);
+            if (sink->timeline_active) { sink->timeline[expert].cpu[7] = ggml_time_us(); }
+            sink->current.down_reduce_us += elapsed_us(phase_start);
             sink->current.compute_us += elapsed_us(compute_start) - down_wait_us;
             if (!upload_started) { sink->vram.admit(expert, data, borrow_upload); }
             sink->cache.admit(request, sink->current);

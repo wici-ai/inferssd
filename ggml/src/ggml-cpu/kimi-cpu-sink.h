@@ -107,14 +107,14 @@ struct kimi_cpu_sink_cache_stats {
 // ring_experts=8. Optional GGML_KIMI_CPU_SINK_ environment settings at create:
 // READY_FIRST=1 computes available experts first, then adds in original order.
 // EARLY_UP_GATE=1 may start a miss after its up and gate reads complete, then
-// waits for down before that projection. It requires EXPERT_JOB=0 and cannot
-// be combined with the cache-location provider; the native GPU tier is safe.
+// waits for down before that projection. It cannot be combined with the
+// cache-location provider; the native GPU tier is safe.
 // ROLE_MAJOR=1 queues every up/gate pair in an I/O batch before its down reads.
 // It requires EARLY_UP_GATE=1; without early compute the order is detrimental.
 // NONBLOCKING_DOWN_SCHED=1 splits each CPU expert into up/gate+quantization and
 // down work, always running an available first half instead of waiting on one
 // late down read. Per-expert quantized hidden rows preserve that dependency.
-// It requires READY_FIRST=1, EARLY_UP_GATE=1, ROLE_MAJOR=1 and EXPERT_JOB=0.
+// It requires READY_FIRST=1, EARLY_UP_GATE=1 and ROLE_MAJOR=1.
 // ROW_WEIGHTS is a positive finite comma-separated weight per compute participant
 // (total_threads - 1, caller first). It affects decode row partitioning only.
 // DYNAMIC_ROWS=1 instead lets every compute participant claim aligned row blocks
