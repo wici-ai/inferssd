@@ -46,7 +46,8 @@ commits `d3b009f705` and `4b70845959`. Unified placement and cost accounting com
 from the lane integration ending at `bdd1530696`, followed by the partial base
 admission fix `6d8cb2b`. They were applied as reviewed net patches against the
 seed; their original repository history was not merged. The standalone earlier
-cost patch `ca8d4ba` is superseded by the lane accounting implementation.
+cost patch `ca8d4ba` is superseded by the lane accounting implementation. This
+integration is reviewed in [PR #3](https://github.com/wici-ai/ssdash/pull/3).
 
 The initial Apple Silicon cache, launch scripts and historical benchmark assets
 come from ustc-sunny's Mac branch at `aee25da468cbdbb7c72d2293f86262d6933da657`.
@@ -55,4 +56,13 @@ integration adapts the CPU source hook to the current engine, keeps one Muse
 parser, preserves the Linux streaming paths, and adds portable cache validation.
 The historical benchmark documents describe that original branch, not a measured
 performance claim for this SSDash revision. The newer GGUF alias reader and I/O
-pipeline are separate work and require their own model validation.
+pipeline are separate work and require their own model validation. The original
+Mac integration is reviewed in [PR #4](https://github.com/wici-ai/ssdash/pull/4).
+
+The GGUF alias source, bounded read-ahead, aligned reads and prefill cache isolation
+originate in optimization commits `301cf6f`, `0824683`, `b513c8a` and `c7f76a2`.
+The checked cache-budget conversion comes from `709326e`.
+They are applied as separate patches to the new history. The CPU hooks preserve
+the new engine's Apple-only path; the portable testing guard and prior malformed
+pack checks remain. The alias-index generator is included as part of this feature.
+Default changes and performance claims require validation of this integrated build.

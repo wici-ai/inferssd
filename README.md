@@ -13,8 +13,8 @@ earlier code and are not release benchmarks.
 
 The supported targets are DeepSeek-V4.1 Flash with MXFP4 experts in the Q8_0 GGUF distribution, and Muse Spark
 Open UD-Q4_K_XL. Linux CUDA development targets RTX 5090, RTX 5060 Ti and GB10. Other inherited models and
-backends have not been qualified by this project. macOS support is being integrated; this import does not
-yet provide a supported macOS launcher.
+backends have not been qualified by this project. Apple Silicon integration includes a
+[GGUF launcher for both models](docs/ssdash/mac-launcher.md); target-device qualification is in progress.
 
 The model files are large: allow approximately 505-508 GB for each model, plus working space. Linux reads
 expert ranges directly from the GGUF shards and does not require a separate expert pack.

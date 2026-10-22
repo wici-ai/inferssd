@@ -58,6 +58,11 @@ jobs:
           ruff check --isolated --select F bench
       - name: Framework tests
         run: python3 -m pytest -q tools/adaptive/tests bench/tests
+      - name: Mac launcher and alias-index checks
+        run: |
+          ruff check --isolated --select F scripts/run-macos-ssd.py scripts/kimi-build-gguf-expert-alias-tsv.py tests/test-macos-launcher.py
+          shellcheck scripts/run-macos-ssd.sh
+          python3 -m pytest -q tests/test-macos-launcher.py
       - name: Launcher tests
         shell: bash
         run: |
@@ -77,13 +82,14 @@ jobs:
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF
       - name: Build
-        run: cmake --build build --parallel 2 --target llama-server test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan test-reasoning-budget test-server-expert-guard test-graph-overhead test-linux-test-resources test-mac-expert-pack-cache
+        run: cmake --build build --parallel 2 --target llama-server test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan test-reasoning-budget test-server-expert-guard test-graph-overhead test-linux-test-resources test-mac-expert-pack-cache test-mac-expert-source
       - name: Synthetic tests
         shell: bash
         run: |
           set -o pipefail
           ctest --test-dir build --output-on-failure --no-tests=error -R '^(test-dsv41-engram|kimi_prefill_cost|moe_pack_copy_plan|test-reasoning-budget|server_expert_guard|test-graph-overhead|linux_test_resources|mac_expert_pack_cache)$' | tee cpu-tests.log
           ! grep -E '\bSKIP\b|\*\*\*Not Run|\*\*\*Skipped' cpu-tests.log
+          python3 tests/test-mac-expert-source.py build/bin/test-mac-expert-source
 
   macos:
     if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
@@ -98,6 +104,7 @@ jobs:
       - name: Cache and Muse rendering tests
         run: |
           ctest --test-dir build-mac --output-on-failure --no-tests=error -R '^mac_expert_pack_cache$'
+          python3 tests/test-mac-expert-source.py build-mac/bin/test-mac-expert-source
           build-mac/bin/test-chat --template muse-spark
       - name: Quantized CPU operator checks on Apple Silicon
         shell: bash
