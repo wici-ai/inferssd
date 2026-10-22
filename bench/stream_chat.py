@@ -192,9 +192,16 @@ def run(args):
     try:
         with deadline(args.timeout):
             base = protocol["base_url"]
-            rendered = post(base, "/apply-template", {"messages": [{"role": "user", "content": prompt}]}, args.timeout)["prompt"]
-            prompt_ids = post(base, "/tokenize", {"content": rendered, "add_special": True,
-                                                   "parse_special": True}, args.timeout)["tokens"]
+            chat_request = {"messages": [{"role": "user", "content": prompt}],
+                            "chat_template_kwargs": {"enable_thinking": False},
+                            "reasoning_effort": "none"}
+            protocol["chat_request"] = chat_request
+            templated = post(base, "/apply-template", chat_request, args.timeout)
+            rendered, prompt_ids = templated["prompt"], templated["tokens"]
+            # The server retains message provenance when tokenizing a template.
+            # Re-tokenizing flattened text could interpret user text as control tokens.
+            if not isinstance(rendered, str):
+                raise ValueError("template response must contain rendered text")
             if not token_list(prompt_ids) or len(prompt_ids) != args.input_tokens:
                 raise ValueError("rendered prompt token count differs from the fixed protocol")
             body = {"prompt": prompt_ids, "n_predict": args.output_tokens, "stream": True,

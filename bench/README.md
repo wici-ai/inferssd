@@ -22,9 +22,10 @@ python3 bench/stream_chat.py --url http://127.0.0.1:8080 \
   --output run/result.json
 ```
 
-The client calls `/apply-template` with one user message, then `/tokenize` with
-special-token handling enabled. The rendered token count must equal the declared
-input count. It sends those exact IDs to native `/completion` with greedy top-k
+The client calls `/apply-template` with one user message and thinking disabled.
+It requires that endpoint's authoritative token IDs, which preserve the distinction
+between user text and template control tokens. The rendered token count must equal
+the declared input count. It sends those exact IDs to native `/completion` with greedy top-k
 sampling, a fixed output count, EOS ignored, prompt caching disabled, and five
 pre-sampling probabilities. It rejects a truncated request, an incomplete stream,
 missing token IDs, invalid top-five records or mismatched final counts. It accepts
