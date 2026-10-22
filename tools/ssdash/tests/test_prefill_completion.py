@@ -7,8 +7,17 @@ import json
 import sys
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+from ssdash.model import (
+    prefill_calibration,
+    prefill_feedback,
+    prefill_lane,
+    prefill_memory,
+    prefill_model,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 ORACLE_PATH = FIXTURES / "oracle/prefill_f.py"
@@ -219,6 +228,16 @@ def observe(module, case):
 
 
 GOLDENS = json.loads((FIXTURES / "prefill-completion-goldens.json").read_text())
+TYPED = SimpleNamespace(
+    **{
+        name: getattr(prefill_calibration, name)
+        for name in ("union_points", "rest_fit", "build", "check")
+    },
+    **{name: getattr(prefill_memory, name) for name in ("graph_line", "graph_pass_max")},
+    **{name: getattr(prefill_feedback, name) for name in ("drive_factor", "feedback")},
+    **{name: getattr(prefill_model, name) for name in DEPENDENCIES if name != "coupled"},
+    coupled=prefill_lane.coupled,
+)
 
 
 def test_frozen_oracle_identity():
@@ -232,3 +251,16 @@ def test_frozen_prefill_completion(case):
     if key not in GOLDENS["runtimes"]:
         pytest.skip("No frozen transcript recorded for this Python minor version")
     assert observe(ORACLE, case) == case["expected"][key]
+
+
+@pytest.mark.parametrize("case", GOLDENS["cases"], ids=lambda case: case["name"])
+def test_typed_prefill_completion(case):
+    assert observe(TYPED, case) == observe(ORACLE, case)
+
+
+def test_null_feedback_observations():
+    case = copy.deepcopy(
+        next(c for c in GOLDENS["cases"] if c["name"] == "feedback-zero-observations")
+    )
+    case["arguments"]["turns"][0].update(cpu_s=None, read_bytes=None)
+    assert observe(TYPED, case) == observe(ORACLE, case)
