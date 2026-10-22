@@ -3,8 +3,8 @@
 The production parser and shared catalog are in `ggml/src/ggml-ssd/store`.
 This directory holds the frozen legacy reference and model-free format,
 configuration, publication, descriptor-lifetime and exception fixtures. It is
-not a second production parser. F/F-prime runtime acceptance remains required;
-passing these tests does not declare C0 complete.
+not a second production parser. The recorded runtime references below supplement
+these fixtures; synthetic parser checks alone do not establish runtime equivalence.
 
 ## Build boundaries
 
@@ -81,3 +81,28 @@ feasibility fixtures. The preload shim is not used by production. The linked
 probe compares resident CPU arithmetic and refuses CUDA libraries; it is not
 the actual-provider same-sink F/F-prime gate. Do not reuse its old protocol or
 historical resident/sink results as C0 acceptance evidence.
+
+## Recorded runtime references
+
+The Linux aarch64 CPU-only sink was compared with F using three synthetic model
+types (MXFP4, Q4_K and Q5_K), each with pack and GGUF-alias sources. All six cases
+matched the complete vocabulary logits and selected IDs byte for byte across F
+and two independent CPU-only candidate processes. Each process repeated its
+request after clearing KV. Grouped prefill, cache admission/reuse, direct reads,
+actual loaded images and normal cleanup were also checked under a finite memory
+limit with zero swap. See [the CPU reference](reference/cpu-aarch64/README.md).
+
+The separate [GPU32 reference](reference/gpu32-aarch64-sm121a/README.md) records
+original F outputs for a 32-token GPU graph prefill followed by CPU-sink decode.
+All six original/candidate pairs matched their four full raw rows exactly.
+The run required actual BATCH1 io_uring reads, GPU copies and computation,
+complete per-batch CQE histories, zero fallback/errors and normal cleanup.
+It does not cover GPU decode or a nonzero VRAM tier. The original worker checked
+DONE live; the saved artifacts retain its completion receipt, not raw DONE lines.
+
+These references describe their exact compiler and execution profile. They do
+not establish cross-architecture equality, large-model quality, or throughput.
+The original failed preparation attempts remain in the migration evidence;
+the accepted recording uses the engine's existing request-phase notifications.
+Later changes must keep numerical comparison separate from provider, source,
+path coverage and resource verification.

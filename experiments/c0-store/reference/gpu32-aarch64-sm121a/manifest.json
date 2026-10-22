@@ -1,0 +1,1013 @@
+{
+  "schema_version": 1,
+  "protocol": "gpu32-raw-v1",
+  "baseline_revision": "8b12192920b339a4ef31c9006d1ebe20304ce45a",
+  "recording_source_revision": "eef176ca3b9965aee53eeb05c78defb803a3b990",
+  "recording_source_equivalence": "Original compiled engine files equal frozen baseline engine files; non-engine metadata may differ.",
+  "compared_candidate_source_revision": "3e100e7a5f738cc7df1aaa6c65d066e8657b276c",
+  "architecture": "aarch64",
+  "hardware": {
+    "gpu": "NVIDIA GB10",
+    "compute_capability": "12.1",
+    "code_generation": "compute_121a and sm_121a"
+  },
+  "compiler": {
+    "host": "GCC 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04)",
+    "cuda": "NVCC 13.0.88 (CUDA 13.0)",
+    "cmake": "3.28.3"
+  },
+  "runtime": {
+    "nvidia_driver": "580.82.09",
+    "kernel_module": "NVIDIA Open Kernel Module for aarch64",
+    "liburing": "2.5-1build1 arm64; SONAME liburing.so.2"
+  },
+  "engine_build": {
+    "configuration": "Release",
+    "c_cxx_math_flags": [
+      "-O3",
+      "-DNDEBUG",
+      "-ffp-contract=off"
+    ],
+    "cuda_math_codegen_flags": [
+      "-O3",
+      "-DNDEBUG",
+      "-std=c++17",
+      "-use_fast_math",
+      "-extended-lambda",
+      "-compress-mode=size",
+      "--generate-code=arch=compute_121a,code=[compute_121a,sm_121a]"
+    ],
+    "native": false,
+    "openmp": true,
+    "llamafile": true,
+    "cpu_extra_march_mcpu_mtune": false,
+    "cuda_options": {
+      "GGML_CUDA": "ON",
+      "GGML_CUDA_COMPRESSION_MODE": "size",
+      "GGML_CUDA_FA": "ON",
+      "GGML_CUDA_FA_ALL_QUANTS": "OFF",
+      "GGML_CUDA_FORCE_CUBLAS": "OFF",
+      "GGML_CUDA_FORCE_MMQ": "OFF",
+      "GGML_CUDA_GRAPHS": "ON",
+      "GGML_CUDA_KIMI_VRAM_TIER": "ON",
+      "GGML_CUDA_LIGHTNING_INDEXER": "ON",
+      "GGML_CUDA_MOE_STREAM": "ON",
+      "GGML_CUDA_MOE_STREAM_BATCH": "ON",
+      "GGML_CUDA_NCCL": "ON",
+      "GGML_CUDA_NO_PEER_COPY": "OFF",
+      "GGML_CUDA_NO_VMM": "OFF",
+      "GGML_CUDA_PEER_MAX_BATCH_SIZE": "128"
+    },
+    "expert_transport": "GGML_CUDA_MOE_STREAM_BATCH=ON, liburing BATCH1"
+  },
+  "runner_build": {
+    "flags": [
+      "-std=c++17",
+      "-O2",
+      "-ffp-contract=off",
+      "-Wall",
+      "-Wextra",
+      "-Werror"
+    ],
+    "elf_sha256": "f420c6b28273b4ad13a22f2b482acffd8831bcbe7e76843ca90106d68d0a2ee9"
+  },
+  "runner_source_sha256": "738f9de7c83cdaadff1daa046e69fcd968fcfc5a33cc68b86b4015f82a5300c8",
+  "generator": {
+    "path": "experiments/c0-store/make-tiny.py",
+    "sha256": "637c2d8219ca9a506dc2a773700cc074fa8cb689f128839b303021bcfe2c41bc",
+    "seed": 20261022,
+    "numpy": "2.0.2",
+    "gguf_source_revision": "df95487f8c1b48054a8136f6655cba399e24c299"
+  },
+  "model_params": {
+    "n_gpu_layers": 99,
+    "use_mmap": true,
+    "use_extra_bufts": false,
+    "defer_experts": true,
+    "remaining": "llama_model_default_params at pinned recording source"
+  },
+  "context_params": {
+    "n_ctx": 128,
+    "n_batch": 32,
+    "n_ubatch": 32,
+    "n_seq_max": 1,
+    "n_threads": 2,
+    "n_threads_batch": 2,
+    "op_offload": true,
+    "offload_kqv": true,
+    "flash_attn_type": "ENABLED",
+    "type_k": "F16",
+    "type_v": "F16",
+    "swa_full": true,
+    "kv_unified": false,
+    "samplers": null,
+    "n_samplers": 0,
+    "remaining": "llama_context_default_params at pinned recording source"
+  },
+  "input_tokens": [
+    3,
+    4,
+    5,
+    6,
+    3,
+    4,
+    5,
+    6,
+    3,
+    4,
+    5,
+    6,
+    3,
+    4,
+    5,
+    6,
+    3,
+    4,
+    5,
+    6,
+    3,
+    4,
+    5,
+    6,
+    3,
+    4,
+    5,
+    6,
+    3,
+    4,
+    5,
+    6
+  ],
+  "output_tokens": 4,
+  "requests_per_process": 1,
+  "selection": "Independent argmax on finite raw logits; lowest token ID tie; ignore EOS",
+  "phase_lifecycle": {
+    "api": "llama_moe_prefill_phase_workspace_sized_ex",
+    "sequence": [
+      [
+        1,
+        32,
+        32
+      ],
+      [
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        0
+      ]
+    ],
+    "boundaries": [
+      "after KV clear, before 32-token prompt decode",
+      "after first complete raw row synchronized, copied and saved",
+      "after final complete raw row synchronized, copied and saved"
+    ],
+    "require_bool_success": true
+  },
+  "recorded_libraries": [
+    {
+      "file": "libggml-base.so.0.10.0",
+      "sha256": "6de90f2b653533c47f96ecaad62140e6cde8230d809710577fa583b7403dff65"
+    },
+    {
+      "file": "libggml-cpu.so.0.10.0",
+      "sha256": "2815abe80aec3775282d3f6063cd517a9ce34c9d00b4a25f0d5a579581a620a2"
+    },
+    {
+      "file": "libggml-cuda.so.0.10.0",
+      "sha256": "29c772312a0b5f9c302471553fd0398d1c189c28d8d98b6954726b7d2130149b"
+    },
+    {
+      "file": "libggml.so.0.10.0",
+      "sha256": "7f4edb9335d6103b0d5c8860db06c910913da5f6df864e295954d781908959d8"
+    },
+    {
+      "file": "libllama.so.0.0.0",
+      "sha256": "d1de0b2aac972c4830aa334de642be69dee62803a7d2c6cfa4e1392a688fe436"
+    },
+    {
+      "file": "liburing.so.2.5",
+      "sha256": "db3cef1cea7d0011476e4270321a77d25f43ff422c347883098005ead0b55655"
+    }
+  ],
+  "verification": {
+    "processes": 12,
+    "pairs": 6,
+    "requests": 12,
+    "full_raw_rows": 48,
+    "comparison": "Six original F / candidate pairs; independent greedy, four full float32 rows and token IDs exact.",
+    "transport": "Positive BATCH1 io_uring and H2D; per-batch CQE validation and terminal zero in-flight reads; normal exit.",
+    "resource_gate": "4 GiB effective memory.max, zero swap, at least 3 GiB machine reserve; scoped lock/STOP/cleanup.",
+    "reference_rows_retained_from": "original F, one request per case",
+    "reference_full_raw_rows": 24,
+    "done_evidence": "The runner DONE event was validated live by the pinned worker before requests_complete=true. Raw DONE event lines were not retained.",
+    "worker_sha256": "f0f942e02e7366157361cbdd09d807e6da12e6a810ec0a0f7af4660091adb31b",
+    "raw_payload_validator_sha256": "97e9c5bb251bde38f751097d74b53471998c17426a40b308dd8e1e91190da6e4",
+    "offline_verifier_scope": "Stored READY, worker completion receipt, one four-row request, argmax/shape/positions and exact raw bytes only; no independent event-order/runtime attestation.",
+    "cross_architecture_golden": false,
+    "GPU_decode_golden": false,
+    "all_prefill_layers_forced_GPU": false,
+    "performance_benchmark": false,
+    "explicit_main_ring_queue_exit": false,
+    "failed_drain_recovery": false,
+    "hot_backend_unload": false,
+    "raw_done_event_retained": false,
+    "offline_event_order_independently_attested": false,
+    "execution_archive_sha256": "17d57162fb6927c7d90bff9f9816d92a5dda914afa9dcd8eb9b669280e6e658e",
+    "admitted_config_sha256": "556c1c73dc64a6d11bdb818d9bc1c0b78108da9b144960e7f6aa828d3ab0054d"
+  },
+  "cases": [
+    {
+      "model": "deepseek41-mxfp4",
+      "source_mode": "pack",
+      "generated_input": "deepseek41-mxfp4.gguf",
+      "model_metadata": {
+        "architecture": "deepseek41",
+        "type": "MXFP4",
+        "seed": 20261022,
+        "experts": 16,
+        "layers": 2,
+        "embedding": 256,
+        "range_count": 96,
+        "dsv_compressed_attention": false
+      },
+      "source_payloads": {
+        "gguf": {
+          "file": "deepseek41-mxfp4.gguf",
+          "bytes": 6807552,
+          "sha256": "bd3cfff70645ffc93391779b14b00075b66aa7de4e8bbf0b019eadbc8fbcc9d9"
+        },
+        "pack": {
+          "file": "deepseek41-mxfp4.pack",
+          "bytes": 3555328,
+          "sha256": "e4614151ed2074d9a79c8a1e0ba547a5bd9082496c4ef69e28a1fe60ad18144c"
+        }
+      },
+      "source_selection": {
+        "environment_key": "GGML_MOE_EXPERT_PACK",
+        "file": "deepseek41-mxfp4.pack"
+      },
+      "settings": {
+        "GGML_KIMI_CPU_SINK": "1",
+        "GGML_KIMI_CPU_SINK_THREADS": "2",
+        "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "0",
+        "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+        "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+        "GGML_KIMI_CPU_SINK_PREFETCH": "0",
+        "GGML_KIMI_CPU_SINK_CACHE_BYTES": "0",
+        "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "0",
+        "GGML_MOE_IO_BACKEND": "iouring",
+        "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+        "GGML_MOE_RAM_TIER_MIB": "0",
+        "GGML_SCHED_MOE_CACHE_SLOTS": "0",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_PROMPT_ONLY": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_BATCH": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_CACHE_BYPASS": "1",
+        "GGML_SCHED_MOE_LOG": "1",
+        "GGML_KIMI_SPLIT_PROFILE": "1",
+        "GGML_MOE_STAGE_PINNED_SLOTS": "4",
+        "GGML_MOE_IO_DEPTH": "4",
+        "GGML_MOE_IO_REFILL_BATCH": "1",
+        "GGML_MOE_IO_SQPOLL": "0",
+        "GGML_MOE_IO_ALIGNED_ALIAS_BATCH": "1",
+        "GGML_MOE_IO_ADJACENT_COALESCE": "0",
+        "GGML_MOE_COMMON_OBJECT_CQE": "1",
+        "GGML_KIMI_CPU_SINK_TRACE": "1"
+      },
+      "selected_ids": [
+        142,
+        213,
+        218,
+        139
+      ],
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 32,
+        "effective_n_ubatch": 32
+      },
+      "rows": [
+        {
+          "step": 0,
+          "position": 31,
+          "batch_tokens": 32,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "f58626c40267472245ecb52a57b1339c1755ed22a07c3fb09a17a7ed6888037a",
+          "selected_id": 142,
+          "file": "deepseek41-mxfp4/pack/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 32,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "57a7f0ffd33ce50f63a34e2235b8cd9f8a6819f3f53872070d2112372882f394",
+          "selected_id": 213,
+          "file": "deepseek41-mxfp4/pack/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 33,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "5bd79fd8948b47dfde967a93da58e7ecde6717c791ccb7b895fc9934a93fb346",
+          "selected_id": 218,
+          "file": "deepseek41-mxfp4/pack/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 34,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "76d6e2e52fc91d540cb546bd59d911fc824ce32b8a2f286111365d67fe34eb9c",
+          "selected_id": 139,
+          "file": "deepseek41-mxfp4/pack/step-3.f32"
+        }
+      ],
+      "recording_receipt_sha256": "0f67bbdbf8671a22c9d6f9d22530b34b86ba506679aaf50a8196ef9a47af71bb",
+      "transport_observation": {
+        "batches": 6,
+        "read_jobs": 39,
+        "all_planned_reads_completed": true
+      }
+    },
+    {
+      "model": "deepseek41-mxfp4",
+      "source_mode": "alias",
+      "generated_input": "deepseek41-mxfp4.gguf",
+      "model_metadata": {
+        "architecture": "deepseek41",
+        "type": "MXFP4",
+        "seed": 20261022,
+        "experts": 16,
+        "layers": 2,
+        "embedding": 256,
+        "range_count": 96,
+        "dsv_compressed_attention": false
+      },
+      "source_payloads": {
+        "gguf": {
+          "file": "deepseek41-mxfp4.gguf",
+          "bytes": 6807552,
+          "sha256": "bd3cfff70645ffc93391779b14b00075b66aa7de4e8bbf0b019eadbc8fbcc9d9"
+        },
+        "pack": {
+          "file": "deepseek41-mxfp4.pack",
+          "bytes": 3555328,
+          "sha256": "e4614151ed2074d9a79c8a1e0ba547a5bd9082496c4ef69e28a1fe60ad18144c"
+        }
+      },
+      "source_selection": {
+        "environment_key": "GGML_MOE_EXPERT_GGUF_ALIAS_TSV",
+        "file": "deepseek41-mxfp4.alias.tsv",
+        "range_count": 96,
+        "normalized_sha256": "baa72a29af2bcfb2f09e91c8681fa976735e3d4f27a669e6023edd4e905519af",
+        "normalization": "Replace only source_path column with its basename; retain header/rows/column text/order, tab separators and LF after every row. Valid only for this one-GGUF fixture."
+      },
+      "settings": {
+        "GGML_KIMI_CPU_SINK": "1",
+        "GGML_KIMI_CPU_SINK_THREADS": "2",
+        "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "0",
+        "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+        "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+        "GGML_KIMI_CPU_SINK_PREFETCH": "0",
+        "GGML_KIMI_CPU_SINK_CACHE_BYTES": "0",
+        "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "0",
+        "GGML_MOE_IO_BACKEND": "iouring",
+        "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+        "GGML_MOE_RAM_TIER_MIB": "0",
+        "GGML_SCHED_MOE_CACHE_SLOTS": "0",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_PROMPT_ONLY": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_BATCH": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_CACHE_BYPASS": "1",
+        "GGML_SCHED_MOE_LOG": "1",
+        "GGML_KIMI_SPLIT_PROFILE": "1",
+        "GGML_MOE_STAGE_PINNED_SLOTS": "4",
+        "GGML_MOE_IO_DEPTH": "4",
+        "GGML_MOE_IO_REFILL_BATCH": "1",
+        "GGML_MOE_IO_SQPOLL": "0",
+        "GGML_MOE_IO_ALIGNED_ALIAS_BATCH": "1",
+        "GGML_MOE_IO_ADJACENT_COALESCE": "0",
+        "GGML_MOE_COMMON_OBJECT_CQE": "1",
+        "GGML_KIMI_CPU_SINK_TRACE": "1"
+      },
+      "selected_ids": [
+        142,
+        213,
+        218,
+        139
+      ],
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 32,
+        "effective_n_ubatch": 32
+      },
+      "rows": [
+        {
+          "step": 0,
+          "position": 31,
+          "batch_tokens": 32,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "f58626c40267472245ecb52a57b1339c1755ed22a07c3fb09a17a7ed6888037a",
+          "selected_id": 142,
+          "file": "deepseek41-mxfp4/alias/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 32,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "57a7f0ffd33ce50f63a34e2235b8cd9f8a6819f3f53872070d2112372882f394",
+          "selected_id": 213,
+          "file": "deepseek41-mxfp4/alias/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 33,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "5bd79fd8948b47dfde967a93da58e7ecde6717c791ccb7b895fc9934a93fb346",
+          "selected_id": 218,
+          "file": "deepseek41-mxfp4/alias/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 34,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "76d6e2e52fc91d540cb546bd59d911fc824ce32b8a2f286111365d67fe34eb9c",
+          "selected_id": 139,
+          "file": "deepseek41-mxfp4/alias/step-3.f32"
+        }
+      ],
+      "recording_receipt_sha256": "4c3741c812792dec0254740b2d2a6b3ec4c15e7d764bd3af0af820d0cd38aa2b",
+      "transport_observation": {
+        "batches": 6,
+        "read_jobs": 39,
+        "all_planned_reads_completed": true
+      }
+    },
+    {
+      "model": "muse-spark-q4_k",
+      "source_mode": "pack",
+      "generated_input": "muse-spark-q4_k.gguf",
+      "model_metadata": {
+        "architecture": "muse-spark",
+        "type": "Q4_K",
+        "seed": 20261022,
+        "experts": 16,
+        "layers": 2,
+        "embedding": 256,
+        "range_count": 96,
+        "dsv_compressed_attention": false
+      },
+      "source_payloads": {
+        "gguf": {
+          "file": "muse-spark-q4_k.gguf",
+          "bytes": 7102464,
+          "sha256": "e749313c15c251efd37a14b9317903cf9b0a848f22bc571e5512d971011a07a3"
+        },
+        "pack": {
+          "file": "muse-spark-q4_k.pack",
+          "bytes": 3555328,
+          "sha256": "c1ebb08932880f804484bf48114cc73d7179c62bd2229069e4959bb8c62e5f4d"
+        }
+      },
+      "source_selection": {
+        "environment_key": "GGML_MOE_EXPERT_PACK",
+        "file": "muse-spark-q4_k.pack"
+      },
+      "settings": {
+        "GGML_KIMI_CPU_SINK": "1",
+        "GGML_KIMI_CPU_SINK_THREADS": "2",
+        "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "0",
+        "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+        "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+        "GGML_KIMI_CPU_SINK_PREFETCH": "0",
+        "GGML_KIMI_CPU_SINK_CACHE_BYTES": "0",
+        "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "0",
+        "GGML_MOE_IO_BACKEND": "iouring",
+        "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+        "GGML_MOE_RAM_TIER_MIB": "0",
+        "GGML_SCHED_MOE_CACHE_SLOTS": "0",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_PROMPT_ONLY": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_BATCH": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_CACHE_BYPASS": "1",
+        "GGML_SCHED_MOE_LOG": "1",
+        "GGML_KIMI_SPLIT_PROFILE": "1",
+        "GGML_MOE_STAGE_PINNED_SLOTS": "4",
+        "GGML_MOE_IO_DEPTH": "4",
+        "GGML_MOE_IO_REFILL_BATCH": "1",
+        "GGML_MOE_IO_SQPOLL": "0",
+        "GGML_MOE_IO_ALIGNED_ALIAS_BATCH": "1",
+        "GGML_MOE_IO_ADJACENT_COALESCE": "0",
+        "GGML_MOE_COMMON_OBJECT_CQE": "1",
+        "GGML_KIMI_CPU_SINK_TRACE": "1"
+      },
+      "selected_ids": [
+        228,
+        246,
+        55,
+        245
+      ],
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 32,
+        "effective_n_ubatch": 32
+      },
+      "rows": [
+        {
+          "step": 0,
+          "position": 31,
+          "batch_tokens": 32,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "bd032a65dfd2129942538cd8ba6f39d5645e29514e28141bf88701943ef67440",
+          "selected_id": 228,
+          "file": "muse-spark-q4_k/pack/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 32,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "5c15da398a42e815a83e3fc5db70e94be35e1f13295675f3e64d1f55ab814f51",
+          "selected_id": 246,
+          "file": "muse-spark-q4_k/pack/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 33,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "2c900f676db7fe3a2801dc2088549de9fa4a8565ee327a37f4a66c6888abb0f3",
+          "selected_id": 55,
+          "file": "muse-spark-q4_k/pack/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 34,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "7e7ecede7285a540756a0344fea1e7ebff6cec71094f3a1959a9e53a701acba6",
+          "selected_id": 245,
+          "file": "muse-spark-q4_k/pack/step-3.f32"
+        }
+      ],
+      "recording_receipt_sha256": "31373bb420add945ccafd664620cbda596b78e0ab1e9afc4b45786b657ba6561",
+      "transport_observation": {
+        "batches": 3,
+        "read_jobs": 15,
+        "all_planned_reads_completed": true
+      }
+    },
+    {
+      "model": "muse-spark-q4_k",
+      "source_mode": "alias",
+      "generated_input": "muse-spark-q4_k.gguf",
+      "model_metadata": {
+        "architecture": "muse-spark",
+        "type": "Q4_K",
+        "seed": 20261022,
+        "experts": 16,
+        "layers": 2,
+        "embedding": 256,
+        "range_count": 96,
+        "dsv_compressed_attention": false
+      },
+      "source_payloads": {
+        "gguf": {
+          "file": "muse-spark-q4_k.gguf",
+          "bytes": 7102464,
+          "sha256": "e749313c15c251efd37a14b9317903cf9b0a848f22bc571e5512d971011a07a3"
+        },
+        "pack": {
+          "file": "muse-spark-q4_k.pack",
+          "bytes": 3555328,
+          "sha256": "c1ebb08932880f804484bf48114cc73d7179c62bd2229069e4959bb8c62e5f4d"
+        }
+      },
+      "source_selection": {
+        "environment_key": "GGML_MOE_EXPERT_GGUF_ALIAS_TSV",
+        "file": "muse-spark-q4_k.alias.tsv",
+        "range_count": 96,
+        "normalized_sha256": "6766971c34b1e8f65261c3d1a076299ebed1596ccce1cae64761df70d12a03b0",
+        "normalization": "Replace only source_path column with its basename; retain header/rows/column text/order, tab separators and LF after every row. Valid only for this one-GGUF fixture."
+      },
+      "settings": {
+        "GGML_KIMI_CPU_SINK": "1",
+        "GGML_KIMI_CPU_SINK_THREADS": "2",
+        "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "0",
+        "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+        "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+        "GGML_KIMI_CPU_SINK_PREFETCH": "0",
+        "GGML_KIMI_CPU_SINK_CACHE_BYTES": "0",
+        "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "0",
+        "GGML_MOE_IO_BACKEND": "iouring",
+        "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+        "GGML_MOE_RAM_TIER_MIB": "0",
+        "GGML_SCHED_MOE_CACHE_SLOTS": "0",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_PROMPT_ONLY": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_BATCH": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_CACHE_BYPASS": "1",
+        "GGML_SCHED_MOE_LOG": "1",
+        "GGML_KIMI_SPLIT_PROFILE": "1",
+        "GGML_MOE_STAGE_PINNED_SLOTS": "4",
+        "GGML_MOE_IO_DEPTH": "4",
+        "GGML_MOE_IO_REFILL_BATCH": "1",
+        "GGML_MOE_IO_SQPOLL": "0",
+        "GGML_MOE_IO_ALIGNED_ALIAS_BATCH": "1",
+        "GGML_MOE_IO_ADJACENT_COALESCE": "0",
+        "GGML_MOE_COMMON_OBJECT_CQE": "1",
+        "GGML_KIMI_CPU_SINK_TRACE": "1"
+      },
+      "selected_ids": [
+        228,
+        246,
+        55,
+        245
+      ],
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 32,
+        "effective_n_ubatch": 32
+      },
+      "rows": [
+        {
+          "step": 0,
+          "position": 31,
+          "batch_tokens": 32,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "bd032a65dfd2129942538cd8ba6f39d5645e29514e28141bf88701943ef67440",
+          "selected_id": 228,
+          "file": "muse-spark-q4_k/alias/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 32,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "5c15da398a42e815a83e3fc5db70e94be35e1f13295675f3e64d1f55ab814f51",
+          "selected_id": 246,
+          "file": "muse-spark-q4_k/alias/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 33,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "2c900f676db7fe3a2801dc2088549de9fa4a8565ee327a37f4a66c6888abb0f3",
+          "selected_id": 55,
+          "file": "muse-spark-q4_k/alias/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 34,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "7e7ecede7285a540756a0344fea1e7ebff6cec71094f3a1959a9e53a701acba6",
+          "selected_id": 245,
+          "file": "muse-spark-q4_k/alias/step-3.f32"
+        }
+      ],
+      "recording_receipt_sha256": "bd1e64583b7d5336d19bc591a4ab86169b0d0c2d06115f7db308fd790064d89b",
+      "transport_observation": {
+        "batches": 3,
+        "read_jobs": 15,
+        "all_planned_reads_completed": true
+      }
+    },
+    {
+      "model": "muse-spark-q5_k",
+      "source_mode": "pack",
+      "generated_input": "muse-spark-q5_k.gguf",
+      "model_metadata": {
+        "architecture": "muse-spark",
+        "type": "Q5_K",
+        "seed": 20261022,
+        "experts": 16,
+        "layers": 2,
+        "embedding": 256,
+        "range_count": 96,
+        "dsv_compressed_attention": false
+      },
+      "source_payloads": {
+        "gguf": {
+          "file": "muse-spark-q5_k.gguf",
+          "bytes": 7888896,
+          "sha256": "eb95c04f7972be265884a01100425cb16cc7ca51aa2b7e708589b99531d76ddb"
+        },
+        "pack": {
+          "file": "muse-spark-q5_k.pack",
+          "bytes": 4341760,
+          "sha256": "085bd690491b35486cb246226de1683817a44d8403546e919787cb4b652b7ee3"
+        }
+      },
+      "source_selection": {
+        "environment_key": "GGML_MOE_EXPERT_PACK",
+        "file": "muse-spark-q5_k.pack"
+      },
+      "settings": {
+        "GGML_KIMI_CPU_SINK": "1",
+        "GGML_KIMI_CPU_SINK_THREADS": "2",
+        "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "0",
+        "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+        "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+        "GGML_KIMI_CPU_SINK_PREFETCH": "0",
+        "GGML_KIMI_CPU_SINK_CACHE_BYTES": "0",
+        "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "0",
+        "GGML_MOE_IO_BACKEND": "iouring",
+        "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+        "GGML_MOE_RAM_TIER_MIB": "0",
+        "GGML_SCHED_MOE_CACHE_SLOTS": "0",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_PROMPT_ONLY": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_BATCH": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_CACHE_BYPASS": "1",
+        "GGML_SCHED_MOE_LOG": "1",
+        "GGML_KIMI_SPLIT_PROFILE": "1",
+        "GGML_MOE_STAGE_PINNED_SLOTS": "4",
+        "GGML_MOE_IO_DEPTH": "4",
+        "GGML_MOE_IO_REFILL_BATCH": "1",
+        "GGML_MOE_IO_SQPOLL": "0",
+        "GGML_MOE_IO_ALIGNED_ALIAS_BATCH": "1",
+        "GGML_MOE_IO_ADJACENT_COALESCE": "0",
+        "GGML_MOE_COMMON_OBJECT_CQE": "1",
+        "GGML_KIMI_CPU_SINK_TRACE": "1"
+      },
+      "selected_ids": [
+        22,
+        203,
+        86,
+        174
+      ],
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 32,
+        "effective_n_ubatch": 32
+      },
+      "rows": [
+        {
+          "step": 0,
+          "position": 31,
+          "batch_tokens": 32,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "e3565ad8911263bd3e93b091b76417a23a762dea65e0cc4b0ead57b948dc6d19",
+          "selected_id": 22,
+          "file": "muse-spark-q5_k/pack/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 32,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "d6e025a005bec625f0d439601567fa1451648ba8b57bea46066504587b2e26ad",
+          "selected_id": 203,
+          "file": "muse-spark-q5_k/pack/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 33,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "7da8b3e74256196f483337f2bfd3100b05bd97eafdb8231c6d9379629ff0279c",
+          "selected_id": 86,
+          "file": "muse-spark-q5_k/pack/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 34,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "e41ffdf5d50c390bf21ebaafe9945196c1519a504303643b05bdd26a45a6b697",
+          "selected_id": 174,
+          "file": "muse-spark-q5_k/pack/step-3.f32"
+        }
+      ],
+      "recording_receipt_sha256": "7683d43c589e1d645342f3acf26156b69ca96817bb9a37b4cf8649e290cbaa78",
+      "transport_observation": {
+        "batches": 3,
+        "read_jobs": 15,
+        "all_planned_reads_completed": true
+      }
+    },
+    {
+      "model": "muse-spark-q5_k",
+      "source_mode": "alias",
+      "generated_input": "muse-spark-q5_k.gguf",
+      "model_metadata": {
+        "architecture": "muse-spark",
+        "type": "Q5_K",
+        "seed": 20261022,
+        "experts": 16,
+        "layers": 2,
+        "embedding": 256,
+        "range_count": 96,
+        "dsv_compressed_attention": false
+      },
+      "source_payloads": {
+        "gguf": {
+          "file": "muse-spark-q5_k.gguf",
+          "bytes": 7888896,
+          "sha256": "eb95c04f7972be265884a01100425cb16cc7ca51aa2b7e708589b99531d76ddb"
+        },
+        "pack": {
+          "file": "muse-spark-q5_k.pack",
+          "bytes": 4341760,
+          "sha256": "085bd690491b35486cb246226de1683817a44d8403546e919787cb4b652b7ee3"
+        }
+      },
+      "source_selection": {
+        "environment_key": "GGML_MOE_EXPERT_GGUF_ALIAS_TSV",
+        "file": "muse-spark-q5_k.alias.tsv",
+        "range_count": 96,
+        "normalized_sha256": "17fa14fb8f5c0a1a1d5355b516f02adda0463155009fea20f1cd796912f7adf9",
+        "normalization": "Replace only source_path column with its basename; retain header/rows/column text/order, tab separators and LF after every row. Valid only for this one-GGUF fixture."
+      },
+      "settings": {
+        "GGML_KIMI_CPU_SINK": "1",
+        "GGML_KIMI_CPU_SINK_THREADS": "2",
+        "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "0",
+        "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+        "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+        "GGML_KIMI_CPU_SINK_PREFETCH": "0",
+        "GGML_KIMI_CPU_SINK_CACHE_BYTES": "0",
+        "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "0",
+        "GGML_MOE_IO_BACKEND": "iouring",
+        "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+        "GGML_MOE_RAM_TIER_MIB": "0",
+        "GGML_SCHED_MOE_CACHE_SLOTS": "0",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_PROMPT_ONLY": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_BATCH": "1",
+        "GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_CACHE_BYPASS": "1",
+        "GGML_SCHED_MOE_LOG": "1",
+        "GGML_KIMI_SPLIT_PROFILE": "1",
+        "GGML_MOE_STAGE_PINNED_SLOTS": "4",
+        "GGML_MOE_IO_DEPTH": "4",
+        "GGML_MOE_IO_REFILL_BATCH": "1",
+        "GGML_MOE_IO_SQPOLL": "0",
+        "GGML_MOE_IO_ALIGNED_ALIAS_BATCH": "1",
+        "GGML_MOE_IO_ADJACENT_COALESCE": "0",
+        "GGML_MOE_COMMON_OBJECT_CQE": "1",
+        "GGML_KIMI_CPU_SINK_TRACE": "1"
+      },
+      "selected_ids": [
+        22,
+        203,
+        86,
+        174
+      ],
+      "ready": {
+        "event": "ready",
+        "n_vocab": 259,
+        "float_bytes": 4,
+        "byte_order": "little",
+        "effective_n_ctx": 256,
+        "effective_n_batch": 32,
+        "effective_n_ubatch": 32
+      },
+      "rows": [
+        {
+          "step": 0,
+          "position": 31,
+          "batch_tokens": 32,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "e3565ad8911263bd3e93b091b76417a23a762dea65e0cc4b0ead57b948dc6d19",
+          "selected_id": 22,
+          "file": "muse-spark-q5_k/alias/step-0.f32"
+        },
+        {
+          "step": 1,
+          "position": 32,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "d6e025a005bec625f0d439601567fa1451648ba8b57bea46066504587b2e26ad",
+          "selected_id": 203,
+          "file": "muse-spark-q5_k/alias/step-1.f32"
+        },
+        {
+          "step": 2,
+          "position": 33,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "7da8b3e74256196f483337f2bfd3100b05bd97eafdb8231c6d9379629ff0279c",
+          "selected_id": 86,
+          "file": "muse-spark-q5_k/alias/step-2.f32"
+        },
+        {
+          "step": 3,
+          "position": 34,
+          "batch_tokens": 1,
+          "n_vocab": 259,
+          "dtype": "IEEE-binary32",
+          "byte_order": "little",
+          "bytes": 1036,
+          "sha256": "e41ffdf5d50c390bf21ebaafe9945196c1519a504303643b05bdd26a45a6b697",
+          "selected_id": 174,
+          "file": "muse-spark-q5_k/alias/step-3.f32"
+        }
+      ],
+      "recording_receipt_sha256": "e9d0c7ea46ef5fe1b686f6dc5f02d4f267d24a314c7dbbe2a939e754a4aa02f2",
+      "transport_observation": {
+        "batches": 3,
+        "read_jobs": 15,
+        "all_planned_reads_completed": true
+      }
+    }
+  ]
+}
