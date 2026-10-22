@@ -80,10 +80,14 @@ def snapshot(machine):
     return state(machine)
 
 
-def observe(case):
+def observe(case, *, full_host_boundary=False):
     tr, instances = CommandTranscript(case), []
     original_path = sys.path[:]
     original_configuration, original_derive = F_SETTINGS.configuration, F_SETTINGS.derive
+    original_host = F_PLACEMENT.default_threads
+
+    def missing_host_file(*args):
+        raise OSError("synthetic host sysfs unavailable")
 
     class Captured(F_MACHINE.Machine):
         def __init__(self, *args, **kwargs):
@@ -113,7 +117,13 @@ def observe(case):
             patch.object(F_MACHINE, "open", tr.open, create=True),
             patch.object(F_MACHINE, "json", SimpleNamespace(load=lambda f: tr.read_json(f.name))),
             patch.object(F_MACHINE, "os", SimpleNamespace(path=SimpleNamespace(exists=tr.exists))),
-            patch.object(F_PLACEMENT, "default_threads", lambda _device: tr.host()),
+            patch.object(
+                F_PLACEMENT,
+                "default_threads",
+                original_host if full_host_boundary else lambda _device: tr.host(),
+            ),
+            patch.object(F_PLACEMENT, "open", missing_host_file, create=True),
+            patch.object(F_PLACEMENT, "os", SimpleNamespace(cpu_count=tr.host)),
             patch.object(F_SETTINGS, "open", tr.open, create=True),
             patch.object(F_SETTINGS, "json", SimpleNamespace(load=lambda f: tr.read_json(f.name))),
             patch.object(
@@ -149,3 +159,11 @@ DATA = json.loads((FIXTURES / "settings-command-goldens.json").read_text())
 @pytest.mark.parametrize("case", DATA["cases"], ids=lambda c: c["name"])
 def test_f_settings_command(case):
     assert observe(case) == case["expected"][runtime_key()]
+
+
+HOST_SUPPLEMENT = json.loads((FIXTURES / "settings-command-host-supplement.json").read_text())
+
+
+def test_f_original_host_boundary():
+    case = next(c for c in DATA["cases"] if c["name"] == "host-needed")
+    assert observe(case, full_host_boundary=True) == HOST_SUPPLEMENT["expected"][runtime_key()]
