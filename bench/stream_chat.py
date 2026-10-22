@@ -2,7 +2,6 @@
 """Measure one short greedy chat through the native server token stream."""
 import argparse
 import hashlib
-import itertools
 import json
 import math
 import signal
@@ -102,7 +101,7 @@ def validate_probability(value, token):
         raise ValueError("expected five valid pre-sampling top probabilities")
     if len({item["id"] for item in top}) != 5:
         raise ValueError("duplicate top probability token IDs")
-    if any(a["logprob"] < b["logprob"] for a, b in itertools.pairwise(top)):
+    if any(a["logprob"] < b["logprob"] for a, b in zip(top, top[1:])):
         raise ValueError("top probabilities are not sorted")
     for item in top:
         if item["id"] == token and item["logprob"] != value["logprob"]:
