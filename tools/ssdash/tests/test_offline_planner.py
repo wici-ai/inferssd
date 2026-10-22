@@ -295,7 +295,6 @@ def observe_candidate(case):
     import argparse
 
     from ssdash.model import machine as candidate
-    from ssdash.plan import settings
     from ssdash.plan.planner import run_plan
     from ssdash.plan.planner_types import PlanArguments
 
@@ -349,55 +348,23 @@ def observe_candidate(case):
                 )
                 outcome = ["return"]
                 if case.get("reload", True):
-                    # Preserve the frozen settings CLI scaffold, replacing its complete
-                    # computation dependencies with the new Machine/settings consumer.
-                    with contextlib.ExitStack() as stack:
-                        stack.enter_context(
-                            patch.dict(
-                                sys.modules,
-                                machine=SimpleNamespace(Machine=Captured),
-                                logparse=SimpleNamespace(ledger=lambda _: None),
-                            )
-                        )
-                        stack.enter_context(
-                            patch.object(F_SETTINGS, "open", transcript.open, create=True)
-                        )
-                        stack.enter_context(
-                            patch.object(
-                                F_SETTINGS,
-                                "json",
-                                SimpleNamespace(load=lambda f: transcript.read_json(f.name)),
-                            )
-                        )
-                        stack.enter_context(
-                            patch.object(
-                                F_SETTINGS,
-                                "os",
-                                SimpleNamespace(
-                                    path=SimpleNamespace(abspath=lambda p: p),
-                                    replace=transcript.replace,
-                                ),
-                            )
-                        )
-                        stack.enter_context(patch.object(F_SETTINGS, "derive", settings.derive))
-                        stack.enter_context(
-                            patch.object(
-                                F_SETTINGS,
-                                "configuration",
-                                lambda m, tier, p: settings.configuration(
-                                    m, tier, p, host_threads=transcript.host
-                                ),
-                            )
-                        )
-                        stack.enter_context(patch.object(F_SETTINGS, "render", settings.render))
-                        stack.enter_context(
-                            patch.object(
-                                sys,
-                                "argv",
-                                ["settings.py", "/case/run", "-o", "/case/settings.env"],
-                            )
-                        )
-                        F_SETTINGS.main()
+                    from ssdash.plan.settings_command import SettingsArguments, run_settings
+
+                    def write_settings(path, text):
+                        with transcript.open(f"{path}.tmp", "w") as stream:
+                            stream.write(text)
+                        transcript.replace(f"{path}.tmp", path)
+
+                    run_settings(
+                        SettingsArguments("/case/run", out="/case/settings.env"),
+                        SimpleNamespace(read_json=transcript.read_json, exists=transcript.exists),
+                        host_threads=transcript.host,
+                        ledger=lambda _: None,
+                        absolute_path=lambda p: p,
+                        write_text=write_settings,
+                        stdout=sys.stdout.write,
+                        factory=Captured,
+                    )
     except (Exception, SystemExit) as error:
         outcome = [type(error).__name__, str(error)]
     finally:

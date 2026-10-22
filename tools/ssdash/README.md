@@ -267,3 +267,43 @@ message. The exception class and empty-range behavior remain unchanged.
 
 This batch does not migrate the settings CLI's ledger-log parser, the fourteen-key
 engine registry, telemetry, live control, launch execution or Mac auto-planning.
+# Recorded logs and the complete settings command
+
+`ssdash settings RUN -o settings.env` now completes the offline path after
+`ssdash plan`. It loads recorded artifacts and the saved plan, then derives the
+existing ordered values and receipts. `--tier`, `--cpus`, `--prompts`, `--decode`
+and `--ledgers DIR ...` retain the legacy command's behavior. A split placement
+without recorded thread facts needs `--host-threads`; the fallback is requested
+only when needed and never probes the reviewing host. With no `-o`, the command
+writes to stdout.
+
+The output deliberately remains **legacy `settings.env` format**, including its
+historical `tools/adaptive/settings.py` first-comment label. That label identifies
+the retained format, not the executable that ran. This command does not write
+the future versioned `settings.ssd` or implement the fourteen-key engine registry.
+It preserves the temporary-file write followed by replacement; a failed write,
+close or replacement can leave `OUT.tmp`, as in the original command.
+
+`ssdash.telemetry.legacy` and `ssdash.telemetry.recorded` read old recorded arms.
+They preserve request/run grouping, mutable result aliases, exact window rules,
+missing fields and exception behavior. The file adapter prefers readable gzip
+logs; corrupt gzip is an error, not a request to try the plain file. Server text
+uses replacement decoding while client JSONL and metadata remain strict. An
+already-fed parser bypasses server-log reads but still rereads client/metadata.
+The standalone ledger reader intentionally requires a record at the line start;
+the full parser retains its different prefix-stripping behavior.
+
+These are **temporary compatibility readers for legacy records**, not the
+planned versioned engine JSONL telemetry API. That API/schema, registry, online
+controller lifecycle, calibration command, launcher and production-entry switch
+remain separate work. No legacy entry point is changed here. Parser construction
+and package imports perform no file, host or process operations.
+
+Tests first freeze original F on synthetic log inputs, then compare complete
+state, aliases, calls, reads, failures and settings bytes under Python 3.9 and
+3.12. The toy log inputs are not represented as logs emitted by a tested engine.
+The full candidate plan/reload/settings chain uses the new command without the
+old settings CLI scaffold. A separate F-only host supplement retains the original
+recorded-value lookup before injecting host fallback; the first observations
+remain unchanged. Future Python versions are not inferred equivalent from these
+two tested runtimes.

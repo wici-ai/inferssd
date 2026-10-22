@@ -167,3 +167,83 @@ HOST_SUPPLEMENT = json.loads((FIXTURES / "settings-command-host-supplement.json"
 def test_f_original_host_boundary():
     case = next(c for c in DATA["cases"] if c["name"] == "host-needed")
     assert observe(case, full_host_boundary=True) == HOST_SUPPLEMENT["expected"][runtime_key()]
+
+
+def observe_candidate(case):
+    import argparse
+
+    from test_log_records import candidate_api
+
+    from ssdash.model.machine import Machine
+    from ssdash.plan import settings, settings_command
+
+    tr, instances = CommandTranscript(case), []
+    original_configuration = settings_command.configuration
+    original_derive = settings_command.derive
+
+    class Captured(Machine):
+        def __init__(self, *args, **kwargs):
+            instances.append(self)
+            super().__init__(*args, **kwargs)
+
+    def configuration(*args, **kwargs):
+        tr.calls.append(["configuration", *args[1:]])
+        result = original_configuration(*args, **kwargs)
+        tr.calls.append(["configuration_return", exact(result)])
+        return result
+
+    def derive(*args):
+        tr.calls.append(["derive", args[1]])
+        result = original_derive(*args)
+        tr.calls.append(["derive_return", exact(result)])
+        return result
+
+    def write_text(path, text):
+        with tr.open(f"{path}.tmp", "w") as stream:
+            stream.write(text)
+        tr.replace(f"{path}.tmp", path)
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tier", type=int)
+    ap.add_argument("--cpus")
+    ap.add_argument("--prompts")
+    ap.add_argument("--decode", type=int)
+    ap.add_argument("--ledgers", nargs="*", default=[])
+    ap.add_argument("-o", "--out")
+    args = ap.parse_args(case["argv"])
+    try:
+        with (
+            candidate_api(tr.logs) as logs,
+            patch.object(settings_command, "configuration", configuration),
+            patch.object(settings_command, "derive", derive),
+            patch.object(settings, "configuration", configuration),
+            patch.object(settings, "derive", derive),
+        ):
+            settings_command.run_settings(
+                settings_command.SettingsArguments("/case/run", **vars(args)),
+                SimpleNamespace(read_json=tr.read_json, exists=tr.exists),
+                host_threads=tr.host,
+                ledger=logs.ledger,
+                absolute_path=lambda p: p,
+                write_text=write_text,
+                stdout=tr.stdout,
+                factory=Captured,
+            )
+        outcome = ["return"]
+    except Exception as error:
+        outcome = [type(error).__name__, str(error)]
+    return {
+        "outcome": outcome,
+        "events": tr.events,
+        "calls": tr.calls,
+        "reads": tr.reads,
+        "writes": tr.writes,
+        "stdout": tr.output.getvalue(),
+        "machines": [snapshot(m) if hasattr(m, "_replays") else exact(vars(m)) for m in instances],
+    }
+
+
+@pytest.mark.parametrize("case", DATA["cases"], ids=lambda c: c["name"])
+def test_candidate_settings_command(case):
+    expected = HOST_SUPPLEMENT["expected"] if case["name"] == "host-needed" else case["expected"]
+    assert observe_candidate(case) == expected[runtime_key()]

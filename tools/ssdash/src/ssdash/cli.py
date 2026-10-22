@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -12,8 +14,11 @@ from ssdash.contracts import DeviceProfile
 from ssdash.plan.planner import run_plan
 from ssdash.plan.planner_types import PlanArguments
 from ssdash.plan.recorded import DirectoryArtifacts, explicit_host_threads, write_json
+from ssdash.plan.settings_command import SettingsArguments, run_settings
+from ssdash.plan.settings_recorded import write_settings
 from ssdash.probe.device_profile import aggregate
 from ssdash.probe.recorded import load_reports
+from ssdash.telemetry.recorded import ledger
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -37,7 +42,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--host-threads", type=int, help="explicit fallback for a recorded split placement"
     )
     plan.add_argument("-o", "--out", required=True)
+    settings = commands.add_parser(
+        "settings", help="derive legacy settings.env from recorded artifacts only"
+    )
+    settings.add_argument("run")
+    settings.add_argument("--tier", type=int)
+    settings.add_argument("--cpus")
+    settings.add_argument("--prompts")
+    settings.add_argument("--decode", type=int)
+    settings.add_argument("--ledgers", nargs="*", default=[])
+    settings.add_argument("-o", "--out")
+    settings.add_argument(
+        "--host-threads", type=int, help="explicit fallback for a recorded split placement"
+    )
     args = parser.parse_args(argv)
+    if args.command == "settings":
+        run_settings(
+            SettingsArguments(
+                args.run, args.tier, args.cpus, args.prompts, args.decode, args.ledgers, args.out
+            ),
+            DirectoryArtifacts(Path(args.run)),
+            host_threads=explicit_host_threads(args.host_threads),
+            ledger=ledger,
+            absolute_path=os.path.abspath,
+            write_text=write_settings,
+            stdout=sys.stdout.write,
+        )
+        return 0
     if args.command == "plan":
         run_plan(
             PlanArguments(
