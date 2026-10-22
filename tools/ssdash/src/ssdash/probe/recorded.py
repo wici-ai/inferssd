@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Callable, Optional
 
-from ssdash.probe.device_profile import ExpertMetadata, Reports
+from ssdash.probe.device_profile import ExpertMetadata, Reports, read_report
 
 
 def load_reports(
@@ -21,7 +21,7 @@ def load_reports(
     def optional(path: Path) -> Optional[str]:
         try:
             return read_text(path)
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             return None
 
     def if_present(path: Path) -> Optional[str]:
@@ -39,8 +39,13 @@ def load_reports(
     reads = []
     for line in files.splitlines() if files is not None else []:
         index, _ = line.split(maxsplit=1)
-        for prefix in ("reads", "fio"):
-            name = f"{prefix}-file{index}.json"
+        name = f"reads-file{index}.json"
+        primary = optional(directory / name)
+        reads.append((name, primary))
+        # The original `read_report(reads) or read_report(fio)` never reads a
+        # fallback after a truthy primary, including a zero-bandwidth record.
+        if not read_report(primary):
+            name = f"fio-file{index}.json"
             reads.append((name, optional(directory / name)))
     return Reports(
         read_text(directory / "cpus.txt"),

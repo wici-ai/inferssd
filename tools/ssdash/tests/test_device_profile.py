@@ -24,7 +24,11 @@ def materialize(case, root):
     experts.mkdir()
     for name, text in case["probe_files"].items():
         (probe / name).write_text(text)
+    for name, value in case.get("probe_binary_hex", {}).items():
+        (probe / name).write_bytes(bytes.fromhex(value))
     (experts / "experts.json").write_text(json.dumps(case["experts"]))
+    if "experts_binary_hex" in case:
+        (experts / "experts.json").write_bytes(bytes.fromhex(case["experts_binary_hex"]))
     return probe, experts
 
 
@@ -56,6 +60,7 @@ def test_extracted_profile_matches_f_or_declared_boundary(case, tmp_path):
             "ValueError": ValueError,
             "IndexError": IndexError,
             "TypeError": TypeError,
+            "UnicodeDecodeError": UnicodeDecodeError,
             "ContractError": ContractError,
         }
         with pytest.raises(errors[case["new_error"]]):
@@ -189,3 +194,40 @@ def test_cli_rejects_unknown_schema_without_a_traceback(tmp_path):
     assert run.returncode == 2
     assert "unsupported device schema" in run.stderr
     assert "Traceback" not in run.stderr
+
+
+def test_numeric_overflow_is_a_contract_error_and_cli_diagnostic(tmp_path):
+    data = json.loads(CASES[0]["legacy"]["stdout"])
+    data["cpus"]["0"]["capacity"] = 10**1000
+    with pytest.raises(ContractError, match="finite numeric range"):
+        DeviceProfile.from_mapping(data)
+    path = tmp_path / "device.json"
+    path.write_text(json.dumps(data))
+    run = subprocess.run(
+        [sys.executable, "-m", "ssdash", "validate", "--device", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run.returncode == 2
+    assert "finite numeric range" in run.stderr
+    assert "Traceback" not in run.stderr
+
+
+def test_valid_primary_never_reads_fallback():
+    case = CASES[0]
+    records = {Path("reports") / key: value for key, value in case["probe_files"].items()}
+    records[Path("experts/experts.json")] = json.dumps(case["experts"])
+
+    def read(path):
+        if path.name in ("fio-file0.json", "fio-file1.json"):
+            raise AssertionError("valid primary must short-circuit fallback reads")
+        if path not in records:
+            raise FileNotFoundError(path)
+        return records[path]
+
+    def find(directory, pattern):
+        return [path for path in records if path.parent == directory and path.match(pattern)]
+
+    result = aggregate(*load_reports(Path("reports"), Path("experts"), read_text=read, find=find))
+    assert result.to_json() == case["legacy"]["stdout"]

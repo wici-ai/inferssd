@@ -308,6 +308,245 @@
         "error": null
       },
       "probe_dir_name": "qd8"
+    },
+    {
+      "name": "valid_primary_ignores_invalid_fallback",
+      "probe_files": {
+        "cpus.txt": "0 1024 4700000\n2 512 3300000\n",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "integrated=0 gpu_read_bw=427.25 pinned=6.91 pageable=3.25\n",
+        "coresets.txt": "all 0,2\nsplit 2\n",
+        "reads-qd2-a.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 1073741824, \"lat_ns\": {\"mean\": 2000000.0}}}]}",
+        "reads-qd2-b.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 3221225472, \"lat_ns\": {\"mean\": 4000000.0}}}]}",
+        "reads-qd1.json": "probe banner\n{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648, \"lat_ns\": {\"mean\": 1000000.0}}}]}",
+        "fio-qd4.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648, \"lat_ns\": {\"mean\": 7000000.0}}}]}",
+        "reads-qd3.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 0, \"lat_ns\": {\"mean\": 0}}}]}",
+        "reads-qd9.json": "broken",
+        "files.txt": "0 /fixture/a.gguf\n1 /fixture/b.gguf\n2 /fixture/c.gguf\n",
+        "reads-file0.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 0}}]}",
+        "reads-file1.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 1073741824}}]}",
+        "fio-file2.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648}}]}",
+        "lanes.txt": "[kimi_vram_group_fit] lane=cpu source=host fixed_us=-2 per_route_us=-1 at150_us=9 load=idle format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_copy] idle_gbps=8 busy_gbps=0\n[kimi_vram_group_fit] lane=gpu source=device fixed_us=3 per_route_us=0.25 at150_us=40.5 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_fit] lane=cpu source=host fixed_us=2 per_route_us=0.5 at150_us=77 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_fit] lane=gpu source=host fixed_us=4 per_route_us=0.4 at150_us=64 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_copy] idle_gbps=8 busy_gbps=5\n"
+      },
+      "experts": {
+        "expert_read_bytes": 123456,
+        "bytes_per_role": {
+          "up": 4096,
+          "gate": 8192,
+          "down": 16384
+        }
+      },
+      "legacy": {
+        "returncode": 0,
+        "stdout": "{\n \"schema\": 2,\n \"expert_read_bytes\": 123456,\n \"bytes_per_role\": {\n  \"up\": 4096,\n  \"gate\": 8192,\n  \"down\": 16384\n },\n \"cpus\": {\n  \"0\": {\n   \"capacity\": 1024.0,\n   \"max_khz\": 4700000.0\n  },\n  \"2\": {\n   \"capacity\": 512.0,\n   \"max_khz\": 3300000.0\n  }\n },\n \"mem_gib\": {\n  \"total\": 8.0,\n  \"available\": 4.0\n },\n \"gpu\": {\n  \"integrated\": false,\n  \"read_gbs\": 427.25,\n  \"h2d_pinned_gbs\": 6.91,\n  \"h2d_pageable_gbs\": 3.25\n },\n \"ssd\": {\n  \"1\": {\n   \"gibs\": 2.0,\n   \"lat_ms\": 1.0,\n   \"gibs_runs\": [\n    2.0\n   ]\n  },\n  \"2\": {\n   \"gibs\": 2.0,\n   \"lat_ms\": 3.0,\n   \"gibs_runs\": [\n    1.0,\n    3.0\n   ]\n  },\n  \"4\": {\n   \"gibs\": 2.0,\n   \"lat_ms\": 7.0,\n   \"gibs_runs\": [\n    2.0\n   ]\n  }\n },\n \"ssd_knee_qd\": 1,\n \"expert_files\": {\n  \"/fixture/a.gguf\": 0.0,\n  \"/fixture/b.gguf\": 1.0,\n  \"/fixture/c.gguf\": 2.0\n },\n \"slow_files\": [\n  \"/fixture/a.gguf\"\n ],\n \"coresets\": {\n  \"all\": {\n   \"cpus\": [\n    0,\n    2\n   ]\n  },\n  \"split\": {\n   \"cpus\": [\n    2\n   ]\n  }\n },\n \"lanes\": {\n  \"cpu\": {\n   \"fixed_us\": 2.0,\n   \"per_route_us\": 0.5,\n   \"at150_us\": 77.0,\n   \"load\": \"busy\"\n  },\n  \"format\": \"mxfp4\",\n  \"latent\": 256,\n  \"hidden\": 512,\n  \"threads\": 2,\n  \"copy_gbps\": 5.0,\n  \"gpu\": {\n   \"fixed_us\": 3.0,\n   \"per_route_us\": 0.25,\n   \"at150_us\": 40.5,\n   \"load\": \"busy\"\n  },\n  \"gpu_host\": {\n   \"fixed_us\": 4.0,\n   \"per_route_us\": 0.4,\n   \"at150_us\": 64.0,\n   \"load\": \"busy\"\n  }\n }\n}",
+        "error": null
+      },
+      "probe_binary_hex": {
+        "fio-file0.json": "ff"
+      }
+    },
+    {
+      "name": "invalid_primary_uses_fallback",
+      "probe_files": {
+        "cpus.txt": "0 1024 4700000\n2 512 3300000\n",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "integrated=0 gpu_read_bw=427.25 pinned=6.91 pageable=3.25\n",
+        "coresets.txt": "all 0,2\nsplit 2\n",
+        "reads-qd2-a.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 1073741824, \"lat_ns\": {\"mean\": 2000000.0}}}]}",
+        "reads-qd2-b.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 3221225472, \"lat_ns\": {\"mean\": 4000000.0}}}]}",
+        "reads-qd1.json": "probe banner\n{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648, \"lat_ns\": {\"mean\": 1000000.0}}}]}",
+        "fio-qd4.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648, \"lat_ns\": {\"mean\": 7000000.0}}}]}",
+        "reads-qd3.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 0, \"lat_ns\": {\"mean\": 0}}}]}",
+        "reads-qd9.json": "broken",
+        "files.txt": "0 /fixture/a.gguf\n1 /fixture/b.gguf\n2 /fixture/c.gguf\n",
+        "reads-file0.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 0}}]}",
+        "reads-file1.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 1073741824}}]}",
+        "fio-file2.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648}}]}",
+        "lanes.txt": "[kimi_vram_group_fit] lane=cpu source=host fixed_us=-2 per_route_us=-1 at150_us=9 load=idle format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_copy] idle_gbps=8 busy_gbps=0\n[kimi_vram_group_fit] lane=gpu source=device fixed_us=3 per_route_us=0.25 at150_us=40.5 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_fit] lane=cpu source=host fixed_us=2 per_route_us=0.5 at150_us=77 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_fit] lane=gpu source=host fixed_us=4 per_route_us=0.4 at150_us=64 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_copy] idle_gbps=8 busy_gbps=5\n",
+        "fio-file0.json": "{\"jobs\":[{\"read\":{\"bw_bytes\":1073741824}}]}"
+      },
+      "experts": {
+        "expert_read_bytes": 123456,
+        "bytes_per_role": {
+          "up": 4096,
+          "gate": 8192,
+          "down": 16384
+        }
+      },
+      "legacy": {
+        "returncode": 0,
+        "stdout": "{\n \"schema\": 2,\n \"expert_read_bytes\": 123456,\n \"bytes_per_role\": {\n  \"up\": 4096,\n  \"gate\": 8192,\n  \"down\": 16384\n },\n \"cpus\": {\n  \"0\": {\n   \"capacity\": 1024.0,\n   \"max_khz\": 4700000.0\n  },\n  \"2\": {\n   \"capacity\": 512.0,\n   \"max_khz\": 3300000.0\n  }\n },\n \"mem_gib\": {\n  \"total\": 8.0,\n  \"available\": 4.0\n },\n \"gpu\": {\n  \"integrated\": false,\n  \"read_gbs\": 427.25,\n  \"h2d_pinned_gbs\": 6.91,\n  \"h2d_pageable_gbs\": 3.25\n },\n \"ssd\": {\n  \"1\": {\n   \"gibs\": 2.0,\n   \"lat_ms\": 1.0,\n   \"gibs_runs\": [\n    2.0\n   ]\n  },\n  \"2\": {\n   \"gibs\": 2.0,\n   \"lat_ms\": 3.0,\n   \"gibs_runs\": [\n    1.0,\n    3.0\n   ]\n  },\n  \"4\": {\n   \"gibs\": 2.0,\n   \"lat_ms\": 7.0,\n   \"gibs_runs\": [\n    2.0\n   ]\n  }\n },\n \"ssd_knee_qd\": 1,\n \"expert_files\": {\n  \"/fixture/a.gguf\": 1.0,\n  \"/fixture/b.gguf\": 1.0,\n  \"/fixture/c.gguf\": 2.0\n },\n \"slow_files\": [],\n \"coresets\": {\n  \"all\": {\n   \"cpus\": [\n    0,\n    2\n   ]\n  },\n  \"split\": {\n   \"cpus\": [\n    2\n   ]\n  }\n },\n \"lanes\": {\n  \"cpu\": {\n   \"fixed_us\": 2.0,\n   \"per_route_us\": 0.5,\n   \"at150_us\": 77.0,\n   \"load\": \"busy\"\n  },\n  \"format\": \"mxfp4\",\n  \"latent\": 256,\n  \"hidden\": 512,\n  \"threads\": 2,\n  \"copy_gbps\": 5.0,\n  \"gpu\": {\n   \"fixed_us\": 3.0,\n   \"per_route_us\": 0.25,\n   \"at150_us\": 40.5,\n   \"load\": \"busy\"\n  },\n  \"gpu_host\": {\n   \"fixed_us\": 4.0,\n   \"per_route_us\": 0.4,\n   \"at150_us\": 64.0,\n   \"load\": \"busy\"\n  }\n }\n}",
+        "error": null
+      },
+      "probe_binary_hex": {
+        "reads-file0.json": "ff"
+      }
+    },
+    {
+      "name": "invalid_queue_report_skipped",
+      "probe_files": {
+        "cpus.txt": "0 1024 4700000\n2 512 3300000\n",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "integrated=0 gpu_read_bw=427.25 pinned=6.91 pageable=3.25\n",
+        "coresets.txt": "all 0,2\nsplit 2\n",
+        "reads-qd2-a.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 1073741824, \"lat_ns\": {\"mean\": 2000000.0}}}]}",
+        "reads-qd2-b.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 3221225472, \"lat_ns\": {\"mean\": 4000000.0}}}]}",
+        "reads-qd1.json": "probe banner\n{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648, \"lat_ns\": {\"mean\": 1000000.0}}}]}",
+        "fio-qd4.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648, \"lat_ns\": {\"mean\": 7000000.0}}}]}",
+        "reads-qd3.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 0, \"lat_ns\": {\"mean\": 0}}}]}",
+        "reads-qd9.json": "broken",
+        "files.txt": "0 /fixture/a.gguf\n1 /fixture/b.gguf\n2 /fixture/c.gguf\n",
+        "reads-file0.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 0}}]}",
+        "reads-file1.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 1073741824}}]}",
+        "fio-file2.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648}}]}",
+        "lanes.txt": "[kimi_vram_group_fit] lane=cpu source=host fixed_us=-2 per_route_us=-1 at150_us=9 load=idle format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_copy] idle_gbps=8 busy_gbps=0\n[kimi_vram_group_fit] lane=gpu source=device fixed_us=3 per_route_us=0.25 at150_us=40.5 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_fit] lane=cpu source=host fixed_us=2 per_route_us=0.5 at150_us=77 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_fit] lane=gpu source=host fixed_us=4 per_route_us=0.4 at150_us=64 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_copy] idle_gbps=8 busy_gbps=5\n"
+      },
+      "experts": {
+        "expert_read_bytes": 123456,
+        "bytes_per_role": {
+          "up": 4096,
+          "gate": 8192,
+          "down": 16384
+        }
+      },
+      "legacy": {
+        "returncode": 0,
+        "stdout": "{\n \"schema\": 2,\n \"expert_read_bytes\": 123456,\n \"bytes_per_role\": {\n  \"up\": 4096,\n  \"gate\": 8192,\n  \"down\": 16384\n },\n \"cpus\": {\n  \"0\": {\n   \"capacity\": 1024.0,\n   \"max_khz\": 4700000.0\n  },\n  \"2\": {\n   \"capacity\": 512.0,\n   \"max_khz\": 3300000.0\n  }\n },\n \"mem_gib\": {\n  \"total\": 8.0,\n  \"available\": 4.0\n },\n \"gpu\": {\n  \"integrated\": false,\n  \"read_gbs\": 427.25,\n  \"h2d_pinned_gbs\": 6.91,\n  \"h2d_pageable_gbs\": 3.25\n },\n \"ssd\": {\n  \"2\": {\n   \"gibs\": 2.0,\n   \"lat_ms\": 3.0,\n   \"gibs_runs\": [\n    1.0,\n    3.0\n   ]\n  },\n  \"4\": {\n   \"gibs\": 2.0,\n   \"lat_ms\": 7.0,\n   \"gibs_runs\": [\n    2.0\n   ]\n  }\n },\n \"ssd_knee_qd\": 2,\n \"expert_files\": {\n  \"/fixture/a.gguf\": 0.0,\n  \"/fixture/b.gguf\": 1.0,\n  \"/fixture/c.gguf\": 2.0\n },\n \"slow_files\": [\n  \"/fixture/a.gguf\"\n ],\n \"coresets\": {\n  \"all\": {\n   \"cpus\": [\n    0,\n    2\n   ]\n  },\n  \"split\": {\n   \"cpus\": [\n    2\n   ]\n  }\n },\n \"lanes\": {\n  \"cpu\": {\n   \"fixed_us\": 2.0,\n   \"per_route_us\": 0.5,\n   \"at150_us\": 77.0,\n   \"load\": \"busy\"\n  },\n  \"format\": \"mxfp4\",\n  \"latent\": 256,\n  \"hidden\": 512,\n  \"threads\": 2,\n  \"copy_gbps\": 5.0,\n  \"gpu\": {\n   \"fixed_us\": 3.0,\n   \"per_route_us\": 0.25,\n   \"at150_us\": 40.5,\n   \"load\": \"busy\"\n  },\n  \"gpu_host\": {\n   \"fixed_us\": 4.0,\n   \"per_route_us\": 0.4,\n   \"at150_us\": 64.0,\n   \"load\": \"busy\"\n  }\n }\n}",
+        "error": null
+      },
+      "probe_binary_hex": {
+        "reads-qd1.json": "ff"
+      }
+    },
+    {
+      "name": "invalid_used_fallback_skipped",
+      "probe_files": {
+        "cpus.txt": "0 1024 4700000\n2 512 3300000\n",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "integrated=0 gpu_read_bw=427.25 pinned=6.91 pageable=3.25\n",
+        "coresets.txt": "all 0,2\nsplit 2\n",
+        "reads-qd2-a.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 1073741824, \"lat_ns\": {\"mean\": 2000000.0}}}]}",
+        "reads-qd2-b.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 3221225472, \"lat_ns\": {\"mean\": 4000000.0}}}]}",
+        "reads-qd1.json": "probe banner\n{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648, \"lat_ns\": {\"mean\": 1000000.0}}}]}",
+        "fio-qd4.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648, \"lat_ns\": {\"mean\": 7000000.0}}}]}",
+        "reads-qd3.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 0, \"lat_ns\": {\"mean\": 0}}}]}",
+        "reads-qd9.json": "broken",
+        "files.txt": "0 /fixture/a.gguf\n1 /fixture/b.gguf\n2 /fixture/c.gguf\n",
+        "reads-file0.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 0}}]}",
+        "reads-file1.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 1073741824}}]}",
+        "fio-file2.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648}}]}",
+        "lanes.txt": "[kimi_vram_group_fit] lane=cpu source=host fixed_us=-2 per_route_us=-1 at150_us=9 load=idle format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_copy] idle_gbps=8 busy_gbps=0\n[kimi_vram_group_fit] lane=gpu source=device fixed_us=3 per_route_us=0.25 at150_us=40.5 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_fit] lane=cpu source=host fixed_us=2 per_route_us=0.5 at150_us=77 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_fit] lane=gpu source=host fixed_us=4 per_route_us=0.4 at150_us=64 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_copy] idle_gbps=8 busy_gbps=5\n"
+      },
+      "experts": {
+        "expert_read_bytes": 123456,
+        "bytes_per_role": {
+          "up": 4096,
+          "gate": 8192,
+          "down": 16384
+        }
+      },
+      "legacy": {
+        "returncode": 0,
+        "stdout": "{\n \"schema\": 2,\n \"expert_read_bytes\": 123456,\n \"bytes_per_role\": {\n  \"up\": 4096,\n  \"gate\": 8192,\n  \"down\": 16384\n },\n \"cpus\": {\n  \"0\": {\n   \"capacity\": 1024.0,\n   \"max_khz\": 4700000.0\n  },\n  \"2\": {\n   \"capacity\": 512.0,\n   \"max_khz\": 3300000.0\n  }\n },\n \"mem_gib\": {\n  \"total\": 8.0,\n  \"available\": 4.0\n },\n \"gpu\": {\n  \"integrated\": false,\n  \"read_gbs\": 427.25,\n  \"h2d_pinned_gbs\": 6.91,\n  \"h2d_pageable_gbs\": 3.25\n },\n \"ssd\": {\n  \"1\": {\n   \"gibs\": 2.0,\n   \"lat_ms\": 1.0,\n   \"gibs_runs\": [\n    2.0\n   ]\n  },\n  \"2\": {\n   \"gibs\": 2.0,\n   \"lat_ms\": 3.0,\n   \"gibs_runs\": [\n    1.0,\n    3.0\n   ]\n  },\n  \"4\": {\n   \"gibs\": 2.0,\n   \"lat_ms\": 7.0,\n   \"gibs_runs\": [\n    2.0\n   ]\n  }\n },\n \"ssd_knee_qd\": 1,\n \"expert_files\": {\n  \"/fixture/a.gguf\": 0.0,\n  \"/fixture/b.gguf\": 1.0\n },\n \"slow_files\": [\n  \"/fixture/a.gguf\"\n ],\n \"coresets\": {\n  \"all\": {\n   \"cpus\": [\n    0,\n    2\n   ]\n  },\n  \"split\": {\n   \"cpus\": [\n    2\n   ]\n  }\n },\n \"lanes\": {\n  \"cpu\": {\n   \"fixed_us\": 2.0,\n   \"per_route_us\": 0.5,\n   \"at150_us\": 77.0,\n   \"load\": \"busy\"\n  },\n  \"format\": \"mxfp4\",\n  \"latent\": 256,\n  \"hidden\": 512,\n  \"threads\": 2,\n  \"copy_gbps\": 5.0,\n  \"gpu\": {\n   \"fixed_us\": 3.0,\n   \"per_route_us\": 0.25,\n   \"at150_us\": 40.5,\n   \"load\": \"busy\"\n  },\n  \"gpu_host\": {\n   \"fixed_us\": 4.0,\n   \"per_route_us\": 0.4,\n   \"at150_us\": 64.0,\n   \"load\": \"busy\"\n  }\n }\n}",
+        "error": null
+      },
+      "probe_binary_hex": {
+        "fio-file2.json": "ff"
+      }
+    },
+    {
+      "name": "invalid_files_list_fails",
+      "probe_files": {
+        "cpus.txt": "0 1024 4700000\n2 512 3300000\n",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "integrated=0 gpu_read_bw=427.25 pinned=6.91 pageable=3.25\n",
+        "coresets.txt": "all 0,2\nsplit 2\n",
+        "reads-qd2-a.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 1073741824, \"lat_ns\": {\"mean\": 2000000.0}}}]}",
+        "reads-qd2-b.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 3221225472, \"lat_ns\": {\"mean\": 4000000.0}}}]}",
+        "reads-qd1.json": "probe banner\n{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648, \"lat_ns\": {\"mean\": 1000000.0}}}]}",
+        "fio-qd4.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648, \"lat_ns\": {\"mean\": 7000000.0}}}]}",
+        "reads-qd3.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 0, \"lat_ns\": {\"mean\": 0}}}]}",
+        "reads-qd9.json": "broken",
+        "files.txt": "0 /fixture/a.gguf\n1 /fixture/b.gguf\n2 /fixture/c.gguf\n",
+        "reads-file0.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 0}}]}",
+        "reads-file1.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 1073741824}}]}",
+        "fio-file2.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648}}]}",
+        "lanes.txt": "[kimi_vram_group_fit] lane=cpu source=host fixed_us=-2 per_route_us=-1 at150_us=9 load=idle format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_copy] idle_gbps=8 busy_gbps=0\n[kimi_vram_group_fit] lane=gpu source=device fixed_us=3 per_route_us=0.25 at150_us=40.5 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_fit] lane=cpu source=host fixed_us=2 per_route_us=0.5 at150_us=77 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_fit] lane=gpu source=host fixed_us=4 per_route_us=0.4 at150_us=64 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_copy] idle_gbps=8 busy_gbps=5\n"
+      },
+      "experts": {
+        "expert_read_bytes": 123456,
+        "bytes_per_role": {
+          "up": 4096,
+          "gate": 8192,
+          "down": 16384
+        }
+      },
+      "legacy": {
+        "returncode": 1,
+        "stdout": "",
+        "error": "UnicodeDecodeError"
+      },
+      "probe_binary_hex": {
+        "files.txt": "ff"
+      },
+      "new_error": "UnicodeDecodeError"
+    },
+    {
+      "name": "invalid_lane_report_fails",
+      "probe_files": {
+        "cpus.txt": "0 1024 4700000\n2 512 3300000\n",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "integrated=0 gpu_read_bw=427.25 pinned=6.91 pageable=3.25\n",
+        "coresets.txt": "all 0,2\nsplit 2\n",
+        "reads-qd2-a.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 1073741824, \"lat_ns\": {\"mean\": 2000000.0}}}]}",
+        "reads-qd2-b.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 3221225472, \"lat_ns\": {\"mean\": 4000000.0}}}]}",
+        "reads-qd1.json": "probe banner\n{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648, \"lat_ns\": {\"mean\": 1000000.0}}}]}",
+        "fio-qd4.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648, \"lat_ns\": {\"mean\": 7000000.0}}}]}",
+        "reads-qd3.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 0, \"lat_ns\": {\"mean\": 0}}}]}",
+        "reads-qd9.json": "broken",
+        "files.txt": "0 /fixture/a.gguf\n1 /fixture/b.gguf\n2 /fixture/c.gguf\n",
+        "reads-file0.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 0}}]}",
+        "reads-file1.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 1073741824}}]}",
+        "fio-file2.json": "{\"jobs\": [{\"read\": {\"bw_bytes\": 2147483648}}]}",
+        "lanes.txt": "[kimi_vram_group_fit] lane=cpu source=host fixed_us=-2 per_route_us=-1 at150_us=9 load=idle format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_copy] idle_gbps=8 busy_gbps=0\n[kimi_vram_group_fit] lane=gpu source=device fixed_us=3 per_route_us=0.25 at150_us=40.5 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_fit] lane=cpu source=host fixed_us=2 per_route_us=0.5 at150_us=77 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_fit] lane=gpu source=host fixed_us=4 per_route_us=0.4 at150_us=64 load=busy format=mxfp4 latent=256 hidden=512 threads=2\n[kimi_vram_group_copy] idle_gbps=8 busy_gbps=5\n"
+      },
+      "experts": {
+        "expert_read_bytes": 123456,
+        "bytes_per_role": {
+          "up": 4096,
+          "gate": 8192,
+          "down": 16384
+        }
+      },
+      "legacy": {
+        "returncode": 1,
+        "stdout": "",
+        "error": "UnicodeDecodeError"
+      },
+      "probe_binary_hex": {
+        "lanes.txt": "ff"
+      },
+      "new_error": "UnicodeDecodeError"
+    },
+    {
+      "name": "invalid_expert_metadata_encoding_fails",
+      "probe_files": {
+        "cpus.txt": "",
+        "meminfo.txt": "MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n",
+        "memprobe.txt": "timing unavailable\n",
+        "coresets.txt": ""
+      },
+      "experts": {
+        "expert_read_bytes": 0,
+        "bytes_per_role": {}
+      },
+      "legacy": {
+        "returncode": 1,
+        "stdout": "",
+        "error": "UnicodeDecodeError"
+      },
+      "experts_binary_hex": "ff",
+      "new_error": "UnicodeDecodeError"
     }
   ]
 }

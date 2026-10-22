@@ -22,7 +22,11 @@ def mapping(value: object, field: str) -> Mapping[str, object]:
 def numeric(value: object, field: str) -> Union[int, float]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ContractError(f"{field} must be a number")
-    if not math.isfinite(value):
+    try:
+        finite = math.isfinite(value)
+    except OverflowError as error:
+        raise ContractError(f"{field} exceeds the finite numeric range") from error
+    if not finite:
         raise ContractError(f"{field} must be finite")
     return value
 
