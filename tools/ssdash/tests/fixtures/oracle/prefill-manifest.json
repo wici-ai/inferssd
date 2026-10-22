@@ -9,6 +9,11 @@
     "cut:266-271",
     "served:341-357",
     "offloaded:360-363",
-    "cold_share:366-369"
+    "cold_share:366-369",
+    "coverage:222-241",
+    "pass_seconds:244-263",
+    "seconds:274-284",
+    "break_even:287-338",
+    "threshold:372-397"
   ]
 }
