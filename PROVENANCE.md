@@ -57,7 +57,8 @@ parser, preserves the Linux streaming paths, and adds portable cache validation.
 The historical benchmark documents describe that original branch, not a measured
 performance claim for this SSDash revision. The newer GGUF alias reader and I/O
 pipeline are separate work and require their own model validation. The original
-Mac integration is reviewed in [PR #4](https://github.com/wici-ai/ssdash/pull/4).
+Mac integration is reviewed in [PR #10](https://github.com/wici-ai/ssdash/pull/10),
+which supersedes the earlier PR #4.
 
 The GGUF alias source, bounded read-ahead, aligned reads and prefill cache isolation
 originate in optimization commits `301cf6f`, `0824683`, `b513c8a` and `c7f76a2`.

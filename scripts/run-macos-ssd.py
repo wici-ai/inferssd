@@ -98,13 +98,13 @@ def main(argv=None):
         template = REPO / "models/templates" / PROFILES[args.model][1]
         if not template.is_file():
             raise ValueError(f"Missing model chat template: {template}")
-        # Conservative reference defaults. Device-tested recommendations can
-        # override these existing controls without changing the GGUF source.
+        # Bound cache capacity conservatively. The read policy overlaps only
+        # selected experts and keeps prefill misses out of the decode cache.
         settings = {
             "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": integer_env("SSD_LLAMA_MAC_EXPERT_CACHE_MIB", 4096, 0, MAX_CACHE_MIB),
-            "SSD_LLAMA_MAC_EXPERT_READ_AHEAD": integer_env("SSD_LLAMA_MAC_EXPERT_READ_AHEAD", 0, 0, 4),
-            "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": integer_env("SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT", 1, 1, 16384),
-            "SSD_LLAMA_MAC_EXPERT_PREFILL": integer_env("SSD_LLAMA_MAC_EXPERT_PREFILL", 0, 0, 1),
+            "SSD_LLAMA_MAC_EXPERT_READ_AHEAD": integer_env("SSD_LLAMA_MAC_EXPERT_READ_AHEAD", 2, 0, 4),
+            "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": integer_env("SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT", 4096, 1, 16384),
+            "SSD_LLAMA_MAC_EXPERT_PREFILL": integer_env("SSD_LLAMA_MAC_EXPERT_PREFILL", 1, 0, 1),
         }
         if settings["SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT"] not in ("1", "4096", "16384"):
             raise ValueError("SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT must be 1, 4096 or 16384")

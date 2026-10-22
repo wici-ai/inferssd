@@ -48,9 +48,16 @@ Existing controls remain available during integration:
 | `SSD_LLAMA_THREADS` / `SSD_LLAMA_PREFILL_THREADS` | Decode / prefill CPU threads |
 | `SSD_LLAMA_CTX` / `SSD_LLAMA_BATCH` / `SSD_LLAMA_UBATCH` | Context capacity / batch / microbatch |
 
-Defaults are being qualified on the integrated build. Device-specific cache and
-thread recommendations require the matching measurement report; they should not
-be inferred from total RAM alone. A 4096 MiB cache is 4 GiB, not 4 GB.
+The launcher defaults to a 4096 MiB LFU cache, two outstanding selected-expert
+reads, 4096-byte read alignment, and direct prefill reads. Prefill can reuse cache
+hits, while its misses use temporary buffers without changing decode cache heat
+or evicting cached experts. The staging limit is 64 MiB per operator batch.
+Explicit values still override these defaults, including zero read-ahead or the
+reference prefill path for comparisons.
+
+Device-specific cache and thread recommendations require the matching measurement
+report; they should not be inferred from total RAM alone. A 4096 MiB cache is
+4 GiB, not 4 GB. Target-device qualification of this integrated revision is ongoing.
 
 Generated indexes live under `~/Library/Caches/ssdash/mac-alias`, or under
 `$XDG_CACHE_HOME/ssdash/mac-alias` when set. The launcher owns the alias selection
