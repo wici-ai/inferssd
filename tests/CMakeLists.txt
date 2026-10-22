@@ -225,6 +225,8 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_include_directories(test-kimi-cpu-sink PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../vendor)
     target_link_libraries(test-kimi-cpu-sink PRIVATE ggml-cpu ggml-base Threads::Threads)
     add_test(NAME kimi_cpu_sink COMMAND test-kimi-cpu-sink)
+    add_test(NAME kimi_cpu_sink_expert_first_call COMMAND test-kimi-cpu-sink --expert-job-first-call)
+    set_tests_properties(kimi_cpu_sink_expert_first_call PROPERTIES LABELS device TIMEOUT 60 SKIP_RETURN_CODE 77)
     add_test(NAME dsv41_q2_cpu_sink_decode COMMAND test-kimi-cpu-sink
         --q2-activation-test --threads 9 --ring-experts 8)
     add_executable(test-kimi-cpu-cache-policy test-kimi-cpu-cache-policy.cpp)

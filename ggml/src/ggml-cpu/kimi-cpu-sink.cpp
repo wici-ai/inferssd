@@ -3137,6 +3137,7 @@ struct kimi_cpu_sink {
         {
             std::lock_guard<std::mutex> lock(compute_mutex);
             compute_expert = true;
+            active_threads = compute_threads;
             begin_dynamic_phase(false);
             expert_up_pending.store(compute_threads - 1, std::memory_order_relaxed);
             expert_down_pending.store(compute_threads - 1, std::memory_order_relaxed);
