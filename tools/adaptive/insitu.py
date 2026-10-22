@@ -255,7 +255,7 @@ for name, m in placements.items():
     print(f"  memory at load: {m['memory']}; checkpoints after the batch at multiples of {m['checkpoint_align']}; "
           f"host-memory ledger {m['ledger']}")
     load = m.get('cache_load')
-    print(f"  RAM cache at load: " + (f"{int(load['slots'])} slots, {load['committed_bytes'] / 1e9:.2f} GB paged in in "
+    print("  RAM cache at load: " + (f"{int(load['slots'])} slots, {load['committed_bytes'] / 1e9:.2f} GB paged in in "
           f"{load['us'] / 1e6:.2f} s" if load else 'none (at its first decode token)')
           + "; decode committed {} GB of new slots (first touches) in tokens 1-128 and {} GB after".format(
               *(m.get('cache_new_slot_gb') or [None, None]))

@@ -47,8 +47,10 @@ jobs:
       - name: Install test dependencies
         run: |
           python3 -m venv .venv
-          .venv/bin/python -m pip install pytest==9.1.1
+          .venv/bin/python -m pip install pytest==9.1.1 ruff==0.17.1
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+      - name: Framework lint
+        run: ruff check tools/adaptive
       - name: Framework tests
         run: python3 -m pytest -q tools/adaptive/tests
       - name: Launcher tests

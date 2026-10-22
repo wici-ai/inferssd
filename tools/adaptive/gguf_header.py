@@ -9,7 +9,6 @@ usage: gguf_header.py FILE [--tensors]   -> the metadata of FILE (one line per k
 """
 import glob
 import mmap
-import os
 import re
 import struct
 import sys

@@ -49,8 +49,8 @@ def resolve(n, force=False):
             return u[0]
     url = f"{endpoint}/{REPO}/resolve/{REV}/{name(n)}"
     try:
-        r = opener_noredir.open(urllib.request.Request(url, method="HEAD"), timeout=30)
-        loc = url
+        with opener_noredir.open(urllib.request.Request(url, method="HEAD"), timeout=30):
+            loc = url
     except urllib.error.HTTPError as e:
         if e.code in (301, 302, 303, 307, 308):
             loc = e.headers["Location"]
@@ -126,7 +126,7 @@ def worker():
                 if off != hi + 1:
                     raise IOError(f"short {off - lo} of {hi + 1 - lo}")
                 break
-            except Exception as e:
+            except Exception:
                 time.sleep(min(30, 1 + attempt))
         else:
             print(f"[fail] {name(n)} chunk {c}", flush=True)
