@@ -358,3 +358,61 @@ def test_calibration_source_identity():
         hashlib.sha256(ORACLE.read_bytes()).hexdigest()
         == "6b79f8a068b5228e56ae408327fb6787b13900ea5d6d92b58d60f98a13d021ee"
     )
+
+
+def observe_candidate(case):
+    import argparse
+
+    from ssdash.model.observed_calibration import measure
+    from ssdash.probe import calibrate
+    from ssdash.telemetry.recorded import read_arm
+
+    tr, ns = CalibrationTranscript(case), {}
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run", action="append", required=True)
+    parser.add_argument("--skip", type=int, default=128)
+    parser.add_argument("--profile", required=True)
+    parser.add_argument("-o", "--out", required=True)
+    parser.add_argument("--graph")
+    parser.add_argument("--ubatch-probe")
+    parsed = parser.parse_args(argv(case))
+    a = calibrate.CalibrationArguments(**vars(parsed))
+    old_trace = sys.gettrace()
+
+    def trace(frame, event, arg):
+        if event == "return" and frame.f_code == measure.__code__ and arg is not None:
+            tr.measured.append(arg)
+        if event == "return" and frame.f_code == calibrate.run_calibration.__code__:
+            ns.update(frame.f_locals)
+        return trace
+
+    try:
+        with (
+            patch.object(
+                calibrate, "json", SimpleNamespace(load=json.load, dumps=json.dumps, dump=tr.dump)
+            ),
+            patch.object(sys, "stdout", SimpleNamespace(write=tr.stdout)),
+        ):
+            sys.settrace(trace)
+            calibrate.run_calibration(
+                a,
+                read_arm=lambda r, s: tr.arm(lambda r, s: read_arm(r, s, files=tr.logs), r, s),
+                open_file=tr.open,
+                emit=print,
+            )
+        outcome = ["return"]
+    except Exception as error:
+        outcome = [type(error).__name__, str(error)]
+    finally:
+        sys.settrace(old_trace)
+    result = tr.result(ns, outcome)
+    if case.get("chain") and outcome == ["return"]:
+        from test_offline_planner import observe_candidate as plan_observer
+
+        result["chain"] = plan_observer(chain_case(case, result["writes"]))
+    return result
+
+
+@pytest.mark.parametrize("case", data()["cases"], ids=lambda c: c["name"])
+def test_candidate_complete_calibration(case):
+    assert observe_candidate(case) == case["expected"][runtime_key()]

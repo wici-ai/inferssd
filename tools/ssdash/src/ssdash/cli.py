@@ -16,9 +16,10 @@ from ssdash.plan.planner_types import PlanArguments
 from ssdash.plan.recorded import DirectoryArtifacts, explicit_host_threads, write_json
 from ssdash.plan.settings_command import SettingsArguments, run_settings
 from ssdash.plan.settings_recorded import write_settings
+from ssdash.probe.calibrate import CalibrationArguments, run_calibration
 from ssdash.probe.device_profile import aggregate
 from ssdash.probe.recorded import load_reports
-from ssdash.telemetry.recorded import ledger
+from ssdash.telemetry.recorded import ledger, read_arm
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -55,7 +56,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     settings.add_argument(
         "--host-threads", type=int, help="explicit fallback for a recorded split placement"
     )
+    fit = commands.add_parser("fit", help="calibrate from recorded run logs only (no bootstrap)")
+    fit.add_argument("--run", action="append", required=True, help="NAME=DIR; first is reference")
+    fit.add_argument("--skip", type=int, default=128)
+    fit.add_argument("--graph")
+    fit.add_argument("--ubatch-probe")
+    fit.add_argument("--profile", required=True)
+    fit.add_argument("-o", "--out", required=True)
     args = parser.parse_args(argv)
+    if args.command == "fit":
+        run_calibration(
+            CalibrationArguments(
+                args.run, args.skip, args.profile, args.out, args.graph, args.ubatch_probe
+            ),
+            read_arm=read_arm,
+            open_file=open,
+            emit=print,
+        )
+        return 0
     if args.command == "settings":
         run_settings(
             SettingsArguments(
