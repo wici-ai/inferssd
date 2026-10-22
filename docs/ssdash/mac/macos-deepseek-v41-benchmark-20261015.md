@@ -1,6 +1,9 @@
+> Historical engineering log from the pre-SSDash Mac branch. These results
+> have not been revalidated on the current SSDash integration.
+
 # DeepSeek-V4.1-Flash on a 48 GiB MacBook Pro — 2026-10-15
 
-This report combines the completed 32, 128, 512, 1024, and 2048-token runs. The 1024/2048 runs were added after the earlier short-prompt comparison; the three short cases were **not rerun**. The tables in the [root README](../README.md#apple-silicon-deepseek-v41-flash) are rendered from the saved [short](../benchmarks/macos-deepseek-v41-20261015/summary-short.json) and [long](../benchmarks/macos-deepseek-v41-20261015/summary-long.json) result summaries by [render.py](../benchmarks/macos-deepseek-v41-20261015/render.py).
+This report combines the completed 32, 128, 512, 1024, and 2048-token runs. The 1024/2048 runs were added after the earlier short-prompt comparison; the three short cases were **not rerun**. Historical tables can be rendered from the saved [short](../../../benchmarks/macos-deepseek-v41-20261015/summary-short.json) and [long](../../../benchmarks/macos-deepseek-v41-20261015/summary-long.json) result summaries by [render.py](../../../benchmarks/macos-deepseek-v41-20261015/render.py).
 
 ## Setup and interpretation
 

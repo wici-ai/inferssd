@@ -2,9 +2,9 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-model_dir="$HOME/Documents/ssd-llama-mac/model/DeepSeek-V4.1-Flash-Q8_0"
-model_file="${SSD_LLAMA_MODEL:-$model_dir/DeepSeek-V4.1-Flash-Q8_0-00001-of-00010.gguf}"
-export SSD_LLAMA_MAC_EXPERT_PACK="${SSD_LLAMA_MAC_EXPERT_PACK:-$model_dir/DeepSeek-V4.1-Flash-Q8_0-MXFP4.expert-pack}"
+model_file="${SSD_LLAMA_MODEL:?Set SSD_LLAMA_MODEL to the first GGUF shard}"
+export SSD_LLAMA_MAC_EXPERT_PACK="${SSD_LLAMA_MAC_EXPERT_PACK:?Set SSD_LLAMA_MAC_EXPERT_PACK to the matching expert pack}"
+build_dir="${SSD_LLAMA_BUILD_DIR:-$repo_dir/build-mac}"
 
 if [[ "$(uname -s)" != Darwin || "$(uname -m)" != arm64 ]]; then
     echo "This expert-pack profile requires an Apple Silicon Mac." >&2
@@ -15,7 +15,7 @@ if (( $(sysctl -n hw.memsize) >= 48 * 1024 * 1024 * 1024 )); then
     default_cache_mib=10240
 fi
 export SSD_LLAMA_MAC_EXPERT_CACHE_MIB="${SSD_LLAMA_MAC_EXPERT_CACHE_MIB:-$default_cache_mib}"
-for file in "$model_file" "$SSD_LLAMA_MAC_EXPERT_PACK" "$repo_dir/build-mac-pack/bin/llama-server"; do
+for file in "$model_file" "$SSD_LLAMA_MAC_EXPERT_PACK" "$build_dir/bin/llama-server"; do
     if [[ ! -f "$file" ]]; then
         echo "Missing required file: $file" >&2
         exit 1
@@ -30,7 +30,7 @@ fi
 export LLAMA_MMAP_PREFETCH=0
 export LLAMA_DSV41_TOPK_REUSE=0
 
-exec "$repo_dir/build-mac-pack/bin/llama-server" \
+exec "$build_dir/bin/llama-server" \
     -m "$model_file" --mmap --no-repack --fit off --no-warmup \
     -ngl 99 --cpu-moe --no-op-offload \
     -ot 'blk\.[0-9]+\.engram_embd\.weight=CPU' \

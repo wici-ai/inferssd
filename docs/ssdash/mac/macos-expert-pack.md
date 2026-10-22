@@ -1,3 +1,6 @@
+> Historical engineering log from the pre-SSDash Mac branch. These results
+> have not been revalidated on the current SSDash integration.
+
 # DeepSeek V4.1 expert-pack path on Apple Silicon
 
 This is an opt-in path. The existing `run-deepseek-v41-macos.sh` and `build-mac`
@@ -40,13 +43,10 @@ reads, not independently measured physical SSD traffic.
 
 ## Build and launch
 
-Build in the independent source worktree, using a separate build directory:
+Build both launcher modes into the same configurable build directory:
 
 ```sh
-cmake -S . -B build-mac-pack -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_CUDA=OFF -DGGML_METAL=ON -DGGML_ACCELERATE=ON \
-  -DGGML_OPENMP=OFF -DLLAMA_BUILD_TESTS=ON
-cmake --build build-mac-pack --target llama-server test-backend-ops -j 8
+./scripts/build-macos-metal.sh
 ```
 
 The pack builder requires the Python GGUF reader dependencies. Generate the
@@ -60,9 +60,9 @@ python3 create-moe-expert-pack.py --inspect \
   -o /path/to/DeepSeek-V4.1-Flash-Q8_0-MXFP4.expert-pack
 ```
 
-Set `SSD_LLAMA_MAC_EXPERT_PACK` if the pack is elsewhere, then launch
+Set both required variables, `SSD_LLAMA_MODEL` and `SSD_LLAMA_MAC_EXPERT_PACK`, then launch
 `./scripts/run-deepseek-v41-macos-pack.sh`. This script deliberately uses
-`build-mac-pack`, port 18089 and the same CPU/Metal placement as the baseline.
+`build-mac` (or `SSD_LLAMA_BUILD_DIR`), port 18089 and the same CPU/Metal placement as the baseline.
 
 This first port reuses the Linux pack format and adds an explicit Mac cache.
 It does **not** yet include Linux's `io_uring` multi-request pipeline, GPU

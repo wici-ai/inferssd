@@ -1,6 +1,6 @@
 #include "mac-expert-pack-cache.h"
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(GGML_MAC_EXPERT_CACHE_TESTING)
 
 #include <algorithm>
 #include <cerrno>
@@ -108,7 +108,8 @@ public:
             if (std::memcmp(header.magic, "GGMLMOEPACKv1\0\0\0", 16) != 0 ||
                     header.version != 1 || header.header_size != sizeof(header) ||
                     header.entry_count == 0 || header.entry_count > max_entries ||
-                    header.data_start > file_bytes || header.data_start % alignment != 0 ||
+                    header.data_start < sizeof(header) || header.data_start > file_bytes ||
+                    header.data_start % alignment != 0 ||
                     header.entry_count > (header.data_start - sizeof(header)) / sizeof(pack_entry)) {
                 throw std::runtime_error("invalid v1 expert-pack header");
             }
@@ -129,9 +130,11 @@ public:
                 }
                 tensor_names.insert(std::string(entry.name));
             }
+#if defined(__APPLE__)
             if (fcntl(fd, F_NOCACHE, 1) == -1) {
                 throw std::runtime_error("F_NOCACHE failed: " + std::string(std::strerror(errno)));
             }
+#endif
             const char * budget_env = std::getenv("SSD_LLAMA_MAC_EXPERT_CACHE_MIB");
             char * end = nullptr;
             errno = 0;

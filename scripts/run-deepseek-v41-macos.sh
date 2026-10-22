@@ -2,7 +2,8 @@
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-model_file="${SSD_LLAMA_MODEL:-$HOME/Documents/ssd-llama-mac/model/DeepSeek-V4.1-Flash-Q8_0/DeepSeek-V4.1-Flash-Q8_0-00001-of-00010.gguf}"
+model_file="${SSD_LLAMA_MODEL:?Set SSD_LLAMA_MODEL to the first GGUF shard}"
+build_dir="${SSD_LLAMA_BUILD_DIR:-$repo_dir/build-mac}"
 mode="${1:-chat}"
 if [[ $# -gt 0 ]]; then shift; fi
 
@@ -31,10 +32,10 @@ args=(
 
 case "$mode" in
     chat)
-        exec "$repo_dir/build-mac/bin/llama-cli" "${args[@]}" -n 128 "$@"
+        exec "$build_dir/bin/llama-cli" "${args[@]}" -n 128 "$@"
         ;;
     server)
-        exec "$repo_dir/build-mac/bin/llama-server" "${args[@]}" \
+        exec "$build_dir/bin/llama-server" "${args[@]}" \
             --host 127.0.0.1 --port "${SSD_LLAMA_PORT:-8080}" -np 1 "$@"
         ;;
     *)
