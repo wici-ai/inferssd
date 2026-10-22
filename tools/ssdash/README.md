@@ -179,3 +179,41 @@ This completes extraction of the pure functions from the old prefill module.
 Artifact loading and frozen schema contracts, engine telemetry, settings
 derivation, planner/controller integration and production callers remain separate
 work. No device is queried by these modules.
+
+
+## Complete settings generation
+
+`ssdash.plan.settings` now contains the complete configuration/derivation/receipt
+core from the frozen framework. It consumes a `MachineView` supplied by the caller
+and returns ordered `Setting` tuples. `configuration` and `derive` compose with
+`env` and `render`; field types, order, pending comments, receipts, formatting and
+the final newline preserve the original behavior. This still emits the original
+environment keys. The fourteen-key engine registry and a new settings file schema
+remain separate work.
+
+`ssdash.plan.placement` formats the existing `all`, `split`, `pin` and `@ubatch`
+choices. `configuration(..., host_threads=provider)` and placement `env` require
+an explicit zero-argument host fallback. It is called only for an otherwise valid
+split placement whose recorded `default_threads` is absent or falsey. Explicit
+recorded threads, pin/all and unsupported split layouts do not call it. The
+package does not inspect `/sys` or query the current host's CPU count. An I/O
+adapter can supply that original fallback, or an offline caller can return its
+captured value. A provider returning `None` or raising preserves the original
+failure path; values are not normalized or eagerly queried.
+
+`settings_types` describes existing input mappings and the Machine replay method.
+These are typing views without runtime validation or copies. Replay may retain
+cache state; its call order and partial state on failure remain observable.
+The `Setting` type retains tuple fields, positional construction, the default
+`pending=False`, `_replace` and immutability. The existing versioned device
+contract in `ssdash.contracts` is unchanged.
+
+The frozen settings tests cover 97 complete and boundary cases, including discrete
+and unified memory, calibrated/probe/missing costs, known/forecast workloads,
+pending iterators, checkpoint/headroom receipts, prefetch rank costs and lazy host
+fallbacks. They compare the full output and mutation/call/exception observations
+with original F on Python 3.9 and 3.12. Five cases have different resident-set
+iteration order between those runtimes; both original transcripts are retained,
+and their final settings/env/render outputs agree. Tests do not infer the frozen
+transcript of another Python version. No production CLI, launcher, artifact
+loader or online controller is switched by this extraction.
