@@ -33,7 +33,7 @@ jobs:
         run: python3 scripts/public-scan.py --skip upstream --ref "$PROPOSED_REF"
       - name: Shell and Python syntax
         run: |
-          shellcheck scripts/check-import.sh scripts/upstream-snapshot.sh
+          shellcheck scripts/check-import.sh scripts/upstream-snapshot.sh bench/device/gate.sh
           python3 -m py_compile scripts/public-scan.py
       - name: Install pinned secret scanner
         run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
@@ -53,9 +53,11 @@ jobs:
           .venv/bin/python -m pip install pytest==9.1.1 ruff==0.17.1
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Framework lint
-        run: ruff check tools/adaptive
+        run: |
+          ruff check tools/adaptive
+          ruff check --isolated --select F bench
       - name: Framework tests
-        run: python3 -m pytest -q tools/adaptive/tests
+        run: python3 -m pytest -q tools/adaptive/tests bench/tests
       - name: Launcher tests
         shell: bash
         run: |
