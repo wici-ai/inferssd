@@ -76,6 +76,16 @@ pack. It checks malformed headers and index entries, LFU retention/eviction and
 pinning while another expert is acquired. Linux uses the same reader/cache code
 without the Apple-only `F_NOCACHE` call. A malformed zero `data_start` is rejected
 before unsigned index-geometry arithmetic. ASan/UBSan are useful for this test.
+Four concurrent callers also exercise two decode and two prefill batches with a
+1 MiB cache, keeping three 1 MiB slices pinned until reverse-order release.
+
+`test-mac-expert-source` and its Python fixture runner cover pack and multi-shard
+GGUF alias sources, unaligned and exact-EOF slices, synchronous and asynchronous
+short reads, pinned entries, prefill cache isolation and staging backpressure.
+The large-budget fixture sets a 24 GiB limit but allocates only small selected
+slices. Run it with `python3 tests/test-mac-expert-source.py build-mac/bin/test-mac-expert-source`.
+It is model-free and supports ASan/UBSan and TSan builds. Launcher and metadata
+validation tests run with `python3 -m pytest -q tests/test-macos-launcher.py`.
 
 The Mac CI build enables Metal, runs that portable cache test, exercises Muse
 rendering with `test-chat --template muse-spark`, and checks the Q4_K/Q5_K/Q8_0

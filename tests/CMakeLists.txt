@@ -803,4 +803,11 @@ if (UNIX)
     target_link_libraries(test-mac-expert-pack-cache PRIVATE Threads::Threads)
     add_test(NAME mac_expert_pack_cache COMMAND test-mac-expert-pack-cache)
     set_tests_properties(mac_expert_pack_cache PROPERTIES LABELS unit)
+
+    add_executable(test-mac-expert-source test-mac-expert-source.cpp
+        ../ggml/src/ggml-cpu/mac-expert-pack-cache.cpp)
+    target_compile_features(test-mac-expert-source PRIVATE cxx_std_17)
+    target_compile_definitions(test-mac-expert-source PRIVATE GGML_MAC_EXPERT_CACHE_TESTING)
+    target_include_directories(test-mac-expert-source PRIVATE ../ggml/src/ggml-cpu)
+    target_link_libraries(test-mac-expert-source PRIVATE Threads::Threads)
 endif()

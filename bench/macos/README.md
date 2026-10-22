@@ -15,7 +15,11 @@ a production default requires numerical, memory and end-to-end validation.
 `GGML_MOE_EXPERT_GGUF_ALIAS_TSV` selects the same index format as the Linux reader.
 The index is generated from GGUF metadata with `scripts/kimi-build-gguf-expert-alias-tsv.py`.
 It is mutually exclusive with `SSD_LLAMA_MAC_EXPERT_PACK`. GGUF slices can be unaligned
-and end exactly at EOF; the reader requests only their logical bytes.
+and end exactly at EOF. Alignment 1 reads only the logical bytes. Alignment 4096
+or 16384 includes surrounding bytes within the same source file, stops at EOF and
+returns the original logical subrange to the operator. Cache accounting includes
+the whole allocation. The 64 MiB staging bound applies per operator batch; callers
+running multiple contexts must include each batch in their memory budget.
 
 Counters are cumulative. `read_call_ms` sums individual pread service times across
 workers and is not elapsed I/O time or a device bandwidth denominator. `read_wait_ms`
@@ -26,9 +30,11 @@ allocation counters are nested diagnostics and must not all be added as disjoint
 request phases. Physical bytes divided by the corresponding phase wall time give
 observed device throughput. Memory sampling records RSS, compression and swap.
 
-With `--trace`, three files are written on normal shutdown: the legacy request list,
+With `--trace`, four files are written on normal shutdown: the legacy request list,
 `.requests.tsv` with demand timestamps and hit flags, and `.reads.tsv` with actual
-source extents, read timestamps and call durations. They allow exact per-request
+source extents, read timestamps and call durations, and `.phases.tsv` with cumulative
+phase counters. These optional traces accumulate in memory until shutdown, so use
+short requests when collecting them. They allow exact per-request
 miss-byte accounting and bounded replay of real misses without duplicating weights.
 
 The source test uses small synthetic files, including multiple sources, unaligned

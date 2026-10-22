@@ -70,6 +70,9 @@ def build_rows(model_paths: list[Path], include_kinds: set[str], n_experts: int,
     total_bytes = 0
 
     for shard_index, model_path in enumerate(model_paths):
+        resolved_path = model_path.resolve()
+        if any(char in str(resolved_path) for char in "\t\r\n"):
+            raise RuntimeError("expert source path cannot contain tabs or newlines")
         reader = GGUFReader(str(model_path))
         for tensor in reader.tensors:
             match = EXPERT_RE.match(tensor.name)
@@ -86,10 +89,8 @@ def build_rows(model_paths: list[Path], include_kinds: set[str], n_experts: int,
             shape = tuple(int(value) for value in tensor.shape)
             if len(shape) != 3 or shape[2] != n_experts:
                 raise RuntimeError(f"{tensor.name}: expected 3D tensor with {n_experts} experts, got {shape}")
-            if any(char in str(model_path) for char in "\t\r\n"):
-                raise RuntimeError("expert source path cannot contain tabs or newlines")
             tensor_bytes = int(tensor.n_bytes)
-            if tensor_bytes % n_experts != 0:
+            if tensor_bytes <= 0 or tensor_bytes % n_experts != 0:
                 raise RuntimeError(f"{tensor.name}: {tensor_bytes} bytes not divisible by n_experts={n_experts}")
             expert_bytes = tensor_bytes // n_experts
             tensor_type = tensor_type_name(tensor)
@@ -107,7 +108,7 @@ def build_rows(model_paths: list[Path], include_kinds: set[str], n_experts: int,
                     "tensor": tensor.name,
                     "expert_idx": expert_idx,
                     "nbytes": expert_bytes,
-                    "source_path": str(model_path.resolve()),
+                    "source_path": str(resolved_path),
                     "offset": offset,
                     "kind": kind,
                     "layer": int(match.group("layer")),
@@ -121,6 +122,8 @@ def build_rows(model_paths: list[Path], include_kinds: set[str], n_experts: int,
                 bucket["bytes"] += tensor_bytes
             total_bytes += tensor_bytes
 
+    if not rows:
+        raise RuntimeError("no expert tensors matched the requested kinds")
     rows.sort(key=lambda r: (str(r["tensor"]), int(r["expert_idx"]), int(r["nbytes"])))
     summary = {
         "model_paths": [str(p) for p in model_paths],
