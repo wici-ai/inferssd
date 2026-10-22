@@ -1,5 +1,5 @@
 #pragma once
-// Compatibility catalog for the private shared-owner experiment. Entry storage
+// Shared catalog for the CPU sink and CUDA transport. Entry storage
 // is frozen after initialization. CUDA alone mutates its existing mmap fields.
 #include <cstdint>
 #include <cstdio>

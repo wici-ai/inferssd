@@ -63,8 +63,9 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
 
-# Private C0 feasibility switch; ordinary builds retain the existing path.
-if (LLAMA_C0_LINKED_STORE_PROTOTYPE)
+# CPU sink and CUDA transport borrow from the same shared owner.
+if (LLAMA_SSD_STORE)
     target_link_libraries(llama PRIVATE ggml-ssd-c0-store)
-    target_compile_definitions(llama PRIVATE LLAMA_C0_LINKED_STORE_PROTOTYPE=1)
+    target_compile_definitions(llama PRIVATE LLAMA_SSD_STORE=1)
+    set_property(TARGET llama APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
 endif()

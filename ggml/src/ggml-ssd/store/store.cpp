@@ -26,12 +26,12 @@ void initialize_cpu(c0::parser_state & destination) {
             "GGML_MOE_GLM52_COLIBRI_PACK", "GGML_MOE_GLM52_COLIBRI_MANIFEST"}) {
         const char * value = std::getenv(name);
         if (value && value[0]) {
-            std::fprintf(stderr, "[c0_store_prototype] unsupported CPU-only source family: %s\n", name);
+            std::fprintf(stderr, "[ssd_store] unsupported CPU-only source family: %s\n", name);
             return;
         }
     }
     if (c0::lossless_requested()) {
-        std::fprintf(stderr, "[c0_store_prototype] unsupported CPU-only source family: active lossless transport\n");
+        std::fprintf(stderr, "[ssd_store] unsupported CPU-only source family: active lossless transport\n");
         return;
     }
     c0::detail::builder builder;
@@ -44,7 +44,7 @@ void initialize_cpu(c0::parser_state & destination) {
     destination.file = destination.sources.empty() ? nullptr : destination.sources[0].file;
     destination.fd_direct = destination.sources.empty() ? -1 : destination.sources[0].fd_direct;
     destination.enabled = true;
-    std::fprintf(stderr, "[c0_store_prototype] directly_linked=1 initialized=1 sources=%zu\n", destination.sources.size());
+    std::fprintf(stderr, "[ssd_store] directly_linked=1 initialized=1 sources=%zu\n", destination.sources.size());
 }
 
 const c0::expert_pack_entry * lookup_cpu(const char * name, int expert, size_t bytes) {
@@ -96,27 +96,31 @@ bool initialize_shared_catalog() {
         }
         try {
             if (retired) {
-                std::fprintf(stderr, "[c0_store_prototype] provider was unloaded before initialization\n");
+                std::fprintf(stderr, "[ssd_store] provider was unloaded before initialization\n");
             } else if (selected) {
                 selected->initialize();
             } else {
-#if defined(GGML_C0_REQUIRE_CUDA_PROVIDER)
-                std::fprintf(stderr, "[c0_store_prototype] CUDA provider is required but not registered\n");
+#if defined(GGML_SSD_REQUIRE_CUDA_PROVIDER)
+                std::fprintf(stderr, "[ssd_store] CUDA provider is required but not registered\n");
 #else
                 initialize_cpu(state.catalog);
 #endif
             }
         } catch (const std::exception & error) {
-            std::fprintf(stderr, "[c0_store_prototype] initialization failed: %s\n", error.what());
+            std::fprintf(stderr, "[ssd_store] initialization failed: %s\n", error.what());
             state.catalog.enabled = false;
         } catch (...) {
-            std::fprintf(stderr, "[c0_store_prototype] initialization failed\n");
+            std::fprintf(stderr, "[ssd_store] initialization failed\n");
             state.catalog.enabled = false;
         }
         // A failed initializer must not expose partially opened/published data.
         if (!state.catalog.enabled) { state.catalog.reset(); }
         state.catalog.inited = true;
         state.published.store(state.catalog.enabled, std::memory_order_release);
+        if (state.catalog.enabled) {
+            std::fprintf(stderr, "[ssd_store] provider=%s sources=%zu entries=%zu published=1\n",
+                    selected ? "cuda" : "portable", state.catalog.sources.size(), state.catalog.entries.size());
+        }
     });
     return catalog_available();
 }
@@ -170,10 +174,10 @@ extern "C" bool ggml_ssd_c0_resolve_raw_direct_shape(
         return false;
 #endif
     } catch (const std::exception & error) {
-        std::fprintf(stderr, "[c0_store_prototype] resolve failed: %s\n", error.what());
+        std::fprintf(stderr, "[ssd_store] resolve failed: %s\n", error.what());
         return false;
     } catch (...) {
-        std::fprintf(stderr, "[c0_store_prototype] resolve failed\n");
+        std::fprintf(stderr, "[ssd_store] resolve failed\n");
         return false;
     }
 }

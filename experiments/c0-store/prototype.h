@@ -1,3 +1,3 @@
 #pragma once
-// Both the extraction oracle and the linked prototype exercise this same index.
+// Production index view; test.cpp separately compiles the frozen legacy oracle.
 #include "../../ggml/src/ggml-ssd/store/legacy-index.h"

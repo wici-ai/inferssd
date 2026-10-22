@@ -147,9 +147,10 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
-    if (LLAMA_C0_LINKED_STORE_PROTOTYPE)
+    if (LLAMA_SSD_STORE)
         target_link_libraries(ggml-cuda PRIVATE ggml-ssd-c0-store)
-        target_compile_definitions(ggml-cuda PRIVATE GGML_C0_SHARED_STORE_PROTOTYPE)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_SSD_STORE)
+        set_property(TARGET ggml-cuda APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
     endif()
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
@@ -159,8 +160,8 @@ if (CUDAToolkit_FOUND)
     endif()
 
     option(GGML_CUDA_MOE_STREAM_BATCH "enable CUDA MoE stream batch path" OFF)
-    if (LLAMA_C0_LINKED_STORE_PROTOTYPE AND (NOT GGML_CUDA_MOE_STREAM OR NOT GGML_CUDA_MOE_STREAM_BATCH))
-        message(FATAL_ERROR "C0 shared store prototype requires GGML_CUDA_MOE_STREAM=ON and GGML_CUDA_MOE_STREAM_BATCH=ON")
+    if (LLAMA_SSD_STORE AND (NOT GGML_CUDA_MOE_STREAM OR NOT GGML_CUDA_MOE_STREAM_BATCH))
+        message(FATAL_ERROR "LLAMA_SSD_STORE requires -DGGML_CUDA_MOE_STREAM=ON and -DGGML_CUDA_MOE_STREAM_BATCH=ON for CUDA builds; no portable fallback is selected")
     endif()
     if (GGML_CUDA_MOE_STREAM)
         target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_MOE_STREAM)

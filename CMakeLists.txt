@@ -173,9 +173,16 @@ license_add_file("llama.cpp" "LICENSE")
 # 3rd-party
 #
 
-option(LLAMA_C0_LINKED_STORE_PROTOTYPE "Link the private shared CPU/CUDA catalog prototype" OFF)
-if (LLAMA_C0_LINKED_STORE_PROTOTYPE AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR LLAMA_USE_SYSTEM_GGML))
-    message(FATAL_ERROR "C0 shared store prototype requires Linux and the bundled ggml")
+set(LLAMA_SSD_STORE_DEFAULT OFF)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(LLAMA_SSD_STORE_DEFAULT ON)
+endif()
+option(LLAMA_SSD_STORE "Link the shared SSD expert store (OFF is legacy comparison only)" ${LLAMA_SSD_STORE_DEFAULT})
+if (DEFINED LLAMA_C0_LINKED_STORE_PROTOTYPE)
+    message(FATAL_ERROR "LLAMA_C0_LINKED_STORE_PROTOTYPE was replaced by LLAMA_SSD_STORE; remove the old cache option")
+endif()
+if (LLAMA_SSD_STORE AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR LLAMA_USE_SYSTEM_GGML OR NOT BUILD_SHARED_LIBS))
+    message(FATAL_ERROR "LLAMA_SSD_STORE requires Linux, bundled ggml and BUILD_SHARED_LIBS=ON; static/system-ggml store builds are unsupported")
 endif()
 
 if (LLAMA_USE_SYSTEM_GGML)

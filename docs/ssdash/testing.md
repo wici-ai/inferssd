@@ -14,6 +14,32 @@ registered only on Linux under `device`, even though it generates its own model.
 a production device acceptance test. GPU and cgroup suites need dedicated launchers
 and explicit resource prerequisites before they can become automated gates.
 
+## Shared expert store
+
+Linux enables `LLAMA_SSD_STORE` by default. The supported configuration uses
+bundled ggml, shared libraries, the CPU backend, and linked backends
+(`GGML_BACKEND_DL=OFF`, `GGML_CPU_ALL_VARIANTS=OFF`). CUDA additionally requires
+`GGML_CUDA_MOE_STREAM=ON` and `GGML_CUDA_MOE_STREAM_BATCH=ON`; a missing provider
+fails configuration. Static, system-ggml and runtime backend-plugin variants
+remain outside this store's supported build boundary. Mac's reader path is
+unchanged. The OFF configuration is retained for explicit legacy comparison,
+not as a runtime fallback.
+
+`test-c0-store` and `test-c0-config` link the actual production store target and
+compare it with the frozen test reference. `test-c0-parser-failures` injects
+allocation and callback failures into the parser to verify handle cleanup.
+Their CTest names `c0-store`, `c0-config` and `c0-parser-failures` carry `unit`
+and run in hosted CPU CI. The cross-DSO/mock-provider, source-open-hook and direct
+I/O fixtures carry `device`; they do not silently join the hosted unit gate.
+The production store CMake target does not read oracle includes or execute
+Python. The fixed reference is copied only in the test configuration.
+
+Successful shared initialization emits one receipt:
+`[ssd_store] provider=cuda|portable sources=N entries=N published=1`.
+Together with loaded-library hashes and direct-file descriptor identity, this
+records which provider populated the single owner. It is not a replacement for
+the finite-RAM same-sink numerical comparison or normal reader-shutdown checks.
+
 ## Known failures retained for investigation
 
 The following 12 inherited cases are disabled and carry the `known-failure` label:

@@ -2,7 +2,7 @@
 #include "moe-adapter-dispatch.h"
 #include "moe-expert-descriptor.h"
 #include "moe-common-device-descriptor.h"
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
 #include "catalog.h"
 #include "parser.h"
 #endif
@@ -794,7 +794,7 @@ struct current_down_overlap_tensor_profile {
 static std::mutex g_current_down_overlap_tensor_profile_mu;
 static std::unordered_map<std::string, current_down_overlap_tensor_profile> g_current_down_overlap_tensor_profile;
 
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
 using expert_pack_entry = c0::expert_pack_entry;
 using expert_pack_source = c0::expert_pack_source;
 #else
@@ -845,7 +845,7 @@ enum class q4_lossless_transport_mode : uint8_t {
 };
 
 struct expert_pack_state {
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
     FILE * & file = c0::shared_catalog().file;
     int & fd_direct = c0::shared_catalog().fd_direct;
     std::vector<expert_pack_source> & sources = c0::shared_catalog().sources;
@@ -861,7 +861,7 @@ struct expert_pack_state {
     std::atomic<uint64_t> mmap_hits{0};
     std::atomic<uint64_t> mmap_misses{0};
     std::atomic<uint64_t> mmap_bytes{0};
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
     bool & inited = c0::shared_catalog().inited;
     bool & enabled = c0::shared_catalog().enabled;
 #else
@@ -1042,7 +1042,7 @@ struct expert_pack_state {
     std::atomic<uint64_t> q4_host_object_read_admit_evictions{0};
     std::atomic<uint64_t> q4_host_object_read_admit_alloc_failures{0};
     bool reported_io_backend = false;
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
     int & io_backend = c0::shared_catalog().io_backend;
 #else
     int io_backend = 0; // 0=buffered, 1=direct, 2=io_uring
@@ -1102,7 +1102,7 @@ struct expert_pack_state {
 static expert_pack_state g_expert_pack;
 
 static bool expert_pack_catalog_ready() {
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
     return c0::catalog_available();
 #else
     return g_expert_pack.enabled;
@@ -1110,7 +1110,7 @@ static bool expert_pack_catalog_ready() {
 }
 
 static size_t expert_pack_published_entry_count() {
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
     if (!c0::catalog_available()) return 0;
 #endif
     return g_expert_pack.entries.size();
@@ -5521,7 +5521,7 @@ static bool expert_pack_read_exact(FILE *file, void *dst, size_t sz) {
     return true;
 }
 
-#if !defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if !defined(GGML_SSD_STORE)
 static std::string expert_pack_key_string(const char *tensor_name, int expert_idx, uint64_t nbytes) {
     std::string key = tensor_name ? tensor_name : "";
     key.push_back('\n');
@@ -5533,7 +5533,7 @@ static std::string expert_pack_key_string(const char *tensor_name, int expert_id
 #endif
 
 static expert_pack_source * expert_pack_source_for_entry(const expert_pack_entry *entry) {
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
     if (!c0::catalog_available()) return nullptr;
 #endif
     if (!entry || entry->source_idx < 0 ||
@@ -5543,7 +5543,7 @@ static expert_pack_source * expert_pack_source_for_entry(const expert_pack_entry
     return &g_expert_pack.sources[(size_t)entry->source_idx];
 }
 
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
 static c0::source_open_hooks expert_pack_source_open_hooks() {
     c0::source_open_hooks hooks;
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
@@ -5633,7 +5633,7 @@ static bool expert_pack_open_data_source(
 }
 #endif
 
-#if !defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if !defined(GGML_SSD_STORE)
 static bool expert_pack_load_source(const char *path, int32_t source_idx, std::vector<expert_pack_entry> &entries, bool page_cache_source = false) {
     if (!path || !path[0]) return false;
 
@@ -5830,7 +5830,7 @@ static int expert_pack_tsv_column(const std::vector<char *> &header, const char 
 
 // one alias index of GGML_MOE_EXPERT_GGUF_ALIAS_TSV (a ':'-separated list: the experts', then e.g. the dense weights
 // homed on the drive); alias_sources: the data files the list's indexes opened so far, shared across them
-#if !defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if !defined(GGML_SSD_STORE)
 static bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_entry> &entries,
                                             std::unordered_map<std::string, int32_t> &alias_sources) {
     if (!path || !path[0]) return true;
@@ -7923,7 +7923,7 @@ static bool q4_colibri_load_manifest(
     }
 }
 
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
 static void expert_pack_initialize_legacy() {
 #else
 static void expert_pack_init_once() {
@@ -7988,7 +7988,7 @@ static void expert_pack_init_once() {
         }
     }
 
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
     const auto source_desc = c0::source_description_from_env();
     const auto & source_paths = source_desc.packs;
     const auto & page_cache_paths = source_desc.page_cache_packs;
@@ -8050,7 +8050,7 @@ static void expert_pack_init_once() {
             glm52_colibri_requested ? glm52_colibri_pack : q4_colibri_pack,
             entries);
     }
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
     if (!c0::append_sources(c0::shared_catalog(), source_desc, entries, expert_pack_source_open_hooks())) {
         g_expert_pack.inited = true;
         return;
@@ -8088,7 +8088,7 @@ static void expert_pack_init_once() {
         return;
     }
 
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
     const bool replace_duplicates = source_desc.replace_duplicates ||
         !page_cache_paths.empty() || q4_colibri_overlay_requested;
     if (!c0::finalize_entries(entries, replace_duplicates)) {
@@ -8153,7 +8153,7 @@ static void expert_pack_init_once() {
                  g_expert_pack.entries.size(), g_expert_pack.sources.size());
 }
 
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
 static void expert_pack_init_once() {
     (void)c0::initialize_shared_catalog();
 }
@@ -8197,7 +8197,7 @@ static const expert_pack_entry * expert_pack_lookup_impl(const char *tensor_name
     return nullptr;
 }
 
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
 static const expert_pack_entry * c0_provider_lookup(const char * name, int expert, size_t bytes) {
     return expert_pack_lookup_impl(name, expert, bytes, false);
 }

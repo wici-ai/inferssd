@@ -1,17 +1,21 @@
 # Shared provider prototype
 
-This is an isolated, default-off C0 experiment. It has not passed a CUDA engine
-build or the required original-provider versus extracted-provider golden test.
+This directory retains the C0 extraction oracle and small lifecycle fixtures.
 The supported migration scope is the common v1/alias source used by DeepSeek and
-Muse. The source-layout migration and release gates remain incomplete.
+Muse. The candidate must still pass the frozen F/F-prime runtime gate; software
+fixtures and a build alone do not establish C0 acceptance.
 
 ## Boundary
 
-With `LLAMA_C0_LINKED_STORE_PROTOTYPE=ON`, `llama` and `ggml-cuda` link one shared
-`ggml-ssd-c0-store` library. A static archive linked separately into both would
-create two owners, so this experiment deliberately requires a shared library.
-The option requires Linux and the bundled ggml; CUDA additionally requires
-both `GGML_CUDA_MOE_STREAM=ON` and `GGML_CUDA_MOE_STREAM_BATCH=ON`.
+`LLAMA_SSD_STORE` is enabled by default for Linux. `llama` and `ggml-cuda` link one
+shared `ggml-ssd-c0-store` library. A static archive copied into both consumers
+would create two owners and is unsupported. The store requires bundled ggml,
+`BUILD_SHARED_LIBS=ON`, `GGML_CPU=ON`, `GGML_BACKEND_DL=OFF` and `GGML_CPU_ALL_VARIANTS=OFF`.
+CUDA additionally requires `GGML_CUDA_MOE_STREAM=ON` and
+`GGML_CUDA_MOE_STREAM_BATCH=ON`; missing flags fail configure rather than selecting
+a different provider. Mac keeps its existing reader path and defaults this
+Linux store off. `LLAMA_SSD_STORE=OFF` retains the old compiled provider only for
+explicit comparison; there is no runtime fallback from the shared owner.
 
 The shared library owns the v1/alias entry vector, source vector, buffered FILE
 handles, direct descriptors, mapping cleanup, once state and first-shape state.

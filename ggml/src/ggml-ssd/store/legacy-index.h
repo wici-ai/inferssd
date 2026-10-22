@@ -1,5 +1,5 @@
 #pragma once
-// Experimental immutable store. The linked C0 option is disabled by default.
+// Immutable index view used by the parser tests and portable initializer.
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>

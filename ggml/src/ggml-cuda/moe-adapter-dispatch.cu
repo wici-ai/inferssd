@@ -3,7 +3,7 @@
 #include <atomic>
 #include <cstdio>
 
-#if defined(GGML_C0_SHARED_STORE_PROTOTYPE)
+#if defined(GGML_SSD_STORE)
 #include "store.h"
 namespace ggml_moe {
 void adapter_select_model_shape(int64_t experts, size_t bytes, const char * source) {
