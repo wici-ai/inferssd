@@ -3,7 +3,9 @@
 This package reads model headers to create source artifacts, and turns recorded
 probe reports and arm logs into calibration artifacts, a plan and legacy launcher settings. The commands are opt-in offline consumers;
 `tools/adaptive` and the existing launchers remain the production entry points.
-The package runtime uses only the Python standard library.
+The package also provides an injectable controller model with caller-owned observation
+sessions. It supplies no live engine or HTTP executor. The package runtime uses only
+the Python standard library.
 
 ## Commands and artifacts
 
@@ -173,6 +175,7 @@ the temporary file, as in F. With no `-o`, output goes to stdout.
 | Prefill | `model.prefill_lane`, `prefill_workload`, `prefill_model`, `prefill_calibration`, `prefill_memory`, `prefill_feedback`: pure costs, geometry, calibration and explicit feedback callbacks |
 | Calibration | `model.observed_calibration`, `probe.calibrate`: arm measurements, working set and complete ordered `fit` orchestration |
 | Planning | `model.machine`, `plan.planner`, `plan.settings`, `plan.placement`: artifact-backed model, ranked plans and ordered settings |
+| Controller model | `loop.records`, `loop.model`, `loop.controller`, `loop.ports`: session-owned observations, re-planning and explicit transition/effect ports |
 | Command adapters | `plan.recorded`, `plan.settings_command`, `plan.settings_recorded`: lazy artifact/host/output ports |
 
 `Machine` borrows its input mappings and owns mutable replay/sink caches. Its
@@ -182,11 +185,35 @@ perform no file or process work. These interfaces preserve existing
 semantics; they are not a claim that every legacy artifact now has a versioned,
 validated contract.
 
+### Controller model and observation ownership
+
+`ObservationSession(files=...)` owns the arm cache and incremental parser/offsets.
+One session preserves one isolated F online module's behavior; independent sessions
+are isolated rather than sharing F's hidden globals. Reusing a session explicitly
+shares its cache. A gzip key retains directory, skip, size and mtime; a live stream
+keeps incomplete trailing lines and the original stale-offset behavior after
+truncation. This is the legacy observation format, not versioned engine telemetry.
+
+`Controller` requires `machine_factory`, `engine_factory`, `post`, `effects` and
+`session` keyword arguments. The Machine factory can provide the artifact-backed
+`model.machine.Machine`; its lazy artifact and host ports still apply. Engine,
+HTTP, files, environment, clock and stdout calls occur at their original sites.
+No native Engine, HTTP default, process discovery or live CLI is provided.
+The old Engine's port-based termination fallback is not copied into the package.
+
+Transitions retain F's mutation and failure behavior: `prepare` returns borrowed
+lists, `note` mutates its supplied record, and `after` appends the turn before its
+event/count update. A displacement catches only `OSError`. `close()` stops the
+current engine without explicitly closing the event stream, as in F. Applications
+must not treat this model-only extraction as a complete native resource owner.
+The synthetic tests use fake engines and HTTP callbacks; they establish no real
+server lifecycle, online performance or device integration claim.
+
 ## Remaining integration boundaries
 
 The old adaptive production entry points have not been switched or deleted.
-Live probe/bootstrap execution, Python launch resolution, online control and
-process ownership remain separate work. The fourteen-key engine settings registry,
+Live probe/bootstrap execution, Python launch resolution, connecting the controller
+to a real online server and process ownership remain separate work. The fourteen-key engine settings registry,
 versioned `settings.ssd`, versioned engine JSONL telemetry and removal of temporary
 legacy log readers are also pending. This package does not complete C3 by itself.
 
