@@ -77,22 +77,6 @@
 #define SWAP(x, y, T) do { T SWAP = x; (x) = y; (y) = SWAP; } while (0)
 
 typedef struct { int32_t i1; int32_t i2; } ggml_moe_stream_row_mapping;
-typedef struct {
-    void * bank_ptr;
-    size_t slot_stride;
-    size_t ring_bytes;
-    uint64_t logical_bytes;
-    uint64_t physical_read_bytes;
-    uint64_t stage_us;
-    uint64_t iouring_reads;
-    uint64_t ram_admissions;
-    uint64_t vram_admissions;
-    uint64_t direct_fallbacks;
-    int32_t bank_index;
-    int32_t n_experts;
-} ggml_moe_cpu_bank_result;
-typedef bool (*ggml_moe_cpu_wave_ready_fn)(void *, int, const ggml_moe_cpu_bank_result *);
-typedef bool (*ggml_moe_cpu_wave_released_fn)(void *, int, bool);
 
 extern bool ggml_cpu_layer_gap_trace_enabled(void);
 extern void ggml_cpu_layer_gap_trace_node(
@@ -220,15 +204,6 @@ __attribute__((weak)) extern bool ggml_cuda_moe_stream_batch(
     const int64_t * matrix_row_counts,
     const ggml_moe_stream_row_mapping * rows,
     int64_t rows_stride);
-__attribute__((weak)) extern bool ggml_cuda_moe_a2_read_pipeline(
-    const char * tensor_name,
-    const int32_t * expert_ids,
-    const int32_t * wave_sizes,
-    int n_waves,
-    size_t expert_bytes,
-    void * opaque,
-    ggml_moe_cpu_wave_ready_fn wave_ready,
-    ggml_moe_cpu_wave_released_fn wave_released);
 __attribute__((weak)) extern bool ggml_cuda_moe_stream_decode_batch(
     int src0_type_int,
     const char * src0_name,
@@ -352,9 +327,6 @@ static bool (*ggml_cuda_moe_stream_batch)(
     int, const char *, const void *, int64_t, int64_t, int64_t, size_t, size_t,
     const float *, int64_t, size_t, size_t, const void *, size_t, int64_t, float *, size_t, size_t,
     const int64_t *, const ggml_moe_stream_row_mapping *, int64_t) = NULL;
-static bool (*ggml_cuda_moe_a2_read_pipeline)(
-    const char *, const int32_t *, const int32_t *, int, size_t, void *,
-    ggml_moe_cpu_wave_ready_fn, ggml_moe_cpu_wave_released_fn) = NULL;
 static bool (*ggml_cuda_moe_stream_decode_batch)(
     int, const char *, const void *, int64_t, int64_t, int64_t, size_t, size_t,
     const float *, int64_t, size_t, size_t, const void *, size_t, float *, size_t, size_t,

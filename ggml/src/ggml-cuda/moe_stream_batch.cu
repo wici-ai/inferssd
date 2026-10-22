@@ -7,29 +7,6 @@
 extern "C" {
 typedef struct { int32_t i1; int32_t i2; } ggml_moe_row_mapping;
 typedef struct { float direct_up; float direct_gate; float direct_fused; float repack_up; float repack_gate; float repack_fused; } ggml_moe_iq2_replay_result;
-typedef struct {
-    void *bank_ptr;
-    size_t slot_stride;
-    size_t ring_bytes;
-    uint64_t logical_bytes;
-    uint64_t physical_read_bytes;
-    uint64_t stage_us;
-    uint64_t iouring_reads;
-    uint64_t ram_admissions;
-    uint64_t vram_admissions;
-    uint64_t direct_fallbacks;
-    int32_t bank_index;
-    int32_t n_experts;
-} ggml_moe_a1_bank_result;
-
-typedef bool (*ggml_moe_a1_wave_ready_fn)(
-    void *opaque,
-    int wave_index,
-    const ggml_moe_a1_bank_result *result);
-typedef bool (*ggml_moe_a1_wave_released_fn)(
-    void *opaque,
-    int wave_index,
-    bool wait);
 void ggml_cuda_moe_stream_batch_link_anchor(void) {}
 void ggml_cuda_moe_ttft_trace_mark(const char *) {}
 bool ggml_cuda_moe_prefill_phase01_plan(uint32_t, uint32_t) { return true; }
@@ -37,10 +14,6 @@ void ggml_cuda_moe_prefill_request_phase(int) {}
 void ggml_cuda_moe_prefill_phase01_release(void) {}
 bool ggml_cuda_moe_prefill_phase_workspace_begin(uint32_t) { return true; }
 bool ggml_cuda_moe_prefill_phase_workspace_end(void) { return true; }
-bool ggml_cuda_moe_a1_read_bank(const char *, const int32_t *, int, size_t, int, ggml_moe_a1_bank_result *) { return false; }
-bool ggml_cuda_moe_a1_read_pipeline(const char *, const int32_t *, const int32_t *, int, size_t, void *, ggml_moe_a1_wave_ready_fn, ggml_moe_a1_wave_released_fn) { return false; }
-bool ggml_cuda_moe_a2_read_pipeline(const char *, const int32_t *, const int32_t *, int, size_t, void *, ggml_moe_a1_wave_ready_fn, ggml_moe_a1_wave_released_fn) { return false; }
-void ggml_cuda_moe_a1_release(void) {}
 bool ggml_cuda_moe_iq2_prompt_replay(int, const void *, const void *, int64_t, int64_t, size_t, const float *, int64_t, int, float, ggml_moe_iq2_replay_result *) { return false; }
 bool ggml_cuda_moe_stream_batch(int, const char *, const void *, int64_t, int64_t, int64_t, size_t, size_t, const float *, int64_t, size_t, size_t, const void *, size_t, int64_t, float *, size_t, size_t, const int64_t *, const ggml_moe_row_mapping *, int64_t) { return false; }
 bool ggml_cuda_moe_stream_handoff_upload(const float *, int64_t, int64_t) { return false; }
@@ -341,29 +314,6 @@ typedef struct {
     float repack_fused;
 } ggml_moe_iq2_replay_result;
 
-typedef struct {
-    void *bank_ptr;
-    size_t slot_stride;
-    size_t ring_bytes;
-    uint64_t logical_bytes;
-    uint64_t physical_read_bytes;
-    uint64_t stage_us;
-    uint64_t iouring_reads;
-    uint64_t ram_admissions;
-    uint64_t vram_admissions;
-    uint64_t direct_fallbacks;
-    int32_t bank_index;
-    int32_t n_experts;
-} ggml_moe_a1_bank_result;
-
-typedef bool (*ggml_moe_a1_wave_ready_fn)(
-    void *opaque,
-    int wave_index,
-    const ggml_moe_a1_bank_result *result);
-typedef bool (*ggml_moe_a1_wave_released_fn)(
-    void *opaque,
-    int wave_index,
-    bool wait);
 
 bool ggml_cuda_moe_iq2_prompt_replay(
         int src0_type_int,
@@ -410,32 +360,6 @@ bool ggml_cuda_moe_stream_batch(
     const ggml_moe_row_mapping *matrix_rows,
     int64_t rows_stride);
 
-bool ggml_cuda_moe_a1_read_bank(
-    const char *tensor_name,
-    const int32_t *expert_ids,
-    int n_experts,
-    size_t expert_bytes,
-    int bank_index,
-    ggml_moe_a1_bank_result *result);
-bool ggml_cuda_moe_a1_read_pipeline(
-    const char *tensor_name,
-    const int32_t *expert_ids,
-    const int32_t *wave_sizes,
-    int n_waves,
-    size_t expert_bytes,
-    void *opaque,
-    ggml_moe_a1_wave_ready_fn wave_ready,
-    ggml_moe_a1_wave_released_fn wave_released);
-bool ggml_cuda_moe_a2_read_pipeline(
-    const char *tensor_name,
-    const int32_t *expert_ids,
-    const int32_t *wave_sizes,
-    int n_waves,
-    size_t expert_bytes,
-    void *opaque,
-    ggml_moe_a1_wave_ready_fn wave_ready,
-    ggml_moe_a1_wave_released_fn wave_released);
-void ggml_cuda_moe_a1_release(void);
 void ggml_cuda_moe_prefill_request_phase(int active);
 void ggml_cuda_moe_prefill_phase01_release(void);
 
@@ -721,13 +645,6 @@ struct batch_ctx {
     // Phase 1 is deliberately isolated from the general provider rings.  Its
     // fixed 16-slot O_DIRECT ring exists only when the Phase 1 env is enabled.
     pinned_stage_ring stage_ring_phase1;
-    // A1 uses the same descriptor/io_uring provider without touching either
-    // GPU cache.  Its two contiguous 8-slot banks exist only in the offline
-    // process that calls ggml_cuda_moe_a1_read_bank().
-    pinned_stage_ring stage_ring_a1;
-    // Task 28 service-only CPU grouped prefill ring.  It is separate from the
-    // offline A1 ring so the two env-gated lifetimes cannot alias.
-    pinned_stage_ring stage_ring_a2;
     cudaEvent_t ev_stage_ready = nullptr;
     cudaEvent_t ev_up_done = nullptr;
     cudaEvent_t ev_gate_done = nullptr;
@@ -7610,17 +7527,15 @@ static moe_phase_counter_snapshot moe_phase_snapshot_now() {
         s.cache_down_prefetch_hits[i] = c.down_prefetch_hits;
         s.cache_async_prefetch_waits[i] = c.async_prefetch_waits;
     }
-    const pinned_stage_ring *rings[8] = {
+    const pinned_stage_ring *rings[6] = {
         &g_batch.stage_ring,
         &g_batch.stage_ring_gate,
         &g_batch.stage_ring_up_aux,
         &g_batch.stage_ring_gate_aux,
         &g_batch.stage_ring_down_aux,
         &g_batch.stage_ring_phase1,
-        &g_batch.stage_ring_a1,
-        &g_batch.stage_ring_a2,
     };
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 6; ++i) {
         s.stage_copies[i] = rings[i]->copies;
         s.stage_waits[i] = rings[i]->waits;
         s.stage_fallbacks[i] = rings[i]->fallbacks;
@@ -7717,11 +7632,10 @@ extern "C" void ggml_cuda_moe_stream_batch_phase_report(const char *label) {
     const size_t provider_host_bytes =
         g_batch.h_src1_sz + g_batch.h_src1_shadow_sz +
         g_batch.h_dst_sz + g_batch.h_dst_shadow_sz;
-    const pinned_stage_ring *resource_rings[8] = {
+    const pinned_stage_ring *resource_rings[6] = {
         &g_batch.stage_ring, &g_batch.stage_ring_gate,
         &g_batch.stage_ring_up_aux, &g_batch.stage_ring_gate_aux,
         &g_batch.stage_ring_down_aux, &g_batch.stage_ring_phase1,
-        &g_batch.stage_ring_a1, &g_batch.stage_ring_a2,
     };
     size_t pinned_ring_bytes = 0;
     for (const pinned_stage_ring *ring : resource_rings) {
@@ -14050,8 +13964,6 @@ static void pinned_stage_report_atexit() {
     report_ring(" gate_aux", g_batch.stage_ring_gate_aux);
     report_ring(" down_aux", g_batch.stage_ring_down_aux);
     report_ring(" phase1", g_batch.stage_ring_phase1);
-    report_ring(" a1", g_batch.stage_ring_a1);
-    report_ring(" a2", g_batch.stage_ring_a2);
 }
 
 static bool pinned_stage_ensure_slots(
@@ -22261,9 +22173,8 @@ static bool expert_pack_iouring_copy_jobs_impl(
             pinned_stage_release(ring);
             (void)cudaGetLastError();
         } else {
-            // The other A1 bank can still be owned by the CPU while this
-            // provider call fails.  Keep both banks alive until the runner
-            // joins the provider and calls ggml_cuda_moe_a1_release().
+            // A host-only consumer can still own another bank on failure.
+            // Keep the ring alive until that consumer releases it.
             ring.failed = true;
         }
         return false;
@@ -23026,103 +22937,6 @@ extern "C" bool ggml_cuda_moe_expert_pack_copy_ranges_to_device(
     return ok;
 }
 
-struct moe_a1_host_read_job {
-    void *dst = nullptr;
-    const expert_pack_entry *pack_entry = nullptr;
-    int expert_idx = -1;
-    char tensor[128] = {};
-};
-
-static bool expert_pack_iouring_read_a1_bank(
-        const std::vector<moe_a1_host_read_job> &jobs,
-        size_t expert_bytes,
-        pinned_stage_ring &ring,
-        int bank_index) {
-    auto fixed_job_size = [expert_bytes](const moe_a1_host_read_job &) -> size_t {
-        return expert_bytes;
-    };
-    auto no_stream = [](const moe_a1_host_read_job &) -> cudaStream_t {
-        return nullptr;
-    };
-    return expert_pack_iouring_copy_jobs_impl(
-        jobs, expert_bytes, fixed_job_size, no_stream, nullptr, ring,
-        "a1_cpu_bank", true, 16, true, (size_t)bank_index * 8);
-}
-
-struct moe_a1_pipeline_context {
-    pinned_stage_ring *ring = nullptr;
-    size_t expert_bytes = 0;
-    void *opaque = nullptr;
-    ggml_moe_a1_wave_ready_fn wave_ready = nullptr;
-    ggml_moe_a1_wave_released_fn wave_released = nullptr;
-    std::vector<size_t> job_waves;
-    std::vector<size_t> job_slots;
-    std::vector<int32_t> wave_sizes;
-    std::vector<int32_t> wave_submitted;
-    std::vector<int32_t> wave_completed;
-    std::vector<std::chrono::steady_clock::time_point> wave_started;
-};
-
-static size_t moe_a1_pipeline_slot_index(void *opaque, size_t job_idx) {
-    moe_a1_pipeline_context *context = static_cast<moe_a1_pipeline_context *>(opaque);
-    return context && job_idx < context->job_slots.size() ? context->job_slots[job_idx] : SIZE_MAX;
-}
-
-static bool moe_a1_pipeline_can_submit(void *opaque, size_t job_idx) {
-    moe_a1_pipeline_context *context = static_cast<moe_a1_pipeline_context *>(opaque);
-    if (!context || job_idx >= context->job_waves.size()) return false;
-    const size_t wave = context->job_waves[job_idx];
-    return wave < 2 || context->wave_released(context->opaque, (int)wave - 2, false);
-}
-
-static bool moe_a1_pipeline_wait_submit(void *opaque, size_t job_idx) {
-    moe_a1_pipeline_context *context = static_cast<moe_a1_pipeline_context *>(opaque);
-    if (!context || job_idx >= context->job_waves.size()) return false;
-    const size_t wave = context->job_waves[job_idx];
-    return wave < 2 || context->wave_released(context->opaque, (int)wave - 2, true);
-}
-
-static bool moe_a1_pipeline_submitted(void *opaque, size_t job_idx) {
-    moe_a1_pipeline_context *context = static_cast<moe_a1_pipeline_context *>(opaque);
-    if (!context || job_idx >= context->job_waves.size()) return false;
-    const size_t wave = context->job_waves[job_idx];
-    if (wave >= context->wave_sizes.size() ||
-            context->wave_submitted[wave] >= context->wave_sizes[wave]) {
-        return false;
-    }
-    if (context->wave_submitted[wave]++ == 0) {
-        context->wave_started[wave] = std::chrono::steady_clock::now();
-    }
-    return true;
-}
-
-static bool moe_a1_pipeline_completed(void *opaque, size_t job_idx) {
-    moe_a1_pipeline_context *context = static_cast<moe_a1_pipeline_context *>(opaque);
-    if (!context || job_idx >= context->job_waves.size()) return false;
-    const size_t wave = context->job_waves[job_idx];
-    if (wave >= context->wave_sizes.size() ||
-            context->wave_completed[wave] >= context->wave_sizes[wave]) {
-        return false;
-    }
-    if (++context->wave_completed[wave] != context->wave_sizes[wave]) {
-        return true;
-    }
-
-    ggml_moe_a1_bank_result result = {};
-    const size_t bank = wave % 2;
-    result.bank_ptr = context->ring->slots[bank * 8].host;
-    result.slot_stride = context->ring->slot_sz;
-    result.ring_bytes = context->ring->slot_sz * context->ring->slots.size();
-    result.logical_bytes = (uint64_t)context->wave_sizes[wave] * (uint64_t)context->expert_bytes;
-    result.physical_read_bytes = result.logical_bytes;
-    result.stage_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - context->wave_started[wave]).count();
-    result.iouring_reads = (uint64_t)context->wave_sizes[wave];
-    result.bank_index = (int32_t)bank;
-    result.n_experts = context->wave_sizes[wave];
-    return context->wave_ready(context->opaque, (int)wave, &result);
-}
-
 static bool moe_a2_triplet_tensor_names(const char *tensor_name, char names[3][128]) {
     static const char *role_markers[3] = {
         ".ffn_up_exps.", ".ffn_gate_exps.", ".ffn_down_exps.",
@@ -23150,270 +22964,6 @@ static bool moe_a2_triplet_tensor_names(const char *tensor_name, char names[3][1
         if (written < 0 || (size_t)written >= sizeof(names[role])) return false;
     }
     return true;
-}
-
-static bool moe_cpu_grouped_read_pipeline(
-        const char *env_name,
-        pinned_stage_ring &ring,
-        const char *trace_op,
-        bool triplet_layout,
-        const char *tensor_name,
-        const int32_t *expert_ids,
-        const int32_t *wave_sizes,
-        int n_waves,
-        size_t expert_bytes,
-        void *opaque,
-        ggml_moe_a1_wave_ready_fn wave_ready,
-        ggml_moe_a1_wave_released_fn wave_released) {
-#if defined(GGML_MOE_HAS_LIBURING) && !defined(_WIN32)
-    if (!env_name || !trace_op || !moe_phase_env_enabled(env_name) ||
-            !tensor_name || !tensor_name[0] || !expert_ids || !wave_sizes ||
-            n_waves < 1 || n_waves > 1024 || expert_bytes == 0 ||
-            !opaque || !wave_ready || !wave_released || expert_pack_io_depth() < 4) {
-        return false;
-    }
-    if (triplet_layout && expert_bytes > SIZE_MAX / 3) return false;
-    const size_t job_bytes = triplet_layout ? 3 * expert_bytes : expert_bytes;
-
-    std::lock_guard<std::mutex> lock(g_batch_mu);
-    moe_a1_pipeline_context context;
-    context.ring = &ring;
-    context.expert_bytes = job_bytes;
-    context.opaque = opaque;
-    context.wave_ready = wave_ready;
-    context.wave_released = wave_released;
-    context.wave_sizes.assign(wave_sizes, wave_sizes + n_waves);
-    context.wave_submitted.assign((size_t)n_waves, 0);
-    context.wave_completed.assign((size_t)n_waves, 0);
-    context.wave_started.resize((size_t)n_waves);
-
-    size_t total_experts = 0;
-    for (int wave = 0; wave < n_waves; ++wave) {
-        if (wave_sizes[wave] < 1 || wave_sizes[wave] > 8 ||
-                total_experts > SIZE_MAX - (size_t)wave_sizes[wave]) {
-            return false;
-        }
-        total_experts += (size_t)wave_sizes[wave];
-    }
-    if (total_experts > 8192) return false;
-
-    std::vector<moe_a1_host_read_job> jobs;
-    jobs.reserve(total_experts);
-    std::vector<expert_pack_entry> triplet_entries;
-    if (triplet_layout) triplet_entries.reserve(total_experts);
-    context.job_waves.reserve(total_experts);
-    context.job_slots.reserve(total_experts);
-    int32_t previous_expert = -1;
-    size_t job_idx = 0;
-    for (int wave = 0; wave < n_waves; ++wave) {
-        for (int slot = 0; slot < wave_sizes[wave]; ++slot, ++job_idx) {
-            const int32_t expert_id = expert_ids[job_idx];
-            if (expert_id < 0 || expert_id <= previous_expert) return false;
-            previous_expert = expert_id;
-            const expert_pack_entry *entry = nullptr;
-            if (triplet_layout) {
-                char role_names[3][128] = {};
-                if (!moe_a2_triplet_tensor_names(tensor_name, role_names)) return false;
-                const expert_pack_entry *roles[3] = {
-                    expert_pack_lookup_impl(role_names[0], expert_id, expert_bytes, false),
-                    expert_pack_lookup_impl(role_names[1], expert_id, expert_bytes, false),
-                    expert_pack_lookup_impl(role_names[2], expert_id, expert_bytes, false),
-                };
-                if (!roles[0] || !roles[1] || !roles[2] ||
-                        roles[0]->source_idx != roles[1]->source_idx ||
-                        roles[0]->source_idx != roles[2]->source_idx ||
-                        roles[0]->offset > UINT64_MAX - expert_bytes ||
-                        roles[1]->offset > UINT64_MAX - expert_bytes ||
-                        roles[0]->offset + expert_bytes != roles[1]->offset ||
-                        roles[1]->offset + expert_bytes != roles[2]->offset) {
-                    return false;
-                }
-                triplet_entries.push_back(*roles[0]);
-                triplet_entries.back().nbytes = job_bytes;
-                entry = &triplet_entries.back();
-            } else {
-                entry = expert_pack_lookup_impl(tensor_name, expert_id, expert_bytes, false);
-            }
-            moe_a1_host_read_job job;
-            job.pack_entry = entry;
-            job.expert_idx = expert_id;
-            std::snprintf(job.tensor, sizeof(job.tensor), "%s", tensor_name);
-            if (!entry || !expert_pack_iouring_job_eligible(job, job_bytes)) return false;
-            jobs.push_back(job);
-            context.job_waves.push_back((size_t)wave);
-            context.job_slots.push_back((size_t)(wave % 2) * 8 + (size_t)slot);
-        }
-    }
-
-    const uint64_t bytes_before = g_expert_pack.iouring_bytes.load(std::memory_order_relaxed);
-    const uint64_t reads_before = g_expert_pack.iouring_reads.load(std::memory_order_relaxed);
-    const uint64_t ram_before = g_expert_pack.ram_tier_dynamic_admissions.load(std::memory_order_relaxed);
-    const uint64_t vram_before = g_expert_pack.unified_vram_admissions.load(std::memory_order_relaxed);
-    const uint64_t fallback_before =
-        g_expert_pack.direct_fallbacks.load(std::memory_order_relaxed) +
-        g_expert_pack.iouring_fallbacks.load(std::memory_order_relaxed);
-
-    iouring_host_pipeline_hooks hooks;
-    hooks.opaque = &context;
-    hooks.slot_index = moe_a1_pipeline_slot_index;
-    hooks.can_submit = moe_a1_pipeline_can_submit;
-    hooks.wait_submit = moe_a1_pipeline_wait_submit;
-    hooks.submitted = moe_a1_pipeline_submitted;
-    hooks.completed = moe_a1_pipeline_completed;
-    auto fixed_job_size = [job_bytes](const moe_a1_host_read_job &) -> size_t {
-        return job_bytes;
-    };
-    auto no_stream = [](const moe_a1_host_read_job &) -> cudaStream_t {
-        return nullptr;
-    };
-    const bool read_ok = expert_pack_iouring_copy_jobs_impl(
-        jobs, job_bytes, fixed_job_size, no_stream, nullptr, ring,
-        trace_op, true, 16, true, 0, &hooks);
-
-    const uint64_t bytes_after = g_expert_pack.iouring_bytes.load(std::memory_order_relaxed);
-    const uint64_t reads_after = g_expert_pack.iouring_reads.load(std::memory_order_relaxed);
-    const uint64_t ram_after = g_expert_pack.ram_tier_dynamic_admissions.load(std::memory_order_relaxed);
-    const uint64_t vram_after = g_expert_pack.unified_vram_admissions.load(std::memory_order_relaxed);
-    const uint64_t fallback_after =
-        g_expert_pack.direct_fallbacks.load(std::memory_order_relaxed) +
-        g_expert_pack.iouring_fallbacks.load(std::memory_order_relaxed);
-    const uint64_t logical_bytes = (uint64_t)total_experts * (uint64_t)job_bytes;
-    return read_ok && ring.slots.size() == 16 &&
-        ring.slot_sz == job_bytes &&
-        bytes_after - bytes_before == logical_bytes &&
-        reads_after - reads_before == total_experts &&
-        ram_after == ram_before && vram_after == vram_before &&
-        fallback_after == fallback_before;
-#else
-    (void)env_name;
-    (void)ring;
-    (void)trace_op;
-    (void)triplet_layout;
-    (void)tensor_name;
-    (void)expert_ids;
-    (void)wave_sizes;
-    (void)n_waves;
-    (void)expert_bytes;
-    (void)opaque;
-    (void)wave_ready;
-    (void)wave_released;
-    return false;
-#endif
-}
-
-extern "C" bool ggml_cuda_moe_a1_read_pipeline(
-        const char *tensor_name,
-        const int32_t *expert_ids,
-        const int32_t *wave_sizes,
-        int n_waves,
-        size_t expert_bytes,
-        void *opaque,
-        ggml_moe_a1_wave_ready_fn wave_ready,
-        ggml_moe_a1_wave_released_fn wave_released) {
-    return moe_cpu_grouped_read_pipeline(
-        "GGML_MOE_A1_CPU_GROUPED", g_batch.stage_ring_a1, "a1_cpu_pipeline", false,
-        tensor_name, expert_ids, wave_sizes, n_waves, expert_bytes,
-        opaque, wave_ready, wave_released);
-}
-
-extern "C" bool ggml_cuda_moe_a2_read_pipeline(
-        const char *tensor_name,
-        const int32_t *expert_ids,
-        const int32_t *wave_sizes,
-        int n_waves,
-        size_t expert_bytes,
-        void *opaque,
-        ggml_moe_a1_wave_ready_fn wave_ready,
-        ggml_moe_a1_wave_released_fn wave_released) {
-    return moe_cpu_grouped_read_pipeline(
-        "GGML_MOE_A2_CPU_GROUPED_PREFILL", g_batch.stage_ring_a2, "a2_cpu_triplet", true,
-        tensor_name, expert_ids, wave_sizes, n_waves, expert_bytes,
-        opaque, wave_ready, wave_released);
-}
-
-extern "C" bool ggml_cuda_moe_a1_read_bank(
-        const char *tensor_name,
-        const int32_t *expert_ids,
-        int n_experts,
-        size_t expert_bytes,
-        int bank_index,
-        ggml_moe_a1_bank_result *result) {
-    if (result) {
-        std::memset(result, 0, sizeof(*result));
-        result->bank_index = bank_index;
-        result->n_experts = n_experts;
-    }
-    if (!moe_phase_env_enabled("GGML_MOE_A1_CPU_GROUPED") ||
-            !result || !tensor_name || !tensor_name[0] || !expert_ids ||
-            n_experts < 1 || n_experts > 8 || expert_bytes == 0 ||
-            (bank_index != 0 && bank_index != 1)) {
-        return false;
-    }
-
-    std::lock_guard<std::mutex> lock(g_batch_mu);
-    std::vector<moe_a1_host_read_job> jobs;
-    jobs.reserve((size_t)n_experts);
-    for (int i = 0; i < n_experts; ++i) {
-        if (expert_ids[i] < 0 || (i > 0 && expert_ids[i] <= expert_ids[i - 1])) {
-            return false;
-        }
-        const expert_pack_entry *entry = expert_pack_lookup_impl(
-            tensor_name, expert_ids[i], expert_bytes, false);
-        moe_a1_host_read_job job;
-        job.pack_entry = entry;
-        job.expert_idx = expert_ids[i];
-        std::snprintf(job.tensor, sizeof(job.tensor), "%s", tensor_name);
-        if (!entry || !expert_pack_iouring_job_eligible(job, expert_bytes)) {
-            return false;
-        }
-        jobs.push_back(job);
-    }
-
-    const uint64_t bytes_before = g_expert_pack.iouring_bytes.load(std::memory_order_relaxed);
-    const uint64_t reads_before = g_expert_pack.iouring_reads.load(std::memory_order_relaxed);
-    const uint64_t ram_before = g_expert_pack.ram_tier_dynamic_admissions.load(std::memory_order_relaxed);
-    const uint64_t vram_before = g_expert_pack.unified_vram_admissions.load(std::memory_order_relaxed);
-    const uint64_t fallback_before =
-        g_expert_pack.direct_fallbacks.load(std::memory_order_relaxed) +
-        g_expert_pack.iouring_fallbacks.load(std::memory_order_relaxed);
-    const auto start = std::chrono::steady_clock::now();
-    const bool read_ok = expert_pack_iouring_read_a1_bank(
-        jobs, expert_bytes, g_batch.stage_ring_a1, bank_index);
-    const uint64_t stage_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - start).count();
-    const uint64_t bytes_after = g_expert_pack.iouring_bytes.load(std::memory_order_relaxed);
-    const uint64_t reads_after = g_expert_pack.iouring_reads.load(std::memory_order_relaxed);
-    const uint64_t ram_after = g_expert_pack.ram_tier_dynamic_admissions.load(std::memory_order_relaxed);
-    const uint64_t vram_after = g_expert_pack.unified_vram_admissions.load(std::memory_order_relaxed);
-    const uint64_t fallback_after =
-        g_expert_pack.direct_fallbacks.load(std::memory_order_relaxed) +
-        g_expert_pack.iouring_fallbacks.load(std::memory_order_relaxed);
-
-    result->slot_stride = g_batch.stage_ring_a1.slot_sz;
-    result->ring_bytes = g_batch.stage_ring_a1.slot_sz * g_batch.stage_ring_a1.slots.size();
-    result->logical_bytes = (uint64_t)n_experts * (uint64_t)expert_bytes;
-    result->physical_read_bytes = bytes_after - bytes_before;
-    result->stage_us = stage_us;
-    result->iouring_reads = reads_after - reads_before;
-    result->ram_admissions = ram_after - ram_before;
-    result->vram_admissions = vram_after - vram_before;
-    result->direct_fallbacks = fallback_after - fallback_before;
-    if (read_ok && g_batch.stage_ring_a1.slots.size() == 16 &&
-            result->slot_stride == expert_bytes) {
-        result->bank_ptr = g_batch.stage_ring_a1.slots[(size_t)bank_index * 8].host;
-    }
-
-    return read_ok && result->bank_ptr &&
-        result->physical_read_bytes == result->logical_bytes &&
-        result->iouring_reads == (uint64_t)n_experts &&
-        result->ram_admissions == 0 && result->vram_admissions == 0 &&
-        result->direct_fallbacks == 0;
-}
-
-extern "C" void ggml_cuda_moe_a1_release(void) {
-    std::lock_guard<std::mutex> lock(g_batch_mu);
-    pinned_stage_release(g_batch.stage_ring_a1);
-    g_batch.stage_ring_a1.failed = false;
 }
 
 template <typename Job>

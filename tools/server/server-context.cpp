@@ -140,10 +140,8 @@ static bool server_kimi_dense_phase_gate_enabled() {
 static bool server_moe_phase01_telemetry_enabled() {
     const char * phase0 = std::getenv("GGML_MOE_PREFILL_PHASE0");
     const char * phase1 = std::getenv("GGML_MOE_PREFILL_PHASE1");
-    const char * a2 = std::getenv("GGML_MOE_A2_CPU_GROUPED_PREFILL");
     return (phase0 && phase0[0] && phase0[0] != '0') ||
-        (phase1 && phase1[0] && phase1[0] != '0') ||
-        (a2 && a2[0] && a2[0] != '0');
+        (phase1 && phase1[0] && phase1[0] != '0');
 }
 
 struct server_moe_memory_events {
