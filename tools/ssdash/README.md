@@ -113,3 +113,36 @@ boundaries are recorded for equivalence, not recommended as valid workload data.
 bits, including composed workload forms. The original source and oracle remain
 unchanged. Coverage estimation, pass timing, break-even search, threshold choice,
 feedback, artifact validation and production callers remain outside this leaf.
+
+## Prefill model functions
+
+`ssdash.model.prefill_model` adds `coverage`, `pass_seconds`, `seconds`,
+`break_even`, and `threshold`, composed with the extracted lane and workload
+functions. Its `TypedDict` definitions describe the existing model keys for
+type checking. They do not validate, copy, normalize, or fill in a loaded model.
+The original adaptive module and production callers remain unchanged.
+
+48 cases were recorded from the complete frozen F call graph before extraction.
+They bind results and selected intermediate values with `float.hex()`, ordered
+mapping reads, call order, and the existing exception type and message. Cases
+cover coverage interpolation/extrapolation and caps; cold/warm tiers; measured
+and fallback graph costs; lane scaling; mixed pass sizes; finite, infinite and
+missing break-even results; threshold ties, reply weights and one-shot iterators.
+Composed expectations come from F, not from the newly extracted leaves.
+
+Python's float `sum` changes between the verified 3.9 and 3.12 runtimes: one
+composed case differs by one ULP in its summed costs, even in the frozen F code.
+Both runtime transcripts are preserved without changing the original 3.12
+goldens. Tests require the corresponding exact transcript and exact agreement
+with F on the same runtime; they do not introduce a numeric tolerance.
+Frozen transcript selection is limited to Python 3.9 and 3.12. On other versions
+those transcript checks are explicitly skipped; the same-runtime F comparisons
+still run, without claiming a recorded transcript for that version.
+
+Arithmetic, lookup order, doubling/bisection bounds and tie breaks are preserved.
+Missing, null and zero costs retain their distinct behavior, including failures
+when used. No validation of cold-state weights or batch sizes is added. An
+iterator consumed while constructing offloaded passes remains consumed when the
+threshold code later asks for served forms. Model fitting, memory sizing,
+feedback, artifact loading, planner integration and device measurements remain
+outside this batch.
