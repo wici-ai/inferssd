@@ -3412,147 +3412,6 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
         }
     }
 
-    // Kimi-K3 tests - XTML think/response parser
-    {
-        auto tst = peg_tester("models/templates/Kimi-K3.jinja", detailed_debug);
-
-        const std::string reasoning = "The user requested a short greeting.";
-        const std::string response  = "你好！";
-        const std::string full =
-            reasoning +
-            "<|close|>think<|sep|>"
-            "<|open|>response<|sep|>" +
-            response +
-            "<|close|>response<|sep|>"
-            "<|close|>message<|sep|>"
-            "<|end_of_msg|>";
-
-        tst.test(full)
-            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
-            .expect(simple_assist_msg(response, reasoning))
-            .expect_reconstruction()
-            .run();
-
-        tst.test(
-               reasoning +
-               "<|close|>think<|sep|>"
-               "<|open|>response<|sep|>" +
-               response +
-               "<|close|>response<|sep|>"
-               "<|close|>message<|sep|>")
-            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
-            .expect(simple_assist_msg(response, reasoning))
-            .run();
-
-        tst.test(
-               reasoning +
-               "<|close|>think<|sep|>"
-               "<|open|>response<|sep|>你")
-            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
-            .is_partial(true)
-            .expect(simple_assist_msg("你", reasoning))
-            .run();
-
-        // Regression: the second message closer used to fail the completed
-        // parse. Server fallback then replaced "Updated." with raw XTML text,
-        // and append-only diff generation threw. peg_tester checks every byte
-        // prefix, reconstructs via compute_diffs, and compares the final
-        // nonstreaming parse with the same message.
-        const std::string update_reasoning =
-            "We must answer exactly \"Updated.\" per user instruction. No extra content. Ensure final only Updated.";
-        const std::string update_prefix = update_reasoning +
-            "<|close|>think<|sep|><|open|>response<|sep|>";
-        const std::string response_end = "<|close|>response<|sep|>";
-        const std::string message_end = "<|close|>message<|sep|>";
-        const std::string repeated_tail = response_end + message_end + message_end;
-
-        tst.test(update_prefix + "Updated." + repeated_tail + "<|end_of_msg|>")
-            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
-            .expect(simple_assist_msg("Updated.", update_reasoning))
-            .run();
-        tst.test(update_prefix + "Updated." + repeated_tail)
-            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
-            .expect(simple_assist_msg("Updated.", update_reasoning))
-            .run();
-        tst.test(update_prefix + "Updated." + repeated_tail + "<|close|>mess")
-            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
-            .is_partial(true)
-            .expect(simple_assist_msg("Updated.", update_reasoning))
-            .run();
-        tst.test(update_prefix + repeated_tail + "<|end_of_msg|>")
-            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
-            .expect(simple_assist_msg("", update_reasoning))
-            .run();
-        const std::string literal_content = "原样保留 " + message_end + " 这个标记。";
-        tst.test(update_prefix + literal_content + repeated_tail + "<|end_of_msg|>")
-            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
-            .expect(simple_assist_msg(literal_content, update_reasoning))
-            .run();
-
-        // Tolerance is limited to complete structural message closers; arbitrary
-        // trailing prose must not silently disappear from a successful parse.
-        auto tmpls = read_templates("models/templates/Kimi-K3.jinja");
-        common_chat_templates_inputs inputs;
-        inputs.messages = { message_user };
-        inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-        auto parser = make_peg_parser(tmpls.get(), inputs, detailed_debug);
-
-        // Exercise the actual server accumulator, including its final empty
-        // reparse after all streamed bytes were already delivered.
-        const std::string exact = update_prefix + "Updated." + repeated_tail + "<|end_of_msg|>";
-        const auto expected = simple_assist_msg("Updated.", update_reasoning);
-        common_chat_parser_params parser_params(parser.params_);
-        parser_params.parser.load(parser.params_.parser);
-        parser_params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-        for (const size_t chunk_size : {size_t(1), size_t(7), size_t(31), exact.size()}) {
-            task_result_state state(parser_params);
-            std::string delivered;
-            std::vector<common_chat_msg_diff> diffs;
-            for (size_t pos = 0; pos < exact.size(); pos += chunk_size) {
-                diffs.clear(); // each production chunk owns a fresh result vector
-                state.update_chat_msg(exact.substr(pos, chunk_size), true, diffs);
-                for (const auto & diff : diffs) { delivered += diff.content_delta; }
-                assert_equals(true, std::string("Updated.").compare(0, delivered.size(), delivered) == 0);
-            }
-            assert_equals(std::string("Updated."), delivered);
-            diffs.clear();
-            assert_msg_equals(expected, state.update_chat_msg("", false, diffs), true);
-            for (const auto & diff : diffs) { assert_equals(std::string(), diff.content_delta); }
-            assert_equals(std::string("Updated."), delivered);
-        }
-        task_result_state nonstream(parser_params);
-        std::vector<common_chat_msg_diff> nonstream_diffs;
-        assert_msg_equals(expected, nonstream.update_chat_msg(exact, false, nonstream_diffs), true);
-
-        // Supply a canonical response-primed template explicitly. This tests
-        // the nonthinking grammar without changing launch-prefix metadata.
-        auto response_tmpls = common_chat_templates_ptr(common_chat_templates_init(nullptr,
-            "{%- set thinking = false -%}" + read_file("models/templates/Kimi-K3.jinja")));
-        test_peg_parser(response_tmpls.get(), [&](peg_test_case & tc) {
-            tc.input = "Updated." + repeated_tail + message_end + "<|end_of_msg|>";
-            tc.params.enable_thinking = false;
-            tc.params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
-            tc.expect = simple_assist_msg("Updated.");
-        }, detailed_debug);
-
-        bool rejected = false;
-        try {
-            parser.parse(update_prefix + "Updated." + repeated_tail + "unexpected prose", false);
-        } catch (const std::runtime_error &) {
-            rejected = true;
-        }
-        assert_equals(true, rejected);
-        bool invalid_diff = false;
-        try {
-            common_chat_msg_diff::compute_diffs(simple_assist_msg("Updated."), simple_assist_msg("replacement"));
-        } catch (const std::runtime_error &) {
-            invalid_diff = true;
-        }
-        assert_equals(true, invalid_diff);
-        std::printf("KIMI_K3_DUPLICATE_CLOSER_STREAM_OK exact_tail=PASS byte_prefixes=PASS "
-                    "server_chunk_sizes=1,7,31,full final_reparse=PASS nonstream=PASS strict_diff=PASS\n");
-    }
-
     // Kimi-K2-Thinking tests - custom parser
     // Unique feature: tool call ID embeds function name as functions.<name>:<counter>
     {
@@ -4804,6 +4663,15 @@ static void test_developer_role_to_system_workaround() {
 
 static void test_msg_diffs_compute() {
     LOG_DBG("%s\n", __func__);
+    {
+        bool invalid_diff = false;
+        try {
+            common_chat_msg_diff::compute_diffs(simple_assist_msg("Updated."), simple_assist_msg("replacement"));
+        } catch (const std::runtime_error &) {
+            invalid_diff = true;
+        }
+        assert_equals(true, invalid_diff);
+    }
     {
         common_chat_msg msg1;
 

@@ -441,60 +441,6 @@ struct llm_build_kimi_linear : public llm_build_delta_net_base {
     const llama_model & model;
 };
 
-struct llm_build_kimi_k3 : public llm_build_delta_net_base {
-    llm_build_kimi_k3(const llama_model & model, const llm_graph_params & params);
-
-    const llama_model & model;
-    const llama_k3_decode_expert_policy decode_expert_policy;
-    const llama_k3_decode_expert_table decode_expert_table;
-
-    // Cross-layer residual checkpoints. Each checkpoint is kept as
-    // [n_embd, 1, n_tokens] and concatenated lazily when the bank changes.
-    std::vector<ggml_tensor *> ckpts;
-    ggml_tensor * stack_cache = nullptr;
-    int stack_cache_n = -1;
-
-    void res_push(ggml_tensor * cur, int64_t n_embd, int64_t n_tokens);
-    ggml_tensor * res_stack(int64_t n_embd, int64_t n_tokens);
-    ggml_tensor * res_mix(
-            ggml_tensor * cur,
-            ggml_tensor * score_w,
-                int64_t   n_embd,
-                int64_t   n_tokens,
-                    int   il);
-
-    ggml_tensor * build_kda_layer(
-            ggml_tensor * cur,
-      const llama_layer & layer,
-    llm_graph_input_rs * inp_rs,
-                int64_t   d_conv,
-                int64_t   head_dim,
-                int64_t   n_head_kda,
-                int64_t   d_inner,
-                int64_t   n_seq_tokens,
-                int64_t   n_seqs,
-                    int   il);
-
-    ggml_tensor * build_mla_layer(
-            ggml_tensor * cur,
-      const llama_layer & layer,
-    llm_graph_input_attn_k * inp_attn_k,
-    llm_graph_input_attn_kv * inp_attn_kv,
-                int64_t   n_embd_head_k_mla,
-                int64_t   n_embd_head_v_mla,
-                int64_t   kv_lora_rank,
-                int64_t   n_embd_head_qk_rope,
-                int64_t   n_embd_head_qk_nope,
-                  float   kq_scale,
-                    int   il);
-
-    ggml_tensor * build_latent_moe(
-            ggml_tensor * cur,
-      const llama_layer & layer,
-                int64_t   n_embd_latent,
-                    int   il);
-};
-
 template <bool iswa>
 struct llm_build_lfm2 : public llm_graph_context {
     llm_build_lfm2(const llama_model & model, const llm_graph_params & params);
