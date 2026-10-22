@@ -167,7 +167,7 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         # GPU tests require explicit ownership of a lane and preloaded exact
         # component DSOs; do not acquire a shared GPU automatically in ctest.
         foreach(tier_test test-kimi-vram-async test-kimi-vram-deferred test-kimi-vram-exclusive test-kimi-q3k-parity
-                test-kimi-vram-location test-kimi-vram-location-lifecycle test-kimi-vram-component-error test-kimi-vram-pool-cuda
+                test-kimi-vram-component-error test-kimi-vram-pool-cuda
                 test-kimi-vram-elastic test-kimi-vram-reclaim)
             add_executable(${tier_test} ${tier_test}.cpp)
             target_compile_features(${tier_test} PRIVATE cxx_std_17)

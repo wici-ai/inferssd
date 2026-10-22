@@ -4,12 +4,11 @@
 
 int main(){try{
     setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD","1",1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GPU_HIDDEN","0",1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY","lru",1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT","0",1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL","1",1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_DECAY_HALF_LIFE","0",1);
-    const size_t role=28672;
+    const size_t role=lifecycle_role_bytes();
     std::vector<unsigned char> payload[4];
     kimi_vram_request requests[4]={};
     for(int j=0;j<4;++j){
@@ -18,27 +17,27 @@ int main(){try{
         for(int i=0;i<3;++i)requests[j].role[i]={1,2,1000000,uint64_t(3*j+i)*role,role,3,4,5,6};
     }
     tier t(2*3*role);int slots[2]={};std::vector<float> out(512);
-    std::vector<unsigned char> q8(292,0),copied(3*role);
+    std::vector<float> input(256,0.0f);std::vector<unsigned char> copied(3*role);
     auto upload=[&](int j){const void * data[]={payload[j].data(),payload[j].data(),payload[j].data()};t.admit(requests[j],data,true);};
     auto bytes_equal=[&](int slot,int j){
         cuda_check(cudaMemcpy(copied.data(),t.arena+size_t(slot)*t.stride,copied.size(),cudaMemcpyDeviceToHost));
         for(int i=0;i<3;++i)require(!std::memcmp(copied.data()+i*role,payload[j].data(),role),"cross-layer slot payload mismatch");
     };
-    t.begin(17,1,true);t.prepare(requests,2,256,256,slots);
+    t.begin(17,1,true);lifecycle_prepare(t,requests,2,slots);
     require(t.table->global_pool && t.table->slots.size()==2 && t.table->half_life==2,"pool options or budget not applied");
     upload(0);upload(1);t.finish(out.data(),256);
-    t.begin(17,2,true);t.prepare(requests,1,256,256,slots);
+    t.begin(17,2,true);lifecycle_prepare(t,requests,1,slots);
     require(slots[0]>=0,"warm layer1 copy missing");const int a_slot=slots[0];t.finish(out.data(),256);
-    t.prepare(requests+2,1,256,256,slots);
+    lifecycle_prepare(t,requests+2,1,slots);
     const int b_slot=t.table->admissions[0];
     require(b_slot>=0 && b_slot!=a_slot,"cross-layer LRU chose wrong victim");upload(2);t.finish(out.data(),256);
     bytes_equal(a_slot,0);bytes_equal(b_slot,2);
 
-    vram_compute_api instrumented={};real_compute=t.compute_api;instrumented=*real_compute;instrumented.compute=blocked_compute;t.compute_api=&instrumented;
+    vram_format_compute_api instrumented={};real_compute=t.format_api;instrumented=*real_compute;instrumented.compute=blocked_compute;t.format_api=&instrumented;
     struct cleanup { ~cleanup(){unblock();} } cleanup_on_error;
-    t.begin(17,3,true);t.prepare(requests+2,2,256,256,slots);
+    t.begin(17,3,true);lifecycle_prepare(t,requests+2,2,slots);
     require(slots[0]==b_slot && slots[1]<0 && t.table->admissions[1]==a_slot,"global hit/admission mapping differs");
-    t.launch(q8.data(),q8.size(),4,25);
+    lifecycle_launch(t,input);
     {std::unique_lock<std::mutex> lock(barrier_mutex);require(barrier_cv.wait_for(lock,std::chrono::seconds(5),[]{return entered;}),"global compute did not enter");}
     upload(3);
     require(!t.table->slots[a_slot].valid && t.table->slots[b_slot].valid,"pending overwrite published early or invalidated live hit");
@@ -46,7 +45,7 @@ int main(){try{
     unblock();t.finish(out.data(),256);bytes_equal(a_slot,3);bytes_equal(b_slot,2);
     t.acquire_ready(17,requests,4,&lease,ready);
     require(!ready[0] && !ready[1] && ready[2] && ready[3],"cross-layer READY accepted overwritten payload");
-    t.release_ready(lease);t.compute_api=real_compute;
+    t.release_ready(lease);t.format_api=real_compute;
     t.begin(0,0,false);require(!t.arena && !t.table,"prefill did not release global arena");
     rejected([&]{t.validate_ready(lease);});
     std::printf("REAL_CUDA_GLOBAL_POOL_PASS assertions=%d\n",assertions);return 0;

@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "vram-tier.cpp"
+#include "test-kimi-vram-format-fixture.h"
 
 #include <functional>
 
@@ -24,7 +25,6 @@ kimi_vram_request request(size_t role) {
 void common_environment() {
     setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", "0", 1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GPU_HIDDEN", "0", 1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY", "lru", 1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", "1", 1);
@@ -47,7 +47,7 @@ int main() { try {
     { tier defaults(1); require(defaults.elastic_safety_blocks==0 && defaults.elastic_safety_mib==32,
             "elastic runtime safety defaults changed"); }
     common_environment();
-    const size_t role = 28672, stride = 3*role;
+    const size_t role = lifecycle_role_bytes(), stride = 3*role;
     const auto key = request(role);
     std::vector<float> output(256);
 
@@ -57,7 +57,7 @@ int main() { try {
     {
         tier t(20*stride);
         int slot = -1;
-        t.begin(17,1,true);t.prepare(&key,1,256,256,&slot);t.finish(output.data(),256);
+        t.begin(17,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         const size_t first_decode_slots=t.table->slots.size();
         t.phase_complete(true);
         require(t.table->slots.size()==first_decode_slots && t.grow_events==(unified?0:1),
@@ -137,7 +137,7 @@ int main() { try {
         tier t(20*stride);
         unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_MALLOC_AT");
         int slot = -1;
-        t.begin(19,1,true);t.prepare(&key,1,256,256,&slot);t.finish(output.data(),256);
+        t.begin(19,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         require(t.elastic_active && t.base_slots==16 && t.blocks[0].slot_count==16 &&
                 t.table->slots.size()==t.slot_locations.size() && t.capacity_bytes==t.slot_locations.size()*stride,
                 "a base block that did not fit did not end the base at the blocks allocated");
@@ -152,7 +152,7 @@ int main() { try {
     // test clears only its injected fault so destruction can release the GPU.
     {
         tier t(20*stride);int slot=-1;
-        t.begin(18,1,true);t.prepare(&key,1,256,256,&slot);t.finish(output.data(),256);
+        t.begin(18,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         t.prepare_prefill_reclaim();
         const size_t old_slots=t.table->slots.size(),old_blocks=t.blocks.size();
         t.fail_free_at=t.free_calls+1;size_t freed=0;
@@ -169,7 +169,7 @@ int main() { try {
     setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "37", 1);
     {
         tier t(20*stride);int slot=-1;
-        t.begin(20,1,true);t.prepare(&key,1,256,256,&slot);t.finish(output.data(),256);
+        t.begin(20,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         if(unified)t.begin(20,2,true); // unified memory grows at the boundary after the first decode step
         require(t.table->slots.size()==37,"demand fixture did not create a decode-grown tail");
         const size_t before=t.table->slots.size();
@@ -187,14 +187,14 @@ int main() { try {
     setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM", "0", 1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "53", 1);
 
-    // Non-global K3/uniform policy keeps the exact legacy single allocation
+    // Non-global uniform policy keeps the same single allocation
     // even when the process-wide elastic request is present.
     setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "0", 1);
     {
         tier t(2*stride);int slot=-1;
-        t.begin(19,1,true);t.prepare(&key,1,256,256,&slot);t.finish(output.data(),256);
+        t.begin(19,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         require(!t.elastic_active && t.arena && t.blocks.empty() &&
-                t.slot_base(1)==t.arena+stride,"K3 non-global path no longer uses its legacy arena");
+                t.slot_base(1)==t.arena+stride,"non-global path no longer uses its single arena");
     }
 
     // Admissions are priced from the second decode token: the tier measures an upload when it gets its storage and
@@ -211,7 +211,7 @@ int main() { try {
         auto r=key;
         t.begin(21,1,true);
         for (int layer = 1; layer <= 40; ++layer) {
-            r.layer=layer;t.prepare(&r,1,256,256,&slot);
+            r.layer=layer;lifecycle_prepare(t,&r,1,&slot);
             require(t.upload_us_per_expert>0 && !t.adaptive_admission && t.table->admissions[0]<0,
                     "the first decode token was priced, or the tier did not measure an upload first");
             t.finish(output.data(),256);
@@ -221,7 +221,7 @@ int main() { try {
         t.begin(21,2,true);
         require(t.adaptive_admission && t.admission_updates==1 && std::fabs(t.table->admission_hits/upload_misses-1)<0.1,
                 "the second decode token was not priced from the first token's misses");
-        r.layer=1;r.expert=8;t.prepare(&r,1,256,256,&slot);
+        r.layer=1;r.expert=8;lifecycle_prepare(t,&r,1,&slot);
         require(upload_misses<3?t.table->admissions[0]>=0:t.table->admissions[0]<0,
                 "a free slot did not follow the priced rule in the second decode token");
         t.finish(output.data(),256);

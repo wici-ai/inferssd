@@ -11,10 +11,11 @@
 //    the growth and are ggml's reserve; growth at the second decode boundary waits for a deferred upload still
 //    copying instead of skipping; a demand rise at a token boundary gives blocks back while an upload into them is
 //    in flight, and collect reports that upload as aborted.
-// The Q3_K legacy engine stands in for the expert format, as in test-kimi-vram-elastic.
+// Shared lifecycle assertions use the retained explicit Q4_K format engine.
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "vram-tier.cpp"
+#include "test-kimi-vram-format-fixture.h"
 #include <future>
 
 namespace {
@@ -48,7 +49,7 @@ void model_reserve(int, size_t bytes) { published = bytes; }
 size_t model_free() { size_t free_bytes = 0, total = 0; model_get(0, &free_bytes, &total); return free_bytes; }
 int assertions = 0;
 void require(bool ok, const char * what) { ++assertions; if (!ok) throw std::runtime_error(what); }
-const size_t role = 28672, stride = 3 * role;
+const size_t role = lifecycle_role_bytes(), stride = 3 * role;
 kimi_vram_request key(int layer, int expert) {
     kimi_vram_request r = {}; r.layer = layer; r.expert = expert; r.weight = .5f;
     for (int i = 0; i < 3; ++i) { r.role[i] = {1, 2, 100000000, uint64_t(layer * 1000 + expert * 3 + i) * role, role, 3, 4, 5, 6}; }
@@ -59,7 +60,6 @@ kimi_vram_request key(int layer, int expert) {
 int main() { try {
     setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", "1", 1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GPU_HIDDEN", "0", 1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY", "lru", 1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "1", 1);
@@ -85,7 +85,7 @@ int main() { try {
         const auto k = key(1, 0);
         int slot = -1;
         t.begin(51, 1, true);
-        t.prepare(&k, 1, 256, 256, &slot);
+        lifecycle_prepare(t,&k, 1,&slot);
         require(t.unified == unified, "the tier and ggml disagree about unified memory");
         require(t.elastic_active && t.base_slots == tier::elastic_block_slots && t.max_slots == 40,
                 "auto did not start from one block under the slot cap");
@@ -109,7 +109,7 @@ int main() { try {
         int slot = -1, queued = 0;
         hold();
         t.begin(52, 1, true);
-        t.prepare(&g, 1, 256, 256, &slot);
+        lifecycle_prepare(t,&g, 1,&slot);
         require(t.elastic_active && t.blocks.size() == 1 && t.table->admissions[0] >= 0, "reclaim fixture has no admission");
         t.reclaimer_armed = true; // armed at every decode token on unified memory
         size_t freed = 0;
@@ -138,7 +138,7 @@ int main() { try {
         require(count == 1 && aborted[0] == 1 && vram_slot_table::same(collected[0], g) &&
                 t.deferred_published == 0 && t.deferred_aborted == 1, "collect did not report the aborted upload");
         t.begin(52, 2, true);
-        t.prepare(&g, 1, 256, 256, &slot);
+        lifecycle_prepare(t,&g, 1,&slot);
         require(slot < 0 && !t.poisoned, "an aborted upload served a hit");
         t.finish(out.data(), 256);
     }
@@ -149,7 +149,7 @@ int main() { try {
         tier t(40 * stride); // a base of three blocks: 16, 16 and 8 slots
         const auto k = key(3, 2);
         int slot = -1;
-        t.begin(53, 1, true); t.prepare(&k, 1, 256, 256, &slot); t.finish(out.data(), 256);
+        t.begin(53, 1, true); lifecycle_prepare(t,&k, 1,&slot); t.finish(out.data(), 256);
         require(t.slot_locations.size() == 40 && t.blocks.size() == 3, "reclaim_host fixture has no three blocks");
         // The arithmetic is the same on any device; on a discrete GPU this only lets the test exercise it.
         t.unified = true;
@@ -163,7 +163,7 @@ int main() { try {
         require(!t.reclaim_host(SIZE_MAX / 2, "test") && t.blocks.size() == 1 && !t.poisoned,
                 "reclaim_host did not keep one block");
         t.begin(53, 2, true);
-        t.prepare(&k, 1, 256, 256, &slot);
+        lifecycle_prepare(t,&k, 1,&slot);
         const size_t slots = t.slot_locations.size();
         require(!t.reclaim_host(SIZE_MAX / 2, "test") && t.slot_locations.size() == slots && t.host_reclaim_refusals == 1,
                 "reclaim_host did not refuse inside a live layer");
@@ -198,7 +198,7 @@ int main() { try {
         policy_set_host_floor(&t, floor); policy_set_host_demand(&t, demand);
         const auto k = key(4, 0);
         int slot = -1;
-        t.begin(61, 1, true); t.prepare(&k, 1, 256, 256, &slot);
+        t.begin(61, 1, true); lifecycle_prepare(t,&k, 1,&slot);
         require(t.unified && published == floor + demand, "ggml's reserve is not the floor plus the demand");
         require(t.slot_locations.size() == 5 && t.grow_events == 0 && model_free() >= floor + demand + low,
                 "the base did not keep the floor and the demand free");
@@ -217,7 +217,7 @@ int main() { try {
         kimi_vram_request keys[17];
         for (int i = 0; i < 17; ++i) { keys[i] = key(4, i); }
         int slots[16] = {}, queued = 0;
-        t.begin(62, 1, true); t.prepare(keys, 16, 256, 256, slots);
+        t.begin(62, 1, true); lifecycle_prepare(t,keys, 16,slots);
         require(t.slot_locations.size() == 16 && t.grow_events == 0, "the auto base is not one block");
         for (int i = 0; i < 15; ++i) { t.admit_deferred(keys[i], data, &queued); require(queued == 1, "an upload was not deferred"); }
         t.drain_deferred();
@@ -239,7 +239,7 @@ int main() { try {
         require(count == 16 && std::none_of(aborted, aborted + count, [](int32_t a) { return a != 0; }),
                 "growth aborted an upload");
         int slot = -1;
-        t.prepare(&keys[16], 1, 256, 256, &slot);
+        lifecycle_prepare(t,&keys[16], 1,&slot);
         require(t.table->admissions[0] == 16, "the fixture's upload does not target the grown block");
         hold();
         t.admit_deferred(keys[16], data, &queued);
@@ -258,7 +258,7 @@ int main() { try {
         t.collect(-1, collected, aborted, 20, &count);
         require(count == 1 && aborted[0] == 1 && vram_slot_table::same(collected[0], keys[16]) && t.deferred_aborted == 1,
                 "collect did not report the upload into the freed block as aborted");
-        t.prepare(&keys[16], 1, 256, 256, &slot);
+        lifecycle_prepare(t,&keys[16], 1,&slot);
         require(slot < 0, "an aborted upload served a hit");
         t.finish(out.data(), 256);
         modeled = nullptr;
