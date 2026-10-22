@@ -217,3 +217,53 @@ iteration order between those runtimes; both original transcripts are retained,
 and their final settings/env/render outputs agree. Tests do not infer the frozen
 transcript of another Python version. No production CLI, launcher, artifact
 loader or online controller is switched by this extraction.
+
+## Offline planner consumer
+
+The installed package now connects the complete Machine model, replay/decode and
+prefill cost models, settings generation, candidate rejection, stable ranking
+and calibration to an opt-in command:
+
+```sh
+ssdash plan recorded-run --prompts 32,17 --decode 8 --window 1-8 --known \
+  --pending '' --host-threads 8 -o chosen-plan.json
+```
+
+It reads the existing `insitu.json`, `probe/device.json` and `model.json` in that
+order. It does not bootstrap, probe hardware, start a server or change the old
+adaptive/online entry points. The output retains the old plan JSON fields,
+field order, receipts, environment keys and numerical formatting. It writes the
+requested output directly, as the original planner did; it does not silently
+add atomic publication. All rejected candidates are printed before failure,
+and an all-rejected plan produces no output file.
+
+`--host-threads` supplies only a lazy fallback for a valid split placement with
+no truthy recorded `default_threads`. This is a new, explicit offline input
+boundary: planning an archived run never guesses its CPU count from the current
+host. Recorded defaults, all/pin placements and invalid split placements retain
+their previous paths. An omitted fallback errors only if it is actually needed.
+No extra numerical or schema validation is introduced by this model migration.
+
+The Python `Machine` accepts an `ArtifactReader` and a host callback. It retains
+input references and owns mutable replay/sink caches. It reads a saved plan only
+when `pending is None`, after prefill construction and configuration generation;
+an explicit empty pending sequence still suppresses that read. `run_plan` takes
+explicit clock, output and JSON-writer ports. Tests fix the clock transcript to
+compare `plan_seconds` and entire JSON/stdout bytes; real CLI timing is measured.
+
+Whole-file F oracles cover the complete old planner, Machine and reload-to-settings
+call graph under the measured Python 3.9 and 3.12 runtimes. F's arithmetic,
+iteration/tie order, cache reuse and exception timing remain the reference.
+Supplemental tests use real temporary artifacts, the installed CLI and original
+F state transitions. The saved historical run is only its actual legacy input,
+not evidence for modern UMA/lane configurations or a historical F output.
+
+Decode pricing now has one Mapping-based F implementation, `price_mapping`.
+The existing frozen `LayerResponse` validation remains available; `price_decode`
+is its thin adapter with unchanged successful numerical results. One error text
+is deliberately aligned with F: uncapped explicit null readiness raises the
+native `TypeError` at exponentiation instead of the adapter's former custom
+message. The exception class and empty-range behavior remain unchanged.
+
+This batch does not migrate the settings CLI's ledger-log parser, the fourteen-key
+engine registry, telemetry, live control, launch execution or Mac auto-planning.

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Optional
 
 from ssdash.contracts import DeviceProfile
+from ssdash.plan.planner import run_plan
+from ssdash.plan.planner_types import PlanArguments
+from ssdash.plan.recorded import DirectoryArtifacts, explicit_host_threads, write_json
 from ssdash.probe.device_profile import aggregate
 from ssdash.probe.recorded import load_reports
 
@@ -22,7 +26,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     probe.add_argument("--experts", required=True, type=Path)
     validate = commands.add_parser("validate", help="validate a device schema-2 artifact")
     validate.add_argument("--device", required=True, type=Path)
+    plan = commands.add_parser("plan", help="plan from existing bootstrap artifacts only")
+    plan.add_argument("run", type=Path)
+    plan.add_argument("--prompts", required=True)
+    plan.add_argument("--decode", type=int, default=512)
+    plan.add_argument("--window", default="129-512")
+    plan.add_argument("--known", action="store_true")
+    plan.add_argument("--pending", default="")
+    plan.add_argument(
+        "--host-threads", type=int, help="explicit fallback for a recorded split placement"
+    )
+    plan.add_argument("-o", "--out", required=True)
     args = parser.parse_args(argv)
+    if args.command == "plan":
+        run_plan(
+            PlanArguments(
+                args.prompts, args.decode, args.window, args.known, args.pending, args.out
+            ),
+            DirectoryArtifacts(args.run),
+            host_threads=explicit_host_threads(args.host_threads),
+            clock=time.time,
+            emit=print,
+            write_json=write_json,
+        )
+        return 0
     try:
         if args.command == "probe":
             reports, experts = load_reports(args.from_reports, args.experts)

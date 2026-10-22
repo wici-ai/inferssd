@@ -289,3 +289,137 @@ def test_f_frozen(case):
 def test_plan_oracle_identity():
     manifest = json.loads((ORACLES / "planner-manifest.json").read_text())
     assert hashlib.sha256((ORACLES / "plan_f.py").read_bytes()).hexdigest() == manifest["sha256"]
+
+
+def observe_candidate(case):
+    import argparse
+
+    from ssdash.model import machine as candidate
+    from ssdash.plan import settings
+    from ssdash.plan.planner import run_plan
+    from ssdash.plan.planner_types import PlanArguments
+
+    transcript, instances = Transcript(case), []
+    output, calls = io.StringIO(), []
+
+    class Captured(candidate.Machine):
+        def __init__(self, artifacts, *args, **kwargs):
+            instances.append(self)
+            if isinstance(artifacts, str):
+                artifacts = transcript
+            kwargs["host_threads"] = transcript.host
+            super().__init__(artifacts, *args, **kwargs)
+
+    names = {v.__code__: k for k, v in vars(candidate.Machine).items() if callable(v)}
+
+    def profile(frame, event, arg):
+        if event == "call" and frame.f_code in names:
+            calls.append(names[frame.f_code])
+
+    original_profile, original_path = sys.getprofile(), sys.path[:]
+    outcome, action_results = None, []
+    try:
+        with contextlib.redirect_stdout(output):
+            sys.setprofile(profile)
+            if case.get("mode", "plan") == "machine":
+                pending = case.get("pending")
+                if case.get("pending_iterator"):
+                    pending = iter(pending)
+                m = Captured(transcript, pending=pending, workload=case.get("workload"))
+                action_results = actions(m, case)
+                outcome = ["return"]
+            else:
+                parser = argparse.ArgumentParser()
+                parser.add_argument("--prompts", required=True)
+                parser.add_argument("--decode", type=int, default=512)
+                parser.add_argument("--window", default="129-512")
+                parser.add_argument("--known", action="store_true")
+                parser.add_argument("--pending", default="")
+                a = parser.parse_args(case.get("argv", []))
+                run_plan(
+                    PlanArguments(
+                        a.prompts, a.decode, a.window, a.known, a.pending, "/case/run/plan.json"
+                    ),
+                    transcript,
+                    host_threads=transcript.host,
+                    clock=transcript.clock,
+                    emit=print,
+                    write_json=transcript.write_json,
+                    factory=Captured,
+                )
+                outcome = ["return"]
+                if case.get("reload", True):
+                    # Preserve the frozen settings CLI scaffold, replacing its complete
+                    # computation dependencies with the new Machine/settings consumer.
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(
+                            patch.dict(
+                                sys.modules,
+                                machine=SimpleNamespace(Machine=Captured),
+                                logparse=SimpleNamespace(ledger=lambda _: None),
+                            )
+                        )
+                        stack.enter_context(
+                            patch.object(F_SETTINGS, "open", transcript.open, create=True)
+                        )
+                        stack.enter_context(
+                            patch.object(
+                                F_SETTINGS,
+                                "json",
+                                SimpleNamespace(load=lambda f: transcript.read_json(f.name)),
+                            )
+                        )
+                        stack.enter_context(
+                            patch.object(
+                                F_SETTINGS,
+                                "os",
+                                SimpleNamespace(
+                                    path=SimpleNamespace(abspath=lambda p: p),
+                                    replace=transcript.replace,
+                                ),
+                            )
+                        )
+                        stack.enter_context(patch.object(F_SETTINGS, "derive", settings.derive))
+                        stack.enter_context(
+                            patch.object(
+                                F_SETTINGS,
+                                "configuration",
+                                lambda m, tier, p: settings.configuration(
+                                    m, tier, p, host_threads=transcript.host
+                                ),
+                            )
+                        )
+                        stack.enter_context(patch.object(F_SETTINGS, "render", settings.render))
+                        stack.enter_context(
+                            patch.object(
+                                sys,
+                                "argv",
+                                ["settings.py", "/case/run", "-o", "/case/settings.env"],
+                            )
+                        )
+                        F_SETTINGS.main()
+    except (Exception, SystemExit) as error:
+        outcome = [type(error).__name__, str(error)]
+    finally:
+        sys.path[:] = original_path
+        sys.setprofile(original_profile)
+    return {
+        "outcome": outcome,
+        "events": transcript.events,
+        "stdout": output.getvalue(),
+        "writes": transcript.writes,
+        "states": [digest(state(m)) for m in instances],
+        "aliases": [
+            [getattr(m, "P", None) is getattr(m, "ins", {}).get("placements")] for m in instances
+        ],
+        "actions": action_results,
+        "calls": calls,
+        "mapping_reads_sha256": digest(transcript.reads),
+        "mapping_read_count": len(transcript.reads),
+        "loaded_after": [digest(x) for x in transcript.loaded],
+    }
+
+
+@pytest.mark.parametrize("case", DATA["cases"], ids=lambda c: c["name"])
+def test_new_complete_callgraph(case):
+    assert observe_candidate(case) == case["expected"][runtime_key()]
