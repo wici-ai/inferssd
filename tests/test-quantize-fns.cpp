@@ -129,6 +129,16 @@ int main(int argc, char * argv[]) {
     int num_failed = 0;
     bool failed = false;
 
+    // Removed slots must be rejected before size/block modulo, even for zero bytes.
+    for (int id : {-1, 4, 5, 31, 32, 33, 36, 37, 38, 42, int(GGML_TYPE_COUNT)}) {
+        for (size_t bytes : {size_t(0), size_t(129)}) {
+            if (ggml_validate_row_data(ggml_type(id), nullptr, bytes)) {
+                fprintf(stderr, "validation accepted unsupported type %d\n", id);
+                return 1;
+            }
+        }
+    }
+
     for (int i = 0; i < GGML_TYPE_COUNT; i++) {
         ggml_type type = (ggml_type) i;
         const auto * qfns = ggml_get_type_traits(type);

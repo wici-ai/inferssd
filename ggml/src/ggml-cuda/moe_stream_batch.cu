@@ -27160,8 +27160,7 @@ static bool moe_stream_type_supported(ggml_type type) {
 
 static bool moe_stream_pack_prefetch_type_supported(ggml_type type) {
     return moe_stream_type_supported(type) ||
-        type == GGML_TYPE_MXFP4 ||
-        type == GGML_TYPE_F8_E4M3_B128;
+        type == GGML_TYPE_MXFP4;
 }
 
 static std::atomic<int> g_q4_down_parity_calls{0};
