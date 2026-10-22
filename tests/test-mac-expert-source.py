@@ -62,7 +62,7 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
         env["GGML_MOE_EXPERT_GGUF_ALIAS_TSV" if source.suffix == ".tsv" else "SSD_LLAMA_MAC_EXPERT_PACK"] = str(source)
         if both:
             env["SSD_LLAMA_MAC_EXPERT_PACK"] = str(pack)
-        result = subprocess.run([str(binary), *(commands if commands is not None else args + args)], env=env, text=True, capture_output=True)
+        result = subprocess.run([str(binary), *(commands if commands is not None else args + args)], env=env, text=True, capture_output=True, timeout=60)
         if expected_error:
             assert result.returncode != 0 and expected_error in result.stderr, (source, result.returncode, result.stderr)
         else:
@@ -103,6 +103,13 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
             bad.write_text(body)
             run(bad, 1, message)
         run(alias, 1, "select one expert source", both=True)
+        fifo = root / "fifo.gguf"
+        os.mkfifo(fifo)
+        bad.write_text(header + f"{names[0]}\t0\t614401\t{fifo}\t0\n")
+        run(bad, 1, "expert source must be a regular file")
+        fifo_index = root / "fifo.tsv"
+        os.mkfifo(fifo_index)
+        run(fifo_index, 1, "alias index must be a regular file")
         for alignment in (1, 4096, 16384):
             for depth in (0, 2):
                 shards[1][0].write_bytes(shards[1][1])
@@ -122,4 +129,4 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
         large_args = [word for i in range(3) for word in ("blk.0.ffn_up_exps.weight", str(i), str(large), str(large_expected))]
         reference = run(large_alias, 0, commands=large_args, depth=0)
         assert run(large_alias, 0, commands=large_args, depth=4) == reference
-print(f"{case_count} source, pipeline, alignment, prefill-cache isolation, bounds, short-read, duplicate and pin cases passed")
+print(f"{case_count} source, pipeline, alignment, prefill-cache isolation, budget, bounds, short-read, duplicate and pin cases passed")

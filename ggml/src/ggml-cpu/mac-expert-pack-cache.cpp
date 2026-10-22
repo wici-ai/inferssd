@@ -63,10 +63,15 @@ struct source_file {
     std::string path;
     int fd;
     uint64_t bytes;
-    explicit source_file(const char * source_path) : path(source_path), fd(open(source_path, O_RDONLY)) {
+    explicit source_file(const char * source_path) : path(source_path), fd(open(source_path, O_RDONLY | O_NONBLOCK)) {
         if (fd < 0) { throw std::runtime_error("cannot open expert source: " + std::string(std::strerror(errno))); }
         struct stat info {};
-        if (fstat(fd, &info) != 0 || info.st_size < 0
+        const bool stat_failed = fstat(fd, &info) != 0;
+        if (!stat_failed && !S_ISREG(info.st_mode)) {
+            close(fd);
+            throw std::runtime_error("expert source must be a regular file");
+        }
+        if (stat_failed || info.st_size < 0
 #if defined(__APPLE__)
                 || fcntl(fd, F_NOCACHE, 1) == -1
 #endif
@@ -582,6 +587,10 @@ private:
     }
 
     void load_alias(const char * path) {
+        struct stat info {};
+        if (stat(path, &info) != 0 || !S_ISREG(info.st_mode)) {
+            throw std::runtime_error("expert alias index must be a regular file");
+        }
         std::ifstream input(path);
         if (!input) { throw std::runtime_error("cannot open expert alias index"); }
         std::unordered_map<std::string, source_file *> opened;

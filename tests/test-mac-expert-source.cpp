@@ -5,7 +5,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <iterator>
 #include <unistd.h>
 #include <vector>
 
@@ -38,8 +37,8 @@ int main(int argc, char ** argv) {
         for (int i = begin; i < end; i += 4) {
             const auto expert = int32_t(std::strtol(argv[i + 1], nullptr, 10));
             std::ifstream file(argv[i + 3], std::ios::binary);
-            std::vector<char> expected((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-            if (expected.size() != bytes) { return 3; }
+            std::vector<char> expected(bytes);
+            if (!file.read(expected.data(), static_cast<std::streamsize>(bytes)) || file.peek() != EOF) { return 3; }
             const auto * data = static_cast<const char *>(ggml_mac_expert_pack_acquire_batch(batch, argv[i], expert, bytes));
             const void * pinned = cache_updates ? ggml_mac_expert_pack_acquire(argv[i], expert, bytes) : data;
             const char * alignment = std::getenv("SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT");
