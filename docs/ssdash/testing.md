@@ -68,3 +68,22 @@ executes its other assertions but returns 77, requiring a separate normal-build
 pass for physical-release acceptance. Current device allowlists and hosted
 runner capability measurements must be collected; they are not inferred from
 historical failure totals.
+
+## Apple Silicon integration
+
+`mac_expert_pack_cache` runs on Linux and macOS using a synthetic three-expert
+pack. It checks malformed headers and index entries, LFU retention/eviction and
+pinning while another expert is acquired. Linux uses the same reader/cache code
+without the Apple-only `F_NOCACHE` call. A malformed zero `data_start` is rejected
+before unsigned index-geometry arithmetic. ASan/UBSan are useful for this test.
+
+The Mac CI build enables Metal, runs that portable cache test, exercises Muse
+rendering with `test-chat --template muse-spark`, and checks the Q4_K/Q5_K/Q8_0
+CPU `MUL_MAT_ID` cases. This is a compilation and synthetic correctness gate.
+The separate target-device gate still needs matched model token sequences and
+memory/performance measurements; no model result follows from hosted CI.
+
+The unfiltered historical `test-chat` suite also reaches a failing Kimi-K3 marker
+case. It remains outside the supported Muse rendering gate and is not declared
+passing or silently allowlisted. Code organization must resolve it with the
+retired K3 implementation rather than changing a generic assertion tolerance.

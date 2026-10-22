@@ -77,12 +77,12 @@ jobs:
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF
       - name: Build
-        run: cmake --build build --parallel 2 --target llama-server test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan test-reasoning-budget test-server-expert-guard test-graph-overhead test-linux-test-resources
+        run: cmake --build build --parallel 2 --target llama-server test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan test-reasoning-budget test-server-expert-guard test-graph-overhead test-linux-test-resources test-mac-expert-pack-cache
       - name: Synthetic tests
         shell: bash
         run: |
           set -o pipefail
-          ctest --test-dir build --output-on-failure --no-tests=error -R '^(test-dsv41-engram|kimi_prefill_cost|moe_pack_copy_plan|test-reasoning-budget|server_expert_guard|test-graph-overhead|linux_test_resources)$' | tee cpu-tests.log
+          ctest --test-dir build --output-on-failure --no-tests=error -R '^(test-dsv41-engram|kimi_prefill_cost|moe_pack_copy_plan|test-reasoning-budget|server_expert_guard|test-graph-overhead|linux_test_resources|mac_expert_pack_cache)$' | tee cpu-tests.log
           ! grep -E '\bSKIP\b|\*\*\*Not Run|\*\*\*Skipped' cpu-tests.log
 
   macos:
@@ -93,9 +93,18 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=OFF -DGGML_METAL=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF
-      - run: cmake --build build --parallel 3 --target llama-server test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan
-      - run: ctest --test-dir build --output-on-failure --no-tests=error -R '^(test-dsv41-engram|kimi_prefill_cost|moe_pack_copy_plan)$'
+      - name: Build Metal and portable cache tests
+        run: SSD_LLAMA_BUILD_JOBS=3 bash scripts/build-macos-metal.sh
+      - name: Cache and Muse rendering tests
+        run: |
+          ctest --test-dir build-mac --output-on-failure --no-tests=error -R '^mac_expert_pack_cache$'
+          build-mac/bin/test-chat --template muse-spark
+      - name: Quantized CPU operator checks on Apple Silicon
+        shell: bash
+        run: |
+          set -o pipefail
+          build-mac/bin/test-backend-ops test -b CPU -o MUL_MAT_ID -p 'type_a=(q4_K|q5_K|q8_0)' | tee mac-operators.log
+          grep -q '148/148 tests passed' mac-operators.log
 
   cuda-compile:
     if: github.event_name == 'workflow_dispatch'
