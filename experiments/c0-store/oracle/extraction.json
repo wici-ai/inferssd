@@ -1,0 +1,16 @@
+{
+  "source": "ggml/src/ggml-cuda/moe_stream_batch_common.cu",
+  "source_sha256": "cf589281172adbd817ef7dcd116e466d6b224efdb0402328e6e216c62cdba253",
+  "fragments": {
+    "entry-cmp": "98a9fdd84c095a73cbe56b3ea5cead41315c85b8b2005028318a1aac5db12c8a",
+    "env-bool": "2aac3b4c8db2ad1333bdda671d0468af2425a8724b982edae44d23da4b353937",
+    "read-and-key": "829c2a1faef3e740bc165da82c86461a5d49d03a23fde71c5da56fbde235b969",
+    "open-and-pack-v1": "49f7afdd5898eb76d6d76af592cf800701ac7e54b14183e387d6576a8234475e",
+    "alias-tsv": "8781233757d0b80e038fd852a1a8dc83380c824a63fa1efd887d27522fa31826"
+  },
+  "config_helpers_sha256": "106a7b5841befcd047a7378520c61dd6a469c6e6c0be9709cf71297f89c22c0c",
+  "member_transform": "remove only leading static on free-function declaration lines",
+  "finalize_transform": "retain sort and replacement loop; pass replace_duplicates as argument",
+  "source_commit": "f2369f98a37487d1882da2aa24b90cac2ef053f7",
+  "source_git_blob": "97bdaced1198536d9e6861a9457236e9686313bb"
+}
