@@ -307,3 +307,39 @@ old settings CLI scaffold. A separate F-only host supplement retains the origina
 recorded-value lookup before injecting host fallback; the first observations
 remain unchanged. Future Python versions are not inferred equivalent from these
 two tested runtimes.
+
+### Fit recorded calibration artifacts
+
+`ssdash fit` reads existing arm logs; it does not start a bootstrap or access
+hardware. It completes the offline `fit → plan → settings` path:
+
+```sh
+ssdash fit --run all=records/all --run pin=records/pin --skip 128 \
+  --profile recorded/model.json -o recorded/insitu.json
+ssdash plan recorded --prompts 512 --decode 256 --window 1-256 -o recorded/plan.json
+ssdash settings recorded -o recorded/settings.env
+```
+
+The destination directory must already exist. `plan` additionally reads the
+recorded `probe/device.json`; split placements without recorded thread facts need
+its explicit `--host-threads` input, as described above. Optional `fit --graph DIR`
+reads a recorded graph arm, and `--ubatch-probe FILE` reads the old numeric or
+`{first, held}` ubatch JSON. These options do not execute either probe.
+
+The first named placement is the reference. Repeated names are all measured and
+replace their earlier value without changing insertion order. The command keeps
+F's calibration arithmetic, layer fitting, shallow derived-placement references,
+report text and legacy model schema 2 / insitu schema 3 formats. Records are typing
+views rather than newly validated schemas. Insufficient or malformed recordings
+retain the original failure behavior.
+
+Output timing is also retained: the compact model profile is directly written
+before optional ubatch processing; the indented insitu file is directly written
+before the report. Later errors may leave one or both outputs, including partial
+writes. The temporary streams passed to `json.dump` retain their original implicit
+close behavior; this command does not replace it with a transaction or explicit
+`with` block. Whole-program F observations cover Python 3.9 and 3.12 separately,
+including exact rounded fitting output and the downstream plan/settings bytes.
+This is a recorded-format compatibility command, not the pending versioned
+telemetry/registry, device bootstrap or online-controller migration. The old
+`tools/adaptive/insitu.py` entry remains unchanged.
