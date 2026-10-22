@@ -315,6 +315,7 @@ def main():
     parser.add_argument("--prompt-tokens", type=int, default=32)
     parser.add_argument("--tokens", type=int, default=32)
     parser.add_argument("--batch", type=int, default=512)
+    parser.add_argument("--ctx-checkpoints", type=int, help="Override the server context-checkpoint count; 0 disables checkpoints")
     parser.add_argument("--runs", type=int, default=2)
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--out", type=Path, required=True)
@@ -332,6 +333,8 @@ def main():
         parser.error("profile-seconds must be between 0 and 10")
     if args.poll is not None and not 0 <= args.poll <= 100:
         parser.error("poll must be between 0 and 100")
+    if args.ctx_checkpoints is not None and args.ctx_checkpoints < 0:
+        parser.error("ctx-checkpoints must be nonnegative")
     repo = Path(__file__).resolve().parents[2]
     binary = (args.binary or repo / "build-mac-pipeline/bin/llama-server").resolve()
     model = args.model_file.resolve()
@@ -370,6 +373,8 @@ def main():
         cmd += ["-ot", r"blk\.[0-9]+\.engram_embd\.weight=CPU"]
     if args.poll is not None:
         cmd += ["--poll", str(args.poll), "--poll-batch", str(args.poll)]
+    if args.ctx_checkpoints is not None:
+        cmd += ["--ctx-checkpoints", str(args.ctx_checkpoints)]
     save(args.out / "config.json", {"argv": cmd, "env": overrides, "git": command(["git", "-C", str(repo), "rev-parse", "HEAD"]).strip(),
          "driver": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
          "status": command(["git", "-C", str(repo), "status", "--short"]), "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
