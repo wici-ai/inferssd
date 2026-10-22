@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
+#include <sstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -43,6 +45,45 @@ struct pack_entry {
 #pragma pack(pop)
 static_assert(sizeof(pack_header) == 40);
 static_assert(sizeof(pack_entry) == 152);
+
+struct source_entry {
+    int fd;
+    uint64_t offset;
+    size_t bytes;
+    size_t read_bytes;
+};
+
+struct source_file {
+    int fd;
+    uint64_t bytes;
+    explicit source_file(const char * path) : fd(open(path, O_RDONLY)) {
+        if (fd < 0) { throw std::runtime_error("cannot open expert source: " + std::string(std::strerror(errno))); }
+        struct stat info {};
+        if (fstat(fd, &info) != 0 || info.st_size < 0
+#if defined(__APPLE__)
+                || fcntl(fd, F_NOCACHE, 1) == -1
+#endif
+                ) {
+            const std::string reason = std::strerror(errno);
+            close(fd);
+            throw std::runtime_error("cannot prepare expert source: " + reason);
+        }
+        bytes = uint64_t(info.st_size);
+    }
+    ~source_file() { close(fd); }
+    source_file(const source_file &) = delete;
+    source_file & operator=(const source_file &) = delete;
+};
+
+static uint64_t parse_uint(const std::string & text) {
+    if (text.empty() || text.find_first_not_of("0123456789") != std::string::npos) {
+        throw std::runtime_error("invalid unsigned integer in expert alias index");
+    }
+    size_t used = 0;
+    const auto value = std::stoull(text, &used);
+    if (used != text.size()) { throw std::runtime_error("invalid expert alias integer"); }
+    return value;
+}
 
 struct key {
     std::string name;
@@ -93,67 +134,23 @@ static void pread_exact(int fd, void * data, size_t bytes, uint64_t offset) {
 
 class pack_cache {
 public:
-    explicit pack_cache(const char * path) {
+    explicit pack_cache(const char * path, bool alias) {
         if (const char * value = std::getenv("SSD_LLAMA_MAC_EXPERT_TRACE")) { trace_path = value; }
-        fd = open(path, O_RDONLY);
-        if (fd < 0) { throw std::runtime_error("cannot open expert pack: " + std::string(std::strerror(errno))); }
-        try {
-            struct stat info {};
-            if (fstat(fd, &info) != 0 || info.st_size < static_cast<off_t>(sizeof(pack_header))) {
-                throw std::runtime_error("expert pack is truncated or cannot be stat'ed");
-            }
-            file_bytes = uint64_t(info.st_size);
-            pack_header header {};
-            pread_exact(fd, &header, sizeof(header), 0);
-            if (std::memcmp(header.magic, "GGMLMOEPACKv1\0\0\0", 16) != 0 ||
-                    header.version != 1 || header.header_size != sizeof(header) ||
-                    header.entry_count == 0 || header.entry_count > max_entries ||
-                    header.data_start < sizeof(header) || header.data_start > file_bytes ||
-                    header.data_start % alignment != 0 ||
-                    header.entry_count > (header.data_start - sizeof(header)) / sizeof(pack_entry)) {
-                throw std::runtime_error("invalid v1 expert-pack header");
-            }
-            index.reserve(size_t(header.entry_count));
-            for (uint64_t i = 0; i < header.entry_count; ++i) {
-                pack_entry entry {};
-                pread_exact(fd, &entry, sizeof(entry), sizeof(header) + i * sizeof(entry));
-                const void * terminator = std::memchr(entry.name, '\0', sizeof(entry.name));
-                if (!terminator || entry.expert < 0 || entry.reserved != 0 || entry.bytes == 0 ||
-                        entry.bytes > SIZE_MAX || entry.offset < header.data_start ||
-                        entry.offset % alignment != 0 || entry.offset > file_bytes ||
-                        round_up(size_t(entry.bytes)) > file_bytes - entry.offset) {
-                    throw std::runtime_error("invalid expert-pack index entry " + std::to_string(i));
-                }
-                key item { std::string(entry.name), entry.expert };
-                if (!index.emplace(std::move(item), entry).second) {
-                    throw std::runtime_error("duplicate expert-pack index entry " + std::to_string(i));
-                }
-                tensor_names.insert(std::string(entry.name));
-            }
-#if defined(__APPLE__)
-            if (fcntl(fd, F_NOCACHE, 1) == -1) {
-                throw std::runtime_error("F_NOCACHE failed: " + std::string(std::strerror(errno)));
-            }
-#endif
-            const char * budget_env = std::getenv("SSD_LLAMA_MAC_EXPERT_CACHE_MIB");
-            char * end = nullptr;
-            errno = 0;
-            unsigned long long mib = budget_env ? std::strtoull(budget_env, &end, 10) : 4096;
-            if ((budget_env && (errno || end == budget_env || *end)) || mib > 16384) {
-                throw std::runtime_error("SSD_LLAMA_MAC_EXPERT_CACHE_MIB must be 0..16384");
-            }
-            budget = size_t(mib) << 20;
-            if (const char * value = std::getenv("SSD_LLAMA_MAC_EXPERT_CACHE_POLICY")) { policy = value; }
-            if (policy != "lfu" && policy != "lru") {
-                throw std::runtime_error("SSD_LLAMA_MAC_EXPERT_CACHE_POLICY must be lfu or lru");
-            }
-            std::fprintf(stderr, "[mac_expert_pack] path=%s entries=%zu cache_budget_mib=%llu cache_policy=%s F_NOCACHE=1\n",
-                         path, index.size(), mib, policy.c_str());
-        } catch (...) {
-            close(fd);
-            fd = -1;
-            throw;
+        if (alias) { load_alias(path); } else { load_pack(path); }
+        const char * budget_env = std::getenv("SSD_LLAMA_MAC_EXPERT_CACHE_MIB");
+        char * end = nullptr;
+        errno = 0;
+        unsigned long long mib = budget_env ? std::strtoull(budget_env, &end, 10) : 4096;
+        if ((budget_env && (errno || end == budget_env || *end)) || mib > 16384) {
+            throw std::runtime_error("SSD_LLAMA_MAC_EXPERT_CACHE_MIB must be 0..16384");
         }
+        budget = size_t(mib) << 20;
+        if (const char * value = std::getenv("SSD_LLAMA_MAC_EXPERT_CACHE_POLICY")) { policy = value; }
+        if (policy != "lfu" && policy != "lru") {
+            throw std::runtime_error("SSD_LLAMA_MAC_EXPERT_CACHE_POLICY must be lfu or lru");
+        }
+        std::fprintf(stderr, "[mac_expert_pack] path=%s entries=%zu cache_budget_mib=%llu cache_policy=%s source=%s F_NOCACHE=1\n",
+                     path, index.size(), mib, policy.c_str(), alias ? "gguf-alias" : "pack");
     }
 
     ~pack_cache() {
@@ -167,7 +164,6 @@ public:
             }
         }
         free(scratch_data);
-        if (fd >= 0) { close(fd); }
     }
 
     const void * acquire(const char * name, int32_t expert, size_t logical_bytes) {
@@ -249,11 +245,11 @@ public:
         fresh.allocated = allocation;
         fresh.admitted = admit;
         const auto read_start = std::chrono::steady_clock::now();
-        pread_exact(fd, fresh.data, allocation, source->second.offset);
+        pread_exact(source->second.fd, fresh.data, source->second.read_bytes, source->second.offset);
         read_us += std::chrono::duration<double, std::micro>(
                 std::chrono::steady_clock::now() - read_start).count();
         ++read_requests;
-        read_bytes += allocation;
+        read_bytes += source->second.read_bytes;
         fresh.pins = 1;
         fresh.last_use = ++clock;
         auto inserted = slots.emplace(id, std::move(fresh));
@@ -284,6 +280,84 @@ public:
     }
 
 private:
+    void load_pack(const char * path) {
+        sources.emplace_back(std::make_unique<source_file>(path));
+        const auto & file = *sources.back();
+        if (file.bytes < sizeof(pack_header)) { throw std::runtime_error("truncated expert pack"); }
+        pack_header header {};
+        pread_exact(file.fd, &header, sizeof(header), 0);
+        if (std::memcmp(header.magic, "GGMLMOEPACKv1\0\0\0", 16) != 0 ||
+                header.version != 1 || header.header_size != sizeof(header) ||
+                header.entry_count == 0 || header.entry_count > max_entries ||
+                header.data_start < sizeof(header) || header.data_start > file.bytes ||
+                header.data_start % alignment != 0 ||
+                header.entry_count > (header.data_start - sizeof(header)) / sizeof(pack_entry)) {
+            throw std::runtime_error("invalid v1 expert-pack header");
+        }
+        index.reserve(size_t(header.entry_count));
+        for (uint64_t i = 0; i < header.entry_count; ++i) {
+            pack_entry entry {};
+            pread_exact(file.fd, &entry, sizeof(entry), sizeof(header) + i * sizeof(entry));
+            if (!std::memchr(entry.name, '\0', sizeof(entry.name)) || entry.expert < 0 || entry.reserved != 0 ||
+                    entry.bytes == 0 || entry.bytes > SIZE_MAX || entry.offset < header.data_start ||
+                    entry.offset % alignment != 0 || entry.offset > file.bytes ||
+                    round_up(size_t(entry.bytes)) > file.bytes - entry.offset) {
+                throw std::runtime_error("invalid expert-pack index entry " + std::to_string(i));
+            }
+            add_entry(entry.name, entry.expert, {file.fd, entry.offset, size_t(entry.bytes), round_up(size_t(entry.bytes))});
+        }
+    }
+
+    void add_entry(const std::string & name, int32_t expert, source_entry entry) {
+        if (!index.emplace(key{name, expert}, entry).second) {
+            throw std::runtime_error("duplicate expert-source index entry");
+        }
+        tensor_names.insert(name);
+    }
+
+    void load_alias(const char * path) {
+        std::ifstream input(path);
+        if (!input) { throw std::runtime_error("cannot open expert alias index"); }
+        std::unordered_map<std::string, source_file *> opened;
+        std::string line;
+        if (!std::getline(input, line)) { throw std::runtime_error("empty expert alias index"); }
+        const std::string header = "tensor\texpert_idx\tnbytes\tsource_path\toffset";
+        if (!line.empty() && line.back() == '\r') { line.pop_back(); }
+        if (line != header && line.compare(0, header.size() + 1, header + "\t") != 0) {
+            throw std::runtime_error("invalid expert alias header");
+        }
+        while (std::getline(input, line)) {
+            if (!line.empty() && line.back() == '\r') { line.pop_back(); }
+            if (line.empty()) { throw std::runtime_error("empty expert alias row"); }
+            if (index.size() >= max_entries || line.size() > 65536) { throw std::runtime_error("expert alias index too large"); }
+            std::istringstream row(line);
+            std::string name, expert_text, bytes_text, file_path, offset_text;
+            if (!std::getline(row, name, '\t') || !std::getline(row, expert_text, '\t') ||
+                    !std::getline(row, bytes_text, '\t') || !std::getline(row, file_path, '\t') ||
+                    !std::getline(row, offset_text, '\t') || name.empty() || name.size() >= 128 ||
+                    file_path.empty() || file_path[0] != '/') {
+                throw std::runtime_error("invalid expert alias row (source paths must be absolute)");
+            }
+            const uint64_t expert = parse_uint(expert_text), bytes = parse_uint(bytes_text), offset = parse_uint(offset_text);
+            if (expert > INT32_MAX || bytes == 0 || bytes > SIZE_MAX || offset > uint64_t(INT64_MAX)) {
+                throw std::runtime_error("expert alias entry is out of range");
+            }
+            auto found = opened.find(file_path);
+            if (found == opened.end()) {
+                sources.emplace_back(std::make_unique<source_file>(file_path.c_str()));
+                found = opened.emplace(file_path, sources.back().get()).first;
+            }
+            const auto & file = *found->second;
+            if (offset > file.bytes || bytes > file.bytes - offset) {
+                throw std::runtime_error("expert alias slice exceeds source file");
+            }
+            // GGUF slices need not be page aligned. Unlike padded packs, read exactly
+            // the logical extent; in particular, never read beyond the final tensor.
+            add_entry(name, int32_t(expert), {file.fd, offset, size_t(bytes), size_t(bytes)});
+        }
+        if (!input.eof() || index.empty()) { throw std::runtime_error("invalid expert alias index"); }
+    }
+
     void maybe_log_stats() const {
         if ((hits + misses) % 1024 == 0) { log_stats("periodic"); }
     }
@@ -303,15 +377,14 @@ private:
                 allocated_bytes, peak_bytes);
     }
 
-    int fd = -1;
-    uint64_t file_bytes = 0;
+    std::vector<std::unique_ptr<source_file>> sources;
     size_t budget = 0;
     size_t allocated_bytes = 0;
     size_t peak_bytes = 0;
     uint64_t clock = 0, hits = 0, misses = 0, read_requests = 0, read_bytes = 0, evictions = 0, scratch_reuses = 0;
     double read_us = 0.0;
     std::mutex mutex;
-    std::unordered_map<key, pack_entry, key_hash> index;
+    std::unordered_map<key, source_entry, key_hash> index;
     std::unordered_set<std::string> tensor_names;
     std::unordered_map<key, uint16_t, key_hash> heat;
     std::unordered_map<key, slot, key_hash> slots;
@@ -325,8 +398,11 @@ private:
 static pack_cache * instance() {
     static std::unique_ptr<pack_cache> cache = []() -> std::unique_ptr<pack_cache> {
         const char * path = std::getenv("SSD_LLAMA_MAC_EXPERT_PACK");
-        if (!path || !*path) { return nullptr; }
-        return std::make_unique<pack_cache>(path);
+        const char * alias = std::getenv("GGML_MOE_EXPERT_GGUF_ALIAS_TSV");
+        const bool has_pack = path && *path, has_alias = alias && *alias;
+        if (has_pack && has_alias) { throw std::runtime_error("select one expert source: pack or GGUF alias"); }
+        if (!has_pack && !has_alias) { return nullptr; }
+        return std::make_unique<pack_cache>(has_alias ? alias : path, has_alias);
     }();
     return cache.get();
 }
@@ -335,7 +411,8 @@ static pack_cache * instance() {
 
 extern "C" bool ggml_mac_expert_pack_enabled(void) {
     const char * path = std::getenv("SSD_LLAMA_MAC_EXPERT_PACK");
-    return path && *path;
+    const char * alias = std::getenv("GGML_MOE_EXPERT_GGUF_ALIAS_TSV");
+    return (path && *path) || (alias && *alias);
 }
 
 extern "C" const void * ggml_mac_expert_pack_acquire(const char * name, int32_t expert, size_t bytes) {
