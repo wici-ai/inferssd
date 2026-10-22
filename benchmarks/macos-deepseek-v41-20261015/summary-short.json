@@ -1,0 +1,205 @@
+{
+  "32": {
+    "fork": {
+      "prefill_tok_s": 1.3049060102706704,
+      "decode_tok_s": 1.2166627537222618,
+      "cases": [
+        {
+          "case": "fork-p32-r1",
+          "prefill_tok_s": 1.3049060102706704,
+          "decode_tok_s": 1.2166627537222618,
+          "prompt_ms": 24522.839,
+          "decode_ms": 25479.534,
+          "matches_original": false
+        }
+      ],
+      "prefill_vs_fork_pct": 0.0,
+      "decode_vs_fork_pct": 0.0
+    },
+    "original": {
+      "prefill_tok_s": 1.6085314901707166,
+      "decode_tok_s": 0.9019016893055499,
+      "cases": [
+        {
+          "case": "original-p32-r1",
+          "prefill_tok_s": 1.581851731455359,
+          "decode_tok_s": 0.9016735173190632,
+          "prompt_ms": 20229.456,
+          "decode_ms": 35489.564,
+          "matches_original": true
+        },
+        {
+          "case": "original-p32-r2",
+          "prefill_tok_s": 1.6361266582910616,
+          "decode_tok_s": 0.9021299768008818,
+          "prompt_ms": 19558.388,
+          "decode_ms": 35471.607,
+          "matches_original": true
+        }
+      ],
+      "prefill_vs_fork_pct": 23.267996124645517,
+      "decode_vs_fork_pct": -25.8708556215542
+    },
+    "pack": {
+      "prefill_tok_s": 1.5841632389128313,
+      "decode_tok_s": 2.0782074265976327,
+      "cases": [
+        {
+          "case": "pack-p32-r1",
+          "prefill_tok_s": 1.567261935605713,
+          "decode_tok_s": 2.0994527841925903,
+          "prompt_ms": 20417.774,
+          "decode_ms": 15242.067,
+          "matches_original": true
+        },
+        {
+          "case": "pack-p32-r2",
+          "prefill_tok_s": 1.6014330423579541,
+          "decode_tok_s": 2.057387745067027,
+          "prompt_ms": 19982.103,
+          "decode_ms": 15553.704,
+          "matches_original": true
+        }
+      ],
+      "prefill_vs_fork_pct": 21.400562679930935,
+      "decode_vs_fork_pct": 70.81211866144159
+    },
+    "colibri": {
+      "prefill_tok_s": 1.7660044150110374,
+      "decode_tok_s": 1.399825021872266,
+      "source_log": "../colibri-v41-20261015/colibri-p32-t18.log",
+      "prefill_vs_fork_pct": 35.33575607064019,
+      "decode_vs_fork_pct": 15.054481415629528
+    }
+  },
+  "128": {
+    "fork": {
+      "prefill_tok_s": 2.727317898475421,
+      "decode_tok_s": 1.069025898773179,
+      "cases": [
+        {
+          "case": "fork-p128-r1",
+          "prefill_tok_s": 2.727317898475421,
+          "decode_tok_s": 1.069025898773179,
+          "prompt_ms": 46932.556,
+          "decode_ms": 28998.362,
+          "matches_original": false
+        }
+      ],
+      "prefill_vs_fork_pct": 0.0,
+      "decode_vs_fork_pct": 0.0
+    },
+    "original": {
+      "prefill_tok_s": 3.122311770367727,
+      "decode_tok_s": 0.9790526933961412,
+      "cases": [
+        {
+          "case": "original-p128-r1",
+          "prefill_tok_s": 3.115328411228023,
+          "decode_tok_s": 0.9751660852594412,
+          "prompt_ms": 41087.161,
+          "decode_ms": 32814.923,
+          "matches_original": true
+        },
+        {
+          "case": "original-p128-r2",
+          "prefill_tok_s": 3.1293265078158594,
+          "decode_tok_s": 0.9829704063243333,
+          "prompt_ms": 40903.37,
+          "decode_ms": 32554.388,
+          "matches_original": true
+        }
+      ],
+      "prefill_vs_fork_pct": 14.482868759564438,
+      "decode_vs_fork_pct": -8.41637283814094
+    },
+    "pack": {
+      "prefill_tok_s": 3.1444436936812172,
+      "decode_tok_s": 2.1527094404650713,
+      "cases": [
+        {
+          "case": "pack-p128-r1",
+          "prefill_tok_s": 3.135436118465301,
+          "decode_tok_s": 2.145529955956293,
+          "prompt_ms": 40823.667,
+          "decode_ms": 14914.73,
+          "matches_original": true
+        },
+        {
+          "case": "pack-p128-r2",
+          "prefill_tok_s": 3.153503172473465,
+          "decode_tok_s": 2.159937135029685,
+          "prompt_ms": 40589.78,
+          "decode_ms": 14815.246,
+          "matches_original": true
+        }
+      ],
+      "prefill_vs_fork_pct": 15.294359173859817,
+      "decode_vs_fork_pct": 101.37112140459217
+    },
+    "colibri": {
+      "prefill_tok_s": 1.9441069258809234,
+      "decode_tok_s": 1.3576580398812048,
+      "source_log": "../colibri-v41-20261015/colibri-p128.log",
+      "prefill_vs_fork_pct": -28.71726002430134,
+      "decode_vs_fork_pct": 26.999546169953568
+    }
+  },
+  "512": {
+    "fork": {
+      "prefill_tok_s": 7.409559738721557,
+      "decode_tok_s": 1.0773061702050613,
+      "cases": [
+        {
+          "case": "fork-p512-r1",
+          "prefill_tok_s": 7.409559738721557,
+          "decode_tok_s": 1.0773061702050613,
+          "prompt_ms": 69099.922,
+          "decode_ms": 28775.478,
+          "matches_original": false
+        }
+      ],
+      "prefill_vs_fork_pct": 0.0,
+      "decode_vs_fork_pct": 0.0
+    },
+    "original": {
+      "prefill_tok_s": 8.301282600044724,
+      "decode_tok_s": 0.928472886096455,
+      "cases": [
+        {
+          "case": "original-p512-r1",
+          "prefill_tok_s": 8.301282600044724,
+          "decode_tok_s": 0.928472886096455,
+          "prompt_ms": 61677.216,
+          "decode_ms": 34465.196,
+          "matches_original": true
+        }
+      ],
+      "prefill_vs_fork_pct": 12.034761750595258,
+      "decode_vs_fork_pct": -13.815319008177262
+    },
+    "pack": {
+      "prefill_tok_s": 8.251725593764842,
+      "decode_tok_s": 2.0618035936205734,
+      "cases": [
+        {
+          "case": "pack-p512-r1",
+          "prefill_tok_s": 8.251725593764842,
+          "decode_tok_s": 2.0618035936205734,
+          "prompt_ms": 62047.628,
+          "decode_ms": 15520.392,
+          "matches_original": true
+        }
+      ],
+      "prefill_vs_fork_pct": 11.365936502842654,
+      "decode_vs_fork_pct": 91.38510951145085
+    },
+    "colibri": {
+      "prefill_tok_s": 2.000781555295037,
+      "decode_tok_s": 1.1962616822429906,
+      "source_log": "../colibri-v41-20261015/colibri-p512.log",
+      "prefill_vs_fork_pct": -72.99729503712388,
+      "decode_vs_fork_pct": 11.041941031052161
+    }
+  }
+}
