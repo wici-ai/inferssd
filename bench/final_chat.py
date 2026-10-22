@@ -33,7 +33,9 @@ def prompt_path(tier):
 def validate_context(prompt_ids, props):
     if not stream_chat.token_list(prompt_ids) or not prompt_ids:
         raise ValueError("template must return nonempty authoritative token IDs")
-    context = props.get("default_generation_settings", {}).get("n_ctx")
+    if not isinstance(props, dict) or not isinstance(props.get("default_generation_settings"), dict):
+        raise ValueError("server properties and default generation settings must be objects")
+    context = props["default_generation_settings"].get("n_ctx")
     if type(props.get("total_slots")) is not int or props["total_slots"] != 1:
         raise ValueError("final benchmark requires exactly one server slot")
     if type(context) is not int or context < len(prompt_ids) + OUTPUT_TOKENS:
@@ -42,6 +44,9 @@ def validate_context(prompt_ids, props):
 
 
 def validate_timings(result):
+    if (not isinstance(result, dict) or not isinstance(result.get("timings"), dict)
+            or not isinstance(result.get("metrics"), dict)):
+        raise ValueError("result timings and metrics must be objects")
     value = result["timings"].get("predicted_ms")
     if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
         raise ValueError("final benchmark requires finite positive native decode time")

@@ -122,6 +122,8 @@ def read_result(path, tier, timeout):
     result = stream_chat.decode_json(path.read_bytes())
     stem = path.with_suffix("")
     protocol = stream_chat.decode_json(stem.with_suffix(".protocol.json").read_bytes())
+    if not isinstance(result, dict) or not isinstance(protocol, dict):
+        raise ValueError("result and protocol must be objects")
     expected_hash = final_chat.PROMPTS[tier][1]
     if (result.get("status") != "passed" or result.get("output_tokens") != 256
             or result.get("prompt_sha256") != expected_hash

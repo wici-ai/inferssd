@@ -143,6 +143,8 @@ def summarize(records, start_ns, end_ns, prompt_ids, output_tokens):
     if not final or len(tokens) != output_tokens:
         raise ValueError("stream ended before the requested completion")
     timings = final.get("timings", {})
+    if not isinstance(timings, dict):
+        raise ValueError("final timings must be an object")
     if (final.get("stop_type") != "limit" or final.get("truncated") is not False
             or final.get("tokens_predicted") != output_tokens
             or final.get("tokens_evaluated") != len(prompt_ids)

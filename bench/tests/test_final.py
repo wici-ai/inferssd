@@ -249,6 +249,36 @@ def test_raw_sse_truncation_is_not_a_success(setup):
         run_final.read_result(path.parent / "result.json", "512", 1)
 
 
+@pytest.mark.parametrize("kind", ["result", "protocol", "props", "settings", "timings"])
+def test_nonobject_inputs_keep_failed_attempt_and_summary(setup, kind):
+    root, config = setup
+    directory = root / "fixtures/512"
+    if kind in ("result", "protocol"):
+        path = directory / ("result.json" if kind == "result" else "result.protocol.json")
+        path.write_text("[]")
+    elif kind in ("props", "settings"):
+        path = directory / "result.protocol.json"
+        protocol = json.loads(path.read_text())
+        if kind == "props":
+            protocol["server_props"] = []
+        else:
+            protocol["server_props"]["default_generation_settings"] = []
+        path.write_text(json.dumps(protocol))
+    else:
+        rows = records(input_count=600)
+        rows[-1]["event"]["timings"] = []
+        (directory / "result.events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+        (directory / "result.events.sse").write_bytes(b"".join(
+            b"data: " + json.dumps(row["event"]).encode() + b"\n\n" for row in rows))
+    assert subprocess.run(command(root, config)).returncode == 1
+    report = json.loads((root / "run/summary.json").read_text())
+    attempts = [json.loads(line) for line in (root / "run/attempts.jsonl").read_text().splitlines()]
+    assert [r["status"] for r in report["rows"]] == ["failed", "not_run"]
+    assert len(attempts) == 2 and not report["complete"]
+    assert "ValueError" in attempts[0]["error"]
+    assert attempts[0]["owned_group_cleanup_confirmed"] and attempts[0]["wrapper_cleanup_confirmed"]
+
+
 @pytest.mark.parametrize("kind", ["settings", "same-server", "missing-cleanup"])
 def test_changed_settings_reused_server_and_missing_cleanup_fail(setup, kind):
     root, config = setup
