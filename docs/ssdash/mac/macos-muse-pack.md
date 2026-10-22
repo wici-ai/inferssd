@@ -1,8 +1,12 @@
+> Historical engineering log from the pre-SSDash Mac branch. These results
+> have not been revalidated on the current SSDash integration.
+
 # Muse Spark on Mac: explicit expert cache and compact Metal allocations
 
-This opt-in integration was prepared with AI assistance for the private Mac
-deployment. It retains the original binary in `build-mac`; the experimental
-binary is built in `build-mac-muse-opt`.
+This records the original opt-in Muse integration. In SSDash, the common Mac
+build script produces the server in `build-mac` (or `SSD_LLAMA_BUILD_DIR`).
+The historical Muse expert-pack generator is not included; the GGUF alias path
+is being validated separately before claiming reproducible Muse support.
 
 ## Changes
 
@@ -40,7 +44,7 @@ export SSD_LLAMA_MAC_EXPERT_PACK=/path/to/Muse-Q4.expert-pack
 export SSD_LLAMA_MAC_EXPERT_CACHE_MIB=8192
 export SSD_LLAMA_MAC_EXPERT_CACHE_POLICY=lfu
 
-./build-mac-muse-opt/bin/llama-server \
+./build-mac/bin/llama-server \
   -m /path/to/Muse-Spark-Open-816B-A42B-UD-Q4_K_XL-00001-of-00012.gguf \
   --mmap --no-warmup --fit off --no-repack --no-host \
   -ngl 99 --cpu-moe --no-op-offload \
@@ -119,7 +123,7 @@ Historical upstream llama.cpp's prompt-512 result was 1.937996 prefill,
 That run had 666 input tokens, a different loader/template, and uncontrolled
 cache state. It is historical context, not a strict matched comparator.
 
-The portable [benchmark summary](benchmarks/muse-mac-512-20261020.json)
+The portable [benchmark summary](../../benchmarks/muse-mac-512-20261020.json)
 contains the measured windows and validation outcomes. Raw events, server logs,
 configuration, and comparison files remain in the test machine's
 `../muse-opt-20261020/benchmark512/prompt-512/` and
