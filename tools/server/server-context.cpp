@@ -40,9 +40,11 @@
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
+#if defined(LLAMA_SERVER_CUDA_MOE)
 extern "C" void ggml_cuda_moe_ram_tier_request_begin(uint64_t request_id) __attribute__((weak));
 extern "C" void ggml_cuda_moe_stream_batch_phase_report(const char * label) __attribute__((weak));
 extern "C" void ggml_cuda_moe_prefill_request_phase(int active) __attribute__((weak));
+#endif
 extern "C" void ggml_cpu_kimi_a2_request_phase(int active) __attribute__((weak));
 extern "C" bool llama_moe_prefill_phase_workspace(
     llama_context * ctx, int active) __attribute__((weak));
@@ -532,6 +534,7 @@ static bool server_moe_phase_report(
             ggml_cpu_kimi_a2_request_phase(0);
         }
     }
+#if defined(LLAMA_SERVER_CUDA_MOE)
     if (phase01_telemetry && ggml_cuda_moe_prefill_request_phase) {
         if (label && std::strcmp(label, "request_begin") == 0) {
             ggml_cuda_moe_prefill_request_phase(1);
@@ -541,9 +544,11 @@ static bool server_moe_phase_report(
             ggml_cuda_moe_prefill_request_phase(0);
         }
     }
+#endif
     if (!phase01_telemetry) {
         return true;
     }
+#if defined(LLAMA_SERVER_CUDA_MOE)
     if (!ggml_cuda_moe_stream_batch_phase_report) {
         return true;
     }
@@ -551,6 +556,7 @@ static bool server_moe_phase_report(
     std::snprintf(scoped_label, sizeof(scoped_label), "%s_task_%lld",
         label ? label : "unknown", (long long)task_id);
     ggml_cuda_moe_stream_batch_phase_report(scoped_label);
+#endif
 #else
     (void) ctx;
     (void) label;
@@ -2124,7 +2130,7 @@ private:
             } catch (const std::exception & e) { send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST); return false; }
         }
 
-#if defined(__GNUC__) || defined(__clang__)
+#if defined(LLAMA_SERVER_CUDA_MOE) && (defined(__GNUC__) || defined(__clang__))
         if (!task.is_child() && ggml_cuda_moe_ram_tier_request_begin) {
             ggml_cuda_moe_ram_tier_request_begin(
                     task.id >= 0 ? static_cast<uint64_t>(task.id) : 0);
