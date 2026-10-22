@@ -26,7 +26,8 @@ failure is `max_abs=0.024879`; the production settings leave `EXPERT_JOB` off. A
 small-runner investigation also recorded a SIGFPE for `schedule_t2`. Disabling
 these tests does not fix either defect. They must be repaired with numerical and
 resource validation or removed together with that unused implementation during
-code organization. Track that decision in an issue before public release.
+code organization. Track the decision and validation in
+[issue #1](https://github.com/wici-ai/ssdash/issues/1) and resolve it before v0.1.0.
 
 Other previously reported device failures are not allowlisted: their full names,
 reproduction conditions and outcomes still need to be collected on the current

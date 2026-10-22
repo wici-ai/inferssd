@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -23,7 +24,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Resolve the upstream snapshot
-        run: git fetch origin upstream:refs/heads/upstream
+        # fetch-depth: 0 already fetched all branch history. Credentials are
+        # deliberately not persisted, so resolve the local remote-tracking ref.
+        run: git branch upstream refs/remotes/origin/upstream
       - name: Public content
         env:
           PROPOSED_REF: ${{ github.head_ref || github.ref_name }}
