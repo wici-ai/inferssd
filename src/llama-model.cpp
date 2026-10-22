@@ -1424,24 +1424,6 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
-        case LLM_ARCH_DFLASH:
-            {
-                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-                if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false) || target_layer_ids.empty()) {
-                    throw std::runtime_error("DFlash model requires a non-empty target_layers array");
-                }
-                hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
-
-                if (ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false) && hparams.n_swa > 0) {
-                    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
-                    ml.get_key_or_arr(
-                        LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
-                    hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
-                    hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
-                }
-
-                type = LLM_TYPE_UNKNOWN;
-            } break;
         case LLM_ARCH_MAINCODER:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -4421,50 +4403,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
                         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
-                    }
-                } break;
-            case LLM_ARCH_DFLASH:
-                {
-                    const int64_t n_embd_inp = hparams.n_embd_inp_enc();
-
-                    fc              = create_tensor(tn(LLM_TENSOR_FC,              "weight"), {n_embd_inp, n_embd}, 0);
-                    output_norm_enc = create_tensor(tn(LLM_TENSOR_ENC_OUTPUT_NORM, "weight"), {n_embd}, 0);
-                    output_norm     = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,     "weight"), {n_embd}, 0);
-
-                    if (const auto * markov_meta = ml.get_tensor_meta("markov_w1.weight")) {
-                        const int64_t markov_rank = markov_meta->ne[0];
-                        dspark_markov_w1 = create_tensor(
-                            tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), {markov_rank, n_vocab}, 0);
-                        dspark_markov_w2 = create_tensor(
-                            tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), {markov_rank, n_vocab}, 0);
-                        dspark_conf_proj = create_tensor(
-                            tn(LLM_TENSOR_DSPARK_CONF_PROJ, "weight"), {n_embd + markov_rank, 1}, 0);
-                        dspark_conf_proj_b = create_tensor(
-                            tn(LLM_TENSOR_DSPARK_CONF_PROJ, "bias"), {1}, TENSOR_NOT_REQUIRED);
-                    }
-
-                    for (int i = 0; i < n_layer; ++i) {
-                        auto & layer = layers[i];
-                        layer.attn_norm = create_tensor(
-                            tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
-                        create_tensor_qkv(
-                            layer, i, n_embd, n_embd_head_k * n_head,
-                            n_embd_gqa, n_embd_gqa, 0);
-                        layer.wo = create_tensor(
-                            tn(LLM_TENSOR_ATTN_OUT, "weight", i),
-                            {n_embd_head_k * n_head, n_embd}, 0);
-                        layer.attn_q_norm = create_tensor(
-                            tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
-                        layer.attn_k_norm = create_tensor(
-                            tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {n_embd_head_k}, 0);
-                        layer.ffn_norm = create_tensor(
-                            tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-                        layer.ffn_gate = create_tensor(
-                            tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff}, 0);
-                        layer.ffn_down = create_tensor(
-                            tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
-                        layer.ffn_up = create_tensor(
-                            tn(LLM_TENSOR_FFN_UP, "weight", i), {n_embd, n_ff}, 0);
                     }
                 } break;
             case LLM_ARCH_QWEN3MOE:
@@ -9632,10 +9570,6 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_qwen3>(*this, params);
             } break;
-        case LLM_ARCH_DFLASH:
-            {
-                llm = std::make_unique<llm_build_dflash>(*this, params);
-            } break;
         case LLM_ARCH_QWEN3MOE:
             {
                 llm = std::make_unique<llm_build_qwen3moe>(*this, params);
@@ -10243,7 +10177,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DREAM:
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3:
-        case LLM_ARCH_DFLASH:
         case LLM_ARCH_QWEN3MOE:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
@@ -10413,7 +10346,6 @@ bool llama_model_has_encoder(const llama_model * model) {
     switch (model->arch) {
         case LLM_ARCH_T5:        return true;
         case LLM_ARCH_T5ENCODER: return true;
-        case LLM_ARCH_DFLASH:    return true;
         default:                 return false;
     }
 }
