@@ -44,13 +44,14 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
     content[40:40 + len(entries) * 152] = b"".join(entries)
     pack.write_bytes(content)
 
-    def run(source, cache, expected_error=None, both=False, commands=None, depth=0):
+    def run(source, cache, expected_error=None, both=False, commands=None, depth=0, alignment=1):
         env = os.environ.copy()
         env.pop("GGML_MOE_EXPERT_GGUF_ALIAS_TSV", None)
         env.pop("SSD_LLAMA_MAC_EXPERT_PACK", None)
         env.pop("SSD_LLAMA_MAC_EXPERT_TRACE", None)
         env["SSD_LLAMA_MAC_EXPERT_CACHE_MIB"] = str(cache)
         env["SSD_LLAMA_MAC_EXPERT_READ_AHEAD"] = str(depth)
+        env["SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT"] = str(alignment)
         if depth == 4:
             env["SSD_LLAMA_MAC_EXPERT_TRACE"] = str(root / "trace.txt")
         env["GGML_MOE_EXPERT_GGUF_ALIAS_TSV" if source.suffix == ".tsv" else "SSD_LLAMA_MAC_EXPERT_PACK"] = str(source)
@@ -67,9 +68,10 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
 
     for source in (pack, alias):
         for cache in (0, 1):
-            reference = run(source, cache, depth=0)
-            for depth in (1, 2, 4):
-                assert run(source, cache, depth=depth) == reference, (source, cache, depth)
+            for alignment in (1, 4096, 16384):
+                reference = run(source, cache, depth=0, alignment=alignment)
+                for depth in (1, 2, 4):
+                    assert run(source, cache, depth=depth, alignment=alignment) == reference, (source, cache, depth, alignment)
     bad = root / "bad.tsv"
     for body, message in [
         (header + "".join(rows) + rows[0], "duplicate"),
@@ -84,4 +86,4 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
     run(alias, 1, "short/failed expert-pack read", commands=args[:4] + ["--truncate", str(shards[1][0])] + args[4:8])
     pack.write_bytes(content[:-4090])
     run(pack, 1, "invalid expert-pack index")
-print("24 source, pipeline, bounds, short-read, duplicate, pin and cache cases passed")
+print("56 source, pipeline, alignment, bounds, short-read, duplicate, pin and cache cases passed")
