@@ -40,7 +40,7 @@ MODEL_CONF=${MODEL_CONF:-$FW/models/dsv41.conf}
 [[ -z ${DSV41_DIR:-}${DSV41_PACK:-} ]] ||
   { echo "DSV41_DIR and DSV41_PACK are gone: set MODEL_DIR (or MODEL, the first shard) and EXPERT_PACK" >&2; exit 2; }
 if grep -q '^LAUNCH=' "$MODEL_CONF"; then
-  source "$MODEL_CONF"   # a conf that names its own launcher and engine (qwen38.conf), a script
+  source "$MODEL_CONF"   # a conf that names its own launcher and engine, a script
 else
   # a data-only conf of this checkout's engine, never executed: run-ssd-llama.sh reads it and finds the model
   # (MODEL, else the conf's MODEL_GLOB under MODEL_DIR, default ROOT/models)
@@ -133,7 +133,7 @@ done
 # the GPU graph's prefill (prefill.py prices the graph route from it): a fresh server of the engine default at the
 # threshold 0 prefills, each from scratch on the ggml graph, a cut of the bootstrap text that the decode trace covers
 # and the whole text.  A server that does not start, or prefills that fail, leave the graph route unmeasured.  A conf
-# with a launcher of its own (qwen38.conf) has no graph route.
+# with a launcher of its own has no graph route.
 GRAPH=""
 if [[ $LAUNCH == "$SRC/run-ssd-llama.sh" ]]; then
   if [[ ! -s $out/boot-graph.out ]]; then
