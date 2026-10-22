@@ -1,4 +1,8 @@
-# Short device comparisons
+# Device measurements
+
+For final performance acceptance, use the separate [formal benchmark](FINAL.md):
+the fixed 512 and 4K prompts once each, with 256 output tokens and no ABBA or
+automatic retry. The tools below retain their original short diagnostic bounds.
 
 These tools coordinate one **ABBA cycle: four arms, in that exact order**. They
 start only commands explicitly supplied by the operator. They do not download
