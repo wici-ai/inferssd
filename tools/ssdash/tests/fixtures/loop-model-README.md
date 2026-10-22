@@ -1,0 +1,9 @@
+# F-first controller and observation transcripts
+
+These 60 synthetic scenarios execute the original frozen F online module and Controller class, with the original Machine, replay, price, prefill and log parser call graph. The first commit contains no candidate loop module. Sources are bound in `oracle/loop-manifest.json`; the other F modules and input model artifacts were frozen in earlier batches.
+
+Each transcript records ordered file/clock/engine/HTTP/output calls, exact float values and mapping order, returned aliases, Machine calls and mutable state, partial output, and partial constructor state after a failure. Python 3.9 and 3.12 expectations are generated independently from F. Test engines, HTTP, clock and in-memory files are effects only; no process, request, host probe, model or device runs. Gzip is a logical input stream in this observer; actual gzip behavior is covered by the existing recorded-log tests.
+
+The scenarios include a real F-model switch with a 5000-token **forecast input**, not an executed request; successful/caught-OSError/uncaught-RuntimeError displacement; no-history, failed replacement, stop and clock faults; repeated prepare aliases and explicit close; partial live lines, truncation, gzip cache keys/identity; ragged traces, matching graph/turn records, and slope/feedback/rounded decision boundaries. Controlled model responses are used only in the named `decide-*` threshold cases.
+
+One session corresponds to one fresh F online module. F globals are not shared across scenarios. Independent target sessions are an explicit ownership change; no cross-session equivalence to F's hidden global cache is claimed. `close()` only stops the engine in F; this observer records that the event stream remains open. Implicit fixture destruction is outside the transcript and is not a production lifecycle promise.
