@@ -11,7 +11,7 @@ With `LLAMA_C0_LINKED_STORE_PROTOTYPE=ON`, `llama` and `ggml-cuda` link one shar
 `ggml-ssd-c0-store` library. A static archive linked separately into both would
 create two owners, so this experiment deliberately requires a shared library.
 The option requires Linux and the bundled ggml; CUDA additionally requires
-`GGML_CUDA_MOE_STREAM_BATCH=ON`.
+both `GGML_CUDA_MOE_STREAM=ON` and `GGML_CUDA_MOE_STREAM_BATCH=ON`.
 
 The shared library owns the v1/alias entry vector, source vector, buffered FILE
 handles, direct descriptors, mapping cleanup, once state and first-shape state.
