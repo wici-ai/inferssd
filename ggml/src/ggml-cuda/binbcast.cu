@@ -1,5 +1,4 @@
 #include "binbcast.cuh"
-#include "cpu-parity.cuh"
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -21,10 +20,6 @@ static __device__ __forceinline__ float op_sub(const float a, const float b) {
 
 static __device__ __forceinline__ float op_mul(const float a, const float b) {
     return a * b;
-}
-
-static __device__ __forceinline__ float op_mul_cpu_parity(const float a, const float b) {
-    return ggml_cuda_kimi_mul_f32_cpu(a, b);
 }
 
 static __device__ __forceinline__ float op_div(const float a, const float b) {
@@ -426,13 +421,6 @@ void ggml_cuda_op_sub(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (dst->ne[0] == 7168 && ggml_nelements(dst) <= 3*7168 &&
-            ggml_cuda_kimi_kda_cpu_parity_enabled(dst)) {
-        ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul_cpu_parity>>(
-            dst->src[0], dst->src[1], dst,
-            dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
-        return;
-    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 

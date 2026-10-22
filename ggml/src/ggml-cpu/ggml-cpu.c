@@ -103,30 +103,6 @@ extern void ggml_cpu_layer_gap_trace_node(
     const char * name);
 
 #if !defined(__APPLE__) && (defined(__GNUC__) || defined(__clang__))
-__attribute__((weak)) extern bool ggml_cuda_kimi_dense_stream_mul_mat(
-    int src0_type_int,
-    const char * src0_name,
-    const void * src0_data,
-    size_t src0_bytes,
-    int64_t ne00,
-    int64_t ne01,
-    int64_t ne02,
-    int64_t ne03,
-    size_t nb01,
-    size_t nb02,
-    size_t nb03,
-    const float * src1_data,
-    int64_t ne11,
-    int64_t ne12,
-    int64_t ne13,
-    size_t nb11,
-    size_t nb12,
-    size_t nb13,
-    float * dst_data,
-    size_t nb1,
-    size_t nb2,
-    size_t nb3);
-__attribute__((weak)) extern bool ggml_cuda_kimi_dense_stream_should_intercept(const char * tensor_name);
 __attribute__((weak)) extern void ggml_cuda_moe_adapter_select_model_shape(
     int64_t n_experts,
     size_t expert_bytes);
@@ -352,12 +328,6 @@ __attribute__((weak)) extern bool ggml_cuda_moe_stream_one_cache_contains(
     size_t expert_bytes,
     int64_t expert_idx);
 #else
-static bool (*ggml_cuda_kimi_dense_stream_mul_mat)(
-    int, const char *, const void *, size_t,
-    int64_t, int64_t, int64_t, int64_t, size_t, size_t, size_t,
-    const float *, int64_t, int64_t, int64_t, size_t, size_t, size_t,
-    float *, size_t, size_t, size_t) = NULL;
-static bool (*ggml_cuda_kimi_dense_stream_should_intercept)(const char *) = NULL;
 static void (*ggml_cuda_moe_adapter_select_model_shape)(int64_t, size_t) = NULL;
 static bool (*ggml_cuda_moe_stream_available)(void) = NULL;
 static void (*ggml_cuda_moe_stream_sync)(void) = NULL;
@@ -413,78 +383,6 @@ static bool (*ggml_cuda_moe_stream_cache_contains)(const char *, size_t, int) = 
 static bool (*ggml_cuda_moe_stream_one_cache_contains)(const char *, const void *, size_t, int64_t) = NULL;
 #endif
 
-static bool ggml_kimi_dense_stream_layer_selected(const char * tensor_name) {
-    const char * layers = getenv("GGML_KIMI_DENSE_STREAM_LAYERS");
-    if (!layers || !layers[0] || !tensor_name) {
-        return false;
-    }
-
-    if (strcmp(tensor_name, "output.weight") == 0) {
-        const char * current = layers;
-        while (*current) {
-            while (*current == ' ' || *current == '\t' || *current == ',') {
-                ++current;
-            }
-            const char * end = current;
-            while (*end && *end != ',') {
-                ++end;
-            }
-            const char * trimmed = end;
-            while (trimmed > current && (trimmed[-1] == ' ' || trimmed[-1] == '\t')) {
-                --trimmed;
-            }
-            const size_t length = (size_t) (trimmed - current);
-            if ((length == 6 && strncmp(current, "output", length) == 0) ||
-                    (length == 13 && strncmp(current, "output.weight", length) == 0)) {
-                return true;
-            }
-            current = *end ? end + 1 : end;
-        }
-        return false;
-    }
-
-    if (strncmp(tensor_name, "blk.", 4) != 0) {
-        return false;
-    }
-
-    char * tensor_end = NULL;
-    const long tensor_layer = strtol(tensor_name + 4, &tensor_end, 10);
-    if (tensor_end == tensor_name + 4 || !tensor_end || *tensor_end != '.' || tensor_layer < 0) {
-        return false;
-    }
-
-    const char * current = layers;
-    while (*current) {
-        while (*current == ' ' || *current == '\t' || *current == ',') {
-            ++current;
-        }
-        if (!*current) {
-            break;
-        }
-
-        const char * number = current;
-        if (strncmp(number, "blk.", 4) == 0) {
-            number += 4;
-        }
-        char * end = NULL;
-        const long selected = strtol(number, &end, 10);
-        if (end != number) {
-            while (*end == ' ' || *end == '\t') {
-                ++end;
-            }
-            if ((*end == ',' || *end == '\0') && selected == tensor_layer) {
-                return true;
-            }
-        }
-
-        const char * comma = strchr(current, ',');
-        if (!comma) {
-            break;
-        }
-        current = comma + 1;
-    }
-    return false;
-}
 
 static bool ggml_cuda_moe_stream_supports_type(enum ggml_type type) {
     return type == GGML_TYPE_IQ1_S ||
@@ -3718,47 +3616,6 @@ void ggml_compute_forward_mul_mat(
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
-
-    const char * dense_min_env = getenv("GGML_KIMI_DENSE_STREAM_MIN_TOKENS");
-    const int dense_min_tokens = dense_min_env ? atoi(dense_min_env) : 1;
-    if (ne11 >= (dense_min_tokens > 0 ? dense_min_tokens : 1) && ggml_cuda_kimi_dense_stream_mul_mat &&
-            ggml_kimi_dense_stream_layer_selected(src0->name) &&
-            (!ggml_cuda_kimi_dense_stream_should_intercept ||
-                ggml_cuda_kimi_dense_stream_should_intercept(src0->name)) &&
-            src1->type == GGML_TYPE_F32 &&
-            dst->type == GGML_TYPE_F32) {
-        if (ith == 0) {
-            const bool done = ggml_cuda_kimi_dense_stream_mul_mat(
-                src0->type,
-                src0->name,
-                src0->data,
-                ggml_nbytes(src0),
-                ne00,
-                ne01,
-                ne02,
-                ne03,
-                nb01,
-                nb02,
-                nb03,
-                (const float *) src1->data,
-                ne11,
-                ne12,
-                ne13,
-                nb11,
-                nb12,
-                nb13,
-                (float *) dst->data,
-                nb1,
-                nb2,
-                nb3);
-            atomic_store_explicit(&params->threadpool->current_chunk, done ? 1 : 0, memory_order_relaxed);
-        }
-
-        ggml_barrier(params->threadpool);
-        if (atomic_load_explicit(&params->threadpool->current_chunk, memory_order_relaxed) != 0) {
-            return;
-        }
-    }
 
     // nb01 >= nb00 - src0 is not transposed
     //   compute by src0 rows

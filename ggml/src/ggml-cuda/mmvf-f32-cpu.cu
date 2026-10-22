@@ -1,5 +1,4 @@
 #include "mmvf-f32-cpu.cuh"
-#include "cpu-parity.cuh"
 #include "dense-parity.cuh"
 
 #include <atomic>
@@ -71,26 +70,6 @@ static __global__ void mul_mat_vec_f32_cpu(
     }
 }
 
-static __global__ void kimi_kda_weighted_sum_f32(
-        const char * __restrict__ rows,
-        const size_t row_stride,
-        const float * __restrict__ weights,
-        const int ncols,
-        float * __restrict__ output,
-        const int64_t nrows) {
-    const int64_t row = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
-    if (row >= nrows) {
-        return;
-    }
-
-    const float * values = (const float *) (rows + (size_t) row*row_stride);
-    float sum = 0.0f;
-    for (int col = 0; col < ncols; ++col) {
-        sum = __fmaf_rn(values[col], weights[col], sum);
-    }
-    output[row] = sum;
-}
-
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 } // namespace
@@ -112,50 +91,6 @@ bool ggml_cuda_should_use_mmvf_f32_cpu(
         dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
         src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
         ggml_cuda_dense_parity_f32_selected(src0->name);
-#endif
-}
-
-bool ggml_cuda_should_use_kimi_kda_weighted_sum(
-        const ggml_tensor * src0,
-        const ggml_tensor * src1,
-        const ggml_tensor * dst) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED(src0);
-    GGML_UNUSED(src1);
-    GGML_UNUSED(dst);
-    return false;
-#else
-    return src0 != nullptr && src1 != nullptr && dst != nullptr &&
-        ggml_cuda_kimi_kda_cpu_parity_enabled(dst) &&
-        src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-        src0->ne[0] >= 2 && src0->ne[0] <= 3 && src0->ne[1] == 7168 &&
-        src0->ne[2] == 1 && src0->ne[3] == 1 &&
-        src1->ne[0] == src0->ne[0] && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
-        dst->ne[0] == 7168 && dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
-        src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float);
-#endif
-}
-
-void ggml_cuda_kimi_kda_weighted_sum(
-        ggml_backend_cuda_context & ctx,
-        const ggml_tensor * src0,
-        const ggml_tensor * src1,
-        ggml_tensor * dst) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(src0);
-    GGML_UNUSED(src1);
-    GGML_UNUSED(dst);
-    GGML_ABORT("CPU-compatible KDA weighted sum is only implemented for CUDA");
-#else
-    GGML_ASSERT(ggml_cuda_should_use_kimi_kda_weighted_sum(src0, src1, dst));
-    constexpr int threads = 256;
-    const int64_t nrows = src0->ne[1];
-    const dim3 block(threads, 1, 1);
-    const dim3 grid((unsigned int) ((nrows + threads - 1) / threads), 1, 1);
-    kimi_kda_weighted_sum_f32<<<grid, block, 0, ctx.stream()>>>(
-        (const char *) src0->data, src0->nb[1], (const float *) src1->data,
-        (int) src0->ne[0], (float *) dst->data, nrows);
 #endif
 }
 

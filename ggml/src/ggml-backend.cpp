@@ -2568,8 +2568,6 @@ static void ggml_backend_sched_kimi_dense_prepare_graph(
 
     const bool dense_enabled = ggml_backend_sched_kimi_env_enabled("GGML_KIMI_DENSE_PREFETCH_LAYERS");
     const bool kda_enabled = ggml_backend_sched_kimi_env_enabled("GGML_KIMI_KDA_GPU_LAYERS");
-    const bool kda_native_parallel =
-        ggml_backend_sched_kimi_env_enabled("GGML_KIMI_KDA_NATIVE_PARALLEL");
     if ((!state->decode_phase && !kda_enabled) ||
             (state->decode_phase && !dense_enabled && !kda_enabled)) {
         state->idle_fill_carry_record_bytes.clear();
@@ -2907,13 +2905,6 @@ static void ggml_backend_sched_kimi_dense_prepare_graph(
                         ggml_backend_sched_kimi_kda_state_destination(node, layer)) {
                     state->kda_state_copies.push_back(node);
                     continue;
-                }
-                // Keep the strict Task 60/66 kernels available for exact
-                // diagnostics, but allow the selected KDA island to use the
-                // ordinary parallel CUDA operators.  Dense Q8_K matmul parity
-                // is selected independently by GGML_CUDA_DENSE_Q8_K.
-                if (!kda_native_parallel) {
-                    node->flags |= GGML_TENSOR_FLAG_KIMI_KDA_CPU_PARITY;
                 }
                 state->kda_nodes.push_back({ node, layer });
                 if (!state->kda_decode_phase) {
@@ -3279,7 +3270,7 @@ static void ggml_backend_sched_kimi_dense_prepare_graph(
             state->records.size(), state->layers.size(),
             state->kda_nodes.size(), state->kda_layers.size(),
             state->kda_interleaved_nodes, state->kda_root_gap_nodes,
-            kda_native_parallel ? "native" : "strict",
+            "native",
             state->required / 1024.0 / 1024.0,
             state->required_late / 1024.0 / 1024.0,
             state->backend_id >= 0 ? ggml_backend_name(sched->backends[state->backend_id]) : "none",

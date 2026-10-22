@@ -3234,8 +3234,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
     if (ggml_cuda_should_use_mmvf_f16_cpu(src0, src1, dst) ||
-        ggml_cuda_should_use_mmvf_f32_cpu(src0, src1, dst) ||
-        ggml_cuda_should_use_kimi_kda_weighted_sum(src0, src1, dst)) {
+        ggml_cuda_should_use_mmvf_f32_cpu(src0, src1, dst)) {
         return false;
     }
 
@@ -3308,8 +3307,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 // The kernel that ggml_cuda_mul_mat uses for a matrix multiplication. It also decides how much the
 // multiplication takes from the memory pool (ggml_cuda_mul_mat_pool_size).
 enum ggml_cuda_mul_mat_kernel {
-    GGML_CUDA_MUL_MAT_KDA_WEIGHTED_SUM,
-    GGML_CUDA_MUL_MAT_VEC_F16_CPU,
+    // 0: retired KDA weighted-sum kernel; do not reuse.
+    GGML_CUDA_MUL_MAT_VEC_F16_CPU = 1,
     GGML_CUDA_MUL_MAT_VEC_F32_CPU,
     GGML_CUDA_MUL_MAT_VEC_F,
     GGML_CUDA_MUL_MAT_F,
@@ -3384,9 +3383,7 @@ static ggml_cuda_mul_mat_kernel ggml_cuda_mul_mat_select(
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
 
-    if (!split && ggml_cuda_should_use_kimi_kda_weighted_sum(src0, src1, dst)) {
-        return GGML_CUDA_MUL_MAT_KDA_WEIGHTED_SUM;
-    } else if (!split && use_mul_mat_vec_f && ggml_cuda_should_use_mmvf_f16_cpu(src0, src1, dst)) {
+    if (!split && use_mul_mat_vec_f && ggml_cuda_should_use_mmvf_f16_cpu(src0, src1, dst)) {
         return GGML_CUDA_MUL_MAT_VEC_F16_CPU;
     } else if (!split && use_mul_mat_vec_f && ggml_cuda_should_use_mmvf_f32_cpu(src0, src1, dst)) {
         return GGML_CUDA_MUL_MAT_VEC_F32_CPU;
@@ -3418,9 +3415,6 @@ static ggml_cuda_mul_mat_kernel ggml_cuda_mul_mat_select(
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     switch (ggml_cuda_mul_mat_select(ctx, src0, src1, dst)) {
-        case GGML_CUDA_MUL_MAT_KDA_WEIGHTED_SUM:
-            ggml_cuda_kimi_kda_weighted_sum(ctx, src0, src1, dst);
-            break;
         case GGML_CUDA_MUL_MAT_VEC_F16_CPU:
             ggml_cuda_mul_mat_vec_f16_cpu(ctx, src0, src1, dst);
             break;
@@ -3569,7 +3563,6 @@ static size_t ggml_cuda_mul_mat_pool_size(
         case GGML_CUDA_MUL_MAT_OP_Q:
         case GGML_CUDA_MUL_MAT_OP_CUBLAS:
             return ggml_cuda_op_mul_mat_pool_size(src0, src1, dst, kernel);
-        case GGML_CUDA_MUL_MAT_KDA_WEIGHTED_SUM:
         case GGML_CUDA_MUL_MAT_VEC_F32_CPU:
         case GGML_CUDA_MUL_MAT_VEC_F:
         case GGML_CUDA_MUL_MAT_F:

@@ -658,7 +658,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
-        GGML_TENSOR_FLAG_KIMI_KDA_CPU_PARITY = 32,
+        // 32: retired KDA CPU-parity flag; do not reuse.
     };
 
     enum ggml_tri_type {

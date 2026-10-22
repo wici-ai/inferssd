@@ -1,6 +1,5 @@
 #include "unary.cuh"
 #include "convert.cuh"
-#include "cpu-parity.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -317,19 +316,6 @@ void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
     GGML_ASSERT(src0->type == dst->type);
-
-    if (src0->type == GGML_TYPE_F32 && ggml_cuda_kimi_kda_unary_shape(dst, src0)) {
-        if constexpr (op == op_silu) {
-            unary_cuda<ggml_cuda_kimi_silu_cpu>(
-                (const float *) src0_d, (float *) dst_d, ggml_nelements(src0), stream);
-            return;
-        }
-        if constexpr (op == op_sigmoid) {
-            unary_cuda<ggml_cuda_kimi_sigmoid_cpu>(
-                (const float *) src0_d, (float *) dst_d, ggml_nelements(src0), stream);
-            return;
-        }
-    }
 
     if (src0->type == GGML_TYPE_F16) {
         unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
@@ -1002,12 +988,7 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
             ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node);
             break;
         case GGML_UNARY_OP_SIGMOID:
-            if (unary_node->src[0]->type == GGML_TYPE_F32 &&
-                    ggml_cuda_kimi_kda_unary_shape(unary_node, unary_node->src[0])) {
-                ggml_cuda_op_unary_mul_impl<ggml_cuda_kimi_sigmoid_cpu>(ctx, unary_node, mul_node);
-            } else {
-                ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node);
-            }
+            ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node);
             break;
         case GGML_UNARY_OP_SOFTPLUS:
             ggml_cuda_op_unary_mul_impl<op_softplus>(ctx, unary_node, mul_node);
