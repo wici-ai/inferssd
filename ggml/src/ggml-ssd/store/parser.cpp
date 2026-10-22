@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <memory>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <unordered_map>
@@ -12,6 +13,20 @@
 
 namespace c0 {
 namespace {
+// A source is borrowed by the catalog only after vector insertion succeeds.
+struct pending_source_handles {
+    expert_pack_source & source;
+    bool transferred = false;
+    ~pending_source_handles() {
+        if (!transferred) {
+            if (source.file) { std::fclose(source.file); }
+#if !defined(_WIN32)
+            if (source.fd_direct >= 0) { ::close(source.fd_direct); }
+#endif
+        }
+    }
+};
+
 class source_parser {
 public:
     explicit source_parser(parser_state & state, source_open_hooks hooks = {}) : g_expert_pack(state), hooks(hooks) {}
@@ -67,6 +82,7 @@ bool expert_pack_open_data_source(
 
     expert_pack_source source;
     source.file = file;
+    pending_source_handles pending{source};
     source.page_cache = page_cache_source;
     source.direct_required = direct_required;
     std::snprintf(source.path, sizeof(source.path), "%s", path);
@@ -74,7 +90,6 @@ bool expert_pack_open_data_source(
     struct stat source_status = {};
     if (fstat(fileno(file), &source_status) != 0 || source_status.st_size < 0) {
         std::fprintf(stderr, "[moe_stream_batch] %s: stat failed: %s\n", label, path);
-        std::fclose(file);
         return false;
     }
     source.file_size = static_cast<uint64_t>(source_status.st_size);
@@ -86,7 +101,6 @@ bool expert_pack_open_data_source(
         if (source.fd_direct < 0) {
             if (direct_required) {
                 std::fprintf(stderr, "[moe_stream_batch] %s: required O_DIRECT open failed: %s\n", label, path);
-                std::fclose(file);
                 return false;
             }
             std::fprintf(stderr, "[moe_stream_batch] %s: direct open failed; using buffered reads: %s\n", label, path);
@@ -112,7 +126,6 @@ bool expert_pack_open_data_source(
     if (g_expert_pack.io_backend == 1 || g_expert_pack.io_backend == 2) {
         if (direct_required) {
             std::fprintf(stderr, "[moe_stream_batch] %s: required O_DIRECT is unsupported on this platform\n", label);
-            std::fclose(file);
             return false;
         }
         std::fprintf(stderr, "[moe_stream_batch] %s: direct/io_uring reads are not supported on this platform; using buffered reads\n", label);
@@ -121,6 +134,7 @@ bool expert_pack_open_data_source(
 #endif
 
     g_expert_pack.sources.push_back(source);
+    pending.transferred = true;
     return true;
 }
 
@@ -220,6 +234,7 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
         std::fprintf(stderr, "[moe_stream_batch] GGUF alias: open failed: %s\n", path);
         return false;
     }
+    std::unique_ptr<FILE, decltype(&std::fclose)> input(file, &std::fclose);
 
     std::unordered_set<std::string> existing_keys;
     existing_keys.reserve(entries.size() * 2 + 1024);
@@ -231,7 +246,6 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
     std::vector<char *> fields;
     if (!std::fgets(line, sizeof(line), file)) {
         std::fprintf(stderr, "[moe_stream_batch] GGUF alias: empty TSV: %s\n", path);
-        std::fclose(file);
         return false;
     }
     expert_pack_split_tsv_line(line, fields);
@@ -251,7 +265,6 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
     }
     if (col_tensor < 0 || col_expert < 0 || col_nbytes < 0 || col_source < 0 || col_offset < 0) {
         std::fprintf(stderr, "[moe_stream_batch] GGUF alias: required TSV columns missing: %s\n", path);
-        std::fclose(file);
         return false;
     }
 
@@ -291,7 +304,6 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
             source_idx = (int32_t)g_expert_pack.sources.size();
             if (!expert_pack_open_data_source(source_path, "GGUF alias", false,
                     expert_pack_env_bool("GGML_MOE_IO_REQUIRE_DIRECT", false))) {
-                std::fclose(file);
                 return false;
             }
             alias_sources[source_path] = source_idx;
@@ -308,7 +320,7 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
         existing_keys.insert(key);
         ++loaded;
     }
-    std::fclose(file);
+    input.reset();
 
     std::fprintf(stderr,
             "[moe_stream_batch] GGUF alias: loaded %lu entries from %s sources=%zu skipped_duplicates=%lu bad_rows=%lu rows=%lu\n",
