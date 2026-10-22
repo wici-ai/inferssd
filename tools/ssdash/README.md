@@ -27,3 +27,30 @@ ruff format --check src/ssdash tests
 ```
 
 Use a mypy release supporting the configured Python 3.9 target (verified with 1.18.2). The preserved oracle is intentionally excluded from formatting/lint rewrites.
+
+## Decode cost leaf
+
+`ssdash.model.decode_cost` adds `fit_response(x, y)` and
+`price_decode(rows, LayerResponse, cpu_scale)`. It consumes fixed replay rows and
+recorded layer observations; it does not run the tier replay, choose a plan, fit
+new device measurements, change settings, or replace `tools/adaptive/sim.py`.
+`LayerResponse` is a frozen nested placement view, not a new top-level `insitu`
+artifact version. A complete schema-3 artifact adapter remains future work.
+
+The F `lstsq`/`price` oracle is preserved verbatim in `fixtures/oracle/sim_f.py`.
+Twenty pricing cases and nine fit cases bind every output float by `float.hex()`.
+They cover measured-count and empirical-readiness cutoffs, capped/uncapped
+fallbacks, missing/empty/null/zero fields, CPU scaling, empty rows, dependent
+columns, the scaled pivot threshold and original column order. The historical
+input projection is evaluated with F code to produce a new offline function
+oracle; its old device run is not presented as a current-F golden.
+
+No summation is reordered, no pivot exchange or fit normalization is added, and
+integer versus float inputs are preserved. `fit_response` retains F's zip
+truncation and empty/ragged-input failures. The typed placement adapter requires
+finite numeric table/beta/count observations and integer `pf_k`; malformed typed
+artifacts fail explicitly. Missing and empty readiness counts retain F's fallback
+semantics; a zero readiness share is distinct from an absent share, and an
+explicit null share fails only if the uncapped fallback uses it. Zero-priced
+outputs still fail instead of becoming a default estimate. No device or full
+planner-equivalence claim follows from these checks.
