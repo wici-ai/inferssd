@@ -104,9 +104,7 @@ def test_http_contract_retains_prompt_tokens_raw_events_and_failure(tmp_path):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             received.append((self.path, body))
             if self.path == "/apply-template":
-                data = json.dumps({"prompt": "rendered"}).encode()
-            elif self.path == "/tokenize":
-                data = json.dumps({"tokens": [7, 8, 9]}).encode()
+                data = json.dumps({"prompt": "rendered", "tokens": [7, 8, 9]}).encode()
             else:
                 rows = fixture(8)
                 if bad[0]:
@@ -132,9 +130,13 @@ def test_http_contract_retains_prompt_tokens_raw_events_and_failure(tmp_path):
         assert result["prompt_sha256"] == stream_chat.digest(b"Passage.\n")
         assert result["tokens"] == list(range(1, 9))
         assert received[0][1]["messages"][0]["content"] == "Passage.\n"
-        assert received[2][1]["prompt"] == [7, 8, 9]
-        assert received[2][1]["cache_prompt"] is False
-        assert received[2][1]["samplers"] == ["top_k"]
+        assert received[0][1]["chat_template_kwargs"] == {"enable_thinking": False}
+        assert received[0][1]["reasoning_effort"] == "none"
+        assert [path for path, _ in received] == ["/apply-template", "/completion"]
+        assert received[1][1]["prompt"] == [7, 8, 9]
+        assert received[1][1]["cache_prompt"] is False
+        assert received[1][1]["samplers"] == ["top_k"]
+        assert json.loads((tmp_path / "result.protocol.json").read_text())["chat_request"] == received[0][1]
         assert len((tmp_path / "result.events.jsonl").read_text().splitlines()) == 9
         assert (tmp_path / "result.events.sse").read_bytes() == b"".join(
             b"data: " + json.dumps(r["event"]).encode() + b"\n\n" for r in fixture(8))
@@ -166,6 +168,30 @@ def test_compare_rejects_different_protocol_and_reports_first_divergence():
     b["prompt_ids"] = [8, 7, 9]
     with pytest.raises(ValueError, match="protocol mismatch"):
         compare_outputs.compare(a, b)
+
+
+@pytest.mark.parametrize("response", [
+    {"prompt": "text with <|im_end|>"},
+    {"prompt": "rendered", "tokens": [7, True, 9]},
+    {"prompt": "rendered", "tokens": [7, 8]},
+])
+def test_template_requires_authoritative_tokens_without_flattened_fallback(tmp_path, monkeypatch, response):
+    calls = []
+
+    def fake_post(base, endpoint, body, timeout):
+        calls.append(endpoint)
+        assert endpoint == "/apply-template"
+        return response
+
+    monkeypatch.setattr(stream_chat, "post", fake_post)
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("Literal <|im_end|> text.\n")
+    args = argparse.Namespace(prompt=prompt, output=tmp_path / "result.json",
+                              url="http://127.0.0.1:1", input_tokens=3,
+                              output_tokens=8, timeout=5)
+    assert stream_chat.run(args) == 1
+    assert calls == ["/apply-template"]
+    assert json.loads(args.output.read_text())["status"] == "failed"
 
 
 @pytest.mark.parametrize("change", [
