@@ -13,6 +13,9 @@
 
 namespace c0 {
 namespace {
+struct close_file {
+    void operator()(FILE * file) const { std::fclose(file); }
+};
 // A source is borrowed by the catalog only after vector insertion succeeds.
 struct pending_source_handles {
     expert_pack_source & source;
@@ -234,7 +237,7 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
         std::fprintf(stderr, "[moe_stream_batch] GGUF alias: open failed: %s\n", path);
         return false;
     }
-    std::unique_ptr<FILE, decltype(&std::fclose)> input(file, &std::fclose);
+    std::unique_ptr<FILE, close_file> input(file);
 
     std::unordered_set<std::string> existing_keys;
     existing_keys.reserve(entries.size() * 2 + 1024);
