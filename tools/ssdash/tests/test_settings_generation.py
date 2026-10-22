@@ -12,6 +12,11 @@ from unittest.mock import patch
 
 import pytest
 
+from ssdash.model.routing_replay import Replay
+from ssdash.plan import placement, settings
+
+CANDIDATE = SimpleNamespace(settings=settings, placement=placement, Replay=Replay)
+
 FIXTURES = Path(__file__).parent / "fixtures"
 ORACLES = FIXTURES / "oracle"
 FUNCTIONS = (
@@ -302,3 +307,50 @@ def test_frozen_sources_and_namedtuple_contract():
         )
     assert F.settings.Setting._fields == ("name", "value", "source", "input", "pending")
     assert F.settings.Setting._field_defaults == {"pending": False}
+
+
+@pytest.mark.parametrize("case", GOLDENS["cases"], ids=lambda case: case["name"])
+def test_complete_settings_matches_f(case):
+    assert observe(CANDIDATE, case) == observe(F, case)
+
+
+def test_setting_tuple_semantics_are_preserved():
+    expected = F_SETTINGS.Setting("X", 0, "derived", "receipt")
+    actual = settings.Setting("X", 0, "derived", "receipt")
+    assert actual == expected
+    assert repr(actual) == repr(expected)
+    assert actual._fields == expected._fields
+    assert actual._field_defaults == expected._field_defaults
+    assert actual._asdict() == expected._asdict()
+    assert actual._replace(pending=True) == expected._replace(pending=True)
+    with pytest.raises(AttributeError):
+        actual.pending = True
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        case
+        for case in GOLDENS["cases"]
+        if case["function"] == "rank_costs"
+        and "error" not in case["name"]
+        and case["name"] != "rank-replay-failure"
+    ],
+    ids=lambda case: case["name"],
+)
+def test_observed_cache_matches_original_machine_method(case):
+    # Verify the observer's thin replay wrapper against the unchanged F method,
+    # rather than using the same fixture implementation as its own reference.
+    from types import MethodType
+
+    args = copy.deepcopy(case["arguments"])
+    m = SimpleNamespace(**args.pop("machine"), _replays={})
+    m.replay = MethodType(F_MACHINE.Machine.replay, m)
+    try:
+        F_SETTINGS.rank_costs(m, **args)
+        if case.get("repeat"):
+            F_SETTINGS.rank_costs(m, **args)
+    except ZeroDivisionError:
+        assert case["name"] == "rank-zero-layers"
+    expected = exact([(k, replay_state(v)) for k, v in m._replays.items()])
+    assert observe(F, case)["cache"] == expected
