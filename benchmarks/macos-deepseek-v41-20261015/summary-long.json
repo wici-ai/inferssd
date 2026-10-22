@@ -1,0 +1,68 @@
+{
+  "1024": {
+    "fork": {
+      "prefill_tps": 8.261399856448497,
+      "decode_tps": 0.9133412672244745,
+      "prefill_s": 123.94993799999999,
+      "decode_s": 33.941311,
+      "peak_rss_gib": 37.42326354980469,
+      "matches_original": null
+    },
+    "original": {
+      "prefill_tps": 8.983520766364505,
+      "decode_tps": 0.9189760630858688,
+      "prefill_s": 113.98649,
+      "decode_s": 34.821364,
+      "peak_rss_gib": 29.565780639648438,
+      "matches_original": null
+    },
+    "pack": {
+      "prefill_tps": 8.948515050729428,
+      "decode_tps": 2.0717052134396954,
+      "prefill_s": 114.432394,
+      "decode_s": 15.446213,
+      "peak_rss_gib": 29.475189208984375,
+      "matches_original": true
+    },
+    "colibri": {
+      "prefill_tps": 1.7483950280016394,
+      "decode_tps": 1.0139416983523448,
+      "prefill_s": 585.68,
+      "decode_s": 31.56,
+      "peak_rss_gib": 18.155181884765625
+    }
+  },
+  "2048": {
+    "fork": {
+      "prefill_tps": 8.870881538395206,
+      "decode_tps": 0.8968636850520251,
+      "prefill_s": 230.867698,
+      "decode_s": 34.564896,
+      "peak_rss_gib": 36.69303894042969,
+      "matches_original": null
+    },
+    "original": {
+      "prefill_tps": 9.34721757225786,
+      "decode_tps": 0.9404112247836444,
+      "prefill_s": 219.10263500000002,
+      "decode_s": 34.027667,
+      "peak_rss_gib": 29.46783447265625,
+      "matches_original": null
+    },
+    "pack": {
+      "prefill_tps": 9.336451975743678,
+      "decode_tps": 2.0796221014698313,
+      "prefill_s": 219.355276,
+      "decode_s": 15.387411,
+      "peak_rss_gib": 29.276092529296875,
+      "matches_original": true
+    },
+    "colibri": {
+      "prefill_tps": 1.4625437406270085,
+      "decode_tps": 0.8076728924785462,
+      "prefill_s": 1400.3,
+      "decode_s": 39.62,
+      "peak_rss_gib": 18.430450439453125
+    }
+  }
+}
