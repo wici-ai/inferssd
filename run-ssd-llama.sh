@@ -11,6 +11,7 @@ set -Eeuo pipefail
 # no model, machine or tuning value.
 #
 # Inputs (environment):
+#   LAUNCH_SCOPE optional unique systemd scope name supplied by the benchmark owner; not a tuning setting.
 #   MODEL_CONF   required: a model's data-only conf (tools/adaptive/models/*.conf): NAME, MODEL_GLOB, EXPERT_PACK,
 #                TEMPLATE, TEMPLATE_KWARGS, SAMPLING (the model's sampling, passed whenever the conf names it: it
 #                overrides the GGUF's general.sampling.*, and a conf whose GGUF carries the model's leaves it out),
@@ -86,7 +87,7 @@ launcher_settings=" CONTEXT UBATCH CTX_CHECKPOINTS THREADS PROMPT_CACHE_DIR PROM
     MEMORY_RESERVE_MIB MEMORY_MAX VRAM_RESERVE_MIB VRAM_ELASTIC_SAFETY_MIB CPUSET SERVER_BIN PRELOAD_LIB
     LLAMA_SERVER_HOST LLAMA_SERVER_PORT EXPERT_ALIAS EXPERT_PACK EXPERT_INDEX DENSE_HOMES ARGS "
 for name in "${!settings[@]}"; do
-    [[ $name =~ ^(GGML|LLAMA)_ || $launcher_settings == *[[:space:]]$name[[:space:]]* ]] ||
+    [[ $name =~ ^(GGML|LLAMA)_ || $launcher_settings == *[[:space:]]${name}[[:space:]]* ]] ||
         die "$SETTINGS: $name is neither a launcher setting nor an engine variable (GGML_*, LLAMA_*)" 2
 done
 model_name=${conf[NAME]:-$(basename "$MODEL_CONF" .conf)}
@@ -420,12 +421,12 @@ for kv in "${model_env[@]}"; do
 done
 # engine variables in SETTINGS that nothing above sets, then those the server inherits from the caller
 for name in $(printf '%s\n' "${!settings[@]}" | sort); do
-    [[ $name =~ ^(GGML|LLAMA)_ && -z ${env_set[$name]+x} && $launcher_settings != *[[:space:]]$name[[:space:]]* ]] ||
+    [[ $name =~ ^(GGML|LLAMA)_ && -z ${env_set[$name]+x} && $launcher_settings != *[[:space:]]${name}[[:space:]]* ]] ||
         continue
     put "$name" "${settings[$name]}" settings "$SETTINGS"
 done
 for name in $(compgen -e | grep -E '^(GGML|LLAMA)_' | sort); do
-    [[ -z ${env_set[$name]+x} && $launcher_settings != *[[:space:]]$name[[:space:]]* ]] || continue
+    [[ -z ${env_set[$name]+x} && $launcher_settings != *[[:space:]]${name}[[:space:]]* ]] || continue
     put "$name" "${!name}" override environment
 done
 
@@ -530,7 +531,9 @@ args+=("$@")
 
 cpumask=()
 [[ -n $CPUSET ]] && cpumask=(taskset -c "$CPUSET")
-SCOPE+=(--quiet --unit="$model_name-$(date +%Y%m%d-%H%M%S)-$$" -p MemoryMax="$MEMORY_MAX" -p MemorySwapMax=0)
+scope_name=${LAUNCH_SCOPE:-$model_name-$(date +%Y%m%d-%H%M%S)-$$}
+[[ $scope_name =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ && ${#scope_name} -le 200 ]] || die "Invalid LAUNCH_SCOPE"
+SCOPE+=(--quiet --unit="$scope_name" -p MemoryMax="$MEMORY_MAX" -p MemorySwapMax=0)
 
 route="prefill on the CPU sink"
 (( graph_route )) && route="prefill on the CPU sink up to $max_sink_tokens tokens and where the GPU does not offload, on the GPU graph above"
