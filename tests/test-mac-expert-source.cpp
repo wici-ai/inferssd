@@ -11,7 +11,12 @@
 
 int main(int argc, char ** argv) {
     if (argc < 5 || !ggml_mac_expert_pack_enabled()) { return 2; }
+    bool cache_updates = true;
     for (int begin = 1; begin < argc;) {
+        if (std::strcmp(argv[begin], "--prefill") == 0 || std::strcmp(argv[begin], "--decode") == 0) {
+            cache_updates = std::strcmp(argv[begin++], "--decode") == 0;
+            continue;
+        }
         if (std::strcmp(argv[begin], "--truncate") == 0) {
             if (begin + 1 >= argc || truncate(argv[begin + 1], 0) != 0) { return 6; }
             begin += 2;
@@ -29,19 +34,19 @@ int main(int argc, char ** argv) {
             counts[expert] = 1;
             end += 4;
         }
-        void * batch = ggml_mac_expert_pack_begin_batch(argv[begin], counts.data(), int(counts.size()), bytes);
+        void * batch = ggml_mac_expert_pack_begin_batch(argv[begin], counts.data(), int(counts.size()), bytes, cache_updates);
         for (int i = begin; i < end; i += 4) {
             const auto expert = int32_t(std::strtol(argv[i + 1], nullptr, 10));
             std::ifstream file(argv[i + 3], std::ios::binary);
             std::vector<char> expected((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
             if (expected.size() != bytes) { return 3; }
             const auto * data = static_cast<const char *>(ggml_mac_expert_pack_acquire_batch(batch, argv[i], expert, bytes));
-            const void * pinned = ggml_mac_expert_pack_acquire(argv[i], expert, bytes);
+            const void * pinned = cache_updates ? ggml_mac_expert_pack_acquire(argv[i], expert, bytes) : data;
             const char * alignment = std::getenv("SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT");
             const bool page_aligned_payload = !alignment || std::strcmp(alignment, "1") == 0 || std::getenv("SSD_LLAMA_MAC_EXPERT_PACK");
             if (data != pinned || (page_aligned_payload && uintptr_t(data) % 4096 != 0) ||
                     !std::equal(expected.begin(), expected.end(), data)) { return 4; }
-            ggml_mac_expert_pack_release(pinned);
+            if (cache_updates) { ggml_mac_expert_pack_release(pinned); }
             if (!std::equal(expected.begin(), expected.end(), data)) { return 5; }
             ggml_mac_expert_pack_release(data);
         }

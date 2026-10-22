@@ -64,6 +64,7 @@ def main():
     parser.add_argument("--source", choices=("alias", "mmap"), default="alias")
     parser.add_argument("--depth", type=int, default=0)
     parser.add_argument("--read-alignment", type=int, choices=(1, 4096, 16384), default=1)
+    parser.add_argument("--expert-prefill", action="store_true")
     parser.add_argument("--cache-mib", type=int, default=8192)
     parser.add_argument("--policy", choices=("lfu", "lru"), default="lfu")
     parser.add_argument("--threads", type=int, default=8)
@@ -89,7 +90,8 @@ def main():
                  "LLAMA_DROP_MMAP_TENSOR_AFTER_UPLOAD": "1", "LLAMA_MAC_ADAPTIVE_PREFILL": "0",
                  "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": str(args.cache_mib), "SSD_LLAMA_MAC_EXPERT_CACHE_POLICY": args.policy,
                  "SSD_LLAMA_MAC_EXPERT_READ_AHEAD": str(args.depth),
-                 "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": str(args.read_alignment)}
+                 "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": str(args.read_alignment),
+                 "SSD_LLAMA_MAC_EXPERT_PREFILL": "1" if args.expert_prefill else "0"}
     if args.source == "alias":
         overrides["GGML_MOE_EXPERT_GGUF_ALIAS_TSV"] = str(args.alias.resolve())
     if args.trace:
@@ -106,8 +108,10 @@ def main():
            "--host", "127.0.0.1", "--port", str(port)]
     save(args.out / "config.json", {"argv": cmd, "env": overrides, "git": command(["git", "-C", str(repo), "rev-parse", "HEAD"]).strip(),
          "status": command(["git", "-C", str(repo), "status", "--short"]), "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+         "shared_library_sha256": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted({p.resolve() for p in binary.parent.glob("*.dylib")})},
          "cache_definition": "First request has an empty application expert cache; repeats retain it. No OS page-cache purge; physical device counters are recorded.",
          "timing_definition": "read_call_ms sums pread service times across workers; compute_ms is thread-0 work, barrier_ms its synchronization waits. These are not device bandwidth or disjoint whole-request phases."})
+    (args.out / "source.patch").write_text(command(["git", "-C", str(repo), "diff", "HEAD"]))
     samples = []
     stop_monitor = threading.Event()
     server = None
