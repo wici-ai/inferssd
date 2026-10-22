@@ -2416,9 +2416,10 @@ static void q2_activation_test(int threads, int depth) {
 // first decode keeps the arena whatever its epoch, through a prefill. An elastic prefill's shrink (shrink_to, as
 // partial reclaim) gives load-time slots back, and decode admissions refault them. Without elastic, slots the first
 // prefill gives back through the ledger come back at the first decode token as far as the room allows (a fixed and
-// an automatic budget), and a later request's give-back stays; with an automatic budget the enabled slots the load
-// step did not commit take their room first. A cache that cannot give room back (neither partial reclaim nor elastic)
-// takes nothing at load.
+// an automatic budget), and so do a later request's; with an automatic budget the enabled slots the load step did not
+// commit take their room first. A prefill's room (its gathered pages and its buffers) is given back in one step at its
+// start and taken back at its first decode token; the load step leaves the pages held then. A cache that cannot give
+// room back (neither partial reclaim nor elastic) takes nothing at load.
 // The room the host ledger's terms leave before its reserve (CACHE_RESERVE_BYTES, also the floor's margin off unified
 // memory): the least of memory.max less memory.current over this process's cgroup and its ancestors with a finite
 // limit, and MemAvailable. 0 without a finite cgroup.
@@ -2563,11 +2564,24 @@ static void cache_load_tests(int threads, int depth) {
                 kind + "the first decode did not take back the given-back slots: " + regrow);
         const auto first = run("load_regrow_layer1", d.get(), 1, { 1, 2, 3 }, { .2f, .3f, .5f }, 0, 3, nullptr);
         require(first.stats.cache_new_slot_bytes == 3 * stride, kind + "regrown slots were not paged in at admission");
-        // a later request's prefill gives slots back for good, as without the load step
+        // a later request's prefill gives slots back as the first's did, and its first decode token takes them back
         begin_cache(d.get(), 11, 3, false);
         require(!kimi_cpu_sink_cache_make_room(d.get(), uint64_t(1) << 50, 0), kind + "the ledger granted 1 PiB");
-        begin_cache(d.get(), 11, 4);
-        require(cache_snapshot(d.get()).enabled_bytes == 0, kind + "a later decode took given-back slots back");
+        require(cache_snapshot(d.get()).enabled_bytes == 0, kind + "a later prefill did not give its slots back");
+        regrow.clear();
+        {
+            stderr_capture log;
+            begin_cache(d.get(), 11, 4);
+            std::istringstream lines(log.read());
+            for (std::string line; std::getline(lines, line);) {
+                if (line.rfind("[kimi_cpu_sink_cache] prefill_regrow=1 ", 0) == 0) { regrow = line; }
+            }
+        }
+        require(cache_snapshot(d.get()).enabled_bytes == 12 * stride &&
+                regrow.find(" before_slots=0 after_slots=12 of=12 ") != std::string::npos,
+                kind + "a later request's first decode did not take its prefill's slots back: " + regrow);
+        begin_cache(d.get(), 11, 5);
+        require(cache_snapshot(d.get()).enabled_bytes == 12 * stride, kind + "a later decode token changed the slots");
     }
     {
         // An automatic budget whose room shrinks between geometry's reading of it and the load step's own, as when
@@ -2645,6 +2659,111 @@ static void cache_load_tests(int threads, int depth) {
                 number(regrow, "after_slots") == enabled + more && std::min(disabled, fit) != more,
                 "owed slots: the first decode did not price the owed slots first: " + regrow);
         std::printf("case=load_regrow_owed status=PASS %s | %s\n", loaded.c_str(), regrow.c_str());
+    }
+    {
+        // A prefill's room, held before it allocates anything (kimi_cpu_sink_cache_prefill_room): its pages and its
+        // compute buffers take their room in one give-back at its start; its later checks keep the rest; the first
+        // decode token takes the slots back. File pages count as room (CACHE_RECLAIMABLE_FILE), so the hold alone
+        // keeps the pages' room. Experts of 51 MiB keep the process's own movements far below a slot.
+        activation_env_guard file_env("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE", "1");
+        auto number = [](const std::string & line, const std::string & key) {
+            const size_t at = line.find(" " + key + "=");
+            require(at != std::string::npos, "the receipt lacks " + key + ": " + line);
+            return uint64_t(std::stoull(line.substr(at + key.size() + 2)));
+        };
+        fixture big;
+        big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
+        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096, slot = 3 * role;
+        auto h = make_sink(big, threads, depth);
+        configure_cache(h.get(), 6 * slot, { 1, 2 }, 6);
+        {
+            tensors meta(big, 1);
+            char error[512] = {};
+            require(kimi_cpu_sink_vram_reserve(h.get(), meta.role[0], meta.role[1], meta.role[2], 6, error, sizeof(error)),
+                error);
+        }
+        require(cache_snapshot(h.get()).committed_bytes == 6 * slot, "prefill room: the load step did not commit 6 slots");
+        begin_cache(h.get(), 13, 1, false);
+        kimi_host_ledger probe;
+        probe.configure(false);
+        const uint64_t room = probe.measure(0).surplus(), pages = room + 5 * slot / 2, host = 1 << 20;
+        require(room != UINT64_MAX && room > 0, "prefill room: no finite room to measure");
+        std::string line;
+        {
+            stderr_capture log;
+            require(kimi_cpu_sink_cache_prefill_room(h.get(), pages - host, host, 0), "prefill room: refused");
+            std::istringstream lines(log.read());
+            for (std::string l; std::getline(lines, l);) {
+                if (l.rfind("[kimi_host_ledger] event=prefill_room ", 0) == 0) { line = l; }
+            }
+        }
+        const auto held = cache_snapshot(h.get());
+        require(held.enabled_bytes == 3 * slot && held.committed_bytes == 3 * slot && held.shrink_ops == 1 &&
+                held.released_bytes == 3 * slot && number(line, "slots_before") == 6 && number(line, "slots_after") == 3 &&
+                number(line, "pages") == pages - host && number(line, "fits") == 1,
+                "prefill room: 2.5 slots of shortage did not take 3 slots back in one step: " + line);
+        begin_cache(h.get(), 13, 1, false); // a later layer's check: the hold is room already made
+        require(cache_snapshot(h.get()).enabled_bytes == 3 * slot && cache_snapshot(h.get()).shrink_ops == 1,
+                "prefill room: a later check gave the held room back again");
+        std::string regrow; // the first request of an arena made at load
+        {
+            stderr_capture log;
+            begin_cache(h.get(), 13, 2);
+            std::istringstream lines(log.read());
+            for (std::string l; std::getline(lines, l);) {
+                if (l.rfind("[kimi_cpu_sink_cache] load_regrow=1 ", 0) == 0) { regrow = l; }
+            }
+        }
+        require(cache_snapshot(h.get()).enabled_bytes == 6 * slot &&
+                regrow.find(" before_slots=3 after_slots=6 of=6 ") != std::string::npos,
+                "prefill room: the first decode token did not take the slots back: " + regrow);
+        std::printf("case=prefill_room status=PASS %s | %s\n", line.c_str(), regrow.c_str());
+    }
+    {
+        // The load step with a prefill's pages held (the load-time graph's): the arena has the slots the first decode
+        // token would size, the slots committed leave the pages' room, and those are owed at the first decode token.
+        activation_env_guard file_env("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE", "1");
+        auto number = [](const std::string & line, const std::string & key) {
+            const size_t at = line.find(" " + key + "=");
+            require(at != std::string::npos, "the receipt lacks " + key + ": " + line);
+            return uint64_t(std::stoull(line.substr(at + key.size() + 2)));
+        };
+        fixture big;
+        big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
+        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096, slot = 3 * role;
+        const uint64_t cost = slot + slot / 128, ring = uint64_t(depth) * slot;
+        kimi_host_ledger probe;
+        probe.configure(false);
+        const uint64_t room = probe.measure(0).surplus() + probe.reserve;
+        require(room != UINT64_MAX && room > ring + 7 * cost + (1ull << 30), "load hold: the case needs a finite cgroup with room");
+        // geometry sees 6.5 slots of room after the read ring; the hold takes 3 of them
+        activation_env_guard reserve_env("GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES", std::to_string(room - ring - 13 * cost / 2).c_str());
+        auto g = make_sink(big, threads, depth);
+        configure_cache(g.get(), std::numeric_limits<uint64_t>::max(), { 1, 2 }, 6);
+        std::string loaded;
+        {
+            tensors meta(big, 1);
+            char error[512] = {};
+            stderr_capture log;
+            require(kimi_cpu_sink_cache_prefill_room(g.get(), 3 * cost, 0, 0), "load hold: the hold was refused");
+            const bool ok = kimi_cpu_sink_vram_reserve(g.get(), meta.role[0], meta.role[1], meta.role[2], 6, error,
+                sizeof(error));
+            std::istringstream lines(log.read());
+            for (std::string l; std::getline(lines, l);) {
+                if (l.rfind("[kimi_cpu_sink_cache] reason=load ", 0) == 0) { loaded = l; }
+            }
+            require(ok, error);
+        }
+        require(number(loaded, "of") == 6 && number(loaded, "slots") == 3,
+                "load hold: the arena or the committed slots did not leave the held pages: " + loaded);
+        const uint64_t stride = number(loaded, "slot_bytes");
+        begin_cache(g.get(), 14, 1, false);
+        require(cache_snapshot(g.get()).enabled_bytes == 6 * stride, "load hold: the first prefill gave held slots back");
+        begin_cache(g.get(), 14, 2);
+        const auto first = cache_snapshot(g.get());
+        require(first.enabled_bytes == 6 * stride && first.committed_bytes == 3 * stride,
+                "load hold: the first decode token did not keep the held slots enabled and owed");
+        std::printf("case=load_hold status=PASS %s\n", loaded.c_str());
     }
     for (const bool elastic : { false, true }) {
         // The load step only for a cache that can give room back to the first prefill's ledger requests: without
@@ -3171,6 +3290,65 @@ static void host_ledger_tests() {
         try { (void) make(false); } catch (const std::exception &) { rejected = true; }
         require(rejected, "an invalid CACHE_RECLAIMABLE_FILE was accepted");
         current = 0; file_pages = 0;
+    }
+
+    // An open prefill's pages (the weight rows its graph gathers from the file mapping) are held in both terms from its
+    // start to the first decode token: with CACHE_RECLAIMABLE_FILE they count beside the reserve whether they have
+    // come in or not; without it the file pages up to them are theirs, not more use; MemAvailable needs them beside
+    // the floor; on unified memory the tier keeps them free beside the allocation.
+    {
+        limit = 8 * GiB; available = 100 * GiB;
+        {
+            activation_env_guard file("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE", "1");
+            auto f = make(false);
+            current = 6 * GiB; file_pages = 1 * GiB; // 5 GiB of anonymous and kernel memory, 1 GiB of old file pages
+            room = f.measure(0);
+            require(room.fits() && room.cgroup_surplus == 8 * GiB - 5 * GiB - 512 * MiB, "prefill pages: the reference room");
+            f.prefill_pages = 1 * GiB;
+            room = f.measure(2 * GiB);
+            require(!room.fits() && room.cgroup_shortage == 512 * MiB && !room.system_shortage,
+                    "prefill pages: the cgroup term did not hold the prefill's pages beside the reserve");
+            current += 1 * GiB; file_pages += 1 * GiB; // they came in
+            room = f.measure(2 * GiB);
+            require(!room.fits() && room.cgroup_shortage == 512 * MiB, "prefill pages: counted twice once they came in");
+            room = f.measure(1 * GiB + 512 * MiB);
+            require(room.fits() && room.cgroup_surplus == 0, "prefill pages: the room beside them");
+            f.prefill_pages = 0;
+            require(f.measure(2 * GiB).fits(), "prefill pages: still held after the hold was cleared");
+        }
+        {
+            auto n = make(false); // file pages are use
+            current = 6 * GiB; file_pages = 0;
+            n.prefill_pages = 1 * GiB;
+            room = n.measure(0);
+            require(room.fits() && room.cgroup_surplus == 8 * GiB - 6 * GiB - 512 * MiB - 1 * GiB,
+                    "prefill pages: the cgroup term without reclaimable file pages");
+            current += 1 * GiB; file_pages = 1 * GiB; // they came in: theirs, not more use
+            room = n.measure(0);
+            require(room.fits() && room.cgroup_surplus == 8 * GiB - 6 * GiB - 512 * MiB - 1 * GiB,
+                    "prefill pages: counted twice without reclaimable file pages");
+            current += 1 * GiB; file_pages = 2 * GiB; // file pages beyond them are use
+            room = n.measure(0);
+            require(!room.fits() && room.cgroup_shortage == 512 * MiB, "prefill pages: file pages beyond them were not use");
+            n.prefill_pages = 0;
+            current = 0; file_pages = 0;
+        }
+        {
+            limit = 0; available = 1 * GiB + 512 * MiB; // the system term alone: the floor, 1 GiB and 256 MiB
+            auto d = make(false);
+            d.prefill_pages = 1 * GiB;
+            room = d.measure(256 * MiB);
+            require(room.cgroup == kimi_host_ledger::room_unreadable && room.system_shortage == 256 * MiB,
+                    "prefill pages: MemAvailable did not hold them beside the floor");
+            calls.clear();
+            limit = 100 * GiB; current = 1 * GiB; file_pages = 0; refaults = 10; available = 1 * GiB;
+            auto u = make(true);
+            u.prefill_pages = 1 * GiB;
+            room = u.make_room(256 * MiB, actions);
+            require(calls.size() >= 2 && calls[1] == "tier" && tier_bytes == 256 * MiB + 1 * GiB,
+                    "prefill pages: the tier was not asked to keep them free beside the allocation");
+            limit = 8 * GiB; available = 100 * GiB; current = 0; file_pages = 0; refaults = 0;
+        }
     }
 
     // MemAvailable at the kernel's full watermark boost (kimi-memory-boost.h). The zones of the GB10 Spark ysy9 (4 KiB
