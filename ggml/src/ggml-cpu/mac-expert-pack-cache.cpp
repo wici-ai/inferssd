@@ -3,6 +3,11 @@
 #if defined(__APPLE__) || defined(GGML_MAC_EXPERT_CACHE_TESTING)
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <future>
+#include <thread>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -54,9 +59,10 @@ struct source_entry {
 };
 
 struct source_file {
+    std::string path;
     int fd;
     uint64_t bytes;
-    explicit source_file(const char * path) : fd(open(path, O_RDONLY)) {
+    explicit source_file(const char * source_path) : path(source_path), fd(open(source_path, O_RDONLY)) {
         if (fd < 0) { throw std::runtime_error("cannot open expert source: " + std::string(std::strerror(errno))); }
         struct stat info {};
         if (fstat(fd, &info) != 0 || info.st_size < 0
@@ -132,6 +138,43 @@ static void pread_exact(int fd, void * data, size_t bytes, uint64_t offset) {
     }
 }
 
+struct pending_read {
+    key id;
+    source_entry source;
+    slot buffer;
+    std::promise<void> completion;
+    std::future<void> ready = completion.get_future();
+};
+
+struct expert_batch {
+    std::string name;
+    size_t logical_bytes;
+    std::vector<int32_t> experts;
+    size_t next = 0;
+    size_t demand = 0;
+    size_t pending_bytes = 0;
+    std::unordered_map<int32_t, std::shared_ptr<pending_read>> pending;
+};
+
+struct request_trace_entry {
+    key id;
+    uint64_t bytes, begin_ns;
+    bool hit;
+};
+
+struct io_trace_entry {
+    int fd;
+    uint64_t offset, bytes, logical_bytes, begin_ns, duration_ns;
+};
+
+struct elapsed_counter {
+    double & total;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~elapsed_counter() {
+        total += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    }
+};
+
 class pack_cache {
 public:
     explicit pack_cache(const char * path, bool alias) {
@@ -149,16 +192,49 @@ public:
         if (policy != "lfu" && policy != "lru") {
             throw std::runtime_error("SSD_LLAMA_MAC_EXPERT_CACHE_POLICY must be lfu or lru");
         }
-        std::fprintf(stderr, "[mac_expert_pack] path=%s entries=%zu cache_budget_mib=%llu cache_policy=%s source=%s F_NOCACHE=1\n",
-                     path, index.size(), mib, policy.c_str(), alias ? "gguf-alias" : "pack");
+        // Temporary experiment control on this optimization branch: zero is the
+        // synchronous reference. The production default is chosen after device tests.
+        if (const char * value = std::getenv("SSD_LLAMA_MAC_EXPERT_READ_AHEAD")) {
+            read_ahead = size_t(parse_uint(value));
+            if (read_ahead > 4) { throw std::runtime_error("expert read-ahead must be 0..4"); }
+        }
+        try {
+            for (size_t i = 0; i < read_ahead; ++i) { readers.emplace_back([this] { reader_main(); }); }
+        } catch (...) {
+            stop_readers();
+            throw;
+        }
+        std::fprintf(stderr, "[mac_expert_pack] path=%s entries=%zu cache_budget_mib=%llu cache_policy=%s source=%s read_ahead=%zu F_NOCACHE=1\n",
+                     path, index.size(), mib, policy.c_str(), alias ? "gguf-alias" : "pack", read_ahead);
     }
 
     ~pack_cache() {
+        stop_readers();
         log_stats("shutdown");
         if (!trace_path.empty()) {
             if (FILE * output = std::fopen(trace_path.c_str(), "w")) {
                 for (const auto & item : access_trace) {
-                    std::fprintf(output, "%s %d\n", item.name.c_str(), item.expert);
+                    std::fprintf(output, "%s %d\n", item.id.name.c_str(), item.id.expert);
+                }
+                std::fclose(output);
+            }
+            if (FILE * output = std::fopen((trace_path + ".requests.tsv").c_str(), "w")) {
+                std::fprintf(output, "tensor\texpert\tlogical_bytes\tbegin_ns\thit\n");
+                for (const auto & item : access_trace) {
+                    std::fprintf(output, "%s\t%d\t%llu\t%llu\t%d\n", item.id.name.c_str(), item.id.expert,
+                            (unsigned long long)item.bytes, (unsigned long long)item.begin_ns, int(item.hit));
+                }
+                std::fclose(output);
+            }
+            if (FILE * output = std::fopen((trace_path + ".reads.tsv").c_str(), "w")) {
+                std::fprintf(output, "source_path\toffset\tread_bytes\tlogical_bytes\tbegin_ns\tduration_ns\n");
+                std::unordered_map<int, std::string> paths;
+                for (const auto & file : sources) { paths.emplace(file->fd, file->path); }
+                for (const auto & item : io_trace) {
+                    std::fprintf(output, "%s\t%llu\t%llu\t%llu\t%llu\t%llu\n", paths.at(item.fd).c_str(),
+                            (unsigned long long)item.offset, (unsigned long long)item.bytes,
+                            (unsigned long long)item.logical_bytes, (unsigned long long)item.begin_ns,
+                            (unsigned long long)item.duration_ns);
                 }
                 std::fclose(output);
             }
@@ -166,10 +242,17 @@ public:
         free(scratch_data);
     }
 
-    const void * acquire(const char * name, int32_t expert, size_t logical_bytes) {
+    const void * acquire(const char * name, int32_t expert, size_t logical_bytes, expert_batch * batch = nullptr) {
+        const auto lock_start = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(mutex);
+        lock_wait_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lock_start).count();
+        elapsed_counter elapsed{acquire_us};
+        const auto lookup_start = std::chrono::steady_clock::now();
+        if (batch && (batch->name != name || batch->logical_bytes != logical_bytes ||
+                batch->demand >= batch->experts.size() || batch->experts[batch->demand++] != expert)) {
+            throw std::runtime_error("expert batch acquired out of order");
+        }
         const key id { name, expert };
-        if (!trace_path.empty()) { access_trace.push_back(id); }
         const auto source = index.find(id);
         if (source == index.end() || source->second.bytes != logical_bytes) {
             throw std::runtime_error("expert pack missing/mismatched tensor " + id.name + "[" + std::to_string(expert) + "]");
@@ -180,14 +263,25 @@ public:
             for (auto & item : heat) { item.second >>= 1; }
         }
         auto hit = slots.find(id);
+        if (!trace_path.empty()) {
+            access_trace.push_back({id, logical_bytes,
+                    uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(lookup_start.time_since_epoch()).count()),
+                    hit != slots.end()});
+        }
+        lookup_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookup_start).count();
         if (hit != slots.end()) {
             ++hits;
             hit->second.pins++;
             hit->second.last_use = ++clock;
+            if (batch) {
+                discard_pending(*batch, expert);
+                schedule(*batch);
+            }
             maybe_log_stats();
             return hit->second.data;
         }
         ++misses;
+        const auto policy_start = std::chrono::steady_clock::now();
         const size_t allocation = round_up(logical_bytes);
         bool admit = budget >= allocation && !tensor_names.empty();
         const size_t per_tensor_slots = admit ? budget / tensor_names.size() / allocation : 0;
@@ -230,37 +324,41 @@ public:
             slots.erase(victim);
             ++evictions;
         }
+        policy_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - policy_start).count();
         slot fresh;
-        if (!admit && scratch_data && scratch_allocated != allocation) {
-            free(scratch_data);
-            scratch_data = nullptr;
-        }
-        if (!admit && scratch_data) {
-            fresh.data = scratch_data;
-            scratch_data = nullptr;
-            ++scratch_reuses;
-        } else if (posix_memalign(&fresh.data, alignment, allocation) != 0) {
-            throw std::runtime_error("cannot allocate expert-pack read buffer");
+        auto staged = batch ? batch->pending.find(expert) : std::unordered_map<int32_t, std::shared_ptr<pending_read>>::iterator{};
+        if (batch && staged != batch->pending.end()) {
+            auto job = staged->second;
+            {
+                elapsed_counter wait{read_wait_us};
+                job->ready.get();
+            }
+            fresh.data = job->buffer.data;
+            job->buffer.data = nullptr;
+            fresh.allocated = job->buffer.allocated;
+            batch->pending_bytes -= fresh.allocated;
+            batch->pending.erase(staged);
+            ++prefetch_used;
+        } else {
+            allocate_buffer(fresh, allocation, !admit);
+            elapsed_counter wait{read_wait_us};
+            read_source(source->second, fresh.data);
         }
         fresh.allocated = allocation;
         fresh.admitted = admit;
-        const auto read_start = std::chrono::steady_clock::now();
-        pread_exact(source->second.fd, fresh.data, source->second.read_bytes, source->second.offset);
-        read_us += std::chrono::duration<double, std::micro>(
-                std::chrono::steady_clock::now() - read_start).count();
-        ++read_requests;
-        read_bytes += source->second.read_bytes;
         fresh.pins = 1;
         fresh.last_use = ++clock;
         auto inserted = slots.emplace(id, std::move(fresh));
         allocated_bytes += allocation;
         peak_bytes = std::max(peak_bytes, allocated_bytes);
+        if (batch) { schedule(*batch); }
         maybe_log_stats();
         return inserted.first->second.data;
     }
 
     void release(const void * data) {
         std::lock_guard<std::mutex> lock(mutex);
+        elapsed_counter elapsed{release_us};
         for (auto it = slots.begin(); it != slots.end(); ++it) {
             if (it->second.data != data) { continue; }
             if (it->second.pins == 0) { throw std::runtime_error("expert-pack slice released twice"); }
@@ -279,7 +377,133 @@ public:
         throw std::runtime_error("unknown expert-pack slice released");
     }
 
+    expert_batch * begin(const char * name, const int64_t * counts, int n, size_t bytes) {
+        if (!read_ahead) { return nullptr; }
+        auto batch = std::make_unique<expert_batch>();
+        batch->name = name;
+        batch->logical_bytes = bytes;
+        for (int i = 0; i < n; ++i) {
+            if (counts[i] > 0) { batch->experts.push_back(i); }
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        schedule(*batch);
+        return batch.release();
+    }
+
+    void end(expert_batch * raw) {
+        if (!raw) { return; }
+        std::unique_ptr<expert_batch> batch(raw);
+        std::lock_guard<std::mutex> lock(mutex);
+        while (!batch->pending.empty()) { discard_pending(*batch, batch->pending.begin()->first); }
+        if (batch->demand != batch->experts.size()) { throw std::runtime_error("incomplete expert batch"); }
+    }
+
+    void record_compute(uint64_t us, uint64_t barriers) {
+        std::lock_guard<std::mutex> lock(mutex);
+        compute_us += us;
+        barrier_us += barriers;
+        ++computed_experts;
+    }
+
 private:
+    void allocate_buffer(slot & buffer, size_t allocation, bool reuse_scratch) {
+        elapsed_counter elapsed{allocation_us};
+        if (reuse_scratch && scratch_data && scratch_allocated != allocation) {
+            free(scratch_data);
+            scratch_data = nullptr;
+        }
+        if (reuse_scratch && scratch_data) {
+            buffer.data = scratch_data;
+            scratch_data = nullptr;
+            ++scratch_reuses;
+        } else if (posix_memalign(&buffer.data, alignment, allocation) != 0) {
+            throw std::runtime_error("cannot allocate expert read buffer");
+        }
+        buffer.allocated = allocation;
+    }
+
+    void read_source(const source_entry & source, void * data) {
+        const auto start = std::chrono::steady_clock::now();
+        pread_exact(source.fd, data, source.read_bytes, source.offset);
+        const auto duration = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count());
+        read_ns.fetch_add(duration, std::memory_order_relaxed);
+        if (!trace_path.empty()) {
+            std::lock_guard<std::mutex> trace_lock(trace_mutex);
+            io_trace.push_back({source.fd, source.offset, source.read_bytes, source.bytes,
+                    uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(start.time_since_epoch()).count()), duration});
+        }
+        read_requests.fetch_add(1, std::memory_order_relaxed);
+        read_bytes.fetch_add(source.read_bytes, std::memory_order_relaxed);
+    }
+
+    void reader_main() {
+        for (;;) {
+            std::shared_ptr<pending_read> job;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex);
+                queue_ready.wait(lock, [this] { return stopping || !queue.empty(); });
+                if (queue.empty()) { return; }
+                job = std::move(queue.front());
+                queue.pop_front();
+            }
+            try {
+                read_source(job->source, job->buffer.data);
+                job->completion.set_value();
+            } catch (...) {
+                job->completion.set_exception(std::current_exception());
+            }
+        }
+    }
+
+    void stop_readers() {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            stopping = true;
+        }
+        queue_ready.notify_all();
+        for (auto & reader : readers) { if (reader.joinable()) { reader.join(); } }
+    }
+
+    void discard_pending(expert_batch & batch, int32_t expert) {
+        const auto found = batch.pending.find(expert);
+        if (found == batch.pending.end()) { return; }
+        found->second->ready.get();
+        batch.pending_bytes -= found->second->buffer.allocated;
+        batch.pending.erase(found);
+        ++prefetch_unused;
+    }
+
+    void schedule(expert_batch & batch) {
+        // Only selected experts in the current op are read. Admission and heat
+        // updates still happen in demand order, exactly as in synchronous mode.
+        constexpr size_t staging_limit = size_t(64) << 20;
+        while (batch.pending.size() < read_ahead && batch.next < batch.experts.size()) {
+            const auto expert = batch.experts[batch.next++];
+            const key id{batch.name, expert};
+            if (slots.find(id) != slots.end()) { continue; }
+            const auto source = index.find(id);
+            if (source == index.end() || source->second.bytes != batch.logical_bytes) {
+                throw std::runtime_error("expert batch missing/mismatched source");
+            }
+            const auto allocation = round_up(batch.logical_bytes);
+            if (allocation > staging_limit - batch.pending_bytes) { continue; }
+            auto job = std::make_shared<pending_read>();
+            job->id = id;
+            job->source = source->second;
+            allocate_buffer(job->buffer, allocation, true);
+            batch.pending_bytes += allocation;
+            peak_staging_bytes = std::max(peak_staging_bytes, batch.pending_bytes);
+            batch.pending.emplace(expert, job);
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                queue.push_back(std::move(job));
+            }
+            ++prefetch_submitted;
+            queue_ready.notify_one();
+        }
+    }
+
     void load_pack(const char * path) {
         sources.emplace_back(std::make_unique<source_file>(path));
         const auto & file = *sources.back();
@@ -366,23 +590,40 @@ private:
         const uint64_t calls = hits + misses;
         std::fprintf(stderr,
                 "[mac_expert_pack] reason=%s requests=%llu hits=%llu misses=%llu hit_rate=%.4f"
-                " read_requests=%llu read_bytes=%llu read_wall_ms=%.1f evictions=%llu scratch_reuses=%llu"
-                " cache_bytes=%zu peak_cache_bytes=%zu\n",
+                " read_requests=%llu read_bytes=%llu read_call_ms=%.1f evictions=%llu scratch_reuses=%llu"
+                " cache_bytes=%zu peak_cache_bytes=%zu acquire_ms=%.1f read_wait_ms=%.1f compute_ms=%.1f"
+                " barrier_ms=%.1f lookup_ms=%.1f policy_ms=%.1f allocation_ms=%.1f release_ms=%.1f lock_wait_ms=%.1f"
+                " computed_experts=%llu prefetch_submitted=%llu prefetch_used=%llu prefetch_unused=%llu"
+                " peak_staging_bytes=%zu\n",
                 reason, static_cast<unsigned long long>(calls),
                 static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses),
                 calls ? double(hits) / double(calls) : 0.0,
-                static_cast<unsigned long long>(read_requests), static_cast<unsigned long long>(read_bytes),
-                read_us / 1000.0, static_cast<unsigned long long>(evictions),
+                static_cast<unsigned long long>(read_requests.load()), static_cast<unsigned long long>(read_bytes.load()),
+                double(read_ns.load()) / 1000000.0, static_cast<unsigned long long>(evictions),
                 static_cast<unsigned long long>(scratch_reuses),
-                allocated_bytes, peak_bytes);
+                allocated_bytes, peak_bytes, acquire_us / 1000.0, read_wait_us / 1000.0, compute_us / 1000.0,
+                double(barrier_us) / 1000.0, lookup_us / 1000.0, policy_us / 1000.0, allocation_us / 1000.0,
+                release_us / 1000.0, lock_wait_us / 1000.0,
+                static_cast<unsigned long long>(computed_experts), static_cast<unsigned long long>(prefetch_submitted),
+                static_cast<unsigned long long>(prefetch_used), static_cast<unsigned long long>(prefetch_unused), peak_staging_bytes);
     }
 
     std::vector<std::unique_ptr<source_file>> sources;
     size_t budget = 0;
     size_t allocated_bytes = 0;
     size_t peak_bytes = 0;
-    uint64_t clock = 0, hits = 0, misses = 0, read_requests = 0, read_bytes = 0, evictions = 0, scratch_reuses = 0;
-    double read_us = 0.0;
+    uint64_t clock = 0, hits = 0, misses = 0, evictions = 0, scratch_reuses = 0;
+    std::atomic<uint64_t> read_requests{0}, read_bytes{0}, read_ns{0};
+    double acquire_us = 0.0, read_wait_us = 0.0, lookup_us = 0.0, policy_us = 0.0;
+    double allocation_us = 0.0, release_us = 0.0, lock_wait_us = 0.0;
+    uint64_t compute_us = 0, barrier_us = 0, computed_experts = 0;
+    uint64_t prefetch_submitted = 0, prefetch_used = 0, prefetch_unused = 0;
+    size_t read_ahead = 0, peak_staging_bytes = 0;
+    std::mutex queue_mutex;
+    std::condition_variable queue_ready;
+    std::deque<std::shared_ptr<pending_read>> queue;
+    std::vector<std::thread> readers;
+    bool stopping = false;
     std::mutex mutex;
     std::unordered_map<key, source_entry, key_hash> index;
     std::unordered_set<std::string> tensor_names;
@@ -390,7 +631,9 @@ private:
     std::unordered_map<key, slot, key_hash> slots;
     std::string trace_path;
     std::string policy = "lfu";
-    std::vector<key> access_trace;
+    std::vector<request_trace_entry> access_trace;
+    std::mutex trace_mutex;
+    std::vector<io_trace_entry> io_trace;
     void * scratch_data = nullptr;
     size_t scratch_allocated = 0;
 };
@@ -421,6 +664,34 @@ extern "C" const void * ggml_mac_expert_pack_acquire(const char * name, int32_t 
         std::fprintf(stderr, "[mac_expert_pack] fatal: %s\n", e.what());
         std::abort();
     }
+}
+
+extern "C" void * ggml_mac_expert_pack_begin_batch(const char * name, const int64_t * counts, int n, size_t bytes) {
+    try { return instance()->begin(name, counts, n, bytes); }
+    catch (const std::exception & e) {
+        std::fprintf(stderr, "[mac_expert_pack] fatal: %s\n", e.what());
+        std::abort();
+    }
+}
+
+extern "C" const void * ggml_mac_expert_pack_acquire_batch(void * batch, const char * name, int32_t expert, size_t bytes) {
+    try { return instance()->acquire(name, expert, bytes, static_cast<expert_batch *>(batch)); }
+    catch (const std::exception & e) {
+        std::fprintf(stderr, "[mac_expert_pack] fatal: %s\n", e.what());
+        std::abort();
+    }
+}
+
+extern "C" void ggml_mac_expert_pack_end_batch(void * batch) {
+    try { instance()->end(static_cast<expert_batch *>(batch)); }
+    catch (const std::exception & e) {
+        std::fprintf(stderr, "[mac_expert_pack] fatal: %s\n", e.what());
+        std::abort();
+    }
+}
+
+extern "C" void ggml_mac_expert_pack_record_compute(uint64_t us, uint64_t barriers) {
+    instance()->record_compute(us, barriers);
 }
 
 extern "C" void ggml_mac_expert_pack_release(const void * data) {
