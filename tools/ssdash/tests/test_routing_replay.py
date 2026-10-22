@@ -3,9 +3,13 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
+
+from ssdash.model import routing_replay
+from ssdash.model.decode_cost import LayerResponse, price_decode
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GOLDENS = json.loads((FIXTURES / "routing-replay-goldens.json").read_text())
@@ -105,3 +109,58 @@ def test_replay_oracle_identity():
 @pytest.mark.parametrize("case", GOLDENS["cases"], ids=lambda case: case["name"])
 def test_frozen_f_state_transcript(case):
     assert transcript(ORACLE, case) == case["legacy"]
+
+
+@pytest.mark.parametrize("case", GOLDENS["cases"], ids=lambda case: case["name"])
+def test_typed_replay_state_exact(case):
+    assert transcript(routing_replay, case) == case["legacy"]
+
+
+def test_incremental_rows_match_simulate_and_cost_leaf():
+    case = next(
+        case for case in GOLDENS["cases"] if case["name"] == "simulate_same_segment_routing"
+    )
+    routing, parameters = case["routing"], case["parameters"]
+    replay = routing_replay.Replay(**parameters, behind=True)
+    for count in range(1, len(routing) + 1):
+        replay.advance(routing[:count])
+        replay.behind_hits(1)
+    assert exact((replay.rows, replay.stats())) == case["legacy"]
+    costs = json.loads((FIXTURES / "decode-cost-goldens.json").read_text())["price_cases"][0][
+        "costs"
+    ]
+    assert exact(
+        price_decode(replay.rows, LayerResponse.from_legacy(costs), 1.0).to_mapping()
+    ) == exact(ORACLE.price(replay.rows, costs, 1.0))
+
+
+def test_state_goldens_include_semantic_boundaries():
+    by_name = {case["name"]: case for case in GOLDENS["cases"]}
+    zero = by_name["tier_zero_capacity_still_counts_duplicates"]["legacy"]
+    assert zero[-1]["state"]["admissions"] == 0 and zero[-1]["state"]["ls"]
+    threshold = by_name["tier_minimum_threshold_and_decay"]["legacy"]
+    assert threshold[2]["state"]["admissions"] == 0
+    assert threshold[3]["state"]["admissions"] == 2
+    duplicates = by_name["ram_locked_hits_and_duplicate_clock"]["legacy"]
+    assert duplicates[2]["result"] == 2  # Duplicate resident IDs count twice.
+    assert duplicates[2]["state"]["clock"] == 5
+    replay = by_name["replay_length_only_prefix_and_rejected_shrink"]["legacy"]
+    assert replay[3]["state"] == replay[2]["state"]  # Changed contents, same lengths.
+    assert replay[4]["error"] == replay[5]["error"] == "ValueError"
+    assert replay[6]["state"]["behind_cache"] == []
+
+
+def test_routing_has_no_host_dependency_or_input_mutation(monkeypatch):
+    case = next(case for case in GOLDENS["cases"] if case["kind"] == "simulate")
+    original = json.dumps(case)
+
+    def denied(*args, **kwargs):
+        raise AssertionError("routing replay consulted a host dependency")
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    monkeypatch.setattr("builtins.open", denied)
+    monkeypatch.setattr("os.getenv", denied)
+    monkeypatch.setattr("os.cpu_count", denied)
+    monkeypatch.setattr(subprocess, "Popen", denied)
+    assert transcript(routing_replay, case) == case["legacy"]
+    assert json.dumps(case) == original
