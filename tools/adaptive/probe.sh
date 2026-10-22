@@ -3,6 +3,7 @@
 # GPU's kind and host link (memprobe), the drive at the queue depths a decode layer issues, every expert file alone.
 # The drive is read the engine's way (reads.sh: ioreplay, or fio with PROBE_READER=fio).
 # usage: probe.sh OUT EXPERT_SOURCE MEMPROBE   (EXPERT_SOURCE: the directory expert_source.py index wrote)
+#        GROUP_TIMER: the build's test-kimi-vram-group, for the grouped-prefill lanes (none: not timed)
 # env:   PROBE_QDS (the queue-depth grid, in role reads), PROBE_REPEATS (2), PROBE_MIN_EXPERTS (60 per run),
 #        PROBE_FILE_EXPERTS (100 per expert file)
 # exit:  nonzero, with the reason, when the drive cannot be read the way the engine reads it
@@ -74,6 +75,21 @@ echo "probe: drive done $(( $(date +%s) - t0 )) s, $gb GB read (reader ${PROBE_R
 
 # CPU: candidate sets from the labels; which placement is faster is measured inside the engine (bootstrap)
 python3 "$here/coresets.py" "$out/cpus.txt" > "$out/coresets.txt"
+
+# the grouped-prefill lanes (B4): one expert's time on the GPU's batched engine (from device memory, and in place where
+# the GPU reads host memory so), on the CPU's grouped path on the sink's threads, and one copy from page-locked
+# memory, at the model's expert shape and types, each busy beside the others as in a pass (test-kimi-vram-group
+# --time, with the tier DSO preloaded). The engine starts from these lines and replaces them with its own.
+if [[ -n ${GROUP_TIMER:-} && -x $GROUP_TIMER ]]; then
+  bin=$(dirname "$GROUP_TIMER")
+  threads=$(awk '$1 == "all" { print split($2, c, ",") }' "$out/coresets.txt")
+  [[ -n $threads ]] || threads=$(wc -l < "$out/cpus.txt")
+  args=$(python3 "$here/expert_source.py" lane-args "$src") &&
+  env LD_LIBRARY_PATH="$bin${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" LD_PRELOAD="$bin/libkimi-vram-tier.so" \
+      "$GROUP_TIMER" --time $args --threads "$threads" > "$out/lanes.txt" 2>&1 < /dev/null ||
+    echo "probe: the lane timing failed (lanes.txt): the engine starts from its built-in values" >&2
+  echo "probe: lanes done $(( $(date +%s) - t0 )) s"
+fi
 
 python3 "$here/device_profile.py" "$out" "$src" > "$out/device.json"
 echo "probe: total $(( $(date +%s) - t0 )) s -> $out/device.json"

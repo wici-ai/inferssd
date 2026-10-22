@@ -437,12 +437,14 @@ void run_grouped_prefill_hybrid(bool batch, size_t & compared, size_t & checks) 
 
 // A cold tier: the makespan rule streams SSD transients to the GPU while the CPU computes the rest, both lanes reading
 // through a two-expert ring in the merged lane order. A GPU fixed cost of 2 ms in the start values keeps both lanes
-// busy; the second pass runs on the terms calibrated by the first. A drive far slower than the lanes (start value
-// 0.1 MB/s) keeps every cold expert on the CPU. The output stays within the batched path's rounding of the graph.
+// busy; the second pass runs on the terms calibrated by the first. Lanes far shorter than the drive keep every cold
+// expert on the CPU: the drive's line comes from the decode step's reads (the cost table fits it over decode's and
+// prefill's layers, so a start value no longer outlives them), and a CPU of 1 ns an expert (start values) is far
+// below it. The output stays within the batched path's rounding of the graph.
 void run_grouped_prefill_cold_transients(size_t & compared, size_t & checks) {
     for (const bool drive_bound : {false, true}) {
         setenv("GGML_KIMI_MXFP4_PREFILL_BATCH", "1", 1);
-        setenv("GGML_KIMI_CPU_PREFILL_MXFP4_COST", drive_bound ? "drive_gbps=0.0001" : "gpu_fixed_us=2000", 1);
+        setenv("GGML_KIMI_CPU_PREFILL_COST", drive_bound ? "cpu_fixed_us=0.001,cpu_route_us=0.000001" : "gpu_fixed_us=2000", 1);
         fixture f;
         f.type = f.down_type = GGML_TYPE_MXFP4;
         f.latent = 512; f.hidden = 256; f.experts = 16;
@@ -525,7 +527,7 @@ void run_grouped_prefill_cold_transients(size_t & compared, size_t & checks) {
                 (unsigned long long) stats.ssd_experts);
         }
         setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "0", 1);
-        unsetenv("GGML_KIMI_CPU_PREFILL_MXFP4_COST");
+        unsetenv("GGML_KIMI_CPU_PREFILL_COST");
         unsetenv("GGML_KIMI_MXFP4_PREFILL_BATCH");
     }
 }

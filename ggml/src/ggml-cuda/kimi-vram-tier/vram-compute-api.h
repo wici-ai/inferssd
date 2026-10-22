@@ -61,9 +61,11 @@ struct vram_group_layer_stats {
     double begin_us;            // the layer's uploads (input rows, route list, post norm) and the accumulator's zeroing
     double finish_us;           // the accumulated rows' download
     uint64_t h2d_bytes, d2h_bytes;
+    double span_us;             // version 2: from the first chain's start to the last one's end (the chains and
+                                // whatever the stream waited for between them: the copies they were ready after)
 };
 struct vram_group_compute_api {
-    uint32_t version, size;   // 1
+    uint32_t version, size;   // 2
     void * (*create)(int device, int latent, int hidden, int weight_type, int down_type, char * error, size_t error_size);
     void (*destroy)(void *);
     // Buffers for passes of up to `rows` input rows and `routes` routes a layer (device and page-locked host memory,
@@ -85,8 +87,10 @@ struct vram_group_compute_api {
     int (*compute)(void *, int group, const struct vram_compute_expert * weights, struct CUevent_st * ready,
                    struct CUevent_st ** done, char * error, size_t error_size);
     // Waits for the layer and returns its accumulated rows [rows][latent] (page-locked, valid until the next
-    // begin_layer) and the layer's stats. Every group of the layer must have been computed.
-    int (*finish_layer)(void *, const float ** output, struct vram_group_layer_stats * stats, char * error, size_t error_size);
+    // begin_layer) and the layer's stats; group_us (optional, one per group) each chain's time. Every group of the
+    // layer must have been computed.
+    int (*finish_layer)(void *, const float ** output, struct vram_group_layer_stats * stats, double * group_us,
+                        char * error, size_t error_size);
     void (*geometry)(void *, struct vram_group_geometry * geometry);
     size_t (*device_bytes)(void *);
     size_t (*host_bytes)(void *);

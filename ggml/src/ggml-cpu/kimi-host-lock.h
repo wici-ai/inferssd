@@ -191,3 +191,39 @@ private:
         }
     }
 };
+
+// The read ring's buffers page-locked for the GPU tier's copies (B3): every buffer of the ring one range, registered
+// together once per allocation of the ring, at a quiescent point the owner picks, and unregistered before the owner
+// reallocates or frees them (unlock). A refused registration undoes the ones made before it: the ring stays pageable,
+// and is not tried again before the next allocation (an unlock).
+struct kimi_ring_lock {
+    std::function<bool(const void * pointer, size_t bytes, std::string * why)> lock_pages;
+    std::function<bool(const void * pointer)> unlock_pages;
+    std::vector<const void *> ranges;   // the registered buffers
+    bool tried = false;
+    uint64_t registered = 0, unregistered = 0, refused = 0;
+    bool locked() const { return !ranges.empty(); }
+    // buffers: every (pointer, bytes) of the ring. True when all of them are page-locked.
+    bool lock(const std::vector<std::pair<const void *, size_t>> & buffers, std::string * why = nullptr) {
+        if (tried) { return locked(); }
+        tried = true;
+        for (const auto & b : buffers) {
+            if (!b.first || !b.second) { continue; }
+            if (!lock_pages(b.first, b.second, why)) {
+                ++refused;
+                unlock();
+                tried = true;
+                return false;
+            }
+            ranges.push_back(b.first);
+            ++registered;
+        }
+        return locked();
+    }
+    // Before the buffers are reallocated or freed; the next lock tries again.
+    void unlock() {
+        for (const void * p : ranges) { unlock_pages(p); ++unregistered; }
+        ranges.clear();
+        tried = false;
+    }
+};

@@ -32,6 +32,8 @@
 // lifecycle unit tests include this file directly and exercise only the generic
 // tier with no format-compute object linked into the test executable.
 extern "C" const vram_format_compute_api * kimi_vram_q2_format_compute_get_api() __attribute__((weak));
+// The batched prefill engine (group-compute-adapter.cu) of the same DSO, weak for the same reason.
+extern "C" const vram_group_compute_api * kimi_vram_group_compute_get_api() __attribute__((weak));
 
 namespace {
 void cuda_check(cudaError_t rc){if(rc!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(rc));}
@@ -113,10 +115,15 @@ struct tier {
     // finish_host_probe). Without it nothing moves: the plan moves only at a measured copy rate.
     const void * host_probe=nullptr;size_t host_probe_bytes=0,host_probe_copied=0;bool host_probe_taken=false;
     cudaEvent_t host_probe_start=nullptr,host_probe_end=nullptr;
-    // The measured lines the sink plans with: (experts, us) of each engine call of residents and of host jobs, and
-    // (MB, us) of each page-locked copy into device memory (host jobs' and deferred admissions'), the last 64 each.
+    // The measured lines the sink plans decode and grouped prefill with (kimi_place_table): (experts, us) of each
+    // vector-engine call of residents and of host jobs (decode's, and a one-token prefill pass's), (MB, us) of each
+    // copy into device memory from page-locked memory (host jobs', deferred admissions', the probe's) and from
+    // pageable memory (the start-up probe's, admissions', prefill transients'), the last 64 each.
     struct samples { std::deque<std::pair<double,double>> s; void add(double x,double y){s.emplace_back(x,y);if(s.size()>64)s.pop_front();} };
-    samples resident_calls,host_calls,locked_copies;
+    samples resident_calls,host_calls,locked_copies,pageable_copies;
+    // Grouped prefill passes of at most this many tokens run the vector engine, a call of the layer's residents a
+    // token, as a decode token does: the same code and the same lines at one token (kimi_vram_host_costs).
+    static constexpr int vector_tokens=1;
     // Admission threshold from measured costs (kimi_vram_policy_api); MIN_COUNT is only the starting value.
     double miss_us=0,upload_us_per_expert=0,last_min_count=0;bool adaptive_admission=false;uint64_t admission_updates=0;
     double last_cost_hits=0,last_expected[3]={};uint64_t last_evictions=0;
@@ -159,6 +166,8 @@ struct tier {
     // Read-only grouped-prefill job. The full distinct-expert union is pinned
     // once; the worker reuses the existing <=16-route format engine per token.
     bool prefill_live=false;
+    // A launched grouped-prefill job not yet finished: its copies and chains use the transient slots (under mutex).
+    bool prefill_launched=false;
     // Decode can initialize the format again after releasing prefill scratch.
     bool prefill_transient_phase=true;
     uint64_t prefill_generation=0;
@@ -171,6 +180,23 @@ struct tier {
     std::vector<kimi_vram_prefill_transient> prefill_transient;
     char * prefill_transient_arena=nullptr;
     size_t prefill_transient_bytes=0;
+    // A transient's copy timed on the upload stream (B3): its DMA, whatever the worker does meanwhile.
+    cudaEvent_t dma_start=nullptr,dma_end=nullptr;
+    // The batched prefill engine (group-compute-adapter.cu) for every format without an engine of its own (MXFP4 keeps
+    // its hand engine, Q2 the per-token path): created with the format, reserved for a prefill's passes before their
+    // reads start (reserve_prefill_engine), released before decode grows the tier. A pass of it: the input rows of the
+    // tokens with GPU work (compact rows, in token order) go up once, each expert's chain runs over its tokens (the
+    // residents first, then the transients in their order, each from a device slot after its copy or in place from
+    // host memory), the accumulated rows come back once and are added at finish.
+    const vram_group_compute_api * group_api=nullptr;void * group=nullptr;
+    int group_rows=0,group_wanted_rows=0;
+    bool group_pass=false,group_in_place=false;
+    std::vector<int32_t> group_tokens,group_first,group_request,group_transient;
+    std::vector<vram_group_route> group_routes;
+    std::vector<double> group_us;
+    std::vector<float> prefill_post_norm;float prefill_post_norm_eps=0;
+    const float * group_output=nullptr;
+    std::vector<cudaEvent_t> group_dma; // two a transient: its copy's start and end on the upload stream
     static constexpr size_t mxfp4_prefill_transient_slots=2;
     size_t prefill_transient_min_routes=0;
     size_t prefill_ssd_transient_min_routes=0;
@@ -299,6 +325,10 @@ struct tier {
             if(seed_stream)cuda_check(cudaStreamDestroy(seed_stream));
             if(host_copy_stream)cuda_check(cudaStreamDestroy(host_copy_stream));
             for(cudaEvent_t e:host_events)cuda_check(cudaEventDestroy(e));
+            if(dma_start)cuda_check(cudaEventDestroy(dma_start));
+            if(dma_end)cuda_check(cudaEventDestroy(dma_end));
+            for(cudaEvent_t e:group_dma)cuda_check(cudaEventDestroy(e));
+            if(group)group_api->destroy(group);
         } catch(const std::exception & e) {
             std::fprintf(stderr,"[kimi_vram_tier] destroy could not drain owned work: %s\n",e.what());std::abort();
         }
@@ -824,6 +854,54 @@ struct tier {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         grow_decode_locked(start);
     }
+    // A prefill pass of ntokens tokens, announced before each layer's reads start: the batched engine's buffers (or
+    // MXFP4's accumulator) for this pass, elastic tier blocks given back for them first. A pass of the vector engine
+    // (one token) needs none. Both are released before decode grows the tier, so a short pass after a long one
+    // reserves for itself.
+    void reserve_prefill_engine(int ntokens){
+        if(ntokens<1)throw std::runtime_error("invalid grouped prefill engine reserve");
+        // a cold prefill's first layer announces its pass before prepare creates the engine, which reserves then
+        group_wanted_rows=ntokens>vector_tokens?ntokens:0;
+        if(ntokens<=vector_tokens)return;
+        if(group){reserve_group(ntokens);return;}
+        reserve_mxfp4_accumulator(ntokens);
+    }
+    // rows input rows a layer (and up to 16 routes a row); grows only (release frees it). Made room for like the MXFP4
+    // accumulator: the pass's buffers, against what is free and the pass buffers the engine frees to grow (it keeps its
+    // fixed scratch; estimated at 64 MiB before the engine's first reserve).
+    void reserve_group(int rows){
+        if(!group || rows<=group_rows)return;
+        cuda_check(cudaSetDevice(device));
+        const size_t held=group_api->device_bytes(group);
+        vram_group_geometry g={};group_api->geometry(group,&g);
+        const size_t fixed=held?size_t(g.fixed_bytes):size_t(64)<<20;
+        const size_t freed=held>fixed?held-fixed:0;
+        const size_t need=size_t(rows)*(2*size_t(latent)*sizeof(float)+16*(sizeof(int32_t)+sizeof(float)))+(held?0:fixed);
+        if(elastic_active){
+            std::lock_guard<std::mutex> lock(lifecycle_mutex);
+            if(!quiescent())throw std::runtime_error("grouped prefill engine reserve requires a quiescent VRAM tier");
+            size_t free_bytes=0,total=0;
+            mem_info(&free_bytes,&total);
+            const size_t safety=watermark_low_mib*size_t(1024*1024);
+            while(free_bytes+freed<need+safety && free_last_block("prefill_engine",false))mem_info(&free_bytes,&total);
+        }
+        char error[512]={};
+        if(group_api->reserve(group,rows,rows*16,error,sizeof(error)))throw std::runtime_error(error[0]?error:"grouped prefill engine reserve failed");
+        group_rows=rows;
+        kimi_vram_prefill_lane l={};lane(l);
+        std::fprintf(stderr,"[kimi_vram_prefill_engine] format=%s/%s engine=batched in_place=%d route_bytes=%llu token_bytes=%llu "
+            "output_bytes=%llu fixed_bytes=%llu bytes_per_token=%llu reserved_rows=%d device_bytes=%zu host_bytes=%zu\n",
+            ggml_type_name(ggml_type(weight_type)),ggml_type_name(ggml_type(down_type)),l.in_place,
+            (unsigned long long)l.route_bytes,(unsigned long long)l.token_bytes,(unsigned long long)l.output_bytes,
+            (unsigned long long)l.fixed_bytes,(unsigned long long)l.bytes_per_token,rows,group_api->device_bytes(group),
+            group_api->host_bytes(group));
+    }
+    void release_group(){
+        if(!group || !group_rows)return;
+        char error[512]={};
+        if(group_api->release(group,error,sizeof(error)))throw std::runtime_error(error[0]?error:"grouped prefill engine release failed");
+        group_rows=0;group_output=nullptr;
+    }
     void reserve_mxfp4_accumulator(int ntokens){
         if(!mxfp4_batch)return;
         if(ntokens<1 || latent<1)throw std::runtime_error("invalid MXFP4 accumulator geometry");
@@ -843,6 +921,12 @@ struct tier {
         if(!mxfp4_batch_api->begin_accumulate(mxfp4_batch,ntokens,error,sizeof(error)))
             throw std::runtime_error(error[0]?error:"MXFP4 accumulator reserve failed");
         mxfp4_reserved_accumulator_bytes=bytes;
+        kimi_vram_prefill_lane l={};lane(l);
+        std::fprintf(stderr,"[kimi_vram_prefill_engine] format=mxfp4/mxfp4 engine=mxfp4 in_place=0 route_bytes=%llu token_bytes=0 "
+            "output_bytes=%llu fixed_bytes=%llu bytes_per_token=%llu reserved_rows=%d device_bytes=%zu host_bytes=%zu\n",
+            (unsigned long long)l.route_bytes,(unsigned long long)l.output_bytes,(unsigned long long)l.fixed_bytes,
+            (unsigned long long)l.bytes_per_token,ntokens,mxfp4_batch_api->device_bytes(mxfp4_batch),
+            mxfp4_batch_api->host_bytes(mxfp4_batch));
     }
     void release_mxfp4_accumulator(){
         if(!mxfp4_batch)return;
@@ -854,18 +938,22 @@ struct tier {
     void phase_complete(bool decode){
         if(decode)prefill_transient_phase=false;
         if(decode && mxfp4_batch){drain();release_mxfp4_accumulator();}
+        if(decode && group){drain();release_group();}
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         reclaimer_armed=false;
         if(decode && table)publish_seeds();
-        if(decode && weight_type==int(GGML_TYPE_MXFP4) && prefill_transient_arena){
+        if(decode && (weight_type==int(GGML_TYPE_MXFP4) || group) && prefill_transient_arena){
             if(prefill_live || (table && !quiescent()))
                 throw std::runtime_error("MXFP4 prefill scratch release is not quiescent");
+            // the slots leave under the tier's lock: a probe copy into one (host_registered) holds it until done
+            char * scratch=nullptr;
             {std::lock_guard<std::mutex> jobs(mutex);
                 if(!done || queued || prefill_queued || !upload_jobs.empty())
-                    throw std::runtime_error("MXFP4 prefill scratch release has pending work");}
-            cuda_check(cudaSetDevice(device));cuda_check(cudaFree(prefill_transient_arena));
+                    throw std::runtime_error("MXFP4 prefill scratch release has pending work");
+                scratch=prefill_transient_arena;prefill_transient_arena=nullptr;}
+            cuda_check(cudaSetDevice(device));cuda_check(cudaFree(scratch));
             std::fprintf(stderr,"[kimi_vram_prefill_scratch] status=released bytes=%zu phase=decode\n",prefill_transient_bytes);
-            prefill_transient_arena=nullptr;prefill_transient_bytes=0;
+            prefill_transient_bytes=0;
         }
         if(!elastic_active)return;
         // The server restores and reserves the decode graph before the first
@@ -904,7 +992,7 @@ struct tier {
         if(!native_pins.empty())throw std::runtime_error("release with native VRAM leases");
         memory_sample("before_release");
         const auto release_start=memory_trace?clock_type::now():clock_type::time_point{};
-        drain();drain_deferred();release_mxfp4_accumulator();
+        drain();drain_deferred();release_mxfp4_accumulator();release_group();
         {std::lock_guard<std::mutex> lock(mutex);deferred.clear();}
         {
             std::lock_guard<std::mutex> lock(lifecycle_mutex);reclaimer_armed=false;
@@ -914,13 +1002,14 @@ struct tier {
             table.reset();elastic_active=false;decode_growth_done=false;base_slots=max_slots=0;slot_locations.clear();
         }
         if(arena){cuda_check(cudaSetDevice(device));cuda_check(cudaFree(arena));arena=nullptr;}
-        if(weight_type==int(GGML_TYPE_MXFP4) && prefill_transient_arena){
+        if((weight_type==int(GGML_TYPE_MXFP4) || group) && prefill_transient_arena){
             cuda_check(cudaSetDevice(device));cuda_check(cudaFree(prefill_transient_arena));
             prefill_transient_arena=nullptr;prefill_transient_bytes=0;
         }
         capacity_bytes=0;have_token=false;failure.clear();active=false;pending_uploads.clear();live_ready_generation=0;
         cold_prefill_admission_phase=adopt_next_decode=false;
         prefill_live=false;prefill_generation=0;prefill_queued=false;prefill_slots.clear();prefill_input.clear();
+        {std::lock_guard<std::mutex> lock(mutex);prefill_launched=false;}
         prefill_routes.clear();prefill_weights.clear();prefill_output.clear();prefill_transient.clear();prefill_job_stats={};
         native_batch=native_begun=native_launched=native_cancelled=false;
         native_candidates.clear();native_outputs.clear();work.clear();output_rows.clear();
@@ -945,7 +1034,7 @@ struct tier {
                 have_token=false;active=false;
                 free_host_scratch(); // the next decode allocates it again when a batch wants it
                 if(elastic_active)prepare_prefill_reclaim();
-                if(weight_type==int(GGML_TYPE_MXFP4) && mxfp4_batch){
+                if((weight_type==int(GGML_TYPE_MXFP4) && mxfp4_batch) || group){
                     make_room_for_prefill_transient(mxfp4_prefill_transient_slots);
                     allocate_prefill_transient(mxfp4_prefill_transient_slots);
                 }
@@ -1109,10 +1198,13 @@ struct tier {
         std::vector<int> device_slot(count,-1);
         std::vector<int> free_slots={1,0};
         std::deque<size_t> ready;
+        if(!dma_start)cuda_check(cudaEventCreate(&dma_start));
+        if(!dma_end)cuda_check(cudaEventCreate(&dma_end));
         size_t remaining=count,resident=0,ready_probes=0,blocked_reads=0;
         size_t inflight=count;
         clock_type::time_point upload_start;
         double upload_enqueue_us=0;
+        bool upload_locked=false;
         auto probe=[&]() -> size_t {
             for(size_t i=0;i<count;++i){
                 const auto & job=prefill_transient[i];
@@ -1131,12 +1223,15 @@ struct tier {
             prefill_job_stats.read_wait_us+=micros(read_start);
             const int slot=free_slots.back();free_slots.pop_back();
             state[i]=1;device_slot[i]=slot;inflight=i;
+            upload_locked=page_locked(job.role[0]);
             upload_start=clock_type::now();
             char * dst=prefill_transient_arena+size_t(slot)*stride;
+            cuda_check(cudaEventRecord(dma_start,upload_stream));
             for(int role=0;role<3;++role){
                 cuda_check(cudaMemcpyAsync(dst,job.role[role],role_bytes[role],cudaMemcpyHostToDevice,upload_stream));
                 dst+=role_bytes[role];
             }
+            cuda_check(cudaEventRecord(dma_end,upload_stream));
             upload_enqueue_us=micros(upload_start);
         };
         auto finish_upload=[&](){
@@ -1147,7 +1242,18 @@ struct tier {
                 throw std::runtime_error("streamed SSD prefill release failed");
             // Count worker time spent enqueueing and waiting. Compute on the
             // other stream may overlap the device copy between these points.
-            const double elapsed=upload_enqueue_us+micros(wait_start);
+            const double waited=micros(wait_start),elapsed=upload_enqueue_us+waited;
+            // A pageable upload's enqueue stages the whole copy, so the worker's time is the copy's: a sample of the
+            // pageable rate. A page-locked one returns at once, its DMA overlaps a computation, and its events time
+            // it: a sample of the page-locked rate (B3); the worker's wait is what the copy left after the computation.
+            float dma_ms=0;
+            const bool timed=cudaEventElapsedTime(&dma_ms,dma_start,dma_end)==cudaSuccess;
+            if(!timed)(void)cudaGetLastError();
+            prefill_job_stats.transient_dma_us+=timed?1e3*double(dma_ms):elapsed;
+            prefill_job_stats.transient_wait_us+=waited;
+            {std::lock_guard<std::mutex> lock(mutex);
+                if(!upload_locked)pageable_copies.add(double(stride)/1e6,elapsed);
+                else if(timed && dma_ms>0)locked_copies.add(double(stride)/1e6,1e3*double(dma_ms));}
             prefill_job_stats.transient_upload_us+=elapsed;
             prefill_job_stats.transient_upload_bytes+=stride;
             if(job.source==KIMI_VRAM_PREFILL_TRANSIENT_RAM){
@@ -1223,17 +1329,221 @@ struct tier {
             (unsigned long long)mxfp4_batch_api->h2d_bytes(mxfp4_batch),
             (unsigned long long)mxfp4_batch_api->d2h_bytes(mxfp4_batch));
     }
+    // The batched engine's layer, at launch (mutex held, the worker idle): its groups, the residents in request order
+    // then the transients in their order; each group's routes, its tokens ascending with the weights of a token's
+    // duplicate routes summed (a zero weight adds nothing); the compact rows, the tokens with GPU work in token order,
+    // their input rows copied into the engine's page-locked staging.
+    void build_group_layer(const uint8_t * q,size_t input_stride){
+        const size_t requests=prefill_slots.size();
+        std::vector<int32_t> group_of(requests,-1);
+        group_request.clear();group_transient.clear();
+        for(size_t r=0;r<requests;++r)if(prefill_slots[r]>=0){group_of[r]=int32_t(group_request.size());group_request.push_back(int32_t(r));group_transient.push_back(-1);}
+        for(size_t t=0;t<prefill_transient.size();++t){
+            const size_t r=size_t(prefill_transient[t].request_index);
+            group_of[r]=int32_t(group_request.size());group_request.push_back(int32_t(r));group_transient.push_back(int32_t(t));
+        }
+        const size_t groups=group_request.size();
+        std::vector<std::vector<vram_group_route>> per(groups);
+        std::vector<int32_t> row_of(size_t(prefill_ntokens),-1);
+        group_tokens.clear();
+        for(int token=0;token<prefill_ntokens;++token){
+            for(int slot=0;slot<prefill_nslots;++slot){
+                const size_t route=size_t(token)*size_t(prefill_nslots)+size_t(slot);
+                const int request=prefill_routes[route];
+                const float weight=prefill_weights[route];
+                if(request<0 || weight==0.0f || group_of[size_t(request)]<0)continue;
+                if(row_of[size_t(token)]<0){row_of[size_t(token)]=int32_t(group_tokens.size());group_tokens.push_back(token);}
+                auto & list=per[size_t(group_of[size_t(request)])];
+                if(!list.empty() && list.back().row==row_of[size_t(token)])list.back().weight+=weight;
+                else list.push_back({row_of[size_t(token)],weight});
+            }
+        }
+        group_routes.clear();group_first.assign(1,0);
+        for(const auto & list:per){group_routes.insert(group_routes.end(),list.begin(),list.end());group_first.push_back(int32_t(group_routes.size()));}
+        // a pass larger than announced (no reserve_accumulate before it): the engine grows here, without making room
+        if(int(group_tokens.size())>group_rows){
+            char error[512]={};
+            if(group_api->reserve(group,int(group_tokens.size()),int(group_tokens.size())*16,error,sizeof(error)))
+                throw std::runtime_error(error[0]?error:"grouped prefill engine reserve failed");
+            group_rows=int(group_tokens.size());
+        }
+        float * rows=group_api->input_rows(group);
+        for(size_t row=0;row<group_tokens.size();++row)
+            std::memcpy(rows+row*size_t(latent),q+size_t(group_tokens[row])*input_stride,size_t(latent)*sizeof(float));
+        group_output=nullptr;
+    }
+    // The batched engine's pass: the residents' chains first (no wait: they fill the first copy's time), then the
+    // transients, each as soon as its read is in: in place from host memory where the GPU reads it so and the caller
+    // asked, else its copy into one of two device slots on the upload stream (behind the chain that last read the
+    // slot), its chain waiting for the copy on the device. Nothing synchronizes per expert: a streamed transient's ring
+    // slot goes back once its copy (or, in place, its chain) is done, polled between transients, and waited for only
+    // when no read is in and a slot the I/O thread needs may be held. Times: the chains by the engine's events (each
+    // a sample of the device or in-place line), the copies by events on the upload stream.
+    void run_group_prefill_worker(){
+        const vram_group_activation act={prefill_activation,prefill_post_norm.empty()?nullptr:prefill_post_norm.data(),prefill_post_norm_eps};
+        char error[512]={};
+        const size_t groups=group_request.size(),count=prefill_transient.size(),residents=groups-count;
+        if(group_tokens.empty()){
+            // no route with a weight on the GPU's experts: nothing to compute; the streamed reads still give their slots back
+            for(const auto & job:prefill_transient){
+                if(!job.stage)continue;
+                if(!job.stage(job.stage_context,job.request_index,0) || !job.stage(job.stage_context,job.request_index,1))
+                    throw std::runtime_error("streamed SSD prefill read failed");
+            }
+            return;
+        }
+        if(group_api->begin_layer(group,int(group_tokens.size()),group_routes.data(),group_first.data(),int(groups),
+                &act,error,sizeof(error)))throw std::runtime_error(error[0]?error:"grouped prefill begin failed");
+        for(size_t g=0;g<residents;++g){
+            char * base=slot_base(size_t(prefill_slots[size_t(group_request[g])]));
+            const vram_compute_expert w={base,base+role_bytes[0],base+role_bytes[0]+role_bytes[1]};
+            if(group_api->compute(group,int(g),&w,nullptr,nullptr,error,sizeof(error)))throw std::runtime_error(error[0]?error:"grouped prefill compute failed");
+        }
+        while(group_dma.size()<2*count){cudaEvent_t e=nullptr;cuda_check(cudaEventCreate(&e));group_dma.push_back(e);}
+        std::vector<uint8_t> issued(count,0),locked(count,0);
+        std::vector<double> staged_us(count,0.0);
+        std::deque<std::pair<size_t,cudaEvent_t>> handback; // ring slots to give back once their event completes
+        cudaEvent_t slot_done[2]={nullptr,nullptr};
+        size_t next_slot=0,issued_count=0;
+        double layer_read_wait_us=0.0;
+        auto give_back=[&](size_t i){
+            const auto & job=prefill_transient[i];
+            if(job.stage && !job.stage(job.stage_context,job.request_index,1))throw std::runtime_error("streamed SSD prefill release failed");
+        };
+        auto give_back_done=[&](bool wait){
+            while(!handback.empty()){
+                const cudaError_t rc=wait?cudaEventSynchronize(handback.front().second):cudaEventQuery(handback.front().second);
+                if(rc==cudaErrorNotReady)return;
+                cuda_check(rc);
+                give_back(handback.front().first);handback.pop_front();
+                if(wait)return;
+            }
+        };
+        try{
+            while(issued_count<count){
+                give_back_done(false);
+                // a transient whose read is in (or a RAM one), else the first one left, once no ring slot it may need is
+                // held by a copy or chain still running
+                size_t i=count;
+                for(size_t k=0;k<count && i==count;++k){
+                    const auto & job=prefill_transient[k];
+                    if(!issued[k] && (!job.stage || job.stage(job.stage_context,job.request_index,2)))i=k;
+                }
+                if(i==count){
+                    if(!handback.empty()){give_back_done(true);continue;}
+                    for(size_t k=0;k<count && i==count;++k)if(!issued[k])i=k;
+                }
+                const auto & job=prefill_transient[i];
+                if(job.stage){
+                    const auto read_start=clock_type::now();
+                    if(!job.stage(job.stage_context,job.request_index,0))throw std::runtime_error("streamed SSD prefill read failed");
+                    const double waited=micros(read_start);
+                    prefill_job_stats.read_wait_us+=waited;layer_read_wait_us+=waited;
+                    handback.push_back({i,nullptr}); // its slot is ours until the event set below completes
+                }
+                issued[i]=1;++issued_count;
+                const int g=int(residents+i);
+                cudaEvent_t done=nullptr;
+                if(group_in_place){
+                    const vram_compute_expert w={job.role[0],job.role[1],job.role[2]};
+                    if(group_api->compute(group,g,&w,nullptr,&done,error,sizeof(error)))throw std::runtime_error(error[0]?error:"grouped prefill compute failed");
+                    if(job.stage)handback.back().second=done;
+                    continue;
+                }
+                const size_t slot=next_slot;next_slot^=1;
+                locked[i]=page_locked(job.role[0]);
+                if(slot_done[slot]){
+                    // a page-locked copy waits on the device; a pageable one is staged by this call, which waits for
+                    // the upload stream: the wait for the slot's last chain is taken here, outside the copy's time
+                    if(locked[i])cuda_check(cudaStreamWaitEvent(upload_stream,slot_done[slot],0));
+                    else{cuda_check(cudaEventSynchronize(slot_done[slot]));cuda_check(cudaStreamSynchronize(upload_stream));}
+                }
+                char * dst=prefill_transient_arena+slot*stride;
+                const auto copy_start=clock_type::now();
+                cuda_check(cudaEventRecord(group_dma[2*i],upload_stream));
+                for(int role=0;role<3;++role){
+                    cuda_check(cudaMemcpyAsync(dst+(role==0?0:role==1?role_bytes[0]:role_bytes[0]+role_bytes[1]),job.role[role],
+                        role_bytes[role],cudaMemcpyHostToDevice,upload_stream));
+                }
+                cuda_check(cudaEventRecord(group_dma[2*i+1],upload_stream));
+                staged_us[i]=micros(copy_start); // a pageable copy is staged by this call: the copy's time
+                const vram_compute_expert w={dst,dst+role_bytes[0],dst+role_bytes[0]+role_bytes[1]};
+                if(group_api->compute(group,g,&w,group_dma[2*i+1],&done,error,sizeof(error)))throw std::runtime_error(error[0]?error:"grouped prefill compute failed");
+                slot_done[slot]=done;
+                if(job.stage)handback.back().second=group_dma[2*i+1];
+            }
+            // the ring slots still held go back as their copies (or chains) end, before the layer's end is awaited:
+            // the CPU's reads may be waiting for them
+            while(!handback.empty())give_back_done(true);
+            group_us.assign(groups,0.0);
+            vram_group_layer_stats st={};
+            if(group_api->finish_layer(group,&group_output,&st,group_us.data(),error,sizeof(error)))
+                throw std::runtime_error(error[0]?error:"grouped prefill finish failed");
+            // the stats: each chain a sample of its source's line; the copies' times; the pipeline's stall, the time
+            // the chains' stream waited between them (for copies); the engine's own time outside its chains
+            for(size_t g=0;g<groups;++g){
+                const double routes=double(group_first[g+1]-group_first[g]),us=group_us[g];
+                const bool host=group_in_place && group_transient[g]>=0;
+                double & n=host?prefill_job_stats.host_fit_experts:prefill_job_stats.gpu_fit_experts;
+                double & x=host?prefill_job_stats.host_fit_routes:prefill_job_stats.gpu_fit_routes;
+                double & xx=host?prefill_job_stats.host_fit_routes_sq:prefill_job_stats.gpu_fit_routes_sq;
+                double & t=host?prefill_job_stats.host_fit_us:prefill_job_stats.gpu_fit_us;
+                double & xt=host?prefill_job_stats.host_fit_route_us:prefill_job_stats.gpu_fit_route_us;
+                n+=1;x+=routes;xx+=routes*routes;t+=us;xt+=routes*us;
+            }
+            // the chains' stream idle between them, less the worker's waits for the drive (a lower bound of the copies'
+            // stall: a read wait while chains still ran left no idle)
+            prefill_job_stats.transient_wait_us+=std::max(0.0,st.span_us-st.us-layer_read_wait_us);
+            prefill_job_stats.engine_overhead_us+=st.begin_us+st.finish_us;
+            if(!group_in_place)for(size_t i=0;i<count;++i){
+                float ms=0;
+                const bool timed=cudaEventElapsedTime(&ms,group_dma[2*i],group_dma[2*i+1])==cudaSuccess;
+                if(!timed)(void)cudaGetLastError();
+                const double us=locked[i]?(timed?1e3*double(ms):0.0):staged_us[i];
+                prefill_job_stats.transient_dma_us+=timed?1e3*double(ms):us;
+                prefill_job_stats.transient_upload_us+=us;prefill_job_stats.transient_upload_bytes+=stride;
+                if(prefill_transient[i].source==KIMI_VRAM_PREFILL_TRANSIENT_RAM){
+                    prefill_job_stats.ram_transient_upload_us+=us;prefill_job_stats.ram_transient_upload_bytes+=stride;
+                }else{
+                    prefill_job_stats.ssd_transient_upload_us+=us;prefill_job_stats.ssd_transient_upload_bytes+=stride;
+                }
+                if(us>0){std::lock_guard<std::mutex> lock(mutex);(locked[i]?locked_copies:pageable_copies).add(double(stride)/1e6,us);}
+            }
+        }catch(...){
+            // a ring payload cannot be reused while a copy or a chain may still read it
+            (void)cudaDeviceSynchronize();
+            for(const auto & h:handback){const auto & job=prefill_transient[h.first];if(job.stage)(void)job.stage(job.stage_context,job.request_index,1);}
+            throw;
+        }
+    }
+    // One-token passes on the vector engine: the tier returns an expert's down row unweighted, and a layer with a
+    // per-expert post norm normalizes it as the CPU does (kimi-cpu-sink-internal.h, kimi_cpu_sink_normalize_expert)
+    // before the routing weight.
+    void post_norm_row(float * values){
+        if(prefill_post_norm.empty())return;
+        double sum=0.0;
+        for(int row=0;row<latent;++row){values[row]*=prefill_post_norm[size_t(row)];sum+=double(values[row])*values[row];}
+        const float scale=1.0f/std::sqrt(float(sum/latent)+prefill_post_norm_eps);
+        for(int row=0;row<latent;++row)values[row]*=scale;
+    }
     void run_prefill_worker(){
         if(!format_mode || !format_api || !engine || !prefill_live)throw std::runtime_error("grouped prefill without an explicit-format engine");
         const auto worker_start=clock_type::now();
+        if(group_pass){
+            run_group_prefill_worker();
+            prefill_job_stats.total_worker_us=micros(worker_start);
+            return;
+        }
         std::fill(prefill_output.begin(),prefill_output.end(),0.0f);
-        if(weight_type==int(GGML_TYPE_MXFP4) && mxfp4_batch){
+        if(weight_type==int(GGML_TYPE_MXFP4) && mxfp4_batch && prefill_ntokens>vector_tokens){
             run_mxfp4_prefill_worker();
             prefill_job_stats.total_worker_us=micros(worker_start);
             return;
         }
-        // Existing decode-resident experts stay batched per token, exactly as
-        // in the original read-only grouped-prefill path.
+        // The vector engine, a call of the layer's residents a token: a pass of one token (the decode shape, whatever
+        // the format), and every pass of a format without a batched engine. Its calls of one-token passes are samples
+        // of the vector engine's line, as decode's are.
+        const bool one=prefill_ntokens<=vector_tokens;
         for(int token_index=0;token_index<prefill_ntokens;++token_index){
             work.clear();output_rows.clear();
             for(int route_slot=0;route_slot<prefill_nslots;++route_slot){
@@ -1251,65 +1561,101 @@ struct tier {
             down.resize(work.size()*size_t(latent));
             char error[512]={};
             const uint8_t * token_input=prefill_input.data()+size_t(token_index)*prefill_input_stride;
+            const auto call_start=clock_type::now();
             const int rc=format_api->compute(engine,work.data(),int(work.size()),token_input,prefill_input_stride,
                     &prefill_activation,down.data(),error,sizeof(error));
             if(rc)throw std::runtime_error(error);
+            if(one){const double us=micros(call_start);std::lock_guard<std::mutex> lock(mutex);resident_calls.add(double(work.size()),us);}
             float * destination=prefill_output.data()+size_t(token_index)*size_t(latent);
             // output_rows is in original route-slot order, preserving the GPU
             // subset's deterministic reduction order.
             for(size_t i=0;i<output_rows.size();++i){
                 const float weight=prefill_weights[output_rows[i]];
+                post_norm_row(down.data()+i*size_t(latent));
                 for(int col=0;col<latent;++col){
                     volatile float scaled=down[i*size_t(latent)+size_t(col)]*weight;
                     destination[col]+=scaled;
                 }
             }
         }
-        // Selected Q2 RAM experts use one dedicated scratch triplet. Uploads
-        // and expert chains are deliberately serialized: the queue is bounded
-        // to one scratch expert, payload leases stay valid through finish, and
+        // Transients one at a time: a streamed read first waits for its ring slot (the ring handoff); where the device
+        // reads host memory in place the engine computes it there, as a decode host job, else its upload goes into the
+        // scratch slot. Its ring slot goes back once nothing reads it. The payload leases stay valid through finish, and
         // no decode-resident slot is displaced.
         for(const auto & transient:prefill_transient){
-            char * dst=prefill_transient_arena;
-            const auto upload_start=clock_type::now();
-            for(int role=0;role<3;++role){
-                cuda_check(cudaMemcpyAsync(dst,transient.role[role],role_bytes[role],cudaMemcpyHostToDevice,upload_stream));
-                dst+=role_bytes[role];
-            }
-            cuda_check(cudaStreamSynchronize(upload_stream));
-            const double upload_elapsed=micros(upload_start);
-            prefill_job_stats.transient_upload_us+=upload_elapsed;
-            prefill_job_stats.transient_upload_bytes+=stride;
-            if(transient.source==KIMI_VRAM_PREFILL_TRANSIENT_RAM){
-                prefill_job_stats.ram_transient_upload_us+=upload_elapsed;
-                prefill_job_stats.ram_transient_upload_bytes+=stride;
-            }else{
-                prefill_job_stats.ssd_transient_upload_us+=upload_elapsed;
-                prefill_job_stats.ssd_transient_upload_bytes+=stride;
-            }
-            char * base=prefill_transient_arena;
-            const vram_compute_expert weights_on_device={base,base+role_bytes[0],base+role_bytes[0]+role_bytes[1]};
-            for(int token_index=0;token_index<prefill_ntokens;++token_index){
-                output_rows.clear();
-                for(int route_slot=0;route_slot<prefill_nslots;++route_slot){
-                    const size_t route=size_t(token_index)*size_t(prefill_nslots)+size_t(route_slot);
-                    if(prefill_routes[route]==transient.request_index)output_rows.push_back(route);
+            bool handed_back=!transient.stage;
+            auto hand_back=[&]{
+                if(handed_back)return;
+                handed_back=true;
+                if(!transient.stage(transient.stage_context,transient.request_index,1))
+                    throw std::runtime_error("streamed SSD prefill release failed");
+            };
+            try{
+                if(transient.stage){
+                    const auto read_start=clock_type::now();
+                    if(!transient.stage(transient.stage_context,transient.request_index,0))
+                        throw std::runtime_error("streamed SSD prefill read failed");
+                    prefill_job_stats.read_wait_us+=micros(read_start);
                 }
-                if(output_rows.empty())continue;
-                down.resize(size_t(latent));
-                char error[512]={};
-                const uint8_t * token_input=prefill_input.data()+size_t(token_index)*prefill_input_stride;
-                const int rc=format_api->compute(engine,&weights_on_device,1,token_input,prefill_input_stride,
-                        &prefill_activation,down.data(),error,sizeof(error));
-                if(rc)throw std::runtime_error(error);
-                float * destination=prefill_output.data()+size_t(token_index)*size_t(latent);
-                for(size_t route:output_rows){
-                    const float weight=prefill_weights[route];
-                    for(int col=0;col<latent;++col){
-                        volatile float scaled=down[size_t(col)]*weight;
-                        destination[col]+=scaled;
+                vram_compute_expert weights={transient.role[0],transient.role[1],transient.role[2]};
+                if(!host_readable){
+                    const bool locked=page_locked(transient.role[0]);
+                    char * dst=prefill_transient_arena;
+                    const auto upload_start=clock_type::now();
+                    for(int role=0;role<3;++role){
+                        cuda_check(cudaMemcpyAsync(dst,transient.role[role],role_bytes[role],cudaMemcpyHostToDevice,upload_stream));
+                        dst+=role_bytes[role];
+                    }
+                    cuda_check(cudaStreamSynchronize(upload_stream));
+                    const double upload_elapsed=micros(upload_start);
+                    {std::lock_guard<std::mutex> lock(mutex);(locked?locked_copies:pageable_copies).add(double(stride)/1e6,upload_elapsed);}
+                    prefill_job_stats.transient_dma_us+=upload_elapsed;prefill_job_stats.transient_wait_us+=upload_elapsed;
+                    prefill_job_stats.transient_upload_us+=upload_elapsed;
+                    prefill_job_stats.transient_upload_bytes+=stride;
+                    if(transient.source==KIMI_VRAM_PREFILL_TRANSIENT_RAM){
+                        prefill_job_stats.ram_transient_upload_us+=upload_elapsed;
+                        prefill_job_stats.ram_transient_upload_bytes+=stride;
+                    }else{
+                        prefill_job_stats.ssd_transient_upload_us+=upload_elapsed;
+                        prefill_job_stats.ssd_transient_upload_bytes+=stride;
+                    }
+                    hand_back();
+                    char * base=prefill_transient_arena;
+                    weights={base,base+role_bytes[0],base+role_bytes[0]+role_bytes[1]};
+                }
+                for(int token_index=0;token_index<prefill_ntokens;++token_index){
+                    output_rows.clear();
+                    for(int route_slot=0;route_slot<prefill_nslots;++route_slot){
+                        const size_t route=size_t(token_index)*size_t(prefill_nslots)+size_t(route_slot);
+                        if(prefill_routes[route]==transient.request_index)output_rows.push_back(route);
+                    }
+                    if(output_rows.empty())continue;
+                    down.resize(size_t(latent));
+                    char error[512]={};
+                    const uint8_t * token_input=prefill_input.data()+size_t(token_index)*prefill_input_stride;
+                    const auto call_start=clock_type::now();
+                    const int rc=format_api->compute(engine,&weights,1,token_input,prefill_input_stride,
+                            &prefill_activation,down.data(),error,sizeof(error));
+                    if(rc)throw std::runtime_error(error);
+                    if(one && host_readable){const double us=micros(call_start);std::lock_guard<std::mutex> lock(mutex);host_calls.add(1.0,us);}
+                    float * destination=prefill_output.data()+size_t(token_index)*size_t(latent);
+                    post_norm_row(down.data());
+                    for(size_t route:output_rows){
+                        const float weight=prefill_weights[route];
+                        for(int col=0;col<latent;++col){
+                            volatile float scaled=down[size_t(col)]*weight;
+                            destination[col]+=scaled;
+                        }
                     }
                 }
+                hand_back();
+            }catch(...){
+                // a ring payload cannot be reused while a copy or a computation may still read it
+                if(!handed_back){
+                    (void)cudaStreamSynchronize(upload_stream);
+                    handed_back=true;(void)transient.stage(transient.stage_context,transient.request_index,1);
+                }
+                throw;
             }
         }
         prefill_job_stats.total_worker_us=micros(worker_start);
@@ -1343,7 +1689,7 @@ struct tier {
             if(job!=deferred.end())job->completed=true;
             if(error_text.empty()){const double us=micros(t);upload_us+=us;++uploads;upload_bytes+=stride;++borrowed_uploads;
                 upload_us_per_expert=upload_us_per_expert>0?0.9*upload_us_per_expert+0.1*us:us;
-                if(locked)locked_copies.add(double(stride)/1e6,us);}
+                (locked?locked_copies:pageable_copies).add(double(stride)/1e6,us);}
             else if(failure.empty())failure=error_text;
             cv.notify_all();
         }
@@ -1375,15 +1721,25 @@ struct tier {
             us=micros(t);
         }
         upload_us_per_expert=us;
+        {std::lock_guard<std::mutex> lock(mutex);pageable_copies.add(double(stride)/1e6,us);}
         std::fprintf(stderr,"[kimi_vram_admission] event=upload_probe upload_us=%.1f bytes=%zu\n",us,stride);
     }
     void copy_upload(const upload_job & job){
+        const bool locked=!job.borrow && page_locked(job.data[0]);
         char * dst=slot_base(size_t(job.slot));const auto t=clock_type::now();
         for(int i=0;i<3;++i){cuda_check(cudaMemcpyAsync(dst,job.data[i],role_bytes[i],cudaMemcpyHostToDevice,upload_stream));dst+=role_bytes[i];}
         if(!job.borrow)cuda_check(cudaStreamSynchronize(upload_stream));
         const double us=micros(t);std::lock_guard<std::mutex> lock(mutex); // the upload thread updates the same counters
         upload_us+=us;++uploads;upload_bytes+=stride;borrowed_uploads+=job.borrow;
-        if(!job.borrow)upload_us_per_expert=upload_us_per_expert>0?0.9*upload_us_per_expert+0.1*us:us;
+        if(!job.borrow){upload_us_per_expert=upload_us_per_expert>0?0.9*upload_us_per_expert+0.1*us:us;
+            (locked?locked_copies:pageable_copies).add(double(stride)/1e6,us);}
+    }
+    // Whether host memory is page-locked (registered or pinned): a copy from it is DMA on its stream; from pageable
+    // memory the copying thread stages it. Where the device reads host memory in place nothing needs a copy.
+    bool page_locked(const void * pointer){
+        cudaPointerAttributes attr{};
+        if(cudaPointerGetAttributes(&attr,pointer)!=cudaSuccess){(void)cudaGetLastError();return false;}
+        return attr.type==cudaMemoryTypeHost;
     }
     void initialize(const kimi_vram_request * r,int l,int h){
         if(format_mode)throw std::runtime_error("VRAM tier already holds an explicit expert format");
@@ -1500,6 +1856,20 @@ struct tier {
             worker=std::thread([this]{worker_loop();});
             if(deferred_upload)upload_thread=std::thread([this]{upload_loop();});
             report_thread_cpus();
+            // The batched prefill engine for a format without an engine of its own. A format the CUDA backend's
+            // products do not serve keeps the CPU for its grouped prefill, as before.
+            if(!mxfp4 && !q2 && kimi_vram_group_compute_get_api){
+                group_api=kimi_vram_group_compute_get_api();
+                if(!group_api || group_api->version!=2 || group_api->size!=sizeof(*group_api) || !group_api->create ||
+                        !group_api->reserve || !group_api->release || !group_api->begin_layer || !group_api->compute ||
+                        !group_api->finish_layer || !group_api->input_rows || !group_api->geometry || !group_api->destroy ||
+                        !group_api->device_bytes || !group_api->host_bytes)
+                    throw std::runtime_error("grouped VRAM engine ABI mismatch");
+                char error[512]={};
+                group=group_api->create(device,f.latent,f.hidden,f.weight_type,f.down_type,error,sizeof(error));
+                if(!group)std::fprintf(stderr,"[kimi_vram_prefill_engine] status=unavailable format=%s/%s error=%s fallback=cpu\n",
+                    ggml_type_name(ggml_type(f.weight_type)),ggml_type_name(ggml_type(f.down_type)),error);
+            }
         }
         if(!upload_stream)cuda_check(cudaStreamCreateWithFlags(&upload_stream,cudaStreamNonBlocking));
         if(deferred_upload && !deferred_stream)cuda_check(cudaStreamCreateWithFlags(&deferred_stream,cudaStreamNonBlocking));
@@ -1528,8 +1898,8 @@ struct tier {
         // during prefill, then returns both before decode cache growth. Failure
         // is a safe CPU fallback reported by transient_available().
         if(((q2 && (prefill_transient_min_routes || prefill_ssd_transient_min_routes)) ||
-                (mxfp4 && mxfp4_batch && prefill_transient_phase)) && !prefill_transient_arena){
-            allocate_prefill_transient(mxfp4?mxfp4_prefill_transient_slots:1);
+                ((mxfp4 && mxfp4_batch) || group) && prefill_transient_phase) && !prefill_transient_arena){
+            allocate_prefill_transient(mxfp4 || group?mxfp4_prefill_transient_slots:1);
         }
         // Cold MXFP4 prefill only needs the transient expert and batch
         // workspace. Defer the large decode arena until the graph has created
@@ -1724,12 +2094,32 @@ struct tier {
         host_scratch_failed=false;
     }
     // A page-locked range was registered (register_host): the first one measures the copy rate unless a copy already
-    // has. Any thread.
+    // has. With the prefill's transient slots allocated and no launched prefill job using them (the sink page-locks
+    // its read ring after a layer's prepare and before its launch, B3; prepared residents pin tier slots only), one
+    // copy into transient slot 0 is timed at once, under the tier's lock, which keeps a launch and the slots' release
+    // out until it is done, so that the layer's page-locked transients are priced; otherwise the next decode token
+    // boundary times it into a scratch slot. Any thread; once a process, a few ms.
     void host_registered(const void * pointer,size_t bytes){
         std::lock_guard<std::mutex> lock(mutex);
         if(host_readable || host_probe_taken || !locked_copies.s.empty())return;
-        host_probe_taken=true;host_probe=pointer;host_probe_bytes=bytes;
-        if(!host_scratch && !host_scratch_failed)host_scratch_wanted=true;
+        if(!prefill_transient_arena || prefill_launched || !done || !stride || !upload_stream){
+            host_probe_taken=true;host_probe=pointer;host_probe_bytes=bytes;
+            if(!host_scratch && !host_scratch_failed)host_scratch_wanted=true;
+            return;
+        }
+        const size_t n=std::min(bytes,stride);
+        cudaEvent_t a=nullptr,b=nullptr;
+        cuda_check(cudaSetDevice(device));
+        cuda_check(cudaEventCreate(&a));cuda_check(cudaEventCreate(&b));
+        cuda_check(cudaEventRecord(a,upload_stream));
+        cuda_check(cudaMemcpyAsync(prefill_transient_arena,pointer,n,cudaMemcpyHostToDevice,upload_stream));
+        cuda_check(cudaEventRecord(b,upload_stream));
+        cuda_check(cudaEventSynchronize(b));
+        float ms=0;const bool timed=cudaEventElapsedTime(&ms,a,b)==cudaSuccess;if(!timed)(void)cudaGetLastError();
+        cuda_check(cudaEventDestroy(a));cuda_check(cudaEventDestroy(b));
+        if(!timed || !(ms>0))return;
+        locked_copies.add(double(n)/1e6,1e3*double(ms));host_probe_taken=true;
+        std::fprintf(stderr,"[kimi_vram_host] event=probe_copy where=prefill bytes=%zu us=%.0f gbs=%.2f\n",n,1e3*double(ms),double(n)/1e6/double(ms));
     }
     // Before a range is unregistered: a probe not started from it is dropped, one in flight is waited for. Sink thread.
     void host_unregistering(const void * pointer){
@@ -1780,6 +2170,9 @@ struct tier {
         c.host_call_us=host_calls.s.empty()?0.0:a;c.host_expert_us=kk>0?ky/kk:0.0;
         double mb=0,us=0;for(const auto & x:locked_copies.s){mb+=x.first;us+=x.second;}
         c.copy_us_per_mb=host_readable || !(mb>0)?0.0:us/mb;
+        double pmb=0,pus=0;for(const auto & x:pageable_copies.s){pmb+=x.first;pus+=x.second;}
+        c.pageable_us_per_mb=pmb>0?pus/pmb:0.0;
+        c.vector_tokens=vector_tokens;
         size_t copying=0;for(const auto & d:deferred)copying+=!d.completed;
         c.link_busy_us=double(copying)*double(stride)/1e6*(c.copy_us_per_mb>0?c.copy_us_per_mb:0.0);
         c.in_place=host_readable;
@@ -1822,12 +2215,17 @@ struct tier {
         if(!keep_across_requests || !count)return;
         if(unified)reclaim_host(0,"floor");
         const bool q2=f->weight_type==int(GGML_TYPE_IQ2_XXS) && f->down_type==int(GGML_TYPE_Q2_K);
+        const bool mxfp4=f->weight_type==int(GGML_TYPE_MXFP4) && f->down_type==int(GGML_TYPE_MXFP4);
         if(!has_storage() || !table || !engine){
-            if(!q2 && !(f->weight_type==int(GGML_TYPE_MXFP4) && mxfp4_batch_enabled))return;
+            if(mxfp4 && !mxfp4_batch_enabled)return;
             if(q2 && !cold_prefill_admit_per_layer && !prefill_ssd_transient_min_routes)return;
             // The graph has already reserved its actual request-sized
             // workspace. Allocate the decode arena from the remaining VRAM,
-            // then seed only empty slots as selected SSD experts arrive.
+            // then seed only empty slots as selected SSD experts arrive. Only
+            // Q2 allocates it here: MXFP4 and the batched engine's formats keep
+            // it deferred to the first decode token (initialize_format with
+            // allocate_cache false), so that its start-up check never runs
+            // inside a prefill holding the engine's workspace.
             initialize_format(r,*f,q2);
             // The immediately following decode adopts an arena initialized
             // here (initialize_format, outside decode); only Q2 admits into it.
@@ -1845,6 +2243,10 @@ struct tier {
             for(int role=0;role<3;++role)if(r[j].role[role].bytes!=role_bytes[role])
                 throw std::runtime_error("grouped-prefill role bytes changed");
         }
+        // no prefill lane for this format (no engine of its own and none from the CUDA backend's products): the CPU's
+        if(!q2 && !mxfp4 && !group)return;
+        // the batched engine for the pass sizes announced (reserve_accumulate), before any read starts
+        if(group && group_wanted_rows>group_rows)reserve_group(group_wanted_rows);
         prefill_slots.resize(size_t(count));
         if(!table){
             std::fill(prefill_slots.begin(),prefill_slots.end(),-1);
@@ -1863,7 +2265,29 @@ struct tier {
         const bool mxfp4=weight_type==int(GGML_TYPE_MXFP4) && down_type==int(GGML_TYPE_MXFP4) && mxfp4_batch;
         return format_mode && prefill_transient_arena &&
             ((q2 && prefill_transient_bytes==stride) ||
-             (mxfp4 && prefill_transient_bytes==stride*mxfp4_prefill_transient_slots));
+             ((mxfp4 || group) && prefill_transient_bytes==stride*mxfp4_prefill_transient_slots));
+    }
+    // The format's grouped-prefill lane (kimi_vram_prefill_api v7).
+    void lane(kimi_vram_prefill_lane & l) const{
+        l={};
+        if(!format_mode)return;
+        const bool q2=weight_type==int(GGML_TYPE_IQ2_XXS) && down_type==int(GGML_TYPE_Q2_K);
+        const bool mxfp4=weight_type==int(GGML_TYPE_MXFP4) && down_type==int(GGML_TYPE_MXFP4);
+        l.vector_tokens=vector_tokens;
+        l.engine=group?KIMI_VRAM_PREFILL_ENGINE_BATCHED:mxfp4 && mxfp4_batch?KIMI_VRAM_PREFILL_ENGINE_MXFP4:
+            q2 || mxfp4?KIMI_VRAM_PREFILL_ENGINE_TOKENS:KIMI_VRAM_PREFILL_ENGINE_NONE;
+        l.f32_input=!mxfp4;
+        if(group){
+            l.in_place=host_readable;l.post_norm=1;
+            vram_group_geometry g={};group_api->geometry(group,&g);
+            l.route_bytes=g.route_bytes;l.token_bytes=g.token_bytes;l.output_bytes=g.output_bytes;
+            l.fixed_bytes=g.fixed_bytes;l.bytes_per_token=g.bytes_per_token;
+        }else if(mxfp4 && mxfp4_batch){
+            const auto * traits=ggml_get_type_traits_cpu(GGML_TYPE_MXFP4);
+            l.route_bytes=(traits?ggml_row_size(traits->vec_dot_type,latent):0)+sizeof(int32_t)+sizeof(float);
+            l.output_bytes=size_t(latent)*sizeof(float);
+            l.fixed_bytes=mxfp4_batch_api->device_bytes(mxfp4_batch);l.bytes_per_token=size_t(latent)*sizeof(float);
+        }
     }
     int cold_prefill_admission_active() const{
         return cold_prefill_admission_phase && format_mode && table &&
@@ -1904,15 +2328,22 @@ struct tier {
     }
     void launch_prefill(const void * q,size_t input_stride,const int32_t * routes,const float * weights,
             int nslots,int ntokens,const kimi_vram_prefill_transient * transient,int transient_count,
-            const kimi_vram_activation * a){
+            const kimi_vram_prefill_launch * options){
         if(transient_count<0 || (transient_count && !transient))throw std::runtime_error("invalid grouped-prefill transient list");
         if(!prefill_live && !transient_count)return;
-        if(!q || !routes || !weights || !a || nslots<0 || nslots>16 || ntokens<1 ||
+        if(!q || !routes || !weights || !options || nslots<0 || nslots>16 || ntokens<1 ||
                 (nslots && ntokens>std::numeric_limits<int>::max()/nslots))
             throw std::runtime_error("invalid grouped-prefill launch");
-        const bool q2=weight_type==int(GGML_TYPE_IQ2_XXS) && down_type==int(GGML_TYPE_Q2_K);
+        const kimi_vram_activation * a=&options->activation;
+        const bool batched=group && ntokens>vector_tokens;
+        // the post norm: the batched engine applies it, and so does the vector path of a one-token pass (as decode's
+        // CPU does to the tier's unweighted rows); MXFP4's hand engine cannot
+        if(options->post_norm && (!std::isfinite(options->post_norm_eps) || options->post_norm_eps<=0 ||
+                (!batched && ntokens>vector_tokens)))
+            throw std::runtime_error("grouped-prefill post norm on an engine without one");
+        const bool f32=!(weight_type==int(GGML_TYPE_MXFP4) && down_type==int(GGML_TYPE_MXFP4));
         const auto * traits=ggml_get_type_traits_cpu(ggml_type(weight_type));
-        const size_t expected=q2?size_t(latent)*sizeof(float):
+        const size_t expected=f32?size_t(latent)*sizeof(float):
             (traits?ggml_row_size(traits->vec_dot_type,latent):0);
         if(!traits || input_stride!=expected ||
                 (a->kind!=KIMI_VRAM_ACTIVATION_SITU && a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP))
@@ -1944,18 +2375,30 @@ struct tier {
             throw std::runtime_error("grouped-prefill workspace overflow");
         std::lock_guard<std::mutex> lock(mutex);
         if(!done)throw std::runtime_error("GPU job already outstanding");
-        prefill_input.assign(static_cast<const uint8_t *>(q),
-                static_cast<const uint8_t *>(q)+size_t(ntokens)*input_stride);
         prefill_routes.assign(routes,routes+route_count);
         prefill_weights.assign(weights,weights+route_count);
         prefill_transient.clear();
         if(transient_count)prefill_transient.assign(transient,transient+transient_count);
-        prefill_output.resize(size_t(ntokens)*size_t(latent));
         prefill_input_stride=input_stride;prefill_nslots=nslots;prefill_ntokens=ntokens;prefill_activation=*a;
+        if(options->post_norm){prefill_post_norm.assign(options->post_norm,options->post_norm+latent);prefill_post_norm_eps=options->post_norm_eps;}
+        else prefill_post_norm.clear();
+        group_pass=batched;
+        group_in_place=batched && host_readable && options->in_place;
+        if(group_pass){
+            // the input rows of the tokens with GPU work go straight into the engine's page-locked staging
+            prefill_input.clear();prefill_output.clear();
+            build_group_layer(static_cast<const uint8_t *>(q),input_stride);
+        }else{
+            prefill_input.assign(static_cast<const uint8_t *>(q),
+                    static_cast<const uint8_t *>(q)+size_t(ntokens)*input_stride);
+            prefill_output.resize(size_t(ntokens)*size_t(latent));
+        }
         prefill_job_stats={};
         prefill_job_stats.resident_experts=uint64_t(std::count_if(prefill_slots.begin(),prefill_slots.end(),[](int slot){return slot>=0;}));
         prefill_job_stats.transient_experts=uint64_t(transient_count);
+        std::vector<int8_t> transient_source(prefill_slots.size(),-1); // per request: its transient's source, or -1
         for(const auto & item:prefill_transient){
+            transient_source[size_t(item.request_index)]=int8_t(item.source);
             if(item.source==KIMI_VRAM_PREFILL_TRANSIENT_RAM)++prefill_job_stats.ram_transient_experts;
             else ++prefill_job_stats.ssd_transient_experts;
         }
@@ -1963,17 +2406,13 @@ struct tier {
             const int request=prefill_routes[route];
             if(request<0)continue;
             if(prefill_slots[size_t(request)]>=0)++prefill_job_stats.resident_routes;
-            else{
-                const auto item=std::find_if(prefill_transient.begin(),prefill_transient.end(),
-                    [&](const kimi_vram_prefill_transient & value){return value.request_index==request;});
-                if(item!=prefill_transient.end()){
-                    ++prefill_job_stats.transient_routes;
-                    if(item->source==KIMI_VRAM_PREFILL_TRANSIENT_RAM)++prefill_job_stats.ram_transient_routes;
-                    else ++prefill_job_stats.ssd_transient_routes;
-                }
+            else if(transient_source[size_t(request)]>=0){
+                ++prefill_job_stats.transient_routes;
+                if(transient_source[size_t(request)]==KIMI_VRAM_PREFILL_TRANSIENT_RAM)++prefill_job_stats.ram_transient_routes;
+                else ++prefill_job_stats.ssd_transient_routes;
             }
         }
-        prefill_live=true;
+        prefill_live=true;prefill_launched=true;
         failure.clear();done=false;prefill_queued=true;
         if(timing){launch_time=clock_type::now();++launches;}
         cv.notify_all();
@@ -1985,7 +2424,15 @@ struct tier {
         if(!failure.empty())throw std::runtime_error(failure);
         if(!output || output_stride<size_t(latent))throw std::runtime_error("grouped-prefill output geometry");
         const auto add_start=clock_type::now();
-        for(int token_index=0;token_index<prefill_ntokens;++token_index){
+        if(group_pass){
+            // the batched engine's accumulated rows: only the tokens with GPU work
+            if(!group_output && !group_tokens.empty())throw std::runtime_error("grouped prefill engine returned no rows");
+            for(size_t row=0;row<group_tokens.size();++row){
+                float * destination=output+size_t(group_tokens[row])*output_stride;
+                const float * source=group_output+row*size_t(latent);
+                for(int col=0;col<latent;++col)destination[col]+=source[col];
+            }
+        }else for(int token_index=0;token_index<prefill_ntokens;++token_index){
             float * destination=output+size_t(token_index)*output_stride;
             const float * source=prefill_output.data()+size_t(token_index)*size_t(latent);
             for(int col=0;col<latent;++col)destination[col]+=source[col];
@@ -2009,6 +2456,7 @@ struct tier {
             (unsigned long long)prefill_job_stats.ssd_transient_upload_bytes,
             prefill_job_stats.ssd_transient_upload_us,
             prefill_job_stats.total_worker_us,prefill_transient_bytes);
+        {std::lock_guard<std::mutex> lock(mutex);prefill_launched=false;}
         prefill_live=false;prefill_generation=0;prefill_slots.clear();prefill_input.clear();
         prefill_routes.clear();prefill_weights.clear();prefill_output.clear();prefill_transient.clear();work.clear();output_rows.clear();
     }
@@ -2017,6 +2465,7 @@ struct tier {
         if(cold_prefill_admission_phase){release();return;}
         if(!prefill_live)return;
         drain();release_mxfp4_accumulator();
+        {std::lock_guard<std::mutex> lock(mutex);prefill_launched=false;}
         if(table && prefill_generation)table->release_ready(prefill_generation);
         prefill_live=false;prefill_generation=0;prefill_slots.clear();prefill_input.clear();
         prefill_routes.clear();prefill_weights.clear();prefill_output.clear();prefill_transient.clear();work.clear();output_rows.clear();
@@ -2121,7 +2570,7 @@ int deferred_collect(void * p,int32_t wait_layer,kimi_vram_request * out,int32_t
     auto * t=static_cast<tier *>(p);try{t->collect(wait_layer,out,aborted,capacity,count);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int deferred_wait(void * p,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->wait_deferred();return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int elastic_phase_complete(void * p,int decode,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->phase_complete(decode!=0);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
-int elastic_reserve_accumulate(void * p,int tokens,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->reserve_mxfp4_accumulator(tokens);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+int elastic_reserve_accumulate(void * p,int tokens,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->reserve_prefill_engine(tokens);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int elastic_reserve(void * p,const kimi_vram_request * r,const kimi_vram_expert_format * f,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{if(!r || !f)throw std::runtime_error("null VRAM reserve geometry");t->reserve(*r,*f);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int format_prepare(void * p,const kimi_vram_request * r,int count,const kimi_vram_expert_format * f,int * slots,char * e,size_t n){
@@ -2133,8 +2582,10 @@ int prefill_prepare(void * p,const kimi_vram_request * r,int count,const kimi_vr
 int prefill_transient_available(void * p){return p?static_cast<tier *>(p)->transient_prefill_available():0;}
 int prefill_launch(void * p,const void * q,size_t stride,const int32_t * routes,const float * weights,
         int nslots,int ntokens,const kimi_vram_prefill_transient * transient,int transient_count,
-        const kimi_vram_activation * a,char * e,size_t n){
-    auto * t=static_cast<tier *>(p);try{t->launch_prefill(q,stride,routes,weights,nslots,ntokens,transient,transient_count,a);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+        const kimi_vram_prefill_launch * options,char * e,size_t n){
+    auto * t=static_cast<tier *>(p);try{t->launch_prefill(q,stride,routes,weights,nslots,ntokens,transient,transient_count,options);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+void prefill_lane(void * p,kimi_vram_prefill_lane * lane){
+    if(!lane)return;*lane={};if(p)static_cast<tier *>(p)->lane(*lane);}
 int prefill_finish(void * p,float * output,size_t stride,kimi_vram_prefill_stats * stats,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{if(stats)*stats={};t->finish_prefill(output,stride,stats);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int prefill_cancel(void * p,char * e,size_t n){
@@ -2190,7 +2641,9 @@ int host_register(void * p,const void * pointer,size_t bytes,char * e,size_t n){
     cudaError_t rc=cudaSetDevice(t->device);
     if(rc==cudaSuccess)rc=cudaHostRegister(const_cast<void *>(pointer),bytes,cudaHostRegisterDefault);
     if(rc!=cudaSuccess){(void)cudaGetLastError();if(n)std::snprintf(e,n,"cudaHostRegister: %s",cudaGetErrorString(rc));return 1;}
-    t->host_registered(pointer,bytes);
+    // the range is registered: a failed probe copy only leaves the copy unmeasured
+    try{t->host_registered(pointer,bytes);}catch(const std::exception & x){
+        (void)cudaGetLastError();std::fprintf(stderr,"[kimi_vram_host] event=probe_copy status=fail error=%s\n",x.what());}
     return 0;}
 int host_unregister(void * p,const void * pointer,char * e,size_t n){
     auto * t=static_cast<tier *>(p);
@@ -2219,7 +2672,9 @@ void policy_set_host_floor(void * p,uint64_t bytes){
 uint64_t policy_host_bytes(void * p){
     auto * t=static_cast<tier *>(p);if(!t)return 0;
     std::lock_guard<std::mutex> lock(t->lifecycle_mutex);
-    return t->unified?t->capacity_bytes+t->prefill_transient_bytes:0;}
+    // on unified memory the batched engine's page-locked staging comes out of the same DRAM as its device buffers
+    return t->unified?t->capacity_bytes+t->prefill_transient_bytes+
+        (t->group?t->group_api->device_bytes(t->group)+t->group_api->host_bytes(t->group):0):0;}
 int policy_reclaim_host(void * p,uint64_t bytes){
     auto * t=static_cast<tier *>(p);if(!t)return 1;
     try{return t->reclaim_host(size_t(std::min<uint64_t>(bytes,SIZE_MAX)),bytes?"host_reserve":"floor")?0:1;}catch(const std::exception & x){
@@ -2233,7 +2688,7 @@ extern "C" const kimi_vram_policy_api * kimi_vram_policy_get_api(){
         policy_set_host_floor,policy_reclaim_host,policy_host_bytes};return &api;
 }
 extern "C" const kimi_vram_host_api * kimi_vram_host_get_api(){
-    static const kimi_vram_host_api api={2,sizeof(kimi_vram_host_api),host_available,host_launch,host_costs,
+    static const kimi_vram_host_api api={3,sizeof(kimi_vram_host_api),host_available,host_launch,host_costs,
         host_register,host_unregister,host_costs2};return &api;
 }
 extern "C" const kimi_vram_tier_api * kimi_vram_tier_get_api(){
@@ -2258,7 +2713,7 @@ extern "C" const kimi_vram_format_api * kimi_vram_format_get_api(){
     static const kimi_vram_format_api api={1,sizeof(kimi_vram_format_api),format_prepare,format_launch};return &api;
 }
 extern "C" const kimi_vram_prefill_api * kimi_vram_prefill_get_api(){
-    static const kimi_vram_prefill_api api={5,sizeof(kimi_vram_prefill_api),prefill_prepare,
+    static const kimi_vram_prefill_api api={7,sizeof(kimi_vram_prefill_api),prefill_prepare,
         prefill_transient_available,prefill_launch,prefill_finish,prefill_cancel,
-        prefill_cold_admission_active,prefill_admit_cold};return &api;
+        prefill_cold_admission_active,prefill_admit_cold,prefill_lane};return &api;
 }

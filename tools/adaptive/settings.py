@@ -3,10 +3,12 @@
 (KEY=VALUE lines, the format of a model conf), and the knobs of every server the framework starts after its plan
 (machine.py env).  Every value carries its receipt,
     KEY=VALUE  # source=<source>; input=<what it follows from>
-source  decided   the plan chose it among the configurations of the machine model (plan.py): the GPU tier's cap
+source  measured  the probe measured it: the cost table's start values (prefill_start)
+        decided   the plan chose it among the configurations of the machine model (plan.py): the GPU tier's cap
                   (and, on a fixed base budget, that base), the CPU placement, a larger prefill ubatch
         derived   it follows from what the probe and the bootstrap measured and from the workload the plan assumed:
-                  the prefill threshold and the ubatch (prefill.py, design section 3.2), the next-layer prefetch
+                  the cost table the bootstrap calibrated (the engine's start values, prefill_carried), the prefill
+                  threshold and the ubatch (prefill.py, design section 3.2), the next-layer prefetch
                   depth (design section 4.1), the checkpoints, and the context where the workload is known (the
                   conversation the servers will serve, not a forecast)
         self-tuned  the engine learned it: the host-memory margin on unified memory, where a run of the framework
@@ -86,6 +88,13 @@ def prefill_route(m, p, limit, bound='the ubatch a server of this machine starte
 
     def state(s):
         st = PF['pass'][p][s]
+        if st.get('lane'):
+            t = st['lane']
+            return (f"with the GPU lane, the table of its {s} prefill of {st['n']} tokens (CPU {t.get('cpu_fixed_us', 0):.0f} + "
+                    f"{t.get('cpu_route_us', 0):.1f} us a route, GPU {t.get('gpu_fixed_us', 0):.0f} + "
+                    f"{t.get('gpu_route_us', 0):.2f}, link {t.get('link_gbps', 0):.2f} GB/s, drive "
+                    f"{t.get('drive_gbps', 0):.2f} GB/s), {st['r']:.1f} routes a token and {st['d'] * 1e3:.2f} ms a token "
+                    "outside its layers")
         return (f"{st['c'] * 1e6:.1f} us a route, {st['r']:.1f} routes a token and {st['d'] * 1e3:.2f} ms a token "
                 f"besides ({s} prefill of {st['n']} tokens)")
     if not turns:
@@ -130,6 +139,79 @@ def prefill_route(m, p, limit, bound='the ubatch a server of this machine starte
             out.append(Setting('UBATCH', limit, 'derived',
                                f'every pass on the sink, of up to {limit} tokens ({bound})'))
     return out
+
+
+# Formats whose grouped prefill the tier computes on an engine of its own, not the batched engine the probe times
+# (kimi-vram-tier/vram-tier.cpp initialize_format): MXFP4's hand engine, Q2's per-token path.
+OWN_ENGINE = {'mxfp4/mxfp4', 'iq2_xxs/q2_k'}
+GB_PER_GIB = 2 ** 30 / 1e9
+
+
+def cost_spec(terms):
+    """The engine's GGML_KIMI_CPU_PREFILL_COST value: name=value items, comma separated."""
+    return ','.join(f'{k}={v:.6g}' for k, v in terms.items())
+
+
+def prefill_carried(m, p):
+    """The cost table the bootstrap of placement p calibrated (B6), carried to its servers as their start values:
+    the last pass's table of its warm prefill with the GPU lane ([kimi_cpu_prefill_cost] calibrated=), in place of the
+    probe's.  None without the lane (a bootstrap before it, as the stored runs')."""
+    pts = sorted((x for x in m.P[p].get('prefill') or [] if x.get('lane')), key=lambda x: x['tier'])
+    if not pts:
+        return None
+    x = pts[-1]
+    terms = {k: v for k, v in x['lane'].items() if v is not None and (v > 0 or (k == 'gpu_token_us' and v == 0))}
+    return Setting('GGML_KIMI_CPU_PREFILL_COST', cost_spec(terms), 'derived',
+                   f"the table the bootstrap's warm prefill of {x['n_tokens']} tokens calibrated with the GPU lane "
+                   f"(its last layer's [kimi_cpu_prefill_cost] line, over the pass's {x.get('layers_costed')} layers), "
+                   "carried as the engine's start values")
+
+
+def prefill_start(m):
+    """The cost table's start values (B4) from the probe: the CPU's grouped path and the GPU's batched engine, each a
+    line of fixed + per-route microseconds an expert timed busy beside the other lanes at the model's expert shape and
+    types (test-kimi-vram-group --time); one copy from page-locked memory and the pageable copy (memprobe); the drive
+    at its knee. The engine starts from them and replaces each with its own measure as it runs. Nothing without the
+    lane timing (a probe before it, as the stored runs')."""
+    dev = m.dev
+    ln, gpu, ssd = dev.get('lanes'), dev.get('gpu') or {}, dev.get('ssd') or {}
+    if not ln:
+        return []
+    terms, why = {}, []
+    if 'cpu' in ln:
+        terms.update(cpu_fixed_us=ln['cpu']['fixed_us'], cpu_route_us=ln['cpu']['per_route_us'])
+        why.append(f"the CPU's grouped path {ln['cpu']['fixed_us']:.1f} + {ln['cpu']['per_route_us']:.3f} us a route "
+                   f"on {ln.get('threads')} threads")
+    if ln.get('format', '').lower() in OWN_ENGINE:
+        why.append(f"no GPU line: the tier computes {ln['format']} on an engine of its own")
+    else:
+        if 'gpu' in ln:
+            terms.update(gpu_fixed_us=ln['gpu']['fixed_us'], gpu_route_us=ln['gpu']['per_route_us'])
+            why.append(f"the batched engine from device memory {ln['gpu']['fixed_us']:.1f} + "
+                       f"{ln['gpu']['per_route_us']:.3f} us a route")
+        if 'gpu_host' in ln:
+            terms.update(gpu_host_fixed_us=ln['gpu_host']['fixed_us'], gpu_host_route_us=ln['gpu_host']['per_route_us'])
+            why.append(f"in place from host memory {ln['gpu_host']['fixed_us']:.1f} + "
+                       f"{ln['gpu_host']['per_route_us']:.3f} us a route")
+    link = ln.get('copy_gbps') or gpu.get('h2d_pinned_gbs')
+    if link and not gpu.get('integrated'):
+        terms['link_gbps'] = link
+        why.append(f'a page-locked copy {link:.2f} GB/s')
+    # the pageable copy: a discrete GPU's unlocked sources; on unified memory the transport the in-place choice weighs
+    # (its read ring stays unregistered there), the probe's copy where memprobe has none
+    pageable = gpu.get('h2d_pageable_gbs') or (ln.get('copy_gbps') if gpu.get('integrated') else None)
+    if pageable:
+        terms['pageable_gbps'] = pageable
+        why.append(f'a pageable copy {pageable:.2f} GB/s')
+    knee = dev.get('ssd_knee_qd')
+    if str(knee) in ssd:
+        terms['drive_gbps'] = ssd[str(knee)]['gibs'] * GB_PER_GIB
+        why.append(f"the drive {terms['drive_gbps']:.2f} GB/s at QD {knee}")
+    if not terms:
+        return []
+    return [Setting('GGML_KIMI_CPU_PREFILL_COST', cost_spec(terms), 'measured',
+                    f"the probe's lanes at {ln.get('format')} latent {ln.get('latent')} hidden {ln.get('hidden')} "
+                    f"(test-kimi-vram-group --time, each busy beside the others): {'; '.join(why)}")]
 
 
 def depth(nu, p, need, cost, gain=1.0, spill=0.0):
@@ -294,6 +376,8 @@ def derive(m, p, pending=(), workload=None, ledgers=()):
     if limit:               # an engine that reports no prefill ubatch leaves nothing to derive the passes from
         out += prefill_route(m, p, limit, bound, workload['prompts'] if workload else None,
                              (workload or {}).get('decode') or 0)
+    carried = prefill_carried(m, p)
+    out += [carried] if carried else prefill_start(m)
     out += prefetch_depth(m, p)
     align = m.P[p].get('checkpoint_align')
     if align and workload and len(workload['prompts']) == 1:

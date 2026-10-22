@@ -46,6 +46,22 @@ class Place(unittest.TestCase):
         self.assertEqual(a.host['resident_us'], 74.6)
         self.assertEqual(a.host['host_us'], 229.0)
 
+    def test_pending(self):
+        # the plan's candidates include the RAM hits a prefetch still reads: how many there were and how many moved
+        a = logparse.ArmParser()
+        a.feed('[kimi_decode_place] reason=destroy layers=21930 tokens=510 gpu_experts=10200 gpu_per_token=20.00 '
+               'planned=10180 candidates=10500 refused=0 wanted=0 error_p50_pct=15 error_p90_pct=90 predicted_ms=32000.0 '
+               'measured_ms=32100.0 cpu_only_ms=36000.0 cpu_expert_us=1600.0 early=0.650 fixed_us=120.0 '
+               'decode_read_gbs=8.10 cpu_alone_us=1500.0 cpu_shared_us=1650.0 cpu_moved=1.100 pending=2400 '
+               'pending_planned=2300\n')
+        self.assertEqual(a.decode_place['pending'], 2400)
+        self.assertEqual(a.decode_place['pending_planned'], 2300)
+        # an engine before them: absent, not zero
+        b = logparse.ArmParser()
+        for line in SNIPPET:
+            b.feed(line)
+        self.assertIsNone(b.decode_place['pending'])
+
     def test_older_engine(self):
         # an engine before the plan: version 1's host line only on unified memory, no plan or page-locking receipt
         a = logparse.ArmParser()

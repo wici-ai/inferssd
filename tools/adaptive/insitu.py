@@ -98,6 +98,8 @@ def measure(run, skip):
                         'graph_gb': round(g['graph_bytes'] / 1e9, 3) if g else None,
                         'graph_read_s': round(g['graph_read_us'] / 1e6, 3) if g else None,
                         'cpu_s': round(g['cpu_s'], 3) if g else None})
+        if p.get('lane'):   # the pass ran with the GPU lane: its calibrated table and its layers' time in the sink
+            prefill[-1].update(lane=p['lane'], layers_s=round(p['layers_s'], 3), layers_costed=p['layers_costed'])
     rb = sum(g['graph_bytes'] for g in graphs if g)
     ru = sum(g['graph_read_us'] for g in graphs if g)
     routing = []
@@ -133,6 +135,7 @@ def measure(run, skip):
         'prefill_ubatch': max((g.get('ubatch') or 0 for g in arm['pf_graphs']), default=0) or None,
         'drive_us_per_mb': round(drive_us_per_mb, 2) if drive_us_per_mb else None,
         'cache_load': arm['cache_load'],
+        'prefill_engine': arm.get('prefill_engine'),
         'cache_new_slot_gb': [round(x / 1e9, 3) for x in arm['new_slot_windows']],
         'load_s': arm['load_s'],
         'pf_k': pf_k,

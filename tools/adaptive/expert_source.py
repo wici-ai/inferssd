@@ -14,6 +14,9 @@ usage: expert_source.py index MODEL [PACK] DIR   -> DIR/experts.json (+ DIR/expe
        expert_source.py facts MODEL [ALIAS]    -> what run-ssd-llama.sh derives settings from, as shell assignments:
                                                   expert_types (the experts' ggml types), alias_unaligned (entries
                                                   of ALIAS, a GGUF alias index, that do not start on a PAGE boundary)
+       expert_source.py lane-args DIR          -> the arguments of test-kimi-vram-group --time for the experts DIR
+                                                  indexes: --latent L --hidden H --up TYPE --down TYPE (the routed
+                                                  experts' shape, and each role's most common type over the layers)
        expert_source.py dense MODEL HOMES OUT  -> OUT, the alias index of the dense matrices HOMES (tensor<TAB>ram|drive
                                                   lines, tools/adaptive DENSE_HOMES) puts on the drive, block by
                                                   block (blocks()), and as shell assignments what HOMES holds:
@@ -208,6 +211,20 @@ def facts(model, alias=None):
     print(f"expert_types='{' '.join(types)}'\nalias_unaligned={unaligned}")
 
 
+def lane_args(d):
+    """The probe's per-expert lane timing at this model's expert shape and types (B4): up is [latent, hidden, E]."""
+    info = json.load(open(f'{d}/experts.json'))
+    tensors = gguf_tensors(info['model'])
+    ups = [t for t in tensors if ROLE.match(t.name).group(2) == 'up']
+    downs = [t for t in tensors if ROLE.match(t.name).group(2) == 'down']
+    assert ups and downs, f'no routed up and down tensors in {info["model"]}'
+
+    def common(ts):
+        names = [t.type_name for t in ts]
+        return max(sorted(set(names)), key=names.count)
+    print(f'--latent {ups[0].shape[0]} --hidden {ups[0].shape[1]} --up {common(ups)} --down {common(downs)}')
+
+
 def dense(model, homes, out):
     every = [t for h in gguf_header.read_model(model) for t in h.tensors]
     tensors = {t.name: t for t in every if not is_role(t)}
@@ -249,6 +266,8 @@ if __name__ == '__main__':
         index(a[1], a[2] if len(a) == 4 else None, a[-1])
     elif a[:1] == ['facts'] and len(a) in (2, 3):
         facts(a[1], a[2] if len(a) == 3 else None)
+    elif a[:1] == ['lane-args'] and len(a) == 2:
+        lane_args(a[1])
     elif a[:1] == ['dense'] and len(a) == 4:
         dense(a[1], a[2], a[3])
     elif a[:1] == ['iolog'] and len(a) in (5, 6):

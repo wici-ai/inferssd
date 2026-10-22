@@ -4,6 +4,7 @@
 // registration leaves the slot pageable; the rent-or-buy rule.
 #include "kimi-host-lock.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <string>
@@ -164,6 +165,39 @@ int main() {
         check(h.missed({ 2 }, { 100 }, 600.0, prior, slots, true) == 0, "occupant 100: 600 of 1000");
         check(h.missed({ 2 }, { 101 }, 600.0, prior, slots, true) == 0, "occupant 101: its own 600, not 1200");
         check(h.missed({ 2 }, { 101 }, 600.0, prior, slots, true) == 1, "occupant 101: 1200, wanted");
+    }
+
+    // The read ring (kimi_ring_lock): every buffer registered once per allocation; a reallocation unregisters them all
+    // first and registers again; a refused registration undoes the ones before it and is not retried until the next
+    // allocation; at the end every registration has its unregistration.
+    {
+        std::vector<char> ring(24 * stride);
+        std::vector<std::pair<const void *, size_t>> buffers;
+        for (size_t i = 0; i < 24; ++i) { buffers.push_back({ ring.data() + i * stride, stride }); }
+        std::vector<const void *> live;
+        size_t calls = 0, refuse_at = SIZE_MAX;
+        kimi_ring_lock r;
+        r.lock_pages = [&](const void * p, size_t, std::string * why) {
+            if (calls++ == refuse_at) { if (why) { *why = "refused"; } return false; }
+            live.push_back(p); return true;
+        };
+        r.unlock_pages = [&](const void * p) {
+            const auto it = std::find(live.begin(), live.end(), p);
+            if (it == live.end()) { return false; }
+            live.erase(it); return true;
+        };
+        check(r.lock(buffers) && r.locked() && live.size() == 24 && r.registered == 24, "ring: every buffer page-locked");
+        check(r.lock(buffers) && r.registered == 24, "ring: once per allocation");
+        r.unlock();                                                   // the ring grows
+        check(live.empty() && !r.locked() && r.unregistered == 24, "ring: unlocked before a reallocation");
+        refuse_at = calls + 5;
+        std::string why;
+        check(!r.lock(buffers, &why) && live.empty() && why == "refused" && r.refused == 1, "ring: a refusal undoes the rest");
+        check(!r.lock(buffers) && calls == refuse_at + 1, "ring: not tried again before the next allocation");
+        r.unlock();                                                   // the next allocation
+        check(r.lock(buffers) && live.size() == 24, "ring: tried again after a reallocation");
+        r.unlock();                                                   // the sink goes
+        check(live.empty() && r.registered == r.unregistered && r.registered == 24 + 5 + 24, "ring: registrations balance");
     }
 
     if (failures) { std::fprintf(stderr, "%d failures\n", failures); return 1; }
