@@ -673,6 +673,9 @@ struct llama_model {
 
     void drop_expert_mmap_pages_after_prompt() const;
 
+    // whether a weight's bytes are the model's file mapping (mmap): reading them brings file pages into the page cache
+    bool file_mapped(const ggml_tensor * t) const;
+
     std::string arch_name() const;
     std::string type_name() const;
 

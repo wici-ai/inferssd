@@ -63,6 +63,7 @@ struct llama_kimi_cpu_sink_runtime {
     decltype(&kimi_cpu_sink_vram_phase_complete) vram_phase_complete = nullptr;
     decltype(&kimi_cpu_sink_cache_get_stats) cache_get_stats = nullptr;
     decltype(&kimi_cpu_sink_cache_make_room) cache_make_room = nullptr; // optional
+    decltype(&kimi_cpu_sink_cache_prefill_room) cache_prefill_room = nullptr; // optional
     resolve_fn resolve = nullptr;
     ggml_backend_reg_t cpu_reg = nullptr;
     const llama_kimi_cpu_sink_node * active_node = nullptr;
@@ -88,6 +89,9 @@ struct llama_kimi_cpu_sink_runtime {
     // reserves inside it repeat the request-boundary transition and are skipped.
     bool prefill_open = false;
     bool cache_keep_across_requests = false;
+    // The file pages the weight rows of the last prefill graph reserved gather (prefill_room): the load step leaves
+    // them uncommitted for the first prefill.
+    uint64_t prefill_pages = 0;
 
     static uint64_t unsigned_env(const char * name, uint64_t fallback, uint64_t maximum) {
         const char * value = std::getenv(name);
@@ -267,6 +271,8 @@ struct llama_kimi_cpu_sink_runtime {
             dlsym(RTLD_DEFAULT, "kimi_cpu_sink_run_activation"));
         cache_make_room = reinterpret_cast<decltype(cache_make_room)>(
             dlsym(RTLD_DEFAULT, "kimi_cpu_sink_cache_make_room"));
+        cache_prefill_room = reinterpret_cast<decltype(cache_prefill_room)>(
+            dlsym(RTLD_DEFAULT, "kimi_cpu_sink_cache_prefill_room"));
         prefetch_hint = reinterpret_cast<decltype(prefetch_hint)>(
             dlsym(RTLD_DEFAULT, "kimi_cpu_sink_prefetch_hint"));
 #endif
@@ -401,6 +407,8 @@ struct llama_kimi_cpu_sink_runtime {
 #if defined(__linux__)
         auto reserve = reinterpret_cast<decltype(&kimi_cpu_sink_vram_reserve)>(
             dlsym(RTLD_DEFAULT, "kimi_cpu_sink_vram_reserve"));
+        // the load-time graph's pages, held from here to the first decode token: the load step leaves their room
+        if (prefill_pages && cache_prefill_room) { cache_prefill_room(sink, prefill_pages, 0, 0); }
         char error[512] = {};
         if (reserve && !reserve(sink, up, gate, down, experts_used, error, sizeof(error))) {
             std::fprintf(stderr, "[kimi_vram_elastic] event=reserve status=fail error=%s\n", error);
@@ -420,6 +428,20 @@ struct llama_kimi_cpu_sink_runtime {
         }
 #endif
         return !cache_make_room || cache_make_room(sink, host_bytes, device_bytes);
+    }
+
+    // Room for a prefill graph about to be allocated (kimi_cpu_sink_cache_prefill_room): its compute buffers and the
+    // file pages of the weight rows it gathers, which the ledger holds until the first decode token.
+    bool prefill_room(uint64_t pages, uint64_t host_bytes, uint64_t device_bytes) {
+        std::lock_guard<std::mutex> lock(mutex);
+        prefill_pages = pages;
+#if defined(__linux__)
+        if (!cache_prefill_room) {
+            cache_prefill_room = reinterpret_cast<decltype(cache_prefill_room)>(
+                dlsym(RTLD_DEFAULT, "kimi_cpu_sink_cache_prefill_room"));
+        }
+#endif
+        return !cache_prefill_room || cache_prefill_room(sink, pages, host_bytes, device_bytes);
     }
 
     bool phase_complete(bool decode) {

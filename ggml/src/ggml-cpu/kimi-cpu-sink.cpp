@@ -874,7 +874,12 @@ struct sink_cache {
         // A retained mapping is bound to the model/context epoch even after
         // prefill cleared has_token. Per-entry fstat keys also reject fd reuse.
         if (keep_across_requests && arena && next_epoch != epoch && !adopt) { release(); }
-        if (adopt) { regrow_adopted(); }
+        // The first decode token after a prefill: the ledger no longer holds the prefill's pages, and the slots the
+        // prefill gave back come back as far as the room allows now.
+        if (!has_token) {
+            ledger.prefill_pages = 0;
+            regrow(adopt ? "load" : "prefill");
+        }
         adopt = false;
         if (has_token && (next_epoch != epoch || token == UINT64_MAX || next_token != token + 1)) { release(); }
         if (elastic) { grow_decode(); }
@@ -1327,9 +1332,12 @@ struct sink_cache {
     // token pays their first touch (13.8 ms a token over decode tokens 1-128 on 125, 1.77 s a cold start). Only a
     // cache kept across requests keeps them through the first prefill, which may give slots back through the ledger
     // as every later request's prefill does; the first decode adopts the arena whatever its epoch, and takes back
-    // what the room allows then (regrow_adopted). So only a cache that can give room back takes its storage here
+    // what the room allows then (regrow). So only a cache that can give room back takes its storage here
     // (partial reclaim, or elastic): an arena that cannot would refuse the first prefill's ledger requests, where a
-    // cache sized at the first decode token comes after them. Returns the slots committed.
+    // cache sized at the first decode token comes after them. The arena has the slots the first decode token would
+    // size, when no prefill holds room; the slots committed leave the room the ledger holds for the first prefill's
+    // pages (prefill_pages: the load-time graph's, the largest prefill's), which the first decode token takes back.
+    // Returns the slots committed.
     size_t reserve_at_load(const size_t * bytes, const ggml_tensor * tensor, size_t max_requests, int threads, double & us) {
         us = 0;
         if (!keep_across_requests || !gives_room_back() || paused || !stats.budget_bytes || arena || layers.empty()) {
@@ -1337,7 +1345,16 @@ struct sink_cache {
         }
         std::vector<std::thread> pool;
         pool.reserve(size_t(std::max(1, threads))); // before anything changes: a failure here leaves the cache as it was
-        if (!geometry(bytes, tensor, std::max<size_t>(1, max_requests)) || !stats.capacity_bytes) { return 0; }
+        struct decode_view {
+            uint64_t & pages;
+            const uint64_t held;
+            explicit decode_view(uint64_t & p) : pages(p), held(p) { pages = 0; }
+            ~decode_view() { pages = held; }
+        };
+        {
+            decode_view view(ledger.prefill_pages);
+            if (!geometry(bytes, tensor, std::max<size_t>(1, max_requests)) || !stats.capacity_bytes) { return 0; }
+        }
         const uint64_t slot_pages = add(ceil_div(stride, page_size), stride % page_size != 0);
         const uint64_t payload_pages = multiply(slot_pages, page_size), tables = page_tables(payload_pages);
         auto cost = [&](size_t n) { return add(multiply(n, add(payload_pages, tables)), 64 * 1024); };
@@ -1377,13 +1394,14 @@ struct sink_cache {
                 touched ? "touched" : "populated");
         return n;
     }
-    // The first decode token after reserve_at_load (partial reclaim, not elastic): the slots the first prefill gave
-    // back come back as far as the room allows now (an automatic budget: geometry's price of a slot past the
-    // metadata room; a fixed one: all of them), so the cache holds what one sized at this token would, within the
-    // arena's slots. They are paged in at their admission, as every slot was without the load step. So are the
-    // enabled slots the load step did not commit (the room it saw was smaller than the one geometry sized from):
-    // with an automatic budget they take their room first (owed).
-    void regrow_adopted() {
+    // The first decode token after a prefill (partial reclaim, not elastic): the slots the prefill gave back (the room
+    // it held for its pages and its buffers, given back at its start) come back as far as the room allows now (an
+    // automatic budget: geometry's price of a slot past the metadata room; a fixed one: all of them), so the cache
+    // holds what one sized at this token would, within the arena's slots. They are paged in at their admission, as
+    // every slot was without the load step. So are the enabled slots the load step did not commit (the room it saw
+    // was smaller than the one geometry sized from, or it left the first prefill's pages): with an automatic budget
+    // they take their room first (owed). `after`: "load" for the first request of an arena made at load, "prefill".
+    void regrow(const char * after) {
         if (!partial_reclaim || elastic || !arena || !stride || paused) { return; }
         const size_t before = enabled_slots();
         uint64_t more = entries.size() - before, surplus = 0, owed = 0;
@@ -1406,8 +1424,8 @@ struct sink_cache {
                 stats.enabled_bytes = add(stats.enabled_bytes, stride);
             }
         }
-        std::fprintf(stderr, "[kimi_cpu_sink_cache] load_regrow=1 before_slots=%zu after_slots=%zu of=%zu owed_slots=%llu surplus_bytes=%llu committed_bytes=%llu\n",
-                before, enabled_slots(), entries.size(), (unsigned long long) owed, (unsigned long long) surplus,
+        std::fprintf(stderr, "[kimi_cpu_sink_cache] %s_regrow=1 before_slots=%zu after_slots=%zu of=%zu owed_slots=%llu surplus_bytes=%llu committed_bytes=%llu\n",
+                after, before, enabled_slots(), entries.size(), (unsigned long long) owed, (unsigned long long) surplus,
                 (unsigned long long) stats.committed_bytes);
     }
     // Host memory the cache may still commit before a reset: its enabled but not yet resident slots (an elastic
@@ -2794,16 +2812,17 @@ struct kimi_cpu_sink {
         if (decode && cache.ledger.unified) { cache.ledger.begin_interval(held_bytes()); }
     }
     // Room for an allocation outside the expert caches (llama_host_reserve, compute buffers): `host` bytes of host
-    // memory and `device` bytes of GPU memory, which count only where the GPU shares the DRAM. No run is in flight:
-    // the caller holds run_mutex and has drained the prefetch.
-    bool make_room(uint64_t host, uint64_t device) {
+    // memory and `device` bytes of GPU memory, which count only where the GPU shares the DRAM, beside the pages the
+    // ledger holds for an open prefill. No run is in flight: the caller holds run_mutex and has drained the prefetch.
+    bool make_room(uint64_t host, uint64_t device, const char * reason = "host_reserve") {
         const uint64_t extra = cache.ledger.dram_bytes(host, device);
-        if (!extra) { return true; } // nothing comes out of this DRAM (device memory of a discrete GPU)
+        // nothing comes out of this DRAM (device memory of a discrete GPU) and no prefill holds room
+        if (!extra && !cache.ledger.prefill_pages) { return true; }
         refresh_floor("make_room");
         kimi_host_ledger::actions actions;
         actions.collect_deferred = [this] { vram.collect_deferred(cache, -1); };
         actions.reclaim_tier = [this](uint64_t bytes) { return vram.reclaim_host(bytes); };
-        actions.reclaim_cache = [this](uint64_t bytes) { return cache.arena && cache.reclaim_for_guard(bytes, "host_reserve", true); };
+        actions.reclaim_cache = [this, reason](uint64_t bytes) { return cache.arena && cache.reclaim_for_guard(bytes, reason, true); };
         const auto room = cache.ledger.make_room(extra, actions);
         if (!room.fits()) {
             ++ledger_refusals;
@@ -2813,6 +2832,20 @@ struct kimi_cpu_sink {
                     (unsigned long long) room.floor);
         }
         return room.fits();
+    }
+    // Room for a prefill, before it allocates anything (kimi_cpu_sink_cache_prefill_room): the ledger holds `pages`
+    // for the file pages of the weight rows its graph gathers until the first decode token, and makes room for its
+    // compute buffers (`host`, `device`) beside them, so that the RAM cache gives back what both need at once.
+    bool prefill_room(uint64_t pages, uint64_t host, uint64_t device) {
+        cache.ledger.prefill_pages = pages;
+        const size_t before = cache.enabled_slots();
+        const uint64_t committed = cache.stats.committed_bytes;
+        const bool fits = make_room(host, device, "prefill_room");
+        // (a refusal has its own receipt, with the short term)
+        std::fprintf(stderr, "[kimi_host_ledger] event=prefill_room pages=%llu host=%llu device=%llu fits=%d slots_before=%zu slots_after=%zu released_bytes=%llu\n",
+                (unsigned long long) pages, (unsigned long long) host, (unsigned long long) device, int(fits),
+                before, cache.enabled_slots(), (unsigned long long) (committed - std::min(committed, cache.stats.committed_bytes)));
+        return fits;
     }
     // The layer's plan, once its reads are issued. Lanes (kimi_place_ring_time): the CPU at the measured time per
     // decode expert, of which the up/gate share may start once an expert's first two roles are in; the tier's
@@ -4549,25 +4582,39 @@ extern "C" void kimi_cpu_sink_cache_get_stats(struct kimi_cpu_sink * sink, kimi_
     *stats = sink->cache.stats;
 }
 
-extern "C" bool kimi_cpu_sink_cache_make_room(struct kimi_cpu_sink * sink, uint64_t host_bytes, uint64_t device_bytes) {
-    if (!sink) {
-        // Before the first graph creates the sink: the ledger alone, from this process's environment and /proc.
-        try {
-            kimi_host_ledger ledger;
-            ledger.configure(sink_unified_memory());
-            const uint64_t extra = ledger.dram_bytes(host_bytes, device_bytes);
-            if (!extra) { return true; }
-            ledger.update_file_reserve();
-            return ledger.measure(extra, true).fits();
-        } catch (const std::exception & e) {
-            std::fprintf(stderr, "[kimi_host_ledger] make_room failed: %s\n", e.what());
-            return false;
-        }
+// Before the first graph creates the sink: the ledger alone, from this process's environment and /proc.
+static bool sink_ledger_room(uint64_t pages, uint64_t host_bytes, uint64_t device_bytes) {
+    try {
+        kimi_host_ledger ledger;
+        ledger.configure(sink_unified_memory());
+        ledger.prefill_pages = pages;
+        const uint64_t extra = ledger.dram_bytes(host_bytes, device_bytes);
+        if (!extra && !pages) { return true; }
+        ledger.update_file_reserve();
+        return ledger.measure(extra, true).fits();
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "[kimi_host_ledger] make_room failed: %s\n", e.what());
+        return false;
     }
+}
+
+extern "C" bool kimi_cpu_sink_cache_make_room(struct kimi_cpu_sink * sink, uint64_t host_bytes, uint64_t device_bytes) {
+    if (!sink) { return sink_ledger_room(0, host_bytes, device_bytes); }
     std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try { return sink->make_room(host_bytes, device_bytes); }
     catch (const std::exception & e) {
         std::fprintf(stderr, "[kimi_cpu_sink_cache] make_room failed: %s\n", e.what());
+        return false;
+    }
+}
+
+extern "C" bool kimi_cpu_sink_cache_prefill_room(struct kimi_cpu_sink * sink, uint64_t pages, uint64_t host_bytes,
+        uint64_t device_bytes) {
+    if (!sink) { return sink_ledger_room(pages, host_bytes, device_bytes); }
+    std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    try { return sink->prefill_room(pages, host_bytes, device_bytes); }
+    catch (const std::exception & e) {
+        std::fprintf(stderr, "[kimi_cpu_sink_cache] prefill_room failed: %s\n", e.what());
         return false;
     }
 }
@@ -4885,6 +4932,7 @@ extern "C" void kimi_cpu_sink_cache_get_stats(struct kimi_cpu_sink *, kimi_cpu_s
     if (stats) { *stats = {}; }
 }
 extern "C" bool kimi_cpu_sink_cache_make_room(struct kimi_cpu_sink *, uint64_t, uint64_t) { return false; }
+extern "C" bool kimi_cpu_sink_cache_prefill_room(struct kimi_cpu_sink *, uint64_t, uint64_t, uint64_t) { return false; }
 extern "C" bool kimi_cpu_sink_run(
         struct kimi_cpu_sink *, const struct ggml_tensor *, const struct ggml_tensor *, const struct ggml_tensor *,
         const float *, const int32_t *, const float *, int, float, float, float *,

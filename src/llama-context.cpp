@@ -6,6 +6,7 @@
 #include "llama-batch.h"
 #include "llama-cpu-sink.h"
 #include "llama-deepseek4-hot.h"
+#include "llama-host-gather.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -1875,15 +1876,28 @@ void llama_context::sched_reserve() {
     // the same host memory as the expert caches; measure them first and let the host-memory ledger make room
     // instead of the cgroup or the kernel killing the process. The device buffers are allocated first: on a
     // unified-memory GPU they come out of the same DRAM, so the ledger counts them there too, and neither
-    // allocation can take the room made for the other.
+    // allocation can take the room made for the other. A prefill's graph also gathers rows of weights the file
+    // mapping backs (token embeddings, Engram tables): their pages come into the page cache while it runs, and the
+    // ledger holds room for them from here to the first decode token, so that the expert caches give back what the
+    // prefill needs at once, before it allocates anything.
     if (cpu_sink_runtime && (cpu_sink_runtime->cache_budget || cpu_sink_runtime->vram_budget) && !model.hparams.no_alloc) {
         std::vector<size_t> sizes(backend_ptrs.size(), 0);
-        graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), true, sizes.data());
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), true, sizes.data());
         size_t host_bytes = 0, device_bytes = 0;
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             (ggml_backend_buft_is_host(backend_buft[i]) ? host_bytes : device_bytes) += sizes[i];
         }
-        if (host_bytes + device_bytes > 0 && !cpu_sink_runtime->make_room(host_bytes, device_bytes)) {
+        const bool prefill = n_tokens > n_seqs && !(cpu_sink_enabled && cpu_sink_decode_active);
+        if (prefill) {
+            const uint64_t pages = gf ? llama_host_gather_bytes(gf, llama_host_page_size(),
+                [&](const ggml_tensor * t) { return model.file_mapped(t); }) : 0;
+            LLAMA_LOG_INFO("[prefill_room] n_tokens=%u gather_bytes=%" PRIu64 " host_bytes=%zu device_bytes=%zu\n",
+                n_tokens, pages, host_bytes, device_bytes);
+            if (!cpu_sink_runtime->prefill_room(pages, host_bytes, device_bytes)) {
+                LLAMA_LOG_WARN("%s: the host-memory ledger found no room for a prefill: %.2f MiB of gathered pages, %.2f MiB of host and %.2f MiB of device compute buffers\n",
+                    __func__, pages/1024.0/1024.0, host_bytes/1024.0/1024.0, device_bytes/1024.0/1024.0);
+            }
+        } else if (host_bytes + device_bytes > 0 && !cpu_sink_runtime->make_room(host_bytes, device_bytes)) {
             LLAMA_LOG_WARN("%s: the host-memory ledger found no room for %.2f MiB of host and %.2f MiB of device compute buffers\n",
                 __func__, host_bytes/1024.0/1024.0, device_bytes/1024.0/1024.0);
         }

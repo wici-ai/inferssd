@@ -27,6 +27,14 @@
 // kernel boosts them after fragmenting allocations by up to 1.5 times the high watermark (kimi-memory-boost.h).
 // Whoever takes memory up to the floor (the tier's growth, an allocation outside the caches) counts MemAvailable as
 // it reads at the full boost, so that the boost coming back cannot take MemAvailable under the floor.
+//
+// A prefill reads rows of weights by index straight from the model's file mapping (token embeddings, DeepSeek-V4.1's
+// Engram tables): their pages come into the page cache while it runs, charged to the cgroup, and they must stay there
+// until the layer that reads them has run. File pages count as room (CACHE_RECLAIMABLE_FILE, MemAvailable), so nothing
+// kept room for them: in a full cgroup the kernel took the rows read ahead back before they were used, and the prefill
+// read them again one synchronous fault at a time. The prefill's graph prices them (prefill_pages) before it runs; both
+// terms hold that room from then until the first decode token, so the RAM cache gives it back at once at the prefill's
+// start and takes it back at the first decode token.
 #include "../kimi-memory-boost.h"
 #include <algorithm>
 #include <cstdint>
@@ -100,6 +108,8 @@ struct kimi_host_ledger {
     uint64_t reserve = 2ull << 30;  // the cgroup term's headroom
     uint64_t margin = 2ull << 30;   // the floor's headroom for untracked growth
     uint64_t explicit_reserve = 0;
+    // The open prefill's file pages (the weight rows its graph gathers), held in both terms until the first decode.
+    uint64_t prefill_pages = 0;
     uint64_t file_reserve = 0, refaults = 0, page_size = 4096, file_updates = 0;
     bool file_measured = false;
     // Host memory make_room has granted so far (callers allocate it right after), for the margin's intervals.
@@ -207,8 +217,9 @@ struct kimi_host_ledger {
         bytes -= headroom;
         return true;
     }
-    // cgroup term: every finite memory.max ancestor must keep the reserve free after `extra`. Unreadable controller
-    // files below the root disable the term (and with it RAM cache admission) conservatively.
+    // cgroup term: every finite memory.max ancestor must keep the reserve and the open prefill's pages free after
+    // `extra`. Unreadable controller files below the root disable the term (and with it RAM cache admission)
+    // conservatively.
     void cgroup_term(uint64_t extra, room & r) const {
         if (cgroup.empty()) { return; }
         const size_t root = std::strlen("/sys/fs/cgroup");
@@ -224,15 +235,19 @@ struct kimi_host_ledger {
                 bounded = true;
                 uint64_t limit = 0, used = 0;
                 if (!decimal(maximum, limit) || !get(path + "/memory.current", text) || !decimal(first_token(text), used)) { return; }
-                if (reclaimable_file) {
+                if (reclaimable_file || prefill_pages) {
                     // File-backed page cache is reclaimable before anonymous memory (dirty pages may first need
-                    // writeback). Both LRU lists count as headroom; unreadable stats fail closed.
+                    // writeback). With CACHE_RECLAIMABLE_FILE both LRU lists count as headroom, and the open prefill's
+                    // pages are required beside the reserve whether they have come in yet or not. Without it file
+                    // pages are use, except up to the prefill's pages: those are the ones it holds room for (or
+                    // pages the kernel takes back to make that room), not more use. Unreadable stats fail closed.
                     uint64_t active = 0, inactive = 0;
                     if (!get(path + "/memory.stat", text) || !field(text, "active_file", active) ||
                             !field(text, "inactive_file", inactive)) { return; }
-                    used -= std::min(used, add(active, inactive));
+                    const uint64_t file = add(active, inactive);
+                    used -= std::min(used, reclaimable_file ? file : std::min(file, prefill_pages));
                 }
-                const uint64_t required = add(reserve, extra);
+                const uint64_t required = add(add(reserve, prefill_pages), extra);
                 uint64_t deficit = 0;
                 if (used >= limit) { deficit = add(used - limit, required); }
                 else if (required > limit - used) { deficit = required - (limit - used); }
@@ -256,14 +271,15 @@ struct kimi_host_ledger {
     }
     // full_boost: the system term counts MemAvailable at the full watermark boost, for memory about to be taken up
     // to the floor (make_room). The RAM cache's per-layer guard reads MemAvailable as it is: it commits only the
-    // slots whose room the tier keeps free as the cache's demand, with the boost headroom beside it.
+    // slots whose room the tier keeps free as the cache's demand, with the boost headroom beside it. MemAvailable
+    // counts page cache as available, so the open prefill's pages are required beside the floor, as in the cgroup term.
     room measure(uint64_t extra, bool full_boost = false) const {
         room r;
         cgroup_term(extra, r);
         if (full_boost ? memory_available_at_full_boost(r.available, r.boost_headroom) : memory_available(r.available)) {
             r.system = true;
             r.floor = floor();
-            const uint64_t need = add(r.floor, extra);
+            const uint64_t need = add(add(r.floor, prefill_pages), extra);
             r.system_shortage = need > r.available ? need - r.available : 0;
             r.system_surplus = r.available > need ? r.available - need : 0;
         }
@@ -310,14 +326,14 @@ struct kimi_host_ledger {
     // Room for `extra` bytes the caller is about to allocate outside the expert caches, MemAvailable counted at the
     // full watermark boost. A tier block on unified memory is system memory the cgroup does not see, so it relieves
     // only the system term; it is taken first because the tier grows back into memory that is free again at a later
-    // decode token, while a RAM cache slot given back stays disabled until the cache is reset (or, given back by the
-    // first prefill of an arena made at load, until the first decode token takes back what the room allows). The RAM
-    // cache relieves both terms.
+    // decode token, while a RAM cache slot given back stays disabled until the first decode token after the prefill
+    // takes back what the room allows then. The RAM cache relieves both terms. The tier keeps the open prefill's pages
+    // free beside the allocation.
     room make_room(uint64_t extra, const actions & a) {
         room r = measure(extra, true);
         if (!r.fits() && r.system_shortage && unified && a.reclaim_tier) {
             if (a.collect_deferred) { a.collect_deferred(); }
-            a.reclaim_tier(extra);
+            a.reclaim_tier(add(extra, prefill_pages));
             r = measure(extra, true);
         }
         if (!r.fits() && a.reclaim_cache) {

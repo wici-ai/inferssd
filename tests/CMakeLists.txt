@@ -141,6 +141,13 @@ target_include_directories(test-kimi-prefill-cost PRIVATE ../ggml/src/ggml-cpu)
 add_test(NAME kimi_prefill_cost COMMAND test-kimi-prefill-cost)
 set_property(TEST kimi_prefill_cost PROPERTY LABELS main)
 
+add_executable(test-kimi-host-gather test-kimi-host-gather.cpp)
+target_compile_features(test-kimi-host-gather PRIVATE cxx_std_17)
+target_include_directories(test-kimi-host-gather PRIVATE ../src)
+target_link_libraries(test-kimi-host-gather PRIVATE ggml-base)
+add_test(NAME kimi_host_gather COMMAND test-kimi-host-gather)
+set_property(TEST kimi_host_gather PROPERTY LABELS main)
+
 add_executable(test-kimi-host-lock test-kimi-host-lock.cpp)
 target_compile_features(test-kimi-host-lock PRIVATE cxx_std_17)
 target_include_directories(test-kimi-host-lock PRIVATE ../ggml/src/ggml-cpu)

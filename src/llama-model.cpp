@@ -9265,6 +9265,22 @@ std::string llama_model::arch_name() const {
     return llm_arch_name(arch);
 }
 
+bool llama_model::file_mapped(const ggml_tensor * t) const {
+    if (!t || !t->data) {
+        return false;
+    }
+    const uintptr_t p = (uintptr_t) t->data;
+    for (const auto & mapping : pimpl->mappings) {
+        if (mapping && mapping->addr()) {
+            const uintptr_t base = (uintptr_t) mapping->addr();
+            if (p >= base && p - base < mapping->size()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void llama_model::drop_expert_mmap_pages_after_prompt() const {
     const char * expert_env = std::getenv("LLAMA_DROP_EXPERT_MMAP_AFTER_PROMPT");
     const char * dense_env  = std::getenv("LLAMA_DROP_DENSE_MMAP_AFTER_PROMPT");
