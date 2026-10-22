@@ -87,6 +87,12 @@ slices. Run it with `python3 tests/test-mac-expert-source.py build-mac/bin/test-
 It is model-free and supports ASan/UBSan and TSan builds. Launcher and metadata
 validation tests run with `python3 -m pytest -q tests/test-macos-launcher.py`.
 
+On Apple Silicon, `mac_expert_operator_*` executes the production CPU source hook
+for 256/384 experts, 1/32/512 token rows, F32/Q8_0 weights, and read depths 0/2/4.
+Each case compares both broadcast and per-route inputs against a resident graph,
+then zeroes the resident weights before the alias computation. All output bytes
+must match, so a bypassed source hook cannot pass accidentally.
+
 The Mac CI build enables Metal, runs that portable cache test, exercises Muse
 rendering with `test-chat --template muse-spark`, and checks the Q4_K/Q5_K/Q8_0
 CPU `MUL_MAT_ID` cases. This is a compilation and synthetic correctness gate.
