@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Small deterministic fixtures; never reads real model weights."""
 import os
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -11,13 +12,13 @@ binary = Path(sys.argv[1]).resolve()
 with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
     root = Path(directory)
     shards = []
-    for index, size in enumerate((22001, 9012)):
+    for index, size in enumerate((1400001, 1300003)):
         data = bytes((i * 17 + index * 23) % 256 for i in range(size))
         path = root / f"shard-{index}.gguf"
         path.write_bytes(data)
         shards.append((path, data))
-    extents = [(0, 33, 8191), (1, 4099, 4913), (0, 21964, 37)]
-    names = ["blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight", "blk.1.ffn_up_exps.weight"]
+    extents = [(0, 33, 614401), (1, 4099, 614401), (0, 700003, 614401), (0, 1399964, 37)]
+    names = ["blk.0.ffn_up_exps.weight"] * 3 + ["blk.1.ffn_up_exps.weight"]
     header = "tensor\texpert_idx\tnbytes\tsource_path\toffset\n"
     rows = []
     args = []
@@ -43,12 +44,15 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
     content[40:40 + len(entries) * 152] = b"".join(entries)
     pack.write_bytes(content)
 
-    def run(source, cache, expected_error=None, both=False, commands=None):
+    def run(source, cache, expected_error=None, both=False, commands=None, depth=0):
         env = os.environ.copy()
         env.pop("GGML_MOE_EXPERT_GGUF_ALIAS_TSV", None)
         env.pop("SSD_LLAMA_MAC_EXPERT_PACK", None)
         env.pop("SSD_LLAMA_MAC_EXPERT_TRACE", None)
         env["SSD_LLAMA_MAC_EXPERT_CACHE_MIB"] = str(cache)
+        env["SSD_LLAMA_MAC_EXPERT_READ_AHEAD"] = str(depth)
+        if depth == 4:
+            env["SSD_LLAMA_MAC_EXPERT_TRACE"] = str(root / "trace.txt")
         env["GGML_MOE_EXPERT_GGUF_ALIAS_TSV" if source.suffix == ".tsv" else "SSD_LLAMA_MAC_EXPERT_PACK"] = str(source)
         if both:
             env["SSD_LLAMA_MAC_EXPERT_PACK"] = str(pack)
@@ -57,15 +61,20 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
             assert result.returncode != 0 and expected_error in result.stderr, (source, result.returncode, result.stderr)
         else:
             assert result.returncode == 0, (source, result.returncode, result.stderr)
+            stats = dict(re.findall(r"([a-z_]+)=([0-9.]+)", result.stderr.split("reason=shutdown", 1)[-1]))
+            assert int(stats.get("peak_staging_bytes", "0")) <= 64 * 1024**2
+            return {key: int(stats[key]) for key in ("requests", "hits", "misses", "read_requests", "read_bytes", "evictions")}
 
     for source in (pack, alias):
         for cache in (0, 1):
-            run(source, cache)
+            reference = run(source, cache, depth=0)
+            for depth in (1, 2, 4):
+                assert run(source, cache, depth=depth) == reference, (source, cache, depth)
     bad = root / "bad.tsv"
     for body, message in [
         (header + "".join(rows) + rows[0], "duplicate"),
-        (header + rows[0].replace("\t33\n", "\t22001\n"), "exceeds source"),
-        (header + rows[0].replace("\t8191\t", "\t-1\t"), "unsigned integer"),
+        (header + rows[0].replace("\t33\n", "\t1400001\n"), "exceeds source"),
+        (header + rows[0].replace("\t614401\t", "\t-1\t"), "unsigned integer"),
         ("bad header\n" + rows[0], "header"),
         (header, "invalid expert alias index"),
     ]:
@@ -75,4 +84,4 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
     run(alias, 1, "short/failed expert-pack read", commands=args[:4] + ["--truncate", str(shards[1][0])] + args[4:8])
     pack.write_bytes(content[:-4090])
     run(pack, 1, "invalid expert-pack index")
-print("12 source, bounds, short-read, duplicate, pin and cache cases passed")
+print("24 source, pipeline, bounds, short-read, duplicate, pin and cache cases passed")

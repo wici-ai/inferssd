@@ -5082,6 +5082,13 @@ cpu_fallback:
     const uint64_t moe_fallback_reason_start = (moe_fallback_reason_profile && ith == 0) ? ggml_time_us() : 0;
     const uint64_t ds4_sparse_fused_mmvq_fallback_start =
         (ds4_sparse_fused_mmvq_membership && ith == 0) ? ggml_time_us() : 0;
+#if defined(__APPLE__)
+    void * mac_read_batch = NULL;
+    if (mac_pack_source && ith == 0) {
+        mac_read_batch = ggml_mac_expert_pack_begin_batch(src0->name, matrix_row_counts, n_as, (size_t) ne01 * nb01);
+    }
+    uint64_t mac_compute_start = 0, mac_compute_us = 0, mac_barrier_start = 0, mac_barrier_us = 0;
+#endif
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
         if (cne1 == 0) {
@@ -5091,9 +5098,14 @@ cpu_fallback:
         if (mac_pack_source) {
             if (ith == 0) {
                 fallback_pack_mmap_ptrs[cur_a] =
-                    ggml_mac_expert_pack_acquire(src0->name, cur_a, (size_t) ne01 * nb01);
+                    ggml_mac_expert_pack_acquire_batch(mac_read_batch, src0->name, cur_a, (size_t) ne01 * nb01);
+                mac_barrier_start = ggml_time_us();
             }
             ggml_barrier(params->threadpool);
+            if (ith == 0) {
+                mac_barrier_us = ggml_time_us() - mac_barrier_start;
+                mac_compute_start = ggml_time_us();
+            }
         }
 #endif
         // printf("k=");
@@ -5274,15 +5286,28 @@ cpu_fallback:
         }
 #if defined(__APPLE__)
         if (mac_pack_source) {
-            ggml_barrier(params->threadpool);
             if (ith == 0) {
-                ggml_mac_expert_pack_release(fallback_pack_mmap_ptrs[cur_a]);
-                fallback_pack_mmap_ptrs[cur_a] = NULL;
+                mac_barrier_start = ggml_time_us();
+                mac_compute_us = mac_barrier_start - mac_compute_start;
             }
             ggml_barrier(params->threadpool);
+            if (ith == 0) {
+                mac_barrier_us += ggml_time_us() - mac_barrier_start;
+                ggml_mac_expert_pack_release(fallback_pack_mmap_ptrs[cur_a]);
+                fallback_pack_mmap_ptrs[cur_a] = NULL;
+                mac_barrier_start = ggml_time_us();
+            }
+            ggml_barrier(params->threadpool);
+            if (ith == 0) {
+                mac_barrier_us += ggml_time_us() - mac_barrier_start;
+                ggml_mac_expert_pack_record_compute(mac_compute_us, mac_barrier_us);
+            }
         }
 #endif
     }
+#if defined(__APPLE__)
+    if (mac_pack_source && ith == 0) { ggml_mac_expert_pack_end_batch(mac_read_batch); }
+#endif
 
     if (moe_fallback_reason_profile && ith == 0) {
         const uint64_t moe_fallback_reason_us = ggml_time_us() - moe_fallback_reason_start;
