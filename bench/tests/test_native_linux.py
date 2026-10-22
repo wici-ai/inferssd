@@ -11,6 +11,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import native_linux as linux
 
 
+@pytest.mark.parametrize("limits,minimum", [( (4096, 8192), 4096), ((0, 0), 0),
+                                            ((linux.resource.RLIM_INFINITY, linux.resource.RLIM_INFINITY), 1 << 40)])
+def test_memlock_finite_zero_and_unlimited_are_explicit(monkeypatch, limits, minimum):
+    monkeypatch.setattr(linux.resource, "getrlimit", lambda kind: limits if kind == linux.resource.RLIMIT_MEMLOCK else None)
+    receipt = linux.memlock_limits(minimum)
+    assert (receipt["soft"], receipt["hard"]) == limits
+    rendered = ["unlimited" if value == linux.resource.RLIM_INFINITY else str(value) for value in limits]
+    linux.check_server_memlock("Max locked memory    " + "    ".join(rendered) + "    bytes\n", receipt)
+
+
+def test_insufficient_soft_memlock_cannot_use_larger_hard_limit(monkeypatch):
+    monkeypatch.setattr(linux.resource, "getrlimit", lambda _kind: (4096, linux.resource.RLIM_INFINITY))
+    with pytest.raises(ValueError, match="soft limit"):
+        linux.memlock_limits(4097)
+
+
+@pytest.mark.parametrize("row", ["Max locked memory 2048 8192 bytes\n", "Max locked memory 4096 16384 bytes\n",
+                                  "Max locked memory 4096 8192 kB\n", "missing"])
+def test_server_memlock_must_prove_exact_inheritance(row):
+    with pytest.raises(ValueError):
+        linux.check_server_memlock(row, {"soft": 4096, "hard": 8192, "minimum_bytes": 4096})
+
+
 def cgroup_fixture(tmp_path):
     mount, proc = tmp_path / "cgroup", tmp_path / "proc"
     scope = mount / "example.scope"

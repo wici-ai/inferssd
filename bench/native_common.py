@@ -155,6 +155,8 @@ def validate_profile(profile):
     resources = profile["resources"]
     for key in ("memory_budget_bytes", "host_reserve_bytes", "minimum_cpus"):
         positive(resources.get(key), key)
+    if profile["platform"] == "linux":
+        positive(resources.get("minimum_memlock_bytes"), "minimum_memlock_bytes", 0)
     if profile["platform"] == "macos":
         for key in ("max_compressor_growth_bytes", "max_swap_growth_bytes"):
             positive(resources.get(key), key, 0)
