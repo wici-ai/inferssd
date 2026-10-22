@@ -10,13 +10,30 @@ from pathlib import Path
 import socket
 import struct
 import tempfile
+import sys
+
+
+def peer_identity(connection):
+    if sys.platform == 'darwin':
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        getpeereid = libc.getpeereid
+        getpeereid.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)]
+        getpeereid.restype = ctypes.c_int
+        uid, gid = ctypes.c_uint(), ctypes.c_uint()
+        if getpeereid(connection.fileno(), ctypes.byref(uid), ctypes.byref(gid)):
+            raise OSError(ctypes.get_errno(), 'getpeereid failed')
+        # Darwin SOL_LOCAL / LOCAL_PEERPID: kernel supplied peer process ID.
+        pid = connection.getsockopt(0, 2)
+        return pid, uid.value, gid.value
+    return struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
 
 
 class LeaseServer:
-    def __init__(self, lock_fd, unit):
+    def __init__(self, lock_fd, unit=None):
         self.lock_fd = lock_fd
         self.unit = unit
-        self.directory = tempfile.TemporaryDirectory(prefix='ssdash-c0-lease-', dir='/tmp')
+        self.directory = tempfile.TemporaryDirectory(prefix='ssdash-native-lease-', dir='/tmp')
         self.path = str(Path(self.directory.name) / 'lease.sock')
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(self.path)
@@ -24,6 +41,7 @@ class LeaseServer:
         self.listener.setblocking(False)
         self.connection = None
         self.peer = None
+        self.expected_pid = None
     def poll(self):
         if self.connection is not None:
             return
@@ -32,12 +50,16 @@ class LeaseServer:
         except BlockingIOError:
             return
         try:
-            pid, uid, gid = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+            pid, uid, gid = peer_identity(connection)
             if uid != os.getuid():
                 raise RuntimeError('lock lease requested by foreign uid')
-            group = Path(f'/proc/{pid}/cgroup').read_text()
-            if not group.strip().endswith('/' + self.unit):
-                raise RuntimeError('lock lease peer is not in the exact owned scope')
+            group = None
+            if self.unit is not None:
+                group = Path(f'/proc/{pid}/cgroup').read_text()
+                if not group.strip().endswith('/' + self.unit):
+                    raise RuntimeError('lock lease peer is not in the exact owned scope')
+            elif pid != self.expected_pid:
+                raise RuntimeError('lock lease peer is not the exact owned worker')
             # Parent was already holding flock before creating the scope.
             # SCM_RIGHTS duplicates that open-file-description in the worker.
             sent = connection.sendmsg([b'L'], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array('i', [self.lock_fd]))])
@@ -56,7 +78,7 @@ class LeaseServer:
 
 
 class Lease:
-    def __init__(self, path, lock_path):
+    def __init__(self, path, lock_path=None, expected_identity=None):
         self.connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.fd = None
         try:
@@ -72,8 +94,11 @@ class Lease:
                     os.close(fd)
                 raise RuntimeError('invalid lock lease transfer')
             self.fd = descriptors[0]
-            got, expected = os.fstat(self.fd), Path(lock_path).stat()
-            if (got.st_dev, got.st_ino) != (expected.st_dev, expected.st_ino):
+            got = os.fstat(self.fd)
+            if expected_identity is None:
+                expected = Path(lock_path).stat()
+                expected_identity = (expected.st_dev, expected.st_ino)
+            if (got.st_dev, got.st_ino) != expected_identity:
                 raise RuntimeError('lock lease inode differs')
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.connection.setblocking(False)

@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import signal
 import sys
 import time
 
@@ -80,3 +81,130 @@ def test_native_mac_pid_listener_and_same_lock_fd_with_harmless_child(tmp_path):
             if child.poll() is None:
                 child.kill()
                 child.wait()
+
+
+def wait_for(predicate, seconds=8):
+    until = time.monotonic() + seconds
+    while not predicate():
+        if time.monotonic() > until:
+            raise AssertionError("harmless guardian fixture deadline")
+        time.sleep(.02)
+
+
+def lock_available(path):
+    with path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+
+def guardian_fixture(tmp_path, mode):
+    worker = tmp_path / "worker.py"
+    worker.write_text('''import argparse,json,os,signal,subprocess,sys,time
+from pathlib import Path
+import native_common as common
+from native_lease import Lease
+p=argparse.ArgumentParser()
+for arg in ("socket", "lock-dev", "lock-ino", "mode", "out"): p.add_argument("--"+arg,required=True)
+a=p.parse_args(); out=Path(a.out)
+lease=Lease(a.socket,expected_identity=(int(a.lock_dev),int(a.lock_ino)))
+child=None; failed=False
+try:
+ if a.mode != "unknown":
+  code="import signal,time; from pathlib import Path; signal.signal(signal.SIGTERM,lambda *_:(Path("+repr(str(out / "stopping"))+ ").touch(),time.sleep(.6),exit(0))); time.sleep(60)"
+  child=subprocess.Popen([sys.executable,"-c",code],start_new_session=True,pass_fds=(lease.fd,))
+  time.sleep(.15)
+ (out/"active.json").write_text(json.dumps({"worker":os.getpid(),"child":child.pid if child else None}))
+ start=time.monotonic()
+ while a.mode != "normal" or time.monotonic()-start < .15:
+  lease.check(); time.sleep(.02)
+except InterruptedError:
+ failed=True
+finally:
+ gone=True
+ if child is not None: gone=common.stop_owned(child,2)["group_gone"]
+ common.save(out/"receipt.json",{"status":"failed" if failed else "passed","server":{"owned_processes_gone":gone,"resource_scope_gone":True},"evidence":[]})
+ lease.close()
+sys.exit(1 if failed else 0)
+''')
+    bench = str(Path(__file__).resolve().parents[1])
+    code = '''import fcntl,os,sys
+from pathlib import Path
+import native_macos as mac
+out=Path(sys.argv[1]); lock=(out/"device.lock").open("a+")
+fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+env=dict(os.environ,SSDASH_RUN_DIR=str(out),SSDASH_WRAPPER_RECEIPT=str(out/"receipt.json"))
+sys.exit(mac.guard_worker([sys.executable,sys.argv[2],"--out",str(out),"--mode",sys.argv[3]],env,lock.fileno(),20))
+'''
+    env = dict(os.environ, PYTHONPATH=bench)
+    return subprocess.Popen([sys.executable, "-c", code, str(tmp_path), str(worker), mode],
+                            env=env, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def test_guardian_normal_cleanup_releases_same_lease(tmp_path):
+    controller = guardian_fixture(tmp_path, "normal")
+    try:
+        assert controller.wait(timeout=8) == 0, controller.stderr.read().decode()
+        assert lock_available(tmp_path / "device.lock")
+        assert mac.cleanup_confirmed(tmp_path / "receipt.json")
+        receipt = json.loads((tmp_path / "receipt.json").read_text())
+        assert receipt["status"] == "passed"
+        assert json.loads((tmp_path / "guardian-cleanup.json").read_text())["worker_group_gone"]
+    finally:
+        if controller.poll() is None:
+            controller.kill(); controller.wait()
+
+
+def test_controller_sigkill_worker_cleans_child_before_lock_release(tmp_path):
+    controller = guardian_fixture(tmp_path, "disconnect")
+    identities = None
+    try:
+        wait_for(lambda: (tmp_path / "active.json").exists())
+        identities = json.loads((tmp_path / "active.json").read_text())
+        controller.kill(); controller.wait()
+        wait_for(lambda: (tmp_path / "stopping").exists())
+        assert not lock_available(tmp_path / "device.lock")
+        wait_for(lambda: lock_available(tmp_path / "device.lock"))
+        assert mac.cleanup_confirmed(tmp_path / "receipt.json")
+        assert json.loads((tmp_path / "receipt.json").read_text())["status"] == "failed"
+        with pytest.raises(ProcessLookupError):
+            os.kill(identities["child"], 0)
+    finally:
+        if controller.poll() is None:
+            controller.kill(); controller.wait()
+        if identities:
+            for pid in identities.values():
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+def test_worker_death_quarantines_controller_and_retains_lock(tmp_path):
+    controller = guardian_fixture(tmp_path, "unknown")
+    worker = None
+    try:
+        wait_for(lambda: (tmp_path / "active.json").exists())
+        active = json.loads((tmp_path / "active.json").read_text())
+        assert active["child"] is None  # This negative fixture starts no child.
+        worker = active["worker"]
+        os.kill(worker, signal.SIGKILL)
+        wait_for(lambda: (tmp_path / "guardian-quarantine.json").exists())
+        assert controller.poll() is None and not lock_available(tmp_path / "device.lock")
+        # Fixture simulates a separately verified empty state after the unknown
+        # state has already made this arm fail; this cannot turn it into a pass.
+        common.save(tmp_path / "receipt.json", {"status": "passed", "server": {
+                    "owned_processes_gone": True, "resource_scope_gone": True}, "evidence": []})
+        assert controller.wait(timeout=5) == 1
+        assert lock_available(tmp_path / "device.lock")
+        assert json.loads((tmp_path / "receipt.json").read_text())["status"] == "failed"
+    finally:
+        if worker:
+            try:
+                os.kill(worker, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if controller.poll() is None:
+            controller.kill(); controller.wait()

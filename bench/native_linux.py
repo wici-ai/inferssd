@@ -130,6 +130,13 @@ class LinuxRuntime:
         held, inherited = Path(f"/proc/{pid}/fd/{lock_fd}").stat(), os.fstat(lock_fd)
         if (held.st_dev, held.st_ino) != (inherited.st_dev, inherited.st_ino):
             raise ValueError("server did not inherit the device lock")
+        raw = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        actual = dict(item.decode().split("=", 1) for item in raw if b"=" in item)
+        expected = common.clean_environment(self.profile)
+        if any(actual.get(key) != value for key, value in expected.items()):
+            raise ValueError("server environment differs from the reviewed launch")
+        common.save(self.out / "effective-environment.json", {key: actual[key] for key in expected
+                    if key in self.profile["environment"] or key == "LD_LIBRARY_PATH"})
 
     def confirm_port(self, pid, port):
         sockets = set()
@@ -170,7 +177,7 @@ class LinuxRuntime:
                              ("model name", "vendor_id", "Hardware", "CPU implementer", "CPU architecture", "CPU part", "Features", "flags")})
         return {"hardware": json.dumps({"cpu": stable_cpu, "gpu": host.get("gpu"), "affinity": host["affinity"]}, sort_keys=True),
                 "os": " ".join(host["uname"]), "memory_budget_bytes": self.profile["resources"]["memory_budget_bytes"],
-                "resource_checks_passed": True, "effective_settings": self.profile["effective_settings"],
+                "resource_checks_passed": True, "effective_settings": common.effective_settings(self.profile),
                 "budget_enforcement": "cgroup v2 hard memory.max, zero swap; GPU allocations are not claimed to be fully charged",
                 "os_page_cache_treatment": "none; OS cache state uncontrolled"}
 
@@ -186,7 +193,7 @@ class LinuxRuntime:
         return False  # Only the controller can verify this worker's scope is gone.
 
     def evidence_paths(self):
-        return [x for x in self.out.iterdir() if x.name.startswith(("linux-host", "cgroup-", "memory-samples", "images-"))]
+        return [x for x in self.out.iterdir() if x.name.startswith(("linux-host", "cgroup-", "memory-samples", "images-", "effective-environment"))]
 
 
 def systemctl(*args):

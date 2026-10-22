@@ -1,7 +1,9 @@
 import copy
 import json
+import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -72,3 +74,71 @@ def test_process_identity_uses_start_ticks_and_exe(monkeypatch):
     monkeypatch.setattr(Path, "resolve", lambda path, **_kwargs: Path("/reviewed/server"))
     identity = json.loads(linux.LinuxRuntime({}, Path(".")).process_identity(123))
     assert identity == {"pid": 123, "start_ticks": "777", "boot_id": "boot", "exe": "/reviewed/server"}
+
+
+@pytest.mark.parametrize("fault", [None, "foreign", "inode", "missing", "changed"])
+def test_linux_maps_bind_actual_inode_bytes_and_complete_set(tmp_path, monkeypatch, fault):
+    binary, library, foreign = [tmp_path / x for x in ("server", "libggml-base.so", "libkimi-foreign.so")]
+    for path in (binary, library, foreign):
+        path.write_bytes(path.name.encode())
+    identity = linux.common.file_identity
+    specs = [{"path": str(p), "sha256": identity(p, True)["sha256"]} for p in (binary, library)]
+    profile = {"binary": specs[0], "images": specs[1:]}
+    maps = []
+    for path in (binary, library, foreign) if fault == "foreign" else (binary, library):
+        if fault == "missing" and path == library:
+            continue
+        info = path.stat()
+        inode = info.st_ino + (1 if fault == "inode" else 0)
+        maps.append(f"0-1 r-xp 0 {os.major(info.st_dev):x}:{os.minor(info.st_dev):x} {inode} {path}")
+    original = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda p, *a, **kw: "\n".join(maps) if str(p) == "/proc/123/maps" else original(p, *a, **kw))
+    monkeypatch.setattr(linux.common, "file_identity", lambda p, h=False: identity(binary if str(p) == "/proc/123/exe" else p, h))
+    if fault == "changed":
+        library.write_bytes(b"changed")
+    if fault:
+        with pytest.raises(ValueError):
+            linux.mapped_images(123, profile, tmp_path / "receipt")
+    else:
+        assert linux.mapped_images(123, profile, tmp_path / "receipt") == specs[1:]
+
+
+def test_scope_uncertainty_retains_lease_and_invalidates_result(tmp_path, monkeypatch):
+    # The platform operations are mocked; this tests the actual controller's
+    # ordering, not a claim of native systemd support on the test host.
+    receipt_path = tmp_path / "wrapper.json"
+    environment = {"SSDASH_RUN_DIR": str(tmp_path), "SSDASH_WRAPPER_RECEIPT": str(receipt_path),
+                   "SSDASH_REQUEST_TIMEOUT": "10"}
+    profile = {"resources": {"memory_budget_bytes": 4 << 30}, "load_timeout_s": 10}
+    events = []
+    class Lease:
+        path, peer = "mock-socket", {"pid": 321}
+        def __init__(self, fd, unit):
+            events.append(("lease", fd))
+        def close(self):
+            events.append("lease-close")
+    class Process:
+        pid, returncode = 123, 0
+        def __init__(self, *_args, **_kwargs):
+            receipt_path.write_text(json.dumps({"status": "passed", "server": {"owned_processes_gone": True}, "evidence": []}))
+        def poll(self):
+            return 0
+    states = iter((False, True))
+    def state(_unit):
+        gone = next(states)
+        events.append(("scope-gone", gone))
+        return {"gone": gone}
+    monkeypatch.setattr(linux, "sys", SimpleNamespace(platform="linux", executable=sys.executable))
+    monkeypatch.setattr(linux, "LeaseServer", Lease)
+    monkeypatch.setattr(linux.subprocess, "Popen", Process)
+    monkeypatch.setattr(linux, "scope_state", state)
+    monkeypatch.setattr(linux, "systemctl", lambda *_args: {"returncode": 0})
+    monkeypatch.setattr(linux.common, "group_exists", lambda _process: False)
+    monkeypatch.setattr(linux.time, "sleep", lambda _seconds: None)
+    original = Path.resolve
+    monkeypatch.setattr(Path, "resolve", lambda p, *a, **kw: tmp_path / "lock" if str(p).startswith("/proc/self/fd/") else original(p, *a, **kw))
+    assert linux.run_scope(profile, environment, 9) == 1
+    assert events == [("lease", 9), ("scope-gone", False), ("scope-gone", True), "lease-close"]
+    result = json.loads(receipt_path.read_text())
+    assert result["status"] == "failed" and result["server"]["resource_scope_gone"]
+    assert (tmp_path / "quarantine.json").exists()
