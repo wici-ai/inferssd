@@ -720,10 +720,20 @@ struct tier {
         blocks.reserve((max_slots+elastic_block_slots-1)/elastic_block_slots);
         slot_locations.reserve(max_slots);table->reserve_global(max_slots);
     }
+    // The base is what was free at its start less the safety reserve (initial_slots). Device memory keeps moving
+    // after that measure (kernels load on first use, the first decode step's buffers), so a block that does not fit
+    // ends the base at the blocks already allocated, as a decode growth ends, and the watermarks hold the margin
+    // from the next token boundary on. Only a base without a single block fails.
     void allocate_base(){
         while(slot_locations.size()<base_slots){
             const size_t count=std::min(elastic_block_slots,base_slots-slot_locations.size());
-            if(!allocate_block(count,"base"))throw std::runtime_error("elastic VRAM base allocation failed");
+            if(allocate_block(count,"base"))continue;
+            if(blocks.empty())throw std::runtime_error("elastic VRAM base allocation failed");
+            std::fprintf(stderr,"[kimi_vram_elastic] event=base_short planned_slots=%zu slots=%zu blocks=%zu\n",
+                base_slots,slot_locations.size(),blocks.size());
+            base_slots=slot_locations.size();
+            if(table)table->resize_global(base_slots);
+            break;
         }
         register_oom_reclaimer();
     }
