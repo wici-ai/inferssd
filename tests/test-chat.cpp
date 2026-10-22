@@ -2910,6 +2910,52 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect(message_assist_thoughts)
             .run();
 
+        // Preserve the server accumulator contract independently of retired templates.
+        if (g_template_filter.empty() ||
+                std::string("models/templates/deepseek-ai-DeepSeek-V4.1.jinja").find(g_template_filter) != std::string::npos) {
+            auto tmpls = read_templates("models/templates/deepseek-ai-DeepSeek-V4.1.jinja");
+            common_chat_templates_inputs inputs;
+            inputs.messages = { message_user };
+            inputs.enable_thinking = true;
+            inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+            auto parser = make_peg_parser(tmpls.get(), inputs, detailed_debug);
+            common_chat_parser_params parser_params(parser.params_);
+            parser_params.parser.load(parser.params_.parser);
+            parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+
+            const std::string reasoning = "The user requested a short update.";
+            const std::string response = "Updated.";
+            const std::string exact = reasoning + "</think>" + response;
+            const auto expected = simple_assist_msg(response, reasoning);
+            for (const size_t chunk_size : {size_t(1), size_t(7), size_t(31), exact.size()}) {
+                task_result_state state(parser_params);
+                std::string delivered;
+                std::string delivered_reasoning;
+                std::vector<common_chat_msg_diff> diffs;
+                for (size_t pos = 0; pos < exact.size(); pos += chunk_size) {
+                    diffs.clear(); // each production chunk owns a fresh result vector
+                    state.update_chat_msg(exact.substr(pos, chunk_size), true, diffs);
+                    for (const auto & diff : diffs) {
+                        delivered += diff.content_delta;
+                        delivered_reasoning += diff.reasoning_content_delta;
+                    }
+                    assert_equals(true, response.compare(0, delivered.size(), delivered) == 0);
+                    assert_equals(true, reasoning.compare(0, delivered_reasoning.size(), delivered_reasoning) == 0);
+                }
+                assert_equals(response, delivered);
+                assert_equals(reasoning, delivered_reasoning);
+                diffs.clear();
+                assert_msg_equals(expected, state.update_chat_msg("", false, diffs), true);
+                for (const auto & diff : diffs) {
+                    assert_equals(std::string(), diff.content_delta);
+                    assert_equals(std::string(), diff.reasoning_content_delta);
+                }
+            }
+            task_result_state nonstream(parser_params);
+            std::vector<common_chat_msg_diff> diffs;
+            assert_msg_equals(expected, nonstream.update_chat_msg(exact, false, diffs), true);
+        }
+
         // Tool call in chat mode, as the model writes it: the block follows two newlines, integer param
         tst.test(
                "\n\n"
