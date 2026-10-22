@@ -14,6 +14,9 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#if defined(__APPLE__)
+#include "mac-expert-pack-cache.h"
+#endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -4485,6 +4488,11 @@ static void ggml_compute_forward_mul_mat_id_generic(
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
+#if defined(__APPLE__)
+    const bool mac_pack_source = ggml_mac_expert_pack_enabled() &&
+        (n_as == 384 || n_as == 256) && ids->ne[1] == 1 &&
+        strstr(src0->name, ".ffn_") && strstr(src0->name, "_exps.weight");
+#endif
 
     // Select the model adapter before any availability/cache probe can
     // initialize the other model's process-global CUDA state.
@@ -4958,15 +4966,22 @@ cpu_fallback:
 
     if (ith == 0) {
         //会走
-        const char * ds4_handoff_env = getenv("GGML_MOE_STREAM_DS4_TRIPLET_CPU_DOWN_HANDOFF");
-        const bool ds4_handoff_enabled = ds4_handoff_env && ds4_handoff_env[0] && ds4_handoff_env[0] != '0';
-        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-            fallback_pack_mmap_ptrs[cur_a] = NULL;
-            if (ds4_handoff_enabled && matrix_row_counts[cur_a] > 0 &&
-                    ggml_cuda_moe_stream_ds4_triplet_host_role_ptr) {
-                fallback_pack_mmap_ptrs[cur_a] =
-                ggml_cuda_moe_stream_ds4_triplet_host_role_ptr(
-                    src0->name, cur_a, (size_t) ne01 * nb01);
+#if defined(__APPLE__)
+        if (mac_pack_source) {
+            memset(fallback_pack_mmap_ptrs, 0, (size_t) n_as * sizeof(void *));
+        } else
+#endif
+        {
+            const char * ds4_handoff_env = getenv("GGML_MOE_STREAM_DS4_TRIPLET_CPU_DOWN_HANDOFF");
+            const bool ds4_handoff_enabled = ds4_handoff_env && ds4_handoff_env[0] && ds4_handoff_env[0] != '0';
+            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                fallback_pack_mmap_ptrs[cur_a] = NULL;
+                if (ds4_handoff_enabled && matrix_row_counts[cur_a] > 0 &&
+                        ggml_cuda_moe_stream_ds4_triplet_host_role_ptr) {
+                    fallback_pack_mmap_ptrs[cur_a] =
+                    ggml_cuda_moe_stream_ds4_triplet_host_role_ptr(
+                        src0->name, cur_a, (size_t) ne01 * nb01);
+                }
             }
         }
         memset(fallback_touch_us, 0, n_as*sizeof(uint64_t));
@@ -5072,6 +5087,15 @@ cpu_fallback:
         if (cne1 == 0) {
             continue;
         }
+#if defined(__APPLE__)
+        if (mac_pack_source) {
+            if (ith == 0) {
+                fallback_pack_mmap_ptrs[cur_a] =
+                    ggml_mac_expert_pack_acquire(src0->name, cur_a, (size_t) ne01 * nb01);
+            }
+            ggml_barrier(params->threadpool);
+        }
+#endif
         // printf("k=");
         const char * src0_cur = fallback_pack_mmap_ptrs[cur_a] ?
             (const char *) fallback_pack_mmap_ptrs[cur_a] :
@@ -5248,6 +5272,16 @@ cpu_fallback:
             }
             ggml_barrier(params->threadpool);
         }
+#if defined(__APPLE__)
+        if (mac_pack_source) {
+            ggml_barrier(params->threadpool);
+            if (ith == 0) {
+                ggml_mac_expert_pack_release(fallback_pack_mmap_ptrs[cur_a]);
+                fallback_pack_mmap_ptrs[cur_a] = NULL;
+            }
+            ggml_barrier(params->threadpool);
+        }
+#endif
     }
 
     if (moe_fallback_reason_profile && ith == 0) {

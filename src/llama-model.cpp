@@ -9037,6 +9037,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
+        // Muse's dense tensors are interleaved with hundreds of GiB of CPU
+        // experts. A single enclosing Metal mmap would pin those gaps too.
+        // Opt in to compact GPU allocations; load_all_data copies only their
+        // tensors, while CPU expert tensors retain their original mmap.
+#if defined(__APPLE__)
+        const char * compact_env = std::getenv("LLAMA_MAC_COMPACT_METAL");
+        if (arch == LLM_ARCH_MUSE_SPARK && compact_env && std::strcmp(compact_env, "1") == 0 &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                std::strncmp(ggml_backend_dev_name(dev), "MTL", 3) == 0) {
+            buffer_from_host_ptr_supported = false;
+            LLAMA_LOG_INFO("%s: Muse compact Metal allocation enabled for %s\n",
+                    __func__, ggml_backend_buft_name(buft));
+        }
+#endif
         std::vector<ggml_backend_buffer_ptr> bufs;
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);

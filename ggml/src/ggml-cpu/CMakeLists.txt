@@ -63,6 +63,12 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ops.cpp
         )
 
+    if (APPLE)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/mac-expert-pack-cache.cpp
+            ggml-cpu/mac-expert-pack-cache.h)
+    endif()
+
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
 
