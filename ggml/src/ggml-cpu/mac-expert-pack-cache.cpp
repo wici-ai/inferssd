@@ -201,8 +201,10 @@ public:
         char * end = nullptr;
         errno = 0;
         unsigned long long mib = budget_env ? std::strtoull(budget_env, &end, 10) : 4096;
-        if ((budget_env && (errno || end == budget_env || *end)) || mib > 16384) {
-            throw std::runtime_error("SSD_LLAMA_MAC_EXPERT_CACHE_MIB must be 0..16384");
+        if ((budget_env && (errno || end == budget_env || *end ||
+                           std::strspn(budget_env, "0123456789") != std::strlen(budget_env))) ||
+                mib > (std::numeric_limits<size_t>::max() >> 20)) {
+            throw std::runtime_error("SSD_LLAMA_MAC_EXPERT_CACHE_MIB must be a nonnegative MiB value fitting size_t");
         }
         budget = size_t(mib) << 20;
         if (const char * value = std::getenv("SSD_LLAMA_MAC_EXPERT_CACHE_POLICY")) { policy = value; }

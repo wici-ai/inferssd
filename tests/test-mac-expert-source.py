@@ -11,6 +11,7 @@ import tempfile
 
 binary = Path(sys.argv[1]).resolve()
 prefill_only = "--prefill-only" in sys.argv[2:]
+case_count = 0
 with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
     root = Path(directory)
     shards = []
@@ -47,6 +48,8 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
     pack.write_bytes(content)
 
     def run(source, cache, expected_error=None, both=False, commands=None, depth=0, alignment=1, trace=False):
+        global case_count
+        case_count += 1
         env = os.environ.copy()
         env.pop("GGML_MOE_EXPERT_GGUF_ALIAS_TSV", None)
         env.pop("SSD_LLAMA_MAC_EXPERT_PACK", None)
@@ -86,6 +89,9 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
                         commands=["--prefill"] + args + ["--decode"] + args + ["--prefill"] + args + ["--decode"] + args)
             assert mixed["decode_hits"] == reference["decode_hits"] and mixed["evictions"] == reference["evictions"], (source, depth, mixed, reference)
     if not prefill_only:
+        run(alias, 24576)
+        for invalid in (-1, " 1", "1x", 18446744073709551615):
+            run(alias, invalid, "CACHE_MIB must be")
         bad = root / "bad.tsv"
         for body, message in [
             (header + "".join(rows) + rows[0], "duplicate"),
@@ -98,8 +104,22 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
             run(bad, 1, message)
         run(alias, 1, "select one expert source", both=True)
         for alignment in (1, 4096, 16384):
-            shards[1][0].write_bytes(shards[1][1])
-            run(alias, 1, "short/failed expert-pack read", commands=args[:4] + ["--truncate", str(shards[1][0])] + args[4:8], alignment=alignment)
+            for depth in (0, 2):
+                shards[1][0].write_bytes(shards[1][1])
+                run(alias, 1, "short/failed expert-pack read", commands=args[:4] + ["--truncate", str(shards[1][0])] + args[4:8], alignment=alignment, depth=depth)
         pack.write_bytes(content[:-4090])
         run(pack, 1, "invalid expert-pack index")
-print(f"{8 if prefill_only else 66} source, pipeline, alignment, prefill-cache isolation, bounds, short-read, duplicate and pin cases passed")
+
+        # Three 40 MiB slices cannot all fit in the 64 MiB staging budget. Use
+        # sparse zero-filled fixtures so this exercises backpressure cheaply.
+        large = 40 * 1024**2
+        large_source, large_expected, large_alias = (root / name for name in ("large.gguf", "large.expected", "large.tsv"))
+        for path, length in ((large_source, large * 3), (large_expected, large)):
+            with path.open("wb") as output:
+                output.truncate(length)
+        large_alias.write_text(header + "".join(
+            f"blk.0.ffn_up_exps.weight\t{i}\t{large}\t{large_source}\t{i * large}\n" for i in range(3)))
+        large_args = [word for i in range(3) for word in ("blk.0.ffn_up_exps.weight", str(i), str(large), str(large_expected))]
+        reference = run(large_alias, 0, commands=large_args, depth=0)
+        assert run(large_alias, 0, commands=large_args, depth=4) == reference
+print(f"{case_count} source, pipeline, alignment, prefill-cache isolation, bounds, short-read, duplicate and pin cases passed")
