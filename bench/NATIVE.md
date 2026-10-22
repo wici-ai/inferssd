@@ -51,7 +51,8 @@ engine's placement algorithm or prove every engine setting from telemetry.
   "resources": {
     "memory_budget_bytes": 8589934592,
     "host_reserve_bytes": 3221225472,
-    "minimum_cpus": 2
+    "minimum_cpus": 2,
+    "minimum_memlock_bytes": 268435456
   },
   "effective_settings": {
     "context_tokens": 8192,
@@ -94,6 +95,14 @@ The existing lock open-file-description is transferred using `SCM_RIGHTS` to the
 worker, then inherited by server/client. No second lock file is opened to bypass
 an owner. The worker checks effective ancestor limits, OOM counters, CPU affinity,
 host reserve, server scope membership and actual executable/project mappings.
+Linux profiles must explicitly declare `minimum_memlock_bytes`, at least the
+reviewed total staging/pinning requirement. Zero is valid only for a reviewed
+configuration that needs no pinned memory. The worker records its soft/hard
+`RLIMIT_MEMLOCK`, rejects an insufficient soft limit, and checks the server's
+`/proc/PID/limits` inherited values. It never raises a limit. Arrange the required
+limit before calling `run_final.py` (for example with an authorized `prlimit`
+invocation); a systemd scope does not support setting `LimitMEMLOCK` on processes
+that already exist. An unlimited value is recorded explicitly, not as zero.
 Mappings must match every declared path, file device/inode and hash, including
 the portable store or private liburing when present. CUDA driver/system images
 are recorded in raw maps but are outside the project-image hash allowlist.

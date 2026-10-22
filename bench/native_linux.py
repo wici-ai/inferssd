@@ -2,6 +2,8 @@
 import argparse
 import json
 import os
+import re
+import resource
 from pathlib import Path
 import signal
 import subprocess
@@ -13,6 +15,25 @@ import native_common as common
 from native_lease import Lease, LeaseServer
 
 HERE = Path(__file__).resolve().parent
+
+
+def memlock_limits(minimum):
+    soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    if soft != resource.RLIM_INFINITY and soft < minimum:
+        raise ValueError("RLIMIT_MEMLOCK soft limit is below the declared pinned-memory requirement")
+    return {"soft": soft, "hard": hard, "minimum_bytes": minimum,
+            "infinity_value": resource.RLIM_INFINITY}
+
+
+def check_server_memlock(text, expected):
+    match = re.search(r"^Max locked memory\s+(\S+)\s+(\S+)\s+bytes\s*$", text, re.M)
+    if match is None:
+        raise ValueError("server memlock limits unavailable")
+    values = [resource.RLIM_INFINITY if x == "unlimited" else int(x) for x in match.groups()]
+    if values != [expected["soft"], expected["hard"]]:
+        raise ValueError("server did not inherit the reviewed worker memlock limits")
+    if values[0] != resource.RLIM_INFINITY and values[0] < expected["minimum_bytes"]:
+        raise ValueError("server memlock limit is below the declared requirement")
 
 
 def scope_pids(root):
@@ -97,6 +118,7 @@ class LinuxRuntime:
     def __init__(self, profile, out):
         self.profile, self.out = profile, out
         self.before = None
+        self.memlock = None
 
     def prepare(self):
         if sys.platform != "linux":
@@ -108,8 +130,9 @@ class LinuxRuntime:
         allowed = sorted(os.sched_getaffinity(0))
         if len(allowed) < self.profile["resources"]["minimum_cpus"]:
             raise ValueError("insufficient allowed CPUs")
+        self.memlock = memlock_limits(self.profile["resources"]["minimum_memlock_bytes"])
         host = {"uname": list(os.uname()), "affinity": allowed, "cpuinfo": Path("/proc/cpuinfo").read_text(),
-                "meminfo": Path("/proc/meminfo").read_text(), "mountinfo": text}
+                "meminfo": Path("/proc/meminfo").read_text(), "mountinfo": text, "memlock": self.memlock}
         if any(Path(x["path"]).name.startswith("libggml-cuda") for x in self.profile["images"]):
             host["gpu"] = common.command(["nvidia-smi", "--query-gpu=name,uuid,driver_version,memory.total", "--format=csv,noheader"])
         common.save(self.out / "linux-host.json", host)
@@ -130,6 +153,9 @@ class LinuxRuntime:
         held, inherited = Path(f"/proc/{pid}/fd/{lock_fd}").stat(), os.fstat(lock_fd)
         if (held.st_dev, held.st_ino) != (inherited.st_dev, inherited.st_ino):
             raise ValueError("server did not inherit the device lock")
+        limits = Path(f"/proc/{pid}/limits").read_text()
+        (self.out / "server-limits.txt").write_text(limits)
+        check_server_memlock(limits, self.memlock)
         raw = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
         actual = dict(item.decode().split("=", 1) for item in raw if b"=" in item)
         expected = common.clean_environment(self.profile)
@@ -177,7 +203,8 @@ class LinuxRuntime:
                              ("model name", "vendor_id", "Hardware", "CPU implementer", "CPU architecture", "CPU part", "Features", "flags")})
         return {"hardware": json.dumps({"cpu": stable_cpu, "gpu": host.get("gpu"), "affinity": host["affinity"]}, sort_keys=True),
                 "os": " ".join(host["uname"]), "memory_budget_bytes": self.profile["resources"]["memory_budget_bytes"],
-                "resource_checks_passed": True, "effective_settings": common.effective_settings(self.profile),
+                "resource_checks_passed": True, "effective_settings": dict(common.effective_settings(self.profile),
+                                                                            actual_memlock_limits=self.memlock),
                 "budget_enforcement": "cgroup v2 hard memory.max, zero swap; GPU allocations are not claimed to be fully charged",
                 "os_page_cache_treatment": "none; OS cache state uncontrolled"}
 
@@ -193,7 +220,7 @@ class LinuxRuntime:
         return False  # Only the controller can verify this worker's scope is gone.
 
     def evidence_paths(self):
-        return [x for x in self.out.iterdir() if x.name.startswith(("linux-host", "cgroup-", "memory-samples", "images-", "effective-environment"))]
+        return [x for x in self.out.iterdir() if x.name.startswith(("linux-host", "cgroup-", "memory-samples", "images-", "effective-environment", "server-limits"))]
 
 
 def systemctl(*args):
