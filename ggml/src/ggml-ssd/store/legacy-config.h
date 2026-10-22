@@ -1,0 +1,40 @@
+#pragma once
+#include "legacy-index.h"
+
+namespace c0 {
+namespace config_detail {
+#include "config-helpers.inc"
+}
+
+// Keep the legacy initializer's order and distinction between a single path
+// and a colon-separated *_LIST. In particular, overlays require a base PACK.
+inline description description_from_env() {
+    description desc;
+    const char * io = std::getenv("GGML_MOE_IO_BACKEND");
+    if (io && io[0]) {
+        if (std::strcmp(io, "direct") == 0) {
+            desc.io_backend = 1;
+        } else if (std::strcmp(io, "iouring") == 0 || std::strcmp(io, "io_uring") == 0) {
+            desc.io_backend = 2;
+        } else if (std::strcmp(io, "mmap") != 0) {
+            std::fprintf(stderr,
+                "[moe_stream_batch] GGML_MOE_IO_BACKEND=%s requested; runtime supports mmap/buffered, direct, and iouring expert-pack reads\n", io);
+        }
+    }
+    const char * path = std::getenv("GGML_MOE_EXPERT_PACK");
+    if (path && path[0]) {
+        desc.packs.emplace_back(path);
+        for (const char * name : {"GGML_MOE_EXPERT_PACK_OVERLAY", "GGML_MOE_EXPERT_PACK_OVERLAY_EXTRA"}) {
+            const char * overlay = std::getenv(name);
+            if (overlay && overlay[0]) { desc.packs.emplace_back(overlay); }
+        }
+    }
+    config_detail::expert_pack_append_env_list(desc.packs, "GGML_MOE_EXPERT_PACK_LIST");
+    const char * page = std::getenv("GGML_MOE_PAGECACHE_PACK");
+    if (page && page[0]) { desc.page_cache_packs.emplace_back(page); }
+    config_detail::expert_pack_append_env_list(desc.page_cache_packs, "GGML_MOE_PAGECACHE_PACK_LIST");
+    config_detail::expert_pack_append_env_list(desc.aliases, "GGML_MOE_EXPERT_GGUF_ALIAS_TSV");
+    desc.replace_duplicates = config_detail::expert_pack_env_bool("GGML_MOE_EXPERT_PACK_REPLACE_DUPLICATES", false);
+    return desc;
+}
+} // namespace c0

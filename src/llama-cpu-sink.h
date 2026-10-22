@@ -1,5 +1,9 @@
 #pragma once
 
+#if defined(LLAMA_C0_LINKED_STORE_PROTOTYPE)
+#include "store.h"
+#endif
+
 #include "kimi-cpu-sink.h"
 #include "llama-cpu-prefill.h"
 
@@ -263,8 +267,12 @@ struct llama_kimi_cpu_sink_runtime {
         if (!source_size || source_size() != sizeof(kimi_cpu_sink_source)) {
             GGML_ABORT("CPU sink native-range ABI mismatch; rebuild the CPU backend and model together");
         }
+#if defined(LLAMA_C0_LINKED_STORE_PROTOTYPE)
+        resolve = &ggml_ssd_c0_resolve_raw_direct_shape;
+#else
         resolve = reinterpret_cast<resolve_fn>(
             dlsym(RTLD_DEFAULT, "ggml_cuda_moe_expert_pack_resolve_raw_direct_shape"));
+#endif
         // Exported by the same CPU backend library as the registry entries
         // above; looked up like the resolver, leaving the proc-address table as is.
         run_activation = reinterpret_cast<decltype(run_activation)>(
