@@ -33,3 +33,22 @@ Other previously reported device failures are not allowlisted: their full names,
 reproduction conditions and outcomes still need to be collected on the current
 hardware. In particular the GB10 MXFP4 parity test needs a separately documented
 numeric expectation; it must not silently become a generic skip.
+
+## Apple Silicon integration
+
+`mac_expert_pack_cache` runs on Linux and macOS using a synthetic three-expert
+pack. It checks malformed headers and index entries, LFU retention/eviction and
+pinning while another expert is acquired. Linux uses the same reader/cache code
+without the Apple-only `F_NOCACHE` call. A malformed zero `data_start` is rejected
+before unsigned index-geometry arithmetic. ASan/UBSan are useful for this test.
+
+The Mac CI build enables Metal, runs that portable cache test, exercises Muse
+rendering with `test-chat --template muse-spark`, and checks the Q4_K/Q5_K/Q8_0
+CPU `MUL_MAT_ID` cases. This is a compilation and synthetic correctness gate.
+The separate target-device gate still needs matched model token sequences and
+memory/performance measurements; no model result follows from hosted CI.
+
+The unfiltered historical `test-chat` suite also reaches a failing Kimi-K3 marker
+case. It remains outside the supported Muse rendering gate and is not declared
+passing or silently allowlisted. Code organization must resolve it with the
+retired K3 implementation rather than changing a generic assertion tolerance.

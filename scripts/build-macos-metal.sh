@@ -14,6 +14,7 @@ command -v ninja >/dev/null || { echo "Ninja is required (brew install ninja)." 
 cmake -S "$repo_dir" -B "$build_dir" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DGGML_CUDA=OFF -DGGML_METAL=ON -DGGML_ACCELERATE=ON \
-    -DGGML_OPENMP=OFF -DLLAMA_BUILD_TESTS=ON
+    -DGGML_OPENMP=OFF -DLLAMA_BUILD_TESTS=ON \
+    -DLLAMA_BUILD_WEBUI=OFF -DLLAMA_BUILD_EXAMPLES=OFF
 cmake --build "$build_dir" \
     --target llama-cli llama-server test-backend-ops test-mac-expert-pack-cache -j "${SSD_LLAMA_BUILD_JOBS:-8}"
