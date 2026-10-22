@@ -70,6 +70,10 @@ def probe(server: Path, model: Path, out: Path, mode: str) -> dict:
             '--host', '127.0.0.1', '--port', str(port)]
     request = {'prompt': [3, 4, 5, 6], 'n_predict': 4, 'ignore_eos': True,
                'temperature': 0.0, 'top_k': 1, 'samplers': ['top_k'],
+               # This synthetic byte vocabulary can end on an incomplete UTF-8
+               # sequence, which the old server fails to serialize with probs.
+               # Constrain every arm equally; this is not unconstrained greedy.
+               'grammar': 'root ::= [a-z]+',
                'cache_prompt': False, 'return_tokens': True,
                'n_probs': 5, 'post_sampling_probs': False}
     write(run / 'settings.json', {'argv': argv, 'settings': {k: v for k, v in env.items()
@@ -103,10 +107,13 @@ def probe(server: Path, model: Path, out: Path, mode: str) -> dict:
                     with urllib.request.urlopen(query, timeout=30) as response:
                         payload = json.load(response)
                     write(run / 'response.json', payload)
+                    probabilities = payload.get('completion_probabilities', [])
                     result['completion_ok'] = (payload.get('tokens_evaluated') == 4
                         and payload.get('tokens_predicted') == 4 and not payload.get('truncated')
                         and len(payload.get('tokens', [])) == 4
-                        and len(payload.get('completion_probabilities', [])) == 4)
+                        and len(probabilities) == 4
+                        and [item.get('id') for item in probabilities] == payload['tokens']
+                        and all(len(item.get('top_logprobs', [])) == 5 for item in probabilities))
                 except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException) as error:
                     result['error'] = str(error)
             result['exit_before_cleanup'] = child.poll()

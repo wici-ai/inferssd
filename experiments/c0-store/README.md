@@ -220,6 +220,9 @@ these dependency probes. All owned server PIDs were verified absent afterward.
 built with the opt-in store and an unmodified base server. It uses four fixed
 prompt token IDs and four output tokens, saves the returned token IDs and full
 top-5 probability arrays, and checks every model in both alias and pack mode.
+All arms use the same ASCII grammar: the synthetic byte vocabulary can otherwise
+end on incomplete UTF-8, for which this base server omits the probability array.
+This is a constrained numerical fixture, not unconstrained greedy generation.
 The candidate runs without LD_PRELOAD, CUDA, or a shim. Loaded-file hashes,
 exact arguments, settings, raw responses, sink counters and PID cleanup are
 preserved. No failed or slow arm is silently retried.
