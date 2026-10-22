@@ -92,8 +92,8 @@ int main() {
             llama_is_kimi_k2_deepseek2_layout(LLM_ARCH_DEEPSEEK2, grouped_kimi_size),
             "grouped DeepSeek2 routing is not treated as Kimi K2");
     rc |= expect_false(
-            llama_is_kimi_k2_deepseek2_layout(LLM_ARCH_DEEPSEEK4, kimi),
-            "DeepSeek4 is not treated as Kimi K2");
+            llama_is_kimi_k2_deepseek2_layout(static_cast<llm_arch>(69), kimi),
+            "retired architecture is not treated as Kimi K2");
 
     rc |= expect_true(
             llama_moe_should_use_plain_top_k(LLM_ARCH_DEEPSEEK2, kimi),

@@ -191,10 +191,6 @@ struct llm_build_deepseek2 : public llm_graph_context {
     llm_build_deepseek2(const llama_model & model, const llm_graph_params & params);
 };
 
-struct llm_build_deepseek4 : public llm_graph_context {
-    llm_build_deepseek4(const llama_model & model, const llm_graph_params & params);
-};
-
 // DeepSeek-V4.1, ported from upstream; see src/models/deepseek41.cpp
 struct llm_build_deepseek41 : public llm_graph_context {
     llm_build_deepseek41(const llama_model & model, const llm_graph_params & params);

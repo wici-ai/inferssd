@@ -9,7 +9,7 @@
 #include <vector>
 
 // Port of the upstream DeepSeek-V4 / V4.1 KV cache (llama-kv-cache-dsv4.{h,cpp}).
-// Used by LLM_ARCH_DEEPSEEK41 only; this fork's own LLM_ARCH_DEEPSEEK4 keeps llama_memory_deepseek4.
+// Used by LLM_ARCH_DEEPSEEK41.
 //
 // Fork notes:
 //  - recurrent-state rollback (n_rs_seq > 0) is not supported: the fork's batch splitter cannot keep

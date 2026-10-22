@@ -5,7 +5,6 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-cpu-sink.h"
-#include "llama-deepseek4-hot.h"
 #include "llama-host-gather.h"
 #include "llama-io.h"
 #include "llama-memory.h"
@@ -1479,19 +1478,6 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        // DeepSeek4 hot-expert pinning: load profile and allocate per-layer
-        // hot subset tensors before the first sched_reserve so the graph
-        // builder can see them. No-op if DS4_HOT_PROFILE_JSON is unset.
-        if (model.arch == LLM_ARCH_DEEPSEEK4) {
-            auto & ds4_hot_mgr = ds4_hot::instance();
-            if (ds4_hot_mgr.load_profile()) {
-                // Pass n_expert_used (P) so the manager can allocate the
-                // K + P + 1 dummy/padding slots needed by the dispatch graph.
-                ds4_hot_mgr.set_n_picks((int) model.hparams.n_expert_used);
-                ds4_hot_mgr.allocate(model);
-            }
-        }
-
         const char * moe_phase0_env = std::getenv("GGML_MOE_PREFILL_PHASE0");
         const char * moe_phase1_env = std::getenv("GGML_MOE_PREFILL_PHASE1");
         const bool moe_phase01_requested =
@@ -1766,7 +1752,7 @@ void llama_context::sched_reserve() {
     if (cparams.auto_fgdn) {
         LLAMA_LOG_INFO("%s: resolving fused Gated Delta Net support:\n", __func__);
 
-        if (model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41) {
+        if (model.arch == LLM_ARCH_DEEPSEEK41) {
             cparams.fused_gdn_ar = false;
             cparams.fused_gdn_ch = false;
         }
@@ -4090,9 +4076,6 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_KIMI_K3 ||
         model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
-    }
-    if (model.arch == LLM_ARCH_DEEPSEEK4) {
-        return std::max<uint32_t>(n_tokens * 512, 256u * model.n_tensors());
     }
     if (model.arch == LLM_ARCH_DEEPSEEK41) {
         // same bound upstream uses for DeepSeek-V4.1
