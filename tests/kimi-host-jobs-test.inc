@@ -36,11 +36,11 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
         dlsym(RTLD_DEFAULT, "ggml_ssd_tier_testing_get_api"));
     require(get_fixture != nullptr, "explicit tier fixture factory missing");
     const auto * fixture_api = get_fixture();
-    require(fixture_api && fixture_api->version == 1 &&
+    require(fixture_api && fixture_api->version == 2 &&
         fixture_api->size == sizeof(ssd::gpu::testing::api) && fixture_api->create,
         "explicit tier fixture factory ABI mismatch");
     const auto options = inputs.tier_policy();
-    const auto create_tier = [&] { return fixture_api->create(2 * stride, &options, error, sizeof(error)); };
+    const auto create_tier = [&] { return fixture_api->create(2 * stride, &options, test_cpu_kernels(), error, sizeof(error)); };
     void * t = create_tier();
     require(t != nullptr, std::string("tier create: ") + error);
     // five experts in host memory, blocks with small scales, in an anonymous mapping like the RAM cache's
