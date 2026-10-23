@@ -392,7 +392,7 @@ The Python `inferssd.engine.runtime.Runtime` requires explicit `LaunchInput`,
 `LaunchSpec`, `Policy`, host and output ports. `Runtime.controller(...)` connects
 the measured Linux Machine decision algorithm to typed snapshots and owned
 Engines. Each selection reads measured placement/CPU/tier/prefetch/cost fields
-directly, validates through the fourteen-key parser, and records its sources.
+directly, validates through the registry-defined parser, and records its sources.
 Explicit CLI values exclude incompatible measured candidates; they are never
 silently replaced by a planner. Model prefill predictions use the selected
 snapshot's actual route and native ubatch. Cross-server prompt persistence is not
@@ -412,7 +412,7 @@ caller-owned legacy observation session. Current versioned native events do not
 yet contain every routing ID and prefill graph required by that algorithm; this
 module does not claim those log readers were removed. Static launch does not
 require debug channels. Adaptive launches select the permitted trace/profile
-output channels through `SSDASH_DEBUG`; these do not control kernels or placement.
+output channels through `INFERSSD_DEBUG`; these do not control kernels or placement.
 Historical F goldens remain a separate recorded contract.
 
 ## Remaining integration boundaries

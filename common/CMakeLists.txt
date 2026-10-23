@@ -96,6 +96,9 @@ add_library(${TARGET}
     preset.cpp
     preset.h
     regex-partial.cpp
+    inferssd/chat-source.cpp
+    inferssd/chat-templates.cpp
+    inferssd/chat-templates.h
     inferssd/reasoning-budget.cpp
     inferssd/reasoning-budget.h
     reasoning-budget.h

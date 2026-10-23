@@ -16,7 +16,7 @@ Each line has `v`, `ev` and `seq`, plus the event payload:
 ```
 
 The first effective-settings publication uses `ev=ssd.settings`. Its `values`
-object contains all fourteen canonical typed settings. Its matching `sources`
+object contains all canonical typed settings. Its matching `sources`
 object contains `origin` (`cli|file|default`), `location` and the exact trailing
 file `receipt`. The settings parser schema is the authority for value types,
 units, bounds, producers and scopes. JSONL telemetry is distinct from the
@@ -25,7 +25,7 @@ human-readable launch log and is not parsed by searching old log markers.
 `inferssd.telemetry.jsonl.read_events` rejects unsupported versions, malformed
 JSON, duplicate keys, nonfinite values and sequence gaps/duplicates. Unknown
 well-formed event kinds remain inspectable. `effective_settings` requires one
-settings event, the complete fourteen-key value/receipt set and typed values.
+settings event, the complete registry-defined value/receipt set and typed values.
 It consumes actual C++ writer output in the cross-language contract test.
 
 The only new-core environment observations are in `telemetry/debug.cpp`:
