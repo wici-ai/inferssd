@@ -111,12 +111,18 @@ class Engine:
         effects: Effects,
         resolve: Callable[[Mapping[str, str], Sequence[str]], Resolution],
         own: Callable[[Resolution, str], Owner],
+        prepare_environment: Callable[
+            [Mapping[str, str], int, str], dict[str, str]
+        ] = environment_for,
+        check_port: bool = False,
     ) -> None:
         self.dir, self.port, self.tier, self.cpus, self.envs = directory, port, tier, cpus, envs
         self._effects = effects
         self.stopping, self.ok = False, False
+        if check_port and effects.port_busy(port):
+            raise ValueError("owned listener port is already in use")
         effects.makedirs(directory)
-        env = environment_for(environment, port, envs)
+        env = prepare_environment(environment, port, envs)
         beginning = effects.clock()
         self.log = effects.open_log(f"{directory}/server.log")
         self._owner: Optional[Owner] = None

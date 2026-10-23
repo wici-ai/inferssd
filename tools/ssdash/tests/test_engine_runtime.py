@@ -12,6 +12,7 @@ from observe_engine_F import Effects as FEffects
 from observe_engine_F import api as f_api
 
 from ssdash.engine import core, owned, runtime
+from ssdash.launch.typed import LaunchSpec
 from ssdash.launch.types import LaunchInput, Resolution
 from ssdash.platform.policy import Policy
 from ssdash.platform.run_directory import reserve
@@ -267,13 +268,14 @@ def test_loader_environment_only_restored_for_server():
 def test_linux_factory_wires_real_dependencies_and_darwin_rejects(tmp_path, monkeypatch):
     captured = {}
     monkeypatch.setattr(
-        runtime, "Controller", lambda *a, **kw: captured.update(args=a, **kw) or captured
+        runtime, "TypedController", lambda *a, **kw: captured.update(args=a, **kw) or captured
     )
     value = runtime.Runtime(
         LaunchInput("/fixture/repo", ()),
         policy(tmp_path, "linux"),
         host=object(),
         emit=lambda _: None,
+        configuration=LaunchSpec("/fixture/model.gguf", 8080),
     )
     result = value.controller(
         "/recorded", "/output", 8080, (4, "2:2"), [], host_threads=lambda: 4, stdout=io.StringIO()

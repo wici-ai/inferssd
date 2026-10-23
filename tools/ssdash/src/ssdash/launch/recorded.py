@@ -162,6 +162,10 @@ class RecordedArtifacts:
         if name == "mkdir":
             Path(args[0]).mkdir(parents=True, exist_ok=True)
             return Reply()
+        if name == "write_exclusive":
+            with Path(args[0]).open("x", encoding="utf-8", newline="\n") as stream:
+                stream.write(args[1])
+            return Reply()
         if name in ("index", "source_facts", "dense"):
             return metadata(name, args)
         if name == "mac_alias":

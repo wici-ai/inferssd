@@ -1,116 +1,84 @@
 # SSDash framework tools
 
-This package reads model headers to create source artifacts, and turns recorded
-probe reports and arm logs into calibration artifacts, a plan, legacy launcher settings and recorded conversation reports. The `launch --dry-run` command also prepares a launch description from explicit host facts.
-`tools/adaptive` and the existing launchers remain the entry points for live execution.
-The package also provides an injectable controller model with caller-owned observation
-sessions and complete request/bootstrap/conversation orchestration with required effect ports.
-It supplies no live engine or HTTP executor. The package runtime uses only
-the Python standard library.
+The package supplies typed settings, source metadata, an owned inference runtime,
+and recorded calibration/planning tools. The production `launch` command consumes
+`ssdash-settings 1` and explicit CLI overrides. It supervises one local server;
+Linux also exposes a typed controller factory. Mac currently supports static
+launch only; online adaptive Mac M2 remains deferred. The runtime uses only the
+Python standard library.
 
 ## Commands and artifacts
 
-| Command | Recorded input | Output |
+| Command | Input | Output |
 | --- | --- | --- |
-| `ssdash launch --dry-run` | Model/settings files, explicit recorded host facts | Prepared source indexes, ordered argv/environment/scope and output |
-| `ssdash source` | GGUF headers, optional v1 pack index, dense placement text | Expert JSON/alias TSV, source facts, lane arguments or fio iolog text |
-| `ssdash probe` | Existing probe reports and expert metadata | Device schema-2 JSON on stdout |
-| `ssdash validate` | Device schema-2 JSON | Validation result; no rewritten artifact |
-| `ssdash fit` | Named arm directories, optional graph arm and ubatch JSON | Model schema-2 JSON, insitu schema-3 JSON and a report |
+| `ssdash launch --execute` | Model, typed settings, explicit resource policy | Owned server, settings/telemetry/resource/cleanup artifacts |
+| `ssdash launch --dry-run` | Same configuration, recorded host facts | Prepared settings/source indexes and native argv; no server |
+| `ssdash launch-recorded --dry-run` | Historical launcher inputs and recorded facts | Historical resolution for comparison; cannot execute |
+| `ssdash configuration` | Typed settings and `--set` overrides | Effective values/source receipts, schema or canonical settings |
+| `ssdash source` | GGUF headers, optional v1 pack index, dense placement text | Expert JSON/alias TSV, source facts, lane arguments or fio iolog |
+| `ssdash probe` | Existing probe reports and expert metadata | Device schema-2 JSON |
+| `ssdash validate` | Device schema-2 JSON | Validation result |
+| `ssdash fit` | Named arm directories, optional graph arm and ubatch JSON | Model schema-2 JSON, insitu schema-3 JSON and report |
 | `ssdash plan` | `insitu.json`, `probe/device.json`, `model.json` | Plan JSON and ranked candidates |
-| `ssdash settings` | The recorded artifacts, saved plan and optional ledger logs | Legacy `settings.env` on stdout or at `-o` |
-| `ssdash bootstrap-records` | Recorded CPU labels or ubatch run/server logs | CPU-set candidates or legacy `{first, held}` JSON |
-| `ssdash report` | Saved plan, conversation events and server logs, optional drive/device facts | Comparison text and legacy `compare-online.json` |
+| `ssdash settings` | Recorded artifacts and saved plan | Historical `settings.env` for recorded comparisons |
+| `ssdash bootstrap-records` | Recorded CPU labels or ubatch logs | CPU-set candidates or historical `{first, held}` JSON |
+| `ssdash report` | Saved plan, conversation events and logs | Comparison text and historical `compare-online.json` |
 
-These commands do not run hardware probes, bootstrap a model, start a server or
-control an online session. Install from the repository root:
+Install from the repository root:
 
 ```sh
 python3 -m pip install ./tools/ssdash
 ```
 
-## Prepare a launch
+## Prepare a typed launch
 
-`launch` requires `--dry-run`, a repository directory and a JSON file of recorded
-host facts. It does not start a server, query the GPU, listen on a port or create
-a systemd scope. It can create or refresh header-based expert indexes, just like
-the existing launcher dry run. Use a dedicated artifact directory when inspecting
-a configuration:
+Use `--settings FILE` for the versioned fourteen-key configuration and repeat
+`--set key=literal` for explicit overrides. CLI values take precedence over file
+values, then registry defaults. Comments following a file value are preserved as
+source receipts. The generated native file contains file/generated values;
+CLI-origin values become the matching registry-generated native `--ssd-*` option
+so native effective telemetry preserves that priority. There is no environment
+translation. Retired settings/launcher environment names fail by name without
+printing their values.
+
+```text
+ssdash-settings 1
+cpu.threads = 8 # measured host allocation
+host.headroom_mib = 3072 # operator resource reserve
+vram.budget = auto # use admitted capacity
+```
+
+A model must be a local GGUF or the first shard of a complete set. An omitted
+`expert.source` generates a strict header-validated alias from that set; explicit
+sources must be nonempty existing alias paths. Native source validation remains
+a separate boundary. The launcher does not download models. Use `--binary` for
+an explicit server executable or the repository's `build[-mac]/bin/llama-server`.
+
+Dry-run requires recorded host facts and a fresh exclusively claimed output
+directory. It may create source metadata and `settings.ssd`, but does not query
+the live GPU, start a server or claim a device lease. A receipt lists environment
+names, never inherited environment values:
 
 ```sh
 ssdash launch --dry-run --platform linux --repo . \
-  --host-facts recorded/host-linux.json \
-  --model-conf tools/adaptive/models/muse-spark.conf \
-  --model models/model.gguf --settings recorded/settings.env \
-  --artifact-dir recorded/expert-index --result recorded/launch.json
-
-SSD_LLAMA_BUILD_DIR=build-mac ssdash launch --dry-run --platform darwin --repo . \
-  --host-facts recorded/host-darwin.json --profile muse --mode server \
-  --model models/model-00001-of-00002.gguf --artifact-dir recorded/cache \
-  --result recorded/launch.json -- --seed 17
+  --model models/model.gguf --settings recorded/settings.ssd \
+  --runtime-policy recorded/policy-linux.json \
+  --host-facts recorded/host-linux.json --output-dir recorded/prepared-001 \
+  --set cpu.threads=8 --result recorded/launch-001.json
 ```
 
-Linux uses `SERVER_BIN`, `CPUSET`, `MEMORY_MAX` and the other existing launcher
-inputs from the caller's environment or SETTINGS. Explicit CLI model/settings
-paths override their corresponding environment path. Appended arguments follow
-`--` and keep their order. The environment still takes precedence over SETTINGS
-inside the existing profile; legacy engine variable names are forwarded unchanged.
-`MEMORY_MAX` is a systemd value passed through to the returned scope, not a
-promise that the scope was created. The JSON result contains the inherited
-environment as well as ordered assigned values; keep that file private if the
-caller environment contains private data.
+Recorded host facts are consumed lazily without falling back to the current
+machine. Both platforms require `platform_system`; Darwin also requires
+`platform_machine=arm64`. Linux uses `cgroup_v2`, `euid`, and for non-root scope
+creation `user_manager` and `memory_controller`. GPU-enabled Linux settings also
+require `gpu_available` and empty `gpu_processes`. These observations do not
+certify native source formats, GPU kernels or real resource enforcement.
 
-The host-fact file contains values that would otherwise come from the target
-machine. Fields are requested lazily, and a missing field fails when needed;
-there is no fallback to the current machine. Boolean facts require JSON booleans,
-`euid` requires an integer, and `memory_kib` requires two integers; booleans do
-not count as integers. Text facts, including GPU memory text such as `[N/A]`,
-require strings. `default_threads`, `physical_memory` and `disk_free` accept
-integer strings or integers. These checks run only when the field is consumed
-and errors identify that field. The files in `examples/` contain
-**synthetic values for documentation**, not measurements to reuse on a device.
-Linux fields are `filesystem`, `gpu_available`, `gpu_memory`, `gpu_processes`,
-`default_threads`, `ss_available`, `port_busy`, `has_uring`, `cgroup_v2`,
-`memory_kib` (total and available KiB), `euid`, `user_manager`,
-`memory_controller` and `scope_suffix`. Some fields are unnecessary when an input
-already supplies the value: for example CPUSET supplies the thread count and
-LAUNCH_SCOPE supplies the scope name. `filesystem` describes the prompt-cache
-location, and `has_uring` describes the selected CUDA backend/server. Host facts
-must correspond to those paths; this command does not certify them.
-
-Darwin fields are `platform_system`, `platform_machine`, `physical_memory`
-(bytes) and `disk_free` (bytes at the index destination). The Darwin path requires
-Apple Silicon facts, the complete shard set and its model template. It retains
-the strict GGUF index generator, cache defaults and selected-expert read policy;
-it is separate from the Linux CPU-sink placement model. Index generation happens
-on every Darwin dry run. Alias and summary publication are two ordered file
-replacements, so a failure after the first can leave the new alias with the old
-summary. The retained `Starting ...` diagnostic describes the prepared argv;
-`--dry-run` always stops before execution. The explicit execution mode below
-uses live facts instead; an online Mac placement controller is not supplied.
-Linux execution stops at the first host condition reported as a refusal by dry
-run, including an occupied port, unsafe GPU sharing, missing cgroup support or
-insufficient automatic memory. Later probes and server creation do not continue.
-
-For numeric launcher inputs, the new interface accepts unsigned decimal data
-within the existing per-key bounds and at most `9223372036854775807`. Linux
-arithmetic fields require canonical spelling (`0` or a nonzero digit followed by
-digits); Bash octal spellings, expressions, variable references and signed
-wraparound are rejected with the key and source. The prefill threshold retains
-its original decimal leading-zero syntax and uint32 bound. CTX_CHECKPOINTS keeps
-its original digit string, including leading zeros. Darwin integers retain the
-original digit-only parsing, range checks and canonical decimal output. These
-are explicit input boundaries, not emulation of arbitrary shell arithmetic.
-If several SETTINGS keys are unknown, the first is reported in file order.
-
-The API separates `resolve_linux` / `resolve_darwin` from `prepare`: the pure
-resolver returns the next required fact, and preparation delivers prior output
-before servicing it. Artifact operations use the typed metadata implementation;
-actual traceback paths and line numbers identify that implementation. They are
-not rewritten to impersonate the former helper script. Output failures stop
-later artifact work. `LAUNCH_RESOLVE=1` still stops before assets or host facts,
-but its result is structured model/conf data rather than shell-evaluable `%q`
-assignments. Use `--result` to save that early result.
+The old Linux/Darwin resolvers and their F observations are retained behind
+`launch-recorded --dry-run`. They still describe the historical settings/env
+contract, and cannot execute a server. Their golden outputs are not observations
+of the new typed production launch. Header-only source and recorded planning
+commands below continue to accept their documented historical artifact formats.
 
 Source artifacts can be generated without reading tensor payloads or running a probe:
 
@@ -353,13 +321,13 @@ borrowed-reference behavior.
 
 ## Explicit owned server execution
 
-`ssdash launch --execute` resolves the same Linux or Darwin launch inputs with
-lazy live host facts, then starts one supervised server. It requires an explicit
+`ssdash launch --execute` resolves typed Linux or Darwin inputs with lazy live
+host facts, then starts one supervised server. It requires an explicit
 policy, an unused execution directory and a loopback port:
 
 ```sh
-MEMORY_MAX=17179869184 ssdash launch --execute --platform linux --repo /path/to/ssdash \
-  --model-conf /path/to/profile.conf --settings /path/to/settings.env \
+ssdash launch --execute --platform linux --repo /path/to/ssdash \
+  --model /path/to/model.gguf --profile muse --settings /path/to/settings.ssd \
   --runtime-policy /path/to/runtime-policy.json --output-dir /path/to/run/instance-001 \
   --port 8080 -- --seed 17
 ```
@@ -383,14 +351,14 @@ recommended budget for any model or machine:
 ```
 
 Linux requires a functioning systemd scope with cgroup v2, the declared exact
-byte `MEMORY_MAX`, zero swap, readable ancestor OOM counters and memory peak.
+byte `memory_budget_bytes`, zero swap, readable ancestor OOM counters and memory peak.
 The worker checks the actual envelope and the server's inherited scope and
 memlock limit. Set any required memlock limit before invoking the command;
 `minimum_memlock_bytes: 0` is appropriate only when the chosen configuration
 needs no pinned-memory minimum. This command never raises system limits.
 
-Darwin uses `platform: "darwin"` and the existing `--profile`, `--model` and
-Mac environment inputs. Its budget is a **sampled soft server RSS threshold**,
+Darwin uses `platform: "darwin"`, explicit `--profile`/`--model` and the same typed
+settings snapshot. Its budget is a **sampled soft server RSS threshold**,
 with host free-plus-inactive memory, compressor and swap growth checks. It is
 not a cgroup or a hard unified-memory cap. Both platforms monitor while the
 server runs, and fail the execution if a threshold or the worker fails. Host
@@ -407,8 +375,10 @@ signal requests cleanup. If cleanup is unknown, the guardian retains the lock
 and writes quarantine evidence; a timeout never authorizes killing that guardian.
 An unrelated listener on the health port is never killed.
 
-`runtime.json` records the actual server argv and scope, `memory-samples.jsonl`
-records resource samples, and `ownership.json` records final status and cleanup.
+`settings.ssd` records the file/generated settings and their receipts;
+`native-events.jsonl` is exclusively created by the context-owned native writer.
+`runtime.json` records server argv and scope, `memory-samples.jsonl` records
+resource samples, and `ownership.json` records final status and cleanup.
 Keep these artifacts private if arguments or paths contain private information.
 Server loader variables are carried in the process environment and restored
 only for the server, not serialized into the launch specification or applied to
@@ -419,29 +389,40 @@ resource check into a successful exit. `--result` and `--host-facts` are dry-run
 options and are rejected by execution mode.
 
 The Python `ssdash.engine.runtime.Runtime` requires explicit `LaunchInput`,
-`Policy`, host and output ports. `Runtime.controller(...)` supplies the real
-Machine, owned Engine, HTTP and observation ports to the typed Linux Controller.
-Its factory is opt-in; it does not replace the old production command. Darwin
-currently supports static launch only and explicitly rejects that adaptive
-factory. Importing these modules starts no process, host probe or network call.
-The actual native entry still needs a per-host harmless lifecycle check before
-model execution; the package's synthetic tests alone do not certify a host.
+`LaunchSpec`, `Policy`, host and output ports. `Runtime.controller(...)` connects
+the measured Linux Machine decision algorithm to typed snapshots and owned
+Engines. Each selection reads measured placement/CPU/tier/prefetch/cost fields
+directly, validates through the fourteen-key parser, and records its sources.
+Explicit CLI values exclude incompatible measured candidates; they are never
+silently replaced by a planner. Model prefill predictions use the selected
+snapshot's actual route and native ubatch. Cross-server prompt persistence is not
+configured by typed launch; the production controller predicts a full prefill on
+switch and refuses `keeps_history=True`. Each Engine receives its own immutable snapshot
+and fresh native files. No production path calls `Machine.env` or accepts the
+old Engine environment-control string. Model/listener/parallel/thread/batch
+arguments must use the explicit launch options so extra flags cannot silently
+replace those owned values.
+
+The retained controller observes routing/profile diagnostics through its
+caller-owned legacy observation session. Current versioned native events do not
+yet contain every routing ID and prefill graph required by that algorithm; this
+module does not claim those log readers were removed. Static launch does not
+require debug channels. Adaptive launches select the permitted trace/profile
+output channels through `SSDASH_DEBUG`; these do not control kernels or placement.
+Historical F goldens remain a separate recorded contract.
 
 ## Remaining integration boundaries
 
-The old adaptive production entry points have not been switched or deleted.
-Live probe/bootstrap and switching the old production controller remain separate
-work. The opt-in Runtime below connects the typed Linux Controller to the owned
-server implementation. The fourteen-key engine settings registry,
-versioned `settings.ssd`, versioned engine JSONL telemetry and removal of temporary
-legacy log readers are also pending. This package does not complete C3 by itself.
+Live probe/bootstrap orchestration and replacing the old `tools/adaptive` command
+remain separate work. The native C3/context integration must be validated with
+this installed package on each target host; Python substitutes for OS effects
+or synthetic model headers do not establish native execution correctness.
+No new performance conclusion follows from these package tests.
 
 Mac automatic framework planning and the common CPU executor/cache belong to the
-later **Mac M2 migration stage**; “M2” here names a migration stage, not an Apple
-chip requirement. Running these offline Python commands on macOS does not imply
-that Mac probes, unified-memory budgeting or the shared executor are integrated.
-The package can explicitly launch a static Darwin server; this does not supply
-Mac automatic placement or reuse Linux CPU-sink settings on Darwin.
+later **Mac M2 migration stage**; “M2” names a project stage, not an Apple chip.
+The static Darwin production path rejects the adaptive factory. Importing these
+modules starts no process, host probe or network call.
 
 ## Development checks
 

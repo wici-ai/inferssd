@@ -1,4 +1,4 @@
-"""Explicit schema/check/write commands, separate from the unconverted launcher."""
+"""Explicit schema/check/write commands for the production settings v1 format."""
 
 from __future__ import annotations
 

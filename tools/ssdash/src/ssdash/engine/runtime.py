@@ -1,8 +1,6 @@
-"""Explicit platform launch adapter and Linux Controller factory.
+"""Typed production launch and Linux controller factories.
 
-The factory is opt-in; old production and online entry points remain unchanged.
-Darwin currently executes static M1 launches. Mac adaptive placement (M2) is not
-implemented by applying Linux Machine.env variables to a Mac server.
+Darwin executes static M1 launches. Online adaptive Mac M2 remains deferred.
 """
 
 from __future__ import annotations
@@ -11,21 +9,23 @@ import os
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import BinaryIO, TextIO, cast
+from typing import BinaryIO, Optional, TextIO, cast
 
+from ssdash.configuration.settings import Snapshot, parse
 from ssdash.engine.core import Engine, NativeEffects, post
 from ssdash.engine.owned import OwnedProcess
-from ssdash.launch.darwin import resolve_darwin
-from ssdash.launch.linux import resolve_linux
 from ssdash.launch.live import Host, LiveArtifacts
 from ssdash.launch.prepare import prepare
 from ssdash.launch.recorded import run_indexer
+from ssdash.launch.typed import LaunchSpec, reject_legacy_environment, resolve_typed
 from ssdash.launch.types import LaunchInput, Output, Resolution
 from ssdash.loop.controller import Controller
 from ssdash.loop.records import ObservationSession
-from ssdash.model.machine import Machine
+from ssdash.loop.typed_controller import TypedController
+from ssdash.model.typed import TypedMachine
 from ssdash.plan.recorded import DirectoryArtifacts
 from ssdash.platform.policy import Policy
 from ssdash.telemetry.files import LocalArmFiles
@@ -61,11 +61,29 @@ class LocalObservations(LocalArmFiles):
 
 class Runtime:
     def __init__(
-        self, inputs: LaunchInput, policy: Policy, *, host: Host, emit: Callable[[Output], None]
+        self,
+        inputs: LaunchInput,
+        policy: Policy,
+        *,
+        host: Host,
+        emit: Callable[[Output], None],
+        configuration: Optional[LaunchSpec] = None,
     ) -> None:
         self.inputs, self.policy, self.host, self.emit = inputs, policy, host, emit
+        self.configuration = configuration
 
-    def resolve(self, environment: Mapping[str, str], args: Sequence[str]) -> Resolution:
+    def resolve(
+        self,
+        environment: Mapping[str, str],
+        args: Sequence[str],
+        *,
+        directory: str,
+        configured: Optional[Snapshot] = None,
+        specification: Optional[LaunchSpec] = None,
+    ) -> Resolution:
+        specification = specification or self.configuration
+        if specification is None:
+            raise ValueError("production Runtime requires explicit typed LaunchSpec")
         inputs = LaunchInput(
             self.inputs.repo,
             tuple(environment.items()),
@@ -78,10 +96,13 @@ class Runtime:
         )
         value = prepare(
             inputs,
-            resolver=(
-                partial(resolve_linux, execute=True)
-                if self.policy.platform == "linux"
-                else resolve_darwin
+            resolver=partial(
+                resolve_typed,
+                spec=specification,
+                platform=self.policy.platform,
+                directory=directory,
+                memory=self.policy.memory_budget_bytes,
+                configured=configured,
             ),
             observe=adapter,
             emit=self.emit,
@@ -92,10 +113,43 @@ class Runtime:
         return value
 
     def engine(
-        self, directory: str, port: int, tier: int, cpus: str, envs: str, args: list[str]
+        self,
+        directory: str,
+        port: int,
+        tier: int,
+        cpus: str,
+        envs: str,
+        args: list[str],
+        *,
+        configured: Optional[Snapshot] = None,
+        specification: Optional[LaunchSpec] = None,
     ) -> Engine:
+        if envs:
+            raise ValueError("production Engine does not accept legacy environment controls")
+        reject_legacy_environment(dict(self.inputs.environment))
+
+        def environment_for(
+            environment: Mapping[str, str], _port: int, _envs: str
+        ) -> dict[str, str]:
+            reject_legacy_environment(environment)
+            output = dict(environment)
+            if configured is not None:
+                channels = output.get("SSDASH_DEBUG", "")
+                selected = channels.split(",") if channels else []
+                for channel in ("trace", "profile"):
+                    if channel not in selected:
+                        selected.append(channel)
+                output["SSDASH_DEBUG"] = ",".join(selected)
+            return output
+
         def checked(environment: Mapping[str, str], extra: Sequence[str]) -> Resolution:
-            value = self.resolve(environment, extra)
+            value = self.resolve(
+                environment,
+                extra,
+                directory=directory,
+                configured=configured,
+                specification=specification,
+            )
             ports = [
                 value.argv[i + 1] for i, item in enumerate(value.argv[:-1]) if item == "--port"
             ]
@@ -123,6 +177,8 @@ class Runtime:
             effects=effects,
             resolve=checked,
             own=own,
+            prepare_environment=environment_for,
+            check_port=True,
         )
 
     def controller(
@@ -139,12 +195,61 @@ class Runtime:
         window: tuple[int, int] = (129, 512),
         decode: int = 512,
         horizon: int = 3,
+        keeps_history: bool = False,
     ) -> Controller:
         if self.policy.platform != "linux":
             raise ValueError(
                 "Darwin adaptive Controller requires the unimplemented M2 placement adapter"
             )
-        return Controller(
+        if self.configuration is None:
+            raise ValueError("production Controller requires explicit typed LaunchSpec")
+        if keeps_history:
+            raise ValueError("typed launches do not configure cross-server prompt persistence")
+        specification = self.configuration
+        base = parse(
+            Path(specification.settings_file).read_text(encoding="utf-8")
+            if specification.settings_file
+            else None,
+            specification.settings_file or "",
+            overrides=specification.overrides,
+            platform=self.policy.platform,
+        )
+
+        def typed_engine(
+            directory: str,
+            selected_port: int,
+            tier: int,
+            cpus: str,
+            extra: Sequence[str],
+            snapshot: Snapshot,
+        ) -> Engine:
+            suffix = cpus.partition("@")[2]
+            selected = replace(specification, ubatch=int(suffix)) if suffix else specification
+            return self.engine(
+                directory,
+                selected_port,
+                tier,
+                cpus,
+                "",
+                list(extra),
+                configured=snapshot,
+                specification=selected,
+            )
+
+        def machine_factory(path: str) -> TypedMachine:
+            machine = TypedMachine(
+                DirectoryArtifacts(Path(path)),
+                base=base,
+                native_ubatch=specification.ubatch,
+                host_threads=host_threads,
+            )
+            if start not in machine.configs:
+                raise ValueError(
+                    "start configuration is excluded by typed settings or measured capacity"
+                )
+            return machine
+
+        return TypedController(
             run,
             out,
             port,
@@ -154,11 +259,14 @@ class Runtime:
             window,
             decode,
             horizon,
-            machine_factory=lambda path: Machine(
-                DirectoryArtifacts(Path(path)), host_threads=host_threads
-            ),
+            machine_factory=machine_factory,
             engine_factory=self.engine,
+            configuration=lambda machine, tier, cpus: cast(TypedMachine, machine).settings(
+                tier, cpus
+            ),
+            typed_engine=typed_engine,
+            keeps_history=keeps_history,
             post=post,
-            effects=LocalEffects(dict(self.inputs.environment), stdout),
+            effects=LocalEffects({}, stdout),
             session=ObservationSession(files=LocalObservations()),
         )

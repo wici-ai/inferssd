@@ -18,11 +18,11 @@ from ssdash.launch.types import LaunchInput, Output
 
 def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     launch = commands.add_parser(
-        "launch", help="resolve a launch or explicitly execute one owned server"
+        "launch-recorded", help="historical F resolver comparison; never execute a server"
     )
     execution = launch.add_mutually_exclusive_group(required=True)
     execution.add_argument("--dry-run", action="store_true")
-    execution.add_argument("--execute", action="store_true")
+    launch.set_defaults(execute=False)
     launch.add_argument("--platform", choices=("linux", "darwin"), required=True)
     launch.add_argument("--repo", type=Path, required=True)
     launch.add_argument("--host-facts", type=Path)
@@ -71,9 +71,7 @@ def launch_inputs(args: argparse.Namespace) -> LaunchInput:
 
 def run_launch(args: argparse.Namespace) -> int:
     if args.execute:
-        from ssdash.engine.command import run_native
-
-        return run_native(args, launch_inputs(args))
+        raise ValueError("historical launch resolver cannot execute a server")
     if args.host_facts is None:
         raise ValueError("--dry-run requires --host-facts; it never observes the live host")
     inputs = launch_inputs(args)

@@ -34,7 +34,7 @@ class Runtime:
 command.Runtime = Runtime
 arguments = ["launch", "--execute", "--platform", "darwin", "--repo", sys.argv[3],
              "--runtime-policy", sys.argv[2], "--output-dir", sys.argv[3] + "/run",
-             "--port", "8080"]
+             "--port", "8080", "--model", sys.argv[3] + "/fixture.gguf"]
 raise SystemExit(cli.main(arguments))
 """
     result = subprocess.run(
@@ -85,7 +85,7 @@ def test_execute_missing_policy_fails_before_host_or_files(tmp_path):
         timeout=10,
     )
     assert result.returncode == 2, result.stderr
-    assert "requires --runtime-policy" in result.stderr
+    assert "--runtime-policy" in result.stderr and "required" in result.stderr
     assert list(tmp_path.iterdir()) == []
 
 

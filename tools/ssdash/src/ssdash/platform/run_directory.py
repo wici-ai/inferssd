@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 RESERVED = (
+    "settings.ssd",
+    "native-events.jsonl",
     "server.log",
     "server.log.gz",
     "runtime.json",

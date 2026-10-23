@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ssdash"
 version = "0.1.0"
-description = "SSDash offline framework contracts"
+description = "SSDash typed settings and owned inference runtime"
 requires-python = ">=3.9"
 dependencies = []
 

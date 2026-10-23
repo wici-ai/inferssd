@@ -46,7 +46,7 @@ def test_installed_command_synthetic_assets(tmp_path):
         sys.executable,
         "-m",
         "ssdash",
-        "launch",
+        "launch-recorded",
         "--dry-run",
         "--platform",
         "linux",
@@ -92,7 +92,7 @@ def test_installed_command_synthetic_assets(tmp_path):
 
 def test_command_requires_explicit_dry_run_and_host_facts(capsys):
     with pytest.raises(SystemExit) as failure:
-        main(["launch", "--platform", "linux", "--repo", "/does-not-exist"])
+        main(["launch-recorded", "--platform", "linux", "--repo", "/does-not-exist"])
     assert failure.value.code == 2
     assert "--dry-run" in capsys.readouterr().err
 

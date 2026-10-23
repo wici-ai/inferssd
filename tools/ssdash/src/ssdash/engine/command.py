@@ -12,6 +12,7 @@ from typing import Optional
 from ssdash.engine.core import Engine
 from ssdash.engine.runtime import Runtime
 from ssdash.launch.live import NativeHost
+from ssdash.launch.typed_command import specification
 from ssdash.launch.types import LaunchInput, Output
 from ssdash.platform.policy import Policy
 
@@ -40,7 +41,9 @@ def run_native(args: argparse.Namespace, inputs: LaunchInput) -> int:
     def interrupted(number: int, _frame: object) -> None:
         raise KeyboardInterrupt(f"signal {number}")
 
-    runtime = Runtime(inputs, policy, host=NativeHost(), emit=emit)
+    runtime = Runtime(
+        inputs, policy, host=NativeHost(), emit=emit, configuration=specification(args)
+    )
     engine: Optional[Engine] = None
     handlers = {
         number: signal.signal(number, interrupted)

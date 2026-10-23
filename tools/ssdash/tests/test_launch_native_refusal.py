@@ -3,15 +3,51 @@
 from __future__ import annotations
 
 import copy
+from functools import partial
 
 import pytest
 import test_launch_linux as linux_fixture
 from observe_launch_refusal_F import CASES, observe
-from test_engine_runtime import policy
 
-from ssdash.engine import runtime
+from ssdash.engine import core
+from ssdash.launch.darwin import resolve_darwin
 from ssdash.launch.linux import LinuxState, resolve_linux
+from ssdash.launch.prepare import prepare
 from ssdash.launch.types import Finished, LaunchInput, Reply
+
+
+def historical_engine(inputs, directory, port, observe, emit, platform="linux"):
+    """Test-only F resolver boundary. Production Runtime never calls it."""
+
+    def resolve(environment, extra):
+        candidate = LaunchInput(
+            inputs.repo, tuple(environment.items()), tuple(extra), inputs.profile
+        )
+        result = prepare(
+            candidate,
+            resolver=partial(resolve_linux, execute=True)
+            if platform == "linux"
+            else resolve_darwin,
+            observe=observe,
+            emit=emit,
+            darwin_errors=platform == "darwin",
+        )
+        if result.code != 0:
+            raise RuntimeError("historical launch preparation failed")
+        return result
+
+    return core.Engine(
+        str(directory),
+        port,
+        0,
+        "static",
+        "",
+        [],
+        environment=dict(inputs.environment),
+        effects=core.NativeEffects(),
+        resolve=resolve,
+        own=lambda *_: pytest.fail("historical refusal must not reach owner"),
+    )
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c["name"])
@@ -63,25 +99,14 @@ def test_all_host_refusals_stop_before_owner(tmp_path, monkeypatch, name, overri
     assert not result.outputs[-1].text.startswith("dry run:")
     assert result.observations[-1].name == last
     emitted = []
-    monkeypatch.setattr(runtime, "LiveArtifacts", lambda *a, **kw: lambda fact: facts[fact])
-    monkeypatch.setattr(
-        runtime, "OwnedProcess", lambda *a, **kw: pytest.fail("refused before spawn")
-    )
-    value = runtime.Runtime(
-        LaunchInput("@repo", tuple(record["env"].items())),
-        policy(tmp_path, "linux"),
-        host=object(),
-        emit=emitted.append,
-    )
     directory = tmp_path / "instance"
     with pytest.raises(RuntimeError, match="preparation failed"):
-        value.engine(
-            str(directory),
+        historical_engine(
+            LaunchInput("@repo", tuple(record["env"].items())),
+            directory,
             int(next(f.arguments[0] for f in facts if f.name == "port_busy")),
-            0,
-            "2:2",
-            "",
-            [],
+            lambda fact: facts[fact],
+            emitted.append,
         )
     assert (directory / ".ssdash-owner").exists()
     assert (directory / "server.log").read_bytes() == b""
@@ -128,14 +153,11 @@ def test_darwin_error_closes_before_owner(tmp_path, monkeypatch, failure):
             raise OSError("fixture alias failure")
         raise AssertionError(fact)
 
-    monkeypatch.setattr(runtime, "LiveArtifacts", lambda *a, **kw: observed)
-    monkeypatch.setattr(runtime, "OwnedProcess", lambda *a, **kw: pytest.fail("no owner"))
-    value = runtime.Runtime(
-        LaunchInput("/fixture", env), policy(tmp_path), host=object(), emit=emitted.append
-    )
     out = tmp_path / "instance"
     with pytest.raises(RuntimeError, match="preparation failed"):
-        value.engine(str(out), 8080, 0, "static", "", [])
+        historical_engine(
+            LaunchInput("/fixture", env), out, 8080, observed, emitted.append, "darwin"
+        )
     assert emitted[-1].channel == "stderr"
     assert (out / ".ssdash-owner").exists() and (out / "server.log").read_bytes() == b""
     assert not (out / "ownership.json").exists()
