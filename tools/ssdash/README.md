@@ -1,8 +1,8 @@
-# SSDash offline framework
+# SSDash framework tools
 
 This package reads model headers to create source artifacts, and turns recorded
-probe reports and arm logs into calibration artifacts, a plan, legacy launcher settings and recorded conversation reports. The commands are opt-in offline consumers;
-`tools/adaptive` and the existing launchers remain the production entry points.
+probe reports and arm logs into calibration artifacts, a plan, legacy launcher settings and recorded conversation reports. The `launch --dry-run` command also prepares a launch description from explicit host facts.
+`tools/adaptive` and the existing launchers remain the entry points for live execution.
 The package also provides an injectable controller model with caller-owned observation
 sessions and complete request/bootstrap/conversation orchestration with required effect ports.
 It supplies no live engine or HTTP executor. The package runtime uses only
@@ -12,6 +12,7 @@ the Python standard library.
 
 | Command | Recorded input | Output |
 | --- | --- | --- |
+| `ssdash launch --dry-run` | Model/settings files, explicit recorded host facts | Prepared source indexes, ordered argv/environment/scope and output |
 | `ssdash source` | GGUF headers, optional v1 pack index, dense placement text | Expert JSON/alias TSV, source facts, lane arguments or fio iolog text |
 | `ssdash probe` | Existing probe reports and expert metadata | Device schema-2 JSON on stdout |
 | `ssdash validate` | Device schema-2 JSON | Validation result; no rewritten artifact |
@@ -27,6 +28,81 @@ control an online session. Install from the repository root:
 ```sh
 python3 -m pip install ./tools/ssdash
 ```
+
+## Prepare a launch
+
+`launch` requires `--dry-run`, a repository directory and a JSON file of recorded
+host facts. It does not start a server, query the GPU, listen on a port or create
+a systemd scope. It can create or refresh header-based expert indexes, just like
+the existing launcher dry run. Use a dedicated artifact directory when inspecting
+a configuration:
+
+```sh
+ssdash launch --dry-run --platform linux --repo . \
+  --host-facts recorded/host-linux.json \
+  --model-conf tools/adaptive/models/muse-spark.conf \
+  --model models/model.gguf --settings recorded/settings.env \
+  --artifact-dir recorded/expert-index --result recorded/launch.json
+
+SSD_LLAMA_BUILD_DIR=build-mac ssdash launch --dry-run --platform darwin --repo . \
+  --host-facts recorded/host-darwin.json --profile muse --mode server \
+  --model models/model-00001-of-00002.gguf --artifact-dir recorded/cache \
+  --result recorded/launch.json -- --seed 17
+```
+
+Linux uses `SERVER_BIN`, `CPUSET`, `MEMORY_MAX` and the other existing launcher
+inputs from the caller's environment or SETTINGS. Explicit CLI model/settings
+paths override their corresponding environment path. Appended arguments follow
+`--` and keep their order. The environment still takes precedence over SETTINGS
+inside the existing profile; legacy engine variable names are forwarded unchanged.
+`MEMORY_MAX` is a systemd value passed through to the returned scope, not a
+promise that the scope was created. The JSON result contains the inherited
+environment as well as ordered assigned values; keep that file private if the
+caller environment contains private data.
+
+The host-fact file contains values that would otherwise come from the target
+machine. Fields are requested lazily, and a missing field fails when needed;
+there is no fallback to the current machine. The files in `examples/` contain
+**synthetic values for documentation**, not measurements to reuse on a device.
+Linux fields are `filesystem`, `gpu_available`, `gpu_memory`, `gpu_processes`,
+`default_threads`, `ss_available`, `port_busy`, `has_uring`, `cgroup_v2`,
+`memory_kib` (total and available KiB), `euid`, `user_manager`,
+`memory_controller` and `scope_suffix`. Some fields are unnecessary when an input
+already supplies the value: for example CPUSET supplies the thread count and
+LAUNCH_SCOPE supplies the scope name. `filesystem` describes the prompt-cache
+location, and `has_uring` describes the selected CUDA backend/server. Host facts
+must correspond to those paths; this command does not certify them.
+
+Darwin fields are `platform_system`, `platform_machine`, `physical_memory`
+(bytes) and `disk_free` (bytes at the index destination). The Darwin path requires
+Apple Silicon facts, the complete shard set and its model template. It retains
+the strict GGUF index generator, cache defaults and selected-expert read policy;
+it is separate from the Linux CPU-sink placement model. Index generation happens
+on every Darwin dry run. Alias and summary publication are two ordered file
+replacements, so a failure after the first can leave the new alias with the old
+summary. The retained `Starting ...` diagnostic describes the prepared argv;
+this command always stops before execution. No automatic hardware collector or
+online Mac controller is supplied.
+
+For numeric launcher inputs, the new interface accepts unsigned decimal data
+within the existing per-key bounds and at most `9223372036854775807`. Linux
+arithmetic fields require canonical spelling (`0` or a nonzero digit followed by
+digits); Bash octal spellings, expressions, variable references and signed
+wraparound are rejected with the key and source. The prefill threshold retains
+its original decimal leading-zero syntax and uint32 bound. CTX_CHECKPOINTS keeps
+its original digit string, including leading zeros. Darwin integers retain the
+original digit-only parsing, range checks and canonical decimal output. These
+are explicit input boundaries, not emulation of arbitrary shell arithmetic.
+If several SETTINGS keys are unknown, the first is reported in file order.
+
+The API separates `resolve_linux` / `resolve_darwin` from `prepare`: the pure
+resolver returns the next required fact, and preparation delivers prior output
+before servicing it. Artifact operations use the typed metadata implementation;
+actual traceback paths and line numbers identify that implementation. They are
+not rewritten to impersonate the former helper script. Output failures stop
+later artifact work. `LAUNCH_RESOLVE=1` still stops before assets or host facts,
+but its result is structured model/conf data rather than shell-evaluable `%q`
+assignments. Use `--result` to save that early result.
 
 Source artifacts can be generated without reading tensor payloads or running a probe:
 

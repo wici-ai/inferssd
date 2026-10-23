@@ -1,0 +1,19 @@
+{
+  "filesystem": "ext4",
+  "gpu_available": true,
+  "gpu_memory": "16384",
+  "gpu_processes": "",
+  "default_threads": "8",
+  "ss_available": true,
+  "port_busy": "",
+  "has_uring": true,
+  "cgroup_v2": true,
+  "memory_kib": [
+    16777216,
+    14680064
+  ],
+  "euid": 1000,
+  "user_manager": true,
+  "memory_controller": true,
+  "scope_suffix": "synthetic-0001"
+}

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from launch_cases import LINUX_CASES, MAC_CASES
+from launch_test_paths import canonical_roots
 from observe_launch_F import mac_case
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -35,4 +36,4 @@ def test_linux_expected_cases_and_partial_outputs():
 def test_original_mac_launcher_observation(case):
     golden = json.loads((FIXTURES / "launch-mac-goldens.json").read_text())
     expected = next(x for x in golden if x["case"]["name"] == case["name"])
-    assert mac_case(case) == expected
+    assert canonical_roots(mac_case(case)) == canonical_roots(expected)
