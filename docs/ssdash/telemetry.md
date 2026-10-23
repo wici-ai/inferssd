@@ -35,8 +35,9 @@ is no process-global mutable settings/telemetry owner. The old diagnostic
 readers still present outside this foundation module require the separate
 supported-profile retirement batch; this document does not imply they are gone.
 
-The production `--ssd-telemetry FILE` and context lifetime connection are
-integrated with the C++ server entry. Defining this writer and its Python
-consumer does not by itself certify every old trace/profile/MRC emitter has
-been migrated. Numerical equality with channels enabled/disabled remains an
+The production integration contract is a `--ssd-telemetry FILE` option and
+context-owned writer, with all publishers joined before its destruction. The
+server/context connection is pending in this foundation batch. Defining this
+writer and its Python consumer does not by itself certify every old
+trace/profile/MRC emitter has been migrated. Numerical equality with channels enabled/disabled remains an
 engine integration gate, not a conclusion of JSON protocol unit tests.

@@ -70,7 +70,7 @@ def integer(literal: str, low: int, high: int) -> int:
 
 def typed(prop: Mapping[str, Any], literal: str) -> Value:
     literal.encode("utf-8")
-    literal = literal.strip()
+    literal = literal.strip(" \t\r\n")
     kind = prop["kind"]
     if literal.startswith('"') and kind != "paths":
         if kind == "integer":
@@ -109,7 +109,7 @@ def typed(prop: Mapping[str, Any], literal: str) -> Value:
             raise ValueError("duplicate CPU ID")
         return tuple(result)
     costs: dict[str, float] = {}
-    for word in literal.replace(",", " ").split():
+    for word in filter(None, re.split(r"[ \t\r\n\v\f]+", literal.replace(",", " "))):
         key, equal, number = word.partition("=")
         if not equal or key not in prop["properties"] or key in costs:
             raise ValueError("unknown or duplicate cost term " + key)
@@ -137,8 +137,8 @@ def uncomment(line: str) -> tuple[str, str]:
         if character == '"':
             quoted = not quoted
         if not quoted and character == "#":
-            return line[:i].strip(), line[i + 1 :]
-    return line.strip(), ""
+            return line[:i].strip(" \t\r\n"), line[i + 1 :]
+    return line.strip(" \t\r\n"), ""
 
 
 def parse(
@@ -172,8 +172,8 @@ def parse(
         values[key] = Setting(key, value, origin, location, receipt)
 
     if text is not None:
-        lines = text.splitlines()
-        if not lines or lines[0].strip() != "ssdash-settings 1":
+        lines = text.split("\n")
+        if not lines or lines[0].strip(" \t\r\n") != "ssdash-settings 1":
             raise ValueError(source + ":1: expected ssdash-settings 1")
         seen = set()
         for n, line in enumerate(lines[1:], 2):
@@ -181,7 +181,7 @@ def parse(
             if not body:
                 continue
             key, equal, literal = body.partition("=")
-            key = key.strip()
+            key = key.strip(" \t\r\n")
             if not equal or key in seen:
                 raise ValueError(f"{source}:{n}: missing '=' or duplicate key {key}")
             seen.add(key)

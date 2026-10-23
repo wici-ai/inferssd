@@ -59,6 +59,7 @@ def test_registry_generated_schema_exact(native_contract):
             "place.costs=cpu_fixed_us=204,link_gbps=12.3\n",
         ),
         ("darwin", "ssdash-settings 1\nhost.expert_cache_mib=12288\ncpu.threads=8\n"),
+        ("linux", 'ssdash-settings 1\nexpert.source=["/path-\u2028-file"]\n'),
     ],
 )
 def test_cpp_python_snapshot_exact(native_contract, tmp_path, platform, text):
@@ -110,6 +111,18 @@ def test_invalid_contract_refused_by_both(native_contract, tmp_path, body):
         [str(native_contract), "--parse", str(source), "linux"], capture_output=True, text=True
     )
     assert result.returncode == 1 and str(source) in result.stderr
+
+
+def test_unicode_header_whitespace_refused_by_both(native_contract, tmp_path):
+    text = "\u3000ssdash-settings 1\u3000\n"
+    source = tmp_path / "header.ssd"
+    source.write_text(text)
+    with pytest.raises(ValueError):
+        parse(text, str(source))
+    result = subprocess.run(
+        [str(native_contract), "--parse", str(source), "linux"], capture_output=True, text=True
+    )
+    assert result.returncode == 1
 
 
 def test_cli_precedence_and_snapshot_owned():
