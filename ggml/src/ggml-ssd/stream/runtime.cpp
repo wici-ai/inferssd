@@ -66,7 +66,7 @@ bool runtime::copy_dense(ggml_backend_t backend, const ggml_tensor * source, ggm
     stats_.dense_first_us += hit ? 0 : elapsed;
     stats_.dense_wait_us += wait_us;
     stats_.dense_readahead += hit ? 1 : 0;
-    return publish("stream.dense", ggml_nbytes(source), elapsed, 1);
+    return publish("ssd.stream.dense", ggml_nbytes(source), elapsed, 1);
 }
 
 int runtime::copy_experts(ggml_backend_t backend, const ggml_tensor * source, ggml_tensor * destination,
@@ -94,7 +94,7 @@ int runtime::copy_experts(ggml_backend_t backend, const ggml_tensor * source, gg
         stats_.expert_slices += copied;
         stats_.bytes += plan.bytes;
         stats_.read_us += elapsed;
-        return publish("stream.experts", bytes, elapsed, reads) ? 1 : -1;
+        return publish("ssd.stream.experts", bytes, elapsed, reads) ? 1 : -1;
     } catch (...) { return -1; }
 }
 
