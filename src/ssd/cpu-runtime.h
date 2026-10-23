@@ -20,9 +20,6 @@
 #include <string>
 #include <vector>
 
-#if defined(__linux__)
-#include <dlfcn.h>
-#endif
 
 // Only metadata is retained here. Expert tensors are deliberately absent from
 // the custom op's graph sources, so the scheduler cannot copy their payloads.
@@ -70,6 +67,7 @@ struct llama_kimi_cpu_sink_runtime {
     decltype(&kimi_cpu_sink_cache_prefill_room) cache_prefill_room = nullptr; // optional
     resolve_fn resolve = nullptr;
     ggml_backend_reg_t cpu_reg = nullptr;
+    const ssd::cpu::api_v1 * cpu_api = nullptr;
     const llama_kimi_cpu_sink_node * active_node = nullptr;
     uint64_t calls = 0;
     uint64_t read_requests = 0;
@@ -241,53 +239,52 @@ struct llama_kimi_cpu_sink_runtime {
         return false;
     }
 
+    void bind_provider(ggml_backend_reg_t registry) {
+        if (cpu_api) {
+            GGML_ASSERT(registry == cpu_reg);
+            return;
+        }
+        const auto get = reinterpret_cast<ssd::cpu::get_api_v1>(
+            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v1"));
+        const auto * api = get ? get() : nullptr;
+        if (!ssd::cpu::valid(api) || api->source_size() != sizeof(kimi_cpu_sink_source)) {
+            GGML_ABORT("CPU sink executor ABI mismatch; rebuild the CPU backend and model together");
+        }
+        cpu_api = api;
+        cpu_reg = registry;
+        cache_make_room = api->cache_make_room;
+        cache_prefill_room = api->cache_prefill_room;
+    }
+
+    void bind_provider_before_create() {
+        if (cpu_api) { return; }
+        const auto registry = ggml_backend_reg_by_name("CPU");
+        if (!registry) {
+            GGML_ABORT("CPU sink requires a loaded CPU backend for host memory admission");
+        }
+        bind_provider(registry);
+    }
+
     void initialize(ggml_backend_reg_t registry) {
         if (sink) {
             GGML_ASSERT(registry == cpu_reg);
             return;
         }
-        cpu_reg = registry;
-        auto create = reinterpret_cast<decltype(&kimi_cpu_sink_create)>(
-            ggml_backend_reg_get_proc_address(registry, "kimi_cpu_sink_create"));
-        run = reinterpret_cast<decltype(run)>(
-            ggml_backend_reg_get_proc_address(registry, "kimi_cpu_sink_run"));
-        destroy = reinterpret_cast<decltype(destroy)>(
-            ggml_backend_reg_get_proc_address(registry, "kimi_cpu_sink_destroy"));
-        cache_configure = reinterpret_cast<decltype(cache_configure)>(
-            ggml_backend_reg_get_proc_address(registry, "kimi_cpu_sink_cache_configure"));
-        cache_begin = reinterpret_cast<decltype(cache_begin)>(
-            ggml_backend_reg_get_proc_address(registry, "kimi_cpu_sink_cache_begin"));
-        vram_phase_complete = reinterpret_cast<decltype(vram_phase_complete)>(
-            ggml_backend_reg_get_proc_address(registry, "kimi_cpu_sink_vram_phase_complete"));
-        cache_get_stats = reinterpret_cast<decltype(cache_get_stats)>(
-            ggml_backend_reg_get_proc_address(registry, "kimi_cpu_sink_cache_get_stats"));
-#if defined(__linux__)
-        const auto source_size = reinterpret_cast<size_t (*)(void)>(
-            dlsym(RTLD_DEFAULT, "kimi_cpu_sink_source_size"));
-        if (!source_size || source_size() != sizeof(kimi_cpu_sink_source)) {
-            GGML_ABORT("CPU sink native-range ABI mismatch; rebuild the CPU backend and model together");
-        }
+        bind_provider(registry);
+        const auto create = cpu_api->create;
+        run = cpu_api->run;
+        run_activation = cpu_api->run_activation;
+        destroy = cpu_api->destroy;
+        cache_configure = cpu_api->cache_configure;
+        cache_begin = cpu_api->cache_begin;
+        vram_phase_complete = cpu_api->vram_phase_complete;
+        cache_get_stats = cpu_api->cache_get_stats;
+        prefetch_hint = cpu_api->prefetch_hint;
 #if defined(LLAMA_SSD_STORE)
         resolve = &ggml_ssd_c0_resolve_raw_direct_shape;
 #else
-        resolve = reinterpret_cast<resolve_fn>(
-            dlsym(RTLD_DEFAULT, "ggml_cuda_moe_expert_pack_resolve_raw_direct_shape"));
+        GGML_ABORT("CPU sink requires the shared SSD expert store; build with LLAMA_SSD_STORE=ON");
 #endif
-        // Exported by the same CPU backend library as the registry entries
-        // above; looked up like the resolver, leaving the proc-address table as is.
-        run_activation = reinterpret_cast<decltype(run_activation)>(
-            dlsym(RTLD_DEFAULT, "kimi_cpu_sink_run_activation"));
-        cache_make_room = reinterpret_cast<decltype(cache_make_room)>(
-            dlsym(RTLD_DEFAULT, "kimi_cpu_sink_cache_make_room"));
-        cache_prefill_room = reinterpret_cast<decltype(cache_prefill_room)>(
-            dlsym(RTLD_DEFAULT, "kimi_cpu_sink_cache_prefill_room"));
-        prefetch_hint = reinterpret_cast<decltype(prefetch_hint)>(
-            dlsym(RTLD_DEFAULT, "kimi_cpu_sink_prefetch_hint"));
-#endif
-        if (!create || !run || !run_activation || !destroy || !resolve || !cache_configure || !cache_begin ||
-                !vram_phase_complete || !cache_get_stats) {
-            GGML_ABORT("CPU sink requires the CPU executor and direct expert-pack resolver; no fallback");
-        }
 
         int threads = 16;
         if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_THREADS")) {
@@ -311,10 +308,8 @@ struct llama_kimi_cpu_sink_runtime {
         }
         char error[512] = {};
         if (cache_compute_enabled) {
-            run_cache_compute = reinterpret_cast<decltype(run_cache_compute)>(
-                ggml_backend_reg_get_proc_address(registry, "kimi_cpu_sink_run_cache_compute"));
-            auto config = reinterpret_cast<decltype(&kimi_cache_compute_config_from_env)>(
-                ggml_backend_reg_get_proc_address(registry, "kimi_cache_compute_config_from_env"));
+            run_cache_compute = cpu_api->run_cache_compute;
+            const auto config = cpu_api->cache_compute_config;
             if (!run_cache_compute || !config || !config(&cache_compute_config, error, sizeof(error))) {
                 GGML_ABORT("cache-compute configuration failed: %s; no fallback", error);
             }
@@ -413,8 +408,7 @@ struct llama_kimi_cpu_sink_runtime {
         if ((!vram_budget && !cache_budget) || !registry) { return; }
         initialize(registry);
 #if defined(__linux__)
-        auto reserve = reinterpret_cast<decltype(&kimi_cpu_sink_vram_reserve)>(
-            dlsym(RTLD_DEFAULT, "kimi_cpu_sink_vram_reserve"));
+        const auto reserve = cpu_api->vram_reserve;
         // the load-time graph's pages, held from here to the first decode token: the load step leaves their room
         if (prefill_pages && cache_prefill_room) { cache_prefill_room(sink, prefill_pages, 0, 0); }
         char error[512] = {};
@@ -430,12 +424,8 @@ struct llama_kimi_cpu_sink_runtime {
     // the sink the ledger alone decides.
     bool make_room(uint64_t host_bytes, uint64_t device_bytes = 0) {
         std::lock_guard<std::mutex> lock(mutex);
-#if defined(__linux__)
-        if (!cache_make_room) {
-            cache_make_room = reinterpret_cast<decltype(cache_make_room)>(dlsym(RTLD_DEFAULT, "kimi_cpu_sink_cache_make_room"));
-        }
-#endif
-        return !cache_make_room || cache_make_room(sink, host_bytes, device_bytes);
+        bind_provider_before_create();
+        return cache_make_room(sink, host_bytes, device_bytes);
     }
 
     // Room for a prefill graph about to be allocated (kimi_cpu_sink_cache_prefill_room): its compute buffers and the
@@ -443,13 +433,8 @@ struct llama_kimi_cpu_sink_runtime {
     bool prefill_room(uint64_t pages, uint64_t host_bytes, uint64_t device_bytes) {
         std::lock_guard<std::mutex> lock(mutex);
         prefill_pages = pages;
-#if defined(__linux__)
-        if (!cache_prefill_room) {
-            cache_prefill_room = reinterpret_cast<decltype(cache_prefill_room)>(
-                dlsym(RTLD_DEFAULT, "kimi_cpu_sink_cache_prefill_room"));
-        }
-#endif
-        return !cache_prefill_room || cache_prefill_room(sink, pages, host_bytes, device_bytes);
+        bind_provider_before_create();
+        return cache_prefill_room(sink, pages, host_bytes, device_bytes);
     }
 
     bool phase_complete(bool decode) {

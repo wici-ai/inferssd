@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 #include "kimi-cpu-sink.h"
 #include "kimi-cpu-prefill.h"
+#include "ssd/api.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -766,7 +767,38 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+// Normal links bind these callbacks to this CPU backend, including with local
+// dynamic loading. Consumers do not search process-global symbols.
+static const ssd::cpu::api_v1 * ggml_backend_cpu_ssd_api_v1() {
+    static const ssd::cpu::api_v1 api = {
+        1, sizeof(ssd::cpu::api_v1),
+        &kimi_cpu_sink_source_size,
+        &kimi_cpu_sink_create,
+        &kimi_cpu_sink_run,
+        &kimi_cpu_sink_run_activation,
+        &kimi_cpu_sink_destroy,
+        &kimi_cpu_sink_cache_configure,
+        &kimi_cpu_sink_cache_begin,
+        &kimi_cpu_sink_vram_phase_complete,
+        &kimi_cpu_sink_cache_get_stats,
+        &kimi_cpu_sink_cache_make_room,
+        &kimi_cpu_sink_cache_prefill_room,
+        &kimi_cpu_sink_prefetch_hint,
+        &kimi_cpu_sink_vram_reserve,
+        &kimi_cpu_sink_run_cache_compute,
+        &kimi_cache_compute_config_from_env,
+        &kimi_cpu_prefill_create,
+        &kimi_cpu_prefill_run,
+        &kimi_cpu_prefill_run_activation,
+        &kimi_cpu_prefill_destroy,
+    };
+    return &api;
+}
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_cpu_ssd_api_v1") == 0) {
+        return (void *) ggml_backend_cpu_ssd_api_v1;
+    }
     if (strcmp(name, "kimi_cpu_prefill_create") == 0) {
         return (void *) kimi_cpu_prefill_create;
     }
