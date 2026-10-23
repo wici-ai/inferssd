@@ -53,7 +53,6 @@ bool ggml_cuda_moe_dense_copy_to_device(const char *, void *, size_t, void *, bo
 
 #include "common.cuh"
 #include "ggml-quants.h"
-#include "moe-common-lossless-format.h"
 #include "moe-common-object-pipeline-runtime.h"
 #include "moe-common-io-submit.h"
 #include "moe-common-role-cache.h"
@@ -129,7 +128,6 @@ extern "C" void ggml_cuda_moe_stream_one_cache_release_descriptors_synchronized(
 #include <sys/mman.h>
 #endif
 
-#include "moe-common-object-cache.h"
 #include "moe-common-object-transport.h"
 
 namespace ggml_moe_common_adapter {
@@ -231,7 +229,6 @@ private:
 #include <sys/mman.h>
 #endif
 
-#include "moe-common-object-cache.h"
 #include "moe-common-object-transport.h"
 
 extern "C" {
@@ -1556,8 +1553,7 @@ static bool batch_cache_invalidate_role_owner(batch_vram_cache *cache, int slot)
     if (!cache || slot < 0 || slot >= cache->n_slots) return false;
     if (cache->slot_key[slot] == 0) return true;
     const int cache_id = batch_cache_id_for_cache(cache);
-    if (cache_id < 0 || !ggml_moe_common::object_engine_invalidate_role_slot(
-                cache_id, slot, cache->slot_generation[slot])) {
+    if (cache_id < 0) {
         ++cache->owner_invalidation_failures;
         return false;
     }
@@ -2533,14 +2529,6 @@ static batch_vram_cache * batch_cache_get(size_t expert_sz) {
                  alloc / (1024.0*1024.0*1024.0), c->n_slots,
                  expert_sz / (1024.0*1024.0));
     std::atexit(batch_cache_report_atexit);
-    if (!ggml_moe_common::object_engine_configure_role_cache(cid, static_cast<size_t>(c->n_slots))) {
-        cudaFree(c->pool);
-        c->pool = nullptr;
-        c->n_slots = 0;
-        c->slot_sz = 0;
-        g_bcache_inited[cid] = true;
-        return nullptr;
-    }
     g_bcache_inited[cid] = true;
     return c;
 }

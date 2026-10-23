@@ -32,7 +32,7 @@ size_t q8_1_bytes(int columns) {
     return padded / QK8_1 * sizeof(block_q8_1);
 }
 
-__global__ void q2_activate(const float * up_gate, float * hidden, int hits, int rows,
+__global__ void generic_activate(const float * up_gate, float * hidden, int hits, int rows,
         int kind, float situ_beta, float situ_linear_beta, float swiglu_limit) {
     const int index = int(blockIdx.x * blockDim.x + threadIdx.x);
     if (index >= hits * rows) {
@@ -44,13 +44,13 @@ __global__ void q2_activate(const float * up_gate, float * hidden, int hits, int
         situ_beta, situ_linear_beta, swiglu_limit);
 }
 
-struct q2_engine {
+struct generic_engine {
     int device = -1;
     int latent = 0;
     int hidden = 0;
     int max_hits = 0;
-    int up_type = GGML_TYPE_IQ2_XXS;
-    int down_type_ = GGML_TYPE_Q2_K;
+    int up_type = GGML_TYPE_COUNT;
+    int down_type_ = GGML_TYPE_COUNT;
     size_t up_stride = 0;
     size_t down_stride = 0;
     size_t q8_bytes = 0;
@@ -70,17 +70,20 @@ struct q2_engine {
     bool poisoned = false;
     bool closed = false;
 
-    q2_engine(int device_, int latent_, int hidden_, int max_hits_, int weight_type, int down_type) :
+    generic_engine(int device_, int latent_, int hidden_, int max_hits_, int weight_type, int down_type) :
         device(device_), latent(latent_), hidden(hidden_), max_hits(max_hits_) {
+        if (weight_type == GGML_TYPE_IQ2_XXS && down_type == GGML_TYPE_Q2_K) {
+            throw std::runtime_error("IQ2_XXS/Q2_K expert format is retired");
+        }
         auto is_float = [](int type) { return type == GGML_TYPE_BF16 || type == GGML_TYPE_F16; };
         const bool floating = is_float(weight_type) && is_float(down_type);
         if (latent <= 0 || hidden <= 0 || latent > 16384 || hidden > 16384 ||
                 latent % 256 || hidden % 256 || max_hits < 1 || max_hits > 16) {
-            throw std::runtime_error("unsupported Q2 VRAM expert geometry");
+            throw std::runtime_error("unsupported generic VRAM expert geometry");
         }
         backend_handle = dlopen("libggml-cuda.so", RTLD_NOW | RTLD_LOCAL);
         if (!backend_handle) {
-            throw std::runtime_error(std::string("cannot load CUDA backend for Q2 VRAM engine: ") + dlerror());
+            throw std::runtime_error(std::string("cannot load CUDA backend for generic VRAM engine: ") + dlerror());
         }
         mmvq = reinterpret_cast<mmvq_fn>(dlsym(backend_handle, "ggml_cuda_moe_stream_mmvq_dev"));
         const auto supports = reinterpret_cast<bool (*)(int)>(dlsym(backend_handle, "ggml_cuda_moe_stream_mmvq_supports"));
@@ -123,7 +126,7 @@ struct q2_engine {
         closed = true;
         const auto checked = [](cudaError_t rc, const char * operation) noexcept {
             if (rc != cudaSuccess) {
-                std::fprintf(stderr, "fatal: Q2 VRAM engine cannot release ownership: %s: %s\n",
+                std::fprintf(stderr, "fatal: generic VRAM engine cannot release ownership: %s: %s\n",
                     operation, cudaGetErrorString(rc));
                 std::abort();
             }
@@ -142,15 +145,15 @@ struct q2_engine {
         if (stream) { checked(cudaStreamDestroy(stream), "destroy compute stream"); stream = nullptr; }
         if (backend_handle) {
             if (dlclose(backend_handle) != 0) {
-                std::fprintf(stderr, "fatal: Q2 VRAM engine cannot release ownership: close backend\n");
+                std::fprintf(stderr, "fatal: generic VRAM engine cannot release ownership: close backend\n");
                 std::abort();
             }
             backend_handle = nullptr;
         }
     }
 
-    ~q2_engine() {
-        std::fprintf(stderr, "[kimi_vram_q2_timing] calls=%llu hits=%llu total_us=%.0f\n",
+    ~generic_engine() {
+        std::fprintf(stderr, "[kimi_vram_generic_timing] calls=%llu hits=%llu total_us=%.0f\n",
             (unsigned long long) calls, (unsigned long long) hits, total_us);
         close();
     }
@@ -169,31 +172,31 @@ struct q2_engine {
 
     void run(const vram_compute_expert * experts, int count, const void * input, size_t input_bytes,
             const kimi_vram_activation & activation, float * output) {
-        if (closed || poisoned) { throw std::runtime_error("Q2 VRAM engine is closed"); }
+        if (closed || poisoned) { throw std::runtime_error("generic VRAM engine is closed"); }
         if (!experts || !input || !output || count < 1 || count > max_hits ||
                 input_bytes != size_t(latent) * sizeof(float)) {
-            throw std::runtime_error("Q2 VRAM engine input shape");
+            throw std::runtime_error("generic VRAM engine input shape");
         }
         if (activation.kind == KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP) {
             if (std::isnan(activation.swiglu_limit) || activation.swiglu_limit <= 1e-6f) {
-                throw std::runtime_error("Q2 VRAM engine invalid SwiGLU clamp");
+                throw std::runtime_error("generic VRAM engine invalid SwiGLU clamp");
             }
         } else if (activation.kind == KIMI_VRAM_ACTIVATION_SITU) {
             if (!std::isfinite(activation.situ_beta) || activation.situ_beta <= 0.0f ||
                     !std::isfinite(activation.situ_linear_beta)) {
-                throw std::runtime_error("Q2 VRAM engine invalid SiTU parameters");
+                throw std::runtime_error("generic VRAM engine invalid SiTU parameters");
             }
         } else {
-            throw std::runtime_error("Q2 VRAM engine activation kind");
+            throw std::runtime_error("generic VRAM engine activation kind");
         }
 
         const auto start = clock_type::now();
         std::memcpy(host_input, input, input_bytes);
         cuda_check(cudaSetDevice(device), "cudaSetDevice");
-        cuda_check(cudaMemcpyAsync(device_input, host_input, input_bytes, cudaMemcpyHostToDevice, stream), "Q2 input H2D");
+        cuda_check(cudaMemcpyAsync(device_input, host_input, input_bytes, cudaMemcpyHostToDevice, stream), "generic input H2D");
         for (int i = 0; i < count; ++i) {
             if (!experts[i].up || !experts[i].gate || !experts[i].down) {
-                throw std::runtime_error("Q2 VRAM engine null resident weight");
+                throw std::runtime_error("generic VRAM engine null resident weight");
             }
             if (!mmvq(up_type, experts[i].up, hidden, latent, up_stride,
                     device_input, device_q8, device_up_gate + size_t(2 * i) * hidden, stream) ||
@@ -203,10 +206,10 @@ struct q2_engine {
             }
         }
         const int rows = count * hidden;
-        q2_activate<<<(rows + 255) / 256, 256, 0, stream>>>(device_up_gate, device_hidden,
+        generic_activate<<<(rows + 255) / 256, 256, 0, stream>>>(device_up_gate, device_hidden,
             count, hidden, activation.kind, activation.situ_beta, activation.situ_linear_beta,
             activation.swiglu_limit);
-        cuda_check(cudaGetLastError(), "Q2 activation launch");
+        cuda_check(cudaGetLastError(), "generic activation launch");
         for (int i = 0; i < count; ++i) {
             if (!mmvq(down_type_, experts[i].down, latent, hidden, down_stride,
                     device_hidden + size_t(i) * hidden, device_q8,
@@ -215,8 +218,8 @@ struct q2_engine {
             }
         }
         const size_t output_bytes = size_t(count) * latent * sizeof(float);
-        cuda_check(cudaMemcpyAsync(host_down, device_down, output_bytes, cudaMemcpyDeviceToHost, stream), "Q2 output D2H");
-        cuda_check(cudaStreamSynchronize(stream), "Q2 compute synchronize");
+        cuda_check(cudaMemcpyAsync(host_down, device_down, output_bytes, cudaMemcpyDeviceToHost, stream), "generic output D2H");
+        cuda_check(cudaStreamSynchronize(stream), "generic compute synchronize");
         std::memcpy(output, host_down, output_bytes);
         ++calls;
         hits += uint64_t(count);
@@ -227,30 +230,30 @@ struct q2_engine {
 void * create(int device, int latent, int hidden, int max_hits, int weight_type, int down_type,
         char * error, size_t error_size) {
     try {
-        return new q2_engine(device, latent, hidden, max_hits, weight_type, down_type);
+        return new generic_engine(device, latent, hidden, max_hits, weight_type, down_type);
     } catch (const std::exception & e) {
         if (error && error_size) { std::snprintf(error, error_size, "%s", e.what()); }
         return nullptr;
     } catch (...) {
-        if (error && error_size) { std::snprintf(error, error_size, "unexpected Q2 VRAM create failure"); }
+        if (error && error_size) { std::snprintf(error, error_size, "unexpected generic VRAM create failure"); }
         return nullptr;
     }
 }
 
 void destroy(void * context) {
-    delete static_cast<q2_engine *>(context);
+    delete static_cast<generic_engine *>(context);
 }
 
 int compute(void * context, const vram_compute_expert * experts, int hits,
         const void * input, size_t input_bytes, const kimi_vram_activation * activation,
         float * output, char * error, size_t error_size) {
     try {
-        if (!context || !activation) { throw std::runtime_error("null Q2 VRAM compute argument"); }
-        static_cast<q2_engine *>(context)->run(experts, hits, input, input_bytes, *activation, output);
+        if (!context || !activation) { throw std::runtime_error("null generic VRAM compute argument"); }
+        static_cast<generic_engine *>(context)->run(experts, hits, input, input_bytes, *activation, output);
         return 0;
     } catch (const std::exception & e) {
         if (context) {
-            auto * engine = static_cast<q2_engine *>(context);
+            auto * engine = static_cast<generic_engine *>(context);
             engine->poisoned = true;
             engine->close();
         }
@@ -258,25 +261,25 @@ int compute(void * context, const vram_compute_expert * experts, int hits,
         return 1;
     } catch (...) {
         if (context) {
-            auto * engine = static_cast<q2_engine *>(context);
+            auto * engine = static_cast<generic_engine *>(context);
             engine->poisoned = true;
             engine->close();
         }
-        if (error && error_size) { std::snprintf(error, error_size, "unexpected Q2 VRAM compute failure"); }
+        if (error && error_size) { std::snprintf(error, error_size, "unexpected generic VRAM compute failure"); }
         return 1;
     }
 }
 
 size_t device_bytes(void * context) {
-    return context ? static_cast<q2_engine *>(context)->device_bytes() : 0;
+    return context ? static_cast<generic_engine *>(context)->device_bytes() : 0;
 }
 
 size_t host_bytes(void * context) {
-    return context ? static_cast<q2_engine *>(context)->host_bytes() : 0;
+    return context ? static_cast<generic_engine *>(context)->host_bytes() : 0;
 }
 } // namespace
 
-extern "C" const vram_format_compute_api * kimi_vram_q2_format_compute_get_api() {
+extern "C" const vram_format_compute_api * kimi_vram_generic_format_compute_get_api() {
     static const vram_format_compute_api api = {
         1, sizeof(vram_format_compute_api), create, destroy, compute, device_bytes, host_bytes
     };

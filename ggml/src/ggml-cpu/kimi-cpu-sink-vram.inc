@@ -18,16 +18,12 @@ struct sink_vram {
     bool format_mxfp4_input = false;
     bool mxfp4_batch_enabled = true;
     // The format's grouped-prefill lane (the tier's, prefill API v7): which engine its passes run on, and this layer's
-    // use of it: a batched engine (MXFP4's hand engine or the batched engine of any other format), Q2's per-token
-    // path, and whether this pass's streamed transients are read in place.
+    // use of it: a batched engine (MXFP4's hand engine or the batched engine of any other format),
+    // and whether this pass's streamed transients are read in place.
     kimi_vram_prefill_lane prefill_lane = {};
-    bool prefill_batched = false, prefill_q2 = false, prefill_in_place = false;
+    bool prefill_batched = false, prefill_in_place = false;
     bool exclusive = false, decode = false, prefill_open = false, async_upload = false, prefill_enabled = false;
     bool prefill_job_active = false;
-    int q2_prefill_ram_gpu_min_routes = 0;
-    int q2_prefill_ssd_gpu_min_routes = 0;
-    int q2_prefill_ssd_gpu_max_experts_per_layer = 0;
-    int q2_prefill_cold_admit_per_layer = 0;
     // The batched lanes' transient candidates and the per-layer SSD transient cap: the makespan decides by default
     // (1 route, no cap: a streamed transient holds only a ring slot and a device slot, whatever the count);
     // the environment keeps them as A/B switches (GGML_KIMI_CPU_PREFILL_RAM_GPU_MIN_ROUTES, _SSD_GPU_MIN_ROUTES,
@@ -201,49 +197,6 @@ struct sink_vram {
             cost.gpu_host_route_us, cost.link_gbps, cost.pageable_gbps, cost.drive_gbps, cost.drive_fixed_us,
             cost.gpu_token_us, prefill_ram_gpu_min_routes, prefill_ssd_gpu_min_routes,
             prefill_ssd_gpu_max_experts_per_layer);
-        if (const char * threshold = std::getenv("GGML_KIMI_CPU_PREFILL_Q2_RAM_GPU_MIN_ROUTES")) {
-            char * threshold_end = nullptr;
-            errno = 0;
-            const long parsed = std::strtol(threshold, &threshold_end, 10);
-            if (errno || threshold_end == threshold || *threshold_end || parsed < 0 || parsed > 2048) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_Q2_RAM_GPU_MIN_ROUTES must be in 0..2048");
-            }
-            q2_prefill_ram_gpu_min_routes = int(parsed);
-        }
-        if (const char * threshold = std::getenv("GGML_KIMI_CPU_PREFILL_Q2_SSD_GPU_MIN_ROUTES")) {
-            char * threshold_end = nullptr;
-            errno = 0;
-            const long parsed = std::strtol(threshold, &threshold_end, 10);
-            if (errno || threshold_end == threshold || *threshold_end || parsed < 0 || parsed > 2048) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_Q2_SSD_GPU_MIN_ROUTES must be in 0..2048");
-            }
-            q2_prefill_ssd_gpu_min_routes = int(parsed);
-        }
-        if (const char * count = std::getenv("GGML_KIMI_CPU_PREFILL_Q2_SSD_GPU_MAX_EXPERTS_PER_LAYER")) {
-            char * count_end = nullptr;
-            errno = 0;
-            const long parsed = std::strtol(count, &count_end, 10);
-            if (errno || count_end == count || *count_end || parsed < 0 || parsed > 64) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_Q2_SSD_GPU_MAX_EXPERTS_PER_LAYER must be in 0..64");
-            }
-            q2_prefill_ssd_gpu_max_experts_per_layer = int(parsed);
-        }
-        if (!!q2_prefill_ssd_gpu_min_routes != !!q2_prefill_ssd_gpu_max_experts_per_layer) {
-            throw std::runtime_error("Q2 SSD GPU scheduling requires both MIN_ROUTES and MAX_EXPERTS_PER_LAYER");
-        }
-        if (const char * count = std::getenv("GGML_KIMI_CPU_PREFILL_Q2_COLD_ADMIT_PER_LAYER")) {
-            char * count_end = nullptr;
-            errno = 0;
-            const long parsed = std::strtol(count, &count_end, 10);
-            if (errno || count_end == count || *count_end || parsed < 0 || parsed > 384) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_Q2_COLD_ADMIT_PER_LAYER must be in 0..384");
-            }
-            q2_prefill_cold_admit_per_layer = int(parsed);
-        }
-        if ((q2_prefill_ram_gpu_min_routes || q2_prefill_ssd_gpu_min_routes ||
-                q2_prefill_cold_admit_per_layer) && !prefill_enabled) {
-            throw std::runtime_error("Q2 prefill GPU scheduling/admission requires VRAM_PREFILL=1");
-        }
         const char * value = std::getenv("GGML_KIMI_CPU_SINK_VRAM_BYTES");
         if (!value || !value[0] || !std::strcmp(value, "0")) {
             if (exclusive || use_locations) { throw std::runtime_error("VRAM_EXCLUSIVE/CACHE_LOCATIONS require a nonzero VRAM budget"); }
@@ -564,7 +517,7 @@ struct sink_vram {
         prefill_plan.valid = false;
         prefill_cpu_fit = {};
         prefill_stats = {};
-        prefill_batched = prefill_q2 = prefill_in_place = false;
+        prefill_batched = prefill_in_place = false;
         if (!context || !prefill_enabled || source.empty()) { return 0; }
         int layer = -1, consumed = 0;
         const char * tensor_name = up->name;
@@ -604,7 +557,6 @@ struct sink_vram {
         format_mxfp4_input = prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_MXFP4;
         prefill_batched = prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_MXFP4 ||
             prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_BATCHED;
-        prefill_q2 = prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_TOKENS && prefill_lane.f32_input;
         for (size_t i = 0; i < source.size(); ++i) {
             source[i].vram_slot = slots[i];
             hits += slots[i] >= 0;
@@ -644,21 +596,17 @@ struct sink_vram {
             request.vram_ssd_transient = false;
             request.vram_ssd_streaming = false;
             request.vram_ssd_staging = -1;
-            request.vram_cold_admit = false;
-            request.vram_cold_admit_routes = 0;
             request.lane_start_us = 0.0;
             request.prefill_routes = 0;
         }
         const bool batched = prefill_batched;
-        if (!context || !prefill_enabled || (!prefill_q2 && !batched) || source.empty()) { return; }
-        const int ram_threshold = batched ? prefill_ram_gpu_min_routes : q2_prefill_ram_gpu_min_routes;
-        const int ssd_threshold = batched ? prefill_ssd_gpu_min_routes : q2_prefill_ssd_gpu_min_routes;
-        const int ssd_cap = batched ? prefill_ssd_gpu_max_experts_per_layer : q2_prefill_ssd_gpu_max_experts_per_layer;
+        if (!context || !prefill_enabled || !batched || source.empty()) { return; }
+        const int ram_threshold = prefill_ram_gpu_min_routes;
+        const int ssd_threshold = prefill_ssd_gpu_min_routes;
+        const int ssd_cap = prefill_ssd_gpu_max_experts_per_layer;
         const bool transient_ready = (ram_threshold || ssd_threshold) &&
             prefill_api->transient_available(context);
-        const bool cold_admission_ready = prefill_q2 && q2_prefill_cold_admit_per_layer &&
-            prefill_api->cold_admission_active(context);
-        if (!transient_ready && !cold_admission_ready) { return; }
+        if (!transient_ready) { return; }
 
         std::vector<int> token_routes(source.size(), 0);
         std::vector<int> last_token(source.size(), -1);
@@ -683,19 +631,19 @@ struct sink_vram {
             // worker), the drive's line, and the form the reads take (the list schedule when they fit the ring,
             // the coupled streamed form otherwise). The candidates move in order of routes, and the planner keeps the
             // fewest within its form's resolution of the lowest time. The reads are then issued in the order the
-            // lanes need them (lane_start_us), so that the lanes overlap. Q2 and the legacy selector keep their
+            // lanes need them (lane_start_us), so that the lanes overlap. The legacy selector keeps its
             // fixed 2026-09 fits and serial greedy rule.
             const bool makespan = batched && !prefill_legacy_schedule;
-            auto cpu_cost = [batched](int routes) {
-                return routes ? (batched ? 70.0 + 95.0 * routes : 70.0 + 184.0 * routes) : 0.0;
+            auto cpu_cost = [](int routes) {
+                return routes ? 70.0 + 95.0 * routes : 0.0;
             };
-            auto gpu_cost = [batched](int routes) {
-                return routes ? (batched ? 55.0 + 7.0 * routes : 15.0 + 39.0 * routes) : 0.0;
+            auto gpu_cost = [](int routes) {
+                return routes ? 55.0 + 7.0 * routes : 0.0;
             };
             auto expert_bytes = [&source](size_t i) {
                 return source[i].role[0].nbytes + source[i].role[1].nbytes + source[i].role[2].nbytes;
             };
-            auto upload_cost = [batched](uint64_t bytes) { return double(bytes) / (batched ? 6740.0 : 7000.0) + 10.0; };
+            auto upload_cost = [](uint64_t bytes) { return double(bytes) / 6740.0 + 10.0; };
             struct candidate { size_t index; int source; };
             std::vector<candidate> candidates;
             size_t ram_candidates = 0, ssd_candidates = 0;
@@ -805,7 +753,7 @@ struct sink_vram {
                 "gpu_backlog_after_us=%.1f link_backlog_us=%.1f "
                 "drive_us=%.1f fill_us=%.1f gpu_overhead_us=%.1f ring=%zu form=%s ring_locked=%d in_place=%d "
                 "makespan_before_us=%.1f makespan_after_us=%.1f scratch_available=1 displacement_slots=0\n",
-                batched ? "batched" : "q2", makespan ? "makespan" : "legacy",
+                "batched", makespan ? "makespan" : "legacy",
                 ram_threshold,ssd_threshold,ssd_limit,
                 ram_candidates,ram_selected,(unsigned long long)ram_selected_routes,
                 (unsigned long long)ram_selected_bytes,ssd_candidates,ssd_selected,
@@ -815,34 +763,6 @@ struct sink_vram {
                 int(prefill_in_place),time_before,time_after);
         }
 
-        if (cold_admission_ready) {
-            std::vector<size_t> cold_candidates;
-            for (size_t i = 0; i < source.size(); ++i) {
-                if (source[i].vram_slot < 0 && source[i].cache_hit < 0 && !source[i].vram_transient &&
-                        token_routes[i] >= 16) {
-                    cold_candidates.push_back(i);
-                }
-            }
-            std::stable_sort(cold_candidates.begin(), cold_candidates.end(), [&](size_t a, size_t b) {
-                if (token_routes[a] != token_routes[b]) { return token_routes[a] > token_routes[b]; }
-                return source[a].id < source[b].id;
-            });
-            batch.gpu_cold_admit_candidates = cold_candidates.size();
-            const size_t selected = std::min(cold_candidates.size(), size_t(q2_prefill_cold_admit_per_layer));
-            uint64_t selected_routes = 0, selected_bytes = 0;
-            for (size_t position = 0; position < selected; ++position) {
-                const size_t index = cold_candidates[position];
-                source[index].vram_cold_admit = true;
-                source[index].vram_cold_admit_routes = token_routes[index];
-                selected_routes += uint64_t(token_routes[index]);
-                for (int role = 0; role < 3; ++role) { selected_bytes += source[index].role[role].nbytes; }
-            }
-            std::fprintf(stderr,
-                "[kimi_cpu_prefill_cold_admit_schedule] format=q2 min_routes=16 per_layer=%d "
-                "candidates=%zu selected=%zu selected_routes=%llu selected_bytes=%llu zero_decode_heat=1 evict_existing=0\n",
-                q2_prefill_cold_admit_per_layer,cold_candidates.size(),selected,
-                (unsigned long long)selected_routes,(unsigned long long)selected_bytes);
-        }
     }
     void bind_prefill_ssd_transient(size_t request_index, const void * const data[3],
             int (*stage)(void *, int32_t, int) = nullptr, void * context = nullptr) {
@@ -860,26 +780,6 @@ struct sink_vram {
             return;
         }
         throw std::runtime_error("SSD prefill staging request was not scheduled");
-    }
-    void admit_cold_prefill(size_t request_index, const void * const data[3],
-            const sink_request & source, kimi_cpu_sink_prefill_batch & batch) {
-        if (!source.vram_cold_admit) { return; }
-        if (!context || !prefill_enabled || request_index >= requests.size()) {
-            throw std::runtime_error("cold-prefill VRAM admission lost its prepared request");
-        }
-        char error[512] = {};
-        int admitted = 0;
-        const auto start = sink_clock::now();
-        check(prefill_api->admit_cold(context, &requests[request_index], data[0], data[1], data[2],
-                &admitted, error, sizeof(error)), error);
-        const double elapsed = elapsed_us(start);
-        if (!admitted) { return; }
-        ++batch.gpu_cold_admit_experts;
-        batch.gpu_cold_admit_routes += uint64_t(source.vram_cold_admit_routes);
-        for (int role = 0; role < 3; ++role) {
-            batch.gpu_cold_admit_upload_bytes += source.role[role].nbytes;
-        }
-        batch.gpu_cold_admit_upload_us += elapsed;
     }
     void launch_prefill(const void * quantized, size_t quantized_stride, const float * f32, size_t f32_stride,
             const int32_t * route_requests, const float * weights, int nslots, int ntokens,
@@ -989,7 +889,7 @@ struct sink_vram {
     }
     void cancel_prefill() {
         if (!context || !prefill_enabled ||
-                (!prefill_job_active && !prefill_api->cold_admission_active(context))) { return; }
+                !prefill_job_active) { return; }
         char error[512] = {};
         if (prefill_api->cancel(context, error, sizeof(error))) {
             std::fprintf(stderr, "[kimi_vram_prefill] failed to drain GPU work: %s; aborting\n", error);

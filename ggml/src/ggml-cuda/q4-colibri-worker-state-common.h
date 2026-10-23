@@ -1,6 +1,6 @@
 #pragma once
 
-#include "moe-common-object-engine.h"
+#include "moe-common-cache-identity.h"
 
 using q4_colibri_slot_state = ggml_moe_common::role_slot_state;
 using q4_colibri_slot_marker = ggml_moe_common::role_slot_marker;

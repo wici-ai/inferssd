@@ -26,7 +26,7 @@ add_custom_command(OUTPUT "${KIMI_MXFP4_PARITY_OUTPUT}"
     VERBATIM)
 add_custom_target(kimi-mxfp4-parity DEPENDS "${KIMI_MXFP4_PARITY_OUTPUT}")
 
-add_library(kimi-vram-tier SHARED vram-tier.cpp mxfp4-compute-adapter.cpp q2-compute-adapter.cu
+add_library(kimi-vram-tier SHARED vram-tier.cpp mxfp4-compute-adapter.cpp generic-compute-adapter.cu
     group-compute-adapter.cu)
 target_include_directories(kimi-vram-tier PRIVATE ../../../include ../.. ../../ggml-cpu)
 target_compile_features(kimi-vram-tier PRIVATE cxx_std_17)

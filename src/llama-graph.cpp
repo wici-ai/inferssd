@@ -2319,18 +2319,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         const float swiglu_limit = arch == LLM_ARCH_DEEPSEEK41 && il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
         const bool deepseek41_mxfp4 = sink_layout && up_exps->type == GGML_TYPE_MXFP4 &&
             gate_exps->type == GGML_TYPE_MXFP4 && down_exps->type == GGML_TYPE_MXFP4;
-        const bool deepseek41_q2 = sink_layout && up_exps->type == GGML_TYPE_IQ2_XXS &&
-            gate_exps->type == GGML_TYPE_IQ2_XXS && down_exps->type == GGML_TYPE_Q2_K;
         const bool deepseek41_swiglu_clamp = sink_layout && arch == LLM_ARCH_DEEPSEEK41 &&
             type_op == LLM_FFN_SILU && !cache_compute && (n_tokens == 1 || cpu_sink_prefill) &&
-            (deepseek41_mxfp4 || deepseek41_q2) &&
+            deepseek41_mxfp4 &&
             std::isfinite(swiglu_limit) && swiglu_limit > 1e-6f;
         // any expert types the sink can compute (it refuses the others): Q8_0, BF16, UD-Q4_K_XL's Q4_K/Q5_K, ...
         const bool muse_swiglu = sink_layout && arch == LLM_ARCH_MUSE_SPARK &&
             type_op == LLM_FFN_SILU && !cache_compute && post_exp_norm && gate_exps->type == up_exps->type;
         if (!deepseek41_swiglu_clamp && !muse_swiglu) {
             GGML_ABORT("CPU sink layer=%d requires contiguous DeepSeek-V4.1 clamped SwiGLU experts in MXFP4/MXFP4/MXFP4 or "
-                "IQ2_XXS/IQ2_XXS/Q2_K, or Muse Spark SwiGLU with per-expert post norm, "
+                "Muse Spark SwiGLU with per-expert post norm, "
                 "without LoRA/bias/scales; no fallback", il);
         }
 

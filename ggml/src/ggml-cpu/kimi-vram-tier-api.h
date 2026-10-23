@@ -241,9 +241,8 @@ struct kimi_vram_prefill_api {
                   struct kimi_vram_prefill_stats * stats,
                   char * error, size_t error_size);
     int (*cancel)(void * context, char * error, size_t error_size);
-    // True only for a tier initialized by the current cold prefill. admit_cold
-    // copies before returning, so an O_DIRECT ring source may be recycled as
-    // soon as the call succeeds. *admitted is zero when no empty slot remains.
+    // Reserved v7 slots for retired Q2 cold admission: active is always zero;
+    // admit_cold returns an error, clears *admitted and drains the context.
     int (*cold_admission_active)(void * context);
     int (*admit_cold)(void * context, const struct kimi_vram_request * request,
                       const void * up, const void * gate, const void * down,

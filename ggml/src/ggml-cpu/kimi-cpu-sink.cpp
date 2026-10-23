@@ -431,8 +431,6 @@ struct sink_request {
     bool vram_ssd_transient = false;
     bool vram_ssd_streaming = false;
     int vram_ssd_staging = -1;
-    bool vram_cold_admit = false;
-    int vram_cold_admit_routes = 0;
     double lane_start_us = 0.0; // MXFP4 grouped prefill: predicted start on its lane (CPU or GPU)
     int prefill_routes = 0;     // grouped prefill: the expert's distinct tokens
     bool cache_lease = false;
@@ -1625,12 +1623,6 @@ struct sink_slot {
     size_t request = 0;
 };
 
-// Q2 prefill keeps dedicated, page-aligned staging storage through finish.
-// MXFP4 prefill instead returns each ring credit after its GPU upload.
-struct sink_prefill_staging {
-    sink_buffer role[3];
-};
-
 // Diagnostic only. All times use the scheduler's CLOCK_MONOTONIC microseconds.
 // An I/O completion is when this process observes the CQE, not a device timestamp.
 // The I/O thread and each worker write disjoint fields; print only after io_done
@@ -1795,7 +1787,6 @@ struct kimi_cpu_sink {
     // The read ring's buffers page-locked for the GPU tier's copies (ring_lock, kimi-host-lock.h): once per
     // allocation, undone before the buffers are reallocated or freed.
     kimi_ring_lock ring_pages;
-    std::vector<sink_prefill_staging> prefill_ssd_staging;
     std::vector<sink_request> requests;
     std::vector<size_t> io_requests;
     sink_cache cache;
@@ -4039,8 +4030,7 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
         // A GPU route's activation rows over the link: one row of the engine's input type, its token index and weight
         // (set once prepare_prefill has seen the layer's format).
         double route_bytes = 0.0;
-        // Set once prepare_prefill has seen this layer's format: before it, the first MXFP4 call of a
-        // process would still see no format and stage its transients the Q2 way.
+        // Set once prepare_prefill has seen this layer's format.
         bool streaming_ssd = false;
         auto streaming_stage = +[](void * context, int32_t request_index, int phase) -> int {
             auto * owner = static_cast<kimi_cpu_sink *>(context);
@@ -4093,7 +4083,7 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
             // decode cache and an SSD miss never receives a duplicate RAM slot.
             sink->cache.prepare_prefill_read(sink->requests, up, gate, down, sink->current);
             // Streamed transients hold a ring slot and a device slot each (in place, a ring slot alone), whatever their
-            // number, so only the optional cap limits them; Q2 staging owns one host buffer per transient.
+            // number, so only the optional cap limits them.
             const int streaming_cap = sink->vram.prefill_ssd_gpu_max_experts_per_layer;
             const size_t staging_limit = !streaming_ssd ? sink->slots.size() :
                 streaming_cap < 0 ? sink->requests.size() : size_t(streaming_cap);
@@ -4110,16 +4100,13 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
             for (const auto & request : sink->requests) {
                 if (!request.vram_ssd_transient) { continue; }
                 if (request.vram_ssd_staging < 0) {
-                    throw std::runtime_error("Q2 SSD prefill staging index is absent");
+                    throw std::runtime_error("SSD prefill staging index is absent");
                 }
                 ssd_transient_count = std::max(
                     ssd_transient_count, size_t(request.vram_ssd_staging) + 1);
             }
             if (ssd_transient_count > staging_limit) {
                 throw std::runtime_error("SSD prefill staging exceeds the allowed capacity");
-            }
-            if (!streaming_ssd && sink->prefill_ssd_staging.size() < ssd_transient_count) {
-                sink->prefill_ssd_staging.resize(ssd_transient_count);
             }
             ssd_transient_requests.assign(ssd_transient_count, std::numeric_limits<size_t>::max());
             for (size_t i = 0; i < sink->requests.size(); ++i) {
@@ -4128,25 +4115,15 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
                 const size_t staging = size_t(request.vram_ssd_staging);
                 if (staging >= ssd_transient_requests.size() ||
                         ssd_transient_requests[staging] != std::numeric_limits<size_t>::max()) {
-                    throw std::runtime_error("invalid duplicate Q2 SSD prefill staging index");
+                    throw std::runtime_error("invalid duplicate SSD prefill staging index");
                 }
                 ssd_transient_requests[staging] = i;
-                if (!streaming_ssd) {
-                    const void * data[3];
-                    for (int role = 0; role < 3; ++role) {
-                        auto & buffer = sink->prefill_ssd_staging[staging].role[role];
-                        buffer.reserve(request.role[role].nbytes);
-                        request.read_target[role] = buffer.data;
-                        data[role] = static_cast<const char *>(buffer.data) + request.role[role].data_offset;
-                    }
-                    sink->vram.bind_prefill_ssd_transient(i, data);
-                } else {
-                    request.vram_ssd_streaming = true;
-                }
+                if (!streaming_ssd) { throw std::runtime_error("SSD transient requires a batched streaming lane"); }
+                request.vram_ssd_streaming = true;
             }
             if (std::find(ssd_transient_requests.begin(), ssd_transient_requests.end(),
                     std::numeric_limits<size_t>::max()) != ssd_transient_requests.end()) {
-                throw std::runtime_error("non-contiguous Q2 SSD prefill staging indices");
+                throw std::runtime_error("non-contiguous SSD prefill staging indices");
             }
 
             sink->io_requests.clear();
@@ -4193,8 +4170,7 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
                     }
                 }
             } else {
-                // Q2 staging owns its payload through finish. Reads release
-                // only the ring credit before CPU expert processing starts.
+                // With no streamed GPU transients, only the CPU reads remain.
                 for (size_t i : ssd_transient_requests) { append_io_request(i); }
                 for (size_t i : cpu_ssd_requests) { append_io_request(i); }
             }
@@ -4305,12 +4281,6 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
             // the grouped path's line, from the passes of the batched engine (a one-token pass is priced as decode)
             if (batch) { sink->vram.observe_prefill_cpu(request.prefill_routes, compute_us); }
             if (sink->profile_enabled) { sink->current.compute_cpu_us += sink_thread_cpu_us() - cpu_start; }
-            // A cold admission copies synchronously before this O_DIRECT ring
-            // slot is returned to the I/O worker. It is timed separately from
-            // CPU expert compute and never borrows the ring pointer.
-            if (batch && request.vram_cold_admit) {
-                sink->vram.admit_cold_prefill(expert, data, request, *batch);
-            }
             if (slot) {
                 std::lock_guard<std::mutex> lock(sink->io_mutex);
                 slot->state = sink_slot::empty;

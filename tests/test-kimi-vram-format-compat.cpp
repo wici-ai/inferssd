@@ -27,5 +27,11 @@ int main(){try{
     require(api_launch(&t,input.data(),input.size()*sizeof(float),4,25,error,sizeof(error))!=0 &&
         std::strstr(error,"implicit expert format retired") && !t.table && !t.arena && t.done && t.pending_uploads.empty(),
         "implicit launch returned with explicit CUDA work or cache still live");
-    std::puts("REAL_CUDA_FORMAT_COMPAT_DRAIN_PASS checks=4");return 0;
+    warm();t.begin(17,2,true);lifecycle_prepare(t,&request,1,&slot);lifecycle_launch(t,input);
+    int admitted=99;
+    require(prefill_cold_admission_active(&t)==0 &&
+        prefill_admit_cold(&t,&request,data[0],data[1],data[2],&admitted,error,sizeof(error))!=0 &&
+        !admitted && std::strstr(error,"Q2 cold admission retired") && !t.table && !t.arena && t.done && t.pending_uploads.empty(),
+        "retired cold admission returned with CUDA work or cache still live");
+    std::puts("REAL_CUDA_FORMAT_COMPAT_DRAIN_PASS checks=5");return 0;
 }catch(const std::exception & e){std::fprintf(stderr,"FORMAT_COMPAT_DRAIN_FAIL: %s\n",e.what());return 1;}}

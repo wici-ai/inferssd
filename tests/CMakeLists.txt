@@ -116,13 +116,6 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
-add_executable(test-q4-colibri-worker test-q4-colibri-worker.cpp)
-find_package(Threads REQUIRED)
-target_link_libraries(test-q4-colibri-worker PRIVATE Threads::Threads)
-add_test(NAME q4_colibri_worker COMMAND test-q4-colibri-worker)
-add_test(NAME q4_colibri_generation COMMAND test-q4-colibri-worker)
-set_property(TEST q4_colibri_worker q4_colibri_generation PROPERTY LABELS main)
-
 add_executable(test-moe-common-dynamic-tier test-moe-common-dynamic-tier.cpp)
 target_link_libraries(test-moe-common-dynamic-tier PRIVATE Threads::Threads)
 add_test(NAME moe_common_dynamic_tier COMMAND test-moe-common-dynamic-tier)
@@ -202,13 +195,13 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_include_directories(test-kimi-prefill-scratch PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../vendor)
         target_link_libraries(test-kimi-prefill-scratch PRIVATE ggml-cpu ggml-base CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-kimi-prefill-scratch kimi-mxfp4-parity kimi-vram-tier)
-        add_executable(test-kimi-vram-q2 test-kimi-vram-q2.cpp)
-        target_compile_features(test-kimi-vram-q2 PRIVATE cxx_std_17)
-        target_include_directories(test-kimi-vram-q2 PRIVATE ../ggml/src ../ggml/src/ggml-cpu
+        add_executable(test-kimi-vram-generic test-kimi-vram-generic.cpp)
+        target_compile_features(test-kimi-vram-generic PRIVATE cxx_std_17)
+        target_include_directories(test-kimi-vram-generic PRIVATE ../ggml/src ../ggml/src/ggml-cpu
             ../ggml/src/ggml-cuda/kimi-vram-tier ../vendor)
-        target_link_libraries(test-kimi-vram-q2 PRIVATE ggml-cpu ggml-base ggml-cuda
+        target_link_libraries(test-kimi-vram-generic PRIVATE ggml-cpu ggml-base ggml-cuda
             CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
-        add_dependencies(test-kimi-vram-q2 kimi-vram-tier)
+        add_dependencies(test-kimi-vram-generic kimi-vram-tier)
         # The CUDA backend's grouped-expert products against ggml's CPU MUL_MAT (owned GPU; not in ctest).
         add_executable(test-kimi-vram-mm test-kimi-vram-mm.cpp)
         target_compile_features(test-kimi-vram-mm PRIVATE cxx_std_17)
@@ -456,28 +449,6 @@ if (GGML_CUDA)
     add_test(NAME cuda_memory_reserve COMMAND test-cuda-memory-reserve)
     set_tests_properties(cuda_memory_reserve PROPERTIES LABELS "gpu" RUN_SERIAL TRUE SKIP_RETURN_CODE 77
         ENVIRONMENT "GGML_CUDA_MEMORY_RESERVE_MIB=576")
-    add_executable(test-moe-object-engine test-moe-object-engine.cpp)
-    target_link_libraries(test-moe-object-engine PRIVATE ggml-cuda CUDA::cudart)
-    add_test(NAME moe_object_engine_layout COMMAND test-moe-object-engine)
-    add_test(NAME moe_object_engine_single_shape COMMAND test-moe-object-engine single)
-    add_test(NAME moe_object_stage_ring COMMAND test-moe-object-engine stage)
-    add_test(NAME moe_object_host_slot COMMAND test-moe-object-engine host)
-    add_test(NAME moe_role_cache_descriptor COMMAND test-moe-object-engine role)
-    add_test(NAME moe_device_descriptor_buffer COMMAND test-moe-object-engine descriptor)
-    add_test(NAME moe_dependency_transfer_plan COMMAND test-moe-object-engine transfer)
-    add_test(NAME moe_object_pipeline_policy COMMAND test-moe-object-engine pipeline)
-    add_test(NAME moe_object_transaction_rendezvous COMMAND test-moe-object-engine transaction)
-    add_test(NAME moe_object_pipeline_lifetime COMMAND test-moe-object-engine pipeline-lifetime)
-    set_property(TEST moe_object_engine_layout PROPERTY
-        ENVIRONMENT "GGML_MOE_OBJECT_ENGINE=glm52-enforce")
-    set_property(TEST moe_object_engine_single_shape PROPERTY
-        ENVIRONMENT "GGML_MOE_OBJECT_ENGINE=glm52-enforce")
-    set_property(TEST moe_object_stage_ring PROPERTY
-        ENVIRONMENT "GGML_MOE_OBJECT_ENGINE=glm52-enforce")
-    set_property(TEST moe_object_transaction_rendezvous PROPERTY
-        ENVIRONMENT "GGML_MOE_OBJECT_ENGINE=glm52-enforce")
-    set_property(TEST moe_object_engine_layout moe_object_engine_single_shape moe_object_stage_ring moe_object_host_slot moe_role_cache_descriptor moe_device_descriptor_buffer moe_dependency_transfer_plan moe_object_pipeline_policy moe_object_transaction_rendezvous moe_object_pipeline_lifetime
-        PROPERTY LABELS main)
 endif()
 
 # build test-tokenizer-0 target once and add many tests

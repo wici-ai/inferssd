@@ -1,7 +1,7 @@
 #pragma once
 
 #include "moe-expert-descriptor.h"
-#include "moe-common-object-engine.h"
+#include "moe-common-cache-identity.h"
 
 #include <cstddef>
 #include <cstdint>
