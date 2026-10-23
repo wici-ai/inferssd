@@ -25,6 +25,50 @@ def verify_runtime(stage, observed):
         raise ValueError("native server is not alive with its owned listener")
 
 
+def verify_stopped(stopped):
+    """Classify cleanup evidence; never promote a failed measurement.
+
+    Linux's guardian owns systemd-run. An explicit stop can make that launcher
+    return 1 even though the server was alive until the controller stopped it.
+    Only its exact watch/guardian cleanup receipt admits that nonzero code.
+    """
+    controlled = "InterruptedError: stage stopped by trusted controller"
+    receipt = stopped.get("receipt")
+    receipt = receipt if isinstance(receipt, dict) else {}
+    code = stopped.get("returncode")
+    if (stopped.get("running") is not False or type(code) is not int
+            or stopped.get("cleanup_confirmed") is not True
+            or stopped.get("state") in ("failed", "quarantined")
+            or stopped.get("error") or stopped.get("cleanup_error")
+            or receipt.get("cleanup_error")
+            or receipt.get("cleanup_confirmed", True) is not True
+            or receipt.get("error") not in (None, "", controlled)):
+        raise ValueError("native benchmark did not stop normally and cleanly")
+    if code == 0:
+        return "normal-exit"
+    guardian = receipt.get("guardian")
+    guardian = guardian if isinstance(guardian, dict) else {}
+    cleanup = guardian.get("cleanup")
+    cleanup = cleanup if isinstance(cleanup, dict) else {}
+    state = cleanup.get("state")
+    state = state if isinstance(state, dict) else {}
+    unit = receipt.get("unit")
+    if (code == 1 and receipt.get("returncode") == 1
+            and receipt.get("error") == controlled
+            and receipt.get("cleanup_confirmed") is True
+            and guardian.get("returncode") == 1
+            and guardian.get("controller_disconnected") is True
+            and guardian.get("cleanup_confirmed") is True and not guardian.get("error")
+            and isinstance(unit, str) and unit
+            and guardian.get("unit") == unit == cleanup.get("unit")
+            and stopped.get("scope_identity") == "/system.slice/" + unit
+            and receipt.get("cleanup") == cleanup
+            and cleanup.get("processes_gone") is True
+            and state.get("MainPID") == "0" and state.get("ActiveState") == "inactive"):
+        return "trusted-controller-stop"
+    raise ValueError("native benchmark did not stop normally and cleanly")
+
+
 def benchmark(session, side, config, output):
     """Run exactly one arm, retaining raw failure and cleanup evidence.
 
@@ -125,11 +169,7 @@ def benchmark(session, side, config, output):
                 stopped = session.call(stage, "stage.stop", timeout=50)
                 retain("stopped", stopped)
                 result["cleanup_confirmed"] = stopped.get("cleanup_confirmed") is True
-                # Linux marks an explicit controller stop as InterruptedError
-                # in its watch receipt. Its passed flag is not an exit verdict.
-                if (stopped.get("running") is not False or stopped.get("returncode") != 0
-                        or not result["cleanup_confirmed"] or stopped.get("state") == "quarantined"):
-                    raise RuntimeError("native benchmark did not stop normally and cleanly")
+                result["stop_classification"] = verify_stopped(stopped)
             except Exception as error:
                 result.update(status="failed", cleanup_error=f"{type(error).__name__}: {error}")
             # Drain each stream independently even if stop or the other stream
