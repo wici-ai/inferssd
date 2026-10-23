@@ -1,0 +1,344 @@
+[
+  {
+    "case": {
+      "name": "f-settings-plan-choice-3.9",
+      "settings": "# tools/adaptive/settings.py /case/run\n# configuration: tier 3 of 4 slots, placement all (the plan's choice: 0.11 s predicted for the workload {'prompts': [32, 17], 'decode': 8, 'window': '1-8', 'known': True})\n# workload: {'prompts': [32, 17], 'decode': 8, 'window': '1-8', 'known': True}\n# held by the model's conf (PENDING): none\nGGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS=3  # source=decided; input=3 of the 4 tier slots the bootstrap of all reached\nGGML_KIMI_CPU_SINK_VRAM_BYTES=3000000  # source=decided; input=3 slots of 1000000 bytes, under the base budget of 10000000 bytes\nCONTEXT=256  # source=derived; input=the workload: turns of 32,17 new prompt tokens and 8 decode tokens each, up to a multiple of 256\nGGML_KIMI_CPU_PREFILL_MAX_TOKENS=16  # source=derived; input=n*=16: the least time for the workload's turns of 32,17 new tokens, the first on a cold tier and the rest on the warm one, each follow-up also as the 8-token reply before it prefilled again with it (25 tokens: the server's cache parts inside a reply whose text gives back other tokens), the two forms weighed 1/2 each, and between their sizes the break-even over the tier states their passes of at least 32 tokens meet (1 cold, 0 warm): the sink's compute 234.4 us a route, 4.0 routes a token and 0.31 ms a token besides (cold prefill of 32 tokens); U(16)=4.6 of 8 experts a layer (prompt tokens: the decode trace times 0.7598, its ratio at the prefill of 32 tokens), 1000000 bytes an expert; the graph's copy at 0.60 GB/s, 0.00 s a pass and 0.31 ms a token besides (its prefills of 32, 64 tokens); graph passes up to 32 tokens fit the GPU (4096 MiB free at load, dense 100, KV 10; the graph's compute 3.05 + 0.4523 a token (its largest role copy, the slope from its reserve at 64 tokens) + 1 GiB)\nUBATCH=32  # source=derived; input=the largest graph pass, up to 32 tokens (the context, at most the ubatch a server of this machine started with, 32): graph passes up to 32 tokens fit the GPU (4096 MiB free at load, dense 100, KV 10; the graph's compute 3.05 + 0.4523 a token (its largest role copy, the slope from its reserve at 64 tokens) + 1 GiB)\nGGML_KIMI_CPU_PREFILL_COST=cpu_fixed_us=200,cpu_route_us=8,gpu_fixed_us=80,gpu_route_us=1,gpu_host_fixed_us=60,gpu_host_route_us=0.5,link_gbps=3,pageable_gbps=2,drive_gbps=1.34218  # source=measured; input=the probe's lanes at q4_K/q5_K latent 64 hidden 32 (test-kimi-vram-group --time, each busy beside the others): the CPU's grouped path 200.0 + 8.000 us a route on 8 threads; the batched engine from device memory 80.0 + 1.000 us a route; in place from host memory 60.0 + 0.500 us a route; a page-locked copy 3.00 GB/s; a pageable copy 2.00 GB/s; the drive 1.34 GB/s at QD 3\nGGML_KIMI_CPU_SINK_PREFETCH=2  # source=derived; input=min(k_pay 3, k_mem 2) of top-k 3: a read pays when the share of it the next layer uses times the demand time it saves, 0.50 ms (the layer fit's read expert less a ready one), exceeds its spill into the next layer's demand reads, 0 us a read (the readers busy 0.10 s, the windows 0.18 s, 200 reads; a lower bound, the engine not measuring it), and, when it starts after the drive's idle window (k_win 3 start inside it), its own transfer; the drive's idle window 2000 us a hinted layer (median of 100) less 0 us of other readers, 1.72 expert reads of 1164 us (1000000 bytes at 0.80 GiB/s, the probe at QD 1 for 2 readers); novel per rank 0.500,0.500,0.333, of them routed 0.900,0.500,0.200; the slots they take serve 0.1000,0.1000,inf a token (the RAM cache of 2 slots a layer behind a 4-slot tier: 0.40, 0.20, 0.00 hits a token at 2 down to 0 slots a layer) (the bootstrap's depth 2)\nCTX_CHECKPOINTS=1  # source=derived; input=the memory saves an earlier state after each prompt batch (at multiples of 1 tokens, the bootstrap's log), so no prompt is split for one: the latest end of a prompt serves an append-only conversation, the disk prompt cache the rest\n"
+    },
+    "cgroup_v2": true,
+    "conf": "NAME=synthetic\nMODEL_GLOB=Synthetic-*.gguf\nTEMPLATE_KWARGS='{\"a\": 1}' # note\nSAMPLING=--temp 1.0 --top-k 9\nENGINE_ENV=LLAMA_TEST_SWITCH=1 GGML_TEST_GLOB=*\n",
+    "env": {
+      "CPUSET": "0-7",
+      "HOME": "@case/home",
+      "LAUNCH_DRY_RUN": "1",
+      "LAUNCH_SCOPE": "ssdash-fixture.scope",
+      "LC_ALL": "C",
+      "MEMORY_MAX": "10737418240",
+      "MODEL_CONF": "@case/model.conf",
+      "MODEL_DIR": "@case/models",
+      "OBS_CASE": "@case",
+      "PATH": "@case/stub:/usr/bin:/bin",
+      "PYTHONHASHSEED": "0",
+      "SERVER_BIN": "@case/bin/llama-server",
+      "SETTINGS": "@case/settings.env",
+      "USER": "fixture"
+    },
+    "host": {
+      "cpu_count": 8,
+      "filesystem": "ext4",
+      "gpu_apps": "",
+      "gpu_mib": "32607",
+      "mem_available_kib": 14680064,
+      "mem_total_kib": 16777216,
+      "port_busy": "",
+      "uring": false
+    },
+    "runs": [
+      {
+        "artifacts": {
+          "home/.cache/ssd-llama/experts/Synthetic-Q4/experts.json": "{\n \"source\": \"gguf\",\n \"model\": \"@case/models/Synthetic-Q4.gguf\",\n \"pack\": null,\n \"alias\": \"@case/home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv\",\n \"roles\": 24,\n \"experts\": 8,\n \"layers\": 1,\n \"bytes_per_role\": {\n  \"down\": 147456,\n  \"gate\": 73728,\n  \"up\": 73728\n },\n \"role_types\": {\n  \"down\": [\n   \"Q4_K\"\n  ],\n  \"gate\": [\n   \"Q4_K\"\n  ],\n  \"up\": [\n   \"Q4_K\"\n  ]\n },\n \"expert_bytes\": 294912,\n \"expert_read_bytes\": 307200,\n \"total_bytes\": 2359296,\n \"files\": [\n  \"@case/models/Synthetic-Q4.gguf\"\n ],\n \"aligned_roles\": 0,\n \"dense\": [\n  {\n   \"name\": \"blk.0.attn_q.weight\",\n   \"layer\": 0,\n   \"type\": \"Q8_0\",\n   \"bytes\": 557056,\n   \"rows\": 1024,\n   \"row_bytes\": 544,\n   \"n_blocks\": 4\n  },\n  {\n   \"name\": \"blk.0.attn_odd.weight\",\n   \"layer\": 0,\n   \"type\": \"Q8_0\",\n   \"bytes\": 542368,\n   \"rows\": 997,\n   \"row_bytes\": 544,\n   \"n_blocks\": null\n  },\n  {\n   \"name\": \"output.weight\",\n   \"layer\": null,\n   \"type\": \"Q8_0\",\n   \"bytes\": 54400,\n   \"rows\": 100,\n   \"row_bytes\": 544,\n   \"n_blocks\": 1\n  }\n ]\n}",
+          "home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv": "tensor\texpert_idx\tnbytes\tsource_path\toffset\nblk.0.ffn_gate_exps.weight\t0\t73728\t@case/models/Synthetic-Q4.gguf\t576\nblk.0.ffn_gate_exps.weight\t1\t73728\t@case/models/Synthetic-Q4.gguf\t74304\nblk.0.ffn_gate_exps.weight\t2\t73728\t@case/models/Synthetic-Q4.gguf\t148032\nblk.0.ffn_gate_exps.weight\t3\t73728\t@case/models/Synthetic-Q4.gguf\t221760\nblk.0.ffn_gate_exps.weight\t4\t73728\t@case/models/Synthetic-Q4.gguf\t295488\nblk.0.ffn_gate_exps.weight\t5\t73728\t@case/models/Synthetic-Q4.gguf\t369216\nblk.0.ffn_gate_exps.weight\t6\t73728\t@case/models/Synthetic-Q4.gguf\t442944\nblk.0.ffn_gate_exps.weight\t7\t73728\t@case/models/Synthetic-Q4.gguf\t516672\nblk.0.ffn_up_exps.weight\t0\t73728\t@case/models/Synthetic-Q4.gguf\t2097728\nblk.0.ffn_up_exps.weight\t1\t73728\t@case/models/Synthetic-Q4.gguf\t2171456\nblk.0.ffn_up_exps.weight\t2\t73728\t@case/models/Synthetic-Q4.gguf\t2245184\nblk.0.ffn_up_exps.weight\t3\t73728\t@case/models/Synthetic-Q4.gguf\t2318912\nblk.0.ffn_up_exps.weight\t4\t73728\t@case/models/Synthetic-Q4.gguf\t2392640\nblk.0.ffn_up_exps.weight\t5\t73728\t@case/models/Synthetic-Q4.gguf\t2466368\nblk.0.ffn_up_exps.weight\t6\t73728\t@case/models/Synthetic-Q4.gguf\t2540096\nblk.0.ffn_up_exps.weight\t7\t73728\t@case/models/Synthetic-Q4.gguf\t2613824\nblk.0.ffn_down_exps.weight\t0\t147456\t@case/models/Synthetic-Q4.gguf\t4194880\nblk.0.ffn_down_exps.weight\t1\t147456\t@case/models/Synthetic-Q4.gguf\t4342336\nblk.0.ffn_down_exps.weight\t2\t147456\t@case/models/Synthetic-Q4.gguf\t4489792\nblk.0.ffn_down_exps.weight\t3\t147456\t@case/models/Synthetic-Q4.gguf\t4637248\nblk.0.ffn_down_exps.weight\t4\t147456\t@case/models/Synthetic-Q4.gguf\t4784704\nblk.0.ffn_down_exps.weight\t5\t147456\t@case/models/Synthetic-Q4.gguf\t4932160\nblk.0.ffn_down_exps.weight\t6\t147456\t@case/models/Synthetic-Q4.gguf\t5079616\nblk.0.ffn_down_exps.weight\t7\t147456\t@case/models/Synthetic-Q4.gguf\t5227072\n"
+        },
+        "calls": [
+          [
+            "stat",
+            [
+              "-f",
+              "-c",
+              "%T",
+              "@case/home"
+            ]
+          ],
+          [
+            "python3",
+            [
+              "-B",
+              "@repo/tools/adaptive/expert_source.py",
+              "index",
+              "@case/models/Synthetic-Q4.gguf",
+              "@case/home/.cache/ssd-llama/experts/Synthetic-Q4"
+            ]
+          ],
+          [
+            "python3",
+            [
+              "-B",
+              "@repo/tools/adaptive/expert_source.py",
+              "facts",
+              "@case/models/Synthetic-Q4.gguf",
+              "@case/home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv"
+            ]
+          ],
+          [
+            "nvidia-smi",
+            [
+              "--query-gpu=memory.total",
+              "--format=csv,noheader,nounits"
+            ]
+          ],
+          [
+            "awk",
+            [
+              "-F,",
+              "\n    { for (i = 1; i <= NF; ++i) {\n        n = split($i, r, \"-\")\n        for (cpu = r[1] + 0; cpu <= (n == 2 ? r[2] + 0 : r[1] + 0); ++cpu) seen[cpu] = 1\n    } }\n    END { for (cpu in seen) ++count; if (count) print count; else exit 1 }"
+            ]
+          ],
+          [
+            "grep",
+            [
+              "-E",
+              "^(GGML|LLAMA)_"
+            ]
+          ],
+          [
+            "ss",
+            [
+              "-Hltn",
+              "sport = :18181"
+            ]
+          ],
+          [
+            "grep",
+            [
+              "-qs",
+              "io_uring_queue_init",
+              "@case/bin/libggml-cuda.so",
+              "@case/bin/llama-server"
+            ]
+          ],
+          [
+            "nvidia-smi",
+            [
+              "--query-compute-apps=pid,process_name",
+              "--format=csv,noheader"
+            ]
+          ],
+          [
+            "awk",
+            [
+              "\n    /^MemTotal:/ { total = $2 } /^MemAvailable:/ { available = $2 }\n    END { print total, available }",
+              "/proc/meminfo"
+            ]
+          ],
+          [
+            "systemctl",
+            [
+              "--user",
+              "show-environment"
+            ]
+          ],
+          [
+            "grep",
+            [
+              "-qw",
+              "memory",
+              "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.controllers"
+            ]
+          ]
+        ],
+        "code": 0,
+        "metadata": [
+          {
+            "argv": [
+              "-B",
+              "@repo/tools/adaptive/expert_source.py",
+              "index",
+              "@case/models/Synthetic-Q4.gguf",
+              "@case/home/.cache/ssd-llama/experts/Synthetic-Q4"
+            ],
+            "code": 0,
+            "command": "index",
+            "stderr": "indexing the experts of @case/models/Synthetic-Q4.gguf into @case/home/.cache/ssd-llama/experts/Synthetic-Q4\n",
+            "stdout": "{\"source\": \"gguf\", \"model\": \"@case/models/Synthetic-Q4.gguf\", \"pack\": null, \"alias\": \"@case/home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv\", \"roles\": 24, \"experts\": 8, \"layers\": 1, \"bytes_per_role\": {\"down\": 147456, \"gate\": 73728, \"up\": 73728}, \"role_types\": {\"down\": [\"Q4_K\"], \"gate\": [\"Q4_K\"], \"up\": [\"Q4_K\"]}, \"expert_bytes\": 294912, \"expert_read_bytes\": 307200, \"total_bytes\": 2359296, \"aligned_roles\": 0}\n"
+          },
+          {
+            "argv": [
+              "-B",
+              "@repo/tools/adaptive/expert_source.py",
+              "facts",
+              "@case/models/Synthetic-Q4.gguf",
+              "@case/home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv"
+            ],
+            "code": 0,
+            "command": "facts",
+            "stderr": "",
+            "stdout": "expert_types='Q4_K'\nalias_unaligned=24\n"
+          }
+        ],
+        "stderr": "indexing the experts of @case/models/Synthetic-Q4.gguf into @case/home/.cache/ssd-llama/experts/Synthetic-Q4\nwarning: the CUDA backend does not call liburing: the GPU prefill route reads every expert with synchronous preads\n",
+        "stdout": "[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_PREFILL_MAX_TOKENS value=16 source=settings input=@case/settings.env\n[ssd_setting] component=launcher name=GGML_MOE_IO_REQUIRE_DIRECT value=1 source=profile\n[ssd_setting] component=launcher name=GGML_MOE_IO_BACKEND value=iouring source=profile\n[ssd_setting] component=launcher name=GGML_MOE_IO_DEPTH value=64 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_RING_EXPERTS value=8 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_READY_FIRST value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_SPLIT_CV value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_DECODE_RESERVE value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES value=536870912 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_POLICY value=count_decay2 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_ALLOCATION value=uniform source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_PREFILL_READ value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_BYTES value=3000000 source=settings input=@case/settings.env\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_POLICY value=count_decay2 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT value=2.5 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_DECAY_HALF_LIFE value=16 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_GPU_HIDDEN value=0 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_PREFILL value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_HOST_HEADROOM_MIB value=512 source=profile input=MEMORY_HEADROOM_MIB\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_SAFETY_MIB value=64 source=derived input=the elastic margin (GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB) of a tier that grows on a discrete GPU\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_ELASTIC value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_BLOCKS value=0 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB value=64 source=profile input=VRAM_RESERVE_MIB, VRAM_ELASTIC_SAFETY_MIB\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_WATERMARK_LOW_MIB value=16 source=profile input=VRAM_RESERVE_MIB\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_WATERMARK_HIGH_MIB value=64 source=profile input=VRAM_RESERVE_MIB, VRAM_ELASTIC_SAFETY_MIB\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_EARLY_UP_GATE value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_ROLE_MAJOR value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_PREFETCH value=2 source=settings input=@case/settings.env\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_DYNAMIC_ROWS value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS value=64 source=profile\n[ssd_setting] component=launcher name=GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE value=1 source=profile\n[ssd_setting] component=launcher name=GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_PROMPT_ONLY value=1 source=profile\n[ssd_setting] component=launcher name=GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_BATCH value=1 source=profile\n[ssd_setting] component=launcher name=GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_CACHE_BYPASS value=1 source=profile\n[ssd_setting] component=launcher name=LLAMA_DROP_EXPERT_MMAP_AFTER_PROMPT value=1 source=profile\n[ssd_setting] component=launcher name=LLAMA_DROP_MMAP_EVERY_PROMPT_BATCH value=1 source=profile\n[ssd_setting] component=launcher name=LLAMA_DROP_MMAP_FADVISE_DONTNEED value=1 source=profile\n[ssd_setting] component=launcher name=LLAMA_DROP_DENSE_MMAP_CACHE value=1 source=profile\n[ssd_setting] component=launcher name=LD_LIBRARY_PATH value=@case/bin source=derived input=SERVER_BIN\n[ssd_setting] component=launcher name=LD_PRELOAD value=@case/bin/libkimi-no-mmap-prefetch.so:@case/bin/libkimi-vram-tier.so source=derived input=SERVER_BIN, PRELOAD_LIB, expert types Q4_K\n[ssd_setting] component=launcher name=GGML_CUDA_MEMORY_RESERVE_MIB value=0 source=derived input=VRAM_RESERVE_MIB\n[ssd_setting] component=launcher name=GGML_MOE_EXPERT_PACK value= source=derived input=EXPERT_PACK\n[ssd_setting] component=launcher name=GGML_MOE_EXPERT_GGUF_ALIAS_TSV value=@case/home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv source=derived input=EXPERT_ALIAS\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_THREADS value=8 source=derived input=THREADS\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_PREFILL_ACTUAL_SHAPE value=1 source=derived input=GGML_KIMI_CPU_SINK\n[ssd_setting] component=launcher name=GGML_MOE_IO_ALIGNED_ALIAS_BATCH value=1 source=derived input=24 unaligned entries of EXPERT_ALIAS\n[ssd_setting] component=launcher name=LLAMA_TEST_SWITCH value=1 source=model input=@case/model.conf\n[ssd_setting] component=launcher name=GGML_TEST_GLOB value=* source=model input=@case/model.conf\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_PREFILL_COST value=cpu_fixed_us=200,cpu_route_us=8,gpu_fixed_us=80,gpu_route_us=1,gpu_host_fixed_us=60,gpu_host_route_us=0.5,link_gbps=3,pageable_gbps=2,drive_gbps=1.34218 source=settings input=@case/settings.env\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS value=3 source=settings input=@case/settings.env\nsynthetic on http://127.0.0.1:18181 (threads=8, context=256, prefill on the CPU sink up to 16 tokens and where the GPU does not offload, on the GPU graph above)\nmemory.max=10737418240 (MEMORY_MAX)\nSCOPE systemd-run\nSCOPE --user\nSCOPE --scope\nSCOPE --quiet\nSCOPE --unit=ssdash-fixture.scope\nSCOPE -p\nSCOPE MemoryMax=10737418240\nSCOPE -p\nSCOPE MemorySwapMax=0\nSCOPE taskset\nSCOPE -c\nSCOPE 0-7\nENV GGML_KIMI_CPU_SINK=1\nENV GGML_KIMI_CPU_PREFILL_MAX_TOKENS=16\nENV GGML_MOE_IO_REQUIRE_DIRECT=1\nENV GGML_MOE_IO_BACKEND=iouring\nENV GGML_MOE_IO_DEPTH=64\nENV GGML_KIMI_CPU_SINK_RING_EXPERTS=8\nENV GGML_KIMI_CPU_SINK_READY_FIRST=1\nENV GGML_KIMI_CPU_SINK_SPLIT_CV=1\nENV GGML_KIMI_CPU_SINK_DECODE_RESERVE=1\nENV GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES=536870912\nENV GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM=1\nENV GGML_KIMI_CPU_SINK_CACHE_POLICY=count_decay2\nENV GGML_KIMI_CPU_SINK_CACHE_ALLOCATION=uniform\nENV GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS=1\nENV GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE=1\nENV GGML_KIMI_CPU_SINK_CACHE_PREFILL_READ=1\nENV GGML_KIMI_CPU_SINK_VRAM_BYTES=3000000\nENV GGML_KIMI_CPU_SINK_VRAM_POLICY=count_decay2\nENV GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT=2.5\nENV GGML_KIMI_CPU_SINK_VRAM_DECAY_HALF_LIFE=16\nENV GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL=1\nENV GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE=1\nENV GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD=1\nENV GGML_KIMI_CPU_SINK_VRAM_GPU_HIDDEN=0\nENV GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS=1\nENV GGML_KIMI_CPU_SINK_VRAM_PREFILL=1\nENV GGML_KIMI_CPU_SINK_VRAM_HOST_HEADROOM_MIB=512\nENV GGML_KIMI_CPU_SINK_VRAM_SAFETY_MIB=64\nENV GGML_KIMI_CPU_SINK_VRAM_ELASTIC=1\nENV GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM=1\nENV GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_BLOCKS=0\nENV GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB=64\nENV GGML_KIMI_CPU_SINK_VRAM_WATERMARK_LOW_MIB=16\nENV GGML_KIMI_CPU_SINK_VRAM_WATERMARK_HIGH_MIB=64\nENV GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD=1\nENV GGML_KIMI_CPU_SINK_EARLY_UP_GATE=1\nENV GGML_KIMI_CPU_SINK_ROLE_MAJOR=1\nENV GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED=1\nENV GGML_KIMI_CPU_SINK_PREFETCH=2\nENV GGML_KIMI_CPU_SINK_DYNAMIC_ROWS=1\nENV GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS=64\nENV GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE=1\nENV GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_PROMPT_ONLY=1\nENV GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_BATCH=1\nENV GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_CACHE_BYPASS=1\nENV LLAMA_DROP_EXPERT_MMAP_AFTER_PROMPT=1\nENV LLAMA_DROP_MMAP_EVERY_PROMPT_BATCH=1\nENV LLAMA_DROP_MMAP_FADVISE_DONTNEED=1\nENV LLAMA_DROP_DENSE_MMAP_CACHE=1\nENV LD_LIBRARY_PATH=@case/bin\nENV LD_PRELOAD=@case/bin/libkimi-no-mmap-prefetch.so:@case/bin/libkimi-vram-tier.so\nENV GGML_CUDA_MEMORY_RESERVE_MIB=0\nENV GGML_MOE_EXPERT_PACK=\nENV GGML_MOE_EXPERT_GGUF_ALIAS_TSV=@case/home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv\nENV GGML_KIMI_CPU_SINK_THREADS=8\nENV GGML_KIMI_CPU_PREFILL_ACTUAL_SHAPE=1\nENV GGML_MOE_IO_ALIGNED_ALIAS_BATCH=1\nENV LLAMA_TEST_SWITCH=1\nENV GGML_TEST_GLOB=*\nENV GGML_KIMI_CPU_PREFILL_COST=cpu_fixed_us=200,cpu_route_us=8,gpu_fixed_us=80,gpu_route_us=1,gpu_host_fixed_us=60,gpu_host_route_us=0.5,link_gbps=3,pageable_gbps=2,drive_gbps=1.34218\nENV GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS=3\nARG @case/bin/llama-server\nARG -m\nARG @case/models/Synthetic-Q4.gguf\nARG -c\nARG 256\nARG -np\nARG 1\nARG -t\nARG 8\nARG -tb\nARG 8\nARG -b\nARG 32\nARG -ub\nARG 32\nARG --ctx-checkpoints\nARG 1\nARG --fit\nARG off\nARG -ngl\nARG 99\nARG -fa\nARG on\nARG --chat-template-kwargs\nARG {\"a\": 1}\nARG --temp\nARG 1.0\nARG --top-k\nARG 9\nARG --defer-experts\nARG --no-repack\nARG --cache-disk\nARG @case/home/.cache/ssd-llama/synthetic\nARG --cache-disk-mib\nARG 16384\nARG --no-warmup\nARG --host\nARG 127.0.0.1\nARG --port\nARG 18181\n"
+      }
+    ],
+    "uid": 1000
+  },
+  {
+    "case": {
+      "name": "f-settings-plan-choice-3.12",
+      "settings": "# tools/adaptive/settings.py /case/run\n# configuration: tier 3 of 4 slots, placement all (the plan's choice: 0.11 s predicted for the workload {'prompts': [32, 17], 'decode': 8, 'window': '1-8', 'known': True})\n# workload: {'prompts': [32, 17], 'decode': 8, 'window': '1-8', 'known': True}\n# held by the model's conf (PENDING): none\nGGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS=3  # source=decided; input=3 of the 4 tier slots the bootstrap of all reached\nGGML_KIMI_CPU_SINK_VRAM_BYTES=3000000  # source=decided; input=3 slots of 1000000 bytes, under the base budget of 10000000 bytes\nCONTEXT=256  # source=derived; input=the workload: turns of 32,17 new prompt tokens and 8 decode tokens each, up to a multiple of 256\nGGML_KIMI_CPU_PREFILL_MAX_TOKENS=16  # source=derived; input=n*=16: the least time for the workload's turns of 32,17 new tokens, the first on a cold tier and the rest on the warm one, each follow-up also as the 8-token reply before it prefilled again with it (25 tokens: the server's cache parts inside a reply whose text gives back other tokens), the two forms weighed 1/2 each, and between their sizes the break-even over the tier states their passes of at least 32 tokens meet (1 cold, 0 warm): the sink's compute 234.4 us a route, 4.0 routes a token and 0.31 ms a token besides (cold prefill of 32 tokens); U(16)=4.6 of 8 experts a layer (prompt tokens: the decode trace times 0.7598, its ratio at the prefill of 32 tokens), 1000000 bytes an expert; the graph's copy at 0.60 GB/s, 0.00 s a pass and 0.31 ms a token besides (its prefills of 32, 64 tokens); graph passes up to 32 tokens fit the GPU (4096 MiB free at load, dense 100, KV 10; the graph's compute 3.05 + 0.4523 a token (its largest role copy, the slope from its reserve at 64 tokens) + 1 GiB)\nUBATCH=32  # source=derived; input=the largest graph pass, up to 32 tokens (the context, at most the ubatch a server of this machine started with, 32): graph passes up to 32 tokens fit the GPU (4096 MiB free at load, dense 100, KV 10; the graph's compute 3.05 + 0.4523 a token (its largest role copy, the slope from its reserve at 64 tokens) + 1 GiB)\nGGML_KIMI_CPU_PREFILL_COST=cpu_fixed_us=200,cpu_route_us=8,gpu_fixed_us=80,gpu_route_us=1,gpu_host_fixed_us=60,gpu_host_route_us=0.5,link_gbps=3,pageable_gbps=2,drive_gbps=1.34218  # source=measured; input=the probe's lanes at q4_K/q5_K latent 64 hidden 32 (test-kimi-vram-group --time, each busy beside the others): the CPU's grouped path 200.0 + 8.000 us a route on 8 threads; the batched engine from device memory 80.0 + 1.000 us a route; in place from host memory 60.0 + 0.500 us a route; a page-locked copy 3.00 GB/s; a pageable copy 2.00 GB/s; the drive 1.34 GB/s at QD 3\nGGML_KIMI_CPU_SINK_PREFETCH=2  # source=derived; input=min(k_pay 3, k_mem 2) of top-k 3: a read pays when the share of it the next layer uses times the demand time it saves, 0.50 ms (the layer fit's read expert less a ready one), exceeds its spill into the next layer's demand reads, 0 us a read (the readers busy 0.10 s, the windows 0.18 s, 200 reads; a lower bound, the engine not measuring it), and, when it starts after the drive's idle window (k_win 3 start inside it), its own transfer; the drive's idle window 2000 us a hinted layer (median of 100) less 0 us of other readers, 1.72 expert reads of 1164 us (1000000 bytes at 0.80 GiB/s, the probe at QD 1 for 2 readers); novel per rank 0.500,0.500,0.333, of them routed 0.900,0.500,0.200; the slots they take serve 0.1000,0.1000,inf a token (the RAM cache of 2 slots a layer behind a 4-slot tier: 0.40, 0.20, 0.00 hits a token at 2 down to 0 slots a layer) (the bootstrap's depth 2)\nCTX_CHECKPOINTS=1  # source=derived; input=the memory saves an earlier state after each prompt batch (at multiples of 1 tokens, the bootstrap's log), so no prompt is split for one: the latest end of a prompt serves an append-only conversation, the disk prompt cache the rest\n"
+    },
+    "cgroup_v2": true,
+    "conf": "NAME=synthetic\nMODEL_GLOB=Synthetic-*.gguf\nTEMPLATE_KWARGS='{\"a\": 1}' # note\nSAMPLING=--temp 1.0 --top-k 9\nENGINE_ENV=LLAMA_TEST_SWITCH=1 GGML_TEST_GLOB=*\n",
+    "env": {
+      "CPUSET": "0-7",
+      "HOME": "@case/home",
+      "LAUNCH_DRY_RUN": "1",
+      "LAUNCH_SCOPE": "ssdash-fixture.scope",
+      "LC_ALL": "C",
+      "MEMORY_MAX": "10737418240",
+      "MODEL_CONF": "@case/model.conf",
+      "MODEL_DIR": "@case/models",
+      "OBS_CASE": "@case",
+      "PATH": "@case/stub:/usr/bin:/bin",
+      "PYTHONHASHSEED": "0",
+      "SERVER_BIN": "@case/bin/llama-server",
+      "SETTINGS": "@case/settings.env",
+      "USER": "fixture"
+    },
+    "host": {
+      "cpu_count": 8,
+      "filesystem": "ext4",
+      "gpu_apps": "",
+      "gpu_mib": "32607",
+      "mem_available_kib": 14680064,
+      "mem_total_kib": 16777216,
+      "port_busy": "",
+      "uring": false
+    },
+    "runs": [
+      {
+        "artifacts": {
+          "home/.cache/ssd-llama/experts/Synthetic-Q4/experts.json": "{\n \"source\": \"gguf\",\n \"model\": \"@case/models/Synthetic-Q4.gguf\",\n \"pack\": null,\n \"alias\": \"@case/home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv\",\n \"roles\": 24,\n \"experts\": 8,\n \"layers\": 1,\n \"bytes_per_role\": {\n  \"down\": 147456,\n  \"gate\": 73728,\n  \"up\": 73728\n },\n \"role_types\": {\n  \"down\": [\n   \"Q4_K\"\n  ],\n  \"gate\": [\n   \"Q4_K\"\n  ],\n  \"up\": [\n   \"Q4_K\"\n  ]\n },\n \"expert_bytes\": 294912,\n \"expert_read_bytes\": 307200,\n \"total_bytes\": 2359296,\n \"files\": [\n  \"@case/models/Synthetic-Q4.gguf\"\n ],\n \"aligned_roles\": 0,\n \"dense\": [\n  {\n   \"name\": \"blk.0.attn_q.weight\",\n   \"layer\": 0,\n   \"type\": \"Q8_0\",\n   \"bytes\": 557056,\n   \"rows\": 1024,\n   \"row_bytes\": 544,\n   \"n_blocks\": 4\n  },\n  {\n   \"name\": \"blk.0.attn_odd.weight\",\n   \"layer\": 0,\n   \"type\": \"Q8_0\",\n   \"bytes\": 542368,\n   \"rows\": 997,\n   \"row_bytes\": 544,\n   \"n_blocks\": null\n  },\n  {\n   \"name\": \"output.weight\",\n   \"layer\": null,\n   \"type\": \"Q8_0\",\n   \"bytes\": 54400,\n   \"rows\": 100,\n   \"row_bytes\": 544,\n   \"n_blocks\": 1\n  }\n ]\n}",
+          "home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv": "tensor\texpert_idx\tnbytes\tsource_path\toffset\nblk.0.ffn_gate_exps.weight\t0\t73728\t@case/models/Synthetic-Q4.gguf\t576\nblk.0.ffn_gate_exps.weight\t1\t73728\t@case/models/Synthetic-Q4.gguf\t74304\nblk.0.ffn_gate_exps.weight\t2\t73728\t@case/models/Synthetic-Q4.gguf\t148032\nblk.0.ffn_gate_exps.weight\t3\t73728\t@case/models/Synthetic-Q4.gguf\t221760\nblk.0.ffn_gate_exps.weight\t4\t73728\t@case/models/Synthetic-Q4.gguf\t295488\nblk.0.ffn_gate_exps.weight\t5\t73728\t@case/models/Synthetic-Q4.gguf\t369216\nblk.0.ffn_gate_exps.weight\t6\t73728\t@case/models/Synthetic-Q4.gguf\t442944\nblk.0.ffn_gate_exps.weight\t7\t73728\t@case/models/Synthetic-Q4.gguf\t516672\nblk.0.ffn_up_exps.weight\t0\t73728\t@case/models/Synthetic-Q4.gguf\t2097728\nblk.0.ffn_up_exps.weight\t1\t73728\t@case/models/Synthetic-Q4.gguf\t2171456\nblk.0.ffn_up_exps.weight\t2\t73728\t@case/models/Synthetic-Q4.gguf\t2245184\nblk.0.ffn_up_exps.weight\t3\t73728\t@case/models/Synthetic-Q4.gguf\t2318912\nblk.0.ffn_up_exps.weight\t4\t73728\t@case/models/Synthetic-Q4.gguf\t2392640\nblk.0.ffn_up_exps.weight\t5\t73728\t@case/models/Synthetic-Q4.gguf\t2466368\nblk.0.ffn_up_exps.weight\t6\t73728\t@case/models/Synthetic-Q4.gguf\t2540096\nblk.0.ffn_up_exps.weight\t7\t73728\t@case/models/Synthetic-Q4.gguf\t2613824\nblk.0.ffn_down_exps.weight\t0\t147456\t@case/models/Synthetic-Q4.gguf\t4194880\nblk.0.ffn_down_exps.weight\t1\t147456\t@case/models/Synthetic-Q4.gguf\t4342336\nblk.0.ffn_down_exps.weight\t2\t147456\t@case/models/Synthetic-Q4.gguf\t4489792\nblk.0.ffn_down_exps.weight\t3\t147456\t@case/models/Synthetic-Q4.gguf\t4637248\nblk.0.ffn_down_exps.weight\t4\t147456\t@case/models/Synthetic-Q4.gguf\t4784704\nblk.0.ffn_down_exps.weight\t5\t147456\t@case/models/Synthetic-Q4.gguf\t4932160\nblk.0.ffn_down_exps.weight\t6\t147456\t@case/models/Synthetic-Q4.gguf\t5079616\nblk.0.ffn_down_exps.weight\t7\t147456\t@case/models/Synthetic-Q4.gguf\t5227072\n"
+        },
+        "calls": [
+          [
+            "stat",
+            [
+              "-f",
+              "-c",
+              "%T",
+              "@case/home"
+            ]
+          ],
+          [
+            "python3",
+            [
+              "-B",
+              "@repo/tools/adaptive/expert_source.py",
+              "index",
+              "@case/models/Synthetic-Q4.gguf",
+              "@case/home/.cache/ssd-llama/experts/Synthetic-Q4"
+            ]
+          ],
+          [
+            "python3",
+            [
+              "-B",
+              "@repo/tools/adaptive/expert_source.py",
+              "facts",
+              "@case/models/Synthetic-Q4.gguf",
+              "@case/home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv"
+            ]
+          ],
+          [
+            "nvidia-smi",
+            [
+              "--query-gpu=memory.total",
+              "--format=csv,noheader,nounits"
+            ]
+          ],
+          [
+            "awk",
+            [
+              "-F,",
+              "\n    { for (i = 1; i <= NF; ++i) {\n        n = split($i, r, \"-\")\n        for (cpu = r[1] + 0; cpu <= (n == 2 ? r[2] + 0 : r[1] + 0); ++cpu) seen[cpu] = 1\n    } }\n    END { for (cpu in seen) ++count; if (count) print count; else exit 1 }"
+            ]
+          ],
+          [
+            "grep",
+            [
+              "-E",
+              "^(GGML|LLAMA)_"
+            ]
+          ],
+          [
+            "ss",
+            [
+              "-Hltn",
+              "sport = :18181"
+            ]
+          ],
+          [
+            "grep",
+            [
+              "-qs",
+              "io_uring_queue_init",
+              "@case/bin/libggml-cuda.so",
+              "@case/bin/llama-server"
+            ]
+          ],
+          [
+            "nvidia-smi",
+            [
+              "--query-compute-apps=pid,process_name",
+              "--format=csv,noheader"
+            ]
+          ],
+          [
+            "awk",
+            [
+              "\n    /^MemTotal:/ { total = $2 } /^MemAvailable:/ { available = $2 }\n    END { print total, available }",
+              "/proc/meminfo"
+            ]
+          ],
+          [
+            "systemctl",
+            [
+              "--user",
+              "show-environment"
+            ]
+          ],
+          [
+            "grep",
+            [
+              "-qw",
+              "memory",
+              "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/cgroup.controllers"
+            ]
+          ]
+        ],
+        "code": 0,
+        "metadata": [
+          {
+            "argv": [
+              "-B",
+              "@repo/tools/adaptive/expert_source.py",
+              "index",
+              "@case/models/Synthetic-Q4.gguf",
+              "@case/home/.cache/ssd-llama/experts/Synthetic-Q4"
+            ],
+            "code": 0,
+            "command": "index",
+            "stderr": "indexing the experts of @case/models/Synthetic-Q4.gguf into @case/home/.cache/ssd-llama/experts/Synthetic-Q4\n",
+            "stdout": "{\"source\": \"gguf\", \"model\": \"@case/models/Synthetic-Q4.gguf\", \"pack\": null, \"alias\": \"@case/home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv\", \"roles\": 24, \"experts\": 8, \"layers\": 1, \"bytes_per_role\": {\"down\": 147456, \"gate\": 73728, \"up\": 73728}, \"role_types\": {\"down\": [\"Q4_K\"], \"gate\": [\"Q4_K\"], \"up\": [\"Q4_K\"]}, \"expert_bytes\": 294912, \"expert_read_bytes\": 307200, \"total_bytes\": 2359296, \"aligned_roles\": 0}\n"
+          },
+          {
+            "argv": [
+              "-B",
+              "@repo/tools/adaptive/expert_source.py",
+              "facts",
+              "@case/models/Synthetic-Q4.gguf",
+              "@case/home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv"
+            ],
+            "code": 0,
+            "command": "facts",
+            "stderr": "",
+            "stdout": "expert_types='Q4_K'\nalias_unaligned=24\n"
+          }
+        ],
+        "stderr": "indexing the experts of @case/models/Synthetic-Q4.gguf into @case/home/.cache/ssd-llama/experts/Synthetic-Q4\nwarning: the CUDA backend does not call liburing: the GPU prefill route reads every expert with synchronous preads\n",
+        "stdout": "[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_PREFILL_MAX_TOKENS value=16 source=settings input=@case/settings.env\n[ssd_setting] component=launcher name=GGML_MOE_IO_REQUIRE_DIRECT value=1 source=profile\n[ssd_setting] component=launcher name=GGML_MOE_IO_BACKEND value=iouring source=profile\n[ssd_setting] component=launcher name=GGML_MOE_IO_DEPTH value=64 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_RING_EXPERTS value=8 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_READY_FIRST value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_SPLIT_CV value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_DECODE_RESERVE value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES value=536870912 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_POLICY value=count_decay2 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_ALLOCATION value=uniform source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_CACHE_PREFILL_READ value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_BYTES value=3000000 source=settings input=@case/settings.env\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_POLICY value=count_decay2 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT value=2.5 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_DECAY_HALF_LIFE value=16 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_GPU_HIDDEN value=0 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_PREFILL value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_HOST_HEADROOM_MIB value=512 source=profile input=MEMORY_HEADROOM_MIB\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_SAFETY_MIB value=64 source=derived input=the elastic margin (GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB) of a tier that grows on a discrete GPU\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_ELASTIC value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_BLOCKS value=0 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB value=64 source=profile input=VRAM_RESERVE_MIB, VRAM_ELASTIC_SAFETY_MIB\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_WATERMARK_LOW_MIB value=16 source=profile input=VRAM_RESERVE_MIB\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_WATERMARK_HIGH_MIB value=64 source=profile input=VRAM_RESERVE_MIB, VRAM_ELASTIC_SAFETY_MIB\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_EARLY_UP_GATE value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_ROLE_MAJOR value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_PREFETCH value=2 source=settings input=@case/settings.env\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_DYNAMIC_ROWS value=1 source=profile\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS value=64 source=profile\n[ssd_setting] component=launcher name=GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE value=1 source=profile\n[ssd_setting] component=launcher name=GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_PROMPT_ONLY value=1 source=profile\n[ssd_setting] component=launcher name=GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_BATCH value=1 source=profile\n[ssd_setting] component=launcher name=GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_CACHE_BYPASS value=1 source=profile\n[ssd_setting] component=launcher name=LLAMA_DROP_EXPERT_MMAP_AFTER_PROMPT value=1 source=profile\n[ssd_setting] component=launcher name=LLAMA_DROP_MMAP_EVERY_PROMPT_BATCH value=1 source=profile\n[ssd_setting] component=launcher name=LLAMA_DROP_MMAP_FADVISE_DONTNEED value=1 source=profile\n[ssd_setting] component=launcher name=LLAMA_DROP_DENSE_MMAP_CACHE value=1 source=profile\n[ssd_setting] component=launcher name=LD_LIBRARY_PATH value=@case/bin source=derived input=SERVER_BIN\n[ssd_setting] component=launcher name=LD_PRELOAD value=@case/bin/libkimi-no-mmap-prefetch.so:@case/bin/libkimi-vram-tier.so source=derived input=SERVER_BIN, PRELOAD_LIB, expert types Q4_K\n[ssd_setting] component=launcher name=GGML_CUDA_MEMORY_RESERVE_MIB value=0 source=derived input=VRAM_RESERVE_MIB\n[ssd_setting] component=launcher name=GGML_MOE_EXPERT_PACK value= source=derived input=EXPERT_PACK\n[ssd_setting] component=launcher name=GGML_MOE_EXPERT_GGUF_ALIAS_TSV value=@case/home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv source=derived input=EXPERT_ALIAS\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_THREADS value=8 source=derived input=THREADS\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_PREFILL_ACTUAL_SHAPE value=1 source=derived input=GGML_KIMI_CPU_SINK\n[ssd_setting] component=launcher name=GGML_MOE_IO_ALIGNED_ALIAS_BATCH value=1 source=derived input=24 unaligned entries of EXPERT_ALIAS\n[ssd_setting] component=launcher name=LLAMA_TEST_SWITCH value=1 source=model input=@case/model.conf\n[ssd_setting] component=launcher name=GGML_TEST_GLOB value=* source=model input=@case/model.conf\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_PREFILL_COST value=cpu_fixed_us=200,cpu_route_us=8,gpu_fixed_us=80,gpu_route_us=1,gpu_host_fixed_us=60,gpu_host_route_us=0.5,link_gbps=3,pageable_gbps=2,drive_gbps=1.34218 source=settings input=@case/settings.env\n[ssd_setting] component=launcher name=GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS value=3 source=settings input=@case/settings.env\nsynthetic on http://127.0.0.1:18181 (threads=8, context=256, prefill on the CPU sink up to 16 tokens and where the GPU does not offload, on the GPU graph above)\nmemory.max=10737418240 (MEMORY_MAX)\nSCOPE systemd-run\nSCOPE --user\nSCOPE --scope\nSCOPE --quiet\nSCOPE --unit=ssdash-fixture.scope\nSCOPE -p\nSCOPE MemoryMax=10737418240\nSCOPE -p\nSCOPE MemorySwapMax=0\nSCOPE taskset\nSCOPE -c\nSCOPE 0-7\nENV GGML_KIMI_CPU_SINK=1\nENV GGML_KIMI_CPU_PREFILL_MAX_TOKENS=16\nENV GGML_MOE_IO_REQUIRE_DIRECT=1\nENV GGML_MOE_IO_BACKEND=iouring\nENV GGML_MOE_IO_DEPTH=64\nENV GGML_KIMI_CPU_SINK_RING_EXPERTS=8\nENV GGML_KIMI_CPU_SINK_READY_FIRST=1\nENV GGML_KIMI_CPU_SINK_SPLIT_CV=1\nENV GGML_KIMI_CPU_SINK_DECODE_RESERVE=1\nENV GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES=536870912\nENV GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM=1\nENV GGML_KIMI_CPU_SINK_CACHE_POLICY=count_decay2\nENV GGML_KIMI_CPU_SINK_CACHE_ALLOCATION=uniform\nENV GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS=1\nENV GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE=1\nENV GGML_KIMI_CPU_SINK_CACHE_PREFILL_READ=1\nENV GGML_KIMI_CPU_SINK_VRAM_BYTES=3000000\nENV GGML_KIMI_CPU_SINK_VRAM_POLICY=count_decay2\nENV GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT=2.5\nENV GGML_KIMI_CPU_SINK_VRAM_DECAY_HALF_LIFE=16\nENV GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL=1\nENV GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE=1\nENV GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD=1\nENV GGML_KIMI_CPU_SINK_VRAM_GPU_HIDDEN=0\nENV GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS=1\nENV GGML_KIMI_CPU_SINK_VRAM_PREFILL=1\nENV GGML_KIMI_CPU_SINK_VRAM_HOST_HEADROOM_MIB=512\nENV GGML_KIMI_CPU_SINK_VRAM_SAFETY_MIB=64\nENV GGML_KIMI_CPU_SINK_VRAM_ELASTIC=1\nENV GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM=1\nENV GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_BLOCKS=0\nENV GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB=64\nENV GGML_KIMI_CPU_SINK_VRAM_WATERMARK_LOW_MIB=16\nENV GGML_KIMI_CPU_SINK_VRAM_WATERMARK_HIGH_MIB=64\nENV GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD=1\nENV GGML_KIMI_CPU_SINK_EARLY_UP_GATE=1\nENV GGML_KIMI_CPU_SINK_ROLE_MAJOR=1\nENV GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED=1\nENV GGML_KIMI_CPU_SINK_PREFETCH=2\nENV GGML_KIMI_CPU_SINK_DYNAMIC_ROWS=1\nENV GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS=64\nENV GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE=1\nENV GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_PROMPT_ONLY=1\nENV GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_BATCH=1\nENV GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE_CACHE_BYPASS=1\nENV LLAMA_DROP_EXPERT_MMAP_AFTER_PROMPT=1\nENV LLAMA_DROP_MMAP_EVERY_PROMPT_BATCH=1\nENV LLAMA_DROP_MMAP_FADVISE_DONTNEED=1\nENV LLAMA_DROP_DENSE_MMAP_CACHE=1\nENV LD_LIBRARY_PATH=@case/bin\nENV LD_PRELOAD=@case/bin/libkimi-no-mmap-prefetch.so:@case/bin/libkimi-vram-tier.so\nENV GGML_CUDA_MEMORY_RESERVE_MIB=0\nENV GGML_MOE_EXPERT_PACK=\nENV GGML_MOE_EXPERT_GGUF_ALIAS_TSV=@case/home/.cache/ssd-llama/experts/Synthetic-Q4/experts.tsv\nENV GGML_KIMI_CPU_SINK_THREADS=8\nENV GGML_KIMI_CPU_PREFILL_ACTUAL_SHAPE=1\nENV GGML_MOE_IO_ALIGNED_ALIAS_BATCH=1\nENV LLAMA_TEST_SWITCH=1\nENV GGML_TEST_GLOB=*\nENV GGML_KIMI_CPU_PREFILL_COST=cpu_fixed_us=200,cpu_route_us=8,gpu_fixed_us=80,gpu_route_us=1,gpu_host_fixed_us=60,gpu_host_route_us=0.5,link_gbps=3,pageable_gbps=2,drive_gbps=1.34218\nENV GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS=3\nARG @case/bin/llama-server\nARG -m\nARG @case/models/Synthetic-Q4.gguf\nARG -c\nARG 256\nARG -np\nARG 1\nARG -t\nARG 8\nARG -tb\nARG 8\nARG -b\nARG 32\nARG -ub\nARG 32\nARG --ctx-checkpoints\nARG 1\nARG --fit\nARG off\nARG -ngl\nARG 99\nARG -fa\nARG on\nARG --chat-template-kwargs\nARG {\"a\": 1}\nARG --temp\nARG 1.0\nARG --top-k\nARG 9\nARG --defer-experts\nARG --no-repack\nARG --cache-disk\nARG @case/home/.cache/ssd-llama/synthetic\nARG --cache-disk-mib\nARG 16384\nARG --no-warmup\nARG --host\nARG 127.0.0.1\nARG --port\nARG 18181\n"
+      }
+    ],
+    "uid": 1000
+  }
+]
