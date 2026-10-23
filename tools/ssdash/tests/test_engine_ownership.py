@@ -72,7 +72,7 @@ def test_owned_metadata_after_lock_and_stable_module(tmp_path, monkeypatch):
     value, guardian, calls, ends = launch_mock(tmp_path, monkeypatch)
     try:
         args, kw = calls[0]
-        assert args[1:3] == ["-m", "ssdash.platform.worker"]
+        assert args[1:4] == ["-I", "-m", "ssdash.platform.worker"]
         assert kw["pass_fds"] == (102, value._lock)
         assert "GGML_TEST" not in kw["env"]
         assert "private-value" not in (value.directory / "runtime.json").read_text()
@@ -166,7 +166,7 @@ def test_guardian_entry_literal_under_main_and_disconnect_port(tmp_path, monkeyp
     monkeypatch.setattr(worker, "guard_worker", guard)
     args = argparse.Namespace(controller_fd=6, lock_fd=7, spec=str(out / "runtime.json"))
     assert worker.run_guardian(args, {"directory": str(out), "scope": [], "unit": None}, p) == 0
-    assert captured["argv"][1:3] == ["-m", "ssdash.platform.worker"]
+    assert captured["argv"][1:4] == ["-I", "-m", "ssdash.platform.worker"]
     assert captured["closed"] == 7 and connection.closed
 
 
