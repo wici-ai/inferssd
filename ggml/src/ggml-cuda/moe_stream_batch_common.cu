@@ -1618,16 +1618,7 @@ static ggml_moe_common::role_cache_view batch_cache_role_view(batch_vram_cache *
     return view;
 }
 
-static bool batch_cache_publish_slot_ready(
-        batch_vram_cache *cache,
-        int slot,
-        uintptr_t key,
-        uint64_t generation,
-        size_t payload_bytes,
-        cudaStream_t stream) {
-    return cache && ggml_moe_common::role_cache_publish_ready(
-        batch_cache_role_view(cache), slot, key, generation, payload_bytes, stream);
-}
+
 
 static FILE * batch_vram_accounting_fp() {
     static FILE * fp = nullptr;
@@ -1890,77 +1881,11 @@ static size_t g_ttft_trace_cap = 100000;
 static uint64_t g_ttft_trace_seq = 0;
 static std::chrono::steady_clock::time_point g_ttft_trace_start;
 
-static bool batch_route_profile_enabled() {
-    const char *route_env = std::getenv("GGML_MOE_ROUTE_PROFILE");
-    if (route_env && route_env[0]) return route_env[0] != '0';
-    const char *prof_env = std::getenv("GGML_MOE_BATCH_PROFILE");
-    return prof_env && prof_env[0] && prof_env[0] != '0';
-}
 
-static void batch_route_profile_report_atexit() {
-    std::vector<batch_route_profile_entry> rows;
-    std::vector<batch_route_trace_entry> trace;
-    {
-        std::lock_guard<std::mutex> lk(g_route_profile_mu);
-        rows = g_route_profile;
-        trace = g_route_trace;
-    }
 
-    if (g_route_profile_out && g_route_profile_out[0] && !rows.empty()) {
-        std::sort(rows.begin(), rows.end(),
-            [](const batch_route_profile_entry &a, const batch_route_profile_entry &b) {
-                if (a.count != b.count) return a.count > b.count;
-                const int name_cmp = std::strcmp(a.tensor, b.tensor);
-                if (name_cmp != 0) return name_cmp < 0;
-                return a.expert_idx < b.expert_idx;
-            });
 
-        FILE *f = std::fopen(g_route_profile_out, "w");
-        if (!f) {
-            std::fprintf(stderr, "[moe_stream_batch] route profile: open failed: %s\n", g_route_profile_out);
-        } else {
-            std::fprintf(f, "rank,count,expert_bytes,cumulative_bytes,tensor_base,expert_idx,tensor\n");
-            size_t cumulative = 0;
-            for (size_t i = 0; i < rows.size(); ++i) {
-                const batch_route_profile_entry &e = rows[i];
-                cumulative += e.expert_bytes;
-                std::fprintf(f, "%zu,%lu,%zu,%zu,0x0,%d,%s\n",
-                             i + 1, e.count, e.expert_bytes, cumulative, e.expert_idx, e.tensor);
-            }
-            std::fclose(f);
-            std::fprintf(stderr, "[moe_stream_batch] route profile written: %s (%zu entries)\n",
-                         g_route_profile_out, rows.size());
-        }
-    }
 
-    if (g_route_trace_out && g_route_trace_out[0] && !trace.empty()) {
-        FILE *f = std::fopen(g_route_trace_out, "w");
-        if (!f) {
-            std::fprintf(stderr, "[moe_stream_batch] route trace: open failed: %s\n", g_route_trace_out);
-        } else {
-            std::fprintf(f, "seq,expert_bytes,tensor_base,expert_idx,tensor\n");
-            for (const batch_route_trace_entry &e : trace) {
-                std::fprintf(f, "%lu,%zu,0x0,%d,%s\n",
-                             e.seq, e.expert_bytes, e.expert_idx, e.tensor);
-            }
-            std::fclose(f);
-            std::fprintf(stderr, "[moe_stream_batch] route trace written: %s (%zu events)\n",
-                         g_route_trace_out, trace.size());
-        }
-    }
-}
 
-static void batch_route_profile_init_once() {
-    if (g_route_profile_inited) return;
-    std::lock_guard<std::mutex> lk(g_route_profile_mu);
-    if (g_route_profile_inited) return;
-    g_route_profile_out = batch_route_profile_enabled() ? std::getenv("GGML_MOE_BATCH_PROFILE_OUT") : nullptr;
-    g_route_trace_out = std::getenv("GGML_MOE_ROUTE_TRACE_OUT");
-    if ((g_route_profile_out && g_route_profile_out[0]) || (g_route_trace_out && g_route_trace_out[0])) {
-        std::atexit(batch_route_profile_report_atexit);
-    }
-    g_route_profile_inited = true;
-}
 
 static void batch_route_detail_parse_name(const char *tensor_name, int &layer, char *kind, size_t kind_sz) {
     layer = -1;
@@ -1990,30 +1915,11 @@ static void batch_route_detail_parse_name(const char *tensor_name, int &layer, c
 
 
 
-static int trace_prefetch_env_int(const char *name, int fallback, int lo, int hi) {
-    const char *env = std::getenv(name);
-    long value = (env && env[0]) ? std::atol(env) : fallback;
-    if (value < lo) value = lo;
-    if (value > hi) value = hi;
-    return (int)value;
-}
 
-static char trace_prefetch_role_from_tensor(const char *tensor) {
-    if (!tensor) return 'o';
-    if (std::strstr(tensor, ".ffn_gate_exps.")) return 'g';
-    if (std::strstr(tensor, ".ffn_up_exps.")) return 'u';
-    if (std::strstr(tensor, ".ffn_down_exps.")) return 'd';
-    return 'o';
-}
 
-static bool trace_prefetch_target_allows(const char *tensor) {
-    if (!g_trace_prefetch.targets[0]) return true;
-    const char role = trace_prefetch_role_from_tensor(tensor);
-    for (const char *p = g_trace_prefetch.targets; *p; ++p) {
-        if (*p == role) return true;
-    }
-    return false;
-}
+
+
+
 
 static void trim_csv_field_tail(char *s) {
     if (!s) return;
@@ -2049,82 +1955,12 @@ static bool load_route_trace_csv(const char *path, std::vector<batch_route_trace
     return !trace.empty();
 }
 
-static void trace_prefetch_report_atexit() {
-    std::lock_guard<std::mutex> lk(g_trace_prefetch.mu);
-    if (!g_trace_prefetch.enabled || g_trace_prefetch.calls == 0) return;
-    std::fprintf(stderr,
-        "[moe_stream_batch] trace prefetch: calls=%lu matched=%lu resync=%lu loads=%lu cached=%lu missing_tensor=%lu cache_unavailable=%lu reuse_skips=%lu cursor=%zu prefetch_cursor=%zu/%zu\n",
-        g_trace_prefetch.calls,
-        g_trace_prefetch.matched,
-        g_trace_prefetch.resync,
-        g_trace_prefetch.loads,
-        g_trace_prefetch.cached,
-        g_trace_prefetch.missing_tensor,
-        g_trace_prefetch.cache_unavailable,
-        g_trace_prefetch.reuse_skips,
-        g_trace_prefetch.cursor,
-        g_trace_prefetch.prefetch_cursor,
-        g_trace_prefetch.trace.size());
-}
 
-static void trace_prefetch_init_once() {
-    if (g_trace_prefetch.inited) return;
-    std::lock_guard<std::mutex> lk(g_trace_prefetch.mu);
-    if (g_trace_prefetch.inited) return;
 
-    const char *path = std::getenv("GGML_MOE_TRACE_PREFETCH");
-    if (!path || !path[0]) {
-        g_trace_prefetch.inited = true;
-        return;
-    }
 
-    load_route_trace_csv(path, g_trace_prefetch.trace, "trace prefetch");
 
-    g_trace_prefetch.window = (size_t)trace_prefetch_env_int("GGML_MOE_TRACE_PREFETCH_WINDOW", 96, 1, 4096);
-    g_trace_prefetch.max_loads = trace_prefetch_env_int("GGML_MOE_TRACE_PREFETCH_MAX_LOADS", 8, 1, 256);
-    g_trace_prefetch.lead_events = (size_t)trace_prefetch_env_int("GGML_MOE_TRACE_PREFETCH_LEAD_EVENTS", 0, 0, 4096);
-    g_trace_prefetch.min_future_uses = trace_prefetch_env_int("GGML_MOE_TRACE_PREFETCH_MIN_FUTURE_USES", 1, 1, 64);
-    g_trace_prefetch.reuse_window = (size_t)trace_prefetch_env_int(
-            "GGML_MOE_TRACE_PREFETCH_REUSE_WINDOW", (int)g_trace_prefetch.window, 1, 4096);
-    const char *targets_env = std::getenv("GGML_MOE_TRACE_PREFETCH_TARGETS");
-    if (targets_env && targets_env[0]) {
-        size_t out = 0;
-        for (const char *p = targets_env; *p && out + 1 < sizeof(g_trace_prefetch.targets); ++p) {
-            if (*p == 'g' || *p == 'G') {
-                g_trace_prefetch.targets[out++] = 'g';
-            } else if (*p == 'u' || *p == 'U') {
-                g_trace_prefetch.targets[out++] = 'u';
-            } else if (*p == 'd' || *p == 'D') {
-                g_trace_prefetch.targets[out++] = 'd';
-            } else if (std::strncmp(p, "gate", 4) == 0) {
-                g_trace_prefetch.targets[out++] = 'g';
-                p += 3;
-            } else if (std::strncmp(p, "up", 2) == 0) {
-                g_trace_prefetch.targets[out++] = 'u';
-                p += 1;
-            } else if (std::strncmp(p, "down", 4) == 0) {
-                g_trace_prefetch.targets[out++] = 'd';
-                p += 3;
-            }
-        }
-        g_trace_prefetch.targets[out] = '\0';
-    }
-    g_trace_prefetch.enabled = !g_trace_prefetch.trace.empty();
-    g_trace_prefetch.inited = true;
-    if (g_trace_prefetch.enabled) {
-        std::atexit(trace_prefetch_report_atexit);
-        std::fprintf(stderr,
-            "[moe_stream_batch] trace prefetch: loaded %zu events from %s window=%zu max_loads=%d lead_events=%zu min_future_uses=%d reuse_window=%zu\n",
-            g_trace_prefetch.trace.size(), path, g_trace_prefetch.window, g_trace_prefetch.max_loads,
-            g_trace_prefetch.lead_events, g_trace_prefetch.min_future_uses, g_trace_prefetch.reuse_window);
-        if (g_trace_prefetch.targets[0]) {
-            std::fprintf(stderr, "[moe_stream_batch] trace prefetch: target roles=%s\n", g_trace_prefetch.targets);
-        }
-    }
-}
 
-static void trace_prefetch_on_hit(const char *tensor_name, int expert_idx, size_t expert_bytes);
-static void host_prefetch_on_route(const char *tensor_name, int expert_idx, size_t expert_bytes);
+
 
 static void batch_ttft_trace_report_atexit() {
     std::vector<batch_ttft_trace_entry> rows;
@@ -2241,43 +2077,7 @@ struct batch_ttft_call_scope {
     }
 };
 
-static void batch_route_profile_hit(const char *tensor_name, int expert_idx, size_t expert_bytes) {
-    batch_route_profile_init_once();
-    if (!tensor_name || !tensor_name[0]) return;
-    trace_prefetch_on_hit(tensor_name, expert_idx, expert_bytes);
-    host_prefetch_on_route(tensor_name, expert_idx, expert_bytes);
-    const bool profile_enabled = g_route_profile_out && g_route_profile_out[0];
-    const bool trace_enabled = g_route_trace_out && g_route_trace_out[0];
-    if (!profile_enabled && !trace_enabled) return;
 
-    std::lock_guard<std::mutex> lk(g_route_profile_mu);
-    if (profile_enabled) {
-        bool found = false;
-        for (batch_route_profile_entry &e : g_route_profile) {
-            if (e.expert_idx == expert_idx && std::strcmp(e.tensor, tensor_name) == 0) {
-                ++e.count;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            batch_route_profile_entry e;
-            e.expert_idx = expert_idx;
-            e.count = 1;
-            e.expert_bytes = expert_bytes;
-            std::snprintf(e.tensor, sizeof(e.tensor), "%s", tensor_name);
-            g_route_profile.push_back(e);
-        }
-    }
-    if (trace_enabled) {
-        batch_route_trace_entry e;
-        e.seq = ++g_route_trace_seq;
-        e.expert_idx = expert_idx;
-        e.expert_bytes = expert_bytes;
-        std::snprintf(e.tensor, sizeof(e.tensor), "%s", tensor_name);
-        g_route_trace.push_back(e);
-    }
-}
 
 static void batch_cache_report_atexit() {
     uint64_t hits = 0;
@@ -2384,19 +2184,9 @@ static size_t profile_preload_slot_budget(const batch_vram_cache *c) {
     return (size_t)c->n_slots > reserve ? (size_t)c->n_slots - reserve : 1;
 }
 
-static size_t prompt_profile_preload_scan_budget(const batch_vram_cache *c) {
-    const char *env = std::getenv("GGML_MOE_VRAM_PROFILE_PROMPT_MAX_ENTRIES");
-    if (env && env[0]) {
-        long max_entries = std::atol(env);
-        if (max_entries > 0) return (size_t)max_entries;
-    }
-    return profile_preload_slot_budget(c);
-}
 
-static bool profile_preload_evict_enabled() {
-    const char *env = std::getenv("GGML_MOE_VRAM_PROFILE_PRELOAD_EVICT");
-    return env && env[0] && env[0] != '0';
-}
+
+
 
 static bool profile_preload_enabled() {
     const char *env = std::getenv("GGML_MOE_VRAM_PROFILE_PRELOAD");
@@ -2539,14 +2329,7 @@ static void load_profile_once() {
     g_profile_loaded = true;
 }
 
-static void load_prompt_profile_once() {
-    if (g_prompt_profile_loaded) return;
-    std::lock_guard<std::mutex> lk(g_profile_mu);
-    if (g_prompt_profile_loaded) return;
-    const char *path = std::getenv("GGML_MOE_VRAM_PROFILE_PROMPT");
-    g_prompt_profile_enabled = load_profile_file(path, g_prompt_profile, "prompt profile");
-    g_prompt_profile_loaded = true;
-}
+
 
 static int batch_cache_id_for_size(size_t expert_sz) {
     const char *fused_env = std::getenv("GGML_MOE_STREAM_FUSED_UP_GATE");
@@ -2880,70 +2663,9 @@ static bool batch_cache_record_slot_lease(batch_vram_cache *c, int slot, cudaStr
         batch_cache_role_view(c), slot, stream);
 }
 
-static int batch_cache_lookup_slot(batch_vram_cache *c, uintptr_t key) {
-    if (!c || !c->pool || c->n_slots == 0) return -1;
-    auto it = c->key_to_slot.find(key);
-    if (it != c->key_to_slot.end()) {
-        const int slot = it->second;
-        if (slot >= 0 && slot < c->n_slots && c->slot_key[slot] == key) {
-            if (c->slot_state[slot] == q4_colibri_slot_state::failed) return -1;
-            if (c->slot_filling[slot]) return -1;
-            if (!batch_cache_wait_slot_ready(c, slot)) return -1;
-            c->slot_used[slot] = c->clock++;
-            if (c->slot_hits[slot] != UINT32_MAX) {
-                ++c->slot_hits[slot];
-            }
-            ++c->hits;
-            if (c->slot_prefetch_down[slot]) {
-                ++c->down_prefetch_hits;
-                c->slot_prefetch_down[slot] = false;
-            }
-            if (c->slot_q4_pilot[slot]) {
-                ++g_expert_pack.q4_pilot_prefetch_used_roles;
-                c->slot_q4_pilot[slot] = false;
-            }
-            return slot;
-        }
-        c->key_to_slot.erase(it);
-    }
-    for (int slot = 0; slot < c->n_slots; ++slot) {
-        if (c->slot_key[slot] == key) {
-            c->key_to_slot[key] = slot;
-            if (c->slot_state[slot] == q4_colibri_slot_state::failed) return -1;
-            if (c->slot_filling[slot]) return -1;
-            if (!batch_cache_wait_slot_ready(c, slot)) return -1;
-            c->slot_used[slot] = c->clock++;
-            if (c->slot_hits[slot] != UINT32_MAX) {
-                ++c->slot_hits[slot];
-            }
-            ++c->hits;
-            if (c->slot_prefetch_down[slot]) {
-                ++c->down_prefetch_hits;
-                c->slot_prefetch_down[slot] = false;
-            }
-            if (c->slot_q4_pilot[slot]) {
-                ++g_expert_pack.q4_pilot_prefetch_used_roles;
-                c->slot_q4_pilot[slot] = false;
-            }
-            return slot;
-        }
-    }
-    return -1;
-}
 
-static bool batch_cache_contains_slot(const batch_vram_cache *c, uintptr_t key) {
-    if (!c || !c->pool || c->n_slots == 0) return false;
-    auto it = c->key_to_slot.find(key);
-    if (it != c->key_to_slot.end()) {
-        const int slot = it->second;
-        return slot >= 0 && slot < c->n_slots && c->slot_key[slot] == key &&
-            c->slot_state[slot] != q4_colibri_slot_state::failed;
-    }
-    for (int slot = 0; slot < c->n_slots; ++slot) {
-        if (c->slot_key[slot] == key && c->slot_state[slot] != q4_colibri_slot_state::failed) return true;
-    }
-    return false;
-}
+
+
 
 static bool batch_cache_clear_slot(batch_vram_cache *c, int slot) {
     if (!c || slot < 0 || slot >= c->n_slots) return false;
@@ -3006,105 +2728,13 @@ static int batch_cache_find_slot(batch_vram_cache *c, uintptr_t key) {
     return -1;
 }
 
-static bool q4_batch_pending_wait_enabled() {
-    const char *env = std::getenv("GGML_MOE_Q4_BATCH_PENDING_WAIT");
-    return env && env[0] && env[0] != '0';
-}
 
-static bool q4_batch_pending_wait_role_allowed(size_t role_idx) {
-    const char *env = std::getenv("GGML_MOE_Q4_BATCH_PENDING_WAIT_ROLES");
-    if (!env || !env[0] || std::strcmp(env, "upgate") == 0 || std::strcmp(env, "gateup") == 0) {
-        return role_idx == 0 || role_idx == 1;
-    }
-    if (std::strcmp(env, "all") == 0 || std::strcmp(env, "*") == 0) {
-        return role_idx < 3;
-    }
-    if (std::strcmp(env, "gate") == 0) return role_idx == 0;
-    if (std::strcmp(env, "up") == 0) return role_idx == 1;
-    if (std::strcmp(env, "down") == 0) return role_idx == 2;
-    return role_idx == 0 || role_idx == 1;
-}
 
-static bool batch_cache_pending_slot_marker_valid(batch_vram_cache *c, int slot) {
-    const q4_colibri_slot_marker expected{
-        c->slot_key[slot], c->slot_generation[slot], c->slot_payload_bytes[slot],
-    };
-    const q4_colibri_slot_marker ready = c->slot_ready_marker[slot];
-    if (ready.generation == 0) return true;
-    if (ready.generation != expected.generation) {
-        ++g_expert_pack.q4_pipe_stale_generation;
-        return false;
-    }
-    if (ready.key != expected.key) {
-        ++g_expert_pack.q4_pipe_key_mismatch;
-        return false;
-    }
-    return true;
-}
 
-static bool batch_cache_wait_pending_slots_for_active(
-        batch_vram_cache *c,
-        const char *const role_names[3],
-        int64_t n_as,
-        const int64_t *matrix_row_counts) {
-    if (!q4_batch_pending_wait_enabled()) return true;
-    if (!c || !role_names || n_as <= 0 || !matrix_row_counts) return true;
 
-    std::vector<int> pending_slots;
-    pending_slots.reserve(64);
-    for (int64_t expert = 0; expert < n_as; ++expert) {
-        if (matrix_row_counts[expert] <= 0) continue;
-        for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-            if (!q4_batch_pending_wait_role_allowed(role_idx)) continue;
-            const char *role_name = role_names[role_idx];
-            if (!role_name || !role_name[0]) continue;
-            const int slot = batch_cache_find_slot(c, batch_key_hash(role_name, (int)expert));
-            if (slot < 0 || slot >= c->n_slots || !c->slot_pending[slot]) continue;
-            bool seen = false;
-            for (int existing : pending_slots) {
-                if (existing == slot) {
-                    seen = true;
-                    break;
-                }
-            }
-            if (!seen) pending_slots.push_back(slot);
-        }
-    }
-    if (pending_slots.empty()) return true;
 
-    for (int slot : pending_slots) {
-        if (!batch_cache_pending_slot_marker_valid(c, slot)) {
-            return false;
-        }
-    }
 
-    const auto wait_start = std::chrono::steady_clock::now();
-    ggml_moe_common::role_cache_batch_wait_stats wait_stats;
-    if (!ggml_moe_common::role_cache_synchronize_ready_events(
-                batch_cache_role_view(c),
-                pending_slots.data(),
-                pending_slots.size(),
-                &wait_stats)) {
-        return false;
-    }
 
-    const uint64_t wait_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - wait_start).count();
-    for (int slot : pending_slots) {
-        ++c->async_prefetch_waits;
-    }
-    ++g_expert_pack.q4_cache_pending_wait_calls;
-    g_expert_pack.q4_cache_pending_wait_slots.fetch_add(pending_slots.size(), std::memory_order_relaxed);
-    g_expert_pack.q4_cache_pending_wait_us.fetch_add(wait_us, std::memory_order_relaxed);
-    ++g_expert_pack.q4_cache_pending_batch_wait_calls;
-    g_expert_pack.q4_cache_pending_batch_wait_slots.fetch_add(pending_slots.size(), std::memory_order_relaxed);
-    g_expert_pack.q4_cache_pending_batch_wait_us.fetch_add(wait_us, std::memory_order_relaxed);
-    g_expert_pack.q4_cache_pending_batch_wait_representative_syncs.fetch_add(
-        wait_stats.representative_syncs, std::memory_order_relaxed);
-    g_expert_pack.q4_cache_pending_batch_wait_extra_syncs.fetch_add(
-        wait_stats.extra_syncs, std::memory_order_relaxed);
-    return true;
-}
 
 enum {
     Q4_CACHE_LOCALITY_BUCKET_UNKNOWN = 0,
@@ -3235,7 +2865,7 @@ struct q4_tier_overlap_diag_state {
 
 static q4_tier_overlap_diag_state g_q4_tier_overlap_diag;
 
-static void q4_cache_locality_maybe_sample(int current_layer);
+
 
 enum q4_host_object_origin : uint8_t {
     Q4_HOST_OBJECT_ORIGIN_UNKNOWN = 0,
@@ -3294,16 +2924,7 @@ static bool q4_tier_vram_reuse_protect_enabled() {
     return enabled;
 }
 
-static int q4_tier_vram_reuse_protect_window_tokens() {
-    static int window = []() {
-        const char *env = std::getenv("GGML_MOE_Q4_VRAM_REUSE_PROTECT_WINDOW_TOKENS");
-        const long value = env && env[0] ? std::atol(env) : 16;
-        if (value < 1) return 1;
-        if (value > 512) return 512;
-        return (int)value;
-    }();
-    return window;
-}
+
 
 static bool q4_tier_vram_reuse_protect_layer_allowed(int layer) {
     static bool inited = false;
@@ -3405,15 +3026,7 @@ static bool q4_tier_reuse_protect_fast_in_range(int layer, int expert) {
     return layer >= 0 && layer < 128 && expert >= 0 && expert < Q4_TIER_REUSE_PROTECT_MAX_EXPERTS;
 }
 
-static void q4_tier_reuse_protect_set_locked(int layer, int expert, uint64_t until_epoch) {
-    if (q4_tier_reuse_protect_fast_in_range(layer, expert)) {
-        g_q4_tier_overlap_diag.vram_reuse_protect_until_fast[layer][expert].store(
-                until_epoch, std::memory_order_release);
-        return;
-    }
-    g_q4_tier_overlap_diag.vram_reuse_protect_until_epoch[
-        q4_tier_diag_object_key(layer, expert)] = until_epoch;
-}
+
 
 static void q4_tier_reuse_protect_clear_locked(const std::string &key, int layer, int expert) {
     if (q4_tier_reuse_protect_fast_in_range(layer, expert)) {
@@ -3542,65 +3155,14 @@ static bool q4_tier_role_family_names(
     return true;
 }
 
-static uint64_t q4_tier_diag_observe_layer_locked(int layer) {
-    if (layer >= 0) {
-        if (g_q4_tier_overlap_diag.last_layer >= 0 && layer < g_q4_tier_overlap_diag.last_layer) {
-            ++g_q4_tier_overlap_diag.token_epoch;
-        }
-        g_q4_tier_overlap_diag.last_layer = layer;
-        g_q4_tier_overlap_diag.token_epoch_public.store(
-                g_q4_tier_overlap_diag.token_epoch, std::memory_order_release);
-    }
-    return g_q4_tier_overlap_diag.token_epoch;
-}
+
 
 static int q4_tier_diag_current_layer_snapshot() {
     std::lock_guard<std::mutex> lock(g_q4_tier_overlap_diag.mu);
     return g_q4_tier_overlap_diag.last_layer;
 }
 
-static void q4_tier_diag_observe_object_request(const q4_colibri_object_marker &marker) {
-    ++g_q4_tier_overlap_diag.object_demands;
-    q4_tier_layer_add(g_q4_tier_overlap_diag.tier_layer_object_demands, marker.layer_idx);
-    std::lock_guard<std::mutex> lock(g_q4_tier_overlap_diag.mu);
-    const uint64_t epoch = q4_tier_diag_observe_layer_locked(marker.layer_idx);
-    q4_cache_locality_maybe_sample(marker.layer_idx);
-    const std::string key = q4_tier_diag_object_key(marker);
-    auto it = g_q4_tier_overlap_diag.vram_evicted_epoch.find(key);
-    if (it == g_q4_tier_overlap_diag.vram_evicted_epoch.end()) return;
-    const uint64_t age = epoch >= it->second ? epoch - it->second : 0;
-    if (age <= (uint64_t)q4_tier_diag_window_tokens()) {
-        if (g_q4_tier_overlap_diag.vram_evicted_reuse_counted.insert(key).second) {
-            ++g_q4_tier_overlap_diag.vram_evicted_reused_within_window;
-            q4_tier_layer_add(g_q4_tier_overlap_diag.tier_layer_vram_evicted_reused_within_window, marker.layer_idx);
-            if (q4_tier_reuse_window_profile_enabled()) {
-                for (int wi = 0; wi < Q4_TIER_REUSE_WINDOW_COUNT; ++wi) {
-                    if (age <= (uint64_t)Q4_TIER_REUSE_WINDOWS[wi]) {
-                        ++g_q4_tier_overlap_diag.vram_evicted_reused_by_window[wi];
-                        q4_tier_layer_add(
-                                g_q4_tier_overlap_diag.tier_layer_vram_evicted_reused_by_window[wi],
-                                marker.layer_idx);
-                    }
-                }
-            }
-            if (q4_tier_vram_reuse_protect_enabled()) {
-                if (!q4_tier_vram_reuse_protect_layer_allowed(marker.layer_idx)) {
-                    ++g_q4_tier_overlap_diag.vram_reuse_protect_layer_skips;
-                    return;
-                }
-                q4_tier_reuse_protect_set_locked(
-                        marker.layer_idx,
-                        marker.expert_idx,
-                        epoch + (uint64_t)q4_tier_vram_reuse_protect_window_tokens());
-                ++g_q4_tier_overlap_diag.vram_reuse_protect_marks;
-            }
-        }
-    } else {
-        g_q4_tier_overlap_diag.vram_evicted_epoch.erase(it);
-        g_q4_tier_overlap_diag.vram_evicted_reuse_counted.erase(key);
-        q4_tier_reuse_protect_clear_locked(key, marker.layer_idx, marker.expert_idx);
-    }
-}
+
 
 static bool q4_tier_diag_vram_reuse_protected(int layer, int expert) {
     if (!q4_tier_vram_reuse_protect_enabled() || layer < 0 || expert < 0) return false;
@@ -3697,14 +3259,7 @@ static void q4_tier_diag_record_ram_hit(const q4_colibri_object_marker &marker) 
     }
 }
 
-static void batch_cache_touch_slot(batch_vram_cache *c, int slot) {
-    if (!c || slot < 0 || slot >= c->n_slots || c->slot_key[slot] == 0) return;
-    if (c->slot_state[slot] == q4_colibri_slot_state::failed || c->slot_filling[slot]) return;
-    c->slot_used[slot] = c->clock++;
-    if (c->slot_hits[slot] != UINT32_MAX) {
-        ++c->slot_hits[slot];
-    }
-}
+
 
 
 
@@ -7591,7 +7146,7 @@ extern "C" const void * ggml_cuda_moe_expert_pack_mmap_ptr_source_debug(
     return (const char *) source->mmap_base + entry->offset;
 }
 
-static bool trace_entry_matches(const batch_route_trace_entry &e, const char *tensor_name, int expert_idx, size_t expert_bytes);
+
 // O_DIRECT may return EOF before unused page padding. Only a complete logical
 // payload is accepted; an incomplete tensor remains an error.
 static bool expert_pack_direct_pread_native(int fd, void * dst, size_t physical,
@@ -7916,31 +7471,6 @@ static void host_prefetch_init_once() {
         predictive_env ? 1 : 0);
 }
 
-static void host_prefetch_on_route(const char *tensor_name, int expert_idx, size_t expert_bytes) {
-    host_prefetch_init_once();
-    if (!g_host_prefetch.enabled || !tensor_name || !tensor_name[0]) return;
-    std::lock_guard<std::mutex> lk(g_host_prefetch.mu);
-    ++g_host_prefetch.calls;
-    if (g_host_prefetch.cursor < g_host_prefetch.trace.size() &&
-            trace_entry_matches(g_host_prefetch.trace[g_host_prefetch.cursor], tensor_name, expert_idx, expert_bytes)) {
-        ++g_host_prefetch.cursor;
-        ++g_host_prefetch.matched;
-    } else {
-        const size_t scan_end = std::min(g_host_prefetch.trace.size(), g_host_prefetch.cursor + (size_t)128);
-        for (size_t i = g_host_prefetch.cursor; i < scan_end; ++i) {
-            if (trace_entry_matches(g_host_prefetch.trace[i], tensor_name, expert_idx, expert_bytes)) {
-                g_host_prefetch.cursor = i + 1;
-                ++g_host_prefetch.matched;
-                ++g_host_prefetch.resync;
-                break;
-            }
-        }
-    }
-    if (g_host_prefetch.produce_cursor < g_host_prefetch.cursor) {
-        g_host_prefetch.produce_cursor = g_host_prefetch.cursor;
-    }
-    g_host_prefetch.cv.notify_one();
-}
 
 
 
@@ -7950,27 +7480,8 @@ static void host_prefetch_on_route(const char *tensor_name, int expert_idx, size
 
 
 
-static bool predictive_prefetch_parse_layer_list(const char *env, bool *layers_all, bool layer_enabled[128]) {
-    if (!env || !env[0]) return false;
-    if (std::strcmp(env, "all") == 0 || std::strcmp(env, "*") == 0) {
-        *layers_all = true;
-        return true;
-    }
-    char buf[512];
-    std::snprintf(buf, sizeof(buf), "%s", env);
-    bool any = false;
-    char *save = nullptr;
-    for (char *tok = ::strtok_r(buf, ",;:", &save); tok; tok = ::strtok_r(nullptr, ",;:", &save)) {
-        while (*tok == ' ' || *tok == '\t') ++tok;
-        if (!*tok) continue;
-        char *end = nullptr;
-        long layer = std::strtol(tok, &end, 10);
-        if (end == tok || layer < 0 || layer >= 128) continue;
-        layer_enabled[layer] = true;
-        any = true;
-    }
-    return any;
-}
+
+
 
 
 
@@ -9847,45 +9358,20 @@ static void q4_host_object_origin_record_hit(uint8_t origin, uint64_t roles, uin
     g_q4_host_object_prefetch.origin_h2d_bytes[origin].fetch_add(bytes, std::memory_order_relaxed);
 }
 
-static bool q4_cache_locality_profile_enabled() {
-    static const bool enabled = expert_pack_env_bool("GGML_MOE_Q4_CACHE_LOCALITY_PROFILE", false);
-    return enabled;
-}
+
 
 static uint64_t q4_cache_locality_sample_period() {
     static const uint64_t period = expert_pack_env_size("GGML_MOE_Q4_CACHE_LOCALITY_SAMPLE_PERIOD", 512, 1, 1048576);
     return period;
 }
 
-static const char *q4_cache_locality_profile_out_path() {
-    static const char *path = std::getenv("GGML_MOE_Q4_CACHE_LOCALITY_PROFILE_OUT");
-    return path && path[0] ? path : nullptr;
-}
+
 
 static bool q4_cache_locality_wrap_past_enabled() {
     return expert_pack_env_bool("GGML_MOE_Q4_CACHE_LOCALITY_WRAP_PAST", false);
 }
 
-static int q4_cache_locality_bucket_for_layer(int current_layer, int object_layer) {
-    if (current_layer < 0 || object_layer < 0) return Q4_CACHE_LOCALITY_BUCKET_UNKNOWN;
-    const int max_layer = (int)expert_pack_env_size("GGML_MOE_Q4_CACHE_LOCALITY_MAX_LAYER", 60, 1, 1024);
-    int dist = object_layer - current_layer;
-    if (dist < 0 && q4_cache_locality_wrap_past_enabled() && max_layer > 0) {
-        dist += max_layer;
-    }
-    if (dist == 0) return Q4_CACHE_LOCALITY_BUCKET_CURRENT;
-    if (dist == 1) return Q4_CACHE_LOCALITY_BUCKET_NEXT1;
-    if (dist == 2) return Q4_CACHE_LOCALITY_BUCKET_NEXT2;
-    if (dist >= 3 && dist <= 7) return Q4_CACHE_LOCALITY_BUCKET_NEXT3_7;
-    if (dist >= 8 && dist <= 15) return Q4_CACHE_LOCALITY_BUCKET_NEXT8_15;
-    if (dist > 15) return Q4_CACHE_LOCALITY_BUCKET_FAR_FUTURE;
-    const int past = -dist;
-    if (past == 1) return Q4_CACHE_LOCALITY_BUCKET_PREV1;
-    if (past == 2) return Q4_CACHE_LOCALITY_BUCKET_PREV2;
-    if (past >= 3 && past <= 7) return Q4_CACHE_LOCALITY_BUCKET_PREV3_7;
-    if (past >= 8 && past <= 15) return Q4_CACHE_LOCALITY_BUCKET_PREV8_15;
-    return Q4_CACHE_LOCALITY_BUCKET_FAR_PAST;
-}
+
 
 static const char *q4_cache_locality_bucket_name(int bucket) {
     switch (bucket) {
@@ -9905,247 +9391,15 @@ static const char *q4_cache_locality_bucket_name(int bucket) {
     }
 }
 
-static bool q4_cache_locality_bucket_is_near(int bucket) {
-    return bucket == Q4_CACHE_LOCALITY_BUCKET_CURRENT ||
-        bucket == Q4_CACHE_LOCALITY_BUCKET_NEXT1 ||
-        bucket == Q4_CACHE_LOCALITY_BUCKET_NEXT2;
-}
 
-static void q4_cache_locality_profile_record_csv(
-        int current_layer,
-        uint64_t demand_epoch,
-        const uint64_t *vram_roles,
-        const uint64_t *vram_full_objects,
-        const uint64_t *ram_objects,
-        const uint64_t *ram_vram_full_overlap,
-        const uint64_t *ram_vram_any_overlap,
-        const uint64_t *ram_vram_partial_roles) {
-    const char *path = q4_cache_locality_profile_out_path();
-    if (!path) return;
-    static std::mutex mu;
-    static bool header_written = false;
-    std::lock_guard<std::mutex> lock(mu);
-    std::FILE *file = std::fopen(path, "a");
-    if (!file) return;
-    if (!header_written) {
-        std::fprintf(file,
-                "sample,demand_epoch,current_layer,"
-                "vram_roles_total,vram_roles_near,"
-                "vram_full_objects_total,vram_full_objects_near,"
-                "ram_objects_total,ram_objects_near,"
-                "ram_vram_full_overlap_total,ram_vram_full_overlap_near,"
-                "ram_vram_any_overlap_total,ram_vram_any_overlap_near,"
-                "ram_vram_partial_roles_total,ram_vram_partial_roles_near");
-        for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-            std::fprintf(file, ",vram_roles_%s", q4_cache_locality_bucket_name(bucket));
-        }
-        for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-            std::fprintf(file, ",vram_full_objects_%s", q4_cache_locality_bucket_name(bucket));
-        }
-        for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-            std::fprintf(file, ",ram_objects_%s", q4_cache_locality_bucket_name(bucket));
-        }
-        for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-            std::fprintf(file, ",ram_vram_full_overlap_%s", q4_cache_locality_bucket_name(bucket));
-        }
-        for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-            std::fprintf(file, ",ram_vram_any_overlap_%s", q4_cache_locality_bucket_name(bucket));
-        }
-        for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-            std::fprintf(file, ",ram_vram_partial_roles_%s", q4_cache_locality_bucket_name(bucket));
-        }
-        std::fprintf(file, "\n");
-        header_written = true;
-    }
-    uint64_t vram_roles_total = 0;
-    uint64_t vram_roles_near = 0;
-    uint64_t vram_full_total = 0;
-    uint64_t vram_full_near = 0;
-    uint64_t ram_total = 0;
-    uint64_t ram_near = 0;
-    uint64_t ram_vram_full_total = 0;
-    uint64_t ram_vram_full_near = 0;
-    uint64_t ram_vram_any_total = 0;
-    uint64_t ram_vram_any_near = 0;
-    uint64_t ram_vram_partial_total = 0;
-    uint64_t ram_vram_partial_near = 0;
-    for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-        vram_roles_total += vram_roles[bucket];
-        vram_full_total += vram_full_objects[bucket];
-        ram_total += ram_objects[bucket];
-        ram_vram_full_total += ram_vram_full_overlap[bucket];
-        ram_vram_any_total += ram_vram_any_overlap[bucket];
-        ram_vram_partial_total += ram_vram_partial_roles[bucket];
-        if (q4_cache_locality_bucket_is_near(bucket)) {
-            vram_roles_near += vram_roles[bucket];
-            vram_full_near += vram_full_objects[bucket];
-            ram_near += ram_objects[bucket];
-            ram_vram_full_near += ram_vram_full_overlap[bucket];
-            ram_vram_any_near += ram_vram_any_overlap[bucket];
-            ram_vram_partial_near += ram_vram_partial_roles[bucket];
-        }
-    }
-    const uint64_t sample = g_q4_tier_overlap_diag.cache_locality_samples.load(std::memory_order_relaxed) + 1;
-    std::fprintf(file, "%lu,%lu,%d,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu",
-            (unsigned long)sample,
-            (unsigned long)demand_epoch,
-            current_layer,
-            (unsigned long)vram_roles_total,
-            (unsigned long)vram_roles_near,
-            (unsigned long)vram_full_total,
-            (unsigned long)vram_full_near,
-            (unsigned long)ram_total,
-            (unsigned long)ram_near,
-            (unsigned long)ram_vram_full_total,
-            (unsigned long)ram_vram_full_near,
-            (unsigned long)ram_vram_any_total,
-            (unsigned long)ram_vram_any_near,
-            (unsigned long)ram_vram_partial_total,
-            (unsigned long)ram_vram_partial_near);
-    for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-        std::fprintf(file, ",%lu", (unsigned long)vram_roles[bucket]);
-    }
-    for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-        std::fprintf(file, ",%lu", (unsigned long)vram_full_objects[bucket]);
-    }
-    for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-        std::fprintf(file, ",%lu", (unsigned long)ram_objects[bucket]);
-    }
-    for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-        std::fprintf(file, ",%lu", (unsigned long)ram_vram_full_overlap[bucket]);
-    }
-    for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-        std::fprintf(file, ",%lu", (unsigned long)ram_vram_any_overlap[bucket]);
-    }
-    for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-        std::fprintf(file, ",%lu", (unsigned long)ram_vram_partial_roles[bucket]);
-    }
-    std::fprintf(file, "\n");
-    std::fclose(file);
-}
 
-static int q4_cache_locality_role_from_tensor(const char *name) {
-    if (!name) return -1;
-    if (std::strstr(name, ".ffn_gate_exps.")) return 0;
-    if (std::strstr(name, ".ffn_up_exps.")) return 1;
-    if (std::strstr(name, ".ffn_down_exps.")) return 2;
-    return -1;
-}
 
-static bool q4_cache_locality_slot_ready(const batch_vram_cache &cache, int slot) {
-    if (!cache.pool || slot < 0 || slot >= cache.n_slots) return false;
-    if (cache.slot_key[slot] == 0 || cache.slot_payload_bytes[slot] == 0) return false;
-    if (cache.slot_filling[slot] || cache.slot_pending[slot]) return false;
-    return cache.slot_state[slot] != q4_colibri_slot_state::free &&
-        cache.slot_state[slot] != q4_colibri_slot_state::reserved &&
-        cache.slot_state[slot] != q4_colibri_slot_state::reading &&
-        cache.slot_state[slot] != q4_colibri_slot_state::failed;
-}
 
-static void q4_cache_locality_maybe_sample(int current_layer) {
-    if (!q4_cache_locality_profile_enabled()) return;
-    if (current_layer < 0 || current_layer >= 128) return;
-    const uint64_t demands = g_q4_tier_overlap_diag.object_demands.load(std::memory_order_relaxed);
-    const uint64_t period = q4_cache_locality_sample_period();
-    if (period > 1 && demands % period != 0) return;
 
-    uint64_t vram_roles[Q4_CACHE_LOCALITY_BUCKETS] = {};
-    uint64_t vram_full_objects[Q4_CACHE_LOCALITY_BUCKETS] = {};
-    uint64_t ram_objects[Q4_CACHE_LOCALITY_BUCKETS] = {};
-    uint64_t ram_vram_full_overlap[Q4_CACHE_LOCALITY_BUCKETS] = {};
-    uint64_t ram_vram_any_overlap[Q4_CACHE_LOCALITY_BUCKETS] = {};
-    uint64_t ram_vram_partial_roles[Q4_CACHE_LOCALITY_BUCKETS] = {};
-    std::unordered_map<uint64_t, int> vram_object_masks;
 
-    for (int cid = 0; cid < 2; ++cid) {
-        const batch_vram_cache &cache = g_bcaches[cid];
-        if (!cache.pool || cache.n_slots <= 0) continue;
-        for (int slot = 0; slot < cache.n_slots; ++slot) {
-            if (!q4_cache_locality_slot_ready(cache, slot)) continue;
-            const int layer = cache.slot_layer[slot];
-            const int expert = cache.slot_expert[slot];
-            const int bucket = q4_cache_locality_bucket_for_layer(current_layer, layer);
-            if (bucket >= 0 && bucket < Q4_CACHE_LOCALITY_BUCKETS) {
-                ++vram_roles[bucket];
-            }
-            if (layer >= 0 && expert >= 0) {
-                const int role = q4_cache_locality_role_from_tensor(cache.slot_tensor[slot]);
-                const uint64_t key = ((uint64_t)(uint32_t)layer << 32) | (uint32_t)expert;
-                vram_object_masks[key] |= role >= 0 && role < 3 ? (1 << role) : 0;
-            }
-        }
-    }
-    for (const auto &kv : vram_object_masks) {
-        if ((kv.second & 7) != 7) continue;
-        const int layer = (int)(uint32_t)(kv.first >> 32);
-        const int bucket = q4_cache_locality_bucket_for_layer(current_layer, layer);
-        if (bucket >= 0 && bucket < Q4_CACHE_LOCALITY_BUCKETS) {
-            ++vram_full_objects[bucket];
-        }
-    }
 
-    if (!g_q4_host_object_prefetch.inited) {
-        ++g_q4_tier_overlap_diag.cache_locality_skipped_lock;
-    } else {
-        std::unique_lock<std::mutex> host_lock(g_q4_host_object_prefetch.mu, std::try_to_lock);
-        if (!host_lock.owns_lock()) {
-            ++g_q4_tier_overlap_diag.cache_locality_skipped_lock;
-        } else {
-            for (const q4_colibri_host_object_slot &slot : g_q4_host_object_prefetch.slots) {
-                if (!slot.ready) continue;
-                const int bucket = q4_cache_locality_bucket_for_layer(current_layer, slot.marker.layer_idx);
-                if (bucket >= 0 && bucket < Q4_CACHE_LOCALITY_BUCKETS) {
-                    ++ram_objects[bucket];
-                    if (slot.marker.layer_idx >= 0 && slot.marker.expert_idx >= 0) {
-                        const uint64_t key =
-                            ((uint64_t)(uint32_t)slot.marker.layer_idx << 32) |
-                            (uint32_t)slot.marker.expert_idx;
-                        const auto vram_it = vram_object_masks.find(key);
-                        const int mask = vram_it == vram_object_masks.end() ? 0 : vram_it->second;
-                        if ((mask & 7) == 7) {
-                            ++ram_vram_full_overlap[bucket];
-                        } else if (mask != 0) {
-                            ++ram_vram_any_overlap[bucket];
-                            ram_vram_partial_roles[bucket] += (uint64_t)__builtin_popcount((unsigned)mask);
-                        }
-                    }
-                }
-            }
-        }
-    }
 
-    q4_cache_locality_profile_record_csv(
-            current_layer, demands, vram_roles, vram_full_objects, ram_objects,
-            ram_vram_full_overlap, ram_vram_any_overlap, ram_vram_partial_roles);
 
-    ++g_q4_tier_overlap_diag.cache_locality_samples;
-    ++g_q4_tier_overlap_diag.cache_locality_layer_samples[current_layer];
-    for (int bucket = 0; bucket < Q4_CACHE_LOCALITY_BUCKETS; ++bucket) {
-        g_q4_tier_overlap_diag.cache_locality_vram_roles[bucket].fetch_add(vram_roles[bucket], std::memory_order_relaxed);
-        g_q4_tier_overlap_diag.cache_locality_vram_full_objects[bucket].fetch_add(vram_full_objects[bucket], std::memory_order_relaxed);
-        g_q4_tier_overlap_diag.cache_locality_ram_objects[bucket].fetch_add(ram_objects[bucket], std::memory_order_relaxed);
-        g_q4_tier_overlap_diag.cache_locality_ram_vram_full_overlap[bucket].fetch_add(
-                ram_vram_full_overlap[bucket], std::memory_order_relaxed);
-        g_q4_tier_overlap_diag.cache_locality_ram_vram_any_overlap[bucket].fetch_add(
-                ram_vram_any_overlap[bucket], std::memory_order_relaxed);
-        g_q4_tier_overlap_diag.cache_locality_ram_vram_partial_roles[bucket].fetch_add(
-                ram_vram_partial_roles[bucket], std::memory_order_relaxed);
-        g_q4_tier_overlap_diag.cache_locality_layer_vram_roles[current_layer].fetch_add(vram_roles[bucket], std::memory_order_relaxed);
-        g_q4_tier_overlap_diag.cache_locality_layer_vram_full_objects[current_layer].fetch_add(vram_full_objects[bucket], std::memory_order_relaxed);
-        g_q4_tier_overlap_diag.cache_locality_layer_ram_objects[current_layer].fetch_add(ram_objects[bucket], std::memory_order_relaxed);
-        g_q4_tier_overlap_diag.cache_locality_layer_ram_vram_full_overlap[current_layer].fetch_add(
-                ram_vram_full_overlap[bucket], std::memory_order_relaxed);
-        g_q4_tier_overlap_diag.cache_locality_layer_ram_vram_any_overlap[current_layer].fetch_add(
-                ram_vram_any_overlap[bucket], std::memory_order_relaxed);
-        g_q4_tier_overlap_diag.cache_locality_layer_ram_vram_partial_roles[current_layer].fetch_add(
-                ram_vram_partial_roles[bucket], std::memory_order_relaxed);
-        if (q4_cache_locality_bucket_is_near(bucket)) {
-            g_q4_tier_overlap_diag.cache_locality_layer_vram_near_roles[current_layer].fetch_add(vram_roles[bucket], std::memory_order_relaxed);
-            g_q4_tier_overlap_diag.cache_locality_layer_vram_near_full_objects[current_layer].fetch_add(vram_full_objects[bucket], std::memory_order_relaxed);
-            g_q4_tier_overlap_diag.cache_locality_layer_ram_near_objects[current_layer].fetch_add(ram_objects[bucket], std::memory_order_relaxed);
-        }
-    }
-}
 
 struct q4_graph_hit_profile_state {
     std::mutex mu;
@@ -10216,10 +9470,7 @@ struct q4_graph_hit_profile_state {
 };
 static q4_graph_hit_profile_state g_q4_graph_hit_profile;
 
-static bool q4_colibri_partial_span_enabled() {
-    if (!g_expert_pack.q4_colibri) return false;
-    return expert_pack_env_bool("GGML_MOE_Q4_COLIBRI_PARTIAL_SPAN", false);
-}
+
 
 static bool q4_colibri_role_in_read_span(
         const q4_colibri_object_role_job &role,
@@ -10271,45 +9522,7 @@ static int q4_graph_descriptor_max_experts() {
     return (int)expert_pack_env_size("GGML_MOE_Q4_GRAPH_DESCRIPTOR_MAX_EXPERTS", 384, 1, 4096);
 }
 
-static bool q4_graph_layer_allowed(const char *tensor_name) {
-    static bool inited = false;
-    static bool allow_all = true;
-    static bool allowed[128] = {};
-    if (!inited) {
-        const char *env = std::getenv("GGML_MOE_Q4_GRAPH_CAPTURE_LAYERS");
-        if (env && env[0] && std::strcmp(env, "all") != 0 && std::strcmp(env, "*") != 0) {
-            allow_all = false;
-            char buf[512];
-            std::snprintf(buf, sizeof(buf), "%s", env);
-            char *save = nullptr;
-            for (char *tok = ::strtok_r(buf, ",;:", &save); tok; tok = ::strtok_r(nullptr, ",;:", &save)) {
-                while (*tok == ' ' || *tok == '\t') ++tok;
-                if (!*tok) continue;
-                char *end = nullptr;
-                long lo = std::strtol(tok, &end, 10);
-                long hi = lo;
-                if (end && *end == '-') {
-                    char *end2 = nullptr;
-                    hi = std::strtol(end + 1, &end2, 10);
-                    end = end2;
-                }
-                if (end == tok || lo < 0 || hi < 0) continue;
-                if (hi < lo) std::swap(lo, hi);
-                lo = std::max<long>(0, std::min<long>(lo, 127));
-                hi = std::max<long>(0, std::min<long>(hi, 127));
-                for (long l = lo; l <= hi; ++l) {
-                    allowed[l] = true;
-                }
-            }
-        }
-        inited = true;
-    }
-    if (allow_all) return true;
-    int layer = -1;
-    char kind[12] = {};
-    batch_route_detail_parse_name(tensor_name, layer, kind, sizeof(kind));
-    return layer >= 0 && layer < 128 && allowed[layer];
-}
+
 
 static int q4_graph_layer_from_tensor(const char *tensor_name) {
     int layer = -1;
@@ -10541,7 +9754,7 @@ static bool q4_graph_descriptor_dry_run_enabled() {
 }
 
 static bool q4_colibri_host_object_prefetch_enabled();
-static q4_graph_slot_status q4_graph_vram_slot_status(const batch_vram_cache *cache, uintptr_t key);
+
 
 struct q4_graph_readiness_io_snapshot {
     uint64_t scheduler_wait_us = 0;
@@ -10582,195 +9795,19 @@ struct q4_graph_readiness_csv_state {
 
 static q4_graph_readiness_csv_state g_q4_graph_readiness_csv;
 
-static const char *q4_graph_readiness_csv_path() {
-    static const char *path = std::getenv("GGML_MOE_Q4_GRAPH_READINESS_CSV");
-    return path && path[0] ? path : nullptr;
-}
 
-static bool q4_graph_readiness_csv_enabled() {
-    return g_expert_pack.q4_colibri && q4_graph_readiness_csv_path();
-}
 
-static q4_graph_readiness_io_snapshot q4_graph_readiness_io_snapshot_now() {
-    q4_graph_readiness_io_snapshot s;
-    s.scheduler_wait_us = g_expert_pack.q4_scheduler_wait_us.load(std::memory_order_relaxed);
-    s.scheduler_read_us = g_expert_pack.q4_scheduler_read_us.load(std::memory_order_relaxed);
-    s.scheduler_h2d_us = g_expert_pack.q4_scheduler_h2d_us.load(std::memory_order_relaxed);
-    s.iouring_batches = g_expert_pack.io_stats.batches.load(std::memory_order_relaxed);
-    s.iouring_reads = g_expert_pack.io_stats.reads.load(std::memory_order_relaxed);
-    s.iouring_bytes = g_expert_pack.io_stats.bytes.load(std::memory_order_relaxed);
-    return s;
-}
 
-static uint64_t q4_graph_readiness_delta_u64(uint64_t now, uint64_t before) {
-    return now >= before ? now - before : 0;
-}
 
-static bool q4_graph_host_object_ready(const q4_colibri_object_marker &marker) {
-    if (!q4_colibri_host_object_prefetch_enabled()) return false;
-    std::lock_guard<std::mutex> lock(g_q4_host_object_prefetch.mu);
-    if (!g_q4_host_object_prefetch.inited || !g_q4_host_object_prefetch.enabled) return false;
-    size_t slot_idx = SIZE_MAX;
-    if (!q4_colibri_host_object_find_ready_locked(marker, &slot_idx)) return false;
-    const q4_colibri_host_object_slot &slot = g_q4_host_object_prefetch.slots[slot_idx];
-    return slot.ready && !slot.loading && !slot.delete_after_h2d &&
-        q4_colibri_object_marker_matches(slot.marker, marker);
-}
 
-static q4_graph_readiness_counts q4_graph_readiness_collect(
-        const char *const role_names[3],
-        batch_vram_cache *cache,
-        int64_t n_as,
-        const int64_t *matrix_row_counts) {
-    q4_graph_readiness_counts counts;
-    if (!role_names || !cache || n_as <= 0 || !matrix_row_counts) return counts;
-    for (int64_t expert = 0; expert < n_as; ++expert) {
-        if (matrix_row_counts[expert] <= 0) continue;
-        ++counts.active_objects;
-        uint64_t ready_for_object = 0;
-        uint64_t present_for_object = 0;
-        uint64_t pending_for_object = 0;
-        const expert_pack_entry *entries[3] = {};
-        for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-            const char *role_name = role_names[role_idx];
-            if (!role_name || !role_name[0]) continue;
-            const q4_graph_slot_status status =
-                q4_graph_vram_slot_status(cache, batch_key_hash(role_name, (int)expert));
-            if (status.present) {
-                ++present_for_object;
-                ++counts.present_roles;
-            }
-            if (status.pending) {
-                ++pending_for_object;
-                ++counts.pending_roles;
-            }
-            if (status.ready) {
-                ++ready_for_object;
-                ++counts.ready_roles;
-            }
-            entries[role_idx] = expert_pack_lookup_any_size(role_name, (int)expert);
-        }
-        counts.active_roles += 3;
-        if (ready_for_object == 3) {
-            ++counts.vram_full_objects;
-        } else if (ready_for_object > 0 || present_for_object > 0 || pending_for_object > 0) {
-            ++counts.vram_partial_objects;
-        }
 
-        bool object_matches = entries[0] && entries[1] && entries[2];
-        if (object_matches) {
-            const expert_pack_entry *first = entries[0];
-            for (size_t role_idx = 1; role_idx < 3; ++role_idx) {
-                object_matches = object_matches &&
-                    entries[role_idx]->source_idx == first->source_idx &&
-                    entries[role_idx]->object_offset == first->object_offset &&
-                    entries[role_idx]->object_nbytes == first->object_nbytes;
-            }
-            if (object_matches) {
-                const q4_colibri_object_marker marker{
-                    first->source_idx, first->layer_idx, (int32_t)expert,
-                    g_expert_pack.q4_manifest_generation, first->object_offset,
-                    (size_t)first->object_nbytes,
-                };
-                if (q4_graph_host_object_ready(marker)) {
-                    ++counts.ram_ready_objects;
-                    counts.ram_roles_to_h2d += 3 - ready_for_object;
-                    continue;
-                }
-            }
-        }
-        if (ready_for_object < 3) {
-            ++counts.ssd_objects;
-            counts.ssd_roles_to_read += 3 - ready_for_object;
-        }
-    }
-    return counts;
-}
 
-static void q4_graph_readiness_csv_record(
-        const char *phase,
-        const char *gate_name,
-        const char *const role_names[3],
-        batch_vram_cache *cache,
-        int64_t n_as,
-        const int64_t *matrix_row_counts,
-        const q4_graph_readiness_provider_stats &provider,
-        const q4_graph_readiness_io_snapshot *before) {
-    if (!q4_graph_readiness_csv_enabled() || !phase || !gate_name ||
-            !role_names || !cache || n_as <= 0 || !matrix_row_counts) {
-        return;
-    }
-    const int layer = q4_graph_layer_from_tensor(gate_name);
-    if (!q4_graph_layer_allowed(gate_name)) return;
-    const q4_graph_readiness_counts counts =
-        q4_graph_readiness_collect(role_names, cache, n_as, matrix_row_counts);
-    if (counts.active_objects == 0) return;
-    const q4_graph_readiness_io_snapshot now = q4_graph_readiness_io_snapshot_now();
-    uint64_t delta_wait_us = 0;
-    uint64_t delta_read_us = 0;
-    uint64_t delta_h2d_us = 0;
-    uint64_t delta_iouring_batches = 0;
-    uint64_t delta_iouring_reads = 0;
-    uint64_t delta_iouring_bytes = 0;
-    if (before) {
-        delta_wait_us = q4_graph_readiness_delta_u64(now.scheduler_wait_us, before->scheduler_wait_us);
-        delta_read_us = q4_graph_readiness_delta_u64(now.scheduler_read_us, before->scheduler_read_us);
-        delta_h2d_us = q4_graph_readiness_delta_u64(now.scheduler_h2d_us, before->scheduler_h2d_us);
-        delta_iouring_batches = q4_graph_readiness_delta_u64(now.iouring_batches, before->iouring_batches);
-        delta_iouring_reads = q4_graph_readiness_delta_u64(now.iouring_reads, before->iouring_reads);
-        delta_iouring_bytes = q4_graph_readiness_delta_u64(now.iouring_bytes, before->iouring_bytes);
-    }
-    const int full_present = counts.present_roles == counts.active_roles ? 1 : 0;
-    const int full_ready = counts.ready_roles == counts.active_roles ? 1 : 0;
-    const int graph_replay_eligible = full_ready;
 
-    std::lock_guard<std::mutex> lock(g_q4_graph_readiness_csv.mu);
-    const char *path = q4_graph_readiness_csv_path();
-    if (!path) return;
-    FILE *f = std::fopen(path, "a");
-    if (!f) return;
-    if (!g_q4_graph_readiness_csv.header_written) {
-        std::fprintf(f,
-            "seq,phase,layer,active_objects,active_roles,present_roles,pending_roles,ready_roles,missing_roles,"
-            "full_present,full_ready,vram_full_objects,vram_partial_objects,ram_ready_objects,ram_roles_to_h2d,"
-            "ssd_objects,ssd_roles_to_read,provider_physical_jobs,provider_role_slices,provider_physical_bytes,"
-            "provider_logical_bytes,delta_wait_us,delta_read_us,delta_h2d_us,delta_iouring_batches,"
-            "delta_iouring_reads,delta_iouring_bytes,graph_replay_eligible\n");
-        g_q4_graph_readiness_csv.header_written = true;
-    }
-    std::fprintf(f,
-        "%llu,%s,%d,%llu,%llu,%llu,%llu,%llu,%llu,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,"
-        "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%d\n",
-        (unsigned long long)++g_q4_graph_readiness_csv.seq,
-        phase,
-        layer,
-        (unsigned long long)counts.active_objects,
-        (unsigned long long)counts.active_roles,
-        (unsigned long long)counts.present_roles,
-        (unsigned long long)counts.pending_roles,
-        (unsigned long long)counts.ready_roles,
-        (unsigned long long)(counts.active_roles > counts.ready_roles ? counts.active_roles - counts.ready_roles : 0),
-        full_present,
-        full_ready,
-        (unsigned long long)counts.vram_full_objects,
-        (unsigned long long)counts.vram_partial_objects,
-        (unsigned long long)counts.ram_ready_objects,
-        (unsigned long long)counts.ram_roles_to_h2d,
-        (unsigned long long)counts.ssd_objects,
-        (unsigned long long)counts.ssd_roles_to_read,
-        (unsigned long long)provider.physical_jobs,
-        (unsigned long long)provider.role_slices,
-        (unsigned long long)provider.physical_bytes,
-        (unsigned long long)provider.logical_bytes,
-        (unsigned long long)delta_wait_us,
-        (unsigned long long)delta_read_us,
-        (unsigned long long)delta_h2d_us,
-        (unsigned long long)delta_iouring_batches,
-        (unsigned long long)delta_iouring_reads,
-        (unsigned long long)delta_iouring_bytes,
-        graph_replay_eligible);
-    std::fclose(f);
-}
+
+
+
+
+
 
 struct q4_scheduler_readiness_csv_state {
     std::mutex mu;
@@ -10780,14 +9817,9 @@ struct q4_scheduler_readiness_csv_state {
 
 static q4_scheduler_readiness_csv_state g_q4_scheduler_readiness_csv;
 
-static const char *q4_scheduler_readiness_csv_path() {
-    static const char *path = std::getenv("GGML_MOE_Q4_SCHEDULER_READINESS_CSV");
-    return path && path[0] ? path : nullptr;
-}
 
-static bool q4_scheduler_readiness_csv_enabled() {
-    return g_expert_pack.q4_colibri && q4_scheduler_readiness_csv_path();
-}
+
+
 
 static uint64_t q4_scheduler_readiness_tp_us(std::chrono::steady_clock::time_point tp) {
     if (tp == std::chrono::steady_clock::time_point{}) return 0;
@@ -10875,126 +9907,7 @@ static void q4_cqe_timeline_record(
         (unsigned long long)read_us);
 }
 
-static void q4_scheduler_readiness_csv_record(
-        const char *phase,
-        const char *gate_name,
-        const q4_colibri_object_batch *batch,
-        uint64_t active_experts,
-        uint64_t requested_objects,
-        uint64_t role_slices,
-        const q4_graph_readiness_provider_stats &provider,
-        bool provider_success,
-        bool active_wait_success) {
-    if (!q4_scheduler_readiness_csv_enabled() || !phase || !gate_name) return;
-    const int layer = q4_graph_layer_from_tensor(gate_name);
-    if (!q4_graph_layer_allowed(gate_name)) return;
 
-    q4_scheduler_readiness_timing timing;
-    bool pilot = false;
-    if (batch) {
-        timing = batch->readiness;
-        pilot = batch->pilot_prefetch;
-    }
-    const uint64_t build_us =
-        q4_scheduler_readiness_delta_us(timing.build_done, timing.schedule_start);
-    const uint64_t queue_wait_us =
-        q4_scheduler_readiness_delta_us(timing.worker_start, timing.queued_at);
-    const uint64_t initial_submit_delay_us =
-        q4_scheduler_readiness_delta_us(timing.initial_submit_start, timing.worker_start);
-    const uint64_t initial_submit_us =
-        q4_scheduler_readiness_delta_us(timing.initial_submit_done, timing.initial_submit_start);
-    const uint64_t first_cqe_delay_us =
-        q4_scheduler_readiness_delta_us(timing.first_cqe, timing.initial_submit_done);
-    const uint64_t last_cqe_delay_us =
-        q4_scheduler_readiness_delta_us(timing.last_cqe, timing.initial_submit_done);
-    const uint64_t first_h2d_delay_us =
-        q4_scheduler_readiness_delta_us(timing.first_h2d_start, timing.initial_submit_done);
-    const uint64_t last_h2d_done_delay_us =
-        q4_scheduler_readiness_delta_us(timing.last_h2d_done, timing.initial_submit_done);
-    const uint64_t provider_wall_us =
-        q4_scheduler_readiness_delta_us(timing.provider_done, timing.queued_at);
-    const uint64_t active_wait_us =
-        q4_scheduler_readiness_delta_us(timing.active_wait_done, timing.active_wait_start);
-    const uint64_t total_us =
-        q4_scheduler_readiness_delta_us(timing.active_wait_done, timing.schedule_start);
-    const uint64_t inflight_avg_x100 =
-        timing.inflight_samples ? (timing.inflight_sum * 100ULL) / timing.inflight_samples : 0;
-
-    std::lock_guard<std::mutex> lock(g_q4_scheduler_readiness_csv.mu);
-    const char *path = q4_scheduler_readiness_csv_path();
-    if (!path) return;
-    FILE *f = std::fopen(path, "a");
-    if (!f) return;
-    if (!g_q4_scheduler_readiness_csv.header_written) {
-        std::fprintf(f,
-            "seq,phase,layer,pilot,provider_success,active_wait_success,"
-            "active_experts,requested_objects,role_slices,provider_physical_jobs,"
-            "provider_role_slices,provider_physical_bytes,provider_logical_bytes,"
-            "schedule_start_us,build_us,queue_wait_us,initial_submit_delay_us,"
-            "initial_submit_us,first_cqe_delay_us,last_cqe_delay_us,"
-            "first_h2d_delay_us,last_h2d_done_delay_us,provider_wall_us,"
-            "active_wait_us,total_us,input_jobs,plans,read_groups,depth,"
-            "refill_batch,initial_submitted,refill_submit_calls,refill_submitted,"
-            "wait_calls,wait_with_inflight,wait_no_inflight,inflight_avg_x100,"
-            "max_inflight,deferred_host_hits,deferred_host_roles,object_h2d_batches,"
-            "object_h2d_objects,object_h2d_roles,object_h2d_bytes,inline_h2d_us,"
-            "read_slot_wait_us,h2d_slot_wait_us,queue_depth_at_submit\n");
-        g_q4_scheduler_readiness_csv.header_written = true;
-    }
-    std::fprintf(f,
-        "%llu,%s,%d,%d,%d,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
-        "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
-        "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
-        (unsigned long long)++g_q4_scheduler_readiness_csv.seq,
-        phase,
-        layer,
-        pilot ? 1 : 0,
-        provider_success ? 1 : 0,
-        active_wait_success ? 1 : 0,
-        (unsigned long long)active_experts,
-        (unsigned long long)requested_objects,
-        (unsigned long long)role_slices,
-        (unsigned long long)provider.physical_jobs,
-        (unsigned long long)provider.role_slices,
-        (unsigned long long)provider.physical_bytes,
-        (unsigned long long)provider.logical_bytes,
-        (unsigned long long)q4_scheduler_readiness_tp_us(timing.schedule_start),
-        (unsigned long long)build_us,
-        (unsigned long long)queue_wait_us,
-        (unsigned long long)initial_submit_delay_us,
-        (unsigned long long)initial_submit_us,
-        (unsigned long long)first_cqe_delay_us,
-        (unsigned long long)last_cqe_delay_us,
-        (unsigned long long)first_h2d_delay_us,
-        (unsigned long long)last_h2d_done_delay_us,
-        (unsigned long long)provider_wall_us,
-        (unsigned long long)active_wait_us,
-        (unsigned long long)total_us,
-        (unsigned long long)timing.input_jobs,
-        (unsigned long long)timing.plans,
-        (unsigned long long)timing.read_groups,
-        (unsigned long long)timing.depth,
-        (unsigned long long)timing.refill_batch,
-        (unsigned long long)timing.initial_submitted,
-        (unsigned long long)timing.refill_submit_calls,
-        (unsigned long long)timing.refill_submitted,
-        (unsigned long long)timing.wait_calls,
-        (unsigned long long)timing.wait_with_inflight,
-        (unsigned long long)timing.wait_no_inflight,
-        (unsigned long long)inflight_avg_x100,
-        (unsigned long long)timing.max_inflight,
-        (unsigned long long)timing.deferred_host_hits,
-        (unsigned long long)timing.deferred_host_roles,
-        (unsigned long long)timing.object_h2d_batches,
-        (unsigned long long)timing.object_h2d_objects,
-        (unsigned long long)timing.object_h2d_roles,
-        (unsigned long long)timing.object_h2d_bytes,
-        (unsigned long long)timing.inline_h2d_us,
-        (unsigned long long)timing.read_slot_wait_us,
-        (unsigned long long)timing.h2d_slot_wait_us,
-        (unsigned long long)timing.queue_depth_at_submit);
-    std::fclose(f);
-}
 
 struct q4_object_reuse_trace_entry {
     uint64_t last_seq = 0;
@@ -11010,67 +9923,11 @@ struct q4_object_reuse_trace_state {
 
 static q4_object_reuse_trace_state g_q4_object_reuse_trace;
 
-static const char *q4_object_reuse_trace_path() {
-    static const char *path = std::getenv("GGML_MOE_Q4_OBJECT_REUSE_TRACE_CSV");
-    return path && path[0] ? path : nullptr;
-}
 
-static bool q4_object_reuse_trace_enabled() {
-    return g_expert_pack.q4_colibri && q4_object_reuse_trace_path();
-}
 
-static void q4_object_reuse_trace_record(
-        const q4_colibri_object_marker &marker,
-        int64_t active_rows,
-        uint64_t vram_ready_roles,
-        uint64_t vram_present_roles,
-        bool ram_ready,
-        uint64_t roles_to_read,
-        uint64_t roles_to_h2d,
-        uint64_t physical_bytes,
-        uint64_t logical_bytes) {
-    if (!q4_object_reuse_trace_enabled()) return;
-    std::lock_guard<std::mutex> lock(g_q4_object_reuse_trace.mu);
-    const char *path = q4_object_reuse_trace_path();
-    if (!path) return;
-    FILE *f = std::fopen(path, "a");
-    if (!f) return;
-    if (!g_q4_object_reuse_trace.header_written) {
-        std::fprintf(f,
-            "seq,layer,expert,source_idx,offset,bytes,active_rows,"
-            "vram_ready_roles,vram_present_roles,ram_ready,roles_to_read,roles_to_h2d,"
-            "physical_bytes,logical_bytes,request_count_before,last_seq,reuse_distance\n");
-        g_q4_object_reuse_trace.header_written = true;
-    }
-    const std::string key = q4_colibri_host_object_key(marker);
-    q4_object_reuse_trace_entry &entry = g_q4_object_reuse_trace.objects[key];
-    const uint64_t seq = ++g_q4_object_reuse_trace.seq;
-    const uint64_t request_count_before = entry.count;
-    const uint64_t last_seq = entry.last_seq;
-    const uint64_t reuse_distance = last_seq > 0 && seq >= last_seq ? seq - last_seq : 0;
-    std::fprintf(f,
-        "%llu,%d,%d,%d,%llu,%zu,%lld,%llu,%llu,%d,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
-        (unsigned long long)seq,
-        (int)marker.layer_idx,
-        (int)marker.expert_idx,
-        (int)marker.source_idx,
-        (unsigned long long)marker.offset,
-        marker.bytes,
-        (long long)active_rows,
-        (unsigned long long)vram_ready_roles,
-        (unsigned long long)vram_present_roles,
-        ram_ready ? 1 : 0,
-        (unsigned long long)roles_to_read,
-        (unsigned long long)roles_to_h2d,
-        (unsigned long long)physical_bytes,
-        (unsigned long long)logical_bytes,
-        (unsigned long long)request_count_before,
-        (unsigned long long)last_seq,
-        (unsigned long long)reuse_distance);
-    entry.last_seq = seq;
-    entry.count += 1;
-    std::fclose(f);
-}
+
+
+
 
 struct q4_object_tier_trace_state {
     std::mutex mu;
@@ -11080,23 +9937,16 @@ struct q4_object_tier_trace_state {
 
 static q4_object_tier_trace_state g_q4_object_tier_trace;
 
-static const char *q4_object_tier_trace_path() {
-    static const char *path = std::getenv("GGML_MOE_Q4_OBJECT_TIER_TRACE_OUT");
-    return path && path[0] ? path : nullptr;
-}
 
-static bool q4_object_tier_trace_enabled() {
-    return g_expert_pack.q4_colibri && q4_object_tier_trace_path();
-}
+
+
 
 static uint64_t q4_colibri_host_object_score(
         const q4_colibri_object_marker &marker,
         int current_layer,
         uint32_t freq);
 
-static bool q4_object_tier_trace_score_enabled() {
-    return expert_pack_env_bool("GGML_MOE_Q4_OBJECT_TIER_TRACE_SCORE", false);
-}
+
 
 struct q4_object_tier_trace_ram_slot_snapshot {
     bool present = false;
@@ -11108,25 +9958,7 @@ struct q4_object_tier_trace_ram_slot_snapshot {
     uint64_t used = 0;
 };
 
-static q4_object_tier_trace_ram_slot_snapshot q4_object_tier_trace_get_ram_snapshot(
-        const q4_colibri_object_marker &marker) {
-    q4_object_tier_trace_ram_slot_snapshot out;
-    if (!q4_colibri_host_object_prefetch_enabled()) return out;
-    std::lock_guard<std::mutex> lock(g_q4_host_object_prefetch.mu);
-    if (!g_q4_host_object_prefetch.inited || !g_q4_host_object_prefetch.enabled) return out;
-    size_t slot_idx = SIZE_MAX;
-    if (!q4_colibri_host_object_find_ready_locked(marker, &slot_idx)) return out;
-    const q4_colibri_host_object_slot &slot = g_q4_host_object_prefetch.slots[slot_idx];
-    if (!q4_colibri_object_marker_matches(slot.marker, marker)) return out;
-    out.present = true;
-    out.ready = slot.ready;
-    out.loading = slot.loading;
-    out.delete_after_h2d = slot.delete_after_h2d;
-    out.score = slot.score;
-    out.freq = slot.freq;
-    out.used = slot.used;
-    return out;
-}
+
 
 static bool q4_tier_diag_vram_evicted_age_snapshot(
         const q4_colibri_object_marker &marker,
@@ -11142,137 +9974,11 @@ static bool q4_tier_diag_vram_evicted_age_snapshot(
     return true;
 }
 
-static void q4_object_tier_trace_record(
-        const q4_colibri_object_marker &marker,
-        int64_t active_rows,
-        uint64_t vram_present_roles,
-        uint64_t vram_ready_roles,
-        bool ram_ready,
-        uint64_t missing_roles,
-        uint64_t scheduled_roles,
-        uint64_t object_bytes,
-        uint64_t logical_role_bytes,
-        bool ram_lookup_allowed,
-        bool ram_admit_allowed,
-        bool ram_net_allowed) {
-    if (!q4_object_tier_trace_enabled()) return;
 
-    const char *demand_tier = "ssd";
-    const char *provider_path = "ssd_read_h2d";
-    if (vram_present_roles >= 3) {
-        demand_tier = vram_ready_roles >= 3 ? "vram_full_ready" : "vram_full_pending";
-        provider_path = vram_ready_roles >= 3 ? "none" : "wait_vram";
-    } else if (vram_present_roles > 0) {
-        demand_tier = ram_ready ? "vram_partial_ram" : "vram_partial_ssd";
-        provider_path = ram_ready ? "ram_h2d" : "ssd_read_h2d";
-    } else if (ram_ready) {
-        demand_tier = "ram";
-        provider_path = "ram_h2d";
-    }
 
-    const uint64_t epoch =
-        g_q4_tier_overlap_diag.token_epoch_public.load(std::memory_order_acquire);
-    uint64_t vram_eviction_age = 0;
-    const bool after_vram_eviction =
-        q4_tier_diag_vram_evicted_age_snapshot(marker, &vram_eviction_age);
-    const bool score_trace = q4_object_tier_trace_score_enabled();
-    const int current_layer = score_trace ? q4_tier_diag_current_layer_snapshot() : -1;
-    const int layer_distance =
-        score_trace && current_layer >= 0 && marker.layer_idx >= 0 ?
-        (int)marker.layer_idx - current_layer : 0;
-    const uint32_t score_freq = 1;
-    const uint64_t object_score = score_trace ?
-        q4_colibri_host_object_score(marker, current_layer, score_freq) : 0;
-    const q4_object_tier_trace_ram_slot_snapshot ram_snapshot =
-        score_trace ? q4_object_tier_trace_get_ram_snapshot(marker) : q4_object_tier_trace_ram_slot_snapshot{};
 
-    std::lock_guard<std::mutex> lock(g_q4_object_tier_trace.mu);
-    const char *path = q4_object_tier_trace_path();
-    if (!path) return;
-    FILE *f = std::fopen(path, "a");
-    if (!f) return;
-    if (!g_q4_object_tier_trace.header_written) {
-        std::fprintf(f,
-            "seq,epoch,layer,expert,source_idx,offset,object_bytes,active_rows,"
-            "vram_present_roles,vram_ready_roles,ram_ready,missing_roles,scheduled_roles,"
-            "logical_role_bytes,demand_tier,provider_path,ram_lookup_allowed,"
-            "ram_admit_allowed,ram_net_allowed,after_vram_eviction,vram_eviction_age,"
-            "current_layer,layer_distance,score_freq,object_score,"
-            "ram_slot_present,ram_slot_ready,ram_slot_loading,ram_slot_delete_after_h2d,"
-            "ram_slot_freq,ram_slot_score,ram_slot_used\n");
-        g_q4_object_tier_trace.header_written = true;
-    }
-    std::fprintf(f,
-        "%llu,%llu,%d,%d,%d,%llu,%llu,%lld,%llu,%llu,%d,%llu,%llu,%llu,%s,%s,%d,%d,%d,%d,%llu,%d,%d,%u,%llu,%d,%d,%d,%d,%u,%llu,%llu\n",
-        (unsigned long long)++g_q4_object_tier_trace.seq,
-        (unsigned long long)epoch,
-        (int)marker.layer_idx,
-        (int)marker.expert_idx,
-        (int)marker.source_idx,
-        (unsigned long long)marker.offset,
-        (unsigned long long)object_bytes,
-        (long long)active_rows,
-        (unsigned long long)vram_present_roles,
-        (unsigned long long)vram_ready_roles,
-        ram_ready ? 1 : 0,
-        (unsigned long long)missing_roles,
-        (unsigned long long)scheduled_roles,
-        (unsigned long long)logical_role_bytes,
-        demand_tier,
-        provider_path,
-        ram_lookup_allowed ? 1 : 0,
-        ram_admit_allowed ? 1 : 0,
-        ram_net_allowed ? 1 : 0,
-        after_vram_eviction ? 1 : 0,
-        (unsigned long long)vram_eviction_age,
-        current_layer,
-        layer_distance,
-        (unsigned)score_freq,
-        (unsigned long long)object_score,
-        ram_snapshot.present ? 1 : 0,
-        ram_snapshot.ready ? 1 : 0,
-        ram_snapshot.loading ? 1 : 0,
-        ram_snapshot.delete_after_h2d ? 1 : 0,
-        (unsigned)ram_snapshot.freq,
-        (unsigned long long)ram_snapshot.score,
-        (unsigned long long)ram_snapshot.used);
-    std::fclose(f);
-}
 
-static q4_graph_slot_status q4_graph_vram_slot_status(const batch_vram_cache *cache, uintptr_t key) {
-    q4_graph_slot_status status;
-    if (!cache || !cache->pool || cache->n_slots <= 0 || key == 0) return status;
-    for (int slot = 0; slot < cache->n_slots; ++slot) {
-        if (cache->slot_key[slot] != key) continue;
-        if (cache->slot_state[slot] != q4_colibri_slot_state::h2d_ready ||
-                cache->slot_filling[slot] ||
-                cache->slot_payload_bytes[slot] == 0) {
-            return status;
-        }
-        status.present = true;
-        status.pending = cache->slot_pending[slot];
-        status.ready = !status.pending;
-        status.slot = slot;
-        return status;
-    }
-    return status;
-}
 
-static bool q4_graph_acquire_descriptor(
-        batch_vram_cache *cache,
-        const q4_graph_slot_status &status,
-        uintptr_t key,
-        ggml_moe_common::role kind,
-        ggml_moe_expert_descriptor &descriptor) {
-    if (!cache || !status.ready || status.slot < 0) return false;
-    if (!ggml_moe_common::role_cache_acquire_descriptor(
-            batch_cache_role_view(cache), status.slot, key, (uint64_t)key,
-            kind, 0, descriptor)) {
-        return false;
-    }
-    ++cache->descriptor_acquires;
-    return true;
-}
 
 static bool q4_graph_release_descriptor(
         batch_vram_cache *cache,
@@ -11296,20 +10002,7 @@ static bool q4_graph_release_descriptor(
     return true;
 }
 
-static bool q4_graph_release_descriptors(
-        batch_vram_cache *cache,
-        const std::vector<uintptr_t> &keys,
-        const std::vector<ggml_moe_expert_descriptor> &descriptors,
-        cudaStream_t stream,
-        bool record_completion) {
-    if (!cache || keys.size() != descriptors.size()) return false;
-    bool ok = true;
-    for (size_t i = 0; i < descriptors.size(); ++i) {
-        ok = q4_graph_release_descriptor(
-            cache, keys[i], descriptors[i], stream, record_completion) && ok;
-    }
-    return ok;
-}
+
 
 
 
@@ -11586,208 +10279,13 @@ static bool q4_graph_descriptor_buffer_init() {
     return true;
 }
 
-static bool q4_graph_descriptor_dry_run_copy(
-        int layer,
-        const std::vector<ggml_moe_expert_descriptor> &entries) {
-    if (!q4_graph_descriptor_dry_run_enabled()) return true;
-    if (entries.empty()) return true;
-    const size_t bytes = entries.size() * sizeof(ggml_moe_expert_descriptor);
-    if (!q4_graph_descriptor_buffer_init() ||
-            g_batch.q4_graph_descriptor_buffer.capacity < entries.size()) {
-        ++g_q4_graph_hit_profile.descriptor_dry_run_failures;
-        return false;
-    }
-    const auto copy_start = std::chrono::steady_clock::now();
-    char label[160];
-    std::snprintf(label, sizeof(label),
-            "q4_graph_descriptor_dry_run layer=%d objects=%zu bytes=%zu",
-            layer, entries.size() / 3, bytes);
-    {
-        moe_nvtx_range nvtx(label);
-        if (!ggml_moe_common::device_descriptor_buffer_copy_async(
-                    g_batch.q4_graph_descriptor_buffer,
-                    entries.data(), entries.size(), g_batch.stream)) {
-            ++g_q4_graph_hit_profile.descriptor_dry_run_failures;
-            return false;
-        }
-    }
-    const uint64_t copy_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - copy_start).count();
-    ++g_q4_graph_hit_profile.descriptor_dry_run_calls;
-    g_q4_graph_hit_profile.descriptor_dry_run_objects.fetch_add(entries.size() / 3, std::memory_order_relaxed);
-    g_q4_graph_hit_profile.descriptor_dry_run_bytes.fetch_add(bytes, std::memory_order_relaxed);
-    g_q4_graph_hit_profile.descriptor_dry_run_copy_us.fetch_add(copy_us, std::memory_order_relaxed);
-    return true;
-}
 
-static void q4_graph_record_same_layer_boundary(
-        const char *gate_name,
-        const char *const role_names[3],
-        batch_vram_cache *cache,
-        int64_t n_as,
-        const int64_t *matrix_row_counts,
-        bool post_wait) {
-    if (!q4_graph_profile_requested() || !gate_name || !role_names || !cache ||
-            n_as <= 0 || !matrix_row_counts) {
-        return;
-    }
-    q4_graph_hit_profile_register_once();
-    const int layer = q4_graph_layer_from_tensor(gate_name);
-    if (!q4_graph_layer_allowed(gate_name)) {
-        ++g_q4_graph_hit_profile.layer_skips;
-        return;
-    }
 
-    uint64_t objects = 0;
-    uint64_t present_roles = 0;
-    uint64_t pending_roles = 0;
-    uint64_t ready_roles = 0;
-    std::vector<ggml_moe_expert_descriptor> descriptors;
-    std::vector<uintptr_t> descriptor_keys;
-    if (q4_graph_descriptor_dry_run_enabled()) {
-        const size_t reserve_objects = (size_t)std::min<int64_t>(
-            n_as, q4_graph_descriptor_max_experts());
-        descriptors.reserve(reserve_objects * 3);
-        descriptor_keys.reserve(reserve_objects * 3);
-    }
-    for (int64_t expert = 0; expert < n_as; ++expert) {
-        if (matrix_row_counts[expert] <= 0) continue;
-        ++objects;
-        q4_graph_slot_status role_status[3];
-        for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-            const char *role_name = role_names[role_idx];
-            if (!role_name || !role_name[0]) continue;
-            const q4_graph_slot_status status =
-                q4_graph_vram_slot_status(cache, batch_key_hash(role_name, (int)expert));
-            role_status[role_idx] = status;
-            if (status.present) ++present_roles;
-            if (status.pending) ++pending_roles;
-            if (status.ready) ++ready_roles;
-        }
-        if (post_wait && q4_graph_descriptor_dry_run_enabled() &&
-                role_status[0].ready && role_status[1].ready && role_status[2].ready) {
-            ggml_moe_expert_descriptor object_descriptors[3];
-            uintptr_t object_keys[3] = {};
-            size_t acquired = 0;
-            for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-                object_keys[role_idx] = batch_key_hash(role_names[role_idx], (int)expert);
-                if (!q4_graph_acquire_descriptor(
-                        cache, role_status[role_idx], object_keys[role_idx],
-                        static_cast<ggml_moe_common::role>(role_idx), object_descriptors[role_idx])) {
-                    break;
-                }
-                ++acquired;
-            }
-            if (acquired == 3) {
-                descriptors.insert(descriptors.end(), object_descriptors, object_descriptors + 3);
-                descriptor_keys.insert(descriptor_keys.end(), object_keys, object_keys + 3);
-            } else {
-                for (size_t role_idx = 0; role_idx < acquired; ++role_idx) {
-                    (void)q4_graph_release_descriptor(
-                        cache, object_keys[role_idx], object_descriptors[role_idx], nullptr, false);
-                }
-            }
-        }
-    }
-    if (objects == 0) return;
-    const uint64_t active_roles = objects * 3;
-    std::atomic<uint64_t> &calls = post_wait ?
-        g_q4_graph_hit_profile.post_wait_calls :
-        g_q4_graph_hit_profile.post_provider_calls;
-    std::atomic<uint64_t> &active_objects_ctr = post_wait ?
-        g_q4_graph_hit_profile.post_wait_active_objects :
-        g_q4_graph_hit_profile.post_provider_active_objects;
-    std::atomic<uint64_t> &present_roles_ctr = post_wait ?
-        g_q4_graph_hit_profile.post_wait_present_roles :
-        g_q4_graph_hit_profile.post_provider_present_roles;
-    std::atomic<uint64_t> &pending_roles_ctr = post_wait ?
-        g_q4_graph_hit_profile.post_wait_pending_roles :
-        g_q4_graph_hit_profile.post_provider_pending_roles;
-    std::atomic<uint64_t> &ready_roles_ctr = post_wait ?
-        g_q4_graph_hit_profile.post_wait_ready_roles :
-        g_q4_graph_hit_profile.post_provider_ready_roles;
-    std::atomic<uint64_t> &full_present_ctr = post_wait ?
-        g_q4_graph_hit_profile.post_wait_full_present_calls :
-        g_q4_graph_hit_profile.post_provider_full_present_calls;
-    std::atomic<uint64_t> &full_ready_ctr = post_wait ?
-        g_q4_graph_hit_profile.post_wait_full_ready_calls :
-        g_q4_graph_hit_profile.post_provider_full_ready_calls;
-    ++calls;
-    active_objects_ctr.fetch_add(objects, std::memory_order_relaxed);
-    present_roles_ctr.fetch_add(present_roles, std::memory_order_relaxed);
-    pending_roles_ctr.fetch_add(pending_roles, std::memory_order_relaxed);
-    ready_roles_ctr.fetch_add(ready_roles, std::memory_order_relaxed);
-    if (present_roles == active_roles) ++full_present_ctr;
-    if (ready_roles == active_roles) ++full_ready_ctr;
-    if (layer >= 0 && layer < 128) {
-        std::atomic<uint64_t> *layer_calls = post_wait ?
-            g_q4_graph_hit_profile.layer_post_wait_calls :
-            g_q4_graph_hit_profile.layer_post_provider_calls;
-        std::atomic<uint64_t> *layer_active_objects = post_wait ?
-            g_q4_graph_hit_profile.layer_post_wait_active_objects :
-            g_q4_graph_hit_profile.layer_post_provider_active_objects;
-        std::atomic<uint64_t> *layer_present_roles = post_wait ?
-            g_q4_graph_hit_profile.layer_post_wait_present_roles :
-            g_q4_graph_hit_profile.layer_post_provider_present_roles;
-        std::atomic<uint64_t> *layer_pending_roles = post_wait ?
-            g_q4_graph_hit_profile.layer_post_wait_pending_roles :
-            g_q4_graph_hit_profile.layer_post_provider_pending_roles;
-        std::atomic<uint64_t> *layer_ready_roles = post_wait ?
-            g_q4_graph_hit_profile.layer_post_wait_ready_roles :
-            g_q4_graph_hit_profile.layer_post_provider_ready_roles;
-        std::atomic<uint64_t> *layer_full_present = post_wait ?
-            g_q4_graph_hit_profile.layer_post_wait_full_present_calls :
-            g_q4_graph_hit_profile.layer_post_provider_full_present_calls;
-        std::atomic<uint64_t> *layer_full_ready = post_wait ?
-            g_q4_graph_hit_profile.layer_post_wait_full_ready_calls :
-            g_q4_graph_hit_profile.layer_post_provider_full_ready_calls;
-        ++layer_calls[layer];
-        layer_active_objects[layer].fetch_add(objects, std::memory_order_relaxed);
-        layer_present_roles[layer].fetch_add(present_roles, std::memory_order_relaxed);
-        layer_pending_roles[layer].fetch_add(pending_roles, std::memory_order_relaxed);
-        layer_ready_roles[layer].fetch_add(ready_roles, std::memory_order_relaxed);
-        if (present_roles == active_roles) ++layer_full_present[layer];
-        if (ready_roles == active_roles) ++layer_full_ready[layer];
-    }
-    if (post_wait && q4_graph_descriptor_dry_run_enabled()) {
-        const bool complete = descriptors.size() == objects * 3 &&
-            descriptor_keys.size() == descriptors.size();
-        const bool copied = complete && q4_graph_descriptor_dry_run_copy(layer, descriptors);
-        if (!q4_graph_release_descriptors(
-                cache, descriptor_keys, descriptors, g_batch.stream, copied)) {
-            ++g_q4_graph_hit_profile.descriptor_dry_run_failures;
-        }
-        if (!copied) ++g_q4_graph_hit_profile.descriptor_dry_run_failures;
-    }
-    char label[192];
-    std::snprintf(label, sizeof(label),
-            "%s layer=%d present=%llu/%llu pending=%llu ready=%llu",
-            post_wait ? "q4_graph_post_wait" : "q4_graph_post_provider",
-            layer,
-            (unsigned long long)present_roles,
-            (unsigned long long)active_roles,
-            (unsigned long long)pending_roles,
-            (unsigned long long)ready_roles);
-    moe_nvtx_range nvtx(label);
-}
 
-static void q4_graph_record_post_provider_same_layer(
-        const char *gate_name,
-        const char *const role_names[3],
-        batch_vram_cache *cache,
-        int64_t n_as,
-        const int64_t *matrix_row_counts) {
-    q4_graph_record_same_layer_boundary(gate_name, role_names, cache, n_as, matrix_row_counts, false);
-}
 
-static void q4_graph_record_post_wait_same_layer(
-        const char *gate_name,
-        const char *const role_names[3],
-        batch_vram_cache *cache,
-        int64_t n_as,
-        const int64_t *matrix_row_counts) {
-    q4_graph_record_same_layer_boundary(gate_name, role_names, cache, n_as, matrix_row_counts, true);
-}
+
+
+
 
 static bool q4_colibri_host_object_prefetch_enabled() {
     if (!g_expert_pack.q4_colibri) return false;
@@ -18972,46 +17470,7 @@ static bool q4_colibri_pipe_submit_object_batch(q4_colibri_object_batch &batch) 
     return completion.success;
 }
 
-static bool q4_colibri_pipe_submit_object_batch_async(q4_colibri_object_batch *batch) {
-    q4_colibri_pipe_init_once();
-    if (!batch || !g_q4_colibri_pipe.enabled || g_q4_colibri_pipe.failed || batch->jobs.empty()) return false;
-    batch->completion = nullptr;
-    batch->queued_at = std::chrono::steady_clock::now();
-    batch->readiness.queued_at = batch->queued_at;
-    for (q4_colibri_object_job &job : batch->jobs) {
-        for (size_t role_idx = 0; role_idx < job.role_count; ++role_idx) {
-            q4_colibri_object_role_job &role = job.roles[role_idx];
-            role.cache->slot_state[role.slot] = q4_colibri_slot_state::reserved;
-            role.cache->slot_filling[role.slot] = true;
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_q4_colibri_pipe.mu);
-        if (g_q4_colibri_pipe.failed || g_q4_colibri_pipe.stop ||
-                q4_colibri_object_queue_size() + g_q4_colibri_pipe.jobs.size() >=
-                    g_q4_colibri_pipe.max_jobs) {
-            ++g_expert_pack.q4_pipe_queue_full;
-            ++g_expert_pack.q4_pilot_prefetch_queue_full;
-            return false;
-        }
-        if (ggml_moe_common::object_engine_enforcing()) {
-            const size_t object_capacity = g_q4_colibri_pipe.max_jobs - g_q4_colibri_pipe.jobs.size();
-            if (!q4_colibri_common_engine_enqueue(*batch, object_capacity)) return false;
-        } else {
-            if (!q4_colibri_common_engine_begin(*batch)) return false;
-            g_q4_colibri_pipe.object_batches.push_back(batch);
-        }
-        g_expert_pack.q4_pipe_submitted.fetch_add(batch->jobs.size(), std::memory_order_relaxed);
-        const uint64_t queue_depth = (uint64_t)q4_colibri_object_queue_size() +
-            (uint64_t)g_q4_colibri_pipe.jobs.size();
-        g_expert_pack.q4_scheduler_queue_depth_sum.fetch_add(queue_depth, std::memory_order_relaxed);
-        ++g_expert_pack.q4_scheduler_queue_depth_samples;
-        expert_pack_atomic_max(g_expert_pack.q4_scheduler_queue_depth_max, queue_depth);
-        batch->readiness.queue_depth_at_submit = queue_depth;
-    }
-    g_q4_colibri_pipe.cv.notify_one();
-    return true;
-}
+
 
 template <typename Job>
 static bool expert_pack_iouring_job_eligible(const Job &job, size_t expert_bytes) {
@@ -21211,11 +19670,11 @@ static int batch_cache_insert_slot(
     return slot;
 }
 
-static bool down_batch_demand_queue_enabled();
-static int down_batch_demand_queue_max();
-static int down_batch_demand_queue_delay_us();
-static int down_batch_demand_queue_coalesce_us();
-static int down_batch_demand_queue_batch_max();
+
+
+
+
+
 
 struct down_demand_prefill_job {
     batch_vram_cache *cache = nullptr;
@@ -21254,214 +19713,15 @@ struct down_demand_prefill_queue_state {
 
 static down_demand_prefill_queue_state g_down_demand_queue;
 
-static void down_demand_prefill_report_atexit() {
-    if (!g_down_demand_queue.inited || !g_down_demand_queue.enabled) return;
-    std::fprintf(stderr,
-            "[moe_stream_batch] down demand queue: submitted=%lu completed=%lu batches=%lu failures=%lu "
-            "queue_full=%lu no_slot=%lu duplicate=%lu evicted=%lu pending=%zu\n",
-            (unsigned long)g_down_demand_queue.submitted.load(),
-            (unsigned long)g_down_demand_queue.completed.load(),
-            (unsigned long)g_down_demand_queue.batches.load(),
-            (unsigned long)g_down_demand_queue.failures.load(),
-            (unsigned long)g_down_demand_queue.queue_full.load(),
-            (unsigned long)g_down_demand_queue.no_slot.load(),
-            (unsigned long)g_down_demand_queue.duplicate.load(),
-            (unsigned long)g_down_demand_queue.evicted.load(),
-            g_down_demand_queue.jobs.size());
-}
 
-static void down_demand_prefill_worker() {
-    if (cudaSetDevice(0) != cudaSuccess) {
-        g_down_demand_queue.failed = true;
-        return;
-    }
-    for (;;) {
-        std::vector<down_demand_prefill_job> batch;
-        {
-            std::unique_lock<std::mutex> lk(g_down_demand_queue.mu);
-            g_down_demand_queue.cv.wait(lk, [] {
-                return g_down_demand_queue.stop || !g_down_demand_queue.jobs.empty();
-            });
-            if (g_down_demand_queue.stop && g_down_demand_queue.jobs.empty()) {
-                break;
-            }
-            if (g_down_demand_queue.jobs.empty()) {
-                continue;
-            }
-            const int delay_us = down_batch_demand_queue_delay_us();
-            if (delay_us > 0 && !g_down_demand_queue.stop) {
-                g_down_demand_queue.cv.wait_for(lk, std::chrono::microseconds(delay_us), [] {
-                    return g_down_demand_queue.stop;
-                });
-                if (g_down_demand_queue.stop && g_down_demand_queue.jobs.empty()) {
-                    break;
-                }
-            }
-            const size_t expert_bytes = g_down_demand_queue.jobs.front().expert_bytes;
-            const int coalesce_us = down_batch_demand_queue_coalesce_us();
-            if (coalesce_us > 0 && !g_down_demand_queue.stop) {
-                g_down_demand_queue.cv.wait_for(lk, std::chrono::microseconds(coalesce_us), [&] {
-                    return g_down_demand_queue.stop ||
-                        (!g_down_demand_queue.jobs.empty() &&
-                         g_down_demand_queue.jobs.front().expert_bytes != expert_bytes);
-                });
-                if (g_down_demand_queue.stop && g_down_demand_queue.jobs.empty()) {
-                    break;
-                }
-            }
-            const size_t batch_max = (size_t)down_batch_demand_queue_batch_max();
-            while (!g_down_demand_queue.jobs.empty() &&
-                    g_down_demand_queue.jobs.front().expert_bytes == expert_bytes &&
-                    batch.size() < batch_max) {
-                batch.push_back(g_down_demand_queue.jobs.front());
-                g_down_demand_queue.jobs.pop_front();
-            }
-        }
-        if (batch.empty()) {
-            continue;
-        }
 
-        const size_t expert_bytes = batch[0].expert_bytes;
-        bool copied = expert_pack_iouring_copy_jobs(batch, expert_bytes, g_down_demand_queue.stream,
-                g_down_demand_queue.ring, "down_demand_queue");
-        if (!copied) {
-            copied = true;
-            for (const down_demand_prefill_job &job : batch) {
-                batch_copy_trace copy_trace;
-                if (!batch_cache_copy_h2d(g_down_demand_queue.ring, job.dst, job.host_data, expert_bytes,
-                            g_down_demand_queue.stream, job.pack_entry, &copy_trace,
-                            "down_demand_queue", job.tensor, job.expert_idx)) {
-                    copied = false;
-                    break;
-                }
-            }
-        }
 
-        std::lock_guard<std::mutex> lk(g_batch_mu);
-        if (!copied || cudaGetLastError() != cudaSuccess) {
-            for (const down_demand_prefill_job &job : batch) {
-                if (job.cache && job.slot >= 0 && job.slot < job.cache->n_slots &&
-                        job.cache->slot_key[job.slot] == job.key && job.cache->slot_filling[job.slot]) {
-                    batch_cache_clear_slot(job.cache, job.slot);
-                }
-            }
-            ++g_down_demand_queue.failures;
-            continue;
-        }
 
-        ++g_down_demand_queue.batches;
-        for (const down_demand_prefill_job &job : batch) {
-            if (!job.cache || job.slot < 0 || job.slot >= job.cache->n_slots ||
-                    job.cache->slot_key[job.slot] != job.key ||
-                    job.cache->slot_generation[job.slot] != job.generation ||
-                    job.cache->slot_payload_bytes[job.slot] != job.expert_bytes ||
-                    !job.cache->slot_filling[job.slot]) {
-                ++g_down_demand_queue.evicted;
-                continue;
-            }
-            if (!batch_cache_publish_slot_ready(
-                        job.cache, job.slot, job.key, job.generation,
-                        job.expert_bytes, g_down_demand_queue.stream)) {
-                batch_cache_clear_slot(job.cache, job.slot);
-                ++g_down_demand_queue.failures;
-                continue;
-            }
-            ++g_down_demand_queue.completed;
-        }
-    }
-}
 
-static void down_demand_prefill_shutdown() {
-    {
-        std::lock_guard<std::mutex> lk(g_down_demand_queue.mu);
-        g_down_demand_queue.stop = true;
-        g_down_demand_queue.cv.notify_all();
-    }
-    if (g_down_demand_queue.worker.joinable()) {
-        g_down_demand_queue.worker.join();
-    }
-    if (g_down_demand_queue.stream) {
-        cudaStreamSynchronize(g_down_demand_queue.stream);
-    }
-    pinned_stage_release(g_down_demand_queue.ring);
-    if (g_down_demand_queue.stream) {
-        cudaStreamDestroy(g_down_demand_queue.stream);
-        g_down_demand_queue.stream = nullptr;
-    }
-}
 
-static void down_demand_prefill_init_once() {
-    if (g_down_demand_queue.inited) return;
-    std::lock_guard<std::mutex> lk(g_down_demand_queue.mu);
-    if (g_down_demand_queue.inited) return;
-    g_down_demand_queue.enabled = down_batch_demand_queue_enabled();
-    g_down_demand_queue.max_jobs = (size_t)down_batch_demand_queue_max();
-    g_down_demand_queue.inited = true;
-    if (!g_down_demand_queue.enabled) {
-        return;
-    }
-    if (cudaStreamCreateWithFlags(&g_down_demand_queue.stream, cudaStreamNonBlocking) != cudaSuccess) {
-        g_down_demand_queue.enabled = false;
-        g_down_demand_queue.failed = true;
-        return;
-    }
-    std::atexit(down_demand_prefill_report_atexit);
-    std::atexit(down_demand_prefill_shutdown);
-    g_down_demand_queue.worker = std::thread(down_demand_prefill_worker);
-    std::fprintf(stderr,
-            "[moe_stream_batch] down demand queue active: max_jobs=%zu\n",
-            g_down_demand_queue.max_jobs);
-}
 
-static bool down_demand_prefill_enqueue(
-        batch_vram_cache *cache,
-        uintptr_t key,
-        const void *host_data,
-        size_t expert_bytes,
-        const char *tensor_name,
-        int expert_idx,
-        cudaStream_t st) {
-    down_demand_prefill_init_once();
-    if (!g_down_demand_queue.enabled || !cache || !cache->pool) return false;
-    if (batch_cache_find_slot(cache, key) >= 0) {
-        ++g_down_demand_queue.duplicate;
-        return false;
-    }
-    const expert_pack_entry *pack_entry = expert_pack_lookup(tensor_name, expert_idx, expert_bytes);
-    const int slot = batch_cache_insert_slot(cache, key, host_data, expert_bytes, st,
-            true, true, nullptr, 0, false, tensor_name, expert_idx,
-            true, false, false);
-    if (slot < 0) {
-        ++g_down_demand_queue.no_slot;
-        return false;
-    }
-    cache->slot_filling[slot] = true;
 
-    down_demand_prefill_job job;
-    job.cache = cache;
-    job.slot = slot;
-    job.key = key;
-    job.generation = cache->slot_generation[slot];
-    job.dst = (char *)cache->pool + (size_t)slot * cache->slot_sz;
-    job.host_data = host_data;
-    job.pack_entry = pack_entry;
-    job.expert_bytes = expert_bytes;
-    job.expert_idx = expert_idx;
-    std::snprintf(job.tensor, sizeof(job.tensor), "%s", tensor_name ? tensor_name : "");
 
-    {
-        std::lock_guard<std::mutex> lk(g_down_demand_queue.mu);
-        if (g_down_demand_queue.jobs.size() >= g_down_demand_queue.max_jobs) {
-            batch_cache_clear_slot(cache, slot);
-            ++g_down_demand_queue.queue_full;
-            return false;
-        }
-        g_down_demand_queue.jobs.push_back(job);
-        ++g_down_demand_queue.submitted;
-    }
-    g_down_demand_queue.cv.notify_one();
-    return true;
-}
 
 static void preload_profile_entries_for_tensor(
         const std::vector<profile_entry> &entries,
@@ -21525,209 +19785,17 @@ static void preload_profile_entries_for_tensor(
     }
 }
 
-static void preload_profile_for_tensor(
-        const char *tensor_name, const void *src0_data, int64_t n_as, size_t nb02, size_t src0_bytes, cudaStream_t st) {
-    load_profile_once();
-    if (!g_profile_enabled) return;
-    if (!profile_preload_enabled()) return;
-    std::lock_guard<std::mutex> lk(g_profile_mu);
-    preload_profile_entries_for_tensor(
-        g_profile, "profile", tensor_name, src0_data, n_as, nb02, src0_bytes, st,
-        true, profile_preload_evict_enabled(), true, true, profile_preload_slot_budget(batch_cache_get(src0_bytes)));
-}
 
-static void preload_prompt_profile_for_tensor(
-        const char *tensor_name, const void *src0_data, int64_t n_as, size_t nb02, size_t src0_bytes, cudaStream_t st) {
-    load_prompt_profile_once();
-    if (!g_prompt_profile_enabled) return;
-    batch_vram_cache *cache = batch_cache_get(src0_bytes);
-    if (!cache) return;
-    if (profile_protect_enabled() && cache->pinned < profile_preload_slot_budget(cache)) return;
-    std::lock_guard<std::mutex> lk(g_profile_mu);
-    preload_profile_entries_for_tensor(
-        g_prompt_profile, "prompt profile", tensor_name, src0_data, n_as, nb02, src0_bytes, st,
-        false, false, false, false, prompt_profile_preload_scan_budget(cache));
-}
 
-static bool registered_tensor_lookup(const char *tensor_name, registered_tensor *out) {
-    if (!tensor_name || !tensor_name[0] || !out) return false;
-    std::lock_guard<std::mutex> lk(g_registered_mu);
-    for (const registered_tensor &t : g_registered_tensors) {
-        if (std::strcmp(t.name, tensor_name) == 0) {
-            *out = t;
-            return true;
-        }
-    }
-    return false;
-}
 
-static bool trace_entry_matches(const batch_route_trace_entry &e, const char *tensor_name, int expert_idx, size_t expert_bytes) {
-    return e.expert_idx == expert_idx &&
-        e.expert_bytes == expert_bytes &&
-        tensor_name && std::strcmp(e.tensor, tensor_name) == 0;
-}
 
-static bool trace_prefetch_candidate_has_reuse(size_t trace_idx) {
-    if (g_trace_prefetch.min_future_uses <= 1) return true;
-    if (trace_idx >= g_trace_prefetch.trace.size()) return false;
-    const batch_route_trace_entry &candidate = g_trace_prefetch.trace[trace_idx];
-    int uses = 1;
-    const size_t end = std::min(g_trace_prefetch.trace.size(), trace_idx + 1 + g_trace_prefetch.reuse_window);
-    for (size_t i = trace_idx + 1; i < end; ++i) {
-        if (trace_entry_matches(
-                    g_trace_prefetch.trace[i],
-                    candidate.tensor,
-                    candidate.expert_idx,
-                    candidate.expert_bytes) &&
-                ++uses >= g_trace_prefetch.min_future_uses) {
-            return true;
-        }
-    }
-    return false;
-}
 
-static void trace_prefetch_on_hit(const char *tensor_name, int expert_idx, size_t expert_bytes) {
-    trace_prefetch_init_once();
-    if (!g_trace_prefetch.enabled || !g_batch.prefetch_stream || !tensor_name || !tensor_name[0]) return;
 
-    std::lock_guard<std::mutex> lk(g_trace_prefetch.mu);
-    ++g_trace_prefetch.calls;
 
-    if (g_trace_prefetch.cursor < g_trace_prefetch.trace.size() &&
-            trace_entry_matches(g_trace_prefetch.trace[g_trace_prefetch.cursor], tensor_name, expert_idx, expert_bytes)) {
-        ++g_trace_prefetch.cursor;
-        ++g_trace_prefetch.matched;
-    } else {
-        const size_t scan_end = std::min(g_trace_prefetch.trace.size(), g_trace_prefetch.cursor + g_trace_prefetch.window);
-        size_t found = SIZE_MAX;
-        for (size_t i = g_trace_prefetch.cursor; i < scan_end; ++i) {
-            if (trace_entry_matches(g_trace_prefetch.trace[i], tensor_name, expert_idx, expert_bytes)) {
-                found = i;
-                break;
-            }
-        }
-        if (found != SIZE_MAX) {
-            g_trace_prefetch.cursor = found + 1;
-            ++g_trace_prefetch.matched;
-            ++g_trace_prefetch.resync;
-        }
-    }
 
-    const size_t min_prefetch_cursor = std::min(
-        g_trace_prefetch.trace.size(),
-        g_trace_prefetch.cursor + g_trace_prefetch.lead_events);
-    if (g_trace_prefetch.prefetch_cursor < min_prefetch_cursor) {
-        g_trace_prefetch.prefetch_cursor = min_prefetch_cursor;
-    }
 
-    struct trace_prefetch_job {
-        int slot = -1;
-        void *dst = nullptr;
-        const void *host_data = nullptr;
-        const expert_pack_entry *pack_entry = nullptr;
-        int expert_idx = -1;
-        char tensor[128] = {};
-    };
-    std::vector<trace_prefetch_job> jobs;
-    size_t job_bytes = 0;
 
-    int examined = 0;
-    const size_t end = std::min(
-        g_trace_prefetch.trace.size(),
-        g_trace_prefetch.cursor + g_trace_prefetch.lead_events + g_trace_prefetch.window);
-    for (size_t i = g_trace_prefetch.prefetch_cursor; i < end && examined < g_trace_prefetch.max_loads; ++i, ++examined) {
-        g_trace_prefetch.prefetch_cursor = i + 1;
-        const batch_route_trace_entry &e = g_trace_prefetch.trace[i];
-        if (!trace_prefetch_target_allows(e.tensor)) {
-            continue;
-        }
-        if (!trace_prefetch_candidate_has_reuse(i)) {
-            ++g_trace_prefetch.reuse_skips;
-            continue;
-        }
-        if (job_bytes != 0 && e.expert_bytes != job_bytes) {
-            continue;
-        }
-        const expert_pack_entry *pack_entry = expert_pack_lookup(e.tensor, e.expert_idx, e.expert_bytes);
-        registered_tensor rt;
-        const bool have_registered = registered_tensor_lookup(e.tensor, &rt);
-        const bool use_registered = !pack_entry && have_registered &&
-            rt.data && e.expert_idx >= 0 && e.expert_idx < rt.n_as && rt.expert_bytes == e.expert_bytes;
-        if (!pack_entry && !use_registered) {
-            ++g_trace_prefetch.missing_tensor;
-            continue;
-        }
-        batch_vram_cache *cache = batch_cache_get(e.expert_bytes);
-        if (!cache) {
-            ++g_trace_prefetch.cache_unavailable;
-            continue;
-        }
-        const uintptr_t key = batch_key_hash(e.tensor, e.expert_idx);
-        if (batch_cache_find_slot(cache, key) >= 0) {
-            ++g_trace_prefetch.cached;
-            continue;
-        }
-        const char *expert_host = use_registered ? (const char *)rt.data + (size_t)e.expert_idx * rt.nb02 : nullptr;
-        const int slot = batch_cache_insert_slot(cache, key, expert_host, e.expert_bytes, g_batch.prefetch_stream,
-                false, true, nullptr, 0, false, e.tensor, e.expert_idx, false, false, false);
-        if (slot >= 0) {
-            void *dst = (char *)cache->pool + (size_t)slot * cache->slot_sz;
-            trace_prefetch_job job;
-            job.slot = slot;
-            job.dst = dst;
-            job.host_data = expert_host;
-            job.pack_entry = pack_entry;
-            job.expert_idx = e.expert_idx;
-            std::snprintf(job.tensor, sizeof(job.tensor), "%s", e.tensor);
-            jobs.push_back(job);
-            job_bytes = e.expert_bytes;
-        }
-    }
 
-    if (jobs.empty()) return;
-
-    auto mark_jobs_pending = [&](batch_vram_cache *cache, const std::vector<trace_prefetch_job> &pending_jobs) -> bool {
-        const ggml_moe_common::role_cache_view role_view = batch_cache_role_view(cache);
-        for (const trace_prefetch_job &job : pending_jobs) {
-            if (!ggml_moe_common::role_cache_ensure_ready_event(role_view, job.slot)) {
-                return false;
-            }
-            if (!ggml_moe_common::role_cache_record_ready_event(
-                        role_view, job.slot, g_batch.prefetch_stream)) {
-                return false;
-            }
-            cache->slot_pending[job.slot] = true;
-        }
-        return true;
-    };
-
-    batch_vram_cache *cache = batch_cache_get(job_bytes);
-    if (!cache) {
-        g_trace_prefetch.cache_unavailable += jobs.size();
-        return;
-    }
-
-    bool copied = expert_pack_iouring_copy_jobs(jobs, job_bytes, g_batch.prefetch_stream, g_batch.stage_ring, "trace_prefetch");
-    if (!copied) {
-        copied = true;
-        for (const trace_prefetch_job &job : jobs) {
-            batch_copy_trace copy_trace;
-            if (!batch_cache_copy_h2d(g_batch.stage_ring, job.dst, job.host_data, job_bytes,
-                    g_batch.prefetch_stream, job.pack_entry, &copy_trace,
-                    "trace_prefetch", job.tensor, job.expert_idx)) {
-                copied = false;
-                break;
-            }
-        }
-    }
-    if (!copied || !mark_jobs_pending(cache, jobs)) {
-        for (const trace_prefetch_job &job : jobs) {
-            batch_cache_clear_slot(cache, job.slot);
-        }
-        return;
-    }
-    g_trace_prefetch.loads += jobs.size();
-}
 
 static bool ensure_dev(void *&p, size_t &cur, size_t need) {
     if (cur >= need) return true;
@@ -23079,10 +21147,7 @@ static void expert_pack_v2_shadow_stage_record(
     }
 }
 
-static bool gpu_handoff_enabled() {
-    const char *env = std::getenv("GGML_MOE_GPU_HANDOFF");
-    return env && env[0] && env[0] != '0';
-}
+
 
 
 extern "C" bool ggml_cuda_moe_stream_handoff_upload(
@@ -23289,18 +21354,9 @@ static bool moe_q8k_selftest(cudaStream_t stream) {
 
 
 
-static bool moe_stream_type_supported(ggml_type type) {
-    return type == GGML_TYPE_IQ1_S ||
-        type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ3_S ||
-        type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ2_S ||
-        type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_0 ||
-        type == GGML_TYPE_Q4_K || type == GGML_TYPE_IQ4_XS;
-}
 
-static bool moe_stream_pack_prefetch_type_supported(ggml_type type) {
-    return moe_stream_type_supported(type) ||
-        type == GGML_TYPE_MXFP4;
-}
+
+
 
 static std::atomic<int> g_q4_down_parity_calls{0};
 static std::mutex g_q4_down_parity_seen_mu;
@@ -23525,22 +21581,11 @@ extern "C" bool ggml_cuda_moe_stream_preload_expert_from_pack_async(
     return false;
 }
 
-static bool q4_colibri_same_layer_scheduler_enabled() {
-    expert_pack_init_once();
-    if (!g_expert_pack.q4_colibri || !q4_colibri_pipe_requested()) return false;
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_SAME_LAYER_BATCH");
-    return !env || !env[0] || env[0] != '0';
-}
 
-static bool q4_colibri_active_avoid_slots_enabled() {
-    const char *env = std::getenv("GGML_MOE_Q4_ACTIVE_AVOID_SLOTS");
-    return env && env[0] && env[0] != '0';
-}
 
-static bool q4_colibri_active_touch_slots_enabled() {
-    const char *env = std::getenv("GGML_MOE_Q4_ACTIVE_TOUCH_SLOTS");
-    return env && env[0] && env[0] != '0';
-}
+
+
+
 
 static bool q4_colibri_same_layer_role_names(
         const char *gate_name,
@@ -23558,18 +21603,7 @@ static bool q4_colibri_same_layer_role_names(
     return true;
 }
 
-static bool q4_colibri_object_all_roles_present_in_vram(
-        batch_vram_cache *cache,
-        const char *const role_names[3],
-        int expert) {
-    if (!cache || !role_names || expert < 0) return false;
-    for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-        if (!role_names[role_idx] || !role_names[role_idx][0]) return false;
-        const uintptr_t key = batch_key_hash(role_names[role_idx], expert);
-        if (batch_cache_find_slot(cache, key) < 0) return false;
-    }
-    return true;
-}
+
 
 struct q4_vram_object_admission_resident {
     uint64_t used = 0;
@@ -23596,413 +21630,59 @@ struct q4_vram_object_admission_state {
 
 static q4_vram_object_admission_state g_q4_vram_object_admission;
 
-static uint64_t q4_vram_object_admission_key(int layer, int expert) {
-    return ((uint64_t)(uint32_t)(layer + 1) << 32) | (uint32_t)(expert + 1);
-}
 
-static void q4_vram_object_admission_report_atexit() {
-    if (!q4_vram_object_admission_enabled()) return;
-    uint64_t admitted_roles[3] = {};
-    for (const batch_vram_cache &cache : g_bcaches) {
-        for (int slot = 0; slot < cache.n_slots; ++slot) {
-            if (!cache.slot_object_admitted[slot] || cache.slot_key[slot] == 0) continue;
-            const char *name = cache.slot_tensor[slot];
-            if (name && std::strstr(name, ".ffn_gate_exps.")) ++admitted_roles[0];
-            else if (name && std::strstr(name, ".ffn_up_exps.")) ++admitted_roles[1];
-            else if (name && std::strstr(name, ".ffn_down_exps.")) ++admitted_roles[2];
-        }
-    }
-    std::fprintf(stderr,
-            "[moe_stream_batch] q4 VRAM object admission: policy=admit_age_t2 "
-            "threshold=2 aging_passes=16 capacity_objects=%zu resident_objects=%zu "
-            "requests=%lu resident_hits=%lu admissions=%lu promotions=%lu evictions=%lu "
-            "bypasses=%lu aging_events=%lu rollbacks=%lu transient_object_evictions=%lu "
-            "admitted_roles_gate_up_down=%lu/%lu/%lu\n",
-            g_q4_vram_object_admission.capacity,
-            g_q4_vram_object_admission.resident.size(),
-            (unsigned long)g_q4_vram_object_admission.requests,
-            (unsigned long)g_q4_vram_object_admission.resident_hits,
-            (unsigned long)g_q4_vram_object_admission.admissions,
-            (unsigned long)g_q4_vram_object_admission.promotions,
-            (unsigned long)g_q4_vram_object_admission.evictions,
-            (unsigned long)g_q4_vram_object_admission.bypasses,
-            (unsigned long)g_q4_vram_object_admission.aging_events,
-            (unsigned long)g_q4_vram_object_admission.rollbacks,
-            (unsigned long)g_q4_vram_object_admission.transient_object_evictions,
-            (unsigned long)admitted_roles[0],
-            (unsigned long)admitted_roles[1],
-            (unsigned long)admitted_roles[2]);
-}
 
-static void q4_vram_object_admission_register_report_once() {
-    static std::once_flag once;
-    std::call_once(once, []() { std::atexit(q4_vram_object_admission_report_atexit); });
-}
 
-static void q4_vram_object_admission_age() {
-    auto &state = g_q4_vram_object_admission;
-    for (auto it = state.frequency.begin(); it != state.frequency.end();) {
-        it->second /= 2;
-        if (it->second == 0 && state.resident.find(it->first) == state.resident.end()) {
-            it = state.frequency.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    ++state.aging_events;
-}
 
-static int q4_vram_object_admission_physical_roles(
-        const batch_vram_cache *cache, int layer, int expert) {
-    if (!cache) return 0;
-    int roles = 0;
-    for (int slot = 0; slot < cache->n_slots; ++slot) {
-        if (cache->slot_key[slot] != 0 && cache->slot_layer[slot] == layer &&
-                cache->slot_expert[slot] == expert) {
-            ++roles;
-        }
-    }
-    return roles;
-}
 
-static bool q4_vram_object_admission_clear_object(
-        batch_vram_cache *cache, int layer, int expert, bool admitted_only) {
-    if (!cache) return false;
-    std::vector<int> slots;
-    for (int slot = 0; slot < cache->n_slots; ++slot) {
-        if (cache->slot_key[slot] == 0 || cache->slot_layer[slot] != layer ||
-                cache->slot_expert[slot] != expert ||
-                (admitted_only && !cache->slot_object_admitted[slot])) {
-            continue;
-        }
-        slots.push_back(slot);
-    }
-    for (int slot : slots) {
-        if (!batch_cache_clear_slot(cache, slot)) return false;
-    }
-    return true;
-}
 
-static bool q4_vram_object_admission_observe(
-        batch_vram_cache *cache,
-        const q4_colibri_object_marker &marker,
-        int64_t n_as,
-        const int64_t *matrix_row_counts) {
-    if (!q4_vram_object_admission_enabled() || !cache || marker.layer_idx < 0 ||
-            marker.expert_idx < 0 || marker.expert_idx >= n_as || !matrix_row_counts ||
-            marker.bytes != cache->slot_sz * 3) {
-        return false;
-    }
-    q4_vram_object_admission_register_report_once();
-    auto &state = g_q4_vram_object_admission;
-    if (state.capacity == 0) {
-        // One decode layer needs at most top-8 transient triplets.  These 24
-        // roles are staging, while every admitted unit remains a full
-        // gate/up/down object.
-        constexpr int scratch_roles = 3 * 8;
-        state.capacity = cache->n_slots > scratch_roles ?
-            (size_t)(cache->n_slots - scratch_roles) / 3 : 0;
-    }
-    if (state.capacity == 0) return false;
 
-    const uint64_t epoch = g_q4_tier_overlap_diag.token_epoch_public.load(std::memory_order_acquire);
-    if (state.last_epoch != epoch) {
-        if (epoch > 0 && epoch % 16 == 0) q4_vram_object_admission_age();
-        state.last_epoch = epoch;
-    }
-    const uint64_t key = q4_vram_object_admission_key(marker.layer_idx, marker.expert_idx);
-    uint32_t &frequency = state.frequency[key];
-    if (frequency != UINT32_MAX) ++frequency;
-    ++state.requests;
 
-    auto resident = state.resident.find(key);
-    if (resident != state.resident.end()) {
-        resident->second.used = ++state.clock;
-        ++state.resident_hits;
-        for (int slot = 0; slot < cache->n_slots; ++slot) {
-            if (cache->slot_key[slot] != 0 && cache->slot_layer[slot] == marker.layer_idx &&
-                    cache->slot_expert[slot] == marker.expert_idx) {
-                cache->slot_object_admitted[slot] = true;
-            }
-        }
-        return true;
-    }
-    if (frequency < 2) {
-        ++state.bypasses;
-        return false;
-    }
 
-    if (state.resident.size() >= state.capacity) {
-        auto victim = state.resident.end();
-        uint32_t victim_frequency = UINT32_MAX;
-        uint64_t victim_used = UINT64_MAX;
-        for (auto it = state.resident.begin(); it != state.resident.end(); ++it) {
-            const auto &entry = it->second;
-            if (entry.layer == marker.layer_idx && entry.expert >= 0 && entry.expert < n_as &&
-                    matrix_row_counts[entry.expert] > 0) {
-                continue;
-            }
-            const uint32_t candidate_frequency = state.frequency[it->first];
-            if (victim == state.resident.end() || candidate_frequency < victim_frequency ||
-                    (candidate_frequency == victim_frequency && entry.used < victim_used)) {
-                victim = it;
-                victim_frequency = candidate_frequency;
-                victim_used = entry.used;
-            }
-        }
-        if (victim == state.resident.end() || frequency <= victim_frequency ||
-                !q4_vram_object_admission_clear_object(
-                    cache, victim->second.layer, victim->second.expert, true)) {
-            ++state.bypasses;
-            return false;
-        }
-        state.resident.erase(victim);
-        ++state.evictions;
-    }
 
-    const int physical_roles = q4_vram_object_admission_physical_roles(
-            cache, marker.layer_idx, marker.expert_idx);
-    state.resident[key] = {++state.clock, marker.layer_idx, marker.expert_idx};
-    ++state.admissions;
-    if (physical_roles > 0) ++state.promotions;
-    for (int slot = 0; slot < cache->n_slots; ++slot) {
-        if (cache->slot_key[slot] != 0 && cache->slot_layer[slot] == marker.layer_idx &&
-                cache->slot_expert[slot] == marker.expert_idx) {
-            cache->slot_object_admitted[slot] = true;
-        }
-    }
-    return true;
-}
 
-static void q4_vram_object_admission_rollback(
-        batch_vram_cache *cache, const q4_colibri_object_marker &marker) {
-    if (!q4_vram_object_admission_enabled() || !cache) return;
-    auto &state = g_q4_vram_object_admission;
-    state.resident.erase(q4_vram_object_admission_key(marker.layer_idx, marker.expert_idx));
-    for (int slot = 0; slot < cache->n_slots; ++slot) {
-        if (cache->slot_key[slot] != 0 && cache->slot_layer[slot] == marker.layer_idx &&
-                cache->slot_expert[slot] == marker.expert_idx) {
-            cache->slot_object_admitted[slot] = false;
-        }
-    }
-    ++state.rollbacks;
-}
 
-static bool q4_vram_object_prepare_slots(
-        batch_vram_cache *cache,
-        int needed,
-        const int *avoid_slots,
-        int n_avoid_slots) {
-    if (!q4_vram_object_admission_enabled() || !cache || needed <= 0) return true;
-    std::unordered_set<int> avoided_slot_set;
-    std::unordered_set<uint64_t> avoided_object_set;
-    for (int index = 0; avoid_slots && index < n_avoid_slots; ++index) {
-        const int slot = avoid_slots[index];
-        if (slot < 0 || slot >= cache->n_slots) continue;
-        avoided_slot_set.insert(slot);
-        if (cache->slot_key[slot] != 0 && cache->slot_layer[slot] >= 0 && cache->slot_expert[slot] >= 0) {
-            avoided_object_set.insert(q4_vram_object_admission_key(
-                    cache->slot_layer[slot], cache->slot_expert[slot]));
-        }
-    }
-    auto free_slots = [&]() {
-        int count = 0;
-        for (int slot = 0; slot < cache->n_slots; ++slot) {
-            if (avoided_slot_set.find(slot) == avoided_slot_set.end() && cache->slot_key[slot] == 0) {
-                ++count;
-            }
-        }
-        return count;
-    };
-    while (free_slots() < needed) {
-        int victim_slot = -1;
-        uint64_t oldest = UINT64_MAX;
-        for (int slot = 0; slot < cache->n_slots; ++slot) {
-            if (cache->slot_key[slot] == 0 || cache->slot_object_admitted[slot] ||
-                    avoided_slot_set.find(slot) != avoided_slot_set.end() ||
-                    cache->slot_pinned[slot] || cache->slot_lease_count[slot] != 0 ||
-                    cache->slot_filling[slot]) {
-                continue;
-            }
-            const uint64_t object_key = q4_vram_object_admission_key(
-                    cache->slot_layer[slot], cache->slot_expert[slot]);
-            if (avoided_object_set.find(object_key) == avoided_object_set.end() &&
-                    cache->slot_used[slot] < oldest) {
-                oldest = cache->slot_used[slot];
-                victim_slot = slot;
-            }
-        }
-        if (victim_slot < 0) return false;
-        const int victim_layer = cache->slot_layer[victim_slot];
-        const int victim_expert = cache->slot_expert[victim_slot];
-        if (!q4_vram_object_admission_clear_object(cache, victim_layer, victim_expert, false)) return false;
-        ++g_q4_vram_object_admission.transient_object_evictions;
-    }
-    return true;
-}
 
-static bool q4_colibri_pilot_prefetch_enabled() {
-    expert_pack_init_once();
-    if (!g_expert_pack.q4_colibri || !q4_colibri_pipe_requested()) return false;
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_PREFETCH");
-    return env && env[0] && env[0] != '0';
-}
 
-static int q4_colibri_pilot_prefetch_window() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_PREFETCH_WINDOW");
-    const long value = env && env[0] ? std::atol(env) : 1;
-    if (value < 1) return 1;
-    if (value > 16) return 16;
-    return (int)value;
-}
 
-static int q4_colibri_pilot_prefetch_topk() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_PREFETCH_TOPK");
-    const long value = env && env[0] ? std::atol(env) : 8;
-    if (value < 1) return 1;
-    if (value > 64) return 64;
-    return (int)value;
-}
 
-static int q4_colibri_pilot_prefetch_topk_for_layer(int layer, int fallback) {
-    static std::once_flag once;
-    static int layer_topk[128];
-    std::call_once(once, []() {
-        for (int &value : layer_topk) value = -1;
-        const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_PREFETCH_LAYER_TOPK_SPEC");
-        if (!env || !env[0]) return;
-        const char *p = env;
-        while (*p) {
-            while (*p == ' ' || *p == '\t' || *p == ',') ++p;
-            if (!*p) break;
-            char *end_layer = nullptr;
-            const long layer = std::strtol(p, &end_layer, 10);
-            if (end_layer == p) break;
-            p = end_layer;
-            while (*p == ' ' || *p == '\t' || *p == ':' || *p == '=') ++p;
-            char *end_topk = nullptr;
-            const long topk = std::strtol(p, &end_topk, 10);
-            if (end_topk == p) break;
-            if (layer >= 0 && layer < 128) {
-                long clamped = topk;
-                if (clamped < 0) clamped = 0;
-                if (clamped > 64) clamped = 64;
-                layer_topk[layer] = (int)clamped;
-            }
-            p = end_topk;
-            while (*p && *p != ',') ++p;
-        }
-    });
-    if (layer >= 0 && layer < 128 && layer_topk[layer] >= 0) {
-        return layer_topk[layer];
-    }
-    return fallback;
-}
 
-static bool q4_colibri_pilot_prefetch_allow_evict() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_PREFETCH_ALLOW_EVICT");
-    return env && env[0] && env[0] != '0';
-}
 
-static bool q4_colibri_pilot_prefetch_debug() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_PREFETCH_DEBUG");
-    return env && env[0] && env[0] != '0';
-}
 
-static bool q4_colibri_pilot_to_vram_enabled() {
-    return expert_pack_env_bool("GGML_MOE_Q4_COLIBRI_PILOT_TO_VRAM", false);
-}
 
-static bool q4_colibri_pilot_prefetch_same_layer_source() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_SOURCE");
-    if (!env || !env[0]) return false;
-    return std::strcmp(env, "prev_token_same_layer") == 0 ||
-        std::strcmp(env, "same_layer") == 0 ||
-        std::strcmp(env, "current_layer_same_expert") == 0;
-}
 
-static bool q4_colibri_pilot_prefetch_prev_token_next_layer_source() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_SOURCE");
-    return env && (std::strcmp(env, "prev_token_next_layer") == 0 ||
-        std::strcmp(env, "prev_token_wrap") == 0);
-}
 
-static bool q4_colibri_pilot_prefetch_prev_token_next_layer_miss_source() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_SOURCE");
-    return env && std::strcmp(env, "prev_token_next_layer_miss") == 0;
-}
 
-static bool q4_colibri_pilot_prefetch_wrap_source() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_SOURCE");
-    return env && std::strcmp(env, "prev_token_wrap") == 0;
-}
 
-static bool q4_colibri_pilot_prefetch_boundary_source() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_SOURCE");
-    return env && (std::strcmp(env, "prev_token_boundary") == 0 ||
-        std::strcmp(env, "token_boundary") == 0);
-}
 
-static bool q4_colibri_pilot_prefetch_layer_allowed(int layer) {
-    struct layer_filter {
-        bool active = false;
-        bool allow_all = true;
-        bool allowed[128] = {};
-    };
-    static const layer_filter filter = []() {
-        layer_filter out;
-        const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_PREFETCH_LAYERS");
-        if (!env || !env[0]) return out;
-        out.allow_all = false;
-        if (predictive_prefetch_parse_layer_list(env, &out.allow_all, out.allowed)) {
-            out.active = true;
-        }
-        return out;
-    }();
-    if (layer < 0 || layer >= 128) return false;
-    if (!filter.active) return true;
-    return filter.allow_all || filter.allowed[layer];
-}
 
-static int q4_colibri_pilot_prefetch_wrap_last_layer() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_WRAP_LAST_LAYER");
-    const long value = env && env[0] ? std::atol(env) : 60;
-    if (value < 1) return 1;
-    if (value > 63) return 63;
-    return (int)value;
-}
 
-static int q4_colibri_pilot_prefetch_boundary_trigger_layer() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_BOUNDARY_TRIGGER_LAYER");
-    const long value = env && env[0] ? std::atol(env) : 1;
-    if (value < 0) return 0;
-    if (value > 63) return 63;
-    return (int)value;
-}
 
-static int q4_colibri_pilot_prefetch_boundary_first_layer() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_BOUNDARY_FIRST_LAYER");
-    const long value = env && env[0] ? std::atol(env) : 2;
-    if (value < 0) return 0;
-    if (value > 63) return 63;
-    return (int)value;
-}
 
-static int q4_colibri_pilot_prefetch_boundary_last_layer() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_BOUNDARY_LAST_LAYER");
-    const long value = env && env[0] ? std::atol(env) : 60;
-    if (value < 0) return 0;
-    if (value > 63) return 63;
-    return (int)value;
-}
 
-static int q4_colibri_pilot_prefetch_boundary_max_objects() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_BOUNDARY_MAX_OBJECTS");
-    const long value = env && env[0] ? std::atol(env) : 64;
-    if (value < 1) return 1;
-    if (value > 512) return 512;
-    return (int)value;
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 static const expert_pack_entry *q4_colibri_pilot_lookup_optional(
         const char *tensor_name,
@@ -24140,22 +21820,7 @@ static void q4_colibri_host_object_preload_allowlist_once(size_t expert_bytes) {
     });
 }
 
-static bool q4_colibri_replace_blk_layer(
-        const char *name,
-        int current_layer,
-        int next_layer,
-        std::string &out) {
-    if (!name || current_layer < 0 || next_layer < 0) return false;
-    char needle[32];
-    char repl[32];
-    std::snprintf(needle, sizeof(needle), "blk.%d.", current_layer);
-    std::snprintf(repl, sizeof(repl), "blk.%d.", next_layer);
-    out = name;
-    const size_t pos = out.find(needle);
-    if (pos == std::string::npos) return false;
-    out.replace(pos, std::strlen(needle), repl);
-    return true;
-}
+
 
 struct q4_colibri_pilot_candidate {
     int expert = -1;
@@ -24170,896 +21835,13 @@ struct q4_colibri_pilot_layer_history {
 static q4_colibri_pilot_layer_history g_q4_pilot_layer_history[64];
 static q4_colibri_pilot_layer_history g_q4_pilot_miss_layer_history[64];
 
-static void q4_colibri_pilot_update_layer_history(
-        int layer,
-        const std::vector<q4_colibri_pilot_candidate> &candidates,
-        int topk) {
-    if (layer < 0 || layer >= 64) return;
-    q4_colibri_pilot_layer_history &history = g_q4_pilot_layer_history[layer];
-    history.count = std::min<int>((int)candidates.size(), std::min<int>(topk, 64));
-    for (int i = 0; i < history.count; ++i) {
-        history.experts[i] = candidates[(size_t)i].expert;
-    }
-}
 
-static void q4_colibri_pilot_update_miss_layer_history(
-        int layer,
-        std::vector<q4_colibri_pilot_candidate> &misses) {
-    if (layer < 0 || layer >= 64) return;
-    std::sort(misses.begin(), misses.end(), [](const q4_colibri_pilot_candidate &a,
-                const q4_colibri_pilot_candidate &b) {
-        if (a.rows != b.rows) return a.rows > b.rows;
-        return a.expert < b.expert;
-    });
-    q4_colibri_pilot_layer_history &history = g_q4_pilot_miss_layer_history[layer];
-    history.count = std::min<int>((int)misses.size(), 64);
-    for (int i = 0; i < history.count; ++i) {
-        history.experts[i] = misses[(size_t)i].expert;
-    }
-}
 
-static int q4_colibri_preload_pilot_next_layer_objects(
-        const char *gate_name,
-        int64_t n_as,
-        size_t expert_bytes,
-        const int64_t *matrix_row_counts,
-        batch_vram_cache *cache) {
-    if (!q4_colibri_pilot_prefetch_enabled() || !gate_name || !matrix_row_counts || !cache) return 0;
-    ++g_expert_pack.q4_pilot_prefetch_calls;
 
-    std::vector<q4_colibri_pilot_candidate> candidates;
-    candidates.reserve((size_t)std::min<int64_t>(n_as, 64));
-    for (int64_t expert = 0; expert < n_as; ++expert) {
-        if (matrix_row_counts[expert] <= 0) continue;
-        q4_colibri_pilot_candidate candidate;
-        candidate.expert = (int)expert;
-        candidate.rows = matrix_row_counts[expert];
-        candidates.push_back(candidate);
-    }
-    if (candidates.empty()) return 0;
-    std::sort(candidates.begin(), candidates.end(), [](const q4_colibri_pilot_candidate &a,
-                const q4_colibri_pilot_candidate &b) {
-        if (a.rows != b.rows) return a.rows > b.rows;
-        return a.expert < b.expert;
-    });
-    const int base_topk = std::min<int>((int)candidates.size(), q4_colibri_pilot_prefetch_topk());
-    const int window = q4_colibri_pilot_prefetch_window();
-    const bool allow_evict = q4_colibri_pilot_prefetch_allow_evict();
-    const bool host_prefetch = q4_colibri_host_object_prefetch_enabled() &&
-        !q4_colibri_pilot_to_vram_enabled();
-    const bool same_layer_source = q4_colibri_pilot_prefetch_same_layer_source();
-    const bool prev_token_next_layer_source =
-        q4_colibri_pilot_prefetch_prev_token_next_layer_source();
-    const bool prev_token_next_layer_miss_source =
-        q4_colibri_pilot_prefetch_prev_token_next_layer_miss_source();
-    const bool wrap_source = q4_colibri_pilot_prefetch_wrap_source();
-    const bool boundary_source = q4_colibri_pilot_prefetch_boundary_source();
-    const int first_delta = same_layer_source ? 0 : 1;
-    const int last_delta = same_layer_source ? 0 : window;
-    const expert_pack_entry *current =
-        q4_colibri_pilot_lookup_optional(gate_name, candidates.front().expert, expert_bytes);
-    const int current_layer = current ? current->layer_idx : -1;
-    const int topk = std::min<int>((int)candidates.size(),
-            q4_colibri_pilot_prefetch_topk_for_layer(current_layer, base_topk));
 
-    if (boundary_source && !host_prefetch) {
-        q4_colibri_pilot_update_layer_history(current_layer, candidates, topk);
-        return 0;
-    }
 
-    if (boundary_source && host_prefetch) {
-        uint64_t submitted_roles = 0;
-        uint64_t submitted_bytes = 0;
-        uint64_t submitted_objects = 0;
-        uint64_t candidates_seen = 0;
-        if (!current) {
-            ++g_expert_pack.q4_pilot_prefetch_skipped_missing_current;
-            return 0;
-        }
-        const int trigger_layer = q4_colibri_pilot_prefetch_boundary_trigger_layer();
-        if (current_layer != trigger_layer) {
-            q4_colibri_pilot_update_layer_history(current_layer, candidates, topk);
-            return 0;
-        }
-        int first_layer = q4_colibri_pilot_prefetch_boundary_first_layer();
-        int last_layer = q4_colibri_pilot_prefetch_boundary_last_layer();
-        if (last_layer < first_layer) std::swap(first_layer, last_layer);
-        const int max_objects = q4_colibri_pilot_prefetch_boundary_max_objects();
-        for (int target_layer = first_layer;
-                target_layer <= last_layer && (int)submitted_objects < max_objects;
-                ++target_layer) {
-            if (target_layer == current_layer) continue;
-            const q4_colibri_pilot_layer_history &history = g_q4_pilot_layer_history[target_layer];
-            const int target_topk = q4_colibri_pilot_prefetch_topk_for_layer(target_layer, base_topk);
-            const int predict_count = std::min<int>(history.count, target_topk);
-            if (predict_count <= 0) continue;
-            if (!q4_colibri_pilot_prefetch_layer_allowed(target_layer)) {
-                g_expert_pack.q4_pilot_prefetch_skipped_layer_filtered_objects.fetch_add(
-                        (uint64_t)predict_count, std::memory_order_relaxed);
-                continue;
-            }
-            char next_gate[128];
-            std::snprintf(next_gate, sizeof(next_gate), "blk.%d.ffn_gate_exps.weight", target_layer);
-            std::string next_up;
-            std::string next_down;
-            if (!q4_colibri_same_layer_role_names(next_gate, next_up, next_down)) {
-                ++g_expert_pack.q4_pilot_prefetch_skipped_missing_next;
-                continue;
-            }
-            const char *role_names[3] = {next_gate, next_up.c_str(), next_down.c_str()};
-            for (int i = 0; i < predict_count && (int)submitted_objects < max_objects; ++i) {
-                ++candidates_seen;
-                const int expert = history.experts[i];
-                if (q4_colibri_object_all_roles_present_in_vram(cache, role_names, expert)) {
-                    ++g_expert_pack.q4_pilot_prefetch_skipped_vram_present_objects;
-                    continue;
-                }
-                const expert_pack_entry *entries[3] = {};
-                bool covered = true;
-                for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-                    entries[role_idx] = q4_colibri_pilot_lookup_optional(
-                            role_names[role_idx], expert, expert_bytes);
-                    if (!entries[role_idx]) covered = false;
-                }
-                if (!covered) {
-                    ++g_expert_pack.q4_pilot_prefetch_skipped_missing_next;
-                    continue;
-                }
-                const expert_pack_entry *first = entries[0];
-                bool object_matches = first->object_nbytes > 0;
-                for (size_t role_idx = 1; role_idx < 3; ++role_idx) {
-                    object_matches = object_matches &&
-                        entries[role_idx]->source_idx == first->source_idx &&
-                        entries[role_idx]->object_offset == first->object_offset &&
-                        entries[role_idx]->object_nbytes == first->object_nbytes;
-                }
-                if (!object_matches) {
-                    ++g_expert_pack.q4_pilot_prefetch_skipped_missing_next;
-                    continue;
-                }
-                const q4_colibri_object_marker marker{
-                    first->source_idx, first->layer_idx, (int32_t)expert,
-                    g_expert_pack.q4_manifest_generation,
-                    first->object_offset, (size_t)first->object_nbytes,
-                };
-                if (q4_colibri_host_object_prefetch_submit(
-                            marker, first->source_idx, first->object_offset,
-                            (size_t)first->object_nbytes, true)) {
-                    submitted_roles += 3;
-                    submitted_bytes += first->object_nbytes;
-                    ++submitted_objects;
-                }
-            }
-        }
-        q4_colibri_pilot_update_layer_history(current_layer, candidates, topk);
-        g_expert_pack.q4_pilot_prefetch_candidates.fetch_add(candidates_seen, std::memory_order_relaxed);
-        g_expert_pack.q4_pilot_prefetch_submitted_objects.fetch_add(submitted_objects, std::memory_order_relaxed);
-        g_expert_pack.q4_pilot_prefetch_submitted_roles.fetch_add(submitted_roles, std::memory_order_relaxed);
-        g_expert_pack.q4_pilot_prefetch_bytes.fetch_add(submitted_bytes, std::memory_order_relaxed);
-        if (q4_colibri_pilot_prefetch_debug()) {
-            std::fprintf(stderr,
-                "[moe_stream_batch] q4 pilot host-boundary queued: layer=%d target=%d-%d topk=%d objects=%lu roles=%lu bytes=%lu\n",
-                current_layer, first_layer, last_layer, topk,
-                (unsigned long)submitted_objects,
-                (unsigned long)submitted_roles,
-                (unsigned long)submitted_bytes);
-        }
-        return (int)submitted_roles;
-    }
 
-    if (prev_token_next_layer_source || prev_token_next_layer_miss_source) {
-        q4_colibri_object_batch *history_vram_batch = nullptr;
-        if (!host_prefetch) {
-            history_vram_batch = new q4_colibri_object_batch();
-            history_vram_batch->heap_owned = true;
-            history_vram_batch->pilot_prefetch = true;
-            history_vram_batch->jobs.reserve((size_t)base_topk * (size_t)std::max(1, window));
-        }
-        uint64_t submitted_roles = 0;
-        uint64_t submitted_bytes = 0;
-        uint64_t submitted_objects = 0;
-        uint64_t candidates_seen = 0;
-        if (!current) {
-            ++g_expert_pack.q4_pilot_prefetch_skipped_missing_current;
-            delete history_vram_batch;
-            return 0;
-        }
-        const int wrap_last_layer = q4_colibri_pilot_prefetch_wrap_last_layer();
-        for (int delta = 1; delta <= window; ++delta) {
-            int next_layer = current_layer + delta;
-            if (wrap_source && next_layer > wrap_last_layer) {
-                next_layer = 1 + (next_layer - wrap_last_layer - 1) % wrap_last_layer;
-            }
-            if (next_layer >= 0 && next_layer < 64) {
-                std::string next_gate;
-                if (!q4_colibri_replace_blk_layer(gate_name, current_layer, next_layer, next_gate)) {
-                    ++g_expert_pack.q4_pilot_prefetch_skipped_last_layer;
-                    continue;
-                }
-                std::string next_up;
-                std::string next_down;
-                if (q4_colibri_same_layer_role_names(next_gate.c_str(), next_up, next_down)) {
-                    const char *role_names[3] = {next_gate.c_str(), next_up.c_str(), next_down.c_str()};
-                    const q4_colibri_pilot_layer_history &history =
-                        prev_token_next_layer_miss_source ?
-                        g_q4_pilot_miss_layer_history[next_layer] :
-                        g_q4_pilot_layer_history[next_layer];
-                    const int target_topk = q4_colibri_pilot_prefetch_topk_for_layer(next_layer, base_topk);
-                    const int predict_count = std::min<int>(history.count, target_topk);
-                    if (predict_count > 0 && !q4_colibri_pilot_prefetch_layer_allowed(next_layer)) {
-                        g_expert_pack.q4_pilot_prefetch_skipped_layer_filtered_objects.fetch_add(
-                                (uint64_t)predict_count, std::memory_order_relaxed);
-                        continue;
-                    }
-                    for (int i = 0; i < predict_count; ++i) {
-                        ++candidates_seen;
-                        const int expert = history.experts[i];
-                        if (q4_colibri_object_all_roles_present_in_vram(cache, role_names, expert)) {
-                            ++g_expert_pack.q4_pilot_prefetch_skipped_vram_present_objects;
-                            continue;
-                        }
-                        const expert_pack_entry *entries[3] = {};
-                        bool covered = true;
-                        for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-                            entries[role_idx] = q4_colibri_pilot_lookup_optional(
-                                    role_names[role_idx], expert, expert_bytes);
-                            if (!entries[role_idx]) covered = false;
-                        }
-                        if (!covered) {
-                            ++g_expert_pack.q4_pilot_prefetch_skipped_missing_next;
-                            continue;
-                        }
-                        const expert_pack_entry *first = entries[0];
-                        bool object_matches = first->object_nbytes > 0;
-                        for (size_t role_idx = 1; role_idx < 3; ++role_idx) {
-                            object_matches = object_matches &&
-                                entries[role_idx]->source_idx == first->source_idx &&
-                                entries[role_idx]->object_offset == first->object_offset &&
-                                entries[role_idx]->object_nbytes == first->object_nbytes;
-                        }
-                        if (!object_matches) {
-                            ++g_expert_pack.q4_pilot_prefetch_skipped_missing_next;
-                            continue;
-                        }
-                        if (host_prefetch) {
-                            const q4_colibri_object_marker marker{
-                                first->source_idx, first->layer_idx, (int32_t)expert,
-                                g_expert_pack.q4_manifest_generation,
-                                first->object_offset, (size_t)first->object_nbytes,
-                            };
-                            if (q4_colibri_host_object_prefetch_submit(
-                                        marker, first->source_idx, first->object_offset,
-                                        (size_t)first->object_nbytes, true)) {
-                                submitted_roles += 3;
-                                submitted_bytes += first->object_nbytes;
-                                ++submitted_objects;
-                            }
-                        } else {
-                            q4_colibri_object_job object_job;
-                            object_job.source_idx = first->source_idx;
-                            object_job.offset = first->object_offset;
-                            object_job.bytes = first->object_nbytes;
-                            object_job.marker = {
-                                first->source_idx, first->layer_idx, (int32_t)expert,
-                                g_expert_pack.q4_manifest_generation,
-                                first->object_offset, (size_t)first->object_nbytes,
-                            };
-                            for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-                                const uintptr_t key = batch_key_hash(role_names[role_idx], expert);
-                                if (batch_cache_find_slot(cache, key) >= 0) continue;
-                                const int slot = batch_cache_insert_slot(cache, key, nullptr, expert_bytes, g_batch.stream,
-                                        allow_evict, false, nullptr, 0, false, role_names[role_idx], expert,
-                                        false, true, false, 0, true);
-                                if (slot < 0) {
-                                    for (size_t reserved = 0; reserved < object_job.role_count; ++reserved) {
-                                        batch_cache_clear_slot(cache, object_job.roles[reserved].slot);
-                                    }
-                                    object_job.role_count = 0;
-                                    break;
-                                }
-                                q4_colibri_object_role_job &role = object_job.roles[object_job.role_count++];
-                                role.cache = cache;
-                                role.slot = slot;
-                                role.marker = {key, cache->slot_generation[slot], expert_bytes};
-                                role.dst = (char *)cache->pool + (size_t)slot * cache->slot_sz;
-                                role.entry = entries[role_idx];
-                                role.expert_idx = expert;
-                                std::snprintf(role.tensor, sizeof(role.tensor), "%s", role_names[role_idx]);
-                            }
-                            if (object_job.role_count == 0) continue;
-                            submitted_roles += object_job.role_count;
-                            submitted_bytes += object_job.bytes;
-                            ++submitted_objects;
-                            history_vram_batch->jobs.push_back(object_job);
-                        }
-                    }
-                } else {
-                    ++g_expert_pack.q4_pilot_prefetch_skipped_missing_next;
-                }
-            } else {
-                ++g_expert_pack.q4_pilot_prefetch_skipped_last_layer;
-            }
-        }
-        q4_colibri_pilot_update_layer_history(current_layer, candidates, topk);
-        if (!host_prefetch) {
-            if (history_vram_batch->jobs.empty()) {
-                delete history_vram_batch;
-            } else {
-                history_vram_batch->pilot_role_count = submitted_roles;
-                history_vram_batch->pilot_bytes = submitted_bytes;
-                if (!q4_colibri_pipe_submit_object_batch_async(history_vram_batch)) {
-                    for (q4_colibri_object_job &job : history_vram_batch->jobs) {
-                        for (size_t role_idx = 0; role_idx < job.role_count; ++role_idx) {
-                            batch_cache_clear_slot(cache, job.roles[role_idx].slot);
-                        }
-                    }
-                    delete history_vram_batch;
-                    submitted_roles = 0;
-                    submitted_bytes = 0;
-                    submitted_objects = 0;
-                }
-            }
-        }
-        g_expert_pack.q4_pilot_prefetch_candidates.fetch_add(candidates_seen, std::memory_order_relaxed);
-        g_expert_pack.q4_pilot_prefetch_submitted_objects.fetch_add(submitted_objects, std::memory_order_relaxed);
-        g_expert_pack.q4_pilot_prefetch_submitted_roles.fetch_add(submitted_roles, std::memory_order_relaxed);
-        g_expert_pack.q4_pilot_prefetch_bytes.fetch_add(submitted_bytes, std::memory_order_relaxed);
-        if (q4_colibri_pilot_prefetch_debug()) {
-            std::fprintf(stderr,
-                "[moe_stream_batch] q4 pilot %s queued: gate=%s topk=%d window=%d objects=%lu roles=%lu bytes=%lu source=%s\n",
-                host_prefetch ? "host-prefetch" : "vram-prefetch",
-                gate_name, topk, window, (unsigned long)submitted_objects,
-                (unsigned long)submitted_roles, (unsigned long)submitted_bytes,
-                prev_token_next_layer_miss_source ? "prev_token_next_layer_miss" :
-                (wrap_source ? "prev_token_wrap" : "prev_token_next_layer"));
-        }
-        return (int)submitted_roles;
-    }
 
-    q4_colibri_object_batch *batch = nullptr;
-    if (!host_prefetch) {
-        batch = new q4_colibri_object_batch();
-        batch->heap_owned = true;
-        batch->pilot_prefetch = true;
-        batch->jobs.reserve((size_t)topk * (size_t)std::max(1, window));
-    }
-
-    uint64_t submitted_roles = 0;
-    uint64_t submitted_bytes = 0;
-    uint64_t submitted_objects = 0;
-    uint64_t candidates_seen = 0;
-    for (int idx = 0; idx < topk; ++idx) {
-        const int expert = candidates[(size_t)idx].expert;
-        ++candidates_seen;
-        const expert_pack_entry *current = q4_colibri_pilot_lookup_optional(gate_name, expert, expert_bytes);
-        if (!current) {
-            ++g_expert_pack.q4_pilot_prefetch_skipped_missing_current;
-            continue;
-        }
-        for (int delta = first_delta; delta <= last_delta; ++delta) {
-            const int next_layer = current->layer_idx + delta;
-            if (!q4_colibri_pilot_prefetch_layer_allowed(next_layer)) {
-                ++g_expert_pack.q4_pilot_prefetch_skipped_layer_filtered_objects;
-                continue;
-            }
-            std::string next_gate;
-            if (!q4_colibri_replace_blk_layer(gate_name, current->layer_idx, next_layer, next_gate)) {
-                ++g_expert_pack.q4_pilot_prefetch_skipped_last_layer;
-                continue;
-            }
-            std::string next_up;
-            std::string next_down;
-            if (!q4_colibri_same_layer_role_names(next_gate.c_str(), next_up, next_down)) {
-                ++g_expert_pack.q4_pilot_prefetch_skipped_missing_next;
-                continue;
-            }
-            const char *role_names[3] = {next_gate.c_str(), next_up.c_str(), next_down.c_str()};
-            if (q4_colibri_object_all_roles_present_in_vram(cache, role_names, expert)) {
-                ++g_expert_pack.q4_pilot_prefetch_skipped_vram_present_objects;
-                continue;
-            }
-            const expert_pack_entry *entries[3] = {};
-            bool covered = true;
-            for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-                entries[role_idx] = q4_colibri_pilot_lookup_optional(role_names[role_idx], expert, expert_bytes);
-                if (!entries[role_idx]) covered = false;
-            }
-            if (!covered) {
-                ++g_expert_pack.q4_pilot_prefetch_skipped_missing_next;
-                continue;
-            }
-            const expert_pack_entry *first = entries[0];
-            bool object_matches = first->object_nbytes > 0;
-            for (size_t role_idx = 1; role_idx < 3; ++role_idx) {
-                object_matches = object_matches && entries[role_idx]->source_idx == first->source_idx &&
-                    entries[role_idx]->object_offset == first->object_offset &&
-                    entries[role_idx]->object_nbytes == first->object_nbytes;
-            }
-            if (!object_matches) {
-                ++g_expert_pack.q4_pilot_prefetch_skipped_missing_next;
-                continue;
-            }
-
-            if (host_prefetch) {
-                const q4_colibri_object_marker marker{
-                    first->source_idx, first->layer_idx, (int32_t)expert,
-                    g_expert_pack.q4_manifest_generation, first->object_offset, (size_t)first->object_nbytes,
-                };
-                if (q4_colibri_host_object_prefetch_submit(
-                            marker, first->source_idx, first->object_offset, (size_t)first->object_nbytes, true)) {
-                    submitted_roles += 3;
-                    submitted_bytes += first->object_nbytes;
-                    ++submitted_objects;
-                }
-                continue;
-            }
-
-            q4_colibri_object_job object_job;
-            object_job.source_idx = first->source_idx;
-            object_job.offset = first->object_offset;
-            object_job.bytes = first->object_nbytes;
-            object_job.marker = {
-                first->source_idx, first->layer_idx, (int32_t)expert,
-                g_expert_pack.q4_manifest_generation, first->object_offset, (size_t)first->object_nbytes,
-            };
-            for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-                const uintptr_t key = batch_key_hash(role_names[role_idx], expert);
-                if (batch_cache_find_slot(cache, key) >= 0) continue;
-                const int slot = batch_cache_insert_slot(cache, key, nullptr, expert_bytes, g_batch.stream,
-                        allow_evict, false, nullptr, 0, false, role_names[role_idx], expert,
-                        false, true, false, 0, true);
-                if (slot < 0) {
-                    for (size_t reserved = 0; reserved < object_job.role_count; ++reserved) {
-                        batch_cache_clear_slot(cache, object_job.roles[reserved].slot);
-                    }
-                    object_job.role_count = 0;
-                    break;
-                }
-                cache->slot_q4_pilot[slot] = true;
-                q4_colibri_object_role_job &role = object_job.roles[object_job.role_count++];
-                role.cache = cache;
-                role.slot = slot;
-                role.marker = {key, cache->slot_generation[slot], expert_bytes};
-                role.dst = (char *)cache->pool + (size_t)slot * cache->slot_sz;
-                role.entry = entries[role_idx];
-                role.expert_idx = expert;
-                std::snprintf(role.tensor, sizeof(role.tensor), "%s", role_names[role_idx]);
-            }
-            if (object_job.role_count == 0) continue;
-            submitted_roles += object_job.role_count;
-            submitted_bytes += object_job.bytes;
-            ++submitted_objects;
-            batch->jobs.push_back(object_job);
-        }
-    }
-
-    g_expert_pack.q4_pilot_prefetch_candidates.fetch_add(candidates_seen, std::memory_order_relaxed);
-    if (host_prefetch) {
-        g_expert_pack.q4_pilot_prefetch_submitted_objects.fetch_add(submitted_objects, std::memory_order_relaxed);
-        g_expert_pack.q4_pilot_prefetch_submitted_roles.fetch_add(submitted_roles, std::memory_order_relaxed);
-        g_expert_pack.q4_pilot_prefetch_bytes.fetch_add(submitted_bytes, std::memory_order_relaxed);
-        if (q4_colibri_pilot_prefetch_debug()) {
-            std::fprintf(stderr,
-                "[moe_stream_batch] q4 pilot host-prefetch queued: gate=%s topk=%d window=%d objects=%lu roles=%lu bytes=%lu source=%s\n",
-                gate_name, topk, window, (unsigned long)submitted_objects,
-                (unsigned long)submitted_roles, (unsigned long)submitted_bytes,
-                same_layer_source ? "same_layer" : "next_layer_same_expert");
-        }
-        return (int)submitted_roles;
-    }
-    if (batch->jobs.empty()) {
-        delete batch;
-        return 0;
-    }
-    batch->pilot_role_count = submitted_roles;
-    batch->pilot_bytes = submitted_bytes;
-    if (!q4_colibri_pipe_submit_object_batch_async(batch)) {
-        for (q4_colibri_object_job &job : batch->jobs) {
-            for (size_t role_idx = 0; role_idx < job.role_count; ++role_idx) {
-                batch_cache_clear_slot(cache, job.roles[role_idx].slot);
-            }
-        }
-        delete batch;
-        return -1;
-    }
-    g_expert_pack.q4_pilot_prefetch_submitted_objects.fetch_add(submitted_objects, std::memory_order_relaxed);
-    g_expert_pack.q4_pilot_prefetch_submitted_roles.fetch_add(submitted_roles, std::memory_order_relaxed);
-    g_expert_pack.q4_pilot_prefetch_bytes.fetch_add(submitted_bytes, std::memory_order_relaxed);
-    if (q4_colibri_pilot_prefetch_debug()) {
-        std::fprintf(stderr,
-            "[moe_stream_batch] q4 pilot prefetch queued: gate=%s topk=%d window=%d objects=%zu roles=%lu bytes=%lu allow_evict=%d\n",
-            gate_name, topk, window, (size_t)submitted_objects, (unsigned long)submitted_roles,
-            (unsigned long)submitted_bytes, allow_evict ? 1 : 0);
-    }
-    return (int)submitted_roles;
-}
-
-static int q4_colibri_preload_same_layer_objects(
-        const char *gate_name,
-        int64_t n_as,
-        size_t expert_bytes,
-        const int64_t *matrix_row_counts,
-        batch_vram_cache *cache) {
-    const bool scheduler_readiness_csv = q4_scheduler_readiness_csv_enabled();
-    const auto scheduler_start =
-        scheduler_readiness_csv ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    char nvtx_label[192];
-    std::snprintf(nvtx_label, sizeof(nvtx_label),
-            "q4_same_layer_schedule tensor=%s experts=%ld bytes=%zu",
-            gate_name ? gate_name : "", (long)n_as, expert_bytes);
-    moe_nvtx_range nvtx_scope(nvtx_label);
-    std::string up_name;
-    std::string down_name;
-    if (!q4_colibri_same_layer_role_names(gate_name, up_name, down_name)) return 0;
-    const char *role_names[3] = {gate_name, up_name.c_str(), down_name.c_str()};
-    const bool readiness_csv = q4_graph_readiness_csv_enabled();
-    const q4_graph_readiness_io_snapshot readiness_start =
-        readiness_csv ? q4_graph_readiness_io_snapshot_now() : q4_graph_readiness_io_snapshot{};
-    q4_colibri_host_object_preload_allowlist_once(expert_bytes);
-    const bool partial_span = q4_colibri_partial_span_enabled() &&
-        q4_colibri_batch_iouring_enabled() && !q4_colibri_object_cache_enabled();
-    // Non-default eviction can select a just-reserved current-layer role before
-    // the PIPE worker marks it as filling. Protect those reservations while
-    // keeping the pure LRU default path unchanged.
-    const bool protect_current_slots = q4_colibri_active_avoid_slots_enabled() || partial_span ||
-        cache_policy_lfu_lru_enabled() || cache_policy_profile_lfu_lru_enabled() ||
-        cache_policy_hybrid_profile_lfu_lru_enabled() || q4_vram_object_admission_enabled();
-    q4_colibri_object_batch batch;
-    batch.readiness.schedule_start = scheduler_start;
-    batch.jobs.reserve(64);
-    q4_colibri_object_batch *async_down_batch = nullptr;
-    uint64_t active_experts = 0;
-    uint64_t requested_objects = 0;
-    uint64_t role_slices = 0;
-    uint64_t duplicates_eliminated = 0;
-    uint64_t physical_bytes = 0;
-    uint64_t logical_bytes = 0;
-    int current_layer_for_miss_history = -1;
-    std::vector<q4_colibri_pilot_candidate> miss_candidates;
-    std::vector<int> active_avoid_slots;
-    if (protect_current_slots) {
-        active_avoid_slots.reserve(256);
-        for (int64_t expert = 0; expert < n_as; ++expert) {
-            if (matrix_row_counts[expert] <= 0) continue;
-            for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-                const uintptr_t key = batch_key_hash(role_names[role_idx], (int)expert);
-                const int slot = batch_cache_find_slot(cache, key);
-                if (slot < 0) continue;
-                bool seen = false;
-                for (int avoid_slot : active_avoid_slots) {
-                    if (avoid_slot == slot) {
-                        seen = true;
-                        break;
-                    }
-                }
-                if (!seen) active_avoid_slots.push_back(slot);
-            }
-        }
-    }
-
-    for (int64_t expert = 0; expert < n_as; ++expert) {
-        if (matrix_row_counts[expert] <= 0) continue;
-        ++active_experts;
-        const expert_pack_entry *entries[3] = {};
-        bool covered = true;
-        for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-            entries[role_idx] = expert_pack_lookup(role_names[role_idx], (int)expert, expert_bytes);
-            if (!entries[role_idx]) covered = false;
-        }
-        if (!covered) continue;
-        ++requested_objects;
-        const expert_pack_entry *first = entries[0];
-        if (current_layer_for_miss_history < 0) {
-            current_layer_for_miss_history = first->layer_idx;
-        }
-        bool object_matches = first->object_nbytes > 0;
-        for (size_t role_idx = 1; role_idx < 3; ++role_idx) {
-            object_matches = object_matches && entries[role_idx]->source_idx == first->source_idx &&
-                entries[role_idx]->object_offset == first->object_offset &&
-                entries[role_idx]->object_nbytes == first->object_nbytes;
-        }
-        if (!object_matches) {
-            ++g_expert_pack.q4_scheduler_failures;
-            q4_layer_io_add(g_expert_pack.q4_layer_io_failures, first->layer_idx, 1);
-            return -1;
-        }
-
-        q4_colibri_object_job object_job;
-        object_job.source_idx = first->source_idx;
-        object_job.offset = first->object_offset;
-        object_job.bytes = first->object_nbytes;
-        object_job.marker = {
-            first->source_idx, first->layer_idx, (int32_t)expert,
-            g_expert_pack.q4_manifest_generation, first->object_offset, (size_t)first->object_nbytes,
-        };
-        q4_tier_diag_observe_object_request(object_job.marker);
-        const bool object_admitted = q4_vram_object_admission_observe(
-                cache, object_job.marker, n_as, matrix_row_counts);
-        size_t vram_role_hits = 0;
-        size_t vram_role_ready = 0;
-        int hit_slots[3] = {-1, -1, -1};
-        for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-            const uintptr_t key = batch_key_hash(role_names[role_idx], (int)expert);
-            const int hit_slot = batch_cache_find_slot(cache, key);
-            if (hit_slot >= 0) {
-                hit_slots[role_idx] = hit_slot;
-                ++vram_role_hits;
-                if (!cache->slot_pending[hit_slot] && !cache->slot_filling[hit_slot]) {
-                    ++vram_role_ready;
-                }
-                if (q4_colibri_active_touch_slots_enabled()) {
-                    batch_cache_touch_slot(cache, hit_slot);
-                }
-                ++g_expert_pack.q4_object_role_hits[role_idx];
-            } else {
-                ++g_expert_pack.q4_object_role_misses[role_idx];
-            }
-        }
-        const int missing_role_count = 3 - (int)vram_role_hits;
-        if (missing_role_count > 0 && !q4_vram_object_prepare_slots(
-                    cache, missing_role_count,
-                    active_avoid_slots.empty() ? nullptr : active_avoid_slots.data(),
-                    (int)active_avoid_slots.size())) {
-            if (object_admitted) q4_vram_object_admission_rollback(cache, object_job.marker);
-            continue;
-        }
-        for (size_t role_idx = 0; role_idx < 3; ++role_idx) {
-            if (hit_slots[role_idx] >= 0) continue;
-            const uintptr_t key = batch_key_hash(role_names[role_idx], (int)expert);
-            const int slot = batch_cache_insert_slot(cache, key, nullptr, expert_bytes, g_batch.stream,
-                    true, false, active_avoid_slots.empty() ? nullptr : active_avoid_slots.data(),
-                    (int)active_avoid_slots.size(), false, role_names[role_idx], (int)expert,
-                    false, true, false, 0, false, object_admitted);
-            if (slot < 0) {
-                for (size_t reserved = 0; reserved < object_job.role_count; ++reserved) {
-                    batch_cache_clear_slot(cache, object_job.roles[reserved].slot);
-                }
-                object_job.role_count = 0;
-                if (object_admitted) q4_vram_object_admission_rollback(cache, object_job.marker);
-                break;
-            }
-            if (protect_current_slots) {
-                active_avoid_slots.push_back(slot);
-            }
-            q4_colibri_object_role_job &role = object_job.roles[object_job.role_count++];
-            role.cache = cache;
-            role.slot = slot;
-            role.marker = {key, cache->slot_generation[slot], expert_bytes};
-            role.dst = (char *)cache->pool + (size_t)slot * cache->slot_sz;
-            role.entry = entries[role_idx];
-            role.expert_idx = (int)expert;
-            std::snprintf(role.tensor, sizeof(role.tensor), "%s", role_names[role_idx]);
-            logical_bytes += entries[role_idx]->nbytes;
-        }
-        const bool reuse_trace = q4_object_reuse_trace_enabled();
-        const bool tier_trace = q4_object_tier_trace_enabled();
-        const bool trace_ram_ready = (reuse_trace || tier_trace) ?
-            q4_graph_host_object_ready(object_job.marker) : false;
-        const uint64_t missing_roles = 3 - (uint64_t)vram_role_hits;
-        const uint64_t logical_role_bytes =
-            entries[0]->nbytes + entries[1]->nbytes + entries[2]->nbytes;
-        if (reuse_trace) {
-            q4_object_reuse_trace_record(
-                    object_job.marker,
-                    matrix_row_counts[expert],
-                    (uint64_t)vram_role_ready,
-                    (uint64_t)vram_role_hits,
-                    trace_ram_ready,
-                    trace_ram_ready ? 0 : missing_roles,
-                    missing_roles,
-                    object_job.bytes,
-                    logical_role_bytes);
-        }
-        if (tier_trace) {
-            q4_object_tier_trace_record(
-                    object_job.marker,
-                    matrix_row_counts[expert],
-                    (uint64_t)vram_role_hits,
-                    (uint64_t)vram_role_ready,
-                    trace_ram_ready,
-                    missing_roles,
-                    (uint64_t)object_job.role_count,
-                    object_job.bytes,
-                    logical_role_bytes,
-                    q4_colibri_host_object_lookup_layer_allowed(first->layer_idx),
-                    q4_colibri_host_object_admit_layer_allowed(first->layer_idx),
-                    q4_colibri_ram_net_layer_allowed(first->layer_idx));
-        }
-        if (vram_role_hits == 3) {
-            ++g_expert_pack.q4_object_vram_hits;
-            ++g_expert_pack.q4_object_full_expert_hits;
-            if (first->layer_idx >= 0 && first->layer_idx < 64) {
-                ++g_expert_pack.q4_object_layer_vram_hits[first->layer_idx];
-            }
-        } else {
-            q4_colibri_pilot_candidate miss_candidate;
-            miss_candidate.expert = (int)expert;
-            miss_candidate.rows = matrix_row_counts[expert];
-            miss_candidates.push_back(miss_candidate);
-            ++g_expert_pack.q4_object_vram_misses;
-            if (first->layer_idx >= 0 && first->layer_idx < 64) {
-                ++g_expert_pack.q4_object_layer_vram_misses[first->layer_idx];
-            }
-        }
-        if (object_job.role_count == 0) continue;
-        if (partial_span && object_job.role_count == 3 &&
-                object_job.roles[0].entry == entries[0] &&
-                object_job.roles[1].entry == entries[1] &&
-                object_job.roles[2].entry == entries[2]) {
-            q4_colibri_object_job gateup_job = object_job;
-            gateup_job.role_count = 2;
-            gateup_job.bytes = entries[1]->object_relative_offset + entries[1]->nbytes;
-            gateup_job.partial_span = true;
-            gateup_job.marker = {
-                first->source_idx, first->layer_idx, (int32_t)expert,
-                g_expert_pack.q4_manifest_generation, gateup_job.offset, (size_t)gateup_job.bytes,
-            };
-
-            q4_colibri_object_job down_job;
-            down_job.source_idx = first->source_idx;
-            down_job.offset = first->object_offset + entries[2]->object_relative_offset;
-            down_job.bytes = entries[2]->nbytes;
-            down_job.marker = {
-                first->source_idx, first->layer_idx, (int32_t)expert,
-                g_expert_pack.q4_manifest_generation, down_job.offset, (size_t)down_job.bytes,
-            };
-            down_job.partial_span = true;
-            down_job.role_count = 1;
-            down_job.roles[0] = object_job.roles[2];
-
-            role_slices += 3;
-            duplicates_eliminated += 1;
-            physical_bytes += gateup_job.bytes + down_job.bytes;
-            batch.jobs.push_back(gateup_job);
-            if (!async_down_batch) {
-                async_down_batch = new q4_colibri_object_batch();
-                async_down_batch->heap_owned = true;
-                async_down_batch->pilot_prefetch = false;
-                async_down_batch->jobs.reserve(64);
-            }
-            async_down_batch->jobs.push_back(down_job);
-        } else {
-            role_slices += object_job.role_count;
-            duplicates_eliminated += object_job.role_count - 1;
-            physical_bytes += object_job.bytes;
-            batch.jobs.push_back(object_job);
-        }
-    }
-
-    q4_colibri_pilot_update_miss_layer_history(current_layer_for_miss_history, miss_candidates);
-
-    q4_graph_readiness_provider_stats readiness_provider;
-    readiness_provider.physical_jobs = (uint64_t)(batch.jobs.size() +
-        (async_down_batch ? async_down_batch->jobs.size() : 0));
-    readiness_provider.role_slices = role_slices;
-    readiness_provider.physical_bytes = physical_bytes;
-    readiness_provider.logical_bytes = logical_bytes;
-    if (scheduler_readiness_csv) {
-        batch.readiness.build_done = std::chrono::steady_clock::now();
-    }
-    if (readiness_csv) {
-        q4_graph_readiness_csv_record(
-                "pre_provider", gate_name, role_names, cache, n_as, matrix_row_counts,
-                readiness_provider, &readiness_start);
-    }
-
-    if (batch.jobs.empty()) {
-        q4_graph_record_post_provider_same_layer(gate_name, role_names, cache, n_as, matrix_row_counts);
-        if (scheduler_readiness_csv) {
-            batch.readiness.active_wait_start = std::chrono::steady_clock::now();
-        }
-        const bool active_wait_ok = batch_cache_wait_pending_slots_for_active(cache, role_names, n_as, matrix_row_counts);
-        if (scheduler_readiness_csv) {
-            batch.readiness.active_wait_done = std::chrono::steady_clock::now();
-            q4_scheduler_readiness_csv_record(
-                    "schedule_done_empty", gate_name, &batch, active_experts, requested_objects,
-                    role_slices, readiness_provider, true, active_wait_ok);
-        }
-        if (!active_wait_ok) {
-            if (async_down_batch) delete async_down_batch;
-            return -1;
-        }
-        q4_graph_record_post_wait_same_layer(gate_name, role_names, cache, n_as, matrix_row_counts);
-        if (readiness_csv) {
-            q4_graph_readiness_csv_record(
-                    "schedule_done", gate_name, role_names, cache, n_as, matrix_row_counts,
-                    readiness_provider, &readiness_start);
-        }
-        if (async_down_batch) delete async_down_batch;
-        return 0;
-    }
-    const bool provider_ok = q4_colibri_pipe_submit_object_batch(batch);
-    if (!provider_ok) {
-        if (scheduler_readiness_csv) {
-            batch.readiness.active_wait_start = std::chrono::steady_clock::now();
-            batch.readiness.active_wait_done = batch.readiness.active_wait_start;
-            q4_scheduler_readiness_csv_record(
-                    "schedule_provider_failed", gate_name, &batch, active_experts, requested_objects,
-                    role_slices, readiness_provider, false, false);
-        }
-        for (q4_colibri_object_job &job : batch.jobs) {
-            for (size_t role_idx = 0; role_idx < job.role_count; ++role_idx) {
-                batch_cache_clear_slot(cache, job.roles[role_idx].slot);
-            }
-        }
-        if (async_down_batch) {
-            for (q4_colibri_object_job &job : async_down_batch->jobs) {
-                for (size_t role_idx = 0; role_idx < job.role_count; ++role_idx) {
-                    batch_cache_clear_slot(cache, job.roles[role_idx].slot);
-                }
-            }
-            delete async_down_batch;
-        }
-        ++g_expert_pack.q4_scheduler_failures;
-        q4_layer_io_add(g_expert_pack.q4_layer_io_failures, current_layer_for_miss_history, 1);
-        return -1;
-    }
-    size_t async_down_jobs_count = 0;
-    if (async_down_batch) {
-        async_down_jobs_count = async_down_batch->jobs.size();
-        async_down_batch->pilot_role_count = async_down_batch->jobs.size();
-        for (const q4_colibri_object_job &job : async_down_batch->jobs) {
-            async_down_batch->pilot_bytes += job.bytes;
-        }
-        if (!q4_colibri_pipe_submit_object_batch_async(async_down_batch)) {
-            for (q4_colibri_object_job &job : async_down_batch->jobs) {
-                for (size_t role_idx = 0; role_idx < job.role_count; ++role_idx) {
-                    batch_cache_clear_slot(cache, job.roles[role_idx].slot);
-                }
-            }
-            delete async_down_batch;
-            async_down_batch = nullptr;
-            async_down_jobs_count = 0;
-        } else {
-            async_down_batch = nullptr;
-        }
-    }
-
-    q4_graph_record_post_provider_same_layer(gate_name, role_names, cache, n_as, matrix_row_counts);
-    if (scheduler_readiness_csv) {
-        batch.readiness.active_wait_start = std::chrono::steady_clock::now();
-    }
-    const bool active_wait_ok = batch_cache_wait_pending_slots_for_active(cache, role_names, n_as, matrix_row_counts);
-    if (scheduler_readiness_csv) {
-        batch.readiness.active_wait_done = std::chrono::steady_clock::now();
-        q4_scheduler_readiness_csv_record(
-                active_wait_ok ? "schedule_done" : "schedule_wait_failed",
-                gate_name, &batch, active_experts, requested_objects,
-                role_slices, readiness_provider, provider_ok, active_wait_ok);
-    }
-    if (!active_wait_ok) {
-        ++g_expert_pack.q4_scheduler_failures;
-        q4_layer_io_add(g_expert_pack.q4_layer_io_failures, current_layer_for_miss_history, 1);
-        return -1;
-    }
-    q4_graph_record_post_wait_same_layer(gate_name, role_names, cache, n_as, matrix_row_counts);
-    if (readiness_csv) {
-        q4_graph_readiness_csv_record(
-                "schedule_done", gate_name, role_names, cache, n_as, matrix_row_counts,
-                readiness_provider, &readiness_start);
-    }
-
-    ++g_expert_pack.q4_scheduler_batches;
-    g_expert_pack.q4_scheduler_active_experts.fetch_add(active_experts, std::memory_order_relaxed);
-    g_expert_pack.q4_scheduler_requested_objects.fetch_add(requested_objects, std::memory_order_relaxed);
-    g_expert_pack.q4_scheduler_physical_jobs.fetch_add(
-            batch.jobs.size() + async_down_jobs_count,
-            std::memory_order_relaxed);
-    g_expert_pack.q4_scheduler_role_slices.fetch_add(role_slices, std::memory_order_relaxed);
-    g_expert_pack.q4_scheduler_duplicates_eliminated.fetch_add(duplicates_eliminated, std::memory_order_relaxed);
-    g_expert_pack.q4_scheduler_physical_bytes.fetch_add(physical_bytes, std::memory_order_relaxed);
-    g_expert_pack.q4_scheduler_logical_bytes.fetch_add(logical_bytes, std::memory_order_relaxed);
-    const int layer_for_io_profile = current_layer_for_miss_history;
-    q4_layer_io_add(g_expert_pack.q4_layer_io_batches, layer_for_io_profile, 1);
-    q4_layer_io_add(g_expert_pack.q4_layer_io_active_experts, layer_for_io_profile, active_experts);
-    q4_layer_io_add(g_expert_pack.q4_layer_io_requested_objects, layer_for_io_profile, requested_objects);
-    q4_layer_io_add(g_expert_pack.q4_layer_io_physical_jobs, layer_for_io_profile,
-            (uint64_t)(batch.jobs.size() + async_down_jobs_count));
-    q4_layer_io_add(g_expert_pack.q4_layer_io_role_slices, layer_for_io_profile, role_slices);
-    q4_layer_io_add(g_expert_pack.q4_layer_io_physical_bytes, layer_for_io_profile, physical_bytes);
-    q4_layer_io_add(g_expert_pack.q4_layer_io_logical_bytes, layer_for_io_profile, logical_bytes);
-    return (int)role_slices;
-}
 
 extern "C" int ggml_cuda_moe_stream_batch_preload_active_from_pack(
     int src0_type_int,
@@ -25123,44 +21905,6 @@ extern "C" bool ggml_cuda_moe_stream_register_tensor(
 
 
 
-static bool down_batch_demand_queue_enabled() {
-    const char *env = std::getenv("GGML_MOE_DOWN_BATCH_DEMAND_QUEUE");
-    return env && env[0] && env[0] != '0';
-}
-
-
-
-static int down_batch_demand_queue_max() {
-    const char *env = std::getenv("GGML_MOE_DOWN_BATCH_DEMAND_QUEUE_MAX");
-    long value = (env && env[0]) ? std::atol(env) : 256;
-    if (value < 1) value = 1;
-    if (value > 8192) value = 8192;
-    return (int)value;
-}
-
-static int down_batch_demand_queue_delay_us() {
-    const char *env = std::getenv("GGML_MOE_DOWN_BATCH_DEMAND_QUEUE_DELAY_US");
-    long value = (env && env[0]) ? std::atol(env) : 0;
-    if (value < 0) value = 0;
-    if (value > 10000) value = 10000;
-    return (int)value;
-}
-
-static int down_batch_demand_queue_coalesce_us() {
-    const char *env = std::getenv("GGML_MOE_DOWN_BATCH_DEMAND_QUEUE_COALESCE_US");
-    long value = (env && env[0]) ? std::atol(env) : 0;
-    if (value < 0) value = 0;
-    if (value > 1000) value = 1000;
-    return (int)value;
-}
-
-static int down_batch_demand_queue_batch_max() {
-    const char *env = std::getenv("GGML_MOE_DOWN_BATCH_DEMAND_QUEUE_BATCH_MAX");
-    long value = (env && env[0]) ? std::atol(env) : 32;
-    if (value < 1) value = 1;
-    if (value > 256) value = 256;
-    return (int)value;
-}
 
 
 
@@ -25168,93 +21912,42 @@ static int down_batch_demand_queue_batch_max() {
 
 
 
-static bool route_group_updown_queue_enabled() {
-    const char *env = std::getenv("GGML_MOE_ROUTE_GROUP_UPDOWN_QUEUE");
-    return env && env[0] && env[0] != '0';
-}
 
-static bool route_group_native_parity_enabled() {
-    const char *env = std::getenv("GGML_MOE_ROUTE_GROUP_NATIVE_PARITY");
-    return env && env[0] && env[0] != '0';
-}
 
-static bool route_group_native_cobatch_enabled() {
-    const char *env = std::getenv("GGML_MOE_ROUTE_GROUP_NATIVE_COBATCH");
-    return env && env[0] && env[0] != '0';
-}
 
-static bool route_group_native_priority_split_enabled() {
-    const char *env = std::getenv("GGML_MOE_ROUTE_GROUP_NATIVE_PRIORITY_SPLIT");
-    return env && env[0] && env[0] != '0';
-}
 
-static bool route_group_native_priority_batch_enabled() {
-    const char *env = std::getenv("GGML_MOE_ROUTE_GROUP_NATIVE_PRIORITY_BATCH");
-    return env && env[0] && env[0] != '0';
-}
 
-static bool route_group_native_skip_gate_enabled() {
-    const char *env = std::getenv("GGML_MOE_ROUTE_GROUP_NATIVE_SKIP_GATE");
-    return env && env[0] && env[0] != '0';
-}
 
-static bool route_group_native_hotset_enabled() {
-    const char *env = std::getenv("GGML_MOE_ROUTE_GROUP_NATIVE_HOTSET");
-    return env && env[0] && env[0] != '0';
-}
 
-static bool route_group_native_trace_clock_enabled() {
-    const char *env = std::getenv("GGML_MOE_TRACE_PREFETCH");
-    return env && env[0];
-}
 
-static bool trace_prefetch_defer_until_one_cache_enabled() {
-    const char *env = std::getenv("GGML_MOE_TRACE_PREFETCH_DEFER_UNTIL_ONE_CACHE");
-    return !env || !env[0] || env[0] != '0';
-}
 
-static int route_group_native_min_seen() {
-    const char *env = std::getenv("GGML_MOE_ROUTE_GROUP_NATIVE_MIN_SEEN");
-    long value = (env && env[0]) ? std::atol(env) : 1;
-    if (value < 1) value = 1;
-    if (value > 1024) value = 1024;
-    return (int)value;
-}
 
-static int route_group_native_role_min_seen(char role) {
-    const char *role_env = nullptr;
-    if (role == 'u') {
-        role_env = std::getenv("GGML_MOE_ROUTE_GROUP_NATIVE_UP_MIN_SEEN");
-    } else if (role == 'd') {
-        role_env = std::getenv("GGML_MOE_ROUTE_GROUP_NATIVE_DOWN_MIN_SEEN");
-    }
-    if (role_env && role_env[0]) {
-        long value = std::atol(role_env);
-        if (value < 1) value = 1;
-        if (value > 1024) value = 1024;
-        return (int)value;
-    }
-    return route_group_native_min_seen();
-}
 
-static int route_group_min_seen() {
-    const char *env = std::getenv("GGML_MOE_ROUTE_GROUP_MIN_SEEN");
-    long value = (env && env[0]) ? std::atol(env) : 1;
-    if (value < 1) value = 1;
-    if (value > 1024) value = 1024;
-    return (int)value;
-}
 
-static bool route_group_target_enabled(const char *target) {
-    const char *env = std::getenv("GGML_MOE_ROUTE_GROUP_TARGETS");
-    if (!env || !env[0]) {
-        return true;
-    }
-    if (std::strcmp(env, "updown") == 0 || std::strcmp(env, "all") == 0) {
-        return true;
-    }
-    return std::strstr(env, target) != nullptr;
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 static std::atomic<uint64_t> g_route_group_calls{0};
 static std::atomic<uint64_t> g_route_group_submitted{0};
@@ -25296,111 +21989,11 @@ static std::atomic<uint64_t> g_route_group_native_priority_down_enqueue_us{0};
 static std::mutex g_route_group_native_seen_mu;
 static std::unordered_map<uintptr_t, uint32_t> g_route_group_native_seen;
 
-static void route_group_report_atexit() {
-    const uint64_t calls = g_route_group_calls.load(std::memory_order_relaxed);
-    if (calls != 0) {
-        std::fprintf(stderr,
-                "[moe_stream_batch] route group down queue: calls=%lu submitted=%lu cache_hits=%lu "
-                "missing_pack=%lu repeat_skips=%lu invalid_gate=%lu inactive_expert_skips=%lu\n",
-                (unsigned long)calls,
-                (unsigned long)g_route_group_submitted.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_cache_hits.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_missing_pack.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_repeat_skips.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_invalid_gate.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_inactive_expert_skips.load(std::memory_order_relaxed));
-    }
-    const uint64_t native_calls = g_route_group_native_calls.load(std::memory_order_relaxed);
-    if (native_calls != 0) {
-        std::fprintf(stderr,
-                "[moe_stream_batch] route group native parity: calls=%lu selected=%lu "
-                "gate_hits=%lu gate_misses=%lu up_hits=%lu up_misses=%lu down_hits=%lu down_misses=%lu "
-                "stage_a_jobs=%lu stage_a_batches=%lu stage_a_bytes=%lu stage_a_copy_us=%lu "
-                "stage_b_jobs=%lu stage_b_batches=%lu stage_b_bytes=%lu stage_b_copy_us=%lu "
-                "missing_pack=%lu no_slot=%lu copy_fail=%lu seen_skips=%lu "
-                "hotset_hits=%lu hotset_skips=%lu hotset_profile_missing=%lu "
-                "priority_down_enqueued=%lu priority_down_queue_fail=%lu priority_down_enqueue_us=%lu\n",
-                (unsigned long)native_calls,
-                (unsigned long)g_route_group_native_selected.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_gate_hits.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_gate_misses.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_up_hits.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_up_misses.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_down_hits.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_down_misses.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_stage_a_jobs.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_stage_a_batches.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_stage_a_bytes.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_stage_a_copy_us.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_stage_b_jobs.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_stage_b_batches.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_stage_b_bytes.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_stage_b_copy_us.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_missing_pack.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_no_slot.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_copy_fail.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_seen_skips.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_hotset_hits.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_hotset_skips.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_hotset_profile_missing.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_priority_down_enqueued.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_priority_down_queue_fail.load(std::memory_order_relaxed),
-                (unsigned long)g_route_group_native_priority_down_enqueue_us.load(std::memory_order_relaxed));
-    }
-}
 
-static bool name_from_gate(const char *gate_name, const char *target, char *out, size_t out_sz) {
-    if (!gate_name || !target || !out || out_sz == 0) return false;
-    const char *needle = std::strstr(gate_name, ".ffn_gate_exps.");
-    if (!needle) return false;
-    const size_t prefix = (size_t)(needle - gate_name);
-    const char *suffix = needle + std::strlen(".ffn_gate_exps.");
-    const int n = std::snprintf(out, out_sz, "%.*s.%s.%s", (int)prefix, gate_name, target, suffix);
-    return n > 0 && (size_t)n < out_sz;
-}
 
-static int route_group_enqueue_tensor(
-        const char *tensor_name,
-        int expert,
-        cudaStream_t st,
-        int min_seen) {
-    const expert_pack_entry *entry = expert_pack_lookup_any_size(tensor_name, expert);
-    if (!entry || entry->nbytes == 0) {
-        ++g_route_group_missing_pack;
-        return 0;
-    }
-    const uintptr_t key = batch_key_hash(tensor_name, expert);
-    if (min_seen > 1) {
-        uint32_t seen = 0;
-        {
-            std::lock_guard<std::mutex> lk(g_route_group_seen_mu);
-            uint32_t &slot_seen = g_route_group_seen[key];
-            seen = slot_seen;
-            if (slot_seen != UINT32_MAX) {
-                ++slot_seen;
-            }
-        }
-        if ((int)seen + 1 < min_seen) {
-            ++g_route_group_repeat_skips;
-            return 0;
-        }
-    }
 
-    batch_vram_cache *cache = batch_cache_get((size_t)entry->nbytes);
-    if (!cache) {
-        return 0;
-    }
-    if (batch_cache_find_slot(cache, key) >= 0) {
-        ++g_route_group_cache_hits;
-        return 0;
-    }
-    if (down_demand_prefill_enqueue(cache, key, nullptr, (size_t)entry->nbytes,
-                tensor_name, expert, st)) {
-        ++g_route_group_submitted;
-        return 1;
-    }
-    return 0;
-}
+
+
 
 struct route_group_native_job {
     batch_vram_cache *cache = nullptr;
@@ -25415,626 +22008,23 @@ struct route_group_native_job {
     char role = '?';
 };
 
-static void route_group_native_count_hit(char role) {
-    if (role == 'g') {
-        ++g_route_group_native_gate_hits;
-    } else if (role == 'u') {
-        ++g_route_group_native_up_hits;
-    } else if (role == 'd') {
-        ++g_route_group_native_down_hits;
-    }
-}
 
-static void route_group_native_count_miss(char role) {
-    if (role == 'g') {
-        ++g_route_group_native_gate_misses;
-    } else if (role == 'u') {
-        ++g_route_group_native_up_misses;
-    } else if (role == 'd') {
-        ++g_route_group_native_down_misses;
-    }
-}
 
-static bool route_group_native_plan_one(
-        std::vector<route_group_native_job> &jobs,
-        const char *tensor_name,
-        int expert,
-        char role,
-        cudaStream_t st,
-        int min_seen) {
-    const expert_pack_entry *entry = expert_pack_lookup_any_size(tensor_name, expert);
-    if (!entry || entry->nbytes == 0) {
-        ++g_route_group_native_missing_pack;
-        return false;
-    }
-    batch_vram_cache *cache = batch_cache_get((size_t)entry->nbytes);
-    if (!cache) {
-        ++g_route_group_native_no_slot;
-        return false;
-    }
-    const uintptr_t key = batch_key_hash(tensor_name, expert);
-    if (route_group_native_hotset_enabled()) {
-        load_profile_once();
-        if (!g_profile_enabled) {
-            ++g_route_group_native_hotset_profile_missing;
-            return true;
-        }
-        if (profile_count_for_key(key) == 0) {
-            ++g_route_group_native_hotset_skips;
-            return true;
-        }
-        ++g_route_group_native_hotset_hits;
-    }
-    if (batch_cache_find_slot(cache, key) >= 0) {
-        route_group_native_count_hit(role);
-        return true;
-    }
-    const int role_min_seen = role == 'g' ? 1 : route_group_native_role_min_seen(role);
-    (void)min_seen;
-    if (role_min_seen > 1) {
-        uint32_t seen = 0;
-        {
-            std::lock_guard<std::mutex> lk(g_route_group_native_seen_mu);
-            uint32_t &slot_seen = g_route_group_native_seen[key];
-            seen = slot_seen;
-            if (slot_seen != UINT32_MAX) {
-                ++slot_seen;
-            }
-        }
-        if ((int)seen + 1 < role_min_seen) {
-            ++g_route_group_native_seen_skips;
-            return true;
-        }
-    }
-    route_group_native_count_miss(role);
-    const int slot = batch_cache_insert_slot(cache, key, nullptr, (size_t)entry->nbytes, st,
-            true, true, nullptr, 0, false, tensor_name, expert,
-            role == 'd', false, false);
-    if (slot < 0) {
-        ++g_route_group_native_no_slot;
-        return false;
-    }
 
-    route_group_native_job job;
-    job.cache = cache;
-    job.slot = slot;
-    job.key = key;
-    job.dst = (char *)cache->pool + (size_t)slot * cache->slot_sz;
-    job.host_data = nullptr;
-    job.pack_entry = entry;
-    job.expert_bytes = (size_t)entry->nbytes;
-    job.expert_idx = expert;
-    job.role = role;
-    std::snprintf(job.tensor, sizeof(job.tensor), "%s", tensor_name);
-    jobs.push_back(job);
-    return true;
-}
 
-static bool route_group_native_enqueue_down_priority(
-        const char *tensor_name,
-        int expert,
-        cudaStream_t st) {
-    const auto enqueue_start = std::chrono::steady_clock::now();
-    auto record_enqueue_us = [&]() {
-        const auto enqueue_end = std::chrono::steady_clock::now();
-        g_route_group_native_priority_down_enqueue_us.fetch_add(
-                (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(enqueue_end - enqueue_start).count(),
-                std::memory_order_relaxed);
-    };
-    const expert_pack_entry *entry = expert_pack_lookup_any_size(tensor_name, expert);
-    if (!entry || entry->nbytes == 0) {
-        ++g_route_group_native_missing_pack;
-        record_enqueue_us();
-        return false;
-    }
-    batch_vram_cache *cache = batch_cache_get((size_t)entry->nbytes);
-    if (!cache) {
-        ++g_route_group_native_no_slot;
-        record_enqueue_us();
-        return false;
-    }
-    const uintptr_t key = batch_key_hash(tensor_name, expert);
-    if (route_group_native_hotset_enabled()) {
-        load_profile_once();
-        if (!g_profile_enabled) {
-            ++g_route_group_native_hotset_profile_missing;
-            record_enqueue_us();
-            return true;
-        }
-        if (profile_count_for_key(key) == 0) {
-            ++g_route_group_native_hotset_skips;
-            record_enqueue_us();
-            return true;
-        }
-        ++g_route_group_native_hotset_hits;
-    }
-    if (batch_cache_find_slot(cache, key) >= 0) {
-        route_group_native_count_hit('d');
-        record_enqueue_us();
-        return true;
-    }
-    const int role_min_seen = route_group_native_role_min_seen('d');
-    if (role_min_seen > 1) {
-        uint32_t seen = 0;
-        {
-            std::lock_guard<std::mutex> lk(g_route_group_native_seen_mu);
-            uint32_t &slot_seen = g_route_group_native_seen[key];
-            seen = slot_seen;
-            if (slot_seen != UINT32_MAX) {
-                ++slot_seen;
-            }
-        }
-        if ((int)seen + 1 < role_min_seen) {
-            ++g_route_group_native_seen_skips;
-            record_enqueue_us();
-            return true;
-        }
-    }
-    route_group_native_count_miss('d');
-    if (!down_demand_prefill_enqueue(cache, key, nullptr, (size_t)entry->nbytes, tensor_name, expert, st)) {
-        ++g_route_group_native_priority_down_queue_fail;
-        record_enqueue_us();
-        return false;
-    }
-    ++g_route_group_native_priority_down_enqueued;
-    g_route_group_native_stage_b_jobs.fetch_add(1, std::memory_order_relaxed);
-    g_route_group_native_stage_b_bytes.fetch_add((uint64_t)entry->nbytes, std::memory_order_relaxed);
-    record_enqueue_us();
-    return true;
-}
 
-static bool route_group_native_prepare_down_priority_job(
-        std::vector<down_demand_prefill_job> &jobs,
-        const char *tensor_name,
-        int expert,
-        cudaStream_t st) {
-    const expert_pack_entry *entry = expert_pack_lookup_any_size(tensor_name, expert);
-    if (!entry || entry->nbytes == 0) {
-        ++g_route_group_native_missing_pack;
-        return false;
-    }
-    batch_vram_cache *cache = batch_cache_get((size_t)entry->nbytes);
-    if (!cache) {
-        ++g_route_group_native_no_slot;
-        return false;
-    }
-    const uintptr_t key = batch_key_hash(tensor_name, expert);
-    if (route_group_native_hotset_enabled()) {
-        load_profile_once();
-        if (!g_profile_enabled) {
-            ++g_route_group_native_hotset_profile_missing;
-            return true;
-        }
-        if (profile_count_for_key(key) == 0) {
-            ++g_route_group_native_hotset_skips;
-            return true;
-        }
-        ++g_route_group_native_hotset_hits;
-    }
-    if (batch_cache_find_slot(cache, key) >= 0) {
-        route_group_native_count_hit('d');
-        return true;
-    }
-    const int role_min_seen = route_group_native_role_min_seen('d');
-    if (role_min_seen > 1) {
-        uint32_t seen = 0;
-        {
-            std::lock_guard<std::mutex> lk(g_route_group_native_seen_mu);
-            uint32_t &slot_seen = g_route_group_native_seen[key];
-            seen = slot_seen;
-            if (slot_seen != UINT32_MAX) {
-                ++slot_seen;
-            }
-        }
-        if ((int)seen + 1 < role_min_seen) {
-            ++g_route_group_native_seen_skips;
-            return true;
-        }
-    }
 
-    down_demand_prefill_init_once();
-    if (!g_down_demand_queue.enabled || !cache->pool) {
-        ++g_route_group_native_priority_down_queue_fail;
-        return false;
-    }
-    if (batch_cache_find_slot(cache, key) >= 0) {
-        ++g_down_demand_queue.duplicate;
-        route_group_native_count_hit('d');
-        return true;
-    }
-    const expert_pack_entry *pack_entry = expert_pack_lookup(tensor_name, expert, (size_t)entry->nbytes);
-    const int slot = batch_cache_insert_slot(cache, key, nullptr, (size_t)entry->nbytes, st,
-            true, true, nullptr, 0, false, tensor_name, expert,
-            true, false, false);
-    if (slot < 0) {
-        ++g_down_demand_queue.no_slot;
-        ++g_route_group_native_no_slot;
-        return false;
-    }
-    cache->slot_filling[slot] = true;
 
-    down_demand_prefill_job job;
-    job.cache = cache;
-    job.slot = slot;
-    job.key = key;
-    job.dst = (char *)cache->pool + (size_t)slot * cache->slot_sz;
-    job.host_data = nullptr;
-    job.pack_entry = pack_entry;
-    job.expert_bytes = (size_t)entry->nbytes;
-    job.expert_idx = expert;
-    std::snprintf(job.tensor, sizeof(job.tensor), "%s", tensor_name ? tensor_name : "");
-    jobs.push_back(job);
-    route_group_native_count_miss('d');
-    return true;
-}
 
-static bool route_group_native_enqueue_down_priority_batch(
-        const char *tensor_name,
-        const std::vector<int> &experts,
-        cudaStream_t st) {
-    const auto enqueue_start = std::chrono::steady_clock::now();
-    std::vector<down_demand_prefill_job> jobs;
-    jobs.reserve(experts.size());
-    bool ok = true;
-    for (int expert : experts) {
-        if (!route_group_native_prepare_down_priority_job(jobs, tensor_name, expert, st)) {
-            ok = false;
-        }
-    }
-    if (!jobs.empty()) {
-        std::stable_sort(jobs.begin(), jobs.end(), [](const down_demand_prefill_job &a, const down_demand_prefill_job &b) {
-            if (a.expert_bytes != b.expert_bytes) return a.expert_bytes < b.expert_bytes;
-            if (a.pack_entry && b.pack_entry && a.pack_entry->source_idx != b.pack_entry->source_idx) {
-                return a.pack_entry->source_idx < b.pack_entry->source_idx;
-            }
-            if (a.pack_entry && b.pack_entry && a.pack_entry->offset != b.pack_entry->offset) {
-                return a.pack_entry->offset < b.pack_entry->offset;
-            }
-            return a.expert_idx < b.expert_idx;
-        });
-        down_demand_prefill_init_once();
-        if (!g_down_demand_queue.enabled) {
-            for (const down_demand_prefill_job &job : jobs) {
-                if (job.cache && job.slot >= 0) {
-                    batch_cache_clear_slot(job.cache, job.slot);
-                }
-            }
-            g_route_group_native_priority_down_queue_fail.fetch_add(jobs.size(), std::memory_order_relaxed);
-            ok = false;
-        } else {
-            size_t accepted = 0;
-            {
-                std::lock_guard<std::mutex> lk(g_down_demand_queue.mu);
-                for (const down_demand_prefill_job &job : jobs) {
-                    if (g_down_demand_queue.jobs.size() >= g_down_demand_queue.max_jobs) {
-                        if (job.cache && job.slot >= 0) {
-                            batch_cache_clear_slot(job.cache, job.slot);
-                        }
-                        ++g_down_demand_queue.queue_full;
-                        ++g_route_group_native_priority_down_queue_fail;
-                        ok = false;
-                        continue;
-                    }
-                    g_down_demand_queue.jobs.push_back(job);
-                    ++g_down_demand_queue.submitted;
-                    ++accepted;
-                }
-            }
-            if (accepted > 0) {
-                g_down_demand_queue.cv.notify_one();
-                g_route_group_native_priority_down_enqueued.fetch_add(accepted, std::memory_order_relaxed);
-                g_route_group_native_stage_b_jobs.fetch_add(accepted, std::memory_order_relaxed);
-                uint64_t accepted_bytes = 0;
-                for (size_t i = 0; i < accepted; ++i) {
-                    accepted_bytes += (uint64_t)jobs[i].expert_bytes;
-                }
-                g_route_group_native_stage_b_bytes.fetch_add(accepted_bytes, std::memory_order_relaxed);
-            }
-        }
-    }
-    const auto enqueue_end = std::chrono::steady_clock::now();
-    g_route_group_native_priority_down_enqueue_us.fetch_add(
-            (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(enqueue_end - enqueue_start).count(),
-            std::memory_order_relaxed);
-    return ok;
-}
 
-static bool route_group_native_copy_stage(
-        std::vector<route_group_native_job> &jobs,
-        const char *trace_op,
-        bool stage_a,
-        pinned_stage_ring *override_ring = nullptr) {
-    if (jobs.empty()) {
-        return true;
-    }
-    std::stable_sort(jobs.begin(), jobs.end(), [](const route_group_native_job &a, const route_group_native_job &b) {
-        if (a.expert_bytes != b.expert_bytes) return a.expert_bytes < b.expert_bytes;
-        if (a.pack_entry && b.pack_entry && a.pack_entry->source_idx != b.pack_entry->source_idx) {
-            return a.pack_entry->source_idx < b.pack_entry->source_idx;
-        }
-        if (a.pack_entry && b.pack_entry && a.pack_entry->offset != b.pack_entry->offset) {
-            return a.pack_entry->offset < b.pack_entry->offset;
-        }
-        return a.expert_idx < b.expert_idx;
-    });
 
-    cudaStream_t copy_stream = g_batch.prefetch_stream ? g_batch.prefetch_stream : g_batch.stream;
-    size_t pos = 0;
-    while (pos < jobs.size()) {
-        const size_t bytes = jobs[pos].expert_bytes;
-        size_t end = pos + 1;
-        while (end < jobs.size() && jobs[end].expert_bytes == bytes) {
-            ++end;
-        }
-        std::vector<route_group_native_job> group(jobs.begin() + (ptrdiff_t)pos, jobs.begin() + (ptrdiff_t)end);
-        pinned_stage_ring &copy_ring = override_ring ? *override_ring : g_batch.stage_ring;
-        const auto copy_start = std::chrono::steady_clock::now();
-        const bool copied = expert_pack_iouring_copy_jobs(group, bytes, copy_stream, copy_ring, trace_op);
-        const auto copy_end = std::chrono::steady_clock::now();
-        const uint64_t copy_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(copy_end - copy_start).count();
-        if (stage_a) {
-            g_route_group_native_stage_a_copy_us.fetch_add(copy_us, std::memory_order_relaxed);
-        } else {
-            g_route_group_native_stage_b_copy_us.fetch_add(copy_us, std::memory_order_relaxed);
-        }
-        if (!copied || cudaGetLastError() != cudaSuccess) {
-            for (const route_group_native_job &job : group) {
-                if (job.cache && job.slot >= 0) {
-                    batch_cache_clear_slot(job.cache, job.slot);
-                }
-            }
-            ++g_route_group_native_copy_fail;
-            return false;
-        }
-        bool mark_ok = true;
-        for (const route_group_native_job &job : group) {
-            if (!job.cache || job.slot < 0 || job.slot >= job.cache->n_slots) {
-                mark_ok = false;
-                break;
-            }
-            const ggml_moe_common::role_cache_view role_view = batch_cache_role_view(job.cache);
-            if (!ggml_moe_common::role_cache_ensure_ready_event(role_view, job.slot)) {
-                mark_ok = false;
-                break;
-            }
-            if (!ggml_moe_common::role_cache_record_ready_event(role_view, job.slot, copy_stream)) {
-                mark_ok = false;
-                break;
-            }
-            job.cache->slot_pending[job.slot] = true;
-            ++job.cache->preloads;
-        }
-        if (!mark_ok) {
-            for (const route_group_native_job &job : group) {
-                if (job.cache && job.slot >= 0) {
-                    batch_cache_clear_slot(job.cache, job.slot);
-                }
-            }
-            ++g_route_group_native_copy_fail;
-            return false;
-        }
-        if (stage_a) {
-            ++g_route_group_native_stage_a_batches;
-            g_route_group_native_stage_a_jobs.fetch_add(group.size(), std::memory_order_relaxed);
-            g_route_group_native_stage_a_bytes.fetch_add((uint64_t)group.size() * (uint64_t)bytes, std::memory_order_relaxed);
-        } else {
-            ++g_route_group_native_stage_b_batches;
-            g_route_group_native_stage_b_jobs.fetch_add(group.size(), std::memory_order_relaxed);
-            g_route_group_native_stage_b_bytes.fetch_add((uint64_t)group.size() * (uint64_t)bytes, std::memory_order_relaxed);
-        }
-        pos = end;
-    }
-    return true;
-}
 
-static bool route_group_native_copy_cobatch(
-        std::vector<route_group_native_job> &stage_a_jobs,
-        std::vector<route_group_native_job> &stage_b_jobs) {
-    if (stage_a_jobs.empty() && stage_b_jobs.empty()) {
-        return true;
-    }
 
-    std::vector<route_group_native_job> jobs;
-    jobs.reserve(stage_a_jobs.size() + stage_b_jobs.size());
-    jobs.insert(jobs.end(), stage_a_jobs.begin(), stage_a_jobs.end());
-    jobs.insert(jobs.end(), stage_b_jobs.begin(), stage_b_jobs.end());
 
-    std::stable_sort(jobs.begin(), jobs.end(), [](const route_group_native_job &a, const route_group_native_job &b) {
-        if (a.expert_bytes != b.expert_bytes) return a.expert_bytes < b.expert_bytes;
-        const int pa = a.role == 'd' ? 1 : 0;
-        const int pb = b.role == 'd' ? 1 : 0;
-        if (pa != pb) return pa < pb;
-        if (a.pack_entry && b.pack_entry && a.pack_entry->source_idx != b.pack_entry->source_idx) {
-            return a.pack_entry->source_idx < b.pack_entry->source_idx;
-        }
-        if (a.pack_entry && b.pack_entry && a.pack_entry->offset != b.pack_entry->offset) {
-            return a.pack_entry->offset < b.pack_entry->offset;
-        }
-        return a.expert_idx < b.expert_idx;
-    });
 
-    cudaStream_t copy_stream = g_batch.prefetch_stream ? g_batch.prefetch_stream : g_batch.stream;
-    size_t pos = 0;
-    while (pos < jobs.size()) {
-        const size_t bytes = jobs[pos].expert_bytes;
-        size_t end = pos + 1;
-        while (end < jobs.size() && jobs[end].expert_bytes == bytes) {
-            ++end;
-        }
-        std::vector<route_group_native_job> group(jobs.begin() + (ptrdiff_t)pos, jobs.begin() + (ptrdiff_t)end);
-        const auto copy_start = std::chrono::steady_clock::now();
-        const bool copied = expert_pack_iouring_copy_jobs(group, bytes, copy_stream, g_batch.stage_ring, "route_group_cobatch");
-        const auto copy_end = std::chrono::steady_clock::now();
-        const uint64_t copy_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(copy_end - copy_start).count();
-        if (!copied || cudaGetLastError() != cudaSuccess) {
-            for (const route_group_native_job &job : group) {
-                if (job.cache && job.slot >= 0) {
-                    batch_cache_clear_slot(job.cache, job.slot);
-                }
-            }
-            ++g_route_group_native_copy_fail;
-            return false;
-        }
-        bool mark_ok = true;
-        uint64_t stage_a_count = 0;
-        uint64_t stage_b_count = 0;
-        for (const route_group_native_job &job : group) {
-            if (!job.cache || job.slot < 0 || job.slot >= job.cache->n_slots) {
-                mark_ok = false;
-                break;
-            }
-            const ggml_moe_common::role_cache_view role_view = batch_cache_role_view(job.cache);
-            if (!ggml_moe_common::role_cache_ensure_ready_event(role_view, job.slot)) {
-                mark_ok = false;
-                break;
-            }
-            if (!ggml_moe_common::role_cache_record_ready_event(role_view, job.slot, copy_stream)) {
-                mark_ok = false;
-                break;
-            }
-            job.cache->slot_pending[job.slot] = true;
-            ++job.cache->preloads;
-            if (job.role == 'd') {
-                ++stage_b_count;
-            } else {
-                ++stage_a_count;
-            }
-        }
-        if (!mark_ok) {
-            for (const route_group_native_job &job : group) {
-                if (job.cache && job.slot >= 0) {
-                    batch_cache_clear_slot(job.cache, job.slot);
-                }
-            }
-            ++g_route_group_native_copy_fail;
-            return false;
-        }
-        if (stage_a_count > 0) {
-            ++g_route_group_native_stage_a_batches;
-            g_route_group_native_stage_a_jobs.fetch_add(stage_a_count, std::memory_order_relaxed);
-            g_route_group_native_stage_a_bytes.fetch_add(stage_a_count * (uint64_t)bytes, std::memory_order_relaxed);
-            g_route_group_native_stage_a_copy_us.fetch_add(
-                    (copy_us * stage_a_count) / (stage_a_count + stage_b_count), std::memory_order_relaxed);
-        }
-        if (stage_b_count > 0) {
-            ++g_route_group_native_stage_b_batches;
-            g_route_group_native_stage_b_jobs.fetch_add(stage_b_count, std::memory_order_relaxed);
-            g_route_group_native_stage_b_bytes.fetch_add(stage_b_count * (uint64_t)bytes, std::memory_order_relaxed);
-            g_route_group_native_stage_b_copy_us.fetch_add(
-                    (copy_us * stage_b_count) / (stage_a_count + stage_b_count), std::memory_order_relaxed);
-        }
-        pos = end;
-    }
-    return true;
-}
 
-static int route_group_native_parity_from_gate(
-        const char *src0_gate_name,
-        int64_t n_as,
-        const int64_t *matrix_row_counts) {
-    if (!route_group_native_parity_enabled()) {
-        return -1;
-    }
-    const bool trace_clock = route_group_native_trace_clock_enabled();
-    if (trace_clock && trace_prefetch_defer_until_one_cache_enabled() &&
-            !ggml_cuda_moe_stream_one_cache_ready()) {
-        static std::atomic<int> first_defer{0};
-        if (first_defer.fetch_add(1, std::memory_order_relaxed) == 0) {
-            std::fprintf(stderr,
-                    "[moe_stream_batch] trace prefetch: deferred until one-cache ready\n");
-        }
-        return 0;
-    }
-    if (!init_batch_once()) {
-        ++g_route_group_native_copy_fail;
-        return 0;
-    }
-    char gate_name[128] = {};
-    char up_name[128] = {};
-    char down_name[128] = {};
-    std::snprintf(gate_name, sizeof(gate_name), "%s", src0_gate_name ? src0_gate_name : "");
-    if (!name_from_gate(src0_gate_name, "ffn_up_exps", up_name, sizeof(up_name)) ||
-            !name_from_gate(src0_gate_name, "ffn_down_exps", down_name, sizeof(down_name))) {
-        ++g_route_group_invalid_gate;
-        return 0;
-    }
 
-    ++g_route_group_native_calls;
-    std::vector<route_group_native_job> stage_a_jobs;
-    std::vector<route_group_native_job> stage_b_jobs;
-    std::vector<int> priority_down_experts;
-    stage_a_jobs.reserve(64);
-    stage_b_jobs.reserve(32);
-    priority_down_experts.reserve(32);
-    const int native_min_seen = route_group_native_min_seen();
-    const bool priority_split = route_group_native_priority_split_enabled();
-    const bool skip_gate = route_group_native_skip_gate_enabled();
-    bool priority_down_ok = true;
 
-    int active = 0;
-    std::lock_guard<std::mutex> lk(g_batch_mu);
-    for (int64_t expert = 0; expert < n_as; ++expert) {
-        if (matrix_row_counts[expert] <= 0) {
-            continue;
-        }
-        ++active;
-        if (trace_clock) {
-            const expert_pack_entry *gate_entry = expert_pack_lookup_any_size(gate_name, (int)expert);
-            if (gate_entry && gate_entry->nbytes > 0) {
-                batch_route_profile_hit(gate_name, (int)expert, (size_t)gate_entry->nbytes);
-            }
-        }
-        if (!skip_gate) {
-            route_group_native_plan_one(stage_a_jobs, gate_name, (int)expert, 'g', g_batch.stream, native_min_seen);
-        }
-        route_group_native_plan_one(stage_a_jobs, up_name, (int)expert, 'u', g_batch.stream, native_min_seen);
-        if (priority_split) {
-            priority_down_experts.push_back((int)expert);
-        } else {
-            route_group_native_plan_one(stage_b_jobs, down_name, (int)expert, 'd', g_batch.stream, native_min_seen);
-        }
-    }
-    g_route_group_native_selected.fetch_add((uint64_t)active, std::memory_order_relaxed);
-
-    static std::atomic<int> first_native{0};
-    if (first_native.fetch_add(1, std::memory_order_relaxed) == 0) {
-        std::fprintf(stderr,
-                "[moe_stream_batch] route group native parity active: gate=%s up=%s down=%s active=%d stage_a_jobs=%zu stage_b_jobs=%zu\n",
-                gate_name, up_name, down_name, active, stage_a_jobs.size(), stage_b_jobs.size());
-    }
-
-    if (priority_split) {
-        if (!route_group_native_copy_stage(stage_a_jobs, "route_group_priority_up_gate", true, &g_batch.stage_ring_gate)) {
-            return 0;
-        }
-        if (route_group_native_priority_batch_enabled()) {
-            priority_down_ok = route_group_native_enqueue_down_priority_batch(
-                    down_name, priority_down_experts, g_batch.stream);
-        } else {
-            for (int expert : priority_down_experts) {
-                if (!route_group_native_enqueue_down_priority(down_name, expert, g_batch.stream)) {
-                    priority_down_ok = false;
-                }
-            }
-        }
-        if (!priority_down_ok) {
-            ++g_route_group_native_copy_fail;
-            return 0;
-        }
-    } else if (route_group_native_cobatch_enabled()) {
-        if (!route_group_native_copy_cobatch(stage_a_jobs, stage_b_jobs)) {
-            return 0;
-        }
-    } else {
-        if (!route_group_native_copy_stage(stage_a_jobs, "route_group_up_gate", true)) {
-            return 0;
-        }
-        if (!route_group_native_copy_stage(stage_b_jobs, "route_group_down", false)) {
-            return 0;
-        }
-    }
-    return (int)(stage_a_jobs.size() + stage_b_jobs.size());
-}
 
 extern "C" int ggml_cuda_moe_stream_route_group_preload_updown_from_gate(
         const char *src0_gate_name,
@@ -26047,15 +22037,7 @@ extern "C" int ggml_cuda_moe_stream_route_group_preload_updown_from_gate(
 
 
 
-static bool gate_updown_cosubmit_make_name(const char *gate_name, const char *target, char *out, size_t out_sz) {
-    if (!gate_name || !target || !out || out_sz == 0) return false;
-    const char *needle = std::strstr(gate_name, ".ffn_gate_exps.");
-    if (!needle) return false;
-    const size_t prefix = (size_t)(needle - gate_name);
-    const char *suffix = needle + std::strlen(".ffn_gate_exps.");
-    const int n = std::snprintf(out, out_sz, "%.*s.%s.%s", (int)prefix, gate_name, target, suffix);
-    return n > 0 && (size_t)n < out_sz;
-}
+
 
 struct gate_updown_cosubmit_job {
     batch_vram_cache *cache = nullptr;
@@ -26085,48 +22067,18 @@ static std::atomic<bool> g_gate_updown_cosubmit_report_registered{false};
 static std::mutex g_gate_updown_cosubmit_seen_mu;
 static std::unordered_map<uintptr_t, uint32_t> g_gate_updown_cosubmit_seen;
 
-static void gate_updown_cosubmit_report_atexit() {
-    const uint64_t calls = g_gate_updown_cosubmit_calls.load(std::memory_order_relaxed);
-    if (calls == 0) return;
-    std::fprintf(stderr,
-            "[moe_stream_batch] gate/up/down cosubmit: calls=%lu jobs=%lu cache_hits=%lu missing_pack=%lu "
-            "iouring_ok=%lu fallback_ok=%lu no_slot_skips=%lu repeat_skips=%lu profile_skips=%lu failures=%lu\n",
-            (unsigned long)calls,
-            (unsigned long)g_gate_updown_cosubmit_jobs.load(std::memory_order_relaxed),
-            (unsigned long)g_gate_updown_cosubmit_cache_hits.load(std::memory_order_relaxed),
-            (unsigned long)g_gate_updown_cosubmit_missing_pack.load(std::memory_order_relaxed),
-            (unsigned long)g_gate_updown_cosubmit_iouring_ok.load(std::memory_order_relaxed),
-            (unsigned long)g_gate_updown_cosubmit_fallback_ok.load(std::memory_order_relaxed),
-            (unsigned long)g_gate_updown_cosubmit_no_slot_skips.load(std::memory_order_relaxed),
-            (unsigned long)g_gate_updown_cosubmit_repeat_skips.load(std::memory_order_relaxed),
-            (unsigned long)g_gate_updown_cosubmit_profile_skips.load(std::memory_order_relaxed),
-            (unsigned long)g_gate_updown_cosubmit_failures.load(std::memory_order_relaxed));
-}
+
 
 static bool gate_updown_cosubmit_env_enabled() {
     const char *env = std::getenv("GGML_MOE_GATE_UPDOWN_COSUBMIT");
     return env && env[0] && env[0] != '0';
 }
 
-static bool gate_updown_cosubmit_down_only_enabled() {
-    const char *env = std::getenv("GGML_MOE_GATE_UPDOWN_COSUBMIT_DOWN_ONLY");
-    return env && env[0] && env[0] != '0';
-}
 
-static uint32_t gate_updown_cosubmit_min_seen() {
-    const char *env = std::getenv("GGML_MOE_GATE_UPDOWN_COSUBMIT_MIN_SEEN");
-    const long value = (env && env[0]) ? std::atol(env) : 0;
-    if (value <= 0) return 0;
-    if (value > 1024) return 1024;
-    return (uint32_t)value;
-}
 
-static uint32_t gate_updown_cosubmit_profile_min_count() {
-    const char *env = std::getenv("GGML_MOE_GATE_UPDOWN_COSUBMIT_PROFILE_MIN_COUNT");
-    const unsigned long value = (env && env[0]) ? std::strtoul(env, nullptr, 10) : 0;
-    if (value == 0) return 0;
-    return value > UINT32_MAX ? UINT32_MAX : (uint32_t)value;
-}
+
+
+
 
 extern "C" int ggml_cuda_moe_stream_batch_preload_gate_updown(const char *gate_name, int expert_idx, size_t expert_bytes) {
     // The experimental batch producer/cache path is retired.
