@@ -130,7 +130,7 @@ void writer_failure_drains(bool acquire_boundary) {
 void configured_context_isolation() {
     fixture file;
     auto snapshot = [&](int mib) {
-        auto parsed = ssd::settings::parse("ssdash-settings 1\nexpert.source = [" + ssd::json::quote(file.path) +
+        auto parsed = ssd::settings::parse("inferssd-settings 1\nexpert.source = [" + ssd::json::quote(file.path) +
                 "]\nhost.expert_cache_mib = " + std::to_string(mib) + "\n", "fixture", {}, "darwin");
         require(bool(parsed), "parse configured Mac settings"); return std::move(parsed.value);
     };
