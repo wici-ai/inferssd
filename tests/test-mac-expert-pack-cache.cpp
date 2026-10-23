@@ -40,6 +40,7 @@ struct fixture {
     void fill(int expert, unsigned char value) { write(&value, 1, alignment + expert * slice_bytes); }
 };
 const char * tensor = "blk.0.ffn_up_exps.weight";
+cache_options small_cache_options() { cache_options options; options.budget = size_t(1) << 20; return options; }
 void rejects(const std::function<void()> & run) {
     bool rejected = false;
     try { run(); } catch (const std::runtime_error &) { rejected = true; }
@@ -51,14 +52,74 @@ void read_byte(pack_cache & cache, int id, unsigned char expected) {
     cache.release(data);
 }
 
+void rejects_foreign_batch() {
+    fixture file;
+    pack_cache first({file.path}, small_cache_options()), second({file.path}, small_cache_options());
+    const int64_t counts[] {1};
+    auto * batch = first.begin(tensor, counts, 1, fixture::slice_bytes, true);
+    rejects([&] { second.acquire(tensor, 0, fixture::slice_bytes, batch); });
+    rejects([&] { second.end(batch); });
+    const auto * payload = first.acquire(tensor, 0, fixture::slice_bytes, batch);
+    require(static_cast<const unsigned char *>(payload)[0] == 0x11, "foreign rejection mutated original batch");
+    first.release(payload); first.end(batch);
+}
+
+void configured_context_isolation() {
+    fixture file;
+    auto snapshot = [&](int mib) {
+        auto parsed = ssd::settings::parse("ssdash-settings 1\nexpert.source = [" + ssd::json::quote(file.path) +
+                "]\nhost.expert_cache_mib = " + std::to_string(mib) + "\n", "fixture", {}, "darwin");
+        require(bool(parsed), "parse configured Mac settings"); return std::move(parsed.value);
+    };
+    const auto hot_settings = snapshot(1), transient_settings = snapshot(0);
+    const std::string event_path = std::string(file.path) + ".events.jsonl";
+    auto opened = ssd::telemetry::writer::open(event_path);
+    require(bool(opened), "open per-context telemetry writer");
+    auto writer = std::move(opened.value);
+    ssd::telemetry::debug_channels debug; debug.trace = true;
+    const ssd::runtime_services services{writer.get(), &debug};
+    char error[512] {};
+    std::unique_ptr<ggml_ssd_mac_cache, decltype(&ssd::mac::destroy)> hot(
+            ssd::mac::create_configured(&hot_settings, &services, error, sizeof(error)), ssd::mac::destroy);
+    require(bool(hot), error);
+    std::unique_ptr<ggml_ssd_mac_cache, decltype(&ssd::mac::destroy)> transient(
+            ssd::mac::create_configured(&transient_settings, nullptr, error, sizeof(error)), ssd::mac::destroy);
+    require(bool(transient), error);
+    debug.trace = false; // The cache owns its debug selection, not this mutable caller object.
+    require(ggml_mac_expert_pack_enabled(hot.get()) && !ggml_mac_expert_pack_enabled(nullptr) &&
+            ggml_mac_expert_pack_prefill_enabled(hot.get()), "configured hook enable/prefill policy");
+    auto read = [&](ggml_ssd_mac_cache * owner, unsigned char expected) {
+        const auto * data = static_cast<const unsigned char *>(
+                ggml_mac_expert_pack_acquire(owner, tensor, 0, fixture::slice_bytes));
+        require(data[0] == expected, "two configured contexts mixed cached bytes");
+        ggml_mac_expert_pack_release(owner, data);
+    };
+    read(hot.get(), 0x11); file.fill(0, 0x66);
+    read(transient.get(), 0x66); read(hot.get(), 0x11);
+    auto other = std::async(std::launch::async, [&] {
+        for (int i = 0; i < 16; ++i) { read(transient.get(), 0x66); }
+    });
+    hot.reset(); // Joins only this context's readers and closes only this source index.
+    other.get(); read(transient.get(), 0x66); transient.reset();
+    require(bool(writer->flush()), "flush context telemetry after its workers joined");
+    writer.reset();
+    std::ifstream events(event_path); std::string line; bool copied_trace = false, own_budget = false;
+    while (std::getline(events, line)) {
+        auto row = ssd::json::parse(line); require(bool(row), "invalid Mac telemetry JSONL");
+        copied_trace = copied_trace || row.value.object.at("ev").text == "ssd.mac.expert_request";
+        own_budget = own_budget || (row.value.object.count("budget_bytes") && row.value.object.at("budget_bytes").text == "1048576");
+    }
+    require(copied_trace && own_budget, "Mac telemetry lost copied debug selection or context budget");
+    unlink(event_path.c_str());
+}
+
 void concurrent_batches() {
     fixture file;
     for (int expert = 0; expert < 3; ++expert) {
         std::vector<unsigned char> payload(fixture::slice_bytes, 0x21 + expert);
         file.write(payload.data(), payload.size(), alignment + expert * fixture::slice_bytes);
     }
-    setenv("SSD_LLAMA_MAC_EXPERT_READ_AHEAD", "2", 1);
-    pack_cache cache(file.path, false);
+    pack_cache cache({file.path}, small_cache_options());
     std::promise<void> start;
     auto ready = start.get_future().share();
     std::vector<std::future<void>> workers;
@@ -94,18 +155,14 @@ void concurrent_batches() {
     }
     start.set_value();
     for (auto & worker : workers) { worker.get(); }
-    unsetenv("SSD_LLAMA_MAC_EXPERT_READ_AHEAD");
 }
 }
 
 int main() {
     try {
-        setenv("SSD_LLAMA_MAC_EXPERT_CACHE_MIB", "1", 1);
-        setenv("SSD_LLAMA_MAC_EXPERT_CACHE_POLICY", "lfu", 1);
-        unsetenv("SSD_LLAMA_MAC_EXPERT_TRACE");
         {
             fixture file;
-            pack_cache cache(file.path, false);
+            pack_cache cache({file.path}, small_cache_options());
             read_byte(cache, 0, 0x11);
             read_byte(cache, 0, 0x11);
             file.fill(0, 0x44);
@@ -118,7 +175,7 @@ int main() {
         }
         {
             fixture file;
-            pack_cache cache(file.path, false);
+            pack_cache cache({file.path}, small_cache_options());
             const auto * pinned = static_cast<const unsigned char *>(cache.acquire(tensor, 0, fixture::slice_bytes));
             file.fill(0, 0x55);
             for (int i = 0; i < 5; ++i) { read_byte(cache, 1, 0x12); }
@@ -130,37 +187,39 @@ int main() {
             rejects([&] { cache.release(pinned); });
         }
         concurrent_batches();
+        configured_context_isolation();
+        rejects_foreign_batch();
         {
             fixture file;
             const unsigned char invalid = 'X';
             file.write(&invalid, 1, 0);
-            rejects([&] { pack_cache cache(file.path, false); });
+            rejects([&] { pack_cache cache({file.path}, small_cache_options()); });
         }
         {
             fixture file;
             uint64_t start = 0;
             file.write(&start, sizeof(start), offsetof(pack_header, data_start));
-            rejects([&] { pack_cache cache(file.path, false); });
+            rejects([&] { pack_cache cache({file.path}, small_cache_options()); });
         }
         {
             fixture file;
             uint64_t count = max_entries + 1;
             file.write(&count, sizeof(count), offsetof(pack_header, entry_count));
-            rejects([&] { pack_cache cache(file.path, false); });
+            rejects([&] { pack_cache cache({file.path}, small_cache_options()); });
         }
         {
             fixture file;
             uint64_t offset = UINT64_MAX;
             file.write(&offset, sizeof(offset), sizeof(pack_header) + offsetof(pack_entry, offset));
-            rejects([&] { pack_cache cache(file.path, false); });
+            rejects([&] { pack_cache cache({file.path}, small_cache_options()); });
         }
         {
             fixture file;
             int32_t duplicate = 0;
             file.write(&duplicate, sizeof(duplicate), sizeof(pack_header) + sizeof(pack_entry) + offsetof(pack_entry, expert));
-            rejects([&] { pack_cache cache(file.path, false); });
+            rejects([&] { pack_cache cache({file.path}, small_cache_options()); });
         }
-        std::puts("MAC_EXPERT_PACK_CACHE_OK header=PASS lfu=PASS pins=PASS concurrent_batches=PASS invalid_entries=PASS");
+        std::puts("MAC_EXPERT_PACK_CACHE_OK header=PASS lfu=PASS pins=PASS concurrent_batches=PASS contexts=PASS copied_debug=PASS telemetry=PASS foreign_batch=PASS invalid_entries=PASS");
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "MAC_EXPERT_PACK_CACHE_FAILED: %s\n", error.what());

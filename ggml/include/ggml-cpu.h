@@ -22,6 +22,9 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        // Borrowed from this backend/context; valid until graph workers have joined.
+        void * ssd_mac_cache;
     };
 
     // numa strategies

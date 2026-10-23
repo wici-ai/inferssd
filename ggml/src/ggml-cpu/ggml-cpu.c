@@ -3214,8 +3214,8 @@ static void ggml_compute_forward_mul_mat_id_generic(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 #if defined(__APPLE__)
-    const bool mac_pack_source = ggml_mac_expert_pack_enabled() &&
-        (n_as == 384 || n_as == 256) && (ids->ne[1] == 1 || ggml_mac_expert_pack_prefill_enabled()) &&
+    const bool mac_pack_source = ggml_mac_expert_pack_enabled(params->ssd_mac_cache) &&
+        (n_as == 384 || n_as == 256) && (ids->ne[1] == 1 || ggml_mac_expert_pack_prefill_enabled(params->ssd_mac_cache)) &&
         strstr(src0->name, ".ffn_") && strstr(src0->name, "_exps.weight");
 #endif
 
@@ -3367,7 +3367,7 @@ static void ggml_compute_forward_mul_mat_id_generic(
 #if defined(__APPLE__)
     void * mac_read_batch = NULL;
     if (mac_pack_source && ith == 0) {
-        mac_read_batch = ggml_mac_expert_pack_begin_batch(src0->name, matrix_row_counts, n_as, (size_t) ne01 * nb01, ids->ne[1] == 1);
+        mac_read_batch = ggml_mac_expert_pack_begin_batch(params->ssd_mac_cache, src0->name, matrix_row_counts, n_as, (size_t) ne01 * nb01, ids->ne[1] == 1);
     }
     uint64_t mac_compute_start = 0, mac_compute_us = 0, mac_barrier_start = 0, mac_barrier_us = 0;
 #endif
@@ -3380,7 +3380,7 @@ static void ggml_compute_forward_mul_mat_id_generic(
         if (mac_pack_source) {
             if (ith == 0) {
                 fallback_pack_mmap_ptrs[cur_a] =
-                    ggml_mac_expert_pack_acquire_batch(mac_read_batch, src0->name, cur_a, (size_t) ne01 * nb01);
+                    ggml_mac_expert_pack_acquire_batch(params->ssd_mac_cache, mac_read_batch, src0->name, cur_a, (size_t) ne01 * nb01);
                 mac_barrier_start = ggml_time_us();
             }
             ggml_barrier(params->threadpool);
@@ -3477,20 +3477,20 @@ static void ggml_compute_forward_mul_mat_id_generic(
             ggml_barrier(params->threadpool);
             if (ith == 0) {
                 mac_barrier_us += ggml_time_us() - mac_barrier_start;
-                ggml_mac_expert_pack_release(fallback_pack_mmap_ptrs[cur_a]);
+                ggml_mac_expert_pack_release(params->ssd_mac_cache, fallback_pack_mmap_ptrs[cur_a]);
                 fallback_pack_mmap_ptrs[cur_a] = NULL;
                 mac_barrier_start = ggml_time_us();
             }
             ggml_barrier(params->threadpool);
             if (ith == 0) {
                 mac_barrier_us += ggml_time_us() - mac_barrier_start;
-                ggml_mac_expert_pack_record_compute(mac_compute_us, mac_barrier_us);
+                ggml_mac_expert_pack_record_compute(params->ssd_mac_cache, mac_compute_us, mac_barrier_us);
             }
         }
 #endif
     }
 #if defined(__APPLE__)
-    if (mac_pack_source && ith == 0) { ggml_mac_expert_pack_end_batch(mac_read_batch); }
+    if (mac_pack_source && ith == 0) { ggml_mac_expert_pack_end_batch(params->ssd_mac_cache, mac_read_batch); }
 #endif
 
     if (moe_fallback_reason_profile && ith == 0) {
@@ -4948,6 +4948,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.ssd_mac_cache =*/ cplan->ssd_mac_cache,
     };
     const bool layer_gap_trace =
         state->ith == 0 && ggml_cpu_layer_gap_trace_enabled();

@@ -2,6 +2,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ssd/mac-runtime-fixture.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -71,12 +72,10 @@ int main(int argc, char ** argv) {
             }
             require(bool(index), "write expert alias");
         }
-        unsetenv("SSD_LLAMA_MAC_EXPERT_PACK");
-        unsetenv("SSD_LLAMA_MAC_EXPERT_TRACE");
-        setenv("SSD_LLAMA_MAC_EXPERT_CACHE_MIB", "1", 1);
-        setenv("SSD_LLAMA_MAC_EXPERT_READ_AHEAD", argv[3], 1);
-        setenv("SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT", "4096", 1);
-        setenv("SSD_LLAMA_MAC_EXPERT_PREFILL", "1", 1);
+        auto registry = ggml_backend_cpu_reg();
+        auto set_cache = reinterpret_cast<ssd::mac::set_backend_cache>(
+                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_set_ssd_mac_cache"));
+        require(set_cache != nullptr, "CPU registry has no explicit Mac cache setter");
         for (int lanes : {1, selected}) {
             constexpr size_t nodes = 32;
             std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init({
@@ -88,6 +87,14 @@ int main(int argc, char ** argv) {
             std::unique_ptr<ggml_threadpool, decltype(&ggml_threadpool_free)> pool(
                     ggml_threadpool_new(&pool_params), ggml_threadpool_free);
             require(bool(pool), "create paused threadpool");
+            ssd::mac::testing::options cache_options;
+            cache_options.budget_bytes = size_t(1) << 20;
+            cache_options.read_ahead = size_t(depth);
+            char cache_error[512] {};
+            std::unique_ptr<ggml_ssd_mac_cache, decltype(&ssd::mac::destroy)> cache(
+                    ssd::mac::testing::create({source.alias}, cache_options, cache_error, sizeof(cache_error)),
+                    ssd::mac::destroy);
+            require(bool(cache), cache_error);
             std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu(ggml_backend_cpu_init(), ggml_backend_free);
             require(bool(cpu), "create CPU backend");
             ggml_backend_cpu_set_n_threads(cpu.get(), threads);
@@ -111,7 +118,7 @@ int main(int argc, char ** argv) {
             ggml_backend_tensor_set(a, packed.data(), 0, packed.size());
             ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
             ggml_backend_tensor_set(ids, routing.data(), 0, routing.size() * sizeof(int32_t));
-            unsetenv("GGML_MOE_EXPERT_GGUF_ALIAS_TSV");
+            require(set_cache(cpu.get(), nullptr), "detach cache for resident reference");
             require(ggml_backend_graph_compute(cpu.get(), graph) == GGML_STATUS_SUCCESS, "compute resident reference");
             std::vector<float> expected(ggml_nelements(result)), actual(expected.size());
             ggml_backend_tensor_get(result, expected.data(), 0, ggml_nbytes(result));
@@ -120,7 +127,16 @@ int main(int argc, char ** argv) {
             // hook actually reads the original bytes from the alias file.
             std::vector<char> zero(packed.size(), 0);
             ggml_backend_tensor_set(a, zero.data(), 0, zero.size());
-            setenv("GGML_MOE_EXPERT_GGUF_ALIAS_TSV", source.alias.c_str(), 1);
+            require(set_cache(cpu.get(), cache.get()), "attach context-owned alias cache");
+            require(set_cache(cpu.get(), cache.get()), "idempotent cache attach");
+            require(!set_cache(nullptr, cache.get()), "null backend accepted a cache");
+            char peer_error[512] {};
+            std::unique_ptr<ggml_ssd_mac_cache, decltype(&ssd::mac::destroy)> peer(
+                    ssd::mac::testing::create({source.alias}, cache_options, peer_error, sizeof(peer_error)),
+                    ssd::mac::destroy);
+            require(bool(peer), peer_error);
+            require(!set_cache(cpu.get(), peer.get()), "nonempty backend replaced a borrowed cache");
+            peer.reset();
             for (int repeat = 0; repeat < 4; ++repeat) {
                 ggml_threadpool_pause(pool.get());
                 require(ggml_backend_graph_compute(cpu.get(), graph) == GGML_STATUS_SUCCESS, "compute alias graph after pause");
@@ -148,6 +164,7 @@ int main(int argc, char ** argv) {
                 }
                 std::printf("MAC_EXPERT_POOL_REUSE_OK capacity=12 active=1,4,12,4,1 lanes=%d\n", lanes);
             }
+            require(set_cache(cpu.get(), nullptr), "detach alias cache before owner destruction");
         }
         std::printf("MAC_EXPERT_OPERATOR_OK experts=%d rows=%d depth=%d type=%s threads=%d broadcast=PASS routed=PASS lifecycle=PASS\n",
                     experts, rows, depth, argv[4], threads);
