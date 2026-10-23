@@ -75,7 +75,7 @@ int main(int argc, char ** argv) {
     auto copy = parsed.value;
     parsed    = parse("", "");
     assert(*copy.integer("cpu.threads") == 4 && *parsed.value.integer("cpu.threads") == 2);
-    for (const std::string & bad :
+    for (const std::string bad :
          { "cpu.threads = 0", "cpu.threads = \"4\"", "cpu.threads = 18446744073709551616", "cpu.compute_cpus = 1,1",
            "cpu.compute_cpus = 2-0", "cpu.compute_cpus = 1-99999999", "cpu.decode_participants = 2", "unknown = 0",
            "vram.reserve_mib = 64", "place.costs = cpu_fixed_us=nan", "place.costs = link_gbps=0",
