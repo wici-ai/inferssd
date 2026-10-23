@@ -25,6 +25,7 @@ class LaunchSpec:
     context: int = 8192
     batch: int = 512
     ubatch: int = 512
+    batch_threads: Optional[int] = None
 
 
 def reject_legacy_environment(environment: Mapping[str, str]) -> None:
@@ -88,6 +89,10 @@ def _resolve(
         raise ValueError("owned typed launch currently supports server mode")
     if not 1 <= spec.port <= 65535 or min(spec.context, spec.batch, spec.ubatch) < 1:
         raise ValueError("invalid port, context or batch size")
+    if spec.batch_threads is not None and (
+        type(spec.batch_threads) is not int or not 1 <= spec.batch_threads <= 256
+    ):
+        raise ValueError("batch_threads must be an integer in 1..256")
     protected = {
         "-m",
         "--model",
@@ -108,12 +113,48 @@ def _resolve(
         "--threads",
         "-tb",
         "--threads-batch",
+        "--fit",
+        "--chat-template-file",
+        "--chat-template",
+        "--reasoning",
+        "-ngl",
+        "--gpu-layers",
+        "--n-gpu-layers",
+        "--cpu-moe",
+        "-ncmoe",
+        "--n-cpu-moe",
+        "--no-host",
+        "--op-offload",
+        "--no-op-offload",
+        "--repack",
+        "--no-repack",
+        "--mmap",
+        "--no-mmap",
+        "--defer-experts",
+        "--no-defer-experts",
+        "--warmup",
+        "--no-warmup",
+        "-fa",
+        "--flash-attn",
+        "--cache-ram",
+        "--cache-disk",
+        "--cache-disk-mib",
+        "-ot",
+        "--override-tensor",
+        "-ts",
+        "--tensor-split",
+        "-sm",
+        "--split-mode",
+        "-mg",
+        "--main-gpu",
     }
     protected.update(MODEL_OPTIONS)
     if any(
         x.split("=", 1)[0] in protected
         or x.startswith("--ssd-")
-        or x.startswith(("-m", "-hf", "-np"))
+        or x.startswith(
+            ("-m", "-hf", "-np", "-t", "-b", "-c", "-ub", "-ngl", "-ncmoe", "-fa", "-ot", "-sm")
+        )
         and not x.startswith("--")
         for x in s.inputs.extra
     ):
@@ -195,6 +236,7 @@ def _resolve(
     telemetry = directory + "/native-events.jsonl"
     s.ask("write_exclusive", settings, materialized_settings(value))
     threads = str(value.at("cpu.threads").value)
+    batch_threads = str(spec.batch_threads) if spec.batch_threads is not None else threads
     command = [binary, "-m", model, "--ssd-settings", settings, "--ssd-telemetry", telemetry]
     for item in value.entries:
         if item.origin == "cli":
@@ -219,7 +261,7 @@ def _resolve(
         "-t",
         threads,
         "-tb",
-        threads,
+        batch_threads,
         "--chat-template-file",
         template,
         "--host",
@@ -260,7 +302,18 @@ def _resolve(
     s.argv = command
     s.emit(
         json.dumps(
-            {"settings": settings, "telemetry": telemetry, "effective": value.document()},
+            {
+                "settings": settings,
+                "telemetry": telemetry,
+                "effective": value.document(),
+                "launch": {
+                    "decode_threads": int(threads),
+                    "batch_threads": int(batch_threads),
+                    "context": spec.context,
+                    "batch": spec.batch,
+                    "ubatch": spec.ubatch,
+                },
+            },
             ensure_ascii=False,
         )
         + "\n"

@@ -46,6 +46,9 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     launch.add_argument("--context", type=int, default=8192)
     launch.add_argument("--batch", type=int, default=512)
     launch.add_argument("--ubatch", type=int, default=512)
+    launch.add_argument(
+        "--batch-threads", type=int, help="native prefill threads (1..256; defaults to cpu.threads)"
+    )
     launch.add_argument("--result", type=Path, help="dry-run resolution receipt")
     launch.add_argument("extra", nargs=argparse.REMAINDER)
     launch.set_defaults(mode="server")
@@ -68,6 +71,7 @@ def specification(args: argparse.Namespace) -> LaunchSpec:
         args.context,
         args.batch,
         args.ubatch,
+        args.batch_threads,
     )
 
 

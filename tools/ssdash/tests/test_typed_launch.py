@@ -394,3 +394,39 @@ def test_controller_rejects_unconfigured_history_persistence(tmp_path):
             stdout=None,
             keeps_history=True,
         )
+
+
+@pytest.mark.parametrize("threads", [4, 8])
+def test_mac_measured_prefill_threads_are_explicit_and_preserved(tmp_path, threads):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path, "darwin")
+    spec = replace(spec, overrides=(("cpu.threads", str(threads)),), batch_threads=12)
+    result = resolve(inputs, spec, adapter, out, "darwin")
+    assert result.argv[result.argv.index("-t") + 1] == str(threads)
+    assert result.argv[result.argv.index("-tb") + 1] == "12"
+    assert json.loads(result.outputs[-1].text)["launch"]["batch_threads"] == 12
+
+
+@pytest.mark.parametrize("batch_threads", [0, -1, 257, True])
+def test_bad_explicit_batch_threads_refused_before_native_file(tmp_path, batch_threads):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    with pytest.raises(ValueError, match="batch_threads"):
+        resolve(inputs, replace(spec, batch_threads=batch_threads), adapter, out)
+    assert not (out / "settings.ssd").exists()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("--fit=on",),
+        ("--chat-template-file", "other"),
+        ("-ngl0",),
+        ("--cpu-moe",),
+        ("--no-host",),
+        ("--tensor-split=1,0",),
+        ("-otbad",),
+    ],
+)
+def test_extra_cannot_replace_selected_native_placement(tmp_path, extra):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    with pytest.raises(ValueError, match="explicit typed"):
+        resolve(replace(inputs, extra=extra), spec, adapter, out)

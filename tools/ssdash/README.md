@@ -401,7 +401,11 @@ switch and refuses `keeps_history=True`. Each Engine receives its own immutable 
 and fresh native files. No production path calls `Machine.env` or accepts the
 old Engine environment-control string. Model/listener/parallel/thread/batch
 arguments must use the explicit launch options so extra flags cannot silently
-replace those owned values.
+replace those owned values. `--batch-threads` selects native prefill `-tb`
+independently of `cpu.threads`/decode `-t` (default: the same count; range1..256).
+This preserves measured Mac choices such as t4/tb12 or t8/tb12 without adding a
+fifteenth SSD setting. The launch receipt and argv record both counts. Extra
+flags cannot override fixed placement, template, fit, cache or offload decisions.
 
 The retained controller observes routing/profile diagnostics through its
 caller-owned legacy observation session. Current versioned native events do not
