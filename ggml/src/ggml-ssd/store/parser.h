@@ -10,6 +10,7 @@ struct description {
     std::vector<std::string> page_cache_packs;
     bool replace_duplicates = false;
     int io_backend = 0;
+    bool require_direct = false;
 };
 
 // Transport capability and accounting stay in the provider. Callbacks run

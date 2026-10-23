@@ -23,9 +23,11 @@ source_file::source_file(const char * source_path) : path(source_path), fd(open(
                 || fcntl(fd, F_NOCACHE, 1) == -1
 #endif
                 ) {
-            const std::string reason = std::strerror(errno);
+            const int cause = errno;
             close(fd);
-            throw std::runtime_error("cannot prepare expert source: " + reason);
+            // Close before constructing an error string: this constructor's
+            // destructor will not run if allocating the message fails.
+            throw std::runtime_error("cannot prepare expert source: " + std::string(std::strerror(cause)));
         }
         bytes = uint64_t(info.st_size);
     }

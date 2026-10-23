@@ -1,11 +1,10 @@
 #pragma once
 
-#if defined(LLAMA_SSD_STORE)
-#include "store.h"
-#endif
-
 #include "kimi-cpu-sink.h"
 #include "cpu-prefill.h"
+#include "ggml-ssd/settings/settings.h"
+#include "ggml-ssd/telemetry/telemetry.h"
+#include "ggml-ssd/store/source.h"
 
 #include <cerrno>
 #include <algorithm>
@@ -48,8 +47,9 @@ struct llama_kimi_cpu_sink_node {
 struct llama_kimi_cpu_sink_runtime {
     // Resolve the logical native range; the callback below aligns its physical I/O.
     // resolve_raw_direct_shape(name, expert, logical bytes, n_experts, fd, logical offset, logical bytes)
-    using resolve_fn = bool (*)(const char *, int, size_t, int64_t, int *, uint64_t *, size_t *);
-
+    const ssd::settings::snapshot & settings;
+    const ssd::runtime_services & services;
+    const ssd::store::source_view source;
     std::mutex mutex;
     kimi_cpu_sink * sink = nullptr;
     llama_kimi_cpu_prefill_runtime prefill;
@@ -63,11 +63,10 @@ struct llama_kimi_cpu_sink_runtime {
     decltype(&kimi_cpu_sink_cache_begin) cache_begin = nullptr;
     decltype(&kimi_cpu_sink_vram_phase_complete) vram_phase_complete = nullptr;
     decltype(&kimi_cpu_sink_cache_get_stats) cache_get_stats = nullptr;
-    decltype(&kimi_cpu_sink_cache_make_room) cache_make_room = nullptr; // optional
-    decltype(&kimi_cpu_sink_cache_prefill_room) cache_prefill_room = nullptr; // optional
-    resolve_fn resolve = nullptr;
+    decltype(&ssd::cpu::cache_make_room_configured) cache_make_room = nullptr; // optional
+    decltype(&ssd::cpu::cache_prefill_room_configured) cache_prefill_room = nullptr; // optional
     ggml_backend_reg_t cpu_reg = nullptr;
-    const ssd::cpu::api_v1 * cpu_api = nullptr;
+    const ssd::cpu::api_v2 * cpu_api = nullptr;
     const llama_kimi_cpu_sink_node * active_node = nullptr;
     uint64_t calls = 0;
     uint64_t read_requests = 0;
@@ -95,91 +94,26 @@ struct llama_kimi_cpu_sink_runtime {
     // them uncommitted for the first prefill.
     uint64_t prefill_pages = 0;
 
-    static uint64_t unsigned_env(const char * name, uint64_t fallback, uint64_t maximum) {
-        const char * value = std::getenv(name);
-        if (!value) { return fallback; }
-        uint64_t parsed = 0;
-        if (!*value) { throw std::runtime_error(std::string(name) + " requires decimal digits"); }
-        for (const char * p = value; *p; ++p) {
-            if (*p < '0' || *p > '9' || parsed > maximum / 10 ||
-                    (parsed == maximum / 10 && uint64_t(*p - '0') > maximum % 10)) {
-                throw std::runtime_error(std::string(name) + " is not a valid unsigned decimal value in range");
-            }
-            parsed = parsed * 10 + uint64_t(*p - '0');
-        }
-        return parsed;
-    }
-
-    // n_expert is the routed-expert tensor ne[2] and bounds CACHE_MAX_PER_LAYER.
-    // Routed layers (model order) are the default cache priority. The VRAM tier needs its
-    // explicit-format extension for them (checked by the executor).
     llama_kimi_cpu_sink_runtime(int n_layers, uint64_t context_epoch,
-            int64_t n_expert, const std::vector<int32_t> & routed_layers) : epoch(context_epoch) {
-        if (n_expert <= 0) {
-            throw std::runtime_error("CPU sink requires a positive routed expert count");
-        }
-        const char * cache_compute = std::getenv("GGML_KIMI_CPU_SINK_CACHE_COMPUTE");
-        cache_compute_enabled = cache_compute && std::strcmp(cache_compute, "off") != 0;
-        if (cache_compute_enabled && std::strcmp(cache_compute, "bonus") &&
-                std::strcmp(cache_compute, "hybrid") && std::strcmp(cache_compute, "shrink")) {
-            throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_COMPUTE must be off, bonus, hybrid or shrink");
-        }
-        const char * locations=std::getenv("GGML_KIMI_CPU_SINK_VRAM_CACHE_LOCATIONS");
-        if(locations && std::strcmp(locations,"0") && std::strcmp(locations,"1")) {
-            throw std::runtime_error("GGML_KIMI_CPU_SINK_VRAM_CACHE_LOCATIONS must be 0 or 1");
-        }
-        // The provider may execute the unchanged S set through the shared
-        // consumer. Optional shrink/bonus policy stays off unless requested.
-        cache_compute_enabled=cache_compute_enabled || (locations&&!std::strcmp(locations,"1"));
-        cache_keep_across_requests = unsigned_env("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS", 0, 1) != 0;
-        // Unset: the sink sizes the cache from this machine at the first decode token (UINT64_MAX).
-        cache_budget = unsigned_env("GGML_KIMI_CPU_SINK_CACHE_BYTES", std::numeric_limits<uint64_t>::max(),
-            std::numeric_limits<size_t>::max());
-        // auto: the tier sizes itself (the sink parses the value); any nonzero value turns it on.
-        const char * vram_bytes = std::getenv("GGML_KIMI_CPU_SINK_VRAM_BYTES");
-        vram_budget = vram_bytes && !std::strcmp(vram_bytes, "auto") ? std::numeric_limits<uint64_t>::max() :
-            unsigned_env("GGML_KIMI_CPU_SINK_VRAM_BYTES", 0, 64ull << 30);
-        if (cache_compute_enabled) {
-            throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_COMPUTE and GGML_KIMI_CPU_SINK_VRAM_CACHE_LOCATIONS "
-                "are retired; use off and 0");
-        }
-        // Bounded by the routed expert count and the executor's per-layer ABI maximum.
-        const uint64_t max_per_layer = uint64_t(std::min<int64_t>(n_expert, 896));
-        // An automatic cache is bounded by memory alone; a fixed one keeps the old default of eight.
-        const bool automatic = cache_budget == std::numeric_limits<uint64_t>::max();
-        cache_max_per_layer = static_cast<int>(unsigned_env("GGML_KIMI_CPU_SINK_CACHE_MAX_PER_LAYER",
-            automatic ? max_per_layer : std::min<uint64_t>(8, max_per_layer), max_per_layer));
-        if (!cache_max_per_layer) {
-            throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_MAX_PER_LAYER must be in [1, " +
-                std::to_string(max_per_layer) + "]");
-        }
-        const char * priority = std::getenv("GGML_KIMI_CPU_SINK_CACHE_LAYER_PRIORITY");
-        if (priority) {
-            const char * p = priority;
-            do {
-                char * end = nullptr;
-                errno = 0;
-                const long value = std::strtol(p, &end, 10);
-                if (errno || end == p || value < 0 || value >= n_layers ||
-                        (*end && *end != ',') ||
-                        std::find(layer_priority.begin(), layer_priority.end(), value) != layer_priority.end()) {
-                    throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_LAYER_PRIORITY requires unique comma-separated model layer IDs");
-                }
-                layer_priority.push_back(static_cast<int32_t>(value));
-                if (!*end) { break; }
-                p = end + 1;
-            } while (true);
-        } else {
-            for (int32_t layer : routed_layers) {
-                if (layer >= 0 && layer < n_layers &&
-                        std::find(layer_priority.begin(), layer_priority.end(), layer) == layer_priority.end()) {
-                    layer_priority.push_back(layer);
-                }
+            int64_t n_expert, const std::vector<int32_t> & routed_layers,
+            const ssd::settings::snapshot & configured, const ssd::runtime_services & runtime_services,
+            ssd::store::source_view source_view)
+        : settings(configured), services(runtime_services), source(source_view), epoch(context_epoch) {
+        if (n_expert <= 0) { throw std::runtime_error("CPU sink requires a positive routed expert count"); }
+        // Supported v0.1 profile: resource-sized RAM cache, model-order priority,
+        // fixed eight-expert read ring, no speculative cache-compute policy.
+        cache_budget = std::numeric_limits<uint64_t>::max();
+        cache_keep_across_requests = true;
+        const auto * budget = settings.vram_budget();
+        vram_budget = budget->automatic ? std::numeric_limits<uint64_t>::max() : budget->bytes;
+        cache_max_per_layer = int(std::min<int64_t>(n_expert, 896));
+        for (int32_t layer : routed_layers) {
+            if (layer >= 0 && layer < n_layers &&
+                    std::find(layer_priority.begin(), layer_priority.end(), layer) == layer_priority.end()) {
+                layer_priority.push_back(layer);
             }
         }
-        if (cache_budget && layer_priority.empty()) {
-            throw std::runtime_error("CPU sink cache requires at least one eligible model layer");
-        }
+        if (layer_priority.empty()) { throw std::runtime_error("CPU sink requires routed model layers"); }
     }
 
     ~llama_kimi_cpu_sink_runtime() {
@@ -198,13 +132,13 @@ struct llama_kimi_cpu_sink_runtime {
     static bool resolve_source(void * userdata, const char * tensor_name, int32_t expert,
             kimi_cpu_sink_source * source) {
         auto & runtime = *static_cast<llama_kimi_cpu_sink_runtime *>(userdata);
-        if (!runtime.active_node || !runtime.resolve || !source) {
+        if (!runtime.active_node || !runtime.source.resolve || !source) {
             return false;
         }
         const auto & node = *runtime.active_node;
         auto range = [&](size_t logical_nbytes, int64_t experts) {
             *source = {};
-            if (!runtime.resolve(tensor_name, expert, logical_nbytes, experts,
+            if (!runtime.source.resolve(runtime.source.userdata, tensor_name, expert, logical_nbytes, experts,
                     &source->fd_direct, &source->offset, &source->nbytes)) { return false; }
             source->data_offset = source->offset % 4096;
             source->payload_nbytes = logical_nbytes;
@@ -226,15 +160,16 @@ struct llama_kimi_cpu_sink_runtime {
     }
 
     void bind_provider(ggml_backend_reg_t registry) {
+        if (!registry) { throw std::runtime_error("CPU sink requires a loaded CPU backend"); }
         if (cpu_api) {
-            GGML_ASSERT(registry == cpu_reg);
+            if (registry != cpu_reg) { throw std::runtime_error("CPU sink backend changed while borrowed"); }
             return;
         }
-        const auto get = reinterpret_cast<ssd::cpu::get_api_v1>(
-            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v1"));
+        const auto get = reinterpret_cast<ssd::cpu::get_api_v2>(
+            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v2"));
         const auto * api = get ? get() : nullptr;
         if (!ssd::cpu::valid(api) || api->source_size() != sizeof(kimi_cpu_sink_source)) {
-            GGML_ABORT("CPU sink executor ABI mismatch; rebuild the CPU backend and model together");
+            throw std::runtime_error("CPU sink executor ABI mismatch; rebuild the CPU backend and model together");
         }
         cpu_api = api;
         cpu_reg = registry;
@@ -246,7 +181,7 @@ struct llama_kimi_cpu_sink_runtime {
         if (cpu_api) { return; }
         const auto registry = ggml_backend_reg_by_name("CPU");
         if (!registry) {
-            GGML_ABORT("CPU sink requires a loaded CPU backend for host memory admission");
+            throw std::runtime_error("CPU sink requires a loaded CPU backend for host memory admission");
         }
         bind_provider(registry);
     }
@@ -266,52 +201,16 @@ struct llama_kimi_cpu_sink_runtime {
         vram_phase_complete = cpu_api->vram_phase_complete;
         cache_get_stats = cpu_api->cache_get_stats;
         prefetch_hint = cpu_api->prefetch_hint;
-#if defined(LLAMA_SSD_STORE)
-        resolve = &ggml_ssd_c0_resolve_raw_direct_shape;
-#else
-        GGML_ABORT("CPU sink requires the shared SSD expert store; build with LLAMA_SSD_STORE=ON");
-#endif
-
-        int threads = 16;
-        if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_THREADS")) {
-            char * end = nullptr;
-            errno = 0;
-            const long parsed = std::strtol(value, &end, 10);
-            if (errno || end == value || *end != '\0' || parsed < 2 || parsed > 256) {
-                GGML_ABORT("GGML_KIMI_CPU_SINK_THREADS must be an integer in [2, 256]");
-            }
-            threads = static_cast<int>(parsed);
-        }
-        int ring_experts = 8;
-        if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_RING_EXPERTS")) {
-            char * end = nullptr;
-            errno = 0;
-            const long parsed = std::strtol(value, &end, 10);
-            if (errno || end == value || *end != '\0' || parsed < 1 || parsed > 32) {
-                GGML_ABORT("GGML_KIMI_CPU_SINK_RING_EXPERTS must be an integer in [1, 32]");
-            }
-            ring_experts = static_cast<int>(parsed);
-        }
+        const int threads = int(*settings.integer("cpu.threads"));
+        constexpr int ring_experts = 8;
         char error[512] = {};
-        if (cache_compute_enabled) {
-            run_cache_compute = cpu_api->run_cache_compute;
-            const auto config = cpu_api->cache_compute_config;
-            if (!run_cache_compute || !config || !config(&cache_compute_config, error, sizeof(error))) {
-                GGML_ABORT("cache-compute configuration failed: %s; no fallback", error);
-            }
-            std::fprintf(stderr, "[kimi_cache_compute_config] version=%u mode=%d bonus_max=%d s_fraction=%.6g min_s=%d max_s=%d deadline_us=%llu protect_mass=%.6g protect_min=%d apply_guard=%d trace=%d\n",
-                cache_compute_config.version, cache_compute_config.mode, cache_compute_config.bonus_max,
-                cache_compute_config.s_fraction, cache_compute_config.min_s, cache_compute_config.max_s,
-                (unsigned long long) cache_compute_config.deadline_us, cache_compute_config.protect_mass,
-                cache_compute_config.protect_min, cache_compute_config.apply_guard, cache_compute_config.trace);
-        }
-        sink = create(threads, ring_experts, resolve_source, this, error, sizeof(error));
+        sink = create(&settings, &services, resolve_source, this, error, sizeof(error));
         if (!sink) {
-            GGML_ABORT("CPU sink initialization failed: %s; no fallback", error);
+            throw std::runtime_error(std::string("CPU sink initialization failed: ") + error + "; no fallback");
         }
         if (!cache_configure(sink, cache_budget, layer_priority.data(),
                 static_cast<int>(layer_priority.size()), cache_max_per_layer, error, sizeof(error))) {
-            GGML_ABORT("CPU sink cache configuration failed: %s; no fallback", error);
+            throw std::runtime_error(std::string("CPU sink cache configuration failed: ") + error + "; no fallback");
         }
         std::fprintf(stderr,
             "[kimi_cpu_sink] enabled threads=%d ring_experts=%d n_tokens=1 expert_h2d_bytes=0"
@@ -349,9 +248,7 @@ struct llama_kimi_cpu_sink_runtime {
 
     void begin(ggml_backend_reg_t registry, uint64_t token, bool decode, llama_seq_id seq = 0) {
         std::lock_guard<std::mutex> lock(mutex);
-        const char * trace = std::getenv("GGML_KIMI_CPU_SINK_TRACE");
-        const char * profile = std::getenv("GGML_KIMI_CPU_SINK_PROFILE");
-        const bool observe = (trace && !std::strcmp(trace, "1")) || (profile && !std::strcmp(profile, "1"));
+        const bool observe = services.debug && (services.debug->trace || services.debug->profile);
         if (!cache_budget && !vram_budget && !observe) { return; }
         if (decode) { initialize(registry); }
         if (!sink || (!decode && prefill_open)) { return; }
@@ -376,8 +273,7 @@ struct llama_kimi_cpu_sink_runtime {
             }
             print_cache_stats(stats.mapped_bytes ? "retain" : "release", false, token);
         } else {
-            const char * trace = std::getenv("GGML_KIMI_CPU_SINK_TRACE");
-            if (trace && trace[0] && trace[0] != '0') { print_cache_stats("token_begin", true, token); }
+            if (services.debug && services.debug->trace) { print_cache_stats("token_begin", true, token); }
         }
     }
 
@@ -396,7 +292,7 @@ struct llama_kimi_cpu_sink_runtime {
 #if defined(__linux__)
         const auto reserve = cpu_api->vram_reserve;
         // the load-time graph's pages, held from here to the first decode token: the load step leaves their room
-        if (prefill_pages && cache_prefill_room) { cache_prefill_room(sink, prefill_pages, 0, 0); }
+        if (prefill_pages && cache_prefill_room) { cache_prefill_room(sink, &settings, &services, prefill_pages, 0, 0); }
         char error[512] = {};
         if (reserve && !reserve(sink, up, gate, down, experts_used, error, sizeof(error))) {
             std::fprintf(stderr, "[kimi_vram_elastic] event=reserve status=fail error=%s\n", error);
@@ -411,7 +307,15 @@ struct llama_kimi_cpu_sink_runtime {
     bool make_room(uint64_t host_bytes, uint64_t device_bytes = 0) {
         std::lock_guard<std::mutex> lock(mutex);
         bind_provider_before_create();
-        return cache_make_room(sink, host_bytes, device_bytes);
+        return cache_make_room(sink, &settings, &services, host_bytes, device_bytes);
+    }
+
+    ssd::result<ssd::host::allocation_ticket> take_room(uint64_t host_bytes,
+            uint64_t device_bytes = 0, uint64_t pages = UINT64_MAX) {
+        std::lock_guard<std::mutex> lock(mutex);
+        bind_provider_before_create();
+        if (pages != UINT64_MAX) { prefill_pages = pages; }
+        return cpu_api->take_room(sink, &settings, &services, host_bytes, device_bytes, pages);
     }
 
     // Room for a prefill graph about to be allocated (kimi_cpu_sink_cache_prefill_room): its compute buffers and the
@@ -420,7 +324,7 @@ struct llama_kimi_cpu_sink_runtime {
         std::lock_guard<std::mutex> lock(mutex);
         prefill_pages = pages;
         bind_provider_before_create();
-        return cache_prefill_room(sink, pages, host_bytes, device_bytes);
+        return cache_prefill_room(sink, &settings, &services, pages, host_bytes, device_bytes);
     }
 
     bool phase_complete(bool decode) {
@@ -445,7 +349,15 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
     GGML_ASSERT(node.runtime);
     auto & runtime = *node.runtime;
     std::lock_guard<std::mutex> lock(runtime.mutex);
-    runtime.initialize(node.cpu_reg);
+    try {
+        runtime.initialize(node.cpu_reg);
+    } catch (const std::exception & error) {
+        // No C++ exception may escape the ggml worker callback. Normal
+        // configured startup initializes this executor before graph execution.
+        GGML_ABORT("CPU sink initialization failed in worker: %s; no fallback", error.what());
+    } catch (...) {
+        GGML_ABORT("CPU sink initialization failed in worker; no fallback");
+    }
     runtime.active_node = &node;
 
     const ggml_tensor * input = dst->src[0];
@@ -528,8 +440,7 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
     runtime.read_errors += stats.read_errors;
     runtime.fallback_count += stats.fallback_count;
     runtime.total_us += stats.total_us;
-    const char * trace = std::getenv("GGML_KIMI_CPU_SINK_TRACE");
-    if (runtime.calls == 1 || (trace && trace[0] && trace[0] != '0')) {
+    if (runtime.calls == 1 || (runtime.services.debug && runtime.services.debug->trace)) {
         if (node.prefill) {
             std::fprintf(stderr,
                 "[kimi_cpu_prefill_layer] layer=%d n_tokens=%d slots=%d unique_experts=%" PRIu64

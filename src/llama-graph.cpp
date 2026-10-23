@@ -2326,9 +2326,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         const bool muse_swiglu = sink_layout && arch == LLM_ARCH_MUSE_SPARK &&
             type_op == LLM_FFN_SILU && !cache_compute && post_exp_norm && gate_exps->type == up_exps->type;
         if (!deepseek41_swiglu_clamp && !muse_swiglu) {
-            GGML_ABORT("CPU sink layer=%d requires contiguous DeepSeek-V4.1 clamped SwiGLU experts in MXFP4/MXFP4/MXFP4 or "
-                "Muse Spark SwiGLU with per-expert post norm, "
-                "without LoRA/bias/scales; no fallback", il);
+            throw std::runtime_error("CPU sink layer=" + std::to_string(il) +
+                " requires contiguous DeepSeek-V4.1 clamped SwiGLU experts in all-MXFP4, or "
+                "Muse Spark SwiGLU with per-expert post norm, without LoRA/bias/scales; no fallback");
         }
 
         auto descriptor = std::make_unique<llama_kimi_cpu_sink_node>();

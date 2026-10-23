@@ -2,17 +2,20 @@
 #pragma once
 
 #include "kimi-cpu-prefill.h"
+#include "runtime.h"
+#include "mac-runtime.h"
+#include "../../ggml-ssd/host/arbiter.h"
 #include <cstddef>
 #include <cstdint>
 
 // A backend owns this immutable table and every callback it contains. Consumers
 // borrow it only while that backend stays loaded, just as for its other procs.
 namespace ssd { namespace cpu {
-struct api_v1 {
+struct api_v2 {
     uint32_t version;
     size_t size;
     decltype(&kimi_cpu_sink_source_size) source_size;
-    decltype(&kimi_cpu_sink_create) create;
+    decltype(&create_configured) create;
     decltype(&kimi_cpu_sink_run) run;
     decltype(&kimi_cpu_sink_run_activation) run_activation;
     decltype(&kimi_cpu_sink_destroy) destroy;
@@ -20,22 +23,27 @@ struct api_v1 {
     decltype(&kimi_cpu_sink_cache_begin) cache_begin;
     decltype(&kimi_cpu_sink_vram_phase_complete) vram_phase_complete;
     decltype(&kimi_cpu_sink_cache_get_stats) cache_get_stats;
-    decltype(&kimi_cpu_sink_cache_make_room) cache_make_room;
-    decltype(&kimi_cpu_sink_cache_prefill_room) cache_prefill_room;
+    decltype(&cache_make_room_configured) cache_make_room;
+    decltype(&cache_prefill_room_configured) cache_prefill_room;
     decltype(&kimi_cpu_sink_prefetch_hint) prefetch_hint;
     decltype(&kimi_cpu_sink_vram_reserve) vram_reserve;
-    decltype(&kimi_cpu_sink_run_cache_compute) run_cache_compute;
-    decltype(&kimi_cache_compute_config_from_env) cache_compute_config;
     decltype(&kimi_cpu_prefill_create) prefill_create;
     decltype(&kimi_cpu_prefill_run) prefill_run;
     decltype(&kimi_cpu_prefill_run_activation) prefill_run_activation;
     decltype(&kimi_cpu_prefill_destroy) prefill_destroy;
+    decltype(&ssd::mac::create_configured) mac_create;
+    decltype(&ssd::mac::destroy) mac_destroy;
+    ssd::mac::set_backend_cache mac_attach;
+    ssd::result<ssd::host::allocation_ticket> (*take_room)(
+        kimi_cpu_sink *, const ssd::settings::snapshot *, const ssd::runtime_services *,
+        uint64_t, uint64_t, uint64_t) noexcept;
+    bool (*attach_services)(ggml_backend_t, const ssd::runtime_services *) noexcept;
 };
-using get_api_v1 = const api_v1 * (*)();
+using get_api_v2 = const api_v2 * (*)();
 
 // Check the prefix before accessing members from a possibly different build.
-inline bool valid(const api_v1 * api) noexcept {
-    return api && api->version == 1 && api->size == sizeof(api_v1) &&
+inline bool valid(const api_v2 * api) noexcept {
+    return api && api->version == 2 && api->size == sizeof(api_v2) &&
         api->source_size &&
         api->create &&
         api->run &&
@@ -49,11 +57,10 @@ inline bool valid(const api_v1 * api) noexcept {
         api->cache_prefill_room &&
         api->prefetch_hint &&
         api->vram_reserve &&
-        api->run_cache_compute &&
-        api->cache_compute_config &&
         api->prefill_create &&
         api->prefill_run &&
         api->prefill_run_activation &&
-        api->prefill_destroy;
+        api->prefill_destroy && api->mac_create && api->mac_destroy && api->mac_attach &&
+        api->take_room && api->attach_services;
 }
 } } // namespace ssd::cpu

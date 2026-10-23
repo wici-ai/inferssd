@@ -30,11 +30,14 @@ static std::set<const ggml_tensor *> graph_dependencies(ggml_cgraph * graph) {
     return visited;
 }
 
-static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decode, const char * label) {
+static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decode, const char * label, ggml_type weight_type = GGML_TYPE_MXFP4) {
     constexpr int latent = 256, hidden = 512, experts = 20, slots = 8;
     // Metadata-only runtimes: no pool, ring, resolver or cache is initialized.
-    llama_kimi_cpu_sink_runtime runtime(1, 1, experts, {0});
-    llama_kimi_cpu_sink_runtime other_runtime(1, 2, experts, {0});
+    const auto configured = ssd::settings::parse("", "");
+    require(bool(configured), "metadata fixture settings rejected");
+    const ssd::runtime_services services;
+    llama_kimi_cpu_sink_runtime runtime(1, 1, experts, {0}, configured.value, services, {});
+    llama_kimi_cpu_sink_runtime other_runtime(1, 2, experts, {0}, configured.value, services, {});
     llm_graph_result result(2048);
     ggml_backend_t backends[] = { cpu };
     ggml_backend_buffer_type_t buffer_types[] = { ggml_backend_cpu_buffer_type() };
@@ -91,9 +94,9 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
     ggml_context * ctx = result.get_ctx();
     ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, latent, ntokens);
     ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, experts, ntokens);
-    ggml_tensor * up = ggml_new_tensor_3d(ctx, GGML_TYPE_MXFP4, latent, hidden, experts);
-    ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_MXFP4, latent, hidden, experts);
-    ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_MXFP4, hidden, latent, experts);
+    ggml_tensor * up = ggml_new_tensor_3d(ctx, weight_type, latent, hidden, experts);
+    ggml_tensor * gate = ggml_new_tensor_3d(ctx, weight_type, latent, hidden, experts);
+    ggml_tensor * down = ggml_new_tensor_3d(ctx, weight_type, hidden, latent, experts);
     ggml_set_name(up, "blk.0.ffn_up_exps.weight");
     ggml_set_name(gate, "blk.0.ffn_gate_exps.weight");
     ggml_set_name(down, "blk.0.ffn_down_exps.weight");
@@ -160,6 +163,13 @@ int main() {
         graph_case(cpu.get(), 1, false, true, "decode_one");
         graph_case(cpu.get(), 2, false, false, "disabled_two");
         graph_case(cpu.get(), 2, false, true, "decode_two_legacy");
+        bool refused = false;
+        try {
+            graph_case(cpu.get(), 1, false, true, "unsupported_f16", GGML_TYPE_F16);
+        } catch (const std::runtime_error & error) {
+            refused = std::string(error.what()).find("all-MXFP4") != std::string::npos;
+        }
+        require(refused, "unsupported expert layout did not refuse with a recoverable graph error");
         std::printf("CPU_PREFILL_GRAPH_OK execution=not_run kda_validation=not_run\n");
         return 0;
     } catch (const std::exception & e) {

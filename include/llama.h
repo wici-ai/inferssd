@@ -385,6 +385,9 @@ extern "C" {
 
         // A source/target context whose model tensors or runtime outputs may be shared.
         struct llama_context * ctx_other;
+
+        // Optional immutable SSD extension; copied during context creation.
+        const struct llama_ssd_options * ssd_options;
     };
 
     struct llama_model_tensor_override {

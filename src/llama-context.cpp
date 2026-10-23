@@ -826,6 +826,7 @@ llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
+    ssd_runtime(params.ssd_options ? std::make_unique<llama_ssd_context>(*params.ssd_options) : nullptr),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -969,66 +970,24 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
-    const char * dense_gpu_env = std::getenv("GGML_KIMI_DENSE_PREFETCH_LAYERS");
-    dense_gpu_phase_gate_enabled =
-        dense_gpu_env && dense_gpu_env[0] && std::strcmp(dense_gpu_env, "0") != 0;
-
-    const char * cpu_sink_env = std::getenv("GGML_KIMI_CPU_SINK");
-    cpu_sink_enabled = cpu_sink_env && cpu_sink_env[0] && std::strcmp(cpu_sink_env, "0") != 0;
-    // The prefill route is decided per ubatch (cpu_sink_prefill_route): the CPU sink's grouped prefill up to a number
-    // of tokens, the ggml graph on the GPU above it.  GGML_KIMI_CPU_PREFILL_MAX_TOKENS is that number;
-    // GGML_KIMI_CPU_PREFILL=1 and 0 spell "every ubatch" and "none".  The threshold is one input: one of the two.
-    const char * cpu_prefill_env = std::getenv("GGML_KIMI_CPU_PREFILL");
-    if (cpu_prefill_env && cpu_prefill_env[0] &&
-            std::strcmp(cpu_prefill_env, "0") != 0 && std::strcmp(cpu_prefill_env, "1") != 0) {
-        throw std::runtime_error("GGML_KIMI_CPU_PREFILL must be 0 or 1");
-    }
-    cpu_prefill_max_tokens = cpu_prefill_env && std::strcmp(cpu_prefill_env, "1") == 0 ?
-        std::numeric_limits<uint32_t>::max() : 0;
-    if (const char * value = std::getenv("GGML_KIMI_CPU_PREFILL_MAX_TOKENS"); value && value[0]) {
-        if (cpu_prefill_env && cpu_prefill_env[0]) {
-            throw std::runtime_error("GGML_KIMI_CPU_PREFILL and GGML_KIMI_CPU_PREFILL_MAX_TOKENS are both set: the "
-                "prefill threshold is one input");
-        }
-        char * end = nullptr;
-        errno = 0;
-        const unsigned long long parsed = std::strtoull(value, &end, 10);
-        if (errno != 0 || !std::isdigit((unsigned char) value[0]) || *end != '\0' ||
-                parsed > std::numeric_limits<uint32_t>::max()) {
-            throw std::runtime_error("GGML_KIMI_CPU_PREFILL_MAX_TOKENS must be a number of tokens");
-        }
-        cpu_prefill_max_tokens = uint32_t(parsed);
-    }
-    cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
-    if (cpu_prefill_max_tokens > 0) {
-        if (!cpu_sink_enabled) {
-            throw std::runtime_error("GGML_KIMI_CPU_PREFILL=1 or GGML_KIMI_CPU_PREFILL_MAX_TOKENS > 0 requires GGML_KIMI_CPU_SINK=1");
-        }
-        if (model.arch != LLM_ARCH_DEEPSEEK41 && model.arch != LLM_ARCH_MUSE_SPARK) {
-            throw std::runtime_error("GGML_KIMI_CPU_PREFILL supports only DeepSeek-V4.1 or Muse Spark models; set GGML_KIMI_CPU_PREFILL=0");
-        }
-    }
+#if defined(__linux__)
+    cpu_sink_enabled = ssd_runtime && !ssd_runtime->settings.sources()->empty();
+#else
+    cpu_sink_enabled = false;
+#endif
+    dense_gpu_phase_gate_enabled = cpu_sink_enabled;
     if (cpu_sink_enabled) {
-        // with the sink on, any prefill ubatch may take its grouped prefill, whatever the threshold: one the GPU does
-        // not offload, or a whole request whose graph does not fit
+        if (model.arch != LLM_ARCH_DEEPSEEK41 && model.arch != LLM_ARCH_MUSE_SPARK) {
+            throw std::runtime_error("SSD CPU experts require DeepSeek-V4.1 or Muse Spark");
+        }
+        if (cparams.n_seq_max != 1) {
+            throw std::runtime_error("SSD CPU experts require --parallel 1 (-np 1)");
+        }
         if (cparams.n_ubatch > uint32_t(std::numeric_limits<int>::max() / 16)) {
             throw std::runtime_error("grouped CPU prefill ubatch exceeds route index range");
         }
-        LLAMA_LOG_INFO("%s: grouped CPU prefill configured; ubatch=%u\n",
-            __func__, cparams.n_ubatch);
-    }
-    if (cpu_sink_enabled) {
-        if (model.arch != LLM_ARCH_DEEPSEEK41 && model.arch != LLM_ARCH_MUSE_SPARK) {
-            throw std::runtime_error("GGML_KIMI_CPU_SINK requires a DeepSeek-V4.1 or Muse Spark model");
-        }
-        if (cparams.n_seq_max != 1) {
-            throw std::runtime_error("GGML_KIMI_CPU_SINK requires --parallel 1 (-np 1): request phase is context-wide");
-        }
-#if !defined(__linux__)
-        throw std::runtime_error("GGML_KIMI_CPU_SINK requires Linux io_uring and O_DIRECT");
-#endif
-        // Layers with routed experts, in model order: the default cache priority
-        // outside the K3 layout. The routed expert count bounds cache quotas.
+        cpu_prefill_max_tokens = uint32_t(*ssd_runtime->settings.integer("prefill.cpu_max_tokens"));
+        cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
         std::vector<int32_t> routed_layers;
         for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
             const auto & layer = model.layers[il];
@@ -1038,79 +997,26 @@ llama_context::llama_context(
         }
         cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer,
             kimi_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
-            int64_t(model.hparams.n_expert), routed_layers);
-        LLAMA_LOG_INFO("%s: CPU sink configured; single-token decode%s uses CPU experts\n",
-            __func__, cpu_prefill_max_tokens > 0 ? " and grouped prefill" : "");
-        if (cpu_prefill_max_tokens == std::numeric_limits<uint32_t>::max()) {
-            LLAMA_LOG_INFO("%s: prefill route: every ubatch on the CPU sink\n", __func__);
-        } else {
-            LLAMA_LOG_INFO("%s: prefill route: ubatches of up to %u tokens, and those the GPU does not offload, on "
-                "the CPU sink; larger ones on the ggml graph\n", __func__, cpu_prefill_max_tokens);
-        }
-        // the sink's next-layer prefetch resolves experts of a layer other than the active one
-        if (const char * prefetch = std::getenv("GGML_KIMI_CPU_SINK_PREFETCH"); prefetch && std::atoi(prefetch) > 0) {
+            int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
+        if (*ssd_runtime->settings.integer("prefetch.depth") > 0) {
             for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
                 const auto & layer = model.layers[il];
-                for (const ggml_tensor * experts : { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps }) {
+                for (const ggml_tensor * experts : {layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
                     if (experts) {
-                        cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = { experts->nb[2], experts->ne[2] };
+                        cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = {experts->nb[2], experts->ne[2]};
                     }
                 }
             }
         }
     }
-
-    const char * reserve_horizon_env = std::getenv("LLAMA_RESERVE_HORIZON");
-    if (reserve_horizon_env && reserve_horizon_env[0] &&
-            std::strcmp(reserve_horizon_env, "0") != 0 && std::strcmp(reserve_horizon_env, "1") != 0) {
-        throw std::runtime_error("LLAMA_RESERVE_HORIZON must be 0 or 1");
-    }
-    reserve_horizon_enabled = !(reserve_horizon_env && std::strcmp(reserve_horizon_env, "0") == 0);
-
-    const char * actual_shape_env = std::getenv("GGML_KIMI_CPU_PREFILL_ACTUAL_SHAPE");
-    if (actual_shape_env && actual_shape_env[0] &&
-            std::strcmp(actual_shape_env, "0") != 0 && std::strcmp(actual_shape_env, "1") != 0) {
-        throw std::runtime_error("GGML_KIMI_CPU_PREFILL_ACTUAL_SHAPE must be 0 or 1");
-    }
-    // Graphs sized to the request on either route: each request reserves its prefill graph at its own size (the
-    // route of each pass follows from that size) and leaves only the one-token graph to decode.
-    cpu_prefill_actual_shape_enabled = actual_shape_env && std::strcmp(actual_shape_env, "1") == 0;
-    if (cpu_prefill_actual_shape_enabled) {
-        if (!cpu_sink_enabled) {
-            throw std::runtime_error("GGML_KIMI_CPU_PREFILL_ACTUAL_SHAPE requires GGML_KIMI_CPU_SINK=1 for phase transitions");
-        }
-        cpu_prefill_configured_ubatch = cparams.n_ubatch;
-        if (const char * value = std::getenv("GGML_KIMI_CPU_PREFILL_GRAPH_GRANULARITY")) {
-            char * end = nullptr;
-            errno = 0;
-            const unsigned long parsed = std::strtoul(value, &end, 10);
-            if (errno != 0 || end == value || *end != '\0' || parsed == 0 || parsed > 2048) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_GRAPH_GRANULARITY must be in 1..2048");
-            }
-            cpu_prefill_graph_granularity = uint32_t(parsed);
-        }
-        // Keep the configured ubatch through context construction: the
-        // DeepSeek recurrent-memory backend uses it to establish the maximum
-        // physical batch capacity.  The first request replaces the initial
-        // scheduler with its actual prefill shape, and the prefill->decode
-        // transition then leaves only the one-token scheduler resident.
-        LLAMA_LOG_INFO(
-            "%s: actual-shape grouped prefill enabled; configured_max=%u granularity=%u "
-            "resident_decode_ubatch=1 after_first_prefill\n",
-            __func__, cpu_prefill_configured_ubatch, cpu_prefill_graph_granularity);
-    }
-
-    const char * reserve_outputs_env = std::getenv("LLAMA_PREFILL_GRAPH_OUTPUTS");
-    if (reserve_outputs_env && reserve_outputs_env[0] &&
-            std::strcmp(reserve_outputs_env, "0") != 0 && std::strcmp(reserve_outputs_env, "1") != 0) {
-        throw std::runtime_error("LLAMA_PREFILL_GRAPH_OUTPUTS must be 0 or 1");
-    }
-    cpu_prefill_output_sizing_enabled = (model.arch == LLM_ARCH_DEEPSEEK41 || model.arch == LLM_ARCH_MUSE_SPARK) &&
-        !(reserve_outputs_env && std::strcmp(reserve_outputs_env, "0") == 0);
-    if (cpu_prefill_output_sizing_enabled) {
-        sched_reserve_n_outputs = cparams.n_seq_max;
-        LLAMA_LOG_INFO("%s: prefill output reserve follows actual outputs\n", __func__);
-    }
+    // The retained resource profile sizes each request's prompt graph, then
+    // keeps a one-token decode graph. The configured ubatch remains available
+    // to the recurrent backend and to the next prompt.
+    reserve_horizon_enabled = true;
+    cpu_prefill_actual_shape_enabled = cpu_sink_enabled;
+    if (cpu_prefill_actual_shape_enabled) { cpu_prefill_configured_ubatch = cparams.n_ubatch; }
+    cpu_prefill_output_sizing_enabled = model.arch == LLM_ARCH_DEEPSEEK41 || model.arch == LLM_ARCH_MUSE_SPARK;
+    if (cpu_prefill_output_sizing_enabled) { sched_reserve_n_outputs = cparams.n_seq_max; }
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
@@ -1195,6 +1101,33 @@ llama_context::llama_context(
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
+
+        if (ssd_runtime) {
+            auto * registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+            const auto get_api = reinterpret_cast<ssd::cpu::get_api_v2>(
+                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v2"));
+            const auto * api = get_api ? get_api() : nullptr;
+            if (!ssd::cpu::valid(api) || api->source_size() != sizeof(kimi_cpu_sink_source)) {
+                throw std::runtime_error("CPU backend has no compatible SSD executor table");
+            }
+            if (cpu_sink_runtime && !api->cache_make_room(nullptr, &ssd_runtime->settings, &ssd_runtime->services, 0, 0)) {
+                throw std::runtime_error("cannot configure the context host budget");
+            }
+            if (!api->attach_services(backend_cpu, &ssd_runtime->services)) {
+                throw std::runtime_error("cannot attach context-owned CPU runtime services");
+            }
+#if defined(__APPLE__)
+            if (!ssd_runtime->settings.sources()->empty()) {
+            char error[512] {};
+            ssd_runtime->mac_cache = api->mac_create(&ssd_runtime->settings, &ssd_runtime->services, error, sizeof(error));
+            ssd_runtime->destroy_mac = api->mac_destroy;
+            if (!ssd_runtime->mac_cache) { throw std::runtime_error(error[0] ? error : "cannot create Mac expert cache"); }
+            if (!api->mac_attach(backend_cpu, ssd_runtime->mac_cache)) {
+                throw std::runtime_error("cannot attach context-owned Mac expert cache");
+            }
+            }
+#endif
+        }
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
@@ -1414,11 +1347,10 @@ void llama_context::dense_graph_cache_end_phase() {
 }
 
 static uint32_t kimi_cpu_sink_reserve_tokens(const llama_cparams & params, bool decode) {
-    const char * value = std::getenv("GGML_KIMI_CPU_SINK_DECODE_RESERVE");
     // CPU sink only executes one token at a time. Reserving the ubatch-sized
     // fallback graph during decode needlessly allocates GPU expert workspace.
     // Keep the configured ubatch intact so the next prefill is unchanged.
-    if (decode && params.n_seq_max == 1 && value && std::strcmp(value, "1") == 0) {
+    if (decode && params.n_seq_max == 1) {
         return 1;
     }
     return std::min(params.n_ctx, params.n_ubatch);
@@ -1645,37 +1577,6 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
-    // Host compute buffers (pinned graph inputs, e.g. the attention masks of a long context) come out of
-    // the same host memory as the expert caches; measure them first and let the host-memory ledger make room
-    // instead of the cgroup or the kernel killing the process. The device buffers are allocated first: on a
-    // unified-memory GPU they come out of the same DRAM, so the ledger counts them there too, and neither
-    // allocation can take the room made for the other. A prefill's graph also gathers rows of weights the file
-    // mapping backs (token embeddings, Engram tables): their pages come into the page cache while it runs, and the
-    // ledger holds room for them from here to the first decode token, so that the expert caches give back what the
-    // prefill needs at once, before it allocates anything.
-    if (cpu_sink_runtime && (cpu_sink_runtime->cache_budget || cpu_sink_runtime->vram_budget) && !model.hparams.no_alloc) {
-        std::vector<size_t> sizes(backend_ptrs.size(), 0);
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), true, sizes.data());
-        size_t host_bytes = 0, device_bytes = 0;
-        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            (ggml_backend_buft_is_host(backend_buft[i]) ? host_bytes : device_bytes) += sizes[i];
-        }
-        const bool prefill = n_tokens > n_seqs && !(cpu_sink_enabled && cpu_sink_decode_active);
-        if (prefill) {
-            const uint64_t pages = gf ? llama_host_gather_bytes(gf, llama_host_page_size(),
-                [&](const ggml_tensor * t) { return model.file_mapped(t); }) : 0;
-            LLAMA_LOG_INFO("[prefill_room] n_tokens=%u gather_bytes=%" PRIu64 " host_bytes=%zu device_bytes=%zu\n",
-                n_tokens, pages, host_bytes, device_bytes);
-            if (!cpu_sink_runtime->prefill_room(pages, host_bytes, device_bytes)) {
-                LLAMA_LOG_WARN("%s: the host-memory ledger found no room for a prefill: %.2f MiB of gathered pages, %.2f MiB of host and %.2f MiB of device compute buffers\n",
-                    __func__, pages/1024.0/1024.0, host_bytes/1024.0/1024.0, device_bytes/1024.0/1024.0);
-            }
-        } else if (host_bytes + device_bytes > 0 && !cpu_sink_runtime->make_room(host_bytes, device_bytes)) {
-            LLAMA_LOG_WARN("%s: the host-memory ledger found no room for %.2f MiB of host and %.2f MiB of device compute buffers\n",
-                __func__, host_bytes/1024.0/1024.0, device_bytes/1024.0/1024.0);
-        }
-    }
-
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -1820,6 +1721,17 @@ void llama_context::synchronize() {
 
 bool llama_context::host_reserve(size_t bytes) {
     return !cpu_sink_runtime || cpu_sink_runtime->make_room(bytes);
+}
+
+ssd::result<ssd::host::allocation_ticket> llama_context::host_take(size_t bytes) {
+    if (!cpu_sink_runtime) { return {}; }
+    return cpu_sink_runtime->take_room(bytes);
+}
+
+void llama_context::host_note_memory_change() noexcept {
+    if (ssd_runtime && ssd_runtime->host) {
+        (void) ssd_runtime->host->note_known_memory_change();
+    }
 }
 
 bool llama_context::moe_prefill_phase_workspace(bool active) {
@@ -2662,8 +2574,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        // The managed scheduler cannot grow implicitly. Reserve the real graph
+        // under the same admission path used for worst-case load-time graphs.
+        if ((cpu_sink_runtime && !reserve_compute_graph(gf, ubatch.n_tokens > ubatch.n_seqs && !cpu_sink_decode_active)) ||
+                !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            // A refused graph is still parameterized but has no valid storage.
+            // Drain before dropping metadata and prevent same-shape reuse on a
+            // later request after resource pressure has been relieved.
+            ggml_backend_sched_synchronize(sched.get());
+            ggml_backend_sched_reset(sched.get());
+            res->reset();
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
@@ -2792,7 +2713,13 @@ int llama_context::encode(const llama_batch & batch_inp) {
     cparams.causal_attn = false;
 
     ggml_status status;
-    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    const llm_graph_result * res = nullptr;
+    try {
+        res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    } catch (...) {
+        cparams.causal_attn = causal_attn_org;
+        throw;
+    }
 
     cparams.causal_attn = causal_attn_org;
 
@@ -3262,8 +3189,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        ggml_status status;
-        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        ggml_status status = GGML_STATUS_FAILED;
+        const llm_graph_result * res = nullptr;
+        try {
+            res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        } catch (const std::exception & error) {
+            LLAMA_LOG_ERROR("%s: ubatch graph/runtime error: %s\n", __func__, error.what());
+            status = GGML_STATUS_FAILED;
+            discard_failed_graph();
+        } catch (...) {
+            LLAMA_LOG_ERROR("%s: unknown ubatch graph/runtime error\n", __func__);
+            status = GGML_STATUS_FAILED;
+            discard_failed_graph();
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -3541,6 +3479,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             LLAMA_LOG_DEBUG("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
             synchronize();
+            host_note_memory_change();
 
             // TODO: not needed?
             buf_output = nullptr;
@@ -3559,12 +3498,18 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
         }
+        auto admitted = host_take(new_size);
+        if (!admitted) {
+            LLAMA_LOG_ERROR("%s: output buffer host budget refused: %s\n", __func__, admitted.error.c_str());
+            return 0;
+        }
         buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
         if (buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             return 0;
         }
         ggml_backend_buffer_clear(buf_output.get(), 0);
+        admitted.value.commit();
     }
 
     float * output_base = (float *) ggml_backend_buffer_get_base(buf_output.get());
@@ -3748,6 +3693,43 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
+bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill) {
+    if (!cpu_sink_runtime) { return ggml_backend_sched_reserve(sched.get(), graph); }
+    ggml_backend_sched_set_auto_reserve(sched.get(), false);
+    ggml_backend_sched_set_host_prefault(sched.get(), llama_host_page_size());
+    // The existing size probe may release an undersized buffer. Invalidate
+    // learning before that known free, including another context's interval.
+    for (auto * backend : backend_ptrs) {
+        if (ggml_backend_sched_get_buffer_size(sched.get(), backend)) {
+            host_note_memory_change();
+            break;
+        }
+    }
+    std::vector<size_t> required(backend_ptrs.size(), 0);
+    ggml_backend_sched_reserve_size(sched.get(), graph, required.data());
+    uint64_t host_bytes = 0, device_bytes = 0;
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        // Query AFTER the probe: it can have released chunks even when the
+        // replacement's total bytes fit inside the previous aggregate size.
+        if (required[i] > ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i])) {
+            auto & bytes = ggml_backend_buft_is_host(backend_buft[i]) ? host_bytes : device_bytes;
+            if (required[i] > UINT64_MAX - bytes) { return false; }
+            bytes += required[i];
+        }
+    }
+    const uint64_t pages = prefill ? llama_host_gather_bytes(graph, llama_host_page_size(),
+        [&](const ggml_tensor * tensor) { return model.file_mapped(tensor); }) : UINT64_MAX;
+    auto admitted = cpu_sink_runtime->take_room(host_bytes, device_bytes, pages);
+    if (!admitted) {
+        LLAMA_LOG_ERROR("%s: host budget refused: %s\n", __func__, admitted.error.c_str());
+        return false;
+    }
+    if (!ggml_backend_sched_reserve(sched.get(), graph)) { return false; }
+    // New host COMPUTE chunks have already been touched by the allocator.
+    admitted.value.commit();
+    return true;
+}
+
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -3772,7 +3754,11 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
-    const auto save_n_outputs = this->n_outputs;
+    struct restore_outputs {
+        uint32_t & target;
+        const uint32_t previous;
+        ~restore_outputs() { target = previous; }
+    } restore { this->n_outputs, this->n_outputs };
 
     this->n_outputs = n_outputs;
 
@@ -3796,16 +3782,16 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * gf = model.build_graph(gparams);
 
-    this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
     if (split_only) {
         if (sizes) {
+            if (cpu_sink_runtime) { host_note_memory_change(); }
             ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+    } else if (!reserve_compute_graph(gf, n_tokens > n_seqs && !cpu_sink_decode_active)) {
         GGML_ASSERT(!sizes);
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
@@ -4925,6 +4911,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.ssd_options                 =*/ nullptr,
     };
 
     return result;
@@ -4935,6 +4922,12 @@ llama_context * llama_init_from_model(
         llama_context_params   params) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
+        return nullptr;
+    }
+
+    char ssd_environment_error[1024] = {};
+    if (!llama_ssd_check_environment(ssd_environment_error, sizeof(ssd_environment_error))) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, ssd_environment_error);
         return nullptr;
     }
 
@@ -5481,6 +5474,38 @@ bool llama_host_reserve(llama_context * ctx, size_t bytes) {
     return ctx->host_reserve(bytes);
 }
 
+llama_ssd_host_reservation * llama_ssd_host_reserve(
+        llama_context * ctx, size_t bytes, char * error, size_t size) {
+    if (error && size) { error[0] = '\0'; }
+    try {
+        if (!ctx) { throw std::invalid_argument("host reservation requires a context"); }
+        auto reservation = std::make_unique<llama_ssd_host_reservation>();
+        auto granted = ctx->host_take(bytes);
+        if (!granted) {
+            if (error && size) { std::snprintf(error, size, "%s", granted.error.c_str()); }
+            return nullptr;
+        }
+        reservation->ticket = std::move(granted.value);
+        return reservation.release();
+    } catch (const std::exception & exception) {
+        if (error && size) { std::snprintf(error, size, "%s", exception.what()); }
+    } catch (...) {
+        if (error && size) { std::snprintf(error, size, "host reservation failed"); }
+    }
+    return nullptr;
+}
+
+void llama_ssd_host_reservation_finish(llama_ssd_host_reservation * reservation, bool materialized) {
+    if (!reservation) { return; }
+    if (materialized) { reservation->ticket.commit(); }
+    else { reservation->ticket.cancel(); }
+    delete reservation;
+}
+
+void llama_ssd_host_note_memory_change(llama_context * ctx) {
+    if (ctx) { ctx->host_note_memory_change(); }
+}
+
 size_t llama_state_seq_get_size_at(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t n_tokens) {
     return ctx->state_seq_get_size_at(seq_id, flags, n_tokens);
 }
@@ -5527,10 +5552,29 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
 
 ///
 
+void llama_context::discard_failed_graph() noexcept {
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+        ggml_backend_sched_reset(sched.get());
+    }
+    if (gf_res_prev) { gf_res_prev->reset(); }
+    if (gf_res_reserve) { gf_res_reserve->reset(); }
+    sched_need_reserve = true;
+}
+
 int32_t llama_encode(
         llama_context * ctx,
           llama_batch   batch) {
-    const int ret = ctx->encode(batch);
+    int ret = -3;
+    try {
+        ret = ctx->encode(batch);
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: graph/runtime error: %s\n", __func__, error.what());
+        ctx->discard_failed_graph();
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown graph/runtime error\n", __func__);
+        ctx->discard_failed_graph();
+    }
     if (ret != 0) {
         LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
     }
@@ -5541,7 +5585,16 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
-    const int ret = ctx->decode(batch);
+    int ret = -3;
+    try {
+        ret = ctx->decode(batch);
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: graph/runtime error: %s\n", __func__, error.what());
+        ctx->discard_failed_graph();
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown graph/runtime error\n", __func__);
+        ctx->discard_failed_graph();
+    }
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

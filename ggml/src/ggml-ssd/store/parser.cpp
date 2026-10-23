@@ -16,6 +16,21 @@ namespace {
 struct close_file {
     void operator()(FILE * file) const { std::fclose(file); }
 };
+// Opening a FIFO must not block startup. Validate the opened handle rather
+// than a path stat, so path replacement cannot bypass the regular-file check.
+FILE * open_regular_file(const char * path) noexcept {
+#if !defined(_WIN32)
+    const int fd = ::open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) { return nullptr; }
+    struct stat info {};
+    if (fstat(fd, &info) || !S_ISREG(info.st_mode)) { ::close(fd); return nullptr; }
+    FILE * file = fdopen(fd, "rb");
+    if (!file) { ::close(fd); }
+    return file;
+#else
+    return std::fopen(path, "rb");
+#endif
+}
 // A source is borrowed by the catalog only after vector insertion succeeds.
 struct pending_source_handles {
     expert_pack_source & source;
@@ -32,21 +47,17 @@ struct pending_source_handles {
 
 class source_parser {
 public:
-    explicit source_parser(parser_state & state, source_open_hooks hooks = {}) : g_expert_pack(state), hooks(hooks) {}
+    explicit source_parser(parser_state & state, source_open_hooks hooks = {}, bool require_direct = false)
+        : g_expert_pack(state), hooks(hooks), force_direct(require_direct) {}
     parser_state & g_expert_pack;
     source_open_hooks hooks;
+    const bool force_direct;
 static int expert_pack_entry_cmp(const expert_pack_entry &e, const char *tensor_name, int expert_idx, size_t nbytes) {
     const int name_cmp = std::strcmp(e.tensor, tensor_name);
     if (name_cmp != 0) return name_cmp;
     if (e.expert_idx != expert_idx) return e.expert_idx < expert_idx ? -1 : 1;
     if (e.nbytes != nbytes) return e.nbytes < nbytes ? -1 : 1;
     return 0;
-}
-
-bool expert_pack_env_bool(const char *name, bool default_value) {
-    const char *env = std::getenv(name);
-    if (!env || !env[0]) return default_value;
-    return env[0] != '0';
 }
 
 bool expert_pack_read_exact(FILE *file, void *dst, size_t sz) {
@@ -76,8 +87,9 @@ bool expert_pack_open_data_source(
         bool page_cache_source = false,
         bool direct_required = false) {
     if (!path || !path[0]) return false;
+    direct_required = direct_required || force_direct;
 
-    FILE *file = std::fopen(path, "rb");
+    FILE *file = open_regular_file(path);
     if (!file) {
         std::fprintf(stderr, "[moe_stream_batch] %s: open failed: %s\n", label, path);
         return false;
@@ -99,7 +111,7 @@ bool expert_pack_open_data_source(
     source.fd_direct = -1;
     if (!page_cache_source && (g_expert_pack.io_backend == 1 || g_expert_pack.io_backend == 2)) {
 #if defined(O_DIRECT)
-        source.fd_direct = ::open(path, O_RDONLY | O_DIRECT);
+        source.fd_direct = ::open(path, O_RDONLY | O_DIRECT | O_NONBLOCK | O_CLOEXEC);
 #endif
         if (source.fd_direct < 0) {
             if (direct_required) {
@@ -112,9 +124,8 @@ bool expert_pack_open_data_source(
             if (hooks.report_iouring_enabled) {
                 hooks.report_iouring_enabled(label, path);
             } else {
-                const bool require_direct = expert_pack_env_bool("GGML_MOE_IO_REQUIRE_DIRECT", false);
                 std::fprintf(stderr, "[moe_stream_batch] %s: io_uring requested but liburing headers are unavailable; %s\n",
-                             label, require_direct ? "using direct fallback anyway" : "using direct fallback");
+                             label, direct_required ? "using direct fallback anyway" : "using direct fallback");
                 g_expert_pack.io_backend = 1;
             }
         } else if (g_expert_pack.io_backend == 1) {
@@ -144,7 +155,7 @@ bool expert_pack_open_data_source(
 bool expert_pack_load_source(const char *path, int32_t source_idx, std::vector<expert_pack_entry> &entries, bool page_cache_source = false) {
     if (!path || !path[0]) return false;
 
-    FILE *probe = std::fopen(path, "rb");
+    FILE *probe = open_regular_file(path);
     if (!probe) {
         std::fprintf(stderr, "[moe_stream_batch] expert pack: open failed: %s\n", path);
         return false;
@@ -232,7 +243,7 @@ int expert_pack_tsv_column(const std::vector<char *> &header, const char *name) 
 bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_entry> &entries,
                                             std::unordered_map<std::string, int32_t> &alias_sources) {
     if (!path || !path[0]) return true;
-    FILE *file = std::fopen(path, "r");
+    FILE *file = open_regular_file(path);
     if (!file) {
         std::fprintf(stderr, "[moe_stream_batch] GGUF alias: open failed: %s\n", path);
         return false;
@@ -306,7 +317,7 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
         } else {
             source_idx = (int32_t)g_expert_pack.sources.size();
             if (!expert_pack_open_data_source(source_path, "GGUF alias", false,
-                    expert_pack_env_bool("GGML_MOE_IO_REQUIRE_DIRECT", false))) {
+                    force_direct)) {
                 return false;
             }
             alias_sources[source_path] = source_idx;
@@ -359,7 +370,7 @@ bool open_data_source(parser_state & state, const char * path, const char * labe
 
 bool append_sources(parser_state & state, const description & desc,
         std::vector<expert_pack_entry> & entries, source_open_hooks hooks) {
-    source_parser parser(state, hooks);
+    source_parser parser(state, hooks, desc.require_direct);
     for (const auto & path : desc.packs) {
         if (!parser.expert_pack_load_source(path.c_str(), int32_t(state.sources.size()), entries, false)) { return false; }
     }
@@ -430,6 +441,7 @@ description source_description_from_env() {
     if (page && page[0]) { desc.page_cache_packs.emplace_back(page); }
     expert_pack_append_env_list(desc.page_cache_packs, "GGML_MOE_PAGECACHE_PACK_LIST");
     expert_pack_append_env_list(desc.aliases, "GGML_MOE_EXPERT_GGUF_ALIAS_TSV");
+    desc.require_direct = [] { const char * value = std::getenv("GGML_MOE_IO_REQUIRE_DIRECT"); return value && value[0] && value[0] != '0'; }();
     desc.replace_duplicates = [] { const char * value = std::getenv("GGML_MOE_EXPERT_PACK_REPLACE_DUPLICATES"); return value && value[0] && value[0] != '0'; }();
     return desc;
 }

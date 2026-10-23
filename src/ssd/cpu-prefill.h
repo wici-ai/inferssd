@@ -21,8 +21,8 @@ struct llama_kimi_cpu_prefill_runtime {
         if (context) {
             return;
         }
-        const auto get = reinterpret_cast<ssd::cpu::get_api_v1>(
-            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v1"));
+        const auto get = reinterpret_cast<ssd::cpu::get_api_v2>(
+            ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v2"));
         const auto * api = get ? get() : nullptr;
         if (!ssd::cpu::valid(api)) {
             GGML_ABORT("CPU prefill executor ABI mismatch; rebuild the CPU backend and model together");

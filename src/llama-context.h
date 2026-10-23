@@ -6,6 +6,7 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
+#include "ssd/options.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -97,6 +98,10 @@ struct llama_context {
 
     void synchronize();
 
+    // Discard failed graph metadata after a C API error, without dropping
+    // already processed KV state or allowing reuse of an unallocated graph.
+    void discard_failed_graph() noexcept;
+
     // Request-scoped scheduler/cache exchange used by the default-off K3
     // grouped-prefill capacity ladder.
     bool moe_prefill_phase_workspace(bool active);
@@ -115,6 +120,8 @@ struct llama_context {
 
     // room in host memory for an allocation outside the RAM expert cache (llama_host_reserve)
     bool host_reserve(size_t bytes);
+    ssd::result<ssd::host::allocation_ticket> host_take(size_t bytes);
+    void host_note_memory_change() noexcept;
 
 
     const llama_model   & get_model()   const;
@@ -309,6 +316,8 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    bool reserve_compute_graph(ggml_cgraph * graph, bool prefill);
+
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
 
@@ -348,6 +357,8 @@ private:
     //
 
     const llama_model & model;
+
+    std::unique_ptr<llama_ssd_context> ssd_runtime;
 
     llama_cparams cparams;
 

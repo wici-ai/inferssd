@@ -10,6 +10,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "preset.h"
+#include "ssdash/options.h"
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -919,6 +920,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             common_params_print_completion(ctx_arg);
             exit(0);
         }
+        common_ssd_prepare(params);
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -1051,6 +1053,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     };
 
+
+    add_opt(common_arg({"--ssd-schema"}, "print SSD settings JSON schema and exit", [](common_params &) {
+        common_ssd_print_schema();
+        exit(0);
+    }));
+    add_opt(common_arg({"--ssd-settings"}, "FILE", "load versioned SSD settings and source receipts",
+        [](common_params & p, const std::string & value) { p.ssd_enabled = true; p.ssd_settings_file = value; }));
+    add_opt(common_arg({"--ssd-telemetry"}, "FILE", "exclusively create versioned SSD JSONL telemetry",
+        [](common_params & p, const std::string & value) { p.ssd_enabled = true; p.ssd_telemetry_file = value; }));
+    // Each block owns the spelling for common_arg's borrowed char pointers.
+    // No SSD option has an environment mirror.
+#define SSD_SETTING(key, type, min, max, default_value, unit, producer, scope, description) \
+    { \
+        static const std::string name = common_ssd_option_name(key); \
+        add_opt(common_arg({name.c_str()}, "VALUE", description, \
+            [](common_params & p, const std::string & value) { \
+                p.ssd_enabled = true; p.ssd_overrides.emplace_back(key, value); \
+            })); \
+    }
+#include "../ggml/src/ggml-ssd/settings/registry.def"
+#undef SSD_SETTING
 
     add_opt(common_arg(
         {"-h", "--help", "--usage"},

@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: MIT
+#pragma once
+
+#include "llama-ssd.h"
+#include "ggml-ssd/settings/settings.h"
+#include "ggml-ssd/telemetry/telemetry.h"
+#include "ggml-ssd/runtime-services.h"
+#include "ggml-ssd/store/source.h"
+#include "ggml-ssd/host/arbiter.h"
+
+#include <memory>
+
+struct llama_ssd_options {
+    ssd::settings::snapshot settings;
+    ssd::telemetry::debug_channels debug;
+    std::string telemetry_file;
+};
+
+struct ggml_ssd_mac_cache;
+struct llama_ssd_source_delete {
+    void (*close)(void *) noexcept = nullptr;
+    void operator()(void * source) const noexcept { if (source) { close(source); } }
+};
+
+// Declare this owner before executors in llama_context. Reverse destruction
+// then joins every borrowed publisher before closing the event stream, also
+// when construction of a later member throws.
+struct llama_ssd_context {
+    const ssd::settings::snapshot settings;
+    const ssd::telemetry::debug_channels debug;
+    std::shared_ptr<ssd::host::process_arbiter> host_owner;
+    std::unique_ptr<ssd::host::context_client> host;
+    std::unique_ptr<void, llama_ssd_source_delete> source_owner;
+    ssd::store::source_view sources;
+    std::unique_ptr<ssd::telemetry::writer> events;
+    ssd::runtime_services services;
+    ggml_ssd_mac_cache * mac_cache = nullptr;
+    void (*destroy_mac)(ggml_ssd_mac_cache *) noexcept = nullptr;
+
+    explicit llama_ssd_context(const llama_ssd_options & options);
+    ~llama_ssd_context();
+};
+
+struct llama_ssd_host_reservation {
+    ssd::host::allocation_ticket ticket;
+};
