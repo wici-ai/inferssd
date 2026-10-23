@@ -2,6 +2,7 @@
 
 import copy
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -12,8 +13,26 @@ from observe_launch_F import mac_case
 GOLDENS = json.loads((Path(__file__).parent / "fixtures/launch-mac-goldens.json").read_text())
 
 
+def original_cache_namespace(value):
+    """Project only the renamed alias-cache path components onto frozen F."""
+    if isinstance(value, str):
+        return re.sub(
+            r"(^|/)cache/inferssd/mac-alias(?=/|['\"]|$)",
+            r"\1cache/ssdash/mac-alias",
+            value,
+        )
+    if isinstance(value, list):
+        return [original_cache_namespace(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            original_cache_namespace(key): original_cache_namespace(item)
+            for key, item in value.items()
+        }
+    return value
+
+
 def original_helper_spelling(observation):
-    """Normalize only the intentional installed-module entrypoint change.
+    """Normalize the explicit entrypoint and cache-namespace renames only.
 
     Keep original F files and observations immutable. The actual new argv and
     isolated installed-wheel execution are checked independently by alias tests.
@@ -36,7 +55,7 @@ def original_helper_spelling(observation):
         # its status and surrounding error text retain the original contract.
         result["stderr"] = result["stderr"].replace(repr(command), repr(original))
         event[1] = original
-    return result
+    return original_cache_namespace(result)
 
 
 @pytest.mark.parametrize("expected", GOLDENS, ids=lambda x: x["case"]["name"])
