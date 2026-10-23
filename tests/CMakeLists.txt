@@ -459,7 +459,6 @@ if (GGML_CUDA)
     add_test(NAME moe_object_pipeline_policy COMMAND test-moe-object-engine pipeline)
     add_test(NAME moe_object_transaction_rendezvous COMMAND test-moe-object-engine transaction)
     add_test(NAME moe_object_pipeline_lifetime COMMAND test-moe-object-engine pipeline-lifetime)
-    add_test(NAME moe_kimi_iq1_adapter_dispatch COMMAND test-moe-object-engine kimi-iq1-adapter)
     set_property(TEST moe_object_engine_layout PROPERTY
         ENVIRONMENT "GGML_MOE_OBJECT_ENGINE=glm52-enforce")
     set_property(TEST moe_object_engine_single_shape PROPERTY
@@ -468,7 +467,7 @@ if (GGML_CUDA)
         ENVIRONMENT "GGML_MOE_OBJECT_ENGINE=glm52-enforce")
     set_property(TEST moe_object_transaction_rendezvous PROPERTY
         ENVIRONMENT "GGML_MOE_OBJECT_ENGINE=glm52-enforce")
-    set_property(TEST moe_object_engine_layout moe_object_engine_single_shape moe_object_stage_ring moe_object_host_slot moe_role_cache_descriptor moe_device_descriptor_buffer moe_dependency_transfer_plan moe_object_pipeline_policy moe_object_transaction_rendezvous moe_object_pipeline_lifetime moe_kimi_iq1_adapter_dispatch
+    set_property(TEST moe_object_engine_layout moe_object_engine_single_shape moe_object_stage_ring moe_object_host_slot moe_role_cache_descriptor moe_device_descriptor_buffer moe_dependency_transfer_plan moe_object_pipeline_policy moe_object_transaction_rendezvous moe_object_pipeline_lifetime
         PROPERTY LABELS main)
 endif()
 

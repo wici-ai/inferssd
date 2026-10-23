@@ -1,9 +1,8 @@
 #pragma once
 
-// Keep the restored common adapter link-isolated from the Kimi-K3-local
-// implementation.  The common translation units include this file before
-// their historical implementation so both variants can coexist in one CUDA
-// backend.  Public dispatch remains on the unprefixed symbols.
+// Internal implementation symbols stay separate from the public transport
+// entries. This allows the CUDA backend to expose one stable private bridge
+// while compiling the shared implementations in separate translation units.
 
 #define ggml_cuda_host_register                                      ggml_cuda_common_host_register
 #define ggml_cuda_moe_stream_available                               ggml_cuda_moe_common_stream_available

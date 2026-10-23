@@ -58,17 +58,11 @@ extern "C" bool ggml_cuda_moe_stream_decode_batch(
     int64_t rows_stride) {
     const size_t expert_bytes = (size_t) ne01 * nb01;
     ggml_moe::adapter_select_model_shape(n_as, expert_bytes, "decode-batch");
-    if (ggml_moe::adapter_uses_common()) {
-        return ggml_cuda_moe_common_stream_decode_batch(
-            src0_type_int, src0_name, src0_data, n_as, ne01, ne00, nb01,
-            nb02, src1_f32, src1_ne1, src1_nb1, src1_nb2, dst, dst_nb1,
-            dst_nb2, matrix_row_counts, rows, rows_stride);
-    }
-    // The shape-selected K3-local implementation is retired. Keep the
-    // public ABI and common forwarding path for supported models.
-    (void) src1_q8_0;
-    (void) src1_q8_0_row_size;
-    return false;
+
+    return ggml_cuda_moe_common_stream_decode_batch(
+        src0_type_int, src0_name, src0_data, n_as, ne01, ne00, nb01,
+        nb02, src1_f32, src1_ne1, src1_nb1, src1_nb2, dst, dst_nb1,
+        dst_nb2, matrix_row_counts, rows, rows_stride);
 }
 
 #endif // GGML_CUDA_MOE_STREAM

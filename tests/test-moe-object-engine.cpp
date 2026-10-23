@@ -43,13 +43,6 @@ ggml_moe::object_request make_request(
 
 } // namespace
 
-static int run_kimi_iq1_adapter() {
-    if (ggml_moe::adapter_is_selected()) return 197;
-    ggml_moe::adapter_select_model_shape(896, 2150400, "iq1-adapter-test");
-    if (!ggml_moe::adapter_is_selected() || ggml_moe::adapter_uses_common()) return 198;
-    return 0;
-}
-
 static int run_single_shape() {
     using namespace ggml_moe;
 
@@ -1640,7 +1633,6 @@ int main(int argc, char **argv) {
     if (argc == 2 && std::strcmp(argv[1], "pipeline") == 0) return run_object_pipeline_policy();
     if (argc == 2 && std::strcmp(argv[1], "transaction") == 0) return run_object_transaction_rendezvous();
     if (argc == 2 && std::strcmp(argv[1], "pipeline-lifetime") == 0) return run_object_pipeline_lifetime();
-    if (argc == 2 && std::strcmp(argv[1], "kimi-iq1-adapter") == 0) return run_kimi_iq1_adapter();
 
     object_layout layout;
     std::strcpy(layout.model, "shape-test");

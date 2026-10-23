@@ -357,11 +357,6 @@ private:
     std::unique_ptr<const llama_k3_runtime_config> k3_runtime;
     bool k3_guard_active = false;
 
-    bool phase_workspace_enabled = false;
-    bool phase_workspace_active = false;
-    bool phase_decode_cache_handover_enabled = false;
-    uint32_t phase_workspace_target_ubatch = 0;
-    uint32_t phase_workspace_selected_ubatch = 0;
     bool dense_gpu_phase_gate_enabled = false;
     bool dense_gpu_prefill_phase_active = false;
     int dense_gpu_scheduler_graph_phase = 0;

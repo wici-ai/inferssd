@@ -42,7 +42,7 @@ void ggml_cuda_moe_stream_sync(void) {}
 }
 #else
 // Public compatibility entries for the common streaming implementation.
-// Shape selection remains shared; the retired local adapter is declined.
+// Shape observation remains shared; the common transport is the sole adapter.
 // Original streaming implementation author: Zili Meng <zilim@ieee.org>
 
 #include <cstddef>
@@ -114,12 +114,9 @@ extern "C" const void * ggml_cuda_moe_stream_ds4_triplet_host_role_ptr(
         const char * src0_name,
         int64_t expert_index,
         size_t role_nbytes) {
-    if (ggml_moe::adapter_uses_common()) {
-        return ggml_cuda_moe_common_stream_ds4_triplet_host_role_ptr(
-            src0_name, expert_index, role_nbytes);
-    }
-    // The shape-selected local path is retired.
-    return nullptr;
+
+    return ggml_cuda_moe_common_stream_ds4_triplet_host_role_ptr(
+        src0_name, expert_index, role_nbytes);
 }
 
 extern "C" void ggml_cuda_moe_stream_one_gate_up_prefetch(
@@ -128,12 +125,9 @@ extern "C" void ggml_cuda_moe_stream_one_gate_up_prefetch(
         const int * expert_indices,
         const int32_t * route_ranks,
         int count) {
-    if (ggml_moe::adapter_uses_common()) {
-        ggml_cuda_moe_common_stream_one_gate_up_prefetch(
-            src0_name, src0_bytes, expert_indices, route_ranks, count);
-        return;
-    }
-    // The shape-selected local path is retired.
+
+    ggml_cuda_moe_common_stream_one_gate_up_prefetch(
+        src0_name, src0_bytes, expert_indices, route_ranks, count);
 }
 
 extern "C" bool ggml_cuda_moe_stream_one_cache_dev_ptrs_or_insert(
@@ -148,36 +142,27 @@ extern "C" bool ggml_cuda_moe_stream_one_cache_dev_ptrs_or_insert(
         const void ** output_ptrs,
         int * cache_states,
         ggml_moe_expert_descriptor * descriptors) {
-    if (ggml_moe::adapter_uses_common()) {
-        return ggml_cuda_moe_common_stream_one_cache_dev_ptrs_or_insert(
-            src0_name, src0_base_data, nb02, src0_bytes, expert_indices,
-            route_ranks, count, stream, output_ptrs, cache_states, descriptors);
-    }
-    // The shape-selected local path is retired.
-    return false;
+
+    return ggml_cuda_moe_common_stream_one_cache_dev_ptrs_or_insert(
+        src0_name, src0_base_data, nb02, src0_bytes, expert_indices,
+        route_ranks, count, stream, output_ptrs, cache_states, descriptors);
 }
 
 extern "C" void ggml_cuda_moe_stream_one_cache_release_descriptors(
         const ggml_moe_expert_descriptor * descriptors,
         int count,
         cudaStream_t stream) {
-    if (ggml_moe::adapter_uses_common()) {
-        ggml_cuda_moe_common_stream_one_cache_release_descriptors(
-            descriptors, count, stream);
-        return;
-    }
-    // The shape-selected local path is retired.
+
+    ggml_cuda_moe_common_stream_one_cache_release_descriptors(
+        descriptors, count, stream);
 }
 
 extern "C" void ggml_cuda_moe_stream_one_cache_release_descriptors_synchronized(
         const ggml_moe_expert_descriptor * descriptors,
         int count) {
-    if (ggml_moe::adapter_uses_common()) {
-        ggml_cuda_moe_common_stream_one_cache_release_descriptors_synchronized(
-            descriptors, count);
-        return;
-    }
-    // The shape-selected local path is retired.
+
+    ggml_cuda_moe_common_stream_one_cache_release_descriptors_synchronized(
+        descriptors, count);
 }
 
 extern "C" bool ggml_cuda_moe_stream_one_cache_contains(
@@ -186,12 +171,9 @@ extern "C" bool ggml_cuda_moe_stream_one_cache_contains(
     size_t src0_bytes,
     int64_t expert_index)
 {
-    if (ggml_moe::adapter_uses_common()) {
-        return ggml_cuda_moe_common_stream_one_cache_contains(
-            src0_name, src0_data, src0_bytes, expert_index);
-    }
-    // The shape-selected local path is retired.
-    return false;
+
+    return ggml_cuda_moe_common_stream_one_cache_contains(
+        src0_name, src0_data, src0_bytes, expert_index);
 }
 
 extern "C" const void * ggml_cuda_moe_stream_one_cache_dev_ptr_or_insert(
@@ -203,24 +185,15 @@ extern "C" const void * ggml_cuda_moe_stream_one_cache_dev_ptr_or_insert(
     cudaStream_t st,
     int *cache_state)
 {
-    if (ggml_moe::adapter_uses_common()) {
-        return ggml_cuda_moe_common_stream_one_cache_dev_ptr_or_insert(
-            src0_name, src0_base_data, nb02, src0_bytes, expert_index, st,
-            cache_state);
-    }
-    // The shape-selected local path is retired.
-    if (cache_state) {
-        *cache_state = 0;
-    }
-    return nullptr;
+
+    return ggml_cuda_moe_common_stream_one_cache_dev_ptr_or_insert(
+        src0_name, src0_base_data, nb02, src0_bytes, expert_index, st,
+        cache_state);
 }
 
 extern "C" bool ggml_cuda_moe_stream_one_cache_ready(void) {
-    if (ggml_moe::adapter_uses_common()) {
-        return ggml_cuda_moe_common_stream_one_cache_ready();
-    }
-    // The shape-selected local path is retired.
-    return false;
+
+    return ggml_cuda_moe_common_stream_one_cache_ready();
 }
 
 extern "C" void ggml_cuda_moe_stream_q80_probe(
@@ -238,14 +211,11 @@ extern "C" void ggml_cuda_moe_stream_q80_probe(
     const float *dst,
     size_t dst_nb1, size_t dst_nb2,
     const ggml_moe_row_mapping *rows) {
-    if (ggml_moe::adapter_uses_common()) {
-        ggml_cuda_moe_common_stream_q80_probe(
-            src0_type_int, src0_name, expert_index, src0_data, ne01, ne00,
-            nb01, src1_q8_0, src1_q8_0_row_size, src1_ne1, cne1, dst,
-            dst_nb1, dst_nb2, rows);
-        return;
-    }
-    // The shape-selected local path is retired.
+
+    ggml_cuda_moe_common_stream_q80_probe(
+        src0_type_int, src0_name, expert_index, src0_data, ne01, ne00,
+        nb01, src1_q8_0, src1_q8_0_row_size, src1_ne1, cne1, dst,
+        dst_nb1, dst_nb2, rows);
 }
 
 extern "C" void ggml_cuda_moe_stream_q80_write(
@@ -263,14 +233,11 @@ extern "C" void ggml_cuda_moe_stream_q80_write(
     float *dst,
     size_t dst_nb1, size_t dst_nb2,
     const ggml_moe_row_mapping *rows) {
-    if (ggml_moe::adapter_uses_common()) {
-        ggml_cuda_moe_common_stream_q80_write(
-            src0_type_int, src0_name, expert_index, src0_data, ne01, ne00,
-            nb01, src1_q8_0, src1_q8_0_row_size, src1_ne1, cne1, dst,
-            dst_nb1, dst_nb2, rows);
-        return;
-    }
-    // The shape-selected local path is retired.
+
+    ggml_cuda_moe_common_stream_q80_write(
+        src0_type_int, src0_name, expert_index, src0_data, ne01, ne00,
+        nb01, src1_q8_0, src1_q8_0_row_size, src1_ne1, cne1, dst,
+        dst_nb1, dst_nb2, rows);
 }
 
 extern "C" void ggml_cuda_moe_stream_q80_hot_batch_probe(
@@ -293,15 +260,12 @@ extern "C" void ggml_cuda_moe_stream_q80_hot_batch_probe(
     size_t dst_nb1,
     size_t dst_nb2) {
     ggml_moe::adapter_select_model_shape(n_as, nb01, "q80-hot-batch");
-    if (ggml_moe::adapter_uses_common()) {
-        ggml_cuda_moe_common_stream_q80_hot_batch_probe(
-            src0_type_int, src0_name, n_as, ne01, ne00, nb01, src1_q8_0,
-            src1_q8_0_row_size, src1_ne1, src1_f32, src1_nb1, src1_nb2,
-            matrix_row_counts, matrix_rows, rows_per_expert, dst, dst_nb1,
-            dst_nb2);
-        return;
-    }
-    // The shape-selected local path is retired.
+
+    ggml_cuda_moe_common_stream_q80_hot_batch_probe(
+        src0_type_int, src0_name, n_as, ne01, ne00, nb01, src1_q8_0,
+        src1_q8_0_row_size, src1_ne1, src1_f32, src1_nb1, src1_nb2,
+        matrix_row_counts, matrix_rows, rows_per_expert, dst, dst_nb1,
+        dst_nb2);
 }
 
 extern "C" bool ggml_cuda_moe_stream_q80_skip(
@@ -319,14 +283,11 @@ extern "C" bool ggml_cuda_moe_stream_q80_skip(
     float *dst,
     size_t dst_nb1, size_t dst_nb2,
     const ggml_moe_row_mapping *rows) {
-    if (ggml_moe::adapter_uses_common()) {
-        return ggml_cuda_moe_common_stream_q80_skip(
-            src0_type_int, src0_name, expert_index, src0_data, ne01, ne00,
-            nb01, src1_q8_0, src1_q8_0_row_size, src1_ne1, cne1, dst,
-            dst_nb1, dst_nb2, rows);
-    }
-    // The shape-selected local path is retired.
-    return false;
+
+    return ggml_cuda_moe_common_stream_q80_skip(
+        src0_type_int, src0_name, expert_index, src0_data, ne01, ne00,
+        nb01, src1_q8_0, src1_q8_0_row_size, src1_ne1, cne1, dst,
+        dst_nb1, dst_nb2, rows);
 }
 
 extern "C" bool ggml_cuda_moe_stream_available(void) {
@@ -336,11 +297,8 @@ extern "C" bool ggml_cuda_moe_stream_available(void) {
     if (!ggml_moe::adapter_is_selected()) {
         return true;
     }
-    if (ggml_moe::adapter_uses_common()) {
-        return ggml_cuda_moe_common_stream_available();
-    }
-    // The shape-selected local path is retired.
-    return false;
+
+    return ggml_cuda_moe_common_stream_available();
 }
 
 extern "C" int ggml_cuda_host_register(void *p, size_t n) {
@@ -374,22 +332,16 @@ extern "C" bool ggml_cuda_moe_stream_one(
     size_t dst_nb1, size_t dst_nb2,
     const ggml_moe_row_mapping *rows)
 {
-    if (ggml_moe::adapter_uses_common()) {
-        return ggml_cuda_moe_common_stream_one(
-            src0_type_int, src0_name, expert_index, src0_data, ne01, ne00,
-            nb01, src1_f32, src1_nb1, src1_nb2, src1_ne1, cne1,
-            src1_q8_1, src1_padded_num_cols, dst, dst_nb1, dst_nb2, rows);
-    }
-    // The shape-selected local path is retired.
-    return false;
+
+    return ggml_cuda_moe_common_stream_one(
+        src0_type_int, src0_name, expert_index, src0_data, ne01, ne00,
+        nb01, src1_f32, src1_nb1, src1_nb2, src1_ne1, cne1,
+        src1_q8_1, src1_padded_num_cols, dst, dst_nb1, dst_nb2, rows);
 }
 
 extern "C" void ggml_cuda_moe_stream_sync(void) {
-    if (ggml_moe::adapter_uses_common()) {
-        ggml_cuda_moe_common_stream_sync();
-        return;
-    }
-    // The shape-selected local path is retired.
+
+    ggml_cuda_moe_common_stream_sync();
 }
 
 #endif // GGML_CUDA_MOE_STREAM

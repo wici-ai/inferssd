@@ -17,7 +17,6 @@ struct runtime_owner {
     std::atomic<bool> retired{false};
     std::atomic<bool> published{false};
     std::atomic<int> shape{0};
-    std::atomic<bool> mismatch_reported{false};
 };
 runtime_owner & owner() { static runtime_owner value; return value; }
 
@@ -129,18 +128,14 @@ bool initialize_shared_catalog() {
 extern "C" void ggml_ssd_c0_select_model_shape(int64_t experts, size_t bytes, const char * source) {
     if (experts <= 0 || !bytes) { return; }
     auto & state = owner();
-    const int requested = experts == 896 && (bytes == 3612672 || bytes == 2150400) ? 2 : 1;
+    constexpr int requested = 1;
     int expected = 0;
     if (state.shape.compare_exchange_strong(expected, requested, std::memory_order_acq_rel, std::memory_order_acquire)) {
         std::fprintf(stderr, "[moe_adapter] dispatch=%s source=%s n_experts=%lld expert_bytes=%zu selection=model-shape\n",
-                requested == 1 ? "common" : "k3-local", source ? source : "unknown", (long long)experts, bytes);
-    } else if (expected != requested && !state.mismatch_reported.exchange(true, std::memory_order_relaxed)) {
-        std::fprintf(stderr, "[moe_adapter] shape mismatch ignored: active=%s requested=%s source=%s n_experts=%lld expert_bytes=%zu\n",
-                expected == 1 ? "common" : "k3-local", requested == 1 ? "common" : "k3-local",
-                source ? source : "unknown", (long long)experts, bytes);
+                "common", source ? source : "unknown", (long long)experts, bytes);
     }
 }
-extern "C" bool ggml_ssd_c0_uses_common() { return owner().shape.load(std::memory_order_acquire) != 2; }
+extern "C" bool ggml_ssd_c0_uses_common() { return true; }
 extern "C" bool ggml_ssd_c0_shape_selected() { return owner().shape.load(std::memory_order_acquire) != 0; }
 
 extern "C" bool ggml_ssd_c0_resolve_raw_direct_shape(

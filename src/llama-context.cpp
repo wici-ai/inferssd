@@ -1128,19 +1128,6 @@ llama_context::llama_context(
             throw std::runtime_error("GGML_KIMI_CPU_PREFILL supports only Kimi-K3, DeepSeek-V4.1 or Muse Spark models; set GGML_KIMI_CPU_PREFILL=0");
         }
     }
-    if (cpu_prefill_max_tokens == std::numeric_limits<uint32_t>::max()) {
-        // The grouped CPU executor has its own small bounded workspace. With every
-        // prefill ubatch on it, the legacy GPU union workspace would serve none:
-        // do not allocate it alongside.  Below a finite threshold the workspace
-        // serves the graph route (K3's phase-workspace profiles with the sink on).
-        for (const char * name : { "GGML_MOE_PREFILL_PHASE0", "GGML_MOE_PREFILL_PHASE1",
-                "GGML_MOE_PREFILL_PHASE_SIZED_WORKSPACE", "GGML_MOE_PREFILL_DECODE_CACHE_HANDOVER" }) {
-            const char * value = std::getenv(name);
-            if (value && value[0] && std::strcmp(value, "0") != 0) {
-                throw std::runtime_error(std::string("CPU prefill requires ") + name + "=0");
-            }
-        }
-    }
     if (cpu_sink_enabled) {
         // with the sink on, any prefill ubatch may take its grouped prefill, whatever the threshold: one the GPU does
         // not offload, or a whole request whose graph does not fit
@@ -1245,43 +1232,6 @@ llama_context::llama_context(
         LLAMA_LOG_INFO("%s: prefill output reserve follows actual outputs\n", __func__);
     }
 
-    const char * phase_workspace_env =
-        std::getenv("GGML_MOE_PREFILL_PHASE_SIZED_WORKSPACE");
-    phase_workspace_enabled = phase_workspace_env && phase_workspace_env[0] &&
-        phase_workspace_env[0] != '0';
-    const char * phase_decode_cache_handover_env =
-        std::getenv("GGML_MOE_PREFILL_DECODE_CACHE_HANDOVER");
-    phase_decode_cache_handover_enabled = phase_decode_cache_handover_env &&
-        phase_decode_cache_handover_env[0] &&
-        phase_decode_cache_handover_env[0] != '0';
-    if (phase_decode_cache_handover_enabled && !phase_workspace_enabled) {
-        throw std::runtime_error(
-            "prefill/decode cache handover requires phase-sized prefill workspace");
-    }
-    const char * handover_phase0_env = std::getenv("GGML_MOE_PREFILL_PHASE0");
-    const char * handover_phase1_env = std::getenv("GGML_MOE_PREFILL_PHASE1");
-    if (phase_decode_cache_handover_enabled &&
-            (!handover_phase0_env || !handover_phase0_env[0] ||
-             handover_phase0_env[0] == '0' ||
-             !handover_phase1_env || !handover_phase1_env[0] ||
-             handover_phase1_env[0] == '0')) {
-        throw std::runtime_error(
-            "prefill/decode cache handover requires Phase 0/1 grouped prefill");
-    }
-    if (phase_workspace_enabled) {
-        phase_workspace_target_ubatch = cparams.n_ubatch;
-        if ((phase_workspace_target_ubatch != 32 &&
-                phase_workspace_target_ubatch != 64 &&
-                phase_workspace_target_ubatch != 96) ||
-                cparams.n_batch < phase_workspace_target_ubatch) {
-            throw std::runtime_error(
-                "phase-sized prefill workspace requires matching -b/-ub at capacity level 32, 64, or 96");
-        }
-        // Keep only the decode-sized graph resident between requests.  The
-        // target prefill graph is created transactionally at request begin.
-        cparams.n_ubatch = 1;
-    }
-
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
@@ -1321,11 +1271,6 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_ctx_seq     = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",   __func__, cparams.n_ubatch);
-    if (phase_workspace_enabled) {
-        LLAMA_LOG_INFO(
-            "%s: phase workspace target ubatch = %u, resident decode ubatch = %u\n",
-            __func__, phase_workspace_target_ubatch, cparams.n_ubatch);
-    }
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
@@ -1471,31 +1416,6 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        const char * moe_phase0_env = std::getenv("GGML_MOE_PREFILL_PHASE0");
-        const char * moe_phase1_env = std::getenv("GGML_MOE_PREFILL_PHASE1");
-        const bool moe_phase01_requested =
-            (moe_phase0_env && moe_phase0_env[0] && moe_phase0_env[0] != '0') ||
-            (moe_phase1_env && moe_phase1_env[0] && moe_phase1_env[0] != '0');
-#if !defined(_WIN32)
-        if (moe_phase01_requested) {
-            using moe_phase01_plan_fn = bool (*)(uint32_t, uint32_t);
-            auto * moe_phase01_plan = reinterpret_cast<moe_phase01_plan_fn>(
-                dlsym(RTLD_DEFAULT, "ggml_cuda_moe_prefill_phase01_plan"));
-            if (!moe_phase01_plan) {
-                throw std::runtime_error("Phase 0/1 prefill planner is unavailable");
-            }
-            const uint32_t planner_ubatch = phase_workspace_enabled ?
-                phase_workspace_target_ubatch : cparams.n_ubatch;
-            if (!moe_phase01_plan(planner_ubatch, hparams.n_expert_used)) {
-                throw std::runtime_error("Phase 0/1 prefill planner rejected the graph reserve");
-            }
-        }
-#else
-        if (moe_phase01_requested) {
-            throw std::runtime_error("Phase 0/1 prefill planner is unsupported on this platform");
-        }
-#endif
-
         // Nothing is cached yet: the first reserve covers one ubatch of positions and
         // grows with the context (decode) or is sized per request (actual-shape prefill).
         reserve_horizon_min = std::max<uint32_t>(1, std::min(cparams.n_ubatch, cparams.n_ctx));
@@ -1569,7 +1489,7 @@ llama_context::~llama_context() {
 }
 
 void llama_context::dense_graph_cache_begin_phase(int phase) {
-    if (!dense_gpu_phase_gate_enabled && !phase_decode_cache_handover_enabled) {
+    if (!dense_gpu_phase_gate_enabled) {
         return;
     }
 
@@ -1590,7 +1510,7 @@ void llama_context::dense_graph_cache_begin_phase(int phase) {
 }
 
 void llama_context::dense_graph_cache_end_phase() {
-    if ((!dense_gpu_phase_gate_enabled && !phase_decode_cache_handover_enabled) ||
+    if ((!dense_gpu_phase_gate_enabled) ||
             dense_gpu_scheduler_graph_phase == 0) {
         return;
     }
@@ -2078,8 +1998,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
         cpu_sink_runtime->begin(nullptr, 0, false);
         cpu_sink_cache_batch_decode = false;
     }
-    const bool graph_phase_gate_enabled = dense_gpu_phase_gate_enabled ||
-        phase_decode_cache_handover_enabled;
+    const bool graph_phase_gate_enabled = dense_gpu_phase_gate_enabled;
     const bool cpu_sink_phase_changed = cpu_sink_enabled &&
         cpu_sink_decode_active != !active;
     const bool phase_changed = cpu_sink_phase_changed || (graph_phase_gate_enabled &&
@@ -2208,104 +2127,9 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
         return graph_restored && vram_complete;
     }
 
-    if (!phase_workspace_enabled) {
-        const bool reserved = !phase_changed || reserve_ubatch(cparams.n_ubatch);
-        const bool vram_complete = complete_vram_phase(reserved && !active);
-        return reserved && vram_complete;
-    }
-#if defined(_WIN32)
-    complete_vram_phase(false);
-    return false;
-#else
-    using workspace_begin_fn = bool (*)(uint32_t);
-    using workspace_end_fn = bool (*)(void);
-    auto * workspace_begin = reinterpret_cast<workspace_begin_fn>(
-        dlsym(RTLD_DEFAULT, "ggml_cuda_moe_prefill_phase_workspace_begin"));
-    auto * workspace_end = reinterpret_cast<workspace_end_fn>(
-        dlsym(RTLD_DEFAULT, "ggml_cuda_moe_prefill_phase_workspace_end"));
-    if (!workspace_begin || !workspace_end) {
-        LLAMA_LOG_ERROR("%s: CUDA phase workspace API is unavailable\n", __func__);
-        complete_vram_phase(false);
-        return false;
-    }
-
-    if (active) {
-        if (phase_workspace_active) {
-            return complete_vram_phase(false);
-        }
-        // Dense staging belongs to decode.  Release it before the prefill
-        // cache transaction measures free VRAM and chooses its phase slots.
-        if (dense_gpu_phase_gate_enabled || cpu_sink_phase_changed) {
-            drop_scheduler();
-        } else {
-            synchronize();
-        }
-        if (workspace_begin(phase_workspace_target_ubatch) &&
-                reserve_ubatch(phase_workspace_target_ubatch)) {
-            phase_workspace_active = true;
-            phase_workspace_selected_ubatch = phase_workspace_target_ubatch;
-            LLAMA_LOG_INFO(
-                "%s: activated target ubatch=%u transition_ms=%.3f\n",
-                __func__, phase_workspace_selected_ubatch,
-                (ggml_time_us() - transition_start_us) / 1000.0);
-            return complete_vram_phase(false);
-        }
-
-        // Undo every target-level allocation before attempting the previous
-        // validated capacity level with the full decode cache geometry.
-        drop_scheduler();
-        workspace_end();
-        const uint32_t fallback_ubatch = phase_workspace_target_ubatch > 64 ? 64 :
-            phase_workspace_target_ubatch > 32 ? 32 : 16;
-        if (workspace_begin(fallback_ubatch) && reserve_ubatch(fallback_ubatch)) {
-            phase_workspace_active = true;
-            phase_workspace_selected_ubatch = fallback_ubatch;
-            LLAMA_LOG_WARN(
-                "%s: target ubatch=%u unavailable; safely fell back to ubatch=%u "
-                "transition_ms=%.3f\n",
-                __func__, phase_workspace_target_ubatch, fallback_ubatch,
-                (ggml_time_us() - transition_start_us) / 1000.0);
-            return complete_vram_phase(false);
-        }
-
-        drop_scheduler();
-        workspace_end();
-        if (graph_phase_gate_enabled) {
-            dense_gpu_prefill_phase_active = false;
-        }
-        const bool decode_restored = reserve_ubatch(1);
-        phase_workspace_selected_ubatch = 0;
-        LLAMA_LOG_ERROR(
-            "%s: target and fallback prefill reserves failed; decode graph restored=%d "
-            "transition_ms=%.3f\n",
-            __func__, decode_restored ? 1 : 0,
-            (ggml_time_us() - transition_start_us) / 1000.0);
-        complete_vram_phase(decode_restored);
-        return false;
-    }
-
-    if (!phase_workspace_active) {
-        const bool reserved = !phase_changed || reserve_ubatch(1);
-        const bool vram_complete = complete_vram_phase(reserved);
-        return reserved && vram_complete;
-    }
-    // The large graph must die before the cache pools are restored, otherwise
-    // the two phases overlap and recreate the 3.1 GiB cliff.
-    drop_scheduler();
-    const bool cache_restored = workspace_end();
-    const bool graph_restored = reserve_ubatch(1);
-    LLAMA_LOG_INFO(
-        "%s: released ubatch=%u cache_restored=%d decode_graph_restored=%d "
-        "transition_ms=%.3f\n",
-        __func__, phase_workspace_selected_ubatch,
-        cache_restored ? 1 : 0,
-        graph_restored ? 1 : 0,
-        (ggml_time_us() - transition_start_us) / 1000.0);
-    phase_workspace_active = false;
-    phase_workspace_selected_ubatch = 0;
-    const bool vram_complete = complete_vram_phase(cache_restored && graph_restored);
-    return cache_restored && graph_restored && vram_complete;
-#endif
+    const bool reserved = !phase_changed || reserve_ubatch(cparams.n_ubatch);
+    const bool vram_complete = complete_vram_phase(reserved && !active);
+    return reserved && vram_complete;
 }
 
 const llama_k3_runtime_config * llama_context::k3_runtime_config_get() const {
@@ -3793,20 +3617,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
-    const char * phase0_env = std::getenv("GGML_MOE_PREFILL_PHASE0");
-    const char * phase1_env = std::getenv("GGML_MOE_PREFILL_PHASE1");
-    const bool phase0_eviction = phase0_env && phase0_env[0] && phase0_env[0] != '0';
-#if !defined(_WIN32)
-    if (batch_inp.n_tokens > 1 && phase1_env && phase1_env[0] && phase1_env[0] != '0') {
-        using moe_phase01_release_fn = void (*)(void);
-        auto * moe_phase01_release = reinterpret_cast<moe_phase01_release_fn>(
-            dlsym(RTLD_DEFAULT, "ggml_cuda_moe_prefill_phase01_release"));
-        if (moe_phase01_release) {
-            moe_phase01_release();
-        }
-    }
-#endif
-    if (batch_inp.n_tokens > 1 && (!cparams.warmup || !phase0_eviction)) {
+    if (batch_inp.n_tokens > 1) {
         model.drop_expert_mmap_pages_after_prompt();
     }
 
@@ -4437,24 +4248,6 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_set_name(cur, name);
         }
 
-        // At CUDA's automatic offload threshold (currently 32 rows), a
-        // host-backed MUL_MAT_ID would otherwise be moved wholesale to CUDA.
-        // That bypasses the grouped prefill provider and faults the multi-GiB
-        // GGUF expert tensors into the cgroup.  Keep only the three routed MoE
-        // operations on the CPU scheduler while the request-scoped workspace
-        // is active; the Kimi CPU entry point immediately dispatches their
-        // active rows to the grouped CUDA path.  sched_reserve() runs before
-        // phase_workspace_active is set, so it still reserves the observed
-        // target CUDA workspace that the cache transaction budgeted for.
-        const bool phase_grouped_moe =
-            phase_workspace_active && ubatch.n_tokens > 1 &&
-            cur->op == GGML_OP_MUL_MAT_ID &&
-            (std::strcmp(name, "ffn_moe_gate") == 0 ||
-             std::strcmp(name, "ffn_moe_up") == 0 ||
-             std::strcmp(name, "ffn_moe_down") == 0);
-        if (phase_grouped_moe) {
-            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
-        }
         if (ds4_weight_profile_path() != nullptr && std::strcmp(name, "ffn_weights") == 0) {
             ggml_set_output(cur);
         }

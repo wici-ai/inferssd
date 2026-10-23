@@ -42,11 +42,7 @@
 
 #if defined(__GNUC__) || defined(__clang__)
 #if defined(LLAMA_SERVER_CUDA_MOE)
-extern "C" void ggml_cuda_moe_ram_tier_request_begin(uint64_t request_id) __attribute__((weak));
-extern "C" void ggml_cuda_moe_stream_batch_phase_report(const char * label) __attribute__((weak));
-extern "C" void ggml_cuda_moe_prefill_request_phase(int active) __attribute__((weak));
 #endif
-extern "C" void ggml_cpu_kimi_a2_request_phase(int active) __attribute__((weak));
 extern "C" bool llama_moe_prefill_phase_workspace(
     llama_context * ctx, int active) __attribute__((weak));
 extern "C" bool llama_moe_prefill_phase_workspace_sized(
@@ -135,13 +131,6 @@ static bool server_kimi_dense_phase_gate_enabled() {
         return false;
     }();
     return enabled;
-}
-
-static bool server_moe_phase01_telemetry_enabled() {
-    const char * phase0 = std::getenv("GGML_MOE_PREFILL_PHASE0");
-    const char * phase1 = std::getenv("GGML_MOE_PREFILL_PHASE1");
-    return (phase0 && phase0[0] && phase0[0] != '0') ||
-        (phase1 && phase1[0] && phase1[0] != '0');
 }
 
 struct server_moe_memory_events {
@@ -455,7 +444,6 @@ static bool server_moe_workspace_transition(
         uint32_t prompt_tokens,
         uint32_t prefill_tokens) {
 #if defined(__GNUC__) || defined(__clang__)
-    const bool phase01_telemetry = server_moe_phase01_telemetry_enabled();
     const bool phase_memory_events = server_moe_phase_memory_events_enabled();
     const bool dense_phase_gate = server_kimi_dense_phase_gate_enabled();
     const char * elastic_value = std::getenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC");
@@ -465,7 +453,7 @@ static bool server_moe_workspace_transition(
     const bool prompt_pack_source_lifecycle = prompt_pack_source_value &&
         prompt_pack_source_value[0] && std::strcmp(prompt_pack_source_value, "0") != 0;
     // Memory lifecycle is a correctness transition, not telemetry.
-    if ((phase01_telemetry || phase_memory_events || dense_phase_gate || elastic_lifecycle ||
+    if ((phase_memory_events || dense_phase_gate || elastic_lifecycle ||
             prompt_pack_source_lifecycle) &&
             (llama_moe_prefill_phase_workspace_sized_ex ||
              llama_moe_prefill_phase_workspace_sized || llama_moe_prefill_phase_workspace) && ctx) {
@@ -509,53 +497,17 @@ static bool server_moe_phase_report(
         uint32_t prompt_tokens = 0,
         bool transition_workspace = true) {
 #if defined(__GNUC__) || defined(__clang__)
-    const bool phase01_telemetry = server_moe_phase01_telemetry_enabled();
     const bool phase_memory_events = server_moe_phase_memory_events_enabled();
     const bool dense_phase_gate = server_kimi_dense_phase_gate_enabled();
     if (transition_workspace &&
             !server_moe_workspace_transition(ctx, label, task_id, prompt_tokens, prompt_tokens)) {
         return false;
     }
-    if (!phase01_telemetry && !phase_memory_events && !dense_phase_gate) {
+    if (!phase_memory_events && !dense_phase_gate) {
         return true;
     }
     server_moe_phase_memory_events_report(label, task_id);
     server_moe_phase_smaps_snapshot(label, task_id);
-    if (!phase01_telemetry && !dense_phase_gate) {
-        return true;
-    }
-    if (phase01_telemetry && ggml_cpu_kimi_a2_request_phase) {
-        if (label && std::strcmp(label, "request_begin") == 0) {
-            ggml_cpu_kimi_a2_request_phase(1);
-        } else if (label &&
-                (std::strcmp(label, "prefill_done") == 0 ||
-                 std::strcmp(label, "request_end") == 0)) {
-            ggml_cpu_kimi_a2_request_phase(0);
-        }
-    }
-#if defined(LLAMA_SERVER_CUDA_MOE)
-    if (phase01_telemetry && ggml_cuda_moe_prefill_request_phase) {
-        if (label && std::strcmp(label, "request_begin") == 0) {
-            ggml_cuda_moe_prefill_request_phase(1);
-        } else if (label &&
-                (std::strcmp(label, "prefill_done") == 0 ||
-                 std::strcmp(label, "request_end") == 0)) {
-            ggml_cuda_moe_prefill_request_phase(0);
-        }
-    }
-#endif
-    if (!phase01_telemetry) {
-        return true;
-    }
-#if defined(LLAMA_SERVER_CUDA_MOE)
-    if (!ggml_cuda_moe_stream_batch_phase_report) {
-        return true;
-    }
-    char scoped_label[96];
-    std::snprintf(scoped_label, sizeof(scoped_label), "%s_task_%lld",
-        label ? label : "unknown", (long long)task_id);
-    ggml_cuda_moe_stream_batch_phase_report(scoped_label);
-#endif
 #else
     (void) ctx;
     (void) label;
@@ -2192,12 +2144,6 @@ private:
             } catch (const std::exception & e) { send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST); return false; }
         }
 
-#if defined(LLAMA_SERVER_CUDA_MOE) && (defined(__GNUC__) || defined(__clang__))
-        if (!task.is_child() && ggml_cuda_moe_ram_tier_request_begin) {
-            ggml_cuda_moe_ram_tier_request_begin(
-                    task.id >= 0 ? static_cast<uint64_t>(task.id) : 0);
-        }
-#endif
         if (!task.is_child()) {
             const bool defer_workspace = server_prefill_new_tokens_enabled() && task.need_sampling();
             if (!server_moe_phase_report(slot.ctx, "request_begin", task.id,

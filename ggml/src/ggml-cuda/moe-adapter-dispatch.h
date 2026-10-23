@@ -5,8 +5,8 @@
 
 namespace ggml_moe {
 
-// Only validated Kimi-K3 expert-count and role-slice shapes use the
-// branch-local adapter. Every other routed-expert shape retains common.
+// Observe the first valid routed-expert shape without initializing transport.
+// The common implementation is the sole supported adapter.
 void adapter_select_model_shape(
     int64_t n_experts,
     size_t expert_bytes,
