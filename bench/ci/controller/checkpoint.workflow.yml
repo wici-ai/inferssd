@@ -135,6 +135,17 @@ jobs:
           print(f"\nActual checkpoint status: **{value['status']}**.")
           print("Observed single-cell performance acceptance: " + json.dumps(value.get("performance_acceptance")) + ".")
           print("Job cleanup confirmed: " + json.dumps(value.get("cleanup_confirmed")) + ".")
+          profile = value.get("reference_profile")
+          profile_id = profile.get("id") if isinstance(profile, dict) else None
+          print("Reference profile: " + json.dumps(profile_id if profile_id is not None else "unavailable") + ".")
+          settings = value.get("measurement_settings")
+          settings = settings if isinstance(settings, dict) else {}
+          budget = settings.get("expert_gpu_budget_bytes")
+          reserve = settings.get("allocator_reserve_mib")
+          print("Expert GPU budget (bytes or auto): " + json.dumps(budget if budget is not None else "unavailable") + ".")
+          print("Allocator reserve (MiB): " + json.dumps(reserve if reserve is not None else "unavailable") + ".")
+          if type(budget) is int and budget == 0:
+              print("**Expert GPU tier disabled; ready-context inference measurement only. This does not establish no regression for the original 8 GiB expert GPU tier configuration.**")
           comparison = value.get("comparison")
           metrics = comparison.get("metrics", {}) if isinstance(comparison, dict) else {}
           if not isinstance(metrics, dict):
