@@ -481,7 +481,7 @@ result<std::string> snapshot::json() const noexcept {
 result<std::string> schema_json() noexcept {
     try {
         std::string out =
-            "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"title\":\"SSDash settings "
+            "{\"$schema\":\"https://json-schema.org/draft/2020-12/schema\",\"title\":\"InferSSD settings "
             "v1\",\"type\":\"object\",\"additionalProperties\":false,\"properties\":{";
         bool comma = false;
         for (const auto & d : registry()) {

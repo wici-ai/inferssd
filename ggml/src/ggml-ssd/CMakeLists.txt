@@ -1,4 +1,4 @@
-# SSDash core modules depend only on ggml-base and platform facilities.
+# InferSSD core modules depend only on ggml-base and platform facilities.
 add_library(ggml-ssd INTERFACE)
 target_link_libraries(ggml-ssd INTERFACE ggml-base)
 target_include_directories(ggml-ssd INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
