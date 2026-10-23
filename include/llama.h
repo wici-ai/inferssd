@@ -991,8 +991,10 @@ extern "C" {
     // Requires the context to have a memory.
     // For encode-decoder contexts, processes the batch using the decoder.
     // Positive return values does not mean a fatal error, but rather a warning.
-    // Upon fatal-error or abort, the ubatches that managed to be been processed will remain in the memory state of the context
+    // Upon fatal-error or abort, successfully processed ubatches remain when the memory implementation can roll back the failing ubatch.
     //   To handle this correctly, query the memory state using llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
+    // A memory implementation without rollback for a partly computed ubatch clears affected sequences on fatal error.
+    // Such sequences require checkpoint restore or replay. Supported pre-compute metadata transactions preserve prior state.
     // Upon other return values, the memory state is restored to the state before this call
     //    0 - success
     //    1 - could not find a KV slot for the batch (try reducing the size of the batch or increase the context)

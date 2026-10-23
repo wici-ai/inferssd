@@ -55,11 +55,47 @@ struct llama_memory_context_i {
     // return false on failure
     virtual bool apply() = 0;
 
+    // Precompute metadata transaction. Capturing may allocate but cannot
+    // publish cells; cancellation after apply must not allocate. Tensor/state
+    // writes are excluded: discard the undo immediately before async submit.
+    virtual bool save_precompute() { return false; }
+    virtual bool restore_precompute() noexcept { return false; }
+    virtual void discard_precompute() noexcept {}
+
+    [[nodiscard]] bool apply_precompute() {
+        precompute_state = state::untouched;
+        precompute_saved = save_precompute();
+        precompute_state = state::applied;
+        return apply();
+    }
+    [[nodiscard]] bool cancel_precompute() noexcept {
+        if (precompute_state == state::untouched || precompute_state == state::restored) {
+            discard_precompute();
+            return true;
+        }
+        if (precompute_state == state::applied && precompute_saved) {
+            precompute_state = restore_precompute() ? state::restored : state::failed;
+            return precompute_state == state::restored;
+        }
+        return false;
+    }
+    void submit_precompute() noexcept {
+        precompute_state = state::submitted;
+        discard_precompute();
+    }
+    bool precompute_submitted() const noexcept { return precompute_state == state::submitted; }
+    bool precompute_rollback_failed() const noexcept { return precompute_state == state::failed; }
+
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+private:
+    enum class state { untouched, applied, restored, submitted, failed };
+    state precompute_state = state::untouched;
+    bool precompute_saved = false;
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

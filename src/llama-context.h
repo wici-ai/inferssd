@@ -313,7 +313,7 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, llama_memory_context_i * mctx = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     bool reserve_compute_graph(ggml_cgraph * graph, bool prefill);

@@ -7,6 +7,8 @@
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <algorithm>
 #include <set>
 #include <vector>
 
@@ -36,6 +38,87 @@ struct llama_kv_cell_ext {
 class llama_kv_cells {
 public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
+
+
+    // Only metadata of rows changed by an ubatch. Standby tree nodes are
+    // allocated before apply, so even a partially failed insert can be undone
+    // without allocating or calling the normal index consistency assertions.
+    struct metadata_undo {
+        struct row {
+            uint32_t index;
+            llama_pos position, shift;
+            llama_kv_cell_ext ext;
+            seq_set_t sequences;
+        };
+        const llama_kv_cells * owner = nullptr;
+        bool has_shift = false;
+        std::vector<row> rows;
+        std::set<uint32_t> used;
+        std::map<llama_seq_id, std::set<std::pair<llama_pos, uint32_t>>> positions;
+    };
+
+    metadata_undo save_metadata(std::vector<uint32_t> indices) const {
+        std::sort(indices.begin(), indices.end());
+        indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+        metadata_undo saved;
+        saved.owner = this;
+        saved.has_shift = has_shift;
+        saved.rows.reserve(indices.size());
+        for (const auto i : indices) {
+            assert(i < pos.size());
+            saved.rows.push_back({i, pos[i], shift[i], ext[i], seq[i]});
+            if (used.count(i)) { saved.used.insert(i); }
+            for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (seq[i].test(s)) { saved.positions[s].insert({pos[i], i}); }
+            }
+        }
+        return saved;
+    }
+
+    void append_sequence_indices(llama_seq_id s, llama_pos maximum, std::vector<uint32_t> & indices) const {
+        assert(s >= 0 && s < LLAMA_MAX_SEQ);
+        for (const auto & item : seq_pos[s]) {
+            if (item.first > maximum) { break; }
+            indices.push_back(item.second);
+        }
+    }
+
+    [[nodiscard]] bool restore_metadata(metadata_undo & saved) noexcept {
+        if (saved.owner != this) { return false; }
+        for (const auto & row : saved.rows) {
+            const auto i = row.index;
+            if (i >= pos.size()) { return false; }
+        }
+        for (const auto & row : saved.rows) {
+            const auto i = row.index;
+            used.erase(i);
+            for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (seq[i].test(s) || row.sequences.test(s)) {
+                    seq_pos[s].erase({pos[i], i});
+                    seq_pos[s].erase({row.position, i});
+                }
+            }
+            pos[i] = row.position;
+            shift[i] = row.shift;
+            ext[i] = row.ext;
+            seq[i] = row.sequences;
+        }
+        // All sets have the same default allocator. Inserting node handles
+        // transfers their storage; no new tree node is allocated here.
+        while (!saved.used.empty()) {
+            if (!used.insert(saved.used.extract(saved.used.begin())).inserted) { return false; }
+        }
+        for (auto & sequence : saved.positions) {
+            auto & target = seq_pos[sequence.first];
+            auto & nodes = sequence.second;
+            while (!nodes.empty()) {
+                if (!target.insert(nodes.extract(nodes.begin())).inserted) { return false; }
+            }
+        }
+        has_shift = saved.has_shift;
+        saved.owner = nullptr;
+        return true;
+    }
 
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {

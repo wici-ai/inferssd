@@ -317,6 +317,23 @@ bool llama_kv_cache_iswa_context::next() {
     return true;
 }
 
+bool llama_kv_cache_iswa_context::save_precompute() {
+    const bool base = ctx_base->save_precompute();
+    const bool swa = ctx_swa->save_precompute();
+    return base && swa;
+}
+
+bool llama_kv_cache_iswa_context::restore_precompute() noexcept {
+    const bool swa = ctx_swa->restore_precompute();
+    const bool base = ctx_base->restore_precompute();
+    return base && swa;
+}
+
+void llama_kv_cache_iswa_context::discard_precompute() noexcept {
+    ctx_base->discard_precompute();
+    ctx_swa->discard_precompute();
+}
+
 bool llama_kv_cache_iswa_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 

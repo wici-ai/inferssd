@@ -1712,17 +1712,30 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    struct precompute_guard {
+        ggml_backend_sched_t sched;
+        llama_memory_context_i * memory;
+        ~precompute_guard() {
+            if (memory && !memory->precompute_submitted()) {
+                // Input uploads and the preceding pipelined ubatch may still
+                // borrow this metadata. Only failure paths add this fence.
+                ggml_backend_sched_synchronize(sched);
+                (void) memory->cancel_precompute();
+            }
+        }
+    } memory_guard{sched.get(), mctx};
+    if (mctx && !mctx->apply_precompute()) {
+        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
     if (cpu_sink_decode_active && ubatch.n_tokens > 1 && !cpu_sink_multi_token_reported) {
         // the sink decodes one token at a time and the prefill route is for prefill: a larger decode ubatch (a draft
         // to verify) runs ggml's MUL_MAT_ID where the scheduler puts it
         LLAMA_LOG_WARN("[kimi_cpu_sink] n_tokens=%u in decode runs ggml's MUL_MAT_ID %s; the sink decodes one token\n",
             ubatch.n_tokens, gpu_offloads_experts(ubatch.n_tokens) ? "on the GPU" : "on the CPU over the mapped experts");
         cpu_sink_multi_token_reported = true;
-    }
-    if (mctx && !mctx->apply()) {
-        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
     }
 
     ggml_backend_sched_kimi_set_dense_decode(
@@ -1824,7 +1837,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         cpu_sink_runtime->begin(registry, cache_decode ? static_cast<uint64_t>(ubatch.pos[0]) : 0,
             cache_decode, cache_decode ? ubatch.seq_id[0][0] : 0);
     }
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, mctx);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2387,26 +2400,47 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         if (!res) {
-            // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
-            llama_pos pos_min[LLAMA_MAX_SEQ];
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                pos_min[s] = std::numeric_limits<llama_pos>::max();
-            }
+            // Pre-submit cancellation already restores exact metadata, even
+            // when capture failed before apply. A legacy suffix removal here
+            // would delete valid restored positions for an overwriting batch.
+            if (!mctx->cancel_precompute()) {
+                if (mctx->precompute_rollback_failed()) {
+                    // An invariant failure may leave partial metadata indexes.
+                    // Do not traverse them through seq_rm's stronger assertions.
+                    LLAMA_LOG_ERROR("%s: metadata undo failed; clearing all memory, checkpoint/replay required\n", __func__);
+                    memory->clear(true);
+                } else {
+                    llama_pos pos_min[LLAMA_MAX_SEQ];
+                    for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                        pos_min[s] = std::numeric_limits<llama_pos>::max();
+                    }
 
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const auto & seq_id = ubatch.seq_id[i][0];
+                    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                            const auto seq_id = ubatch.seq_id[i][j];
+                            pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+                        }
+                    }
 
-                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
-            }
+                    for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                        if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                            continue;
+                        }
 
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
-                    continue;
+                        LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+
+                        if (!memory->seq_rm(s, pos_min[s], -1)) {
+                            // A recurrent/compressed implementation may have no
+                            // payload rollback after submit. Invalidate this sequence
+                            // instead of exposing failed-token metadata as usable KV.
+                            LLAMA_LOG_ERROR("%s: cannot roll back failed ubatch for seq_id=%d; clearing sequence, checkpoint/replay required\n", __func__, s);
+                            if (!memory->seq_rm(s, -1, -1)) {
+                                LLAMA_LOG_ERROR("%s: sequence clear failed; clearing all memory\n", __func__);
+                                memory->clear(true);
+                            }
+                        }
+                    }
                 }
-
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
-
-                memory->seq_rm(s, pos_min[s], -1);
             }
 
             switch (status) {
@@ -3148,7 +3182,8 @@ llm_graph_params llama_context::graph_params(
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+            llama_memory_context_i * mctx) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3178,6 +3213,7 @@ ggml_status llama_context::graph_compute(
     const bool graph_profile = ssd_runtime && ssd_runtime->diagnostics.profile_enabled();
     const int64_t t_submit_start_us = graph_profile ? ggml_time_us() : 0;
     ggml_backend_sched_kimi_set_profile_phase(sched.get(), batched ? 1 : 2);
+    if (mctx) { mctx->submit_precompute(); }
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     ggml_backend_sched_kimi_set_profile_phase(sched.get(), 0);
     if (graph_profile) {

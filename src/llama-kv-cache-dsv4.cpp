@@ -1574,6 +1574,29 @@ bool llama_kv_cache_dsv4_raw_context::next() {
     return true;
 }
 
+bool llama_kv_cache_dsv4_raw_context::save_precompute() {
+    if (ubatches_write.empty()) { return false; }
+    // Finish every allocation before apply can publish either raw cache.
+    const bool base = !ctx_base_mem || ctx_base_mem->save_precompute();
+    precompute_swa = kv_swa->save_ubatch_metadata(sinfos_write[i_next]);
+    return base;
+}
+
+bool llama_kv_cache_dsv4_raw_context::restore_precompute() noexcept {
+    bool restored = true;
+    if (precompute_swa) {
+        restored = kv_swa->restore_ubatch_metadata(*precompute_swa);
+        precompute_swa.reset();
+    }
+    if (ctx_base_mem) { restored = ctx_base_mem->restore_precompute() && restored; }
+    return restored;
+}
+
+void llama_kv_cache_dsv4_raw_context::discard_precompute() noexcept {
+    precompute_swa.reset();
+    if (ctx_base_mem) { ctx_base_mem->discard_precompute(); }
+}
+
 bool llama_kv_cache_dsv4_raw_context::apply() {
     bool res = true;
 
@@ -1847,6 +1870,14 @@ bool llama_kv_cache_dsv4_context::next() {
 
     return true;
 }
+
+bool llama_kv_cache_dsv4_context::save_precompute() {
+    return !ubatches.empty() && ctx_raw->save_precompute();
+}
+
+bool llama_kv_cache_dsv4_context::restore_precompute() noexcept { return ctx_raw->restore_precompute(); }
+
+void llama_kv_cache_dsv4_context::discard_precompute() noexcept { ctx_raw->discard_precompute(); }
 
 bool llama_kv_cache_dsv4_context::apply() {
     assert(!llama_memory_status_is_fail(status));
