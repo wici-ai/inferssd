@@ -26,7 +26,7 @@ def observe(session, config, model, output):
     # candidate source tree. A server.log is intentionally absent here.
     from inferssd.engine.runtime import LocalObservations
     from inferssd.telemetry.controller import NativeObservationSession
-    arm = NativeObservationSession(files=LocalObservations()).read_arm_cached(output, 0)
+    arm = NativeObservationSession(files=LocalObservations()).read_arm_cached(str(output), 0)
     if not arm["groups"] or not arm["trace"] or not arm["prof"]:
         raise ValueError("production observer did not consume native route and profile records")
     receipt = dict(status="passed", source="native-events.jsonl", sha256=digest(events),

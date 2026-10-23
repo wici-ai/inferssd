@@ -57,3 +57,40 @@ def test_negative_finish_receipt_never_reports_ready(tmp_path, monkeypatch):
     assert report['cleanup_confirmed'] is False
     assert report['functional'] == 'failed' and report['performance'] == 'not-measured'
     assert (result / 'evidence-manifest.json').is_file()
+
+
+def test_native_observation_stage_uses_the_real_consumer(tmp_path, monkeypatch):
+    import json
+    from ci import staged_observations as observations
+
+    values = [
+        dict(v=1, seq=0, ev="ssd.controller.begin", schema=1),
+        dict(v=1, seq=1, ev="ssd.place.layer", epoch=1, token=32, layer=0,
+             decode=True, success=True, has_token=True, selected_experts=[7],
+             vram_hit=[False], cache_hit=[True], wall_us=9, wait_io_us=2, compute_us=5),
+    ]
+    raw = "".join(json.dumps(value) + "\n" for value in values).encode()
+
+    class Session:
+        def start(self, name, kind, argv, environment, cwd, timeout):
+            assert (name, kind, argv, environment, cwd, timeout) == (
+                "candidate-observations-muse", "test",
+                ["/usr/bin/cat", "/scratch/run/native-events.jsonl"], {}, "/scratch", 30)
+            return "stage"
+
+        def wait(self, stage, *, deadline):
+            assert stage == "stage" and deadline > 0
+            return dict(returncode=0, cleanup_confirmed=True)
+
+    def collect_log(session, stage, output):
+        (output / "stdout.log").write_bytes(raw)
+
+    monkeypatch.setattr(observations, "collect_log", collect_log)
+    output = tmp_path / "observation"
+    receipt = observations.observe(Session(), dict(path="/scratch/run/native-events.jsonl",
+                                                  cwd="/scratch"), "muse", output)
+    assert receipt["status"] == "passed"
+    assert (receipt["groups"], receipt["trace"], receipt["prof"]) == (1, 1, 1)
+    assert receipt["legacy_log_present"] is False
+    assert (output / "native-events.jsonl").read_bytes() == raw
+    assert json.loads((output / "observation.json").read_text()) == receipt
