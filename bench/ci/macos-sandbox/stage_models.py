@@ -2,13 +2,11 @@
 """Root-only APFS model clone staging. Never opens the personal home to workers."""
 import argparse
 import ctypes
-import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
-import sys
 
 import supervisor as core
 

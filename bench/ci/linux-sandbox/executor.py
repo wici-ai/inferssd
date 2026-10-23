@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import select
-import selectors
 import socket
 import stat
 import subprocess
@@ -13,7 +12,7 @@ import sys
 import time
 import uuid
 
-from contract import UNIT, protected, systemd
+from contract import UNIT, protected
 
 CLEAN_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 

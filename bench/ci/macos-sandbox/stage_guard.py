@@ -1,6 +1,6 @@
 #!/usr/bin/python3 -I
 """Independent privileged per-stage guardian, the sole parent of worker processes."""
-import json,os,pathlib,signal,socket,sys
+import json,pathlib,signal,socket,sys
 BASE=pathlib.Path('/Library/InferSSD-CI')
 sys.path.insert(0,str(BASE/'control'))
 import supervisor as s

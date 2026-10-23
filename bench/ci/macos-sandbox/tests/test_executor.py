@@ -1,5 +1,4 @@
 """Portable contract/file-sealing checks; never claimed as native isolation proof."""
-import importlib.util
 import os
 from pathlib import Path
 import tempfile

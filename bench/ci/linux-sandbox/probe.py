@@ -2,7 +2,6 @@
 """Real root-only negative gates; produces no model/performance samples."""
 
 import argparse
-import fcntl
 import json
 import os
 from pathlib import Path
