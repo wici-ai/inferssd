@@ -153,9 +153,12 @@ int main(int argc, char ** argv) {
         if (setrlimit(RLIMIT_FSIZE, &limit)) {
             _exit(2);
         }
-        const auto first  = failed.value->event("ssd.io.read", "{}");
-        const auto second = failed.value->event("ssd.io.read", "{}");
-        _exit(!first && first.code == ssd::status::io && !second && second.code == ssd::status::io ? 0 : 3);
+        const auto first   = failed.value->event("ssd.io.read", "{}");
+        const auto second  = failed.value->event("ssd.io.read", "{}");
+        const auto third   = failed.value->flush();
+        const bool refused = !first && first.code == ssd::status::io && !second && second.code == ssd::status::io &&
+                             !third && third.code == ssd::status::io;
+        _exit(refused ? 0 : 3);
     }
     int status = 0;
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);

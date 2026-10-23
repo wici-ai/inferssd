@@ -148,6 +148,9 @@ def parse(
     overrides: Sequence[tuple[str, str]] = (),
     platform: str = "linux",
 ) -> Snapshot:
+    source.encode("utf-8")
+    if text is not None:
+        text.encode("utf-8")
     if platform not in ("linux", "darwin"):
         raise ValueError("unknown settings platform " + platform)
     properties: dict[str, Any] = schema()["properties"]

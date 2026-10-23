@@ -347,8 +347,9 @@ result<snapshot> parse(const std::string &                 text,
                        const std::string &                 source,
                        const std::vector<override_value> & overrides,
                        const std::string &                 platform) noexcept {
-    std::string where = source;
+    std::string where;
     try {
+        where = source;
         if (!json::valid_utf8(text) || !json::valid_utf8(source)) {
             return failure<snapshot>(status::invalid, "settings source/text must be UTF-8");
         }

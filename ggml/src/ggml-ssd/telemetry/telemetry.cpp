@@ -14,28 +14,37 @@ namespace ssd {
 namespace telemetry {
 
 result<std::unique_ptr<writer>> writer::open(const std::string & path) noexcept {
-    int         fd     = -1;
-    std::FILE * stream = nullptr;
+    // The fd and FILE must have exactly one owner even while constructing an
+    // error result or allocating the writer. In particular fdopen failure must
+    // never leave a closed descriptor available for a catch block to close again.
+    struct file_owner {
+        int         fd     = -1;
+        std::FILE * stream = nullptr;
+
+        ~file_owner() {
+            if (stream) {
+                std::fclose(stream);
+            } else if (fd >= 0) {
+                ::close(fd);
+            }
+        }
+    } owned;
+
     try {
-        fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-        if (fd < 0) {
+        owned.fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (owned.fd < 0) {
             return { nullptr, status::io, path + ": " + std::strerror(errno) };
         }
-        stream = fdopen(fd, "w");
-        if (!stream) {
+        owned.stream = fdopen(owned.fd, "w");
+        if (!owned.stream) {
             const int code = errno;
-            ::close(fd);
             return { nullptr, status::io, path + ": " + std::strerror(code) };
         }
-        fd = -1;
-        std::unique_ptr<writer> out(new writer(stream));
+        owned.fd = -1;
+        std::unique_ptr<writer> out(new writer(owned.stream));
+        owned.stream = nullptr;
         return { std::move(out), status::ok, {} };
     } catch (const std::bad_alloc &) {
-        if (stream) {
-            std::fclose(stream);
-        } else if (fd >= 0) {
-            ::close(fd);
-        }
         return { nullptr, status::resource, "oom" };
     }
 }
@@ -109,6 +118,7 @@ result<void> writer::flush() noexcept {
             return { status::io, "telemetry stream previously failed" };
         }
         if (std::fflush(stream_) != 0) {
+            failed_ = true;
             return { status::io, "telemetry flush failed" };
         }
         return {};

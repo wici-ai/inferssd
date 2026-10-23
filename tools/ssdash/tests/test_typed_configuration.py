@@ -156,3 +156,21 @@ def test_effective_settings_requires_registry_and_typed_receipts():
 def test_telemetry_protocol_rejects_invalid(line):
     with pytest.raises(ValueError):
         list(read_events([line]))
+
+
+@pytest.mark.parametrize(
+    "text,source",
+    [
+        ("ssdash-settings 1\ncpu.threads=2 # \ud800\n", "input.ssd"),
+        ("ssdash-settings 1\n", "input-\udfff.ssd"),
+    ],
+)
+def test_unpaired_surrogate_rejected_even_in_receipts(text, source):
+    with pytest.raises(ValueError):
+        parse(text, source)
+
+
+def test_unicode_source_and_receipt_preserved():
+    value = parse("ssdash-settings 1\ncpu.threads=2 # 来源=测量🐈\n", "设置🐈.ssd")
+    assert value.at("cpu.threads").location == "设置🐈.ssd:2"
+    assert value.at("cpu.threads").receipt == " 来源=测量🐈"
