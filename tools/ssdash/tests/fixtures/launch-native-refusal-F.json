@@ -1,0 +1,54 @@
+{
+  "source_sha256": "7a23a3ddee0993679cbaf6c3c9cc96c78bfd42c04890d76d546c8018e5c522db",
+  "definitions": "die() { echo \"$*\" >&2; exit \"${2:-1}\"; }\nrefuse() { if [[ $dry_run == 1 ]]; then echo \"dry run: the launch would stop here: $*\" >&2; else die \"$@\"; fi; }",
+  "cases": [
+    {
+      "name": "native-port",
+      "dry_run": "0",
+      "message": "Port 8080 is already in use",
+      "code": 1,
+      "stdout": "",
+      "stderr": "Port 8080 is already in use\n"
+    },
+    {
+      "name": "dry-port",
+      "dry_run": "1",
+      "message": "Port 8080 is already in use",
+      "code": 0,
+      "stdout": "continued\n",
+      "stderr": "dry run: the launch would stop here: Port 8080 is already in use\n"
+    },
+    {
+      "name": "native-multiline",
+      "dry_run": "0",
+      "message": "The GPU already runs a compute process:\n123 fixture",
+      "code": 1,
+      "stdout": "",
+      "stderr": "The GPU already runs a compute process:\n123 fixture\n"
+    },
+    {
+      "name": "dry-multiline",
+      "dry_run": "1",
+      "message": "The GPU already runs a compute process:\n123 fixture",
+      "code": 0,
+      "stdout": "continued\n",
+      "stderr": "dry run: the launch would stop here: The GPU already runs a compute process:\n123 fixture\n"
+    },
+    {
+      "name": "native-empty-flag",
+      "dry_run": "",
+      "message": "cgroup v2 is required",
+      "code": 1,
+      "stdout": "",
+      "stderr": "cgroup v2 is required\n"
+    },
+    {
+      "name": "native-literal",
+      "dry_run": "0",
+      "message": "literal $value `text` and 'quoted' 数据",
+      "code": 1,
+      "stdout": "",
+      "stderr": "literal $value `text` and 'quoted' 数据\n"
+    }
+  ]
+}
