@@ -486,6 +486,8 @@ endif()
 # build test-tokenizer-0 target once and add many tests
 llama_build_and_test(test-vocab-loading.cpp)
 target_include_directories(test-vocab-loading PRIVATE ../src)
+llama_build_and_test(test-nemotron-gqa.cpp)
+set_tests_properties(test-nemotron-gqa PROPERTIES TIMEOUT 60)
 
 llama_build(test-tokenizer-0.cpp)
 
@@ -620,6 +622,9 @@ llama_build_and_test(test-chat-literal.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggm
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if (Python3_Interpreter_FOUND)
+    add_test(NAME test-nemotron-converter
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test-nemotron-converter.py)
+    set_tests_properties(test-nemotron-converter PROPERTIES LABELS python)
     add_test(
         NAME test-moe-copy-lru-sim
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}

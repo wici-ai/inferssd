@@ -1,5 +1,20 @@
 # Source provenance
 
+## Nemotron attention-dimension compatibility
+
+The explicit head-dimension RoPE calculation and non-standard GQA tensor shapes
+are selectively adapted from ggml-org/llama.cpp
+[`0693dbfb915f33233818373b5f6969396658d02c`](https://github.com/ggml-org/llama.cpp/commit/0693dbfb915f33233818373b5f6969396658d02c),
+[PR #23343](https://github.com/ggml-org/llama.cpp/pull/23343), by Martin Cimmino
+(MIT). Tensor loading remains in SSDash's `src/llama-model.cpp`, and conversion
+remains in the monolithic `convert_hf_to_gguf.py`. The no-`head_dim` conversion
+fallback is preserved exactly. The upstream BPE/Metaspace/Domyn tokenizer changes
+are **not** included: this is not a claim of complete Domyn model support.
+
+Local tests cover explicit-head metadata and synthetic GGUF loading/inference
+for standard and non-standard GQA, merged/split QKV, optional biases and invalid
+shapes. No full model weights were used for qualification.
+
 ## Vocabulary loading port
 
 The bounded metadata previews, vocabulary-map reservations, merge parsing and
