@@ -1,6 +1,6 @@
 // The MXFP4 grouped-prefill cost model alone (ggml/src/ggml-cpu/kimi-prefill-cost.h): the per-expert fit, the coupling
 // of the drive with the lanes, and the choice of the experts that move to the GPU.
-#include "kimi-prefill-cost.h"
+#include "../ggml/src/ggml-ssd/place/layer-plan.h"
 
 #include <algorithm>
 #include <cmath>

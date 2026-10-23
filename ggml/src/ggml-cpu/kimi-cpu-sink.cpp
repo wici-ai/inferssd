@@ -1,7 +1,7 @@
 #include "kimi-cpu-sink.h"
 #include "kimi-cpu-sink-internal.h"
-#include "kimi-prefill-cost.h"
-#include "kimi-host-lock.h"
+#include "../ggml-ssd/place/layer-plan.h"
+#include "../ggml-ssd/host/page-lock.h"
 #include "kimi-cache-location-api.h"
 
 #include <algorithm>
@@ -41,7 +41,7 @@ static void sink_error(char * dst, size_t size, const char * message) {
 #include <cerrno>
 #include <fcntl.h>
 #include <dlfcn.h>
-#include "kimi-host-ledger.h"
+#include "../ggml-ssd/host/ledger.h"
 #include "kimi-vram-tier-api.h"
 #include "kimi-vram-location-api.h"
 #include <linux/io_uring.h>

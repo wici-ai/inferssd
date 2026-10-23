@@ -1,6 +1,6 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
-#include "../kimi-memory-boost.h"
+#include "../ggml-ssd/host/budget-linux.h"
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/common.cuh"

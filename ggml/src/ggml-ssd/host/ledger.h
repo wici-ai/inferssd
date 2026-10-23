@@ -35,7 +35,7 @@
 // read them again one synchronous fault at a time. The prefill's graph prices them (prefill_pages) before it runs; both
 // terms hold that room from then until the first decode token, so the RAM cache gives it back at once at the prefill's
 // start and takes it back at the first decode token.
-#include "../kimi-memory-boost.h"
+#include "budget-linux.h"
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>

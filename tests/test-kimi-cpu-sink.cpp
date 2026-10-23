@@ -39,7 +39,7 @@
 #include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
-#include "kimi-host-ledger.h"
+#include "../ggml/src/ggml-ssd/host/ledger.h"
 #include "linux-test-resources.h"
 
 static void require(bool ok, const std::string & what) { if (!ok) { throw std::runtime_error(what); } }

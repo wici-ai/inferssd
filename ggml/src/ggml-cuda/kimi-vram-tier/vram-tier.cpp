@@ -1,6 +1,6 @@
 #include "vram-slot-table.h"
 #include "vram-compute-api.h"
-#include "kimi-prefill-cost.h"
+#include "../../ggml-ssd/place/layer-plan.h"
 #include "kimi-vram-location-api.h"
 #include "kimi-mxfp4-batch.h"
 #include "ggml.h"

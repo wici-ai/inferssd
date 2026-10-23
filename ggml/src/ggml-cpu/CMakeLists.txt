@@ -25,6 +25,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     endif()
 
     ggml_add_backend_library(${GGML_CPU_NAME})
+    target_link_libraries(${GGML_CPU_NAME} PRIVATE ggml-ssd)
 
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
@@ -35,7 +36,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/kimi-cpu-sink.cpp
         ggml-cpu/kimi-cpu-sink.h
         ggml-cpu/kimi-cpu-sink-internal.h
-        ggml-cpu/kimi-host-ledger.h
+        ggml-ssd/host/ledger.h
         ggml-cpu/kimi-cpu-prefill.cpp
         ggml-cpu/kimi-cpu-prefill.h
         ggml-cpu/repack.cpp
