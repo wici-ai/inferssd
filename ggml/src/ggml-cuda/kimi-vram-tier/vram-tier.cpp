@@ -474,6 +474,13 @@ struct tier {
         }
     }
     void register_seed(){
+        // The legacy registry routes only by device and resolves keys through a
+        // process-global source index. A managed tier must wait for explicit
+        // per-context source and offer ownership before it can register there.
+        if(host_client){
+            std::fprintf(stderr,"[ssd.tier] legacy prefill seeding disabled: context source routing is required\n");
+            return;
+        }
         if(seed_registered || device<0)return;
         if(!seed_resolve)seed_resolve=reinterpret_cast<resolve_fn>(dlsym(RTLD_DEFAULT,"ggml_cuda_moe_expert_pack_resolve_raw_direct_shape"));
         auto reg=reinterpret_cast<seed_register_fn>(dlsym(RTLD_DEFAULT,"ggml_cuda_moe_seed_register"));
