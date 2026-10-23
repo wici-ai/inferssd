@@ -1,5 +1,5 @@
 // The grouped prefill engine for any expert format (vram_group_compute_api, vram-compute-api.h). The matrix products
-// are the CUDA backend's (ggml_cuda_moe_stream_mm_*, its MUL_MAT kernels), loaded at run time like the decode
+// are the CUDA backend's (ggml_cuda_moe_stream_mm_*, its MUL_MAT kernels), normally linked into the backend like the decode
 // engine's matrix-vector products (q2-compute-adapter.cu). Per expert and chunk of at most `chunk` tokens:
 //   1. the chunk's input rows, gathered by row and quantized for the up/gate type (one operand for both);
 //   2. up and gate;
@@ -143,7 +143,7 @@ struct group_engine {
         try {
             if (!supports || !create || !mm_destroy || !mm_release || !mm_reserve || !mm_operand_bytes || !mm_quantize || !mm ||
                     !mm_device_bytes) {
-                throw std::runtime_error("CUDA grouped expert products are missing; build with GGML_CUDA_MOE_STREAM=ON");
+                throw std::runtime_error("CUDA grouped expert products are missing from the SSD executor");
             }
             if (!supports(up_type) || !supports(down_type)) {
                 throw std::runtime_error(std::string("grouped VRAM engine: no CUDA matrix product for ") +

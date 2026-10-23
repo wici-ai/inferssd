@@ -2,8 +2,6 @@ cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
 find_package(CUDAToolkit)
 
-option(GGML_CUDA_MOE_STREAM "Compile the opt-in CUDA MoE streaming path" ON)
-
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
 
@@ -104,8 +102,6 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
-    list(APPEND GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/moe_stream_decode_batch.cu")
-    list(REMOVE_DUPLICATES GGML_SOURCES_CUDA)
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -132,45 +128,19 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
-    target_sources(ggml-cuda PRIVATE ssd/staging.cpp)
-    target_link_libraries(ggml-cuda PRIVATE ggml-ssd-object-io)
-
     if (GGML_CUDA_KIMI_VRAM_TIER)
-        if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT GGML_CUDA_MOE_STREAM)
-            message(FATAL_ERROR "SSD CUDA executor requires Linux and GGML_CUDA_MOE_STREAM")
+        if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            message(FATAL_ERROR "SSD CUDA executor requires Linux")
         endif()
+        target_sources(ggml-cuda PRIVATE ssd/staging.cpp ssd/group-matmul.cu)
+        target_link_libraries(ggml-cuda PRIVATE ggml-ssd-object-io)
         add_subdirectory(ssd)
-    endif()
-
-    if (LLAMA_SSD_STORE)
-        target_link_libraries(ggml-cuda PRIVATE ggml-ssd-c0-store)
-        target_compile_definitions(ggml-cuda PRIVATE GGML_SSD_STORE)
-        set_property(TARGET ggml-cuda APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
     endif()
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
-    endif()
-
-    option(GGML_CUDA_MOE_STREAM_BATCH "enable CUDA MoE stream batch path" OFF)
-    if (LLAMA_SSD_STORE AND (NOT GGML_CUDA_MOE_STREAM OR NOT GGML_CUDA_MOE_STREAM_BATCH))
-        message(FATAL_ERROR "LLAMA_SSD_STORE requires -DGGML_CUDA_MOE_STREAM=ON and -DGGML_CUDA_MOE_STREAM_BATCH=ON for CUDA builds; no portable fallback is selected")
-    endif()
-    if (GGML_CUDA_MOE_STREAM)
-        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_MOE_STREAM)
-        if (GGML_CUDA_MOE_STREAM_BATCH)
-            target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_MOE_STREAM_BATCH)
-        endif()
-        if (UNIX AND NOT APPLE)
-            find_library(GGML_CUDA_LIBURING uring)
-            if (GGML_CUDA_LIBURING)
-                target_link_libraries(ggml-cuda PRIVATE ${GGML_CUDA_LIBURING})
-            else()
-                target_compile_definitions(ggml-cuda PRIVATE GGML_MOE_DISABLE_LIBURING)
-            endif()
-        endif()
     endif()
 
     if (GGML_CUDA_FORCE_MMQ)

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 #pragma once
-#include "../moe-common-cache-identity.h"
+#include "ggml-ssd/store/object-identity.h"
 #include "ggml-ssd/io/object-uring.h"
 #include <vector>
 struct CUevent_st;

@@ -247,7 +247,7 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
 
-#ifdef GGML_CUDA_MOE_STREAM
+#ifdef GGML_SSD_CUDA_EXECUTOR
 void ggml_cuda_moe_stream_mmq(
         ggml_backend_cuda_context & ctx, ggml_type type, const char * x, int64_t ncols, int64_t nrows, int64_t stride_row_x,
         const int * y, int64_t n, float * dst, cudaStream_t stream) {
@@ -272,7 +272,7 @@ void ggml_cuda_moe_stream_mmq(
         use_stream_k, n};
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
-#endif // GGML_CUDA_MOE_STREAM
+#endif // GGML_SSD_CUDA_EXECUTOR
 
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,

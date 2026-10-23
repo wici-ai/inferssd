@@ -1218,7 +1218,7 @@ void ggml_cuda_op_mul_mat_vec_q(
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }
 
-#ifdef GGML_CUDA_MOE_STREAM
+#ifdef GGML_SSD_CUDA_EXECUTOR
 extern "C" bool ggml_cuda_moe_stream_mmvf_dev(
     int, const void *, int64_t, int64_t, size_t, const float *, float *, int64_t, cudaStream_t);
 extern "C" bool ggml_cuda_moe_stream_mmvq_dev(
@@ -1373,7 +1373,7 @@ extern "C" bool ggml_cuda_moe_stream_mmvq_batch_dev(
     }
     return true;
 }
-#endif // GGML_CUDA_MOE_STREAM
+#endif // GGML_SSD_CUDA_EXECUTOR
 
 size_t ggml_cuda_mul_mat_vec_q_pool_size(const ggml_tensor * src1) {
     const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);

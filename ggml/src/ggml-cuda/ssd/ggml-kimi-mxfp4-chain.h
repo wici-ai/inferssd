@@ -7,7 +7,7 @@ extern "C" {
 
 // Optional GPU hidden chain for the MXFP4 VRAM tier (DeepSeek-V4.1 routed experts),
 // compiled into the same DSO as the matvec parity component: kimi-mxfp4-chain.cu
-// includes kimi-mxfp4-parity.cu unchanged. One submission per layer: one H2D of the
+// includes private mxfp4-kernels.cuh unchanged. One submission per layer: one H2D of the
 // job descriptors and the Q8_0 input, the stage-1 up/gate matvec, the clamped SwiGLU
 // on the device (device expf), device Q8_0 of the hidden rows, the stage-2 down matvec
 // on that device buffer and one D2H of the unweighted down rows. NOT bitwise equal to

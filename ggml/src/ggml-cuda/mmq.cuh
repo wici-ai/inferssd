@@ -4112,14 +4112,14 @@ size_t ggml_cuda_mul_mat_q_pool_size(const ggml_tensor * src0, const ggml_tensor
 // the most that the stream-k fixup of a quantized matrix multiplication takes from the memory pool
 size_t ggml_cuda_mul_mat_q_fixup_pool_size();
 
-#ifdef GGML_CUDA_MOE_STREAM
+#ifdef GGML_SSD_CUDA_EXECUTOR
 // One matrix of `type` (nrows rows of ncols values, stride_row_x blocks apart) times n columns of an operand quantized
 // as ggml_cuda_mul_mat_q quantizes src1 without ids (quantize_mmq_q8_1_cuda, or quantize_mmq_mxfp4_cuda for MXFP4 on
 // Blackwell). dst receives n columns of nrows floats. Stream-k's fixup comes from ctx's pool.
 void ggml_cuda_moe_stream_mmq(
         ggml_backend_cuda_context & ctx, ggml_type type, const char * x, int64_t ncols, int64_t nrows, int64_t stride_row_x,
         const int * y, int64_t n, float * dst, cudaStream_t stream);
-#endif // GGML_CUDA_MOE_STREAM
+#endif // GGML_SSD_CUDA_EXECUTOR
 
 void ggml_cuda_op_mul_mat_q(
     ggml_backend_cuda_context & ctx,

@@ -19,13 +19,12 @@
 // so a product made after it allocates no device memory; release gives all of it back. reserve also loads every kernel
 // the products can take: CUDA loads a kernel, and takes device memory for its module, on the kernel's first launch
 // (lazy loading) and keeps it for the process, so that happens in reserve and not in the middle of a pass.
-#ifdef GGML_CUDA_MOE_STREAM
-#include "common.cuh"
-#include "convert.cuh"
-#include "mmq.cuh"
-#include "mmvf.cuh"
-#include "mmvq.cuh"
-#include "quantize.cuh"
+#include "../common.cuh"
+#include "../convert.cuh"
+#include "../mmq.cuh"
+#include "../mmvf.cuh"
+#include "../mmvq.cuh"
+#include "../quantize.cuh"
 
 #include <algorithm>
 #include <memory>
@@ -408,4 +407,3 @@ extern "C" size_t ggml_cuda_moe_stream_mm_device_bytes(void * context) {
     }
     return pool + mm->dequant_bytes + (mm->workspace ? moe_stream_mm_workspace_bytes : 0);
 }
-#endif // GGML_CUDA_MOE_STREAM

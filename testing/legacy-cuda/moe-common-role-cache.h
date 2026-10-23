@@ -1,7 +1,7 @@
 #pragma once
 
 #include "moe-expert-descriptor.h"
-#include "moe-common-cache-identity.h"
+#include "../../ggml/src/ggml-ssd/store/object-identity.h"
 
 #include <cstddef>
 #include <cstdint>

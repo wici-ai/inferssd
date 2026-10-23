@@ -18,11 +18,11 @@ void ggml_cuda_op_mul_mat_vec_q(
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
-#ifdef GGML_CUDA_MOE_STREAM
+#ifdef GGML_SSD_CUDA_EXECUTOR
 // One matrix of `type` (nrows rows of ncols values, stride_row_x blocks apart) times n <= MMVQ_MAX_BATCH_SIZE columns of
 // an operand quantized as ggml_cuda_mul_mat_vec_q quantizes src1 (quantize_row_q8_1_cuda, rows padded to
 // MATRIX_ROW_PADDING). dst receives n columns of nrows floats.
 void ggml_cuda_moe_stream_mmvq(
         ggml_type type, const void * x, int64_t ncols, int64_t nrows, int64_t stride_row_x,
         const void * y, int64_t n, float * dst, cudaStream_t stream);
-#endif // GGML_CUDA_MOE_STREAM
+#endif // GGML_SSD_CUDA_EXECUTOR

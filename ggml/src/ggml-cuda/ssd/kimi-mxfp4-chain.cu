@@ -6,7 +6,7 @@
 // device buffer, and one D2H of the unweighted down rows. Not bitwise: expf, the device
 // quantizer and (for the rows kernels) the matvec accumulation order differ from the
 // CPU sink in the last bits. Selected by GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN=1.
-#include "kimi-mxfp4-parity.cu"
+#include "mxfp4-kernels.cuh"
 #include "ggml-kimi-mxfp4-chain.h"
 
 namespace {

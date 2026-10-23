@@ -3,7 +3,7 @@
 #include "../gpu/provider.h"
 #include "../gpu/transport.h"
 #include "../telemetry/telemetry.h"
-#include "../../ggml-moe-pack-plan.h"
+#include "copy-plan.h"
 #include <algorithm>
 #include <string>
 
