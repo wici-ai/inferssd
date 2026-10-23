@@ -10,7 +10,8 @@ int main(){
     inputs.set("tier.policy", "lru");
     inputs.set("tier.min_count", "0");
     inputs.set("tier.global", "1");
-    inputs.set("tier.half_life", "0");
+    // The retired environment zero sentinel resolved to this effective default.
+    inputs.set("tier.half_life", "2");
     const size_t role=lifecycle_role_bytes();
     std::vector<unsigned char> payload[4];
     kimi_vram_request requests[4]={};
