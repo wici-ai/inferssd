@@ -15,7 +15,7 @@
 #include "ggml.h"
 #include "common.h"
 #if defined(__APPLE__)
-#include "mac-expert-pack-cache.h"
+#include "ssd/mac-expert-source.h"
 #endif
 
 #if defined(_MSC_VER) || defined(__MINGW32__)

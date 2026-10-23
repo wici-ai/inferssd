@@ -12,6 +12,21 @@ python3 -m pip install ./gguf-py
 bash scripts/build-macos-metal.sh
 ```
 
+The equivalent CMake configuration is available as `macos-metal`:
+
+```sh
+cmake --preset macos-metal
+cmake --build build-macos-metal --target llama-server llama-cli
+export SSD_LLAMA_BUILD_DIR="$PWD/build-macos-metal"
+```
+
+The current Mac support stage uses the generic CPU expert operator and Metal
+for dense layers. The pinned LFU expert source lives in `ggml-cpu/ssd`; its
+regular-file reader lives in `ggml-ssd/io` and uses `pread` with `F_NOCACHE` on
+macOS. Read queues and cache pins keep their existing ownership and drain
+behavior. The full online adaptive framework and shared CPU expert executor
+remain planned for the next support stage.
+
 Set `SSD_LLAMA_MODEL` to the first shard of the matching model. Keep all shards
 in the same directory. For example:
 

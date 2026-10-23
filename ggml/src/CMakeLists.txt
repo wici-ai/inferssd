@@ -353,6 +353,10 @@ if (LLAMA_SSD_STORE)
     add_subdirectory(ggml-ssd/store)
 endif()
 
+if (UNIX)
+    add_subdirectory(ggml-ssd/io)
+endif()
+
 ggml_add_backend(CPU)
 
 if (GGML_CPU_ALL_VARIANTS)

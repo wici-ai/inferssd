@@ -90,6 +90,32 @@
     { "name": "x64-windows-sycl-release-f16", "inherits": [ "sycl-base", "release", "sycl_f16" ] },
 
     { "name": "x64-windows-vulkan-debug", "inherits": [ "base", "vulkan", "debug" ] },
-    { "name": "x64-windows-vulkan-release", "inherits": [ "base", "vulkan", "release" ] }
+    { "name": "x64-windows-vulkan-release", "inherits": [ "base", "vulkan", "release" ] },
+    {
+        "name": "macos-metal",
+        "displayName": "SSDash macOS Metal",
+        "inherits": [
+            "base",
+            "release"
+        ],
+        "condition": {
+            "type": "equals",
+            "lhs": "${hostSystemName}",
+            "rhs": "Darwin"
+        },
+        "cacheVariables": {
+            "GGML_NATIVE": "ON",
+            "GGML_CPU": "ON",
+            "GGML_METAL": "ON",
+            "GGML_METAL_EMBED_LIBRARY": "ON",
+            "GGML_BLAS": "ON",
+            "GGML_BLAS_VENDOR": "Apple",
+            "GGML_ACCELERATE": "ON",
+            "GGML_OPENMP": "OFF",
+            "GGML_CUDA": "OFF",
+            "GGML_BACKEND_DL": "OFF",
+            "LLAMA_BUILD_TESTS": "ON"
+        }
+    }
   ]
 }

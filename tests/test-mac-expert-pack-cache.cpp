@@ -1,6 +1,6 @@
 // Exercise the cache implementation without a model, GPU or Apple-only I/O.
 #define GGML_MAC_EXPERT_CACHE_TESTING
-#include "../ggml/src/ggml-cpu/mac-expert-pack-cache.cpp"
+#include "../ggml/src/ggml-cpu/ssd/mac-expert-source.cpp"
 
 #include <functional>
 

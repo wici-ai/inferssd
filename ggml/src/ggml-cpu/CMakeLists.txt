@@ -65,8 +65,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     if (APPLE)
         list(APPEND GGML_CPU_SOURCES
-            ggml-cpu/mac-expert-pack-cache.cpp
-            ggml-cpu/mac-expert-pack-cache.h)
+            ggml-cpu/ssd/mac-expert-source.cpp
+            ggml-cpu/ssd/mac-expert-source.h)
+        target_link_libraries(${GGML_CPU_NAME} PRIVATE ggml-ssd-pread)
     endif()
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
