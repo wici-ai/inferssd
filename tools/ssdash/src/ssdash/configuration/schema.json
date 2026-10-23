@@ -1,0 +1,265 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "SSDash settings v1",
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+        "expert.source": {
+            "description": "Expert index source paths in declared order",
+            "kind": "paths",
+            "unit": "path",
+            "producer": "plan",
+            "scope": "all",
+            "cli": "--ssd-expert-source",
+            "default_literal": "[]",
+            "type": "array",
+            "items": {
+                "type": "string",
+                "minLength": 1
+            },
+            "default": []
+        },
+        "cpu.threads": {
+            "description": "Total CPU participants including the I/O participant",
+            "kind": "integer",
+            "unit": "participants",
+            "producer": "plan",
+            "scope": "all",
+            "cli": "--ssd-cpu-threads",
+            "default_literal": "2",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 256,
+            "default": 2
+        },
+        "cpu.compute_cpus": {
+            "description": "Ordered unique CPU IDs for compute participants",
+            "kind": "cpus",
+            "unit": "CPU ID",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-cpu-compute-cpus",
+            "default_literal": "",
+            "type": "array",
+            "uniqueItems": true,
+            "maxItems": 65536,
+            "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2147483647
+            },
+            "default": []
+        },
+        "cpu.io_cpus": {
+            "description": "Ordered unique CPU IDs for I/O participants",
+            "kind": "cpus",
+            "unit": "CPU ID",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-cpu-io-cpus",
+            "default_literal": "",
+            "type": "array",
+            "uniqueItems": true,
+            "maxItems": 65536,
+            "items": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2147483647
+            },
+            "default": []
+        },
+        "cpu.decode_participants": {
+            "description": "Decode compute participants; zero selects the measured/default policy",
+            "kind": "integer",
+            "unit": "compute participants",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-cpu-decode-participants",
+            "default_literal": "0",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 255,
+            "default": 0
+        },
+        "prefetch.depth": {
+            "description": "Next-layer predicted experts, not a layer count or Mac read window",
+            "kind": "integer",
+            "unit": "predicted experts",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-prefetch-depth",
+            "default_literal": "2",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 64,
+            "default": 2
+        },
+        "place.costs": {
+            "description": "Measured placement cost terms; omitted terms retain calibrated priors",
+            "kind": "costs",
+            "unit": "named us and GB/s terms",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-place-costs",
+            "default_literal": "",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "cpu_fixed_us": {
+                    "type": "number",
+                    "maximum": 1000000,
+                    "minimum": 0
+                },
+                "cpu_route_us": {
+                    "type": "number",
+                    "maximum": 1000000,
+                    "minimum": 0
+                },
+                "drive_fixed_us": {
+                    "type": "number",
+                    "maximum": 1000000,
+                    "minimum": 0
+                },
+                "drive_gbps": {
+                    "type": "number",
+                    "maximum": 1000000,
+                    "minimum": 0
+                },
+                "gpu_fixed_us": {
+                    "type": "number",
+                    "maximum": 1000000,
+                    "minimum": 0
+                },
+                "gpu_host_fixed_us": {
+                    "type": "number",
+                    "maximum": 1000000,
+                    "minimum": 0
+                },
+                "gpu_host_route_us": {
+                    "type": "number",
+                    "maximum": 1000000,
+                    "minimum": 0
+                },
+                "gpu_route_us": {
+                    "type": "number",
+                    "maximum": 1000000,
+                    "minimum": 0
+                },
+                "gpu_token_us": {
+                    "type": "number",
+                    "maximum": 1000000,
+                    "minimum": 0
+                },
+                "link_gbps": {
+                    "type": "number",
+                    "maximum": 1000000,
+                    "exclusiveMinimum": 0
+                },
+                "pageable_gbps": {
+                    "type": "number",
+                    "maximum": 1000000,
+                    "minimum": 0
+                }
+            },
+            "default": {}
+        },
+        "prefill.cpu_max_tokens": {
+            "description": "Largest CPU prefill ubatch; transitional v0.1 setting",
+            "kind": "integer",
+            "unit": "tokens",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-prefill-cpu-max-tokens",
+            "default_literal": "4294967295",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295,
+            "default": 4294967295
+        },
+        "vram.budget": {
+            "description": "Expert VRAM byte budget or auto",
+            "kind": "budget",
+            "unit": "bytes",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-vram-budget",
+            "default_literal": "auto",
+            "oneOf": [
+                {
+                    "const": "auto"
+                },
+                {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 68719476736
+                }
+            ],
+            "default": "auto"
+        },
+        "vram.max_slots": {
+            "description": "Maximum expert slots; zero leaves the resource-derived bound",
+            "kind": "integer",
+            "unit": "slots",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-vram-max-slots",
+            "default_literal": "0",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295,
+            "default": 0
+        },
+        "vram.reserve_mib": {
+            "description": "CUDA allocation reserve in MiB",
+            "kind": "integer",
+            "unit": "MiB",
+            "producer": "launch",
+            "scope": "linux",
+            "cli": "--ssd-vram-reserve-mib",
+            "default_literal": "0",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 8192,
+            "default": 0
+        },
+        "vram.margin_mib": {
+            "description": "Elastic safety margin in MiB, at least reserve plus 64",
+            "kind": "integer",
+            "unit": "MiB",
+            "producer": "launch",
+            "scope": "linux",
+            "cli": "--ssd-vram-margin-mib",
+            "default_literal": "64",
+            "type": "integer",
+            "minimum": 64,
+            "maximum": 8192,
+            "default": 64
+        },
+        "host.headroom_mib": {
+            "description": "Host safety headroom in MiB",
+            "kind": "integer",
+            "unit": "MiB",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-host-headroom-mib",
+            "default_literal": "512",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295,
+            "default": 512
+        },
+        "host.expert_cache_mib": {
+            "description": "Mac M1 expert cache in MiB; M1 is a migration stage",
+            "kind": "integer",
+            "unit": "MiB",
+            "producer": "plan",
+            "scope": "darwin",
+            "cli": "--ssd-host-expert-cache-mib",
+            "default_literal": "4096",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 17592186044415,
+            "default": 4096
+        }
+    }
+}

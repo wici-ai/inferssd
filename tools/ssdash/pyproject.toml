@@ -16,7 +16,7 @@ ssdash = "ssdash.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ssdash = ["py.typed"]
+ssdash = ["py.typed", "configuration/schema.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
