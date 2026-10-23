@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <cstddef>
+
 namespace ssd {
 namespace store { struct source_view; }
 namespace gpu { struct provider_v1; struct cpu_kernels_v1; }
@@ -21,5 +23,6 @@ struct runtime_services {
     int gpu_device = 0;
     const store::source_view * source = nullptr;
     void * gpu_transport = nullptr;
+    size_t gpu_reserve_bytes = 0;
 };
 }  // namespace ssd

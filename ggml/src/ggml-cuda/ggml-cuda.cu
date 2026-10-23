@@ -9,6 +9,7 @@ extern "C" const ssd::gpu::provider_v1 * ggml_backend_cuda_ssd_api_v1();
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/activation-quant-reuse.cuh"
+#include "ggml-cuda/ssd/reserve-registry.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -145,12 +146,16 @@ static void ggml_cuda_memory_info(int device, size_t * free, size_t * total);
 // Memory that allocations must leave free, explicitly set by the typed tier
 // owner (on unified memory this also preserves the host working set).
 static std::array<std::atomic<size_t>, GGML_CUDA_MAX_DEVICES> g_cuda_dynamic_reserve = {};
+// Exactly one registry in the CUDA DSO. Each backend registration lives until
+// its borrowed transport has quiesced; one context cannot replace another's floor.
+static ssd::gpu::reserve_registry<GGML_CUDA_MAX_DEVICES> g_cuda_context_reserves;
 
 // Reclaim the elastic expert cache before an allocation would eat into the reserve, rather than waiting
 // until cudaMalloc/cuMemCreate has already exhausted the device (on unified memory it never fails). With
 // no reclaimer (or while it is unarmed), fail normally so the graph planner can try a smaller batch.
 static cudaError_t ggml_cuda_reserve_memory(int device, size_t size) {
-    const size_t reserve = g_cuda_dynamic_reserve[device].load(std::memory_order_relaxed);
+    const size_t reserve = std::max(g_cuda_dynamic_reserve[device].load(std::memory_order_relaxed),
+                                    g_cuda_context_reserves.maximum(device));
     if (!reserve) {
         return cudaSuccess;
     }
@@ -3681,6 +3686,9 @@ static void ggml_backend_cuda_free(ggml_backend_t backend) {
     if (cuda_ctx->ssd_services) {
         const auto & services = *cuda_ctx->ssd_services;
         services.gpu->transport->quiesce(services.gpu_transport);
+        if (g_cuda_context_reserves.remove(cuda_ctx) != ssd::status::ok) {
+            GGML_ABORT("cannot unregister CUDA context allocation reserve");
+        }
         cuda_ctx->ssd_services = nullptr;
     }
 #endif
@@ -5760,6 +5768,9 @@ extern "C" bool ggml_backend_cuda_ssd_attach_services(
         return refuse("CUDA SSD services are already attached to another context");
     }
     if (services->gpu_device != context->device) { return refuse("CUDA SSD service device differs from backend"); }
+    if (g_cuda_context_reserves.add(context, context->device, services->gpu_reserve_bytes) != ssd::status::ok) {
+        return refuse("cannot register CUDA context allocation reserve");
+    }
     context->ssd_services = services;
     if (error && error_size) { error[0] = '\0'; }
     return true;

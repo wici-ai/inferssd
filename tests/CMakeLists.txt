@@ -156,6 +156,12 @@ if (UNIX)
     target_include_directories(test-ssd-gpu-contract PRIVATE ../ggml/src ../ggml/include)
     add_test(NAME ssd_gpu_contract COMMAND test-ssd-gpu-contract)
 
+    add_executable(test-ssd-cuda-reserve test-ssd-cuda-reserve.cpp)
+    target_compile_features(test-ssd-cuda-reserve PRIVATE cxx_std_17)
+    target_include_directories(test-ssd-cuda-reserve PRIVATE ../ggml/src)
+    target_link_libraries(test-ssd-cuda-reserve PRIVATE Threads::Threads)
+    add_test(NAME ssd_cuda_reserve COMMAND test-ssd-cuda-reserve)
+
     add_executable(test-ssd-host-arbiter test-ssd-host-arbiter.cpp)
     target_compile_features(test-ssd-host-arbiter PRIVATE cxx_std_17)
     target_link_libraries(test-ssd-host-arbiter PRIVATE ggml-ssd-host Threads::Threads)
