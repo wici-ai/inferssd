@@ -2,6 +2,7 @@
 #pragma once
 
 #include "llama-ssd.h"
+#include "telemetry.h"
 #include "ggml-ssd/settings/settings.h"
 #include "ggml-ssd/telemetry/telemetry.h"
 #include "ggml-ssd/runtime-services.h"
@@ -34,6 +35,7 @@ struct llama_ssd_context {
     std::unique_ptr<void, llama_ssd_source_delete> source_owner;
     ssd::store::source_view sources;
     std::unique_ptr<ssd::telemetry::writer> events;
+    llama_ssd_telemetry diagnostics;
     ssd::runtime_services services;
     std::unique_ptr<void, llama_ssd_source_delete> gpu_transport;
     ssd::stream::runtime stream;

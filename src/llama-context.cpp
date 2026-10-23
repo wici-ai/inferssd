@@ -22,17 +22,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
-#include <fstream>
 #include <limits>
-#include <mutex>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <dlfcn.h>
-#endif
 
 extern "C" bool llama_moe_prefill_phase_workspace(
         llama_context * ctx,
@@ -47,16 +41,6 @@ extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(
         uint32_t prompt_tokens,
         uint32_t prefill_tokens);
 
-#if __has_include(<nvtx3/nvToolsExt.h>)
-#include <nvtx3/nvToolsExt.h>
-#define LLAMA_MOE_NVTX_HEADER_AVAILABLE 1
-#elif __has_include("/usr/local/cuda/include/nvtx3/nvToolsExt.h")
-#include "/usr/local/cuda/include/nvtx3/nvToolsExt.h"
-#define LLAMA_MOE_NVTX_HEADER_AVAILABLE 1
-#else
-#define LLAMA_MOE_NVTX_HEADER_AVAILABLE 0
-#endif
-
 //
 // llama_context
 //
@@ -64,761 +48,6 @@ extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(
 namespace {
 
 static std::atomic<uint64_t> kimi_cpu_sink_context_epoch { 1 };
-
-
-
-struct kimi_logits_trace_state {
-    std::mutex mutex;
-    FILE * file = nullptr;
-    bool initialized = false;
-    bool enabled = false;
-    bool have_last_hash = false;
-    uint64_t sequence = 0;
-    uint64_t last_hash = 0;
-    int32_t n_vocab = 0;
-};
-
-static kimi_logits_trace_state & kimi_logits_trace_get_state() {
-    static kimi_logits_trace_state * state = new kimi_logits_trace_state();
-    return *state;
-}
-
-static uint64_t kimi_logits_trace_hash(const float * logits, int32_t n_vocab) {
-    const uint8_t * bytes = reinterpret_cast<const uint8_t *>(logits);
-    const size_t size = (size_t) n_vocab * sizeof(float);
-    uint64_t hash = 1469598103934665603ULL;
-    for (size_t i = 0; i < size; ++i) {
-        hash ^= bytes[i];
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-static void kimi_logits_trace_write(const float * logits, int32_t n_vocab, int32_t output_index) {
-    const char * path = std::getenv("LLAMA_KIMI_LOGITS_TRACE");
-    if (!path || !path[0] || !logits || n_vocab <= 0) {
-        return;
-    }
-
-    kimi_logits_trace_state & state = kimi_logits_trace_get_state();
-    std::lock_guard<std::mutex> lock(state.mutex);
-    if (!state.initialized) {
-        state.initialized = true;
-        state.file = std::fopen(path, "wb");
-        if (!state.file) {
-            LLAMA_LOG_ERROR("[kimi_logits_trace] failed to open %s\n", path);
-            return;
-        }
-
-        const char magic[8] = { 'K', 'L', 'O', 'G', 'I', 'T', 'S', '1' };
-        const uint32_t version = 1;
-        const uint32_t vocab = (uint32_t) n_vocab;
-        if (std::fwrite(magic, sizeof(magic), 1, state.file) != 1 ||
-                std::fwrite(&version, sizeof(version), 1, state.file) != 1 ||
-                std::fwrite(&vocab, sizeof(vocab), 1, state.file) != 1) {
-            LLAMA_LOG_ERROR("[kimi_logits_trace] failed to write header to %s\n", path);
-            std::fclose(state.file);
-            state.file = nullptr;
-            return;
-        }
-        state.n_vocab = n_vocab;
-        state.enabled = true;
-        LLAMA_LOG_INFO("[kimi_logits_trace] enabled: %s n_vocab=%d\n", path, n_vocab);
-    }
-
-    if (!state.enabled || !state.file || state.n_vocab != n_vocab) {
-        return;
-    }
-
-    const uint64_t hash = kimi_logits_trace_hash(logits, n_vocab);
-    if (state.have_last_hash && state.last_hash == hash) {
-        return;
-    }
-
-    const uint64_t sequence = state.sequence++;
-    const uint32_t vocab = (uint32_t) n_vocab;
-    if (std::fwrite(&sequence, sizeof(sequence), 1, state.file) != 1 ||
-            std::fwrite(&output_index, sizeof(output_index), 1, state.file) != 1 ||
-            std::fwrite(&vocab, sizeof(vocab), 1, state.file) != 1 ||
-            std::fwrite(&hash, sizeof(hash), 1, state.file) != 1 ||
-            std::fwrite(logits, sizeof(float), (size_t) n_vocab, state.file) != (size_t) n_vocab ||
-            std::fflush(state.file) != 0) {
-        LLAMA_LOG_ERROR("[kimi_logits_trace] write failed at sequence %llu\n", (unsigned long long) sequence);
-        state.enabled = false;
-        return;
-    }
-
-    state.last_hash = hash;
-    state.have_last_hash = true;
-}
-
-struct llama_nvtx_api {
-    bool initialized = false;
-    bool enabled = false;
-#if !LLAMA_MOE_NVTX_HEADER_AVAILABLE
-    int (*range_push_a)(const char *) = nullptr;
-    int (*range_pop)() = nullptr;
-#endif
-};
-
-static llama_nvtx_api g_llama_nvtx;
-static std::once_flag g_llama_nvtx_once;
-
-static void llama_nvtx_init_once() {
-    const char *env = std::getenv("GGML_MOE_NVTX");
-    if (!env || !env[0] || env[0] == '0') {
-        g_llama_nvtx.initialized = true;
-        return;
-    }
-#if LLAMA_MOE_NVTX_HEADER_AVAILABLE
-    g_llama_nvtx.enabled = true;
-#else
-#if !defined(_WIN32)
-    void *handle = dlopen("libnvToolsExt.so.1", RTLD_LAZY | RTLD_LOCAL);
-    if (!handle) {
-        handle = dlopen("libnvToolsExt.so", RTLD_LAZY | RTLD_LOCAL);
-    }
-    if (handle) {
-        g_llama_nvtx.range_push_a = reinterpret_cast<int (*)(const char *)>(dlsym(handle, "nvtxRangePushA"));
-        g_llama_nvtx.range_pop = reinterpret_cast<int (*)()>(dlsym(handle, "nvtxRangePop"));
-        g_llama_nvtx.enabled = g_llama_nvtx.range_push_a && g_llama_nvtx.range_pop;
-    }
-#endif
-#endif
-    g_llama_nvtx.initialized = true;
-}
-
-static bool llama_nvtx_push(const char *label) {
-    std::call_once(g_llama_nvtx_once, llama_nvtx_init_once);
-    if (!g_llama_nvtx.enabled || !label || !label[0]) return false;
-#if LLAMA_MOE_NVTX_HEADER_AVAILABLE
-    nvtxRangePushA(label);
-#else
-    g_llama_nvtx.range_push_a(label);
-#endif
-    return true;
-}
-
-static void llama_nvtx_pop() {
-    if (g_llama_nvtx.enabled) {
-#if LLAMA_MOE_NVTX_HEADER_AVAILABLE
-        nvtxRangePop();
-#else
-        if (g_llama_nvtx.range_pop) {
-            g_llama_nvtx.range_pop();
-        }
-#endif
-    }
-}
-
-class llama_nvtx_range {
-public:
-    explicit llama_nvtx_range(const char *label) : active(llama_nvtx_push(label)) {}
-    ~llama_nvtx_range() {
-        if (active) llama_nvtx_pop();
-    }
-    llama_nvtx_range(const llama_nvtx_range &) = delete;
-    llama_nvtx_range & operator=(const llama_nvtx_range &) = delete;
-
-private:
-    bool active = false;
-};
-
-struct kimi_layer_gap_context_entry {
-    uint64_t call_index = 0;
-    uint32_t n_tokens = 0;
-    int reused = 0;
-    uint64_t call_start_us = 0;
-    uint64_t graph_prepare_start_us = 0;
-    uint64_t graph_build_start_us = 0;
-    uint64_t graph_build_end_us = 0;
-    uint64_t graph_alloc_end_us = 0;
-    uint64_t set_inputs_start_us = 0;
-    uint64_t set_inputs_end_us = 0;
-    uint64_t compute_start_us = 0;
-    uint64_t compute_end_us = 0;
-    uint64_t call_end_us = 0;
-};
-
-struct kimi_layer_gap_sync_entry {
-    uint32_t queued_tokens = 0;
-    uint64_t sync_start_us = 0;
-    uint64_t sync_end_us = 0;
-};
-
-struct kimi_layer_gap_context_buffer {
-    std::vector<kimi_layer_gap_context_entry> entries;
-    std::vector<kimi_layer_gap_sync_entry> sync_entries;
-};
-
-static const char * const g_kimi_layer_gap_context_prefix =
-    std::getenv("GGML_MOE_TRACE_LAYER_GAPS");
-static const bool g_kimi_layer_gap_context_enabled =
-    g_kimi_layer_gap_context_prefix != nullptr && g_kimi_layer_gap_context_prefix[0] != '\0';
-static std::atomic<uint64_t> g_kimi_layer_gap_context_call_index{0};
-static std::once_flag g_kimi_layer_gap_context_init_once;
-
-static std::mutex & kimi_layer_gap_context_registry_mutex() {
-    static auto * mutex = new std::mutex();
-    return *mutex;
-}
-
-static std::vector<kimi_layer_gap_context_buffer *> & kimi_layer_gap_context_registry() {
-    static auto * registry = new std::vector<kimi_layer_gap_context_buffer *>();
-    return *registry;
-}
-
-static void kimi_layer_gap_context_report_atexit() {
-    if (!g_kimi_layer_gap_context_enabled) {
-        return;
-    }
-    const std::string path = std::string(g_kimi_layer_gap_context_prefix) + ".context.csv";
-    FILE * file = std::fopen(path.c_str(), "w");
-    if (file == nullptr) {
-        std::fprintf(stderr, "[kimi_layer_gap] context trace open failed: %s\n", path.c_str());
-        return;
-    }
-    std::fprintf(
-        file,
-        "call_index,n_tokens,reused,call_start_us,graph_prepare_start_us,"
-        "graph_build_start_us,graph_build_end_us,graph_alloc_end_us,"
-        "set_inputs_start_us,set_inputs_end_us,compute_start_us,compute_end_us,call_end_us\n");
-    size_t rows = 0;
-    {
-        std::lock_guard<std::mutex> lock(kimi_layer_gap_context_registry_mutex());
-        for (const kimi_layer_gap_context_buffer * buffer : kimi_layer_gap_context_registry()) {
-            for (const kimi_layer_gap_context_entry & entry : buffer->entries) {
-                std::fprintf(
-                    file,
-                    "%" PRIu64 ",%u,%d,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
-                    "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
-                    "%" PRIu64 ",%" PRIu64 "\n",
-                    entry.call_index,
-                    entry.n_tokens,
-                    entry.reused,
-                    entry.call_start_us,
-                    entry.graph_prepare_start_us,
-                    entry.graph_build_start_us,
-                    entry.graph_build_end_us,
-                    entry.graph_alloc_end_us,
-                    entry.set_inputs_start_us,
-                    entry.set_inputs_end_us,
-                    entry.compute_start_us,
-                    entry.compute_end_us,
-                    entry.call_end_us);
-                ++rows;
-            }
-        }
-    }
-    std::fclose(file);
-    std::fprintf(stderr, "[kimi_layer_gap] context trace written: %s (%zu rows)\n", path.c_str(), rows);
-
-    const std::string sync_path = std::string(g_kimi_layer_gap_context_prefix) + ".sync.csv";
-    file = std::fopen(sync_path.c_str(), "w");
-    if (file == nullptr) {
-        std::fprintf(stderr, "[kimi_layer_gap] sync trace open failed: %s\n", sync_path.c_str());
-        return;
-    }
-    std::fprintf(file, "queued_tokens,sync_start_us,sync_end_us\n");
-    rows = 0;
-    {
-        std::lock_guard<std::mutex> lock(kimi_layer_gap_context_registry_mutex());
-        for (const kimi_layer_gap_context_buffer * buffer : kimi_layer_gap_context_registry()) {
-            for (const kimi_layer_gap_sync_entry & entry : buffer->sync_entries) {
-                std::fprintf(
-                    file,
-                    "%u,%" PRIu64 ",%" PRIu64 "\n",
-                    entry.queued_tokens,
-                    entry.sync_start_us,
-                    entry.sync_end_us);
-                ++rows;
-            }
-        }
-    }
-    std::fclose(file);
-    std::fprintf(stderr, "[kimi_layer_gap] sync trace written: %s (%zu rows)\n", sync_path.c_str(), rows);
-}
-
-static kimi_layer_gap_context_buffer & kimi_layer_gap_context_thread_buffer() {
-    static thread_local kimi_layer_gap_context_buffer * buffer = nullptr;
-    if (buffer == nullptr) {
-        std::call_once(g_kimi_layer_gap_context_init_once, []() {
-            std::atexit(kimi_layer_gap_context_report_atexit);
-            std::fprintf(
-                stderr,
-                "[kimi_layer_gap] context trace enabled: prefix=%s\n",
-                g_kimi_layer_gap_context_prefix);
-        });
-        buffer = new kimi_layer_gap_context_buffer();
-        buffer->entries.reserve(256);
-        std::lock_guard<std::mutex> lock(kimi_layer_gap_context_registry_mutex());
-        kimi_layer_gap_context_registry().push_back(buffer);
-    }
-    return *buffer;
-}
-
-struct kimi_graph_profile_state {
-    std::atomic<uint64_t> submit_calls{0};
-    std::atomic<uint64_t> submit_us{0};
-    std::atomic<uint64_t> sync_calls{0};
-    std::atomic<uint64_t> sync_us{0};
-    std::atomic<uint64_t> sync_decode_calls{0};
-    std::atomic<uint64_t> sync_decode_us{0};
-    std::atomic<uint64_t> sync_prompt_calls{0};
-    std::atomic<uint64_t> sync_prompt_us{0};
-    std::atomic<uint64_t> sync_idle_calls{0};
-    std::atomic<uint64_t> sync_idle_us{0};
-    std::atomic<uint64_t> sync_decode_tokens{0};
-    std::atomic<uint64_t> sync_prompt_tokens{0};
-};
-
-static kimi_graph_profile_state g_kimi_graph_profile;
-
-static const char * ds4_weight_profile_path() {
-    const char * path = std::getenv("GGML_DS4_WEIGHT_PROFILE_OUT");
-    if (path == nullptr || path[0] == '\0' || std::strcmp(path, "0") == 0) {
-        return nullptr;
-    }
-    return path;
-}
-
-static FILE * ds4_weight_profile_fp() {
-    static FILE * fp = nullptr;
-    static bool attempted = false;
-    if (fp != nullptr || attempted) {
-        return fp;
-    }
-    attempted = true;
-    const char * path = ds4_weight_profile_path();
-    if (path == nullptr) {
-        return nullptr;
-    }
-    fp = std::fopen(path, "w");
-    if (fp == nullptr) {
-        LLAMA_LOG_WARN("ds4 weight profile: failed to open %s\n", path);
-        return nullptr;
-    }
-    std::fprintf(fp, "graph_seq,batched,node,il,ne0,ne1,ne2,nb0,nb1,nb2,token,rank,value\n");
-    std::fflush(fp);
-    return fp;
-}
-
-static int ds4_weight_profile_layer_from_name(const char * name) {
-    if (name == nullptr) {
-        return -1;
-    }
-    const char * dash = std::strrchr(name, '-');
-    if (dash == nullptr || dash[1] == '\0') {
-        return -1;
-    }
-    char * end = nullptr;
-    const long value = std::strtol(dash + 1, &end, 10);
-    if (end == dash + 1) {
-        return -1;
-    }
-    return (int) value;
-}
-
-static void kimi_graph_profile_report() {
-    const uint64_t submit_calls = g_kimi_graph_profile.submit_calls.load();
-    const uint64_t sync_calls   = g_kimi_graph_profile.sync_calls.load();
-    if (submit_calls == 0 && sync_calls == 0) {
-        return;
-    }
-    const auto avg_ms = [](uint64_t us, uint64_t calls) {
-        return calls == 0 ? 0.0 : (double) us / 1000.0 / (double) calls;
-    };
-    const uint64_t submit_us       = g_kimi_graph_profile.submit_us.load();
-    const uint64_t sync_us         = g_kimi_graph_profile.sync_us.load();
-    const uint64_t sync_dec_calls  = g_kimi_graph_profile.sync_decode_calls.load();
-    const uint64_t sync_dec_us     = g_kimi_graph_profile.sync_decode_us.load();
-    const uint64_t sync_pr_calls   = g_kimi_graph_profile.sync_prompt_calls.load();
-    const uint64_t sync_pr_us      = g_kimi_graph_profile.sync_prompt_us.load();
-    const uint64_t sync_idle_calls = g_kimi_graph_profile.sync_idle_calls.load();
-    const uint64_t sync_idle_us    = g_kimi_graph_profile.sync_idle_us.load();
-    LLAMA_LOG_INFO(
-        "[kimi_graph_profile] submit: calls=%" PRIu64 " total=%.3f ms avg=%.3f ms/call\n",
-        submit_calls, (double) submit_us / 1000.0, avg_ms(submit_us, submit_calls));
-    LLAMA_LOG_INFO(
-        "[kimi_graph_profile] sync: calls=%" PRIu64 " total=%.3f ms avg=%.3f ms/call "
-        "decode_calls=%" PRIu64 " decode_tokens=%" PRIu64 " decode_total=%.3f ms decode_avg=%.3f ms/call "
-        "prompt_calls=%" PRIu64 " prompt_tokens=%" PRIu64 " prompt_total=%.3f ms prompt_avg=%.3f ms/call "
-        "idle_calls=%" PRIu64 " idle_total=%.3f ms idle_avg=%.3f ms/call\n",
-        sync_calls, (double) sync_us / 1000.0, avg_ms(sync_us, sync_calls),
-        sync_dec_calls, g_kimi_graph_profile.sync_decode_tokens.load(),
-        (double) sync_dec_us / 1000.0, avg_ms(sync_dec_us, sync_dec_calls),
-        sync_pr_calls, g_kimi_graph_profile.sync_prompt_tokens.load(),
-        (double) sync_pr_us / 1000.0, avg_ms(sync_pr_us, sync_pr_calls),
-        sync_idle_calls, (double) sync_idle_us / 1000.0, avg_ms(sync_idle_us, sync_idle_calls));
-}
-
-static bool kimi_graph_profile_enabled() {
-    static bool enabled = []() {
-        const char * env = std::getenv("LLAMA_KIMI_GRAPH_PROFILE");
-        const bool on = env && env[0] && env[0] != '0';
-        if (on) {
-            std::atexit(kimi_graph_profile_report);
-        }
-        return on;
-    }();
-    return enabled;
-}
-
-struct moe_next_gate_shadow_csv_state {
-    std::mutex mutex;
-    std::ofstream file;
-    bool initialized = false;
-    bool disabled = false;
-    uint64_t call = 0;
-};
-
-static moe_next_gate_shadow_csv_state g_moe_next_gate_shadow_csv;
-
-static const char * moe_next_gate_shadow_out_path() {
-    const char * path = std::getenv("GGML_MOE_NEXT_GATE_SHADOW_OUT");
-    return path && path[0] ? path : nullptr;
-}
-
-struct moe_route_score_trace_csv_state {
-    std::mutex mutex;
-    std::ofstream file;
-    bool initialized = false;
-    bool disabled = false;
-    uint64_t call = 0;
-};
-
-static moe_route_score_trace_csv_state g_moe_route_score_trace_csv;
-
-static const char * moe_route_score_trace_out_path() {
-    const char * path = std::getenv("GGML_MOE_ROUTE_SCORE_TRACE_OUT");
-    return path && path[0] ? path : nullptr;
-}
-
-struct moe_next_gate_prefetch_probe_state {
-    std::mutex mutex;
-    std::ofstream file;
-    bool initialized = false;
-    bool disabled = false;
-    uint64_t seq = 0;
-};
-
-static moe_next_gate_prefetch_probe_state g_moe_next_gate_prefetch_probe;
-
-static const char * moe_next_gate_prefetch_probe_out_path() {
-    const char * path = std::getenv("GGML_MOE_NEXT_GATE_PREFETCH_PROBE_OUT");
-    return path && path[0] ? path : nullptr;
-}
-
-static bool moe_next_gate_prefetch_probe_wants(const ggml_tensor * t) {
-    const char * path = moe_next_gate_prefetch_probe_out_path();
-    if (!path || !t || !t->name[0] || t->type != GGML_TYPE_I32 || !ggml_is_contiguous(t)) {
-        return false;
-    }
-    return std::strstr(t->name, "ffn_moe_next_shadow_topk") != nullptr ||
-        std::strstr(t->name, "ffn_moe_topk") != nullptr;
-}
-
-static std::string moe_next_gate_shadow_values_csv(const std::vector<int32_t> & values) {
-    std::ostringstream oss;
-    for (size_t i = 0; i < values.size(); ++i) {
-        if (i > 0) {
-            oss << '|';
-        }
-        oss << values[i];
-    }
-    return oss.str();
-}
-
-static std::string moe_route_score_float_values_csv(const std::vector<float> & values) {
-    std::ostringstream oss;
-    oss.precision(9);
-    for (size_t i = 0; i < values.size(); ++i) {
-        if (i > 0) {
-            oss << '|';
-        }
-        oss << values[i];
-    }
-    return oss.str();
-}
-
-static void moe_next_gate_prefetch_probe_record(ggml_tensor * t) {
-    const char * path = moe_next_gate_prefetch_probe_out_path();
-    if (!path || !t || !t->name[0] || t->type != GGML_TYPE_I32 || !ggml_is_contiguous(t)) {
-        return;
-    }
-
-    const int64_t start_us = ggml_time_us();
-    std::vector<int32_t> values((size_t)ggml_nelements(t));
-    if (ggml_backend_buffer_is_host(t->buffer)) {
-        std::memcpy(values.data(), t->data, ggml_nbytes(t));
-    } else {
-        ggml_backend_tensor_get(t, values.data(), 0, ggml_nbytes(t));
-    }
-    const int64_t copy_us = ggml_time_us() - start_us;
-
-    std::lock_guard<std::mutex> lock(g_moe_next_gate_prefetch_probe.mutex);
-    if (g_moe_next_gate_prefetch_probe.disabled) {
-        return;
-    }
-    if (!g_moe_next_gate_prefetch_probe.initialized) {
-        g_moe_next_gate_prefetch_probe.file.open(path, std::ios::out);
-        if (!g_moe_next_gate_prefetch_probe.file) {
-            LLAMA_LOG_ERROR("%s: failed to open GGML_MOE_NEXT_GATE_PREFETCH_PROBE_OUT=%s\n", __func__, path);
-            g_moe_next_gate_prefetch_probe.disabled = true;
-            return;
-        }
-        g_moe_next_gate_prefetch_probe.file
-            << "seq,time_us,name,kind,ne0,ne1,nbytes,copy_us,values\n";
-        g_moe_next_gate_prefetch_probe.initialized = true;
-    }
-
-    const bool predicted = std::strstr(t->name, "ffn_moe_next_shadow_topk") != nullptr;
-    g_moe_next_gate_prefetch_probe.file
-        << g_moe_next_gate_prefetch_probe.seq++ << ','
-        << ggml_time_us() << ','
-        << t->name << ','
-        << (predicted ? "pred" : "actual") << ','
-        << t->ne[0] << ','
-        << t->ne[1] << ','
-        << ggml_nbytes(t) << ','
-        << copy_us << ','
-        << moe_next_gate_shadow_values_csv(values)
-        << '\n';
-}
-
-static bool moe_next_gate_prefetch_probe_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
-    llama_context * lctx = (llama_context *) user_data;
-    const bool probe_need = moe_next_gate_prefetch_probe_wants(t);
-    const llama_cparams * cparams = lctx ? &lctx->get_cparams() : nullptr;
-    if (ask) {
-        const bool user_need = cparams && cparams->cb_eval ?
-            cparams->cb_eval(t, true, cparams->cb_eval_user_data) : false;
-        return probe_need || user_need;
-    }
-    if (probe_need) {
-        moe_next_gate_prefetch_probe_record(t);
-    }
-    if (cparams && cparams->cb_eval) {
-        return cparams->cb_eval(t, false, cparams->cb_eval_user_data);
-    }
-    return true;
-}
-
-static void moe_next_gate_shadow_record(
-        llm_graph_result * res,
-        const llama_ubatch & ubatch,
-        ggml_backend_sched_t sched) {
-    const auto & outputs = res->get_moe_next_gate_shadow_outputs();
-    if (outputs.empty()) {
-        return;
-    }
-
-    const char * path = moe_next_gate_shadow_out_path();
-    if (!path) {
-        return;
-    }
-
-    struct pending_shadow_copy {
-        llm_moe_next_gate_shadow_output meta;
-        std::vector<int32_t> values;
-        int64_t ne0 = 0;
-        int64_t ne1 = 0;
-    };
-
-    std::vector<pending_shadow_copy> pending;
-    pending.reserve(outputs.size());
-
-    const int64_t copy_start_us = ggml_time_us();
-    for (const auto & out : outputs) {
-        ggml_tensor * t = out.tensor;
-        if (t == nullptr || t->type != GGML_TYPE_I32 || !ggml_is_contiguous(t)) {
-            continue;
-        }
-
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, t);
-        if (backend == nullptr) {
-            continue;
-        }
-
-        pending_shadow_copy copy;
-        copy.meta = out;
-        copy.ne0 = t->ne[0];
-        copy.ne1 = t->ne[1];
-        copy.values.resize((size_t) ggml_nelements(t));
-
-        ggml_backend_tensor_get_async(backend, t, copy.values.data(), 0, ggml_nbytes(t));
-        pending.push_back(std::move(copy));
-    }
-
-    if (pending.empty()) {
-        return;
-    }
-
-    ggml_backend_sched_synchronize(sched);
-    const int64_t record_us = ggml_time_us() - copy_start_us;
-
-    std::lock_guard<std::mutex> lock(g_moe_next_gate_shadow_csv.mutex);
-    if (g_moe_next_gate_shadow_csv.disabled) {
-        return;
-    }
-
-    if (!g_moe_next_gate_shadow_csv.initialized) {
-        g_moe_next_gate_shadow_csv.file.open(path, std::ios::out);
-        if (!g_moe_next_gate_shadow_csv.file) {
-            LLAMA_LOG_ERROR("%s: failed to open GGML_MOE_NEXT_GATE_SHADOW_OUT=%s\n", __func__, path);
-            g_moe_next_gate_shadow_csv.disabled = true;
-            return;
-        }
-        g_moe_next_gate_shadow_csv.file
-            << "call,seq_id,pos,n_tokens,n_seq_tokens,source_layer,target_layer,kind,topk,ne0,ne1,record_us,values\n";
-        g_moe_next_gate_shadow_csv.initialized = true;
-    }
-
-    const uint64_t call = g_moe_next_gate_shadow_csv.call++;
-    const int seq_id = ubatch.n_tokens > 0 && ubatch.seq_id != nullptr && ubatch.seq_id[0] != nullptr ? ubatch.seq_id[0][0] : -1;
-    const int64_t pos = ubatch.n_tokens > 0 && ubatch.pos != nullptr ? ubatch.pos[0] : -1;
-
-    for (const auto & copy : pending) {
-        g_moe_next_gate_shadow_csv.file
-            << call << ','
-            << seq_id << ','
-            << pos << ','
-            << ubatch.n_tokens << ','
-            << ubatch.n_seq_tokens << ','
-            << copy.meta.source_layer << ','
-            << copy.meta.target_layer << ','
-            << (copy.meta.predicted ? "pred" : "actual") << ','
-            << copy.values.size() << ','
-            << copy.ne0 << ','
-            << copy.ne1 << ','
-            << record_us << ','
-            << moe_next_gate_shadow_values_csv(copy.values)
-            << '\n';
-    }
-}
-
-static void moe_route_score_trace_record(
-        llm_graph_result * res,
-        const llama_ubatch & ubatch,
-        ggml_backend_sched_t sched) {
-    const auto & outputs = res->get_moe_route_score_outputs();
-    if (outputs.empty()) {
-        return;
-    }
-
-    const char * path = moe_route_score_trace_out_path();
-    if (!path) {
-        return;
-    }
-
-    struct pending_route_score_copy {
-        llm_moe_route_score_output meta;
-        std::vector<int32_t> ids;
-        std::vector<float> scores;
-        std::vector<float> weights;
-        int64_t ids_ne0 = 0;
-        int64_t ids_ne1 = 0;
-        int64_t scores_ne0 = 0;
-        int64_t scores_ne1 = 0;
-        int64_t weights_ne0 = 0;
-        int64_t weights_ne1 = 0;
-    };
-
-    std::vector<pending_route_score_copy> pending;
-    pending.reserve(outputs.size());
-
-    const int64_t copy_start_us = ggml_time_us();
-    for (const auto & out : outputs) {
-        ggml_tensor * ids = out.ids;
-        ggml_tensor * scores = out.scores;
-        ggml_tensor * weights = out.weights;
-        if (ids == nullptr || scores == nullptr || weights == nullptr) {
-            continue;
-        }
-        if (ids->type != GGML_TYPE_I32 || scores->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32) {
-            continue;
-        }
-        if (!ggml_is_contiguous(ids) || !ggml_is_contiguous(scores) || !ggml_is_contiguous(weights)) {
-            continue;
-        }
-
-        ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(sched, ids);
-        ggml_backend_t scores_backend = ggml_backend_sched_get_tensor_backend(sched, scores);
-        ggml_backend_t weights_backend = ggml_backend_sched_get_tensor_backend(sched, weights);
-        if (ids_backend == nullptr || scores_backend == nullptr || weights_backend == nullptr) {
-            continue;
-        }
-
-        pending_route_score_copy copy;
-        copy.meta = out;
-        copy.ids_ne0 = ids->ne[0];
-        copy.ids_ne1 = ids->ne[1];
-        copy.scores_ne0 = scores->ne[0];
-        copy.scores_ne1 = scores->ne[1];
-        copy.weights_ne0 = weights->ne[0];
-        copy.weights_ne1 = weights->ne[1];
-        copy.ids.resize((size_t) ggml_nelements(ids));
-        copy.scores.resize((size_t) ggml_nelements(scores));
-        copy.weights.resize((size_t) ggml_nelements(weights));
-
-        ggml_backend_tensor_get_async(ids_backend, ids, copy.ids.data(), 0, ggml_nbytes(ids));
-        ggml_backend_tensor_get_async(scores_backend, scores, copy.scores.data(), 0, ggml_nbytes(scores));
-        ggml_backend_tensor_get_async(weights_backend, weights, copy.weights.data(), 0, ggml_nbytes(weights));
-        pending.push_back(std::move(copy));
-    }
-
-    if (pending.empty()) {
-        return;
-    }
-
-    ggml_backend_sched_synchronize(sched);
-    const int64_t record_us = ggml_time_us() - copy_start_us;
-
-    std::lock_guard<std::mutex> lock(g_moe_route_score_trace_csv.mutex);
-    if (g_moe_route_score_trace_csv.disabled) {
-        return;
-    }
-
-    if (!g_moe_route_score_trace_csv.initialized) {
-        g_moe_route_score_trace_csv.file.open(path, std::ios::out);
-        if (!g_moe_route_score_trace_csv.file) {
-            LLAMA_LOG_ERROR("%s: failed to open GGML_MOE_ROUTE_SCORE_TRACE_OUT=%s\n", __func__, path);
-            g_moe_route_score_trace_csv.disabled = true;
-            return;
-        }
-        g_moe_route_score_trace_csv.file
-            << "call,seq_id,pos,n_tokens,n_seq_tokens,layer,topk,"
-            << "ids_ne0,ids_ne1,scores_ne0,scores_ne1,weights_ne0,weights_ne1,"
-            << "record_us,ids,scores,weights\n";
-        g_moe_route_score_trace_csv.initialized = true;
-    }
-
-    const uint64_t call = g_moe_route_score_trace_csv.call++;
-    const int seq_id = ubatch.n_tokens > 0 && ubatch.seq_id != nullptr && ubatch.seq_id[0] != nullptr ? ubatch.seq_id[0][0] : -1;
-    const int64_t pos = ubatch.n_tokens > 0 && ubatch.pos != nullptr ? ubatch.pos[0] : -1;
-
-    for (const auto & copy : pending) {
-        g_moe_route_score_trace_csv.file
-            << call << ','
-            << seq_id << ','
-            << pos << ','
-            << ubatch.n_tokens << ','
-            << ubatch.n_seq_tokens << ','
-            << copy.meta.layer << ','
-            << copy.ids.size() << ','
-            << copy.ids_ne0 << ','
-            << copy.ids_ne1 << ','
-            << copy.scores_ne0 << ','
-            << copy.scores_ne1 << ','
-            << copy.weights_ne0 << ','
-            << copy.weights_ne1 << ','
-            << record_us << ','
-            << moe_next_gate_shadow_values_csv(copy.ids) << ','
-            << moe_route_score_float_values_csv(copy.scores) << ','
-            << moe_route_score_float_values_csv(copy.weights)
-            << '\n';
-    }
-}
 
 }
 
@@ -855,6 +84,12 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
+    if (ssd_runtime) {
+        const auto * engram = ssd_runtime->settings.integer("model.engram_prefetch");
+        const auto * hc = ssd_runtime->settings.integer("model.hc_fused");
+        if (engram) { cparams.ssd_engram_prefetch = *engram != 0; }
+        if (hc) { cparams.ssd_hc_fused = *hc != 0; }
+    }
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
 
@@ -1665,35 +900,14 @@ void llama_context::synchronize() {
         return;
     }
 
-    const bool graph_profile = kimi_graph_profile_enabled();
+    const bool graph_profile = ssd_runtime && ssd_runtime->diagnostics.profile_enabled();
     const int  queued_tokens = n_queued_tokens;
-    const uint64_t layer_gap_sync_start_us =
-        g_kimi_layer_gap_context_enabled ? (uint64_t) ggml_time_us() : 0;
     const int64_t t_sync_start_us = graph_profile ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
-    if (g_kimi_layer_gap_context_enabled) {
-        kimi_layer_gap_context_thread_buffer().sync_entries.push_back({
-            (uint32_t) std::max(0, queued_tokens),
-            layer_gap_sync_start_us,
-            (uint64_t) ggml_time_us(),
-        });
-    }
     if (graph_profile) {
-        const uint64_t sync_us = (uint64_t) (ggml_time_us() - t_sync_start_us);
-        g_kimi_graph_profile.sync_calls.fetch_add(1, std::memory_order_relaxed);
-        g_kimi_graph_profile.sync_us.fetch_add(sync_us, std::memory_order_relaxed);
-        if (queued_tokens == 1) {
-            g_kimi_graph_profile.sync_decode_calls.fetch_add(1, std::memory_order_relaxed);
-            g_kimi_graph_profile.sync_decode_us.fetch_add(sync_us, std::memory_order_relaxed);
-            g_kimi_graph_profile.sync_decode_tokens.fetch_add(1, std::memory_order_relaxed);
-        } else if (queued_tokens > 1) {
-            g_kimi_graph_profile.sync_prompt_calls.fetch_add(1, std::memory_order_relaxed);
-            g_kimi_graph_profile.sync_prompt_us.fetch_add(sync_us, std::memory_order_relaxed);
-            g_kimi_graph_profile.sync_prompt_tokens.fetch_add((uint64_t) queued_tokens, std::memory_order_relaxed);
-        } else {
-            g_kimi_graph_profile.sync_idle_calls.fetch_add(1, std::memory_order_relaxed);
-            g_kimi_graph_profile.sync_idle_us.fetch_add(sync_us, std::memory_order_relaxed);
-        }
+        const auto published = ssd_runtime->diagnostics.graph(false,
+            uint64_t(ggml_time_us() - t_sync_start_us), uint32_t(std::max(0, queued_tokens)), GGML_STATUS_SUCCESS);
+        if (!published) { LLAMA_LOG_ERROR("%s: context telemetry failed: %s\n", __func__, published.error.c_str()); }
     }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -2028,6 +1242,11 @@ enum llama_pooling_type llama_context::pooling_type() const {
 float * llama_context::get_logits() {
     output_reorder();
 
+    if (ssd_runtime && !ssd_runtime->diagnostics.good()) {
+        LLAMA_LOG_ERROR("%s: context telemetry previously failed\n", __func__);
+        return nullptr;
+    }
+
     return logits.data;
 }
 
@@ -2070,7 +1289,13 @@ float * llama_context::get_logits_ith(int32_t i) {
 
         const int64_t j = output_resolve_row(i);
         float * result = logits.data + j*model.vocab.n_tokens();
-        kimi_logits_trace_write(result, model.vocab.n_tokens(), i);
+        if (ssd_runtime) {
+            const auto published = ssd_runtime->diagnostics.logits(result, model.vocab.n_tokens(), i);
+            if (!published) {
+                LLAMA_LOG_ERROR("%s: context telemetry failed: %s\n", __func__, published.error.c_str());
+                return nullptr;
+            }
+        }
         return result;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
@@ -2493,13 +1718,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ubatch.n_tokens, gpu_offloads_experts(ubatch.n_tokens) ? "on the GPU" : "on the CPU over the mapped experts");
         cpu_sink_multi_token_reported = true;
     }
-    kimi_layer_gap_context_entry layer_gap_entry;
-    if (g_kimi_layer_gap_context_enabled) {
-        layer_gap_entry.call_index =
-            g_kimi_layer_gap_context_call_index.fetch_add(1, std::memory_order_relaxed);
-        layer_gap_entry.n_tokens = ubatch.n_tokens;
-        layer_gap_entry.call_start_us = (uint64_t) ggml_time_us();
-    }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2516,9 +1734,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    if (g_kimi_layer_gap_context_enabled) {
-        layer_gap_entry.graph_prepare_start_us = (uint64_t) ggml_time_us();
-    }
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
     if (dense_stream.phase != nullptr) {
         dense_stream.add(ubatch.n_tokens);
@@ -2547,28 +1762,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
-        if (g_kimi_layer_gap_context_enabled) {
-            layer_gap_entry.reused = 1;
-        }
     } else {
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        if (moe_next_gate_prefetch_probe_out_path()) {
-            ggml_backend_sched_set_eval_callback(sched.get(), moe_next_gate_prefetch_probe_cb_eval, this);
-        } else {
-            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
-        }
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
-        if (g_kimi_layer_gap_context_enabled) {
-            layer_gap_entry.graph_build_start_us = (uint64_t) ggml_time_us();
-        }
         gf = model.build_graph(gparams);
-        if (g_kimi_layer_gap_context_enabled) {
-            layer_gap_entry.graph_build_end_us = (uint64_t) ggml_time_us();
-        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -2592,9 +1794,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-        if (g_kimi_layer_gap_context_enabled) {
-            layer_gap_entry.graph_alloc_end_us = (uint64_t) ggml_time_us();
-        }
     }
 
     // set the input data for the input tensors
@@ -2602,20 +1801,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        if (g_kimi_layer_gap_context_enabled) {
-            layer_gap_entry.set_inputs_start_us = (uint64_t) ggml_time_us();
-        }
         res->set_inputs(&ubatch);
-        if (g_kimi_layer_gap_context_enabled) {
-            layer_gap_entry.set_inputs_end_us = (uint64_t) ggml_time_us();
-        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    if (g_kimi_layer_gap_context_enabled) {
-        layer_gap_entry.compute_start_us = (uint64_t) ggml_time_us();
-    }
     // Phase/token tracking is also required by a VRAM-only tier and by
     // zero-cache profiling. The runtime skips this when all are disabled.
     if (cpu_sink_cache_batch_decode && cpu_sink_runtime) {
@@ -2631,23 +1821,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             cache_decode, cache_decode ? ubatch.seq_id[0][0] : 0);
     }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    if (g_kimi_layer_gap_context_enabled) {
-        layer_gap_entry.compute_end_us = (uint64_t) ggml_time_us();
-    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
     }
 
-    moe_next_gate_shadow_record(res, ubatch, sched.get());
-    moe_route_score_trace_record(res, ubatch, sched.get());
-
     ret = GGML_STATUS_SUCCESS;
-    if (g_kimi_layer_gap_context_enabled) {
-        layer_gap_entry.call_end_us = (uint64_t) ggml_time_us();
-        kimi_layer_gap_context_thread_buffer().entries.push_back(layer_gap_entry);
-    }
 
     return res;
 }
@@ -2976,12 +2156,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
-
-    char nvtx_decode_label[96];
-    std::snprintf(nvtx_decode_label, sizeof(nvtx_decode_label), "%s tokens=%d",
-            batch_inp.n_tokens > 1 ? "prompt_phase" : "decode_token",
-            batch_inp.n_tokens);
-    llama_nvtx_range nvtx_decode_scope(nvtx_decode_label);
 
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
@@ -3985,7 +3159,11 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, sink_cpu_backend ? 1 : n_threads);
     }
 
-    const bool graph_profile = kimi_graph_profile_enabled();
+    if (ssd_runtime && !ssd_runtime->diagnostics.good()) {
+        LLAMA_LOG_ERROR("%s: context telemetry previously failed\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    const bool graph_profile = ssd_runtime && ssd_runtime->diagnostics.profile_enabled();
     const int64_t t_submit_start_us = graph_profile ? ggml_time_us() : 0;
     using activation_quant_reuse_fn = void (*)(ggml_backend_t);
     using activation_quant_reuse_scope = std::pair<ggml_backend_t, activation_quant_reuse_fn>;
@@ -4020,58 +3198,16 @@ ggml_status llama_context::graph_compute(
         scope->second(scope->first);
     }
     if (graph_profile) {
-        const uint64_t submit_us = (uint64_t) (ggml_time_us() - t_submit_start_us);
-        g_kimi_graph_profile.submit_calls.fetch_add(1, std::memory_order_relaxed);
-        g_kimi_graph_profile.submit_us.fetch_add(submit_us, std::memory_order_relaxed);
+        const auto published = ssd_runtime->diagnostics.graph(true,
+            uint64_t(ggml_time_us() - t_submit_start_us), 0, status);
+        if (!published) {
+            ggml_backend_sched_synchronize(sched.get());
+            LLAMA_LOG_ERROR("%s: context telemetry failed: %s\n", __func__, published.error.c_str());
+            return GGML_STATUS_FAILED;
+        }
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
-    } else if (ds4_weight_profile_path() != nullptr) {
-        ggml_backend_sched_synchronize(sched.get());
-        FILE * fp = ds4_weight_profile_fp();
-        static uint64_t graph_seq = 0;
-        const uint64_t seq = graph_seq++;
-        if (fp != nullptr) {
-            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                ggml_tensor * node = ggml_graph_node(gf, i);
-                if (node == nullptr || std::strstr(node->name, "ffn_weights") == nullptr) {
-                    continue;
-                }
-                if (node->type != GGML_TYPE_F32 || ggml_nelements(node) <= 0 || ggml_nelements(node) > 4096) {
-                    continue;
-                }
-                ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
-                if (backend == nullptr) {
-                    continue;
-                }
-                const int il = ds4_weight_profile_layer_from_name(node->name);
-                const int64_t ne0 = node->ne[0] > 0 ? node->ne[0] : 1;
-                const int64_t ne1 = node->ne[1] > 0 ? node->ne[1] : 1;
-                const int64_t ne2 = node->ne[2] > 0 ? node->ne[2] : 1;
-                for (int64_t token = 0; token < ne2; ++token) {
-                    for (int64_t rank = 0; rank < ne1; ++rank) {
-                        float value = 0.0f;
-                        const size_t offs = (size_t) (token * node->nb[2] + rank * node->nb[1]);
-                        ggml_backend_tensor_get(node, &value, offs, sizeof(float));
-                        std::fprintf(fp, "%llu,%d,%s,%d,%lld,%lld,%lld,%zu,%zu,%zu,%lld,%lld,%.9g\n",
-                                (unsigned long long) seq,
-                                batched ? 1 : 0,
-                                node->name,
-                                il,
-                                (long long) ne0,
-                                (long long) ne1,
-                                (long long) ne2,
-                                (size_t) node->nb[0],
-                                (size_t) node->nb[1],
-                                (size_t) node->nb[2],
-                                (long long) token,
-                                (long long) rank,
-                                value);
-                    }
-                }
-            }
-            std::fflush(fp);
-        }
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
@@ -4085,10 +3221,6 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
-        }
-
-        if (ds4_weight_profile_path() != nullptr && std::strcmp(name, "ffn_weights") == 0) {
-            ggml_set_output(cur);
         }
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends

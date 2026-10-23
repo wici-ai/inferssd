@@ -147,6 +147,8 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
         const auto published = events->settings(settings);
         if (!published) { throw std::runtime_error(published.error); }
     }
+    const auto diagnostics_bound = diagnostics.bind(debug, events.get());
+    if (!diagnostics_bound) { throw std::runtime_error(diagnostics_bound.error); }
     const auto effective = settings.json();
     if (!effective) { throw std::runtime_error(effective.error); }
     std::fprintf(stderr, "[ssd.settings] %s\n", effective.value.c_str());
