@@ -38,7 +38,7 @@ jobs:
       - name: Install and retain the reviewed control wheel
         run: |
           python3 -m venv .control-venv
-          .control-venv/bin/python -m pip wheel --no-deps ./control/tools/inferssd --wheel-dir wheel
+          .control-venv/bin/python -m pip wheel --no-deps ./control/framework --wheel-dir wheel
           .control-venv/bin/python -m pip install --no-index --no-deps wheel/*.whl
       - name: Admit only the exact reviewed current SHA and base
         id: admit

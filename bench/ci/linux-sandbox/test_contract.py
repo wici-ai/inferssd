@@ -191,3 +191,47 @@ class ClientTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class OriginalLeaseTests(unittest.TestCase):
+    def test_operator_lease_preserves_identity_and_rejects_replacement_or_worker_owner(self):
+        from types import SimpleNamespace
+        from contract import coordination_paths
+        import stat
+        config = dict(lock_path='/srv/host-operator/device.lock', stop_path='/srv/host-operator/STOP',
+                      coordination_owner={'uid': 1001, 'gid': 1001}, lock_identity=[30, 42],
+                      controller_uid=991, controller_gid=991, worker_uid=992, worker_gid=992,
+                      client_uid=993, client_gid=993)
+        def metadata(path, **kwargs):
+            name = str(path)
+            if name.endswith('STOP'):
+                raise FileNotFoundError(2, 'missing test path', name)
+            return SimpleNamespace(st_mode=(stat.S_IFREG | 0o664) if name.endswith('.lock') else (stat.S_IFDIR | 0o755),
+                                   st_uid=1001 if name.startswith('/srv/host-operator') else 0,
+                                   st_gid=1001 if name.startswith('/srv/host-operator') else 0,
+                                   st_dev=30, st_ino=42)
+        with patch.object(Path, 'lstat', metadata), patch.object(Path, 'stat', metadata):
+            coordination_paths(config)
+            config['lock_identity'] = [30, 43]
+            with self.assertRaisesRegex(ValueError, 'identity changed'):
+                coordination_paths(config)
+            config['lock_identity'] = [30, 42]
+            config['coordination_owner']['uid'] = 992
+            with self.assertRaisesRegex(ValueError, 'trusted host operator'):
+                coordination_paths(config)
+
+
+class QuarantineTests(unittest.TestCase):
+    def test_external_stop_uses_reviewed_coordination_and_preserves_existing(self):
+        from executor import quarantine
+        with tempfile.TemporaryDirectory() as temporary:
+            stop = Path(temporary) / 'STOP'
+            config = {'stop_path': str(stop)}
+            with patch('executor.coordination_paths') as check:
+                quarantine(stop, 'first', config)
+                identity = stop.stat().st_ino
+                quarantine(stop, 'second', config)
+                self.assertEqual(stop.stat().st_ino, identity)
+                self.assertEqual(json.loads(stop.read_text())['reason'], 'first')
+                self.assertEqual(check.call_count, 3)
+                with self.assertRaisesRegex(ValueError, 'differs'):
+                    quarantine(stop.with_name('elsewhere'), 'bad', config)

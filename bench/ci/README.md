@@ -4,7 +4,10 @@
 
 The current private manual path uses `StageSession` and the independently
 provisioned per-stage broker. `controller/integration-smoke.workflow.yml` builds
-one reviewed source and makes an eight-token request.
+one reviewed source, requires actual CUDA/Metal numerical operations, and makes
+one eight-token request per selected model on any of the three admitted devices.
+Its readiness/evidence/cleanup/performance states are separate; 233 and 125 are
+not CI devices.
 `controller/checkpoint.workflow.yml` builds the fixed f5 baseline and reviewed
 candidate, then records one Muse 512/256 request per side under the same lease.
 See [the checkpoint instructions](controller/CHECKPOINT.md). Its actual
@@ -154,7 +157,7 @@ python3 bench/ci/export_controller.py --source /path/to/inferssd \
   --revision FULL_REVIEWED_40_CHARACTER_SHA --output /path/to/new-controller-export
 ```
 
-The final structure already contains `tools/inferssd`; export it directly.
+The final structure already contains `framework/`; export it directly.
 Do not pass `--registry-revision` when that package is present; that option is
 only for the older control branch that needed a separately pinned registry.
 

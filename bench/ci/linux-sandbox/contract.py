@@ -44,6 +44,44 @@ def protected(path, *, directory=False):
     return path
 
 
+
+def coordination_paths(value):
+    """Preserve an operator's existing lease without changing its inode/owner.
+
+    The separately protected config binds the owner and inode. Candidate and
+    runner UIDs/GIDs may not own any part of this coordination path, which is
+    never mounted into their execution namespace.
+    """
+    owner = value.get("coordination_owner")
+    if owner is None:
+        protected(Path(value["lock_path"]).parent, directory=True)
+        protected(Path(value["stop_path"]).parent, directory=True)
+        protected(value["lock_path"])
+        return
+    uid, gid = owner["uid"], owner["gid"]
+    integer(uid, 1, 2**31 - 1)
+    integer(gid, 1, 2**31 - 1)
+    if uid in (value["controller_uid"], value["worker_uid"], value["client_uid"]) or gid in (
+            value["controller_gid"], value["worker_gid"], value["client_gid"]):
+        raise ValueError("coordination owner must be the trusted host operator")
+    lock, stop = Path(value["lock_path"]), Path(value["stop_path"])
+    if not lock.is_absolute() or ".." in lock.parts or stop.parent != lock.parent:
+        raise ValueError("existing lock/STOP must share their reviewed absolute directory")
+    for item in (lock, *lock.parents):
+        info = item.lstat()
+        if (stat.S_ISLNK(info.st_mode) or info.st_uid not in (0, uid)
+                or info.st_mode & 0o002 or info.st_mode & 0o020 and info.st_gid not in (0, gid)):
+            raise ValueError("unsafe existing coordination path")
+    info = lock.stat()
+    if (not stat.S_ISREG(info.st_mode) or (info.st_uid, info.st_gid) != (uid, gid)
+            or [info.st_dev, info.st_ino] != value["lock_identity"]):
+        raise ValueError("existing coordination lock identity changed")
+    if stop.exists() or stop.is_symlink():
+        info = stop.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, uid):
+            raise ValueError("unsafe existing STOP")
+
+
 def integer(value, low, high):
     if type(value) is not int or not low <= value <= high:
         raise ValueError("integer out of range")
@@ -63,9 +101,14 @@ def load(path):
         raise ValueError("runner and worker must have distinct identities and groups")
     for key in ("install_root", "state_root"):
         protected(value[key], directory=True)
-    protected(Path(value["lock_path"]).parent, directory=True)
-    protected(Path(value["stop_path"]).parent, directory=True)
-    protected(value["lock_path"])
+    coordination_paths(value)
+    launcher = value.get("namespace_launcher")
+    if launcher is not None:
+        expected = Path(value["install_root"]) / "bin/bwrap"
+        if (set(launcher) != {"path", "sha256"} or Path(launcher["path"]) != expected
+                or digest(protected(expected)) != launcher["sha256"]
+                or not expected.stat().st_mode & 0o111):
+            raise ValueError("namespace launcher differs from its root-owned reviewed identity")
     for item in value["readonly_system"]:
         protected(item, directory=Path(item).is_dir())
         if Path(item).parts[1] not in ("usr", "lib", "lib64", "bin", "sbin", "opt"):
@@ -105,12 +148,17 @@ def bwrap(config, stage):
     if not stage.argv or len(stage.argv) > 256 or any(not isinstance(v, str) or "\0" in v for v in stage.argv):
         raise ValueError("invalid worker argv")
     integer(stage.timeout, 1, 43200)
-    argv = ["/usr/bin/bwrap", "--unshare-user", "--unshare-pid", "--unshare-ipc",
+    launcher = config.get("namespace_launcher", {}).get("path", "/usr/bin/bwrap")
+    argv = [launcher, "--unshare-user", "--unshare-pid", "--unshare-ipc",
             "--unshare-uts", "--uid", str(config["worker_uid"]),
             "--gid", str(config["worker_gid"]), "--cap-drop", "ALL", "--new-session",
             "--die-with-parent", "--clearenv", "--hostname", "inferssd-worker",
             "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/run",
             "--dir", "/home", "--dir", "/root", "--dir", "/etc", "--dir", "/sys"]
+    if "namespace_launcher" in config:
+        # The host helper may create the first namespace, but the candidate
+        # must not inherit permission to create additional user namespaces.
+        argv += ["--disable-userns", "--assert-userns-disabled", "--remount-ro", "/proc"]
     # systemd supplies a private network namespace; bwrap deliberately retains
     # it so a privileged, trusted measurement client can later join this one.
     for source in config["readonly_system"]:
@@ -169,6 +217,12 @@ def systemd(config, stage):
              "LimitMEMLOCK=" + str(config["memory_max"]),
              "TasksMax=" + str(config["tasks_max"]), "RuntimeMaxSec=" + str(stage.timeout),
              "ReadWritePaths=" + str(stage.scratch), "DevicePolicy=closed"]
+    if "namespace_launcher" in config:
+        # Recent systemd masks proc files before bwrap can create the nested
+        # PID namespace's procfs. Linux refuses that more revealing mount.
+        # Keep host /proc out; bwrap creates its own procfs and remounts it RO.
+        props = [value.replace("ProtectKernelTunables=yes", "ProtectKernelTunables=no")
+                 .replace("ProtectKernelLogs=yes", "ProtectKernelLogs=no") for value in props]
     for device in config.get("gpu_devices", []) if stage.gpu else []:
         props.append("DeviceAllow=" + device + " rw")
     for item in props:

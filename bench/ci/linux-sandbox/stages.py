@@ -180,7 +180,7 @@ class RunningStage:
             except BaseException as error:
                 self.error = self.error or 'cleanup: ' + str(error)
                 self.receipt['cleanup_error'] = str(error)
-                quarantine(self.config['stop_path'], 'async stage cleanup unconfirmed: ' + self.stage.unit)
+                quarantine(self.config['stop_path'], 'async stage cleanup unconfirmed: ' + self.stage.unit, self.config)
             self.receipt['passed'] = self.receipt.get('returncode') == 0 and self.error is None
             try:
                 save(self.directory / 'receipt.json', self.receipt)
@@ -229,7 +229,7 @@ class RunningStage:
     def stop(self):
         self.stop_event.set()
         if not self.done.wait(45):
-            quarantine(self.config['stop_path'], 'async stage supervisor did not finish: ' + self.stage.unit)
+            quarantine(self.config['stop_path'], 'async stage supervisor did not finish: ' + self.stage.unit, self.config)
             raise RuntimeError('async stage cleanup deadline exceeded')
         if not self.receipt.get('cleanup_confirmed'):
             raise RuntimeError('stage cleanup not confirmed')
@@ -568,7 +568,7 @@ class JobSession:
                    'frozen': {key: value['manifest_sha256'] for key, value in self.frozen.items()}}
         try:
             if errors:
-                quarantine(self.config['stop_path'], 'job cleanup unconfirmed: ' + self.job_id)
+                quarantine(self.config['stop_path'], 'job cleanup unconfirmed: ' + self.job_id, self.config)
             save(self.root / 'job-receipt.json', receipt)
         finally:
             self.closed = True

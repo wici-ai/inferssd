@@ -98,3 +98,32 @@ artifact sealing, request admission and trusted HTTP timing tests. These tests
 are not proof of Linux isolation. Native `probe.py` is model-free and produces
 no benchmark samples. Real CUDA toolchain/driver operation and performance
 comparison still require the independent trusted coordinator integration.
+
+For DGX Spark, install with `--device dgx-spark --existing-lock ... --stop-path ...`
+and the inventoried `--lock-device`, `--lock-inode`, `--operator-uid` and
+`--operator-gid`. The installer preserves that existing operator-owned inode and
+its owner. Its protected configuration binds the identity; runner/worker/client
+identities cannot own or replace that path. Only the trusted broker receives
+access to the coordination directory, never candidate namespaces. No independent
+second device lease is created. Cloud provisioning can still create its first
+root-owned lease when there is no pre-existing shared device lock.
+
+On Ubuntu hosts that restrict unprivileged user namespaces, keep the global
+restriction enabled. An operator may install an exact root-owned
+`<install_root>/bin/bwrap` copy with a dedicated AppArmor `userns,` profile and
+bind its path/SHA-256 in `namespace_launcher`. The broker validates that protected
+identity. Do not grant the candidate a writable launcher or mount the broker
+installation into its namespace. This path also requires bubblewrap
+`--disable-userns --assert-userns-disabled`; the native negative payload verifies
+that the candidate cannot create a nested user namespace or see the host helper. Validate the affected namespace/UID/native
+cleanup gate once after the host-specific deployment. See Ubuntu's
+[restricted namespace design](https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces).
+
+Recent systemd versions can mask proc files in the parent namespace before
+bubblewrap creates the nested PID namespace's procfs; Linux then refuses the
+new proc mount. For the dedicated launcher only, the broker omits the redundant
+parent `ProtectKernelTunables`/`ProtectKernelLogs` mounts. Bubblewrap still
+creates a new PID/user/mount namespace and makes that private `/proc` read-only;
+`/sys` remains a read-only bind, capabilities remain dropped, and no host `/proc`
+is exposed. Native proof checks the private namespaces, read-only proc mount,
+denied kernel-tunable write, hidden helper and denied nested user namespace.

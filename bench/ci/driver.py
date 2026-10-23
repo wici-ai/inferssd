@@ -71,7 +71,7 @@ def control_environment():
 
 def verify_control_install():
     installed = Path(inferssd.__file__).resolve().parent
-    source = BENCH.parent / "tools/inferssd/src/inferssd"
+    source = BENCH.parent / "framework/src/inferssd"
     for path in source.rglob("*"):
         if path.is_file() and path.suffix in (".py", ".json"):
             if digest(path) != digest(installed / path.relative_to(source)):

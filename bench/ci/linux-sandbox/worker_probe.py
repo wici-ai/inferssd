@@ -47,6 +47,14 @@ def main():
         gates[gate] = denied(lambda path=path: write(path))
     gates["sudo_denied"] = subprocess.run(["/usr/bin/sudo", "-n", "/usr/bin/true"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=False).returncode != 0 if Path("/usr/bin/sudo").exists() else True
+    if spec.get("namespace_launcher"):
+        gates["nested_userns_denied"] = subprocess.run(
+            ["/usr/bin/unshare", "--user", "--map-root-user", "/usr/bin/true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=False).returncode != 0
+        gates["namespace_launcher_hidden"] = not Path(spec["namespace_launcher"]["path"]).exists()
+        mounts = [line.split() for line in Path("/proc/mounts").read_text().splitlines()]
+        gates["readonly_private_proc"] = any(row[1] == "/proc" and "ro" in row[3].split(",") for row in mounts)
+        gates["kernel_tunables_denied"] = denied(lambda: os.close(os.open("/proc/sys/kernel/hostname", os.O_WRONLY)))
     gates["host_sockets_denied"] = all(denied(lambda path=path: connect(path)) for path in (
         "/run/dbus/system_bus_socket", "/run/systemd/private", "/run/docker.sock",
         "/var/run/docker.sock", "/run/user/" + str(spec["controller_uid"]) + "/bus",

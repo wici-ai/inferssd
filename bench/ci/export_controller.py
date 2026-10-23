@@ -17,7 +17,7 @@ def export(source, revision, output, workflow="device-performance", registry_rev
         return subprocess.check_output(["git", "-C", str(source), *args])
 
     paths = (
-        git("ls-tree", "-r", "--name-only", revision, "bench", "tools/ssdash", "tools/inferssd")
+        git("ls-tree", "-r", "--name-only", revision, "bench", "framework", "tools/ssdash", "tools/inferssd")
         .decode()
         .splitlines()
     )
@@ -38,7 +38,7 @@ def export(source, revision, output, workflow="device-performance", registry_rev
         if len(registry_revision) != 40 or any(x not in "0123456789abcdef" for x in registry_revision):
             raise ValueError("full reviewed settings registry revision required")
         prefix = "tools/inferssd/src/inferssd/"
-        if any(path.startswith(prefix) for path in files):
+        if any(path.startswith((prefix, "framework/src/inferssd/")) for path in files):
             raise ValueError("control source already includes its own registry")
         registry_files = {}
         for name in ("__init__.py", "configuration/__init__.py", "configuration/settings.py", "configuration/schema.json"):

@@ -6,6 +6,11 @@ name: InferSSD reviewed integration smoke
 on:
   workflow_dispatch:
     inputs:
+      device:
+        description: Reviewed physical device (125 and 233 are not CI devices)
+        required: true
+        type: choice
+        options: [cloud-5090, dgx-spark, local-mbp]
       job_id:
         description: Fresh root-staged job ID (32 lowercase hexadecimal characters)
         required: true
@@ -22,17 +27,18 @@ on:
 permissions: {}
 
 jobs:
-  cloud-5090:
+  device:
     if: github.repository == 'wici-ai/inferssd-device-ci' && github.ref == 'refs/heads/main'
-    runs-on: [self-hosted, Linux, X64, inferssd-device-ci, cloud-5090]
+    runs-on: ${{ fromJSON(inputs.device == 'cloud-5090' && '["self-hosted","Linux","X64","inferssd-device-ci","cloud-5090"]' || inputs.device == 'dgx-spark' && '["self-hosted","Linux","ARM64","inferssd-device-ci","dgx-spark"]' || '["self-hosted","macOS","ARM64","inferssd-device-ci","local-mbp"]') }}
     timeout-minutes: 120
     concurrency:
-      group: physical-cloud-5090
+      group: physical-${{ inputs.device }}
       cancel-in-progress: false
     steps:
       - name: Build and run the root-staged reviewed source
         shell: bash
         env:
+          INTEGRATION_DEVICE: ${{ inputs.device }}
           INTEGRATION_JOB_ID: ${{ inputs.job_id }}
           INTEGRATION_SOURCE_REVISION: ${{ inputs.source_revision }}
           INTEGRATION_CONFIG_SHA256: ${{ inputs.config_sha256 }}
@@ -48,14 +54,27 @@ jobs:
           [[ "$INTEGRATION_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
           [[ "$INTEGRATION_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]]
 
-          control=/opt/inferssd-ci-control/current
+          case "$INTEGRATION_DEVICE" in
+            cloud-5090|dgx-spark)
+              control=/opt/inferssd-ci-control/current
+              config="/opt/inferssd-ci-integrations/$INTEGRATION_JOB_ID.json"
+              socket=/run/inferssd-ci-broker/broker.sock
+              platform=linux
+              ;;
+            local-mbp)
+              control=/Library/InferSSD-CI/controller/current
+              config="/Library/InferSSD-CI/integrations/$INTEGRATION_JOB_ID.json"
+              socket=/Library/InferSSD-CI/control/executor.sock
+              platform=darwin
+              ;;
+            *) exit 64 ;;
+          esac
           python="$control/venv/bin/python"
-          config="/opt/inferssd-ci-integrations/$INTEGRATION_JOB_ID.json"
-          "$python" -I - "$control" "$config" "$INTEGRATION_CONFIG_SHA256" "$INTEGRATION_SOURCE_REVISION" "$INTEGRATION_JOB_ID" "$artifact" <<'PY'
+          "$python" -I - "$control" "$config" "$INTEGRATION_CONFIG_SHA256" "$INTEGRATION_SOURCE_REVISION" "$INTEGRATION_JOB_ID" "$artifact" "$INTEGRATION_DEVICE" "$platform" <<'PY'
           import re
           import sys
           from pathlib import Path
-          control, config, expected_hash, expected_revision, job_id, output = sys.argv[1:]
+          control, config, expected_hash, expected_revision, job_id, output, device, platform = sys.argv[1:]
           if sys.version_info < (3, 10):
               raise SystemExit("the operator-installed controller requires Python 3.10 or later")
           sys.path.insert(0, str(Path(control) / "bench"))
@@ -66,20 +85,22 @@ jobs:
           if digest(config) != expected_hash:
               raise SystemExit("root-staged integration config hash differs")
           value = load(config)
-          if value.get("revision") != expected_revision or value.get("paths", {}).get("platform") != "linux":
-              raise SystemExit("job config does not bind this reviewed Linux source revision")
+          if (value.get("revision") != expected_revision or value.get("device") != device
+                  or value.get("paths", {}).get("platform") != platform):
+              raise SystemExit("job config does not bind the reviewed device/platform/source revision")
           manifest_hash = value.get("manifest_sha256", "")
           if not isinstance(manifest_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest_hash):
               raise SystemExit("job config must bind the exact root broker manifest hash")
           save(Path(output) / "dispatch.json", dict(
-              purpose="integration-smoke", job_id=job_id, revision=expected_revision,
+              purpose="integration-smoke", job_id=job_id, revision=expected_revision, device=device,
+              platform=platform,
               config_sha256=expected_hash, manifest_sha256=manifest_hash,
               control_entry_sha256=digest(entry),
               python_version=sys.version, performance_acceptance=False, benchmark_samples=0,
           ))
           PY
           "$python" -I "$control/bench/ci/staged_integration.py" \
-            --socket /run/inferssd-ci-broker/broker.sock \
+            --socket "$socket" \
             --job-id "$INTEGRATION_JOB_ID" \
             --config "$config" --config-sha256 "$INTEGRATION_CONFIG_SHA256" \
             --output "$artifact/$INTEGRATION_JOB_ID"
@@ -88,7 +109,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: integration-smoke-cloud-5090-${{ github.run_id }}-${{ github.run_attempt }}
+          name: integration-smoke-${{ inputs.device }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/inferssd-integration-${{ github.run_id }}-${{ github.run_attempt }}/
           include-hidden-files: true
           if-no-files-found: warn

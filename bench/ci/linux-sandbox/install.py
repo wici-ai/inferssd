@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import pwd
 import subprocess
+import stat
 
 FILES = ("contract.py", "executor.py", "guardian.py", "daemon.py", "client.py", "worker_probe.py", "probe.py",
          "stages.py", "worker_entry.py", "http_client.py", "stage_probe.py")
@@ -71,11 +72,24 @@ def write(path, data, mode):
 
 def main(args):
     source = Path(__file__).resolve().parent
+    existing = args.existing_lock
+    if args.device == "dgx-spark" and existing is None:
+        raise ValueError("DGX deployment must preserve the reviewed original device lock")
+    if existing:
+        if not existing.is_absolute() or ".." in existing.parts or existing.is_symlink():
+            raise ValueError("original lock must be an absolute regular path")
+        info = existing.lstat()
+        if (not stat.S_ISREG(info.st_mode) or [info.st_dev, info.st_ino] != [args.lock_device, args.lock_inode]
+                or info.st_uid != args.operator_uid or info.st_gid != args.operator_gid):
+            raise ValueError("original lock differs from explicit reviewed identity")
+        if not args.stop_path or args.stop_path.parent != existing.parent:
+            raise ValueError("explicit original STOP path beside existing lease required")
     hashes = {name: hashlib.sha256((source / name).read_bytes()).hexdigest() for name in FILES}
     plan = {"schema_version": 1, "install_root": str(INSTALL), "state_root": str(STATE),
             "controller": "inferssd-runner", "worker": "inferssd-worker", "client": "inferssd-client", "files": hashes,
+            "device": args.device, "existing_lock": str(existing) if existing else None,
             "actions": ["create three unprivileged non-login accounts", "install root-owned reviewed files",
-                        "create persistent original lock without replacement", "install disabled broker service"],
+                        "preserve existing coordination lease or create first cloud lease", "install disabled broker service"],
             "not_activated": ["no runner registration", "no ACTIVE proof binding", "no models or CUDA installation", "no physical benchmark"]}
     if not args.apply:
         print(json.dumps(plan, indent=2))
@@ -105,23 +119,33 @@ def main(args):
     write(INSTALL / "etc/nsswitch.conf", "passwd: files\ngroup: files\nhosts: files\n", 0o644)
     write(INSTALL / "etc/hosts", "127.0.0.1 localhost\n::1 localhost\n", 0o644)
     write(INSTALL / "etc/resolv.conf", "", 0o644)
-    lock = STATE / "device.lock"
-    write(lock, "", 0o600)
+    lock = existing or STATE / "device.lock"
+    if existing is None:
+        write(lock, "", 0o600)
     info = lock.stat()
     software = [str(p) for p in (Path("/usr/bin"), Path("/usr/sbin"), Path("/usr/lib"), Path("/usr/lib64"), Path("/usr/libexec"), Path("/usr/share")) if p.is_dir() and not p.is_symlink()]
-    config = {"schema_version": 1, "activation_ready": False, "device": "cloud-5090", "platform": "linux",
+    config = {"schema_version": 1, "activation_ready": False, "device": args.device, "platform": "linux",
               "install_root": str(INSTALL), "state_root": str(STATE),
               "controller_uid": runner.pw_uid, "controller_gid": runner.pw_gid,
               "worker_uid": worker.pw_uid, "worker_gid": worker.pw_gid,
               'client_uid': client.pw_uid, 'client_gid': client.pw_gid,
               "lock_path": str(lock), "lock_identity": [info.st_dev, info.st_ino],
-              "stop_path": str(STATE / "STOP"), "readonly_system": software,
+              "stop_path": str(args.stop_path or STATE / "STOP"), "readonly_system": software,
               "gpu_devices": [], "gpu_uuid": "", "memory_max": 1024**3, "tasks_max": 256,
               "log_max": 64 * 1024**2, 'build_max_bytes': 32 * 1024**3}
+    if existing:
+        config["coordination_owner"] = {"uid": args.operator_uid, "gid": args.operator_gid}
+    from contract import coordination_paths
+    coordination_paths(config)
     write(INSTALL / "config.json", json.dumps(config, indent=2) + "\n", 0o644)
     write(INSTALL / "install-receipt.json", json.dumps(plan, indent=2) + "\n", 0o644)
     unit = Path("/etc/systemd/system/inferssd-ci-broker.service")
-    write(unit, SERVICE, 0o644)
+    service = SERVICE
+    if existing:
+        service = service.replace("ProtectHome=yes", "ProtectHome=read-only").replace(
+            "ReadWritePaths=/var/lib/inferssd-ci-broker /run/inferssd-ci-broker",
+            "ReadWritePaths=/var/lib/inferssd-ci-broker /run/inferssd-ci-broker " + str(existing.parent))
+    write(unit, service, 0o644)
     subprocess.run(["/usr/bin/systemctl", "daemon-reload"], check=True)
     print(json.dumps({"installed": True, "service_started": False, "runner_registered": False,
                       "config": str(INSTALL / "config.json"), "negative_probe_required": True}))
@@ -131,4 +155,11 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--device", choices=("cloud-5090", "dgx-spark"), default="cloud-5090")
+    parser.add_argument("--existing-lock", type=Path)
+    parser.add_argument("--stop-path", type=Path)
+    parser.add_argument("--lock-device", type=int)
+    parser.add_argument("--lock-inode", type=int)
+    parser.add_argument("--operator-uid", type=int)
+    parser.add_argument("--operator-gid", type=int)
     raise SystemExit(main(parser.parse_args()))
