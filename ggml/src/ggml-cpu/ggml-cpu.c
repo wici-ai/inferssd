@@ -365,15 +365,6 @@ static bool ggml_cuda_moe_stream_supports_type(enum ggml_type type) {
            type == GGML_TYPE_MXFP4;
 }
 
-static bool ggml_moe_gate_batch_prefetch_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char * env = getenv("GGML_MOE_GATE_BATCH_PREFETCH");
-        enabled = (env && env[0] && env[0] != '0') ? 1 : 0;
-    }
-    return enabled != 0;
-}
-
 static bool ggml_cuda_moe_stream_one_q4k_enabled(void) {
     const char * env = getenv("GGML_MOE_STREAM_ONE_Q4K");
     return env && env[0] && env[0] != '0';
@@ -568,15 +559,6 @@ static bool ggml_moe_stream_one_name_filter_would_allow(const char * name) {
 
 static bool ggml_moe_stream_one_gpu_only_filter_matches(const char * name) {
     return ggml_moe_name_filter_matches_any(getenv("GGML_MOE_STREAM_ONE_GPU_ONLY_FILTER"), name);
-}
-
-static bool ggml_moe_stream_one_fast_return_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char * env = getenv("GGML_MOE_STREAM_ONE_FAST_RETURN");
-        enabled = (!env || !env[0] || env[0] != '0') ? 1 : 0;
-    }
-    return enabled != 0;
 }
 
 static void ggml_moe_fallback_reason_profile_report(void) {
@@ -1677,25 +1659,6 @@ static int ggml_moe_keep_topk_updown(void) {
     return keep_topk;
 }
 
-static int ggml_moe_gpu_keep_topk_updown(void) {
-    static int keep_topk = -1;
-    if (keep_topk < 0) {
-        const char * env = getenv("GGML_MOE_GPU_KEEP_TOPK_UPDOWN");
-        keep_topk = env && env[0] ? atoi(env) : 0;
-        if (keep_topk < 0) {
-            keep_topk = 0;
-        }
-    }
-    return keep_topk;
-}
-
-static bool ggml_moe_gpu_keep_topk_applies(const char * name) {
-    if (!name) {
-        return false;
-    }
-    return strstr(name, "ffn_up_exps") || strstr(name, "ffn_down_exps");
-}
-
 static bool ggml_moe_keep_topk_applies(const char * name) {
     if (!name) {
         return false;
@@ -2187,15 +2150,6 @@ static void ggml_moe_cpu_willneed_pages(const void * ptr, size_t size) {
 #endif
 }
 
-static bool ggml_moe_stream_compare_cpu_enabled(void) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char * env = getenv("GGML_MOE_STREAM_COMPARE_CPU_OUT");
-        enabled = env && env[0] ? 1 : 0;
-    }
-    return enabled != 0;
-}
-
 static bool ggml_moe_cpu_batch_microprobe_enabled(void) {
     static atomic_int cached = -1;
     int enabled = atomic_load_explicit(&cached, memory_order_relaxed);
@@ -2305,171 +2259,9 @@ static void ggml_moe_cpu_batch_microprobe_write(
     funlockfile(fp);
 }
 
-static FILE * ggml_moe_stream_compare_cpu_fp(void) {
-    static FILE * fp = NULL;
-    static int initialized = 0;
-    static pthread_mutex_t init_mu = PTHREAD_MUTEX_INITIALIZER;
-
-    pthread_mutex_lock(&init_mu);
-    if (!initialized) {
-        initialized = 1;
-        const char * path = getenv("GGML_MOE_STREAM_COMPARE_CPU_OUT");
-        if (path && path[0]) {
-            fp = fopen(path, "w");
-            if (fp) {
-                setvbuf(fp, NULL, _IOLBF, 0);
-                fprintf(fp,
-                    "seq,tensor,type,expert,cne1,count,max_abs,mean_abs,max_rel,max_k,max_row,max_col,cpu_value,gpu_value\n");
-            } else {
-                fprintf(stderr, "[moe_stream_compare] failed to open compare trace: %s\n", path);
-            }
-        }
-    }
-    pthread_mutex_unlock(&init_mu);
-
-    return fp;
-}
-
-static bool ggml_moe_stream_compare_cpu_take_record(int * out_seq) {
-    static atomic_int seq = 0;
-    static int limit = -1;
-    if (limit < 0) {
-        const char * env = getenv("GGML_MOE_STREAM_COMPARE_CPU_LIMIT");
-        limit = env && env[0] ? atoi(env) : 32;
-        if (limit <= 0) {
-            limit = 32;
-        }
-    }
-
-    const int cur_seq = atomic_fetch_add_explicit(&seq, 1, memory_order_relaxed);
-    if (cur_seq >= limit) {
-        return false;
-    }
-    *out_seq = cur_seq;
-    return true;
-}
-
-static void ggml_moe_stream_compare_cpu_write(
-    int seq,
-    const char * tensor,
-    enum ggml_type type,
-    int expert,
-    int64_t cne1,
-    int64_t count,
-    double max_abs,
-    double mean_abs,
-    double max_rel,
-    int64_t max_k,
-    int32_t max_row,
-    int32_t max_col,
-    float cpu_value,
-    float gpu_value) {
-    FILE * fp = ggml_moe_stream_compare_cpu_fp();
-    if (!fp) {
-        return;
-    }
-
-    flockfile(fp);
-    fprintf(fp,
-        "%d,%s,%d,%d,%" PRId64 ",%" PRId64 ",%.9g,%.9g,%.9g,%" PRId64 ",%d,%d,%.9g,%.9g\n",
-        seq,
-        tensor ? tensor : "",
-        (int) type,
-        expert,
-        cne1,
-        count,
-        max_abs,
-        mean_abs,
-        max_rel,
-        max_k,
-        max_row,
-        max_col,
-        (double) cpu_value,
-        (double) gpu_value);
-    funlockfile(fp);
-}
-
-static FILE * ggml_moe_stream_compare_block_fp(void) {
-    static FILE * fp = NULL;
-    static int initialized = 0;
-    static pthread_mutex_t init_mu = PTHREAD_MUTEX_INITIALIZER;
-
-    pthread_mutex_lock(&init_mu);
-    if (!initialized) {
-        initialized = 1;
-        const char * path = getenv("GGML_MOE_STREAM_COMPARE_BLOCK_OUT");
-        if (path && path[0]) {
-            fp = fopen(path, "w");
-            if (fp) {
-                setvbuf(fp, NULL, _IOLBF, 0);
-                fprintf(fp,
-                    "seq,tensor,type,expert,max_k,row_id,i12,out_col,block,cpu_wdata_q80_part,post_src1_q80_part,abs_part_diff,d_wdata,d_post,e,amax_post,sumi_wdata,sumi_post,cpu_wdata_total,post_src1_total,gpu_value\n");
-            } else {
-                fprintf(stderr, "[moe_stream_compare] failed to open block trace: %s\n", path);
-            }
-        }
-    }
-    pthread_mutex_unlock(&init_mu);
-
-    return fp;
-}
-
 static const int8_t ggml_moe_stream_mxfp4_values[16] = {
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 };
-
-static void ggml_moe_stream_compare_block_write(
-    int seq,
-    const char * tensor,
-    enum ggml_type type,
-    int expert,
-    int64_t max_k,
-    int32_t row_id,
-    int64_t i12,
-    int32_t out_col,
-    int64_t block,
-    double cpu_wdata_q80_part,
-    double post_src1_q80_part,
-    double d_wdata,
-    double d_post,
-    int e,
-    double amax_post,
-    int sumi_wdata,
-    int sumi_post,
-    double cpu_wdata_total,
-    double post_src1_total,
-    float gpu_value) {
-    FILE * fp = ggml_moe_stream_compare_block_fp();
-    if (!fp) {
-        return;
-    }
-
-    flockfile(fp);
-    fprintf(fp,
-        "%d,%s,%d,%d,%" PRId64 ",%d,%" PRId64 ",%d,%" PRId64 ",%.9g,%.9g,%.9g,%.9g,%.9g,%d,%.9g,%d,%d,%.9g,%.9g,%.9g\n",
-        seq,
-        tensor ? tensor : "",
-        (int) type,
-        expert,
-        max_k,
-        row_id,
-        i12,
-        out_col,
-        block,
-        cpu_wdata_q80_part,
-        post_src1_q80_part,
-        fabs(cpu_wdata_q80_part - post_src1_q80_part),
-        d_wdata,
-        d_post,
-        e,
-        amax_post,
-        sumi_wdata,
-        sumi_post,
-        cpu_wdata_total,
-        post_src1_total,
-        (double) gpu_value);
-    funlockfile(fp);
-}
 
 #define GGML_THREADPOOL_N_THREADS_MASK (0xffffU)
 #define GGML_THREADPOOL_N_THREADS_BITS (16)
@@ -3878,167 +3670,6 @@ static void ggml_compute_forward_mul_mat_id_microprobe_one_chunk(
         ggml_moe_cpu_batch_microprobe_sum_abs[ith] += sum_abs;
         ggml_moe_cpu_batch_microprobe_sink[ith] += sink;
     }
-}
-
-static void ggml_moe_stream_compare_block_result(
-    int seq,
-    struct ggml_tensor * dst,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    const int64_t cur_a,
-    const char * src0_cur,
-    const struct mmid_row_mapping * matrix_rows,
-    const size_t row_size,
-    const bool src1_cont,
-    const void * wdata,
-    const int64_t max_k,
-    const int32_t max_col) {
-    if (src0->type != GGML_TYPE_MXFP4 || src1->type != GGML_TYPE_F32 || max_k < 0 || max_col < 0 || !ggml_moe_stream_compare_block_fp()) {
-        return;
-    }
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
-    const struct mmid_row_mapping row_mapping = matrix_rows[max_k];
-    const int id = row_mapping.i1;
-    const int64_t i11 = id % ne11;
-    const int64_t i12 = row_mapping.i2;
-    const char * src1_col_q80 = (const char *) wdata +
-        (src1_cont || src1->type != vec_dot_type
-        ? (i11 + i12*ne11)*row_size
-        : (i11*nb11 + i12*nb12));
-    const block_q8_0 * y_wdata = (const block_q8_0 *) src1_col_q80;
-    const float * src1_f32 = (const float *) ((const char *) src1->data + i11*nb11 + i12*nb12);
-    const block_mxfp4 * x = (const block_mxfp4 *) (src0_cur + (int64_t) max_col*nb01);
-    const float gpu = *(const float *) ((const char *) dst->data + (id*nb1 + i12*nb2 + (int64_t) max_col*nb0));
-
-    double cpu_wdata_total = 0.0;
-    double post_src1_total = 0.0;
-
-    const int64_t nb = ne00 / QK_MXFP4;
-    for (int64_t ib = 0; ib < nb; ++ib) {
-        float amax = 0.0f;
-        for (int j = 0; j < QK_MXFP4; ++j) {
-            amax = MAX(amax, fabsf(src1_f32[ib*QK_MXFP4 + j]));
-        }
-
-        const float d_post = amax / ((1 << 7) - 1);
-        const float id_q = d_post ? 1.0f/d_post : 0.0f;
-        const ggml_fp16_t d_h = GGML_FP32_TO_FP16(d_post);
-        const float d_post_q = GGML_FP16_TO_FP32(d_h);
-
-        int8_t q_post[QK_MXFP4];
-        for (int j = 0; j < QK_MXFP4; ++j) {
-            const int q = (int) roundf(src1_f32[ib*QK_MXFP4 + j] * id_q);
-            q_post[j] = (int8_t) q;
-        }
-
-        int sumi_wdata = 0;
-        int sumi_post = 0;
-        for (int j = 0; j < QK_MXFP4/2; ++j) {
-            const int v0 = ggml_moe_stream_mxfp4_values[x[ib].qs[j] & 0x0F];
-            const int v1 = ggml_moe_stream_mxfp4_values[x[ib].qs[j] >> 4];
-            sumi_wdata += y_wdata[ib].qs[j] * v0;
-            sumi_wdata += y_wdata[ib].qs[j + QK_MXFP4/2] * v1;
-            sumi_post += q_post[j] * v0;
-            sumi_post += q_post[j + QK_MXFP4/2] * v1;
-        }
-
-        const float scale_base = GGML_E8M0_TO_FP32_HALF(x[ib].e);
-        const float d_wdata = GGML_FP16_TO_FP32(y_wdata[ib].d);
-        const double cpu_part = (double) scale_base * (double) d_wdata * (double) sumi_wdata;
-        const double post_part = (double) scale_base * (double) d_post_q * (double) sumi_post;
-        cpu_wdata_total += cpu_part;
-        post_src1_total += post_part;
-
-        ggml_moe_stream_compare_block_write(
-            seq, src0->name, src0->type, (int) cur_a, max_k, id, i12, max_col, ib,
-            cpu_part, post_part, d_wdata, d_post_q, (int) x[ib].e, amax, sumi_wdata, sumi_post,
-            cpu_wdata_total, post_src1_total, gpu);
-    }
-}
-
-static void ggml_moe_stream_compare_cpu_result(
-    struct ggml_tensor * dst,
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    const int64_t cur_a,
-    const int64_t cne1,
-    const char * src0_cur,
-    const struct mmid_row_mapping * matrix_rows,
-    const size_t row_size,
-    const bool src1_cont,
-    const void * wdata) {
-    int seq = 0;
-    if (!ggml_moe_stream_compare_cpu_take_record(&seq)) {
-        return;
-    }
-
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const enum ggml_type type = src0->type;
-    ggml_vec_dot_t const vec_dot = type_traits_cpu[type].vec_dot;
-    enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
-
-    double sum_abs = 0.0;
-    double max_abs = -1.0;
-    double max_rel = 0.0;
-    int64_t count = 0;
-    int64_t max_k = -1;
-    int32_t max_row = -1;
-    int32_t max_col = -1;
-    float max_cpu = 0.0f;
-    float max_gpu = 0.0f;
-
-    for (int64_t k = 0; k < cne1; ++k) {
-        struct mmid_row_mapping row_mapping = matrix_rows[k];
-        const int id = row_mapping.i1;
-        const int64_t i11 = id % ne11;
-        const int64_t i12 = row_mapping.i2;
-
-        const char * src1_col = (const char *) wdata +
-            (src1_cont || src1->type != vec_dot_type
-            ? (i11 + i12*ne11)*row_size
-            : (i11*nb11 + i12*nb12));
-
-        const float * dst_col = (const float *) ((const char *) dst->data + (id*nb1 + i12*nb2));
-
-        for (int64_t ir0 = 0; ir0 < ne01; ++ir0) {
-            float cpu = 0.0f;
-            vec_dot(ne00, &cpu, 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
-            const float gpu = dst_col[ir0];
-            const double abs_diff = fabs((double) cpu - (double) gpu);
-            const double denom = fmax(fabs((double) cpu), 1.0e-12);
-            const double rel_diff = abs_diff / denom;
-
-            sum_abs += abs_diff;
-            count += 1;
-            if (abs_diff > max_abs) {
-                max_abs = abs_diff;
-                max_rel = rel_diff;
-                max_k = k;
-                max_row = id;
-                max_col = (int32_t) ir0;
-                max_cpu = cpu;
-                max_gpu = gpu;
-            }
-        }
-    }
-
-    ggml_moe_stream_compare_cpu_write(
-        seq, src0->name, src0->type, (int) cur_a, cne1, count,
-        max_abs < 0.0 ? 0.0 : max_abs,
-        count > 0 ? sum_abs / (double) count : 0.0,
-        max_rel,
-        max_k,
-        max_row,
-        max_col,
-        max_cpu,
-        max_gpu);
-
-    ggml_moe_stream_compare_block_result(
-        seq, dst, src0, src1, cur_a, src0_cur, matrix_rows, row_size, src1_cont, wdata, max_k, max_col);
 }
 
 static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
