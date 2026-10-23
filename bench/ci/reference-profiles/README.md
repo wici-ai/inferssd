@@ -1,5 +1,23 @@
 # Cloud 5090 Muse reference launch
 
+`cloud-5090-muse-f5-tier-off-reserve1024.json` is a separate, unexecuted
+static mapping for untouched f5 versus
+`a1bd9d22248dc897e288af303cde9c501952b347`. Both sides disable the expert GPU
+tier while retaining the model, 64 GiB host limit, CPU settings, dense GPU
+offload and the explicit sixteen-setting snapshot. It records the five legacy
+environment changes, the candidate's equivalent `vram.budget=0` derivation,
+and exact source-file hashes and lines. It does not replace the historical
+8 GiB draft below and cannot establish no regression for that mode.
+
+The tier-off draft retains a 1024 MiB allocator reserve for the ready-context
+request measurement. Candidate CUDA service attachment registers that reserve
+independently of tier creation. There is a startup distinction: f5's environment
+guard also covers model loading, whereas the candidate context registration
+occurs afterward. The draft explicitly records this scope and an **unapplied**
+reserve-zero alternative if equal startup coverage is required. It is not an
+executable binding or job authorization; actual identities and acceptance of
+the stated scope are still required before a device comparison.
+
 `cloud-5090-muse-f5.json` is a source-reviewed launch draft for untouched
 `f5e6e26ff26d2014cccef0118048039b88163f54`, compared with the actual behavior of
 `677763d63974b073cfeb68de1e276d8ce513e493`. It contains a concrete argv/environment,
