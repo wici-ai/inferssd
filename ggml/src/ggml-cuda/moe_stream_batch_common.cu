@@ -23501,75 +23501,8 @@ extern "C" bool ggml_cuda_moe_stream_stage_active_experts(
     void *dst_staged,
     size_t dst_staged_bytes,
     cudaStream_t stream) {
-    if (!src0_name || !src0_data || n_as <= 0 || nb02 < expert_bytes ||
-            !matrix_row_counts || !dst_staged || dst_staged_bytes < (size_t)n_as * nb02 || !stream) {
-        return false;
-    }
-
-    std::vector<int> active_experts;
-    active_experts.reserve((size_t)n_as);
-    for (int64_t expert = 0; expert < n_as; ++expert) {
-        if (matrix_row_counts[expert] > 0) {
-            active_experts.push_back((int)expert);
-        }
-    }
-    if (active_experts.empty()) {
-        return false;
-    }
-
-    std::vector<const void *> expert_ptrs(active_experts.size(), nullptr);
-    std::vector<int> cache_states(active_experts.size(), 0);
-    std::vector<ggml_moe_expert_descriptor> descriptors(active_experts.size());
-    int resolved = 0;
-    for (int first = 0; first < (int)active_experts.size(); first += 8) {
-        const int count = std::min(8, (int)active_experts.size() - first);
-        if (!ggml_cuda_moe_stream_one_cache_dev_ptrs_or_insert(
-                src0_name,
-                src0_data,
-                nb02,
-                expert_bytes,
-                active_experts.data() + first,
-                nullptr,
-                count,
-                stream,
-                expert_ptrs.data() + first,
-                cache_states.data() + first,
-                descriptors.data() + first)) {
-            if (resolved > 0) {
-                cudaStreamSynchronize(stream);
-                ggml_cuda_moe_stream_one_cache_release_descriptors_synchronized(
-                    descriptors.data(), resolved);
-            }
-            return false;
-        }
-        resolved += count;
-    }
-
-    bool copied = true;
-    for (size_t i = 0; i < active_experts.size(); ++i) {
-        copied = copied && cudaMemcpyAsync(
-            (char *)dst_staged + (size_t)active_experts[i] * nb02,
-            expert_ptrs[i],
-            expert_bytes,
-            cudaMemcpyDeviceToDevice,
-            stream) == cudaSuccess;
-    }
-    if (!copied) {
-        cudaStreamSynchronize(stream);
-        ggml_cuda_moe_stream_one_cache_release_descriptors_synchronized(
-            descriptors.data(), resolved);
-        return false;
-    }
-    ggml_cuda_moe_stream_one_cache_release_descriptors(
-        descriptors.data(), resolved, stream);
-
-    static std::atomic<int> first_report{0};
-    if (first_report.fetch_add(1, std::memory_order_relaxed) == 0) {
-        std::fprintf(stderr,
-            "[moe_stream_batch] staged active experts for native CUDA: tensor=%s active=%zu expert_bytes=%zu staging_bytes=%zu\n",
-            src0_name, active_experts.size(), expert_bytes, dst_staged_bytes);
-    }
-    return true;
+    // The experimental object/cache or probe path is retired.
+    return false;
 }
 
 extern "C" bool ggml_cuda_moe_stream_preload_tensor(
