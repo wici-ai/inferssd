@@ -1,0 +1,105 @@
+name: InferSSD reviewed integration smoke
+
+# Deploy only as a workflow in the PRIVATE wici-ai/inferssd-device-ci repository.
+# Source and job manifests are already reviewed and root-staged on this device.
+# This workflow is not the full PR performance gate and publishes no App check.
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Fresh root-staged job ID (32 lowercase hexadecimal characters)
+        required: true
+        type: string
+      source_revision:
+        description: Reviewed source revision (full 40-character lowercase SHA)
+        required: true
+        type: string
+      config_sha256:
+        description: SHA-256 of the root-owned per-job integration configuration
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  cloud-5090:
+    if: github.repository == 'wici-ai/inferssd-device-ci' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Linux, X64, inferssd-device-ci, cloud-5090]
+    timeout-minutes: 120
+    concurrency:
+      group: physical-cloud-5090
+      cancel-in-progress: false
+    steps:
+      - name: Build and run the root-staged reviewed source
+        shell: bash
+        env:
+          INTEGRATION_JOB_ID: ${{ inputs.job_id }}
+          INTEGRATION_SOURCE_REVISION: ${{ inputs.source_revision }}
+          INTEGRATION_CONFIG_SHA256: ${{ inputs.config_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          artifact="$RUNNER_TEMP/inferssd-integration-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$artifact"
+          exec > >(tee "$artifact/controller.stdout.log") 2> >(tee "$artifact/controller.stderr.log" >&2)
+
+          [[ "$INTEGRATION_JOB_ID" =~ ^[0-9a-f]{32}$ ]]
+          [[ "$INTEGRATION_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$INTEGRATION_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]]
+
+          control=/opt/inferssd-ci-control/current
+          python="$control/venv/bin/python"
+          config="/opt/inferssd-ci-integrations/$INTEGRATION_JOB_ID.json"
+          "$python" -I - "$control" "$config" "$INTEGRATION_CONFIG_SHA256" "$INTEGRATION_SOURCE_REVISION" "$INTEGRATION_JOB_ID" "$artifact" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          control, config, expected_hash, expected_revision, job_id, output = sys.argv[1:]
+          if sys.version_info < (3, 10):
+              raise SystemExit("the operator-installed controller requires Python 3.10 or later")
+          sys.path.insert(0, str(Path(control) / "bench"))
+          from ci.contract import digest, load, save
+          from ci.isolated_device import protected
+          entry = protected(Path(control) / "bench/ci/staged_integration.py")
+          config = protected(config)
+          if digest(config) != expected_hash:
+              raise SystemExit("root-staged integration config hash differs")
+          value = load(config)
+          if value.get("revision") != expected_revision or value.get("paths", {}).get("platform") != "linux":
+              raise SystemExit("job config does not bind this reviewed Linux source revision")
+          manifest_hash = value.get("manifest_sha256", "")
+          if not isinstance(manifest_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest_hash):
+              raise SystemExit("job config must bind the exact root broker manifest hash")
+          save(Path(output) / "dispatch.json", dict(
+              purpose="integration-smoke", job_id=job_id, revision=expected_revision,
+              config_sha256=expected_hash, manifest_sha256=manifest_hash,
+              control_entry_sha256=digest(entry),
+              python_version=sys.version, performance_acceptance=False, benchmark_samples=0,
+          ))
+          PY
+          "$python" -I "$control/bench/ci/staged_integration.py" \
+            --socket /run/inferssd-ci-broker/broker.sock \
+            --job-id "$INTEGRATION_JOB_ID" \
+            --config "$config" --config-sha256 "$INTEGRATION_CONFIG_SHA256" \
+            --output "$artifact/$INTEGRATION_JOB_ID"
+
+      - name: Retain the complete attempt, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: integration-smoke-cloud-5090-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/inferssd-integration-${{ github.run_id }}-${{ github.run_attempt }}/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: State the scope of this result
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo 'This attempt is an integration smoke test of one reviewed, root-staged source.'
+            echo 'Performance acceptance: false. Formal benchmark samples: 0.'
+            echo 'It does not replace the three-device PR performance gate or establish no regression.'
+          } >> "$GITHUB_STEP_SUMMARY"

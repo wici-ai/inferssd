@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import socket
+import stat
 import subprocess
 import sys
 import uuid
@@ -68,7 +69,14 @@ def worker_environment(environment: dict[str, str]) -> dict[str, str]:
 
 class OwnedProcess:
     def __init__(
-        self, resolution: Resolution, directory: str, policy: Policy, *, reservation: Reservation
+        self,
+        resolution: Resolution,
+        directory: str,
+        policy: Policy,
+        *,
+        reservation: Reservation,
+        inherited_lock_fd: Optional[int] = None,
+        command_mode: bool = False,
     ) -> None:
         if resolution.code != 0 or resolution.needed is not None or not resolution.argv:
             raise ValueError("native launch requires a complete successful resolution")
@@ -88,11 +96,23 @@ class OwnedProcess:
             "scope": scope,
             "unit": unit,
             "policy": asdict(policy),
+            "command_mode": command_mode,
         }
         path = self.directory / "runtime.json"
         child_end: Optional[socket.socket] = None
         try:
-            self._lock = os.open(policy.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            if inherited_lock_fd is None:
+                self._lock = os.open(policy.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            else:
+                actual, expected = os.fstat(inherited_lock_fd), os.stat(policy.lock_path)
+                if not stat.S_ISREG(actual.st_mode) or (actual.st_dev, actual.st_ino) != (
+                    expected.st_dev,
+                    expected.st_ino,
+                ):
+                    raise ValueError("inherited lease differs from the existing device lock inode")
+                # dup retains the same flock open-file-description. Closing this
+                # owner's copy does not release the caller's batch lease.
+                self._lock = os.dup(inherited_lock_fd)
             fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             reservation.verify()
             save(path, specification)

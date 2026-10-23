@@ -7,11 +7,11 @@ from pathlib import Path
 from stream_chat import decode_json, token_list, validate_probability
 
 
-def compare(a, b):
+def compare(a, b, *, max_input_tokens=1024):
     for value in (a, b):
         if value.get("status") != "passed":
             raise ValueError("both measurements must have passed")
-        if (type(value.get("input_tokens")) is not int or not 1 <= value["input_tokens"] <= 1024
+        if (type(value.get("input_tokens")) is not int or not 1 <= value["input_tokens"] <= max_input_tokens
                 or type(value.get("output_tokens")) is not int or not 1 <= value["output_tokens"] <= 512
                 or not token_list(value.get("prompt_ids"))
                 or len(value["prompt_ids"]) != value["input_tokens"]):

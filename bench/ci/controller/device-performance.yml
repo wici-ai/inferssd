@@ -1,0 +1,185 @@
+name: InferSSD private device controller
+
+# Deploy ONLY to wici-ai/inferssd-device-ci, with protected main and no PR trigger.
+# Protect this workflow/ref and use only private-repository runners. Labels do
+# not grant trust. Never register physical runners with the public code repo.
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: Reviewed trusted staging PR number
+        required: true
+        type: string
+      head_sha:
+        description: Full 40-character SHA explicitly reviewed for physical execution
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: physical-pr-${{ inputs.pull_request }}
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.repository == 'wici-ai/inferssd-device-ci' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.admit.outputs.code }}
+      matrix: ${{ steps.admit.outputs.matrix }}
+      candidate: ${{ steps.admit.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Install and retain the reviewed control wheel
+        run: |
+          python3 -m venv .control-venv
+          .control-venv/bin/python -m pip wheel --no-deps ./control/tools/inferssd --wheel-dir wheel
+          .control-venv/bin/python -m pip install --no-index --no-deps wheel/*.whl
+      - name: Admit only the exact reviewed current SHA and base
+        id: admit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_READ_TOKEN: ${{ secrets.INFERSSD_SOURCE_READ_TOKEN }}
+          INFERSSD_CI_ENABLED: ${{ vars.INFERSSD_CI_ENABLED }}
+          INFERSSD_CI_DEVICE_CONFIG_HASHES: ${{ vars.INFERSSD_CI_DEVICE_CONFIG_HASHES }}
+        run: .control-venv/bin/python -I control/bench/ci/private_controller.py preflight --control control --policy control/bench/ci/policy.json --plan admission.json
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: wici-ai/inferssd
+          ref: ${{ steps.admit.outputs.candidate }}
+          token: ${{ secrets.INFERSSD_SOURCE_READ_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: source-data
+      - name: Pack source objects as data; execute no candidate code
+        run: .control-venv/bin/python -I control/bench/ci/pack_sources.py --source source-data --admission admission.json --bundle source.bundle --plan device-plan.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: admitted-inputs
+          path: |
+            device-plan.json
+            source.bundle
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: control-wheel
+          path: wheel/
+          if-no-files-found: error
+          retention-days: 30
+
+  device:
+    needs: prepare
+    if: needs.prepare.outputs.code == 'true'
+    # Exact-SHA physical authorization is checked in the source review body.
+    # Environment reviewers are an additional external setting where available
+    # (not available for private environments on Team); never an OS sandbox.
+    environment: physical-devices
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.labels }}
+    timeout-minutes: 720
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: physical-${{ matrix.device }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: admitted-inputs
+          path: inputs
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: control-wheel
+          path: wheel
+      - name: Install trusted control without network dependencies
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/controller-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          "$RUNNER_TEMP/controller-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/bin/python" -m pip install --no-index --no-deps wheel/*.whl
+      - name: Invoke the root-owned isolated broker; no direct candidate command
+        shell: bash
+        env:
+          DEVICE_SLOT: ${{ matrix.device }}
+        run: |
+          test -n "${INFERSSD_CI_CONFIG:-}"
+          "$RUNNER_TEMP/controller-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/bin/python" -I control/bench/ci/isolated_device.py \
+            --control control --plan inputs/device-plan.json --policy control/bench/ci/policy.json \
+            --config "$INFERSSD_CI_CONFIG" --source-bundle inputs/source.bundle --device "$DEVICE_SLOT" \
+            --output "$RUNNER_TEMP/device-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/device-$DEVICE_SLOT"
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: device-${{ matrix.device }}
+          path: ${{ runner.temp }}/device-${{ github.run_id }}-${{ github.run_attempt }}/device-${{ matrix.device }}/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
+
+  publish:
+    needs: [prepare, device]
+    if: always() && needs.prepare.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: admitted-inputs
+          path: inputs
+      - if: needs.prepare.outputs.code == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: device-*
+          path: artifacts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: control-wheel
+          path: wheel
+      - name: Install trusted finalizer
+        run: |
+          python3 -m venv .control-venv
+          .control-venv/bin/python -m pip install --no-index --no-deps wheel/*.whl
+      - name: Mint short-lived dedicated check App token only on the hosted publisher
+        id: check-app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
+        with:
+          client-id: ${{ vars.INFERSSD_CHECK_APP_CLIENT_ID }}
+          private-key: ${{ secrets.INFERSSD_CHECK_APP_PRIVATE_KEY }}
+          owner: wici-ai
+          repositories: inferssd
+          permission-checks: write
+          permission-contents: read
+          permission-pull-requests: read
+          permission-actions: read
+      - name: Revalidate current sources, review, CI attempt and raw evidence before App publication
+        env:
+          DEVICE_CHECK_TOKEN: ${{ steps.check-app.outputs.token }}
+          DEVICE_CHECK_APP_ID: ${{ vars.INFERSSD_CHECK_APP_ID }}
+        run: .control-venv/bin/python -I control/bench/ci/private_controller.py finalize --control control --plan inputs/device-plan.json --policy control/bench/ci/policy.json --artifacts artifacts --output comparison.json
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: device-comparison
+          path: comparison.json
+          if-no-files-found: warn
+          retention-days: 30
