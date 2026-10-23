@@ -8528,27 +8528,13 @@ static void expert_pack_init_once() {
     std::lock_guard<std::mutex> lk(g_expert_pack.mu);
     if (g_expert_pack.inited) return;
 
-    const char *q4_colibri_pack = std::getenv("GGML_MOE_Q4_COLIBRI_PACK");
-    const char *q4_colibri_manifest = std::getenv("GGML_MOE_Q4_COLIBRI_MANIFEST");
-    const char *q4_colibri_overlay_pack = std::getenv("GGML_MOE_Q4_COLIBRI_OVERLAY_PACK");
-    const char *q4_colibri_overlay_manifest = std::getenv("GGML_MOE_Q4_COLIBRI_OVERLAY_MANIFEST");
-    const bool q4_colibri_requested =
-        (q4_colibri_pack && q4_colibri_pack[0]) || (q4_colibri_manifest && q4_colibri_manifest[0]);
-    if (q4_colibri_requested) {
-        if (!q4_colibri_pack || !q4_colibri_pack[0] || !q4_colibri_manifest || !q4_colibri_manifest[0]) {
-            q4_colibri_fail("both GGML_MOE_Q4_COLIBRI_PACK and GGML_MOE_Q4_COLIBRI_MANIFEST are required");
+    for (const char * name : {"GGML_MOE_Q4_COLIBRI_PACK", "GGML_MOE_Q4_COLIBRI_MANIFEST"}) {
+        const char * value = std::getenv(name);
+        if (value && value[0]) {
+            std::fprintf(stderr, "[moe_stream_batch] retired source family: %s\n", name);
+            g_expert_pack.inited = true;
+            return;
         }
-        if ((q4_colibri_overlay_pack && q4_colibri_overlay_pack[0]) ||
-                (q4_colibri_overlay_manifest && q4_colibri_overlay_manifest[0])) {
-            if (!q4_colibri_overlay_pack || !q4_colibri_overlay_pack[0] ||
-                    !q4_colibri_overlay_manifest || !q4_colibri_overlay_manifest[0]) {
-                q4_colibri_fail("both GGML_MOE_Q4_COLIBRI_OVERLAY_PACK and GGML_MOE_Q4_COLIBRI_OVERLAY_MANIFEST are required");
-            }
-        }
-        g_expert_pack.q4_colibri = true;
-        g_expert_pack.q4_colibri_debug_partial_fallback =
-            expert_pack_env_bool("GGML_MOE_Q4_COLIBRI_DEBUG_PARTIAL_FALLBACK", false);
-        g_expert_pack.io_backend = 1;
     }
 
     const char *io_backend_env = std::getenv("GGML_MOE_IO_BACKEND");
@@ -8591,27 +8577,12 @@ static void expert_pack_init_once() {
     const char *gguf_alias_tsv = std::getenv("GGML_MOE_EXPERT_GGUF_ALIAS_TSV");
     const bool has_gguf_alias = gguf_alias_tsv && gguf_alias_tsv[0];
 
-    if (q4_colibri_requested && (!source_paths.empty() || !page_cache_paths.empty() || has_gguf_alias)) {
-        q4_colibri_fail("q4 colibri source cannot be combined with legacy pack, page-cache, or GGUF alias sources");
-    }
-    if (!q4_colibri_requested && source_paths.empty() && page_cache_paths.empty() && !has_gguf_alias) {
+    if (source_paths.empty() && page_cache_paths.empty() && !has_gguf_alias) {
         g_expert_pack.inited = true;
         return;
     }
 
-
     std::vector<expert_pack_entry> entries;
-    if (q4_colibri_requested && !q4_colibri_load_manifest(q4_colibri_pack, q4_colibri_manifest, entries)) {
-        q4_colibri_fail("manifest load failed");
-    }
-    const bool q4_colibri_overlay_requested =
-        q4_colibri_requested &&
-        q4_colibri_overlay_pack && q4_colibri_overlay_pack[0] &&
-        q4_colibri_overlay_manifest && q4_colibri_overlay_manifest[0];
-    if (q4_colibri_overlay_requested &&
-            !q4_colibri_load_manifest(q4_colibri_overlay_pack, q4_colibri_overlay_manifest, entries)) {
-        q4_colibri_fail("overlay manifest load failed");
-    }
     for (const std::string &source_path : source_paths) {
         if (!expert_pack_load_source(source_path.c_str(), (int32_t)g_expert_pack.sources.size(), entries, false)) {
             g_expert_pack.inited = true;
@@ -8652,7 +8623,7 @@ static void expert_pack_init_once() {
         });
     const bool replace_duplicates =
         expert_pack_env_bool("GGML_MOE_EXPERT_PACK_REPLACE_DUPLICATES", false) ||
-        !page_cache_paths.empty() || q4_colibri_overlay_requested;
+        !page_cache_paths.empty();
     uint64_t replaced_duplicates = 0;
     if (replace_duplicates && !entries.empty()) {
         std::vector<expert_pack_entry> deduped;

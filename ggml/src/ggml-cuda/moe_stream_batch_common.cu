@@ -6586,44 +6586,20 @@ static void expert_pack_init_once() {
     std::lock_guard<std::mutex> lk(g_expert_pack.mu);
     if (g_expert_pack.inited) return;
 
-    const char *q4_colibri_pack = std::getenv("GGML_MOE_Q4_COLIBRI_PACK");
-    const char *q4_colibri_manifest = std::getenv("GGML_MOE_Q4_COLIBRI_MANIFEST");
-    const char *glm52_colibri_pack = std::getenv("GGML_MOE_GLM52_COLIBRI_PACK");
-    const char *glm52_colibri_manifest = std::getenv("GGML_MOE_GLM52_COLIBRI_MANIFEST");
-    const char *q4_colibri_overlay_pack = std::getenv("GGML_MOE_Q4_COLIBRI_OVERLAY_PACK");
-    const char *q4_colibri_overlay_manifest = std::getenv("GGML_MOE_Q4_COLIBRI_OVERLAY_MANIFEST");
-    const bool q4_colibri_requested =
-        (q4_colibri_pack && q4_colibri_pack[0]) || (q4_colibri_manifest && q4_colibri_manifest[0]);
-    const bool glm52_colibri_requested =
-        (glm52_colibri_pack && glm52_colibri_pack[0]) || (glm52_colibri_manifest && glm52_colibri_manifest[0]);
-    if (q4_colibri_requested && glm52_colibri_requested) {
-        q4_colibri_fail("q4 colibri and GLM52 colibri sources cannot be combined");
+    for (const char * name : {"GGML_MOE_Q4_COLIBRI_PACK", "GGML_MOE_Q4_COLIBRI_MANIFEST", "GGML_MOE_GLM52_COLIBRI_PACK", "GGML_MOE_GLM52_COLIBRI_MANIFEST"}) {
+        const char * value = std::getenv(name);
+        if (value && value[0]) {
+            std::fprintf(stderr, "[moe_stream_batch] retired source family: %s\n", name);
+            g_expert_pack.inited = true;
+            return;
+        }
     }
-    if (q4_colibri_requested) {
-        if (!q4_colibri_pack || !q4_colibri_pack[0] || !q4_colibri_manifest || !q4_colibri_manifest[0]) {
-            q4_colibri_fail("both GGML_MOE_Q4_COLIBRI_PACK and GGML_MOE_Q4_COLIBRI_MANIFEST are required");
-        }
-        if ((q4_colibri_overlay_pack && q4_colibri_overlay_pack[0]) ||
-                (q4_colibri_overlay_manifest && q4_colibri_overlay_manifest[0])) {
-            if (!q4_colibri_overlay_pack || !q4_colibri_overlay_pack[0] ||
-                    !q4_colibri_overlay_manifest || !q4_colibri_overlay_manifest[0]) {
-                q4_colibri_fail("both GGML_MOE_Q4_COLIBRI_OVERLAY_PACK and GGML_MOE_Q4_COLIBRI_OVERLAY_MANIFEST are required");
-            }
-        }
-        g_expert_pack.q4_colibri = true;
-        g_expert_pack.q4_colibri_debug_partial_fallback =
-            expert_pack_env_bool("GGML_MOE_Q4_COLIBRI_DEBUG_PARTIAL_FALLBACK", false);
-        g_expert_pack.io_backend = 1;
-    }
-    if (glm52_colibri_requested) {
-        if (!glm52_colibri_pack || !glm52_colibri_pack[0] || !glm52_colibri_manifest || !glm52_colibri_manifest[0]) {
-            q4_colibri_fail("both GGML_MOE_GLM52_COLIBRI_PACK and GGML_MOE_GLM52_COLIBRI_MANIFEST are required");
-        }
-        g_expert_pack.q4_colibri = true;
-        g_expert_pack.glm52_colibri = true;
-        g_expert_pack.q4_colibri_debug_partial_fallback =
-            expert_pack_env_bool("GGML_MOE_GLM52_COLIBRI_DEBUG_PARTIAL_FALLBACK", false);
-        g_expert_pack.io_backend = 1;
+    const char * lossless_pack = q4_lossless_sidecar_path_from_env();
+    if (q4_lossless_transport_mode_from_env(lossless_pack) !=
+            q4_lossless_transport_mode::disabled) {
+        std::fprintf(stderr, "[moe_stream_batch] retired source family: active lossless transport\n");
+        g_expert_pack.inited = true;
+        return;
     }
 
     const char *io_backend_env = std::getenv("GGML_MOE_IO_BACKEND");
@@ -6672,39 +6648,12 @@ static void expert_pack_init_once() {
     const char *gguf_alias_tsv = std::getenv("GGML_MOE_EXPERT_GGUF_ALIAS_TSV");
     const bool has_gguf_alias = gguf_alias_tsv && gguf_alias_tsv[0];
 
-    if ((q4_colibri_requested || glm52_colibri_requested) &&
-            (!source_paths.empty() || !page_cache_paths.empty() || has_gguf_alias)) {
-        q4_colibri_fail("colibri source cannot be combined with legacy pack, page-cache, or GGUF alias sources");
-    }
-    if (!q4_colibri_requested && !glm52_colibri_requested &&
-            source_paths.empty() && page_cache_paths.empty() && !has_gguf_alias) {
+    if (source_paths.empty() && page_cache_paths.empty() && !has_gguf_alias) {
         g_expert_pack.inited = true;
         return;
     }
 
-
     std::vector<expert_pack_entry> entries;
-    if (q4_colibri_requested && !q4_colibri_load_manifest(q4_colibri_pack, q4_colibri_manifest, entries)) {
-        q4_colibri_fail("manifest load failed");
-    }
-    if (glm52_colibri_requested && !q4_colibri_load_manifest(glm52_colibri_pack, glm52_colibri_manifest, entries)) {
-        q4_colibri_fail("GLM52 manifest load failed");
-    }
-    const bool q4_colibri_overlay_requested =
-        q4_colibri_requested &&
-        q4_colibri_overlay_pack && q4_colibri_overlay_pack[0] &&
-        q4_colibri_overlay_manifest && q4_colibri_overlay_manifest[0];
-    if (q4_colibri_overlay_requested &&
-            !q4_colibri_load_manifest(q4_colibri_overlay_pack, q4_colibri_overlay_manifest, entries)) {
-        q4_colibri_fail("overlay manifest load failed");
-    }
-    const char *lossless_pack = q4_lossless_sidecar_path_from_env();
-    if (q4_lossless_transport_mode_from_env(lossless_pack) !=
-            q4_lossless_transport_mode::disabled) {
-        q4_lossless_transport_init(
-            glm52_colibri_requested ? glm52_colibri_pack : q4_colibri_pack,
-            entries);
-    }
 #if defined(GGML_SSD_STORE)
     if (!c0::append_sources(c0::shared_catalog(), source_desc, entries, expert_pack_source_open_hooks())) {
         g_expert_pack.inited = true;
@@ -6745,7 +6694,7 @@ static void expert_pack_init_once() {
 
 #if defined(GGML_SSD_STORE)
     const bool replace_duplicates = source_desc.replace_duplicates ||
-        !page_cache_paths.empty() || q4_colibri_overlay_requested;
+        !page_cache_paths.empty();
     if (!c0::finalize_entries(entries, replace_duplicates)) {
         g_expert_pack.inited = true;
         return;
@@ -6761,7 +6710,7 @@ static void expert_pack_init_once() {
         });
     const bool replace_duplicates =
         expert_pack_env_bool("GGML_MOE_EXPERT_PACK_REPLACE_DUPLICATES", false) ||
-        !page_cache_paths.empty() || q4_colibri_overlay_requested;
+        !page_cache_paths.empty();
     uint64_t replaced_duplicates = 0;
     if (replace_duplicates && !entries.empty()) {
         std::vector<expert_pack_entry> deduped;
