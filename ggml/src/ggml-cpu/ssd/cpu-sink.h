@@ -29,34 +29,15 @@ typedef bool (*kimi_cpu_sink_resolver)(
 
 // Linux io_uring and O_DIRECT are required. total_threads includes the calling
 // compute thread and one I/O thread; all other threads sleep between phases.
-// A context serializes run calls. Suggested values: total_threads=16,
-// ring_experts=8. Optional GGML_KIMI_CPU_SINK_ environment settings at create:
-// READY_FIRST=1 computes available experts first, then adds in original order.
-// EARLY_UP_GATE=1 may start a miss after its up and gate reads complete, then
-// waits for down before that projection. It cannot be combined with the
-// cache-location provider; the native GPU tier is safe.
-// ROLE_MAJOR=1 queues every up/gate pair in an I/O batch before its down reads.
-// It requires EARLY_UP_GATE=1; without early compute the order is detrimental.
-// NONBLOCKING_DOWN_SCHED=1 splits each CPU expert into up/gate+quantization and
-// down work, always running an available first half instead of waiting on one
-// late down read. Per-expert quantized hidden rows preserve that dependency.
-// It requires READY_FIRST=1, EARLY_UP_GATE=1 and ROLE_MAJOR=1.
-// ROW_WEIGHTS is a positive finite comma-separated weight per compute participant
-// (total_threads - 1, caller first). It affects decode row partitioning only.
-// DYNAMIC_ROWS=1 instead lets every compute participant claim aligned row blocks
-// from a shared cursor; it is mutually exclusive with ROW_WEIGHTS and does not
-// alter the ith/nth prefill callback ABI. DYNAMIC_CHUNK_ROWS selects a multiple
-// of 16 rows in [16,16384] (default 64). Dynamic scheduling defaults off.
-// COMPUTE_CPUS is one logical CPU per compute participant; IO_CPUS is the allowed
-// CPU list for the sole I/O thread. Both use comma-separated IDs in the creator's
-// allowed mask. Invalid settings fail closed. Empty lists disable these options.
-// Caller affinity is scoped to run/stream and restored on return; persistent
-// workers retain their explicit affinity. Defaults preserve OS scheduling.
+// A context serializes run calls. This unconfigured factory is for explicit
+// CPU-only callers. Production uses ssd::cpu::create_configured with an owned
+// typed snapshot and borrowed context services. Test policies are explicit
+// constructor inputs; no environment configuration is read here.
 GGML_BACKEND_API struct kimi_cpu_sink * kimi_cpu_sink_create(
         int total_threads, int ring_experts, kimi_cpu_sink_resolver resolver,
         void * userdata, char * error, size_t error_size);
 GGML_BACKEND_API void kimi_cpu_sink_destroy(struct kimi_cpu_sink * sink);
-// Next-layer expert prefetch (GGML_KIMI_CPU_SINK_PREFETCH=k): the experts that `layer` is predicted to select,
+// Next-layer expert prefetch: the experts that `layer` is predicted to select,
 // best first, given before the decode run of the layer before it. Ignored when prefetch is off.
 GGML_BACKEND_API void kimi_cpu_sink_prefetch_hint(struct kimi_cpu_sink * sink, int32_t layer, const int32_t * experts, int n);
 
@@ -66,42 +47,15 @@ GGML_BACKEND_API void kimi_cpu_sink_prefetch_hint(struct kimi_cpu_sink * sink, i
 // Payload uses ordinary anonymous mmap, never pinned/registered. Configuration
 // does not touch payload pages. budget=0 disables the cache. Reconfiguration
 // releases the old mapping first. max_experts_per_layer must be 1..896.
-// Admission requires readable finite cgroup-v2 memory limits and, by default,
-// 2 GiB spare headroom at every finite ancestor. Checks charge only this batch's newly
-// resident slots, plus conservative page-table bounds and allocator allowances;
-// the full virtual payload budget is never prefaulted or charged as resident.
-// Without partial reclaim, a pressure stop releases the mapping and pauses
-// until decode=false. CACHE_RESERVE_BYTES accepts uint64 byte counts >=512 MiB; default 2 GiB.
-// A reserve larger than the finite cgroup headroom disables optional cache admission.
-// Caller must disable swapping (MemorySwapMax=0) and keep cgroup membership
-// fixed: first-touch accounting assumes resident slots cannot be swapped out
-// and faulted back in. Concurrent non-cache growth can consume the reserve.
-// At create time, CACHE_POLICY (GGML_KIMI_CPU_SINK_ prefix) selects window
-// (default), lru, lfu, decay (LFU counts halved every 32 decode tokens), or
-// count_decay2 (unweighted selection frequency, half-life two decode tokens).
-// CACHE_KEEP_ACROSS_REQUESTS=1 retains persistent-policy payload at prefill
-// boundaries when the selected reserve permits; default 0 releases it.
-// CACHE_RECLAIMABLE_FILE=1 subtracts each bounded cgroup's active_file and
-// inactive_file bytes from memory.current in that guard; default 0. Unreadable
-// controller/stat files still fail closed.
-// CACHE_PARTIAL_RECLAIM=1 requires persistent policy + uniform allocation +
-// CACHE_KEEP_ACROSS_REQUESTS=1. A known guard shortage disables low-score
-// slots within every layer and releases their resident pages with
-// MADV_DONTNEED. It leaves the mapping and policy heat intact; it does not grow
-// those slots back. An unreadable guard still rejects admission fail-closed.
-// CACHE_ELASTIC=1 has the same configuration requirements and additionally
-// requires CACHE_PREFILL_SLOTS. At prefill it keeps exactly that many enabled
-// slots, chosen per layer by policy score. The first following decode logically
-// enables every slot without prefaulting. Partial reclaim and phase elasticity
-// are independent opt-ins and are disabled by default.
-// Prefill never reads/adopts these entries. Frequency age counts decode tokens
-// across retained requests; prefill tokens do not train or age the policy.
-// CACHE_ALLOCATION selects priority (default), uniform, or global. Global is
-// a shared pool for persistent policies; max_experts_per_layer only bounds its
-// total capacity. Uniform divides slots evenly, with remainders in priority
-// order. Every policy protects the complete current batch before reserving
-// zero-copy read targets. LFU counts include misses; lower-frequency misses
-// bypass a full cache, and equal-frequency victims are ordered by recency.
+// Admission requires readable finite cgroup-v2 limits and the context's host
+// budget client. Only newly resident slots and conservative metadata/page-table
+// costs are charged; the virtual payload budget is not prefaulted wholesale.
+// Production fixes count_decay2/uniform retention with partial reclaim and
+// reclaimable-file accounting. Explicit test policies exercise other supported
+// algorithms through the testing factory. Unreadable resource guards reject
+// admission; known shortages may discard low-score pages while retaining the
+// mapping and policy heat. The caller must use swap0 and keep cgroup membership
+// fixed until workers stop and resident mappings are released.
 GGML_BACKEND_API bool kimi_cpu_sink_cache_configure(
         struct kimi_cpu_sink * sink, uint64_t budget_bytes,
         const int32_t * layer_priority, int n_layers, int max_experts_per_layer,

@@ -85,7 +85,6 @@ extern void ggml_cpu_layer_gap_trace_node(
     const char * op_name,
     const char * name);
 
-#include "ssd/common-observers.inc"
 
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
@@ -210,7 +209,6 @@ typedef void * thread_ret_t;
 
 typedef pthread_t ggml_thread_t;
 
-#include "ssd/common-policy.inc"
 
 #define GGML_THREADPOOL_N_THREADS_MASK (0xffffU)
 #define GGML_THREADPOOL_N_THREADS_BITS (16)
@@ -2806,8 +2804,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         const uint64_t layer_gap_start_us =
             layer_gap_trace ? (uint64_t) ggml_time_us() : 0;
-        const bool kimi_pipeline_checkpoint =
-            ggml_kimi_pipeline_m1_checkpoint_wants(node);
         ggml_compute_forward(&params, node);
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -2816,18 +2812,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
-        if (node_n + 1 < cgraph->n_nodes || kimi_pipeline_checkpoint) {
+        if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
-        if (kimi_pipeline_checkpoint) {
-            if (state->ith == 0) {
-                ggml_kimi_pipeline_m1_checkpoint_record(node);
-            }
-            // The next CPU node may reuse this scratch immediately.  Keep all
-            // worker threads behind the byte-exact checkpoint until hashing is
-            // complete; this barrier exists only in the M1 spike process.
-            ggml_barrier(state->threadpool);
-        }
+
         if (layer_gap_trace) {
             if (node_n + 1 < cgraph->n_nodes) {
                 ggml_cpu_layer_gap_trace_node(

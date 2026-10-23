@@ -386,8 +386,8 @@ struct sink_duration_histogram {
 // seen (most recent first) and a histogram of stack distances, so the hit rate an LRU cache of any per-layer size
 // would get is known while serving, for any model and without an offline trace. The k experts of one token are one
 // access group: their distances are taken before any of them moves to the front. Cost: a linear scan of at most
-// n_experts entries per selected expert. GGML_KIMI_CPU_SINK_MRC=1 enables it; a summary line is printed every
-// GGML_KIMI_CPU_SINK_MRC_EVERY decode tokens (default 256) and when a new request starts.
+// n_experts entries per selected expert. Explicit fixture policy enables this
+// observer; production observation follows the context debug selection.
 struct sink_mrc {
     bool enabled = false;
     uint64_t report_every = 256;
@@ -501,7 +501,7 @@ struct kimi_cpu_sink {
     bool margin_boundary = false; // the last token boundary the margin saw was a decode token
     uint64_t margin_epoch = 0, margin_token = 0;
 
-    // Next-layer expert prefetch (GGML_KIMI_CPU_SINK_PREFETCH=k, off by default). The graph applies the next
+    // Next-layer expert prefetch (typed prefetch.depth). The graph applies the next
     // layer's router to this layer's expert input and hands its experts over as a hint, best first; the first k
     // that are neither cached nor held by the GPU tier now (its residency ABI) are read into RAM cache slots of the
     // next layer once this layer's own reads are done, so the drive works through the gap before the next router
@@ -537,8 +537,8 @@ struct kimi_cpu_sink {
         std::vector<std::thread> readers;
         bool gate_open = false, stop = false;
         int running = 0;
-        uint64_t fail_every = 0, reads = 0; // GGML_KIMI_CPU_SINK_PREFETCH_FAIL_EVERY: fault injection
-        // GGML_KIMI_CPU_SINK_PREFETCH_THROW_{DRAIN,SCHEDULE}=n: the n-th allocation there fails (fault injection)
+        uint64_t fail_every = 0, reads = 0; // explicit fixture fault injection
+        // Explicit fixture policy can fail the n-th drain/schedule allocation.
         uint64_t throw_drain = 0, throw_schedule = 0, allocs_drain = 0, allocs_schedule = 0;
         uint64_t layers = 0, predicted = 0, issued = 0, ready = 0, cancelled = 0, failed = 0,
                  skip_vram = 0, skip_cached = 0, no_slot = 0, unresolved = 0, carried = 0, activated = 0;
@@ -1753,7 +1753,7 @@ struct kimi_cpu_sink {
         vram.ring_locked = false;
     }
     // Whether the registrar runs: a GPU tier whose host path copies (not in place), the host path on
-    // (GGML_KIMI_CPU_SINK_HOST_GPU), a page-aligned slot stride, a mapped arena. Decided once the arena exists.
+    // supplied by the injected provider, a page-aligned slot stride and mapped arena. Decided once the arena exists.
     void host_lock_decide() {
         if (host_lock.decided || !cache.arena || !cache.stride || !vram.context || !vram.host_api) { return; }
         host_lock.decided = true;

@@ -76,175 +76,6 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
-static bool ggml_kimi_pipeline_v2_active(void) {
-    const char * active = getenv("GGML_KIMI_PIPELINE_V2_ACTIVE");
-    const char * mode = getenv("GGML_KIMI_PIPELINE_V2_MODE");
-    return active && active[0] && active[0] != '0' && mode &&
-        (strcmp(mode, "depth1") == 0 || strcmp(mode, "pipeline") == 0);
-}
-
-static uint64_t ggml_kimi_pipeline_m1_fnv1a(const void * data, size_t size) {
-    const unsigned char * bytes = (const unsigned char *) data;
-    uint64_t hash = UINT64_C(1469598103934665603);
-    for (size_t i = 0; i < size; ++i) {
-        hash = (hash ^ bytes[i]) * UINT64_C(1099511628211);
-    }
-    return hash;
-}
-
-static bool ggml_kimi_pipeline_m1_checkpoint_wants(const struct ggml_tensor * tensor) {
-    if (!ggml_kimi_pipeline_v2_active() || !tensor || !tensor->data ||
-            tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) {
-        return false;
-    }
-    const char * path = getenv("GGML_KIMI_PIPELINE_M1_CHECKPOINT_OUT");
-    if (!path || !path[0]) {
-        return false;
-    }
-    return strstr(tensor->name, "ffn_moe_situ") != NULL ||
-        strstr(tensor->name, "ffn_moe_weighted") != NULL ||
-        strstr(tensor->name, "ffn_moe_out") != NULL;
-}
-
-static pthread_mutex_t ggml_kimi_pipeline_m1_checkpoint_mu = PTHREAD_MUTEX_INITIALIZER;
-static atomic_uint_fast64_t ggml_kimi_pipeline_m1_checkpoint_seq = 0;
-static bool ggml_kimi_pipeline_m1_checkpoint_header = false;
-
-static void ggml_kimi_pipeline_m1_checkpoint_record(const struct ggml_tensor * tensor) {
-    const char * path = getenv("GGML_KIMI_PIPELINE_M1_CHECKPOINT_OUT");
-    if (!path || !path[0] || !tensor || !tensor->data) {
-        return;
-    }
-    const char * run = getenv("GGML_KIMI_PIPELINE_M1_RUN");
-    const char * mode = getenv("GGML_KIMI_PIPELINE_V2_MODE");
-    const size_t bytes = ggml_nbytes(tensor);
-    const uint64_t hash = ggml_kimi_pipeline_m1_fnv1a(tensor->data, bytes);
-    const uint64_t seq = atomic_fetch_add_explicit(
-        &ggml_kimi_pipeline_m1_checkpoint_seq, 1, memory_order_relaxed);
-    pthread_mutex_lock(&ggml_kimi_pipeline_m1_checkpoint_mu);
-    FILE * file = fopen(path, "a");
-    if (file) {
-        if (!ggml_kimi_pipeline_m1_checkpoint_header) {
-            fprintf(file, "seq,run,mode,tensor,op,bytes,fnv\n");
-            ggml_kimi_pipeline_m1_checkpoint_header = true;
-        }
-        fprintf(file, "%" PRIu64 ",%s,%s,%s,%s,%zu,%016" PRIx64 "\n",
-                seq, run ? run : "", mode ? mode : "", tensor->name,
-                ggml_op_name(tensor->op), bytes, hash);
-        fclose(file);
-    }
-    pthread_mutex_unlock(&ggml_kimi_pipeline_m1_checkpoint_mu);
-}
-
-static atomic_bool ggml_kimi_a2_request_phase_active = false;
-static atomic_uint_fast64_t ggml_kimi_full_coverage_request_seq = 0;
-static atomic_uint_fast64_t ggml_kimi_full_coverage_expert_calls = 0;
-static atomic_uint_fast64_t ggml_kimi_full_coverage_fallback_tensors = 0;
-static atomic_uint_fast64_t ggml_kimi_full_coverage_fallback_rows = 0;
-static pthread_mutex_t ggml_kimi_full_coverage_trace_mu = PTHREAD_MUTEX_INITIALIZER;
-static bool ggml_kimi_full_coverage_trace_header = false;
-
-static bool ggml_kimi_full_coverage_prefill_enabled(void) {
-    const char * env = getenv("GGML_MOE_PREFILL_FULL_COVERAGE");
-    return env && env[0] && env[0] != '0';
-}
-
-static void ggml_kimi_full_coverage_counters_reset(void) {
-    atomic_store_explicit(&ggml_kimi_full_coverage_expert_calls, 0, memory_order_relaxed);
-    atomic_store_explicit(&ggml_kimi_full_coverage_fallback_tensors, 0, memory_order_relaxed);
-    atomic_store_explicit(&ggml_kimi_full_coverage_fallback_rows, 0, memory_order_relaxed);
-}
-
-static void ggml_kimi_full_coverage_report(void) {
-    if (!ggml_kimi_full_coverage_prefill_enabled()) {
-        return;
-    }
-    fprintf(stderr,
-            "[kimi_full_coverage_prefill] request=%" PRIuFAST64
-            " expert_calls=%" PRIuFAST64 " cpu_fallback_expert_tensors=%" PRIuFAST64
-            " cpu_fallback_expert_rows=%" PRIuFAST64 "\n",
-            atomic_load_explicit(&ggml_kimi_full_coverage_request_seq, memory_order_relaxed),
-            atomic_load_explicit(&ggml_kimi_full_coverage_expert_calls, memory_order_relaxed),
-            atomic_load_explicit(&ggml_kimi_full_coverage_fallback_tensors, memory_order_relaxed),
-            atomic_load_explicit(&ggml_kimi_full_coverage_fallback_rows, memory_order_relaxed));
-}
-
-void ggml_cpu_kimi_a2_request_phase(int active);
-
-void ggml_cpu_kimi_a2_request_phase(int active) {
-    const bool enabled = active != 0;
-    const bool previous = atomic_exchange_explicit(
-        &ggml_kimi_a2_request_phase_active, enabled, memory_order_acq_rel);
-    if (ggml_kimi_full_coverage_prefill_enabled()) {
-        if (enabled && !previous) {
-            atomic_fetch_add_explicit(
-                &ggml_kimi_full_coverage_request_seq, 1, memory_order_relaxed);
-            ggml_kimi_full_coverage_counters_reset();
-        } else if (!enabled && previous) {
-            ggml_kimi_full_coverage_report();
-        }
-    }
-}
-
-static bool ggml_cpu_kimi_a2_request_phase_is_active(void) {
-    return atomic_load_explicit(
-        &ggml_kimi_a2_request_phase_active, memory_order_acquire);
-}
-
-static void ggml_kimi_full_coverage_cpu_fallback_record(
-        const struct ggml_tensor * src0,
-        const struct ggml_tensor * ids,
-        const int64_t * matrix_row_counts,
-        int64_t n_as) {
-    if (!ggml_kimi_full_coverage_prefill_enabled() ||
-            !ggml_cpu_kimi_a2_request_phase_is_active() ||
-            !src0 || !ids || !matrix_row_counts || ids->ne[1] <= 1 || n_as <= 0) {
-        return;
-    }
-
-    int64_t fallback_rows = 0;
-    for (int64_t expert = 0; expert < n_as; ++expert) {
-        if (matrix_row_counts[expert] > 0) {
-            fallback_rows += matrix_row_counts[expert];
-        }
-    }
-    atomic_fetch_add_explicit(
-        &ggml_kimi_full_coverage_expert_calls, 1, memory_order_relaxed);
-    if (fallback_rows <= 0) {
-        return;
-    }
-
-    atomic_fetch_add_explicit(
-        &ggml_kimi_full_coverage_fallback_tensors, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(
-        &ggml_kimi_full_coverage_fallback_rows, (uint64_t) fallback_rows, memory_order_relaxed);
-    fprintf(stderr,
-            "[kimi_full_coverage_fallback] tensor=%s tokens=%" PRId64
-            " cpu_fallback_expert_rows=%" PRId64 "\n",
-            src0->name, ids->ne[1], fallback_rows);
-
-    const char * path = getenv("GGML_MOE_PREFILL_FULL_COVERAGE_FALLBACK_OUT");
-    if (!path || !path[0]) {
-        return;
-    }
-    pthread_mutex_lock(&ggml_kimi_full_coverage_trace_mu);
-    FILE * file = fopen(path, "a");
-    if (file) {
-        if (!ggml_kimi_full_coverage_trace_header) {
-            fprintf(file, "request,tensor,tokens,cpu_fallback_expert_rows\n");
-            ggml_kimi_full_coverage_trace_header = true;
-        }
-        fprintf(file, "%" PRIuFAST64 ",%s,%" PRId64 ",%" PRId64 "\n",
-                atomic_load_explicit(
-                    &ggml_kimi_full_coverage_request_seq, memory_order_relaxed),
-                src0->name, ids->ne[1], fallback_rows);
-        fclose(file);
-    }
-    pthread_mutex_unlock(&ggml_kimi_full_coverage_trace_mu);
-}
-
-#include "common-adapter.inc"
-
 static void ggml_compute_forward_mul_mat_id_generic(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -252,14 +83,12 @@ static void ggml_compute_forward_mul_mat_id_generic(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
-    // if(strstr(src0->name,"up")){
-    //     printf("%d ",src0->ne[1]*src0->nb[1]);
+
     // }
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
     const int nth = params->nth;
-    const bool ds4_sparse_fused_mmvq_membership = ggml_ds4_sparse_fused_mmvq_membership_enabled();
 
     const enum ggml_type type = src0->type;
 
@@ -287,7 +116,6 @@ static void ggml_compute_forward_mul_mat_id_generic(
         strstr(src0->name, ".ffn_") && strstr(src0->name, "_exps.weight");
 #endif
 
-
     void * wdata_cur = params->wdata;
 
     if (src1->type != vec_dot_type) {
@@ -306,8 +134,7 @@ static void ggml_compute_forward_mul_mat_id_generic(
     const void ** fallback_pack_mmap_ptrs =
         incr_ptr_aligned(&wdata_cur, n_as*sizeof(void *), sizeof(void *));
 
-    uint64_t * fallback_touch_us =
-        incr_ptr_aligned(&wdata_cur, n_as*sizeof(uint64_t), sizeof(uint64_t));
+    (void) incr_ptr_aligned(&wdata_cur, n_as*sizeof(uint64_t), sizeof(uint64_t)); // preserve the existing scratch layout
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
@@ -350,8 +177,6 @@ static void ggml_compute_forward_mul_mat_id_generic(
     if (ith == 0) {
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
-        const int keep_topk_updown = ggml_moe_keep_topk_for_tensor(src0->name);
-        const bool prune_updown = keep_topk_updown > 0;
 
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
@@ -363,11 +188,6 @@ static void ggml_compute_forward_mul_mat_id_generic(
                     continue;
                 }
                 assert(i02 >= 0 && i02 < n_as);
-
-                if (prune_updown && id >= keep_topk_updown) {
-                    memset((char *) dst->data + id * nb1 + iid1 * nb2, 0, (size_t) ne01 * sizeof(float));
-                    continue;
-                }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;
@@ -383,50 +203,13 @@ static void ggml_compute_forward_mul_mat_id_generic(
 
     ggml_barrier(params->threadpool);
 
-    const char * gpu_stream_batch_reason = "decode_batch_only_cpu_fallback";
-    const bool use_gpu_stream_batch = false;
-    const bool gpu_stream_batch_done = false;
-    const int64_t gpu_stream_single_attempts = 0;
-
-    if (ggml_moe_cpu_willneed_enabled()) {
-        //都不会走
-        if (ith == 0) {
-            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-                if (matrix_row_counts[cur_a] == 0) {
-                    continue;
-                }
-                ggml_moe_cpu_willneed_pages((const char *) src0->data + cur_a * nb02, (size_t) ne01 * nb01);
-            }
-        }
-        ggml_barrier(params->threadpool);
-    }
-
     if (ith == 0) {
-        //会走
+
         memset(fallback_pack_mmap_ptrs, 0, (size_t) n_as * sizeof(void *));
-        memset(fallback_touch_us, 0, n_as*sizeof(uint64_t));
-        if (ggml_moe_cpu_fallback_touch_profile_enabled()) {
-            //不会走
-            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-                if (matrix_row_counts[cur_a] == 0) {
-                    continue;
-                }
-                const char * src0_cur = fallback_pack_mmap_ptrs[cur_a] ?
-                    (const char *) fallback_pack_mmap_ptrs[cur_a] :
-                    (const char *) src0->data + cur_a * nb02;
-                fallback_touch_us[cur_a] =
-                    ggml_moe_cpu_touch_pages_us(src0_cur, (size_t) ne01 * nb01);
-            }
-        }
+
     }
     ggml_barrier(params->threadpool);
 
-
-    const bool moe_fallback_reason_profile = ggml_moe_fallback_reason_profile_enabled();
-    // const uint64_t kimi_cpu_moe_fallback_start = (kimi_cpu_moe_profile && ith == 0) ? ggml_time_us() : 0;
-    const uint64_t moe_fallback_reason_start = (moe_fallback_reason_profile && ith == 0) ? ggml_time_us() : 0;
-    const uint64_t ds4_sparse_fused_mmvq_fallback_start =
-        (ds4_sparse_fused_mmvq_membership && ith == 0) ? ggml_time_us() : 0;
 #if defined(__APPLE__)
     void * mac_read_batch = NULL;
     if (mac_pack_source && ith == 0) {
@@ -453,7 +236,7 @@ static void ggml_compute_forward_mul_mat_id_generic(
             }
         }
 #endif
-        // printf("k=");
+
         const char * src0_cur = fallback_pack_mmap_ptrs[cur_a] ?
             (const char *) fallback_pack_mmap_ptrs[cur_a] :
             (const char *) src0->data + cur_a * nb02;
@@ -496,33 +279,11 @@ static void ggml_compute_forward_mul_mat_id_generic(
             const int64_t ir1_start = dr1 * ith1;
             const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-            const bool trace_cpu_chunk = ggml_moe_cpu_chunk_trace_enabled();
-            const double trace_t0_ms = trace_cpu_chunk ? ggml_moe_cpu_trace_now_ms() : 0.0;
-
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
                 src0_cur, matrix_rows, row_size, src1_cont, wdata
             );
-
-            if (trace_cpu_chunk) {
-               //不会执行
-                const double trace_t1_ms = ggml_moe_cpu_trace_now_ms();
-                ggml_moe_cpu_chunk_trace_write(
-                    ggml_moe_tensor_role(src0->name),
-                    src0->name,
-                    src0->type,
-                    cur_a,
-                    ith,
-                    nth,
-                    cne1,
-                    ir0_start,
-                    ir0_end,
-                    ir1_start,
-                    ir1_end,
-                    (size_t) ne01 * nb01,
-                    trace_t1_ms - trace_t0_ms);
-            }
 
             if (nth >= nchunk0 * nchunk1) {
                 break;
@@ -556,93 +317,9 @@ static void ggml_compute_forward_mul_mat_id_generic(
     if (mac_pack_source && ith == 0) { ggml_mac_expert_pack_end_batch(params->ssd_mac_cache, mac_read_batch); }
 #endif
 
-    if (moe_fallback_reason_profile && ith == 0) {
-        const uint64_t moe_fallback_reason_us = ggml_time_us() - moe_fallback_reason_start;
-        int64_t fallback_rows = 0;
-        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-            fallback_rows += matrix_row_counts[cur_a];
-        }
-        const char * batch_reason_name = gpu_stream_batch_reason;
-        const char * single_reason_name = "retired_gpu_bridge";
-        const char * final_reason_name = "cpu_fallback";
-        if (fallback_rows > 0) {
-            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-                const int64_t cne1 = matrix_row_counts[cur_a];
-                if (cne1 == 0) {
-                    continue;
-                }
-                const uint64_t expert_fallback_us =
-                    (uint64_t) (((double) moe_fallback_reason_us * (double) cne1) / (double) fallback_rows);
-                ggml_moe_fallback_reason_profile_record(
-                        ggml_moe_tensor_role(src0->name),
-                        src0->name,
-                        src0->type,
-                        ids->ne[1] > 1,
-                        cur_a,
-                        cne1,
-                        (size_t) nb02,
-                        expert_fallback_us,
-                        batch_reason_name,
-                        single_reason_name,
-                        final_reason_name,
-                        use_gpu_stream_batch,
-                        gpu_stream_batch_done,
-                        gpu_stream_single_attempts > 0,
-                        false);
-                ggml_moe_fallback_source_probe_record(
-                        ggml_moe_tensor_role(src0->name),
-                        src0->name,
-                        ids->ne[1] > 1,
-                        cur_a,
-                        cne1,
-                        expert_fallback_us,
-                        batch_reason_name,
-                        single_reason_name,
-                        final_reason_name,
-                        src0,
-                        src1,
-                        ids,
-                        dst);
-            }
-        }
-    }
-    if (ds4_sparse_fused_mmvq_membership && ith == 0) {
-        const uint64_t ds4_sparse_fused_mmvq_fallback_us =
-            ggml_time_us() - ds4_sparse_fused_mmvq_fallback_start;
-        int64_t fallback_rows = 0;
-        for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-            fallback_rows += matrix_row_counts[cur_a];
-        }
-        if (fallback_rows > 0) {
-            for (int cur_a = 0; cur_a < n_as; ++cur_a) {
-                const int64_t cne1 = matrix_row_counts[cur_a];
-                if (cne1 == 0) {
-                    continue;
-                }
-                const uint64_t expert_fallback_us =
-                    (uint64_t) (((double) ds4_sparse_fused_mmvq_fallback_us * (double) cne1) / (double) fallback_rows);
-                ggml_ds4_sparse_fused_mmvq_membership_record(
-                        src0->name,
-                        src0->type,
-                        ids->ne[1] > 1,
-                        cur_a,
-                        cne1,
-                        (size_t) nb02,
-                        expert_fallback_us,
-                        fallback_touch_us[cur_a],
-                        fallback_pack_mmap_ptrs[cur_a] != NULL);
-            }
-        }
-    }
-
 }
 
 static void ggml_compute_forward_mul_mat_id(
-        const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
-    if (ggml_common_model_type_is_kimi()) {
-        ggml_compute_forward_mul_mat_id_common_kimi(params, dst);
-        return;
-    }
+        const struct ggml_compute_params * params, struct ggml_tensor * dst) {
     ggml_compute_forward_mul_mat_id_generic(params, dst);
 }
