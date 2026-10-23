@@ -320,6 +320,8 @@ def run(args):
         if (config.get("schema_version") != 1 or config.get("purpose") != report["purpose"]
                 or config.get("device") != "cloud-5090"):
             raise ValueError("only the reviewed Cloud 5090 integration checkpoint is supported")
+        if "reference_profile" in config:
+            report["reference_profile"] = copy.deepcopy(config["reference_profile"])
         policy_read(config["policy"])
         manifest_path = protected(config["manifest_path"])
         if digest(manifest_path) != config["manifest_sha256"]:
@@ -337,6 +339,9 @@ def run(args):
             raise ValueError("checkpoint requires exactly 64 GiB host limit and no swap")
         binding = copy.deepcopy(config["comparison_binding"])
         check_declaration(binding)
+        report["measurement_settings"] = dict(
+            expert_gpu_budget_bytes=binding["semantic_settings"]["vram.budget"],
+            allocator_reserve_mib=binding["semantic_settings"]["vram.reserve_mib"])
         if config["base"]["revision"] != LEGACY_REVISION:
             raise ValueError("checkpoint base is not the frozen accepted revision")
         for side in ("base", "candidate"):
