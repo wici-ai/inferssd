@@ -31,13 +31,13 @@ struct kimi_vram_tier_api {
     void (*destroy)(void * context);
     int (*begin)(void * context, uint64_t epoch, uint64_t token, int decode,
                  char * error, size_t error_size);
-    // prepare pins hits and selects this layer's admission candidates. slots
-    // receives -1 for CPU work, otherwise an opaque pinned GPU cache slot.
+    // Retired implicit-format slot: returns an error and drains the context.
+    // Use the explicit-format extension to prepare expert geometry.
     int (*prepare)(void * context, const struct kimi_vram_request * requests,
                    int count, int latent, int hidden, int * slots,
                    char * error, size_t error_size);
-    // launch copies Q8_K input before returning. A private worker drives the
-    // two GPU stages and CPU SiTU bridge while CPU experts and SSD proceed.
+    // Retired implicit-format slot: returns an error and drains the context.
+    // Field order and signature remain reserved for private transport ABI 2.
     int (*launch)(void * context, const void * input_q8k, size_t input_bytes,
                   float beta, float linear_beta, char * error, size_t error_size);
     // A RAM cache source may be borrowed until finish/cancel when borrow=1;

@@ -146,7 +146,7 @@ struct tier {
     reclaimer_register_fn reclaimer_register=nullptr;
     reclaimer_unregister_fn reclaimer_unregister=nullptr;
     std::unique_ptr<vram_slot_table> table;
-    const vram_compute_api * compute_api=nullptr;void * engine=nullptr;
+    void * engine=nullptr;
     // Explicit-format engine (kimi_vram_format_api). A context uses one of the two engines.
     const vram_format_compute_api * format_api=nullptr;bool format_mode=false;
     const kimi_mxfp4_batch_api * mxfp4_batch_api=nullptr;
@@ -235,7 +235,6 @@ struct tier {
     uint64_t deferred_sequence=0,deferred_uploads=0,deferred_published=0,deferred_layer_waits=0,deferred_capacity_waits=0,deferred_aborted=0;
     double deferred_wait_us=0;
     bool (*deferred_hook)(void *)=nullptr;void * deferred_hook_arg=nullptr; // tests: runs before each copy, false fails it
-    float beta=0,linear_beta=0;
     std::string failure;
     struct native_pin { kimi_cache_location_lease lease; int slot; kimi_vram_request key; };
     std::vector<native_pin> native_pins;
@@ -317,7 +316,7 @@ struct tier {
             if(timing)std::fprintf(stderr,"[kimi_vram_tier_timing] launches=%llu handoff_us=%.0f finish_drain_us=%.0f compute_us=%.0f upload_us=%.0f upload_wait_us=%.0f uploads=%llu hits=%llu cpu_requests=%llu\n",
                 (unsigned long long)launches,handoff_us,finish_drain_us,compute_us,upload_us,upload_wait_us,(unsigned long long)uploads,(unsigned long long)gpu_hits,(unsigned long long)cpu_requests);
             if(mxfp4_batch)mxfp4_batch_api->destroy(mxfp4_batch);
-            if(engine){if(format_mode)format_api->destroy(engine);else compute_api->destroy(engine);}
+            if(engine)format_api->destroy(engine);
             if(prefill_transient_arena)cuda_check(cudaFree(prefill_transient_arena));
             if(upload_stream)cuda_check(cudaStreamDestroy(upload_stream));
             if(deferred_stream)cuda_check(cudaStreamDestroy(deferred_stream));
@@ -437,8 +436,8 @@ struct tier {
         std::fprintf(stderr,"[kimi_vram_tier] reason=%s budget_bytes=%llu capacity_bytes=%llu slots=%zu hits=%llu cpu_requests=%llu uploads=%llu upload_bytes=%llu upload_us=%.3f compute_us=%.3f device_scratch=%zu host_scratch=%zu borrowed_uploads=%llu upload_wait_us=%.3f cold_prefill_admissions=%llu cold_prefill_admission_bytes=%llu cold_prefill_admission_us=%.3f min_count=%.3f async_upload=%d global_pool=%d half_life=%.3f deferred_upload=%d elastic=%d demand_reclaim=%d blocks=%zu base_slots=%zu safety_blocks=%zu safety_mib=%zu proactive_blocks=%llu reactive_blocks=%llu base_blocks_reclaimed=%llu poisoned=%d\n",
             reason,(unsigned long long)budget,(unsigned long long)capacity_bytes,table?table->slots.size():0,
             (unsigned long long)gpu_hits,(unsigned long long)cpu_requests,(unsigned long long)uploads,
-            (unsigned long long)upload_bytes,upload_us,compute_us,engine?(format_mode?format_api->device_scratch_bytes(engine):compute_api->device_scratch_bytes(engine)):0,
-            engine?(format_mode?format_api->host_scratch_bytes(engine):compute_api->host_scratch_bytes(engine)):0,(unsigned long long)borrowed_uploads,upload_wait_us,
+            (unsigned long long)upload_bytes,upload_us,compute_us,engine?format_api->device_scratch_bytes(engine):0,
+            engine?format_api->host_scratch_bytes(engine):0,(unsigned long long)borrowed_uploads,upload_wait_us,
             (unsigned long long)cold_prefill_admissions,(unsigned long long)cold_prefill_admission_bytes,cold_prefill_admission_us,
             table?table->minimum_count:0,int(async_upload),table?int(table->global_pool):0,table?table->half_life:2,int(deferred_upload),int(elastic_active),int(elastic_demand_reclaim),blocks.size(),base_slots,elastic_safety_blocks,elastic_safety_mib,
             (unsigned long long)proactive_blocks,(unsigned long long)reactive_blocks,
@@ -1097,9 +1096,8 @@ struct tier {
             try{
                 cuda_check(cudaSetDevice(device));
                 if(grouped){run_prefill_worker();}
-                else if(compute){char error[512]={};int rc=format_mode?
-                    format_api->compute(engine,work.data(),int(work.size()),input.data(),input.size(),&activation,down.data(),error,sizeof(error)):
-                    compute_api->compute(engine,work.data(),int(work.size()),input.data(),input.size(),beta,linear_beta,down.data(),error,sizeof(error));
+                else if(compute){char error[512]={};int rc=
+                    format_api->compute(engine,work.data(),int(work.size()),input.data(),input.size(),&activation,down.data(),error,sizeof(error));
                     if(rc)throw std::runtime_error(error);}
                 else if(host){
                     std::vector<vram_compute_expert> experts;experts.reserve(batch.size());
@@ -1751,88 +1749,8 @@ struct tier {
         if(cudaPointerGetAttributes(&attr,pointer)!=cudaSuccess){(void)cudaGetLastError();return false;}
         return attr.type==cudaMemoryTypeHost;
     }
-    void initialize(const kimi_vram_request * r,int l,int h){
-        if(format_mode)throw std::runtime_error("VRAM tier already holds an explicit expert format");
-        if(l<=0 || h<=0 || l%256 || h%256 || l>16384 || h>16384)throw std::runtime_error("unsupported VRAM expert geometry");
-        if(engine && (latent!=l || hidden!=h))throw std::runtime_error("VRAM geometry changed");
-        if(!engine){
-            latent=l;hidden=h;cuda_check(cudaGetDevice(&device));detect_unified();
-            auto get=reinterpret_cast<vram_compute_get_api_fn>(dlsym(RTLD_DEFAULT,"kimi_vram_compute_get_api"));
-            if(!get)throw std::runtime_error("test2 parity adapter missing; no fallback");
-            compute_api=get();
-            if(!compute_api || compute_api->version!=1 || compute_api->size!=sizeof(*compute_api) ||
-                !compute_api->create || !compute_api->destroy || !compute_api->compute ||
-                !compute_api->device_scratch_bytes || !compute_api->host_scratch_bytes)throw std::runtime_error("parity adapter ABI mismatch");
-            char error[512]={};engine=compute_api->create(device,latent,hidden,16,error,sizeof(error));if(!engine)throw std::runtime_error(error);
-            worker=std::thread([this]{worker_loop();});
-            if(deferred_upload)upload_thread=std::thread([this]{upload_loop();});
-            report_thread_cpus();
-        }
-        if(!upload_stream)cuda_check(cudaStreamCreateWithFlags(&upload_stream,cudaStreamNonBlocking));
-        if(deferred_upload && !deferred_stream)cuda_check(cudaStreamCreateWithFlags(&deferred_stream,cudaStreamNonBlocking));
-        if(table)return;
-        stride=0;for(int i=0;i<3;++i){role_bytes[i]=r->role[i].bytes;stride+=role_bytes[i];}
-        const size_t raw=size_t(latent/256)*110*hidden,padded=(raw+4095)&~size_t(4095);
-        for(size_t b:role_bytes)if(b!=padded)throw std::runtime_error("VRAM pack padding/shape mismatch");
-        size_t free_bytes=0,total=0;mem_info(&free_bytes,&total);
-        if(free_bytes<=safety_bytes || std::min<uint64_t>(budget,free_bytes-safety_bytes)<stride)throw std::runtime_error("no VRAM cache capacity after safety reserve");
-        std::vector<int> priority;
-        const char * p=std::getenv("GGML_KIMI_CPU_SINK_CACHE_LAYER_PRIORITY");
-        if(p && *p){std::string s(p);size_t start=0;do{size_t end=s.find(',',start),used=0;std::string item=s.substr(start,end-start);int value=std::stoi(item,&used);if(used!=item.size())throw std::runtime_error("invalid VRAM layer priority");priority.push_back(value);if(end==std::string::npos)break;start=end+1;if(start==s.size())throw std::runtime_error("empty VRAM layer priority");}while(start<s.size());}
-        else for(int i=1;i<=92;++i)priority.push_back(i);
-        if(priority.size()!=92)throw std::runtime_error("VRAM allocation requires all 92 layer IDs");
-        const bool global=env_size("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL",0,1)!=0;
-        const size_t count=initial_slots(free_bytes,92*896,global);
-        base_slots=count;
-        const char * policy=std::getenv("GGML_KIMI_CPU_SINK_VRAM_POLICY");
-        if(policy && std::strcmp(policy,"lru") && std::strcmp(policy,"count_decay2"))throw std::runtime_error("invalid VRAM policy");
-        table=std::make_unique<vram_slot_table>(count,priority,!policy || std::strcmp(policy,"lru"),env_count(),global,env_half_life());
-        configure_elastic(global,92*896);
-        memory_sample("before_allocate");
-        const auto allocate_start=memory_trace?clock_type::now():clock_type::time_point{};
-        if(elastic_active)allocate_base();
-        else{capacity_bytes=count*stride;cuda_check(cudaMalloc(reinterpret_cast<void **>(&arena),capacity_bytes));}
-        if(memory_trace)memory_sample("after_allocate",micros(allocate_start));
-        probe_upload();register_seed();
-        arena_epoch=epoch;table->next_token();adopt_next_decode=!active;
-        // On unified memory the rest of the first decode step (the RAM cache committing its slots, graph
-        // instantiation) comes out of the same DRAM: grow at the token boundary after it (grow_after_first_token,
-        // which counts this step when a decode step allocated the tier).
-        if(elastic_active && !unified){std::lock_guard<std::mutex> lock(lifecycle_mutex);grow_decode_locked();}
-        else if(elastic_active && active)phase_decode_tokens=1;
-        report("allocated");
-    }
-    void prepare(const kimi_vram_request * r,int count,int l,int h,int * slots){
-        if(count<0 || count>16 || (count && (!r || !slots)))throw std::runtime_error("VRAM request count");
-        if(count)std::fill(slots,slots+count,-1);
-        if(!active || !count)return;
-        initialize(r,l,h);
-        for(int j=0;j<count;++j){
-            if(!std::isfinite(r[j].weight) || r[j].weight<0)throw std::runtime_error("VRAM routing weight");
-            for(int i=0;i<3;++i)if(r[j].role[i].bytes!=role_bytes[i])throw std::runtime_error("VRAM role bytes changed");
-        }
-        table->prepare(r,count);std::copy(table->hits.begin(),table->hits.end(),slots);
-        for(int slot:table->hits){gpu_hits+=slot>=0;cpu_requests+=slot<0;}
-    }
-    void launch(const void * q,size_t bytes,float b,float lb){
-        if(!active || !table || !table->in_flight)return;
-        if(format_mode)throw std::runtime_error("Q3_K/SiTU launch on an explicit-format VRAM tier");
-        if(bytes!=size_t(latent/256)*292 || !q || !std::isfinite(b) || b<=0 || !std::isfinite(lb))throw std::runtime_error("VRAM Q8_K input or SiTU parameter");
-        std::lock_guard<std::mutex> lock(mutex);if(!done)throw std::runtime_error("GPU job already outstanding");
-        work.clear();output_rows.clear();failure.clear();
-        for(size_t j=0;j<table->hits.size();++j){
-            int slot=table->hits[j];if(slot<0)continue;char * base=slot_base(size_t(slot));
-            work.push_back({base,base+role_bytes[0],base+role_bytes[0]+role_bytes[1]});output_rows.push_back(j);
-        }
-        if(work.empty())return;
-        input.assign(static_cast<const uint8_t *>(q),static_cast<const uint8_t *>(q)+bytes);
-        down.resize(work.size()*size_t(latent));beta=b;linear_beta=lb;done=false;queued=true;
-        if(timing){launch_time=clock_type::now();++launches;}
-        cv.notify_all();
-    }
-    // Explicit-format path: geometry from the expert tensors and the owner's
-    // layer list, engine from kimi_vram_format_compute_get_api. The slot table,
-    // policies, uploads, residency and leases are the same as the Q3_K path.
+    // Geometry comes from the expert tensors and the owner's layer list;
+    // the explicit-format engine shares the slot, upload and lease lifecycle.
     void initialize_format(const kimi_vram_request * r,const kimi_vram_expert_format & f,bool allocate_cache=true){
         if(!f.layers || f.n_layers<=0 || f.n_layers>1024 || f.n_experts<=0 || f.n_experts>65536 ||
                 f.latent<=0 || f.hidden<=0 || f.latent>16384 || f.hidden>16384 ||
@@ -2566,11 +2484,22 @@ int fail(tier * t,char * error,size_t size,const std::exception & e){
     try{t->release();}catch(const std::exception & drain_error){std::fprintf(stderr,"[kimi_vram_tier] cannot drain after %s: %s\n",e.what(),drain_error.what());std::abort();}
     return 1;
 }
+// Retired C ABI slots use only a static message before draining. Allocation or
+// other drain failures must not escape this C boundary or leave work live.
+int reject_implicit_format(void * p,char * error,size_t size,const char * message) noexcept {
+    if(error && size)std::snprintf(error,size,"%s",message);
+    if(p){
+        try{static_cast<tier *>(p)->release();}
+        catch(const std::exception & e){std::fprintf(stderr,"[kimi_vram_tier] cannot drain after %s: %s\n",message,e.what());std::abort();}
+        catch(...){std::fprintf(stderr,"[kimi_vram_tier] cannot drain after %s: unknown exception\n",message);std::abort();}
+    }
+    return 1;
+}
 void * api_create(uint64_t bytes,char * error,size_t n){try{return new tier(bytes);}catch(const std::exception & e){if(n)std::snprintf(error,n,"%s",e.what());return nullptr;}}
 void api_destroy(void * p){delete static_cast<tier *>(p);}
 int api_begin(void * p,uint64_t epoch,uint64_t token,int decode,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->begin(epoch,token,decode);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
-int api_prepare(void * p,const kimi_vram_request * r,int count,int latent,int hidden,int * slots,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->prepare(r,count,latent,hidden,slots);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
-int api_launch(void * p,const void * q,size_t bytes,float beta,float linear,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->launch(q,bytes,beta,linear);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+int api_prepare(void * p,const kimi_vram_request *,int,int,int,int *,char * e,size_t n){return reject_implicit_format(p,e,n,"implicit expert format retired; use explicit-format prepare");}
+int api_launch(void * p,const void *,size_t,float,float,char * e,size_t n){return reject_implicit_format(p,e,n,"implicit expert format retired; use explicit-format launch");}
 int api_admit(void * p,const kimi_vram_request * r,const void * up,const void * gate,const void * down,int borrow,char * e,size_t n){auto * t=static_cast<tier *>(p);try{const void * data[]={up,gate,down};t->admit(*r,data,borrow!=0);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int api_finish(void * p,float * output,size_t stride,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->finish(output,stride);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int api_cancel(void * p,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->release();return 0;}catch(const std::exception & x){if(n)std::snprintf(e,n,"%s",x.what());return 1;}}

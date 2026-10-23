@@ -2313,11 +2313,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             !up_exps_b && !gate_exps_b && !down_exps_b &&
             !up_exps_s && !gate_exps_s && !down_exps_s &&
             !weight_before_ffn && (!loras || loras->empty());
-        const bool kimi_k3_situ = sink_layout && arch == LLM_ARCH_KIMI_K3 && type_op == LLM_FFN_SITU &&
-            up_exps->type == GGML_TYPE_Q3_K && gate_exps->type == GGML_TYPE_Q3_K &&
-            down_exps->type == GGML_TYPE_Q3_K &&
-            std::isfinite(hparams.situ_beta) && hparams.situ_beta > 0.0f &&
-            std::isfinite(hparams.situ_linear_beta);
         // DeepSeek-V4.1 clamped SwiGLU (weights arrive normalized and scaled).
         // The grouped executor accepts batched prefill; cache compute remains a
         // single-token SiTU-only path.
@@ -2333,9 +2328,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // any expert types the sink can compute (it refuses the others): Q8_0, BF16, UD-Q4_K_XL's Q4_K/Q5_K, ...
         const bool muse_swiglu = sink_layout && arch == LLM_ARCH_MUSE_SPARK &&
             type_op == LLM_FFN_SILU && !cache_compute && post_exp_norm && gate_exps->type == up_exps->type;
-        if (!kimi_k3_situ && !deepseek41_swiglu_clamp && !muse_swiglu) {
-            GGML_ABORT("CPU sink layer=%d requires contiguous Q3_K Kimi-K3 SiTU experts, or "
-                "DeepSeek-V4.1 clamped SwiGLU experts in MXFP4/MXFP4/MXFP4 or "
+        if (!deepseek41_swiglu_clamp && !muse_swiglu) {
+            GGML_ABORT("CPU sink layer=%d requires contiguous DeepSeek-V4.1 clamped SwiGLU experts in MXFP4/MXFP4/MXFP4 or "
                 "IQ2_XXS/IQ2_XXS/Q2_K, or Muse Spark SwiGLU with per-expert post norm, "
                 "without LoRA/bias/scales; no fallback", il);
         }

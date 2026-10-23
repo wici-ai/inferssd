@@ -3,19 +3,6 @@
 #include <stdint.h>
 #include "kimi-vram-tier-api.h"
 struct vram_compute_expert { const void * up; const void * gate; const void * down; };
-// Adapter around test2's two-stage parity component. compute blocks only the
-// tier's private worker and returns unweighted, separate expert down vectors.
-struct vram_compute_api {
-    uint32_t version, size;
-    void * (*create)(int device, int latent, int hidden, int max_hits, char *, size_t);
-    void (*destroy)(void *);
-    int (*compute)(void *, const vram_compute_expert *, int hits,
-                   const void * q8_input, size_t input_bytes, float beta, float linear_beta,
-                   float * host_down, char * error, size_t error_size);
-    size_t (*device_scratch_bytes)(void *);
-    size_t (*host_scratch_bytes)(void *);
-};
-typedef const vram_compute_api * (*vram_compute_get_api_fn)();
 // Engine of the explicit-format tier path: both GPU matvec stages with the host
 // activation and hidden quantization between them; returns unweighted down rows.
 struct vram_format_compute_api {

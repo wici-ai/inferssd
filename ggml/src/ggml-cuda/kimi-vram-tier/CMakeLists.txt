@@ -14,20 +14,9 @@ elseif (CMAKE_CUDA_ARCHITECTURES)
     endif()
 endif()
 
-# Use test2's verified standalone script, outside the backend's fast-math flags.
-get_filename_component(KIMI_PARITY_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
-set(KIMI_PARITY_OUTPUT "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/libkimi-q3k-parity.so")
-add_custom_command(OUTPUT "${KIMI_PARITY_OUTPUT}"
-    COMMAND ${CMAKE_COMMAND} -E env "PARITY_NVCC=${CMAKE_CUDA_COMPILER}" ${KIMI_PARITY_ARCH_ENV}
-        bash "${CMAKE_CURRENT_SOURCE_DIR}/build_component.sh"
-        "${KIMI_PARITY_SOURCE_DIR}" "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
-    DEPENDS ../kimi-q3k-parity.cu ../kimi-q3k-chain.cu ../kimi-q3k-reference-math.cuh
-        ../../../include/ggml-kimi-q3k-parity.h ../../../include/ggml-kimi-q3k-chain.h build_component.sh
-    VERBATIM)
-add_custom_target(kimi-q3k-parity DEPENDS "${KIMI_PARITY_OUTPUT}")
-
 # MXFP4 x Q8_0 component for DeepSeek-V4.1 experts: a separate DSO with the same
-# strict rounding flags. It is not part of the backend or of the Q3_K DSO.
+# strict rounding flags, separate from the backend.
+get_filename_component(KIMI_PARITY_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
 set(KIMI_MXFP4_PARITY_OUTPUT "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/libkimi-mxfp4-parity.so")
 add_custom_command(OUTPUT "${KIMI_MXFP4_PARITY_OUTPUT}"
     COMMAND ${CMAKE_COMMAND} -E env "PARITY_NVCC=${CMAKE_CUDA_COMPILER}" ${KIMI_PARITY_ARCH_ENV}
@@ -37,7 +26,7 @@ add_custom_command(OUTPUT "${KIMI_MXFP4_PARITY_OUTPUT}"
     VERBATIM)
 add_custom_target(kimi-mxfp4-parity DEPENDS "${KIMI_MXFP4_PARITY_OUTPUT}")
 
-add_library(kimi-vram-tier SHARED vram-tier.cpp test2-compute-adapter.cpp mxfp4-compute-adapter.cpp q2-compute-adapter.cu
+add_library(kimi-vram-tier SHARED vram-tier.cpp mxfp4-compute-adapter.cpp q2-compute-adapter.cu
     group-compute-adapter.cu)
 target_include_directories(kimi-vram-tier PRIVATE ../../../include ../.. ../../ggml-cpu)
 target_compile_features(kimi-vram-tier PRIVATE cxx_std_17)

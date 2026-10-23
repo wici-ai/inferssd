@@ -1,6 +1,6 @@
-// Exercise the real CPU sink, io_uring, borrowed H2D and test2 GPU math at the
-// actual K3 expert shape. Synthetic packed weights avoid a model dependency;
-// the operator gate separately checks the real model's packed weights.
+// Exercise the real CPU sink, io_uring, borrowed H2D and explicit MXFP4 GPU
+// format at synthetic geometry. Cache, upload and failure assertions use the
+// production sink and tier without a full model dependency.
 #define main original_sink_test_main
 #include "test-kimi-cpu-sink.cpp"
 #undef main
@@ -14,9 +14,9 @@ int main() { try {
     setenv("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS","0",1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY","lru",1);
     setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT","0",1);
-    fixture f;f.latent=3584;f.hidden=3072;f.experts=4;make_synthetic(f);
+    fixture f;f.latent=256;f.hidden=256;f.experts=4;f.type=f.down_type=GGML_TYPE_MXFP4;make_synthetic(f);
     const auto ram_bytes=2*triplet_bytes(f);
-    const auto gpu_bytes=std::to_string(92*triplet_bytes(f)); // one GPU slot/layer
+    const auto gpu_bytes=std::to_string(2*triplet_bytes(f)); // one GPU slot/layer
     struct options { bool exclusive,async,hidden; };
     size_t compared=0,checks=0;
     for(const auto cfg : {options{false,false,false},options{true,false,false},options{true,true,false},options{true,true,true},options{false,true,true}}) {
@@ -26,7 +26,7 @@ int main() { try {
         setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES",gpu_bytes.c_str(),1);
         setenv("GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE",cfg.exclusive?"1":"0",1);
         setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD",cfg.async?"1":"0",1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_GPU_HIDDEN",cfg.hidden?"1":"0",1);
+        setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN",cfg.hidden?"1":"0",1);
         auto mixed=make_sink(f,16,2);
         configure_cache(cpu.get(),ram_bytes,{1,2},1);configure_cache(mixed.get(),ram_bytes,{1,2},1);
         for(int token=1;token<=10;++token) {

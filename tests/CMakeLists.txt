@@ -166,15 +166,15 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if (TARGET kimi-vram-tier)
         # GPU tests require explicit ownership of a lane and preloaded exact
         # component DSOs; do not acquire a shared GPU automatically in ctest.
-        foreach(tier_test test-kimi-vram-async test-kimi-vram-deferred test-kimi-vram-exclusive test-kimi-q3k-parity
-                test-kimi-vram-component-error test-kimi-vram-pool-cuda
+        foreach(tier_test test-kimi-vram-async test-kimi-vram-deferred test-kimi-vram-exclusive
+                test-kimi-vram-component-error test-kimi-vram-format-compat test-kimi-vram-pool-cuda
                 test-kimi-vram-elastic test-kimi-vram-reclaim)
             add_executable(${tier_test} ${tier_test}.cpp)
             target_compile_features(${tier_test} PRIVATE cxx_std_17)
             target_compile_options(${tier_test} PRIVATE -fno-fast-math -ffp-contract=off)
             target_include_directories(${tier_test} PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../ggml/src/ggml-cuda/kimi-vram-tier ../vendor)
             target_link_libraries(${tier_test} PRIVATE ggml-cpu ggml-base CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
-            add_dependencies(${tier_test} kimi-q3k-parity kimi-vram-tier)
+            add_dependencies(${tier_test} kimi-mxfp4-parity kimi-vram-tier)
         endforeach()
         # DeepSeek-V4.1 MXFP4 tier: component rows and the sink end to end. Like the
         # tests above they need an owned GPU and preloaded DSOs, so they stay out of ctest.

@@ -406,20 +406,19 @@ struct sink_vram {
         char error[512] = {};
         check(elastic->phase_complete(context, decode ? 1 : 0, error, sizeof(error)), error);
     }
-    // Q3_K SiTU experts (legacy) keep transport ABI 2 and the K3 layer range;
-    // every other format uses the tier's explicit-format extension.
+    // Expert geometry is supplied through the explicit-format extension.
     void prepare(std::vector<sink_request> & source, const ggml_tensor * up, const ggml_tensor * down,
-                 int latent, int hidden, bool legacy, const std::vector<int32_t> & layer_ids, sink_cache & cache, bool unweighted = false) {
+                 int latent, int hidden, const std::vector<int32_t> & layer_ids, sink_cache & cache, bool unweighted = false) {
         hits = 0;
         if (!context) { return; }
         int layer = -1, consumed = 0;
         const char * tensor_name = up->name;
         if (std::sscanf(tensor_name, "blk.%d.ffn_up_exps.weight%n", &layer, &consumed) != 1 ||
                 !consumed || tensor_name[consumed] || source.size() > 16 ||
-                (legacy ? (layer < 1 || layer > 92) : (layer < 0 || layer > 1023))) {
+                (layer < 0 || layer > 1023)) {
             throw std::runtime_error("GPU tier requires a canonical routed layer and <=16 slots");
         }
-        if (!legacy && !format) {
+        if (!format) {
             throw std::runtime_error("GPU tier lacks the explicit expert format ABI for these experts; no fallback");
         }
         if (deferred_upload && decode) {
@@ -438,10 +437,7 @@ struct sink_vram {
         }
         char error[512] = {};
         int result;
-        if (legacy) {
-            result = api->prepare(context, requests.data(), int(requests.size()), latent, hidden,
-                                  slots.data(), error, sizeof(error));
-        } else {
+        {
             // MXFP4's engine takes the input quantized, the generic one (every other format the CUDA
             // backend has a matrix-vector kernel for; it refuses the rest) takes it as f32
             const bool mxfp4 = up->type == GGML_TYPE_MXFP4 && down->type == GGML_TYPE_MXFP4;
@@ -450,7 +446,7 @@ struct sink_vram {
             result = format->prepare(context, requests.data(), int(requests.size()), &f, slots.data(), error, sizeof(error));
             format_f32_input = !mxfp4;
         }
-        format_path = !legacy;
+        format_path = true;
         check(result, error);
         for (size_t i = 0; i < source.size(); ++i) { source[i].vram_slot = slots[i]; hits += slots[i] >= 0; }
     }
@@ -465,8 +461,7 @@ struct sink_vram {
             const size_t bytes = format_f32_input ? f32_bytes : quantized_bytes;
             result = format->launch(context, input, bytes, &a, error, sizeof(error));
         } else {
-            result = api->launch(context, quantized, quantized_bytes,
-                                 activation.situ_beta, activation.situ_linear_beta, error, sizeof(error));
+            throw std::runtime_error("GPU launch requires an explicit expert format");
         }
         check(result, error);
     }
@@ -560,17 +555,17 @@ struct sink_vram {
         if (deferred_upload) { collect_deferred(cache, -2); }
     }
     // The layer's grouped prefill on the tier: every format the tier has a lane for (it initializes the format on a cold
-    // prefill, its decode arena deferred to the first decode token). legacy: Kimi-K3's Q3_K SiTU experts, which keep
-    // transport ABI 2 and no grouped prefill. A pass the format's engine cannot take (a per-expert post norm on MXFP4's
+    // prefill, its decode arena deferred to the first decode token).
+    // A pass the format's engine cannot take (a per-expert post norm on MXFP4's
     // hand engine) stays the CPU's.
     int prepare_prefill(std::vector<sink_request> & source, const ggml_tensor * up, const ggml_tensor * down,
-            int latent, int hidden, const std::vector<int32_t> & layer_ids, int ntokens, bool post_norm, bool legacy) {
+            int latent, int hidden, const std::vector<int32_t> & layer_ids, int ntokens, bool post_norm) {
         hits = 0;
         prefill_plan.valid = false;
         prefill_cpu_fit = {};
         prefill_stats = {};
         prefill_batched = prefill_q2 = prefill_in_place = false;
-        if (!context || !prefill_enabled || source.empty() || legacy) { return 0; }
+        if (!context || !prefill_enabled || source.empty()) { return 0; }
         int layer = -1, consumed = 0;
         const char * tensor_name = up->name;
         if (std::sscanf(tensor_name, "blk.%d.ffn_up_exps.weight%n", &layer, &consumed) != 1 ||

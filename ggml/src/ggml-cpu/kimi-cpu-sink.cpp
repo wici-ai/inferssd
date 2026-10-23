@@ -2723,12 +2723,10 @@ struct kimi_cpu_sink {
     // GPU tier's (sink_vram::reserve), with the floor and the RAM cache's demand published first, as the first decode
     // layer publishes them before the tier sizes itself there; the RAM cache there only lands the prefetch and follows
     // at the first decode token, from the demand the tier left. Elsewhere the RAM cache's (reserve_cache), with a GPU
-    // tier or without one, when the cache can give room back (partial reclaim or elastic). The legacy Q3_K tier has
-    // no format ABI and allocates at its first decode layer.
+    // tier or without one, when the cache can give room back (partial reclaim or elastic).
     void reserve_tier(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down, int experts_used) {
         if (!cache.ledger.unified) { reserve_cache(up, gate, down, experts_used); }
-        if (!vram.context || cache.layers.empty() ||
-                (up->type == GGML_TYPE_Q3_K && down->type == GGML_TYPE_Q3_K && activation_kind == KIMI_CPU_SINK_ACTIVATION_SITU)) { return; }
+        if (!vram.context || cache.layers.empty()) { return; }
         refresh_floor("reserve");
         if (!cache.arena) { vram.set_host_demand(cache.pending_bytes(size_t(up->nb[2] + gate->nb[2] + down->nb[2]))); }
         std::vector<int32_t> layer_ids;
@@ -3533,10 +3531,6 @@ struct kimi_cpu_sink {
             down->ne[0] != up->ne[1] || down->ne[1] != up->ne[0] || down->ne[2] != up->ne[2]) {
             throw std::runtime_error("CPU sink expert shape mismatch");
         }
-        // Q3_K SiTU experts use the tier's original ABI; other formats need its
-        // explicit-format extension, checked when the tier prepares the layer.
-        const bool vram_legacy = up->type == GGML_TYPE_Q3_K && down->type == GGML_TYPE_Q3_K &&
-            activation_kind == KIMI_CPU_SINK_ACTIVATION_SITU;
         latent = static_cast<int>(up->ne[0]); hidden = static_cast<int>(up->ne[1]);
         // The graph's MUL_MAT_ID kernels: vec_dot of the weight type against the
         // input quantized to its vec_dot_type (Q3_K/Q8_K, MXFP4/Q8_0, ...).
@@ -3621,7 +3615,7 @@ struct kimi_cpu_sink {
             if (provider_path) { vram.hits = 0; }
             else {
                 std::vector<int32_t> vram_layers;
-                if (vram.context && !vram_legacy) {
+                if (vram.context) {
                     vram_layers.reserve(cache.layers.size());
                     for (const auto & l : cache.layers) { vram_layers.push_back(l.id); }
                 }
@@ -3630,7 +3624,7 @@ struct kimi_cpu_sink {
                 if (vram.context && !cache.arena) {
                     vram.set_host_demand(cache.pending_bytes(max_bytes[0] + max_bytes[1] + max_bytes[2]));
                 }
-                vram.prepare(requests, up, down, latent, hidden, vram_legacy, vram_layers, cache, post_exp_norm != nullptr);
+                vram.prepare(requests, up, down, latent, hidden, vram_layers, cache, post_exp_norm != nullptr);
             }
             // Auto sizing reads memory.current. After GPU prefill, the CPU
             // read ring may still be absent or only virtually allocated. Its
@@ -4077,12 +4071,8 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
             std::vector<int32_t> vram_layers;
             vram_layers.reserve(sink->cache.layers.size());
             for (const auto & layer : sink->cache.layers) { vram_layers.push_back(layer.id); }
-            // Kimi-K3's Q3_K SiTU experts keep the tier's transport ABI 2 (no grouped prefill); a per-expert post norm
-            // (Muse) is applied by the batched engine and by a one-token pass's vector path, per expert before the sum
-            const bool legacy = up->type == GGML_TYPE_Q3_K && down->type == GGML_TYPE_Q3_K &&
-                batch->activation.kind == KIMI_CPU_SINK_ACTIVATION_SITU;
             batch->gpu_experts = sink->vram.prepare_prefill(sink->requests, up, down, sink->latent, sink->hidden,
-                vram_layers, batch->ntokens, batch->activation.post_exp_norm != nullptr, legacy);
+                vram_layers, batch->ntokens, batch->activation.post_exp_norm != nullptr);
             // the batched lanes stream their SSD transients through the ring (MXFP4's hand engine, the batched engine)
             streaming_ssd = sink->vram.prefill_batched;
             route_bytes = double(sink->vram.prefill_lane.route_bytes);

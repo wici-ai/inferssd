@@ -104,10 +104,6 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
-    # This optional component has its own strict rounding flags and ABI. It is
-    # loaded explicitly by the CPU sink and must not enter the normal backend.
-    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/kimi-q3k-parity.cu"
-        "${CMAKE_CURRENT_SOURCE_DIR}/kimi-q3k-chain.cu")
     if (GGML_CUDA_KIMI_VRAM_TIER)
         if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT GGML_CPU)
             message(FATAL_ERROR "Kimi VRAM tier requires Linux and the CPU backend")
