@@ -20,6 +20,7 @@ synthetic = test_device_ci.synthetic
 def pair():
     result = {
         "input_tokens": 100, "prompt_ids": [7] * 100, "prompt_sha256": "a" * 64,
+        "output_tokens": 256, "tokens": [11] * 256,
         "timings": {"prompt_n": 100, "prompt_ms": 1000},
         "metrics": {"decode_first128_tps": 10, "decode_second128_tps": 10,
                     "decode_tps": 10, "ttft_s": 1, "server_prefill_tps": 100},
@@ -55,6 +56,41 @@ def test_equal_samples_pass_only_observed_gate(pair, policy):
     assert result["passed"] and result["status"] == "passed"
     assert not result["diagnostic_required"]
     assert "not statistical proof" in result["interpretation"]
+
+
+def test_faster_different_output_is_inconclusive_and_retains_metrics(pair, policy):
+    a, b, ar, br = pair
+    b["tokens"][64] = 12
+    for metric in compare.METRICS:
+        b["metrics"][metric] *= .5 if metric == "ttft_s" else 2
+    b["timings"]["prompt_ms"] /= 2
+    result = compare.compare_pair(a, b, ar, br, policy)
+    assert not result["passed"] and result["status"] == "inconclusive"
+    assert result["diagnostic_required"] and result["evidence_valid"]
+    assert result["observed_slowdowns"] == []
+    assert all(value["passed"] for value in result["metrics"].values())
+    assert result["metrics"]["decode_tps"]["candidate"] == 20
+    assert result["output_workload"] == {
+        "same_tokens": False, "first_difference_one_based": 65,
+        "base_token": 11, "candidate_token": 12,
+    }
+
+
+def test_same_tokens_with_different_probability_floats_can_compare(pair, policy):
+    pair[0]["probabilities"] = [{"id": 11, "logprob": -.1}]
+    pair[1]["probabilities"] = [{"id": 11, "logprob": -.10001}]
+    result = compare.compare_pair(*pair, policy)
+    assert result["passed"] and result["output_workload"]["same_tokens"]
+
+
+@pytest.mark.parametrize("tokens", [None, [], [11] * 255, [True] * 256, [-1] * 256])
+def test_missing_or_invalid_output_tokens_are_invalid_evidence(pair, policy, tokens):
+    if tokens is None:
+        pair[1].pop("tokens")
+    else:
+        pair[1]["tokens"] = tokens
+    with pytest.raises(ValueError, match="output token evidence"):
+        compare.compare_pair(*pair, policy)
 
 
 @pytest.mark.parametrize("value", [None, 0, -1, True, float("nan"), float("inf")])
