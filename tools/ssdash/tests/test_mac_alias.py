@@ -342,6 +342,25 @@ def test_aligned_selection_and_runtime_name_limit(tmp_path):
         m.build_rows([path], {"up"}, 256)
 
 
+@pytest.mark.parametrize("name", ["d" * 128, "é" * 64])
+def test_all_native_tensor_names_are_byte_bounded_before_reading(tmp_path, monkeypatch, name):
+    path = tmp_path / "bad.gguf"
+    fixture(path, tensors=[(name, (1,), 0, 0)])
+    original = m._Reader.read
+    reads = []
+
+    def read(reader, count):
+        reads.append(count)
+        return original(reader, count)
+
+    monkeypatch.setattr(m._Reader, "read", read)
+    with pytest.raises(RuntimeError, match="tensor name too long for runtime key: 128 UTF-8 bytes"):
+        m.read_header(path)
+    assert max(reads) <= 8  # The 128-byte name is rejected before its allocation/read.
+    fixture(path, tensors=[("d" * 127, (1,), 0, 0)])
+    assert m.read_header(path).tensors[0].name == "d" * 127
+
+
 def test_legacy_type42_observation_remains_separate_from_native_admission(tmp_path):
     from ssdash.source import header
 
