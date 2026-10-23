@@ -25,7 +25,7 @@ static bool resident(const allocation & a) {
     return std::all_of(bits.begin(), bits.end(), [](auto byte) { return byte & 1; });
 }
 struct host_type {
-    bool host = true, initialize = true;
+    bool host = true, initialize = true, expose_base = true;
     unsigned fail_after = UINT32_MAX;
     unsigned allocations = 0, initially_unresident = 0;
     std::vector<ggml_backend_buffer_t> buffers;
@@ -49,6 +49,7 @@ struct host_type {
                 auto & item = *static_cast<allocation *>(b->context);
                 return item.data;
             };
+            if (!owner.expose_base) { methods.get_base = nullptr; }
             methods.free_buffer = [](ggml_backend_buffer_t b) {
                 auto * item = static_cast<allocation *>(b->context);
                 auto & list = item->owner->buffers;
@@ -133,6 +134,13 @@ static void real_page_population_and_failure() {
         require(!ggml_gallocr_reserve(alloc.get(), g) && type.buffers.empty(), "partial multi-chunk allocation failure leaked");
     }
 }
+static void missing_host_base() {
+    host_type type; type.expose_base = false; auto ctx = context(); auto * g = graph(ctx.get());
+    allocator_ptr alloc(ggml_gallocr_new(&type.type), &ggml_gallocr_free);
+    ggml_gallocr_set_host_prefault(alloc.get(), size_t(sysconf(_SC_PAGESIZE)));
+    require(!ggml_gallocr_reserve(alloc.get(), g) && type.buffers.empty(),
+        "host buffer without a base was not rejected or leaked a chunk");
+}
 static void scheduler_explicit_reserve() {
     host_type type;
     ggml_backend_device device = {};
@@ -170,7 +178,7 @@ static void scheduler_explicit_reserve() {
 }
 int main() {
     try {
-        multi_chunk_and_reuse(); disabled_and_device(); real_page_population_and_failure(); scheduler_explicit_reserve();
+        multi_chunk_and_reuse(); disabled_and_device(); real_page_population_and_failure(); missing_host_base(); scheduler_explicit_reserve();
         std::cout << "host prefault: real multichunk pages, reuse, weights, disabled/device and failure cleanup passed\n";
     } catch (const std::exception & error) { std::cerr << error.what() << '\n'; return 1; }
 }

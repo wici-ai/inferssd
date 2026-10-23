@@ -443,6 +443,10 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
                 ggml_backend_buffer_get_usage(buf->chunks[n]) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
             const size_t size = ggml_backend_buffer_get_size(buf->chunks[n]);
             volatile unsigned char * base = (volatile unsigned char *)ggml_backend_buffer_get_base(buf->chunks[n]);
+            if (size && base == NULL) {
+                ggml_vbuffer_free(buf);
+                return NULL;
+            }
             for (size_t offset = 0; offset < size;) {
                 base[offset] = 0;
                 if (size - offset <= host_prefault_page_size) { break; }
