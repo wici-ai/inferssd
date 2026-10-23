@@ -14,7 +14,6 @@
 #include <limits>
 #include <map>
 #include <numeric>
-#include <sstream>
 #include <stdexcept>
 
 // Port of upstream src/llama-kv-cache-dsv4.cpp (DeepSeek-V4 / V4.1). Fork adaptations are marked "fork:".
@@ -188,19 +187,6 @@ static int64_t dsv4_comp_graph_n_stream(const llama_ubatch & ubatch, uint32_t n_
     }
 
     return ubatch.n_seqs_unq;
-}
-
-static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
-    std::ostringstream ss;
-    ss << "[";
-    for (size_t i = 0; i < values.size(); ++i) {
-        if (i > 0) {
-            ss << ", ";
-        }
-        ss << values[i];
-    }
-    ss << "]";
-    return ss.str();
 }
 
 static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
@@ -498,24 +484,6 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                     plan.state_snapshot_dst_idxs.push_back((int32_t) (dst_plane + stream_off + r));
                 }
             }
-        }
-    }
-
-    static const bool debug = []() {
-        const char * env = getenv("LLAMA_DSV4_COMPRESS_DEBUG");
-        return env && atoi(env) > 0;
-    }();
-
-    if (debug) {
-        LLAMA_LOG_DEBUG("%s: ratio=%u, n_tokens=%u, n_seqs_unq=%u, state_persist_dst=%s, state_write_pos=%s\n",
-                __func__, ratio, ubatch.n_tokens, ubatch.n_seqs_unq,
-                dsv4_plan_positions(plan.state_persist_dst_idxs).c_str(),
-                dsv4_plan_positions(plan.state_write_pos).c_str());
-        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-            const llama_seq_id seq_id = ubatch.seq_id_unq[s];
-            const uint32_t rollback = seq_id >= 0 && (uint32_t) seq_id < rs_idx.size() ? rs_idx[seq_id] : 0;
-            LLAMA_LOG_DEBUG("%s:   seq %d pos [%d, %d] rollback=%u\n", __func__, seq_id,
-                    ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1], rollback);
         }
     }
 

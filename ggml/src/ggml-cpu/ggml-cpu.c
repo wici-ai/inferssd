@@ -77,15 +77,6 @@
 #define SWAP(x, y, T) do { T SWAP = x; (x) = y; (y) = SWAP; } while (0)
 
 
-extern bool ggml_cpu_layer_gap_trace_enabled(void);
-extern void ggml_cpu_layer_gap_trace_node(
-    uint64_t start_us,
-    uint64_t end_us,
-    int op,
-    const char * op_name,
-    const char * name);
-
-
 // precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
 
@@ -2779,10 +2770,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.use_ref    =*/ cplan->use_ref,
         /*.ssd_mac_cache =*/ cplan->ssd_mac_cache,
     };
-    const bool layer_gap_trace =
-        state->ith == 0 && ggml_cpu_layer_gap_trace_enabled();
-    uint64_t layer_gap_last_start_us = 0;
-    struct ggml_tensor * layer_gap_last_node = NULL;
 
 #ifdef GGML_USE_OPENMP
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p\n", state->ith, (const void *)cplan);
@@ -2802,8 +2789,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
-        const uint64_t layer_gap_start_us =
-            layer_gap_trace ? (uint64_t) ggml_time_us() : 0;
         ggml_compute_forward(&params, node);
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -2816,19 +2801,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             ggml_barrier(state->threadpool);
         }
 
-        if (layer_gap_trace) {
-            if (node_n + 1 < cgraph->n_nodes) {
-                ggml_cpu_layer_gap_trace_node(
-                    layer_gap_start_us,
-                    (uint64_t) ggml_time_us(),
-                    (int) node->op,
-                    ggml_op_name(node->op),
-                    node->name);
-            } else {
-                layer_gap_last_start_us = layer_gap_start_us;
-                layer_gap_last_node = node;
-            }
-        }
     }
 
 #ifdef GGML_USE_OPENMP
@@ -2838,14 +2810,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
-    if (layer_gap_trace && layer_gap_last_node != NULL) {
-        ggml_cpu_layer_gap_trace_node(
-            layer_gap_last_start_us,
-            (uint64_t) ggml_time_us(),
-            (int) layer_gap_last_node->op,
-            ggml_op_name(layer_gap_last_node->op),
-            layer_gap_last_node->name);
-    }
 
     return 0;
 }

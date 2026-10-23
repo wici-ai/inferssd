@@ -28,42 +28,6 @@
 
 // dedup helpers
 
-static bool llama_moe_next_gate_shadow_enabled_env() {
-    static const bool enabled = []() {
-        const char * path = std::getenv("GGML_MOE_NEXT_GATE_SHADOW_OUT");
-        return path != nullptr && path[0] != '\0';
-    }();
-    return enabled;
-}
-
-static bool llama_moe_route_score_trace_enabled_env() {
-    static const bool enabled = []() {
-        const char * path = std::getenv("GGML_MOE_ROUTE_SCORE_TRACE_OUT");
-        return path != nullptr && path[0] != '\0';
-    }();
-    return enabled;
-}
-
-static bool llama_kimi_pipeline_v2_preserve_hard_ids_env() {
-    const char * active = std::getenv("GGML_KIMI_PIPELINE_V2_ACTIVE");
-    const char * preserve = std::getenv("GGML_KIMI_PIPELINE_V2_PRESERVE_HARD_IDS");
-    const char * mode = std::getenv("GGML_KIMI_PIPELINE_V2_MODE");
-    return active && active[0] && active[0] != '0' &&
-        preserve && preserve[0] && preserve[0] != '0' && mode &&
-        (std::strcmp(mode, "depth1") == 0 || std::strcmp(mode, "pipeline") == 0);
-}
-
-static int64_t llama_moe_next_gate_shadow_topk_env(int64_t default_topk, int64_t n_expert) {
-    int64_t topk = default_topk;
-    if (const char * env = std::getenv("GGML_MOE_NEXT_GATE_SHADOW_TOPK")) {
-        const int64_t parsed = strtoll(env, nullptr, 10);
-        if (parsed > 0) {
-            topk = parsed;
-        }
-    }
-    return std::max<int64_t>(1, std::min<int64_t>(topk, n_expert));
-}
-
 static ggml_tensor * build_attn_inp_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_context * mctx,
@@ -618,50 +582,6 @@ static void dsv4_set_i32(ggml_tensor * dst, const std::vector<int32_t> & src) {
     ggml_backend_tensor_set(dst, src.data(), 0, src.size()*ggml_element_size(dst));
 }
 
-static void dsv4_set_kq_mask(
-        ggml_tensor * dst,
-        const llama_kv_cache_dsv4_context::comp_plan & plan,
-        uint32_t n_tokens,
-        int64_t n_stream) {
-    if (!dst || !dst->buffer) {
-        return;
-    }
-
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
-    GGML_ASSERT(n_stream > 0);
-    GGML_ASSERT(n_tokens%n_stream == 0);
-    GGML_ASSERT(dst->ne[0] == plan.n_kv);
-    GGML_ASSERT(dst->ne[1] == (int64_t) n_tokens/n_stream);
-    GGML_ASSERT(dst->ne[2] == 1);
-    GGML_ASSERT(dst->ne[3] == n_stream);
-    GGML_ASSERT((int64_t) plan.n_visible.size() == (int64_t) n_tokens);
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-
-    if (dst->type == GGML_TYPE_F32) {
-        float * data = (float *) dst->data;
-
-        for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
-            const int32_t n_visible = plan.n_visible[i];
-
-            for (int64_t j = 0; j < dst->ne[0]; ++j) {
-                data[i*dst->ne[0] + j] = j < n_visible ? 0.0f : -INFINITY;
-            }
-        }
-    } else if (dst->type == GGML_TYPE_F16) {
-        ggml_fp16_t * data = (ggml_fp16_t *) dst->data;
-        const ggml_fp16_t fp16_ninf = llama_cast<ggml_fp16_t>(-INFINITY);
-        const ggml_fp16_t fp16_zero = llama_cast<ggml_fp16_t>(0.0f);
-
-        for (int64_t i = 0; i < (int64_t) n_tokens; ++i) {
-            const int32_t n_visible = plan.n_visible[i];
-
-            for (int64_t j = 0; j < dst->ne[0]; ++j) {
-                data[i*dst->ne[0] + j] = j < n_visible ? fp16_zero : fp16_ninf;
-            }
-        }
-    }
-}
-
 static ggml_tensor * dsv4_build_raw_kq_mask(
         ggml_context * ctx,
         const llama_kv_cache_dsv4_raw_context * mctx,
@@ -718,15 +638,6 @@ static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
     return ss.str();
 }
 
-static bool dsv4_compress_debug() {
-    static const bool debug = []() {
-        const char * env = getenv("LLAMA_DSV4_COMPRESS_DEBUG");
-        return env && atoi(env) > 0;
-    }();
-
-    return debug;
-}
-
 static void dsv4_set_comp_inputs(
         const llm_graph_input_dsv4::comp_input & inp,
         const llama_kv_cache_dsv4_context::comp_plan & plan,
@@ -745,11 +656,8 @@ static void dsv4_set_comp_inputs(
     dsv4_set_i64(inp.state_write_idxs, plan.state_write_idxs);
     dsv4_set_i32(inp.state_write_pos, plan.state_write_pos);
     dsv4_set_i32(inp.kq_visible, plan.n_visible);
-    if (!inp.kq_visible) {
-        dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
-    }
 
-    if (debug || dsv4_compress_debug()) {
+    if (debug) {
         LLAMA_LOG_INFO("%s: %s n_tokens=%u, n_stream=%d, state_persist_dst=%s, state_write_pos=%s\n",
                 __func__, name, n_tokens, (int) n_stream,
                 dsv4_plan_positions(plan.state_persist_dst_idxs).c_str(),
@@ -819,14 +727,6 @@ static ggml_tensor * dsv4_build_input_1d(
     return res;
 }
 
-static bool dsv4_gpu_mask_enabled() {
-    static const bool enabled = []() {
-        const char * env = getenv("LLAMA_DSV4_GPU_MASK");
-        return !env || strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
 static void dsv4_build_comp_inputs(
         ggml_context * ctx,
         llm_graph_input_dsv4::comp_input & inp,
@@ -854,16 +754,10 @@ static void dsv4_build_comp_inputs(
         // fork: no fused lightning indexer (upstream cparams.fused_lid), so the indexer mask is always F32
         const bool use_f16 = strcmp(name, "lid") != 0 && cparams.flash_attn;
 
-        if (dsv4_gpu_mask_enabled()) {
-            inp.kq_visible = dsv4_build_input_1d(ctx, GGML_TYPE_I32, n_tokens,
-                    std::string("dsv4_") + name + "_kq_visible");
-            inp.kq_mask = ggml_row_mask(ctx, inp.kq_visible,
-                    use_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_stream);
-        } else {
-            inp.kq_mask = ggml_new_tensor_4d(ctx, use_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32,
-                    plan.n_kv, n_tokens/n_stream, 1, n_stream);
-            ggml_set_input(inp.kq_mask);
-        }
+        inp.kq_visible = dsv4_build_input_1d(ctx, GGML_TYPE_I32, n_tokens,
+                std::string("dsv4_") + name + "_kq_visible");
+        inp.kq_mask = ggml_row_mask(ctx, inp.kq_visible,
+                use_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_stream);
         ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
     }
 }
@@ -1214,8 +1108,6 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
-    t_moe_next_gate_shadow.clear();
-    t_moe_route_score.clear();
 
     params = {};
 
@@ -1279,22 +1171,6 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             ggml_set_output(t);
         }
     }
-    for (auto & out : t_moe_next_gate_shadow) {
-        if (out.tensor != nullptr) {
-            ggml_set_output(out.tensor);
-        }
-    }
-    for (auto & out : t_moe_route_score) {
-        if (out.ids != nullptr) {
-            ggml_set_output(out.ids);
-        }
-        if (out.scores != nullptr) {
-            ggml_set_output(out.scores);
-        }
-        if (out.weights != nullptr) {
-            ggml_set_output(out.weights);
-        }
-    }
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
@@ -1332,22 +1208,6 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
     inputs.emplace_back(std::move(input));
     return inputs.back().get();
-}
-
-void llm_graph_result::add_moe_next_gate_shadow_output(
-        int source_layer,
-        int target_layer,
-        bool predicted,
-        ggml_tensor * tensor) {
-    t_moe_next_gate_shadow.push_back({ source_layer, target_layer, predicted, tensor });
-}
-
-void llm_graph_result::add_moe_route_score_output(
-        int layer,
-        ggml_tensor * ids,
-        ggml_tensor * scores,
-        ggml_tensor * weights) {
-    t_moe_route_score.push_back({ layer, ids, scores, weights });
 }
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
@@ -1475,105 +1335,6 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
     }
 
     return res;
-}
-
-bool llm_graph_context::moe_next_gate_shadow_enabled() const {
-    return (arch == LLM_ARCH_KIMI_LINEAR || arch == LLM_ARCH_DEEPSEEK2) &&
-        n_tokens == 1 &&
-        llama_moe_next_gate_shadow_enabled_env();
-}
-
-int64_t llm_graph_context::moe_next_gate_shadow_topk(int64_t default_topk, int64_t n_expert) const {
-    return llama_moe_next_gate_shadow_topk_env(default_topk, n_expert);
-}
-
-ggml_tensor * llm_graph_context::build_moe_gate_topk_shadow(
-         ggml_tensor * cur,
-         ggml_tensor * gate_inp,
-         ggml_tensor * gate_inp_b,
-         ggml_tensor * exp_probs_b,
-             int64_t   n_expert,
-             int64_t   n_expert_used,
-        llama_expert_gating_func_type gating_op,
-                 int   source_layer,
-                 int   target_layer,
-                bool   predicted) const {
-    if (!moe_next_gate_shadow_enabled() || gate_inp == nullptr || n_expert <= 0) {
-        return nullptr;
-    }
-
-    const int64_t topk = moe_next_gate_shadow_topk(n_expert_used, n_expert);
-
-    ggml_tensor * logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
-    if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
-        ggml_prec_set_acc(logits, GGML_PREC_F32);
-    }
-    cb(logits, predicted ? "ffn_moe_next_shadow_logits" : "ffn_moe_shadow_logits", target_layer);
-
-    if (gate_inp_b) {
-        logits = ggml_add(ctx0, logits, gate_inp_b);
-        cb(logits, predicted ? "ffn_moe_next_shadow_logits_biased" : "ffn_moe_shadow_logits_biased", target_layer);
-    }
-
-    ggml_tensor * probs = nullptr;
-    switch (gating_op) {
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
-            {
-                probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
-            } break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
-            {
-                probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
-            } break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
-            {
-                probs = logits; // [n_expert, n_tokens]
-            } break;
-        case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
-            {
-                probs = ggml_sqrt(ctx0, ggml_softplus(ctx0, logits)); // [n_expert, n_tokens]
-            } break;
-        default:
-            GGML_ABORT("fatal error");
-    }
-    cb(probs, predicted ? "ffn_moe_next_shadow_probs" : "ffn_moe_shadow_probs", target_layer);
-
-    ggml_tensor * selection_probs = probs;
-    if (exp_probs_b != nullptr) {
-        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
-        cb(selection_probs, predicted ? "ffn_moe_next_shadow_probs_biased" : "ffn_moe_shadow_probs_biased", target_layer);
-    }
-
-    if (hparams.n_expert_groups > 1 && n_tokens > 0) {
-        const int64_t n_exp_per_group = n_expert / hparams.n_expert_groups;
-
-        ggml_tensor * selection_groups = ggml_reshape_3d(ctx0, selection_probs, n_exp_per_group, hparams.n_expert_groups, n_tokens);
-
-        ggml_tensor * group_scores = ggml_argsort_top_k(ctx0, selection_groups, 2);
-        group_scores = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, selection_groups, 1, selection_groups->ne[0], selection_groups->ne[1], selection_groups->ne[2]), group_scores);
-
-        group_scores = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2], group_scores->ne[3]));
-        group_scores = ggml_reshape_2d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2]);
-
-        ggml_tensor * expert_groups = ggml_argsort_top_k(ctx0, group_scores, hparams.n_group_used);
-        cb(expert_groups, predicted ? "ffn_moe_next_shadow_group_topk" : "ffn_moe_shadow_group_topk", target_layer);
-
-        selection_probs = ggml_get_rows(ctx0, selection_groups, expert_groups);
-        selection_probs = ggml_set_rows(ctx0, ggml_fill(ctx0, selection_groups, -INFINITY), selection_probs, expert_groups);
-        selection_probs = ggml_reshape_2d(ctx0, selection_probs, n_expert, n_tokens);
-        cb(selection_probs, predicted ? "ffn_moe_next_shadow_probs_masked" : "ffn_moe_shadow_probs_masked", target_layer);
-    }
-
-    ggml_tensor * selected_experts =
-        llama_moe_should_use_plain_top_k(arch, hparams)
-        ? ggml_top_k(ctx0, selection_probs, topk)
-        : ggml_argsort_top_k(ctx0, selection_probs, topk); // [topk, n_tokens]
-    cb(selected_experts, predicted ? "ffn_moe_next_shadow_topk" : "ffn_moe_shadow_topk", target_layer);
-
-    res->add_moe_next_gate_shadow_output(source_layer, target_layer, predicted, selected_experts);
-    ggml_build_forward_expand(gf, selected_experts);
-
-    return selected_experts;
 }
 
 ggml_tensor * llm_graph_context::build_norm(
@@ -2078,17 +1839,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     GGML_ASSERT(expert_hard_top_k >= 0 && expert_hard_top_k <= n_expert_used);
 
     ggml_tensor * route_scores = nullptr;
-    const bool route_score_trace =
-        llama_moe_route_score_trace_enabled_env() &&
-        n_tokens >= 1 &&
-        (arch == LLM_ARCH_KIMI_LINEAR || arch == LLM_ARCH_DEEPSEEK2);
-    if (route_score_trace || expert_hard_reduction) {
+    if (expert_hard_reduction) {
         ggml_tensor * trace_selection_probs = ggml_reshape_3d(ctx0, selection_probs, 1, n_expert, n_tokens);
         route_scores = ggml_get_rows(ctx0, trace_selection_probs, selected_experts);
         cb(route_scores, "ffn_moe_route_scores", il);
-    }
-    if (moe_next_gate_shadow_enabled()) {
-        res->add_moe_next_gate_shadow_output(il, il, false, selected_experts);
     }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
@@ -2266,18 +2020,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         weights = ggml_reshape_3d(ctx0, weights_2d, 1, n_expert_used, n_tokens);
         cb(weights, "ffn_moe_mass_weights_norm", il);
 
-        if (!llama_kimi_pipeline_v2_preserve_hard_ids_env()) {
-            // The legacy hard policy encodes dropped slots as -1 so the
-            // streamed MMID route builder can skip their I/O.  The private v2
-            // executor deliberately retains all 16 sorted ids while keeping
-            // the exact same zero weights: fixed-4 can still exercise every
-            // route, and the ordered join remains hard-top1 equivalent.
-            ggml_tensor * selected_f32 = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
-            selected_f32 = ggml_add(ctx0,
-                ggml_mul(ctx0, selected_f32, keep),
-                ggml_scale_bias(ctx0, keep, 1.0f, -1.0f));
-            selected_experts = ggml_cast(ctx0, selected_f32, GGML_TYPE_I32);
-        }
+        // Dropped routes retain the existing -1 sentinel so routed matmul
+        // skips their I/O while preserving the same zero weights.
+        ggml_tensor * selected_f32 = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+        selected_f32 = ggml_add(ctx0,
+            ggml_mul(ctx0, selected_f32, keep),
+            ggml_scale_bias(ctx0, keep, 1.0f, -1.0f));
+        selected_experts = ggml_cast(ctx0, selected_f32, GGML_TYPE_I32);
         cb(selected_experts, "ffn_moe_mass_ids", il);
     }
 
@@ -2286,19 +2035,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
-    if (route_score_trace) {
-        res->add_moe_route_score_output(il, selected_experts, route_scores, weights);
-        ggml_build_forward_expand(gf, route_scores);
-    }
-
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    // Optional comparison arm: retain grouped CPU prefill, then let the
-    // ordinary routed graph use the opt-in CUDA expert stream for decode.
-    const char * gpu_decode_env = std::getenv("GGML_KIMI_CPU_SINK_GPU_DECODE");
-    const bool gpu_decode = gpu_decode_env && gpu_decode_env[0] && gpu_decode_env[0] != '0';
-    if ((cpu_sink_decode && !gpu_decode && n_tokens == 1) || cpu_sink_prefill) {
+    // The context's typed runtime selects CPU decode and grouped prefill.
+    if ((cpu_sink_decode && n_tokens == 1) || cpu_sink_prefill) {
         GGML_ASSERT(n_tokens >= 1);
 
         const bool sink_layout = backend_cpu && cpu_sink_runtime && up_exps && gate_exps && down_exps &&
