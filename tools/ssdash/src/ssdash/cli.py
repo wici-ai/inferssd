@@ -34,9 +34,7 @@ from ssdash.telemetry.recorded import ledger, read_arm
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="SSDash recorded-device tools (no hardware probes)"
-    )
+    parser = argparse.ArgumentParser(description="SSDash recorded tools and explicit owned launch")
     commands = parser.add_subparsers(dest="command", required=True)
     add_source_commands(commands)
     add_launch_command(commands)
@@ -94,7 +92,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "launch":
         try:
             return run_launch(args)
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, RuntimeError) as error:
             parser.error(str(error))
     if args.command == "bootstrap-records":
         if args.bootstrap_command == "coresets":

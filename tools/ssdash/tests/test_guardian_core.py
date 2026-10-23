@@ -30,7 +30,12 @@ class DefaultPorts(WithoutTypes):
         return self.generic_visit(node)
 
     def visit_Name(self, node):
-        if isinstance(node.ctx, ast.Load) and node.id in ("pass_fds", "lease_unit"):
+        if isinstance(node.ctx, ast.Load) and node.id in (
+            "pass_fds",
+            "lease_unit",
+            "interrupted",
+            "request_stop",
+        ):
             return ast.copy_location(
                 ast.parse("()" if node.id == "pass_fds" else "None").body[0].value, node
             )

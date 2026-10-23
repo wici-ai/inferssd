@@ -18,12 +18,17 @@ from ssdash.launch.types import LaunchInput, Output
 
 def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     launch = commands.add_parser(
-        "launch", help="resolve launch arguments and indexes without starting a server"
+        "launch", help="resolve a launch or explicitly execute one owned server"
     )
-    launch.add_argument("--dry-run", action="store_true", required=True)
+    execution = launch.add_mutually_exclusive_group(required=True)
+    execution.add_argument("--dry-run", action="store_true")
+    execution.add_argument("--execute", action="store_true")
     launch.add_argument("--platform", choices=("linux", "darwin"), required=True)
     launch.add_argument("--repo", type=Path, required=True)
-    launch.add_argument("--host-facts", type=Path, required=True)
+    launch.add_argument("--host-facts", type=Path)
+    launch.add_argument("--runtime-policy", type=Path)
+    launch.add_argument("--output-dir", type=Path)
+    launch.add_argument("--port", type=int)
     launch.add_argument("--model-conf", type=Path)
     launch.add_argument("--settings", type=Path)
     launch.add_argument("--model", type=Path)
@@ -37,7 +42,7 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     launch.add_argument("extra", nargs=argparse.REMAINDER)
 
 
-def run_launch(args: argparse.Namespace) -> int:
+def launch_inputs(args: argparse.Namespace) -> LaunchInput:
     environment = dict(os.environ)
     for name, value in (
         ("MODEL_CONF", args.model_conf),
@@ -53,9 +58,25 @@ def run_launch(args: argparse.Namespace) -> int:
             args.artifact_dir
         )
     extra = args.extra[1:] if args.extra[:1] == ["--"] else args.extra
-    inputs = LaunchInput(
+    if args.port is not None:
+        if not 1 <= args.port <= 65535:
+            raise ValueError("--port must be in 1..65535")
+        environment["LLAMA_SERVER_PORT" if args.platform == "linux" else "SSD_LLAMA_PORT"] = str(
+            args.port
+        )
+    return LaunchInput(
         str(args.repo.resolve()), tuple(environment.items()), tuple(extra), args.profile, args.mode
     )
+
+
+def run_launch(args: argparse.Namespace) -> int:
+    if args.execute:
+        from ssdash.engine.command import run_native
+
+        return run_native(args, launch_inputs(args))
+    if args.host_facts is None:
+        raise ValueError("--dry-run requires --host-facts; it never observes the live host")
+    inputs = launch_inputs(args)
     host = json.loads(args.host_facts.read_text())
     if not isinstance(host, dict):
         raise ValueError("Host facts must be a JSON object")

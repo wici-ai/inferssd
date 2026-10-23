@@ -41,6 +41,8 @@ def guard_worker(
     cleanup_confirmed: Callable[[Path], bool],
     pass_fds: tuple[int, ...] = (),
     lease_unit: Optional[str] = None,
+    interrupted: Optional[Callable[[], bool]] = None,
+    request_stop: Optional[Callable[[int], None]] = None,
 ) -> int:
     """Keep a second owner outside the worker's session until cleanup is proven.
 
@@ -91,10 +93,18 @@ def guard_worker(
                 lease.poll()
             except BaseException as error:
                 failure = f"lease: {type(error).__name__}: {error}"
-            if failure or signals or time.monotonic() > deadline:
+            if (
+                failure
+                or signals
+                or (interrupted is not None and interrupted())
+                or time.monotonic() > deadline
+            ):
                 failure = failure or "guardian interrupted or timed out"
                 if not asked_stop:
-                    os.kill(worker.pid, signal.SIGTERM)
+                    if request_stop is None:
+                        os.kill(worker.pid, signal.SIGTERM)
+                    else:
+                        request_stop(worker.pid)
                     asked_stop = True
                 common.save(
                     out / "guardian-quarantine.json",
