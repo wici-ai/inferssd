@@ -40,7 +40,7 @@ def mac_images(raw, pid):
     return paths
 
 
-def receipt(config, manifest, side, model, spec, build, output):
+def receipt(config, manifest, side, model, spec, build, output, *, destination=None):
     output = Path(output)
     before, after = (load(output / (name + ".json")) for name in ("runtime-before", "runtime-after"))
     started = load(output / "started.json")
@@ -195,5 +195,5 @@ def receipt(config, manifest, side, model, spec, build, output):
                             effective_settings=dict(native_launch_policy=normalize(dict(args=args, typed_values=expected,
                                 template_sha256=template["sha256"]), frozen), native_resource_policy=resources,
                                 ambient_environment=ambient, system_images=systems)))
-    save(output / "comparison-receipt.json", result)
+    save(destination if destination is not None else output / "comparison-receipt.json", result)
     return result

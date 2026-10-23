@@ -92,6 +92,14 @@ execution is used; see [GitHub's security guidance](https://docs.github.com/en/a
    numerical executable. Both arms must use the same resource cap, placement,
    model distribution, template and semantic typed settings. Native snapshots,
    real runtime image mappings and root-observed resources are checked.
+   Before any selected 256-token request, every selected performance model/tier
+   runs both sides' eight-token preflight with that performance arm's exact
+   argv, environment and working directory. A candidate functional smoke is
+   reused only when its complete launch matches. Native typed snapshots, owned
+   runtime images, resources and immutable inputs must compare equal for every
+   pair first. Missing declarations or exact root stage authorization refuse
+   before opening the lease. Timed arms retain their existing once-only checks
+   and must still match their successful short preflight; no request is retried.
 5. `python3 -I bench/ci/stage_selection.py --template template.json --manifest
    manifest.json --plan plan.json --policy bench/ci/policy.json --output fresh`
    produces three reviewable local files only. The generator derives the Linux

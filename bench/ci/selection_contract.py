@@ -106,6 +106,7 @@ def linux_stages(config, needs, sides):
                 if data["smoke"].get("observations"):
                     add("candidate-observations-" + model, "test", side, "/usr/bin/cat", data["smoke"]["observations"]["cwd"], False)
             for tier, arm in data.get("benchmarks", {}).items():
+                add(side + "-" + model + "-preflight-" + tier, "server", side, binary, arm["cwd"], True)
                 add(side + "-" + model + "-benchmark-" + tier, "server", side, binary, arm["cwd"], True)
     root = config["sides"]["candidate"]["paths"]["frozen"]
     for case in needs["numerical"]:

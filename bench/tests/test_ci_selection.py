@@ -217,6 +217,7 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
     import json
     from types import SimpleNamespace
     from ci import selected_integration as execution
+    from ci import selected_preflight
     from test_ci_staged_benchmark import Session as Recorder, CONFIG
     value = plan(['engine/ggml/src/ggml-cuda/ssd/mxfp4-compute-adapter.cpp'])
     config = template(value)
@@ -224,12 +225,14 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
                   manifest_sha256='a'*64, paths=config['sides']['candidate']['paths'],
                   control_revision='d'*40, control_manifest_sha256='e'*64, policy=POLICY)
     manifest = tmp_path/'manifest.json'
-    manifest.write_text('{}')
     config['manifest_path'] = str(manifest)
     for side, spec in config['sides'].items():
-        spec['models']['deepseek']['smoke']['argv'] = ['/build/'+side+'/bin/llama-server']
+        spec['models']['deepseek']['smoke'] = dict(CONFIG,
+            model='deepseek', argv=['/build/'+side+'/bin/llama-server'])
         spec['models']['deepseek']['benchmarks']['512'] = dict(CONFIG,
             model='deepseek', argv=['/build/'+side+'/bin/llama-server'])
+    manifest.write_text(json.dumps(dict(stages=contract.linux_stages(config,
+        impact.device_requirements(value, config['device']), ('base', 'candidate')))))
     path = tmp_path/'config.json'
     path.write_text(json.dumps(config))
     sessions = []
@@ -249,12 +252,19 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
         dict(binary=dict(runtime_path='/build/'+side+'/bin/llama-server', sha256='0'*64), toolchain={}, actual_server_version='synthetic', images=[]))
     monkeypatch.setattr(execution, 'selected_numerical', lambda session, cfg, build, cases, output:
         {c: dict(status='passed', synthetic=True) for c in cases})
-    monkeypatch.setattr(execution, 'smoke', lambda *args, **kwargs: dict(status='passed'))
-    def receipt(cfg, mf, side, model, launch, build, folder):
-        return dict(model_identity={'synthetic': True}, server=dict(pid=1 if side=='base' else 2, start_identity=side),
+    monkeypatch.setattr(execution, 'smoke', lambda *args, **kwargs:
+        dict(status='passed', cleanup_confirmed=True, completion_requests=1))
+    monkeypatch.setattr(selected_preflight, 'smoke', execution.smoke)
+    def receipt(cfg, mf, side, model, launch, build, folder, *, destination=None):
+        result = dict(model_identity={'synthetic': True}, server=dict(pid=1 if side=='base' else 2, start_identity=side),
             build=dict(loaded_libraries=[]), host=dict(hardware='synthetic', os='synthetic', memory_budget_bytes=1,
                 os_page_cache_treatment='uncontrolled', effective_settings=dict(native_launch_policy=dict(typed_values={}))))
+        if destination is not None:
+            from ci.contract import save
+            save(destination, result)
+        return result
     monkeypatch.setattr(execution, 'receipt', receipt)
+    monkeypatch.setattr(selected_preflight, 'receipt', receipt)
     args = SimpleNamespace(output=tmp_path/'out', config=path, config_sha256=real_digest(path),
                            selection_plan_sha256=impact.fingerprint(value), job_id='f'*32, socket='/unused')
     assert execution.run(args) == (0 if clean else 1)

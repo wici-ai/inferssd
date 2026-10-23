@@ -5,12 +5,13 @@ from pathlib import Path
 import time
 
 import run_final
-from ci.compare import compare_pair
+from ci.compare import comparable, compare_pair
 from ci.contract import digest, load, save
 from ci.impact import device_requirements
 from ci.private_controller import API, source_manifest
 from ci.selection_lifetime import ParentWatch
 from ci.selected_receipt import receipt
+from ci import selected_preflight
 from ci.selection_contract import protected_binding
 from ci.stage_session import StageSession
 from ci.staged_benchmark import benchmark
@@ -41,6 +42,7 @@ def run(args):
         manifest = load(config["manifest_path"])
         (output / "root-manifest.json").write_bytes(Path(config["manifest_path"]).read_bytes())
         needs = device_requirements(plan, device)
+        pairs = selected_preflight.declarations(config, manifest, needs)
         parent = getattr(args, "selection_parent", "")
         report.update(selection_parent=parent,
                       authorization_path="live-private-parent" if parent else "operator-root-staged")
@@ -79,6 +81,7 @@ def run(args):
         if len(builds) == 2 and builds["base"]["toolchain"] != builds["candidate"]["toolchain"]:
             raise ValueError("actual compiler paths differ between compared arms")
         numeric = selected_numerical(session, config["numerical"], builds["candidate"], needs["numerical"], output / "numerical")
+        functional, cells = {}, {}
         for model in needs["models"]:
             data = config["sides"]["candidate"]["models"][model]
             native = dict(data["smoke"], revision=plan["candidate"])
@@ -87,13 +90,18 @@ def run(args):
             result = smoke(session, native, output / ("native-" + model), stage_id="candidate-smoke-" + model)
             if result["status"] != "passed":
                 raise RuntimeError("selected functional model request failed")
+            functional[model] = dict(launch=native, output=output / ("native-" + model), result=result)
             observation = native.get("observations")
             if observation:
                 argv = native["argv"]
                 if argv.count("--ssd-telemetry") != 1 or argv[argv.index("--ssd-telemetry") + 1] != observation["path"]:
                     raise ValueError("observations do not bind actual native telemetry")
                 observe(session, observation, model, output / ("observations-" + model))
-            cell = dict(model=model, functional="passed", numerical={case: numeric[case] for case in needs["numerical"]}, performance=[])
+            cells[model] = dict(model=model, functional="passed", numerical={case: numeric[case] for case in needs["numerical"]}, performance=[])
+        preflight = selected_preflight.run(session, config, manifest, pairs, builds, functional, output)
+        report["performance_preflight_sha256"] = digest(output / "performance-preflight.json")
+        for model in needs["models"]:
+            cell = cells[model]
             for tier in needs["performance"].get(model, {}).get("tiers", []):
                 measurements, receipts = {}, {}
                 for side in ("base", "candidate"):
@@ -107,6 +115,8 @@ def run(args):
                         raise RuntimeError("selected single benchmark arm failed; no retry")
                     measurements[side] = run_final.read_result(folder / "result.json", tier, spec["request_timeout_s"])
                     receipts[side] = receipt(config, manifest, side, model, launch, builds[side], folder)
+                    if comparable(receipts[side]) != comparable(preflight[model, tier, side]):
+                        raise ValueError("timed runtime differs from its successful short preflight")
                 compared = compare_pair(measurements["base"], measurements["candidate"], receipts["base"], receipts["candidate"], config["policy"])
                 save(output / model / tier / "comparison.json", compared)
                 cell["performance"].append(dict(tier=tier, **compared))

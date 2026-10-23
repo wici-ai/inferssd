@@ -3,11 +3,12 @@
 from pathlib import Path, PurePosixPath
 
 import run_final
-from ci.compare import compare_pair
+from ci.compare import comparable, compare_pair
 from ci.contract import digest, load
 from ci.impact import CASES, MARKERS, fingerprint, validate
 from ci.selection_contract import bound
 from ci.staged_numerical import validate_csv
+from ci.selected_preflight import retained
 
 
 def sealed(root, report):
@@ -49,6 +50,9 @@ def device_report(root, plan, policy, job, child):
             or report.get("control_manifest_sha256") != job["control_manifest_sha256"]
             or child.get("conclusion") != "success" or child.get("run_attempt") != 1):
         raise ValueError("selected result/source/controller/cleanup identity is not a clean single attempt")
+    if digest(root / "performance-preflight.json") != report.get("performance_preflight_sha256"):
+        raise ValueError("selected preflight gate missing or changed")
+    preflight = retained(root, config, needs)
     gate = load(root / "numerical/selected-numerical.json")
     if set(gate) != set(needs["numerical"]):
         raise ValueError("selected numerical cases missing or unexpected")
@@ -92,6 +96,8 @@ def device_report(root, plan, policy, job, child):
                 spec = config["sides"][side]["models"][model]["benchmarks"][tier]
                 data[side] = run_final.read_result(folder / "result.json", tier, spec["request_timeout_s"])
                 receipts[side] = load(folder / "comparison-receipt.json")
+                if comparable(receipts[side]) != comparable(preflight[model, tier, side]):
+                    raise ValueError("timed runtime differs from retained short preflight")
                 if arm["result"] != data[side]:
                     raise ValueError("measurement summary differs from complete raw SSE evidence")
             compared = compare_pair(data["base"], data["candidate"], receipts["base"], receipts["candidate"], policy)
