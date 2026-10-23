@@ -2,6 +2,7 @@
 #include "llama.h"
 #include "llama-ssd.h"
 #include "llama-model.h" // Private fixture only: scoped enum fault injection, no payload mutation.
+#include "llama-context.h" // Private fixture only: discard cached graph before fault injection.
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "inferssd/prompt-cache.h"
@@ -125,7 +126,7 @@ int main(int argc, char ** argv) {
         cp.swa_full = true; cp.kv_unified = false; cp.samplers = nullptr; cp.n_samplers = 0;
         using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
         context_ptr ctx(llama_init_from_model(model.get(), cp), llama_free); require(bool(ctx), "context create failed");
-        require(llama_moe_prefill_phase_workspace_sized_ex(ctx.get(), 0, 0, 0), "decode phase start failed");
+        require(llama_ssd_prefill_phase(ctx.get(), false, 0, 0), "decode phase start failed");
         batch_lifetime storage; auto & batch = storage.value; require(batch.token, "batch allocation failed");
         auto memory = llama_get_memory(ctx.get()); require(memory, "KV memory missing");
         llama_memory_clear(memory, true); set_batch(batch, {3}, 0);
@@ -147,8 +148,16 @@ int main(int argc, char ** argv) {
         set_batch(batch, {3, 4}, 0);
         require(llama_decode(ctx.get(), batch) == 0, "exception retained prefix failed");
         (void)logits(ctx.get(), vocab);
-        require(llama_memory_seq_pos_min(memory, 0) == 0 && llama_memory_seq_pos_max(memory, 0) == 1,
+        // DSV4 reports its current compressed-state boundary for both queries.
+        require(llama_memory_seq_pos_min(memory, 0) == 1 && llama_memory_seq_pos_max(memory, 0) == 1,
             "exception setup did not retain exactly the successful prefix");
+        // Decode phase uses physical one-token ubatches. Reserve before changing
+        // the enum so the public decode rebuilds only after applying its memory context.
+        require(ctx->get_cparams().n_ubatch == 1, "decode fixture requires physical one-token ubatches");
+        ctx->discard_failed_graph();
+        ctx->sched_reserve();
+        require(ctx->get_cparams().n_ubatch == 1 && llama_memory_seq_pos_min(memory, 0) == 1 &&
+            llama_memory_seq_pos_max(memory, 0) == 1, "pre-fault reserve changed the retained prefix or physical ubatch");
         auto * up = const_cast<ggml_tensor *>(model->get_tensor("blk.0.ffn_up_exps.weight"));
         require(up && up->type == GGML_TYPE_MXFP4, "exception fixture requires the frozen DeepSeek MXFP4 experts");
         set_batch(batch, {5}, 2); // Exact batch and position are retried after restoring the enum.
@@ -158,12 +167,12 @@ int main(int argc, char ** argv) {
                 ~enum_restore() { tensor->type = type; }
             } restore{up, up->type};
             up->type = GGML_TYPE_F16; // Unsupported CPU sink layout; payload/storage remain untouched.
-            std::fprintf(stderr, "HOST_EXCEPTION_BEGIN enum_only=1 retained_pos_min=0 retained_pos_max=1\n");
+            std::fprintf(stderr, "HOST_EXCEPTION_BEGIN enum_only=1 retained_pos_min=1 retained_pos_max=1\n");
             std::fflush(stderr);
             const int code = llama_decode(ctx.get(), batch);
             std::fprintf(stderr, "HOST_EXCEPTION_END code=%d\n", code); std::fflush(stderr);
             require(code == -3, "unsupported layout exception did not return -3 across the public C API");
-            require(llama_memory_seq_pos_min(memory, 0) == 0 && llama_memory_seq_pos_max(memory, 0) == 1,
+            require(llama_memory_seq_pos_min(memory, 0) == 1 && llama_memory_seq_pos_max(memory, 0) == 1,
                 "exception rollback lost the previous successful prefix or retained the failed position");
         }
         require(up->type == GGML_TYPE_MXFP4, "exception enum was not restored");
@@ -172,7 +181,7 @@ int main(int argc, char ** argv) {
         require(exception_actual.size() == exception_expected.size() &&
             !std::memcmp(exception_actual.data(), exception_expected.data(), exception_actual.size() * sizeof(float)),
             "exception retry differs from clean same-context prefix/suffix reference");
-        require(llama_memory_seq_pos_min(memory, 0) == 0 && llama_memory_seq_pos_max(memory, 0) == 2,
+        require(llama_memory_seq_pos_min(memory, 0) == 2 && llama_memory_seq_pos_max(memory, 0) == 2,
             "exception retry did not commit the restored suffix");
         std::printf("HOST_CONTEXT_EXCEPTION_PASS internal_enum_injection=1 public_decode=1 returned_minus3=1 prefix_retained=1 same_ctx=1 same_batch=1 same_position=1 bitwise=1\n");
         std::fflush(stdout);

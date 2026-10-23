@@ -585,7 +585,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         # Requires an explicit tiny GGUF/alias and the admitted 8GiB/noSwap scope;
         # deliberately not an asset-free CTest entry.
         add_executable(test-server-prompt-cache-native test-server-prompt-cache-native.cpp)
-        target_include_directories(test-server-prompt-cache-native PRIVATE ../src ../tools/server)
+        target_include_directories(test-server-prompt-cache-native PRIVATE ../src ../tools/server ../ggml/src)
         target_link_libraries(test-server-prompt-cache-native PRIVATE server-context ggml-cpu)
         target_compile_features(test-server-prompt-cache-native PRIVATE cxx_std_17)
     endif()
