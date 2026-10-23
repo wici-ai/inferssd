@@ -86,8 +86,8 @@ it is separate from the Linux CPU-sink placement model. Index generation happens
 on every Darwin dry run. Alias and summary publication are two ordered file
 replacements, so a failure after the first can leave the new alias with the old
 summary. The retained `Starting ...` diagnostic describes the prepared argv;
-this command always stops before execution. No automatic hardware collector or
-online Mac controller is supplied.
+`--dry-run` always stops before execution. The explicit execution mode below
+uses live facts instead; an online Mac placement controller is not supplied.
 
 For numeric launcher inputs, the new interface accepts unsigned decimal data
 within the existing per-key bounds and at most `9223372036854775807`. Linux
@@ -348,11 +348,86 @@ event stream during object collection; that test cleanup cannot mutate a returne
 transcript. Tests separately preserve the original open event stream and internal
 borrowed-reference behavior.
 
+## Explicit owned server execution
+
+`ssdash launch --execute` resolves the same Linux or Darwin launch inputs with
+lazy live host facts, then starts one supervised server. It requires an explicit
+policy, an unused execution directory and a loopback port:
+
+```sh
+MEMORY_MAX=17179869184 ssdash launch --execute --platform linux --repo /path/to/ssdash \
+  --model-conf /path/to/profile.conf --settings /path/to/settings.env \
+  --runtime-policy /path/to/runtime-policy.json --output-dir /path/to/run/instance-001 \
+  --port 8080 -- --seed 17
+```
+
+A policy has exactly these fields; values below illustrate the format, not a
+recommended budget for any model or machine:
+
+```json
+{
+  "platform": "linux",
+  "lock_path": "/path/to/device.lock",
+  "stop_path": "/path/to/STOP",
+  "memory_budget_bytes": 17179869184,
+  "host_reserve_bytes": 3221225472,
+  "minimum_memlock_bytes": 0,
+  "max_compressor_growth_bytes": 0,
+  "max_swap_growth_bytes": 0,
+  "runtime_seconds": 3600,
+  "cleanup_seconds": 30
+}
+```
+
+Linux requires a functioning systemd scope with cgroup v2, the declared exact
+byte `MEMORY_MAX`, zero swap, readable ancestor OOM counters and memory peak.
+The worker checks the actual envelope and the server's inherited scope and
+memlock limit. Set any required memlock limit before invoking the command;
+`minimum_memlock_bytes: 0` is appropriate only when the chosen configuration
+needs no pinned-memory minimum. This command never raises system limits.
+
+Darwin uses `platform: "darwin"` and the existing `--profile`, `--model` and
+Mac environment inputs. Its budget is a **sampled soft server RSS threshold**,
+with host free-plus-inactive memory, compressor and swap growth checks. It is
+not a cgroup or a hard unified-memory cap. Both platforms monitor while the
+server runs, and fail the execution if a threshold or the worker fails. Host
+utility calls have a ten-second timeout. These checks do not replace per-host
+validation or prove a model will fit.
+
+Execution claims `.ssdash-owner` atomically before opening logs. A directory
+may already exist, but an existing execution claim or execution artifact is
+never overwritten, including after successful completion. A cooperating device
+lock is acquired before writing the launch specification. The guardian, worker
+and server receive the same locked file description; only owned groups and the
+fresh exact Linux scope may be cleaned up. A disconnected controller, STOP or
+signal requests cleanup. If cleanup is unknown, the guardian retains the lock
+and writes quarantine evidence; a timeout never authorizes killing that guardian.
+An unrelated listener on the health port is never killed.
+
+`runtime.json` records the actual server argv and scope, `memory-samples.jsonl`
+records resource samples, and `ownership.json` records final status and cleanup.
+Keep these artifacts private if arguments or paths contain private information.
+Server loader variables are carried in the process environment and restored
+only for the server, not serialized into the launch specification or applied to
+the Python lock owner. A successful cleanup does not turn a failed server or
+resource check into a successful exit. `--result` and `--host-facts` are dry-run
+options and are rejected by execution mode.
+
+The Python `ssdash.engine.runtime.Runtime` requires explicit `LaunchInput`,
+`Policy`, host and output ports. `Runtime.controller(...)` supplies the real
+Machine, owned Engine, HTTP and observation ports to the typed Linux Controller.
+Its factory is opt-in; it does not replace the old production command. Darwin
+currently supports static launch only and explicitly rejects that adaptive
+factory. Importing these modules starts no process, host probe or network call.
+The actual native entry still needs a per-host harmless lifecycle check before
+model execution; the package's synthetic tests alone do not certify a host.
+
 ## Remaining integration boundaries
 
 The old adaptive production entry points have not been switched or deleted.
-Live probe/bootstrap execution, Python launch resolution, connecting the controller
-to a real online server and process ownership remain separate work. The fourteen-key engine settings registry,
+Live probe/bootstrap and switching the old production controller remain separate
+work. The opt-in Runtime below connects the typed Linux Controller to the owned
+server implementation. The fourteen-key engine settings registry,
 versioned `settings.ssd`, versioned engine JSONL telemetry and removal of temporary
 legacy log readers are also pending. This package does not complete C3 by itself.
 
@@ -360,7 +435,8 @@ Mac automatic framework planning and the common CPU executor/cache belong to the
 later **Mac M2 migration stage**; “M2” here names a migration stage, not an Apple
 chip requirement. Running these offline Python commands on macOS does not imply
 that Mac probes, unified-memory budgeting or the shared executor are integrated.
-Existing Mac launch/engine paths remain separate from this package.
+The package can explicitly launch a static Darwin server; this does not supply
+Mac automatic placement or reuse Linux CPU-sink settings on Darwin.
 
 ## Development checks
 
