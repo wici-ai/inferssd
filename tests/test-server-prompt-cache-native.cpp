@@ -190,6 +190,12 @@ int main(int argc, char ** argv) {
         (void)logits(ctx.get(), vocab);
         llama_memory_clear(memory, true);
         require(llama_memory_seq_pos_max(memory, 0) < 0, "post-exception KV clear failed");
+        // KV clear preserves the cached one-token graph. Reserve before applying
+        // pressure so the refused public decode must take real graph admission.
+        ctx->discard_failed_graph();
+        ctx->sched_reserve();
+        require(ctx->get_cparams().n_ubatch == 1 && llama_memory_seq_pos_max(memory, 0) < 0,
+            "pre-pressure reserve changed the empty KV or physical ubatch");
         // Exercise real opaque ticket commit and cancellation before saturation.
         {
             auto ticket = take(ctx.get(), 65536, true); pages allocation(ctx.get(), 65536); allocation.touch();
