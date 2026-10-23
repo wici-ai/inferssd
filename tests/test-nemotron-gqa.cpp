@@ -10,6 +10,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 static constexpr int embd = 64, head_dim = 16, kv_heads = 2, vocab = 32;

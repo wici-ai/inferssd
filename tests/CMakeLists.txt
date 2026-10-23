@@ -484,8 +484,14 @@ if (GGML_CUDA)
 endif()
 
 # build test-tokenizer-0 target once and add many tests
-llama_build_and_test(test-vocab-loading.cpp)
-target_include_directories(test-vocab-loading PRIVATE ../src)
+# These helpers are internal symbols, not DLL exports. Compile their real
+# implementations into the test instead of depending on shared-library exports.
+add_executable(test-vocab-loading test-vocab-loading.cpp
+    ../src/llama-impl.cpp ../src/unicode.cpp ../src/unicode-data.cpp)
+target_include_directories(test-vocab-loading PRIVATE ../src ../include)
+target_compile_features(test-vocab-loading PRIVATE cxx_std_17)
+target_link_libraries(test-vocab-loading PRIVATE ggml)
+llama_test(test-vocab-loading)
 llama_build_and_test(test-nemotron-gqa.cpp)
 set_tests_properties(test-nemotron-gqa PROPERTIES TIMEOUT 60)
 
