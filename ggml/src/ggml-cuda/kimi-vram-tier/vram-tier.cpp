@@ -9,6 +9,7 @@
 #include "../../ggml-ssd/testing/tier.h"
 #include "../../ggml-ssd/settings/settings.h"
 #include "../../ggml-ssd/telemetry/telemetry.h"
+#include "../../ggml-ssd/host/arbiter.h"
 #include <cuda_runtime_api.h>
 #include <dlfcn.h>
 #include <algorithm>
@@ -41,6 +42,7 @@ extern "C" const vram_group_compute_api * kimi_vram_group_compute_get_api() __at
 
 namespace {
 void cuda_check(cudaError_t rc){if(rc!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(rc));}
+struct host_budget_refused : std::runtime_error { using std::runtime_error::runtime_error; };
 using tier_options = ssd::gpu::testing::tier_options;
 // ggml's own device-memory query (MemAvailable on a unified-memory GPU) and its run-time reserve. Looked up
 // at run time like the OOM reclaimer: lifecycle tests link this file without the CUDA backend, and may replace
@@ -58,6 +60,7 @@ using clock_type=std::chrono::steady_clock;
 double micros(clock_type::time_point t){return std::chrono::duration<double,std::micro>(clock_type::now()-t).count();}
 struct tier {
     const tier_options configuration;
+    ssd::host::context_client * host_client = nullptr; // borrowed from L3 through sink lifetime
     static constexpr size_t elastic_block_slots=16;
     static constexpr uint64_t automatic_budget=UINT64_MAX; // GGML_KIMI_CPU_SINK_VRAM_BYTES=auto
     using reclaimer_callback=int (*)(void *,size_t,size_t *);
@@ -218,7 +221,7 @@ struct tier {
     bool (*deferred_hook)(void *)=nullptr;void * deferred_hook_arg=nullptr; // tests: runs before each copy, false fails it
     std::string failure;
 
-    explicit tier(uint64_t b, const tier_options & options = {}) : configuration(options),
+    explicit tier(uint64_t b, const tier_options & options = {}, ssd::host::context_client * host = nullptr) : configuration(options), host_client(host),
         budget(b), safety_bytes(options.safety_mib << 20), async_upload(options.async_upload),
         memory_trace(options.memory_trace), keep_across_requests(options.keep_across_requests), timing(options.timing),
         elastic_requested(options.elastic), elastic_demand_reclaim(options.demand_reclaim || b == automatic_budget),
@@ -592,7 +595,7 @@ struct tier {
                 reason,(unsigned long long)malloc_calls,count);return false;
         }
         char * data=nullptr;const size_t bytes=count*stride;
-        cuda_check(cudaSetDevice(device));const cudaError_t rc=cudaMalloc(reinterpret_cast<void **>(&data),bytes);
+        cuda_check(cudaSetDevice(device));const cudaError_t rc=allocate_dram(&data,bytes);
         if(rc!=cudaSuccess){(void)cudaGetLastError();std::fprintf(stderr,"[kimi_vram_elastic] event=grow status=oom reason=%s slots=%zu bytes=%zu\n",reason,count,bytes);return false;}
         const size_t first=slot_locations.size();
         blocks.push_back({data,first,count});
@@ -600,6 +603,34 @@ struct tier {
         capacity_bytes+=bytes;
         if(table && table->slots.size()<slot_locations.size())table->resize_global(slot_locations.size());
         return true;
+    }
+    ssd::host::allocation_ticket take_unified(size_t bytes) {
+        if (!unified || !host_client) { return {}; } // explicit legacy fixtures have no L3 services
+        auto state = host_client->state();
+        if (!state || !state.value.configured || !state.value.unified) {
+            throw std::runtime_error("unified tier has no configured shared DRAM budget");
+        }
+        auto reservation = host_client->take(0, bytes, {}, false, ssd::host::allocation_class::tracked);
+        if (!reservation) {
+            if (reservation.code == ssd::status::resource) { throw host_budget_refused(reservation.error); }
+            throw std::runtime_error(reservation.error);
+        }
+        return std::move(reservation.value);
+    }
+    // Allocation and physical first touch stay inside the pending reservation.
+    // Only fresh storage is cleared; valid residents and uploads are untouched.
+    cudaError_t allocate_dram(char ** output, size_t bytes) {
+        ssd::host::allocation_ticket ticket;
+        try { ticket = take_unified(bytes); }
+        catch (const host_budget_refused &) { return cudaErrorMemoryAllocation; } // optional cache growth stops safely
+        cudaError_t rc = cudaMalloc(reinterpret_cast<void **>(output), bytes);
+        if (rc == cudaSuccess && unified && host_client) {
+            rc = cudaMemset(*output, 0, bytes);
+            if (rc == cudaSuccess) { rc = cudaDeviceSynchronize(); }
+            if (rc != cudaSuccess) { (void) cudaFree(*output); *output = nullptr; }
+        }
+        if (rc == cudaSuccess) { ticket.commit(); }
+        return rc;
     }
     bool free_last_block(const char * reason,bool reactive){
         if(blocks.empty())return false;
@@ -795,7 +826,7 @@ struct tier {
         if(prefill_transient_arena || !stride || !slots)return;
         const size_t bytes=stride*slots;
         cuda_check(cudaSetDevice(device));
-        const cudaError_t rc=cudaMalloc(reinterpret_cast<void **>(&prefill_transient_arena),bytes);
+        const cudaError_t rc=allocate_dram(&prefill_transient_arena,bytes);
         if(rc==cudaSuccess){
             prefill_transient_bytes=bytes;
             std::fprintf(stderr,"[kimi_vram_prefill_scratch] status=ready bytes=%zu slots=%zu ram_min_routes=%zu ssd_min_routes=%zu displacement_slots=0\n",
@@ -852,8 +883,14 @@ struct tier {
             const size_t safety=watermark_low_mib*size_t(1024*1024);
             while(free_bytes+freed<need+safety && free_last_block("prefill_engine",false))mem_info(&free_bytes,&total);
         }
+        const size_t pass_known=size_t(rows)*(4*size_t(latent)*sizeof(float)+32*(sizeof(int32_t)+sizeof(float)));
+        // The pass buffers have an exact host+device price. The historical
+        // fixed 64 MiB is an estimate; opaque GEMM/driver workspace beyond this
+        // remains covered by the process margin, not a claimed exact quote.
+        auto ticket=take_unified(pass_known+(held?0:fixed));
         char error[512]={};
         if(group_api->reserve(group,rows,rows*16,error,sizeof(error)))throw std::runtime_error(error[0]?error:"grouped prefill engine reserve failed");
+        ticket.commit();
         group_rows=rows;
         kimi_vram_prefill_lane l={};lane(l);
         std::fprintf(stderr,"[kimi_vram_prefill_engine] format=%s/%s engine=batched in_place=%d route_bytes=%llu token_bytes=%llu "
@@ -884,9 +921,11 @@ struct tier {
             while(free_bytes<bytes+safety && free_last_block("prefill_accumulator",false))
                 mem_info(&free_bytes,&total);
         }
+        auto ticket=take_unified(bytes);
         char error[512]={};
         if(!mxfp4_batch_api->begin_accumulate(mxfp4_batch,ntokens,error,sizeof(error)))
             throw std::runtime_error(error[0]?error:"MXFP4 accumulator reserve failed");
+        ticket.commit();
         mxfp4_reserved_accumulator_bytes=bytes;
         kimi_vram_prefill_lane l={};lane(l);
         std::fprintf(stderr,"[kimi_vram_prefill_engine] format=mxfp4/mxfp4 engine=mxfp4 in_place=0 route_bytes=%llu token_bytes=0 "
@@ -1120,9 +1159,12 @@ struct tier {
         batch_input.reserve(size_t(prefill_ntokens)*prefill_input_stride);
         token_indices.reserve(size_t(prefill_ntokens));
         route_weights.reserve(size_t(prefill_ntokens));
+        const size_t accumulator_bytes=size_t(prefill_ntokens)*size_t(latent)*sizeof(float);
+        auto accumulator_ticket=take_unified(accumulator_bytes>mxfp4_reserved_accumulator_bytes?accumulator_bytes:0);
         char error[512]={};
         if(!mxfp4_batch_api->begin_accumulate(mxfp4_batch,prefill_ntokens,error,sizeof(error)))
             throw std::runtime_error(error[0]?error:"MXFP4 accumulation begin failed");
+        accumulator_ticket.commit(); // begin_accumulate clears and synchronizes its new pages
         // The first cold layer creates the batch component after the preflight
         // hook. Its successful allocation is reusable by subsequent layers.
         mxfp4_reserved_accumulator_bytes=std::max(mxfp4_reserved_accumulator_bytes,
@@ -1324,9 +1366,13 @@ struct tier {
         for(const auto & list:per){group_routes.insert(group_routes.end(),list.begin(),list.end());group_first.push_back(int32_t(group_routes.size()));}
         // a pass larger than announced (no reserve_accumulate before it): the engine grows here, without making room
         if(int(group_tokens.size())>group_rows){
+            const size_t pass_known=group_tokens.size()*(4*size_t(latent)*sizeof(float)+32*(sizeof(int32_t)+sizeof(float)));
+            const size_t fixed=group_api->device_bytes(group)?0:size_t(64)<<20;
+            auto ticket=take_unified(pass_known+fixed);
             char error[512]={};
             if(group_api->reserve(group,int(group_tokens.size()),int(group_tokens.size())*16,error,sizeof(error)))
                 throw std::runtime_error(error[0]?error:"grouped prefill engine reserve failed");
+            ticket.commit();
             group_rows=int(group_tokens.size());
         }
         float * rows=group_api->input_rows(group);
@@ -1814,7 +1860,7 @@ struct tier {
         memory_sample("before_allocate");
         const auto allocate_start=memory_trace?clock_type::now():clock_type::time_point{};
         if(elastic_active)allocate_base();
-        else{capacity_bytes=count*stride;cuda_check(cudaMalloc(reinterpret_cast<void **>(&arena),capacity_bytes));}
+        else{const size_t bytes=count*stride;cuda_check(allocate_dram(&arena,bytes));capacity_bytes=bytes;}
         if(memory_trace)memory_sample("after_allocate",micros(allocate_start));
         probe_upload();register_seed();
         arena_epoch=epoch;table->next_token();adopt_next_decode=!active;
@@ -1965,7 +2011,7 @@ struct tier {
         cuda_check(cudaSetDevice(device));
         const size_t bytes=stride*host_scratch_slots;
         auto attempt=[&]{
-            if(cudaMalloc(reinterpret_cast<void **>(&host_scratch),bytes)==cudaSuccess)return true;
+            if(allocate_dram(&host_scratch,bytes)==cudaSuccess)return true;
             (void)cudaGetLastError();host_scratch=nullptr;return false;
         };
         bool ok=attempt();
@@ -2533,8 +2579,8 @@ uint64_t policy_host_bytes(void * p){
     auto * t=static_cast<tier *>(p);if(!t)return 0;
     std::lock_guard<std::mutex> lock(t->lifecycle_mutex);
     // on unified memory the batched engine's page-locked staging comes out of the same DRAM as its device buffers
-    return t->unified?t->capacity_bytes+t->prefill_transient_bytes+
-        (t->group?t->group_api->device_bytes(t->group)+t->group_api->host_bytes(t->group):0):0;}
+    return t->unified?t->capacity_bytes+t->prefill_transient_bytes+t->mxfp4_reserved_accumulator_bytes+
+        (t->host_scratch?t->stride*t->host_scratch_slots:0)+(t->group?t->group_api->device_bytes(t->group)+t->group_api->host_bytes(t->group):0):0;}
 int policy_reclaim_host(void * p,uint64_t bytes){
     auto * t=static_cast<tier *>(p);if(!t)return 1;
     try{return t->reclaim_host(size_t(std::min<uint64_t>(bytes,SIZE_MAX)),bytes?"host_reserve":"floor")?0:1;}catch(const std::exception & x){
@@ -2555,6 +2601,7 @@ void * create_configured_tier(const ssd::settings::snapshot * input, const ssd::
         char * error, size_t size) noexcept {
     try {
         if (!input) { throw std::runtime_error("missing typed GPU tier settings"); }
+        if (!services || !services->host) { throw std::runtime_error("missing process host budget client"); }
         const auto settings = *input;
         const auto * budget = settings.vram_budget();
         const auto * margin = settings.integer("vram.margin_mib");
@@ -2583,7 +2630,7 @@ void * create_configured_tier(const ssd::settings::snapshot * input, const ssd::
             options.memory_trace = debug.ledger;
             options.timing = debug.profile;
         }
-        return new tier(bytes, options);
+        return new tier(bytes, options, services->host);
     } catch (const std::exception & e) {
         if (error && size) { std::snprintf(error, size, "%s", e.what()); }
         return nullptr;

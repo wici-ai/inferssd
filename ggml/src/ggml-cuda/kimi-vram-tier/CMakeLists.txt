@@ -33,6 +33,6 @@ target_compile_features(kimi-vram-tier PRIVATE cxx_std_17)
 set_target_properties(kimi-vram-tier PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
 target_compile_options(kimi-vram-tier PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math;-ffp-contract=off>)
-target_link_libraries(kimi-vram-tier PRIVATE ggml-cpu ggml-base CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+target_link_libraries(kimi-vram-tier PRIVATE ggml-cpu ggml-base ggml-ssd-host CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
 set_target_properties(kimi-vram-tier PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")

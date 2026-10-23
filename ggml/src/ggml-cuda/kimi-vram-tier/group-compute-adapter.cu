@@ -212,6 +212,8 @@ struct group_engine {
         norm = reinterpret_cast<float *>(take(aligned(size_t(latent) * sizeof(float))));
         up_operand = take(aligned(up_operand_bytes));
         down_operand = take(aligned(down_operand_bytes));
+        cuda_check(cudaMemsetAsync(scratch, 0, scratch_bytes, stream), "grouped scratch prefault");
+        cuda_check(cudaStreamSynchronize(stream), "grouped scratch prefault drain");
     }
 
     void free_fixed() noexcept {
@@ -279,6 +281,13 @@ struct group_engine {
             cuda_check(cudaMallocHost(reinterpret_cast<void **>(&host_output), row_bytes), "cudaMallocHost grouped output");
             cuda_check(cudaMallocHost(reinterpret_cast<void **>(&host_rows), size_t(n) * sizeof(int32_t)), "cudaMallocHost grouped routes");
             cuda_check(cudaMallocHost(reinterpret_cast<void **>(&host_weights), size_t(n) * sizeof(float)), "cudaMallocHost grouped weights");
+            cuda_check(cudaMemsetAsync(input, 0, row_bytes, stream), "grouped input prefault");
+            cuda_check(cudaMemsetAsync(accumulator, 0, row_bytes, stream), "grouped accumulator prefault");
+            cuda_check(cudaMemsetAsync(route_rows, 0, size_t(n) * sizeof(int32_t), stream), "grouped routes prefault");
+            cuda_check(cudaMemsetAsync(route_weights, 0, size_t(n) * sizeof(float), stream), "grouped weights prefault");
+            std::memset(host_input, 0, row_bytes); std::memset(host_output, 0, row_bytes);
+            std::memset(host_rows, 0, size_t(n) * sizeof(int32_t)); std::memset(host_weights, 0, size_t(n) * sizeof(float));
+            cuda_check(cudaStreamSynchronize(stream), "grouped pass prefault drain");
         } catch (...) {
             free_pass();
             throw;
