@@ -259,7 +259,10 @@ def read_header(path: Path) -> Header:
                     Tensor(name, shape, type_id, offset, _tensor_size(name, shape, type_id))
                 )
             data_offset = (reader.offset + alignment - 1) // alignment * alignment
-            if data_offset > reader.length:
+            # Native GGUF permits metadata-only shards to end immediately
+            # after their header. Seeking to their logical aligned data start
+            # can pass EOF, but there is no tensor range or payload to read.
+            if tensors and data_offset > reader.length:
                 raise ValueError("GGUF data region starts beyond the source file")
             checked = []
             expected_offset = 0

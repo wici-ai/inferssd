@@ -132,6 +132,34 @@ def test_native_ordered_layout_rejects_nonzero_start_overlap_unaligned_and_gap(t
         m.read_header(path)
 
 
+def test_metadata_only_shard_without_data_alignment_padding_is_native_valid(tmp_path):
+    a, b = (tmp_path / f"model-{i:05d}-of-00002.gguf" for i in (1, 2))
+    raw, data = fixture(
+        a,
+        tensors=[],
+        kv=[("split.no", 2, 0), ("split.count", 2, 2), ("split.tensors.count", 5, 1)],
+        payload=0,
+    )
+    assert len(raw) < data
+    a.write_bytes(raw)  # No data and no tail padding, as in the real Muse first shard.
+    header = m.read_header(a)
+    assert header.tensors == () and header.data_offset == data > a.stat().st_size
+    fixture(b, kv=[("split.no", 2, 1)])
+    rows, summary = m.build_rows([a, b], {"up"}, 256)
+    assert len(rows) == 256 and all(row["shard_index"] == 1 for row in rows)
+    assert summary["model_shards"] == 2 and summary["expert_tensors"] == 1
+
+
+def test_nonempty_shard_without_payload_is_still_rejected(tmp_path):
+    path = tmp_path / "bad.gguf"
+    raw, _ = fixture(path, tensors=[("dense", (32,), 0, 0)], payload=0)
+    with pytest.raises(ValueError, match="payload range exceeds source file"):
+        m.read_header(path)
+    path.write_bytes(raw)  # Missing alignment padding is not admitted for tensors.
+    with pytest.raises(ValueError, match="data region starts beyond the source file"):
+        m.read_header(path)
+
+
 def test_reader_stops_before_payload_and_validates_discarded_strings(tmp_path, monkeypatch):
     path = tmp_path / "model.gguf"
     raw, data = fixture(
