@@ -1,6 +1,6 @@
-#include "catalog.h"
+#include "legacy-runtime/catalog.h"
 #include "mock-provider.h"
-#include "store.h"
+#include "legacy-runtime/store.h"
 
 #include <atomic>
 #include <cstring>

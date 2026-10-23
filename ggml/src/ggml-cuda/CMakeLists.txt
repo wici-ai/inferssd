@@ -2,9 +2,6 @@ cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 
 find_package(CUDAToolkit)
 
-option(GGML_CUDA_MOE_STREAM "Compile the opt-in CUDA MoE streaming path" ON)
-option(GGML_CUDA_LIGHTNING_INDEXER "Compile the CUDA lightning indexer op" ON)
-
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
 
@@ -105,22 +102,6 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
-    # This optional component has its own strict rounding flags and ABI. It is
-    # loaded explicitly by the CPU sink and must not enter the normal backend.
-    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/kimi-q3k-parity.cu"
-        "${CMAKE_CURRENT_SOURCE_DIR}/kimi-q3k-chain.cu")
-    if (GGML_CUDA_KIMI_VRAM_TIER)
-        if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT GGML_CPU)
-            message(FATAL_ERROR "Kimi VRAM tier requires Linux and the CPU backend")
-        endif()
-        add_subdirectory(kimi-vram-tier)
-    endif()
-    list(APPEND GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/moe_stream_decode_batch.cu")
-    list(REMOVE_DUPLICATES GGML_SOURCES_CUDA)
-    if (NOT GGML_CUDA_LIGHTNING_INDEXER)
-        list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/lightning-indexer.cu")
-        add_compile_definitions(GGML_CUDA_NO_LIGHTNING_INDEXER)
-    endif()
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
@@ -147,35 +128,19 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
-    if (LLAMA_SSD_STORE)
-        target_link_libraries(ggml-cuda PRIVATE ggml-ssd-c0-store)
-        target_compile_definitions(ggml-cuda PRIVATE GGML_SSD_STORE)
-        set_property(TARGET ggml-cuda APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
+    if (GGML_CUDA_KIMI_VRAM_TIER)
+        if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            message(FATAL_ERROR "SSD CUDA executor requires Linux")
+        endif()
+        target_sources(ggml-cuda PRIVATE ssd/staging.cpp ssd/group-matmul.cu)
+        target_link_libraries(ggml-cuda PRIVATE ggml-ssd-object-io)
+        add_subdirectory(ssd)
     endif()
 
     add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
 
     if (GGML_CUDA_GRAPHS)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
-    endif()
-
-    option(GGML_CUDA_MOE_STREAM_BATCH "enable CUDA MoE stream batch path" OFF)
-    if (LLAMA_SSD_STORE AND (NOT GGML_CUDA_MOE_STREAM OR NOT GGML_CUDA_MOE_STREAM_BATCH))
-        message(FATAL_ERROR "LLAMA_SSD_STORE requires -DGGML_CUDA_MOE_STREAM=ON and -DGGML_CUDA_MOE_STREAM_BATCH=ON for CUDA builds; no portable fallback is selected")
-    endif()
-    if (GGML_CUDA_MOE_STREAM)
-        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_MOE_STREAM)
-        if (GGML_CUDA_MOE_STREAM_BATCH)
-            target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_MOE_STREAM_BATCH)
-        endif()
-        if (UNIX AND NOT APPLE)
-            find_library(GGML_CUDA_LIBURING uring)
-            if (GGML_CUDA_LIBURING)
-                target_link_libraries(ggml-cuda PRIVATE ${GGML_CUDA_LIBURING})
-            else()
-                target_compile_definitions(ggml-cuda PRIVATE GGML_MOE_DISABLE_LIBURING)
-            endif()
-        endif()
     endif()
 
     if (GGML_CUDA_FORCE_MMQ)

@@ -11,7 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bundle_native
 import native_core
-from ssdash.platform import guardian, lease, process
+from inferssd.platform import guardian, lease, process
 
 
 def test_installed_identity_matches_installed_core():

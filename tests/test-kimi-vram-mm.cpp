@@ -1,4 +1,4 @@
-// The CUDA backend's grouped-expert matrix products (ggml_cuda_moe_stream_mm_*, ggml/src/ggml-cuda/moe_stream_mm.cu)
+// The CUDA backend's grouped-expert matrix products (ggml_cuda_moe_stream_mm_*, ggml/src/ggml-cuda/ssd/group-matmul.cu)
 // against ggml's CPU MUL_MAT on the same data. Every weight type the decode engine serves
 // (ggml_cuda_moe_stream_mmvq_supports, which must be the products' set) at 1, 7, 26, 129, 150 and 300 activation
 // columns, gathered from scattered rows of a wider matrix by device row ids, and once without ids: NMSE <= 5e-4, or

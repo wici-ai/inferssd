@@ -861,7 +861,7 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
     }
 }
 
-#ifdef GGML_CUDA_MOE_STREAM
+#ifdef GGML_SSD_CUDA_EXECUTOR
 // Native floating weights for the streaming/tier bridge. Reuse ggml's MMVF
 // kernel with F32 accumulation and F32 input; weights are never requantized.
 extern "C" bool ggml_cuda_moe_stream_mmvf_dev(

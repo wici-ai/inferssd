@@ -420,7 +420,8 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     return size;
 }
 
-static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
+static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc,
+        enum ggml_backend_buffer_usage usage, size_t host_prefault_page_size) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
         return NULL;
@@ -434,6 +435,25 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
             return NULL;
         }
         ggml_backend_buffer_set_usage(buf->chunks[n], usage);
+        // This chunk is freshly owned and has no initialized tensor contents.
+        // Charge every host page while its caller still holds admission room;
+        // touching a reused buffer later could corrupt inputs or weights.
+        if (host_prefault_page_size && usage == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                ggml_backend_buffer_is_host(buf->chunks[n]) &&
+                ggml_backend_buffer_get_usage(buf->chunks[n]) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            const size_t size = ggml_backend_buffer_get_size(buf->chunks[n]);
+            volatile unsigned char * base = (volatile unsigned char *)ggml_backend_buffer_get_base(buf->chunks[n]);
+            if (size && base == NULL) {
+                ggml_vbuffer_free(buf);
+                return NULL;
+            }
+            for (size_t offset = 0; offset < size;) {
+                base[offset] = 0;
+                if (size - offset <= host_prefault_page_size) { break; }
+                offset += host_prefault_page_size;
+            }
+            if (size) { base[size - 1] = 0; }
+        }
     }
     return buf;
 }
@@ -479,6 +499,8 @@ struct node_alloc {
 };
 
 struct ggml_gallocr {
+    size_t host_prefault_page_size;
+    bool auto_reserve;
     ggml_backend_buffer_type_t * bufts; // [n_buffers]
     struct vbuffer ** buffers; // [n_buffers]
     struct ggml_dyn_tallocr ** buf_tallocs; // [n_buffers]
@@ -525,6 +547,7 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
             galloc->buf_tallocs[i] = ggml_dyn_tallocr_new(alignment, max_size);
         }
     }
+    galloc->auto_reserve = true;
     galloc->n_buffers = n_bufs;
 
     return galloc;
@@ -532,6 +555,12 @@ ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs
 
 ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
+}
+
+void ggml_gallocr_set_host_prefault(ggml_gallocr_t galloc, size_t page_size) {
+    GGML_ASSERT(galloc != NULL);
+    GGML_ASSERT(page_size == 0 || (page_size >= 4096 && page_size <= 65536 && (page_size & (page_size - 1)) == 0));
+    galloc->host_prefault_page_size = page_size;
 }
 
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
@@ -935,7 +964,8 @@ static bool ggml_gallocr_reserve_n_impl(
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
-                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i],
+                        GGML_BACKEND_BUFFER_USAGE_COMPUTE, galloc->host_prefault_page_size);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
@@ -1050,6 +1080,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
     if (ggml_gallocr_needs_realloc(galloc, graph)) {
+        if (!galloc->auto_reserve) { return false; }
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: reallocating buffers automatically\n", __func__);
@@ -1094,6 +1125,11 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     }
 
     return true;
+}
+
+void ggml_gallocr_set_auto_reserve(ggml_gallocr_t galloc, bool enabled) {
+    GGML_ASSERT(galloc);
+    galloc->auto_reserve = enabled;
 }
 
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {

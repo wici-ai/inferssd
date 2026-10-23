@@ -2,7 +2,7 @@
 // for the prefill: GET_ROWS of a file-mapped weight (token embeddings) and a custom op gathering rows of one by an I32
 // index (DeepSeek-V4.1's Engram tables), each row at page + row bytes - 1, a table at most its own pages; weights that
 // are not file-mapped, other indices and other operands are not counted.
-#include "llama-host-gather.h"
+#include "../src/ssd/host-gather.h"
 
 #include <cstdio>
 #include <set>

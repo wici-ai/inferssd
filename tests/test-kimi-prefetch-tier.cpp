@@ -6,7 +6,7 @@
 #define main original_sink_test_main
 #include "test-kimi-cpu-sink.cpp"
 #undef main
-#include "kimi-vram-tier-api.h"
+#include "ggml-ssd/gpu/kimi-vram-tier-api.h"
 #include <set>
 
 namespace {
@@ -39,6 +39,19 @@ extern "C" const kimi_vram_tier_api * kimi_vram_tier_get_api() {
         tier_prepare, tier_launch, tier_admit, tier_finish, tier_cancel };
     return &api;
 }
+extern "C" const kimi_vram_format_api * kimi_vram_format_get_api() {
+    static const kimi_vram_format_api api = { 1, sizeof(kimi_vram_format_api),
+        [](void *, const kimi_vram_request *, int count, const kimi_vram_expert_format *, int * slots, char *, size_t) {
+            std::fill(slots, slots + count, -1); return 0;
+        },
+        [](void *, const void *, size_t, const kimi_vram_activation *, char *, size_t) { return 0; } };
+    return &api;
+}
+extern "C" const ssd::gpu::testing::api * ggml_ssd_tier_testing_get_api() {
+    static const ssd::gpu::testing::api api = { 1, sizeof(ssd::gpu::testing::api),
+        [](uint64_t, const ssd::gpu::testing::tier_options *, char *, size_t) noexcept -> void * { return &tier_context; } };
+    return &api;
+}
 extern "C" const kimi_vram_residency_api * kimi_vram_residency_get_api() {
     static const kimi_vram_residency_api api = { 2, sizeof(kimi_vram_residency_api), tier_no_lease,
         tier_no_lease_check, tier_no_lease_check, tier_held };
@@ -51,17 +64,22 @@ extern "C" const kimi_vram_residency_api * kimi_vram_residency_get_api() {
 // selects 5, 6, 7 and 12. The read of 5 is not one it needs (vram_late, never activated); 6 was skipped and is lost
 // (skip_vram_lost), read on demand like 7. The read of 5 has finished by then (the test waits), so the RAM cache
 // publishes it and the run takes 5 from there, and no read ran past the window (no spill).
-int main() { try {
+int main(int argc, char ** argv) {
+    fixture_inputs inputs; try {
+    int threads = 4;
+    if (argc == 3 && !std::strcmp(argv[1], "--threads")) { threads = std::stoi(argv[2]); }
+    else { require(argc == 1, "usage: test-kimi-prefetch-tier [--threads N]"); }
+    inputs.set("split_cv", "1");
     test_resources::finite_cgroup();
-    for (const auto & kv : { std::pair<const char *, const char *>{ "GGML_KIMI_CPU_SINK_READY_FIRST", "1" },
-            { "GGML_KIMI_CPU_SINK_EXPERT_JOB", "0" }, { "GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "1" },
-            { "GGML_KIMI_CPU_SINK_ROLE_MAJOR", "1" }, { "GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", "1" },
-            { "GGML_KIMI_CPU_SINK_CACHE_POLICY", "lru" }, { "GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", "uniform" },
-            { "GGML_KIMI_CPU_SINK_READ_FIXED", "0" }, { "GGML_KIMI_CPU_SINK_PROFILE", "0" },
-            { "GGML_KIMI_CPU_SINK_PREFETCH", "2" }, { "GGML_KIMI_CPU_SINK_VRAM_BYTES", "1" },
-            { "GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE", "0" }, { "GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", "0" },
-            { "GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD", "0" }, { "GGML_KIMI_CPU_SINK_VRAM_PREFILL", "0" } }) {
-        require(setenv(kv.first, kv.second, 1) == 0, "set prefetch tier test environment");
+    for (const auto & kv : { std::pair<const char *, const char *>{ "ready_first", "1" },
+            { "early_up_gate", "1" },
+            { "role_major", "1" }, { "nonblocking_down_sched", "1" },
+            { "cache_policy", "lru" }, { "cache_allocation", "uniform" },
+            { "read_fixed", "0" }, { "profile", "0" },
+            { "prefetch_depth", "2" }, { "vram_budget", "1" },
+            { "vram_exclusive", "0" }, { "vram_async", "0" },
+            { "vram_deferred", "0" }, { "vram_prefill", "0" } }) {
+        require(inputs.set(kv.first, kv.second) == 0, "set prefetch tier test environment");
     }
     ggml_cpu_init();
     fixture f; make_synthetic(f);
@@ -70,20 +88,20 @@ int main() { try {
     for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int(i % 19) - 9) * .021f; }
     stderr_capture log;
     {
-        auto sink = make_sink(f, 4, 2);
+        auto sink = make_sink(inputs, f, threads, 2);
         configure_cache(sink.get(), 12 * unit, { 1, 2 }, 6);
         begin_cache(sink.get(), 1, 1);
-        cache_case("tier_warm_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
-        cache_case("tier_warm_layer2", f, sink.get(), 2, input, { 10, 11, 12, 13, 14, 15 },
+        cache_case(inputs, "tier_warm_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+        cache_case(inputs, "tier_warm_layer2", f, sink.get(), 2, input, { 10, 11, 12, 13, 14, 15 },
             { .1f, .1f, .2f, .2f, .2f, .2f }, 0, 6);
         begin_cache(sink.get(), 1, 2);
         tier_holds = { { 2, 6 } };
         const int32_t hint[] = { 5, 6, 7, 12 };
         kimi_cpu_sink_prefetch_hint(sink.get(), 2, hint, 4);
-        cache_case("tier_hinted_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
+        cache_case(inputs, "tier_hinted_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(200)); // the read of 5 completes
         tier_holds = { { 2, 5 } };
-        cache_case("tier_predicted_layer2", f, sink.get(), 2, input, { 5, 6, 7, 12 }, { .2f, .2f, .2f, .4f }, 2, -1);
+        cache_case(inputs, "tier_predicted_layer2", f, sink.get(), 2, input, { 5, 6, 7, 12 }, { .2f, .2f, .2f, .4f }, 2, -1);
     }
     std::istringstream lines(log.read());
     std::string line, report;

@@ -1,6 +1,6 @@
 #pragma once
-// Shared catalog for the CPU sink and CUDA transport. Entry storage
-// is frozen after initialization. CUDA alone mutates its existing mmap fields.
+// Per-index owned parser records. Production publishes only a context-owned
+// immutable source_index; no singleton or backend registration lives here.
 #include <cstdint>
 #include <cstdio>
 #include <vector>
@@ -60,18 +60,4 @@ struct parser_state {
     }
 };
 
-// The one instance is defined in a shared library, never as an inline singleton.
-// Providers may populate it only inside their registered initializer. Once
-// published, vectors and file descriptors must remain stable until shutdown.
-parser_state & shared_catalog();
-struct provider {
-    void (*initialize)();
-    const expert_pack_entry * (*lookup)(const char *, int, size_t);
-};
-bool register_provider(const provider * value);
-bool unregister_provider(const provider * value);
-bool initialize_shared_catalog();
-// Does not initialize. Diagnostics must not inspect vectors until publication.
-// A retired provider makes the catalog unavailable even while its fds live.
-bool catalog_available();
 } // namespace c0

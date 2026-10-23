@@ -704,70 +704,80 @@ llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool 
     return std::make_unique<llama_kv_cache_context>(this, lctx, do_shift, std::move(sc_info));
 }
 
-llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
-    llama_kv_cache::slot_info_vec_t res;
-
-    struct state_t {
-        slot_info sinfo; // slot info for the ubatch
-
-        std::vector<uint32_t> v_heads_old; // old positions of the heads, before placing the ubatch
-
-        std::vector<llama_kv_cells> v_cells; // copy of the old cells, before placing the ubatch
-    };
-
-    // remember the old state of the cells so we can restore it in the end
-    std::vector<state_t> states;
-
-    bool success = true;
-
-    for (const auto & ubatch : ubatches) {
-        // only find a suitable slot for the ubatch. don't modify the cells yet
-        const auto sinfo_new = find_slot(ubatch, false);
-        if (sinfo_new.empty()) {
-            success = false;
-            break;
-        }
-
-        // remember the position that we found
-        res.push_back(sinfo_new);
-
-        // store the old state of the cells in the recovery stack
-        {
-            state_t state = { sinfo_new, v_heads, {} };
-
-            for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
-                auto & cells = v_cells[sinfo_new.strm[s]];
-
-                state.v_cells.push_back(cells.cp(sinfo_new.idxs[s]));
+std::unique_ptr<llama_kv_cache::metadata_undo> llama_kv_cache::save_ubatch_metadata(const slot_info & sinfo) const {
+    auto saved = std::make_unique<metadata_undo>();
+    saved->heads = v_heads;
+    std::vector<std::vector<uint32_t>> indices(n_stream);
+    llama_pos purged_max[LLAMA_MAX_SEQ];
+    std::fill(std::begin(purged_max), std::end(purged_max), -1);
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const auto stream = sinfo.strm[s];
+        auto & selected = indices[stream];
+        const auto & cells = v_cells[stream];
+        selected.insert(selected.end(), sinfo.idxs[s].begin(), sinfo.idxs[s].end());
+        for (const auto index : sinfo.idxs[s]) {
+            if (!cells.is_empty(index)) {
+                const auto seq_id = cells.seq_get(index);
+                purged_max[seq_id] = std::max(purged_max[seq_id], cells.pos_get(index));
             }
-
-            states.push_back(std::move(state));
         }
-
-        // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
     }
+    for (llama_seq_id seq = 0; seq < LLAMA_MAX_SEQ; ++seq) {
+        if (purged_max[seq] >= 0) {
+            const auto stream = seq_to_stream[seq];
+            v_cells[stream].append_sequence_indices(seq, purged_max[seq], indices[stream]);
+        }
+    }
+    saved->streams.reserve(n_stream);
+    for (uint32_t stream = 0; stream < n_stream; ++stream) {
+        if (!indices[stream].empty()) {
+            saved->streams.emplace_back(stream, v_cells[stream].save_metadata(std::move(indices[stream])));
+        }
+    }
+    return saved;
+}
 
+bool llama_kv_cache::restore_ubatch_metadata(metadata_undo & saved) noexcept {
+    if (saved.heads.size() != v_heads.size()) { return false; }
+    for (const auto & stream : saved.streams) {
+        if (stream.first >= v_cells.size()) { return false; }
+    }
+    bool restored = true;
+    for (auto & stream : saved.streams) {
+        restored = v_cells[stream.first].restore_metadata(stream.second) && restored;
+    }
+    std::copy(saved.heads.begin(), saved.heads.end(), v_heads.begin());
+    return restored;
+}
+
+llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_ubatch> & ubatches) {
+    slot_info_vec_t res;
+    std::vector<std::unique_ptr<metadata_undo>> states;
+    states.reserve(ubatches.size());
+    res.reserve(ubatches.size());
+    const auto restore = [&]() noexcept {
+        bool restored = true;
+        for (auto it = states.rbegin(); it != states.rend(); ++it) {
+            restored = restore_ubatch_metadata(**it) && restored;
+        }
+        GGML_ASSERT(restored && "KV metadata planning rollback failed");
+    };
+    bool success = true;
+    try {
+        for (const auto & ubatch : ubatches) {
+            const auto sinfo = find_slot(ubatch, false);
+            if (sinfo.empty()) { success = false; break; }
+            res.push_back(sinfo);
+            states.push_back(save_ubatch_metadata(sinfo));
+            apply_ubatch(sinfo, ubatch);
+        }
+    } catch (...) {
+        restore();
+        throw;
+    }
     GGML_ASSERT(!states.empty() || !success);
-
-    // iterate backwards and restore the cells to their original state
-    for (auto it = states.rbegin(); it != states.rend(); ++it) {
-        const auto & sinfo = it->sinfo;
-
-        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            auto & cells = v_cells[sinfo.strm[s]];
-            auto & head  = v_heads[sinfo.strm[s]];
-
-            cells.set(sinfo.idxs[s], it->v_cells[s]);
-            head = it->v_heads_old[s];
-        }
-    }
-
-    if (!success) {
-        return {};
-    }
-
-    return res;
+    restore();
+    return success ? std::move(res) : slot_info_vec_t{};
 }
 
 bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info) {
@@ -1967,86 +1977,6 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     state_write_range(io, seq_id, flags, std::numeric_limits<llama_pos>::min(), std::numeric_limits<llama_pos>::max());
 }
 
-bool llama_kv_cache::seq_has_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
-    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-
-    if (p1 < p0) {
-        return true;
-    }
-
-    const auto & cells = v_cells[seq_to_stream[seq_id]];
-
-    std::vector<bool> seen(p1 - p0 + 1, false);
-    size_t n_seen = 0;
-
-    for (uint32_t i = 0; i < cells.size(); ++i) {
-        if (cells.is_empty(i) || !cells.seq_has(i, seq_id)) {
-            continue;
-        }
-        const llama_pos pos = cells.pos_get(i);
-        if (pos >= p0 && pos <= p1 && !seen[pos - p0]) {
-            seen[pos - p0] = true;
-            ++n_seen;
-        }
-    }
-
-    return n_seen == seen.size();
-}
-
-void llama_kv_cache::state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) const {
-    GGML_UNUSED(flags);
-
-    io.write(&n_stream, sizeof(n_stream));
-
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        cell_ranges_t cr { s, {} };
-
-        uint32_t cell_count = 0;
-
-        const auto & cells = v_cells[s];
-
-        // Count the number of cells with the specified seq_id
-        // Find all the ranges of cells with this seq id (or all, when -1)
-        uint32_t cell_range_begin = cells.size();
-
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.is_empty(i) && (seq_id == -1 || cells.seq_has(i, seq_id)) &&
-                    cells.pos_get(i) >= p0 && cells.pos_get(i) <= p1) {
-                ++cell_count;
-                if (cell_range_begin == cells.size()) {
-                    cell_range_begin = i;
-                }
-            } else {
-                if (cell_range_begin != cells.size()) {
-                    cr.data.emplace_back(cell_range_begin, i);
-                    cell_range_begin = cells.size();
-                }
-            }
-        }
-
-        if (cell_range_begin != cells.size()) {
-            cr.data.emplace_back(cell_range_begin, cells.size());
-        }
-
-        // DEBUG CHECK: Sum of cell counts in ranges should equal the total cell count
-        uint32_t cell_count_check = 0;
-        for (const auto & range : cr.data) {
-            cell_count_check += range.second - range.first;
-        }
-        GGML_ASSERT(cell_count == cell_count_check);
-
-        io.write(&cell_count, sizeof(cell_count));
-
-        // skip empty streams
-        if (cell_count == 0) {
-            continue;
-        }
-
-        state_write_meta(io, cr, seq_id);
-        state_write_data(io, cr);
-    }
-}
-
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     GGML_UNUSED(flags);
 
@@ -2582,6 +2512,21 @@ bool llama_kv_cache_context::next() {
 
     return true;
 }
+
+bool llama_kv_cache_context::save_precompute() {
+    if (ubatches.empty()) { return false; }
+    precompute_undo = kv->save_ubatch_metadata(sinfos[i_cur]);
+    return true;
+}
+
+bool llama_kv_cache_context::restore_precompute() noexcept {
+    if (!precompute_undo) { return true; }
+    const bool restored = kv->restore_ubatch_metadata(*precompute_undo);
+    precompute_undo.reset();
+    return restored;
+}
+
+void llama_kv_cache_context::discard_precompute() noexcept { precompute_undo.reset(); }
 
 bool llama_kv_cache_context::apply() {
     assert(!llama_memory_status_is_fail(status));

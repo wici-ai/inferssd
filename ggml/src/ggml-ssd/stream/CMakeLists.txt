@@ -1,0 +1,5 @@
+add_library(ggml-ssd-stream STATIC runtime.cpp runtime.h)
+target_compile_features(ggml-ssd-stream PUBLIC cxx_std_17)
+target_include_directories(ggml-ssd-stream PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_link_libraries(ggml-ssd-stream PUBLIC ggml-base ggml-ssd-settings)
+set_target_properties(ggml-ssd-stream PROPERTIES POSITION_INDEPENDENT_CODE ON)

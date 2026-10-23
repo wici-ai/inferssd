@@ -206,6 +206,14 @@ public:
 
     // find places for the provided ubatches in the cache, returns the slot infos
     // return empty vector on failure
+    struct metadata_undo {
+        std::vector<uint32_t> heads;
+        std::vector<std::pair<uint32_t, llama_kv_cells::metadata_undo>> streams;
+    };
+    // Captures written cells AND old cells purged by SWA overwrite. No tensor data.
+    std::unique_ptr<metadata_undo> save_ubatch_metadata(const slot_info & sinfo) const;
+    [[nodiscard]] bool restore_ubatch_metadata(metadata_undo & saved) noexcept;
+
     slot_info_vec_t prepare(const std::vector<llama_ubatch> & ubatches);
 
     bool update(llama_context * lctx, bool do_shift, const stream_copy_info & sc_info);
@@ -382,6 +390,9 @@ public:
 
     bool next()  override;
     bool apply() override;
+    bool save_precompute() override;
+    bool restore_precompute() noexcept override;
+    void discard_precompute() noexcept override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -434,6 +445,7 @@ private:
     llama_memory_status status;
 
     llama_kv_cache * kv;
+    std::unique_ptr<llama_kv_cache::metadata_undo> precompute_undo;
     llama_context * lctx;
 
     //

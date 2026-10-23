@@ -68,8 +68,8 @@ check base "the engine's granularity" -v -e "^ENV GGML_KIMI_CPU_PREFILL_GRAPH_GR
 check base "no widened alias reads without the graph route" -v -e "^ENV GGML_MOE_IO_ALIGNED_ALIAS_BATCH"
 check base "the GGUF's ranges indexed into EXPERT_INDEX" -x "ENV GGML_MOE_EXPERT_GGUF_ALIAS_TSV=$T/home/.cache/ssd-llama/experts/Some-Q4_K-00001-of-00002/experts.tsv"
 check base "the scope is named after the conf" -e "^SCOPE --unit=testmodel-"
-run owned-scope LAUNCH_SCOPE=ssdash-arm-test.scope
-check owned-scope "the benchmark controls its own scope" -x "SCOPE --unit=ssdash-arm-test.scope"
+run owned-scope LAUNCH_SCOPE=inferssd-arm-test.scope
+check owned-scope "the benchmark controls its own scope" -x "SCOPE --unit=inferssd-arm-test.scope"
 stops invalid-scope "scope names cannot inject options or patterns" "Invalid LAUNCH_SCOPE" LAUNCH_SCOPE='*.scope'
 # the index is made once and kept while it is newer than the model's files
 run again

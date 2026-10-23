@@ -1,10 +1,11 @@
+#include "ssd/explicit-fixture-inputs.h"
 // CPU-only grouped prefill correctness and real-pack transport benchmark.
 // The reference is an independent one-token ggml CPU graph, never the executor.
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
-#include "kimi-cpu-sink.h"
-#include "kimi-cpu-prefill.h"
+#include "ssd/cpu-sink.h"
+#include "ssd/cpu-prefill.h"
 #include <set>
 #include <limits>
 #include <algorithm>
@@ -194,11 +195,11 @@ struct executor {
     static bool resolve(void * user, const char * name, int32_t id, kimi_cpu_sink_source * out) {
         return fixture::resolve(static_cast<executor *>(user)->active, name, id, out);
     }
-    executor(fixture & f, int threads, int depth) : active(&f), sink(nullptr, kimi_cpu_sink_destroy),
+    executor(fixture_inputs & inputs, fixture & f, int threads, int depth) : active(&f), sink(nullptr, kimi_cpu_sink_destroy),
             prefill(nullptr, kimi_cpu_prefill_destroy) {
         test_resources::cpu_threads(threads - 1, 1);
         char error[512] = {};
-        sink.reset(kimi_cpu_sink_create(threads, depth, resolve, this, error, sizeof(error)));
+        sink.reset(inputs.create(threads, depth, resolve, this, error, sizeof(error)));
         require(bool(sink), std::string("sink create: ") + error);
         prefill.reset(kimi_cpu_prefill_create(sink.get(), error, sizeof(error)));
         require(bool(prefill), std::string("prefill create: ") + error);
@@ -314,9 +315,9 @@ static void add_stats(kimi_cpu_sink_stats & sum, const kimi_cpu_sink_stats & s) 
     sum.cache_new_slot_bytes += s.cache_new_slot_bytes;
 }
 
-static void check_transport(const kimi_cpu_sink_stats & s, bool succeeded, bool grouped,
+static void check_transport(fixture_inputs & inputs, const kimi_cpu_sink_stats & s, bool succeeded, bool grouped,
         bool allow_grouped_hits = false) {
-    const char * mode = std::getenv("GGML_KIMI_CPU_SINK_READ_FIXED");
+    const char * mode = inputs.get("read_fixed");
     const bool fixed = mode && !std::strcmp(mode, "1");
     require(s.cache_fill_read_requests + s.ring_read_requests == s.read_requests &&
             s.cache_fill_read_bytes + s.ring_read_bytes == s.read_bytes,
@@ -350,7 +351,7 @@ static kimi_cpu_sink_cache_stats cache_snapshot(kimi_cpu_sink * sink, bool relea
     return s;
 }
 
-static sample_result run_checked(const std::string & name, fixture & f, executor & e, int layer, const batch & b,
+static sample_result run_checked(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, int layer, const batch & b,
         const std::vector<float> & expected, bool grouped = true, float linear_beta = 25,
         uint64_t expected_hits = 0, uint64_t expected_admitted = 0, bool bit_exact = true) {
     tensors meta(f, layer);
@@ -379,7 +380,7 @@ static sample_result run_checked(const std::string & name, fixture & f, executor
     require(guarded.front() == -12345.25f && guarded.back() == -12345.25f, name + ": output canary overwritten");
     const auto counts = count_routes(f, layer, b, grouped);
     const auto & s = r.stats.stream;
-    check_transport(s, true, grouped, expected_hits != 0);
+    check_transport(inputs, s, true, grouped, expected_hits != 0);
     cache_snapshot(e.sink.get(), grouped && expected_hits == 0);
     require(expected_hits <= counts.experts, "invalid expected decode hit count");
     const uint64_t triplet = counts.experts ? counts.bytes / counts.experts : 0;
@@ -432,17 +433,17 @@ static void print_sample(const std::string & name, const batch & b, const sample
     std::fflush(stdout);
 }
 
-static void compare_case(const std::string & name, fixture & f, executor & e, int layer, const batch & b, float linear_beta = 25) {
+static void compare_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, int layer, const batch & b, float linear_beta = 25) {
     const auto expected = reference_batch(f, layer, b, linear_beta);
-    print_sample(name, b, run_checked(name, f, e, layer, b, expected, true, linear_beta));
+    print_sample(name, b, run_checked(inputs, name, f, e, layer, b, expected, true, linear_beta));
 }
 
-static void compare_large_case(const std::string & name, fixture & f, executor & e, int layer, const batch & b) {
+static void compare_large_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, int layer, const batch & b) {
     const auto expected = reference_batch(f, layer, b, 25);
-    print_sample(name, b, run_checked(name, f, e, layer, b, expected, true, 25, 0, 0, false));
+    print_sample(name, b, run_checked(inputs, name, f, e, layer, b, expected, true, 25, 0, 0, false));
 }
 
-static kimi_cpu_prefill_stats fail_case(const std::string & name, fixture & f, executor & e, batch b,
+static kimi_cpu_prefill_stats fail_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, batch b,
         int tokens_override = -1, int slots_override = -1, bool short_read = false, int metadata_fault = 0,
         bool allow_prefill_hits = false) {
     tensors meta(f, 1);
@@ -455,7 +456,7 @@ static kimi_cpu_prefill_stats fail_case(const std::string & name, fixture & f, e
         b.ids.data(), b.weights.data(), slots_override < 0 ? b.slots : slots_override,
         tokens_override < 0 ? b.tokens : tokens_override, 4, 25, output.data() + 1, &stats, error, sizeof(error));
     require(!ok && error[0] && stats.stream.fallback_count == 0, name + ": did not fail closed");
-    check_transport(stats.stream, false, true, allow_prefill_hits);
+    check_transport(inputs, stats.stream, false, true, allow_prefill_hits);
     cache_snapshot(e.sink.get(), true);
     require(output.front() == -77 && output.back() == -77, name + ": failed run overwrote output guard");
     if (short_read) { require(stats.stream.read_errors > 0, "short read not counted"); }
@@ -465,66 +466,66 @@ static kimi_cpu_prefill_stats fail_case(const std::string & name, fixture & f, e
     return stats;
 }
 
-static void synthetic_tests(int threads, int depth) {
+static void synthetic_tests(fixture_inputs & inputs, int threads, int depth) {
     fixture small; make_synthetic(small);
-    executor e(small, threads, depth);
+    executor e(inputs, small, threads, depth);
     for (int nt : { 1, 2, 25, 64 }) {
         auto b = synthetic_batch(small, nt, nt == 64 ? 16 : 8);
         if (nt == 64) {
             for (int t = 0; t < nt; ++t) { b.ids[size_t(t) * b.slots] = b.ids[size_t(t) * b.slots + 2] = 3; }
         }
-        compare_case("ub" + std::to_string(nt) + "_holes_duplicate_zero", small, e, 1, b);
+        compare_case(inputs, "ub" + std::to_string(nt) + "_holes_duplicate_zero", small, e, 1, b);
     }
-    compare_large_case("ub65_bounded_accumulator", small, e, 1, synthetic_batch(small, 65, 16));
+    compare_large_case(inputs, "ub65_bounded_accumulator", small, e, 1, synthetic_batch(small, 65, 16));
     auto full = synthetic_batch(small, 2, 16);
-    compare_case("full16_slots", small, e, 2, full);
+    compare_case(inputs, "full16_slots", small, e, 2, full);
     auto empty = synthetic_batch(small, 64);
     std::fill(empty.ids.begin(), empty.ids.end(), -7); std::fill(empty.weights.begin(), empty.weights.end(), 0);
-    compare_case("all_empty_ub64", small, e, 2, empty);
-    compare_case("no_slots_ub25", small, e, 1, synthetic_batch(small, 25, 0));
+    compare_case(inputs, "all_empty_ub64", small, e, 2, empty);
+    compare_case(inputs, "no_slots_ub25", small, e, 1, synthetic_batch(small, 25, 0));
     auto mixed = synthetic_batch(small, 25);
     std::fill(mixed.ids.begin() + 8, mixed.ids.begin() + 16, -7);
     std::fill(mixed.weights.begin() + 8, mixed.weights.begin() + 16, 0);
-    compare_case("empty_token_inside_batch", small, e, 2, mixed);
-    compare_case("linear_beta_disabled", small, e, 1, synthetic_batch(small, 2), 0);
+    compare_case(inputs, "empty_token_inside_batch", small, e, 2, mixed);
+    compare_case(inputs, "linear_beta_disabled", small, e, 1, synthetic_batch(small, 2), 0);
     for (int i = 0; i < 4; ++i) {
-        compare_case("layer_and_batch_reuse", small, e, i % 2 + 1, synthetic_batch(small, i % 2 ? 25 : 2));
+        compare_case(inputs, "layer_and_batch_reuse", small, e, i % 2 + 1, synthetic_batch(small, i % 2 ? 25 : 2));
     }
     fixture large; large.latent = 512; large.hidden = 256; make_synthetic(large);
     e.active = &large;
-    compare_case("grow_non_square_shape", large, e, 2, synthetic_batch(large, 25));
+    compare_case(inputs, "grow_non_square_shape", large, e, 2, synthetic_batch(large, 25));
     e.active = &small;
-    compare_case("shrink_shape", small, e, 1, synthetic_batch(small, 2));
+    compare_case(inputs, "shrink_shape", small, e, 1, synthetic_batch(small, 2));
     // Exercise decode/grouped reuse of the borrowed ring and pool in both directions.
     auto one = synthetic_batch(small, 1);
     auto expected = reference_batch(small, 1, one);
-    print_sample("decode_after_prefill", one, run_checked("decode_after_prefill", small, e, 1, one, expected, false));
-    compare_case("prefill_after_decode", small, e, 2, synthetic_batch(small, 25));
+    print_sample("decode_after_prefill", one, run_checked(inputs, "decode_after_prefill", small, e, 1, one, expected, false));
+    compare_case(inputs, "prefill_after_decode", small, e, 2, synthetic_batch(small, 25));
 
     auto bad = synthetic_batch(small, 2);
-    bad.ids[0] = small.experts; fail_case("out_of_range_id", small, e, bad);
-    bad = synthetic_batch(small, 2); bad.weights[0] = -1; fail_case("negative_live_weight", small, e, bad);
-    bad.weights[0] = std::numeric_limits<float>::infinity(); fail_case("infinite_live_weight", small, e, bad);
-    bad.weights[0] = std::numeric_limits<float>::quiet_NaN(); fail_case("nan_live_weight", small, e, bad);
-    bad = synthetic_batch(small, 2); bad.x[0] = std::numeric_limits<float>::infinity(); fail_case("nonfinite_input", small, e, bad);
+    bad.ids[0] = small.experts; fail_case(inputs, "out_of_range_id", small, e, bad);
+    bad = synthetic_batch(small, 2); bad.weights[0] = -1; fail_case(inputs, "negative_live_weight", small, e, bad);
+    bad.weights[0] = std::numeric_limits<float>::infinity(); fail_case(inputs, "infinite_live_weight", small, e, bad);
+    bad.weights[0] = std::numeric_limits<float>::quiet_NaN(); fail_case(inputs, "nan_live_weight", small, e, bad);
+    bad = synthetic_batch(small, 2); bad.x[0] = std::numeric_limits<float>::infinity(); fail_case(inputs, "nonfinite_input", small, e, bad);
     bad = synthetic_batch(small, 2);
-    fail_case("zero_tokens", small, e, bad, 0);
-    fail_case("too_many_tokens", small, e, bad, 2049);
-    fail_case("too_many_slots", small, e, bad, -1, 17);
-    fail_case("noncontiguous_up_stride", small, e, bad, -1, -1, false, 1);
-    fail_case("wrong_gate_type", small, e, bad, -1, -1, false, 2);
-    fail_case("wrong_down_shape", small, e, bad, -1, -1, false, 3);
+    fail_case(inputs, "zero_tokens", small, e, bad, 0);
+    fail_case(inputs, "too_many_tokens", small, e, bad, 2049);
+    fail_case(inputs, "too_many_slots", small, e, bad, -1, 17);
+    fail_case(inputs, "noncontiguous_up_stride", small, e, bad, -1, -1, false, 1);
+    fail_case(inputs, "wrong_gate_type", small, e, bad, -1, -1, false, 2);
+    fail_case(inputs, "wrong_down_shape", small, e, bad, -1, -1, false, 3);
     const int direct_fd = small.fd;
     small.fd = open(small.path.c_str(), O_RDONLY | O_CLOEXEC);
     require(small.fd >= 0, "buffered test open failed");
-    fail_case("buffered_fd_rejected", small, e, bad);
+    fail_case(inputs, "buffered_fd_rejected", small, e, bad);
     close(small.fd); small.fd = direct_fd;
-    compare_case("recovery_after_invalid_inputs", small, e, 2, synthetic_batch(small, 2));
+    compare_case(inputs, "recovery_after_invalid_inputs", small, e, 2, synthetic_batch(small, 2));
     for (auto fault : { fixture::missing, fixture::unaligned_offset, fixture::wrong_size, fixture::past_eof }) {
         small.fault = fault;
-        fail_case("resolver_fault_" + std::to_string(fault), small, e, synthetic_batch(small, 25), -1, -1, fault == fixture::past_eof);
+        fail_case(inputs, "resolver_fault_" + std::to_string(fault), small, e, synthetic_batch(small, 25), -1, -1, fault == fixture::past_eof);
         small.fault = fixture::none;
-        compare_case("recovery_after_fault_" + std::to_string(fault), small, e, 2, synthetic_batch(small, 2));
+        compare_case(inputs, "recovery_after_fault_" + std::to_string(fault), small, e, 2, synthetic_batch(small, 2));
     }
     auto late = synthetic_batch(small, 25);
     std::vector<int32_t> first_touch;
@@ -533,11 +534,11 @@ static void synthetic_tests(int threads, int depth) {
     }
     require(first_touch.size() > 2, "late fault fixture lacks valid preceding experts");
     small.fault = fixture::past_eof; small.fault_expert = first_touch.back();
-    fail_case("last_expert_short_read", small, e, late, -1, -1, true);
+    fail_case(inputs, "last_expert_short_read", small, e, late, -1, -1, true);
     small.fault = fixture::none; small.fault_expert = -1;
-    compare_case("recovery_after_last_expert_short_read", small, e, 2, synthetic_batch(small, 25));
-    executor serial(small, 2, 1);
-    compare_case("one_compute_ring1", small, serial, 1, synthetic_batch(small, 25));
+    compare_case(inputs, "recovery_after_last_expert_short_read", small, e, 2, synthetic_batch(small, 25));
+    executor serial(inputs, small, 2, 1);
+    compare_case(inputs, "one_compute_ring1", small, serial, 1, synthetic_batch(small, 25));
     std::printf("SYNTHETIC_CPU_PREFILL_OK\n");
 }
 
@@ -561,11 +562,11 @@ static batch one_token(const fixture & f, const std::vector<int32_t> & ids, cons
     return result;
 }
 
-static sample_result decode_cache_case(const std::string & name, fixture & f, executor & e, int layer,
+static sample_result decode_cache_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, int layer,
         const batch & b, uint64_t hits, uint64_t admitted) {
     require(b.tokens == 1, "cache phase must represent one logical token");
     const auto expected = reference_batch(f, layer, b);
-    auto result = run_checked(name, f, e, layer, b, expected, false, 25, hits, admitted);
+    auto result = run_checked(inputs, name, f, e, layer, b, expected, false, 25, hits, admitted);
     print_sample(name, b, result);
     return result;
 }
@@ -604,16 +605,16 @@ static bool address_sanitizer_build() {
 #endif
 }
 
-static void cache_retention_tests(int threads, int depth) {
-    setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY", "count_decay2", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS", "1", 1);
+static void cache_retention_tests(fixture_inputs & inputs, int threads, int depth) {
+    inputs.set("cache_policy", "count_decay2");
+    inputs.set("cache_keep", "1");
     fixture f; make_synthetic(f);
-    executor retained(f, threads, depth), baseline(f, threads, depth);
+    executor retained(inputs, f, threads, depth), baseline(inputs, f, threads, depth);
     const uint64_t unit = count_routes(f, 1, one_token(f, { 0 }, { 1 }), false).bytes;
     configure_cache(retained, 2 * unit, { 1 }, 2);
     auto selected = one_token(f, { 1, 2 }, { .4f, .6f });
     begin_decode(retained, 1, 1);
-    decode_cache_case("retain_seed", f, retained, 1, selected, 0, 2);
+    decode_cache_case(inputs, "retain_seed", f, retained, 1, selected, 0, 2);
     const auto before = cache_snapshot(retained.sink.get());
     require(before.valid_bytes == 2 * unit, "retention seed did not fill");
     tensors meta(f, 1);
@@ -626,40 +627,40 @@ static void cache_retention_tests(int threads, int depth) {
         require(kimi_cpu_prefill_run(retained.prefill.get(), meta.role[0], meta.role[1], meta.role[2],
             b.x.data(), b.ids.data(), b.weights.data(), b.slots, b.tokens, 4, 25, kept.data(), &c, error, sizeof(error)), error);
         require(!std::memcmp(original.data(), kept.data(), kept.size() * sizeof(float)), "retention changed prefill output bits");
-        check_transport(c.stream, true, true);
+        check_transport(inputs, c.stream, true, true);
         const auto after = cache_snapshot(retained.sink.get());
         require(after.valid_bytes == before.valid_bytes && after.hits == before.hits && after.misses == before.misses &&
             c.stream.read_bytes == a.stream.read_bytes, "prefill borrowed, admitted or released retained weights");
     }
     begin_decode(retained, 1, 1);
     selected.x[0] += .13f;
-    decode_cache_case("retain_changed_input_hits", f, retained, 1, selected, 2, 0);
+    decode_cache_case(inputs, "retain_changed_input_hits", f, retained, 1, selected, 2, 0);
     auto bad = synthetic_batch(f, 2);
-    fail_case("retain_invalid_prefill_releases", f, retained, bad, 0);
+    fail_case(inputs, "retain_invalid_prefill_releases", f, retained, bad, 0);
     begin_decode(retained, 1, 2);
-    decode_cache_case("retain_error_recovery_cold", f, retained, 1, selected, 0, 2);
+    decode_cache_case(inputs, "retain_error_recovery_cold", f, retained, 1, selected, 0, 2);
     f.fault = fixture::past_eof; f.fault_expert = 1;
-    fail_case("retain_short_read_releases", f, retained, one_token(f, { 1 }, { 1 }), -1, -1, true);
+    fail_case(inputs, "retain_short_read_releases", f, retained, one_token(f, { 1 }, { 1 }), -1, -1, true);
     f.fault = fixture::none; f.fault_expert = -1;
     std::printf("CACHE_RETAIN_PREFILL_BIT_EXACT_OK tokens=1,25,64 ring=%d\n", depth);
 }
 
-static void cache_prefill_read_tests(int threads, int depth) {
-    setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY", "count_decay2", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_PREFILL_READ", "1", 1);
+static void cache_prefill_read_tests(fixture_inputs & inputs, int threads, int depth) {
+    inputs.set("cache_policy", "count_decay2");
+    inputs.set("cache_keep", "1");
+    inputs.set("cache_prefill_read", "1");
     fixture f; make_synthetic(f);
-    executor e(f, threads, depth);
+    executor e(inputs, f, threads, depth);
     const uint64_t unit = count_routes(f, 1, one_token(f, { 0 }, { 1 }), false).bytes;
     configure_cache(e, 4 * unit, { 1 }, 4);
     const auto seed = one_token(f, { 1, 2, 3, 4 }, { .1f, .2f, .3f, .4f });
     begin_decode(e, 7, 1);
-    decode_cache_case("prefill_read_seed", f, e, 1, seed, 0, 4);
+    decode_cache_case(inputs, "prefill_read_seed", f, e, 1, seed, 0, 4);
     const auto before = cache_snapshot(e.sink.get());
 
     const auto mixed = one_token(f, { 1, 2, 5, 6 }, { .1f, .2f, .3f, .4f });
     const auto expected = reference_batch(f, 1, mixed);
-    const auto read = run_checked("prefill_read_mixed", f, e, 1, mixed, expected, true, 25, 2, 0);
+    const auto read = run_checked(inputs, "prefill_read_mixed", f, e, 1, mixed, expected, true, 25, 2, 0);
     print_sample("prefill_read_mixed", mixed, read);
     require(read.stats.ram_experts == 2 && read.stats.ram_routes == 2 && read.stats.ram_bytes == 2 * unit &&
             read.stats.ssd_experts == 2 && read.stats.ssd_routes == 2 && read.stats.ssd_bytes == 2 * unit &&
@@ -675,47 +676,47 @@ static void cache_prefill_read_tests(int threads, int depth) {
             "read-only prefill changed decode policy state or source accounting");
 
     begin_decode(e, 7, 2);
-    decode_cache_case("prefill_read_decode_still_hot", f, e, 1,
+    decode_cache_case(inputs, "prefill_read_decode_still_hot", f, e, 1,
         one_token(f, { 1, 2 }, { .4f, .6f }), 2, 0);
 
     f.fault = fixture::past_eof; f.fault_expert = 5;
-    fail_case("prefill_read_error_releases_leases", f, e,
+    fail_case(inputs, "prefill_read_error_releases_leases", f, e,
         one_token(f, { 1, 5 }, { .5f, .5f }), -1, -1, true, 0, true);
     f.fault = fixture::none; f.fault_expert = -1;
     configure_cache(e, 2 * unit, { 1 }, 2);
     begin_decode(e, 8, 1);
-    decode_cache_case("prefill_read_error_recovery", f, e, 1,
+    decode_cache_case(inputs, "prefill_read_error_recovery", f, e, 1,
         one_token(f, { 1, 5 }, { .5f, .5f }), 0, 2);
     std::printf("CACHE_PREFILL_READ_ONLY_OK hits=2 misses=2 lease_error_recovery=1\n");
 }
 
-static void cache_lifecycle_tests(int threads, int depth) {
+static void cache_lifecycle_tests(fixture_inputs & inputs, int threads, int depth) {
     fixture f; f.experts = 32; make_synthetic(f);
-    executor e(f, threads, depth);
+    executor e(inputs, f, threads, depth);
     const uint64_t unit = count_routes(f, 1, one_token(f, { 0 }, { 1 }), false).bytes;
     require(unit == 86016, "fused fixture must include 4096-aligned Q3_K role padding");
     const auto grouped = synthetic_batch(f, 64, 16);
     // Allocate the shared ring, grouped workspace and independent reference
     // first. Later Anonymous deltas must measure release, not workspace growth.
-    compare_case("fused_prefill_workspace_warm", f, e, 1, grouped);
+    compare_case(inputs, "fused_prefill_workspace_warm", f, e, 1, grouped);
     const auto grouped_expected = reference_batch(f, 1, grouped);
     configure_cache(e, 64 * unit, { 1, 2 }, 32);
     std::vector<int32_t> all_ids(32);
     for (int id = 0; id < 32; ++id) { all_ids[id] = id; }
     const auto full = one_token(f, all_ids, std::vector<float>(32, 1.0f / 32));
     begin_decode(e, 1, 1);
-    const auto first = decode_cache_case("fused_decode_fill_layer1", f, e, 1, full, 0, 32);
-    decode_cache_case("fused_decode_fill_layer2", f, e, 2, full, 0, 32);
+    const auto first = decode_cache_case(inputs, "fused_decode_fill_layer1", f, e, 1, full, 0, 32);
+    decode_cache_case(inputs, "fused_decode_fill_layer2", f, e, 2, full, 0, 32);
     begin_decode(e, 1, 2);
-    decode_cache_case("fused_decode_hot_layer1", f, e, 1, full, 32, 0);
-    decode_cache_case("fused_decode_hot_layer2", f, e, 2, full, 32, 0);
+    decode_cache_case(inputs, "fused_decode_hot_layer1", f, e, 1, full, 32, 0);
+    decode_cache_case(inputs, "fused_decode_hot_layer2", f, e, 2, full, 32, 0);
     const auto resident = cache_snapshot(e.sink.get());
     require(resident.valid_bytes == 64 * unit && resident.committed_bytes == 64 * unit,
             "fused physical release fixture did not fill cache");
     const uint64_t before = anonymous_bytes();
     // Deliberately do not call cache_begin(false): the public prefill API must
     // release before validating/allocating its own workspace and before stream.
-    const auto prefill = run_checked("fused_grouped_releases_hot_cache", f, e, 1, grouped, grouped_expected);
+    const auto prefill = run_checked(inputs, "fused_grouped_releases_hot_cache", f, e, 1, grouped, grouped_expected);
     const uint64_t after = anonymous_bytes();
     print_sample("fused_grouped_releases_hot_cache", grouped, prefill);
     require_cache_counters_unchanged(resident, e);
@@ -739,50 +740,50 @@ static void cache_lifecycle_tests(int threads, int depth) {
             (unsigned long long) resident.committed_bytes, (unsigned long long) before, (unsigned long long) after);
     }
     begin_decode(e, 1, 3);
-    decode_cache_case("fused_decode_after_prefill_cold", f, e, 1, full, 0, 32);
+    decode_cache_case(inputs, "fused_decode_after_prefill_cold", f, e, 1, full, 0, 32);
     begin_decode(e, 1, 4);
-    decode_cache_case("fused_decode_after_prefill_hot", f, e, 1, full, 32, 0);
+    decode_cache_case(inputs, "fused_decode_after_prefill_hot", f, e, 1, full, 32, 0);
 
     configure_cache(e, 3 * unit, { 1 }, 3);
     begin_decode(e, 2, 1);
-    decode_cache_case("fused_mixed_seed", f, e, 1, one_token(f, { 1 }, { 1 }), 0, 1);
+    decode_cache_case(inputs, "fused_mixed_seed", f, e, 1, one_token(f, { 1 }, { 1 }), 0, 1);
     begin_decode(e, 2, 2);
-    const auto mixed = decode_cache_case("fused_hit_admit_duplicate_bypass", f, e, 1,
+    const auto mixed = decode_cache_case(inputs, "fused_hit_admit_duplicate_bypass", f, e, 1,
         one_token(f, { 1, 2, 2, 3, 4, 1, 3, 5 }, { .1f, .15f, .05f, .25f, .1f, .2f, .05f, .1f }), 2, 2);
     require(mixed.stats.stream.cache_fill_read_requests == 6 && mixed.stats.stream.ring_read_requests == 12,
             "fused mixed decode did not cover direct cache and ring targets");
-    compare_case("fused_grouped_after_mixed_targets", f, e, 2, synthetic_batch(f, 25));
+    compare_case(inputs, "fused_grouped_after_mixed_targets", f, e, 2, synthetic_batch(f, 25));
 
     const auto four = one_token(f, { 1, 2, 3, 4 }, { .1f, .2f, .3f, .4f });
     configure_cache(e, 4 * unit, { 1 }, 4);
     for (int phase = 0; phase < 3; ++phase) {
         const std::string suffix = std::to_string(phase);
         begin_decode(e, 3 + phase, 1);
-        decode_cache_case("fused_edge_cold_" + suffix, f, e, 1, four, 0, 4);
+        decode_cache_case(inputs, "fused_edge_cold_" + suffix, f, e, 1, four, 0, 4);
         begin_decode(e, 3 + phase, 2);
-        decode_cache_case("fused_edge_hot_" + suffix, f, e, 1, four, 4, 0);
+        decode_cache_case(inputs, "fused_edge_hot_" + suffix, f, e, 1, four, 4, 0);
         auto edge = synthetic_batch(f, phase == 0 ? 64 : phase == 1 ? 25 : 1, phase == 1 ? 0 : 8);
         if (phase == 0) {
             std::fill(edge.ids.begin(), edge.ids.end(), -7);
             std::fill(edge.weights.begin(), edge.weights.end(), 0);
         }
         const auto snapshot = cache_snapshot(e.sink.get());
-        compare_case(phase == 0 ? "fused_empty_union_clears_cache" : phase == 1 ?
+        compare_case(inputs, phase == 0 ? "fused_empty_union_clears_cache" : phase == 1 ?
             "fused_zero_slots_clears_cache" : "fused_one_token_prefill_clears_cache", f, e, 1, edge);
         require_cache_counters_unchanged(snapshot, e);
         begin_decode(e, 3 + phase, 3);
-        decode_cache_case("fused_edge_decode_cold_" + suffix, f, e, 1, four, 0, 4);
+        decode_cache_case(inputs, "fused_edge_decode_cold_" + suffix, f, e, 1, four, 0, 4);
         begin_decode(e, 3 + phase, 4);
-        decode_cache_case("fused_edge_decode_hot_" + suffix, f, e, 1, four, 4, 0);
+        decode_cache_case(inputs, "fused_edge_decode_hot_" + suffix, f, e, 1, four, 4, 0);
     }
 
     for (int role = 0; role < 3; ++role) {
         const std::string suffix = std::to_string(role);
         begin_decode(e, 10 + role, 1);
-        decode_cache_case("fused_short_seed_" + suffix, f, e, 1, four, 0, 4);
+        decode_cache_case(inputs, "fused_short_seed_" + suffix, f, e, 1, four, 0, 4);
         auto bad = synthetic_batch(f, 25);
         f.fault = fixture::short_tail; f.fault_expert = bad.ids[0]; f.fault_role = role;
-        const auto failed = fail_case("fused_prefill_short_role_" + suffix, f, e, bad, -1, -1, true);
+        const auto failed = fail_case(inputs, "fused_prefill_short_role_" + suffix, f, e, bad, -1, -1, true);
         f.fault = fixture::none; f.fault_expert = -1; f.fault_role = -1;
         require(failed.stream.ring_read_bytes >= 4096 && failed.stream.ring_read_requests >= uint64_t(depth > 1 ? 6 : 3),
                 "fused short read did not include a positive CQE and other in-flight roles");
@@ -791,19 +792,19 @@ static void cache_lifecycle_tests(int threads, int depth) {
             // drained error must leave decode usable and allow a new borrower.
             e.prefill.reset();
             begin_decode(e, 20, 1);
-            decode_cache_case("fused_decode_after_prefill_destroy", f, e, 1, four, 0, 4);
+            decode_cache_case(inputs, "fused_decode_after_prefill_destroy", f, e, 1, four, 0, 4);
             char error[512] = {};
             e.prefill.reset(kimi_cpu_prefill_create(e.sink.get(), error, sizeof(error)));
             require(bool(e.prefill), std::string("fused prefill recreate: ") + error);
         }
         auto empty = synthetic_batch(f, 2);
         std::fill(empty.ids.begin(), empty.ids.end(), -1);
-        compare_case("fused_short_then_empty_union_" + suffix, f, e, 1, empty);
+        compare_case(inputs, "fused_short_then_empty_union_" + suffix, f, e, 1, empty);
         begin_decode(e, 30 + role, 1);
-        decode_cache_case("fused_short_decode_cold_" + suffix, f, e, 1, four, 0, 4);
+        decode_cache_case(inputs, "fused_short_decode_cold_" + suffix, f, e, 1, four, 0, 4);
         begin_decode(e, 30 + role, 2);
-        decode_cache_case("fused_short_decode_hot_" + suffix, f, e, 1, four, 4, 0);
-        compare_case("fused_short_grouped_recovery_" + suffix, f, e, 2, synthetic_batch(f, 25));
+        decode_cache_case(inputs, "fused_short_decode_hot_" + suffix, f, e, 1, four, 4, 0);
+        compare_case(inputs, "fused_short_grouped_recovery_" + suffix, f, e, 2, synthetic_batch(f, 25));
     }
 
     auto late = synthetic_batch(f, 25);
@@ -812,23 +813,23 @@ static void cache_lifecycle_tests(int threads, int depth) {
         if (id >= 0 && std::find(first_touch.begin(), first_touch.end(), id) == first_touch.end()) { first_touch.push_back(id); }
     }
     begin_decode(e, 40, 1);
-    decode_cache_case("fused_late_short_seed", f, e, 1, four, 0, 4);
+    decode_cache_case(inputs, "fused_late_short_seed", f, e, 1, four, 0, 4);
     f.fault = fixture::short_tail; f.fault_expert = first_touch.back(); f.fault_role = 2;
-    const auto failed = fail_case("fused_last_expert_short_read", f, e, late, -1, -1, true);
+    const auto failed = fail_case(inputs, "fused_last_expert_short_read", f, e, late, -1, -1, true);
     f.fault = fixture::none; f.fault_expert = -1; f.fault_role = -1;
     require(failed.stream.read_requests == 3 * first_touch.size(), "last-expert failure did not submit the full union");
-    compare_case("fused_last_expert_short_recovery", f, e, 2, synthetic_batch(f, 2));
+    compare_case(inputs, "fused_last_expert_short_recovery", f, e, 2, synthetic_batch(f, 2));
 
     for (int invalid = 0; invalid < 3; ++invalid) {
         begin_decode(e, 50 + invalid, 1);
-        decode_cache_case("fused_invalid_seed_" + std::to_string(invalid), f, e, 1, four, 0, 4);
+        decode_cache_case(inputs, "fused_invalid_seed_" + std::to_string(invalid), f, e, 1, four, 0, 4);
         auto bad = synthetic_batch(f, 2);
         if (invalid == 2) { bad.x[0] = std::numeric_limits<float>::infinity(); }
-        const auto result = fail_case("fused_early_invalid_clears_cache_" + std::to_string(invalid), f, e, bad,
+        const auto result = fail_case(inputs, "fused_early_invalid_clears_cache_" + std::to_string(invalid), f, e, bad,
             invalid == 0 ? 0 : -1, -1, false, invalid == 1 ? 3 : 0);
         require(result.stream.read_requests == 0, "early prefill validation failure unexpectedly submitted IO");
         begin_decode(e, 50 + invalid, 2);
-        decode_cache_case("fused_early_invalid_decode_recovery_" + std::to_string(invalid), f, e, 1, four, 0, 4);
+        decode_cache_case(inputs, "fused_early_invalid_decode_recovery_" + std::to_string(invalid), f, e, 1, four, 0, 4);
     }
     std::printf("FUSED_CPU_PREFILL_CACHE_OK threads=%d ring_experts=%d\n", threads, depth);
 }
@@ -913,7 +914,7 @@ static void write_json(std::ostream & out, const sample_result & r, const batch 
     out.flush(); require(bool(out), "JSONL write failed");
 }
 
-static void real_test(const options & o) {
+static void real_test(fixture_inputs & inputs, const options & o) {
     fixture f; int layer = 0;
     auto b = load_real(f, layer, o);
     const auto begin = std::chrono::steady_clock::now();
@@ -921,7 +922,7 @@ static void real_test(const options & o) {
     const double reference_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count();
     std::printf("reference=independent_scalar_cpu tokens=%d wall_us=%.3f excluded_from_benchmark=1\n", b.tokens, reference_us);
     std::fflush(stdout);
-    executor e(f, o.threads, o.ring);
+    executor e(inputs, f, o.threads, o.ring);
     std::ofstream json;
     if (!o.jsonl.empty()) { json.open(o.jsonl, std::ios::out | std::ios::trunc); require(bool(json), "JSONL open failed"); }
     // Reference is computed exactly once. Alternating grouped/per-token order
@@ -932,7 +933,7 @@ static void real_test(const options & o) {
         for (bool grouped : { first_grouped, !first_grouped }) {
             const std::string mode = grouped ? "grouped" : "per-token";
             if (o.mode != "both" && o.mode != mode) { continue; }
-            const auto r = run_checked(mode + "_" + phase, f, e, layer, b, expected, grouped);
+            const auto r = run_checked(inputs, mode + "_" + phase, f, e, layer, b, expected, grouped);
             print_sample(mode + "_" + phase, b, r);
             if (json.is_open()) { write_json(json, r, b, o, layer, mode, phase, i, reference_us); }
         }
@@ -942,6 +943,7 @@ static void real_test(const options & o) {
 #endif
 
 int main(int argc, char ** argv) {
+    fixture_inputs inputs;
 #if defined(__linux__)
     try {
         options o; bool ring_set = false, cache_lifecycle = false, cache_retention = false,
@@ -950,7 +952,8 @@ int main(int argc, char ** argv) {
             const std::string arg = argv[i];
             auto next = [&]() { require(i + 1 < argc, "missing option argument"); return std::string(argv[++i]); };
             auto number = [&]() { const std::string s = next(); size_t end = 0; const int n = std::stoi(s, &end); require(end == s.size(), "invalid integer option"); return n; };
-            if (arg == "--threads") { o.threads = number(); }
+            if (arg == "--fixture") { inputs.argument(next()); }
+            else if (arg == "--threads") { o.threads = number(); }
             else if (arg == "--ring-experts") { o.ring = number(); ring_set = true; }
             else if (arg == "--real-pack") { o.pack = next(); }
             else if (arg == "--fixture-prefix") { o.prefix = next(); }
@@ -963,7 +966,7 @@ int main(int argc, char ** argv) {
             else if (arg == "--cache-lifecycle") { cache_lifecycle = true; }
             else if (arg == "--cache-retention") { cache_retention = true; }
             else if (arg == "--cache-prefill-read") { cache_prefill_read = true; }
-            else { throw std::runtime_error("usage: test-kimi-cpu-prefill [--cache-lifecycle] [--threads N --ring-experts N] [--real-pack FILE --fixture-prefix PREFIX --start-token N --tokens 1..64 --mode grouped|per-token|both --warmup N --repeats N --jsonl FILE]"); }
+            else { throw std::runtime_error("usage: test-kimi-cpu-prefill [--cache-lifecycle] [--threads N --ring-experts N] [--fixture KEY=VALUE] [--real-pack FILE --fixture-prefix PREFIX --start-token N --tokens 1..64 --mode grouped|per-token|both --warmup N --repeats N --jsonl FILE]"); }
         }
         require(o.threads >= 2 && o.threads <= 128 && o.ring >= 1 && o.ring <= 32 &&
                 o.repeats >= 1 && o.repeats <= 1000 && o.warmup >= 0 && o.warmup <= 1000, "invalid thread/ring/repeat count");
@@ -972,16 +975,16 @@ int main(int argc, char ** argv) {
         test_resources::io_uring();
         if (cache_lifecycle || cache_retention || cache_prefill_read) { test_resources::finite_cgroup(); }
         if (cache_prefill_read) {
-            cache_prefill_read_tests(o.threads, ring_set ? o.ring : 2);
+            cache_prefill_read_tests(inputs, o.threads, ring_set ? o.ring : 2);
         } else if (cache_retention) {
-            cache_retention_tests(o.threads, ring_set ? o.ring : 2);
+            cache_retention_tests(inputs, o.threads, ring_set ? o.ring : 2);
         } else if (cache_lifecycle) {
             require(o.pack.empty() && o.prefix.empty() && o.jsonl.empty(), "cache lifecycle cannot run a real-pack benchmark");
-            cache_lifecycle_tests(o.threads, ring_set ? o.ring : 2);
+            cache_lifecycle_tests(inputs, o.threads, ring_set ? o.ring : 2);
         } else if (o.pack.empty()) {
             require(o.prefix.empty() && o.jsonl.empty(), "real fixture/JSONL requires --real-pack");
-            synthetic_tests(o.threads, ring_set ? o.ring : 2);
-        } else { require(!o.prefix.empty(), "real pack requires fixture prefix"); real_test(o); }
+            synthetic_tests(inputs, o.threads, ring_set ? o.ring : 2);
+        } else { require(!o.prefix.empty(), "real pack requires fixture prefix"); real_test(inputs, o); }
         if (cache_lifecycle && address_sanitizer_build()) {
             throw test_resources::unavailable("physical-release RSS oracle unavailable under ASan; other cache assertions executed");
         }

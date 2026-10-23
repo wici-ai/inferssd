@@ -136,6 +136,9 @@ public:
 
     bool next()  override;
     bool apply() override;
+    bool save_precompute() override;
+    bool restore_precompute() noexcept override;
+    void discard_precompute() noexcept override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

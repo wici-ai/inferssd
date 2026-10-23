@@ -1,10 +1,15 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
-#include "../kimi-memory-boost.h"
+#include "../ggml-ssd/host/budget-linux.h"
 #include "ggml-backend-impl.h"
+#ifdef GGML_SSD_CUDA_EXECUTOR
+#include "../ggml-ssd/gpu/provider.h"
+extern "C" const ssd::gpu::provider_v1 * ggml_backend_cuda_ssd_api_v1();
+#endif
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/activation-quant-reuse.cuh"
+#include "ggml-cuda/ssd/reserve-registry.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -69,7 +74,6 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/hc-weighted-sum.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
-#include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -97,395 +101,6 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
-
-struct kimi_layer_gap_cuda_entry {
-    int device = 0;
-    int mode = 0;
-    int router_layer = -1;
-    int n_nodes = 0;
-    int kernel_nodes = 0;
-    int has_router = 0;
-    int router_timing_valid = 0;
-    uint64_t cpu_start_us = 0;
-    uint64_t cpu_end_us = 0;
-    uint64_t prepare_start_us = 0;
-    uint64_t prepare_end_us = 0;
-    uint64_t evaluate_start_us = 0;
-    uint64_t evaluate_end_us = 0;
-    uint64_t instantiate_start_us = 0;
-    uint64_t instantiate_end_us = 0;
-    uint64_t update_start_us = 0;
-    uint64_t update_end_us = 0;
-    uint64_t launch_start_us = 0;
-    uint64_t launch_end_us = 0;
-    uint64_t device_start_us = 0;
-    uint64_t device_router_us = 0;
-    uint64_t device_router_done_us = 0;
-    uint64_t device_end_us = 0;
-    char first[128] = {};
-    char last[128] = {};
-};
-
-struct kimi_layer_gap_cuda_buffer {
-    std::vector<kimi_layer_gap_cuda_entry> entries;
-};
-
-static const char * const g_kimi_layer_gap_cuda_prefix =
-    std::getenv("GGML_MOE_TRACE_LAYER_GAPS");
-static const bool g_kimi_layer_gap_cuda_enabled =
-    g_kimi_layer_gap_cuda_prefix != nullptr && g_kimi_layer_gap_cuda_prefix[0] != '\0';
-static std::once_flag g_kimi_layer_gap_cuda_init_once;
-
-static std::mutex & kimi_layer_gap_cuda_registry_mutex() {
-    static auto * mutex = new std::mutex();
-    return *mutex;
-}
-
-static std::vector<kimi_layer_gap_cuda_buffer *> & kimi_layer_gap_cuda_registry() {
-    static auto * registry = new std::vector<kimi_layer_gap_cuda_buffer *>();
-    return *registry;
-}
-
-static void kimi_layer_gap_cuda_copy_field(char * dst, size_t dst_size, const char * src) {
-    if (dst_size == 0) {
-        return;
-    }
-    size_t out = 0;
-    for (const char * p = src != nullptr ? src : ""; *p != '\0' && out + 1 < dst_size; ++p) {
-        const char ch = *p;
-        dst[out++] = ch == ',' || ch == '\n' || ch == '\r' ? ' ' : ch;
-    }
-    dst[out] = '\0';
-}
-
-static const char * kimi_layer_gap_cuda_mode_name(int mode) {
-    switch (mode) {
-        case 0: return "fallback_disabled";
-        case 1: return "fallback_ineligible";
-        case 2: return "fallback_warmup";
-        case 3: return "fallback_changed";
-        case 4: return "capture";
-        case 5: return "replay";
-        default: return "unknown";
-    }
-}
-
-static void kimi_layer_gap_cuda_flush_file() {
-    if (!g_kimi_layer_gap_cuda_enabled) {
-        return;
-    }
-    const std::string path = std::string(g_kimi_layer_gap_cuda_prefix) + ".cuda.csv";
-    FILE * file = std::fopen(path.c_str(), "w");
-    if (file == nullptr) {
-        std::fprintf(stderr, "[kimi_layer_gap] CUDA trace open failed: %s\n", path.c_str());
-        return;
-    }
-    std::fprintf(
-        file,
-        "device,mode,router_layer,n_nodes,kernel_nodes,has_router,router_timing_valid,first,last,"
-        "cpu_start_us,cpu_end_us,prepare_start_us,prepare_end_us,"
-        "evaluate_start_us,evaluate_end_us,instantiate_start_us,instantiate_end_us,"
-        "update_start_us,update_end_us,launch_start_us,launch_end_us,"
-        "device_start_us,device_router_us,device_router_done_us,device_end_us\n");
-    size_t rows = 0;
-    {
-        std::lock_guard<std::mutex> lock(kimi_layer_gap_cuda_registry_mutex());
-        for (const kimi_layer_gap_cuda_buffer * buffer : kimi_layer_gap_cuda_registry()) {
-            for (const kimi_layer_gap_cuda_entry & entry : buffer->entries) {
-                std::fprintf(
-                    file,
-                    "%d,%s,%d,%d,%d,%d,%d,%s,%s,"
-                    "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
-                    "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
-                    "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
-                    "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
-                    entry.device,
-                    kimi_layer_gap_cuda_mode_name(entry.mode),
-                    entry.router_layer,
-                    entry.n_nodes,
-                    entry.kernel_nodes,
-                    entry.has_router,
-                    entry.router_timing_valid,
-                    entry.first,
-                    entry.last,
-                    entry.cpu_start_us,
-                    entry.cpu_end_us,
-                    entry.prepare_start_us,
-                    entry.prepare_end_us,
-                    entry.evaluate_start_us,
-                    entry.evaluate_end_us,
-                    entry.instantiate_start_us,
-                    entry.instantiate_end_us,
-                    entry.update_start_us,
-                    entry.update_end_us,
-                    entry.launch_start_us,
-                    entry.launch_end_us,
-                    entry.device_start_us,
-                    entry.device_router_us,
-                    entry.device_router_done_us,
-                    entry.device_end_us);
-                ++rows;
-            }
-        }
-    }
-    std::fclose(file);
-    std::fprintf(stderr, "[kimi_layer_gap] CUDA trace written: %s (%zu rows)\n", path.c_str(), rows);
-}
-
-static kimi_layer_gap_cuda_buffer & kimi_layer_gap_cuda_thread_buffer() {
-    static thread_local kimi_layer_gap_cuda_buffer * buffer = nullptr;
-    if (buffer == nullptr) {
-        std::call_once(g_kimi_layer_gap_cuda_init_once, []() {
-            std::atexit(kimi_layer_gap_cuda_flush_file);
-            std::fprintf(
-                stderr,
-                "[kimi_layer_gap] CUDA trace enabled: prefix=%s\n",
-                g_kimi_layer_gap_cuda_prefix);
-        });
-        buffer = new kimi_layer_gap_cuda_buffer();
-        buffer->entries.reserve(1U << 14);
-        std::lock_guard<std::mutex> lock(kimi_layer_gap_cuda_registry_mutex());
-        kimi_layer_gap_cuda_registry().push_back(buffer);
-    }
-    return *buffer;
-}
-
-static int kimi_layer_gap_parse_layer(const char * name) {
-    if (name == nullptr) {
-        return -1;
-    }
-    const char * dash = std::strrchr(name, '-');
-    if (dash == nullptr || dash[1] == '\0') {
-        return -1;
-    }
-    char * end = nullptr;
-    const long layer = std::strtol(dash + 1, &end, 10);
-    if (end == dash + 1 || *end != '\0' || layer < 0 || layer > INT_MAX) {
-        return -1;
-    }
-    return (int) layer;
-}
-
-#ifdef USE_CUDA_GRAPH
-static void kimi_layer_gap_cuda_init_events(
-        ggml_backend_cuda_context * cuda_ctx,
-        ggml_cuda_graph * graph) {
-    if (!g_kimi_layer_gap_cuda_enabled) {
-        return;
-    }
-    if (cuda_ctx->gap_trace_origin_event == nullptr) {
-        CUDA_CHECK(cudaEventCreate(&cuda_ctx->gap_trace_origin_event));
-        const uint64_t cpu_before_us = (uint64_t) ggml_time_us();
-        CUDA_CHECK(cudaEventRecord(cuda_ctx->gap_trace_origin_event, cuda_ctx->stream()));
-        CUDA_CHECK(cudaEventSynchronize(cuda_ctx->gap_trace_origin_event));
-        const uint64_t cpu_after_us = (uint64_t) ggml_time_us();
-        cuda_ctx->gap_trace_origin_cpu_us = cpu_before_us + (cpu_after_us - cpu_before_us) / 2;
-    }
-    if (graph->gap_trace_start_event == nullptr) {
-        CUDA_CHECK(cudaEventCreate(&graph->gap_trace_start_event));
-        CUDA_CHECK(cudaEventCreate(&graph->gap_trace_router_event));
-        CUDA_CHECK(cudaEventCreate(&graph->gap_trace_router_done_event));
-        CUDA_CHECK(cudaEventCreate(&graph->gap_trace_end_event));
-    }
-}
-
-static int kimi_layer_gap_cuda_count_kernel_nodes(cudaGraph_t graph) {
-    if (graph == nullptr) {
-        return 0;
-    }
-    size_t count = 0;
-    CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &count));
-    if (count == 0) {
-        return 0;
-    }
-    std::vector<cudaGraphNode_t> nodes(count);
-    CUDA_CHECK(cudaGraphGetNodes(graph, nodes.data(), &count));
-    int kernels = 0;
-    for (size_t i = 0; i < count; ++i) {
-        cudaGraphNodeType type;
-        CUDA_CHECK(cudaGraphNodeGetType(nodes[i], &type));
-        if (type == cudaGraphNodeTypeKernel) {
-            ++kernels;
-        }
-    }
-    return kernels;
-}
-
-static bool kimi_layer_gap_cuda_collect_pending(
-        ggml_backend_cuda_context * cuda_ctx,
-        ggml_cuda_graph * graph) {
-    if (!g_kimi_layer_gap_cuda_enabled || graph == nullptr || !graph->gap_trace_pending.valid) {
-        return false;
-    }
-    const cudaError_t ready = cudaEventQuery(graph->gap_trace_end_event);
-    if (ready == cudaErrorNotReady) {
-        return false;
-    }
-    CUDA_CHECK(ready);
-
-    float start_ms = 0.0f;
-    float router_ms = 0.0f;
-    float router_done_ms = 0.0f;
-    float end_ms = 0.0f;
-    CUDA_CHECK(cudaEventElapsedTime(
-        &start_ms, cuda_ctx->gap_trace_origin_event, graph->gap_trace_start_event));
-    CUDA_CHECK(cudaEventElapsedTime(
-        &router_ms, cuda_ctx->gap_trace_origin_event, graph->gap_trace_router_event));
-    CUDA_CHECK(cudaEventElapsedTime(
-        &router_done_ms, cuda_ctx->gap_trace_origin_event, graph->gap_trace_router_done_event));
-    CUDA_CHECK(cudaEventElapsedTime(
-        &end_ms, cuda_ctx->gap_trace_origin_event, graph->gap_trace_end_event));
-
-    const ggml_cuda_graph::gap_trace_pending_state & pending = graph->gap_trace_pending;
-    kimi_layer_gap_cuda_entry entry;
-    entry.device = cuda_ctx->device;
-    entry.mode = pending.mode;
-    entry.router_layer = pending.router_layer;
-    entry.n_nodes = pending.n_nodes;
-    entry.kernel_nodes = pending.kernel_nodes;
-    entry.has_router = pending.has_router ? 1 : 0;
-    entry.router_timing_valid = pending.router_timing_valid ? 1 : 0;
-    entry.cpu_start_us = pending.cpu_start_us;
-    entry.cpu_end_us = pending.cpu_end_us;
-    entry.prepare_start_us = pending.prepare_start_us;
-    entry.prepare_end_us = pending.prepare_end_us;
-    entry.evaluate_start_us = pending.evaluate_start_us;
-    entry.evaluate_end_us = pending.evaluate_end_us;
-    entry.instantiate_start_us = pending.instantiate_start_us;
-    entry.instantiate_end_us = pending.instantiate_end_us;
-    entry.update_start_us = pending.update_start_us;
-    entry.update_end_us = pending.update_end_us;
-    entry.launch_start_us = pending.launch_start_us;
-    entry.launch_end_us = pending.launch_end_us;
-    entry.device_start_us =
-        cuda_ctx->gap_trace_origin_cpu_us + (uint64_t) std::llround((double) start_ms * 1000.0);
-    entry.device_router_us =
-        cuda_ctx->gap_trace_origin_cpu_us + (uint64_t) std::llround((double) router_ms * 1000.0);
-    entry.device_router_done_us =
-        cuda_ctx->gap_trace_origin_cpu_us + (uint64_t) std::llround((double) router_done_ms * 1000.0);
-    entry.device_end_us =
-        cuda_ctx->gap_trace_origin_cpu_us + (uint64_t) std::llround((double) end_ms * 1000.0);
-    kimi_layer_gap_cuda_copy_field(entry.first, sizeof(entry.first), pending.first);
-    kimi_layer_gap_cuda_copy_field(entry.last, sizeof(entry.last), pending.last);
-    kimi_layer_gap_cuda_thread_buffer().entries.push_back(entry);
-    graph->gap_trace_pending.valid = false;
-    return true;
-}
-#endif
-
-typedef struct {
-    int32_t i1;
-    int32_t i2;
-} ggml_moe_row_mapping;
-
-extern "C" bool ggml_cuda_moe_stream_batch(
-    int  src0_type_int,
-    const char *src0_name,
-    const void *src0_data,
-    int64_t n_as,
-    int64_t ne01,
-    int64_t ne00,
-    size_t nb01,
-    size_t nb02,
-    const float *src1_f32,
-    int64_t src1_ne1,
-    size_t src1_nb1, size_t src1_nb2,
-    const void *src1_q8_0,
-    size_t src1_q8_0_row_size,
-    int64_t src1_q8_0_ne1,
-    float *dst,
-    size_t dst_nb1, size_t dst_nb2,
-    const int64_t *matrix_row_counts,
-    const ggml_moe_row_mapping *matrix_rows,
-    int64_t rows_stride);
-
-extern "C" bool ggml_cuda_moe_stream_up_gate_batch(
-    int  src0_up_type_int,
-    int  src0_gate_type_int,
-    const char *src0_up_name,
-    const void *src0_up_data,
-    const char *src0_gate_name,
-    const void *src0_gate_data,
-    int64_t n_as,
-    int64_t ne01,
-    int64_t ne00,
-    size_t up_nb01,
-    size_t up_nb02,
-    size_t up_expert_bytes,
-    size_t gate_nb01,
-    size_t gate_nb02,
-    size_t gate_expert_bytes,
-    const float *src1_f32,
-    size_t src1_nb1, size_t src1_nb2,
-    float *dst,
-    size_t dst_nb1, size_t dst_nb2,
-    int unary_op,
-    float limit,
-    const int64_t *matrix_row_counts,
-    const ggml_moe_row_mapping *matrix_rows,
-    int64_t rows_stride);
-
-extern "C" int ggml_cuda_moe_stream_batch_preload_active_from_pack(
-    int src0_type_int,
-    const char *src0_name,
-    int64_t n_as,
-    size_t expert_bytes,
-    const int64_t *matrix_row_counts);
-
-extern "C" int ggml_cuda_moe_stream_q4_colibri_pilot_prefetch_from_gate(
-    int src0_type_int,
-    const char *src0_gate_name,
-    int64_t n_as,
-    size_t expert_bytes,
-    const int64_t *matrix_row_counts);
-
-extern "C" bool ggml_cuda_moe_expert_pack_copy_ranges_to_device(
-    const char *tensor_name,
-    const int32_t *range_first,
-    const int32_t *range_last,
-    size_t range_count,
-    int64_t n_expert,
-    size_t expert_bytes,
-    size_t padding,
-    bool cache_bypass,
-    void *device_dst,
-    size_t device_capacity,
-    void *stream,
-    uint64_t *experts_copied,
-    uint64_t *iouring_reads,
-    uint64_t *iouring_bytes,
-    uint64_t *cache_lookups,
-    uint64_t *cache_hits);
-
-extern "C" bool ggml_cuda_moe_dense_copy_to_device(
-    const char *tensor_name,
-    void *device_dst,
-    size_t nbytes,
-    void *stream,
-    bool *read_ahead_hit);
-
-static bool ggml_cuda_glm52_colibri_requested() {
-    const char * pack = std::getenv("GGML_MOE_GLM52_COLIBRI_PACK");
-    const char * manifest = std::getenv("GGML_MOE_GLM52_COLIBRI_MANIFEST");
-    return pack && pack[0] && manifest && manifest[0];
-}
-
-static bool ggml_cuda_glm52_external_expert_name(const char * name) {
-    return name != nullptr &&
-        (std::strstr(name, "ffn_gate_exps") != nullptr ||
-         std::strstr(name, "ffn_up_exps")   != nullptr ||
-         std::strstr(name, "ffn_down_exps") != nullptr);
-}
-
-static bool ggml_cuda_moe_gate_batch_prefetch_enabled() {
-    const char *env = std::getenv("GGML_MOE_GATE_BATCH_PREFETCH");
-    return env && env[0] && env[0] != '0';
-}
-
-static bool ggml_cuda_moe_q4_colibri_pilot_prefetch_enabled() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_PREFETCH");
-    return env && env[0] && env[0] != '0';
-}
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -528,28 +143,19 @@ static bool ggml_cuda_memory_is_unified(int device);
 // boost (kimi-memory-boost.h): a reserve kept on MemAvailable must survive the boost coming back.
 static void ggml_cuda_memory_info(int device, size_t * free, size_t * total);
 
-// Memory that allocations must leave free on a device: the larger of a deployment's fixed reserve
-// (GGML_CUDA_MEMORY_RESERVE_MIB, for a GPU shared with other processes) and a reserve a cache owner
-// sets at run time (ggml_cuda_set_memory_reserve: on unified memory, the host's working set).
+// Memory that allocations must leave free, explicitly set by the typed tier
+// owner (on unified memory this also preserves the host working set).
 static std::array<std::atomic<size_t>, GGML_CUDA_MAX_DEVICES> g_cuda_dynamic_reserve = {};
+// Exactly one registry in the CUDA DSO. Each backend registration lives until
+// its borrowed transport has quiesced; one context cannot replace another's floor.
+static ssd::gpu::reserve_registry<GGML_CUDA_MAX_DEVICES> g_cuda_context_reserves;
 
 // Reclaim the elastic expert cache before an allocation would eat into the reserve, rather than waiting
 // until cudaMalloc/cuMemCreate has already exhausted the device (on unified memory it never fails). With
 // no reclaimer (or while it is unarmed), fail normally so the graph planner can try a smaller batch.
 static cudaError_t ggml_cuda_reserve_memory(int device, size_t size) {
-    static const size_t fixed_reserve = [] {
-        const char * value = std::getenv("GGML_CUDA_MEMORY_RESERVE_MIB");
-        if (!value || !*value) {
-            return size_t(0);
-        }
-        char * end = nullptr;
-        const unsigned long long mib = std::strtoull(value, &end, 10);
-        if (end == value || *end != '\0' || value[0] == '-' || mib > 8192) {
-            GGML_ABORT("GGML_CUDA_MEMORY_RESERVE_MIB must be in 0..8192");
-        }
-        return size_t(mib) * 1024 * 1024;
-    }();
-    const size_t reserve = std::max(fixed_reserve, g_cuda_dynamic_reserve[device].load(std::memory_order_relaxed));
+    const size_t reserve = std::max(g_cuda_dynamic_reserve[device].load(std::memory_order_relaxed),
+                                    g_cuda_context_reserves.maximum(device));
     if (!reserve) {
         return cudaSuccess;
     }
@@ -1139,36 +745,6 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
-#ifdef USE_CUDA_GRAPH
-    if (g_kimi_layer_gap_cuda_enabled && gap_trace_origin_event != nullptr) {
-        CUDA_CHECK(cudaStreamSynchronize(stream()));
-        for (const auto & item : cuda_graphs) {
-            kimi_layer_gap_cuda_collect_pending(this, item.second.get());
-        }
-        kimi_layer_gap_cuda_flush_file();
-        CUDA_CHECK(cudaEventDestroy(gap_trace_origin_event));
-        gap_trace_origin_event = nullptr;
-    }
-    if (std::getenv("GGML_CUDA_GRAPH_STATS") != nullptr) {
-        GGML_LOG_INFO(
-            "[cuda_graph] device=%d compute=%llu compatible=%llu capture=%llu instantiate=%llu "
-            "exec_update=%llu launch=%llu replay=%llu fallback=%llu fallback_disabled=%llu "
-            "fallback_ineligible=%llu fallback_warmup=%llu fallback_changed=%llu\n",
-            device,
-            (unsigned long long) graph_compute_calls,
-            (unsigned long long) graph_compatible_calls,
-            (unsigned long long) graph_capture_calls,
-            (unsigned long long) graph_instantiate_calls,
-            (unsigned long long) graph_exec_update_calls,
-            (unsigned long long) graph_launch_calls,
-            (unsigned long long) graph_replay_calls,
-            (unsigned long long) graph_fallback_calls,
-            (unsigned long long) graph_fallback_disabled,
-            (unsigned long long) graph_fallback_ineligible,
-            (unsigned long long) graph_fallback_warmup,
-            (unsigned long long) graph_fallback_changed);
-    }
-#endif
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -1251,9 +827,7 @@ static void ggml_backend_cuda_graph_cache_end_phase(ggml_backend_t backend, int 
         if (item.first.phase == phase) {
             entry_count_before++;
         }
-        if (item.first.phase == phase && g_kimi_layer_gap_cuda_enabled) {
-            kimi_layer_gap_cuda_collect_pending(cuda_ctx, item.second.get());
-        }
+
     }
 
     size_t free_before = 0;
@@ -1570,83 +1144,6 @@ static int ggml_cuda_oom_reclaimer_invoke(int device, size_t requested_bytes, si
         }
     }
     return result;
-}
-
-// Prefill seeding (ggml-cuda.h): one owner per device, an event recorded behind each offered copy, and the
-// owner's event the backend's stream waits for at the next fence.
-struct ggml_cuda_moe_seed_entry {
-    std::mutex mutex;
-    ggml_cuda_moe_seed_fn callback = nullptr;
-    void * userdata = nullptr;
-    cudaEvent_t ready = nullptr;
-    void * pending = nullptr; // the owner's event the backend's stream has not waited for yet
-};
-
-static std::array<ggml_cuda_moe_seed_entry, GGML_CUDA_MAX_DEVICES> g_cuda_moe_seeds;
-
-extern "C" GGML_BACKEND_API bool ggml_cuda_moe_seed_register(int device, ggml_cuda_moe_seed_fn callback, void * userdata) {
-    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || callback == nullptr || userdata == nullptr) {
-        return false;
-    }
-    auto & entry = g_cuda_moe_seeds[device];
-    std::lock_guard<std::mutex> lock(entry.mutex);
-    if (entry.callback != nullptr) {
-        return entry.callback == callback && entry.userdata == userdata;
-    }
-    entry.callback = callback;
-    entry.userdata = userdata;
-    return true;
-}
-
-extern "C" GGML_BACKEND_API bool ggml_cuda_moe_seed_unregister(int device, ggml_cuda_moe_seed_fn callback, void * userdata) {
-    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
-        return false;
-    }
-    auto & entry = g_cuda_moe_seeds[device];
-    std::lock_guard<std::mutex> lock(entry.mutex);
-    if (entry.callback != callback || entry.userdata != userdata) {
-        return false;
-    }
-    entry.callback = nullptr;
-    entry.userdata = nullptr;
-    entry.pending = nullptr;
-    return true;
-}
-
-extern "C" GGML_BACKEND_API void ggml_cuda_moe_seed_offer(ggml_backend_t backend, const ggml_tensor * tensor,
-        const char * tensor_name, int64_t n_expert, size_t expert_bytes, const int32_t * counts) {
-    if (!ggml_backend_is_cuda(backend) || tensor == nullptr || tensor->data == nullptr || counts == nullptr) {
-        return;
-    }
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    auto & entry = g_cuda_moe_seeds[cuda_ctx->device];
-    std::lock_guard<std::mutex> lock(entry.mutex);
-    if (entry.callback == nullptr) {
-        return;
-    }
-    ggml_cuda_set_device(cuda_ctx->device);
-    if (entry.ready == nullptr) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&entry.ready, cudaEventDisableTiming));
-    }
-    CUDA_CHECK(cudaEventRecord(entry.ready, cuda_ctx->stream()));
-    void * done = nullptr;
-    if (entry.callback(entry.userdata, tensor_name, tensor->data, expert_bytes, n_expert, counts, entry.ready, &done) > 0 && done) {
-        entry.pending = done;
-    }
-}
-
-extern "C" GGML_BACKEND_API void ggml_cuda_moe_seed_fence(ggml_backend_t backend) {
-    if (!ggml_backend_is_cuda(backend)) {
-        return;
-    }
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    auto & entry = g_cuda_moe_seeds[cuda_ctx->device];
-    std::lock_guard<std::mutex> lock(entry.mutex);
-    if (entry.pending != nullptr) {
-        ggml_cuda_set_device(cuda_ctx->device);
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t) entry.pending, 0));
-        entry.pending = nullptr;
-    }
 }
 
 static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -3234,8 +2731,7 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
     if (ggml_cuda_should_use_mmvf_f16_cpu(src0, src1, dst) ||
-        ggml_cuda_should_use_mmvf_f32_cpu(src0, src1, dst) ||
-        ggml_cuda_should_use_kimi_kda_weighted_sum(src0, src1, dst)) {
+        ggml_cuda_should_use_mmvf_f32_cpu(src0, src1, dst)) {
         return false;
     }
 
@@ -3308,8 +2804,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 // The kernel that ggml_cuda_mul_mat uses for a matrix multiplication. It also decides how much the
 // multiplication takes from the memory pool (ggml_cuda_mul_mat_pool_size).
 enum ggml_cuda_mul_mat_kernel {
-    GGML_CUDA_MUL_MAT_KDA_WEIGHTED_SUM,
-    GGML_CUDA_MUL_MAT_VEC_F16_CPU,
+    // 0: retired KDA weighted-sum kernel; do not reuse.
+    GGML_CUDA_MUL_MAT_VEC_F16_CPU = 1,
     GGML_CUDA_MUL_MAT_VEC_F32_CPU,
     GGML_CUDA_MUL_MAT_VEC_F,
     GGML_CUDA_MUL_MAT_F,
@@ -3384,9 +2880,7 @@ static ggml_cuda_mul_mat_kernel ggml_cuda_mul_mat_select(
     bool use_batched_cublas_bf16 = src0->type == GGML_TYPE_BF16 && bf16_mma_hardware_available(cc);
     bool use_batched_cublas_f32  = src0->type == GGML_TYPE_F32;
 
-    if (!split && ggml_cuda_should_use_kimi_kda_weighted_sum(src0, src1, dst)) {
-        return GGML_CUDA_MUL_MAT_KDA_WEIGHTED_SUM;
-    } else if (!split && use_mul_mat_vec_f && ggml_cuda_should_use_mmvf_f16_cpu(src0, src1, dst)) {
+    if (!split && use_mul_mat_vec_f && ggml_cuda_should_use_mmvf_f16_cpu(src0, src1, dst)) {
         return GGML_CUDA_MUL_MAT_VEC_F16_CPU;
     } else if (!split && use_mul_mat_vec_f && ggml_cuda_should_use_mmvf_f32_cpu(src0, src1, dst)) {
         return GGML_CUDA_MUL_MAT_VEC_F32_CPU;
@@ -3418,9 +2912,6 @@ static ggml_cuda_mul_mat_kernel ggml_cuda_mul_mat_select(
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     switch (ggml_cuda_mul_mat_select(ctx, src0, src1, dst)) {
-        case GGML_CUDA_MUL_MAT_KDA_WEIGHTED_SUM:
-            ggml_cuda_kimi_kda_weighted_sum(ctx, src0, src1, dst);
-            break;
         case GGML_CUDA_MUL_MAT_VEC_F16_CPU:
             ggml_cuda_mul_mat_vec_f16_cpu(ctx, src0, src1, dst);
             break;
@@ -3569,7 +3060,6 @@ static size_t ggml_cuda_mul_mat_pool_size(
         case GGML_CUDA_MUL_MAT_OP_Q:
         case GGML_CUDA_MUL_MAT_OP_CUBLAS:
             return ggml_cuda_op_mul_mat_pool_size(src0, src1, dst, kernel);
-        case GGML_CUDA_MUL_MAT_KDA_WEIGHTED_SUM:
         case GGML_CUDA_MUL_MAT_VEC_F32_CPU:
         case GGML_CUDA_MUL_MAT_VEC_F:
         case GGML_CUDA_MUL_MAT_F:
@@ -3578,446 +3068,6 @@ static size_t ggml_cuda_mul_mat_pool_size(
     return 0;
 }
 
-
-struct ds4_exact_mmid_dataflow_probe_state {
-    std::mutex mutex;
-    FILE * fp = nullptr;
-    bool fp_attempted = false;
-    uint64_t seq = 0;
-};
-
-static ds4_exact_mmid_dataflow_probe_state & ds4_exact_mmid_dataflow_probe() {
-    static ds4_exact_mmid_dataflow_probe_state state;
-    return state;
-}
-
-static bool ds4_exact_mmid_dataflow_probe_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("DS4_EXACT_MMID_DATAFLOW_PROBE_OUT");
-        return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
-
-static const char * ds4_exact_mmid_tensor_buft_name(const ggml_tensor * tensor) {
-    if (tensor == nullptr || tensor->buffer == nullptr) {
-        return "none";
-    }
-    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
-    const char * name = buft ? ggml_backend_buft_name(buft) : nullptr;
-    return name ? name : "unknown";
-}
-
-static int ds4_exact_mmid_tensor_is_cuda(const ggml_tensor * tensor) {
-    if (tensor == nullptr || tensor->buffer == nullptr) {
-        return 0;
-    }
-    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
-    return buft && ggml_backend_buft_is_cuda(buft) ? 1 : 0;
-}
-
-static int ds4_exact_mmid_tensor_is_cuda_host(const ggml_tensor * tensor) {
-    if (tensor == nullptr || tensor->buffer == nullptr) {
-        return 0;
-    }
-    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
-    return buft && ggml_backend_buft_is_cuda_host(buft) ? 1 : 0;
-}
-
-static int ds4_exact_mmid_tensor_is_host(const ggml_tensor * tensor) {
-    if (tensor == nullptr || tensor->buffer == nullptr) {
-        return 0;
-    }
-    return ggml_backend_buffer_is_host(tensor->buffer) ? 1 : 0;
-}
-
-static const char * ds4_exact_mmid_role(const char * name) {
-    if (name == nullptr) {
-        return "other";
-    }
-    if (strstr(name, "ffn_gate_up_exps") != nullptr) {
-        return "gate_up";
-    }
-    if (strstr(name, "ffn_gate_exps") != nullptr) {
-        return "gate";
-    }
-    if (strstr(name, "ffn_up_exps") != nullptr) {
-        return "up";
-    }
-    if (strstr(name, "ffn_down_exps") != nullptr) {
-        return "down";
-    }
-    return "other";
-}
-
-static uint64_t ds4_exact_mmid_tensor_nbytes(const ggml_tensor * tensor) {
-    return tensor ? (uint64_t) ggml_nbytes(tensor) : 0;
-}
-
-static FILE * ds4_exact_mmid_dataflow_probe_fp_locked() {
-    auto & state = ds4_exact_mmid_dataflow_probe();
-    if (state.fp != nullptr) {
-        return state.fp;
-    }
-    if (state.fp_attempted) {
-        return nullptr;
-    }
-    state.fp_attempted = true;
-
-    const char * path = std::getenv("DS4_EXACT_MMID_DATAFLOW_PROBE_OUT");
-    if (path == nullptr || path[0] == '\0' || strcmp(path, "0") == 0) {
-        return nullptr;
-    }
-
-    state.fp = std::fopen(path, "w");
-    if (state.fp == nullptr) {
-        std::fprintf(stderr, "ds4_exact_mmid_dataflow_probe: failed to open %s\n", path);
-        return nullptr;
-    }
-    std::setvbuf(state.fp, nullptr, _IOLBF, 0);
-    std::fprintf(state.fp,
-        "seq,path,cc,src0_role,src0_name,src1_name,ids_name,dst_name,"
-        "src0_buft,src1_buft,ids_buft,dst_buft,src0_type,src1_type,ids_type,dst_type,"
-        "src0_nbytes,src1_nbytes,ids_nbytes,dst_nbytes,"
-        "src0_ne0,src0_ne1,src0_ne2,src0_ne3,src1_ne0,src1_ne1,src1_ne2,src1_ne3,"
-        "ids_ne0,ids_ne1,ids_ne2,ids_ne3,dst_ne0,dst_ne1,dst_ne2,dst_ne3,"
-        "src0_cuda,src1_cuda,ids_cuda,dst_cuda,src0_cuda_host,src1_cuda_host,ids_cuda_host,dst_cuda_host,"
-        "src0_host,src1_host,ids_host,dst_host,src0_quantized,mmvq_mmid_max,"
-        "mmvq_fast_candidate,mmq_fast_candidate,mmf_fast_candidate,slow_sync_required,cuda_graph_fast_candidate\n");
-    std::fprintf(stderr, "ds4_exact_mmid_dataflow_probe: enabled out=%s\n", path);
-    return state.fp;
-}
-
-static void ds4_exact_mmid_dataflow_probe_write(
-        const char * path,
-        int cc,
-        const ggml_tensor * src0,
-        const ggml_tensor * src1,
-        const ggml_tensor * ids,
-        const ggml_tensor * dst,
-        int mmvq_mmid_max,
-        bool mmvq_fast_candidate,
-        bool mmq_fast_candidate,
-        bool mmf_fast_candidate) {
-    if (!ds4_exact_mmid_dataflow_probe_enabled()) {
-        return;
-    }
-
-    auto & state = ds4_exact_mmid_dataflow_probe();
-    std::lock_guard<std::mutex> lock(state.mutex);
-    FILE * fp = ds4_exact_mmid_dataflow_probe_fp_locked();
-    if (fp == nullptr) {
-        return;
-    }
-
-    const bool slow_sync_required = strcmp(path, "slow_sync") == 0;
-    const bool cuda_graph_fast_candidate = !slow_sync_required;
-    std::fprintf(fp,
-        "%llu,%s,%d,%s,%s,%s,%s,%s,"
-        "%s,%s,%s,%s,%s,%s,%s,%s,"
-        "%llu,%llu,%llu,%llu,"
-        "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,"
-        "%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,"
-        "%d,%d,%d,%d,%d,%d,%d,%d,"
-        "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
-        (unsigned long long) state.seq++,
-        path,
-        cc,
-        ds4_exact_mmid_role(src0 ? src0->name : nullptr),
-        src0 ? src0->name : "",
-        src1 ? src1->name : "",
-        ids ? ids->name : "",
-        dst ? dst->name : "",
-        ds4_exact_mmid_tensor_buft_name(src0),
-        ds4_exact_mmid_tensor_buft_name(src1),
-        ds4_exact_mmid_tensor_buft_name(ids),
-        ds4_exact_mmid_tensor_buft_name(dst),
-        src0 ? ggml_type_name(src0->type) : "none",
-        src1 ? ggml_type_name(src1->type) : "none",
-        ids ? ggml_type_name(ids->type) : "none",
-        dst ? ggml_type_name(dst->type) : "none",
-        (unsigned long long) ds4_exact_mmid_tensor_nbytes(src0),
-        (unsigned long long) ds4_exact_mmid_tensor_nbytes(src1),
-        (unsigned long long) ds4_exact_mmid_tensor_nbytes(ids),
-        (unsigned long long) ds4_exact_mmid_tensor_nbytes(dst),
-        (long long) (src0 ? src0->ne[0] : -1),
-        (long long) (src0 ? src0->ne[1] : -1),
-        (long long) (src0 ? src0->ne[2] : -1),
-        (long long) (src0 ? src0->ne[3] : -1),
-        (long long) (src1 ? src1->ne[0] : -1),
-        (long long) (src1 ? src1->ne[1] : -1),
-        (long long) (src1 ? src1->ne[2] : -1),
-        (long long) (src1 ? src1->ne[3] : -1),
-        (long long) (ids ? ids->ne[0] : -1),
-        (long long) (ids ? ids->ne[1] : -1),
-        (long long) (ids ? ids->ne[2] : -1),
-        (long long) (ids ? ids->ne[3] : -1),
-        (long long) (dst ? dst->ne[0] : -1),
-        (long long) (dst ? dst->ne[1] : -1),
-        (long long) (dst ? dst->ne[2] : -1),
-        (long long) (dst ? dst->ne[3] : -1),
-        ds4_exact_mmid_tensor_is_cuda(src0),
-        ds4_exact_mmid_tensor_is_cuda(src1),
-        ds4_exact_mmid_tensor_is_cuda(ids),
-        ds4_exact_mmid_tensor_is_cuda(dst),
-        ds4_exact_mmid_tensor_is_cuda_host(src0),
-        ds4_exact_mmid_tensor_is_cuda_host(src1),
-        ds4_exact_mmid_tensor_is_cuda_host(ids),
-        ds4_exact_mmid_tensor_is_cuda_host(dst),
-        ds4_exact_mmid_tensor_is_host(src0),
-        ds4_exact_mmid_tensor_is_host(src1),
-        ds4_exact_mmid_tensor_is_host(ids),
-        ds4_exact_mmid_tensor_is_host(dst),
-        src0 && ggml_is_quantized(src0->type) ? 1 : 0,
-        mmvq_mmid_max,
-        mmvq_fast_candidate ? 1 : 0,
-        mmq_fast_candidate ? 1 : 0,
-        mmf_fast_candidate ? 1 : 0,
-        slow_sync_required ? 1 : 0,
-        cuda_graph_fast_candidate ? 1 : 0);
-}
-
-static bool ggml_cuda_moe_build_host_routes(
-        cudaStream_t stream,
-        const ggml_tensor * ids,
-        int64_t n_as,
-        std::vector<int64_t> & matrix_row_counts,
-        std::vector<ggml_moe_row_mapping> & matrix_rows,
-        int64_t & rows_stride) {
-    if (ids == nullptr || ids->type != GGML_TYPE_I32 || ids->ne[2] != 1 || ids->ne[3] != 1) {
-        return false;
-    }
-
-    const int64_t n_ids = ids->ne[0];
-    const int64_t n_tokens = ids->ne[1];
-    rows_stride = n_ids * n_tokens;
-    if (n_as <= 0 || n_ids <= 0 || n_tokens <= 0 || rows_stride <= 0) {
-        return false;
-    }
-
-    static const char * route_timeline_path = std::getenv("GGML_MOE_ROUTE_D2H_TIMELINE_CSV");
-    const bool route_timeline_enabled = route_timeline_path && route_timeline_path[0];
-    const auto route_start = route_timeline_enabled ?
-        std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    std::vector<uint8_t> ids_bytes(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_bytes.data(), ids->data, ids_bytes.size(), cudaMemcpyDeviceToHost, stream));
-    const auto copy_enqueued = route_timeline_enabled ?
-        std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    const auto copy_done = route_timeline_enabled ?
-        std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-
-    matrix_row_counts.assign(n_as, 0);
-    matrix_rows.assign((size_t) n_as * (size_t) rows_stride, ggml_moe_row_mapping{0, 0});
-
-    for (int64_t it = 0; it < n_tokens; ++it) {
-        for (int64_t iid = 0; iid < n_ids; ++iid) {
-            const int32_t expert = *(const int32_t *) (ids_bytes.data() + (size_t) it * ids->nb[1] + (size_t) iid * ids->nb[0]);
-            if (expert < 0 || expert >= n_as) {
-                return false;
-            }
-            const int64_t row = matrix_row_counts[expert]++;
-            matrix_rows[(size_t) expert * (size_t) rows_stride + (size_t) row] =
-                ggml_moe_row_mapping{(int32_t) iid, (int32_t) it};
-        }
-    }
-
-    if (route_timeline_enabled) {
-        static std::mutex route_timeline_mu;
-        static bool route_timeline_header = false;
-        static uint64_t route_timeline_seq = 0;
-        const auto route_done = std::chrono::steady_clock::now();
-        const auto us = [](const auto & end, const auto & start) -> uint64_t {
-            return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-        };
-        std::lock_guard<std::mutex> lock(route_timeline_mu);
-        FILE * file = std::fopen(route_timeline_path, "a");
-        if (file != nullptr) {
-            if (!route_timeline_header) {
-                std::fprintf(file,
-                    "seq,tensor,n_ids,n_tokens,n_experts,bytes,enqueue_us,sync_us,parse_us,total_us\n");
-                route_timeline_header = true;
-            }
-            std::fprintf(file, "%" PRIu64 ",%s,%" PRId64 ",%" PRId64 ",%" PRId64
-                    ",%zu,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
-                ++route_timeline_seq,
-                ids->name,
-                n_ids,
-                n_tokens,
-                n_as,
-                ids_bytes.size(),
-                us(copy_enqueued, route_start),
-                us(copy_done, copy_enqueued),
-                us(route_done, copy_done),
-                us(route_done, route_start));
-            std::fclose(file);
-        }
-    }
-
-    return true;
-}
-
-static bool ggml_cuda_copy_f32_tensor_to_host(
-        cudaStream_t stream,
-        const ggml_tensor * src,
-        std::vector<uint8_t> & host) {
-    if (src == nullptr || src->type != GGML_TYPE_F32 || src->data == nullptr) {
-        return false;
-    }
-    host.resize(ggml_nbytes(src));
-    CUDA_CHECK(cudaMemcpyAsync(host.data(), src->data, host.size(), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    return true;
-}
-
-static bool ggml_cuda_try_glm52_colibri_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-    const ggml_tensor * ids  = dst->src[2];
-    if (!ggml_cuda_glm52_colibri_requested() ||
-            src0 == nullptr || src1 == nullptr || ids == nullptr ||
-            src0->type != GGML_TYPE_Q4_0 ||
-            src1->type != GGML_TYPE_F32 ||
-            dst->type != GGML_TYPE_F32 ||
-            !ggml_cuda_glm52_external_expert_name(src0->name)) {
-        return false;
-    }
-
-    cudaStream_t stream = ctx.stream();
-    std::vector<int64_t> matrix_row_counts;
-    std::vector<ggml_moe_row_mapping> matrix_rows;
-    int64_t rows_stride = 0;
-    if (!ggml_cuda_moe_build_host_routes(stream, ids, src0->ne[2], matrix_row_counts, matrix_rows, rows_stride)) {
-        return false;
-    }
-
-    std::vector<uint8_t> src1_host;
-    if (!ggml_cuda_copy_f32_tensor_to_host(stream, src1, src1_host)) {
-        return false;
-    }
-
-    const bool done = ggml_cuda_moe_stream_batch(
-        src0->type,
-        src0->name,
-        src0->data,
-        src0->ne[2],
-        src0->ne[1],
-        src0->ne[0],
-        src0->nb[1],
-        src0->nb[2],
-        (const float *) src1_host.data(),
-        src1->ne[1],
-        (size_t) src1->ne[0] * sizeof(float),
-        (size_t) src1->ne[0] * (size_t) src1->ne[1] * sizeof(float),
-        nullptr,
-        0,
-        0,
-        (float *) dst->data,
-        dst->nb[1],
-        dst->nb[2],
-        matrix_row_counts.data(),
-        matrix_rows.data(),
-        rows_stride);
-    if (!done) {
-        GGML_ABORT("GLM5.2 colibri MUL_MAT_ID dispatch declined");
-    }
-    return true;
-}
-
-static void ggml_cuda_op_moe_fused_up_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0_up   = dst->src[0];
-    const ggml_tensor * src0_gate = dst->src[1];
-    const ggml_tensor * src1      = dst->src[2];
-    const ggml_tensor * ids       = dst->src[3];
-
-    GGML_ASSERT(src0_up   != nullptr);
-    GGML_ASSERT(src0_gate != nullptr);
-    GGML_ASSERT(src1      != nullptr);
-    GGML_ASSERT(ids       != nullptr);
-    GGML_ASSERT(src0_up->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(src0_gate->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-
-    cudaStream_t stream = ctx.stream();
-    std::vector<int64_t> matrix_row_counts;
-    std::vector<ggml_moe_row_mapping> matrix_rows;
-    int64_t rows_stride = 0;
-    if (!ggml_cuda_moe_build_host_routes(stream, ids, src0_up->ne[2], matrix_row_counts, matrix_rows, rows_stride)) {
-        GGML_ABORT("GLM5.2 colibri fused up/gate route build failed");
-    }
-
-    std::vector<uint8_t> src1_host;
-    if (!ggml_cuda_copy_f32_tensor_to_host(stream, src1, src1_host)) {
-        GGML_ABORT("GLM5.2 colibri fused up/gate activation copy failed");
-    }
-
-    if (ggml_cuda_moe_gate_batch_prefetch_enabled()) {
-        const int same_layer_jobs = ggml_cuda_moe_stream_batch_preload_active_from_pack(
-                src0_gate->type,
-                src0_gate->name,
-                src0_gate->ne[2],
-                (size_t) src0_gate->ne[1] * src0_gate->nb[1],
-                matrix_row_counts.data());
-        static std::atomic<int> first_report{0};
-        if (first_report.fetch_add(1, std::memory_order_relaxed) == 0) {
-            std::fprintf(stderr,
-                    "[ggml-cuda] GLM5.2 same-layer triplet preload: gate=%s experts=%ld bytes=%zu jobs=%d\n",
-                    src0_gate->name,
-                    (long) src0_gate->ne[2],
-                    (size_t) src0_gate->ne[1] * src0_gate->nb[1],
-                    same_layer_jobs);
-        }
-    }
-    if (ggml_cuda_moe_q4_colibri_pilot_prefetch_enabled()) {
-        const int pilot_jobs = ggml_cuda_moe_stream_q4_colibri_pilot_prefetch_from_gate(
-                src0_gate->type,
-                src0_gate->name,
-                src0_gate->ne[2],
-                (size_t) src0_gate->ne[1] * src0_gate->nb[1],
-                matrix_row_counts.data());
-        static std::atomic<int> first_pilot_report{0};
-        if (first_pilot_report.fetch_add(1, std::memory_order_relaxed) == 0) {
-            std::fprintf(stderr,
-                    "[ggml-cuda] GLM5.2 pilot prefetch: gate=%s experts=%ld bytes=%zu jobs=%d\n",
-                    src0_gate->name,
-                    (long) src0_gate->ne[2],
-                    (size_t) src0_gate->ne[1] * src0_gate->nb[1],
-                    pilot_jobs);
-        }
-    }
-
-    const bool done = ggml_cuda_moe_stream_up_gate_batch(
-        src0_up->type,
-        src0_gate->type,
-        src0_up->name,
-        src0_up->data,
-        src0_gate->name,
-        src0_gate->data,
-        src0_up->ne[2],
-        src0_up->ne[1],
-        src0_up->ne[0],
-        src0_up->nb[1],
-        src0_up->nb[2],
-        (size_t) src0_up->ne[1] * src0_up->nb[1],
-        src0_gate->nb[1],
-        src0_gate->nb[2],
-        (size_t) src0_gate->ne[1] * src0_gate->nb[1],
-        (const float *) src1_host.data(),
-        (size_t) src1->ne[0] * sizeof(float),
-        (size_t) src1->ne[0] * (size_t) src1->ne[1] * sizeof(float),
-        (float *) dst->data,
-        dst->nb[1],
-        dst->nb[2],
-        ggml_get_op_params_i32(dst, 0),
-        ggml_get_op_params_f32(dst, 1),
-        matrix_row_counts.data(),
-        matrix_rows.data(),
-        rows_stride);
-    if (!done) {
-        GGML_ABORT("GLM5.2 colibri fused up/gate dispatch declined");
-    }
-}
 
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -4033,18 +3083,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
     const bool mmid_f32_io = src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
-    const bool mmvq_fast_candidate = mmid_f32_io && ne2 <= MMVQ_MAX_BATCH_SIZE &&
-        ggml_is_quantized(src0->type) && ne2 <= mmvq_mmid_max;
     const bool mmvf_fast_candidate = mmid_f32_io && ne2 <= MMVQ_MAX_BATCH_SIZE &&
         !ggml_is_quantized(src0->type) && GGML_CUDA_CC_IS_AMD(cc);
-    const bool mmq_fast_candidate = mmid_f32_io &&
-        ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02);
-    const bool mmf_fast_candidate = mmid_f32_io &&
-        ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true);
 
-    if (ggml_cuda_try_glm52_colibri_mul_mat_id(ctx, dst)) {
-        return;
-    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (mmid_f32_io) {
@@ -4052,17 +3093,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 if (ne2 <= mmvq_mmid_max) {
-                    ds4_exact_mmid_dataflow_probe_write(
-                        "mmvq", cc, src0, src1, ids, dst, mmvq_mmid_max,
-                        mmvq_fast_candidate, mmq_fast_candidate, mmf_fast_candidate);
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
             } else {
                 if (mmvf_fast_candidate) {
-                    ds4_exact_mmid_dataflow_probe_write(
-                        "mmvf", cc, src0, src1, ids, dst, mmvq_mmid_max,
-                        mmvq_fast_candidate, mmq_fast_candidate, mmf_fast_candidate);
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -4070,25 +3105,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ds4_exact_mmid_dataflow_probe_write(
-                "mmq", cc, src0, src1, ids, dst, mmvq_mmid_max,
-                mmvq_fast_candidate, mmq_fast_candidate, mmf_fast_candidate);
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-            ds4_exact_mmid_dataflow_probe_write(
-                "mmf", cc, src0, src1, ids, dst, mmvq_mmid_max,
-                mmvq_fast_candidate, mmq_fast_candidate, mmf_fast_candidate);
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
     }
 
-    ds4_exact_mmid_dataflow_probe_write(
-        "slow_sync", cc, src0, src1, ids, dst, mmvq_mmid_max,
-        mmvq_fast_candidate, mmq_fast_candidate, mmf_fast_candidate);
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     // TODO: add asserts to verify this. should work with CUDA, HIP, etc.
@@ -4486,9 +3512,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
-        case GGML_OP_MOE_FUSED_UP_GATE:
-            ggml_cuda_op_moe_fused_up_gate(ctx, dst);
-            break;
         case GGML_OP_HC_WEIGHTED_SUM:
             ggml_cuda_op_hc_weighted_sum(ctx, dst);
             break;
@@ -4497,13 +3520,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
-            break;
-        case GGML_OP_LIGHTNING_INDEXER:
-#ifdef GGML_CUDA_NO_LIGHTNING_INDEXER
-            GGML_ABORT("CUDA lightning indexer was disabled at build time");
-#else
-            ggml_cuda_op_lightning_indexer(ctx, dst);
-#endif
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -4666,6 +3682,16 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+#ifdef GGML_SSD_CUDA_EXECUTOR
+    if (cuda_ctx->ssd_services) {
+        const auto & services = *cuda_ctx->ssd_services;
+        services.gpu->transport->quiesce(services.gpu_transport);
+        if (g_cuda_context_reserves.remove(cuda_ctx) != ssd::status::ok) {
+            GGML_ABORT("cannot unregister CUDA context allocation reserve");
+        }
+        cuda_ctx->ssd_services = nullptr;
+    }
+#endif
     delete cuda_ctx;
     delete backend;
 }
@@ -4677,50 +3703,6 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
-}
-
-extern "C" bool ggml_cuda_moe_expert_pack_copy_ranges_to_tensor(
-        ggml_backend_t backend,
-        ggml_tensor *tensor,
-        const char *tensor_name,
-        const int32_t *range_first,
-        const int32_t *range_last,
-        size_t range_count,
-        int64_t n_expert,
-        size_t expert_bytes,
-        size_t padding,
-        bool cache_bypass,
-        uint64_t *experts_copied,
-        uint64_t *iouring_reads,
-        uint64_t *iouring_bytes,
-        uint64_t *cache_lookups,
-        uint64_t *cache_hits) {
-    if (!backend || !tensor || !ggml_backend_is_cuda(backend)) return false;
-    ggml_backend_cuda_context *cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-    if (!buffer || buffer->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device)) return false;
-    ggml_cuda_set_device(cuda_ctx->device);
-    return ggml_cuda_moe_expert_pack_copy_ranges_to_device(
-        tensor_name, range_first, range_last, range_count, n_expert,
-        expert_bytes, padding, cache_bypass, tensor->data, ggml_nbytes(tensor),
-        reinterpret_cast<void *>(cuda_ctx->stream()), experts_copied,
-        iouring_reads, iouring_bytes, cache_lookups, cache_hits);
-}
-
-// a weight homed on the drive (the expert transport indexes it in blocks) into its copy on the device, on the
-// backend's stream; read_ahead_hit: its blocks had been read ahead
-extern "C" bool ggml_cuda_moe_dense_copy_to_tensor(
-        ggml_backend_t backend,
-        ggml_tensor *tensor,
-        const char *tensor_name,
-        bool *read_ahead_hit) {
-    if (!backend || !tensor || !ggml_backend_is_cuda(backend)) return false;
-    ggml_backend_cuda_context *cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-    if (!buffer || buffer->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device)) return false;
-    ggml_cuda_set_device(cuda_ctx->device);
-    return ggml_cuda_moe_dense_copy_to_device(tensor_name, tensor->data, ggml_nbytes(tensor),
-        reinterpret_cast<void *>(cuda_ctx->stream()), read_ahead_hit);
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -4982,8 +3964,7 @@ static bool ggml_cuda_graph_update_required(
         const ggml_cuda_graph_key & graph_key) {
     bool res = false;
 
-    static const bool ignore_metadata_props =
-        std::getenv("GGML_CUDA_GRAPH_IGNORE_METADATA_PROPS") != nullptr;
+    constexpr bool ignore_metadata_props = false; // Historical unset default.
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
@@ -5090,13 +4071,7 @@ static bool ggml_cuda_graph_update_executable(
 // remembers work the capture recorded but never ran. Dense activation-quant reuse does (a capture
 // registers quantized activations that the eager pass would then skip), so it keeps the abort.
 static bool ggml_cuda_graph_oom_fallback_allowed() {
-    static const bool allowed = []() {
-        const char * value = std::getenv("GGML_CUDA_DENSE_ACTIVATION_QUANT_REUSE");
-        const bool reuse = value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
-            std::strcmp(value, "false") != 0;
-        return !reuse;
-    }();
-    return allowed;
+    return true; // Activation-quant reuse is disabled by the fixed production profile.
 }
 #endif // USE_CUDA_GRAPH
 
@@ -5563,21 +4538,7 @@ static void ggml_cuda_graph_evaluate_and_capture(
 
     bool graph_evaluated_or_captured = false;
 
-#ifdef USE_CUDA_GRAPH
-    ggml_cuda_graph * layer_gap_graph =
-        g_kimi_layer_gap_cuda_enabled ? cuda_ctx->cuda_graph(graph_key) : nullptr;
-    int layer_gap_router_node = -1;
-    if (layer_gap_graph != nullptr) {
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            const char * name = cgraph->nodes[i] != nullptr ? cgraph->nodes[i]->name : nullptr;
-            if (name != nullptr && std::strstr(name, "ffn_moe_logits-") != nullptr) {
-                layer_gap_router_node = i;
-                break;
-            }
-        }
-        layer_gap_graph->gap_trace_pending.evaluate_start_us = (uint64_t) ggml_time_us();
-    }
-#endif
+
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -5674,18 +4635,8 @@ static void ggml_cuda_graph_evaluate_and_capture(
                 stream_ctx.concurrent_events.clear();
             }
 
-#ifdef USE_CUDA_GRAPH
-            if (layer_gap_graph != nullptr && !use_cuda_graph) {
-                CUDA_CHECK(cudaEventRecord(layer_gap_graph->gap_trace_start_event, cuda_ctx->stream()));
-            }
-#endif
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-#ifdef USE_CUDA_GRAPH
-                if (layer_gap_graph != nullptr && !use_cuda_graph && i == layer_gap_router_node) {
-                    CUDA_CHECK(cudaEventRecord(layer_gap_graph->gap_trace_router_event, cuda_ctx->stream()));
-                }
-#endif
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -6103,26 +5054,12 @@ static void ggml_cuda_graph_evaluate_and_capture(
                 }
                 GGML_ASSERT(ok);
 
-#ifdef USE_CUDA_GRAPH
-                if (layer_gap_graph != nullptr && !use_cuda_graph && i == layer_gap_router_node) {
-                    CUDA_CHECK(cudaEventRecord(layer_gap_graph->gap_trace_router_done_event, cuda_ctx->stream()));
-                }
-#endif
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                 }
             }
 
-#ifdef USE_CUDA_GRAPH
-            if (layer_gap_graph != nullptr && !use_cuda_graph) {
-                if (layer_gap_router_node < 0) {
-                    CUDA_CHECK(cudaEventRecord(layer_gap_graph->gap_trace_router_event, cuda_ctx->stream()));
-                    CUDA_CHECK(cudaEventRecord(layer_gap_graph->gap_trace_router_done_event, cuda_ctx->stream()));
-                }
-                CUDA_CHECK(cudaEventRecord(layer_gap_graph->gap_trace_end_event, cuda_ctx->stream()));
-            }
-#endif
         }
 
 #ifdef USE_CUDA_GRAPH
@@ -6136,9 +5073,7 @@ static void ggml_cuda_graph_evaluate_and_capture(
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph->pool_end = cuda_ctx->pool().peak();
             cuda_ctx->graph_capture_calls++;
-            if (g_kimi_layer_gap_cuda_enabled) {
-                graph->gap_trace_kernel_nodes = kimi_layer_gap_cuda_count_kernel_nodes(graph->graph);
-            }
+
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -6150,17 +5085,13 @@ static void ggml_cuda_graph_evaluate_and_capture(
         }
     }
 
-    if (layer_gap_graph != nullptr) {
-        layer_gap_graph->gap_trace_pending.evaluate_end_us = (uint64_t) ggml_time_us();
-    }
+
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         const char * oom_stage = nullptr;
         const bool oom_fallback = ggml_cuda_graph_oom_fallback_allowed();
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            if (g_kimi_layer_gap_cuda_enabled) {
-                graph->gap_trace_pending.instantiate_start_us = (uint64_t) ggml_time_us();
-            }
+
             const cudaError_t rc = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
             if (rc == cudaErrorMemoryAllocation && oom_fallback) {
                 (void)cudaGetLastError();
@@ -6169,31 +5100,22 @@ static void ggml_cuda_graph_evaluate_and_capture(
             } else {
                 CUDA_CHECK(rc);
             }
-            if (g_kimi_layer_gap_cuda_enabled) {
-                graph->gap_trace_pending.instantiate_end_us = (uint64_t) ggml_time_us();
-            }
+
             cuda_ctx->graph_instantiate_calls++;
         }
         if (oom_stage == nullptr && cuda_graph_update_required) { // Update graph executable
-            if (g_kimi_layer_gap_cuda_enabled) {
-                graph->gap_trace_pending.update_start_us = (uint64_t) ggml_time_us();
-            }
+
             if (!ggml_cuda_graph_update_executable(cuda_ctx, graph_key)) {
                 if (!oom_fallback) {
                     CUDA_CHECK(cudaErrorMemoryAllocation);
                 }
                 oom_stage = "re-instantiate";
             }
-            if (g_kimi_layer_gap_cuda_enabled) {
-                graph->gap_trace_pending.update_end_us = (uint64_t) ggml_time_us();
-            }
+
             cuda_ctx->graph_exec_update_calls++;
         }
         if (oom_stage == nullptr) {
-            if (g_kimi_layer_gap_cuda_enabled) {
-                graph->gap_trace_pending.launch_start_us = (uint64_t) ggml_time_us();
-                CUDA_CHECK(cudaEventRecord(graph->gap_trace_start_event, cuda_ctx->stream()));
-            }
+
             // the launch itself can need device memory (e.g. kernels loaded on first use)
             const cudaError_t rc = cudaGraphLaunch(graph->instance, cuda_ctx->stream());
             if (rc == cudaErrorMemoryAllocation && oom_fallback) {
@@ -6225,12 +5147,7 @@ static void ggml_cuda_graph_evaluate_and_capture(
         if (!cuda_graph_update_required) {
             cuda_ctx->graph_replay_calls++;
         }
-        if (g_kimi_layer_gap_cuda_enabled) {
-            CUDA_CHECK(cudaEventRecord(graph->gap_trace_router_event, cuda_ctx->stream()));
-            CUDA_CHECK(cudaEventRecord(graph->gap_trace_router_done_event, cuda_ctx->stream()));
-            CUDA_CHECK(cudaEventRecord(graph->gap_trace_end_event, cuda_ctx->stream()));
-            graph->gap_trace_pending.launch_end_us = (uint64_t) ggml_time_us();
-        }
+
         cuda_ctx->graph_launch_calls++;
 #else
         GGML_UNUSED(graph_key);
@@ -6272,38 +5189,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     const auto graph_lookup = cuda_ctx->cuda_graph_begin(graph_key, cgraph->uid);
     ggml_cuda_graph * graph = graph_lookup.graph;
-    const bool layer_gap_trace = g_kimi_layer_gap_cuda_enabled;
-    if (layer_gap_trace) {
-        kimi_layer_gap_cuda_init_events(cuda_ctx, graph);
-        if (!kimi_layer_gap_cuda_collect_pending(cuda_ctx, graph) &&
-                graph->gap_trace_pending.valid) {
-            CUDA_CHECK(cudaEventSynchronize(graph->gap_trace_end_event));
-            kimi_layer_gap_cuda_collect_pending(cuda_ctx, graph);
-        }
-        graph->gap_trace_pending = {};
-        graph->gap_trace_pending.cpu_start_us = (uint64_t) ggml_time_us();
-        graph->gap_trace_pending.prepare_start_us = graph->gap_trace_pending.cpu_start_us;
-        graph->gap_trace_pending.n_nodes = cgraph->n_nodes;
-        if (cgraph->n_nodes > 0) {
-            kimi_layer_gap_cuda_copy_field(
-                graph->gap_trace_pending.first,
-                sizeof(graph->gap_trace_pending.first),
-                cgraph->nodes[0] != nullptr ? cgraph->nodes[0]->name : "");
-            kimi_layer_gap_cuda_copy_field(
-                graph->gap_trace_pending.last,
-                sizeof(graph->gap_trace_pending.last),
-                cgraph->nodes[cgraph->n_nodes - 1] != nullptr ?
-                    cgraph->nodes[cgraph->n_nodes - 1]->name : "");
-        }
-        for (int i = 0; i < cgraph->n_nodes; ++i) {
-            const char * name = cgraph->nodes[i] != nullptr ? cgraph->nodes[i]->name : nullptr;
-            if (name != nullptr && std::strstr(name, "ffn_moe_logits-") != nullptr) {
-                graph->gap_trace_pending.has_router = true;
-                graph->gap_trace_pending.router_layer = kimi_layer_gap_parse_layer(name);
-                break;
-            }
-        }
-    }
+
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
@@ -6329,9 +5215,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 } else {
                     cuda_ctx->graph_cache_reuse_direct++;
                 }
-                if (layer_gap_trace) {
-                    graph->gap_trace_pending.mode = properties_changed ? 4 : 5;
-                }
+
             } else if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
@@ -6339,15 +5223,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
-                    if (layer_gap_trace) {
-                        graph->gap_trace_pending.mode = 4;
-                    }
+
                 }
                 if (properties_changed) {
                     cuda_ctx->graph_fallback_warmup++;
-                    if (layer_gap_trace) {
-                        graph->gap_trace_pending.mode = 2;
-                    }
+
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
@@ -6357,38 +5237,26 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     graph->warmup_complete = false;
                     cuda_ctx->graph_fallback_changed++;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
-                    if (layer_gap_trace) {
-                        graph->gap_trace_pending.mode = 3;
-                    }
+
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
-                    if (layer_gap_trace) {
-                        graph->gap_trace_pending.mode =
-                            cuda_graph_update_required ? 4 : 5;
-                    }
+
                 }
             }
         } else {
             cuda_ctx->graph_fallback_ineligible++;
-            if (layer_gap_trace) {
-                graph->gap_trace_pending.mode = 1;
-            }
+
         }
     } else {
         cuda_ctx->graph_fallback_disabled++;
-        if (layer_gap_trace) {
-            graph->gap_trace_pending.mode = 0;
-        }
+
     }
 
     if (!use_cuda_graph) {
         cuda_ctx->graph_fallback_calls++;
     }
-    if (layer_gap_trace) {
-        graph->gap_trace_pending.router_timing_valid = !use_cuda_graph;
-        graph->gap_trace_pending.prepare_end_us = (uint64_t) ggml_time_us();
-    }
+
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -6400,22 +5268,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
         cuda_ctx->pool().reset_peak();
-#ifdef USE_CUDA_GRAPH
-        if (layer_gap_trace) {
-            graph->gap_trace_pending.prepare_end_us = (uint64_t) ggml_time_us();
-        }
-#endif
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
-#ifdef USE_CUDA_GRAPH
-    if (layer_gap_trace) {
-        graph->gap_trace_pending.cpu_end_us = (uint64_t) ggml_time_us();
-        graph->gap_trace_pending.kernel_nodes = graph->gap_trace_kernel_nodes;
-        graph->gap_trace_pending.valid = true;
-    }
-#endif
 
     return GGML_STATUS_SUCCESS;
 }
@@ -6885,6 +5741,42 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+#ifdef GGML_SSD_CUDA_EXECUTOR
+extern "C" void * ggml_backend_cuda_ssd_stream(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) { return nullptr; }
+    return reinterpret_cast<void *>(static_cast<ggml_backend_cuda_context *>(backend->context)->stream());
+}
+
+extern "C" int ggml_backend_cuda_ssd_device_ordinal(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) { return -1; }
+    return static_cast<ggml_backend_cuda_context *>(backend->context)->device;
+}
+
+extern "C" bool ggml_backend_cuda_ssd_attach_services(
+        ggml_backend_t backend, const ssd::runtime_services * services,
+        char * error, size_t error_size) noexcept {
+    auto refuse = [&](const char * message) noexcept {
+        if (error && error_size) { std::snprintf(error, error_size, "%s", message); }
+        return false;
+    };
+    if (!ggml_backend_is_cuda(backend)) { return refuse("SSD services require a CUDA backend"); }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (!services || !services->gpu || !services->cpu) {
+        return refuse("CUDA SSD services require explicit GPU and CPU providers");
+    }
+    if (context->ssd_services && context->ssd_services != services) {
+        return refuse("CUDA SSD services are already attached to another context");
+    }
+    if (services->gpu_device != context->device) { return refuse("CUDA SSD service device differs from backend"); }
+    if (g_cuda_context_reserves.add(context, context->device, services->gpu_reserve_bytes) != ssd::status::ok) {
+        return refuse("cannot register CUDA context allocation reserve");
+    }
+    context->ssd_services = services;
+    if (error && error_size) { error[0] = '\0'; }
+    return true;
+}
+#endif
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
@@ -7296,25 +6188,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                         return false;
                 }
             } break;
-        case GGML_OP_MOE_FUSED_UP_GATE:
-            {
-                struct ggml_tensor * up   = op->src[0];
-                struct ggml_tensor * gate = op->src[1];
-                struct ggml_tensor * act  = op->src[2];
-                struct ggml_tensor * ids  = op->src[3];
-                return ggml_cuda_glm52_colibri_requested() &&
-                    up != nullptr && gate != nullptr && act != nullptr && ids != nullptr &&
-                    up->type == GGML_TYPE_Q4_0 &&
-                    gate->type == GGML_TYPE_Q4_0 &&
-                    act->type == GGML_TYPE_F32 &&
-                    ids->type == GGML_TYPE_I32 &&
-                    op->type == GGML_TYPE_F32 &&
-                    ggml_cuda_glm52_external_expert_name(up->name) &&
-                    ggml_cuda_glm52_external_expert_name(gate->name) &&
-                    ggml_are_same_shape(up, gate) &&
-                    !ggml_is_transposed(up) &&
-                    !ggml_is_transposed(gate);
-            } break;
         case GGML_OP_OUT_PROD:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS:
@@ -7555,30 +6428,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
-        case GGML_OP_LIGHTNING_INDEXER:
-#ifdef GGML_CUDA_NO_LIGHTNING_INDEXER
-            return false;
-#else
-            // The CUDA kernel currently only handles n_embd=128, n_head=64
-            // (matches DeepSeek V3.2 / V4 indexer shapes). Other shapes
-            // GGML_ABORT inside the kernel; surface that here so the
-            // scheduler keeps the op on a backend that can run it.
-            return op->src[0]->type == GGML_TYPE_F32 &&
-                op->src[2]->type == GGML_TYPE_F32 &&
-                op->type == GGML_TYPE_F32 &&
-                op->src[0]->ne[0] == 128 &&
-                op->src[0]->ne[1] == 64 &&
-                op->src[1]->ne[0] == 128 &&
-                op->src[1]->ne[1] == 1 &&
-                (op->src[1]->type == GGML_TYPE_F32 ||
-                 op->src[1]->type == GGML_TYPE_F16 ||
-                 op->src[1]->type == GGML_TYPE_BF16 ||
-                 op->src[1]->type == GGML_TYPE_Q4_0 ||
-                 op->src[1]->type == GGML_TYPE_Q4_1 ||
-                 op->src[1]->type == GGML_TYPE_Q5_0 ||
-                 op->src[1]->type == GGML_TYPE_Q5_1 ||
-                 op->src[1]->type == GGML_TYPE_Q8_0);
-#endif
         case GGML_OP_PAD:
             return true;
         case GGML_OP_UPSCALE:
@@ -7776,6 +6625,11 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#ifdef GGML_SSD_CUDA_EXECUTOR
+    if (strcmp(name, "ggml_backend_cuda_ssd_api_v1") == 0) {
+        return (void *) ggml_backend_cuda_ssd_api_v1;
+    }
+#endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

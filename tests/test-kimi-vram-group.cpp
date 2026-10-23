@@ -1,4 +1,6 @@
-// The grouped prefill engine of the VRAM tier (kimi-vram-tier/group-compute-adapter.cu) against the CPU lane
+#include "ssd/gpu-kernels.h"
+#include "ssd/explicit-fixture-inputs.h"
+// The grouped prefill engine of the VRAM tier (ggml-cuda/ssd/group-compute-adapter.cu) against the CPU lane
 // (kimi_cpu_prefill_run_activation) on the same packed experts.
 //
 // Default: three expert formats, 16 experts, top 8, at 1, 33 and 300 tokens (one expert takes every token of the 300,
@@ -40,7 +42,6 @@
 #include "vram-compute-api.h"
 
 #include <cuda_runtime.h>
-#include <dlfcn.h>
 #include <strings.h>
 
 #include <atomic>
@@ -51,14 +52,7 @@ void cuda(cudaError_t rc, const char * what) {
 }
 
 const vram_group_compute_api * engine_api() {
-    auto get = reinterpret_cast<vram_group_compute_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_group_compute_get_api"));
-    if (!get) {
-        void * tier = dlopen("libkimi-vram-tier.so", RTLD_NOW | RTLD_GLOBAL);
-        require(tier, std::string("cannot load libkimi-vram-tier.so: ") + dlerror());
-        get = reinterpret_cast<vram_group_compute_get_api_fn>(dlsym(tier, "kimi_vram_group_compute_get_api"));
-    }
-    require(get, "kimi_vram_group_compute_get_api is missing from the tier DSO");
-    const auto * api = get();
+    const auto * api = kimi_vram_group_compute_get_api();
     require(api && api->version == 2 && api->size == sizeof(vram_group_compute_api), "grouped engine API version");
     return api;
 }
@@ -334,7 +328,7 @@ std::vector<float> run_engine(const vram_group_compute_api * api, engine_ptr & e
     return output;
 }
 
-void run_fixture(const vram_group_compute_api * api, const grouped_fixture & spec, bool in_place, size_t & checks, double & worst,
+void run_fixture(fixture_inputs & inputs, const vram_group_compute_api * api, const grouped_fixture & spec, bool in_place, size_t & checks, double & worst,
         bool & failed) {
     fixture f;
     f.type = spec.up;
@@ -343,8 +337,8 @@ void run_fixture(const vram_group_compute_api * api, const grouped_fixture & spe
     f.hidden = spec.hidden;
     f.experts = 16;
     make_synthetic(f, 20261021);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", "0", 1);
-    auto sink = make_sink(f, 8, 8);
+    inputs.set("vram_budget", "0");
+    auto sink = make_sink(inputs, f, 8, 8);
     char error[512] = {};
     std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)> prefill(
         kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
@@ -437,7 +431,7 @@ void run_fixture(const vram_group_compute_api * api, const grouped_fixture & spe
     }
 }
 
-void run_numerics(size_t & checks, double & worst) {
+void run_numerics(fixture_inputs & inputs, size_t & checks, double & worst) {
     const auto * api = engine_api();
     int in_place = 0;
     cuda(cudaDeviceGetAttribute(&in_place, cudaDevAttrPageableMemoryAccessUsesHostPageTables, 0), "attribute");
@@ -480,7 +474,7 @@ void run_numerics(size_t & checks, double & worst) {
         } },
     };
     bool failed = false;
-    for (const auto & spec : fixtures) { run_fixture(api, spec, in_place != 0, checks, worst, failed); }
+    for (const auto & spec : fixtures) { run_fixture(inputs, api, spec, in_place != 0, checks, worst, failed); }
     require(!failed, "the engine is above 5e-4 or above 1.5x the CPU lane against the exact layer, or the CPU lane is above "
         "1e-3 against it, or the lanes are 1.5e-3 apart");
 }
@@ -490,21 +484,21 @@ void run_numerics(size_t & checks, double & worst) {
 // place where the GPU reads host memory so), against the same sink without a GPU tier. A pass of one token runs the
 // vector engine with the post norm applied by the tier, as decode's rows are normalized by the CPU. Start values that
 // make the GPU cheap move transients; the CPU still computes the experts the planner leaves it.
-void run_tier_lane(size_t & checks, double & worst) {
+void run_tier_lane(fixture_inputs & inputs, size_t & checks, double & worst) {
     fixture f;
     f.type = GGML_TYPE_Q4_K; f.down_type = GGML_TYPE_Q5_K;
     f.latent = 512; f.hidden = 512; f.experts = 16;
     make_synthetic(f, 20261023);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "0", 1);
-    auto cpu = make_sink(f, 8, 4);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", std::to_string(uint64_t(4) * triplet_bytes(f)).c_str(), 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
-    setenv("GGML_KIMI_CPU_PREFILL_COST", "gpu_fixed_us=1,gpu_route_us=0.01,gpu_host_fixed_us=1,gpu_host_route_us=0.01", 1);
-    auto mixed = make_sink(f, 8, 4);
+    inputs.set("vram_budget", "0");
+    inputs.set("vram_prefill", "0");
+    auto cpu = make_sink(inputs, f, 8, 4);
+    inputs.set("vram_budget", std::to_string(uint64_t(4) * triplet_bytes(f)).c_str());
+    inputs.set("tier.keep_across_requests", "1");
+    inputs.set("tier.global", "1");
+    inputs.set("vram_prefill", "1");
+    inputs.set("tier.min_count", "0");
+    inputs.set("place_costs", "gpu_fixed_us=1,gpu_route_us=0.01,gpu_host_fixed_us=1,gpu_host_route_us=0.01");
+    auto mixed = make_sink(inputs, f, 8, 4);
     configure_cache(cpu.get(), 0, {1, 2}, f.experts);
     configure_cache(mixed.get(), 0, {1, 2}, f.experts);
     tensors meta(f, 1);
@@ -574,8 +568,8 @@ void run_tier_lane(size_t & checks, double & worst) {
         require(gs.stream.pending_reads == 0, "the lane returned with live reads");
         checks += 4;
     }
-    unsetenv("GGML_KIMI_CPU_PREFILL_COST");
-    setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "0", 1);
+    inputs.unset("place_costs");
+    inputs.set("vram_prefill", "0");
 }
 
 // least-squares line y = a + b x with both terms >= 0 (the engine's start values take no negative term): a line
@@ -729,15 +723,15 @@ struct cpu_lane {
     std::vector<int32_t> ids;
     kimi_cpu_sink_activation activation = {};
 
-    explicit cpu_lane(const time_options & options) : o(options) {
+    explicit cpu_lane(fixture_inputs & inputs, const time_options & options) : o(options) {
         f.type = o.up;
         f.down_type = o.down;
         f.latent = o.latent;
         f.hidden = o.hidden;
         f.experts = 1;
         make_synthetic(f, 20261024);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", "0", 1);
-        sink = make_sink(f, o.sink_threads(), 8);
+        inputs.set("vram_budget", "0");
+        sink = make_sink(inputs, f, o.sink_threads(), 8);
         char error[512] = {};
         prefill.reset(kimi_cpu_prefill_create(sink.get(), error, sizeof(error)));
         require(prefill != nullptr, error);
@@ -809,7 +803,7 @@ struct link_copy {
 // for the GPU lane the CPU lane on its participants and, when the weights come from device memory, the link copying one
 // expert after another; for the CPU lane the GPU lane (in place where it can be, else from device memory, with the
 // link). The drive's reads into host memory are not reproduced. Lines are fitted to each.
-void run_timing(const time_options & o) {
+void run_timing(fixture_inputs & inputs, const time_options & o) {
     const auto * api = engine_api();
     const double expert_bytes = double(o.expert_bytes());
     std::vector<double> x(o.counts.begin(), o.counts.end());
@@ -830,7 +824,7 @@ void run_timing(const time_options & o) {
         require(load.finish(), std::string("the ") + what + " load did not run: " + load.error);
     };
     std::unique_ptr<cpu_lane> cpu;
-    if (o.cpu) { cpu = std::make_unique<cpu_lane>(o); }
+    if (o.cpu) { cpu = std::make_unique<cpu_lane>(inputs, o); }
     link_copy link(o.expert_bytes());
 
     gpu_lane device(api, o, false);
@@ -893,11 +887,12 @@ void run_timing(const time_options & o) {
 } // namespace
 
 int main(int argc, char ** argv) {
+    fixture_inputs inputs; inputs.set_runtime_services(test_gpu_services());
     try {
         ggml_cpu_init();
-        setenv("GGML_KIMI_CPU_SINK_READY_FIRST", "1", 1);
-        setenv("GGML_KIMI_CPU_SINK_SPLIT_CV", "1", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", "0", 1);
+        inputs.set("ready_first", "1");
+        inputs.set("split_cv", "1");
+        inputs.set("vram_budget", "0");
         cuda(cudaSetDevice(0), "cudaSetDevice");
         bool timing = false;
         time_options o;
@@ -917,14 +912,14 @@ int main(int argc, char ** argv) {
             else { throw std::runtime_error("unknown argument " + a); }
         }
         if (timing) {
-            run_timing(o);
+            run_timing(inputs, o);
             std::printf("KIMI_VRAM_GROUP_TIME_DONE\n");
             return 0;
         }
         size_t checks = 0;
         double worst = 0.0, lane_worst = 0.0;
-        run_numerics(checks, worst);
-        run_tier_lane(checks, lane_worst);
+        run_numerics(inputs, checks, worst);
+        run_tier_lane(inputs, checks, lane_worst);
         std::printf("KIMI_VRAM_GROUP_PASS checks=%zu worst_token_nmse_against_exact=%.3g lane_against_cpu=%.3g\n", checks,
             worst, lane_worst);
         return 0;

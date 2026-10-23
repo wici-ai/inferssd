@@ -7,12 +7,7 @@
 #include <cstring>
 
 static bool q8_K_parallel_enabled() {
-    static const bool enabled = []() {
-        const char * value = std::getenv("GGML_CUDA_DENSE_Q8_K_QUANT_PARALLEL");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
-            std::strcmp(value, "false") != 0;
-    }();
-    return enabled;
+    return false; // Frozen production profile: historical unset default.
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

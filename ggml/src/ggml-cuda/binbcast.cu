@@ -1,5 +1,4 @@
 #include "binbcast.cuh"
-#include "cpu-parity.cuh"
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -21,10 +20,6 @@ static __device__ __forceinline__ float op_sub(const float a, const float b) {
 
 static __device__ __forceinline__ float op_mul(const float a, const float b) {
     return a * b;
-}
-
-static __device__ __forceinline__ float op_mul_cpu_parity(const float a, const float b) {
-    return ggml_cuda_kimi_mul_f32_cpu(a, b);
 }
 
 static __device__ __forceinline__ float op_div(const float a, const float b) {
@@ -260,19 +255,7 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
         GGML_ASSERT(nb02 % sizeof(src0_t) == 0);
         GGML_ASSERT(nb03 % sizeof(src0_t) == 0);
 
-        if (nb10 % sizeof(src1_t) != 0) {
-            const char * env = std::getenv("GGML_CUDA_BINBCAST_DEBUG");
-            if (env && env[0] && env[0] != '0') {
-                std::fprintf(stderr,
-                    "binbcast debug: dst=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] "
-                    "src0=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] "
-                    "src1=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] sizeof_src1=%zu\n",
-                    dst->name,  ggml_type_name(dst->type),  dst->ne[0],  dst->ne[1],  dst->ne[2],  dst->ne[3],  nb0,  nb1,  nb2,  nb3,
-                    src0->name, ggml_type_name(src0->type), src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], nb00, nb01, nb02, nb03,
-                    src1->name, ggml_type_name(src1->type), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], nb10, nb11, nb12, nb13,
-                    sizeof(src1_t));
-            }
-        }
+
         GGML_ASSERT(nb10 % sizeof(src1_t) == 0);
         GGML_ASSERT(nb11 % sizeof(src1_t) == 0);
         GGML_ASSERT(nb12 % sizeof(src1_t) == 0);
@@ -426,13 +409,6 @@ void ggml_cuda_op_sub(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (dst->ne[0] == 7168 && ggml_nelements(dst) <= 3*7168 &&
-            ggml_cuda_kimi_kda_cpu_parity_enabled(dst)) {
-        ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul_cpu_parity>>(
-            dst->src[0], dst->src[1], dst,
-            dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
-        return;
-    }
     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_mul>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
 }
 

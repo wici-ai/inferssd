@@ -14,12 +14,7 @@
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 static bool ggml_cuda_q4k_mmvq_row_pack_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("GGML_CUDA_Q4_K_MMVQ_ROW_PACK");
-        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
-            std::strcmp(env, "false") != 0;
-    }();
-    return enabled;
+    return false; // Frozen production profile: historical unset default.
 }
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {
@@ -1218,7 +1213,7 @@ void ggml_cuda_op_mul_mat_vec_q(
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }
 
-#ifdef GGML_CUDA_MOE_STREAM
+#ifdef GGML_SSD_CUDA_EXECUTOR
 extern "C" bool ggml_cuda_moe_stream_mmvf_dev(
     int, const void *, int64_t, int64_t, size_t, const float *, float *, int64_t, cudaStream_t);
 extern "C" bool ggml_cuda_moe_stream_mmvq_dev(
@@ -1373,7 +1368,7 @@ extern "C" bool ggml_cuda_moe_stream_mmvq_batch_dev(
     }
     return true;
 }
-#endif // GGML_CUDA_MOE_STREAM
+#endif // GGML_SSD_CUDA_EXECUTOR
 
 size_t ggml_cuda_mul_mat_vec_q_pool_size(const ggml_tensor * src1) {
     const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);

@@ -2,7 +2,7 @@
 // backend's ggml_vec_dot_mxfp4_q8_0, plus the host clamped-SwiGLU/Q8_0 bridge
 // the VRAM tier runs between its two matvec stages. Synthetic MXFP4 weights at
 // the DeepSeek-V4.1 expert shapes; no model or VRAM tier is involved.
-// usage: test-kimi-mxfp4-parity path/to/libkimi-mxfp4-parity.so
+// usage: test-kimi-mxfp4-parity
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-kimi-mxfp4-parity.h"
@@ -11,7 +11,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -77,12 +76,8 @@ struct gpu {
     const kimi_mxfp4_gpu_api_v1 * api = nullptr;
     kimi_mxfp4_gpu * handle = nullptr;
     std::vector<void *> held;
-    explicit gpu(const char * path) {
-        void * so = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-        need(so, dlerror());
-        auto get = reinterpret_cast<const kimi_mxfp4_gpu_api_v1 * (*)()>(dlsym(so, "kimi_mxfp4_gpu_get_api_v1"));
-        need(get, "API export");
-        api = get();
+    gpu() {
+        api = kimi_mxfp4_gpu_get_api_v1();
         need(api->version == 1 && api->job_size == sizeof(kimi_mxfp4_gpu_job), "ABI");
         char err[256] = {};
         const kimi_mxfp4_gpu_config odd_columns{0, 32, 5000, 5120};
@@ -129,9 +124,9 @@ static kimi_mxfp4_gpu_job job(void * w, size_t bytes, int columns, int rows, siz
 
 int main(int argc, char ** argv) {
     try {
-        need(argc == 2, "usage: test-kimi-mxfp4-parity path/to/libkimi-mxfp4-parity.so");
+        need(argc == 1, "usage: test-kimi-mxfp4-parity ");
         ggml_cpu_init();
-        gpu g(argv[1]);
+        gpu g;
         std::mt19937 rng(20260914);
         std::normal_distribution<float> normal(0.0f, 1.0f);
         const int latent = 5120, hidden = 2304;

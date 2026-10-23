@@ -10,6 +10,10 @@ file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
 
 add_library(llama
             ../include/llama.h
+            ../include/llama-ssd.h
+            ssd/options.cpp
+            ssd/model-source.cpp
+            ssd/model-pages.cpp
             llama.cpp
             llama-adapter.cpp
             llama-arch.cpp
@@ -25,6 +29,10 @@ add_library(llama
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
             llama-kv-cache-dsv4.cpp
+            inferssd/state-range.cpp
+            inferssd/state-iswa.cpp
+            inferssd/state-dsv4.cpp
+            inferssd/state-dsv4-constants.h
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
@@ -54,6 +62,8 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+target_link_libraries(llama PRIVATE ggml-ssd)
+target_include_directories(llama PRIVATE ../ggml/src)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

@@ -1,4 +1,4 @@
-#include "../ggml/src/ggml-cuda/moe-common-dynamic-tier.h"
+#include "../testing/legacy-cuda/moe-common-dynamic-tier.h"
 
 #include <algorithm>
 #include <array>

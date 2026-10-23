@@ -385,6 +385,9 @@ extern "C" {
 
         // A source/target context whose model tensors or runtime outputs may be shared.
         struct llama_context * ctx_other;
+
+        // Optional immutable SSD extension; copied during context creation.
+        const struct llama_ssd_options * ssd_options;
     };
 
     struct llama_model_tensor_override {
@@ -988,8 +991,10 @@ extern "C" {
     // Requires the context to have a memory.
     // For encode-decoder contexts, processes the batch using the decoder.
     // Positive return values does not mean a fatal error, but rather a warning.
-    // Upon fatal-error or abort, the ubatches that managed to be been processed will remain in the memory state of the context
+    // Upon fatal-error or abort, successfully processed ubatches remain when the memory implementation can roll back the failing ubatch.
     //   To handle this correctly, query the memory state using llama_memory_seq_pos_min() and llama_memory_seq_pos_max()
+    // A memory implementation without rollback for a partly computed ubatch clears affected sequences on fatal error.
+    // Such sequences require checkpoint restore or replay. Supported pre-compute metadata transactions preserve prior state.
     // Upon other return values, the memory state is restored to the state before this call
     //    0 - success
     //    1 - could not find a KV slot for the batch (try reducing the size of the batch or increase the context)
@@ -1468,27 +1473,6 @@ extern "C" {
 
     ///  @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
 
-    // Force a phase transition or end-of-generation token once a degenerate
-    // repetition loop is detected. min_len is the shortest block considered;
-    // repeats is the number of prior occurrences required in the current phase.
-    // eog_override <= 0 means "pick automatically"; min_len/max_len/repeats <= 0
-    // fall back to the LLAMA_LOOP_STOP_* environment variables.
-    LLAMA_API struct llama_sampler * llama_sampler_init_loop_stop(
-            const struct llama_vocab * vocab,
-            int32_t   min_len,
-            int32_t   max_len,
-            int32_t   repeats,
-            llama_token eog_override,
-            bool      verbose);
-
-    // Inspect loop_stop immediately after accepting a token. The trigger remains
-    // valid until the sampler is applied for the next token.
-    LLAMA_API bool llama_sampler_loop_stop_triggered(
-            const struct llama_sampler * smpl,
-            int32_t * matched_len);
-
-    LLAMA_API int32_t llama_sampler_loop_stop_min_len(
-            const struct llama_sampler * smpl);
     LLAMA_API struct llama_sampler * llama_sampler_init_dry(
             const struct llama_vocab *  vocab,
                              int32_t    n_ctx_train,

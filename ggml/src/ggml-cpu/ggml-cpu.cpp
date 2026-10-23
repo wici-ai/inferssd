@@ -1,8 +1,9 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
-#include "kimi-cpu-sink.h"
-#include "kimi-cpu-prefill.h"
+#include "ssd/cpu-sink.h"
+#include "ssd/cpu-prefill.h"
+#include "ssd/api.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -12,9 +13,10 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
-#include <mutex>
+#include <cstring>
 #include <string>
 #include <vector>
+#include <new>
 
 #ifdef GGML_USE_CPU_HBM
 #    include "hbm.h"
@@ -42,126 +44,6 @@
 #    include <sys/sysctl.h>
 #    include <sys/types.h>
 #endif
-
-extern "C" bool ggml_cpu_layer_gap_trace_enabled();
-extern "C" void ggml_cpu_layer_gap_trace_node(
-    uint64_t start_us,
-    uint64_t end_us,
-    int op,
-    const char * op_name,
-    const char * name);
-
-struct kimi_layer_gap_cpu_entry {
-    uint64_t start_us = 0;
-    uint64_t end_us = 0;
-    int op = 0;
-    char op_name[32] = {};
-    char name[GGML_MAX_NAME] = {};
-};
-
-struct kimi_layer_gap_cpu_buffer {
-    std::vector<kimi_layer_gap_cpu_entry> entries;
-};
-
-static const char * const g_kimi_layer_gap_cpu_prefix =
-    std::getenv("GGML_MOE_TRACE_LAYER_GAPS");
-static const bool g_kimi_layer_gap_cpu_enabled =
-    g_kimi_layer_gap_cpu_prefix != nullptr && g_kimi_layer_gap_cpu_prefix[0] != '\0';
-static std::once_flag g_kimi_layer_gap_cpu_init_once;
-
-static std::mutex & kimi_layer_gap_cpu_registry_mutex() {
-    static auto * mutex = new std::mutex();
-    return *mutex;
-}
-
-static std::vector<kimi_layer_gap_cpu_buffer *> & kimi_layer_gap_cpu_registry() {
-    static auto * registry = new std::vector<kimi_layer_gap_cpu_buffer *>();
-    return *registry;
-}
-
-static void kimi_layer_gap_cpu_copy_field(char * dst, size_t dst_size, const char * src) {
-    if (dst_size == 0) {
-        return;
-    }
-    size_t out = 0;
-    for (const char * p = src != nullptr ? src : ""; *p != '\0' && out + 1 < dst_size; ++p) {
-        const char ch = *p;
-        dst[out++] = ch == ',' || ch == '\n' || ch == '\r' ? ' ' : ch;
-    }
-    dst[out] = '\0';
-}
-
-static void kimi_layer_gap_cpu_report_atexit() {
-    if (!g_kimi_layer_gap_cpu_enabled) {
-        return;
-    }
-    const std::string path = std::string(g_kimi_layer_gap_cpu_prefix) + ".cpu.csv";
-    FILE * file = std::fopen(path.c_str(), "w");
-    if (file == nullptr) {
-        std::fprintf(stderr, "[kimi_layer_gap] CPU trace open failed: %s\n", path.c_str());
-        return;
-    }
-    std::fprintf(file, "start_us,end_us,op,op_name,name\n");
-    size_t rows = 0;
-    {
-        std::lock_guard<std::mutex> lock(kimi_layer_gap_cpu_registry_mutex());
-        for (const kimi_layer_gap_cpu_buffer * buffer : kimi_layer_gap_cpu_registry()) {
-            for (const kimi_layer_gap_cpu_entry & entry : buffer->entries) {
-                std::fprintf(
-                    file,
-                    "%" PRIu64 ",%" PRIu64 ",%d,%s,%s\n",
-                    entry.start_us,
-                    entry.end_us,
-                    entry.op,
-                    entry.op_name,
-                    entry.name);
-                ++rows;
-            }
-        }
-    }
-    std::fclose(file);
-    std::fprintf(stderr, "[kimi_layer_gap] CPU trace written: %s (%zu rows)\n", path.c_str(), rows);
-}
-
-static kimi_layer_gap_cpu_buffer & kimi_layer_gap_cpu_thread_buffer() {
-    static thread_local kimi_layer_gap_cpu_buffer * buffer = nullptr;
-    if (buffer == nullptr) {
-        std::call_once(g_kimi_layer_gap_cpu_init_once, []() {
-            std::atexit(kimi_layer_gap_cpu_report_atexit);
-            std::fprintf(
-                stderr,
-                "[kimi_layer_gap] CPU trace enabled: prefix=%s\n",
-                g_kimi_layer_gap_cpu_prefix);
-        });
-        buffer = new kimi_layer_gap_cpu_buffer();
-        buffer->entries.reserve(1U << 18);
-        std::lock_guard<std::mutex> lock(kimi_layer_gap_cpu_registry_mutex());
-        kimi_layer_gap_cpu_registry().push_back(buffer);
-    }
-    return *buffer;
-}
-
-extern "C" bool ggml_cpu_layer_gap_trace_enabled() {
-    return g_kimi_layer_gap_cpu_enabled;
-}
-
-extern "C" void ggml_cpu_layer_gap_trace_node(
-        uint64_t start_us,
-        uint64_t end_us,
-        int op,
-        const char * op_name,
-        const char * name) {
-    if (!g_kimi_layer_gap_cpu_enabled || end_us <= start_us) {
-        return;
-    }
-    kimi_layer_gap_cpu_entry entry;
-    entry.start_us = start_us;
-    entry.end_us = end_us;
-    entry.op = op;
-    kimi_layer_gap_cpu_copy_field(entry.op_name, sizeof(entry.op_name), op_name);
-    kimi_layer_gap_cpu_copy_field(entry.name, sizeof(entry.name), name);
-    kimi_layer_gap_cpu_thread_buffer().entries.push_back(entry);
-}
 
 // ggml-backend interface
 
@@ -233,7 +115,37 @@ struct ggml_backend_cpu_context {
     void *              abort_callback_data;
 
     bool                use_ref;  // use reference implementation
+    void *              ssd_mac_cache; // context-owned; workers borrow while computing
+    const ssd::runtime_services * ssd_services;
+    size_t              ssd_plans;
 };
+
+static void ggml_backend_cpu_note_work_free(ggml_backend_cpu_context * context) noexcept {
+    if (context->ssd_services && context->ssd_services->host) {
+        (void) context->ssd_services->host->note_known_memory_change();
+    }
+}
+
+static uint8_t * ggml_backend_cpu_allocate_work(ggml_backend_cpu_context * context, size_t size) noexcept {
+    ssd::host::allocation_ticket ticket;
+    auto * host = context->ssd_services ? context->ssd_services->host : nullptr;
+    if (host) {
+        auto granted = host->take(size);
+        if (!granted) {
+            GGML_LOG_ERROR("%s: %s\n", __func__, granted.error.c_str());
+            return nullptr;
+        }
+        ticket = std::move(granted.value);
+    }
+    auto * data = new (std::nothrow) uint8_t[size];
+    if (!data) { return nullptr; }
+    if (host) {
+        // Account resident pages before returning the process pending budget.
+        std::memset(data, 0, size);
+        ticket.commit();
+    }
+    return data;
+}
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
     return "CPU";
@@ -243,6 +155,7 @@ static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_cpu_free(ggml_backend_t backend) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
+    if (cpu_ctx->work_data) { ggml_backend_cpu_note_work_free(cpu_ctx); }
     delete[] cpu_ctx->work_data;
     delete cpu_ctx;
     delete backend;
@@ -256,13 +169,14 @@ struct ggml_backend_plan_cpu {
 static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend_t backend, const struct ggml_cgraph * cgraph) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
-    struct ggml_backend_plan_cpu * cpu_plan = new ggml_backend_plan_cpu;
+    struct ggml_backend_plan_cpu * cpu_plan = new (std::nothrow) ggml_backend_plan_cpu;
+    if (!cpu_plan) { return nullptr; }
 
     cpu_plan->cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
     cpu_plan->cgraph = *cgraph; // FIXME: deep copy
 
     if (cpu_plan->cplan.work_size > 0) {
-        cpu_plan->cplan.work_data = new uint8_t[cpu_plan->cplan.work_size];
+        cpu_plan->cplan.work_data = ggml_backend_cpu_allocate_work(cpu_ctx, cpu_plan->cplan.work_size);
         if (cpu_plan->cplan.work_data == NULL) {
             delete cpu_plan;
             return NULL;
@@ -272,12 +186,17 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
+    cpu_plan->cplan.ssd_mac_cache       = cpu_ctx->ssd_mac_cache;
+    ++cpu_ctx->ssd_plans;
 
     return cpu_plan;
 }
 
 static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
+    auto * context = static_cast<ggml_backend_cpu_context *>(backend->context);
+    if (cpu_plan->cplan.work_data) { ggml_backend_cpu_note_work_free(context); }
+    --context->ssd_plans;
 
     delete[] cpu_plan->cplan.work_data;
     delete cpu_plan;
@@ -287,10 +206,12 @@ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backen
 
 static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
+    const auto * cpu_ctx = static_cast<ggml_backend_cpu_context *>(backend->context);
+    // A quiescent detach must also affect plans created before the detach.
+    cpu_plan->cplan.ssd_mac_cache = cpu_ctx->ssd_mac_cache;
 
     return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
 
-    GGML_UNUSED(backend);
 }
 
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -299,12 +220,17 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
 
     if (cpu_ctx->work_size < cplan.work_size) {
-        delete[] cpu_ctx->work_data;
-        cpu_ctx->work_data = new uint8_t[cplan.work_size];
-        if (cpu_ctx->work_data == NULL) {
+        if (!cpu_ctx->ssd_services || !cpu_ctx->ssd_services->host) {
+            // Preserve the ordinary backend's original free-before-grow peak.
+            delete[] cpu_ctx->work_data;
+            cpu_ctx->work_data = nullptr;
             cpu_ctx->work_size = 0;
-            return GGML_STATUS_ALLOC_FAILED;
         }
+        auto * fresh = ggml_backend_cpu_allocate_work(cpu_ctx, cplan.work_size);
+        if (!fresh) { return GGML_STATUS_ALLOC_FAILED; }
+        if (cpu_ctx->work_data) { ggml_backend_cpu_note_work_free(cpu_ctx); }
+        delete[] cpu_ctx->work_data;
+        cpu_ctx->work_data = fresh;
         cpu_ctx->work_size = cplan.work_size;
     }
     cplan.work_data = (uint8_t *)cpu_ctx->work_data;
@@ -312,6 +238,7 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
+    cplan.ssd_mac_cache       = cpu_ctx->ssd_mac_cache;
 
     return ggml_graph_compute(cgraph, &cplan);
 }
@@ -357,6 +284,9 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;
     ctx->use_ref             = false;
+    ctx->ssd_mac_cache       = nullptr;
+    ctx->ssd_services        = nullptr;
+    ctx->ssd_plans           = 0;
 
     ggml_backend_t cpu_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cpu_guid(),
@@ -375,6 +305,26 @@ ggml_backend_t ggml_backend_cpu_init(void) {
 
 bool ggml_backend_is_cpu(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cpu_guid());
+}
+
+// Private registry contract: the owner joins graph callers before changing
+// this borrowed handle. A nonempty binding cannot be silently replaced.
+static bool ggml_backend_cpu_set_ssd_mac_cache(ggml_backend_t backend, void * cache) noexcept {
+    if (!ggml_backend_is_cpu(backend)) { return false; }
+    auto * context = static_cast<ggml_backend_cpu_context *>(backend->context);
+    if (cache && context->ssd_mac_cache && cache != context->ssd_mac_cache) { return false; }
+    context->ssd_mac_cache = cache;
+    return true;
+}
+
+static bool ggml_backend_cpu_set_ssd_runtime_services(
+        ggml_backend_t backend, const ssd::runtime_services * services) noexcept {
+    if (!ggml_backend_is_cpu(backend)) { return false; }
+    auto * context = static_cast<ggml_backend_cpu_context *>(backend->context);
+    if (services == context->ssd_services) { return true; }
+    if (context->work_size || context->ssd_plans || (services && context->ssd_services)) { return false; }
+    context->ssd_services = services;
+    return true;
 }
 
 void ggml_backend_cpu_set_n_threads(ggml_backend_t backend_cpu, int n_threads) {
@@ -766,7 +716,72 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
+// Normal links bind these callbacks to this CPU backend, including with local
+// dynamic loading. Consumers do not search process-global symbols.
+static ggml_ssd_mac_cache * ggml_backend_cpu_ssd_mac_create(
+        const ssd::settings::snapshot * settings, const ssd::runtime_services * services,
+        char * error, size_t size) noexcept {
+#if defined(__APPLE__)
+    return ssd::mac::create_configured(settings, services, error, size);
+#else
+    GGML_UNUSED(settings);
+    GGML_UNUSED(services);
+    if (error && size) { std::snprintf(error, size, "Mac expert sources require an Apple CPU backend"); }
+    return nullptr;
+#endif
+}
+
+static void ggml_backend_cpu_ssd_mac_destroy(ggml_ssd_mac_cache * cache) noexcept {
+#if defined(__APPLE__)
+    ssd::mac::destroy(cache);
+#else
+    GGML_UNUSED(cache);
+#endif
+}
+
+static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
+    static const ssd::cpu::api_v2 api = {
+        2, sizeof(ssd::cpu::api_v2),
+        &kimi_cpu_sink_source_size,
+        &ssd::cpu::create_configured,
+        &kimi_cpu_sink_run,
+        &kimi_cpu_sink_run_activation,
+        &kimi_cpu_sink_destroy,
+        &kimi_cpu_sink_cache_configure,
+        &kimi_cpu_sink_cache_begin,
+        &kimi_cpu_sink_vram_phase_complete,
+        &kimi_cpu_sink_cache_get_stats,
+        &ssd::cpu::cache_make_room_configured,
+        &ssd::cpu::cache_prefill_room_configured,
+        &kimi_cpu_sink_prefetch_hint,
+        &kimi_cpu_sink_vram_reserve,
+        &kimi_cpu_prefill_create,
+        &kimi_cpu_prefill_run,
+        &kimi_cpu_prefill_run_activation,
+        &kimi_cpu_prefill_destroy,
+        &ggml_backend_cpu_ssd_mac_create,
+        &ggml_backend_cpu_ssd_mac_destroy,
+        &ggml_backend_cpu_set_ssd_mac_cache,
+        &ssd::cpu::take_room_configured,
+        &ggml_backend_cpu_set_ssd_runtime_services,
+        sizeof(ssd::runtime_services),
+    };
+    return &api;
+}
+
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_cpu_set_ssd_runtime_services") == 0) {
+        return (void *) ggml_backend_cpu_set_ssd_runtime_services;
+    }
+    if (strcmp(name, "ggml_backend_cpu_set_ssd_mac_cache") == 0) {
+        return (void *) ggml_backend_cpu_set_ssd_mac_cache;
+    }
+    if (strcmp(name, "ggml_backend_cpu_ssd_kernels_v1") == 0) {
+        return (void *) ssd::cpu::kernels;
+    }
+    if (strcmp(name, "ggml_backend_cpu_ssd_api_v2") == 0) {
+        return (void *) ggml_backend_cpu_ssd_api_v2;
+    }
     if (strcmp(name, "kimi_cpu_prefill_create") == 0) {
         return (void *) kimi_cpu_prefill_create;
     }

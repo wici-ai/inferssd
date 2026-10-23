@@ -14,7 +14,7 @@ fi
 listeners=$(ss -Hltn "sport = :$PORT") || exit 2
 [[ -z $listeners ]] || { echo "PORT $PORT is already in use" >&2; exit 2; }
 # The standard launcher uses this exact unit. Custom launchers must honor LAUNCH_SCOPE.
-scope=ssdash-arm-$(date +%s)-$$-$RANDOM.scope
+scope=inferssd-arm-$(date +%s)-$$-$RANDOM.scope
 manager=(systemctl)
 (( EUID == 0 )) || manager+=(--user)
 spid= wd= scope_started=0

@@ -48,6 +48,10 @@ typedef struct ggml_gallocr * ggml_gallocr_t;
 GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
 GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs);
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
+// Prefault only new writable host COMPUTE chunks. Zero disables this scoped
+// policy. Existing buffers and externally supplied tensor storage are untouched.
+GGML_API void ggml_gallocr_set_host_prefault(ggml_gallocr_t galloc, size_t page_size);
+GGML_API void ggml_gallocr_set_auto_reserve(ggml_gallocr_t galloc, bool enabled);
 
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
 // call with a worst-case graph to avoid buffer reallocations

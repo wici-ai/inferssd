@@ -1,21 +1,24 @@
+#include "ssd/explicit-fixture-inputs.h"
 // CUDA transport lifecycle test. A blocked compute callback makes borrowed
 // source lifetime observable, independently of GPU/CPU scheduling speed.
+#include "ssd/gpu-kernels.h"
 #include "vram-tier.cpp"
+#include "test-kimi-vram-format-fixture.h"
 #include <functional>
 
 namespace {
 std::mutex barrier_mutex;
 std::condition_variable barrier_cv;
 bool entered = false, proceed = false, inject_error = false;
-const vram_compute_api * real_compute = nullptr;
+const vram_format_compute_api * real_compute = nullptr;
 int blocked_compute(void * p,const vram_compute_expert * w,int n,const void * q,size_t bytes,
-                    float beta,float linear,float * out,char * error,size_t size) {
+                    const kimi_vram_activation * activation,float * out,char * error,size_t size) {
     {
         std::unique_lock<std::mutex> lock(barrier_mutex); entered = true; barrier_cv.notify_all();
         barrier_cv.wait(lock,[] { return proceed; });
     }
     if (inject_error) { std::snprintf(error,size,"injected worker error"); return 1; }
-    return real_compute->compute(p,w,n,q,bytes,beta,linear,out,error,size);
+    return real_compute->compute(p,w,n,q,bytes,activation,out,error,size);
 }
 int assertions = 0;
 void require(bool ok,const char * what) { ++assertions; if(!ok)throw std::runtime_error(what); }
@@ -24,29 +27,29 @@ void rejected(const std::function<void()> & fn) {
 }
 void unblock() { std::lock_guard<std::mutex> lock(barrier_mutex); proceed=true;barrier_cv.notify_all(); }
 }
-int main() { try {
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD","1",1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GPU_HIDDEN","0",1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY","lru",1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT","0",1);
-    const size_t role=28672;
-    std::vector<unsigned char> payload(role,0),q8(292,0);payload.back()=37;
+int main() {
+    fixture_inputs inputs; inputs.set_runtime_services(test_gpu_services()); try {
+    inputs.set("vram_async", "1");
+    inputs.set("tier.policy", "lru");
+    inputs.set("tier.min_count", "0");
+    const size_t role=lifecycle_role_bytes();
+    std::vector<unsigned char> payload(role,0);std::vector<float> input(256,0.0f);payload.back()=37;
     const void * data[]={payload.data(),payload.data(),payload.data()};
     kimi_vram_request requests[2]={};
     for(int j=0;j<2;++j){requests[j].layer=1;requests[j].expert=j;requests[j].weight=.7f;
         for(int i=0;i<3;++i)requests[j].role[i]={1,2,1000000,uint64_t(3*j+i)*role,role,3,4,5,6};}
-    vram_compute_api instrumented={};
-    tier t(32ULL<<20);
+    vram_format_compute_api instrumented={};
+    tier t(32ULL<<20, inputs.tier_policy(), nullptr, test_cpu_kernels());
     struct cleanup { ~cleanup(){unblock();} } cleanup_on_error;
     int slots[2]={};std::vector<float> out(512);
-    auto warm=[&]{t.begin(17,1,true);t.prepare(requests,1,256,256,slots);t.admit(requests[0],data,true);t.finish(out.data(),256);};
+    auto warm=[&]{t.begin(17,1,true);lifecycle_prepare(t,requests,1,slots);t.admit(requests[0],data,true);t.finish(out.data(),256);};
     warm();
-    real_compute=t.compute_api;instrumented=*real_compute;instrumented.compute=blocked_compute;
-    t.compute_api=&instrumented;
-    t.begin(17,2,true);t.prepare(requests,2,256,256,slots);
+    real_compute=t.format_api;instrumented=*real_compute;instrumented.compute=blocked_compute;
+    t.format_api=&instrumented;
+    t.begin(17,2,true);lifecycle_prepare(t,requests,2,slots);
     require(slots[0]>=0 && slots[1]<0,"mixed hit/admission not exercised");
     const int destination=t.table->admissions[1];
-    t.launch(q8.data(),q8.size(),4,25);
+    lifecycle_launch(t,input);
     {std::unique_lock<std::mutex> lock(barrier_mutex);require(barrier_cv.wait_for(lock,std::chrono::seconds(5),[]{return entered;}),"worker did not enter");}
     t.admit(requests[1],data,true);
     // Compute is still blocked. admit must have returned with source ownership
@@ -73,11 +76,11 @@ int main() { try {
     {
         std::lock_guard<std::mutex> lock(barrier_mutex);entered=proceed=false;inject_error=true;
     }
-    t.begin(17,2,true);t.prepare(requests,2,256,256,slots);t.launch(q8.data(),q8.size(),4,25);
+    t.begin(17,2,true);lifecycle_prepare(t,requests,2,slots);lifecycle_launch(t,input);
     {std::unique_lock<std::mutex> lock(barrier_mutex);require(barrier_cv.wait_for(lock,std::chrono::seconds(5),[]{return entered;}),"error worker did not enter");}
     t.admit(requests[1],data,true);unblock();char error[512]={};
     require(api_finish(&t,out.data(),256,error,sizeof(error))!=0 && std::strstr(error,"injected worker error"),"worker failure was hidden");
     require(!t.arena && !t.table && t.done && t.pending_uploads.empty() && t.upload_jobs.empty(),"error returned with borrowed work live");
-    t.compute_api=real_compute;
+    t.format_api=real_compute;
     std::printf("REAL_CUDA_ASYNC_LEASE_PASS assertions=%d\n",assertions);return 0;
 }catch(const std::exception & e){unblock();std::fprintf(stderr,"ASYNC_LEASE_FAIL: %s\n",e.what());return 1;} }

@@ -1,4 +1,4 @@
-SSDash third-party notices
+InferSSD third-party notices
 =========================
 
 Existing notices in AUTHORS, licenses/, vendor/ and individual source files
@@ -59,26 +59,13 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Legacy reference math
----------------------
+Historical reference math
+-------------------------
 
-The imported K3 reference routines in
-  ggml/src/ggml-cuda/kimi-q3k-reference-math.cuh
-and the glibc-derived expf implementation/table in
-  ggml/src/ggml-cuda/cpu-parity.cuh
-retain their source provenance. The glibc expf portion is LGPL-2.1-or-later.
-The license text is supplied at ggml/src/ggml-cuda/kimi-vram-tier/COPYING.LIB;
-see also that directory's THIRD_PARTY.md. The cpu-parity copy is compiled into
-libggml-cuda when its corresponding legacy paths are enabled, not only into
-a standalone parity library. These legacy K3 paths are scheduled for removal
-before v0.1.0.
-
-The fdlibm expm1f and tanhf routines retain this notice:
-
-Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
-Developed at SunPro, a Sun Microsystems, Inc. business.
-Permission to use, copy, modify, and distribute this software is freely
-granted, provided that this notice is preserved.
+The former K3 parity component and its glibc/fdlibm reference math were removed
+from the live source before v0.1.0. Their original authorship and LGPL notices
+remain with the source snapshots in Git history; those historical notices are
+not replaced by the repository's MIT license.
 
 External runtime dependencies
 -----------------------------

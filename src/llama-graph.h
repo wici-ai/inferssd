@@ -82,20 +82,6 @@ struct llama_cross {
 
 struct llm_graph_params;
 
-struct llm_moe_next_gate_shadow_output {
-    int source_layer = -1;
-    int target_layer = -1;
-    bool predicted = false;
-    ggml_tensor * tensor = nullptr;
-};
-
-struct llm_moe_route_score_output {
-    int layer = -1;
-    ggml_tensor * ids = nullptr;
-    ggml_tensor * scores = nullptr;
-    ggml_tensor * weights = nullptr;
-};
-
 //
 // llm_graph_input
 //
@@ -666,12 +652,7 @@ struct llm_graph_params {
 
     bool cpu_sink_decode = false;
     bool cpu_sink_prefill = false;
-    bool cpu_sink_guard = false;
     llama_kimi_cpu_sink_runtime * cpu_sink_runtime = nullptr;
-
-    // Effective value snapshots, including constants and canonical table rows.
-    llama_k3_decode_expert_policy k3_expert_policy;
-    llama_k3_decode_expert_table k3_expert_table;
 
     llm_graph_cb cb;
 
@@ -683,13 +664,6 @@ struct llm_graph_params {
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
-        // The experimental file can change routed-layer topology between
-        // calls. Rebuild so the model's file watcher can observe each update.
-        const char * skip_file = std::getenv("LLAMA_K3_DECODE_SKIP_MOE_LAYERS_FILE");
-        if ((arch == LLM_ARCH_KIMI_K3 || other.arch == LLM_ARCH_KIMI_K3) &&
-                skip_file && skip_file[0]) {
-            return false;
-        }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -743,11 +717,8 @@ struct llm_graph_params {
         }
 
         return
-            k3_expert_policy == other.k3_expert_policy &&
-            llama_k3_expert_tables_equal(k3_expert_table, other.k3_expert_table) &&
             cpu_sink_decode == other.cpu_sink_decode &&
             cpu_sink_prefill == other.cpu_sink_prefill &&
-            cpu_sink_guard == other.cpu_sink_guard &&
             cpu_sink_runtime == other.cpu_sink_runtime &&
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -775,13 +746,6 @@ public:
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp.at(il); }
-    const std::vector<llm_moe_next_gate_shadow_output> & get_moe_next_gate_shadow_outputs() const {
-        return t_moe_next_gate_shadow;
-    }
-    const std::vector<llm_moe_route_score_output> & get_moe_route_score_outputs() const {
-        return t_moe_route_score;
-    }
-
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
 
@@ -800,8 +764,6 @@ public:
     bool can_reuse(const llm_graph_params & params);
 
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
-    void add_moe_next_gate_shadow_output(int source_layer, int target_layer, bool predicted, ggml_tensor * tensor);
-    void add_moe_route_score_output(int layer, ggml_tensor * ids, ggml_tensor * scores, ggml_tensor * weights);
 
     void set_params(const llm_graph_params & params);
 
@@ -819,8 +781,6 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
     std::map<llama_seq_id, ggml_tensor*> t_sampled;
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
-    std::vector<llm_moe_next_gate_shadow_output> t_moe_next_gate_shadow;
-    std::vector<llm_moe_route_score_output> t_moe_route_score;
 
     std::vector<llm_graph_input_ptr> inputs;
 
@@ -894,7 +854,6 @@ struct llm_graph_context {
     const int64_t n_outputs;
     const bool cpu_sink_decode;
     const bool cpu_sink_prefill;
-    const bool cpu_sink_guard;
     llama_kimi_cpu_sink_runtime * const cpu_sink_runtime;
     // Set by a model around its build_moe_ffn call: the next layer's predicted experts for the CPU sink's
     // prefetch and its hint statistics (single-token decode only).
@@ -1049,22 +1008,6 @@ struct llm_graph_context {
                  int64_t   expert_mass_min = 0,
              ggml_tensor * post_exp_norm = nullptr,
                    float   post_exp_norm_eps = 1e-5f) const;
-
-    bool moe_next_gate_shadow_enabled() const;
-
-    int64_t moe_next_gate_shadow_topk(int64_t default_topk, int64_t n_expert) const;
-
-    ggml_tensor * build_moe_gate_topk_shadow(
-             ggml_tensor * cur,
-             ggml_tensor * gate_inp,
-             ggml_tensor * gate_inp_b,
-             ggml_tensor * exp_probs_b,
-                 int64_t   n_expert,
-                 int64_t   n_expert_used,
-            llama_expert_gating_func_type gating_op,
-                     int   source_layer,
-                     int   target_layer,
-                    bool   predicted) const;
 
     //
     // inputs
