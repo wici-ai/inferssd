@@ -24,7 +24,7 @@ def numerical(session, config, build, output):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     backend = config["backend"]
-    if backend not in ("CUDA0", "Metal"):
+    if backend not in ("CUDA0", "MTL0"):
         raise ValueError("readiness needs an explicit supported physical backend")
     binary = config["binary"]
     identities = {image["runtime_path"]: image for image in build["images"]}

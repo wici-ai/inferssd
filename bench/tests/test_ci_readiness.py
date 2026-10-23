@@ -23,7 +23,7 @@ def test_readiness_devices_exclude_local_performance_hosts():
     assert DEVICES == {"cloud-5090": "linux", "dgx-spark": "linux", "local-mbp": "darwin"}
 
 
-@pytest.mark.parametrize("backend", ["CUDA0", "Metal"])
+@pytest.mark.parametrize("backend", ["CUDA0", "MTL0"])
 def test_actual_requested_gpu_rows_are_required(backend):
     assert validate_csv(records(backend), backend) == 1
     for raw in (records("CPU"), records(backend, "0"), b"backend_name,supported\n"):

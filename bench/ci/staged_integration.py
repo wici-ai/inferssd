@@ -29,7 +29,7 @@ def run(args):
         raise ValueError("one or two distinct short model requests required")
     if any(item["model"] not in ("deepseek", "muse") for item in smokes):
         raise ValueError("unsupported readiness model")
-    backend = "Metal" if DEVICES[device] == "darwin" else "CUDA0"
+    backend = "MTL0" if DEVICES[device] == "darwin" else "CUDA0"
     if config["numerical"]["backend"] != backend:
         raise ValueError("numerical gate must use the actual device backend")
     if digest(args.config) != args.config_sha256:
