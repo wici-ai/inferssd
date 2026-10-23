@@ -45,12 +45,12 @@ struct sink_vram {
         double pageable_gbps = 0.0;  // a copy from pageable memory, until the tier measures one (0: link_gbps)
         double drive_gbps = 0.0;     // the drive while reads are in flight; 0: unknown until measured
         double drive_fixed_us = 0.0; // the drive's time per layer beyond its bytes: the read queue filling and draining
-        double gpu_token_us = -1.0;  // the batched engine's time per token outside its experts; -1: the output row
-                                     // over the link
+        double gpu_overhead_fixed_us = 0.0; // learned begin/finish cost, once per GPU layer (not per expert)
+        double gpu_token_us = -1.0;  // row-dependent overhead; -1: the lane's row transfers over the link
     } cost, prior;
     // Calibration: every grouped-prefill layer adds one sample, and the batched lanes' terms are refit over the
     // samples of the last forward pass (one per layer of the sink): the CPU and GPU lines by least squares over each
-    // expert's time against its routes, the GPU overhead as a ratio of sums. The drive's line is fitted with
+    // expert's time against its routes, GPU overhead as fixed plus per-row work. The drive's line is fitted with
     // decode's layers when the table is built (kimi_cpu_sink::place_table), the copy rates are the tier's.
     struct prefill_sample {
         kimi_prefill_fit cpu, gpu, gpu_host;
@@ -745,6 +745,14 @@ struct sink_vram {
     void observe_prefill_cpu(int routes, double us) {
         if (prefill_plan.valid && routes > 0) { prefill_cpu_fit.add(double(routes), us); }
     }
+    double overhead_row_prior(double locked_us_per_mb) const {
+        if (prior.gpu_token_us >= 0.0) { return prior.gpu_token_us; }
+        // The lane already separates per-route input work from per-row transfers. MXFP4 inputs are charged by
+        // route (token_bytes=0); the generic batch engine supplies both its input and output row sizes. Reuse the
+        // observed link rate, or its existing prior, without inventing a fixed launch-time constant.
+        const double us_per_mb = locked_us_per_mb > 0.0 ? locked_us_per_mb : 1e3 / prior.link_gbps;
+        return (double(prefill_lane.token_bytes) + double(prefill_lane.output_bytes)) / 1e6 * us_per_mb;
+    }
     // After each grouped-prefill layer: read_us is the I/O time with reads in flight, layer_us the layer so far. The
     // batched lanes' lines are refit over the last pass's layers; table() then builds the cost table from them (with
     // decode's lines and the tier's copy rates), and the calibrated line prints it by the names the start values take,
@@ -781,30 +789,32 @@ struct sink_vram {
         else { prefill_samples[prefill_sample_next] = sample; }
         prefill_sample_next = (prefill_sample_next + 1) % prefill_window;
         kimi_prefill_fit cpu, gpu, gpu_host;
-        double overhead_us = 0, gpu_tokens = 0;
+        kimi_prefill_overhead_fit overhead;
         for (const auto & s : prefill_samples) {
             cpu.add(s.cpu); gpu.add(s.gpu); gpu_host.add(s.gpu_host);
-            overhead_us += s.gpu_overhead_us; gpu_tokens += s.gpu_tokens;
+            if (s.gpu_tokens > 0.0) { overhead.add(int(s.gpu_tokens), s.gpu_overhead_us); }
         }
         kimi_prefill_fit_line(cpu, prior.cpu_fixed_us, prior.cpu_route_us, cost.cpu_fixed_us, cost.cpu_route_us);
         kimi_prefill_fit_line(gpu, prior.gpu_fixed_us, prior.gpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us);
         kimi_prefill_fit_line(gpu_host, prior.gpu_host_fixed_us > 0 || prior.gpu_host_route_us > 0 ? prior.gpu_host_fixed_us :
             prior.gpu_fixed_us, prior.gpu_host_fixed_us > 0 || prior.gpu_host_route_us > 0 ? prior.gpu_host_route_us :
             prior.gpu_route_us, cost.gpu_host_fixed_us, cost.gpu_host_route_us);
-        if (gpu_tokens > 0.0) { cost.gpu_token_us = overhead_us / gpu_tokens; }
+        overhead.fit(overhead_row_prior(table().locked_us_per_mb), cost.gpu_overhead_fixed_us, cost.gpu_token_us);
         ++cost_calibrations;
         const kimi_place_table t = table();
         std::fprintf(stderr,
             "[kimi_cpu_prefill_cost] calibrated=%llu tokens=%d samples=%zu cpu_fixed_us=%.3f cpu_route_us=%.3f "
             "gpu_fixed_us=%.3f gpu_route_us=%.3f gpu_host_fixed_us=%.3f gpu_host_route_us=%.3f link_gbps=%.3f "
-            "pageable_gbps=%.3f drive_gbps=%.3f drive_fixed_us=%.3f gpu_token_us=%.3f cpu_one_us=%.1f "
+            "pageable_gbps=%.3f drive_gbps=%.3f drive_fixed_us=%.3f gpu_overhead_fixed_us=%.3f gpu_token_us=%.3f "
+            "gpu_overhead_samples=%.0f gpu_overhead_min_tokens=%d gpu_overhead_max_tokens=%d cpu_one_us=%.1f "
             "predicted_us=%.1f measured_us=%.1f cpu_predicted_us=%.1f cpu_us=%.1f gpu_predicted_us=%.1f gpu_us=%.1f "
             "drive_predicted_us=%.1f drive_us=%.1f gpu_overhead_predicted_us=%.1f gpu_overhead_us=%.1f\n",
             (unsigned long long) cost_calibrations, plan.ntokens, prefill_samples.size(),
             cost.cpu_fixed_us, cost.cpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us, cost.gpu_host_fixed_us,
             cost.gpu_host_route_us, t.locked_us_per_mb > 0 ? 1e3 / t.locked_us_per_mb : 0.0,
             t.pageable_us_per_mb > 0 ? 1e3 / t.pageable_us_per_mb : 0.0, t.drive_us_per_mb > 0 ? 1e3 / t.drive_us_per_mb : 0.0,
-            t.drive_fixed_us, cost.gpu_token_us, t.cpu_one_us,
+            t.drive_fixed_us, cost.gpu_overhead_fixed_us, cost.gpu_token_us,
+            overhead.samples.n, overhead.min_tokens, overhead.max_tokens, t.cpu_one_us,
             plan.layer_us, layer_us, plan.cpu_us, cpu_us, plan.gpu_us, gpu_lane_us,
             plan.drive_us, read_us, plan.gpu_overhead_us, gpu_overhead_us);
     }

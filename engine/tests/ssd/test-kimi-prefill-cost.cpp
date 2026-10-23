@@ -55,6 +55,66 @@ static void test_fit() {
     check(fixed == 7 && slope == 9, "no samples keep the terms");
 }
 
+static void test_overhead_fit() {
+    // Recorded 125 calibration: 2 tokens, 279.656 us outside the GPU experts; MXFP4's output row is 5120 floats,
+    // and its measured link rate was 33.617 GB/s. Inputs already have the lane's per-route charge. One token shape
+    // does not identify the fixed and row terms: retain this geometry slope, not 279.656 / 2 us per future token.
+    const double row_prior = (5120.0 * sizeof(float)) / 1e6 * (1e3 / 33.617);
+    kimi_prefill_overhead_fit one;
+    one.add(2, 279.656);
+    double fixed = 0, row = -1;
+    one.fit(row_prior, fixed, row);
+    check(near(row, row_prior, 1e-12), "one overhead shape retains the transfer geometry slope");
+    check(near(fixed + 2 * row, 279.656, 1e-12), "same-shape overhead matches the observation");
+    const double full = fixed + 512 * row;
+    // The recorded 512 layers' no-GPU predictions exceed their drive bound by at least 1828.5 us. The old
+    // 71591.936 us charge ruled out every prefix even with free GPU computation; the identified fixed component
+    // is paid once. This replay removes that arithmetic veto; it does not predict the unmeasured GPU's speed.
+    check(full < 1828.5 && near((279.656 / 2) * 512, 71591.936, 1e-12), "2-to-512 replay does not multiply fixed overhead");
+    const double initial_fixed = fixed, initial_row = row;
+    kimi_prefill_overhead_fit().fit(row_prior, fixed, row);
+    check(fixed == initial_fixed && row == initial_row, "empty overhead window retains its last fit");
+    one.add(2, 281.656);
+    one.fit(row_prior, fixed, row);
+    check(near(fixed + 2 * row, 280.656, 1e-12) && row == row_prior, "same-shape repeats estimate the fixed residual");
+
+    // A synthetic second shape makes the two coefficients identifiable. No prior scaling should distort the
+    // exact affine data once the window contains that information.
+    kimi_prefill_overhead_fit two;
+    two.add(2, 280.0); two.add(512, 1300.0);
+    two.fit(row_prior, fixed, row);
+    check(near(fixed, 276.0, 1e-12) && near(row, 2.0, 1e-12), "second overhead shape identifies fixed and row costs");
+    check(near(fixed + 128 * row, 532.0, 1e-12), "identified overhead interpolates a third shape");
+    kimi_prefill_overhead_fit negative_fixed;
+    negative_fixed.add(2, 1.0); negative_fixed.add(512, 1300.0);
+    negative_fixed.fit(row_prior, fixed, row);
+    check(fixed == 0.0 && row > 0.0 && std::isfinite(row), "negative overhead intercept uses the nonnegative boundary");
+    kimi_prefill_overhead_fit negative_row;
+    negative_row.add(2, 1000.0); negative_row.add(512, 100.0);
+    negative_row.fit(row_prior, fixed, row);
+    check(near(fixed, 550.0, 1e-12) && row == 0.0, "negative overhead slope uses the nonnegative boundary");
+    kimi_prefill_overhead_fit below_prior;
+    below_prior.add(2, 0.5);
+    below_prior.fit(row_prior, fixed, row);
+    check(fixed == 0.0 && row == 0.25, "one shape bounds an infeasible row prior without a negative intercept");
+
+    kimi_place_table t;
+    t.overhead_fixed_us = initial_fixed; t.token_us = initial_row;
+    t.batched.device.expert_us = 10; t.vector.device.expert_us = 10;
+    t.cpu_one_us = t.cpu_fixed_us = 1000;
+    std::vector<kimi_place_item> items(2);
+    for (auto & x : items) { x.routes = 512; x.resident = true; }
+    const auto batched = kimi_place_layer(t, 512, 8, items.data(), items.size());
+    check(near(batched.overhead, full, 1e-12) && near(batched.time, 20 + full, 1e-12), "fixed GPU overhead is once per layer, not once per expert");
+    for (auto & x : items) { x.routes = 1; }
+    const auto decode = kimi_place_layer(t, 1, 8, items.data(), items.size());
+    check(decode.overhead == 0.0 && decode.time == 20, "the batched overhead fit does not change decode pricing");
+    for (auto & x : items) { x.routes = 512; x.resident = false; }
+    check(kimi_place_layer(t, 512, 8, items.data(), items.size()).overhead == 0.0, "no GPU work pays no GPU overhead");
+    std::printf("overhead replay: 2 tokens 279.656 us, fixed %.3f us, row %.6f us, 512 tokens %.3f us (old 71591.936)\n",
+                initial_fixed, initial_row, full);
+}
+
 static void test_coupled() {
     check(kimi_prefill_coupled(1000.0, 0.0, 8) == 1000.0, "coupled with an idle side is the busy side");
     check(near(kimi_prefill_coupled(1000.0, 1000.0, 8), 1125.0, 1e-12), "equal sides: max * (n + 1) / n");
@@ -832,6 +892,7 @@ static void test_place_pending() {
 
 int main() {
     test_fit();
+    test_overhead_fit();
     test_coupled();
     test_select();
     test_same_choice();

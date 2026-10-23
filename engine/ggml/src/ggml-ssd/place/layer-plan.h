@@ -49,6 +49,38 @@ inline void kimi_prefill_fit_line(const kimi_prefill_fit & s, double prior_fixed
     fixed = f; slope = r;
 }
 
+// GPU begin/finish and output addition have both a fixed cost and row-dependent work. A single row count cannot
+// identify their slope: keep the transfer-geometry prior and assign the measured remainder to the fixed part.
+// With two distinct row counts, fit both terms by nonnegative least squares. No observations leave the last fit
+// alone; sample expiry/exploration is a separate placement policy.
+struct kimi_prefill_overhead_fit {
+    kimi_prefill_fit samples;
+    int min_tokens = 0, max_tokens = 0;
+    void add(int tokens, double us) {
+        if (tokens <= 0 || !std::isfinite(us) || us < 0.0) { return; }
+        if (samples.n == 0.0) { min_tokens = max_tokens = tokens; }
+        min_tokens = std::min(min_tokens, tokens); max_tokens = std::max(max_tokens, tokens);
+        samples.add(double(tokens), us);
+    }
+    void fit(double row_prior_us, double & fixed_us, double & row_us) const {
+        const auto & s = samples;
+        if (s.n == 0.0) { return; }
+        const double mean_tokens = s.x / s.n, mean_us = s.t / s.n;
+        const double det = s.n * s.xx - s.x * s.x;
+        if (min_tokens == max_tokens || det <= 0.0) {
+            // If even the prior exceeds the whole observation, its largest feasible nonnegative slope is the
+            // measured ratio. Otherwise the prior is retained exactly, rather than scaling a tiny shape's ratio.
+            row_us = std::min(std::max(0.0, row_prior_us), mean_us / mean_tokens);
+            fixed_us = std::max(0.0, mean_us - row_us * mean_tokens);
+            return;
+        }
+        row_us = (s.n * s.xt - s.x * s.t) / det;
+        fixed_us = (s.t - row_us * s.x) / s.n;
+        if (row_us < 0.0) { row_us = 0.0; fixed_us = mean_us; }
+        else if (fixed_us < 0.0) { fixed_us = 0.0; row_us = s.xt / s.xx; }
+    }
+};
+
 // The time a producer busy for a and a consumer busy for b take together when they hand the work over through a ring
 // of n buffers: the throughput of a two-station tandem queue with n places between the stations (exponential
 // service), as a time. It is max(a, b) when one is far shorter, rises smoothly as they approach, and is
@@ -336,7 +368,8 @@ struct kimi_place_table {
     double cpu_moved = 1;                      // the CPU's time in a layer with moved experts, relative (>= 1)
     kimi_place_engine vector, batched;
     int vector_tokens = 1;                     // passes of at most this many tokens run the vector engine
-    double token_us = 0;                       // batched: the GPU's time a token of the layer outside its experts
+    double overhead_fixed_us = 0;             // batched: GPU work's fixed begin/finish cost, paid once per layer
+    double token_us = 0;                       // batched: row-dependent work, full layer rows as a conservative bound
     double route_us = 0;                       // batched: per route of a GPU expert, what the engine sends for it
     double locked_us_per_mb = 0;               // a copy from page-locked memory, measured (0: none is, none moves)
     double pageable_us_per_mb = 0;             // a copy from pageable memory, staged by the GPU's worker (0: none)
@@ -469,7 +502,7 @@ inline kimi_place_result kimi_place_layer(const kimi_place_table & t, int ntoken
     out.candidates = order.size();
     bool residents = false;
     for (size_t i = 0; i < n; ++i) { residents = residents || (items[i].resident && items[i].routes > 0); }
-    const double overhead = one ? 0.0 : double(ntokens) * t.token_us;
+    const double overhead = one ? 0.0 : t.overhead_fixed_us + double(ntokens) * t.token_us;
     // a route's rows cross a link only to a GPU that does not read host memory (one token: in decode's lines)
     const double route_us = one || t.in_place ? 0.0 : t.route_us;
     size_t k = 0;

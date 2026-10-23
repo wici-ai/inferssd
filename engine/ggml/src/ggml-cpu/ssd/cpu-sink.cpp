@@ -1561,7 +1561,8 @@ struct kimi_cpu_sink {
         t.in_place = c.in_place != 0 && (t.one(ntokens) ||
             (vram.prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_BATCHED && vram.prefill_lane.in_place));
         t.route_us = t.one(ntokens) ? 0.0 : route_bytes / 1e6 * rows_us_per_mb;
-        t.token_us = s.gpu_token_us >= 0 ? s.gpu_token_us : double(latent) * sizeof(float) / 1e6 * rows_us_per_mb;
+        t.overhead_fixed_us = s.gpu_overhead_fixed_us;
+        t.token_us = s.gpu_token_us >= 0 ? s.gpu_token_us : vram.overhead_row_prior(c.copy_us_per_mb);
         // the drive: one line through decode's layers and prefill's, from the start values' shape (else decode's
         // running rate, else a line through the origin) scaled to the samples
         kimi_prefill_fit drive;
