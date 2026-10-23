@@ -35,6 +35,7 @@ jobs:
         run: |
           shellcheck scripts/check-import.sh scripts/upstream-snapshot.sh bench/device/gate.sh
           python3 -m py_compile scripts/public-scan.py
+          python3 scripts/test-public-scan.py
       - name: Install pinned secret scanner
         run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
       - name: Secret scan
