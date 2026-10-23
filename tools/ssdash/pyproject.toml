@@ -36,3 +36,7 @@ select = ["E", "F", "I", "UP"]
 
 [tool.ruff.lint.pyupgrade]
 keep-runtime-typing = true
+
+[tool.ruff.format]
+# Original observer inputs are hash-bound; keep linting and byte checks active.
+exclude = ["tests/launch_numeric_cases.py"]
