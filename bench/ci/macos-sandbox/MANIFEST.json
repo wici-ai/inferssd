@@ -1,0 +1,21 @@
+{
+  "files": {
+    "README.md": "5da6a70b0485cfcaf79be3d6b85d60abe5e4c0644c4846edd1f452e331cd15c4",
+    "client.py": "a5dc802adfdf3619df6fea1aba40b353e1e1a4218d38b164d73cd30e45de8acc",
+    "disconnect-client.py": "697049afb7b62eb5927c52edcfa0cfc1e583debe441305a2ed55a7ecc1e74c49",
+    "disconnect.py": "44ee53e4f097bdf97278db88b66e964b77ac0b2bca986c7afaa7300a22d94617",
+    "executor.py": "3b8e7d385bc48035e4cd717f43734bbc64db08dbf1f3ed379d70abfb0b228c16",
+    "install.py": "ec2f04295569e37d2df7269ade60d4d9ac109b6838b2d0e93dcf36030f25d837",
+    "metal-probe.mm": "920e836b0d325df93a9cacf535bd45479f23d305750e58af99c192c1006d5077",
+    "positive.py": "4c8d4b8016357832319a264331ca97f14e2f9f9f8eef41907c695e0f1ea42945",
+    "probe.py": "5a04b5cc9b27d0345353b5a0a66efc710a159047367fba6bcab776c64b237328",
+    "stage_guard.py": "e164b9141b038c496d1f00607e82b6319d51b76c13cbbbac2a1e6ab4003756eb",
+    "stage_models.py": "90ac81b815db77638d25992cc1a5cd6ab0eb6af02e3797cb84d298a98434395a",
+    "supervisor.py": "0517d053d6491057c513640bbcb8c04ae4000bf026e6d4e76a1e7a2734ee1975",
+    "tests/test_executor.py": "caced6cb800c3fbdac4a45dd31158f34efe1740c997f409e5e197655590f8c13",
+    "verify.py": "485bde9656d39ff5f4fdf3431f36d4e0589a3f25298d06fd86a4caf8841db351",
+    "verify_broker.py": "83b63a3823fad039760af6a99e323070ba19414cbc2d95ad1ed94a5e552e7c53",
+    "worker.sb": "13fba77b5fdf5026b3c57b3cdf69227d5053341ec2b0e0bf0dd42f255ce63c59"
+  },
+  "status": "public-template-adjusted-native-rerun-required"
+}

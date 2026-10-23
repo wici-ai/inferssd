@@ -180,3 +180,17 @@ unsupported bundle fails; it never falls back to another installed copy. No
 search-path modification or ambient checkout is used. Archive the complete
 bundle and manifest with the result. Timing, request and prompt protocols are
 unchanged.
+
+## Typed profile extension for InferSSD CI
+
+A new production profile can add `typed_settings` as an absolute `{path,sha256}`
+file specification. Its contents use the current `inferssd-settings 1` parser
+and complete sixteen-key registry. `expert.source` must equal the exact ordered
+`alias`/`aliases` paths;
+retired control environments are refused. The wrapper owns `--ssd-settings` and
+`--ssd-telemetry`, creates a fresh native-events path per arm, and checks the
+actual native `ssd.settings` publication against the pinned typed values. The
+settings file identity is checked before/after the request with the other small
+assets. The receipt includes typed values and exact launch policy in addition
+to the existing actual resource/build/model evidence. Legacy profiles remain a
+separate historical wrapper contract; InferSSD CI requires the typed extension.

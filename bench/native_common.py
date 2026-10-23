@@ -26,7 +26,7 @@ MANAGED_ARGS = {"-m", "--model", "-c", "--ctx-size", "-np", "--parallel", "--hos
                 "--warmup", "--no-warmup", "--fit", "--cache-ram", "--cache-disk", "--cache-disk-mib",
                 "--chat-template-file", "--chat-template", "--reasoning", "--api-key", "--api-key-file",
                 "--model-url", "-mu", "--hf-repo", "-hf", "--hf-file", "-hff", "--docker-repo",
-                "--log-disable", "--log-file", "--verbosity", "--log-verbosity", "-lv"}
+                "--ssd-settings", "--ssd-telemetry", "--log-disable", "--log-file", "--verbosity", "--log-verbosity", "-lv"}
 LEGACY_SOURCES = {"GGML_MOE_EXPERT_PACK", "GGML_MOE_EXPERT_PACK_LIST", "GGML_MOE_EXPERT_PACK_OVERLAY",
                   "GGML_MOE_EXPERT_PACK_OVERLAY_EXTRA", "GGML_MOE_EXPERT_PACK_V2", "GGML_MOE_PAGECACHE_PACK",
                   "GGML_MOE_Q4_COLIBRI_PACK", "GGML_MOE_GLM52_COLIBRI_PACK", "GGML_MOE_Q4_COLIBRI_OVERLAY_PACK",
@@ -137,7 +137,7 @@ def validate_profile(profile):
     args = profile.get("args")
     if not isinstance(args, list) or any(not isinstance(x, str) or not x for x in args):
         raise ValueError("args must be an explicit string list")
-    if any(word.split("=", 1)[0] in MANAGED_ARGS for word in args):
+    if any(word.split("=", 1)[0] in MANAGED_ARGS or word.startswith("--ssd-") for word in args):
         raise ValueError("wrapper owns model, context, template, port, slot, logging and warmup arguments")
     env = profile.get("environment")
     if not isinstance(env, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in env.items()):
@@ -146,7 +146,13 @@ def validate_profile(profile):
         raise ValueError("H2D caps and implicit CLI environment are not permitted")
     if any(env.get(key) for key in LEGACY_SOURCES):
         raise ValueError("formal runs use direct GGUF, not legacy expert packs")
-    if env.get("GGML_MOE_EXPERT_GGUF_ALIAS_TSV") != ":".join(x["path"] for x in sources):
+    if "typed_settings" in profile:
+        file_spec(profile["typed_settings"])
+        if any(k.startswith(("GGML_KIMI_", "GGML_MOE_", "LLAMA_K3_", "LLAMA_DSV41_", "DS4_", "SSD_LLAMA_MAC_"))
+               or re.match(r"TASK[0-9]+_", k) for k in env):
+            raise ValueError("typed profiles reject retired environment controls")
+        typed_snapshot(profile)
+    elif env.get("GGML_MOE_EXPERT_GGUF_ALIAS_TSV") != ":".join(x["path"] for x in sources):
         raise ValueError("source environment must use the exact reviewed GGUF alias")
     if any(k.startswith("DYLD_") or k in ("LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG") for k in env):
         raise ValueError("wrapper owns runtime library search paths")
@@ -175,10 +181,24 @@ def validate_profile(profile):
     return profile
 
 
+def typed_snapshot(profile):
+    try:
+        from inferssd.configuration.settings import parse
+    except ImportError as error:
+        raise ValueError("typed profiles require the installed settings framework") from error
+    snapshot = parse(Path(profile["typed_settings"]["path"]).read_text(encoding="utf-8"),
+                     profile["typed_settings"]["path"],
+                     platform="darwin" if profile["platform"] == "macos" else "linux")
+    if snapshot.at("expert.source").value != tuple(x["path"] for x in aliases(profile)):
+        raise ValueError("typed expert.source differs from the exact reviewed aliases")
+    return snapshot
+
+
 def verify_inputs(profile):
     build = [verify_file(x) for x in [profile["binary"], *profile["images"]]]
     shards = [verify_file(x, model=True) for x in profile["shards"]]
-    assets = [verify_file(x) for x in [profile["template"], *aliases(profile)]]
+    assets = [verify_file(x) for x in [profile["template"], *aliases(profile),
+              *([profile["typed_settings"]] if "typed_settings" in profile else [])]]
     sources = {x["path"]: x["bytes"] for x in shards}
     count = 0
     for alias in aliases(profile):
@@ -216,13 +236,23 @@ def effective_settings(profile):
     # Bind every argv/env/threshold to cross-tier identity, including values
     # whose runtime telemetry is dynamic (e.g. admitted cache capacity).
     digest = hashlib.sha256(json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    policy = {"args": profile["args"], "environment": profile["environment"],
+              "template_sha256": profile["template"]["sha256"],
+              "alias_sha256": [x["sha256"] for x in aliases(profile)]}
+    if "typed_settings" in profile:
+        policy["typed_values"] = typed_snapshot(profile).document()["values"]
     return dict(profile["effective_settings"], native_profile_sha256=digest,
-                native_resource_policy=profile["resources"],
+                native_launch_policy=policy, native_resource_policy=profile["resources"],
                 native_ownership_core=CORE_IDENTITY)
 
 
-def server_argv(profile, port):
-    return [profile["binary"]["path"], *profile["args"], "-m", profile["shards"][0]["path"],
+def server_argv(profile, port, telemetry=None):
+    typed = []
+    if "typed_settings" in profile:
+        if telemetry is None:
+            raise ValueError("typed profile requires its fresh context telemetry path")
+        typed = ["--ssd-settings", profile["typed_settings"]["path"], "--ssd-telemetry", str(telemetry)]
+    return [profile["binary"]["path"], *profile["args"], *typed, "-m", profile["shards"][0]["path"],
             "--chat-template-file", profile["template"]["path"], "--reasoning", "off",
             "-c", str(profile["effective_settings"]["context_tokens"]), "-np", "1", "--fit", "off",
             "--no-warmup", "--cache-ram", "0", "--host", "127.0.0.1", "--port", str(port)]

@@ -1,0 +1,19 @@
+name: InferSSD device admission information
+
+# Public PR code runs only on GitHub-hosted machines. Physical runners must
+# never be registered with this repository, including after it becomes public.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+permissions: {}
+jobs:
+  device-admission:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Physical tests require separate private admission
+        run: |
+          echo "Physical device tests are not automatically authorized by a PR."
+          echo "A maintainer must review an exact SHA and use the protected private device controller."
+          echo "This informational job is not the required InferSSD device performance check."

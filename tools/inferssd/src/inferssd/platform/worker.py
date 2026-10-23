@@ -231,13 +231,23 @@ def run_worker(args: argparse.Namespace, specification: dict[str, Any], policy: 
                 )
             time.sleep(0.5)
         if child.poll() is not None and not signals and not (out / "STOP").exists():
-            failure = "server exited before a requested stop"
+            if specification.get("command_mode") is not True:
+                failure = "server exited before a requested stop"
+            elif child.returncode != 0:
+                failure = f"command exited {child.returncode}"
     except BaseException as error:
         failure = f"{type(error).__name__}: {error}"
     finally:
         while True:
             try:
-                clean = child is None or stop_owned(child, policy.cleanup_seconds)["group_gone"]
+                cleanup = stop_owned(child, policy.cleanup_seconds) if child else None
+                clean = cleanup is None or cleanup["group_gone"]
+                if (
+                    specification.get("command_mode") is True
+                    and cleanup
+                    and (cleanup["forced_kill"] or cleanup["orphaned_descendants"])
+                ):
+                    failure = failure or "command left descendants or required forced cleanup"
                 if runtime.scope is not None:
                     # A server that escaped its process group remains inside this
                     # scope. Do not release the last lease while it is present.

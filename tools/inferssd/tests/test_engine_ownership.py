@@ -370,3 +370,98 @@ def test_preexisting_linux_unit_never_stopped_or_spawned(tmp_path, monkeypatch):
             },
             policy(tmp_path, "linux"),
         )
+
+
+def test_command_owner_borrows_the_same_batch_lock(tmp_path, monkeypatch):
+    claim = reserve(str(tmp_path / "run"))
+    p = policy(tmp_path)
+    fd = os.open(p.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(owned.socket, "socketpair", lambda: (Connection(101), Connection(102)))
+    monkeypatch.setattr(owned.subprocess, "Popen", lambda *a, **kw: Guardian())
+    value = owned.OwnedProcess(
+        resolution(),
+        str(claim.directory),
+        p,
+        reservation=claim,
+        inherited_lock_fd=fd,
+        command_mode=True,
+    )
+    try:
+        assert json.loads((claim.directory / "runtime.json").read_text())["command_mode"] is True
+        (claim.directory / "ownership.json").write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "server": {"owned_processes_gone": True, "resource_scope_gone": True},
+                }
+            )
+        )
+        value.stop()
+        with open(p.lock_path, "r+") as other:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "returncode,orphan,force,expected",
+    [(0, False, False, 0), (7, False, False, 1), (0, True, False, 1), (0, False, True, 1)],
+)
+def test_command_mode_checks_natural_exit_and_descendants(
+    tmp_path, monkeypatch, returncode, orphan, force, expected
+):
+    out = tmp_path / "run"
+    out.mkdir()
+
+    class Lease:
+        fd = 88
+
+        def __init__(self, *a, **kw):
+            pass
+
+        def close(self):
+            pass
+
+    class Resources:
+        baseline, scope = None, None
+
+        def __init__(self, *_):
+            pass
+
+        def prepare(self):
+            return {}
+
+    child = SimpleNamespace(pid=123, returncode=returncode, poll=lambda: returncode)
+    monkeypatch.setattr(worker, "Lease", Lease)
+    monkeypatch.setattr(worker, "Resources", Resources)
+    monkeypatch.setattr(worker.subprocess, "Popen", lambda *a, **kw: child)
+    monkeypatch.setattr(
+        worker,
+        "stop_owned",
+        lambda *a: {"group_gone": True, "forced_kill": force, "orphaned_descendants": orphan},
+    )
+    monkeypatch.setenv("SSDASH_INTERNAL_SERVER_ENV", "{}")
+    result = worker.run_worker(
+        argparse.Namespace(socket="unused", lock_dev=1, lock_ino=2),
+        {"directory": str(out), "argv": ["fixture"], "command_mode": True},
+        policy(tmp_path),
+    )
+    assert result == expected
+
+
+def test_inherited_batch_fd_must_match_existing_lock_inode(tmp_path):
+    claim = reserve(str(tmp_path / "run"))
+    p = policy(tmp_path)
+    with open(p.lock_path, "w"), open(tmp_path / "wrong", "w+") as wrong:
+        with pytest.raises(ValueError, match="inode"):
+            owned.OwnedProcess(
+                resolution(),
+                str(claim.directory),
+                p,
+                reservation=claim,
+                inherited_lock_fd=wrong.fileno(),
+                command_mode=True,
+            )
+    assert not (claim.directory / "runtime.json").exists()

@@ -1,0 +1,45 @@
+(version 1)
+(deny default)
+; dyld opens the filesystem root during startup; literal directory only, no subtree.
+(allow file-read-data (literal "/"))
+(allow file-read-metadata ;TOOL_METADATA_ANCESTORS;
+  (literal "/System/Cryptexes") (literal "/System/Cryptexes/OS")
+  (literal "/System/Volumes") (literal "/System/Volumes/Data")
+  (literal "/private") (literal "/private/etc") (literal "/etc")
+  (literal "/private/var") (literal "/var"))
+; This profile is intentionally fail-closed on a new OS/GPU. No permissive fallback.
+; Only standard system runtimes, frozen tool roots, the read-only source and this
+; single job's work area are readable. /Users and the broker/runner state have no allow.
+(allow file-read* (subpath "/System/Library") (subpath "/System/Cryptexes/OS/usr/lib") (subpath "/usr/lib") (subpath "/usr/share")
+  (subpath "/Library/Apple") (subpath "/usr/bin") (subpath "/bin")
+  (subpath "/private/var/db/dyld")
+  ;TOOL_READ_ROOTS; (subpath (param "CLT"))
+  (subpath (param "INPUT")) (subpath (param "PUBLIC"))
+  (subpath (param "FROZEN")) (subpath (param "MODELS"))
+  (subpath (param "WORK")) (literal "/dev/urandom") (literal "/dev/random")
+  (literal "/dev/null") (literal "/dev/zero"))
+(allow file-write* (subpath (param "WORK")) (literal "/dev/null"))
+(allow file-map-executable (subpath "/System/Library") (subpath "/System/Cryptexes/OS/usr/lib") (subpath "/usr/lib")
+  ;TOOL_READ_ROOTS; (subpath (param "CLT")) (subpath (param "WORK")) (subpath (param "FROZEN")))
+(allow process-fork)
+(allow process-exec (literal "/usr/bin/python3") (literal "/usr/bin/xcrun")
+  (literal "/usr/bin/clang") (literal "/usr/bin/clang++") (literal "/usr/bin/ld")
+  (literal "/usr/bin/ar") (literal "/usr/bin/ranlib") (literal "/usr/bin/strip")
+  (literal "/bin/sh") (literal "/bin/bash")
+  (literal "/usr/bin/env") (literal "/usr/bin/git") (literal "/usr/bin/make")
+  (literal "/usr/bin/sed") (literal "/usr/bin/awk") (literal "/usr/bin/uname")
+  (literal "/usr/bin/sw_vers")
+  (subpath (param "CLT")) ;TOOL_READ_ROOTS; (subpath (param "WORK")) (subpath (param "FROZEN")))
+(allow signal (target self))
+(allow sysctl-read)
+; Required bootstrap/runtime queries only. Never allow arbitrary mach-lookup.
+(allow mach-lookup (global-name "com.apple.system.logger")
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.MTLCompilerService")
+  (global-name "com.apple.MetalCompilerService"))
+; These exact classes are proposals, not proof of M5 compatibility. Real Metal
+; compile+dispatch is a required positive gate; a mismatch keeps the runner off.
+(allow iokit-open (iokit-user-client-class "IOGPUDeviceUserClient")
+  (iokit-user-client-class "AGXDeviceUserClient")
+  (iokit-user-client-class "IOSurfaceRootUserClient"))
+; No network, host Unix sockets, user launchd, task_for_pid or privilege operations.

@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "purpose": "ci",
+  "repository": "wici-ai/inferssd",
+  "required_devices": [
+    "cloud-5090",
+    "dgx-spark",
+    "local-mbp"
+  ],
+  "required_models": [
+    "deepseek",
+    "muse"
+  ],
+  "thresholds": {
+    "provisional": true,
+    "mode": "observed-no-slowdown",
+    "slowdown_outcome": "inconclusive",
+    "decode_regression_fraction": 0,
+    "ttft_regression_fraction": 0,
+    "prefill_regression_fraction": 0
+  },
+  "extended_prefixes": [
+    "ggml/",
+    "src/",
+    "common/",
+    "include/",
+    "tools/server/",
+    "tools/inferssd/src/inferssd/engine/",
+    "tools/inferssd/src/inferssd/platform/",
+    "tools/inferssd/src/inferssd/launch/",
+    "tools/inferssd/src/inferssd/configuration/",
+    "bench/",
+    "scripts/",
+    "models/templates/",
+    "tools/inferssd/src/"
+  ],
+  "extended_names": [
+    "CMakeLists.txt",
+    "cmake/"
+  ],
+  "authorized_associations": [
+    "OWNER",
+    "MEMBER",
+    "COLLABORATOR"
+  ],
+  "documentation_suffixes": [
+    ".md",
+    ".rst",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg"
+  ],
+  "documentation_names": [
+    "LICENSE",
+    "NOTICE",
+    "COPYING",
+    "AUTHORS"
+  ],
+  "controller_repository": "wici-ai/inferssd-device-ci",
+  "controller_ref": "refs/heads/main",
+  "controller_workflow": ".github/workflows/device-performance.yml",
+  "staging_prefix": "device-ci/approved/",
+  "upstream_workflow": ".github/workflows/ci.yml",
+  "check_name": "InferSSD device performance"
+}
