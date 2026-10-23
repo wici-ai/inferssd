@@ -155,8 +155,16 @@ def test_smoke_waits_through_health_timeout_and_sends_one_completion(tmp_path, m
 
 
 @pytest.mark.parametrize('failure_point', ['headers', 'body'])
-def test_local_http_timeout_is_recorded_and_never_accepted_as_completion(monkeypatch, failure_point):
+@pytest.mark.parametrize('socket_timeout_is_alias', [True, False])
+def test_local_http_timeout_is_recorded_and_never_accepted_as_completion(
+        monkeypatch, failure_point, socket_timeout_is_alias):
     from ci import staged_chat as chat
+
+    class LegacySocketTimeout(OSError):
+        pass
+
+    timeout_type = TimeoutError if socket_timeout_is_alias else LegacySocketTimeout
+    monkeypatch.setattr(chat.socket, 'timeout', timeout_type)
 
     class Connection:
         closed = False
@@ -167,11 +175,11 @@ def test_local_http_timeout_is_recorded_and_never_accepted_as_completion(monkeyp
 
         def getresponse(self):
             if failure_point == 'headers':
-                raise TimeoutError('headers timed out')
+                raise timeout_type('headers timed out')
             return self
 
         def readline(self, *args):
-            raise TimeoutError('body timed out')
+            raise timeout_type('body timed out')
 
         def close(self):
             self.closed = True
