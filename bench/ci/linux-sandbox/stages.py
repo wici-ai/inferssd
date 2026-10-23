@@ -348,7 +348,12 @@ class RunningStage:
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=CLEAN_ENV,
                 close_fds=True, pass_fds=(self.net_fd,), timeout=spec['timeout_s'] + 5)
             if result.returncode or len(result.stdout) > 1024 * 1024:
-                raise RuntimeError('trusted loopback client failed or exceeded output bound')
+                failure = {'returncode': result.returncode, 'stdout_bytes': len(result.stdout),
+                           'stderr': result.stderr[:4096],
+                           'stderr_truncated': len(result.stderr) > 4096}
+                save(self.directory / ('http-client-failure-' + uuid.uuid4().hex + '.json'), failure)
+                raise RuntimeError('trusted loopback client failed or exceeded output bound: ' +
+                                   json.dumps(failure, separators=(',', ':')))
             value = json.loads(result.stdout)
         except subprocess.TimeoutExpired:
             value = failed('trusted HTTP client exceeded request deadline', started)
