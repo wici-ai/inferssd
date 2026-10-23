@@ -15,6 +15,8 @@ from typing import Optional
 from ssdash.bootstrap.core_sets import run_coresets
 from ssdash.bootstrap.tier_slots import run_ubprobe
 from ssdash.contracts import DeviceProfile
+from ssdash.launch.command import add_command as add_launch_command
+from ssdash.launch.command import run_launch
 from ssdash.loop.report import run_report
 from ssdash.model.machine import Machine
 from ssdash.plan.planner import run_plan
@@ -37,6 +39,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     add_source_commands(commands)
+    add_launch_command(commands)
     bootstrap = commands.add_parser(
         "bootstrap-records", help="read recorded CPU rows and ubatch logs; never run a probe"
     )
@@ -88,6 +91,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     fit.add_argument("--profile", required=True)
     fit.add_argument("-o", "--out", required=True)
     args = parser.parse_args(argv)
+    if args.command == "launch":
+        try:
+            return run_launch(args)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
     if args.command == "bootstrap-records":
         if args.bootstrap_command == "coresets":
             run_coresets(["coresets.py", args.cpu_rows], open_file=open, emit=print)
