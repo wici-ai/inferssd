@@ -24,10 +24,12 @@ def original_cache_namespace(value):
     if isinstance(value, list):
         return [original_cache_namespace(item) for item in value]
     if isinstance(value, dict):
-        return {
-            original_cache_namespace(key): original_cache_namespace(item)
-            for key, item in value.items()
-        }
+        projected = {}
+        for key, item in value.items():
+            key = original_cache_namespace(key)
+            assert key not in projected, "cache namespace projection would hide duplicate artifacts"
+            projected[key] = original_cache_namespace(item)
+        return projected
     return value
 
 
