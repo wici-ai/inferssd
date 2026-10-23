@@ -1,6 +1,6 @@
 # Upstream integration
 
-The immutable `upstream` branch is the bundled llama.cpp snapshot described in
+Commit `8884f8314ce8ea96d62cd602b6bbf7fc25758a09` is the bundled llama.cpp snapshot described in
 [PROVENANCE.md](PROVENANCE.md). Owned SSD implementations are mapped in
 [ARCHITECTURE.md](ARCHITECTURE.md). Relocations preserve source attribution and
 retained license files; no upstream history is rewritten by these changes.
@@ -24,8 +24,9 @@ Private candidate validation must finish before claiming operational acceptance.
 
 Regenerate the path inventory with
 `python3 scripts/inferssd/patch-surface.py`. It compares the working tree with
-`upstream` and excludes newly owned paths. Review model/op exceptions separately
-from integration hooks when assessing future patch growth.
+the local `upstream` alias set up in [CONTRIBUTING.md](CONTRIBUTING.md) and excludes
+newly owned paths. Review model/op exceptions separately from integration hooks
+when assessing future patch growth.
 
 <!-- BEGIN UPSTREAM INVENTORY -->
 | Upstream path | Added | Removed |

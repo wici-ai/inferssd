@@ -61,8 +61,8 @@ or formal release are published by this source integration.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for checks and review requirements, [PROVENANCE.md](PROVENANCE.md)
 for source history, and [the import manifest](docs/inferssd/import-manifest.tsv) for the origin of every changed
-path. The `upstream` branch contains the baseline snapshot. `git diff upstream main` exposes the downstream
-changes after integration.
+path. The baseline snapshot is commit `8884f8314ce8ea96d62cd602b6bbf7fc25758a09`, already included in main.
+`git diff 8884f8314ce8ea96d62cd602b6bbf7fc25758a09 main` exposes the downstream changes after integration.
 
 The core and backend executors, runtime assembly, common/server features and
 Python framework now follow the [module layout](ARCHITECTURE.md). Run

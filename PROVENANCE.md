@@ -8,7 +8,7 @@ not publicly accessible.
 ## Import structure
 
 1. An upstream snapshot of ggml-org/llama.cpp `f42e29fdf199481effd31f281bf095ec6067757b`, without upstream
-   project-process files. The `upstream` branch identifies this snapshot.
+   project-process files. Commit `8884f8314ce8ea96d62cd602b6bbf7fc25758a09` identifies this snapshot.
 2. Files marked `keep` or `carry-p6` copied byte for byte from the source seed.
 3. The planned CPU-only build guard, excluded launcher-test registration, required golden launcher fixture,
    and documentation cleanup. Runtime algorithms are unchanged by this step.

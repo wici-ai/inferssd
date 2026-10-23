@@ -10,6 +10,10 @@ the description. Do not add automated authorship trailers. Preserve the actual c
 
 ## Checks
 
+For a new clone, create the local snapshot alias once with
+`git branch upstream 8884f8314ce8ea96d62cd602b6bbf7fc25758a09`.
+The snapshot is part of main's history; no remote `upstream` branch is required.
+
 ```sh
 python3 -m pytest -q tools/adaptive/tests
 bash tools/adaptive/tests/test_launcher_settings.sh
