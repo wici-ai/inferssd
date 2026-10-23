@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import gzip
 import os
 import sys
 import time
@@ -11,6 +12,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Optional
 
+from ssdash.bootstrap.core_sets import run_coresets
+from ssdash.bootstrap.tier_slots import run_ubprobe
 from ssdash.contracts import DeviceProfile
 from ssdash.loop.report import run_report
 from ssdash.model.machine import Machine
@@ -34,6 +37,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     add_source_commands(commands)
+    bootstrap = commands.add_parser(
+        "bootstrap-records", help="read recorded CPU rows and ubatch logs; never run a probe"
+    )
+    bootstrap_commands = bootstrap.add_subparsers(dest="bootstrap_command", required=True)
+    coresets = bootstrap_commands.add_parser("coresets", help="CPU candidates from recorded labels")
+    coresets.add_argument("cpu_rows")
+    slots = bootstrap_commands.add_parser("tier-slots", help="tier slots from recorded server logs")
+    slots.add_argument("pipeline")
+    slots.add_argument("ubs", nargs="*")
     report = commands.add_parser("report", help="compare recorded conversations only")
     report.add_argument("run")
     report.add_argument(
@@ -76,6 +88,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     fit.add_argument("--profile", required=True)
     fit.add_argument("-o", "--out", required=True)
     args = parser.parse_args(argv)
+    if args.command == "bootstrap-records":
+        if args.bootstrap_command == "coresets":
+            run_coresets(["coresets.py", args.cpu_rows], open_file=open, emit=print)
+        else:
+            run_ubprobe(
+                ["ubprobe.py", args.pipeline, *args.ubs],
+                open_file=open,
+                open_gzip=gzip.open,
+                emit=print,
+            )
+        return 0
     if args.command == "report":
         run_report(
             args.run,
