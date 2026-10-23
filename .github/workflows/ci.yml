@@ -31,6 +31,8 @@ jobs:
         env:
           PROPOSED_REF: ${{ github.head_ref || github.ref_name }}
         run: python3 scripts/public-scan.py --skip upstream --ref "$PROPOSED_REF"
+      - name: Production module boundaries
+        run: python3 scripts/inferssd/check-layering.py
       - name: Shell and Python syntax
         run: |
           shellcheck scripts/check-import.sh scripts/upstream-snapshot.sh bench/device/gate.sh

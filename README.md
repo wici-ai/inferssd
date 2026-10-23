@@ -28,7 +28,7 @@ expert ranges directly from the GGUF shards and does not require a separate expe
 - CMake, a C/C++ compiler, Python 3.9 or newer, and Bash 4.3 or newer.
 - Linux cgroup v2 and a systemd user instance with the memory controller delegated.
 - Local storage supporting `O_DIRECT`, and an enabled `io_uring` interface. Install `liburing-dev` for GPU
-  prefill reads. The framework needs `nvcc` and a C compiler at runtime for its probes.
+  prefill reads. CUDA builds need `nvcc`; the typed runtime itself does not compile probe shims.
 - Exclusive use of the GPU during measurement. Build on the target machine; the build script selects its
   CUDA architecture and CPU capabilities. Compilation and normal execution do not require root.
 
@@ -42,18 +42,20 @@ Clone this repository and download every shard of one supported model after acce
 ```sh
 git clone https://github.com/wici-ai/inferssd.git
 cd inferssd
-tools/adaptive/build.sh
-mkdir -p ./run-data
-ROOT="$PWD/run-data" MODEL_DIR=/data/models tools/adaptive/adaptive.sh serve
+cmake --preset linux-cuda
+cmake --build build-linux-cuda --target llama-server --parallel 4
+python3 -m pip install ./tools/inferssd
+inferssd launch --help
 ```
 
-For Muse, also set `MODEL_CONF=tools/adaptive/models/muse-spark.conf`. Set `MODEL` to the first GGUF shard
-when the model directory contains multiple matching distributions. The default HTTP endpoint is
-`http://127.0.0.1:8080`. See [the framework guide](tools/adaptive/README.md) for retained step outputs and
-configuration receipts. Do not expose the server directly to an untrusted network.
-
-Current launchers and environment variables retain their source names during integration. A typed settings
-interface and a Python package are planned for the first release. No binary packages are published yet.
+Use `macos-metal` on Apple Silicon, or `linux-cpu` for core/CPU development.
+The [typed launcher guide](tools/inferssd/README.md) describes model paths,
+explicit resource policies, leases, settings receipts and launch artifacts.
+`inferssd launch --execute` is the production package entry point. It consumes
+`inferssd-settings 1`; native callers may use `llama-server --ssd-settings FILE
+--ssd-telemetry FILE`. `llama-server --ssd-schema` emits the current registry.
+Historical launchers are retained for recorded comparisons. No binary packages
+or formal release are published by this source integration.
 
 ## Development
 
@@ -62,10 +64,12 @@ for source history, and [the import manifest](docs/inferssd/import-manifest.tsv)
 path. The `upstream` branch contains the baseline snapshot. `git diff upstream main` exposes the downstream
 changes after integration.
 
-The current tree retains the imported engine layout. Work toward v0.1.0 will separate the SSD runtime into
-`ggml/src/ggml-ssd/`, its CPU and CUDA executors into backend-specific `ssd/` directories, and the adaptive
-framework into `tools/inferssd/`. These boundaries are not yet implemented in the release candidate; the
-engine and its upstream integration are still maintained together.
+The core and backend executors, runtime assembly, common/server features and
+Python framework now follow the [module layout](ARCHITECTURE.md). Run
+`python3 scripts/inferssd/check-layering.py` for dependency checks. The
+[upstream patch inventory](PATCHES.md) identifies integration hooks and model/op
+exceptions. Real-device candidate qualification remains separate from source
+organization; formal benchmark samples have not been collected.
 
 Support is best effort and applies to the listed models on validated hardware. The first release will qualify
 the first request after server startup; concurrent serving and long-running conversation behavior need
