@@ -31,7 +31,6 @@ bool ggml_cuda_moe_stream_cache_contains(const char *, size_t, int) { return fal
 const void * ggml_cuda_moe_stream_cache_dev_ptr(const char *, size_t, int) { return nullptr; }
 void ggml_cuda_moe_stream_batch_phase_report(const char *) {}
 bool ggml_cuda_moe_iq2_xxs_q8k_selftest(void) { return false; }
-bool ggml_cuda_moe_stream_up_gate_batch(int, int, const char *, const void *, const char *, const void *, int64_t, int64_t, int64_t, size_t, size_t, size_t, size_t, size_t, size_t, const float *, size_t, size_t, float *, size_t, size_t, int, float, const int64_t *, const ggml_moe_row_mapping *, int64_t) { return false; }
 const void * ggml_cuda_moe_expert_pack_mmap_ptr(const char *, int, size_t) { return nullptr; }
 const void * ggml_cuda_moe_expert_pack_mmap_ptr_debug(const char *, int, size_t, const char **, size_t *, uint64_t *) { return nullptr; }
 const void * ggml_cuda_moe_expert_pack_mmap_ptr_source_debug(const char *, int, size_t, const char **, size_t *, uint64_t *, int *, const char **, int *) { return nullptr; }
@@ -340,32 +339,6 @@ bool ggml_cuda_moe_stream_cache_contains(
     const char *src0_name,
     size_t expert_bytes,
     int expert_idx);
-
-bool ggml_cuda_moe_stream_up_gate_batch(
-    int  src0_up_type_int,
-    int  src0_gate_type_int,
-    const char *src0_up_name,
-    const void *src0_up_data,
-    const char *src0_gate_name,
-    const void *src0_gate_data,
-    int64_t n_as,
-    int64_t ne01,
-    int64_t ne00,
-    size_t up_nb01,
-    size_t up_nb02,
-    size_t up_expert_bytes,
-    size_t gate_nb01,
-    size_t gate_nb02,
-    size_t gate_expert_bytes,
-    const float *src1_f32,
-    size_t src1_nb1, size_t src1_nb2,
-    float *dst,
-    size_t dst_nb1, size_t dst_nb2,
-    int unary_op,
-    float limit,
-    const int64_t *matrix_row_counts,
-    const ggml_moe_row_mapping *matrix_rows,
-    int64_t rows_stride);
 
 bool ggml_cuda_moe_stream_mmvq_dev(
     int src0_type_int,
@@ -14258,35 +14231,6 @@ static bool batch_cache_launch_with_role_leases(
             cache, keys[i], descriptors[i], run_stream, true) && released;
     }
     return launched && released;
-}
-
-extern "C" bool ggml_cuda_moe_stream_up_gate_batch(
-    int  src0_up_type_int,
-    int  src0_gate_type_int,
-    const char *src0_up_name,
-    const void *src0_up_data,
-    const char *src0_gate_name,
-    const void *src0_gate_data,
-    int64_t n_as,
-    int64_t ne01,
-    int64_t ne00,
-    size_t up_nb01,
-    size_t up_nb02,
-    size_t up_expert_bytes,
-    size_t gate_nb01,
-    size_t gate_nb02,
-    size_t gate_expert_bytes,
-    const float *src1_f32,
-    size_t src1_nb1, size_t src1_nb2,
-    float *dst,
-    size_t dst_nb1, size_t dst_nb2,
-    int unary_op,
-    float limit,
-    const int64_t *matrix_row_counts,
-    const ggml_moe_row_mapping *matrix_rows,
-    int64_t rows_stride) {
-    // The opt-in runtime streaming compute path is retired.
-    return false;
 }
 
 extern "C" bool ggml_cuda_moe_stream_batch(

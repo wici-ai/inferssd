@@ -30,7 +30,6 @@ const void * ggml_cuda_moe_stream_cache_dev_ptr(const char *, size_t, int) { ret
 void ggml_cuda_moe_stream_batch_phase_report(const char *) {}
 void ggml_cuda_moe_ram_tier_request_begin(uint64_t) {}
 bool ggml_cuda_moe_iq2_xxs_q8k_selftest(void) { return false; }
-bool ggml_cuda_moe_stream_up_gate_batch(int, int, const char *, const void *, const char *, const void *, int64_t, int64_t, int64_t, size_t, size_t, size_t, size_t, size_t, size_t, const float *, size_t, size_t, float *, size_t, size_t, int, float, const int64_t *, const ggml_moe_row_mapping *, int64_t) { return false; }
 const void * ggml_cuda_moe_expert_pack_mmap_ptr(const char *, int, size_t) { return nullptr; }
 const void * ggml_cuda_moe_expert_pack_mmap_ptr_debug(const char *, int, size_t, const char **, size_t *, uint64_t *) { return nullptr; }
 const void * ggml_cuda_moe_expert_pack_mmap_ptr_source_debug(const char *, int, size_t, const char **, size_t *, uint64_t *, int *, const char **, int *) { return nullptr; }
@@ -329,32 +328,6 @@ bool ggml_cuda_moe_stream_cache_contains(
     size_t expert_bytes,
     int expert_idx);
 
-bool ggml_cuda_moe_stream_up_gate_batch(
-    int  src0_up_type_int,
-    int  src0_gate_type_int,
-    const char *src0_up_name,
-    const void *src0_up_data,
-    const char *src0_gate_name,
-    const void *src0_gate_data,
-    int64_t n_as,
-    int64_t ne01,
-    int64_t ne00,
-    size_t up_nb01,
-    size_t up_nb02,
-    size_t up_expert_bytes,
-    size_t gate_nb01,
-    size_t gate_nb02,
-    size_t gate_expert_bytes,
-    const float *src1_f32,
-    size_t src1_nb1, size_t src1_nb2,
-    float *dst,
-    size_t dst_nb1, size_t dst_nb2,
-    int unary_op,
-    float limit,
-    const int64_t *matrix_row_counts,
-    const ggml_moe_row_mapping *matrix_rows,
-    int64_t rows_stride);
-
 bool ggml_cuda_moe_stream_mmvq_dev(
     int src0_type_int,
     const void *d_src0,
@@ -449,11 +422,6 @@ int ggml_cuda_moe_common_stream_route_group_preload_updown_from_gate(
 int ggml_cuda_moe_common_stream_batch_preload_gate_updown(
     const char *, int, size_t);
 int ggml_cuda_moe_common_stream_batch_flush_gate_updown_cosubmit(void);
-bool ggml_cuda_moe_common_stream_up_gate_batch(
-    int, int, const char *, const void *, const char *, const void *, int64_t,
-    int64_t, int64_t, size_t, size_t, size_t, size_t, size_t, size_t,
-    const float *, size_t, size_t, float *, size_t, size_t, int, float,
-    const int64_t *, const ggml_moe_row_mapping *, int64_t);
 bool ggml_cuda_moe_common_stream_batch(
     int, const char *, const void *, int64_t, int64_t, int64_t, size_t,
     size_t, const float *, int64_t, size_t, size_t, const void *, size_t,
@@ -22860,46 +22828,6 @@ static bool moe_stream_compare_device_rows(
 }
 
 
-
-extern "C" bool ggml_cuda_moe_stream_up_gate_batch(
-    int  src0_up_type_int,
-    int  src0_gate_type_int,
-    const char *src0_up_name,
-    const void *src0_up_data,
-    const char *src0_gate_name,
-    const void *src0_gate_data,
-    int64_t n_as,
-    int64_t ne01,
-    int64_t ne00,
-    size_t up_nb01,
-    size_t up_nb02,
-    size_t up_expert_bytes,
-    size_t gate_nb01,
-    size_t gate_nb02,
-    size_t gate_expert_bytes,
-    const float *src1_f32,
-    size_t src1_nb1, size_t src1_nb2,
-    float *dst,
-    size_t dst_nb1, size_t dst_nb2,
-    int unary_op,
-    float limit,
-    const int64_t *matrix_row_counts,
-    const ggml_moe_row_mapping *matrix_rows,
-    int64_t rows_stride) {
-    ggml_moe::adapter_select_model_shape(
-        n_as, std::max(up_expert_bytes, gate_expert_bytes), "up-gate-batch");
-    if (ggml_moe::adapter_uses_common()) {
-        return ggml_cuda_moe_common_stream_up_gate_batch(
-            src0_up_type_int, src0_gate_type_int, src0_up_name, src0_up_data,
-            src0_gate_name, src0_gate_data, n_as, ne01, ne00, up_nb01,
-            up_nb02, up_expert_bytes, gate_nb01, gate_nb02,
-            gate_expert_bytes, src1_f32, src1_nb1, src1_nb2, dst, dst_nb1,
-            dst_nb2, unary_op, limit, matrix_row_counts, matrix_rows,
-            rows_stride);
-    }
-    // The shape-selected local compute path is retired.
-    return false;
-}
 
 enum class moe_phase1_mode {
     disabled,

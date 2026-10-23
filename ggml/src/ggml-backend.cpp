@@ -7256,33 +7256,10 @@ static bool ggml_kimi_split_moe_assign_profile_enabled() {
     return enabled;
 }
 
-static bool ggml_kimi_moe_upgate_cuda_dryrun_enabled() {
-    static const bool enabled = []() {
-        const char * env = getenv("GGML_KIMI_MOE_UPGATE_CUDA_DRYRUN");
-        return env && env[0] && env[0] != '0';
-    }();
-    return enabled;
-}
-
 static int ggml_kimi_split_moe_assign_profile_limit() {
     static const int limit = []() {
         const char * env = getenv("GGML_KIMI_SPLIT_MOE_ASSIGN_PROFILE_LIMIT");
         int value = (env && env[0]) ? atoi(env) : 256;
-        if (value < 1) {
-            value = 1;
-        }
-        if (value > 4096) {
-            value = 4096;
-        }
-        return value;
-    }();
-    return limit;
-}
-
-static int ggml_kimi_moe_upgate_cuda_dryrun_limit() {
-    static const int limit = []() {
-        const char * env = getenv("GGML_KIMI_MOE_UPGATE_CUDA_DRYRUN_LIMIT");
-        int value = (env && env[0]) ? atoi(env) : 32;
         if (value < 1) {
             value = 1;
         }
@@ -7318,132 +7295,13 @@ static bool ggml_kimi_tensor_buffer_name_contains(const ggml_tensor * tensor, co
     return strstr(ggml_kimi_tensor_buffer_name(tensor), needle) != nullptr;
 }
 
-static int ggml_kimi_find_backend_by_name(ggml_backend_sched_t sched, const char * needle) {
-    if (sched == nullptr || needle == nullptr) {
-        return -1;
-    }
-    for (int b = 0; b < sched->n_backends; ++b) {
-        if (strstr(ggml_backend_name(sched->backends[b]), needle) != nullptr) {
-            return b;
-        }
-    }
-    return -1;
-}
-
-static const ggml_tensor * ggml_kimi_find_split_node_by_name(
-        const ggml_backend_sched_split * split,
-        const char * needle) {
-    if (split == nullptr || needle == nullptr) {
-        return nullptr;
-    }
-    for (int node_id = 0; node_id < split->graph.n_nodes; ++node_id) {
-        const ggml_tensor * node = split->graph.nodes[node_id];
-        if (node != nullptr && ggml_kimi_name_contains(node->name, needle)) {
-            return node;
-        }
-    }
-    return nullptr;
-}
-
-static void ggml_kimi_moe_upgate_cuda_dryrun_record(
-        ggml_backend_sched_t sched,
-        int split_id,
-        const ggml_backend_sched_split * split,
-        ggml_backend_t split_backend) {
-    if (!ggml_kimi_moe_upgate_cuda_dryrun_enabled() ||
-            g_kimi_split_profile_phase != 2 ||
-            sched == nullptr || split == nullptr || split_backend == nullptr ||
-            split->graph.n_nodes <= 0) {
-        return;
-    }
-    if (strstr(ggml_backend_name(split_backend), "CPU") == nullptr) {
-        return;
-    }
-    const ggml_tensor * upgate = ggml_kimi_find_split_node_by_name(split, "ffn_moe_swiglu");
-    const ggml_tensor * down   = ggml_kimi_find_split_node_by_name(split, "ffn_moe_down");
-    if (upgate == nullptr || upgate->op != GGML_OP_MOE_FUSED_UP_GATE) {
-        return;
-    }
-
-    static int emitted = 0;
-    if (emitted >= ggml_kimi_moe_upgate_cuda_dryrun_limit()) {
-        return;
-    }
-    emitted++;
-
-    const int cuda_backend_id = ggml_kimi_find_backend_by_name(sched, "CUDA");
-    ggml_backend_t cuda_backend = cuda_backend_id >= 0 ? sched->backends[cuda_backend_id] : nullptr;
-    const bool upgate_cuda_support = cuda_backend != nullptr && ggml_backend_supports_op(cuda_backend, upgate);
-    const bool down_cuda_support = cuda_backend != nullptr && down != nullptr && ggml_backend_supports_op(cuda_backend, down);
-
-    const ggml_tensor * up_w   = upgate->src[0];
-    const ggml_tensor * gate_w = upgate->src[1];
-    const ggml_tensor * act    = upgate->src[2];
-    const ggml_tensor * ids    = upgate->src[3];
-    const ggml_tensor * down_w = down != nullptr ? down->src[0] : nullptr;
-    const int64_t rows_stride = ids != nullptr ? ids->ne[0] * ids->ne[1] : -1;
-    const bool down_weight_cpu_mapped = ggml_kimi_tensor_buffer_name_contains(down_w, "CPU_Mapped");
-    const bool upgate_weights_cpu_mapped =
-        ggml_kimi_tensor_buffer_name_contains(up_w, "CPU_Mapped") &&
-        ggml_kimi_tensor_buffer_name_contains(gate_w, "CPU_Mapped");
-
-    GGML_LOG_INFO(
-        "[kimi_upgate_cuda_dryrun] split=%d backend=%s cuda_backend=%s"
-        " upgate=%s op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]"
-        " out_buf=%s cuda_support=%d"
-        " ids=%s ids_type=%s ids_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] rows_stride=%" PRId64
-        " act=%s act_buf=%s"
-        " up_w=%s up_type=%s up_buf=%s gate_w=%s gate_type=%s gate_buf=%s"
-        " helper_needs_cpu_rowmap=1 weights_cpu_mapped=%d\n",
-        split_id,
-        ggml_backend_name(split_backend),
-        cuda_backend != nullptr ? ggml_backend_name(cuda_backend) : "<none>",
-        upgate->name[0] ? upgate->name : "<unnamed>",
-        ggml_op_name(upgate->op),
-        ggml_type_name(upgate->type),
-        upgate->ne[0], upgate->ne[1], upgate->ne[2], upgate->ne[3],
-        ggml_kimi_tensor_buffer_name(upgate),
-        upgate_cuda_support ? 1 : 0,
-        ids && ids->name[0] ? ids->name : "<null>",
-        ids ? ggml_type_name(ids->type) : "<null>",
-        ids ? ids->ne[0] : -1, ids ? ids->ne[1] : -1, ids ? ids->ne[2] : -1, ids ? ids->ne[3] : -1,
-        rows_stride,
-        act && act->name[0] ? act->name : "<null>",
-        ggml_kimi_tensor_buffer_name(act),
-        up_w && up_w->name[0] ? up_w->name : "<null>",
-        up_w ? ggml_type_name(up_w->type) : "<null>",
-        ggml_kimi_tensor_buffer_name(up_w),
-        gate_w && gate_w->name[0] ? gate_w->name : "<null>",
-        gate_w ? ggml_type_name(gate_w->type) : "<null>",
-        ggml_kimi_tensor_buffer_name(gate_w),
-        upgate_weights_cpu_mapped ? 1 : 0);
-
-    GGML_LOG_INFO(
-        "[kimi_upgate_cuda_dryrun] split=%d down=%s op=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]"
-        " out_buf=%s cuda_support=%d down_w=%s down_type=%s down_buf=%s down_weight_cpu_mapped=%d"
-        " current_chain_cpu_because_upgate_cuda_support=0 estimated_next_if_upgate_cuda=down_requires_selected_weight_copy_or_cache=%d\n",
-        split_id,
-        down && down->name[0] ? down->name : "<null>",
-        down ? ggml_op_name(down->op) : "<null>",
-        down ? ggml_type_name(down->type) : "<null>",
-        down ? down->ne[0] : -1, down ? down->ne[1] : -1, down ? down->ne[2] : -1, down ? down->ne[3] : -1,
-        ggml_kimi_tensor_buffer_name(down),
-        down_cuda_support ? 1 : 0,
-        down_w && down_w->name[0] ? down_w->name : "<null>",
-        down_w ? ggml_type_name(down_w->type) : "<null>",
-        ggml_kimi_tensor_buffer_name(down_w),
-        down_weight_cpu_mapped ? 1 : 0,
-        down_weight_cpu_mapped ? 1 : 0);
-}
-
 static void ggml_kimi_split_moe_assign_profile_record(
         ggml_backend_sched_t sched,
         int split_id,
         const ggml_backend_sched_split * split,
         ggml_backend_t split_backend) {
     const bool assign_profile = ggml_kimi_split_moe_assign_profile_enabled();
-    const bool dryrun_profile = ggml_kimi_moe_upgate_cuda_dryrun_enabled();
-    if ((!assign_profile && !dryrun_profile) ||
+    if (!assign_profile ||
             g_kimi_split_profile_phase != 2 ||
             sched == nullptr || split == nullptr || split_backend == nullptr ||
             split->graph.n_nodes <= 0) {
@@ -7462,11 +7320,6 @@ static void ggml_kimi_split_moe_assign_profile_record(
         ggml_kimi_name_contains(last_name, "ffn_moe_swiglu") ||
         ggml_kimi_name_contains(last_name, "ffn_moe_down");
     if (!moe_split) {
-        return;
-    }
-
-    ggml_kimi_moe_upgate_cuda_dryrun_record(sched, split_id, split, split_backend);
-    if (!assign_profile) {
         return;
     }
 
@@ -9222,10 +9075,8 @@ static bool ggml_backend_sched_kimi_async_h2d_build_plan(
                 for (int node_id = 0; node_id < split.graph.n_nodes;
                         ++node_id) {
                     const ggml_tensor * node = split.graph.nodes[node_id];
-                    if ((node->op == GGML_OP_MUL_MAT_ID &&
-                         node->src[0] == dst) ||
-                            (node->op == GGML_OP_MOE_FUSED_UP_GATE &&
-                             (node->src[0] == dst || node->src[1] == dst))) {
+                    if (node->op == GGML_OP_MUL_MAT_ID &&
+                            node->src[0] == dst) {
                         partial_moe_copy = true;
                         break;
                     }
@@ -10177,11 +10028,8 @@ static bool ggml_backend_sched_kimi_async_ids_build_plan(
             ggml_tensor * node = nullptr;
             for (int node_id = 0; node_id < split.graph.n_nodes; ++node_id) {
                 ggml_tensor * candidate = split.graph.nodes[node_id];
-                if ((candidate->op == GGML_OP_MUL_MAT_ID &&
-                     candidate->src[0] == input_cpy) ||
-                        (candidate->op == GGML_OP_MOE_FUSED_UP_GATE &&
-                         (candidate->src[0] == input_cpy ||
-                          candidate->src[1] == input_cpy))) {
+                if (candidate->op == GGML_OP_MUL_MAT_ID &&
+                        candidate->src[0] == input_cpy) {
                     node = candidate;
                     break;
                 }
@@ -10191,9 +10039,7 @@ static bool ggml_backend_sched_kimi_async_ids_build_plan(
             }
 
             const int64_t n_expert = input->ne[2];
-            ggml_tensor * ids_tensor =
-                node->op == GGML_OP_MOE_FUSED_UP_GATE ?
-                    node->src[3] : node->src[2];
+            ggml_tensor * ids_tensor = node->src[2];
             ggml_backend_t ids_backend = split_backend;
             for (int i = input_id + 1; i < split.n_inputs; ++i) {
                 if (ids_tensor == tensor_copy(
@@ -11040,11 +10886,6 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             node = candidate;
                             break;
                         }
-                        if (candidate->op == GGML_OP_MOE_FUSED_UP_GATE &&
-                                (candidate->src[0] == input_cpy || candidate->src[1] == input_cpy)) {
-                            node = candidate;
-                            break;
-                        }
                     }
                 }
                 if (node != nullptr) {
@@ -11055,7 +10896,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(input_backend);
 
                     // get the ids
-                    ggml_tensor * ids_tensor = node->op == GGML_OP_MOE_FUSED_UP_GATE ? node->src[3] : node->src[2];
+                    ggml_tensor * ids_tensor = node->src[2];
                     ggml_backend_t ids_backend = split_backend;
 
                     // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend

@@ -28,11 +28,6 @@
 
 // dedup helpers
 
-static bool llama_kimi_moe_graph_profile_enabled() {
-    static const bool enabled = std::getenv("GGML_KIMI_MOE_GRAPH_PROFILE") != nullptr;
-    return enabled;
-}
-
 static bool llama_moe_next_gate_shadow_enabled_env() {
     static const bool enabled = []() {
         const char * path = std::getenv("GGML_MOE_NEXT_GATE_SHADOW_OUT");
@@ -67,22 +62,6 @@ static int64_t llama_moe_next_gate_shadow_topk_env(int64_t default_topk, int64_t
         }
     }
     return std::max<int64_t>(1, std::min<int64_t>(topk, n_expert));
-}
-
-static const char * llama_tensor_name_or_null(const ggml_tensor * t) {
-    return t ? t->name : "(null)";
-}
-
-static const char * llama_tensor_type_name_or_null(const ggml_tensor * t) {
-    return t ? ggml_type_name(t->type) : "(null)";
-}
-
-static bool llama_kimi_moe_mixed_iq2_iq3_pair(const ggml_tensor * up, const ggml_tensor * gate) {
-    if (!up || !gate) {
-        return false;
-    }
-    return (up->type == GGML_TYPE_IQ2_S && gate->type == GGML_TYPE_IQ3_XXS) ||
-           (up->type == GGML_TYPE_IQ3_XXS && gate->type == GGML_TYPE_IQ2_S);
 }
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -2416,107 +2395,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
-    bool fused_up_gate_done = false;
-
-    const bool mixed_fused_up_gate =
-        std::getenv("GGML_MOE_STREAM_FUSED_UP_GATE_MIXED_TYPES") != nullptr &&
-        llama_kimi_moe_mixed_iq2_iq3_pair(up_exps, gate_exps);
-    const char * prompt_up_gate_env = std::getenv("GGML_MOE_STREAM_PROMPT_UP_GATE");
-    const bool prompt_stream_fused_up_gate =
-        prompt_up_gate_env != nullptr && prompt_up_gate_env[0] && prompt_up_gate_env[0] != '0';
-    // DeepSeek-V4.1 clamps the routed-expert SwiGLU (hparams.swiglu_clamp_exp, see the LLM_FFN_SILU case below).
-    // ggml_moe_up_gate() computes an unclamped SwiGLU, so the fused stream shortcut must not be used for such a
-    // layer: fall back to the separate up/gate path, which applies the clamp.
-    const bool moe_swiglu_clamped =
-        arch == LLM_ARCH_DEEPSEEK41 && il >= 0 && gate_exps != nullptr && hparams.swiglu_clamp_exp[il] > 1e-6f;
-    if (moe_swiglu_clamped && std::getenv("GGML_MOE_STREAM_FUSED_UP_GATE") != nullptr) {
-        static std::atomic<bool> warned { false };
-        if (!warned.exchange(true)) {
-            LLAMA_LOG_WARN("%s: GGML_MOE_STREAM_FUSED_UP_GATE ignored for %s: the fused up/gate op does not clamp the SwiGLU\n",
-                    __func__, llm_arch_name(arch));
-        }
-    }
-    const bool use_stream_fused_up_gate =
-        !moe_swiglu_clamped &&
-        std::getenv("GGML_MOE_STREAM_FUSED_UP_GATE") != nullptr &&
-        (n_tokens == 1 || prompt_stream_fused_up_gate) &&
-        gate_up_exps == nullptr &&
-        up_exps != nullptr &&
-        gate_exps != nullptr &&
-        up_exps_b == nullptr &&
-        gate_exps_b == nullptr &&
-        up_exps_s == nullptr &&
-        gate_exps_s == nullptr &&
-        type_op == LLM_FFN_SILU &&
-        (up_exps->type == gate_exps->type || mixed_fused_up_gate) &&
-        ggml_are_same_shape(up_exps, gate_exps);
-    if (llama_kimi_moe_graph_profile_enabled()) {
-        const bool env_fused          = std::getenv("GGML_MOE_STREAM_FUSED_UP_GATE") != nullptr;
-        const bool one_token          = n_tokens == 1;
-        const bool prompt_fused       = prompt_stream_fused_up_gate;
-        const bool no_gate_up         = gate_up_exps == nullptr;
-        const bool has_up             = up_exps != nullptr;
-        const bool has_gate           = gate_exps != nullptr;
-        const bool no_up_bias         = up_exps_b == nullptr;
-        const bool no_gate_bias       = gate_exps_b == nullptr;
-        const bool no_up_scale        = up_exps_s == nullptr;
-        const bool no_gate_scale      = gate_exps_s == nullptr;
-        const bool silu_op            = type_op == LLM_FFN_SILU;
-        const bool same_type          = up_exps != nullptr && gate_exps != nullptr && up_exps->type == gate_exps->type;
-        const bool same_shape         = up_exps != nullptr && gate_exps != nullptr && ggml_are_same_shape(up_exps, gate_exps);
-
-        fprintf(stderr,
-                "[kimi_moe_graph_profile] il=%d n_tokens=%" PRId64
-                " fused_up_gate=%d env=%d one_token=%d prompt_fused=%d no_gate_up=%d has_up=%d has_gate=%d"
-                " no_up_bias=%d no_gate_bias=%d no_up_scale=%d no_gate_scale=%d"
-                " silu=%d same_type=%d mixed_type_allowed=%d same_shape=%d"
-                " up_name=%s up_type=%s gate_name=%s gate_type=%s gate_up_name=%s"
-                " up_shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]"
-                " gate_shape=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]"
-                " up_nb01=%zu up_nb02=%zu up_expert_bytes=%zu"
-                " gate_nb01=%zu gate_nb02=%zu gate_expert_bytes=%zu"
-                " n_expert=%" PRId64 "\n",
-                il,
-                n_tokens,
-                use_stream_fused_up_gate ? 1 : 0,
-                env_fused ? 1 : 0,
-                one_token ? 1 : 0,
-                prompt_fused ? 1 : 0,
-                no_gate_up ? 1 : 0,
-                has_up ? 1 : 0,
-                has_gate ? 1 : 0,
-                no_up_bias ? 1 : 0,
-                no_gate_bias ? 1 : 0,
-                no_up_scale ? 1 : 0,
-                no_gate_scale ? 1 : 0,
-                silu_op ? 1 : 0,
-                same_type ? 1 : 0,
-                mixed_fused_up_gate ? 1 : 0,
-                same_shape ? 1 : 0,
-                llama_tensor_name_or_null(up_exps),
-                llama_tensor_type_name_or_null(up_exps),
-                llama_tensor_name_or_null(gate_exps),
-                llama_tensor_type_name_or_null(gate_exps),
-                llama_tensor_name_or_null(gate_up_exps),
-                up_exps ? up_exps->ne[0] : -1,
-                up_exps ? up_exps->ne[1] : -1,
-                up_exps ? up_exps->ne[2] : -1,
-                up_exps ? up_exps->ne[3] : -1,
-                gate_exps ? gate_exps->ne[0] : -1,
-                gate_exps ? gate_exps->ne[1] : -1,
-                gate_exps ? gate_exps->ne[2] : -1,
-                gate_exps ? gate_exps->ne[3] : -1,
-                up_exps ? up_exps->nb[1] : 0,
-                up_exps ? up_exps->nb[2] : 0,
-                up_exps ? (size_t) up_exps->ne[1] * up_exps->nb[1] : 0,
-                gate_exps ? gate_exps->nb[1] : 0,
-                gate_exps ? gate_exps->nb[2] : 0,
-                gate_exps ? (size_t) gate_exps->ne[1] * gate_exps->nb[1] : 0,
-                up_exps ? up_exps->ne[2] : (gate_exps ? gate_exps->ne[2] : -1));
-    }
     const bool build_gate_first_for_cuda_fusion =
         gate_up_exps == nullptr &&
-        !use_stream_fused_up_gate &&
         gate_exps != nullptr &&
         up_exps_b == nullptr &&
         gate_exps_b == nullptr &&
@@ -2548,10 +2428,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_gate", il);
         up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
         cb(up, "ffn_moe_up", il);
-    } else if (use_stream_fused_up_gate) {
-        cur = ggml_moe_up_gate(ctx0, up_exps, gate_exps, cur, selected_experts, GGML_UNARY_OP_SILU);
-        cb(cur, "ffn_moe_swiglu", il);
-        fused_up_gate_done = true;
     } else if (build_gate_first_for_cuda_fusion) {
         cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
         cb(cur, "ffn_moe_gate", il);
@@ -2603,9 +2479,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     switch (type_op) {
         case LLM_FFN_SILU:
-            if (fused_up_gate_done) {
-                break;
-            }
             if (gate_exps) {
                 // Step35: per-layer clamp for routed experts
                 // DeepSeek-V4.1: same limit, computed by the fused swiglu_clamp op (as upstream)

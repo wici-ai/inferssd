@@ -372,71 +372,7 @@ static bool kimi_layer_gap_cuda_collect_pending(
 }
 #endif
 
-typedef struct {
-    int32_t i1;
-    int32_t i2;
-} ggml_moe_row_mapping;
 
-extern "C" bool ggml_cuda_moe_stream_batch(
-    int  src0_type_int,
-    const char *src0_name,
-    const void *src0_data,
-    int64_t n_as,
-    int64_t ne01,
-    int64_t ne00,
-    size_t nb01,
-    size_t nb02,
-    const float *src1_f32,
-    int64_t src1_ne1,
-    size_t src1_nb1, size_t src1_nb2,
-    const void *src1_q8_0,
-    size_t src1_q8_0_row_size,
-    int64_t src1_q8_0_ne1,
-    float *dst,
-    size_t dst_nb1, size_t dst_nb2,
-    const int64_t *matrix_row_counts,
-    const ggml_moe_row_mapping *matrix_rows,
-    int64_t rows_stride);
-
-extern "C" bool ggml_cuda_moe_stream_up_gate_batch(
-    int  src0_up_type_int,
-    int  src0_gate_type_int,
-    const char *src0_up_name,
-    const void *src0_up_data,
-    const char *src0_gate_name,
-    const void *src0_gate_data,
-    int64_t n_as,
-    int64_t ne01,
-    int64_t ne00,
-    size_t up_nb01,
-    size_t up_nb02,
-    size_t up_expert_bytes,
-    size_t gate_nb01,
-    size_t gate_nb02,
-    size_t gate_expert_bytes,
-    const float *src1_f32,
-    size_t src1_nb1, size_t src1_nb2,
-    float *dst,
-    size_t dst_nb1, size_t dst_nb2,
-    int unary_op,
-    float limit,
-    const int64_t *matrix_row_counts,
-    const ggml_moe_row_mapping *matrix_rows,
-    int64_t rows_stride);
-
-extern "C" int ggml_cuda_moe_stream_batch_preload_active_from_pack(
-    int src0_type_int,
-    const char *src0_name,
-    int64_t n_as,
-    size_t expert_bytes,
-    const int64_t *matrix_row_counts);
-
-extern "C" int ggml_cuda_moe_stream_q4_colibri_pilot_prefetch_from_gate(
-    int src0_type_int,
-    const char *src0_gate_name,
-    int64_t n_as,
-    size_t expert_bytes,
-    const int64_t *matrix_row_counts);
 
 extern "C" bool ggml_cuda_moe_expert_pack_copy_ranges_to_device(
     const char *tensor_name,
@@ -462,29 +398,6 @@ extern "C" bool ggml_cuda_moe_dense_copy_to_device(
     size_t nbytes,
     void *stream,
     bool *read_ahead_hit);
-
-static bool ggml_cuda_glm52_colibri_requested() {
-    const char * pack = std::getenv("GGML_MOE_GLM52_COLIBRI_PACK");
-    const char * manifest = std::getenv("GGML_MOE_GLM52_COLIBRI_MANIFEST");
-    return pack && pack[0] && manifest && manifest[0];
-}
-
-static bool ggml_cuda_glm52_external_expert_name(const char * name) {
-    return name != nullptr &&
-        (std::strstr(name, "ffn_gate_exps") != nullptr ||
-         std::strstr(name, "ffn_up_exps")   != nullptr ||
-         std::strstr(name, "ffn_down_exps") != nullptr);
-}
-
-static bool ggml_cuda_moe_gate_batch_prefetch_enabled() {
-    const char *env = std::getenv("GGML_MOE_GATE_BATCH_PREFETCH");
-    return env && env[0] && env[0] != '0';
-}
-
-static bool ggml_cuda_moe_q4_colibri_pilot_prefetch_enabled() {
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PILOT_PREFETCH");
-    return env && env[0] && env[0] != '0';
-}
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -3769,248 +3682,6 @@ static void ds4_exact_mmid_dataflow_probe_write(
         cuda_graph_fast_candidate ? 1 : 0);
 }
 
-static bool ggml_cuda_moe_build_host_routes(
-        cudaStream_t stream,
-        const ggml_tensor * ids,
-        int64_t n_as,
-        std::vector<int64_t> & matrix_row_counts,
-        std::vector<ggml_moe_row_mapping> & matrix_rows,
-        int64_t & rows_stride) {
-    if (ids == nullptr || ids->type != GGML_TYPE_I32 || ids->ne[2] != 1 || ids->ne[3] != 1) {
-        return false;
-    }
-
-    const int64_t n_ids = ids->ne[0];
-    const int64_t n_tokens = ids->ne[1];
-    rows_stride = n_ids * n_tokens;
-    if (n_as <= 0 || n_ids <= 0 || n_tokens <= 0 || rows_stride <= 0) {
-        return false;
-    }
-
-    static const char * route_timeline_path = std::getenv("GGML_MOE_ROUTE_D2H_TIMELINE_CSV");
-    const bool route_timeline_enabled = route_timeline_path && route_timeline_path[0];
-    const auto route_start = route_timeline_enabled ?
-        std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    std::vector<uint8_t> ids_bytes(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_bytes.data(), ids->data, ids_bytes.size(), cudaMemcpyDeviceToHost, stream));
-    const auto copy_enqueued = route_timeline_enabled ?
-        std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    const auto copy_done = route_timeline_enabled ?
-        std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-
-    matrix_row_counts.assign(n_as, 0);
-    matrix_rows.assign((size_t) n_as * (size_t) rows_stride, ggml_moe_row_mapping{0, 0});
-
-    for (int64_t it = 0; it < n_tokens; ++it) {
-        for (int64_t iid = 0; iid < n_ids; ++iid) {
-            const int32_t expert = *(const int32_t *) (ids_bytes.data() + (size_t) it * ids->nb[1] + (size_t) iid * ids->nb[0]);
-            if (expert < 0 || expert >= n_as) {
-                return false;
-            }
-            const int64_t row = matrix_row_counts[expert]++;
-            matrix_rows[(size_t) expert * (size_t) rows_stride + (size_t) row] =
-                ggml_moe_row_mapping{(int32_t) iid, (int32_t) it};
-        }
-    }
-
-    if (route_timeline_enabled) {
-        static std::mutex route_timeline_mu;
-        static bool route_timeline_header = false;
-        static uint64_t route_timeline_seq = 0;
-        const auto route_done = std::chrono::steady_clock::now();
-        const auto us = [](const auto & end, const auto & start) -> uint64_t {
-            return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-        };
-        std::lock_guard<std::mutex> lock(route_timeline_mu);
-        FILE * file = std::fopen(route_timeline_path, "a");
-        if (file != nullptr) {
-            if (!route_timeline_header) {
-                std::fprintf(file,
-                    "seq,tensor,n_ids,n_tokens,n_experts,bytes,enqueue_us,sync_us,parse_us,total_us\n");
-                route_timeline_header = true;
-            }
-            std::fprintf(file, "%" PRIu64 ",%s,%" PRId64 ",%" PRId64 ",%" PRId64
-                    ",%zu,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
-                ++route_timeline_seq,
-                ids->name,
-                n_ids,
-                n_tokens,
-                n_as,
-                ids_bytes.size(),
-                us(copy_enqueued, route_start),
-                us(copy_done, copy_enqueued),
-                us(route_done, copy_done),
-                us(route_done, route_start));
-            std::fclose(file);
-        }
-    }
-
-    return true;
-}
-
-static bool ggml_cuda_copy_f32_tensor_to_host(
-        cudaStream_t stream,
-        const ggml_tensor * src,
-        std::vector<uint8_t> & host) {
-    if (src == nullptr || src->type != GGML_TYPE_F32 || src->data == nullptr) {
-        return false;
-    }
-    host.resize(ggml_nbytes(src));
-    CUDA_CHECK(cudaMemcpyAsync(host.data(), src->data, host.size(), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    return true;
-}
-
-static bool ggml_cuda_try_glm52_colibri_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
-    const ggml_tensor * ids  = dst->src[2];
-    if (!ggml_cuda_glm52_colibri_requested() ||
-            src0 == nullptr || src1 == nullptr || ids == nullptr ||
-            src0->type != GGML_TYPE_Q4_0 ||
-            src1->type != GGML_TYPE_F32 ||
-            dst->type != GGML_TYPE_F32 ||
-            !ggml_cuda_glm52_external_expert_name(src0->name)) {
-        return false;
-    }
-
-    cudaStream_t stream = ctx.stream();
-    std::vector<int64_t> matrix_row_counts;
-    std::vector<ggml_moe_row_mapping> matrix_rows;
-    int64_t rows_stride = 0;
-    if (!ggml_cuda_moe_build_host_routes(stream, ids, src0->ne[2], matrix_row_counts, matrix_rows, rows_stride)) {
-        return false;
-    }
-
-    std::vector<uint8_t> src1_host;
-    if (!ggml_cuda_copy_f32_tensor_to_host(stream, src1, src1_host)) {
-        return false;
-    }
-
-    const bool done = ggml_cuda_moe_stream_batch(
-        src0->type,
-        src0->name,
-        src0->data,
-        src0->ne[2],
-        src0->ne[1],
-        src0->ne[0],
-        src0->nb[1],
-        src0->nb[2],
-        (const float *) src1_host.data(),
-        src1->ne[1],
-        (size_t) src1->ne[0] * sizeof(float),
-        (size_t) src1->ne[0] * (size_t) src1->ne[1] * sizeof(float),
-        nullptr,
-        0,
-        0,
-        (float *) dst->data,
-        dst->nb[1],
-        dst->nb[2],
-        matrix_row_counts.data(),
-        matrix_rows.data(),
-        rows_stride);
-    if (!done) {
-        GGML_ABORT("GLM5.2 colibri MUL_MAT_ID dispatch declined");
-    }
-    return true;
-}
-
-static void ggml_cuda_op_moe_fused_up_gate(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0_up   = dst->src[0];
-    const ggml_tensor * src0_gate = dst->src[1];
-    const ggml_tensor * src1      = dst->src[2];
-    const ggml_tensor * ids       = dst->src[3];
-
-    GGML_ASSERT(src0_up   != nullptr);
-    GGML_ASSERT(src0_gate != nullptr);
-    GGML_ASSERT(src1      != nullptr);
-    GGML_ASSERT(ids       != nullptr);
-    GGML_ASSERT(src0_up->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(src0_gate->type == GGML_TYPE_Q4_0);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-
-    cudaStream_t stream = ctx.stream();
-    std::vector<int64_t> matrix_row_counts;
-    std::vector<ggml_moe_row_mapping> matrix_rows;
-    int64_t rows_stride = 0;
-    if (!ggml_cuda_moe_build_host_routes(stream, ids, src0_up->ne[2], matrix_row_counts, matrix_rows, rows_stride)) {
-        GGML_ABORT("GLM5.2 colibri fused up/gate route build failed");
-    }
-
-    std::vector<uint8_t> src1_host;
-    if (!ggml_cuda_copy_f32_tensor_to_host(stream, src1, src1_host)) {
-        GGML_ABORT("GLM5.2 colibri fused up/gate activation copy failed");
-    }
-
-    if (ggml_cuda_moe_gate_batch_prefetch_enabled()) {
-        const int same_layer_jobs = ggml_cuda_moe_stream_batch_preload_active_from_pack(
-                src0_gate->type,
-                src0_gate->name,
-                src0_gate->ne[2],
-                (size_t) src0_gate->ne[1] * src0_gate->nb[1],
-                matrix_row_counts.data());
-        static std::atomic<int> first_report{0};
-        if (first_report.fetch_add(1, std::memory_order_relaxed) == 0) {
-            std::fprintf(stderr,
-                    "[ggml-cuda] GLM5.2 same-layer triplet preload: gate=%s experts=%ld bytes=%zu jobs=%d\n",
-                    src0_gate->name,
-                    (long) src0_gate->ne[2],
-                    (size_t) src0_gate->ne[1] * src0_gate->nb[1],
-                    same_layer_jobs);
-        }
-    }
-    if (ggml_cuda_moe_q4_colibri_pilot_prefetch_enabled()) {
-        const int pilot_jobs = ggml_cuda_moe_stream_q4_colibri_pilot_prefetch_from_gate(
-                src0_gate->type,
-                src0_gate->name,
-                src0_gate->ne[2],
-                (size_t) src0_gate->ne[1] * src0_gate->nb[1],
-                matrix_row_counts.data());
-        static std::atomic<int> first_pilot_report{0};
-        if (first_pilot_report.fetch_add(1, std::memory_order_relaxed) == 0) {
-            std::fprintf(stderr,
-                    "[ggml-cuda] GLM5.2 pilot prefetch: gate=%s experts=%ld bytes=%zu jobs=%d\n",
-                    src0_gate->name,
-                    (long) src0_gate->ne[2],
-                    (size_t) src0_gate->ne[1] * src0_gate->nb[1],
-                    pilot_jobs);
-        }
-    }
-
-    const bool done = ggml_cuda_moe_stream_up_gate_batch(
-        src0_up->type,
-        src0_gate->type,
-        src0_up->name,
-        src0_up->data,
-        src0_gate->name,
-        src0_gate->data,
-        src0_up->ne[2],
-        src0_up->ne[1],
-        src0_up->ne[0],
-        src0_up->nb[1],
-        src0_up->nb[2],
-        (size_t) src0_up->ne[1] * src0_up->nb[1],
-        src0_gate->nb[1],
-        src0_gate->nb[2],
-        (size_t) src0_gate->ne[1] * src0_gate->nb[1],
-        (const float *) src1_host.data(),
-        (size_t) src1->ne[0] * sizeof(float),
-        (size_t) src1->ne[0] * (size_t) src1->ne[1] * sizeof(float),
-        (float *) dst->data,
-        dst->nb[1],
-        dst->nb[2],
-        ggml_get_op_params_i32(dst, 0),
-        ggml_get_op_params_f32(dst, 1),
-        matrix_row_counts.data(),
-        matrix_rows.data(),
-        rows_stride);
-    if (!done) {
-        GGML_ABORT("GLM5.2 colibri fused up/gate dispatch declined");
-    }
-}
-
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -4034,9 +3705,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const bool mmf_fast_candidate = mmid_f32_io &&
         ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true);
 
-    if (ggml_cuda_try_glm52_colibri_mul_mat_id(ctx, dst)) {
-        return;
-    }
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (mmid_f32_io) {
@@ -4477,9 +4145,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
-            break;
-        case GGML_OP_MOE_FUSED_UP_GATE:
-            ggml_cuda_op_moe_fused_up_gate(ctx, dst);
             break;
         case GGML_OP_HC_WEIGHTED_SUM:
             ggml_cuda_op_hc_weighted_sum(ctx, dst);
@@ -7280,25 +6945,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     default:
                         return false;
                 }
-            } break;
-        case GGML_OP_MOE_FUSED_UP_GATE:
-            {
-                struct ggml_tensor * up   = op->src[0];
-                struct ggml_tensor * gate = op->src[1];
-                struct ggml_tensor * act  = op->src[2];
-                struct ggml_tensor * ids  = op->src[3];
-                return ggml_cuda_glm52_colibri_requested() &&
-                    up != nullptr && gate != nullptr && act != nullptr && ids != nullptr &&
-                    up->type == GGML_TYPE_Q4_0 &&
-                    gate->type == GGML_TYPE_Q4_0 &&
-                    act->type == GGML_TYPE_F32 &&
-                    ids->type == GGML_TYPE_I32 &&
-                    op->type == GGML_TYPE_F32 &&
-                    ggml_cuda_glm52_external_expert_name(up->name) &&
-                    ggml_cuda_glm52_external_expert_name(gate->name) &&
-                    ggml_are_same_shape(up, gate) &&
-                    !ggml_is_transposed(up) &&
-                    !ggml_is_transposed(gate);
             } break;
         case GGML_OP_OUT_PROD:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;

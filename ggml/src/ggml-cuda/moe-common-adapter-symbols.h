@@ -56,6 +56,5 @@
 #define ggml_cuda_moe_stream_register_tensor                         ggml_cuda_moe_common_stream_register_tensor
 #define ggml_cuda_moe_stream_route_group_preload_updown_from_gate    ggml_cuda_moe_common_stream_route_group_preload_updown_from_gate
 #define ggml_cuda_moe_stream_stage_active_experts                    ggml_cuda_moe_common_stream_stage_active_experts
-#define ggml_cuda_moe_stream_up_gate_batch                           ggml_cuda_moe_common_stream_up_gate_batch
 #define ggml_cuda_moe_ttft_trace_event                               ggml_cuda_moe_common_ttft_trace_event
 #define ggml_cuda_moe_ttft_trace_mark                                ggml_cuda_moe_common_ttft_trace_mark

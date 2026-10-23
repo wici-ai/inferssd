@@ -852,9 +852,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             case GGML_OP_MUL_MAT_ID: {
                 split_state = handle_mul_mat(src_ss);
             } break;
-            case GGML_OP_MOE_FUSED_UP_GATE: {
-                split_state = handle_generic(src_ss, /*scalar_only =*/ false);
-            } break;
             case GGML_OP_OUT_PROD: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;

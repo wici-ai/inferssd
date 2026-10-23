@@ -232,12 +232,6 @@ static void ggml_kimi_phase1_mmap_reclaim_tensor(
     ggml_barrier(params->threadpool);
 }
 
-static bool ggml_kimi_moe_mixed_iq2_iq3_pair(enum ggml_type up_type, enum ggml_type gate_type) {
-    return ggml_model_type_is_kimi() &&
-           ((up_type == GGML_TYPE_IQ2_S && gate_type == GGML_TYPE_IQ3_XXS) ||
-            (up_type == GGML_TYPE_IQ3_XXS && gate_type == GGML_TYPE_IQ2_S));
-}
-
 struct ggml_kimi_cpu_moe_profile_op {
     uint64_t calls;
     uint64_t setup_us;
