@@ -471,15 +471,21 @@ struct tier {
     void disarm_reclaimer(){
         std::lock_guard<std::mutex> lock(lifecycle_mutex);reclaimer_armed=false;
     }
+    static void drain_failed_seed_offer(tier * t) noexcept {
+        if(t->seed_stream && (cudaSetDevice(t->device)!=cudaSuccess || cudaStreamSynchronize(t->seed_stream)!=cudaSuccess)){
+            std::fprintf(stderr,"[ssd.tier] cannot drain failed seed offer\n");std::abort();
+        }
+    }
     static int seed_offer_thunk(void * p,const char * name,const void * data,size_t expert_bytes,int64_t n,
             const int32_t * counts,void * ready,void ** done) noexcept {
         auto * t=static_cast<tier *>(p);
         try{return t->seed_offer(name,static_cast<const char *>(data),expert_bytes,n,counts,static_cast<cudaEvent_t>(ready),done);}
         catch(const std::exception & e){
+            drain_failed_seed_offer(t);
             std::fprintf(stderr,"[kimi_vram_seed] event=offer status=fail error=%s\n",e.what());
             if(done)*done=nullptr;
             return -1;
-        }catch(...){if(done)*done=nullptr;return -1;}
+        }catch(...){drain_failed_seed_offer(t);if(done)*done=nullptr;return -1;}
     }
     void register_seed(){
         if(seed_registered || device<0)return;

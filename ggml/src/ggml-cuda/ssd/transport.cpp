@@ -58,7 +58,7 @@ struct transport_owner {
     uint64_t reads = 0, bytes = 0;
     ssd::gpu::seed_offer_fn seed = nullptr;
     void * seed_data = nullptr;
-    cudaEvent_t ready = nullptr, pending = nullptr;
+    cudaEvent_t ready = nullptr, pending = nullptr, last_seed_done = nullptr;
     transport_owner(const ssd::runtime_services & services, int ordinal) : source(*services.source), host(services.host), device(ordinal) { dense.owner = this; }
     bool resolve(const char * name, int expert, size_t bytes, int64_t experts, extent & out) {
         size_t logical = 0;
@@ -433,10 +433,10 @@ void quiesce(void * value) noexcept {
     owner.release(owner.dense.ring);
     for (auto & half : owner.dense.half) half = dense_stage_half();
     std::lock_guard<std::mutex> seed_lock(owner.seed_mutex);
-    if (owner.pending && cudaEventSynchronize(owner.pending) != cudaSuccess) fatal("pending seed");
+    if (owner.last_seed_done && cudaEventSynchronize(owner.last_seed_done) != cudaSuccess) fatal("last seed copy");
     if (owner.ready && cudaEventSynchronize(owner.ready) != cudaSuccess) fatal("seed source");
     if (owner.ready && cudaEventDestroy(owner.ready) != cudaSuccess) fatal("seed event");
-    owner.pending = owner.ready = nullptr;
+    owner.pending = owner.ready = owner.last_seed_done = nullptr;
 }
 void destroy(void * value) noexcept {
     if (!value) return;
@@ -540,8 +540,8 @@ bool seed_unregister(void * p, ssd::gpu::seed_offer_fn callback, void * data) no
     auto & owner = *static_cast<transport_owner *>(p);
     std::lock_guard<std::mutex> lock(owner.seed_mutex);
     if (owner.seed != callback || owner.seed_data != data) return false;
-    if (owner.pending && cudaEventSynchronize(owner.pending) != cudaSuccess) fatal("seed unregister");
-    owner.seed = nullptr; owner.seed_data = nullptr; owner.pending = nullptr; return true;
+    if (owner.last_seed_done && cudaEventSynchronize(owner.last_seed_done) != cudaSuccess) fatal("seed unregister");
+    owner.seed = nullptr; owner.seed_data = nullptr; owner.pending = owner.last_seed_done = nullptr; return true;
 }
 bool seed_offer(void * p, const char * name, const void * data, size_t bytes, int64_t experts,
         const int32_t * counts, void * stream_ptr) noexcept {
@@ -556,7 +556,7 @@ bool seed_offer(void * p, const char * name, const void * data, size_t bytes, in
     void * done = nullptr;
     const int result = owner.seed(owner.seed_data, name, data, bytes, experts, counts, owner.ready, &done);
     if (result < 0) return false;
-    if (result > 0 && done) owner.pending = static_cast<cudaEvent_t>(done);
+    if (result > 0 && done) owner.pending = owner.last_seed_done = static_cast<cudaEvent_t>(done);
     return true;
 }
 bool seed_fence(void * p, void * stream_ptr) noexcept {
