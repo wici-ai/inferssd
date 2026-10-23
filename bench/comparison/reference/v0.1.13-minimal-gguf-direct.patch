@@ -1,0 +1,376 @@
+diff --git a/ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc b/ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc
+index 1bf593f..1772905 100644
+--- a/ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc
++++ b/ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc
+@@ -558,7 +558,7 @@ struct sink_vram {
+                 selected.source = item.source;
+                 if (item.source == KIMI_VRAM_PREFILL_TRANSIENT_RAM) {
+                     for (int role = 0; role < 3; ++role) {
+-                        selected.role[role] = cache.data(source[index].cache_hit, role);
++                        selected.role[role] = static_cast<const char *>(cache.data(source[index].cache_hit, role)) + source[index].role[role].data_offset;
+                     }
+                     ++ram_selected;
+                     ram_selected_routes += uint64_t(token_routes[index]);
+diff --git a/ggml/src/ggml-cpu/kimi-cpu-sink.cpp b/ggml/src/ggml-cpu/kimi-cpu-sink.cpp
+index 1062bc7..a3534cd 100644
+--- a/ggml/src/ggml-cpu/kimi-cpu-sink.cpp
++++ b/ggml/src/ggml-cpu/kimi-cpu-sink.cpp
+@@ -25,6 +25,8 @@
+ #include <thread>
+ #include <vector>
+ 
++extern "C" size_t kimi_cpu_sink_source_size(void) { return sizeof(kimi_cpu_sink_source); }
++
+ static void sink_error(char * dst, size_t size, const char * message) {
+     if (dst && size) {
+         std::snprintf(dst, size, "%s", message);
+@@ -1031,14 +1033,19 @@ struct sink_cache {
+         struct stat st;
+         if (fstat(s.fd_direct, &st) != 0) { throw sys_error("CPU sink cache fstat"); }
+         return { static_cast<uint64_t>(st.st_dev), static_cast<uint64_t>(st.st_ino),
+-            static_cast<uint64_t>(st.st_size), s.offset, s.nbytes,
++            static_cast<uint64_t>(st.st_size), s.offset + s.data_offset, s.payload_nbytes ? s.payload_nbytes : s.nbytes,
+             st.st_mtim.tv_sec, st.st_mtim.tv_nsec, st.st_ctim.tv_sec, st.st_ctim.tv_nsec };
+     }
+     static bool matches(const entry & e, const sink_request & r) {
+         for (int role = 0; role < 3; ++role) { if (!(e.source[role] == key(r.role[role]))) { return false; } }
+         return true;
+     }
+-    bool geometry(const size_t * bytes) {
++    bool geometry(const size_t * requested) {
++        // Native GGUF roles can differ only in page-prefix padding across
++        // layers. Keep the largest buffers instead of clearing the cache as
++        // those physical read lengths alternate.
++        const size_t bytes[3] = { std::max(requested[0], role_bytes[0]),
++            std::max(requested[1], role_bytes[1]), std::max(requested[2], role_bytes[2]) };
+         if (std::equal(bytes, bytes + 3, role_bytes)) { return true; }
+         const uint64_t sum = add(add(bytes[0], bytes[1]), bytes[2]);
+         if (!sum || sum > std::numeric_limits<size_t>::max()) { throw std::runtime_error("invalid CPU sink cache stride"); }
+@@ -1336,7 +1343,7 @@ struct sink_cache {
+                 bytes[role] = std::max(bytes[role], request.role[role].nbytes);
+             }
+         }
+-        if (!std::equal(bytes, bytes + 3, role_bytes)) { return; }
++        if (bytes[0] > role_bytes[0] || bytes[1] > role_bytes[1] || bytes[2] > role_bytes[2]) { return; }
+ 
+         for (auto & request : requests) {
+             if (request.vram_slot >= 0 || request.cache_hit >= 0) { continue; }
+@@ -1719,6 +1726,7 @@ struct kimi_cpu_sink {
+                 if (got < 0 && errno == EINTR) { continue; }
+                 if (got <= 0) { ok = false; break; }
+                 done += size_t(got);
++                if (source.payload_nbytes && done >= source.data_offset + source.payload_nbytes) { break; }
+             }
+             lock.lock();
+             if (ok) { ++job.done; } else { job.failed = true; }
+@@ -2476,9 +2484,14 @@ struct kimi_cpu_sink {
+                 sink_slot & slot = slots[index];
+                 if (timeline_active) { timeline[slot.request].io[3 + role] = ggml_time_us(); }
+                 if (cache_compute_active) { requests[slot.request].events[3 + role] = ggml_time_us(); }
+-                const size_t expected = requests[slot.request].role[role].nbytes;
++                const auto & range = requests[slot.request].role[role];
++                const size_t expected = range.nbytes;
++                const size_t required = range.payload_nbytes ? range.data_offset + range.payload_nbytes : expected;
+                 account_read_bytes(cqe);
+-                if (cqe.res < 0 || static_cast<size_t>(cqe.res) != expected) {
++                // A final GGUF payload may end before the rounded physical
++                // read does. Accept only a complete logical payload, never a
++                // truncated weight, and preserve the actual CQE byte count.
++                if (cqe.res < 0 || size_t(cqe.res) < required || size_t(cqe.res) > expected) {
+                     ++current.read_errors;
+                     failed = true;
+                     if (io_error.empty()) {
+@@ -2561,12 +2574,18 @@ struct kimi_cpu_sink {
+                 const size_t bytes = ggml_row_size(tensors[role]->type, tensors[role]->ne[0]) * tensors[role]->ne[1];
+                 const int flags = fcntl(source.fd_direct, F_GETFL);
+                 if (flags < 0 || !(flags & O_DIRECT) || source.offset % 4096 || source.nbytes % 4096 ||
+-                    source.nbytes < bytes || source.nbytes > bytes + 4095 ||
++                    (source.payload_nbytes && source.payload_nbytes != bytes) || source.data_offset >= 4096 ||
++                    source.data_offset > source.nbytes || bytes > source.nbytes - source.data_offset ||
++                    source.nbytes > source.data_offset + bytes + 4095 ||
+                     source.nbytes > static_cast<size_t>(std::numeric_limits<int>::max()) ||
+                     source.offset > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) - source.nbytes) {
+                     throw std::runtime_error("CPU sink requires an O_DIRECT fd and aligned, exact padded expert range");
+                 }
+-                max_bytes[role] = std::max(max_bytes[role], source.nbytes);
++                // A later native tensor can have another page prefix. Reserve
++                // that maximum once, while submitting only the actual read.
++                const size_t capacity = source.payload_nbytes ?
++                    std::max(source.nbytes, (bytes + 8190) / 4096 * 4096) : source.nbytes;
++                max_bytes[role] = std::max(max_bytes[role], capacity);
+                 if (!request.cache_only) { current.demand_bytes += source.nbytes; }
+             }
+             requests.push_back(request);
+@@ -2647,7 +2666,12 @@ struct kimi_cpu_sink {
+                 needs_resize |= slot.role[role].size < max_bytes[role];
+             }
+         }
+-        if (allocated > 768ull * 1024 * 1024) { throw std::runtime_error("CPU sink ring exceeds 768 MiB limit"); }
++        // The payload limit excludes the one alignment page needed by each
++        // role when a native GGUF tensor begins between O_DIRECT boundaries.
++        const size_t alignment_bytes = slots.size() * 3 * 4096;
++        if (allocated > 768ull * 1024 * 1024 + alignment_bytes) {
++            throw std::runtime_error("CPU sink ring payload exceeds 768 MiB limit");
++        }
+         // run calls are serialized and the previous I/O job is already drained.
+         // Unregister the entire old set before reserve can free any allocation.
+         if (needs_resize) { ring.unregister_buffers(); }
+@@ -2772,7 +2796,7 @@ struct kimi_cpu_sink {
+             const auto & request = requests[expert];
+             const void * data[3];
+             for (int role = 0; role < 3; ++role) {
+-                data[role] = request.cache_hit >= 0 ? cache.data(request.cache_hit, role) : request.read_target[role];
++                data[role] = static_cast<const char *>(request.cache_hit >= 0 ? cache.data(request.cache_hit, role) : request.read_target[role]) + request.role[role].data_offset;
+             }
+             const bool borrow_upload = request.cache_hit >= 0 || request.cache_admit >= 0;
+             up_data = static_cast<const char *>(data[0]);
+@@ -3033,7 +3057,7 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
+                         auto & buffer = sink->prefill_ssd_staging[staging].role[role];
+                         buffer.reserve(request.role[role].nbytes);
+                         request.read_target[role] = buffer.data;
+-                        data[role] = buffer.data;
++                        data[role] = static_cast<const char *>(buffer.data) + request.role[role].data_offset;
+                     }
+                     sink->vram.bind_prefill_ssd_transient(i, data);
+                 } else {
+@@ -3085,7 +3109,9 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
+                 for (size_t i : ssd_transient_requests) {
+                     const auto & request = sink->requests[i];
+                     const void * data[3] = {
+-                        request.read_target[0], request.read_target[1], request.read_target[2],
++                        static_cast<const char *>(request.read_target[0]) + request.role[0].data_offset,
++                        static_cast<const char *>(request.read_target[1]) + request.role[1].data_offset,
++                        static_cast<const char *>(request.read_target[2]) + request.role[2].data_offset,
+                     };
+                     sink->vram.bind_prefill_ssd_transient(i, data, streaming_stage, sink);
+                 }
+@@ -3166,7 +3192,7 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
+             const double cpu_start = sink->profile_enabled ? sink_thread_cpu_us() : 0.0;
+             const void * data[3];
+             for (int role = 0; role < 3; ++role) {
+-                data[role] = request.cache_hit >= 0 ? sink->cache.data(request.cache_hit, role) : request.read_target[role];
++                data[role] = static_cast<const char *>(request.cache_hit >= 0 ? sink->cache.data(request.cache_hit, role) : request.read_target[role]) + request.role[role].data_offset;
+             }
+             try {
+                 consumer(userdata, expert, data[0], data[1], data[2]);
+@@ -3512,7 +3538,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
+             compute_start = sink_clock::now();
+             const void * data[3];
+             for (int role = 0; role < 3; ++role) {
+-                data[role] = request.cache_hit >= 0 ? sink->cache.data(request.cache_hit, role) : request.read_target[role];
++                data[role] = static_cast<const char *>(request.cache_hit >= 0 ? sink->cache.data(request.cache_hit, role) : request.read_target[role]) + request.role[role].data_offset;
+             }
+             const bool borrow_upload = request.cache_hit >= 0 || request.cache_admit >= 0;
+             // A cache hit has all three roles. A cache admission is also an I/O
+diff --git a/ggml/src/ggml-cpu/kimi-cpu-sink.h b/ggml/src/ggml-cpu/kimi-cpu-sink.h
+index 48d80ee..1acfd65 100644
+--- a/ggml/src/ggml-cpu/kimi-cpu-sink.h
++++ b/ggml/src/ggml-cpu/kimi-cpu-sink.h
+@@ -14,9 +14,14 @@ struct kimi_cpu_sink;
+ struct kimi_cpu_sink_source {
+     int fd_direct;
+     uint64_t offset;
+-    size_t nbytes;
++    size_t nbytes;             // physical aligned read capacity
++    size_t data_offset;        // logical payload starts this far into the read
++    size_t payload_nbytes;     // zero retains the legacy whole-read payload
+ };
+ 
++// The model-side native-range resolver checks this before using the callback ABI.
++GGML_BACKEND_API size_t kimi_cpu_sink_source_size(void);
++
+ typedef bool (*kimi_cpu_sink_resolver)(
+         void * userdata, const char * tensor_name, int32_t expert,
+         struct kimi_cpu_sink_source * source);
+diff --git a/ggml/src/ggml-cuda/moe_stream_batch.cu b/ggml/src/ggml-cuda/moe_stream_batch.cu
+index b4e7eac..8d7dd7a 100644
+--- a/ggml/src/ggml-cuda/moe_stream_batch.cu
++++ b/ggml/src/ggml-cuda/moe_stream_batch.cu
+@@ -66,6 +66,7 @@ bool ggml_cuda_moe_expert_pack_v2_read_debug(const char *, int, void *, size_t,
+ bool ggml_cuda_moe_expert_pack_read_to_host(const char *, int, size_t, void *, size_t, size_t *, int *) { return false; }
+ bool ggml_cuda_moe_expert_pack_resolve_direct(const char *, int, size_t, int *, uint64_t *) { return false; }
+ bool ggml_cuda_moe_expert_pack_copy_ranges_to_device(const char *, const int32_t *, const int32_t *, size_t, int64_t, size_t, size_t, bool, void *, size_t, void *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *) { return false; }
++bool ggml_cuda_moe_expert_pack_resolve_raw_direct_shape(const char *, int, size_t, int64_t, int *, uint64_t *, size_t *) { return false; }
+ bool ggml_cuda_moe_expert_pack_resolve_direct_shape(const char *, int, size_t, int64_t, int *, uint64_t *, size_t *) { return false; }
+ }
+ #else
+@@ -565,6 +566,8 @@ const void * ggml_cuda_moe_common_expert_pack_mmap_ptr_source_debug(
+     const char **, int *);
+ bool ggml_cuda_moe_common_expert_pack_read_to_host(
+     const char *, int, size_t, void *, size_t, size_t *, int *);
++bool ggml_cuda_moe_common_expert_pack_resolve_raw_direct(
++    const char *, int, size_t, int *, uint64_t *, size_t *);
+ bool ggml_cuda_moe_common_expert_pack_resolve_direct(
+     const char *, int, size_t, int *, uint64_t *, size_t *);
+ bool ggml_cuda_moe_common_expert_pack_copy_ranges_to_device(
+@@ -12262,6 +12265,15 @@ static bool expert_pack_read_entry(const expert_pack_entry *entry, void *dst, si
+ // one logical role slice. A v1 pack may serve that slice with a page-padded
+ // physical read; the K3-local adapter (validated 896-expert Q2_K/IQ1_S slices)
+ // has no CPU sink transport and is refused.
++extern "C" bool ggml_cuda_moe_expert_pack_resolve_raw_direct_shape(
++        const char * tensor_name, int expert_idx, size_t nbytes, int64_t n_experts,
++        int * fd_direct, uint64_t * offset, size_t * logical_nbytes) {
++    if (!tensor_name || expert_idx < 0 || n_experts <= 0 || expert_idx >= n_experts || !nbytes) { return false; }
++    ggml_moe::adapter_select_model_shape(n_experts, nbytes, "cpu-sink-raw-range");
++    return ggml_moe::adapter_uses_common() && ggml_cuda_moe_common_expert_pack_resolve_raw_direct(
++        tensor_name, expert_idx, nbytes, fd_direct, offset, logical_nbytes);
++}
++
+ extern "C" bool ggml_cuda_moe_expert_pack_resolve_direct_shape(
+         const char * tensor_name,
+         int expert_idx,
+diff --git a/ggml/src/ggml-cuda/moe_stream_batch_common.cu b/ggml/src/ggml-cuda/moe_stream_batch_common.cu
+index 12e7d3b..3564dad 100644
+--- a/ggml/src/ggml-cuda/moe_stream_batch_common.cu
++++ b/ggml/src/ggml-cuda/moe_stream_batch_common.cu
+@@ -5833,7 +5833,8 @@ static bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert
+             source_idx = it->second;
+         } else {
+             source_idx = (int32_t)g_expert_pack.sources.size();
+-            if (!expert_pack_open_data_source(source_path, "GGUF alias")) {
++            if (!expert_pack_open_data_source(source_path, "GGUF alias", false,
++                    expert_pack_env_bool("GGML_MOE_IO_REQUIRE_DIRECT", false))) {
+                 std::fclose(file);
+                 return false;
+             }
+@@ -8432,6 +8433,29 @@ extern "C" const void * ggml_cuda_moe_expert_pack_mmap_ptr_source_debug(
+ }
+ 
+ static bool trace_entry_matches(const batch_route_trace_entry &e, const char *tensor_name, int expert_idx, size_t expert_bytes);
++// O_DIRECT may return EOF before unused page padding. Only a complete logical
++// payload is accepted; an incomplete tensor remains an error.
++static bool expert_pack_direct_pread_native(int fd, void * dst, size_t physical,
++        size_t required, uint64_t offset) {
++#if !defined(_WIN32)
++    size_t done = 0;
++    while (done < physical) {
++        const size_t chunk = std::min(physical - done, size_t(64) * 1024 * 1024);
++        ssize_t got;
++        do { got = pread(fd, static_cast<char *>(dst) + done, chunk, off_t(offset + done)); }
++        while (got < 0 && errno == EINTR);
++        if (got <= 0) { return false; }
++        done += size_t(got);
++        if (done >= required) { return true; }
++        if (size_t(got) != chunk) { return false; }
++    }
++    return done >= required;
++#else
++    (void) fd; (void) dst; (void) physical; (void) required; (void) offset;
++    return false;
++#endif
++}
++
+ static bool expert_pack_direct_read_entry_to_host(const expert_pack_entry *entry, void *dst, size_t sz);
+ 
+ static uint64_t host_prefetch_key(const char *tensor_name, int expert_idx, size_t nbytes) {
+@@ -9424,9 +9448,9 @@ static bool expert_pack_direct_read_entry_to_host(const expert_pack_entry *entry
+     if ((entry->offset % alignment) == 0 &&
+             ((uintptr_t)dst % alignment) == 0 &&
+             read_sz == (size_t)align_up_u64((uint64_t)sz, alignment)) {
+-        return expert_pack_direct_pread_all(source->fd_direct, dst, read_sz, entry->offset);
++        return expert_pack_direct_pread_native(source->fd_direct, dst, read_sz, sz, entry->offset);
+     }
+-    if (source->direct_required) {
++    if (source->direct_required && !entry->alias_source) {
+         return false;
+     }
+ 
+@@ -9434,7 +9458,7 @@ static bool expert_pack_direct_read_entry_to_host(const expert_pack_entry *entry
+     if (posix_memalign(&bounce, alignment, read_sz) != 0 || !bounce) {
+         return false;
+     }
+-    const bool ok = expert_pack_direct_pread_all(source->fd_direct, bounce, read_sz, aligned_offset);
++    const bool ok = expert_pack_direct_pread_native(source->fd_direct, bounce, read_sz, prefix + sz, aligned_offset);
+     if (ok) {
+         std::memcpy(dst, (const char *)bounce + prefix, sz);
+     }
+@@ -9577,6 +9601,28 @@ extern "C" bool ggml_cuda_moe_expert_pack_resolve_direct(
+ #endif
+ }
+ 
++// Logical native range for an aligned-read consumer. This API neither copies
++// weights nor rounds their byte offsets; the CPU sink owns its bounded bounce.
++extern "C" bool ggml_cuda_moe_common_expert_pack_resolve_raw_direct(
++        const char * tensor_name, int expert_idx, size_t nbytes,
++        int * fd_direct, uint64_t * offset, size_t * logical_nbytes) {
++#if defined(__linux__)
++    if (!tensor_name || expert_idx < 0 || !nbytes || !fd_direct || !offset || !logical_nbytes) { return false; }
++    const expert_pack_entry * entry = expert_pack_lookup_impl(tensor_name, expert_idx, nbytes, false);
++    const expert_pack_source * source = expert_pack_source_for_entry(entry);
++    if (!entry || !source || source->fd_direct < 0 || entry->nbytes != nbytes ||
++            entry->offset > source->file_size || nbytes > source->file_size - entry->offset) { return false; }
++    const int flags = fcntl(source->fd_direct, F_GETFL);
++    if (flags < 0 || !(flags & O_DIRECT)) { return false; }
++    *fd_direct = source->fd_direct; *offset = entry->offset; *logical_nbytes = nbytes;
++    return true;
++#else
++    (void) tensor_name; (void) expert_idx; (void) nbytes;
++    (void) fd_direct; (void) offset; (void) logical_nbytes;
++    return false;
++#endif
++}
++
+ extern "C" bool ggml_cuda_moe_expert_pack_read_to_host(
+         const char *tensor_name,
+         int expert_idx,
+diff --git a/src/llama-cpu-sink.h b/src/llama-cpu-sink.h
+index 14cffb0..1f31276 100644
+--- a/src/llama-cpu-sink.h
++++ b/src/llama-cpu-sink.h
+@@ -43,8 +43,8 @@ struct llama_kimi_cpu_sink_node {
+ };
+ 
+ struct llama_kimi_cpu_sink_runtime {
+-    // The resolver matches logical tensor bytes, then returns the padded direct-I/O length separately.
+-    // ggml_cuda_moe_expert_pack_resolve_direct_shape(name, expert, logical bytes, n_experts, fd, offset, io bytes)
++    // Resolve the logical native range; the callback below aligns its physical I/O.
++    // resolve_raw_direct_shape(name, expert, logical bytes, n_experts, fd, logical offset, logical bytes)
+     using resolve_fn = bool (*)(const char *, int, size_t, int64_t, int *, uint64_t *, size_t *);
+ 
+     std::mutex mutex;
+@@ -199,17 +199,25 @@ struct llama_kimi_cpu_sink_runtime {
+             return false;
+         }
+         const auto & node = *runtime.active_node;
++        auto range = [&](size_t logical_nbytes, int64_t experts) {
++            *source = {};
++            if (!runtime.resolve(tensor_name, expert, logical_nbytes, experts,
++                    &source->fd_direct, &source->offset, &source->nbytes)) { return false; }
++            source->data_offset = source->offset % 4096;
++            source->payload_nbytes = logical_nbytes;
++            if (logical_nbytes > SIZE_MAX - source->data_offset - 4095) { return false; }
++            source->offset -= source->data_offset;
++            source->nbytes = (source->data_offset + logical_nbytes + 4095) / 4096 * 4096;
++            return true;
++        };
+         for (const ggml_tensor * tensor : { &node.up, &node.gate, &node.down }) {
+             if (std::strcmp(tensor_name, tensor->name) == 0) {
+-                const size_t logical_nbytes = tensor->nb[2];
+-                return runtime.resolve(tensor_name, expert, logical_nbytes, tensor->ne[2],
+-                    &source->fd_direct, &source->offset, &source->nbytes);
++                return range(tensor->nb[2], tensor->ne[2]);
+             }
+         }
+         const auto shape = runtime.expert_shapes.find(tensor_name);
+         if (shape != runtime.expert_shapes.end()) {
+-            return runtime.resolve(tensor_name, expert, shape->second.first, shape->second.second,
+-                &source->fd_direct, &source->offset, &source->nbytes);
++            return range(shape->second.first, shape->second.second);
+         }
+         return false;
+     }
+@@ -235,8 +243,13 @@ struct llama_kimi_cpu_sink_runtime {
+         cache_get_stats = reinterpret_cast<decltype(cache_get_stats)>(
+             ggml_backend_reg_get_proc_address(registry, "kimi_cpu_sink_cache_get_stats"));
+ #if defined(__linux__)
++        const auto source_size = reinterpret_cast<size_t (*)(void)>(
++            dlsym(RTLD_DEFAULT, "kimi_cpu_sink_source_size"));
++        if (!source_size || source_size() != sizeof(kimi_cpu_sink_source)) {
++            GGML_ABORT("CPU sink native-range ABI mismatch; rebuild the CPU backend and model together");
++        }
+         resolve = reinterpret_cast<resolve_fn>(
+-            dlsym(RTLD_DEFAULT, "ggml_cuda_moe_expert_pack_resolve_direct_shape"));
++            dlsym(RTLD_DEFAULT, "ggml_cuda_moe_expert_pack_resolve_raw_direct_shape"));
+         // Exported by the same CPU backend library as the registry entries
+         // above; looked up like the resolver, leaving the proc-address table as is.
+         run_activation = reinterpret_cast<decltype(run_activation)>(
