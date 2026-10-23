@@ -1,29 +1,4 @@
 // August-5 common CPU adapter, mechanically name-isolated for per-shape dispatch.
-static int64_t ggml_common_moe_prompt_hybrid_cpu_max_rows(void) {
-    static bool initialized = false;
-    static int64_t max_rows = 0;
-    if (!initialized) {
-        initialized = true;
-        const char * env = getenv("GGML_MOE_PROMPT_HYBRID_CPU_MAX_ROWS");
-        if (env && env[0]) {
-            char * end = NULL;
-            const long value = strtol(env, &end, 10);
-            if (end != env && value > 0 && value <= INT32_MAX) {
-                max_rows = value;
-            }
-        }
-    }
-    return max_rows;
-}
-
-static bool ggml_common_moe_prompt_hybrid_cpu_expert(
-        const struct ggml_tensor * ids,
-        int64_t rows) {
-    const int64_t max_rows = ggml_common_moe_prompt_hybrid_cpu_max_rows();
-    return ids && ids->ne[1] > 1 && max_rows > 0 && rows > 0 && rows <= max_rows;
-}
-
-
 // Kimi-specific CPU MoE mul_mat_id path.
 // This file is included by ggml-cpu.c so it can use that translation unit's
 // internal helpers, macros, and static CUDA MoE bridge symbols.
@@ -57,81 +32,6 @@ static bool ggml_common_kimi_moe_mixed_iq2_iq3_pair(enum ggml_type up_type, enum
     return ggml_common_model_type_is_kimi() &&
            ((up_type == GGML_TYPE_IQ2_S && gate_type == GGML_TYPE_IQ3_XXS) ||
             (up_type == GGML_TYPE_IQ3_XXS && gate_type == GGML_TYPE_IQ2_S));
-}
-
-struct ggml_common_kimi_prompt_hybrid_stats {
-    bool registered;
-    uint64_t up_gate_calls;
-    uint64_t down_calls;
-    uint64_t cpu_experts;
-    uint64_t gpu_experts;
-    uint64_t cpu_rows;
-    uint64_t gpu_rows;
-};
-
-static struct ggml_common_kimi_prompt_hybrid_stats ggml_common_kimi_prompt_hybrid_stats;
-
-static void ggml_common_kimi_prompt_hybrid_report(void) {
-    const struct ggml_common_kimi_prompt_hybrid_stats * s = &ggml_common_kimi_prompt_hybrid_stats;
-    fprintf(stderr,
-            "[kimi_prompt_hybrid] max_cpu_rows=%" PRId64
-            " up_gate_calls=%" PRIu64 " down_calls=%" PRIu64
-            " cpu_experts=%" PRIu64 " gpu_experts=%" PRIu64
-            " cpu_rows=%" PRIu64 " gpu_rows=%" PRIu64 "\n",
-            ggml_common_moe_prompt_hybrid_cpu_max_rows(),
-            s->up_gate_calls, s->down_calls,
-            s->cpu_experts, s->gpu_experts,
-            s->cpu_rows, s->gpu_rows);
-}
-
-static void ggml_common_kimi_prompt_hybrid_partition(
-        const struct ggml_tensor * ids,
-        int64_t n_as,
-        int64_t rows_stride,
-        int64_t * gpu_row_counts,
-        struct mmid_row_mapping * gpu_matrix_rows,
-        int64_t * cpu_row_counts,
-        struct mmid_row_mapping * cpu_matrix_rows,
-        bool up_gate) {
-    memset(cpu_row_counts, 0, (size_t) n_as * sizeof(int64_t));
-
-    uint64_t cpu_experts = 0;
-    uint64_t gpu_experts = 0;
-    uint64_t cpu_rows = 0;
-    uint64_t gpu_rows = 0;
-    for (int64_t cur_a = 0; cur_a < n_as; ++cur_a) {
-        const int64_t rows = gpu_row_counts[cur_a];
-        if (rows <= 0) {
-            continue;
-        }
-        if (ggml_common_moe_prompt_hybrid_cpu_expert(ids, rows)) {
-            cpu_row_counts[cur_a] = rows;
-            memcpy(cpu_matrix_rows + cur_a * rows_stride,
-                   gpu_matrix_rows + cur_a * rows_stride,
-                   (size_t) rows * sizeof(struct mmid_row_mapping));
-            gpu_row_counts[cur_a] = 0;
-            ++cpu_experts;
-            cpu_rows += (uint64_t) rows;
-        } else {
-            ++gpu_experts;
-            gpu_rows += (uint64_t) rows;
-        }
-    }
-
-    struct ggml_common_kimi_prompt_hybrid_stats * s = &ggml_common_kimi_prompt_hybrid_stats;
-    if (!s->registered) {
-        s->registered = true;
-        atexit(ggml_common_kimi_prompt_hybrid_report);
-    }
-    if (up_gate) {
-        ++s->up_gate_calls;
-    } else {
-        ++s->down_calls;
-    }
-    s->cpu_experts += cpu_experts;
-    s->gpu_experts += gpu_experts;
-    s->cpu_rows += cpu_rows;
-    s->gpu_rows += gpu_rows;
 }
 
 struct ggml_common_kimi_cpu_moe_profile_op {
@@ -1097,7 +997,6 @@ static void ggml_compute_forward_mul_mat_id_common_kimi(
         ggml_common_kimi_cpu_moe_profile.down.convert_us += ggml_time_us() - kimi_cpu_moe_convert_start;
     }
 
-    const bool prompt_hybrid = false;
     if (ith == 0) {
         const uint64_t kimi_cpu_moe_route_start = kimi_cpu_moe_profile ? ggml_time_us() : 0;
         // initialize matrix_row_counts
@@ -1144,15 +1043,6 @@ static void ggml_compute_forward_mul_mat_id_common_kimi(
                 ne01,
                 matrix_row_counts,
                 n_as);
-        if (prompt_hybrid) {
-            ggml_common_kimi_prompt_hybrid_partition(
-                    ids, n_as, ids->ne[0] * ids->ne[1],
-                    matrix_row_counts, matrix_rows,
-                    gpu_tail_row_counts, gpu_tail_matrix_rows,
-                    false);
-            memset(fallback_pack_mmap_ptrs, 0, (size_t) n_as * sizeof(void *));
-            memset(fallback_touch_us, 0, (size_t) n_as * sizeof(uint64_t));
-        }
     }
 
     // reset current_chunk
@@ -1202,7 +1092,7 @@ static void ggml_compute_forward_mul_mat_id_common_kimi(
     int64_t kimi_cpu_moe_single_attempts = 0;
     int64_t kimi_cpu_moe_single_accepts = 0;
 
-    if (!prompt_hybrid && ggml_moe_stream_one_gpu_only_filter_matches(src0->name)) {
+    if (ggml_moe_stream_one_gpu_only_filter_matches(src0->name)) {
         int64_t gpu_only_rows = 0;
         for (int cur_a = 0; cur_a < n_as; ++cur_a) {
             gpu_only_rows += matrix_row_counts[cur_a];
@@ -1217,7 +1107,7 @@ static void ggml_compute_forward_mul_mat_id_common_kimi(
         }
     }
 
-    if (!prompt_hybrid && ggml_moe_cpu_willneed_enabled()) {
+    if (ggml_moe_cpu_willneed_enabled()) {
         if (ith == 0) {
             for (int cur_a = 0; cur_a < n_as; ++cur_a) {
                 if (matrix_row_counts[cur_a] == 0) {
@@ -1229,7 +1119,7 @@ static void ggml_compute_forward_mul_mat_id_common_kimi(
         ggml_barrier(params->threadpool);
     }
 
-    if (!prompt_hybrid) {
+    {
         if (ith == 0) {
             ggml_common_kimi_cpu_fallback_pack_mmap_prepare(
                     src0->name,
@@ -1257,7 +1147,7 @@ static void ggml_compute_forward_mul_mat_id_common_kimi(
     }
 
     const bool use_cpu_batch_microprobe =
-        !prompt_hybrid && ggml_moe_cpu_batch_microprobe_enabled() &&
+        ggml_moe_cpu_batch_microprobe_enabled() &&
         src0->type == GGML_TYPE_MXFP4 &&
         src1->type != vec_dot_type &&
         vec_dot_type == GGML_TYPE_Q8_0 &&
@@ -1293,9 +1183,9 @@ static void ggml_compute_forward_mul_mat_id_common_kimi(
         cpu_batch_microprobe_cur_a = atomic_load_explicit(&ggml_moe_cpu_batch_microprobe_active_expert, memory_order_relaxed);
     }
 
-    const int64_t * cpu_row_counts = prompt_hybrid ? gpu_tail_row_counts : matrix_row_counts;
+    const int64_t * cpu_row_counts = matrix_row_counts;
     const struct mmid_row_mapping * cpu_matrix_rows =
-        prompt_hybrid ? gpu_tail_matrix_rows : matrix_rows;
+        matrix_rows;
 
     const bool moe_fallback_reason_profile = ggml_moe_fallback_reason_profile_enabled();
     const uint64_t kimi_cpu_moe_fallback_start = (kimi_cpu_moe_profile && ith == 0) ? ggml_time_us() : 0;
@@ -1483,9 +1373,6 @@ static void ggml_compute_forward_mul_mat_id_common_kimi(
             }
             ggml_barrier(params->threadpool);
         }
-    }
-    if (prompt_hybrid) {
-        ggml_barrier(params->threadpool);
     }
     if (moe_fallback_reason_profile && ith == 0) {
         const uint64_t moe_fallback_reason_us = ggml_time_us() - moe_fallback_reason_start;
@@ -1868,7 +1755,6 @@ static void ggml_compute_forward_moe_up_gate_common(
         ggml_common_kimi_cpu_moe_profile.up_gate.convert_us += ggml_time_us() - kimi_cpu_moe_convert_start;
     }
 
-    const bool prompt_hybrid = false;
     if (ith == 0) {
         const uint64_t kimi_cpu_moe_route_start = kimi_cpu_moe_profile ? ggml_time_us() : 0;
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
@@ -1932,13 +1818,6 @@ static void ggml_compute_forward_moe_up_gate_common(
                 matrix_row_counts,
                 n_as,
                 ids->ne[0]*ids->ne[1]);
-        if (prompt_hybrid) {
-            ggml_common_kimi_prompt_hybrid_partition(
-                    ids, n_as, ids->ne[0] * ids->ne[1],
-                    matrix_row_counts, matrix_rows,
-                    cpu_row_counts, cpu_matrix_rows,
-                    true);
-        }
     }
 
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
@@ -1959,9 +1838,9 @@ static void ggml_compute_forward_moe_up_gate_common(
     const bool moe_fallback_reason_profile = ggml_moe_fallback_reason_profile_enabled();
     const uint64_t moe_fallback_reason_start = (moe_fallback_reason_profile && ith == 0) ? ggml_time_us() : 0;
     const uint64_t kimi_cpu_moe_fallback_start = (kimi_cpu_moe_profile && ith == 0) ? ggml_time_us() : 0;
-    const int64_t * fallback_row_counts = prompt_hybrid ? cpu_row_counts : matrix_row_counts;
+    const int64_t * fallback_row_counts = matrix_row_counts;
     const struct mmid_row_mapping * fallback_matrix_rows =
-        prompt_hybrid ? cpu_matrix_rows : matrix_rows;
+        matrix_rows;
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = fallback_row_counts[cur_a];
 
@@ -2039,9 +1918,6 @@ static void ggml_compute_forward_moe_up_gate_common(
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
         }
-    }
-    if (prompt_hybrid) {
-        ggml_barrier(params->threadpool);
     }
     if (moe_fallback_reason_profile && ith == 0) {
         const uint64_t moe_fallback_reason_us = ggml_time_us() - moe_fallback_reason_start;
