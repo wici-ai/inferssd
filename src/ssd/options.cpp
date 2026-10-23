@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #include "options.h"
+#include "llama-model.h"
 #include "ggml-ssd/gpu/provider.h"
 #include "ggml-ssd/gpu/transport.h"
 #if defined(LLAMA_SSD_STORE)
@@ -210,5 +211,25 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend) {
     services.gpu_transport = gpu_transport.get();
     if (!provider->attach_services(backend, &services, error, sizeof(error))) {
         throw std::runtime_error(error[0] ? error : "cannot attach context GPU transport");
+    }
+}
+
+void llama_ssd_context::prepare_dense(const llama_model & model) {
+    if (!services.gpu || !gpu_transport) { return; }
+    size_t tensors = 0, bytes = 0;
+    for (const auto & named : model.tensors_by_name) {
+        const auto * tensor = named.second;
+        if (ggml_n_dims(tensor) <= 2 && model.file_mapped(tensor) &&
+                services.gpu->transport->dense_has(gpu_transport.get(), tensor->name, ggml_nbytes(tensor), nullptr)) {
+            ++tensors;
+        }
+    }
+    if (tensors && !services.gpu->transport->dense_prepare(gpu_transport.get(), &bytes)) {
+        throw std::runtime_error("cannot reserve the context dense weight staging buffers");
+    }
+    if (events) {
+        const auto published = events->event("ssd.stream.prepare",
+            "{\"dense_tensors\":" + std::to_string(tensors) + ",\"pinned_bytes\":" + std::to_string(bytes) + "}");
+        if (!published) { throw std::runtime_error(published.error); }
     }
 }

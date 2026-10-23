@@ -12,6 +12,8 @@ add_library(llama
             ../include/llama.h
             ../include/llama-ssd.h
             ssd/options.cpp
+            ssd/model-source.cpp
+            ssd/model-pages.cpp
             llama.cpp
             llama-adapter.cpp
             llama-arch.cpp

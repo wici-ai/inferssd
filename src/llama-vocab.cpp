@@ -2214,10 +2214,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
         scores = (const float * ) gguf_get_arr_data(ctx, score_idx);
     }
 
-    const bool token_type_undefined_as_normal = []() {
-        const char * env = std::getenv("LLAMA_GGUF_TOKEN_TYPE_UNDEFINED_AS_NORMAL");
-        return env && std::strcmp(env, "0") != 0;
-    }();
+    constexpr bool token_type_undefined_as_normal = false;
 
     const int * toktypes = nullptr;
     const int toktype_idx = gguf_find_key(ctx, kv(LLM_KV_TOKENIZER_TOKEN_TYPE).c_str());

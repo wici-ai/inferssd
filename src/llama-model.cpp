@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "ssd/model-pages.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -666,8 +667,6 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
     std::vector<std::vector<llama_file_range>> expert_mmap_ranges;
-    std::vector<llama_file_range> mmap_used_ranges;
-    mutable bool expert_mmap_drop_after_prompt_done = false;
 
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
@@ -8572,8 +8571,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         // Opt in to compact GPU allocations; load_all_data copies only their
         // tensors, while CPU expert tensors retain their original mmap.
 #if defined(__APPLE__)
-        const char * compact_env = std::getenv("LLAMA_MAC_COMPACT_METAL");
-        if (arch == LLM_ARCH_MUSE_SPARK && compact_env && std::strcmp(compact_env, "1") == 0 &&
+        if (arch == LLM_ARCH_MUSE_SPARK &&
                 ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
                 std::strncmp(ggml_backend_dev_name(dev), "MTL", 3) == 0) {
             buffer_from_host_ptr_supported = false;
@@ -8676,64 +8674,12 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // Where the dense weights (the 2-D weights; the routed experts are 3-D) are homed: on a device; in RAM (a host
-    // buffer other than the mapping of the GGUF); on the drive: a matrix product's weight in the mapping that the
-    // expert transport's index holds in blocks, read through the transport and never through the page cache into a
-    // copy target of its size, through a pinned stage of two of the largest (allocated here: a plan it cannot hold
-    // stops the load).  A matrix product's weight in the mapping that the index does not hold is read through the page
-    // cache (paged).  Lookup tables in the mapping (token embeddings, GET_ROWS) are none of these.
-    {
-        using has_tensor_fn = bool (*)(const char *, size_t, size_t *);
-        using stage_prepare_fn = bool (*)(size_t *);
-#if !defined(_WIN32)
-        const auto has_tensor = reinterpret_cast<has_tensor_fn>(dlsym(RTLD_DEFAULT, "ggml_cuda_moe_dense_has_tensor"));
-        const auto stage_prepare = reinterpret_cast<stage_prepare_fn>(dlsym(RTLD_DEFAULT, "ggml_cuda_moe_dense_stage_prepare"));
-#else
-        const has_tensor_fn has_tensor = nullptr;
-        const stage_prepare_fn stage_prepare = nullptr;
-#endif
-        uint64_t gpu_bytes = 0, ram_bytes = 0, drive_bytes = 0, drive_tensors = 0, copy_target_bytes = 0;
-        uint64_t paged_bytes = 0, paged_tensors = 0;
-        for (auto & [ctx_ptr, _] : pimpl->ctxs_bufs) {
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx_ptr.get()); t; t = ggml_get_next_tensor(ctx_ptr.get(), t)) {
-                if (t->buffer == nullptr || ggml_n_dims(t) > 2) {
-                    continue;
-                }
-                const uint64_t nbytes = ggml_nbytes(t);
-                if (!ggml_backend_buffer_is_host(t->buffer)) {
-                    gpu_bytes += nbytes;
-                } else if (mapped_bufs.count(t->buffer) == 0) {
-                    ram_bytes += nbytes;
-                } else if (ml.mul_mat_weights.count(t) == 0) {
-                    continue;
-                } else if (has_tensor && has_tensor(t->name, nbytes, nullptr)) {
-                    drive_bytes += nbytes;
-                    drive_tensors += 1;
-                    copy_target_bytes = std::max(copy_target_bytes, nbytes);
-                } else {
-                    paged_bytes += nbytes;
-                    paged_tensors += 1;
-                }
-            }
-        }
-        size_t stage_bytes = 0;
-        if (drive_tensors > 0 && !(stage_prepare && stage_prepare(&stage_bytes))) {
-            throw std::runtime_error(format("the pinned stage for the %" PRIu64 " weights homed on the drive could not "
-                "be allocated", drive_tensors));
-        }
-        LLAMA_LOG_INFO("[dense_homes] gpu_bytes=%" PRIu64 " ram_bytes=%" PRIu64 " drive_bytes=%" PRIu64
-            " drive_tensors=%" PRIu64 " copy_target_bytes=%" PRIu64 " stage_bytes=%zu paged_bytes=%" PRIu64
-            " paged_tensors=%" PRIu64 "\n", gpu_bytes, ram_bytes, drive_bytes, drive_tensors, copy_target_bytes,
-            stage_bytes, paged_bytes, paged_tensors);
-    }
-
     // DeepSeek-V4.1 Engram tables use random rows. Under a tight cgroup, mmap
     // read-around can evict the pages prefetched for the next Engram layer.
-    // Enable random advice by default; =0 restores the previous behavior.
+    // The supported layout uses random advice for Engram rows.
     // Verify the tensor address against its source mapping so --no-mmap or a
     // buffer override cannot apply this advice to unrelated storage.
-    const char * engram_random_env = std::getenv("LLAMA_DSV41_ENGRAM_MADV_RANDOM");
-    if (arch == LLM_ARCH_DEEPSEEK41 && (!engram_random_env || std::strcmp(engram_random_env, "0") != 0)) {
+    if (arch == LLM_ARCH_DEEPSEEK41) {
         size_t advised_tensors = 0;
         size_t advised_bytes = 0;
         size_t tensor_bytes = 0;
@@ -8779,12 +8725,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 skipped_non_mmap, failures);
     }
 
-    pimpl->mmap_used_ranges.clear();
-    pimpl->mmap_used_ranges.reserve(ml.mmaps_used.size());
-    for (const auto & range : ml.mmaps_used) {
-        pimpl->mmap_used_ranges.push_back({ range.first, range.second });
-    }
-
     if (defer_expert_mmap) {
         ml.drop_mmap_expert_pages();
         LLAMA_LOG_INFO("%s: dense parameters loaded, expert mmap pages deferred/dropped (dense %.2f GiB, deferred %.2f GiB)\n",
@@ -8792,7 +8732,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 ml.expert_tensor_index.dense_bytes / 1024.0 / 1024.0 / 1024.0,
                 ml.expert_tensor_index.deferred_bytes / 1024.0 / 1024.0 / 1024.0);
     }
-    ml.drop_mmap_used_pages_after_load();
 
     ml.tensor_buft_overrides = original_tensor_buft_overrides;
 
@@ -8826,111 +8765,7 @@ bool llama_model::file_mapped(const ggml_tensor * t) const {
 }
 
 void llama_model::drop_expert_mmap_pages_after_prompt() const {
-    const char * expert_env = std::getenv("LLAMA_DROP_EXPERT_MMAP_AFTER_PROMPT");
-    const char * dense_env  = std::getenv("LLAMA_DROP_DENSE_MMAP_AFTER_PROMPT");
-    const char * repeat_env = std::getenv("LLAMA_DROP_MMAP_EVERY_PROMPT_BATCH");
-    const char * phase1_env = std::getenv("GGML_MOE_PREFILL_PHASE1");
-    const bool drop_expert = expert_env && expert_env[0] && expert_env[0] != '0';
-    const bool phase1      = phase1_env && phase1_env[0] && phase1_env[0] != '0';
-    const bool dense_requested = dense_env && dense_env[0] && dense_env[0] != '0';
-    const bool drop_dense  = dense_requested && !phase1;
-    const bool repeat_drop = repeat_env && repeat_env[0] && repeat_env[0] != '0';
-    if (phase1 && dense_requested) {
-        LLAMA_LOG_WARN("%s: ignoring LLAMA_DROP_DENSE_MMAP_AFTER_PROMPT during Phase 1; "
-                "request-time reclaim is expert-only\n", __func__);
-    }
-    if (!drop_expert && !drop_dense) {
-        return;
-    }
-    if (pimpl->expert_mmap_drop_after_prompt_done && !repeat_drop) {
-        return;
-    }
-    pimpl->expert_mmap_drop_after_prompt_done = true;
-    if (pimpl->mappings.empty()) {
-        return;
-    }
-
-    if (drop_expert) {
-        const int64_t t_start_us = ggml_time_us();
-        size_t bytes = 0;
-        size_t ranges = 0;
-        size_t failures = 0;
-        const size_t n = std::min(pimpl->mappings.size(), pimpl->expert_mmap_ranges.size());
-        for (size_t i = 0; i < n; ++i) {
-            if (!pimpl->mappings[i]) {
-                continue;
-            }
-            for (const llama_file_range & range : pimpl->expert_mmap_ranges[i]) {
-                size_t len = 0;
-                const bool ok = pimpl->mappings[i]->dontneed_fragment(range.first, range.last, &len);
-                bytes += len;
-                ++ranges;
-                if (!ok) {
-                    ++failures;
-                }
-            }
-        }
-        const int64_t t_end_us = ggml_time_us();
-        LLAMA_LOG_INFO("%s: expert mmap dontneed after prompt bytes=%.2f MiB ranges=%zu failures=%zu wall_ms=%.3f\n",
-                __func__, bytes / 1024.0 / 1024.0, ranges, failures,
-                (double)(t_end_us - t_start_us) / 1000.0);
-    }
-
-    if (drop_dense) {
-        const int64_t t_start_us = ggml_time_us();
-        size_t bytes = 0;
-        size_t ranges = 0;
-        size_t failures = 0;
-        const size_t n = std::min(pimpl->mappings.size(), pimpl->mmap_used_ranges.size());
-        for (size_t idx = 0; idx < n; ++idx) {
-            if (!pimpl->mappings[idx]) {
-                continue;
-            }
-            const llama_file_range & used = pimpl->mmap_used_ranges[idx];
-            if (used.last <= used.first) {
-                continue;
-            }
-
-            size_t cursor = used.first;
-            const auto * expert_ranges = idx < pimpl->expert_mmap_ranges.size() ?
-                &pimpl->expert_mmap_ranges[idx] : nullptr;
-
-            auto drop_range = [&](size_t first, size_t last) {
-                if (last <= first) {
-                    return;
-                }
-                size_t len = 0;
-                const bool ok = pimpl->mappings[idx]->dontneed_fragment(first, last, &len);
-                bytes += len;
-                ++ranges;
-                if (!ok) {
-                    ++failures;
-                }
-            };
-
-            if (expert_ranges) {
-                for (const llama_file_range & range : *expert_ranges) {
-                    if (range.last <= used.first || range.first >= used.last) {
-                        continue;
-                    }
-                    const size_t expert_first = std::max(range.first, used.first);
-                    const size_t expert_last  = std::min(range.last, used.last);
-                    if (cursor < expert_first) {
-                        drop_range(cursor, expert_first);
-                    }
-                    cursor = std::max(cursor, expert_last);
-                }
-            }
-
-            if (cursor < used.last) {
-                drop_range(cursor, used.last);
-            }
-        }
-        const int64_t t_end_us = ggml_time_us();
-        LLAMA_LOG_INFO("%s: dense mmap dontneed after prompt bytes=%.2f MiB ranges=%zu failures=%zu wall_ms=%.3f\n",
-                __func__, bytes / 1024.0 / 1024.0, ranges, failures,
-                (double)(t_end_us - t_start_us) / 1000.0);
-    }
+    if (!pimpl->expert_mmap_ranges.empty()) { ssd::drop_expert_pages(pimpl->mappings, pimpl->expert_mmap_ranges); }
 }
 std::string llama_model::type_name() const {
     return llm_type_name(type);

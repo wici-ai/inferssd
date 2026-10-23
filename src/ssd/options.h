@@ -19,6 +19,7 @@ struct llama_ssd_options {
 };
 
 struct ggml_ssd_mac_cache;
+struct llama_model;
 struct llama_ssd_source_delete {
     void (*close)(void *) noexcept = nullptr;
     void operator()(void * source) const noexcept { if (source) { close(source); } }
@@ -46,6 +47,7 @@ struct llama_ssd_context {
     ~llama_ssd_context();
     void bind_cpu(ggml_backend_t backend);
     void attach_backend(ggml_backend_t backend);
+    void prepare_dense(const llama_model & model);
 };
 
 struct llama_ssd_host_reservation {

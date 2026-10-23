@@ -47,7 +47,9 @@ int main(int argc, char ** argv) {
         return 0;
     }
     using namespace ssd::settings;
-    assert(registry().size() == 14);
+    assert(registry().size() == 16);
+    assert(parse("inferssd-settings 1\nmodel.engram_prefetch=1\nmodel.hc_fused=0\n", "model.ssd"));
+    assert(!parse("inferssd-settings 1\nmodel.hc_fused=2\n", "model-invalid.ssd"));
     auto base = parse("", "");
     assert(base);
     assert(*base.value.integer("cpu.threads") == 2);
@@ -101,7 +103,7 @@ int main(int argc, char ** argv) {
     const auto unrelated = cli_override("--port", "8080", cli);
     assert(unrelated && !unrelated.value);
     const auto schema = schema_json();
-    assert(schema && ssd::json::parse(schema.value).value.object.at("properties").object.size() == 14);
+    assert(schema && ssd::json::parse(schema.value).value.object.at("properties").object.size() == registry().size());
     const auto help_text = help();
     assert(help_text && help_text.value.find("--ssd-host-expert-cache-mib") != std::string::npos);
 

@@ -353,6 +353,7 @@ llama_context::llama_context(
             if (!api->attach_services(backend_cpu, &ssd_runtime->services)) {
                 throw std::runtime_error("cannot attach context-owned CPU runtime services");
             }
+            ssd_runtime->prepare_dense(model);
 #if defined(__APPLE__)
             if (!ssd_runtime->settings.sources()->empty()) {
             char error[512] {};
@@ -3165,38 +3166,9 @@ ggml_status llama_context::graph_compute(
     }
     const bool graph_profile = ssd_runtime && ssd_runtime->diagnostics.profile_enabled();
     const int64_t t_submit_start_us = graph_profile ? ggml_time_us() : 0;
-    using activation_quant_reuse_fn = void (*)(ggml_backend_t);
-    using activation_quant_reuse_scope = std::pair<ggml_backend_t, activation_quant_reuse_fn>;
-    std::vector<activation_quant_reuse_scope> activation_quant_reuse_scopes;
-    static const bool activation_quant_reuse_enabled = []() {
-        const char * value = std::getenv("GGML_CUDA_DENSE_ACTIVATION_QUANT_REUSE");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
-            std::strcmp(value, "false") != 0;
-    }();
-    if (activation_quant_reuse_enabled) {
-        for (const auto & backend : backends) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            if (reg == nullptr) {
-                continue;
-            }
-            auto begin = reinterpret_cast<activation_quant_reuse_fn>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_activation_quant_reuse_begin"));
-            auto end = reinterpret_cast<activation_quant_reuse_fn>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_activation_quant_reuse_end"));
-            if (begin != nullptr && end != nullptr) {
-                begin(backend.get());
-                activation_quant_reuse_scopes.emplace_back(backend.get(), end);
-            }
-        }
-    }
     ggml_backend_sched_kimi_set_profile_phase(sched.get(), batched ? 1 : 2);
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     ggml_backend_sched_kimi_set_profile_phase(sched.get(), 0);
-    for (auto scope = activation_quant_reuse_scopes.rbegin();
-            scope != activation_quant_reuse_scopes.rend(); ++scope) {
-        scope->second(scope->first);
-    }
     if (graph_profile) {
         const auto published = ssd_runtime->diagnostics.graph(true,
             uint64_t(ggml_time_us() - t_submit_start_us), 0, status);

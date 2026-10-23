@@ -14,3 +14,5 @@ SSD_SETTING("vram.reserve_mib", integer, 0, 8192, "0", "MiB", "launch", "linux",
 SSD_SETTING("vram.margin_mib", integer, 64, 8192, "64", "MiB", "launch", "linux", "Elastic safety margin in MiB, at least reserve plus 64")
 SSD_SETTING("host.headroom_mib", integer, 0, 4294967295, "512", "MiB", "plan", "linux", "Host safety headroom in MiB")
 SSD_SETTING("host.expert_cache_mib", integer, 0, 17592186044415, "4096", "MiB", "plan", "darwin", "Mac M1 expert cache in MiB; M1 is a migration stage")
+SSD_SETTING("model.engram_prefetch", integer, 0, 1, "0", "boolean", "model", "all", "Read ahead DeepSeek Engram rows; changes I/O timing only")
+SSD_SETTING("model.hc_fused", integer, 0, 1, "1", "boolean", "model", "all", "Use fused DeepSeek hyper connection operations")
