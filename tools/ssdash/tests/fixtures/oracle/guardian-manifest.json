@@ -1,0 +1,23 @@
+{
+  "base": "76dccf491181995981324e1e88201c87886911b9",
+  "cases": 10,
+  "observed_runtimes": [
+    "3.9.6",
+    "3.12.13"
+  ],
+  "files": [
+    {
+      "path": "fixtures/oracle/runtime_native_macos.py",
+      "sha256": "7b8d77b6a747f3ac95d979b253ff5184f7e37b17430a9180529233025cc3fa3d"
+    },
+    {
+      "path": "observe_guardian_F.py",
+      "sha256": "7d4dc8e73d9eb0179ec4f6355bfcf7260aba9e7a3f5d82add273b5b5e3d92017"
+    },
+    {
+      "path": "fixtures/guardian-goldens.json",
+      "sha256": "19f224a85c4899e641ec0ef922ff9e1570239c399b3e233cfb582f53ae4cc38b"
+    }
+  ],
+  "boundary": "The guardian observes worker failures after STOP/controller disconnect; the separate lease transcript proves EOF behavior and group transcript TERM/KILL ordering. No actual signal/process/socket is used. Unknown cleanup is observed until first quarantine wait, then a fixture-only BaseException ends observation with lease still open. This is not a native lifecycle acceptance test."
+}

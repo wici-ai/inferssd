@@ -1,0 +1,2957 @@
+{
+  "cases": [
+    {
+      "name": "normal",
+      "events": [
+        [
+          "lease",
+          [
+            7
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-launch.json",
+            {
+              "argv": [
+                "python",
+                "worker.py",
+                "--socket",
+                "/case/socket",
+                "--lock-dev",
+                "3",
+                "--lock-ino",
+                "5"
+              ]
+            }
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "callable"
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "open",
+          [
+            "/case/guardian.log",
+            "xb"
+          ]
+        ],
+        [
+          "enter",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "spawn",
+          [
+            [
+              "python",
+              "worker.py",
+              "--socket",
+              "/case/socket",
+              "--lock-dev",
+              "3",
+              "--lock-ino",
+              "5"
+            ],
+            {
+              "env": {
+                "SSDASH_RUN_DIR": "/case",
+                "SSDASH_WRAPPER_RECEIPT": "/case/receipt.json"
+              },
+              "stdout": "/case/guardian.log",
+              "stderr": -2,
+              "start_new_session": true
+            }
+          ]
+        ],
+        [
+          "exit",
+          [
+            "/case/guardian.log",
+            null
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "lease_poll",
+          [
+            12
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "sleep",
+          [
+            0.05
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "read",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-cleanup.json",
+            {
+              "worker": {
+                "pid": 12,
+                "uid": 501,
+                "gid": 20,
+                "cgroup": null
+              },
+              "worker_returncode": 0,
+              "worker_group_gone": true,
+              "cleanup_receipt_confirmed": true
+            }
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-launch.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-launch.json",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian.log",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-cleanup.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-cleanup.json",
+            true
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/receipt.json",
+            {
+              "status": "passed",
+              "server": {
+                "owned_processes_gone": true,
+                "resource_scope_gone": true
+              },
+              "evidence": [
+                {
+                  "path": "guardian-launch.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian.log",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian-cleanup.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+              ]
+            }
+          ]
+        ],
+        [
+          "lease_close",
+          []
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "old"
+          ]
+        ]
+      ],
+      "result": 0,
+      "error": null,
+      "files": {
+        "/case/guardian-launch.json": {
+          "argv": [
+            "python",
+            "worker.py",
+            "--socket",
+            "/case/socket",
+            "--lock-dev",
+            "3",
+            "--lock-ino",
+            "5"
+          ]
+        },
+        "/case/guardian.log": "",
+        "/case/receipt.json": {
+          "status": "passed",
+          "server": {
+            "owned_processes_gone": true,
+            "resource_scope_gone": true
+          },
+          "evidence": [
+            {
+              "path": "guardian-launch.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian.log",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian-cleanup.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ]
+        },
+        "/case/guardian-cleanup.json": {
+          "worker": {
+            "pid": 12,
+            "uid": 501,
+            "gid": 20,
+            "cgroup": null
+          },
+          "worker_returncode": 0,
+          "worker_group_gone": true,
+          "cleanup_receipt_confirmed": true
+        }
+      },
+      "lease_closed": [
+        true
+      ]
+    },
+    {
+      "name": "spawn-failure",
+      "events": [
+        [
+          "lease",
+          [
+            7
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-launch.json",
+            {
+              "argv": [
+                "python",
+                "worker.py",
+                "--socket",
+                "/case/socket",
+                "--lock-dev",
+                "3",
+                "--lock-ino",
+                "5"
+              ]
+            }
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "callable"
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "open",
+          [
+            "/case/guardian.log",
+            "xb"
+          ]
+        ],
+        [
+          "enter",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "spawn",
+          [
+            [
+              "python",
+              "worker.py",
+              "--socket",
+              "/case/socket",
+              "--lock-dev",
+              "3",
+              "--lock-ino",
+              "5"
+            ],
+            {
+              "env": {
+                "SSDASH_RUN_DIR": "/case",
+                "SSDASH_WRAPPER_RECEIPT": "/case/receipt.json"
+              },
+              "stdout": "/case/guardian.log",
+              "stderr": -2,
+              "start_new_session": true
+            }
+          ]
+        ],
+        [
+          "exit",
+          [
+            "/case/guardian.log",
+            "OSError"
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-cleanup.json",
+            {
+              "worker": null,
+              "worker_returncode": null,
+              "worker_group_gone": true,
+              "cleanup_receipt_confirmed": true
+            }
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-launch.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-launch.json",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian.log",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-cleanup.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-cleanup.json",
+            true
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/receipt.json",
+            {
+              "status": "failed",
+              "server": {
+                "owned_processes_gone": true,
+                "resource_scope_gone": true
+              },
+              "evidence": [
+                {
+                  "path": "guardian-launch.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian.log",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian-cleanup.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+              ],
+              "guardian_error": "OSError: synthetic spawn failure",
+              "guardian_signals": []
+            }
+          ]
+        ],
+        [
+          "lease_close",
+          []
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "old"
+          ]
+        ]
+      ],
+      "result": 1,
+      "error": null,
+      "files": {
+        "/case/guardian-launch.json": {
+          "argv": [
+            "python",
+            "worker.py",
+            "--socket",
+            "/case/socket",
+            "--lock-dev",
+            "3",
+            "--lock-ino",
+            "5"
+          ]
+        },
+        "/case/guardian.log": "",
+        "/case/guardian-cleanup.json": {
+          "worker": null,
+          "worker_returncode": null,
+          "worker_group_gone": true,
+          "cleanup_receipt_confirmed": true
+        },
+        "/case/receipt.json": {
+          "status": "failed",
+          "server": {
+            "owned_processes_gone": true,
+            "resource_scope_gone": true
+          },
+          "evidence": [
+            {
+              "path": "guardian-launch.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian.log",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian-cleanup.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ],
+          "guardian_error": "OSError: synthetic spawn failure",
+          "guardian_signals": []
+        }
+      },
+      "lease_closed": [
+        true
+      ]
+    },
+    {
+      "name": "lease-failure",
+      "events": [
+        [
+          "lease",
+          [
+            7
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-launch.json",
+            {
+              "argv": [
+                "python",
+                "worker.py",
+                "--socket",
+                "/case/socket",
+                "--lock-dev",
+                "3",
+                "--lock-ino",
+                "5"
+              ]
+            }
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "callable"
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "open",
+          [
+            "/case/guardian.log",
+            "xb"
+          ]
+        ],
+        [
+          "enter",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "spawn",
+          [
+            [
+              "python",
+              "worker.py",
+              "--socket",
+              "/case/socket",
+              "--lock-dev",
+              "3",
+              "--lock-ino",
+              "5"
+            ],
+            {
+              "env": {
+                "SSDASH_RUN_DIR": "/case",
+                "SSDASH_WRAPPER_RECEIPT": "/case/receipt.json"
+              },
+              "stdout": "/case/guardian.log",
+              "stderr": -2,
+              "start_new_session": true
+            }
+          ]
+        ],
+        [
+          "exit",
+          [
+            "/case/guardian.log",
+            null
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "lease_poll",
+          [
+            12
+          ]
+        ],
+        [
+          "kill",
+          [
+            12,
+            15
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-quarantine.json",
+            {
+              "pid": 10,
+              "worker_pid": 12,
+              "retaining_lock": true,
+              "reason": "lease: OSError: synthetic lease_poll failure"
+            }
+          ]
+        ],
+        [
+          "sleep",
+          [
+            0.05
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "read",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-cleanup.json",
+            {
+              "worker": null,
+              "worker_returncode": 0,
+              "worker_group_gone": true,
+              "cleanup_receipt_confirmed": true
+            }
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-launch.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-launch.json",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian.log",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-cleanup.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-cleanup.json",
+            true
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/receipt.json",
+            {
+              "status": "failed",
+              "server": {
+                "owned_processes_gone": true,
+                "resource_scope_gone": true
+              },
+              "evidence": [
+                {
+                  "path": "guardian-launch.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian.log",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian-cleanup.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+              ],
+              "guardian_error": "lease: OSError: synthetic lease_poll failure",
+              "guardian_signals": []
+            }
+          ]
+        ],
+        [
+          "lease_close",
+          []
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "old"
+          ]
+        ]
+      ],
+      "result": 1,
+      "error": null,
+      "files": {
+        "/case/guardian-launch.json": {
+          "argv": [
+            "python",
+            "worker.py",
+            "--socket",
+            "/case/socket",
+            "--lock-dev",
+            "3",
+            "--lock-ino",
+            "5"
+          ]
+        },
+        "/case/guardian.log": "",
+        "/case/guardian-quarantine.json": {
+          "pid": 10,
+          "worker_pid": 12,
+          "retaining_lock": true,
+          "reason": "lease: OSError: synthetic lease_poll failure"
+        },
+        "/case/receipt.json": {
+          "status": "failed",
+          "server": {
+            "owned_processes_gone": true,
+            "resource_scope_gone": true
+          },
+          "evidence": [
+            {
+              "path": "guardian-launch.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian.log",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian-cleanup.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ],
+          "guardian_error": "lease: OSError: synthetic lease_poll failure",
+          "guardian_signals": []
+        },
+        "/case/guardian-cleanup.json": {
+          "worker": null,
+          "worker_returncode": 0,
+          "worker_group_gone": true,
+          "cleanup_receipt_confirmed": true
+        }
+      },
+      "lease_closed": [
+        true
+      ]
+    },
+    {
+      "name": "worker-stop",
+      "events": [
+        [
+          "lease",
+          [
+            7
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-launch.json",
+            {
+              "argv": [
+                "python",
+                "worker.py",
+                "--socket",
+                "/case/socket",
+                "--lock-dev",
+                "3",
+                "--lock-ino",
+                "5"
+              ]
+            }
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "callable"
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "open",
+          [
+            "/case/guardian.log",
+            "xb"
+          ]
+        ],
+        [
+          "enter",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "spawn",
+          [
+            [
+              "python",
+              "worker.py",
+              "--socket",
+              "/case/socket",
+              "--lock-dev",
+              "3",
+              "--lock-ino",
+              "5"
+            ],
+            {
+              "env": {
+                "SSDASH_RUN_DIR": "/case",
+                "SSDASH_WRAPPER_RECEIPT": "/case/receipt.json"
+              },
+              "stdout": "/case/guardian.log",
+              "stderr": -2,
+              "start_new_session": true
+            }
+          ]
+        ],
+        [
+          "exit",
+          [
+            "/case/guardian.log",
+            null
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "lease_poll",
+          [
+            12
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "sleep",
+          [
+            0.05
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "read",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-cleanup.json",
+            {
+              "worker": {
+                "pid": 12,
+                "uid": 501,
+                "gid": 20,
+                "cgroup": null
+              },
+              "worker_returncode": 1,
+              "worker_group_gone": true,
+              "cleanup_receipt_confirmed": true
+            }
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-launch.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-launch.json",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian.log",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-cleanup.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-cleanup.json",
+            true
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/receipt.json",
+            {
+              "status": "failed",
+              "server": {
+                "owned_processes_gone": true,
+                "resource_scope_gone": true
+              },
+              "evidence": [
+                {
+                  "path": "guardian-launch.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian.log",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian-cleanup.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+              ],
+              "guardian_error": "worker failed or did not receive the inherited lease",
+              "guardian_signals": []
+            }
+          ]
+        ],
+        [
+          "lease_close",
+          []
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "old"
+          ]
+        ]
+      ],
+      "result": 1,
+      "error": null,
+      "files": {
+        "/case/guardian-launch.json": {
+          "argv": [
+            "python",
+            "worker.py",
+            "--socket",
+            "/case/socket",
+            "--lock-dev",
+            "3",
+            "--lock-ino",
+            "5"
+          ]
+        },
+        "/case/guardian.log": "",
+        "/case/receipt.json": {
+          "status": "failed",
+          "server": {
+            "owned_processes_gone": true,
+            "resource_scope_gone": true
+          },
+          "evidence": [
+            {
+              "path": "guardian-launch.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian.log",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian-cleanup.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ],
+          "guardian_error": "worker failed or did not receive the inherited lease",
+          "guardian_signals": []
+        },
+        "/case/guardian-cleanup.json": {
+          "worker": {
+            "pid": 12,
+            "uid": 501,
+            "gid": 20,
+            "cgroup": null
+          },
+          "worker_returncode": 1,
+          "worker_group_gone": true,
+          "cleanup_receipt_confirmed": true
+        }
+      },
+      "lease_closed": [
+        true
+      ]
+    },
+    {
+      "name": "worker-controller-disconnect",
+      "events": [
+        [
+          "lease",
+          [
+            7
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-launch.json",
+            {
+              "argv": [
+                "python",
+                "worker.py",
+                "--socket",
+                "/case/socket",
+                "--lock-dev",
+                "3",
+                "--lock-ino",
+                "5"
+              ]
+            }
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "callable"
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "open",
+          [
+            "/case/guardian.log",
+            "xb"
+          ]
+        ],
+        [
+          "enter",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "spawn",
+          [
+            [
+              "python",
+              "worker.py",
+              "--socket",
+              "/case/socket",
+              "--lock-dev",
+              "3",
+              "--lock-ino",
+              "5"
+            ],
+            {
+              "env": {
+                "SSDASH_RUN_DIR": "/case",
+                "SSDASH_WRAPPER_RECEIPT": "/case/receipt.json"
+              },
+              "stdout": "/case/guardian.log",
+              "stderr": -2,
+              "start_new_session": true
+            }
+          ]
+        ],
+        [
+          "exit",
+          [
+            "/case/guardian.log",
+            null
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "lease_poll",
+          [
+            12
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "sleep",
+          [
+            0.05
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "lease_poll",
+          [
+            12
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "sleep",
+          [
+            0.05
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "read",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-cleanup.json",
+            {
+              "worker": {
+                "pid": 12,
+                "uid": 501,
+                "gid": 20,
+                "cgroup": null
+              },
+              "worker_returncode": 1,
+              "worker_group_gone": true,
+              "cleanup_receipt_confirmed": true
+            }
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-launch.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-launch.json",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian.log",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-cleanup.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-cleanup.json",
+            true
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/receipt.json",
+            {
+              "status": "failed",
+              "server": {
+                "owned_processes_gone": true,
+                "resource_scope_gone": true
+              },
+              "evidence": [
+                {
+                  "path": "guardian-launch.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian.log",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian-cleanup.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+              ],
+              "guardian_error": "worker failed or did not receive the inherited lease",
+              "guardian_signals": []
+            }
+          ]
+        ],
+        [
+          "lease_close",
+          []
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "old"
+          ]
+        ]
+      ],
+      "result": 1,
+      "error": null,
+      "files": {
+        "/case/guardian-launch.json": {
+          "argv": [
+            "python",
+            "worker.py",
+            "--socket",
+            "/case/socket",
+            "--lock-dev",
+            "3",
+            "--lock-ino",
+            "5"
+          ]
+        },
+        "/case/guardian.log": "",
+        "/case/receipt.json": {
+          "status": "failed",
+          "server": {
+            "owned_processes_gone": true,
+            "resource_scope_gone": true
+          },
+          "evidence": [
+            {
+              "path": "guardian-launch.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian.log",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian-cleanup.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ],
+          "guardian_error": "worker failed or did not receive the inherited lease",
+          "guardian_signals": []
+        },
+        "/case/guardian-cleanup.json": {
+          "worker": {
+            "pid": 12,
+            "uid": 501,
+            "gid": 20,
+            "cgroup": null
+          },
+          "worker_returncode": 1,
+          "worker_group_gone": true,
+          "cleanup_receipt_confirmed": true
+        }
+      },
+      "lease_closed": [
+        true
+      ]
+    },
+    {
+      "name": "signal-stop",
+      "events": [
+        [
+          "lease",
+          [
+            7
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-launch.json",
+            {
+              "argv": [
+                "python",
+                "worker.py",
+                "--socket",
+                "/case/socket",
+                "--lock-dev",
+                "3",
+                "--lock-ino",
+                "5"
+              ]
+            }
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "callable"
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "open",
+          [
+            "/case/guardian.log",
+            "xb"
+          ]
+        ],
+        [
+          "enter",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "spawn",
+          [
+            [
+              "python",
+              "worker.py",
+              "--socket",
+              "/case/socket",
+              "--lock-dev",
+              "3",
+              "--lock-ino",
+              "5"
+            ],
+            {
+              "env": {
+                "SSDASH_RUN_DIR": "/case",
+                "SSDASH_WRAPPER_RECEIPT": "/case/receipt.json"
+              },
+              "stdout": "/case/guardian.log",
+              "stderr": -2,
+              "start_new_session": true
+            }
+          ]
+        ],
+        [
+          "exit",
+          [
+            "/case/guardian.log",
+            null
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "lease_poll",
+          [
+            12
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "sleep",
+          [
+            0.05
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "lease_poll",
+          [
+            12
+          ]
+        ],
+        [
+          "kill",
+          [
+            12,
+            15
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-quarantine.json",
+            {
+              "pid": 10,
+              "worker_pid": 12,
+              "retaining_lock": true,
+              "reason": "guardian interrupted or timed out"
+            }
+          ]
+        ],
+        [
+          "sleep",
+          [
+            0.05
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "read",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-cleanup.json",
+            {
+              "worker": {
+                "pid": 12,
+                "uid": 501,
+                "gid": 20,
+                "cgroup": null
+              },
+              "worker_returncode": 0,
+              "worker_group_gone": true,
+              "cleanup_receipt_confirmed": true
+            }
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-launch.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-launch.json",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian.log",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-cleanup.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-cleanup.json",
+            true
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/receipt.json",
+            {
+              "status": "failed",
+              "server": {
+                "owned_processes_gone": true,
+                "resource_scope_gone": true
+              },
+              "evidence": [
+                {
+                  "path": "guardian-launch.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian.log",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian-cleanup.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+              ],
+              "guardian_error": "guardian interrupted or timed out",
+              "guardian_signals": [
+                15,
+                15
+              ]
+            }
+          ]
+        ],
+        [
+          "lease_close",
+          []
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "old"
+          ]
+        ]
+      ],
+      "result": 1,
+      "error": null,
+      "files": {
+        "/case/guardian-launch.json": {
+          "argv": [
+            "python",
+            "worker.py",
+            "--socket",
+            "/case/socket",
+            "--lock-dev",
+            "3",
+            "--lock-ino",
+            "5"
+          ]
+        },
+        "/case/guardian.log": "",
+        "/case/guardian-quarantine.json": {
+          "pid": 10,
+          "worker_pid": 12,
+          "retaining_lock": true,
+          "reason": "guardian interrupted or timed out"
+        },
+        "/case/receipt.json": {
+          "status": "failed",
+          "server": {
+            "owned_processes_gone": true,
+            "resource_scope_gone": true
+          },
+          "evidence": [
+            {
+              "path": "guardian-launch.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian.log",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian-cleanup.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ],
+          "guardian_error": "guardian interrupted or timed out",
+          "guardian_signals": [
+            15,
+            15
+          ]
+        },
+        "/case/guardian-cleanup.json": {
+          "worker": {
+            "pid": 12,
+            "uid": 501,
+            "gid": 20,
+            "cgroup": null
+          },
+          "worker_returncode": 0,
+          "worker_group_gone": true,
+          "cleanup_receipt_confirmed": true
+        }
+      },
+      "lease_closed": [
+        true
+      ]
+    },
+    {
+      "name": "timeout",
+      "events": [
+        [
+          "lease",
+          [
+            7
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-launch.json",
+            {
+              "argv": [
+                "python",
+                "worker.py",
+                "--socket",
+                "/case/socket",
+                "--lock-dev",
+                "3",
+                "--lock-ino",
+                "5"
+              ]
+            }
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "callable"
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "open",
+          [
+            "/case/guardian.log",
+            "xb"
+          ]
+        ],
+        [
+          "enter",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "spawn",
+          [
+            [
+              "python",
+              "worker.py",
+              "--socket",
+              "/case/socket",
+              "--lock-dev",
+              "3",
+              "--lock-ino",
+              "5"
+            ],
+            {
+              "env": {
+                "SSDASH_RUN_DIR": "/case",
+                "SSDASH_WRAPPER_RECEIPT": "/case/receipt.json"
+              },
+              "stdout": "/case/guardian.log",
+              "stderr": -2,
+              "start_new_session": true
+            }
+          ]
+        ],
+        [
+          "exit",
+          [
+            "/case/guardian.log",
+            null
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "lease_poll",
+          [
+            12
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "kill",
+          [
+            12,
+            15
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-quarantine.json",
+            {
+              "pid": 10,
+              "worker_pid": 12,
+              "retaining_lock": true,
+              "reason": "guardian interrupted or timed out"
+            }
+          ]
+        ],
+        [
+          "sleep",
+          [
+            0.05
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "read",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-cleanup.json",
+            {
+              "worker": {
+                "pid": 12,
+                "uid": 501,
+                "gid": 20,
+                "cgroup": null
+              },
+              "worker_returncode": 0,
+              "worker_group_gone": true,
+              "cleanup_receipt_confirmed": true
+            }
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-launch.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-launch.json",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian.log",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-cleanup.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-cleanup.json",
+            true
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/receipt.json",
+            {
+              "status": "failed",
+              "server": {
+                "owned_processes_gone": true,
+                "resource_scope_gone": true
+              },
+              "evidence": [
+                {
+                  "path": "guardian-launch.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian.log",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian-cleanup.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+              ],
+              "guardian_error": "guardian interrupted or timed out",
+              "guardian_signals": []
+            }
+          ]
+        ],
+        [
+          "lease_close",
+          []
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "old"
+          ]
+        ]
+      ],
+      "result": 1,
+      "error": null,
+      "files": {
+        "/case/guardian-launch.json": {
+          "argv": [
+            "python",
+            "worker.py",
+            "--socket",
+            "/case/socket",
+            "--lock-dev",
+            "3",
+            "--lock-ino",
+            "5"
+          ]
+        },
+        "/case/guardian.log": "",
+        "/case/guardian-quarantine.json": {
+          "pid": 10,
+          "worker_pid": 12,
+          "retaining_lock": true,
+          "reason": "guardian interrupted or timed out"
+        },
+        "/case/receipt.json": {
+          "status": "failed",
+          "server": {
+            "owned_processes_gone": true,
+            "resource_scope_gone": true
+          },
+          "evidence": [
+            {
+              "path": "guardian-launch.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian.log",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian-cleanup.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ],
+          "guardian_error": "guardian interrupted or timed out",
+          "guardian_signals": []
+        },
+        "/case/guardian-cleanup.json": {
+          "worker": {
+            "pid": 12,
+            "uid": 501,
+            "gid": 20,
+            "cgroup": null
+          },
+          "worker_returncode": 0,
+          "worker_group_gone": true,
+          "cleanup_receipt_confirmed": true
+        }
+      },
+      "lease_closed": [
+        true
+      ]
+    },
+    {
+      "name": "unknown-receipt",
+      "events": [
+        [
+          "lease",
+          [
+            7
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-launch.json",
+            {
+              "argv": [
+                "python",
+                "worker.py",
+                "--socket",
+                "/case/socket",
+                "--lock-dev",
+                "3",
+                "--lock-ino",
+                "5"
+              ]
+            }
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "callable"
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "open",
+          [
+            "/case/guardian.log",
+            "xb"
+          ]
+        ],
+        [
+          "enter",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "spawn",
+          [
+            [
+              "python",
+              "worker.py",
+              "--socket",
+              "/case/socket",
+              "--lock-dev",
+              "3",
+              "--lock-ino",
+              "5"
+            ],
+            {
+              "env": {
+                "SSDASH_RUN_DIR": "/case",
+                "SSDASH_WRAPPER_RECEIPT": "/case/receipt.json"
+              },
+              "stdout": "/case/guardian.log",
+              "stderr": -2,
+              "start_new_session": true
+            }
+          ]
+        ],
+        [
+          "exit",
+          [
+            "/case/guardian.log",
+            null
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "lease_poll",
+          [
+            12
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "sleep",
+          [
+            0.05
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-quarantine.json",
+            {
+              "pid": 10,
+              "worker_pid": 12,
+              "retaining_lock": true,
+              "reason": "worker cleanup uncertain; retaining inherited lock"
+            }
+          ]
+        ],
+        [
+          "sleep",
+          [
+            1
+          ]
+        ]
+      ],
+      "result": null,
+      "error": [
+        "EndObservation",
+        "bounded observer stopped while original guardian retains lock"
+      ],
+      "files": {
+        "/case/guardian-launch.json": {
+          "argv": [
+            "python",
+            "worker.py",
+            "--socket",
+            "/case/socket",
+            "--lock-dev",
+            "3",
+            "--lock-ino",
+            "5"
+          ]
+        },
+        "/case/guardian.log": "",
+        "/case/receipt.json": {
+          "status": "passed",
+          "server": {
+            "owned_processes_gone": true,
+            "resource_scope_gone": true
+          },
+          "evidence": []
+        },
+        "/case/guardian-quarantine.json": {
+          "pid": 10,
+          "worker_pid": 12,
+          "retaining_lock": true,
+          "reason": "worker cleanup uncertain; retaining inherited lock"
+        }
+      },
+      "lease_closed": [
+        false
+      ]
+    },
+    {
+      "name": "group-unknown",
+      "events": [
+        [
+          "lease",
+          [
+            7
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-launch.json",
+            {
+              "argv": [
+                "python",
+                "worker.py",
+                "--socket",
+                "/case/socket",
+                "--lock-dev",
+                "3",
+                "--lock-ino",
+                "5"
+              ]
+            }
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "callable"
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "open",
+          [
+            "/case/guardian.log",
+            "xb"
+          ]
+        ],
+        [
+          "enter",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "spawn",
+          [
+            [
+              "python",
+              "worker.py",
+              "--socket",
+              "/case/socket",
+              "--lock-dev",
+              "3",
+              "--lock-ino",
+              "5"
+            ],
+            {
+              "env": {
+                "SSDASH_RUN_DIR": "/case",
+                "SSDASH_WRAPPER_RECEIPT": "/case/receipt.json"
+              },
+              "stdout": "/case/guardian.log",
+              "stderr": -2,
+              "start_new_session": true
+            }
+          ]
+        ],
+        [
+          "exit",
+          [
+            "/case/guardian.log",
+            null
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "lease_poll",
+          [
+            12
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "sleep",
+          [
+            0.05
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-quarantine.json",
+            {
+              "pid": 10,
+              "worker_pid": 12,
+              "retaining_lock": true,
+              "reason": "worker cleanup uncertain; retaining inherited lock"
+            }
+          ]
+        ],
+        [
+          "sleep",
+          [
+            1
+          ]
+        ]
+      ],
+      "result": null,
+      "error": [
+        "EndObservation",
+        "bounded observer stopped while original guardian retains lock"
+      ],
+      "files": {
+        "/case/guardian-launch.json": {
+          "argv": [
+            "python",
+            "worker.py",
+            "--socket",
+            "/case/socket",
+            "--lock-dev",
+            "3",
+            "--lock-ino",
+            "5"
+          ]
+        },
+        "/case/guardian.log": "",
+        "/case/receipt.json": {
+          "status": "passed",
+          "server": {
+            "owned_processes_gone": true,
+            "resource_scope_gone": true
+          },
+          "evidence": []
+        },
+        "/case/guardian-quarantine.json": {
+          "pid": 10,
+          "worker_pid": 12,
+          "retaining_lock": true,
+          "reason": "worker cleanup uncertain; retaining inherited lock"
+        }
+      },
+      "lease_closed": [
+        false
+      ]
+    },
+    {
+      "name": "no-lease",
+      "events": [
+        [
+          "lease",
+          [
+            7
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-launch.json",
+            {
+              "argv": [
+                "python",
+                "worker.py",
+                "--socket",
+                "/case/socket",
+                "--lock-dev",
+                "3",
+                "--lock-ino",
+                "5"
+              ]
+            }
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "callable"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "callable"
+          ]
+        ],
+        [
+          "clock",
+          []
+        ],
+        [
+          "open",
+          [
+            "/case/guardian.log",
+            "xb"
+          ]
+        ],
+        [
+          "enter",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "spawn",
+          [
+            [
+              "python",
+              "worker.py",
+              "--socket",
+              "/case/socket",
+              "--lock-dev",
+              "3",
+              "--lock-ino",
+              "5"
+            ],
+            {
+              "env": {
+                "SSDASH_RUN_DIR": "/case",
+                "SSDASH_WRAPPER_RECEIPT": "/case/receipt.json"
+              },
+              "stdout": "/case/guardian.log",
+              "stderr": -2,
+              "start_new_session": true
+            }
+          ]
+        ],
+        [
+          "exit",
+          [
+            "/case/guardian.log",
+            null
+          ]
+        ],
+        [
+          "poll",
+          []
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "read",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "group_exists",
+          [
+            12
+          ]
+        ],
+        [
+          "cleanup_confirmed",
+          [
+            "/case/receipt.json"
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/guardian-cleanup.json",
+            {
+              "worker": null,
+              "worker_returncode": 0,
+              "worker_group_gone": true,
+              "cleanup_receipt_confirmed": true
+            }
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-launch.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-launch.json",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian.log"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian.log",
+            true
+          ]
+        ],
+        [
+          "exists",
+          [
+            "/case/guardian-cleanup.json"
+          ]
+        ],
+        [
+          "identity",
+          [
+            "/case/guardian-cleanup.json",
+            true
+          ]
+        ],
+        [
+          "save",
+          [
+            "/case/receipt.json",
+            {
+              "status": "failed",
+              "server": {
+                "owned_processes_gone": true,
+                "resource_scope_gone": true
+              },
+              "evidence": [
+                {
+                  "path": "guardian-launch.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian.log",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                },
+                {
+                  "path": "guardian-cleanup.json",
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+              ],
+              "guardian_error": "worker failed or did not receive the inherited lease",
+              "guardian_signals": []
+            }
+          ]
+        ],
+        [
+          "lease_close",
+          []
+        ],
+        [
+          "signal_handler",
+          [
+            2,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            15,
+            "old"
+          ]
+        ],
+        [
+          "signal_handler",
+          [
+            1,
+            "old"
+          ]
+        ]
+      ],
+      "result": 1,
+      "error": null,
+      "files": {
+        "/case/guardian-launch.json": {
+          "argv": [
+            "python",
+            "worker.py",
+            "--socket",
+            "/case/socket",
+            "--lock-dev",
+            "3",
+            "--lock-ino",
+            "5"
+          ]
+        },
+        "/case/guardian.log": "",
+        "/case/receipt.json": {
+          "status": "failed",
+          "server": {
+            "owned_processes_gone": true,
+            "resource_scope_gone": true
+          },
+          "evidence": [
+            {
+              "path": "guardian-launch.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian.log",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            {
+              "path": "guardian-cleanup.json",
+              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ],
+          "guardian_error": "worker failed or did not receive the inherited lease",
+          "guardian_signals": []
+        },
+        "/case/guardian-cleanup.json": {
+          "worker": null,
+          "worker_returncode": 0,
+          "worker_group_gone": true,
+          "cleanup_receipt_confirmed": true
+        }
+      },
+      "lease_closed": [
+        true
+      ]
+    }
+  ]
+}

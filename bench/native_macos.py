@@ -5,13 +5,12 @@ import os
 from pathlib import Path
 import re
 import sys
-import signal
-import subprocess
 import time
 
 import native_common as common
 from macos.measurement_images import snapshot_images
-from native_lease import Lease, LeaseServer
+from native_lease import Lease
+from native_core import CORE
 
 
 def parse_vm(text):
@@ -140,68 +139,9 @@ def cleanup_confirmed(path):
 
 
 def guard_worker(argv, environment, lock_fd, deadline_s):
-    """Keep a second owner outside the worker's session until cleanup is proven.
-
-    A killed controller disconnects the lease; the worker remains alive to clean
-    its server/client groups. A killed worker leaves the controller holding the
-    lease in quarantine. Never force-kill that cleanup guardian to meet a timeout.
-    """
-    out, receipt_path = Path(environment["SSDASH_RUN_DIR"]), Path(environment["SSDASH_WRAPPER_RECEIPT"])
-    lease = LeaseServer(lock_fd)
-    identity = os.fstat(lock_fd)
-    command = [*argv, "--socket", lease.path, "--lock-dev", str(identity.st_dev), "--lock-ino", str(identity.st_ino)]
-    common.save(out / "guardian-launch.json", {"argv": command})
-    signals, worker, failure, asked_stop = [], None, None, False
-    handlers = {s: signal.signal(s, lambda n, _f: signals.append(n)) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
-    deadline = time.monotonic() + deadline_s
-    try:
-        with (out / "guardian.log").open("xb") as log:
-            worker = subprocess.Popen(command, env=environment, stdout=log, stderr=subprocess.STDOUT,
-                                      start_new_session=True)
-        lease.expected_pid = worker.pid
-        while worker.poll() is None:
-            try:
-                lease.poll()
-            except BaseException as error:
-                failure = f"lease: {type(error).__name__}: {error}"
-            if failure or signals or time.monotonic() > deadline:
-                failure = failure or "guardian interrupted or timed out"
-                if not asked_stop:
-                    os.kill(worker.pid, signal.SIGTERM)
-                    asked_stop = True
-                common.save(out / "guardian-quarantine.json", {"pid": os.getpid(), "worker_pid": worker.pid,
-                            "retaining_lock": True, "reason": failure})
-            time.sleep(.05)
-        if lease.peer is None or worker.returncode != 0:
-            failure = failure or "worker failed or did not receive the inherited lease"
-    except BaseException as error:
-        failure = f"{type(error).__name__}: {error}"
-    finally:
-        # No child was created on a spawn failure; otherwise unknown cleanup
-        # retains the same original flock, including after worker SIGKILL.
-        while worker is not None and (common.group_exists(worker) or not cleanup_confirmed(receipt_path)):
-            failure = failure or "worker cleanup uncertain; retaining inherited lock"
-            common.save(out / "guardian-quarantine.json", {"pid": os.getpid(), "worker_pid": worker.pid,
-                        "retaining_lock": True, "reason": failure})
-            time.sleep(1)
-        if receipt_path.exists():
-            receipt = json.loads(receipt_path.read_text())
-        else:
-            receipt = {"status": "failed", "server": {"owned_processes_gone": True,
-                       "resource_scope_gone": True}, "evidence": []}
-        if failure or signals:
-            receipt.update(status="failed", guardian_error=failure, guardian_signals=signals)
-        common.save(out / "guardian-cleanup.json", {"worker": lease.peer, "worker_returncode": worker.returncode if worker else None,
-                    "worker_group_gone": worker is None or not common.group_exists(worker), "cleanup_receipt_confirmed": worker is None or cleanup_confirmed(receipt_path)})
-        for path in (out / "guardian-launch.json", out / "guardian.log", out / "guardian-cleanup.json"):
-            if path.exists():
-                receipt.setdefault("evidence", []).append({"path": path.name, "sha256": common.file_identity(path, True)["sha256"]})
-        common.save(receipt_path, receipt)
-        lease.close()
-        for sig, handler in handlers.items():
-            signal.signal(sig, handler)
-    return 0 if receipt["status"] == "passed" else 1
-
+    return CORE["guardian"].guard_worker(
+        argv, environment, lock_fd, deadline_s, effects=common,
+        cleanup_confirmed=cleanup_confirmed)
 
 def run_guardian(profile, environment, lock_fd):
     if sys.platform != "darwin":

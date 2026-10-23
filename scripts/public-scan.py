@@ -3,6 +3,7 @@
 """Check public changes without exposing matched values in diagnostics."""
 import argparse
 import ipaddress
+import json
 import re
 import subprocess
 import sys
@@ -20,6 +21,41 @@ SELF = "scripts/public-scan.py"
 
 def git(*args):
     return subprocess.check_output(["git", *args]).decode("utf-8", errors="replace")
+
+
+def added_line_text(filename, text):
+    """Decode complete JSON strings while preserving every other fragment."""
+    if not filename.endswith(".json"):
+        return text
+    parts = []
+    start = 0
+    while start < len(text):
+        opening = text.find('"', start)
+        if opening < 0:
+            parts.append(text[start:])
+            break
+        parts.append(text[start:opening])
+        closing = opening + 1
+        while closing < len(text):
+            if text[closing] == "\\":
+                closing += 2
+            elif text[closing] == '"':
+                break
+            else:
+                closing += 1
+        if closing >= len(text):
+            parts.append(text[opening:])
+            break
+        literal = text[opening:closing + 1]
+        try:
+            decoded = json.loads(literal)
+        except ValueError:
+            parts.append(literal)
+        else:
+            # Retain delimiters so decoding does not join adjacent fragments.
+            parts.append('"' + decoded + '"')
+        start = closing + 1
+    return "".join(parts)
 
 
 def inspect(text, location, strict=False):
@@ -81,7 +117,8 @@ def main():
                 line_number = int(match.group(1)) if match else 0
             elif line.startswith("+") and not line.startswith("+++"):
                 if filename != SELF:
-                    failures += inspect(line[1:], f"{revision}:{filename}:{line_number}", args.tree)
+                    failures += inspect(added_line_text(filename, line[1:]),
+                                        f"{revision}:{filename}:{line_number}", args.tree)
                 line_number += 1
             elif not line.startswith("-"):
                 line_number += 1

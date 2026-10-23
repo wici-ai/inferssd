@@ -1,0 +1,35 @@
+{
+  "source": "unchanged F8b121 shell suites",
+  "bash": "GNU bash, version 5.2.21(1)-release (x86_64-pc-linux-gnu)",
+  "initial_incomplete_oracle": [
+    {
+      "suite": "settings",
+      "code": 1,
+      "pass": 98,
+      "fail": 4
+    },
+    {
+      "suite": "replica",
+      "code": 0,
+      "pass": 6,
+      "fail": 0
+    }
+  ],
+  "final_complete_oracle": [
+    {
+      "suite": "settings",
+      "code": 0,
+      "pass": 102,
+      "fail": 0
+    },
+    {
+      "suite": "replica",
+      "code": 0,
+      "pass": 6,
+      "fail": 0
+    }
+  ],
+  "reason_for_initial_failure": "The capture directory omitted settings.py and its three imports. Four assertions that consume generated settings failed; original scripts were unchanged. The missing four F sources were added to the oracle closure before a fresh run.",
+  "capture_boundary": "env exec wrapper records invocation; BASH_ENV rm wrapper copies fixture outputs before cleanup; production scripts and tests byte unchanged",
+  "actual_engine_service_gpu_invocations": 0
+}
