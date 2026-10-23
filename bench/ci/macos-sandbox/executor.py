@@ -384,20 +384,29 @@ class Session:
             observed = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-u", str(self.config["worker_uid"]), "-F", "pcuftn"], capture_output=True, text=True, check=False)
             require(observed.returncode in (0, 1), "cannot inventory actual worker files")
             result["lsof"] = observed.stdout
+            if record["kind"] == "server":
+                result.update(self.listener(result["members"]))
         return result
+
+    def listener(self, members):
+        port = self.config["executor"]["server_port"]
+        listeners = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-u", str(self.config["worker_uid"]), "-iTCP:" + str(port), "-sTCP:LISTEN", "-F", "pn"], capture_output=True, text=True, check=False)
+        require(listeners.returncode in (0, 1), "cannot inventory owned server listener")
+        if listeners.returncode == 1 and not listeners.stdout.strip():
+            return {"ready": False, "listener_pids": []}
+        names = [line[1:] for line in listeners.stdout.splitlines() if line.startswith("n")]
+        pids = [int(line[1:]) for line in listeners.stdout.splitlines() if line.startswith("p")]
+        require(names and all(name == "127.0.0.1:" + str(port) for name in names), "listener is not fixed IPv4 loopback")
+        require(set(pids) <= {p["pid"] for p in members}, "listener outside owned worker UID")
+        return {"ready": True, "listener_pids": pids}
 
     def client(self, record):
         require(record["kind"] == "server" and record["state"] == "running", "client requires a running server")
         probe = self.probe(record)
+        require(probe["ready"], "owned server has no listener")
         port = self.config["executor"]["server_port"]
-        listeners = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-u", str(self.config["worker_uid"]), "-iTCP:" + str(port), "-sTCP:LISTEN", "-F", "pn"], capture_output=True, text=True, check=False)
-        require(listeners.returncode == 0, "owned server has no listener")
-        names = [line[1:] for line in listeners.stdout.splitlines() if line.startswith("n")]
-        pids = [int(line[1:]) for line in listeners.stdout.splitlines() if line.startswith("p")]
-        require(names and all(name == "127.0.0.1:" + str(port) for name in names), "listener is not fixed IPv4 loopback")
-        require(set(pids) <= {p["pid"] for p in probe["members"]}, "listener outside owned worker UID")
         return {**{k: record[k] for k in ("handle", "worker_pid", "worker_uid", "birth_identity", "scope_identity")},
-                "url": "http://127.0.0.1:" + str(port), "listener_pids": pids}
+                "url": "http://127.0.0.1:" + str(port), "listener_pids": probe["listener_pids"]}
 
     def dispatch(self, request):
         require(request.get("schema_version") == 1 and request.get("job_id") == self.job.name, "request job/schema mismatch")

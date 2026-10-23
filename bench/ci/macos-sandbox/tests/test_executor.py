@@ -147,3 +147,20 @@ class ContractTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ListenerTests(unittest.TestCase):
+    def test_startup_without_listener_is_not_a_broker_failure(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        session = object.__new__(executor.Session)
+        session.config = {'worker_uid': 62002, 'executor': {'server_port': 18080}}
+        with patch.object(executor.subprocess, 'run', return_value=SimpleNamespace(returncode=1, stdout='')):
+            self.assertEqual(session.listener([{'pid': 123}]), {'ready': False, 'listener_pids': []})
+        with patch.object(executor.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='p123\nn127.0.0.1:18080\n')):
+            self.assertEqual(session.listener([{'pid': 123}]), {'ready': True, 'listener_pids': [123]})
+            with self.assertRaisesRegex(ValueError, 'outside owned'):
+                session.listener([{'pid': 124}])
+        with patch.object(executor.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='p123\nn*:18080\n')):
+            with self.assertRaisesRegex(ValueError, 'fixed IPv4'):
+                session.listener([{'pid': 123}])
