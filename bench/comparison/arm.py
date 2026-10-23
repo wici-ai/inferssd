@@ -181,8 +181,8 @@ def run(config, output, lock_fd=None):
                 pass
             time.sleep(.1)
         before = snapshot(process, config, output, "runtime-before")
-        marker = "processing task, is_child = "
-        if marker in (output / "server.log").read_text():
+        marker = b"processing task, is_child = "
+        if marker in (output / "server.log").read_bytes():
             raise ValueError("completion occurred before the first comparison request")
         result["completion_requests"] = 1
         common.save(output / "request-started.json", {"completion_requests": 1, "monotonic_ns": time.monotonic_ns()})
@@ -198,7 +198,7 @@ def run(config, output, lock_fd=None):
         native_linux.unchanged_oom(before["cgroup"], after["cgroup"])
         if before_inputs != inputs(config):
             raise ValueError("frozen build/model/input identity changed across the request")
-        if (output / "server.log").read_text().count(marker) != 1:
+        if (output / "server.log").read_bytes().count(marker) != 1:
             raise ValueError("native log does not confirm exactly one completion")
         if "typed_settings" in config:
             from inferssd.telemetry.jsonl import effective_settings, read_events

@@ -48,7 +48,8 @@ Engram fallback is 0, while the production DeepSeek launch profile already
 selects 1; these are different layers of defaults. The original release launcher
 has separate base/elastic VRAM safety values 1024/64 MiB. The current typed
 margin controls both, so this comparison explicitly uses 64/64 MiB on both sides,
-with candidate allocator reserve 0. This is a comparison at equal effective
+with candidate allocator reserve 0. The reference low VRAM watermark is
+also explicitly aligned from 16 to 0 MiB; both high watermarks are 64 MiB. This is a comparison at equal effective
 settings, not release-default versus current-default behavior. Record all such
 launch changes and native effective evidence; do not modify algorithms to make
 the comparison run.
