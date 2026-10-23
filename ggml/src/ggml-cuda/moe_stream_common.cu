@@ -756,39 +756,9 @@ static void vram_cache_report_atexit() {
     }
 }
 
-static bool moe_stream_dontneed_enabled() {
-    static int enabled = [] {
-        const char * env = std::getenv("GGML_MOE_STREAM_DONTNEED");
-        return env && env[0] && env[0] != '0';
-    }();
-    return enabled != 0;
-}
 
-static void moe_stream_dontneed_source_pages(const void * ptr, size_t size) {
-#if defined(__linux__)
-    if (!moe_stream_dontneed_enabled() || ptr == nullptr || size == 0) {
-        return;
-    }
 
-    const long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) {
-        return;
-    }
 
-    const uintptr_t begin = reinterpret_cast<uintptr_t>(ptr);
-    const uintptr_t end = begin + size;
-    const uintptr_t aligned_begin = begin & ~static_cast<uintptr_t>(page_size - 1);
-    const uintptr_t aligned_end = (end + static_cast<uintptr_t>(page_size - 1)) & ~static_cast<uintptr_t>(page_size - 1);
-    if (aligned_end <= aligned_begin) {
-        return;
-    }
-
-    (void) madvise(reinterpret_cast<void *>(aligned_begin), aligned_end - aligned_begin, MADV_DONTNEED);
-#else
-    (void) ptr;
-    (void) size;
-#endif
-}
 
 static bool moe_stream_cache_admit_name_matches(const char * filter, const char * tensor) {
     if (!filter || !filter[0] || !tensor) {
@@ -825,10 +795,7 @@ static bool moe_stream_cache_admit_profile_applies(const char * tensor) {
     return !applies_filter || !applies_filter[0] || moe_stream_cache_admit_name_matches(applies_filter, tensor);
 }
 
-static bool moe_stream_one_require_cache_admit(const char * tensor) {
-    static const char * require_filter = std::getenv("GGML_MOE_STREAM_ONE_REQUIRE_CACHE_ADMIT_FILTER");
-    return require_filter && require_filter[0] && moe_stream_cache_admit_name_matches(require_filter, tensor);
-}
+
 
 static int moe_stream_cache_partition_tail_slots() {
     static int slots = [] {
@@ -6964,69 +6931,13 @@ static void one_direct_manifest_init_once() {
     return nullptr;
 }
 
-static bool one_direct_manifest_read_direct_aligned(const one_expert_pack_entry * entry, void * dst, size_t sz) {
-#if defined(__linux__) && defined(O_DIRECT)
-    const uint64_t align = 4096;
-    const uint64_t prefix = entry->offset & (align - 1);
-    const uint64_t read_off = entry->offset - prefix;
-    const size_t read_sz = (size_t) (((prefix + sz + align - 1) / align) * align);
-    void * bounce = nullptr;
-    if (posix_memalign(&bounce, (size_t) align, read_sz) != 0 || bounce == nullptr) {
-        return false;
-    }
-    const bool ok = one_pack_read_exact_fd(g_one_direct_manifest.fd_direct, bounce, read_sz, read_off);
-    if (ok) {
-        std::memcpy(dst, (const char *) bounce + prefix, sz);
-    }
-    std::free(bounce);
-    return ok;
-#else
-    (void) entry;
-    (void) dst;
-    (void) sz;
-    return false;
-#endif
-}
 
-[[maybe_unused]] static bool one_direct_manifest_read_entry(const one_expert_pack_entry * entry, void * dst, size_t sz) {
-    if (!entry || g_one_direct_manifest.fd < 0 || entry->nbytes != sz) {
-        return false;
-    }
-    if (g_one_direct_manifest.fd_direct >= 0) {
-        if (one_direct_manifest_read_direct_aligned(entry, dst, sz)) {
-            ++g_one_direct_manifest.reads;
-            ++g_one_direct_manifest.direct_reads;
-            g_one_direct_manifest.bytes.fetch_add(sz);
-            return true;
-        }
-        ++g_one_direct_manifest.direct_failures;
-        ++g_one_direct_manifest.direct_fallbacks;
-    }
-    if (!one_pack_read_exact_fd(g_one_direct_manifest.fd, dst, sz, entry->offset)) {
-        ++g_one_direct_manifest.failures;
-        return false;
-    }
-    ++g_one_direct_manifest.reads;
-    g_one_direct_manifest.bytes.fetch_add(sz);
-    return true;
-}
 
-static bool ensure_host_pinned(void *&p, size_t &cur, size_t need);
 
-static __global__ void moe_stream_mxfp4_transpose_blocks_kernel(
-        const block_mxfp4 * __restrict__ src,
-        block_mxfp4 * __restrict__ dst,
-        int ne01,
-        int nb) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = ne01 * nb;
-    if (idx >= total) {
-        return;
-    }
-    const int ib = idx / ne01;
-    const int col = idx - ib * ne01;
-    dst[idx] = src[col * nb + ib];
-}
+
+
+
+
 
 struct one_direct_hot_pool_state {
     void * pool = nullptr;
@@ -7060,14 +6971,7 @@ struct one_direct_hot_pool_state {
 
 static one_direct_hot_pool_state g_one_direct_hot_pool;
 
-static bool one_direct_hot_pool_async_prefill_enabled() {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char * env = std::getenv("GGML_MOE_STREAM_ONE_DIRECT_PREFILL_ASYNC");
-        enabled = env && env[0] && std::strcmp(env, "0") != 0 ? 1 : 0;
-    }
-    return enabled != 0;
-}
+
 
 static bool one_direct_hot_pool_transpose_enabled() {
     static int enabled = -1;
@@ -7123,13 +7027,7 @@ static uint64_t one_direct_hot_pool_env_u64(const char * name, uint64_t fallback
     return (uint64_t) std::strtoull(env, nullptr, 10);
 }
 
-static bool gate_batch_prefetch_enabled() {
-    static int enabled = [] {
-        const char * env = std::getenv("GGML_MOE_GATE_BATCH_PREFETCH");
-        return env && env[0] && env[0] != '0' ? 1 : 0;
-    }();
-    return enabled != 0;
-}
+
 
 static std::string one_direct_hot_pool_key(const char * tensor, int64_t expert) {
     std::string key = tensor ? tensor : "";
@@ -7247,304 +7145,15 @@ static const void * one_direct_hot_pool_lookup_dev_ptr(const char * tensor, int6
     return (const char *) g_one_direct_hot_pool.pool + (size_t) it->second * g_one_direct_hot_pool.slot_sz;
 }
 
-static const void * one_direct_hot_pool_lookup_stream_one_dev_ptr(const char * tensor, int64_t expert, bool * pool_ready) {
-    const void * ptr = one_direct_hot_pool_lookup_dev_ptr(tensor, expert, pool_ready);
-    if (!ptr) {
-        return nullptr;
-    }
-    std::lock_guard<std::mutex> lk(g_one_direct_hot_pool.mu);
-    if (g_one_direct_hot_pool.transposed) {
-        return nullptr;
-    }
-    return ptr;
-}
 
-static bool one_direct_hot_pool_entry_shape(const one_expert_pack_entry & e, int & ne01, int & nb) {
-    if (std::strstr(e.tensor, "ffn_up_exps") != nullptr) {
-        ne01 = 2048;
-        nb = 4096 / QK_MXFP4;
-    } else if (std::strstr(e.tensor, "ffn_down_exps") != nullptr) {
-        ne01 = 4096;
-        nb = 2048 / QK_MXFP4;
-    } else {
-        return false;
-    }
-    return e.nbytes == (uint64_t) ne01 * (uint64_t) nb * sizeof(block_mxfp4);
-}
 
-static bool one_direct_hot_pool_copy_entry(
-        const one_expert_pack_entry & e,
-        const void * h_src,
-        void * dst,
-        void * d_stage,
-        cudaStream_t st,
-        bool have_stream) {
-    if (!g_one_direct_hot_pool.transposed) {
-        const auto t0 = std::chrono::steady_clock::now();
-        cudaError_t copy_err = cudaSuccess;
-        if (have_stream) {
-            copy_err = cudaMemcpyAsync(dst, h_src, (size_t) e.nbytes, cudaMemcpyHostToDevice, st);
-            if (copy_err == cudaSuccess) {
-                copy_err = cudaStreamSynchronize(st);
-            }
-        } else {
-            copy_err = cudaMemcpy(dst, h_src, (size_t) e.nbytes, cudaMemcpyHostToDevice);
-        }
-        const auto t1 = std::chrono::steady_clock::now();
-        g_one_direct_hot_pool.h2d_elapsed_ms +=
-            std::chrono::duration<double, std::milli>(t1 - t0).count();
-        return copy_err == cudaSuccess;
-    }
 
-    int ne01 = 0;
-    int nb = 0;
-    if (!d_stage || !one_direct_hot_pool_entry_shape(e, ne01, nb)) {
-        return false;
-    }
 
-    cudaError_t err = cudaSuccess;
-    if (have_stream) {
-        cudaEvent_t ev0 = nullptr;
-        cudaEvent_t ev1 = nullptr;
-        cudaEvent_t ev2 = nullptr;
-        const bool have_events =
-            cudaEventCreate(&ev0) == cudaSuccess &&
-            cudaEventCreate(&ev1) == cudaSuccess &&
-            cudaEventCreate(&ev2) == cudaSuccess;
-        if (have_events) {
-            cudaEventRecord(ev0, st);
-        }
-        err = cudaMemcpyAsync(d_stage, h_src, (size_t) e.nbytes, cudaMemcpyHostToDevice, st);
-        if (err == cudaSuccess && have_events) {
-            cudaEventRecord(ev1, st);
-        }
-        if (err == cudaSuccess) {
-            const int threads = 256;
-            const int blocks = (ne01 * nb + threads - 1) / threads;
-            moe_stream_mxfp4_transpose_blocks_kernel<<<blocks, threads, 0, st>>>(
-                    (const block_mxfp4 *) d_stage, (block_mxfp4 *) dst, ne01, nb);
-            err = cudaGetLastError();
-        }
-        if (err == cudaSuccess && have_events) {
-            cudaEventRecord(ev2, st);
-        }
-        if (err == cudaSuccess) {
-            err = cudaStreamSynchronize(st);
-        }
-        if (err == cudaSuccess && have_events) {
-            float h2d_ms = 0.0f;
-            float transform_ms = 0.0f;
-            if (cudaEventElapsedTime(&h2d_ms, ev0, ev1) == cudaSuccess) {
-                g_one_direct_hot_pool.h2d_elapsed_ms += h2d_ms;
-            }
-            if (cudaEventElapsedTime(&transform_ms, ev1, ev2) == cudaSuccess) {
-                g_one_direct_hot_pool.transform_elapsed_ms += transform_ms;
-            }
-        }
-        if (ev0) cudaEventDestroy(ev0);
-        if (ev1) cudaEventDestroy(ev1);
-        if (ev2) cudaEventDestroy(ev2);
-    } else {
-        const auto t0 = std::chrono::steady_clock::now();
-        err = cudaMemcpy(d_stage, h_src, (size_t) e.nbytes, cudaMemcpyHostToDevice);
-        const auto t1 = std::chrono::steady_clock::now();
-        if (err == cudaSuccess) {
-            const int threads = 256;
-            const int blocks = (ne01 * nb + threads - 1) / threads;
-            moe_stream_mxfp4_transpose_blocks_kernel<<<blocks, threads>>>(
-                    (const block_mxfp4 *) d_stage, (block_mxfp4 *) dst, ne01, nb);
-            err = cudaGetLastError();
-        }
-        if (err == cudaSuccess) {
-            err = cudaDeviceSynchronize();
-        }
-        const auto t2 = std::chrono::steady_clock::now();
-        g_one_direct_hot_pool.h2d_elapsed_ms +=
-            std::chrono::duration<double, std::milli>(t1 - t0).count();
-        g_one_direct_hot_pool.transform_elapsed_ms +=
-            std::chrono::duration<double, std::milli>(t2 - t1).count();
-    }
-    return err == cudaSuccess;
-}
 
-static void one_direct_hot_pool_prefill_worker(uint64_t limit) {
-    const auto t0 = std::chrono::steady_clock::now();
 
-    void * h_tmp = nullptr;
-    bool h_tmp_pinned = false;
-    if (cudaHostAlloc(&h_tmp, g_one_direct_hot_pool.slot_sz, cudaHostAllocDefault) == cudaSuccess) {
-        h_tmp_pinned = true;
-    } else {
-        h_tmp = std::malloc(g_one_direct_hot_pool.slot_sz);
-    }
 
-    cudaStream_t st = nullptr;
-    const bool have_stream = cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) == cudaSuccess;
-    void * d_stage = nullptr;
-    if (g_one_direct_hot_pool.transposed) {
-        if (cudaMalloc(&d_stage, g_one_direct_hot_pool.slot_sz) != cudaSuccess) {
-            d_stage = nullptr;
-        }
-    }
 
-    if (!h_tmp || (g_one_direct_hot_pool.transposed && !d_stage)) {
-        g_one_direct_hot_pool.read_failures += limit;
-    } else {
-        const std::vector<one_expert_pack_entry> & prefill_entries =
-            g_one_direct_manifest.prefill_entries.empty() ? g_one_direct_manifest.entries : g_one_direct_manifest.prefill_entries;
-        for (uint64_t i = 0; i < limit; ++i) {
-            const one_expert_pack_entry & e = prefill_entries[(size_t) i];
-            g_one_direct_hot_pool.attempted++;
-            if (e.nbytes > g_one_direct_hot_pool.slot_sz) {
-                g_one_direct_hot_pool.read_failures++;
-                continue;
-            }
-            const auto t_read0 = std::chrono::steady_clock::now();
-            if (!one_direct_manifest_read_entry(&e, h_tmp, (size_t) e.nbytes)) {
-                g_one_direct_hot_pool.read_failures++;
-                continue;
-            }
-            const auto t_read1 = std::chrono::steady_clock::now();
-            g_one_direct_hot_pool.read_elapsed_ms +=
-                std::chrono::duration<double, std::milli>(t_read1 - t_read0).count();
-            void * dst = (char *) g_one_direct_hot_pool.pool + (size_t) i * g_one_direct_hot_pool.slot_sz;
-            if (!one_direct_hot_pool_copy_entry(e, h_tmp, dst, d_stage, st, have_stream)) {
-                if (g_one_direct_hot_pool.transposed) {
-                    g_one_direct_hot_pool.transform_failures++;
-                } else {
-                    g_one_direct_hot_pool.copy_failures++;
-                }
-                continue;
-            }
-            g_one_direct_hot_pool.slot_entries[(size_t) i] = e;
-            g_one_direct_hot_pool.inserted++;
-            g_one_direct_hot_pool.bytes += e.nbytes;
-        }
-    }
 
-    if (d_stage) {
-        cudaFree(d_stage);
-    }
-    if (have_stream) {
-        cudaStreamDestroy(st);
-    }
-    if (h_tmp_pinned) {
-        cudaFreeHost(h_tmp);
-    } else {
-        std::free(h_tmp);
-    }
-
-    const auto t1 = std::chrono::steady_clock::now();
-    g_one_direct_hot_pool.prefill_elapsed_ms =
-        std::chrono::duration<double, std::milli>(t1 - t0).count();
-    g_one_direct_hot_pool.async_done.store(true, std::memory_order_release);
-    std::fprintf(stderr,
-        "[moe_stream] one direct hot pool: async prefill completed attempted=%lu inserted=%lu bytes=%lu"
-        " elapsed_ms=%.3f read_ms=%.3f h2d_ms=%.3f transform_ms=%.3f transposed=%d\n",
-        g_one_direct_hot_pool.attempted,
-        g_one_direct_hot_pool.inserted,
-        g_one_direct_hot_pool.bytes,
-        g_one_direct_hot_pool.prefill_elapsed_ms,
-        g_one_direct_hot_pool.read_elapsed_ms,
-        g_one_direct_hot_pool.h2d_elapsed_ms,
-        g_one_direct_hot_pool.transform_elapsed_ms,
-        g_one_direct_hot_pool.transposed ? 1 : 0);
-}
-
-static void one_direct_hot_pool_prefill_maybe(slot_ctx & ctx, cudaStream_t st) {
-    one_direct_hot_pool_init_once();
-    std::lock_guard<std::mutex> lk(g_one_direct_hot_pool.mu);
-    if (g_one_direct_hot_pool.prefill_done || !g_one_direct_hot_pool.enabled) {
-        return;
-    }
-
-    uint64_t limit = one_direct_hot_pool_env_u64("GGML_MOE_STREAM_ONE_DIRECT_PREFILL_LIMIT", 0);
-    if (limit == 0) {
-        return;
-    }
-    g_one_direct_hot_pool.prefill_done = true;
-    if (limit > (uint64_t) g_one_direct_hot_pool.n_slots) {
-        limit = (uint64_t) g_one_direct_hot_pool.n_slots;
-    }
-    const std::vector<one_expert_pack_entry> & prefill_entries =
-        g_one_direct_manifest.prefill_entries.empty() ? g_one_direct_manifest.entries : g_one_direct_manifest.prefill_entries;
-    if (limit > (uint64_t) prefill_entries.size()) {
-        limit = (uint64_t) prefill_entries.size();
-    }
-
-    if (one_direct_hot_pool_async_prefill_enabled()) {
-        g_one_direct_hot_pool.async_started.store(true, std::memory_order_release);
-        g_one_direct_hot_pool.async_done.store(false, std::memory_order_release);
-        g_one_direct_hot_pool.async_thread = std::thread(one_direct_hot_pool_prefill_worker, limit);
-        std::fprintf(stderr,
-            "[moe_stream] one direct hot pool: async prefill started limit=%lu\n",
-            limit);
-        return;
-    }
-
-    if (!ensure_host_pinned(ctx.h_src0_pack, ctx.h_src0_pack_sz, g_one_direct_hot_pool.slot_sz)) {
-        g_one_direct_hot_pool.read_failures += limit;
-        return;
-    }
-
-    void * d_stage = nullptr;
-    if (g_one_direct_hot_pool.transposed) {
-        if (cudaMalloc(&d_stage, g_one_direct_hot_pool.slot_sz) != cudaSuccess) {
-            g_one_direct_hot_pool.transform_failures += limit;
-            return;
-        }
-    }
-
-    const auto t0 = std::chrono::steady_clock::now();
-    for (uint64_t i = 0; i < limit; ++i) {
-        const one_expert_pack_entry & e = prefill_entries[(size_t) i];
-        g_one_direct_hot_pool.attempted++;
-        if (e.nbytes > g_one_direct_hot_pool.slot_sz) {
-            g_one_direct_hot_pool.read_failures++;
-            continue;
-        }
-        const auto t_read0 = std::chrono::steady_clock::now();
-        if (!one_direct_manifest_read_entry(&e, ctx.h_src0_pack, (size_t) e.nbytes)) {
-            g_one_direct_hot_pool.read_failures++;
-            continue;
-        }
-        const auto t_read1 = std::chrono::steady_clock::now();
-        g_one_direct_hot_pool.read_elapsed_ms +=
-            std::chrono::duration<double, std::milli>(t_read1 - t_read0).count();
-        void * dst = (char *) g_one_direct_hot_pool.pool + (size_t) i * g_one_direct_hot_pool.slot_sz;
-        if (!one_direct_hot_pool_copy_entry(e, ctx.h_src0_pack, dst, d_stage, st, true)) {
-            if (g_one_direct_hot_pool.transposed) {
-                g_one_direct_hot_pool.transform_failures++;
-            } else {
-                g_one_direct_hot_pool.copy_failures++;
-            }
-            continue;
-        }
-        g_one_direct_hot_pool.slot_entries[(size_t) i] = e;
-        g_one_direct_hot_pool.inserted++;
-        g_one_direct_hot_pool.bytes += e.nbytes;
-    }
-    if (d_stage) {
-        cudaFree(d_stage);
-    }
-    if (cudaStreamSynchronize(st) != cudaSuccess) {
-        g_one_direct_hot_pool.copy_failures++;
-    }
-    const auto t1 = std::chrono::steady_clock::now();
-    g_one_direct_hot_pool.prefill_elapsed_ms =
-        std::chrono::duration<double, std::milli>(t1 - t0).count();
-    std::fprintf(stderr,
-        "[moe_stream] one direct hot pool: prefill attempted=%lu inserted=%lu bytes=%lu"
-        " elapsed_ms=%.3f read_ms=%.3f h2d_ms=%.3f transform_ms=%.3f transposed=%d\n",
-        g_one_direct_hot_pool.attempted,
-        g_one_direct_hot_pool.inserted,
-        g_one_direct_hot_pool.bytes,
-        g_one_direct_hot_pool.prefill_elapsed_ms,
-        g_one_direct_hot_pool.read_elapsed_ms,
-        g_one_direct_hot_pool.h2d_elapsed_ms,
-        g_one_direct_hot_pool.transform_elapsed_ms,
-        g_one_direct_hot_pool.transposed ? 1 : 0);
-}
 
 struct one_prefill_entry {
     std::string tensor;
@@ -7570,89 +7179,11 @@ struct one_prefill_state {
 
 static one_prefill_state g_one_prefill;
 
-static void one_prefill_report_atexit() {
-    if (!g_one_prefill.enabled && g_one_prefill.attempted == 0) {
-        return;
-    }
-    std::fprintf(stderr,
-        "[moe_stream] one prefill: enabled=%d loaded=%zu limit=%zu attempted=%lu inserted=%lu"
-        " pack_misses=%lu read_failures=%lu bytes=%lu elapsed_ms=%.3f\n",
-        g_one_prefill.enabled ? 1 : 0,
-        g_one_prefill.entries.size(),
-        g_one_prefill.limit,
-        g_one_prefill.attempted,
-        g_one_prefill.inserted,
-        g_one_prefill.pack_misses,
-        g_one_prefill.read_failures,
-        g_one_prefill.bytes,
-        g_one_prefill.elapsed_ms);
-}
 
-static void one_prefill_init_once_locked() {
-    if (g_one_prefill.initialized) {
-        return;
-    }
-    g_one_prefill.initialized = true;
 
-    const char * path = std::getenv("GGML_MOE_STREAM_ONE_PREFILL_PROFILE");
-    if (!path || !path[0]) {
-        return;
-    }
 
-    const char * limit_env = std::getenv("GGML_MOE_STREAM_ONE_PREFILL_LIMIT");
-    g_one_prefill.limit = (limit_env && limit_env[0]) ? (size_t) std::strtoull(limit_env, nullptr, 10) : 0;
 
-    FILE * fp = std::fopen(path, "r");
-    if (!fp) {
-        std::fprintf(stderr, "[moe_stream] one prefill: failed to open profile %s\n", path);
-        return;
-    }
 
-    char line[4096];
-    while (std::fgets(line, sizeof(line), fp)) {
-        char tensor[3072];
-        long long expert = -1;
-        long long score = 0;
-        const int n = std::sscanf(line, "%3071[^\t]\t%lld\t%lld", tensor, &expert, &score);
-        if (n >= 2 && expert >= 0) {
-            one_prefill_entry e;
-            e.tensor = tensor;
-            e.expert = expert;
-            e.score = (n >= 3) ? score : 0;
-            g_one_prefill.entries.push_back(std::move(e));
-        }
-    }
-    std::fclose(fp);
-
-    std::sort(g_one_prefill.entries.begin(), g_one_prefill.entries.end(),
-        [](const one_prefill_entry & a, const one_prefill_entry & b) {
-            if (a.score != b.score) {
-                return a.score > b.score;
-            }
-            const int name_cmp = std::strcmp(a.tensor.c_str(), b.tensor.c_str());
-            if (name_cmp != 0) {
-                return name_cmp < 0;
-            }
-            return a.expert < b.expert;
-        });
-
-    if (g_one_prefill.limit == 0 || g_one_prefill.limit > g_one_prefill.entries.size()) {
-        g_one_prefill.limit = g_one_prefill.entries.size();
-    }
-    g_one_prefill.enabled = !g_one_prefill.entries.empty();
-    if (g_one_prefill.enabled && !g_one_prefill.registered) {
-        g_one_prefill.registered = true;
-        std::atexit(one_prefill_report_atexit);
-    }
-    std::fprintf(stderr, "[moe_stream] one prefill: loaded %zu entries from %s limit=%zu\n",
-            g_one_prefill.entries.size(), path, g_one_prefill.limit);
-}
-
-static bool one_prefill_enabled() {
-    std::lock_guard<std::mutex> lk(g_one_prefill.mu);
-    one_prefill_init_once_locked();
-    return g_one_prefill.enabled;
-}
 
 static uintptr_t one_named_cache_key(const char * tensor, int64_t expert) {
     uint64_t h = 1469598103934665603ULL;
@@ -9505,67 +9036,7 @@ extern "C" bool ggml_cuda_moe_stream_one_cache_ready(void) {
     return g_vcache_inited && g_vcache.pool && g_vcache.n_slots > 0;
 }
 
-static void one_prefill_maybe(slot_ctx & ctx, cudaStream_t st, size_t src0_bytes) {
-    if (!one_prefill_key_mode_enabled() || !one_prefill_enabled()) {
-        return;
-    }
 
-    std::lock_guard<std::mutex> lk(g_one_prefill.mu);
-    if (g_one_prefill.done || !g_one_prefill.enabled || !g_vcache.pool || g_vcache.n_slots <= 0) {
-        return;
-    }
-    g_one_prefill.done = true;
-
-    size_t n = g_one_prefill.limit;
-    if (n > (size_t) g_vcache.n_slots) {
-        n = (size_t) g_vcache.n_slots;
-    }
-    if (n > g_one_prefill.entries.size()) {
-        n = g_one_prefill.entries.size();
-    }
-
-    {
-        std::lock_guard<std::mutex> rk(g_resize_mu);
-        if (!ensure_host_pinned(ctx.h_src0_pack, ctx.h_src0_pack_sz, src0_bytes)) {
-            g_one_prefill.read_failures += n;
-            return;
-        }
-    }
-
-    const auto t0 = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < n; ++i) {
-        const one_prefill_entry & e = g_one_prefill.entries[i];
-        g_one_prefill.attempted++;
-        const one_expert_pack_entry * pack_entry = one_pack_lookup(e.tensor.c_str(), e.expert, src0_bytes);
-        if (!pack_entry) {
-            g_one_prefill.pack_misses++;
-            continue;
-        }
-        if (!one_pack_read_entry(pack_entry, ctx.h_src0_pack, src0_bytes)) {
-            g_one_prefill.read_failures++;
-            continue;
-        }
-        const uintptr_t key = one_named_cache_key(e.tensor.c_str(), e.expert);
-        if (vram_cache_insert_impl(key, ctx.h_src0_pack, src0_bytes, st, false, e.tensor.c_str())) {
-            g_one_prefill.inserted++;
-            g_one_prefill.bytes += src0_bytes;
-        } else {
-            g_one_prefill.read_failures++;
-        }
-    }
-    if (cudaStreamSynchronize(st) != cudaSuccess) {
-        g_one_prefill.read_failures++;
-    }
-    const auto t1 = std::chrono::steady_clock::now();
-    g_one_prefill.elapsed_ms =
-        std::chrono::duration<double, std::milli>(t1 - t0).count();
-    std::fprintf(stderr,
-        "[moe_stream] one prefill: completed attempted=%lu inserted=%lu bytes=%lu elapsed_ms=%.3f\n",
-        g_one_prefill.attempted,
-        g_one_prefill.inserted,
-        g_one_prefill.bytes,
-        g_one_prefill.elapsed_ms);
-}
 
 struct one_trace_state {
     std::mutex mu;
@@ -9693,159 +9164,25 @@ static bool one_stage_profile_enabled() {
     return enabled;
 }
 
-static bool one_stage_profile_events_init(slot_ctx & ctx) {
-    if (ctx.profile_weight_start) return true;
-    cudaEvent_t * events[] = {
-        &ctx.profile_weight_start,
-        &ctx.profile_weight_done,
-        &ctx.profile_input_done,
-        &ctx.profile_kernel_done,
-        &ctx.profile_d2h_done,
-    };
-    for (cudaEvent_t * event : events) {
-        if (cudaEventCreate(event) != cudaSuccess) {
-            cudaGetLastError();
-            return false;
-        }
-    }
-    return true;
-}
-
-static double trace_elapsed_ms(std::chrono::steady_clock::time_point t) {
-    return std::chrono::duration<double, std::milli>(t - g_one_trace.start).count();
-}
 
 
-static bool gate_updown_cosubmit_profile_enabled() {
-    const char *path = std::getenv("GGML_MOE_GATE_UPDOWN_COSUBMIT_PROFILE_OUT");
-    return path && path[0];
-}
+
+
+
+
 
 static bool gate_updown_cosubmit_enabled() {
     const char *env = std::getenv("GGML_MOE_GATE_UPDOWN_COSUBMIT");
     return env && env[0] && env[0] != '0';
 }
 
-static uint64_t gate_updown_profile_now_us() {
-    return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-}
 
-static void gate_updown_cosubmit_profile_write(
-        const char *phase,
-        const char *tensor,
-        const char *pair_tensor,
-        int64_t expert,
-        size_t expert_bytes,
-        int64_t n_active,
-        uint64_t active_hash,
-        int cache_hit,
-        int cache_inserted,
-        int cache_hits,
-        int cache_misses,
-        int pack_hit,
-        int pack_hits,
-        int pack_misses,
-        double src0_ms,
-        double total_ms) {
-    const char *path = std::getenv("GGML_MOE_GATE_UPDOWN_COSUBMIT_PROFILE_OUT");
-    if (!path || !path[0]) return;
-    static std::mutex mu;
-    static bool header = false;
-    std::lock_guard<std::mutex> lk(mu);
-    FILE *f = std::fopen(path, "a");
-    if (!f) return;
-    if (!header) {
-        std::fprintf(f,
-                "phase,time_us,tensor,pair_tensor,expert,expert_bytes,n_active,active_hash,"
-                "cache_hit,cache_inserted,cache_hits,cache_misses,pack_hit,pack_hits,pack_misses,src0_ms,total_ms\n");
-        header = true;
-    }
-    std::fprintf(f,
-            "%s,%lu,%s,%s,%ld,%lu,%ld,%lu,%d,%d,%d,%d,%d,%d,%d,%.6f,%.6f\n",
-            phase ? phase : "",
-            (unsigned long)gate_updown_profile_now_us(),
-            tensor ? tensor : "",
-            pair_tensor ? pair_tensor : "",
-            (long)expert,
-            (unsigned long)expert_bytes,
-            (long)n_active,
-            (unsigned long)active_hash,
-            cache_hit,
-            cache_inserted,
-            cache_hits,
-            cache_misses,
-            pack_hit,
-            pack_hits,
-            pack_misses,
-            src0_ms,
-            total_ms);
-    std::fclose(f);
-}
 
-static FILE * one_trace_fp_locked(std::chrono::steady_clock::time_point start_time) {
-    if (!g_one_trace.initialized) {
-        g_one_trace.initialized = true;
-        g_one_trace.start = start_time;
-        const char * path = std::getenv("GGML_MOE_STREAM_ONE_TRACE_OUT");
-        if (path && path[0]) {
-            g_one_trace.fp = std::fopen(path, "w");
-            if (g_one_trace.fp) {
-                std::setvbuf(g_one_trace.fp, nullptr, _IOLBF, 0);
-                std::fprintf(g_one_trace.fp,
-                    "seq,t_ms,tensor,expert,src0_ptr,src0_bytes,cne1,cache_hit,cache_inserted,slot,src0_ms,src1_ms,kernel_ms,d2h_ms,sync_ms,scatter_ms,dontneed_ms,total_ms\n");
-            } else {
-                std::fprintf(stderr, "[moe_stream] failed to open one trace: %s\n", path);
-            }
-        }
-    }
-    return g_one_trace.fp;
-}
 
-static void one_trace_write(
-    const char * src0_name,
-    int64_t expert_index,
-    const void * src0_data,
-    size_t src0_bytes,
-    int64_t cne1,
-    bool cache_hit,
-    bool cache_inserted,
-    int slot,
-    std::chrono::steady_clock::time_point t0,
-    std::chrono::steady_clock::time_point t_src0,
-    std::chrono::steady_clock::time_point t_src1,
-    std::chrono::steady_clock::time_point t_kernel,
-    std::chrono::steady_clock::time_point t_d2h,
-    std::chrono::steady_clock::time_point t_sync,
-    std::chrono::steady_clock::time_point t_scatter,
-    std::chrono::steady_clock::time_point t_dontneed) {
-    std::lock_guard<std::mutex> lk(g_one_trace.mu);
-    FILE * fp = one_trace_fp_locked(t0);
-    if (!fp) {
-        return;
-    }
-    const uint64_t seq = g_one_trace.seq.fetch_add(1, std::memory_order_relaxed);
-    std::fprintf(fp,
-        "%lu,%.3f,%s,%ld,%p,%zu,%ld,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-        (unsigned long) seq,
-        trace_elapsed_ms(t0),
-        src0_name ? src0_name : "",
-        (long) expert_index,
-        src0_data,
-        src0_bytes,
-        (long) cne1,
-        cache_hit ? 1 : 0,
-        cache_inserted ? 1 : 0,
-        slot,
-        std::chrono::duration<double, std::milli>(t_src0 - t0).count(),
-        std::chrono::duration<double, std::milli>(t_src1 - t_src0).count(),
-        std::chrono::duration<double, std::milli>(t_kernel - t_src1).count(),
-        std::chrono::duration<double, std::milli>(t_d2h - t_kernel).count(),
-        std::chrono::duration<double, std::milli>(t_sync - t_d2h).count(),
-        std::chrono::duration<double, std::milli>(t_scatter - t_sync).count(),
-        std::chrono::duration<double, std::milli>(t_dontneed - t_scatter).count(),
-        std::chrono::duration<double, std::milli>(t_dontneed - t0).count());
-}
+
+
+
+
 
 struct sparse_graph_probe_state {
     std::mutex mu;
@@ -9856,173 +9193,21 @@ struct sparse_graph_probe_state {
 
 static sparse_graph_probe_state g_sparse_graph_probe;
 
-static bool sparse_graph_probe_enabled() {
-    static int enabled = [] {
-        const char * env = std::getenv("DS4_SPARSE_PAIR_GRAPH_PROBE");
-        return (env && env[0] && env[0] != '0') ? 1 : 0;
-    }();
-    return enabled != 0;
-}
 
-static const char * sparse_graph_probe_role(const char * name) {
-    if (!name) {
-        return "other";
-    }
-    if (std::strstr(name, "ffn_gate_exps") != nullptr) {
-        return "gate";
-    }
-    if (std::strstr(name, "ffn_up_exps") != nullptr) {
-        return "up";
-    }
-    if (std::strstr(name, "ffn_down_exps") != nullptr) {
-        return "down";
-    }
-    return "other";
-}
 
-static FILE * sparse_graph_probe_fp_locked() {
-    if (!g_sparse_graph_probe.initialized) {
-        g_sparse_graph_probe.initialized = true;
-        if (sparse_graph_probe_enabled()) {
-            const char * path = std::getenv("DS4_SPARSE_PAIR_GRAPH_PROBE_OUT");
-            const char * profile = std::getenv("DS4_SPARSE_PAIR_PROFILE_JSON");
-            if (path && path[0]) {
-                g_sparse_graph_probe.fp = std::fopen(path, "w");
-                if (g_sparse_graph_probe.fp) {
-                    std::setvbuf(g_sparse_graph_probe.fp, nullptr, _IOLBF, 0);
-                    std::fprintf(g_sparse_graph_probe.fp,
-                        "seq,tensor_role,tensor,expert,cne1,src0_bytes,src1_f32_bytes,dst_bytes,"
-                        "src0_from_cache,src0_cache_inserted,slot,deferred_sync,src1_h2d_bytes,dst_d2h_bytes,"
-                        "scatter_to_cpu,retains_gpu_output,returns_gpu_handle,zero_transfer_ready,"
-                        "kernel_src0_ptr,d_src1_f32_ptr,d_dst_ptr,h_scratch_ptr,dst_host_ptr\n");
-                    std::fprintf(stderr,
-                        "[moe_stream] sparse graph probe enabled out=%s profile=%s\n",
-                        path, (profile && profile[0]) ? profile : "");
-                } else {
-                    std::fprintf(stderr, "[moe_stream] failed to open sparse graph probe: %s\n", path);
-                }
-            }
-        }
-    }
-    return g_sparse_graph_probe.fp;
-}
 
-static void sparse_graph_probe_write(
-    const char * src0_name,
-    int64_t expert_index,
-    int64_t cne1,
-    size_t src0_bytes,
-    size_t src1_f32_bytes,
-    size_t dst_bytes,
-    bool cache_hit,
-    bool cache_inserted,
-    int slot,
-    bool deferred_sync,
-    const void * kernel_src0,
-    const void * d_src1_f32,
-    const void * d_dst,
-    const void * h_scratch,
-    const void * dst_host) {
-    if (!sparse_graph_probe_enabled()) {
-        return;
-    }
 
-    std::lock_guard<std::mutex> lk(g_sparse_graph_probe.mu);
-    FILE * fp = sparse_graph_probe_fp_locked();
-    if (!fp) {
-        return;
-    }
 
-    const bool src1_h2d = src1_f32_bytes > 0;
-    const bool dst_d2h = dst_bytes > 0;
-    const bool scatter_to_cpu = true;
-    const bool retains_gpu_output = false;
-    const bool returns_gpu_handle = false;
-    const bool zero_transfer_ready =
-        !src1_h2d && !dst_d2h && !scatter_to_cpu && retains_gpu_output && returns_gpu_handle;
-    const uint64_t seq = g_sparse_graph_probe.seq.fetch_add(1, std::memory_order_relaxed);
 
-    std::fprintf(fp,
-        "%" PRIu64 ",%s,%s,%" PRId64 ",%" PRId64 ",%zu,%zu,%zu,%d,%d,%d,%d,%zu,%zu,%d,%d,%d,%d,%p,%p,%p,%p,%p\n",
-        seq,
-        sparse_graph_probe_role(src0_name),
-        src0_name ? src0_name : "",
-        expert_index,
-        cne1,
-        src0_bytes,
-        src1_f32_bytes,
-        dst_bytes,
-        cache_hit ? 1 : 0,
-        cache_inserted ? 1 : 0,
-        slot,
-        deferred_sync ? 1 : 0,
-        src1_h2d ? src1_f32_bytes : (size_t) 0,
-        dst_d2h ? dst_bytes : (size_t) 0,
-        scatter_to_cpu ? 1 : 0,
-        retains_gpu_output ? 1 : 0,
-        returns_gpu_handle ? 1 : 0,
-        zero_transfer_ready ? 1 : 0,
-        kernel_src0,
-        d_src1_f32,
-        d_dst,
-        h_scratch,
-        dst_host);
-}
 
-static bool moe_stream_one_experimental_ds4_enabled() {
-    static int enabled = [] {
-        const char * env = std::getenv("GGML_MOE_STREAM_ONE_EXPERIMENTAL_DS4");
-        return env && env[0] && env[0] != '0';
-    }();
-    return enabled != 0;
-}
 
-static bool moe_stream_one_ds4_nonids_enabled() {
-    static int enabled = [] {
-        const char * env = std::getenv("GGML_MOE_STREAM_ONE_DS4_NONIDS");
-        return env && env[0] && env[0] != '0';
-    }();
-    return enabled != 0;
-}
 
-static bool moe_stream_name_filter_matches_any(const char * filter, const char * name) {
-    if (!filter || !filter[0] || !name) {
-        return false;
-    }
 
-    const char * p = filter;
-    while (*p) {
-        while (*p == ' ' || *p == '\t' || *p == ',' || *p == ':') {
-            ++p;
-        }
-        const char * start = p;
-        while (*p && *p != ',' && *p != ':') {
-            ++p;
-        }
-        const char * end = p;
-        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
-            --end;
-        }
-        const size_t len = (size_t) (end - start);
-        if (len > 0) {
-            for (const char * hit = name; *hit; ++hit) {
-                if (std::strncmp(hit, start, len) == 0) {
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
-}
 
-static bool moe_stream_one_name_filter_allows(const char * name) {
 
-    static const char * filter = std::getenv("GGML_MOE_STREAM_ONE_NAME_FILTER");
-    if (!filter || !filter[0]) {
-        return true;
-    }
-    return moe_stream_name_filter_matches_any(filter, name);
-}
+
+
+
 
 static const int8_t moe_stream_mxfp4_values[16] = {
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
@@ -10042,119 +9227,9 @@ static bool moe_stream_q80_cpu_compat_enabled() {
     return enabled != 0;
 }
 
-static FILE * moe_stream_q8_debug_fp() {
-    static FILE * fp = nullptr;
-    static int initialized = 0;
-    static std::mutex mu;
 
-    std::lock_guard<std::mutex> lk(mu);
-    if (!initialized) {
-        initialized = 1;
-        const char * path = std::getenv("GGML_MOE_STREAM_Q8_DEBUG_OUT");
-        if (path && path[0]) {
-            fp = std::fopen(path, "w");
-            if (fp) {
-                std::setvbuf(fp, nullptr, _IOLBF, 0);
-                std::fprintf(fp,
-                    "tensor,expert,row_id,i12,out_col,block,gpu_q81_part,gpu_q81_total,gpu_value,d_q,e,sumi_q81\n");
-            } else {
-                std::fprintf(stderr, "[moe_stream_q8_debug] failed to open trace: %s\n", path);
-            }
-        }
-    }
-    return fp;
-}
 
-static void moe_stream_q8_debug_maybe(
-    const char * src0_name,
-    int64_t expert_index,
-    const void * src0_data,
-    int64_t ne00,
-    size_t nb01,
-    const void * d_src1_q8,
-    const void * d_dst,
-    int64_t src1_padded,
-    int64_t ne01,
-    int64_t cne1,
-    const ggml_moe_row_mapping * rows,
-    cudaStream_t st) {
-    FILE * fp = moe_stream_q8_debug_fp();
-    if (!fp || !src0_data || !d_src1_q8 || !d_dst || !rows) {
-        return;
-    }
 
-    const int target_expert = moe_stream_env_int("GGML_MOE_STREAM_Q8_DEBUG_EXPERT", -1);
-    const int target_row    = moe_stream_env_int("GGML_MOE_STREAM_Q8_DEBUG_ROW", -1);
-    const int target_i12    = moe_stream_env_int("GGML_MOE_STREAM_Q8_DEBUG_I12", -1);
-    const int target_col    = moe_stream_env_int("GGML_MOE_STREAM_Q8_DEBUG_COL", -1);
-    if (target_expert >= 0 && expert_index != target_expert) {
-        return;
-    }
-    if (target_col < 0 || target_col >= ne01) {
-        return;
-    }
-
-    int64_t target_k = -1;
-    for (int64_t k = 0; k < cne1; ++k) {
-        if ((target_row < 0 || rows[k].i1 == target_row) && (target_i12 < 0 || rows[k].i2 == target_i12)) {
-            target_k = k;
-            break;
-        }
-    }
-    if (target_k < 0) {
-        return;
-    }
-
-    const size_t src1_q8_row_bytes = (size_t)(src1_padded / QK8_1) * sizeof(block_q8_1);
-    std::vector<uint8_t> q8_row(src1_q8_row_bytes);
-    float gpu_value = 0.0f;
-    const char * d_q8_row = (const char *) d_src1_q8 + (size_t) target_k * src1_q8_row_bytes;
-    const float * d_dst_value = (const float *) d_dst + (size_t) target_k * ne01 + (size_t) target_col;
-
-    if (cudaMemcpyAsync(q8_row.data(), d_q8_row, src1_q8_row_bytes, cudaMemcpyDeviceToHost, st) != cudaSuccess) {
-        return;
-    }
-    if (cudaMemcpyAsync(&gpu_value, d_dst_value, sizeof(float), cudaMemcpyDeviceToHost, st) != cudaSuccess) {
-        return;
-    }
-    if (cudaStreamSynchronize(st) != cudaSuccess) {
-        return;
-    }
-
-    const block_q8_1 * y = (const block_q8_1 *) q8_row.data();
-    const block_mxfp4 * x = (const block_mxfp4 *) ((const char *) src0_data + (size_t) target_col * nb01);
-    const int64_t nb = ne00 / QK_MXFP4;
-    double total = 0.0;
-
-    flockfile(fp);
-    for (int64_t ib = 0; ib < nb; ++ib) {
-        int sumi = 0;
-        for (int j = 0; j < QK_MXFP4/2; ++j) {
-            const int v0 = moe_stream_mxfp4_values[x[ib].qs[j] & 0x0F];
-            const int v1 = moe_stream_mxfp4_values[x[ib].qs[j] >> 4];
-            sumi += y[ib].qs[j] * v0;
-            sumi += y[ib].qs[j + QK_MXFP4/2] * v1;
-        }
-        const float d_q = __low2float(y[ib].ds);
-        const double part = (double) GGML_E8M0_TO_FP32_HALF(x[ib].e) * (double) d_q * (double) sumi;
-        total += part;
-        std::fprintf(fp,
-            "%s,%" PRId64 ",%d,%d,%d,%" PRId64 ",%.9g,%.9g,%.9g,%.9g,%d,%d\n",
-            src0_name ? src0_name : "",
-            expert_index,
-            rows[target_k].i1,
-            rows[target_k].i2,
-            target_col,
-            ib,
-            part,
-            total,
-            (double) gpu_value,
-            (double) d_q,
-            (int) x[ib].e,
-            sumi);
-    }
-    funlockfile(fp);
-}
 
 static FILE * moe_stream_q80_probe_fp() {
     static FILE * fp = nullptr;
@@ -12106,71 +11181,13 @@ extern "C" bool ggml_cuda_moe_stream_q80_skip(
     return ok;
 }
 
-static bool moe_stream_one_type_allowed(ggml_type type, const char * name) {
-    if (type == GGML_TYPE_BF16 || type == GGML_TYPE_F16) {
-        const char * flag = std::getenv("GGML_MOE_STREAM_FLOAT");
-        return flag && flag[0] && flag[0] != '0' && moe_stream_one_name_filter_allows(name);
-    }
-    if (type == GGML_TYPE_Q8_0) {
-        const char * q8 = std::getenv("GGML_MOE_STREAM_Q8_0");
-        return q8 && q8[0] && q8[0] != '0' && moe_stream_one_name_filter_allows(name);
-    }
-    if (type == GGML_TYPE_IQ3_XXS) {
-        return moe_stream_one_name_filter_allows(name);
-    }
-    if (type == GGML_TYPE_Q4_K) {
-        const char * env = std::getenv("GGML_MOE_STREAM_ONE_Q4K");
-        return env && env[0] && env[0] != '0' && moe_stream_one_name_filter_allows(name);
-    }
-    if (!moe_stream_one_experimental_ds4_enabled()) {
-        return false;
-    }
-    if (type != GGML_TYPE_MXFP4) {
-        return false;
-    }
-    return moe_stream_one_name_filter_allows(name);
-}
 
-static bool ensure_dev(void *&p, size_t &cur, size_t need) {
-    if (cur >= need) return true;
-    if (p) cudaFree(p);
-    p = nullptr; cur = 0;
-    if (cudaMalloc(&p, need) != cudaSuccess) return false;
-    cur = need;
-    return true;
-}
 
-static bool ensure_host_pinned(void *&p, size_t &cur, size_t need) {
-    if (cur >= need) return true;
-    if (p) cudaFreeHost(p);
-    p = nullptr; cur = 0;
-    if (cudaHostAlloc(&p, need, cudaHostAllocDefault) != cudaSuccess) return false;
-    cur = need;
-    return true;
-}
 
-static void init_once() {
-    if (g_inited.load(std::memory_order_acquire)) return;
-    std::lock_guard<std::mutex> lk(g_init_mu);
-    if (g_inited.load(std::memory_order_acquire)) return;
 
-    const char *env = std::getenv("GGML_MOE_STREAM");
-    bool enabled = env && env[0] && env[0] != '0';
-    const char *defer_env = std::getenv("GGML_MOE_STREAM_DEFER");
-    g_defer_sync = defer_env && defer_env[0] && defer_env[0] != '0';
-    if (enabled && cudaSetDevice(0) == cudaSuccess) {
-        bool ok = true;
-        for (int i = 0; i < MOE_STREAM_NSLOTS; ++i) {
-            if (cudaStreamCreate(&g_slots[i].stream) != cudaSuccess) { ok = false; break; }
-        }
-        if (ok) {
-            g_avail.store(true, std::memory_order_release);
-            std::fprintf(stderr, "[moe_stream] enabled (%d streams, GPU expert compute, defer_sync=%d)\n",
-                         MOE_STREAM_NSLOTS, g_defer_sync ? 1 : 0);
-        }
-    }
-    g_inited.store(true, std::memory_order_release);
-}
+
+
+
 
 extern "C" bool ggml_cuda_moe_stream_available(void) {
     // The opt-in runtime streaming compute path is retired.
@@ -12195,21 +11212,7 @@ static void flush_deferred_scatter();
 
 // Acquire a slot via test-and-set on per-slot flag; flush deferred work if this
 // thread filled all stream slots before the CPU-side op-level sync point.
-static int acquire_slot() {
-    for (;;) {
-        for (int attempt = 0; attempt < 1024; ++attempt) {
-            int s = g_slot_rr.fetch_add(1, std::memory_order_relaxed) & (MOE_STREAM_NSLOTS - 1);
-            if (!g_slots[s].in_use.test_and_set(std::memory_order_acquire)) {
-                return s;
-            }
-        }
-        if (g_defer_sync && !tls_pending.empty()) {
-            flush_deferred_scatter();
-            continue;
-        }
-        std::this_thread::yield();
-    }
-}
+
 
 static void release_slot(int s) {
     g_slots[s].in_use.clear(std::memory_order_release);

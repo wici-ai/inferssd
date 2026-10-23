@@ -144,17 +144,7 @@ std::atomic<uint64_t> g_decode_batch_descriptor_fallback_batches{0};
 std::atomic<uint64_t> g_decode_batch_descriptor_fallback_routes{0};
 std::atomic<bool> g_decode_batch_lifecycle_registered{false};
 
-static void decode_batch_lifecycle_report() {
-    std::fprintf(stderr,
-        "[moe_stream_decode_batch] descriptor lifecycle: batches=%lu "
-        "descriptor_batches=%lu fallback_batches=%lu fallback_routes=%lu "
-        "staged_routes=%lu\n",
-        (unsigned long)g_decode_batch_calls.load(std::memory_order_relaxed),
-        (unsigned long)g_decode_batch_descriptor_batches.load(std::memory_order_relaxed),
-        (unsigned long)g_decode_batch_descriptor_fallback_batches.load(std::memory_order_relaxed),
-        (unsigned long)g_decode_batch_descriptor_fallback_routes.load(std::memory_order_relaxed),
-        (unsigned long)g_decode_batch_staged.load(std::memory_order_relaxed));
-}
+
 
 struct decode_batch_profile_role {
     std::atomic<uint64_t> calls{0};
