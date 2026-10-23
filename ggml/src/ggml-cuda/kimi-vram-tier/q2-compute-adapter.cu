@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
 #include <stdexcept>
@@ -66,6 +67,8 @@ struct q2_engine {
     uint64_t calls = 0;
     uint64_t hits = 0;
     double total_us = 0.0;
+    bool poisoned = false;
+    bool closed = false;
 
     q2_engine(int device_, int latent_, int hidden_, int max_hits_, int weight_type, int down_type) :
         device(device_), latent(latent_), hidden(hidden_), max_hits(max_hits_) {
@@ -116,21 +119,34 @@ struct q2_engine {
     }
 
     void close() noexcept {
-        if (device >= 0) {
-            (void) cudaSetDevice(device);
+        if (closed) { return; }
+        closed = true;
+        const auto checked = [](cudaError_t rc, const char * operation) noexcept {
+            if (rc != cudaSuccess) {
+                std::fprintf(stderr, "fatal: Q2 VRAM engine cannot release ownership: %s: %s\n",
+                    operation, cudaGetErrorString(rc));
+                std::abort();
+            }
+        };
+        if (stream || device_input || device_up_gate || device_hidden || device_down || device_q8 || host_input || host_down) {
+            checked(cudaSetDevice(device), "cudaSetDevice during close");
         }
-        if (stream) {
-            (void) cudaStreamSynchronize(stream);
+        if (stream) { checked(cudaStreamSynchronize(stream), "compute drain during close"); }
+        if (host_down)  { checked(cudaFreeHost(host_down), "free host down"); host_down = nullptr; }
+        if (host_input) { checked(cudaFreeHost(host_input), "free host input"); host_input = nullptr; }
+        if (device_q8)      { checked(cudaFree(device_q8), "free Q8 scratch"); device_q8 = nullptr; }
+        if (device_down)    { checked(cudaFree(device_down), "free device down"); device_down = nullptr; }
+        if (device_hidden)  { checked(cudaFree(device_hidden), "free device hidden"); device_hidden = nullptr; }
+        if (device_up_gate) { checked(cudaFree(device_up_gate), "free device up/gate"); device_up_gate = nullptr; }
+        if (device_input)   { checked(cudaFree(device_input), "free device input"); device_input = nullptr; }
+        if (stream) { checked(cudaStreamDestroy(stream), "destroy compute stream"); stream = nullptr; }
+        if (backend_handle) {
+            if (dlclose(backend_handle) != 0) {
+                std::fprintf(stderr, "fatal: Q2 VRAM engine cannot release ownership: close backend\n");
+                std::abort();
+            }
+            backend_handle = nullptr;
         }
-        if (host_down)  { (void) cudaFreeHost(host_down);  host_down = nullptr; }
-        if (host_input) { (void) cudaFreeHost(host_input); host_input = nullptr; }
-        if (device_q8)      { (void) cudaFree(device_q8);      device_q8 = nullptr; }
-        if (device_down)    { (void) cudaFree(device_down);    device_down = nullptr; }
-        if (device_hidden)  { (void) cudaFree(device_hidden);  device_hidden = nullptr; }
-        if (device_up_gate) { (void) cudaFree(device_up_gate); device_up_gate = nullptr; }
-        if (device_input)   { (void) cudaFree(device_input);   device_input = nullptr; }
-        if (stream) { (void) cudaStreamDestroy(stream); stream = nullptr; }
-        if (backend_handle) { (void) dlclose(backend_handle); backend_handle = nullptr; }
     }
 
     ~q2_engine() {
@@ -140,16 +156,20 @@ struct q2_engine {
     }
 
     size_t device_bytes() const {
-        return size_t(latent) * sizeof(float) + size_t(2 * max_hits) * hidden * sizeof(float) +
-            size_t(max_hits) * hidden * sizeof(float) + size_t(max_hits) * latent * sizeof(float) + q8_bytes;
+        return (device_input ? size_t(latent) * sizeof(float) : 0) +
+            (device_up_gate ? size_t(2 * max_hits) * hidden * sizeof(float) : 0) +
+            (device_hidden ? size_t(max_hits) * hidden * sizeof(float) : 0) +
+            (device_down ? size_t(max_hits) * latent * sizeof(float) : 0) + (device_q8 ? q8_bytes : 0);
     }
 
     size_t host_bytes() const {
-        return size_t(latent) * sizeof(float) + size_t(max_hits) * latent * sizeof(float);
+        return (host_input ? size_t(latent) * sizeof(float) : 0) +
+            (host_down ? size_t(max_hits) * latent * sizeof(float) : 0);
     }
 
     void run(const vram_compute_expert * experts, int count, const void * input, size_t input_bytes,
             const kimi_vram_activation & activation, float * output) {
+        if (closed || poisoned) { throw std::runtime_error("Q2 VRAM engine is closed"); }
         if (!experts || !input || !output || count < 1 || count > max_hits ||
                 input_bytes != size_t(latent) * sizeof(float)) {
             throw std::runtime_error("Q2 VRAM engine input shape");
@@ -209,7 +229,10 @@ void * create(int device, int latent, int hidden, int max_hits, int weight_type,
     try {
         return new q2_engine(device, latent, hidden, max_hits, weight_type, down_type);
     } catch (const std::exception & e) {
-        if (error_size) { std::snprintf(error, error_size, "%s", e.what()); }
+        if (error && error_size) { std::snprintf(error, error_size, "%s", e.what()); }
+        return nullptr;
+    } catch (...) {
+        if (error && error_size) { std::snprintf(error, error_size, "unexpected Q2 VRAM create failure"); }
         return nullptr;
     }
 }
@@ -226,7 +249,20 @@ int compute(void * context, const vram_compute_expert * experts, int hits,
         static_cast<q2_engine *>(context)->run(experts, hits, input, input_bytes, *activation, output);
         return 0;
     } catch (const std::exception & e) {
-        if (error_size) { std::snprintf(error, error_size, "%s", e.what()); }
+        if (context) {
+            auto * engine = static_cast<q2_engine *>(context);
+            engine->poisoned = true;
+            engine->close();
+        }
+        if (error && error_size) { std::snprintf(error, error_size, "%s", e.what()); }
+        return 1;
+    } catch (...) {
+        if (context) {
+            auto * engine = static_cast<q2_engine *>(context);
+            engine->poisoned = true;
+            engine->close();
+        }
+        if (error && error_size) { std::snprintf(error, error_size, "unexpected Q2 VRAM compute failure"); }
         return 1;
     }
 }
