@@ -1,11 +1,9 @@
 #!/usr/bin/python3
 """One fixed native broker-death probe. No persistent activation or model run."""
-import fcntl
 import json
 import os
 from pathlib import Path
 import signal
-import socket
 import stat
 import subprocess
 import sys

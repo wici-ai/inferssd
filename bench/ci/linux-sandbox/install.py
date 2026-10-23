@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import pwd
-import shutil
 import subprocess
 
 FILES = ("contract.py", "executor.py", "guardian.py", "daemon.py", "client.py", "worker_probe.py", "probe.py",

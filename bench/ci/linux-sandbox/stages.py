@@ -15,7 +15,7 @@ import time
 import uuid
 
 from contract import Stage, digest, integer, protected, systemd
-from executor import CLEAN_ENV, Guardian, Lease, cleanup, quarantine, show
+from executor import CLEAN_ENV, Guardian, Lease, quarantine, show
 
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z')
 JOB = re.compile(r'[0-9a-f]{32}\Z')

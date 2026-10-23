@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """Actual isolation negatives plus positive compiler/Metal; root, no runner enablement."""
-import ctypes,fcntl,hashlib,json,os,pathlib,signal,socket,subprocess,sys,time,uuid
+import ctypes,json,os,pathlib,socket,subprocess,sys,uuid
 sys.path.insert(0,'/Library/InferSSD-CI/control')
 import supervisor as s
 
