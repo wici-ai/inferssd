@@ -123,7 +123,7 @@ def main(args):
     if existing is None:
         write(lock, "", 0o600)
     info = lock.stat()
-    software = [str(p) for p in (Path("/usr/bin"), Path("/usr/sbin"), Path("/usr/lib"), Path("/usr/lib64"), Path("/usr/libexec"), Path("/usr/share")) if p.is_dir() and not p.is_symlink()]
+    software = [str(p) for p in (Path("/usr/bin"), Path("/usr/sbin"), Path("/usr/include"), Path("/usr/lib"), Path("/usr/lib64"), Path("/usr/libexec"), Path("/usr/share")) if p.is_dir() and not p.is_symlink()]
     config = {"schema_version": 1, "activation_ready": False, "device": args.device, "platform": "linux",
               "install_root": str(INSTALL), "state_root": str(STATE),
               "controller_uid": runner.pw_uid, "controller_gid": runner.pw_gid,
