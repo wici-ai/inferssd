@@ -127,6 +127,16 @@ int main(int argc, char ** argv) {
             // hook actually reads the original bytes from the alias file.
             std::vector<char> zero(packed.size(), 0);
             ggml_backend_tensor_set(a, zero.data(), 0, zero.size());
+            // Capture a real backend plan before attaching any source handle.
+            auto free_plan = [backend = cpu.get()](void * value) { ggml_backend_graph_plan_free(backend, value); };
+            std::unique_ptr<void, decltype(free_plan)> plan(ggml_backend_graph_plan_create(cpu.get(), graph), free_plan);
+            require(bool(plan), "create plan before cache attach");
+            require(ggml_backend_graph_plan_compute(cpu.get(), plan.get()) == GGML_STATUS_SUCCESS,
+                    "compute detached resident plan");
+            std::vector<float> resident_zero(expected.size());
+            ggml_backend_tensor_get(result, resident_zero.data(), 0, ggml_nbytes(result));
+            require(std::all_of(resident_zero.begin(), resident_zero.end(), [](float value) { return value == 0; }),
+                    "zero resident plan did not compute zero reference");
             require(set_cache(cpu.get(), cache.get()), "attach context-owned alias cache");
             require(set_cache(cpu.get(), cache.get()), "idempotent cache attach");
             require(!set_cache(nullptr, cache.get()), "null backend accepted a cache");
@@ -137,6 +147,11 @@ int main(int argc, char ** argv) {
             require(bool(peer), peer_error);
             require(!set_cache(cpu.get(), peer.get()), "nonempty backend replaced a borrowed cache");
             peer.reset();
+            require(ggml_backend_graph_plan_compute(cpu.get(), plan.get()) == GGML_STATUS_SUCCESS,
+                    "existing plan did not refresh attached source handle");
+            ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
+            require(std::memcmp(expected.data(), actual.data(), ggml_nbytes(result)) == 0,
+                    "plan captured before attach did not read alias bytes");
             for (int repeat = 0; repeat < 4; ++repeat) {
                 ggml_threadpool_pause(pool.get());
                 require(ggml_backend_graph_compute(cpu.get(), graph) == GGML_STATUS_SUCCESS, "compute alias graph after pause");
@@ -165,6 +180,13 @@ int main(int argc, char ** argv) {
                 std::printf("MAC_EXPERT_POOL_REUSE_OK capacity=12 active=1,4,12,4,1 lanes=%d\n", lanes);
             }
             require(set_cache(cpu.get(), nullptr), "detach alias cache before owner destruction");
+            cache.reset();
+            require(ggml_backend_graph_plan_compute(cpu.get(), plan.get()) == GGML_STATUS_SUCCESS,
+                    "existing plan did not refresh detached source handle");
+            ggml_backend_tensor_get(result, actual.data(), 0, ggml_nbytes(result));
+            require(std::memcmp(resident_zero.data(), actual.data(), ggml_nbytes(result)) == 0,
+                    "detached plan retained a stale destroyed cache instead of resident weights");
+            std::printf("MAC_EXPERT_PLAN_REFRESH_OK lanes=%d attached_alias=PASS detached_resident=PASS\n", lanes);
         }
         std::printf("MAC_EXPERT_OPERATOR_OK experts=%d rows=%d depth=%d type=%s threads=%d broadcast=PASS routed=PASS lifecycle=PASS\n",
                     experts, rows, depth, argv[4], threads);

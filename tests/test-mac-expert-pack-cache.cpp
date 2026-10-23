@@ -3,6 +3,8 @@
 #include "../ggml/src/ggml-cpu/ssd/mac-expert-source.cpp"
 
 #include <functional>
+#include <csignal>
+#include <sys/resource.h>
 
 namespace {
 void require(bool ok, const char * message) {
@@ -62,6 +64,67 @@ void rejects_foreign_batch() {
     const auto * payload = first.acquire(tensor, 0, fixture::slice_bytes, batch);
     require(static_cast<const unsigned char *>(payload)[0] == 0x11, "foreign rejection mutated original batch");
     first.release(payload); first.end(batch);
+}
+
+// A real regular writer hits EFBIG in a reader thread. Limit/handler restoration
+// precedes destructor diagnostics, so the rest of the fixture process is intact.
+void writer_failure_drains(bool acquire_boundary) {
+    fixture file;
+    const std::string path = std::string(file.path) + ".full.jsonl";
+    auto opened = ssd::telemetry::writer::open(path); require(bool(opened), "open writer-full fixture");
+    auto writer = std::move(opened.value);
+    require(bool(writer->event("ssd.fixture.ready", "{}")), "prime real writer");
+    struct stat info {}; require(stat(path.c_str(), &info) == 0, "stat real writer");
+    {
+        std::promise<void> start;
+        auto options = small_cache_options(); options.events = writer.get(); options.debug.profile = true;
+        options.read_gate = start.get_future().share();
+        pack_cache cache({file.path}, options);
+        struct bounded_file_size {
+            struct rlimit previous {};
+            struct sigaction signal_before {};
+            explicit bounded_file_size(rlim_t bytes) {
+                require(getrlimit(RLIMIT_FSIZE, &previous) == 0, "read file-size limit");
+                struct sigaction ignore {}; ignore.sa_handler = SIG_IGN; sigemptyset(&ignore.sa_mask);
+                require(sigaction(SIGXFSZ, &ignore, &signal_before) == 0, "ignore expected SIGXFSZ");
+                auto limit = previous; limit.rlim_cur = bytes;
+                if (setrlimit(RLIMIT_FSIZE, &limit) != 0) {
+                    sigaction(SIGXFSZ, &signal_before, nullptr);
+                    throw std::runtime_error("set actual file-size limit");
+                }
+            }
+            ~bounded_file_size() {
+                if (setrlimit(RLIMIT_FSIZE, &previous) != 0 || sigaction(SIGXFSZ, &signal_before, nullptr) != 0) { std::abort(); }
+            }
+        };
+        const int64_t counts[] {1,1,1};
+        auto * batch = cache.begin(tensor, counts, 3, fixture::slice_bytes, true);
+        {
+            bounded_file_size limit(rlim_t(info.st_size));
+            start.set_value();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!cache.fixture_publication_failed() && std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            require(cache.fixture_publication_failed(), "real writer did not fail under RLIMIT_FSIZE");
+            bool rejected = false;
+            try {
+                if (acquire_boundary) { cache.acquire(tensor, 0, fixture::slice_bytes, batch); }
+                else { auto * owned = batch; batch = nullptr; cache.end(owned); }
+            } catch (const std::exception & e) {
+                rejected = std::strstr(e.what(), "telemetry publication failed after reader drain") != nullptr;
+            }
+            require(rejected && cache.fixture_readers_joined(), "writer failure returned before reader threads joined");
+            require(cache.fixture_submitted_reads() == 2 && cache.fixture_read_count() == 2,
+                    "writer failure cancelled or left an issued real pread incomplete");
+            const auto before = cache.fixture_read_count();
+            rejects([&] { cache.acquire(tensor, 0, fixture::slice_bytes); });
+            require(cache.fixture_read_count() == before && cache.fixture_readers_joined(), "failed cache accepted another read");
+            if (batch) { rejects([&] { auto * owned = batch; batch = nullptr; cache.end(owned); }); }
+        }
+        require(!writer->flush(), "real writer I/O failure was not sticky after resource restoration");
+    } // cache drains and drops its borrowed writer before writer destruction.
+    writer.reset(); unlink(path.c_str());
 }
 
 void configured_context_isolation() {
@@ -189,6 +252,8 @@ int main() {
         concurrent_batches();
         configured_context_isolation();
         rejects_foreign_batch();
+        writer_failure_drains(false);
+        writer_failure_drains(true);
         {
             fixture file;
             const unsigned char invalid = 'X';
@@ -219,7 +284,7 @@ int main() {
             file.write(&duplicate, sizeof(duplicate), sizeof(pack_header) + sizeof(pack_entry) + offsetof(pack_entry, expert));
             rejects([&] { pack_cache cache({file.path}, small_cache_options()); });
         }
-        std::puts("MAC_EXPERT_PACK_CACHE_OK header=PASS lfu=PASS pins=PASS concurrent_batches=PASS contexts=PASS copied_debug=PASS telemetry=PASS foreign_batch=PASS invalid_entries=PASS");
+        std::puts("MAC_EXPERT_PACK_CACHE_OK header=PASS lfu=PASS pins=PASS concurrent_batches=PASS contexts=PASS copied_debug=PASS telemetry=PASS foreign_batch=PASS writer_full_drains=PASS invalid_entries=PASS");
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "MAC_EXPERT_PACK_CACHE_FAILED: %s\n", error.what());

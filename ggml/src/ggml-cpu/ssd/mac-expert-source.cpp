@@ -285,6 +285,9 @@ struct cache_options {
     std::string fixture_trace;
     ssd::telemetry::writer * events = nullptr;
     ssd::telemetry::debug_channels debug;
+#ifdef GGML_MAC_EXPERT_CACHE_TESTING
+    std::shared_future<void> read_gate;
+#endif
 };
 
 class pack_cache {
@@ -298,6 +301,9 @@ public:
         if (read_ahead > 4 || (read_alignment != 1 && read_alignment != 4096 && read_alignment != 16384)) {
             throw std::runtime_error("invalid explicit Mac reader window/alignment");
         }
+#ifdef GGML_MAC_EXPERT_CACHE_TESTING
+        fixture_gate = options.read_gate;
+#endif
         try {
             for (size_t i = 0; i < read_ahead; ++i) { readers.emplace_back([this] { reader_main(); }); }
         } catch (...) {
@@ -313,6 +319,13 @@ public:
     ~pack_cache() {
         stop_readers();
         log_stats("shutdown");
+        if (publication_failed.load(std::memory_order_acquire) &&
+                !terminal_failed.load(std::memory_order_acquire)) {
+            // A shutdown-only publication failure still cannot report success.
+            // stop_readers() above has already joined every publisher/reader.
+            std::fprintf(stderr, "[mac_expert_pack] fatal: telemetry failed after reader drain\n");
+            std::abort();
+        }
         if (!trace_path.empty()) {
             if (FILE * output = std::fopen(trace_path.c_str(), "w")) {
                 for (const auto & item : access_trace) {
@@ -359,6 +372,7 @@ public:
         const auto lock_start = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(mutex);
         lock_wait_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lock_start).count();
+        check_publication_locked();
         elapsed_counter elapsed{acquire_us};
         const auto lookup_start = std::chrono::steady_clock::now();
         if (batch && (batch->name != name || batch->logical_bytes != logical_bytes ||
@@ -392,6 +406,7 @@ public:
                     uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(lookup_start.time_since_epoch()).count()),
                     hit != slots.end(), cache_updates});
         }
+        check_publication_locked();
         lookup_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookup_start).count();
         if (hit != slots.end()) {
             ++hits;
@@ -402,6 +417,7 @@ public:
                 schedule(*batch);
             }
             maybe_log_stats();
+            check_publication_locked();
             return hit->second.payload();
         }
         ++misses;
@@ -456,6 +472,7 @@ public:
             {
                 elapsed_counter wait{read_wait_us};
                 job->ready.get();
+                check_publication_locked();
             }
             fresh.data = job->buffer.data;
             job->buffer.data = nullptr;
@@ -467,6 +484,7 @@ public:
             allocate_buffer(fresh, allocation, !admit);
             elapsed_counter wait{read_wait_us};
             read_source(source->second, fresh.data);
+            check_publication_locked();
         }
         fresh.allocated = allocation;
         fresh.prefix = source->second.prefix;
@@ -478,6 +496,7 @@ public:
         peak_bytes = std::max(peak_bytes, allocated_bytes);
         if (batch) { schedule(*batch); }
         maybe_log_stats();
+        check_publication_locked();
         return inserted.first->second.payload();
     }
 
@@ -497,12 +516,16 @@ public:
                 }
                 slots.erase(it);
             }
+            check_publication_locked();
             return;
         }
         throw std::runtime_error("unknown expert-pack slice released");
     }
 
     expert_batch * begin(const char * name, const int64_t * counts, int n, size_t bytes, bool cache_updates) {
+        if (publication_failed.load(std::memory_order_acquire) || terminal_failed.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(mutex); check_publication_locked();
+        }
         if (!read_ahead && cache_updates) { return nullptr; }
         auto batch = std::make_unique<expert_batch>();
         batch->owner = this;
@@ -513,16 +536,24 @@ public:
             if (counts[i] > 0) { batch->experts.push_back(i); }
         }
         std::lock_guard<std::mutex> lock(mutex);
+        check_publication_locked();
         schedule(*batch);
+        check_publication_locked();
         return batch.release();
     }
 
     void end(expert_batch * raw) {
-        if (!raw) { return; }
+        if (!raw) {
+            if (publication_failed.load(std::memory_order_acquire) || terminal_failed.load(std::memory_order_acquire)) {
+                std::lock_guard<std::mutex> lock(mutex); check_publication_locked();
+            }
+            return;
+        }
         if (raw->owner != this) { throw std::runtime_error("foreign Mac cache batch"); }
         std::unique_ptr<expert_batch> batch(raw);
         std::lock_guard<std::mutex> lock(mutex);
         while (!batch->pending.empty()) { discard_pending(*batch, batch->pending.begin()->first); }
+        check_publication_locked();
         if (batch->demand != batch->experts.size()) { throw std::runtime_error("incomplete expert batch"); }
     }
 
@@ -541,9 +572,40 @@ public:
                     acquire_us, read_wait_us, double(compute_us), double(barrier_us), lookup_us, policy_us,
                     allocation_us, release_us, lock_wait_us});
         }
+        check_publication_locked();
     }
 
+    // Called by C ABI catches after the failing method has released its lock.
+    // No failure path may abort while a reader still borrows a source/buffer.
+    void drain_after_failure() noexcept {
+        terminal_failed.store(true, std::memory_order_release);
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop_readers();
+        } catch (...) {
+            std::fprintf(stderr, "[mac_expert_pack] fatal: failed to join Mac readers\n");
+            std::abort();
+        }
+    }
+#ifdef GGML_MAC_EXPERT_CACHE_TESTING
+    bool fixture_readers_joined() {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        return queue.empty() && std::all_of(readers.begin(), readers.end(), [](const std::thread & r) { return !r.joinable(); });
+    }
+    bool fixture_publication_failed() const { return publication_failed.load(std::memory_order_acquire); }
+    uint64_t fixture_read_count() const { return read_requests.load(std::memory_order_acquire); }
+    uint64_t fixture_submitted_reads() const { return prefetch_submitted; }
+#endif
 private:
+    // Caller holds mutex; reader threads never take it and only record failure.
+    void check_publication_locked() {
+        if (!publication_failed.load(std::memory_order_acquire) && !terminal_failed.load(std::memory_order_acquire)) { return; }
+        terminal_failed.store(true, std::memory_order_release);
+        stop_readers();
+        throw std::runtime_error(publication_failed.load(std::memory_order_acquire) ?
+                "Mac telemetry publication failed after reader drain" : "Mac cache closed after reader drain");
+    }
+
     void allocate_buffer(slot & buffer, size_t allocation, bool reuse_scratch) {
         elapsed_counter elapsed{allocation_us};
         if (reuse_scratch && scratch_data && scratch_allocated != allocation) {
@@ -592,6 +654,13 @@ private:
                 queue.pop_front();
             }
             try {
+#ifdef GGML_MAC_EXPERT_CACHE_TESTING
+                // Only deterministic fixture scheduling; the actual pread and writer stay real.
+                while (fixture_gate.valid() && fixture_gate.wait_for(std::chrono::milliseconds(1)) != std::future_status::ready) {
+                    std::lock_guard<std::mutex> lock(queue_mutex);
+                    if (stopping) { break; }
+                }
+#endif
                 read_source(job->source, job->buffer.data);
                 job->completion.set_value();
             } catch (...) {
@@ -650,7 +719,9 @@ private:
 
     template<class Payload> void publish(const char * name, Payload payload) const noexcept {
         if (!events) { return; }
-        try { (void) events->event(name, payload()); } catch (...) {}
+        try {
+            if (!events->event(name, payload())) { publication_failed.store(true, std::memory_order_release); }
+        } catch (...) { publication_failed.store(true, std::memory_order_release); }
     }
 
     void maybe_log_stats() const {
@@ -693,6 +764,11 @@ private:
     size_t peak_bytes = 0;
     uint64_t clock = 0, hits = 0, misses = 0, evictions = 0, scratch_reuses = 0;
     std::atomic<uint64_t> read_requests{0}, read_bytes{0}, read_ns{0};
+#ifdef GGML_MAC_EXPERT_CACHE_TESTING
+    std::shared_future<void> fixture_gate;
+#endif
+    mutable std::atomic<bool> publication_failed{false};
+    std::atomic<bool> terminal_failed{false};
     double acquire_us = 0.0, read_wait_us = 0.0, lookup_us = 0.0, policy_us = 0.0;
     double allocation_us = 0.0, release_us = 0.0, lock_wait_us = 0.0;
     uint64_t compute_us = 0, barrier_us = 0, computed_experts = 0;
@@ -749,7 +825,8 @@ ggml_ssd_mac_cache * create_cache(const std::vector<std::string> & paths, cache_
       catch (...) { error_text(error, size, "unknown Mac cache construction failure"); }
     return nullptr;
 }
-[[noreturn]] void fatal(const char * message) noexcept {
+[[noreturn]] void drain_and_fatal(void * handle, const char * message) noexcept {
+    if (handle) { static_cast<ggml_ssd_mac_cache *>(handle)->value->drain_after_failure(); }
     std::fprintf(stderr, "[mac_expert_pack] fatal: %s\n", message);
     std::abort();
 }
@@ -799,27 +876,27 @@ extern "C" bool ggml_mac_expert_pack_prefill_enabled(void * cache) {
 }
 extern "C" const void * ggml_mac_expert_pack_acquire(void * cache, const char * name, int32_t expert, size_t bytes) {
     try { return require_cache(cache).acquire(name, expert, bytes); }
-    catch (const std::exception & e) { fatal(e.what()); } catch (...) { fatal("unknown acquire failure"); }
+    catch (const std::exception & e) { drain_and_fatal(cache, e.what()); } catch (...) { drain_and_fatal(cache, "unknown acquire failure"); }
 }
 extern "C" void * ggml_mac_expert_pack_begin_batch(void * cache, const char * name, const int64_t * counts, int n, size_t bytes, bool cache_updates) {
     try { return require_cache(cache).begin(name, counts, n, bytes, cache_updates); }
-    catch (const std::exception & e) { fatal(e.what()); } catch (...) { fatal("unknown begin failure"); }
+    catch (const std::exception & e) { drain_and_fatal(cache, e.what()); } catch (...) { drain_and_fatal(cache, "unknown begin failure"); }
 }
 extern "C" const void * ggml_mac_expert_pack_acquire_batch(void * cache, void * batch, const char * name, int32_t expert, size_t bytes) {
     try { return require_cache(cache).acquire(name, expert, bytes, static_cast<expert_batch *>(batch)); }
-    catch (const std::exception & e) { fatal(e.what()); } catch (...) { fatal("unknown batch acquire failure"); }
+    catch (const std::exception & e) { drain_and_fatal(cache, e.what()); } catch (...) { drain_and_fatal(cache, "unknown batch acquire failure"); }
 }
 extern "C" void ggml_mac_expert_pack_end_batch(void * cache, void * batch) {
     try { require_cache(cache).end(static_cast<expert_batch *>(batch)); }
-    catch (const std::exception & e) { fatal(e.what()); } catch (...) { fatal("unknown end failure"); }
+    catch (const std::exception & e) { drain_and_fatal(cache, e.what()); } catch (...) { drain_and_fatal(cache, "unknown end failure"); }
 }
 extern "C" void ggml_mac_expert_pack_record_compute(void * cache, uint64_t us, uint64_t barriers) {
     try { require_cache(cache).record_compute(us, barriers); }
-    catch (const std::exception & e) { fatal(e.what()); } catch (...) { fatal("unknown compute trace failure"); }
+    catch (const std::exception & e) { drain_and_fatal(cache, e.what()); } catch (...) { drain_and_fatal(cache, "unknown compute trace failure"); }
 }
 extern "C" void ggml_mac_expert_pack_release(void * cache, const void * data) {
     try { require_cache(cache).release(data); }
-    catch (const std::exception & e) { fatal(e.what()); } catch (...) { fatal("unknown release failure"); }
+    catch (const std::exception & e) { drain_and_fatal(cache, e.what()); } catch (...) { drain_and_fatal(cache, "unknown release failure"); }
 }
 
 #endif
