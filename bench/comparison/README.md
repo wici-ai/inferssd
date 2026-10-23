@@ -80,6 +80,18 @@ most one reverse candidate/base diagnostic with `attempt: reverse-diagnostic`,
 a retained `initial_pair` reference and a concrete `hypothesis`; retain both
 pairs independently. No 4K, other model or other device is added to this task.
 
+The legacy cache budget is a literal byte count: `UINT64_MAX` is **not** an
+automatic budget in v0.1.13. The first local pair exposed this mapping error and
+is retained as `invalid-resource-match`, irrespective of its measured speeds.
+The corrected profile sets the legacy budget to 12,905,668,608 bytes (686 physical
+slots), the current engine's observed initial capacity under the same 13 GiB
+limit. The current engine retains its automatic policy. Both arms must report
+that initial capacity, successful mapping/admission and nonzero cache hits;
+native cache allocation/reclaim lifecycles are recorded as implementation
+differences. A configuration correction is a separately identified pair, never
+a replacement of the invalid original. Disk counters and I/O pressure accompany
+the measurement; no historical disk-rate normalization is applied.
+
 At the end, archive the exact old server, all project DSOs and preloads, source,
 patch, build flags and raw evidence off the device. Verify recovery and hashes
 before deleting only the reviewed cleanup-manifest paths. Preserve the current

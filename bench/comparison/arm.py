@@ -11,6 +11,7 @@ import csv
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import socket
 import sys
@@ -106,12 +107,32 @@ def snapshot(process, config, output, name):
              "cmdline": cmdline, "environment": environment, "limits": limits,
              "cpus": sorted(os.sched_getaffinity(pid)), "libraries": libraries,
              "host_meminfo": Path("/proc/meminfo").read_text(),
+             "host_diskstats": Path("/proc/diskstats").read_text(),
+             "host_io_pressure": Path("/proc/pressure/io").read_text(),
+             "host_loadavg": Path("/proc/loadavg").read_text(),
              "process_io": Path(f"/proc/{pid}/io").read_text(),
              "cgroup": native_linux.cgroup_snapshot(pid, config["policy"]["memory_budget_bytes"])}
     if value["cpus"] != config["effective_contract"]["cpu_affinity"]:
         raise ValueError("actual CPU affinity differs from the reviewed resource contract")
     common.save(output / (name + ".json"), value)
     return value
+
+
+def cache_receipt(raw, expected_capacity):
+    """Check actual admission, rather than equating legacy and typed sentinels."""
+    if b"reason=mmap_failed" in raw:
+        raise ValueError("CPU cache mapping failed; resource comparison is invalid")
+    rows = re.findall(rb"\[kimi_cpu_sink_cache\] reason=before_destroy ([^\r\n]+)", raw)
+    if len(rows) != 1:
+        raise ValueError("exactly one native final CPU cache receipt is required")
+    values = {k.decode(): int(v) for k, v in re.findall(rb"(\w+)=(\d+)", rows[0])}
+    if values.get("capacity_bytes") != expected_capacity or any(
+            values.get(k, 0) <= 0 for k in ("mapped_bytes", "committed_bytes", "hits")):
+        raise ValueError("actual CPU cache capacity/admission differs from the reviewed contract")
+    automatic = re.findall(rb"\[kimi_cpu_sink_cache\] auto_capacity_bytes=(\d+)", raw)
+    if automatic and [int(x) for x in automatic] != [expected_capacity]:
+        raise ValueError("automatic initial CPU cache capacity changed")
+    return dict(values=values, automatic_initial_capacity_bytes=[int(x) for x in automatic])
 
 
 def run(config, output, lock_fd=None):
@@ -221,6 +242,14 @@ def run(config, output, lock_fd=None):
             except BaseException as error:
                 result.update(status="failed", cleanup_confirmed=cleanup_confirmed(output / "ownership.json"),
                               cleanup_error=f"{type(error).__name__}: {error}")
+        if result["status"] == "passed" and "cpu_cache_initial_capacity_bytes" in config["effective_contract"]:
+            try:
+                receipt = cache_receipt((output / "server.log").read_bytes(),
+                                        config["effective_contract"]["cpu_cache_initial_capacity_bytes"])
+                common.save(output / "cache-receipt.json", receipt)
+                result["cache_receipt"] = receipt
+            except ValueError as error:
+                result.update(status="failed", resource_match="invalid", error=str(error))
         common.save(output / "arm.json", result)
         for sig, handler in handlers.items():
             signal.signal(sig, handler)

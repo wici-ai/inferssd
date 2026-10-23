@@ -9,6 +9,16 @@ import pair
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_actual_cache_failure_cannot_pass_declared_resource_match(self):
+        with self.assertRaises(ValueError):
+            pair.arm.cache_receipt(b"[kimi_cpu_sink_cache] paused=1 reason=mmap_failed\n", 123)
+        valid = b"[kimi_cpu_sink_cache] reason=before_destroy capacity_bytes=123 mapped_bytes=123 committed_bytes=100 hits=1\n"
+        self.assertEqual(pair.arm.cache_receipt(valid, 123)["values"]["hits"], 1)
+        with self.assertRaises(ValueError):
+            pair.arm.cache_receipt(valid, 124)
+        with self.assertRaises(ValueError):
+            pair.arm.cache_receipt(b"[kimi_cpu_sink_cache] auto_capacity_bytes=124\n" + valid, 123)
+
     def setUp(self):
         self.result = {"prompt_ids": [1, 2], "prompt_sha256": "same", "tokens": [4] * 256,
                        "input_tokens": 2, "timings": {"prompt_n": 2, "prompt_ms": 10},
