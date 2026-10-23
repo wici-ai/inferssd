@@ -101,6 +101,7 @@ class OwnedProcess:
                 self.guardian = subprocess.Popen(
                     [
                         sys.executable,
+                        "-I",
                         "-m",
                         "ssdash.platform.worker",
                         "--guardian",

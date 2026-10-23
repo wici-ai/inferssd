@@ -101,6 +101,7 @@ def run_guardian(args: argparse.Namespace, specification: dict[str, Any], policy
     command = [
         *prefix,
         sys.executable,
+        "-I",
         "-m",
         "ssdash.platform.worker",
         "--worker",

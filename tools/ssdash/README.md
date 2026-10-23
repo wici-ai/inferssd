@@ -409,7 +409,9 @@ records resource samples, and `ownership.json` records final status and cleanup.
 Keep these artifacts private if arguments or paths contain private information.
 Server loader variables are carried in the process environment and restored
 only for the server, not serialized into the launch specification or applied to
-the Python lock owner. A successful cleanup does not turn a failed server or
+the Python lock owner. Guardian and scoped worker use the same installed interpreter
+with Python isolated mode; a package in the caller's directory or PYTHONPATH
+cannot replace their implementation. A successful cleanup does not turn a failed server or
 resource check into a successful exit. `--result` and `--host-facts` are dry-run
 options and are rejected by execution mode.
 

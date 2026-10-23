@@ -87,3 +87,27 @@ def test_execute_missing_policy_fails_before_host_or_files(tmp_path):
     assert result.returncode == 2, result.stderr
     assert "requires --runtime-policy" in result.stderr
     assert list(tmp_path.iterdir()) == []
+
+
+def test_installed_worker_ignores_shadow_package_in_cwd(tmp_path):
+    shadow = tmp_path / "ssdash"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("raise RuntimeError('shadow-package-was-imported')\n")
+    unisolated = subprocess.run(
+        [sys.executable, "-m", "ssdash.platform.worker", "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert unisolated.returncode != 0
+    assert "shadow-package-was-imported" in unisolated.stderr
+    isolated = subprocess.run(
+        [sys.executable, "-I", "-m", "ssdash.platform.worker", "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert isolated.returncode == 0, isolated.stderr
+    assert "--guardian" in isolated.stdout and "--worker" in isolated.stdout
