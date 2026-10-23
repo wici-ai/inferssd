@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "server-ssd-reservation.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -2437,6 +2438,7 @@ void server_prompt_cache::save(
         llama_context              * ctx,
         int32_t                      id_slot,
         common_context_seq_rm_type   seq_rm_type) {
+    server_ssd_memory_change budget_changes(ctx);
     const int32_t n_state = current ? -1 : prompt.n_tokens();
 
     if (contains(prompt, seq_rm_type)) {
@@ -2467,6 +2469,16 @@ void server_prompt_cache::save(
             }
         }
 
+        server_ssd_memory_change changes(ctx);
+        size_t allocation_bytes = state_size;
+        for (const auto & checkpoint : prompt.checkpoints) {
+            if (checkpoint.data.size() > SIZE_MAX - allocation_bytes) {
+                SRV_WRN("%s", " - prompt cache allocation size overflow\n"); return;
+            }
+            allocation_bytes += checkpoint.data.size();
+        }
+        server_ssd_reservation reservation(ctx, allocation_bytes);
+        if (!reservation) { SRV_WRN("%s", " - no host budget for prompt cache state\n"); return; }
         std::vector<uint8_t> state_data;
 
         // check if we can allocate enough memory for the new state
@@ -2493,6 +2505,7 @@ void server_prompt_cache::save(
         entry.tokens      = prompt.tokens.clone();
         entry.data        = std::move(state_data);
         entry.checkpoints = prompt.checkpoints;
+        reservation.commit();
         states.push_back(std::move(entry));
 
         return;
@@ -2541,9 +2554,15 @@ void server_prompt_cache::save(
         size_t offset = ok ? std::ftell(f) : 0;
         for (const auto & cp : prompt.checkpoints) {
             // a checkpoint in memory is written as it is; one in another prompt's file is read back first
+            server_ssd_memory_change changes(ctx);
             std::vector<uint8_t> copy;
             const bool in_memory = !cp.data.empty();
-            ok = ok && (in_memory || (llama_host_reserve(ctx, cp.size()) && server_prompt_checkpoint_data(prompt, cp, copy)));
+            server_ssd_reservation reservation;
+            if (ok && !in_memory) {
+                reservation = server_ssd_reservation(ctx, cp.size());
+                ok = bool(reservation) && server_prompt_checkpoint_data(prompt, cp, copy);
+                if (ok) { reservation.commit(); }
+            }
             const std::vector<uint8_t> & data = in_memory ? cp.data : copy;
             ok = ok && server_prompt_fwrite(f, data.data(), data.size());
             // A copied-and-cleared vector retains its payload capacity. Disk
@@ -2589,6 +2608,7 @@ bool server_prompt_cache::load(
         llama_context              * ctx,
         int32_t                      id_slot,
         common_context_seq_rm_type   seq_rm_type) {
+    server_ssd_memory_change budget_changes(ctx);
     auto it_best = states.end();
     const server_prompt_checkpoint * checkpoint_best = nullptr;
     int64_t n_tokens_best = -1;
@@ -2658,10 +2678,12 @@ bool server_prompt_cache::load(
             continue;
         }
         // into memory as far as the memory limit allows (the RAM expert cache gives back room first)
+        server_ssd_memory_change changes(ctx);
+        server_ssd_reservation reservation(ctx, cp.size());
+        if (!reservation) { continue; }
         server_prompt_checkpoint cur = cp;
-        if ((cp.data.empty() && !llama_host_reserve(ctx, cp.size())) || !server_prompt_checkpoint_data(*it_best, cp, cur.data)) {
-            continue;
-        }
+        if (!server_prompt_checkpoint_data(*it_best, cp, cur.data)) { continue; }
+        reservation.commit();
         cur.file_offset = 0;
         cur.file_size   = 0;
         loaded.checkpoints.push_back(std::move(cur));

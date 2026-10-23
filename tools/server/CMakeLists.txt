@@ -15,6 +15,7 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-ssd-reservation.h
     server-tools.cpp
     server-tools.h
 )

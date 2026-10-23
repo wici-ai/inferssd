@@ -5,6 +5,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-ssd-reservation.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -1342,6 +1343,7 @@ private:
         SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
         slot.prompt_save(*prompt_cache);
         slot.prompt_clear(false);
+        llama_ssd_host_note_memory_change(ctx);
         prompt_cache->update();
     }
 
@@ -1853,6 +1855,7 @@ private:
                     ret->prompt_clear(false);
                 }
 
+                llama_ssd_host_note_memory_change(ctx);
                 prompt_cache->update();
 
                 SRV_WRN("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
@@ -2548,8 +2551,11 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        if (checkpoint_room(slot, llama_state_seq_get_size_ext(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY))) {
-            add_checkpoint(slot, server_get_checkpoint(ctx, slot.id, slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max));
+        auto reservation = checkpoint_room(slot, llama_state_seq_get_size_ext(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+        if (reservation) {
+            auto checkpoint = server_get_checkpoint(ctx, slot.id, slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+            reservation.commit();
+            add_checkpoint(slot, std::move(checkpoint));
         }
     }
 
@@ -2600,11 +2606,15 @@ private:
                 SLT_WRN(slot, "cannot save the state after %" PRId64 " tokens\n", n);
                 continue;
             }
-            if (params_base.n_ctx_checkpoints > 0 &&
-                    checkpoint_room(slot, llama_state_seq_get_size_at(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, n))) {
-                const llama_pos pos_min = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? n - 1 :
-                    llama_state_seq_pos_min_at(ctx, slot.id, n);
-                add_checkpoint(slot, server_get_checkpoint_at(ctx, slot.id, n, pos_min));
+            if (params_base.n_ctx_checkpoints > 0) {
+                auto reservation = checkpoint_room(slot, llama_state_seq_get_size_at(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, n));
+                if (reservation) {
+                    const llama_pos pos_min = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? n - 1 :
+                        llama_state_seq_pos_min_at(ctx, slot.id, n);
+                    auto checkpoint = server_get_checkpoint_at(ctx, slot.id, n, pos_min);
+                    reservation.commit();
+                    add_checkpoint(slot, std::move(checkpoint));
+                }
             }
             if (shared && prompt_cache) {
                 server_prompt prefix;
@@ -2612,6 +2622,7 @@ private:
                 prefix.tokens.keep_first(n);
                 SLT_INF(slot, "keeping the shared prompt prefix of %" PRId64 " tokens\n", n);
                 prompt_cache->save(prefix, false, ctx, slot.id, slot.ctx_seq_rm_type);
+                llama_ssd_host_note_memory_change(ctx);
                 prompt_cache->update();
             }
         }
@@ -2620,24 +2631,27 @@ private:
     // Room for a new checkpoint of `bytes`, made before it is allocated: the oldest checkpoint goes when the slot
     // holds n_ctx_checkpoints, the RAM expert cache gives back what the memory limit requires, and failing that the
     // oldest checkpoints go too. False (the checkpoint is skipped) when even no checkpoints leave no room.
-    bool checkpoint_room(server_slot & slot, size_t bytes) {
+    server_ssd_reservation checkpoint_room(server_slot & slot, size_t bytes) {
         auto erase_oldest = [&](const char * why) {
             const auto & cur = slot.prompt.checkpoints.front();
             SLT_WRN(slot, "erasing old context checkpoint (%s; pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     why, cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
+            llama_ssd_host_note_memory_change(ctx);
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         };
         while (!slot.prompt.checkpoints.empty() && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             erase_oldest("count");
         }
-        while (!llama_host_reserve(ctx, bytes)) {
+        server_ssd_reservation reservation(ctx, bytes);
+        while (!reservation) {
             if (slot.prompt.checkpoints.empty()) {
                 SLT_WRN(slot, "skipping a context checkpoint of %.3f MiB: no room in the memory limit\n", (float) bytes / 1024 / 1024);
-                return false;
+                return {};
             }
             erase_oldest("memory");
+            reservation = server_ssd_reservation(ctx, bytes);
         }
-        return true;
+        return reservation;
     }
 
     void add_checkpoint(server_slot & slot, server_prompt_checkpoint && checkpoint) {
@@ -3458,6 +3472,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
                                         SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
+                                        llama_ssd_host_note_memory_change(ctx);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
