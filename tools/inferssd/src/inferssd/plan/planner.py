@@ -7,7 +7,13 @@ from collections.abc import Callable, Mapping
 from typing import Optional, cast
 
 from inferssd.model.machine import Machine, layer_faults, row_faults
-from inferssd.model.machine_types import ArtifactReader, Calibration, PlanArtifact, PlanRow, Rejected
+from inferssd.model.machine_types import (
+    ArtifactReader,
+    Calibration,
+    PlanArtifact,
+    PlanRow,
+    Rejected,
+)
 from inferssd.plan.planner_types import Emit, PlanArguments
 from inferssd.plan.settings_types import HostThreads
 

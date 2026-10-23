@@ -203,9 +203,15 @@ def _resolve(
         value = replace(
             value,
             entries=tuple(
-                replace(item, value=1, origin="file", location="model profile dsv",
-                        receipt=" source=model; profile=dsv")
-                if item.key in ("model.engram_prefetch", "model.hc_fused") and item.origin == "default"
+                replace(
+                    item,
+                    value=1,
+                    origin="file",
+                    location="model profile dsv",
+                    receipt=" source=model; profile=dsv",
+                )
+                if item.key in ("model.engram_prefetch", "model.hc_fused")
+                and item.origin == "default"
                 else item
                 for item in value.entries
             ),

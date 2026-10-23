@@ -38,7 +38,9 @@ from inferssd.telemetry.recorded import ledger, read_arm
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="InferSSD recorded tools and explicit owned launch")
+    parser = argparse.ArgumentParser(
+        description="InferSSD recorded tools and explicit owned launch"
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     add_source_commands(commands)
     add_launch_command(commands)

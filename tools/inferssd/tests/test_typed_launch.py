@@ -431,13 +431,19 @@ def test_extra_cannot_replace_selected_native_placement(tmp_path, extra):
     with pytest.raises(ValueError, match="explicit typed"):
         resolve(replace(inputs, extra=extra), spec, adapter, out)
 
+
 @pytest.mark.parametrize("explicit,expected", [(False, 1), (True, 0)])
-def test_deepseek_profile_materializes_model_policy_and_preserves_explicit_values(tmp_path, explicit, expected):
+def test_deepseek_profile_materializes_model_policy_and_preserves_explicit_values(
+    tmp_path, explicit, expected
+):
     inputs, spec, _, adapter, out, _ = setup(tmp_path)
     inputs = replace(inputs, profile="dsv")
     (Path(inputs.repo) / "models/templates/deepseek-ai-DeepSeek-V4.1.jinja").write_text("template")
     if explicit:
-        spec = replace(spec, overrides=spec.overrides + (("model.engram_prefetch", "0"), ("model.hc_fused", "0")))
+        spec = replace(
+            spec,
+            overrides=spec.overrides + (("model.engram_prefetch", "0"), ("model.hc_fused", "0")),
+        )
     result = resolve(inputs, spec, adapter, out)
     assert result.code == 0
     native = parse((out / "settings.ssd").read_text(), overrides=spec.overrides)
