@@ -45,6 +45,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 -I control/bench/ci/selected_controller.py execute --control control --policy control/bench/ci/policy.json --plan admission.json --artifacts selected-artifacts
+      - name: Cancel any remaining exact child runs
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I control/bench/ci/selected_controller.py cancel_children --control control --policy control/bench/ci/policy.json --plan admission.json --artifacts selected-artifacts
       - name: Retain every admission, dispatch and child attempt
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

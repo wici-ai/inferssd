@@ -28,6 +28,11 @@ def device_report(root, plan, policy, job, child):
     root = Path(root)
     report = load(root / "integration.json")
     sealed(root, report)
+    dispatch = load(root.parent / "dispatch.json")
+    if (not dispatch.get("selection_parent")
+            or report.get("selection_parent") != dispatch["selection_parent"]
+            or report.get("authorization_path") != "live-private-parent"):
+        raise ValueError("manual operator execution cannot satisfy a selected parent")
     config = load(root / "selected-config.json")
     manifest = load(root / "root-manifest.json")
     needs = bound(config, manifest, job["job_id"])

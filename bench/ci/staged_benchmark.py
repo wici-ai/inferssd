@@ -37,16 +37,27 @@ def verify_stopped(stopped):
     receipt = stopped.get("receipt")
     receipt = receipt if isinstance(receipt, dict) else {}
     code = stopped.get("returncode")
+    cleanup = stopped.get("cleanup")
+    cleanup = cleanup if isinstance(cleanup, dict) else {}
+    job = stopped.get("job_id", "")
+    mac_requested = (
+        stopped.get("state") == "failed" and stopped.get("reason") == "requested stop"
+        and code == 0 and isinstance(job, str) and re.fullmatch(r"[0-9a-f]{32}", job)
+        and stopped.get("job_root") == stopped.get("scope_identity") == "/Library/InferSSD-CI/jobs/" + job
+        and stopped.get("worker_uid") == 62002
+        and cleanup.get("confirmed") is True and cleanup.get("remaining") == []
+        and cleanup.get("worker_user_domain_retired", {}).get("returncode") == 0)
     if (stopped.get("running") is not False or type(code) is not int
             or stopped.get("cleanup_confirmed") is not True
-            or stopped.get("state") in ("failed", "quarantined")
+            or stopped.get("state") == "quarantined"
+            or (stopped.get("state") == "failed" and not mac_requested)
             or stopped.get("error") or stopped.get("cleanup_error")
             or receipt.get("cleanup_error")
             or receipt.get("cleanup_confirmed", True) is not True
             or receipt.get("error") not in (None, "", controlled)):
         raise ValueError("native benchmark did not stop normally and cleanly")
     if code == 0:
-        return "normal-exit"
+        return "mac-requested-stop" if mac_requested else "normal-exit"
     guardian = receipt.get("guardian")
     guardian = guardian if isinstance(guardian, dict) else {}
     cleanup = guardian.get("cleanup")

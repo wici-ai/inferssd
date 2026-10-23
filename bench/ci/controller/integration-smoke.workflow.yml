@@ -43,6 +43,8 @@ jobs:
     if: github.repository == 'wici-ai/inferssd-device-ci' && github.ref == 'refs/heads/main'
     runs-on: ${{ fromJSON(inputs.device == 'cloud-5090' && '["self-hosted","Linux","X64","inferssd-device-ci","cloud-5090"]' || inputs.device == 'dgx-spark' && '["self-hosted","Linux","ARM64","inferssd-device-ci","dgx-spark"]' || '["self-hosted","macOS","ARM64","inferssd-device-ci","local-mbp"]') }}
     timeout-minutes: 120
+    permissions:
+      actions: read
     concurrency:
       group: physical-${{ inputs.device }}
       cancel-in-progress: false
@@ -56,6 +58,7 @@ jobs:
           INTEGRATION_CONFIG_SHA256: ${{ inputs.config_sha256 }}
           INTEGRATION_PLAN_SHA256: ${{ inputs.selection_plan_sha256 }}
           INTEGRATION_PARENT: ${{ inputs.selection_parent }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
@@ -133,6 +136,7 @@ jobs:
             --job-id "$INTEGRATION_JOB_ID" \
             --config "$config" --config-sha256 "$INTEGRATION_CONFIG_SHA256" \
             --selection-plan-sha256 "$INTEGRATION_PLAN_SHA256" \
+            --selection-parent "$INTEGRATION_PARENT" \
             --output "$artifact/$INTEGRATION_JOB_ID"
 
       - name: Retain the complete attempt, including failures

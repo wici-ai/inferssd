@@ -27,9 +27,10 @@ from ci.contract import (
 
 
 class API:
-    def __init__(self, repository, token, version="2022-11-28"):
+    def __init__(self, repository, token, version="2022-11-28", timeout=30):
         self.repository, self.token = repository, token
         self.version = version
+        self.timeout = timeout
 
     def call(self, path, data=None, method=None):
         request = urllib.request.Request(
@@ -42,7 +43,7 @@ class API:
             },
             method=method,
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
             raw = response.read()
             return json.loads(raw) if raw else None
 

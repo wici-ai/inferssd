@@ -8,7 +8,8 @@ import run_final
 from ci.compare import compare_pair
 from ci.contract import digest, load, save
 from ci.impact import device_requirements
-from ci.private_controller import source_manifest
+from ci.private_controller import API, source_manifest
+from ci.selection_lifetime import ParentWatch
 from ci.selected_receipt import receipt
 from ci.selection_contract import protected_binding
 from ci.stage_session import StageSession
@@ -24,7 +25,7 @@ def run(args):
     output.mkdir(parents=True, exist_ok=False)
     report = dict(schema_version=1, purpose="selected-integration", status="failed",
                   cleanup_confirmed=False, formal_samples=0, cells=[])
-    session = None
+    session, watch = None, None
     try:
         config = protected_binding(args.config, args.config_sha256, args.selection_plan_sha256, args.job_id)
         control = Path(__file__).resolve().parents[2]
@@ -40,7 +41,22 @@ def run(args):
         manifest = load(config["manifest_path"])
         (output / "root-manifest.json").write_bytes(Path(config["manifest_path"]).read_bytes())
         needs = device_requirements(plan, device)
+        parent = getattr(args, "selection_parent", "")
+        report.update(selection_parent=parent,
+                      authorization_path="live-private-parent" if parent else "operator-root-staged")
+        if parent:
+            repository = config["policy"]["controller_repository"]
+            sha = os.environ["GITHUB_WORKFLOW_SHA"]
+            if (os.environ.get("GITHUB_REPOSITORY") != repository
+                    or os.environ.get("GITHUB_REF") != "refs/heads/main"
+                    or os.environ.get("GITHUB_SHA") != sha
+                    or os.environ.get("GITHUB_WORKFLOW_REF") != repository + "/.github/workflows/integration-smoke.yml@refs/heads/main"):
+                raise ValueError("selected child must use the protected private main workflow")
+            watch = ParentWatch(API(repository, os.environ["GITHUB_TOKEN"], timeout=10), parent, sha)
+            watch.start()
         session = StageSession(args.socket, args.job_id, controller_uid=os.getuid())
+        if watch is not None:
+            watch.attach(session)
         opened = session.open()
         save(output / "job-opened.json", opened)
         if opened["manifest_sha256"] != config["manifest_sha256"]:
@@ -97,6 +113,8 @@ def run(args):
                 if compared["passed"] is not True:
                     raise RuntimeError("observed slowdown is inconclusive and blocks acceptance")
             report["cells"].append(cell)
+        if watch is not None:
+            watch.check()
         report["status"] = "passed"
     except Exception as error:
         report["error"] = f"{type(error).__name__}: {error}"
@@ -113,6 +131,11 @@ def run(args):
             report.update(status="failed", cleanup_error=f"{type(error).__name__}: {error}")
         if session is not None:
             session.close()
+        if watch is not None:
+            try:
+                watch.stop()
+            except Exception as error:
+                report.update(status="failed", parent_error=repr(error))
         files = {str(path.relative_to(output)): digest(path) for path in sorted(output.rglob("*")) if path.is_file()}
         save(output / "evidence-manifest.json", dict(schema_version=1, files=files))
         report["evidence_manifest_sha256"] = digest(output / "evidence-manifest.json")

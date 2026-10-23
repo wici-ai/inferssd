@@ -105,6 +105,24 @@ execution is used; see [GitHub's security guidance](https://docs.github.com/en/a
    if any required device/model is absent. Do not pass an operator diagnostic off
    as an independently approved PR attempt.
 
+The hosted parent has a three-hour collection deadline below its four-hour job
+limit. Interruption and its always-run cleanup step request cancellation of the
+exact recorded children; an API cancellation response is not worker cleanup.
+Each selected child checks the parent's fixed workflow/main SHA/attempt and live
+`control` job before opening the lease and every 60 seconds while running. The
+private Actions-read token remains only in the trusted coordinator UID. Parent
+termination, identity mismatch or an unavailable observation shuts down the
+coordinator socket, leaving the existing independent guardian to drain workers
+and retain the original lock. Missing positive cleanup remains red. A manual
+root-staged operator run has no parent watcher and is explicitly labelled; its
+artifact cannot satisfy a PR parent. Publication rereads the PR after raw
+aggregation before rechecking the current base/head/merge and authorization.
+
+The Mac broker labels a requested server stop `failed` even when the server
+returns zero. Only that exact reason, dedicated job scope and positive empty
+worker/domain cleanup is classified as a requested stop. Deadline, resource,
+STOP, quarantine, nonzero server exit or incomplete cleanup is still rejected.
+
 macOS control must include the read-only `resource_policy` probe field added in
 this branch, so the compared envelope is the actual continuously enforced root
 executor policy. Old probes fail closed. An unresolved model admission cannot be

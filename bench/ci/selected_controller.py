@@ -6,7 +6,9 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci.contract import HASH, load, policy_read, revision, save
@@ -106,6 +108,14 @@ def execute(args, env=os.environ):
     state = dict(schema_version=1, selection_plan_sha256=fingerprint(impact), children={}, errors={})
     dispatched = {}
     parent = f"{admitted['controller']['run_id']}-{admitted['controller']['run_attempt']}"
+    deadline = time.monotonic() + 10800
+    previous = {}
+
+    def interrupted(number, frame):
+        raise KeyboardInterrupt("selected controller interrupted")
+
+    for number in (signal.SIGINT, signal.SIGTERM):
+        previous[number] = signal.signal(number, interrupted)
     try:
         for device, job in jobs.items():
             try:
@@ -115,14 +125,39 @@ def execute(args, env=os.environ):
                 state["errors"][device] = f"{type(error).__name__}: {error}"
         for device, child in dispatched.items():
             try:
-                run = selection_dispatch.wait(api, child)
+                run = selection_dispatch.wait(api, child, timeout_s=max(1, deadline - time.monotonic()))
                 state["children"][device] = run
                 selection_dispatch.collect(api, run, jobs[device], args.artifacts / device, parent=parent)
             except Exception as error:
                 state["errors"][device] = f"{type(error).__name__}: {error}"
     finally:
         save(args.artifacts / "dispatch-state.json", state)
+        try:
+            cancel_children(args, env)
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
     return 1 if state["errors"] else 0
+
+
+def cancel_children(args, env=os.environ):
+    """Also called by the hosted always step after a killed execute process."""
+    policy, _, identity = environment(args, env)
+    api = API(policy["controller_repository"], env["GITHUB_TOKEN"])
+    results = {}
+    if args.artifacts.exists():
+        for path in sorted(args.artifacts.glob("*-dispatch.json")):
+            child = load(path)
+            parent = f"{identity['run_id']}-{identity['run_attempt']}"
+            if (child.get("controller_sha") != identity["workflow_sha"]
+                    or child.get("inputs", {}).get("selection_parent") != parent):
+                raise ValueError("refuse cancellation of another controller's child")
+            try:
+                results[path.name] = selection_dispatch.cancel(api, child)
+            except Exception as error:
+                results[path.name] = dict(error=repr(error), cleanup_confirmed=False)
+        save(args.artifacts / "cancellation-requests.json", results)
+    return 0  # Request success is never a device acceptance or cleanup verdict.
 
 
 def finalize(args, env=os.environ):
@@ -157,7 +192,7 @@ def finalize(args, env=os.environ):
             if latest.get("status") != "completed" or latest.get("conclusion") != "success":
                 raise ValueError("selected child state changed before App publication")
         report = aggregate(impact, policy, args.artifacts, admitted["jobs"], state["children"])
-        current = admission(api, pr, policy, head)
+        current = admission(api, api.call("pulls/" + number), policy, head)
         if any(current[key] != admitted[key] for key in ("base", "head", "candidate", "authorization")):
             raise ValueError("source or independent approval changed before publication")
         if current_ci(api, admitted, policy) != admitted["normal_ci"]:
@@ -182,7 +217,7 @@ def finalize(args, env=os.environ):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("preflight", "execute", "finalize"))
+    parser.add_argument("mode", choices=("preflight", "execute", "cancel_children", "finalize"))
     for name in ("control", "policy", "plan", "artifacts", "output"):
         parser.add_argument("--" + name, type=Path, required=name in ("control", "policy", "plan"))
     args = parser.parse_args()

@@ -60,6 +60,16 @@ def wait(api, dispatched, *, timeout_s=21600, sleep=time.sleep, clock=time.monot
     raise TimeoutError("selected child deadline; cleanup must be independently confirmed")
 
 
+def cancel(api, dispatched):
+    """Request cancellation of the exact child, never claim worker cleanup."""
+    run = api.call("actions/runs/" + str(dispatched["id"]))
+    run_identity(run, dispatched["workflow_id"], dispatched["controller_sha"], dispatched["job_id"])
+    if run.get("status") != "completed":
+        api.call("actions/runs/" + str(dispatched["id"]) + "/cancel", {}, method="POST")
+    return dict(run_id=dispatched["id"], cancellation_requested=run.get("status") != "completed",
+                cleanup_confirmed=False)
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
