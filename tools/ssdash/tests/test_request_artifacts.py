@@ -343,20 +343,29 @@ def observe(case, api_factory=original_api):
             for key, value in h.ns.get("boot_client", {}).items()
             if key in ("text", "msgs", "devices", "drive", "counts", "hist", "total")
         }
-    return {
-        "outcome": outcome,
-        "events": h.events,
-        "stdout": h.stdout.getvalue(),
-        "files": {p: v for p, v in h.data.items() if p not in h.initial or v != h.initial[p]},
-        "histories": exact(h.histories),
-        "snapshot": snap,
-        "state": states,
-        "chain": chain,
-    }
+    return copy.deepcopy(
+        {
+            "outcome": outcome,
+            "events": h.events,
+            "stdout": h.stdout.getvalue(),
+            "files": {p: v for p, v in h.data.items() if p not in h.initial or v != h.initial[p]},
+            "histories": exact(h.histories),
+            "snapshot": snap,
+            "state": states,
+            "chain": chain,
+        }
+    )
 
 
 def data():
-    return json.loads(GOLDENS.read_text()) if GOLDENS.exists() else {"cases": []}
+    result = json.loads(GOLDENS.read_text()) if GOLDENS.exists() else {"cases": []}
+    boundary = FIXTURES / "request-artifacts-return-boundary.json"
+    if boundary.exists():
+        corrections = json.loads(boundary.read_text())["events"]
+        for case in result["cases"]:
+            for runtime, events in corrections.get(case["name"], {}).items():
+                case["expected"][runtime]["events"] = events
+    return result
 
 
 @pytest.mark.parametrize("case", data()["cases"], ids=lambda c: c["name"])
@@ -368,3 +377,22 @@ def test_request_source_bytes():
     manifest = json.loads((ORACLES / "request-artifacts-manifest.json").read_text())
     for spec in manifest["sources"].values():
         assert hashlib.sha256((ORACLES / spec["oracle"]).read_bytes()).hexdigest() == spec["sha256"]
+
+
+def test_returned_snapshot_does_not_alias_later_stream_cleanup(monkeypatch):
+    retained = []
+    original = RequestEffects
+
+    class Retained(original):
+        def __init__(self, case):
+            super().__init__(case)
+            retained.append(self)
+
+    monkeypatch.setattr(sys.modules[__name__], "RequestEffects", Retained)
+    result = observe({"kind": "conversation"})
+    before = copy.deepcopy(result)
+    h = retained[0]
+    assert not h.controllers[-1].events.closed
+    h.controllers[-1].events.close()
+    assert h.events[-1] == ["close", {"tuple": ["/case/run/conv-static/events.jsonl"]}]
+    assert result == before
