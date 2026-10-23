@@ -27,6 +27,10 @@ add_library(llama
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
             llama-kv-cache-dsv4.cpp
+            inferssd/state-range.cpp
+            inferssd/state-iswa.cpp
+            inferssd/state-dsv4.cpp
+            inferssd/state-dsv4-constants.h
             llama-memory.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp

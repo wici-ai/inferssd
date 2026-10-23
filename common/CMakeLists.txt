@@ -96,7 +96,8 @@ add_library(${TARGET}
     preset.cpp
     preset.h
     regex-partial.cpp
-    reasoning-budget.cpp
+    inferssd/reasoning-budget.cpp
+    inferssd/reasoning-budget.h
     reasoning-budget.h
     regex-partial.h
     sampling.cpp
