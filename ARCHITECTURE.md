@@ -26,7 +26,10 @@ has no dependency on the core implementation. Kernels stay in their backend.
 
 The context owns sources, host registration, writer, transport and diagnostics.
 Executors borrow them. Graph failure fences outstanding seed consumers before
-reset; backend destruction quiesces transport before destroying CUDA streams.
+reset. A precompute transaction restores touched and purged KV metadata without
+allocating; it ends before compute submission. Stateful memory that cannot roll
+back a submitted failure clears affected sequences for checkpoint restore or replay.
+Backend destruction quiesces transport before destroying CUDA streams.
 The writer and source descriptors close after all borrowers stop. Allocation
 admission precedes allocation and first touch; committed allocations invalidate
 learning intervals when subsequently freed or replaced. Linux uses finite real

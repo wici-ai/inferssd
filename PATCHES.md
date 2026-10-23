@@ -123,12 +123,12 @@ from integration hooks when assessing future patch growth.
 | `ggml/src/ggml-zendnn/ggml-zendnn.cpp` | 1 | 0 |
 | `ggml/src/ggml.c` | 272 | 8 |
 | `ggml/src/gguf.cpp` | 7 | 0 |
-| `include/llama.h` | 85 | 0 |
+| `include/llama.h` | 88 | 1 |
 | `src/CMakeLists.txt` | 19 | 0 |
 | `src/llama-arch.cpp` | 114 | 2 |
 | `src/llama-arch.h` | 77 | 2 |
-| `src/llama-context.cpp` | 1297 | 27 |
-| `src/llama-context.h` | 149 | 1 |
+| `src/llama-context.cpp` | 1352 | 46 |
+| `src/llama-context.h` | 150 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
 | `src/llama-graph.cpp` | 758 | 49 |
@@ -136,13 +136,13 @@ from integration hooks when assessing future patch growth.
 | `src/llama-hparams.cpp` | 4 | 0 |
 | `src/llama-hparams.h` | 45 | 1 |
 | `src/llama-impl.h` | 35 | 0 |
-| `src/llama-kv-cache-iswa.cpp` | 24 | 3 |
-| `src/llama-kv-cache-iswa.h` | 25 | 0 |
-| `src/llama-kv-cache.cpp` | 169 | 67 |
-| `src/llama-kv-cache.h` | 45 | 0 |
-| `src/llama-kv-cells.h` | 50 | 26 |
+| `src/llama-kv-cache-iswa.cpp` | 41 | 3 |
+| `src/llama-kv-cache-iswa.h` | 28 | 0 |
+| `src/llama-kv-cache.cpp` | 250 | 123 |
+| `src/llama-kv-cache.h` | 57 | 0 |
+| `src/llama-kv-cells.h` | 132 | 25 |
 | `src/llama-memory-recurrent.cpp` | 6 | 0 |
-| `src/llama-memory.h` | 34 | 0 |
+| `src/llama-memory.h` | 70 | 0 |
 | `src/llama-mmap.cpp` | 132 | 3 |
 | `src/llama-mmap.h` | 7 | 0 |
 | `src/llama-model-loader.cpp` | 127 | 2 |
@@ -166,5 +166,5 @@ from integration hooks when assessing future patch growth.
 | `tools/server/server-task.cpp` | 195 | 183 |
 | `tools/server/server-task.h` | 23 | 80 |
 
-Total: 15274 added, 5269 removed across 135 upstream paths.
+Total: 15564 added, 5345 removed across 135 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
