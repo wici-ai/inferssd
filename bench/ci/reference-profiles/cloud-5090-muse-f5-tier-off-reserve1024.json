@@ -1,0 +1,715 @@
+{
+  "allocator_reserve_scope": {
+    "base_bytes": 1073741824,
+    "candidate_ready_context_bytes": 1073741824,
+    "candidate_tier_creation_required": false,
+    "difference": "f5 caches its fixed environment reserve from the first guarded allocation, including model loading. The candidate only registers its typed reserve at backend service attachment, after model loading and initial context transport creation; teardown also releases this registration.",
+    "measurement_boundary": "TTFT and token rates start at the formal completion request after context readiness. This draft does not claim equal whole-process startup or teardown reserve coverage.",
+    "registration_condition": "The reviewed nonempty expert.source resolves and the CUDA backend attaches runtime services; one live context on this GPU.",
+    "strict_lifecycle_alternative": {
+      "approved_or_applied": false,
+      "base_environment": {
+        "GGML_CUDA_MEMORY_RESERVE_MIB": "0"
+      },
+      "candidate_typed_settings": {
+        "vram.reserve_mib": 0
+      },
+      "scope": "If equal allocator reserve from model loading onward is required, a separately reviewed reserve-zero profile can align both at zero with tier off. That changes the requested reserve setting and must not be silently substituted into this profile."
+    }
+  },
+  "base_build_targets": [
+    "llama-server",
+    "kimi-vram-tier"
+  ],
+  "base_launch": {
+    "args": [
+      "/build/base/bin/llama-server",
+      "-m",
+      "/models/muse/Muse-Spark-Open-816B-A42B-Q4_K_S-00001-of-00022.gguf",
+      "--chat-template-file",
+      "/source/base/models/templates/muse-spark.jinja",
+      "-c",
+      "1024",
+      "-np",
+      "1",
+      "-t",
+      "10",
+      "-tb",
+      "10",
+      "-b",
+      "512",
+      "-ub",
+      "512",
+      "--ctx-checkpoints",
+      "0",
+      "--cache-ram",
+      "0",
+      "--fit",
+      "off",
+      "-ngl",
+      "99",
+      "-fa",
+      "on",
+      "--defer-experts",
+      "--no-repack",
+      "--no-warmup",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18080"
+    ],
+    "environment": {
+      "GGML_CUDA_MEMORY_RESERVE_MIB": "1024",
+      "GGML_KIMI_CPU_PREFILL_MAX_TOKENS": "4294967295",
+      "GGML_KIMI_CPU_SINK": "1",
+      "GGML_KIMI_CPU_SINK_CACHE_ALLOCATION": "uniform",
+      "GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS": "1",
+      "GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM": "1",
+      "GGML_KIMI_CPU_SINK_CACHE_POLICY": "count_decay2",
+      "GGML_KIMI_CPU_SINK_CACHE_PREFILL_READ": "1",
+      "GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE": "1",
+      "GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES": "536870912",
+      "GGML_KIMI_CPU_SINK_DECODE_RESERVE": "1",
+      "GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS": "64",
+      "GGML_KIMI_CPU_SINK_DYNAMIC_ROWS": "1",
+      "GGML_KIMI_CPU_SINK_EARLY_UP_GATE": "1",
+      "GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED": "1",
+      "GGML_KIMI_CPU_SINK_PREFETCH": "2",
+      "GGML_KIMI_CPU_SINK_READY_FIRST": "1",
+      "GGML_KIMI_CPU_SINK_RING_EXPERTS": "8",
+      "GGML_KIMI_CPU_SINK_ROLE_MAJOR": "1",
+      "GGML_KIMI_CPU_SINK_SPLIT_CV": "1",
+      "GGML_KIMI_CPU_SINK_THREADS": "10",
+      "GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD": "0",
+      "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+      "GGML_KIMI_CPU_SINK_VRAM_DECAY_HALF_LIFE": "16",
+      "GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD": "0",
+      "GGML_KIMI_CPU_SINK_VRAM_ELASTIC": "1",
+      "GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM": "1",
+      "GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS": "0",
+      "GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB": "1088",
+      "GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE": "0",
+      "GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL": "1",
+      "GGML_KIMI_CPU_SINK_VRAM_HOST_HEADROOM_MIB": "2048",
+      "GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS": "1",
+      "GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT": "2.5",
+      "GGML_KIMI_CPU_SINK_VRAM_POLICY": "count_decay2",
+      "GGML_KIMI_CPU_SINK_VRAM_PREFILL": "0",
+      "GGML_KIMI_CPU_SINK_VRAM_SAFETY_MIB": "1088",
+      "GGML_KIMI_CPU_SINK_VRAM_WATERMARK_HIGH_MIB": "1088",
+      "GGML_KIMI_CPU_SINK_VRAM_WATERMARK_LOW_MIB": "1024",
+      "GGML_KIMI_HOST_RESERVE_MIB": "1536",
+      "GGML_MOE_EXPERT_GGUF_ALIAS_TSV": "/build/base/assets/muse-alias.tsv",
+      "GGML_MOE_IO_BACKEND": "direct",
+      "GGML_MOE_IO_REQUIRE_DIRECT": "1",
+      "LD_LIBRARY_PATH": "/build/base/bin",
+      "LD_PRELOAD": "/build/base/bin/libkimi-vram-tier.so"
+    },
+    "template_sha256": "cb4bba2a98f56cbd925a93999f245b639d7c4912b087ee360233ec5e8211ef23"
+  },
+  "base_revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+  "candidate_launch": {
+    "args": [
+      "/build/candidate/bin/llama-server",
+      "-m",
+      "/models/muse/Muse-Spark-Open-816B-A42B-Q4_K_S-00001-of-00022.gguf",
+      "--chat-template-file",
+      "/source/candidate/models/templates/muse-spark.jinja",
+      "-c",
+      "1024",
+      "-np",
+      "1",
+      "-t",
+      "10",
+      "-tb",
+      "10",
+      "-b",
+      "512",
+      "-ub",
+      "512",
+      "--ctx-checkpoints",
+      "0",
+      "--cache-ram",
+      "0",
+      "--fit",
+      "off",
+      "-ngl",
+      "99",
+      "-fa",
+      "on",
+      "--defer-experts",
+      "--no-repack",
+      "--no-warmup",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18080",
+      "--ssd-settings",
+      "/models/checkpoint-settings.ssd"
+    ],
+    "environment": {
+      "LD_LIBRARY_PATH": "/build/candidate/bin"
+    },
+    "template_sha256": "cb4bba2a98f56cbd925a93999f245b639d7c4912b087ee360233ec5e8211ef23",
+    "typed_values": {
+      "cpu.compute_cpus": [],
+      "cpu.decode_participants": 0,
+      "cpu.io_cpus": [],
+      "cpu.threads": 10,
+      "expert.source": [
+        "/build/candidate/assets/muse-alias.tsv"
+      ],
+      "host.expert_cache_mib": 4096,
+      "host.headroom_mib": 2048,
+      "model.engram_prefetch": 0,
+      "model.hc_fused": 1,
+      "place.costs": {},
+      "prefetch.depth": 2,
+      "prefill.cpu_max_tokens": 4294967295,
+      "vram.budget": 0,
+      "vram.margin_mib": 1088,
+      "vram.max_slots": 0,
+      "vram.reserve_mib": 1024
+    }
+  },
+  "changes_from_historical_8gib_draft": {
+    "base_environment": {
+      "GGML_CUDA_MEMORY_RESERVE_MIB": "1024",
+      "GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD": "0",
+      "GGML_KIMI_CPU_SINK_VRAM_BYTES": "0",
+      "GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD": "0",
+      "GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE": "0",
+      "GGML_KIMI_CPU_SINK_VRAM_PREFILL": "0"
+    },
+    "explicit_model_settings": {
+      "model.engram_prefetch": 0,
+      "model.hc_fused": 1
+    },
+    "note": "All other fourteen-setting values are retained. The two model keys are explicit legacy defaults, not fabricated legacy telemetry. The added fixed allocator environment variable corrects the original 677-only draft to the reviewed a1bd ready-context behavior.",
+    "semantic_settings": {
+      "vram.budget": {
+        "from": 8589934592,
+        "to": 0
+      }
+    }
+  },
+  "legacy_mapping": {
+    "cpu.compute_cpus": {
+      "explanation": "Leave GGML_KIMI_CPU_SINK_COMPUTE_CPUS absent: empty vector means no explicit sink pinning. Both cgroup cpusets must permit the same entire CPU set.",
+      "inputs": [
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-cpu/kimi-cpu-sink.cpp",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "af8a09c0fe72faaa941e93094f27cb7ecf491fc0efb297e51b715b22abf1e1ac"
+        }
+      ],
+      "value": []
+    },
+    "cpu.decode_participants": {
+      "explanation": "Leave GGML_KIMI_CPU_SINK_DECODE_PARTICIPANTS absent. The legacy parser rejects 0; absence selects the same all/fast-cluster measured default policy. DECODE_THREAD_CHOICE stays absent/default true.",
+      "inputs": [
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-cpu/kimi-cpu-sink.cpp",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "af8a09c0fe72faaa941e93094f27cb7ecf491fc0efb297e51b715b22abf1e1ac"
+        }
+      ],
+      "value": 0
+    },
+    "cpu.io_cpus": {
+      "explanation": "Leave GGML_KIMI_CPU_SINK_IO_CPUS absent: no explicit I/O pinning; inherit the identical full allowed CPU set.",
+      "inputs": [
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-cpu/kimi-cpu-sink.cpp",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "af8a09c0fe72faaa941e93094f27cb7ecf491fc0efb297e51b715b22abf1e1ac"
+        }
+      ],
+      "value": []
+    },
+    "cpu.threads": {
+      "explanation": "10 total participants means 9 compute participants plus the I/O participant; shared -t/-tb are separately 10.",
+      "inputs": [
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_THREADS",
+          "value": "10"
+        },
+        {
+          "kind": "source-default",
+          "path": "src/llama-cpu-sink.h",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "d15cd506688755d03171e952835b1e077d507e99491914359f5fe9c0b8970367"
+        },
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-cpu/kimi-cpu-sink.cpp",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "af8a09c0fe72faaa941e93094f27cb7ecf491fc0efb297e51b715b22abf1e1ac"
+        }
+      ],
+      "value": 10
+    },
+    "expert.source": {
+      "explanation": "Base and candidate aliases must have identical bytes and resolve to the same 22 /models/muse shards. Canonical value uses the candidate typed path; the original base path remains in the recorded environment. Direct handles feed the CPU executor io_uring ring; no expert pack.",
+      "inputs": [
+        {
+          "kind": "environment",
+          "name": "GGML_MOE_EXPERT_GGUF_ALIAS_TSV",
+          "value": "/build/base/assets/muse-alias.tsv"
+        },
+        {
+          "kind": "environment",
+          "name": "GGML_MOE_IO_BACKEND",
+          "value": "direct"
+        },
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-ssd/store/parser.cpp",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "33927bc43019b4b4504325dfb2fa9f8c49e44665d74007649ec5e10dd55a4699"
+        },
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-ssd/store/legacy-config.h",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "d6440104668b9bbdc214314b981dd764b5dcd76faedca3bc439ef80ca64c777a"
+        }
+      ],
+      "value": [
+        "/build/candidate/assets/muse-alias.tsv"
+      ]
+    },
+    "host.expert_cache_mib": {
+      "explanation": "Darwin-only registry default 4096 is retained in the full typed snapshot, not applied or fabricated as Linux telemetry. Legacy Mac cache constructor also defaults to 4096; no SSD_LLAMA_MAC environment is set.",
+      "inputs": [
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-cpu/mac-expert-pack-cache.cpp",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "013319a443f2a06701c3ed256b7f7f9e4d30c01a68865d59c3d9ae263dff2f95"
+        }
+      ],
+      "value": 4096
+    },
+    "host.headroom_mib": {
+      "explanation": "Discrete-GPU-only adapter: legacy margin 512 MiB + explicit host reserve 1536 MiB = new process-arbiter system floor 2048 MiB; cgroup reserve remains 512 MiB. Legacy VRAM_HOST_HEADROOM is ignored on a discrete GPU. No unified-memory margin learning on this host. Re-review if final candidate changes arbiter semantics.",
+      "inputs": [
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES",
+          "value": "536870912"
+        },
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_HOST_RESERVE_MIB",
+          "value": "1536"
+        },
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_VRAM_HOST_HEADROOM_MIB",
+          "value": "2048"
+        },
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-cpu/kimi-host-ledger.h",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "4d9c258b6c4740addfba265ab30298b9262f68675e9a4e7a612a67bcb424ef44"
+        }
+      ],
+      "value": 2048
+    },
+    "model.engram_prefetch": {
+      "explanation": "LLAMA_DSV41_ENGRAM_PREFETCH remains absent: old function enables only exact 1; no Muse execution effect.",
+      "inputs": [
+        {
+          "kind": "source-default",
+          "path": "src/models/deepseek41.cpp",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "eeef5430bb21135b1d571dd2240e0309fbd40f463336d39f23e9e0225ec3ad47"
+        }
+      ],
+      "value": 0
+    },
+    "model.hc_fused": {
+      "explanation": "LLAMA_DSV41_HC_FUSED remains absent: old function disables only exact 0; no Muse execution effect.",
+      "inputs": [
+        {
+          "kind": "source-default",
+          "path": "src/models/deepseek41.cpp",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "eeef5430bb21135b1d571dd2240e0309fbd40f463336d39f23e9e0225ec3ad47"
+        }
+      ],
+      "value": 1
+    },
+    "place.costs": {
+      "explanation": "Both GGML_KIMI_CPU_PREFILL_COST and GGML_KIMI_CPU_PREFILL_MXFP4_COST remain absent. Identical priors: CPU 204/87 us, GPU 25/8.2 us, host 0/0, link 6.74 GB/s, pageable/drive/fixed 0, token -1 sentinel; runtime calibration remains enabled.",
+      "inputs": [
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "c3eeaeac45d33a3ff7bb2a26386e267878d8955560bea35daab66349ebf879ff"
+        }
+      ],
+      "value": {}
+    },
+    "prefetch.depth": {
+      "explanation": "2 next-layer predicted experts. The fixed ready-first/nonblocking prerequisites are explicitly enabled in base.",
+      "inputs": [
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_PREFETCH",
+          "value": "2"
+        },
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-cpu/kimi-cpu-sink.cpp",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "af8a09c0fe72faaa941e93094f27cb7ecf491fc0efb297e51b715b22abf1e1ac"
+        }
+      ],
+      "value": 2
+    },
+    "prefill.cpu_max_tokens": {
+      "explanation": "Every ubatch uses the CPU sink grouped-prefill route; GGML_KIMI_CPU_PREFILL must stay absent because the two spellings conflict.",
+      "inputs": [
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_PREFILL_MAX_TOKENS",
+          "value": "4294967295"
+        },
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK",
+          "value": "1"
+        },
+        {
+          "kind": "source-default",
+          "path": "src/llama-context.cpp",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "f6d24fa10d70b7cb3d81bafadc62207e35dab9d66bdb00fbd24d8f52415e52dc"
+        }
+      ],
+      "value": 4294967295
+    },
+    "vram.budget": {
+      "explanation": "Numeric zero disables the expert GPU tier. Explicitly disable prefill, exclusive, deferred and async upload to match the candidate production derivation. CACHE_LOCATIONS stays absent/default false. The legacy initializer returns before api->create; dense and attention GPU offload remain unchanged.",
+      "inputs": [
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_VRAM_BYTES",
+          "value": "0"
+        },
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_VRAM_PREFILL",
+          "value": "0"
+        },
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE",
+          "value": "0"
+        },
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD",
+          "value": "0"
+        },
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD",
+          "value": "0"
+        },
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "c3eeaeac45d33a3ff7bb2a26386e267878d8955560bea35daab66349ebf879ff"
+        }
+      ],
+      "value": 0
+    },
+    "vram.margin_mib": {
+      "explanation": "Retain the configured 1088 MiB margin; expert-tier safety/high-watermark logic is inactive when its context is absent. This does not disable the separate CUDA allocator reserve.",
+      "inputs": [
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_VRAM_SAFETY_MIB",
+          "value": "1088"
+        },
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB",
+          "value": "1088"
+        },
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_VRAM_WATERMARK_HIGH_MIB",
+          "value": "1088"
+        },
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-cuda/kimi-vram-tier/vram-tier.cpp",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "c14c654e48c52a5ac1fcf6efe27c29e918accd13d92a516dd9631a2275d89677"
+        }
+      ],
+      "value": 1088
+    },
+    "vram.max_slots": {
+      "explanation": "Retain the same configured maximum 0. The expert GPU context is not created, so slot growth and its cap are inactive in this profile.",
+      "inputs": [
+        {
+          "kind": "environment",
+          "name": "GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS",
+          "value": "0"
+        },
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-cuda/kimi-vram-tier/vram-tier.cpp",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "c14c654e48c52a5ac1fcf6efe27c29e918accd13d92a516dd9631a2275d89677"
+        }
+      ],
+      "value": 0
+    },
+    "vram.reserve_mib": {
+      "explanation": "The original fixed CUDA allocator environment reserve remains 1024 MiB even with the expert tier disabled. The candidate registers the same 1024 MiB when the context attaches CUDA services, independently of tier creation. This mapping covers the ready-context request measurement only: the legacy fixed guard also covers earlier model loading, while the candidate context guard does not yet exist during model loading or before service attachment.",
+      "inputs": [
+        {
+          "kind": "environment",
+          "name": "GGML_CUDA_MEMORY_RESERVE_MIB",
+          "value": "1024"
+        },
+        {
+          "kind": "source-default",
+          "path": "ggml/src/ggml-cuda/ggml-cuda.cu",
+          "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+          "sha256": "d409449e9cf2da28dc80f95770d79f3472473b72e4fd191282793d61e688e016"
+        }
+      ],
+      "value": 1024
+    }
+  },
+  "profile_id": "cloud-5090-muse-f5-tier-off-reserve1024",
+  "purpose": "reviewed-tier-off-launch-mapping-draft",
+  "resource_contract": {
+    "cpuset": "same full allowed set, no taskset or per-participant placement",
+    "memory_max_bytes": 68719476736,
+    "memory_swap_max_bytes": 0,
+    "request": "same pinned 512-token prompt; exactly 256 generated tokens; one attempt per side",
+    "toolchain": "same CUDA 12.8 / GCC 12 / CUDA architecture 120a"
+  },
+  "reviewed_candidate_revision": "a1bd9d22248dc897e288af303cde9c501952b347",
+  "schema_version": 1,
+  "scope": {
+    "comparison_scope": "A separately named same-tier-off structure comparison after both contexts report ready. No model request has been executed for this draft.",
+    "dense_gpu_layers": 99,
+    "device": "cloud-5090",
+    "expert_gpu_tier": "off on both sides",
+    "full_device_gate": false,
+    "model": "Muse-Spark-Open-816B-A42B-Q4_K_S",
+    "performance_acceptance": false,
+    "proves_8gib_tier_no_regression": false,
+    "sampling": "One first completion per side at the fixed short prompt and 256 output tokens; no automatic retries or best-sample selection.",
+    "source_policy": "Untouched original f5; no compatibility patch, quantization change, budget substitution on one side, or bypass of format guards."
+  },
+  "semantic_settings": {
+    "cpu.compute_cpus": [],
+    "cpu.decode_participants": 0,
+    "cpu.io_cpus": [],
+    "cpu.threads": 10,
+    "expert.source": [
+      "/build/candidate/assets/muse-alias.tsv"
+    ],
+    "host.expert_cache_mib": 4096,
+    "host.headroom_mib": 2048,
+    "model.engram_prefetch": 0,
+    "model.hc_fused": 1,
+    "place.costs": {},
+    "prefetch.depth": 2,
+    "prefill.cpu_max_tokens": 4294967295,
+    "vram.budget": 0,
+    "vram.margin_mib": 1088,
+    "vram.max_slots": 0,
+    "vram.reserve_mib": 1024
+  },
+  "source_evidence": {
+    "a1bd9d22248dc897e288af303cde9c501952b347": {
+      "common/common.cpp": "a579ff206d34b723c2698df8082e92acc2195e1e939a35728b95a56d973f3f04",
+      "ggml/src/ggml-cpu/ssd/cpu-sink-vram.inc": "037b9ed1fe62f9dc9684f9cbc9c199171a5beb523cdd4b387d4d7512cc564f90",
+      "ggml/src/ggml-cuda/ggml-cuda.cu": "a7584af42e1b269145550ed5cb7704fecb5114f3297f02bf663c3d8d5385fe6b",
+      "ggml/src/ggml-ssd/host/arbiter.cpp": "afa5286693cddcc72de0001974d920b9e9fb369b293e240f17fead78ae93f16c",
+      "ggml/src/ggml-ssd/host/ledger.h": "2c50932ff88711b285be46ce7d434c07c4d6723dd5d2ce01eb017692ecd4cca0",
+      "ggml/src/ggml-ssd/settings/registry.def": "40ccaabe7869b55c973904edfabc2a005cc0eaa34669d27f17df7213349923b7",
+      "ggml/src/ggml-ssd/settings/settings.cpp": "9426bf27d99ba7cc129a1ebaddd189f5962e4144e5d0d0d94dab02970d7cbc36",
+      "src/llama-context.cpp": "8c803350fc516fce93a20829eda3ba53dee9870078430b51f5ce5f44e28a737e",
+      "src/ssd/cpu-runtime.h": "651e3289a08d7740785477f54d522c0551d37d506f4f1f76760afcac2c0556e5",
+      "src/ssd/options.cpp": "357c9726ce97481483a7c581ca571199c7a64572d81695b9e23802077f99a0d4",
+      "tools/inferssd/src/inferssd/configuration/schema.json": "2384c7eec72901d1e9f41f00f759c27f33a15b60c1e7ff5fb65ad339c89cdf52"
+    },
+    "f5e6e26ff26d2014cccef0118048039b88163f54": {
+      "ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc": "c3eeaeac45d33a3ff7bb2a26386e267878d8955560bea35daab66349ebf879ff",
+      "ggml/src/ggml-cpu/kimi-cpu-sink.cpp": "af8a09c0fe72faaa941e93094f27cb7ecf491fc0efb297e51b715b22abf1e1ac",
+      "ggml/src/ggml-cpu/kimi-host-ledger.h": "4d9c258b6c4740addfba265ab30298b9262f68675e9a4e7a612a67bcb424ef44",
+      "ggml/src/ggml-cpu/mac-expert-pack-cache.cpp": "013319a443f2a06701c3ed256b7f7f9e4d30c01a68865d59c3d9ae263dff2f95",
+      "ggml/src/ggml-cuda/ggml-cuda.cu": "d409449e9cf2da28dc80f95770d79f3472473b72e4fd191282793d61e688e016",
+      "ggml/src/ggml-cuda/kimi-vram-tier/vram-tier.cpp": "c14c654e48c52a5ac1fcf6efe27c29e918accd13d92a516dd9631a2275d89677",
+      "ggml/src/ggml-ssd/store/legacy-config.h": "d6440104668b9bbdc214314b981dd764b5dcd76faedca3bc439ef80ca64c777a",
+      "ggml/src/ggml-ssd/store/parser.cpp": "33927bc43019b4b4504325dfb2fa9f8c49e44665d74007649ec5e10dd55a4699",
+      "src/llama-context.cpp": "f6d24fa10d70b7cb3d81bafadc62207e35dab9d66bdb00fbd24d8f52415e52dc",
+      "src/llama-cpu-sink.h": "d15cd506688755d03171e952835b1e077d507e99491914359f5fe9c0b8970367",
+      "src/models/deepseek41.cpp": "eeef5430bb21135b1d571dd2240e0309fbd40f463336d39f23e9e0225ec3ad47"
+    }
+  },
+  "static_flow_evidence": [
+    {
+      "claim": "The old environment independently sets async, exclusive, deferred and GPU prefill.",
+      "kind": "source-default",
+      "line_end": 154,
+      "line_start": 134,
+      "path": "ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc",
+      "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+      "sha256": "c3eeaeac45d33a3ff7bb2a26386e267878d8955560bea35daab66349ebf879ff"
+    },
+    {
+      "claim": "Zero returns before GPU API lookup and context creation; exclusive/locations/deferred/prefill must be off.",
+      "kind": "source-default",
+      "line_end": 252,
+      "line_start": 247,
+      "path": "ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc",
+      "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+      "sha256": "c3eeaeac45d33a3ff7bb2a26386e267878d8955560bea35daab66349ebf879ff"
+    },
+    {
+      "claim": "No-context load reserve and decode prepare return before the GPU format API.",
+      "kind": "source-default",
+      "line_end": 414,
+      "line_start": 389,
+      "path": "ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc",
+      "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+      "sha256": "c3eeaeac45d33a3ff7bb2a26386e267878d8955560bea35daab66349ebf879ff"
+    },
+    {
+      "claim": "No-context grouped-prefill preparation returns before the GPU prefill API.",
+      "kind": "source-default",
+      "line_end": 595,
+      "line_start": 566,
+      "path": "ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc",
+      "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+      "sha256": "c3eeaeac45d33a3ff7bb2a26386e267878d8955560bea35daab66349ebf879ff"
+    },
+    {
+      "claim": "auto and numeric zero are distinct parsed budget values.",
+      "kind": "source-default",
+      "line_end": 141,
+      "line_start": 133,
+      "path": "ggml/src/ggml-ssd/settings/settings.cpp",
+      "revision": "a1bd9d22248dc897e288af303cde9c501952b347",
+      "sha256": "9426bf27d99ba7cc129a1ebaddd189f5962e4144e5d0d0d94dab02970d7cbc36"
+    },
+    {
+      "claim": "Production zero derives all four tier features false and returns before context creation.",
+      "kind": "source-default",
+      "line_end": 136,
+      "line_start": 94,
+      "path": "ggml/src/ggml-cpu/ssd/cpu-sink-vram.inc",
+      "revision": "a1bd9d22248dc897e288af303cde9c501952b347",
+      "sha256": "037b9ed1fe62f9dc9684f9cbc9c199171a5beb523cdd4b387d4d7512cc564f90"
+    },
+    {
+      "claim": "No-context load reserve and decode prepare return.",
+      "kind": "source-default",
+      "line_end": 293,
+      "line_start": 268,
+      "path": "ggml/src/ggml-cpu/ssd/cpu-sink-vram.inc",
+      "revision": "a1bd9d22248dc897e288af303cde9c501952b347",
+      "sha256": "037b9ed1fe62f9dc9684f9cbc9c199171a5beb523cdd4b387d4d7512cc564f90"
+    },
+    {
+      "claim": "No-context grouped-prefill preparation returns before initialize_format can be called.",
+      "kind": "source-default",
+      "line_end": 470,
+      "line_start": 441,
+      "path": "ggml/src/ggml-cpu/ssd/cpu-sink-vram.inc",
+      "revision": "a1bd9d22248dc897e288af303cde9c501952b347",
+      "sha256": "037b9ed1fe62f9dc9684f9cbc9c199171a5beb523cdd4b387d4d7512cc564f90"
+    },
+    {
+      "claim": "The legacy fixed allocator reserve is independent of GPU expert-tier context creation.",
+      "kind": "source-default",
+      "line_end": 560,
+      "line_start": 531,
+      "path": "ggml/src/ggml-cuda/ggml-cuda.cu",
+      "revision": "f5e6e26ff26d2014cccef0118048039b88163f54",
+      "sha256": "d409449e9cf2da28dc80f95770d79f3472473b72e4fd191282793d61e688e016"
+    },
+    {
+      "claim": "The typed reserve is copied into runtime services unconditionally, independently of tier budget.",
+      "kind": "source-default",
+      "line_end": 164,
+      "line_start": 157,
+      "path": "src/ssd/options.cpp",
+      "revision": "a1bd9d22248dc897e288af303cde9c501952b347",
+      "sha256": "357c9726ce97481483a7c581ca571199c7a64572d81695b9e23802077f99a0d4"
+    },
+    {
+      "claim": "Configured sources attach CUDA services independently of expert-tier creation.",
+      "kind": "source-default",
+      "line_end": 220,
+      "line_start": 182,
+      "path": "src/ssd/options.cpp",
+      "revision": "a1bd9d22248dc897e288af303cde9c501952b347",
+      "sha256": "357c9726ce97481483a7c581ca571199c7a64572d81695b9e23802077f99a0d4"
+    },
+    {
+      "claim": "CUDA services attach before CPU executor creation/use in context setup.",
+      "kind": "source-default",
+      "line_end": 355,
+      "line_start": 340,
+      "path": "src/llama-context.cpp",
+      "revision": "a1bd9d22248dc897e288af303cde9c501952b347",
+      "sha256": "8c803350fc516fce93a20829eda3ba53dee9870078430b51f5ce5f44e28a737e"
+    },
+    {
+      "claim": "Backend service attachment registers the context allocation reserve.",
+      "kind": "source-default",
+      "line_end": 5776,
+      "line_start": 5755,
+      "path": "ggml/src/ggml-cuda/ggml-cuda.cu",
+      "revision": "a1bd9d22248dc897e288af303cde9c501952b347",
+      "sha256": "a7584af42e1b269145550ed5cb7704fecb5114f3297f02bf663c3d8d5385fe6b"
+    },
+    {
+      "claim": "CUDA allocations use the maximum of dynamic and registered context reserves.",
+      "kind": "source-default",
+      "line_end": 167,
+      "line_start": 146,
+      "path": "ggml/src/ggml-cuda/ggml-cuda.cu",
+      "revision": "a1bd9d22248dc897e288af303cde9c501952b347",
+      "sha256": "a7584af42e1b269145550ed5cb7704fecb5114f3297f02bf663c3d8d5385fe6b"
+    },
+    {
+      "claim": "Model loading precedes context initialization, so context reserve does not cover that earlier phase.",
+      "kind": "source-default",
+      "line_end": 1235,
+      "line_start": 1159,
+      "path": "common/common.cpp",
+      "revision": "a1bd9d22248dc897e288af303cde9c501952b347",
+      "sha256": "a579ff206d34b723c2698df8082e92acc2195e1e939a35728b95a56d973f3f04"
+    }
+  ],
+  "status": "static-reviewed-not-executed",
+  "unresolved": [
+    "This is a static mapping draft, not an executable comparison binding, a dispatched job, or performance evidence.",
+    "An operator must explicitly accept the ready-context reserve scope; equal whole-process startup reserve coverage is not established by the 1024/1024 values.",
+    "Pin the exact executed candidate SHA and verify these source identities; re-review source differences instead of silently substituting another revision.",
+    "Provide actual model identities, identical alias bytes, typed settings file digest, full launch/profile hashes, root manifest/config hashes and actual mapped-library identities before any comparison.",
+    "Any observed slowdown in the single pair is inconclusive. No result from this profile establishes no regression for the 8 GiB expert-tier mode."
+  ]
+}
