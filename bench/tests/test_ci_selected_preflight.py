@@ -90,7 +90,8 @@ def setup(tmp_path, monkeypatch, *, change=None, fault=None, paths=None):
         output.mkdir(parents=True, exist_ok=False)
         measured = dict(metrics=dict(decode_first128_tps=1, decode_second128_tps=1,
             decode_tps=1, ttft_s=1, server_prefill_tps=1),
-            input_tokens=1, timings=dict(prompt_n=1, prompt_ms=1000), prompt_ids=[1], prompt_sha256="a" * 64)
+            input_tokens=1, timings=dict(prompt_n=1, prompt_ms=1000), prompt_ids=[1], prompt_sha256="a" * 64,
+            output_tokens=256, tokens=[11] * 256)
         save(output / "result.json", measured)
         return dict(status="passed", cleanup_confirmed=True, completion_requests=1)
 
