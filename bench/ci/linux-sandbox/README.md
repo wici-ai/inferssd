@@ -127,7 +127,8 @@ Recent systemd versions can mask proc files in the parent namespace before
 bubblewrap creates the nested PID namespace's procfs; Linux then refuses the
 new proc mount. For the dedicated launcher only, the broker omits the redundant
 parent `ProtectKernelTunables`/`ProtectKernelLogs` mounts. Bubblewrap still
-creates a new PID/user/mount namespace and makes that private `/proc` read-only;
-`/sys` remains a read-only bind, capabilities remain dropped, and no host `/proc`
-is exposed. Native proof checks the private namespaces, read-only proc mount,
-denied kernel-tunable write, hidden helper and denied nested user namespace.
+creates a new PID/user/mount namespace with a private `/proc` and read-only
+`/proc/sys`. CUDA may write its own thread names through `/proc/self/task/*/comm`;
+`/sys` remains a read-only bind, capabilities remain dropped, and no host PID
+namespace is exposed. Native proof checks writable own-task metadata, read-only
+kernel tunables, private namespaces, hidden helper and denied nested user namespace.
