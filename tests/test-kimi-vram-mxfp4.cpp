@@ -1,3 +1,5 @@
+#include "vram-compute-api.h"
+#include "ssd/gpu-kernels.h"
 #include "ssd/explicit-fixture-inputs.h"
 // The real CPU sink with the VRAM tier on MXFP4 experts and the DeepSeek-V4.1
 // clamped SwiGLU: every output must equal a CPU-only sink bit for bit while GPU
@@ -7,11 +9,10 @@
 // opt-in GPU hidden chain, SWIGLU_CLAMP outputs stay within 1e-3 relative L2 of the
 // CPU sink (not bitwise) and SiTU keeps the bitwise bridge.
 // Synthetic packed weights avoid a model dependency.
-// Run with libkimi-mxfp4-parity.so and libkimi-vram-tier.so preloaded.
+// Normally linked backend and strict MXFP4 objects; no preload.
 #define main original_sink_test_main
 #include "test-kimi-cpu-sink.cpp"
 #undef main
-#include <dlfcn.h>
 #include "kimi-host-jobs-test.inc"
 
 namespace {
@@ -63,7 +64,7 @@ void flipped_dot(int n, float * s, size_t bs, const void * x, size_t bx, const v
 // fail the decode call with the failing check named, again on a retry (no
 // fallback, no silent CPU-only continuation).
 void selfcheck_mismatch(fixture_inputs & inputs, const char * label, ggml_vec_dot_t reference, const char * expected, size_t & checks) {
-    const auto hook = reinterpret_cast<selfcheck_hook_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_mxfp4_selfcheck_reference_for_testing"));
+    const auto hook = kimi_vram_mxfp4_selfcheck_reference_for_testing;
     require(hook != nullptr, "MXFP4 self-check test hook is not exported by the tier DSO");
     fixture f;
     f.type = f.down_type = GGML_TYPE_MXFP4;
@@ -103,7 +104,7 @@ void selfcheck_mismatch(fixture_inputs & inputs, const char * label, ggml_vec_do
 // With the GPU hidden chain on, the engine skips the parity self-check: a mismatching CPU
 // reference must not refuse the tier, and the chain keeps producing finite outputs.
 void selfcheck_skipped_with_chain(fixture_inputs & inputs, size_t & checks) {
-    const auto hook = reinterpret_cast<selfcheck_hook_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_mxfp4_selfcheck_reference_for_testing"));
+    const auto hook = kimi_vram_mxfp4_selfcheck_reference_for_testing;
     require(hook != nullptr, "MXFP4 self-check test hook is not exported by the tier DSO");
     fixture f;
     f.type = f.down_type = GGML_TYPE_MXFP4;
@@ -535,7 +536,7 @@ void run_grouped_prefill_cold_transients(fixture_inputs & inputs, size_t & compa
 }
 
 int main() {
-    fixture_inputs inputs;
+    fixture_inputs inputs; inputs.set_runtime_services(test_gpu_services());
     try {
         ggml_cpu_init();
         inputs.set("ready_first", "1");

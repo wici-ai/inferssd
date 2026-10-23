@@ -1,5 +1,6 @@
+#include "ssd/gpu-kernels.h"
 #include "ssd/explicit-fixture-inputs.h"
-// The grouped prefill engine of the VRAM tier (kimi-vram-tier/group-compute-adapter.cu) against the CPU lane
+// The grouped prefill engine of the VRAM tier (ggml-cuda/ssd/group-compute-adapter.cu) against the CPU lane
 // (kimi_cpu_prefill_run_activation) on the same packed experts.
 //
 // Default: three expert formats, 16 experts, top 8, at 1, 33 and 300 tokens (one expert takes every token of the 300,
@@ -41,7 +42,6 @@
 #include "vram-compute-api.h"
 
 #include <cuda_runtime.h>
-#include <dlfcn.h>
 #include <strings.h>
 
 #include <atomic>
@@ -52,14 +52,7 @@ void cuda(cudaError_t rc, const char * what) {
 }
 
 const vram_group_compute_api * engine_api() {
-    auto get = reinterpret_cast<vram_group_compute_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_group_compute_get_api"));
-    if (!get) {
-        void * tier = dlopen("libkimi-vram-tier.so", RTLD_NOW | RTLD_GLOBAL);
-        require(tier, std::string("cannot load libkimi-vram-tier.so: ") + dlerror());
-        get = reinterpret_cast<vram_group_compute_get_api_fn>(dlsym(tier, "kimi_vram_group_compute_get_api"));
-    }
-    require(get, "kimi_vram_group_compute_get_api is missing from the tier DSO");
-    const auto * api = get();
+    const auto * api = kimi_vram_group_compute_get_api();
     require(api && api->version == 2 && api->size == sizeof(vram_group_compute_api), "grouped engine API version");
     return api;
 }
@@ -894,7 +887,7 @@ void run_timing(fixture_inputs & inputs, const time_options & o) {
 } // namespace
 
 int main(int argc, char ** argv) {
-    fixture_inputs inputs;
+    fixture_inputs inputs; inputs.set_runtime_services(test_gpu_services());
     try {
         ggml_cpu_init();
         inputs.set("ready_first", "1");

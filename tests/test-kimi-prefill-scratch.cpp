@@ -1,3 +1,6 @@
+#ifdef KIMI_SCRATCH_MXFP4_ONLY
+#include "ssd/gpu-kernels.h"
+#endif
 #include "ssd/explicit-fixture-inputs.h"
 // Reuse one real grouped-prefill handle as expert service moves CPU -> GPU.
 // Synthetic packed weights; real tier kernels; zero input is an exact oracle
@@ -111,6 +114,9 @@ void run_case(fixture_inputs & inputs, ggml_type type, int tokens, int activatio
 
 int main(int argc, char ** argv) {
     fixture_inputs inputs;
+#ifdef KIMI_SCRATCH_MXFP4_ONLY
+    inputs.set_runtime_services(test_gpu_services());
+#endif
     try {
         ggml_cpu_init();
         #ifdef KIMI_SCRATCH_MXFP4_ONLY

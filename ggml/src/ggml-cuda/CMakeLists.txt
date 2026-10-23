@@ -104,12 +104,6 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
-    if (GGML_CUDA_KIMI_VRAM_TIER)
-        if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT GGML_CPU)
-            message(FATAL_ERROR "Kimi VRAM tier requires Linux and the CPU backend")
-        endif()
-        add_subdirectory(kimi-vram-tier)
-    endif()
     list(APPEND GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/moe_stream_decode_batch.cu")
     list(REMOVE_DUPLICATES GGML_SOURCES_CUDA)
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
@@ -137,6 +131,13 @@ if (CUDAToolkit_FOUND)
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
+
+    if (GGML_CUDA_KIMI_VRAM_TIER)
+        if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT GGML_CUDA_MOE_STREAM)
+            message(FATAL_ERROR "SSD CUDA executor requires Linux and GGML_CUDA_MOE_STREAM")
+        endif()
+        add_subdirectory(ssd)
+    endif()
 
     if (LLAMA_SSD_STORE)
         target_link_libraries(ggml-cuda PRIVATE ggml-ssd-c0-store)

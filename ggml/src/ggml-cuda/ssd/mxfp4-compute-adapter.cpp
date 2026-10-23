@@ -2,7 +2,7 @@
 #include "ggml-kimi-mxfp4-parity.h"
 #include "ggml-kimi-mxfp4-chain.h"
 #include "ggml.h"
-#include "ggml-cpu.h"
+#include "ggml-ssd/gpu/kernels.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -10,7 +10,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -18,7 +17,7 @@
 namespace {
 // Test hook (kimi_vram_mxfp4_selfcheck_reference_for_testing): replaces the CPU
 // reference of later engine self-checks. Nothing in llama.cpp sets it.
-std::atomic<ggml_vec_dot_t> selfcheck_reference{nullptr};
+std::atomic<ssd::gpu::vec_dot_t> selfcheck_reference{nullptr};
 
 // splitmix64, fully specified, so the self-check rows are the same in every
 // build and on every host.
@@ -69,7 +68,7 @@ struct format_bridge {
     kimi_mxfp4_gpu * gpu = nullptr;
     const kimi_mxfp4_gpu_chain_api_v1 * chain_api = nullptr;
     kimi_mxfp4_gpu_chain * chain = nullptr;
-    void * base_getter = nullptr;
+    ssd::gpu::cpu_kernels_v1 cpu{};
     int latent, hidden, max_hits, chain_kernel = -1;
     bool timing = false;
     size_t up_stride = 0, down_stride = 0, input_bytes = 0, hidden_bytes = 0;
@@ -81,31 +80,28 @@ struct format_bridge {
     host_timing host;
 
     format_bridge(int device, int l, int h, int n, int weight_type, int down_type,
-            bool gpu_hidden = true, bool profile = false) : latent(l), hidden(h), max_hits(n), timing(profile) {
+            const ssd::gpu::cpu_kernels_v1 * kernels, bool gpu_hidden = true, bool profile = false,
+            const kimi_mxfp4_gpu_api_v1 * component = nullptr,
+            const kimi_mxfp4_gpu_chain_api_v1 * extension = nullptr) : latent(l), hidden(h), max_hits(n), timing(profile) {
         if (weight_type != GGML_TYPE_MXFP4 || down_type != GGML_TYPE_MXFP4) {
             throw std::runtime_error("format VRAM engine supports MXFP4 up/gate/down experts only");
         }
         if (l <= 0 || h <= 0 || l > 16384 || h > 16384 || l % 64 || h % 64 || n < 1 || n > 16) {
             throw std::runtime_error("unsupported MXFP4 VRAM expert geometry");
         }
-        base_getter = dlsym(RTLD_DEFAULT, "kimi_mxfp4_gpu_get_api_v1");
-        auto get = reinterpret_cast<const kimi_mxfp4_gpu_api_v1 * (*)()>(base_getter);
-        if (!get) { throw std::runtime_error("MXFP4 parity component (libkimi-mxfp4-parity.so) missing; no fallback"); }
-        api = get();
+        if (!ssd::gpu::valid(kernels)) { throw std::runtime_error("CPU kernels provider missing or incompatible"); }
+        cpu = *kernels;
+        api = component ? component : kimi_mxfp4_gpu_get_api_v1();
+        chain_api = extension;
         if (!api || api->version != 1 || api->job_size != sizeof(kimi_mxfp4_gpu_job) || !api->create ||
                 !api->submit || !api->wait || !api->result || !api->error || !api->destroy ||
                 !api->device_bytes || !api->host_bytes || !api->upload || !api->release_weights) {
             throw std::runtime_error("MXFP4 parity component ABI mismatch");
         }
-        const auto * traits = ggml_get_type_traits_cpu(GGML_TYPE_MXFP4);
-        const auto * input = traits ? ggml_get_type_traits_cpu(traits->vec_dot_type) : nullptr;
-        if (!traits || !traits->vec_dot || traits->vec_dot_type != GGML_TYPE_Q8_0 || !input || !input->from_float) {
-            throw std::runtime_error("CPU MXFP4 vec_dot or Q8_0 quantizer unavailable");
-        }
         if (ggml_type_size(GGML_TYPE_MXFP4) != 17 || ggml_blck_size(GGML_TYPE_MXFP4) != 32) {
             throw std::runtime_error("unexpected MXFP4 block layout");
         }
-        quantize = input->from_float;
+        quantize = cpu.quantize_q8_0;
         up_stride = ggml_row_size(GGML_TYPE_MXFP4, l);
         down_stride = ggml_row_size(GGML_TYPE_MXFP4, h);
         input_bytes = ggml_row_size(GGML_TYPE_Q8_0, l);
@@ -117,7 +113,7 @@ struct format_bridge {
         char error[512] = {};
         gpu = api->create(&config, error, sizeof(error));
         if (!gpu) { throw std::runtime_error(error); }
-        std::fprintf(stderr, "[kimi_vram_bridge] format=mxfp4 latent=%d hidden=%d hidden_quantizer=linked_ggml_cpu\n", l, h);
+        std::fprintf(stderr, "[kimi_vram_bridge] format=mxfp4 latent=%d hidden=%d hidden_quantizer=injected_ggml_cpu\n", l, h);
         try {
             // The parity self-check guards bitwise equality with the CPU sink only. The GPU hidden
             // chain makes no such claim, so it starts without the check and also runs on hosts
@@ -134,13 +130,7 @@ struct format_bridge {
     // extension, which must come from the same DSO as the base API.
     void configure_extensions(bool gpu_hidden) {
         if (gpu_hidden || timing) {
-            auto get_chain = reinterpret_cast<const kimi_mxfp4_gpu_chain_api_v1 * (*)()>(dlsym(RTLD_DEFAULT, "kimi_mxfp4_gpu_get_chain_api_v1"));
-            Dl_info base_info = {}, chain_info = {};
-            if (!get_chain || !dladdr(base_getter, &base_info) || !dladdr(reinterpret_cast<void *>(get_chain), &chain_info) ||
-                    base_info.dli_fbase != chain_info.dli_fbase) {
-                throw std::runtime_error("MXFP4 chain extension missing from the parity component DSO; no fallback");
-            }
-            chain_api = get_chain();
+            if (!chain_api) { chain_api = kimi_mxfp4_gpu_get_chain_api_v1(); }
             if (!chain_api || chain_api->version != 1 || chain_api->size != sizeof(*chain_api) || !chain_api->create ||
                     !chain_api->submit || !chain_api->destroy || !chain_api->host_bytes || !chain_api->device_bytes ||
                     !chain_api->set_timing || !chain_api->set_timing_stage || !chain_api->timing) {
@@ -208,8 +198,8 @@ struct format_bridge {
     // bit for bit; otherwise engine creation fails closed. No override exists.
     void self_check() {
         const auto start = std::chrono::steady_clock::now();
-        const ggml_vec_dot_t replaced = selfcheck_reference.load();
-        const ggml_vec_dot_t reference = replaced ? replaced : ggml_get_type_traits_cpu(GGML_TYPE_MXFP4)->vec_dot;
+        const ssd::gpu::vec_dot_t replaced = selfcheck_reference.load();
+        const ssd::gpu::vec_dot_t reference = replaced ? replaced : cpu.reference_mxfp4;
         const char * reference_name = replaced ? "test_override" : "linked_cpu_vec_dot";
         selfcheck_totals totals;
         for (int stage = 0; stage < 2; ++stage) {
@@ -219,7 +209,7 @@ struct format_bridge {
         std::fprintf(stderr, "[kimi_vram_bridge] mxfp4_selfcheck=pass checks=%d jobs=%d rows=%zu columns=%d,%d reference=%s us=%.0f\n",
             totals.checks, totals.jobs, totals.rows, latent, hidden, reference_name, us);
     }
-    void run_check(ggml_vec_dot_t reference, const char * reference_name, int stage, int family, selfcheck_totals & totals) {
+    void run_check(ssd::gpu::vec_dot_t reference, const char * reference_name, int stage, int family, selfcheck_totals & totals) {
         const int columns = stage ? hidden : latent, blocks = columns / 32, rows = selfcheck_rows;
         char name[64];
         std::snprintf(name, sizeof(name), "%s_c%d/%s", stage ? "down" : "up_gate", columns, family ? "e8m0_edges" : "scales");
@@ -381,8 +371,8 @@ struct format_bridge {
     }
 };
 
-void * create(int device, int latent, int hidden, int max_hits, int weight_type, int down_type, char * error, size_t size) {
-    try { return new format_bridge(device, latent, hidden, max_hits, weight_type, down_type); }
+void * create(int device, int latent, int hidden, int max_hits, int weight_type, int down_type, const ssd::gpu::cpu_kernels_v1 * kernels, char * error, size_t size) {
+    try { return new format_bridge(device, latent, hidden, max_hits, weight_type, down_type, kernels); }
     catch (const std::exception & e) { if (size) { std::snprintf(error, size, "%s", e.what()); } return nullptr; }
 }
 void destroy(void * p) { delete static_cast<format_bridge *>(p); }
@@ -413,14 +403,14 @@ size_t host_bytes(void * p) {
 }
 
 extern "C" const vram_format_compute_api * kimi_vram_format_compute_get_api() {
-    static const vram_format_compute_api api{1, sizeof(vram_format_compute_api), create, destroy, compute, device_bytes, host_bytes};
+    static const vram_format_compute_api api{2, sizeof(vram_format_compute_api), create, destroy, compute, device_bytes, host_bytes};
     return &api;
 }
 
 // Test hook only: replace the CPU reference of later MXFP4 engine self-checks
 // (nullptr restores the linked ggml_vec_dot_mxfp4_q8_0). The self-check log line
 // reports reference=test_override while it is set.
-extern "C" __attribute__((visibility("default"))) void kimi_vram_mxfp4_selfcheck_reference_for_testing(ggml_vec_dot_t reference) {
+extern "C" __attribute__((visibility("default"))) void kimi_vram_mxfp4_selfcheck_reference_for_testing(ssd::gpu::vec_dot_t reference) {
     selfcheck_reference.store(reference);
 }
 
@@ -428,8 +418,8 @@ extern "C" __attribute__((visibility("default"))) void kimi_vram_mxfp4_selfcheck
 // exercise the real component DSO without a production environment switch.
 extern "C" __attribute__((visibility("default"))) void * ggml_ssd_mxfp4_create_for_testing(
         int device, int latent, int hidden, int max_hits, int weight_type, int down_type,
-        bool gpu_hidden, bool profile, char * error, size_t size) noexcept {
-    try { return new format_bridge(device, latent, hidden, max_hits, weight_type, down_type, gpu_hidden, profile); }
+        bool gpu_hidden, bool profile, const ssd::gpu::cpu_kernels_v1 * kernels, char * error, size_t size) noexcept {
+    try { return new format_bridge(device, latent, hidden, max_hits, weight_type, down_type, kernels, gpu_hidden, profile); }
     catch (const std::exception & e) {
         if (error && size) { std::snprintf(error, size, "%s", e.what()); }
         return nullptr;
@@ -448,5 +438,25 @@ extern "C" __attribute__((visibility("default"))) int ggml_backend_cuda_ssd_mxfp
     } catch (const std::exception & e) {
         if (error && size) { std::snprintf(error, size, "%s", e.what()); }
         return 1;
+    }
+}
+
+// Explicit dependency injection for queued-error fixtures. Product callers use
+// only the directly linked component above; no symbol interposition is needed.
+extern "C" void * ggml_ssd_mxfp4_create_with_components_for_testing(
+        int device, int latent, int hidden, int max_hits, int weight_type, int down_type,
+        bool gpu_hidden, bool profile, const ssd::gpu::cpu_kernels_v1 * kernels,
+        const kimi_mxfp4_gpu_api_v1 * component, const kimi_mxfp4_gpu_chain_api_v1 * extension,
+        char * error, size_t size) noexcept {
+    try {
+        if (!component || !extension) { throw std::runtime_error("missing explicit fixture component"); }
+        return new format_bridge(device, latent, hidden, max_hits, weight_type, down_type,
+            kernels, gpu_hidden, profile, component, extension);
+    } catch (const std::exception & e) {
+        if (error && size) { std::snprintf(error, size, "%s", e.what()); }
+        return nullptr;
+    } catch (...) {
+        if (error && size) { std::snprintf(error, size, "unexpected MXFP4 fixture failure"); }
+        return nullptr;
     }
 }

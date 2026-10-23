@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -20,8 +21,17 @@ struct kimi_vram_request {
 // read aligns it) and its logical bytes. The sink keys what it reads by it and a prefill seed what it copies, so
 // that decode finds the seed: both build it here.
 static inline struct kimi_vram_source kimi_vram_source_identity(const struct stat * st, uint64_t offset, uint64_t bytes) {
+#if defined(__APPLE__)
+    const int64_t mtime_s = st->st_mtimespec.tv_sec, mtime_ns = st->st_mtimespec.tv_nsec;
+    const int64_t ctime_s = st->st_ctimespec.tv_sec, ctime_ns = st->st_ctimespec.tv_nsec;
+#elif defined(_WIN32)
+    const int64_t mtime_s = st->st_mtime, mtime_ns = 0, ctime_s = st->st_ctime, ctime_ns = 0;
+#else
+    const int64_t mtime_s = st->st_mtim.tv_sec, mtime_ns = st->st_mtim.tv_nsec;
+    const int64_t ctime_s = st->st_ctim.tv_sec, ctime_ns = st->st_ctim.tv_nsec;
+#endif
     struct kimi_vram_source s = { (uint64_t) st->st_dev, (uint64_t) st->st_ino, (uint64_t) st->st_size, offset, bytes,
-        (int64_t) st->st_mtim.tv_sec, (int64_t) st->st_mtim.tv_nsec, (int64_t) st->st_ctim.tv_sec, (int64_t) st->st_ctim.tv_nsec };
+        mtime_s, mtime_ns, ctime_s, ctime_ns };
     return s;
 }
 struct kimi_vram_tier_api {

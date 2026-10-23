@@ -1,6 +1,7 @@
 #include "ssd/explicit-fixture-inputs.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "ssd/gpu-kernels.h"
 #include "vram-tier.cpp"
 #include "test-kimi-vram-format-fixture.h"
 
@@ -40,13 +41,13 @@ void common_environment(fixture_inputs & inputs) {
 }
 
 int main() {
-    fixture_inputs inputs; try {
+    fixture_inputs inputs; inputs.set_runtime_services(test_gpu_services()); try {
     // A discrete GPU grows at allocation and at the decode phase boundary; unified memory grows at the token
     // boundary after the first decode step (test-kimi-vram-reclaim has its own cases). Everything else is the same.
     const bool unified = ggml_backend_cuda_device_is_unified(0);
     inputs.unset("tier.safety_blocks");
     inputs.unset("tier.margin_mib");
-    { tier defaults(1, inputs.tier_policy()); require(defaults.elastic_safety_blocks==0 && defaults.elastic_safety_mib==32,
+    { tier defaults(1, inputs.tier_policy(), nullptr, test_cpu_kernels()); require(defaults.elastic_safety_blocks==0 && defaults.elastic_safety_mib==32,
             "elastic runtime safety defaults changed"); }
     common_environment(inputs);
     const size_t role = lifecycle_role_bytes(), stride = 3*role;
@@ -57,7 +58,7 @@ int main() {
     // allocations, while the cache table remains a single logical global pool.
     inputs.set("tier.global", "1");
     {
-        tier t(20*stride, inputs.tier_policy());
+        tier t(20*stride, inputs.tier_policy(), nullptr, test_cpu_kernels());
         int slot = -1;
         t.begin(17,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         const size_t first_decode_slots=t.table->slots.size();
@@ -136,7 +137,7 @@ int main() {
     // decode growth adds elastic blocks after them, and a prefill gives back to that base.
     {
         inputs.set("tier.fail_malloc_at", "2");
-        tier t(20*stride, inputs.tier_policy());
+        tier t(20*stride, inputs.tier_policy(), nullptr, test_cpu_kernels());
         inputs.unset("tier.fail_malloc_at");
         int slot = -1;
         t.begin(19,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
@@ -153,7 +154,7 @@ int main() {
     // A failed free retains the block/table mapping and poisons the tier. The
     // test clears only its injected fault so destruction can release the GPU.
     {
-        tier t(20*stride, inputs.tier_policy());int slot=-1;
+        tier t(20*stride, inputs.tier_policy(), nullptr, test_cpu_kernels());int slot=-1;
         t.begin(18,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         t.prepare_prefill_reclaim();
         const size_t old_slots=t.table->slots.size(),old_blocks=t.blocks.size();
@@ -170,7 +171,7 @@ int main() {
     inputs.set("tier.demand_reclaim", "1");
     inputs.set("tier.max_slots", "37");
     {
-        tier t(20*stride, inputs.tier_policy());int slot=-1;
+        tier t(20*stride, inputs.tier_policy(), nullptr, test_cpu_kernels());int slot=-1;
         t.begin(20,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         if(unified)t.begin(20,2,true); // unified memory grows at the boundary after the first decode step
         require(t.table->slots.size()==37,"demand fixture did not create a decode-grown tail");
@@ -193,7 +194,7 @@ int main() {
     // even when the process-wide elastic request is present.
     inputs.set("tier.global", "0");
     {
-        tier t(2*stride, inputs.tier_policy());int slot=-1;
+        tier t(2*stride, inputs.tier_policy(), nullptr, test_cpu_kernels());int slot=-1;
         t.begin(19,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         require(!t.elastic_active && t.arena && t.blocks.empty() &&
                 t.slot_base(1)==t.arena+stride,"non-global path no longer uses its single arena");
@@ -209,7 +210,7 @@ int main() {
     inputs.set("tier.policy", "count_decay2");
     inputs.set("tier.min_count", "2.5");
     for (const double upload_misses : {0.3, 2.1, 4.0}) {
-        tier t(20*stride, inputs.tier_policy());int slot=-1;
+        tier t(20*stride, inputs.tier_policy(), nullptr, test_cpu_kernels());int slot=-1;
         auto r=key;
         t.begin(21,1,true);
         for (int layer = 1; layer <= 40; ++layer) {
@@ -233,19 +234,17 @@ int main() {
 
     // At load (kimi_vram_elastic_api reserve) a unified-memory tier takes its storage and grows into what is free;
     // a prefill keeps it and the first decode adopts it. A discrete GPU leaves the arena to its first decode. The
-    // MXFP4 format engine needs the parity component preloaded (libkimi-mxfp4-parity.so).
+    // MXFP4 format engine uses the strict component normally linked into ggml-cuda.
     inputs.set("tier.mxfp4_batch", "0");
     inputs.set("tier.mxfp4_gpu_hidden", "1"); // as served: no bitwise CPU parity self-check
-    if (!dlsym(RTLD_DEFAULT, "kimi_mxfp4_gpu_get_api_v1")) {
-        std::printf("load reserve: skipped, libkimi-mxfp4-parity.so is not preloaded\n");
-    } else {
+    {
         const size_t mx = 36864; // one 256 x 256 MXFP4 role, padded to 4 KiB
         kimi_vram_request r = {};r.layer=1;r.weight=1;
         for (int i = 0; i < 3; ++i) r.role[i].bytes = mx;
         const int32_t layers[] = {1,2};
         const kimi_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,2,layers};
         {
-            tier t(10*3*mx, inputs.tier_policy());
+            tier t(10*3*mx, inputs.tier_policy(), nullptr, test_cpu_kernels());
             t.reserve(r,f);
             if (!unified) {
                 require(!t.has_storage() && !t.table,"a discrete GPU took its tier's storage at load");
@@ -298,7 +297,7 @@ int main() {
             const int32_t three[] = {1,2,3};
             const kimi_vram_expert_format f3 = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,3,three};
             inputs.set("tier.max_slots", "16");
-            tier q(10*3*mx, inputs.tier_policy());
+            tier q(10*3*mx, inputs.tier_policy(), nullptr, test_cpu_kernels());
             inputs.set("tier.max_slots", "53");
             q.reserve(r,f3);
             require(q.has_storage() && q.table->slots.size()==16,"the quota test's tier has another size");

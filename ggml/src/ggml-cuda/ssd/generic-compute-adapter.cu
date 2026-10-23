@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
+#include "backend-functions.h"
 #include <stdexcept>
 #include <string>
 
@@ -62,7 +62,6 @@ struct generic_engine {
     void * device_q8 = nullptr;
     float * host_input = nullptr;
     float * host_down = nullptr;
-    void * backend_handle = nullptr;
     mmvq_fn mmvq = nullptr;
     uint64_t calls = 0;
     uint64_t hits = 0;
@@ -81,20 +80,9 @@ struct generic_engine {
                 latent % 256 || hidden % 256 || max_hits < 1 || max_hits > 16) {
             throw std::runtime_error("unsupported generic VRAM expert geometry");
         }
-        backend_handle = dlopen("libggml-cuda.so", RTLD_NOW | RTLD_LOCAL);
-        if (!backend_handle) {
-            throw std::runtime_error(std::string("cannot load CUDA backend for generic VRAM engine: ") + dlerror());
-        }
-        mmvq = reinterpret_cast<mmvq_fn>(dlsym(backend_handle, "ggml_cuda_moe_stream_mmvq_dev"));
-        const auto supports = reinterpret_cast<bool (*)(int)>(dlsym(backend_handle, "ggml_cuda_moe_stream_mmvq_supports"));
-        if (!mmvq || !supports) {
-            (void) dlclose(backend_handle);
-            backend_handle = nullptr;
-            throw std::runtime_error("CUDA MoE MMVQ helper is missing; build with GGML_CUDA_MOE_STREAM=ON");
-        }
+        mmvq = ggml_cuda_moe_stream_mmvq_dev;
+        const auto supports = ggml_cuda_moe_stream_mmvq_supports;
         if (!supports(weight_type) || !supports(down_type)) {
-            (void) dlclose(backend_handle);
-            backend_handle = nullptr;
             throw std::runtime_error(std::string("GPU expert layer: no CUDA matrix-vector kernel for ") +
                 ggml_type_name(ggml_type(weight_type)) + "/" + ggml_type_name(ggml_type(down_type)) + " experts");
         }
@@ -143,13 +131,7 @@ struct generic_engine {
         if (device_up_gate) { checked(cudaFree(device_up_gate), "free device up/gate"); device_up_gate = nullptr; }
         if (device_input)   { checked(cudaFree(device_input), "free device input"); device_input = nullptr; }
         if (stream) { checked(cudaStreamDestroy(stream), "destroy compute stream"); stream = nullptr; }
-        if (backend_handle) {
-            if (dlclose(backend_handle) != 0) {
-                std::fprintf(stderr, "fatal: generic VRAM engine cannot release ownership: close backend\n");
-                std::abort();
-            }
-            backend_handle = nullptr;
-        }
+
     }
 
     ~generic_engine() {
@@ -228,7 +210,7 @@ struct generic_engine {
 };
 
 void * create(int device, int latent, int hidden, int max_hits, int weight_type, int down_type,
-        char * error, size_t error_size) {
+        const ssd::gpu::cpu_kernels_v1 *, char * error, size_t error_size) {
     try {
         return new generic_engine(device, latent, hidden, max_hits, weight_type, down_type);
     } catch (const std::exception & e) {
@@ -281,7 +263,7 @@ size_t host_bytes(void * context) {
 
 extern "C" const vram_format_compute_api * kimi_vram_generic_format_compute_get_api() {
     static const vram_format_compute_api api = {
-        1, sizeof(vram_format_compute_api), create, destroy, compute, device_bytes, host_bytes
+        2, sizeof(vram_format_compute_api), create, destroy, compute, device_bytes, host_bytes
     };
     return &api;
 }

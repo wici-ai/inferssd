@@ -6,6 +6,7 @@
 
 namespace ssd {
 namespace gpu {
+struct cpu_kernels_v1;
 namespace testing {
 // Explicit construction inputs for real CUDA lifecycle fixtures. Product
 // callers receive no policy parser: their factory derives the fixed profile
@@ -25,7 +26,7 @@ struct tier_options {
 struct api {
     uint32_t version;
     size_t size;
-    void * (*create)(uint64_t, const tier_options *, char *, size_t) noexcept;
+    void * (*create)(uint64_t, const tier_options *, const cpu_kernels_v1 *, char *, size_t) noexcept;
 };
 using get_api = const api * (*)();
 }  // namespace testing

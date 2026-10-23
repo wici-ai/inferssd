@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
+#include "ssd/gpu-kernels.h"
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -70,30 +70,14 @@ struct context {
 };
 }
 
-// Both getters belong to this executable, satisfying the adapter's same-DSO
-// guard. Every function except the injected return delegates to one real DSO.
-extern "C" const kimi_mxfp4_gpu_api_v1 * kimi_mxfp4_gpu_get_api_v1() { return &proxy_base; }
-extern "C" const kimi_mxfp4_gpu_chain_api_v1 * kimi_mxfp4_gpu_get_chain_api_v1() { return &proxy_chain; }
-
 int main(int argc, char ** argv) { try {
-    require(argc == 2, "usage: test-kimi-vram-component-error /path/to/libkimi-mxfp4-parity.so");
-    void * library = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
-    require(library != nullptr, "load real component DSO");
-    auto get_base = reinterpret_cast<const kimi_mxfp4_gpu_api_v1 * (*)()>(dlsym(library, "kimi_mxfp4_gpu_get_api_v1"));
-    auto get_chain = reinterpret_cast<const kimi_mxfp4_gpu_chain_api_v1 * (*)()>(dlsym(library, "kimi_mxfp4_gpu_get_chain_api_v1"));
-    require(get_base && get_chain && get_base != kimi_mxfp4_gpu_get_api_v1 && get_chain != kimi_mxfp4_gpu_get_chain_api_v1,
-            "resolve actual DSO APIs, not test proxies");
-    real_base = get_base(); real_chain = get_chain();
+    require(argc == 1, "usage: test-kimi-vram-component-error");
+    real_base = kimi_mxfp4_gpu_get_api_v1(); real_chain = kimi_mxfp4_gpu_get_chain_api_v1();
     proxy_base = *real_base; proxy_chain = *real_chain;
     proxy_base.submit = submit; proxy_base.wait = wait; proxy_base.error = error; proxy_base.destroy = destroy;
     proxy_chain.submit = chain_submit; proxy_chain.destroy = chain_destroy;
-    auto get_compute = reinterpret_cast<vram_format_compute_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_format_compute_get_api"));
-    require(get_compute != nullptr, "preload production tier DSO");
-    using test_create_fn = void * (*)(int, int, int, int, int, int, bool, bool, char *, size_t) noexcept;
-    auto test_create = reinterpret_cast<test_create_fn>(dlsym(RTLD_DEFAULT, "ggml_ssd_mxfp4_create_for_testing"));
-    require(test_create != nullptr, "real MXFP4 explicit fixture factory");
-    const auto * api = get_compute();
-    require(api && api->version == 1 && api->size == sizeof(*api), "compute ABI");
+    const auto * api = kimi_vram_format_compute_get_api();
+    require(api && api->version == 2 && api->size == sizeof(*api), "compute ABI");
     constexpr int latent = 256, hidden = 256;
     const size_t role = ggml_row_size(GGML_TYPE_MXFP4, latent) * hidden;
     device_payload weights;
@@ -111,7 +95,7 @@ int main(int argc, char ** argv) { try {
             // Engine creation runs the retained parity self-check before any injection.
             inject = fault::none; injected = false; submissions = 0; destroyed.clear();
             std::fill(output.begin(), output.end(), 123.0f);
-            context failed{api, test_create(0, latent, hidden, 1, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, bool(gpu_hidden), false, message, sizeof(message))};
+            context failed{api, ggml_ssd_mxfp4_create_with_components_for_testing(0, latent, hidden, 1, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, bool(gpu_hidden), false, test_cpu_kernels(), &proxy_base, &proxy_chain, message, sizeof(message))};
             require(failed.value != nullptr, message);
             inject = point; injected = false; submissions = 0; destroyed.clear();
             const int status = api->compute(failed.value, &expert, 1, q8.data(), q8.size(), &activation,
@@ -131,7 +115,7 @@ int main(int argc, char ** argv) { try {
         // Only a separately created context may run after the failure.
         inject = fault::none; injected = false; destroyed.clear();
         char message[512] = {};
-        context healthy{api, test_create(0, latent, hidden, 1, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, bool(gpu_hidden), false, message, sizeof(message))};
+        context healthy{api, ggml_ssd_mxfp4_create_with_components_for_testing(0, latent, hidden, 1, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, bool(gpu_hidden), false, test_cpu_kernels(), &proxy_base, &proxy_chain, message, sizeof(message))};
         require(healthy.value != nullptr, message);
         require(api->compute(healthy.value, &expert, 1, q8.data(), q8.size(), &activation,
                 output.data(), message, sizeof(message)) == 0, message);

@@ -1,5 +1,7 @@
+// SPDX-License-Identifier: MIT
 #pragma once
-#include "kimi-cpu-sink.h"
+#include "source.h"
+struct kimi_cpu_sink;
 
 // Executor-facing view of the ONE registry owned by the RAM/VRAM placement
 // provider. This adapter does not implement a second cache or CUDA math path.

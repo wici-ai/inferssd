@@ -1,3 +1,4 @@
+#include "ssd/gpu-kernels.h"
 #include "ssd/explicit-fixture-inputs.h"
 // End-to-end generic-format CPU-sink test with the real VRAM tier: Q4_K/Q5_K
 // as in Muse Spark UD-Q4_K_XL, and Q8_0. Synthetic
@@ -135,7 +136,7 @@ void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, mod
 } // namespace
 
 int main() {
-    fixture_inputs inputs;
+    fixture_inputs inputs; inputs.set_runtime_services(test_gpu_services());
     try {
         ggml_cpu_init();
         inputs.set("ready_first", "1");

@@ -1,3 +1,4 @@
+#include "ssd/gpu-kernels.h"
 #include "ssd/explicit-fixture-inputs.h"
 // Real-pack DeepSeek-V4.1 prefill crossover benchmark.
 //
@@ -332,8 +333,7 @@ struct gpu_runner {
                         quantized.data + size_t(row) * input_stride, expert.pack.latent);
             }
         }
-        auto get_batch = reinterpret_cast<const kimi_mxfp4_batch_api * (*)()>(
-                dlsym(RTLD_DEFAULT, "kimi_mxfp4_batch_get_api"));
+        auto get_batch = kimi_mxfp4_batch_get_api;
         if (use_batch && get_batch && expert.pack.type == GGML_TYPE_MXFP4) {
             batch_api = get_batch();
             require(batch_api && batch_api->version == 3 && batch_api->size == sizeof(*batch_api),
@@ -610,7 +610,7 @@ static int run(fixture_inputs & inputs, int argc, char ** argv) {
                 size_t(count) * size_t(expert.pack.latent));
             require(resident_error < 0.001, "tier resident batch output differs from CPU");
             const uint64_t stride = expert.role_bytes[0] + expert.role_bytes[1] + expert.role_bytes[2];
-            tier cold(stride, inputs.tier_policy());
+            tier cold(stride, inputs.tier_policy(), nullptr, test_cpu_kernels());
             cold.begin(20260921, 0, false);
             const kimi_vram_request request = make_request(expert, 0);
             int slot = -2;
@@ -659,7 +659,7 @@ static int run(fixture_inputs & inputs, int argc, char ** argv) {
 
 #ifndef KIMI_CROSSOVER_NO_MAIN
 int main(int argc, char ** argv) {
-    fixture_inputs inputs;
+    fixture_inputs inputs; inputs.set_runtime_services(test_gpu_services());
     try {
         return crossover::run(inputs, argc, argv);
     } catch (const std::exception & error) {

@@ -1,17 +1,17 @@
 #include "vram-slot-table.h"
 #include "vram-compute-api.h"
 #include "../../ggml-ssd/place/layer-plan.h"
-#include "kimi-vram-location-api.h"
+#include "ggml-ssd/gpu/kimi-vram-location-api.h"
 #include "kimi-mxfp4-batch.h"
 #include "ggml.h"
-#include "ggml-cpu.h"
+#include "ggml-ssd/gpu/kernels.h"
+#include "backend-functions.h"
 #include "../../ggml-ssd/gpu-tier-settings.h"
 #include "../../ggml-ssd/testing/tier.h"
 #include "../../ggml-ssd/settings/settings.h"
 #include "../../ggml-ssd/telemetry/telemetry.h"
 #include "../../ggml-ssd/host/arbiter.h"
 #include <cuda_runtime_api.h>
-#include <dlfcn.h>
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
@@ -33,13 +33,6 @@
 #include <map>
 #include <set>
 
-// The production DSO provides this CUDA adapter.  Keep it weak because several
-// lifecycle unit tests include this file directly and exercise only the generic
-// tier with no format-compute object linked into the test executable.
-extern "C" const vram_format_compute_api * kimi_vram_generic_format_compute_get_api() __attribute__((weak));
-// The batched prefill engine (group-compute-adapter.cu) of the same DSO, weak for the same reason.
-extern "C" const vram_group_compute_api * kimi_vram_group_compute_get_api() __attribute__((weak));
-
 namespace {
 void cuda_check(cudaError_t rc){if(rc!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(rc));}
 struct host_budget_refused : std::runtime_error { using std::runtime_error::runtime_error; };
@@ -51,15 +44,16 @@ struct ggml_memory_query {
     using get_fn=void (*)(int,size_t *,size_t *);
     using unified_fn=bool (*)(int);
     using reserve_fn=void (*)(int,size_t);
-    get_fn get=reinterpret_cast<get_fn>(dlsym(RTLD_DEFAULT,"ggml_backend_cuda_get_device_memory"));
-    unified_fn unified=reinterpret_cast<unified_fn>(dlsym(RTLD_DEFAULT,"ggml_backend_cuda_device_is_unified"));
-    reserve_fn set_reserve=reinterpret_cast<reserve_fn>(dlsym(RTLD_DEFAULT,"ggml_cuda_set_memory_reserve"));
+    get_fn get=ggml_backend_cuda_get_device_memory;
+    unified_fn unified=ggml_backend_cuda_device_is_unified;
+    reserve_fn set_reserve=ggml_cuda_set_memory_reserve;
     static ggml_memory_query & instance(){static ggml_memory_query q;return q;}
 };
 using clock_type=std::chrono::steady_clock;
 double micros(clock_type::time_point t){return std::chrono::duration<double,std::micro>(clock_type::now()-t).count();}
 struct tier {
     const tier_options configuration;
+    ssd::gpu::cpu_kernels_v1 cpu{};
     ssd::host::context_client * host_client = nullptr; // borrowed from L3 through sink lifetime
     static constexpr size_t elastic_block_slots=16;
     static constexpr uint64_t automatic_budget=UINT64_MAX; // GGML_KIMI_CPU_SINK_VRAM_BYTES=auto
@@ -221,12 +215,18 @@ struct tier {
     bool (*deferred_hook)(void *)=nullptr;void * deferred_hook_arg=nullptr; // tests: runs before each copy, false fails it
     std::string failure;
 
-    explicit tier(uint64_t b, const tier_options & options = {}, ssd::host::context_client * host = nullptr) : configuration(options), host_client(host),
+    explicit tier(uint64_t b, const tier_options & options = {}, ssd::host::context_client * host = nullptr,
+            const ssd::gpu::cpu_kernels_v1 * kernels = nullptr, int configured_device = -1) : configuration(options), host_client(host),
         budget(b), safety_bytes(options.safety_mib << 20), async_upload(options.async_upload),
         memory_trace(options.memory_trace), keep_across_requests(options.keep_across_requests), timing(options.timing),
         elastic_requested(options.elastic), elastic_demand_reclaim(options.demand_reclaim || b == automatic_budget),
         elastic_safety_blocks(options.safety_blocks), elastic_safety_mib(options.margin_mib), elastic_max_slots(options.max_slots),
         fail_malloc_at(options.fail_malloc_at), fail_free_at(options.fail_free_at), deferred_upload(options.deferred_upload) {
+        device = configured_device;
+        if (kernels) {
+            if (!ssd::gpu::valid(kernels)) { throw std::runtime_error("CPU kernels provider incompatible"); }
+            cpu = *kernels;
+        }
         mxfp4_batch_enabled = options.mxfp4_batch;
         watermark = options.watermark;
         watermark_low_mib = options.low_mib;
@@ -448,8 +448,8 @@ struct tier {
     }
     void register_oom_reclaimer(){
         if(!elastic_active || reclaimer_registered)return;
-        reclaimer_register=reinterpret_cast<reclaimer_register_fn>(dlsym(RTLD_DEFAULT,"ggml_cuda_oom_reclaimer_register"));
-        reclaimer_unregister=reinterpret_cast<reclaimer_unregister_fn>(dlsym(RTLD_DEFAULT,"ggml_cuda_oom_reclaimer_unregister"));
+        reclaimer_register=ggml_cuda_oom_reclaimer_register;
+        reclaimer_unregister=ggml_cuda_oom_reclaimer_unregister;
         if(!reclaimer_register || !reclaimer_unregister || !reclaimer_register(device,oom_reclaim_thunk,this))
             throw std::runtime_error("CUDA OOM reclaimer registry is unavailable or busy");
         reclaimer_registered=true;
@@ -482,13 +482,13 @@ struct tier {
             return;
         }
         if(seed_registered || device<0)return;
-        if(!seed_resolve)seed_resolve=reinterpret_cast<resolve_fn>(dlsym(RTLD_DEFAULT,"ggml_cuda_moe_expert_pack_resolve_raw_direct_shape"));
-        auto reg=reinterpret_cast<seed_register_fn>(dlsym(RTLD_DEFAULT,"ggml_cuda_moe_seed_register"));
+        if(!seed_resolve)seed_resolve=ggml_cuda_moe_expert_pack_resolve_raw_direct_shape;
+        auto reg=ggml_cuda_moe_seed_register;
         seed_registered=reg && reg(device,seed_offer_thunk,this);
     }
     void unregister_seed(){
         if(!seed_registered)return;
-        auto unreg=reinterpret_cast<seed_register_fn>(dlsym(RTLD_DEFAULT,"ggml_cuda_moe_seed_unregister"));
+        auto unreg=ggml_cuda_moe_seed_unregister;
         if(!unreg || !unreg(device,seed_offer_thunk,this))throw std::runtime_error("CUDA prefill seed unregister failed");
         seed_registered=false;
     }
@@ -851,7 +851,8 @@ struct tier {
     void reserve(const kimi_vram_request & r,const kimi_vram_expert_format & f){
         if(table || has_storage())return;
         const auto & q=ggml_memory_query::instance();
-        int current=-1;cuda_check(cudaGetDevice(&current));
+        int current=device;
+        if(current<0)cuda_check(cudaGetDevice(&current));else cuda_check(cudaSetDevice(current));
         if(!q.unified || !q.unified(current))return;
         const auto start=clock_type::now();
         initialize_format(&r,f,true);
@@ -1767,37 +1768,29 @@ struct tier {
         if(engine && (!format_mode || latent!=f.latent || hidden!=f.hidden || weight_type!=f.weight_type ||
                 down_type!=f.down_type || n_experts!=f.n_experts))throw std::runtime_error("VRAM expert format changed");
         if(!engine){
-            cuda_check(cudaGetDevice(&device));detect_unified();
+            if(device<0)cuda_check(cudaGetDevice(&device));else cuda_check(cudaSetDevice(device));
+            detect_unified();
             // MXFP4 has its own engine; the generic one serves every format the CUDA backend has a
             // matrix-vector kernel for, and refuses the others when it is created.
             if(!mxfp4){
-                if(!kimi_vram_generic_format_compute_get_api)
-                    throw std::runtime_error("generic explicit-format VRAM engine missing; no fallback");
                 format_api=kimi_vram_generic_format_compute_get_api();
             }
             else{
-                auto get=reinterpret_cast<vram_format_compute_get_api_fn>(dlsym(RTLD_DEFAULT,"kimi_vram_format_compute_get_api"));
-                if(!get)throw std::runtime_error("MXFP4 explicit-format VRAM engine missing; no fallback");
-                format_api=get();
+                format_api=kimi_vram_format_compute_get_api();
             }
-            if(!format_api || format_api->version!=1 || format_api->size!=sizeof(*format_api) || !format_api->create ||
+            if(!format_api || format_api->version!=2 || format_api->size!=sizeof(*format_api) || !format_api->create ||
                     !format_api->destroy || !format_api->compute || !format_api->device_scratch_bytes || !format_api->host_scratch_bytes)
                 throw std::runtime_error("explicit-format VRAM engine ABI mismatch");
             char error[512]={};
             if (mxfp4 && configuration.fixture) {
-                using fixture_create_fn = void * (*)(int, int, int, int, int, int, bool, bool, char *, size_t) noexcept;
-                auto create_fixture = reinterpret_cast<fixture_create_fn>(dlsym(RTLD_DEFAULT, "ggml_ssd_mxfp4_create_for_testing"));
-                if (!create_fixture) { throw std::runtime_error("real MXFP4 fixture factory missing"); }
-                engine = create_fixture(device, f.latent, f.hidden, 16, f.weight_type, f.down_type,
-                    configuration.mxfp4_gpu_hidden, timing, error, sizeof(error));
+                engine = ggml_ssd_mxfp4_create_for_testing(device, f.latent, f.hidden, 16, f.weight_type, f.down_type,
+                    configuration.mxfp4_gpu_hidden, timing, &cpu, error, sizeof(error));
             } else {
-                engine=format_api->create(device,f.latent,f.hidden,16,f.weight_type,f.down_type,error,sizeof(error));
+                engine=format_api->create(device,f.latent,f.hidden,16,f.weight_type,f.down_type,&cpu,error,sizeof(error));
             }
             if(!engine)throw std::runtime_error(error);
             if (mxfp4 && timing) {
-                using set_profile_fn = int (*)(void *, bool, char *, size_t) noexcept;
-                auto set_profile = reinterpret_cast<set_profile_fn>(dlsym(RTLD_DEFAULT, "ggml_backend_cuda_ssd_mxfp4_set_profile"));
-                if (!set_profile || set_profile(engine, true, error, sizeof(error))) {
+                if (ggml_backend_cuda_ssd_mxfp4_set_profile(engine, true, error, sizeof(error))) {
                     format_api->destroy(engine); engine = nullptr;
                     throw std::runtime_error(error[0] ? error : "MXFP4 profile service missing");
                 }
@@ -1808,7 +1801,7 @@ struct tier {
             report_thread_cpus();
             // The batched prefill engine for a format without an engine of its own. A format the CUDA backend's
             // products do not serve keeps the CPU for its grouped prefill, as before.
-            if(!mxfp4 && kimi_vram_group_compute_get_api){
+            if(!mxfp4){
                 group_api=kimi_vram_group_compute_get_api();
                 if(!group_api || group_api->version!=2 || group_api->size!=sizeof(*group_api) || !group_api->create ||
                         !group_api->reserve || !group_api->release || !group_api->begin_layer || !group_api->compute ||
@@ -1831,10 +1824,7 @@ struct tier {
         // Allocate fixed batch scratch before the decode arena. The token
         // accumulator is reserved for each prefill and released before decode.
         if(mxfp4 && mxfp4_batch_enabled && !mxfp4_batch){
-            auto get=reinterpret_cast<decltype(&kimi_mxfp4_batch_get_api)>(
-                dlsym(RTLD_DEFAULT,"kimi_mxfp4_batch_get_api"));
-            if(!get)throw std::runtime_error("MXFP4 batch component missing");
-            mxfp4_batch_api=get();
+            mxfp4_batch_api=kimi_mxfp4_batch_get_api();
             if(!mxfp4_batch_api || mxfp4_batch_api->version!=3 ||
                     mxfp4_batch_api->size!=sizeof(*mxfp4_batch_api))
                 throw std::runtime_error("MXFP4 batch ABI mismatch");
@@ -1895,10 +1885,10 @@ struct tier {
         if(!format_mode || !q || !a)throw std::runtime_error("explicit-format VRAM launch without its format");
         // the generic engine takes the f32 input; MXFP4's takes it quantized to its vec_dot type
         const bool mxfp4=weight_type==int(GGML_TYPE_MXFP4) && down_type==int(GGML_TYPE_MXFP4);
-        const auto * traits=ggml_get_type_traits_cpu(ggml_type(weight_type));
+        const int input_type = cpu.vec_dot_type ? cpu.vec_dot_type(weight_type) : int(GGML_TYPE_COUNT);
         const size_t expected=!mxfp4?size_t(latent)*sizeof(float):
-            (traits?ggml_row_size(traits->vec_dot_type,latent):0);
-        if(!traits || bytes!=expected)throw std::runtime_error("VRAM input bytes");
+            (input_type < int(GGML_TYPE_COUNT) ? ggml_row_size(ggml_type(input_type),latent):0);
+        if((mxfp4 && input_type == int(GGML_TYPE_COUNT)) || bytes!=expected)throw std::runtime_error("VRAM input bytes");
         if(a->kind!=KIMI_VRAM_ACTIVATION_SITU && a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP)throw std::runtime_error("VRAM activation kind");
         std::lock_guard<std::mutex> lock(mutex);if(!done)throw std::runtime_error("GPU job already outstanding");
         work.clear();output_rows.clear();failure.clear();host_done.clear();host_down.clear();
@@ -2214,8 +2204,8 @@ struct tier {
             l.route_bytes=g.route_bytes;l.token_bytes=g.token_bytes;l.output_bytes=g.output_bytes;
             l.fixed_bytes=g.fixed_bytes;l.bytes_per_token=g.bytes_per_token;
         }else if(mxfp4 && mxfp4_batch){
-            const auto * traits=ggml_get_type_traits_cpu(GGML_TYPE_MXFP4);
-            l.route_bytes=(traits?ggml_row_size(traits->vec_dot_type,latent):0)+sizeof(int32_t)+sizeof(float);
+            const int input_type = cpu.vec_dot_type ? cpu.vec_dot_type(GGML_TYPE_MXFP4) : int(GGML_TYPE_COUNT);
+            l.route_bytes=(input_type < int(GGML_TYPE_COUNT) ? ggml_row_size(ggml_type(input_type),latent):0)+sizeof(int32_t)+sizeof(float);
             l.output_bytes=size_t(latent)*sizeof(float);
             l.fixed_bytes=mxfp4_batch_api->device_bytes(mxfp4_batch);l.bytes_per_token=size_t(latent)*sizeof(float);
         }
@@ -2236,10 +2226,10 @@ struct tier {
                 (!batched && ntokens>vector_tokens)))
             throw std::runtime_error("grouped-prefill post norm on an engine without one");
         const bool f32=!(weight_type==int(GGML_TYPE_MXFP4) && down_type==int(GGML_TYPE_MXFP4));
-        const auto * traits=ggml_get_type_traits_cpu(ggml_type(weight_type));
+        const int input_type = cpu.vec_dot_type ? cpu.vec_dot_type(weight_type) : int(GGML_TYPE_COUNT);
         const size_t expected=f32?size_t(latent)*sizeof(float):
-            (traits?ggml_row_size(traits->vec_dot_type,latent):0);
-        if(!traits || input_stride!=expected ||
+            (input_type < int(GGML_TYPE_COUNT) ? ggml_row_size(ggml_type(input_type),latent):0);
+        if((!f32 && input_type == int(GGML_TYPE_COUNT)) || input_stride!=expected ||
                 (a->kind!=KIMI_VRAM_ACTIVATION_SITU && a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP))
             throw std::runtime_error("grouped-prefill input or activation format");
         const size_t route_count=size_t(nslots)*size_t(ntokens);
@@ -2595,10 +2585,10 @@ int policy_reclaim_host(void * p,uint64_t bytes){
 void policy_set_miss_cost(void * p,double us){
     auto * t=static_cast<tier *>(p);if(!t || !std::isfinite(us) || us<0)return;
     std::lock_guard<std::mutex> lock(t->mutex);t->miss_us=t->miss_us>0?0.9*t->miss_us+0.1*us:us;}
-void * create_test_tier(uint64_t bytes, const tier_options * options, char * error, size_t size) noexcept {
+void * create_test_tier(uint64_t bytes, const tier_options * options, const ssd::gpu::cpu_kernels_v1 * kernels, char * error, size_t size) noexcept {
     try {
         if (!options) { throw std::runtime_error("missing explicit CUDA fixture policy"); }
-        return new tier(bytes, *options);
+        return new tier(bytes, *options, nullptr, kernels);
     } catch (const std::exception & e) {
         if (error && size) { std::snprintf(error, size, "%s", e.what()); }
         return nullptr;
@@ -2609,6 +2599,8 @@ void * create_configured_tier(const ssd::settings::snapshot * input, const ssd::
     try {
         if (!input) { throw std::runtime_error("missing typed GPU tier settings"); }
         if (!services || !services->host) { throw std::runtime_error("missing process host budget client"); }
+        if (services->gpu_device < 0) { throw std::runtime_error("invalid configured CUDA device"); }
+        if (!ssd::gpu::valid(services->cpu)) { throw std::runtime_error("missing CPU kernels provider"); }
         const auto settings = *input;
         const auto * budget = settings.vram_budget();
         const auto * margin = settings.integer("vram.margin_mib");
@@ -2637,7 +2629,7 @@ void * create_configured_tier(const ssd::settings::snapshot * input, const ssd::
             options.memory_trace = debug.ledger;
             options.timing = debug.profile;
         }
-        return new tier(bytes, options, services->host);
+        return new tier(bytes, options, services->host, services->cpu, services->gpu_device);
     } catch (const std::exception & e) {
         if (error && size) { std::snprintf(error, size, "%s", e.what()); }
         return nullptr;
@@ -2685,6 +2677,6 @@ extern "C" const ssd::gpu::settings_api * ggml_backend_cuda_ssd_tier_settings_ge
 }
 
 extern "C" const ssd::gpu::testing::api * ggml_ssd_tier_testing_get_api() {
-    static const ssd::gpu::testing::api api = { 1, sizeof(ssd::gpu::testing::api), create_test_tier };
+    static const ssd::gpu::testing::api api = { 2, sizeof(ssd::gpu::testing::api), create_test_tier };
     return &api;
 }

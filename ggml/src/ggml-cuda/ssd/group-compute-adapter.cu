@@ -18,7 +18,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <dlfcn.h>
+#include "backend-functions.h"
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -91,7 +91,6 @@ __global__ void group_scatter(const float * down, int latent, const int32_t * ro
 struct group_engine {
     static constexpr int chunk = 256; // tokens of one expert per chain pass
     int device = -1, latent = 0, hidden = 0, up_type = 0, down_type = 0;
-    void * backend = nullptr;
     mm_destroy_fn mm_destroy = nullptr;
     mm_release_fn mm_release = nullptr;
     mm_reserve_fn mm_reserve = nullptr;
@@ -132,20 +131,15 @@ struct group_engine {
         if (latent <= 0 || hidden <= 0 || latent > 16384 || hidden > 16384 || latent % 4 || hidden % 4) {
             throw std::runtime_error("unsupported grouped VRAM expert geometry");
         }
-        backend = dlopen("libggml-cuda.so", RTLD_NOW | RTLD_LOCAL);
-        if (!backend) {
-            throw std::runtime_error(std::string("cannot load the CUDA backend for the grouped VRAM engine: ") + dlerror());
-        }
-        auto sym = [&](const char * name) { return dlsym(backend, name); };
-        const auto supports = reinterpret_cast<mm_supports_fn>(sym("ggml_cuda_moe_stream_mm_supports"));
-        const auto create = reinterpret_cast<mm_create_fn>(sym("ggml_cuda_moe_stream_mm_create"));
-        mm_destroy = reinterpret_cast<mm_destroy_fn>(sym("ggml_cuda_moe_stream_mm_destroy"));
-        mm_release = reinterpret_cast<mm_release_fn>(sym("ggml_cuda_moe_stream_mm_release"));
-        mm_reserve = reinterpret_cast<mm_reserve_fn>(sym("ggml_cuda_moe_stream_mm_reserve"));
-        mm_operand_bytes = reinterpret_cast<mm_operand_bytes_fn>(sym("ggml_cuda_moe_stream_mm_operand_bytes"));
-        mm_quantize = reinterpret_cast<mm_quantize_fn>(sym("ggml_cuda_moe_stream_mm_quantize"));
-        mm = reinterpret_cast<mm_fn>(sym("ggml_cuda_moe_stream_mm"));
-        mm_device_bytes = reinterpret_cast<mm_device_bytes_fn>(sym("ggml_cuda_moe_stream_mm_device_bytes"));
+        const auto supports = ggml_cuda_moe_stream_mm_supports;
+        const auto create = ggml_cuda_moe_stream_mm_create;
+        mm_destroy = ggml_cuda_moe_stream_mm_destroy;
+        mm_release = ggml_cuda_moe_stream_mm_release;
+        mm_reserve = ggml_cuda_moe_stream_mm_reserve;
+        mm_operand_bytes = ggml_cuda_moe_stream_mm_operand_bytes;
+        mm_quantize = ggml_cuda_moe_stream_mm_quantize;
+        mm = ggml_cuda_moe_stream_mm;
+        mm_device_bytes = ggml_cuda_moe_stream_mm_device_bytes;
         try {
             if (!supports || !create || !mm_destroy || !mm_release || !mm_reserve || !mm_operand_bytes || !mm_quantize || !mm ||
                     !mm_device_bytes) {
@@ -247,7 +241,6 @@ struct group_engine {
         if (host_norm) { (void) cudaFreeHost(host_norm); host_norm = nullptr; }
         if (mm_context) { mm_destroy(mm_context); mm_context = nullptr; }
         if (stream) { (void) cudaStreamDestroy(stream); stream = nullptr; }
-        if (backend) { (void) dlclose(backend); backend = nullptr; }
     }
 
     ~group_engine() { close(); }

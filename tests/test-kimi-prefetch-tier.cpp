@@ -6,7 +6,7 @@
 #define main original_sink_test_main
 #include "test-kimi-cpu-sink.cpp"
 #undef main
-#include "kimi-vram-tier-api.h"
+#include "ggml-ssd/gpu/kimi-vram-tier-api.h"
 #include <set>
 
 namespace {

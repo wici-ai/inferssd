@@ -9,7 +9,7 @@
 // (relative L2 above 1e-3 for the Q8_0 kernels; the float-hidden kernel skips Q8_0 and
 // is only bounded by 5e-2). It then times one layer of 16 hits per path with the
 // component's timing events and host clocks (no H2D pacing in this process).
-// usage: test-kimi-mxfp4-chain path/to/libkimi-mxfp4-parity.so [timing_iterations]
+// usage: test-kimi-mxfp4-chain [timing_iterations]
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-kimi-mxfp4-chain.h"
@@ -19,7 +19,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -68,14 +67,9 @@ struct component {
     const kimi_mxfp4_gpu_chain_api_v1 * chain_api = nullptr;
     kimi_mxfp4_gpu * handle = nullptr;
     std::vector<void *> held;
-    explicit component(const char * path) {
-        void * so = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-        need(so != nullptr, dlerror());
-        auto get = reinterpret_cast<const kimi_mxfp4_gpu_api_v1 * (*)()>(dlsym(so, "kimi_mxfp4_gpu_get_api_v1"));
-        auto get_chain = reinterpret_cast<const kimi_mxfp4_gpu_chain_api_v1 * (*)()>(dlsym(so, "kimi_mxfp4_gpu_get_chain_api_v1"));
-        need(get && get_chain, "component exports");
-        api = get();
-        chain_api = get_chain();
+    component() {
+        api = kimi_mxfp4_gpu_get_api_v1();
+        chain_api = kimi_mxfp4_gpu_get_chain_api_v1();
         need(api->version == 1 && api->job_size == sizeof(kimi_mxfp4_gpu_job), "base ABI");
         need(chain_api->version == 1 && chain_api->size == sizeof(kimi_mxfp4_gpu_chain_api_v1), "chain ABI");
         char error[256] = {};
@@ -258,10 +252,10 @@ void print_timing(const char * path, int iterations, const kimi_mxfp4_gpu_timing
 
 int main(int argc, char ** argv) {
     try {
-        need(argc >= 2, "usage: test-kimi-mxfp4-chain path/to/libkimi-mxfp4-parity.so [timing_iterations]");
-        const int iterations = argc >= 3 ? std::max(1, std::atoi(argv[2])) : 20;
+        need(argc <= 2, "usage: test-kimi-mxfp4-chain [timing_iterations]");
+        const int iterations = argc == 2 ? std::max(1, std::atoi(argv[1])) : 20;
         ggml_cpu_init();
-        component g(argv[1]);
+        component g;
         std::mt19937 rng(20260915);
         std::vector<std::vector<kimi_mxfp4_chain_expert>> family(2);
         for (int fam = 0; fam < 2; ++fam) {

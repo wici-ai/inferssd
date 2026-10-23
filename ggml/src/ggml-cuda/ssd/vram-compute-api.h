@@ -1,13 +1,14 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
-#include "kimi-vram-tier-api.h"
+#include "ggml-ssd/gpu/kernels.h"
+#include "ggml-ssd/gpu/kimi-vram-tier-api.h"
 struct vram_compute_expert { const void * up; const void * gate; const void * down; };
 // Engine of the explicit-format tier path: both GPU matvec stages with the host
 // activation and hidden quantization between them; returns unweighted down rows.
 struct vram_format_compute_api {
-    uint32_t version, size;
-    void * (*create)(int device, int latent, int hidden, int max_hits, int weight_type, int down_type, char *, size_t);
+    uint32_t version, size; // 2: explicit immutable CPU kernels in create
+    void * (*create)(int device, int latent, int hidden, int max_hits, int weight_type, int down_type, const ssd::gpu::cpu_kernels_v1 *, char *, size_t);
     void (*destroy)(void *);
     int (*compute)(void *, const vram_compute_expert *, int hits, const void * input, size_t input_bytes,
                    const kimi_vram_activation * activation, float * host_down, char * error, size_t error_size);
@@ -83,3 +84,19 @@ struct vram_group_compute_api {
     size_t (*host_bytes)(void *);
 };
 typedef const vram_group_compute_api * (*vram_group_compute_get_api_fn)();
+
+extern "C" {
+const vram_format_compute_api * kimi_vram_format_compute_get_api();
+const vram_format_compute_api * kimi_vram_generic_format_compute_get_api();
+const vram_group_compute_api * kimi_vram_group_compute_get_api();
+void * ggml_ssd_mxfp4_create_for_testing(int, int, int, int, int, int, bool, bool,
+    const ssd::gpu::cpu_kernels_v1 *, char *, size_t) noexcept;
+int ggml_backend_cuda_ssd_mxfp4_set_profile(void *, bool, char *, size_t) noexcept;
+}
+
+struct kimi_mxfp4_gpu_api_v1;
+struct kimi_mxfp4_gpu_chain_api_v1;
+extern "C" void * ggml_ssd_mxfp4_create_with_components_for_testing(
+    int, int, int, int, int, int, bool, bool, const ssd::gpu::cpu_kernels_v1 *,
+    const kimi_mxfp4_gpu_api_v1 *, const kimi_mxfp4_gpu_chain_api_v1 *, char *, size_t) noexcept;
+extern "C" void kimi_vram_mxfp4_selfcheck_reference_for_testing(ssd::gpu::vec_dot_t);

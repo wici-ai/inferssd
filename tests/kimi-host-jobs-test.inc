@@ -2,7 +2,7 @@
 // The tier's host path (kimi_vram_host_api v3) through its C API, shared by test-kimi-vram-q2 (Q8_0, the generic
 // engine) and test-kimi-vram-mxfp4 (MXFP4, DeepSeek's engine). Included after test-kimi-cpu-sink.cpp (require, ggml).
 #pragma once
-#include "kimi-vram-tier-api.h"
+#include "ggml-ssd/gpu/kimi-vram-tier-api.h"
 #include <dlfcn.h>
 #include <functional>
 #include <sys/mman.h>
