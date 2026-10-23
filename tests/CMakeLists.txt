@@ -151,6 +151,11 @@ set_property(TEST kimi_host_lock PROPERTY LABELS main)
 
 if (UNIX)
     find_package(Threads REQUIRED)
+    add_executable(test-ssd-gpu-contract test-ssd-gpu-contract.cpp)
+    target_compile_features(test-ssd-gpu-contract PRIVATE cxx_std_17)
+    target_include_directories(test-ssd-gpu-contract PRIVATE ../ggml/src ../ggml/include)
+    add_test(NAME ssd_gpu_contract COMMAND test-ssd-gpu-contract)
+
     add_executable(test-ssd-host-arbiter test-ssd-host-arbiter.cpp)
     target_compile_features(test-ssd-host-arbiter PRIVATE cxx_std_17)
     target_link_libraries(test-ssd-host-arbiter PRIVATE ggml-ssd-host Threads::Threads)
@@ -194,35 +199,43 @@ if (TARGET ggml-cpu)
     set_property(TEST ssd_cpu_api PROPERTY LABELS main)
 endif()
 
+if (TARGET ggml-ssd-host AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test-kimi-cache-lease test-kimi-cache-lease.cpp)
+    target_compile_features(test-kimi-cache-lease PRIVATE cxx_std_17)
+    target_include_directories(test-kimi-cache-lease PRIVATE ../ggml/src)
+    target_link_libraries(test-kimi-cache-lease PRIVATE ggml-ssd-host ggml-base Threads::Threads)
+    add_test(NAME test-kimi-cache-lease COMMAND test-kimi-cache-lease)
+endif()
+
 if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    foreach(lease_target test-kimi-vram-ready test-kimi-cache-lease test-kimi-vram-native test-kimi-vram-pool)
+    foreach(lease_target test-kimi-vram-ready test-kimi-vram-native test-kimi-vram-pool)
         add_executable(${lease_target} ${lease_target}.cpp)
         target_compile_features(${lease_target} PRIVATE cxx_std_17)
-        target_include_directories(${lease_target} PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../ggml/src/ggml-cuda/kimi-vram-tier)
+        target_include_directories(${lease_target} PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../ggml/src/ggml-cuda/ssd)
         target_link_libraries(${lease_target} PRIVATE ggml-cpu ggml-base Threads::Threads ${CMAKE_DL_LIBS})
         add_test(NAME ${lease_target} COMMAND ${lease_target})
     endforeach()
     if (TARGET kimi-vram-tier)
-        # GPU tests require explicit ownership of a lane and preloaded exact
-        # component DSOs; do not acquire a shared GPU automatically in ctest.
+        # GPU tests require explicit ownership of a lane and normally linked
+        # backend objects; do not acquire a shared GPU automatically in ctest.
         foreach(tier_test test-kimi-vram-async test-kimi-vram-deferred test-kimi-vram-exclusive
                 test-kimi-vram-component-error test-kimi-vram-format-compat test-kimi-vram-pool-cuda
                 test-kimi-vram-elastic test-kimi-vram-reclaim)
             add_executable(${tier_test} ${tier_test}.cpp)
             target_compile_features(${tier_test} PRIVATE cxx_std_17)
             target_compile_options(${tier_test} PRIVATE -fno-fast-math -ffp-contract=off)
-            target_include_directories(${tier_test} PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../ggml/src/ggml-cuda/kimi-vram-tier ../vendor)
-            target_link_libraries(${tier_test} PRIVATE ggml-ssd-host ggml-cpu ggml-base CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+            target_include_directories(${tier_test} PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../ggml/src/ggml-cuda/ssd ../vendor)
+            target_link_libraries(${tier_test} PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
             add_dependencies(${tier_test} kimi-mxfp4-parity kimi-vram-tier)
         endforeach()
         # DeepSeek-V4.1 MXFP4 tier: component rows and the sink end to end. Like the
-        # tests above they need an owned GPU and preloaded DSOs, so they stay out of ctest.
+        # tests above they need an owned GPU and normally linked backend objects, so they stay out of ctest.
         foreach(mxfp4_test test-kimi-mxfp4-parity test-kimi-mxfp4-chain test-kimi-vram-mxfp4)
             add_executable(${mxfp4_test} ${mxfp4_test}.cpp)
             target_compile_features(${mxfp4_test} PRIVATE cxx_std_17)
             target_compile_options(${mxfp4_test} PRIVATE -fno-fast-math -ffp-contract=off)
-            target_include_directories(${mxfp4_test} PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../ggml/src/ggml-cuda/kimi-vram-tier ../vendor)
-            target_link_libraries(${mxfp4_test} PRIVATE ggml-ssd-host ggml-cpu ggml-base CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+            target_include_directories(${mxfp4_test} PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../ggml/src/ggml-cuda/ssd ../vendor)
+            target_link_libraries(${mxfp4_test} PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
             add_dependencies(${mxfp4_test} kimi-mxfp4-parity kimi-vram-tier)
         endforeach()
         add_executable(test-kimi-prefill-scratch test-kimi-prefill-scratch.cpp)
@@ -230,12 +243,12 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_compile_definitions(test-kimi-prefill-scratch PRIVATE KIMI_SCRATCH_MXFP4_ONLY)
         target_compile_options(test-kimi-prefill-scratch PRIVATE -fno-fast-math -ffp-contract=off)
         target_include_directories(test-kimi-prefill-scratch PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../vendor)
-        target_link_libraries(test-kimi-prefill-scratch PRIVATE ggml-ssd-host ggml-cpu ggml-base CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+        target_link_libraries(test-kimi-prefill-scratch PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-kimi-prefill-scratch kimi-mxfp4-parity kimi-vram-tier)
         add_executable(test-kimi-vram-generic test-kimi-vram-generic.cpp)
         target_compile_features(test-kimi-vram-generic PRIVATE cxx_std_17)
         target_include_directories(test-kimi-vram-generic PRIVATE ../ggml/src ../ggml/src/ggml-cpu
-            ../ggml/src/ggml-cuda/kimi-vram-tier ../vendor)
+            ../ggml/src/ggml-cuda/ssd ../vendor)
         target_link_libraries(test-kimi-vram-generic PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda
             CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-kimi-vram-generic kimi-vram-tier)
@@ -247,8 +260,8 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         add_executable(test-kimi-vram-group test-kimi-vram-group.cpp)
         target_compile_features(test-kimi-vram-group PRIVATE cxx_std_17)
         target_include_directories(test-kimi-vram-group PRIVATE ../ggml/src ../ggml/src/ggml-cpu
-            ../ggml/src/ggml-cuda/kimi-vram-tier ../vendor)
-        target_link_libraries(test-kimi-vram-group PRIVATE ggml-ssd-host ggml-cpu ggml-base CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+            ../ggml/src/ggml-cuda/ssd ../vendor)
+        target_link_libraries(test-kimi-vram-group PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-kimi-vram-group kimi-vram-tier)
         # Real-pack, RAM-only crossover measurement for grouped DeepSeek-V4.1
         # prefill.  It is a manually-run performance tool (owned GPU, 7 GB/s
@@ -258,12 +271,11 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_compile_features(test-kimi-prefill-crossover PRIVATE cxx_std_17)
         target_compile_options(test-kimi-prefill-crossover PRIVATE -fno-fast-math -ffp-contract=off)
         target_include_directories(test-kimi-prefill-crossover PRIVATE ../ggml/src ../ggml/src/ggml-cpu
-            ../ggml/src/ggml-cuda/kimi-vram-tier ../vendor)
+            ../ggml/src/ggml-cuda/ssd ../vendor)
         target_link_libraries(test-kimi-prefill-crossover PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda
             CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-kimi-prefill-crossover kimi-mxfp4-parity kimi-vram-tier)
-        # The error fixture interposes the component API around the real DSO.
-        set_target_properties(test-kimi-vram-component-error PROPERTIES ENABLE_EXPORTS ON)
+        # The error fixture explicitly injects callbacks around the real linked component.
         target_link_libraries(test-kimi-vram-elastic PRIVATE ggml-cuda)
         target_link_libraries(test-kimi-vram-reclaim PRIVATE ggml-cuda)
     endif()
@@ -278,8 +290,8 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME dsv41_q2_cpu_sink_decode COMMAND test-kimi-cpu-sink
         --q2-activation-test --threads 9 --ring-experts 8)
     add_executable(test-kimi-cpu-cache-policy test-kimi-cpu-cache-policy.cpp)
-    target_include_directories(test-kimi-cpu-cache-policy PRIVATE ../ggml/src/ggml-cpu)
-    target_link_libraries(test-kimi-cpu-cache-policy PRIVATE ggml-cpu ggml-base)
+    target_include_directories(test-kimi-cpu-cache-policy PRIVATE ../ggml/src)
+    target_link_libraries(test-kimi-cpu-cache-policy PRIVATE ggml-ssd-host ggml-base)
     add_test(NAME kimi_cpu_sink_cache_compute_policy COMMAND test-kimi-cpu-cache-policy)
     if (TARGET ggml-cuda)
         add_executable(test-dsv41-q2-pack test-dsv41-q2-pack.cpp)
