@@ -26,6 +26,11 @@ LLAMA_API bool llama_ssd_check_environment(char * error, size_t error_size);
 // buffer is left empty; callers can first query with (NULL, 0).
 LLAMA_API size_t llama_ssd_schema_json(char * output, size_t output_size);
 
+// Request lifecycle transition; counts are tokens after prompt-cache reuse.
+// Failure is reported without allowing C++ exceptions across the C boundary.
+LLAMA_API bool llama_ssd_prefill_phase(struct llama_context * ctx, bool active,
+    uint32_t prompt_tokens, uint32_t prefill_tokens);
+
 // Keep this reservation alive until allocation and first touch finish. NULL
 // means refusal. A context without the Linux SSD executor returns a valid no-op
 // handle. Finish exactly once before destroying the context; false cancels an

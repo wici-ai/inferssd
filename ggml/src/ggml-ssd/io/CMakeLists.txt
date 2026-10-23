@@ -13,3 +13,5 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set_target_properties(ggml-ssd-linux-ring PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_link_libraries(ggml-ssd INTERFACE ggml-ssd-linux-ring)
 endif()
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/object-uring.cmake")

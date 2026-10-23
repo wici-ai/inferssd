@@ -13,3 +13,6 @@ endif()
 if (UNIX)
     add_subdirectory(io)
 endif()
+
+add_subdirectory(stream)
+target_link_libraries(ggml-ssd INTERFACE ggml-ssd-stream)

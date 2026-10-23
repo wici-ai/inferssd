@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "options.h"
+#include "ggml-ssd/gpu/provider.h"
+#include "ggml-ssd/gpu/transport.h"
 #if defined(LLAMA_SSD_STORE)
 #include "ggml-ssd/store/index.h"
 #endif
@@ -120,7 +122,7 @@ size_t llama_ssd_schema_json(char * output, size_t size) {
 }
 
 llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
-    : settings(options.settings), debug(options.debug) {
+    : settings(options.settings), debug(options.debug), stream(services) {
 #if defined(__linux__)
     if (!settings.sources()->empty()) {
         host_owner = ::host_owner();
@@ -149,10 +151,62 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
     if (!effective) { throw std::runtime_error(effective.error); }
     std::fprintf(stderr, "[ssd.settings] %s\n", effective.value.c_str());
     services = {events.get(), &debug, host.get()};
+    services.source = &sources;
 }
 
 llama_ssd_context::~llama_ssd_context() {
     // Context backends have already synchronized and been destroyed. This
     // callback joins the Mac reader jobs before events closes below.
     if (mac_cache) { destroy_mac(mac_cache); }
+}
+
+void llama_ssd_context::bind_cpu(ggml_backend_t backend) {
+    const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    const auto get = reinterpret_cast<ssd::gpu::get_cpu_kernels_v1>(
+        ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_kernels_v1"));
+    const auto * kernels = get ? get() : nullptr;
+    if (!ssd::gpu::valid(kernels)) { throw std::runtime_error("CPU backend has no compatible SSD quantization services"); }
+    services.cpu = kernels;
+}
+
+void llama_ssd_context::attach_backend(ggml_backend_t backend) {
+    if (!sources.resolve) { return; }
+    const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    const auto get = reinterpret_cast<ssd::gpu::get_provider_v1>(
+        ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_ssd_api_v1"));
+    if (!get) {
+        const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            throw std::runtime_error("configured SSD sources require the GPU context transport provider");
+        }
+        return;
+    }
+    if (gpu_transport) { throw std::runtime_error("one configured CUDA executor per context is supported"); }
+    const auto * provider = get();
+    if (!provider || provider->version != 1 || provider->size != sizeof(*provider) ||
+            !provider->device_is_unified || !provider->device_ordinal || !provider->attach_services || !provider->stream) {
+        throw std::runtime_error("CUDA backend has no compatible SSD provider table");
+    }
+    const auto * transport = provider->transport;
+    if (!transport || transport->version != 1 || transport->size != sizeof(*transport) ||
+            transport->runtime_services_size != sizeof(services) || !transport->create ||
+            !transport->quiesce || !transport->destroy || !transport->copy_ranges ||
+            !transport->dense_has || !transport->dense_prepare || !transport->dense_read_ahead ||
+            !transport->dense_copy || !transport->seed_register || !transport->seed_unregister ||
+            !transport->seed_offer || !transport->seed_fence) {
+        throw std::runtime_error("CUDA backend has no compatible context transport table");
+    }
+    const int device = provider->device_ordinal(backend);
+    if (device < 0 || !services.cpu) { throw std::runtime_error("CUDA SSD device/CPU services are unavailable"); }
+    services.gpu = provider;
+    services.gpu_device = device;
+    char error[512] {};
+    gpu_transport = std::unique_ptr<void, llama_ssd_source_delete>(
+        transport->create(&services, device, error, sizeof(error)),
+        llama_ssd_source_delete{transport->destroy});
+    if (!gpu_transport) { throw std::runtime_error(error[0] ? error : "cannot create context GPU transport"); }
+    services.gpu_transport = gpu_transport.get();
+    if (!provider->attach_services(backend, &services, error, sizeof(error))) {
+        throw std::runtime_error(error[0] ? error : "cannot attach context GPU transport");
+    }
 }

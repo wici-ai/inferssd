@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <memory>
 
+namespace ssd { struct runtime_services; }
+
 #if defined(GGML_USE_HIP)
 #define GGML_COMMON_DECL_HIP
 #define GGML_COMMON_IMPL_HIP
@@ -1456,6 +1458,8 @@ struct ggml_cuda_stream_context {
 };
 
 struct ggml_backend_cuda_context {
+    // Borrowed from the owning llama context; outlives this backend.
+    const ssd::runtime_services * ssd_services = nullptr;
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;

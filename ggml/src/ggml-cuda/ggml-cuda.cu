@@ -2,6 +2,10 @@
 #include "ggml-impl.h"
 #include "../ggml-ssd/host/budget-linux.h"
 #include "ggml-backend-impl.h"
+#ifdef GGML_SSD_CUDA_EXECUTOR
+#include "../ggml-ssd/gpu/provider.h"
+extern "C" const ssd::gpu::provider_v1 * ggml_backend_cuda_ssd_api_v1();
+#endif
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/activation-quant-reuse.cuh"
@@ -373,31 +377,6 @@ static bool kimi_layer_gap_cuda_collect_pending(
 #endif
 
 
-
-extern "C" bool ggml_cuda_moe_expert_pack_copy_ranges_to_device(
-    const char *tensor_name,
-    const int32_t *range_first,
-    const int32_t *range_last,
-    size_t range_count,
-    int64_t n_expert,
-    size_t expert_bytes,
-    size_t padding,
-    bool cache_bypass,
-    void *device_dst,
-    size_t device_capacity,
-    void *stream,
-    uint64_t *experts_copied,
-    uint64_t *iouring_reads,
-    uint64_t *iouring_bytes,
-    uint64_t *cache_lookups,
-    uint64_t *cache_hits);
-
-extern "C" bool ggml_cuda_moe_dense_copy_to_device(
-    const char *tensor_name,
-    void *device_dst,
-    size_t nbytes,
-    void *stream,
-    bool *read_ahead_hit);
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -1482,83 +1461,6 @@ static int ggml_cuda_oom_reclaimer_invoke(int device, size_t requested_bytes, si
         }
     }
     return result;
-}
-
-// Prefill seeding (ggml-cuda.h): one owner per device, an event recorded behind each offered copy, and the
-// owner's event the backend's stream waits for at the next fence.
-struct ggml_cuda_moe_seed_entry {
-    std::mutex mutex;
-    ggml_cuda_moe_seed_fn callback = nullptr;
-    void * userdata = nullptr;
-    cudaEvent_t ready = nullptr;
-    void * pending = nullptr; // the owner's event the backend's stream has not waited for yet
-};
-
-static std::array<ggml_cuda_moe_seed_entry, GGML_CUDA_MAX_DEVICES> g_cuda_moe_seeds;
-
-extern "C" GGML_BACKEND_API bool ggml_cuda_moe_seed_register(int device, ggml_cuda_moe_seed_fn callback, void * userdata) {
-    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || callback == nullptr || userdata == nullptr) {
-        return false;
-    }
-    auto & entry = g_cuda_moe_seeds[device];
-    std::lock_guard<std::mutex> lock(entry.mutex);
-    if (entry.callback != nullptr) {
-        return entry.callback == callback && entry.userdata == userdata;
-    }
-    entry.callback = callback;
-    entry.userdata = userdata;
-    return true;
-}
-
-extern "C" GGML_BACKEND_API bool ggml_cuda_moe_seed_unregister(int device, ggml_cuda_moe_seed_fn callback, void * userdata) {
-    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
-        return false;
-    }
-    auto & entry = g_cuda_moe_seeds[device];
-    std::lock_guard<std::mutex> lock(entry.mutex);
-    if (entry.callback != callback || entry.userdata != userdata) {
-        return false;
-    }
-    entry.callback = nullptr;
-    entry.userdata = nullptr;
-    entry.pending = nullptr;
-    return true;
-}
-
-extern "C" GGML_BACKEND_API void ggml_cuda_moe_seed_offer(ggml_backend_t backend, const ggml_tensor * tensor,
-        const char * tensor_name, int64_t n_expert, size_t expert_bytes, const int32_t * counts) {
-    if (!ggml_backend_is_cuda(backend) || tensor == nullptr || tensor->data == nullptr || counts == nullptr) {
-        return;
-    }
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    auto & entry = g_cuda_moe_seeds[cuda_ctx->device];
-    std::lock_guard<std::mutex> lock(entry.mutex);
-    if (entry.callback == nullptr) {
-        return;
-    }
-    ggml_cuda_set_device(cuda_ctx->device);
-    if (entry.ready == nullptr) {
-        CUDA_CHECK(cudaEventCreateWithFlags(&entry.ready, cudaEventDisableTiming));
-    }
-    CUDA_CHECK(cudaEventRecord(entry.ready, cuda_ctx->stream()));
-    void * done = nullptr;
-    if (entry.callback(entry.userdata, tensor_name, tensor->data, expert_bytes, n_expert, counts, entry.ready, &done) > 0 && done) {
-        entry.pending = done;
-    }
-}
-
-extern "C" GGML_BACKEND_API void ggml_cuda_moe_seed_fence(ggml_backend_t backend) {
-    if (!ggml_backend_is_cuda(backend)) {
-        return;
-    }
-    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    auto & entry = g_cuda_moe_seeds[cuda_ctx->device];
-    std::lock_guard<std::mutex> lock(entry.mutex);
-    if (entry.pending != nullptr) {
-        ggml_cuda_set_device(cuda_ctx->device);
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t) entry.pending, 0));
-        entry.pending = nullptr;
-    }
 }
 
 static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -4316,6 +4218,13 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+#ifdef GGML_SSD_CUDA_EXECUTOR
+    if (cuda_ctx->ssd_services) {
+        const auto & services = *cuda_ctx->ssd_services;
+        services.gpu->transport->quiesce(services.gpu_transport);
+        cuda_ctx->ssd_services = nullptr;
+    }
+#endif
     delete cuda_ctx;
     delete backend;
 }
@@ -4327,50 +4236,6 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
-}
-
-extern "C" bool ggml_cuda_moe_expert_pack_copy_ranges_to_tensor(
-        ggml_backend_t backend,
-        ggml_tensor *tensor,
-        const char *tensor_name,
-        const int32_t *range_first,
-        const int32_t *range_last,
-        size_t range_count,
-        int64_t n_expert,
-        size_t expert_bytes,
-        size_t padding,
-        bool cache_bypass,
-        uint64_t *experts_copied,
-        uint64_t *iouring_reads,
-        uint64_t *iouring_bytes,
-        uint64_t *cache_lookups,
-        uint64_t *cache_hits) {
-    if (!backend || !tensor || !ggml_backend_is_cuda(backend)) return false;
-    ggml_backend_cuda_context *cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-    if (!buffer || buffer->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device)) return false;
-    ggml_cuda_set_device(cuda_ctx->device);
-    return ggml_cuda_moe_expert_pack_copy_ranges_to_device(
-        tensor_name, range_first, range_last, range_count, n_expert,
-        expert_bytes, padding, cache_bypass, tensor->data, ggml_nbytes(tensor),
-        reinterpret_cast<void *>(cuda_ctx->stream()), experts_copied,
-        iouring_reads, iouring_bytes, cache_lookups, cache_hits);
-}
-
-// a weight homed on the drive (the expert transport indexes it in blocks) into its copy on the device, on the
-// backend's stream; read_ahead_hit: its blocks had been read ahead
-extern "C" bool ggml_cuda_moe_dense_copy_to_tensor(
-        ggml_backend_t backend,
-        ggml_tensor *tensor,
-        const char *tensor_name,
-        bool *read_ahead_hit) {
-    if (!backend || !tensor || !ggml_backend_is_cuda(backend)) return false;
-    ggml_backend_cuda_context *cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-    if (!buffer || buffer->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device)) return false;
-    ggml_cuda_set_device(cuda_ctx->device);
-    return ggml_cuda_moe_dense_copy_to_device(tensor_name, tensor->data, ggml_nbytes(tensor),
-        reinterpret_cast<void *>(cuda_ctx->stream()), read_ahead_hit);
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -6535,6 +6400,39 @@ bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+#ifdef GGML_SSD_CUDA_EXECUTOR
+extern "C" void * ggml_backend_cuda_ssd_stream(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) { return nullptr; }
+    return reinterpret_cast<void *>(static_cast<ggml_backend_cuda_context *>(backend->context)->stream());
+}
+
+extern "C" int ggml_backend_cuda_ssd_device_ordinal(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) { return -1; }
+    return static_cast<ggml_backend_cuda_context *>(backend->context)->device;
+}
+
+extern "C" bool ggml_backend_cuda_ssd_attach_services(
+        ggml_backend_t backend, const ssd::runtime_services * services,
+        char * error, size_t error_size) noexcept {
+    auto refuse = [&](const char * message) noexcept {
+        if (error && error_size) { std::snprintf(error, error_size, "%s", message); }
+        return false;
+    };
+    if (!ggml_backend_is_cuda(backend)) { return refuse("SSD services require a CUDA backend"); }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (!services || !services->gpu || !services->cpu) {
+        return refuse("CUDA SSD services require explicit GPU and CPU providers");
+    }
+    if (context->ssd_services && context->ssd_services != services) {
+        return refuse("CUDA SSD services are already attached to another context");
+    }
+    if (services->gpu_device != context->device) { return refuse("CUDA SSD service device differs from backend"); }
+    context->ssd_services = services;
+    if (error && error_size) { error[0] = '\0'; }
+    return true;
+}
+#endif
+
 int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }
@@ -7383,6 +7281,11 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+#ifdef GGML_SSD_CUDA_EXECUTOR
+    if (strcmp(name, "ggml_backend_cuda_ssd_api_v1") == 0) {
+        return (void *) ggml_backend_cuda_ssd_api_v1;
+    }
+#endif
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

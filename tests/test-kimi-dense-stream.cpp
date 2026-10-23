@@ -74,9 +74,9 @@ struct copy_delta {
     uint64_t tensors, bytes, readahead, fallbacks;
 };
 
-copy_delta copies_since(const ggml_backend_sched_kimi_copy_stats & a) {
+copy_delta copies_since(ggml_backend_sched_t sched, const ggml_backend_sched_kimi_copy_stats & a) {
     ggml_backend_sched_kimi_copy_stats b = {};
-    ggml_backend_sched_kimi_copy_stats_get(&b);
+    ggml_backend_sched_kimi_copy_stats_get(sched, &b);
     return { b.dense_tensors - a.dense_tensors, b.dense_bytes - a.dense_bytes, b.dense_readahead - a.dense_readahead,
              b.dense_fallbacks - a.dense_fallbacks };
 }
@@ -243,10 +243,10 @@ void run() {
         const graph_out ref = run_graph(sched, ref_w, dev[n_drive], dev[n_drive + 1], nullptr, n_tokens, x);
         for (int pass = 0; pass < 2; ++pass) {
             ggml_backend_sched_kimi_copy_stats before = {};
-            ggml_backend_sched_kimi_copy_stats_get(&before);
+            ggml_backend_sched_kimi_copy_stats_get(sched, &before);
             const std::vector<ggml_tensor *> drive_w = { home[0], home[1], home[2], home[3] };
             const graph_out got = run_graph(sched, drive_w, home[n_drive], dev[n_drive + 1], ram, n_tokens, x);
-            const copy_delta d = copies_since(before);
+            const copy_delta d = copies_since(sched, before);
             require(std::memcmp(got.out.data(), ref.out.data(), sizeof(float) * got.out.size()) == 0,
                     "the drive homes' product differs from the device weights' at " + std::to_string(n_tokens) +
                     " tokens");

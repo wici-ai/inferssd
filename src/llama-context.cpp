@@ -1103,6 +1103,8 @@ llama_context::llama_context(
         backends.emplace_back(backend_cpu);
 
         if (ssd_runtime) {
+            ssd_runtime->bind_cpu(backend_cpu);
+            for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get()); }
             auto * registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
             const auto get_api = reinterpret_cast<ssd::cpu::get_api_v2>(
                 ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v2"));
@@ -1270,7 +1272,7 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     {
         ggml_backend_sched_kimi_copy_stats now = {};
-        ggml_backend_sched_kimi_copy_stats_get(&now);
+        ggml_backend_sched_kimi_copy_stats_get(sched.get(), &now);
         const std::string line = dense_stream.end(now);
         if (!line.empty()) {
             LLAMA_LOG_INFO("%s\n", line.c_str());
@@ -1414,6 +1416,7 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (ssd_runtime) { ssd_runtime->stream.attach(sched.get()); }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1586,6 +1589,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+    if (ssd_runtime) { ssd_runtime->stream.attach(sched.get()); }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -1752,7 +1756,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     if (active || prefill_copy.passes > 0) {
         // the scheduler reads a split's experts before it launches the split: the passes' reads are all counted
         ggml_backend_sched_kimi_copy_stats now = {};
-        ggml_backend_sched_kimi_copy_stats_get(&now);
+        ggml_backend_sched_kimi_copy_stats_get(sched.get(), &now);
         if (active) {
             prefill_copy.begin(now);
         } else {
@@ -1763,7 +1767,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     // previous phase and begins its prefill, the prefill's end begins its decode, the request's end ends that
     {
         ggml_backend_sched_kimi_copy_stats now = {};
-        ggml_backend_sched_kimi_copy_stats_get(&now);
+        ggml_backend_sched_kimi_copy_stats_get(sched.get(), &now);
         const bool decode_begins = !active && dense_stream.phase != nullptr &&
             std::strcmp(dense_stream.phase, "prefill") == 0;
         if (active || dense_stream.phase != nullptr) {
@@ -4008,9 +4012,9 @@ ggml_status llama_context::graph_compute(
             }
         }
     }
-    ggml_backend_sched_kimi_set_profile_phase(batched ? 1 : 2);
+    ggml_backend_sched_kimi_set_profile_phase(sched.get(), batched ? 1 : 2);
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
-    ggml_backend_sched_kimi_set_profile_phase(0);
+    ggml_backend_sched_kimi_set_profile_phase(sched.get(), 0);
     for (auto scope = activation_quant_reuse_scopes.rbegin();
             scope != activation_quant_reuse_scopes.rend(); ++scope) {
         scope->second(scope->first);
@@ -5030,6 +5034,14 @@ uint32_t llama_n_batch(const llama_context * ctx) {
 
 uint32_t llama_n_ubatch(const llama_context * ctx) {
     return ctx->n_ubatch();
+}
+
+bool llama_ssd_prefill_phase(llama_context * ctx, bool active,
+        uint32_t prompt_tokens, uint32_t prefill_tokens) {
+    try { return ctx && ctx->moe_prefill_phase_workspace(active, prompt_tokens, prefill_tokens); }
+    catch (const std::exception & failure) { LLAMA_LOG_ERROR("SSD phase transition failed: %s\n", failure.what()); }
+    catch (...) { LLAMA_LOG_ERROR("SSD phase transition failed\n"); }
+    return false;
 }
 
 extern "C" bool llama_moe_prefill_phase_workspace(

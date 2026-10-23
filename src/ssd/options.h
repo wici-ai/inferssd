@@ -7,6 +7,7 @@
 #include "ggml-ssd/runtime-services.h"
 #include "ggml-ssd/store/source.h"
 #include "ggml-ssd/host/arbiter.h"
+#include "ggml-ssd/stream/runtime.h"
 
 #include <memory>
 
@@ -34,11 +35,15 @@ struct llama_ssd_context {
     ssd::store::source_view sources;
     std::unique_ptr<ssd::telemetry::writer> events;
     ssd::runtime_services services;
+    std::unique_ptr<void, llama_ssd_source_delete> gpu_transport;
+    ssd::stream::runtime stream;
     ggml_ssd_mac_cache * mac_cache = nullptr;
     void (*destroy_mac)(ggml_ssd_mac_cache *) noexcept = nullptr;
 
     explicit llama_ssd_context(const llama_ssd_options & options);
     ~llama_ssd_context();
+    void bind_cpu(ggml_backend_t backend);
+    void attach_backend(ggml_backend_t backend);
 };
 
 struct llama_ssd_host_reservation {
