@@ -24,9 +24,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Resolve the upstream snapshot
-        # fetch-depth: 0 already fetched all branch history. Credentials are
-        # deliberately not persisted, so resolve the local remote-tracking ref.
-        run: git branch upstream refs/remotes/origin/upstream
+        # This snapshot is already in main's history. Create the local alias
+        # without depending on a separately maintained remote branch.
+        run: git branch upstream 8884f8314ce8ea96d62cd602b6bbf7fc25758a09
       - name: Public content
         env:
           PROPOSED_REF: ${{ github.head_ref || github.ref_name }}
