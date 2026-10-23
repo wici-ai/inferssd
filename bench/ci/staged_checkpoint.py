@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One Linux Muse 512/256 comparison under one root-broker lease.
+"""One Linux Muse 512/256 comparison with explicit broker lease provenance.
 
 Operator configuration binds the root manifest, both source revisions, build and
 benchmark specs, model file identities, host/resources and the explicit reference
@@ -28,6 +28,7 @@ from ci.compare import compare_pair
 from ci.contract import digest, load, policy_read, revision, save
 from ci.isolated_device import protected
 from ci.reference import LEGACY_REVISION, identity, validate_binding
+from ci.resume_base import recover
 from ci.stage_session import StageSession, unique_object
 from ci.staged_benchmark import benchmark
 from ci.staged_build import run_build, sealed_file
@@ -218,8 +219,9 @@ def validate_candidate(session, spec, build, output):
         raise ValueError("CUDA short gate did not report actual successful execution")
 
 
-def runtime_receipt(config, side, spec, build, output, binding, model):
-    before, after = (load(output / (name + ".json")) for name in ("runtime-before", "runtime-after"))
+def runtime_receipt(config, side, spec, build, output, binding, model, *, evidence=None):
+    evidence = output if evidence is None else evidence
+    before, after = (load(evidence / (name + ".json")) for name in ("runtime-before", "runtime-after"))
     resources = config["host"]["resources"]
     ambient = None
     mapped = {}
@@ -276,7 +278,7 @@ def runtime_receipt(config, side, spec, build, output, binding, model):
     if launch["args"] != spec["benchmark"]["argv"] or launch["environment"] != spec["benchmark"]["environment"]:
         raise ValueError("reviewed binding does not describe the actual launch")
     if side == "candidate":
-        native = native_settings(output / "stderr.log")
+        native = native_settings(evidence / "stderr.log")
         _, raw = asset(spec["settings"], contents=True)
         registry = importlib.import_module("inferssd.configuration.settings")
         expected = registry.parse(raw.decode("utf-8"), spec["settings"]["runtime_path"], platform="linux").document()["values"]
@@ -380,13 +382,23 @@ def run(args):
                         raise ValueError("pinned legacy source evidence differs")
         model = models(config, manifest)
         save(output / "model-identity-before.json", model)
+        results, receipts = {}, {}
+        if "resumed_base" in config:
+            result, receipt, recovered, binary_hash = recover(
+                config, args.job_id, output / "base", binding, model,
+                receipt=runtime_receipt, alias_asset=alias_asset, models=models)
+            results["base"], receipts["base"] = result, receipt
+            report["recovered_source"] = recovered
+            report["lease_scope"] = "base evidence from a completed earlier lease; candidate alone in the new lease"
+            report["arms"]["base"] = dict(revision=config["base"]["revision"], status="recovered",
+                completion_requests=1, new_completion_requests=0, binary_sha256=binary_hash)
         session = StageSession(args.socket, args.job_id, controller_uid=os.getuid())
         opened = session.open()
         save(output / "job-opened.json", opened)
         if opened.get("manifest_sha256") != config["manifest_sha256"]:
             raise ValueError("leased broker manifest differs from the reviewed checkpoint")
-        results, receipts = {}, {}
-        for side in ("base", "candidate"):
+        report["current_lease"] = dict(job_id=args.job_id, lease=opened["lease"])
+        for side in (("candidate",) if "resumed_base" in config else ("base", "candidate")):
             spec, arm = config[side], output / side
             arm.mkdir()
             report["arms"][side] = dict(revision=spec["revision"], status="failed")
