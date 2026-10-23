@@ -1,7 +1,7 @@
 name: InferSSD device admission information
 
-# Public PR code runs only on GitHub-hosted machines. Physical runners must
-# never be registered with this repository, including after it becomes public.
+# Physical execution and App publication belong to the separate private control.
+# This preview has no device runner, App token, secret or dispatch permission.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -10,10 +10,27 @@ permissions: {}
 jobs:
   device-admission:
     runs-on: ubuntu-24.04
-    timeout-minutes: 2
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Preview complete changed-path selection on hosted hardware
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I bench/ci/preview_selection.py --output selection-preview.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && github.event_name == 'pull_request'
+        with:
+          name: device-selection-preview
+          path: selection-preview.json
+          if-no-files-found: warn
       - name: Physical tests require separate private admission
         run: |
-          echo "Physical device tests are not automatically authorized by a PR."
-          echo "A maintainer must review an exact SHA and use the protected private device controller."
-          echo "This informational job is not the required InferSSD device performance check."
+          echo "This is an unprivileged preview, not physical acceptance."
+          echo "The protected private controller independently reads the real PR and exact-head approval."
+          echo "It binds the same selected plan to root-staged config/manifests, execution and terminal App aggregation."

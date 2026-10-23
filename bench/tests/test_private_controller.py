@@ -272,13 +272,15 @@ def test_public_workflow_cannot_schedule_physical_runner_and_private_token_only_
     private = (root / "bench/ci/controller/device-performance.yml").read_text()
     assert "self-hosted" not in public and "workflow_run:" not in public
     assert "head_sha:" in private and "environment: physical-devices" in private
-    device = private[private.index("\n  device:") : private.index("\n  publish:")]
+    device = (root / "bench/ci/controller/integration-smoke.workflow.yml").read_text()
     assert (
         "source-data" not in device
         and "SOURCE_READ_TOKEN" not in device
         and "CHECK_APP" not in device
     )
-    assert "driver.py" not in device and "isolated_device.py" in device
+    assert "driver.py" not in device and "staged_integration.py" in device
+    assert "selected_controller.py execute" in private
+    assert "if: always() &&" in private[private.index("\n  publish:"):]
 
 
 def test_default_broker_template_refuses_execution():

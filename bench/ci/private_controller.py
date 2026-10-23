@@ -27,8 +27,9 @@ from ci.contract import (
 
 
 class API:
-    def __init__(self, repository, token):
+    def __init__(self, repository, token, version="2022-11-28"):
         self.repository, self.token = repository, token
+        self.version = version
 
     def call(self, path, data=None, method=None):
         request = urllib.request.Request(
@@ -37,12 +38,13 @@ class API:
             {
                 "Authorization": "Bearer " + self.token,
                 "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
+                "X-GitHub-Api-Version": self.version,
             },
             method=method,
         )
         with urllib.request.urlopen(request, timeout=30) as response:
-            return json.load(response)
+            raw = response.read()
+            return json.loads(raw) if raw else None
 
 
 def context(policy, env, event):
