@@ -3175,12 +3175,6 @@ static void ggml_kimi_full_coverage_cpu_fallback_record(
     pthread_mutex_unlock(&ggml_kimi_full_coverage_trace_mu);
 }
 
-static bool ggml_kimi_uses_k3_local_adapter(int64_t n_experts, size_t expert_bytes) {
-    return n_experts == 896 &&
-        (expert_bytes == 3612672 || expert_bytes == 2150400);
-}
-
-#include "kimi.c"
 #include "kimi-common-adapter.inc"
 
 static void ggml_compute_forward_mul_mat_id_generic(
@@ -3617,17 +3611,13 @@ static void ggml_compute_forward_mul_mat_id_generic(
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
-    if (ggml_model_type_is_kimi()) {
+    if (ggml_common_model_type_is_kimi()) {
         const int64_t n_experts = dst->src[0]->ne[2];
         const size_t expert_bytes = (size_t) dst->src[0]->ne[1] * dst->src[0]->nb[1];
         if (ggml_cuda_moe_adapter_select_model_shape) {
             ggml_cuda_moe_adapter_select_model_shape(n_experts, expert_bytes);
         }
-        if (ggml_kimi_uses_k3_local_adapter(n_experts, expert_bytes)) {
-            ggml_compute_forward_mul_mat_id_kimi(params, dst);
-        } else {
-            ggml_compute_forward_mul_mat_id_common_kimi(params, dst);
-        }
+        ggml_compute_forward_mul_mat_id_common_kimi(params, dst);
         return;
     }
     ggml_compute_forward_mul_mat_id_generic(params, dst);

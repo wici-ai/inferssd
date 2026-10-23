@@ -4102,13 +4102,6 @@ ggml_cgraph * llama_context::graph_reserve(
         sched.get(),
         !dense_gpu_phase_gate_enabled ||
             (!dense_gpu_prefill_phase_active && reserve_tg));
-    // A phase-1 reserve constructs both the actual prompt graph and a synthetic
-    // token-generation graph. Keep dense streaming phase-gated, but size and
-    // split the synthetic tg graph with the KDA decode topology that will run
-    // after the prompt. Real prompt execution still uses process_ubatch's
-    // prefill assignment.
-    ggml_backend_sched_kimi_set_kda_decode(
-        sched.get(), !dense_gpu_phase_gate_enabled || reserve_tg);
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that

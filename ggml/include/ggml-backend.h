@@ -344,7 +344,6 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
     GGML_API void                 ggml_backend_sched_kimi_set_profile_phase(int phase);
     GGML_API void                 ggml_backend_sched_kimi_set_dense_decode(ggml_backend_sched_t sched, bool decode);
-    GGML_API void                 ggml_backend_sched_kimi_set_kda_decode(ggml_backend_sched_t sched, bool decode);
     // the expert copies of every scheduler of the process so far (GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE): expert
     // slices (one expert of one expert tensor: gate, up, down or a fused gate-up) and bytes read from the expert
     // source, the time those reads took, and the reads that fell back to a slower path (a failed batched read redone
