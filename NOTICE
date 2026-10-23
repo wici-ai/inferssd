@@ -8,6 +8,9 @@ licenses. No model weights are distributed with this source tree.
 1. llama.cpp and ggml
    https://github.com/ggml-org/llama.cpp
    Copyright (c) 2023-2026 The ggml authors. MIT (LICENSE).
+   Vocabulary loading optimizations: Evgen Mykhailenko and Georgi Gerganov,
+   upstream PR #30679, commit 824eaecf486f5ce0070f71501094b60f3cd70864.
+   Ported under the same MIT license; see PROVENANCE.md.
 
 2. DeepSeek V4 support
    https://github.com/nisparks/llama.cpp

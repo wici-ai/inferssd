@@ -1,5 +1,16 @@
 # Source provenance
 
+## Vocabulary loading port
+
+The bounded metadata previews, vocabulary-map reservations, merge parsing and
+direct byte-codepoint lookup are adapted from ggml-org/llama.cpp
+[`824eaecf486f5ce0070f71501094b60f3cd70864`](https://github.com/ggml-org/llama.cpp/commit/824eaecf486f5ce0070f71501094b60f3cd70864),
+[PR #30679](https://github.com/ggml-org/llama.cpp/pull/30679), by Evgen Mykhailenko
+and Georgi Gerganov (MIT). The port retains SSDash's Kimi-K2 tokenizer branch.
+`tests/test-vocab-loading.cpp` adds local regression coverage. This targets
+vocabulary initialization and metadata logging; it is not a measured improvement
+in model prefill or decode throughput.
+
 Imported from WiCi AI's internal repository ssd-llama (not public) at commit
 `e79cddaa3a76730fa953b969b7f8c19693867fec`; the [import manifest](docs/ssdash/import-manifest.tsv)
 lists the origin of every changed path. Historical source hashes are plain text because that repository is
