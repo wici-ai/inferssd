@@ -3,7 +3,6 @@ cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
 find_package(CUDAToolkit)
 
 option(GGML_CUDA_MOE_STREAM "Compile the opt-in CUDA MoE streaming path" ON)
-option(GGML_CUDA_LIGHTNING_INDEXER "Compile the CUDA lightning indexer op" ON)
 
 if (CUDAToolkit_FOUND)
     message(STATUS "CUDA Toolkit found")
@@ -117,10 +116,6 @@ if (CUDAToolkit_FOUND)
     endif()
     list(APPEND GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/moe_stream_decode_batch.cu")
     list(REMOVE_DUPLICATES GGML_SOURCES_CUDA)
-    if (NOT GGML_CUDA_LIGHTNING_INDEXER)
-        list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/lightning-indexer.cu")
-        add_compile_definitions(GGML_CUDA_NO_LIGHTNING_INDEXER)
-    endif()
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")

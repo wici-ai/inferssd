@@ -586,7 +586,6 @@ extern "C" {
 
         GGML_OP_GLU,
         GGML_OP_HC_WEIGHTED_SUM,
-        GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_ROW_MASK,
@@ -1457,24 +1456,6 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
-
-    // Lightning indexer: fused sparse-attention scoring used by DeepSeek
-    // V3.2/V4. Computes
-    //   score[k, b, 1, s] = sum_h relu(<q[:, h, b, s], k[:, 0, k, s]> * scale_embd)
-    //                          * weights[h, b, 0, s] * scale_heads
-    //  q:       [n_embd, n_heads, n_batch, n_stream]  F32
-    //  k:       [n_embd, 1,       n_kv,    n_stream]  F32/F16/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0
-    //  weights: [n_heads, n_batch, 1,      n_stream]  F32
-    //  result:  [n_kv,   n_batch,  1,      n_stream]  F32
-    // Replaces the explicit mul_mat -> relu -> mul(weights) -> sum_rows
-    // sequence with a single fused kernel.
-    GGML_API struct ggml_tensor * ggml_lightning_indexer(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * q,
-            struct ggml_tensor  * k,
-            struct ggml_tensor  * weights,
-            float                 scale_embd,
-            float                 scale_heads);
 
     // DeepSeek-V4 hyper-connection Sinkhorn combination, hc = 4:
     //   mixes [(2 + hc)*hc, n_tokens], scale [>= 3], base [(2 + hc)*hc] -> [hc, hc, n_tokens]

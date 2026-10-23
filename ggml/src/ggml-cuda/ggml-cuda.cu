@@ -69,7 +69,6 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/hc-weighted-sum.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
-#include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -4491,13 +4490,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
             break;
-        case GGML_OP_LIGHTNING_INDEXER:
-#ifdef GGML_CUDA_NO_LIGHTNING_INDEXER
-            GGML_ABORT("CUDA lightning indexer was disabled at build time");
-#else
-            ggml_cuda_op_lightning_indexer(ctx, dst);
-#endif
-            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -7548,30 +7540,6 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
-        case GGML_OP_LIGHTNING_INDEXER:
-#ifdef GGML_CUDA_NO_LIGHTNING_INDEXER
-            return false;
-#else
-            // The CUDA kernel currently only handles n_embd=128, n_head=64
-            // (matches DeepSeek V3.2 / V4 indexer shapes). Other shapes
-            // GGML_ABORT inside the kernel; surface that here so the
-            // scheduler keeps the op on a backend that can run it.
-            return op->src[0]->type == GGML_TYPE_F32 &&
-                op->src[2]->type == GGML_TYPE_F32 &&
-                op->type == GGML_TYPE_F32 &&
-                op->src[0]->ne[0] == 128 &&
-                op->src[0]->ne[1] == 64 &&
-                op->src[1]->ne[0] == 128 &&
-                op->src[1]->ne[1] == 1 &&
-                (op->src[1]->type == GGML_TYPE_F32 ||
-                 op->src[1]->type == GGML_TYPE_F16 ||
-                 op->src[1]->type == GGML_TYPE_BF16 ||
-                 op->src[1]->type == GGML_TYPE_Q4_0 ||
-                 op->src[1]->type == GGML_TYPE_Q4_1 ||
-                 op->src[1]->type == GGML_TYPE_Q5_0 ||
-                 op->src[1]->type == GGML_TYPE_Q5_1 ||
-                 op->src[1]->type == GGML_TYPE_Q8_0);
-#endif
         case GGML_OP_PAD:
             return true;
         case GGML_OP_UPSCALE:
