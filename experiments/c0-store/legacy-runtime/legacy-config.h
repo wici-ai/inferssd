@@ -1,7 +1,9 @@
 #pragma once
-#include "legacy-index.h"
+#include "ggml-ssd/store/legacy-index.h"
+#include "catalog.h"
 
 namespace c0 {
+description source_description_from_env();
 
 // Match mode/sidecar precedence only to refuse active unsupported transport.
 // Explicit 0/off/disabled remains inert even when a sidecar path is present.
