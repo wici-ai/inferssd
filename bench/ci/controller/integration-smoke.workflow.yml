@@ -75,8 +75,8 @@ jobs:
           import sys
           from pathlib import Path
           control, config, expected_hash, expected_revision, job_id, output, device, platform = sys.argv[1:]
-          if sys.version_info < (3, 10):
-              raise SystemExit("the operator-installed controller requires Python 3.10 or later")
+          if sys.version_info < (3, 9):
+              raise SystemExit("the operator-installed controller requires Python 3.9 or later")
           sys.path.insert(0, str(Path(control) / "bench"))
           from ci.contract import digest, load, save
           from ci.isolated_device import protected

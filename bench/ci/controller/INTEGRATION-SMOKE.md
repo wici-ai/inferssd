@@ -15,7 +15,7 @@ no CI slot. Readiness does not activate the full PR performance matrix.
 The operator provisions these fixed Linux paths before dispatch:
 
 - `/opt/inferssd-ci-control/current/venv/bin/python`: root-owned native Python
-  3.10 environment containing the reviewed control dependencies; the installation
+  3.9 or later environment containing the reviewed control dependencies; the installation
   and interpreter target must be protected from the runner and candidate UIDs.
 - `/opt/inferssd-ci-control/current/bench/ci/staged_integration.py`: reviewed
   trusted coordinator, with all imported control files root protected. `current`
