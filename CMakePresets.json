@@ -34,7 +34,7 @@
     {
         "name": "x64-windows-llvm", "hidden": true,
         "cacheVariables": {
-            "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/x64-windows-llvm.cmake"
+            "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/engine/cmake/x64-windows-llvm.cmake"
         }
     },
 
@@ -43,7 +43,7 @@
         "architecture": { "value": "arm64",    "strategy": "external" },
         "toolset":      { "value": "host=x64", "strategy": "external" },
         "cacheVariables": {
-            "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/arm64-windows-llvm.cmake"
+            "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/engine/cmake/arm64-windows-llvm.cmake"
         }
     },
 
@@ -52,7 +52,7 @@
         "architecture": { "value": "arm64",    "strategy": "external" },
         "toolset":      { "value": "host=x64", "strategy": "external" },
         "cacheVariables": {
-            "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/arm64-apple-clang.cmake"
+            "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/engine/cmake/arm64-apple-clang.cmake"
         }
     },
     {

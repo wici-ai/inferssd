@@ -1,8 +1,8 @@
 # InferSSD
 
 InferSSD is an SSD-backed inference framework for large mixture-of-experts models. It streams expert weights
-from local storage and manages execution across the CPU, host memory and GPU. The Linux adaptive framework
-measures the machine and derives the runtime configuration.
+from local storage and manages execution across the CPU, host memory and GPU. The Python framework provides typed configuration, owned launch and Linux
+adaptive control; full live probe/bootstrap orchestration remains under integration.
 
 InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) and ggml. This repository includes the
 engine source with InferSSD's runtime extensions. The upstream baseline and component attribution are
@@ -17,7 +17,7 @@ earlier code and are not release benchmarks.
 The supported targets are DeepSeek-V4.1 Flash with MXFP4 experts in the Q8_0 GGUF distribution, and Muse Spark
 Open UD-Q4_K_XL. Linux CUDA development targets RTX 5090, RTX 5060 Ti and GB10. Other inherited models and
 backends have not been qualified by this project. Apple Silicon integration includes a
-[GGUF launcher for both models](docs/inferssd/mac-launcher.md); target-device qualification is in progress.
+[GGUF launcher for both models](docs/mac-launcher.md); target-device qualification is in progress.
 
 The model files are large: allow approximately 505-508 GB for each model, plus working space. Linux reads
 expert ranges directly from the GGUF shards and does not require a separate expert pack.
@@ -44,12 +44,13 @@ git clone https://github.com/wici-ai/inferssd.git
 cd inferssd
 cmake --preset linux-cuda
 cmake --build build-linux-cuda --target llama-server --parallel 4
-python3 -m pip install ./tools/inferssd
+python3 -m pip install ./framework
+python3 scripts/engine-resources.py --build build-linux-cuda --output engine-resources.json
 inferssd launch --help
 ```
 
 Use `macos-metal` on Apple Silicon, or `linux-cpu` for core/CPU development.
-The [typed launcher guide](tools/inferssd/README.md) describes model paths,
+The [typed launcher guide](framework/README.md) describes model paths,
 explicit resource policies, leases, settings receipts and launch artifacts.
 `inferssd launch --execute` is the production package entry point. It consumes
 `inferssd-settings 1`; native callers may use `llama-server --ssd-settings FILE
@@ -57,16 +58,32 @@ explicit resource policies, leases, settings receipts and launch artifacts.
 Historical launchers are retained for recorded comparisons. No binary packages
 or formal release are published by this source integration.
 
+## Repository layout
+
+- `engine/`: bundled native runtime, ggml backends, model resources and native tests.
+- `framework/`: installable Python configuration, planning and owned runtime package.
+- `bench/`: benchmark clients and real-device CI.
+- `tests/`: cross-component integration tests; native tests live in `engine/tests/ssd/`.
+- `scripts/` and `docs/`: product maintenance and documentation. Historical reports
+  live in `docs/history/`; consumed old implementations exist only as test fixtures.
+
+The root CMake entry point preserves `build*/bin` output paths. Installed deployments
+use an explicit [engine resource descriptor](docs/engine-resources.md), independent
+of the working directory or source checkout.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for checks and review requirements, [PROVENANCE.md](PROVENANCE.md)
-for source history, and [the import manifest](docs/inferssd/import-manifest.tsv) for the origin of every changed
+for source history, and [the import manifest](docs/import-manifest.tsv) for the origin of every changed
 path. The baseline snapshot is commit `8884f8314ce8ea96d62cd602b6bbf7fc25758a09`, already included in main.
-`git diff 8884f8314ce8ea96d62cd602b6bbf7fc25758a09 main` exposes the downstream changes after integration.
+`python3 scripts/inferssd/patch-surface.py` compares current engine files to that
+snapshot without counting the directory relocation as a code patch. The complete
+[path migration](docs/development/path-migration.tsv) records every original path.
 
 The core and backend executors, runtime assembly, common/server features and
 Python framework now follow the [module layout](ARCHITECTURE.md). Run
-`python3 scripts/inferssd/check-layering.py` for dependency checks. The
+`python3 scripts/inferssd/check-layering.py` for dependency checks and
+`python3 scripts/inferssd/check-layout.py` for whole-tree ownership checks. The
 [upstream patch inventory](PATCHES.md) identifies integration hooks and model/op
 exceptions. Real-device candidate qualification remains separate from source
 organization; formal benchmark samples have not been collected.

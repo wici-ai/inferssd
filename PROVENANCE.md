@@ -1,7 +1,7 @@
 # Source provenance
 
 Imported from WiCi AI's internal repository ssd-llama (not public) at commit
-`e79cddaa3a76730fa953b969b7f8c19693867fec`; the [import manifest](docs/inferssd/import-manifest.tsv)
+`e79cddaa3a76730fa953b969b7f8c19693867fec`; the [import manifest](docs/import-manifest.tsv)
 lists the origin of every changed path. Historical source hashes are plain text because that repository is
 not publicly accessible.
 
@@ -15,7 +15,7 @@ not publicly accessible.
 4. Repository metadata, attribution, community documentation and verification tools.
 
 The golden launcher fixture is copied byte for byte from ssd-llama `1f174b4`. The example at
-`examples/simple/simple.cpp` retains its upstream version. Future ports and source-layout changes will be
+`engine/examples/simple/simple.cpp` retains its upstream version. Future ports and source-layout changes will be
 recorded here by their public pull-request numbers.
 
 ## Module origins
