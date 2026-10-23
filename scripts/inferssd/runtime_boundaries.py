@@ -20,8 +20,9 @@ def source_issues(path: Path, kind: str, content: str) -> list[str]:
             target = include.group(1)
             if relative.startswith(POLICY) and re.search(
                 r"ggml-(?:cpu|cuda|metal)|cpu-sink|cpu-prefill|runtime-services|ggml-backend"
-                r"|(?:^|/)(?:io|host|store|stream|worker|thread-pool)/"
-                r"|^(?:thread|mutex|condition_variable|future|chrono|unistd.h|fcntl.h|sys/)$", target
+                r"|(?:^|/)(?:io|host|store|stream|worker|thread-pool)(?:/|[.-])"
+                r"|^(?:thread|mutex|condition_variable|future|chrono|unistd.h|fcntl.h|pthread.h)$"
+                r"|^sys/", target
             ):
                 issue = "placement policy includes execution or resource machinery"
             if relative.startswith(MODEL) and re.search(
@@ -57,8 +58,10 @@ def framework_issues(path: Path, content: str) -> list[str]:
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
         elif isinstance(node, ast.ImportFrom):
-            names = [node.module or ""]
-        if any(name == "bench" or name.startswith(("bench.", "engine.src", "engine.ggml", "ggml.")) for name in names):
+            module = node.module or ""
+            names = [module] + [f"{module}.{alias.name}" for alias in node.names]
+        if any(name in {"bench", "ggml", "engine.src", "engine.ggml"}
+               or name.startswith(("bench.", "engine.src.", "engine.ggml.", "ggml.")) for name in names):
             errors.append(f"{path}:{node.lineno}: framework imports native or benchmark implementation")
     return errors
 

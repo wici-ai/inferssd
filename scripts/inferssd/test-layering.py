@@ -18,7 +18,8 @@ class RuntimeBoundaries(unittest.TestCase):
     def test_policy_cannot_reach_execution(self):
         path = Path("engine/ggml/src/ggml-ssd/place/runtime-policy.h")
         for code in ('#include "../io/reader.h"', '#include "cpu-sink-internal.h"',
-                     '#include <thread>', 'struct kimi_cpu_sink * private_state;',
+                     '#include <thread>', '#include <sys/mman.h>', '#include <sys/socket.h>',
+                     '#include <pthread.h>', '#include "worker.h"', 'struct kimi_cpu_sink * private_state;',
                      'cudaLaunchKernel(kernel);'):
             with self.subTest(code=code):
                 self.assertTrue(source_issues(path, "policy", code))
@@ -43,7 +44,8 @@ class RuntimeBoundaries(unittest.TestCase):
     def test_installed_framework_boundary(self):
         path = Path("framework/src/inferssd/launch/typed.py")
         self.assertEqual([], framework_issues(path, 'from inferssd.launch.resources import read_resources'))
-        for code in ('from engine.src import model', 'import bench.ci.private_controller'):
+        for code in ('from engine.src import model', 'import bench.ci.private_controller',
+                     'import ggml', 'from engine import src', 'from engine import ggml'):
             with self.subTest(code=code):
                 self.assertTrue(framework_issues(path, code))
 
