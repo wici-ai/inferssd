@@ -1,3 +1,4 @@
+#include "ssd/explicit-fixture-inputs.h"
 // Exercise the real CPU sink, io_uring, borrowed H2D and explicit MXFP4 GPU
 // format at synthetic geometry. Cache, upload and failure assertions use the
 // production sink and tier without a full model dependency.
@@ -5,29 +6,30 @@
 #include "test-kimi-cpu-sink.cpp"
 #undef main
 
-int main() { try {
+int main() {
+    fixture_inputs inputs; try {
     ggml_cpu_init();
-    setenv("GGML_KIMI_CPU_SINK_READY_FIRST","1",1);
-    setenv("GGML_KIMI_CPU_SINK_SPLIT_CV","1",1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY","lru",1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION","uniform",1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS","0",1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY","lru",1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT","0",1);
+    inputs.set("ready_first", "1");
+    inputs.set("split_cv", "1");
+    inputs.set("cache_policy", "lru");
+    inputs.set("cache_allocation", "uniform");
+    inputs.set("cache_keep", "0");
+    inputs.set("tier.policy", "lru");
+    inputs.set("tier.min_count", "0");
     fixture f;f.latent=256;f.hidden=256;f.experts=4;f.type=f.down_type=GGML_TYPE_MXFP4;make_synthetic(f);
     const auto ram_bytes=2*triplet_bytes(f);
     const auto gpu_bytes=std::to_string(2*triplet_bytes(f)); // one GPU slot/layer
     struct options { bool exclusive,async,hidden; };
     size_t compared=0,checks=0;
     for(const auto cfg : {options{false,false,false},options{true,false,false},options{true,true,false},options{true,true,true},options{false,true,true}}) {
-        setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES","0",1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE","0",1);
-        auto cpu=make_sink(f,16,2);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES",gpu_bytes.c_str(),1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE",cfg.exclusive?"1":"0",1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD",cfg.async?"1":"0",1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN",cfg.hidden?"1":"0",1);
-        auto mixed=make_sink(f,16,2);
+        inputs.set("vram_budget", "0");
+        inputs.set("vram_exclusive", "0");
+        auto cpu=make_sink(inputs, f,16,2);
+        inputs.set("vram_budget", gpu_bytes.c_str());
+        inputs.set("vram_exclusive", cfg.exclusive?"1":"0");
+        inputs.set("vram_async", cfg.async?"1":"0");
+        inputs.set("tier.mxfp4_gpu_hidden", cfg.hidden?"1":"0");
+        auto mixed=make_sink(inputs, f,16,2);
         configure_cache(cpu.get(),ram_bytes,{1,2},1);configure_cache(mixed.get(),ram_bytes,{1,2},1);
         for(int token=1;token<=10;++token) {
             const bool decode=token!=7;

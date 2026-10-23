@@ -1,3 +1,4 @@
+#include "ssd/explicit-fixture-inputs.h"
 // CUDA lifecycle test of the elastic GPU tier's unified-memory behaviour, on any CUDA device:
 //  - GGML_KIMI_CPU_SINK_VRAM_BYTES=auto starts from one block; a discrete GPU grows at once, a unified one at the
 //    token boundary after its first decode step;
@@ -57,20 +58,21 @@ kimi_vram_request key(int layer, int expert) {
 }
 }
 
-int main() { try {
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY", "lru", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_WATERMARK", "0", 1);
-    unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_BLOCKS");
-    unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_MALLOC_AT");
-    unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_FREE_AT");
+int main() {
+    fixture_inputs inputs; try {
+    inputs.set("vram_async", "1");
+    inputs.set("vram_deferred", "1");
+    inputs.set("tier.policy", "lru");
+    inputs.set("tier.min_count", "0");
+    inputs.set("tier.global", "1");
+    inputs.set("tier.keep_across_requests", "1");
+    inputs.set("tier.elastic", "1");
+    inputs.set("tier.demand_reclaim", "1");
+    inputs.set("tier.margin_mib", "0");
+    inputs.set("tier.watermark", "0");
+    inputs.unset("tier.safety_blocks");
+    inputs.unset("tier.fail_malloc_at");
+    inputs.unset("tier.fail_free_at");
     std::vector<unsigned char> payload(stride, 7);
     const void * data[] = {payload.data(), payload.data() + role, payload.data() + 2 * role};
     std::vector<float> out(256);
@@ -79,9 +81,9 @@ int main() { try {
     const bool unified = ggml_backend_cuda_device_is_unified(0);
 
     // auto: one block first; growth at once on a discrete GPU, after the first decode step on unified memory.
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "40", 1);
+    inputs.set("tier.max_slots", "40");
     {
-        tier t(tier::automatic_budget);
+        tier t(tier::automatic_budget, inputs.tier_policy());
         const auto k = key(1, 0);
         int slot = -1;
         t.begin(51, 1, true);
@@ -101,9 +103,9 @@ int main() { try {
     }
 
     // OOM reclaim: refused inside a live layer, then waits for a deferred copy and aborts its reservation.
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "2", 1);
+    inputs.set("tier.max_slots", "2");
     {
-        tier t(2 * stride); // one block of two slots
+        tier t(2 * stride, inputs.tier_policy()); // one block of two slots
         t.deferred_hook = upload_gate;
         const auto g = key(2, 1);
         int slot = -1, queued = 0;
@@ -144,9 +146,9 @@ int main() { try {
     }
 
     // reclaim_host: blocks go until free memory covers the allocation, one stays, a live layer refuses.
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "40", 1);
+    inputs.set("tier.max_slots", "40");
     {
-        tier t(40 * stride); // a base of three blocks: 16, 16 and 8 slots
+        tier t(40 * stride, inputs.tier_policy()); // a base of three blocks: 16, 16 and 8 slots
         const auto k = key(3, 2);
         int slot = -1;
         t.begin(53, 1, true); lifecycle_prepare(t,&k, 1,&slot); t.finish(out.data(), 256);
@@ -171,29 +173,29 @@ int main() { try {
     }
     // auto sizes an elastic tier only, and has no base to shrink to at a prefill: it gives back on demand.
     {
-        setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC", "0", 1);
+        inputs.set("tier.elastic", "0");
         bool refused = false;
-        try { tier t(tier::automatic_budget); } catch (const std::exception &) { refused = true; }
+        try { tier t(tier::automatic_budget, inputs.tier_policy()); } catch (const std::exception &) { refused = true; }
         require(refused, "auto was accepted without an elastic tier");
-        setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC", "1", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM", "0", 1);
-        { tier t(tier::automatic_budget); require(t.elastic_demand_reclaim, "auto did not reclaim on demand"); }
-        { tier t(2 * stride); require(!t.elastic_demand_reclaim, "a byte budget changed its prefill policy"); }
-        setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM", "1", 1);
+        inputs.set("tier.elastic", "1");
+        inputs.set("tier.demand_reclaim", "0");
+        { tier t(tier::automatic_budget, inputs.tier_policy()); require(t.elastic_demand_reclaim, "auto did not reclaim on demand"); }
+        { tier t(2 * stride, inputs.tier_policy()); require(!t.elastic_demand_reclaim, "a byte budget changed its prefill policy"); }
+        inputs.set("tier.demand_reclaim", "1");
     }
 
     // The floor on a modeled unified DRAM. Low watermark 1 MiB, growth leaves 2 MiB, no fixed safety reserve.
     auto & query = ggml_memory_query::instance();
     query.get = model_get; query.unified = model_unified; query.set_reserve = model_reserve;
-    setenv("GGML_KIMI_CPU_SINK_VRAM_SAFETY_MIB", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB", "2", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_WATERMARK_LOW_MIB", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_WATERMARK_HIGH_MIB", "2", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "40", 1);
+    inputs.set("tier.safety_mib", "0");
+    inputs.set("tier.margin_mib", "2");
+    inputs.set("tier.low_mib", "1");
+    inputs.set("tier.high_mib", "2");
+    inputs.set("tier.max_slots", "40");
     const size_t low = size_t(1) << 20, safety = size_t(2) << 20, floor = size_t(3) << 30, demand = size_t(1) << 30;
     // Published before the first prepare (the sink does so at its first decode layer), floor and demand bound the base.
     {
-        tier t(tier::automatic_budget);
+        tier t(tier::automatic_budget, inputs.tier_policy());
         modeled = &t; pool = floor + demand + low + 5 * stride + stride / 2; published = 0;
         policy_set_host_floor(&t, floor); policy_set_host_demand(&t, demand);
         const auto k = key(4, 0);
@@ -210,7 +212,7 @@ int main() { try {
     }
     // Growth at the second decode boundary waits for a copy still in flight; a demand rise gives blocks back.
     {
-        tier t(tier::automatic_budget);
+        tier t(tier::automatic_budget, inputs.tier_policy());
         modeled = &t; pool = floor + demand + safety + 20 * stride + stride / 2; published = 0;
         t.deferred_hook = upload_gate;
         policy_set_host_floor(&t, floor); policy_set_host_demand(&t, demand);

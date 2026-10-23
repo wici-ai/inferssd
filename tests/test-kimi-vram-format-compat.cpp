@@ -1,3 +1,4 @@
+#include "ssd/explicit-fixture-inputs.h"
 // Retired implicit ABI slots must reject callers while draining actual
 // explicit-format CUDA work before releasing its cache-owned weights.
 #include "ggml-backend.h"
@@ -10,14 +11,15 @@
 namespace {
 void require(bool ok,const char * message){if(!ok)throw std::runtime_error(message);}
 }
-int main(){try{
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT","0",1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY","lru",1);
+int main(){
+    fixture_inputs inputs;try{
+    inputs.set("tier.min_count", "0");
+    inputs.set("tier.policy", "lru");
     const auto role=lifecycle_role_bytes();std::vector<unsigned char> payload(role,0);
     const void * data[]={payload.data(),payload.data(),payload.data()};
     kimi_vram_request request={};request.layer=1;request.expert=0;request.weight=1;
     for(int i=0;i<3;++i)request.role[i]={1,2,1000000,uint64_t(i)*role,role,3,4,5,6};
-    tier t(32ULL<<20);int slot=-1;std::vector<float> input(256,0),output(256);char error[256]={};
+    tier t(32ULL<<20, inputs.tier_policy());int slot=-1;std::vector<float> input(256,0),output(256);char error[256]={};
     auto warm=[&]{t.begin(17,1,true);lifecycle_prepare(t,&request,1,&slot);t.admit(request,data,true);t.finish(output.data(),256);};
     warm();require(t.table && t.arena,"explicit cache was not allocated");
     require(api_prepare(&t,&request,1,256,256,&slot,error,sizeof(error))!=0 &&

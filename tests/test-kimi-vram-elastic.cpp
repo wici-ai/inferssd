@@ -1,3 +1,4 @@
+#include "ssd/explicit-fixture-inputs.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
 #include "vram-tier.cpp"
@@ -22,40 +23,41 @@ kimi_vram_request request(size_t role) {
     for (int i = 0; i < 3; ++i) r.role[i] = {1,2,1000000,uint64_t(i)*role,role,3,4,5,6};
     return r;
 }
-void common_environment() {
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY", "lru", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_BLOCKS", "4096", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "53", 1);
-    unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_MALLOC_AT");
-    unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_FREE_AT");
+void common_environment(fixture_inputs & inputs) {
+    inputs.set("vram_async", "0");
+    inputs.set("vram_deferred", "0");
+    inputs.set("tier.policy", "lru");
+    inputs.set("tier.min_count", "0");
+    inputs.set("tier.keep_across_requests", "1");
+    inputs.set("tier.elastic", "1");
+    inputs.set("tier.demand_reclaim", "0");
+    inputs.set("tier.safety_blocks", "4096");
+    inputs.set("tier.margin_mib", "0");
+    inputs.set("tier.max_slots", "53");
+    inputs.unset("tier.fail_malloc_at");
+    inputs.unset("tier.fail_free_at");
 }
 }
 
-int main() { try {
+int main() {
+    fixture_inputs inputs; try {
     // A discrete GPU grows at allocation and at the decode phase boundary; unified memory grows at the token
     // boundary after the first decode step (test-kimi-vram-reclaim has its own cases). Everything else is the same.
     const bool unified = ggml_backend_cuda_device_is_unified(0);
-    unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_BLOCKS");
-    unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB");
-    { tier defaults(1); require(defaults.elastic_safety_blocks==0 && defaults.elastic_safety_mib==32,
+    inputs.unset("tier.safety_blocks");
+    inputs.unset("tier.margin_mib");
+    { tier defaults(1, inputs.tier_policy()); require(defaults.elastic_safety_blocks==0 && defaults.elastic_safety_mib==32,
             "elastic runtime safety defaults changed"); }
-    common_environment();
+    common_environment(inputs);
     const size_t role = lifecycle_role_bytes(), stride = 3*role;
     const auto key = request(role);
     std::vector<float> output(256);
 
     // Base and elastic slots share one block map. Tail IDs cross three CUDA
     // allocations, while the cache table remains a single logical global pool.
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "1", 1);
+    inputs.set("tier.global", "1");
     {
-        tier t(20*stride);
+        tier t(20*stride, inputs.tier_policy());
         int slot = -1;
         t.begin(17,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         const size_t first_decode_slots=t.table->slots.size();
@@ -133,9 +135,9 @@ int main() { try {
     // already allocated, and the table follows them; the first request is served from them, a discrete GPU's
     // decode growth adds elastic blocks after them, and a prefill gives back to that base.
     {
-        setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_MALLOC_AT", "2", 1);
-        tier t(20*stride);
-        unsetenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_MALLOC_AT");
+        inputs.set("tier.fail_malloc_at", "2");
+        tier t(20*stride, inputs.tier_policy());
+        inputs.unset("tier.fail_malloc_at");
         int slot = -1;
         t.begin(19,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         require(t.elastic_active && t.base_slots==16 && t.blocks[0].slot_count==16 &&
@@ -151,7 +153,7 @@ int main() { try {
     // A failed free retains the block/table mapping and poisons the tier. The
     // test clears only its injected fault so destruction can release the GPU.
     {
-        tier t(20*stride);int slot=-1;
+        tier t(20*stride, inputs.tier_policy());int slot=-1;
         t.begin(18,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         t.prepare_prefill_reclaim();
         const size_t old_slots=t.table->slots.size(),old_blocks=t.blocks.size();
@@ -165,10 +167,10 @@ int main() { try {
     // Demand mode retains the decode-grown tail until a real backend-buffer
     // allocation fails. One callback frees exactly one complete tail block,
     // and the backend retries the same allocation.
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "37", 1);
+    inputs.set("tier.demand_reclaim", "1");
+    inputs.set("tier.max_slots", "37");
     {
-        tier t(20*stride);int slot=-1;
+        tier t(20*stride, inputs.tier_policy());int slot=-1;
         t.begin(20,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         if(unified)t.begin(20,2,true); // unified memory grows at the boundary after the first decode step
         require(t.table->slots.size()==37,"demand fixture did not create a decode-grown tail");
@@ -184,14 +186,14 @@ int main() { try {
                 t.phase_reclaim_requests==1,"demand reclaim did not free exactly the physical tail block");
         t.phase_complete(false);
     }
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "53", 1);
+    inputs.set("tier.demand_reclaim", "0");
+    inputs.set("tier.max_slots", "53");
 
     // Non-global uniform policy keeps the same single allocation
     // even when the process-wide elastic request is present.
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "0", 1);
+    inputs.set("tier.global", "0");
     {
-        tier t(2*stride);int slot=-1;
+        tier t(2*stride, inputs.tier_policy());int slot=-1;
         t.begin(19,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
         require(!t.elastic_active && t.arena && t.blocks.empty() &&
                 t.slot_base(1)==t.arena+stride,"non-global path no longer uses its single arena");
@@ -203,11 +205,11 @@ int main() { try {
     // and one expensive layer does not make the upload look cheap. In a table two tokens old one selection is a
     // count of 2 over its memory (half-life 2), worth 2.1 hits by the prior: a count-1 miss takes a free slot where
     // an upload costs 0.3 misses (the Spark) and 2.1 (233) alike, and not where it costs 4.
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY", "count_decay2", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "2.5", 1);
+    inputs.set("tier.global", "1");
+    inputs.set("tier.policy", "count_decay2");
+    inputs.set("tier.min_count", "2.5");
     for (const double upload_misses : {0.3, 2.1, 4.0}) {
-        tier t(20*stride);int slot=-1;
+        tier t(20*stride, inputs.tier_policy());int slot=-1;
         auto r=key;
         t.begin(21,1,true);
         for (int layer = 1; layer <= 40; ++layer) {
@@ -226,14 +228,14 @@ int main() { try {
                 "a free slot did not follow the priced rule in the second decode token");
         t.finish(output.data(),256);
     }
-    setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY", "lru", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
+    inputs.set("tier.policy", "lru");
+    inputs.set("tier.min_count", "0");
 
     // At load (kimi_vram_elastic_api reserve) a unified-memory tier takes its storage and grows into what is free;
     // a prefill keeps it and the first decode adopts it. A discrete GPU leaves the arena to its first decode. The
     // MXFP4 format engine needs the parity component preloaded (libkimi-mxfp4-parity.so).
-    setenv("GGML_KIMI_MXFP4_PREFILL_BATCH", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN", "1", 1); // as served: no bitwise CPU parity self-check
+    inputs.set("tier.mxfp4_batch", "0");
+    inputs.set("tier.mxfp4_gpu_hidden", "1"); // as served: no bitwise CPU parity self-check
     if (!dlsym(RTLD_DEFAULT, "kimi_mxfp4_gpu_get_api_v1")) {
         std::printf("load reserve: skipped, libkimi-mxfp4-parity.so is not preloaded\n");
     } else {
@@ -243,7 +245,7 @@ int main() { try {
         const int32_t layers[] = {1,2};
         const kimi_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,2,layers};
         {
-            tier t(10*3*mx);
+            tier t(10*3*mx, inputs.tier_policy());
             t.reserve(r,f);
             if (!unified) {
                 require(!t.has_storage() && !t.table,"a discrete GPU took its tier's storage at load");
@@ -295,9 +297,9 @@ int main() { try {
         if (unified) {
             const int32_t three[] = {1,2,3};
             const kimi_vram_expert_format f3 = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,3,three};
-            setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "16", 1);
-            tier q(10*3*mx);
-            setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS", "53", 1);
+            inputs.set("tier.max_slots", "16");
+            tier q(10*3*mx, inputs.tier_policy());
+            inputs.set("tier.max_slots", "53");
             q.reserve(r,f3);
             require(q.has_storage() && q.table->slots.size()==16,"the quota test's tier has another size");
             static int fd=-1;fd=open("/proc/self/exe",O_RDONLY);require(fd>=0,"no file for the fake resolver");
@@ -323,8 +325,8 @@ int main() { try {
             require(q.table->free_slots(1)==15,"cancelled seeds kept their slots");
         }
     }
-    unsetenv("GGML_KIMI_MXFP4_PREFILL_BATCH");
-    unsetenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN");
+    inputs.unset("tier.mxfp4_batch");
+    inputs.unset("tier.mxfp4_gpu_hidden");
 
     std::printf("REAL_CUDA_ELASTIC_PASS assertions=%d unified=%d\n",assertions,int(unified));
     return 0;

@@ -2,6 +2,7 @@
 
 #include "kimi-cpu-sink.h"
 #include <cmath>
+#include "../ggml-ssd/telemetry/telemetry.h"
 
 // Matches mul(weight) followed by RMS normalization, then route scaling.
 inline void kimi_cpu_sink_normalize_expert(float * values, int rows, const float * norm, float eps) {
@@ -76,3 +77,6 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         struct kimi_cpu_sink_prefill_batch * batch,
         kimi_cpu_sink_consumer_fn consumer, void * userdata,
         struct kimi_cpu_sink_stats * stats, char * error, size_t error_size);
+
+// Borrowed immutable selection; the prefill owner never outlives its sink.
+const ssd::telemetry::debug_channels & kimi_cpu_sink_debug(const kimi_cpu_sink * sink) noexcept;

@@ -89,6 +89,9 @@ int main(int argc, char ** argv) { try {
     proxy_chain.submit = chain_submit; proxy_chain.destroy = chain_destroy;
     auto get_compute = reinterpret_cast<vram_format_compute_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_format_compute_get_api"));
     require(get_compute != nullptr, "preload production tier DSO");
+    using test_create_fn = void * (*)(int, int, int, int, int, int, bool, bool, char *, size_t) noexcept;
+    auto test_create = reinterpret_cast<test_create_fn>(dlsym(RTLD_DEFAULT, "ggml_ssd_mxfp4_create_for_testing"));
+    require(test_create != nullptr, "real MXFP4 explicit fixture factory");
     const auto * api = get_compute();
     require(api && api->version == 1 && api->size == sizeof(*api), "compute ABI");
     constexpr int latent = 256, hidden = 256;
@@ -103,13 +106,12 @@ int main(int argc, char ** argv) { try {
     const kimi_vram_activation activation = {KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP, 0, 0, 3.0f};
     std::vector<float> output(latent, 123.0f);
     for (int gpu_hidden : {0, 1}) {
-        setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN", gpu_hidden ? "1" : "0", 1);
         for (fault point : {fault::submit, fault::wait}) {
             char message[512] = {};
             // Engine creation runs the retained parity self-check before any injection.
             inject = fault::none; injected = false; submissions = 0; destroyed.clear();
             std::fill(output.begin(), output.end(), 123.0f);
-            context failed{api, api->create(0, latent, hidden, 1, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, message, sizeof(message))};
+            context failed{api, test_create(0, latent, hidden, 1, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, bool(gpu_hidden), false, message, sizeof(message))};
             require(failed.value != nullptr, message);
             inject = point; injected = false; submissions = 0; destroyed.clear();
             const int status = api->compute(failed.value, &expert, 1, q8.data(), q8.size(), &activation,
@@ -129,7 +131,7 @@ int main(int argc, char ** argv) { try {
         // Only a separately created context may run after the failure.
         inject = fault::none; injected = false; destroyed.clear();
         char message[512] = {};
-        context healthy{api, api->create(0, latent, hidden, 1, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, message, sizeof(message))};
+        context healthy{api, test_create(0, latent, hidden, 1, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, bool(gpu_hidden), false, message, sizeof(message))};
         require(healthy.value != nullptr, message);
         require(api->compute(healthy.value, &expert, 1, q8.data(), q8.size(), &activation,
                 output.data(), message, sizeof(message)) == 0, message);

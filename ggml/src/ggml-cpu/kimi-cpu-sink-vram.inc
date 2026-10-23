@@ -26,16 +26,13 @@ struct sink_vram {
     bool prefill_job_active = false;
     // The batched lanes' transient candidates and the per-layer SSD transient cap: the makespan decides by default
     // (1 route, no cap: a streamed transient holds only a ring slot and a device slot, whatever the count);
-    // the environment keeps them as A/B switches (GGML_KIMI_CPU_PREFILL_RAM_GPU_MIN_ROUTES, _SSD_GPU_MIN_ROUTES,
-    // _SSD_GPU_MAX_EXPERTS_PER_LAYER, _SCHED_LEGACY; their MXFP4_ spellings are still read), and the legacy selector
-    // keeps 16/16/64.
+    // The supported profile fixes these thresholds; the learned cost table chooses each lane.
     int prefill_ram_gpu_min_routes = 1;
     int prefill_ssd_gpu_min_routes = 1;
     int prefill_ssd_gpu_max_experts_per_layer = -1; // -1: no cap
     bool prefill_legacy_schedule = false;
     // The start values of the cost table's lines the sink fits (kimi-prefill-cost.h, kimi_place_table) and the fitted
-    // lines. GGML_KIMI_CPU_PREFILL_COST (or its MXFP4_ spelling) sets any of them by name (cpu_fixed_us=..,link_gbps=..);
-    // each calibrated line prints the table by the same names.
+    // lines. Typed place.costs overlays named priors; each calibrated line reports the same names.
     struct prefill_costs {
         // Start values only: 166, 10 CPU threads, a2f1fbb5e, 2026-09-26, MXFP4; see
         // 20260925-deepseek-prefill-sched-assets/{cpu-calibration.txt,gpu-micro.jsonl}. The framework's probe gives
@@ -93,99 +90,38 @@ struct sink_vram {
     uint64_t host_experts = 0;
     const kimi_vram_policy_api * policy_api = nullptr; // optional: miss cost, host demand and floor, host reclaim
 
-    // "name=value" items separated by commas or spaces, names as in prefill_costs; the others keep their values.
-    static void parse_costs(const char * name, const char * spec, prefill_costs & cost) {
-        static const struct { const char * name; double prefill_costs::* field; } terms[] = {
-            { "cpu_fixed_us", &prefill_costs::cpu_fixed_us }, { "cpu_route_us", &prefill_costs::cpu_route_us },
-            { "gpu_fixed_us", &prefill_costs::gpu_fixed_us }, { "gpu_route_us", &prefill_costs::gpu_route_us },
-            { "gpu_host_fixed_us", &prefill_costs::gpu_host_fixed_us },
-            { "gpu_host_route_us", &prefill_costs::gpu_host_route_us },
-            { "link_gbps", &prefill_costs::link_gbps }, { "pageable_gbps", &prefill_costs::pageable_gbps },
-            { "drive_gbps", &prefill_costs::drive_gbps },
-            { "drive_fixed_us", &prefill_costs::drive_fixed_us }, { "gpu_token_us", &prefill_costs::gpu_token_us },
-        };
-        auto separator = [](char c) { return c == ',' || c == ' ' || c == '\t' || c == '\n'; };
-        for (const char * cursor = spec; *cursor;) {
-            if (separator(*cursor)) { ++cursor; continue; }
-            const char * equals = cursor;
-            while (*equals && *equals != '=' && !separator(*equals)) { ++equals; }
-            const std::string item(cursor, equals);
-            auto term = std::find_if(std::begin(terms), std::end(terms),
-                [&](const auto & t) { return item == t.name; });
-            if (*equals != '=' || term == std::end(terms)) {
-                throw std::runtime_error(std::string(name) + ": unknown item " + item);
-            }
-            char * end = nullptr;
-            errno = 0;
-            const double value = std::strtod(equals + 1, &end);
-            if (errno || end == equals + 1 || (*end && !separator(*end)) || !std::isfinite(value) || value < 0.0 ||
-                    value > 1e6 || (term->field == &prefill_costs::link_gbps && value == 0.0)) {
-                throw std::runtime_error(std::string(name) + ": invalid value of " + item);
-            }
-            cost.*(term->field) = value;
-            cursor = end;
+    void initialize(bool ready_first, const sink_configuration & configuration) {
+        const bool use_locations = !configuration.production && configuration.policy.vram_locations;
+        uint64_t bytes = configuration.policy.vram_budget;
+        if (!configuration.production) {
+            async_upload = configuration.policy.vram_async;
+            exclusive = configuration.policy.vram_exclusive;
+            deferred_upload = configuration.policy.vram_deferred;
+            prefill_enabled = configuration.policy.vram_prefill;
+            mxfp4_batch_enabled = configuration.policy.tier.mxfp4_batch;
         }
-    }
-
-    void initialize(bool ready_first) {
-        bool use_locations = false;
-        if (const char * flag = std::getenv("GGML_KIMI_CPU_SINK_VRAM_CACHE_LOCATIONS")) {
-            if (std::strcmp(flag,"0") && std::strcmp(flag,"1")) { throw std::runtime_error("VRAM_CACHE_LOCATIONS must be 0 or 1"); }
-            use_locations = !std::strcmp(flag,"1");
+        if (configuration.production) {
+            const auto * budget = configuration.settings.vram_budget();
+            if (!budget) { throw std::runtime_error("missing typed vram.budget"); }
+            bytes = budget->automatic ? UINT64_MAX : budget->bytes;
+            async_upload = exclusive = deferred_upload = prefill_enabled = bytes != 0;
         }
-        if (const char * flag = std::getenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD")) {
-            if (std::strcmp(flag, "0") && std::strcmp(flag, "1")) { throw std::runtime_error("VRAM_ASYNC_UPLOAD must be 0 or 1"); }
-            async_upload = !std::strcmp(flag, "1");
-        }
-        if (const char * flag = std::getenv("GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE")) {
-            if (std::strcmp(flag, "0") && std::strcmp(flag, "1")) { throw std::runtime_error("VRAM_EXCLUSIVE must be 0 or 1"); }
-            exclusive = !std::strcmp(flag, "1");
-        }
-        if (const char * flag = std::getenv("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD")) {
-            if (std::strcmp(flag, "0") && std::strcmp(flag, "1")) { throw std::runtime_error("VRAM_DEFERRED_UPLOAD must be 0 or 1"); }
-            deferred_upload = !std::strcmp(flag, "1");
-        }
-        if (const char * flag = std::getenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL")) {
-            if (std::strcmp(flag, "0") && std::strcmp(flag, "1")) { throw std::runtime_error("VRAM_PREFILL must be 0 or 1"); }
-            prefill_enabled = !std::strcmp(flag, "1");
-        }
-        if (const char * flag = std::getenv("GGML_KIMI_MXFP4_PREFILL_BATCH")) {
-            if (std::strcmp(flag, "0") && std::strcmp(flag, "1")) {
-                throw std::runtime_error("GGML_KIMI_MXFP4_PREFILL_BATCH must be 0 or 1");
-            }
-            mxfp4_batch_enabled = !std::strcmp(flag, "1");
-        }
-        // a selector switch by its format-neutral name, or by its MXFP4_ spelling of before; not both
-        auto spelled = [](const char * name, const char * old_name) -> const char * {
-            const char * value = std::getenv(name), * old_value = std::getenv(old_name);
-            if (value && old_value) {
-                throw std::runtime_error(std::string(name) + " and " + old_name + " are both given: set " + name);
-            }
-            return value ? name : old_name;
-        };
-        auto setting = [&](const char * name, const char * old_name, int fallback, long minimum, long maximum) {
-            const char * key = spelled(name, old_name);
-            const char * value = std::getenv(key);
-            if (!value) { return fallback; }
-            char * end = nullptr;
-            errno = 0;
-            const long parsed = std::strtol(value, &end, 10);
-            if (errno || end == value || *end || parsed < minimum || parsed > maximum) {
-                throw std::runtime_error(std::string(key) + " is out of range");
-            }
-            return int(parsed);
-        };
-        prefill_legacy_schedule = setting("GGML_KIMI_CPU_PREFILL_SCHED_LEGACY",
-            "GGML_KIMI_CPU_PREFILL_MXFP4_SCHED_LEGACY", 0, 0, 1) != 0;
-        prefill_ram_gpu_min_routes = setting("GGML_KIMI_CPU_PREFILL_RAM_GPU_MIN_ROUTES",
-            "GGML_KIMI_CPU_PREFILL_MXFP4_RAM_GPU_MIN_ROUTES", prefill_legacy_schedule ? 16 : 1, 0, 2048);
-        prefill_ssd_gpu_min_routes = setting("GGML_KIMI_CPU_PREFILL_SSD_GPU_MIN_ROUTES",
-            "GGML_KIMI_CPU_PREFILL_MXFP4_SSD_GPU_MIN_ROUTES", prefill_legacy_schedule ? 16 : 1, 0, 2048);
-        prefill_ssd_gpu_max_experts_per_layer = setting("GGML_KIMI_CPU_PREFILL_SSD_GPU_MAX_EXPERTS_PER_LAYER",
-            "GGML_KIMI_CPU_PREFILL_MXFP4_SSD_GPU_MAX_EXPERTS_PER_LAYER", prefill_legacy_schedule ? 64 : -1, -1, 65536);
         {
-            const char * key = spelled("GGML_KIMI_CPU_PREFILL_COST", "GGML_KIMI_CPU_PREFILL_MXFP4_COST");
-            if (const char * spec = std::getenv(key)) { parse_costs(key, spec, cost); }
+            const auto * costs = configuration.production ? configuration.settings.costs() : &configuration.policy.place_costs;
+            if (!costs) { throw std::runtime_error("missing typed place.costs"); }
+            static const struct { const char * key; double prefill_costs::* field; } terms[] = {
+                { "cpu_fixed_us", &prefill_costs::cpu_fixed_us }, { "cpu_route_us", &prefill_costs::cpu_route_us },
+                { "gpu_fixed_us", &prefill_costs::gpu_fixed_us }, { "gpu_route_us", &prefill_costs::gpu_route_us },
+                { "gpu_host_fixed_us", &prefill_costs::gpu_host_fixed_us },
+                { "gpu_host_route_us", &prefill_costs::gpu_host_route_us },
+                { "link_gbps", &prefill_costs::link_gbps }, { "pageable_gbps", &prefill_costs::pageable_gbps },
+                { "drive_gbps", &prefill_costs::drive_gbps }, { "drive_fixed_us", &prefill_costs::drive_fixed_us },
+                { "gpu_token_us", &prefill_costs::gpu_token_us },
+            };
+            for (const auto & term : terms) {
+                const auto found = costs->find(term.key);
+                if (found != costs->end()) { cost.*(term.field) = found->second; }
+            }
         }
         prior = cost;
         std::fprintf(stderr,
@@ -197,25 +133,7 @@ struct sink_vram {
             cost.gpu_host_route_us, cost.link_gbps, cost.pageable_gbps, cost.drive_gbps, cost.drive_fixed_us,
             cost.gpu_token_us, prefill_ram_gpu_min_routes, prefill_ssd_gpu_min_routes,
             prefill_ssd_gpu_max_experts_per_layer);
-        const char * value = std::getenv("GGML_KIMI_CPU_SINK_VRAM_BYTES");
-        if (!value || !value[0] || !std::strcmp(value, "0")) {
-            if (exclusive || use_locations) { throw std::runtime_error("VRAM_EXCLUSIVE/CACHE_LOCATIONS require a nonzero VRAM budget"); }
-            if (deferred_upload) { throw std::runtime_error("VRAM_DEFERRED_UPLOAD requires a nonzero VRAM budget"); }
-            if (prefill_enabled) { throw std::runtime_error("VRAM_PREFILL requires a nonzero VRAM budget"); }
-            return;
-        }
-        // auto: no byte budget. An elastic tier starts from one block and grows into free memory; a number keeps
-        // its legacy meaning, the first allocation.
-        uint64_t bytes = UINT64_MAX;
-        if (std::strcmp(value, "auto")) {
-            char * end = nullptr;
-            errno = 0;
-            bytes = std::strtoull(value, &end, 10);
-            // The tier clamps the arena to free VRAM minus its safety margin; this is only a sanity bound.
-            if (errno || end == value || *end || value[0] == '-' || !bytes || bytes > (64ull << 30)) {
-                throw std::runtime_error("invalid GGML_KIMI_CPU_SINK_VRAM_BYTES (auto or 1..64 GiB)");
-            }
-        }
+        if (!bytes) { return; }
         if (!ready_first) { throw std::runtime_error("GPU tier requires READY_FIRST=1 for ordered reduction"); }
         auto get_api = reinterpret_cast<kimi_vram_tier_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_tier_get_api"));
         if (!get_api) { throw std::runtime_error("GPU tier DSO is missing; no fallback"); }
@@ -270,7 +188,23 @@ struct sink_vram {
         }
         if (exclusive || async_upload) { ram_leases.reserve(16); }
         char error[512] = {};
-        context = api->create(bytes, error, sizeof(error));
+        if (configuration.production) {
+            auto get_settings = reinterpret_cast<ssd::gpu::get_settings_api>(
+                dlsym(RTLD_DEFAULT, "ggml_backend_cuda_ssd_tier_settings_get_api"));
+            const auto * settings_api = get_settings ? get_settings() : nullptr;
+            if (!settings_api || settings_api->version != 1 || settings_api->size != sizeof(*settings_api) || !settings_api->create) {
+                throw std::runtime_error("GPU tier typed-settings ABI missing or incompatible");
+            }
+            const ssd::runtime_services services{ configuration.events, &configuration.debug };
+            context = settings_api->create(&configuration.settings, &services, error, sizeof(error));
+        } else {
+            auto get = reinterpret_cast<ssd::gpu::testing::get_api>(dlsym(RTLD_DEFAULT, "ggml_ssd_tier_testing_get_api"));
+            const auto * test_api = get ? get() : nullptr;
+            if (!test_api || test_api->version != 1 || test_api->size != sizeof(*test_api) || !test_api->create) {
+                throw std::runtime_error("explicit CUDA fixture factory missing");
+            }
+            context = test_api->create(bytes, &configuration.policy.tier, error, sizeof(error));
+        }
         if (!context) { throw std::runtime_error(std::string("GPU tier create: ") + error); }
         if (auto get_policy = reinterpret_cast<kimi_vram_policy_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_policy_get_api"))) {
             policy_api = get_policy();

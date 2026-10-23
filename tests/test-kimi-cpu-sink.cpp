@@ -1,3 +1,4 @@
+#include "ssd/explicit-fixture-inputs.h"
 // Independent CPU-only O_DIRECT/io_uring and numerical coverage for the Kimi sink.
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -273,10 +274,10 @@ static std::vector<float> reference(const fixture & f, int layer, const std::vec
 }
 
 using sink_ptr = std::unique_ptr<kimi_cpu_sink, decltype(&kimi_cpu_sink_destroy)>;
-static sink_ptr make_sink(fixture & f, int threads, int depth) {
+static sink_ptr make_sink(fixture_inputs & inputs, fixture & f, int threads, int depth) {
     test_resources::cpu_threads(threads - 1, 1);
     char error[512] = {};
-    auto * sink = kimi_cpu_sink_create(threads, depth, fixture::resolve, &f, error, sizeof(error));
+    auto * sink = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
     require(sink, std::string("create: ") + error);
     return sink_ptr(sink, kimi_cpu_sink_destroy);
 }
@@ -290,13 +291,13 @@ struct sample_result {
 
 static double timeval_us(const timeval & value) { return value.tv_sec * 1e6 + value.tv_usec; }
 
-static void check_io_targets(const kimi_cpu_sink_stats & stats, bool succeeded) {
+static void check_io_targets(fixture_inputs & inputs, const kimi_cpu_sink_stats & stats, bool succeeded) {
     require(stats.cache_fill_read_requests + stats.ring_read_requests == stats.read_requests &&
             stats.cache_fill_read_bytes + stats.ring_read_bytes == stats.read_bytes,
             "cache/ring transport counters do not sum to total IO");
     require(stats.read_completions == stats.read_requests && stats.pending_reads == 0,
             "run returned before every submitted read CQE was consumed");
-    const char * mode = std::getenv("GGML_KIMI_CPU_SINK_READ_FIXED");
+    const char * mode = inputs.get("read_fixed");
     const bool fixed = mode && !std::strcmp(mode, "1");
     require(stats.fixed_read_requests == (fixed ? stats.ring_read_requests : 0),
             "READ_FIXED was used for cache payload or omitted for a bypass ring read");
@@ -313,7 +314,7 @@ static void check_io_targets(const kimi_cpu_sink_stats & stats, bool succeeded) 
     }
 }
 
-static sample_result run_checked(const char * name, fixture & f, kimi_cpu_sink * sink, tensors & meta,
+static sample_result run_checked(fixture_inputs & inputs, const char * name, fixture & f, kimi_cpu_sink * sink, tensors & meta,
         const std::vector<float> & input, const std::vector<int32_t> & ids,
         const std::vector<float> & weights, const std::vector<float> & expected, int layer, float linear_beta,
         size_t expected_hits = 0, int expected_admitted = -1, std::vector<float> * exact_output = nullptr,
@@ -352,7 +353,7 @@ static sample_result run_checked(const char * name, fixture & f, kimi_cpu_sink *
     result.rel_l2 = std::sqrt(ss / std::max(norm, 1e-30));
     const size_t live = std::count_if(ids.begin(), ids.end(), [](int32_t id) { return id >= 0; });
     const auto & stats = result.stats;
-    check_io_targets(stats, true);
+    check_io_targets(inputs, stats, true);
     require(expected_hits <= live, "invalid test hit expectation");
     require(stats.experts == live && stats.read_requests == 3 * (live - expected_hits) && stats.fallback_count == 0 && stats.read_errors == 0,
             "expert/read/fallback counters mismatch");
@@ -390,51 +391,51 @@ static void print_sample(const char * name, const sample_result & result) {
     std::fflush(stdout);
 }
 
-static void compare_case(const char * name, fixture & f, kimi_cpu_sink * sink, int layer,
+static void compare_case(fixture_inputs & inputs, const char * name, fixture & f, kimi_cpu_sink * sink, int layer,
         const std::vector<float> & input, const std::vector<int32_t> & ids,
         const std::vector<float> & weights, float linear_beta = 25.0f) {
     tensors meta(f, layer);
     const auto expected = reference(f, layer, input, ids, weights, 4.0f, linear_beta);
-    print_sample(name, run_checked(name, f, sink, meta, input, ids, weights, expected, layer, linear_beta));
+    print_sample(name, run_checked(inputs, name, f, sink, meta, input, ids, weights, expected, layer, linear_beta));
 }
 
-static void fault_case(const char * name, fixture & f, fixture::fault_kind fault, const std::vector<float> & input) {
-    f.fault = fault; auto sink = make_sink(f, 2, 1); tensors meta(f, 1);
+static void fault_case(fixture_inputs & inputs, const char * name, fixture & f, fixture::fault_kind fault, const std::vector<float> & input) {
+    f.fault = fault; auto sink = make_sink(inputs, f, 2, 1); tensors meta(f, 1);
     const int32_t id = 3; const float weight = 1; std::vector<float> output(f.latent); char error[512] = {}; kimi_cpu_sink_stats stats = {};
     bool ok = kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight, 1,
                                4, 25, output.data(), &stats, error, sizeof(error));
     require(!ok && error[0] && stats.fallback_count == 0, std::string(name) + " did not fail closed");
-    check_io_targets(stats, false);
+    check_io_targets(inputs, stats, false);
     if (fault == fixture::past_eof) {
         require(stats.read_errors > 0, "short read did not increment errors");
         f.fault = fixture::none;
-        compare_case("after_short_read_recovery", f, sink.get(), 1, input, { id }, { weight });
+        compare_case(inputs, "after_short_read_recovery", f, sink.get(), 1, input, { id }, { weight });
     }
     std::printf("case=%s status=PASS error=%s\n", name, error); f.fault = fixture::none;
 }
 
-static void synthetic_tests(int threads, int ring_experts) {
+static void synthetic_tests(fixture_inputs & inputs, int threads, int ring_experts) {
     fixture f; make_synthetic(f);
     std::mt19937 rng(81); std::normal_distribution<float> sample(0.0f, 0.3f);
     std::vector<float> input(f.latent); for (auto & v : input) { v = sample(rng); }
-    auto sink = make_sink(f, threads, ring_experts);
-    compare_case("one_expert", f, sink.get(), 1, input, { 3 }, { 1 });
+    auto sink = make_sink(inputs, f, threads, ring_experts);
+    compare_case(inputs, "one_expert", f, sink.get(), 1, input, { 3 }, { 1 });
     std::vector<int32_t> ids = { 17, 0, 8, 2, 19, 4, 11, 6, 15, 1, 13, 7, 18, 5, 10, 9 };
     std::vector<float> weights(16); for (int i = 0; i < 16; ++i) { weights[i] = float(i + 1) / 136; }
-    compare_case("top16_ordered", f, sink.get(), 1, input, ids, weights);
-    compare_case("top8", f, sink.get(), 1, input, { ids.begin(), ids.begin() + 8 }, { weights.begin(), weights.begin() + 8 });
-    compare_case("mass_holes_duplicate_zero", f, sink.get(), 1, input, { 9, -1, 2, 9, -7, 13, 5, -1 }, { .2f, 0, .3f, .1f, 0, 0, .4f, 0 });
-    compare_case("empty_slots", f, sink.get(), 1, input, { -1, -3 }, { 0, 0 });
-    compare_case("linear_transform_disabled", f, sink.get(), 1, input, { 9, 0, 5, 13 }, { .1f, .2f, .3f, .4f }, 0);
+    compare_case(inputs, "top16_ordered", f, sink.get(), 1, input, ids, weights);
+    compare_case(inputs, "top8", f, sink.get(), 1, input, { ids.begin(), ids.begin() + 8 }, { weights.begin(), weights.begin() + 8 });
+    compare_case(inputs, "mass_holes_duplicate_zero", f, sink.get(), 1, input, { 9, -1, 2, 9, -7, 13, 5, -1 }, { .2f, 0, .3f, .1f, 0, 0, .4f, 0 });
+    compare_case(inputs, "empty_slots", f, sink.get(), 1, input, { -1, -3 }, { 0, 0 });
+    compare_case(inputs, "linear_transform_disabled", f, sink.get(), 1, input, { 9, 0, 5, 13 }, { .1f, .2f, .3f, .4f }, 0);
     for (int repeat = 0; repeat < 8; ++repeat) {
-        compare_case("layer_generation_reuse", f, sink.get(), repeat % 2 + 1, input, ids, weights);
+        compare_case(inputs, "layer_generation_reuse", f, sink.get(), repeat % 2 + 1, input, ids, weights);
         input[repeat] += 0.03f;
     }
-    auto one_compute = make_sink(f, 2, 1);
-    compare_case("single_compute_thread", f, one_compute.get(), 2, input, ids, weights);
+    auto one_compute = make_sink(inputs, f, 2, 1);
+    compare_case(inputs, "single_compute_thread", f, one_compute.get(), 2, input, ids, weights);
     for (auto test : { std::make_pair("missing_entry", fixture::missing), std::make_pair("unaligned_offset", fixture::unaligned_offset),
                        std::make_pair("invalid_range_size", fixture::wrong_size), std::make_pair("short_read_drain", fixture::past_eof) }) {
-        fault_case(test.first, f, test.second, input);
+        fault_case(inputs, test.first, f, test.second, input);
     }
     std::printf("SYNTHETIC_CPU_SINK_OK\n");
 }
@@ -527,7 +528,7 @@ static void write_sample_json(std::ostream & out, const sample_result & result, 
     out.flush(); require(bool(out), "sample JSON output failed");
 }
 
-static void real_test(const std::string & pack, const std::string & prefix, const real_options & options) {
+static void real_test(fixture_inputs & inputs, const std::string & pack, const std::string & prefix, const real_options & options) {
     fixture f; int layer, count;
     std::ifstream route(prefix + ".txt"); require(bool(route >> layer >> f.latent >> f.hidden >> count), "cannot parse route fixture");
     require(count > 0 && count <= 16 && f.latent == 3584 && f.hidden == 3072, "unexpected real fixture dimensions");
@@ -571,11 +572,11 @@ static void real_test(const std::string & pack, const std::string & prefix, cons
     const double reference_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - reference_begin).count();
     // The ordinary CPU reference runs once before the first API sample. It never
     // runs between warmup/steady samples, and is excluded from all sink timings.
-    tensors meta(f, layer); auto sink = make_sink(f, options.threads, options.ring_experts);
+    tensors meta(f, layer); auto sink = make_sink(inputs, f, options.threads, options.ring_experts);
     std::ofstream json_file; if (!options.jsonl.empty()) { json_file.open(options.jsonl, std::ios::out | std::ios::trunc); require(bool(json_file), "cannot open sample JSONL"); }
     for (int iteration = 0; iteration < 1 + options.warmup + options.repeats; ++iteration) {
         const std::string phase = iteration == 0 ? "first_call_after_reference" : iteration <= options.warmup ? "warmup" : "steady";
-        const auto result = run_checked("real_repeat", f, sink.get(), meta, input, ids, weights, expected, layer, 25.0f);
+        const auto result = run_checked(inputs, "real_repeat", f, sink.get(), meta, input, ids, weights, expected, layer, 25.0f);
         print_sample(phase.c_str(), result);
         if (json_file.is_open()) { write_sample_json(json_file, result, options, phase, iteration, layer, reference_us); }
     }
@@ -600,15 +601,17 @@ static void drop_child_memlock() {
     require(syscall(SYS_capset, &header, caps) == 0, "dropping child IPC_LOCK failed");
 }
 
-static void registration_failure_child(fixture & f) {
+static void registration_failure_child(fixture_inputs & inputs, fixture & f) {
     // Change only a child process: the parent keeps its memlock limit and caps.
     // This runs before the first sink starts any worker threads.
     std::fflush(nullptr);
     const pid_t child = fork(); require(child >= 0, "fork failed");
     if (child == 0) {
         try {
+            // The kernel may charge ring setup itself to memlock. Create the
+            // real ring first, then deny only the buffer registration under test.
+            auto sink = make_sink(inputs, f, 2, 1);
             drop_child_memlock();
-            auto sink = make_sink(f, 2, 1);
             tensors meta(f, 1);
             std::vector<float> input(f.latent, 0.1f), output(f.latent);
             int32_t id = 3; float weight = 1; char error[512] = {}; kimi_cpu_sink_stats stats = {};
@@ -617,7 +620,7 @@ static void registration_failure_child(fixture & f) {
             require(!ok && std::strstr(error, "IORING_REGISTER_BUFFERS") &&
                     stats.read_requests == 0 && stats.fallback_count == 0,
                     std::string("registration failure did not fail closed: ") + error);
-            check_io_targets(stats, false);
+            check_io_targets(inputs, stats, false);
             sink.reset();
             std::printf("REGISTER_FAILURE_NO_FALLBACK_OK error=%s\n", error);
             std::fflush(nullptr);
@@ -634,31 +637,31 @@ static void registration_failure_child(fixture & f) {
             "registration failure child did not pass");
 }
 
-static void registered_lifecycle_tests() {
-    const char * mode = std::getenv("GGML_KIMI_CPU_SINK_READ_FIXED");
-    require(mode && !std::strcmp(mode, "1"), "run this lifecycle test with GGML_KIMI_CPU_SINK_READ_FIXED=1");
+static void registered_lifecycle_tests(fixture_inputs & inputs) {
+    const char * mode = inputs.get("read_fixed");
+    require(mode && !std::strcmp(mode, "1"), "run this lifecycle test with --fixture read_fixed=1");
     fixture small, large;
     make_synthetic(small);
-    registration_failure_child(small);
+    registration_failure_child(inputs, small);
     large.latent = large.hidden = 512;
     make_synthetic(large);
     fixture_selector selector; selector.active = &small;
     char error[512] = {};
-    sink_ptr sink(kimi_cpu_sink_create(4, 2, fixture_selector::resolve, &selector, error, sizeof(error)),
+    sink_ptr sink(inputs.create(4, 2, fixture_selector::resolve, &selector, error, sizeof(error)),
                   kimi_cpu_sink_destroy);
     require(bool(sink), std::string("create: ") + error);
     std::vector<float> xs(small.latent), xl(large.latent);
     for (size_t i = 0; i < xs.size(); ++i) { xs[i] = float(int(i % 23) - 11) * 0.02f; }
     for (size_t i = 0; i < xl.size(); ++i) { xl[i] = float(int(i % 29) - 14) * 0.02f; }
 
-    compare_case("fixed_empty_before_allocation", small, sink.get(), 1, xs, { -1 }, { 0 });
-    compare_case("fixed_initial_register", small, sink.get(), 1, xs, { 3 }, { 1 });
-    compare_case("fixed_cross_layer_reuse", small, sink.get(), 2, xs, { 3, 4, -1, 8 }, { .2f, .3f, 0, .5f });
+    compare_case(inputs, "fixed_empty_before_allocation", small, sink.get(), 1, xs, { -1 }, { 0 });
+    compare_case(inputs, "fixed_initial_register", small, sink.get(), 1, xs, { 3 }, { 1 });
+    compare_case(inputs, "fixed_cross_layer_reuse", small, sink.get(), 2, xs, { 3, 4, -1, 8 }, { .2f, .3f, 0, .5f });
     selector.active = &large;
-    compare_case("fixed_unregister_grow_register", large, sink.get(), 1, xl, { 3, 5 }, { .3f, .7f });
+    compare_case(inputs, "fixed_unregister_grow_register", large, sink.get(), 1, xl, { 3, 5 }, { .3f, .7f });
     selector.active = &small;
-    compare_case("fixed_smaller_shape_reuses_registration", small, sink.get(), 1, xs, { 9 }, { 1 });
-    compare_case("fixed_empty_keeps_registration", small, sink.get(), 2, xs, { -1, -2 }, { 0, 0 });
+    compare_case(inputs, "fixed_smaller_shape_reuses_registration", small, sink.get(), 1, xs, { 9 }, { 1 });
+    compare_case(inputs, "fixed_empty_keeps_registration", small, sink.get(), 2, xs, { -1, -2 }, { 0, 0 });
 
     tensors meta(small, 1);
     const int32_t id = 3; const float weight = 1;
@@ -668,9 +671,9 @@ static void registered_lifecycle_tests() {
     const bool ok = kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
         xs.data(), &id, &weight, 1, 4, 25, output.data(), &stats, error, sizeof(error));
     require(!ok && stats.read_errors > 0 && stats.fallback_count == 0, "fixed short read did not fail closed");
-    check_io_targets(stats, false);
+    check_io_targets(inputs, stats, false);
     small.fault = fixture::none;
-    compare_case("fixed_short_read_drain_recovery", small, sink.get(), 2, xs, { 3 }, { 1 });
+    compare_case(inputs, "fixed_short_read_drain_recovery", small, sink.get(), 2, xs, { 3 }, { 1 });
     sink.reset(); // unregister before fixture/buffer destruction
     std::printf("REGISTERED_BUFFER_LIFECYCLE_OK expected_register_count=2 expected_unregister_count=2\n");
 }
@@ -709,12 +712,12 @@ static void begin_cache(kimi_cpu_sink * sink, uint64_t epoch, uint64_t token, bo
     cache_snapshot(sink);
 }
 
-static sample_result cache_case(const char * name, fixture & f, kimi_cpu_sink * sink, int layer,
+static sample_result cache_case(fixture_inputs & inputs, const char * name, fixture & f, kimi_cpu_sink * sink, int layer,
         const std::vector<float> & input, const std::vector<int32_t> & ids,
         const std::vector<float> & weights, size_t hits, int admitted, float linear_beta = 25) {
     tensors meta(f, layer);
     const auto expected = reference(f, layer, input, ids, weights, 4, linear_beta);
-    auto result = run_checked(name, f, sink, meta, input, ids, weights, expected, layer, linear_beta, hits, admitted);
+    auto result = run_checked(inputs, name, f, sink, meta, input, ids, weights, expected, layer, linear_beta, hits, admitted);
     cache_snapshot(sink);
     print_sample(name, result);
     return result;
@@ -752,21 +755,21 @@ struct location_fixture {
     static int finished(void *p,kimi_cpu_sink *,char *,size_t){auto & f=self(p);require(f.done&&!f.pinned&&!f.work.joinable(),"RAM eviction callback before finish/unpin");f.finished_count++;return 0;}
     static kimi_cache_location_api api(){return {1,sizeof(kimi_cache_location_api),acquire,begin,launch,admit,finish,cancel,release,finished};}
 };
-static void cache_location_tests(int threads,int depth){
+static void cache_location_tests(fixture_inputs & inputs, int threads,int depth){
     ggml_cpu_init(); // Initialize FP16 lookup tables before the raw-vector oracle.
-    setenv("GGML_KIMI_CPU_SINK_READY_FIRST","1",1);
-    setenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE","0",1);setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY","lru",1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION","uniform",1);setenv("GGML_KIMI_CPU_SINK_READ_FIXED","0",1);
+    inputs.set("ready_first", "1");
+    inputs.set("early_up_gate", "0");inputs.set("cache_policy", "lru");
+    inputs.set("cache_allocation", "uniform");inputs.set("read_fixed", "0");
     fixture f;make_synthetic(f);tensors meta(f,1);char error[512]={};
     std::vector<float> input(f.latent);for(int i=0;i<f.latent;++i){input[i]=std::sin(i*.037f);}
     const int32_t native[]={0,1,2,3,4,5};const float nw[]={.32f,.24f,.16f,.12f,.10f,.06f};
     const int32_t ids[]={0,1,2,3};const float weights[]={.32f/.84f,.24f/.84f,.16f/.84f,.12f/.84f};
     location_fixture transport;transport.raw.resize(6);auto api=location_fixture::api();
-    for(int i=0;i<6;++i){auto old=make_sink(f,threads,depth);transport.raw[i].resize(f.latent);const float one=1;require(kimi_cpu_sink_run(old.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),&native[i],&one,1,4,25,transport.raw[i].data(),nullptr,error,sizeof(error)),error);}
+    for(int i=0;i<6;++i){auto old=make_sink(inputs, f,threads,depth);transport.raw[i].resize(f.latent);const float one=1;require(kimi_cpu_sink_run(old.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),&native[i],&one,1,4,25,transport.raw[i].data(),nullptr,error,sizeof(error)),error);}
     for(const auto & raw:transport.raw){require(std::any_of(raw.begin(),raw.end(),[](float v){return v!=0;}),"uninitialized raw-vector oracle");}
     for(int mode=0;mode<=3;++mode) for(uint32_t resident : {0u,17u,63u}) for(bool guard : {false,true}){
-        auto sink=make_sink(f,threads,depth);configure_cache(sink.get(),4*triplet_bytes(f),{1},4);begin_cache(sink.get(),1,1);
-        cache_case("location_warm",f,sink.get(),1,input,{1,3,4,5},{.4f,.3f,.2f,.1f},0,4);
+        auto sink=make_sink(inputs, f,threads,depth);configure_cache(sink.get(),4*triplet_bytes(f),{1},4);begin_cache(sink.get(),1,1);
+        cache_case(inputs, "location_warm",f,sink.get(),1,input,{1,3,4,5},{.4f,.3f,.2f,.1f},0,4);
         require(kimi_cpu_sink_set_cache_locations(sink.get(),&api,&transport,error,sizeof(error)),error);begin_cache(sink.get(),1,2);
         transport.resident=resident;transport.finished_count=0;
         kimi_cache_compute_config cfg{1,mode,1,2,0,.5f,0,.65f,2,0,1};kimi_cpu_sink_stats stats{};kimi_cache_compute_stats audit{};std::vector<float> actual(f.latent),expected(f.latent);
@@ -777,27 +780,27 @@ static void cache_location_tests(int threads,int depth){
         require(!stats.pending_reads&&stats.read_requests==stats.read_completions&&!stats.read_errors,"mixed cache drain failed");
         std::vector<int32_t> final_ids;std::vector<float> final_weights;
         for(int n=0;n<6;++n){if(audit.plan.final_mask&(1u<<n)){final_ids.push_back(n);final_weights.push_back(audit.final_weights[n]);}}
-        auto old=make_sink(f,threads,depth);require(kimi_cpu_sink_run(old.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),final_ids.data(),final_weights.data(),int(final_ids.size()),4,25,expected.data(),nullptr,error,sizeof(error)),error);
+        auto old=make_sink(inputs, f,threads,depth);require(kimi_cpu_sink_run(old.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),final_ids.data(),final_weights.data(),int(final_ids.size()),4,25,expected.data(),nullptr,error,sizeof(error)),error);
         require(!std::memcmp(actual.data(),expected.data(),actual.size()*sizeof(float)),"RAM+GPU fixed final set not bit exact");
         std::printf("CACHE_LOCATION_CASE mode=%d resident=%u guarded=%d final=%u GPU=%u bytes=%llu PASS\n",mode,resident,guard,audit.plan.final_mask,transport.launched,(unsigned long long)stats.read_bytes);
     }
-    auto sink=make_sink(f,threads,depth);configure_cache(sink.get(),4*triplet_bytes(f),{1},4);begin_cache(sink.get(),2,1);
+    auto sink=make_sink(inputs, f,threads,depth);configure_cache(sink.get(),4*triplet_bytes(f),{1},4);begin_cache(sink.get(),2,1);
     require(kimi_cpu_sink_set_cache_locations(sink.get(),&api,&transport,error,sizeof(error)),error);transport.resident=17;transport.fail_finish=true;
     kimi_cache_compute_config cfg{1,1,1,2,0,.75f,0,.8f,2,0,1};kimi_cpu_sink_stats stats{};std::vector<float> actual(f.latent);
     require(!kimi_cpu_sink_run_cache_compute(sink.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),ids,weights,4,native,nw,6,1,false,&cfg,4,25,actual.data(),&stats,nullptr,error,sizeof(error)),"GPU failure ignored");
     require(!transport.pinned&&transport.cancel_count==1&&!stats.pending_reads&&stats.read_requests==stats.read_completions,"GPU failure did not drain and unpin");
     require(!cache_snapshot(sink.get()).mapped_bytes,"GPU failure retained borrowed RAM");
     transport.fail_finish=false;require(kimi_cpu_sink_set_cache_locations(sink.get(),nullptr,nullptr,error,sizeof(error)),error);
-    begin_cache(sink.get(),2,2);cache_case("location_failure_recover",f,sink.get(),1,input,{1},{1},0,1);
+    begin_cache(sink.get(),2,2);cache_case(inputs, "location_failure_recover",f,sink.get(),1,input,{1},{1},0,1);
     std::printf("CACHE_LOCATION_PASS threads=%d depth=%d\n",threads,depth);
 }
 
-static void cache_compute_tests(int threads, int depth) {
-    setenv("GGML_KIMI_CPU_SINK_READY_FIRST","1",1);
-    setenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE","0",1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY","lru",1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION","uniform",1);
-    setenv("GGML_KIMI_CPU_SINK_READ_FIXED","0",1);
+static void cache_compute_tests(fixture_inputs & inputs, int threads, int depth) {
+    inputs.set("ready_first", "1");
+    inputs.set("early_up_gate", "0");
+    inputs.set("cache_policy", "lru");
+    inputs.set("cache_allocation", "uniform");
+    inputs.set("read_fixed", "0");
     fixture f; make_synthetic(f); tensors meta(f,1);
     const uint64_t unit=triplet_bytes(f);
     std::vector<float> input(f.latent); for(int i=0;i<f.latent;++i){input[i]=std::sin(i*.037f);}
@@ -805,11 +808,11 @@ static void cache_compute_tests(int threads, int depth) {
     const int32_t ids[]={0,1,2,3}; const float weights[]={.32f/.84f,.24f/.84f,.16f/.84f,.12f/.84f};
     char error[512]={};
     for(int mode=0;mode<=3;++mode) for(int bonus : {0,1,2}) for(bool guarded : {false,true}) {
-        auto sink=make_sink(f,threads,depth);
+        auto sink=make_sink(inputs, f,threads,depth);
         // Four slots: all extra candidates remain pinned while two base misses
         // seek admission. Ring depth 1 exercises completion/compute credits.
         configure_cache(sink.get(),4*unit,{1},4);begin_cache(sink.get(),1,1);
-        cache_case("compensate_warm",f,sink.get(),1,input,{1,3,4,5},{.4f,.3f,.2f,.1f},0,4);
+        cache_case(inputs, "compensate_warm",f,sink.get(),1,input,{1,3,4,5},{.4f,.3f,.2f,.1f},0,4);
         begin_cache(sink.get(),1,2);
         kimi_cache_compute_config cfg{1,mode,bonus,2,0,.5f,0,.65f,2,0,1};
         std::vector<float> actual(f.latent),expected(f.latent);
@@ -827,7 +830,7 @@ static void cache_compute_tests(int threads, int depth) {
         }
         std::vector<int32_t> final_ids;std::vector<float> final_weights;
         for(int n=0;n<6;++n) if(audit.plan.final_mask&(1u<<n)){final_ids.push_back(native[n]);final_weights.push_back(audit.final_weights[n]);}
-        auto baseline=make_sink(f,threads,depth);
+        auto baseline=make_sink(inputs, f,threads,depth);
         kimi_cpu_sink_stats reference_stats{};
         require(kimi_cpu_sink_run(baseline.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),final_ids.data(),
             final_weights.data(),int(final_ids.size()),4,25,expected.data(),&reference_stats,error,sizeof(error)),error);
@@ -839,7 +842,7 @@ static void cache_compute_tests(int threads, int depth) {
     }
     // A low miss that would be discarded still owns its read buffers and must
     // propagate a positive short CQE. It cannot silently become a cache bonus.
-    auto broken=make_sink(f,threads,depth);configure_cache(broken.get(),4*unit,{1},4);begin_cache(broken.get(),3,1);
+    auto broken=make_sink(inputs, f,threads,depth);configure_cache(broken.get(),4*unit,{1},4);begin_cache(broken.get(),3,1);
     f.fault=fixture::short_tail;f.fault_expert=2;f.fault_role=2;
     kimi_cache_compute_config cfg{1,2,1,2,0,.75f,0,.65f,2,0,1};
     kimi_cpu_sink_stats st{};kimi_cache_compute_stats audit{};std::vector<float> output(f.latent);
@@ -849,24 +852,24 @@ static void cache_compute_tests(int threads, int depth) {
     require(!cache_snapshot(broken.get()).mapped_bytes,"failed read retained cache targets");
     f.fault=fixture::none;f.fault_expert=-1;f.fault_role=-1;
     begin_cache(broken.get(),3,2);
-    cache_case("compensate_recover",f,broken.get(),1,input,{0},{1},0,1);
+    cache_case(inputs, "compensate_recover",f,broken.get(),1,input,{0},{1},0,1);
     std::printf("CACHE_COMPUTE_EXECUTOR_PASS threads=%d depth=%d\n",threads,depth);
 }
 
-static void schedule_tests(int threads, int depth, bool schedules = false, bool early_up_gate = false,
+static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool schedules = false, bool early_up_gate = false,
                              int poll = 0, bool role_major = false, bool nonblocking_down_sched = false) {
     fixture small, large;
     make_synthetic(small);
     large.latent = 512; large.hidden = 1024; make_synthetic(large);
     fixture_selector selector; selector.active = &small;
-    const char * names[] = { "GGML_KIMI_CPU_SINK_SPLIT_CV",
-        "GGML_KIMI_CPU_SINK_READY_FIRST", "GGML_KIMI_CPU_SINK_ROW_WEIGHTS",
-        "GGML_KIMI_CPU_SINK_COMPUTE_CPUS", "GGML_KIMI_CPU_SINK_IO_CPUS",
-        "GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "GGML_KIMI_CPU_SINK_POLL_US",
-        "GGML_KIMI_CPU_SINK_ROLE_MAJOR", "GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED",
-        "GGML_KIMI_CPU_SINK_DYNAMIC_ROWS", "GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS" };
+    const char * names[] = { "split_cv",
+        "ready_first", "row_weights",
+        "compute_cpus", "io_cpus",
+        "early_up_gate", "poll_us",
+        "role_major", "nonblocking_down_sched",
+        "dynamic_rows", "dynamic_chunk_rows" };
     std::map<std::string, std::string> original;
-    for (const char * name : names) { if (std::getenv(name)) { original[name] = std::getenv(name); } }
+    for (const char * name : names) { if (inputs.get(name)) { original[name] = inputs.get(name); } }
     cpu_set_t original_affinity;
     require(!sched_getaffinity(0, sizeof(original_affinity), &original_affinity), "read fixture affinity");
     std::vector<int> allowed;
@@ -884,31 +887,31 @@ static void schedule_tests(int threads, int depth, bool schedules = false, bool 
     std::vector<bool> ready(modes, false);
     for (int index = 0; index < modes; ++index) {
         const int mode = mode_ids[index];
-        setenv(names[5], role_major || nonblocking_down_sched || (early_up_gate && mode) ? "1" : "0", 1);
-        setenv(names[6], poll && mode ? std::to_string(poll).c_str() : "0", 1);
-        setenv(names[7], (role_major || nonblocking_down_sched) && mode ? "1" : "0", 1);
-        setenv(names[8], nonblocking_down_sched && mode ? "1" : "0", 1);
+        inputs.set(names[5], role_major || nonblocking_down_sched || (early_up_gate && mode) ? "1" : "0");
+        inputs.set(names[6], poll && mode ? std::to_string(poll).c_str() : "0");
+        inputs.set(names[7], (role_major || nonblocking_down_sched) && mode ? "1" : "0");
+        inputs.set(names[8], nonblocking_down_sched && mode ? "1" : "0");
         const bool dynamic = schedules ? mode >= 7 : nonblocking_down_sched && mode;
-        setenv(names[9], dynamic ? "1" : "0", 1);
-        setenv(names[10], "16", 1);
+        inputs.set(names[9], dynamic ? "1" : "0");
+        inputs.set(names[10], "16");
         if (schedules) {
             ready[index] = mode == 1 || mode == 7;
-            setenv(names[0], mode == 1 || mode == 6 ? "1" : "0", 1);
-            setenv(names[1], ready[index] ? "1" : "0", 1);
-            setenv(names[2], mode == 6 ? weighted.c_str() : "", 1);
-            setenv(names[3], mode >= 3 ? cpus.c_str() : "", 1);
-            setenv(names[4], mode >= 3 ? std::to_string(allowed[threads - 1]).c_str() : "", 1);
+            inputs.set(names[0], mode == 1 || mode == 6 ? "1" : "0");
+            inputs.set(names[1], ready[index] ? "1" : "0");
+            inputs.set(names[2], mode == 6 ? weighted.c_str() : "");
+            inputs.set(names[3], mode >= 3 ? cpus.c_str() : "");
+            inputs.set(names[4], mode >= 3 ? std::to_string(allowed[threads - 1]).c_str() : "");
             // Mode 7 exercises dynamic rows through ordinary compute_phase.
         }
         char error[512] = {};
-        sinks.emplace_back(kimi_cpu_sink_create(threads, depth, fixture_selector::resolve,
+        sinks.emplace_back(inputs.create(threads, depth, fixture_selector::resolve,
             &selector, error, sizeof(error)), kimi_cpu_sink_destroy);
         require(bool(sinks[index]), std::string("schedule create: ") + error);
         configure_cache(sinks[index].get(), 8 * triplet_bytes(large), { 1, 2 }, 4);
     }
     for (const char * name : names) {
-        if (original.count(name)) { setenv(name, original[name].c_str(), 1); }
-        else { unsetenv(name); }
+        if (original.count(name)) { inputs.set(name, original[name].c_str()); }
+        else { inputs.unset(name); }
     }
     auto check_affinity = [&] {
         cpu_set_t current;
@@ -932,7 +935,7 @@ static void schedule_tests(int threads, int depth, bool schedules = false, bool 
         for (int index = 0; index < modes; ++index) {
             const int mode = mode_ids[index];
             begin_cache(sinks[index].get(), 99, token);
-            result[index] = run_checked(name, f, sinks[index].get(), meta, input, ids, weights,
+            result[index] = run_checked(inputs, name, f, sinks[index].get(), meta, input, ids, weights,
                 expected, 1, 25, hits, -1, &actual[index]);
             check_affinity();
             if (schedules) {
@@ -1004,65 +1007,66 @@ static void schedule_tests(int threads, int depth, bool schedules = false, bool 
                 threads, depth, modes, early_up_gate, role_major, nonblocking_down_sched, poll);
 }
 
-static void schedule_invalid_tests() {
+static void schedule_invalid_tests(fixture_inputs & inputs) {
     fixture f;
     const std::pair<const char *, const char *> invalid[] = {
-        { "GGML_KIMI_CPU_SINK_READY_FIRST", "2" },
-        { "GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "2" },
-        { "GGML_KIMI_CPU_SINK_ROLE_MAJOR", "2" },
-        { "GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", "2" },
-        { "GGML_KIMI_CPU_SINK_POLL_US", "-1" },
-        { "GGML_KIMI_CPU_SINK_POLL_US", "1001" },
-        { "GGML_KIMI_CPU_SINK_POLL_US", "100x" },
-        { "GGML_KIMI_CPU_SINK_DYNAMIC_ROWS", "2" },
-        { "GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS", "0" },
-        { "GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS", "15" },
-        { "GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS", "17" },
-        { "GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS", "16385" },
-        { "GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS", "64x" },
-        { "GGML_KIMI_CPU_SINK_ROW_WEIGHTS", "1,1" }, // 4 total threads needs 3 weights
-        { "GGML_KIMI_CPU_SINK_ROW_WEIGHTS", "1,0,1" },
-        { "GGML_KIMI_CPU_SINK_ROW_WEIGHTS", "1,nan,1" },
-        { "GGML_KIMI_CPU_SINK_ROW_WEIGHTS", "1,inf,1" },
-        { "GGML_KIMI_CPU_SINK_ROW_WEIGHTS", "1,1,-1" },
-        { "GGML_KIMI_CPU_SINK_ROW_WEIGHTS", "1,1,1," },
-        { "GGML_KIMI_CPU_SINK_COMPUTE_CPUS", "0,0,0" },
-        { "GGML_KIMI_CPU_SINK_COMPUTE_CPUS", "1024,1025,1026" },
-        { "GGML_KIMI_CPU_SINK_IO_CPUS", "-1" },
-        { "GGML_KIMI_CPU_SINK_IO_CPUS", "1x" },
+        { "ready_first", "2" },
+        { "prefetch_depth", "1" },
+        { "early_up_gate", "2" },
+        { "role_major", "2" },
+        { "nonblocking_down_sched", "2" },
+        { "poll_us", "-1" },
+        { "poll_us", "1001" },
+        { "poll_us", "100x" },
+        { "dynamic_rows", "2" },
+        { "dynamic_chunk_rows", "0" },
+        { "dynamic_chunk_rows", "15" },
+        { "dynamic_chunk_rows", "17" },
+        { "dynamic_chunk_rows", "16385" },
+        { "dynamic_chunk_rows", "64x" },
+        { "row_weights", "1,1" }, // 4 total threads needs 3 weights
+        { "row_weights", "1,0,1" },
+        { "row_weights", "1,nan,1" },
+        { "row_weights", "1,inf,1" },
+        { "row_weights", "1,1,-1" },
+        { "row_weights", "1,1,1," },
+        { "compute_cpus", "0,0,0" },
+        { "compute_cpus", "1024,1025,1026" },
+        { "io_cpus", "-1" },
+        { "io_cpus", "1x" },
     };
     for (const auto & item : invalid) {
-        setenv(item.first, item.second, 1);
+        inputs.set(item.first, item.second);
         char error[512] = {};
-        sink_ptr sink(kimi_cpu_sink_create(4, 1, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
-        unsetenv(item.first);
+        sink_ptr sink(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        inputs.unset(item.first);
         require(!sink && error[0], std::string("invalid schedule accepted: ") + item.first + "=" + item.second);
     }
     char error[512] = {};
     sink_ptr incompatible(nullptr, kimi_cpu_sink_destroy);
-    setenv("GGML_KIMI_CPU_SINK_DYNAMIC_ROWS", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_ROW_WEIGHTS", "1,1,1", 1);
-    incompatible.reset(kimi_cpu_sink_create(4, 1, fixture::resolve, &f, error, sizeof(error)));
-    unsetenv("GGML_KIMI_CPU_SINK_DYNAMIC_ROWS");
-    unsetenv("GGML_KIMI_CPU_SINK_ROW_WEIGHTS");
+    inputs.set("dynamic_rows", "1");
+    inputs.set("row_weights", "1,1,1");
+    incompatible.reset(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)));
+    inputs.unset("dynamic_rows");
+    inputs.unset("row_weights");
     require(!incompatible && std::strstr(error, "mutually exclusive"), "dynamic rows accepted static row weights");
-    setenv("GGML_KIMI_CPU_SINK_ROLE_MAJOR", "1", 1);
-    incompatible.reset(kimi_cpu_sink_create(4, 1, fixture::resolve, &f, error, sizeof(error)));
-    unsetenv("GGML_KIMI_CPU_SINK_ROLE_MAJOR");
+    inputs.set("role_major", "1");
+    incompatible.reset(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)));
+    inputs.unset("role_major");
     require(!incompatible && std::strstr(error, "EARLY_UP_GATE=1"), "role-major accepted without early up/gate");
 
-    setenv("GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", "1", 1);
-    incompatible.reset(kimi_cpu_sink_create(4, 1, fixture::resolve, &f, error, sizeof(error)));
+    inputs.set("nonblocking_down_sched", "1");
+    incompatible.reset(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)));
     require(!incompatible && std::strstr(error, "ROLE_MAJOR=1"), "nonblocking scheduler accepted without role-major");
-    setenv("GGML_KIMI_CPU_SINK_ROLE_MAJOR", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_READY_FIRST", "0", 1);
-    incompatible.reset(kimi_cpu_sink_create(4, 1, fixture::resolve, &f, error, sizeof(error)));
+    inputs.set("role_major", "1");
+    inputs.set("early_up_gate", "1");
+    inputs.set("ready_first", "0");
+    incompatible.reset(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)));
     require(!incompatible && std::strstr(error, "READY_FIRST=1"), "nonblocking scheduler accepted unordered reduction");
-    unsetenv("GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED");
-    unsetenv("GGML_KIMI_CPU_SINK_ROLE_MAJOR");
-    unsetenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE");
-    unsetenv("GGML_KIMI_CPU_SINK_READY_FIRST");
+    inputs.unset("nonblocking_down_sched");
+    inputs.unset("role_major");
+    inputs.unset("early_up_gate");
+    inputs.unset("ready_first");
     std::printf("SCHEDULE_INVALID_SETTINGS_REJECTED cases=%zu\n", sizeof(invalid) / sizeof(invalid[0]));
 }
 
@@ -1080,16 +1084,16 @@ static uint64_t anonymous_bytes() {
     throw std::runtime_error("smaps_rollup has no Anonymous counter");
 }
 
-static void cache_release_test(int threads, int depth) {
+static void cache_release_test(fixture_inputs & inputs, int threads, int depth) {
     fixture f; f.experts = 32; make_synthetic(f);
-    auto sink = make_sink(f, threads, depth);
+    auto sink = make_sink(inputs, f, threads, depth);
     const uint64_t bytes = 64 * triplet_bytes(f);
     configure_cache(sink.get(), bytes, { 1, 2 }, 32);
     begin_cache(sink.get(), 1, 1);
     std::vector<float> input(f.latent, .13f), weights(32, 1.0f / 32);
     std::vector<int32_t> ids(32); for (int i = 0; i < 32; ++i) { ids[i] = i; }
-    cache_case("cache_physical_fill_layer1", f, sink.get(), 1, input, ids, weights, 0, 32);
-    cache_case("cache_physical_fill_layer2", f, sink.get(), 2, input, ids, weights, 0, 32);
+    cache_case(inputs, "cache_physical_fill_layer1", f, sink.get(), 1, input, ids, weights, 0, 32);
+    cache_case(inputs, "cache_physical_fill_layer2", f, sink.get(), 2, input, ids, weights, 0, 32);
     const auto full = cache_snapshot(sink.get());
     require(full.mapped_bytes == bytes && full.committed_bytes == bytes && full.valid_bytes == bytes,
             "physical release fixture did not fill its budget");
@@ -1105,26 +1109,28 @@ static void cache_release_test(int threads, int depth) {
             "prefill zeroed accounting without releasing anonymous cache pages");
     std::printf("case=cache_prefill_physical_release payload=%llu anonymous_before=%llu anonymous_after=%llu status=PASS\n",
             (unsigned long long) bytes, (unsigned long long) before, (unsigned long long) after);
-    cache_case("cache_prefill_no_admission", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 0);
+    cache_case(inputs, "cache_prefill_no_admission", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 0);
     begin_cache(sink.get(), 1, 3);
-    cache_case("cache_decode_after_prefill_cold", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
+    cache_case(inputs, "cache_decode_after_prefill_cold", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
 }
 
-static void direct_cache_memlock_child(fixture & f, const std::vector<float> & input) {
-    const char * mode = std::getenv("GGML_KIMI_CPU_SINK_READ_FIXED");
+static void direct_cache_memlock_child(fixture_inputs & inputs, fixture & f, const std::vector<float> & input) {
+    const char * mode = inputs.get("read_fixed");
     if (!mode || std::strcmp(mode, "1")) { return; }
     // No parent sink exists yet. Lower limits/capabilities only in this child.
     std::fflush(nullptr);
     const pid_t child = fork(); require(child >= 0, "direct cache memlock fork failed");
     if (child == 0) {
         try {
+            // The kernel may charge ring setup itself to memlock. Create the
+            // real ring first, then deny only the buffer registration under test.
+            auto sink = make_sink(inputs, f, 2, 1);
             drop_child_memlock();
-            auto sink = make_sink(f, 2, 1);
             configure_cache(sink.get(), 2 * triplet_bytes(f), { 1 }, 2);
             begin_cache(sink.get(), 1, 1);
-            cache_case("direct_cache_memlock0_all_admit", f, sink.get(), 1, input, { 1, 2 }, { .3f, .7f }, 0, 2);
+            cache_case(inputs, "direct_cache_memlock0_all_admit", f, sink.get(), 1, input, { 1, 2 }, { .3f, .7f }, 0, 2);
             begin_cache(sink.get(), 1, 2);
-            cache_case("direct_cache_memlock0_all_hit", f, sink.get(), 1, input, { 1, 2 }, { .7f, .3f }, 2, 0);
+            cache_case(inputs, "direct_cache_memlock0_all_hit", f, sink.get(), 1, input, { 1, 2 }, { .7f, .3f }, 2, 0);
             begin_cache(sink.get(), 1, 3);
             tensors meta(f, 1); char error[512] = {}; kimi_cpu_sink_stats stats = {};
             const int32_t ids[] = { 1, 2, 3 }; const float weights[] = { .2f, .3f, .5f };
@@ -1133,12 +1139,12 @@ static void direct_cache_memlock_child(fixture & f, const std::vector<float> & i
                     input.data(), ids, weights, 3, 4, 25, output.data(), &stats, error, sizeof(error));
             require(!ok && std::strstr(error, "IORING_REGISTER_BUFFERS") && stats.read_requests == 0 &&
                     stats.fallback_count == 0, "RF bypass under memlock0 did not fail closed before submitting IO");
-            check_io_targets(stats, false);
+            check_io_targets(inputs, stats, false);
             const auto cleared = cache_snapshot(sink.get());
             require(cleared.mapped_bytes == 0 && cleared.committed_bytes == 0 && cleared.valid_bytes == 0,
                     "failed bypass registration retained direct cache targets");
             begin_cache(sink.get(), 1, 4);
-            cache_case("direct_cache_memlock0_after_registration_failure", f, sink.get(), 1, input,
+            cache_case(inputs, "direct_cache_memlock0_after_registration_failure", f, sink.get(), 1, input,
                     { 1, 2 }, { .3f, .7f }, 0, 2);
             sink.reset();
             std::printf("DIRECT_CACHE_MEMLOCK0_OK cache_READ_succeeded=1 bypass_READ_FIXED_failed_closed=1\n");
@@ -1153,30 +1159,30 @@ static void direct_cache_memlock_child(fixture & f, const std::vector<float> & i
     require(result == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, "direct cache memlock child did not pass");
 }
 
-static void direct_cache_target_tests(fixture & f, const std::vector<float> & input, int threads, int depth) {
+static void direct_cache_target_tests(fixture_inputs & inputs, fixture & f, const std::vector<float> & input, int threads, int depth) {
     const uint64_t unit = triplet_bytes(f);
-    auto sink = make_sink(f, threads, depth);
+    auto sink = make_sink(inputs, f, threads, depth);
     configure_cache(sink.get(), 8 * unit, { 1 }, 8);
     begin_cache(sink.get(), 1, 1);
-    const auto cold = cache_case("direct_cache_all_admit_over_ring_depth", f, sink.get(), 1, input,
+    const auto cold = cache_case(inputs, "direct_cache_all_admit_over_ring_depth", f, sink.get(), 1, input,
             { 0, 1, 2, 3, 4, 5, 6, 7 }, { .02f, .03f, .05f, .1f, .1f, .15f, .2f, .35f }, 0, 8);
     require(cold.stats.cache_new_slot_bytes == 8 * unit, "cold direct reads did not reserve all first-touch pages");
     begin_cache(sink.get(), 1, 2);
-    cache_case("direct_cache_all_hit_after_fill", f, sink.get(), 1, input,
+    cache_case(inputs, "direct_cache_all_hit_after_fill", f, sink.get(), 1, input,
             { 7, 0, 6, 1, 5, 2, 4, 3 }, { .2f, .15f, .05f, .2f, .1f, .05f, .1f, .15f }, 8, 0);
     begin_cache(sink.get(), 1, 3);
-    cache_case("direct_cache_all_hit_then_zero_active", f, sink.get(), 1, input, { -1, -7 }, { 0, 0 }, 0, 0);
+    cache_case(inputs, "direct_cache_all_hit_then_zero_active", f, sink.get(), 1, input, { -1, -7 }, { 0, 0 }, 0, 0);
 
     configure_cache(sink.get(), 3 * unit, { 1 }, 3);
     begin_cache(sink.get(), 2, 1);
-    cache_case("direct_cache_mixed_warm_one", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
+    cache_case(inputs, "direct_cache_mixed_warm_one", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
     begin_cache(sink.get(), 2, 2);
-    const auto mixed = cache_case("direct_cache_hit_admit_duplicate_bypass_order", f, sink.get(), 1, input,
+    const auto mixed = cache_case(inputs, "direct_cache_hit_admit_duplicate_bypass_order", f, sink.get(), 1, input,
             { 1, 2, 2, 3, 4, 1, 3, 5 }, { .1f, .15f, .05f, .25f, .1f, .2f, .05f, .1f }, 2, 2);
     require(mixed.stats.cache_fill_read_requests == 6 && mixed.stats.ring_read_requests == 12,
             "mixed target fixture did not exercise both cache and bypass destinations");
     begin_cache(sink.get(), 2, 3);
-    cache_case("direct_cache_mixed_next_token_resident", f, sink.get(), 1, input, { 1, 2, 3 }, { .2f, .3f, .5f }, 3, 0);
+    cache_case(inputs, "direct_cache_mixed_next_token_resident", f, sink.get(), 1, input, { 1, 2, 3 }, { .2f, .3f, .5f }, 3, 0);
 
     // Each single-role positive short read targets an admitted cache slot, with
     // the other roles (and, at depth>1, another expert) submitted in the batch.
@@ -1193,7 +1199,7 @@ static void direct_cache_target_tests(fixture & f, const std::vector<float> & in
         f.fault = fixture::none; f.fault_expert = -1; f.fault_role = -1;
         require(!ok && error[0] && stats.read_errors > 0 && stats.fallback_count == 0,
                 "admitted single-role short read did not fail closed");
-        check_io_targets(stats, false);
+        check_io_targets(inputs, stats, false);
         require(stats.ring_read_requests == 0 && stats.cache_fill_read_requests >= 3 && stats.cache_fill_read_bytes >= 4096,
                 "short read did not exercise the direct cache destination");
         require(stats.cache_new_slot_bytes == 4 * unit, "failed direct batch did not account for every reserved target");
@@ -1205,97 +1211,97 @@ static void direct_cache_target_tests(fixture & f, const std::vector<float> & in
                 role, (unsigned long long) stats.read_requests, (unsigned long long) stats.read_completions,
                 (unsigned long long) stats.pending_reads);
         if (role == 0) {
-            cache_case("direct_cache_short_read_then_empty", f, sink.get(), 1, input, { -1 }, { 0 }, 0, 0);
+            cache_case(inputs, "direct_cache_short_read_then_empty", f, sink.get(), 1, input, { -1 }, { 0 }, 0, 0);
             configure_cache(sink.get(), 4 * unit, { 1 }, 4);
         } else if (role == 1) {
             begin_cache(sink.get(), 3 + role, 2, false);
         } else {
             sink.reset(); // immediate destructor after the failed direct read
-            sink = make_sink(f, threads, depth);
+            sink = make_sink(inputs, f, threads, depth);
             configure_cache(sink.get(), 4 * unit, { 1 }, 4);
         }
         begin_cache(sink.get(), 10 + role, 1);
-        cache_case("direct_cache_short_read_remap_cold", f, sink.get(), 1, input,
+        cache_case(inputs, "direct_cache_short_read_remap_cold", f, sink.get(), 1, input,
                 { 1, 2, 3, 4 }, { .1f, .2f, .3f, .4f }, 0, 4);
         begin_cache(sink.get(), 10 + role, 2);
-        cache_case("direct_cache_short_read_recovered_hits", f, sink.get(), 1, input,
+        cache_case(inputs, "direct_cache_short_read_recovered_hits", f, sink.get(), 1, input,
                 { 4, 3, 2, 1 }, { .1f, .2f, .3f, .4f }, 4, 0);
     }
     std::printf("DIRECT_CACHE_TARGETS_OK\n");
 }
 
-static void cache_policy_tests(int threads, int depth) {
-    const char * policy = std::getenv("GGML_KIMI_CPU_SINK_CACHE_POLICY");
-    const char * allocation = std::getenv("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION");
+static void cache_policy_tests(fixture_inputs & inputs, int threads, int depth) {
+    const char * policy = inputs.get("cache_policy");
+    const char * allocation = inputs.get("cache_allocation");
     require(policy && allocation && std::strcmp(policy, "window"), "policy tests require a persistent policy and allocation");
     const bool recency = !std::strcmp(policy, "lru");
     const bool aging = !std::strcmp(policy, "decay") || !std::strcmp(policy, "count_decay2");
     const bool priority = !std::strcmp(allocation, "priority");
     const bool shared = !std::strcmp(allocation, "global");
     fixture f; make_synthetic(f);
-    auto sink = make_sink(f, threads, depth);
+    auto sink = make_sink(inputs, f, threads, depth);
     const uint64_t unit = triplet_bytes(f);
     std::vector<float> input(f.latent, .13f);
 
     configure_cache(sink.get(), 2 * unit, { 1 }, 2);
     begin_cache(sink.get(), 1, 1);
-    cache_case("policy_cold", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+    cache_case(inputs, "policy_cold", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
     begin_cache(sink.get(), 1, 2);
-    cache_case("policy_empty_preserves_history", f, sink.get(), 1, input, { -1 }, { 0 }, 0, 0);
+    cache_case(inputs, "policy_empty_preserves_history", f, sink.get(), 1, input, { -1 }, { 0 }, 0, 0);
     begin_cache(sink.get(), 1, 3);
-    cache_case("policy_miss_before_later_hit_protected", f, sink.get(), 1, input, { 3, 1 }, { .3f, .7f }, 1, 1);
+    cache_case(inputs, "policy_miss_before_later_hit_protected", f, sink.get(), 1, input, { 3, 1 }, { .3f, .7f }, 1, 1);
     begin_cache(sink.get(), 1, 4);
-    cache_case("policy_all_residents_protected_duplicate_hit", f, sink.get(), 1, input,
+    cache_case(inputs, "policy_all_residents_protected_duplicate_hit", f, sink.get(), 1, input,
         { 3, 3, 4, 1 }, { .1f, .2f, .3f, .4f }, 3, 0);
     begin_cache(sink.get(), 1, 5);
-    cache_case("policy_unlisted_layer_bypass", f, sink.get(), 2, input, { 1 }, { 1 }, 0, 0);
+    cache_case(inputs, "policy_unlisted_layer_bypass", f, sink.get(), 2, input, { 1 }, { 1 }, 0, 0);
     begin_cache(sink.get(), 1, 6);
-    cache_case("policy_layer_skip_retains_entries", f, sink.get(), 1, input, { 1, 3 }, { .2f, .8f }, 2, 0);
-    cache_case("policy_repeated_layer_same_token_bypass", f, sink.get(), 1, input, { 1, 3 }, { .7f, .3f }, 0, 0);
+    cache_case(inputs, "policy_layer_skip_retains_entries", f, sink.get(), 1, input, { 1, 3 }, { .2f, .8f }, 2, 0);
+    cache_case(inputs, "policy_repeated_layer_same_token_bypass", f, sink.get(), 1, input, { 1, 3 }, { .7f, .3f }, 0, 0);
     begin_cache(sink.get(), 1, 8);
-    cache_case("policy_token_jump_cold", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
+    cache_case(inputs, "policy_token_jump_cold", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
     begin_cache(sink.get(), 2, 9);
-    cache_case("policy_epoch_cold", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
+    cache_case(inputs, "policy_epoch_cold", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
     begin_cache(sink.get(), 2, 10, false);
     require(cache_snapshot(sink.get()).mapped_bytes == 0, "persistent cache survived prefill");
     begin_cache(sink.get(), 2, 11);
-    cache_case("policy_prefill_cold", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
+    cache_case(inputs, "policy_prefill_cold", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
 
     configure_cache(sink.get(), 2 * unit, { 2, 1 }, 2);
     begin_cache(sink.get(), 3, 1);
-    cache_case("policy_allocation_low_priority_layer", f, sink.get(), 1, input, { 1 }, { 1 }, 0, priority ? 0 : 1);
-    cache_case("policy_layer_id_is_part_of_key", f, sink.get(), 2, input, { 1 }, { 1 }, 0, 1);
+    cache_case(inputs, "policy_allocation_low_priority_layer", f, sink.get(), 1, input, { 1 }, { 1 }, 0, priority ? 0 : 1);
+    cache_case(inputs, "policy_layer_id_is_part_of_key", f, sink.get(), 2, input, { 1 }, { 1 }, 0, 1);
     begin_cache(sink.get(), 3, 2);
-    cache_case("policy_allocation_low_priority_hit", f, sink.get(), 1, input, { 1 }, { 1 }, priority ? 0 : 1, 0);
-    cache_case("policy_allocation_high_priority_hit", f, sink.get(), 2, input, { 1 }, { 1 }, 1, 0);
+    cache_case(inputs, "policy_allocation_low_priority_hit", f, sink.get(), 1, input, { 1 }, { 1 }, priority ? 0 : 1, 0);
+    cache_case(inputs, "policy_allocation_high_priority_hit", f, sink.get(), 2, input, { 1 }, { 1 }, 1, 0);
     configure_cache(sink.get(), 2 * unit, { 1, 2 }, 1);
     begin_cache(sink.get(), 4, 1);
-    cache_case("policy_global_can_borrow_other_layer_slot", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, shared ? 2 : 1);
+    cache_case(inputs, "policy_global_can_borrow_other_layer_slot", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, shared ? 2 : 1);
 
     configure_cache(sink.get(), 2 * unit, { 1 }, 2);
     begin_cache(sink.get(), 5, 1);
-    cache_case("policy_heat_cold", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+    cache_case(inputs, "policy_heat_cold", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
     begin_cache(sink.get(), 5, 2);
-    cache_case("policy_heat_train", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
+    cache_case(inputs, "policy_heat_train", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
     begin_cache(sink.get(), 5, 3);
-    cache_case("policy_cold_scan_admission", f, sink.get(), 1, input, { 3 }, { 1 }, 0, recency ? 1 : 0);
+    cache_case(inputs, "policy_cold_scan_admission", f, sink.get(), 1, input, { 3 }, { 1 }, 0, recency ? 1 : 0);
     begin_cache(sink.get(), 5, 4);
-    cache_case("policy_equal_frequency_admitted", f, sink.get(), 1, input, { 3 }, { 1 }, recency ? 1 : 0, recency ? 0 : 1);
+    cache_case(inputs, "policy_equal_frequency_admitted", f, sink.get(), 1, input, { 3 }, { 1 }, recency ? 1 : 0, recency ? 0 : 1);
 
     configure_cache(sink.get(), unit, { 1 }, 1);
     begin_cache(sink.get(), 6, 1);
-    cache_case("policy_decay_warm", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
+    cache_case(inputs, "policy_decay_warm", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
     begin_cache(sink.get(), 6, 2);
-    cache_case("policy_decay_heat", f, sink.get(), 1, input, { 1 }, { 1 }, 1, 0);
+    cache_case(inputs, "policy_decay_heat", f, sink.get(), 1, input, { 1 }, { 1 }, 1, 0);
     for (uint64_t token = 3; token < 32; ++token) { begin_cache(sink.get(), 6, token); }
     begin_cache(sink.get(), 6, 32);
-    cache_case("policy_decay_forgets_old_heat", f, sink.get(), 1, input, { 2 }, { 1 }, 0, recency || aging ? 1 : 0);
+    cache_case(inputs, "policy_decay_forgets_old_heat", f, sink.get(), 1, input, { 2 }, { 1 }, 0, recency || aging ? 1 : 0);
 
     // A failed direct admission must drain before unmapping, even when old
     // persistent entries would otherwise survive the next token.
     configure_cache(sink.get(), 3 * unit, { 1 }, 3);
     begin_cache(sink.get(), 7, 1);
-    cache_case("policy_fault_warm", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
+    cache_case(inputs, "policy_fault_warm", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
     begin_cache(sink.get(), 7, 2);
     tensors meta(f, 1); std::vector<float> output(f.latent);
     int32_t ids[] = { 2, 1, 3 }; float weights[] = { .2f, .3f, .5f };
@@ -1305,22 +1311,22 @@ static void cache_policy_tests(int threads, int depth) {
         ids, weights, 3, 4, 25, output.data(), &stats, error, sizeof(error));
     f.fault = fixture::none; f.fault_expert = f.fault_role = -1;
     require(!ok && error[0] && stats.read_errors > 0, "persistent direct admission fault did not fail closed");
-    check_io_targets(stats, false);
+    check_io_targets(inputs, stats, false);
     require(cache_snapshot(sink.get()).mapped_bytes == 0, "persistent failed admission retained mapping");
     begin_cache(sink.get(), 7, 3);
-    cache_case("policy_fault_recovers_cold", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
+    cache_case(inputs, "policy_fault_recovers_cold", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
     std::printf("CACHE_POLICY_OK policy=%s allocation=%s\n", policy, allocation);
 }
 
-static void elastic_cache_tests(int threads, int depth);
+static void elastic_cache_tests(fixture_inputs & inputs, int threads, int depth);
 
-static void max_cache_tests(int threads, int depth) {
+static void max_cache_tests(fixture_inputs & inputs, int threads, int depth) {
     fixture f; make_synthetic(f);
     std::vector<sink_ptr> sinks;
     for (int arm = 0; arm < 4; ++arm) {
-        setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY", arm < 2 ? "lru" : "count_decay2", 1);
-        setenv("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS", arm == 3 ? "1" : "0", 1);
-        sinks.push_back(make_sink(f, threads, depth));
+        inputs.set("cache_policy", arm < 2 ? "lru" : "count_decay2");
+        inputs.set("cache_keep", arm == 3 ? "1" : "0");
+        sinks.push_back(make_sink(inputs, f, threads, depth));
         configure_cache(sinks.back().get(), arm ? 2 * triplet_bytes(f) : 0, { 1 }, 2);
     }
     tensors meta(f, 1);
@@ -1335,7 +1341,7 @@ static void max_cache_tests(int threads, int depth) {
             kimi_cpu_sink_stats stats = {}; char error[512] = {};
             require(kimi_cpu_sink_run(sinks[arm].get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
                 ids.data(), weights.data(), int(ids.size()), 4, 25, output.data(), &stats, error, sizeof(error)), error);
-            check_io_targets(stats, true);
+            check_io_targets(inputs, stats, true);
             if (arm == 0) { expected = output; }
             else {
                 require(!std::memcmp(expected.data(), output.data(), output.size() * sizeof(float)),
@@ -1373,54 +1379,54 @@ static void max_cache_tests(int threads, int depth) {
     std::vector<float> output(f.latent); kimi_cpu_sink_stats stats = {}; char error[512] = {};
     require(!kimi_cpu_sink_run(retained.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
         ids, weights, 2, 4, 25, output.data(), &stats, error, sizeof(error)), "retained short read succeeded");
-    check_io_targets(stats, false);
+    check_io_targets(inputs, stats, false);
     require(stats.read_errors && cache_snapshot(retained.get()).mapped_bytes == 0, "retained error did not release");
     std::printf("MAX_CACHE_BIT_EXACT_OK comparisons=%llu threads=%d ring=%d\n",
         (unsigned long long) comparisons, threads, depth);
 }
 
-static void cache_tests(int threads, int depth) {
+static void cache_tests(fixture_inputs & inputs, int threads, int depth) {
     fixture f; make_synthetic(f);
     const uint64_t unit = triplet_bytes(f);
     std::vector<float> input(f.latent);
     for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int(i % 23) - 11) * .023f; }
-    direct_cache_memlock_child(f, input);
-    direct_cache_target_tests(f, input, threads, depth);
-    auto sink = make_sink(f, threads, depth);
+    direct_cache_memlock_child(inputs, f, input);
+    direct_cache_target_tests(inputs, f, input, threads, depth);
+    auto sink = make_sink(inputs, f, threads, depth);
     configure_cache(sink.get(), 2 * unit + 17, { 1 }, 2);
-    cache_case("cache_before_decode_bypass", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 0);
+    cache_case(inputs, "cache_before_decode_bypass", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 0);
     require(cache_snapshot(sink.get()).mapped_bytes == 0, "nondecode run mapped cache payload");
     begin_cache(sink.get(), 1, 0, false);
-    cache_case("cache_explicit_prefill_bypass", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 0);
+    cache_case(inputs, "cache_explicit_prefill_bypass", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 0);
     begin_cache(sink.get(), 1, 1);
-    cache_case("cache_cold", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+    cache_case(inputs, "cache_cold", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
     require(cache_snapshot(sink.get()).capacity_bytes == 2 * unit, "cache rounded a partial triplet up");
     begin_cache(sink.get(), 1, 2);
     input[3] += .125f;
-    cache_case("cache_full_hit_changed_activation_weights", f, sink.get(), 1, input, { 1, 2 }, { .8f, .2f }, 2, 0);
-    cache_case("cache_repeat_same_token_bypass", f, sink.get(), 1, input, { 4, 5 }, { .3f, .7f }, 0, 0);
+    cache_case(inputs, "cache_full_hit_changed_activation_weights", f, sink.get(), 1, input, { 1, 2 }, { .8f, .2f }, 2, 0);
+    cache_case(inputs, "cache_repeat_same_token_bypass", f, sink.get(), 1, input, { 4, 5 }, { .3f, .7f }, 0, 0);
     begin_cache(sink.get(), 1, 3);
-    cache_case("cache_window_intersection_B", f, sink.get(), 1, input, { 2, 3 }, { .3f, .7f }, 1, 1);
+    cache_case(inputs, "cache_window_intersection_B", f, sink.get(), 1, input, { 2, 3 }, { .3f, .7f }, 1, 1);
     begin_cache(sink.get(), 1, 4);
-    cache_case("cache_window_intersection_C", f, sink.get(), 1, input, { 1, 3 }, { .2f, .8f }, 1, 1);
+    cache_case(inputs, "cache_window_intersection_C", f, sink.get(), 1, input, { 1, 3 }, { .2f, .8f }, 1, 1);
     begin_cache(sink.get(), 1, 5);
-    cache_case("cache_unselected_layer_bypass", f, sink.get(), 2, input, { 1, 2, 3, 4 }, { .1f, .2f, .3f, .4f }, 0, 0);
-    cache_case("cache_selected_survives_unselected", f, sink.get(), 1, input, { 1, 3 }, { .1f, .9f }, 2, 0);
+    cache_case(inputs, "cache_unselected_layer_bypass", f, sink.get(), 2, input, { 1, 2, 3, 4 }, { .1f, .2f, .3f, .4f }, 0, 0);
+    cache_case(inputs, "cache_selected_survives_unselected", f, sink.get(), 1, input, { 1, 3 }, { .1f, .9f }, 2, 0);
     begin_cache(sink.get(), 1, 6);
-    cache_case("cache_skip_selected_layer_token", f, sink.get(), 2, input, { 1 }, { 1 }, 0, 0);
+    cache_case(inputs, "cache_skip_selected_layer_token", f, sink.get(), 2, input, { 1 }, { 1 }, 0, 0);
     begin_cache(sink.get(), 1, 7);
-    cache_case("cache_missing_previous_layer_is_cold", f, sink.get(), 1, input, { 1, 3 }, { .1f, .9f }, 0, 2);
+    cache_case(inputs, "cache_missing_previous_layer_is_cold", f, sink.get(), 1, input, { 1, 3 }, { .1f, .9f }, 0, 2);
     begin_cache(sink.get(), 1, 10);
-    cache_case("cache_nonconsecutive_token_is_cold", f, sink.get(), 1, input, { 1, 3 }, { .1f, .9f }, 0, 2);
+    cache_case(inputs, "cache_nonconsecutive_token_is_cold", f, sink.get(), 1, input, { 1, 3 }, { .1f, .9f }, 0, 2);
     begin_cache(sink.get(), 2, 11);
-    cache_case("cache_new_epoch_is_cold", f, sink.get(), 1, input, { 1, 3 }, { .1f, .9f }, 0, 2);
+    cache_case(inputs, "cache_new_epoch_is_cold", f, sink.get(), 1, input, { 1, 3 }, { .1f, .9f }, 0, 2);
 
     // Two disjoint full generations must reuse the same physical budget, never
     // allocate an unaccounted second payload while publishing the next window.
     for (uint64_t token = 12; token < 28; ++token) {
         begin_cache(sink.get(), 2, token);
         const int32_t first = token % 2 ? 5 : 7;
-        cache_case("cache_full_budget_generation_replace", f, sink.get(), 1, input,
+        cache_case(inputs, "cache_full_budget_generation_replace", f, sink.get(), 1, input,
                 { first, first + 1 }, { .37f, .63f }, 0, 2);
         const auto state = cache_snapshot(sink.get());
         require(state.valid_bytes == 2 * unit && state.committed_bytes == 2 * unit && state.peak_bytes <= 2 * unit + 17,
@@ -1428,47 +1434,47 @@ static void cache_tests(int threads, int depth) {
     }
     configure_cache(sink.get(), unit - 1, { 1 }, 2);
     begin_cache(sink.get(), 3, 1);
-    cache_case("cache_sub_triplet_budget_bypass", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 0);
+    cache_case(inputs, "cache_sub_triplet_budget_bypass", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 0);
     require(cache_snapshot(sink.get()).capacity_bytes == 0, "sub-triplet budget allocated payload");
     configure_cache(sink.get(), 0, { 1 }, 2);
     begin_cache(sink.get(), 3, 2);
-    cache_case("cache_zero_budget_bypass", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 0);
+    cache_case(inputs, "cache_zero_budget_bypass", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 0);
 
     // Priority quotas may end in a partial layer. No later layer may take the
     // first layer's storage simply because it is visited later in the token.
     configure_cache(sink.get(), 3 * unit, { 2, 1 }, 2);
     begin_cache(sink.get(), 4, 1);
-    cache_case("cache_priority_partial_layer_cold", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 1);
-    cache_case("cache_priority_full_layer_cold", f, sink.get(), 2, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+    cache_case(inputs, "cache_priority_partial_layer_cold", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 1);
+    cache_case(inputs, "cache_priority_full_layer_cold", f, sink.get(), 2, input, { 1, 2 }, { .4f, .6f }, 0, 2);
     begin_cache(sink.get(), 4, 2);
-    cache_case("cache_priority_partial_layer_hit", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 1, 0);
-    cache_case("cache_priority_full_layer_hit", f, sink.get(), 2, input, { 1, 2 }, { .4f, .6f }, 2, 0);
+    cache_case(inputs, "cache_priority_partial_layer_hit", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 1, 0);
+    cache_case(inputs, "cache_priority_full_layer_hit", f, sink.get(), 2, input, { 1, 2 }, { .4f, .6f }, 2, 0);
 
     configure_cache(sink.get(), 2 * unit, { 1 }, 2);
     begin_cache(sink.get(), 5, 1);
-    cache_case("cache_duplicates_cold_not_temporal_hits", f, sink.get(), 1, input,
+    cache_case(inputs, "cache_duplicates_cold_not_temporal_hits", f, sink.get(), 1, input,
             { 3, -1, 3, 4, 3, -7 }, { .2f, 0, .1f, 0, .7f, 0 }, 0, 2);
     begin_cache(sink.get(), 5, 2);
-    cache_case("cache_duplicates_resident_ordered", f, sink.get(), 1, input,
+    cache_case(inputs, "cache_duplicates_resident_ordered", f, sink.get(), 1, input,
             { 3, -1, 3, 4, 3, -7 }, { .2f, 0, .1f, 0, .7f, 0 }, 4, 0, 0);
     begin_cache(sink.get(), 5, 3);
-    cache_case("cache_empty_token", f, sink.get(), 1, input, { -1, -7 }, { 0, 0 }, 0, 0);
+    cache_case(inputs, "cache_empty_token", f, sink.get(), 1, input, { -1, -7 }, { 0, 0 }, 0, 0);
     begin_cache(sink.get(), 5, 4);
-    cache_case("cache_empty_previous_window_is_cold", f, sink.get(), 1, input, { 3 }, { 1 }, 0, 1);
+    cache_case(inputs, "cache_empty_previous_window_is_cold", f, sink.get(), 1, input, { 3 }, { 1 }, 0, 1);
 
     // Interleave resident and missed requests across every ring wrap. Repeated
     // misses are independent reads in this API, but publish only one entry.
     configure_cache(sink.get(), 4 * unit, { 1 }, 4);
     begin_cache(sink.get(), 6, 1);
-    cache_case("cache_ring_mix_warm", f, sink.get(), 1, input, { 1, 3 }, { .4f, .6f }, 0, 2);
+    cache_case(inputs, "cache_ring_mix_warm", f, sink.get(), 1, input, { 1, 3 }, { .4f, .6f }, 0, 2);
     begin_cache(sink.get(), 6, 2);
-    cache_case("cache_ring_mixed_wrap", f, sink.get(), 1, input,
+    cache_case(inputs, "cache_ring_mixed_wrap", f, sink.get(), 1, input,
             { 1, 2, 3, 4, 1, -1, 2, 3, 4 }, { .1f, .2f, .15f, .05f, .1f, 0, .2f, .15f, .05f }, 4, 2);
 
     for (auto fault : { fixture::missing, fixture::unaligned_offset, fixture::wrong_size, fixture::past_eof }) {
         configure_cache(sink.get(), 2 * unit, { 1 }, 2);
         begin_cache(sink.get(), 7, 1);
-        cache_case("cache_fault_warm", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
+        cache_case(inputs, "cache_fault_warm", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
         begin_cache(sink.get(), 7, 2);
         tensors meta(f, 1); std::vector<float> output(f.latent);
         int32_t ids[] = { 1, 2, 3 }; float weights[] = { .2f, .3f, .5f };
@@ -1478,15 +1484,15 @@ static void cache_tests(int threads, int depth) {
                 ids, weights, 3, 4, 25, output.data(), &stats, error, sizeof(error));
         f.fault = fixture::none; f.fault_expert = -1;
         require(!ok && error[0] && stats.fallback_count == 0, "mixed cache fault did not fail closed");
-        check_io_targets(stats, false);
+        check_io_targets(inputs, stats, false);
         if (fault == fixture::past_eof) { require(stats.read_errors > 0, "mixed short read did not report error"); }
         require(cache_snapshot(sink.get()).valid_bytes == 0, "failed run retained a cache window");
         if (fault == fixture::past_eof) {
-            cache_case("cache_short_read_then_empty_clears_io_error", f, sink.get(), 1, input,
+            cache_case(inputs, "cache_short_read_then_empty_clears_io_error", f, sink.get(), 1, input,
                     { -1, -7 }, { 0, 0 }, 0, 0);
         }
         begin_cache(sink.get(), 7, 3);
-        cache_case("cache_fault_drained_cold_recovery", f, sink.get(), 1, input,
+        cache_case(inputs, "cache_fault_drained_cold_recovery", f, sink.get(), 1, input,
                 { 1, 2, 3 }, { .2f, .3f, .5f }, 0, 2);
     }
 
@@ -1495,27 +1501,27 @@ static void cache_tests(int threads, int depth) {
     fixture other; make_synthetic(other, 20260909);
     fixture_selector selector; selector.active = &f;
     char error[512] = {};
-    sink_ptr identities(kimi_cpu_sink_create(threads, depth, fixture_selector::resolve, &selector, error, sizeof(error)),
+    sink_ptr identities(inputs.create(threads, depth, fixture_selector::resolve, &selector, error, sizeof(error)),
             kimi_cpu_sink_destroy);
     require(bool(identities), std::string("identity sink create: ") + error);
     configure_cache(identities.get(), 2 * unit, { 1 }, 2);
     begin_cache(identities.get(), 100, 1);
-    cache_case("cache_model_A_warm", f, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+    cache_case(inputs, "cache_model_A_warm", f, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
     selector.active = &other; begin_cache(identities.get(), 101, 2);
-    cache_case("cache_model_B_same_names_new_epoch", other, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+    cache_case(inputs, "cache_model_B_same_names_new_epoch", other, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
     begin_cache(identities.get(), 101, 3);
-    cache_case("cache_model_B_resident", other, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
+    cache_case(inputs, "cache_model_B_resident", other, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
     selector.active = &f; begin_cache(identities.get(), 102, 4);
-    cache_case("cache_model_A_return_is_cold", f, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+    cache_case(inputs, "cache_model_A_return_is_cold", f, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
     // Defence beyond the immutable-pack contract: fstat identity must catch a
     // caller replacing the source without changing epoch, including fd reuse.
     selector.active = &other; begin_cache(identities.get(), 102, 5);
-    cache_case("cache_same_epoch_different_pack_fd", other, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+    cache_case(inputs, "cache_same_epoch_different_pack_fd", other, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
     require(f.fd != other.fd && dup2(f.fd, other.fd) == other.fd, "pack fd reuse fixture failed");
     begin_cache(identities.get(), 102, 6);
     // The resolver still returns other's fd number and identical offsets, but
     // that descriptor now names A. The independent reference uses A's bytes.
-    cache_case("cache_same_epoch_reused_fd_new_inode", f, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+    cache_case(inputs, "cache_same_epoch_reused_fd_new_inode", f, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
 
     const int32_t layer = 1;
     for (int quota : { 0, 897 }) {
@@ -1523,54 +1529,54 @@ static void cache_tests(int threads, int depth) {
                 "invalid cache quota was accepted");
     }
     identities.reset(); sink.reset();
-    cache_release_test(threads, depth);
-    elastic_cache_tests(threads, depth);
+    cache_release_test(inputs, threads, depth);
+    elastic_cache_tests(inputs, threads, depth);
     std::printf("CACHE_CPU_SINK_OK threads=%d ring_experts=%d\n", threads, depth);
 }
 
-static void cache_hitrate_tests(int threads, int depth) {
+static void cache_hitrate_tests(fixture_inputs & inputs, int threads, int depth) {
     fixture f; make_synthetic(f);
     const uint64_t unit = triplet_bytes(f);
-    const char * quotas = "GGML_KIMI_CPU_SINK_CACHE_LAYER_QUOTAS";
-    const char * reserve = "GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES";
-    setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY", "count_decay2", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", "uniform", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS", "1", 1);
+    const char * quotas = "cache_layer_quotas";
+    const char * reserve = "cache_reserve_bytes";
+    inputs.set("cache_policy", "count_decay2");
+    inputs.set("cache_allocation", "uniform");
+    inputs.set("cache_keep", "1");
     unsigned rejected = 0;
     for (const char * value : { "", "1", "1:", ":1", "1:2,", "1:2,,2:2", "1:2,1:2", "1:-1", "1024:1", "1:897", "1:2x", "1:1:2" }) {
-        setenv(quotas, value, 1); char error[512] = {};
-        sink_ptr s(kimi_cpu_sink_create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        inputs.set(quotas, value); char error[512] = {};
+        sink_ptr s(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
         require(!s && error[0], "invalid layer quota accepted"); ++rejected;
     }
-    unsetenv(quotas);
+    inputs.unset(quotas);
     for (const char * value : { "", "0", "536870911", "-1", "536870912x", "18446744073709551616" }) {
-        setenv(reserve, value, 1); char error[512] = {};
-        sink_ptr s(kimi_cpu_sink_create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        inputs.set(reserve, value); char error[512] = {};
+        sink_ptr s(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
         require(!s && error[0], "invalid cache reserve accepted"); ++rejected;
     }
     for (const char * value : { "2147483649", "2466374752", "12884901888", "18446744073709551615" }) {
-        setenv(reserve, value, 1);
-        auto s = make_sink(f, threads, depth);
+        inputs.set(reserve, value);
+        auto s = make_sink(inputs, f, threads, depth);
         require(bool(s), "large model-derived cache reserve rejected");
     }
-    setenv(reserve, "1073741824", 1);
+    inputs.set(reserve, "1073741824");
     for (const char * value : { "1:1", "1:1,3:3", "1:1,2:5" }) {
-        setenv(quotas, value, 1); auto s = make_sink(f, threads, depth);
+        inputs.set(quotas, value); auto s = make_sink(inputs, f, threads, depth);
         const int32_t ids[] = { 1, 2 }; char error[512] = {};
         require(!kimi_cpu_sink_cache_configure(s.get(), 4 * unit, ids, 2, 4, error, sizeof(error)) && error[0],
                 "partial, unknown or oversized layer quota accepted"); ++rejected;
     }
     unsigned comparisons = 0;
     for (const char * profile : { "2:3,1:1", "2:4,1:0" }) {
-        setenv(quotas, profile, 1); auto s = make_sink(f, threads, depth);
+        inputs.set(quotas, profile); auto s = make_sink(inputs, f, threads, depth);
         configure_cache(s.get(), 4 * unit + 17, { 1, 2 }, 4);
         const bool zero = std::strstr(profile, "1:0") != nullptr;
         std::vector<float> input(f.latent, .17f);
         for (uint64_t token = 1; token <= 4; ++token) {
             begin_cache(s.get(), 1, token);
-            cache_case("hitrate_layer1", f, s.get(), 1, input, { 1 }, { 1 },
+            cache_case(inputs, "hitrate_layer1", f, s.get(), 1, input, { 1 }, { 1 },
                     !zero && token > 1 ? 1 : 0, !zero && token == 1 ? 1 : 0);
-            cache_case("hitrate_layer2", f, s.get(), 2, input, { 1, 2, 3 }, { .2f, .3f, .5f },
+            cache_case(inputs, "hitrate_layer2", f, s.get(), 2, input, { 1, 2, 3 }, { .2f, .3f, .5f },
                     token > 1 ? 3 : 0, token == 1 ? 3 : 0);
             input[0] += .013f; comparisons += 2;
         }
@@ -1578,12 +1584,12 @@ static void cache_hitrate_tests(int threads, int depth) {
         require(stats.capacity_bytes == 4 * unit && stats.committed_bytes == (zero ? 3 : 4) * unit && !stats.pressure_stops,
                 "fixed quotas exceeded physical budget or touched unused slots");
         begin_cache(s.get(), 0, 0, false); begin_cache(s.get(), 1, 1);
-        cache_case("hitrate_retained", f, s.get(), 2, input, { 3, 1 }, { .7f, .3f }, 2, 0); ++comparisons;
+        cache_case(inputs, "hitrate_retained", f, s.get(), 2, input, { 3, 1 }, { .7f, .3f }, 2, 0); ++comparisons;
         begin_cache(s.get(), 2, 2);
-        cache_case("hitrate_epoch_cold", f, s.get(), 2, input, { 3, 1 }, { .3f, .7f }, 0, 2); ++comparisons;
+        cache_case(inputs, "hitrate_epoch_cold", f, s.get(), 2, input, { 3, 1 }, { .3f, .7f }, 0, 2); ++comparisons;
     }
-    setenv(quotas, "1:1,2:2", 1);
-    auto mismatch = make_sink(f, threads, depth); configure_cache(mismatch.get(), 4 * unit, { 1, 2 }, 4);
+    inputs.set(quotas, "1:1,2:2");
+    auto mismatch = make_sink(inputs, f, threads, depth); configure_cache(mismatch.get(), 4 * unit, { 1, 2 }, 4);
     begin_cache(mismatch.get(), 1, 1); tensors meta(f, 1);
     std::vector<float> input(f.latent, .13f), output(f.latent);
     const int32_t id = 1; const float weight = 1; char error[512] = {}; kimi_cpu_sink_stats stats = {};
@@ -1591,7 +1597,7 @@ static void cache_hitrate_tests(int threads, int depth) {
             1, 4, 25, output.data(), &stats, error, sizeof(error)), "quota sum mismatch did not fail closed");
     require(error[0] && !stats.read_bytes && !stats.pending_reads && !stats.fallback_count && !cache_snapshot(mismatch.get()).mapped_bytes,
             "invalid quota geometry submitted I/O or retained a mapping"); ++rejected;
-    unsetenv(quotas); unsetenv(reserve);
+    inputs.unset(quotas); inputs.unset(reserve);
     std::printf("CACHE_HITRATE_BIT_EXACT_OK comparisons=%u rejected=%u reserve_bytes=1073741824\n", comparisons, rejected);
 }
 
@@ -1601,7 +1607,7 @@ static std::vector<int32_t> all_cache_layers() {
     return layers;
 }
 
-static void cache_auto_ring_test(int threads, int depth) {
+static void cache_auto_ring_test(fixture_inputs & inputs, int threads, int depth) {
     // A dedicated small scope tests planned capacity without filling it or
     // manufacturing an OOM. The fixture and its file pages stay charged.
     std::ifstream groups("/proc/self/cgroup"); std::string line, path;
@@ -1614,16 +1620,16 @@ static void cache_auto_ring_test(int threads, int depth) {
             "--auto-cache-ring-test requires an independent 1 GiB scope");
     require(depth == 8, "cold-ring regression uses eight staging slots");
     const uint64_t reserve = 512ull * 1024 * 1024;
-    setenv("GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES", "536870912", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", "uniform", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY", "count_decay2", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_ELASTIC", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_READ_FIXED", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_READY_FIRST", "0", 1);
-    unsetenv("GGML_KIMI_CPU_SINK_CACHE_LAYER_QUOTAS");
+    inputs.set("cache_reserve_bytes", "536870912");
+    inputs.set("cache_allocation", "uniform");
+    inputs.set("cache_policy", "count_decay2");
+    inputs.set("cache_reclaimable_file", "0");
+    inputs.set("cache_keep", "0");
+    inputs.set("cache_partial_reclaim", "0");
+    inputs.set("cache_elastic", "0");
+    inputs.set("read_fixed", "0");
+    inputs.set("ready_first", "0");
+    inputs.unset("cache_layer_quotas");
     fixture f; f.latent = f.hidden = 2048; f.experts = 8; make_synthetic(f);
     const uint64_t unit = triplet_bytes(f);
     std::vector<float> input(f.latent, .013f), weights(8, .125f);
@@ -1643,11 +1649,11 @@ static void cache_auto_ring_test(int threads, int depth) {
         }
     }
     f.experts = 128;
-    auto sink = make_sink(f, threads, depth);
+    auto sink = make_sink(inputs, f, threads, depth);
     configure_cache(sink.get(), std::numeric_limits<uint64_t>::max(), {1, 2}, 256);
     tensors meta(f, 1);
     const auto execute = [&](const char * name, size_t hits, int admitted) {
-        auto value = run_checked(name, f, sink.get(), meta, input, ids, weights, expected, 1, 25, hits, admitted);
+        auto value = run_checked(inputs, name, f, sink.get(), meta, input, ids, weights, expected, 1, 25, hits, admitted);
         cache_snapshot(sink.get()); print_sample(name, value); return value;
     };
     begin_cache(sink.get(), 71, 1);
@@ -1707,7 +1713,7 @@ static void cache_auto_ring_test(int threads, int depth) {
     std::printf("AUTO_CACHE_RING_OK output_hash=%llu\n", (unsigned long long) hit.output_hash);
 }
 
-static void cache_large_test(int threads, int depth) {
+static void cache_large_test(fixture_inputs & inputs, int threads, int depth) {
     // Only three experts are materialized. The metadata exposes ID 895 and
     // 256 * 896 cache slots, making a > 120 GB virtual arena with < 3 MB payload
     // touched. In particular global allocation must not charge the whole arena.
@@ -1718,7 +1724,7 @@ static void cache_large_test(int threads, int depth) {
         }
     }
     f.experts = 896;
-    auto sink = make_sink(f, threads, depth);
+    auto sink = make_sink(inputs, f, threads, depth);
     const auto layers = all_cache_layers();
     char error[512] = {};
     const int32_t invalid_layer = 1024;
@@ -1735,7 +1741,7 @@ static void cache_large_test(int threads, int depth) {
     const uint64_t unit = triplet_bytes(f), before = anonymous_bytes();
     std::vector<float> input(f.latent, .13f);
     begin_cache(sink.get(), 1, 1);
-    cache_case("cache_large_sparse_first_touch", f, sink.get(), 1, input, { 1, 2 }, { .3f, .7f }, 0, 2);
+    cache_case(inputs, "cache_large_sparse_first_touch", f, sink.get(), 1, input, { 1, 2 }, { .3f, .7f }, 0, 2);
     auto stats = cache_snapshot(sink.get());
     require(stats.capacity_bytes == unit * 256 * 896 && stats.mapped_bytes == stats.capacity_bytes &&
             stats.capacity_bytes > 120000000000ull && stats.committed_bytes == 2 * unit,
@@ -1745,9 +1751,9 @@ static void cache_large_test(int threads, int depth) {
             "large cache guard omitted page tables or charged unused slots");
     require(anonymous_bytes() < before + 128ull * 1024 * 1024, "large virtual cache prefaulted payload");
     begin_cache(sink.get(), 1, 2);
-    cache_case("cache_large_hit_and_high_id", f, sink.get(), 1, input, { 1, 895 }, { .4f, .6f }, 1, 1);
+    cache_case(inputs, "cache_large_hit_and_high_id", f, sink.get(), 1, input, { 1, 895 }, { .4f, .6f }, 1, 1);
     begin_cache(sink.get(), 1, 3);
-    cache_case("cache_large_all_hits_no_new_pages", f, sink.get(), 1, input, { 895, 1 }, { .6f, .4f }, 2, 0);
+    cache_case(inputs, "cache_large_all_hits_no_new_pages", f, sink.get(), 1, input, { 895, 1 }, { .6f, .4f }, 2, 0);
     stats = cache_snapshot(sink.get());
     require(stats.committed_bytes == 3 * unit && stats.last_guard_extra_bytes == 0 && stats.pressure_stops == 0,
             "large cache hit reused or charged an untouched quota");
@@ -1758,7 +1764,7 @@ static void cache_large_test(int threads, int depth) {
             (unsigned long long) stats.page_table_bytes, (unsigned long long) stats.peak_guard_extra_bytes);
 }
 
-static void cache_pressure_transition_test(int threads, int depth) {
+static void cache_pressure_transition_test(fixture_inputs & inputs, int threads, int depth) {
     // Explicit opt-in, dedicated scope only. Lowering its limit leaves the
     // selected reserve minus a small, known deficit, so this exercises the
     // cache guard without OOM or pressure ballast. The same test supports an
@@ -1781,28 +1787,28 @@ static void cache_pressure_transition_test(int threads, int depth) {
         std::ofstream file(path + "/memory.max"); file << value << '\n'; file.flush();
         require(bool(file), "cannot write owned pressure-test memory.max");
     };
-    const char * partial_value = std::getenv("GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM");
+    const char * partial_value = inputs.get("cache_partial_reclaim");
     const bool partial = partial_value && !std::strcmp(partial_value, "1");
-    fixture f; make_synthetic(f); auto sink = make_sink(f, threads, depth);
+    fixture f; make_synthetic(f); auto sink = make_sink(inputs, f, threads, depth);
     const uint64_t unit = triplet_bytes(f);
     if (partial) { configure_cache(sink.get(), 4 * unit, { 1, 2 }, 2); }
     else { configure_cache(sink.get(), 594000000000, all_cache_layers(), 896); }
     std::vector<float> input(f.latent, .13f);
     begin_cache(sink.get(), 1, 1);
     if (partial) {
-        cache_case("cache_partial_pressure_warm_layer1", f, sink.get(), 1, input, { 1, 2 }, { .6f, .4f }, 0, 2);
-        cache_case("cache_partial_pressure_warm_layer2", f, sink.get(), 2, input, { 3, 4 }, { .6f, .4f }, 0, 2);
+        cache_case(inputs, "cache_partial_pressure_warm_layer1", f, sink.get(), 1, input, { 1, 2 }, { .6f, .4f }, 0, 2);
+        cache_case(inputs, "cache_partial_pressure_warm_layer2", f, sink.get(), 2, input, { 3, 4 }, { .6f, .4f }, 0, 2);
         for (uint64_t token = 2; token <= 5; ++token) {
             begin_cache(sink.get(), 1, token);
-            cache_case("cache_partial_pressure_train_hot_layer1", f, sink.get(), 1, input, { 1 }, { 1 }, 1, 0);
-            cache_case("cache_partial_pressure_train_hot_layer2", f, sink.get(), 2, input, { 3 }, { 1 }, 1, 0);
+            cache_case(inputs, "cache_partial_pressure_train_hot_layer1", f, sink.get(), 1, input, { 1 }, { 1 }, 1, 0);
+            cache_case(inputs, "cache_partial_pressure_train_hot_layer2", f, sink.get(), 2, input, { 3 }, { 1 }, 1, 0);
         }
     } else {
-        cache_case("cache_pressure_transition_warm", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
+        cache_case(inputs, "cache_pressure_transition_warm", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
     }
     uint64_t used = 0;
     std::ifstream current(path + "/memory.current"); require(bool(current >> used), "cannot read pressure-test usage");
-    const char * chosen = std::getenv("GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES");
+    const char * chosen = inputs.get("cache_reserve_bytes");
     const uint64_t reserve_bytes = chosen ? std::stoull(chosen) : 2ull * 1024 * 1024 * 1024;
     // One byte beyond a single slot makes the guard request two slots while
     // leaving almost one slot of slack after the per-layer release. That keeps
@@ -1817,9 +1823,9 @@ static void cache_pressure_transition_test(int threads, int depth) {
     try {
         begin_cache(sink.get(), 1, partial ? 6 : 2);
         if (partial) {
-            const auto layer1 = cache_case("cache_partial_pressure_retains_hot_layer1", f, sink.get(), 1,
+            const auto layer1 = cache_case(inputs, "cache_partial_pressure_retains_hot_layer1", f, sink.get(), 1,
                     input, { 1 }, { 1 }, 1, 0);
-            const auto layer2 = cache_case("cache_partial_pressure_retains_hot_layer2", f, sink.get(), 2,
+            const auto layer2 = cache_case(inputs, "cache_partial_pressure_retains_hot_layer2", f, sink.get(), 2,
                     input, { 3 }, { 1 }, 1, 0);
             const auto stats = cache_snapshot(sink.get());
             require(stats.pressure_stops == 0 && stats.mapped_bytes == 4 * unit &&
@@ -1829,7 +1835,7 @@ static void cache_pressure_transition_test(int threads, int depth) {
                     stats.clears == 0 && layer1.stats.ring_read_bytes == 0 && layer2.stats.ring_read_bytes == 0,
                     "partial pressure guard did not release one cold slot per layer while retaining both hot hits");
         } else {
-            const auto result = cache_case("cache_pressure_transition_hit_becomes_ring_miss", f, sink.get(), 1,
+            const auto result = cache_case(inputs, "cache_pressure_transition_hit_becomes_ring_miss", f, sink.get(), 1,
                     input, { 1, 2 }, { .3f, .7f }, 0, 0);
             const auto stats = cache_snapshot(sink.get());
             require(stats.pressure_stops == 1 && stats.mapped_bytes == 0 && stats.page_table_bytes == 0 &&
@@ -1837,7 +1843,7 @@ static void cache_pressure_transition_test(int threads, int depth) {
                     "pressure fallback retained a cache pointer, hit counter, or new-slot reservation");
             write_limit(original);
             begin_cache(sink.get(), 1, 3, false); begin_cache(sink.get(), 1, 4);
-            cache_case("cache_pressure_transition_recovery", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
+            cache_case(inputs, "cache_pressure_transition_recovery", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
         }
         write_limit(original);
     } catch (...) { write_limit(original); throw; }
@@ -1845,7 +1851,7 @@ static void cache_pressure_transition_test(int threads, int depth) {
             partial, actual != path, original.c_str(), (unsigned long long) reduced);
 }
 
-static void cache_pressure_test(int threads, int depth, bool unbounded = false) {
+static void cache_pressure_test(fixture_inputs & inputs, int threads, int depth, bool unbounded = false) {
     // Run explicitly in a small dedicated scope, e.g. MemoryMax=1G. Never try
     // to manufacture pressure by filling the production 16 GiB envelope.
     std::ifstream groups("/proc/self/cgroup"); std::string line, path;
@@ -1865,26 +1871,26 @@ static void cache_pressure_test(int threads, int depth, bool unbounded = false) 
     }
     test_resources::need(unbounded ? !finite : constrained, unbounded ? "--cache-unbounded requires no finite cgroup ancestor" :
             "--cache-pressure requires a cgroup memory.max <= 2 GiB (use an independent 1 GiB scope)");
-    fixture f; make_synthetic(f); auto sink = make_sink(f, threads, depth);
+    fixture f; make_synthetic(f); auto sink = make_sink(inputs, f, threads, depth);
     std::vector<float> input(f.latent, .13f);
     configure_cache(sink.get(), 2 * triplet_bytes(f), { 1 }, 2);
     begin_cache(sink.get(), 1, 1);
-    cache_case("cache_pressure_bypass_correct", f, sink.get(), 1, input, { 1, 2 }, { .3f, .7f }, 0, 0);
+    cache_case(inputs, "cache_pressure_bypass_correct", f, sink.get(), 1, input, { 1, 2 }, { .3f, .7f }, 0, 0);
     auto stats = cache_snapshot(sink.get());
     require(stats.pressure_stops == 1 && stats.mapped_bytes == 0 && stats.committed_bytes == 0 && stats.valid_bytes == 0,
             "2 GiB reserve did not pause before allocating payload");
     begin_cache(sink.get(), 1, 2);
-    cache_case("cache_pressure_stays_paused", f, sink.get(), 1, input, { 1, 2 }, { .3f, .7f }, 0, 0);
+    cache_case(inputs, "cache_pressure_stays_paused", f, sink.get(), 1, input, { 1, 2 }, { .3f, .7f }, 0, 0);
     require(cache_snapshot(sink.get()).pressure_stops == 1, "paused cache retried admission every token");
     begin_cache(sink.get(), 1, 3, false);
     begin_cache(sink.get(), 1, 4);
-    cache_case("cache_pressure_prefill_resets_pause", f, sink.get(), 1, input, { 1, 2 }, { .3f, .7f }, 0, 0);
+    cache_case(inputs, "cache_pressure_prefill_resets_pause", f, sink.get(), 1, input, { 1, 2 }, { .3f, .7f }, 0, 0);
     stats = cache_snapshot(sink.get());
     require(stats.pressure_stops == 2 && stats.mapped_bytes == 0, "prefill did not allow a fresh headroom check");
     configure_cache(sink.get(), 594000000000, all_cache_layers(), 896);
     begin_cache(sink.get(), 2, 1);
     const auto before = anonymous_bytes();
-    cache_case("cache_pressure_large_metadata_bypass", f, sink.get(), 1, input, { 1, 2 }, { .3f, .7f }, 0, 0);
+    cache_case(inputs, "cache_pressure_large_metadata_bypass", f, sink.get(), 1, input, { 1, 2 }, { .3f, .7f }, 0, 0);
     require(cache_snapshot(sink.get()).pressure_stops == 1 && anonymous_bytes() < before + 16ull * 1024 * 1024,
             "small finite cgroup touched large slot metadata before headroom check");
     std::printf("CACHE_PRESSURE_OK pressure_stops=%llu mapped_bytes=%llu\n",
@@ -1916,19 +1922,19 @@ struct stderr_capture {
     }
 };
 
-static void trace_profile_test(int threads, int depth) {
-    require(setenv("GGML_KIMI_CPU_SINK_TRACE", "1", 1) == 0 &&
-            setenv("GGML_KIMI_CPU_SINK_PROFILE", "1", 1) == 0, "set observation environment");
+static void trace_profile_test(fixture_inputs & inputs, int threads, int depth) {
+    require(inputs.set("trace", "1") == 0 &&
+            inputs.set("profile", "1") == 0, "set observation environment");
     fixture f; make_synthetic(f);
-    auto sink = make_sink(f, threads, depth);
+    auto sink = make_sink(inputs, f, threads, depth);
     std::vector<float> input(f.latent, .13f);
     const std::vector<int32_t> ids = { 1, -1, 1, 2 };
     const std::vector<float> weights = { .2f, 0, .3f, .5f };
     stderr_capture log;
     begin_cache(sink.get(), 777, 8);
-    cache_case("trace_profile_token8", f, sink.get(), 1, input, ids, weights, 0, 0);
+    cache_case(inputs, "trace_profile_token8", f, sink.get(), 1, input, ids, weights, 0, 0);
     begin_cache(sink.get(), 777, 9);
-    cache_case("trace_profile_token9", f, sink.get(), 1, input, ids, weights, 0, 0);
+    cache_case(inputs, "trace_profile_token9", f, sink.get(), 1, input, ids, weights, 0, 0);
     begin_cache(sink.get(), 777, 10, false);
     begin_cache(sink.get(), 778, 1);
     // Invalid input must still have an error record, without stale expert IDs.
@@ -1997,14 +2003,14 @@ static void trace_profile_test(int threads, int depth) {
 // selects 5, 7 and 12. At depth 2, 5 and 6 are read and 5 is a hit; at depth 0 nothing is read, and the counts of
 // novel ranks and of novel ones selected are the same. One idle window: from layer 1's schedule (it reads nothing)
 // to layer 2's start. The decode trace gives each run's hint.
-static void prefetch_tests(int threads, int depth) {
+static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
     // the served scheduler (the launcher's profile), which the prefetch requires
-    for (const auto & kv : { std::pair<const char *, const char *>{ "GGML_KIMI_CPU_SINK_READY_FIRST", "1" },
-            { "GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "1" },
-            { "GGML_KIMI_CPU_SINK_ROLE_MAJOR", "1" }, { "GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", "1" },
-            { "GGML_KIMI_CPU_SINK_CACHE_POLICY", "lru" },
-            { "GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", "uniform" }, { "GGML_KIMI_CPU_SINK_TRACE", "1" } }) {
-        require(setenv(kv.first, kv.second, 1) == 0, "set prefetch test environment");
+    for (const auto & kv : { std::pair<const char *, const char *>{ "ready_first", "1" },
+            { "early_up_gate", "1" },
+            { "role_major", "1" }, { "nonblocking_down_sched", "1" },
+            { "cache_policy", "lru" },
+            { "cache_allocation", "uniform" }, { "trace", "1" } }) {
+        require(inputs.set(kv.first, kv.second) == 0, "set prefetch test environment");
     }
     fixture f; make_synthetic(f);
     const uint64_t unit = triplet_bytes(f);
@@ -2012,27 +2018,27 @@ static void prefetch_tests(int threads, int depth) {
     for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int(i % 19) - 9) * .021f; }
     // a depth up to the hint's width starts (a model's top-k may exceed 8), a deeper one is refused at start
     for (const int k : { 10, 65 }) {
-        require(setenv("GGML_KIMI_CPU_SINK_PREFETCH", std::to_string(k).c_str(), 1) == 0, "set prefetch depth");
+        require(inputs.set("prefetch_depth", std::to_string(k).c_str()) == 0, "set prefetch depth");
         char error[512] = {};
-        sink_ptr sink(kimi_cpu_sink_create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        sink_ptr sink(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
         require(k == 10 ? sink != nullptr : sink == nullptr && std::strstr(error, "must be 0..64"),
                 "prefetch depth " + std::to_string(k) + ": " + error);
     }
     for (const int k : { 2, 0 }) {
-        require(setenv("GGML_KIMI_CPU_SINK_PREFETCH", std::to_string(k).c_str(), 1) == 0, "set prefetch depth");
+        require(inputs.set("prefetch_depth", std::to_string(k).c_str()) == 0, "set prefetch depth");
         stderr_capture log;
         {
-            auto sink = make_sink(f, threads, depth);
+            auto sink = make_sink(inputs, f, threads, depth);
             configure_cache(sink.get(), 12 * unit, { 1, 2 }, 6);
             begin_cache(sink.get(), 1, 1);
-            cache_case("prefetch_warm_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
-            cache_case("prefetch_warm_layer2", f, sink.get(), 2, input, { 10, 11, 12, 13, 14, 15 },
+            cache_case(inputs, "prefetch_warm_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+            cache_case(inputs, "prefetch_warm_layer2", f, sink.get(), 2, input, { 10, 11, 12, 13, 14, 15 },
                 { .1f, .1f, .2f, .2f, .2f, .2f }, 0, 6);
             begin_cache(sink.get(), 1, 2);
             const int32_t hint[] = { 5, 6, 7, 12 };
             kimi_cpu_sink_prefetch_hint(sink.get(), 2, hint, 4);
-            cache_case("prefetch_hinted_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
-            cache_case("prefetch_predicted_layer2", f, sink.get(), 2, input, { 5, 7, 12 }, { .2f, .3f, .5f },
+            cache_case(inputs, "prefetch_hinted_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
+            cache_case(inputs, "prefetch_predicted_layer2", f, sink.get(), 2, input, { 5, 7, 12 }, { .2f, .3f, .5f },
                 k ? 2 : 1, -1);
         }
         std::istringstream lines(log.read());
@@ -2082,7 +2088,7 @@ static void prefetch_tests(int threads, int depth) {
         // needs, without timing assumptions. A prefetch lands only in resident slots, so both layers are warmed
         // first; the hinted run of layer 1 then has no reads of its own. A case's runs end with layer 2's, which
         // closes the window on the held reads; `after` follows with the hold. The prefetch report at destroy.
-        require(setenv("GGML_KIMI_CPU_SINK_PREFETCH", "2", 1) == 0, "set prefetch depth");
+        require(inputs.set("prefetch_depth", "2") == 0, "set prefetch depth");
         std::vector<uint64_t> offsets;
         for (int role = 0; role < 3; ++role) {
             kimi_cpu_sink_source source = {};
@@ -2092,20 +2098,20 @@ static void prefetch_tests(int threads, int depth) {
         auto spill_case = [&](const char * name, const std::vector<int32_t> & ids, size_t hits, auto && after) {
             stderr_capture log;
             {
-                auto sink = make_sink(f, threads, depth);
+                auto sink = make_sink(inputs, f, threads, depth);
                 pread_hold_guard hold(f.fd, offsets); // released before the sink's end waits for the reads
                 configure_cache(sink.get(), 12 * unit, { 1, 2 }, 6);
                 begin_cache(sink.get(), 1, 1);
-                cache_case("spill_warm_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
-                cache_case("spill_warm_layer2", f, sink.get(), 2, input, { 10, 11, 12, 13, 14, 15 },
+                cache_case(inputs, "spill_warm_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+                cache_case(inputs, "spill_warm_layer2", f, sink.get(), 2, input, { 10, 11, 12, 13, 14, 15 },
                     { .1f, .1f, .2f, .2f, .2f, .2f }, 0, 6);
                 begin_cache(sink.get(), 1, 2);
                 const int32_t hint[] = { 5, 6 };
                 kimi_cpu_sink_prefetch_hint(sink.get(), 2, hint, 2);
-                cache_case("spill_hinted_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
+                cache_case(inputs, "spill_hinted_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
                 hold.wait(3); // the readers run 6's three reads, so 5's are done
                 std::vector<float> weights(ids.size(), 1.0f / float(ids.size()));
-                cache_case(name, f, sink.get(), 2, input, ids, weights, hits, -1);
+                cache_case(inputs, name, f, sink.get(), 2, input, ids, weights, hits, -1);
                 after(sink.get(), hold);
             }
             std::istringstream lines(log.read());
@@ -2222,38 +2228,30 @@ static std::vector<float> reference_moe_graph(const fixture & f, int layer, cons
     return output;
 }
 
-struct activation_env_guard {
-    std::string name, saved;
-    bool had = false;
-    activation_env_guard(const char * key, const char * value) : name(key) {
-        if (const char * old = std::getenv(key)) { saved = old; had = true; }
-        if (value) { setenv(key, value, 1); } else { unsetenv(key); }
-    }
-    ~activation_env_guard() { if (had) { setenv(name.c_str(), saved.c_str(), 1); } else { unsetenv(name.c_str()); } }
-};
 
-static void elastic_cache_tests(int threads, int depth) {
-    activation_env_guard policy_env("GGML_KIMI_CPU_SINK_CACHE_POLICY", "count_decay2");
-    activation_env_guard allocation_env("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", "uniform");
-    activation_env_guard keep_env("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS", "1");
-    activation_env_guard elastic_env("GGML_KIMI_CPU_SINK_CACHE_ELASTIC", "1");
-    activation_env_guard partial_env("GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM", nullptr);
-    activation_env_guard prefill_env("GGML_KIMI_CPU_SINK_CACHE_PREFILL_SLOTS", "2");
-    activation_env_guard reserve_env("GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES", "536870912");
-    activation_env_guard quotas_env("GGML_KIMI_CPU_SINK_CACHE_LAYER_QUOTAS", nullptr);
+
+static void elastic_cache_tests(fixture_inputs & inputs, int threads, int depth) {
+    scoped_fixture_input policy_env(inputs, "cache_policy", "count_decay2");
+    scoped_fixture_input allocation_env(inputs, "cache_allocation", "uniform");
+    scoped_fixture_input keep_env(inputs, "cache_keep", "1");
+    scoped_fixture_input elastic_env(inputs, "cache_elastic", "1");
+    scoped_fixture_input partial_env(inputs, "cache_partial_reclaim", nullptr);
+    scoped_fixture_input prefill_env(inputs, "cache_prefill_slots", "2");
+    scoped_fixture_input reserve_env(inputs, "cache_reserve_bytes", "536870912");
+    scoped_fixture_input quotas_env(inputs, "cache_layer_quotas", nullptr);
 
     fixture f; make_synthetic(f);
     const uint64_t unit = triplet_bytes(f);
     std::vector<float> input(f.latent, .13f);
-    auto sink = make_sink(f, threads, depth);
+    auto sink = make_sink(inputs, f, threads, depth);
     configure_cache(sink.get(), 6 * unit, { 1, 2 }, 3);
     begin_cache(sink.get(), 71, 1);
-    cache_case("elastic_layer1_warm", f, sink.get(), 1, input, { 1, 2, 3 }, { .5f, .3f, .2f }, 0, 3);
-    cache_case("elastic_layer2_warm", f, sink.get(), 2, input, { 4, 5, 6 }, { .5f, .3f, .2f }, 0, 3);
+    cache_case(inputs, "elastic_layer1_warm", f, sink.get(), 1, input, { 1, 2, 3 }, { .5f, .3f, .2f }, 0, 3);
+    cache_case(inputs, "elastic_layer2_warm", f, sink.get(), 2, input, { 4, 5, 6 }, { .5f, .3f, .2f }, 0, 3);
     for (uint64_t token = 2; token <= 5; ++token) {
         begin_cache(sink.get(), 71, token);
-        cache_case("elastic_layer1_train_hot", f, sink.get(), 1, input, { 1 }, { 1 }, 1, 0);
-        cache_case("elastic_layer2_train_hot", f, sink.get(), 2, input, { 4 }, { 1 }, 1, 0);
+        cache_case(inputs, "elastic_layer1_train_hot", f, sink.get(), 1, input, { 1 }, { 1 }, 1, 0);
+        cache_case(inputs, "elastic_layer2_train_hot", f, sink.get(), 2, input, { 4 }, { 1 }, 1, 0);
     }
     const auto warm = cache_snapshot(sink.get());
     require(warm.mapped_bytes == 6 * unit && warm.enabled_bytes == 6 * unit &&
@@ -2271,84 +2269,84 @@ static void elastic_cache_tests(int threads, int depth) {
     require(grown.enabled_bytes == 6 * unit && grown.committed_bytes == 2 * unit &&
             grown.valid_bytes == 2 * unit && grown.phase_grows == 1,
             "elastic decode grow prefaulted or lost retained entries");
-    cache_case("elastic_layer1_hot_survives", f, sink.get(), 1, input, { 1 }, { 1 }, 1, 0);
-    cache_case("elastic_layer2_hot_survives", f, sink.get(), 2, input, { 4 }, { 1 }, 1, 0);
+    cache_case(inputs, "elastic_layer1_hot_survives", f, sink.get(), 1, input, { 1 }, { 1 }, 1, 0);
+    cache_case(inputs, "elastic_layer2_hot_survives", f, sink.get(), 2, input, { 4 }, { 1 }, 1, 0);
     begin_cache(sink.get(), 71, 2);
-    cache_case("elastic_layer1_refault", f, sink.get(), 1, input, { 2, 3 }, { .6f, .4f }, 0, 2);
-    cache_case("elastic_layer2_refault", f, sink.get(), 2, input, { 5, 6 }, { .6f, .4f }, 0, 2);
+    cache_case(inputs, "elastic_layer1_refault", f, sink.get(), 1, input, { 2, 3 }, { .6f, .4f }, 0, 2);
+    cache_case(inputs, "elastic_layer2_refault", f, sink.get(), 2, input, { 5, 6 }, { .6f, .4f }, 0, 2);
     const auto refilled = cache_snapshot(sink.get());
     require(refilled.committed_bytes == 6 * unit && refilled.valid_bytes == 6 * unit &&
             refilled.refaulted_bytes == 4 * unit && refilled.page_table_bytes == warm.page_table_bytes,
             "elastic decode did not account released-slot direct-read refaults");
 
     {
-        activation_env_guard zero_prefill("GGML_KIMI_CPU_SINK_CACHE_PREFILL_SLOTS", "0");
-        auto zero = make_sink(f, threads, depth);
+        scoped_fixture_input zero_prefill(inputs, "cache_prefill_slots", "0");
+        auto zero = make_sink(inputs, f, threads, depth);
         configure_cache(zero.get(), 2 * unit, { 1, 2 }, 1);
         begin_cache(zero.get(), 72, 1);
-        cache_case("elastic_zero_layer1_warm", f, zero.get(), 1, input, { 1 }, { 1 }, 0, 1);
-        cache_case("elastic_zero_layer2_warm", f, zero.get(), 2, input, { 4 }, { 1 }, 0, 1);
+        cache_case(inputs, "elastic_zero_layer1_warm", f, zero.get(), 1, input, { 1 }, { 1 }, 0, 1);
+        cache_case(inputs, "elastic_zero_layer2_warm", f, zero.get(), 2, input, { 4 }, { 1 }, 0, 1);
         begin_cache(zero.get(), 72, 0, false);
         const auto empty = cache_snapshot(zero.get());
         require(empty.mapped_bytes == 2 * unit && !empty.enabled_bytes && !empty.committed_bytes &&
                 !empty.valid_bytes && empty.released_bytes == 2 * unit,
                 "elastic zero-prefill arm unmapped or retained resident payload");
         begin_cache(zero.get(), 72, 1);
-        cache_case("elastic_zero_decode_refault", f, zero.get(), 1, input, { 1 }, { 1 }, 0, 1);
+        cache_case(inputs, "elastic_zero_decode_refault", f, zero.get(), 1, input, { 1 }, { 1 }, 0, 1);
         require(cache_snapshot(zero.get()).refaulted_bytes == unit,
                 "elastic zero-prefill arm did not refault through direct admission");
     }
 
     auto rejected = [&](const char * message) {
         char error[512] = {};
-        sink_ptr value(kimi_cpu_sink_create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        sink_ptr value(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
         require(!value && error[0], message);
     };
     {
-        activation_env_guard bad("GGML_KIMI_CPU_SINK_CACHE_ELASTIC", "2");
+        scoped_fixture_input bad(inputs, "cache_elastic", "2");
         rejected("invalid CACHE_ELASTIC was accepted");
     }
     {
-        activation_env_guard off("GGML_KIMI_CPU_SINK_CACHE_ELASTIC", "0");
-        activation_env_guard no_prefill("GGML_KIMI_CPU_SINK_CACHE_PREFILL_SLOTS", nullptr);
-        activation_env_guard bad("GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM", "2");
+        scoped_fixture_input off(inputs, "cache_elastic", "0");
+        scoped_fixture_input no_prefill(inputs, "cache_prefill_slots", nullptr);
+        scoped_fixture_input bad(inputs, "cache_partial_reclaim", "2");
         rejected("invalid CACHE_PARTIAL_RECLAIM was accepted");
     }
     {
-        activation_env_guard missing("GGML_KIMI_CPU_SINK_CACHE_PREFILL_SLOTS", nullptr);
+        scoped_fixture_input missing(inputs, "cache_prefill_slots", nullptr);
         rejected("elastic cache without CACHE_PREFILL_SLOTS was accepted");
     }
     {
-        activation_env_guard priority("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", "priority");
+        scoped_fixture_input priority(inputs, "cache_allocation", "priority");
         rejected("elastic cache with priority allocation was accepted");
     }
     {
-        activation_env_guard quotas("GGML_KIMI_CPU_SINK_CACHE_LAYER_QUOTAS", "1:1,2:1");
+        scoped_fixture_input quotas(inputs, "cache_layer_quotas", "1:1,2:1");
         rejected("elastic cache with fixed layer quotas was accepted");
     }
     {
-        activation_env_guard off("GGML_KIMI_CPU_SINK_CACHE_ELASTIC", "0");
-        activation_env_guard no_prefill("GGML_KIMI_CPU_SINK_CACHE_PREFILL_SLOTS", nullptr);
-        activation_env_guard partial("GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM", "1");
-        activation_env_guard priority("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", "priority");
+        scoped_fixture_input off(inputs, "cache_elastic", "0");
+        scoped_fixture_input no_prefill(inputs, "cache_prefill_slots", nullptr);
+        scoped_fixture_input partial(inputs, "cache_partial_reclaim", "1");
+        scoped_fixture_input priority(inputs, "cache_allocation", "priority");
         rejected("partial reclaim with priority allocation was accepted");
     }
     {
-        activation_env_guard off("GGML_KIMI_CPU_SINK_CACHE_ELASTIC", "0");
-        activation_env_guard no_prefill("GGML_KIMI_CPU_SINK_CACHE_PREFILL_SLOTS", nullptr);
-        activation_env_guard partial("GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM", "1");
-        activation_env_guard quotas("GGML_KIMI_CPU_SINK_CACHE_LAYER_QUOTAS", "1:1,2:1");
+        scoped_fixture_input off(inputs, "cache_elastic", "0");
+        scoped_fixture_input no_prefill(inputs, "cache_prefill_slots", nullptr);
+        scoped_fixture_input partial(inputs, "cache_partial_reclaim", "1");
+        scoped_fixture_input quotas(inputs, "cache_layer_quotas", "1:1,2:1");
         rejected("partial reclaim with fixed layer quotas was accepted");
     }
     {
-        activation_env_guard off("GGML_KIMI_CPU_SINK_CACHE_ELASTIC", "0");
+        scoped_fixture_input off(inputs, "cache_elastic", "0");
         rejected("CACHE_PREFILL_SLOTS without elastic mode was accepted");
     }
     std::printf("ELASTIC_CACHE_OK max_slots=6 prefill_slots=2 zero_slots=0 reserve_bytes=536870912\n");
 }
 
 // Strict bitwise comparison with the MoE graph at one and four threads.
-static std::vector<float> activation_case(const char * name, fixture & f, kimi_cpu_sink * sink, int layer,
+static std::vector<float> activation_case(fixture_inputs & inputs, const char * name, fixture & f, kimi_cpu_sink * sink, int layer,
         const std::vector<float> & input, const std::vector<int32_t> & ids, const std::vector<float> & weights,
         const kimi_cpu_sink_activation & activation, size_t hits = 0, int admitted = -1) {
     tensors meta(f, layer);
@@ -2357,13 +2355,13 @@ static std::vector<float> activation_case(const char * name, fixture & f, kimi_c
     require(!std::memcmp(expected.data(), threaded.data(), expected.size() * sizeof(float)),
             std::string(name) + ": MoE reference output depends on its thread count");
     std::vector<float> exact;
-    const auto result = run_checked(name, f, sink, meta, input, ids, weights, expected, layer, 25.0f,
+    const auto result = run_checked(inputs, name, f, sink, meta, input, ids, weights, expected, layer, 25.0f,
             hits, admitted, &exact, &activation);
     print_sample(name, result);
     return exact;
 }
 
-static void q2_activation_test(int threads, int depth) {
+static void q2_activation_test(fixture_inputs & inputs, int threads, int depth) {
     const kimi_cpu_sink_activation clamp = {
         KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f
     };
@@ -2383,8 +2381,8 @@ static void q2_activation_test(int threads, int depth) {
     }
     const std::vector<int32_t> top6 = { 17, 0, 8, 2, 19, 4 };
     const std::vector<float> weights = { .3f, .25f, .15f, .12f, .1f, .08f };
-    auto sink = make_sink(q2, threads, depth);
-    activation_case("iq2_xxs_up_gate_q2k_down_swiglu_clamp", q2, sink.get(), 1,
+    auto sink = make_sink(inputs, q2, threads, depth);
+    activation_case(inputs, "iq2_xxs_up_gate_q2k_down_swiglu_clamp", q2, sink.get(), 1,
             input, top6, weights, clamp);
     std::printf("DSV41_Q2_CPU_SINK_DECODE_OK threads=%d ring_experts=%d\n", threads, depth);
 }
@@ -2426,14 +2424,14 @@ static uint64_t host_room() {
     }
     return finite ? room : 0;
 }
-static void cache_load_tests(int threads, int depth) {
-    activation_env_guard policy_env("GGML_KIMI_CPU_SINK_CACHE_POLICY", "lru");
-    activation_env_guard allocation_env("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", "uniform");
-    activation_env_guard keep_env("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS", "1");
-    activation_env_guard partial_env("GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM", "1");
-    activation_env_guard elastic_env("GGML_KIMI_CPU_SINK_CACHE_ELASTIC", nullptr);
-    activation_env_guard prefill_env("GGML_KIMI_CPU_SINK_CACHE_PREFILL_SLOTS", nullptr);
-    activation_env_guard quotas_env("GGML_KIMI_CPU_SINK_CACHE_LAYER_QUOTAS", nullptr);
+static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
+    scoped_fixture_input policy_env(inputs, "cache_policy", "lru");
+    scoped_fixture_input allocation_env(inputs, "cache_allocation", "uniform");
+    scoped_fixture_input keep_env(inputs, "cache_keep", "1");
+    scoped_fixture_input partial_env(inputs, "cache_partial_reclaim", "1");
+    scoped_fixture_input elastic_env(inputs, "cache_elastic", nullptr);
+    scoped_fixture_input prefill_env(inputs, "cache_prefill_slots", nullptr);
+    scoped_fixture_input quotas_env(inputs, "cache_layer_quotas", nullptr);
     fixture f; f.native_ranges = true; make_synthetic(f);
     uint64_t stride = 0; // a role as a decode request reserves it: its bytes and a page prefix, in whole pages
     for (int role = 0; role < 3; ++role) { stride += (f.entries.at({ tensor_name(1, role), 0 }).raw_bytes + 8190) / 4096 * 4096; }
@@ -2449,7 +2447,7 @@ static void cache_load_tests(int threads, int depth) {
             if (line.rfind("[kimi_cpu_sink_cache] reason=load ", 0) == 0) { *receipt = line; }
         }
     };
-    auto a = make_sink(f, threads, depth), b = make_sink(f, threads, depth);
+    auto a = make_sink(inputs, f, threads, depth), b = make_sink(inputs, f, threads, depth);
     configure_cache(a.get(), 12 * stride, { 1, 2 }, 6);
     configure_cache(b.get(), 12 * stride, { 1, 2 }, 6);
     std::string receipt;
@@ -2467,7 +2465,7 @@ static void cache_load_tests(int threads, int depth) {
                    const std::vector<float> & weights, size_t hits, size_t admitted, std::vector<float> * out) {
         tensors meta(f, layer);
         const auto expected = reference(f, layer, input, ids, weights, 4, 25);
-        const auto r = run_checked(name, f, sink, meta, input, ids, weights, expected, layer, 25, hits, -1, out);
+        const auto r = run_checked(inputs, name, f, sink, meta, input, ids, weights, expected, layer, 25, hits, -1, out);
         require(r.stats.cache_admitted == admitted && r.stats.cache_admitted_bytes == admitted * stride,
                 std::string(name) + ": cache admission count mismatch");
         return r;
@@ -2494,9 +2492,9 @@ static void cache_load_tests(int threads, int depth) {
             "the load step's geometry is not the decode's, or decode mapped again");
     {
         // an elastic prefill keeps 4 slots: the load step's others go back (MADV_DONTNEED) and come back by refault
-        activation_env_guard elastic("GGML_KIMI_CPU_SINK_CACHE_ELASTIC", "1");
-        activation_env_guard prefill("GGML_KIMI_CPU_SINK_CACHE_PREFILL_SLOTS", "4");
-        auto c = make_sink(f, threads, depth);
+        scoped_fixture_input elastic(inputs, "cache_elastic", "1");
+        scoped_fixture_input prefill(inputs, "cache_prefill_slots", "4");
+        auto c = make_sink(inputs, f, threads, depth);
         configure_cache(c.get(), 12 * stride, { 1, 2 }, 6);
         load(c.get(), &receipt);
         begin_cache(c.get(), 10, 1, false);
@@ -2518,9 +2516,9 @@ static void cache_load_tests(int threads, int depth) {
     for (const bool automatic : { false, true }) {
         // an allocation larger than the cgroup during the first prefill takes every load-time slot back (the ledger's
         // partial reclaim); the room is back by the first decode token, which enables them again
-        activation_env_guard policy("GGML_KIMI_CPU_SINK_CACHE_POLICY", automatic ? "count_decay2" : "lru");
+        scoped_fixture_input policy(inputs, "cache_policy", automatic ? "count_decay2" : "lru");
         const std::string kind = automatic ? "automatic budget: " : "fixed budget: ";
-        auto d = make_sink(f, threads, depth);
+        auto d = make_sink(inputs, f, threads, depth);
         configure_cache(d.get(), automatic ? std::numeric_limits<uint64_t>::max() : 12 * stride, { 1, 2 }, 6);
         load(d.get(), &receipt);
         require(cache_snapshot(d.get()).committed_bytes == 12 * stride, kind + "the load step did not commit 12 slots");
@@ -2581,10 +2579,10 @@ static void cache_load_tests(int threads, int depth) {
         const uint64_t ring = uint64_t(depth) * slot, room = host_room();
         test_resources::need(room > ring + 7 * cost + (1ull << 30), "the owed slots' case needs a finite cgroup with room");
         // geometry sees 6.5 slots of room, after the read ring the load step resizes first
-        activation_env_guard reserve_env("GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES",
+        scoped_fixture_input reserve_env(inputs, "cache_reserve_bytes",
             std::to_string(room - ring - 13 * cost / 2).c_str());
         const uint64_t reserve = room - ring - 13 * cost / 2;
-        auto g = make_sink(big, threads, depth);
+        auto g = make_sink(inputs, big, threads, depth);
         configure_cache(g.get(), std::numeric_limits<uint64_t>::max(), { 1, 2 }, 6);
         std::vector<char> drift, pad;
         std::string capacity, loaded;
@@ -2645,7 +2643,7 @@ static void cache_load_tests(int threads, int depth) {
         // compute buffers take their room in one give-back at its start; its later checks keep the rest; the first
         // decode token takes the slots back. File pages count as room (CACHE_RECLAIMABLE_FILE), so the hold alone
         // keeps the pages' room. Experts of 51 MiB keep the process's own movements far below a slot.
-        activation_env_guard file_env("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE", "1");
+        scoped_fixture_input file_env(inputs, "cache_reclaimable_file", "1");
         auto number = [](const std::string & line, const std::string & key) {
             const size_t at = line.find(" " + key + "=");
             require(at != std::string::npos, "the receipt lacks " + key + ": " + line);
@@ -2654,7 +2652,7 @@ static void cache_load_tests(int threads, int depth) {
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
         const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096, slot = 3 * role;
-        auto h = make_sink(big, threads, depth);
+        auto h = make_sink(inputs, big, threads, depth);
         configure_cache(h.get(), 6 * slot, { 1, 2 }, 6);
         {
             tensors meta(big, 1);
@@ -2665,7 +2663,7 @@ static void cache_load_tests(int threads, int depth) {
         require(cache_snapshot(h.get()).committed_bytes == 6 * slot, "prefill room: the load step did not commit 6 slots");
         begin_cache(h.get(), 13, 1, false);
         kimi_host_ledger probe;
-        probe.configure(false);
+        inputs.configure(probe, false);
         const uint64_t room = probe.measure(0).surplus(), pages = room + 5 * slot / 2, host = 1 << 20;
         require(room != UINT64_MAX && room > 0, "prefill room: no finite room to measure");
         std::string line;
@@ -2702,7 +2700,7 @@ static void cache_load_tests(int threads, int depth) {
     {
         // The load step with a prefill's pages held (the load-time graph's): the arena has the slots the first decode
         // token would size, the slots committed leave the pages' room, and those are owed at the first decode token.
-        activation_env_guard file_env("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE", "1");
+        scoped_fixture_input file_env(inputs, "cache_reclaimable_file", "1");
         auto number = [](const std::string & line, const std::string & key) {
             const size_t at = line.find(" " + key + "=");
             require(at != std::string::npos, "the receipt lacks " + key + ": " + line);
@@ -2713,12 +2711,12 @@ static void cache_load_tests(int threads, int depth) {
         const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096, slot = 3 * role;
         const uint64_t cost = slot + slot / 128, ring = uint64_t(depth) * slot;
         kimi_host_ledger probe;
-        probe.configure(false);
+        inputs.configure(probe, false);
         const uint64_t room = probe.measure(0).surplus() + probe.reserve;
         require(room != UINT64_MAX && room > ring + 7 * cost + (1ull << 30), "load hold: the case needs a finite cgroup with room");
         // geometry sees 6.5 slots of room after the read ring; the hold takes 3 of them
-        activation_env_guard reserve_env("GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES", std::to_string(room - ring - 13 * cost / 2).c_str());
-        auto g = make_sink(big, threads, depth);
+        scoped_fixture_input reserve_env(inputs, "cache_reserve_bytes", std::to_string(room - ring - 13 * cost / 2).c_str());
+        auto g = make_sink(inputs, big, threads, depth);
         configure_cache(g.get(), std::numeric_limits<uint64_t>::max(), { 1, 2 }, 6);
         std::string loaded;
         {
@@ -2749,11 +2747,11 @@ static void cache_load_tests(int threads, int depth) {
         // The load step only for a cache that can give room back to the first prefill's ledger requests: without
         // partial reclaim and without elastic, nothing at load, and the first decode token sizes and pages the cache
         // as without the hook; elastic alone takes the load step (its prefill shrinks to the prefill slots).
-        activation_env_guard partial("GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM", nullptr);
-        activation_env_guard elastic_env("GGML_KIMI_CPU_SINK_CACHE_ELASTIC", elastic ? "1" : nullptr);
-        activation_env_guard prefill("GGML_KIMI_CPU_SINK_CACHE_PREFILL_SLOTS", elastic ? "4" : nullptr);
+        scoped_fixture_input partial(inputs, "cache_partial_reclaim", nullptr);
+        scoped_fixture_input elastic_env(inputs, "cache_elastic", elastic ? "1" : nullptr);
+        scoped_fixture_input prefill(inputs, "cache_prefill_slots", elastic ? "4" : nullptr);
         const std::string kind = elastic ? "elastic, no partial reclaim: " : "no partial reclaim, no elastic: ";
-        auto e = make_sink(f, threads, depth);
+        auto e = make_sink(inputs, f, threads, depth);
         configure_cache(e.get(), 12 * stride, { 1, 2 }, 6);
         std::string line;
         load(e.get(), &line);
@@ -2773,7 +2771,7 @@ static void cache_load_tests(int threads, int depth) {
         // An automatic budget without partial reclaim or elastic: the read ring is not made resident at load either (the
         // first decode charges it). Experts of 51 MiB (Q8_0 4096 x 4096, no file) make the ring's pages, a slot for each
         // of the depth's reads, show in the process's resident memory.
-        activation_env_guard partial("GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM", nullptr);
+        scoped_fixture_input partial(inputs, "cache_partial_reclaim", nullptr);
         auto resident = [] {
             std::ifstream statm("/proc/self/statm");
             uint64_t size = 0, pages = 0;
@@ -2783,7 +2781,7 @@ static void cache_load_tests(int threads, int depth) {
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
         const uint64_t slot = 3 * ((ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096);
-        auto r = make_sink(big, threads, depth);
+        auto r = make_sink(inputs, big, threads, depth);
         configure_cache(r.get(), std::numeric_limits<uint64_t>::max(), { 1, 2 }, 6);
         tensors meta(big, 1);
         char error[512] = {};
@@ -2808,7 +2806,7 @@ static void cache_load_tests(int threads, int depth) {
             (unsigned long long) first_touch, receipt.c_str());
 }
 
-static void activation_tests(int threads, int depth) {
+static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
     const kimi_cpu_sink_activation clamp10 = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 10.0f };
     const kimi_cpu_sink_activation clamp = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f };
     const kimi_cpu_sink_activation situ = { KIMI_CPU_SINK_ACTIVATION_SITU, 4.0f, 25.0f, 0.0f };
@@ -2819,43 +2817,43 @@ static void activation_tests(int threads, int depth) {
     std::vector<float> input(f.latent); for (auto & v : input) { v = sample(rng); }
     const std::vector<int32_t> top6 = { 17, 0, 8, 2, 19, 4 };
     const std::vector<float> w6 = { .3f, .25f, .15f, .12f, .1f, .08f };
-    auto sink = make_sink(f, threads, depth);
-    const auto wide = activation_case("mxfp4_swiglu_clamp_top6_limit10", f, sink.get(), 1, input, top6, w6, clamp10);
-    const auto narrow = activation_case("mxfp4_swiglu_clamp_top6_limit075", f, sink.get(), 1, input, top6, w6, clamp);
+    auto sink = make_sink(inputs, f, threads, depth);
+    const auto wide = activation_case(inputs, "mxfp4_swiglu_clamp_top6_limit10", f, sink.get(), 1, input, top6, w6, clamp10);
+    const auto narrow = activation_case(inputs, "mxfp4_swiglu_clamp_top6_limit075", f, sink.get(), 1, input, top6, w6, clamp);
     require(std::memcmp(wide.data(), narrow.data(), wide.size() * sizeof(float)) != 0,
             "the clamp limit did not change the output; the fixture does not exercise clamping");
-    activation_case("mxfp4_swiglu_clamp_one_expert", f, sink.get(), 2, input, { 3 }, { 1.5f }, clamp);
-    activation_case("mxfp4_swiglu_clamp_duplicate_ids", f, sink.get(), 2, input, { 9, 2, 9 }, { .5f, .3f, .2f }, clamp);
+    activation_case(inputs, "mxfp4_swiglu_clamp_one_expert", f, sink.get(), 2, input, { 3 }, { 1.5f }, clamp);
+    activation_case(inputs, "mxfp4_swiglu_clamp_duplicate_ids", f, sink.get(), 2, input, { 9, 2, 9 }, { .5f, .3f, .2f }, clamp);
     const std::vector<int32_t> top16 = { 17, 0, 8, 2, 19, 4, 11, 6, 15, 1, 13, 7, 18, 5, 10, 9 };
     std::vector<float> w16(16); for (int i = 0; i < 16; ++i) { w16[i] = float(16 - i) / 136; }
-    activation_case("mxfp4_swiglu_clamp_top16", f, sink.get(), 1, input, top16, w16, clamp);
-    activation_case("mxfp4_situ", f, sink.get(), 1, input, top6, w6, situ);
+    activation_case(inputs, "mxfp4_swiglu_clamp_top16", f, sink.get(), 1, input, top16, w16, clamp);
+    activation_case(inputs, "mxfp4_situ", f, sink.get(), 1, input, top6, w6, situ);
     for (int repeat = 0; repeat < 4; ++repeat) {
-        activation_case("mxfp4_swiglu_clamp_layer_generation_reuse", f, sink.get(), repeat % 2 + 1, input, top6, w6, clamp);
+        activation_case(inputs, "mxfp4_swiglu_clamp_layer_generation_reuse", f, sink.get(), repeat % 2 + 1, input, top6, w6, clamp);
         input[size_t(repeat)] += .25f;
     }
-    const auto uncached = activation_case("mxfp4_swiglu_clamp_uncached", f, sink.get(), 1, input, top6, w6, clamp);
+    const auto uncached = activation_case(inputs, "mxfp4_swiglu_clamp_uncached", f, sink.get(), 1, input, top6, w6, clamp);
 
     // RAM cache (count_decay2 as in the V4.1 recipe, and window): cold direct
     // admission, full and partial hits stay bit-identical to the graph.
     const uint64_t unit = triplet_bytes(f);
     for (const char * policy : { "count_decay2", "window" }) {
-        activation_env_guard policy_env("GGML_KIMI_CPU_SINK_CACHE_POLICY", policy);
-        activation_env_guard keep_env("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS", nullptr);
-        activation_env_guard allocation_env("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", nullptr);
+        scoped_fixture_input policy_env(inputs, "cache_policy", policy);
+        scoped_fixture_input keep_env(inputs, "cache_keep", nullptr);
+        scoped_fixture_input allocation_env(inputs, "cache_allocation", nullptr);
         const bool window = !std::strcmp(policy, "window");
-        auto cached = make_sink(f, threads, depth);
+        auto cached = make_sink(inputs, f, threads, depth);
         configure_cache(cached.get(), 6 * unit, { 1, 2 }, 6);
         begin_cache(cached.get(), 41, 1);
-        const auto cold = activation_case("mxfp4_cache_cold", f, cached.get(), 1, input, top6, w6, clamp, 0, 6);
+        const auto cold = activation_case(inputs, "mxfp4_cache_cold", f, cached.get(), 1, input, top6, w6, clamp, 0, 6);
         begin_cache(cached.get(), 41, 2);
-        const auto hit = activation_case("mxfp4_cache_full_hit", f, cached.get(), 1, input, top6, w6, clamp, 6, 0);
+        const auto hit = activation_case(inputs, "mxfp4_cache_full_hit", f, cached.get(), 1, input, top6, w6, clamp, 6, 0);
         require(!std::memcmp(cold.data(), uncached.data(), cold.size() * sizeof(float)) &&
                 !std::memcmp(hit.data(), uncached.data(), hit.size() * sizeof(float)),
                 "RAM cache changed an output bit");
         begin_cache(cached.get(), 41, 3);
         // count_decay2 bypasses admission of the less frequent new experts.
-        activation_case("mxfp4_cache_partial_hit", f, cached.get(), 1, input, { 17, 3, 8, 12, 19, 5 }, w6, clamp,
+        activation_case(inputs, "mxfp4_cache_partial_hit", f, cached.get(), 1, input, { 17, 3, 8, 12, 19, 5 }, w6, clamp,
                 3, window ? 3 : 0);
         std::printf("case=mxfp4_cache_policy policy=%s status=PASS\n", policy);
     }
@@ -2863,21 +2861,21 @@ static void activation_tests(int threads, int depth) {
         // Opt-in reclaimable page-cache accounting: invalid values fail at
         // create; enabled admission and hits stay bit-identical.
         for (const char * bad : { "", "2", "yes" }) {
-            activation_env_guard env("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE", bad);
+            scoped_fixture_input env(inputs, "cache_reclaimable_file", bad);
             char error[512] = {};
-            sink_ptr rejected(kimi_cpu_sink_create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+            sink_ptr rejected(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
             require(!rejected && error[0], "invalid CACHE_RECLAIMABLE_FILE was accepted");
         }
-        activation_env_guard reclaim_env("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE", "1");
-        activation_env_guard policy_env("GGML_KIMI_CPU_SINK_CACHE_POLICY", "count_decay2");
-        activation_env_guard keep_env("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS", nullptr);
-        activation_env_guard allocation_env("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", nullptr);
-        auto cached = make_sink(f, threads, depth);
+        scoped_fixture_input reclaim_env(inputs, "cache_reclaimable_file", "1");
+        scoped_fixture_input policy_env(inputs, "cache_policy", "count_decay2");
+        scoped_fixture_input keep_env(inputs, "cache_keep", nullptr);
+        scoped_fixture_input allocation_env(inputs, "cache_allocation", nullptr);
+        auto cached = make_sink(inputs, f, threads, depth);
         configure_cache(cached.get(), 6 * unit, { 1, 2 }, 6);
         begin_cache(cached.get(), 43, 1);
-        const auto cold = activation_case("mxfp4_cache_reclaimable_file_cold", f, cached.get(), 1, input, top6, w6, clamp, 0, 6);
+        const auto cold = activation_case(inputs, "mxfp4_cache_reclaimable_file_cold", f, cached.get(), 1, input, top6, w6, clamp, 0, 6);
         begin_cache(cached.get(), 43, 2);
-        const auto hit = activation_case("mxfp4_cache_reclaimable_file_hit", f, cached.get(), 1, input, top6, w6, clamp, 6, 0);
+        const auto hit = activation_case(inputs, "mxfp4_cache_reclaimable_file_hit", f, cached.get(), 1, input, top6, w6, clamp, 6, 0);
         require(!std::memcmp(cold.data(), uncached.data(), cold.size() * sizeof(float)) &&
                 !std::memcmp(hit.data(), uncached.data(), hit.size() * sizeof(float)),
                 "reclaimable-file cache changed an output bit");
@@ -2886,14 +2884,14 @@ static void activation_tests(int threads, int depth) {
     // Other trait-selected type combinations.
     fixture mixed; mixed.type = GGML_TYPE_MXFP4; mixed.down_type = GGML_TYPE_Q8_0;
     mixed.latent = 320; mixed.hidden = 224; make_synthetic(mixed, 20260915);
-    auto mixed_sink = make_sink(mixed, threads, depth);
-    activation_case("mxfp4_up_gate_q8_0_down_swiglu_clamp", mixed, mixed_sink.get(), 1, input, top6, w6, clamp);
+    auto mixed_sink = make_sink(inputs, mixed, threads, depth);
+    activation_case(inputs, "mxfp4_up_gate_q8_0_down_swiglu_clamp", mixed, mixed_sink.get(), 1, input, top6, w6, clamp);
     fixture q3; make_synthetic(q3, 20260916);
     std::vector<float> q3_input(q3.latent); for (auto & v : q3_input) { v = sample(rng); }
-    auto q3_sink = make_sink(q3, threads, depth);
-    activation_case("q3k_swiglu_clamp", q3, q3_sink.get(), 1, q3_input, top6, w6, clamp);
-    activation_case("q3k_situ_moe_graph", q3, q3_sink.get(), 2, q3_input, top6, w6, situ);
-    q2_activation_test(threads, depth);
+    auto q3_sink = make_sink(inputs, q3, threads, depth);
+    activation_case(inputs, "q3k_swiglu_clamp", q3, q3_sink.get(), 1, q3_input, top6, w6, clamp);
+    activation_case(inputs, "q3k_situ_moe_graph", q3, q3_sink.get(), 2, q3_input, top6, w6, situ);
+    q2_activation_test(inputs, threads, depth);
 
     // Invalid activations and up/gate type mismatches fail before any I/O.
     tensors meta(f, 1);
@@ -2901,7 +2899,7 @@ static void activation_tests(int threads, int depth) {
     const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
     kimi_cpu_sink_activation unbounded = clamp;
     unbounded.swiglu_limit = inf;
-    activation_case("mxfp4_swiglu_unbounded", f, sink.get(), 1, input, top6, w6, unbounded);
+    activation_case(inputs, "mxfp4_swiglu_unbounded", f, sink.get(), 1, input, top6, w6, unbounded);
     int refusals = 0;
     for (const auto & bad : { kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, 0 },
                               kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, 1e-7f },
@@ -2967,7 +2965,7 @@ static void activation_tests(int threads, int depth) {
         std::printf("DSV41_MXFP4_CPU_PREFILL_OK tokens=2 experts=%llu\n",
                 (unsigned long long) stats.stream.experts);
     }
-    activation_case("mxfp4_swiglu_clamp_after_refusals", f, sink.get(), 1, input, top6, w6, clamp10);
+    activation_case(inputs, "mxfp4_swiglu_clamp_after_refusals", f, sink.get(), 1, input, top6, w6, clamp10);
     std::printf("CPU_SINK_ACTIVATION_OK threads=%d ring_experts=%d refusals=%d\n", threads, depth, refusals);
 }
 
@@ -2978,8 +2976,8 @@ static void activation_tests(int threads, int depth) {
 // Native Muse expert semantics against an independent ordinary ggml MoE graph. Different
 // norm weights/epsilons and >64-token prefill catch normalization after the sum,
 // missing norm weights, and both grouped accumulation paths.
-static void muse_expert_norm_test(int threads, int depth, ggml_type type, bool native_ranges = false) {
-    activation_env_guard ready("GGML_KIMI_CPU_SINK_READY_FIRST", "1");
+static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int depth, ggml_type type, bool native_ranges = false) {
+    scoped_fixture_input ready(inputs, "ready_first", "1");
     fixture f; f.type = f.down_type = type; make_synthetic(f, 20261017);
     if (native_ranges) {
         // Rebuild a tiny native-weight source with mixed zero/128-byte page prefixes and
@@ -3001,7 +2999,7 @@ static void muse_expert_norm_test(int threads, int depth, ggml_type type, bool n
         f.fd = test_resources::open_direct(f.path);
         f.native_ranges = true;
     }
-    auto sink = make_sink(f, threads, depth);
+    auto sink = make_sink(inputs, f, threads, depth);
     tensors meta(f, 1);
     std::vector<float> norm(f.latent), input(f.latent);
     for (int row = 0; row < f.latent; ++row) {
@@ -3068,8 +3066,8 @@ static void muse_expert_norm_test(int threads, int depth, ggml_type type, bool n
             if (token == 2) { require(stats.cache_hits == 8 && stats.read_requests == 0, "native offset cache hit lost its payload prefix"); }
         }
         {
-            activation_env_guard persistent("GGML_KIMI_CPU_SINK_CACHE_POLICY", "lru");
-            auto varied = make_sink(f, threads, depth);
+            scoped_fixture_input persistent(inputs, "cache_policy", "lru");
+            auto varied = make_sink(inputs, f, threads, depth);
             configure_cache(varied.get(), 16 * 3 * aligned(128 + f.entries.begin()->second.raw_bytes), {1}, 16);
             const std::vector<int32_t> aligned_ids = { 0, 1, 2, 3, 4, 5, 6, 7 };
             for (uint64_t token : {1, 2, 3}) {
@@ -3089,7 +3087,7 @@ static void muse_expert_norm_test(int threads, int depth, ggml_type type, bool n
         require(writable >= 0 && fstat(writable, &status) == 0 &&
             ftruncate(writable, status.st_size - 1) == 0, "native fixture truncate");
         close(writable);
-        auto truncated = make_sink(f, threads, depth);
+        auto truncated = make_sink(inputs, f, threads, depth);
         std::vector<float> actual(f.latent); kimi_cpu_sink_stats stats = {};
         require(!kimi_cpu_sink_run_activation(truncated.get(), meta.role[0], meta.role[1], meta.role[2],
             input.data(), ids.data(), weights.data(), 8, &activation, actual.data(), &stats, error, sizeof(error)) &&
@@ -3102,13 +3100,13 @@ static void muse_expert_norm_test(int threads, int depth, ggml_type type, bool n
 
 // The host-memory ledger (kimi-host-ledger.h) with injected /proc and cgroup files, a fake GPU tier and a fake RAM
 // cache: which term binds where, the make_room order, and the refault-driven file reserve.
-static void host_ledger_tests() {
+static void host_ledger_tests(fixture_inputs & inputs) {
     constexpr uint64_t MiB = 1ull << 20, GiB = 1ull << 30;
-    activation_env_guard margin_env("GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES", "536870912");
-    activation_env_guard file_env("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE", nullptr);
-    activation_env_guard host_env("GGML_KIMI_HOST_RESERVE_MIB", nullptr);
-    activation_env_guard cuda_env("GGML_CUDA_MEMORY_RESERVE_MIB", nullptr);
-    activation_env_guard headroom_env("GGML_KIMI_CPU_SINK_VRAM_HOST_HEADROOM_MIB", nullptr);
+    scoped_fixture_input margin_env(inputs, "cache_reserve_bytes", "536870912");
+    scoped_fixture_input file_env(inputs, "cache_reclaimable_file", nullptr);
+    scoped_fixture_input host_env(inputs, "host_reserve_mib", nullptr);
+    scoped_fixture_input cuda_env(inputs, "device_reserve_mib", nullptr);
+    scoped_fixture_input headroom_env(inputs, "host_headroom_mib", nullptr);
     const std::string scope = "/sys/fs/cgroup/user.slice/run-1.scope";
     uint64_t limit = 8 * GiB, current = 0, available = 0, file_pages = 0, refaults = 0;
     bool meminfo = true;
@@ -3135,7 +3133,7 @@ static void host_ledger_tests() {
             text = it->second;
             return true;
         };
-        ledger.configure(unified);
+        inputs.configure(ledger, unified);
         return ledger;
     };
     std::vector<std::string> calls;
@@ -3252,7 +3250,7 @@ static void host_ledger_tests() {
     // The cgroup term keeps the cgroup reserve; CACHE_RECLAIMABLE_FILE (read by every ledger) counts file pages as its
     // headroom.
     {
-        activation_env_guard headroom("GGML_KIMI_CPU_SINK_VRAM_HOST_HEADROOM_MIB", "4096");
+        scoped_fixture_input headroom(inputs, "host_headroom_mib", "4096");
         limit = 8 * GiB; current = 6 * GiB; available = 100 * GiB; file_pages = 0;
         auto u = make(true);
         room = u.measure(1 * GiB);
@@ -3260,12 +3258,12 @@ static void host_ledger_tests() {
                 "unified: the cgroup term held the floor's margin");
         current = 7 * GiB + 512 * MiB; file_pages = 2 * GiB;
         require(!make(false).measure(1 * GiB).fits(), "file pages counted as cgroup headroom without the switch");
-        activation_env_guard file("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE", "1");
+        scoped_fixture_input file(inputs, "cache_reclaimable_file", "1");
         auto f = make(false);
         room = f.measure(1 * GiB);
         require(f.reclaimable_file && room.fits() && room.cgroup_surplus == 8 * GiB - (current - file_pages) - 512 * MiB - 1 * GiB,
                 "the ledger did not read CACHE_RECLAIMABLE_FILE");
-        activation_env_guard bad("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE", "2");
+        scoped_fixture_input bad(inputs, "cache_reclaimable_file", "2");
         bool rejected = false;
         try { (void) make(false); } catch (const std::exception &) { rejected = true; }
         require(rejected, "an invalid CACHE_RECLAIMABLE_FILE was accepted");
@@ -3279,7 +3277,7 @@ static void host_ledger_tests() {
     {
         limit = 8 * GiB; available = 100 * GiB;
         {
-            activation_env_guard file("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE", "1");
+            scoped_fixture_input file(inputs, "cache_reclaimable_file", "1");
             auto f = make(false);
             current = 6 * GiB; file_pages = 1 * GiB; // 5 GiB of anonymous and kernel memory, 1 GiB of old file pages
             room = f.measure(0);
@@ -3389,7 +3387,7 @@ static void host_ledger_tests() {
                 text = it->second;
                 return true;
             };
-            ledger.configure(unified);
+            inputs.configure(ledger, unified);
             return ledger;
         };
         limit = 100 * GiB; current = 1 * GiB; file_pages = 300 * MiB; refaults = 10;
@@ -3429,9 +3427,9 @@ static void host_ledger_tests() {
     // Explicit reserves: GGML_KIMI_HOST_RESERVE_MIB everywhere; GGML_CUDA_MEMORY_RESERVE_MIB and the tier's former
     // headroom (the same margin) only where the GPU shares the DRAM.
     {
-        activation_env_guard host("GGML_KIMI_HOST_RESERVE_MIB", "1024");
-        activation_env_guard cuda("GGML_CUDA_MEMORY_RESERVE_MIB", "256");
-        activation_env_guard headroom("GGML_KIMI_CPU_SINK_VRAM_HOST_HEADROOM_MIB", "4096");
+        scoped_fixture_input host(inputs, "host_reserve_mib", "1024");
+        scoped_fixture_input cuda(inputs, "device_reserve_mib", "256");
+        scoped_fixture_input headroom(inputs, "host_headroom_mib", "4096");
         const auto d = make(false);
         const auto u = make(true);
         require(d.explicit_reserve == 1 * GiB && d.margin == 512 * MiB && d.reserve == 512 * MiB, "discrete reserves");
@@ -3440,10 +3438,16 @@ static void host_ledger_tests() {
     std::printf("HOST_LEDGER_OK\n");
 }
 
+#if defined(__linux__)
+#include "ssd/configured-runtime-gate.h"
+#endif
+
 int main(int argc, char ** argv) {
+    fixture_inputs inputs;
 #if defined(__linux__)
     try {
         real_options options; bool ring_set = false, registered_lifecycle = false, cache_mode = false, cache_pressure = false;
+        bool configured_runtime_mode = false;
         bool trace_profile_mode = false, max_cache_mode = false, hitrate_mode = false, elastic_cache_mode = false;
         bool schedules_mode = false, schedule_invalid_mode = false, early_up_gate_mode = false;
         bool role_major_mode = false, nonblocking_down_mode = false;
@@ -3454,7 +3458,8 @@ int main(int argc, char ** argv) {
         std::string pack, prefix;
         for (int i = 1; i < argc; ++i) {
             auto argument = [&]() { require(i + 1 < argc, "missing option argument"); return argv[++i]; };
-            if (!std::strcmp(argv[i], "--threads")) { options.threads = std::atoi(argument()); }
+            if (!std::strcmp(argv[i], "--fixture")) { inputs.argument(argument()); }
+            else if (!std::strcmp(argv[i], "--threads")) { options.threads = std::atoi(argument()); }
             else if (!std::strcmp(argv[i], "--real-pack")) { pack = argument(); }
             else if (!std::strcmp(argv[i], "--fixture-prefix")) { prefix = argument(); }
             else if (!std::strcmp(argv[i], "--ring-experts")) { options.ring_experts = std::atoi(argument()); ring_set = true; }
@@ -3463,6 +3468,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--policy")) { options.policy = argument(); }
             else if (!std::strcmp(argv[i], "--jsonl")) { options.jsonl = argument(); }
             else if (!std::strcmp(argv[i], "--resident-dir")) { options.resident_dir = argument(); }
+            else if (!std::strcmp(argv[i], "--configured-runtime")) { configured_runtime_mode = true; }
             else if (!std::strcmp(argv[i], "--trace-profile")) { trace_profile_mode = true; }
             else if (!std::strcmp(argv[i], "--prefetch-tests")) { prefetch_mode = true; }
             else if (!std::strcmp(argv[i], "--registered-lifecycle")) { registered_lifecycle = true; }
@@ -3490,7 +3496,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--muse-bf16-test")) { muse_bf16_mode = true; }
             else if (!std::strcmp(argv[i], "--activation-tests")) { activation_mode = true; }
             else if (!std::strcmp(argv[i], "--q2-activation-test")) { q2_activation_mode = true; }
-            else { throw std::runtime_error("usage: test-kimi-cpu-sink [--registered-lifecycle|--cache-tests|--cache-pressure] [--threads N] [--real-pack FILE --fixture-prefix PREFIX --ring-experts N --repeats N --warmup N --policy fixture|top16|top8|mass085 --jsonl FILE --resident-dir TMPFS]"); }
+            else { throw std::runtime_error("usage: test-kimi-cpu-sink [--registered-lifecycle|--cache-tests|--cache-pressure] [--threads N] [--fixture KEY=VALUE] [--real-pack FILE --fixture-prefix PREFIX --ring-experts N --repeats N --warmup N --policy fixture|top16|top8|mass085 --jsonl FILE --resident-dir TMPFS]"); }
         }
         require(options.threads >= 2 && options.threads <= 128 && options.ring_experts >= 1 && options.ring_experts <= 32, "invalid thread/ring count");
         require(options.repeats >= 1 && options.repeats <= 10000 && options.warmup >= 0 && options.warmup <= 10000, "invalid repeat/warmup count");
@@ -3505,43 +3511,44 @@ int main(int argc, char ** argv) {
                 prefetch_mode || cache_policy_mode || cache_large_mode || activation_mode || muse_q8_mode || muse_bf16_mode) {
             test_resources::finite_cgroup();
         }
-        if (auto_ring_mode) { cache_auto_ring_test(options.threads, ring_set ? options.ring_experts : 8); return 0; }
-        if (muse_q8_mode) { muse_expert_norm_test(options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_Q8_0); return 0; }
+        if (configured_runtime_mode) { configured_runtime_tests(inputs); return 0; }
+        if (auto_ring_mode) { cache_auto_ring_test(inputs, options.threads, ring_set ? options.ring_experts : 8); return 0; }
+        if (muse_q8_mode) { muse_expert_norm_test(inputs, options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_Q8_0); return 0; }
         if (muse_bf16_mode) {
-            muse_expert_norm_test(options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_BF16);
-            muse_expert_norm_test(options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_BF16, true);
+            muse_expert_norm_test(inputs, options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_BF16);
+            muse_expert_norm_test(inputs, options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_BF16, true);
             return 0;
         }
-        if (activation_mode) { activation_tests(options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (q2_activation_mode) { q2_activation_test(options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (cache_location_mode) { cache_location_tests(options.threads, options.ring_experts); return 0; }
-        if (cache_compute_mode) { cache_compute_tests(options.threads, options.ring_experts); return 0; }
-        if (hitrate_mode) { cache_hitrate_tests(options.threads, options.ring_experts); return 0; }
-        if (elastic_cache_mode) { elastic_cache_tests(options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (cache_load_mode) { cache_load_tests(options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (max_cache_mode) { max_cache_tests(options.threads, options.ring_experts); return 0; }
-        if (early_up_gate_mode) { schedule_tests(options.threads, options.ring_experts, false, true); return 0; }
-        if (role_major_mode) { schedule_tests(options.threads, options.ring_experts, false, false, 0, true); return 0; }
-        if (nonblocking_down_mode) { schedule_tests(options.threads, options.ring_experts, false, false, 0, false, true); return 0; }
-        if (poll_mode || poll_early_mode) { schedule_tests(options.threads, options.ring_experts, false, poll_early_mode, 100); return 0; }
-        if (schedules_mode) { schedule_tests(options.threads, options.ring_experts, true); return 0; }
-        if (schedule_invalid_mode) { schedule_invalid_tests(); return 0; }
-        if (trace_profile_mode) { trace_profile_test(options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (prefetch_mode) { prefetch_tests(options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (cache_policy_mode) { cache_policy_tests(options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (cache_large_mode) { cache_large_test(options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (cache_pressure_transition) { cache_pressure_transition_test(options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (cache_unbounded) { cache_pressure_test(options.threads, ring_set ? options.ring_experts : 2, true); return 0; }
+        if (activation_mode) { activation_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (q2_activation_mode) { q2_activation_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (cache_location_mode) { cache_location_tests(inputs, options.threads, options.ring_experts); return 0; }
+        if (cache_compute_mode) { cache_compute_tests(inputs, options.threads, options.ring_experts); return 0; }
+        if (hitrate_mode) { cache_hitrate_tests(inputs, options.threads, options.ring_experts); return 0; }
+        if (elastic_cache_mode) { elastic_cache_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (cache_load_mode) { cache_load_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (max_cache_mode) { max_cache_tests(inputs, options.threads, options.ring_experts); return 0; }
+        if (early_up_gate_mode) { schedule_tests(inputs, options.threads, options.ring_experts, false, true); return 0; }
+        if (role_major_mode) { schedule_tests(inputs, options.threads, options.ring_experts, false, false, 0, true); return 0; }
+        if (nonblocking_down_mode) { schedule_tests(inputs, options.threads, options.ring_experts, false, false, 0, false, true); return 0; }
+        if (poll_mode || poll_early_mode) { schedule_tests(inputs, options.threads, options.ring_experts, false, poll_early_mode, 100); return 0; }
+        if (schedules_mode) { schedule_tests(inputs, options.threads, options.ring_experts, true); return 0; }
+        if (schedule_invalid_mode) { schedule_invalid_tests(inputs); return 0; }
+        if (trace_profile_mode) { trace_profile_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (prefetch_mode) { prefetch_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (cache_policy_mode) { cache_policy_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (cache_large_mode) { cache_large_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (cache_pressure_transition) { cache_pressure_transition_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (cache_unbounded) { cache_pressure_test(inputs, options.threads, ring_set ? options.ring_experts : 2, true); return 0; }
         if (cache_mode || cache_pressure) {
             require(!(cache_mode && cache_pressure) && !registered_lifecycle && pack.empty() && prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(),
                     "cache tests cannot be combined with other test modes or real-pack measurement");
-            if (cache_pressure) { cache_pressure_test(options.threads, ring_set ? options.ring_experts : 2); }
-            else { cache_tests(options.threads, ring_set ? options.ring_experts : 2); }
+            if (cache_pressure) { cache_pressure_test(inputs, options.threads, ring_set ? options.ring_experts : 2); }
+            else { cache_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); }
         } else if (registered_lifecycle) {
             require(pack.empty() && prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(), "registered lifecycle cannot be combined with real-pack measurement");
-            registered_lifecycle_tests();
-        } else if (pack.empty()) { require(prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(), "measurement options require real pack"); host_ledger_tests(); synthetic_tests(options.threads, ring_set ? options.ring_experts : 2); }
-        else { require(!prefix.empty(), "real pack requires fixture prefix"); real_test(pack, prefix, options); }
+            registered_lifecycle_tests(inputs);
+        } else if (pack.empty()) { require(prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(), "measurement options require real pack"); host_ledger_tests(inputs); synthetic_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); }
+        else { require(!prefix.empty(), "real pack requires fixture prefix"); real_test(inputs, pack, prefix, options); }
         std::printf("CPU_SINK_TEST_OK\n"); return 0;
     } catch (const unsupported_resident & e) { std::fprintf(stderr, "CPU_SINK_RESIDENT_UNSUPPORTED: %s\n", e.what()); return 77; }
       catch (const std::exception & e) { return test_resources::report("CPU_SINK_TEST", e); }

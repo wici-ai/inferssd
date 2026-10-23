@@ -122,38 +122,7 @@ struct kimi_cpu_prefill {
     kimi_cpu_prefill_stats current = {};
 
     explicit kimi_cpu_prefill(kimi_cpu_sink * shared_sink) : sink(shared_sink) {
-        if (const char * v = std::getenv("GGML_KIMI_CPU_PREFILL_DYNAMIC_ROWS")) {
-            dynamic_rows = !(v[0] == '0' && v[1] == '\0');
-        }
-        if (const char * v = std::getenv("GGML_KIMI_CPU_PREFILL_DYNAMIC_CHUNK_ROWS")) {
-            char * end = nullptr;
-            const long chunk = std::strtol(v, &end, 10);
-            if (end == v || *end != '\0' || chunk < 8 || chunk > 16384 || chunk % 8 != 0) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_DYNAMIC_CHUNK_ROWS must be a multiple of 8 in [8,16384]");
-            }
-            dynamic_chunk_rows = int(chunk);
-        }
-        if (const char * v = std::getenv("GGML_KIMI_CPU_PREFILL_COLUMN_BLOCK")) {
-            char * end = nullptr;
-            const long block = std::strtol(v, &end, 10);
-            if (end == v || *end != '\0' || block < 0 || block > 2048 || block % 4 != 0) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_COLUMN_BLOCK must be 0 or a multiple of 4 in [4,2048]");
-            }
-            column_block = int(block);
-        }
-        if (const char * v = std::getenv("GGML_KIMI_CPU_PREFILL_MXFP4_GEMM")) {
-            if (std::strcmp(v, "0") && std::strcmp(v, "1") && std::strcmp(v, "2")) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_MXFP4_GEMM must be 0, 1 or 2");
-            }
-            mxfp4_gemm = v[0] - '0';
-        }
-        if (const char * v = std::getenv("GGML_KIMI_CPU_PREFILL_GROUP_TRACE")) {
-            if (std::strcmp(v, "0") && std::strcmp(v, "1")) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_GROUP_TRACE must be 0 or 1");
-            }
-            group_trace = v[0] == '1';
-        }
-
+        group_trace = kimi_cpu_sink_debug(sink).trace;
         if (!sink) { throw std::runtime_error("CPU prefill needs a sink"); }
     }
 
@@ -474,8 +443,7 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         // useful to the following decode, so expose the exact candidates for
         // an offline prompt->decode overlap analysis without changing cache
         // heat, residency, execution order or payload lifetime.
-        if (const char * audit = std::getenv("GGML_KIMI_CPU_PREFILL_ADMISSION_AUDIT")) {
-            if (!std::strcmp(audit, "1")) {
+        if (prefill->group_trace) {
                 std::fprintf(stderr, "[kimi_cpu_prefill_admission_audit] tensor=%s ntokens=%d candidates=",
                     up->name, ntokens);
                 bool first = true;
@@ -485,9 +453,6 @@ extern "C" bool kimi_cpu_prefill_run_activation(
                     first = false;
                 }
                 std::fprintf(stderr, "\n");
-            } else if (std::strcmp(audit, "0")) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_ADMISSION_AUDIT must be 0 or 1");
-            }
         }
         prefill->activation_config = *activation;
         prefill->output = output;
@@ -584,7 +549,7 @@ extern "C" bool kimi_cpu_prefill_run(
         float situ_beta, float situ_linear_beta, float * output,
         struct kimi_cpu_prefill_stats * stats, char * error, size_t error_size) {
     const kimi_cpu_sink_activation activation = {
-        KIMI_CPU_SINK_ACTIVATION_SITU, situ_beta, situ_linear_beta, 0.0f,
+        KIMI_CPU_SINK_ACTIVATION_SITU, situ_beta, situ_linear_beta, 0.0f, nullptr, 0.0f,
     };
     return kimi_cpu_prefill_run_activation(prefill, up, gate, down, input, ids, weights, nslots, ntokens,
             &activation, output, stats, error, error_size);

@@ -39,14 +39,6 @@ double elapsed_us(clock_type::time_point from, clock_type::time_point to) {
     return std::chrono::duration<double, std::micro>(to - from).count();
 }
 
-// 0/1 switches of the MXFP4 engine; any other value is a configuration error.
-bool env_switch(const char * name) {
-    const char * value = std::getenv(name);
-    if (!value || !*value || !std::strcmp(value, "0")) { return false; }
-    if (!std::strcmp(value, "1")) { return true; }
-    throw std::runtime_error(std::string(name) + " must be 0 or 1");
-}
-
 const char * chain_kernel_name(int kernel) {
     switch (kernel) {
         case KIMI_MXFP4_CHAIN_PARITY_Q8: return "parity_q8";
@@ -54,15 +46,6 @@ const char * chain_kernel_name(int kernel) {
         case KIMI_MXFP4_CHAIN_ROWS_FLOAT: return "rows_float";
         default: return "none";
     }
-}
-
-int env_chain_kernel() {
-    const char * value = std::getenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_KERNEL");
-    if (!value || !*value) { return KIMI_MXFP4_CHAIN_ROWS_Q8; }
-    for (int kernel = KIMI_MXFP4_CHAIN_PARITY_Q8; kernel <= KIMI_MXFP4_CHAIN_ROWS_FLOAT; ++kernel) {
-        if (!std::strcmp(value, chain_kernel_name(kernel))) { return kernel; }
-    }
-    throw std::runtime_error("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_KERNEL must be parity_q8, rows_q8 or rows_float");
 }
 
 // Host side of the optional timing split (GGML_KIMI_CPU_SINK_VRAM_TIMING=1), all on
@@ -97,7 +80,8 @@ struct format_bridge {
     std::vector<kimi_mxfp4_chain_expert> experts;
     host_timing host;
 
-    format_bridge(int device, int l, int h, int n, int weight_type, int down_type) : latent(l), hidden(h), max_hits(n) {
+    format_bridge(int device, int l, int h, int n, int weight_type, int down_type,
+            bool gpu_hidden = true, bool profile = false) : latent(l), hidden(h), max_hits(n), timing(profile) {
         if (weight_type != GGML_TYPE_MXFP4 || down_type != GGML_TYPE_MXFP4) {
             throw std::runtime_error("format VRAM engine supports MXFP4 up/gate/down experts only");
         }
@@ -138,19 +122,17 @@ struct format_bridge {
             // The parity self-check guards bitwise equality with the CPU sink only. The GPU hidden
             // chain makes no such claim, so it starts without the check and also runs on hosts
             // whose CPU vec_dot takes another path.
-            if (env_switch("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN")) {
+            if (gpu_hidden) {
                 std::fprintf(stderr, "[kimi_vram_bridge] mxfp4_selfcheck=skipped reason=gpu_hidden_chain\n");
             } else {
                 self_check();
             }
         } catch (...) { close(); throw; }
-        try { configure_extensions(); } catch (...) { close(); throw; }
+        try { configure_extensions(gpu_hidden); } catch (...) { close(); throw; }
     }
     // The GPU hidden chain and the timing split live in the component's chain
     // extension, which must come from the same DSO as the base API.
-    void configure_extensions() {
-        const bool gpu_hidden = env_switch("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN");
-        timing = env_switch("GGML_KIMI_CPU_SINK_VRAM_TIMING");
+    void configure_extensions(bool gpu_hidden) {
         if (gpu_hidden || timing) {
             auto get_chain = reinterpret_cast<const kimi_mxfp4_gpu_chain_api_v1 * (*)()>(dlsym(RTLD_DEFAULT, "kimi_mxfp4_gpu_get_chain_api_v1"));
             Dl_info base_info = {}, chain_info = {};
@@ -167,7 +149,7 @@ struct format_bridge {
         }
         if (timing && !chain_api->set_timing(gpu, 1)) { throw std::runtime_error(api->error(gpu)); }
         if (gpu_hidden) {
-            chain_kernel = env_chain_kernel();
+            chain_kernel = KIMI_MXFP4_CHAIN_ROWS_Q8;
             chain = chain_api->create(gpu, latent, hidden, max_hits, chain_kernel, 0);
             if (!chain) { throw std::runtime_error(api->error(gpu)); }
             experts.reserve(size_t(max_hits));
@@ -440,4 +422,31 @@ extern "C" const vram_format_compute_api * kimi_vram_format_compute_get_api() {
 // reports reference=test_override while it is set.
 extern "C" __attribute__((visibility("default"))) void kimi_vram_mxfp4_selfcheck_reference_for_testing(ggml_vec_dot_t reference) {
     selfcheck_reference.store(reference);
+}
+
+// Explicit fixture factory: retained host-bridge parity and queued-error tests
+// exercise the real component DSO without a production environment switch.
+extern "C" __attribute__((visibility("default"))) void * ggml_ssd_mxfp4_create_for_testing(
+        int device, int latent, int hidden, int max_hits, int weight_type, int down_type,
+        bool gpu_hidden, bool profile, char * error, size_t size) noexcept {
+    try { return new format_bridge(device, latent, hidden, max_hits, weight_type, down_type, gpu_hidden, profile); }
+    catch (const std::exception & e) {
+        if (error && size) { std::snprintf(error, size, "%s", e.what()); }
+        return nullptr;
+    }
+}
+
+extern "C" __attribute__((visibility("default"))) int ggml_backend_cuda_ssd_mxfp4_set_profile(
+        void * value, bool enabled, char * error, size_t size) noexcept {
+    try {
+        auto * bridge = static_cast<format_bridge *>(value);
+        if (!bridge || !bridge->gpu || !bridge->chain_api || !bridge->chain_api->set_timing(bridge->gpu, int(enabled))) {
+            throw std::runtime_error("cannot configure MXFP4 profile channel");
+        }
+        bridge->timing = enabled;
+        return 0;
+    } catch (const std::exception & e) {
+        if (error && size) { std::snprintf(error, size, "%s", e.what()); }
+        return 1;
+    }
 }

@@ -1,3 +1,4 @@
+#include "ssd/explicit-fixture-inputs.h"
 // CUDA lifecycle test of deferred VRAM uploads (GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD=1). A borrowed upload
 // outlives finish, keeps its slot out of every eviction, is published only by collect, and release waits for it.
 // A hook on the upload thread holds a copy in flight or makes it fail, independently of GPU/CPU speed.
@@ -33,12 +34,13 @@ kimi_vram_request key(int layer, int expert) {
 }
 }
 
-int main() { try {
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY", "lru", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "1", 1);
+int main() {
+    fixture_inputs inputs; try {
+    inputs.set("vram_async", "1");
+    inputs.set("vram_deferred", "1");
+    inputs.set("tier.policy", "lru");
+    inputs.set("tier.min_count", "0");
+    inputs.set("tier.global", "1");
     std::vector<unsigned char> payload(stride);
     for (size_t i = 0; i < payload.size(); ++i) { payload[i] = uint8_t(i * 131 + 7); }
     const void * data[] = {payload.data(), payload.data() + role, payload.data() + 2 * role};
@@ -49,7 +51,7 @@ int main() { try {
     kimi_vram_ready_lease lease = {};
     int ready[2] = {};
     struct cleanup { ~cleanup() { open_gate(); } } cleanup_on_error;
-    tier t(2 * stride); // two slots, one global pool for every layer
+    tier t(2 * stride, inputs.tier_policy()); // two slots, one global pool for every layer
     t.deferred_hook = upload_gate;
 
     // The upload outlives finish; its slot is reserved, not ready, and collect does not publish it.
@@ -153,7 +155,7 @@ int main() { try {
     // destructor must wait, abort that unpublished reservation, and free the
     // elastic blocks without treating the live tail as corruption.
     {
-        auto * pending = new tier(2 * stride);
+        auto * pending = new tier(2 * stride, inputs.tier_policy());
         pending->deferred_hook = upload_gate;
         hold();
         pending->begin(32, 1, true);

@@ -1,3 +1,4 @@
+#include "ssd/explicit-fixture-inputs.h"
 // The real CPU sink with the VRAM tier on MXFP4 experts and the DeepSeek-V4.1
 // clamped SwiGLU: every output must equal a CPU-only sink bit for bit while GPU
 // hits replace SSD reads. The engine's runtime parity gate must refuse a CPU
@@ -61,20 +62,20 @@ void flipped_dot(int n, float * s, size_t bs, const void * x, size_t bx, const v
 // A sink whose MXFP4 engine self-check sees a mismatching CPU reference must
 // fail the decode call with the failing check named, again on a retry (no
 // fallback, no silent CPU-only continuation).
-void selfcheck_mismatch(const char * label, ggml_vec_dot_t reference, const char * expected, size_t & checks) {
+void selfcheck_mismatch(fixture_inputs & inputs, const char * label, ggml_vec_dot_t reference, const char * expected, size_t & checks) {
     const auto hook = reinterpret_cast<selfcheck_hook_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_mxfp4_selfcheck_reference_for_testing"));
     require(hook != nullptr, "MXFP4 self-check test hook is not exported by the tier DSO");
     fixture f;
     f.type = f.down_type = GGML_TYPE_MXFP4;
     f.latent = 512; f.hidden = 256; f.experts = 4;
     make_synthetic(f, 20260916);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", std::to_string(uint64_t(2 * f.experts) * triplet_bytes(f)).c_str(), 1);
-    for (const char * name : {"GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE", "GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD",
-                              "GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS",
-                              "GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD"}) {
-        setenv(name, "0", 1);
+    inputs.set("vram_budget", std::to_string(uint64_t(2 * f.experts) * triplet_bytes(f)).c_str());
+    for (const char * name : {"vram_exclusive", "vram_async",
+                              "tier.global", "tier.keep_across_requests",
+                              "vram_deferred"}) {
+        inputs.set(name, "0");
     }
-    auto sink = make_sink(f, 16, 2);
+    auto sink = make_sink(inputs, f, 16, 2);
     configure_cache(sink.get(), 0, {1, 2}, f.experts);
     const kimi_cpu_sink_activation activation = {KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 10.0f};
     std::vector<int32_t> ids = {0, 1, 2};
@@ -101,21 +102,21 @@ void selfcheck_mismatch(const char * label, ggml_vec_dot_t reference, const char
 
 // With the GPU hidden chain on, the engine skips the parity self-check: a mismatching CPU
 // reference must not refuse the tier, and the chain keeps producing finite outputs.
-void selfcheck_skipped_with_chain(size_t & checks) {
+void selfcheck_skipped_with_chain(fixture_inputs & inputs, size_t & checks) {
     const auto hook = reinterpret_cast<selfcheck_hook_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_mxfp4_selfcheck_reference_for_testing"));
     require(hook != nullptr, "MXFP4 self-check test hook is not exported by the tier DSO");
     fixture f;
     f.type = f.down_type = GGML_TYPE_MXFP4;
     f.latent = 512; f.hidden = 256; f.experts = 4;
     make_synthetic(f, 20260918);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", std::to_string(uint64_t(2 * f.experts) * triplet_bytes(f)).c_str(), 1);
-    for (const char * name : {"GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE", "GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD",
-                              "GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS",
-                              "GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD"}) {
-        setenv(name, "0", 1);
+    inputs.set("vram_budget", std::to_string(uint64_t(2 * f.experts) * triplet_bytes(f)).c_str());
+    for (const char * name : {"vram_exclusive", "vram_async",
+                              "tier.global", "tier.keep_across_requests",
+                              "vram_deferred"}) {
+        inputs.set(name, "0");
     }
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN", "1", 1); // read when the engine is created
-    auto sink = make_sink(f, 16, 2);
+    inputs.set("tier.mxfp4_gpu_hidden", "1"); // read when the engine is created
+    auto sink = make_sink(inputs, f, 16, 2);
     configure_cache(sink.get(), 0, {1, 2}, f.experts);
     const kimi_cpu_sink_activation activation = {KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 10.0f};
     std::vector<int32_t> ids = {0, 1, 2};
@@ -137,14 +138,14 @@ void selfcheck_skipped_with_chain(size_t & checks) {
         ++checks;
     }
     hook(nullptr);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN", "0", 1);
+    inputs.set("tier.mxfp4_gpu_hidden", "0");
     require(last_reads < first_reads, "the chain served no VRAM hits after the skipped self-check");
     ++checks;
     std::printf("MXFP4_SELFCHECK_SKIPPED_WITH_CHAIN_PASS first_reads=%llu last_reads=%llu\n",
         (unsigned long long) first_reads, (unsigned long long) last_reads);
 }
 
-void run_shape(int latent, int hidden, int experts, int tokens, size_t & compared, size_t & checks) {
+void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, int tokens, size_t & compared, size_t & checks) {
     fixture f;
     f.type = f.down_type = GGML_TYPE_MXFP4;
     f.latent = latent; f.hidden = hidden; f.experts = experts;
@@ -162,26 +163,26 @@ void run_shape(int latent, int hidden, int experts, int tokens, size_t & compare
                            tier_options{true, true, true, true, true, true, true, true, true},
                            tier_options{false, true, false, true, false, true, true, true, false},
                            tier_options{false, true, false, true, false, true, true, true, true}}) {
-        setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_ROLE_MAJOR", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD", "0", 1);
-        auto cpu = make_sink(f, 16, 2);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", gpu_bytes.c_str(), 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE", cfg.exclusive ? "1" : "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", cfg.async ? "1" : "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", cfg.global ? "1" : "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", cfg.keep ? "1" : "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD", cfg.deferred ? "1" : "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE", cfg.early_up_gate ? "1" : "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_ROLE_MAJOR", cfg.role_major ? "1" : "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", cfg.nonblocking_down_sched ? "1" : "0", 1);
-        auto mixed = make_sink(f, 16, 2);
+        inputs.set("vram_budget", "0");
+        inputs.set("early_up_gate", "0");
+        inputs.set("role_major", "0");
+        inputs.set("nonblocking_down_sched", "0");
+        inputs.set("vram_exclusive", "0");
+        inputs.set("vram_async", "0");
+        inputs.set("tier.global", "0");
+        inputs.set("tier.keep_across_requests", "0");
+        inputs.set("vram_deferred", "0");
+        auto cpu = make_sink(inputs, f, 16, 2);
+        inputs.set("vram_budget", gpu_bytes.c_str());
+        inputs.set("vram_exclusive", cfg.exclusive ? "1" : "0");
+        inputs.set("vram_async", cfg.async ? "1" : "0");
+        inputs.set("tier.global", cfg.global ? "1" : "0");
+        inputs.set("tier.keep_across_requests", cfg.keep ? "1" : "0");
+        inputs.set("vram_deferred", cfg.deferred ? "1" : "0");
+        inputs.set("early_up_gate", cfg.early_up_gate ? "1" : "0");
+        inputs.set("role_major", cfg.role_major ? "1" : "0");
+        inputs.set("nonblocking_down_sched", cfg.nonblocking_down_sched ? "1" : "0");
+        auto mixed = make_sink(inputs, f, 16, 2);
         const uint64_t ram = cfg.ram ? 2 * unit : 0;
         configure_cache(cpu.get(), ram, {1, 2}, experts);
         configure_cache(mixed.get(), ram, {1, 2}, experts);
@@ -270,29 +271,29 @@ double rel_l2(const std::vector<float> & a, const std::vector<float> & b) {
 
 // GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN=1: layer 1 (SWIGLU_CLAMP, limits 0.75 and 10)
 // runs its VRAM hits through the GPU chain, layer 2 (SiTU) keeps the bitwise bridge.
-void run_chain_shape(int latent, int hidden, int experts, int tokens, size_t & checks, double & worst) {
+void run_chain_shape(fixture_inputs & inputs, int latent, int hidden, int experts, int tokens, size_t & checks, double & worst) {
     fixture f;
     f.type = f.down_type = GGML_TYPE_MXFP4;
     f.latent = latent; f.hidden = hidden; f.experts = experts;
     make_synthetic(f, uint32_t(20260917 + latent));
     const std::string gpu_bytes = std::to_string(uint64_t(2 * experts) * triplet_bytes(f));
-    for (const char * name : {"GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE", "GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD",
-                              "GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS",
-                              "GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD"}) {
-        setenv(name, "0", 1);
+    for (const char * name : {"vram_exclusive", "vram_async",
+                              "tier.global", "tier.keep_across_requests",
+                              "vram_deferred"}) {
+        inputs.set(name, "0");
     }
-    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_ROLE_MAJOR", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", "0", 1);
-    auto cpu = make_sink(f, 16, 2);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", gpu_bytes.c_str(), 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN", "1", 1); // read when the engine is created
-    setenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_ROLE_MAJOR", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", "1", 1);
-    auto mixed = make_sink(f, 16, 2);
+    inputs.set("vram_budget", "0");
+    inputs.set("early_up_gate", "0");
+    inputs.set("role_major", "0");
+    inputs.set("nonblocking_down_sched", "0");
+    auto cpu = make_sink(inputs, f, 16, 2);
+    inputs.set("vram_budget", gpu_bytes.c_str());
+    inputs.set("vram_async", "1");
+    inputs.set("tier.mxfp4_gpu_hidden", "1"); // read when the engine is created
+    inputs.set("early_up_gate", "1");
+    inputs.set("role_major", "1");
+    inputs.set("nonblocking_down_sched", "1");
+    auto mixed = make_sink(inputs, f, 16, 2);
     configure_cache(cpu.get(), 0, {1, 2}, experts);
     configure_cache(mixed.get(), 0, {1, 2}, experts);
     uint64_t cpu_reads = 0, mixed_reads = 0;
@@ -332,7 +333,7 @@ void run_chain_shape(int latent, int hidden, int experts, int tokens, size_t & c
             ++checks;
         }
     }
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN", "0", 1);
+    inputs.set("tier.mxfp4_gpu_hidden", "0");
     std::printf("MXFP4_CHAIN_SHAPE_PASS latent=%d hidden=%d worst_rel_l2=%.3e cpu_reads=%llu mixed_reads=%llu\n", latent, hidden,
         worst, (unsigned long long) cpu_reads, (unsigned long long) mixed_reads);
     require(mixed_reads < cpu_reads, "GPU chain served no hits; nothing was validated");
@@ -340,22 +341,22 @@ void run_chain_shape(int latent, int hidden, int experts, int tokens, size_t & c
 
 // batch: the default batched GPU expert prefill, which rounds differently from the CPU; otherwise the
 // per-expert path of GGML_KIMI_MXFP4_PREFILL_BATCH=0, which reproduces the CPU bitwise.
-void run_grouped_prefill_hybrid(bool batch, size_t & compared, size_t & checks) {
-    setenv("GGML_KIMI_MXFP4_PREFILL_BATCH", batch ? "1" : "0", 1);
+void run_grouped_prefill_hybrid(fixture_inputs & inputs, bool batch, size_t & compared, size_t & checks) {
+    inputs.set("tier.mxfp4_batch", batch ? "1" : "0");
     fixture f;
     f.type = f.down_type = GGML_TYPE_MXFP4;
     f.latent = 512; f.hidden = 256; f.experts = 8;
     make_synthetic(f, 20260920);
     const std::string gpu_bytes = std::to_string(uint64_t(2 * f.experts) * triplet_bytes(f));
-    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "0", 1);
-    auto cpu = make_sink(f, 16, 2);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", gpu_bytes.c_str(), 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN", "0", 1);
-    auto mixed = make_sink(f, 16, 2);
+    inputs.set("vram_budget", "0");
+    inputs.set("vram_prefill", "0");
+    auto cpu = make_sink(inputs, f, 16, 2);
+    inputs.set("vram_budget", gpu_bytes.c_str());
+    inputs.set("tier.keep_across_requests", "1");
+    inputs.set("vram_prefill", "1");
+    inputs.set("tier.global", "1");
+    inputs.set("tier.mxfp4_gpu_hidden", "0");
+    auto mixed = make_sink(inputs, f, 16, 2);
     configure_cache(cpu.get(), 0, {1, 2}, f.experts);
     configure_cache(mixed.get(), 0, {1, 2}, f.experts);
     tensors meta(f, 1);
@@ -431,8 +432,8 @@ void run_grouped_prefill_hybrid(bool batch, size_t & compared, size_t & checks) 
         int(batch), rel, ntokens, ids.size(), (unsigned long long) hybrid_stats.gpu_experts,
         (unsigned long long) hybrid_stats.gpu_routes, (unsigned long long) cpu_stats.stream.read_requests,
         (unsigned long long) hybrid_stats.stream.read_requests);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "0", 1);
-    unsetenv("GGML_KIMI_MXFP4_PREFILL_BATCH");
+    inputs.set("vram_prefill", "0");
+    inputs.unset("tier.mxfp4_batch");
 }
 
 // A cold tier: the makespan rule streams SSD transients to the GPU while the CPU computes the rest, both lanes reading
@@ -441,20 +442,20 @@ void run_grouped_prefill_hybrid(bool batch, size_t & compared, size_t & checks) 
 // expert on the CPU: the drive's line comes from the decode step's reads (the cost table fits it over decode's and
 // prefill's layers, so a start value no longer outlives them), and a CPU of 1 ns an expert (start values) is far
 // below it. The output stays within the batched path's rounding of the graph.
-void run_grouped_prefill_cold_transients(size_t & compared, size_t & checks) {
+void run_grouped_prefill_cold_transients(fixture_inputs & inputs, size_t & compared, size_t & checks) {
     for (const bool drive_bound : {false, true}) {
-        setenv("GGML_KIMI_MXFP4_PREFILL_BATCH", "1", 1);
-        setenv("GGML_KIMI_CPU_PREFILL_COST", drive_bound ? "cpu_fixed_us=0.001,cpu_route_us=0.000001" : "gpu_fixed_us=2000", 1);
+        inputs.set("tier.mxfp4_batch", "1");
+        inputs.set("place_costs", drive_bound ? "cpu_fixed_us=0.001,cpu_route_us=0.000001" : "gpu_fixed_us=2000");
         fixture f;
         f.type = f.down_type = GGML_TYPE_MXFP4;
         f.latent = 512; f.hidden = 256; f.experts = 16;
         make_synthetic(f, 20261020);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", std::to_string(uint64_t(2 * f.experts) * triplet_bytes(f)).c_str(), 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", "1", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "1", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "1", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN", "0", 1);
-        auto mixed = make_sink(f, 4, 2);
+        inputs.set("vram_budget", std::to_string(uint64_t(2 * f.experts) * triplet_bytes(f)).c_str());
+        inputs.set("tier.keep_across_requests", "1");
+        inputs.set("vram_prefill", "1");
+        inputs.set("tier.global", "1");
+        inputs.set("tier.mxfp4_gpu_hidden", "0");
+        auto mixed = make_sink(inputs, f, 4, 2);
         configure_cache(mixed.get(), 0, {1, 2}, f.experts);
         tensors meta(f, 1);
         const kimi_cpu_sink_activation activation = {
@@ -526,45 +527,45 @@ void run_grouped_prefill_cold_transients(size_t & compared, size_t & checks) {
                 (unsigned long long) stats.gpu_experts, (unsigned long long) stats.gpu_ssd_transient_experts,
                 (unsigned long long) stats.ssd_experts);
         }
-        setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "0", 1);
-        unsetenv("GGML_KIMI_CPU_PREFILL_COST");
-        unsetenv("GGML_KIMI_MXFP4_PREFILL_BATCH");
+        inputs.set("vram_prefill", "0");
+        inputs.unset("place_costs");
+        inputs.unset("tier.mxfp4_batch");
     }
 }
 }
 
 int main() {
+    fixture_inputs inputs;
     try {
         ggml_cpu_init();
-        setenv("GGML_KIMI_CPU_SINK_READY_FIRST", "1", 1);
-        setenv("GGML_KIMI_CPU_SINK_SPLIT_CV", "1", 1);
-        setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY", "lru", 1);
-        setenv("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", "uniform", 1);
-        setenv("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY", "lru", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_GPU_HIDDEN", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_ROLE_MAJOR", "0", 1);
-        setenv("GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", "0", 1);
+        inputs.set("ready_first", "1");
+        inputs.set("split_cv", "1");
+        inputs.set("cache_policy", "lru");
+        inputs.set("cache_allocation", "uniform");
+        inputs.set("cache_keep", "0");
+        inputs.set("tier.policy", "lru");
+        inputs.set("tier.min_count", "0");
+        inputs.set("tier.mxfp4_gpu_hidden", "0");
+        inputs.set("early_up_gate", "0");
+        inputs.set("role_major", "0");
+        inputs.set("nonblocking_down_sched", "0");
         size_t compared = 0, checks = 0;
         // Mismatch path first; the shape runs below then create fresh engines
         // whose self-check passes against the linked CPU kernel.
-        selfcheck_mismatch("scalar_order", scalar_order_dot, "check=up_gate_c512/", checks);
+        selfcheck_mismatch(inputs, "scalar_order", scalar_order_dot, "check=up_gate_c512/", checks);
         flipped_columns = 256;
-        selfcheck_mismatch("one_bit_down_stage", flipped_dot, "check=down_c256/scales input=0 row=0 ", checks);
-        selfcheck_skipped_with_chain(checks);
-        run_shape(512, 256, 8, 12, compared, checks);
-        run_shape(5120, 2304, 4, 8, compared, checks);
+        selfcheck_mismatch(inputs, "one_bit_down_stage", flipped_dot, "check=down_c256/scales input=0 row=0 ", checks);
+        selfcheck_skipped_with_chain(inputs, checks);
+        run_shape(inputs, 512, 256, 8, 12, compared, checks);
+        run_shape(inputs, 5120, 2304, 4, 8, compared, checks);
         double chain_worst = 0;
-        run_chain_shape(512, 256, 8, 10, checks, chain_worst);
-        run_chain_shape(5120, 2304, 4, 8, checks, chain_worst);
-        run_grouped_prefill_hybrid(false, compared, checks);
-        run_grouped_prefill_hybrid(true, compared, checks);
-        run_grouped_prefill_cold_transients(compared, checks);
+        run_chain_shape(inputs, 512, 256, 8, 10, checks, chain_worst);
+        run_chain_shape(inputs, 5120, 2304, 4, 8, checks, chain_worst);
+        run_grouped_prefill_hybrid(inputs, false, compared, checks);
+        run_grouped_prefill_hybrid(inputs, true, compared, checks);
+        run_grouped_prefill_cold_transients(inputs, compared, checks);
         // last: it sets the tier's environment for itself
-        run_host_jobs(GGML_TYPE_MXFP4, checks);
+        run_host_jobs(inputs, GGML_TYPE_MXFP4, checks);
         std::printf("REAL_GPU_MXFP4_TIER_PASS compared=%zu assertions=%zu chain_worst_rel_l2=%.3e\n", compared, checks, chain_worst);
         return 0;
     } catch (const std::exception & e) {

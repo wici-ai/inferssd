@@ -1,3 +1,4 @@
+#include "ssd/explicit-fixture-inputs.h"
 // The tier's host path (kimi_vram_host_api v3) through its C API, shared by test-kimi-vram-q2 (Q8_0, the generic
 // engine) and test-kimi-vram-mxfp4 (MXFP4, DeepSeek's engine). Included after test-kimi-cpu-sink.cpp (require, ggml).
 #pragma once
@@ -13,7 +14,7 @@
 // publishes (the next prepare hits it), or into a scratch slot the tier allocates at the token boundary after the first
 // registration; that registration's range is copied once, timed, when no copy has been; a batch wider than the free
 // scratch slots is refused; the costs report measured lines.
-inline void run_host_jobs(ggml_type type, size_t & checks) {
+inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & checks) {
     const auto * tier_api = reinterpret_cast<kimi_vram_tier_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_tier_get_api"))();
     const auto * format_api = reinterpret_cast<kimi_vram_format_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_format_get_api"))();
     const auto * host_api = reinterpret_cast<kimi_vram_host_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_host_get_api"))();
@@ -23,13 +24,13 @@ inline void run_host_jobs(ggml_type type, size_t & checks) {
     auto pad = [](size_t b) { return (b + 4095) & ~size_t(4095); };
     const size_t up = pad(ggml_row_size(type, latent) * hidden), down = pad(ggml_row_size(type, hidden) * latent);
     const size_t stride = 2 * up + down;
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY", "lru", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
+    inputs.set("vram_async", "0");
+    inputs.set("vram_deferred", "0");
+    inputs.set("tier.global", "0");
+    inputs.set("tier.elastic", "0");
+    inputs.set("tier.keep_across_requests", "1");
+    inputs.set("tier.policy", "lru");
+    inputs.set("tier.min_count", "0");
     char error[512] = {};
     void * t = tier_api->create(2 * stride, error, sizeof(error));
     require(t != nullptr, std::string("tier create: ") + error);

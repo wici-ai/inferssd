@@ -1,3 +1,4 @@
+#include "ssd/explicit-fixture-inputs.h"
 // Reuse one real grouped-prefill handle as expert service moves CPU -> GPU.
 // Synthetic packed weights; real tier kernels; zero input is an exact oracle
 // for these bias-free experts, independent of CPU/GPU rounding differences.
@@ -25,26 +26,26 @@ void check_zero(const char * label, ggml_type type, int tokens, const std::vecto
     std::fflush(stdout);
 }
 
-void run_case(ggml_type type, int tokens, int activation_kind) {
+void run_case(fixture_inputs & inputs, ggml_type type, int tokens, int activation_kind) {
     fixture f; f.type = f.down_type = type;
     f.latent = 512; f.hidden = 256; f.experts = 4;
     make_synthetic(f, 20261004);
     const auto unit = triplet_bytes(f);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", std::to_string(8 * unit).c_str(), 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_READY_FIRST", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN", "1", 1);
-    for (const char * key : {"GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "GGML_KIMI_CPU_SINK_VRAM_EXCLUSIVE",
-            "GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", "GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD",
-            "GGML_KIMI_CPU_SINK_VRAM_ELASTIC", "GGML_KIMI_CPU_SINK_EARLY_UP_GATE",
-            "GGML_KIMI_CPU_SINK_ROLE_MAJOR", "GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED",
+    inputs.set("vram_budget", std::to_string(8 * unit).c_str());
+    inputs.set("vram_prefill", "1");
+    inputs.set("ready_first", "1");
+    inputs.set("tier.keep_across_requests", "1");
+    inputs.set("tier.min_count", "0");
+    inputs.set("tier.mxfp4_gpu_hidden", "1");
+    for (const char * key : {"tier.global", "vram_exclusive",
+            "vram_async", "vram_deferred",
+            "tier.elastic", "early_up_gate",
+            "role_major", "nonblocking_down_sched",
             "GGML_KIMI_CPU_PREFILL_Q8_SSD_GPU_MAX_EXPERTS_PER_LAYER",
             "GGML_KIMI_CPU_PREFILL_MXFP4_SSD_GPU_MAX_EXPERTS_PER_LAYER"}) {
-        setenv(key, "0", 1);
+        inputs.set(key, "0");
     }
-    auto sink = make_sink(f, 4, 2);
+    auto sink = make_sink(inputs, f, 4, 2);
     configure_cache(sink.get(), 0, {1}, 4);
     tensors meta(f, 1);
     char error[512] = {};
@@ -109,6 +110,7 @@ void run_case(ggml_type type, int tokens, int activation_kind) {
 }
 
 int main(int argc, char ** argv) {
+    fixture_inputs inputs;
     try {
         ggml_cpu_init();
         #ifdef KIMI_SCRATCH_MXFP4_ONLY
@@ -118,11 +120,11 @@ int main(int argc, char ** argv) {
         #endif
         require(argc == 1 || (argc == 2 && std::string(argv[1]) == "--mxfp4-only"), "usage: test-kimi-prefill-scratch [--mxfp4-only]");
         for (int tokens : {9, 14, 48, 64, 65}) {
-            run_case(GGML_TYPE_MXFP4, tokens, KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP);
+            run_case(inputs, GGML_TYPE_MXFP4, tokens, KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP);
 #ifndef KIMI_SCRATCH_MXFP4_ONLY
             if (!mxfp4_only) {
-                run_case(GGML_TYPE_Q8_0, tokens, KIMI_CPU_SINK_ACTIVATION_SWIGLU);
-                run_case(GGML_TYPE_Q8_0, tokens, KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP);
+                run_case(inputs, GGML_TYPE_Q8_0, tokens, KIMI_CPU_SINK_ACTIVATION_SWIGLU);
+                run_case(inputs, GGML_TYPE_Q8_0, tokens, KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP);
             }
 #endif
         }

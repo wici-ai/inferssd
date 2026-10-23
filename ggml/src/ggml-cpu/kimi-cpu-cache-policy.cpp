@@ -39,37 +39,22 @@ static void validate(const kimi_cache_compute_config & c) {
         throw std::runtime_error("invalid cache-compute policy configuration (version 1)");
     }
 }
-static double number(const char * suffix, double fallback, bool integer) {
-    const std::string name = std::string("GGML_KIMI_CPU_SINK_CACHE_COMPUTE_") + suffix;
-    const char * s = std::getenv(name.c_str());
-    if (!s) { return fallback; }
-    char * end = nullptr; errno = 0;
-    const double v = std::strtod(s, &end);
-    if (errno || end == s || *end || !std::isfinite(v) || (integer && std::floor(v) != v) || v < 0 || v > 10000000) {
-        throw std::runtime_error("invalid " + name);
-    }
-    return v;
-}
+// The supported execution profile uses the model's original routes. Historical
+// bonus/hybrid/shrink policy planners remain explicit numerical unit fixtures;
+// no ambient configuration can enable them in production.
 extern "C" bool kimi_cache_compute_config_from_env(kimi_cache_compute_config * c, char * error, size_t size) {
     policy_error(error, size, "");
-    try {
-        if (!c) { throw std::runtime_error("null cache-compute config"); }
-        *c = {}; c->version = 1;
-        const char * mode = std::getenv("GGML_KIMI_CPU_SINK_CACHE_COMPUTE");
-        if (!mode || !std::strcmp(mode, "off") || !std::strcmp(mode, "0")) { c->mode = KIMI_CACHE_COMPUTE_OFF; }
-        else if (!std::strcmp(mode, "bonus")) { c->mode = KIMI_CACHE_COMPUTE_BONUS; }
-        else if (!std::strcmp(mode, "hybrid")) { c->mode = KIMI_CACHE_COMPUTE_HYBRID; }
-        else if (!std::strcmp(mode, "shrink")) { c->mode = KIMI_CACHE_COMPUTE_SHRINK; }
-        else { throw std::runtime_error("CACHE_COMPUTE must be off, bonus, hybrid, or shrink"); }
-        c->bonus_max = int(number("BONUS_MAX", 1, true));
-        c->min_s = int(number("MIN_S", 2, true)); c->max_s = int(number("MAX_S", 0, true));
-        c->s_fraction = float(number("S_FRACTION", .75, false));
-        c->deadline_us = uint64_t(number("DEADLINE_US", 1000, true));
-        c->protect_mass = float(number("PROTECT_MASS", .8, false));
-        c->protect_min = int(number("PROTECT_MIN", 2, true));
-        c->apply_guard = int(number("APPLY_GUARD", 0, true)); c->trace = int(number("TRACE", 0, true));
-        validate(*c); return true;
-    } catch (const std::exception & e) { policy_error(error, size, e.what()); return false; }
+    if (!c) { policy_error(error, size, "null cache-compute config"); return false; }
+    *c = {};
+    c->version = 1;
+    c->mode = KIMI_CACHE_COMPUTE_OFF;
+    c->bonus_max = 1;
+    c->min_s = 2;
+    c->s_fraction = .75f;
+    c->deadline_us = 1000;
+    c->protect_mass = .8f;
+    c->protect_min = 2;
+    return true;
 }
 extern "C" bool kimi_cache_compute_plan_init(const kimi_cache_compute_config * config,
         const int32_t * native_ids, const float * native_weights, int native_count,

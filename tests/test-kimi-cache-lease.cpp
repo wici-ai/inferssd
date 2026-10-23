@@ -1,13 +1,16 @@
+#include "ssd/explicit-fixture-inputs.h"
 // Inspect private metadata without creating workers, a GPU context or a payload
 // arena. Real file identities exercise version rejection and RAM lease vetoes.
 #include "kimi-cpu-sink.cpp"
-int main() { try {
+int main() {
+    fixture_inputs inputs; try {
     int checks = 0;
     auto require = [&](bool ok) { ++checks; if (!ok) throw std::runtime_error("cache lease assertion"); };
-    setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY","lru",1);
+    inputs.set("cache_policy", "lru");
     char path[] = "/tmp/kimi-cache-lease-XXXXXX";
     const int fd = mkstemp(path); require(fd >= 0); unlink(path);
-    sink_cache cache; sink_cache::layer layer; layer.id = 1; layer.count = 1;
+    sink_configuration configuration; configuration.policy = inputs.policy();
+    sink_cache cache(configuration); sink_cache::layer layer; layer.id = 1; layer.count = 1;
     cache.layers.push_back(layer); cache.entries.resize(1); cache.stride = 12288;
     sink_request r; r.id = 5;
     auto & e = cache.entries[0]; e.id = 5; e.valid = e.resident = e.enabled = true;

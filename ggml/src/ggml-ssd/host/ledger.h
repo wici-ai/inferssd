@@ -5,7 +5,7 @@
 // checkpoints and prompt-cache blobs, host compute buffers (and on a unified-memory GPU the device compute buffers,
 // which come out of the same DRAM). Room for `extra` more bytes is the smaller of two terms.
 //  - cgroup: the tightest finite memory.max among this process's cgroup and its ancestors, less the cgroup reserve
-//    (GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES, at least 512 MiB). It is what the RAM cache was always checked
+//    (a fixed 512 MiB). It is what the RAM cache was always checked
 //    against, and on a discrete GPU it is the term that binds.
 //  - system: MemAvailable less the floor. On a unified-memory GPU (DGX Spark, Jetson) a device allocation comes out
 //    of the same DRAM without being charged to the cgroup, so only this term sees the GPU tier, the KV cache, the
@@ -158,34 +158,15 @@ struct kimi_host_ledger {
         return false;
     }
 
-    static uint64_t env_mib(const char * name) {
-        const char * text = std::getenv(name);
-        uint64_t mib = 0;
-        if (!text || !*text) { return 0; }
-        if (!decimal(text, mib) || mib > (UINT64_MAX >> 20)) { throw std::runtime_error(std::string("invalid ") + name); }
-        return mib << 20;
-    }
-    // Configuration from the environment, the one place every ledger of the process reads it. The cgroup reserve is
-    // GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES (default 2 GiB, at least 512 MiB) and the margin starts there. On unified
-    // memory the tier's former GGML_KIMI_CPU_SINK_VRAM_HOST_HEADROOM_MIB named the same margin, so the larger of the
-    // two applies to it; a discrete GPU never read it. GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE=1 counts the
-    // cgroup's file pages as its headroom.
-    void configure(bool is_unified) {
+    // The cgroup reserve is the supported profile's fixed 512 MiB. Hardware
+    // observations still come from /proc and cgroup v2; only the context's host
+    // margin and device reserve are supplied by the typed settings owner.
+    void configure(bool is_unified, uint32_t host_headroom_mib = 512, uint32_t device_reserve_mib = 0) {
         unified = is_unified;
-        reserve = 2ull << 30;
-        if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES")) {
-            if (!decimal(value, reserve)) { throw std::runtime_error("invalid GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES"); }
-            if (reserve < (512ull << 20)) { throw std::runtime_error("CACHE_RESERVE_BYTES must be at least 512 MiB"); }
-        }
-        margin = unified ? std::max(reserve, env_mib("GGML_KIMI_CPU_SINK_VRAM_HOST_HEADROOM_MIB")) : reserve;
-        reclaimable_file = false;
-        if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE")) {
-            if (!std::strcmp(value, "1")) { reclaimable_file = true; }
-            else if (std::strcmp(value, "0")) {
-                throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_RECLAIMABLE_FILE must be 0 or 1");
-            }
-        }
-        explicit_reserve = add(env_mib("GGML_KIMI_HOST_RESERVE_MIB"), unified ? env_mib("GGML_CUDA_MEMORY_RESERVE_MIB") : 0);
+        reserve = 512ull << 20;
+        margin = unified ? std::max(reserve, uint64_t(host_headroom_mib) << 20) : reserve;
+        reclaimable_file = true;
+        explicit_reserve = unified ? uint64_t(device_reserve_mib) << 20 : 0;
         const long page = sysconf(_SC_PAGESIZE);
         page_size = page > 0 ? uint64_t(page) : 4096;
         std::string groups;

@@ -6,7 +6,6 @@
 static void require(bool ok, const char * why) { if (!ok) { throw std::runtime_error(why); } }
 int main() {
  try {
-    unsetenv("GGML_KIMI_CPU_SINK_CACHE_COMPUTE");
     kimi_cache_compute_config c{}; char error[256] = {};
     require(kimi_cache_compute_config_from_env(&c, error, sizeof(error)), error);
     require(c.mode == 0 && c.apply_guard == 0, "default off and guard bypass");

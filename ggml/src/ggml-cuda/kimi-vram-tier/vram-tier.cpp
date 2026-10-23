@@ -5,6 +5,10 @@
 #include "kimi-mxfp4-batch.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
+#include "../../ggml-ssd/gpu-tier-settings.h"
+#include "../../ggml-ssd/testing/tier.h"
+#include "../../ggml-ssd/settings/settings.h"
+#include "../../ggml-ssd/telemetry/telemetry.h"
 #include <cuda_runtime_api.h>
 #include <dlfcn.h>
 #include <algorithm>
@@ -37,26 +41,7 @@ extern "C" const vram_group_compute_api * kimi_vram_group_compute_get_api() __at
 
 namespace {
 void cuda_check(cudaError_t rc){if(rc!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(rc));}
-uint64_t env_size(const char * name,uint64_t fallback,uint64_t maximum){
-    const char * s=std::getenv(name);if(!s || !*s)return fallback;
-    char * end=nullptr;errno=0;uint64_t value=std::strtoull(s,&end,10);
-    if(errno || s==end || *end || *s=='-' || value>maximum)throw std::runtime_error(std::string("invalid ")+name);
-    return value;
-}
-double env_count(){
-    const char * s=std::getenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT");if(!s || !*s)return 0;
-    char * end=nullptr;errno=0;double x=std::strtod(s,&end);
-    if(errno || end==s || *end || !std::isfinite(x) || x<0 || x>4)throw std::runtime_error("invalid GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT");
-    return x;
-}
-double env_half_life(){
-    const char * s=std::getenv("GGML_KIMI_CPU_SINK_VRAM_DECAY_HALF_LIFE");
-    if(!s || !*s)return 2;
-    char * end=nullptr;errno=0;double x=std::strtod(s,&end);
-    if(errno || end==s || *end || !std::isfinite(x) || (x!=0 && (x<1 || x>64)))
-        throw std::runtime_error("invalid GGML_KIMI_CPU_SINK_VRAM_DECAY_HALF_LIFE");
-    return x==0?2:x; // zero leaves the original two-token half-life in use
-}
+using tier_options = ssd::gpu::testing::tier_options;
 // ggml's own device-memory query (MemAvailable on a unified-memory GPU) and its run-time reserve. Looked up
 // at run time like the OOM reclaimer: lifecycle tests link this file without the CUDA backend, and may replace
 // these functions with a model of the memory before the first tier asks.
@@ -72,6 +57,7 @@ struct ggml_memory_query {
 using clock_type=std::chrono::steady_clock;
 double micros(clock_type::time_point t){return std::chrono::duration<double,std::micro>(clock_type::now()-t).count();}
 struct tier {
+    const tier_options configuration;
     static constexpr size_t elastic_block_slots=16;
     static constexpr uint64_t automatic_budget=UINT64_MAX; // GGML_KIMI_CPU_SINK_VRAM_BYTES=auto
     using reclaimer_callback=int (*)(void *,size_t,size_t *);
@@ -232,32 +218,23 @@ struct tier {
     bool (*deferred_hook)(void *)=nullptr;void * deferred_hook_arg=nullptr; // tests: runs before each copy, false fails it
     std::string failure;
 
-    explicit tier(uint64_t b):budget(b),safety_bytes(env_size("GGML_KIMI_CPU_SINK_VRAM_SAFETY_MIB",512,8192)<<20),
-        async_upload(env_size("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD",0,1)!=0),
-        memory_trace(env_size("GGML_KIMI_CPU_SINK_VRAM_MEMORY_TRACE",0,1)!=0),
-        keep_across_requests(env_size("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS",0,1)!=0),
-        timing(env_size("GGML_KIMI_CPU_SINK_VRAM_TIMING",0,1)!=0),
-        elastic_requested(env_size("GGML_KIMI_CPU_SINK_VRAM_ELASTIC",0,1)!=0),
-        // auto has no base to shrink to at a prefill: it gives back only what an allocation needs
-        elastic_demand_reclaim(env_size("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_DEMAND_RECLAIM",0,1)!=0 || b==automatic_budget),
-        elastic_safety_blocks(env_size("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_BLOCKS",0,4096)),
-        // cudaGraphInstantiate bypasses the backend-buffer allocator. A real
-        // safety=0 run left 5.25 MiB and aborted there; 32 MiB is a compact
-        // power-of-two reserve above the measured 21 MiB of late allocations.
-        elastic_safety_mib(env_size("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_SAFETY_MIB",32,8192)),
-        elastic_max_slots(env_size("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_MAX_SLOTS",0,1000000)),
-        fail_malloc_at(env_size("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_MALLOC_AT",0,UINT64_MAX)),
-        fail_free_at(env_size("GGML_KIMI_CPU_SINK_VRAM_ELASTIC_FAIL_FREE_AT",0,UINT64_MAX)),
-        deferred_upload(env_size("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD",0,1)!=0){
-        mxfp4_batch_enabled=env_size("GGML_KIMI_MXFP4_PREFILL_BATCH",1,1)!=0;
-        watermark=env_size("GGML_KIMI_CPU_SINK_VRAM_WATERMARK",1,1)!=0;
-        watermark_low_mib=env_size("GGML_KIMI_CPU_SINK_VRAM_WATERMARK_LOW_MIB",128,8192);
-        watermark_high_mib=env_size("GGML_KIMI_CPU_SINK_VRAM_WATERMARK_HIGH_MIB",448,8192);
-        if(watermark && watermark_high_mib<=watermark_low_mib)throw std::runtime_error("GGML_KIMI_CPU_SINK_VRAM_WATERMARK_HIGH_MIB must exceed LOW_MIB");
+    explicit tier(uint64_t b, const tier_options & options = {}) : configuration(options),
+        budget(b), safety_bytes(options.safety_mib << 20), async_upload(options.async_upload),
+        memory_trace(options.memory_trace), keep_across_requests(options.keep_across_requests), timing(options.timing),
+        elastic_requested(options.elastic), elastic_demand_reclaim(options.demand_reclaim || b == automatic_budget),
+        elastic_safety_blocks(options.safety_blocks), elastic_safety_mib(options.margin_mib), elastic_max_slots(options.max_slots),
+        fail_malloc_at(options.fail_malloc_at), fail_free_at(options.fail_free_at), deferred_upload(options.deferred_upload) {
+        mxfp4_batch_enabled = options.mxfp4_batch;
+        watermark = options.watermark;
+        watermark_low_mib = options.low_mib;
+        watermark_high_mib = options.high_mib;
+        if (watermark && watermark_high_mib <= watermark_low_mib) {
+            throw std::runtime_error("VRAM watermark high margin must exceed low reserve");
+        }
         pending_uploads.reserve(16);
         if(deferred_upload && !async_upload)throw std::runtime_error("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD requires ASYNC_UPLOAD=1");
         // auto sizes an elastic tier only; a fixed arena would take all free memory and could never give it back
-        if(budget==automatic_budget && !(elastic_requested && keep_across_requests && env_size("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL",0,1)))
+        if(budget==automatic_budget && !(elastic_requested && keep_across_requests && configuration.global))
             throw std::runtime_error("GGML_KIMI_CPU_SINK_VRAM_BYTES=auto requires VRAM_ELASTIC=1, VRAM_GLOBAL_POOL=1 and VRAM_KEEP_ACROSS_REQUESTS=1");
     }
     ~tier(){
@@ -361,7 +338,7 @@ struct tier {
     // are first touches read from the drive (4.6-5.0 ms a miss on the Spark against about 1.2 ms from the fourth
     // token, when recurring experts come from the RAM cache): the price follows what a miss costs at the time.
     void update_admission(){
-        static const bool enabled=env_size("GGML_KIMI_CPU_SINK_VRAM_ADAPTIVE_ADMISSION",1,1)!=0; // diagnostic A/B switch
+        const bool enabled = configuration.adaptive_admission;
         if(!enabled || !table || !table->count_decay)return;
         double miss=0,hit=0,upload=0; // the sink, the worker and the upload thread write them under mutex
         {std::lock_guard<std::mutex> lock(mutex);miss=miss_us;hit=resident_us_per_expert;upload=upload_us_per_expert;}
@@ -1754,8 +1731,24 @@ struct tier {
                     !format_api->destroy || !format_api->compute || !format_api->device_scratch_bytes || !format_api->host_scratch_bytes)
                 throw std::runtime_error("explicit-format VRAM engine ABI mismatch");
             char error[512]={};
-            engine=format_api->create(device,f.latent,f.hidden,16,f.weight_type,f.down_type,error,sizeof(error));
+            if (mxfp4 && configuration.fixture) {
+                using fixture_create_fn = void * (*)(int, int, int, int, int, int, bool, bool, char *, size_t) noexcept;
+                auto create_fixture = reinterpret_cast<fixture_create_fn>(dlsym(RTLD_DEFAULT, "ggml_ssd_mxfp4_create_for_testing"));
+                if (!create_fixture) { throw std::runtime_error("real MXFP4 fixture factory missing"); }
+                engine = create_fixture(device, f.latent, f.hidden, 16, f.weight_type, f.down_type,
+                    configuration.mxfp4_gpu_hidden, timing, error, sizeof(error));
+            } else {
+                engine=format_api->create(device,f.latent,f.hidden,16,f.weight_type,f.down_type,error,sizeof(error));
+            }
             if(!engine)throw std::runtime_error(error);
+            if (mxfp4 && timing) {
+                using set_profile_fn = int (*)(void *, bool, char *, size_t) noexcept;
+                auto set_profile = reinterpret_cast<set_profile_fn>(dlsym(RTLD_DEFAULT, "ggml_backend_cuda_ssd_mxfp4_set_profile"));
+                if (!set_profile || set_profile(engine, true, error, sizeof(error))) {
+                    format_api->destroy(engine); engine = nullptr;
+                    throw std::runtime_error(error[0] ? error : "MXFP4 profile service missing");
+                }
+            }
             latent=f.latent;hidden=f.hidden;weight_type=f.weight_type;down_type=f.down_type;n_experts=f.n_experts;format_mode=true;
             worker=std::thread([this]{worker_loop();});
             if(deferred_upload)upload_thread=std::thread([this]{upload_loop();});
@@ -1812,13 +1805,11 @@ struct tier {
         if(free_bytes<=safety_bytes || std::min<uint64_t>(budget,free_bytes-safety_bytes)<stride)throw std::runtime_error("no VRAM cache capacity after safety reserve");
         const std::vector<int> priority(f.layers,f.layers+f.n_layers);
         const size_t logical_max=size_t(priority.size())*size_t(n_experts);
-        const bool global=env_size("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL",0,1)!=0;
+        const bool global = configuration.global;
         const size_t count=initial_slots(free_bytes,logical_max,global);
         base_slots=count;
-        const char * policy=std::getenv("GGML_KIMI_CPU_SINK_VRAM_POLICY");
-        if(policy && std::strcmp(policy,"lru") && std::strcmp(policy,"count_decay2"))throw std::runtime_error("invalid VRAM policy");
-        table=std::make_unique<vram_slot_table>(count,priority,!policy || std::strcmp(policy,"lru"),env_count(),
-                global,env_half_life(),0,1023,n_experts);
+        table=std::make_unique<vram_slot_table>(count,priority,configuration.count_policy,configuration.min_count,
+                global,configuration.half_life,0,1023,n_experts);
         configure_elastic(global,logical_max);
         memory_sample("before_allocate");
         const auto allocate_start=memory_trace?clock_type::now():clock_type::time_point{};
@@ -2415,7 +2406,10 @@ int reject_implicit_format(void * p,char * error,size_t size,const char * messag
     }
     return 1;
 }
-void * api_create(uint64_t bytes,char * error,size_t n){try{return new tier(bytes);}catch(const std::exception & e){if(n)std::snprintf(error,n,"%s",e.what());return nullptr;}}
+void * api_create(uint64_t, char * error, size_t size) noexcept {
+    if (error && size) { std::snprintf(error, size, "GPU tier creation requires typed settings or explicit fixture policy"); }
+    return nullptr;
+}
 void api_destroy(void * p){delete static_cast<tier *>(p);}
 int api_begin(void * p,uint64_t epoch,uint64_t token,int decode,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->begin(epoch,token,decode);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int api_prepare(void * p,const kimi_vram_request *,int,int,int,int *,char * e,size_t n){return reject_implicit_format(p,e,n,"implicit expert format retired; use explicit-format prepare");}
@@ -2548,6 +2542,53 @@ int policy_reclaim_host(void * p,uint64_t bytes){
 void policy_set_miss_cost(void * p,double us){
     auto * t=static_cast<tier *>(p);if(!t || !std::isfinite(us) || us<0)return;
     std::lock_guard<std::mutex> lock(t->mutex);t->miss_us=t->miss_us>0?0.9*t->miss_us+0.1*us:us;}
+void * create_test_tier(uint64_t bytes, const tier_options * options, char * error, size_t size) noexcept {
+    try {
+        if (!options) { throw std::runtime_error("missing explicit CUDA fixture policy"); }
+        return new tier(bytes, *options);
+    } catch (const std::exception & e) {
+        if (error && size) { std::snprintf(error, size, "%s", e.what()); }
+        return nullptr;
+    }
+}
+void * create_configured_tier(const ssd::settings::snapshot * input, const ssd::runtime_services * services,
+        char * error, size_t size) noexcept {
+    try {
+        if (!input) { throw std::runtime_error("missing typed GPU tier settings"); }
+        const auto settings = *input;
+        const auto * budget = settings.vram_budget();
+        const auto * margin = settings.integer("vram.margin_mib");
+        const auto * reserve = settings.integer("vram.reserve_mib");
+        const auto * slots = settings.integer("vram.max_slots");
+        if (!budget || !margin || !reserve || !slots || *reserve > 8192 || *margin > 8192 || *margin < *reserve + 64) {
+            throw std::runtime_error("invalid typed GPU tier budget or margins");
+        }
+        const uint64_t bytes = budget->automatic ? tier::automatic_budget : budget->bytes;
+        if (!bytes || (bytes != tier::automatic_budget && bytes > (64ull << 30))) {
+            throw std::runtime_error("GPU tier requires a nonzero typed vram.budget");
+        }
+        tier_options options;
+        options.fixture = false;
+        options.mxfp4_gpu_hidden = true;
+        options.safety_mib = options.margin_mib = size_t(*margin);
+        options.low_mib = size_t(*reserve);
+        options.high_mib = size_t(*margin);
+        options.max_slots = size_t(*slots);
+        options.async_upload = options.keep_across_requests = options.elastic = options.demand_reclaim = true;
+        options.deferred_upload = options.global = options.count_policy = options.adaptive_admission = true;
+        options.min_count = 2.5;
+        options.half_life = 16;
+        if (services && services->debug) {
+            const auto debug = *services->debug;
+            options.memory_trace = debug.ledger;
+            options.timing = debug.profile;
+        }
+        return new tier(bytes, options);
+    } catch (const std::exception & e) {
+        if (error && size) { std::snprintf(error, size, "%s", e.what()); }
+        return nullptr;
+    }
+}
 } // namespace
 extern "C" const kimi_vram_policy_api * kimi_vram_policy_get_api(){
     static const kimi_vram_policy_api api={3,sizeof(kimi_vram_policy_api),policy_set_miss_cost,policy_set_host_demand,
@@ -2582,4 +2623,14 @@ extern "C" const kimi_vram_prefill_api * kimi_vram_prefill_get_api(){
     static const kimi_vram_prefill_api api={7,sizeof(kimi_vram_prefill_api),prefill_prepare,
         prefill_transient_available,prefill_launch,prefill_finish,prefill_cancel,
         prefill_cold_admission_active,prefill_admit_cold,prefill_lane};return &api;
+}
+
+extern "C" const ssd::gpu::settings_api * ggml_backend_cuda_ssd_tier_settings_get_api() {
+    static const ssd::gpu::settings_api api = { 1, sizeof(ssd::gpu::settings_api), create_configured_tier };
+    return &api;
+}
+
+extern "C" const ssd::gpu::testing::api * ggml_ssd_tier_testing_get_api() {
+    static const ssd::gpu::testing::api api = { 1, sizeof(ssd::gpu::testing::api), create_test_tier };
+    return &api;
 }

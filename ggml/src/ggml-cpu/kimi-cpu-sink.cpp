@@ -1,5 +1,10 @@
 #include "kimi-cpu-sink.h"
 #include "kimi-cpu-sink-internal.h"
+#include "ssd/runtime.h"
+#include "ssd/testing.h"
+#include "../ggml-ssd/settings/settings.h"
+#include "../ggml-ssd/gpu-tier-settings.h"
+#include "../ggml-ssd/telemetry/telemetry.h"
 #include "../ggml-ssd/place/layer-plan.h"
 #include "../ggml-ssd/host/page-lock.h"
 #include "kimi-cache-location-api.h"
@@ -25,6 +30,9 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <sstream>
+#include <iomanip>
+#include <locale>
 #include <thread>
 #include <vector>
 
@@ -61,18 +69,6 @@ static double elapsed_us(sink_clock::time_point start) {
     return std::chrono::duration<double, std::micro>(sink_clock::now() - start).count();
 }
 
-static int sink_poll_us_env() {
-    const char * value = std::getenv("GGML_KIMI_CPU_SINK_POLL_US");
-    if (!value || !*value) { return 0; }
-    char * end = nullptr;
-    errno = 0;
-    const long n = std::strtol(value, &end, 10);
-    if (errno || end == value || *end || n < 0 || n > 1000) {
-        throw std::runtime_error("GGML_KIMI_CPU_SINK_POLL_US must be an integer in [0,1000]");
-    }
-    return int(n);
-}
-
 template <typename Predicate>
 static void sink_poll(int microseconds, Predicate ready) {
     const auto deadline = sink_clock::now() + std::chrono::microseconds(microseconds);
@@ -90,13 +86,6 @@ static void sink_poll(int microseconds, Predicate ready) {
 
 static std::runtime_error sys_error(const char * operation) {
     return std::runtime_error(std::string(operation) + ": " + std::strerror(errno));
-}
-
-static bool sink_read_fixed_from_env() {
-    const char * value = std::getenv("GGML_KIMI_CPU_SINK_READ_FIXED");
-    if (!value || !value[0] || !std::strcmp(value, "0")) { return false; }
-    if (!std::strcmp(value, "1")) { return true; }
-    throw std::runtime_error("GGML_KIMI_CPU_SINK_READ_FIXED must be 0 or 1");
 }
 
 // Single producer/consumer, owned by the persistent I/O thread. Direct syscalls
@@ -306,69 +295,28 @@ static bool sink_expert_type_supported(ggml_type type, int64_t columns) {
         columns % ggml_blck_size(type) == 0 && columns % ggml_blck_size(traits->vec_dot_type) == 0;
 }
 
-static bool sink_bool_env(const char * name, bool fallback) {
-    const char * value = std::getenv(name);
-    if (!value || !*value) { return fallback; }
-    if (std::strcmp(value, "0") == 0) { return false; }
-    if (std::strcmp(value, "1") == 0) { return true; }
-    throw std::runtime_error(std::string(name) + " must be 0 or 1");
-}
+struct sink_configuration {
+    bool production = false;
+    ssd::settings::snapshot settings;
+    ssd::telemetry::debug_channels debug;
+    ssd::telemetry::writer * events = nullptr;
+    ssd::cpu::testing::execution_policy policy;
+};
 
-static int sink_dynamic_chunk_rows_env() {
-    const char * value = std::getenv("GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS");
-    if (!value || !*value) { return 64; }
-    char * end = nullptr;
-    errno = 0;
-    const long n = std::strtol(value, &end, 10);
-    // A float output cache line is 16 rows. Requiring whole lines lets the
-    // scheduler give every worker disjoint cache lines after its aligned prefix.
-    if (errno || end == value || *end || n < 16 || n > 16384 || n % 16) {
-        throw std::runtime_error("GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS must be a multiple of 16 in [16,16384]");
-    }
-    return int(n);
-}
-
-static std::vector<double> sink_weights_env(int count) {
-    const char * p = std::getenv("GGML_KIMI_CPU_SINK_ROW_WEIGHTS");
-    std::vector<double> result;
-    if (!p || !*p) { return result; }
-    for (;;) {
-        char * end = nullptr;
-        errno = 0;
-        const double value = std::strtod(p, &end);
-        if (end == p || errno || !std::isfinite(value) || value <= 0 || (*end && *end != ',')) {
-            throw std::runtime_error("ROW_WEIGHTS requires comma-separated positive finite weights");
-        }
-        result.push_back(value);
-        if (!*end) { break; }
-        p = end + 1;
-    }
-    if (result.size() != size_t(count)) {
-        throw std::runtime_error("ROW_WEIGHTS requires total_threads - 1 entries, including the caller");
-    }
-    return result;
-}
-
-static std::vector<int> sink_cpus_env(const char * name, int count) {
-    const char * p = std::getenv(name);
-    std::vector<int> result;
-    if (!p || !*p) { return result; }
+static std::vector<int> sink_cpus(const std::vector<int> & cpus, int count) {
+    if (cpus.empty()) { return {}; }
     cpu_set_t allowed;
     if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) { throw sys_error("get sink affinity"); }
-    for (;;) {
-        char * end = nullptr;
-        errno = 0;
-        const long cpu = std::strtol(p, &end, 10);
-        if (end == p || errno || cpu < 0 || cpu >= CPU_SETSIZE || (*end && *end != ',') ||
-            !CPU_ISSET(cpu, &allowed) || std::find(result.begin(), result.end(), cpu) != result.end()) {
-            throw std::runtime_error(std::string(name) + " requires distinct CPUs within the caller's allowed mask");
+    std::vector<int> result;
+    for (int cpu : cpus) {
+        if (cpu < 0 || cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &allowed) ||
+            std::find(result.begin(), result.end(), cpu) != result.end()) {
+            throw std::runtime_error("CPU setting requires distinct CPUs within the caller's allowed mask");
         }
-        result.push_back(int(cpu));
-        if (!*end) { break; }
-        p = end + 1;
+        result.push_back(cpu);
     }
     if (count && result.size() != size_t(count)) {
-        throw std::runtime_error(std::string(name) + " requires total_threads - 1 CPUs, including the caller");
+        throw std::runtime_error("cpu.compute_cpus requires cpu.threads - 1 CPUs, including the caller");
     }
     return result;
 }
@@ -636,116 +584,49 @@ struct sink_cache {
         return "unknown";
     }
 
-    sink_cache() {
+    explicit sink_cache(const sink_configuration & configuration) {
         if (page_size < 4096 || page_size > 65536 || (page_size & (page_size - 1))) {
             throw std::runtime_error("CPU sink cache requires a supported system page size");
         }
-        if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_CACHE_POLICY")) {
-            if (!std::strcmp(value, "window")) { policy = window; }
-            else if (!std::strcmp(value, "lru")) { policy = lru; }
-            else if (!std::strcmp(value, "lfu")) { policy = lfu; }
-            else if (!std::strcmp(value, "decay")) { policy = decay; }
-            else if (!std::strcmp(value, "count_decay2")) { policy = count_decay2; }
-            else { throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_POLICY must be window, lru, lfu, decay, or count_decay2"); }
-        }
-        if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS")) {
-            if (!std::strcmp(value, "1")) { keep_across_requests = true; }
-            else if (std::strcmp(value, "0")) {
-                throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS must be 0 or 1");
-            }
-        }
+        const auto & p = configuration.policy;
+        if (p.cache_policy == "window") { policy = window; }
+        else if (p.cache_policy == "lru") { policy = lru; }
+        else if (p.cache_policy == "lfu") { policy = lfu; }
+        else if (p.cache_policy == "decay") { policy = decay; }
+        else if (p.cache_policy == "count_decay2") { policy = count_decay2; }
+        else { throw std::runtime_error("invalid explicit test cache policy"); }
+        if (p.cache_allocation == "priority") { allocation = priority_order; }
+        else if (p.cache_allocation == "uniform") { allocation = uniform; }
+        else if (p.cache_allocation == "global") { allocation = global; }
+        else { throw std::runtime_error("invalid explicit test cache allocation"); }
+        keep_across_requests = p.cache_keep;
+        prefill_read = p.cache_prefill_read;
+        elastic = p.cache_elastic;
+        partial_reclaim = p.cache_partial_reclaim;
+        prefill_slots = p.cache_prefill_slots;
+        layer_quotas = p.cache_layer_quotas;
         if (keep_across_requests && policy == window) {
-            throw std::runtime_error("CACHE_KEEP_ACROSS_REQUESTS requires a persistent cache policy");
-        }
-        if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_CACHE_PREFILL_READ")) {
-            if (!std::strcmp(value, "1")) { prefill_read = true; }
-            else if (std::strcmp(value, "0")) {
-                throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_PREFILL_READ must be 0 or 1");
-            }
+            throw std::runtime_error("cache retention requires a persistent policy");
         }
         if (prefill_read && !keep_across_requests) {
-            throw std::runtime_error("CACHE_PREFILL_READ requires CACHE_KEEP_ACROSS_REQUESTS=1");
-        }
-        if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_CACHE_ELASTIC")) {
-            if (!std::strcmp(value, "1")) { elastic = true; }
-            else if (std::strcmp(value, "0")) {
-                throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_ELASTIC must be 0 or 1");
-            }
-        }
-        if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM")) {
-            if (!std::strcmp(value, "1")) { partial_reclaim = true; }
-            else if (std::strcmp(value, "0")) {
-                throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_PARTIAL_RECLAIM must be 0 or 1");
-            }
-        }
-        if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION")) {
-            if (!std::strcmp(value, "priority")) { allocation = priority_order; }
-            else if (!std::strcmp(value, "uniform")) { allocation = uniform; }
-            else if (!std::strcmp(value, "global")) { allocation = global; }
-            else { throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION must be priority, uniform, or global"); }
+            throw std::runtime_error("read-only prefill cache requires retention");
         }
         if (policy == window && allocation == global) {
-            throw std::runtime_error("window cache policy requires priority or uniform allocation");
+            throw std::runtime_error("window cache cannot use global allocation");
         }
-        auto decimal = [](const std::string & text, uint64_t maximum) {
-            uint64_t result = 0;
-            if (text.empty()) { throw std::runtime_error("empty CPU sink cache setting"); }
-            for (const char c : text) {
-                if (c < '0' || c > '9' || uint64_t(c - '0') > maximum ||
-                        result > (maximum - uint64_t(c - '0')) / 10) {
-                    throw std::runtime_error("invalid CPU sink cache integer setting");
-                }
-                result = result * 10 + uint64_t(c - '0');
-            }
-            return result;
-        };
-        const char * prefill_value = std::getenv("GGML_KIMI_CPU_SINK_CACHE_PREFILL_SLOTS");
-        if (prefill_value) {
-            prefill_slots = size_t(decimal(prefill_value, 256ull * 896));
-        }
-        if (elastic) {
-            if (!prefill_value) {
-                throw std::runtime_error("CACHE_ELASTIC requires CACHE_PREFILL_SLOTS");
-            }
-            if (!keep_across_requests || policy == window || allocation != uniform) {
-                throw std::runtime_error("CACHE_ELASTIC requires retention, a persistent policy, and uniform allocation");
-            }
-        } else if (prefill_value) {
-            throw std::runtime_error("CACHE_PREFILL_SLOTS requires CACHE_ELASTIC=1");
-        }
-        if (partial_reclaim && (!keep_across_requests || policy == window || allocation != uniform)) {
-            throw std::runtime_error("CACHE_PARTIAL_RECLAIM requires retention, a persistent policy, and uniform allocation");
-        }
-        if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_CACHE_LAYER_QUOTAS")) {
-            // A bounded inline list is included in the normal environment
-            // receipt. Reject partial/duplicate profiles instead of falling
-            // back to a different placement silently.
-            const size_t length = strnlen(value, 4097);
-            if (!length || length > 4096 || allocation != uniform) {
-                throw std::runtime_error("CACHE_LAYER_QUOTAS requires uniform allocation and a nonempty list of at most 4096 bytes");
-            }
-            const std::string profile(value, length);
-            size_t start = 0;
-            do {
-                const size_t end = profile.find(',', start);
-                const std::string pair = profile.substr(start, end == std::string::npos ? end : end - start);
-                const size_t colon = pair.find(':');
-                if (colon == std::string::npos || layer_quotas.size() == 256) {
-                    throw std::runtime_error("CACHE_LAYER_QUOTAS must contain at most 256 layer:slots pairs");
-                }
-                const int32_t id = int32_t(decimal(pair.substr(0, colon), 1023));
-                const size_t slots = size_t(decimal(pair.substr(colon + 1), 896));
-                if (!layer_quotas.emplace(id, slots).second) {
-                    throw std::runtime_error("CACHE_LAYER_QUOTAS contains a duplicate layer");
-                }
-                if (end == std::string::npos) { break; }
-                start = end + 1;
-            } while (true);
+        if ((elastic || partial_reclaim) && (!keep_across_requests || policy == window || allocation != uniform)) {
+            throw std::runtime_error("cache reclaim requires retention, a persistent policy, and uniform allocation");
         }
         if ((elastic || partial_reclaim) && !layer_quotas.empty()) {
-            throw std::runtime_error("CACHE_ELASTIC and CACHE_PARTIAL_RECLAIM cannot be combined with CACHE_LAYER_QUOTAS");
+            throw std::runtime_error("cache reclaim cannot use explicit layer quotas");
         }
-        ledger.configure(sink_unified_memory());
+        const auto * headroom = configuration.settings.integer("host.headroom_mib");
+        const auto * reserve = configuration.settings.integer("vram.reserve_mib");
+        ledger.configure(sink_unified_memory(), headroom ? uint32_t(*headroom) : 512, reserve ? uint32_t(*reserve) : 0);
+        ledger.reserve = p.cache_reserve_bytes;
+        if (ledger.reserve < (512ull << 20)) { throw std::runtime_error("cache reserve must be at least 512 MiB"); }
+        ledger.margin = std::max(ledger.margin, ledger.reserve);
+        ledger.reclaimable_file = p.cache_reclaimable_file;
         std::fprintf(stderr, "[kimi_host_ledger] unified=%d reserve=%llu margin=%llu explicit_reserve=%llu reclaimable_file=%d cgroup=%s\n",
                 int(ledger.unified), (unsigned long long) ledger.reserve, (unsigned long long) ledger.margin,
                 (unsigned long long) ledger.explicit_reserve, int(ledger.reclaimable_file),
@@ -1688,12 +1569,7 @@ struct sink_mrc {
     int first_layer = -1;
     std::vector<int> scratch;
 
-    explicit sink_mrc(bool on) : enabled(on) {
-        if (const char * v = std::getenv("GGML_KIMI_CPU_SINK_MRC_EVERY")) {
-            const long n = std::strtol(v, nullptr, 10);
-            if (n > 0) { report_every = uint64_t(n); }
-        }
-    }
+    explicit sink_mrc(bool on) : enabled(on) {}
 
     void observe(int layer, const int32_t * ids, int n) {
         if (!enabled || layer < 0 || !ids || n <= 0) { return; }
@@ -1777,6 +1653,7 @@ struct sink_mrc {
 };
 
 struct kimi_cpu_sink {
+    const sink_configuration configuration;
     const int compute_threads;
     const int ring_experts;
     kimi_cpu_sink_resolver resolver;
@@ -1957,8 +1834,8 @@ struct kimi_cpu_sink {
     // (sink_cache::before_discard).
     kimi_host_lock host_lock;
     // Diagnostic switches for A/B runs; both on by default.
-    const bool host_gpu_enabled = sink_bool_env("GGML_KIMI_CPU_SINK_HOST_GPU", true);
-    const bool decode_thread_choice = sink_bool_env("GGML_KIMI_CPU_SINK_DECODE_THREAD_CHOICE", true);
+    const bool host_gpu_enabled = true;
+    const bool decode_thread_choice = true;
     std::vector<uint8_t> staged_quant_hidden;
     const bool profile_enabled;
     const bool trace_enabled;
@@ -1970,7 +1847,7 @@ struct kimi_cpu_sink {
     uint64_t trace_epoch = 0, trace_token = 0, trace_call = 0;
     bool trace_has_token = false, trace_decode = false;
     int trace_layer = -1;
-    sink_mrc mrc{sink_bool_env("GGML_KIMI_CPU_SINK_MRC", false)};
+    sink_mrc mrc;
     double caller_cpu_start = 0;
     sink_clock::time_point phase_dispatch;
     std::vector<sink_worker_profile> worker_profiles;
@@ -1988,7 +1865,7 @@ struct kimi_cpu_sink {
     struct thread_choice {
         static constexpr uint64_t probe_experts = 400, recheck_experts = 40000;
         int candidates[2] = {}, current = 0, decided = -1;
-        bool locked = false; // fixed by the environment: no comparison, no recheck
+        bool locked = false; // fixed by the owned configuration: no comparison, no recheck
         double us[2] = {};
         uint64_t samples[2] = {}, since_decision = 0;
     } decode_threads;
@@ -2010,27 +1887,44 @@ struct kimi_cpu_sink {
     ggml_vec_dot_t dot_up = nullptr, dot_down = nullptr;
     ggml_from_float_t quantize_input = nullptr, quantize_hidden = nullptr;
 
-    kimi_cpu_sink(int threads, int depth, kimi_cpu_sink_resolver resolve, void * user) :
-        compute_threads(threads - 1), ring_experts(depth), resolver(resolve), userdata(user), slots(depth),
-        split_cv(sink_bool_env("GGML_KIMI_CPU_SINK_SPLIT_CV", false)),
-        ready_first(sink_bool_env("GGML_KIMI_CPU_SINK_READY_FIRST", false)),
-        early_up_gate(sink_bool_env("GGML_KIMI_CPU_SINK_EARLY_UP_GATE", false)),
-        role_major(sink_bool_env("GGML_KIMI_CPU_SINK_ROLE_MAJOR", false)),
-        nonblocking_down_sched(sink_bool_env("GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", false)),
-        poll_us(sink_poll_us_env()),
-        dynamic_rows(sink_bool_env("GGML_KIMI_CPU_SINK_DYNAMIC_ROWS", false)),
-        dynamic_chunk_rows(sink_dynamic_chunk_rows_env()),
-        row_weights(sink_weights_env(threads - 1)),
-        compute_cpus(sink_cpus_env("GGML_KIMI_CPU_SINK_COMPUTE_CPUS", threads - 1)),
-        io_cpus(sink_cpus_env("GGML_KIMI_CPU_SINK_IO_CPUS", 0)),
-        profile_enabled(sink_bool_env("GGML_KIMI_CPU_SINK_PROFILE", false)),
-        trace_enabled(sink_bool_env("GGML_KIMI_CPU_SINK_TRACE", false)),
-        timeline_enabled(sink_bool_env("GGML_KIMI_CPU_SINK_TIMELINE", false)), worker_profiles(threads - 1) {
+    kimi_cpu_sink(int threads, int depth, kimi_cpu_sink_resolver resolve, void * user,
+                  const sink_configuration & input = {}) :
+        configuration(input), compute_threads(threads - 1), ring_experts(depth), resolver(resolve), userdata(user), slots(depth),
+        cache(configuration),
+        split_cv(configuration.policy.split_cv), ready_first(configuration.policy.ready_first),
+        early_up_gate(configuration.policy.early_up_gate), role_major(configuration.policy.role_major),
+        nonblocking_down_sched(configuration.policy.nonblocking_down_sched), poll_us(configuration.policy.poll_us),
+        dynamic_rows(configuration.policy.dynamic_rows), dynamic_chunk_rows(configuration.policy.dynamic_chunk_rows),
+        row_weights(configuration.policy.row_weights),
+        compute_cpus(sink_cpus(configuration.policy.compute_cpus, threads - 1)),
+        io_cpus(sink_cpus(configuration.policy.io_cpus, 0)),
+        profile_enabled(configuration.debug.profile), trace_enabled(configuration.debug.trace),
+        timeline_enabled(configuration.debug.trace), mrc(configuration.debug.mrc), worker_profiles(threads - 1) {
+        if (poll_us < 0 || poll_us > 1000 || dynamic_chunk_rows < 16 || dynamic_chunk_rows > 16384 || dynamic_chunk_rows % 16 ||
+                configuration.policy.decode_participants < 0 || configuration.policy.decode_participants > compute_threads) {
+            throw std::runtime_error("invalid explicit executor schedule");
+        }
+        if (configuration.policy.prefetch_depth < 0 || configuration.policy.prefetch_depth > 64) {
+            throw std::runtime_error("prefetch depth must be 0..64");
+        }
+        if (configuration.policy.prefetch_depth && (!ready_first || !nonblocking_down_sched)) {
+            throw std::runtime_error("next-layer prefetch requires the ordered nonblocking scheduler");
+        }
+        if (!row_weights.empty() && row_weights.size() != size_t(compute_threads)) {
+            throw std::runtime_error("row weights require cpu.threads - 1 entries");
+        }
+        for (double value : row_weights) {
+            if (!std::isfinite(value) || value <= 0) { throw std::runtime_error("invalid explicit row weight"); }
+        }
+        if (configuration.events) {
+            const auto healthy = configuration.events->flush();
+            if (!healthy) { throw std::runtime_error(healthy.error); }
+        }
         // Kernels are selected per call from the expert tensor types in prepare().
         if (dynamic_rows && !row_weights.empty()) {
             throw std::runtime_error("DYNAMIC_ROWS and ROW_WEIGHTS are mutually exclusive row schedulers");
         }
-        vram.initialize(ready_first);
+        vram.initialize(ready_first, configuration);
         refresh_floor("init");
         if (vram.deferred_upload) {
             cache.before_release = [](void * p) { static_cast<sink_vram *>(p)->wait_deferred(); };
@@ -2052,7 +1946,28 @@ struct kimi_cpu_sink {
         if (nonblocking_down_sched && !ready_first) {
             throw std::runtime_error("NONBLOCKING_DOWN_SCHED requires READY_FIRST=1");
         }
-        ring.init(static_cast<unsigned>(3 * depth), sink_read_fixed_from_env());
+        ring.init(static_cast<unsigned>(3 * depth), configuration.policy.read_fixed);
+        {
+            // One CPU of the fastest cluster stays with the I/O thread, as THREADS counts it.
+            const int fast = sink_fast_cpus();
+            const int fast_participants = std::max(1, std::min(compute_threads, fast - 1));
+            decode_threads.candidates[0] = compute_threads;
+            decode_threads.candidates[1] = fast > 0 && fast_participants < compute_threads ? fast_participants : compute_threads;
+            if (decode_threads.candidates[1] == compute_threads || !decode_thread_choice) {
+                decode_threads.decided = 0;
+                decode_threads.locked = true;
+            }
+            // Per-phase pools: decode on the first N participants (the fastest CPUs when COMPUTE_CPUS lists them
+            // first), prefill on all.
+            if (configuration.policy.decode_participants) {
+                decode_threads.candidates[1] = configuration.policy.decode_participants;
+                decode_threads.decided = 1;
+                decode_threads.locked = true;
+            }
+            std::fprintf(stderr, "[kimi_cpu_sink_threads] participants=%d fast_cluster_cpus=%d decode_candidates=%d,%d"
+                    " decode_fixed=%d\n", compute_threads, fast, decode_threads.candidates[0],
+                    decode_threads.candidates[1], decode_threads.locked ? decode_threads.candidates[decode_threads.decided] : 0);
+        }
         // Reserve before starting threads so vector growth cannot strand a thread.
         workers.reserve(static_cast<size_t>(std::max(0, compute_threads - 1)));
         try {
@@ -2069,33 +1984,6 @@ struct kimi_cpu_sink {
         } catch (...) {
             stop_threads();
             throw;
-        }
-        {
-            // One CPU of the fastest cluster stays with the I/O thread, as THREADS counts it.
-            const int fast = sink_fast_cpus();
-            const int fast_participants = std::max(1, std::min(compute_threads, fast - 1));
-            decode_threads.candidates[0] = compute_threads;
-            decode_threads.candidates[1] = fast > 0 && fast_participants < compute_threads ? fast_participants : compute_threads;
-            if (decode_threads.candidates[1] == compute_threads || !decode_thread_choice) {
-                decode_threads.decided = 0;
-                decode_threads.locked = true;
-            }
-            // Per-phase pools: decode on the first N participants (the fastest CPUs when COMPUTE_CPUS lists them
-            // first), prefill on all.
-            if (const char * value = std::getenv("GGML_KIMI_CPU_SINK_DECODE_PARTICIPANTS")) {
-                char * end = nullptr;
-                errno = 0;
-                const long n = std::strtol(value, &end, 10);
-                if (errno || end == value || *end || n < 1 || n > compute_threads) {
-                    throw std::runtime_error("GGML_KIMI_CPU_SINK_DECODE_PARTICIPANTS must be in 1..THREADS-1");
-                }
-                decode_threads.candidates[1] = int(n);
-                decode_threads.decided = 1;
-                decode_threads.locked = true;
-            }
-            std::fprintf(stderr, "[kimi_cpu_sink_threads] participants=%d fast_cluster_cpus=%d decode_candidates=%d,%d"
-                    " decode_fixed=%d\n", compute_threads, fast, decode_threads.candidates[0],
-                    decode_threads.candidates[1], decode_threads.locked ? decode_threads.candidates[decode_threads.decided] : 0);
         }
         std::fprintf(stderr, "[kimi_cpu_sink_schedule] ready_first=%d early_up_gate=%d role_major=%d nonblocking_down_sched=%d poll_us=%d dynamic_rows=%d dynamic_chunk_rows=%d row_weights=",
                      ready_first ? 1 : 0, early_up_gate ? 1 : 0, role_major ? 1 : 0,
@@ -2117,31 +2005,19 @@ struct kimi_cpu_sink {
     }
 
     void prefetch_start() {
-        const char * value = std::getenv("GGML_KIMI_CPU_SINK_PREFETCH");
-        if (!value || !value[0]) { return; }
-        char * end = nullptr;
-        const long k = std::strtol(value, &end, 10);
-        // at most the hint's width: the graph hints the model's top-k, up to the ranks the hint keeps
-        const long width = long(sizeof(prefetch.hint) / sizeof(prefetch.hint[0]));
-        if (end == value || *end || k < 0 || k > width) {
-            throw std::runtime_error("GGML_KIMI_CPU_SINK_PREFETCH must be 0.." + std::to_string(width) + " (the hint's width)");
-        }
-        prefetch.topk = int(k);
+        prefetch.topk = configuration.policy.prefetch_depth;
         cache.staging_per_layer = std::max(1, prefetch.topk);
         if (!prefetch.topk) { return; }
-        // a prefetched hit may still be reading when its run starts; only this scheduler waits for it
-        if (!ready_first || !nonblocking_down_sched) {
-            throw std::runtime_error("GGML_KIMI_CPU_SINK_PREFETCH requires GGML_KIMI_CPU_SINK_READY_FIRST=1 and "
-                "GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED=1");
-        }
-        if (const char * every = std::getenv("GGML_KIMI_CPU_SINK_PREFETCH_FAIL_EVERY")) {
-            prefetch.fail_every = std::strtoull(every, nullptr, 10);
-        }
-        if (const char * n = std::getenv("GGML_KIMI_CPU_SINK_PREFETCH_THROW_DRAIN")) { prefetch.throw_drain = std::strtoull(n, nullptr, 10); }
-        if (const char * n = std::getenv("GGML_KIMI_CPU_SINK_PREFETCH_THROW_SCHEDULE")) { prefetch.throw_schedule = std::strtoull(n, nullptr, 10); }
+        prefetch.fail_every = configuration.policy.prefetch_fail_every;
+        prefetch.throw_drain = configuration.policy.prefetch_throw_drain;
+        prefetch.throw_schedule = configuration.policy.prefetch_throw_schedule;
         cache.before_unmap = [](void * p) { static_cast<kimi_cpu_sink *>(p)->prefetch_wait_reads(); };
         cache.before_unmap_arg = this;
-        for (int i = 0; i < 3; ++i) { prefetch.readers.emplace_back([this, i] { prefetch_reader(i); }); }
+        prefetch.readers.reserve(3);
+        for (int i = 0; i < 3; ++i) {
+            prefetch.readers.emplace_back([this, i] { prefetch_reader(i); });
+            sink_pin(prefetch.readers.back().native_handle(), io_cpus);
+        }
     }
     void prefetch_stop() {
         {
@@ -3170,7 +3046,7 @@ struct kimi_cpu_sink {
         timeline_call = {};
         timeline.clear();
         if (timeline_active) { timeline_call[0] = ggml_time_us(); }
-        if (!trace_enabled && !profile_enabled && !timeline_enabled) { return; }
+        if (!trace_enabled && !profile_enabled && !timeline_enabled && !configuration.events) { return; }
         ++trace_call;
         trace_decode = decode;
         if (!decode) { trace_has_token = false; }
@@ -3195,6 +3071,36 @@ struct kimi_cpu_sink {
             current.compute_cpu_us += p.up_gate_cpu_us + p.down_cpu_us + p.parallel_cpu_us;
         }
         current.other_us = std::max(0.0, current.total_us - current.compute_us - current.wait_io_us);
+    }
+
+    ssd::result<void> publish_observation(bool success) const noexcept {
+        if (!configuration.events) { return {}; }
+        try {
+            std::ostringstream out;
+            out.imbue(std::locale::classic());
+            out << std::setprecision(17) << "{\"epoch\":" << trace_epoch << ",\"token\":" << trace_token
+                << ",\"has_token\":" << (trace_has_token ? "true" : "false") << ",\"layer\":" << trace_layer
+                << ",\"decode\":" << (trace_decode ? "true" : "false") << ",\"success\":" << (success ? "true" : "false")
+                << ",\"read_bytes\":" << current.read_bytes << ",\"read_requests\":" << current.read_requests
+                << ",\"read_completions\":" << current.read_completions << ",\"pending_reads\":" << current.pending_reads
+                << ",\"demand_bytes\":" << current.demand_bytes << ",\"cache_hit_bytes\":" << current.cache_hit_bytes
+                << ",\"cache_hits\":" << current.cache_hits << ",\"cache_misses\":" << current.cache_misses
+                << ",\"vram_hits\":" << vram.hits << ",\"wall_us\":" << current.total_us
+                << ",\"wait_io_us\":" << current.wait_io_us << ",\"compute_us\":" << current.compute_us
+                << ",\"compute_thread_cpu_us\":" << current.compute_cpu_us << ",\"io_thread_cpu_us\":" << current.io_cpu_us
+                << ",\"caller_thread_cpu_us\":" << current.caller_cpu_us << '}';
+            if (!out) { return { ssd::status::resource, "telemetry serialization failed" }; }
+            const auto payload = out.str();
+            const auto read = configuration.events->event("ssd.io.read", payload);
+            if (!read) { return read; }
+            const auto place = configuration.events->event("ssd.place.layer", payload);
+            if (!place) { return place; }
+            return {};
+        } catch (const std::bad_alloc &) {
+            return { ssd::status::resource, "oom" };
+        } catch (const std::exception & e) {
+            return { ssd::status::invalid, e.what() };
+        }
     }
 
     void print_observation(bool success) {
@@ -4352,6 +4258,8 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
         sink->finish_observation();
         if (stats) { *stats = sink->current; }
         sink->print_observation(true);
+        const auto published = sink->publish_observation(true);
+        if (!published) { sink_error(error, error_size, published.error.c_str()); return false; }
         return true;
     } catch (const std::exception & e) {
         // Stop new submissions and drain before returning, including an
@@ -4367,7 +4275,10 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
         sink->finish_observation();
         if (stats) { *stats = sink->current; }
         sink->print_observation(false);
-        sink_error(error, error_size, e.what());
+        const auto published = sink->publish_observation(false);
+        if (!published && error && error_size) {
+            std::snprintf(error, error_size, "%s; telemetry: %s", e.what(), published.error.c_str());
+        } else { sink_error(error, error_size, e.what()); }
         return false;
     }
 }
@@ -4404,6 +4315,91 @@ extern "C" struct kimi_cpu_sink * kimi_cpu_sink_create(
         sink_error(error, error_size, e.what());
         return nullptr;
     }
+}
+
+namespace ssd {
+namespace cpu {
+namespace {
+sink_configuration configured(const settings::snapshot * input, const runtime_services * services) {
+    if (!input) { throw std::runtime_error("missing typed SSD settings"); }
+    sink_configuration out;
+    out.production = true;
+    out.settings = *input;
+    if (services) {
+        out.events = services->events;
+        if (services->debug) { out.debug = *services->debug; }
+    }
+    auto integer = [&](const char * key) {
+        const auto * value = out.settings.integer(key);
+        if (!value) { throw std::runtime_error(std::string("missing typed ") + key); }
+        return *value;
+    };
+    const uint64_t threads = integer("cpu.threads");
+    const uint64_t participants = integer("cpu.decode_participants");
+    const uint64_t prefetch = integer("prefetch.depth");
+    if (threads < 2 || threads > 256 || participants > threads - 1 || prefetch > 64 ||
+            !out.settings.cpus("cpu.compute_cpus") || !out.settings.cpus("cpu.io_cpus") ||
+            !out.settings.vram_budget() || !out.settings.costs() || !out.settings.sources() ||
+            integer("host.headroom_mib") > UINT32_MAX || integer("vram.reserve_mib") > 8192 ||
+            integer("vram.margin_mib") < integer("vram.reserve_mib") + 64 || integer("vram.margin_mib") > 8192) {
+        throw std::runtime_error("invalid typed SSD executor dependencies");
+    }
+    auto & p = out.policy;
+    p.split_cv = p.ready_first = p.early_up_gate = p.role_major = p.nonblocking_down_sched = p.dynamic_rows = true;
+    p.dynamic_chunk_rows = 64;
+    p.decode_participants = int(participants);
+    p.prefetch_depth = int(prefetch);
+    for (uint32_t cpu : *out.settings.cpus("cpu.compute_cpus")) { p.compute_cpus.push_back(int(cpu)); }
+    for (uint32_t cpu : *out.settings.cpus("cpu.io_cpus")) { p.io_cpus.push_back(int(cpu)); }
+    p.cache_policy = "count_decay2";
+    p.cache_allocation = "uniform";
+    p.cache_keep = p.cache_prefill_read = p.cache_partial_reclaim = p.cache_reclaimable_file = true;
+    p.cache_reserve_bytes = 512ull << 20;
+    return out;
+}
+}  // namespace
+
+kimi_cpu_sink * create_configured(const settings::snapshot * input, const runtime_services * services,
+        kimi_cpu_sink_resolver resolver, void * userdata, char * error, size_t error_size) noexcept {
+    sink_error(error, error_size, "");
+    try {
+        const auto value = configured(input, services);
+        if (!resolver) { throw std::runtime_error("missing SSD expert resolver"); }
+        return new kimi_cpu_sink(int(*value.settings.integer("cpu.threads")), 8, resolver, userdata, value);
+    } catch (const std::exception & e) {
+        sink_error(error, error_size, e.what());
+        return nullptr;
+    }
+}
+
+namespace testing {
+kimi_cpu_sink * create(int total_threads, int ring_experts, const execution_policy & policy,
+        const runtime_services * services, kimi_cpu_sink_resolver resolver, void * userdata,
+        char * error, size_t error_size) noexcept {
+    sink_error(error, error_size, "");
+    try {
+        if (total_threads < 2 || total_threads > 256 || ring_experts < 1 || ring_experts > 32 || !resolver) {
+            throw std::runtime_error("invalid explicit CPU test executor dimensions");
+        }
+        sink_configuration value;
+        value.policy = policy;
+        if (services) {
+            value.events = services->events;
+            if (services->debug) { value.debug = *services->debug; }
+        }
+        return new kimi_cpu_sink(total_threads, ring_experts, resolver, userdata, value);
+    } catch (const std::exception & e) {
+        sink_error(error, error_size, e.what());
+        return nullptr;
+    }
+}
+}  // namespace testing
+}  // namespace cpu
+}  // namespace ssd
+
+const ssd::telemetry::debug_channels & kimi_cpu_sink_debug(const kimi_cpu_sink * sink) noexcept {
+    static const ssd::telemetry::debug_channels off;
+    return sink ? sink->configuration.debug : off;
 }
 
 extern "C" void kimi_cpu_sink_destroy(struct kimi_cpu_sink * sink) { delete sink; }
@@ -4506,11 +4502,15 @@ extern "C" void kimi_cpu_sink_cache_get_stats(struct kimi_cpu_sink * sink, kimi_
     *stats = sink->cache.stats;
 }
 
-// Before the first graph creates the sink: the ledger alone, from this process's environment and /proc.
-static bool sink_ledger_room(uint64_t pages, uint64_t host_bytes, uint64_t device_bytes) {
+// Before the first graph creates the sink, use the same context margins and observed /proc/cgroup facts.
+static bool sink_ledger_room(uint64_t pages, uint64_t host_bytes, uint64_t device_bytes,
+        const ssd::settings::snapshot * settings = nullptr) {
     try {
         kimi_host_ledger ledger;
-        ledger.configure(sink_unified_memory());
+        const auto * headroom = settings ? settings->integer("host.headroom_mib") : nullptr;
+        const auto * reserve = settings ? settings->integer("vram.reserve_mib") : nullptr;
+        if (settings && (!headroom || !reserve)) { return false; }
+        ledger.configure(sink_unified_memory(), headroom ? uint32_t(*headroom) : 512, reserve ? uint32_t(*reserve) : 0);
         ledger.prefill_pages = pages;
         const uint64_t extra = ledger.dram_bytes(host_bytes, device_bytes);
         if (!extra && !pages) { return true; }
@@ -4555,6 +4555,27 @@ static bool sink_activation_valid(const kimi_cpu_sink_activation * activation) {
             return false;
     }
 }
+
+namespace ssd {
+namespace cpu {
+bool cache_make_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
+        const runtime_services * services, uint64_t host_bytes, uint64_t device_bytes) noexcept {
+    try {
+        const auto value = configured(input, services);
+        return sink ? kimi_cpu_sink_cache_make_room(sink, host_bytes, device_bytes) :
+                      sink_ledger_room(0, host_bytes, device_bytes, &value.settings);
+    } catch (const std::exception &) { return false; }
+}
+bool cache_prefill_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
+        const runtime_services * services, uint64_t pages, uint64_t host_bytes, uint64_t device_bytes) noexcept {
+    try {
+        const auto value = configured(input, services);
+        return sink ? kimi_cpu_sink_cache_prefill_room(sink, pages, host_bytes, device_bytes) :
+                      sink_ledger_room(pages, host_bytes, device_bytes, &value.settings);
+    } catch (const std::exception &) { return false; }
+}
+}  // namespace cpu
+}  // namespace ssd
 
 extern "C" bool kimi_cpu_sink_run_activation(
         struct kimi_cpu_sink * sink, const struct ggml_tensor * up, const struct ggml_tensor * gate,
@@ -4770,6 +4791,8 @@ extern "C" bool kimi_cpu_sink_run_activation(
         sink->finish_observation();
         if (stats) { *stats = sink->current; }
         sink->print_observation(true);
+        const auto published = sink->publish_observation(true);
+        if (!published) { sink_error(error, error_size, published.error.c_str()); return false; }
         return true;
     } catch (const std::exception & e) {
         // Cache slots are kernel read targets now. Stop producing new reads and
@@ -4785,7 +4808,10 @@ extern "C" bool kimi_cpu_sink_run_activation(
         sink->finish_observation();
         if (stats) { *stats = sink->current; }
         sink->print_observation(false);
-        sink_error(error, error_size, e.what());
+        const auto published = sink->publish_observation(false);
+        if (!published && error && error_size) {
+            std::snprintf(error, error_size, "%s; telemetry: %s", e.what(), published.error.c_str());
+        } else { sink_error(error, error_size, e.what()); }
         return false;
     }
 }
@@ -4795,7 +4821,7 @@ extern "C" bool kimi_cpu_sink_run(
         const struct ggml_tensor * down, const float * input, const int32_t * ids, const float * weights,
         int nslots, float situ_beta, float situ_linear_beta, float * output,
         struct kimi_cpu_sink_stats * stats, char * error, size_t error_size) {
-    const kimi_cpu_sink_activation activation = { KIMI_CPU_SINK_ACTIVATION_SITU, situ_beta, situ_linear_beta, 0.0f };
+    const kimi_cpu_sink_activation activation = { KIMI_CPU_SINK_ACTIVATION_SITU, situ_beta, situ_linear_beta, 0.0f, nullptr, 0.0f };
     return kimi_cpu_sink_run_activation(sink, up, gate, down, input, ids, weights, nslots, &activation,
         output, stats, error, error_size);
 }
@@ -4803,6 +4829,32 @@ extern "C" bool kimi_cpu_sink_run(
 #include "kimi-cpu-cache-executor.inc"
 
 #else
+
+namespace ssd {
+namespace cpu {
+kimi_cpu_sink * create_configured(const settings::snapshot *, const runtime_services *,
+        kimi_cpu_sink_resolver, void *, char * error, size_t size) noexcept {
+    sink_error(error, size, "SSD CPU executor requires Linux io_uring/O_DIRECT");
+    return nullptr;
+}
+bool cache_make_room_configured(kimi_cpu_sink *, const settings::snapshot *, const runtime_services *,
+        uint64_t, uint64_t) noexcept { return false; }
+bool cache_prefill_room_configured(kimi_cpu_sink *, const settings::snapshot *, const runtime_services *,
+        uint64_t, uint64_t, uint64_t) noexcept { return false; }
+namespace testing {
+kimi_cpu_sink * create(int, int, const execution_policy &, const runtime_services *,
+        kimi_cpu_sink_resolver, void *, char * error, size_t size) noexcept {
+    sink_error(error, size, "SSD CPU executor requires Linux io_uring/O_DIRECT");
+    return nullptr;
+}
+}
+}
+}
+
+const ssd::telemetry::debug_channels & kimi_cpu_sink_debug(const kimi_cpu_sink *) noexcept {
+    static const ssd::telemetry::debug_channels off;
+    return off;
+}
 
 void kimi_cpu_sink_parallel(struct kimi_cpu_sink *, kimi_cpu_sink_parallel_fn, void *) {}
 bool kimi_cpu_sink_stream(struct kimi_cpu_sink *, const struct ggml_tensor *, const struct ggml_tensor *,
