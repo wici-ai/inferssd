@@ -83,7 +83,11 @@ def generate_alias(
         )
         command = [
             python,
-            repo + "/scripts/kimi-build-gguf-expert-alias-tsv.py",
+            "-I",
+            "-m",
+            "ssdash.source.mac_alias",
+            "--repo",
+            repo,
             "--n-experts",
             str(PROFILES[profile][0]),
             "--out",
@@ -105,7 +109,7 @@ def generate_alias(
 
 
 def run_indexer(command: list[str]) -> None:
-    # The only subprocess allowed by this adapter is the retained Python header
+    # The only subprocess allowed by this adapter is the installed strict header
     # indexer, assembled by generate_alias. Engine argv never reaches this call.
     subprocess.run(command, check=True)
 
