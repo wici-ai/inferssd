@@ -11,12 +11,14 @@ import json
 import os
 from pathlib import Path
 import re
-import signal
 import stat
 import subprocess
-import time
 
 import final_chat
+from native_core import CORE, IDENTITY as CORE_IDENTITY
+
+group_exists = CORE["process"].group_exists
+stop_owned = CORE["process"].stop_owned
 
 SHA = re.compile(r"[0-9a-f]{64}")
 FILE_FIELDS = ("dev", "ino", "bytes", "mtime_ns", "ctime_ns")
@@ -215,7 +217,8 @@ def effective_settings(profile):
     # whose runtime telemetry is dynamic (e.g. admitted cache capacity).
     digest = hashlib.sha256(json.dumps(profile, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return dict(profile["effective_settings"], native_profile_sha256=digest,
-                native_resource_policy=profile["resources"])
+                native_resource_policy=profile["resources"],
+                native_ownership_core=CORE_IDENTITY)
 
 
 def server_argv(profile, port):
@@ -223,44 +226,6 @@ def server_argv(profile, port):
             "--chat-template-file", profile["template"]["path"], "--reasoning", "off",
             "-c", str(profile["effective_settings"]["context_tokens"]), "-np", "1", "--fit", "off",
             "--no-warmup", "--cache-ram", "0", "--host", "127.0.0.1", "--port", str(port)]
-
-
-def group_exists(process):
-    process.poll()
-    try:
-        os.killpg(process.pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Darwin may briefly report EPERM while an owned group exits, before
-        # waitpid reports completion. Unknown is still present, never clean.
-        return True
-
-
-def stop_owned(process, timeout):
-    was_running = process.poll() is None
-    orphan = not was_running and group_exists(process)
-    if group_exists(process):
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
-    until = time.monotonic() + timeout
-    while group_exists(process) and time.monotonic() < until:
-        time.sleep(.05)
-    forced = group_exists(process)
-    if forced:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-    process.wait(timeout=5)
-    until = time.monotonic() + 2
-    while group_exists(process) and time.monotonic() < until:
-        time.sleep(.05)
-    return {"returncode": process.returncode, "group_gone": not group_exists(process),
-            "forced_kill": forced, "orphaned_descendants": orphan, "was_running": was_running}
 
 
 def command(argv, timeout=5):

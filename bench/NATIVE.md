@@ -154,3 +154,29 @@ Native Mac PID/listener/FD tests run only on Darwin and report a skip elsewhere.
 Linux scope logic has mock tests; an actual harmless scope/lease lifecycle check
 is still required on each intended Linux host before the final attempt. These
 tests do not load models or constitute final benchmark data.
+
+## Shared ownership code and deployment
+
+The native wrapper uses the same `ssdash.platform.lease` and
+`ssdash.platform.process` and `ssdash.platform.guardian` implementations as the framework. With a normal wheel
+installation, the wrapper imports those modules and records their actual file
+SHA-256 identities in `native_ownership_core`. Its required ownership API is 1;
+an absent package or unsupported API fails before launch.
+
+For standalone deployment, prepare a new bundle explicitly:
+
+```sh
+python3 bench/bundle_native.py --output /path/to/new-wrapper-bundle \
+  --core /path/to/admitted/ssdash/platform
+```
+
+Use the exact `ssdash/platform` directory from the admitted source or installed
+wheel. Copy the **entire** resulting directory, including `ownership/`,
+`native-core.json` and `bundle-manifest.json`, and verify every manifest member
+before an attempt. The wrapper loads that adjacent manifest automatically;
+`SSDASH_NATIVE_CORE_MANIFEST` can select an explicit manifest instead. Every
+member is verified before either module is imported. A missing, changed or
+unsupported bundle fails; it never falls back to another installed copy. No
+search-path modification or ambient checkout is used. Archive the complete
+bundle and manifest with the result. Timing, request and prompt protocols are
+unchanged.
