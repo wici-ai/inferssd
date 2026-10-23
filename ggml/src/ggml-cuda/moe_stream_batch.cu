@@ -23903,43 +23903,8 @@ extern "C" bool ggml_cuda_moe_stream_handoff_upload(
         return ggml_cuda_moe_common_stream_handoff_upload(
             host_ptr, ne01, dst_cols);
     }
-    const char *env = std::getenv("GGML_MOE_GPU_HANDOFF_UPLOAD_GLU");
-    if (!env || !env[0] || env[0] == 0x30 || !gpu_handoff_enabled()) {
-        return false;
-    }
-    if (!host_ptr || ne01 <= 0 || dst_cols <= 0) {
-        return false;
-    }
-    if (!init_batch_once()) {
-        return false;
-    }
-    const size_t bytes = (size_t)ne01 * (size_t)dst_cols * sizeof(float);
-    std::lock_guard<std::mutex> lk(g_batch_mu);
-    batch_ctx &bc = g_batch;
-    if (!ensure_dev(bc.d_handoff, bc.d_handoff_sz, bytes)) {
-        return false;
-    }
-    if (cudaMemcpyAsync(bc.d_handoff, host_ptr, bytes, cudaMemcpyHostToDevice, bc.stream) != cudaSuccess) {
-        return false;
-    }
-    const char *sync_env = std::getenv("GGML_MOE_GPU_HANDOFF_UPLOAD_GLU_SYNC");
-    if (sync_env && sync_env[0] && sync_env[0] != 0x30) {
-        if (cudaStreamSynchronize(bc.stream) != cudaSuccess) {
-            return false;
-        }
-    }
-    g_handoff.host_ptr = host_ptr;
-    g_handoff.d_data = (const float *) bc.d_handoff;
-    g_handoff.bytes = bytes;
-    g_handoff.ne01 = ne01;
-    g_handoff.dst_cols = dst_cols;
-    ++g_handoff.serial;
-    static std::atomic<int> first_upload{0};
-    if (first_upload.fetch_add(1) == 0) {
-        std::fprintf(stderr, "[moe_stream_batch] GLU GPU handoff upload active: ne01=%ld dst_cols=%ld bytes=%zu\n",
-                (long)ne01, (long)dst_cols, bytes);
-    }
-    return true;
+    // The shape-selected local producer/cache path is retired.
+    return false;
 }
 
 
@@ -24427,13 +24392,8 @@ extern "C" bool ggml_cuda_moe_stream_preload_tensor(
         return ggml_cuda_moe_common_stream_preload_tensor(
             src0_type_int, src0_name, src0_data, n_as, nb02, expert_bytes);
     }
-    if (!init_batch_once()) return false;
-    if (!moe_stream_type_supported((ggml_type)src0_type_int) || !src0_data || !src0_name) return false;
-    std::lock_guard<std::mutex> lk(g_batch_mu);
-    if (!batch_cache_get_for_tensor(src0_name, expert_bytes)) return false;
-    preload_profile_for_tensor(src0_name, src0_data, n_as, nb02, expert_bytes, g_batch.stream);
-    cudaStreamSynchronize(g_batch.stream);
-    return true;
+    // The shape-selected local producer/cache path is retired.
+    return false;
 }
 
 extern "C" bool ggml_cuda_moe_stream_preload_tensor_prompt(
@@ -24448,14 +24408,8 @@ extern "C" bool ggml_cuda_moe_stream_preload_tensor_prompt(
         return ggml_cuda_moe_common_stream_preload_tensor_prompt(
             src0_type_int, src0_name, src0_data, n_as, nb02, expert_bytes);
     }
-    if (!init_batch_once()) return false;
-    if (!moe_stream_type_supported((ggml_type)src0_type_int) || !src0_data || !src0_name) return false;
-    std::lock_guard<std::mutex> lk(g_batch_mu);
-    if (!batch_cache_get_for_tensor(src0_name, expert_bytes)) return false;
-    preload_profile_for_tensor(src0_name, src0_data, n_as, nb02, expert_bytes, g_batch.stream);
-    preload_prompt_profile_for_tensor(src0_name, src0_data, n_as, nb02, expert_bytes, g_batch.stream);
-    cudaStreamSynchronize(g_batch.stream);
-    return true;
+    // The shape-selected local producer/cache path is retired.
+    return false;
 }
 
 extern "C" bool ggml_cuda_moe_stream_preload_tensor_async(
@@ -24470,12 +24424,8 @@ extern "C" bool ggml_cuda_moe_stream_preload_tensor_async(
         return ggml_cuda_moe_common_stream_preload_tensor_async(
             src0_type_int, src0_name, src0_data, n_as, nb02, expert_bytes);
     }
-    if (!init_batch_once()) return false;
-    if (!moe_stream_type_supported((ggml_type)src0_type_int) || !src0_data || !src0_name) return false;
-    std::lock_guard<std::mutex> lk(g_batch_mu);
-    if (!batch_cache_get_for_tensor(src0_name, expert_bytes)) return false;
-    preload_profile_for_tensor(src0_name, src0_data, n_as, nb02, expert_bytes, g_batch.stream);
-    return true;
+    // The shape-selected local producer/cache path is retired.
+    return false;
 }
 
 extern "C" bool ggml_cuda_moe_stream_preload_expert_async(
@@ -24492,17 +24442,8 @@ extern "C" bool ggml_cuda_moe_stream_preload_expert_async(
             src0_type_int, src0_name, src0_data, n_as, nb02, expert_bytes,
             expert_idx);
     }
-    if (!init_batch_once()) return false;
-    if (!moe_stream_type_supported((ggml_type)src0_type_int) || !src0_data || !src0_name) return false;
-    if (expert_idx < 0 || expert_idx >= n_as) return false;
-    std::lock_guard<std::mutex> lk(g_batch_mu);
-    batch_vram_cache *cache = batch_cache_get_for_tensor(src0_name, expert_bytes);
-    if (!cache) return false;
-    const uintptr_t key = batch_key_hash(src0_name, expert_idx);
-    if (batch_cache_find_slot(cache, key) >= 0) return true;
-    const char *expert_host = (const char *)src0_data + (size_t)expert_idx * nb02;
-    return batch_cache_insert_slot(cache, key, expert_host, expert_bytes, g_batch.stream, false, true,
-            nullptr, 0, true, src0_name, expert_idx) >= 0;
+    // The shape-selected local producer/cache path is retired.
+    return false;
 }
 
 extern "C" bool ggml_cuda_moe_stream_preload_expert_from_pack_async(
@@ -24516,16 +24457,8 @@ extern "C" bool ggml_cuda_moe_stream_preload_expert_from_pack_async(
         return ggml_cuda_moe_common_stream_preload_expert_from_pack_async(
             src0_type_int, src0_name, n_as, expert_bytes, expert_idx);
     }
-    if (!init_batch_once()) return false;
-    if (!moe_stream_type_supported((ggml_type)src0_type_int) || !src0_name || !src0_name[0]) return false;
-    if (expert_idx < 0 || expert_idx >= n_as) return false;
-    std::lock_guard<std::mutex> lk(g_batch_mu);
-    batch_vram_cache *cache = batch_cache_get_for_tensor(src0_name, expert_bytes);
-    if (!cache) return false;
-    const uintptr_t key = batch_key_hash(src0_name, expert_idx);
-    if (batch_cache_find_slot(cache, key) >= 0) return true;
-    return batch_cache_insert_slot(cache, key, nullptr, expert_bytes, g_batch.stream, false, true,
-            nullptr, 0, true, src0_name, expert_idx) >= 0;
+    // The shape-selected local producer/cache path is retired.
+    return false;
 }
 
 static bool q4_colibri_same_layer_scheduler_enabled() {
@@ -25787,107 +25720,8 @@ extern "C" int ggml_cuda_moe_stream_batch_preload_active_from_pack(
         return ggml_cuda_moe_common_stream_batch_preload_active_from_pack(
             src0_type_int, src0_name, n_as, expert_bytes, matrix_row_counts);
     }
-    static std::atomic<int> first_report{0};
-    auto report_once = [&](const char *reason, int jobs) {
-        if (first_report.fetch_add(1) == 0) {
-            std::fprintf(stderr,
-                    "[moe_stream_batch] gate active batch preload probe: reason=%s tensor=%s jobs=%d n_as=%ld bytes=%zu\n",
-                    reason, src0_name ? src0_name : "", jobs, (long)n_as, expert_bytes);
-        }
-    };
-    if (!init_batch_once()) {
-        report_once("init_failed", 0);
-        return 0;
-    }
-    if (!moe_stream_pack_prefetch_type_supported((ggml_type)src0_type_int) || !src0_name || !src0_name[0] ||
-            n_as <= 0 || expert_bytes == 0 || !matrix_row_counts) {
-        report_once("invalid_args", 0);
-        return 0;
-    }
-
-    struct active_preload_job {
-        int slot = -1;
-        void *dst = nullptr;
-        const void *host_data = nullptr;
-        const expert_pack_entry *pack_entry = nullptr;
-        int expert_idx = -1;
-        char tensor[128] = {};
-    };
-
-    std::lock_guard<std::mutex> lk(g_batch_mu);
-    batch_vram_cache *cache = batch_cache_get_for_tensor(src0_name, expert_bytes);
-    if (!cache) {
-        report_once("cache_unavailable", 0);
-        return 0;
-    }
-
-    if (q4_colibri_same_layer_scheduler_enabled() && !batch_cache_role_split_enabled()) {
-        const int scheduled = q4_colibri_preload_same_layer_objects(
-            src0_name, n_as, expert_bytes, matrix_row_counts, cache);
-        report_once(scheduled < 0 ? "same_layer_failed" : "same_layer_active", scheduled);
-        return scheduled;
-    }
-
-    std::vector<active_preload_job> jobs;
-    jobs.reserve(256);
-    for (int64_t expert = 0; expert < n_as; ++expert) {
-        if (matrix_row_counts[expert] <= 0) {
-            continue;
-        }
-        const uintptr_t key = batch_key_hash(src0_name, (int)expert);
-        if (batch_cache_find_slot(cache, key) >= 0) {
-            continue;
-        }
-        const expert_pack_entry *pack_entry = expert_pack_lookup(src0_name, (int)expert, expert_bytes);
-        if (!pack_entry) {
-            continue;
-        }
-        const int slot = batch_cache_insert_slot(cache, key, nullptr, expert_bytes, g_batch.stream,
-                true, false, nullptr, 0, false, src0_name, (int)expert);
-        if (slot < 0) {
-            continue;
-        }
-        active_preload_job job;
-        job.slot = slot;
-        job.dst = (char *)cache->pool + (size_t)slot * cache->slot_sz;
-        job.host_data = nullptr;
-        job.pack_entry = pack_entry;
-        job.expert_idx = (int)expert;
-        std::snprintf(job.tensor, sizeof(job.tensor), "%s", src0_name);
-        jobs.push_back(job);
-    }
-
-    if (jobs.empty()) {
-        report_once("empty_jobs", 0);
-        return 0;
-    }
-
-    auto clear_jobs = [&]() {
-        for (const active_preload_job &job : jobs) {
-            batch_cache_clear_slot(cache, job.slot);
-        }
-    };
-
-    bool ok = expert_pack_iouring_copy_jobs(jobs, expert_bytes, g_batch.stream, g_batch.stage_ring, "gate_batch_preload");
-    if (!ok) {
-        for (const active_preload_job &job : jobs) {
-            batch_copy_trace copy_trace;
-            if (!batch_cache_copy_h2d(g_batch.stage_ring, job.dst, job.host_data, expert_bytes,
-                        g_batch.stream, job.pack_entry, &copy_trace,
-                        "gate_batch_preload", job.tensor, job.expert_idx)) {
-                ok = false;
-                break;
-            }
-            ok = true;
-        }
-    }
-    if (!ok || cudaStreamSynchronize(g_batch.stream) != cudaSuccess) {
-        clear_jobs();
-        report_once("copy_failed", (int)jobs.size());
-        return 0;
-    }
-    report_once("active", (int)jobs.size());
-    return (int)jobs.size();
+    // The shape-selected local producer/cache path is retired.
+    return 0;
 }
 
 extern "C" int ggml_cuda_moe_stream_q4_colibri_pilot_prefetch_from_gate(
@@ -25902,42 +25736,8 @@ extern "C" int ggml_cuda_moe_stream_q4_colibri_pilot_prefetch_from_gate(
             src0_type_int, src0_gate_name, n_as, expert_bytes,
             matrix_row_counts);
     }
-    static std::atomic<int> first_report{0};
-    auto report_once = [&](const char *reason, int jobs) {
-        if (first_report.fetch_add(1) == 0) {
-            std::fprintf(stderr,
-                    "[moe_stream_batch] q4 pilot prefetch probe: reason=%s tensor=%s jobs=%d n_as=%ld bytes=%zu\n",
-                    reason, src0_gate_name ? src0_gate_name : "", jobs, (long)n_as, expert_bytes);
-        }
-    };
-    if (!q4_colibri_pilot_prefetch_enabled()) {
-        report_once("disabled", 0);
-        return 0;
-    }
-    if (batch_cache_role_split_enabled()) {
-        report_once("disabled_role_split", 0);
-        return 0;
-    }
-    if (!init_batch_once()) {
-        report_once("init_failed", 0);
-        return 0;
-    }
-    if (!moe_stream_pack_prefetch_type_supported((ggml_type)src0_type_int) ||
-            !src0_gate_name || !src0_gate_name[0] || n_as <= 0 || expert_bytes == 0 ||
-            !matrix_row_counts || !std::strstr(src0_gate_name, ".ffn_gate_exps.")) {
-        report_once("invalid_args", 0);
-        return 0;
-    }
-    std::lock_guard<std::mutex> lk(g_batch_mu);
-    batch_vram_cache *cache = batch_cache_get_for_tensor(src0_gate_name, expert_bytes);
-    if (!cache) {
-        report_once("cache_unavailable", 0);
-        return 0;
-    }
-    const int scheduled = q4_colibri_preload_pilot_next_layer_objects(
-        src0_gate_name, n_as, expert_bytes, matrix_row_counts, cache);
-    report_once(scheduled < 0 ? "failed" : "active", scheduled);
-    return scheduled;
+    // The shape-selected local producer/cache path is retired.
+    return 0;
 }
 
 extern "C" bool ggml_cuda_moe_stream_preload_synchronize(void) {
@@ -25958,12 +25758,8 @@ extern "C" bool ggml_cuda_moe_stream_cache_contains(
         return ggml_cuda_moe_common_stream_cache_contains(
             src0_name, expert_bytes, expert_idx);
     }
-    if (!src0_name || !src0_name[0] || expert_bytes == 0 || expert_idx < 0) return false;
-    const int cid = batch_cache_id_for_tensor(src0_name, expert_bytes);
-    if (!g_bcache_inited[cid]) return false;
-    std::lock_guard<std::mutex> lk(g_batch_mu);
-    const batch_vram_cache *cache = &g_bcaches[cid];
-    return batch_cache_contains_slot(cache, batch_key_hash(src0_name, expert_idx));
+    // The shape-selected local producer/cache path is retired.
+    return false;
 }
 
 extern "C" const void * ggml_cuda_moe_stream_cache_dev_ptr(
@@ -25974,14 +25770,8 @@ extern "C" const void * ggml_cuda_moe_stream_cache_dev_ptr(
         return ggml_cuda_moe_common_stream_cache_dev_ptr(
             src0_name, expert_bytes, expert_idx);
     }
-    if (!src0_name || !src0_name[0] || expert_bytes == 0 || expert_idx < 0) return nullptr;
-    const int cid = batch_cache_id_for_tensor(src0_name, expert_bytes);
-    if (!g_bcache_inited[cid]) return nullptr;
-    std::lock_guard<std::mutex> lk(g_batch_mu);
-    batch_vram_cache *cache = &g_bcaches[cid];
-    const int slot = batch_cache_lookup_slot(cache, batch_key_hash(src0_name, expert_idx));
-    if (slot < 0) return nullptr;
-    return (const char *)cache->pool + (size_t)slot * cache->slot_sz;
+    // The shape-selected local producer/cache path is retired.
+    return nullptr;
 }
 
 extern "C" bool ggml_cuda_moe_stream_register_tensor(
@@ -25996,48 +25786,8 @@ extern "C" bool ggml_cuda_moe_stream_register_tensor(
         return ggml_cuda_moe_common_stream_register_tensor(
             src0_type_int, src0_name, src0_data, n_as, nb02, expert_bytes);
     }
-    if (!moe_stream_type_supported((ggml_type)src0_type_int) || !src0_name || !src0_name[0] || !src0_data) return false;
-    if (!std::strstr(src0_name, ".ffn_up_exps.") &&
-            !std::strstr(src0_name, ".ffn_gate_exps.") &&
-            !std::strstr(src0_name, ".ffn_down_exps.")) {
-        return true;
-    }
-
-    expert_pack_init_once();
-    if (g_expert_pack.q4_colibri) {
-        if ((ggml_type)src0_type_int != GGML_TYPE_Q4_0) {
-            q4_colibri_fail(std::string("non-Q4_0 routed tensor registered: ") + src0_name);
-        }
-        const expert_pack_entry *entry = expert_pack_lookup_impl(src0_name, 0, expert_bytes, false);
-        if (!entry) {
-            if (!g_expert_pack.q4_colibri_debug_partial_fallback) {
-                q4_colibri_fail(std::string("uncovered routed tensor registered: ") + src0_name);
-            }
-            ++g_expert_pack.q4_colibri_partial_fallback_tensors;
-        }
-    }
-
-    std::lock_guard<std::mutex> lk(g_registered_mu);
-    for (registered_tensor &t : g_registered_tensors) {
-        if (std::strcmp(t.name, src0_name) == 0) {
-            t.type = src0_type_int;
-            t.data = src0_data;
-            t.n_as = n_as;
-            t.nb02 = nb02;
-            t.expert_bytes = expert_bytes;
-            return true;
-        }
-    }
-
-    registered_tensor t;
-    t.type = src0_type_int;
-    std::snprintf(t.name, sizeof(t.name), "%s", src0_name);
-    t.data = src0_data;
-    t.n_as = n_as;
-    t.nb02 = nb02;
-    t.expert_bytes = expert_bytes;
-    g_registered_tensors.push_back(t);
-    return true;
+    // The shape-selected local producer/cache path is retired.
+    return false;
 }
 
 
@@ -26983,56 +26733,8 @@ extern "C" int ggml_cuda_moe_stream_route_group_preload_updown_from_gate(
         return ggml_cuda_moe_common_stream_route_group_preload_updown_from_gate(
             src0_gate_name, n_as, matrix_row_counts);
     }
-    const int native_result = route_group_native_parity_from_gate(src0_gate_name, n_as, matrix_row_counts);
-    if (native_result >= 0) {
-        if (!g_route_group_report_registered.exchange(true)) {
-            std::atexit(route_group_report_atexit);
-        }
-        return native_result;
-    }
-    if (!route_group_updown_queue_enabled()) {
-        return 0;
-    }
-    if (!src0_gate_name || !matrix_row_counts || n_as <= 0) {
-        return 0;
-    }
-    if (!g_route_group_report_registered.exchange(true)) {
-        std::atexit(route_group_report_atexit);
-    }
-    ++g_route_group_calls;
-
-    char up_name[128] = {};
-    char down_name[128] = {};
-    if (!name_from_gate(src0_gate_name, "ffn_up_exps", up_name, sizeof(up_name)) ||
-            !name_from_gate(src0_gate_name, "ffn_down_exps", down_name, sizeof(down_name))) {
-        ++g_route_group_invalid_gate;
-        return 0;
-    }
-
-    const int min_seen = route_group_min_seen();
-    int submitted = 0;
-    int active = 0;
-    for (int64_t expert = 0; expert < n_as; ++expert) {
-        if (matrix_row_counts[expert] <= 0) {
-            ++g_route_group_inactive_expert_skips;
-            continue;
-        }
-        ++active;
-        if (route_group_target_enabled("up")) {
-            submitted += route_group_enqueue_tensor(up_name, (int)expert, nullptr, min_seen);
-        }
-        if (route_group_target_enabled("down")) {
-            submitted += route_group_enqueue_tensor(down_name, (int)expert, nullptr, min_seen);
-        }
-    }
-
-    static std::atomic<int> first_route_group_updown{0};
-    if (submitted > 0 && first_route_group_updown.fetch_add(1, std::memory_order_relaxed) == 0) {
-        std::fprintf(stderr,
-                "[moe_stream_batch] route group up/down queue active: gate=%s submitted=%d active=%d min_seen=%d\n",
-                src0_gate_name, submitted, active, min_seen);
-    }
-    return submitted;
+    // The shape-selected local producer/cache path is retired.
+    return 0;
 }
 
 
@@ -27133,90 +26835,8 @@ extern "C" int ggml_cuda_moe_stream_batch_preload_gate_updown(const char *gate_n
         return ggml_cuda_moe_common_stream_batch_preload_gate_updown(
             gate_name, expert_idx, expert_bytes);
     }
-    if (!gate_updown_cosubmit_env_enabled()) return 0;
-    if (!gate_name || !std::strstr(gate_name, ".ffn_gate_exps.")) return 0;
-    if (expert_idx < 0 || expert_bytes == 0) return 0;
-
-    if (!g_gate_updown_cosubmit_report_registered.exchange(true)) {
-        std::atexit(gate_updown_cosubmit_report_atexit);
-    }
-    ++g_gate_updown_cosubmit_calls;
-
-    char names[2][128] = {};
-    if (!gate_updown_cosubmit_make_name(gate_name, "ffn_up_exps", names[0], sizeof(names[0])) ||
-            !gate_updown_cosubmit_make_name(gate_name, "ffn_down_exps", names[1], sizeof(names[1]))) {
-        return 0;
-    }
-
-    std::vector<gate_updown_cosubmit_job> planned;
-    planned.reserve(2);
-    const bool down_only = gate_updown_cosubmit_down_only_enabled();
-    const uint32_t min_seen = gate_updown_cosubmit_min_seen();
-    const uint32_t profile_min_count = gate_updown_cosubmit_profile_min_count();
-    if (profile_min_count > 0) {
-        load_profile_once();
-    }
-    for (int i = 0; i < 2; ++i) {
-        const char *tensor = names[i];
-        batch_vram_cache *cache = batch_cache_get_for_tensor(tensor, expert_bytes);
-        if (!cache) continue;
-        const bool is_down = std::strstr(tensor, ".ffn_down_exps.") != nullptr;
-        if (down_only && !is_down) {
-            continue;
-        }
-        const uintptr_t key = batch_key_hash(tensor, expert_idx);
-        if (min_seen > 0) {
-            uint32_t seen = 0;
-            {
-                std::lock_guard<std::mutex> lk(g_gate_updown_cosubmit_seen_mu);
-                uint32_t &slot_seen = g_gate_updown_cosubmit_seen[key];
-                seen = slot_seen;
-                if (slot_seen != UINT32_MAX) {
-                    ++slot_seen;
-                }
-            }
-            if (seen < min_seen) {
-                ++g_gate_updown_cosubmit_repeat_skips;
-                continue;
-            }
-        }
-        if (profile_min_count > 0 && profile_count_for_key(key) < profile_min_count) {
-            ++g_gate_updown_cosubmit_profile_skips;
-            continue;
-        }
-        if (batch_cache_find_slot(cache, key) >= 0) {
-            ++g_gate_updown_cosubmit_cache_hits;
-            continue;
-        }
-        const expert_pack_entry *pack_entry = expert_pack_lookup(tensor, expert_idx, expert_bytes);
-        if (!pack_entry) {
-            ++g_gate_updown_cosubmit_missing_pack;
-            continue;
-        }
-        const int slot = batch_cache_insert_slot(cache, key, nullptr, expert_bytes, g_batch.prefetch_stream,
-                true, true, nullptr, 0, false, tensor, expert_idx,
-                is_down, false, false);
-        if (slot < 0) {
-            ++g_gate_updown_cosubmit_no_slot_skips;
-            continue;
-        }
-        gate_updown_cosubmit_job job;
-        job.cache = cache;
-        job.slot = slot;
-        job.key = key;
-        job.dst = (char *)cache->pool + (size_t)slot * cache->slot_sz;
-        job.host_data = nullptr;
-        job.pack_entry = pack_entry;
-        job.expert_bytes = expert_bytes;
-        job.expert_idx = expert_idx;
-        std::snprintf(job.tensor, sizeof(job.tensor), "%s", tensor);
-        planned.push_back(job);
-    }
-
-    if (planned.empty()) return 0;
-    std::lock_guard<std::mutex> lk(g_gate_updown_cosubmit_pending_mu);
-    g_gate_updown_cosubmit_pending.insert(g_gate_updown_cosubmit_pending.end(), planned.begin(), planned.end());
-    return (int)planned.size();
+    // The shape-selected local producer/cache path is retired.
+    return 0;
 }
 
 extern "C" int ggml_cuda_moe_stream_batch_flush_gate_updown_cosubmit(void) {
