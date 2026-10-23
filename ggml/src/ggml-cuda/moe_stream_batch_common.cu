@@ -57,7 +57,6 @@ bool ggml_cuda_moe_dense_copy_to_device(const char *, void *, size_t, void *, bo
 #include "moe-common-lossless-format.h"
 #include "moe-common-object-pipeline-runtime.h"
 #include "moe-common-io-submit.h"
-#include "moe-common-cross-role.h"
 #include "moe-common-role-cache.h"
 #include "moe-common-dynamic-tier.h"
 #include "q4-colibri-worker-state-common.h"
@@ -16978,7 +16977,6 @@ static bool expert_pack_iouring_job_eligible(const Job &job, size_t expert_bytes
 #endif
 }
 
-#include "moe-common-cross-role.inc"
 
 template <typename Job, typename JobSizeFn, typename JobStreamFn>
 static bool expert_pack_iouring_copy_jobs_impl(
@@ -17057,11 +17055,6 @@ static bool expert_pack_iouring_copy_jobs_impl(
         copy_trace.pack_hit = true;
         const auto copy_start = batch_ttft_trace_enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto ram_enqueue_start = profile_ram_batch ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        if (!cache_bypass && common_cross_role_copy_h2d(job.pack_entry, job.dst, job_bytes, copy_stream)) {
-            ++ram_or_prefetch_jobs;
-            ram_or_prefetch_bytes += job_bytes;
-            continue;
-        }
         if (!cache_bypass && expert_pack_ram_tier_copy_h2d(job.pack_entry, job.dst, job_bytes, copy_stream, &copy_trace)) {
             ++ram_or_prefetch_jobs;
             ram_or_prefetch_bytes += job_bytes;
