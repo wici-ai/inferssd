@@ -1,0 +1,1581 @@
+[
+  {
+    "artifacts": {
+      "cache/ssdash/mac-alias/<alias-key>.json": "{\n  \"model_shards\": 1,\n  \"entries\": 256,\n  \"output_tsv\": \"@case/cache/ssdash/mac-alias/<alias-key>.tsv\"\n}\n",
+      "cache/ssdash/mac-alias/<alias-key>.tsv": "complete expert index\n"
+    },
+    "case": {
+      "mode": "chat",
+      "name": "dsv-chat",
+      "profile": "dsv"
+    },
+    "code": 0,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ],
+      [
+        "disk_usage",
+        "@case/cache/ssdash/mac-alias"
+      ],
+      [
+        "run",
+        [
+          "@python",
+          "/private@repo/scripts/kimi-build-gguf-expert-alias-tsv.py",
+          "--n-experts",
+          "384",
+          "--out",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+          "--summary-json",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+          "--model-glob",
+          "/private@case/model.gguf"
+        ],
+        true
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+        "@case/cache/ssdash/mac-alias/<alias-key>.tsv"
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+        "@case/cache/ssdash/mac-alias/<alias-key>.json"
+      ],
+      [
+        "execvpe",
+        "/private@case/build/bin/llama-cli"
+      ]
+    ],
+    "execs": [
+      [
+        "/private@case/build/bin/llama-cli",
+        [
+          "/private@case/build/bin/llama-cli",
+          "-m",
+          "/private@case/model.gguf",
+          "--mmap",
+          "--no-repack",
+          "--fit",
+          "off",
+          "--no-warmup",
+          "--no-host",
+          "-ngl",
+          "99",
+          "--cpu-moe",
+          "--no-op-offload",
+          "-c",
+          "8192",
+          "-b",
+          "512",
+          "-ub",
+          "512",
+          "-t",
+          "8",
+          "-tb",
+          "12",
+          "--chat-template-file",
+          "/private@repo/models/templates/deepseek-ai-DeepSeek-V4.1.jinja",
+          "--reasoning",
+          "off",
+          "--cache-ram",
+          "0",
+          "-ot",
+          "blk\\.[0-9]+\\.engram_embd\\.weight=CPU",
+          "-n",
+          "128"
+        ],
+        {
+          "GGML_MOE_EXPERT_GGUF_ALIAS_TSV": "@case/cache/ssdash/mac-alias/<alias-key>.tsv",
+          "HOME": "@case/home",
+          "LLAMA_DROP_MMAP_TENSOR_AFTER_UPLOAD": "1",
+          "LLAMA_DSV41_TOPK_REUSE": "0",
+          "LLAMA_MAC_ADAPTIVE_PREFILL": "0",
+          "LLAMA_MAC_COMPACT_METAL": "1",
+          "LLAMA_MMAP_PREFETCH": "0",
+          "SSD_LLAMA_BUILD_DIR": "@case/build",
+          "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "4096",
+          "SSD_LLAMA_MAC_EXPERT_CACHE_POLICY": "lfu",
+          "SSD_LLAMA_MAC_EXPERT_PREFILL": "1",
+          "SSD_LLAMA_MAC_EXPERT_READ_AHEAD": "2",
+          "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": "4096",
+          "SSD_LLAMA_MODEL": "@case/model.gguf",
+          "XDG_CACHE_HOME": "@case/cache"
+        }
+      ]
+    ],
+    "stderr": "",
+    "stdout": "Physical memory: 32.0 GiB; expert cache limit: 4096 MiB. Model buffers and the OS need additional RAM.\nReading 1 GGUF file(s) directly; no expert-pack copy. Index storage has 64.0 GiB free.\nStarting dsv chat with a fresh GGUF alias index: @case/cache/ssdash/mac-alias/<alias-key>.tsv\n"
+  },
+  {
+    "artifacts": {
+      "cache/ssdash/mac-alias/<alias-key>.json": "{\n  \"model_shards\": 1,\n  \"entries\": 256,\n  \"output_tsv\": \"@case/cache/ssdash/mac-alias/<alias-key>.tsv\"\n}\n",
+      "cache/ssdash/mac-alias/<alias-key>.tsv": "complete expert index\n"
+    },
+    "case": {
+      "mode": "server",
+      "name": "dsv-server",
+      "profile": "dsv"
+    },
+    "code": 0,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ],
+      [
+        "disk_usage",
+        "@case/cache/ssdash/mac-alias"
+      ],
+      [
+        "run",
+        [
+          "@python",
+          "/private@repo/scripts/kimi-build-gguf-expert-alias-tsv.py",
+          "--n-experts",
+          "384",
+          "--out",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+          "--summary-json",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+          "--model-glob",
+          "/private@case/model.gguf"
+        ],
+        true
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+        "@case/cache/ssdash/mac-alias/<alias-key>.tsv"
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+        "@case/cache/ssdash/mac-alias/<alias-key>.json"
+      ],
+      [
+        "execvpe",
+        "/private@case/build/bin/llama-server"
+      ]
+    ],
+    "execs": [
+      [
+        "/private@case/build/bin/llama-server",
+        [
+          "/private@case/build/bin/llama-server",
+          "-m",
+          "/private@case/model.gguf",
+          "--mmap",
+          "--no-repack",
+          "--fit",
+          "off",
+          "--no-warmup",
+          "--no-host",
+          "-ngl",
+          "99",
+          "--cpu-moe",
+          "--no-op-offload",
+          "-c",
+          "8192",
+          "-b",
+          "512",
+          "-ub",
+          "512",
+          "-t",
+          "8",
+          "-tb",
+          "12",
+          "--chat-template-file",
+          "/private@repo/models/templates/deepseek-ai-DeepSeek-V4.1.jinja",
+          "--reasoning",
+          "off",
+          "--cache-ram",
+          "0",
+          "-ot",
+          "blk\\.[0-9]+\\.engram_embd\\.weight=CPU",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "8080",
+          "-np",
+          "1"
+        ],
+        {
+          "GGML_MOE_EXPERT_GGUF_ALIAS_TSV": "@case/cache/ssdash/mac-alias/<alias-key>.tsv",
+          "HOME": "@case/home",
+          "LLAMA_DROP_MMAP_TENSOR_AFTER_UPLOAD": "1",
+          "LLAMA_DSV41_TOPK_REUSE": "0",
+          "LLAMA_MAC_ADAPTIVE_PREFILL": "0",
+          "LLAMA_MAC_COMPACT_METAL": "1",
+          "LLAMA_MMAP_PREFETCH": "0",
+          "SSD_LLAMA_BUILD_DIR": "@case/build",
+          "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "4096",
+          "SSD_LLAMA_MAC_EXPERT_CACHE_POLICY": "lfu",
+          "SSD_LLAMA_MAC_EXPERT_PREFILL": "1",
+          "SSD_LLAMA_MAC_EXPERT_READ_AHEAD": "2",
+          "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": "4096",
+          "SSD_LLAMA_MODEL": "@case/model.gguf",
+          "XDG_CACHE_HOME": "@case/cache"
+        }
+      ]
+    ],
+    "stderr": "",
+    "stdout": "Physical memory: 32.0 GiB; expert cache limit: 4096 MiB. Model buffers and the OS need additional RAM.\nReading 1 GGUF file(s) directly; no expert-pack copy. Index storage has 64.0 GiB free.\nStarting dsv server with a fresh GGUF alias index: @case/cache/ssdash/mac-alias/<alias-key>.tsv\n"
+  },
+  {
+    "artifacts": {
+      "cache/ssdash/mac-alias/<alias-key>.json": "{\n  \"model_shards\": 1,\n  \"entries\": 256,\n  \"output_tsv\": \"@case/cache/ssdash/mac-alias/<alias-key>.tsv\"\n}\n",
+      "cache/ssdash/mac-alias/<alias-key>.tsv": "complete expert index\n"
+    },
+    "case": {
+      "mode": "chat",
+      "name": "muse-chat",
+      "profile": "muse"
+    },
+    "code": 0,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ],
+      [
+        "disk_usage",
+        "@case/cache/ssdash/mac-alias"
+      ],
+      [
+        "run",
+        [
+          "@python",
+          "/private@repo/scripts/kimi-build-gguf-expert-alias-tsv.py",
+          "--n-experts",
+          "256",
+          "--out",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+          "--summary-json",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+          "--model-glob",
+          "/private@case/model.gguf"
+        ],
+        true
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+        "@case/cache/ssdash/mac-alias/<alias-key>.tsv"
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+        "@case/cache/ssdash/mac-alias/<alias-key>.json"
+      ],
+      [
+        "execvpe",
+        "/private@case/build/bin/llama-cli"
+      ]
+    ],
+    "execs": [
+      [
+        "/private@case/build/bin/llama-cli",
+        [
+          "/private@case/build/bin/llama-cli",
+          "-m",
+          "/private@case/model.gguf",
+          "--mmap",
+          "--no-repack",
+          "--fit",
+          "off",
+          "--no-warmup",
+          "--no-host",
+          "-ngl",
+          "99",
+          "--cpu-moe",
+          "--no-op-offload",
+          "-c",
+          "8192",
+          "-b",
+          "512",
+          "-ub",
+          "512",
+          "-t",
+          "8",
+          "-tb",
+          "12",
+          "--chat-template-file",
+          "/private@repo/models/templates/muse-spark.jinja",
+          "--reasoning",
+          "off",
+          "--cache-ram",
+          "0",
+          "-n",
+          "128"
+        ],
+        {
+          "GGML_MOE_EXPERT_GGUF_ALIAS_TSV": "@case/cache/ssdash/mac-alias/<alias-key>.tsv",
+          "HOME": "@case/home",
+          "LLAMA_DROP_MMAP_TENSOR_AFTER_UPLOAD": "1",
+          "LLAMA_DSV41_TOPK_REUSE": "0",
+          "LLAMA_MAC_ADAPTIVE_PREFILL": "0",
+          "LLAMA_MAC_COMPACT_METAL": "1",
+          "LLAMA_MMAP_PREFETCH": "0",
+          "SSD_LLAMA_BUILD_DIR": "@case/build",
+          "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "4096",
+          "SSD_LLAMA_MAC_EXPERT_CACHE_POLICY": "lfu",
+          "SSD_LLAMA_MAC_EXPERT_PREFILL": "1",
+          "SSD_LLAMA_MAC_EXPERT_READ_AHEAD": "2",
+          "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": "4096",
+          "SSD_LLAMA_MODEL": "@case/model.gguf",
+          "XDG_CACHE_HOME": "@case/cache"
+        }
+      ]
+    ],
+    "stderr": "",
+    "stdout": "Physical memory: 32.0 GiB; expert cache limit: 4096 MiB. Model buffers and the OS need additional RAM.\nReading 1 GGUF file(s) directly; no expert-pack copy. Index storage has 64.0 GiB free.\nStarting muse chat with a fresh GGUF alias index: @case/cache/ssdash/mac-alias/<alias-key>.tsv\n"
+  },
+  {
+    "artifacts": {
+      "cache/ssdash/mac-alias/<alias-key>.json": "{\n  \"model_shards\": 1,\n  \"entries\": 256,\n  \"output_tsv\": \"@case/cache/ssdash/mac-alias/<alias-key>.tsv\"\n}\n",
+      "cache/ssdash/mac-alias/<alias-key>.tsv": "complete expert index\n"
+    },
+    "case": {
+      "mode": "server",
+      "name": "muse-server",
+      "profile": "muse"
+    },
+    "code": 0,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ],
+      [
+        "disk_usage",
+        "@case/cache/ssdash/mac-alias"
+      ],
+      [
+        "run",
+        [
+          "@python",
+          "/private@repo/scripts/kimi-build-gguf-expert-alias-tsv.py",
+          "--n-experts",
+          "256",
+          "--out",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+          "--summary-json",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+          "--model-glob",
+          "/private@case/model.gguf"
+        ],
+        true
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+        "@case/cache/ssdash/mac-alias/<alias-key>.tsv"
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+        "@case/cache/ssdash/mac-alias/<alias-key>.json"
+      ],
+      [
+        "execvpe",
+        "/private@case/build/bin/llama-server"
+      ]
+    ],
+    "execs": [
+      [
+        "/private@case/build/bin/llama-server",
+        [
+          "/private@case/build/bin/llama-server",
+          "-m",
+          "/private@case/model.gguf",
+          "--mmap",
+          "--no-repack",
+          "--fit",
+          "off",
+          "--no-warmup",
+          "--no-host",
+          "-ngl",
+          "99",
+          "--cpu-moe",
+          "--no-op-offload",
+          "-c",
+          "8192",
+          "-b",
+          "512",
+          "-ub",
+          "512",
+          "-t",
+          "8",
+          "-tb",
+          "12",
+          "--chat-template-file",
+          "/private@repo/models/templates/muse-spark.jinja",
+          "--reasoning",
+          "off",
+          "--cache-ram",
+          "0",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "8080",
+          "-np",
+          "1"
+        ],
+        {
+          "GGML_MOE_EXPERT_GGUF_ALIAS_TSV": "@case/cache/ssdash/mac-alias/<alias-key>.tsv",
+          "HOME": "@case/home",
+          "LLAMA_DROP_MMAP_TENSOR_AFTER_UPLOAD": "1",
+          "LLAMA_DSV41_TOPK_REUSE": "0",
+          "LLAMA_MAC_ADAPTIVE_PREFILL": "0",
+          "LLAMA_MAC_COMPACT_METAL": "1",
+          "LLAMA_MMAP_PREFETCH": "0",
+          "SSD_LLAMA_BUILD_DIR": "@case/build",
+          "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "4096",
+          "SSD_LLAMA_MAC_EXPERT_CACHE_POLICY": "lfu",
+          "SSD_LLAMA_MAC_EXPERT_PREFILL": "1",
+          "SSD_LLAMA_MAC_EXPERT_READ_AHEAD": "2",
+          "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": "4096",
+          "SSD_LLAMA_MODEL": "@case/model.gguf",
+          "XDG_CACHE_HOME": "@case/cache"
+        }
+      ]
+    ],
+    "stderr": "",
+    "stdout": "Physical memory: 32.0 GiB; expert cache limit: 4096 MiB. Model buffers and the OS need additional RAM.\nReading 1 GGUF file(s) directly; no expert-pack copy. Index storage has 64.0 GiB free.\nStarting muse server with a fresh GGUF alias index: @case/cache/ssdash/mac-alias/<alias-key>.tsv\n"
+  },
+  {
+    "artifacts": {
+      "cache/ssdash/mac-alias/<alias-key>.json": "{\n  \"model_shards\": 1,\n  \"entries\": 256,\n  \"output_tsv\": \"@case/cache/ssdash/mac-alias/<alias-key>.tsv\"\n}\n",
+      "cache/ssdash/mac-alias/<alias-key>.tsv": "complete expert index\n"
+    },
+    "case": {
+      "env": {
+        "LLAMA_DSV41_TOPK_REUSE": "1",
+        "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "24576",
+        "SSD_LLAMA_PREFILL_THREADS": "12",
+        "SSD_LLAMA_THREADS": "4",
+        "UNRELATED": "kept"
+      },
+      "extra": [
+        "--",
+        "--seed",
+        "7"
+      ],
+      "name": "mac-overrides"
+    },
+    "code": 0,
+    "env": {
+      "HOME": "@case/home",
+      "LLAMA_DSV41_TOPK_REUSE": "1",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "24576",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "SSD_LLAMA_PREFILL_THREADS": "12",
+      "SSD_LLAMA_THREADS": "4",
+      "UNRELATED": "kept",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ],
+      [
+        "disk_usage",
+        "@case/cache/ssdash/mac-alias"
+      ],
+      [
+        "run",
+        [
+          "@python",
+          "/private@repo/scripts/kimi-build-gguf-expert-alias-tsv.py",
+          "--n-experts",
+          "256",
+          "--out",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+          "--summary-json",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+          "--model-glob",
+          "/private@case/model.gguf"
+        ],
+        true
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+        "@case/cache/ssdash/mac-alias/<alias-key>.tsv"
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+        "@case/cache/ssdash/mac-alias/<alias-key>.json"
+      ],
+      [
+        "execvpe",
+        "/private@case/build/bin/llama-server"
+      ]
+    ],
+    "execs": [
+      [
+        "/private@case/build/bin/llama-server",
+        [
+          "/private@case/build/bin/llama-server",
+          "-m",
+          "/private@case/model.gguf",
+          "--mmap",
+          "--no-repack",
+          "--fit",
+          "off",
+          "--no-warmup",
+          "--no-host",
+          "-ngl",
+          "99",
+          "--cpu-moe",
+          "--no-op-offload",
+          "-c",
+          "8192",
+          "-b",
+          "512",
+          "-ub",
+          "512",
+          "-t",
+          "4",
+          "-tb",
+          "12",
+          "--chat-template-file",
+          "/private@repo/models/templates/muse-spark.jinja",
+          "--reasoning",
+          "off",
+          "--cache-ram",
+          "0",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "8080",
+          "-np",
+          "1",
+          "--seed",
+          "7"
+        ],
+        {
+          "GGML_MOE_EXPERT_GGUF_ALIAS_TSV": "@case/cache/ssdash/mac-alias/<alias-key>.tsv",
+          "HOME": "@case/home",
+          "LLAMA_DROP_MMAP_TENSOR_AFTER_UPLOAD": "1",
+          "LLAMA_DSV41_TOPK_REUSE": "1",
+          "LLAMA_MAC_ADAPTIVE_PREFILL": "0",
+          "LLAMA_MAC_COMPACT_METAL": "1",
+          "LLAMA_MMAP_PREFETCH": "0",
+          "SSD_LLAMA_BUILD_DIR": "@case/build",
+          "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "24576",
+          "SSD_LLAMA_MAC_EXPERT_CACHE_POLICY": "lfu",
+          "SSD_LLAMA_MAC_EXPERT_PREFILL": "1",
+          "SSD_LLAMA_MAC_EXPERT_READ_AHEAD": "2",
+          "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": "4096",
+          "SSD_LLAMA_MODEL": "@case/model.gguf",
+          "SSD_LLAMA_PREFILL_THREADS": "12",
+          "SSD_LLAMA_THREADS": "4",
+          "UNRELATED": "kept",
+          "XDG_CACHE_HOME": "@case/cache"
+        }
+      ]
+    ],
+    "stderr": "",
+    "stdout": "Physical memory: 32.0 GiB; expert cache limit: 24576 MiB. Model buffers and the OS need additional RAM.\nReading 1 GGUF file(s) directly; no expert-pack copy. Index storage has 64.0 GiB free.\nStarting muse server with a fresh GGUF alias index: @case/cache/ssdash/mac-alias/<alias-key>.tsv\n"
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "env": {
+        "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": ""
+      },
+      "name": "mac-bad-"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "SSD_LLAMA_MAC_EXPERT_CACHE_MIB must be 0..17592186044415\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "env": {
+        "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "-1"
+      },
+      "name": "mac-bad--1"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "-1",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "SSD_LLAMA_MAC_EXPERT_CACHE_MIB must be 0..17592186044415\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "env": {
+        "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "1x"
+      },
+      "name": "mac-bad-1x"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "1x",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "SSD_LLAMA_MAC_EXPERT_CACHE_MIB must be 0..17592186044415\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "env": {
+        "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "18446744073709551616"
+      },
+      "name": "mac-bad-18446744073709551616"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "18446744073709551616",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "SSD_LLAMA_MAC_EXPERT_CACHE_MIB must be 0..17592186044415\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "env": {
+        "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": "3"
+      },
+      "name": "mac-alignment"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": "3",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT must be 1, 4096 or 16384\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "env": {
+        "SSD_LLAMA_MAC_EXPERT_CACHE_POLICY": "bad"
+      },
+      "name": "mac-policy"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MAC_EXPERT_CACHE_POLICY": "bad",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "SSD_LLAMA_MAC_EXPERT_CACHE_POLICY must be lfu or lru\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "env": {
+        "SSD_LLAMA_MAC_EXPERT_PACK": "pack.bin"
+      },
+      "name": "mac-pack"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MAC_EXPERT_PACK": "pack.bin",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "Unset SSD_LLAMA_MAC_EXPERT_PACK for GGUF mode, or use the legacy pack launcher\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "missing_model": true,
+      "name": "mac-missing-model"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "Set SSD_LLAMA_MODEL to the first GGUF shard\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "name": "mac-second-shard",
+      "second_shard": true
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model-00002-of-00002.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "SSD_LLAMA_MODEL must name the first GGUF shard\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "incomplete": true,
+      "name": "mac-incomplete"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model-00001-of-00002.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "Missing GGUF shard: /private@case/model-00002-of-00002.gguf\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {
+      "cache/ssdash/mac-alias/<alias-key>.json": "{\n  \"model_shards\": 2,\n  \"entries\": 256,\n  \"output_tsv\": \"@case/cache/ssdash/mac-alias/<alias-key>.tsv\"\n}\n",
+      "cache/ssdash/mac-alias/<alias-key>.tsv": "complete expert index\n"
+    },
+    "case": {
+      "name": "mac-split",
+      "split": true
+    },
+    "code": 0,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model-00001-of-00002.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ],
+      [
+        "disk_usage",
+        "@case/cache/ssdash/mac-alias"
+      ],
+      [
+        "run",
+        [
+          "@python",
+          "/private@repo/scripts/kimi-build-gguf-expert-alias-tsv.py",
+          "--n-experts",
+          "256",
+          "--out",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+          "--summary-json",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+          "--model-glob",
+          "/private@case/model-00001-of-00002.gguf",
+          "--model-glob",
+          "/private@case/model-00002-of-00002.gguf"
+        ],
+        true
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+        "@case/cache/ssdash/mac-alias/<alias-key>.tsv"
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+        "@case/cache/ssdash/mac-alias/<alias-key>.json"
+      ],
+      [
+        "execvpe",
+        "/private@case/build/bin/llama-server"
+      ]
+    ],
+    "execs": [
+      [
+        "/private@case/build/bin/llama-server",
+        [
+          "/private@case/build/bin/llama-server",
+          "-m",
+          "/private@case/model-00001-of-00002.gguf",
+          "--mmap",
+          "--no-repack",
+          "--fit",
+          "off",
+          "--no-warmup",
+          "--no-host",
+          "-ngl",
+          "99",
+          "--cpu-moe",
+          "--no-op-offload",
+          "-c",
+          "8192",
+          "-b",
+          "512",
+          "-ub",
+          "512",
+          "-t",
+          "8",
+          "-tb",
+          "12",
+          "--chat-template-file",
+          "/private@repo/models/templates/muse-spark.jinja",
+          "--reasoning",
+          "off",
+          "--cache-ram",
+          "0",
+          "--host",
+          "127.0.0.1",
+          "--port",
+          "8080",
+          "-np",
+          "1"
+        ],
+        {
+          "GGML_MOE_EXPERT_GGUF_ALIAS_TSV": "@case/cache/ssdash/mac-alias/<alias-key>.tsv",
+          "HOME": "@case/home",
+          "LLAMA_DROP_MMAP_TENSOR_AFTER_UPLOAD": "1",
+          "LLAMA_DSV41_TOPK_REUSE": "0",
+          "LLAMA_MAC_ADAPTIVE_PREFILL": "0",
+          "LLAMA_MAC_COMPACT_METAL": "1",
+          "LLAMA_MMAP_PREFETCH": "0",
+          "SSD_LLAMA_BUILD_DIR": "@case/build",
+          "SSD_LLAMA_MAC_EXPERT_CACHE_MIB": "4096",
+          "SSD_LLAMA_MAC_EXPERT_CACHE_POLICY": "lfu",
+          "SSD_LLAMA_MAC_EXPERT_PREFILL": "1",
+          "SSD_LLAMA_MAC_EXPERT_READ_AHEAD": "2",
+          "SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT": "4096",
+          "SSD_LLAMA_MODEL": "@case/model-00001-of-00002.gguf",
+          "XDG_CACHE_HOME": "@case/cache"
+        }
+      ]
+    ],
+    "stderr": "",
+    "stdout": "Physical memory: 32.0 GiB; expert cache limit: 4096 MiB. Model buffers and the OS need additional RAM.\nReading 2 GGUF file(s) directly; no expert-pack copy. Index storage has 64.0 GiB free.\nStarting muse server with a fresh GGUF alias index: @case/cache/ssdash/mac-alias/<alias-key>.tsv\n"
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "missing_binary": true,
+      "name": "mac-missing-binary"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "Missing executable: /private@case/build/bin/llama-server; run scripts/build-macos-metal.sh first\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "missing_template": true,
+      "name": "mac-missing-template"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "Missing model chat template: /private@repo/models/templates/muse-spark.jinja\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "name": "mac-platform",
+      "system": "Linux"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ]
+    ],
+    "execs": [],
+    "stderr": "This launcher requires an Apple Silicon Mac\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "extra": [
+        "--model=other.gguf"
+      ],
+      "name": "mac-model-override"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "Set the model with SSD_LLAMA_MODEL so the expert index matches it\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "env": {
+        "LLAMA_ARG_HF_REPO": "example/model"
+      },
+      "name": "mac-remote-env"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "LLAMA_ARG_HF_REPO": "example/model",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ]
+    ],
+    "execs": [],
+    "stderr": "Set the model with SSD_LLAMA_MODEL so the expert index matches it\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "failure": "index",
+      "name": "mac-index-failure"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ],
+      [
+        "disk_usage",
+        "@case/cache/ssdash/mac-alias"
+      ],
+      [
+        "run",
+        [
+          "@python",
+          "/private@repo/scripts/kimi-build-gguf-expert-alias-tsv.py",
+          "--n-experts",
+          "256",
+          "--out",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+          "--summary-json",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+          "--model-glob",
+          "/private@case/model.gguf"
+        ],
+        true
+      ]
+    ],
+    "execs": [],
+    "stderr": "Command '['@python', '/private@repo/scripts/kimi-build-gguf-expert-alias-tsv.py', '--n-experts', '256', '--out', '@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv', '--summary-json', '@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json', '--model-glob', '/private@case/model.gguf']' returned non-zero exit status 9.\n",
+    "stdout": "Physical memory: 32.0 GiB; expert cache limit: 4096 MiB. Model buffers and the OS need additional RAM.\nReading 1 GGUF file(s) directly; no expert-pack copy. Index storage has 64.0 GiB free.\n"
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "failure": "empty",
+      "name": "mac-index-empty"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ],
+      [
+        "disk_usage",
+        "@case/cache/ssdash/mac-alias"
+      ],
+      [
+        "run",
+        [
+          "@python",
+          "/private@repo/scripts/kimi-build-gguf-expert-alias-tsv.py",
+          "--n-experts",
+          "256",
+          "--out",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+          "--summary-json",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+          "--model-glob",
+          "/private@case/model.gguf"
+        ],
+        true
+      ]
+    ],
+    "execs": [],
+    "stderr": "GGUF metadata did not produce a complete nonempty expert index\n",
+    "stdout": "Physical memory: 32.0 GiB; expert cache limit: 4096 MiB. Model buffers and the OS need additional RAM.\nReading 1 GGUF file(s) directly; no expert-pack copy. Index storage has 64.0 GiB free.\n"
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "failure": "partial",
+      "name": "mac-index-partial"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ],
+      [
+        "disk_usage",
+        "@case/cache/ssdash/mac-alias"
+      ],
+      [
+        "run",
+        [
+          "@python",
+          "/private@repo/scripts/kimi-build-gguf-expert-alias-tsv.py",
+          "--n-experts",
+          "256",
+          "--out",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+          "--summary-json",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+          "--model-glob",
+          "/private@case/model.gguf"
+        ],
+        true
+      ]
+    ],
+    "execs": [],
+    "stderr": "GGUF metadata did not produce a complete nonempty expert index\n",
+    "stdout": "Physical memory: 32.0 GiB; expert cache limit: 4096 MiB. Model buffers and the OS need additional RAM.\nReading 1 GGUF file(s) directly; no expert-pack copy. Index storage has 64.0 GiB free.\n"
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "failure": "replace1",
+      "name": "mac-replace-first"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ],
+      [
+        "disk_usage",
+        "@case/cache/ssdash/mac-alias"
+      ],
+      [
+        "run",
+        [
+          "@python",
+          "/private@repo/scripts/kimi-build-gguf-expert-alias-tsv.py",
+          "--n-experts",
+          "256",
+          "--out",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+          "--summary-json",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+          "--model-glob",
+          "/private@case/model.gguf"
+        ],
+        true
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+        "@case/cache/ssdash/mac-alias/<alias-key>.tsv"
+      ]
+    ],
+    "execs": [],
+    "stderr": "fixture replace failure\n",
+    "stdout": "Physical memory: 32.0 GiB; expert cache limit: 4096 MiB. Model buffers and the OS need additional RAM.\nReading 1 GGUF file(s) directly; no expert-pack copy. Index storage has 64.0 GiB free.\n"
+  },
+  {
+    "artifacts": {
+      "cache/ssdash/mac-alias/<alias-key>.tsv": "complete expert index\n"
+    },
+    "case": {
+      "failure": "replace2",
+      "name": "mac-replace-second"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ],
+      [
+        "disk_usage",
+        "@case/cache/ssdash/mac-alias"
+      ],
+      [
+        "run",
+        [
+          "@python",
+          "/private@repo/scripts/kimi-build-gguf-expert-alias-tsv.py",
+          "--n-experts",
+          "256",
+          "--out",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+          "--summary-json",
+          "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+          "--model-glob",
+          "/private@case/model.gguf"
+        ],
+        true
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/index.tsv",
+        "@case/cache/ssdash/mac-alias/<alias-key>.tsv"
+      ],
+      [
+        "replace",
+        "@case/cache/ssdash/mac-alias/.index-<temporary>/summary.json",
+        "@case/cache/ssdash/mac-alias/<alias-key>.json"
+      ]
+    ],
+    "execs": [],
+    "stderr": "fixture replace failure\n",
+    "stdout": "Physical memory: 32.0 GiB; expert cache limit: 4096 MiB. Model buffers and the OS need additional RAM.\nReading 1 GGUF file(s) directly; no expert-pack copy. Index storage has 64.0 GiB free.\n"
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "failure": "stdout",
+      "name": "mac-stdout-failure"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ],
+      [
+        "disk_usage",
+        "@case/cache/ssdash/mac-alias"
+      ]
+    ],
+    "execs": [],
+    "stderr": "fixture stdout failure\n",
+    "stdout": ""
+  },
+  {
+    "artifacts": {},
+    "case": {
+      "failure": "sysctl",
+      "name": "mac-sysctl-failure"
+    },
+    "code": 2,
+    "env": {
+      "HOME": "@case/home",
+      "SSD_LLAMA_BUILD_DIR": "@case/build",
+      "SSD_LLAMA_MODEL": "@case/model.gguf",
+      "XDG_CACHE_HOME": "@case/cache"
+    },
+    "events": [
+      [
+        "platform.system"
+      ],
+      [
+        "platform.machine"
+      ],
+      [
+        "check_output",
+        [
+          "sysctl",
+          "-n",
+          "hw.memsize"
+        ],
+        {
+          "text": true
+        }
+      ]
+    ],
+    "execs": [],
+    "stderr": "Command '['sysctl', '-n', 'hw.memsize']' returned non-zero exit status 3.\n",
+    "stdout": ""
+  }
+]
