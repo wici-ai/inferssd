@@ -37,17 +37,6 @@
 #include <sys/resource.h>
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-#if defined(LLAMA_SERVER_CUDA_MOE)
-#endif
-extern "C" bool llama_moe_prefill_phase_workspace(
-    llama_context * ctx, int active) __attribute__((weak));
-extern "C" bool llama_moe_prefill_phase_workspace_sized(
-    llama_context * ctx, int active, uint32_t requested_tokens) __attribute__((weak));
-extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(
-    llama_context * ctx, int active, uint32_t prompt_tokens, uint32_t prefill_tokens) __attribute__((weak));
-#endif
-
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -60,22 +49,6 @@ extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
-
-static bool server_prompt_last_token_single_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("LLAMA_SERVER_PROMPT_LAST_TOKEN_SINGLE");
-        return env && env[0] && env[0] != '0';
-    }();
-    return enabled;
-}
-
-static bool server_prefill_new_tokens_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("LLAMA_SERVER_PREFILL_NEW_TOKENS");
-        return !env || std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
 
 // The number of tokens of the shared prompt prefix the chat template reported ("shared_prefix_chars", see
 // oaicompat_chat_params_parse), if that prefix tokenizes to a prefix of the prompt's tokens; 0 otherwise.
@@ -109,411 +82,7 @@ static int64_t server_shared_prefix_tokens(const llama_vocab * vocab, const json
     return 0;
 }
 
-static bool server_raw_io_log_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("LLAMA_RAW_IO_LOG");
-        return env && env[0] && env[0] != '0';
-    }();
-    return enabled;
-}
-
-static bool server_kimi_dense_phase_gate_enabled() {
-    static const bool enabled = []() {
-        for (const char * name : { "GGML_KIMI_DENSE_PREFETCH_LAYERS", "GGML_KIMI_KDA_GPU_LAYERS", "GGML_KIMI_CPU_SINK" }) {
-            const char * env = std::getenv(name);
-            if (env && env[0] && std::strcmp(env, "0") != 0) {
-                return true;
-            }
-        }
-        return false;
-    }();
-    return enabled;
-}
-
-struct server_moe_memory_events {
-    uint64_t monotonic_ns = 0;
-    uint64_t low = 0;
-    uint64_t high = 0;
-    uint64_t max = 0;
-    uint64_t oom = 0;
-    uint64_t oom_kill = 0;
-    uint64_t oom_group_kill = 0;
-    uint64_t current = 0;
-    uint64_t anon = 0;
-    uint64_t file = 0;
-    uint64_t kernel = 0;
-    uint64_t shmem = 0;
-    uint64_t file_mapped = 0;
-    uint64_t file_dirty = 0;
-    uint64_t file_writeback = 0;
-    uint64_t pgfault = 0;
-    uint64_t pgmajfault = 0;
-    uint64_t pgscan = 0;
-    uint64_t pgsteal = 0;
-    uint64_t workingset_refault_file = 0;
-    uint64_t workingset_activate_file = 0;
-    uint64_t minor_faults = 0;
-    uint64_t major_faults = 0;
-    uint64_t cpu_usage_usec = 0;
-    uint64_t cpu_user_usec = 0;
-    uint64_t cpu_system_usec = 0;
-    uint64_t cpu_nr_throttled = 0;
-    uint64_t cpu_throttled_usec = 0;
-    uint64_t io_read_bytes = 0;
-    uint64_t io_write_bytes = 0;
-};
-
-struct server_moe_memory_event_task_state {
-    server_moe_memory_events begin;
-    server_moe_memory_events last;
-};
-
-static bool server_moe_phase_memory_events_enabled() {
-    const char * env = std::getenv("GGML_MOE_PHASE_MEMORY_EVENTS");
-    return env && env[0] && env[0] != '0';
-}
-
-static const std::filesystem::path & server_moe_cgroup_path() {
-    static const std::filesystem::path path = []() {
-#if defined(__linux__)
-        std::ifstream cgroup("/proc/self/cgroup");
-        std::string line;
-        while (std::getline(cgroup, line)) {
-            if (line.rfind("0::", 0) != 0) {
-                continue;
-            }
-            std::string relative = line.substr(3);
-            while (!relative.empty() && relative.front() == '/') {
-                relative.erase(relative.begin());
-            }
-            return std::filesystem::path("/sys/fs/cgroup") / relative;
-        }
-#endif
-        return std::filesystem::path();
-    }();
-    return path;
-}
-
-static bool server_moe_read_memory_events(server_moe_memory_events & events) {
-#if defined(__linux__)
-    events.monotonic_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    struct rusage usage = {};
-    if (getrusage(RUSAGE_SELF, &usage) == 0) {
-        events.minor_faults = (uint64_t) usage.ru_minflt;
-        events.major_faults = (uint64_t) usage.ru_majflt;
-    }
-
-    const std::filesystem::path & cgroup_path = server_moe_cgroup_path();
-    if (cgroup_path.empty()) {
-        return false;
-    }
-
-    std::ifstream input(cgroup_path / "memory.events");
-    std::string key;
-    uint64_t value = 0;
-    bool saw_max = false;
-    while (input >> key >> value) {
-        if (key == "low") {
-            events.low = value;
-        } else if (key == "high") {
-            events.high = value;
-        } else if (key == "max") {
-            events.max = value;
-            saw_max = true;
-        } else if (key == "oom") {
-            events.oom = value;
-        } else if (key == "oom_kill") {
-            events.oom_kill = value;
-        } else if (key == "oom_group_kill") {
-            events.oom_group_kill = value;
-        }
-    }
-
-    std::ifstream current_input(cgroup_path / "memory.current");
-    current_input >> events.current;
-    std::ifstream stat_input(cgroup_path / "memory.stat");
-    while (stat_input >> key >> value) {
-        if (key == "anon") {
-            events.anon = value;
-        } else if (key == "file") {
-            events.file = value;
-        } else if (key == "kernel") {
-            events.kernel = value;
-        } else if (key == "shmem") {
-            events.shmem = value;
-        } else if (key == "file_mapped") {
-            events.file_mapped = value;
-        } else if (key == "file_dirty") {
-            events.file_dirty = value;
-        } else if (key == "file_writeback") {
-            events.file_writeback = value;
-        } else if (key == "pgfault") {
-            events.pgfault = value;
-        } else if (key == "pgmajfault") {
-            events.pgmajfault = value;
-        } else if (key == "pgscan") {
-            events.pgscan = value;
-        } else if (key == "pgsteal") {
-            events.pgsteal = value;
-        } else if (key == "workingset_refault_file") {
-            events.workingset_refault_file = value;
-        } else if (key == "workingset_activate_file") {
-            events.workingset_activate_file = value;
-        }
-    }
-
-    std::ifstream cpu_input(cgroup_path / "cpu.stat");
-    while (cpu_input >> key >> value) {
-        if (key == "usage_usec") {
-            events.cpu_usage_usec = value;
-        } else if (key == "user_usec") {
-            events.cpu_user_usec = value;
-        } else if (key == "system_usec") {
-            events.cpu_system_usec = value;
-        } else if (key == "nr_throttled") {
-            events.cpu_nr_throttled = value;
-        } else if (key == "throttled_usec") {
-            events.cpu_throttled_usec = value;
-        }
-    }
-
-    std::ifstream io_input("/proc/self/io");
-    while (io_input >> key >> value) {
-        if (key == "read_bytes:") {
-            events.io_read_bytes = value;
-        } else if (key == "write_bytes:") {
-            events.io_write_bytes = value;
-        }
-    }
-    return saw_max;
-#else
-    (void) events;
-    return false;
-#endif
-}
-
-static uint64_t server_moe_memory_event_delta(uint64_t current, uint64_t previous) {
-    return current >= previous ? current - previous : 0;
-}
-
-static void server_moe_phase_memory_events_report(const char * label, int64_t task_id) {
-    if (!server_moe_phase_memory_events_enabled()) {
-        return;
-    }
-
-    server_moe_memory_events current;
-    if (!server_moe_read_memory_events(current)) {
-        SRV_WRN("[moe_phase_memory_events] label=%s task=%lld status=unavailable\n",
-                label ? label : "unknown", (long long) task_id);
-        return;
-    }
-
-    static std::mutex mutex;
-    static std::unordered_map<int64_t, server_moe_memory_event_task_state> tasks;
-    std::lock_guard<std::mutex> lock(mutex);
-    auto it = tasks.find(task_id);
-    if (!label || std::strcmp(label, "request_begin") == 0 || it == tasks.end()) {
-        it = tasks.insert_or_assign(task_id, server_moe_memory_event_task_state{current, current}).first;
-    }
-    const server_moe_memory_events & begin = it->second.begin;
-    const server_moe_memory_events & last = it->second.last;
-
-    SRV_INF("[moe_phase_memory_events] label=%s task=%lld "
-            "monotonic_ns=%llu minor_faults=%llu major_faults=%llu "
-            "max=%llu oom=%llu oom_kill=%llu oom_group_kill=%llu "
-            "current=%llu anon=%llu file=%llu kernel=%llu shmem=%llu "
-            "file_mapped=%llu file_dirty=%llu file_writeback=%llu "
-            "pgfault=%llu pgmajfault=%llu pgscan=%llu pgsteal=%llu "
-            "workingset_refault_file=%llu workingset_activate_file=%llu "
-            "delta_phase_minor_faults=%llu delta_phase_major_faults=%llu "
-            "delta_phase_pgfault=%llu delta_phase_pgmajfault=%llu "
-            "delta_phase_pgscan=%llu delta_phase_pgsteal=%llu "
-            "delta_phase_workingset_refault_file=%llu "
-            "delta_phase_max=%llu delta_phase_oom=%llu delta_phase_oom_kill=%llu "
-            "delta_phase_oom_group_kill=%llu delta_total_max=%llu delta_total_oom=%llu "
-            "delta_total_oom_kill=%llu delta_total_oom_group_kill=%llu\n",
-            label ? label : "unknown",
-            (long long) task_id,
-            (unsigned long long) current.monotonic_ns,
-            (unsigned long long) current.minor_faults,
-            (unsigned long long) current.major_faults,
-            (unsigned long long) current.max,
-            (unsigned long long) current.oom,
-            (unsigned long long) current.oom_kill,
-            (unsigned long long) current.oom_group_kill,
-            (unsigned long long) current.current,
-            (unsigned long long) current.anon,
-            (unsigned long long) current.file,
-            (unsigned long long) current.kernel,
-            (unsigned long long) current.shmem,
-            (unsigned long long) current.file_mapped,
-            (unsigned long long) current.file_dirty,
-            (unsigned long long) current.file_writeback,
-            (unsigned long long) current.pgfault,
-            (unsigned long long) current.pgmajfault,
-            (unsigned long long) current.pgscan,
-            (unsigned long long) current.pgsteal,
-            (unsigned long long) current.workingset_refault_file,
-            (unsigned long long) current.workingset_activate_file,
-            (unsigned long long) server_moe_memory_event_delta(current.minor_faults, last.minor_faults),
-            (unsigned long long) server_moe_memory_event_delta(current.major_faults, last.major_faults),
-            (unsigned long long) server_moe_memory_event_delta(current.pgfault, last.pgfault),
-            (unsigned long long) server_moe_memory_event_delta(current.pgmajfault, last.pgmajfault),
-            (unsigned long long) server_moe_memory_event_delta(current.pgscan, last.pgscan),
-            (unsigned long long) server_moe_memory_event_delta(current.pgsteal, last.pgsteal),
-            (unsigned long long) server_moe_memory_event_delta(
-                current.workingset_refault_file, last.workingset_refault_file),
-            (unsigned long long) server_moe_memory_event_delta(current.max, last.max),
-            (unsigned long long) server_moe_memory_event_delta(current.oom, last.oom),
-            (unsigned long long) server_moe_memory_event_delta(current.oom_kill, last.oom_kill),
-            (unsigned long long) server_moe_memory_event_delta(current.oom_group_kill, last.oom_group_kill),
-            (unsigned long long) server_moe_memory_event_delta(current.max, begin.max),
-            (unsigned long long) server_moe_memory_event_delta(current.oom, begin.oom),
-            (unsigned long long) server_moe_memory_event_delta(current.oom_kill, begin.oom_kill),
-            (unsigned long long) server_moe_memory_event_delta(current.oom_group_kill, begin.oom_group_kill));
-
-    SRV_INF("[moe_phase_resource] label=%s task=%lld monotonic_ns=%llu "
-            "cpu_usage_usec=%llu cpu_user_usec=%llu cpu_system_usec=%llu "
-            "cpu_nr_throttled=%llu cpu_throttled_usec=%llu "
-            "io_read_bytes=%llu io_write_bytes=%llu "
-            "delta_phase_cpu_usage_usec=%llu delta_phase_cpu_user_usec=%llu "
-            "delta_phase_cpu_system_usec=%llu delta_phase_cpu_nr_throttled=%llu "
-            "delta_phase_cpu_throttled_usec=%llu delta_phase_io_read_bytes=%llu "
-            "delta_phase_io_write_bytes=%llu\n",
-            label ? label : "unknown",
-            (long long) task_id,
-            (unsigned long long) current.monotonic_ns,
-            (unsigned long long) current.cpu_usage_usec,
-            (unsigned long long) current.cpu_user_usec,
-            (unsigned long long) current.cpu_system_usec,
-            (unsigned long long) current.cpu_nr_throttled,
-            (unsigned long long) current.cpu_throttled_usec,
-            (unsigned long long) current.io_read_bytes,
-            (unsigned long long) current.io_write_bytes,
-            (unsigned long long) server_moe_memory_event_delta(current.cpu_usage_usec, last.cpu_usage_usec),
-            (unsigned long long) server_moe_memory_event_delta(current.cpu_user_usec, last.cpu_user_usec),
-            (unsigned long long) server_moe_memory_event_delta(current.cpu_system_usec, last.cpu_system_usec),
-            (unsigned long long) server_moe_memory_event_delta(current.cpu_nr_throttled, last.cpu_nr_throttled),
-            (unsigned long long) server_moe_memory_event_delta(current.cpu_throttled_usec, last.cpu_throttled_usec),
-            (unsigned long long) server_moe_memory_event_delta(current.io_read_bytes, last.io_read_bytes),
-            (unsigned long long) server_moe_memory_event_delta(current.io_write_bytes, last.io_write_bytes));
-
-    if (label && std::strcmp(label, "request_end") == 0) {
-        tasks.erase(it);
-    } else {
-        it->second.last = current;
-    }
-}
-
-static void server_moe_phase_smaps_snapshot(const char * label, int64_t task_id) {
-#if defined(__linux__)
-    const char * directory = std::getenv("GGML_MOE_PHASE_SMAPS_DIR");
-    if (!directory || !directory[0] || !label || !label[0]) {
-        return;
-    }
-
-    char stem[128];
-    const int written = std::snprintf(
-        stem, sizeof(stem), "task-%lld-%s", (long long) task_id, label);
-    if (written < 0 || (size_t) written >= sizeof(stem)) {
-        return;
-    }
-    const std::filesystem::path base = std::filesystem::path(directory) / stem;
-    for (const char * source : { "/proc/self/maps", "/proc/self/smaps" }) {
-        std::ifstream input(source, std::ios::binary);
-        std::ofstream output(base.string() + (source[11] == 's' ? ".smaps" : ".maps"),
-            std::ios::binary | std::ios::trunc);
-        if (input && output) {
-            output << input.rdbuf();
-        }
-    }
-#else
-    (void) label;
-    (void) task_id;
-#endif
-}
-
-static bool server_moe_workspace_transition(
-        llama_context * ctx,
-        const char * label,
-        int64_t task_id,
-        uint32_t prompt_tokens,
-        uint32_t prefill_tokens) {
-#if defined(__GNUC__) || defined(__clang__)
-    const bool phase_memory_events = server_moe_phase_memory_events_enabled();
-    const bool dense_phase_gate = server_kimi_dense_phase_gate_enabled();
-    const char * elastic_value = std::getenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC");
-    const bool elastic_lifecycle = elastic_value && !std::strcmp(elastic_value, "1");
-    const char * prompt_pack_source_value =
-        std::getenv("GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE");
-    const bool prompt_pack_source_lifecycle = prompt_pack_source_value &&
-        prompt_pack_source_value[0] && std::strcmp(prompt_pack_source_value, "0") != 0;
-    // Memory lifecycle is a correctness transition, not telemetry.
-    if ((phase_memory_events || dense_phase_gate || elastic_lifecycle ||
-            prompt_pack_source_lifecycle) &&
-            (llama_moe_prefill_phase_workspace_sized_ex ||
-             llama_moe_prefill_phase_workspace_sized || llama_moe_prefill_phase_workspace) && ctx) {
-        bool transition_ok = true;
-        if (label && std::strcmp(label, "request_begin") == 0) {
-            transition_ok = llama_moe_prefill_phase_workspace_sized_ex ?
-                llama_moe_prefill_phase_workspace_sized_ex(ctx, 1, prompt_tokens, prefill_tokens) :
-                llama_moe_prefill_phase_workspace_sized ?
-                llama_moe_prefill_phase_workspace_sized(ctx, 1, prompt_tokens) :
-                llama_moe_prefill_phase_workspace(ctx, 1);
-        } else if (label &&
-                (std::strcmp(label, "prefill_done") == 0 ||
-                 std::strcmp(label, "request_end") == 0)) {
-            transition_ok = llama_moe_prefill_phase_workspace_sized_ex ?
-                llama_moe_prefill_phase_workspace_sized_ex(ctx, 0, 0, 0) :
-                llama_moe_prefill_phase_workspace_sized ?
-                llama_moe_prefill_phase_workspace_sized(ctx, 0, 0) :
-                llama_moe_prefill_phase_workspace(ctx, 0);
-        }
-        if (!transition_ok) {
-            SRV_WRN(
-                "[moe_prefill_phase_workspace] label=%s task=%lld transition=failed\n",
-                label ? label : "unknown", (long long) task_id);
-            return false;
-        }
-    }
-#else
-    (void) ctx;
-    (void) label;
-    (void) task_id;
-    (void) prompt_tokens;
-    (void) prefill_tokens;
-#endif
-    return true;
-}
-
-static bool server_moe_phase_report(
-        llama_context * ctx,
-        const char * label,
-        int64_t task_id,
-        uint32_t prompt_tokens = 0,
-        bool transition_workspace = true) {
-#if defined(__GNUC__) || defined(__clang__)
-    const bool phase_memory_events = server_moe_phase_memory_events_enabled();
-    const bool dense_phase_gate = server_kimi_dense_phase_gate_enabled();
-    if (transition_workspace &&
-            !server_moe_workspace_transition(ctx, label, task_id, prompt_tokens, prompt_tokens)) {
-        return false;
-    }
-    if (!phase_memory_events && !dense_phase_gate) {
-        return true;
-    }
-    server_moe_phase_memory_events_report(label, task_id);
-    server_moe_phase_smaps_snapshot(label, task_id);
-#else
-    (void) ctx;
-    (void) label;
-    (void) task_id;
-#endif
-    return true;
-}
-
-
+#include "inferssd/runtime.h"
 #include "inferssd/checkpoint.h"
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -1188,11 +757,6 @@ private:
 
     // Opt-in bounded prefill sizing on Mac. The context's physical ubatch
     // remains the hard ceiling; the server submits smaller physical work.
-    int32_t mac_prefill_task = -1;
-    int32_t mac_prefill_size = 0;
-    int32_t mac_prefill_previous_size = 0;
-    double mac_prefill_previous_ms_per_token = 0;
-    bool mac_prefill_settled = false;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
@@ -1942,7 +1506,7 @@ private:
 
 
         if (!task.is_child()) {
-            const bool defer_workspace = server_prefill_new_tokens_enabled() && task.need_sampling();
+            const bool defer_workspace = task.need_sampling();
             if (!server_moe_phase_report(slot.ctx, "request_begin", task.id,
                     static_cast<uint32_t>(task.n_tokens()), !defer_workspace)) {
                 send_error(task, "failed to prepare GPU memory for prompt processing", ERROR_TYPE_SERVER);
@@ -2006,17 +1570,6 @@ private:
 
     void emit_output_token(completion_token_output result, server_slot & slot) {
         const std::string token_str = result.text_to_send;
-
-        // Optional per-token audit: preserve chat request/sampling semantics and
-        // measure completion-to-completion latency without per-layer profiling.
-        static const bool token_audit = [] {
-            const char * value = std::getenv("LLAMA_KIMI_TOKEN_AUDIT");
-            return value && std::strcmp(value, "1") == 0;
-        }();
-        if (token_audit) {
-            std::fprintf(stderr, "[kimi_token_audit] {\"task\":%d,\"n\":%d,\"id\":%d,\"us\":%lld}\n",
-                slot.task->id, slot.n_decoded, result.tok, (long long) ggml_time_us());
-        }
 
         if (!token_str.empty() && llama_vocab_is_control(vocab, result.tok)) {
             slot.output_source.controls.push_back({slot.generated_text.size(),
@@ -2282,13 +1835,6 @@ private:
         res->id_slot = slot.id;
 
         res->index = slot.task->index;
-
-        // Log the exact decoded generation before chat protocol parsing splits it
-        // into reasoning/content/tool-call fields. JSON encoding keeps one record per line.
-        if (server_raw_io_log_enabled()) {
-            SLT_INF(slot, "raw_io id=%s output_pre_parser=%s\n",
-                slot.task->params.oaicompat_cmpl_id.c_str(), json(slot.generated_text).dump().c_str());
-        }
 
         // keep copy of last generated text for debugging purposes
         if (slots_debug) {
@@ -3110,32 +2656,6 @@ private:
         int32_t n_batch  = llama_n_batch(ctx);
         int32_t n_ubatch = llama_n_ubatch(ctx);
 
-        bool mac_adaptive_prefill = false;
-#if defined(__APPLE__)
-        const char * mac_adaptive = std::getenv("LLAMA_MAC_ADAPTIVE_PREFILL");
-        mac_adaptive_prefill = mac_adaptive && std::strcmp(mac_adaptive, "1") == 0 &&
-            params_base.n_parallel == 1 && batch.n_tokens == 0;
-#endif
-        if (mac_adaptive_prefill) {
-            for (const auto & slot : slots) {
-                if (!slot.is_processing() || !slot.task || slot.state == SLOT_STATE_GENERATING) {
-                    continue;
-                }
-                const int32_t ceiling = std::min(n_batch, n_ubatch);
-                if (mac_prefill_task != slot.task->id) {
-                    mac_prefill_task = slot.task->id;
-                    mac_prefill_size = std::min(256, ceiling);
-                    mac_prefill_previous_size = 0;
-                    mac_prefill_previous_ms_per_token = 0;
-                    mac_prefill_settled = false;
-                    SRV_INF("mac_adaptive_prefill task=%d initial=%d ceiling=%d\n",
-                            mac_prefill_task, mac_prefill_size, ceiling);
-                }
-                n_batch = std::min(n_batch, mac_prefill_size);
-                break;
-            }
-        }
-
         float  alora_scale       = -1.0f;
         size_t alora_disabled_id = 0;
 
@@ -3501,7 +3021,7 @@ private:
 
                     // The cache decision can change again when sequence removal fails.
                     // Reserve only after the remaining prompt length is final.
-                    if (server_prefill_new_tokens_enabled() && slot.task->need_sampling()) {
+                    if (slot.task->need_sampling()) {
                         const uint32_t prompt_tokens = static_cast<uint32_t>(slot.task->n_tokens());
                         const uint32_t prefill_tokens = prompt_tokens -
                             static_cast<uint32_t>(slot.prompt.n_tokens());
@@ -3589,15 +3109,6 @@ private:
                         // this batch at those pre-invocation tokens.
                         if (alora_scale > 0 && slot.prompt.n_tokens() == slot.alora_invocation_start - 1) {
                             SLT_DBG(slot, "stop prompt batch filling at (n_tokens = %d, alora_invocation_start = %d)\n", slot.prompt.n_tokens(), slot.alora_invocation_start);
-                            break;
-                        }
-
-                        const bool is_last_prompt_token = slot.prompt.n_tokens() + 1 == slot.task->n_tokens();
-                        if (server_prompt_last_token_single_enabled() && is_last_prompt_token && batch.n_tokens > 0) {
-                            // Start or a prompt-primed opener must protect the logits predicting the first
-                            // sampled token. Earlier prompt rows do not consume either budget.
-                            // The DeepSeek-V4 MoE path can return bad first-token logits when the final prompt
-                            // token is decoded together with earlier prompt tokens.
                             break;
                         }
 
@@ -3753,29 +3264,7 @@ private:
                 batch.logits   + i,
             };
 
-            const int64_t mac_batch_start = mac_adaptive_prefill ? ggml_time_us() : 0;
             const int ret = llama_decode(ctx, batch_view);
-            if (mac_adaptive_prefill && ret == 0 && n_tokens > 1) {
-                llama_synchronize(ctx);
-                const double elapsed_ms = double(ggml_time_us() - mac_batch_start) / 1000.0;
-                const double ms_per_token = elapsed_ms / n_tokens;
-                const int32_t used_size = mac_prefill_size;
-                // Exclude short checkpoint/tail batches from size comparisons.
-                if (n_tokens == used_size && !mac_prefill_settled) {
-                    if (mac_prefill_previous_size > 0 && used_size > mac_prefill_previous_size &&
-                            ms_per_token > 1.20 * mac_prefill_previous_ms_per_token) {
-                        mac_prefill_size = mac_prefill_previous_size;
-                        mac_prefill_settled = true;
-                    } else {
-                        mac_prefill_previous_size = used_size;
-                        mac_prefill_previous_ms_per_token = ms_per_token;
-                        const int32_t ceiling = std::min(llama_n_batch(ctx), llama_n_ubatch(ctx));
-                        mac_prefill_size = std::min(ceiling, used_size * 2);
-                    }
-                }
-                SRV_INF("mac_adaptive_prefill task=%d tokens=%d elapsed_ms=%.3f next=%d settled=%d\n",
-                        mac_prefill_task, n_tokens, elapsed_ms, mac_prefill_size, int(mac_prefill_settled));
-            }
 
             metrics.on_decoded(slots);
 
@@ -3849,10 +3338,6 @@ private:
 
             // on successful decode, restore the original batch size
             n_batch = llama_n_batch(ctx);
-            if (mac_adaptive_prefill && mac_prefill_size > 0) {
-                n_batch = std::min(n_batch, mac_prefill_size);
-            }
-
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
@@ -3907,8 +3392,13 @@ private:
                     GGML_ASSERT(slot.task->need_sampling());
 
                     // prompt evaluated for next-token prediction
-                    server_moe_phase_report(
-                        slot.ctx, "prefill_done", slot.task ? slot.task->id : -1);
+                    if (!server_moe_phase_report(
+                            slot.ctx, "prefill_done", slot.task ? slot.task->id : -1)) {
+                        send_error(slot, "failed to restore decode memory after prompt processing", ERROR_TYPE_SERVER);
+                        slot.release();
+                        slot.i_batch = -1;
+                        continue;
+                    }
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
@@ -4238,10 +3728,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         std::vector<server_task> tasks;
 
         const auto & prompt = data.at("prompt");
-        if (server_raw_io_log_enabled()) {
-            SRV_INF("raw_io id=%s input_pre_tokenizer=%s\n", completion_id.c_str(), prompt.dump().c_str());
-        }
-
         // process prompt
         std::vector<server_tokens> inputs;
         int64_t n_shared_prefix = 0;

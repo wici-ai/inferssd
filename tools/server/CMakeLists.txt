@@ -12,6 +12,7 @@ add_library(${TARGET} STATIC
     inferssd/prompt-cache.cpp
     inferssd/prompt-cache.h
     inferssd/checkpoint.h
+    inferssd/runtime.h
     server-queue.cpp
     server-queue.h
     server-common.cpp
