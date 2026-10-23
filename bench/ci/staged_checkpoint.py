@@ -141,9 +141,10 @@ def normalized_args(spec):
 
 def native_settings(stderr):
     rows = []
-    for line in Path(stderr).read_text(encoding="utf-8").splitlines():
-        if line.startswith("[ssd.settings] "):
-            rows.append(json.loads(line[len("[ssd.settings] "):], object_pairs_hook=unique_object))
+    prefix = b"[ssd.settings] "
+    for line in Path(stderr).read_bytes().splitlines():
+        if line.startswith(prefix):
+            rows.append(json.loads(line[len(prefix):].decode("utf-8"), object_pairs_hook=unique_object))
     if len(rows) != 1 or not isinstance(rows[0].get("values"), dict):
         raise ValueError("candidate must emit exactly one native settings snapshot")
     return rows[0]
