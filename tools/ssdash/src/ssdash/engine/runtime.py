@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from pathlib import Path
 from typing import BinaryIO, TextIO, cast
 
@@ -77,7 +78,11 @@ class Runtime:
         )
         value = prepare(
             inputs,
-            resolver=resolve_linux if self.policy.platform == "linux" else resolve_darwin,
+            resolver=(
+                partial(resolve_linux, execute=True)
+                if self.policy.platform == "linux"
+                else resolve_darwin
+            ),
             observe=adapter,
             emit=self.emit,
             darwin_errors=self.policy.platform == "darwin",

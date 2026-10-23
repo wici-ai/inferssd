@@ -88,6 +88,9 @@ replacements, so a failure after the first can leave the new alias with the old
 summary. The retained `Starting ...` diagnostic describes the prepared argv;
 `--dry-run` always stops before execution. The explicit execution mode below
 uses live facts instead; an online Mac placement controller is not supplied.
+Linux execution stops at the first host condition reported as a refusal by dry
+run, including an occupied port, unsafe GPU sharing, missing cgroup support or
+insufficient automatic memory. Later probes and server creation do not continue.
 
 For numeric launcher inputs, the new interface accepts unsigned decimal data
 within the existing per-key bounds and at most `9223372036854775807`. Linux
