@@ -18,6 +18,7 @@ the Python standard library.
 | `ssdash fit` | Named arm directories, optional graph arm and ubatch JSON | Model schema-2 JSON, insitu schema-3 JSON and a report |
 | `ssdash plan` | `insitu.json`, `probe/device.json`, `model.json` | Plan JSON and ranked candidates |
 | `ssdash settings` | The recorded artifacts, saved plan and optional ledger logs | Legacy `settings.env` on stdout or at `-o` |
+| `ssdash bootstrap-records` | Recorded CPU labels or ubatch run/server logs | CPU-set candidates or legacy `{first, held}` JSON |
 | `ssdash report` | Saved plan, conversation events and server logs, optional drive/device facts | Comparison text and legacy `compare-online.json` |
 
 These commands do not run hardware probes, bootstrap a model, start a server or
@@ -45,6 +46,23 @@ legacy artifact formats and consumed-input errors. The new CLI uses argparse
 for missing/invalid command arguments rather than the old script's usage text.
 A generated alias is not a payload-integrity
 certificate or a substitute for the Mac launcher's stricter alias validation.
+
+Recorded bootstrap inputs and results can be read separately:
+
+```sh
+ssdash bootstrap-records coresets recorded/cpus.txt
+ssdash bootstrap-records tier-slots recorded 32 64 128 > recorded/ubatch.json
+```
+
+The CPU-row file contains `cpu capacity max_khz [thread_siblings]`. Candidates
+keep the recorded sibling filtering, 92% grouping against the first member of a
+group, stable ranking and duplicate behavior. `tier-slots` reads each recorded
+`ubprobe-UB.out` first line and that run's `server.log.gz`; repeated UB arguments
+are read again and keep their original JSON key position. Neither command
+queries the current machine. Empty/malformed rows and the legacy zero/None tier
+cases retain their original errors; only consumed `OSError`s in `tier-slots`
+become null entries. These commands provide recorded inputs for later steps and
+do not run native bootstrap or fix the legacy parser's edge cases.
 
 A complete recorded calibration path, assuming the destination directories already exist:
 
@@ -88,7 +106,7 @@ F transcripts are verified on Python 3.9 and 3.12. Their original results can
 differ because of float summation, resident-set iteration or native exception
 wording. Tests retain separate runtime transcripts and compare exactly within
 each runtime, without a numeric tolerance or production version branch. Frozen
-transcript checks explicitly skip other versions; direct F comparisons that do
+transcript checks select only those two versions; direct F comparisons that do
 not require a recorded transcript still run. Future versions are not assumed
 identical to either verified runtime.
 
