@@ -1,10 +1,11 @@
 # SSDash offline framework
 
 This package reads model headers to create source artifacts, and turns recorded
-probe reports and arm logs into calibration artifacts, a plan and legacy launcher settings. The commands are opt-in offline consumers;
+probe reports and arm logs into calibration artifacts, a plan, legacy launcher settings and recorded conversation reports. The commands are opt-in offline consumers;
 `tools/adaptive` and the existing launchers remain the production entry points.
 The package also provides an injectable controller model with caller-owned observation
-sessions. It supplies no live engine or HTTP executor. The package runtime uses only
+sessions and complete request/bootstrap/conversation orchestration with required effect ports.
+It supplies no live engine or HTTP executor. The package runtime uses only
 the Python standard library.
 
 ## Commands and artifacts
@@ -17,6 +18,7 @@ the Python standard library.
 | `ssdash fit` | Named arm directories, optional graph arm and ubatch JSON | Model schema-2 JSON, insitu schema-3 JSON and a report |
 | `ssdash plan` | `insitu.json`, `probe/device.json`, `model.json` | Plan JSON and ranked candidates |
 | `ssdash settings` | The recorded artifacts, saved plan and optional ledger logs | Legacy `settings.env` on stdout or at `-o` |
+| `ssdash report` | Saved plan, conversation events and server logs, optional drive/device facts | Comparison text and legacy `compare-online.json` |
 
 These commands do not run hardware probes, bootstrap a model, start a server or
 control an online session. Install from the repository root:
@@ -54,6 +56,7 @@ ssdash fit --run all=records/all --run pin=records/pin --skip 128 \
   --profile recorded/model.json -o recorded/insitu.json
 ssdash plan recorded --prompts 512 --decode 256 --window 1-256 -o recorded/plan.json
 ssdash settings recorded -o recorded/settings.env
+ssdash report recorded
 ```
 
 `fit --graph DIR` reads an existing graph arm. `--ubatch-probe FILE` accepts the
@@ -64,7 +67,7 @@ replace the earlier value without moving its insertion position.
 `plan` also accepts `--known` and `--pending`. `settings` supports `--tier`,
 `--cpus`, `--prompts`, `--decode` and `--ledgers DIR ...`. Use each command's
 `--help` for its arguments. For a valid split placement without truthy recorded
-`default_threads`, supply `--host-threads` to `plan` or `settings`. This explicit
+`default_threads`, supply `--host-threads` to `plan`, `settings` or `report`. This explicit
 fallback is requested only when needed. The offline commands do not infer a
 recorded machine's CPU count from the current host.
 
@@ -75,7 +78,8 @@ The reference framework F is frozen at
 observations are under `tests/fixtures`. Extraction preserves arithmetic, sum and
 mapping order, stable ties, rounding, mutable replay state, borrowed references,
 callback order and exception timing. Composed expectations come from the complete
-original F call graph, including records → calibration → plan → reload → settings.
+original F call graph, including request output → calibration → plan → reload → settings
+→ Controller → recorded report.
 Toy logs are synthetic inputs, not claimed engine-run evidence. Historical
 archives establish only their actual recorded input coverage.
 
@@ -164,6 +168,15 @@ identifies the retained format, not the executable used. Writing to a file uses
 `OUT.tmp` followed by replacement; write, close or replacement failure can leave
 the temporary file, as in F. With no `-o`, output goes to stdout.
 
+`report` keeps the complete legacy comparison: static prefill predictions by route
+and tier state, controller decisions, decode-placement flags and final ordered
+JSON. It chooses gzip by existence, whereas the arm reader chooses by readability.
+It reads the plan before constructing a Machine; only the original OSError,
+KeyError and ValueError classes suppress an unavailable model's route checks.
+Other errors, including late zero division, retain their point of failure and
+already printed text. The report's JSON is written last and can remain partial.
+Report text and field names remain legacy formats, not new measurement claims.
+
 ## Python interfaces
 
 | Area | Modules and boundary |
@@ -175,6 +188,8 @@ the temporary file, as in F. With no `-o`, output goes to stdout.
 | Prefill | `model.prefill_lane`, `prefill_workload`, `prefill_model`, `prefill_calibration`, `prefill_memory`, `prefill_feedback`: pure costs, geometry, calibration and explicit feedback callbacks |
 | Calibration | `model.observed_calibration`, `probe.calibrate`: arm measurements, working set and complete ordered `fit` orchestration |
 | Planning | `model.machine`, `plan.planner`, `plan.settings`, `plan.placement`: artifact-backed model, ranked plans and ordered settings |
+| Request protocols | `bootstrap.client`, `bootstrap.requests`, `bootstrap.ports`: streamed legacy client timing and cold/warm/graph bootstrap requests with required transport, file, clock and device-number ports |
+| Conversation and report | `loop.conversation`, `loop.report`: complete Controller consumer and recorded comparison command |
 | Controller model | `loop.records`, `loop.model`, `loop.controller`, `loop.ports`: session-owned observations, re-planning and explicit transition/effect ports |
 | Command adapters | `plan.recorded`, `plan.settings_command`, `plan.settings_recorded`: lazy artifact/host/output ports |
 
@@ -208,6 +223,31 @@ current engine without explicitly closing the event stream, as in F. Application
 must not treat this model-only extraction as a complete native resource owner.
 The synthetic tests use fake engines and HTTP callbacks; they establish no real
 server lifecycle, online performance or device integration claim.
+
+### Request and conversation effects
+
+`turn` requires a transport and nanosecond clock. `run_client`, `run_bootstrap`
+and `run_conversation` require every consumed effect port; no network, engine,
+host-reader or process implementation is selected implicitly. Their argument
+records are unvalidated views of the old parsed arguments. Request URL/body/header
+bytes, history aliases, token callback order and sparse first-observed token
+timestamps are retained. This legacy timing protocol is separate from
+`bench/final_chat.py`, which remains authoritative for formal benchmarking.
+
+Bootstrap preserves cold chat followed by an uncached warm prefill, graph
+sentence-cut search, and optional token-count differences. Its drive counters
+are whole block-device reads, including unrelated readers; supplied stat/diskstats
+ports do not establish per-process I/O. The graph command retains SystemExit(0)
+after its output and before drive discovery. The script client opens output
+before reading input and records per-turn Exceptions. The conversation consumer
+catches only OSError; other failures do not acquire a newly invented finally
+cleanup. Its normal path still stops the Controller then records done. These
+interfaces are not a native resource-ownership adapter or a live CLI.
+
+The F observations freeze at command return. A fixture may later close its retained
+event stream during object collection; that test cleanup cannot mutate a returned
+transcript. Tests separately preserve the original open event stream and internal
+borrowed-reference behavior.
 
 ## Remaining integration boundaries
 

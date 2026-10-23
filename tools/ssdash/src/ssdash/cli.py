@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import sys
 import time
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Optional
 
 from ssdash.contracts import DeviceProfile
+from ssdash.loop.report import run_report
+from ssdash.model.machine import Machine
 from ssdash.plan.planner import run_plan
 from ssdash.plan.planner_types import PlanArguments
 from ssdash.plan.recorded import DirectoryArtifacts, explicit_host_threads, write_json
@@ -21,6 +24,7 @@ from ssdash.probe.device_profile import aggregate
 from ssdash.probe.recorded import load_reports
 from ssdash.source.command import add_commands as add_source_commands
 from ssdash.source.command import run_source
+from ssdash.telemetry.files import LOCAL_FILES, lines
 from ssdash.telemetry.recorded import ledger, read_arm
 
 
@@ -30,6 +34,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     commands = parser.add_subparsers(dest="command", required=True)
     add_source_commands(commands)
+    report = commands.add_parser("report", help="compare recorded conversations only")
+    report.add_argument("run")
+    report.add_argument(
+        "--host-threads", type=int, help="explicit fallback for a recorded split placement"
+    )
     probe = commands.add_parser("probe", help="aggregate existing report files only")
     probe.add_argument("--from-reports", required=True, type=Path)
     probe.add_argument("--experts", required=True, type=Path)
@@ -67,6 +76,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     fit.add_argument("--profile", required=True)
     fit.add_argument("-o", "--out", required=True)
     args = parser.parse_args(argv)
+    if args.command == "report":
+        run_report(
+            args.run,
+            machine_factory=lambda run: Machine(
+                DirectoryArtifacts(Path(run)),
+                host_threads=explicit_host_threads(args.host_threads),
+            ),
+            open_file=open,
+            glob_paths=glob.glob,
+            exists=os.path.exists,
+            basename=os.path.basename,
+            read_lines=lambda path: lines(path, LOCAL_FILES),
+            emit=print,
+        )
+        return 0
     if args.command == "source":
         run_source(args)
         return 0
