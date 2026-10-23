@@ -2,6 +2,7 @@
 #pragma once
 
 namespace ssd {
+namespace host { class context_client; }
 namespace telemetry {
 class writer;
 struct debug_channels;
@@ -12,5 +13,6 @@ struct debug_channels;
 struct runtime_services {
     telemetry::writer * events = nullptr;
     const telemetry::debug_channels * debug = nullptr;
+    host::context_client * host = nullptr;
 };
 }  // namespace ssd

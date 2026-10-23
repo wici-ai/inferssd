@@ -44,12 +44,20 @@ static void sink_error(char * dst, size_t size, const char * message) {
     }
 }
 
+static ssd::result<ssd::host::allocation_ticket> sink_host_failure(ssd::status code, const char * message) noexcept {
+    ssd::result<ssd::host::allocation_ticket> result;
+    result.code = code;
+    try { result.error = message; } catch (...) {} // allocation failure must not escape this ABI seam
+    return result;
+}
+
 #if defined(__linux__)
 
 #include <cerrno>
 #include <fcntl.h>
 #include <dlfcn.h>
 #include "../ggml-ssd/host/ledger.h"
+#include "../ggml-ssd/host/arbiter.h"
 #include "kimi-vram-tier-api.h"
 #include "kimi-vram-location-api.h"
 #include <linux/io_uring.h>
@@ -300,6 +308,7 @@ struct sink_configuration {
     ssd::settings::snapshot settings;
     ssd::telemetry::debug_channels debug;
     ssd::telemetry::writer * events = nullptr;
+    ssd::host::context_client * host = nullptr;
     ssd::cpu::testing::execution_policy policy;
 };
 
@@ -432,6 +441,73 @@ static bool sink_unified_memory() {
     return is_unified && is_unified(0);
 }
 
+template<class T> static T sink_host_value(ssd::result<T> result) {
+    if (!result) { throw std::runtime_error(result.error); }
+    return std::move(result.value);
+}
+static void sink_host_value(ssd::result<void> result) {
+    if (!result) { throw std::runtime_error(result.error); }
+}
+static ssd::host::client_config sink_host_configuration(const sink_configuration & value) {
+    ssd::host::client_config config;
+    const auto * headroom = value.settings.integer("host.headroom_mib");
+    const auto * reserve = value.settings.integer("vram.reserve_mib");
+    if (value.production && (!headroom || !reserve)) { throw std::runtime_error("missing host budget settings"); }
+    config.unified = sink_unified_memory();
+    config.reserve_bytes = value.policy.cache_reserve_bytes;
+    if (config.reserve_bytes < (512ull << 20)) { throw std::runtime_error("cache reserve must be at least 512 MiB"); }
+    config.margin_bytes = std::max(config.reserve_bytes, uint64_t(headroom ? *headroom : 512) << 20);
+    config.explicit_reserve_bytes = config.unified ? uint64_t(reserve ? *reserve : 0) << 20 : 0;
+    config.reclaimable_file = value.policy.cache_reclaimable_file;
+    return config;
+}
+// Production borrows L3's context registration. Only the explicit legacy/test
+// factory has an isolated owner; no production backend creates a budget singleton.
+struct sink_host_client {
+    std::shared_ptr<ssd::host::process_arbiter> test_owner;
+    std::unique_ptr<ssd::host::context_client> test_client;
+    ssd::host::context_client * client = nullptr;
+    explicit sink_host_client(const sink_configuration & value) : client(value.host) {
+        if (!client) {
+            if (value.production) { throw std::runtime_error("missing process host budget client"); }
+            test_owner = std::make_shared<ssd::host::process_arbiter>();
+            test_client = sink_host_value(test_owner->make_client()); client = test_client.get();
+        }
+        sink_host_value(client->configure(sink_host_configuration(value)));
+    }
+    ssd::host::snapshot state() const { return sink_host_value(client->state()); }
+    ssd::host::room measure(uint64_t extra, bool full = false) const { return sink_host_value(client->measure(extra, full)); }
+    ssd::host::room project_decode_capacity(uint64_t extra, bool full = false) const {
+        return sink_host_value(client->project_decode_capacity(extra, full));
+    }
+    uint64_t floor() const { return state().floor; }
+    uint64_t dram_bytes(uint64_t host, uint64_t device) const { return sink_host_value(client->dram_bytes(host, device)); }
+    void set_prefill_pages(uint64_t pages) { sink_host_value(client->set_prefill_pages(pages)); }
+    bool update_file_reserve() { return sink_host_value(client->update_file_reserve()); }
+    void begin_interval(uint64_t held) { sink_host_value(client->begin_interval(held)); }
+    bool end_interval(bool consecutive, uint64_t held, uint64_t & unknown) {
+        return sink_host_value(client->end_interval(consecutive, held, unknown));
+    }
+    ssd::host::room make_room(uint64_t extra, const ssd::host::actions & actions) {
+        return sink_host_value(client->make_room(extra, actions));
+    }
+    bool memory_available_at_full_boost(uint64_t & available, uint64_t & headroom) const {
+        const auto r = measure(0, true); available = r.available; headroom = r.boost_headroom; return r.system;
+    }
+};
+static const char * sink_short_term(const ssd::host::room & r) {
+    return r.cgroup_shortage && r.system_shortage ? "both" : r.cgroup_shortage ? "cgroup" : r.system_shortage ? "system" : "none";
+}
+static void sink_touch_pages(void * address, size_t bytes, size_t page) {
+    if (!bytes) { return; }
+    auto * data = static_cast<volatile unsigned char *>(address);
+    for (size_t at = 0; at < bytes;) {
+        data[at] = 0;
+        if (bytes - at <= page) { break; }
+        at += page;
+    }
+    data[bytes - 1] = 0;
+}
 struct sink_cache {
     struct source_key {
         uint64_t device, inode, size, offset, bytes;
@@ -473,18 +549,19 @@ struct sink_cache {
     enum policy_type { window, lru, lfu, decay, count_decay2 } policy = window;
     // Room for the cache comes from the host-memory ledger, which every other host allocation asks too. Its cgroup
     // reserve is CACHE_RESERVE_BYTES; opt-in CACHE_RECLAIMABLE_FILE counts file-backed pages as cgroup headroom.
-    kimi_host_ledger ledger;
+    sink_host_client ledger;
     // The last answer check_room got and the rejections per short term, for the receipts: on a discrete GPU the
     // cgroup term is meant to bind, so a system-term rejection there points at memory the cgroup does not see.
-    mutable kimi_host_ledger::room last_room;
+    mutable ssd::host::room last_room;
     uint64_t cgroup_rejections = 0, system_rejections = 0;
     void count_rejection() {
         cgroup_rejections += last_room.cgroup_shortage != 0;
         system_rejections += last_room.system_shortage != 0;
     }
-    using room_state = kimi_host_ledger::room_state;
-    static constexpr room_state room_ok = kimi_host_ledger::room_ok, room_pressure = kimi_host_ledger::room_pressure,
-        room_unreadable = kimi_host_ledger::room_unreadable;
+    using room_state = ssd::host::room_state;
+    static constexpr room_state room_ok = ssd::host::room_ok, room_pressure = ssd::host::room_pressure,
+        room_unreadable = ssd::host::room_unreadable;
+    bool decode_projection = false;
     bool keep_across_requests = false;
     bool adopt = false; // the arena was made at load (reserve_at_load): the first decode keeps it, whatever its epoch
     // An automatic budget's prices off unified memory (geometry): a slot, and the metadata room kept beside the slots.
@@ -548,6 +625,15 @@ struct sink_cache {
         stats.peak_guard_extra_bytes = std::max(stats.peak_guard_extra_bytes, extra);
         return check_room(extra, nullptr) == room_ok;
     }
+    ssd::result<ssd::host::allocation_ticket> take_guard(uint64_t extra, const char * reason) {
+        stats.last_guard_extra_bytes = extra;
+        stats.peak_guard_extra_bytes = std::max(stats.peak_guard_extra_bytes, extra);
+        ssd::host::actions actions;
+        actions.reclaim_cache = [this, reason](uint64_t bytes) { return reclaim_for_guard(bytes, reason); };
+        auto ticket = ledger.client->take(extra, 0, actions, true, ssd::host::allocation_class::tracked);
+        last_room = ticket.value.observation();
+        return ticket;
+    }
     // term: the ledger term that was short when the pause is a rejection for room ("none" otherwise).
     void pause(std::vector<sink_request> & requests, kimi_cpu_sink_stats & current, const char * reason,
                const char * term = "none") {
@@ -561,7 +647,7 @@ struct sink_cache {
         stats.capacity_bytes = stats.enabled_bytes = 0;
         paused = true; ++stats.pressure_stops;
         std::fprintf(stderr, "[kimi_cpu_sink_cache] paused=1 reason=%s term=%s reserve_bytes=%llu extra_bytes=%llu\n",
-                reason, term, (unsigned long long) ledger.reserve,
+                reason, term, (unsigned long long) ledger.state().reserve,
                 (unsigned long long) stats.last_guard_extra_bytes);
     }
 
@@ -584,7 +670,7 @@ struct sink_cache {
         return "unknown";
     }
 
-    explicit sink_cache(const sink_configuration & configuration) {
+    explicit sink_cache(const sink_configuration & configuration) : ledger(configuration) {
         if (page_size < 4096 || page_size > 65536 || (page_size & (page_size - 1))) {
             throw std::runtime_error("CPU sink cache requires a supported system page size");
         }
@@ -620,17 +706,10 @@ struct sink_cache {
         if ((elastic || partial_reclaim) && !layer_quotas.empty()) {
             throw std::runtime_error("cache reclaim cannot use explicit layer quotas");
         }
-        const auto * headroom = configuration.settings.integer("host.headroom_mib");
-        const auto * reserve = configuration.settings.integer("vram.reserve_mib");
-        ledger.configure(sink_unified_memory(), headroom ? uint32_t(*headroom) : 512, reserve ? uint32_t(*reserve) : 0);
-        ledger.reserve = p.cache_reserve_bytes;
-        if (ledger.reserve < (512ull << 20)) { throw std::runtime_error("cache reserve must be at least 512 MiB"); }
-        ledger.margin = std::max(ledger.margin, ledger.reserve);
-        ledger.reclaimable_file = p.cache_reclaimable_file;
         std::fprintf(stderr, "[kimi_host_ledger] unified=%d reserve=%llu margin=%llu explicit_reserve=%llu reclaimable_file=%d cgroup=%s\n",
-                int(ledger.unified), (unsigned long long) ledger.reserve, (unsigned long long) ledger.margin,
-                (unsigned long long) ledger.explicit_reserve, int(ledger.reclaimable_file),
-                ledger.cgroup.empty() ? "-" : ledger.cgroup.c_str());
+                int(ledger.state().unified), (unsigned long long) ledger.state().reserve, (unsigned long long) ledger.state().margin,
+                (unsigned long long) ledger.state().explicit_reserve, int(ledger.state().reclaimable_file),
+                ledger.state().cgroup.empty() ? "-" : ledger.state().cgroup.c_str());
     }
     ~sink_cache() { release(); }
     void release() {
@@ -690,22 +769,22 @@ struct sink_cache {
         stats = {}; stats.budget_bytes = budget;
         stride = 0; std::fill(role_bytes, role_bytes + 3, 0);
         quota = per_layer; active = has_token = paused = elastic_prefill = false;
-        if (ledger.reclaimable_file) {
+        if (ledger.state().reclaimable_file) {
             std::fprintf(stderr, "[kimi_cpu_sink_cache] reclaimable_file=1 active_file_counts_as_headroom=1 inactive_file_counts_as_headroom=1\n");
         }
-        if (!layer_quotas.empty() || ledger.reserve != 2ull * 1024 * 1024 * 1024) {
+        if (!layer_quotas.empty() || ledger.state().reserve != 2ull * 1024 * 1024 * 1024) {
             std::fprintf(stderr, "[kimi_cpu_sink_cache] fixed_layer_quotas=%zu reserve_bytes=%llu\n",
-                    layer_quotas.size(), (unsigned long long) ledger.reserve);
+                    layer_quotas.size(), (unsigned long long) ledger.state().reserve);
         }
         if (elastic) {
             std::fprintf(stderr,
                     "[kimi_cpu_sink_cache] elastic=1 prefill_slots=%zu reserve_bytes=%llu mapping=retained\n",
-                    prefill_slots, (unsigned long long) ledger.reserve);
+                    prefill_slots, (unsigned long long) ledger.state().reserve);
         }
         if (partial_reclaim) {
             std::fprintf(stderr,
                     "[kimi_cpu_sink_cache] partial_reclaim=1 reserve_bytes=%llu mapping=retained_on_known_pressure\n",
-                    (unsigned long long) ledger.reserve);
+                    (unsigned long long) ledger.state().reserve);
         }
     }
     void begin(uint64_t next_epoch, uint64_t next_token, bool decode) {
@@ -729,7 +808,7 @@ struct sink_cache {
                 } else {
                     ++stats.pressure_stops; count_rejection();
                     std::fprintf(stderr, "[kimi_cpu_sink_cache] paused=1 reason=prefill_headroom term=%s reserve_bytes=%llu\n",
-                            kimi_host_ledger::short_term(last_room), (unsigned long long) ledger.reserve);
+                            sink_short_term(last_room), (unsigned long long) ledger.state().reserve);
                     release();
                 }
             } else if (keep_across_requests && arena &&
@@ -743,7 +822,7 @@ struct sink_cache {
                 if (keep_across_requests && arena) {
                     ++stats.pressure_stops; count_rejection();
                     std::fprintf(stderr, "[kimi_cpu_sink_cache] paused=1 reason=prefill_headroom term=%s reserve_bytes=%llu\n",
-                            kimi_host_ledger::short_term(last_room), (unsigned long long) ledger.reserve);
+                            sink_short_term(last_room), (unsigned long long) ledger.state().reserve);
                 }
                 release();
             }
@@ -756,7 +835,7 @@ struct sink_cache {
         // The first decode token after a prefill: the ledger no longer holds the prefill's pages, and the slots the
         // prefill gave back come back as far as the room allows now.
         if (!has_token) {
-            ledger.prefill_pages = 0;
+            ledger.set_prefill_pages(0);
             regrow(adopt ? "load" : "prefill");
         }
         adopt = false;
@@ -775,7 +854,7 @@ struct sink_cache {
     room_state check_room(uint64_t extra, uint64_t * shortage, uint64_t * surplus = nullptr, bool full_boost = false) const {
         if (shortage) { *shortage = 0; }
         if (surplus) { *surplus = 0; }
-        const auto r = ledger.measure(extra, full_boost);
+        const auto r = decode_projection ? ledger.project_decode_capacity(extra, full_boost) : ledger.measure(extra, full_boost);
         last_room = r;
         if (r.cgroup == room_unreadable) { return room_unreadable; }
         if (shortage) { *shortage = r.shortage(); }
@@ -903,7 +982,7 @@ struct sink_cache {
     }
     void reject_admission(std::vector<sink_request> & requests, kimi_cpu_sink_stats & current, const char * reason) {
         count_rejection();
-        if (!partial_reclaim) { pause(requests, current, reason, kimi_host_ledger::short_term(last_room)); return; }
+        if (!partial_reclaim) { pause(requests, current, reason, sink_short_term(last_room)); return; }
         for (auto & r : requests) {
             if (r.cache_admit >= 0) { entries[size_t(r.cache_admit)].reserved = false; }
             r.cache_hit = r.cache_admit = -1;
@@ -913,7 +992,7 @@ struct sink_cache {
         ++stats.pressure_stops;
         std::fprintf(stderr,
                 "[kimi_cpu_sink_cache] admission_rejected=1 reason=%s term=%s mapping_retained=1 reserve_bytes=%llu extra_bytes=%llu enabled_slots=%zu\n",
-                reason, kimi_host_ledger::short_term(last_room), (unsigned long long) ledger.reserve,
+                reason, sink_short_term(last_room), (unsigned long long) ledger.state().reserve,
                 (unsigned long long) stats.last_guard_extra_bytes, enabled_slots());
     }
     static source_key key(const kimi_cpu_sink_source & s) {
@@ -1008,8 +1087,10 @@ struct sink_cache {
         }
         // Check before vector value-initialization can touch metadata pages.
         // Existing allocations are already included in memory.current.
-        if (!reclaim_for_guard(allocation_cost(multiply(count, sizeof(entry))), "cgroup_metadata_headroom")) { return false; }
+        auto metadata_ticket = take_guard(allocation_cost(multiply(count, sizeof(entry))), "cgroup_metadata_headroom");
+        if (!metadata_ticket) { return false; }
         std::vector<entry> next(count);
+        metadata_ticket.value.commit();
         release();
         // Geometry is first learned during the first decode token's prepare.
         age_steps = active ? 1 : 0;
@@ -1073,8 +1154,9 @@ struct sink_cache {
         if (policy == count_decay2) {
             size_t nodes = 0;
             for (const auto & r : requests) { nodes += !r.cache_only && l.count_frequency.find(r.id) == l.count_frequency.end(); }
-            if (!reclaim_for_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, double>) + 4 * sizeof(void *))),
-                    "cgroup_count_frequency_headroom")) {
+            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, double>) + 4 * sizeof(void *))),
+                    "cgroup_count_frequency_headroom");
+            if (!frequency_ticket) {
                 reject_admission(requests, current, "cgroup_count_frequency_headroom"); return;
             }
             const double factor = std::exp2(-double(age_steps - l.count_step) / 2.0);
@@ -1090,14 +1172,16 @@ struct sink_cache {
                     if (duplicate == requests.begin() + j) { l.count_frequency[requests[j].id] += 1.0; }
                 }
             } catch (const std::bad_alloc &) { pause(requests, current, "count_frequency_allocation_failed"); return; }
+            frequency_ticket.value.commit();
         }
         if (policy == lfu || policy == decay) {
             size_t nodes = 0;
             for (const auto & r : requests) { nodes += !r.cache_only && l.frequency.find(r.id) == l.frequency.end(); }
             // Each map node may fault a different allocator page/THP. Duplicate
             // IDs deliberately overcount; no allocation occurs before this guard.
-            if (!reclaim_for_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, uint64_t>) + 4 * sizeof(void *))),
-                    "cgroup_frequency_headroom")) {
+            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, uint64_t>) + 4 * sizeof(void *))),
+                    "cgroup_frequency_headroom");
+            if (!frequency_ticket) {
                 reject_admission(requests, current, "cgroup_frequency_headroom"); return;
             }
             try {
@@ -1107,6 +1191,7 @@ struct sink_cache {
                     if (frequency != UINT64_MAX) { ++frequency; }
                 }
             } catch (const std::bad_alloc &) { pause(requests, current, "frequency_allocation_failed"); return; }
+            frequency_ticket.value.commit();
         }
         // Protect every resident hit before reserving any direct-read target.
         // A miss at the front of the batch must never overwrite a later hit.
@@ -1167,7 +1252,8 @@ struct sink_cache {
         const uint64_t payload_pages = multiply(slot_pages, page_size);
         const uint64_t new_tables = multiply(new_slots, page_tables(payload_pages));
         const uint64_t extra = add(add(multiply(new_slots, payload_pages), new_tables), arena ? 0 : 64 * 1024);
-        if (!reclaim_for_guard(extra, "cgroup_headroom")) {
+        auto slot_ticket = take_guard(extra, "cgroup_headroom");
+        if (!slot_ticket) {
             reject_admission(requests, current, "cgroup_headroom"); return;
         }
         if (!arena && stats.capacity_bytes && !requests.empty()) {
@@ -1185,11 +1271,15 @@ struct sink_cache {
                 stats.refaulted_bytes = add(stats.refaulted_bytes, stride);
                 entries[r.cache_admit].was_released = false;
             }
+            // Finish the admitted first touch before publishing resident slots
+            // or asynchronous read targets. Only this new slot is written.
+            sink_touch_pages(arena + size_t(r.cache_admit) * stride, stride, size_t(page_size));
             entries[r.cache_admit].resident = true;
             stats.committed_bytes = add(stats.committed_bytes, stride);
             current.cache_new_slot_bytes = add(current.cache_new_slot_bytes, stride);
         }
         stats.peak_bytes = std::max(stats.peak_bytes, stats.committed_bytes);
+        slot_ticket.value.commit();
     }
     // The arena, address space only: the guard admits each resident slot against the cgroup, so the kernel's
     // overcommit heuristic must not refuse a mapping larger than RAM plus swap. Ordinary pages: partial reclaim gives
@@ -1225,13 +1315,12 @@ struct sink_cache {
         std::vector<std::thread> pool;
         pool.reserve(size_t(std::max(1, threads))); // before anything changes: a failure here leaves the cache as it was
         struct decode_view {
-            uint64_t & pages;
-            const uint64_t held;
-            explicit decode_view(uint64_t & p) : pages(p), held(p) { pages = 0; }
-            ~decode_view() { pages = held; }
+            bool & projection;
+            explicit decode_view(bool & p) : projection(p) { projection = true; }
+            ~decode_view() { projection = false; }
         };
         {
-            decode_view view(ledger.prefill_pages);
+            decode_view view(decode_projection);
             if (!geometry(bytes, tensor, std::max<size_t>(1, max_requests)) || !stats.capacity_bytes) { return 0; }
         }
         const uint64_t slot_pages = add(ceil_div(stride, page_size), stride % page_size != 0);
@@ -1240,7 +1329,9 @@ struct sink_cache {
         uint64_t surplus = 0;
         if (check_room(0, nullptr, &surplus) == room_unreadable) { return 0; }
         size_t n = std::min<size_t>(entries.size(), surplus > 64 * 1024 ? (surplus - 64 * 1024) / add(payload_pages, tables) : 0);
-        if (!n || !guard(cost(n))) { return 0; }
+        if (!n) { return 0; }
+        auto load_ticket = take_guard(cost(n), "load");
+        if (!load_ticket) { return 0; }
         if (map_arena()) { release(); return 0; }
         const auto start = sink_clock::now();
         const size_t workers = size_t(std::max(1, std::min(threads, int(n))));
@@ -1262,6 +1353,10 @@ struct sink_cache {
         for (size_t w = started; w < workers; ++w) { populate(w); }
         populate(0);
         for (auto & t : pool) { t.join(); }
+        // Page-aligned production strides are fully populated by the workers;
+        // also touch the tail for a valid nonaligned legacy/test geometry.
+        sink_touch_pages(arena + n * stride - 1, 1, size_t(page_size));
+        load_ticket.value.commit();
         us = elapsed_us(start);
         for (size_t i = 0; i < n; ++i) { entries[i].resident = true; }
         stats.committed_bytes = multiply(n, stride);
@@ -1977,7 +2072,7 @@ struct kimi_cpu_sink {
             }
             io_thread = std::thread([this] { io_loop(); });
             sink_pin(io_thread.native_handle(), io_cpus);
-            if (cache.ledger.unified && vram.context) {
+            if (cache.ledger.state().unified && vram.context) {
                 watch_thread = std::thread([this] { floor_watch_loop(); });
                 sink_pin(watch_thread.native_handle(), io_cpus);
             }
@@ -2394,9 +2489,9 @@ struct kimi_cpu_sink {
         place_report("destroy");
         prefetch_report("destroy");
         {
-            const auto & l = cache.ledger;
+            const auto l = cache.ledger.state();
             std::fprintf(stderr, "[kimi_host_ledger] reason=destroy unified=%d reserve=%llu margin=%llu floor=%llu file_reserve=%llu explicit_reserve=%llu granted=%llu refused=%llu cache_cgroup_rejections=%llu cache_system_rejections=%llu margin_updates=%llu\n",
-                    int(l.unified), (unsigned long long) l.reserve, (unsigned long long) l.margin, (unsigned long long) l.floor(),
+                    int(l.unified), (unsigned long long) l.reserve, (unsigned long long) l.margin, (unsigned long long) l.floor,
                     (unsigned long long) l.file_reserve, (unsigned long long) l.explicit_reserve, (unsigned long long) l.granted,
                     (unsigned long long) ledger_refusals, (unsigned long long) cache.cgroup_rejections,
                     (unsigned long long) cache.system_rejections, (unsigned long long) l.margin_updates);
@@ -2592,7 +2687,7 @@ struct kimi_cpu_sink {
     // at the first decode token, from the demand the tier left. Elsewhere the RAM cache's (reserve_cache), with a GPU
     // tier or without one, when the cache can give room back (partial reclaim or elastic).
     void reserve_tier(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down, int experts_used) {
-        if (!cache.ledger.unified) { reserve_cache(up, gate, down, experts_used); }
+        if (!cache.ledger.state().unified) { reserve_cache(up, gate, down, experts_used); }
         if (!vram.context || cache.layers.empty()) { return; }
         refresh_floor("reserve");
         if (!cache.arena) { vram.set_host_demand(cache.pending_bytes(size_t(up->nb[2] + gate->nb[2] + down->nb[2]))); }
@@ -2625,33 +2720,43 @@ struct kimi_cpu_sink {
             // watcher repeats it): the file pages that came back keep coming back while the tier holds their memory.
             if (ledger.floor() > before) { vram.reclaim_host(ledger.floor() - before); }
             std::fprintf(stderr, "[kimi_host_ledger] reason=%s floor=%llu file_reserve=%llu margin=%llu explicit_reserve=%llu refaults=%llu updates=%llu\n",
-                    reason, (unsigned long long) ledger.floor(), (unsigned long long) ledger.file_reserve,
-                    (unsigned long long) ledger.margin, (unsigned long long) ledger.explicit_reserve,
-                    (unsigned long long) ledger.refaults, (unsigned long long) ledger.file_updates);
+                    reason, (unsigned long long) ledger.floor(), (unsigned long long) ledger.state().file_reserve,
+                    (unsigned long long) ledger.state().margin, (unsigned long long) ledger.state().explicit_reserve,
+                    (unsigned long long) ledger.state().refaults, (unsigned long long) ledger.state().file_updates);
         }
         vram.set_host_floor(ledger.floor());
     }
     // DRAM the engine knows it holds: GPU tier blocks on unified memory, committed RAM cache slots.
-    uint64_t held_bytes() { return kimi_host_ledger::add(vram.host_bytes(), cache.stats.committed_bytes); }
+    uint64_t held_bytes() {
+        uint64_t ring_bytes = 0;
+        for (const auto & slot : slots) { for (const auto & role : slot.role) { ring_bytes = kimi_host_ledger::add(ring_bytes, role.size); } }
+        uint64_t scratch = sink_cache::multiply(expert_output.capacity() + activation.capacity(), sizeof(float));
+        scratch = sink_cache::add(scratch, expert_computed.capacity());
+        scratch = sink_cache::add(scratch, quant_input.capacity());
+        scratch = sink_cache::add(scratch, quant_hidden.capacity());
+        scratch = sink_cache::add(scratch, staged_quant_hidden.capacity());
+        return kimi_host_ledger::add(kimi_host_ledger::add(vram.host_bytes(), cache.stats.committed_bytes),
+            kimi_host_ledger::add(ring_bytes, scratch));
+    }
     // At a token boundary, before anything resizes: the margin learns what the last decode token took that nobody
     // accounts (unified memory). A boundary that does not follow the previous decode token ends nothing.
     void end_margin_interval(bool decode, uint64_t epoch, uint64_t token) {
         const bool consecutive = decode && margin_boundary && epoch == margin_epoch && token == margin_token + 1;
         margin_boundary = decode; margin_epoch = epoch; margin_token = token;
         auto & ledger = cache.ledger;
-        if (!ledger.unified) { return; }
-        const uint64_t before = ledger.margin, held = held_bytes();
+        if (!ledger.state().unified) { return; }
+        const uint64_t before = ledger.state().margin, held = held_bytes();
         uint64_t untracked = 0;
         if (ledger.end_interval(consecutive, held, untracked)) {
             std::fprintf(stderr, "[kimi_host_ledger] event=margin_grow token=%llu untracked=%llu margin_before=%llu margin=%llu held=%llu granted=%llu updates=%llu\n",
                     (unsigned long long) token, (unsigned long long) untracked, (unsigned long long) before,
-                    (unsigned long long) ledger.margin, (unsigned long long) held, (unsigned long long) ledger.granted,
-                    (unsigned long long) ledger.margin_updates);
+                    (unsigned long long) ledger.state().margin, (unsigned long long) held, (unsigned long long) ledger.state().granted,
+                    (unsigned long long) ledger.state().margin_updates);
         }
     }
     // After the boundary resized the GPU tier and the RAM cache: the next decode token's interval starts here.
     void begin_margin_interval(bool decode) {
-        if (decode && cache.ledger.unified) { cache.ledger.begin_interval(held_bytes()); }
+        if (decode && cache.ledger.state().unified) { cache.ledger.begin_interval(held_bytes()); }
     }
     // Room for an allocation outside the expert caches (llama_host_reserve, compute buffers): `host` bytes of host
     // memory and `device` bytes of GPU memory, which count only where the GPU shares the DRAM, beside the pages the
@@ -2659,9 +2764,9 @@ struct kimi_cpu_sink {
     bool make_room(uint64_t host, uint64_t device, const char * reason = "host_reserve") {
         const uint64_t extra = cache.ledger.dram_bytes(host, device);
         // nothing comes out of this DRAM (device memory of a discrete GPU) and no prefill holds room
-        if (!extra && !cache.ledger.prefill_pages) { return true; }
+        if (!extra && !cache.ledger.state().prefill_pages) { return true; }
         refresh_floor("make_room");
-        kimi_host_ledger::actions actions;
+        ssd::host::actions actions;
         actions.collect_deferred = [this] { vram.collect_deferred(cache, -1); };
         actions.reclaim_tier = [this](uint64_t bytes) { return vram.reclaim_host(bytes); };
         actions.reclaim_cache = [this, reason](uint64_t bytes) { return cache.arena && cache.reclaim_for_guard(bytes, reason, true); };
@@ -2669,7 +2774,7 @@ struct kimi_cpu_sink {
         if (!room.fits()) {
             ++ledger_refusals;
             std::fprintf(stderr, "[kimi_host_ledger] event=refused extra=%llu term=%s cgroup_shortage=%llu system_shortage=%llu available=%llu floor=%llu\n",
-                    (unsigned long long) extra, kimi_host_ledger::short_term(room), (unsigned long long) room.cgroup_shortage,
+                    (unsigned long long) extra, sink_short_term(room), (unsigned long long) room.cgroup_shortage,
                     (unsigned long long) room.system_shortage, (unsigned long long) room.available,
                     (unsigned long long) room.floor);
         }
@@ -2679,7 +2784,7 @@ struct kimi_cpu_sink {
     // for the file pages of the weight rows its graph gathers until the first decode token, and makes room for its
     // compute buffers (`host`, `device`) beside them, so that the RAM cache gives back what both need at once.
     bool prefill_room(uint64_t pages, uint64_t host, uint64_t device) {
-        cache.ledger.prefill_pages = pages;
+        cache.ledger.set_prefill_pages(pages);
         const size_t before = cache.enabled_slots();
         const uint64_t committed = cache.stats.committed_bytes;
         const bool fits = make_room(host, device, "prefill_room");
@@ -3383,6 +3488,23 @@ struct kimi_cpu_sink {
         }
     }
 
+    template<class T> void resize_scratch(std::vector<T> & values, size_t count) {
+        if (count <= values.capacity()) { values.resize(count); return; }
+        const uint64_t bytes = sink_cache::multiply(count, sizeof(T));
+        ssd::host::actions actions;
+        actions.collect_deferred = [this] { vram.collect_deferred(cache, -1); };
+        actions.reclaim_tier = [this](uint64_t need) { return vram.reclaim_host(need); };
+        actions.reclaim_cache = [this](uint64_t need) { return cache.reclaim_for_guard(need, "scratch"); };
+        auto ticket = cache.ledger.client->take(cache.allocation_cost(bytes), 0, actions, false,
+            ssd::host::allocation_class::tracked);
+        if (!ticket) { throw std::runtime_error(ticket.error); }
+        // Value initialization materializes the new working pages. Keep old
+        // storage alive until the replacement succeeds; price the full new size.
+        std::vector<T> next(count);
+        std::copy(values.begin(), values.end(), next.begin());
+        values.swap(next);
+        ticket.value.commit();
+    }
     size_t reserve_ring(const size_t * max_bytes, bool resident) {
         size_t allocated = 0;
         bool needs_resize = false;
@@ -3399,13 +3521,28 @@ struct kimi_cpu_sink {
         }
         // Serialized runs drain previous consumers before reusing these slots.
         if (ring.pending) { throw std::runtime_error("CPU sink reserve with pending ring I/O"); }
+        // Price each full new allocation: reserve() creates it before freeing
+        // the old block. Existing capacity is resident and requires no ticket.
+        uint64_t growth = 0;
+        for (const auto & slot : slots) { for (int role = 0; role < 3; ++role) {
+            if (slot.role[role].size < max_bytes[role]) { growth = sink_cache::add(growth, max_bytes[role]); }
+        } }
+        ssd::host::actions actions;
+        actions.collect_deferred = [this] { vram.collect_deferred(cache, -1); };
+        actions.reclaim_tier = [this](uint64_t bytes) { return vram.reclaim_host(bytes); };
+        actions.reclaim_cache = [this](uint64_t bytes) { return cache.reclaim_for_guard(bytes, "ring"); };
+        auto ticket = cache.ledger.client->take(growth, 0, actions, false, ssd::host::allocation_class::tracked);
+        if (!ticket) { throw std::runtime_error(ticket.error); }
         if (needs_resize) { ring.unregister_buffers(); ring_unlock(); }
         for (auto & slot : slots) {
             for (int role = 0; role < 3; ++role) {
+                const bool new_block = slot.role[role].size < max_bytes[role];
                 slot.role[role].reserve(max_bytes[role]);
-                if (resident) { std::memset(slot.role[role].data, 0, slot.role[role].size); }
+                if (new_block) { sink_touch_pages(slot.role[role].data, slot.role[role].size, size_t(cache.page_size)); }
+                else if (resident) { std::memset(slot.role[role].data, 0, slot.role[role].size); }
             }
         }
+        ticket.value.commit();
         return allocated;
     }
 
@@ -3477,8 +3614,9 @@ struct kimi_cpu_sink {
         if (use_cache && ready_first) {
             // nslots <= 1024 and latent <= 16384: at most 64 MiB. Allocate
             // before the cache admission check so memory.current includes it.
-            expert_output.resize(requests.size() * size_t(latent));
-            expert_computed.assign(requests.size(), 0);
+            resize_scratch(expert_output, requests.size() * size_t(latent));
+            resize_scratch(expert_computed, requests.size());
+            std::fill(expert_computed.begin(), expert_computed.end(), 0);
             current.ready_scratch_bytes = expert_output.capacity() * sizeof(float) + expert_computed.capacity();
         }
         if (!row_weights.empty()) {
@@ -3584,16 +3722,16 @@ struct kimi_cpu_sink {
         }
         current.ring_bytes = allocated;
         current.experts = requests.size();
-        activation.resize(hidden);
-        quant_input.resize(ggml_row_size(up_traits->vec_dot_type, latent));
+        resize_scratch(activation, hidden);
+        resize_scratch(quant_input, ggml_row_size(up_traits->vec_dot_type, latent));
         quant_hidden_stride = ggml_row_size(down_traits->vec_dot_type, hidden);
-        quant_hidden.resize(quant_hidden_stride);
+        resize_scratch(quant_hidden, quant_hidden_stride);
         down_quant_data = quant_hidden.data();
         if (nonblocking_down_sched) {
             if (quant_hidden_stride && requests.size() > std::numeric_limits<size_t>::max() / quant_hidden_stride) {
                 throw std::runtime_error("nonblocking down scheduler scratch overflow");
             }
-            staged_quant_hidden.resize(requests.size() * quant_hidden_stride);
+            resize_scratch(staged_quant_hidden, requests.size() * quant_hidden_stride);
             expert_stage.assign(requests.size(), 0);
             expert_upload_started.assign(requests.size(), 0);
             for (size_t i = 0; i < requests.size(); ++i) {
@@ -4324,6 +4462,8 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     if (!input) { throw std::runtime_error("missing typed SSD settings"); }
     sink_configuration out;
     out.production = true;
+    if (!services || !services->host) { throw std::runtime_error("missing process host budget client"); }
+    out.host = services->host;
     out.settings = *input;
     if (services) {
         out.events = services->events;
@@ -4384,6 +4524,7 @@ kimi_cpu_sink * create(int total_threads, int ring_experts, const execution_poli
         sink_configuration value;
         value.policy = policy;
         if (services) {
+            value.host = services->host;
             value.events = services->events;
             if (services->debug) { value.debug = *services->debug; }
         }
@@ -4502,28 +4643,10 @@ extern "C" void kimi_cpu_sink_cache_get_stats(struct kimi_cpu_sink * sink, kimi_
     *stats = sink->cache.stats;
 }
 
-// Before the first graph creates the sink, use the same context margins and observed /proc/cgroup facts.
-static bool sink_ledger_room(uint64_t pages, uint64_t host_bytes, uint64_t device_bytes,
-        const ssd::settings::snapshot * settings = nullptr) {
-    try {
-        kimi_host_ledger ledger;
-        const auto * headroom = settings ? settings->integer("host.headroom_mib") : nullptr;
-        const auto * reserve = settings ? settings->integer("vram.reserve_mib") : nullptr;
-        if (settings && (!headroom || !reserve)) { return false; }
-        ledger.configure(sink_unified_memory(), headroom ? uint32_t(*headroom) : 512, reserve ? uint32_t(*reserve) : 0);
-        ledger.prefill_pages = pages;
-        const uint64_t extra = ledger.dram_bytes(host_bytes, device_bytes);
-        if (!extra && !pages) { return true; }
-        ledger.update_file_reserve();
-        return ledger.measure(extra, true).fits();
-    } catch (const std::exception & e) {
-        std::fprintf(stderr, "[kimi_host_ledger] make_room failed: %s\n", e.what());
-        return false;
-    }
-}
-
+// The unconfigured C compatibility API has no L3 registration to borrow.
+// A null sink is therefore a refusal, never a new independent production ledger.
 extern "C" bool kimi_cpu_sink_cache_make_room(struct kimi_cpu_sink * sink, uint64_t host_bytes, uint64_t device_bytes) {
-    if (!sink) { return sink_ledger_room(0, host_bytes, device_bytes); }
+    if (!sink) { return false; }
     std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try { return sink->make_room(host_bytes, device_bytes); }
     catch (const std::exception & e) {
@@ -4534,7 +4657,7 @@ extern "C" bool kimi_cpu_sink_cache_make_room(struct kimi_cpu_sink * sink, uint6
 
 extern "C" bool kimi_cpu_sink_cache_prefill_room(struct kimi_cpu_sink * sink, uint64_t pages, uint64_t host_bytes,
         uint64_t device_bytes) {
-    if (!sink) { return sink_ledger_room(pages, host_bytes, device_bytes); }
+    if (!sink) { return false; }
     std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try { return sink->prefill_room(pages, host_bytes, device_bytes); }
     catch (const std::exception & e) {
@@ -4558,21 +4681,48 @@ static bool sink_activation_valid(const kimi_cpu_sink_activation * activation) {
 
 namespace ssd {
 namespace cpu {
-bool cache_make_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
-        const runtime_services * services, uint64_t host_bytes, uint64_t device_bytes) noexcept {
+result<host::allocation_ticket> take_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
+        const runtime_services * services, uint64_t host_bytes, uint64_t device_bytes, uint64_t pages) noexcept {
+    if (!input || !services || !services->host) { return sink_host_failure(status::invalid, "missing host client or settings"); }
     try {
         const auto value = configured(input, services);
-        return sink ? kimi_cpu_sink_cache_make_room(sink, host_bytes, device_bytes) :
-                      sink_ledger_room(0, host_bytes, device_bytes, &value.settings);
-    } catch (const std::exception &) { return false; }
+        if (sink) {
+            if (sink->cache.ledger.client != value.host) {
+                return {{}, status::invalid, "host client does not own executor"};
+            }
+            std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
+            if (pages != UINT64_MAX) { sink->cache.ledger.set_prefill_pages(pages); }
+            sink->refresh_floor("take_room");
+            host::actions actions;
+            actions.collect_deferred = [sink] { sink->vram.collect_deferred(sink->cache, -1); };
+            actions.reclaim_tier = [sink](uint64_t bytes) { return sink->vram.reclaim_host(bytes); };
+            actions.reclaim_cache = [sink](uint64_t bytes) { return sink->cache.arena && sink->cache.reclaim_for_guard(bytes, "take_room", true); };
+            return value.host->take(host_bytes, device_bytes, actions);
+        }
+        // Early graph reserve and a later sink configure the same registration
+        // with observed device topology and the identical immutable settings.
+        auto configured_host = value.host->configure(sink_host_configuration(value));
+        if (!configured_host) { return {{}, configured_host.code, configured_host.error}; }
+        if (pages != UINT64_MAX) {
+            auto held = value.host->set_prefill_pages(pages);
+            if (!held) { return {{}, held.code, held.error}; }
+        }
+        auto refresh = value.host->update_file_reserve();
+        if (!refresh) { return {{}, refresh.code, refresh.error}; }
+        return value.host->take(host_bytes, device_bytes);
+    } catch (const std::bad_alloc &) { return sink_host_failure(status::resource, "host admission allocation failed"); }
+      catch (const std::exception &) { return sink_host_failure(status::io, "host admission failed"); }
+      catch (...) { return sink_host_failure(status::io, "host admission failed"); }
+}
+bool cache_make_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
+        const runtime_services * services, uint64_t host_bytes, uint64_t device_bytes) noexcept {
+    auto ticket = take_room_configured(sink, input, services, host_bytes, device_bytes, UINT64_MAX);
+    return bool(ticket); // Compatibility observation only: destructor cancels the unmaterialized ticket.
 }
 bool cache_prefill_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
         const runtime_services * services, uint64_t pages, uint64_t host_bytes, uint64_t device_bytes) noexcept {
-    try {
-        const auto value = configured(input, services);
-        return sink ? kimi_cpu_sink_cache_prefill_room(sink, pages, host_bytes, device_bytes) :
-                      sink_ledger_room(pages, host_bytes, device_bytes, &value.settings);
-    } catch (const std::exception &) { return false; }
+    auto ticket = take_room_configured(sink, input, services, host_bytes, device_bytes, pages);
+    return bool(ticket); // Production allocations use take_room_configured and retain the ticket.
 }
 }  // namespace cpu
 }  // namespace ssd
@@ -4836,6 +4986,10 @@ kimi_cpu_sink * create_configured(const settings::snapshot *, const runtime_serv
         kimi_cpu_sink_resolver, void *, char * error, size_t size) noexcept {
     sink_error(error, size, "SSD CPU executor requires Linux io_uring/O_DIRECT");
     return nullptr;
+}
+result<host::allocation_ticket> take_room_configured(kimi_cpu_sink *, const settings::snapshot *, const runtime_services *,
+        uint64_t, uint64_t, uint64_t) noexcept {
+    return sink_host_failure(status::invalid, "SSD CPU host admission requires Linux");
 }
 bool cache_make_room_configured(kimi_cpu_sink *, const settings::snapshot *, const runtime_services *,
         uint64_t, uint64_t) noexcept { return false; }

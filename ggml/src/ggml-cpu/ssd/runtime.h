@@ -3,6 +3,7 @@
 
 #include "../kimi-cpu-sink.h"
 #include "../../ggml-ssd/runtime-services.h"
+#include "../../ggml-ssd/host/arbiter.h"
 
 namespace ssd {
 namespace settings {
@@ -22,5 +23,10 @@ namespace cpu {
 [[nodiscard]] GGML_BACKEND_API bool cache_prefill_room_configured(
     kimi_cpu_sink * sink, const settings::snapshot * settings, const runtime_services * services,
     uint64_t pages, uint64_t host_bytes, uint64_t device_bytes) noexcept;
+// UINT64_MAX keeps the context prefill hold; 0 clears it. Success is the
+// result status, including for a zero-byte allocation; keep ticket through first touch.
+[[nodiscard]] GGML_BACKEND_API result<host::allocation_ticket> take_room_configured(
+    kimi_cpu_sink * sink, const settings::snapshot * settings, const runtime_services * services,
+    uint64_t host_bytes, uint64_t device_bytes, uint64_t prefill_pages) noexcept;
 }  // namespace cpu
 }  // namespace ssd

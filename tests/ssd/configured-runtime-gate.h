@@ -30,7 +30,10 @@ static void configured_writer_failure_test(fixture & f, const ssd::settings::sna
     if (!child) {
         auto writer = ssd::telemetry::writer::open(path);
         if (!writer) { _exit(1); }
-        const ssd::runtime_services services{ writer.value.get(), nullptr };
+        auto owner = std::make_shared<ssd::host::process_arbiter>();
+        auto made = owner->make_client(); if (!made) { _exit(5); }
+        auto client = std::move(made.value);
+        const ssd::runtime_services services{ writer.value.get(), nullptr, client.get() };
         char error[512] = {};
         sink_ptr sink(ssd::cpu::create_configured(&settings, &services, fixture::resolve, &f, error, sizeof(error)),
             kimi_cpu_sink_destroy);
@@ -61,21 +64,39 @@ static void configured_runtime_tests(fixture_inputs & inputs) {
     auto writer = ssd::telemetry::writer::open(path);
     require(bool(writer) && bool(writer.value->settings(settings)), "configured settings publication");
     ssd::telemetry::debug_channels debug; debug.profile = true;
-    const ssd::runtime_services services{ writer.value.get(), &debug };
+    auto owner = std::make_shared<ssd::host::process_arbiter>();
+    auto made_first = owner->make_client(), made_second = owner->make_client();
+    require(bool(made_first) && bool(made_second), "shared host client registration");
+    auto first_client = std::move(made_first.value), second_client = std::move(made_second.value);
+    const ssd::runtime_services services{ writer.value.get(), &debug, first_client.get() };
     char error[512] = {};
     sink_ptr first(ssd::cpu::create_configured(&settings, &services, fixture::resolve, &f, error, sizeof(error)),
         kimi_cpu_sink_destroy);
     require(bool(first) && configured_task_count() == before + 1, std::string("configured two-thread create: ") + error);
     settings = configured_settings(2, false, 1); debug.profile = false;
-    const ssd::runtime_services second_services{ nullptr, &debug };
+    const ssd::runtime_services second_services{ nullptr, &debug, second_client.get() };
     sink_ptr second(ssd::cpu::create_configured(&settings, &second_services, fixture::resolve, &f, error, sizeof(error)),
         kimi_cpu_sink_destroy);
     require(bool(second) && configured_task_count() == before + 5, "independent second context thread count");
     auto invalid = configured_settings(2, true);
-    sink_ptr rejected(ssd::cpu::create_configured(&invalid, nullptr, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+    sink_ptr rejected(ssd::cpu::create_configured(&invalid, &services, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
     require(!rejected && error[0] && configured_task_count() == before + 5, "affinity rejection leaked a started worker");
-    require(ssd::cpu::cache_make_room_configured(nullptr, &original, nullptr, 0, 0) &&
-        ssd::cpu::cache_prefill_room_configured(nullptr, &original, nullptr, 0, 0, 0), "early configured ledger admission");
+    require(!ssd::cpu::cache_make_room_configured(nullptr, &original, nullptr, 0, 0),
+        "missing early registration silently admitted allocation");
+    auto first_hold = ssd::cpu::take_room_configured(nullptr, &original, &services, 0, 0, 11);
+    auto second_hold = ssd::cpu::take_room_configured(nullptr, &original, &second_services, 0, 0, 17);
+    require(bool(first_hold) && bool(second_hold) && bool(first_hold.value) && bool(second_hold.value), "zero-byte configured tickets");
+    first_hold.value.cancel(); second_hold.value.cancel();
+    auto held = first_client->state();
+    require(bool(held) && held.value.prefill_pages == 11 && held.value.all_prefill_pages == 28, "context holds not aggregated");
+    auto keep = ssd::cpu::take_room_configured(nullptr, &original, &services, 0, 0, UINT64_MAX);
+    require(bool(keep) && first_client->state().value.prefill_pages == 11, "keep sentinel changed own hold"); keep.value.cancel();
+    auto clear = ssd::cpu::take_room_configured(nullptr, &original, &services, 0, 0, 0);
+    require(bool(clear) && first_client->state().value.all_prefill_pages == 17, "clearing own hold cleared peer"); clear.value.cancel();
+    auto mismatch = ssd::cpu::take_room_configured(first.get(), &original, &second_services, 0, 0, UINT64_MAX);
+    require(!mismatch && mismatch.code == ssd::status::invalid, "cross-context executor accepted wrong client");
+    require(ssd::cpu::cache_make_room_configured(nullptr, &original, &services, 0, 0) &&
+        ssd::cpu::cache_prefill_room_configured(nullptr, &original, &second_services, 0, 0, 0), "early configured shared admission");
     const std::vector<int32_t> ids{ 1, 2 }; const std::vector<float> weights{ .4f, .6f };
     const std::vector<float> input(f.latent, .13f);
     const auto expected = reference(f, 1, input, ids, weights, 4, 25);
@@ -83,6 +104,8 @@ static void configured_runtime_tests(fixture_inputs & inputs) {
     run_checked(inputs, "configured_profile", f, first.get(), meta, input, ids, weights, expected, 1, 25, 0, 0, &a);
     run_checked(inputs, "configured_quiet", f, second.get(), meta, input, ids, weights, expected, 1, 25, 0, 0, &b);
     require(a == b, "debug channels or independent thread selection changed CPU output bits");
+    require(first_client->state().value.pending_bytes == 0 && second_client->state().value.pending_bytes == 0,
+        "actual ring/cache allocation leaked shared pending debit");
     first.reset(); second.reset(); writer.value.reset();
     require(configured_task_count() == before, "configured context destruction left worker threads");
     std::ifstream records(path); std::string line; size_t sequence = 0; bool profile = false;

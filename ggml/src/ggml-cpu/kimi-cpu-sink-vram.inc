@@ -195,7 +195,7 @@ struct sink_vram {
             if (!settings_api || settings_api->version != 1 || settings_api->size != sizeof(*settings_api) || !settings_api->create) {
                 throw std::runtime_error("GPU tier typed-settings ABI missing or incompatible");
             }
-            const ssd::runtime_services services{ configuration.events, &configuration.debug };
+            const ssd::runtime_services services{ configuration.events, &configuration.debug, configuration.host };
             context = settings_api->create(&configuration.settings, &services, error, sizeof(error));
         } else {
             auto get = reinterpret_cast<ssd::gpu::testing::get_api>(dlsym(RTLD_DEFAULT, "ggml_ssd_tier_testing_get_api"));

@@ -2588,7 +2588,19 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         std::string capacity, loaded;
         {
             auto & h = pread_hold::get();
-            { std::lock_guard<std::mutex> lock(h.mutex); h.before_meminfo = [&] { drift.assign(3 * cost / 2, 1); }; }
+            // Admission can legitimately re-read the budget before the ring
+            // exists. Inject between geometry's cgroup/system observations only
+            // after the mandatory ring is physically resident, rather than
+            // assuming a particular number of ledger reads.
+            std::function<void()> inject;
+            inject = [&] {
+                const uint64_t current_room = host_room();
+                if (current_room >= room || room - current_room < ring / 2) {
+                    std::lock_guard<std::mutex> lock(h.mutex); h.before_meminfo = inject; return;
+                }
+                drift.assign(3 * cost / 2, 1);
+            };
+            { std::lock_guard<std::mutex> lock(h.mutex); h.before_meminfo = inject; }
             tensors meta(big, 1);
             char error[512] = {};
             stderr_capture log;
