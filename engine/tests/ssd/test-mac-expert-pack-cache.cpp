@@ -176,6 +176,108 @@ void configured_context_isolation() {
     unlink(event_path.c_str());
 }
 
+struct multi_fixture {
+    char path[64] = "/tmp/ssdash-pack-index-XXXXXX";
+    int fd;
+    static constexpr int tensors = 96, experts = 4;
+    static constexpr size_t bytes = 16384;
+    static constexpr size_t start = ((sizeof(pack_header) + tensors * experts * sizeof(pack_entry)
+            + alignment - 1) / alignment) * alignment;
+    static std::string name(int t) { return "blk." + std::to_string(t) + ".ffn_up_exps.weight"; }
+    static unsigned char value(int t, int e) { return static_cast<unsigned char>(1 + (t * experts + e) % 190); }
+    multi_fixture() : fd(mkstemp(path)) {
+        require(fd >= 0, "create multi-tensor pack");
+        require(ftruncate(fd, start + tensors * experts * bytes) == 0, "size multi-tensor pack");
+        pack_header h{};
+        std::memcpy(h.magic, "GGMLMOEPACKv1\0\0\0", 16);
+        h.version = 1; h.header_size = sizeof(h); h.entry_count = tensors * experts; h.data_start = start;
+        write(&h, sizeof(h), 0);
+        for (int t = 0; t < tensors; ++t) {
+            for (int e = 0; e < experts; ++e) {
+                pack_entry entry{};
+                std::strcpy(entry.name, name(t).c_str());
+                entry.expert = e; entry.offset = start + (t * experts + e) * bytes; entry.bytes = bytes;
+                write(&entry, sizeof(entry), sizeof(h) + (t * experts + e) * sizeof(entry));
+                fill(t, e, value(t, e));
+            }
+        }
+    }
+    ~multi_fixture() { close(fd); unlink(path); }
+    void write(const void * data, size_t size, uint64_t offset) {
+        require(pwrite(fd, data, size, static_cast<off_t>(offset)) == static_cast<ssize_t>(size), "write multi-tensor pack");
+    }
+    void fill(int t, int e, unsigned char v) {
+        std::vector<unsigned char> data(bytes, v);
+        write(data.data(), data.size(), start + (t * experts + e) * bytes);
+    }
+};
+
+void indexed_lifetimes(const char * policy) {
+    cache_options options;
+    options.budget = size_t(3) << 20;
+    options.lru = std::strcmp(policy, "lru") == 0;
+    multi_fixture file;
+    pack_cache cache({file.path}, options);
+    std::vector<const unsigned char *> held;
+    for (int t = 0; t < multi_fixture::tensors; ++t) {
+        for (int e = 0; e < multi_fixture::experts; ++e) {
+            held.push_back(static_cast<const unsigned char *>(cache.acquire(
+                    multi_fixture::name(t).c_str(), e, multi_fixture::bytes)));
+        }
+    }
+    // Mix nested pins and non-FIFO releases after multiple map growths. The last
+    // two slices of each tensor are transient and disappear at their last unpin.
+    for (int t = multi_fixture::tensors - 1; t >= 0; --t) {
+        for (int e : {2, 0, 3, 1}) {
+            const auto * p = held[t * multi_fixture::experts + e];
+            require(p[0] == multi_fixture::value(t, e) && p[multi_fixture::bytes - 1] == p[0], "rehash changed pinned payload");
+            const void * again = cache.acquire(multi_fixture::name(t).c_str(), e, multi_fixture::bytes);
+            require(again == p, "nested pin changed payload address");
+            cache.release(p);
+            require(p[0] == multi_fixture::value(t, e), "nested pin released too soon");
+            cache.release(again);
+            rejects([&] { cache.release(p); });
+        }
+    }
+    int unrelated = 0;
+    rejects([&] { cache.release(&unrelated); });
+    // Repeated replacements and scratch-buffer reuse must remove all old indexes.
+    for (int round = 0; round < 8; ++round) {
+        for (int t = 0; t < multi_fixture::tensors; ++t) {
+            for (int e : {3, 2, 1, 0}) {
+                const auto * p = static_cast<const unsigned char *>(cache.acquire(
+                        multi_fixture::name(t).c_str(), e, multi_fixture::bytes));
+                require(p[0] == multi_fixture::value(t, e), "replacement returned another expert");
+                cache.release(p);
+            }
+        }
+    }
+}
+
+void indexed_policy(const char * policy) {
+    cache_options options;
+    options.budget = size_t(3) << 20;
+    options.lru = std::strcmp(policy, "lru") == 0;
+    multi_fixture file;
+    pack_cache cache({file.path}, options);
+    auto read = [&](int t, int e, unsigned char expected) {
+        const auto * p = static_cast<const unsigned char *>(cache.acquire(
+                multi_fixture::name(t).c_str(), e, multi_fixture::bytes));
+        require(p[0] == expected, "per-tensor LFU/LRU decision changed");
+        cache.release(p);
+    };
+    for (int t = 0; t < multi_fixture::tensors; ++t) {
+        read(t, 0, multi_fixture::value(t, 0));
+        read(t, 0, multi_fixture::value(t, 0));
+        read(t, 1, multi_fixture::value(t, 1));
+        file.fill(t, 0, 250);
+    }
+    for (int t = multi_fixture::tensors - 1; t >= 0; --t) {
+        read(t, 2, multi_fixture::value(t, 2));
+        read(t, 0, std::strcmp(policy, "lfu") == 0 ? multi_fixture::value(t, 0) : 250);
+    }
+}
+
 void concurrent_batches() {
     fixture file;
     for (int expert = 0; expert < 3; ++expert) {
@@ -250,6 +352,10 @@ int main() {
             rejects([&] { cache.release(pinned); });
         }
         concurrent_batches();
+        for (const char * policy : {"lfu", "lru"}) {
+            indexed_lifetimes(policy);
+            indexed_policy(policy);
+        }
         configured_context_isolation();
         rejects_foreign_batch();
         writer_failure_drains(false);
@@ -284,7 +390,7 @@ int main() {
             file.write(&duplicate, sizeof(duplicate), sizeof(pack_header) + sizeof(pack_entry) + offsetof(pack_entry, expert));
             rejects([&] { pack_cache cache({file.path}, small_cache_options()); });
         }
-        std::puts("MAC_EXPERT_PACK_CACHE_OK header=PASS lfu=PASS pins=PASS concurrent_batches=PASS contexts=PASS copied_debug=PASS telemetry=PASS foreign_batch=PASS writer_full_drains=PASS invalid_entries=PASS");
+        std::puts("MAC_EXPERT_PACK_CACHE_OK header=PASS lfu=PASS pins=PASS concurrent_batches=PASS indexed_lifetimes=PASS indexed_policy=PASS contexts=PASS copied_debug=PASS telemetry=PASS foreign_batch=PASS writer_full_drains=PASS invalid_entries=PASS");
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "MAC_EXPERT_PACK_CACHE_FAILED: %s\n", error.what());

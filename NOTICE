@@ -5,6 +5,14 @@ Existing notices in AUTHORS, licenses/, vendor/ and individual source files
 remain applicable. The project-wide MIT license does not replace component
 licenses. No model weights are distributed with this source tree.
 
+Design reference: Strata's explicit expert-to-slot indexing
+https://github.com/Niko1221/Strata
+Revision 011c9e600a93bbc9fd451c563501b5831c32bbca,
+metal/src/engine/stream.h and stream.cpp.
+Copyright (c) 2026 Niko1221 and the Strata contributors; MIT.
+The Mac cache indexes are independently implemented for SSDash's existing
+LFU/LRU policy and ownership model. No Strata implementation is copied.
+
 1. llama.cpp and ggml
    https://github.com/ggml-org/llama.cpp
    Copyright (c) 2023-2026 The ggml authors. MIT (LICENSE).

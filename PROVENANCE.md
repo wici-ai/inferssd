@@ -60,6 +60,11 @@ recorded here by their public pull-request numbers.
 The source repository also incorporated ik_llama.cpp history. Its copyright line is retained to acknowledge
 that lineage; the imported-path audit did not identify surviving lines authored by that project's contributors.
 The colibri project informed scheduling ideas, but its implementation is not copied into this repository.
+Strata's explicit expert-to-slot indexing at revision
+`011c9e600a93bbc9fd451c563501b5831c32bbca` informed the independently implemented
+Mac cache payload and per-tensor indexes. The existing SSDash cache policies,
+weight formats and CPU execution path are retained. See the
+[design review](docs/ssdash/cache-index-design-review.md) for scope and validation.
 Retained literary prompt excerpts are from public-domain works, including Moby-Dick and Pride and Prejudice.
 
 Full third-party copyright and permission notices are in [NOTICE](NOTICE). Existing upstream attribution in

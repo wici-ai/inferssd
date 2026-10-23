@@ -291,6 +291,8 @@ struct cache_options {
 };
 
 class pack_cache {
+    using slot_map = std::unordered_map<key, slot, key_hash>;
+    using slot_entry = slot_map::value_type;
 public:
     explicit pack_cache(const std::vector<std::string> & paths, cache_options options)
         : source(paths, options.read_alignment), sources(source.sources), index(source.index),
@@ -427,26 +429,28 @@ public:
         const size_t per_tensor_slots = admit ? budget / tensor_names.size() / allocation : 0;
         admit = admit && per_tensor_slots > 0;
         const bool use_lru = policy == "lru";
-        size_t same_tensor = 0;
-        auto same_tensor_victim = slots.end();
-        for (auto it = slots.begin(); it != slots.end(); ++it) {
-            if (it->first.name != id.name || !it->second.admitted) { continue; }
-            ++same_tensor;
-            if (it->second.pins != 0) { continue; }
-            if (same_tensor_victim == slots.end() ||
-                    (use_lru ? it->second.last_use < same_tensor_victim->second.last_use :
-                    heat[it->first] < heat[same_tensor_victim->first] ||
-                    (heat[it->first] == heat[same_tensor_victim->first] &&
-                     it->second.last_use < same_tensor_victim->second.last_use))) {
-                same_tensor_victim = it;
+        const auto group = admitted_by_tensor.find(id.name);
+        const size_t same_tensor = group == admitted_by_tensor.end() ? 0 : group->second.size();
+        slot_entry * same_tensor_victim = nullptr;
+        // Only the current tensor's admitted slices participate in its quota.
+        // Unique decode last_use values retain the original LFU/LRU tie-break.
+        if (admit && same_tensor >= per_tensor_slots) {
+            for (auto * entry : group->second) {
+                if (entry->second.pins != 0) { continue; }
+                if (!same_tensor_victim ||
+                        (use_lru ? entry->second.last_use < same_tensor_victim->second.last_use :
+                        heat[entry->first] < heat[same_tensor_victim->first] ||
+                        (heat[entry->first] == heat[same_tensor_victim->first] &&
+                         entry->second.last_use < same_tensor_victim->second.last_use))) {
+                    same_tensor_victim = entry;
+                }
             }
         }
         if (admit && same_tensor >= per_tensor_slots) {
-            if (same_tensor_victim == slots.end() || (!use_lru && frequency <= heat[same_tensor_victim->first])) {
+            if (!same_tensor_victim || (!use_lru && frequency <= heat[same_tensor_victim->first])) {
                 admit = false;
             } else {
-                allocated_bytes -= same_tensor_victim->second.allocated;
-                slots.erase(same_tensor_victim);
+                erase_slot(slots.find(same_tensor_victim->first));
                 ++evictions;
             }
         }
@@ -460,8 +464,7 @@ public:
                 }
             }
             if (victim == slots.end()) { admit = false; break; }
-            allocated_bytes -= victim->second.allocated;
-            slots.erase(victim);
+            erase_slot(victim);
             ++evictions;
         }
         policy_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - policy_start).count();
@@ -492,6 +495,20 @@ public:
         fresh.pins = 1;
         fresh.last_use = cache_updates ? ++clock : clock;
         auto inserted = slots.emplace(id, std::move(fresh));
+        // unordered_map rehash invalidates iterators, but not element pointers.
+        // Publish both non-owning indexes before accounting for this allocation.
+        try {
+            by_payload.emplace(inserted.first->second.payload(), &*inserted.first);
+            if (admit) { admitted_by_tensor[id.name].push_back(&*inserted.first); }
+        } catch (...) {
+            by_payload.erase(inserted.first->second.payload());
+            const auto empty_group = admitted_by_tensor.find(id.name);
+            if (empty_group != admitted_by_tensor.end() && empty_group->second.empty()) {
+                admitted_by_tensor.erase(empty_group);
+            }
+            slots.erase(inserted.first);
+            throw;
+        }
         allocated_bytes += allocation;
         peak_bytes = std::max(peak_bytes, allocated_bytes);
         if (batch) { schedule(*batch); }
@@ -503,23 +520,15 @@ public:
     void release(const void * data) {
         std::lock_guard<std::mutex> lock(mutex);
         elapsed_counter elapsed{release_us};
-        for (auto it = slots.begin(); it != slots.end(); ++it) {
-            if (it->second.payload() != data) { continue; }
-            if (it->second.pins == 0) { throw std::runtime_error("expert-pack slice released twice"); }
-            --it->second.pins;
-            if (!it->second.admitted && it->second.pins == 0) {
-                allocated_bytes -= it->second.allocated;
-                if (!scratch_data) {
-                    scratch_data = it->second.data;
-                    scratch_allocated = it->second.allocated;
-                    it->second.data = nullptr;
-                }
-                slots.erase(it);
-            }
-            check_publication_locked();
-            return;
+        const auto found = by_payload.find(data);
+        if (found == by_payload.end()) { throw std::runtime_error("unknown expert-pack slice released"); }
+        auto & entry = *found->second;
+        if (entry.second.pins == 0) { throw std::runtime_error("expert-pack slice released twice"); }
+        --entry.second.pins;
+        if (!entry.second.admitted && entry.second.pins == 0) {
+            erase_slot(slots.find(entry.first), true);
         }
-        throw std::runtime_error("unknown expert-pack slice released");
+        check_publication_locked();
     }
 
     expert_batch * begin(const char * name, const int64_t * counts, int n, size_t bytes, bool cache_updates) {
@@ -604,6 +613,26 @@ private:
         stop_readers();
         throw std::runtime_error(publication_failed.load(std::memory_order_acquire) ?
                 "Mac telemetry publication failed after reader drain" : "Mac cache closed after reader drain");
+    }
+
+    void erase_slot(slot_map::iterator it, bool reuse_scratch = false) {
+        // Remove aliases before releasing/recycling the payload or its owning key.
+        by_payload.erase(it->second.payload());
+        if (it->second.admitted) {
+            auto group = admitted_by_tensor.find(it->first.name);
+            auto & entries = group->second;
+            const auto entry = std::find(entries.begin(), entries.end(), &*it);
+            *entry = entries.back();
+            entries.pop_back();
+            if (entries.empty()) { admitted_by_tensor.erase(group); }
+        }
+        allocated_bytes -= it->second.allocated;
+        if (reuse_scratch && !scratch_data) {
+            scratch_data = it->second.data;
+            scratch_allocated = it->second.allocated;
+            it->second.data = nullptr;
+        }
+        slots.erase(it);
     }
 
     void allocate_buffer(slot & buffer, size_t allocation, bool reuse_scratch) {
@@ -783,7 +812,10 @@ private:
     bool stopping = false;
     std::mutex mutex;
     std::unordered_map<key, uint16_t, key_hash> heat;
-    std::unordered_map<key, slot, key_hash> slots;
+    slot_map slots;
+    // Non-owning indexes, guarded by mutex like slots; no weights are duplicated.
+    std::unordered_map<const void *, slot_entry *> by_payload;
+    std::unordered_map<std::string, std::vector<slot_entry *>> admitted_by_tensor;
     std::string trace_path;
     const std::string policy;
     const bool prefill;
