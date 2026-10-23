@@ -151,6 +151,8 @@ struct server_prompt_cache {
     void update();
 
 private:
+    friend struct server_prompt_cache_testing; // Explicit metadata-only unit fixture; no production admission shortcut.
+    void remove_obsolete(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type);
     bool contains(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type);
     void remove(std::list<server_prompt>::iterator it);
 };

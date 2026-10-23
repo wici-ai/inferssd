@@ -317,6 +317,23 @@ void server_prompt_cache::remove(std::list<server_prompt>::iterator it) {
     states.erase(it);
 }
 
+void server_prompt_cache::remove_obsolete(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type) {
+        // remove any cached prompts that are fully contained in the current prompt
+        for (auto it = states.begin(); it != states.end();) {
+            const int len = it->tokens.get_common_prefix(prompt.tokens);
+
+            if (len == (int) it->tokens.size() &&
+                    server_prompt_can_restore_prefix(prompt, it->n_tokens(), seq_rm_type)) {
+                SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
+
+                it = states.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+}
+
 void server_prompt_cache::save(
         const server_prompt        & prompt,
         bool                         current,
@@ -340,19 +357,7 @@ void server_prompt_cache::save(
     SRV_WRN(" - saving prompt with length %d, total state size = %.3f MiB\n", prompt.n_tokens(), state_size / (1024.0 * 1024.0));
 
     if (!on_disk()) {
-        // remove any cached prompts that are fully contained in the current prompt
-        for (auto it = states.begin(); it != states.end();) {
-            const int len = it->tokens.get_common_prefix(prompt.tokens);
-
-            if (len == (int) it->tokens.size() &&
-                    server_prompt_can_restore_prefix(prompt, it->n_tokens(), seq_rm_type)) {
-                SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
-
-                it = states.erase(it);
-            } else {
-                ++it;
-            }
-        }
+        remove_obsolete(prompt, seq_rm_type);
 
         server_ssd_memory_change changes(ctx);
         size_t allocation_bytes = state_size;

@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-prompt-cache-fixture.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -111,9 +112,9 @@ static void test_full_removal_keeps_exact_shorter_without_checkpoint() {
     server_prompt long_prompt  = make_prompt({ 1, 2, 3, 4, 5, 6 });
     server_prompt short_prompt = make_prompt({ 1, 2, 3, 4 });
 
-    require(cache.alloc(long_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
+    require(server_prompt_cache_testing::alloc_metadata(cache, long_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
             "failed to allocate initial long prompt");
-    require(cache.alloc(short_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
+    require(server_prompt_cache_testing::alloc_metadata(cache, short_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
             "short exact prompt should be cached when the longer state has no restorable prefix checkpoint");
     require(cache.states.size() == 2,
             "cache should retain both long and short prompts without a restorable prefix checkpoint");
@@ -126,9 +127,9 @@ static void test_full_removal_reuses_longer_checkpoint_for_shorter_prompt() {
     server_prompt short_prompt = make_prompt({ 1, 2, 3, 4 });
     add_checkpoint(long_prompt, short_prompt.n_tokens());
 
-    require(cache.alloc(long_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
+    require(server_prompt_cache_testing::alloc_metadata(cache, long_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
             "failed to allocate checkpointed long prompt");
-    require(cache.alloc(short_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) == nullptr,
+    require(server_prompt_cache_testing::alloc_metadata(cache, short_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) == nullptr,
             "short exact prompt should be skipped when a longer checkpoint can restore it");
     require(cache.states.size() == 1,
             "checkpointed long prompt should make the exact shorter prompt redundant");
@@ -141,9 +142,9 @@ static void test_full_removal_only_removes_obsolete_shorter_with_checkpoint() {
         server_prompt short_prompt = make_prompt({ 1, 2, 3, 4 });
         server_prompt long_prompt  = make_prompt({ 1, 2, 3, 4, 5, 6 });
 
-        require(cache.alloc(short_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
+        require(server_prompt_cache_testing::alloc_metadata(cache, short_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
                 "failed to allocate initial short prompt");
-        require(cache.alloc(long_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
+        require(server_prompt_cache_testing::alloc_metadata(cache, long_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
                 "long prompt without checkpoint should still be cached");
         require(cache.states.size() == 2,
                 "short prompt must not be removed when long prompt cannot restore that prefix");
@@ -156,9 +157,9 @@ static void test_full_removal_only_removes_obsolete_shorter_with_checkpoint() {
         server_prompt long_prompt  = make_prompt({ 1, 2, 3, 4, 5, 6 });
         add_checkpoint(long_prompt, short_prompt.n_tokens());
 
-        require(cache.alloc(short_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
+        require(server_prompt_cache_testing::alloc_metadata(cache, short_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
                 "failed to allocate initial short prompt");
-        require(cache.alloc(long_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
+        require(server_prompt_cache_testing::alloc_metadata(cache, long_prompt, 8, COMMON_CONTEXT_SEQ_RM_TYPE_FULL) != nullptr,
                 "failed to allocate checkpointed long prompt");
         require(cache.states.size() == 1,
                 "short prompt should be removed once long prompt has a restorable prefix checkpoint");
