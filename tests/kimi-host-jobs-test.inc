@@ -32,7 +32,16 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
     inputs.set("tier.policy", "lru");
     inputs.set("tier.min_count", "0");
     char error[512] = {};
-    void * t = tier_api->create(2 * stride, error, sizeof(error));
+    const auto get_fixture = reinterpret_cast<ssd::gpu::testing::get_api>(
+        dlsym(RTLD_DEFAULT, "ggml_ssd_tier_testing_get_api"));
+    require(get_fixture != nullptr, "explicit tier fixture factory missing");
+    const auto * fixture_api = get_fixture();
+    require(fixture_api && fixture_api->version == 1 &&
+        fixture_api->size == sizeof(ssd::gpu::testing::api) && fixture_api->create,
+        "explicit tier fixture factory ABI mismatch");
+    const auto options = inputs.tier_policy();
+    const auto create_tier = [&] { return fixture_api->create(2 * stride, &options, error, sizeof(error)); };
+    void * t = create_tier();
     require(t != nullptr, std::string("tier create: ") + error);
     // five experts in host memory, blocks with small scales, in an anonymous mapping like the RAM cache's
     const int count = 5;
@@ -122,7 +131,7 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
     bool in_place = false;
     {
         void * main_tier = t;
-        t = tier_api->create(2 * stride, error, sizeof(error));
+        t = create_tier();
         require(t != nullptr, std::string("tier create: ") + error);
         layer({ 0 }, [&](const std::vector<int> &) {});
         host_api->costs2(t, &c);
@@ -134,7 +143,7 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
         // Before any page-locked copy (a tier of its own): the first registration asks for the scratch slots; the next
         // decode token boundary copies its range into one, timed, and the boundary after reads the time. No job ran.
         void * main_tier = t;
-        t = tier_api->create(2 * stride, error, sizeof(error));
+        t = create_tier();
         require(t != nullptr, std::string("tier create: ") + error);
         layer({ 0 }, [&](const std::vector<int> &) {});
         require(host_api->register_host(t, host, count * stride, error, sizeof(error)) == 0, std::string("register: ") + error);
@@ -148,7 +157,7 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
         require(host_api->unregister_host(t, host, error, sizeof(error)) == 0, std::string("unregister: ") + error);
         tier_api->destroy(t);
         // A range unregistered before its probe started is not copied.
-        t = tier_api->create(2 * stride, error, sizeof(error));
+        t = create_tier();
         require(t != nullptr, std::string("tier create: ") + error);
         layer({ 0 }, [&](const std::vector<int> &) {});
         require(host_api->register_host(t, host, count * stride, error, sizeof(error)) == 0, std::string("register: ") + error);
