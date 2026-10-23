@@ -10,7 +10,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "preset.h"
-#include "ssdash/options.h"
+#include "inferssd/options.h"
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)

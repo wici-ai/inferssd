@@ -245,7 +245,7 @@ def run_scope(profile, environment, lock_fd):
     if sys.platform != "linux":
         raise ValueError("Linux scope requires Linux")
     out = Path(environment["SSDASH_RUN_DIR"])
-    unit = f"ssdash-final-{uuid.uuid4().hex}.scope"
+    unit = f"inferssd-final-{uuid.uuid4().hex}.scope"
     profile_path = out / "scope-profile.json"
     common.save(profile_path, profile)
     lease = LeaseServer(lock_fd, unit)

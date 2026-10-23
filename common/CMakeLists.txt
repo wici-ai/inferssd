@@ -55,7 +55,7 @@ set(TARGET llama-common)
 
 add_library(${TARGET}
     arg.cpp
-    ssdash/options.cpp
+    inferssd/options.cpp
     arg.h
     base64.hpp
     chat-auto-parser-generator.cpp

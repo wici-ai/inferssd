@@ -53,17 +53,17 @@ jobs:
         run: |
           python3 -m venv .venv
           .venv/bin/python -m pip install pytest==9.1.1 ruff==0.17.1 mypy==1.18.2
-          .venv/bin/python -m pip install ./tools/ssdash
+          .venv/bin/python -m pip install ./tools/inferssd
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       - name: Framework lint
         run: |
           ruff check tools/adaptive
           ruff check --isolated --select F bench
-          ruff check tools/ssdash
-          ruff format --check tools/ssdash
-          mypy --config-file tools/ssdash/pyproject.toml tools/ssdash/src
+          ruff check tools/inferssd
+          ruff format --check tools/inferssd
+          mypy --config-file tools/inferssd/pyproject.toml tools/inferssd/src
       - name: Framework tests
-        run: python3 -m pytest -q tools/adaptive/tests bench/tests tools/ssdash/tests
+        run: python3 -m pytest -q tools/adaptive/tests bench/tests tools/inferssd/tests
       - name: Mac launcher and alias-index checks
         run: |
           ruff check --isolated --select F scripts/run-macos-ssd.py scripts/kimi-build-gguf-expert-alias-tsv.py tests/test-macos-launcher.py bench/macos/measure.py bench/macos/measurement_images.py tests/test-macos-measurement.py tests/test-macos-measurement-images.py

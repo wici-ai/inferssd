@@ -1,11 +1,11 @@
-# SSDash
+# InferSSD
 
-SSDash is an SSD-backed inference framework for large mixture-of-experts models. It streams expert weights
+InferSSD is an SSD-backed inference framework for large mixture-of-experts models. It streams expert weights
 from local storage and manages execution across the CPU, host memory and GPU. The Linux adaptive framework
 measures the machine and derives the runtime configuration.
 
-SSDash builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) and ggml. This repository includes the
-engine source with SSDash's runtime extensions. The upstream baseline and component attribution are
+InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) and ggml. This repository includes the
+engine source with InferSSD's runtime extensions. The upstream baseline and component attribution are
 recorded in [PROVENANCE.md](PROVENANCE.md) and [NOTICE](NOTICE).
 
 The initial source import is under development toward **v0.1.0**. Published performance results and a complete
@@ -17,7 +17,7 @@ earlier code and are not release benchmarks.
 The supported targets are DeepSeek-V4.1 Flash with MXFP4 experts in the Q8_0 GGUF distribution, and Muse Spark
 Open UD-Q4_K_XL. Linux CUDA development targets RTX 5090, RTX 5060 Ti and GB10. Other inherited models and
 backends have not been qualified by this project. Apple Silicon integration includes a
-[GGUF launcher for both models](docs/ssdash/mac-launcher.md); target-device qualification is in progress.
+[GGUF launcher for both models](docs/inferssd/mac-launcher.md); target-device qualification is in progress.
 
 The model files are large: allow approximately 505-508 GB for each model, plus working space. Linux reads
 expert ranges directly from the GGUF shards and does not require a separate expert pack.
@@ -40,8 +40,8 @@ servers, read several GB of model data and evict model pages from the page cache
 Clone this repository and download every shard of one supported model after accepting its license:
 
 ```sh
-git clone https://github.com/wici-ai/ssdash.git
-cd ssdash
+git clone https://github.com/wici-ai/inferssd.git
+cd inferssd
 tools/adaptive/build.sh
 mkdir -p ./run-data
 ROOT="$PWD/run-data" MODEL_DIR=/data/models tools/adaptive/adaptive.sh serve
@@ -58,13 +58,13 @@ interface and a Python package are planned for the first release. No binary pack
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for checks and review requirements, [PROVENANCE.md](PROVENANCE.md)
-for source history, and [the import manifest](docs/ssdash/import-manifest.tsv) for the origin of every changed
+for source history, and [the import manifest](docs/inferssd/import-manifest.tsv) for the origin of every changed
 path. The `upstream` branch contains the baseline snapshot. `git diff upstream main` exposes the downstream
 changes after integration.
 
 The current tree retains the imported engine layout. Work toward v0.1.0 will separate the SSD runtime into
 `ggml/src/ggml-ssd/`, its CPU and CUDA executors into backend-specific `ssd/` directories, and the adaptive
-framework into `tools/ssdash/`. These boundaries are not yet implemented in the release candidate; the
+framework into `tools/inferssd/`. These boundaries are not yet implemented in the release candidate; the
 engine and its upstream integration are still maintained together.
 
 Support is best effort and applies to the listed models on validated hardware. The first release will qualify
@@ -73,7 +73,7 @@ separate validation.
 
 ## Models and licenses
 
-SSDash ships no model weights. Obtain the model files from their publishers and accept their licenses:
+InferSSD ships no model weights. Obtain the model files from their publishers and accept their licenses:
 
 - [DeepSeek-V4.1 Flash 1017 GGUF](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF)
   or [the original Flash GGUF](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF): MIT.
@@ -84,4 +84,4 @@ SSDash ships no model weights. Obtain the model files from their publishers and 
 The project code is distributed under [MIT](LICENSE), with third-party exceptions and attribution in
 [NOTICE](NOTICE) and the retained component licenses. Legacy K3 reference math is separately licensed and
 scheduled for removal before v0.1.0. DeepSeek, Muse, Meta, Kimi and llama.cpp are trademarks of their owners.
-SSDash is not affiliated with or endorsed by them.
+InferSSD is not affiliated with or endorsed by them.

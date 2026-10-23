@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security policy
-    url: https://github.com/wici-ai/ssdash/blob/main/SECURITY.md
+    url: https://github.com/wici-ai/inferssd/blob/main/SECURITY.md
     about: Read the private reporting policy before sharing a security issue.

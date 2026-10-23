@@ -56,7 +56,7 @@ def test_cleanup_signals_only_the_generated_scope(tmp_path):
              "PORT": "18250", "CALL_LOG": str(log)}, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     scope = result.stdout
-    assert scope.startswith("ssdash-arm-") and scope.endswith(".scope")
+    assert scope.startswith("inferssd-arm-") and scope.endswith(".scope")
     calls = log.read_text().splitlines()
     assert len(calls) == 3
     assert all(call.endswith(scope) for call in calls)

@@ -93,7 +93,7 @@
     { "name": "x64-windows-vulkan-release", "inherits": [ "base", "vulkan", "release" ] },
     {
         "name": "macos-metal",
-        "displayName": "SSDash macOS Metal",
+        "displayName": "InferSSD macOS Metal",
         "inherits": [
             "base",
             "release"
