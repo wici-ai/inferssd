@@ -93,6 +93,7 @@ def test_complete_valid_rows_summary_and_original_five_columns(tmp_path, experts
         (0, 32, 128, "F32"),
         (1, 32, 64, "F16"),
         (8, 32, 34, "Q8_0"),
+        (9, 32, 36, "Q8_1"),
         (12, 256, 144, "Q4_K"),
         (13, 256, 176, "Q5_K"),
         (14, 256, 210, "Q6_K"),
@@ -106,6 +107,29 @@ def test_native_tensor_sizes(tmp_path, type_id, inner, expected_bytes, type_name
     rows, summary = m.build_rows([path], {"up"}, 256)
     assert all(row["nbytes"] == expected_bytes and row["type"] == type_name for row in rows)
     assert summary["total_payload_bytes"] == expected_bytes * 256
+
+
+@pytest.mark.parametrize("alignment", [32, 64, 4096])
+def test_native_ordered_layout_accepts_exact_padding(tmp_path, alignment):
+    path = tmp_path / "model.gguf"
+    # Three differently sized rows force real padding between tensors.
+    offsets = [0, alignment, alignment * 2]
+    _, data = fixture(
+        path,
+        tensors=[(f"dense.{i}", (1,), 0, offset) for i, offset in enumerate(offsets)],
+        kv=[("general.alignment", 4, alignment)],
+        align=alignment,
+    )
+    header = m.read_header(path)
+    assert [tensor.offset for tensor in header.tensors] == [data + o for o in offsets]
+
+
+@pytest.mark.parametrize("offsets", [(1,), (32,), (0, 0), (0, 4), (0, 31), (0, 33), (0, 64)])
+def test_native_ordered_layout_rejects_nonzero_start_overlap_unaligned_and_gap(tmp_path, offsets):
+    path = tmp_path / "bad.gguf"
+    fixture(path, tensors=[(f"dense.{i}", (1,), 0, offset) for i, offset in enumerate(offsets)])
+    with pytest.raises(ValueError, match="expected native ordered offset"):
+        m.read_header(path)
 
 
 def test_reader_stops_before_payload_and_validates_discarded_strings(tmp_path, monkeypatch):
@@ -293,7 +317,7 @@ def test_native_split_metadata_and_nonexpert_duplicates_are_checked(tmp_path):
         m.build_rows([a, b], {"up"}, 256)
     fixture(
         a,
-        tensors=[(EXPERT, (32, 2, 256), 8, 0), ("dense", (32,), 0, 32768)],
+        tensors=[(EXPERT, (32, 2, 256), 8, 0), ("dense", (32,), 0, 17408)],
         kv=[("split.no", 2, 0), ("split.count", 2, 2), ("split.tensors.count", 5, 3)],
     )
     fixture(b, tensors=[("dense", (32,), 0, 0)], kv=[("split.no", 2, 1)])
@@ -381,7 +405,7 @@ def test_module_cli_preserves_tsv_order_and_summary(tmp_path, monkeypatch, capsy
         path,
         tensors=[
             ("blk.9.ffn_up_exps.weight", (32, 2, 256), 8, 0),
-            ("blk.2.ffn_gate_exps.weight", (32, 2, 256), 8, 32768),
+            ("blk.2.ffn_gate_exps.weight", (32, 2, 256), 8, 17408),
         ],
     )
     out, summary = tmp_path / "pending.tsv", tmp_path / "pending.json"
