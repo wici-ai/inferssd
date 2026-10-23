@@ -9,12 +9,17 @@ add_library(${TARGET} STATIC
     server-chat.h
     server-task.cpp
     server-task.h
+    inferssd/prompt-cache.cpp
+    inferssd/prompt-cache.h
+    inferssd/checkpoint.h
+    inferssd/runtime.h
     server-queue.cpp
     server-queue.h
     server-common.cpp
     server-common.h
     server-context.cpp
     server-context.h
+    server-ssd-reservation.h
     server-tools.cpp
     server-tools.h
 )

@@ -149,19 +149,7 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
 
-    if ((src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32)) {
-        const char * env = std::getenv("GGML_CUDA_CONCAT_DEBUG");
-        if (env && env[0] && env[0] != '0') {
-            std::fprintf(stderr,
-                "concat debug: dim=%d dst=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
-                "src0=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] "
-                "src1=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
-                dim,
-                dst->name, ggml_type_name(dst->type), dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                src0->name, ggml_type_name(src0->type), src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
-                src1->name, ggml_type_name(src1->type), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3]);
-        }
-    }
+
 
     GGML_ASSERT(src0->type == src1->type);
     GGML_ASSERT(src0->type == dst->type);

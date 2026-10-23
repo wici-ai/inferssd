@@ -140,7 +140,7 @@ enum llm_arch {
     LLM_ARCH_LLAMA_EMBED,
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
-    LLM_ARCH_KIMI_K3,
+    // 129 is reserved for the retired K3 architecture.
     // 130 is reserved for the retired draft architecture.
     LLM_ARCH_UNKNOWN = 131,
 };
@@ -481,14 +481,8 @@ enum llm_tensor {
     LLM_TENSOR_SSM_BETA,            // kimi: beta mixing coefficient and qwen3.5
     LLM_TENSOR_SSM_G_A,             // kimi: output gate projection A
     LLM_TENSOR_SSM_G_B,             // kimi: output gate projection B
-    LLM_TENSOR_SSM_G,               // kimi-k3: full-rank KDA gate
-    LLM_TENSOR_ATTN_RES_SCORE,       // kimi-k3: fused res_norm*res_proj (pre-attn)
-    LLM_TENSOR_FFN_RES_SCORE,        // kimi-k3: fused res_norm*res_proj (pre-ffn)
-    LLM_TENSOR_OUTPUT_RES_SCORE,     // kimi-k3: fused res_norm*res_proj (final)
-    LLM_TENSOR_FFN_ROUTED_DOWN,      // kimi-k3: latent MoE down
-    LLM_TENSOR_FFN_ROUTED_UP,        // kimi-k3: latent MoE up
-    LLM_TENSOR_FFN_ROUTED_NORM,      // kimi-k3: latent MoE norm
-    LLM_TENSOR_TIME_MIX_W0,
+    // 102-108 remain reserved for retired model tensors.
+    LLM_TENSOR_TIME_MIX_W0 = 109,
     LLM_TENSOR_TIME_MIX_W1,
     LLM_TENSOR_TIME_MIX_W2,
     LLM_TENSOR_TIME_MIX_A0,

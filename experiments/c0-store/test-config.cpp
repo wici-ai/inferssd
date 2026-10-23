@@ -1,4 +1,4 @@
-#include "../../ggml/src/ggml-ssd/store/legacy-config.h"
+#include "legacy-runtime/legacy-config.h"
 #include <stdexcept>
 
 int main() {

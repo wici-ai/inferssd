@@ -157,8 +157,8 @@ tests do not load models or constitute final benchmark data.
 
 ## Shared ownership code and deployment
 
-The native wrapper uses the same `ssdash.platform.lease` and
-`ssdash.platform.process` and `ssdash.platform.guardian` implementations as the framework. With a normal wheel
+The native wrapper uses the same `inferssd.platform.lease` and
+`inferssd.platform.process` and `inferssd.platform.guardian` implementations as the framework. With a normal wheel
 installation, the wrapper imports those modules and records their actual file
 SHA-256 identities in `native_ownership_core`. Its required ownership API is 1;
 an absent package or unsupported API fails before launch.
@@ -167,10 +167,10 @@ For standalone deployment, prepare a new bundle explicitly:
 
 ```sh
 python3 bench/bundle_native.py --output /path/to/new-wrapper-bundle \
-  --core /path/to/admitted/ssdash/platform
+  --core /path/to/admitted/inferssd/platform
 ```
 
-Use the exact `ssdash/platform` directory from the admitted source or installed
+Use the exact `inferssd/platform` directory from the admitted source or installed
 wheel. Copy the **entire** resulting directory, including `ownership/`,
 `native-core.json` and `bundle-manifest.json`, and verify every manifest member
 before an attempt. The wrapper loads that adjacent manifest automatically;

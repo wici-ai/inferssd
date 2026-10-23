@@ -124,8 +124,7 @@ static __global__ void top_k_warp_f32_i32(const float * src, int * dst, const in
 }
 
 static bool kimi_pipeline_top_k_enabled() {
-    const char * env = std::getenv("GGML_KIMI_PIPELINE_V2_TOPK");
-    return env && env[0] && env[0] != '0';
+    return false; // Frozen production profile: historical unset default.
 }
 
 bool ggml_cuda_kimi_pipeline_top_k_self_test(char * digest, size_t digest_size) {

@@ -349,9 +349,7 @@ function(ggml_add_cpu_backend_variant tag_name)
     ggml_add_cpu_backend_variant_impl(${tag_name})
 endfunction()
 
-if (LLAMA_SSD_STORE)
-    add_subdirectory(ggml-ssd/store)
-endif()
+add_subdirectory(ggml-ssd)
 
 ggml_add_backend(CPU)
 

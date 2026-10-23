@@ -25,19 +25,20 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     endif()
 
     ggml_add_backend_library(${GGML_CPU_NAME})
+    target_link_libraries(${GGML_CPU_NAME} PRIVATE ggml-ssd)
 
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
-        ggml-cpu/kimi-cpu-cache-executor.inc
-        ggml-cpu/kimi-cpu-cache-policy.cpp
-        ggml-cpu/kimi-cpu-cache-policy.h
-        ggml-cpu/kimi-cpu-sink.cpp
-        ggml-cpu/kimi-cpu-sink.h
-        ggml-cpu/kimi-cpu-sink-internal.h
-        ggml-cpu/kimi-host-ledger.h
-        ggml-cpu/kimi-cpu-prefill.cpp
-        ggml-cpu/kimi-cpu-prefill.h
+        ggml-cpu/ssd/routed-matmul.inc
+        ggml-cpu/ssd/cpu-cache-executor.inc
+        ggml-cpu/ssd/kernels.cpp
+        ggml-cpu/ssd/cpu-sink.cpp
+        ggml-cpu/ssd/cpu-sink.h
+        ggml-cpu/ssd/cpu-sink-internal.h
+        ggml-ssd/host/ledger.h
+        ggml-cpu/ssd/cpu-prefill.cpp
+        ggml-cpu/ssd/cpu-prefill.h
         ggml-cpu/repack.cpp
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
@@ -65,8 +66,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     if (APPLE)
         list(APPEND GGML_CPU_SOURCES
-            ggml-cpu/mac-expert-pack-cache.cpp
-            ggml-cpu/mac-expert-pack-cache.h)
+            ggml-cpu/ssd/mac-expert-source.cpp
+            ggml-cpu/ssd/mac-expert-source.h)
+        target_link_libraries(${GGML_CPU_NAME} PRIVATE ggml-ssd-pread)
     endif()
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)

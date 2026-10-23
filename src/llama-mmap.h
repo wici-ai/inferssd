@@ -64,12 +64,6 @@ private:
     std::unique_ptr<impl> pimpl;
 };
 
-// Internal weak bridge used by the strict-memory Kimi request path.  Returns
-// false unless tensor_name identifies a routed-expert weight and the complete
-// host range belongs to live model mappings.
-extern "C" bool llama_mmap_dontneed_expert_host_range(
-        const char * tensor_name, const void * addr, size_t size, size_t * advised_out);
-
 struct llama_mlock {
     llama_mlock();
     ~llama_mlock();

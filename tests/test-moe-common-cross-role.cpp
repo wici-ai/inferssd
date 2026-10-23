@@ -1,4 +1,4 @@
-#include "../ggml/src/ggml-cuda/moe-common-cross-role.h"
+#include "../testing/legacy-cuda/moe-common-cross-role.h"
 
 #include <array>
 #include <cstdio>

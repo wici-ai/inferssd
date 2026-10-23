@@ -1,0 +1,12 @@
+add_library(ggml-ssd-host STATIC arbiter.cpp cache-policy.cpp cache-policy.h
+    expert-cache.h expert-request.h cache-stats.h)
+target_compile_features(ggml-ssd-host PUBLIC cxx_std_17)
+target_include_directories(ggml-ssd-host PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
+find_package(Threads REQUIRED)
+target_link_libraries(ggml-ssd-host PUBLIC Threads::Threads ggml-base)
+set_target_properties(ggml-ssd-host PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if (MSVC)
+    target_compile_options(ggml-ssd-host PRIVATE /W4)
+else()
+    target_compile_options(ggml-ssd-host PRIVATE -Wall -Wextra -Wpedantic -Wshadow)
+endif()

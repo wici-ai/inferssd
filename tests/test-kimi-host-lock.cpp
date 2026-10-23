@@ -2,7 +2,7 @@
 // nothing is page-locked outside an offer in the drive's shadow; before a range of slots loses its pages every locked
 // slot of it is unlocked, a hand-off not yet taken is withdrawn and a registration in flight is waited for; a refused
 // registration leaves the slot pageable; the rent-or-buy rule.
-#include "kimi-host-lock.h"
+#include "../ggml/src/ggml-ssd/host/page-lock.h"
 
 #include <algorithm>
 #include <atomic>

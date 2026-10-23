@@ -7,12 +7,7 @@
 namespace {
 
 static bool activation_quant_reuse_enabled() {
-    static const bool enabled = []() {
-        const char * value = std::getenv("GGML_CUDA_DENSE_ACTIVATION_QUANT_REUSE");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
-            std::strcmp(value, "false") != 0;
-    }();
-    return enabled;
+    return false; // Frozen production profile: historical unset default.
 }
 
 struct activation_quant_reuse_entry {

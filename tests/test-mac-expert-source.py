@@ -47,22 +47,17 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
     content[40:40 + len(entries) * 152] = b"".join(entries)
     pack.write_bytes(content)
 
-    def run(source, cache, expected_error=None, both=False, commands=None, depth=0, alignment=1, trace=False):
+    def run(source, cache, expected_error=None, both=False, commands=None, depth=0, alignment=1, trace=False, extra_sources=()):
         global case_count
         case_count += 1
-        env = os.environ.copy()
-        env.pop("GGML_MOE_EXPERT_GGUF_ALIAS_TSV", None)
-        env.pop("SSD_LLAMA_MAC_EXPERT_PACK", None)
-        env.pop("SSD_LLAMA_MAC_EXPERT_TRACE", None)
-        env["SSD_LLAMA_MAC_EXPERT_CACHE_MIB"] = str(cache)
-        env["SSD_LLAMA_MAC_EXPERT_READ_AHEAD"] = str(depth)
-        env["SSD_LLAMA_MAC_EXPERT_READ_ALIGNMENT"] = str(alignment)
+        controls = ["--source", str(source), "--cache-mib", str(cache), "--depth", str(depth), "--alignment", str(alignment)]
         if depth == 4 or trace:
-            env["SSD_LLAMA_MAC_EXPERT_TRACE"] = str(root / "trace.txt")
-        env["GGML_MOE_EXPERT_GGUF_ALIAS_TSV" if source.suffix == ".tsv" else "SSD_LLAMA_MAC_EXPERT_PACK"] = str(source)
+            controls.extend(("--trace", str(root / "trace.txt")))
         if both:
-            env["SSD_LLAMA_MAC_EXPERT_PACK"] = str(pack)
-        result = subprocess.run([str(binary), *(commands if commands is not None else args + args)], env=env, text=True, capture_output=True, timeout=60)
+            controls.extend(("--source", str(pack)))
+        for extra in extra_sources:
+            controls.extend(("--source", str(extra)))
+        result = subprocess.run([str(binary), *controls, "--", *(commands if commands is not None else args + args)], text=True, capture_output=True, timeout=60)
         if expected_error:
             assert result.returncode != 0 and expected_error in result.stderr, (source, result.returncode, result.stderr)
         else:
@@ -89,7 +84,16 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
                         commands=["--prefill"] + args + ["--decode"] + args + ["--prefill"] + args + ["--decode"] + args)
             assert mixed["decode_hits"] == reference["decode_hits"] and mixed["evictions"] == reference["evictions"], (source, depth, mixed, reference)
     if not prefill_only:
+        first_index, second_index = root / "first.tsv", root / "second.tsv"
+        first_index.write_text(header + "".join(rows[:2]))
+        second_index.write_text(header + "".join(rows[2:]))
+        for depth in (0, 2):
+            assert run(first_index, 2, depth=depth, extra_sources=(second_index,)) == run(alias, 2, depth=depth)
         run(alias, 24576)
+        for depth in (5, 18446744073709551615):
+            run(alias, 1, "invalid explicit Mac", depth=depth)
+        for alignment in (0, 3):
+            run(alias, 1, "invalid explicit Mac", alignment=alignment)
         for invalid in (-1, " 1", "1x", 18446744073709551615):
             run(alias, invalid, "CACHE_MIB must be")
         bad = root / "bad.tsv"
@@ -102,14 +106,14 @@ with tempfile.TemporaryDirectory(prefix="mac-expert-source-") as directory:
         ]:
             bad.write_text(body)
             run(bad, 1, message)
-        run(alias, 1, "select one expert source", both=True)
+        run(alias, 1, "duplicate", both=True)
         fifo = root / "fifo.gguf"
         os.mkfifo(fifo)
         bad.write_text(header + f"{names[0]}\t0\t614401\t{fifo}\t0\n")
         run(bad, 1, "expert source must be a regular file")
         fifo_index = root / "fifo.tsv"
         os.mkfifo(fifo_index)
-        run(fifo_index, 1, "alias index must be a regular file")
+        run(fifo_index, 1, "expert source must be a regular file")
         for alignment in (1, 4096, 16384):
             for depth in (0, 2):
                 shards[1][0].write_bytes(shards[1][1])

@@ -55,6 +55,7 @@ set(TARGET llama-common)
 
 add_library(${TARGET}
     arg.cpp
+    inferssd/options.cpp
     arg.h
     base64.hpp
     chat-auto-parser-generator.cpp
@@ -95,7 +96,11 @@ add_library(${TARGET}
     preset.cpp
     preset.h
     regex-partial.cpp
-    reasoning-budget.cpp
+    inferssd/chat-source.cpp
+    inferssd/chat-templates.cpp
+    inferssd/chat-templates.h
+    inferssd/reasoning-budget.cpp
+    inferssd/reasoning-budget.h
     reasoning-budget.h
     regex-partial.h
     sampling.cpp

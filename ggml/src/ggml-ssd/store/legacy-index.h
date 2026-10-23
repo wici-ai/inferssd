@@ -1,5 +1,5 @@
 #pragma once
-// Immutable index view used by the parser tests and portable initializer.
+// Explicit immutable parsed index shared by typed source_index and parser tests.
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
@@ -70,8 +70,8 @@ public:
         return true;
     }
     // Borrowed descriptor, valid until this index is destroyed; never close it.
-    // This experiment exposes buffered handles for file-identity tests. The
-    // production raw-direct adapter must separately require O_DIRECT on Linux.
+    // Buffered handles support file-identity tests. Typed source_index separately
+    // requires O_DIRECT on Linux before publishing a source view.
     int borrowed_fd(int source_id) const {
         if (source_id < 0 || size_t(source_id) >= state_->sources.size()) { return -1; }
         return ::fileno(state_->sources[size_t(source_id)].file);

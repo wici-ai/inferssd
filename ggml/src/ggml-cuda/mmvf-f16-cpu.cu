@@ -11,12 +11,7 @@ namespace {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 static bool dense_cpu_semantics_enabled() {
-    static const bool enabled = []() {
-        const char * value = std::getenv("GGML_CUDA_DENSE_Q8_K");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
-            std::strcmp(value, "false") != 0;
-    }();
-    return enabled;
+    return false; // Frozen production profile: historical unset default.
 }
 
 static __device__ __forceinline__ float add_rn(float a, float b) {

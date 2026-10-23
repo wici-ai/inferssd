@@ -248,22 +248,6 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch
-            if (moe_next_gate_shadow_enabled() &&
-                    il + 1 < n_layer &&
-                    (uint32_t) (il + 1) >= hparams.n_layer_dense_lead) {
-                const auto & next_layer = model.layers[il + 1];
-                build_moe_gate_topk_shadow(cur,
-                    next_layer.ffn_gate_inp,
-                    nullptr,
-                    next_layer.ffn_exp_probs_b,
-                    hparams.n_expert,
-                    hparams.n_expert_used,
-                    (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il,
-                    il + 1,
-                    true);
-            }
-
             ggml_tensor * moe_out = build_moe_ffn(cur,
                 model.layers[il].ffn_gate_inp,
                 model.layers[il].ffn_up_exps,

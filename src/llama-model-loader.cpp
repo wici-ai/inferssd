@@ -1,4 +1,5 @@
 #include "llama-model-loader.h"
+#include "ssd/model-source.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -25,134 +26,6 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
-static std::string llama_cgroup_v2_path() {
-#if defined(__linux__)
-    std::ifstream f("/proc/self/cgroup");
-    std::string line;
-    while (std::getline(f, line)) {
-        if (line.rfind("0::", 0) == 0) {
-            const std::string rel = line.substr(3);
-            if (rel.empty() || rel == "/") {
-                return "/sys/fs/cgroup";
-            }
-            return "/sys/fs/cgroup" + rel;
-        }
-    }
-#endif
-    return {};
-}
-
-static uint64_t llama_read_uint64_file(const std::string & path) {
-    std::ifstream f(path);
-    uint64_t value = 0;
-    f >> value;
-    return value;
-}
-
-static uint64_t llama_read_memory_stat_key(const std::string & path, const char * key) {
-    std::ifstream f(path);
-    std::string name;
-    uint64_t value = 0;
-    while (f >> name >> value) {
-        if (name == key) {
-            return value;
-        }
-    }
-    return 0;
-}
-
-static void llama_log_cgroup_memory_snapshot(const char * label) {
-    const std::string cg = llama_cgroup_v2_path();
-    if (cg.empty()) {
-        return;
-    }
-    const uint64_t current = llama_read_uint64_file(cg + "/memory.current");
-    const uint64_t file = llama_read_memory_stat_key(cg + "/memory.stat", "file");
-    const uint64_t anon = llama_read_memory_stat_key(cg + "/memory.stat", "anon");
-    const uint64_t inactive_file = llama_read_memory_stat_key(cg + "/memory.stat", "inactive_file");
-    const uint64_t active_file = llama_read_memory_stat_key(cg + "/memory.stat", "active_file");
-    LLAMA_LOG_INFO(
-        "llama_cgroup_memory_snapshot: label=%s current=%" PRIu64
-        " file=%" PRIu64 " anon=%" PRIu64
-        " inactive_file=%" PRIu64 " active_file=%" PRIu64 "\n",
-        label ? label : "",
-        current,
-        file,
-        anon,
-        inactive_file,
-        active_file);
-}
-
-static bool llama_deepseek4_hc_weight_alias_enabled() {
-    const char * env = std::getenv("LLAMA_DEEPSEEK4_HC_WEIGHT_ALIAS");
-    const char * env_4expert = std::getenv("LLAMA_DEEPSEEK4_4EXPERT_TENSOR_ALIAS");
-    return (env && env[0] && env[0] != '0') || (env_4expert && env_4expert[0] && env_4expert[0] != '0');
-}
-
-static std::string llama_deepseek4_hc_weight_alias(const char * name) {
-    const std::string tensor_name(name);
-    if (tensor_name == "hc_head_base") {
-        return "output_hc_base.weight";
-    }
-    if (tensor_name == "hc_head_fn") {
-        return "output_hc_fn.weight";
-    }
-    if (tensor_name == "hc_head_scale") {
-        return "output_hc_scale.weight";
-    }
-    if (tensor_name.rfind("blk.", 0) == 0 &&
-            (tensor_name.find(".hc_attn_base")  != std::string::npos ||
-             tensor_name.find(".hc_attn_fn")    != std::string::npos ||
-             tensor_name.find(".hc_attn_scale") != std::string::npos ||
-             tensor_name.find(".hc_ffn_base")   != std::string::npos ||
-             tensor_name.find(".hc_ffn_fn")     != std::string::npos ||
-             tensor_name.find(".hc_ffn_scale")  != std::string::npos)) {
-        return tensor_name + ".weight";
-    }
-    return {};
-}
-
-static bool llama_deepseek4_4expert_tensor_alias_enabled() {
-    const char * env = std::getenv("LLAMA_DEEPSEEK4_4EXPERT_TENSOR_ALIAS");
-    return env && env[0] && env[0] != '0';
-}
-
-static std::string llama_deepseek4_4expert_tensor_alias(const char * name) {
-    const std::string tensor_name(name);
-    const std::string from = ".attn_kv_latent.weight";
-    const size_t pos = tensor_name.find(from);
-    if (tensor_name.rfind("blk.", 0) == 0 && pos != std::string::npos) {
-        std::string alias = tensor_name;
-        alias.replace(pos, from.size(), ".attn_kv.weight");
-        return alias;
-    }
-    for (const auto & item : {
-            std::make_pair(std::string(".exp_probs_b"),              std::string(".exp_probs_b.bias")),
-            std::make_pair(std::string(".attn_compress_ape"),        std::string(".attn_compressor_ape.weight")),
-            std::make_pair(std::string(".attn_compress_kv.weight"),  std::string(".attn_compressor_kv.weight")),
-            std::make_pair(std::string(".attn_compress_gate.weight"),std::string(".attn_compressor_gate.weight")),
-            std::make_pair(std::string(".attn_compress_norm.weight"),std::string(".attn_compressor_norm.weight")),
-            std::make_pair(std::string(".indexer.compress_ape"),        std::string(".indexer_compressor_ape.weight")),
-            std::make_pair(std::string(".indexer.compress_kv.weight"),  std::string(".indexer_compressor_kv.weight")),
-            std::make_pair(std::string(".indexer.compress_gate.weight"),std::string(".indexer_compressor_gate.weight")),
-            std::make_pair(std::string(".indexer.compress_norm.weight"),std::string(".indexer_compressor_norm.weight")),
-        }) {
-        const size_t alias_pos = tensor_name.find(item.first);
-        if (tensor_name.rfind("blk.", 0) == 0 && alias_pos != std::string::npos) {
-            std::string alias = tensor_name;
-            alias.replace(alias_pos, item.first.size(), item.second);
-            return alias;
-        }
-    }
-    if (tensor_name.rfind("blk.", 0) == 0 && tensor_name.find(".weight") == std::string::npos) {
-        return tensor_name + ".weight";
-    }
-    return {};
-}
-
-// antirez's Q2 conversion uses explicit norm/KV names for the three Engram
-// tensors. The architecture names stay canonical; only missing canonical names
-// fall back to these exact aliases.
 static std::string llama_deepseek41_engram_tensor_alias(const char * name) {
     const std::string tensor_name(name);
     for (const auto & item : {
@@ -310,81 +183,10 @@ namespace GGUFMeta {
         GKV() = delete;
 
         public:
-        static bool allow_u64_to_u32_metadata() {
-            const char * env = std::getenv("LLAMA_GGUF_ALLOW_U64_TO_U32");
-            return env && env[0] && env[0] != '0';
-        }
-
-        static bool allow_f64_to_f32_metadata() {
-            const char * env = std::getenv("LLAMA_GGUF_ALLOW_F64_TO_F32");
-            return env && env[0] && env[0] != '0';
-        }
-
-        template<typename U = T>
-        static typename std::enable_if<std::is_integral<U>::value && !std::is_same<U, bool>::value, bool>::type
-        try_get_compatible_integer(const gguf_context * ctx, const int k, const enum gguf_type kt, U & out) {
-            if (!allow_u64_to_u32_metadata()) {
-                return false;
-            }
-            if (kt == GGUF_TYPE_UINT64) {
-                const uint64_t value = gguf_get_val_u64(ctx, k);
-                if (value > uint64_t(std::numeric_limits<U>::max())) {
-                    throw std::runtime_error(format("key %s value %" PRIu64 " overflows expected type %s",
-                        gguf_get_key(ctx, k), value, gguf_type_name(GKV::gt)));
-                }
-                out = U(value);
-                return true;
-            }
-            if (kt == GGUF_TYPE_INT64) {
-                const int64_t value = gguf_get_val_i64(ctx, k);
-                if (value < int64_t(std::numeric_limits<U>::min()) || value > int64_t(std::numeric_limits<U>::max())) {
-                    throw std::runtime_error(format("key %s value %" PRId64 " overflows expected type %s",
-                        gguf_get_key(ctx, k), value, gguf_type_name(GKV::gt)));
-                }
-                out = U(value);
-                return true;
-            }
-            return false;
-        }
-
-        template<typename U = T>
-        static typename std::enable_if<!std::is_integral<U>::value || std::is_same<U, bool>::value, bool>::type
-        try_get_compatible_integer(const gguf_context *, const int, const enum gguf_type, U &) {
-            return false;
-        }
-
-        template<typename U = T>
-        static typename std::enable_if<std::is_same<U, float>::value, bool>::type
-        try_get_compatible_float(const gguf_context * ctx, const int k, const enum gguf_type kt, U & out) {
-            if (!allow_f64_to_f32_metadata() || kt != GGUF_TYPE_FLOAT64) {
-                return false;
-            }
-            const double value = gguf_get_val_f64(ctx, k);
-            if (!std::isfinite(value) || value < -double(std::numeric_limits<U>::max()) || value > double(std::numeric_limits<U>::max())) {
-                throw std::runtime_error(format("key %s value %.17g cannot be represented as expected type %s",
-                    gguf_get_key(ctx, k), value, gguf_type_name(GKV::gt)));
-            }
-            out = U(value);
-            return true;
-        }
-
-        template<typename U = T>
-        static typename std::enable_if<!std::is_same<U, float>::value, bool>::type
-        try_get_compatible_float(const gguf_context *, const int, const enum gguf_type, U &) {
-            return false;
-        }
-
         static T get_kv(const gguf_context * ctx, const int k) {
             const enum gguf_type kt = gguf_get_kv_type(ctx, k);
 
             if (kt != GKV::gt) {
-                T compatible_value{};
-                if (try_get_compatible_integer(ctx, k, kt, compatible_value)) {
-                    return compatible_value;
-                }
-                if (try_get_compatible_float(ctx, k, kt, compatible_value)) {
-                    return compatible_value;
-                }
                 throw std::runtime_error(format("key %s has wrong type %s but expected type %s",
                     gguf_get_key(ctx, k), gguf_type_name(kt), gguf_type_name(GKV::gt)));
             }
@@ -1056,186 +858,6 @@ llama_model_loader::llama_model_loader(
     this->no_alloc = no_alloc;
 }
 
-static void llama_coalesce_ranges(std::vector<llama_file_range> & ranges) {
-    if (ranges.empty()) {
-        return;
-    }
-
-    std::sort(ranges.begin(), ranges.end(), [] (const llama_file_range & a, const llama_file_range & b) {
-        return a.first < b.first || (a.first == b.first && a.last < b.last);
-    });
-
-    std::vector<llama_file_range> merged;
-    merged.reserve(ranges.size());
-    for (const auto & range : ranges) {
-        if (range.first >= range.last) {
-            continue;
-        }
-        if (merged.empty() || range.first > merged.back().last) {
-            merged.push_back(range);
-        } else {
-            merged.back().last = std::max(merged.back().last, range.last);
-        }
-    }
-    ranges = std::move(merged);
-}
-
-static bool llama_is_expert_tensor_name(const std::string & name, uint32_t & layer) {
-    int parsed_layer = -1;
-    if (sscanf(name.c_str(), "blk.%d.", &parsed_layer) != 1 || parsed_layer < 0) {
-        return false;
-    }
-
-    static const std::regex expert_re(R"(^blk\.([0-9]+)\.ffn_(up|down|gate|gate_up)_(ch)?exps\.)");
-    if (!std::regex_search(name, expert_re)) {
-        return false;
-    }
-
-    layer = (uint32_t) parsed_layer;
-    return true;
-}
-
-void llama_model_loader::build_expert_tensor_index(const llama_hparams & hparams) {
-    expert_tensor_index = {};
-
-    if (hparams.n_layer == 0 || hparams.n_expert == 0 || files.empty()) {
-        return;
-    }
-
-    expert_tensor_index.file_ranges.resize(files.size());
-
-    size_t deferred_bytes = 0;
-    for (const auto & it : weights_map) {
-        const std::string & name = it.first;
-        const llama_tensor_weight & weight = it.second;
-
-        uint32_t layer = 0;
-        if (!llama_is_expert_tensor_name(name, layer)) {
-            continue;
-        }
-        if (layer >= hparams.n_layer) {
-            throw std::runtime_error(format("expert tensor '%s' has invalid layer index %u", name.c_str(), layer));
-        }
-        if (weight.idx >= expert_tensor_index.file_ranges.size()) {
-            throw std::runtime_error(format("expert tensor '%s' has invalid file index %u", name.c_str(), (unsigned) weight.idx));
-        }
-
-        const size_t tensor_bytes = ggml_nbytes(weight.tensor);
-        deferred_bytes += tensor_bytes;
-        expert_tensor_index.file_ranges[weight.idx].push_back({ weight.offs, weight.offs + tensor_bytes });
-    }
-
-    for (auto & ranges : expert_tensor_index.file_ranges) {
-        llama_coalesce_ranges(ranges);
-    }
-
-    expert_tensor_index.deferred_bytes = deferred_bytes;
-    expert_tensor_index.dense_bytes = n_bytes > deferred_bytes ? n_bytes - deferred_bytes : 0;
-}
-
-bool llama_model_loader::should_defer_expert_mmaps() const {
-    return defer_experts && use_mmap && !no_alloc && !expert_tensor_index.empty();
-}
-
-void llama_model_loader::drop_mmap_expert_pages() const {
-    if (!use_mmap || mappings.empty() || expert_tensor_index.file_ranges.empty()) {
-        return;
-    }
-
-    const size_t n_range_sets = std::min(mappings.size(), expert_tensor_index.file_ranges.size());
-    for (size_t idx = 0; idx < n_range_sets; ++idx) {
-        for (const auto & range : expert_tensor_index.file_ranges[idx]) {
-            mappings[idx]->dontneed_fragment(range.first, range.last);
-        }
-    }
-}
-
-void llama_model_loader::drop_mmap_used_pages_after_load() const {
-    const char * env = std::getenv("LLAMA_DROP_MMAP_AFTER_LOAD");
-    if (!env || !env[0] || env[0] == '0') {
-        return;
-    }
-    if (!use_mmap || mappings.empty() || mmaps_used.empty()) {
-        return;
-    }
-
-    llama_log_cgroup_memory_snapshot("before_load_end_mmap_dontneed");
-    const int64_t t_start_us = ggml_time_us();
-    size_t total_bytes = 0;
-    size_t total_ranges = 0;
-    size_t total_failures = 0;
-    size_t expert_bytes = 0;
-    size_t expert_ranges = 0;
-    size_t dense_bytes = 0;
-    size_t dense_ranges = 0;
-
-    auto drop_one = [&](size_t idx, size_t first, size_t last, bool expert) {
-        if (idx >= mappings.size() || !mappings[idx] || last <= first) {
-            return;
-        }
-        size_t len = 0;
-        const bool ok = mappings[idx]->dontneed_fragment(first, last, &len);
-        total_bytes += len;
-        ++total_ranges;
-        if (!ok) {
-            ++total_failures;
-        }
-        if (expert) {
-            expert_bytes += len;
-            ++expert_ranges;
-        } else {
-            dense_bytes += len;
-            ++dense_ranges;
-        }
-    };
-
-    const size_t n = std::min(mappings.size(), mmaps_used.size());
-    for (size_t idx = 0; idx < n; ++idx) {
-        const auto & used = mmaps_used[idx];
-        if (used.second <= used.first) {
-            continue;
-        }
-
-        size_t cursor = used.first;
-        const auto * ranges = idx < expert_tensor_index.file_ranges.size() ?
-            &expert_tensor_index.file_ranges[idx] : nullptr;
-
-        if (ranges) {
-            for (const auto & range : *ranges) {
-                if (range.last <= used.first || range.first >= used.second) {
-                    continue;
-                }
-                const size_t expert_first = std::max(range.first, used.first);
-                const size_t expert_last  = std::min(range.last, used.second);
-                if (cursor < expert_first) {
-                    drop_one(idx, cursor, expert_first, false);
-                }
-                drop_one(idx, expert_first, expert_last, true);
-                cursor = std::max(cursor, expert_last);
-            }
-        }
-
-        if (cursor < used.second) {
-            drop_one(idx, cursor, used.second, false);
-        }
-    }
-
-    const int64_t t_end_us = ggml_time_us();
-    LLAMA_LOG_INFO(
-        "%s: load-end mmap dontneed bytes=%.2f MiB ranges=%zu failures=%zu "
-        "expert=%.2f MiB/%zu dense=%.2f MiB/%zu wall_ms=%.3f\n",
-        __func__,
-        total_bytes / 1024.0 / 1024.0,
-        total_ranges,
-        total_failures,
-        expert_bytes / 1024.0 / 1024.0,
-        expert_ranges,
-        dense_bytes / 1024.0 / 1024.0,
-        dense_ranges,
-        (double)(t_end_us - t_start_us) / 1000.0);
-    llama_log_cgroup_memory_snapshot("after_load_end_mmap_dontneed");
-}
-
 std::string llama_model_loader::get_arch_name() const {
     return arch_name;
 }
@@ -1269,18 +891,7 @@ struct ggml_tensor * llama_model_loader::get_tensor_meta(const char * name) cons
             weight = get_weight(alias.c_str());
         }
     }
-    if (!weight && llama_deepseek4_4expert_tensor_alias_enabled()) {
-        const std::string alias = llama_deepseek4_4expert_tensor_alias(name);
-        if (!alias.empty()) {
-            weight = get_weight(alias.c_str());
-        }
-    }
-    if (!weight && llama_deepseek4_hc_weight_alias_enabled()) {
-        const std::string alias = llama_deepseek4_hc_weight_alias(name);
-        if (!alias.empty()) {
-            weight = get_weight(alias.c_str());
-        }
-    }
+
     if (!weight) {
         return nullptr;
     }
@@ -1765,17 +1376,6 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
 
 void llama_model_loader::done_getting_tensors() const {
     if (n_created != n_tensors) {
-        const char * dump_env = std::getenv("LLAMA_DUMP_UNCREATED_TENSORS");
-        if (dump_env && dump_env[0] && dump_env[0] != '0') {
-            int missing = 0;
-            for (const auto & it : weights_map) {
-                if (created_tensor_names.find(it.first) == created_tensor_names.end()) {
-                    std::fprintf(stderr, "%s: uncreated tensor[%d]: %s\n", __func__, missing, it.first.c_str());
-                    missing++;
-                }
-            }
-            std::fprintf(stderr, "%s: uncreated tensor count = %d\n", __func__, missing);
-        }
         throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
     }
     if (n_tensors_moved > 0) {
@@ -1787,13 +1387,8 @@ void llama_model_loader::done_getting_tensors() const {
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
 #if defined(__APPLE__)
-    // SSD-backed models can be much larger than unified memory. Allow the
-    // macOS profile to fault in only the pages that inference actually uses.
-    const char * mmap_prefetch = std::getenv("LLAMA_MMAP_PREFETCH");
-    if (mmap_prefetch && std::strcmp(mmap_prefetch, "0") == 0) {
-        prefetch = false;
-        LLAMA_LOG_INFO("%s: mmap prefetch disabled by LLAMA_MMAP_PREFETCH=0\n", __func__);
-    }
+    // Deferred expert mappings can exceed unified memory by an order of magnitude.
+    if (defer_experts) { prefetch = false; }
 #endif
     if (use_mmap) {
         mappings.reserve(files.size());
@@ -1881,19 +1476,14 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
-    const bool drop_mmap_tensor_after_upload = []() {
-        const char * env = std::getenv("LLAMA_DROP_MMAP_TENSOR_AFTER_UPLOAD");
-        return env && env[0] && env[0] != '0';
-    }();
+    constexpr bool drop_mmap_tensor_after_upload = false;
     size_t mmap_upload_advised_bytes = 0;
     size_t mmap_upload_drop_ranges = 0;
     size_t mmap_upload_drop_failures = 0;
 
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
-    const char * drop_gpu_dense_env = std::getenv("LLAMA_DROP_DENSE_MMAP_CACHE");
-    const bool drop_gpu_dense_sources = use_mmap && drop_gpu_dense_env &&
-        drop_gpu_dense_env[0] && drop_gpu_dense_env[0] != '0';
+    const bool drop_gpu_dense_sources = should_defer_expert_mmaps();
     std::vector<std::vector<llama_file_range>> gpu_dense_ranges(
         drop_gpu_dense_sources ? mappings.size() : 0);
 

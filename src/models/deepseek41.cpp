@@ -137,69 +137,12 @@ dsv41_state_tensors dsv41_build_state_snapshot(
     return { kv, score };
 }
 
-// LLAMA_DSV41_ENGRAM_PREFETCH=1: once a step's engram rows are known (set_input, before the graph
-// runs), ask the kernel to read their table pages ahead. The tables are mmap-backed and far larger
-// than the page cache, so otherwise the CPU get_rows at an engram layer takes one synchronous disk
-// fault per row while the rest of the step waits. Only I/O timing changes; the lookup is the same
-// get_rows on the same bytes.
-bool dsv41_engram_prefetch_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("LLAMA_DSV41_ENGRAM_PREFETCH");
-        const bool on = value && std::strcmp(value, "1") == 0;
-        if (on) {
-            LLAMA_LOG_INFO("%s: engram row prefetch enabled\n", __func__);
-        }
-        return on;
-    }();
-    return enabled;
-}
-
-// Layers between index sources attend to the positions their source picked, as the reference does (vLLM
-// deepseek_v41 publishes them in a shared top-k buffer). LLAMA_DSV41_TOPK_REUSE=0 makes those layers attend
-// to every visible compressed position instead, which is what this runtime did before.
-static bool dsv41_top_k_reuse_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("LLAMA_DSV41_TOPK_REUSE");
-        const bool on = !(value && std::strcmp(value, "0") == 0);
-        LLAMA_LOG_INFO("%s: reader layers %s their index source's top-k\n", __func__, on ? "reuse" : "do not reuse");
-        return on;
-    }();
-    return enabled;
-}
-
 // The reference narrows the index sources after layer 20 to the candidate blocks of layer 20 (vLLM
 // deepseek_v41 config: candidate_source_layer_id 20, candidate_topk_blocks 2048, candidate_block_size 8).
 // The GGUF does not carry these keys. LLAMA_DSV41_CANDIDATE=0 turns the filter off.
 static constexpr int32_t DSV41_CANDIDATE_SOURCE      = 20;
 static constexpr int64_t DSV41_CANDIDATE_TOPK_BLOCKS = 2048;
 static constexpr int64_t DSV41_CANDIDATE_BLOCK_SIZE  = 8;
-
-static bool dsv41_candidate_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("LLAMA_DSV41_CANDIDATE");
-        const bool on = !(value && std::strcmp(value, "0") == 0);
-        LLAMA_LOG_INFO("%s: two-level candidate filter %s\n", __func__, on ? "enabled" : "disabled");
-        return on;
-    }();
-    return enabled;
-}
-
-// GGML_KIMI_CPU_SINK_PREFETCH=k: the CPU sink reads the k experts the next layer is predicted to select ahead
-// of its router (see kimi-cpu-sink.cpp). The graph supplies the prediction.
-// LLAMA_DSV41_HC_FUSED=0 builds the hyper-connection mixing from plain ggml ops as the reference writes it:
-// about 190 GPU kernels per sublayer at decode, each on 4 or 16 floats, most of them in the 20 Sinkhorn
-// iterations. By default the pre collapse, the Sinkhorn comb and the post expansion each run as one op
-// (hc_weighted_sum, dsv4_hc_comb, dsv4_hc_post). The arithmetic is the same, but the fused kernels
-// accumulate sums in a different order, so activations differ in the low bits.
-bool dsv41_hc_fused_enabled() {
-    static const bool enabled = [] {
-        const char * value = std::getenv("LLAMA_DSV41_HC_FUSED");
-        const bool on = !(value && std::strcmp(value, "0") == 0);
-        LLAMA_LOG_INFO("%s: fused hyper-connection ops %s\n", __func__, on ? "enabled" : "disabled");
-        return on;
-    }();
-    return enabled;
-}
 
 void dsv41_engram_prefetch_rows(const ggml_tensor * table, const std::vector<int32_t> & rows) {
 #ifdef __linux__
@@ -260,7 +203,7 @@ class llm_graph_input_engram : public llm_graph_input_i {
 public:
     llm_graph_input_engram(const llama_model & model,
                            const llama_kv_cache_dsv4_raw_context * mctx,
-                           int eg) : model(model), mctx(mctx), eg(eg) {}
+                           int eg, bool prefetch) : model(model), mctx(mctx), eg(eg), prefetch(prefetch) {}
     virtual ~llm_graph_input_engram() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -280,6 +223,7 @@ public:
 
     // which engram layer this is, so the right multipliers and buckets are used
     const int eg;
+    const bool prefetch;
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
@@ -344,7 +288,7 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    if (dsv41_engram_prefetch_enabled()) {
+    if (prefetch) {
         dsv41_engram_prefetch_rows(model.layers[hp.engram_layer_ids[eg]].engram_embd, idx);
     }
 
@@ -374,7 +318,7 @@ ggml_tensor * llm_build_deepseek41::build_hc_pre(
     GGML_ASSERT(x->ne[0] == n_embd);
     GGML_ASSERT(x->ne[1] == hparams.dsv4_hc_mult);
 
-    if (dsv41_hc_fused_enabled()) {
+    if (cparams.ssd_hc_fused) {
         return ggml_hc_weighted_sum(ctx0, x, weights);
     }
 
@@ -470,7 +414,7 @@ void llm_build_deepseek41::build_hc_mixes(
     *post = ggml_scale(ctx0, *post, 2.0f);
     cb(*post, "hc_post", il);
 
-    if (dsv41_hc_fused_enabled()) {
+    if (cparams.ssd_hc_fused) {
         *comb = ggml_dsv4_hc_comb(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
                 (int32_t) hparams.dsv4_hc_sinkhorn_iters);
     } else {
@@ -495,7 +439,7 @@ ggml_tensor * llm_build_deepseek41::build_hc_post(
     GGML_ASSERT(x->ne[0] == n_embd);
     GGML_ASSERT(residual->ne[1] == hparams.dsv4_hc_mult);
 
-    if (dsv41_hc_fused_enabled()) {
+    if (cparams.ssd_hc_fused) {
         return ggml_dsv4_hc_post(ctx0, x, residual, post, comb);
     }
 
@@ -527,7 +471,7 @@ ggml_tensor * llm_build_deepseek41::build_inp_engram(int il) {
 
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
 
-    auto inp = std::make_unique<llm_graph_input_engram>(model, mctx_cur->get_raw(), model.engram_index(il));
+    auto inp = std::make_unique<llm_graph_input_engram>(model, mctx_cur->get_raw(), model.engram_index(il), cparams.ssd_engram_prefetch);
 
     inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
     ggml_set_input(inp->rows);
@@ -773,18 +717,7 @@ ggml_tensor * llm_build_deepseek41::build_attention_tail(
 // its permuted copy). Size tiles for the largest compressed width in the current reserve horizon,
 // so the reserve graph also covers shorter contexts in the same phase.
 static int64_t dsv41_indexer_tile_tokens(int64_t n_comp, int64_t n_idx_head, int64_t n_tokens) {
-    static const int64_t budget = [] {
-        const char * value = std::getenv("LLAMA_DSV41_INDEXER_TILE_MIB");
-        if (value == nullptr || value[0] == '\0') {
-            return int64_t(256) << 20;
-        }
-        char * end = nullptr;
-        const long long mib = std::strtoll(value, &end, 10);
-        if (end == value || *end != '\0' || mib < 1 || mib > (1 << 20)) {
-            throw std::runtime_error("LLAMA_DSV41_INDEXER_TILE_MIB must be a positive number of MiB");
-        }
-        return int64_t(mib) << 20;
-    }();
+    constexpr int64_t budget = int64_t(256) << 20;
     const int64_t per_token = 2*n_comp*n_idx_head*int64_t(sizeof(float));
     const int64_t fit = budget/std::max<int64_t>(per_token, 1);
     if (fit >= n_tokens) {
@@ -853,7 +786,7 @@ ggml_tensor * llm_build_deepseek41::build_indexer_mask(
     *n_top_k_out = n_top_k;
 
     // below topk_blocks*block_size rows every block is a candidate and the filter changes nothing
-    const bool candidate = dsv41_candidate_enabled() && n_stream == 1 &&
+    const bool candidate = n_stream == 1 &&
         il >= DSV41_CANDIDATE_SOURCE && DSV41_CANDIDATE_SOURCE < int32_t(n_layer) &&
         hparams.dsv41_is_index_source(DSV41_CANDIDATE_SOURCE) &&
         hparams.dsv4_compress_ratios[il] == hparams.dsv4_compress_ratios[DSV41_CANDIDATE_SOURCE] &&
@@ -915,15 +848,9 @@ ggml_tensor * llm_build_deepseek41::build_indexer_mask(
         return top_k;
     };
 
-    static const bool tile_horizon = [] {
-        const char * value = std::getenv("LLAMA_DSV41_INDEXER_TILE_HORIZON");
-        return value == nullptr || std::strcmp(value, "0") != 0;
-    }();
     const int64_t ratio = hparams.dsv4_compress_ratios[il];
     const int64_t max_comp = GGML_PAD((n_ctx_reserve + ratio - 1)/ratio, 256);
-    const int64_t n_comp_tile = tile_horizon
-        ? std::max<int64_t>(n_comp, std::min<int64_t>(n_comp_capacity, max_comp))
-        : n_comp;
+    const int64_t n_comp_tile = std::max<int64_t>(n_comp, std::min<int64_t>(n_comp_capacity, max_comp));
     const int64_t n_tile = n_stream == 1 ? dsv41_indexer_tile_tokens(n_comp_tile, n_idx_head, nt) : nt;
     // the source's scores are complete once its last tile is scheduled; its readers take the candidates from here
     auto pick_candidates = [&]() {
@@ -1126,7 +1053,7 @@ ggml_tensor * llm_build_deepseek41::build_attention_v41(
         top_k_mask = build_indexer_mask(inp_dsv4, inp_comp, qr, cur, inp_pos, &n_top_k, il);
         top_k_masks[il]  = top_k_mask;
         top_k_counts[il] = n_top_k;
-    } else if (dsv41_top_k_reuse_enabled() && hparams.dsv41_topk_source[il] >= 0) {
+    } else if (hparams.dsv41_topk_source[il] >= 0) {
         // the positions of a source's selection are rows of its compressed stream, so a reader may only take
         // them when it reads a stream of the same ratio from the same KV source
         const int32_t source = hparams.dsv41_topk_source[il];

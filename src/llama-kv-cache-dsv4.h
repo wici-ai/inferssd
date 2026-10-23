@@ -238,6 +238,9 @@ public:
 
     bool next() override;
     bool apply() override;
+    bool save_precompute() override;
+    bool restore_precompute() noexcept override;
+    void discard_precompute() noexcept override;
 
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
@@ -262,6 +265,7 @@ private:
     size_t i_next = 0;
 
     llama_kv_cache * kv_swa = nullptr;
+    std::unique_ptr<llama_kv_cache::metadata_undo> precompute_swa;
 
     slot_info_vec_t sinfos_write;
     slot_info_vec_t sinfos_read;
@@ -395,6 +399,9 @@ public:
 
     bool next()  override;
     bool apply() override;
+    bool save_precompute() override;
+    bool restore_precompute() noexcept override;
+    void discard_precompute() noexcept override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;

@@ -42,6 +42,8 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool ssd_engram_prefetch = false;
+    bool ssd_hc_fused = true;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer + 1], extract layer input embeddings
 

@@ -1,14 +1,11 @@
 
 #include "server-context.h"
-#include "server-expert-guard.h"
-#include "server-sampler-struct-top1.h"
-#include "server-k3-protocol.h"
-#include "src/llama-kimi-runtime.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-ssd-reservation.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -40,21 +37,6 @@
 #include <sys/resource.h>
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-#if defined(LLAMA_SERVER_CUDA_MOE)
-extern "C" void ggml_cuda_moe_ram_tier_request_begin(uint64_t request_id) __attribute__((weak));
-extern "C" void ggml_cuda_moe_stream_batch_phase_report(const char * label) __attribute__((weak));
-extern "C" void ggml_cuda_moe_prefill_request_phase(int active) __attribute__((weak));
-#endif
-extern "C" void ggml_cpu_kimi_a2_request_phase(int active) __attribute__((weak));
-extern "C" bool llama_moe_prefill_phase_workspace(
-    llama_context * ctx, int active) __attribute__((weak));
-extern "C" bool llama_moe_prefill_phase_workspace_sized(
-    llama_context * ctx, int active, uint32_t requested_tokens) __attribute__((weak));
-extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(
-    llama_context * ctx, int active, uint32_t prompt_tokens, uint32_t prefill_tokens) __attribute__((weak));
-#endif
-
 // fix problem with std::min and std::max
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -67,22 +49,6 @@ extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
-
-static bool server_prompt_last_token_single_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("LLAMA_SERVER_PROMPT_LAST_TOKEN_SINGLE");
-        return env && env[0] && env[0] != '0';
-    }();
-    return enabled;
-}
-
-static bool server_prefill_new_tokens_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("LLAMA_SERVER_PREFILL_NEW_TOKENS");
-        return !env || std::strcmp(env, "0") != 0;
-    }();
-    return enabled;
-}
 
 // The number of tokens of the shared prompt prefix the chat template reported ("shared_prefix_chars", see
 // oaicompat_chat_params_parse), if that prefix tokenizes to a prefix of the prompt's tokens; 0 otherwise.
@@ -116,504 +82,8 @@ static int64_t server_shared_prefix_tokens(const llama_vocab * vocab, const json
     return 0;
 }
 
-static bool server_raw_io_log_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("LLAMA_RAW_IO_LOG");
-        return env && env[0] && env[0] != '0';
-    }();
-    return enabled;
-}
-
-static bool server_kimi_dense_phase_gate_enabled() {
-    static const bool enabled = []() {
-        for (const char * name : { "GGML_KIMI_DENSE_PREFETCH_LAYERS", "GGML_KIMI_KDA_GPU_LAYERS", "GGML_KIMI_CPU_SINK" }) {
-            const char * env = std::getenv(name);
-            if (env && env[0] && std::strcmp(env, "0") != 0) {
-                return true;
-            }
-        }
-        return false;
-    }();
-    return enabled;
-}
-
-static bool server_moe_phase01_telemetry_enabled() {
-    const char * phase0 = std::getenv("GGML_MOE_PREFILL_PHASE0");
-    const char * phase1 = std::getenv("GGML_MOE_PREFILL_PHASE1");
-    const char * a2 = std::getenv("GGML_MOE_A2_CPU_GROUPED_PREFILL");
-    return (phase0 && phase0[0] && phase0[0] != '0') ||
-        (phase1 && phase1[0] && phase1[0] != '0') ||
-        (a2 && a2[0] && a2[0] != '0');
-}
-
-struct server_moe_memory_events {
-    uint64_t monotonic_ns = 0;
-    uint64_t low = 0;
-    uint64_t high = 0;
-    uint64_t max = 0;
-    uint64_t oom = 0;
-    uint64_t oom_kill = 0;
-    uint64_t oom_group_kill = 0;
-    uint64_t current = 0;
-    uint64_t anon = 0;
-    uint64_t file = 0;
-    uint64_t kernel = 0;
-    uint64_t shmem = 0;
-    uint64_t file_mapped = 0;
-    uint64_t file_dirty = 0;
-    uint64_t file_writeback = 0;
-    uint64_t pgfault = 0;
-    uint64_t pgmajfault = 0;
-    uint64_t pgscan = 0;
-    uint64_t pgsteal = 0;
-    uint64_t workingset_refault_file = 0;
-    uint64_t workingset_activate_file = 0;
-    uint64_t minor_faults = 0;
-    uint64_t major_faults = 0;
-    uint64_t cpu_usage_usec = 0;
-    uint64_t cpu_user_usec = 0;
-    uint64_t cpu_system_usec = 0;
-    uint64_t cpu_nr_throttled = 0;
-    uint64_t cpu_throttled_usec = 0;
-    uint64_t io_read_bytes = 0;
-    uint64_t io_write_bytes = 0;
-};
-
-struct server_moe_memory_event_task_state {
-    server_moe_memory_events begin;
-    server_moe_memory_events last;
-};
-
-static bool server_moe_phase_memory_events_enabled() {
-    const char * env = std::getenv("GGML_MOE_PHASE_MEMORY_EVENTS");
-    return env && env[0] && env[0] != '0';
-}
-
-static const std::filesystem::path & server_moe_cgroup_path() {
-    static const std::filesystem::path path = []() {
-#if defined(__linux__)
-        std::ifstream cgroup("/proc/self/cgroup");
-        std::string line;
-        while (std::getline(cgroup, line)) {
-            if (line.rfind("0::", 0) != 0) {
-                continue;
-            }
-            std::string relative = line.substr(3);
-            while (!relative.empty() && relative.front() == '/') {
-                relative.erase(relative.begin());
-            }
-            return std::filesystem::path("/sys/fs/cgroup") / relative;
-        }
-#endif
-        return std::filesystem::path();
-    }();
-    return path;
-}
-
-static bool server_moe_read_memory_events(server_moe_memory_events & events) {
-#if defined(__linux__)
-    events.monotonic_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    struct rusage usage = {};
-    if (getrusage(RUSAGE_SELF, &usage) == 0) {
-        events.minor_faults = (uint64_t) usage.ru_minflt;
-        events.major_faults = (uint64_t) usage.ru_majflt;
-    }
-
-    const std::filesystem::path & cgroup_path = server_moe_cgroup_path();
-    if (cgroup_path.empty()) {
-        return false;
-    }
-
-    std::ifstream input(cgroup_path / "memory.events");
-    std::string key;
-    uint64_t value = 0;
-    bool saw_max = false;
-    while (input >> key >> value) {
-        if (key == "low") {
-            events.low = value;
-        } else if (key == "high") {
-            events.high = value;
-        } else if (key == "max") {
-            events.max = value;
-            saw_max = true;
-        } else if (key == "oom") {
-            events.oom = value;
-        } else if (key == "oom_kill") {
-            events.oom_kill = value;
-        } else if (key == "oom_group_kill") {
-            events.oom_group_kill = value;
-        }
-    }
-
-    std::ifstream current_input(cgroup_path / "memory.current");
-    current_input >> events.current;
-    std::ifstream stat_input(cgroup_path / "memory.stat");
-    while (stat_input >> key >> value) {
-        if (key == "anon") {
-            events.anon = value;
-        } else if (key == "file") {
-            events.file = value;
-        } else if (key == "kernel") {
-            events.kernel = value;
-        } else if (key == "shmem") {
-            events.shmem = value;
-        } else if (key == "file_mapped") {
-            events.file_mapped = value;
-        } else if (key == "file_dirty") {
-            events.file_dirty = value;
-        } else if (key == "file_writeback") {
-            events.file_writeback = value;
-        } else if (key == "pgfault") {
-            events.pgfault = value;
-        } else if (key == "pgmajfault") {
-            events.pgmajfault = value;
-        } else if (key == "pgscan") {
-            events.pgscan = value;
-        } else if (key == "pgsteal") {
-            events.pgsteal = value;
-        } else if (key == "workingset_refault_file") {
-            events.workingset_refault_file = value;
-        } else if (key == "workingset_activate_file") {
-            events.workingset_activate_file = value;
-        }
-    }
-
-    std::ifstream cpu_input(cgroup_path / "cpu.stat");
-    while (cpu_input >> key >> value) {
-        if (key == "usage_usec") {
-            events.cpu_usage_usec = value;
-        } else if (key == "user_usec") {
-            events.cpu_user_usec = value;
-        } else if (key == "system_usec") {
-            events.cpu_system_usec = value;
-        } else if (key == "nr_throttled") {
-            events.cpu_nr_throttled = value;
-        } else if (key == "throttled_usec") {
-            events.cpu_throttled_usec = value;
-        }
-    }
-
-    std::ifstream io_input("/proc/self/io");
-    while (io_input >> key >> value) {
-        if (key == "read_bytes:") {
-            events.io_read_bytes = value;
-        } else if (key == "write_bytes:") {
-            events.io_write_bytes = value;
-        }
-    }
-    return saw_max;
-#else
-    (void) events;
-    return false;
-#endif
-}
-
-static uint64_t server_moe_memory_event_delta(uint64_t current, uint64_t previous) {
-    return current >= previous ? current - previous : 0;
-}
-
-static void server_moe_phase_memory_events_report(const char * label, int64_t task_id) {
-    if (!server_moe_phase_memory_events_enabled()) {
-        return;
-    }
-
-    server_moe_memory_events current;
-    if (!server_moe_read_memory_events(current)) {
-        SRV_WRN("[moe_phase_memory_events] label=%s task=%lld status=unavailable\n",
-                label ? label : "unknown", (long long) task_id);
-        return;
-    }
-
-    static std::mutex mutex;
-    static std::unordered_map<int64_t, server_moe_memory_event_task_state> tasks;
-    std::lock_guard<std::mutex> lock(mutex);
-    auto it = tasks.find(task_id);
-    if (!label || std::strcmp(label, "request_begin") == 0 || it == tasks.end()) {
-        it = tasks.insert_or_assign(task_id, server_moe_memory_event_task_state{current, current}).first;
-    }
-    const server_moe_memory_events & begin = it->second.begin;
-    const server_moe_memory_events & last = it->second.last;
-
-    SRV_INF("[moe_phase_memory_events] label=%s task=%lld "
-            "monotonic_ns=%llu minor_faults=%llu major_faults=%llu "
-            "max=%llu oom=%llu oom_kill=%llu oom_group_kill=%llu "
-            "current=%llu anon=%llu file=%llu kernel=%llu shmem=%llu "
-            "file_mapped=%llu file_dirty=%llu file_writeback=%llu "
-            "pgfault=%llu pgmajfault=%llu pgscan=%llu pgsteal=%llu "
-            "workingset_refault_file=%llu workingset_activate_file=%llu "
-            "delta_phase_minor_faults=%llu delta_phase_major_faults=%llu "
-            "delta_phase_pgfault=%llu delta_phase_pgmajfault=%llu "
-            "delta_phase_pgscan=%llu delta_phase_pgsteal=%llu "
-            "delta_phase_workingset_refault_file=%llu "
-            "delta_phase_max=%llu delta_phase_oom=%llu delta_phase_oom_kill=%llu "
-            "delta_phase_oom_group_kill=%llu delta_total_max=%llu delta_total_oom=%llu "
-            "delta_total_oom_kill=%llu delta_total_oom_group_kill=%llu\n",
-            label ? label : "unknown",
-            (long long) task_id,
-            (unsigned long long) current.monotonic_ns,
-            (unsigned long long) current.minor_faults,
-            (unsigned long long) current.major_faults,
-            (unsigned long long) current.max,
-            (unsigned long long) current.oom,
-            (unsigned long long) current.oom_kill,
-            (unsigned long long) current.oom_group_kill,
-            (unsigned long long) current.current,
-            (unsigned long long) current.anon,
-            (unsigned long long) current.file,
-            (unsigned long long) current.kernel,
-            (unsigned long long) current.shmem,
-            (unsigned long long) current.file_mapped,
-            (unsigned long long) current.file_dirty,
-            (unsigned long long) current.file_writeback,
-            (unsigned long long) current.pgfault,
-            (unsigned long long) current.pgmajfault,
-            (unsigned long long) current.pgscan,
-            (unsigned long long) current.pgsteal,
-            (unsigned long long) current.workingset_refault_file,
-            (unsigned long long) current.workingset_activate_file,
-            (unsigned long long) server_moe_memory_event_delta(current.minor_faults, last.minor_faults),
-            (unsigned long long) server_moe_memory_event_delta(current.major_faults, last.major_faults),
-            (unsigned long long) server_moe_memory_event_delta(current.pgfault, last.pgfault),
-            (unsigned long long) server_moe_memory_event_delta(current.pgmajfault, last.pgmajfault),
-            (unsigned long long) server_moe_memory_event_delta(current.pgscan, last.pgscan),
-            (unsigned long long) server_moe_memory_event_delta(current.pgsteal, last.pgsteal),
-            (unsigned long long) server_moe_memory_event_delta(
-                current.workingset_refault_file, last.workingset_refault_file),
-            (unsigned long long) server_moe_memory_event_delta(current.max, last.max),
-            (unsigned long long) server_moe_memory_event_delta(current.oom, last.oom),
-            (unsigned long long) server_moe_memory_event_delta(current.oom_kill, last.oom_kill),
-            (unsigned long long) server_moe_memory_event_delta(current.oom_group_kill, last.oom_group_kill),
-            (unsigned long long) server_moe_memory_event_delta(current.max, begin.max),
-            (unsigned long long) server_moe_memory_event_delta(current.oom, begin.oom),
-            (unsigned long long) server_moe_memory_event_delta(current.oom_kill, begin.oom_kill),
-            (unsigned long long) server_moe_memory_event_delta(current.oom_group_kill, begin.oom_group_kill));
-
-    SRV_INF("[moe_phase_resource] label=%s task=%lld monotonic_ns=%llu "
-            "cpu_usage_usec=%llu cpu_user_usec=%llu cpu_system_usec=%llu "
-            "cpu_nr_throttled=%llu cpu_throttled_usec=%llu "
-            "io_read_bytes=%llu io_write_bytes=%llu "
-            "delta_phase_cpu_usage_usec=%llu delta_phase_cpu_user_usec=%llu "
-            "delta_phase_cpu_system_usec=%llu delta_phase_cpu_nr_throttled=%llu "
-            "delta_phase_cpu_throttled_usec=%llu delta_phase_io_read_bytes=%llu "
-            "delta_phase_io_write_bytes=%llu\n",
-            label ? label : "unknown",
-            (long long) task_id,
-            (unsigned long long) current.monotonic_ns,
-            (unsigned long long) current.cpu_usage_usec,
-            (unsigned long long) current.cpu_user_usec,
-            (unsigned long long) current.cpu_system_usec,
-            (unsigned long long) current.cpu_nr_throttled,
-            (unsigned long long) current.cpu_throttled_usec,
-            (unsigned long long) current.io_read_bytes,
-            (unsigned long long) current.io_write_bytes,
-            (unsigned long long) server_moe_memory_event_delta(current.cpu_usage_usec, last.cpu_usage_usec),
-            (unsigned long long) server_moe_memory_event_delta(current.cpu_user_usec, last.cpu_user_usec),
-            (unsigned long long) server_moe_memory_event_delta(current.cpu_system_usec, last.cpu_system_usec),
-            (unsigned long long) server_moe_memory_event_delta(current.cpu_nr_throttled, last.cpu_nr_throttled),
-            (unsigned long long) server_moe_memory_event_delta(current.cpu_throttled_usec, last.cpu_throttled_usec),
-            (unsigned long long) server_moe_memory_event_delta(current.io_read_bytes, last.io_read_bytes),
-            (unsigned long long) server_moe_memory_event_delta(current.io_write_bytes, last.io_write_bytes));
-
-    if (label && std::strcmp(label, "request_end") == 0) {
-        tasks.erase(it);
-    } else {
-        it->second.last = current;
-    }
-}
-
-static void server_moe_phase_smaps_snapshot(const char * label, int64_t task_id) {
-#if defined(__linux__)
-    const char * directory = std::getenv("GGML_MOE_PHASE_SMAPS_DIR");
-    if (!directory || !directory[0] || !label || !label[0]) {
-        return;
-    }
-
-    char stem[128];
-    const int written = std::snprintf(
-        stem, sizeof(stem), "task-%lld-%s", (long long) task_id, label);
-    if (written < 0 || (size_t) written >= sizeof(stem)) {
-        return;
-    }
-    const std::filesystem::path base = std::filesystem::path(directory) / stem;
-    for (const char * source : { "/proc/self/maps", "/proc/self/smaps" }) {
-        std::ifstream input(source, std::ios::binary);
-        std::ofstream output(base.string() + (source[11] == 's' ? ".smaps" : ".maps"),
-            std::ios::binary | std::ios::trunc);
-        if (input && output) {
-            output << input.rdbuf();
-        }
-    }
-#else
-    (void) label;
-    (void) task_id;
-#endif
-}
-
-static bool server_moe_workspace_transition(
-        llama_context * ctx,
-        const char * label,
-        int64_t task_id,
-        uint32_t prompt_tokens,
-        uint32_t prefill_tokens) {
-#if defined(__GNUC__) || defined(__clang__)
-    const bool phase01_telemetry = server_moe_phase01_telemetry_enabled();
-    const bool phase_memory_events = server_moe_phase_memory_events_enabled();
-    const bool dense_phase_gate = server_kimi_dense_phase_gate_enabled();
-    const char * elastic_value = std::getenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC");
-    const bool elastic_lifecycle = elastic_value && !std::strcmp(elastic_value, "1");
-    const char * prompt_pack_source_value =
-        std::getenv("GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE");
-    const bool prompt_pack_source_lifecycle = prompt_pack_source_value &&
-        prompt_pack_source_value[0] && std::strcmp(prompt_pack_source_value, "0") != 0;
-    // Memory lifecycle is a correctness transition, not telemetry.
-    if ((phase01_telemetry || phase_memory_events || dense_phase_gate || elastic_lifecycle ||
-            prompt_pack_source_lifecycle) &&
-            (llama_moe_prefill_phase_workspace_sized_ex ||
-             llama_moe_prefill_phase_workspace_sized || llama_moe_prefill_phase_workspace) && ctx) {
-        bool transition_ok = true;
-        if (label && std::strcmp(label, "request_begin") == 0) {
-            transition_ok = llama_moe_prefill_phase_workspace_sized_ex ?
-                llama_moe_prefill_phase_workspace_sized_ex(ctx, 1, prompt_tokens, prefill_tokens) :
-                llama_moe_prefill_phase_workspace_sized ?
-                llama_moe_prefill_phase_workspace_sized(ctx, 1, prompt_tokens) :
-                llama_moe_prefill_phase_workspace(ctx, 1);
-        } else if (label &&
-                (std::strcmp(label, "prefill_done") == 0 ||
-                 std::strcmp(label, "request_end") == 0)) {
-            transition_ok = llama_moe_prefill_phase_workspace_sized_ex ?
-                llama_moe_prefill_phase_workspace_sized_ex(ctx, 0, 0, 0) :
-                llama_moe_prefill_phase_workspace_sized ?
-                llama_moe_prefill_phase_workspace_sized(ctx, 0, 0) :
-                llama_moe_prefill_phase_workspace(ctx, 0);
-        }
-        if (!transition_ok) {
-            SRV_WRN(
-                "[moe_prefill_phase_workspace] label=%s task=%lld transition=failed\n",
-                label ? label : "unknown", (long long) task_id);
-            return false;
-        }
-    }
-#else
-    (void) ctx;
-    (void) label;
-    (void) task_id;
-    (void) prompt_tokens;
-    (void) prefill_tokens;
-#endif
-    return true;
-}
-
-static bool server_moe_phase_report(
-        llama_context * ctx,
-        const char * label,
-        int64_t task_id,
-        uint32_t prompt_tokens = 0,
-        bool transition_workspace = true) {
-#if defined(__GNUC__) || defined(__clang__)
-    const bool phase01_telemetry = server_moe_phase01_telemetry_enabled();
-    const bool phase_memory_events = server_moe_phase_memory_events_enabled();
-    const bool dense_phase_gate = server_kimi_dense_phase_gate_enabled();
-    if (transition_workspace &&
-            !server_moe_workspace_transition(ctx, label, task_id, prompt_tokens, prompt_tokens)) {
-        return false;
-    }
-    if (!phase01_telemetry && !phase_memory_events && !dense_phase_gate) {
-        return true;
-    }
-    server_moe_phase_memory_events_report(label, task_id);
-    server_moe_phase_smaps_snapshot(label, task_id);
-    if (!phase01_telemetry && !dense_phase_gate) {
-        return true;
-    }
-    if (phase01_telemetry && ggml_cpu_kimi_a2_request_phase) {
-        if (label && std::strcmp(label, "request_begin") == 0) {
-            ggml_cpu_kimi_a2_request_phase(1);
-        } else if (label &&
-                (std::strcmp(label, "prefill_done") == 0 ||
-                 std::strcmp(label, "request_end") == 0)) {
-            ggml_cpu_kimi_a2_request_phase(0);
-        }
-    }
-#if defined(LLAMA_SERVER_CUDA_MOE)
-    if (phase01_telemetry && ggml_cuda_moe_prefill_request_phase) {
-        if (label && std::strcmp(label, "request_begin") == 0) {
-            ggml_cuda_moe_prefill_request_phase(1);
-        } else if (label &&
-                (std::strcmp(label, "prefill_done") == 0 ||
-                 std::strcmp(label, "request_end") == 0)) {
-            ggml_cuda_moe_prefill_request_phase(0);
-        }
-    }
-#endif
-    if (!phase01_telemetry) {
-        return true;
-    }
-#if defined(LLAMA_SERVER_CUDA_MOE)
-    if (!ggml_cuda_moe_stream_batch_phase_report) {
-        return true;
-    }
-    char scoped_label[96];
-    std::snprintf(scoped_label, sizeof(scoped_label), "%s_task_%lld",
-        label ? label : "unknown", (long long)task_id);
-    ggml_cuda_moe_stream_batch_phase_report(scoped_label);
-#endif
-#else
-    (void) ctx;
-    (void) label;
-    (void) task_id;
-#endif
-    return true;
-}
-
-
-static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1) {
-    if (pos_min == -1) {
-        pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx), id);
-    }
-    if (pos_max == -1) {
-        pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx), id);
-    }
-
-    const size_t checkpoint_size = llama_state_seq_get_size_ext(ctx, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-
-    auto cur = server_prompt_checkpoint {
-        /*.pos_min  = */ pos_min,
-        /*.pos_max  = */ pos_max,
-        /*.n_tokens = */ n_tokens,
-        /*.data     = */ std::vector<uint8_t>(checkpoint_size),
-    };
-
-    const size_t n = llama_state_seq_get_data_ext(ctx, cur.data.data(), checkpoint_size, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-    if (n != checkpoint_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", checkpoint_size, n);
-    }
-
-    return cur;
-}
-
-// The partial state of the sequence after its first n_tokens tokens, taken after the batch that went past them by a
-// memory that can save an earlier state (llama_state_seq_at_align). It holds the positions from pos_min to the one
-// before n_tokens: a memory that cannot be rolled back resumes exactly after that position (pos_min = pos_max), a
-// sliding-window cache holds the window that position attends to and is truncated after loading like an ordinary
-// checkpoint.
-static server_prompt_checkpoint server_get_checkpoint_at(llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min) {
-    const size_t checkpoint_size = llama_state_seq_get_size_at(ctx, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, n_tokens);
-
-    auto cur = server_prompt_checkpoint {
-        /*.pos_min  = */ pos_min,
-        /*.pos_max  = */ (llama_pos) n_tokens - 1,
-        /*.n_tokens = */ n_tokens,
-        /*.data     = */ std::vector<uint8_t>(checkpoint_size),
-    };
-
-    const size_t n = llama_state_seq_get_data_at(ctx, cur.data.data(), checkpoint_size, id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, n_tokens);
-    if (checkpoint_size == 0 || n != checkpoint_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", checkpoint_size, n);
-    }
-
-    return cur;
-}
+#include "inferssd/runtime.h"
+#include "inferssd/checkpoint.h"
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -629,34 +99,6 @@ enum server_state {
     SERVER_STATE_LOADING_MODEL,  // Server is starting up, model not fully loaded yet
     SERVER_STATE_READY,          // Server is ready and model is loaded
 };
-
-static json server_runtime_policy_json(const llama_k3_decode_expert_policy & p) {
-    return {{"mode", llama_k3_decode_expert_mode_name(p.mode)}, {"top_k", p.top_k},
-        {"mass", p.mass}, {"min_k", p.min_k}, {"max_k", p.max_k},
-        {"layer_start", p.layer_start}, {"layer_end", p.layer_end}, {"small_batch", p.small_batch}};
-}
-
-static json server_runtime_config_json(const llama_k3_runtime_config & config) {
-    json table = json::array();
-    for (const auto & row : config.table) {
-        table.push_back({{"layer", row.layer}, {"mass", row.mass}, {"min_k", row.min_k}, {"max_k", row.max_k}});
-    }
-    return {{"primary", server_runtime_policy_json(config.primary)},
-        {"guard_tokens", config.guard_tokens}, {"guard_policy", server_runtime_policy_json(config.guard)},
-        {"guard_start_tokens", config.guard_start_tokens},
-        {"guard_control_tokens", config.guard_control_tokens},
-        {"layer_table", table}};
-}
-
-static llama_tokens server_guard_control_token_ids(const llama_vocab * vocab) {
-    const auto open = common_tokenize(vocab, "<|open|>", false, true);
-    const auto close = common_tokenize(vocab, "<|close|>", false, true);
-    if (open.size() != 1 || close.size() != 1 || open[0] < 0 || close[0] < 0 || open[0] == close[0] ||
-            !llama_vocab_is_control(vocab, open[0]) || !llama_vocab_is_control(vocab, close[0])) {
-        throw std::invalid_argument("K3 control guard requires distinct single control-token IDs for <|open|> and <|close|>");
-    }
-    return {open[0], close[0]};
-}
 
 struct server_slot {
     int id;
@@ -712,11 +154,6 @@ struct server_slot {
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
 
-    // Last min_len sampled tokens are held back from SSE. If loop_stop fires,
-    // the matched suffix is removed here before any client can observe it.
-    std::deque<completion_token_output> loop_output_hold;
-    int64_t loop_removed_tokens = 0;
-
     std::vector<completion_token_output> generated_token_probs;
 
     bool has_next_token = true;
@@ -731,27 +168,6 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
-    server_expert_guard expert_guard;
-    server_k3_protocol k3_protocol;
-    uint64_t guard_predictions = 0, guard_failed_decodes = 0;
-    uint64_t guard_start_predictions = 0, guard_opener_predictions = 0, guard_overlap_predictions = 0;
-    uint64_t guard_control_predictions = 0, guard_control_only_predictions = 0;
-    int64_t guard_opened_after_token = -1;
-    bool guard_prompt_primed = false, guard_last_selected = false;
-    bool guard_last_start_selected = false, guard_last_opener_selected = false;
-    bool guard_last_control_selected = false;
-
-    void reset_guard() {
-        expert_guard.reset(0, {});
-        guard_predictions = guard_failed_decodes = 0;
-        guard_start_predictions = guard_opener_predictions = guard_overlap_predictions = 0;
-        guard_control_predictions = guard_control_only_predictions = 0;
-        guard_opened_after_token = -1;
-        guard_prompt_primed = guard_last_selected = false;
-        guard_last_start_selected = guard_last_opener_selected = false;
-        guard_last_control_selected = false;
-    }
-
     void prompt_save(server_prompt_cache & prompt_cache) const {
         GGML_ASSERT(prompt.data.size() == 0);
 
@@ -820,8 +236,6 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
-        reset_guard();
-        k3_protocol = {};
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -839,8 +253,6 @@ struct server_slot {
             spec_ckpt.clear();
         }
         generated_tokens.clear();
-        loop_output_hold.clear();
-        loop_removed_tokens = 0;
         generated_token_probs.clear();
         json_schema = json();
 
@@ -1226,10 +638,6 @@ struct server_metrics {
     uint64_t n_prompt_tokens_processed_total = 0;
     uint64_t t_prompt_processing_total       = 0;
     uint64_t n_tokens_predicted_total        = 0;
-    uint64_t n_sampler_struct_top1_replacements_total = 0;
-    uint64_t n_sampler_struct_mixed_samples_total = 0;
-    uint64_t n_k3_constraint_conflicts_total = 0;
-    uint64_t n_k3_protocol_forced_tokens_total = 0;
     uint64_t t_tokens_generation_total       = 0;
 
     uint64_t n_tokens_max = 0;
@@ -1349,25 +757,15 @@ private:
 
     // Opt-in bounded prefill sizing on Mac. The context's physical ubatch
     // remains the hard ceiling; the server submits smaller physical work.
-    int32_t mac_prefill_task = -1;
-    int32_t mac_prefill_size = 0;
-    int32_t mac_prefill_previous_size = 0;
-    double mac_prefill_previous_ms_per_token = 0;
-    bool mac_prefill_settled = false;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     // positions at which the memory can save a state it has gone past (llama_state_seq_at_align), 0 if it cannot
     int64_t checkpoint_at_align = 0;
 
-    bool guard_enabled() const {
-        const auto * config = llama_k3_runtime_config_get(ctx);
-        return config && (config->guard_tokens > 0 || config->guard_start_tokens > 0 || config->guard_control_tokens > 0);
-    }
+
 
     server_metrics metrics;
-    server_sampler_struct_top1 sampler_struct_top1;
-    server_k3_protocol_ids k3_protocol_ids;
 
     json json_webui_settings = json::object();
 
@@ -1455,8 +853,7 @@ private:
     }
 
     void slot_save_and_clear(server_slot & slot) {
-        // Guard trajectories have no persisted prefix/schedule identity.
-        if (guard_enabled()) { return; }
+
         if (slot.prompt.n_tokens() == 0) {
             return;
         }
@@ -1464,6 +861,7 @@ private:
         SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
         slot.prompt_save(*prompt_cache);
         slot.prompt_clear(false);
+        llama_ssd_host_note_memory_change(ctx);
         prompt_cache->update();
     }
 
@@ -1490,19 +888,6 @@ private:
 
         params_base = params;
 
-        try {
-            sampler_struct_top1.config = server_sampler_struct_top1_config::from_env();
-        } catch (const std::exception & e) {
-            SRV_ERR("%s\n", e.what());
-            return false;
-        }
-        if (sampler_struct_top1.config.active() && params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
-            SRV_ERR("%s", "K3 sampler structural top-1 requires non-speculative sampling\n");
-            return false;
-        }
-
-        if (sampler_struct_top1.config.active()) { params_base.sampling.backend_sampling = false; }
-
         llama_init = common_init_from_params(params_base);
 
         model = llama_init->model();
@@ -1523,43 +908,6 @@ private:
         }
 
         vocab = llama_model_get_vocab(model);
-        sampler_struct_top1.tokens.clear();
-        if (sampler_struct_top1.config.active()) {
-            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-            sampler_struct_top1.tokens.reserve(n_vocab);
-            size_t n_struct = 0, n_mixed = 0;
-            for (int32_t token = 0; token < n_vocab; ++token) {
-                sampler_struct_top1.tokens.push_back(server_struct_classify(
-                    common_token_to_piece(vocab, token, true),
-                    (llama_vocab_get_attr(vocab, token) & LLAMA_TOKEN_ATTR_CONTROL) != 0,
-                    llama_vocab_is_eog(vocab, token)));
-                n_struct += sampler_struct_top1.is_struct(token);
-                n_mixed += sampler_struct_top1.tokens.back().mixed;
-            }
-            k3_protocol_ids = server_k3_protocol_ids::find(sampler_struct_top1.tokens);
-            const auto & config = sampler_struct_top1.config;
-            SRV_INF("K3 sampler: struct_top1=%d, protocol_tags=%d, force_response=%d, vocab=%d, structural=%zu, mixed=%zu, classes=%u, min_top1_p=%.9g, basis=effective_q, grammar_first=1, backend_sampling=0\n",
-                config.enabled, config.protocol_tags, config.force_response, n_vocab, n_struct, n_mixed,
-                unsigned(config.classes), config.min_top1_p);
-        }
-        if (const auto * config = llama_k3_runtime_config_get(ctx)) {
-            if (config->guard_control_tokens > 0) {
-                try {
-                    const auto control = server_guard_control_token_ids(vocab);
-                    SRV_INF("control guard tokens: open=%d, close=%d\n", control[0], control[1]);
-                }
-                catch (const std::exception & e) { SRV_ERR("%s\n", e.what()); return false; }
-            }
-            if (guard_enabled() && (params_base.n_parallel != 1 ||
-                    params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE || !params_base.mmproj.path.empty())) {
-                SRV_ERR("%s", "K3 opener guard requires one slot, no speculation and a text-only context\n");
-                return false;
-            }
-            if (guard_enabled() || !config->table.empty()) {
-                SRV_INF("runtime routing launch: %s\n", server_runtime_config_json(*config).dump().c_str());
-            }
-        }
-
         n_ctx = llama_n_ctx(ctx);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
@@ -2001,7 +1349,7 @@ private:
             const auto & tokens = ret->prompt.tokens;
 
             // cache prompts only for completion tasks
-            const bool cache_task = prompt_cache && !guard_enabled() && task.type == SERVER_TASK_TYPE_COMPLETION;
+            const bool cache_task = prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
             update_cache = update_cache && cache_task;
 
@@ -2025,6 +1373,7 @@ private:
                     ret->prompt_clear(false);
                 }
 
+                llama_ssd_host_note_memory_change(ctx);
                 prompt_cache->update();
 
                 SRV_WRN("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
@@ -2081,8 +1430,6 @@ private:
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // Rejected launches need not pass through release()/reset().
-        slot.reset_guard();
-        slot.k3_protocol = {};
 
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
@@ -2154,54 +1501,12 @@ private:
             return false;
         }
 
-        if (sampler_struct_top1.config.active() && task.need_sampling()) {
-            try {
-                const auto & config = sampler_struct_top1.config;
-                if ((config.protocol_tags || config.force_response) && common_grammar_needs_prefill(task.params.sampling.grammar)) {
-                    throw std::invalid_argument("K3 protocol tags currently support ordinary chat, not tool/schema generation profiles");
-                }
-                // Declared tools (tool_choice other than none) admit the template's tool section;
-                // tool_choice=required makes it mandatory, as the tool-call grammar does elsewhere.
-                slot.k3_protocol.reset(task.params.sampling.generation_prompt, sampler_struct_top1.tokens,
-                    k3_protocol_ids, config.protocol_tags, config.force_response,
-                    task.params.chat_parser_params.parse_tool_calls, task.params.tool_call_required);
-                if (slot.k3_protocol.observing()) {
-                    if (task.tokens.has_mtmd) { throw std::invalid_argument("K3 protocol requires a text-only prompt"); }
-                    const auto prefix = common_tokenize(vocab, task.params.sampling.generation_prompt, false, true);
-                    server_expert_guard_verify_prefix(task.params.sampling.generation_prompt, prefix, task.tokens.get_text_tokens());
-                }
-                task.params.sampling.backend_sampling = false;
-            } catch (const std::exception & e) {
-                send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
-                return false;
-            }
-        }
 
-        if (guard_enabled()) {
-            try {
-                const auto * config = llama_k3_runtime_config_get(ctx);
-                if (mctx || task.tokens.has_mtmd) { throw std::invalid_argument("K3 opener guard requires a text-only prompt"); }
-                const auto prefix = common_tokenize(vocab, task.params.sampling.generation_prompt, false, true);
-                server_expert_guard_verify_prefix(task.params.sampling.generation_prompt, prefix, task.tokens.get_text_tokens());
-                const auto control = config->guard_control_tokens > 0
-                    ? server_guard_control_token_ids(vocab) : llama_tokens{LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL};
-                slot.expert_guard.reset(config->guard_tokens,
-                    common_tokenize(vocab, "<|open|>response<|sep|>", false, true), config->guard_start_tokens,
-                    config->guard_control_tokens, control[0], control[1]);
-                slot.expert_guard.prime_current_prefix(prefix);
-                slot.guard_prompt_primed = slot.expert_guard.opened();
-                if (slot.guard_prompt_primed) { slot.guard_opened_after_token = 0; }
-            } catch (const std::exception & e) { send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST); return false; }
-        }
 
-#if defined(LLAMA_SERVER_CUDA_MOE) && (defined(__GNUC__) || defined(__clang__))
-        if (!task.is_child() && ggml_cuda_moe_ram_tier_request_begin) {
-            ggml_cuda_moe_ram_tier_request_begin(
-                    task.id >= 0 ? static_cast<uint64_t>(task.id) : 0);
-        }
-#endif
+
+
         if (!task.is_child()) {
-            const bool defer_workspace = server_prefill_new_tokens_enabled() && task.need_sampling();
+            const bool defer_workspace = task.need_sampling();
             if (!server_moe_phase_report(slot.ctx, "request_begin", task.id,
                     static_cast<uint32_t>(task.n_tokens()), !defer_workspace)) {
                 send_error(task, "failed to prepare GPU memory for prompt processing", ERROR_TYPE_SERVER);
@@ -2235,7 +1540,6 @@ private:
 
             // TODO: getting post/pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_logits;
-            backend_sampling &= !sampler_struct_top1.config.active();
 
             // TODO: tmp until backend sampling is fully implemented
             if (backend_sampling) {
@@ -2249,28 +1553,7 @@ private:
             slot.smpl.reset();
         }
 
-        if (guard_enabled()) {
-            // Only B requires a cold cross-request state. Inside one response,
-            // switching the frozen policy preserves KV/recurrent continuity.
-            llama_synchronize(ctx);
-            if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, -1, -1)) {
-                llama_memory_clear(llama_get_memory(ctx), true);
-            }
-            slot.prompt.tokens.clear();
-            slot.prompt.data.clear();
-            slot.prompt.checkpoints.clear();
-            slot.spec_ckpt.clear();
-            slot.n_prompt_tokens_cache = 0;
-            if (prompt_cache) { prompt_cache->states.clear(); }
-            if (!llama_k3_runtime_guard_set(ctx, false)) {
-                slot.end_request();
-                send_error(task, "cannot restore K3 primary routing", ERROR_TYPE_SERVER);
-                return false;
-            }
-            SLT_INF(slot, "opener guard cold start: tokens=%u, prompt_primed=%d, start_tokens=%u, control_tokens=%u\n",
-                llama_k3_runtime_config_get(ctx)->guard_tokens, int(slot.guard_prompt_primed),
-                llama_k3_runtime_config_get(ctx)->guard_start_tokens, llama_k3_runtime_config_get(ctx)->guard_control_tokens);
-        }
+
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -2287,17 +1570,6 @@ private:
 
     void emit_output_token(completion_token_output result, server_slot & slot) {
         const std::string token_str = result.text_to_send;
-
-        // Optional per-token audit: preserve chat request/sampling semantics and
-        // measure completion-to-completion latency without per-layer profiling.
-        static const bool token_audit = [] {
-            const char * value = std::getenv("LLAMA_KIMI_TOKEN_AUDIT");
-            return value && std::strcmp(value, "1") == 0;
-        }();
-        if (token_audit) {
-            std::fprintf(stderr, "[kimi_token_audit] {\"task\":%d,\"n\":%d,\"id\":%d,\"us\":%lld}\n",
-                slot.task->id, slot.n_decoded, result.tok, (long long) ggml_time_us());
-        }
 
         if (!token_str.empty() && llama_vocab_is_control(vocab, result.tok)) {
             slot.output_source.controls.push_back({slot.generated_text.size(),
@@ -2356,28 +1628,7 @@ private:
         }
     }
 
-    void flush_loop_output_hold(server_slot & slot) {
-        if (slot.stop == STOP_TYPE_WORD) {
-            slot.loop_output_hold.clear();
-            return;
-        }
 
-        while (!slot.loop_output_hold.empty()) {
-            completion_token_output output = std::move(slot.loop_output_hold.front());
-            slot.loop_output_hold.pop_front();
-
-            // EOG controls generation but is never user-visible.
-            if (llama_vocab_is_eog(vocab, output.tok)) {
-                continue;
-            }
-
-            emit_output_token(std::move(output), slot);
-            if (slot.stop == STOP_TYPE_WORD) {
-                slot.loop_output_hold.clear();
-                break;
-            }
-        }
-    }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
         const completion_token_output sampled_result = result;
@@ -2387,32 +1638,7 @@ private:
         // while its user-visible representation remains in the rolling hold.
         slot.sampled = sampled_result.tok;
         slot.has_next_token = true;
-        slot.loop_output_hold.push_back(sampled_result);
-
-        int32_t matched_len = 0;
-        const bool loop_triggered = common_sampler_loop_stop_triggered(slot.smpl.get(), &matched_len);
-        if (loop_triggered && matched_len > 0) {
-            const size_t removable = std::min<size_t>((size_t) matched_len, slot.loop_output_hold.size());
-            for (size_t i = 0; i < removable; ++i) {
-                slot.loop_output_hold.pop_back();
-            }
-            slot.loop_removed_tokens += removable;
-
-            if (removable != (size_t) matched_len) {
-                SLT_WRN(slot,
-                        "loop_stop triggered for %d tokens, but only %zu unsent tokens remained; visible output may be incomplete\n",
-                        matched_len, removable);
-            } else {
-                SLT_WRN(slot, "loop_stop suppressed repeated output block before streaming: %d tokens\n", matched_len);
-            }
-        }
-
-        const int32_t hold_limit = std::max(0, common_sampler_loop_stop_min_len(slot.smpl.get()));
-        if ((int32_t) slot.loop_output_hold.size() > hold_limit) {
-            completion_token_output output = std::move(slot.loop_output_hold.front());
-            slot.loop_output_hold.pop_front();
-            emit_output_token(std::move(output), slot);
-        }
+        emit_output_token(sampled_result, slot);
 
         // if context shifting is disabled, make sure that we don't run out of context
         if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
@@ -2601,18 +1827,7 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
-        if (guard_enabled()) {
-            SLT_INF(slot, "opener guard summary: predictions=%" PRIu64 ", remaining=%u, opened_after_token=%" PRId64
-                ", prompt_primed=%d, failed_decodes=%" PRIu64 ", start_predictions=%" PRIu64
-                ", opener_predictions=%" PRIu64 ", overlap_predictions=%" PRIu64 ", start_remaining=%u"
-                ", control_predictions=%" PRIu64 ", control_only_predictions=%" PRIu64 ", control_remaining=%u"
-                ", control_triggers=%" PRIu64 "\n",
-                slot.guard_predictions, slot.expert_guard.remaining(), slot.guard_opened_after_token,
-                int(slot.guard_prompt_primed), slot.guard_failed_decodes, slot.guard_start_predictions,
-                slot.guard_opener_predictions, slot.guard_overlap_predictions, slot.expert_guard.start_remaining(),
-                slot.guard_control_predictions, slot.guard_control_only_predictions, slot.expert_guard.control_remaining(),
-                slot.expert_guard.control_triggers());
-        }
+
         slot.end_request();
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
@@ -2620,13 +1835,6 @@ private:
         res->id_slot = slot.id;
 
         res->index = slot.task->index;
-
-        // Log the exact decoded generation before chat protocol parsing splits it
-        // into reasoning/content/tool-call fields. JSON encoding keeps one record per line.
-        if (server_raw_io_log_enabled()) {
-            SLT_INF(slot, "raw_io id=%s output_pre_parser=%s\n",
-                slot.task->params.oaicompat_cmpl_id.c_str(), json(slot.generated_text).dump().c_str());
-        }
 
         // keep copy of last generated text for debugging purposes
         if (slots_debug) {
@@ -2843,8 +2051,11 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        if (checkpoint_room(slot, llama_state_seq_get_size_ext(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY))) {
-            add_checkpoint(slot, server_get_checkpoint(ctx, slot.id, slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max));
+        auto reservation = checkpoint_room(slot, llama_state_seq_get_size_ext(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+        if (reservation) {
+            auto checkpoint = server_get_checkpoint(ctx, slot.id, slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+            reservation.commit();
+            add_checkpoint(slot, std::move(checkpoint));
         }
     }
 
@@ -2895,11 +2106,15 @@ private:
                 SLT_WRN(slot, "cannot save the state after %" PRId64 " tokens\n", n);
                 continue;
             }
-            if (params_base.n_ctx_checkpoints > 0 &&
-                    checkpoint_room(slot, llama_state_seq_get_size_at(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, n))) {
-                const llama_pos pos_min = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? n - 1 :
-                    llama_state_seq_pos_min_at(ctx, slot.id, n);
-                add_checkpoint(slot, server_get_checkpoint_at(ctx, slot.id, n, pos_min));
+            if (params_base.n_ctx_checkpoints > 0) {
+                auto reservation = checkpoint_room(slot, llama_state_seq_get_size_at(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, n));
+                if (reservation) {
+                    const llama_pos pos_min = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? n - 1 :
+                        llama_state_seq_pos_min_at(ctx, slot.id, n);
+                    auto checkpoint = server_get_checkpoint_at(ctx, slot.id, n, pos_min);
+                    reservation.commit();
+                    add_checkpoint(slot, std::move(checkpoint));
+                }
             }
             if (shared && prompt_cache) {
                 server_prompt prefix;
@@ -2907,6 +2122,7 @@ private:
                 prefix.tokens.keep_first(n);
                 SLT_INF(slot, "keeping the shared prompt prefix of %" PRId64 " tokens\n", n);
                 prompt_cache->save(prefix, false, ctx, slot.id, slot.ctx_seq_rm_type);
+                llama_ssd_host_note_memory_change(ctx);
                 prompt_cache->update();
             }
         }
@@ -2915,24 +2131,27 @@ private:
     // Room for a new checkpoint of `bytes`, made before it is allocated: the oldest checkpoint goes when the slot
     // holds n_ctx_checkpoints, the RAM expert cache gives back what the memory limit requires, and failing that the
     // oldest checkpoints go too. False (the checkpoint is skipped) when even no checkpoints leave no room.
-    bool checkpoint_room(server_slot & slot, size_t bytes) {
+    server_ssd_reservation checkpoint_room(server_slot & slot, size_t bytes) {
         auto erase_oldest = [&](const char * why) {
             const auto & cur = slot.prompt.checkpoints.front();
             SLT_WRN(slot, "erasing old context checkpoint (%s; pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     why, cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.data.size() / 1024 / 1024);
+            llama_ssd_host_note_memory_change(ctx);
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         };
         while (!slot.prompt.checkpoints.empty() && slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             erase_oldest("count");
         }
-        while (!llama_host_reserve(ctx, bytes)) {
+        server_ssd_reservation reservation(ctx, bytes);
+        while (!reservation) {
             if (slot.prompt.checkpoints.empty()) {
                 SLT_WRN(slot, "skipping a context checkpoint of %.3f MiB: no room in the memory limit\n", (float) bytes / 1024 / 1024);
-                return false;
+                return {};
             }
             erase_oldest("memory");
+            reservation = server_ssd_reservation(ctx, bytes);
         }
-        return true;
+        return reservation;
     }
 
     void add_checkpoint(server_slot & slot, server_prompt_checkpoint && checkpoint) {
@@ -3033,17 +2252,8 @@ private:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
                 {
-                    if (guard_enabled() && (task.type != SERVER_TASK_TYPE_COMPLETION || task.params.n_cmpl != 1 ||
-                            task.is_parent() || task.is_child() || task.params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE ||
-                            (task.params.res_type != TASK_RESPONSE_TYPE_NONE && task.params.res_type != TASK_RESPONSE_TYPE_OAI_CHAT &&
-                             task.params.res_type != TASK_RESPONSE_TYPE_OAI_CMPL))) {
-                        send_error(task, "K3 opener guard requires one native/OAI completion without speculation", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    if (sampler_struct_top1.config.active() && task.params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
-                        send_error(task, "K3 sampler structural top-1 requires non-speculative sampling", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
+
+
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
                     if (task.cli) {
@@ -3149,10 +2359,6 @@ private:
                     res->n_prompt_tokens_processed_total = metrics.n_prompt_tokens_processed_total;
                     res->t_prompt_processing_total       = metrics.t_prompt_processing_total;
                     res->n_tokens_predicted_total        = metrics.n_tokens_predicted_total;
-                    res->n_sampler_struct_top1_replacements_total = metrics.n_sampler_struct_top1_replacements_total;
-                    res->n_sampler_struct_mixed_samples_total = metrics.n_sampler_struct_mixed_samples_total;
-                    res->n_k3_constraint_conflicts_total = metrics.n_k3_constraint_conflicts_total;
-                    res->n_k3_protocol_forced_tokens_total = metrics.n_k3_protocol_forced_tokens_total;
                     res->t_tokens_generation_total       = metrics.t_tokens_generation_total;
 
                     res->n_tokens_max = metrics.n_tokens_max;
@@ -3172,10 +2378,7 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    if (guard_enabled()) {
-                        send_error(task, "K3 opener guard does not support slot files without a routing schedule identity", ERROR_TYPE_NOT_SUPPORTED);
-                        break;
-                    }
+
                     if (!check_no_mtmd(task.id)) {
                         break;
                     }
@@ -3217,10 +2420,7 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (guard_enabled()) {
-                        send_error(task, "K3 opener guard does not support slot files without a routing schedule identity", ERROR_TYPE_NOT_SUPPORTED);
-                        break;
-                    }
+
                     if (!check_no_mtmd(task.id)) break;
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
@@ -3455,32 +2655,6 @@ private:
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx);
         int32_t n_ubatch = llama_n_ubatch(ctx);
-
-        bool mac_adaptive_prefill = false;
-#if defined(__APPLE__)
-        const char * mac_adaptive = std::getenv("LLAMA_MAC_ADAPTIVE_PREFILL");
-        mac_adaptive_prefill = mac_adaptive && std::strcmp(mac_adaptive, "1") == 0 &&
-            params_base.n_parallel == 1 && batch.n_tokens == 0;
-#endif
-        if (mac_adaptive_prefill) {
-            for (const auto & slot : slots) {
-                if (!slot.is_processing() || !slot.task || slot.state == SLOT_STATE_GENERATING) {
-                    continue;
-                }
-                const int32_t ceiling = std::min(n_batch, n_ubatch);
-                if (mac_prefill_task != slot.task->id) {
-                    mac_prefill_task = slot.task->id;
-                    mac_prefill_size = std::min(256, ceiling);
-                    mac_prefill_previous_size = 0;
-                    mac_prefill_previous_ms_per_token = 0;
-                    mac_prefill_settled = false;
-                    SRV_INF("mac_adaptive_prefill task=%d initial=%d ceiling=%d\n",
-                            mac_prefill_task, mac_prefill_size, ceiling);
-                }
-                n_batch = std::min(n_batch, mac_prefill_size);
-                break;
-            }
-        }
 
         float  alora_scale       = -1.0f;
         size_t alora_disabled_id = 0;
@@ -3772,6 +2946,7 @@ private:
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
                                         SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.data.size() / 1024 / 1024);
+                                        llama_ssd_host_note_memory_change(ctx);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -3846,7 +3021,7 @@ private:
 
                     // The cache decision can change again when sequence removal fails.
                     // Reserve only after the remaining prompt length is final.
-                    if (server_prefill_new_tokens_enabled() && slot.task->need_sampling()) {
+                    if (slot.task->need_sampling()) {
                         const uint32_t prompt_tokens = static_cast<uint32_t>(slot.task->n_tokens());
                         const uint32_t prefill_tokens = prompt_tokens -
                             static_cast<uint32_t>(slot.prompt.n_tokens());
@@ -3934,15 +3109,6 @@ private:
                         // this batch at those pre-invocation tokens.
                         if (alora_scale > 0 && slot.prompt.n_tokens() == slot.alora_invocation_start - 1) {
                             SLT_DBG(slot, "stop prompt batch filling at (n_tokens = %d, alora_invocation_start = %d)\n", slot.prompt.n_tokens(), slot.alora_invocation_start);
-                            break;
-                        }
-
-                        const bool is_last_prompt_token = slot.prompt.n_tokens() + 1 == slot.task->n_tokens();
-                        if ((server_prompt_last_token_single_enabled() || slot.expert_guard.active()) && is_last_prompt_token && batch.n_tokens > 0) {
-                            // Start or a prompt-primed opener must protect the logits predicting the first
-                            // sampled token. Earlier prompt rows do not consume either budget.
-                            // The DeepSeek-V4 MoE path can return bad first-token logits when the final prompt
-                            // token is decoded together with earlier prompt tokens.
                             break;
                         }
 
@@ -4098,60 +3264,12 @@ private:
                 batch.logits   + i,
             };
 
-            const bool predictive_row = slot_batched && slot_batched->i_batch >= i &&
-                slot_batched->i_batch < i + n_tokens &&
-                (slot_batched->state == SLOT_STATE_GENERATING || slot_batched->state == SLOT_STATE_DONE_PROMPT);
-            const bool start_guarded = predictive_row && slot_batched->expert_guard.start_active();
-            const bool opener_guarded = predictive_row && slot_batched->expert_guard.opener_active();
-            const bool control_guarded = predictive_row && slot_batched->expert_guard.control_active();
-            const bool guarded = start_guarded || opener_guarded || control_guarded;
-            if (guard_enabled()) {
-                GGML_ASSERT(!guarded || n_tokens == 1);
-                if (!llama_k3_runtime_guard_set(ctx, guarded)) { GGML_ABORT("cannot select frozen K3 guard policy"); }
-                if (slot_batched && (slot_batched->guard_last_selected != guarded ||
-                        slot_batched->guard_last_start_selected != start_guarded ||
-                        slot_batched->guard_last_opener_selected != opener_guarded ||
-                        slot_batched->guard_last_control_selected != control_guarded)) {
-                    SLT_INF(*slot_batched, "opener guard switch: active=%d, prediction=%d, remaining=%u"
-                        ", start_active=%d, opener_active=%d, start_remaining=%u, control_active=%d, control_remaining=%u\n",
-                        int(guarded), slot_batched->n_decoded + 1, slot_batched->expert_guard.remaining(),
-                        int(start_guarded), int(opener_guarded), slot_batched->expert_guard.start_remaining(),
-                        int(control_guarded), slot_batched->expert_guard.control_remaining());
-                    slot_batched->guard_last_selected = guarded;
-                    slot_batched->guard_last_start_selected = start_guarded;
-                    slot_batched->guard_last_opener_selected = opener_guarded;
-                    slot_batched->guard_last_control_selected = control_guarded;
-                }
-            }
-
-            const int64_t mac_batch_start = mac_adaptive_prefill ? ggml_time_us() : 0;
             const int ret = llama_decode(ctx, batch_view);
-            if (mac_adaptive_prefill && ret == 0 && n_tokens > 1) {
-                llama_synchronize(ctx);
-                const double elapsed_ms = double(ggml_time_us() - mac_batch_start) / 1000.0;
-                const double ms_per_token = elapsed_ms / n_tokens;
-                const int32_t used_size = mac_prefill_size;
-                // Exclude short checkpoint/tail batches from size comparisons.
-                if (n_tokens == used_size && !mac_prefill_settled) {
-                    if (mac_prefill_previous_size > 0 && used_size > mac_prefill_previous_size &&
-                            ms_per_token > 1.20 * mac_prefill_previous_ms_per_token) {
-                        mac_prefill_size = mac_prefill_previous_size;
-                        mac_prefill_settled = true;
-                    } else {
-                        mac_prefill_previous_size = used_size;
-                        mac_prefill_previous_ms_per_token = ms_per_token;
-                        const int32_t ceiling = std::min(llama_n_batch(ctx), llama_n_ubatch(ctx));
-                        mac_prefill_size = std::min(ceiling, used_size * 2);
-                    }
-                }
-                SRV_INF("mac_adaptive_prefill task=%d tokens=%d elapsed_ms=%.3f next=%d settled=%d\n",
-                        mac_prefill_task, n_tokens, elapsed_ms, mac_prefill_size, int(mac_prefill_settled));
-            }
 
             metrics.on_decoded(slots);
 
             if (ret != 0) {
-                if (guard_enabled() && slot_batched) { ++slot_batched->guard_failed_decodes; }
+
                 {
                     std::string err;
 
@@ -4200,17 +3318,7 @@ private:
                 continue; // continue loop of n_batch
             }
 
-            if (guarded) {
-                ++slot_batched->guard_predictions;
-                slot_batched->guard_start_predictions += start_guarded;
-                slot_batched->guard_opener_predictions += opener_guarded;
-                slot_batched->guard_overlap_predictions += start_guarded && opener_guarded;
-                slot_batched->guard_control_predictions += control_guarded;
-                // Existing overlap is S/O only. Adding control-only preserves
-                // union = start + opener - overlap + control_only for all three.
-                slot_batched->guard_control_only_predictions += control_guarded && !start_guarded && !opener_guarded;
-                slot_batched->expert_guard.commit_forward(true);
-            }
+
 
             for (auto & slot : slots) {
                 if (slot.can_speculate() &&
@@ -4230,10 +3338,6 @@ private:
 
             // on successful decode, restore the original batch size
             n_batch = llama_n_batch(ctx);
-            if (mac_adaptive_prefill && mac_prefill_size > 0) {
-                n_batch = std::min(n_batch, mac_prefill_size);
-            }
-
             // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
             for (auto & slot : slots) {
                 if (slot.state == SLOT_STATE_DONE_PROMPT && slot.task->is_parent()) {
@@ -4288,8 +3392,13 @@ private:
                     GGML_ASSERT(slot.task->need_sampling());
 
                     // prompt evaluated for next-token prediction
-                    server_moe_phase_report(
-                        slot.ctx, "prefill_done", slot.task ? slot.task->id : -1);
+                    if (!server_moe_phase_report(
+                            slot.ctx, "prefill_done", slot.task ? slot.task->id : -1)) {
+                        send_error(slot, "failed to restore decode memory after prompt processing", ERROR_TYPE_SERVER);
+                        slot.release();
+                        slot.i_batch = -1;
+                        continue;
+                    }
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
@@ -4306,86 +3415,17 @@ private:
                 const int tok_idx = slot.i_batch - i;
 
                 llama_token id = LLAMA_TOKEN_NULL;
-                auto next_protocol = slot.k3_protocol;
-                const bool k3_active = sampler_struct_top1.config.active();
-                const bool budget_forced = k3_active && common_sampler_is_budget_forcing(slot.smpl.get());
-                const bool protocol_forced = k3_active && slot.k3_protocol.forcing();
                 try {
-                    if (k3_active) {
-                        id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx, true,
-                            [&](llama_token_data_array & candidates) { slot.k3_protocol.mask(candidates); });
-                        const llama_token sampled = id;
-                        const auto * q = common_sampler_get_candidates(slot.smpl.get(), false);
-                        const auto replacement = sampler_struct_top1.apply(sampled, *q,
-                            budget_forced || protocol_forced, slot.k3_protocol.is_label_token(sampled));
-                        id = replacement.token;
-                        // Validate and stage the observer before changing any live history.
-                        next_protocol.accept(id);
-                        const auto & sampled_info = sampler_struct_top1.tokens[sampled];
-                        const auto & top1_info = sampler_struct_top1.tokens[replacement.top1];
-                        metrics.n_sampler_struct_top1_replacements_total += replacement.replaced;
-                        metrics.n_sampler_struct_mixed_samples_total += sampled_info.mixed;
-                        metrics.n_k3_protocol_forced_tokens_total += protocol_forced;
-                        if (replacement.replaced || sampled_info.mixed || budget_forced || protocol_forced) {
-                            const json event = {
-                                {"task", slot.task->id}, {"slot", slot.id}, {"prediction", slot.n_decoded + 1},
-                                {"input_pos", batch_view.pos[tok_idx]}, {"output_pos", batch_view.pos[tok_idx] + 1},
-                                {"sampled", sampled}, {"sampled_piece", sampled_info.bytes},
-                                {"sampled_bytes_hex", server_struct_bytes_hex(sampled_info.bytes)},
-                                {"sampled_p", replacement.sampled_p}, {"top1", replacement.top1},
-                                {"top1_piece", top1_info.bytes}, {"top1_bytes_hex", server_struct_bytes_hex(top1_info.bytes)},
-                                {"top1_p", replacement.top1_p}, {"final", id}, {"q_size", q->size},
-                                {"probability_basis", "effective_q_before_projection"},
-                                {"min_top1_p", sampler_struct_top1.config.min_top1_p},
-                                {"sampled_mixed", sampled_info.mixed}, {"budget_forced", budget_forced},
-                                {"protocol_forced", protocol_forced}, {"protocol_phase", slot.k3_protocol.name()},
-                                {"replaced", replacement.replaced},
-                                {"replacements_total", metrics.n_sampler_struct_top1_replacements_total}
-                            };
-                            SLT_INF(slot, "%s %s\n", replacement.replaced ? "sampler_struct_top1_replace" :
-                                sampled_info.mixed ? "sampler_struct_mixed_sample" : "k3_sampler_forced",
-                                event.dump(-1, ' ', true, json::error_handler_t::replace).c_str());
-                        }
-                    } else {
-                        id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
-                    }
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
                 } catch (const std::exception & e) {
-                    ++metrics.n_k3_constraint_conflicts_total;
-                    const json event = {
-                        {"task", slot.task->id}, {"slot", slot.id}, {"prediction", slot.n_decoded + 1},
-                        {"input_pos", batch_view.pos[tok_idx]}, {"error", e.what()},
-                        {"protocol_phase", slot.k3_protocol.name()}, {"stack", slot.k3_protocol.stack()},
-                        {"label_bytes_hex", server_struct_bytes_hex(slot.k3_protocol.label_bytes())},
-                        {"budget_forced", budget_forced}, {"protocol_forced", protocol_forced},
-                        {"conflicts_total", metrics.n_k3_constraint_conflicts_total}
-                    };
-                    SLT_ERR(slot, "k3_constraint_conflict %s\n", event.dump().c_str());
+                    SLT_ERR(slot, "sampling failed: %s\n", e.what());
                     send_error(slot, e.what(), ERROR_TYPE_SERVER);
                     slot.release();
                     slot.i_batch = -1;
                     continue;
                 }
-
                 slot.i_batch = -1;
-                const bool reasoning_end_complete = k3_active && slot.k3_protocol.state() == server_k3_protocol::CLOSE_LABEL &&
-                    next_protocol.state() == server_k3_protocol::AFTER_THINK;
-                const bool reasoning_end_token = reasoning_end_complete || (k3_active &&
-                    next_protocol.state() == server_k3_protocol::CLOSE_LABEL && next_protocol.stack().back() == "think");
-                common_sampler_accept(slot.smpl.get(), id, true, reasoning_end_token, reasoning_end_complete);
-                const char * token_trace = std::getenv("LLAMA_K3_SERVER_TOKEN_TRACE");
-                if (token_trace && std::strcmp(token_trace, "1") == 0) {
-                    SLT_INF(slot, "k3_output_token prediction=%d input_pos=%d token=%d budget_forced=%d protocol_forced=%d\n",
-                        slot.n_decoded + 1, batch_view.pos[tok_idx], id, int(budget_forced), int(protocol_forced));
-                }
-                if (k3_active) { slot.k3_protocol = std::move(next_protocol); }
-                const bool was_opened = slot.expert_guard.opened();
-                const uint64_t control_triggers_before = slot.expert_guard.control_triggers();
-                slot.expert_guard.accept_generated(id);
-                if (!was_opened && slot.expert_guard.opened()) { slot.guard_opened_after_token = slot.n_decoded + 1; }
-                if (slot.expert_guard.control_triggers() != control_triggers_before) {
-                    SLT_INF(slot, "opener guard control trigger: token=%d, after_token=%d, remaining=%u, triggers=%" PRIu64 "\n",
-                        id, slot.n_decoded + 1, slot.expert_guard.control_remaining(), slot.expert_guard.control_triggers());
-                }
+                common_sampler_accept(slot.smpl.get(), id, true);
 
                 // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();
@@ -4411,7 +3451,6 @@ private:
 
                 if (!process_token(result, slot)) {
                     // release slot because of stop condition
-                    flush_loop_output_hold(slot);
                     slot.print_timings();
                     send_final_response(slot);
                     metrics.on_prediction(slot);
@@ -4545,7 +3584,6 @@ private:
                     // TODO: set result.probs
 
                     if (!process_token(result, slot)) {
-                        flush_loop_output_hold(slot);
                         slot.print_timings();
                         send_final_response(slot);
                         metrics.on_prediction(slot);
@@ -4690,10 +3728,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         std::vector<server_task> tasks;
 
         const auto & prompt = data.at("prompt");
-        if (server_raw_io_log_enabled()) {
-            SRV_INF("raw_io id=%s input_pre_tokenizer=%s\n", completion_id.c_str(), prompt.dump().c_str());
-        }
-
         // process prompt
         std::vector<server_tokens> inputs;
         int64_t n_shared_prefix = 0;
@@ -4983,22 +4017,6 @@ void server_routes::init_routes() {
                     {"name",  "tokens_predicted_total"},
                     {"help",  "Number of generation tokens processed."},
                     {"value",  (uint64_t) res_task->n_tokens_predicted_total}
-            }, {
-                    {"name",  "sampler_struct_top1_replacements_total"},
-                    {"help",  "Structural non-top-1 samples projected to effective-distribution top-1."},
-                    {"value", res_task->n_sampler_struct_top1_replacements_total}
-            }, {
-                    {"name", "sampler_struct_mixed_samples_total"},
-                    {"help", "Mixed body/structure pieces sampled; never projected."},
-                    {"value", res_task->n_sampler_struct_mixed_samples_total}
-            }, {
-                    {"name", "k3_constraint_conflicts_total"},
-                    {"help", "Requests failed on an empty or inconsistent K3 sampling constraint."},
-                    {"value", res_task->n_k3_constraint_conflicts_total}
-            }, {
-                    {"name", "k3_protocol_forced_tokens_total"},
-                    {"help", "Protocol-forced tokens exempt from structural projection."},
-                    {"value", res_task->n_k3_protocol_forced_tokens_total}
             }, {
                     {"name",  "tokens_predicted_seconds_total"},
                     {"help",  "Predict process time"},

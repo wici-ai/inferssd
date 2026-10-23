@@ -1,4 +1,4 @@
-#include "../../ggml/src/ggml-ssd/store/store.h"
+#include "legacy-runtime/store.h"
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>

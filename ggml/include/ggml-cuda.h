@@ -56,8 +56,7 @@ GGML_BACKEND_API bool ggml_cuda_oom_reclaimer_register(
 GGML_BACKEND_API bool ggml_cuda_oom_reclaimer_unregister(
         int device, ggml_cuda_oom_reclaimer_fn callback, void * userdata);
 // Memory that device allocations must leave free, set at run time by a cache that can give memory back
-// through the OOM reclaimer (on unified memory, the host's own working set). The effective reserve is
-// the larger of this and GGML_CUDA_MEMORY_RESERVE_MIB.
+// through the OOM reclaimer (on unified memory, the host's own working set).
 GGML_BACKEND_API void ggml_cuda_set_memory_reserve(int device, size_t bytes);
 // Pinned host memory about to be allocated for the current device: on a unified-memory GPU it comes out of the same
 // DRAM, so the reserve is made first (the OOM reclaimer gives memory back). False when no room could be made; the
@@ -66,21 +65,6 @@ GGML_BACKEND_API bool ggml_cuda_admit_host_alloc(size_t size);
 // Deterministic test hook; the next count backend-buffer allocations report
 // OOM before cudaMalloc and exercise the same reclaim-and-retry loop.
 GGML_BACKEND_API bool ggml_cuda_oom_reclaimer_inject_failures(int device, uint64_t count);
-
-// Optional prefill seeding of an expert cache (one owner per device). The scheduler offers every routed expert
-// tensor it copied to a device for a graph pass (ggml_cuda_moe_seed_offer): the tensor's name, its device copy,
-// the bytes of one expert, the expert count and the pass's routing count of each expert, with `ready` (a
-// cudaEvent_t) recorded on the backend's stream behind the copy. The callback may copy experts out of it on its
-// own stream after waiting for `ready`; it sets *done to an event recorded behind those copies (or leaves it null),
-// and the backend's stream waits for it before the split that copied computes (ggml_cuda_moe_seed_fence): a node
-// after the expert matmul may reuse the copy's memory.
-typedef int (*ggml_cuda_moe_seed_fn)(void * userdata, const char * tensor_name, const void * data, size_t expert_bytes,
-        int64_t n_expert, const int32_t * counts, void * ready, void ** done);
-GGML_BACKEND_API bool ggml_cuda_moe_seed_register(int device, ggml_cuda_moe_seed_fn callback, void * userdata);
-GGML_BACKEND_API bool ggml_cuda_moe_seed_unregister(int device, ggml_cuda_moe_seed_fn callback, void * userdata);
-GGML_BACKEND_API void ggml_cuda_moe_seed_offer(ggml_backend_t backend, const struct ggml_tensor * tensor,
-        const char * tensor_name, int64_t n_expert, size_t expert_bytes, const int32_t * counts);
-GGML_BACKEND_API void ggml_cuda_moe_seed_fence(ggml_backend_t backend);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 

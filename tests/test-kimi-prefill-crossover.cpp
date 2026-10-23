@@ -1,3 +1,5 @@
+#include "ssd/gpu-kernels.h"
+#include "ssd/explicit-fixture-inputs.h"
 // Real-pack DeepSeek-V4.1 prefill crossover benchmark.
 //
 // The timed region has no storage access.  Setup reads one expert triplet,
@@ -179,31 +181,31 @@ struct json_writer {
     }
 };
 
-static void configure_environment() {
-    setenv("GGML_KIMI_CPU_SINK_READY_FIRST", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_SPLIT_CV", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_EARLY_UP_GATE", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_ROLE_MAJOR", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_NONBLOCKING_DOWN_SCHED", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_DYNAMIC_ROWS", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_DYNAMIC_CHUNK_ROWS", "64", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_POLICY", "lru", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_ALLOCATION", "uniform", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_KEEP_ACROSS_REQUESTS", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_PREFILL_READ", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_CACHE_RESERVE_BYTES", "536870912", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_BYTES", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_PREFILL", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_POLICY", "lru", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MIN_COUNT", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_KEEP_ACROSS_REQUESTS", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_GLOBAL_POOL", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_ELASTIC", "0", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_SAFETY_MIB", "32", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN", "1", 1);
-    setenv("GGML_KIMI_CPU_SINK_VRAM_TIMING", "1", 1);
+static void configure_environment(fixture_inputs & inputs) {
+    inputs.set("ready_first", "1");
+    inputs.set("split_cv", "1");
+    inputs.set("early_up_gate", "1");
+    inputs.set("role_major", "1");
+    inputs.set("nonblocking_down_sched", "1");
+    inputs.set("dynamic_rows", "1");
+    inputs.set("dynamic_chunk_rows", "64");
+    inputs.set("cache_policy", "lru");
+    inputs.set("cache_allocation", "uniform");
+    inputs.set("cache_keep", "1");
+    inputs.set("cache_prefill_read", "1");
+    inputs.set("cache_reserve_bytes", "536870912");
+    inputs.set("vram_budget", "0");
+    inputs.set("vram_prefill", "0");
+    inputs.set("tier.policy", "lru");
+    inputs.set("tier.min_count", "0");
+    inputs.set("tier.keep_across_requests", "1");
+    inputs.set("vram_async", "0");
+    inputs.set("vram_deferred", "0");
+    inputs.set("tier.global", "0");
+    inputs.set("tier.elastic", "0");
+    inputs.set("tier.safety_mib", "32");
+    inputs.set("tier.mxfp4_gpu_hidden", "1");
+    inputs.set("tier.timing", "1");
 }
 
 struct cpu_runner {
@@ -219,9 +221,9 @@ struct cpu_runner {
     std::vector<float> weights;
     std::vector<float> output;
 
-    cpu_runner(real_expert & value, int threads, int maximum) :
+    cpu_runner(fixture_inputs & inputs, real_expert & value, int threads, int maximum) :
             expert(value), metadata(expert.pack, expert.layer),
-            sink(make_sink(expert.pack, threads, 8)),
+            sink(make_sink(inputs, expert.pack, threads, 8)),
             prefill(nullptr, kimi_cpu_prefill_destroy),
             input(size_t(maximum) * size_t(expert.pack.latent)),
             ids(size_t(maximum), expert.expert), weights(size_t(maximum), 1.0f),
@@ -331,8 +333,7 @@ struct gpu_runner {
                         quantized.data + size_t(row) * input_stride, expert.pack.latent);
             }
         }
-        auto get_batch = reinterpret_cast<const kimi_mxfp4_batch_api * (*)()>(
-                dlsym(RTLD_DEFAULT, "kimi_mxfp4_batch_get_api"));
+        auto get_batch = kimi_mxfp4_batch_get_api;
         if (use_batch && get_batch && expert.pack.type == GGML_TYPE_MXFP4) {
             batch_api = get_batch();
             require(batch_api && batch_api->version == 3 && batch_api->size == sizeof(*batch_api),
@@ -526,9 +527,9 @@ static options parse_options(int argc, char ** argv) {
     return result;
 }
 
-static int run(int argc, char ** argv) {
+static int run(fixture_inputs & inputs, int argc, char ** argv) {
     const options o = parse_options(argc, argv);
-    configure_environment();
+    configure_environment(inputs);
     ggml_cpu_init();
     std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu_backend(
         ggml_backend_cpu_init(), ggml_backend_free);
@@ -537,7 +538,7 @@ static int run(int argc, char ** argv) {
     load_expert(expert, o);
     constexpr int maximum = 2048;
     const std::array<int, 11> multiplicities = { 1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048 };
-    cpu_runner cpu(expert, o.threads, maximum);
+    cpu_runner cpu(inputs, expert, o.threads, maximum);
     if (!o.real_input.empty()) {
         std::ifstream stream(o.real_input, std::ios::binary);
         require(bool(stream), "cannot open real activation dump");
@@ -609,7 +610,7 @@ static int run(int argc, char ** argv) {
                 size_t(count) * size_t(expert.pack.latent));
             require(resident_error < 0.001, "tier resident batch output differs from CPU");
             const uint64_t stride = expert.role_bytes[0] + expert.role_bytes[1] + expert.role_bytes[2];
-            tier cold(stride);
+            tier cold(stride, inputs.tier_policy(), nullptr, test_cpu_kernels());
             cold.begin(20260921, 0, false);
             const kimi_vram_request request = make_request(expert, 0);
             int slot = -2;
@@ -658,8 +659,9 @@ static int run(int argc, char ** argv) {
 
 #ifndef KIMI_CROSSOVER_NO_MAIN
 int main(int argc, char ** argv) {
+    fixture_inputs inputs; inputs.set_runtime_services(test_gpu_services());
     try {
-        return crossover::run(argc, argv);
+        return crossover::run(inputs, argc, argv);
     } catch (const std::exception & error) {
         std::fprintf(stderr, "CROSSOVER_FAIL: %s\n", error.what());
         return 1;

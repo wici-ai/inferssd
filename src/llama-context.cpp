@@ -4,8 +4,8 @@
 #include "llama-arch.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
-#include "llama-cpu-sink.h"
-#include "llama-host-gather.h"
+#include "ssd/cpu-runtime.h"
+#include "ssd/host-gather.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -22,17 +22,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
-#include <fstream>
 #include <limits>
-#include <mutex>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <dlfcn.h>
-#endif
 
 extern "C" bool llama_moe_prefill_phase_workspace(
         llama_context * ctx,
@@ -47,16 +41,6 @@ extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(
         uint32_t prompt_tokens,
         uint32_t prefill_tokens);
 
-#if __has_include(<nvtx3/nvToolsExt.h>)
-#include <nvtx3/nvToolsExt.h>
-#define LLAMA_MOE_NVTX_HEADER_AVAILABLE 1
-#elif __has_include("/usr/local/cuda/include/nvtx3/nvToolsExt.h")
-#include "/usr/local/cuda/include/nvtx3/nvToolsExt.h"
-#define LLAMA_MOE_NVTX_HEADER_AVAILABLE 1
-#else
-#define LLAMA_MOE_NVTX_HEADER_AVAILABLE 0
-#endif
-
 //
 // llama_context
 //
@@ -65,878 +49,13 @@ namespace {
 
 static std::atomic<uint64_t> kimi_cpu_sink_context_epoch { 1 };
 
-static bool llama_kimi_kda_gpu_layer_selected(int layer) {
-    const char * env = std::getenv("GGML_KIMI_KDA_GPU_LAYERS");
-    if (env == nullptr || env[0] == '\0' || std::strcmp(env, "0") == 0) {
-        return false;
-    }
-    if (std::strcmp(env, "all") == 0 || std::strcmp(env, "*") == 0) {
-        return true;
-    }
-
-    const char * p = env;
-    while (*p != '\0') {
-        while (*p == ' ' || *p == '\t' || *p == ',') {
-            ++p;
-        }
-        if (*p == '\0') {
-            break;
-        }
-
-        errno = 0;
-        char * end = nullptr;
-        const long first = std::strtol(p, &end, 10);
-        if (errno != 0 || end == p || first < 0 ||
-                first > std::numeric_limits<int>::max()) {
-            return false;
-        }
-        long last = first;
-        p = end;
-        if (*p == '-') {
-            ++p;
-            errno = 0;
-            last = std::strtol(p, &end, 10);
-            if (errno != 0 || end == p || last < first ||
-                    last > std::numeric_limits<int>::max()) {
-                return false;
-            }
-            p = end;
-        }
-        if (layer >= first && layer <= last) {
-            return true;
-        }
-        while (*p == ' ' || *p == '\t') {
-            ++p;
-        }
-        if (*p != '\0' && *p != ',') {
-            return false;
-        }
-    }
-    return false;
-}
-
-struct kimi_logits_trace_state {
-    std::mutex mutex;
-    FILE * file = nullptr;
-    bool initialized = false;
-    bool enabled = false;
-    bool have_last_hash = false;
-    uint64_t sequence = 0;
-    uint64_t last_hash = 0;
-    int32_t n_vocab = 0;
-};
-
-static kimi_logits_trace_state & kimi_logits_trace_get_state() {
-    static kimi_logits_trace_state * state = new kimi_logits_trace_state();
-    return *state;
-}
-
-static uint64_t kimi_logits_trace_hash(const float * logits, int32_t n_vocab) {
-    const uint8_t * bytes = reinterpret_cast<const uint8_t *>(logits);
-    const size_t size = (size_t) n_vocab * sizeof(float);
-    uint64_t hash = 1469598103934665603ULL;
-    for (size_t i = 0; i < size; ++i) {
-        hash ^= bytes[i];
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-static void kimi_logits_trace_write(const float * logits, int32_t n_vocab, int32_t output_index) {
-    const char * path = std::getenv("LLAMA_KIMI_LOGITS_TRACE");
-    if (!path || !path[0] || !logits || n_vocab <= 0) {
-        return;
-    }
-
-    kimi_logits_trace_state & state = kimi_logits_trace_get_state();
-    std::lock_guard<std::mutex> lock(state.mutex);
-    if (!state.initialized) {
-        state.initialized = true;
-        state.file = std::fopen(path, "wb");
-        if (!state.file) {
-            LLAMA_LOG_ERROR("[kimi_logits_trace] failed to open %s\n", path);
-            return;
-        }
-
-        const char magic[8] = { 'K', 'L', 'O', 'G', 'I', 'T', 'S', '1' };
-        const uint32_t version = 1;
-        const uint32_t vocab = (uint32_t) n_vocab;
-        if (std::fwrite(magic, sizeof(magic), 1, state.file) != 1 ||
-                std::fwrite(&version, sizeof(version), 1, state.file) != 1 ||
-                std::fwrite(&vocab, sizeof(vocab), 1, state.file) != 1) {
-            LLAMA_LOG_ERROR("[kimi_logits_trace] failed to write header to %s\n", path);
-            std::fclose(state.file);
-            state.file = nullptr;
-            return;
-        }
-        state.n_vocab = n_vocab;
-        state.enabled = true;
-        LLAMA_LOG_INFO("[kimi_logits_trace] enabled: %s n_vocab=%d\n", path, n_vocab);
-    }
-
-    if (!state.enabled || !state.file || state.n_vocab != n_vocab) {
-        return;
-    }
-
-    const uint64_t hash = kimi_logits_trace_hash(logits, n_vocab);
-    if (state.have_last_hash && state.last_hash == hash) {
-        return;
-    }
-
-    const uint64_t sequence = state.sequence++;
-    const uint32_t vocab = (uint32_t) n_vocab;
-    if (std::fwrite(&sequence, sizeof(sequence), 1, state.file) != 1 ||
-            std::fwrite(&output_index, sizeof(output_index), 1, state.file) != 1 ||
-            std::fwrite(&vocab, sizeof(vocab), 1, state.file) != 1 ||
-            std::fwrite(&hash, sizeof(hash), 1, state.file) != 1 ||
-            std::fwrite(logits, sizeof(float), (size_t) n_vocab, state.file) != (size_t) n_vocab ||
-            std::fflush(state.file) != 0) {
-        LLAMA_LOG_ERROR("[kimi_logits_trace] write failed at sequence %llu\n", (unsigned long long) sequence);
-        state.enabled = false;
-        return;
-    }
-
-    state.last_hash = hash;
-    state.have_last_hash = true;
-}
-
-struct llama_nvtx_api {
-    bool initialized = false;
-    bool enabled = false;
-#if !LLAMA_MOE_NVTX_HEADER_AVAILABLE
-    int (*range_push_a)(const char *) = nullptr;
-    int (*range_pop)() = nullptr;
-#endif
-};
-
-static llama_nvtx_api g_llama_nvtx;
-static std::once_flag g_llama_nvtx_once;
-
-static void llama_nvtx_init_once() {
-    const char *env = std::getenv("GGML_MOE_NVTX");
-    if (!env || !env[0] || env[0] == '0') {
-        g_llama_nvtx.initialized = true;
-        return;
-    }
-#if LLAMA_MOE_NVTX_HEADER_AVAILABLE
-    g_llama_nvtx.enabled = true;
-#else
-#if !defined(_WIN32)
-    void *handle = dlopen("libnvToolsExt.so.1", RTLD_LAZY | RTLD_LOCAL);
-    if (!handle) {
-        handle = dlopen("libnvToolsExt.so", RTLD_LAZY | RTLD_LOCAL);
-    }
-    if (handle) {
-        g_llama_nvtx.range_push_a = reinterpret_cast<int (*)(const char *)>(dlsym(handle, "nvtxRangePushA"));
-        g_llama_nvtx.range_pop = reinterpret_cast<int (*)()>(dlsym(handle, "nvtxRangePop"));
-        g_llama_nvtx.enabled = g_llama_nvtx.range_push_a && g_llama_nvtx.range_pop;
-    }
-#endif
-#endif
-    g_llama_nvtx.initialized = true;
-}
-
-static bool llama_nvtx_push(const char *label) {
-    std::call_once(g_llama_nvtx_once, llama_nvtx_init_once);
-    if (!g_llama_nvtx.enabled || !label || !label[0]) return false;
-#if LLAMA_MOE_NVTX_HEADER_AVAILABLE
-    nvtxRangePushA(label);
-#else
-    g_llama_nvtx.range_push_a(label);
-#endif
-    return true;
-}
-
-static void llama_nvtx_pop() {
-    if (g_llama_nvtx.enabled) {
-#if LLAMA_MOE_NVTX_HEADER_AVAILABLE
-        nvtxRangePop();
-#else
-        if (g_llama_nvtx.range_pop) {
-            g_llama_nvtx.range_pop();
-        }
-#endif
-    }
-}
-
-class llama_nvtx_range {
-public:
-    explicit llama_nvtx_range(const char *label) : active(llama_nvtx_push(label)) {}
-    ~llama_nvtx_range() {
-        if (active) llama_nvtx_pop();
-    }
-    llama_nvtx_range(const llama_nvtx_range &) = delete;
-    llama_nvtx_range & operator=(const llama_nvtx_range &) = delete;
-
-private:
-    bool active = false;
-};
-
-struct kimi_layer_gap_context_entry {
-    uint64_t call_index = 0;
-    uint32_t n_tokens = 0;
-    int reused = 0;
-    uint64_t call_start_us = 0;
-    uint64_t graph_prepare_start_us = 0;
-    uint64_t graph_build_start_us = 0;
-    uint64_t graph_build_end_us = 0;
-    uint64_t graph_alloc_end_us = 0;
-    uint64_t set_inputs_start_us = 0;
-    uint64_t set_inputs_end_us = 0;
-    uint64_t compute_start_us = 0;
-    uint64_t compute_end_us = 0;
-    uint64_t call_end_us = 0;
-};
-
-struct kimi_layer_gap_sync_entry {
-    uint32_t queued_tokens = 0;
-    uint64_t sync_start_us = 0;
-    uint64_t sync_end_us = 0;
-};
-
-struct kimi_layer_gap_context_buffer {
-    std::vector<kimi_layer_gap_context_entry> entries;
-    std::vector<kimi_layer_gap_sync_entry> sync_entries;
-};
-
-static const char * const g_kimi_layer_gap_context_prefix =
-    std::getenv("GGML_MOE_TRACE_LAYER_GAPS");
-static const bool g_kimi_layer_gap_context_enabled =
-    g_kimi_layer_gap_context_prefix != nullptr && g_kimi_layer_gap_context_prefix[0] != '\0';
-static std::atomic<uint64_t> g_kimi_layer_gap_context_call_index{0};
-static std::once_flag g_kimi_layer_gap_context_init_once;
-
-static std::mutex & kimi_layer_gap_context_registry_mutex() {
-    static auto * mutex = new std::mutex();
-    return *mutex;
-}
-
-static std::vector<kimi_layer_gap_context_buffer *> & kimi_layer_gap_context_registry() {
-    static auto * registry = new std::vector<kimi_layer_gap_context_buffer *>();
-    return *registry;
-}
-
-static void kimi_layer_gap_context_report_atexit() {
-    if (!g_kimi_layer_gap_context_enabled) {
-        return;
-    }
-    const std::string path = std::string(g_kimi_layer_gap_context_prefix) + ".context.csv";
-    FILE * file = std::fopen(path.c_str(), "w");
-    if (file == nullptr) {
-        std::fprintf(stderr, "[kimi_layer_gap] context trace open failed: %s\n", path.c_str());
-        return;
-    }
-    std::fprintf(
-        file,
-        "call_index,n_tokens,reused,call_start_us,graph_prepare_start_us,"
-        "graph_build_start_us,graph_build_end_us,graph_alloc_end_us,"
-        "set_inputs_start_us,set_inputs_end_us,compute_start_us,compute_end_us,call_end_us\n");
-    size_t rows = 0;
-    {
-        std::lock_guard<std::mutex> lock(kimi_layer_gap_context_registry_mutex());
-        for (const kimi_layer_gap_context_buffer * buffer : kimi_layer_gap_context_registry()) {
-            for (const kimi_layer_gap_context_entry & entry : buffer->entries) {
-                std::fprintf(
-                    file,
-                    "%" PRIu64 ",%u,%d,%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
-                    "%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ","
-                    "%" PRIu64 ",%" PRIu64 "\n",
-                    entry.call_index,
-                    entry.n_tokens,
-                    entry.reused,
-                    entry.call_start_us,
-                    entry.graph_prepare_start_us,
-                    entry.graph_build_start_us,
-                    entry.graph_build_end_us,
-                    entry.graph_alloc_end_us,
-                    entry.set_inputs_start_us,
-                    entry.set_inputs_end_us,
-                    entry.compute_start_us,
-                    entry.compute_end_us,
-                    entry.call_end_us);
-                ++rows;
-            }
-        }
-    }
-    std::fclose(file);
-    std::fprintf(stderr, "[kimi_layer_gap] context trace written: %s (%zu rows)\n", path.c_str(), rows);
-
-    const std::string sync_path = std::string(g_kimi_layer_gap_context_prefix) + ".sync.csv";
-    file = std::fopen(sync_path.c_str(), "w");
-    if (file == nullptr) {
-        std::fprintf(stderr, "[kimi_layer_gap] sync trace open failed: %s\n", sync_path.c_str());
-        return;
-    }
-    std::fprintf(file, "queued_tokens,sync_start_us,sync_end_us\n");
-    rows = 0;
-    {
-        std::lock_guard<std::mutex> lock(kimi_layer_gap_context_registry_mutex());
-        for (const kimi_layer_gap_context_buffer * buffer : kimi_layer_gap_context_registry()) {
-            for (const kimi_layer_gap_sync_entry & entry : buffer->sync_entries) {
-                std::fprintf(
-                    file,
-                    "%u,%" PRIu64 ",%" PRIu64 "\n",
-                    entry.queued_tokens,
-                    entry.sync_start_us,
-                    entry.sync_end_us);
-                ++rows;
-            }
-        }
-    }
-    std::fclose(file);
-    std::fprintf(stderr, "[kimi_layer_gap] sync trace written: %s (%zu rows)\n", sync_path.c_str(), rows);
-}
-
-static kimi_layer_gap_context_buffer & kimi_layer_gap_context_thread_buffer() {
-    static thread_local kimi_layer_gap_context_buffer * buffer = nullptr;
-    if (buffer == nullptr) {
-        std::call_once(g_kimi_layer_gap_context_init_once, []() {
-            std::atexit(kimi_layer_gap_context_report_atexit);
-            std::fprintf(
-                stderr,
-                "[kimi_layer_gap] context trace enabled: prefix=%s\n",
-                g_kimi_layer_gap_context_prefix);
-        });
-        buffer = new kimi_layer_gap_context_buffer();
-        buffer->entries.reserve(256);
-        std::lock_guard<std::mutex> lock(kimi_layer_gap_context_registry_mutex());
-        kimi_layer_gap_context_registry().push_back(buffer);
-    }
-    return *buffer;
-}
-
-struct kimi_graph_profile_state {
-    std::atomic<uint64_t> submit_calls{0};
-    std::atomic<uint64_t> submit_us{0};
-    std::atomic<uint64_t> sync_calls{0};
-    std::atomic<uint64_t> sync_us{0};
-    std::atomic<uint64_t> sync_decode_calls{0};
-    std::atomic<uint64_t> sync_decode_us{0};
-    std::atomic<uint64_t> sync_prompt_calls{0};
-    std::atomic<uint64_t> sync_prompt_us{0};
-    std::atomic<uint64_t> sync_idle_calls{0};
-    std::atomic<uint64_t> sync_idle_us{0};
-    std::atomic<uint64_t> sync_decode_tokens{0};
-    std::atomic<uint64_t> sync_prompt_tokens{0};
-};
-
-static kimi_graph_profile_state g_kimi_graph_profile;
-
-static const char * ds4_weight_profile_path() {
-    const char * path = std::getenv("GGML_DS4_WEIGHT_PROFILE_OUT");
-    if (path == nullptr || path[0] == '\0' || std::strcmp(path, "0") == 0) {
-        return nullptr;
-    }
-    return path;
-}
-
-static FILE * ds4_weight_profile_fp() {
-    static FILE * fp = nullptr;
-    static bool attempted = false;
-    if (fp != nullptr || attempted) {
-        return fp;
-    }
-    attempted = true;
-    const char * path = ds4_weight_profile_path();
-    if (path == nullptr) {
-        return nullptr;
-    }
-    fp = std::fopen(path, "w");
-    if (fp == nullptr) {
-        LLAMA_LOG_WARN("ds4 weight profile: failed to open %s\n", path);
-        return nullptr;
-    }
-    std::fprintf(fp, "graph_seq,batched,node,il,ne0,ne1,ne2,nb0,nb1,nb2,token,rank,value\n");
-    std::fflush(fp);
-    return fp;
-}
-
-static int ds4_weight_profile_layer_from_name(const char * name) {
-    if (name == nullptr) {
-        return -1;
-    }
-    const char * dash = std::strrchr(name, '-');
-    if (dash == nullptr || dash[1] == '\0') {
-        return -1;
-    }
-    char * end = nullptr;
-    const long value = std::strtol(dash + 1, &end, 10);
-    if (end == dash + 1) {
-        return -1;
-    }
-    return (int) value;
-}
-
-static void kimi_graph_profile_report() {
-    const uint64_t submit_calls = g_kimi_graph_profile.submit_calls.load();
-    const uint64_t sync_calls   = g_kimi_graph_profile.sync_calls.load();
-    if (submit_calls == 0 && sync_calls == 0) {
-        return;
-    }
-    const auto avg_ms = [](uint64_t us, uint64_t calls) {
-        return calls == 0 ? 0.0 : (double) us / 1000.0 / (double) calls;
-    };
-    const uint64_t submit_us       = g_kimi_graph_profile.submit_us.load();
-    const uint64_t sync_us         = g_kimi_graph_profile.sync_us.load();
-    const uint64_t sync_dec_calls  = g_kimi_graph_profile.sync_decode_calls.load();
-    const uint64_t sync_dec_us     = g_kimi_graph_profile.sync_decode_us.load();
-    const uint64_t sync_pr_calls   = g_kimi_graph_profile.sync_prompt_calls.load();
-    const uint64_t sync_pr_us      = g_kimi_graph_profile.sync_prompt_us.load();
-    const uint64_t sync_idle_calls = g_kimi_graph_profile.sync_idle_calls.load();
-    const uint64_t sync_idle_us    = g_kimi_graph_profile.sync_idle_us.load();
-    LLAMA_LOG_INFO(
-        "[kimi_graph_profile] submit: calls=%" PRIu64 " total=%.3f ms avg=%.3f ms/call\n",
-        submit_calls, (double) submit_us / 1000.0, avg_ms(submit_us, submit_calls));
-    LLAMA_LOG_INFO(
-        "[kimi_graph_profile] sync: calls=%" PRIu64 " total=%.3f ms avg=%.3f ms/call "
-        "decode_calls=%" PRIu64 " decode_tokens=%" PRIu64 " decode_total=%.3f ms decode_avg=%.3f ms/call "
-        "prompt_calls=%" PRIu64 " prompt_tokens=%" PRIu64 " prompt_total=%.3f ms prompt_avg=%.3f ms/call "
-        "idle_calls=%" PRIu64 " idle_total=%.3f ms idle_avg=%.3f ms/call\n",
-        sync_calls, (double) sync_us / 1000.0, avg_ms(sync_us, sync_calls),
-        sync_dec_calls, g_kimi_graph_profile.sync_decode_tokens.load(),
-        (double) sync_dec_us / 1000.0, avg_ms(sync_dec_us, sync_dec_calls),
-        sync_pr_calls, g_kimi_graph_profile.sync_prompt_tokens.load(),
-        (double) sync_pr_us / 1000.0, avg_ms(sync_pr_us, sync_pr_calls),
-        sync_idle_calls, (double) sync_idle_us / 1000.0, avg_ms(sync_idle_us, sync_idle_calls));
-}
-
-static bool kimi_graph_profile_enabled() {
-    static bool enabled = []() {
-        const char * env = std::getenv("LLAMA_KIMI_GRAPH_PROFILE");
-        const bool on = env && env[0] && env[0] != '0';
-        if (on) {
-            std::atexit(kimi_graph_profile_report);
-        }
-        return on;
-    }();
-    return enabled;
-}
-
-struct moe_next_gate_shadow_csv_state {
-    std::mutex mutex;
-    std::ofstream file;
-    bool initialized = false;
-    bool disabled = false;
-    uint64_t call = 0;
-};
-
-static moe_next_gate_shadow_csv_state g_moe_next_gate_shadow_csv;
-
-static const char * moe_next_gate_shadow_out_path() {
-    const char * path = std::getenv("GGML_MOE_NEXT_GATE_SHADOW_OUT");
-    return path && path[0] ? path : nullptr;
-}
-
-struct moe_route_score_trace_csv_state {
-    std::mutex mutex;
-    std::ofstream file;
-    bool initialized = false;
-    bool disabled = false;
-    uint64_t call = 0;
-};
-
-static moe_route_score_trace_csv_state g_moe_route_score_trace_csv;
-
-static const char * moe_route_score_trace_out_path() {
-    const char * path = std::getenv("GGML_MOE_ROUTE_SCORE_TRACE_OUT");
-    return path && path[0] ? path : nullptr;
-}
-
-struct moe_next_gate_prefetch_probe_state {
-    std::mutex mutex;
-    std::ofstream file;
-    bool initialized = false;
-    bool disabled = false;
-    uint64_t seq = 0;
-};
-
-static moe_next_gate_prefetch_probe_state g_moe_next_gate_prefetch_probe;
-
-static const char * moe_next_gate_prefetch_probe_out_path() {
-    const char * path = std::getenv("GGML_MOE_NEXT_GATE_PREFETCH_PROBE_OUT");
-    return path && path[0] ? path : nullptr;
-}
-
-static bool moe_next_gate_prefetch_probe_wants(const ggml_tensor * t) {
-    const char * path = moe_next_gate_prefetch_probe_out_path();
-    if (!path || !t || !t->name[0] || t->type != GGML_TYPE_I32 || !ggml_is_contiguous(t)) {
-        return false;
-    }
-    return std::strstr(t->name, "ffn_moe_next_shadow_topk") != nullptr ||
-        std::strstr(t->name, "ffn_moe_topk") != nullptr;
-}
-
-static std::string moe_next_gate_shadow_values_csv(const std::vector<int32_t> & values) {
-    std::ostringstream oss;
-    for (size_t i = 0; i < values.size(); ++i) {
-        if (i > 0) {
-            oss << '|';
-        }
-        oss << values[i];
-    }
-    return oss.str();
-}
-
-static std::string moe_route_score_float_values_csv(const std::vector<float> & values) {
-    std::ostringstream oss;
-    oss.precision(9);
-    for (size_t i = 0; i < values.size(); ++i) {
-        if (i > 0) {
-            oss << '|';
-        }
-        oss << values[i];
-    }
-    return oss.str();
-}
-
-static void moe_next_gate_prefetch_probe_record(ggml_tensor * t) {
-    const char * path = moe_next_gate_prefetch_probe_out_path();
-    if (!path || !t || !t->name[0] || t->type != GGML_TYPE_I32 || !ggml_is_contiguous(t)) {
-        return;
-    }
-
-    const int64_t start_us = ggml_time_us();
-    std::vector<int32_t> values((size_t)ggml_nelements(t));
-    if (ggml_backend_buffer_is_host(t->buffer)) {
-        std::memcpy(values.data(), t->data, ggml_nbytes(t));
-    } else {
-        ggml_backend_tensor_get(t, values.data(), 0, ggml_nbytes(t));
-    }
-    const int64_t copy_us = ggml_time_us() - start_us;
-
-    std::lock_guard<std::mutex> lock(g_moe_next_gate_prefetch_probe.mutex);
-    if (g_moe_next_gate_prefetch_probe.disabled) {
-        return;
-    }
-    if (!g_moe_next_gate_prefetch_probe.initialized) {
-        g_moe_next_gate_prefetch_probe.file.open(path, std::ios::out);
-        if (!g_moe_next_gate_prefetch_probe.file) {
-            LLAMA_LOG_ERROR("%s: failed to open GGML_MOE_NEXT_GATE_PREFETCH_PROBE_OUT=%s\n", __func__, path);
-            g_moe_next_gate_prefetch_probe.disabled = true;
-            return;
-        }
-        g_moe_next_gate_prefetch_probe.file
-            << "seq,time_us,name,kind,ne0,ne1,nbytes,copy_us,values\n";
-        g_moe_next_gate_prefetch_probe.initialized = true;
-    }
-
-    const bool predicted = std::strstr(t->name, "ffn_moe_next_shadow_topk") != nullptr;
-    g_moe_next_gate_prefetch_probe.file
-        << g_moe_next_gate_prefetch_probe.seq++ << ','
-        << ggml_time_us() << ','
-        << t->name << ','
-        << (predicted ? "pred" : "actual") << ','
-        << t->ne[0] << ','
-        << t->ne[1] << ','
-        << ggml_nbytes(t) << ','
-        << copy_us << ','
-        << moe_next_gate_shadow_values_csv(values)
-        << '\n';
-}
-
-static bool moe_next_gate_prefetch_probe_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
-    llama_context * lctx = (llama_context *) user_data;
-    const bool probe_need = moe_next_gate_prefetch_probe_wants(t);
-    const llama_cparams * cparams = lctx ? &lctx->get_cparams() : nullptr;
-    if (ask) {
-        const bool user_need = cparams && cparams->cb_eval ?
-            cparams->cb_eval(t, true, cparams->cb_eval_user_data) : false;
-        return probe_need || user_need;
-    }
-    if (probe_need) {
-        moe_next_gate_prefetch_probe_record(t);
-    }
-    if (cparams && cparams->cb_eval) {
-        return cparams->cb_eval(t, false, cparams->cb_eval_user_data);
-    }
-    return true;
-}
-
-static void moe_next_gate_shadow_record(
-        llm_graph_result * res,
-        const llama_ubatch & ubatch,
-        ggml_backend_sched_t sched) {
-    const auto & outputs = res->get_moe_next_gate_shadow_outputs();
-    if (outputs.empty()) {
-        return;
-    }
-
-    const char * path = moe_next_gate_shadow_out_path();
-    if (!path) {
-        return;
-    }
-
-    struct pending_shadow_copy {
-        llm_moe_next_gate_shadow_output meta;
-        std::vector<int32_t> values;
-        int64_t ne0 = 0;
-        int64_t ne1 = 0;
-    };
-
-    std::vector<pending_shadow_copy> pending;
-    pending.reserve(outputs.size());
-
-    const int64_t copy_start_us = ggml_time_us();
-    for (const auto & out : outputs) {
-        ggml_tensor * t = out.tensor;
-        if (t == nullptr || t->type != GGML_TYPE_I32 || !ggml_is_contiguous(t)) {
-            continue;
-        }
-
-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, t);
-        if (backend == nullptr) {
-            continue;
-        }
-
-        pending_shadow_copy copy;
-        copy.meta = out;
-        copy.ne0 = t->ne[0];
-        copy.ne1 = t->ne[1];
-        copy.values.resize((size_t) ggml_nelements(t));
-
-        ggml_backend_tensor_get_async(backend, t, copy.values.data(), 0, ggml_nbytes(t));
-        pending.push_back(std::move(copy));
-    }
-
-    if (pending.empty()) {
-        return;
-    }
-
-    ggml_backend_sched_synchronize(sched);
-    const int64_t record_us = ggml_time_us() - copy_start_us;
-
-    std::lock_guard<std::mutex> lock(g_moe_next_gate_shadow_csv.mutex);
-    if (g_moe_next_gate_shadow_csv.disabled) {
-        return;
-    }
-
-    if (!g_moe_next_gate_shadow_csv.initialized) {
-        g_moe_next_gate_shadow_csv.file.open(path, std::ios::out);
-        if (!g_moe_next_gate_shadow_csv.file) {
-            LLAMA_LOG_ERROR("%s: failed to open GGML_MOE_NEXT_GATE_SHADOW_OUT=%s\n", __func__, path);
-            g_moe_next_gate_shadow_csv.disabled = true;
-            return;
-        }
-        g_moe_next_gate_shadow_csv.file
-            << "call,seq_id,pos,n_tokens,n_seq_tokens,source_layer,target_layer,kind,topk,ne0,ne1,record_us,values\n";
-        g_moe_next_gate_shadow_csv.initialized = true;
-    }
-
-    const uint64_t call = g_moe_next_gate_shadow_csv.call++;
-    const int seq_id = ubatch.n_tokens > 0 && ubatch.seq_id != nullptr && ubatch.seq_id[0] != nullptr ? ubatch.seq_id[0][0] : -1;
-    const int64_t pos = ubatch.n_tokens > 0 && ubatch.pos != nullptr ? ubatch.pos[0] : -1;
-
-    for (const auto & copy : pending) {
-        g_moe_next_gate_shadow_csv.file
-            << call << ','
-            << seq_id << ','
-            << pos << ','
-            << ubatch.n_tokens << ','
-            << ubatch.n_seq_tokens << ','
-            << copy.meta.source_layer << ','
-            << copy.meta.target_layer << ','
-            << (copy.meta.predicted ? "pred" : "actual") << ','
-            << copy.values.size() << ','
-            << copy.ne0 << ','
-            << copy.ne1 << ','
-            << record_us << ','
-            << moe_next_gate_shadow_values_csv(copy.values)
-            << '\n';
-    }
-}
-
-static void moe_route_score_trace_record(
-        llm_graph_result * res,
-        const llama_ubatch & ubatch,
-        ggml_backend_sched_t sched) {
-    const auto & outputs = res->get_moe_route_score_outputs();
-    if (outputs.empty()) {
-        return;
-    }
-
-    const char * path = moe_route_score_trace_out_path();
-    if (!path) {
-        return;
-    }
-
-    struct pending_route_score_copy {
-        llm_moe_route_score_output meta;
-        std::vector<int32_t> ids;
-        std::vector<float> scores;
-        std::vector<float> weights;
-        int64_t ids_ne0 = 0;
-        int64_t ids_ne1 = 0;
-        int64_t scores_ne0 = 0;
-        int64_t scores_ne1 = 0;
-        int64_t weights_ne0 = 0;
-        int64_t weights_ne1 = 0;
-    };
-
-    std::vector<pending_route_score_copy> pending;
-    pending.reserve(outputs.size());
-
-    const int64_t copy_start_us = ggml_time_us();
-    for (const auto & out : outputs) {
-        ggml_tensor * ids = out.ids;
-        ggml_tensor * scores = out.scores;
-        ggml_tensor * weights = out.weights;
-        if (ids == nullptr || scores == nullptr || weights == nullptr) {
-            continue;
-        }
-        if (ids->type != GGML_TYPE_I32 || scores->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32) {
-            continue;
-        }
-        if (!ggml_is_contiguous(ids) || !ggml_is_contiguous(scores) || !ggml_is_contiguous(weights)) {
-            continue;
-        }
-
-        ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(sched, ids);
-        ggml_backend_t scores_backend = ggml_backend_sched_get_tensor_backend(sched, scores);
-        ggml_backend_t weights_backend = ggml_backend_sched_get_tensor_backend(sched, weights);
-        if (ids_backend == nullptr || scores_backend == nullptr || weights_backend == nullptr) {
-            continue;
-        }
-
-        pending_route_score_copy copy;
-        copy.meta = out;
-        copy.ids_ne0 = ids->ne[0];
-        copy.ids_ne1 = ids->ne[1];
-        copy.scores_ne0 = scores->ne[0];
-        copy.scores_ne1 = scores->ne[1];
-        copy.weights_ne0 = weights->ne[0];
-        copy.weights_ne1 = weights->ne[1];
-        copy.ids.resize((size_t) ggml_nelements(ids));
-        copy.scores.resize((size_t) ggml_nelements(scores));
-        copy.weights.resize((size_t) ggml_nelements(weights));
-
-        ggml_backend_tensor_get_async(ids_backend, ids, copy.ids.data(), 0, ggml_nbytes(ids));
-        ggml_backend_tensor_get_async(scores_backend, scores, copy.scores.data(), 0, ggml_nbytes(scores));
-        ggml_backend_tensor_get_async(weights_backend, weights, copy.weights.data(), 0, ggml_nbytes(weights));
-        pending.push_back(std::move(copy));
-    }
-
-    if (pending.empty()) {
-        return;
-    }
-
-    ggml_backend_sched_synchronize(sched);
-    const int64_t record_us = ggml_time_us() - copy_start_us;
-
-    std::lock_guard<std::mutex> lock(g_moe_route_score_trace_csv.mutex);
-    if (g_moe_route_score_trace_csv.disabled) {
-        return;
-    }
-
-    if (!g_moe_route_score_trace_csv.initialized) {
-        g_moe_route_score_trace_csv.file.open(path, std::ios::out);
-        if (!g_moe_route_score_trace_csv.file) {
-            LLAMA_LOG_ERROR("%s: failed to open GGML_MOE_ROUTE_SCORE_TRACE_OUT=%s\n", __func__, path);
-            g_moe_route_score_trace_csv.disabled = true;
-            return;
-        }
-        g_moe_route_score_trace_csv.file
-            << "call,seq_id,pos,n_tokens,n_seq_tokens,layer,topk,"
-            << "ids_ne0,ids_ne1,scores_ne0,scores_ne1,weights_ne0,weights_ne1,"
-            << "record_us,ids,scores,weights\n";
-        g_moe_route_score_trace_csv.initialized = true;
-    }
-
-    const uint64_t call = g_moe_route_score_trace_csv.call++;
-    const int seq_id = ubatch.n_tokens > 0 && ubatch.seq_id != nullptr && ubatch.seq_id[0] != nullptr ? ubatch.seq_id[0][0] : -1;
-    const int64_t pos = ubatch.n_tokens > 0 && ubatch.pos != nullptr ? ubatch.pos[0] : -1;
-
-    for (const auto & copy : pending) {
-        g_moe_route_score_trace_csv.file
-            << call << ','
-            << seq_id << ','
-            << pos << ','
-            << ubatch.n_tokens << ','
-            << ubatch.n_seq_tokens << ','
-            << copy.meta.layer << ','
-            << copy.ids.size() << ','
-            << copy.ids_ne0 << ','
-            << copy.ids_ne1 << ','
-            << copy.scores_ne0 << ','
-            << copy.scores_ne1 << ','
-            << copy.weights_ne0 << ','
-            << copy.weights_ne1 << ','
-            << record_us << ','
-            << moe_next_gate_shadow_values_csv(copy.ids) << ','
-            << moe_route_score_float_values_csv(copy.scores) << ','
-            << moe_route_score_float_values_csv(copy.weights)
-            << '\n';
-    }
-}
-
-}
-
-// Freeze the launch routing form before any scheduler reserve/runtime graph.
-// The only later mutation is the bool selecting primary or guard; no request
-// can supply a policy or table through this internal interface.
-static llama_k3_runtime_config llama_k3_runtime_from_env(const llama_hparams & hp) {
-    llama_k3_runtime_config config;
-    config.primary = llama_k3_decode_expert_policy_from_env(hp.n_expert_used, hp.n_layer);
-    if (!config.primary.valid()) {
-        throw std::invalid_argument(std::string("invalid K3 decode expert policy: ") +
-            llama_k3_decode_expert_policy_error_name(config.primary.error));
-    }
-    config.table = llama_k3_expert_table_from_env(hp.n_expert_used, hp.n_layer);
-    config.guard = config.primary;
-    config.guard.mode = llama_k3_decode_expert_mode::hard;
-    config.guard.top_k = hp.n_expert_used;
-
-    const auto value = [](const char * suffix) {
-        const std::string name = std::string("LLAMA_K3_DECODE_EXPERT_GUARD_") + suffix;
-        const char * text = std::getenv(name.c_str());
-        return text && text[0] ? text : nullptr;
-    };
-    const auto integer = [&](const char * suffix, int64_t & field, int64_t lower, int64_t upper) {
-        const char * text = value(suffix);
-        if (text && (!llama_k3_parse_i64_strict(text, field) || field < lower || field > upper)) {
-            throw std::invalid_argument(std::string("invalid K3 expert guard ") + suffix);
-        }
-    };
-    int64_t tokens = 0;
-    integer("TOKENS", tokens, 0, INT32_MAX);
-    config.guard_tokens = uint32_t(tokens);
-    int64_t start_tokens = 0;
-    integer("START_TOKENS", start_tokens, 0, INT32_MAX);
-    config.guard_start_tokens = uint32_t(start_tokens);
-    int64_t control_tokens = 0;
-    integer("CONTROL_TOKENS", control_tokens, 0, INT32_MAX);
-    config.guard_control_tokens = uint32_t(control_tokens);
-    if (const char * mode = value("MODE")) {
-        if (std::strcmp(mode, "off") == 0) { config.guard.mode = llama_k3_decode_expert_mode::disabled; }
-        else if (std::strcmp(mode, "hard") == 0) { config.guard.mode = llama_k3_decode_expert_mode::hard; }
-        else if (std::strcmp(mode, "mass") == 0) { config.guard.mode = llama_k3_decode_expert_mode::mass; }
-        else { throw std::invalid_argument("invalid K3 expert guard MODE"); }
-    }
-    integer("TOP_K", config.guard.top_k, 1, hp.n_expert_used);
-    integer("MIN_K", config.guard.min_k, 1, hp.n_expert_used);
-    integer("MAX_K", config.guard.max_k, 0, hp.n_expert_used);
-    if (const char * mass = value("MASS")) {
-        if (!llama_k3_parse_f32_strict(mass, config.guard.mass) || config.guard.mass <= 0 || config.guard.mass > 1) {
-            throw std::invalid_argument("invalid K3 expert guard MASS");
-        }
-    }
-    if (config.guard.mode == llama_k3_decode_expert_mode::mass &&
-            (config.guard.mass <= 0 || config.guard.mass > 1 || config.guard.min_k < 1 ||
-             config.guard.min_k > hp.n_expert_used ||
-             (config.guard.max_k > 0 && config.guard.min_k > config.guard.max_k))) {
-        throw std::invalid_argument("invalid K3 expert guard mass/min_k/max_k combination");
-    }
-    if (!hp.expert_weights_norm &&
-            (config.primary.mode == llama_k3_decode_expert_mode::mass ||
-             config.guard.mode == llama_k3_decode_expert_mode::mass || !config.table.empty())) {
-        throw std::invalid_argument("K3 cumulative-mass routing requires normalized routing weights");
-    }
-    return config;
 }
 
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
+    ssd_runtime(params.ssd_options ? std::make_unique<llama_ssd_context>(*params.ssd_options) : nullptr),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -948,13 +67,6 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
-
-    // Real vocab-only loaders omit model routing metadata. Preserve those
-    // graphless callers; incomplete full-model metadata still fails validation.
-    if (model.arch == LLM_ARCH_KIMI_K3 &&
-            !(hparams.vocab_only && (hparams.n_expert_used == 0 || hparams.n_layer == 0))) {
-        k3_runtime = std::make_unique<const llama_k3_runtime_config>(llama_k3_runtime_from_env(hparams));
-    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -972,6 +84,12 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
+    if (ssd_runtime) {
+        const auto * engram = ssd_runtime->settings.integer("model.engram_prefetch");
+        const auto * hc = ssd_runtime->settings.integer("model.hc_fused");
+        if (engram) { cparams.ssd_engram_prefetch = *engram != 0; }
+        if (hc) { cparams.ssd_hc_fused = *hc != 0; }
+    }
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
 
@@ -1087,81 +205,24 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
-    const char * dense_gpu_env = std::getenv("GGML_KIMI_DENSE_PREFETCH_LAYERS");
-    const char * kda_gpu_env = std::getenv("GGML_KIMI_KDA_GPU_LAYERS");
-    dense_gpu_phase_gate_enabled =
-        (dense_gpu_env && dense_gpu_env[0] && std::strcmp(dense_gpu_env, "0") != 0) ||
-        (kda_gpu_env && kda_gpu_env[0] && std::strcmp(kda_gpu_env, "0") != 0);
-
-    const char * cpu_sink_env = std::getenv("GGML_KIMI_CPU_SINK");
-    cpu_sink_enabled = cpu_sink_env && cpu_sink_env[0] && std::strcmp(cpu_sink_env, "0") != 0;
-    // The prefill route is decided per ubatch (cpu_sink_prefill_route): the CPU sink's grouped prefill up to a number
-    // of tokens, the ggml graph on the GPU above it.  GGML_KIMI_CPU_PREFILL_MAX_TOKENS is that number;
-    // GGML_KIMI_CPU_PREFILL=1 and 0 spell "every ubatch" and "none".  The threshold is one input: one of the two.
-    const char * cpu_prefill_env = std::getenv("GGML_KIMI_CPU_PREFILL");
-    if (cpu_prefill_env && cpu_prefill_env[0] &&
-            std::strcmp(cpu_prefill_env, "0") != 0 && std::strcmp(cpu_prefill_env, "1") != 0) {
-        throw std::runtime_error("GGML_KIMI_CPU_PREFILL must be 0 or 1");
-    }
-    cpu_prefill_max_tokens = cpu_prefill_env && std::strcmp(cpu_prefill_env, "1") == 0 ?
-        std::numeric_limits<uint32_t>::max() : 0;
-    if (const char * value = std::getenv("GGML_KIMI_CPU_PREFILL_MAX_TOKENS"); value && value[0]) {
-        if (cpu_prefill_env && cpu_prefill_env[0]) {
-            throw std::runtime_error("GGML_KIMI_CPU_PREFILL and GGML_KIMI_CPU_PREFILL_MAX_TOKENS are both set: the "
-                "prefill threshold is one input");
-        }
-        char * end = nullptr;
-        errno = 0;
-        const unsigned long long parsed = std::strtoull(value, &end, 10);
-        if (errno != 0 || !std::isdigit((unsigned char) value[0]) || *end != '\0' ||
-                parsed > std::numeric_limits<uint32_t>::max()) {
-            throw std::runtime_error("GGML_KIMI_CPU_PREFILL_MAX_TOKENS must be a number of tokens");
-        }
-        cpu_prefill_max_tokens = uint32_t(parsed);
-    }
-    cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
-    if (cpu_prefill_max_tokens > 0) {
-        if (!cpu_sink_enabled) {
-            throw std::runtime_error("GGML_KIMI_CPU_PREFILL=1 or GGML_KIMI_CPU_PREFILL_MAX_TOKENS > 0 requires GGML_KIMI_CPU_SINK=1");
-        }
-        if (model.arch != LLM_ARCH_KIMI_K3 && model.arch != LLM_ARCH_DEEPSEEK41 && model.arch != LLM_ARCH_MUSE_SPARK) {
-            throw std::runtime_error("GGML_KIMI_CPU_PREFILL supports only Kimi-K3, DeepSeek-V4.1 or Muse Spark models; set GGML_KIMI_CPU_PREFILL=0");
-        }
-    }
-    if (cpu_prefill_max_tokens == std::numeric_limits<uint32_t>::max()) {
-        // The grouped CPU executor has its own small bounded workspace. With every
-        // prefill ubatch on it, the legacy GPU union workspace would serve none:
-        // do not allocate it alongside.  Below a finite threshold the workspace
-        // serves the graph route (K3's phase-workspace profiles with the sink on).
-        for (const char * name : { "GGML_MOE_PREFILL_PHASE0", "GGML_MOE_PREFILL_PHASE1",
-                "GGML_MOE_PREFILL_PHASE_SIZED_WORKSPACE", "GGML_MOE_PREFILL_DECODE_CACHE_HANDOVER" }) {
-            const char * value = std::getenv(name);
-            if (value && value[0] && std::strcmp(value, "0") != 0) {
-                throw std::runtime_error(std::string("CPU prefill requires ") + name + "=0");
-            }
-        }
-    }
+#if defined(__linux__)
+    cpu_sink_enabled = ssd_runtime && !ssd_runtime->settings.sources()->empty();
+#else
+    cpu_sink_enabled = false;
+#endif
+    dense_gpu_phase_gate_enabled = cpu_sink_enabled;
     if (cpu_sink_enabled) {
-        // with the sink on, any prefill ubatch may take its grouped prefill, whatever the threshold: one the GPU does
-        // not offload, or a whole request whose graph does not fit
+        if (model.arch != LLM_ARCH_DEEPSEEK41 && model.arch != LLM_ARCH_MUSE_SPARK) {
+            throw std::runtime_error("SSD CPU experts require DeepSeek-V4.1 or Muse Spark");
+        }
+        if (cparams.n_seq_max != 1) {
+            throw std::runtime_error("SSD CPU experts require --parallel 1 (-np 1)");
+        }
         if (cparams.n_ubatch > uint32_t(std::numeric_limits<int>::max() / 16)) {
             throw std::runtime_error("grouped CPU prefill ubatch exceeds route index range");
         }
-        LLAMA_LOG_INFO("%s: grouped CPU prefill configured; ubatch=%u\n",
-            __func__, cparams.n_ubatch);
-    }
-    if (cpu_sink_enabled) {
-        if (model.arch != LLM_ARCH_KIMI_K3 && model.arch != LLM_ARCH_DEEPSEEK41 && model.arch != LLM_ARCH_MUSE_SPARK) {
-            throw std::runtime_error("GGML_KIMI_CPU_SINK requires a Kimi-K3, DeepSeek-V4.1 or Muse Spark model");
-        }
-        if (cparams.n_seq_max != 1) {
-            throw std::runtime_error("GGML_KIMI_CPU_SINK requires --parallel 1 (-np 1): request phase is context-wide");
-        }
-#if !defined(__linux__)
-        throw std::runtime_error("GGML_KIMI_CPU_SINK requires Linux io_uring and O_DIRECT");
-#endif
-        // Layers with routed experts, in model order: the default cache priority
-        // outside the K3 layout. The routed expert count bounds cache quotas.
+        cpu_prefill_max_tokens = uint32_t(*ssd_runtime->settings.integer("prefill.cpu_max_tokens"));
+        cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
         std::vector<int32_t> routed_layers;
         for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
             const auto & layer = model.layers[il];
@@ -1171,116 +232,26 @@ llama_context::llama_context(
         }
         cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer,
             kimi_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
-            model.arch == LLM_ARCH_KIMI_K3, int64_t(model.hparams.n_expert), routed_layers);
-        LLAMA_LOG_INFO("%s: CPU sink configured; single-token decode%s uses CPU experts\n",
-            __func__, cpu_prefill_max_tokens > 0 ? " and grouped prefill" : "");
-        if (cpu_prefill_max_tokens == std::numeric_limits<uint32_t>::max()) {
-            LLAMA_LOG_INFO("%s: prefill route: every ubatch on the CPU sink\n", __func__);
-        } else {
-            LLAMA_LOG_INFO("%s: prefill route: ubatches of up to %u tokens, and those the GPU does not offload, on "
-                "the CPU sink; larger ones on the ggml graph\n", __func__, cpu_prefill_max_tokens);
-        }
-        // the sink's next-layer prefetch resolves experts of a layer other than the active one
-        if (const char * prefetch = std::getenv("GGML_KIMI_CPU_SINK_PREFETCH"); prefetch && std::atoi(prefetch) > 0) {
+            int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
+        if (*ssd_runtime->settings.integer("prefetch.depth") > 0) {
             for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
                 const auto & layer = model.layers[il];
-                for (const ggml_tensor * experts : { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps }) {
+                for (const ggml_tensor * experts : {layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
                     if (experts) {
-                        cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = { experts->nb[2], experts->ne[2] };
+                        cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = {experts->nb[2], experts->ne[2]};
                     }
                 }
             }
         }
     }
-
-    const char * reserve_horizon_env = std::getenv("LLAMA_RESERVE_HORIZON");
-    if (reserve_horizon_env && reserve_horizon_env[0] &&
-            std::strcmp(reserve_horizon_env, "0") != 0 && std::strcmp(reserve_horizon_env, "1") != 0) {
-        throw std::runtime_error("LLAMA_RESERVE_HORIZON must be 0 or 1");
-    }
-    reserve_horizon_enabled = !(reserve_horizon_env && std::strcmp(reserve_horizon_env, "0") == 0);
-
-    const char * actual_shape_env = std::getenv("GGML_KIMI_CPU_PREFILL_ACTUAL_SHAPE");
-    if (actual_shape_env && actual_shape_env[0] &&
-            std::strcmp(actual_shape_env, "0") != 0 && std::strcmp(actual_shape_env, "1") != 0) {
-        throw std::runtime_error("GGML_KIMI_CPU_PREFILL_ACTUAL_SHAPE must be 0 or 1");
-    }
-    // Graphs sized to the request on either route: each request reserves its prefill graph at its own size (the
-    // route of each pass follows from that size) and leaves only the one-token graph to decode.
-    cpu_prefill_actual_shape_enabled = actual_shape_env && std::strcmp(actual_shape_env, "1") == 0;
-    if (cpu_prefill_actual_shape_enabled) {
-        if (!cpu_sink_enabled) {
-            throw std::runtime_error("GGML_KIMI_CPU_PREFILL_ACTUAL_SHAPE requires GGML_KIMI_CPU_SINK=1 for phase transitions");
-        }
-        cpu_prefill_configured_ubatch = cparams.n_ubatch;
-        if (const char * value = std::getenv("GGML_KIMI_CPU_PREFILL_GRAPH_GRANULARITY")) {
-            char * end = nullptr;
-            errno = 0;
-            const unsigned long parsed = std::strtoul(value, &end, 10);
-            if (errno != 0 || end == value || *end != '\0' || parsed == 0 || parsed > 2048) {
-                throw std::runtime_error("GGML_KIMI_CPU_PREFILL_GRAPH_GRANULARITY must be in 1..2048");
-            }
-            cpu_prefill_graph_granularity = uint32_t(parsed);
-        }
-        // Keep the configured ubatch through context construction: the
-        // DeepSeek recurrent-memory backend uses it to establish the maximum
-        // physical batch capacity.  The first request replaces the initial
-        // scheduler with its actual prefill shape, and the prefill->decode
-        // transition then leaves only the one-token scheduler resident.
-        LLAMA_LOG_INFO(
-            "%s: actual-shape grouped prefill enabled; configured_max=%u granularity=%u "
-            "resident_decode_ubatch=1 after_first_prefill\n",
-            __func__, cpu_prefill_configured_ubatch, cpu_prefill_graph_granularity);
-    }
-
-    const char * reserve_outputs_env = std::getenv("LLAMA_PREFILL_GRAPH_OUTPUTS");
-    if (reserve_outputs_env && reserve_outputs_env[0] &&
-            std::strcmp(reserve_outputs_env, "0") != 0 && std::strcmp(reserve_outputs_env, "1") != 0) {
-        throw std::runtime_error("LLAMA_PREFILL_GRAPH_OUTPUTS must be 0 or 1");
-    }
-    cpu_prefill_output_sizing_enabled = (model.arch == LLM_ARCH_DEEPSEEK41 || model.arch == LLM_ARCH_MUSE_SPARK) &&
-        !(reserve_outputs_env && std::strcmp(reserve_outputs_env, "0") == 0);
-    if (cpu_prefill_output_sizing_enabled) {
-        sched_reserve_n_outputs = cparams.n_seq_max;
-        LLAMA_LOG_INFO("%s: prefill output reserve follows actual outputs\n", __func__);
-    }
-
-    const char * phase_workspace_env =
-        std::getenv("GGML_MOE_PREFILL_PHASE_SIZED_WORKSPACE");
-    phase_workspace_enabled = phase_workspace_env && phase_workspace_env[0] &&
-        phase_workspace_env[0] != '0';
-    const char * phase_decode_cache_handover_env =
-        std::getenv("GGML_MOE_PREFILL_DECODE_CACHE_HANDOVER");
-    phase_decode_cache_handover_enabled = phase_decode_cache_handover_env &&
-        phase_decode_cache_handover_env[0] &&
-        phase_decode_cache_handover_env[0] != '0';
-    if (phase_decode_cache_handover_enabled && !phase_workspace_enabled) {
-        throw std::runtime_error(
-            "prefill/decode cache handover requires phase-sized prefill workspace");
-    }
-    const char * handover_phase0_env = std::getenv("GGML_MOE_PREFILL_PHASE0");
-    const char * handover_phase1_env = std::getenv("GGML_MOE_PREFILL_PHASE1");
-    if (phase_decode_cache_handover_enabled &&
-            (!handover_phase0_env || !handover_phase0_env[0] ||
-             handover_phase0_env[0] == '0' ||
-             !handover_phase1_env || !handover_phase1_env[0] ||
-             handover_phase1_env[0] == '0')) {
-        throw std::runtime_error(
-            "prefill/decode cache handover requires Phase 0/1 grouped prefill");
-    }
-    if (phase_workspace_enabled) {
-        phase_workspace_target_ubatch = cparams.n_ubatch;
-        if ((phase_workspace_target_ubatch != 32 &&
-                phase_workspace_target_ubatch != 64 &&
-                phase_workspace_target_ubatch != 96) ||
-                cparams.n_batch < phase_workspace_target_ubatch) {
-            throw std::runtime_error(
-                "phase-sized prefill workspace requires matching -b/-ub at capacity level 32, 64, or 96");
-        }
-        // Keep only the decode-sized graph resident between requests.  The
-        // target prefill graph is created transactionally at request begin.
-        cparams.n_ubatch = 1;
-    }
+    // The retained resource profile sizes each request's prompt graph, then
+    // keeps a one-token decode graph. The configured ubatch remains available
+    // to the recurrent backend and to the next prompt.
+    reserve_horizon_enabled = true;
+    cpu_prefill_actual_shape_enabled = cpu_sink_enabled;
+    if (cpu_prefill_actual_shape_enabled) { cpu_prefill_configured_ubatch = cparams.n_ubatch; }
+    cpu_prefill_output_sizing_enabled = model.arch == LLM_ARCH_DEEPSEEK41 || model.arch == LLM_ARCH_MUSE_SPARK;
+    if (cpu_prefill_output_sizing_enabled) { sched_reserve_n_outputs = cparams.n_seq_max; }
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
@@ -1321,11 +292,6 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_ctx_seq     = %u\n",   __func__, cparams.n_ctx_seq);
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",   __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",   __func__, cparams.n_ubatch);
-    if (phase_workspace_enabled) {
-        LLAMA_LOG_INFO(
-            "%s: phase workspace target ubatch = %u, resident decode ubatch = %u\n",
-            __func__, phase_workspace_target_ubatch, cparams.n_ubatch);
-    }
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
@@ -1370,6 +336,36 @@ llama_context::llama_context(
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
+
+        if (ssd_runtime) {
+            ssd_runtime->bind_cpu(backend_cpu);
+            for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get()); }
+            auto * registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+            const auto get_api = reinterpret_cast<ssd::cpu::get_api_v2>(
+                ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v2"));
+            const auto * api = get_api ? get_api() : nullptr;
+            if (!ssd::cpu::valid(api) || api->source_size() != sizeof(kimi_cpu_sink_source)) {
+                throw std::runtime_error("CPU backend has no compatible SSD executor table");
+            }
+            if (cpu_sink_runtime && !api->cache_make_room(nullptr, &ssd_runtime->settings, &ssd_runtime->services, 0, 0)) {
+                throw std::runtime_error("cannot configure the context host budget");
+            }
+            if (!api->attach_services(backend_cpu, &ssd_runtime->services)) {
+                throw std::runtime_error("cannot attach context-owned CPU runtime services");
+            }
+            ssd_runtime->prepare_dense(model);
+#if defined(__APPLE__)
+            if (!ssd_runtime->settings.sources()->empty()) {
+            char error[512] {};
+            ssd_runtime->mac_cache = api->mac_create(&ssd_runtime->settings, &ssd_runtime->services, error, sizeof(error));
+            ssd_runtime->destroy_mac = api->mac_destroy;
+            if (!ssd_runtime->mac_cache) { throw std::runtime_error(error[0] ? error : "cannot create Mac expert cache"); }
+            if (!api->mac_attach(backend_cpu, ssd_runtime->mac_cache)) {
+                throw std::runtime_error("cannot attach context-owned Mac expert cache");
+            }
+            }
+#endif
+        }
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
@@ -1471,31 +467,6 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
-        const char * moe_phase0_env = std::getenv("GGML_MOE_PREFILL_PHASE0");
-        const char * moe_phase1_env = std::getenv("GGML_MOE_PREFILL_PHASE1");
-        const bool moe_phase01_requested =
-            (moe_phase0_env && moe_phase0_env[0] && moe_phase0_env[0] != '0') ||
-            (moe_phase1_env && moe_phase1_env[0] && moe_phase1_env[0] != '0');
-#if !defined(_WIN32)
-        if (moe_phase01_requested) {
-            using moe_phase01_plan_fn = bool (*)(uint32_t, uint32_t);
-            auto * moe_phase01_plan = reinterpret_cast<moe_phase01_plan_fn>(
-                dlsym(RTLD_DEFAULT, "ggml_cuda_moe_prefill_phase01_plan"));
-            if (!moe_phase01_plan) {
-                throw std::runtime_error("Phase 0/1 prefill planner is unavailable");
-            }
-            const uint32_t planner_ubatch = phase_workspace_enabled ?
-                phase_workspace_target_ubatch : cparams.n_ubatch;
-            if (!moe_phase01_plan(planner_ubatch, hparams.n_expert_used)) {
-                throw std::runtime_error("Phase 0/1 prefill planner rejected the graph reserve");
-            }
-        }
-#else
-        if (moe_phase01_requested) {
-            throw std::runtime_error("Phase 0/1 prefill planner is unsupported on this platform");
-        }
-#endif
-
         // Nothing is cached yet: the first reserve covers one ubatch of positions and
         // grows with the context (decode) or is sized per request (actual-shape prefill).
         reserve_horizon_min = std::max<uint32_t>(1, std::min(cparams.n_ubatch, cparams.n_ctx));
@@ -1537,7 +508,7 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     {
         ggml_backend_sched_kimi_copy_stats now = {};
-        ggml_backend_sched_kimi_copy_stats_get(&now);
+        ggml_backend_sched_kimi_copy_stats_get(sched.get(), &now);
         const std::string line = dense_stream.end(now);
         if (!line.empty()) {
             LLAMA_LOG_INFO("%s\n", line.c_str());
@@ -1569,7 +540,7 @@ llama_context::~llama_context() {
 }
 
 void llama_context::dense_graph_cache_begin_phase(int phase) {
-    if (!dense_gpu_phase_gate_enabled && !phase_decode_cache_handover_enabled) {
+    if (!dense_gpu_phase_gate_enabled) {
         return;
     }
 
@@ -1590,7 +561,7 @@ void llama_context::dense_graph_cache_begin_phase(int phase) {
 }
 
 void llama_context::dense_graph_cache_end_phase() {
-    if ((!dense_gpu_phase_gate_enabled && !phase_decode_cache_handover_enabled) ||
+    if ((!dense_gpu_phase_gate_enabled) ||
             dense_gpu_scheduler_graph_phase == 0) {
         return;
     }
@@ -1614,11 +585,10 @@ void llama_context::dense_graph_cache_end_phase() {
 }
 
 static uint32_t kimi_cpu_sink_reserve_tokens(const llama_cparams & params, bool decode) {
-    const char * value = std::getenv("GGML_KIMI_CPU_SINK_DECODE_RESERVE");
     // CPU sink only executes one token at a time. Reserving the ubatch-sized
     // fallback graph during decode needlessly allocates GPU expert workspace.
     // Keep the configured ubatch intact so the next prefill is unchanged.
-    if (decode && params.n_seq_max == 1 && value && std::strcmp(value, "1") == 0) {
+    if (decode && params.n_seq_max == 1) {
         return 1;
     }
     return std::min(params.n_ctx, params.n_ubatch);
@@ -1682,6 +652,7 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (ssd_runtime) { ssd_runtime->stream.attach(sched.get()); }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1768,10 +739,7 @@ void llama_context::sched_reserve() {
                 GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FGDN_AR "-", prefix_len) == 0);
                 const int il = std::stoi(n->name + prefix_len);
                 ggml_backend_dev_t device_kv = model.dev_layer(il);
-                const bool kda_gpu_override = model.arch == LLM_ARCH_KIMI_K3 &&
-                    llama_kimi_kda_gpu_layer_selected(il) &&
-                    ggml_backend_dev_type(device_gdn) == GGML_BACKEND_DEVICE_TYPE_GPU;
-                if (device_gdn != device_kv && !kda_gpu_override) {
+                if (device_gdn != device_kv) {
                     LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the fused Gated Delta Net tensor "
                             "is assigned to device %s (usually due to missing support)\n",
                             __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_gdn));
@@ -1812,10 +780,7 @@ void llama_context::sched_reserve() {
                 GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FGDN_CH "-", prefix_len) == 0);
                 const int il = std::stoi(n->name + prefix_len);
                 ggml_backend_dev_t device_kv = model.dev_layer(il);
-                const bool kda_gpu_override = model.arch == LLM_ARCH_KIMI_K3 &&
-                    llama_kimi_kda_gpu_layer_selected(il) &&
-                    ggml_backend_dev_type(device_gdn) == GGML_BACKEND_DEVICE_TYPE_GPU;
-                if (device_gdn != device_kv && !kda_gpu_override) {
+                if (device_gdn != device_kv) {
                     LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the fused Gated Delta Net tensor "
                             "is assigned to device %s (usually due to missing support)\n",
                             __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_gdn));
@@ -1851,37 +816,6 @@ void llama_context::sched_reserve() {
     int n_splits_tg = -1;
     int n_nodes_tg  = -1;
 
-    // Host compute buffers (pinned graph inputs, e.g. the attention masks of a long context) come out of
-    // the same host memory as the expert caches; measure them first and let the host-memory ledger make room
-    // instead of the cgroup or the kernel killing the process. The device buffers are allocated first: on a
-    // unified-memory GPU they come out of the same DRAM, so the ledger counts them there too, and neither
-    // allocation can take the room made for the other. A prefill's graph also gathers rows of weights the file
-    // mapping backs (token embeddings, Engram tables): their pages come into the page cache while it runs, and the
-    // ledger holds room for them from here to the first decode token, so that the expert caches give back what the
-    // prefill needs at once, before it allocates anything.
-    if (cpu_sink_runtime && (cpu_sink_runtime->cache_budget || cpu_sink_runtime->vram_budget) && !model.hparams.no_alloc) {
-        std::vector<size_t> sizes(backend_ptrs.size(), 0);
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), true, sizes.data());
-        size_t host_bytes = 0, device_bytes = 0;
-        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
-            (ggml_backend_buft_is_host(backend_buft[i]) ? host_bytes : device_bytes) += sizes[i];
-        }
-        const bool prefill = n_tokens > n_seqs && !(cpu_sink_enabled && cpu_sink_decode_active);
-        if (prefill) {
-            const uint64_t pages = gf ? llama_host_gather_bytes(gf, llama_host_page_size(),
-                [&](const ggml_tensor * t) { return model.file_mapped(t); }) : 0;
-            LLAMA_LOG_INFO("[prefill_room] n_tokens=%u gather_bytes=%" PRIu64 " host_bytes=%zu device_bytes=%zu\n",
-                n_tokens, pages, host_bytes, device_bytes);
-            if (!cpu_sink_runtime->prefill_room(pages, host_bytes, device_bytes)) {
-                LLAMA_LOG_WARN("%s: the host-memory ledger found no room for a prefill: %.2f MiB of gathered pages, %.2f MiB of host and %.2f MiB of device compute buffers\n",
-                    __func__, pages/1024.0/1024.0, host_bytes/1024.0/1024.0, device_bytes/1024.0/1024.0);
-            }
-        } else if (host_bytes + device_bytes > 0 && !cpu_sink_runtime->make_room(host_bytes, device_bytes)) {
-            LLAMA_LOG_WARN("%s: the host-memory ledger found no room for %.2f MiB of host and %.2f MiB of device compute buffers\n",
-                __func__, host_bytes/1024.0/1024.0, device_bytes/1024.0/1024.0);
-        }
-    }
-
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
@@ -1891,6 +825,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+    if (ssd_runtime) { ssd_runtime->stream.attach(sched.get()); }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -1966,35 +901,14 @@ void llama_context::synchronize() {
         return;
     }
 
-    const bool graph_profile = kimi_graph_profile_enabled();
+    const bool graph_profile = ssd_runtime && ssd_runtime->diagnostics.profile_enabled();
     const int  queued_tokens = n_queued_tokens;
-    const uint64_t layer_gap_sync_start_us =
-        g_kimi_layer_gap_context_enabled ? (uint64_t) ggml_time_us() : 0;
     const int64_t t_sync_start_us = graph_profile ? ggml_time_us() : 0;
     ggml_backend_sched_synchronize(sched.get());
-    if (g_kimi_layer_gap_context_enabled) {
-        kimi_layer_gap_context_thread_buffer().sync_entries.push_back({
-            (uint32_t) std::max(0, queued_tokens),
-            layer_gap_sync_start_us,
-            (uint64_t) ggml_time_us(),
-        });
-    }
     if (graph_profile) {
-        const uint64_t sync_us = (uint64_t) (ggml_time_us() - t_sync_start_us);
-        g_kimi_graph_profile.sync_calls.fetch_add(1, std::memory_order_relaxed);
-        g_kimi_graph_profile.sync_us.fetch_add(sync_us, std::memory_order_relaxed);
-        if (queued_tokens == 1) {
-            g_kimi_graph_profile.sync_decode_calls.fetch_add(1, std::memory_order_relaxed);
-            g_kimi_graph_profile.sync_decode_us.fetch_add(sync_us, std::memory_order_relaxed);
-            g_kimi_graph_profile.sync_decode_tokens.fetch_add(1, std::memory_order_relaxed);
-        } else if (queued_tokens > 1) {
-            g_kimi_graph_profile.sync_prompt_calls.fetch_add(1, std::memory_order_relaxed);
-            g_kimi_graph_profile.sync_prompt_us.fetch_add(sync_us, std::memory_order_relaxed);
-            g_kimi_graph_profile.sync_prompt_tokens.fetch_add((uint64_t) queued_tokens, std::memory_order_relaxed);
-        } else {
-            g_kimi_graph_profile.sync_idle_calls.fetch_add(1, std::memory_order_relaxed);
-            g_kimi_graph_profile.sync_idle_us.fetch_add(sync_us, std::memory_order_relaxed);
-        }
+        const auto published = ssd_runtime->diagnostics.graph(false,
+            uint64_t(ggml_time_us() - t_sync_start_us), uint32_t(std::max(0, queued_tokens)), GGML_STATUS_SUCCESS);
+        if (!published) { LLAMA_LOG_ERROR("%s: context telemetry failed: %s\n", __func__, published.error.c_str()); }
     }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -2028,6 +942,17 @@ bool llama_context::host_reserve(size_t bytes) {
     return !cpu_sink_runtime || cpu_sink_runtime->make_room(bytes);
 }
 
+ssd::result<ssd::host::allocation_ticket> llama_context::host_take(size_t bytes) {
+    if (!cpu_sink_runtime) { return {}; }
+    return cpu_sink_runtime->take_room(bytes);
+}
+
+void llama_context::host_note_memory_change() noexcept {
+    if (ssd_runtime && ssd_runtime->host) {
+        (void) ssd_runtime->host->note_known_memory_change();
+    }
+}
+
 bool llama_context::moe_prefill_phase_workspace(bool active) {
     return moe_prefill_phase_workspace(active, 0);
 }
@@ -2046,7 +971,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     if (active || prefill_copy.passes > 0) {
         // the scheduler reads a split's experts before it launches the split: the passes' reads are all counted
         ggml_backend_sched_kimi_copy_stats now = {};
-        ggml_backend_sched_kimi_copy_stats_get(&now);
+        ggml_backend_sched_kimi_copy_stats_get(sched.get(), &now);
         if (active) {
             prefill_copy.begin(now);
         } else {
@@ -2057,7 +982,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     // previous phase and begins its prefill, the prefill's end begins its decode, the request's end ends that
     {
         ggml_backend_sched_kimi_copy_stats now = {};
-        ggml_backend_sched_kimi_copy_stats_get(&now);
+        ggml_backend_sched_kimi_copy_stats_get(sched.get(), &now);
         const bool decode_begins = !active && dense_stream.phase != nullptr &&
             std::strcmp(dense_stream.phase, "prefill") == 0;
         if (active || dense_stream.phase != nullptr) {
@@ -2078,8 +1003,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
         cpu_sink_runtime->begin(nullptr, 0, false);
         cpu_sink_cache_batch_decode = false;
     }
-    const bool graph_phase_gate_enabled = dense_gpu_phase_gate_enabled ||
-        phase_decode_cache_handover_enabled;
+    const bool graph_phase_gate_enabled = dense_gpu_phase_gate_enabled;
     const bool cpu_sink_phase_changed = cpu_sink_enabled &&
         cpu_sink_decode_active != !active;
     const bool phase_changed = cpu_sink_phase_changed || (graph_phase_gate_enabled &&
@@ -2208,126 +1132,9 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
         return graph_restored && vram_complete;
     }
 
-    if (!phase_workspace_enabled) {
-        const bool reserved = !phase_changed || reserve_ubatch(cparams.n_ubatch);
-        const bool vram_complete = complete_vram_phase(reserved && !active);
-        return reserved && vram_complete;
-    }
-#if defined(_WIN32)
-    complete_vram_phase(false);
-    return false;
-#else
-    using workspace_begin_fn = bool (*)(uint32_t);
-    using workspace_end_fn = bool (*)(void);
-    auto * workspace_begin = reinterpret_cast<workspace_begin_fn>(
-        dlsym(RTLD_DEFAULT, "ggml_cuda_moe_prefill_phase_workspace_begin"));
-    auto * workspace_end = reinterpret_cast<workspace_end_fn>(
-        dlsym(RTLD_DEFAULT, "ggml_cuda_moe_prefill_phase_workspace_end"));
-    if (!workspace_begin || !workspace_end) {
-        LLAMA_LOG_ERROR("%s: CUDA phase workspace API is unavailable\n", __func__);
-        complete_vram_phase(false);
-        return false;
-    }
-
-    if (active) {
-        if (phase_workspace_active) {
-            return complete_vram_phase(false);
-        }
-        // Dense staging belongs to decode.  Release it before the prefill
-        // cache transaction measures free VRAM and chooses its phase slots.
-        if (dense_gpu_phase_gate_enabled || cpu_sink_phase_changed) {
-            drop_scheduler();
-        } else {
-            synchronize();
-        }
-        if (workspace_begin(phase_workspace_target_ubatch) &&
-                reserve_ubatch(phase_workspace_target_ubatch)) {
-            phase_workspace_active = true;
-            phase_workspace_selected_ubatch = phase_workspace_target_ubatch;
-            LLAMA_LOG_INFO(
-                "%s: activated target ubatch=%u transition_ms=%.3f\n",
-                __func__, phase_workspace_selected_ubatch,
-                (ggml_time_us() - transition_start_us) / 1000.0);
-            return complete_vram_phase(false);
-        }
-
-        // Undo every target-level allocation before attempting the previous
-        // validated capacity level with the full decode cache geometry.
-        drop_scheduler();
-        workspace_end();
-        const uint32_t fallback_ubatch = phase_workspace_target_ubatch > 64 ? 64 :
-            phase_workspace_target_ubatch > 32 ? 32 : 16;
-        if (workspace_begin(fallback_ubatch) && reserve_ubatch(fallback_ubatch)) {
-            phase_workspace_active = true;
-            phase_workspace_selected_ubatch = fallback_ubatch;
-            LLAMA_LOG_WARN(
-                "%s: target ubatch=%u unavailable; safely fell back to ubatch=%u "
-                "transition_ms=%.3f\n",
-                __func__, phase_workspace_target_ubatch, fallback_ubatch,
-                (ggml_time_us() - transition_start_us) / 1000.0);
-            return complete_vram_phase(false);
-        }
-
-        drop_scheduler();
-        workspace_end();
-        if (graph_phase_gate_enabled) {
-            dense_gpu_prefill_phase_active = false;
-        }
-        const bool decode_restored = reserve_ubatch(1);
-        phase_workspace_selected_ubatch = 0;
-        LLAMA_LOG_ERROR(
-            "%s: target and fallback prefill reserves failed; decode graph restored=%d "
-            "transition_ms=%.3f\n",
-            __func__, decode_restored ? 1 : 0,
-            (ggml_time_us() - transition_start_us) / 1000.0);
-        complete_vram_phase(decode_restored);
-        return false;
-    }
-
-    if (!phase_workspace_active) {
-        const bool reserved = !phase_changed || reserve_ubatch(1);
-        const bool vram_complete = complete_vram_phase(reserved);
-        return reserved && vram_complete;
-    }
-    // The large graph must die before the cache pools are restored, otherwise
-    // the two phases overlap and recreate the 3.1 GiB cliff.
-    drop_scheduler();
-    const bool cache_restored = workspace_end();
-    const bool graph_restored = reserve_ubatch(1);
-    LLAMA_LOG_INFO(
-        "%s: released ubatch=%u cache_restored=%d decode_graph_restored=%d "
-        "transition_ms=%.3f\n",
-        __func__, phase_workspace_selected_ubatch,
-        cache_restored ? 1 : 0,
-        graph_restored ? 1 : 0,
-        (ggml_time_us() - transition_start_us) / 1000.0);
-    phase_workspace_active = false;
-    phase_workspace_selected_ubatch = 0;
-    const bool vram_complete = complete_vram_phase(cache_restored && graph_restored);
-    return cache_restored && graph_restored && vram_complete;
-#endif
-}
-
-const llama_k3_runtime_config * llama_context::k3_runtime_config_get() const {
-    return k3_runtime.get();
-}
-
-bool llama_context::k3_runtime_guard_set(bool active) {
-    if (!k3_runtime || (active && k3_runtime->guard_tokens == 0 && k3_runtime->guard_start_tokens == 0 &&
-            k3_runtime->guard_control_tokens == 0)) { return false; }
-    if (active == k3_guard_active) { return true; }
-    synchronize();
-    k3_guard_active = active;
-    sched_need_reserve = true;
-    return true;
-}
-
-const llama_k3_runtime_config * llama_k3_runtime_config_get(const llama_context * ctx) {
-    return ctx ? ctx->k3_runtime_config_get() : nullptr;
-}
-
-bool llama_k3_runtime_guard_set(llama_context * ctx, bool active) {
-    return ctx && ctx->k3_runtime_guard_set(active);
+    const bool reserved = !phase_changed || reserve_ubatch(cparams.n_ubatch);
+    const bool vram_complete = complete_vram_phase(reserved && !active);
+    return reserved && vram_complete;
 }
 
 const llama_model & llama_context::get_model() const {
@@ -2436,6 +1243,11 @@ enum llama_pooling_type llama_context::pooling_type() const {
 float * llama_context::get_logits() {
     output_reorder();
 
+    if (ssd_runtime && !ssd_runtime->diagnostics.good()) {
+        LLAMA_LOG_ERROR("%s: context telemetry previously failed\n", __func__);
+        return nullptr;
+    }
+
     return logits.data;
 }
 
@@ -2478,7 +1290,13 @@ float * llama_context::get_logits_ith(int32_t i) {
 
         const int64_t j = output_resolve_row(i);
         float * result = logits.data + j*model.vocab.n_tokens();
-        kimi_logits_trace_write(result, model.vocab.n_tokens(), i);
+        if (ssd_runtime) {
+            const auto published = ssd_runtime->diagnostics.logits(result, model.vocab.n_tokens(), i);
+            if (!published) {
+                LLAMA_LOG_ERROR("%s: context telemetry failed: %s\n", __func__, published.error.c_str());
+                return nullptr;
+            }
+        }
         return result;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
@@ -2894,24 +1712,30 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    struct precompute_guard {
+        ggml_backend_sched_t sched;
+        llama_memory_context_i * memory;
+        ~precompute_guard() {
+            if (memory && !memory->precompute_submitted()) {
+                // Input uploads and the preceding pipelined ubatch may still
+                // borrow this metadata. Only failure paths add this fence.
+                ggml_backend_sched_synchronize(sched);
+                (void) memory->cancel_precompute();
+            }
+        }
+    } memory_guard{sched.get(), mctx};
+    if (mctx && !mctx->apply_precompute()) {
+        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
     if (cpu_sink_decode_active && ubatch.n_tokens > 1 && !cpu_sink_multi_token_reported) {
         // the sink decodes one token at a time and the prefill route is for prefill: a larger decode ubatch (a draft
         // to verify) runs ggml's MUL_MAT_ID where the scheduler puts it
         LLAMA_LOG_WARN("[kimi_cpu_sink] n_tokens=%u in decode runs ggml's MUL_MAT_ID %s; the sink decodes one token\n",
             ubatch.n_tokens, gpu_offloads_experts(ubatch.n_tokens) ? "on the GPU" : "on the CPU over the mapped experts");
         cpu_sink_multi_token_reported = true;
-    }
-    kimi_layer_gap_context_entry layer_gap_entry;
-    if (g_kimi_layer_gap_context_enabled) {
-        layer_gap_entry.call_index =
-            g_kimi_layer_gap_context_call_index.fetch_add(1, std::memory_order_relaxed);
-        layer_gap_entry.n_tokens = ubatch.n_tokens;
-        layer_gap_entry.call_start_us = (uint64_t) ggml_time_us();
-    }
-    if (mctx && !mctx->apply()) {
-        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
     }
 
     ggml_backend_sched_kimi_set_dense_decode(
@@ -2924,9 +1748,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    if (g_kimi_layer_gap_context_enabled) {
-        layer_gap_entry.graph_prepare_start_us = (uint64_t) ggml_time_us();
-    }
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
     if (dense_stream.phase != nullptr) {
         dense_stream.add(ubatch.n_tokens);
@@ -2955,28 +1776,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
-        if (g_kimi_layer_gap_context_enabled) {
-            layer_gap_entry.reused = 1;
-        }
     } else {
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        if (moe_next_gate_prefetch_probe_out_path()) {
-            ggml_backend_sched_set_eval_callback(sched.get(), moe_next_gate_prefetch_probe_cb_eval, this);
-        } else {
-            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
-        }
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
-        if (g_kimi_layer_gap_context_enabled) {
-            layer_gap_entry.graph_build_start_us = (uint64_t) ggml_time_us();
-        }
         gf = model.build_graph(gparams);
-        if (g_kimi_layer_gap_context_enabled) {
-            layer_gap_entry.graph_build_end_us = (uint64_t) ggml_time_us();
-        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -2986,13 +1794,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        // The managed scheduler cannot grow implicitly. Reserve the real graph
+        // under the same admission path used for worst-case load-time graphs.
+        const bool allocated = cpu_sink_runtime ?
+            reserve_compute_graph(gf, ubatch.n_tokens > ubatch.n_seqs && !cpu_sink_decode_active) &&
+                ggml_backend_sched_alloc_prepared(sched.get(), gf) :
+            ggml_backend_sched_alloc_graph(sched.get(), gf);
+        if (!allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            // A refused graph is still parameterized but has no valid storage.
+            // Drain before dropping metadata and prevent same-shape reuse on a
+            // later request after resource pressure has been relieved.
+            ggml_backend_sched_synchronize(sched.get());
+            ggml_backend_sched_reset(sched.get());
+            res->reset();
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
-        }
-        if (g_kimi_layer_gap_context_enabled) {
-            layer_gap_entry.graph_alloc_end_us = (uint64_t) ggml_time_us();
         }
     }
 
@@ -3001,20 +1818,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        if (g_kimi_layer_gap_context_enabled) {
-            layer_gap_entry.set_inputs_start_us = (uint64_t) ggml_time_us();
-        }
         res->set_inputs(&ubatch);
-        if (g_kimi_layer_gap_context_enabled) {
-            layer_gap_entry.set_inputs_end_us = (uint64_t) ggml_time_us();
-        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    if (g_kimi_layer_gap_context_enabled) {
-        layer_gap_entry.compute_start_us = (uint64_t) ggml_time_us();
-    }
     // Phase/token tracking is also required by a VRAM-only tier and by
     // zero-cache profiling. The runtime skips this when all are disabled.
     if (cpu_sink_cache_batch_decode && cpu_sink_runtime) {
@@ -3029,24 +1837,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         cpu_sink_runtime->begin(registry, cache_decode ? static_cast<uint64_t>(ubatch.pos[0]) : 0,
             cache_decode, cache_decode ? ubatch.seq_id[0][0] : 0);
     }
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
-    if (g_kimi_layer_gap_context_enabled) {
-        layer_gap_entry.compute_end_us = (uint64_t) ggml_time_us();
-    }
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, mctx);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
+        discard_failed_graph();
         return nullptr;
     }
 
-    moe_next_gate_shadow_record(res, ubatch, sched.get());
-    moe_route_score_trace_record(res, ubatch, sched.get());
-
     ret = GGML_STATUS_SUCCESS;
-    if (g_kimi_layer_gap_context_enabled) {
-        layer_gap_entry.call_end_us = (uint64_t) ggml_time_us();
-        kimi_layer_gap_context_thread_buffer().entries.push_back(layer_gap_entry);
-    }
 
     return res;
 }
@@ -3116,7 +1915,13 @@ int llama_context::encode(const llama_batch & batch_inp) {
     cparams.causal_attn = false;
 
     ggml_status status;
-    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    const llm_graph_result * res = nullptr;
+    try {
+        res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    } catch (...) {
+        cparams.causal_attn = causal_attn_org;
+        throw;
+    }
 
     cparams.causal_attn = causal_attn_org;
 
@@ -3370,12 +2175,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
-    char nvtx_decode_label[96];
-    std::snprintf(nvtx_decode_label, sizeof(nvtx_decode_label), "%s tokens=%d",
-            batch_inp.n_tokens > 1 ? "prompt_phase" : "decode_token",
-            batch_inp.n_tokens);
-    llama_nvtx_range nvtx_decode_scope(nvtx_decode_label);
-
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -3586,30 +2385,62 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        ggml_status status;
-        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        ggml_status status = GGML_STATUS_FAILED;
+        const llm_graph_result * res = nullptr;
+        try {
+            res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        } catch (const std::exception & error) {
+            LLAMA_LOG_ERROR("%s: ubatch graph/runtime error: %s\n", __func__, error.what());
+            status = GGML_STATUS_FAILED;
+            discard_failed_graph();
+        } catch (...) {
+            LLAMA_LOG_ERROR("%s: unknown ubatch graph/runtime error\n", __func__);
+            status = GGML_STATUS_FAILED;
+            discard_failed_graph();
+        }
 
         if (!res) {
-            // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
-            llama_pos pos_min[LLAMA_MAX_SEQ];
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                pos_min[s] = std::numeric_limits<llama_pos>::max();
-            }
+            // Pre-submit cancellation already restores exact metadata, even
+            // when capture failed before apply. A legacy suffix removal here
+            // would delete valid restored positions for an overwriting batch.
+            if (!mctx->cancel_precompute()) {
+                if (mctx->precompute_rollback_failed()) {
+                    // An invariant failure may leave partial metadata indexes.
+                    // Do not traverse them through seq_rm's stronger assertions.
+                    LLAMA_LOG_ERROR("%s: metadata undo failed; clearing all memory, checkpoint/replay required\n", __func__);
+                    memory->clear(true);
+                } else {
+                    llama_pos pos_min[LLAMA_MAX_SEQ];
+                    for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                        pos_min[s] = std::numeric_limits<llama_pos>::max();
+                    }
 
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const auto & seq_id = ubatch.seq_id[i][0];
+                    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                            const auto seq_id = ubatch.seq_id[i][j];
+                            pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+                        }
+                    }
 
-                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
-            }
+                    for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                        if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                            continue;
+                        }
 
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
-                    continue;
+                        LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+
+                        if (!memory->seq_rm(s, pos_min[s], -1)) {
+                            // A recurrent/compressed implementation may have no
+                            // payload rollback after submit. Invalidate this sequence
+                            // instead of exposing failed-token metadata as usable KV.
+                            LLAMA_LOG_ERROR("%s: cannot roll back failed ubatch for seq_id=%d; clearing sequence, checkpoint/replay required\n", __func__, s);
+                            if (!memory->seq_rm(s, -1, -1)) {
+                                LLAMA_LOG_ERROR("%s: sequence clear failed; clearing all memory\n", __func__);
+                                memory->clear(true);
+                            }
+                        }
+                    }
                 }
-
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
-
-                memory->seq_rm(s, pos_min[s], -1);
             }
 
             switch (status) {
@@ -3793,20 +2624,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
-    const char * phase0_env = std::getenv("GGML_MOE_PREFILL_PHASE0");
-    const char * phase1_env = std::getenv("GGML_MOE_PREFILL_PHASE1");
-    const bool phase0_eviction = phase0_env && phase0_env[0] && phase0_env[0] != '0';
-#if !defined(_WIN32)
-    if (batch_inp.n_tokens > 1 && phase1_env && phase1_env[0] && phase1_env[0] != '0') {
-        using moe_phase01_release_fn = void (*)(void);
-        auto * moe_phase01_release = reinterpret_cast<moe_phase01_release_fn>(
-            dlsym(RTLD_DEFAULT, "ggml_cuda_moe_prefill_phase01_release"));
-        if (moe_phase01_release) {
-            moe_phase01_release();
-        }
-    }
-#endif
-    if (batch_inp.n_tokens > 1 && (!cparams.warmup || !phase0_eviction)) {
+    if (batch_inp.n_tokens > 1) {
         model.drop_expert_mmap_pages_after_prompt();
     }
 
@@ -3878,6 +2696,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             LLAMA_LOG_DEBUG("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
             synchronize();
+            host_note_memory_change();
 
             // TODO: not needed?
             buf_output = nullptr;
@@ -3896,12 +2715,18 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         if (output_dev_host_buft) {
             buft = output_dev_host_buft;
         }
+        auto admitted = host_take(new_size);
+        if (!admitted) {
+            LLAMA_LOG_ERROR("%s: output buffer host budget refused: %s\n", __func__, admitted.error.c_str());
+            return 0;
+        }
         buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
         if (buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
             return 0;
         }
         ggml_backend_buffer_clear(buf_output.get(), 0);
+        admitted.value.commit();
     }
 
     float * output_base = (float *) ggml_backend_buffer_get_base(buf_output.get());
@@ -4066,7 +2891,7 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
-    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_KIMI_K3 ||
+    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
@@ -4083,6 +2908,47 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
+}
+
+bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill) {
+    if (!cpu_sink_runtime) { return ggml_backend_sched_reserve(sched.get(), graph); }
+    ggml_backend_sched_set_auto_reserve(sched.get(), false);
+    ggml_backend_sched_set_host_prefault(sched.get(), llama_host_page_size());
+    // The existing size probe may release an undersized buffer. Invalidate
+    // learning before that known free, including another context's interval.
+    for (auto * backend : backend_ptrs) {
+        if (ggml_backend_sched_get_buffer_size(sched.get(), backend)) {
+            host_note_memory_change();
+            break;
+        }
+    }
+    std::vector<size_t> required(backend_ptrs.size(), 0);
+    if (!ggml_backend_sched_prepare_graph(sched.get(), graph, required.data())) { return false; }
+    uint64_t host_bytes = 0, device_bytes = 0;
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        // Query AFTER the probe: it can have released chunks even when the
+        // replacement's total bytes fit inside the previous aggregate size.
+        if (required[i] > ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i])) {
+            auto & bytes = ggml_backend_buft_is_host(backend_buft[i]) ? host_bytes : device_bytes;
+            if (required[i] > UINT64_MAX - bytes) {
+                ggml_backend_sched_reset(sched.get());
+                return false;
+            }
+            bytes += required[i];
+        }
+    }
+    const uint64_t pages = prefill ? llama_host_gather_bytes(graph, llama_host_page_size(),
+        [&](const ggml_tensor * tensor) { return model.file_mapped(tensor); }) : UINT64_MAX;
+    auto admitted = cpu_sink_runtime->take_room(host_bytes, device_bytes, pages);
+    if (!admitted) {
+        LLAMA_LOG_ERROR("%s: host budget refused: %s\n", __func__, admitted.error.c_str());
+        ggml_backend_sched_reset(sched.get());
+        return false;
+    }
+    if (!ggml_backend_sched_reserve_prepared(sched.get(), graph)) { return false; }
+    // New host COMPUTE chunks have already been touched by the allocator.
+    admitted.value.commit();
+    return true;
 }
 
 ggml_cgraph * llama_context::graph_reserve(
@@ -4102,13 +2968,6 @@ ggml_cgraph * llama_context::graph_reserve(
         sched.get(),
         !dense_gpu_phase_gate_enabled ||
             (!dense_gpu_prefill_phase_active && reserve_tg));
-    // A phase-1 reserve constructs both the actual prompt graph and a synthetic
-    // token-generation graph. Keep dense streaming phase-gated, but size and
-    // split the synthetic tg graph with the KDA decode topology that will run
-    // after the prompt. Real prompt execution still uses process_ubatch's
-    // prefill assignment.
-    ggml_backend_sched_kimi_set_kda_decode(
-        sched.get(), !dense_gpu_phase_gate_enabled || reserve_tg);
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
@@ -4116,7 +2975,11 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
-    const auto save_n_outputs = this->n_outputs;
+    struct restore_outputs {
+        uint32_t & target;
+        const uint32_t previous;
+        ~restore_outputs() { target = previous; }
+    } restore { this->n_outputs, this->n_outputs };
 
     this->n_outputs = n_outputs;
 
@@ -4140,20 +3003,23 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * gf = model.build_graph(gparams);
 
-    this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
     if (split_only) {
         if (sizes) {
+            if (cpu_sink_runtime) { host_note_memory_change(); }
             ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+    } else if (!reserve_compute_graph(gf, n_tokens > n_seqs && !cpu_sink_decode_active)) {
         GGML_ASSERT(!sizes);
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
     }
+    // This independent measure graph is not executed. Keep its reservation,
+    // then retire its prepared metadata before a real graph is built.
+    if (!split_only && cpu_sink_runtime) { ggml_backend_sched_reset(sched.get()); }
 
     return gf;
 }
@@ -4307,10 +3173,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cpu_sink_decode =*/ cpu_sink_enabled && cpu_sink_decode_active && !cparams.warmup,
         /*.cpu_sink_prefill =*/ !cpu_sink_decode_active && !cparams.warmup && cpu_sink_prefill_route(ubatch.n_tokens),
-        /*.cpu_sink_guard =*/ k3_guard_active,
         /*.cpu_sink_runtime =*/ cpu_sink_runtime.get(),
-        /*.k3_expert_policy =*/ k3_runtime ? (k3_guard_active ? k3_runtime->guard : k3_runtime->primary) : llama_k3_decode_expert_policy{},
-        /*.k3_expert_table =*/ k3_runtime && !k3_guard_active ? k3_runtime->table : llama_k3_decode_expert_table{},
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.n_ctx_reserve =*/ sched_reserve_n_ctx ? sched_reserve_n_ctx : cparams.n_ctx,
@@ -4319,7 +3182,8 @@ llm_graph_params llama_context::graph_params(
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+            llama_memory_context_i * mctx) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -4342,93 +3206,27 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, sink_cpu_backend ? 1 : n_threads);
     }
 
-    const bool graph_profile = kimi_graph_profile_enabled();
+    if (ssd_runtime && !ssd_runtime->diagnostics.good()) {
+        LLAMA_LOG_ERROR("%s: context telemetry previously failed\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    const bool graph_profile = ssd_runtime && ssd_runtime->diagnostics.profile_enabled();
     const int64_t t_submit_start_us = graph_profile ? ggml_time_us() : 0;
-    using activation_quant_reuse_fn = void (*)(ggml_backend_t);
-    using activation_quant_reuse_scope = std::pair<ggml_backend_t, activation_quant_reuse_fn>;
-    std::vector<activation_quant_reuse_scope> activation_quant_reuse_scopes;
-    static const bool activation_quant_reuse_enabled = []() {
-        const char * value = std::getenv("GGML_CUDA_DENSE_ACTIVATION_QUANT_REUSE");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
-            std::strcmp(value, "false") != 0;
-    }();
-    if (activation_quant_reuse_enabled) {
-        for (const auto & backend : backends) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            if (reg == nullptr) {
-                continue;
-            }
-            auto begin = reinterpret_cast<activation_quant_reuse_fn>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_activation_quant_reuse_begin"));
-            auto end = reinterpret_cast<activation_quant_reuse_fn>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_activation_quant_reuse_end"));
-            if (begin != nullptr && end != nullptr) {
-                begin(backend.get());
-                activation_quant_reuse_scopes.emplace_back(backend.get(), end);
-            }
-        }
-    }
-    ggml_backend_sched_kimi_set_profile_phase(batched ? 1 : 2);
+    ggml_backend_sched_kimi_set_profile_phase(sched.get(), batched ? 1 : 2);
+    if (mctx) { mctx->submit_precompute(); }
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
-    ggml_backend_sched_kimi_set_profile_phase(0);
-    for (auto scope = activation_quant_reuse_scopes.rbegin();
-            scope != activation_quant_reuse_scopes.rend(); ++scope) {
-        scope->second(scope->first);
-    }
+    ggml_backend_sched_kimi_set_profile_phase(sched.get(), 0);
     if (graph_profile) {
-        const uint64_t submit_us = (uint64_t) (ggml_time_us() - t_submit_start_us);
-        g_kimi_graph_profile.submit_calls.fetch_add(1, std::memory_order_relaxed);
-        g_kimi_graph_profile.submit_us.fetch_add(submit_us, std::memory_order_relaxed);
+        const auto published = ssd_runtime->diagnostics.graph(true,
+            uint64_t(ggml_time_us() - t_submit_start_us), 0, status);
+        if (!published) {
+            ggml_backend_sched_synchronize(sched.get());
+            LLAMA_LOG_ERROR("%s: context telemetry failed: %s\n", __func__, published.error.c_str());
+            return GGML_STATUS_FAILED;
+        }
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
-    } else if (ds4_weight_profile_path() != nullptr) {
-        ggml_backend_sched_synchronize(sched.get());
-        FILE * fp = ds4_weight_profile_fp();
-        static uint64_t graph_seq = 0;
-        const uint64_t seq = graph_seq++;
-        if (fp != nullptr) {
-            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
-                ggml_tensor * node = ggml_graph_node(gf, i);
-                if (node == nullptr || std::strstr(node->name, "ffn_weights") == nullptr) {
-                    continue;
-                }
-                if (node->type != GGML_TYPE_F32 || ggml_nelements(node) <= 0 || ggml_nelements(node) > 4096) {
-                    continue;
-                }
-                ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
-                if (backend == nullptr) {
-                    continue;
-                }
-                const int il = ds4_weight_profile_layer_from_name(node->name);
-                const int64_t ne0 = node->ne[0] > 0 ? node->ne[0] : 1;
-                const int64_t ne1 = node->ne[1] > 0 ? node->ne[1] : 1;
-                const int64_t ne2 = node->ne[2] > 0 ? node->ne[2] : 1;
-                for (int64_t token = 0; token < ne2; ++token) {
-                    for (int64_t rank = 0; rank < ne1; ++rank) {
-                        float value = 0.0f;
-                        const size_t offs = (size_t) (token * node->nb[2] + rank * node->nb[1]);
-                        ggml_backend_tensor_get(node, &value, offs, sizeof(float));
-                        std::fprintf(fp, "%llu,%d,%s,%d,%lld,%lld,%lld,%zu,%zu,%zu,%lld,%lld,%.9g\n",
-                                (unsigned long long) seq,
-                                batched ? 1 : 0,
-                                node->name,
-                                il,
-                                (long long) ne0,
-                                (long long) ne1,
-                                (long long) ne2,
-                                (size_t) node->nb[0],
-                                (size_t) node->nb[1],
-                                (size_t) node->nb[2],
-                                (long long) token,
-                                (long long) rank,
-                                value);
-                    }
-                }
-            }
-            std::fflush(fp);
-        }
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
@@ -4442,28 +3240,6 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
-        }
-
-        // At CUDA's automatic offload threshold (currently 32 rows), a
-        // host-backed MUL_MAT_ID would otherwise be moved wholesale to CUDA.
-        // That bypasses the grouped prefill provider and faults the multi-GiB
-        // GGUF expert tensors into the cgroup.  Keep only the three routed MoE
-        // operations on the CPU scheduler while the request-scoped workspace
-        // is active; the Kimi CPU entry point immediately dispatches their
-        // active rows to the grouped CUDA path.  sched_reserve() runs before
-        // phase_workspace_active is set, so it still reserves the observed
-        // target CUDA workspace that the cache transaction budgeted for.
-        const bool phase_grouped_moe =
-            phase_workspace_active && ubatch.n_tokens > 1 &&
-            cur->op == GGML_OP_MUL_MAT_ID &&
-            (std::strcmp(name, "ffn_moe_gate") == 0 ||
-             std::strcmp(name, "ffn_moe_up") == 0 ||
-             std::strcmp(name, "ffn_moe_down") == 0);
-        if (phase_grouped_moe) {
-            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend_cpu);
-        }
-        if (ds4_weight_profile_path() != nullptr && std::strcmp(name, "ffn_weights") == 0) {
-            ggml_set_output(cur);
         }
 
         // norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -5290,6 +4066,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.ssd_options                 =*/ nullptr,
     };
 
     return result;
@@ -5300,6 +4077,12 @@ llama_context * llama_init_from_model(
         llama_context_params   params) {
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
+        return nullptr;
+    }
+
+    char ssd_environment_error[1024] = {};
+    if (!llama_ssd_check_environment(ssd_environment_error, sizeof(ssd_environment_error))) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, ssd_environment_error);
         return nullptr;
     }
 
@@ -5402,6 +4185,14 @@ uint32_t llama_n_batch(const llama_context * ctx) {
 
 uint32_t llama_n_ubatch(const llama_context * ctx) {
     return ctx->n_ubatch();
+}
+
+bool llama_ssd_prefill_phase(llama_context * ctx, bool active,
+        uint32_t prompt_tokens, uint32_t prefill_tokens) {
+    try { return ctx && ctx->moe_prefill_phase_workspace(active, prompt_tokens, prefill_tokens); }
+    catch (const std::exception & failure) { LLAMA_LOG_ERROR("SSD phase transition failed: %s\n", failure.what()); }
+    catch (...) { LLAMA_LOG_ERROR("SSD phase transition failed\n"); }
+    return false;
 }
 
 extern "C" bool llama_moe_prefill_phase_workspace(
@@ -5846,6 +4637,38 @@ bool llama_host_reserve(llama_context * ctx, size_t bytes) {
     return ctx->host_reserve(bytes);
 }
 
+llama_ssd_host_reservation * llama_ssd_host_reserve(
+        llama_context * ctx, size_t bytes, char * error, size_t size) {
+    if (error && size) { error[0] = '\0'; }
+    try {
+        if (!ctx) { throw std::invalid_argument("host reservation requires a context"); }
+        auto reservation = std::make_unique<llama_ssd_host_reservation>();
+        auto granted = ctx->host_take(bytes);
+        if (!granted) {
+            if (error && size) { std::snprintf(error, size, "%s", granted.error.c_str()); }
+            return nullptr;
+        }
+        reservation->ticket = std::move(granted.value);
+        return reservation.release();
+    } catch (const std::exception & exception) {
+        if (error && size) { std::snprintf(error, size, "%s", exception.what()); }
+    } catch (...) {
+        if (error && size) { std::snprintf(error, size, "host reservation failed"); }
+    }
+    return nullptr;
+}
+
+void llama_ssd_host_reservation_finish(llama_ssd_host_reservation * reservation, bool materialized) {
+    if (!reservation) { return; }
+    if (materialized) { reservation->ticket.commit(); }
+    else { reservation->ticket.cancel(); }
+    delete reservation;
+}
+
+void llama_ssd_host_note_memory_change(llama_context * ctx) {
+    if (ctx) { ctx->host_note_memory_change(); }
+}
+
 size_t llama_state_seq_get_size_at(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags, int32_t n_tokens) {
     return ctx->state_seq_get_size_at(seq_id, flags, n_tokens);
 }
@@ -5892,10 +4715,29 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
 
 ///
 
+void llama_context::discard_failed_graph() noexcept {
+    if (sched) {
+        ggml_backend_sched_synchronize(sched.get());
+        ggml_backend_sched_reset(sched.get());
+    }
+    if (gf_res_prev) { gf_res_prev->reset(); }
+    if (gf_res_reserve) { gf_res_reserve->reset(); }
+    sched_need_reserve = true;
+}
+
 int32_t llama_encode(
         llama_context * ctx,
           llama_batch   batch) {
-    const int ret = ctx->encode(batch);
+    int ret = -3;
+    try {
+        ret = ctx->encode(batch);
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: graph/runtime error: %s\n", __func__, error.what());
+        ctx->discard_failed_graph();
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown graph/runtime error\n", __func__);
+        ctx->discard_failed_graph();
+    }
     if (ret != 0) {
         LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
     }
@@ -5906,7 +4748,16 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
-    const int ret = ctx->decode(batch);
+    int ret = -3;
+    try {
+        ret = ctx->decode(batch);
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: graph/runtime error: %s\n", __func__, error.what());
+        ctx->discard_failed_graph();
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown graph/runtime error\n", __func__);
+        ctx->discard_failed_graph();
+    }
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

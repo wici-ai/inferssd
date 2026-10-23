@@ -117,7 +117,7 @@ def main(argv=None):
         threads = integer_env("SSD_LLAMA_THREADS", 8, 1, 1024)
         prefill_threads = integer_env("SSD_LLAMA_PREFILL_THREADS", 12, 1, 1024)
         port = integer_env("SSD_LLAMA_PORT", 8080, 1, 65535)
-        cache_dir = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / "Library/Caches"))) / "ssdash/mac-alias"
+        cache_dir = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / "Library/Caches"))) / "inferssd/mac-alias"
         cache_dir.mkdir(parents=True, exist_ok=True)
         memory = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True))
         free = shutil.disk_usage(cache_dir).free

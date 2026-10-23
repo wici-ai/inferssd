@@ -109,7 +109,7 @@ static inline bool ggml_cuda_dense_parity_resident_selected_for_spec(
 }
 
 static inline const char * ggml_cuda_dense_parity_resident_spec() {
-    return std::getenv("GGML_CUDA_DENSE_PARITY_RESIDENT_LAYERS");
+    return nullptr; // Retired ambient resident-layer probe; explicit oracle specs remain.
 }
 
 static inline bool ggml_cuda_dense_parity_resident_selected(const char * name) {

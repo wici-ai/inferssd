@@ -321,6 +321,16 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
+    // Admission transaction for an actual graph. Start after reset, preserving
+    // explicit backend assignments. The graph is split exactly once; its source
+    // pointers borrow scheduler metadata until execution/reset. Hold resource
+    // admission between prepare and reserve, then allocate the prepared graph.
+    // Do not mutate or re-split it. Reset/failure invalidates the transaction;
+    // discard that graph before starting another one.
+    GGML_API bool ggml_backend_sched_prepare_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph, size_t * sizes);
+    GGML_API bool ggml_backend_sched_reserve_prepared(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API bool ggml_backend_sched_alloc_prepared(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
 
@@ -330,6 +340,12 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // Explicit context resource policy; 0 disables. Applies only to newly
+    // allocated host COMPUTE chunks, before their allocation ticket is released.
+    GGML_API void ggml_backend_sched_set_host_prefault(ggml_backend_sched_t sched, size_t page_size);
+    // Default true. A resource-managed context disables this fallback and must
+    // explicitly reserve while its allocation ticket is alive.
+    GGML_API void ggml_backend_sched_set_auto_reserve(ggml_backend_sched_t sched, bool enabled);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
@@ -342,10 +358,10 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
-    GGML_API void                 ggml_backend_sched_kimi_set_profile_phase(int phase);
+    GGML_API void                 ggml_backend_sched_kimi_set_profile_phase(ggml_backend_sched_t sched, int phase);
     GGML_API void                 ggml_backend_sched_kimi_set_dense_decode(ggml_backend_sched_t sched, bool decode);
-    GGML_API void                 ggml_backend_sched_kimi_set_kda_decode(ggml_backend_sched_t sched, bool decode);
-    // the expert copies of every scheduler of the process so far (GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE): expert
+    // The expert copies of this context (counters survive graph rebuilds).
+    // Previously the expert copies of every scheduler of the process so far (GGML_SCHED_MOE_COPY_EXPERT_PACK_SOURCE): expert
     // slices (one expert of one expert tensor: gate, up, down or a fused gate-up) and bytes read from the expert
     // source, the time those reads took, and the reads that fell back to a slower path (a failed batched read redone
     // range by range, a range read left to the mmap'd tensor); and the copies of the weights homed on the drive:
@@ -364,7 +380,26 @@ extern "C" {
         uint64_t dense_readahead;
         uint64_t dense_fallbacks;
     };
-    GGML_API void                 ggml_backend_sched_kimi_copy_stats_get(struct ggml_backend_sched_kimi_copy_stats * stats);
+    GGML_API void                 ggml_backend_sched_kimi_copy_stats_get(ggml_backend_sched_t sched, struct ggml_backend_sched_kimi_copy_stats * stats);
+
+    // Same-build extension: borrowed from the owning context until the scheduler
+    // is destroyed. ggml-base has no dependency on any SSD implementation/backend.
+    struct ggml_backend_sched_ssd_hooks {
+        uint32_t version;
+        size_t size;
+        bool (*drive_home)(void *, const struct ggml_tensor *);
+        bool (*copy_dense)(void *, ggml_backend_t, const struct ggml_tensor *, struct ggml_tensor *,
+                           const struct ggml_tensor *, uint64_t);
+        // 0: ordinary backend copy, 1: copied, -1: configured transport failed.
+        int (*copy_experts)(void *, ggml_backend_t, const struct ggml_tensor *, struct ggml_tensor *,
+                           int64_t, size_t, const int32_t *);
+        bool (*fence)(void *, ggml_backend_t);
+        void (*phase)(void *, int);
+        void (*stats)(void *, struct ggml_backend_sched_kimi_copy_stats *);
+        void (*reset)(void *);
+    };
+    GGML_API void ggml_backend_sched_set_ssd_runtime(ggml_backend_sched_t sched,
+        const struct ggml_backend_sched_ssd_hooks * hooks, void * userdata);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.

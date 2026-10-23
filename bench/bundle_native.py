@@ -41,6 +41,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--core", type=Path, required=True,
-                        help="exact ssdash/platform directory from the admitted source or installed wheel")
+                        help="exact inferssd/platform directory from the admitted source or installed wheel")
     args = parser.parse_args()
     bundle(args.output, args.core)
