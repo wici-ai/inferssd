@@ -1318,22 +1318,6 @@ static void ggml_compute_forward_mul_mat_id_kimi(
         if (kimi_cpu_moe_profile) {
             ggml_kimi_cpu_moe_profile.down.route_us += ggml_time_us() - kimi_cpu_moe_route_start;
         }
-        ggml_ds4_grouped_retained_route_profile_record(
-                src0->name,
-                src0->type,
-                src0->data,
-                nb02,
-                ids->ne[1] > 1,
-                matrix_row_counts,
-                n_as,
-                (size_t)ne01 * nb01);
-        ggml_ds4_grouped_retained_handoff_record_down(
-                src0->name,
-                src1->data,
-                ne10,
-                ne01,
-                matrix_row_counts,
-                n_as);
     }
 
     const uint64_t kimi_cpu_moe_route_tail_start =

@@ -1021,22 +1021,6 @@ static void ggml_compute_forward_mul_mat_id_common_kimi(
         if (kimi_cpu_moe_profile) {
             ggml_common_kimi_cpu_moe_profile.down.route_us += ggml_time_us() - kimi_cpu_moe_route_start;
         }
-        ggml_ds4_grouped_retained_route_profile_record(
-                src0->name,
-                src0->type,
-                src0->data,
-                nb02,
-                ids->ne[1] > 1,
-                matrix_row_counts,
-                n_as,
-                (size_t)ne01 * nb01);
-        ggml_ds4_grouped_retained_handoff_record_down(
-                src0->name,
-                src1->data,
-                ne10,
-                ne01,
-                matrix_row_counts,
-                n_as);
     }
 
     // reset current_chunk
@@ -1764,48 +1748,6 @@ static void ggml_compute_forward_moe_up_gate_common(
         if (kimi_cpu_moe_profile) {
             ggml_common_kimi_cpu_moe_profile.up_gate.route_us += ggml_time_us() - kimi_cpu_moe_route_start;
         }
-        const size_t up_expert_bytes = (size_t)ne01 * nb01;
-        const size_t gate_expert_bytes = (size_t)src0_gate->ne[1] * src0_gate->nb[1];
-        ggml_ds4_grouped_retained_route_profile_record(
-                src0_up->name,
-                src0_up->type,
-                src0_up->data,
-                src0_up->nb[2],
-                ids->ne[1] > 1,
-                matrix_row_counts,
-                n_as,
-                up_expert_bytes);
-        ggml_ds4_grouped_retained_route_profile_record(
-                src0_gate->name,
-                src0_gate->type,
-                src0_gate->data,
-                src0_gate->nb[2],
-                ids->ne[1] > 1,
-                matrix_row_counts,
-                n_as,
-                gate_expert_bytes);
-        ggml_ds4_grouped_retained_route_profile_record_up_gate(
-                src0_up->name,
-                src0_gate->name,
-                src0_up->type,
-                src0_gate->type,
-                src0_up->data,
-                src0_up->nb[2],
-                src0_gate->data,
-                src0_gate->nb[2],
-                ids->ne[1] > 1,
-                matrix_row_counts,
-                n_as,
-                up_expert_bytes,
-                gate_expert_bytes);
-        ggml_ds4_grouped_retained_handoff_mark_up_gate(
-                src0_up->name,
-                src0_gate->name,
-                dst->data,
-                ne01,
-                matrix_row_counts,
-                n_as,
-                ids->ne[0]*ids->ne[1]);
     }
 
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
