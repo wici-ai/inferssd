@@ -53,8 +53,12 @@ def main():
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3, check=False).returncode != 0
         gates["namespace_launcher_hidden"] = not Path(spec["namespace_launcher"]["path"]).exists()
         mounts = [line.split() for line in Path("/proc/mounts").read_text().splitlines()]
-        gates["readonly_private_proc"] = any(row[1] == "/proc" and "ro" in row[3].split(",") for row in mounts)
+        gates["readonly_kernel_tunables"] = any(row[1] == "/proc/sys" and "ro" in row[3].split(",") for row in mounts)
         gates["kernel_tunables_denied"] = denied(lambda: os.close(os.open("/proc/sys/kernel/hostname", os.O_WRONLY)))
+        comm = Path("/proc/self/task") / str(os.getpid()) / "comm"
+        name = comm.read_text().rstrip("\n")
+        comm.write_text(name)
+        gates["private_task_metadata_writable"] = comm.read_text().rstrip("\n") == name
     gates["host_sockets_denied"] = all(denied(lambda path=path: connect(path)) for path in (
         "/run/dbus/system_bus_socket", "/run/systemd/private", "/run/docker.sock",
         "/var/run/docker.sock", "/run/user/" + str(spec["controller_uid"]) + "/bus",

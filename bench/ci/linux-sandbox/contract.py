@@ -158,7 +158,11 @@ def bwrap(config, stage):
     if "namespace_launcher" in config:
         # The host helper may create the first namespace, but the candidate
         # must not inherit permission to create additional user namespaces.
-        argv += ["--disable-userns", "--assert-userns-disabled", "--remount-ro", "/proc"]
+        # CUDA writes its own thread names through /proc/self/task/*/comm.
+        # This procfs belongs to the private PID namespace; protect system
+        # tunables without making the worker's own task metadata read-only.
+        argv += ["--disable-userns", "--assert-userns-disabled",
+                 "--ro-bind", "/proc/sys", "/proc/sys"]
     # systemd supplies a private network namespace; bwrap deliberately retains
     # it so a privileged, trusted measurement client can later join this one.
     for source in config["readonly_system"]:
@@ -220,7 +224,7 @@ def systemd(config, stage):
     if "namespace_launcher" in config:
         # Recent systemd masks proc files before bwrap can create the nested
         # PID namespace's procfs. Linux refuses that more revealing mount.
-        # Keep host /proc out; bwrap creates its own procfs and remounts it RO.
+        # Keep host /proc out; bwrap creates its own procfs with read-only sysctl.
         props = [value.replace("ProtectKernelTunables=yes", "ProtectKernelTunables=no")
                  .replace("ProtectKernelLogs=yes", "ProtectKernelLogs=no") for value in props]
     for device in config.get("gpu_devices", []) if stage.gpu else []:
