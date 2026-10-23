@@ -57,7 +57,11 @@ All messages include `schema_version: 1`, `operation`, and `job_id`.
   executable. Also returns actual `cmdline`, clean worker `environment`,
   `cpus_allowed_list`, `cgroup_limits` (`memory_max`, `memory_swap_max`,
   `pids_max`, as kernel strings), and raw `proc_limits` including memlock.
-  A port requires one listener owned by that same pinned PID.
+  A port requires one listener owned by that same pinned PID. Optional boolean
+  `light: true` retains birth/UID/cgroup/listener checks while omitting full
+  executable, mapping and launch evidence. Startup polling and HTTP admission
+  use this mode so model memory allocation cannot stall repeated mapping reads;
+  request-boundary evidence still uses the default full probe.
 - `stage.client`: `request={port,method,path,body,timeout_s}`. Only fixed health
   and completion endpoints on private loopback are allowed. The separate-UID
   client timestamps each response line: `started_monotonic_ns`,

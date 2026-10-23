@@ -59,8 +59,8 @@ HTTPServer(('127.0.0.1', 18889), Handler).serve_forever()
         deadline = time.monotonic() + 10
         while True:
             try:
-                result['probe'] = request('stage.probe', **server_handle, port=18889)
-                if result['probe']['ready']:
+                result['light_probe'] = request('stage.probe', **server_handle, port=18889, light=True)
+                if result['light_probe']['ready']:
                     break
             except RuntimeError:
                 if time.monotonic() > deadline:
@@ -71,7 +71,13 @@ HTTPServer(('127.0.0.1', 18889), Handler).serve_forever()
             time.sleep(.05)
         result['client'] = request('stage.client', **server_handle,
                                   request={'port': 18889, 'method': 'GET', 'path': '/health', 'timeout_s': 5})
+        if any(key in result['light_probe'] for key in ('proc_maps', 'cmdline', 'environment', 'executable_sha256')):
+            raise RuntimeError('light readiness unexpectedly collected full process evidence')
+        result['probe'] = request('stage.probe', **server_handle, port=18889)
         observed = result['probe']
+        if any(result['light_probe'][key] != observed[key] for key in
+               ('worker_pid', 'worker_uid', 'birth_identity', 'scope_identity', 'listener_owners')):
+            raise RuntimeError('light readiness lost exact worker/listener identity')
         if (observed['cmdline'] != ['/usr/bin/python3', '-I', '/build/base/server.py'] or
                 observed['environment'].get('HOME') != '/scratch/home' or
                 not observed['cpus_allowed_list'] or 'Max locked memory' not in observed['proc_limits'] or

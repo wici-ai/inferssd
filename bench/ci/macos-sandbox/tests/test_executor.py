@@ -164,3 +164,28 @@ class ListenerTests(unittest.TestCase):
         with patch.object(executor.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='p123\nn*:18080\n')):
             with self.assertRaisesRegex(ValueError, 'fixed IPv4'):
                 session.listener([{'pid': 123}])
+
+
+class LightProbeTests(unittest.TestCase):
+    def test_light_client_keeps_birth_and_listener_checks_without_full_lsof(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        session = object.__new__(executor.Session)
+        session.config = {'worker_uid': 62002, 'executor': {'server_port': 18080}}
+        record = dict(state='running', kind='server', handle='h', worker_pid=123,
+                      worker_uid=62002, birth_identity='birth', scope_identity='scope')
+        def run(argv, **kwargs):
+            if argv[-1] == 'pcuftn':
+                raise OSError('full file inventory unavailable')
+            return SimpleNamespace(returncode=0, stdout='p123\nn127.0.0.1:18080\n')
+        with patch.object(executor, 'birth', return_value='birth'), \
+             patch.object(executor.core, 'members', return_value=[dict(pid=123, rss_bytes=1)]), \
+             patch.object(executor.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(OSError, 'full file inventory'):
+                session.probe(record)
+            self.assertTrue(session.probe(record, light=True)['ready'])
+            self.assertEqual(session.client(record)['listener_pids'], [123])
+            with self.assertRaisesRegex(ValueError, 'PID reused'):
+                session.probe(dict(record, birth_identity='reused'), light=True)
+            with self.assertRaisesRegex(ValueError, 'boolean'):
+                session.probe(record, light=1)

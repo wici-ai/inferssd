@@ -81,9 +81,16 @@ class StageSession:
             if response.get("job_id", self.job_id) != self.job_id:
                 raise BrokerError("broker returned another job identity")
             return response
-        except BaseException:
+        except BaseException as error:
             # A late response must never be mistaken for the next operation.
             self.close()
+            context = "broker " + operation + " stage=" + str(fields.get("stage_id", "<job>"))
+            if isinstance(error, (TimeoutError, socket.timeout)):
+                # Preserve the timeout type on Python 3.9 too, where add_note
+                # does not exist and JSON reports only serialize str(error).
+                raise type(error)(context + ": " + str(error)) from error
+            if hasattr(error, "add_note"):
+                error.add_note(context)
             raise
 
     def open(self):

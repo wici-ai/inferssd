@@ -373,17 +373,19 @@ class Session:
                 time.sleep(1)
             raise RuntimeError("quarantine cleaned, failed job cannot continue")
 
-    def probe(self, record):
+    def probe(self, record, *, light=False):
+        require(type(light) is bool, "probe light flag must be boolean")
         result = dict(record)
         if record["state"] == "running":
             identity = birth(record["worker_pid"])
             require(identity == record["birth_identity"], "worker PID reused")
             result["members"] = core.members(self.config["worker_uid"])
             result["rss_bytes"] = sum(p["rss_bytes"] for p in result["members"])
-            # lsof is an installed Apple tool executed outside the candidate UID.
-            observed = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-u", str(self.config["worker_uid"]), "-F", "pcuftn"], capture_output=True, text=True, check=False)
-            require(observed.returncode in (0, 1), "cannot inventory actual worker files")
-            result["lsof"] = observed.stdout
+            if not light:
+                # lsof is an installed Apple tool executed outside the candidate UID.
+                observed = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-u", str(self.config["worker_uid"]), "-F", "pcuftn"], capture_output=True, text=True, check=False)
+                require(observed.returncode in (0, 1), "cannot inventory actual worker files")
+                result["lsof"] = observed.stdout
             if record["kind"] == "server":
                 result.update(self.listener(result["members"]))
         return result
@@ -402,7 +404,7 @@ class Session:
 
     def client(self, record):
         require(record["kind"] == "server" and record["state"] == "running", "client requires a running server")
-        probe = self.probe(record)
+        probe = self.probe(record, light=True)
         require(probe["ready"], "owned server has no listener")
         port = self.config["executor"]["server_port"]
         return {**{k: record[k] for k in ("handle", "worker_pid", "worker_uid", "birth_identity", "scope_identity")},
@@ -455,7 +457,7 @@ class Session:
                 time.sleep(.1)
             return dict(record)
         if operation == "stage.probe":
-            return self.probe(record)
+            return self.probe(record, light=request.get("light", False))
         if operation == "stage.client":
             return self.client(record)
         raise ValueError("unknown operation")

@@ -98,3 +98,19 @@ def test_session_binds_worker_and_closes_connection_on_ambiguous_response():
     assert not thread.is_alive()
     assert observed[1]["handle"] == "h" and observed[1]["job_id"] == "a" * 32
     assert observed[-1] == b""  # independent broker sees EOF and owns cleanup
+
+
+def test_broker_timeout_retains_type_operation_stage_and_closes_session():
+    class Connection:
+        closed = False
+        def settimeout(self, value): pass
+        def connect(self, address): pass
+        def sendall(self, value): pass
+        def recv(self, size): raise socket.timeout("timed out")
+        def close(self): self.closed = True
+    connection = Connection()
+    session = StageSession('/unused', 'a' * 32, controller_uid=1000,
+                           connect=lambda *args: connection)
+    with pytest.raises(socket.timeout, match='stage.probe stage=candidate-smoke'):
+        session.request('stage.probe', stage_id='candidate-smoke', handle='h')
+    assert session.closed and connection.closed

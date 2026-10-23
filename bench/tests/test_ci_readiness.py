@@ -106,6 +106,7 @@ def test_smoke_waits_through_health_timeout_and_sends_one_completion(tmp_path, m
     class Session:
         health = 0
         completions = 0
+        probes = []
 
         def start(self, *args):
             return Stage('smoke', 'handle', 41, 62002, {'birth': 9}, 'owned-scope')
@@ -114,6 +115,7 @@ def test_smoke_waits_through_health_timeout_and_sends_one_completion(tmp_path, m
             if operation == 'stage.poll':
                 return dict(running=True)
             if operation == 'stage.probe':
+                self.probes.append(kwargs.get('light', False))
                 return dict(asdict(stage), ready=True)
             if operation == 'stage.stop':
                 return dict(returncode=0, cleanup_confirmed=True)
@@ -150,6 +152,7 @@ def test_smoke_waits_through_health_timeout_and_sends_one_completion(tmp_path, m
     result = smoke.smoke(session, config, tmp_path / 'run')
     assert result['status'] == 'passed' and result['cleanup_confirmed'] is True
     assert session.completions == 1 and session.health == 3
+    assert session.probes == [True, True, True, False, False]
     assert [json.loads(p.read_text())['status'] for p in sorted(
         (tmp_path / 'run').glob('health-attempt-*.json'))] == [0, 503, 200]
 

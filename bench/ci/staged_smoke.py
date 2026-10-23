@@ -66,7 +66,7 @@ def smoke(session, config, output, *, stage_id="candidate-smoke"):
             state = session.call(stage, "stage.poll")
             if state.get("running") is not True:
                 raise RuntimeError("native server exited before readiness")
-            probe = session.call(stage, "stage.probe", port=config["port"])
+            probe = session.call(stage, "stage.probe", port=config["port"], light=True)
             if probe.get("ready", True):
                 health = http.request("GET", "/health", None, 2, allow_health_timeout=True)
                 health_attempt += 1
