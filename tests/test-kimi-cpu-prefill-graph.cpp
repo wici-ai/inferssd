@@ -33,8 +33,8 @@ static std::set<const ggml_tensor *> graph_dependencies(ggml_cgraph * graph) {
 static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decode, const char * label) {
     constexpr int latent = 256, hidden = 512, experts = 20, slots = 8;
     // Metadata-only runtimes: no pool, ring, resolver or cache is initialized.
-    llama_kimi_cpu_sink_runtime runtime(93, 1);
-    llama_kimi_cpu_sink_runtime other_runtime(93, 2);
+    llama_kimi_cpu_sink_runtime runtime(1, 1, experts, {0});
+    llama_kimi_cpu_sink_runtime other_runtime(1, 2, experts, {0});
     llm_graph_result result(2048);
     ggml_backend_t backends[] = { cpu };
     ggml_backend_buffer_type_t buffer_types[] = { ggml_backend_cpu_buffer_type() };
@@ -43,7 +43,7 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
     require(bool(scheduler), "CPU scheduler allocation failed");
     llama_adapter_loras loras;
     llm_graph_params params = {};
-    params.arch = LLM_ARCH_KIMI_K3;
+    params.arch = LLM_ARCH_DEEPSEEK41;
     params.hparams.n_embd = latent;
     params.hparams.n_layer = 1;
     params.hparams.n_expert = experts;
@@ -52,8 +52,7 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
     params.hparams.n_head_kv_arr.fill(1);
     params.hparams.n_embd_head_k_full = latent;
     params.hparams.n_embd_head_v_full = latent;
-    params.hparams.situ_beta = 4;
-    params.hparams.situ_linear_beta = 25;
+    params.hparams.swiglu_clamp_exp.fill(7.0f);
     params.cparams.n_ctx = params.cparams.n_ctx_seq = 128;
     params.cparams.n_batch = params.cparams.n_ubatch = 64;
     params.cparams.n_seq_max = 1;
@@ -92,14 +91,14 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
     ggml_context * ctx = result.get_ctx();
     ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, latent, ntokens);
     ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, experts, ntokens);
-    ggml_tensor * up = ggml_new_tensor_3d(ctx, GGML_TYPE_Q3_K, latent, hidden, experts);
-    ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_Q3_K, latent, hidden, experts);
-    ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_Q3_K, hidden, latent, experts);
+    ggml_tensor * up = ggml_new_tensor_3d(ctx, GGML_TYPE_MXFP4, latent, hidden, experts);
+    ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_MXFP4, latent, hidden, experts);
+    ggml_tensor * down = ggml_new_tensor_3d(ctx, GGML_TYPE_MXFP4, hidden, latent, experts);
     ggml_set_name(up, "blk.0.ffn_up_exps.weight");
     ggml_set_name(gate, "blk.0.ffn_gate_exps.weight");
     ggml_set_name(down, "blk.0.ffn_down_exps.weight");
     ggml_tensor * output = context.build_moe_ffn(input, nullptr, up, gate, down, nullptr,
-        experts, slots, LLM_FFN_SITU, true, 1.0f, LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, 0, logits);
+        experts, slots, LLM_FFN_SILU, true, 1.0f, LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, 0, logits);
     ggml_build_forward_expand(result.get_gf(), output);
     require(output->type == GGML_TYPE_F32 && output->ne[0] == latent && output->ne[1] == ntokens &&
             output->ne[2] == 1 && output->ne[3] == 1, "MoE output shape mismatch");
@@ -152,15 +151,6 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
 
 int main() {
     try {
-        // The experimental dynamic file deliberately disables reuse. Exercise
-        // this without opening any file or constructing a full model graph.
-        unsetenv("LLAMA_K3_DECODE_SKIP_MOE_LAYERS_FILE");
-        llm_graph_params skip_params = {};
-        skip_params.arch = LLM_ARCH_KIMI_K3;
-        require(setenv("LLAMA_K3_DECODE_SKIP_MOE_LAYERS_FILE", "/not-opened-by-graph-test", 1) == 0,
-                "failed to configure skip-file reuse check");
-        require(!skip_params.allow_reuse(skip_params), "dynamic skip file must reject graph reuse");
-        unsetenv("LLAMA_K3_DECODE_SKIP_MOE_LAYERS_FILE");
         std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> cpu(ggml_backend_cpu_init(), ggml_backend_free);
         require(bool(cpu), "CPU backend initialization failed");
         graph_case(cpu.get(), 0, true, false, "prefill_empty_output");

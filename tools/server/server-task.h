@@ -533,10 +533,6 @@ struct server_task_result_metrics : server_task_result {
     uint64_t n_prompt_tokens_processed_total = 0;
     uint64_t t_prompt_processing_total       = 0;
     uint64_t n_tokens_predicted_total        = 0;
-    uint64_t n_sampler_struct_top1_replacements_total = 0;
-    uint64_t n_sampler_struct_mixed_samples_total = 0;
-    uint64_t n_k3_constraint_conflicts_total = 0;
-    uint64_t n_k3_protocol_forced_tokens_total = 0;
     uint64_t t_tokens_generation_total       = 0;
 
     uint64_t n_tokens_max = 0;

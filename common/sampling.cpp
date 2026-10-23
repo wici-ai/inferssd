@@ -115,7 +115,6 @@ struct common_sampler {
 
     struct llama_sampler * grmr;
     struct llama_sampler * rbudget;
-    struct llama_sampler * loop_stop; // non-owning; owned by chain
     struct llama_sampler * chain;
 
     ring_buffer<llama_token> prev;
@@ -187,16 +186,10 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
-static bool common_model_is_kimi_k3(const struct llama_model * model) {
-    char architecture[64] = {};
-    const int32_t n = llama_model_meta_val_str(
-            model, "general.architecture", architecture, sizeof(architecture));
-    return n >= 0 && std::strcmp(architecture, "kimi-k3") == 0;
-}
+
 
 struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
-    const bool is_kimi_k3 = common_model_is_kimi_k3(model);
 
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
 
@@ -204,7 +197,6 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;
-    llama_sampler * loop_stop = nullptr;
     llama_sampler * chain = llama_sampler_chain_init(lparams);
 
     std::vector<llama_sampler *> samplers;
@@ -320,14 +312,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
         bool use_adaptive_p = false; // see below
 
-        // Kimi-K3 uses model-specific reasoning markers and phase transitions.
-        // Never install this sampler for another architecture.
-        if (is_kimi_k3) {
-            // loop_stop must run before the filters so they cannot drop the
-            // forced phase-transition or EOG token (all other logits become -inf).
-            loop_stop = llama_sampler_init_loop_stop(vocab, 0, 0, 0, 0, false);
-            samplers.push_back(loop_stop);
-        }
+
 
         for (const auto & cnstr : params.samplers) {
             switch (cnstr) {
@@ -416,7 +401,6 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         /* .params  = */ params,
         /* .grmr      = */ grmr,
         /* .rbudget   = */ rbudget,
-        /* .loop_stop = */ loop_stop,
         /* .chain     = */ chain,
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
@@ -484,20 +468,6 @@ void common_sampler_set_log_context(struct common_sampler * gsmpl, int32_t slot,
     if (gsmpl) { common_reasoning_budget_set_log_context(gsmpl->rbudget, slot, task); }
 }
 
-bool common_sampler_loop_stop_triggered(const struct common_sampler * gsmpl, int32_t * matched_len) {
-    if (gsmpl == nullptr) {
-        if (matched_len != nullptr) {
-            *matched_len = 0;
-        }
-        return false;
-    }
-    return llama_sampler_loop_stop_triggered(gsmpl->loop_stop, matched_len);
-}
-
-int32_t common_sampler_loop_stop_min_len(const struct common_sampler * gsmpl) {
-    return gsmpl == nullptr ? 0 : llama_sampler_loop_stop_min_len(gsmpl->loop_stop);
-}
-
 void common_sampler_reset(struct common_sampler * gsmpl) {
     if (!gsmpl) {
         return;
@@ -508,21 +478,10 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     llama_sampler * chain = llama_sampler_clone(gsmpl->chain);
-    llama_sampler * loop_stop = nullptr;
-    const int n = llama_sampler_chain_n(chain);
-    for (int i = 0; i < n; ++i) {
-        llama_sampler * candidate = llama_sampler_chain_get(chain, i);
-        if (llama_sampler_loop_stop_min_len(candidate) > 0) {
-            loop_stop = candidate;
-            break;
-        }
-    }
-
     return new common_sampler {
         /* .params    = */ gsmpl->params,
         /* .grmr      = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget   = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .loop_stop = */ loop_stop,
         /* .chain     = */ chain,
         /* .prev      = */ gsmpl->prev,
         /* .cur       = */ gsmpl->cur,

@@ -168,83 +168,50 @@ common_chat_msg task_result_state::update_chat_msg(
     auto msg_prv_copy = chat_msg;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
     common_chat_msg new_msg;
-    // Kimi-K3 emits its native reasoning boundary verbatim. The generic PEG
-    // parser does not recognize this marker and otherwise treats the entire
-    // reasoning transcript as normal content. Keep the cumulative message in
-    // reasoning_content until the full boundary is present, then expose only
-    // the suffix as content. This also preserves the prefix invariant used by
-    // common_chat_msg_diff for streaming responses.
-    static const std::string kimi_reasoning_start = "<|open|>think<|sep|>";
-    static const std::string kimi_reasoning_end   = "<|close|>think<|sep|>";
-    const size_t kimi_reasoning_end_pos = generated_text.find(kimi_reasoning_end);
-    const bool kimi_reasoning =
-        kimi_reasoning_end_pos != std::string::npos ||
-        string_ends_with(chat_parser_params.generation_prompt, kimi_reasoning_start);
 
-    if (kimi_reasoning) {
+    try {
+        new_msg = common_chat_parse(
+            generated_text,
+            is_partial,
+            chat_parser_params, &output_source);
+    } catch (const std::runtime_error & e) {
+        // The PEG chat parser threw because the model output didn't match
+        // the auto-generated grammar. Common cause: a reasoning model that
+        // got stuck in <think>...</think> and emitted EOS without ever
+        // closing </think>, so the optional reasoning rule's until(</think>)
+        // never matched and the parser couldn't make sense of the rest.
+        //
+        // Rather than failing the entire request with a 500, fall back to a
+        // best-effort split: if the prompt primed reasoning and we have
+        // </think>, split there; otherwise treat everything as reasoning
+        // (since the prompt told the model to reason). The caller still
+        // gets a usable assistant message.
+        new_msg = common_chat_msg();
         new_msg.role = "assistant";
-        if (kimi_reasoning_end_pos == std::string::npos) {
-            // The native marker may span several sampled tokens. Hold back the
-            // longest suffix that could still become the full marker; emitting
-            // it now would make the streamed reasoning field impossible to
-            // retract after the boundary is completed.
-            size_t marker_prefix_hold = 0;
-            const size_t max_prefix = std::min(generated_text.size(), kimi_reasoning_end.size() - 1);
-            for (size_t n = max_prefix; n > 0; --n) {
-                if (generated_text.compare(generated_text.size() - n, n, kimi_reasoning_end, 0, n) == 0) {
-                    marker_prefix_hold = n;
-                    break;
-                }
+        const bool primed_reasoning =
+            chat_parser_params.reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK &&
+            string_ends_with(chat_parser_params.generation_prompt, "<think>");
+        const size_t close_pos = common_chat_find_control(generated_text, "</think>", chat_parser_params, output_source);
+        if (primed_reasoning && close_pos != std::string::npos) {
+            std::string reasoning = generated_text.substr(0, close_pos);
+            if (common_chat_find_control(reasoning, "<think>", chat_parser_params, output_source) == 0) {
+                reasoning.erase(0, std::string("<think>").size());
             }
-            new_msg.reasoning_content = generated_text.substr(0, generated_text.size() - marker_prefix_hold);
+            new_msg.reasoning_content = std::move(reasoning);
+            new_msg.content = generated_text.substr(close_pos + std::string("</think>").size());
+        } else if (primed_reasoning) {
+            std::string text = generated_text;
+            if (common_chat_find_control(text, "<think>", chat_parser_params, output_source) == 0) {
+                text.erase(0, std::string("<think>").size());
+            }
+            new_msg.content = std::move(text);
         } else {
-            new_msg.reasoning_content = generated_text.substr(0, kimi_reasoning_end_pos);
-            new_msg.content = generated_text.substr(kimi_reasoning_end_pos + kimi_reasoning_end.size());
-        }
-    } else {
-        try {
-            new_msg = common_chat_parse(
-                generated_text,
-                is_partial,
-                chat_parser_params, &output_source);
-        } catch (const std::runtime_error & e) {
-            // The PEG chat parser threw because the model output didn't match
-            // the auto-generated grammar. Common cause: a reasoning model that
-            // got stuck in <think>...</think> and emitted EOS without ever
-            // closing </think>, so the optional reasoning rule's until(</think>)
-            // never matched and the parser couldn't make sense of the rest.
-            //
-            // Rather than failing the entire request with a 500, fall back to a
-            // best-effort split: if the prompt primed reasoning and we have
-            // </think>, split there; otherwise treat everything as reasoning
-            // (since the prompt told the model to reason). The caller still
-            // gets a usable assistant message.
-            new_msg = common_chat_msg();
-            new_msg.role = "assistant";
-            const bool primed_reasoning =
-                chat_parser_params.reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK &&
-                string_ends_with(chat_parser_params.generation_prompt, "<think>");
-            const size_t close_pos = common_chat_find_control(generated_text, "</think>", chat_parser_params, output_source);
-            if (primed_reasoning && close_pos != std::string::npos) {
-                std::string reasoning = generated_text.substr(0, close_pos);
-                if (common_chat_find_control(reasoning, "<think>", chat_parser_params, output_source) == 0) {
-                    reasoning.erase(0, std::string("<think>").size());
-                }
-                new_msg.reasoning_content = std::move(reasoning);
-                new_msg.content = generated_text.substr(close_pos + std::string("</think>").size());
-            } else if (primed_reasoning) {
-                std::string text = generated_text;
-                if (common_chat_find_control(text, "<think>", chat_parser_params, output_source) == 0) {
-                    text.erase(0, std::string("<think>").size());
-                }
-                new_msg.content = std::move(text);
-            } else {
-                new_msg.content = generated_text;
-            }
+            new_msg.content = generated_text;
         }
     }
 
-    if (!kimi_reasoning && is_partial &&
+
+    if (is_partial &&
             chat_parser_params.reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK &&
             string_ends_with(chat_parser_params.generation_prompt, "<think>") &&
             common_chat_find_control(generated_text, "</think>", chat_parser_params, output_source) == std::string::npos) {
@@ -264,7 +231,7 @@ common_chat_msg task_result_state::update_chat_msg(
     // message bubble alongside a (possibly very long) Reasoning toggle, which
     // looks like the model said nothing. Promote that text into content so the
     // user sees what the model actually produced.
-    if (!kimi_reasoning && !is_partial &&
+    if (!is_partial &&
             chat_parser_params.reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK &&
             string_ends_with(chat_parser_params.generation_prompt, "<think>") &&
             common_chat_find_control(generated_text, "</think>", chat_parser_params, output_source) == std::string::npos &&

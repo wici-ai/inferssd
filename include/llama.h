@@ -1468,27 +1468,6 @@ extern "C" {
 
     ///  @details DRY sampler, designed by p-e-w, as described in: https://github.com/oobabooga/text-generation-webui/pull/5677, porting Koboldcpp implementation authored by pi6am: https://github.com/LostRuins/koboldcpp/pull/982
 
-    // Force a phase transition or end-of-generation token once a degenerate
-    // repetition loop is detected. min_len is the shortest block considered;
-    // repeats is the number of prior occurrences required in the current phase.
-    // eog_override <= 0 means "pick automatically"; min_len/max_len/repeats <= 0
-    // fall back to the LLAMA_LOOP_STOP_* environment variables.
-    LLAMA_API struct llama_sampler * llama_sampler_init_loop_stop(
-            const struct llama_vocab * vocab,
-            int32_t   min_len,
-            int32_t   max_len,
-            int32_t   repeats,
-            llama_token eog_override,
-            bool      verbose);
-
-    // Inspect loop_stop immediately after accepting a token. The trigger remains
-    // valid until the sampler is applied for the next token.
-    LLAMA_API bool llama_sampler_loop_stop_triggered(
-            const struct llama_sampler * smpl,
-            int32_t * matched_len);
-
-    LLAMA_API int32_t llama_sampler_loop_stop_min_len(
-            const struct llama_sampler * smpl);
     LLAMA_API struct llama_sampler * llama_sampler_init_dry(
             const struct llama_vocab *  vocab,
                              int32_t    n_ctx_train,

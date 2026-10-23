@@ -1499,137 +1499,9 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
 // <|close|>call<|sep|>...<|close|>tools<|sep|>
 // Every marker is a literal, so with output provenance only generated CONTROL
 // tokens delimit calls and values; the same spelling in ordinary text stays in the value.
-static common_peg_parser common_chat_kimi_k3_tool_section(common_chat_peg_builder & p, const json & tools) {
-    const std::string ARG_OPEN  = "<|open|>argument key=\"";
-    const std::string ARG_CLOSE = "<|close|>argument<|sep|>";
 
-    // Template attribute values are escaped and never contain a raw quote.
-    auto attr_value   = p.chars("[^\"]", 1, -1);
-    auto attr_end     = p.literal("\"<|sep|>");
-    auto string_value = p.tool_arg_string_value(p.until(ARG_CLOSE));
-    auto any_type     = p.literal("\" type=\"") + attr_value + attr_end;
-    // The type attribute selects the encoding: strings verbatim, other types as JSON text.
-    auto typed_value  = p.choice({
-        p.literal("\" type=\"string\"<|sep|>") + string_value,
-        any_type + p.tool_arg_value(p.until(ARG_CLOSE)),
-    });
 
-    auto argument = [&](const common_peg_parser & key, const common_peg_parser & value) {
-        return p.tool_arg(p.tool_arg_open(p.literal(ARG_OPEN)) + p.tool_arg_name(key) + value +
-                          p.tool_arg_close(p.literal(ARG_CLOSE)));
-    };
-    auto arguments = [&](const json & schema) {
-        auto arg = p.choice();
-        if (schema.is_object() && schema.contains("properties") && schema.at("properties").is_object()) {
-            for (const auto & item : schema.at("properties").items()) {
-                const auto & def = item.value();
-                // A declared string stays a string whatever type the model writes.
-                const bool is_string = def.is_object() && def.contains("type") && def.at("type") == "string";
-                arg |= argument(p.literal(item.key()), is_string ? any_type + string_value : typed_value);
-            }
-        }
-        arg |= argument(attr_value, typed_value);
-        return p.choice({
-            p.literal("<|open|>json type=\"object\"<|sep|>") + p.tool_args(p.json()) + p.literal("<|close|>json<|sep|>"),
-            p.tool_args(p.zero_or_more(arg)),
-        });
-    };
-    auto call = [&](const common_peg_parser & name, const common_peg_parser & args) {
-        return p.tool(p.tool_open(p.literal("<|open|>call tool=\"") + p.tool_name(name) +
-                                  p.literal("\" index=\"") + p.chars("[0-9]", 1, -1) + attr_end) +
-                      args + p.tool_close(p.literal("<|close|>call<|sep|>")));
-    };
 
-    auto calls = p.choice();
-    foreach_function(tools, [&](const json & tool) {
-        const auto & function = tool.at("function");
-        calls |= call(p.literal(function.at("name").get<std::string>()),
-                      arguments(function.contains("parameters") ? function.at("parameters") : json::object()));
-    });
-    // An undeclared name still parses as a structured call; the client validates it.
-    calls |= call(attr_value, arguments(json::object()));
-
-    return p.literal("<|open|>tools<|sep|>") + p.repeat(calls, 1, -1) + p.optional(p.literal("<|close|>tools<|sep|>"));
-}
-
-static common_chat_params common_chat_params_init_kimi_k3(const common_chat_template &    tmpl,
-                                                          const autoparser::generation_params & inputs) {
-    common_chat_params data;
-
-    // The K3 template itself renders the required/none notice from tool_choice.
-    const bool has_tools = inputs.tools.is_array() && !inputs.tools.empty();
-    std::optional<json> tool_choice;
-    if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_AUTO) {
-        tool_choice = json{{"tool_choice", inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? "required" : "none"}};
-    }
-    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, tool_choice, &data.prompt_input_spans);
-    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
-    data.supports_thinking = true;
-    data.preserved_tokens  = {
-        "<|open|>",
-        "<|close|>",
-        "<|sep|>",
-        "<|end_of_msg|>",
-    };
-
-    const std::string THINK_START    = "<|open|>think<|sep|>";
-    const std::string THINK_END      = "<|close|>think<|sep|>";
-    const std::string RESPONSE_START = "<|open|>response<|sep|>";
-    const std::string RESPONSE_END   = "<|close|>response<|sep|>";
-    const std::string MESSAGE_END    = "<|close|>message<|sep|>";
-    const std::string END_OF_MESSAGE = "<|end_of_msg|>";
-
-    data.thinking_start_tag = THINK_START;
-    data.thinking_end_tag   = THINK_END;
-
-    const bool extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
-        const std::string & generation_start = inputs.enable_thinking ? THINK_START : RESPONSE_START;
-        auto generation_prompt = p.prefix(inputs.generation_prompt, generation_start);
-
-        if (!extract_reasoning) {
-            return generation_prompt + p.content(p.rest()) + p.end();
-        }
-
-        auto response =
-            RESPONSE_START +
-            p.content(p.until(RESPONSE_END)) +
-            p.optional(p.literal(RESPONSE_END));
-
-        // A repeated message closer is structural tail, not new content. Keep
-        // the completed parse stable while streaming each partial/extra closer.
-        auto message_end = p.zero_or_more(p.literal(MESSAGE_END));
-
-        // Declared tools may follow the response. The section is parsed even for
-        // tool_choice=none, so generated call markup never becomes content.
-        auto tool_section = has_tools ? p.optional(common_chat_kimi_k3_tool_section(p, inputs.tools)) : p.eps();
-
-        if (!inputs.enable_thinking) {
-            return generation_prompt +
-                   response +
-                   tool_section +
-                   message_end +
-                   p.optional(p.literal(END_OF_MESSAGE)) +
-                   p.end();
-        }
-
-        auto reasoning =
-            THINK_START +
-            p.reasoning(p.until(THINK_END)) +
-            p.optional(p.literal(THINK_END));
-
-        return generation_prompt +
-               reasoning +
-               p.optional(response) +
-               tool_section +
-               message_end +
-               p.optional(p.literal(END_OF_MESSAGE)) +
-               p.end();
-    });
-
-    data.parser = parser.save();
-    return data;
-}
 
 // LFM2 format: uses <|tool_list_start|>[...]<|tool_list_end|> in system prompt
 // and <|tool_call_start|>[name(arg="val")]<|tool_call_end|> for tool calls.
@@ -2435,21 +2307,6 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         src.find("<|tool_call_begin|>") != std::string::npos) {
         LOG_DBG("Using specialized template: Kimi K2 Thinking\n");
         return common_chat_params_init_kimi_k2(tmpl, params);
-    }
-
-    // Kimi K3 uses nested XTML think/response sections, followed by a tool
-    // section when tools are declared. The generic analyzer identifies the
-    // close-tag prefix as the reasoning delimiter and leaves the tag name in
-    // content. Keep schema requests on the generic path until their XTML
-    // structure has dedicated coverage.
-    const bool is_kimi_k3 =
-        src.find("open_tag('think' if thinking else 'response')") != std::string::npos &&
-        src.find("close_tag('message')") != std::string::npos &&
-        src.find("<|end_of_msg|>") != std::string::npos;
-    const bool has_schema = params.json_schema.is_object() && !params.json_schema.empty();
-    if (is_kimi_k3 && !has_schema) {
-        LOG_DBG("Using specialized template: Kimi K3\n");
-        return common_chat_params_init_kimi_k3(tmpl, params);
     }
 
     if (is_lfm2_template(src)) {

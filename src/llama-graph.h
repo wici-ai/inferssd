@@ -666,12 +666,7 @@ struct llm_graph_params {
 
     bool cpu_sink_decode = false;
     bool cpu_sink_prefill = false;
-    bool cpu_sink_guard = false;
     llama_kimi_cpu_sink_runtime * cpu_sink_runtime = nullptr;
-
-    // Effective value snapshots, including constants and canonical table rows.
-    llama_k3_decode_expert_policy k3_expert_policy;
-    llama_k3_decode_expert_table k3_expert_table;
 
     llm_graph_cb cb;
 
@@ -683,13 +678,6 @@ struct llm_graph_params {
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
-        // The experimental file can change routed-layer topology between
-        // calls. Rebuild so the model's file watcher can observe each update.
-        const char * skip_file = std::getenv("LLAMA_K3_DECODE_SKIP_MOE_LAYERS_FILE");
-        if ((arch == LLM_ARCH_KIMI_K3 || other.arch == LLM_ARCH_KIMI_K3) &&
-                skip_file && skip_file[0]) {
-            return false;
-        }
         // first check the ubatch
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
@@ -743,11 +731,8 @@ struct llm_graph_params {
         }
 
         return
-            k3_expert_policy == other.k3_expert_policy &&
-            llama_k3_expert_tables_equal(k3_expert_table, other.k3_expert_table) &&
             cpu_sink_decode == other.cpu_sink_decode &&
             cpu_sink_prefill == other.cpu_sink_prefill &&
-            cpu_sink_guard == other.cpu_sink_guard &&
             cpu_sink_runtime == other.cpu_sink_runtime &&
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -894,7 +879,6 @@ struct llm_graph_context {
     const int64_t n_outputs;
     const bool cpu_sink_decode;
     const bool cpu_sink_prefill;
-    const bool cpu_sink_guard;
     llama_kimi_cpu_sink_runtime * const cpu_sink_runtime;
     // Set by a model around its build_moe_ffn call: the next layer's predicted experts for the CPU sink's
     // prefetch and its hint statistics (single-token decode only).

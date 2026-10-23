@@ -1,5 +1,4 @@
 #include "server-common.h"
-#include "server-expert-guard.h"
 #include "chat.h"
 
 #include <algorithm>
@@ -13,11 +12,7 @@
 static void require(bool ok, const char * message) {
     if (!ok) { throw std::runtime_error(message); }
 }
-template<class F> static void rejects(F fn) {
-    bool rejected = false;
-    try { fn(); } catch (const std::exception &) { rejected = true; }
-    require(rejected, "invalid generation prefix was accepted");
-}
+
 
 static void test_template_kwargs_generation_prefix() {
     const std::string source =
@@ -58,27 +53,12 @@ static void test_template_kwargs_generation_prefix() {
             "a previous request's thinking kwarg leaked into the template default");
 }
 
-static void test_verified_current_prefix() {
-    const std::string assistant = "<|open|>message role=\"assistant\"<|sep|>";
-    const std::string response = "<|open|>response<|sep|>";
-    // Earlier history contains the same synthetic marker IDs. Only the verified
-    // current suffix is passed to the observer by the production launch path.
-    const llama_tokens prompt = {1, 2, 3, 88, 89, 4, 5};
-    server_expert_guard_verify_prefix(assistant + "<|open|>think<|sep|>", {4, 5}, prompt);
-    server_expert_guard_verify_prefix(assistant + response, {4, 5}, prompt);
-    server_expert_guard_verify_prefix(assistant + "<|open|>response", {4, 5}, prompt);
-    rejects([&] { server_expert_guard_verify_prefix("", {}, prompt); });
-    rejects([&] { server_expert_guard_verify_prefix(response, {4, 5}, prompt); });
-    rejects([&] { server_expert_guard_verify_prefix(assistant + response, {1, 2, 3}, prompt); });
-    rejects([&] { server_expert_guard_verify_prefix(assistant + response + "prefilled answer", {4, 5}, prompt); });
-    rejects([&] { server_expert_guard_verify_prefix(assistant + "<|end_of_msg|>" + response, {4, 5}, prompt); });
-}
+
 int main(int argc, char **) {
     try {
         require(argc == 1,
                 "usage: test-server-runtime-routing");
         test_template_kwargs_generation_prefix();
-        test_verified_current_prefix();
-        std::puts("runtime routing server: 2 groups PASS (no service started)");
+        std::puts("template prefix kwargs: PASS (no service started)");
     } catch (const std::exception & e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

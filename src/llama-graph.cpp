@@ -1388,7 +1388,6 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_outputs        (params.n_outputs),
     cpu_sink_decode  (params.cpu_sink_decode),
     cpu_sink_prefill (params.cpu_sink_prefill),
-    cpu_sink_guard   (params.cpu_sink_guard),
     cpu_sink_runtime (params.cpu_sink_runtime),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
@@ -1479,7 +1478,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
 }
 
 bool llm_graph_context::moe_next_gate_shadow_enabled() const {
-    return (arch == LLM_ARCH_KIMI_LINEAR || arch == LLM_ARCH_KIMI_K3 || arch == LLM_ARCH_DEEPSEEK2) &&
+    return (arch == LLM_ARCH_KIMI_LINEAR || arch == LLM_ARCH_DEEPSEEK2) &&
         n_tokens == 1 &&
         llama_moe_next_gate_shadow_enabled_env();
 }
@@ -2082,7 +2081,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const bool route_score_trace =
         llama_moe_route_score_trace_enabled_env() &&
         n_tokens >= 1 &&
-        (arch == LLM_ARCH_KIMI_LINEAR || arch == LLM_ARCH_KIMI_K3 || arch == LLM_ARCH_DEEPSEEK2);
+        (arch == LLM_ARCH_KIMI_LINEAR || arch == LLM_ARCH_DEEPSEEK2);
     if (route_score_trace || expert_hard_reduction) {
         ggml_tensor * trace_selection_probs = ggml_reshape_3d(ctx0, selection_probs, 1, n_expert, n_tokens);
         route_scores = ggml_get_rows(ctx0, trace_selection_probs, selected_experts);
@@ -2340,15 +2339,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         descriptor->runtime = cpu_sink_runtime;
         descriptor->situ_beta = hparams.situ_beta;
         descriptor->situ_linear_beta = hparams.situ_linear_beta;
-        descriptor->activation = kimi_k3_situ ?
-            kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SITU, hparams.situ_beta, hparams.situ_linear_beta, 0.0f } :
+        descriptor->activation =
             kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, muse_swiglu ? INFINITY : swiglu_limit };
         descriptor->post_exp_norm = post_exp_norm != nullptr;
         descriptor->post_exp_norm_eps = post_exp_norm_eps;
         descriptor->layer = il;
         descriptor->prefill = cpu_sink_prefill;
         descriptor->cache_compute = cache_compute;
-        descriptor->guarded = cpu_sink_guard;
         descriptor->routed_scale = w_scale == 0.0f ? 1.0f : w_scale;
         ggml_tensor * hint = !cache_compute && !cpu_sink_prefill && n_tokens == 1 ? cpu_sink_prefetch_hint : nullptr;
         // slots: input, ids, weights, then the post-expert norm or the native ids and weights, then the hint

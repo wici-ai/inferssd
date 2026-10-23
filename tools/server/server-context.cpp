@@ -1,9 +1,5 @@
 
 #include "server-context.h"
-#include "server-expert-guard.h"
-#include "server-sampler-struct-top1.h"
-#include "server-k3-protocol.h"
-#include "src/llama-kimi-runtime.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -580,34 +576,6 @@ enum server_state {
     SERVER_STATE_READY,          // Server is ready and model is loaded
 };
 
-static json server_runtime_policy_json(const llama_k3_decode_expert_policy & p) {
-    return {{"mode", llama_k3_decode_expert_mode_name(p.mode)}, {"top_k", p.top_k},
-        {"mass", p.mass}, {"min_k", p.min_k}, {"max_k", p.max_k},
-        {"layer_start", p.layer_start}, {"layer_end", p.layer_end}, {"small_batch", p.small_batch}};
-}
-
-static json server_runtime_config_json(const llama_k3_runtime_config & config) {
-    json table = json::array();
-    for (const auto & row : config.table) {
-        table.push_back({{"layer", row.layer}, {"mass", row.mass}, {"min_k", row.min_k}, {"max_k", row.max_k}});
-    }
-    return {{"primary", server_runtime_policy_json(config.primary)},
-        {"guard_tokens", config.guard_tokens}, {"guard_policy", server_runtime_policy_json(config.guard)},
-        {"guard_start_tokens", config.guard_start_tokens},
-        {"guard_control_tokens", config.guard_control_tokens},
-        {"layer_table", table}};
-}
-
-static llama_tokens server_guard_control_token_ids(const llama_vocab * vocab) {
-    const auto open = common_tokenize(vocab, "<|open|>", false, true);
-    const auto close = common_tokenize(vocab, "<|close|>", false, true);
-    if (open.size() != 1 || close.size() != 1 || open[0] < 0 || close[0] < 0 || open[0] == close[0] ||
-            !llama_vocab_is_control(vocab, open[0]) || !llama_vocab_is_control(vocab, close[0])) {
-        throw std::invalid_argument("K3 control guard requires distinct single control-token IDs for <|open|> and <|close|>");
-    }
-    return {open[0], close[0]};
-}
-
 struct server_slot {
     int id;
 
@@ -662,11 +630,6 @@ struct server_slot {
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
 
-    // Last min_len sampled tokens are held back from SSE. If loop_stop fires,
-    // the matched suffix is removed here before any client can observe it.
-    std::deque<completion_token_output> loop_output_hold;
-    int64_t loop_removed_tokens = 0;
-
     std::vector<completion_token_output> generated_token_probs;
 
     bool has_next_token = true;
@@ -681,27 +644,6 @@ struct server_slot {
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
-    server_expert_guard expert_guard;
-    server_k3_protocol k3_protocol;
-    uint64_t guard_predictions = 0, guard_failed_decodes = 0;
-    uint64_t guard_start_predictions = 0, guard_opener_predictions = 0, guard_overlap_predictions = 0;
-    uint64_t guard_control_predictions = 0, guard_control_only_predictions = 0;
-    int64_t guard_opened_after_token = -1;
-    bool guard_prompt_primed = false, guard_last_selected = false;
-    bool guard_last_start_selected = false, guard_last_opener_selected = false;
-    bool guard_last_control_selected = false;
-
-    void reset_guard() {
-        expert_guard.reset(0, {});
-        guard_predictions = guard_failed_decodes = 0;
-        guard_start_predictions = guard_opener_predictions = guard_overlap_predictions = 0;
-        guard_control_predictions = guard_control_only_predictions = 0;
-        guard_opened_after_token = -1;
-        guard_prompt_primed = guard_last_selected = false;
-        guard_last_start_selected = guard_last_opener_selected = false;
-        guard_last_control_selected = false;
-    }
-
     void prompt_save(server_prompt_cache & prompt_cache) const {
         GGML_ASSERT(prompt.data.size() == 0);
 
@@ -770,8 +712,6 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
-        reset_guard();
-        k3_protocol = {};
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -789,8 +729,6 @@ struct server_slot {
             spec_ckpt.clear();
         }
         generated_tokens.clear();
-        loop_output_hold.clear();
-        loop_removed_tokens = 0;
         generated_token_probs.clear();
         json_schema = json();
 
@@ -1176,10 +1114,6 @@ struct server_metrics {
     uint64_t n_prompt_tokens_processed_total = 0;
     uint64_t t_prompt_processing_total       = 0;
     uint64_t n_tokens_predicted_total        = 0;
-    uint64_t n_sampler_struct_top1_replacements_total = 0;
-    uint64_t n_sampler_struct_mixed_samples_total = 0;
-    uint64_t n_k3_constraint_conflicts_total = 0;
-    uint64_t n_k3_protocol_forced_tokens_total = 0;
     uint64_t t_tokens_generation_total       = 0;
 
     uint64_t n_tokens_max = 0;
@@ -1310,14 +1244,9 @@ private:
     // positions at which the memory can save a state it has gone past (llama_state_seq_at_align), 0 if it cannot
     int64_t checkpoint_at_align = 0;
 
-    bool guard_enabled() const {
-        const auto * config = llama_k3_runtime_config_get(ctx);
-        return config && (config->guard_tokens > 0 || config->guard_start_tokens > 0 || config->guard_control_tokens > 0);
-    }
+
 
     server_metrics metrics;
-    server_sampler_struct_top1 sampler_struct_top1;
-    server_k3_protocol_ids k3_protocol_ids;
 
     json json_webui_settings = json::object();
 
@@ -1405,8 +1334,7 @@ private:
     }
 
     void slot_save_and_clear(server_slot & slot) {
-        // Guard trajectories have no persisted prefix/schedule identity.
-        if (guard_enabled()) { return; }
+
         if (slot.prompt.n_tokens() == 0) {
             return;
         }
@@ -1440,19 +1368,6 @@ private:
 
         params_base = params;
 
-        try {
-            sampler_struct_top1.config = server_sampler_struct_top1_config::from_env();
-        } catch (const std::exception & e) {
-            SRV_ERR("%s\n", e.what());
-            return false;
-        }
-        if (sampler_struct_top1.config.active() && params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
-            SRV_ERR("%s", "K3 sampler structural top-1 requires non-speculative sampling\n");
-            return false;
-        }
-
-        if (sampler_struct_top1.config.active()) { params_base.sampling.backend_sampling = false; }
-
         llama_init = common_init_from_params(params_base);
 
         model = llama_init->model();
@@ -1473,43 +1388,6 @@ private:
         }
 
         vocab = llama_model_get_vocab(model);
-        sampler_struct_top1.tokens.clear();
-        if (sampler_struct_top1.config.active()) {
-            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-            sampler_struct_top1.tokens.reserve(n_vocab);
-            size_t n_struct = 0, n_mixed = 0;
-            for (int32_t token = 0; token < n_vocab; ++token) {
-                sampler_struct_top1.tokens.push_back(server_struct_classify(
-                    common_token_to_piece(vocab, token, true),
-                    (llama_vocab_get_attr(vocab, token) & LLAMA_TOKEN_ATTR_CONTROL) != 0,
-                    llama_vocab_is_eog(vocab, token)));
-                n_struct += sampler_struct_top1.is_struct(token);
-                n_mixed += sampler_struct_top1.tokens.back().mixed;
-            }
-            k3_protocol_ids = server_k3_protocol_ids::find(sampler_struct_top1.tokens);
-            const auto & config = sampler_struct_top1.config;
-            SRV_INF("K3 sampler: struct_top1=%d, protocol_tags=%d, force_response=%d, vocab=%d, structural=%zu, mixed=%zu, classes=%u, min_top1_p=%.9g, basis=effective_q, grammar_first=1, backend_sampling=0\n",
-                config.enabled, config.protocol_tags, config.force_response, n_vocab, n_struct, n_mixed,
-                unsigned(config.classes), config.min_top1_p);
-        }
-        if (const auto * config = llama_k3_runtime_config_get(ctx)) {
-            if (config->guard_control_tokens > 0) {
-                try {
-                    const auto control = server_guard_control_token_ids(vocab);
-                    SRV_INF("control guard tokens: open=%d, close=%d\n", control[0], control[1]);
-                }
-                catch (const std::exception & e) { SRV_ERR("%s\n", e.what()); return false; }
-            }
-            if (guard_enabled() && (params_base.n_parallel != 1 ||
-                    params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE || !params_base.mmproj.path.empty())) {
-                SRV_ERR("%s", "K3 opener guard requires one slot, no speculation and a text-only context\n");
-                return false;
-            }
-            if (guard_enabled() || !config->table.empty()) {
-                SRV_INF("runtime routing launch: %s\n", server_runtime_config_json(*config).dump().c_str());
-            }
-        }
-
         n_ctx = llama_n_ctx(ctx);
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
@@ -1951,7 +1829,7 @@ private:
             const auto & tokens = ret->prompt.tokens;
 
             // cache prompts only for completion tasks
-            const bool cache_task = prompt_cache && !guard_enabled() && task.type == SERVER_TASK_TYPE_COMPLETION;
+            const bool cache_task = prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
 
             update_cache = update_cache && cache_task;
 
@@ -2031,8 +1909,6 @@ private:
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // Rejected launches need not pass through release()/reset().
-        slot.reset_guard();
-        slot.k3_protocol = {};
 
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
@@ -2104,45 +1980,9 @@ private:
             return false;
         }
 
-        if (sampler_struct_top1.config.active() && task.need_sampling()) {
-            try {
-                const auto & config = sampler_struct_top1.config;
-                if ((config.protocol_tags || config.force_response) && common_grammar_needs_prefill(task.params.sampling.grammar)) {
-                    throw std::invalid_argument("K3 protocol tags currently support ordinary chat, not tool/schema generation profiles");
-                }
-                // Declared tools (tool_choice other than none) admit the template's tool section;
-                // tool_choice=required makes it mandatory, as the tool-call grammar does elsewhere.
-                slot.k3_protocol.reset(task.params.sampling.generation_prompt, sampler_struct_top1.tokens,
-                    k3_protocol_ids, config.protocol_tags, config.force_response,
-                    task.params.chat_parser_params.parse_tool_calls, task.params.tool_call_required);
-                if (slot.k3_protocol.observing()) {
-                    if (task.tokens.has_mtmd) { throw std::invalid_argument("K3 protocol requires a text-only prompt"); }
-                    const auto prefix = common_tokenize(vocab, task.params.sampling.generation_prompt, false, true);
-                    server_expert_guard_verify_prefix(task.params.sampling.generation_prompt, prefix, task.tokens.get_text_tokens());
-                }
-                task.params.sampling.backend_sampling = false;
-            } catch (const std::exception & e) {
-                send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
-                return false;
-            }
-        }
 
-        if (guard_enabled()) {
-            try {
-                const auto * config = llama_k3_runtime_config_get(ctx);
-                if (mctx || task.tokens.has_mtmd) { throw std::invalid_argument("K3 opener guard requires a text-only prompt"); }
-                const auto prefix = common_tokenize(vocab, task.params.sampling.generation_prompt, false, true);
-                server_expert_guard_verify_prefix(task.params.sampling.generation_prompt, prefix, task.tokens.get_text_tokens());
-                const auto control = config->guard_control_tokens > 0
-                    ? server_guard_control_token_ids(vocab) : llama_tokens{LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL};
-                slot.expert_guard.reset(config->guard_tokens,
-                    common_tokenize(vocab, "<|open|>response<|sep|>", false, true), config->guard_start_tokens,
-                    config->guard_control_tokens, control[0], control[1]);
-                slot.expert_guard.prime_current_prefix(prefix);
-                slot.guard_prompt_primed = slot.expert_guard.opened();
-                if (slot.guard_prompt_primed) { slot.guard_opened_after_token = 0; }
-            } catch (const std::exception & e) { send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST); return false; }
-        }
+
+
 
         if (!task.is_child()) {
             const bool defer_workspace = server_prefill_new_tokens_enabled() && task.need_sampling();
@@ -2179,7 +2019,6 @@ private:
 
             // TODO: getting post/pre sampling logits is not yet supported with backend sampling
             backend_sampling &= !need_logits;
-            backend_sampling &= !sampler_struct_top1.config.active();
 
             // TODO: tmp until backend sampling is fully implemented
             if (backend_sampling) {
@@ -2193,28 +2032,7 @@ private:
             slot.smpl.reset();
         }
 
-        if (guard_enabled()) {
-            // Only B requires a cold cross-request state. Inside one response,
-            // switching the frozen policy preserves KV/recurrent continuity.
-            llama_synchronize(ctx);
-            if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, -1, -1)) {
-                llama_memory_clear(llama_get_memory(ctx), true);
-            }
-            slot.prompt.tokens.clear();
-            slot.prompt.data.clear();
-            slot.prompt.checkpoints.clear();
-            slot.spec_ckpt.clear();
-            slot.n_prompt_tokens_cache = 0;
-            if (prompt_cache) { prompt_cache->states.clear(); }
-            if (!llama_k3_runtime_guard_set(ctx, false)) {
-                slot.end_request();
-                send_error(task, "cannot restore K3 primary routing", ERROR_TYPE_SERVER);
-                return false;
-            }
-            SLT_INF(slot, "opener guard cold start: tokens=%u, prompt_primed=%d, start_tokens=%u, control_tokens=%u\n",
-                llama_k3_runtime_config_get(ctx)->guard_tokens, int(slot.guard_prompt_primed),
-                llama_k3_runtime_config_get(ctx)->guard_start_tokens, llama_k3_runtime_config_get(ctx)->guard_control_tokens);
-        }
+
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -2300,28 +2118,7 @@ private:
         }
     }
 
-    void flush_loop_output_hold(server_slot & slot) {
-        if (slot.stop == STOP_TYPE_WORD) {
-            slot.loop_output_hold.clear();
-            return;
-        }
 
-        while (!slot.loop_output_hold.empty()) {
-            completion_token_output output = std::move(slot.loop_output_hold.front());
-            slot.loop_output_hold.pop_front();
-
-            // EOG controls generation but is never user-visible.
-            if (llama_vocab_is_eog(vocab, output.tok)) {
-                continue;
-            }
-
-            emit_output_token(std::move(output), slot);
-            if (slot.stop == STOP_TYPE_WORD) {
-                slot.loop_output_hold.clear();
-                break;
-            }
-        }
-    }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
         const completion_token_output sampled_result = result;
@@ -2331,32 +2128,7 @@ private:
         // while its user-visible representation remains in the rolling hold.
         slot.sampled = sampled_result.tok;
         slot.has_next_token = true;
-        slot.loop_output_hold.push_back(sampled_result);
-
-        int32_t matched_len = 0;
-        const bool loop_triggered = common_sampler_loop_stop_triggered(slot.smpl.get(), &matched_len);
-        if (loop_triggered && matched_len > 0) {
-            const size_t removable = std::min<size_t>((size_t) matched_len, slot.loop_output_hold.size());
-            for (size_t i = 0; i < removable; ++i) {
-                slot.loop_output_hold.pop_back();
-            }
-            slot.loop_removed_tokens += removable;
-
-            if (removable != (size_t) matched_len) {
-                SLT_WRN(slot,
-                        "loop_stop triggered for %d tokens, but only %zu unsent tokens remained; visible output may be incomplete\n",
-                        matched_len, removable);
-            } else {
-                SLT_WRN(slot, "loop_stop suppressed repeated output block before streaming: %d tokens\n", matched_len);
-            }
-        }
-
-        const int32_t hold_limit = std::max(0, common_sampler_loop_stop_min_len(slot.smpl.get()));
-        if ((int32_t) slot.loop_output_hold.size() > hold_limit) {
-            completion_token_output output = std::move(slot.loop_output_hold.front());
-            slot.loop_output_hold.pop_front();
-            emit_output_token(std::move(output), slot);
-        }
+        emit_output_token(sampled_result, slot);
 
         // if context shifting is disabled, make sure that we don't run out of context
         if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
@@ -2545,18 +2317,7 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
-        if (guard_enabled()) {
-            SLT_INF(slot, "opener guard summary: predictions=%" PRIu64 ", remaining=%u, opened_after_token=%" PRId64
-                ", prompt_primed=%d, failed_decodes=%" PRIu64 ", start_predictions=%" PRIu64
-                ", opener_predictions=%" PRIu64 ", overlap_predictions=%" PRIu64 ", start_remaining=%u"
-                ", control_predictions=%" PRIu64 ", control_only_predictions=%" PRIu64 ", control_remaining=%u"
-                ", control_triggers=%" PRIu64 "\n",
-                slot.guard_predictions, slot.expert_guard.remaining(), slot.guard_opened_after_token,
-                int(slot.guard_prompt_primed), slot.guard_failed_decodes, slot.guard_start_predictions,
-                slot.guard_opener_predictions, slot.guard_overlap_predictions, slot.expert_guard.start_remaining(),
-                slot.guard_control_predictions, slot.guard_control_only_predictions, slot.expert_guard.control_remaining(),
-                slot.expert_guard.control_triggers());
-        }
+
         slot.end_request();
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
@@ -2977,17 +2738,8 @@ private:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
                 {
-                    if (guard_enabled() && (task.type != SERVER_TASK_TYPE_COMPLETION || task.params.n_cmpl != 1 ||
-                            task.is_parent() || task.is_child() || task.params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE ||
-                            (task.params.res_type != TASK_RESPONSE_TYPE_NONE && task.params.res_type != TASK_RESPONSE_TYPE_OAI_CHAT &&
-                             task.params.res_type != TASK_RESPONSE_TYPE_OAI_CMPL))) {
-                        send_error(task, "K3 opener guard requires one native/OAI completion without speculation", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    if (sampler_struct_top1.config.active() && task.params.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
-                        send_error(task, "K3 sampler structural top-1 requires non-speculative sampling", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
+
+
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
                     if (task.cli) {
@@ -3093,10 +2845,6 @@ private:
                     res->n_prompt_tokens_processed_total = metrics.n_prompt_tokens_processed_total;
                     res->t_prompt_processing_total       = metrics.t_prompt_processing_total;
                     res->n_tokens_predicted_total        = metrics.n_tokens_predicted_total;
-                    res->n_sampler_struct_top1_replacements_total = metrics.n_sampler_struct_top1_replacements_total;
-                    res->n_sampler_struct_mixed_samples_total = metrics.n_sampler_struct_mixed_samples_total;
-                    res->n_k3_constraint_conflicts_total = metrics.n_k3_constraint_conflicts_total;
-                    res->n_k3_protocol_forced_tokens_total = metrics.n_k3_protocol_forced_tokens_total;
                     res->t_tokens_generation_total       = metrics.t_tokens_generation_total;
 
                     res->n_tokens_max = metrics.n_tokens_max;
@@ -3116,10 +2864,7 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
                 {
-                    if (guard_enabled()) {
-                        send_error(task, "K3 opener guard does not support slot files without a routing schedule identity", ERROR_TYPE_NOT_SUPPORTED);
-                        break;
-                    }
+
                     if (!check_no_mtmd(task.id)) {
                         break;
                     }
@@ -3161,10 +2906,7 @@ private:
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
                 {
-                    if (guard_enabled()) {
-                        send_error(task, "K3 opener guard does not support slot files without a routing schedule identity", ERROR_TYPE_NOT_SUPPORTED);
-                        break;
-                    }
+
                     if (!check_no_mtmd(task.id)) break;
                     const int id_slot = task.slot_action.id_slot;
                     server_slot * slot = get_slot_by_id(id_slot);
@@ -3882,7 +3624,7 @@ private:
                         }
 
                         const bool is_last_prompt_token = slot.prompt.n_tokens() + 1 == slot.task->n_tokens();
-                        if ((server_prompt_last_token_single_enabled() || slot.expert_guard.active()) && is_last_prompt_token && batch.n_tokens > 0) {
+                        if (server_prompt_last_token_single_enabled() && is_last_prompt_token && batch.n_tokens > 0) {
                             // Start or a prompt-primed opener must protect the logits predicting the first
                             // sampled token. Earlier prompt rows do not consume either budget.
                             // The DeepSeek-V4 MoE path can return bad first-token logits when the final prompt
@@ -4042,32 +3784,6 @@ private:
                 batch.logits   + i,
             };
 
-            const bool predictive_row = slot_batched && slot_batched->i_batch >= i &&
-                slot_batched->i_batch < i + n_tokens &&
-                (slot_batched->state == SLOT_STATE_GENERATING || slot_batched->state == SLOT_STATE_DONE_PROMPT);
-            const bool start_guarded = predictive_row && slot_batched->expert_guard.start_active();
-            const bool opener_guarded = predictive_row && slot_batched->expert_guard.opener_active();
-            const bool control_guarded = predictive_row && slot_batched->expert_guard.control_active();
-            const bool guarded = start_guarded || opener_guarded || control_guarded;
-            if (guard_enabled()) {
-                GGML_ASSERT(!guarded || n_tokens == 1);
-                if (!llama_k3_runtime_guard_set(ctx, guarded)) { GGML_ABORT("cannot select frozen K3 guard policy"); }
-                if (slot_batched && (slot_batched->guard_last_selected != guarded ||
-                        slot_batched->guard_last_start_selected != start_guarded ||
-                        slot_batched->guard_last_opener_selected != opener_guarded ||
-                        slot_batched->guard_last_control_selected != control_guarded)) {
-                    SLT_INF(*slot_batched, "opener guard switch: active=%d, prediction=%d, remaining=%u"
-                        ", start_active=%d, opener_active=%d, start_remaining=%u, control_active=%d, control_remaining=%u\n",
-                        int(guarded), slot_batched->n_decoded + 1, slot_batched->expert_guard.remaining(),
-                        int(start_guarded), int(opener_guarded), slot_batched->expert_guard.start_remaining(),
-                        int(control_guarded), slot_batched->expert_guard.control_remaining());
-                    slot_batched->guard_last_selected = guarded;
-                    slot_batched->guard_last_start_selected = start_guarded;
-                    slot_batched->guard_last_opener_selected = opener_guarded;
-                    slot_batched->guard_last_control_selected = control_guarded;
-                }
-            }
-
             const int64_t mac_batch_start = mac_adaptive_prefill ? ggml_time_us() : 0;
             const int ret = llama_decode(ctx, batch_view);
             if (mac_adaptive_prefill && ret == 0 && n_tokens > 1) {
@@ -4095,7 +3811,7 @@ private:
             metrics.on_decoded(slots);
 
             if (ret != 0) {
-                if (guard_enabled() && slot_batched) { ++slot_batched->guard_failed_decodes; }
+
                 {
                     std::string err;
 
@@ -4144,17 +3860,7 @@ private:
                 continue; // continue loop of n_batch
             }
 
-            if (guarded) {
-                ++slot_batched->guard_predictions;
-                slot_batched->guard_start_predictions += start_guarded;
-                slot_batched->guard_opener_predictions += opener_guarded;
-                slot_batched->guard_overlap_predictions += start_guarded && opener_guarded;
-                slot_batched->guard_control_predictions += control_guarded;
-                // Existing overlap is S/O only. Adding control-only preserves
-                // union = start + opener - overlap + control_only for all three.
-                slot_batched->guard_control_only_predictions += control_guarded && !start_guarded && !opener_guarded;
-                slot_batched->expert_guard.commit_forward(true);
-            }
+
 
             for (auto & slot : slots) {
                 if (slot.can_speculate() &&
@@ -4250,86 +3956,17 @@ private:
                 const int tok_idx = slot.i_batch - i;
 
                 llama_token id = LLAMA_TOKEN_NULL;
-                auto next_protocol = slot.k3_protocol;
-                const bool k3_active = sampler_struct_top1.config.active();
-                const bool budget_forced = k3_active && common_sampler_is_budget_forcing(slot.smpl.get());
-                const bool protocol_forced = k3_active && slot.k3_protocol.forcing();
                 try {
-                    if (k3_active) {
-                        id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx, true,
-                            [&](llama_token_data_array & candidates) { slot.k3_protocol.mask(candidates); });
-                        const llama_token sampled = id;
-                        const auto * q = common_sampler_get_candidates(slot.smpl.get(), false);
-                        const auto replacement = sampler_struct_top1.apply(sampled, *q,
-                            budget_forced || protocol_forced, slot.k3_protocol.is_label_token(sampled));
-                        id = replacement.token;
-                        // Validate and stage the observer before changing any live history.
-                        next_protocol.accept(id);
-                        const auto & sampled_info = sampler_struct_top1.tokens[sampled];
-                        const auto & top1_info = sampler_struct_top1.tokens[replacement.top1];
-                        metrics.n_sampler_struct_top1_replacements_total += replacement.replaced;
-                        metrics.n_sampler_struct_mixed_samples_total += sampled_info.mixed;
-                        metrics.n_k3_protocol_forced_tokens_total += protocol_forced;
-                        if (replacement.replaced || sampled_info.mixed || budget_forced || protocol_forced) {
-                            const json event = {
-                                {"task", slot.task->id}, {"slot", slot.id}, {"prediction", slot.n_decoded + 1},
-                                {"input_pos", batch_view.pos[tok_idx]}, {"output_pos", batch_view.pos[tok_idx] + 1},
-                                {"sampled", sampled}, {"sampled_piece", sampled_info.bytes},
-                                {"sampled_bytes_hex", server_struct_bytes_hex(sampled_info.bytes)},
-                                {"sampled_p", replacement.sampled_p}, {"top1", replacement.top1},
-                                {"top1_piece", top1_info.bytes}, {"top1_bytes_hex", server_struct_bytes_hex(top1_info.bytes)},
-                                {"top1_p", replacement.top1_p}, {"final", id}, {"q_size", q->size},
-                                {"probability_basis", "effective_q_before_projection"},
-                                {"min_top1_p", sampler_struct_top1.config.min_top1_p},
-                                {"sampled_mixed", sampled_info.mixed}, {"budget_forced", budget_forced},
-                                {"protocol_forced", protocol_forced}, {"protocol_phase", slot.k3_protocol.name()},
-                                {"replaced", replacement.replaced},
-                                {"replacements_total", metrics.n_sampler_struct_top1_replacements_total}
-                            };
-                            SLT_INF(slot, "%s %s\n", replacement.replaced ? "sampler_struct_top1_replace" :
-                                sampled_info.mixed ? "sampler_struct_mixed_sample" : "k3_sampler_forced",
-                                event.dump(-1, ' ', true, json::error_handler_t::replace).c_str());
-                        }
-                    } else {
-                        id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
-                    }
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx, tok_idx);
                 } catch (const std::exception & e) {
-                    ++metrics.n_k3_constraint_conflicts_total;
-                    const json event = {
-                        {"task", slot.task->id}, {"slot", slot.id}, {"prediction", slot.n_decoded + 1},
-                        {"input_pos", batch_view.pos[tok_idx]}, {"error", e.what()},
-                        {"protocol_phase", slot.k3_protocol.name()}, {"stack", slot.k3_protocol.stack()},
-                        {"label_bytes_hex", server_struct_bytes_hex(slot.k3_protocol.label_bytes())},
-                        {"budget_forced", budget_forced}, {"protocol_forced", protocol_forced},
-                        {"conflicts_total", metrics.n_k3_constraint_conflicts_total}
-                    };
-                    SLT_ERR(slot, "k3_constraint_conflict %s\n", event.dump().c_str());
+                    SLT_ERR(slot, "sampling failed: %s\n", e.what());
                     send_error(slot, e.what(), ERROR_TYPE_SERVER);
                     slot.release();
                     slot.i_batch = -1;
                     continue;
                 }
-
                 slot.i_batch = -1;
-                const bool reasoning_end_complete = k3_active && slot.k3_protocol.state() == server_k3_protocol::CLOSE_LABEL &&
-                    next_protocol.state() == server_k3_protocol::AFTER_THINK;
-                const bool reasoning_end_token = reasoning_end_complete || (k3_active &&
-                    next_protocol.state() == server_k3_protocol::CLOSE_LABEL && next_protocol.stack().back() == "think");
-                common_sampler_accept(slot.smpl.get(), id, true, reasoning_end_token, reasoning_end_complete);
-                const char * token_trace = std::getenv("LLAMA_K3_SERVER_TOKEN_TRACE");
-                if (token_trace && std::strcmp(token_trace, "1") == 0) {
-                    SLT_INF(slot, "k3_output_token prediction=%d input_pos=%d token=%d budget_forced=%d protocol_forced=%d\n",
-                        slot.n_decoded + 1, batch_view.pos[tok_idx], id, int(budget_forced), int(protocol_forced));
-                }
-                if (k3_active) { slot.k3_protocol = std::move(next_protocol); }
-                const bool was_opened = slot.expert_guard.opened();
-                const uint64_t control_triggers_before = slot.expert_guard.control_triggers();
-                slot.expert_guard.accept_generated(id);
-                if (!was_opened && slot.expert_guard.opened()) { slot.guard_opened_after_token = slot.n_decoded + 1; }
-                if (slot.expert_guard.control_triggers() != control_triggers_before) {
-                    SLT_INF(slot, "opener guard control trigger: token=%d, after_token=%d, remaining=%u, triggers=%" PRIu64 "\n",
-                        id, slot.n_decoded + 1, slot.expert_guard.control_remaining(), slot.expert_guard.control_triggers());
-                }
+                common_sampler_accept(slot.smpl.get(), id, true);
 
                 // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();
@@ -4355,7 +3992,6 @@ private:
 
                 if (!process_token(result, slot)) {
                     // release slot because of stop condition
-                    flush_loop_output_hold(slot);
                     slot.print_timings();
                     send_final_response(slot);
                     metrics.on_prediction(slot);
@@ -4489,7 +4125,6 @@ private:
                     // TODO: set result.probs
 
                     if (!process_token(result, slot)) {
-                        flush_loop_output_hold(slot);
                         slot.print_timings();
                         send_final_response(slot);
                         metrics.on_prediction(slot);
@@ -4927,22 +4562,6 @@ void server_routes::init_routes() {
                     {"name",  "tokens_predicted_total"},
                     {"help",  "Number of generation tokens processed."},
                     {"value",  (uint64_t) res_task->n_tokens_predicted_total}
-            }, {
-                    {"name",  "sampler_struct_top1_replacements_total"},
-                    {"help",  "Structural non-top-1 samples projected to effective-distribution top-1."},
-                    {"value", res_task->n_sampler_struct_top1_replacements_total}
-            }, {
-                    {"name", "sampler_struct_mixed_samples_total"},
-                    {"help", "Mixed body/structure pieces sampled; never projected."},
-                    {"value", res_task->n_sampler_struct_mixed_samples_total}
-            }, {
-                    {"name", "k3_constraint_conflicts_total"},
-                    {"help", "Requests failed on an empty or inconsistent K3 sampling constraint."},
-                    {"value", res_task->n_k3_constraint_conflicts_total}
-            }, {
-                    {"name", "k3_protocol_forced_tokens_total"},
-                    {"help", "Protocol-forced tokens exempt from structural projection."},
-                    {"value", res_task->n_k3_protocol_forced_tokens_total}
             }, {
                     {"name",  "tokens_predicted_seconds_total"},
                     {"help",  "Predict process time"},

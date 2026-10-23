@@ -48,10 +48,6 @@ void                    common_sampler_accept(struct common_sampler * gsmpl, lla
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
 
-// loop_stop state, valid immediately after common_sampler_accept()
-bool    common_sampler_loop_stop_triggered(const struct common_sampler * gsmpl, int32_t * matched_len);
-int32_t common_sampler_loop_stop_min_len  (const struct common_sampler * gsmpl);
-
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
 

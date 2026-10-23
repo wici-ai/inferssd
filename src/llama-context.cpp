@@ -65,55 +65,7 @@ namespace {
 
 static std::atomic<uint64_t> kimi_cpu_sink_context_epoch { 1 };
 
-static bool llama_kimi_kda_gpu_layer_selected(int layer) {
-    const char * env = std::getenv("GGML_KIMI_KDA_GPU_LAYERS");
-    if (env == nullptr || env[0] == '\0' || std::strcmp(env, "0") == 0) {
-        return false;
-    }
-    if (std::strcmp(env, "all") == 0 || std::strcmp(env, "*") == 0) {
-        return true;
-    }
 
-    const char * p = env;
-    while (*p != '\0') {
-        while (*p == ' ' || *p == '\t' || *p == ',') {
-            ++p;
-        }
-        if (*p == '\0') {
-            break;
-        }
-
-        errno = 0;
-        char * end = nullptr;
-        const long first = std::strtol(p, &end, 10);
-        if (errno != 0 || end == p || first < 0 ||
-                first > std::numeric_limits<int>::max()) {
-            return false;
-        }
-        long last = first;
-        p = end;
-        if (*p == '-') {
-            ++p;
-            errno = 0;
-            last = std::strtol(p, &end, 10);
-            if (errno != 0 || end == p || last < first ||
-                    last > std::numeric_limits<int>::max()) {
-                return false;
-            }
-            p = end;
-        }
-        if (layer >= first && layer <= last) {
-            return true;
-        }
-        while (*p == ' ' || *p == '\t') {
-            ++p;
-        }
-        if (*p != '\0' && *p != ',') {
-            return false;
-        }
-    }
-    return false;
-}
 
 struct kimi_logits_trace_state {
     std::mutex mutex;
@@ -870,69 +822,6 @@ static void moe_route_score_trace_record(
 
 }
 
-// Freeze the launch routing form before any scheduler reserve/runtime graph.
-// The only later mutation is the bool selecting primary or guard; no request
-// can supply a policy or table through this internal interface.
-static llama_k3_runtime_config llama_k3_runtime_from_env(const llama_hparams & hp) {
-    llama_k3_runtime_config config;
-    config.primary = llama_k3_decode_expert_policy_from_env(hp.n_expert_used, hp.n_layer);
-    if (!config.primary.valid()) {
-        throw std::invalid_argument(std::string("invalid K3 decode expert policy: ") +
-            llama_k3_decode_expert_policy_error_name(config.primary.error));
-    }
-    config.table = llama_k3_expert_table_from_env(hp.n_expert_used, hp.n_layer);
-    config.guard = config.primary;
-    config.guard.mode = llama_k3_decode_expert_mode::hard;
-    config.guard.top_k = hp.n_expert_used;
-
-    const auto value = [](const char * suffix) {
-        const std::string name = std::string("LLAMA_K3_DECODE_EXPERT_GUARD_") + suffix;
-        const char * text = std::getenv(name.c_str());
-        return text && text[0] ? text : nullptr;
-    };
-    const auto integer = [&](const char * suffix, int64_t & field, int64_t lower, int64_t upper) {
-        const char * text = value(suffix);
-        if (text && (!llama_k3_parse_i64_strict(text, field) || field < lower || field > upper)) {
-            throw std::invalid_argument(std::string("invalid K3 expert guard ") + suffix);
-        }
-    };
-    int64_t tokens = 0;
-    integer("TOKENS", tokens, 0, INT32_MAX);
-    config.guard_tokens = uint32_t(tokens);
-    int64_t start_tokens = 0;
-    integer("START_TOKENS", start_tokens, 0, INT32_MAX);
-    config.guard_start_tokens = uint32_t(start_tokens);
-    int64_t control_tokens = 0;
-    integer("CONTROL_TOKENS", control_tokens, 0, INT32_MAX);
-    config.guard_control_tokens = uint32_t(control_tokens);
-    if (const char * mode = value("MODE")) {
-        if (std::strcmp(mode, "off") == 0) { config.guard.mode = llama_k3_decode_expert_mode::disabled; }
-        else if (std::strcmp(mode, "hard") == 0) { config.guard.mode = llama_k3_decode_expert_mode::hard; }
-        else if (std::strcmp(mode, "mass") == 0) { config.guard.mode = llama_k3_decode_expert_mode::mass; }
-        else { throw std::invalid_argument("invalid K3 expert guard MODE"); }
-    }
-    integer("TOP_K", config.guard.top_k, 1, hp.n_expert_used);
-    integer("MIN_K", config.guard.min_k, 1, hp.n_expert_used);
-    integer("MAX_K", config.guard.max_k, 0, hp.n_expert_used);
-    if (const char * mass = value("MASS")) {
-        if (!llama_k3_parse_f32_strict(mass, config.guard.mass) || config.guard.mass <= 0 || config.guard.mass > 1) {
-            throw std::invalid_argument("invalid K3 expert guard MASS");
-        }
-    }
-    if (config.guard.mode == llama_k3_decode_expert_mode::mass &&
-            (config.guard.mass <= 0 || config.guard.mass > 1 || config.guard.min_k < 1 ||
-             config.guard.min_k > hp.n_expert_used ||
-             (config.guard.max_k > 0 && config.guard.min_k > config.guard.max_k))) {
-        throw std::invalid_argument("invalid K3 expert guard mass/min_k/max_k combination");
-    }
-    if (!hp.expert_weights_norm &&
-            (config.primary.mode == llama_k3_decode_expert_mode::mass ||
-             config.guard.mode == llama_k3_decode_expert_mode::mass || !config.table.empty())) {
-        throw std::invalid_argument("K3 cumulative-mass routing requires normalized routing weights");
-    }
-    return config;
-}
-
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -948,13 +837,6 @@ llama_context::llama_context(
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
-
-    // Real vocab-only loaders omit model routing metadata. Preserve those
-    // graphless callers; incomplete full-model metadata still fails validation.
-    if (model.arch == LLM_ARCH_KIMI_K3 &&
-            !(hparams.vocab_only && (hparams.n_expert_used == 0 || hparams.n_layer == 0))) {
-        k3_runtime = std::make_unique<const llama_k3_runtime_config>(llama_k3_runtime_from_env(hparams));
-    }
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
@@ -1088,10 +970,8 @@ llama_context::llama_context(
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     const char * dense_gpu_env = std::getenv("GGML_KIMI_DENSE_PREFETCH_LAYERS");
-    const char * kda_gpu_env = std::getenv("GGML_KIMI_KDA_GPU_LAYERS");
     dense_gpu_phase_gate_enabled =
-        (dense_gpu_env && dense_gpu_env[0] && std::strcmp(dense_gpu_env, "0") != 0) ||
-        (kda_gpu_env && kda_gpu_env[0] && std::strcmp(kda_gpu_env, "0") != 0);
+        dense_gpu_env && dense_gpu_env[0] && std::strcmp(dense_gpu_env, "0") != 0;
 
     const char * cpu_sink_env = std::getenv("GGML_KIMI_CPU_SINK");
     cpu_sink_enabled = cpu_sink_env && cpu_sink_env[0] && std::strcmp(cpu_sink_env, "0") != 0;
@@ -1124,8 +1004,8 @@ llama_context::llama_context(
         if (!cpu_sink_enabled) {
             throw std::runtime_error("GGML_KIMI_CPU_PREFILL=1 or GGML_KIMI_CPU_PREFILL_MAX_TOKENS > 0 requires GGML_KIMI_CPU_SINK=1");
         }
-        if (model.arch != LLM_ARCH_KIMI_K3 && model.arch != LLM_ARCH_DEEPSEEK41 && model.arch != LLM_ARCH_MUSE_SPARK) {
-            throw std::runtime_error("GGML_KIMI_CPU_PREFILL supports only Kimi-K3, DeepSeek-V4.1 or Muse Spark models; set GGML_KIMI_CPU_PREFILL=0");
+        if (model.arch != LLM_ARCH_DEEPSEEK41 && model.arch != LLM_ARCH_MUSE_SPARK) {
+            throw std::runtime_error("GGML_KIMI_CPU_PREFILL supports only DeepSeek-V4.1 or Muse Spark models; set GGML_KIMI_CPU_PREFILL=0");
         }
     }
     if (cpu_sink_enabled) {
@@ -1138,8 +1018,8 @@ llama_context::llama_context(
             __func__, cparams.n_ubatch);
     }
     if (cpu_sink_enabled) {
-        if (model.arch != LLM_ARCH_KIMI_K3 && model.arch != LLM_ARCH_DEEPSEEK41 && model.arch != LLM_ARCH_MUSE_SPARK) {
-            throw std::runtime_error("GGML_KIMI_CPU_SINK requires a Kimi-K3, DeepSeek-V4.1 or Muse Spark model");
+        if (model.arch != LLM_ARCH_DEEPSEEK41 && model.arch != LLM_ARCH_MUSE_SPARK) {
+            throw std::runtime_error("GGML_KIMI_CPU_SINK requires a DeepSeek-V4.1 or Muse Spark model");
         }
         if (cparams.n_seq_max != 1) {
             throw std::runtime_error("GGML_KIMI_CPU_SINK requires --parallel 1 (-np 1): request phase is context-wide");
@@ -1158,7 +1038,7 @@ llama_context::llama_context(
         }
         cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer,
             kimi_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
-            model.arch == LLM_ARCH_KIMI_K3, int64_t(model.hparams.n_expert), routed_layers);
+            int64_t(model.hparams.n_expert), routed_layers);
         LLAMA_LOG_INFO("%s: CPU sink configured; single-token decode%s uses CPU experts\n",
             __func__, cpu_prefill_max_tokens > 0 ? " and grouped prefill" : "");
         if (cpu_prefill_max_tokens == std::numeric_limits<uint32_t>::max()) {
@@ -1688,10 +1568,7 @@ void llama_context::sched_reserve() {
                 GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FGDN_AR "-", prefix_len) == 0);
                 const int il = std::stoi(n->name + prefix_len);
                 ggml_backend_dev_t device_kv = model.dev_layer(il);
-                const bool kda_gpu_override = model.arch == LLM_ARCH_KIMI_K3 &&
-                    llama_kimi_kda_gpu_layer_selected(il) &&
-                    ggml_backend_dev_type(device_gdn) == GGML_BACKEND_DEVICE_TYPE_GPU;
-                if (device_gdn != device_kv && !kda_gpu_override) {
+                if (device_gdn != device_kv) {
                     LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the fused Gated Delta Net tensor "
                             "is assigned to device %s (usually due to missing support)\n",
                             __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_gdn));
@@ -1732,10 +1609,7 @@ void llama_context::sched_reserve() {
                 GGML_ASSERT(strncmp(n->name, LLAMA_TENSOR_NAME_FGDN_CH "-", prefix_len) == 0);
                 const int il = std::stoi(n->name + prefix_len);
                 ggml_backend_dev_t device_kv = model.dev_layer(il);
-                const bool kda_gpu_override = model.arch == LLM_ARCH_KIMI_K3 &&
-                    llama_kimi_kda_gpu_layer_selected(il) &&
-                    ggml_backend_dev_type(device_gdn) == GGML_BACKEND_DEVICE_TYPE_GPU;
-                if (device_gdn != device_kv && !kda_gpu_override) {
+                if (device_gdn != device_kv) {
                     LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but the fused Gated Delta Net tensor "
                             "is assigned to device %s (usually due to missing support)\n",
                             __func__, il, ggml_backend_dev_name(device_kv), ggml_backend_dev_name(device_gdn));
@@ -2130,28 +2004,6 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     const bool reserved = !phase_changed || reserve_ubatch(cparams.n_ubatch);
     const bool vram_complete = complete_vram_phase(reserved && !active);
     return reserved && vram_complete;
-}
-
-const llama_k3_runtime_config * llama_context::k3_runtime_config_get() const {
-    return k3_runtime.get();
-}
-
-bool llama_context::k3_runtime_guard_set(bool active) {
-    if (!k3_runtime || (active && k3_runtime->guard_tokens == 0 && k3_runtime->guard_start_tokens == 0 &&
-            k3_runtime->guard_control_tokens == 0)) { return false; }
-    if (active == k3_guard_active) { return true; }
-    synchronize();
-    k3_guard_active = active;
-    sched_need_reserve = true;
-    return true;
-}
-
-const llama_k3_runtime_config * llama_k3_runtime_config_get(const llama_context * ctx) {
-    return ctx ? ctx->k3_runtime_config_get() : nullptr;
-}
-
-bool llama_k3_runtime_guard_set(llama_context * ctx, bool active) {
-    return ctx && ctx->k3_runtime_guard_set(active);
 }
 
 const llama_model & llama_context::get_model() const {
@@ -3877,7 +3729,7 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
-    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_KIMI_K3 ||
+    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
@@ -4111,10 +3963,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cpu_sink_decode =*/ cpu_sink_enabled && cpu_sink_decode_active && !cparams.warmup,
         /*.cpu_sink_prefill =*/ !cpu_sink_decode_active && !cparams.warmup && cpu_sink_prefill_route(ubatch.n_tokens),
-        /*.cpu_sink_guard =*/ k3_guard_active,
         /*.cpu_sink_runtime =*/ cpu_sink_runtime.get(),
-        /*.k3_expert_policy =*/ k3_runtime ? (k3_guard_active ? k3_runtime->guard : k3_runtime->primary) : llama_k3_decode_expert_policy{},
-        /*.k3_expert_table =*/ k3_runtime && !k3_guard_active ? k3_runtime->table : llama_k3_decode_expert_table{},
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.n_ctx_reserve =*/ sched_reserve_n_ctx ? sched_reserve_n_ctx : cparams.n_ctx,

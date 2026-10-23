@@ -110,15 +110,10 @@ struct llama_kimi_cpu_sink_runtime {
         return parsed;
     }
 
-    // Kimi-K3 layout: frozen K3 cache priority table and 896 routed experts.
-    llama_kimi_cpu_sink_runtime(int n_layers, uint64_t context_epoch)
-        : llama_kimi_cpu_sink_runtime(n_layers, context_epoch, true, 896, {}) {}
-
     // n_expert is the routed-expert tensor ne[2] and bounds CACHE_MAX_PER_LAYER.
-    // Other layouts default to routed_layers (model order) as cache priority and
-    // refuse the K3-only cache-compute policies. The VRAM tier needs its
+    // Routed layers (model order) are the default cache priority. The VRAM tier needs its
     // explicit-format extension for them (checked by the executor).
-    llama_kimi_cpu_sink_runtime(int n_layers, uint64_t context_epoch, bool kimi_k3_layout,
+    llama_kimi_cpu_sink_runtime(int n_layers, uint64_t context_epoch,
             int64_t n_expert, const std::vector<int32_t> & routed_layers) : epoch(context_epoch) {
         if (n_expert <= 0) {
             throw std::runtime_error("CPU sink requires a positive routed expert count");
@@ -144,9 +139,9 @@ struct llama_kimi_cpu_sink_runtime {
         const char * vram_bytes = std::getenv("GGML_KIMI_CPU_SINK_VRAM_BYTES");
         vram_budget = vram_bytes && !std::strcmp(vram_bytes, "auto") ? std::numeric_limits<uint64_t>::max() :
             unsigned_env("GGML_KIMI_CPU_SINK_VRAM_BYTES", 0, 64ull << 30);
-        if (!kimi_k3_layout && cache_compute_enabled) {
+        if (cache_compute_enabled) {
             throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_COMPUTE and GGML_KIMI_CPU_SINK_VRAM_CACHE_LOCATIONS "
-                "require Kimi-K3 SiTU experts; use off and 0");
+                "are retired; use off and 0");
         }
         // Bounded by the routed expert count and the executor's per-layer ABI maximum.
         const uint64_t max_per_layer = uint64_t(std::min<int64_t>(n_expert, 896));
@@ -158,13 +153,6 @@ struct llama_kimi_cpu_sink_runtime {
             throw std::runtime_error("GGML_KIMI_CPU_SINK_CACHE_MAX_PER_LAYER must be in [1, " +
                 std::to_string(max_per_layer) + "]");
         }
-        // Frozen ordering: true top16 decode trace, first 127 of 255 tokens.
-        const int32_t defaults[] = {
-            57,46,56,90,12,86,73,53,87,58,43,55,45,59,81,88,42,84,47,49,76,44,85,54,
-            91,89,52,74,79,77,78,41,9,38,50,72,10,83,39,37,75,30,19,31,51,36,4,48,
-            29,40,33,3,82,2,60,80,18,23,11,34,27,32,26,22,7,17,35,25,20,16,24,67,
-            14,15,13,62,28,69,64,92,66,21,8,61,71,63,70,5,65,68,1,6,
-        };
         const char * priority = std::getenv("GGML_KIMI_CPU_SINK_CACHE_LAYER_PRIORITY");
         if (priority) {
             const char * p = priority;
@@ -181,8 +169,6 @@ struct llama_kimi_cpu_sink_runtime {
                 if (!*end) { break; }
                 p = end + 1;
             } while (true);
-        } else if (kimi_k3_layout) {
-            for (int32_t layer : defaults) { if (layer < n_layers) { layer_priority.push_back(layer); } }
         } else {
             for (int32_t layer : routed_layers) {
                 if (layer >= 0 && layer < n_layers &&

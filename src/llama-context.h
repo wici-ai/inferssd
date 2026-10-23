@@ -6,7 +6,6 @@
 #include "llama-graph.h"
 #include "llama-adapter.h"
 #include "llama-impl.h"
-#include "llama-kimi-runtime.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -117,8 +116,6 @@ struct llama_context {
     // room in host memory for an allocation outside the RAM expert cache (llama_host_reserve)
     bool host_reserve(size_t bytes);
 
-    const llama_k3_runtime_config * k3_runtime_config_get() const;
-    bool k3_runtime_guard_set(bool active);
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -354,8 +351,6 @@ private:
 
     llama_cparams cparams;
 
-    std::unique_ptr<const llama_k3_runtime_config> k3_runtime;
-    bool k3_guard_active = false;
 
     bool dense_gpu_phase_gate_enabled = false;
     bool dense_gpu_prefill_phase_active = false;
