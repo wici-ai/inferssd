@@ -2385,8 +2385,7 @@ static size_t q4_lossless_cuda_budget_reserve_mib() {
     if (reserve_env && reserve_env[0]) {
         return static_cast<size_t>(std::strtoull(reserve_env, nullptr, 10));
     }
-    if (g_expert_pack.lossless_mode != q4_lossless_transport_mode::cuda ||
-            g_expert_pack.lossless_sidecar.objects.empty()) {
+    {
         // The role cache is allocated before the deferred-pack manifest is
         // opened. Reserve the measured fixed CUDA decoder footprint at that
         // early point when CUDA lossless transport has already been requested.
@@ -2397,51 +2396,6 @@ static size_t q4_lossless_cuda_budget_reserve_mib() {
         }
         return 0;
     }
-
-    size_t max_payload_bytes = 0;
-    size_t max_descriptors = 0;
-    for (const ggml_moe_common::lossless_object_record &object :
-            g_expert_pack.lossless_sidecar.objects) {
-        max_payload_bytes = std::max<size_t>(
-            max_payload_bytes, static_cast<size_t>(object.payload_bytes));
-        size_t descriptors = 0;
-        for (const ggml_moe_common::lossless_role_record &role : object.roles) {
-            if (role.codec == ggml_moe_common::lossless_role_codec::rans_q40) {
-                descriptors += role.chunks;
-            }
-        }
-        max_descriptors = std::max(max_descriptors, descriptors);
-    }
-    if (max_payload_bytes == 0 || max_descriptors == 0) return 0;
-
-    size_t input_slots = g_expert_pack.glm52_colibri ? 1 : 16;
-    const char *input_slots_env = std::getenv(
-        "GGML_MOE_LOSSLESS_CUDA_BATCH_OBJECTS");
-    if (input_slots_env && input_slots_env[0]) {
-        const long value = std::atol(input_slots_env);
-        if (value > 0 && value <= 16) {
-            input_slots = static_cast<size_t>(value);
-        }
-    }
-    const size_t decoder_capacity = max_descriptors * input_slots;
-    size_t reserve_bytes = max_payload_bytes * input_slots;
-    reserve_bytes += decoder_capacity * (
-        sizeof(ggml_moe_common::lossless_q40_decode_descriptor) +
-        sizeof(ggml_moe_common::lossless_mxfp4_decode_descriptor) +
-        sizeof(ggml_moe_common::lossless_crc32_descriptor) +
-        sizeof(uint32_t) +
-        ggml_moe_common::lossless_crc32_segments * sizeof(uint32_t));
-    reserve_bytes +=
-        ggml_moe_common::lossless_rans_max_table_count *
-            ggml_moe_common::lossless_rans_table_size +
-        8 * 256 * sizeof(uint32_t);
-
-    // The fixed buffers above are exact. Keep CUDA allocator fragmentation and
-    // the transient graph-instantiation peak out of that accounting; without
-    // this headroom the server prefill path can reach single-digit free MiB.
-    reserve_bytes += 256ULL * 1024ULL * 1024ULL;
-    const size_t mib = 1024ULL * 1024ULL;
-    return (reserve_bytes + mib - 1) / mib;
 }
 
 static size_t batch_cache_effective_budget_mib(size_t requested_mib) {
@@ -8216,7 +8170,7 @@ static const char *q4_direct_object_trace_path() {
 }
 
 static bool q4_direct_object_trace_enabled() {
-    return g_expert_pack.q4_colibri && q4_direct_object_trace_path();
+    return false;
 }
 
 static bool q4_direct_host_object_copy_h2d(
@@ -8980,31 +8934,23 @@ static bool q4_colibri_role_in_read_span(
 }
 
 static bool q4_colibri_pipe_requested() {
-    if (!g_expert_pack.q4_colibri) return false;
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_PIPE");
-    return !env || !env[0] || env[0] != '0';
+    return false;
 }
 
 static bool q4_colibri_object_cache_enabled() {
-    if (!g_expert_pack.q4_colibri) return false;
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_OBJECT_CACHE");
-    return env && env[0] && env[0] != '0';
+    return false;
 }
 
 static bool q4_colibri_batch_iouring_enabled() {
-    if (!g_expert_pack.q4_colibri) return false;
-    const char *env = std::getenv("GGML_MOE_Q4_COLIBRI_BATCH_IOURING");
-    return env && env[0] && env[0] != '0';
+    return false;
 }
 
 static bool q4_graph_hit_path_requested() {
-    if (!g_expert_pack.q4_colibri) return false;
-    return expert_pack_env_bool("GGML_MOE_Q4_GRAPH_HIT_PATH", false);
+    return false;
 }
 
 static bool q4_graph_profile_requested() {
-    if (!g_expert_pack.q4_colibri) return false;
-    return q4_graph_hit_path_requested() || expert_pack_env_bool("GGML_MOE_Q4_GRAPH_PROFILE", false);
+    return false;
 }
 
 static int q4_graph_descriptor_max_experts() {
@@ -9777,14 +9723,7 @@ static bool q4_graph_descriptor_buffer_init() {
 
 
 static bool q4_colibri_host_object_prefetch_enabled() {
-    if (!g_expert_pack.q4_colibri) return false;
-    // GLM's accepted lossless path owns a separate compressed staging ring.
-    // Kimi uses the generation-aware compressed Host object cache below.
-    if (g_expert_pack.glm52_colibri &&
-            g_expert_pack.lossless_mode == q4_lossless_transport_mode::cuda) {
-        return false;
-    }
-    return expert_pack_env_bool("GGML_MOE_Q4_HOST_OBJECT_PREFETCH", false);
+    return false;
 }
 
 static size_t q4_colibri_host_object_prefetch_slots() {
@@ -9798,8 +9737,7 @@ static size_t q4_colibri_host_object_prefetch_queue_limit() {
 }
 
 static bool q4_colibri_host_object_defer_h2d_enabled() {
-    if (!g_expert_pack.q4_colibri) return false;
-    return expert_pack_env_bool("GGML_MOE_Q4_HOST_OBJECT_DEFER_H2D", false);
+    return false;
 }
 
 static size_t q4_colibri_host_object_prefetch_max_bytes() {
@@ -9890,18 +9828,15 @@ static void q4_colibri_host_object_account_alloc_locked(q4_colibri_host_object_s
 }
 
 static bool q4_colibri_host_object_admit_on_read_enabled() {
-    if (!g_expert_pack.q4_colibri) return false;
-    return expert_pack_env_bool("GGML_MOE_Q4_HOST_OBJECT_ADMIT_ON_READ", false);
+    return false;
 }
 
 static uint64_t q4_colibri_host_object_admit_min_read_us() {
-    if (!g_expert_pack.q4_colibri) return 0;
-    return expert_pack_env_size("GGML_MOE_Q4_HOST_OBJECT_ADMIT_MIN_READ_US", 0, 0, 10000000ULL);
+    return 0;
 }
 
 static bool q4_colibri_host_object_lookup_admit_layers_only_enabled() {
-    if (!g_expert_pack.q4_colibri) return false;
-    return expert_pack_env_bool("GGML_MOE_Q4_HOST_OBJECT_LOOKUP_ADMIT_LAYERS_ONLY", false);
+    return false;
 }
 
 static bool q4_colibri_host_object_admit_layer_allowed(int layer);
@@ -16628,114 +16563,6 @@ static void q4_colibri_pipe_shutdown() {
 }
 
 static bool q4_lossless_cuda_runtime_init() {
-    if (g_expert_pack.lossless_mode != q4_lossless_transport_mode::cuda) {
-        return true;
-    }
-    size_t max_payload_bytes = 0;
-    size_t max_descriptors = 0;
-    std::unordered_map<int32_t, size_t> layer_object_counts;
-    size_t max_layer_objects = 0;
-    for (const ggml_moe_common::lossless_object_record &object :
-            g_expert_pack.lossless_sidecar.objects) {
-        max_layer_objects = std::max(
-            max_layer_objects, ++layer_object_counts[object.layer]);
-        max_payload_bytes = std::max<size_t>(
-            max_payload_bytes, static_cast<size_t>(object.payload_bytes));
-        size_t descriptors = 0;
-        for (const ggml_moe_common::lossless_role_record &role : object.roles) {
-            if (role.codec == ggml_moe_common::lossless_role_codec::rans_q40) {
-                descriptors += role.chunks;
-            }
-        }
-        max_descriptors = std::max(max_descriptors, descriptors);
-    }
-    if (max_payload_bytes == 0 || max_descriptors == 0) return false;
-    const size_t workspace_objects = std::max<size_t>(
-        std::max<size_t>(1, g_q4_colibri_pipe.max_jobs), max_layer_objects);
-    size_t input_slots = g_expert_pack.glm52_colibri ? 1 : 16;
-    const char *input_slots_env = std::getenv(
-        "GGML_MOE_LOSSLESS_CUDA_BATCH_OBJECTS");
-    if (input_slots_env && input_slots_env[0]) {
-        const long value = std::atol(input_slots_env);
-        if (value <= 0 || value > 16) return false;
-        input_slots = static_cast<size_t>(value);
-    }
-    input_slots = std::min(input_slots,
-        std::max<size_t>(1, g_q4_colibri_pipe.max_jobs));
-    if (max_payload_bytes > SIZE_MAX / input_slots ||
-            max_descriptors > SIZE_MAX / input_slots) {
-        return false;
-    }
-    const size_t input_allocation_bytes = max_payload_bytes * input_slots;
-    const size_t decoder_capacity = max_descriptors * input_slots;
-    const size_t status_capacity = max_descriptors * workspace_objects;
-    const size_t crc32_capacity = ggml_moe_common::lossless_crc32_segments *
-        workspace_objects;
-    g_q4_colibri_pipe.lossless_decoder =
-        ggml_moe_common::lossless_rans_cuda_create(
-            g_expert_pack.lossless_sidecar.tables.data(),
-            g_expert_pack.lossless_sidecar.table_count,
-            decoder_capacity);
-    if (!g_q4_colibri_pipe.lossless_decoder ||
-            cudaMalloc(
-                reinterpret_cast<void **>(
-                    &g_q4_colibri_pipe.lossless_device_input),
-                input_allocation_bytes) != cudaSuccess ||
-            cudaHostAlloc(
-                reinterpret_cast<void **>(
-                    &g_q4_colibri_pipe.lossless_status_host),
-                status_capacity * sizeof(uint32_t),
-                cudaHostAllocPortable) != cudaSuccess ||
-            cudaHostAlloc(
-                reinterpret_cast<void **>(
-                    &g_q4_colibri_pipe.lossless_crc32_host),
-                crc32_capacity * sizeof(uint32_t),
-                cudaHostAllocPortable) != cudaSuccess) {
-        if (g_q4_colibri_pipe.lossless_status_host) {
-            cudaFreeHost(g_q4_colibri_pipe.lossless_status_host);
-            g_q4_colibri_pipe.lossless_status_host = nullptr;
-        }
-        if (g_q4_colibri_pipe.lossless_crc32_host) {
-            cudaFreeHost(g_q4_colibri_pipe.lossless_crc32_host);
-            g_q4_colibri_pipe.lossless_crc32_host = nullptr;
-        }
-        cudaFree(g_q4_colibri_pipe.lossless_device_input);
-        g_q4_colibri_pipe.lossless_device_input = nullptr;
-        ggml_moe_common::lossless_rans_cuda_destroy(
-            g_q4_colibri_pipe.lossless_decoder);
-        g_q4_colibri_pipe.lossless_decoder = nullptr;
-        return false;
-    }
-    g_q4_colibri_pipe.lossless_device_input_bytes = input_allocation_bytes;
-    g_q4_colibri_pipe.lossless_device_input_stride = max_payload_bytes;
-    g_q4_colibri_pipe.lossless_device_input_slots = input_slots;
-    g_q4_colibri_pipe.lossless_status_capacity = status_capacity;
-    g_q4_colibri_pipe.lossless_crc32_capacity = crc32_capacity;
-    g_q4_colibri_pipe.lossless_descriptors.reserve(decoder_capacity);
-    g_q4_colibri_pipe.lossless_chunks.resize(
-        g_expert_pack.lossless_sidecar.chunks_per_role);
-    g_q4_colibri_pipe.lossless_scale_records.resize(
-        static_cast<size_t>(g_expert_pack.lossless_sidecar.chunks_per_role) *
-            ggml_moe_common::lossless_rans_q40_scale_planes);
-    const bool trust_offline_verified = expert_pack_env_bool(
-        "GGML_MOE_LOSSLESS_TRUST_OFFLINE_VERIFIED", false);
-    g_q4_colibri_pipe.lossless_crc_verified.assign(
-        g_expert_pack.lossless_sidecar.objects.size(),
-        trust_offline_verified ? 1 : 0);
-    if (trust_offline_verified) {
-        g_expert_pack.lossless_offline_trusted_records.store(
-            g_expert_pack.lossless_sidecar.objects.size(),
-            std::memory_order_relaxed);
-    }
-    g_q4_colibri_pipe.lossless_ready = true;
-    std::fprintf(stderr,
-        "[moe_stream_batch] %s lossless CUDA runtime: input_bytes=%zu input_stride=%zu "
-        "input_slots=%zu descriptor_capacity=%zu status_capacity=%zu "
-        "crc32_capacity=%zu workspace_objects=%zu fixed_allocations=1 dedicated_stream=%d\n",
-        g_expert_pack.glm52_colibri ? "GLM52" : "Kimi",
-        input_allocation_bytes, max_payload_bytes, input_slots,
-        decoder_capacity, status_capacity, crc32_capacity, workspace_objects,
-        g_q4_colibri_pipe.lossless_stream ? 1 : 0);
     return true;
 }
 
@@ -21177,8 +21004,7 @@ static const expert_pack_entry *q4_colibri_pilot_lookup_optional(
 }
 
 static bool q4_colibri_host_object_preload_enabled() {
-    if (!g_expert_pack.q4_colibri) return false;
-    return expert_pack_env_bool("GGML_MOE_Q4_HOST_OBJECT_PRELOAD", false);
+    return false;
 }
 
 static size_t q4_colibri_host_object_preload_max() {
