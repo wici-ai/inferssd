@@ -5,7 +5,7 @@
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
-#include "llama-cpu-sink.h"
+#include "ssd/cpu-runtime.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"

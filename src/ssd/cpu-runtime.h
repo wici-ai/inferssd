@@ -5,7 +5,7 @@
 #endif
 
 #include "kimi-cpu-sink.h"
-#include "llama-cpu-prefill.h"
+#include "cpu-prefill.h"
 
 #include <cerrno>
 #include <algorithm>

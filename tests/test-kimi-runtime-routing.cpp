@@ -3,7 +3,7 @@
 // frontend with the frozen configurations. Full-model KV/KDA is not claimed.
 #include "llama-context.h"
 #include "llama-model.h"
-#include "llama-cpu-sink.h"
+#include "../src/ssd/cpu-runtime.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-cpp.h"

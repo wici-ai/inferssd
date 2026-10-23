@@ -4,7 +4,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
-#include "llama-cpu-sink.h"
+#include "../src/ssd/cpu-runtime.h"
 
 #include <cstdio>
 #include <memory>
