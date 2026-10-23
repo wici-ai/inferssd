@@ -62,7 +62,12 @@ caller environment contains private data.
 
 The host-fact file contains values that would otherwise come from the target
 machine. Fields are requested lazily, and a missing field fails when needed;
-there is no fallback to the current machine. The files in `examples/` contain
+there is no fallback to the current machine. Boolean facts require JSON booleans,
+`euid` requires an integer, and `memory_kib` requires two integers; booleans do
+not count as integers. Text facts, including GPU memory text such as `[N/A]`,
+require strings. `default_threads`, `physical_memory` and `disk_free` accept
+integer strings or integers. These checks run only when the field is consumed
+and errors identify that field. The files in `examples/` contain
 **synthetic values for documentation**, not measurements to reuse on a device.
 Linux fields are `filesystem`, `gpu_available`, `gpu_memory`, `gpu_processes`,
 `default_threads`, `ss_available`, `port_busy`, `has_uring`, `cgroup_v2`,

@@ -175,6 +175,51 @@ class RecordedArtifacts:
         if name not in self.host:
             raise ValueError(f"Missing recorded host fact: {name}")
         value = self.host[name]
-        if name in ("gpu_memory", "default_threads", "physical_memory", "disk_free"):
+        boolean = {
+            "gpu_available",
+            "ss_available",
+            "has_uring",
+            "cgroup_v2",
+            "user_manager",
+            "memory_controller",
+        }
+        textual = {
+            "filesystem",
+            "gpu_memory",
+            "gpu_processes",
+            "port_busy",
+            "scope_suffix",
+            "platform_system",
+            "platform_machine",
+        }
+        converted = {"default_threads", "physical_memory", "disk_free"}
+        if name in boolean:
+            if not isinstance(value, bool):
+                raise ValueError(f"Recorded host fact {name}: expected a JSON boolean")
+        elif name == "euid":
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"Recorded host fact {name}: expected an integer")
+        elif name == "memory_kib":
+            if (
+                not isinstance(value, (list, tuple))
+                or len(value) != 2
+                or any(isinstance(item, bool) or not isinstance(item, int) for item in value)
+            ):
+                raise ValueError(
+                    f"Recorded host fact {name}: expected two integers [total, available]"
+                )
+        elif name in textual:
+            if not isinstance(value, str):
+                raise ValueError(f"Recorded host fact {name}: expected text")
+        elif name in converted:
+            if isinstance(value, bool) or not isinstance(value, (str, int)):
+                raise ValueError(f"Recorded host fact {name}: expected integer text or an integer")
+            if name in ("physical_memory", "disk_free"):
+                try:
+                    int(value)
+                except ValueError as error:
+                    raise ValueError(f"Recorded host fact {name}: expected integer text") from error
             value = str(value)
+        else:
+            raise ValueError(f"Unknown recorded host fact: {name}")
         return Reply(value)
