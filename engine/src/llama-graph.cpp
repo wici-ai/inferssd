@@ -6,6 +6,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "ssd/cpu-runtime.h"
+#include "ssd/model-adapter.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -2042,35 +2043,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if ((cpu_sink_decode && n_tokens == 1) || cpu_sink_prefill) {
         GGML_ASSERT(n_tokens >= 1);
 
-        const bool sink_layout = backend_cpu && cpu_sink_runtime && up_exps && gate_exps && down_exps &&
-            ggml_is_contiguous(up_exps) &&
-            ggml_is_contiguous(gate_exps) && ggml_is_contiguous(down_exps) &&
-            ggml_are_same_shape(up_exps, gate_exps) && up_exps->ne[3] == 1 &&
-            down_exps->ne[3] == 1 && down_exps->ne[0] == up_exps->ne[1] &&
-            down_exps->ne[1] == n_embd && up_exps->ne[0] == n_embd &&
-            down_exps->ne[2] == up_exps->ne[2] &&
-            !gate_up_exps && !gate_up_exps_b && !gate_inp_b &&
-            !up_exps_b && !gate_exps_b && !down_exps_b &&
-            !up_exps_s && !gate_exps_s && !down_exps_s &&
-            !weight_before_ffn && (!loras || loras->empty());
-        // DeepSeek-V4.1 clamped SwiGLU (weights arrive normalized and scaled).
-        // The grouped executor accepts batched prefill; cache compute remains a
-        // single-token SiTU-only path.
-        const float swiglu_limit = arch == LLM_ARCH_DEEPSEEK41 && il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
-        const bool deepseek41_mxfp4 = sink_layout && up_exps->type == GGML_TYPE_MXFP4 &&
-            gate_exps->type == GGML_TYPE_MXFP4 && down_exps->type == GGML_TYPE_MXFP4;
-        const bool deepseek41_swiglu_clamp = sink_layout && arch == LLM_ARCH_DEEPSEEK41 &&
-            type_op == LLM_FFN_SILU && !cache_compute && (n_tokens == 1 || cpu_sink_prefill) &&
-            deepseek41_mxfp4 &&
-            std::isfinite(swiglu_limit) && swiglu_limit > 1e-6f;
-        // any expert types the sink can compute (it refuses the others): Q8_0, BF16, UD-Q4_K_XL's Q4_K/Q5_K, ...
-        const bool muse_swiglu = sink_layout && arch == LLM_ARCH_MUSE_SPARK &&
-            type_op == LLM_FFN_SILU && !cache_compute && post_exp_norm && gate_exps->type == up_exps->type;
-        if (!deepseek41_swiglu_clamp && !muse_swiglu) {
-            throw std::runtime_error("CPU sink layer=" + std::to_string(il) +
-                " requires contiguous DeepSeek-V4.1 clamped SwiGLU experts in all-MXFP4, or "
-                "Muse Spark SwiGLU with per-expert post norm, without LoRA/bias/scales; no fallback");
+        const auto requirements = llama_ssd::describe_experts(arch, hparams, il);
+        const auto adapted = llama_ssd::validate_experts(requirements, {
+            backend_cpu != nullptr, cpu_sink_runtime != nullptr, up_exps, gate_exps, down_exps,
+            gate_up_exps, gate_up_exps_b, gate_inp_b, up_exps_b, gate_exps_b, down_exps_b,
+            up_exps_s, gate_exps_s, down_exps_s, n_embd, n_tokens, type_op == LLM_FFN_SILU,
+            cache_compute, cpu_sink_prefill, weight_before_ffn, loras && !loras->empty(),
+            post_exp_norm, post_exp_norm_eps, w_scale});
+        if (!adapted.accepted) {
+            throw std::runtime_error("CPU sink layer=" + std::to_string(il) + adapted.error);
         }
+        const auto & execution = adapted.execution;
 
         auto descriptor = std::make_unique<llama_kimi_cpu_sink_node>();
         descriptor->up = llama_kimi_cpu_sink_metadata(up_exps);
@@ -2080,14 +2063,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         descriptor->runtime = cpu_sink_runtime;
         descriptor->situ_beta = hparams.situ_beta;
         descriptor->situ_linear_beta = hparams.situ_linear_beta;
-        descriptor->activation =
-            kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, muse_swiglu ? INFINITY : swiglu_limit };
-        descriptor->post_exp_norm = post_exp_norm != nullptr;
-        descriptor->post_exp_norm_eps = post_exp_norm_eps;
+        switch (execution.activation) {
+            case llama_ssd::expert_activation::swiglu_clamp:
+                descriptor->activation =
+                    kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, execution.clamp };
+                break;
+            case llama_ssd::expert_activation::unsupported:
+                GGML_ABORT("invalid accepted SSD expert activation");
+        }
+        descriptor->post_exp_norm = execution.post_norm;
+        descriptor->post_exp_norm_eps = execution.post_norm_eps;
         descriptor->layer = il;
         descriptor->prefill = cpu_sink_prefill;
         descriptor->cache_compute = cache_compute;
-        descriptor->routed_scale = w_scale == 0.0f ? 1.0f : w_scale;
+        descriptor->routed_scale = execution.routed_scale;
         ggml_tensor * hint = !cache_compute && !cpu_sink_prefill && n_tokens == 1 ? cpu_sink_prefetch_hint : nullptr;
         // slots: input, ids, weights, then the post-expert norm or the native ids and weights, then the hint
         ggml_tensor * args[] = {
