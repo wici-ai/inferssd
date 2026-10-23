@@ -65,8 +65,9 @@ def cpu_count(value: str) -> str:
 
 
 class LinuxState(State):
-    def __init__(self, inputs: LaunchInput, facts: Mapping[Fact, Reply]):
+    def __init__(self, inputs: LaunchInput, facts: Mapping[Fact, Reply], *, execute: bool = False):
         super().__init__(inputs, facts)
+        self.execute = execute
         self.settings: dict[str, str] = {}
         self.variables = dict(self.env)
         self.set_names: set[str] = set()
@@ -162,7 +163,8 @@ class LinuxState(State):
         self.receipt(name, value, "derived", input_)
 
     def refuse(self, text: str) -> None:
-        # This public resolver only describes a dry run; native execution is separate.
+        if self.execute:
+            self.error(text)
         self.emit("dry run: the launch would stop here: " + text + "\n", "stderr")
 
     def profile(self, pairs: tuple[tuple[str, str], ...]) -> None:
@@ -695,8 +697,10 @@ def _resolve(s: LinuxState) -> None:
         s.emit("ARG " + value + "\n")
 
 
-def resolve_linux(inputs: LaunchInput, facts: Mapping[Fact, Reply]) -> Resolution:
-    state = LinuxState(inputs, facts)
+def resolve_linux(
+    inputs: LaunchInput, facts: Mapping[Fact, Reply], *, execute: bool = False
+) -> Resolution:
+    state = LinuxState(inputs, facts, execute=execute)
     try:
         _resolve(state)
     except AwaitFact as missing:
