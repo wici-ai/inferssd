@@ -2,6 +2,8 @@
 add_library(ggml-ssd INTERFACE)
 target_link_libraries(ggml-ssd INTERFACE ggml-base)
 target_include_directories(ggml-ssd INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
+add_subdirectory(host)
+target_link_libraries(ggml-ssd INTERFACE ggml-ssd-host)
 
 if (LLAMA_SSD_STORE)
     add_subdirectory(store)

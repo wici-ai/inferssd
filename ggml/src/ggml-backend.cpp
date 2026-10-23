@@ -1323,6 +1323,7 @@ struct ggml_backend_sched_kimi_async_ids_state {
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    bool auto_reserve; // explicit per-context fallback policy; default true
 
     int n_backends;
 
@@ -2227,6 +2228,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
     // allocate graph
     if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        if (!sched->auto_reserve) {
+            GGML_LOG_ERROR("%s: explicit graph reservation required\n", __func__);
+            return false;
+        }
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -6722,6 +6727,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
+    sched->auto_reserve = true;
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
@@ -7027,6 +7033,17 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+}
+
+void ggml_backend_sched_set_host_prefault(ggml_backend_sched_t sched, size_t page_size) {
+    GGML_ASSERT(sched);
+    ggml_gallocr_set_host_prefault(sched->galloc, page_size);
+}
+
+void ggml_backend_sched_set_auto_reserve(ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    sched->auto_reserve = enabled;
+    ggml_gallocr_set_auto_reserve(sched->galloc, enabled);
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {

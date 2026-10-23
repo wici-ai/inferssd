@@ -330,6 +330,12 @@ extern "C" {
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    // Explicit context resource policy; 0 disables. Applies only to newly
+    // allocated host COMPUTE chunks, before their allocation ticket is released.
+    GGML_API void ggml_backend_sched_set_host_prefault(ggml_backend_sched_t sched, size_t page_size);
+    // Default true. A resource-managed context disables this fallback and must
+    // explicitly reserve while its allocation ticket is alive.
+    GGML_API void ggml_backend_sched_set_auto_reserve(ggml_backend_sched_t sched, bool enabled);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
