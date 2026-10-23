@@ -149,6 +149,7 @@ def run(config, output, lock_fd=None):
     if policy.platform != "linux":
         raise ValueError("Linux comparison only")
     with socket.socket() as check:
+        check.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         check.bind(("127.0.0.1", config["port"]))
     reservation = reserve(str(output))
     env = config["environment"]
