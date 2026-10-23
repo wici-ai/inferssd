@@ -1232,18 +1232,10 @@ struct ggml_cuda_graph {
         if (graph != nullptr) {
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
-        if (gap_trace_start_event != nullptr) {
-            CUDA_CHECK(cudaEventDestroy(gap_trace_start_event));
-        }
-        if (gap_trace_router_event != nullptr) {
-            CUDA_CHECK(cudaEventDestroy(gap_trace_router_event));
-        }
-        if (gap_trace_router_done_event != nullptr) {
-            CUDA_CHECK(cudaEventDestroy(gap_trace_router_done_event));
-        }
-        if (gap_trace_end_event != nullptr) {
-            CUDA_CHECK(cudaEventDestroy(gap_trace_end_event));
-        }
+
+
+
+
     }
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t instance = nullptr;
@@ -1267,37 +1259,6 @@ struct ggml_cuda_graph {
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
     };
     std::vector<node_properties> node_props;
-
-    struct gap_trace_pending_state {
-        bool valid = false;
-        bool has_router = false;
-        bool router_timing_valid = false;
-        int mode = 0;
-        int router_layer = -1;
-        int n_nodes = 0;
-        int kernel_nodes = 0;
-        uint64_t cpu_start_us = 0;
-        uint64_t cpu_end_us = 0;
-        uint64_t prepare_start_us = 0;
-        uint64_t prepare_end_us = 0;
-        uint64_t evaluate_start_us = 0;
-        uint64_t evaluate_end_us = 0;
-        uint64_t instantiate_start_us = 0;
-        uint64_t instantiate_end_us = 0;
-        uint64_t update_start_us = 0;
-        uint64_t update_end_us = 0;
-        uint64_t launch_start_us = 0;
-        uint64_t launch_end_us = 0;
-        char first[128] = {};
-        char last[128] = {};
-    };
-
-    cudaEvent_t gap_trace_start_event = nullptr;
-    cudaEvent_t gap_trace_router_event = nullptr;
-    cudaEvent_t gap_trace_router_done_event = nullptr;
-    cudaEvent_t gap_trace_end_event = nullptr;
-    int gap_trace_kernel_nodes = 0;
-    gap_trace_pending_state gap_trace_pending;
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
@@ -1515,8 +1476,6 @@ struct ggml_backend_cuda_context {
     uint64_t graph_fallback_warmup     = 0;
     uint64_t graph_fallback_changed    = 0;
 
-    cudaEvent_t gap_trace_origin_event = nullptr;
-    uint64_t gap_trace_origin_cpu_us = 0;
 
     ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
         const int64_t time_now = ggml_time_us();

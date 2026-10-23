@@ -56,8 +56,7 @@ GGML_BACKEND_API bool ggml_cuda_oom_reclaimer_register(
 GGML_BACKEND_API bool ggml_cuda_oom_reclaimer_unregister(
         int device, ggml_cuda_oom_reclaimer_fn callback, void * userdata);
 // Memory that device allocations must leave free, set at run time by a cache that can give memory back
-// through the OOM reclaimer (on unified memory, the host's own working set). The effective reserve is
-// the larger of this and GGML_CUDA_MEMORY_RESERVE_MIB.
+// through the OOM reclaimer (on unified memory, the host's own working set).
 GGML_BACKEND_API void ggml_cuda_set_memory_reserve(int device, size_t bytes);
 // Pinned host memory about to be allocated for the current device: on a unified-memory GPU it comes out of the same
 // DRAM, so the reserve is made first (the OOM reclaimer gives memory back). False when no room could be made; the

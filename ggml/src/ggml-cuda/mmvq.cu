@@ -14,12 +14,7 @@
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
 static bool ggml_cuda_q4k_mmvq_row_pack_enabled() {
-    static const bool enabled = []() {
-        const char * env = std::getenv("GGML_CUDA_Q4_K_MMVQ_ROW_PACK");
-        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0 &&
-            std::strcmp(env, "false") != 0;
-    }();
-    return enabled;
+    return false; // Frozen production profile: historical unset default.
 }
 
 static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) {

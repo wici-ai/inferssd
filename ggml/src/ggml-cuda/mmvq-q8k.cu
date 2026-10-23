@@ -13,29 +13,11 @@ namespace {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 static bool dense_q8k_enabled() {
-    static const bool enabled = []() {
-        const char * value = std::getenv("GGML_CUDA_DENSE_Q8_K");
-        return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
-            std::strcmp(value, "false") != 0;
-    }();
-    return enabled;
+    return false; // Frozen production profile: historical unset default.
 }
 
 static int dense_q8k_warps_per_block() {
-    static const int warps = []() {
-        const char * value = std::getenv("GGML_CUDA_DENSE_Q8_K_WARPS_PER_BLOCK");
-        if (value == nullptr || value[0] == '\0') {
-            return 8;
-        }
-        const int parsed = std::atoi(value);
-        if (parsed != 2 && parsed != 4 && parsed != 8 && parsed != 16) {
-            std::fprintf(stderr,
-                "ggml_cuda: GGML_CUDA_DENSE_Q8_K_WARPS_PER_BLOCK must be 2, 4, 8, or 16\n");
-            std::abort();
-        }
-        return parsed;
-    }();
-    return warps;
+    return 8; // Frozen production profile: historical unset default.
 }
 
 static __device__ __forceinline__ float mul_rn(float a, float b) {

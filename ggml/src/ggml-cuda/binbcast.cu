@@ -255,19 +255,7 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
         GGML_ASSERT(nb02 % sizeof(src0_t) == 0);
         GGML_ASSERT(nb03 % sizeof(src0_t) == 0);
 
-        if (nb10 % sizeof(src1_t) != 0) {
-            const char * env = std::getenv("GGML_CUDA_BINBCAST_DEBUG");
-            if (env && env[0] && env[0] != '0') {
-                std::fprintf(stderr,
-                    "binbcast debug: dst=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] "
-                    "src0=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] "
-                    "src1=%s type=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] sizeof_src1=%zu\n",
-                    dst->name,  ggml_type_name(dst->type),  dst->ne[0],  dst->ne[1],  dst->ne[2],  dst->ne[3],  nb0,  nb1,  nb2,  nb3,
-                    src0->name, ggml_type_name(src0->type), src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], nb00, nb01, nb02, nb03,
-                    src1->name, ggml_type_name(src1->type), src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], nb10, nb11, nb12, nb13,
-                    sizeof(src1_t));
-            }
-        }
+
         GGML_ASSERT(nb10 % sizeof(src1_t) == 0);
         GGML_ASSERT(nb11 % sizeof(src1_t) == 0);
         GGML_ASSERT(nb12 % sizeof(src1_t) == 0);
