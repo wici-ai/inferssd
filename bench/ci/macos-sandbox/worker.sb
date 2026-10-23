@@ -1,12 +1,12 @@
 (version 1)
 (deny default)
 ; dyld opens the filesystem root during startup; literal directory only, no subtree.
-(allow file-read-data (literal "/"))
+(allow file-read-data (literal "/") (literal "/private/var/select/sh"))
 (allow file-read-metadata ;TOOL_METADATA_ANCESTORS;
   (literal "/System/Cryptexes") (literal "/System/Cryptexes/OS")
   (literal "/System/Volumes") (literal "/System/Volumes/Data")
   (literal "/private") (literal "/private/etc") (literal "/etc")
-  (literal "/private/var") (literal "/var"))
+  (literal "/private/var") (literal "/var") (literal "/private/var/select"))
 ; This profile is intentionally fail-closed on a new OS/GPU. No permissive fallback.
 ; Only standard system runtimes, frozen tool roots, the read-only source and this
 ; single job's work area are readable. /Users and the broker/runner state have no allow.

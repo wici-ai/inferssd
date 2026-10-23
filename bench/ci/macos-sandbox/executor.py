@@ -239,6 +239,12 @@ class Session:
                 profile = (core.BASE / "public" / name).read_text()
                 for root in self.manifest["input_roots"] + self.manifest["model_roots"]:
                     profile += "\n(allow file-read* (subpath " + json.dumps(root) + "))\n"
+                # Shell canonicalization traverses these directories before entering
+                # WORK. Metadata alone reveals no host file contents or directory listing.
+                ancestors = {parent for root in [str(self.job / "work"), *self.manifest["input_roots"], *self.manifest["model_roots"]]
+                             for parent in Path(root).parents}
+                profile += "\n(allow file-read-metadata " + " ".join(
+                    "(literal " + json.dumps(str(parent)) + ")" for parent in sorted(ancestors)) + ")\n"
                 (self.job / name).write_text(profile)
                 (self.job / name).chmod(0o444)
         except BaseException:
