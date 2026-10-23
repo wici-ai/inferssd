@@ -114,8 +114,10 @@ class _Reader:
         self.stream.seek(count, os.SEEK_CUR)
         self.offset += count
 
-    def string(self, *, capture: bool = True) -> str:
+    def string(self, *, capture: bool = True, max_bytes: int | None = None) -> str:
         length = int(self.take("Q"))
+        if max_bytes is not None and length > max_bytes:
+            raise RuntimeError(f"tensor name too long for runtime key: {length} UTF-8 bytes")
         self.span(length)
         decoder = codecs.getincrementaldecoder("utf-8")("strict")
         pieces = []
@@ -243,7 +245,9 @@ def read_header(path: Path) -> Header:
             tensors = []
             names: set[str] = set()
             for _ in range(tensor_count):
-                name, dimensions = reader.string(), int(reader.take("I"))
+                # Native gguf rejects every tensor name at GGML_MAX_NAME (128)
+                # bytes, including dense tensors not selected for the alias.
+                name, dimensions = reader.string(max_bytes=127), int(reader.take("I"))
                 if name in names:
                     raise ValueError(f"Found duplicated tensor with name {name}")
                 names.add(name)
