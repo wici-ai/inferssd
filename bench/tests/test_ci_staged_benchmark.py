@@ -147,3 +147,52 @@ def test_startup_health_timeout_then_loading_then_ready_is_one_completion(tmp_pa
     with pytest.raises(ValueError, match="only startup health"):
         staged_chat.NativeHTTP(session, None, 18080).request(
             "POST", "/completion", {}, 2, allow_health_timeout=True)
+
+
+def controlled_stop():
+    unit = "inferssd-stage-" + "a" * 32 + ".service"
+    cleanup = dict(unit=unit, processes_gone=True,
+                   state=dict(MainPID="0", ActiveState="inactive"))
+    guardian = dict(unit=unit, returncode=1, controller_disconnected=True,
+                    cleanup_confirmed=True, cleanup=cleanup)
+    receipt = dict(unit=unit, returncode=1, cleanup_confirmed=True, passed=False,
+                   error="InterruptedError: stage stopped by trusted controller",
+                   guardian=guardian, cleanup=cleanup)
+    return dict(running=False, returncode=1, state="finished", cleanup_confirmed=True,
+                scope_identity="/system.slice/" + unit, receipt=receipt)
+
+
+def test_controlled_launcher_stop_preserves_measurement_failure(tmp_path):
+    class ControlledSession(Session):
+        def call(self, stage, operation, **kwargs):
+            response = super().call(stage, operation, **kwargs)
+            return controlled_stop() if operation == "stage.stop" else response
+
+    assert staged_benchmark.verify_stopped(controlled_stop()) == "trusted-controller-stop"
+    for failure in (None, "raw-result"):
+        result = staged_benchmark.benchmark(
+            ControlledSession(failure), "base", CONFIG, tmp_path / str(failure))
+        assert result["status"] == ("passed" if failure is None else "failed")
+        assert result["stop_classification"] == "trusted-controller-stop"
+        assert result["completion_requests"] == 1
+
+
+@pytest.mark.parametrize("case", ["native-exit", "STOP", "timeout", "unclean", "active", "disconnected", "quarantined"])
+def test_controlled_stop_rejects_abnormal_or_unconfirmed_exit(case):
+    value = controlled_stop()
+    if case == "native-exit":
+        value["receipt"].pop("error")
+    elif case in ("STOP", "timeout"):
+        value["returncode"] = 0  # Even zero must not override the watch failure.
+        value["receipt"]["error"] = ("InterruptedError: device STOP exists" if case == "STOP"
+                                     else "TimeoutError: stage exceeded finite deadline")
+    elif case == "unclean":
+        value["receipt"]["guardian"]["cleanup"]["processes_gone"] = False
+    elif case == "active":
+        value["receipt"]["guardian"]["cleanup"]["state"]["ActiveState"] = "active"
+    elif case == "disconnected":
+        value["receipt"]["guardian"]["controller_disconnected"] = False
+    else:
+        value["state"] = "quarantined"
+    with pytest.raises(ValueError, match="did not stop normally and cleanly"):
+        staged_benchmark.verify_stopped(value)
