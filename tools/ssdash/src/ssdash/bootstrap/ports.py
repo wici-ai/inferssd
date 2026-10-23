@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from types import TracebackType
-from typing import Optional, Protocol, TextIO
-from urllib.request import Request
+from typing import TYPE_CHECKING, Optional, Protocol, TextIO
 
 from ssdash.telemetry.types import Record
+
+if TYPE_CHECKING:
+    from urllib.request import Request
 
 History = list[Record]
 OpenText = Callable[..., TextIO]
