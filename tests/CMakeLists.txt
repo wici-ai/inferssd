@@ -187,6 +187,13 @@ if (TARGET ggml-cpu)
         target_include_directories(test-ssd-runtime-options PRIVATE ../src ../ggml/src)
         target_link_libraries(test-ssd-runtime-options PRIVATE llama ggml-ssd-settings)
         add_test(NAME ssd_runtime_options COMMAND test-ssd-runtime-options)
+
+        add_executable(test-ssd-precompute-memory ssd/test-precompute-memory.cpp)
+        target_compile_features(test-ssd-precompute-memory PRIVATE cxx_std_17)
+        target_compile_options(test-ssd-precompute-memory PRIVATE -UNDEBUG)
+        target_include_directories(test-ssd-precompute-memory PRIVATE ../src ../ggml/src)
+        target_link_libraries(test-ssd-precompute-memory PRIVATE llama)
+        add_test(NAME ssd_precompute_memory COMMAND test-ssd-precompute-memory)
         set_property(TEST ssd_runtime_options PROPERTY LABELS main)
 
         add_executable(test-ssd-settings-telemetry ssd/test-settings-telemetry.cpp)
