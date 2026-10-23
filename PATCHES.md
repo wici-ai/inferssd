@@ -56,7 +56,7 @@ from integration hooks when assessing future patch growth.
 | `common/speculative.h` | 6 | 0 |
 | `ggml/CMakeLists.txt` | 1 | 0 |
 | `ggml/include/ggml-alloc.h` | 4 | 0 |
-| `ggml/include/ggml-backend.h` | 48 | 0 |
+| `ggml/include/ggml-backend.h` | 58 | 0 |
 | `ggml/include/ggml-cpu.h` | 3 | 0 |
 | `ggml/include/ggml-cuda.h` | 23 | 0 |
 | `ggml/include/ggml-rpc.h` | 2 | 2 |
@@ -65,7 +65,7 @@ from integration hooks when assessing future patch growth.
 | `ggml/src/ggml-alloc.c` | 38 | 2 |
 | `ggml/src/ggml-backend-impl.h` | 5 | 0 |
 | `ggml/src/ggml-backend-meta.cpp` | 14 | 1 |
-| `ggml/src/ggml-backend.cpp` | 311 | 61 |
+| `ggml/src/ggml-backend.cpp` | 386 | 64 |
 | `ggml/src/ggml-blas/ggml-blas.cpp` | 1 | 0 |
 | `ggml/src/ggml-cann/ggml-cann.cpp` | 1 | 0 |
 | `ggml/src/ggml-common.h` | 1 | 0 |
@@ -91,7 +91,7 @@ from integration hooks when assessing future patch growth.
 | `ggml/src/ggml-cuda/fattn-common.cuh` | 35 | 7 |
 | `ggml/src/ggml-cuda/fattn.cu` | 10 | 0 |
 | `ggml/src/ggml-cuda/fattn.cuh` | 3 | 0 |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1422 | 125 |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1433 | 125 |
 | `ggml/src/ggml-cuda/mmq.cu` | 54 | 3 |
 | `ggml/src/ggml-cuda/mmq.cuh` | 28 | 10 |
 | `ggml/src/ggml-cuda/mmvf.cu` | 22 | 0 |
@@ -127,7 +127,7 @@ from integration hooks when assessing future patch growth.
 | `src/CMakeLists.txt` | 19 | 0 |
 | `src/llama-arch.cpp` | 114 | 2 |
 | `src/llama-arch.h` | 77 | 2 |
-| `src/llama-context.cpp` | 1286 | 27 |
+| `src/llama-context.cpp` | 1297 | 27 |
 | `src/llama-context.h` | 149 | 1 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
@@ -166,5 +166,5 @@ from integration hooks when assessing future patch growth.
 | `tools/server/server-task.cpp` | 195 | 183 |
 | `tools/server/server-task.h` | 23 | 80 |
 
-Total: 15167 added, 5266 removed across 135 upstream paths.
+Total: 15274 added, 5269 removed across 135 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
