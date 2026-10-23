@@ -20,23 +20,25 @@
     "prefill_regression_fraction": 0
   },
   "extended_prefixes": [
-    "ggml/",
-    "src/",
-    "common/",
-    "include/",
-    "tools/server/",
-    "tools/inferssd/src/inferssd/engine/",
-    "tools/inferssd/src/inferssd/platform/",
-    "tools/inferssd/src/inferssd/launch/",
-    "tools/inferssd/src/inferssd/configuration/",
+    "engine/ggml/",
+    "engine/src/",
+    "engine/common/",
+    "engine/include/",
+    "engine/tools/server/",
+    "framework/src/inferssd/engine/",
+    "framework/src/inferssd/platform/",
+    "framework/src/inferssd/launch/",
+    "framework/src/inferssd/configuration/",
     "bench/",
     "scripts/",
-    "models/templates/",
-    "tools/inferssd/src/"
+    "engine/models/templates/",
+    "framework/src/"
   ],
   "extended_names": [
     "CMakeLists.txt",
-    "cmake/"
+    "cmake/",
+    "engine/CMakeLists.txt",
+    "engine/cmake/"
   ],
   "authorized_associations": [
     "OWNER",

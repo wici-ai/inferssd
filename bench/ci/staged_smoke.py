@@ -8,6 +8,7 @@ the separately pinned base/candidate performance protocol.
 
 import argparse
 import os
+import subprocess
 from pathlib import Path
 import sys
 import time
@@ -31,7 +32,20 @@ def collect_log(session, stage, output):
                     break
 
 
-def smoke(session, config, output):
+
+def host_memory(output, name):
+    if sys.platform != "darwin":
+        return
+    values = {}
+    for key, argv in (("vm_stat", ["/usr/bin/vm_stat"]),
+                      ("swap", ["/usr/sbin/sysctl", "vm.swapusage"]),
+                      ("memory_bytes", ["/usr/sbin/sysctl", "-n", "hw.memsize"])):
+        value = subprocess.run(argv, capture_output=True, text=True, timeout=10, check=True)
+        values[key] = value.stdout
+    save(output / name, dict(platform="darwin", monotonic_ns=time.monotonic_ns(), **values))
+
+
+def smoke(session, config, output, *, stage_id="candidate-smoke"):
     """The manifest independently fixes source/models/argv admission and lease."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
@@ -40,25 +54,29 @@ def smoke(session, config, output):
                   performance_acceptance=False, output_tokens=8)
     stage = None
     try:
-        stage = session.start("candidate-smoke", "server", config["argv"],
+        stage = session.start(stage_id, "server", config["argv"],
                               config["environment"], config["cwd"], config["timeout_s"])
         save(output / "started.json", stage.__dict__)
         deadline = time.monotonic() + config["timeout_s"]
         http = NativeHTTP(session, stage, config["port"])
+        health_attempt = 0
         while True:
             if time.monotonic() >= deadline:
                 raise TimeoutError("native smoke startup deadline")
             state = session.call(stage, "stage.poll")
             if state.get("running") is not True:
                 raise RuntimeError("native server exited before readiness")
-            probe = session.call(stage, "stage.probe", port=config["port"])
+            probe = session.call(stage, "stage.probe", port=config["port"], light=True)
             if probe.get("ready", True):
-                health = http.request("GET", "/health", None, 2)
+                health = http.request("GET", "/health", None, 2, allow_health_timeout=True)
+                health_attempt += 1
+                save(output / f"health-attempt-{health_attempt:04d}.json", health)
                 if health["status"] == 200:
                     break
             time.sleep(0.2)
         before = session.call(stage, "stage.probe", port=config["port"])
         save(output / "runtime-before.json", before)
+        host_memory(output, "host-memory-before-request.json")
         chat = {"messages": [{"role": "user", "content": "Say hello in one short sentence."}],
                 "chat_template_kwargs": {"enable_thinking": False}, "reasoning_effort": "none"}
         templated = http.json("POST", "/apply-template", chat, 10)
@@ -78,6 +96,7 @@ def smoke(session, config, output):
             raise ValueError("native completion did not finish the eight-token smoke")
         after = session.call(stage, "stage.probe", port=config["port"])
         save(output / "runtime-after.json", after)
+        host_memory(output, "host-memory-after-request.json")
         for key in ("worker_pid", "worker_uid", "birth_identity", "scope_identity"):
             if before.get(key) != after.get(key) or before.get(key) != getattr(stage, key):
                 raise ValueError("native runtime identity changed during smoke")
@@ -93,6 +112,7 @@ def smoke(session, config, output):
                 if stopped.get("cleanup_confirmed") is not True or stopped.get("returncode") != 0:
                     raise RuntimeError("native smoke did not stop normally and cleanly")
                 result["cleanup_confirmed"] = True
+                host_memory(output, "host-memory-after-cleanup.json")
             except Exception as error:
                 result.update(status="failed", cleanup_error=f"{type(error).__name__}: {error}")
         save(output / "smoke.json", result)

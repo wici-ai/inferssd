@@ -53,9 +53,9 @@ def pr():
     "path,tiers,code",
     [
         ("docs/example.md", ["512"], False),
-        ("tests/test-quantize.cpp", ["512"], True),
-        ("ggml/src/ggml-cpu/ops.cpp", ["512", "4096"], True),
-        ("tools/inferssd/src/inferssd/platform/worker.py", ["512", "4096"], True),
+        ("engine/tests/test-quantize.cpp", ["512"], True),
+        ("engine/ggml/src/ggml-cpu/ops.cpp", ["512", "4096"], True),
+        ("framework/src/inferssd/platform/worker.py", ["512", "4096"], True),
         ("bench/ci/driver.py", ["512", "4096"], True),
         (".github/workflows/ci.yml", ["512"], True),
     ],
@@ -397,7 +397,7 @@ def test_preflight_pins_all_three_slots_without_accepting_an_incomplete_file_lis
             if path == "pulls/12":
                 return current
             if path.startswith("pulls/12/files"):
-                return [{"filename": "src/llama-context.cpp"}]
+                return [{"filename": "engine/src/llama-context.cpp"}]
             if path == "check-runs":
                 return {"id": 33}
             raise AssertionError(path)

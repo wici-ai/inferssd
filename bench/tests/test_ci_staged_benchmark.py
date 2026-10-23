@@ -26,6 +26,7 @@ class Session:
     def __init__(self, failure=None):
         self.failure, self.calls, self.started = failure, [], []
         self.completions = 0
+        self.probes = []
 
     def start(self, name, kind, argv, environment, cwd, timeout):
         assert kind == "server" and timeout == 600
@@ -39,6 +40,7 @@ class Session:
         if operation == "stage.poll":
             return dict(running=self.failure != "startup-exit", returncode=1)
         if operation == "stage.probe":
+            self.probes.append(kwargs.get("light", False))
             value = dict(asdict(stage), ready=True, running=True, executable_sha256="b" * 64)
             if self.failure == "identity" and self.completed:
                 value["birth_identity"] = {"birth": 10}
@@ -96,6 +98,7 @@ def test_both_arms_share_session_and_revalidate_raw_result(tmp_path):
         assert load(output / "benchmark.json") == result
     assert session.started == ["base-benchmark-512", "candidate-benchmark-512"]
     assert session.completions == 2
+    assert session.probes == [True, False, False] * 2
 
 
 @pytest.mark.parametrize("failure", ["startup-exit", "raw-result", "identity", "cleanup", "log"])

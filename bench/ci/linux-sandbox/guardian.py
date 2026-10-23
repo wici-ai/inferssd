@@ -11,13 +11,16 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from contract import UNIT, protected
+from contract import UNIT, protected, load
 from executor import CLEAN_ENV, cleanup, quarantine, show
 
 
 def main(args):
     if os.geteuid() != 0 or not UNIT.fullmatch(args.unit):
         raise PermissionError("root-owned guardian only")
+    config = load(args.config)
+    if args.stop != config["stop_path"]:
+        raise ValueError("guardian STOP differs from reviewed coordination path")
     receipt = {"schema_version": 1, "unit": args.unit, "cleanup_confirmed": False}
     process = None
     try:
@@ -60,7 +63,7 @@ def main(args):
         receipt["cleanup_confirmed"] = True
     except BaseException as error:
         receipt["error"] = type(error).__name__ + ": " + str(error)
-        quarantine(args.stop, "guardian could not confirm " + args.unit)
+        quarantine(args.stop, "guardian could not confirm " + args.unit, config)
     finally:
         if process is not None and process.poll() is None:
             process.kill()
@@ -68,7 +71,7 @@ def main(args):
             try:
                 cleanup(args.unit)
             except Exception:
-                quarantine(args.stop, 'supervisor final cleanup unconfirmed: ' + args.unit)
+                quarantine(args.stop, 'supervisor final cleanup unconfirmed: ' + args.unit, config)
         with Path(args.receipt).open("x") as output:
             json.dump(receipt, output, indent=2)
             output.flush()
@@ -83,7 +86,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     for field in ("lock-fd", "read-fd", "ack-fd"):
         parser.add_argument("--" + field, type=int, required=True)
-    for field in ("unit", "stop", "receipt"):
+    for field in ("unit", "stop", "receipt", "config"):
         parser.add_argument("--" + field, required=True)
     parser.add_argument('--command')
     raise SystemExit(main(parser.parse_args()))

@@ -8,6 +8,7 @@ The production final benchmark entry point and protocol remain unchanged.
 import base64
 import http.client
 import json
+import socket
 from pathlib import Path
 import time
 
@@ -39,6 +40,12 @@ def local_request(port, method, path, body, timeout):
             chunks.append(dict(elapsed_ns=elapsed,
                                data_b64=base64.b64encode(line).decode()))
         return dict(status=response.status, headers=response.getheaders(),
+                    started_monotonic_ns=started, ended_monotonic_ns=time.monotonic_ns(),
+                    chunks=chunks)
+    except (TimeoutError, socket.timeout) as error:
+        # Match the isolated Linux client's transport receipt. Only the explicit
+        # startup-health path may tolerate it; generation is never retried.
+        return dict(status=0, headers=[], transport_error=f"TimeoutError: {error}",
                     started_monotonic_ns=started, ended_monotonic_ns=time.monotonic_ns(),
                     chunks=chunks)
     finally:

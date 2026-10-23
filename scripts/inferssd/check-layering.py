@@ -6,13 +6,13 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MODULES = {
-    "core": "ggml/src/ggml-ssd",
-    "cpu": "ggml/src/ggml-cpu/ssd",
-    "cuda": "ggml/src/ggml-cuda/ssd",
-    "runtime": "src/ssd",
-    "common": "common/inferssd",
-    "server": "tools/server/inferssd",
-    "framework": "tools/inferssd/src/inferssd",
+    "core": "engine/ggml/src/ggml-ssd",
+    "cpu": "engine/ggml/src/ggml-cpu/ssd",
+    "cuda": "engine/ggml/src/ggml-cuda/ssd",
+    "runtime": "engine/src/ssd",
+    "common": "engine/common/inferssd",
+    "server": "engine/tools/server/inferssd",
+    "framework": "framework/src/inferssd",
 }
 errors = []
 for name, directory in MODULES.items():
@@ -40,7 +40,7 @@ for name, directory in MODULES.items():
                 if name == "cuda" and "ggml-cpu" in target:
                     issue = "CUDA includes CPU backend"
             if name in {"core", "cpu", "cuda", "runtime"} and re.search(r"\bgetenv\s*\(", code):
-                allowed = path == ROOT / "ggml/src/ggml-ssd/telemetry/debug.cpp" and re.search(
+                allowed = path == ROOT / "engine/ggml/src/ggml-ssd/telemetry/debug.cpp" and re.search(
                     r'getenv\("INFERSSD_(?:DEBUG|TRACE_DIR)"\)', code)
                 if not allowed:
                     issue = "ambient production configuration"

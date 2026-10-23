@@ -239,6 +239,12 @@ class Session:
                 profile = (core.BASE / "public" / name).read_text()
                 for root in self.manifest["input_roots"] + self.manifest["model_roots"]:
                     profile += "\n(allow file-read* (subpath " + json.dumps(root) + "))\n"
+                # Shell canonicalization traverses these directories before entering
+                # WORK. Metadata alone reveals no host file contents or directory listing.
+                ancestors = {parent for root in [str(self.job / "work"), *self.manifest["input_roots"], *self.manifest["model_roots"]]
+                             for parent in Path(root).parents}
+                profile += "\n(allow file-read-metadata " + " ".join(
+                    "(literal " + json.dumps(str(parent)) + ")" for parent in sorted(ancestors)) + ")\n"
                 (self.job / name).write_text(profile)
                 (self.job / name).chmod(0o444)
         except BaseException:
@@ -367,31 +373,42 @@ class Session:
                 time.sleep(1)
             raise RuntimeError("quarantine cleaned, failed job cannot continue")
 
-    def probe(self, record):
+    def probe(self, record, *, light=False):
+        require(type(light) is bool, "probe light flag must be boolean")
         result = dict(record)
         if record["state"] == "running":
             identity = birth(record["worker_pid"])
             require(identity == record["birth_identity"], "worker PID reused")
             result["members"] = core.members(self.config["worker_uid"])
             result["rss_bytes"] = sum(p["rss_bytes"] for p in result["members"])
-            # lsof is an installed Apple tool executed outside the candidate UID.
-            observed = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-u", str(self.config["worker_uid"]), "-F", "pcuftn"], capture_output=True, text=True, check=False)
-            require(observed.returncode in (0, 1), "cannot inventory actual worker files")
-            result["lsof"] = observed.stdout
+            if not light:
+                # lsof is an installed Apple tool executed outside the candidate UID.
+                observed = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-u", str(self.config["worker_uid"]), "-F", "pcuftn"], capture_output=True, text=True, check=False)
+                require(observed.returncode in (0, 1), "cannot inventory actual worker files")
+                result["lsof"] = observed.stdout
+            if record["kind"] == "server":
+                result.update(self.listener(result["members"]))
         return result
 
-    def client(self, record):
-        require(record["kind"] == "server" and record["state"] == "running", "client requires a running server")
-        probe = self.probe(record)
+    def listener(self, members):
         port = self.config["executor"]["server_port"]
         listeners = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-u", str(self.config["worker_uid"]), "-iTCP:" + str(port), "-sTCP:LISTEN", "-F", "pn"], capture_output=True, text=True, check=False)
-        require(listeners.returncode == 0, "owned server has no listener")
+        require(listeners.returncode in (0, 1), "cannot inventory owned server listener")
+        if listeners.returncode == 1 and not listeners.stdout.strip():
+            return {"ready": False, "listener_pids": []}
         names = [line[1:] for line in listeners.stdout.splitlines() if line.startswith("n")]
         pids = [int(line[1:]) for line in listeners.stdout.splitlines() if line.startswith("p")]
         require(names and all(name == "127.0.0.1:" + str(port) for name in names), "listener is not fixed IPv4 loopback")
-        require(set(pids) <= {p["pid"] for p in probe["members"]}, "listener outside owned worker UID")
+        require(set(pids) <= {p["pid"] for p in members}, "listener outside owned worker UID")
+        return {"ready": True, "listener_pids": pids}
+
+    def client(self, record):
+        require(record["kind"] == "server" and record["state"] == "running", "client requires a running server")
+        probe = self.probe(record, light=True)
+        require(probe["ready"], "owned server has no listener")
+        port = self.config["executor"]["server_port"]
         return {**{k: record[k] for k in ("handle", "worker_pid", "worker_uid", "birth_identity", "scope_identity")},
-                "url": "http://127.0.0.1:" + str(port), "listener_pids": pids}
+                "url": "http://127.0.0.1:" + str(port), "listener_pids": probe["listener_pids"]}
 
     def dispatch(self, request):
         require(request.get("schema_version") == 1 and request.get("job_id") == self.job.name, "request job/schema mismatch")
@@ -440,7 +457,7 @@ class Session:
                 time.sleep(.1)
             return dict(record)
         if operation == "stage.probe":
-            return self.probe(record)
+            return self.probe(record, light=request.get("light", False))
         if operation == "stage.client":
             return self.client(record)
         raise ValueError("unknown operation")

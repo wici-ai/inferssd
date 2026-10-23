@@ -1,0 +1,66 @@
+#!/usr/bin/python3
+"""Recreate this host's reviewed read-only model binds before the CI broker."""
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+
+MANIFEST = Path('@@MANIFEST@@')
+SOURCE = Path('@@SOURCE@@')
+TARGET = Path('@@TARGET@@')
+
+
+def root_path(path):
+    for parent in (path, *path.parents):
+        info = parent.lstat()
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise RuntimeError('unprotected installed manifest or mountpoint parent')
+
+
+def main():
+    if os.geteuid() != 0:
+        raise PermissionError('root-only fixed model setup')
+    root_path(MANIFEST)
+    root_path(TARGET)
+    rows = json.loads(MANIFEST.read_text())['files']
+    expected = set(@@EXACT_SHARD_NAMES@@)
+    if len(rows) != len(expected) or {row['name'] for row in rows} != expected:
+        raise RuntimeError('reviewed model inventory changed')
+    output = []
+    for row in rows:
+        source, target = SOURCE / row['name'], TARGET / row['name']
+        if row['source'] != str(source) or row['path'] != str(target):
+            raise RuntimeError('manifest points outside the exact reviewed model roots')
+        info = source.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != @@SOURCE_UID@@ or info.st_gid != @@SOURCE_GID@@
+                or (info.st_ino, info.st_size, info.st_mtime_ns) != (row['inode'], row['bytes'], row['mtime_ns'])):
+            raise RuntimeError('source shard differs from its reviewed identity')
+        mounted = subprocess.run(['/usr/bin/findmnt', '-rn', '--mountpoint', str(target), '-o', 'VFS-OPTIONS'], capture_output=True, text=True)
+        created = False
+        if mounted.returncode == 1:
+            before = target.lstat()
+            if not stat.S_ISREG(before.st_mode) or before.st_uid != 0 or before.st_mode & 0o222 or before.st_size:
+                raise RuntimeError('mountpoint is not the original root-owned empty placeholder')
+            subprocess.run(['/usr/bin/mount', '--bind', str(source), str(target)], check=True)
+            created = True
+            try:
+                subprocess.run(['/usr/bin/mount', '-o', 'remount,bind,ro', str(target)], check=True)
+                mounted = subprocess.run(['/usr/bin/findmnt', '-rn', '--mountpoint', str(target), '-o', 'VFS-OPTIONS'], capture_output=True, text=True)
+                if mounted.returncode or 'ro' not in mounted.stdout.strip().split(','):
+                    raise RuntimeError('new bind did not become read-only')
+            except BaseException:
+                subprocess.run(['/usr/bin/umount', str(target)], check=True)
+                raise
+        elif mounted.returncode or 'ro' not in mounted.stdout.strip().split(','):
+            raise RuntimeError('existing model mount is not the reviewed read-only bind')
+        observed = target.stat()
+        if (observed.st_dev, observed.st_ino, observed.st_size) != (info.st_dev, info.st_ino, info.st_size):
+            raise RuntimeError('target does not expose the reviewed source inode')
+        output.append({'name': row['name'], 'created': created, 'readonly': True,
+                       'device': observed.st_dev, 'inode': observed.st_ino, 'bytes': observed.st_size})
+    print(json.dumps({'status': 'passed', 'models': output, 'fresh_payload_hash': False}))
+
+
+if __name__ == '__main__':
+    main()

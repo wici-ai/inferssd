@@ -8,5 +8,5 @@ id = "generic-api-key"
 description = "Verified SHA-256 of the frozen 653-byte parser source fragment"
 condition = "AND"
 regexTarget = "match"
-paths = ['''^experiments/c0-store/oracle/extraction\.json$''']
+paths = ['''^(experiments/c0-store|engine/tests/ssd/fixtures/c0-store)/oracle/extraction\.json$''']
 regexes = ['''^read-and-key": "829c2a1faef3e740bc165da82c86461a5d49d03a23fde71c5da56fbde235b969"$''']

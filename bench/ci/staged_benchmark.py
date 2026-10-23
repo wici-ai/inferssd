@@ -125,7 +125,7 @@ def benchmark(session, side, config, output):
             if state.get("running") is not True:
                 retain("startup-exit", state)
                 raise RuntimeError("native server exited before readiness")
-            probe = session.call(stage, "stage.probe", port=config["port"])
+            probe = session.call(stage, "stage.probe", port=config["port"], light=True)
             if "ready" not in probe:
                 retain("startup-probe", probe)
                 raise ValueError("broker probe must report explicit listener readiness")

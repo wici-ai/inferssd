@@ -24,14 +24,14 @@ Private candidate validation must finish before claiming operational acceptance.
 
 Regenerate the path inventory with
 `python3 scripts/inferssd/patch-surface.py`. It compares the working tree with
-the local `upstream` alias set up in [CONTRIBUTING.md](CONTRIBUTING.md) and excludes
-newly owned paths. Review model/op exceptions separately from integration hooks
+the immutable bundled source snapshot and compares matching files below `engine/`,
+excluding directory relocation and newly owned paths. Review model/op exceptions separately from integration hooks
 when assessing future patch growth.
 
 <!-- BEGIN UPSTREAM INVENTORY -->
-| Upstream path | Added | Removed |
+| Upstream path (under engine/) | Added | Removed |
 | --- | ---: | ---: |
-| `common/CMakeLists.txt` | 6 | 1 |
+| `common/CMakeLists.txt` | 16 | 22 |
 | `common/arg.cpp` | 60 | 2 |
 | `common/chat-auto-parser-generator.cpp` | 1 | 1 |
 | `common/chat-peg-parser.cpp` | 4 | 2 |
@@ -50,6 +50,7 @@ when assessing future patch growth.
 | `common/jinja/value.h` | 17 | 18 |
 | `common/peg-parser.cpp` | 16 | 0 |
 | `common/peg-parser.h` | 4 | 0 |
+| `common/reasoning-budget.cpp` | 0 | 264 |
 | `common/reasoning-budget.h` | 1 | 53 |
 | `common/sampling.cpp` | 78 | 12 |
 | `common/sampling.h` | 11 | 2 |
@@ -128,7 +129,7 @@ when assessing future patch growth.
 | `src/CMakeLists.txt` | 19 | 0 |
 | `src/llama-arch.cpp` | 114 | 2 |
 | `src/llama-arch.h` | 77 | 2 |
-| `src/llama-context.cpp` | 1352 | 46 |
+| `src/llama-context.cpp` | 1359 | 46 |
 | `src/llama-context.h` | 150 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
@@ -158,7 +159,7 @@ when assessing future patch growth.
 | `src/llama.cpp` | 8 | 1 |
 | `src/models/deepseek2.cpp` | 10 | 4 |
 | `src/models/models.h` | 56 | 0 |
-| `tools/server/CMakeLists.txt` | 8 | 0 |
+| `tools/server/CMakeLists.txt` | 10 | 2 |
 | `tools/server/README.md` | 2 | 1 |
 | `tools/server/server-chat.cpp` | 66 | 16 |
 | `tools/server/server-common.cpp` | 288 | 5 |
@@ -167,5 +168,5 @@ when assessing future patch growth.
 | `tools/server/server-task.cpp` | 195 | 183 |
 | `tools/server/server-task.h` | 23 | 80 |
 
-Total: 15564 added, 5345 removed across 135 upstream paths.
+Total: 15583 added, 5632 removed across 136 upstream paths.
 <!-- END UPSTREAM INVENTORY -->

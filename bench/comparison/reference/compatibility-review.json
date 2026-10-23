@@ -1,0 +1,8 @@
+{
+  "patch_sha256": "faf7dc3a711f2f27fbeba97a31b1aefdaf559d7f4abdf8491a1e96193edf652c",
+  "reviewer": "root agent",
+  "decision": "approved-for-reference-build",
+  "review": "Only raw logical range/page prefix, complete-payload EOF, physical padding capacity, and ABI check. No later kernels, thread-local bounce reuse, or scheduling changes. Label baseline v0.1.13 + GGUF compatibility, not the unmodified package.",
+  "zero_initialization_review": "Demand sink_request request = {}; prefetch_job role[3] = {}; production raw resolver clears *source; three-field aggregate initializers zero new trailing fields.",
+  "formal_model_requests": 0
+}

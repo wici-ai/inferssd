@@ -180,7 +180,7 @@ class RunningStage:
             except BaseException as error:
                 self.error = self.error or 'cleanup: ' + str(error)
                 self.receipt['cleanup_error'] = str(error)
-                quarantine(self.config['stop_path'], 'async stage cleanup unconfirmed: ' + self.stage.unit)
+                quarantine(self.config['stop_path'], 'async stage cleanup unconfirmed: ' + self.stage.unit, self.config)
             self.receipt['passed'] = self.receipt.get('returncode') == 0 and self.error is None
             try:
                 save(self.directory / 'receipt.json', self.receipt)
@@ -229,7 +229,7 @@ class RunningStage:
     def stop(self):
         self.stop_event.set()
         if not self.done.wait(45):
-            quarantine(self.config['stop_path'], 'async stage supervisor did not finish: ' + self.stage.unit)
+            quarantine(self.config['stop_path'], 'async stage supervisor did not finish: ' + self.stage.unit, self.config)
             raise RuntimeError('async stage cleanup deadline exceeded')
         if not self.receipt.get('cleanup_confirmed'):
             raise RuntimeError('stage cleanup not confirmed')
@@ -238,40 +238,43 @@ class RunningStage:
             self.net_fd = -1
         return self.response()
 
-    def probe(self, port=None):
+    def probe(self, port=None, *, light=False):
+        if type(light) is not bool:
+            raise ValueError('probe light flag must be boolean')
         self.verify_alive()
         result = dict(self.identity)
-        process = Path('/proc') / str(self.identity['worker_pid'])
-        result['executable'] = os.readlink(process / 'exe')
-        result['executable_sha256'] = digest(process / 'exe')
-        maps = (process / 'maps').read_text()
-        if len(maps.encode()) > 512 * 1024:
-            raise RuntimeError('process mapping evidence exceeds protocol bound')
-        result['proc_maps'] = maps
-        result['image_paths'] = sorted({line.split(None, 5)[5] for line in maps.splitlines()
-                                        if len(line.split(None, 5)) == 6 and line.split(None, 5)[5].startswith('/')})
-        for name in ('cmdline', 'environ'):
-            with (process / name).open('rb') as stream:
-                data = stream.read(128 * 1024 + 1)
-            if len(data) > 128 * 1024:
-                raise RuntimeError('process launch evidence exceeds protocol bound')
-            values = [item.decode('utf-8', errors='surrogateescape') for item in data.rstrip(b'\0').split(b'\0') if item]
-            if name == 'cmdline':
-                result['cmdline'] = values
-            else:
-                environment = {}
-                for item in values:
-                    key, separator, value = item.partition('=')
-                    if not separator or key in environment:
-                        raise RuntimeError('ambiguous worker environment')
-                    environment[key] = value
-                result['environment'] = environment
-        status = dict(line.split(':', 1) for line in (process / 'status').read_text().splitlines() if ':' in line)
-        result['cpus_allowed_list'] = status['Cpus_allowed_list'].strip()
-        cgroup = Path('/sys/fs/cgroup') / self.cgroup.lstrip('/')
-        result['cgroup_limits'] = {key: (cgroup / name).read_text().strip() for key, name in (
-            ('memory_max', 'memory.max'), ('memory_swap_max', 'memory.swap.max'), ('pids_max', 'pids.max'))}
-        result['proc_limits'] = (process / 'limits').read_text()
+        if not light:
+            process = Path('/proc') / str(self.identity['worker_pid'])
+            result['executable'] = os.readlink(process / 'exe')
+            result['executable_sha256'] = digest(process / 'exe')
+            maps = (process / 'maps').read_text()
+            if len(maps.encode()) > 512 * 1024:
+                raise RuntimeError('process mapping evidence exceeds protocol bound')
+            result['proc_maps'] = maps
+            result['image_paths'] = sorted({line.split(None, 5)[5] for line in maps.splitlines()
+                                            if len(line.split(None, 5)) == 6 and line.split(None, 5)[5].startswith('/')})
+            for name in ('cmdline', 'environ'):
+                with (process / name).open('rb') as stream:
+                    data = stream.read(128 * 1024 + 1)
+                if len(data) > 128 * 1024:
+                    raise RuntimeError('process launch evidence exceeds protocol bound')
+                values = [item.decode('utf-8', errors='surrogateescape') for item in data.rstrip(b'\0').split(b'\0') if item]
+                if name == 'cmdline':
+                    result['cmdline'] = values
+                else:
+                    environment = {}
+                    for item in values:
+                        key, separator, value = item.partition('=')
+                        if not separator or key in environment:
+                            raise RuntimeError('ambiguous worker environment')
+                        environment[key] = value
+                    result['environment'] = environment
+            status = dict(line.split(':', 1) for line in (process / 'status').read_text().splitlines() if ':' in line)
+            result['cpus_allowed_list'] = status['Cpus_allowed_list'].strip()
+            cgroup = Path('/sys/fs/cgroup') / self.cgroup.lstrip('/')
+            result['cgroup_limits'] = {key: (cgroup / name).read_text().strip() for key, name in (
+                ('memory_max', 'memory.max'), ('memory_swap_max', 'memory.swap.max'), ('pids_max', 'pids.max'))}
+            result['proc_limits'] = (process / 'limits').read_text()
         self.verify_alive()
         if port is None:
             return result
@@ -330,7 +333,7 @@ class RunningStage:
             save(self.directory / ('http-' + uuid.uuid4().hex + '.json'), value)
             return value
         try:
-            ready = self.probe(spec['port'])['ready']
+            ready = self.probe(spec['port'], light=True)['ready']
         except (FileNotFoundError, ProcessLookupError, RuntimeError):
             if alive():
                 raise
@@ -345,7 +348,12 @@ class RunningStage:
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=CLEAN_ENV,
                 close_fds=True, pass_fds=(self.net_fd,), timeout=spec['timeout_s'] + 5)
             if result.returncode or len(result.stdout) > 1024 * 1024:
-                raise RuntimeError('trusted loopback client failed or exceeded output bound')
+                failure = {'returncode': result.returncode, 'stdout_bytes': len(result.stdout),
+                           'stderr': result.stderr[:4096],
+                           'stderr_truncated': len(result.stderr) > 4096}
+                save(self.directory / ('http-client-failure-' + uuid.uuid4().hex + '.json'), failure)
+                raise RuntimeError('trusted loopback client failed or exceeded output bound: ' +
+                                   json.dumps(failure, separators=(',', ':')))
             value = json.loads(result.stdout)
         except subprocess.TimeoutExpired:
             value = failed('trusted HTTP client exceeded request deadline', started)
@@ -518,7 +526,7 @@ class JobSession:
             raise ValueError('exact owned stage handle required')
         shared = {'schema_version', 'operation', 'job_id', 'stage_id', 'handle'}
         allowed = {'stage.poll': {'output_offset'}, 'stage.wait': {'output_offset', 'wait_s'},
-                   'stage.stop': set(), 'stage.probe': {'port'}, 'stage.client': {'request'},
+                   'stage.stop': set(), 'stage.probe': {'port', 'light'}, 'stage.client': {'request'},
                    'job.freeze': set(), 'stage.output': {'stream', 'offset', 'limit'}}
         if operation not in allowed or set(value) - shared - allowed[operation]:
             raise ValueError('unknown operation or request field')
@@ -531,7 +539,7 @@ class JobSession:
         if operation == 'stage.output':
             return running.output(value.get('stream', 'stdout'), value.get('offset', 0), value.get('limit', 65536))
         if operation == 'stage.probe':
-            return running.probe(value.get('port'))
+            return running.probe(value.get('port'), light=value.get('light', False))
         if operation == 'stage.client':
             return running.client(value['request'])
         if operation == 'job.freeze':
@@ -568,7 +576,7 @@ class JobSession:
                    'frozen': {key: value['manifest_sha256'] for key, value in self.frozen.items()}}
         try:
             if errors:
-                quarantine(self.config['stop_path'], 'job cleanup unconfirmed: ' + self.job_id)
+                quarantine(self.config['stop_path'], 'job cleanup unconfirmed: ' + self.job_id, self.config)
             save(self.root / 'job-receipt.json', receipt)
         finally:
             self.closed = True

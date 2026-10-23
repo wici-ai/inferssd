@@ -119,7 +119,10 @@ one original device lease across every stage and both sides. All requests have
 - `stage.probe` returns kernel PID/birth identity, actual dedicated-UID members,
   aggregate RSS and trusted `/usr/sbin/lsof` output. `stage.client` verifies the
   exact owned listener at `127.0.0.1:18080` and returns its URL and listener PIDs.
-  HTTP/SSE timing and comparison run in the trusted coordinator.
+  Optional boolean `light: true` omits the full open-file inventory while keeping
+  PID/birth/UID and listener checks; HTTP admission uses this mode. Default
+  probes still retain the complete inventory. HTTP/SSE timing and comparison
+  run in the trusted coordinator.
 - `job.freeze` binds the completed successful build `stage_id` and `handle`, takes `source` (inside job work) and unique `name` (use `base` or
   `candidate`). It requires an empty worker UID, makes a new root-owned read-only
   byte copy, and returns path, manifest path/hash and file count. Internal file

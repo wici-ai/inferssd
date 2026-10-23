@@ -15,9 +15,10 @@ For a new clone, create the local snapshot alias once with
 The snapshot is part of main's history; no remote `upstream` branch is required.
 
 ```sh
-python3 -m pytest -q tools/adaptive/tests
-bash tools/adaptive/tests/test_launcher_settings.sh
-bash tools/adaptive/tests/test_launcher_replica.sh
+python3 -m pip install ./framework
+python3 -m pytest -q framework/tests tests/integration
+bash framework/tests/fixtures/oracle/launch/tools/adaptive/tests/test_launcher_settings.sh
+bash framework/tests/fixtures/oracle/launch/tools/adaptive/tests/test_launcher_replica.sh
 python3 scripts/public-scan.py --skip upstream
 gitleaks git --log-opts="--all"
 ```

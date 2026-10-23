@@ -152,6 +152,63 @@ class ClientTests(unittest.TestCase):
                     thread.join(timeout=5)
                     server.server_close()
 
+    def test_light_probe_and_client_avoid_full_maps_but_keep_listener_ownership(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{}\n')
+            def log_message(self, *args):
+                pass
+        server = HTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.handle_request)
+        thread.start()
+        original_read, original_link = Path.read_text, os.readlink
+        owner = [321]
+        def read(path, *args, **kwargs):
+            if str(path) == '/proc/321/maps':
+                raise PermissionError('full mapping evidence unavailable')
+            if str(path) in ('/proc/321/net/tcp', '/proc/321/net/tcp6'):
+                return 'header\n0: 0100007F:%04X 00000000:0000 0A 0 0 0 0 0 7\n' % server.server_port
+            if str(path) == '/sys/fs/cgroup/owned/cgroup.procs':
+                return str(owner[0])
+            return original_read(path, *args, **kwargs)
+        def link(path, *args, **kwargs):
+            if str(path).startswith('/proc/'):
+                return '/build/server' if Path(path).name == 'exe' else 'socket:[7]'
+            return original_link(path, *args, **kwargs)
+        stage = object.__new__(RunningStage)
+        stage.identity = dict(worker_pid=321, worker_uid=996, birth_identity='birth', scope_identity='/owned')
+        stage.config, stage.cgroup = {'worker_uid': 996, 'log_max': 4096}, '/owned'
+        stage.done = threading.Event()
+        def identity(pid, *_):
+            return dict(stage.identity, worker_pid=pid)
+        try:
+            with tempfile.TemporaryDirectory() as directory, open(os.devnull) as net:
+                stage.directory, stage.net_fd = Path(directory), net.fileno()
+                with patch('stages.process_identity', side_effect=identity), patch.object(Path, 'read_text', read), \
+                     patch.object(Path, 'rglob', return_value=[Path('/sys/fs/cgroup/owned/cgroup.procs')]), \
+                     patch.object(Path, 'iterdir', return_value=[Path('/proc/321/fd/4')]), \
+                     patch('stages.os.readlink', side_effect=link), patch('stages.digest', return_value='sealed'), \
+                     patch('stages.namespace_entry', return_value=[sys.executable, '-I', str(Path(__file__).with_name('http_client.py'))]):
+                    with self.assertRaisesRegex(PermissionError, 'mapping evidence'):
+                        stage.probe(server.server_port)
+                    observed = stage.probe(server.server_port, light=True)
+                    self.assertTrue(observed['ready'])
+                    self.assertEqual(observed['listener_owners'], [stage.identity])
+                    self.assertNotIn('proc_maps', observed)
+                    value = stage.client(dict(port=server.server_port, method='GET', path='/health', timeout_s=2))
+                    self.assertEqual(value['status'], 200)
+                    owner[0] = 322
+                    with self.assertRaisesRegex(RuntimeError, 'exact pinned worker'):
+                        stage.probe(server.server_port, light=True)
+                    with self.assertRaisesRegex(ValueError, 'boolean'):
+                        stage.probe(server.server_port, light='yes')
+        finally:
+            thread.join(timeout=5)
+            server.server_close()
+        self.assertFalse(thread.is_alive())
+
     def test_changed_worker_identity_still_refuses_http(self):
         stage = object.__new__(RunningStage)
         stage.identity = {'worker_pid': 321, 'worker_uid': 996, 'birth_identity': 'old', 'scope_identity': '/owned'}
@@ -191,3 +248,47 @@ class ClientTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class OriginalLeaseTests(unittest.TestCase):
+    def test_operator_lease_preserves_identity_and_rejects_replacement_or_worker_owner(self):
+        from types import SimpleNamespace
+        from contract import coordination_paths
+        import stat
+        config = dict(lock_path='/srv/host-operator/device.lock', stop_path='/srv/host-operator/STOP',
+                      coordination_owner={'uid': 1001, 'gid': 1001}, lock_identity=[30, 42],
+                      controller_uid=991, controller_gid=991, worker_uid=992, worker_gid=992,
+                      client_uid=993, client_gid=993)
+        def metadata(path, **kwargs):
+            name = str(path)
+            if name.endswith('STOP'):
+                raise FileNotFoundError(2, 'missing test path', name)
+            return SimpleNamespace(st_mode=(stat.S_IFREG | 0o664) if name.endswith('.lock') else (stat.S_IFDIR | 0o755),
+                                   st_uid=1001 if name.startswith('/srv/host-operator') else 0,
+                                   st_gid=1001 if name.startswith('/srv/host-operator') else 0,
+                                   st_dev=30, st_ino=42)
+        with patch.object(Path, 'lstat', metadata), patch.object(Path, 'stat', metadata):
+            coordination_paths(config)
+            config['lock_identity'] = [30, 43]
+            with self.assertRaisesRegex(ValueError, 'identity changed'):
+                coordination_paths(config)
+            config['lock_identity'] = [30, 42]
+            config['coordination_owner']['uid'] = 992
+            with self.assertRaisesRegex(ValueError, 'trusted host operator'):
+                coordination_paths(config)
+
+
+class QuarantineTests(unittest.TestCase):
+    def test_external_stop_uses_reviewed_coordination_and_preserves_existing(self):
+        from executor import quarantine
+        with tempfile.TemporaryDirectory() as temporary:
+            stop = Path(temporary) / 'STOP'
+            config = {'stop_path': str(stop)}
+            with patch('executor.coordination_paths') as check:
+                quarantine(stop, 'first', config)
+                identity = stop.stat().st_ino
+                quarantine(stop, 'second', config)
+                self.assertEqual(stop.stat().st_ino, identity)
+                self.assertEqual(json.loads(stop.read_text())['reason'], 'first')
+                self.assertEqual(check.call_count, 3)
+                with self.assertRaisesRegex(ValueError, 'differs'):
+                    quarantine(stop.with_name('elsewhere'), 'bad', config)

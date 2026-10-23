@@ -113,7 +113,7 @@ def stop_gate(config, evidence):
         def stop():
             wait_for(lambda: show(stage.unit).get("ActiveState") == "active")
             reason = "owned-negative-probe-" + uuid.uuid4().hex
-            quarantine(config["stop_path"], reason)
+            quarantine(config["stop_path"], reason, config)
             info = Path(config["stop_path"]).stat()
             created.append((reason, info.st_dev, info.st_ino, digest(config["stop_path"])))
         thread = threading.Thread(target=stop)
@@ -182,6 +182,7 @@ def main(args):
         spec = {"worker_uid": config["worker_uid"], "controller_uid": config["controller_uid"],
                 "memory_max": config["memory_max"], "tasks_max": config["tasks_max"],
                 "controller_gid": config["controller_gid"], "controller_pid": sleeper.pid,
+                "namespace_launcher": config.get("namespace_launcher"),
                 "controller_canary": str(canaries[0]), "credential_canary": str(canaries[1]),
                 "control_canary": str(canaries[2]), "evidence_canary": str(canaries[3]),
                 "host_namespaces": {name: os.readlink("/proc/self/ns/" + name) for name in ("user", "mnt", "net", "pid")}}

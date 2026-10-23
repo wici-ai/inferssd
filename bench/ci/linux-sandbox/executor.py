@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 
-from contract import UNIT, protected
+from contract import UNIT, protected, coordination_paths
 
 CLEAN_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 
@@ -55,13 +55,21 @@ def cleanup(unit, cgroup="", timeout=12):
         time.sleep(.05)
 
 
-def quarantine(path, reason):
+def quarantine(path, reason, config=None):
     path = Path(path)
-    protected(path.parent, directory=True)
+    if config is not None:
+        if path != Path(config["stop_path"]):
+            raise ValueError("quarantine path differs from reviewed coordination path")
+        coordination_paths(config)
+    else:
+        protected(path.parent, directory=True)
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     except FileExistsError:
-        protected(path)
+        if config is not None:
+            coordination_paths(config)
+        else:
+            protected(path)
         return
     with os.fdopen(descriptor, "w") as stream:
         json.dump({"schema_version": 1, "quarantined": True, "reason": reason}, stream)
@@ -107,9 +115,14 @@ class Guardian:
         read_fd, self.write_fd = os.pipe()
         ack_read, ack_write = os.pipe()
         self.receipt = directory / "guardian.json"
+        config_path = directory / "guardian-config.json"
+        with config_path.open("x") as stream:
+            json.dump(config, stream)
+        config_path.chmod(0o600)
         argv = [sys.executable, "-I", str(Path(config["install_root"]) / "guardian.py"),
                 "--lock-fd", str(lease.fd), "--read-fd", str(read_fd), "--ack-fd", str(ack_write),
-                "--unit", unit, "--stop", config["stop_path"], "--receipt", str(self.receipt)]
+                "--unit", unit, "--stop", config["stop_path"], "--receipt", str(self.receipt),
+                "--config", str(config_path)]
         if command is not None:
             path = directory / 'trusted-command.json'
             with path.open('x') as stream:
