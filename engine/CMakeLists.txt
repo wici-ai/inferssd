@@ -198,6 +198,17 @@ if (NOT TARGET ggml AND NOT LLAMA_USE_SYSTEM_GGML)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
 
+if (GGML_CUDA)
+    # ggml selects architectures in its own directory. The sibling native tools
+    # and tests also compile CUDA, so expose that language/toolkit at their
+    # common engine ancestor without changing the selected architectures.
+    if (TARGET ggml-cuda AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        get_target_property(CMAKE_CUDA_ARCHITECTURES ggml-cuda CUDA_ARCHITECTURES)
+    endif()
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+endif()
+
 #
 # build the library
 #
