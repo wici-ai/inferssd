@@ -132,6 +132,9 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
+    target_sources(ggml-cuda PRIVATE ssd/staging.cpp)
+    target_link_libraries(ggml-cuda PRIVATE ggml-ssd-object-io)
+
     if (GGML_CUDA_KIMI_VRAM_TIER)
         if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT GGML_CUDA_MOE_STREAM)
             message(FATAL_ERROR "SSD CUDA executor requires Linux and GGML_CUDA_MOE_STREAM")

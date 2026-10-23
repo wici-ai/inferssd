@@ -97,6 +97,22 @@ source_view source_index::view() noexcept {
 #endif
         *fd = direct; *offset = extent.offset; *logical_bytes = extent.logical_bytes;
         return true;
+    }, [](void * opaque, const char * name, size_t bytes, size_t * block_bytes) noexcept -> size_t {
+        if (!opaque || !name || !name[0] || !bytes) { return 0; }
+        const auto & entries = static_cast<source_index *>(opaque)->state_->index->entries_for_test();
+        const auto first = std::lower_bound(entries.begin(), entries.end(), name,
+            [](const c0::expert_pack_entry & entry, const char * value) { return std::strcmp(entry.tensor, value) < 0; });
+        if (first == entries.end() || std::strcmp(first->tensor, name) || first->expert_idx != 0 ||
+                !first->nbytes || first->nbytes > SIZE_MAX || bytes % first->nbytes) { return 0; }
+        const size_t block = size_t(first->nbytes), count = bytes / block;
+        if (!count || count > INT32_MAX || count > size_t(entries.end() - first)) { return 0; }
+        for (size_t i = 0; i < count; ++i) {
+            const auto & entry = first[i];
+            if (std::strcmp(entry.tensor, name) || entry.expert_idx != int32_t(i) || entry.nbytes != block) { return 0; }
+        }
+        if (first + count != entries.end() && !std::strcmp(first[count].tensor, name)) { return 0; }
+        if (block_bytes) { *block_bytes = block; }
+        return count;
     }};
 }
 } }

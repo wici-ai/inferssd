@@ -1,23 +1,17 @@
-#include "moe-common-object-transport.h"
-
-#include "ggml-cuda.h"
-#include <cuda_runtime.h>
-
+// SPDX-License-Identifier: MIT
+#include "object-uring.h"
 #include <climits>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
-
+#include <new>
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
-
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
 #include <liburing.h>
 #endif
-
-namespace ggml_moe_common {
-
+namespace ssd { namespace io {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
 namespace {
 
@@ -35,12 +29,8 @@ static sqpoll_affinity_request resolve_sqpoll_affinity(
     sqpoll_affinity_request request;
     if ((flags & IORING_SETUP_SQPOLL) == 0) return request;
 
-    request.env_name = "GGML_MOE_CPU_SQPOLL";
-    request.spec = std::getenv(request.env_name);
-    if ((!request.spec || !request.spec[0]) && legacy_env) {
-        request.env_name = legacy_env;
-        request.spec = std::getenv(legacy_env);
-    }
+    request.env_name = "explicit";
+    request.spec = legacy_env;
     if (!request.spec || !request.spec[0]) return request;
 
     request.requested = true;
@@ -56,7 +46,7 @@ static sqpoll_affinity_request resolve_sqpoll_affinity(
 #endif
 
 object_io_runtime_snapshot object_io_runtime_snapshot_load(
-        const object_io_runtime_counters &counters) {
+        const object_io_runtime_counters &counters) noexcept {
     object_io_runtime_snapshot snapshot;
     snapshot.batches = counters.batches.load(std::memory_order_relaxed);
     snapshot.reads = counters.reads.load(std::memory_order_relaxed);
@@ -78,7 +68,7 @@ bool object_pread_all(
         void *dst,
         size_t bytes,
         uint64_t offset,
-        size_t max_chunk_bytes) {
+        size_t max_chunk_bytes) noexcept {
 #if !defined(_WIN32)
     if (fd < 0 || (!dst && bytes != 0)) return false;
     char *out = static_cast<char *>(dst);
@@ -103,7 +93,7 @@ bool object_pread_all(
 #endif
 }
 
-unsigned object_io_sqpoll_setup_flag() {
+unsigned object_io_sqpoll_setup_flag() noexcept {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
     return IORING_SETUP_SQPOLL;
 #else
@@ -111,7 +101,7 @@ unsigned object_io_sqpoll_setup_flag() {
 #endif
 }
 
-unsigned object_io_deferred_taskrun_setup_flags() {
+unsigned object_io_deferred_taskrun_setup_flags() noexcept {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING) && \
     defined(IORING_SETUP_SINGLE_ISSUER) && defined(IORING_SETUP_DEFER_TASKRUN)
     return IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
@@ -120,11 +110,11 @@ unsigned object_io_deferred_taskrun_setup_flags() {
 #endif
 }
 
-void object_io_ring_release(object_stage_ring &ring) {
+bool object_io_ring_release(object_io_ring &ring) noexcept {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
     if (ring.uring) {
         // Do not free staging buffers under reads that are still in flight.
-        (void)object_io_ring_drain(ring);
+        if (!object_io_ring_drain(ring)) return false;
         io_uring_queue_exit(ring.uring);
         delete ring.uring;
         ring.uring = nullptr;
@@ -141,14 +131,15 @@ void object_io_ring_release(object_stage_ring &ring) {
 #else
     (void)ring;
 #endif
+    return true;
 }
 
 bool object_io_ring_ensure(
-        object_stage_ring &ring,
+        object_io_ring &ring,
         size_t depth,
         unsigned flags,
         const char *sqpoll_cpu_env,
-        unsigned sq_thread_idle) {
+        unsigned sq_thread_idle) noexcept {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
     if (depth == 0 || depth > UINT_MAX) return false;
     const sqpoll_affinity_request affinity =
@@ -167,9 +158,10 @@ bool object_io_ring_ensure(
         }
     }
 
-    object_io_ring_release(ring);
+    if (!object_io_ring_release(ring)) return false;
     ++ring.iouring_init_attempts;
-    ring.uring = new io_uring();
+    ring.uring = new (std::nothrow) io_uring();
+    if (!ring.uring) { ++ring.iouring_init_failures; return false; }
     int rc = 0;
     if (affinity.requested) {
         ++ring.iouring_sqpoll_affinity_attempts;
@@ -224,7 +216,7 @@ bool object_io_ring_ensure(
 #endif
 }
 
-bool object_io_ring_register_file(object_stage_ring &ring, int fd) {
+bool object_io_ring_register_file(object_io_ring &ring, int fd) noexcept {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
     if (!ring.uring || fd < 0 || ring.uring_fixed_file_registered) return false;
     if (io_uring_register_files(ring.uring, &fd, 1) != 0) return false;
@@ -238,7 +230,7 @@ bool object_io_ring_register_file(object_stage_ring &ring, int fd) {
 #endif
 }
 
-bool object_io_ring_unregister_files(object_stage_ring &ring) {
+bool object_io_ring_unregister_files(object_io_ring &ring) noexcept {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
     if (!ring.uring || !ring.uring_fixed_file_registered) return false;
     if (io_uring_unregister_files(ring.uring) != 0) return false;
@@ -252,13 +244,13 @@ bool object_io_ring_unregister_files(object_stage_ring &ring) {
 }
 
 bool object_io_ring_prepare_read(
-        object_stage_ring &ring,
+        object_io_ring &ring,
         int fd,
         void *dst,
         size_t bytes,
         uint64_t offset,
         uint64_t user_data,
-        bool fixed_file) {
+        bool fixed_file) noexcept {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
     if (!ring.uring || fd < 0 || !dst || bytes == 0 || bytes > UINT_MAX || offset > INT64_MAX) {
         return false;
@@ -286,11 +278,11 @@ bool object_io_ring_prepare_read(
 }
 
 bool object_io_window_prepare_read(
-        object_stage_ring &ring,
+        object_io_ring &ring,
         object_io_window_slot *window,
         size_t window_size,
         size_t window_slot,
-        const object_io_window_request &request) {
+        const object_io_window_request &request) noexcept {
     const size_t expected_bytes = request.expected_bytes ? request.expected_bytes : request.bytes;
     if (!window || window_slot >= window_size || window_slot == SIZE_MAX ||
             window[window_slot].active || request.fd < 0 || !request.destination ||
@@ -308,7 +300,7 @@ bool object_io_window_prepare_read(
     return true;
 }
 
-int object_io_ring_submit_count(object_stage_ring &ring) {
+int object_io_ring_submit_count(object_io_ring &ring) noexcept {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
     if (!ring.uring) return -1;
     const int submitted = io_uring_submit(ring.uring);
@@ -321,13 +313,13 @@ int object_io_ring_submit_count(object_stage_ring &ring) {
 #endif
 }
 
-bool object_io_ring_submit(object_stage_ring &ring) {
+bool object_io_ring_submit(object_io_ring &ring) noexcept {
     return object_io_ring_submit_count(ring) >= 0;
 }
 
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
 static void object_io_ring_consume_completion(
-        object_stage_ring &ring,
+        object_io_ring &ring,
         io_uring_cqe *cqe,
         object_io_completion &completion) {
     completion.user_data = static_cast<uint64_t>(
@@ -339,7 +331,7 @@ static void object_io_ring_consume_completion(
 }
 #endif
 
-bool object_io_ring_drain(object_stage_ring &ring) {
+bool object_io_ring_drain(object_io_ring &ring) noexcept {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
     if (!ring.uring) {
         ring.uring_unreaped = 0;
@@ -369,7 +361,7 @@ bool object_io_ring_drain(object_stage_ring &ring) {
 #endif
 }
 
-bool object_io_ring_wait(object_stage_ring &ring, object_io_completion &completion) {
+bool object_io_ring_wait(object_io_ring &ring, object_io_completion &completion) noexcept {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
     if (!ring.uring) return false;
     ++ring.iouring_wait_calls;
@@ -385,9 +377,9 @@ bool object_io_ring_wait(object_stage_ring &ring, object_io_completion &completi
 }
 
 bool object_io_ring_wait_for(
-        object_stage_ring &ring,
+        object_io_ring &ring,
         object_io_completion &completion,
-        uint64_t timeout_ms) {
+        uint64_t timeout_ms) noexcept {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
     if (!ring.uring) return false;
     ++ring.iouring_wait_calls;
@@ -407,8 +399,8 @@ bool object_io_ring_wait_for(
 }
 
 object_io_poll_result object_io_ring_peek(
-        object_stage_ring &ring,
-        object_io_completion &completion) {
+        object_io_ring &ring,
+        object_io_completion &completion) noexcept {
 #if defined(GGML_MOE_OBJECT_TRANSPORT_HAS_LIBURING)
     if (!ring.uring) return object_io_poll_result::error;
     io_uring_cqe *cqe = nullptr;
@@ -425,10 +417,10 @@ object_io_poll_result object_io_ring_peek(
 }
 
 object_io_completion_status object_io_completion_validate(
-        object_stage_ring &ring,
+        object_io_ring &ring,
         const object_io_completion &completion,
         bool user_data_valid,
-        size_t expected_bytes) {
+        size_t expected_bytes) noexcept {
     object_io_completion_counters &counters = ring.completion_counters;
     ++counters.validations;
     if (!user_data_valid) {
@@ -457,11 +449,11 @@ object_io_completion_status object_io_completion_validate(
 }
 
 object_io_completion_status object_io_window_resolve(
-        object_stage_ring &ring,
+        object_io_ring &ring,
         object_io_window_slot *window,
         size_t window_size,
         const object_io_completion &completion,
-        object_io_window_completion &resolved) {
+        object_io_window_completion &resolved) noexcept {
     resolved = {};
     const bool encoded_slot_valid = completion.user_data > 0 &&
         completion.user_data <= static_cast<uint64_t>(window_size);
@@ -483,150 +475,9 @@ object_io_completion_status object_io_window_resolve(
 
 void object_io_window_reset(
         object_io_window_slot *window,
-        size_t window_size) {
+        size_t window_size) noexcept {
     if (!window) return;
     for (size_t i = 0; i < window_size; ++i) window[i] = {};
 }
 
-bool object_stage_slot_collect_timing(
-        object_stage_ring &ring,
-        object_stage_slot &slot,
-        float *h2d_ms_out) {
-    if (h2d_ms_out) *h2d_ms_out = 0.0f;
-    if (!slot.timing_pending || !slot.copy_start || !slot.copy_done) return false;
-
-    bool collected = false;
-    if (cudaEventSynchronize(slot.copy_done) == cudaSuccess) {
-        float h2d_ms = 0.0f;
-        if (cudaEventElapsedTime(&h2d_ms, slot.copy_start, slot.copy_done) == cudaSuccess) {
-            ring.h2d_ms += h2d_ms;
-            ++ring.h2d_timed;
-            if (h2d_ms_out) *h2d_ms_out = h2d_ms;
-            collected = true;
-        }
-    }
-    slot.timing_pending = false;
-    return collected;
-}
-
-bool object_stage_slot_synchronize(
-        object_stage_ring &ring,
-        object_stage_slot &slot) {
-    if (!slot.pending) return true;
-    if (!slot.done || cudaEventSynchronize(slot.done) != cudaSuccess) return false;
-    object_stage_slot_publish_ready(slot);
-    ++ring.waits;
-    return true;
-}
-
-bool object_stage_slot_record(
-        object_stage_slot &slot,
-        cudaStream_t stream) {
-    if (!slot.done || !stream || slot.pending ||
-            cudaEventRecord(slot.done, stream) != cudaSuccess) {
-        return false;
-    }
-    slot.pending = true;
-    return true;
-}
-
-void object_stage_ring_release(object_stage_ring &ring) {
-    object_io_ring_release(ring);
-    for (object_stage_slot &slot : ring.slots) {
-        if (slot.pending && slot.done) {
-            cudaEventSynchronize(slot.done);
-            slot.pending = false;
-        }
-        (void)object_stage_slot_collect_timing(ring, slot, nullptr);
-        if (slot.host) {
-            cudaFreeHost(slot.host);
-            slot.host = nullptr;
-        }
-        slot.host_capacity = 0;
-        if (slot.done) {
-            cudaEventDestroy(slot.done);
-            slot.done = nullptr;
-        }
-        if (slot.copy_start) {
-            cudaEventDestroy(slot.copy_start);
-            slot.copy_start = nullptr;
-        }
-        if (slot.copy_done) {
-            cudaEventDestroy(slot.copy_done);
-            slot.copy_done = nullptr;
-        }
-    }
-    ring.slots.clear();
-    ring.slot_sz = 0;
-    ring.next = 0;
-}
-
-bool object_stage_slot_allocate(
-        object_stage_slot &slot,
-        size_t slot_size,
-        bool create_timing_events) {
-    if (slot_size == 0 || slot.host || slot.done || slot.copy_start || slot.copy_done) return false;
-    (void) ggml_cuda_admit_host_alloc(slot_size); // unified memory: the reserve first, as for device memory
-    if (cudaHostAlloc(&slot.host, slot_size, cudaHostAllocDefault) != cudaSuccess ||
-            cudaEventCreateWithFlags(&slot.done, cudaEventDisableTiming) != cudaSuccess) {
-        if (slot.host) cudaFreeHost(slot.host);
-        if (slot.done) cudaEventDestroy(slot.done);
-        slot.host = nullptr;
-        slot.done = nullptr;
-        return false;
-    }
-    slot.host_capacity = slot_size;
-    if (create_timing_events &&
-            (cudaEventCreate(&slot.copy_start) != cudaSuccess ||
-             cudaEventCreate(&slot.copy_done) != cudaSuccess)) {
-        if (slot.copy_start) cudaEventDestroy(slot.copy_start);
-        if (slot.copy_done) cudaEventDestroy(slot.copy_done);
-        slot.copy_start = nullptr;
-        slot.copy_done = nullptr;
-    }
-    return true;
-}
-
-bool object_stage_slot_ensure_capacity(
-        object_stage_slot &slot,
-        size_t slot_size,
-        bool create_timing_events) {
-    if (slot_size == 0 || slot.pending) return false;
-    const bool has_timing = slot.copy_start && slot.copy_done;
-    if (slot.host && slot.done && slot.host_capacity >= slot_size &&
-            (!create_timing_events || has_timing)) {
-        return true;
-    }
-    if (slot.host) cudaFreeHost(slot.host);
-    if (slot.done) cudaEventDestroy(slot.done);
-    if (slot.copy_start) cudaEventDestroy(slot.copy_start);
-    if (slot.copy_done) cudaEventDestroy(slot.copy_done);
-    slot.host = nullptr;
-    slot.host_capacity = 0;
-    slot.done = nullptr;
-    slot.copy_start = nullptr;
-    slot.copy_done = nullptr;
-    slot.timing_pending = false;
-    return object_stage_slot_allocate(slot, slot_size, create_timing_events);
-}
-
-bool object_stage_ring_allocate(
-        object_stage_ring &ring,
-        size_t slot_size,
-        size_t slot_count,
-        bool create_timing_events) {
-    if (ring.failed || slot_size == 0 || slot_count == 0 || !ring.slots.empty()) return false;
-
-    ring.slot_sz = slot_size;
-    ring.slots.resize(slot_count);
-    for (object_stage_slot &slot : ring.slots) {
-        if (!object_stage_slot_allocate(slot, ring.slot_sz, create_timing_events)) {
-            object_stage_ring_release(ring);
-            ring.failed = true;
-            return false;
-        }
-    }
-    return true;
-}
-
-} // namespace ggml_moe_common
+}} // namespace ssd::io

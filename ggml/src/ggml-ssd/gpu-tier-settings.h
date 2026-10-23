@@ -13,6 +13,7 @@ namespace gpu {
 struct settings_api {
     uint32_t version;
     size_t size;
+    size_t runtime_services_size;
     void * (*create)(const settings::snapshot *, const runtime_services *, char *, size_t) noexcept;
 };
 using get_settings_api = const settings_api * (*)();

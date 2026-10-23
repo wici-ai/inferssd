@@ -4,6 +4,7 @@
 #include "kimi-vram-tier-api.h"
 #include "kimi-vram-location-api.h"
 #include "kernels.h"
+#include "transport.h"
 #include "../gpu-tier-settings.h"
 #include "../testing/tier.h"
 
@@ -24,9 +25,11 @@ struct provider_v1 {
     const kimi_vram_policy_api * policy;
     const settings_api * settings;
     const testing::api * testing;
+    const transport_v1 * transport;
     bool (*device_is_unified)(int);
     int (*device_ordinal)(ggml_backend_t);
     bool (*attach_services)(ggml_backend_t, const runtime_services *, char *, size_t) noexcept;
+    void * (*stream)(ggml_backend_t);
 };
 using get_provider_v1 = const provider_v1 * (*)();
 }} // namespace ssd::gpu

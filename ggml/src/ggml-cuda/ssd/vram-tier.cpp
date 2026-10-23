@@ -5,6 +5,9 @@
 #include "kimi-mxfp4-batch.h"
 #include "ggml.h"
 #include "ggml-ssd/gpu/kernels.h"
+#include "ggml-ssd/gpu/transport.h"
+#include "ggml-ssd/store/source.h"
+extern "C" const ssd::gpu::transport_v1 * ggml_backend_cuda_ssd_transport_v1();
 #include "backend-functions.h"
 #include "../../ggml-ssd/gpu-tier-settings.h"
 #include "../../ggml-ssd/testing/tier.h"
@@ -194,7 +197,9 @@ struct tier {
     // the expert-pack resolver (ggml-cuda's, found at registration): tensor name, expert, logical bytes, experts ->
     // descriptor, logical offset, bytes
     using resolve_fn=bool (*)(const char *,int,size_t,int64_t,int *,uint64_t *,size_t *);
-    resolve_fn seed_resolve=nullptr;
+    resolve_fn seed_resolve=nullptr; // explicit fixture-only override
+    ssd::store::source_view seed_source{};
+    void * seed_owner=nullptr;
     uint64_t seeds_planned=0,seeds_published=0,seeds_cancelled=0,seeds_freed=0,seed_copies=0,seed_bytes=0;
     double seed_offer_us=0,seed_wait_us=0;
     uint64_t prefill_count=0; // prefills begun: a seed plan is one prefill's
@@ -216,13 +221,16 @@ struct tier {
     std::string failure;
 
     explicit tier(uint64_t b, const tier_options & options = {}, ssd::host::context_client * host = nullptr,
-            const ssd::gpu::cpu_kernels_v1 * kernels = nullptr, int configured_device = -1) : configuration(options), host_client(host),
+            const ssd::gpu::cpu_kernels_v1 * kernels = nullptr, int configured_device = -1,
+            const ssd::store::source_view * source = nullptr, void * transport = nullptr) : configuration(options), host_client(host),
         budget(b), safety_bytes(options.safety_mib << 20), async_upload(options.async_upload),
         memory_trace(options.memory_trace), keep_across_requests(options.keep_across_requests), timing(options.timing),
         elastic_requested(options.elastic), elastic_demand_reclaim(options.demand_reclaim || b == automatic_budget),
         elastic_safety_blocks(options.safety_blocks), elastic_safety_mib(options.margin_mib), elastic_max_slots(options.max_slots),
         fail_malloc_at(options.fail_malloc_at), fail_free_at(options.fail_free_at), deferred_upload(options.deferred_upload) {
         device = configured_device;
+        if (source) seed_source = *source;
+        seed_owner = transport;
         if (kernels) {
             if (!ssd::gpu::valid(kernels)) { throw std::runtime_error("CPU kernels provider incompatible"); }
             cpu = *kernels;
@@ -464,44 +472,45 @@ struct tier {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);reclaimer_armed=false;
     }
     static int seed_offer_thunk(void * p,const char * name,const void * data,size_t expert_bytes,int64_t n,
-            const int32_t * counts,void * ready,void ** done){
+            const int32_t * counts,void * ready,void ** done) noexcept {
         auto * t=static_cast<tier *>(p);
         try{return t->seed_offer(name,static_cast<const char *>(data),expert_bytes,n,counts,static_cast<cudaEvent_t>(ready),done);}
         catch(const std::exception & e){
             std::fprintf(stderr,"[kimi_vram_seed] event=offer status=fail error=%s\n",e.what());
             if(done)*done=nullptr;
             return -1;
-        }
+        }catch(...){if(done)*done=nullptr;return -1;}
     }
     void register_seed(){
-        // The legacy registry routes only by device and resolves keys through a
-        // process-global source index. A managed tier must wait for explicit
-        // per-context source and offer ownership before it can register there.
-        if(host_client){
-            std::fprintf(stderr,"[ssd.tier] legacy prefill seeding disabled: context source routing is required\n");
-            return;
-        }
         if(seed_registered || device<0)return;
-        if(!seed_resolve)seed_resolve=ggml_cuda_moe_expert_pack_resolve_raw_direct_shape;
-        auto reg=ggml_cuda_moe_seed_register;
-        seed_registered=reg && reg(device,seed_offer_thunk,this);
+        if(!seed_owner || !seed_source.resolve){
+            if(configuration.fixture)return;
+            throw std::runtime_error("missing context prefill seed owner or source");
+        }
+        const auto * transport=ggml_backend_cuda_ssd_transport_v1();
+        if(!transport->seed_register(seed_owner,seed_offer_thunk,this))
+            throw std::runtime_error("context prefill seed registration failed");
+        seed_registered=true;
     }
     void unregister_seed(){
         if(!seed_registered)return;
-        auto unreg=ggml_cuda_moe_seed_unregister;
-        if(!unreg || !unreg(device,seed_offer_thunk,this))throw std::runtime_error("CUDA prefill seed unregister failed");
+        const auto * transport=ggml_backend_cuda_ssd_transport_v1();
+        if(!transport->seed_unregister(seed_owner,seed_offer_thunk,this))
+            throw std::runtime_error("context prefill seed unregister failed");
         seed_registered=false;
     }
     // A seed's key as the sink keys a decode request's payload (kimi_vram_source_identity): each role's file, its
     // logical offset and its logical bytes, from the resolver the sink's sources come from.
     bool seed_key(int layer,int expert,kimi_vram_request & r){
         static const char * const names[3]={"up","gate","down"};
-        if(!seed_resolve)return false;
+        if(!seed_source.resolve && !(configuration.fixture && seed_resolve))return false;
         r={};r.layer=layer;r.expert=expert;
         for(int i=0;i<3;++i){
             char name[64];std::snprintf(name,sizeof(name),"blk.%d.ffn_%s_exps.weight",layer,names[i]);
             int fd=-1;uint64_t offset=0;size_t bytes=0;
-            if(!seed_resolve(name,expert,role_bytes[i],n_experts,&fd,&offset,&bytes) || fd<0)return false;
+            const bool resolved=seed_source.resolve?seed_source.resolve(seed_source.userdata,name,expert,role_bytes[i],n_experts,&fd,&offset,&bytes):
+                seed_resolve(name,expert,role_bytes[i],n_experts,&fd,&offset,&bytes);
+            if(!resolved || fd<0 || bytes!=role_bytes[i])return false;
             auto it=seed_files.find(fd);
             if(it==seed_files.end()){struct stat st={};if(fstat(fd,&st))return false;it=seed_files.emplace(fd,st).first;}
             r.role[i]=kimi_vram_source_identity(&it->second,offset,role_bytes[i]);
@@ -2599,6 +2608,7 @@ void * create_configured_tier(const ssd::settings::snapshot * input, const ssd::
     try {
         if (!input) { throw std::runtime_error("missing typed GPU tier settings"); }
         if (!services || !services->host) { throw std::runtime_error("missing process host budget client"); }
+        if (!services->source || !services->source->resolve || !services->gpu_transport) { throw std::runtime_error("missing context GPU source or transport"); }
         if (services->gpu_device < 0) { throw std::runtime_error("invalid configured CUDA device"); }
         if (!ssd::gpu::valid(services->cpu)) { throw std::runtime_error("missing CPU kernels provider"); }
         const auto settings = *input;
@@ -2629,7 +2639,7 @@ void * create_configured_tier(const ssd::settings::snapshot * input, const ssd::
             options.memory_trace = debug.ledger;
             options.timing = debug.profile;
         }
-        return new tier(bytes, options, services->host, services->cpu, services->gpu_device);
+        return new tier(bytes, options, services->host, services->cpu, services->gpu_device, services->source, services->gpu_transport);
     } catch (const std::exception & e) {
         if (error && size) { std::snprintf(error, size, "%s", e.what()); }
         return nullptr;
@@ -2672,7 +2682,7 @@ extern "C" const kimi_vram_prefill_api * kimi_vram_prefill_get_api(){
 }
 
 extern "C" const ssd::gpu::settings_api * ggml_backend_cuda_ssd_tier_settings_get_api() {
-    static const ssd::gpu::settings_api api = { 1, sizeof(ssd::gpu::settings_api), create_configured_tier };
+    static const ssd::gpu::settings_api api = { 2, sizeof(ssd::gpu::settings_api), sizeof(ssd::runtime_services), create_configured_tier };
     return &api;
 }
 

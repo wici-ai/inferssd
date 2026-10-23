@@ -18,5 +18,4 @@ size_t ggml_cuda_moe_stream_mm_operand_bytes(void *, int, int64_t, int64_t);
 bool ggml_cuda_moe_stream_mm_quantize(void *, int, const float *, const int32_t *, int64_t, int64_t, int64_t, void *, cudaStream_t);
 bool ggml_cuda_moe_stream_mm(void *, int, const void *, int64_t, int64_t, const void *, int64_t, float *, cudaStream_t);
 size_t ggml_cuda_moe_stream_mm_device_bytes(void *);
-bool ggml_cuda_moe_expert_pack_resolve_raw_direct_shape(const char *, int, size_t, int64_t, int *, uint64_t *, size_t *);
 }
