@@ -3944,12 +3944,6 @@ static void ggml_compute_forward_mul_mat_id_generic(
     uint64_t * fallback_touch_us =
         incr_ptr_aligned(&wdata_cur, n_as*sizeof(uint64_t), sizeof(uint64_t));
 
-    int64_t * gpu_tail_row_counts =
-        incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
-
-    struct mmid_row_mapping * gpu_tail_matrix_rows =
-        incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
-
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
     if (src1->type != vec_dot_type) {
@@ -6107,10 +6101,6 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as * sizeof(void *) + sizeof(void *);
                         // CPU fallback source-touch profile timings
                         cur += n_as * sizeof(uint64_t) + sizeof(uint64_t);
-                        // GPU top-k / CPU-tail split counts
-                        cur += n_as * sizeof(int64_t) + sizeof(int64_t);
-                        // GPU top-k / CPU-tail split rows
-                        cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                     } break;
                 case GGML_OP_MOE_FUSED_UP_GATE:
                     {
@@ -6126,14 +6116,6 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
-                        // The restored common adapter partitions prompt rows between
-                        // GPU and CPU.  Only the validated Kimi-K3 expert-count and
-                        // role-slice shape has its own local workspace layout.
-                        const size_t expert_bytes = (size_t) src0->ne[1] * src0->nb[1];
-                        if (!ggml_kimi_uses_k3_local_adapter(n_as, expert_bytes)) {
-                            cur += n_as * sizeof(int64_t) + sizeof(int64_t);
-                            cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
-                        }
                     } break;
                 case GGML_OP_OUT_PROD:
                     {

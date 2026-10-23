@@ -1272,12 +1272,6 @@ static void ggml_compute_forward_mul_mat_id_kimi(
     uint64_t * fallback_touch_us =
         incr_ptr_aligned(&wdata_cur, n_as*sizeof(uint64_t), sizeof(uint64_t));
 
-    int64_t * gpu_tail_row_counts =
-        incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
-
-    struct mmid_row_mapping * gpu_tail_matrix_rows =
-        incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
-
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
     const uint64_t kimi_cpu_moe_convert_start = (kimi_cpu_moe_profile && ith == 0) ? ggml_time_us() : 0;
