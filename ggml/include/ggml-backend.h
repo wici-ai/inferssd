@@ -321,6 +321,16 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
+    // Admission transaction for an actual graph. Start after reset, preserving
+    // explicit backend assignments. The graph is split exactly once; its source
+    // pointers borrow scheduler metadata until execution/reset. Hold resource
+    // admission between prepare and reserve, then allocate the prepared graph.
+    // Do not mutate or re-split it. Reset/failure invalidates the transaction;
+    // discard that graph before starting another one.
+    GGML_API bool ggml_backend_sched_prepare_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph, size_t * sizes);
+    GGML_API bool ggml_backend_sched_reserve_prepared(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    GGML_API bool ggml_backend_sched_alloc_prepared(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
 

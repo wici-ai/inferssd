@@ -788,7 +788,11 @@ struct ggml_backend_sched_split {
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
+    bool is_split; // source pointers already borrow this scheduler's copy metadata
     bool auto_reserve; // explicit per-context fallback policy; default true
+    struct ggml_cgraph * prepared_graph;
+    uint64_t prepared_uid;
+    bool prepared_reserved;
 
     int n_backends;
 
@@ -1166,10 +1170,13 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    sched->prepared_graph = nullptr;
+    sched->prepared_reserved = false;
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
+    sched->is_split = true;
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -2034,6 +2041,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    sched->prepared_graph = nullptr;
+    sched->prepared_reserved = false;
+    sched->is_split = false;
     if (sched->ssd_hooks) { sched->ssd_hooks->reset(sched->ssd_userdata); }
 
     // reset state for the next run
@@ -2063,18 +2073,7 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, sizes);
 }
 
-bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
-    GGML_ASSERT(sched);
-    GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
-
-    ggml_backend_sched_synchronize(sched);
-
-    ggml_backend_sched_split_graph(sched, measure_graph);
-
-    if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
-        return false;
-    }
-
+static bool ggml_backend_sched_reserve_backend_scratch(ggml_backend_sched_t sched) {
     // each backend sizes its scratch memory for its splits now, rather than while the graph runs
     bool ok = true;
     std::vector<struct ggml_cgraph *> graphs;
@@ -2092,15 +2091,84 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
         ok = backend->iface.graph_reserve(backend, graphs.data(), (int) graphs.size());
     }
 
-    ggml_backend_sched_reset(sched);
-
     return ok;
+}
+
+bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
+    ggml_backend_sched_synchronize(sched);
+    ggml_backend_sched_split_graph(sched, measure_graph);
+    const bool ok = ggml_gallocr_reserve_n(sched->galloc, &sched->graph,
+        sched->node_backend_ids, sched->leaf_backend_ids) && ggml_backend_sched_reserve_backend_scratch(sched);
+    ggml_backend_sched_reset(sched);
+    return ok;
+}
+
+bool ggml_backend_sched_prepare_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph, size_t * sizes) {
+    GGML_ASSERT(sched && graph && sizes);
+    GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
+    // Explicit assignments mark is_reset=false without creating any copies.
+    // They must survive; only an actual previous split prevents preparation.
+    if (sched->is_alloc || sched->is_split || sched->prepared_graph) {
+        if (sched->prepared_graph) { ggml_backend_sched_reset(sched); }
+        return false;
+    }
+    ggml_backend_sched_synchronize(sched);
+    // Copies are selected before the sole split and stay fixed through compute.
+    sched->cur_copy = sched->next_copy;
+    sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
+    ggml_backend_sched_split_graph(sched, graph);
+    ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph,
+        sched->node_backend_ids, sched->leaf_backend_ids, sizes);
+    sched->prepared_graph = graph;
+    sched->prepared_uid = graph->uid;
+    return true;
+}
+
+static bool ggml_backend_sched_is_prepared(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    return !sched->is_alloc && sched->prepared_graph == graph && graph && graph->uid == sched->prepared_uid;
+}
+
+bool ggml_backend_sched_reserve_prepared(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    GGML_ASSERT(sched);
+    if (!ggml_backend_sched_is_prepared(sched, graph) || sched->prepared_reserved) {
+        if (sched->prepared_graph) { ggml_backend_sched_reset(sched); }
+        return false;
+    }
+    if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids) ||
+            !ggml_backend_sched_reserve_backend_scratch(sched)) {
+        ggml_backend_sched_reset(sched);
+        return false;
+    }
+    sched->prepared_reserved = true;
+    return true;
+}
+
+bool ggml_backend_sched_alloc_prepared(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    GGML_ASSERT(sched);
+    if (!ggml_backend_sched_is_prepared(sched, graph) || !sched->prepared_reserved) {
+        if (sched->prepared_graph) { ggml_backend_sched_reset(sched); }
+        return false;
+    }
+    if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+        ggml_backend_sched_reset(sched);
+        return false;
+    }
+    sched->prepared_graph = nullptr;
+    sched->prepared_reserved = false;
+    sched->is_alloc = true;
+    return true;
 }
 
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
+    if (sched->prepared_graph) {
+        ggml_backend_sched_reset(sched);
+        return false;
+    }
 
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
@@ -2124,6 +2192,10 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    if (sched->prepared_graph) {
+        ggml_backend_sched_reset(sched);
+        return GGML_STATUS_ALLOC_FAILED;
+    }
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }

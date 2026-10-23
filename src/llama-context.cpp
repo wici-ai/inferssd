@@ -1783,8 +1783,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // The managed scheduler cannot grow implicitly. Reserve the real graph
         // under the same admission path used for worst-case load-time graphs.
-        if ((cpu_sink_runtime && !reserve_compute_graph(gf, ubatch.n_tokens > ubatch.n_seqs && !cpu_sink_decode_active)) ||
-                !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        const bool allocated = cpu_sink_runtime ?
+            reserve_compute_graph(gf, ubatch.n_tokens > ubatch.n_seqs && !cpu_sink_decode_active) &&
+                ggml_backend_sched_alloc_prepared(sched.get(), gf) :
+            ggml_backend_sched_alloc_graph(sched.get(), gf);
+        if (!allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             // A refused graph is still parameterized but has no valid storage.
             // Drain before dropping metadata and prevent same-shape reuse on a
@@ -1825,6 +1828,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
+        discard_failed_graph();
         return nullptr;
     }
 
@@ -2885,14 +2889,17 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill) {
         }
     }
     std::vector<size_t> required(backend_ptrs.size(), 0);
-    ggml_backend_sched_reserve_size(sched.get(), graph, required.data());
+    if (!ggml_backend_sched_prepare_graph(sched.get(), graph, required.data())) { return false; }
     uint64_t host_bytes = 0, device_bytes = 0;
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         // Query AFTER the probe: it can have released chunks even when the
         // replacement's total bytes fit inside the previous aggregate size.
         if (required[i] > ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i])) {
             auto & bytes = ggml_backend_buft_is_host(backend_buft[i]) ? host_bytes : device_bytes;
-            if (required[i] > UINT64_MAX - bytes) { return false; }
+            if (required[i] > UINT64_MAX - bytes) {
+                ggml_backend_sched_reset(sched.get());
+                return false;
+            }
             bytes += required[i];
         }
     }
@@ -2901,9 +2908,10 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill) {
     auto admitted = cpu_sink_runtime->take_room(host_bytes, device_bytes, pages);
     if (!admitted) {
         LLAMA_LOG_ERROR("%s: host budget refused: %s\n", __func__, admitted.error.c_str());
+        ggml_backend_sched_reset(sched.get());
         return false;
     }
-    if (!ggml_backend_sched_reserve(sched.get(), graph)) { return false; }
+    if (!ggml_backend_sched_reserve_prepared(sched.get(), graph)) { return false; }
     // New host COMPUTE chunks have already been touched by the allocator.
     admitted.value.commit();
     return true;
@@ -2975,6 +2983,9 @@ ggml_cgraph * llama_context::graph_reserve(
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;
     }
+    // This independent measure graph is not executed. Keep its reservation,
+    // then retire its prepared metadata before a real graph is built.
+    if (!split_only && cpu_sink_runtime) { ggml_backend_sched_reset(sched.get()); }
 
     return gf;
 }
