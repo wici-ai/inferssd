@@ -62,32 +62,32 @@ int main() { try {
         t.phase_complete(true);
         require(t.table->slots.size()==first_decode_slots && t.grow_events==(unified?0:1),
                 "duplicate decode phase grew the arena twice");
-        // Cold prefill allocates its tier against the large prompt graph. The
+        // A tier created during prefill is measured against the large prompt graph. The
         // prefill_done callback restores the decode graph before the first
         // decode begin(), so it must re-arm and complete one grow here. Once
         // begin() adopts the arena, request_end must not attempt a second grow
         // around potentially live deferred work.
-        t.cold_prefill_admission_phase=t.adopt_next_decode=true;t.have_token=false;t.active=false;t.decode_growth_done=true;
-        const uint64_t before_cold_transition=t.grow_events;
+        t.adopt_next_decode=true;t.have_token=false;t.active=false;t.decode_growth_done=true;
+        const uint64_t before_prefill_transition=t.grow_events;
         t.phase_complete(true);
         if(!unified){
-            require(t.decode_growth_done && t.grow_events==before_cold_transition+1,
-                    "cold-prefill decode graph transition did not re-arm growth");
+            require(t.decode_growth_done && t.grow_events==before_prefill_transition+1,
+                    "prefill-created tier decode graph transition did not re-arm growth");
             t.begin(17,2,true);
         }else{
             // Re-armed there, grown at the boundary after the first decode step (token 2 here).
-            require(!t.decode_growth_done && t.grow_events==before_cold_transition,
+            require(!t.decode_growth_done && t.grow_events==before_prefill_transition,
                     "unified memory grew at the decode phase boundary");
             t.begin(17,2,true);
             require(!t.decode_growth_done,"unified memory grew before the first decode step ended");
             t.begin(17,3,true);
-            require(t.decode_growth_done && t.grow_events==before_cold_transition+1 && t.table->slots.size()==53,
+            require(t.decode_growth_done && t.grow_events==before_prefill_transition+1 && t.table->slots.size()==53,
                     "unified memory did not grow after the first decode step");
         }
-        const uint64_t after_cold_adopt=t.grow_events;
+        const uint64_t after_prefill_adopt=t.grow_events;
         t.phase_complete(true);
-        require(!t.cold_prefill_admission_phase && t.grow_events==after_cold_adopt,
-                "request end repeated cold-prefill decode growth");
+        require(!t.adopt_next_decode && t.grow_events==after_prefill_adopt,
+                "request end repeated prefill-created tier decode growth");
         t.prepare_prefill_reclaim();
         require(t.elastic_active && !t.arena && t.blocks.size()==2 && t.table->slots.size()==20,
                 "elastic base was not split into 16-slot blocks");

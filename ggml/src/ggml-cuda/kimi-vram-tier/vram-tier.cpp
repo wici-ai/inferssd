@@ -231,14 +231,6 @@ struct tier {
     double deferred_wait_us=0;
     bool (*deferred_hook)(void *)=nullptr;void * deferred_hook_arg=nullptr; // tests: runs before each copy, false fails it
     std::string failure;
-    struct native_pin { kimi_cache_location_lease lease; int slot; kimi_vram_request key; };
-    std::vector<native_pin> native_pins;
-    std::vector<kimi_vram_request> native_candidates;
-    std::vector<float *> native_outputs;
-    uint64_t native_generation=0;
-    uint64_t native_queries=0,native_query_hits=0,native_gpu_jobs=0;
-    int native_latent=0,native_hidden=0;
-    bool native_batch=false,native_begun=false,native_launched=false,native_cancelled=false;
 
     explicit tier(uint64_t b):budget(b),safety_bytes(env_size("GGML_KIMI_CPU_SINK_VRAM_SAFETY_MIB",512,8192)<<20),
         async_upload(env_size("GGML_KIMI_CPU_SINK_VRAM_ASYNC_UPLOAD",0,1)!=0),
@@ -433,8 +425,6 @@ struct tier {
             table?table->minimum_count:0,int(async_upload),table?int(table->global_pool):0,table?table->half_life:2,int(deferred_upload),int(elastic_active),int(elastic_demand_reclaim),blocks.size(),base_slots,elastic_safety_blocks,elastic_safety_mib,
             (unsigned long long)proactive_blocks,(unsigned long long)reactive_blocks,
             (unsigned long long)base_blocks_reclaimed,int(poisoned));
-        if(native_queries)std::fprintf(stderr,"[kimi_vram_native] reason=%s queries=%llu ready_hits=%llu gpu_jobs=%llu\n",reason,
-            (unsigned long long)native_queries,(unsigned long long)native_query_hits,(unsigned long long)native_gpu_jobs);
     }
     bool has_storage() const{return arena || !blocks.empty();}
     char * slot_base(size_t slot) const{
@@ -443,10 +433,10 @@ struct tier {
         if(slot>=slot_locations.size() || !slot_locations[slot])throw std::runtime_error("VRAM elastic slot is unavailable");
         return slot_locations[slot];
     }
-    // Slots in use by anything but a deferred upload: a layer, a residency lease, a native batch, grouped prefill.
+    // Slots in use by anything but a deferred upload: a layer, a residency lease or grouped prefill.
     bool busy(){
         if((table && (table->in_flight || table->lease_generation || table->native_pinned())) || live_ready_generation ||
-                native_batch || !native_pins.empty() || prefill_live)return true;
+                prefill_live)return true;
         std::lock_guard<std::mutex> lock(mutex);
         return !done || queued || prefill_queued || !upload_jobs.empty() || !pending_uploads.empty();
     }
@@ -989,7 +979,6 @@ struct tier {
         cv.wait(lock,[&]{return std::all_of(deferred.begin(),deferred.end(),[](const deferred_job & d){return d.completed;});});
     }
     void release(){
-        if(!native_pins.empty())throw std::runtime_error("release with native VRAM leases");
         memory_sample("before_release");
         const auto release_start=memory_trace?clock_type::now():clock_type::time_point{};
         drain();drain_deferred();release_mxfp4_accumulator();release_group();
@@ -1011,8 +1000,7 @@ struct tier {
         prefill_live=false;prefill_generation=0;prefill_queued=false;prefill_slots.clear();prefill_input.clear();
         {std::lock_guard<std::mutex> lock(mutex);prefill_launched=false;}
         prefill_routes.clear();prefill_weights.clear();prefill_output.clear();prefill_transient.clear();prefill_job_stats={};
-        native_batch=native_begun=native_launched=native_cancelled=false;
-        native_candidates.clear();native_outputs.clear();work.clear();output_rows.clear();
+        work.clear();output_rows.clear();
         {std::lock_guard<std::mutex> lock(mutex);
             for(auto & task:host_pending)return_host_events(task);
             host_pending.clear();host_done.clear();host_down.clear();host_queued=false;layer_input_ready=false;}
@@ -1022,7 +1010,6 @@ struct tier {
     void begin(uint64_t e,uint64_t t,bool decode){
         prefill_transient_phase=!decode;
         if(!decode)++prefill_count;
-        if(native_batch || !native_pins.empty())throw std::runtime_error("begin with native VRAM batch");
         if(live_ready_generation)throw std::runtime_error("begin with live VRAM residency lease");
         if(!decode || !have_token || epoch!=e || token!=t)memory_token_report();
         // Optional retention through prefill. A failure, or a decode token of a
@@ -2365,7 +2352,7 @@ struct tier {
         if(!count || capacity<0 || (capacity && (!out || !aborted)) || wait_layer<-2)throw std::runtime_error("invalid deferred VRAM collect");
         *count=0;
         if(!deferred_upload)throw std::runtime_error("deferred VRAM upload is off in the tier (GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD)");
-        if((table && (table->in_flight || table->lease_generation)) || live_ready_generation || native_batch)
+        if((table && (table->in_flight || table->lease_generation)) || live_ready_generation)
             throw std::runtime_error("deferred VRAM collect inside a layer or a residency lease");
         std::unique_lock<std::mutex> lock(mutex);
         const auto copying=[&]{return std::any_of(deferred.begin(),deferred.end(),[&](const deferred_job & d){
@@ -2411,7 +2398,6 @@ struct tier {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         for(int i=0;i<count;++i)out[i]=table && table->holds(layer,experts[i]);
     }
-    #include "vram-location-provider.inc"
 };
 int fail(tier * t,char * error,size_t size,const std::exception & e){
     if(size)std::snprintf(error,size,"%s",e.what());
@@ -2478,24 +2464,31 @@ int residency_release(void * p,const kimi_vram_ready_lease * lease,char * e,size
 void residency_held(void * p,int32_t layer,const int32_t * experts,int count,uint8_t * out){
     if(!out || count<=0)return;
     std::fill(out,out+count,uint8_t(0));if(p && experts)static_cast<tier *>(p)->held(layer,experts,count,out);}
-// Native callbacks preserve any returned leases on error. The consumer owns
-// cancel+release; the legacy fail() would free their payload too early.
-template<class F> int native_call(F call,char * error,size_t size){
-    try{call();return 0;}catch(const std::exception & e){if(error&&size)std::snprintf(error,size,"%s",e.what());return 1;}
-}
-int location_configure(void * p,int l,int h,char * e,size_t n){return native_call([&]{static_cast<tier *>(p)->native_configure(l,h);},e,n);}
-int location_acquire(void * p,const kimi_cache_location_candidate * c,int count,kimi_cache_location_lease * leases,char * e,size_t n){
-    return native_call([&]{static_cast<tier *>(p)->native_acquire(c,count,leases);},e,n);}
-int location_begin(void * p,const kimi_cache_location_candidate * c,int count,uint32_t base,uint32_t pin,char * e,size_t n){
-    return native_call([&]{static_cast<tier *>(p)->native_begin_layer(c,count,base,pin);},e,n);}
-int location_launch(void * p,const kimi_cache_location_job * jobs,int count,const void * q,size_t bytes,int l,int h,float b,float lb,char * e,size_t n){
-    return native_call([&]{static_cast<tier *>(p)->native_launch(jobs,count,q,bytes,l,h,b,lb);},e,n);}
-int location_admit(void * p,const kimi_cache_location_candidate * c,const void * up,const void * gate,const void * down,int borrow,char * e,size_t n){
-    return native_call([&]{if(!c)throw std::runtime_error("null native VRAM admission");const void * data[]={up,gate,down};static_cast<tier *>(p)->native_admit(*c,data,borrow!=0);},e,n);}
-int location_finish(void * p,char * e,size_t n){return native_call([&]{static_cast<tier *>(p)->native_finish();},e,n);}
-int location_cancel(void * p,char * e,size_t n){return native_call([&]{static_cast<tier *>(p)->native_cancel();},e,n);}
-int location_release(void * p,const kimi_cache_location_lease * leases,int count,char * e,size_t n){
-    return native_call([&]{static_cast<tier *>(p)->native_release(leases,count);},e,n);}
+// Retired implicit-format location ABI. No callback issues native leases.
+// Reuse the allocation-free C-boundary rejection/drain path; borrowed explicit
+// CUDA payloads remain owned until release() has completed every drain.
+int location_configure(void * p,int,int,char * e,size_t n) noexcept {
+    return reject_implicit_format(p,e,n,"implicit cache-location provider retired");}
+int location_acquire(void * p,const kimi_cache_location_candidate *,int count,kimi_cache_location_lease * leases,char * e,size_t n) noexcept {
+    if(leases && count>0 && count<=16)std::fill(leases,leases+count,kimi_cache_location_lease{});
+    return reject_implicit_format(p,e,n,"implicit cache-location provider retired");}
+int location_begin(void * p,const kimi_cache_location_candidate *,int,uint32_t,uint32_t,char * e,size_t n) noexcept {
+    return reject_implicit_format(p,e,n,"implicit cache-location provider retired");}
+int location_launch(void * p,const kimi_cache_location_job *,int,const void *,size_t,int,int,float,float,char * e,size_t n) noexcept {
+    return reject_implicit_format(p,e,n,"implicit cache-location provider retired");}
+int location_admit(void * p,const kimi_cache_location_candidate *,const void *,const void *,const void *,int,char * e,size_t n) noexcept {
+    return reject_implicit_format(p,e,n,"implicit cache-location provider retired");}
+int location_finish(void * p,char * e,size_t n) noexcept {
+    return reject_implicit_format(p,e,n,"implicit cache-location provider retired");}
+int location_cancel(void * p,char * e,size_t n) noexcept {
+    // The consumer treats a nonzero cancel as failure to drain and aborts.
+    // Successful cleanup is still supported even though computation retired.
+    reject_implicit_format(p,e,n,"implicit cache-location provider retired");
+    if(e && n){e[0]=0;}
+    return 0;}
+int location_release(void * p,const kimi_cache_location_lease *,int count,char * e,size_t n) noexcept {
+    if(count==0)return location_cancel(p,e,n);
+    return reject_implicit_format(p,e,n,"implicit cache-location provider retired; no native leases are issued");}
 int host_available(void * p){return p && static_cast<tier *>(p)->format_mode;}
 int host_launch(void * p,const kimi_vram_host_job * jobs,int count,int * accepted,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->launch_host(jobs,count,accepted);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
