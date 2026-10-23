@@ -9,8 +9,8 @@ namespace telemetry {
 result<debug_channels> read_debug_environment() noexcept {
     try {
         debug_channels out;
-        const char *   channels  = std::getenv("SSDASH_DEBUG");
-        const char *   directory = std::getenv("SSDASH_TRACE_DIR");
+        const char *   channels  = std::getenv("INFERSSD_DEBUG");
+        const char *   directory = std::getenv("INFERSSD_TRACE_DIR");
         if (directory) {
             out.trace_dir = directory;
         }
@@ -29,7 +29,7 @@ result<debug_channels> read_debug_environment() noexcept {
             } else if (channel == "ledger") {
                 out.ledger = true;
             } else {
-                return { {}, status::invalid, "unknown SSDASH_DEBUG channel " + channel };
+                return { {}, status::invalid, "unknown INFERSSD_DEBUG channel " + channel };
             }
         }
         return { std::move(out), status::ok, {} };

@@ -228,8 +228,8 @@ result<void> read_settings_file(const std::string & text, const std::string & so
         std::istringstream stream(text);
         std::string        line;
         size_t             line_number = 1;
-        if (!std::getline(stream, line) || trim(line) != "ssdash-settings 1") {
-            return failure<void>(status::invalid, source + ":1: expected ssdash-settings 1");
+        if (!std::getline(stream, line) || trim(line) != "inferssd-settings 1") {
+            return failure<void>(status::invalid, source + ":1: expected inferssd-settings 1");
         }
         std::set<std::string> seen;
         while (std::getline(stream, line)) {
@@ -565,7 +565,7 @@ result<void> reject_retired_environment(const std::vector<std::string> & names) 
             }
             if (retired) {
                 return { status::invalid,
-                         "retired environment variable " + name + "; see docs/ssdash/migrating-from-ssd-llama.md" };
+                         "retired environment variable " + name + "; see docs/inferssd/migrating-from-ssd-llama.md" };
             }
         }
         return {};

@@ -54,7 +54,7 @@ int main(int argc, char ** argv) {
     assert(base.value.integer("expert.source") == nullptr);
     assert(base.value.find("unknown") == nullptr);
     const std::string text =
-        "ssdash-settings 1\n"
+        "inferssd-settings 1\n"
         "cpu.threads = 4 # source=derived; input=measured CPUs\n"
         "cpu.compute_cpus = 2-4\n"
         "expert.source = [\"/path # 1\",\"/unicode-\\ud83d\\udc08\"] # preserved\n"
@@ -79,19 +79,19 @@ int main(int argc, char ** argv) {
            "vram.reserve_mib = 64", "place.costs = cpu_fixed_us=nan", "place.costs = link_gbps=0",
            "place.costs = unknown=1", "place.costs = cpu_fixed_us=1,cpu_fixed_us=2", "vram.budget = \"123\"",
            "expert.source = [1]", "host.expert_cache_mib = 0", "prefetch.depth = 65" }) {
-        const auto rejected = parse("ssdash-settings 1\n" + bad + "\n", "bad.ssd");
+        const auto rejected = parse("inferssd-settings 1\n" + bad + "\n", "bad.ssd");
         if (rejected || rejected.error.find("bad.ssd:2") == std::string::npos) {
             std::cerr << bad << ": " << rejected.error << '\n';
         }
         assert(!rejected && rejected.code == ssd::status::invalid &&
                rejected.error.find("bad.ssd:2") != std::string::npos);
     }
-    assert(!parse("ssdash-settings 1\ncpu.threads=2\ncpu.threads=4\n", "duplicate.ssd"));
+    assert(!parse("inferssd-settings 1\ncpu.threads=2\ncpu.threads=4\n", "duplicate.ssd"));
     assert(!parse("", "empty.ssd"));
-    assert(!parse("ssdash-settings 2\n", "version.ssd"));
-    assert(parse("ssdash-settings 1\nhost.expert_cache_mib=12288\ncpu.threads=8\n", "mac.ssd", {}, "darwin"));
-    assert(!parse("ssdash-settings 1\nvram.budget=auto\n", "mac.ssd", {}, "darwin"));
-    assert(reject_retired_environment({ "TASKRC", "TASKDATA", "SSDASH_DEBUG" }));
+    assert(!parse("inferssd-settings 2\n", "version.ssd"));
+    assert(parse("inferssd-settings 1\nhost.expert_cache_mib=12288\ncpu.threads=8\n", "mac.ssd", {}, "darwin"));
+    assert(!parse("inferssd-settings 1\nvram.budget=auto\n", "mac.ssd", {}, "darwin"));
+    assert(reject_retired_environment({ "TASKRC", "TASKDATA", "INFERSSD_DEBUG" }));
     assert(!reject_retired_environment({ "TASK123_PROBE" }));
     assert(!reject_retired_environment({ "GGML_KIMI_CPU_SINK" }));
     std::vector<override_value> cli;

@@ -71,7 +71,7 @@ std::string                       cli_option(const std::string & key);
                                                const std::string &           literal,
                                                std::vector<override_value> & overrides) noexcept;
 // Empty file_text and source together mean no settings file. A supplied file must start with
-// 'ssdash-settings 1'. Unknown keys, duplicate file keys and invalid dependencies fail.
+// 'inferssd-settings 1'. Unknown keys, duplicate file keys and invalid dependencies fail.
 [[nodiscard]] result<snapshot>    parse(const std::string &                 file_text,
                                         const std::string &                 source,
                                         const std::vector<override_value> & overrides = {},
