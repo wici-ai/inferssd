@@ -12,8 +12,15 @@ from collections.abc import Iterable, Sequence
 from typing import Optional, cast
 
 from inferssd.loop import model as online
-from inferssd.loop.ports import Effects, Engine, EngineFactory, MachineFactory, Post, Segments
-from inferssd.loop.records import ObservationSession
+from inferssd.loop.ports import (
+    Effects,
+    Engine,
+    EngineFactory,
+    MachineFactory,
+    ObservationReader,
+    Post,
+    Segments,
+)
 from inferssd.telemetry.types import Record
 
 
@@ -46,7 +53,7 @@ class Controller:
         engine_factory: EngineFactory,
         post: Post,
         effects: Effects,
-        session: ObservationSession,
+        session: ObservationReader,
     ) -> None:
         (self._engine_factory, self._post) = (engine_factory, post)
         (self._effects, self._session) = (effects, session)

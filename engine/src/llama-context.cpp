@@ -975,6 +975,9 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
         if (active) {
             prefill_copy.begin(now);
         } else {
+            if (ssd_runtime && !ssd_runtime->diagnostics.prefill_copy(
+                    now.bytes - prefill_copy.start.bytes, now.read_us - prefill_copy.start.read_us,
+                    prefill_copy.passes, prefill_copy.tokens)) { return false; }
             LLAMA_LOG_INFO("%s\n", prefill_copy.end(now).c_str());
         }
     }
@@ -1078,6 +1081,8 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
             if (fallback == target && cpu_prefill_request_max_tokens == cpu_prefill_max_tokens) {
                 cpu_prefill_actual_shape_active = true;
                 cpu_prefill_selected_ubatch = target;
+                if (ssd_runtime && !ssd_runtime->diagnostics.prefill_graph(
+                        prefill_tokens, cpu_prefill_configured_ubatch, target)) { return false; }
                 LLAMA_LOG_INFO(
                     "[kimi_cpu_prefill_graph] event=activate requested_tokens=%u selected_ubatch=%u "
                     "configured_max=%u granularity=%u transition_ms=%.3f\n",
@@ -1089,6 +1094,8 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
             if (fallback) {
                 cpu_prefill_actual_shape_active = true;
                 cpu_prefill_selected_ubatch = fallback;
+                if (ssd_runtime && !ssd_runtime->diagnostics.prefill_graph(
+                        prefill_tokens, 0, fallback)) { return false; }
                 char max_tokens[16] = "all";
                 if (cpu_prefill_request_max_tokens != std::numeric_limits<uint32_t>::max()) {
                     snprintf(max_tokens, sizeof(max_tokens), "%u", cpu_prefill_request_max_tokens);

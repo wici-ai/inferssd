@@ -7,8 +7,7 @@ import statistics
 from collections.abc import Iterable, Sequence
 from typing import Union, cast
 
-from inferssd.loop.ports import Model, Point, Segments
-from inferssd.loop.records import ObservationSession
+from inferssd.loop.ports import Model, ObservationReader, Point, Segments
 from inferssd.model.machine_types import Feedback
 from inferssd.model.prefill_feedback import ServedTurn
 from inferssd.model.prefill_feedback import feedback as prefill_feedback
@@ -18,7 +17,7 @@ from inferssd.telemetry.types import Record
 
 
 def served(
-    m: Model, insts: Iterable[str], w0: int, w1: int, *, session: ObservationSession
+    m: Model, insts: Iterable[str], w0: int, w1: int, *, session: ObservationReader
 ) -> tuple[list[Record], Segments, list[Point]]:
     """Turns served so far, in order, from the server instances' directories; plus every decode
     segment's routing (for the replay) and the outside-the-sink points (position, ms,

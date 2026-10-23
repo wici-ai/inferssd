@@ -282,7 +282,7 @@ def test_linux_factory_wires_real_dependencies_and_darwin_rejects(tmp_path, monk
     )
     assert result["engine_factory"].__self__ is value
     assert result["post"] is core.post
-    assert result["session"].__class__.__name__ == "ObservationSession"
+    assert result["session"].__class__.__name__ == "NativeObservationSession"
     value.policy = replace(value.policy, platform="darwin")
     with pytest.raises(ValueError, match="M2"):
         value.controller(

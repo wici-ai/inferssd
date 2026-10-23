@@ -60,6 +60,16 @@ int main() {
     assert(l.find("\"data\":\"" + expected + "\"") != std::string::npos);
     assert(l.find("ssd.context.graph_submit") != std::string::npos);
     assert(r.find("\"tokens\":11") != std::string::npos);
+    // Production observations must still be emitted with both debug channels off.
+    llama_ssd_telemetry controller;
+    assert(controller.bind({}, a.value.get()));
+    assert(controller.prefill_graph(128, 8192, 256));
+    assert(controller.prefill_copy(4096, 7, 1, 128));
+    const auto observed = read(first);
+    assert(observed.find("ssd.prefill.graph") != std::string::npos);
+    assert(observed.find("\"requested_tokens\":128") != std::string::npos);
+    assert(observed.find("ssd.prefill.copy") != std::string::npos);
+    assert(observed.find("\"bytes\":4096") != std::string::npos);
     llama_ssd_telemetry allocation;
     assert(allocation.bind(debug, a.value.get()));
     fail_next_allocation = true;

@@ -47,12 +47,15 @@ int main() {
     require(refused, "existing telemetry file was overwritten");
     for (const auto & path : {first, second}) {
         std::ifstream stream(path);
-        std::string settings, event, extra;
-        require(bool(std::getline(stream, settings)) && bool(std::getline(stream, event)) && !std::getline(stream, extra),
+        std::string settings, contract, event, extra;
+        require(bool(std::getline(stream, settings)) && bool(std::getline(stream, contract)) &&
+                bool(std::getline(stream, event)) && !std::getline(stream, extra),
             "event count differs");
         require(settings.find("\"ev\":\"ssd.settings\",\"seq\":0") != std::string::npos,
             "effective settings were not the first event");
-        require(event.find("\"seq\":1") != std::string::npos, "per-context sequence differs");
+        require(contract.find("\"ev\":\"ssd.controller.begin\",\"seq\":1") != std::string::npos,
+            "controller observation contract is missing");
+        require(event.find("\"seq\":2") != std::string::npos, "per-context sequence differs");
     }
     const llama_ssd_override invalid[] = {{"cpu.threads", "0"}};
     require(!llama_ssd_options_create(nullptr, invalid, 1, nullptr, error, sizeof(error)) && error[0],

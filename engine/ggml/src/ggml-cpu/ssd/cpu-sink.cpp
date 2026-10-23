@@ -1932,7 +1932,23 @@ struct kimi_cpu_sink {
             const auto payload = out.str();
             const auto read = configuration.events->event("ssd.io.read", payload);
             if (!read) { return read; }
-            const auto place = configuration.events->event("ssd.place.layer", payload);
+            // These routes are the controller API, independent of optional debug
+            // logging. Read only after the layer's workers and readers have drained.
+            std::ostringstream routes;
+            routes.imbue(std::locale::classic());
+            routes << payload.substr(0, payload.size() - 1) << ",\"selected_experts\":[";
+            for (size_t i = 0; i < requests.size(); ++i) { routes << (i ? "," : "") << requests[i].id; }
+            routes << "],\"vram_hit\":[";
+            for (size_t i = 0; i < requests.size(); ++i) {
+                routes << (i ? "," : "") << (requests[i].vram_slot >= 0 ? "true" : "false");
+            }
+            routes << "],\"cache_hit\":[";
+            for (size_t i = 0; i < requests.size(); ++i) {
+                routes << (i ? "," : "") << (requests[i].cache_hit >= 0 ? "true" : "false");
+            }
+            routes << "]}";
+            if (!routes) { return { ssd::status::resource, "controller route serialization failed" }; }
+            const auto place = configuration.events->event("ssd.place.layer", routes.str());
             if (!place) { return place; }
             return {};
         } catch (const std::bad_alloc &) {

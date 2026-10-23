@@ -148,6 +148,8 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
         events = std::move(opened.value);
         const auto published = events->settings(settings);
         if (!published) { throw std::runtime_error(published.error); }
+        const auto contract = events->event("ssd.controller.begin", "{\"schema\":1}");
+        if (!contract) { throw std::runtime_error(contract.error); }
     }
     const auto diagnostics_bound = diagnostics.bind(debug, events.get());
     if (!diagnostics_bound) { throw std::runtime_error(diagnostics_bound.error); }

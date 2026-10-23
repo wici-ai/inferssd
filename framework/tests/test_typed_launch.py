@@ -200,7 +200,7 @@ def test_runtime_uses_typed_resolution_and_keeps_owned_process_port(tmp_path, mo
     )
     assert engine.ok and captured["result"].argv[1:3] == ("-m", spec.model)
     env = dict(captured["result"].effective_environment)
-    assert env["INFERSSD_DEBUG"] == "trace,profile"
+    assert "INFERSSD_DEBUG" not in env  # controller observes JSONL without debug logging
     assert "GGML_KIMI_CPU_SINK_TRACE" not in env and "LLAMA_SERVER_PORT" not in env
     engine.stop()
     assert effects.events[-1] == ("busy", 8080)

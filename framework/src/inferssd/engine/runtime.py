@@ -23,11 +23,11 @@ from inferssd.launch.recorded import run_indexer
 from inferssd.launch.typed import LaunchSpec, reject_legacy_environment, resolve_typed
 from inferssd.launch.types import LaunchInput, Output, Resolution
 from inferssd.loop.controller import Controller
-from inferssd.loop.records import ObservationSession
 from inferssd.loop.typed_controller import TypedController
 from inferssd.model.typed import TypedMachine
 from inferssd.plan.recorded import DirectoryArtifacts
 from inferssd.platform.policy import Policy
+from inferssd.telemetry.controller import NativeObservationSession
 from inferssd.telemetry.files import LocalArmFiles
 
 
@@ -133,13 +133,6 @@ class Runtime:
         ) -> dict[str, str]:
             reject_legacy_environment(environment)
             output = dict(environment)
-            if configured is not None:
-                channels = output.get("INFERSSD_DEBUG", "")
-                selected = channels.split(",") if channels else []
-                for channel in ("trace", "profile"):
-                    if channel not in selected:
-                        selected.append(channel)
-                output["INFERSSD_DEBUG"] = ",".join(selected)
             return output
 
         def checked(environment: Mapping[str, str], extra: Sequence[str]) -> Resolution:
@@ -268,5 +261,5 @@ class Runtime:
             keeps_history=keeps_history,
             post=post,
             effects=LocalEffects({}, stdout),
-            session=ObservationSession(files=LocalObservations()),
+            session=NativeObservationSession(files=LocalObservations()),
         )

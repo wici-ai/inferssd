@@ -440,6 +440,12 @@ inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, voi
     runtime.read_errors += stats.read_errors;
     runtime.fallback_count += stats.fallback_count;
     runtime.total_us += stats.total_us;
+    if (node.prefill && runtime.services.events) {
+        const auto published = runtime.services.events->event("ssd.prefill.layer",
+            "{\"layer\":" + std::to_string(node.layer) + ",\"n_tokens\":" + std::to_string(ntokens) +
+            ",\"read_bytes\":" + std::to_string(grouped_stats.ssd_bytes) + "}");
+        if (!published) { GGML_ABORT("prefill telemetry failed after layer drain: %s", published.error.c_str()); }
+    }
     if (runtime.calls == 1 || (runtime.services.debug && runtime.services.debug->trace)) {
         if (node.prefill) {
             std::fprintf(stderr,

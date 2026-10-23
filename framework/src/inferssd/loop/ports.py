@@ -12,7 +12,7 @@ from typing import BinaryIO, Optional, Protocol, TextIO
 from inferssd.model.machine_types import Feedback, Prediction
 from inferssd.model.prefill_model import PrefillModel
 from inferssd.model.routing_replay import Replay, Routing, Rows
-from inferssd.telemetry.types import ArmFiles, Record
+from inferssd.telemetry.types import ArmFiles, ControllerArmResult, Record
 
 Segments = list[list[list[list[int]]]]
 Point = tuple[float, float, str]
@@ -113,3 +113,10 @@ class Model(Protocol):
 MachineFactory = Callable[[str], Model]
 EngineFactory = Callable[[str, int, int, str, str, list[str]], Engine]
 Post = Callable[[int, str, Record], object]
+
+
+class ObservationReader(Protocol):
+    @property
+    def files(self) -> ObservationFiles: ...
+
+    def read_arm_cached(self, directory: str, skip: int) -> ControllerArmResult: ...

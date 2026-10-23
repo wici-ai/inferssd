@@ -49,8 +49,8 @@ def finite_integer(value: str) -> int:
     return number
 
 
-def read_events(lines: Iterable[str]) -> Iterable[Event]:
-    for expected, line in enumerate(lines):
+def read_events(lines: Iterable[str], *, start: int = 0) -> Iterable[Event]:
+    for expected, line in enumerate(lines, start):
         try:
             value: object = json.loads(
                 line,

@@ -17,18 +17,22 @@ class ArmFiles(Protocol):
     def gzip_open(self, path: str, mode: str = "r", *, errors: Optional[str] = None) -> TextIO: ...
 
 
-class ArmResult(TypedDict):
+class ControllerArmResult(TypedDict):
+    groups: list[list[TokenKey]]
+    trace: dict[TokenKey, dict[int, TraceLayer]]
+    prof: dict[TokenKey, list[float]]
+    pf_graphs: list[Record]
+
+
+class ArmResult(ControllerArmResult):
     cache_load: Optional[Record]
     new_slot_bytes: float
     new_slot_windows: list[float]
     load_s: Optional[float]
     segments: list[list[dict[int, TraceLayer]]]
-    groups: list[list[TokenKey]]
     window: list[TokenKey]
     lprof: dict[tuple[tuple[int, int], int, int], tuple[float, float]]
     prefill: list[Record]
-    trace: dict[TokenKey, dict[int, TraceLayer]]
-    prof: dict[TokenKey, list[float]]
     admission: list[Record]
     threads: Optional[Record]
     host: Optional[Record]
@@ -39,7 +43,6 @@ class ArmResult(TypedDict):
     tier_min_count: Optional[float]
     lio: dict[TokenKey, list[float]]
     client: list[Record]
-    pf_graphs: list[Record]
     memory: Record
     checkpoint_align: Optional[int]
     ledger: Optional[Record]
