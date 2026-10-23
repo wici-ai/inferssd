@@ -1,8 +1,8 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
-#include "kimi-cpu-sink.h"
-#include "kimi-cpu-prefill.h"
+#include "ssd/cpu-sink.h"
+#include "ssd/cpu-prefill.h"
 #include "ssd/api.h"
 #include "repack.h"
 #include "traits.h"
@@ -885,6 +885,7 @@ static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
         &ggml_backend_cpu_set_ssd_mac_cache,
         &ssd::cpu::take_room_configured,
         &ggml_backend_cpu_set_ssd_runtime_services,
+        sizeof(ssd::runtime_services),
     };
     return &api;
 }
@@ -895,6 +896,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_set_ssd_mac_cache") == 0) {
         return (void *) ggml_backend_cpu_set_ssd_mac_cache;
+    }
+    if (strcmp(name, "ggml_backend_cpu_ssd_kernels_v1") == 0) {
+        return (void *) ssd::cpu::kernels;
     }
     if (strcmp(name, "ggml_backend_cpu_ssd_api_v2") == 0) {
         return (void *) ggml_backend_cpu_ssd_api_v2;

@@ -93,7 +93,7 @@ extern "C" bool kimi_cpu_sink_run_cache_compute(kimi_cpu_sink * sink,
         cache_compute_print(a,sink->cache.epoch,sink->cache.token,layer,local,ok);return ok;
     }
     std::lock_guard<std::mutex> serial(sink->run_mutex);
-    const auto start=sink_clock::now();const uint64_t completed_before=sink->ring.completed;
+    const auto start=sink_clock::now();const uint64_t completed_before=sink->ring.completed();
     sink->current={};sink->requests.clear();sink->begin_observation(up,true);
     // The dedicated trace represents uncomputed/dropped slots too; legacy
     // TIMELINE assumes every request was computed and is not emitted here.
@@ -315,7 +315,7 @@ extern "C" bool kimi_cpu_sink_run_cache_compute(kimi_cpu_sink * sink,
         sink->vram.release_ram_batch(sink->cache);
         if(provider_acquired) {release_leases(gpu_mask);}
         if(provider_begun&&locations.finished){checked(locations.finished(location_context,sink,error,error_size));}
-        collect();sink->current.total_us=elapsed_us(start);sink->current.read_completions=sink->ring.completed-completed_before;sink->current.pending_reads=sink->ring.pending;
+        collect();sink->current.total_us=elapsed_us(start);sink->current.read_completions=sink->ring.completed()-completed_before;sink->current.pending_reads=sink->ring.pending();
         sink->finish_observation();sink->cache_compute_active=false;
         if(stats){*stats=sink->current;}if(decision){*decision=a;}
         cache_compute_print(a,sink->cache.epoch,sink->cache.token,layer,sink->current,true,gpu_mask);return true;
@@ -331,7 +331,7 @@ extern "C" bool kimi_cpu_sink_run_cache_compute(kimi_cpu_sink * sink,
         }
         sink->vram.ram_leases.clear(); // payload owner invalidates only after all work drained
         collect();sink->cache.release();
-        sink->current.total_us=elapsed_us(start);sink->current.read_completions=sink->ring.completed-completed_before;sink->current.pending_reads=sink->ring.pending;
+        sink->current.total_us=elapsed_us(start);sink->current.read_completions=sink->ring.completed()-completed_before;sink->current.pending_reads=sink->ring.pending();
         sink->finish_observation();sink->cache_compute_active=false;
         if(stats){*stats=sink->current;}if(decision){*decision=a;}
         cache_compute_print(a,sink->cache.epoch,sink->cache.token,layer,sink->current,false,gpu_mask);sink_error(error,error_size,e.what());return false;

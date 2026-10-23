@@ -1,5 +1,5 @@
 #pragma once
-#include "ggml-cpu.h"
+#include "ggml-backend.h"
 #ifdef __cplusplus
 extern "C" {
 #endif

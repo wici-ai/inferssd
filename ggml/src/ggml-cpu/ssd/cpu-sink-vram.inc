@@ -135,23 +135,20 @@ struct sink_vram {
             prefill_ssd_gpu_max_experts_per_layer);
         if (!bytes) { return; }
         if (!ready_first) { throw std::runtime_error("GPU tier requires READY_FIRST=1 for ordered reduction"); }
-        auto get_api = reinterpret_cast<kimi_vram_tier_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_tier_get_api"));
-        if (!get_api) { throw std::runtime_error("GPU tier DSO is missing; no fallback"); }
-        api = get_api();
+        if (!configuration.has_gpu) { throw std::runtime_error("GPU provider was not injected; no fallback"); }
+        api = configuration.gpu.api;
         if (!api || api->version != 2 || api->size != sizeof(*api) || !api->create || !api->destroy ||
                 !api->begin || !api->prepare || !api->launch || !api->admit || !api->finish || !api->cancel) {
             throw std::runtime_error("GPU tier ABI mismatch");
         }
-        if (auto get_format = reinterpret_cast<kimi_vram_format_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_format_get_api"))) {
-            format = get_format();
+        if (configuration.gpu.format) {
+            format = configuration.gpu.format;
             if (!format || format->version != 1 || format->size != sizeof(*format) || !format->prepare || !format->launch) {
                 throw std::runtime_error("GPU tier explicit-format ABI mismatch");
             }
         }
         if (prefill_enabled) {
-            auto get_prefill = reinterpret_cast<kimi_vram_prefill_get_api_fn>(
-                dlsym(RTLD_DEFAULT, "kimi_vram_prefill_get_api"));
-            prefill_api = get_prefill ? get_prefill() : nullptr;
+            prefill_api = configuration.gpu.prefill;
             if (!prefill_api || prefill_api->version != 7 || prefill_api->size != sizeof(*prefill_api) ||
                     !prefill_api->prepare || !prefill_api->transient_available || !prefill_api->launch ||
                     !prefill_api->finish || !prefill_api->cancel || !prefill_api->cold_admission_active ||
@@ -160,8 +157,8 @@ struct sink_vram {
             }
             if (!format) { throw std::runtime_error("GPU tier grouped prefill requires the explicit-format ABI"); }
         }
-        if (auto get_elastic = reinterpret_cast<kimi_vram_elastic_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_elastic_get_api"))) {
-            elastic = get_elastic();
+        if (configuration.gpu.elastic) {
+            elastic = configuration.gpu.elastic;
             if (!elastic || elastic->version != 3 || elastic->size != sizeof(*elastic) ||
                     !elastic->phase_complete || !elastic->reserve_accumulate || !elastic->reserve) {
                 throw std::runtime_error("GPU tier elastic lifecycle ABI mismatch");
@@ -169,8 +166,7 @@ struct sink_vram {
         }
         {
             // what the tier holds (the next-layer prefetch asks), and with VRAM_EXCLUSIVE its ready leases
-            auto get = reinterpret_cast<kimi_vram_residency_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_residency_get_api"));
-            residency = get ? get() : nullptr;
+            residency = configuration.gpu.residency;
             if (!residency || residency->version != 2 || residency->size != sizeof(*residency) || !residency->held ||
                     (exclusive && (!residency->acquire || !residency->validate || !residency->release))) {
                 throw std::runtime_error("GPU residency ABI missing or incompatible; no fallback");
@@ -178,8 +174,7 @@ struct sink_vram {
         }
         if (deferred_upload) {
             if (!async_upload || use_locations) { throw std::runtime_error("VRAM_DEFERRED_UPLOAD requires ASYNC_UPLOAD=1 and no CACHE_LOCATIONS"); }
-            auto get = reinterpret_cast<kimi_vram_deferred_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_deferred_get_api"));
-            deferred_api = get ? get() : nullptr;
+            deferred_api = configuration.gpu.deferred;
             if (!deferred_api || deferred_api->version != 2 || deferred_api->size != sizeof(*deferred_api) ||
                     !deferred_api->admit || !deferred_api->collect || !deferred_api->wait) {
                 throw std::runtime_error("GPU tier deferred-upload ABI missing or incompatible; no fallback");
@@ -189,33 +184,32 @@ struct sink_vram {
         if (exclusive || async_upload) { ram_leases.reserve(16); }
         char error[512] = {};
         if (configuration.production) {
-            auto get_settings = reinterpret_cast<ssd::gpu::get_settings_api>(
-                dlsym(RTLD_DEFAULT, "ggml_backend_cuda_ssd_tier_settings_get_api"));
-            const auto * settings_api = get_settings ? get_settings() : nullptr;
-            if (!settings_api || settings_api->version != 1 || settings_api->size != sizeof(*settings_api) || !settings_api->create) {
+            const auto * settings_api = configuration.gpu.settings;
+            if (!settings_api || settings_api->version != 2 || settings_api->size != sizeof(*settings_api) ||
+                    settings_api->runtime_services_size != sizeof(ssd::runtime_services) || !settings_api->create) {
                 throw std::runtime_error("GPU tier typed-settings ABI missing or incompatible");
             }
-            const ssd::runtime_services services{ configuration.events, &configuration.debug, configuration.host };
+            const ssd::runtime_services services{ configuration.events, &configuration.debug, configuration.host,
+                &configuration.gpu, &configuration.cpu, configuration.gpu_device, configuration.source, configuration.gpu_transport };
             context = settings_api->create(&configuration.settings, &services, error, sizeof(error));
         } else {
-            auto get = reinterpret_cast<ssd::gpu::testing::get_api>(dlsym(RTLD_DEFAULT, "ggml_ssd_tier_testing_get_api"));
-            const auto * test_api = get ? get() : nullptr;
-            if (!test_api || test_api->version != 1 || test_api->size != sizeof(*test_api) || !test_api->create) {
+            const auto * test_api = configuration.gpu.testing;
+            if (!test_api || test_api->version != 2 || test_api->size != sizeof(*test_api) || !test_api->create) {
                 throw std::runtime_error("explicit CUDA fixture factory missing");
             }
-            context = test_api->create(bytes, &configuration.policy.tier, error, sizeof(error));
+            context = test_api->create(bytes, &configuration.policy.tier, &configuration.cpu, error, sizeof(error));
         }
         if (!context) { throw std::runtime_error(std::string("GPU tier create: ") + error); }
-        if (auto get_policy = reinterpret_cast<kimi_vram_policy_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_policy_get_api"))) {
-            policy_api = get_policy();
+        if (configuration.gpu.policy) {
+            policy_api = configuration.gpu.policy;
             if (!policy_api || policy_api->version != 3 || policy_api->size != sizeof(*policy_api) ||
                     !policy_api->set_miss_cost || !policy_api->set_host_demand || !policy_api->set_host_floor ||
                     !policy_api->reclaim_host || !policy_api->host_bytes) {
                 throw std::runtime_error("GPU tier admission-policy ABI mismatch");
             }
         }
-        if (auto get_host = reinterpret_cast<kimi_vram_host_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_host_get_api"))) {
-            host_api = get_host();
+        if (configuration.gpu.host) {
+            host_api = configuration.gpu.host;
             if (!host_api || host_api->version != 3 || host_api->size != sizeof(*host_api) ||
                     !host_api->available || !host_api->launch || !host_api->costs || !host_api->register_host ||
                     !host_api->unregister_host || !host_api->costs2) {
@@ -223,8 +217,7 @@ struct sink_vram {
             }
         }
         if (use_locations) {
-            auto get=reinterpret_cast<kimi_vram_location_get_api_fn>(dlsym(RTLD_DEFAULT,"kimi_vram_location_get_api"));
-            location_api=get?get():nullptr;
+            location_api=configuration.gpu.location;
             if(!location_api || location_api->version!=1 || location_api->size!=sizeof(*location_api) ||
                     !location_api->configure || !location_api->view || location_api->view->version!=1 ||
                     location_api->view->size!=sizeof(kimi_cache_location_api)) {

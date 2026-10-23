@@ -4,8 +4,8 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
-#include "kimi-cpu-sink.h"
-#include "kimi-cpu-prefill.h"
+#include "ssd/cpu-sink.h"
+#include "ssd/cpu-prefill.h"
 #include <set>
 #include <limits>
 #include <algorithm>

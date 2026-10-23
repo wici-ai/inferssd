@@ -1,13 +1,14 @@
-#include "kimi-cpu-sink.h"
-#include "kimi-cpu-sink-internal.h"
+#include "ssd/cpu-sink.h"
+#include "ssd/cpu-sink-internal.h"
 #include "ssd/runtime.h"
 #include "ssd/testing.h"
-#include "../ggml-ssd/settings/settings.h"
-#include "../ggml-ssd/gpu-tier-settings.h"
-#include "../ggml-ssd/telemetry/telemetry.h"
-#include "../ggml-ssd/place/layer-plan.h"
-#include "../ggml-ssd/host/page-lock.h"
-#include "kimi-cache-location-api.h"
+#include "ggml-ssd/gpu/provider.h"
+#include "ggml-ssd/settings/settings.h"
+#include "ggml-ssd/gpu-tier-settings.h"
+#include "ggml-ssd/telemetry/telemetry.h"
+#include "ggml-ssd/place/layer-plan.h"
+#include "ggml-ssd/host/page-lock.h"
+#include "ggml-ssd/gpu/kimi-cache-location-api.h"
 
 #include <algorithm>
 #include <array>
@@ -55,12 +56,12 @@ static ssd::result<ssd::host::allocation_ticket> sink_host_failure(ssd::status c
 
 #include <cerrno>
 #include <fcntl.h>
-#include <dlfcn.h>
-#include "../ggml-ssd/host/ledger.h"
-#include "../ggml-ssd/host/arbiter.h"
-#include "kimi-vram-tier-api.h"
-#include "kimi-vram-location-api.h"
-#include <linux/io_uring.h>
+#include "ggml-ssd/host/ledger.h"
+#include "ggml-ssd/host/arbiter.h"
+#include "ggml-ssd/host/expert-cache.h"
+#include "ggml-ssd/gpu/kimi-vram-tier-api.h"
+#include "ggml-ssd/gpu/kimi-vram-location-api.h"
+#include "ggml-ssd/io/linux-ring.h"
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
@@ -96,184 +97,15 @@ static std::runtime_error sys_error(const char * operation) {
     return std::runtime_error(std::string(operation) + ": " + std::strerror(errno));
 }
 
-// Single producer/consumer, owned by the persistent I/O thread. Direct syscalls
-// avoid adding a liburing dependency to the CPU backend.
-struct sink_ring {
-    int fd = -1;
-    void * sq = MAP_FAILED;
-    void * cq = MAP_FAILED;
-    io_uring_sqe * sqes = static_cast<io_uring_sqe *>(MAP_FAILED);
-    size_t sq_size = 0, cq_size = 0, sqes_size = 0;
-    unsigned * sq_head = nullptr, * sq_tail = nullptr, * sq_mask = nullptr, * sq_array = nullptr;
-    unsigned * cq_head = nullptr, * cq_tail = nullptr, * cq_mask = nullptr;
-    io_uring_cqe * cqes = nullptr;
-    unsigned sq_entries = 0;
-    uint64_t pending = 0; // published SQEs whose CQEs have not been consumed
-    uint64_t completed = 0;
-    bool read_fixed = false;
-    bool buffers_registered = false;
-    std::vector<iovec> fixed_buffers;
-    uint64_t register_count = 0, unregister_count = 0;
-
-    ~sink_ring() { close_ring(); }
-
-    void close_ring() {
-        // close(io_uring_fd) starts asynchronous cancellation; it does not make
-        // freeing user buffers safe. Every runtime error must first drain them.
-        if (pending) {
-            std::fprintf(stderr, "[kimi_cpu_sink] undrained I/O at ring destruction; aborting\n");
-            std::abort();
-        }
-        try {
-            unregister_buffers();
-        } catch (const std::exception & e) {
-            std::fprintf(stderr, "[kimi_cpu_sink_io] cannot unregister before buffer release: %s; aborting\n", e.what());
-            std::abort();
-        }
-        if (sqes != MAP_FAILED) { munmap(sqes, sqes_size); }
-        if (cq != MAP_FAILED && cq != sq) { munmap(cq, cq_size); }
-        if (sq != MAP_FAILED) { munmap(sq, sq_size); }
-        if (fd >= 0) { close(fd); }
-        fd = -1;
-        sq = cq = MAP_FAILED;
-        sqes = static_cast<io_uring_sqe *>(MAP_FAILED);
-    }
-
-    void init(unsigned depth, bool fixed) {
-        read_fixed = fixed;
-        io_uring_params p = {};
-        fd = static_cast<int>(syscall(__NR_io_uring_setup, depth, &p));
-        if (fd < 0) { throw sys_error("io_uring_setup (no fallback)"); }
-        sq_size = p.sq_off.array + p.sq_entries * sizeof(unsigned);
-        cq_size = p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe);
-        if (p.features & IORING_FEAT_SINGLE_MMAP) { sq_size = cq_size = std::max(sq_size, cq_size); }
-        sq = mmap(nullptr, sq_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, IORING_OFF_SQ_RING);
-        if (sq == MAP_FAILED) { throw sys_error("mmap io_uring SQ"); }
-        cq = (p.features & IORING_FEAT_SINGLE_MMAP) ? sq :
-            mmap(nullptr, cq_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, IORING_OFF_CQ_RING);
-        if (cq == MAP_FAILED) { throw sys_error("mmap io_uring CQ"); }
-        sqes_size = p.sq_entries * sizeof(io_uring_sqe);
-        sqes = static_cast<io_uring_sqe *>(mmap(nullptr, sqes_size, PROT_READ | PROT_WRITE,
-                                              MAP_SHARED, fd, IORING_OFF_SQES));
-        if (sqes == MAP_FAILED) { throw sys_error("mmap io_uring SQEs"); }
-        auto sq_ptr = [this](unsigned off) { return reinterpret_cast<unsigned *>(static_cast<char *>(sq) + off); };
-        auto cq_ptr = [this](unsigned off) { return reinterpret_cast<unsigned *>(static_cast<char *>(cq) + off); };
-        sq_head = sq_ptr(p.sq_off.head); sq_tail = sq_ptr(p.sq_off.tail);
-        sq_mask = sq_ptr(p.sq_off.ring_mask); sq_array = sq_ptr(p.sq_off.array);
-        cq_head = cq_ptr(p.cq_off.head); cq_tail = cq_ptr(p.cq_off.tail); cq_mask = cq_ptr(p.cq_off.ring_mask);
-        cqes = reinterpret_cast<io_uring_cqe *>(static_cast<char *>(cq) + p.cq_off.cqes);
-        sq_entries = p.sq_entries;
-    }
-
-    void register_buffers(const std::vector<iovec> & buffers) {
-        if (!read_fixed || buffers_registered || pending || buffers.empty() || buffers.size() > UINT16_MAX) {
-            throw std::runtime_error("invalid CPU sink fixed-buffer registration state");
-        }
-        // Retain the indexed ranges for submission checks. Allocate before the
-        // syscall so a C++ allocation failure cannot lose a live registration.
-        fixed_buffers = buffers;
-        int result;
-        do {
-            result = static_cast<int>(syscall(__NR_io_uring_register, fd, IORING_REGISTER_BUFFERS,
-                                              fixed_buffers.data(), static_cast<unsigned>(fixed_buffers.size())));
-        } while (result < 0 && errno == EINTR);
-        if (result < 0) {
-            const auto error = sys_error("IORING_REGISTER_BUFFERS (check RLIMIT_MEMLOCK; no fallback)");
-            fixed_buffers.clear();
-            throw error;
-        }
-        buffers_registered = true;
-        ++register_count;
-        size_t bytes = 0;
-        for (const auto & buffer : fixed_buffers) { bytes += buffer.iov_len; }
-        std::fprintf(stderr, "[kimi_cpu_sink_io] read_fixed=1 registered=%zu bytes=%zu register_count=%llu unregister_count=%llu\n",
-                     fixed_buffers.size(), bytes, static_cast<unsigned long long>(register_count),
-                     static_cast<unsigned long long>(unregister_count));
-    }
-
-    void unregister_buffers() {
-        if (!buffers_registered) { return; }
-        if (pending) { throw std::runtime_error("cannot unregister CPU sink buffers with pending I/O"); }
-        int result;
-        do {
-            result = static_cast<int>(syscall(__NR_io_uring_register, fd, IORING_UNREGISTER_BUFFERS, nullptr, 0));
-        } while (result < 0 && errno == EINTR);
-        if (result < 0) { throw sys_error("IORING_UNREGISTER_BUFFERS"); }
-        buffers_registered = false;
-        fixed_buffers.clear();
-        ++unregister_count;
-        std::fprintf(stderr, "[kimi_cpu_sink_io] read_fixed=1 register_count=%llu unregister_count=%llu\n",
-                     static_cast<unsigned long long>(register_count), static_cast<unsigned long long>(unregister_count));
-    }
-
-    void queue(const kimi_cpu_sink_source & source, void * data, uint64_t tag, bool fixed) {
-        if (!data || reinterpret_cast<uintptr_t>(data) % 4096) {
-            throw std::runtime_error("CPU sink read target is not 4096-byte aligned");
-        }
-        if (fixed && (!read_fixed || !buffers_registered || tag >= fixed_buffers.size() ||
-            data != fixed_buffers[tag].iov_base || source.nbytes > fixed_buffers[tag].iov_len)) {
-            throw std::runtime_error("READ_FIXED buffer is absent or outside its registered range (no fallback)");
-        }
-        const unsigned head = __atomic_load_n(sq_head, __ATOMIC_ACQUIRE);
-        const unsigned tail = *sq_tail;
-        if (tail - head >= sq_entries) { throw std::runtime_error("CPU sink SQ unexpectedly full"); }
-        const unsigned index = tail & *sq_mask;
-        io_uring_sqe & entry = sqes[index];
-        std::memset(&entry, 0, sizeof(entry));
-        entry.opcode = fixed ? IORING_OP_READ_FIXED : IORING_OP_READ;
-        if (fixed) { entry.buf_index = static_cast<uint16_t>(tag); }
-        entry.fd = source.fd_direct;
-        entry.off = source.offset;
-        entry.addr = reinterpret_cast<uint64_t>(data);
-        entry.len = static_cast<unsigned>(source.nbytes);
-        entry.user_data = tag;
-        sq_array[index] = index;
-        __atomic_store_n(sq_tail, tail + 1, __ATOMIC_RELEASE);
-        ++pending;
-    }
-
-    void submit(unsigned count) {
-        while (count) {
-            const int result = static_cast<int>(syscall(__NR_io_uring_enter, fd, count, 0, 0, nullptr, 0));
-            if (result < 0 && errno == EINTR) { continue; }
-            if (result < 0) { throw sys_error("io_uring_enter submit"); }
-            if (!result) { throw std::runtime_error("io_uring submission made no progress"); }
-            count -= static_cast<unsigned>(result);
-        }
-    }
-
-    bool pop(io_uring_cqe & result) {
-        const unsigned head = *cq_head;
-        if (head == __atomic_load_n(cq_tail, __ATOMIC_ACQUIRE)) { return false; }
-        result = cqes[head & *cq_mask];
-        __atomic_store_n(cq_head, head + 1, __ATOMIC_RELEASE);
-        if (!pending) { throw std::runtime_error("CPU sink received an untracked completion"); }
-        --pending;
-        ++completed;
-        return true;
-    }
-
-    void wait() {
-        int result;
-        do {
-            result = static_cast<int>(syscall(__NR_io_uring_enter, fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr, 0));
-        } while (result < 0 && errno == EINTR);
-        if (result < 0) { throw sys_error("io_uring_enter wait"); }
-    }
-
-    void drain(void * userdata, void (*on_completion)(void *, const io_uring_cqe &)) {
-        if (!pending) { return; }
-        // An interrupted/failed submission may have consumed only part of the
-        // published SQEs. Submit the rest before waiting for their completions.
-        const unsigned remaining = *sq_tail - __atomic_load_n(sq_head, __ATOMIC_ACQUIRE);
-        submit(remaining);
-        io_uring_cqe cqe;
-        while (pending) {
-            while (pop(cqe)) { on_completion(userdata, cqe); }
-            if (pending) { wait(); }
-        }
-    }
-};
+using sink_ring = ssd::io::linux_ring;
+using sink_completion = ssd::io::completion;
+template<class T> static T sink_io_value(ssd::result<T> value) {
+    if (!value) { throw std::runtime_error(value.error.empty() ? "direct I/O operation failed" : value.error); }
+    return std::move(value.value);
+}
+static void sink_io_value(ssd::result<void> value) {
+    if (!value) { throw std::runtime_error(value.error.empty() ? "direct I/O operation failed" : value.error); }
+}
 
 struct sink_buffer {
     void * data = nullptr;
@@ -309,6 +141,12 @@ struct sink_configuration {
     ssd::telemetry::debug_channels debug;
     ssd::telemetry::writer * events = nullptr;
     ssd::host::context_client * host = nullptr;
+    ssd::gpu::provider_v1 gpu{};
+    ssd::gpu::cpu_kernels_v1 cpu{};
+    bool has_gpu = false;
+    int gpu_device = 0;
+    const ssd::store::source_view * source = nullptr;
+    void * gpu_transport = nullptr;
     ssd::cpu::testing::execution_policy policy;
 };
 
@@ -377,28 +215,8 @@ struct sink_worker_profile {
     uint64_t phases = 0, no_work_wakeups = 0;
 };
 
-struct sink_request {
-    kimi_cpu_sink_source role[3];
-    float weight;
-    int32_t id = -1;
-    int cache_hit = -1;
-    int cache_admit = -1;
-    int vram_slot = -1;
-    bool vram_transient = false;
-    bool vram_ssd_transient = false;
-    bool vram_ssd_streaming = false;
-    int vram_ssd_staging = -1;
-    double lane_start_us = 0.0; // MXFP4 grouped prefill: predicted start on its lane (CPU or GPU)
-    int prefill_routes = 0;     // grouped prefill: the expert's distinct tokens
-    bool cache_lease = false;
-    bool trace_ram_resident_before = false;
-    size_t io_slot = 0;
-    uint64_t read_bytes = 0; // positive CQE bytes; only the I/O thread writes
-    void * read_target[3] = {}; // fixed before publishing the I/O job
-    bool cache_only = false; // must never allocate a read target or submit I/O
-    uint64_t ready_us = 0; // all successful CQEs, published under io_mutex
-    uint64_t events[8] = {}; // cache-compute audit; read only after I/O drain
-};
+using sink_request = ssd::host::expert_request;
+
 
 // One bounded, ordinary anonymous mapping. Entries never point into the I/O
 // ring and are never registered with io_uring or CUDA. The run mutex owns all
@@ -433,12 +251,35 @@ static int sink_fast_cpus() {
     return int(cut);
 }
 
-// Whether the GPU shares system memory (DGX Spark, Jetson), from the CUDA backend if it is loaded.
-static bool sink_unified_memory() {
-    using unified_fn = bool (*)(int);
-    static const unified_fn is_unified =
-        reinterpret_cast<unified_fn>(dlsym(RTLD_DEFAULT, "ggml_backend_cuda_device_is_unified"));
-    return is_unified && is_unified(0);
+// Device facts are selected by L3 from this context's actual GPU backend.
+static bool sink_unified_memory(const sink_configuration & value) {
+    return value.has_gpu && value.gpu.device_is_unified(value.gpu_device);
+}
+
+static void sink_copy_services(sink_configuration & value, const ssd::runtime_services * services) {
+    if (!services) { return; }
+    value.host = services->host;
+    value.source = services->source;
+    value.gpu_transport = services->gpu_transport;
+    value.events = services->events;
+    if (services->debug) { value.debug = *services->debug; }
+    if (services->cpu) {
+        if (!ssd::gpu::valid(services->cpu)) { throw std::runtime_error("CPU kernel provider ABI mismatch"); }
+        value.cpu = *services->cpu;
+    }
+    if (services->gpu) {
+        const auto * gpu = services->gpu;
+        if (gpu->version != 1 || gpu->size != sizeof(*gpu) || !gpu->api || !gpu->residency ||
+                !gpu->location || !gpu->format || !gpu->prefill || !gpu->elastic || !gpu->deferred ||
+                !gpu->host || !gpu->policy || !gpu->settings || !gpu->testing || !gpu->transport || !gpu->stream ||
+                !gpu->device_is_unified || !gpu->device_ordinal || !gpu->attach_services || services->gpu_device < 0) {
+            throw std::runtime_error("GPU provider ABI missing or incompatible");
+        }
+        if (!ssd::gpu::valid(&value.cpu)) { throw std::runtime_error("GPU tier requires injected CPU kernels"); }
+        value.gpu = *gpu;
+        value.gpu_device = services->gpu_device;
+        value.has_gpu = true;
+    }
 }
 
 template<class T> static T sink_host_value(ssd::result<T> result) {
@@ -453,7 +294,7 @@ static ssd::host::client_config sink_host_configuration(const sink_configuration
     const auto * headroom = value.settings.integer("host.headroom_mib");
     const auto * reserve = value.settings.integer("vram.reserve_mib");
     if (value.production && (!headroom || !reserve)) { throw std::runtime_error("missing host budget settings"); }
-    config.unified = sink_unified_memory();
+    config.unified = sink_unified_memory(value);
     config.reserve_bytes = value.policy.cache_reserve_bytes;
     if (config.reserve_bytes < (512ull << 20)) { throw std::runtime_error("cache reserve must be at least 512 MiB"); }
     config.margin_bytes = std::max(config.reserve_bytes, uint64_t(headroom ? *headroom : 512) << 20);
@@ -463,1133 +304,26 @@ static ssd::host::client_config sink_host_configuration(const sink_configuration
 }
 // Production borrows L3's context registration. Only the explicit legacy/test
 // factory has an isolated owner; no production backend creates a budget singleton.
-struct sink_host_client {
-    std::shared_ptr<ssd::host::process_arbiter> test_owner;
-    std::unique_ptr<ssd::host::context_client> test_client;
-    ssd::host::context_client * client = nullptr;
-    explicit sink_host_client(const sink_configuration & value) : client(value.host) {
-        if (!client) {
-            if (value.production) { throw std::runtime_error("missing process host budget client"); }
-            test_owner = std::make_shared<ssd::host::process_arbiter>();
-            test_client = sink_host_value(test_owner->make_client()); client = test_client.get();
-        }
-        sink_host_value(client->configure(sink_host_configuration(value)));
-    }
-    ssd::host::snapshot state() const { return sink_host_value(client->state()); }
-    ssd::host::room measure(uint64_t extra, bool full = false) const { return sink_host_value(client->measure(extra, full)); }
-    ssd::host::room project_decode_capacity(uint64_t extra, bool full = false) const {
-        return sink_host_value(client->project_decode_capacity(extra, full));
-    }
-    uint64_t floor() const { return state().floor; }
-    uint64_t dram_bytes(uint64_t host, uint64_t device) const { return sink_host_value(client->dram_bytes(host, device)); }
-    void set_prefill_pages(uint64_t pages) { sink_host_value(client->set_prefill_pages(pages)); }
-    bool update_file_reserve() { return sink_host_value(client->update_file_reserve()); }
-    void begin_interval(uint64_t held) { sink_host_value(client->begin_interval(held)); }
-    bool end_interval(bool consecutive, uint64_t held, uint64_t & unknown) {
-        return sink_host_value(client->end_interval(consecutive, held, unknown));
-    }
-    ssd::host::room make_room(uint64_t extra, const ssd::host::actions & actions) {
-        return sink_host_value(client->make_room(extra, actions));
-    }
-    bool memory_available_at_full_boost(uint64_t & available, uint64_t & headroom) const {
-        const auto r = measure(0, true); available = r.available; headroom = r.boost_headroom; return r.system;
-    }
-};
-static const char * sink_short_term(const ssd::host::room & r) {
-    return r.cgroup_shortage && r.system_shortage ? "both" : r.cgroup_shortage ? "cgroup" : r.system_shortage ? "system" : "none";
+
+using sink_cache = ssd::host::expert_cache;
+static ssd::host::expert_cache_options sink_cache_options(const sink_configuration & value) {
+    ssd::host::expert_cache_options out;
+    out.host = value.host;
+    out.budget = sink_host_configuration(value);
+    out.require_shared = value.production;
+    const auto & policy = value.policy;
+    out.cache_policy = policy.cache_policy;
+    out.cache_allocation = policy.cache_allocation;
+    out.cache_keep = policy.cache_keep;
+    out.cache_prefill_read = policy.cache_prefill_read;
+    out.cache_elastic = policy.cache_elastic;
+    out.cache_partial_reclaim = policy.cache_partial_reclaim;
+    out.cache_prefill_slots = policy.cache_prefill_slots;
+    out.cache_layer_quotas = policy.cache_layer_quotas;
+    return out;
 }
-static void sink_touch_pages(void * address, size_t bytes, size_t page) {
-    if (!bytes) { return; }
-    auto * data = static_cast<volatile unsigned char *>(address);
-    for (size_t at = 0; at < bytes;) {
-        data[at] = 0;
-        if (bytes - at <= page) { break; }
-        at += page;
-    }
-    data[bytes - 1] = 0;
-}
-struct sink_cache {
-    struct source_key {
-        uint64_t device, inode, size, offset, bytes;
-        int64_t mtime_s, mtime_ns, ctime_s, ctime_ns;
-        bool operator==(const source_key & o) const {
-            return device == o.device && inode == o.inode && size == o.size && offset == o.offset &&
-                bytes == o.bytes && mtime_s == o.mtime_s && mtime_ns == o.mtime_ns &&
-                ctime_s == o.ctime_s && ctime_ns == o.ctime_ns;
-        }
-    };
-    struct entry {
-        source_key source[3] = {};
-        int32_t id = -1;
-        size_t layer_index = 0;
-        uint64_t last_touch = 0;
-        bool valid = false, reserved = false, resident = false, enabled = false, was_released = false, protected_now = false;
-        bool prefetched = false; // read ahead by the next-layer prefetch and not requested yet
-        bool inflight = false;   // a prefetch read writes into the slot; nothing else may take it
-        uint32_t leases = 0;
-        uint64_t generation = 0; // cache generation at a prefetch reservation
-    };
-    struct layer {
-        int32_t id;
-        size_t begin = 0, count = 0;
-        uint64_t token = 0;
-        bool seen = false;
-        std::map<int32_t, uint64_t> frequency;
-        std::map<int32_t, double> count_frequency;
-        uint64_t count_step = 0;
-    };
-    std::vector<layer> layers;
-    std::vector<entry> entries;
-    kimi_cpu_sink_cache_stats stats = {};
-    char * arena = nullptr;
-    size_t stride = 0, role_bytes[3] = {};
-    int quota = 8;
-    uint64_t epoch = 0, token = 0;
-    bool active = false, has_token = false, paused = false, elastic_prefill = false;
-    enum policy_type { window, lru, lfu, decay, count_decay2 } policy = window;
-    // Room for the cache comes from the host-memory ledger, which every other host allocation asks too. Its cgroup
-    // reserve is CACHE_RESERVE_BYTES; opt-in CACHE_RECLAIMABLE_FILE counts file-backed pages as cgroup headroom.
-    sink_host_client ledger;
-    // The last answer check_room got and the rejections per short term, for the receipts: on a discrete GPU the
-    // cgroup term is meant to bind, so a system-term rejection there points at memory the cgroup does not see.
-    mutable ssd::host::room last_room;
-    uint64_t cgroup_rejections = 0, system_rejections = 0;
-    void count_rejection() {
-        cgroup_rejections += last_room.cgroup_shortage != 0;
-        system_rejections += last_room.system_shortage != 0;
-    }
-    using room_state = ssd::host::room_state;
-    static constexpr room_state room_ok = ssd::host::room_ok, room_pressure = ssd::host::room_pressure,
-        room_unreadable = ssd::host::room_unreadable;
-    bool decode_projection = false;
-    bool keep_across_requests = false;
-    bool adopt = false; // the arena was made at load (reserve_at_load): the first decode keeps it, whatever its epoch
-    // An automatic budget's prices off unified memory (geometry): a slot, and the metadata room kept beside the slots.
-    uint64_t slot_cost_bytes = 0, metadata_bytes = 0;
-    bool prefill_read = false;
-    bool elastic = false;
-    bool partial_reclaim = false;
-    size_t prefill_slots = 0;
-    enum allocation_type { priority_order, uniform, global } allocation = priority_order;
-    uint64_t clock = 0, age_steps = 0;
-    uint64_t prefetch_hits = 0, prefetch_unused = 0;
-    // CACHE_BYTES unset: the cache is sized from this machine when the first decode token learns the slot size.
-    static constexpr uint64_t auto_budget = UINT64_MAX;
-    int staging_per_layer = 1; // slots per layer the next-layer prefetch lands in
-    // Changes whenever release() drops every entry. A hook lets deferred GPU uploads that borrow entries finish first.
-    uint64_t generation = 0;
-    void (*before_release)(void *) = nullptr;
-    void * before_release_arg = nullptr;
-    void (*before_unmap)(void *) = nullptr; // waits for prefetch reads into the arena
-    void * before_unmap_arg = nullptr;
-    // Before slots' pages are discarded (MADV_DONTNEED) or unmapped: entries [first, first + count). The decode
-    // registrar's page-locks must go first, or the device would keep the old pages.
-    void (*before_discard)(void *, size_t first, size_t count) = nullptr;
-    void * before_discard_arg = nullptr;
-    // Optional fixed geometry learned from earlier requests. This only assigns
-    // physical RAM slots; source identity, admission and leases stay unchanged.
-    std::map<int32_t, size_t> layer_quotas;
-    const uint64_t page_size = uint64_t(sysconf(_SC_PAGESIZE));
 
-    static uint64_t add(uint64_t a, uint64_t b) {
-        if (b > UINT64_MAX - a) { throw std::runtime_error("CPU sink cache size addition overflow"); }
-        return a + b;
-    }
-    static uint64_t multiply(uint64_t a, uint64_t b) {
-        if (a && b > UINT64_MAX / a) { throw std::runtime_error("CPU sink cache size multiplication overflow"); }
-        return a * b;
-    }
-    static uint64_t ceil_div(uint64_t a, uint64_t b) { return a / b + (a % b != 0); }
-    uint64_t page_tables(uint64_t bytes) const {
-        if (!bytes) { return 0; }
-        // Five levels, with an extra boundary table at each level. Summing
-        // this independently for each new slot overcounts shared tables.
-        uint64_t pages = ceil_div(bytes, page_size), tables = 1;
-        for (int level = 0; level < 4; ++level) {
-            pages = add(ceil_div(pages, page_size / sizeof(uint64_t)), 1);
-            tables = add(tables, pages);
-        }
-        return multiply(tables, page_size);
-    }
-    uint64_t allocation_cost(uint64_t bytes) const {
-        if (!bytes) { return 0; }
-        // std::vector/map storage belongs to libc. Allow allocator headers,
-        // unaligned ends and PMD-sized THP at both boundaries. Payload itself
-        // is MADV_NOHUGEPAGE and uses the much smaller ordinary-page bound.
-        const uint64_t huge = multiply(page_size, page_size / sizeof(uint64_t));
-        const uint64_t resident = add(multiply(ceil_div(add(bytes, 64), huge), huge), huge);
-        return add(add(resident, page_tables(resident)), 64 * 1024);
-    }
-    bool guard(uint64_t extra) {
-        stats.last_guard_extra_bytes = extra;
-        stats.peak_guard_extra_bytes = std::max(stats.peak_guard_extra_bytes, extra);
-        return check_room(extra, nullptr) == room_ok;
-    }
-    ssd::result<ssd::host::allocation_ticket> take_guard(uint64_t extra, const char * reason) {
-        stats.last_guard_extra_bytes = extra;
-        stats.peak_guard_extra_bytes = std::max(stats.peak_guard_extra_bytes, extra);
-        ssd::host::actions actions;
-        actions.reclaim_cache = [this, reason](uint64_t bytes) { return reclaim_for_guard(bytes, reason); };
-        auto ticket = ledger.client->take(extra, 0, actions, true, ssd::host::allocation_class::tracked);
-        last_room = ticket.value.observation();
-        return ticket;
-    }
-    // term: the ledger term that was short when the pause is a rejection for room ("none" otherwise).
-    void pause(std::vector<sink_request> & requests, kimi_cpu_sink_stats & current, const char * reason,
-               const char * term = "none") {
-        // No I/O job or read_target has been published yet. In particular,
-        // hits planned before the pressure check must become ring misses.
-        for (auto & r : requests) { r.cache_hit = r.cache_admit = -1; }
-        current.cache_hits = current.cache_new_slot_bytes = 0;
-        release();
-        std::vector<entry>().swap(entries);
-        stride = 0; std::fill(role_bytes, role_bytes + 3, 0);
-        stats.capacity_bytes = stats.enabled_bytes = 0;
-        paused = true; ++stats.pressure_stops;
-        std::fprintf(stderr, "[kimi_cpu_sink_cache] paused=1 reason=%s term=%s reserve_bytes=%llu extra_bytes=%llu\n",
-                reason, term, (unsigned long long) ledger.state().reserve,
-                (unsigned long long) stats.last_guard_extra_bytes);
-    }
-
-    const char * policy_name() const {
-        switch (policy) {
-            case window: return "window";
-            case lru:    return "lru";
-            case lfu:    return "lfu";
-            case decay:  return "decay";
-            case count_decay2: return "count_decay2";
-        }
-        return "unknown";
-    }
-    const char * allocation_name() const {
-        switch (allocation) {
-            case priority_order: return "priority";
-            case uniform:        return "uniform";
-            case global:         return "global";
-        }
-        return "unknown";
-    }
-
-    explicit sink_cache(const sink_configuration & configuration) : ledger(configuration) {
-        if (page_size < 4096 || page_size > 65536 || (page_size & (page_size - 1))) {
-            throw std::runtime_error("CPU sink cache requires a supported system page size");
-        }
-        const auto & p = configuration.policy;
-        if (p.cache_policy == "window") { policy = window; }
-        else if (p.cache_policy == "lru") { policy = lru; }
-        else if (p.cache_policy == "lfu") { policy = lfu; }
-        else if (p.cache_policy == "decay") { policy = decay; }
-        else if (p.cache_policy == "count_decay2") { policy = count_decay2; }
-        else { throw std::runtime_error("invalid explicit test cache policy"); }
-        if (p.cache_allocation == "priority") { allocation = priority_order; }
-        else if (p.cache_allocation == "uniform") { allocation = uniform; }
-        else if (p.cache_allocation == "global") { allocation = global; }
-        else { throw std::runtime_error("invalid explicit test cache allocation"); }
-        keep_across_requests = p.cache_keep;
-        prefill_read = p.cache_prefill_read;
-        elastic = p.cache_elastic;
-        partial_reclaim = p.cache_partial_reclaim;
-        prefill_slots = p.cache_prefill_slots;
-        layer_quotas = p.cache_layer_quotas;
-        if (keep_across_requests && policy == window) {
-            throw std::runtime_error("cache retention requires a persistent policy");
-        }
-        if (prefill_read && !keep_across_requests) {
-            throw std::runtime_error("read-only prefill cache requires retention");
-        }
-        if (policy == window && allocation == global) {
-            throw std::runtime_error("window cache cannot use global allocation");
-        }
-        if ((elastic || partial_reclaim) && (!keep_across_requests || policy == window || allocation != uniform)) {
-            throw std::runtime_error("cache reclaim requires retention, a persistent policy, and uniform allocation");
-        }
-        if ((elastic || partial_reclaim) && !layer_quotas.empty()) {
-            throw std::runtime_error("cache reclaim cannot use explicit layer quotas");
-        }
-        std::fprintf(stderr, "[kimi_host_ledger] unified=%d reserve=%llu margin=%llu explicit_reserve=%llu reclaimable_file=%d cgroup=%s\n",
-                int(ledger.state().unified), (unsigned long long) ledger.state().reserve, (unsigned long long) ledger.state().margin,
-                (unsigned long long) ledger.state().explicit_reserve, int(ledger.state().reclaimable_file),
-                ledger.state().cgroup.empty() ? "-" : ledger.state().cgroup.c_str());
-    }
-    ~sink_cache() { release(); }
-    void release() {
-        if (arena && before_release) { before_release(before_release_arg); }
-        if (arena && before_unmap) { before_unmap(before_unmap_arg); }
-        if (arena && before_discard) { before_discard(before_discard_arg, 0, entries.size()); }
-        ++generation;
-        if (arena) {
-            if (munmap(arena, stats.mapped_bytes) != 0) { std::abort(); }
-            arena = nullptr;
-            ++stats.clears;
-        }
-        stats.mapped_bytes = stats.committed_bytes = stats.enabled_bytes = stats.valid_bytes = stats.page_table_bytes = 0;
-        elastic_prefill = adopt = false;
-        for (auto & e : entries) { e = {}; e.enabled = true; }
-        for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
-            auto & l = layers[layer_index];
-            l.seen = false; l.frequency.clear(); l.count_frequency.clear(); l.count_step = 0;
-            if (allocation != global) {
-                for (size_t index = l.begin; index < l.begin + l.count && index < entries.size(); ++index) {
-                    entries[index].layer_index = layer_index;
-                }
-            }
-        }
-        if (!entries.empty()) { stats.enabled_bytes = stats.capacity_bytes; }
-        clock = age_steps = 0;
-    }
-    void configure(uint64_t budget, const int32_t * priority, int n, int per_layer) {
-        if (budget > std::numeric_limits<size_t>::max() ||
-            n < 0 || n > 256 || (n && !priority) ||
-            (budget && !n) || per_layer < 1 || per_layer > 896) {
-            throw std::runtime_error("invalid CPU sink cache budget, layers or quota");
-        }
-        std::vector<layer> next;
-        next.reserve(size_t(n)); // at most 256 small configuration records
-        for (int i = 0; i < n; ++i) {
-            if (priority[i] < 0 || priority[i] > 1023 || std::any_of(next.begin(), next.end(),
-                    [&](const layer & l) { return l.id == priority[i]; })) {
-                throw std::runtime_error("CPU sink cache layers must be distinct integers in [0,1023]");
-            }
-            layer item; item.id = priority[i]; next.push_back(item);
-        }
-        if (!layer_quotas.empty()) {
-            if (layer_quotas.size() != next.size()) {
-                throw std::runtime_error("CACHE_LAYER_QUOTAS must name every configured layer exactly once");
-            }
-            for (const auto & l : next) {
-                const auto item = layer_quotas.find(l.id);
-                if (item == layer_quotas.end() || item->second > size_t(per_layer)) {
-                    throw std::runtime_error("CACHE_LAYER_QUOTAS contains an unknown layer or exceeds CACHE_MAX_PER_LAYER");
-                }
-            }
-        }
-        release();
-        layers = std::move(next);
-        std::vector<entry>().swap(entries);
-        stats = {}; stats.budget_bytes = budget;
-        stride = 0; std::fill(role_bytes, role_bytes + 3, 0);
-        quota = per_layer; active = has_token = paused = elastic_prefill = false;
-        if (ledger.state().reclaimable_file) {
-            std::fprintf(stderr, "[kimi_cpu_sink_cache] reclaimable_file=1 active_file_counts_as_headroom=1 inactive_file_counts_as_headroom=1\n");
-        }
-        if (!layer_quotas.empty() || ledger.state().reserve != 2ull * 1024 * 1024 * 1024) {
-            std::fprintf(stderr, "[kimi_cpu_sink_cache] fixed_layer_quotas=%zu reserve_bytes=%llu\n",
-                    layer_quotas.size(), (unsigned long long) ledger.state().reserve);
-        }
-        if (elastic) {
-            std::fprintf(stderr,
-                    "[kimi_cpu_sink_cache] elastic=1 prefill_slots=%zu reserve_bytes=%llu mapping=retained\n",
-                    prefill_slots, (unsigned long long) ledger.state().reserve);
-        }
-        if (partial_reclaim) {
-            std::fprintf(stderr,
-                    "[kimi_cpu_sink_cache] partial_reclaim=1 reserve_bytes=%llu mapping=retained_on_known_pressure\n",
-                    (unsigned long long) ledger.state().reserve);
-        }
-    }
-    void begin(uint64_t next_epoch, uint64_t next_token, bool decode) {
-        if (!decode) {
-            // No run can be in flight under run_mutex. The optional read-only
-            // prefill path may lease retained valid entries, but never trains,
-            // admits or evicts here. Recheck headroom before each grouped
-            // workspace/stream; an error or explicit configure still unmaps.
-            if (elastic && arena) {
-                shrink_to(prefill_slots, false, "prefill_phase", true);
-                elastic_prefill = true;
-                const bool room = partial_reclaim
-                        ? reclaim_for_guard(0, "prefill_headroom") : guard(0);
-                if (room) {
-                    std::fprintf(stderr,
-                            "[kimi_cpu_sink_cache] retained_prefill=1 elastic=1 enabled_bytes=%llu resident_bytes=%llu valid_bytes=%llu\n",
-                            (unsigned long long) stats.enabled_bytes,
-                            (unsigned long long) stats.committed_bytes,
-                            (unsigned long long) stats.valid_bytes);
-                    for (auto & l : layers) { l.seen = false; }
-                } else {
-                    ++stats.pressure_stops; count_rejection();
-                    std::fprintf(stderr, "[kimi_cpu_sink_cache] paused=1 reason=prefill_headroom term=%s reserve_bytes=%llu\n",
-                            sink_short_term(last_room), (unsigned long long) ledger.state().reserve);
-                    release();
-                }
-            } else if (keep_across_requests && arena &&
-                    (partial_reclaim ? reclaim_for_guard(0, "prefill_headroom") : guard(0))) {
-                if (active) {
-                    std::fprintf(stderr, "[kimi_cpu_sink_cache] retained_prefill=1 valid_bytes=%llu\n",
-                            (unsigned long long) stats.valid_bytes);
-                }
-                for (auto & l : layers) { l.seen = false; }
-            } else {
-                if (keep_across_requests && arena) {
-                    ++stats.pressure_stops; count_rejection();
-                    std::fprintf(stderr, "[kimi_cpu_sink_cache] paused=1 reason=prefill_headroom term=%s reserve_bytes=%llu\n",
-                            sink_short_term(last_room), (unsigned long long) ledger.state().reserve);
-                }
-                release();
-            }
-            active = has_token = paused = false;
-            return;
-        }
-        // A retained mapping is bound to the model/context epoch even after
-        // prefill cleared has_token. Per-entry fstat keys also reject fd reuse.
-        if (keep_across_requests && arena && next_epoch != epoch && !adopt) { release(); }
-        // The first decode token after a prefill: the ledger no longer holds the prefill's pages, and the slots the
-        // prefill gave back come back as far as the room allows now.
-        if (!has_token) {
-            ledger.set_prefill_pages(0);
-            regrow(adopt ? "load" : "prefill");
-        }
-        adopt = false;
-        if (has_token && (next_epoch != epoch || token == UINT64_MAX || next_token != token + 1)) { release(); }
-        if (elastic) { grow_decode(); }
-        epoch = next_epoch; token = next_token; active = has_token = true;
-        if (policy == decay || policy == count_decay2) { ++age_steps; }
-        if (policy == decay && age_steps % 32 == 0) {
-            for (auto & l : layers) {
-                for (auto & item : l.frequency) { item.second >>= 1; }
-            }
-        }
-    }
-    // Room for the cache's own admission: both ledger terms, and only under a readable finite cgroup. full_boost: the
-    // system term at the kernel's full watermark boost, as the ledger's make_room measures it (kimi_host_ledger::measure).
-    room_state check_room(uint64_t extra, uint64_t * shortage, uint64_t * surplus = nullptr, bool full_boost = false) const {
-        if (shortage) { *shortage = 0; }
-        if (surplus) { *surplus = 0; }
-        const auto r = decode_projection ? ledger.project_decode_capacity(extra, full_boost) : ledger.measure(extra, full_boost);
-        last_room = r;
-        if (r.cgroup == room_unreadable) { return room_unreadable; }
-        if (shortage) { *shortage = r.shortage(); }
-        if (surplus) { *surplus = r.surplus(); }
-        return r.fits() ? room_ok : room_pressure;
-    }
-    std::pair<uint64_t, double> score(size_t layer_id, int32_t expert) const {
-        if (policy == count_decay2) {
-            const auto & item = layers.at(layer_id);
-            const auto found = item.count_frequency.find(expert);
-            const double value = found == item.count_frequency.end() ? 0.0 : found->second;
-            return { 0, value * std::exp2(-double(age_steps - item.count_step) / 2.0) };
-        }
-        const auto & counts = layers.at(layer_id).frequency;
-        const auto found = counts.find(expert);
-        return { found == counts.end() ? uint64_t(0) : found->second, 0.0 };
-    }
-    bool colder(size_t left, size_t right) const {
-        const entry & a = entries[left];
-        const entry & b = entries[right];
-        if (a.valid != b.valid) { return !a.valid; }
-        const auto a_score = score(a.layer_index, a.id);
-        const auto b_score = score(b.layer_index, b.id);
-        if (policy != lru && a_score != b_score) { return a_score < b_score; }
-        if (a.last_touch != b.last_touch) { return a.last_touch < b.last_touch; }
-        return left < right;
-    }
-    size_t enabled_slots() const {
-        return size_t(std::count_if(entries.begin(), entries.end(), [](const entry & e) { return e.enabled; }));
-    }
-    size_t shrink_to(size_t target, bool guard_reclaim, const char * reason, bool strict) {
-        if ((!elastic && !partial_reclaim) || target > entries.size() || !stride || stride % page_size) {
-            throw std::runtime_error("invalid CPU sink cache shrink");
-        }
-        const size_t before = enabled_slots();
-        if (target >= before) { return before; }
-        const uint64_t started = ggml_time_us();
-        const uint64_t released_before = stats.released_bytes;
-        for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
-            const auto & item = layers[layer_index];
-            const size_t wanted = target / layers.size() + (layer_index < target % layers.size());
-            if (wanted > item.count) { throw std::runtime_error("cache shrink target exceeds a layer's maximum quota"); }
-            size_t have = 0;
-            std::vector<size_t> candidates;
-            candidates.reserve(item.count);
-            for (size_t index = item.begin; index < item.begin + item.count; ++index) {
-                entry & e = entries[index];
-                if (!e.enabled) { continue; }
-                ++have;
-                if (!e.leases && !e.reserved && !e.protected_now && !e.inflight) { candidates.push_back(index); }
-            }
-            if (have <= wanted) { continue; }
-            std::sort(candidates.begin(), candidates.end(), [&](size_t a, size_t b) { return colder(a, b); });
-            const size_t count = std::min(have - wanted, candidates.size());
-            for (size_t offset = 0; offset < count; ++offset) {
-                entry & e = entries[candidates[offset]];
-                if (e.resident) {
-                    if (arena && before_discard) { before_discard(before_discard_arg, candidates[offset], 1); }
-                    if (!arena || madvise(arena + candidates[offset] * stride, stride, MADV_DONTNEED) != 0) {
-                        const auto error = sys_error("CPU sink cache MADV_DONTNEED");
-                        release();
-                        throw error;
-                    }
-                    e.resident = false;
-                    e.was_released = true;
-                    stats.committed_bytes -= stride;
-                    stats.released_bytes = add(stats.released_bytes, stride);
-                }
-                if (e.valid) {
-                    e.valid = false;
-                    stats.valid_bytes -= stride;
-                    ++stats.evictions;
-                }
-                e.enabled = false;
-                stats.enabled_bytes -= stride;
-            }
-        }
-        const size_t after = enabled_slots();
-        if (strict && after != target) {
-            throw std::runtime_error("elastic CPU sink cache shrink found a busy slot at a phase boundary");
-        }
-        if (after < before) {
-            ++stats.shrink_ops;
-            if (guard_reclaim) { ++stats.guard_reclaims; }
-            stats.shrink_us = add(stats.shrink_us, ggml_time_us() - started);
-            std::fprintf(stderr,
-                    "[kimi_cpu_sink_cache] cache_shrink=1 reason=%s target_slots=%zu before_slots=%zu after_slots=%zu released_bytes=%llu valid_bytes=%llu\n",
-                    reason, target, before, after,
-                    (unsigned long long) (stats.released_bytes - released_before),
-                    (unsigned long long) stats.valid_bytes);
-        }
-        return after;
-    }
-    void grow_decode() {
-        if (!elastic || !elastic_prefill || entries.empty()) { elastic_prefill = false; return; }
-        const size_t before = enabled_slots();
-        for (auto & e : entries) { e.enabled = true; }
-        stats.enabled_bytes = multiply(entries.size(), stride);
-        elastic_prefill = false;
-        if (before != entries.size()) {
-            ++stats.phase_grows;
-            std::fprintf(stderr,
-                    "[kimi_cpu_sink_cache] elastic_grow=1 before_slots=%zu after_slots=%zu resident_bytes=%llu\n",
-                    before, entries.size(), (unsigned long long) stats.committed_bytes);
-        }
-    }
-    // Slots given back until the room for `extra` fits; full_boost for the ledger's make_room, which then measures at the
-    // full watermark boost: stopping at MemAvailable as it is would leave make_room short by the boost's headroom.
-    bool reclaim_for_guard(uint64_t extra, const char * reason, bool full_boost = false) {
-        stats.last_guard_extra_bytes = extra;
-        stats.peak_guard_extra_bytes = std::max(stats.peak_guard_extra_bytes, extra);
-        uint64_t shortage = 0;
-        room_state state = check_room(extra, &shortage, nullptr, full_boost);
-        if (state == room_ok) { return true; }
-        if (state == room_unreadable || !partial_reclaim || !arena || !stride) { return false; }
-        size_t before = enabled_slots();
-        while (state == room_pressure && before) {
-            const size_t slots = size_t(std::min<uint64_t>(before, ceil_div(shortage, stride)));
-            const size_t after = shrink_to(before - std::max<size_t>(slots, 1), true, reason, false);
-            if (after >= before) { break; }
-            before = after;
-            state = check_room(extra, &shortage, nullptr, full_boost);
-        }
-        return state == room_ok;
-    }
-    void reject_admission(std::vector<sink_request> & requests, kimi_cpu_sink_stats & current, const char * reason) {
-        count_rejection();
-        if (!partial_reclaim) { pause(requests, current, reason, sink_short_term(last_room)); return; }
-        for (auto & r : requests) {
-            if (r.cache_admit >= 0) { entries[size_t(r.cache_admit)].reserved = false; }
-            r.cache_hit = r.cache_admit = -1;
-        }
-        for (auto & e : entries) { e.protected_now = false; }
-        current.cache_hits = current.cache_new_slot_bytes = 0;
-        ++stats.pressure_stops;
-        std::fprintf(stderr,
-                "[kimi_cpu_sink_cache] admission_rejected=1 reason=%s term=%s mapping_retained=1 reserve_bytes=%llu extra_bytes=%llu enabled_slots=%zu\n",
-                reason, sink_short_term(last_room), (unsigned long long) ledger.state().reserve,
-                (unsigned long long) stats.last_guard_extra_bytes, enabled_slots());
-    }
-    static source_key key(const kimi_cpu_sink_source & s) {
-        struct stat st;
-        if (fstat(s.fd_direct, &st) != 0) { throw sys_error("CPU sink cache fstat"); }
-        const auto v = kimi_vram_source_identity(&st, s.offset + s.data_offset, s.payload_nbytes ? s.payload_nbytes : s.nbytes);
-        return { v.device, v.inode, v.size, v.offset, v.bytes, v.mtime_s, v.mtime_ns, v.ctime_s, v.ctime_ns };
-    }
-    static bool matches(const entry & e, const sink_request & r) {
-        for (int role = 0; role < 3; ++role) { if (!(e.source[role] == key(r.role[role]))) { return false; } }
-        return true;
-    }
-    bool geometry(const size_t * requested, const ggml_tensor * tensor, size_t max_requests) {
-        // Native GGUF roles can differ only in page-prefix padding across
-        // layers. Keep the largest buffers instead of clearing the cache as
-        // those physical read lengths alternate.
-        const size_t bytes[3] = { std::max(requested[0], role_bytes[0]),
-            std::max(requested[1], role_bytes[1]), std::max(requested[2], role_bytes[2]) };
-        if (std::equal(bytes, bytes + 3, role_bytes)) { return true; }
-        const uint64_t sum = add(add(bytes[0], bytes[1]), bytes[2]);
-        if (!sum || sum > std::numeric_limits<size_t>::max()) { throw std::runtime_error("invalid CPU sink cache stride"); }
-        const size_t next_stride = size_t(sum);
-        uint64_t budget = stats.budget_bytes;
-        if (budget == auto_budget) {
-            // With a unified-memory GPU the GPU tier keeps the same experts in the same DRAM and computes
-            // them faster, so the RAM cache keeps only the slots the next-layer prefetch lands in. Otherwise
-            // it takes what the cgroup guard would admit now.
-            // The receipt names both terms: on a discrete GPU the cgroup term should be the smaller one.
-            uint64_t surplus = 0;
-            const bool readable = check_room(0, nullptr, &surplus) == room_ok;
-            budget = sink_unified_memory()
-                    ? multiply(multiply(layers.size(), uint64_t(std::max(1, staging_per_layer))), next_stride)
-                    : (readable ? surplus : 0);
-            const auto & r = last_room;
-            std::fprintf(stderr, "[kimi_cpu_sink_cache] auto_budget=%llu unified=%d slot_bytes=%zu cgroup_surplus=%llu system_surplus=%llu available=%llu floor=%llu binding=%s\n",
-                    (unsigned long long) budget, int(sink_unified_memory()), next_stride,
-                    (unsigned long long) (r.cgroup == room_unreadable ? 0 : r.cgroup_surplus), (unsigned long long) r.system_surplus,
-                    (unsigned long long) r.available, (unsigned long long) r.floor,
-                    !readable ? "unreadable" : !r.system || r.cgroup_surplus <= r.system_surplus ? "cgroup" : "system");
-        }
-        size_t count = static_cast<size_t>(std::min(budget / next_stride,
-                                                  multiply(layers.size(), uint64_t(quota))));
-        if (stats.budget_bytes == auto_budget && !sink_unified_memory()) {
-            // Price the same page rounding/tables and allocation guards used
-            // by admission. Payload-only division can spend their headroom,
-            // making an automatically chosen arena pause before it fills.
-            const uint64_t pages = add(ceil_div(next_stride, page_size), next_stride % page_size != 0);
-            const uint64_t payload = multiply(pages, page_size);
-            const uint64_t slot_cost = add(payload, page_tables(payload));
-            const bool frequencies = policy == count_decay2 || policy == lfu || policy == decay;
-            const uint64_t node = sizeof(std::pair<const int32_t, uint64_t>) + 4 * sizeof(void *);
-            const uint64_t node_storage = frequencies
-                    ? allocation_cost(multiply(multiply(layers.size(), uint64_t(tensor->ne[2])), node)) : 0;
-            const uint64_t node_guard = frequencies ? multiply(max_requests, allocation_cost(node)) : 0;
-            const auto cost = [&](size_t slots) {
-                if (!slots) { return uint64_t(0); }
-                return add(add(multiply(slots, slot_cost), allocation_cost(multiply(slots, sizeof(entry)))),
-                           add(add(node_storage, node_guard), 64 * 1024));
-            };
-            size_t low = 0, high = count;
-            while (low < high) {
-                const size_t middle = low + (high - low + 1) / 2;
-                if (cost(middle) <= budget) { low = middle; }
-                else { high = middle - 1; }
-            }
-            count = low;
-            slot_cost_bytes = slot_cost;
-            metadata_bytes = add(add(node_storage, node_guard), 64 * 1024);
-            std::fprintf(stderr,
-                    "[kimi_cpu_sink_cache] auto_capacity_bytes=%llu capacity_cost_bytes=%llu surplus_bytes=%llu slot_cost_bytes=%llu metadata_node_storage_bytes=%llu metadata_guard_bytes=%llu\n",
-                    (unsigned long long) multiply(count, next_stride), (unsigned long long) cost(count),
-                    (unsigned long long) budget, (unsigned long long) slot_cost,
-                    (unsigned long long) node_storage, (unsigned long long) node_guard);
-        }
-        const uint64_t capacity = multiply(count, next_stride);
-        if ((elastic || partial_reclaim) && next_stride % page_size) {
-            throw std::runtime_error("CACHE_ELASTIC and CACHE_PARTIAL_RECLAIM require a page-aligned expert slot stride");
-        }
-        if (elastic && prefill_slots > count) {
-            throw std::runtime_error("CACHE_PREFILL_SLOTS exceeds the decode cache slot count");
-        }
-        if (!layer_quotas.empty()) {
-            uint64_t total = 0;
-            for (const auto & item : layer_quotas) { total = add(total, item.second); }
-            if (total != count) {
-                throw std::runtime_error("CACHE_LAYER_QUOTAS sum must equal the cache budget's physical slot count");
-            }
-        }
-        if (count > size_t(INT_MAX) || count > entries.max_size() ||
-                capacity > uint64_t(std::numeric_limits<ptrdiff_t>::max())) {
-            throw std::runtime_error("CPU sink cache geometry exceeds addressable storage");
-        }
-        // Check before vector value-initialization can touch metadata pages.
-        // Existing allocations are already included in memory.current.
-        auto metadata_ticket = take_guard(allocation_cost(multiply(count, sizeof(entry))), "cgroup_metadata_headroom");
-        if (!metadata_ticket) { return false; }
-        std::vector<entry> next(count);
-        metadata_ticket.value.commit();
-        release();
-        // Geometry is first learned during the first decode token's prepare.
-        age_steps = active ? 1 : 0;
-        std::copy(bytes, bytes + 3, role_bytes);
-        stride = next_stride;
-        entries = std::move(next);
-        size_t assigned = 0;
-        for (size_t i = 0; i < layers.size(); ++i) {
-            auto & l = layers[i];
-            l.begin = assigned;
-            l.count = allocation == uniform ? count / layers.size() + (i < count % layers.size()) :
-                std::min(size_t(quota), count - assigned);
-            if (!layer_quotas.empty()) { l.count = layer_quotas.at(l.id); }
-            if (allocation == global) { l.begin = 0; l.count = count; }
-            if (allocation == global) { continue; }
-            for (size_t index = l.begin; index < l.begin + l.count; ++index) {
-                entries[index].layer_index = i;
-            }
-            assigned += l.count;
-        }
-        for (auto & e : entries) { e.enabled = true; }
-        stats.capacity_bytes = capacity;
-        stats.enabled_bytes = capacity;
-        return true;
-    }
-    void prepare(std::vector<sink_request> & requests, const ggml_tensor * const * tensors,
-                 const size_t * bytes, kimi_cpu_sink_stats & current) {
-        if (!active || paused || !stats.budget_bytes) { return; }
-        int id = -1, consumed = 0;
-        if (std::sscanf(tensors[0]->name, "blk.%d.ffn_up_exps.weight%n", &id, &consumed) != 1 ||
-            !consumed || tensors[0]->name[consumed]) { return; }
-        char name[GGML_MAX_NAME];
-        std::snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", id);
-        if (std::strcmp(name, tensors[1]->name)) { return; }
-        std::snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.weight", id);
-        if (std::strcmp(name, tensors[2]->name)) { return; }
-        auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == id; });
-        if (found == layers.end()) { return; }
-        try {
-            if (!requests.empty() && !geometry(bytes, tensors[0], requests.size())) { reject_admission(requests, current, "cgroup_metadata_headroom"); return; }
-        } catch (const std::bad_alloc &) { pause(requests, current, "metadata_allocation_failed"); return; }
-        layer & l = *found;
-        const size_t layer_index = size_t(found - layers.begin());
-        if (!l.count || (l.seen && l.token == token)) { return; }
-        // Entries from a skipped token are not a previous-token window.
-        const bool previous = l.seen && l.token != UINT64_MAX && l.token + 1 == token;
-        for (size_t i = l.begin; i < l.begin + l.count; ++i) {
-            auto & e = entries[i];
-            if (e.leases) { throw std::runtime_error("CPU sink prepare with an outstanding cache lease"); }
-            e.protected_now = false;
-            if (!e.enabled) { e.reserved = false; continue; }
-            if (!e.valid) { e.reserved = false; continue; }
-            if (e.layer_index != layer_index) { continue; }
-            auto r = std::find_if(requests.begin(), requests.end(), [&](const sink_request & request) { return request.id == e.id; });
-            if ((policy == window && (!previous || r == requests.end())) ||
-                    (r != requests.end() && !matches(e, *r))) {
-                e.valid = e.reserved = false; ++stats.evictions; stats.valid_bytes -= stride;
-            }
-        }
-        l.seen = true; l.token = token;
-        if (policy == count_decay2) {
-            size_t nodes = 0;
-            for (const auto & r : requests) { nodes += !r.cache_only && l.count_frequency.find(r.id) == l.count_frequency.end(); }
-            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, double>) + 4 * sizeof(void *))),
-                    "cgroup_count_frequency_headroom");
-            if (!frequency_ticket) {
-                reject_admission(requests, current, "cgroup_count_frequency_headroom"); return;
-            }
-            const double factor = std::exp2(-double(age_steps - l.count_step) / 2.0);
-            for (auto & item : l.count_frequency) { item.second *= factor; }
-            l.count_step = age_steps;
-            try {
-                // Selection frequency, independent of routing weight. Count a
-                // duplicated ID once per layer/token, as the offline set did.
-                for (size_t j = 0; j < requests.size(); ++j) {
-                    if (requests[j].cache_only) { continue; }
-                    const auto duplicate = std::find_if(requests.begin(), requests.begin() + j,
-                        [&](const sink_request & r) { return r.id == requests[j].id; });
-                    if (duplicate == requests.begin() + j) { l.count_frequency[requests[j].id] += 1.0; }
-                }
-            } catch (const std::bad_alloc &) { pause(requests, current, "count_frequency_allocation_failed"); return; }
-            frequency_ticket.value.commit();
-        }
-        if (policy == lfu || policy == decay) {
-            size_t nodes = 0;
-            for (const auto & r : requests) { nodes += !r.cache_only && l.frequency.find(r.id) == l.frequency.end(); }
-            // Each map node may fault a different allocator page/THP. Duplicate
-            // IDs deliberately overcount; no allocation occurs before this guard.
-            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, uint64_t>) + 4 * sizeof(void *))),
-                    "cgroup_frequency_headroom");
-            if (!frequency_ticket) {
-                reject_admission(requests, current, "cgroup_frequency_headroom"); return;
-            }
-            try {
-                for (const auto & r : requests) {
-                    if (r.cache_only) { continue; }
-                    auto & frequency = l.frequency[r.id];
-                    if (frequency != UINT64_MAX) { ++frequency; }
-                }
-            } catch (const std::bad_alloc &) { pause(requests, current, "frequency_allocation_failed"); return; }
-            frequency_ticket.value.commit();
-        }
-        // Protect every resident hit before reserving any direct-read target.
-        // A miss at the front of the batch must never overwrite a later hit.
-        for (auto & r : requests) {
-            for (size_t i = l.begin; i < l.begin + l.count; ++i) {
-                if (entries[i].enabled && entries[i].valid && entries[i].layer_index == layer_index &&
-                        entries[i].id == r.id && matches(entries[i], r)) {
-                    r.cache_hit = int(i);
-                    entries[i].protected_now = true;
-                    if (entries[i].prefetched && !r.cache_only) { entries[i].prefetched = false; ++prefetch_hits; }
-                    if (!r.cache_only) { entries[i].last_touch = ++clock; }
-                    break;
-                }
-            }
-            if (r.cache_hit >= 0 && !r.cache_only) {
-                ++current.cache_hits;
-                current.cache_hit_bytes = add(current.cache_hit_bytes, stride);
-            }
-        }
-        for (auto & r : requests) {
-            if (r.cache_hit >= 0 || r.cache_only) { continue; }
-            const bool already_reserved = std::any_of(entries.begin() + l.begin, entries.begin() + l.begin + l.count,
-                [&](const entry & e) { return e.enabled && e.reserved && e.layer_index == layer_index && e.id == r.id; });
-            if (already_reserved) { ++stats.admission_skips; continue; }
-            auto free = std::find_if(entries.begin() + l.begin, entries.begin() + l.begin + l.count,
-                [](const entry & e) { return e.enabled && !e.valid && !e.reserved && !e.inflight; });
-            if (free == entries.begin() + l.begin + l.count && policy != window) {
-                auto frequency = [&](const entry & e) { return score(e.layer_index, e.id); };
-                for (auto candidate = entries.begin() + l.begin; candidate != entries.begin() + l.begin + l.count; ++candidate) {
-                    if (!candidate->enabled || candidate->protected_now || candidate->reserved || candidate->inflight) { continue; }
-                    if (free == entries.begin() + l.begin + l.count ||
-                            (policy != lru && frequency(*candidate) < frequency(*free)) ||
-                            ((policy == lru || frequency(*candidate) == frequency(*free)) && candidate->last_touch < free->last_touch)) {
-                        free = candidate;
-                    }
-                }
-                if (free != entries.begin() + l.begin + l.count && policy != lru && score(layer_index, r.id) < frequency(*free)) {
-                    free = entries.begin() + l.begin + l.count;
-                }
-                if (free != entries.begin() + l.begin + l.count) {
-                    free->valid = false;
-                    ++stats.evictions; stats.valid_bytes -= stride;
-                    if (free->prefetched) { free->prefetched = false; ++prefetch_unused; }
-                }
-            }
-            if (free == entries.begin() + l.begin + l.count) { ++stats.admission_skips; continue; }
-            free->id = r.id; free->layer_index = layer_index; free->reserved = true; free->last_touch = ++clock;
-            for (int role = 0; role < 3; ++role) { free->source[role] = key(r.role[role]); }
-            r.cache_admit = int(free - entries.begin());
-        }
-        uint64_t new_slots = 0;
-        for (const auto & r : requests) {
-            if (r.cache_admit >= 0 && !entries[r.cache_admit].resident) { ++new_slots; }
-        }
-        // The arena is page aligned; a non-page-aligned stride can straddle one
-        // additional page. No unused slot or whole-layer quota is charged here.
-        const uint64_t slot_pages = add(ceil_div(stride, page_size), stride % page_size != 0);
-        const uint64_t payload_pages = multiply(slot_pages, page_size);
-        const uint64_t new_tables = multiply(new_slots, page_tables(payload_pages));
-        const uint64_t extra = add(add(multiply(new_slots, payload_pages), new_tables), arena ? 0 : 64 * 1024);
-        auto slot_ticket = take_guard(extra, "cgroup_headroom");
-        if (!slot_ticket) {
-            reject_admission(requests, current, "cgroup_headroom"); return;
-        }
-        if (!arena && stats.capacity_bytes && !requests.empty()) {
-            if (const char * failed = map_arena()) { pause(requests, current, failed); return; }
-        }
-        // MADV_DONTNEED may retain upper-level page tables. Keep a lifetime
-        // upper bound, while capping refaults so repeated phase churn cannot
-        // make the diagnostic grow beyond one per mapped slot.
-        const uint64_t maximum_tables = multiply(entries.size(), page_tables(payload_pages));
-        stats.page_table_bytes = std::min(stats.page_table_bytes, maximum_tables);
-        stats.page_table_bytes += std::min(new_tables, maximum_tables - stats.page_table_bytes);
-        for (const auto & r : requests) {
-            if (r.cache_admit < 0 || entries[r.cache_admit].resident) { continue; }
-            if (entries[r.cache_admit].was_released) {
-                stats.refaulted_bytes = add(stats.refaulted_bytes, stride);
-                entries[r.cache_admit].was_released = false;
-            }
-            // Finish the admitted first touch before publishing resident slots
-            // or asynchronous read targets. Only this new slot is written.
-            sink_touch_pages(arena + size_t(r.cache_admit) * stride, stride, size_t(page_size));
-            entries[r.cache_admit].resident = true;
-            stats.committed_bytes = add(stats.committed_bytes, stride);
-            current.cache_new_slot_bytes = add(current.cache_new_slot_bytes, stride);
-        }
-        stats.peak_bytes = std::max(stats.peak_bytes, stats.committed_bytes);
-        slot_ticket.value.commit();
-    }
-    // The arena, address space only: the guard admits each resident slot against the cgroup, so the kernel's
-    // overcommit heuristic must not refuse a mapping larger than RAM plus swap. Ordinary pages: partial reclaim gives
-    // single slots back (MADV_DONTNEED). nullptr, or why it failed.
-    const char * map_arena() {
-        void * memory = mmap(nullptr, stats.capacity_bytes, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (memory == MAP_FAILED) { return "mmap_failed"; }
-        arena = static_cast<char *>(memory); stats.mapped_bytes = stats.capacity_bytes;
-        return madvise(arena, stats.mapped_bytes, MADV_NOHUGEPAGE) != 0 ? "nohugepage_failed" : nullptr;
-    }
-    // A cache that can give room back to the ledger: partial reclaim, or elastic (its prefill shrinks to its prefill
-    // slots).
-    bool gives_room_back() const { return partial_reclaim || elastic; }
-    // At load (the sink's load hook, off unified memory): the geometry from the expert tensors' strides (bytes: each
-    // role as a decode request reserves it; max_requests: the model's experts a token, as the first decode layer's
-    // requests price the frequency nodes its admissions add), the arena, and the slots the guard admits now (all of
-    // them when the cache was sized from this room) committed and paged in from `threads` threads, so that no decode
-    // token pays their first touch (13.8 ms a token over decode tokens 1-128 on 125, 1.77 s a cold start). Only a
-    // cache kept across requests keeps them through the first prefill, which may give slots back through the ledger
-    // as every later request's prefill does; the first decode adopts the arena whatever its epoch, and takes back
-    // what the room allows then (regrow). So only a cache that can give room back takes its storage here
-    // (partial reclaim, or elastic): an arena that cannot would refuse the first prefill's ledger requests, where a
-    // cache sized at the first decode token comes after them. The arena has the slots the first decode token would
-    // size, when no prefill holds room; the slots committed leave the room the ledger holds for the first prefill's
-    // pages (prefill_pages: the load-time graph's, the largest prefill's), which the first decode token takes back.
-    // Returns the slots committed.
-    size_t reserve_at_load(const size_t * bytes, const ggml_tensor * tensor, size_t max_requests, int threads, double & us) {
-        us = 0;
-        if (!keep_across_requests || !gives_room_back() || paused || !stats.budget_bytes || arena || layers.empty()) {
-            return 0;
-        }
-        std::vector<std::thread> pool;
-        pool.reserve(size_t(std::max(1, threads))); // before anything changes: a failure here leaves the cache as it was
-        struct decode_view {
-            bool & projection;
-            explicit decode_view(bool & p) : projection(p) { projection = true; }
-            ~decode_view() { projection = false; }
-        };
-        {
-            decode_view view(decode_projection);
-            if (!geometry(bytes, tensor, std::max<size_t>(1, max_requests)) || !stats.capacity_bytes) { return 0; }
-        }
-        const uint64_t slot_pages = add(ceil_div(stride, page_size), stride % page_size != 0);
-        const uint64_t payload_pages = multiply(slot_pages, page_size), tables = page_tables(payload_pages);
-        auto cost = [&](size_t n) { return add(multiply(n, add(payload_pages, tables)), 64 * 1024); };
-        uint64_t surplus = 0;
-        if (check_room(0, nullptr, &surplus) == room_unreadable) { return 0; }
-        size_t n = std::min<size_t>(entries.size(), surplus > 64 * 1024 ? (surplus - 64 * 1024) / add(payload_pages, tables) : 0);
-        if (!n) { return 0; }
-        auto load_ticket = take_guard(cost(n), "load");
-        if (!load_ticket) { return 0; }
-        if (map_arena()) { release(); return 0; }
-        const auto start = sink_clock::now();
-        const size_t workers = size_t(std::max(1, std::min(threads, int(n))));
-        std::atomic<bool> touched{false};
-        auto populate = [&](size_t w) {
-            char * begin = arena + n * w / workers * stride, * end = arena + n * (w + 1) / workers * stride;
-#ifdef MADV_POPULATE_WRITE
-            if (begin == end || madvise(begin, size_t(end - begin), MADV_POPULATE_WRITE) == 0) { return; }
-#endif
-            touched = true;
-            for (char * page = begin; page < end; page += page_size) { *reinterpret_cast<volatile char *>(page) = 0; }
-        };
-        // this thread takes part 0 and whatever no started thread took (the pool's storage is reserved, so only a
-        // thread's creation can fail, and then nothing was added)
-        size_t started = 1;
-        try {
-            for (; started < workers; ++started) { pool.emplace_back(populate, started); }
-        } catch (...) {}
-        for (size_t w = started; w < workers; ++w) { populate(w); }
-        populate(0);
-        for (auto & t : pool) { t.join(); }
-        // Page-aligned production strides are fully populated by the workers;
-        // also touch the tail for a valid nonaligned legacy/test geometry.
-        sink_touch_pages(arena + n * stride - 1, 1, size_t(page_size));
-        load_ticket.value.commit();
-        us = elapsed_us(start);
-        for (size_t i = 0; i < n; ++i) { entries[i].resident = true; }
-        stats.committed_bytes = multiply(n, stride);
-        stats.page_table_bytes = multiply(n, tables);
-        stats.peak_bytes = std::max(stats.peak_bytes, stats.committed_bytes);
-        adopt = true;
-        std::fprintf(stderr, "[kimi_cpu_sink_cache] reason=load slots=%zu of=%zu slot_bytes=%zu committed_bytes=%llu us=%.0f threads=%zu pages=%s\n",
-                n, entries.size(), stride, (unsigned long long) stats.committed_bytes, us, workers,
-                touched ? "touched" : "populated");
-        return n;
-    }
-    // The first decode token after a prefill (partial reclaim, not elastic): the slots the prefill gave back (the room
-    // it held for its pages and its buffers, given back at its start) come back as far as the room allows now (an
-    // automatic budget: geometry's price of a slot past the metadata room; a fixed one: all of them), so the cache
-    // holds what one sized at this token would, within the arena's slots. They are paged in at their admission, as
-    // every slot was without the load step. So are the enabled slots the load step did not commit (the room it saw
-    // was smaller than the one geometry sized from, or it left the first prefill's pages): with an automatic budget
-    // they take their room first (owed). `after`: "load" for the first request of an arena made at load, "prefill".
-    void regrow(const char * after) {
-        if (!partial_reclaim || elastic || !arena || !stride || paused) { return; }
-        const size_t before = enabled_slots();
-        uint64_t more = entries.size() - before, surplus = 0, owed = 0;
-        if (!more) { return; }
-        if (stats.budget_bytes == auto_budget) {
-            if (check_room(0, nullptr, &surplus) == room_unreadable || !slot_cost_bytes) { return; }
-            for (const auto & e : entries) { owed += e.enabled && !e.resident; }
-            const uint64_t room = surplus > metadata_bytes ? (surplus - metadata_bytes) / slot_cost_bytes : 0;
-            more = std::min<uint64_t>(more, room > owed ? room - owed : 0);
-        }
-        const size_t target = before + size_t(more);
-        for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
-            const auto & item = layers[layer_index];
-            const size_t wanted = target / layers.size() + (layer_index < target % layers.size());
-            size_t have = 0;
-            for (size_t i = item.begin; i < item.begin + item.count; ++i) { have += entries[i].enabled; }
-            for (size_t i = item.begin; i < item.begin + item.count && have < wanted; ++i) {
-                if (entries[i].enabled) { continue; }
-                entries[i].enabled = true; ++have;
-                stats.enabled_bytes = add(stats.enabled_bytes, stride);
-            }
-        }
-        std::fprintf(stderr, "[kimi_cpu_sink_cache] %s_regrow=1 before_slots=%zu after_slots=%zu of=%zu owed_slots=%llu surplus_bytes=%llu committed_bytes=%llu\n",
-                after, before, enabled_slots(), entries.size(), (unsigned long long) owed, (unsigned long long) surplus,
-                (unsigned long long) stats.committed_bytes);
-    }
-    // Host memory the cache may still commit before a reset: its enabled but not yet resident slots (an elastic
-    // cache enables all of them again at the next decode phase), or before the first decode token maps the arena,
-    // what geometry() will size it to for this slot size. Off unified memory the automatic size depends on the
-    // cgroup at that time, and only the GPU tier of a unified device asks.
-    uint64_t pending_bytes(size_t slot_bytes) const {
-        if (!stats.budget_bytes || paused) { return 0; }
-        if (arena) {
-            const uint64_t usable = elastic ? stats.capacity_bytes : stats.enabled_bytes;
-            return usable > stats.committed_bytes ? usable - stats.committed_bytes : 0;
-        }
-        if (!slot_bytes || layers.empty()) { return 0; }
-        uint64_t budget = stats.budget_bytes;
-        if (budget == auto_budget) {
-            if (!sink_unified_memory()) { return 0; }
-            budget = multiply(multiply(layers.size(), uint64_t(std::max(1, staging_per_layer))), slot_bytes);
-        }
-        return multiply(std::min(budget / slot_bytes, multiply(layers.size(), uint64_t(quota))), slot_bytes);
-    }
-    char * data(int index, int role) const {
-        size_t offset = size_t(index) * stride;
-        for (int r = 0; r < role; ++r) { offset += role_bytes[r]; }
-        return arena + offset;
-    }
-    // Whether the layer's slots hold the expert or a read of it is on its way. Changes nothing: the next-layer
-    // prefetch's statistics ask it for every rank of a hint, read or not.
-    bool holds(int32_t layer_id, int32_t expert) const {
-        if (!active || !arena) { return false; }
-        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
-        if (found == layers.end()) { return false; }
-        const size_t layer_index = size_t(found - layers.begin());
-        for (size_t i = found->begin; i < found->begin + found->count; ++i) {
-            const auto & e = entries[i];
-            if (e.enabled && (e.valid || e.reserved || e.inflight) && e.layer_index == layer_index && e.id == expert) { return true; }
-        }
-        return false;
-    }
-    // Next-layer prefetch: take a resident, idle slot of the layer (a free one first, else the coldest) for an
-    // expert that is not cached. The slot is inflight, invisible to lookups and allocation, until prefetch_done
-    // publishes it (or prefetch_activate publishes it early as a hit that its run waits for).
-    // Returns -2 when the expert is already cached or on its way, -1 when there is no slot.
-    int prefetch_reserve(int32_t layer_id, int32_t expert, const kimi_cpu_sink_source * roles) {
-        if (!active || paused || !stats.budget_bytes || !arena || !stride) { return -1; }
-        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
-        if (found == layers.end() || !found->count) { return -1; }
-        const size_t layer_index = size_t(found - layers.begin());
-        for (int role = 0; role < 3; ++role) { if (roles[role].nbytes > role_bytes[role]) { return -1; } }
-        source_key keys[3];
-        for (int role = 0; role < 3; ++role) { keys[role] = key(roles[role]); }
-        int victim = -1;
-        for (size_t i = found->begin; i < found->begin + found->count; ++i) {
-            const auto & e = entries[i];
-            if (!e.enabled) { continue; }
-            if ((e.valid || e.reserved || e.inflight) && e.layer_index == layer_index && e.id == expert &&
-                    e.source[0] == keys[0] && e.source[1] == keys[1] && e.source[2] == keys[2]) { return -2; }
-            if (!e.resident || e.reserved || e.inflight || e.leases || e.protected_now) { continue; }
-            if (victim < 0 || (entries[size_t(victim)].valid && (!e.valid || colder(i, size_t(victim))))) { victim = int(i); }
-        }
-        if (victim < 0) { return -1; }
-        auto & e = entries[size_t(victim)];
-        if (e.valid) {
-            e.valid = false; ++stats.evictions; stats.valid_bytes -= stride;
-            if (e.prefetched) { ++prefetch_unused; }
-        }
-        e.id = expert; e.layer_index = layer_index; e.inflight = true; e.prefetched = false;
-        e.generation = generation; e.last_touch = ++clock;
-        for (int role = 0; role < 3; ++role) { e.source[role] = keys[role]; }
-        return victim;
-    }
-    void prefetch_done(int index, uint64_t reserved_generation, bool ok) {
-        if (index < 0 || size_t(index) >= entries.size() || reserved_generation != generation) { return; }
-        auto & e = entries[size_t(index)];
-        if (!e.inflight || e.generation != reserved_generation) { return; }
-        e.inflight = false;
-        if (e.valid) { // published early as a hit
-            if (!ok) { e.valid = false; e.prefetched = false; e.id = -1; stats.valid_bytes -= stride; }
-            return;
-        }
-        if (ok && e.enabled && e.resident) {
-            e.valid = true; e.prefetched = true; e.last_touch = ++clock;
-            stats.valid_bytes += stride;
-        } else {
-            e.id = -1;
-        }
-    }
-    bool prefetch_activate(int index, uint64_t reserved_generation) {
-        if (index < 0 || size_t(index) >= entries.size() || reserved_generation != generation) { return false; }
-        auto & e = entries[size_t(index)];
-        if (!e.inflight || e.valid || e.generation != reserved_generation || !e.enabled || !e.resident) { return false; }
-        e.valid = true; e.prefetched = true; e.last_touch = ++clock;
-        stats.valid_bytes += stride;
-        return true;
-    }
-    void prepare_prefill_read(std::vector<sink_request> & requests,
-            const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down,
-            kimi_cpu_sink_stats & current) {
-        if (!prefill_read || !arena || !stride || !stats.valid_bytes || requests.empty()) { return; }
-        int layer_id = -1, consumed = 0;
-        if (std::sscanf(up->name, "blk.%d.ffn_up_exps.weight%n", &layer_id, &consumed) != 1 ||
-                !consumed || up->name[consumed]) { return; }
-        char name[GGML_MAX_NAME];
-        std::snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", layer_id);
-        if (std::strcmp(name, gate->name)) { return; }
-        std::snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.weight", layer_id);
-        if (std::strcmp(name, down->name)) { return; }
-        const auto found = std::find_if(layers.begin(), layers.end(),
-            [&](const layer & l) { return l.id == layer_id; });
-        if (found == layers.end() || !found->count) { return; }
-        const size_t layer_index = size_t(found - layers.begin());
-        size_t bytes[3] = {};
-        for (int role = 0; role < 3; ++role) {
-            for (const auto & request : requests) {
-                bytes[role] = std::max(bytes[role], request.role[role].nbytes);
-            }
-        }
-        if (bytes[0] > role_bytes[0] || bytes[1] > role_bytes[1] || bytes[2] > role_bytes[2]) { return; }
-
-        for (auto & request : requests) {
-            if (request.vram_slot >= 0 || request.cache_hit >= 0) { continue; }
-            for (size_t index = found->begin; index < found->begin + found->count; ++index) {
-                auto & e = entries[index];
-                if (!e.enabled || !e.valid || !e.resident || e.layer_index != layer_index ||
-                        e.id != request.id || !matches(e, request)) { continue; }
-                acquire_lease(int(index), request);
-                request.cache_hit = int(index);
-                request.cache_lease = true;
-                e.protected_now = true;
-                ++current.cache_hits;
-                current.cache_hit_bytes = add(current.cache_hit_bytes, stride);
-                ++stats.prefill_hits;
-                stats.prefill_hit_bytes = add(stats.prefill_hit_bytes, stride);
-                ++stats.prefill_leases;
-                break;
-            }
-        }
-    }
-    void release_prefill_leases(std::vector<sink_request> & requests) {
-        for (auto & request : requests) {
-            if (!request.cache_lease) { continue; }
-            release_lease(request.cache_hit);
-            request.cache_lease = false;
-        }
-    }
-    void admit(const sink_request & request, kimi_cpu_sink_stats & current) {
-        if (request.cache_admit < 0) { return; }
-        auto & e = entries[request.cache_admit];
-        if (!e.enabled || !e.resident) { throw std::runtime_error("CPU sink cache admitted a disabled slot"); }
-        // All three reads completed and no compute worker retains this slot.
-        // Publication changes metadata only; the expert payload never moves.
-        e.valid = true; e.reserved = false;
-        stats.valid_bytes += stride;
-        stats.admitted_bytes += stride;
-        ++current.cache_admitted; current.cache_admitted_bytes += stride;
-    }
-    void acquire_lease(int index, const sink_request & request) {
-        auto & e = entries.at(size_t(index));
-        if (!e.enabled || (!e.valid && !e.reserved) || e.id != request.id ||
-                !matches(e, request) || e.leases == UINT32_MAX) {
-            throw std::runtime_error("CPU sink cache lease identity mismatch");
-        }
-        ++e.leases;
-    }
-    void release_lease(int index) {
-        auto & e = entries.at(size_t(index));
-        if (!e.leases || e.reserved) { throw std::runtime_error("CPU sink cache lease released before completion"); }
-        if (!--e.leases) { e.protected_now = false; }
-    }
-    // Called only while the other tier holds a versioned ready lease. Return
-    // -1 if an executor still owns this RAM copy, 0 if absent, 1 if dropped.
-    int drop_duplicate(int layer_id, const sink_request & request) {
-        if (entries.empty()) { return 0; } // RAM admission may have paused.
-        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
-        if (found == layers.end()) { return 0; }
-        const size_t layer_index = size_t(found - layers.begin());
-        for (size_t i = found->begin; i < found->begin + found->count; ++i) {
-            auto & e = entries[i];
-            if (!e.valid || e.id != request.id || e.layer_index != layer_index || !matches(e, request)) { continue; }
-            if (e.leases || e.protected_now || e.reserved || e.inflight) { return -1; }
-            e.valid = false;
-            stats.valid_bytes -= stride;
-            // Keep resident and committed/page-table accounting: the physical
-            // slot is reused in place, without a second payload allocation.
-            return 1;
-        }
-        return 0;
-    }
-};
-
-#include "kimi-cpu-sink-vram.inc"
+#include "ssd/cpu-sink-vram.inc"
 
 struct sink_slot {
     sink_buffer role[3];
@@ -1985,7 +719,7 @@ struct kimi_cpu_sink {
     kimi_cpu_sink(int threads, int depth, kimi_cpu_sink_resolver resolve, void * user,
                   const sink_configuration & input = {}) :
         configuration(input), compute_threads(threads - 1), ring_experts(depth), resolver(resolve), userdata(user), slots(depth),
-        cache(configuration),
+        cache(sink_cache_options(configuration)),
         split_cv(configuration.policy.split_cv), ready_first(configuration.policy.ready_first),
         early_up_gate(configuration.policy.early_up_gate), role_major(configuration.policy.role_major),
         nonblocking_down_sched(configuration.policy.nonblocking_down_sched), poll_us(configuration.policy.poll_us),
@@ -2041,7 +775,7 @@ struct kimi_cpu_sink {
         if (nonblocking_down_sched && !ready_first) {
             throw std::runtime_error("NONBLOCKING_DOWN_SCHED requires READY_FIRST=1");
         }
-        ring.init(static_cast<unsigned>(3 * depth), configuration.policy.read_fixed);
+        sink_io_value(ring.init(static_cast<unsigned>(3 * depth), configuration.policy.read_fixed));
         {
             // One CPU of the fastest cluster stays with the I/O thread, as THREADS counts it.
             const int fast = sink_fast_cpus();
@@ -2774,7 +1508,7 @@ struct kimi_cpu_sink {
         if (!room.fits()) {
             ++ledger_refusals;
             std::fprintf(stderr, "[kimi_host_ledger] event=refused extra=%llu term=%s cgroup_shortage=%llu system_shortage=%llu available=%llu floor=%llu\n",
-                    (unsigned long long) extra, sink_short_term(room), (unsigned long long) room.cgroup_shortage,
+                    (unsigned long long) extra, ssd::host::binding_term(room), (unsigned long long) room.cgroup_shortage,
                     (unsigned long long) room.system_shortage, (unsigned long long) room.available,
                     (unsigned long long) room.floor);
         }
@@ -3319,7 +2053,7 @@ struct kimi_cpu_sink {
         funlockfile(stderr);
     }
 
-    void account_read_bytes(const io_uring_cqe & cqe) {
+    void account_read_bytes(const sink_completion & cqe) {
         if (cqe.user_data >= 3 * slots.size()) { throw std::runtime_error("invalid CPU sink CQE target"); }
         if (cqe.res <= 0) { return; }
         auto & request = requests[slots[cqe.user_data / 3].request];
@@ -3344,9 +2078,9 @@ struct kimi_cpu_sink {
                 // A broken ring cannot be reused. If it cannot even drain, end
                 // the process rather than return user buffers still owned by I/O.
                 try {
-                    ring.drain(this, [](void * userdata, const io_uring_cqe & cqe) {
+                    sink_io_value(ring.drain(this, [](void * userdata, const sink_completion & cqe) {
                         static_cast<kimi_cpu_sink *>(userdata)->account_read_bytes(cqe);
-                    });
+                    }));
                 } catch (const std::exception & drain_error) {
                     std::fprintf(stderr, "[kimi_cpu_sink] cannot drain I/O after %s: %s; aborting\n",
                                  e.what(), drain_error.what());
@@ -3384,8 +2118,9 @@ struct kimi_cpu_sink {
                     const bool cache_fill = request.cache_admit >= 0;
                     const bool external_target = cache_fill ||
                         (request.vram_ssd_transient && !request.vram_ssd_streaming);
-                    const bool fixed = ring.read_fixed && !external_target;
-                    ring.queue(request.role[role], request.read_target[role], 3 * index + role, fixed);
+                    const bool fixed = ring.read_fixed() && !external_target;
+                    sink_io_value(ring.queue({request.role[role].fd_direct, request.role[role].offset, request.role[role].nbytes},
+                        request.read_target[role], 3 * index + role, fixed));
                     ++queued;
                     ++current.read_requests;
                     if (cache_fill) { ++current.cache_fill_read_requests; }
@@ -3419,7 +2154,7 @@ struct kimi_cpu_sink {
             }
             if (queued) {
                 const uint64_t submit_begin = timeline_active || cache_compute_active ? ggml_time_us() : 0;
-                ring.submit(queued); inflight += queued;
+                sink_io_value(ring.submit(queued)); inflight += queued;
                 if (cache_compute_active) {
                     const uint64_t end = ggml_time_us();
                     for (size_t j = batch_begin; j < next; ++j) {
@@ -3435,9 +2170,9 @@ struct kimi_cpu_sink {
                     }
                 }
             }
-            io_uring_cqe cqe;
+            sink_completion cqe;
             bool consumed = false;
-            while (ring.pop(cqe)) {
+            while (sink_io_value(ring.pop(cqe))) {
                 consumed = true;
                 if (!inflight || cqe.user_data >= 3 * slots.size()) {
                     throw std::runtime_error("invalid CPU sink CQE");
@@ -3475,7 +2210,7 @@ struct kimi_cpu_sink {
             if (failed && !inflight) { return; }
             if (inflight && !consumed) {
                 const auto wait_start = profile_enabled ? sink_clock::now() : sink_clock::time_point();
-                ring.wait();
+                sink_io_value(ring.wait());
                 if (profile_enabled) { current.io_wait_us += elapsed_us(wait_start); }
             } else if (!inflight && next < io_requests.size()) {
                 // Always timed: the drive is idle here, and the prefill cost model takes the drive rate
@@ -3520,7 +2255,7 @@ struct kimi_cpu_sink {
             throw std::runtime_error("CPU sink ring payload exceeds 768 MiB limit");
         }
         // Serialized runs drain previous consumers before reusing these slots.
-        if (ring.pending) { throw std::runtime_error("CPU sink reserve with pending ring I/O"); }
+        if (ring.pending()) { throw std::runtime_error("CPU sink reserve with pending ring I/O"); }
         // Price each full new allocation: reserve() creates it before freeing
         // the old block. Existing capacity is resident and requires no ticket.
         uint64_t growth = 0;
@@ -3533,12 +2268,12 @@ struct kimi_cpu_sink {
         actions.reclaim_cache = [this](uint64_t bytes) { return cache.reclaim_for_guard(bytes, "ring"); };
         auto ticket = cache.ledger.client->take(growth, 0, actions, false, ssd::host::allocation_class::tracked);
         if (!ticket) { throw std::runtime_error(ticket.error); }
-        if (needs_resize) { ring.unregister_buffers(); ring_unlock(); }
+        if (needs_resize) { sink_io_value(ring.unregister_buffers()); ring_unlock(); }
         for (auto & slot : slots) {
             for (int role = 0; role < 3; ++role) {
                 const bool new_block = slot.role[role].size < max_bytes[role];
                 slot.role[role].reserve(max_bytes[role]);
-                if (new_block) { sink_touch_pages(slot.role[role].data, slot.role[role].size, size_t(cache.page_size)); }
+                if (new_block) { ssd::host::touch_pages(slot.role[role].data, slot.role[role].size, size_t(cache.page_size)); }
                 else if (resident) { std::memset(slot.role[role].data, 0, slot.role[role].size); }
             }
         }
@@ -3712,13 +2447,13 @@ struct kimi_cpu_sink {
                     cache.data(request.cache_admit, role) : slots[request.io_slot].role[role].data;
             }
         }
-        if (ring.read_fixed && has_ring_reads && !ring.buffers_registered) {
+        if (ring.read_fixed() && has_ring_reads && !ring.buffers_registered()) {
             std::vector<iovec> buffers;
             buffers.reserve(3 * slots.size());
             for (const auto & slot : slots) {
                 for (const auto & buffer : slot.role) { buffers.push_back({ buffer.data, buffer.size }); }
             }
-            ring.register_buffers(buffers);
+            sink_io_value(ring.register_buffers(buffers));
         }
         current.ring_bytes = allocated;
         current.experts = requests.size();
@@ -4026,7 +2761,7 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
     std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
     const auto start = sink_clock::now();
-    const uint64_t completed_before = sink->ring.completed;
+    const uint64_t completed_before = sink->ring.completed();
     sink->current = {};
     sink->requests.clear();
     sink->begin_observation(up, false);
@@ -4391,8 +3126,8 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
         }
         if (sink->timeline_active) { sink->timeline_call[5] = ggml_time_us(); }
         sink->current.total_us = elapsed_us(start);
-        sink->current.read_completions = sink->ring.completed - completed_before;
-        sink->current.pending_reads = sink->ring.pending;
+        sink->current.read_completions = sink->ring.completed() - completed_before;
+        sink->current.pending_reads = sink->ring.pending();
         sink->finish_observation();
         if (stats) { *stats = sink->current; }
         sink->print_observation(true);
@@ -4408,8 +3143,8 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
         sink->cache.release();
         if (sink->timeline_active) { sink->timeline_call[5] = ggml_time_us(); }
         sink->current.total_us = elapsed_us(start);
-        sink->current.read_completions = sink->ring.completed - completed_before;
-        sink->current.pending_reads = sink->ring.pending;
+        sink->current.read_completions = sink->ring.completed() - completed_before;
+        sink->current.pending_reads = sink->ring.pending();
         sink->finish_observation();
         if (stats) { *stats = sink->current; }
         sink->print_observation(false);
@@ -4463,12 +3198,8 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     sink_configuration out;
     out.production = true;
     if (!services || !services->host) { throw std::runtime_error("missing process host budget client"); }
-    out.host = services->host;
     out.settings = *input;
-    if (services) {
-        out.events = services->events;
-        if (services->debug) { out.debug = *services->debug; }
-    }
+    sink_copy_services(out, services);
     auto integer = [&](const char * key) {
         const auto * value = out.settings.integer(key);
         if (!value) { throw std::runtime_error(std::string("missing typed ") + key); }
@@ -4483,6 +3214,10 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
             integer("host.headroom_mib") > UINT32_MAX || integer("vram.reserve_mib") > 8192 ||
             integer("vram.margin_mib") < integer("vram.reserve_mib") + 64 || integer("vram.margin_mib") > 8192) {
         throw std::runtime_error("invalid typed SSD executor dependencies");
+    }
+    const auto * gpu_budget = out.settings.vram_budget();
+    if ((gpu_budget->automatic || gpu_budget->bytes) && !out.has_gpu) {
+        throw std::runtime_error("nonzero GPU tier budget requires an injected GPU provider");
     }
     auto & p = out.policy;
     p.split_cv = p.ready_first = p.early_up_gate = p.role_major = p.nonblocking_down_sched = p.dynamic_rows = true;
@@ -4523,11 +3258,8 @@ kimi_cpu_sink * create(int total_threads, int ring_experts, const execution_poli
         }
         sink_configuration value;
         value.policy = policy;
-        if (services) {
-            value.host = services->host;
-            value.events = services->events;
-            if (services->debug) { value.debug = *services->debug; }
-        }
+        sink_copy_services(value, services);
+        if (policy.vram_budget && !value.has_gpu) { throw std::runtime_error("explicit GPU fixture requires an injected provider"); }
         return new kimi_cpu_sink(total_threads, ring_experts, resolver, userdata, value);
     } catch (const std::exception & e) {
         sink_error(error, error_size, e.what());
@@ -4737,7 +3469,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
     std::lock_guard<std::mutex> serial(sink->run_mutex);
     const auto start = sink_clock::now();
-    const uint64_t completed_before = sink->ring.completed;
+    const uint64_t completed_before = sink->ring.completed();
     sink->current = {};
     sink->requests.clear();
     sink->begin_observation(up, true);
@@ -4935,8 +3667,8 @@ extern "C" bool kimi_cpu_sink_run_activation(
         }
         if (sink->timeline_active) { sink->timeline_call[5] = ggml_time_us(); }
         sink->current.total_us = elapsed_us(start);
-        sink->current.read_completions = sink->ring.completed - completed_before;
-        sink->current.pending_reads = sink->ring.pending;
+        sink->current.read_completions = sink->ring.completed() - completed_before;
+        sink->current.pending_reads = sink->ring.pending();
         sink->observe_decode_layer(lanes_us, sink->current.total_us);
         sink->finish_observation();
         if (stats) { *stats = sink->current; }
@@ -4953,8 +3685,8 @@ extern "C" bool kimi_cpu_sink_run_activation(
         sink->cache.release();
         if (sink->timeline_active) { sink->timeline_call[5] = ggml_time_us(); }
         sink->current.total_us = elapsed_us(start);
-        sink->current.read_completions = sink->ring.completed - completed_before;
-        sink->current.pending_reads = sink->ring.pending;
+        sink->current.read_completions = sink->ring.completed() - completed_before;
+        sink->current.pending_reads = sink->ring.pending();
         sink->finish_observation();
         if (stats) { *stats = sink->current; }
         sink->print_observation(false);
@@ -4976,7 +3708,7 @@ extern "C" bool kimi_cpu_sink_run(
         output, stats, error, error_size);
 }
 
-#include "kimi-cpu-cache-executor.inc"
+#include "ssd/cpu-cache-executor.inc"
 
 #else
 

@@ -1,4 +1,4 @@
-#include "kimi-cpu-cache-policy.h"
+#include "ggml-ssd/host/cache-policy.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

@@ -27,6 +27,9 @@ int main() {
     changed = *api;
     changed.prefill_destroy = nullptr;
     if (ssd::cpu::valid(&changed) || ssd::cpu::valid(nullptr)) { return 5; }
+    changed = *api;
+    --changed.runtime_services_size;
+    if (ssd::cpu::valid(&changed)) { return 6; }
     std::puts("CPU_EXECUTOR_REGISTRY_ABI_PASS");
     return 0;
 }

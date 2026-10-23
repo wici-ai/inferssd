@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kimi-cpu-sink.h"
+#include "ggml-cpu/ssd/cpu-sink.h"
 #include "cpu-prefill.h"
 #include "ggml-ssd/settings/settings.h"
 #include "ggml-ssd/telemetry/telemetry.h"

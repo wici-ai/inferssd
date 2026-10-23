@@ -3,9 +3,9 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
-#include "kimi-cpu-sink.h"
-#include "kimi-cpu-prefill.h"
-#include "kimi-cache-location-api.h"
+#include "ssd/cpu-sink.h"
+#include "ssd/cpu-prefill.h"
+#include "ggml-ssd/gpu/kimi-cache-location-api.h"
 #include <thread>
 #include <array>
 #include <nlohmann/json.hpp>

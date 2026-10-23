@@ -1,4 +1,4 @@
-#include "kimi-cpu-cache-policy.h"
+#include "cache-policy.h"
 #include <algorithm>
 #include <cerrno>
 #include <cmath>

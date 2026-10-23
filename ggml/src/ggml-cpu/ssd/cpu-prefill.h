@@ -1,6 +1,6 @@
 #pragma once
 
-#include "kimi-cpu-sink.h"
+#include "cpu-sink.h"
 
 #ifdef __cplusplus
 extern "C" {

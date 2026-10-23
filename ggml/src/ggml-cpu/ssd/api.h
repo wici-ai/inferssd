@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-#include "kimi-cpu-prefill.h"
+#include "cpu-prefill.h"
 #include "runtime.h"
 #include "mac-runtime.h"
 #include "../../ggml-ssd/host/arbiter.h"
@@ -38,12 +38,14 @@ struct api_v2 {
         kimi_cpu_sink *, const ssd::settings::snapshot *, const ssd::runtime_services *,
         uint64_t, uint64_t, uint64_t) noexcept;
     bool (*attach_services)(ggml_backend_t, const ssd::runtime_services *) noexcept;
+    size_t runtime_services_size;
 };
 using get_api_v2 = const api_v2 * (*)();
 
 // Check the prefix before accessing members from a possibly different build.
 inline bool valid(const api_v2 * api) noexcept {
     return api && api->version == 2 && api->size == sizeof(api_v2) &&
+        api->runtime_services_size == sizeof(runtime_services) &&
         api->source_size &&
         api->create &&
         api->run &&

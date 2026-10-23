@@ -1,6 +1,6 @@
-#include "kimi-cpu-prefill.h"
-#include "kimi-cpu-sink-internal.h"
-#include "quants.h"
+#include "ssd/cpu-prefill.h"
+#include "ssd/cpu-sink-internal.h"
+#include "../quants.h"
 
 #include <algorithm>
 #include <atomic>

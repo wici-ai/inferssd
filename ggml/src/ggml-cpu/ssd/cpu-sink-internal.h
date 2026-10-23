@@ -1,8 +1,8 @@
 #pragma once
 
-#include "kimi-cpu-sink.h"
+#include "cpu-sink.h"
 #include <cmath>
-#include "../ggml-ssd/telemetry/telemetry.h"
+#include "ggml-ssd/telemetry/telemetry.h"
 
 // Matches mul(weight) followed by RMS normalization, then route scaling.
 inline void kimi_cpu_sink_normalize_expert(float * values, int rows, const float * norm, float eps) {

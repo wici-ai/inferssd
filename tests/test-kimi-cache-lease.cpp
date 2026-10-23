@@ -1,15 +1,17 @@
-#include "ssd/explicit-fixture-inputs.h"
 // Inspect private metadata without creating workers, a GPU context or a payload
 // arena. Real file identities exercise version rejection and RAM lease vetoes.
-#include "kimi-cpu-sink.cpp"
+#include "ggml-ssd/host/expert-cache.h"
+#include <stdexcept>
+using sink_cache = ssd::host::expert_cache;
+using sink_request = ssd::host::expert_request;
 int main() {
-    fixture_inputs inputs; try {
+    try {
     int checks = 0;
     auto require = [&](bool ok) { ++checks; if (!ok) throw std::runtime_error("cache lease assertion"); };
-    inputs.set("cache_policy", "lru");
     char path[] = "/tmp/kimi-cache-lease-XXXXXX";
     const int fd = mkstemp(path); require(fd >= 0); unlink(path);
-    sink_configuration configuration; configuration.policy = inputs.policy();
+    ssd::host::expert_cache_options configuration;
+    configuration.require_shared = false; configuration.cache_policy = "lru";
     sink_cache cache(configuration); sink_cache::layer layer; layer.id = 1; layer.count = 1;
     cache.layers.push_back(layer); cache.entries.resize(1); cache.stride = 12288;
     sink_request r; r.id = 5;

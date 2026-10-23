@@ -20,6 +20,8 @@
 struct fixture_inputs {
     std::map<std::string, std::string> values;
     ssd::telemetry::writer * events = nullptr;
+    ssd::runtime_services runtime;
+    void set_runtime_services(const ssd::runtime_services & value) { runtime = value; }
     int set(const char * key, const char * value) {
         if (value) { values[key] = value; } else { values.erase(key); }
         return 0;
@@ -70,7 +72,7 @@ struct fixture_inputs {
     }
     bool boolean(const char * key, bool fallback) const {
         const char * text = get(key);
-        if (!text || !*text) { return fallback; }
+        if (!text) { return fallback; }
         if (std::string(text) == "0") { return false; }
         if (std::string(text) == "1") { return true; }
         throw std::runtime_error(std::string("invalid fixture boolean ") + key);
@@ -206,7 +208,9 @@ struct fixture_inputs {
             char * error, size_t size) const noexcept {
         try {
             const auto selection = debug();
-            const ssd::runtime_services services{ events, &selection };
+            auto services = runtime;
+            services.events = events ? events : runtime.events;
+            services.debug = &selection;
             return ssd::cpu::testing::create(threads, depth, policy(), &services, resolver, userdata, error, size);
         } catch (const std::exception & e) {
             if (error && size) { std::snprintf(error, size, "%s", e.what()); }
