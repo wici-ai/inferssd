@@ -32,6 +32,10 @@ RuntimeDirectory=inferssd-ci-broker
 RuntimeDirectoryMode=0755
 UMask=0077
 NoNewPrivileges=yes
+# The trusted broker must drop HTTP clients to their separate UID even on
+# systemd versions that remove CAP_SETUID during sandbox setup. Candidate
+# units retain their own empty capability set.
+AmbientCapabilities=CAP_SETUID
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/inferssd-ci-broker /run/inferssd-ci-broker
