@@ -41,6 +41,12 @@ def local_request(port, method, path, body, timeout):
         return dict(status=response.status, headers=response.getheaders(),
                     started_monotonic_ns=started, ended_monotonic_ns=time.monotonic_ns(),
                     chunks=chunks)
+    except TimeoutError as error:
+        # Match the isolated Linux client's transport receipt. Only the explicit
+        # startup-health path may tolerate it; generation is never retried.
+        return dict(status=0, headers=[], transport_error=f"TimeoutError: {error}",
+                    started_monotonic_ns=started, ended_monotonic_ns=time.monotonic_ns(),
+                    chunks=chunks)
     finally:
         connection.close()
 

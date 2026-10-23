@@ -94,3 +94,93 @@ def test_native_observation_stage_uses_the_real_consumer(tmp_path, monkeypatch):
     assert receipt["legacy_log_present"] is False
     assert (output / "native-events.jsonl").read_bytes() == raw
     assert json.loads((output / "observation.json").read_text()) == receipt
+
+
+def test_smoke_waits_through_health_timeout_and_sends_one_completion(tmp_path, monkeypatch):
+    import base64
+    from dataclasses import asdict
+    import json
+    from ci import staged_smoke as smoke
+    from ci.stage_session import Stage
+
+    class Session:
+        health = 0
+        completions = 0
+
+        def start(self, *args):
+            return Stage('smoke', 'handle', 41, 62002, {'birth': 9}, 'owned-scope')
+
+        def call(self, stage, operation, **kwargs):
+            if operation == 'stage.poll':
+                return dict(running=True)
+            if operation == 'stage.probe':
+                return dict(asdict(stage), ready=True)
+            if operation == 'stage.stop':
+                return dict(returncode=0, cleanup_confirmed=True)
+            assert operation == 'stage.client'
+            request = kwargs['request']
+            path, body, status = request['path'], {}, 200
+            if path == '/health':
+                self.health += 1
+                if self.health == 1:
+                    return dict(status=0, chunks=[], transport_error='TimeoutError: timed out',
+                                started_monotonic_ns=100, ended_monotonic_ns=200)
+                status = 503 if self.health == 2 else 200
+            elif path == '/apply-template':
+                body = dict(tokens=[1, 2])
+            elif path == '/props':
+                body = dict(total_slots=1, default_generation_settings=dict(n_ctx=1024))
+            else:
+                assert path == '/completion' and request['body']['n_predict'] == 8
+                self.completions += 1
+                body = dict(tokens_predicted=8, truncated=False, stop_type='limit')
+            return dict(status=status, started_monotonic_ns=100, ended_monotonic_ns=200,
+                        chunks=[dict(elapsed_ns=1,
+                                     data_b64=base64.b64encode(json.dumps(body).encode()).decode())])
+
+        def output(self, *args):
+            return b'', 0, True
+
+    monkeypatch.setattr(smoke.time, 'sleep', lambda _: None)
+    monkeypatch.setattr(smoke, 'host_memory', lambda *_: None)
+    config = dict(model='muse', revision='a' * 40, argv=['/sealed/server'],
+                  environment={}, cwd='/scratch', port=18080, timeout_s=30,
+                  request_timeout_s=10)
+    session = Session()
+    result = smoke.smoke(session, config, tmp_path / 'run')
+    assert result['status'] == 'passed' and result['cleanup_confirmed'] is True
+    assert session.completions == 1 and session.health == 3
+    assert [json.loads(p.read_text())['status'] for p in sorted(
+        (tmp_path / 'run').glob('health-attempt-*.json'))] == [0, 503, 200]
+
+
+@pytest.mark.parametrize('failure_point', ['headers', 'body'])
+def test_local_http_timeout_is_recorded_and_never_accepted_as_completion(monkeypatch, failure_point):
+    from ci import staged_chat as chat
+
+    class Connection:
+        closed = False
+        status = 200
+
+        def request(self, *args):
+            pass
+
+        def getresponse(self):
+            if failure_point == 'headers':
+                raise TimeoutError('headers timed out')
+            return self
+
+        def readline(self, *args):
+            raise TimeoutError('body timed out')
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+    monkeypatch.setattr(chat.http.client, 'HTTPConnection', lambda *a, **k: connection)
+    receipt = chat.local_request(18080, 'GET', '/health', None, 2)
+    assert connection.closed and receipt['status'] == 0
+    assert receipt['transport_error'].startswith('TimeoutError:')
+    chat.validate_response(receipt, (0,))
+    with pytest.raises(ValueError, match='did not succeed'):
+        chat.validate_response(receipt)

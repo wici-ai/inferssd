@@ -59,6 +59,7 @@ def smoke(session, config, output, *, stage_id="candidate-smoke"):
         save(output / "started.json", stage.__dict__)
         deadline = time.monotonic() + config["timeout_s"]
         http = NativeHTTP(session, stage, config["port"])
+        health_attempt = 0
         while True:
             if time.monotonic() >= deadline:
                 raise TimeoutError("native smoke startup deadline")
@@ -67,7 +68,9 @@ def smoke(session, config, output, *, stage_id="candidate-smoke"):
                 raise RuntimeError("native server exited before readiness")
             probe = session.call(stage, "stage.probe", port=config["port"])
             if probe.get("ready", True):
-                health = http.request("GET", "/health", None, 2)
+                health = http.request("GET", "/health", None, 2, allow_health_timeout=True)
+                health_attempt += 1
+                save(output / f"health-attempt-{health_attempt:04d}.json", health)
                 if health["status"] == 200:
                     break
             time.sleep(0.2)
