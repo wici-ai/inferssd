@@ -27,21 +27,21 @@ vocabulary initialization and metadata logging; it is not a measured improvement
 in model prefill or decode throughput.
 
 Imported from WiCi AI's internal repository ssd-llama (not public) at commit
-`e79cddaa3a76730fa953b969b7f8c19693867fec`; the [import manifest](docs/ssdash/import-manifest.tsv)
+`e79cddaa3a76730fa953b969b7f8c19693867fec`; the [import manifest](docs/import-manifest.tsv)
 lists the origin of every changed path. Historical source hashes are plain text because that repository is
 not publicly accessible.
 
 ## Import structure
 
 1. An upstream snapshot of ggml-org/llama.cpp `f42e29fdf199481effd31f281bf095ec6067757b`, without upstream
-   project-process files. The `upstream` branch identifies this snapshot.
+   project-process files. Commit `8884f8314ce8ea96d62cd602b6bbf7fc25758a09` identifies this snapshot.
 2. Files marked `keep` or `carry-p6` copied byte for byte from the source seed.
 3. The planned CPU-only build guard, excluded launcher-test registration, required golden launcher fixture,
    and documentation cleanup. Runtime algorithms are unchanged by this step.
 4. Repository metadata, attribution, community documentation and verification tools.
 
 The golden launcher fixture is copied byte for byte from ssd-llama `1f174b4`. The example at
-`examples/simple/simple.cpp` retains its upstream version. Future ports and source-layout changes will be
+`engine/examples/simple/simple.cpp` retains its upstream version. Future ports and source-layout changes will be
 recorded here by their public pull-request numbers.
 
 ## Module origins
@@ -73,7 +73,7 @@ from the lane integration ending at `bdd1530696`, followed by the partial base
 admission fix `6d8cb2b`. They were applied as reviewed net patches against the
 seed; their original repository history was not merged. The standalone earlier
 cost patch `ca8d4ba` is superseded by the lane accounting implementation. This
-integration is reviewed in [PR #3](https://github.com/wici-ai/ssdash/pull/3).
+integration is reviewed in [PR #3](https://github.com/wici-ai/inferssd/pull/3).
 
 The initial Apple Silicon cache, launch scripts and historical benchmark assets
 come from ustc-sunny's Mac branch at `aee25da468cbdbb7c72d2293f86262d6933da657`.
@@ -81,9 +81,9 @@ Unchanged imported files retain that author's GitHub noreply attribution. The
 integration adapts the CPU source hook to the current engine, keeps one Muse
 parser, preserves the Linux streaming paths, and adds portable cache validation.
 The historical benchmark documents describe that original branch, not a measured
-performance claim for this SSDash revision. The newer GGUF alias reader and I/O
+performance claim for this InferSSD revision. The newer GGUF alias reader and I/O
 pipeline are separate work and require their own model validation. The original
-Mac integration is reviewed in [PR #10](https://github.com/wici-ai/ssdash/pull/10),
+Mac integration is reviewed in [PR #10](https://github.com/wici-ai/inferssd/pull/10),
 which supersedes the earlier PR #4.
 
 The GGUF alias source, bounded read-ahead, aligned reads and prefill cache isolation

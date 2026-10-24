@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "purpose": "release-comparison-reference-compatibility",
+  "base_revision": "08157d66c8702b29988be83e7c54fc51aa91b26e",
+  "base_tree": "58965a04306cb236fd938254ff5265bbf6165805",
+  "base_archive_sha256": "0e959bc47fe6d50add93795312786cb81d37f8425fef229a4aedf236edd7af41",
+  "base_verified_git_blobs": 8021,
+  "compatibility_source_revision": "6c6c81ceb51cb3abfb2dc421625060e30793bd69",
+  "patch_sha256": "faf7dc3a711f2f27fbeba97a31b1aefdaf559d7f4abdf8491a1e96193edf652c",
+  "files": [
+    {
+      "path": "ggml/src/ggml-cpu/kimi-cpu-sink-vram.inc",
+      "base_sha256": "86b063c7414bc717c1831679127bfdc146e9a780b655a0050060931c35fc2e94",
+      "patched_sha256": "541eed90dbb463adb43b08af6e3c80764e07083f63a99183abf12429612a1734"
+    },
+    {
+      "path": "ggml/src/ggml-cpu/kimi-cpu-sink.cpp",
+      "base_sha256": "8665d8905cfeda364493d63215d3b96983cb221bcff2f4d1614aaa5d013d284c",
+      "patched_sha256": "4a2a649bb7de8df1a245f0343f7fc82ec55c02609df11df65096059cb3ac0a13"
+    },
+    {
+      "path": "ggml/src/ggml-cpu/kimi-cpu-sink.h",
+      "base_sha256": "c14a00c04f550dd253a34ce9b6296c7886345f1d4e37a8542f9eacf3868eaacc",
+      "patched_sha256": "416e51b4a40bcb9fa5271c69b547204ec392fa1cd5e9ba83a30ec81b8a00ae06"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/moe_stream_batch.cu",
+      "base_sha256": "a981fdbd02fe8c1cf665bba064faef7a09ec2e59ab9e893cb03333c940796c40",
+      "patched_sha256": "3a54a59bf606da634fa387f05acb24ce126732a8616f78c3a11ea898633c4399"
+    },
+    {
+      "path": "ggml/src/ggml-cuda/moe_stream_batch_common.cu",
+      "base_sha256": "afe9062e0421ceefbcc33fa2f4efea8d1648c6665ace06b06a2ed7db2010da02",
+      "patched_sha256": "bb917984d83dd09c429b917b0c0cf3192a15d31eb175d02c8358958e102dffe7"
+    },
+    {
+      "path": "src/llama-cpu-sink.h",
+      "base_sha256": "a95d0a01e5528ebda3a20195c2f4c39c7b1dfb2a3abb5e1f03dc09e05be04eaf",
+      "patched_sha256": "6de472c233b6a55c3f41330d0ca11ebb2d9fdcdc03a7d1c2f9a9c67a216d2a93"
+    }
+  ],
+  "excluded_changes": [
+    "BF16/F16 expert support",
+    "dense-stream changes",
+    "mmvf/mmvq and Q2 kernel changes",
+    "CPU worker dispatch changes",
+    "thread-local host bounce reuse",
+    "later activation branch absent in v0.1.13"
+  ],
+  "review_status": "pending",
+  "formal_model_requests": 0
+}

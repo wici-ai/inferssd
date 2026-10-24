@@ -21,7 +21,7 @@ The launcher already sets what an agent client needs:
 | --- | --- | --- |
 | `--ctx-checkpoints` | 8 | 5 MiB each, in RAM: the points a conversation falls back to when a client changes an earlier turn |
 | `--cache-disk`, `--cache-disk-mib` | `PROMPT_CACHE_DIR`, `PROMPT_CACHE_MIB` | saved prompt states on disk: the shared system prompt and tools, and conversations another request displaced |
-| `--chat-template-file` | `models/templates/deepseek-ai-DeepSeek-V4.1.jinja` | DSML tool calls with the V4.1 tags |
+| `--chat-template-file` | `engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja` | DSML tool calls with the V4.1 tags |
 | `--chat-template-kwargs` | `{"drop_thinking": false}` | keeps the reasoning of earlier turns, as generated |
 
 Environment variables of the launcher that matter here:
@@ -41,7 +41,7 @@ Starting `llama-server` without the launcher, pass the same options:
 
 ```bash
 llama-server -m "$MODEL" ... \
-    --chat-template-file models/templates/deepseek-ai-DeepSeek-V4.1.jinja \
+    --chat-template-file engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja \
     --chat-template-kwargs '{"drop_thinking": false}' \
     --ctx-checkpoints 8 --cache-disk /var/cache/ssd-llama/dsv41 --cache-disk-mib 16384
 ```

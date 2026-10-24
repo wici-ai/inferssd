@@ -210,19 +210,28 @@ def fixed_identity(receipt):
                                           "os_page_cache_treatment")}}
 
 
-def run(config, output, lock_path, stop_path):
+def run(config, output, lock_path, stop_path, *, order=ORDER, purpose="formal", inherited_lock_fd=None, environment=None):
+    if purpose not in ("formal", "ci") or (purpose == "formal" and tuple(order) != ORDER):
+        raise ValueError("formal benchmark always runs both fixed tiers once")
+    if not order or len(set(order)) != len(order) or any(t not in ORDER for t in order):
+        raise ValueError("invalid or duplicate fixed prompt tier")
     # Use the established shared inode, including when it contains owner metadata.
-    with lock_path.open("a+") as lock:
+    if inherited_lock_fd is not None:
+        actual, expected = os.fstat(inherited_lock_fd), lock_path.stat()
+        if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+            raise ValueError("inherited CI lease differs from the device lock")
+    with (os.fdopen(os.dup(inherited_lock_fd), "a+") if inherited_lock_fd is not None
+          else lock_path.open("a+")) as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if stop_path.exists():
             raise RuntimeError("STOP exists; no arm was started")
-        for tier in ORDER:
+        for tier in order:
             final_chat.prompt_path(tier)
         output.mkdir(parents=True, exist_ok=False)
         run_id = str(uuid.uuid4())
         stream_chat.save(output / "manifest.json", {
-            "schema_version": 1, "protocol": final_chat.PROTOCOL, "run_id": run_id,
-            "order": ORDER, "samples_per_tier": 1, "config": config,
+            "schema_version": 1, "protocol": final_chat.PROTOCOL, "purpose": purpose, "run_id": run_id,
+            "order": order, "samples_per_tier": 1, "config": config,
             "owner_pid": os.getpid(), "started_unix_s": time.time(),
             "driver_sha256": {name: stream_chat.digest(Path(__file__).with_name(name).read_bytes())
                               for name in ("run_final.py", "final_chat.py", "stream_chat.py", "run_abba.py")},
@@ -233,7 +242,7 @@ def run(config, output, lock_path, stop_path):
         rows, abort_reason, identity = [], None, None
         try:
             with (output / "attempts.jsonl").open("x") as ledger:
-                for tier in ORDER:
+                for tier in order:
                     row = {"tier": tier, "device": config["device"], "model": config["model"],
                            "status": "not_run", "samples": 1}
                     if stop_path.exists() or interrupted:
@@ -244,7 +253,7 @@ def run(config, output, lock_path, stop_path):
                         arm_dir = output / tier
                         arm_dir.mkdir()
                         result_path, receipt_path = arm_dir / "result.json", arm_dir / "wrapper.json"
-                        env = dict(os.environ, SSDASH_RUN_ID=run_id, SSDASH_RUN_DIR=str(arm_dir),
+                        env = dict(os.environ if environment is None else environment, SSDASH_RUN_ID=run_id, SSDASH_RUN_DIR=str(arm_dir),
                                    SSDASH_RESULT_PATH=str(result_path), SSDASH_WRAPPER_RECEIPT=str(receipt_path),
                                    SSDASH_TIER=tier, SSDASH_PROMPT_PATH=str(final_chat.prompt_path(tier)),
                                    SSDASH_REQUEST_TIMEOUT=str(config["request_timeout_s"]),
@@ -301,8 +310,8 @@ def run(config, output, lock_path, stop_path):
                     ledger.flush()
             complete = all(row["status"] == "passed" for row in rows) and not interrupted and not stop_path.exists()
             stream_chat.save(output / "summary.json", {
-                "schema_version": 1, "protocol": final_chat.PROTOCOL, "run_id": run_id,
-                "complete": complete, "order": ORDER, "samples_per_tier": 1,
+                "schema_version": 1, "protocol": final_chat.PROTOCOL, "purpose": purpose, "run_id": run_id,
+                "complete": complete, "order": order, "samples_per_tier": 1,
                 "interrupted_signals": interrupted, "rows": rows,
             })
             return 0 if complete else 1

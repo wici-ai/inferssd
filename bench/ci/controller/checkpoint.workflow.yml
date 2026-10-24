@@ -1,0 +1,163 @@
+name: InferSSD reviewed Muse checkpoint
+
+# Deploy only in PRIVATE wici-ai/inferssd-device-ci on protected main.
+# Root-staged base/candidate inputs share one broker job and its device lease.
+# This is one Muse 512/256 pair, not the complete three-device performance gate.
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Fresh root-staged job ID (32 lowercase hexadecimal characters)
+        required: true
+        type: string
+      source_revision:
+        description: Reviewed candidate revision (full 40-character lowercase SHA)
+        required: true
+        type: string
+      config_sha256:
+        description: SHA-256 of the root-owned per-job checkpoint configuration
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  cloud-5090:
+    if: github.repository == 'wici-ai/inferssd-device-ci' && github.ref == 'refs/heads/main' && github.event.repository.private == true
+    runs-on: [self-hosted, Linux, X64, inferssd-device-ci, cloud-5090]
+    timeout-minutes: 120
+    concurrency:
+      group: physical-cloud-5090
+      cancel-in-progress: false
+    steps:
+      - name: Build and compare the reviewed base and candidate once
+        shell: bash
+        env:
+          CHECKPOINT_JOB_ID: ${{ inputs.job_id }}
+          CHECKPOINT_SOURCE_REVISION: ${{ inputs.source_revision }}
+          CHECKPOINT_CONFIG_SHA256: ${{ inputs.config_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          artifact="$RUNNER_TEMP/inferssd-checkpoint-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -m 700 "$artifact"
+          exec > >(tee "$artifact/controller.stdout.log") 2> >(tee "$artifact/controller.stderr.log" >&2)
+
+          [[ "$CHECKPOINT_JOB_ID" =~ ^[0-9a-f]{32}$ ]]
+          [[ "$CHECKPOINT_SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CHECKPOINT_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]]
+
+          control=/opt/inferssd-ci-control/current
+          python="$control/venv/bin/python"
+          config="/opt/inferssd-ci-integrations/$CHECKPOINT_JOB_ID.json"
+          "$python" -I - "$control" "$config" "$CHECKPOINT_CONFIG_SHA256" "$CHECKPOINT_SOURCE_REVISION" "$CHECKPOINT_JOB_ID" "$artifact" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+          control, config, expected_hash, expected_revision, job_id, output = sys.argv[1:]
+          if sys.version_info < (3, 10):
+              raise SystemExit("the operator-installed controller requires Python 3.10 or later")
+          sys.path.insert(0, str(Path(control) / "bench"))
+          from ci.contract import digest, load, save
+          from ci.isolated_device import protected
+          entry = protected(Path(control) / "bench/ci/staged_checkpoint.py")
+          config = protected(config)
+          if digest(config) != expected_hash:
+              raise SystemExit("root-staged checkpoint config hash differs")
+          value = load(config)
+          baseline = "f5e6e26ff26d2014cccef0118048039b88163f54"
+          if value.get("purpose") != "integration-checkpoint" or value.get("device") != "cloud-5090":
+              raise SystemExit("job config must identify the cloud-5090 integration checkpoint")
+          if value.get("candidate", {}).get("revision") != expected_revision:
+              raise SystemExit("job config does not bind the reviewed candidate revision")
+          if value.get("base", {}).get("revision") != baseline:
+              raise SystemExit("job config must use the fixed reviewed f5 baseline")
+          manifest_hash = value.get("manifest_sha256", "")
+          if not isinstance(manifest_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest_hash):
+              raise SystemExit("job config must bind the exact root broker manifest hash")
+          save(Path(output) / "dispatch.json", dict(
+              purpose="integration-checkpoint", device="cloud-5090", job_id=job_id,
+              base_revision=baseline, candidate_revision=expected_revision,
+              config_sha256=expected_hash, manifest_sha256=manifest_hash,
+              control_entry_sha256=digest(entry), python_version=sys.version,
+          ))
+          PY
+          "$python" -I "$control/bench/ci/staged_checkpoint.py" \
+            --socket /run/inferssd-ci-broker/broker.sock \
+            --job-id "$CHECKPOINT_JOB_ID" \
+            --config "$config" --config-sha256 "$CHECKPOINT_CONFIG_SHA256" \
+            --output "$artifact/$CHECKPOINT_JOB_ID"
+
+      - name: Retain the complete attempt, including failures
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: checkpoint-cloud-5090-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/inferssd-checkpoint-${{ github.run_id }}-${{ github.run_attempt }}/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Show the actual checkpoint report and scope
+        if: always()
+        shell: bash
+        env:
+          CHECKPOINT_JOB_ID: ${{ inputs.job_id }}
+        run: |
+          set -euo pipefail
+          /opt/inferssd-ci-control/current/venv/bin/python -I - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import re
+          print("### Muse 512/256 checkpoint")
+          print("One cloud-5090 base/candidate pair, one attempt per arm. No 4K sample.")
+          print("This is not the complete three-device gate or statistical proof of no regression.")
+          job_id, run_id, attempt = (os.environ[key] for key in (
+              "CHECKPOINT_JOB_ID", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
+          if not re.fullmatch(r"[0-9a-f]{32}", job_id) or not all(
+                  re.fullmatch(r"[0-9]+", value) for value in (run_id, attempt)):
+              print("No valid report path; no benchmark verdict is available.")
+              raise SystemExit(0)
+          report = Path(os.environ["RUNNER_TEMP"]) / f"inferssd-checkpoint-{run_id}-{attempt}" / job_id / "checkpoint.json"
+          try:
+              value = json.loads(report.read_text())
+              if (value.get("purpose") != "integration-checkpoint" or value.get("device") != "cloud-5090"
+                      or value.get("model") != "muse" or value.get("tier") != "512"
+                      or value.get("status") not in ("passed", "failed", "inconclusive")
+                      or value.get("full_device_gate") is not False):
+                  raise ValueError("unexpected checkpoint report identity or scope")
+          except (OSError, ValueError, AttributeError):
+              print("No valid checkpoint report was produced; no benchmark verdict is available. See the retained attempt logs.")
+              raise SystemExit(0)
+          print(f"\nActual checkpoint status: **{value['status']}**.")
+          print("Observed single-cell performance acceptance: " + json.dumps(value.get("performance_acceptance")) + ".")
+          print("Job cleanup confirmed: " + json.dumps(value.get("cleanup_confirmed")) + ".")
+          profile = value.get("reference_profile")
+          profile_id = profile.get("id") if isinstance(profile, dict) else None
+          print("Reference profile: " + json.dumps(profile_id if profile_id is not None else "unavailable") + ".")
+          settings = value.get("measurement_settings")
+          settings = settings if isinstance(settings, dict) else {}
+          budget = settings.get("expert_gpu_budget_bytes")
+          reserve = settings.get("allocator_reserve_mib")
+          print("Expert GPU budget (bytes or auto): " + json.dumps(budget if budget is not None else "unavailable") + ".")
+          print("Allocator reserve (MiB): " + json.dumps(reserve if reserve is not None else "unavailable") + ".")
+          if type(budget) is int and budget == 0:
+              print("**Expert GPU tier disabled; ready-context inference measurement only. This does not establish no regression for the original 8 GiB expert GPU tier configuration.**")
+          comparison = value.get("comparison")
+          metrics = comparison.get("metrics", {}) if isinstance(comparison, dict) else {}
+          if not isinstance(metrics, dict):
+              metrics = {}
+          def number(item):
+              return f"{item:.6g}" if type(item) in (int, float) and math.isfinite(item) else "unavailable"
+          print("\n| Metric | Base | Candidate | Candidate/base |")
+          print("| --- | ---: | ---: | ---: |")
+          for key in ("decode_first128_tps", "decode_second128_tps", "decode_tps", "ttft_s", "server_prefill_tps"):
+              row = metrics.get(key, {})
+              if not isinstance(row, dict):
+                  row = {}
+              print(f"| {key} | {number(row.get('base'))} | {number(row.get('candidate'))} | {number(row.get('ratio'))} |")
+          print("\nTTFT is lower-is-better; token rates are higher-is-better. Missing measurements remain unavailable.")
+          PY

@@ -1,0 +1,6 @@
+add_library(ggml-ssd-settings STATIC settings.cpp ../telemetry/telemetry.cpp ../telemetry/debug.cpp)
+target_compile_features(ggml-ssd-settings PUBLIC cxx_std_17)
+target_include_directories(ggml-ssd-settings PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
+find_package(Threads REQUIRED)
+target_link_libraries(ggml-ssd-settings PUBLIC Threads::Threads)
+set_target_properties(ggml-ssd-settings PROPERTIES POSITION_INDEPENDENT_CODE ON)

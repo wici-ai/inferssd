@@ -23,7 +23,7 @@ def load_core(manifest_path=None):
     loaded, identity = {}, {}
     if manifest_path is None:
         for name in MODULES:
-            module = importlib.import_module("ssdash.platform." + name)
+            module = importlib.import_module("inferssd.platform." + name)
             if module.CORE_API_VERSION != API_VERSION:
                 raise ValueError("unsupported installed ownership core API")
             path = Path(module.__file__).resolve(strict=True)
@@ -52,7 +52,7 @@ def load_core(manifest_path=None):
         verified_bytes[name] = source
     # Verify every member before importing any code. A private package namespace
     # binds relative imports to these verified modules without changing sys.path.
-    package_name = "ssdash_native_core_" + hashlib.sha256(manifest_bytes).hexdigest()
+    package_name = "inferssd_native_core_" + hashlib.sha256(manifest_bytes).hexdigest()
     package = types.ModuleType(package_name)
     package.__path__ = []
     sys.modules[package_name] = package

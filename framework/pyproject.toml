@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inferssd"
+version = "0.1.0"
+description = "InferSSD typed settings and owned inference runtime"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+inferssd = "inferssd.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+inferssd = ["py.typed", "configuration/schema.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+files = ["src/inferssd"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+extend-exclude = ["tests/fixtures", "tests/compat"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.ruff.lint.pyupgrade]
+keep-runtime-typing = true
+
+[tool.ruff.format]
+# Original observer inputs are hash-bound; keep linting and byte checks active.
+exclude = ["tests/launch_numeric_cases.py"]

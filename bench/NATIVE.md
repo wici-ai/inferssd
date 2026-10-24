@@ -157,8 +157,8 @@ tests do not load models or constitute final benchmark data.
 
 ## Shared ownership code and deployment
 
-The native wrapper uses the same `ssdash.platform.lease` and
-`ssdash.platform.process` and `ssdash.platform.guardian` implementations as the framework. With a normal wheel
+The native wrapper uses the same `inferssd.platform.lease` and
+`inferssd.platform.process` and `inferssd.platform.guardian` implementations as the framework. With a normal wheel
 installation, the wrapper imports those modules and records their actual file
 SHA-256 identities in `native_ownership_core`. Its required ownership API is 1;
 an absent package or unsupported API fails before launch.
@@ -167,10 +167,10 @@ For standalone deployment, prepare a new bundle explicitly:
 
 ```sh
 python3 bench/bundle_native.py --output /path/to/new-wrapper-bundle \
-  --core /path/to/admitted/ssdash/platform
+  --core /path/to/admitted/inferssd/platform
 ```
 
-Use the exact `ssdash/platform` directory from the admitted source or installed
+Use the exact `inferssd/platform` directory from the admitted source or installed
 wheel. Copy the **entire** resulting directory, including `ownership/`,
 `native-core.json` and `bundle-manifest.json`, and verify every manifest member
 before an attempt. The wrapper loads that adjacent manifest automatically;
@@ -180,3 +180,17 @@ unsupported bundle fails; it never falls back to another installed copy. No
 search-path modification or ambient checkout is used. Archive the complete
 bundle and manifest with the result. Timing, request and prompt protocols are
 unchanged.
+
+## Typed profile extension for InferSSD CI
+
+A new production profile can add `typed_settings` as an absolute `{path,sha256}`
+file specification. Its contents use the current `inferssd-settings 1` parser
+and complete sixteen-key registry. `expert.source` must equal the exact ordered
+`alias`/`aliases` paths;
+retired control environments are refused. The wrapper owns `--ssd-settings` and
+`--ssd-telemetry`, creates a fresh native-events path per arm, and checks the
+actual native `ssd.settings` publication against the pinned typed values. The
+settings file identity is checked before/after the request with the other small
+assets. The receipt includes typed values and exact launch policy in addition
+to the existing actual resource/build/model evidence. Legacy profiles remain a
+separate historical wrapper contract; InferSSD CI requires the typed extension.

@@ -157,3 +157,18 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# Product and direct-engine development outputs
+/engine/build*/
+/engine/models/*
+!/engine/models/.editorconfig
+!/engine/models/ggml-vocab-*.gguf*
+!/engine/models/templates/
+/engine/tools/server/webui/node_modules/
+/engine/tools/server/webui/dist/
+/framework/build/
+/framework/dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

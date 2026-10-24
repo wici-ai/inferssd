@@ -1,8 +1,8 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
 set -eu
-if [ "$#" -ne 3 ]; then
-    echo "usage: $0 <seed> <upstream-commit> <manifest>" >&2
+if [ "$#" -ne 4 ]; then
+    echo "usage: $0 <seed> <upstream-commit> <manifest> <historical-import-ref>" >&2
     exit 2
 fi
 python3 - "$@" <<'PY'
@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-seed, base, manifest = sys.argv[1:]
+seed, base, manifest, imported = sys.argv[1:]
 
 def git(*args):
     return subprocess.check_output(["git", *args])
@@ -34,7 +34,7 @@ if any(len(row) != 4 for row in rows):
 allowed = {"keep", "carry-p6", "keep-edit", "restore-upstream", "replace", "add", "drop", "exclude"}
 if any(row[2] not in allowed for row in rows):
     sys.exit("FAIL: unknown manifest disposition")
-head, source, original, snapshot = (tree(ref) for ref in ("HEAD", seed, base, "upstream"))
+head, source, original, snapshot = (tree(ref) for ref in (imported, seed, base, "8884f8314ce8ea96d62cd602b6bbf7fc25758a09"))
 errors = []
 planned = []
 for path, _, action, _ in rows:
@@ -64,7 +64,7 @@ for path in head:
 for path in planned:
     reference = seed if path in source else base
     print(f"\n--- Planned change: {path} ---", flush=True)
-    subprocess.run(["git", "diff", "--no-ext-diff", reference, "HEAD", "--", path], check=True)
+    subprocess.run(["git", "diff", "--no-ext-diff", reference, imported, "--", path], check=True)
 if errors:
     print("\n".join(f"FAIL: {error}" for error in errors), file=sys.stderr)
     sys.exit(1)

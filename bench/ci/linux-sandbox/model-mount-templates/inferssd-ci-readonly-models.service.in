@@ -1,0 +1,12 @@
+[Unit]
+Description=Restore reviewed read-only InferSSD model binds
+Before=inferssd-ci-broker.service
+RequiresMountsFor=@@SOURCE@@ @@TARGET@@
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/inferssd-ci-broker/ensure-readonly-models.py
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

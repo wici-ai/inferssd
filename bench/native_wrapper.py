@@ -96,7 +96,7 @@ def run_native(profile, environment, runtime, lock_fd, lease=None):
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
-        argv = common.server_argv(profile, port)
+        argv = common.server_argv(profile, port, out / "native-events.jsonl")
         env = common.clean_environment(profile)
         common.save(out / "launch.json", {"argv": argv, "environment": profile["environment"],
                                           "library_path": str(Path(profile["binary"]["path"]).resolve().parent)})
@@ -141,6 +141,14 @@ def run_native(profile, environment, runtime, lock_fd, lease=None):
         loaded_after = runtime.images(server.pid, "images-after")
         if loaded_before != loaded_after:
             raise ValueError("actual project image set or identity changed during the request")
+        if "typed_settings" in profile:
+            from inferssd.telemetry.jsonl import effective_settings, read_events
+            native_events = out / "native-events.jsonl"
+            with native_events.open(encoding="utf-8") as events:
+                actual = effective_settings(read_events(events))
+            if actual["values"] != common.typed_snapshot(profile).document()["values"]:
+                raise ValueError("native effective settings differ from the pinned typed snapshot")
+            evidence.append(native_events)
         after = common.verify_inputs(profile)
         if before != after:
             raise ValueError("build, model or input identity changed")
