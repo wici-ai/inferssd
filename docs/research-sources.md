@@ -8,7 +8,7 @@ Review means selected source paths and patches, not a whole-repository audit.
 | Source | Focus | Current status |
 |---|---|---|
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | Model compatibility, vocabulary loading, graphs and kernels | Selective vocabulary and Nemotron dimension ports prepared; see the October 23 report |
-| [Strata](https://github.com/Niko1221/Strata) | Expert indexing, Metal ownership, prefill overlap, measured scheduling costs | Indexing idea used in the separate cache candidate; broader designs pending |
+| [Strata](https://github.com/Niko1221/Strata) | Expert indexing, Metal ownership, prefill overlap, measured scheduling costs | Indexing candidate integrated into this branch; broader designs pending |
 | [Colibri](https://github.com/JustVugg/colibri) | Persistent expert history, admission hysteresis, scheduling | Selected implementations reviewed; no implementation copied |
 | [MoE-Infinity](https://github.com/TorchMoE/MoE-Infinity) | Prefetch budgets and computation/transfer overlap | Selected implementations reviewed; deferred pending workload evidence |
 | [HybriMoE](https://github.com/PKU-SEC-Lab/HybriMoE) | Routing-score smoothing and prefetch/cache interaction | Selected implementations reviewed; overlap with existing policies requires comparison |
@@ -60,5 +60,8 @@ on a Mac. It also does not establish benefits for SSD-resident experts from
 host-memory-to-GPU measurements alone.
 
 Prior evidence: [October 23 performance and model review](upstream-research-2026-10-23.md).
-The first-pass cache-index review is retained on the separate `mac-cache-index`
-branch. Adding a source here does not change benchmark results or enable a policy.
+The [first-pass cache-index review](cache-index-design-review.md) and its code are
+now integrated into this branch. The original `mac-cache-index` branch remains
+available. See the [main integration report](research-integration-2026-10-24.md)
+for current paths and validation. Adding a research source does not establish a
+throughput gain or enable an additional cache policy.

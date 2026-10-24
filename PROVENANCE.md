@@ -6,8 +6,8 @@ The explicit head-dimension RoPE calculation and non-standard GQA tensor shapes
 are selectively adapted from ggml-org/llama.cpp
 [`0693dbfb915f33233818373b5f6969396658d02c`](https://github.com/ggml-org/llama.cpp/commit/0693dbfb915f33233818373b5f6969396658d02c),
 [PR #23343](https://github.com/ggml-org/llama.cpp/pull/23343), by Martin Cimmino
-(MIT). Tensor loading remains in SSDash's `src/llama-model.cpp`, and conversion
-remains in the monolithic `convert_hf_to_gguf.py`. The no-`head_dim` conversion
+(MIT). Tensor loading remains in `engine/src/llama-model.cpp`, and conversion
+remains in the monolithic `engine/convert_hf_to_gguf.py`. The no-`head_dim` conversion
 fallback is preserved exactly. The upstream BPE/Metaspace/Domyn tokenizer changes
 are **not** included: this is not a claim of complete Domyn model support.
 
@@ -22,7 +22,7 @@ direct byte-codepoint lookup are adapted from ggml-org/llama.cpp
 [`824eaecf486f5ce0070f71501094b60f3cd70864`](https://github.com/ggml-org/llama.cpp/commit/824eaecf486f5ce0070f71501094b60f3cd70864),
 [PR #30679](https://github.com/ggml-org/llama.cpp/pull/30679), by Evgen Mykhailenko
 and Georgi Gerganov (MIT). The port retains SSDash's Kimi-K2 tokenizer branch.
-`tests/test-vocab-loading.cpp` adds local regression coverage. This targets
+`engine/tests/test-vocab-loading.cpp` adds local regression coverage. This targets
 vocabulary initialization and metadata logging; it is not a measured improvement
 in model prefill or decode throughput.
 
@@ -64,7 +64,7 @@ Strata's explicit expert-to-slot indexing at revision
 `011c9e600a93bbc9fd451c563501b5831c32bbca` informed the independently implemented
 Mac cache payload and per-tensor indexes. The existing SSDash cache policies,
 weight formats and CPU execution path are retained. See the
-[design review](docs/ssdash/cache-index-design-review.md) for scope and validation.
+[design review](docs/cache-index-design-review.md) for scope and validation.
 Retained literary prompt excerpts are from public-domain works, including Moby-Dick and Pride and Prejudice.
 
 Full third-party copyright and permission notices are in [NOTICE](NOTICE). Existing upstream attribution in

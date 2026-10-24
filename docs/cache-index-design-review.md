@@ -1,10 +1,13 @@
 <!-- SPDX-License-Identifier: MIT -->
 # Mac expert cache indexing: design review
 
-This candidate is based on SSDash `f5e6e26` (2026-10-23). It reduces metadata
+This review records the original candidate based on SSDash `f5e6e26` (2026-10-23).
+The candidate has since been integrated with reorganized main; see the
+[integration report](research-integration-2026-10-24.md) for current validation.
+It reduces metadata
 search work in the existing Mac expert reader; it does not introduce a new
 eviction policy, change expert routing, or move expert computation to Metal.
-It is a local candidate, not an accepted performance optimization.
+It is a review candidate, not an accepted performance optimization.
 
 ## First research pass
 
@@ -124,5 +127,5 @@ Real-model performance and Linux execution remain separate device checks.
   Bash lacks associative arrays, and cgroup/Linux prerequisites are absent.
   These are pending Linux checks, not passes or accepted skips.
 
-The live-model 512/4K comparisons have not been run. Publication and PR creation
-are intentionally outside this local implementation step.
+The live-model 512/4K comparisons have not been run. These original validation
+results do not replace checks against the integrated main revision.

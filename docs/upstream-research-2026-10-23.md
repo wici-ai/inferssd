@@ -1,4 +1,8 @@
 <!-- SPDX-License-Identifier: MIT -->
+
+This historical review is preserved with its original benchmark scope. For the
+subsequent main integration and current validation, see the
+[October 24 integration report](research-integration-2026-10-24.md).
 # Upstream design and model compatibility review, 2026-10-23
 
 ## Scope and decision
