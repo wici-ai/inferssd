@@ -34,6 +34,7 @@ jobs:
       - name: Production module boundaries
         run: |
           python3 scripts/inferssd/check-layering.py
+          python3 scripts/inferssd/test-layering.py
           python3 scripts/inferssd/check-layout.py
       - name: Shell and Python syntax
         run: |

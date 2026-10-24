@@ -5,6 +5,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "ssd/cpu-runtime.h"
+#include "ssd/model-adapter.h"
 #include "ssd/host-gather.h"
 #include "llama-io.h"
 #include "llama-memory.h"
@@ -212,7 +213,8 @@ llama_context::llama_context(
 #endif
     dense_gpu_phase_gate_enabled = cpu_sink_enabled;
     if (cpu_sink_enabled) {
-        if (model.arch != LLM_ARCH_DEEPSEEK41 && model.arch != LLM_ARCH_MUSE_SPARK) {
+        if (llama_ssd::describe_experts(model.arch, model.hparams, -1).activation ==
+                llama_ssd::expert_activation::unsupported) {
             throw std::runtime_error("SSD CPU experts require DeepSeek-V4.1 or Muse Spark");
         }
         if (cparams.n_seq_max != 1) {

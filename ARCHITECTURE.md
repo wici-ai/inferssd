@@ -24,6 +24,20 @@ same-build provider tables through ordinary backend registries and supplies
 context-owned services. The scheduler calls a borrowed hook table, so ggml-base
 has no dependency on the core implementation. Kernels stay in their backend.
 
+Model-specific SSD requirements are described in
+`engine/src/ssd/model-adapter`: expert layout/quantization relationships,
+activation and normalization requirements are validated before the shared MoE
+bridge creates an executor node. The context uses the same descriptor for its
+early support check. Executors consume validated operations rather than model
+identities; the ordinary shared MoE implementation remains in place.
+
+`engine/ggml/src/ggml-ssd/place/runtime-policy.h` owns numeric learning state and
+placement/prefetch decisions. Executors supply workload, resource and measured
+cost inputs, execute the returned request/rank plans using their existing
+caches, readers and workers, then publish feedback at the existing update
+points. Policy code has no sink, device, file or worker handles. It preserves
+the shared placement evaluator, arithmetic order and selection thresholds.
+
 The context owns sources, host registration, writer, transport and diagnostics.
 Executors borrow them. Graph failure fences outstanding seed consumers before
 reset. A precompute transaction restores touched and purged KV metadata without
