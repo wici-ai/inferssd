@@ -1,0 +1,14 @@
+[Unit]
+Description=InferSSD fixed Spark root staging socket
+
+[Socket]
+ListenStream=/run/inferssd-ci-stage.sock
+SocketUser=root
+SocketGroup=sparker
+SocketMode=0660
+Accept=yes
+MaxConnections=2
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -173,6 +173,15 @@ class StageSession:
             self.closed = True
             self.connection.close()
 
+    def abort(self):
+        """Interrupt an in-flight RPC; disconnect is never a cleanup receipt."""
+        if not self.closed:
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.close()
+
     def __enter__(self):
         self.open()
         return self

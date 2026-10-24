@@ -20,6 +20,11 @@ DEVICES = {"cloud-5090": "linux", "dgx-spark": "linux", "local-mbp": "darwin"}
 
 def run(args):
     config = load(args.config)
+    if config.get("purpose") == "selected-integration":
+        from ci.selected_integration import run as selected_run
+        return selected_run(args)
+    if getattr(args, "selection_plan_sha256", "") or getattr(args, "selection_parent", ""):
+        raise ValueError("a legacy readiness configuration cannot satisfy a selected plan")
     source_revision = revision(config["revision"])
     device = config["device"]
     if device not in DEVICES or config["paths"]["platform"] != DEVICES[device]:
@@ -117,6 +122,8 @@ def main():
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--config-sha256", required=True)
+    parser.add_argument("--selection-plan-sha256", default="")
+    parser.add_argument("--selection-parent", default="")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     return run(args)

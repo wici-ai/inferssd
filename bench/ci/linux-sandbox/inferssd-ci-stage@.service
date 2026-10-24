@@ -1,0 +1,22 @@
+[Unit]
+Description=InferSSD one bounded Spark root staging connection
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I /opt/inferssd-ci-control/current/bench/ci/operator_stage.py --root-bridge --peer-uid 1001
+StandardInput=socket
+StandardOutput=inherit
+StandardError=journal
+RuntimeMaxSec=300
+TimeoutStopSec=10
+KillMode=control-group
+MemoryMax=536870912
+TasksMax=32
+UMask=0022
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=no
+ReadWritePaths=/opt/inferssd-ci-integrations /var/lib/inferssd-ci-inputs /var/lib/inferssd-ci-broker/jobs
