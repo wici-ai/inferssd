@@ -236,7 +236,11 @@ def cancel_children(args, env=os.environ):
     policy, _, identity = environment(args, env)
     api = API(policy["controller_repository"], env["GITHUB_TOKEN"])
     results = {}
+    uncertain = False
     if args.artifacts.exists():
+        original = args.artifacts / "cancellation-requests.json"
+        prior = load(original) if original.exists() else None
+        prior_sha = digest(original) if prior is not None else None
         for path in sorted(args.artifacts.glob("*-dispatch.json")):
             child = load(path)
             parent = f"{identity['run_id']}-{identity['run_attempt']}"
@@ -244,11 +248,44 @@ def cancel_children(args, env=os.environ):
                     or child.get("inputs", {}).get("selection_parent") != parent):
                 raise ValueError("refuse cancellation of another controller's child")
             try:
-                results[path.name] = selection_dispatch.cancel(api, child)
+                claim = args.artifacts / ("cancellation-" + path.stem + "-attempt.json")
+                expected_claim = dict(schema_version=1, parent=parent, child_sha256=fingerprint(child),
+                                      run_id=child["id"], cleanup_confirmed=False)
+                attempted = prior is not None or claim.exists()
+                if not attempted:
+                    try:
+                        # Claim before the first possible POST. An interrupted
+                        # or ambiguous request is never an automatic retry.
+                        save(claim, expected_claim)
+                    except FileExistsError:
+                        attempted = True
+                if attempted:
+                    if claim.exists() and load(claim) != expected_claim:
+                        raise ValueError("prior cancellation claim identifies another child")
+                    run = api.call("actions/runs/" + str(child["id"]))
+                    selection_dispatch.run_identity(run, child["workflow_id"], child["controller_sha"], child["job_id"])
+                    previous = prior.get(path.name) if isinstance(prior, dict) else None
+                    unknown = (not isinstance(previous, dict) or previous.get("run_id") != child["id"] or "error" in previous
+                               or previous.get("prior_outcome_unknown") is True)
+                    results[path.name] = dict(run_id=child["id"], status=run.get("status"),
+                        conclusion=run.get("conclusion"), prior_attempt=True, prior_outcome_unknown=unknown,
+                        cancellation_requested=False, cleanup_confirmed=False)
+                    uncertain |= unknown or run.get("status") != "completed"
+                else:
+                    results[path.name] = selection_dispatch.cancel(api, child)
+                    uncertain |= results[path.name].get("cancellation_requested") is not False
             except Exception as error:
                 results[path.name] = dict(error=repr(error), cleanup_confirmed=False)
-        save(args.artifacts / "cancellation-requests.json", results)
-    return 0  # Request success is never a device acceptance or cleanup verdict.
+                uncertain = True
+        if prior is None:
+            save(original, results)
+        else:
+            save(args.artifacts / ("cancellation-recheck-" + str(time.time_ns()) + ".json"),
+                 dict(schema_version=1, parent=f"{identity['run_id']}-{identity['run_attempt']}",
+                      prior_requests_sha256=prior_sha, results=results, cleanup_confirmed=False))
+    # Closed Actions runs are not a physical cleanup verdict; only retained
+    # root guardian/unit/process evidence can establish that independently.
+    return 1 if uncertain else 0
 
 
 def operator_report(args, env=os.environ):

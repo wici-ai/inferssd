@@ -7,8 +7,10 @@ birth identity and lsof image inventory under its continuously enforced policy.
 
 import os
 import csv
+import hashlib
 import io
-from pathlib import Path
+import json
+from pathlib import Path, PurePosixPath
 import re
 
 from ci.contract import digest, load, save
@@ -26,6 +28,72 @@ def normalize(value, frozen):
     if isinstance(value, dict):
         return {key: normalize(item, frozen) for key, item in value.items()}
     return value
+
+
+def retained_typed_settings(native, expected, side, model, build, freeze_manifest, manifest_path):
+    """Compare a native snapshot to its receipt without broad path rewriting.
+
+    Only a source in the fixed candidate sandbox may share the receipt's sealed
+    spelling, and only when that exact asset is in the root freezer's hash-bound
+    inventory. Other typed values and direct model-shard paths remain exact.
+    """
+    if isinstance(native, dict) and isinstance(expected, dict) and native == expected:
+        return True
+    if (not isinstance(native, dict) or not isinstance(expected, dict) or set(native) != set(expected)
+            or any(native[key] != expected[key] for key in native if key != "expert.source")):
+        return False
+    if "expert.source" not in native:
+        return True
+    actual, reviewed = native["expert.source"], expected["expert.source"]
+    if (not isinstance(actual, list) or not isinstance(reviewed, list) or not actual
+            or len(actual) != len(reviewed)
+            or any(not isinstance(value, str) or not value or "\0" in value
+                   for value in [*actual, *reviewed])):
+        return False
+    if any("\\" in value or str(PurePosixPath(value)) != value
+           or any(part in (".", "..") for part in value.split("/")) for value in [*actual, *reviewed]):
+        return False
+    shards = {item["runtime_path"] for item in side["models"][model]["model_identity"]["shards"]}
+    assets = None
+    for observed, reference in zip(actual, reviewed):
+        if observed == reference and observed.startswith("/") and observed in shards:
+            continue
+        if assets is None:
+            frozen = build["freeze"]
+            host = frozen["host_path"]
+            if (not isinstance(manifest_path, str) or not re.fullmatch(
+                    r"/var/lib/inferssd-ci-broker/jobs/[0-9a-f]{32}/manifest\.json", manifest_path)
+                    or side["paths"]["frozen"] != "/build/candidate" or frozen["path"] != "/build/candidate"
+                    or frozen["side"] != "candidate" or not isinstance(host, str)
+                    or host != str(PurePosixPath(manifest_path).parent / "frozen/candidate")):
+                raise ValueError("retained source does not bind the fixed candidate freeze")
+            records = load(freeze_manifest)["files"]
+            encoded = json.dumps(records, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+            if (hashlib.sha256(encoded).hexdigest() != frozen["manifest_sha256"]
+                    or len(records) != frozen["files"]):
+                raise ValueError("retained source root freezer inventory differs")
+            assets = {}
+            for row in records:
+                name = row["path"]
+                if (not isinstance(name, str) or not name or name.startswith("/") or "\\" in name
+                        or any(part in ("", ".", "..") for part in name.split("/")) or name in assets):
+                    raise ValueError("retained source freezer member is unsafe or duplicated")
+                assets[name] = row
+        names = []
+        for value in (observed, reference):
+            prefix = next((p for p in ("/build/candidate/", "<sealed-build>/") if value.startswith(p)), None)
+            name = value[len(prefix):] if prefix else ""
+            if (not name.startswith("assets/") or "\\" in name
+                    or any(part in ("", ".", "..") for part in name.split("/"))):
+                return False
+            names.append(name)
+        if names[0] != names[1] or names[0] not in assets:
+            return False
+        row = assets[names[0]]
+        if (not isinstance(row.get("size"), int) or isinstance(row["size"], bool) or row["size"] <= 0
+                or not isinstance(row.get("sha256"), str) or not re.fullmatch("[0-9a-f]{64}", row["sha256"])):
+            raise ValueError("retained source asset lacks its sealed file identity")
+    return True
 
 
 def mac_images(raw, pid):

@@ -306,6 +306,74 @@ def test_functional_retained_identity_or_resources_cannot_be_rehashed_into_accep
     with pytest.raises(ValueError): aggregation.functional_retained(root, cfg, "deepseek", cell)
 
 
+@pytest.fixture
+def functional_alias_raw(functional_raw):
+    root, folder, cfg, cell = functional_raw
+    records = [dict(path="assets/deepseek-alias.tsv", size=12, sha256="d" * 64)]
+    save(root / "build-candidate/freeze-manifest.json", dict(files=records))
+    build = load(root / "build-candidate/build-receipt.json")
+    build["freeze"] = dict(side="candidate", path="/build/candidate",
+        host_path="/var/lib/inferssd-ci-broker/jobs/" + "f" * 32 + "/frozen/candidate",
+        files=len(records), manifest_sha256=impact.fingerprint(records))
+    (root / "build-candidate/build-receipt.json").write_text(json.dumps(build))
+    cfg["sides"]["candidate"]["paths"] = dict(frozen="/build/candidate")
+    cfg["manifest_path"] = "/var/lib/inferssd-ci-broker/jobs/" + "f" * 32 + "/manifest.json"
+    receipt = load(folder / "runtime-receipt.json")
+    receipt["host"]["effective_settings"]["native_launch_policy"]["typed_values"]["expert.source"] = ["<sealed-build>/assets/deepseek-alias.tsv"]
+    (folder / "runtime-receipt.json").write_text(json.dumps(receipt))
+    cell["runtime_receipt_sha256"] = digest(folder / "runtime-receipt.json")
+    (folder / "stderr.log").write_text('[ssd.settings] {"values":{"fixture":1,"expert.source":["/build/candidate/assets/deepseek-alias.tsv"]}}\n')
+    return root, folder, cfg, cell
+
+
+@pytest.mark.parametrize("native_source", ["/build/candidate/assets/deepseek-alias.tsv", "<sealed-build>/assets/deepseek-alias.tsv"])
+def test_functional_retained_accepts_only_the_same_sealed_alias(functional_alias_raw, native_source):
+    root, folder, cfg, cell = functional_alias_raw
+    (folder / "stderr.log").write_text('[ssd.settings] ' + json.dumps(dict(values={"fixture": 1, "expert.source": [native_source]})) + '\n')
+    aggregation.functional_retained(root, cfg, "deepseek", cell)
+
+
+def test_functional_retained_keeps_exact_source_semantics_without_linux_remapping(functional_raw):
+    root, folder, cfg, cell = functional_raw
+    source = "/Library/InferSSD-CI/jobs/owned/frozen/candidate/assets/deepseek-alias.tsv"
+    values = {"fixture": 1, "expert.source": [source]}
+    receipt = load(folder / "runtime-receipt.json")
+    receipt["host"]["effective_settings"]["native_launch_policy"]["typed_values"] = values
+    (folder / "runtime-receipt.json").write_text(json.dumps(receipt))
+    cell["runtime_receipt_sha256"] = digest(folder / "runtime-receipt.json")
+    (folder / "stderr.log").write_text('[ssd.settings] ' + json.dumps(dict(values=values)) + '\n')
+    aggregation.functional_retained(root, cfg, "deepseek", cell)
+
+
+@pytest.mark.parametrize("fault", ["prefix", "other-build", "parent", "dot", "double-slash", "asset", "missing-asset", "inventory-hash", "host-root", "other-job", "manifest-root", "runtime-root", "other-setting"])
+def test_functional_retained_source_spelling_cannot_hide_another_input(functional_alias_raw, fault):
+    root, folder, cfg, cell = functional_alias_raw
+    source = "/build/candidate/assets/deepseek-alias.tsv"
+    native = {"fixture": 1, "expert.source": [source]}
+    replacements = {"prefix": "/tmp/candidate/assets/deepseek-alias.tsv",
+        "other-build": "/build/candidate-extra/assets/deepseek-alias.tsv",
+        "parent": "/build/candidate/assets/../assets/deepseek-alias.tsv",
+        "dot": "/build/candidate/assets/./deepseek-alias.tsv",
+        "double-slash": "/build/candidate/assets//deepseek-alias.tsv",
+        "asset": "/build/candidate/assets/muse-alias.tsv"}
+    if fault in replacements:
+        native["expert.source"] = [replacements[fault]]
+    elif fault == "other-setting": native["fixture"] = 2
+    elif fault == "runtime-root": cfg["sides"]["candidate"]["paths"]["frozen"] = "/tmp/candidate"
+    elif fault == "manifest-root": cfg["manifest_path"] = "/tmp/manifest.json"
+    else:
+        build = load(root / "build-candidate/build-receipt.json")
+        if fault == "inventory-hash": build["freeze"]["manifest_sha256"] = "0" * 64
+        elif fault == "host-root": build["freeze"]["host_path"] = "/tmp/frozen/candidate"
+        elif fault == "other-job": build["freeze"]["host_path"] = "/var/lib/inferssd-ci-broker/jobs/" + "e" * 32 + "/frozen/candidate"
+        else:
+            (root / "build-candidate/freeze-manifest.json").write_text(json.dumps(dict(files=[])))
+            build["freeze"].update(files=0, manifest_sha256=impact.fingerprint([]))
+        (root / "build-candidate/build-receipt.json").write_text(json.dumps(build))
+    (folder / "stderr.log").write_text('[ssd.settings] ' + json.dumps(dict(values=native)) + '\n')
+    with pytest.raises(ValueError): aggregation.functional_retained(root, cfg, "deepseek", cell)
+
+
 def test_operator_execute_reuses_exact_child_and_cancellation_protocol(operator, monkeypatch):
     a = operator; controller.operator_preflight(a.args, a.env)
     calls = []
@@ -332,3 +400,70 @@ def test_operator_execute_refuses_modified_admission_before_any_child(operator):
     a.args.plan.write_text(json.dumps(admitted))
     with pytest.raises(ValueError, match="envelope changed"): controller.execute(a.args, a.env)
     assert not a.args.artifacts.exists()
+
+
+def cancellation_dispatch(operator):
+    a = operator
+    a.args.artifacts.mkdir()
+    child = dict(id=73, workflow_id=91, controller_sha=a.env["GITHUB_SHA"], job_id="f" * 32,
+                 inputs=dict(selection_parent="42-1"))
+    save(a.args.artifacts / "cloud-5090-dispatch.json", child)
+    return child
+
+
+def test_cancel_reentry_preserves_first_receipt_and_only_rechecks_exact_closed_child(operator):
+    a = operator; cancellation_dispatch(a)
+    assert controller.cancel_children(a.args, a.env) == 0
+    path = a.args.artifacts / "cancellation-requests.json"; original = path.read_bytes()
+    assert controller.cancel_children(a.args, a.env) == 0
+    assert path.read_bytes() == original
+    recheck = load(next(a.args.artifacts.glob("cancellation-recheck-*.json")))
+    result = recheck["results"]["cloud-5090-dispatch.json"]
+    assert result["run_id"] == 73 and result["status"] == "completed"
+    assert result["prior_outcome_unknown"] is False and result["cleanup_confirmed"] is False
+    assert a.calls.count("actions/runs/73") == 2
+
+
+@pytest.mark.parametrize("state", ["in_progress", "completed"])
+def test_cancel_reentry_does_not_repeat_an_ambiguous_request(operator, monkeypatch, state):
+    a = operator; cancellation_dispatch(a); posts = []
+    def ambiguous(api, child):
+        posts.append(child["id"])
+        raise RuntimeError("POST response lost")
+    monkeypatch.setattr(controller.selection_dispatch, "cancel", ambiguous)
+    assert controller.cancel_children(a.args, a.env) == 1
+    path = a.args.artifacts / "cancellation-requests.json"; original = path.read_bytes()
+    a.child["status"] = state
+    assert controller.cancel_children(a.args, a.env) == 1
+    assert posts == [73] and path.read_bytes() == original
+    recheck = load(next(a.args.artifacts.glob("cancellation-recheck-*.json")))
+    assert recheck["results"]["cloud-5090-dispatch.json"]["prior_outcome_unknown"] is True
+
+
+def test_cancel_claim_without_result_is_uncertain_and_never_reposted(operator, monkeypatch):
+    a = operator; child = cancellation_dispatch(a)
+    save(a.args.artifacts / "cancellation-cloud-5090-dispatch-attempt.json",
+         dict(schema_version=1, parent="42-1", child_sha256=impact.fingerprint(child), run_id=73, cleanup_confirmed=False))
+    monkeypatch.setattr(controller.selection_dispatch, "cancel", lambda *a: pytest.fail("must not repeat an uncertain request"))
+    assert controller.cancel_children(a.args, a.env) == 1
+    assert load(a.args.artifacts / "cancellation-requests.json")["cloud-5090-dispatch.json"]["prior_outcome_unknown"] is True
+
+
+def test_cancel_reentry_rejects_changed_child_identity(operator):
+    a = operator; cancellation_dispatch(a)
+    assert controller.cancel_children(a.args, a.env) == 0
+    original = (a.args.artifacts / "cancellation-requests.json").read_bytes()
+    a.child["head_sha"] = "0" * 40
+    assert controller.cancel_children(a.args, a.env) == 1
+    assert (a.args.artifacts / "cancellation-requests.json").read_bytes() == original
+    recheck = load(next(a.args.artifacts.glob("cancellation-recheck-*.json")))
+    assert "identity differs" in recheck["results"]["cloud-5090-dispatch.json"]["error"]
+
+
+def test_cancel_reentry_does_not_trust_a_prior_receipt_for_another_run(operator):
+    a = operator; cancellation_dispatch(a)
+    save(a.args.artifacts / "cancellation-requests.json", {
+        "cloud-5090-dispatch.json": dict(run_id=74, cancellation_requested=False, cleanup_confirmed=False)})
+    assert controller.cancel_children(a.args, a.env) == 1
+    recheck = load(next(a.args.artifacts.glob("cancellation-recheck-*.json")))
+    assert recheck["results"]["cloud-5090-dispatch.json"]["prior_outcome_unknown"] is True

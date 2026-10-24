@@ -13,6 +13,7 @@ from ci.staged_numerical import validate_csv
 from ci.staged_benchmark import verify_stopped, verify_runtime
 from ci.staged_checkpoint import mapped_files, native_settings
 from ci.selected_preflight import retained
+from ci.selected_receipt import retained_typed_settings
 from ci import model_admission
 
 
@@ -50,7 +51,9 @@ def functional_retained(root, config, model, cell):
             or runtime["host"]["os"] != config["host"]["os"]
             or effective["native_resource_policy"] != resources
             or effective["native_launch_policy"]["template_sha256"] != data["template"]["sha256"]
-            or native_settings(folder / "stderr.log")["values"] != effective["native_launch_policy"]["typed_values"]):
+            or not retained_typed_settings(native_settings(folder / "stderr.log")["values"],
+                effective["native_launch_policy"]["typed_values"], config["sides"]["candidate"], model, build,
+                root / "build-candidate/freeze-manifest.json", config.get("manifest_path"))):
         raise ValueError("functional typed inputs/host/receipt identity differs")
     previous = None
     for name in ("runtime-before.json", "runtime-after.json"):
