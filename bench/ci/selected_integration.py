@@ -11,7 +11,7 @@ from ci.impact import device_requirements
 from ci.private_controller import API, source_manifest
 from ci.selection_lifetime import ParentWatch
 from ci.selected_receipt import receipt
-from ci import selected_preflight
+from ci import selected_preflight, model_admission
 from ci.selection_contract import protected_binding
 from ci.stage_session import StageSession
 from ci.staged_benchmark import benchmark
@@ -27,6 +27,7 @@ def run(args):
     report = dict(schema_version=1, purpose="selected-integration", status="failed",
                   cleanup_confirmed=False, formal_samples=0, cells=[])
     session, watch = None, None
+    admitted = False
     try:
         config = protected_binding(args.config, args.config_sha256, args.selection_plan_sha256, args.job_id)
         control = Path(__file__).resolve().parents[2]
@@ -43,6 +44,8 @@ def run(args):
         (output / "root-manifest.json").write_bytes(Path(config["manifest_path"]).read_bytes())
         needs = device_requirements(plan, device)
         pairs = selected_preflight.declarations(config, manifest, needs)
+        admitted = model_admission.enabled(config)
+        model_admission.prepare(config, manifest, output)
         parent = getattr(args, "selection_parent", "")
         report.update(selection_parent=parent,
                       authorization_path="live-private-parent" if parent else "operator-root-staged")
@@ -63,6 +66,7 @@ def run(args):
         save(output / "job-opened.json", opened)
         if opened["manifest_sha256"] != config["manifest_sha256"]:
             raise ValueError("active broker job differs from root-staged selection")
+        model_admission.probe(session, config, manifest, "before", output)
         builds = {}
         sides = ("base", "candidate") if needs["performance"] else ("candidate",)
         for side in sides:
@@ -123,6 +127,7 @@ def run(args):
                 if compared["passed"] is not True:
                     raise RuntimeError("observed slowdown is inconclusive and blocks acceptance")
             report["cells"].append(cell)
+        model_admission.probe(session, config, manifest, "after", output)
         if watch is not None:
             watch.check()
         report["status"] = "passed"
@@ -139,6 +144,11 @@ def run(args):
             report["cleanup_confirmed"] = True
         except Exception as error:
             report.update(status="failed", cleanup_error=f"{type(error).__name__}: {error}")
+        if admitted and report["cleanup_confirmed"]:
+            try:
+                report["model_admission_sha256"] = model_admission.finalize(output, config, manifest)
+            except Exception as error:
+                report.update(status="failed", model_admission_error=f"{type(error).__name__}: {error}")
         if session is not None:
             session.close()
         if watch is not None:

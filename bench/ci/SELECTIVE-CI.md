@@ -145,3 +145,28 @@ blocks, not permission to relax the contract. Existing root-stage readiness runs
 use a different manual authorization path. Cloud DeepSeek and Spark Muse model
 admission gaps also remain explicit; inventory alone is not model admission.
 No settings, protection rule, runner installation or dispatch was changed here.
+
+Spark's existing UID1001/0664 GGUF originals may be used only through their
+root-controlled per-file readonly views. A selected root configuration must
+explicitly bind the existing `model_admission_path`/`model_admission_sha256`,
+`model_mount_proof_path`/`model_mount_proof_sha256`, and `prior_model_job_id`.
+Those small metadata files remain protected and immutable; `protected()` is not
+relaxed for GGUFs, settings, code, or proofs. The receipt checks the exact selected
+shards, original payload hashes and source/view identities, current view stats,
+and exact host readonly mounts without copying, chowning, or rehashing payloads.
+The proof's `source_path` is historical provenance; live checks cover the actually
+consumed readonly view and never fall back to the original source path.
+Missing or previously removed views refuse admission. This connection does not
+provision views or turn the old manual proof into automatic PR authorization.
+
+The existing StageSession protocol runs `model-readonly-before` as a build stage
+before freeze and `model-readonly-after` as a test stage after native work. Both
+use the fixed Python probe: GGUF magic readable, model/source O_RDWR denied, and
+model-parent O_TMPFILE denied. Counts derive from the selected mount set. The
+old proof's “required separately” text is not a passed worker check. The retained
+admission gate binds the two real probes to this job's manifest, handles, PID and
+birth identities, scopes, original lease and positive guardian/job cleanup. The
+hosted aggregate reconstructs that gate and rejects missing or stale evidence.
+Ordinary root-owned model inputs and the existing Mac protocol retain their
+previous contract. Root staging and actual device readiness remain separate
+operator prerequisites; local contract tests establish neither.

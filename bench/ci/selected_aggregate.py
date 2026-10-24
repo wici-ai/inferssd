@@ -9,6 +9,7 @@ from ci.impact import CASES, MARKERS, fingerprint, validate
 from ci.selection_contract import bound
 from ci.staged_numerical import validate_csv
 from ci.selected_preflight import retained
+from ci import model_admission
 
 
 def sealed(root, report):
@@ -50,6 +51,7 @@ def device_report(root, plan, policy, job, child):
             or report.get("control_manifest_sha256") != job["control_manifest_sha256"]
             or child.get("conclusion") != "success" or child.get("run_attempt") != 1):
         raise ValueError("selected result/source/controller/cleanup identity is not a clean single attempt")
+    model_admission.retained(root, config, manifest, report)
     if digest(root / "performance-preflight.json") != report.get("performance_preflight_sha256"):
         raise ValueError("selected preflight gate missing or changed")
     preflight = retained(root, config, needs)

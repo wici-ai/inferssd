@@ -13,7 +13,8 @@ import re
 
 from ci.contract import digest, load, save
 from ci.staged_build import sealed_file
-from ci.staged_checkpoint import file_identity, mapped_files, image_identity, native_settings
+from ci.staged_checkpoint import mapped_files, image_identity, native_settings
+from ci.model_admission import checked_model
 from ci.staged_benchmark import verify_runtime
 
 
@@ -141,9 +142,7 @@ def receipt(config, manifest, side, model, spec, build, output, *, destination=N
             # Apple shared-cache entries may lack a standalone file. Their path
             # inventory is bound to the exact root-observed OS build above.
             systems.append(dict(path=path, sha256=digest(path) if Path(path).is_file() else "os-shared-cache"))
-    for shard in model_identity["shards"]:
-        if file_identity(shard["host_path"]) != shard["stat"]:
-            raise ValueError("root-bound readonly model shard changed")
+    model_identity = checked_model(config, manifest, model, data)
     template = sealed_file(data["template"]["host_path"])
     settings, settings_raw = sealed_file(data["settings"]["host_path"], contents=True)
     if (template["sha256"] != data["template"]["sha256"]

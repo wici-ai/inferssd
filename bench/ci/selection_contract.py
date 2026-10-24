@@ -55,6 +55,8 @@ def requirements(config):
             raise ValueError("sealed build identity omits selected numerical images")
     if config["paths"] != config["sides"]["candidate"]["paths"]:
         raise ValueError("workflow platform guard must use the exact candidate paths")
+    from ci.model_admission import enabled
+    enabled(config)
     return needs
 
 
@@ -80,6 +82,10 @@ def bind(config, manifest, plan, policy):
                                  device=config["device"],
                                  source_revisions={k: plan[k] for k in ("base", "head", "candidate")})
     return config, manifest
+
+
+def manifest_sources(config, sides):
+    return {"sources": {side: config["sides"][side]["paths"]["source"] for side in sides}}
 
 
 def linux_stages(config, needs, sides):
@@ -111,6 +117,11 @@ def linux_stages(config, needs, sides):
     root = config["sides"]["candidate"]["paths"]["frozen"]
     for case in needs["numerical"]:
         add("candidate-numerical-" + case, "test", "candidate", root + "/bin/" + CASES[case][0], config["numerical"]["cwd"], True)
+    from ci.model_admission import enabled, probe_spec
+    if enabled(config):
+        for when in ("before", "after"):
+            probe = probe_spec(config, manifest_sources(config, sides), when)
+            add(probe["stage_id"], probe["kind"], "candidate", probe["argv"][0], probe["cwd"], False)
     return stages
 
 
