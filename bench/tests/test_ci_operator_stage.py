@@ -14,7 +14,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci import operator_prepare as prepare, operator_stage as stage
 from ci.contract import load
-from test_ci_operator_prepare import prepared_fixture, source as _source_fixture
+from test_ci_operator_prepare import prepared_fixture, changed_identity, source as _source_fixture
 
 git_source = _source_fixture
 
@@ -33,9 +33,12 @@ def packet(request, files, extra=None):
     return output.getvalue(), hashlib.sha256(members[0][1]).hexdigest()
 
 
-@pytest.fixture
-def staged(tmp_path, git_source, monkeypatch):
-    args, api = prepared_fixture(tmp_path, git_source, devices=["cloud-5090"])
+@pytest.fixture(params=[prepare.LEGACY_MODE, prepare.MODE, "control-only"])
+def staged(tmp_path, git_source, monkeypatch, request):
+    mode = prepare.MODE if request.param == "control-only" else request.param
+    args, api = prepared_fixture(tmp_path, git_source, devices=["cloud-5090"], mode=mode)
+    if request.param == "control-only":
+        changed_identity(args, "bench/ci/example.py")
     prepare.prepare(args, api)
     root = tmp_path / "fake-host"
     root.mkdir()
@@ -66,10 +69,19 @@ def staged(tmp_path, git_source, monkeypatch):
     broker = dict(device="cloud-5090", lock_identity=[original.st_dev, original.st_ino], lock_path=str(lock), stop_path=str(root / "STOP"))
     constants["BROKER_CONFIG"].write_text(json.dumps(broker))
     config["manifest_path"] = str(constants["BROOT"] / "jobs" / job / "manifest.json")
-    manifest["sources"] = {"candidate": str(constants["SROOT"] / ("operator-" + job))}
-    for model, data in config["sides"]["candidate"]["models"].items():
-        data["settings"]["host_path"] = str(constants["IROOT"] / (job + "-" + model + "-candidate-settings.ssd"))
-        manifest["models"]["settings-" + model + "-candidate.ssd"] = data["settings"]["host_path"]
+    sides = stage.source_sides(config)
+    manifest["sources"] = {side: str(constants["SROOT"] / ("operator-" + job) / side) if mode == prepare.MODE
+        else str(constants["SROOT"] / ("operator-" + job)) for side in sides}
+    for side in sides:
+        for model, data in config["sides"][side]["models"].items():
+            data["settings"]["host_path"] = str(constants["IROOT"] / (job + "-" + model + "-" + side + "-settings.ssd"))
+            manifest["models"]["settings-" + model + "-" + side + ".ssd"] = data["settings"]["host_path"]
+            data["template"]["host_path"] = manifest["sources"][side] + "/chat.jinja"
+    if mode == prepare.MODE:
+        import final_chat
+        path = constants["CONTROL"] / "bench/prompts/prompt-512.txt"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(final_chat.prompt_path("512").read_bytes())
     for name, value in (("manifest.json", manifest), ("config.json", config)):
         path = root / name
         if name == "config.json": value["manifest_sha256"] = prepare.digest(root / "manifest.json")
@@ -95,9 +107,19 @@ def test_plain_packet_seals_exact_git_bytes_and_preserves_lease_config(staged):
     assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
     assert not (root / "STOP").exists()
     source = Path(proof["source"]["root"])
-    assert (source / "new.cpp").read_bytes() == b"old\n"
-    assert stat.S_IMODE((source / "new.cpp").stat().st_mode) == 0o444
+    leaf = source / ("new.cpp" if (source / "new.cpp").exists() else "old.cpp")
+    assert leaf.read_bytes() == b"old\n"
+    assert stat.S_IMODE(leaf.stat().st_mode) == 0o444
     assert stat.S_IMODE(source.stat().st_mode) == 0o555
+    if "sources" in request:
+        assert proof["performance_protocol"] == stage.PERFORMANCE_PROTOCOL
+        assert set(proof["sources"]) == set(request["sources"])
+        if "base" in proof["sources"]:
+            assert Path(proof["sources"]["base"]["root"], "old.cpp").read_bytes() == b"old\n"
+            assert not Path(proof["sources"]["base"]["root"], "new.cpp").exists()
+            for model in ("muse", "deepseek"):
+                left, right = ((constants["IROOT"] / (request["job_id"] + "-" + model + "-" + side + "-settings.ssd")).read_bytes() for side in ("base", "candidate"))
+                assert left != right and stage.paired_settings(left, right)
     with pytest.raises(ValueError, match="fresh job"):
         stage.receive(expected, io.BytesIO(raw))
 
@@ -167,3 +189,32 @@ def test_gpu_preflight_is_read_only_and_never_kills_external_work(monkeypatch, m
         with pytest.raises(ValueError):
             stage.gpu_idle({}, policy)
     assert all(argv[0] == "/usr/bin/nvidia-smi" and "--format=csv,noheader" in argv for argv in calls)
+
+
+@pytest.mark.parametrize("staged", [prepare.MODE], indirect=True)
+@pytest.mark.parametrize("mutation", ["base-revision", "base-tree", "source-map-omitted", "settings-policy", "prompt", "template"])
+def test_double_source_root_admission_refuses_mixed_inputs(staged, mutation):
+    root, request, files, constants = staged
+    assert "sources" in request
+    if mutation == "base-revision": request["sources"]["base"]["revision"] = request["candidate"]
+    elif mutation == "base-tree": request["sources"]["base"]["tree"] = "0" * 40
+    elif mutation == "source-map-omitted":
+        del files["base-source-map.json"]
+        del request["files"]["base-source-map.json"]
+    elif mutation == "settings-policy":
+        policy = load(constants["POLICY"])
+        policy["side_settings_sha256"]["base"]["muse"] = "0" * 64
+        constants["POLICY"].write_text(json.dumps(policy))
+        request["policy_sha256"] = prepare.digest(constants["POLICY"])
+    elif mutation == "prompt": (constants["CONTROL"] / "bench/prompts/prompt-512.txt").write_text("wrong prompt")
+    else:
+        config = load(Path(files["config.json"]["local_path"]))
+        config["sides"]["base"]["models"]["muse"]["template"]["sha256"] = "0" * 64
+        path = Path(files["config.json"]["local_path"])
+        path.write_text(json.dumps(config))
+        files["config.json"].update(bytes=path.stat().st_size, sha256=prepare.digest(path))
+        request["files"]["config.json"].update(bytes=path.stat().st_size, sha256=prepare.digest(path))
+    raw, expected = packet(request, files)
+    with pytest.raises((ValueError, FileNotFoundError)):
+        stage.receive(expected, io.BytesIO(raw))
+    assert not (constants["IROOT"] / (request["job_id"] + ".json")).exists()

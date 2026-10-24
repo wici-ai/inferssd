@@ -97,6 +97,9 @@ def benchmark(session, side, config, output):
     prefix = config.get("stage_prefix", side)
     if tier not in ("512", "4096") or not re.fullmatch(r"[a-z0-9-]{1,64}", prefix):
         raise ValueError("fixed prompt tier and bounded stage identity required")
+    # Validate the trusted asset before a candidate process starts. record()
+    # and read_result() independently retain and recheck the same fixed hash.
+    final_chat.prompt_path(tier)
     timeout, request_timeout = config["timeout_s"], config["request_timeout_s"]
     final_chat.bounded_timeout(timeout)
     final_chat.bounded_timeout(request_timeout)
@@ -113,7 +116,8 @@ def benchmark(session, side, config, output):
                   side=side, model=config["model"], revision=config["revision"],
                   tier=tier, output_tokens=256, samples_per_tier=1,
                   completion_requests=0, performance_acceptance=False,
-                  cleanup_confirmed=False)
+                  cleanup_confirmed=False, formal_samples=0,
+                  prompt_sha256=final_chat.PROMPTS[tier][1])
     runtime = dict(schema_version=1, purpose="staged-benchmark-runtime", side=side,
                    job_id=session.job_id, observations={},
                    launch={key: config[key] for key in (

@@ -9,6 +9,8 @@ import copy
 import re
 from pathlib import PurePosixPath
 
+import final_chat
+
 from ci.contract import DEVICES, digest, load, policy_read
 from ci.impact import CASES, device_requirements, fingerprint, validate
 
@@ -16,6 +18,13 @@ from ci.impact import CASES, device_requirements, fingerprint, validate
 JOB = re.compile(r"[0-9a-f]{32}")
 OPERATOR_DEVICES = ("cloud-5090", "dgx-spark")
 FUNCTIONAL_MODE = "functional-numerical"
+PERFORMANCE_MODE = "functional-numerical-performance"
+
+
+def performance_protocol():
+    """The operator performance checkpoint is fixed, and is never a formal sample."""
+    return dict(tier="512", prompt_sha256=final_chat.PROMPTS["512"][1],
+                output_tokens=256, samples_per_side=1)
 
 
 def execution_scope(value):
@@ -23,11 +32,11 @@ def execution_scope(value):
     if not any(key in value for key in ("validation_mode", "execution_devices")):
         return None
     devices = value.get("execution_devices")
-    if (value.get("validation_mode") != FUNCTIONAL_MODE or not isinstance(devices, list)
+    if (value.get("validation_mode") not in (FUNCTIONAL_MODE, PERFORMANCE_MODE) or not isinstance(devices, list)
             or not devices or any(not isinstance(device, str) or device not in OPERATOR_DEVICES for device in devices)
             or len(set(devices)) != len(devices)):
         raise ValueError("operator scope requires a nonempty unique Linux device subset")
-    return dict(validation_mode=FUNCTIONAL_MODE, execution_devices=devices)
+    return dict(validation_mode=value["validation_mode"], execution_devices=devices)
 
 
 def runtime_requirements(config):
@@ -36,7 +45,13 @@ def runtime_requirements(config):
     if scope is not None:
         if config["device"] not in scope["execution_devices"]:
             raise ValueError("device is outside the sealed operator execution scope")
-        needs = dict(needs, performance={})
+        if scope["validation_mode"] == FUNCTIONAL_MODE:
+            needs = dict(needs, performance={})
+        else:
+            # Keep the canonical plan unchanged, including any required 4K
+            # coverage. This explicitly bounded operator run executes 512 only.
+            needs = dict(needs, performance={model: dict(required=value["required"],
+                tiers=["512"], output_tokens=256) for model, value in needs["performance"].items()})
     return needs
 
 
@@ -64,6 +79,13 @@ def requirements(config):
     if device not in DEVICES:
         raise ValueError("unknown physical device")
     needs = runtime_requirements(config)
+    scope = execution_scope(config)
+    if scope is not None and scope["validation_mode"] == PERFORMANCE_MODE:
+        protocol = config.get("performance_protocol")
+        if (protocol != performance_protocol()
+                or type(protocol.get("output_tokens")) is not int
+                or type(protocol.get("samples_per_side")) is not int):
+            raise ValueError("operator performance requires the fixed Azure 512/256 single-sample protocol")
     if not needs["models"]:
         raise ValueError("unselected device must not be dispatched")
     if (config.get("schema_version") != 1 or config.get("purpose") != "selected-integration"

@@ -33,7 +33,7 @@ def normalize(value, frozen):
 def retained_typed_settings(native, expected, side, model, build, freeze_manifest, manifest_path):
     """Compare a native snapshot to its receipt without broad path rewriting.
 
-    Only a source in the fixed candidate sandbox may share the receipt's sealed
+    Only a source in the fixed base/candidate sandbox may share its receipt's sealed
     spelling, and only when that exact asset is in the root freezer's hash-bound
     inventory. Other typed values and direct model-shard paths remain exact.
     """
@@ -61,12 +61,14 @@ def retained_typed_settings(native, expected, side, model, build, freeze_manifes
         if assets is None:
             frozen = build["freeze"]
             host = frozen["host_path"]
+            frozen_side = frozen.get("side")
             if (not isinstance(manifest_path, str) or not re.fullmatch(
                     r"/var/lib/inferssd-ci-broker/jobs/[0-9a-f]{32}/manifest\.json", manifest_path)
-                    or side["paths"]["frozen"] != "/build/candidate" or frozen["path"] != "/build/candidate"
-                    or frozen["side"] != "candidate" or not isinstance(host, str)
-                    or host != str(PurePosixPath(manifest_path).parent / "frozen/candidate")):
-                raise ValueError("retained source does not bind the fixed candidate freeze")
+                    or frozen_side not in ("base", "candidate")
+                    or side["paths"]["frozen"] != "/build/" + frozen_side
+                    or frozen["path"] != "/build/" + frozen_side or not isinstance(host, str)
+                    or host != str(PurePosixPath(manifest_path).parent / "frozen" / frozen_side)):
+                raise ValueError("retained source does not bind the fixed side freeze")
             records = load(freeze_manifest)["files"]
             encoded = json.dumps(records, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
             if (hashlib.sha256(encoded).hexdigest() != frozen["manifest_sha256"]
@@ -81,7 +83,7 @@ def retained_typed_settings(native, expected, side, model, build, freeze_manifes
                 assets[name] = row
         names = []
         for value in (observed, reference):
-            prefix = next((p for p in ("/build/candidate/", "<sealed-build>/") if value.startswith(p)), None)
+            prefix = next((p for p in ("/build/" + frozen_side + "/", "<sealed-build>/") if value.startswith(p)), None)
             name = value[len(prefix):] if prefix else ""
             if (not name.startswith("assets/") or "\\" in name
                     or any(part in ("", ".", "..") for part in name.split("/"))):

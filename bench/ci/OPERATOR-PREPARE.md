@@ -23,8 +23,10 @@ It contains reviewed device templates, model/settings identities and a profile:
       "gpu_uuid": "GPU-ACTUAL_UUID",
       "min_free_bytes": 8589934592,
       "rootstage_files": {
-        "settings-deepseek.ssd": "deepseek.ssd",
-        "settings-muse.ssd": "muse.ssd"
+        "settings-deepseek-base.ssd": "deepseek-base.ssd",
+        "settings-deepseek-candidate.ssd": "deepseek-candidate.ssd",
+        "settings-muse-base.ssd": "muse-base.ssd",
+        "settings-muse-candidate.ssd": "muse-candidate.ssd"
       },
       "ssh": {
         "argv": ["/usr/bin/ssh", "-T", "-a", "-o", "BatchMode=yes", "REVIEWED_ENDPOINT"],
@@ -41,9 +43,16 @@ The placeholder values above are not executable configuration. Both device
 profiles are required, but `--execution-devices` can choose one or both Linux
 devices. An optional per-device `job_id` must be fresh, distinct and 32 lowercase
 hex characters; otherwise preparation generates one. Old template job/source
-identities are replaced with the exact new identities. Base remains provenance
-metadata; this mode stages/builds only candidate. Template resource/model values
-are retained. Settings payload hashes must match the declarations.
+identities are replaced with the exact new identities. When the impact plan
+requires performance, both base and candidate are exported and built. Both sides
+use the same reviewed model/settings/resource values and unchanged prompt bytes;
+settings payload hashes must match their declarations.
+Each benchmark declares its timed `argv` and an explicit `preflight_argv`. They
+differ only in the single `--ssd-telemetry` destination, using distinct canonical
+files in that side's private scratch directory. Every other argument remains
+identical. Existing events are retained; the telemetry writer's exclusive-create
+contract is preserved. An identical functional launch can supply the short
+preflight without another request.
 
 Prepare a reviewable package without connecting to a device:
 
@@ -63,10 +72,12 @@ file, including files marked `export-ignore`; no checkout/filter/hook runs.
 
 `envelope.json` retains the canonical impact plan, including required Mac and
 performance cells. Separate `execution_devices` and `validation_mode` limit this
-run to Linux functional/numerical work. The complete workflow input must fit
-60 KiB; exceeding that bound refuses without truncation. No 256-token request
-is authorized by this mode, and its report cannot claim complete impact coverage
-or PR check publication.
+run to the two available Linux devices and the 512-tier performance comparison.
+Each required Linux model runs decode 256 once per side; 4K and offline Mac
+requirements remain explicit coverage gaps. Historical functional/numerical
+envelopes retain their old meaning. The complete workflow input must fit
+60 KiB; exceeding that bound refuses without truncation. The report cannot claim
+PR check publication or full impact coverage when required Mac/4K work is absent.
 
 Before enabling root staging, review and install each generated
 `DEVICE/policy.review.json` as the local root-owned, nonwritable
@@ -115,8 +126,8 @@ authorization mechanism. The sender uses non-PTY SSH and a plain tar stream,
 matching the root receiver's `r|` contract. Root holds the original lease during
 staging, rejects STOP, verifies GPU UUID and absence of compute work, checks the
 entire installed control manifest, reads model stat/RO mount metadata, and
-verifies every extracted Git blob before sealing source readonly. It installs
-only the reviewed candidate config/settings and job manifest, then returns an
+verifies every extracted Git blob before sealing each required source readonly.
+It installs only the reviewed two-sided config/settings and job manifest, then returns an
 identity-bound root receipt.
 
 Dispatch requires all chosen root receipts and an unchanged local account and
