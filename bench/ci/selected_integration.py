@@ -7,12 +7,11 @@ import time
 import run_final
 from ci.compare import comparable, compare_pair
 from ci.contract import digest, load, save
-from ci.impact import device_requirements
 from ci.private_controller import API, source_manifest
 from ci.selection_lifetime import ParentWatch
 from ci.selected_receipt import receipt
 from ci import selected_preflight, model_admission
-from ci.selection_contract import protected_binding
+from ci.selection_contract import protected_binding, runtime_requirements, execution_scope
 from ci.stage_session import StageSession
 from ci.staged_benchmark import benchmark
 from ci.staged_build import run_build
@@ -42,7 +41,10 @@ def run(args):
         (output / "selected-config.json").write_bytes(args.config.read_bytes())
         manifest = load(config["manifest_path"])
         (output / "root-manifest.json").write_bytes(Path(config["manifest_path"]).read_bytes())
-        needs = device_requirements(plan, device)
+        needs = runtime_requirements(config)
+        scope = execution_scope(config)
+        if scope is not None:
+            report.update(scope)
         pairs = selected_preflight.declarations(config, manifest, needs)
         admitted = model_admission.enabled(config)
         model_admission.prepare(config, manifest, output)
@@ -102,6 +104,11 @@ def run(args):
                     raise ValueError("observations do not bind actual native telemetry")
                 observe(session, observation, model, output / ("observations-" + model))
             cells[model] = dict(model=model, functional="passed", numerical={case: numeric[case] for case in needs["numerical"]}, performance=[])
+            if scope is not None:
+                folder = output / ("native-" + model)
+                receipt(config, manifest, "candidate", model, native, builds["candidate"], folder,
+                        destination=folder / "runtime-receipt.json")
+                cells[model]["runtime_receipt_sha256"] = digest(folder / "runtime-receipt.json")
         preflight = selected_preflight.run(session, config, manifest, pairs, builds, functional, output)
         report["performance_preflight_sha256"] = digest(output / "performance-preflight.json")
         for model in needs["models"]:

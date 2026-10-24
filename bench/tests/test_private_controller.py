@@ -266,12 +266,13 @@ def test_ephemeral_or_whole_driver_lower_uid_is_not_an_isolation_claim():
             isolated.isolation(config, "challenge", changed, 501)
 
 
-def test_public_workflow_cannot_schedule_physical_runner_and_private_token_only_publisher():
+def test_public_workflow_cannot_schedule_physical_runner_and_operator_report_has_no_source_writer():
     root = Path(__file__).parents[2]
     public = (root / ".github/workflows/device-performance.yml").read_text()
     private = (root / "bench/ci/controller/device-performance.yml").read_text()
     assert "self-hosted" not in public and "workflow_run:" not in public
-    assert "head_sha:" in private and "environment: physical-devices" in private
+    assert "prepared_envelope:" in private and "environment: physical-devices" in private
+    assert "SOURCE_READ_TOKEN" not in private and "DEVICE_CHECK_TOKEN" not in private and "CHECK_APP" not in private
     device = (root / "bench/ci/controller/integration-smoke.workflow.yml").read_text()
     assert (
         "source-data" not in device
@@ -280,7 +281,8 @@ def test_public_workflow_cannot_schedule_physical_runner_and_private_token_only_
     )
     assert "driver.py" not in device and "staged_integration.py" in device
     assert "selected_controller.py execute" in private
-    assert "if: always() &&" in private[private.index("\n  publish:"):]
+    assert "selected_controller.py operator_preflight" in private and "selected_controller.py operator_report" in private
+    assert "if: always() &&" in private[private.index("\n  report:"):]
 
 
 def test_default_broker_template_refuses_execution():

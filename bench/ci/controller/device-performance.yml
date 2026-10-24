@@ -1,25 +1,18 @@
-name: InferSSD impact-selected private controller
+name: InferSSD operator-authorized device report
+run-name: operator-selected-report
 
 # Export only to the protected main of PRIVATE wici-ai/inferssd-device-ci.
 # Hosted control reads PR metadata; candidate code runs only in root-stage sandboxes.
 on:
   workflow_dispatch:
     inputs:
-      pull_request:
-        description: Independently reviewed protected staging PR number
-        required: true
-        type: string
-      head_sha:
-        description: Full exact head SHA approved by a different maintainer
-        required: true
-        type: string
-      staged_jobs:
-        description: JSON object of selected device to reviewed root-stage dispatch-inputs
+      prepared_envelope:
+        description: Complete sealed operator/source/impact/scope/root-staged job envelope
         required: true
         type: string
 permissions: {}
 concurrency:
-  group: selected-pr-${{ inputs.pull_request }}
+  group: operator-selected-${{ github.actor }}
   cancel-in-progress: false
 jobs:
   control:
@@ -35,15 +28,15 @@ jobs:
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
-      - name: Admit exact source, complete changed paths and root-staged plan
+      - name: Admit sealed operator source and Linux execution scope
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          SOURCE_READ_TOKEN: ${{ secrets.INFERSSD_SOURCE_READ_TOKEN }}
           INFERSSD_CI_ENABLED: ${{ vars.INFERSSD_CI_ENABLED }}
-        run: python3 -I control/bench/ci/selected_controller.py preflight --control control --policy control/bench/ci/policy.json --plan admission.json
+        run: python3 -I control/bench/ci/selected_controller.py operator_preflight --control control --policy control/bench/ci/policy.json --plan admission.json
       - name: Dispatch and collect the same selected plan
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          INFERSSD_CI_ENABLED: ${{ vars.INFERSSD_CI_ENABLED }}
         run: python3 -I control/bench/ci/selected_controller.py execute --control control --policy control/bench/ci/policy.json --plan admission.json --artifacts selected-artifacts
       - name: Cancel any remaining exact child runs
         if: always()
@@ -62,10 +55,10 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  publish:
+  report:
     needs: control
     # No path filter or success-only dependency: rejected/missing jobs get a
-    # terminal failure, never a skipped job mistaken for physical acceptance.
+    # terminal failure report, never a skipped job mistaken for acceptance.
     if: always() && github.repository == 'wici-ai/inferssd-device-ci' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -82,20 +75,11 @@ jobs:
         with:
           name: selected-control-${{ github.run_id }}-${{ github.run_attempt }}
           path: retained
-      - name: Mint dedicated check App token only on the hosted publisher
-        id: check-app
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
-        with:
-          client-id: ${{ vars.INFERSSD_CHECK_APP_CLIENT_ID }}
-          private-key: ${{ secrets.INFERSSD_CHECK_APP_PRIVATE_KEY }}
-          owner: wici-ai
-          repositories: inferssd
-      - name: Publish a terminal exact-head selected result
+      - name: Rebuild scoped acceptance and write an Actions report
         env:
-          DEVICE_CHECK_TOKEN: ${{ steps.check-app.outputs.token }}
-          DEVICE_CHECK_APP_ID: ${{ vars.INFERSSD_CHECK_APP_ID }}
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -I control/bench/ci/selected_controller.py finalize --control control --policy control/bench/ci/policy.json --plan retained/admission.json --artifacts retained/selected-artifacts --output aggregate.json
+          INFERSSD_CI_ENABLED: ${{ vars.INFERSSD_CI_ENABLED }}
+        run: python3 -I control/bench/ci/selected_controller.py operator_report --control control --policy control/bench/ci/policy.json --plan retained/admission.json --artifacts retained/selected-artifacts --output aggregate.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

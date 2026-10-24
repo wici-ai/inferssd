@@ -1,13 +1,17 @@
 """Rebuild selected acceptance from raw artifacts, never from a green job alone."""
 
 from pathlib import Path, PurePosixPath
+import re
+from types import SimpleNamespace
 
 import run_final
 from ci.compare import comparable, compare_pair
 from ci.contract import digest, load
 from ci.impact import CASES, MARKERS, fingerprint, validate
-from ci.selection_contract import bound
+from ci.selection_contract import bound, execution_scope
 from ci.staged_numerical import validate_csv
+from ci.staged_benchmark import verify_stopped, verify_runtime
+from ci.staged_checkpoint import mapped_files, native_settings
 from ci.selected_preflight import retained
 from ci import model_admission
 
@@ -26,7 +30,54 @@ def sealed(root, report):
             raise ValueError("selected raw evidence missing or changed")
 
 
-def device_report(root, plan, policy, job, child):
+def functional_retained(root, config, model, cell):
+    """Recheck retained root probes; do not pretend to observe the device here."""
+    folder = root / ("native-" + model)
+    verify_stopped(load(folder / "stopped.json"))
+    if digest(folder / "runtime-receipt.json") != cell.get("runtime_receipt_sha256"):
+        raise ValueError("functional runtime receipt missing or changed")
+    runtime, started = load(folder / "runtime-receipt.json"), load(folder / "started.json")
+    build = load(root / "build-candidate/build-receipt.json")
+    data = config["sides"]["candidate"]["models"][model]
+    launch, resources = data["smoke"], config["host"]["resources"]
+    effective = runtime["host"]["effective_settings"]
+    identity = data["model_identity"]
+    if model_admission.enabled(config):
+        identity = dict(identity, readonly_admission=model_admission.binding(config))
+    if (runtime["model_identity"] != identity or runtime["build"]["revision"] != config["revision"]
+            or runtime["server"] != dict(pid=started["worker_pid"], start_identity=started["birth_identity"])
+            or runtime["host"]["hardware"] != config["host"]["hardware"]
+            or runtime["host"]["os"] != config["host"]["os"]
+            or effective["native_resource_policy"] != resources
+            or effective["native_launch_policy"]["template_sha256"] != data["template"]["sha256"]
+            or native_settings(folder / "stderr.log")["values"] != effective["native_launch_policy"]["typed_values"]):
+        raise ValueError("functional typed inputs/host/receipt identity differs")
+    previous = None
+    for name in ("runtime-before.json", "runtime-after.json"):
+        probe = load(folder / name)
+        verify_runtime(SimpleNamespace(**started), probe)
+        if (probe["cmdline"] != launch["argv"] or probe["executable"] != build["binary"]["runtime_path"]
+                or probe["executable_sha256"] != build["binary"]["sha256"]
+                or probe["cpus_allowed_list"] != resources["cpus_allowed_list"]
+                or probe["cgroup_limits"] != resources["cgroup_limits"]):
+            raise ValueError("retained functional executable/argv/resources differ")
+        lock = re.search(r"^Max locked memory\s+(\S+)\s+(\S+)\s+bytes\s*$", probe["proc_limits"], re.M)
+        environment = dict(probe["environment"])
+        if (not lock or lock.groups() != (str(resources["memlock_bytes"]),) * 2
+                or environment.pop("PWD", None) != launch["cwd"]):
+            raise ValueError("retained functional memlock/cwd differs")
+        for key, value in launch["environment"].items():
+            if environment.pop(key, None) != value:
+                raise ValueError("retained functional explicit environment differs")
+        maps = mapped_files(probe)
+        if environment != effective["ambient_environment"] or previous is not None and maps != previous:
+            raise ValueError("retained functional ambient environment/image identities changed")
+        if any(item["path"] not in maps for item in runtime["build"]["loaded_libraries"]):
+            raise ValueError("retained functional loaded images are absent from root maps")
+        previous = maps
+
+
+def device_report(root, plan, policy, job, child, scope=None):
     root = Path(root)
     report = load(root / "integration.json")
     sealed(root, report)
@@ -37,6 +88,8 @@ def device_report(root, plan, policy, job, child):
         raise ValueError("manual operator execution cannot satisfy a selected parent")
     config = load(root / "selected-config.json")
     manifest = load(root / "root-manifest.json")
+    if execution_scope(config) != scope:
+        raise ValueError("retained execution scope differs from the parent acceptance mode")
     needs = bound(config, manifest, job["job_id"])
     if (config["selection_plan"] != plan or digest(root / "selected-config.json") != job["config_sha256"]
             or digest(root / "root-manifest.json") != config["manifest_sha256"]):
@@ -51,6 +104,8 @@ def device_report(root, plan, policy, job, child):
             or report.get("control_manifest_sha256") != job["control_manifest_sha256"]
             or child.get("conclusion") != "success" or child.get("run_attempt") != 1):
         raise ValueError("selected result/source/controller/cleanup identity is not a clean single attempt")
+    if scope is not None and any(report.get(key) != value for key, value in scope.items()):
+        raise ValueError("executed report scope differs from its root-staged inputs")
     model_admission.retained(root, config, manifest, report)
     if digest(root / "performance-preflight.json") != report.get("performance_preflight_sha256"):
         raise ValueError("selected preflight gate missing or changed")
@@ -85,6 +140,11 @@ def device_report(root, plan, policy, job, child):
         response = load(root / ("native-" + model) / "response.json")
         if response.get("tokens_predicted") != 8 or response.get("stop_type") != "limit" or response.get("truncated") is not False:
             raise ValueError("selected model did not complete its actual short request")
+        if scope is not None:
+            rows_for_model = [cell for cell in report["cells"] if cell.get("model") == model]
+            if len(rows_for_model) != 1:
+                raise ValueError("functional model receipt is missing or repeated")
+            functional_retained(root, config, model, rows_for_model[0])
         performance = []
         for tier in needs["performance"].get(model, {}).get("tiers", []):
             data, receipts = {}, {}
@@ -106,8 +166,12 @@ def device_report(root, plan, policy, job, child):
             if load(root / model / tier / "comparison.json") != compared or compared["passed"] is not True:
                 raise ValueError("selected performance failed or is inconclusive")
             performance.append(dict(tier=tier, **compared))
+        required_performance = next(cell["performance"]["required"] for cell in plan["cells"]
+                                    if cell["device"] == job["device"] and cell["model"] == model)
+        deferred = scope is not None and required_performance
         rows.append(dict(device=job["device"], model=model, status="passed", functional="passed",
-                         numerical="passed", performance=performance or "not-required"))
+                         numerical="passed", performance=performance or (
+                             "deferred-not-in-this-run" if deferred else "not-required")))
     return rows
 
 
@@ -123,4 +187,35 @@ def aggregate(plan, policy, artifacts, jobs, children):
         except (OSError, ValueError, KeyError, TypeError) as error:
             errors.append(dict(device=device, error=str(error)))
     return dict(schema_version=1, purpose="selected-ci", passed=not errors,
+                selection_plan_sha256=fingerprint(plan), cells=rows, errors=errors, formal_samples=0)
+
+
+def operator_aggregate(plan, policy, artifacts, jobs, children, scope):
+    """Report this authorized run without claiming the entire impact is covered."""
+    validate(plan, policy)
+    if execution_scope(scope) != scope:
+        raise ValueError("explicit operator execution scope required")
+    devices = set(scope["execution_devices"])
+    if set(jobs) != devices or set(children) != devices:
+        raise ValueError("operator results must exactly cover the declared devices")
+    rows, errors = [], []
+    for cell in plan["cells"]:
+        if not cell["required"]:
+            rows.append(dict(device=cell["device"], model=cell["model"], status="not-required", reason=cell["reason"]))
+        elif cell["device"] not in devices:
+            status = "deferred-offline" if cell["device"] == "local-mbp" else "deferred-not-in-this-run"
+            rows.append(dict(device=cell["device"], model=cell["model"], status=status,
+                             functional=status, numerical=status,
+                             performance="deferred-not-in-this-run" if cell["performance"]["required"] else "not-required"))
+    for device in scope["execution_devices"]:
+        try:
+            rows += device_report(Path(artifacts) / device / jobs[device]["job_id"], plan, policy,
+                                  jobs[device], children[device], scope)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            errors.append(dict(device=device, error=str(error)))
+    complete = not errors and all(cell["status"] in ("passed", "not-required")
+                                  and cell.get("performance") != "deferred-not-in-this-run" for cell in rows)
+    return dict(schema_version=1, purpose="operator-selected-report-only", passed=not errors,
+                full_impact_coverage_complete=complete, pr_publication="not-enabled",
+                source_identity="sealed-source-not-current-pr", **scope,
                 selection_plan_sha256=fingerprint(plan), cells=rows, errors=errors, formal_samples=0)

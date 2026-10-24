@@ -14,6 +14,41 @@ from ci.impact import CASES, device_requirements, fingerprint, validate
 
 
 JOB = re.compile(r"[0-9a-f]{32}")
+OPERATOR_DEVICES = ("cloud-5090", "dgx-spark")
+FUNCTIONAL_MODE = "functional-numerical"
+
+
+def execution_scope(value):
+    """An explicit run scope never edits the canonical impact requirements."""
+    if not any(key in value for key in ("validation_mode", "execution_devices")):
+        return None
+    devices = value.get("execution_devices")
+    if (value.get("validation_mode") != FUNCTIONAL_MODE or not isinstance(devices, list)
+            or not devices or any(not isinstance(device, str) or device not in OPERATOR_DEVICES for device in devices)
+            or len(set(devices)) != len(devices)):
+        raise ValueError("operator scope requires a nonempty unique Linux device subset")
+    return dict(validation_mode=FUNCTIONAL_MODE, execution_devices=devices)
+
+
+def runtime_requirements(config):
+    needs = device_requirements(config["selection_plan"], config["device"])
+    scope = execution_scope(config)
+    if scope is not None:
+        if config["device"] not in scope["execution_devices"]:
+            raise ValueError("device is outside the sealed operator execution scope")
+        needs = dict(needs, performance={})
+    return needs
+
+
+def selection_identity(config):
+    plan = config["selection_plan"]
+    identity = dict(plan_sha256=fingerprint(plan), config_payload_sha256=payload_hash(config),
+                    device=config["device"],
+                    source_revisions={k: plan[k] for k in ("base", "head", "candidate")})
+    scope = execution_scope(config)
+    if scope is not None:
+        identity.update(scope)
+    return identity
 
 
 def payload_hash(config):
@@ -28,7 +63,7 @@ def requirements(config):
     device = config["device"]
     if device not in DEVICES:
         raise ValueError("unknown physical device")
-    needs = device_requirements(plan, device)
+    needs = runtime_requirements(config)
     if not needs["models"]:
         raise ValueError("unselected device must not be dispatched")
     if (config.get("schema_version") != 1 or config.get("purpose") != "selected-integration"
@@ -77,10 +112,7 @@ def bind(config, manifest, plan, policy):
         manifest["stages"] = linux_stages(config, needs, sides)
     else:
         manifest["selection_resource_policy"] = config["host"]["resources"]
-    manifest["selection"] = dict(plan_sha256=fingerprint(plan),
-                                 config_payload_sha256=payload_hash(config),
-                                 device=config["device"],
-                                 source_revisions={k: plan[k] for k in ("base", "head", "candidate")})
+    manifest["selection"] = selection_identity(config)
     return config, manifest
 
 
@@ -127,10 +159,7 @@ def linux_stages(config, needs, sides):
 
 def bound(config, manifest, job_id):
     needs = requirements(config)
-    plan = config["selection_plan"]
-    expected = dict(plan_sha256=fingerprint(plan), config_payload_sha256=payload_hash(config),
-                    device=config["device"],
-                    source_revisions={k: plan[k] for k in ("base", "head", "candidate")})
+    expected = selection_identity(config)
     if (not JOB.fullmatch(job_id) or manifest.get("job_id") != job_id
             or manifest.get("selection") != expected):
         raise ValueError("root broker manifest/config/selected source binding differs")
