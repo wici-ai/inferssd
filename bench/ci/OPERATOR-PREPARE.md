@@ -80,7 +80,18 @@ runner home or `/etc/shadow` are refused. All new destinations are fixed CI
 prefixes with fresh exclusive writes. Existing model bytes/mounts, broker config,
 lock and STOP are not changed.
 
-For a separately reviewed narrow NOPASSWD entry, Spark's profile uses
+On a nonroot host, install the reviewed `inferssd-ci-stage.socket` and
+`inferssd-ci-stage@.service` templates with the actual permitted peer UID/group.
+The same fixed Python command above becomes a local client of
+`/run/inferssd-ci-stage.sock`; use `sudo_password_required: false` and omit
+`sudo_mode`. The root service accepts only that UID, a bounded SHA header and
+the plain tar, then invokes the same policy-bound receiver. Its fixed service
+command and owner-controlled socket do not grant arbitrary root commands.
+Keep the socket outside candidate worker mounts. Preserve vendor sudo/SSH
+policy; do not change its ordering to obtain passwordless execution. Review
+the forced SSH command as well: it must accept this exact client command.
+
+For an existing permitted and separately reviewed narrow NOPASSWD entry, a profile uses
 `sudo_mode: "nopasswd"`, `sudo_password_required: false`, and the fixed root argv
 `["/usr/bin/sudo", "-n", "/usr/bin/python3", "-I",
 "/opt/inferssd-ci-control/current/bench/ci/operator_stage.py"]`. It does not permit

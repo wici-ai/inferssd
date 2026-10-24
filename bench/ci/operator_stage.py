@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Root-only, once-only Linux operator staging. Never executes candidate code.
+"""Once-only Linux operator staging with a fixed Spark root socket bridge.
 
 The SSH sender passes the reviewed first-member SHA out of band and sends a
 plain tar stream. Existing broker config, model mounts, lease and STOP are not
 modified. A failed fresh job remains evidence and cannot be reused.
+Non-root Spark callers forward only the same hash and tar to the root service.
 """
 
 import argparse
@@ -14,11 +15,15 @@ import math
 import os
 from pathlib import Path, PurePosixPath
 import re
+import select
 import shutil
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 
 BROOT = Path("/var/lib/inferssd-ci-broker")
@@ -28,6 +33,10 @@ CONTROL = Path("/opt/inferssd-ci-control/current")
 BROKER_CONFIG = Path("/opt/inferssd-ci-broker/config.json")
 POLICY = Path("/opt/inferssd-ci-control/operator-policy.json")
 LIMIT = 512 << 20
+BRIDGE_SOCKET = Path("/run/inferssd-ci-stage.sock")
+BRIDGE_TIMEOUT = 300
+WIRE_LIMIT = LIMIT + (16 << 20)
+RESPONSE_LIMIT = 1 << 20
 
 
 def parsed(raw):
@@ -337,8 +346,150 @@ def receive(expected_sha256, incoming=None):
             os.close(fd)
 
 
-if __name__ == "__main__":
+def remaining(deadline):
+    value = deadline - time.monotonic()
+    if value <= 0:
+        raise TimeoutError("fixed staging bridge deadline exceeded")
+    return value
+
+
+def peer_uid(connection):
+    if not hasattr(socket, "SO_PEERCRED"):
+        fail("Linux SO_PEERCRED is required")
+    return struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
+
+
+def input_chunks(incoming, deadline):
+    try:
+        descriptor = incoming.fileno()
+    except (OSError, AttributeError):
+        descriptor = None
+    while True:
+        if descriptor is not None:
+            if not select.select([descriptor], [], [], remaining(deadline))[0]:
+                raise TimeoutError("staging stdin deadline exceeded")
+            block = os.read(descriptor, 1 << 20)
+        else:
+            remaining(deadline)
+            block = incoming.read(1 << 20)
+        if not block:
+            return
+        yield block
+
+
+def client(expected_sha256, incoming=None):
+    """Forward the fixed root-stage input; no caller-supplied command or path."""
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        fail("reviewed stage input SHA required")
+    protected(BRIDGE_SOCKET.parent, directory=True)
+    info = BRIDGE_SOCKET.lstat()
+    if (not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o660):
+        fail("fixed bridge socket owner/type/mode differs")
+    deadline = time.monotonic() + BRIDGE_TIMEOUT
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(min(10, remaining(deadline)))
+        connection.connect(str(BRIDGE_SOCKET))
+        if peer_uid(connection) != 0:
+            fail("staging bridge peer is not root")
+        connection.settimeout(remaining(deadline))
+        connection.sendall((expected_sha256 + "\n").encode())
+        total = 0
+        for block in input_chunks(incoming or sys.stdin.buffer, deadline):
+            total += len(block)
+            if total > WIRE_LIMIT:
+                fail("complete staging wire exceeds bound")
+            connection.settimeout(remaining(deadline))
+            connection.sendall(block)
+        connection.shutdown(socket.SHUT_WR)
+        response = bytearray()
+        while True:
+            connection.settimeout(remaining(deadline))
+            block = connection.recv(min(65536, RESPONSE_LIMIT + 1 - len(response)))
+            if not block:
+                break
+            response.extend(block)
+            if len(response) > RESPONSE_LIMIT:
+                fail("root staging response exceeds bound")
+    value = parsed(bytes(response))
+    if (not isinstance(value, dict) or value.get("status") != "passed"
+            or value.get("root_uid") != 0 or value.get("root_input_sha256") != expected_sha256):
+        detail = value.get("error", "invalid root receipt") if isinstance(value, dict) else "invalid root receipt"
+        fail("root staging bridge refused: " + str(detail)[:2048])
+    return value
+
+
+def root_bridge(authorized_uid, connection=None):
+    """One Accept=yes connection; root receive/policy/lease remain unchanged."""
+    if os.geteuid() != 0:
+        raise PermissionError("root bridge mode requires root")
+    broker = parsed(protected(BROKER_CONFIG).read_bytes())
+    if (type(authorized_uid) is not int or authorized_uid <= 0 or broker.get("device") != "dgx-spark"
+            or broker.get("coordination_owner", {}).get("uid") != authorized_uid):
+        fail("bridge peer UID differs from protected Spark coordination owner")
+    if connection is None:
+        connection = socket.socket(fileno=os.dup(0))
+    deadline = time.monotonic() + BRIDGE_TIMEOUT
+    with connection:
+        try:
+            if connection.family != socket.AF_UNIX or peer_uid(connection) != authorized_uid:
+                fail("root staging bridge peer UID refused")
+            header_deadline = min(deadline, time.monotonic() + 10)
+            header = bytearray()
+            while len(header) < 65:
+                connection.settimeout(remaining(header_deadline))
+                block = connection.recv(65 - len(header))
+                if not block:
+                    fail("truncated staging hash header")
+                header.extend(block)
+            if not re.fullmatch(rb"[0-9a-f]{64}\n", header):
+                fail("fixed 64hex newline header required")
+            # Bound the complete wire including tar padding before root receive
+            # publishes anything. Anonymous spool closes on failure/process death.
+            with tempfile.TemporaryFile() as incoming:
+                total = 0
+                while True:
+                    connection.settimeout(remaining(deadline))
+                    block = connection.recv(1 << 20)
+                    if not block:
+                        break
+                    total += len(block)
+                    if total > WIRE_LIMIT:
+                        fail("complete staging wire exceeds bound")
+                    incoming.write(block)
+                incoming.seek(0)
+                proof = receive(header[:-1].decode("ascii"), incoming)
+            response = json.dumps(proof, indent=2).encode() + b"\n"
+            if len(response) > RESPONSE_LIMIT:
+                fail("root staging response exceeds bound")
+        except Exception as error:
+            response = json.dumps(dict(status="failed", error=type(error).__name__ + ": " + str(error)[:2048])).encode() + b"\n"
+        connection.settimeout(remaining(deadline))
+        connection.sendall(response)
+
+
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--expected-sha256", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--expected-sha256")
+    mode.add_argument("--root-bridge", action="store_true")
+    parser.add_argument("--peer-uid", type=int)
     args = parser.parse_args()
-    print(json.dumps(receive(args.expected_sha256), indent=2))
+    if args.root_bridge:
+        if args.peer_uid is None:
+            parser.error("root bridge requires the fixed peer UID")
+        root_bridge(args.peer_uid)
+    elif args.peer_uid is not None:
+        parser.error("peer UID belongs only to the root service mode")
+    elif os.geteuid() == 0:
+        print(json.dumps(receive(args.expected_sha256), indent=2))
+    else:
+        try:
+            print(json.dumps(client(args.expected_sha256), indent=2))
+        except Exception as error:
+            print("fixed staging client: " + type(error).__name__ + ": " + str(error)[:2048], file=sys.stderr)
+            raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -42,12 +42,16 @@ the PR is open/nondraft with the fixed source base repository, the review remain
 the exact head, current base/merge identity and latest normal hosted CI success.
 Profile/policy changes cannot be silently applied to an existing authorization.
 
-Background staging accepts only already reviewed root transport or the fixed
-narrow passwordless root helper. It never prompts, reads, stores or forwards a
-personal password. The separately authorized one-time operator bootstrap must
-install that exact helper/policy; the poller neither edits sudoers nor grants
-arbitrary Python/root commands. Missing unattended staging permission stays
-queued with an explicit reason.
+Background staging accepts already reviewed root transport or the fixed
+stager's restricted local socket client. An existing permitted narrow
+passwordless sudo helper is also supported. The socket service checks the
+connecting UID and runs only the trusted receiver under its root-owned policy,
+original device lease and finite byte/time limits. It does not expose a shell
+or candidate execution. The separately authorized one-time operator bootstrap
+installs this CI service; it must preserve the host's vendor access policy.
+The poller never prompts, reads, stores or forwards a personal password and
+does not edit sudoers. Missing unattended staging permission stays queued
+with an explicit reason.
 
 After dispatch it monitors only the returned exact parent run ID, workflow,
 controller SHA, actor and attempt1. A new head/base, edited/dismissed authorization,
