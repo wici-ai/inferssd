@@ -34,7 +34,9 @@ class API:
 
     def call(self, path, data=None, method=None):
         request = urllib.request.Request(
-            "https://api.github.com/repos/" + self.repository + "/" + path,
+            "https://api.github.com/repos/"
+            + self.repository
+            + ("/" + path if path else ""),
             None if data is None else json.dumps(data).encode(),
             {
                 "Authorization": "Bearer " + self.token,
