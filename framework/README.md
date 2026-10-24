@@ -404,16 +404,19 @@ arguments must use the explicit launch options so extra flags cannot silently
 replace those owned values. `--batch-threads` selects native prefill `-tb`
 independently of `cpu.threads`/decode `-t` (default: the same count; range1..256).
 This preserves measured Mac choices such as t4/tb12 or t8/tb12 without adding a
-fifteenth SSD setting. The launch receipt and argv record both counts. Extra
+additional SSD setting. The launch receipt and argv record both counts. Extra
 flags cannot override fixed placement, template, fit, cache or offload decisions.
 
-The retained controller observes routing/profile diagnostics through its
-caller-owned legacy observation session. Current versioned native events do not
-yet contain every routing ID and prefill graph required by that algorithm; this
-module does not claim those log readers were removed. Static launch does not
-require debug channels. Adaptive launches select the permitted trace/profile
-output channels through `INFERSSD_DEBUG`; these do not control kernels or placement.
-Historical F goldens remain a separate recorded contract.
+The production controller uses `NativeObservationSession` to consume the owned
+`native-events.jsonl` stream. It requires `ssd.controller.begin` schema 1 and
+versioned placement/prefill records, checks event sequence and field types, and
+rejects failed layer observations. Human-readable server logs remain diagnostic
+artifacts; production decisions do not parse them. The historical observation
+session and log readers remain available for recorded imports and their goldens.
+Static launch does not require debug channels. Adaptive launches select the
+permitted trace/profile observations through `INFERSSD_DEBUG`; these do not
+control kernels or placement. This interface does not complete Mac online
+adaptation or live probe/bootstrap orchestration.
 
 ## Remaining integration boundaries
 

@@ -4,6 +4,8 @@ import pathlib
 import re
 import sys
 
+from runtime_boundaries import check_runtime_boundaries
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MODULES = {
     "core": "engine/ggml/src/ggml-ssd",
@@ -59,6 +61,7 @@ for backend, other in (("cpu", "cuda"), ("cuda", "cpu")):
 for module in ("store", "io", "host", "place", "stream", "settings", "telemetry"):
     if not (ROOT / MODULES["core"] / module).is_dir():
         errors.append(f"missing core module: {module}")
+errors.extend(check_runtime_boundaries(ROOT))
 if errors:
     print("\n".join(errors), file=sys.stderr)
     sys.exit(1)
