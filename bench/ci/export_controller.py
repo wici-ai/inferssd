@@ -61,7 +61,9 @@ def export(source, revision, output, workflow="device-performance", registry_rev
     target.parent.mkdir(parents=True)
     target.write_bytes(git("show", revision + ":bench/ci/controller/" + template))
     (output / "README.md").write_text(
-        "Private device controller. Do not enable execution until the source manifest, protected refs, dedicated check App and per-stage host isolation gates are reviewed.\n"
+        "Private device controller. Operator-authorized runs report frozen-source results in Actions. "
+        "Review the exported manifest, protected controller main, root-staged jobs and per-stage "
+        "host isolation before execution. PR publication is a separate optional mode.\n"
     )
 
 

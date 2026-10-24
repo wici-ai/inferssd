@@ -1,4 +1,4 @@
-"""Block invalid evidence or any observed slowdown; n=1 is not a variance test."""
+"""Block invalid evidence, changed output or slowdown; n=1 is not a variance test."""
 
 import argparse
 import importlib.util
@@ -28,6 +28,7 @@ INTERPRETATION = (
     "not statistical proof of no regression. Any slowdown is inconclusive and blocks "
     "acceptance pending a bounded independent diagnosis; no automatic retries or "
     "selection of a best attempt. OS cache treatment is recorded, not assumed cold."
+    " Different generated token sequences are inconclusive even when every metric improves."
 )
 
 
@@ -154,6 +155,20 @@ def compare_pair(base, head, base_receipt, head_receipt, policy, *, comparison_b
         head_receipt["server"]["start_identity"],
     ]:
         raise ValueError("baseline and candidate reused a server process")
+    for result in (base, head):
+        tokens = result.get("tokens")
+        if (type(result.get("output_tokens")) is not int or result["output_tokens"] != 256
+                or not isinstance(tokens, list) or len(tokens) != result["output_tokens"]
+                or any(type(token) is not int or token < 0 for token in tokens)):
+            raise ValueError("performance comparison requires complete output token evidence")
+    difference = next((i for i, (before, after) in enumerate(zip(base["tokens"], head["tokens"]))
+                       if before != after), None)
+    output_workload = {
+        "same_tokens": difference is None,
+        "first_difference_one_based": None if difference is None else difference + 1,
+        "base_token": None if difference is None else base["tokens"][difference],
+        "candidate_token": None if difference is None else head["tokens"][difference],
+    }
     metrics, failures = {}, []
     for key in METRICS:
         before, after = base["metrics"][key], head["metrics"][key]
@@ -171,15 +186,16 @@ def compare_pair(base, head, base_receipt, head_receipt, policy, *, comparison_b
         if not passed:
             failures.append(key)
     return {
-        "passed": not failures,
-        "status": "inconclusive" if failures else "passed",
+        "passed": not failures and output_workload["same_tokens"],
+        "status": "inconclusive" if failures or difference is not None else "passed",
         "evidence_valid": True,
         "metrics": metrics,
         # Retain the old field for consumers; these are observations, not a
         # claim that a single pair established a reproducible regression.
         "regressions": failures,
         "observed_slowdowns": failures,
-        "diagnostic_required": bool(failures),
+        "diagnostic_required": bool(failures) or difference is not None,
+        "output_workload": output_workload,
         "interpretation": INTERPRETATION,
         "actual_input_tokens": head["input_tokens"],
         "prefill_tps": {

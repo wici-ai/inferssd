@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci.contract import load, save
 from ci.stage_session import StageSession
 from ci.staged_chat import NativeHTTP
+from ci.staged_benchmark import verify_stopped
 
 
 def collect_log(session, stage, output):
@@ -109,8 +110,7 @@ def smoke(session, config, output, *, stage_id="candidate-smoke"):
                 stopped = session.call(stage, "stage.stop", timeout=50)
                 save(output / "stopped.json", stopped)
                 collect_log(session, stage, output)
-                if stopped.get("cleanup_confirmed") is not True or stopped.get("returncode") != 0:
-                    raise RuntimeError("native smoke did not stop normally and cleanly")
+                result["stop_classification"] = verify_stopped(stopped)
                 result["cleanup_confirmed"] = True
                 host_memory(output, "host-memory-after-cleanup.json")
             except Exception as error:

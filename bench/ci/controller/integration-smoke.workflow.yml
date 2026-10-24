@@ -1,4 +1,5 @@
 name: InferSSD reviewed integration smoke
+run-name: integration-${{ inputs.job_id }}
 
 # Deploy only as a workflow in the PRIVATE wici-ai/inferssd-device-ci repository.
 # Source and job manifests are already reviewed and root-staged on this device.
@@ -24,6 +25,17 @@ on:
         required: true
         type: string
 
+      selection_plan_sha256:
+        description: Required selected-plan SHA-256 (empty only for legacy readiness)
+        required: false
+        default: ''
+        type: string
+      selection_parent:
+        description: Private parent run-attempt (selected dispatch provenance)
+        required: false
+        default: ''
+        type: string
+
 permissions: {}
 
 jobs:
@@ -31,6 +43,8 @@ jobs:
     if: github.repository == 'wici-ai/inferssd-device-ci' && github.ref == 'refs/heads/main'
     runs-on: ${{ fromJSON(inputs.device == 'cloud-5090' && '["self-hosted","Linux","X64","inferssd-device-ci","cloud-5090"]' || inputs.device == 'dgx-spark' && '["self-hosted","Linux","ARM64","inferssd-device-ci","dgx-spark"]' || '["self-hosted","macOS","ARM64","inferssd-device-ci","local-mbp"]') }}
     timeout-minutes: 120
+    permissions:
+      actions: read
     concurrency:
       group: physical-${{ inputs.device }}
       cancel-in-progress: false
@@ -42,6 +56,9 @@ jobs:
           INTEGRATION_JOB_ID: ${{ inputs.job_id }}
           INTEGRATION_SOURCE_REVISION: ${{ inputs.source_revision }}
           INTEGRATION_CONFIG_SHA256: ${{ inputs.config_sha256 }}
+          INTEGRATION_PLAN_SHA256: ${{ inputs.selection_plan_sha256 }}
+          INTEGRATION_PARENT: ${{ inputs.selection_parent }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
@@ -70,11 +87,11 @@ jobs:
             *) exit 64 ;;
           esac
           python="$control/venv/bin/python"
-          "$python" -I - "$control" "$config" "$INTEGRATION_CONFIG_SHA256" "$INTEGRATION_SOURCE_REVISION" "$INTEGRATION_JOB_ID" "$artifact" "$INTEGRATION_DEVICE" "$platform" <<'PY'
+          "$python" -I - "$control" "$config" "$INTEGRATION_CONFIG_SHA256" "$INTEGRATION_SOURCE_REVISION" "$INTEGRATION_JOB_ID" "$artifact" "$INTEGRATION_DEVICE" "$platform" "$INTEGRATION_PLAN_SHA256" "$INTEGRATION_PARENT" <<'PY'
           import re
           import sys
           from pathlib import Path
-          control, config, expected_hash, expected_revision, job_id, output, device, platform = sys.argv[1:]
+          control, config, expected_hash, expected_revision, job_id, output, device, platform, plan_hash, parent = sys.argv[1:]
           if sys.version_info < (3, 9):
               raise SystemExit("the operator-installed controller requires Python 3.9 or later")
           sys.path.insert(0, str(Path(control) / "bench"))
@@ -91,11 +108,26 @@ jobs:
           manifest_hash = value.get("manifest_sha256", "")
           if not isinstance(manifest_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", manifest_hash):
               raise SystemExit("job config must bind the exact root broker manifest hash")
+          from ci.private_controller import source_manifest
+          installed_revision = source_manifest(Path(control))
+          installed_manifest = digest(Path(control) / "control-source.json")
+          if value.get("purpose") == "selected-integration":
+              from ci.selection_contract import protected_binding
+              protected_binding(config, expected_hash, plan_hash, job_id)
+              if (value["control_revision"] != installed_revision
+                      or value["control_manifest_sha256"] != installed_manifest):
+                  raise SystemExit("root-installed controller differs from selected deployment identity")
+              if parent and not re.fullmatch(r"[1-9][0-9]*-[1-9][0-9]*", parent):
+                  raise SystemExit("invalid private parent provenance")
+          elif plan_hash or parent:
+              raise SystemExit("legacy readiness cannot satisfy a selected dispatch")
           save(Path(output) / "dispatch.json", dict(
               purpose="integration-smoke", job_id=job_id, revision=expected_revision, device=device,
               platform=platform,
               config_sha256=expected_hash, manifest_sha256=manifest_hash,
-              control_entry_sha256=digest(entry),
+              control_entry_sha256=digest(entry), selection_plan_sha256=plan_hash,
+              selection_parent=parent, control_revision=installed_revision,
+              control_manifest_sha256=installed_manifest,
               python_version=sys.version, performance_acceptance=False, benchmark_samples=0,
           ))
           PY
@@ -103,6 +135,8 @@ jobs:
             --socket "$socket" \
             --job-id "$INTEGRATION_JOB_ID" \
             --config "$config" --config-sha256 "$INTEGRATION_CONFIG_SHA256" \
+            --selection-plan-sha256 "$INTEGRATION_PLAN_SHA256" \
+            --selection-parent "$INTEGRATION_PARENT" \
             --output "$artifact/$INTEGRATION_JOB_ID"
 
       - name: Retain the complete attempt, including failures

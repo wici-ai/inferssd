@@ -6,17 +6,22 @@ from pathlib import Path
 import time
 
 from ci.contract import save
+from ci.impact import CASES, MARKERS
 from ci.staged_smoke import collect_log
 
 
-def validate_csv(raw, backend):
+def validate_csv(raw, backend, operation=None, params=None):
     rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8"))))
     executed = [row for row in rows if row.get("backend_name") == backend
                 and row.get("test_mode") == "test" and row.get("supported") == "1"]
     if not executed:
         raise ValueError("native numerical gate executed no supported tests on the requested GPU")
-    if any(row.get("error_message") for row in executed):
+    if any(row.get("error_message") or row.get("passed") not in (None, "1", "true") for row in executed):
         raise ValueError("native numerical comparison failed")
+    if operation is not None and any(row.get("op_name") != operation for row in executed):
+        raise ValueError("executed operator differs from the selected numerical case")
+    if params and any(params not in row.get("op_params", "") for row in executed):
+        raise ValueError("executed format differs from the selected numerical case")
     return len(executed)
 
 
@@ -55,3 +60,46 @@ def numerical(session, config, build, output):
     if result["status"] != "passed":
         raise RuntimeError(result["error"])
     return result
+
+
+def selected_numerical(session, config, build, cases, output):
+    """Each required format/operator is a distinct real CPU-oracle GPU gate."""
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=False)
+    backend = config["backend"]
+    if backend not in ("CUDA0", "MTL0") or not cases or len(cases) != len(set(cases)):
+        raise ValueError("explicit GPU backend and unique nonempty cases required")
+    images = {Path(item["runtime_path"]).name: item for item in build["images"]}
+    results = {}
+    for case in cases:
+        target, operation, params = CASES[case]
+        if target not in images:
+            raise ValueError("selected numerical target is absent from the sealed image set")
+        folder = output / case
+        folder.mkdir()
+        argv = [images[target]["runtime_path"]]
+        if operation:
+            argv += ["test", "-b", backend, "-o", operation]
+            if params:
+                argv += ["-p", params]
+            argv += ["--output", "csv"]
+        elif case.startswith("cuda-") and backend != "CUDA0":
+            raise ValueError("CUDA tier oracle cannot establish a Metal numerical pass")
+        stage = session.start("candidate-numerical-" + case, "test", argv, {}, config["cwd"], 900)
+        completed = session.wait(stage, deadline=time.monotonic() + 900)
+        save(folder / "stage.json", completed)
+        collect_log(session, stage, folder)
+        if completed.get("returncode") != 0 or completed.get("cleanup_confirmed") is not True:
+            raise RuntimeError("selected numerical stage failed or was not clean")
+        raw = (folder / "stdout.log").read_bytes()
+        if operation:
+            count = validate_csv(raw, backend, operation, params)
+        else:
+            marker = MARKERS[case]
+            if sum(line.startswith(marker) for line in raw.splitlines()) != 1:
+                raise ValueError("real GPU oracle success marker missing or duplicated")
+            count = 1
+        results[case] = dict(status="passed", tests_executed=count, binary=images[target],
+                             argv=argv, cleanup_confirmed=True)
+    save(output / "selected-numerical.json", results)
+    return results

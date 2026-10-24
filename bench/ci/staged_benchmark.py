@@ -8,6 +8,7 @@ job lease across base and candidate. No completion is retried.
 from dataclasses import asdict
 from pathlib import Path
 import time
+import re
 
 import final_chat
 import run_final
@@ -36,16 +37,27 @@ def verify_stopped(stopped):
     receipt = stopped.get("receipt")
     receipt = receipt if isinstance(receipt, dict) else {}
     code = stopped.get("returncode")
+    cleanup = stopped.get("cleanup")
+    cleanup = cleanup if isinstance(cleanup, dict) else {}
+    job = stopped.get("job_id", "")
+    mac_requested = (
+        stopped.get("state") == "failed" and stopped.get("reason") == "requested stop"
+        and code == 0 and isinstance(job, str) and re.fullmatch(r"[0-9a-f]{32}", job)
+        and stopped.get("job_root") == stopped.get("scope_identity") == "/Library/InferSSD-CI/jobs/" + job
+        and stopped.get("worker_uid") == 62002
+        and cleanup.get("confirmed") is True and cleanup.get("remaining") == []
+        and cleanup.get("worker_user_domain_retired", {}).get("returncode") == 0)
     if (stopped.get("running") is not False or type(code) is not int
             or stopped.get("cleanup_confirmed") is not True
-            or stopped.get("state") in ("failed", "quarantined")
+            or stopped.get("state") == "quarantined"
+            or (stopped.get("state") == "failed" and not mac_requested)
             or stopped.get("error") or stopped.get("cleanup_error")
             or receipt.get("cleanup_error")
             or receipt.get("cleanup_confirmed", True) is not True
             or receipt.get("error") not in (None, "", controlled)):
         raise ValueError("native benchmark did not stop normally and cleanly")
     if code == 0:
-        return "normal-exit"
+        return "mac-requested-stop" if mac_requested else "normal-exit"
     guardian = receipt.get("guardian")
     guardian = guardian if isinstance(guardian, dict) else {}
     cleanup = guardian.get("cleanup")
@@ -81,6 +93,10 @@ def benchmark(session, side, config, output):
     if side not in ("base", "candidate"):
         raise ValueError("explicit base or candidate benchmark side required")
     revision(config["revision"])
+    tier = config.get("tier", "512")
+    prefix = config.get("stage_prefix", side)
+    if tier not in ("512", "4096") or not re.fullmatch(r"[a-z0-9-]{1,64}", prefix):
+        raise ValueError("fixed prompt tier and bounded stage identity required")
     timeout, request_timeout = config["timeout_s"], config["request_timeout_s"]
     final_chat.bounded_timeout(timeout)
     final_chat.bounded_timeout(request_timeout)
@@ -95,7 +111,7 @@ def benchmark(session, side, config, output):
     output.mkdir(parents=True, exist_ok=False)
     result = dict(schema_version=1, purpose="ci-checkpoint", status="failed",
                   side=side, model=config["model"], revision=config["revision"],
-                  tier="512", output_tokens=256, samples_per_tier=1,
+                  tier=tier, output_tokens=256, samples_per_tier=1,
                   completion_requests=0, performance_acceptance=False,
                   cleanup_confirmed=False)
     runtime = dict(schema_version=1, purpose="staged-benchmark-runtime", side=side,
@@ -112,7 +128,7 @@ def benchmark(session, side, config, output):
         runtime["observations"][name] = dict(path=path.name, sha256=digest(path))
 
     try:
-        stage = session.start(side + "-benchmark-512", "server", config["argv"],
+        stage = session.start(prefix + "-benchmark-" + tier, "server", config["argv"],
                               config["environment"], config["cwd"], timeout)
         retain("started", asdict(stage))
         http = NativeHTTP(session, stage, config["port"])
@@ -150,12 +166,12 @@ def benchmark(session, side, config, output):
         try:
             # The recorder saves raw success/failure; never promote its return
             # value directly into the checked measurement used for comparison.
-            record(http, "512", output / "result.json", request_timeout)
+            record(http, tier, output / "result.json", request_timeout)
         finally:
             after = session.call(stage, "stage.probe", port=config["port"])
             retain("runtime-after", after)
             verify_runtime(stage, after)
-        checked = run_final.read_result(output / "result.json", "512", request_timeout)
+        checked = run_final.read_result(output / "result.json", tier, request_timeout)
         if http.completions != 1:
             raise ValueError("benchmark must contain one completion on the fresh server")
         result.update(status="passed", result=checked,

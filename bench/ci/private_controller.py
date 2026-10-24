@@ -27,22 +27,27 @@ from ci.contract import (
 
 
 class API:
-    def __init__(self, repository, token):
+    def __init__(self, repository, token, version="2022-11-28", timeout=30):
         self.repository, self.token = repository, token
+        self.version = version
+        self.timeout = timeout
 
     def call(self, path, data=None, method=None):
         request = urllib.request.Request(
-            "https://api.github.com/repos/" + self.repository + "/" + path,
+            "https://api.github.com/repos/"
+            + self.repository
+            + ("/" + path if path else ""),
             None if data is None else json.dumps(data).encode(),
             {
                 "Authorization": "Bearer " + self.token,
                 "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
+                "X-GitHub-Api-Version": self.version,
             },
             method=method,
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.load(response)
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            raw = response.read()
+            return json.loads(raw) if raw else None
 
 
 def context(policy, env, event):

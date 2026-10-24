@@ -118,7 +118,7 @@ def test_smoke_waits_through_health_timeout_and_sends_one_completion(tmp_path, m
                 self.probes.append(kwargs.get('light', False))
                 return dict(asdict(stage), ready=True)
             if operation == 'stage.stop':
-                return dict(returncode=0, cleanup_confirmed=True)
+                return dict(running=False, returncode=0, cleanup_confirmed=True)
             assert operation == 'stage.client'
             request = kwargs['request']
             path, body, status = request['path'], {}, 200

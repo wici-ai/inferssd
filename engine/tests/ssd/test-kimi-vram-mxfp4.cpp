@@ -2,12 +2,14 @@
 #include "gpu-kernels.h"
 #include "explicit-fixture-inputs.h"
 // The real CPU sink with the VRAM tier on MXFP4 experts and the DeepSeek-V4.1
-// clamped SwiGLU: every output must equal a CPU-only sink bit for bit while GPU
-// hits replace SSD reads. The engine's runtime parity gate must refuse a CPU
+// clamped SwiGLU: the supported strict bridge equals a CPU-only sink bit for bit
+// while GPU hits replace SSD reads. The engine's runtime parity gate refuses a CPU
 // reference that takes another accumulation path or differs in one bit. With the
 // opt-in deferred uploads the same holds while borrowed uploads outlive their layer. With the
 // opt-in GPU hidden chain, SWIGLU_CLAMP outputs stay within 1e-3 relative L2 of the
-// CPU sink (not bitwise) and SiTU keeps the bitwise bridge.
+// CPU sink (not bitwise). SiTU keeps the strict bridge on compatible hosts;
+// incompatible ARM references demonstrate strict refusal and test the real
+// production clamp chain, without claiming successful SiTU bridge computation.
 // Synthetic packed weights avoid a model dependency.
 // Normally linked backend and strict MXFP4 objects; no preload.
 #define main original_sink_test_main
@@ -21,6 +23,80 @@ struct tier_options {
 };
 
 using selfcheck_hook_fn = void (*)(ggml_vec_dot_t);
+
+struct scoped_selfcheck_reference {
+    selfcheck_hook_fn hook;
+    scoped_selfcheck_reference(selfcheck_hook_fn h, ggml_vec_dot_t reference) : hook(h) { hook(reference); }
+    ~scoped_selfcheck_reference() { hook(nullptr); }
+    scoped_selfcheck_reference(const scoped_selfcheck_reference &) = delete;
+    scoped_selfcheck_reference & operator=(const scoped_selfcheck_reference &) = delete;
+};
+
+double rel_l2(const std::vector<float> & a, const std::vector<float> & b);
+
+bool parity_refusal(const char * error) {
+    const char * wrapped = "GPU tier: ";
+    if (!std::strncmp(error, wrapped, std::strlen(wrapped))) { error += std::strlen(wrapped); }
+    const char * prefix = "MXFP4 VRAM parity self-check failed: check=";
+    const char * suffix = "; the GPU kernel does not reproduce this host's ggml_vec_dot_mxfp4_q8_0 path; MXFP4 VRAM tier refused, no fallback";
+    const size_t size = std::strlen(error), tail = std::strlen(suffix);
+    return size > std::strlen(prefix) + tail && !std::strncmp(error, prefix, std::strlen(prefix)) &&
+        std::strstr(error, " input=") && std::strstr(error, " row=") &&
+        std::strstr(error, " cpu=") && std::strstr(error, " gpu=") &&
+        !std::strcmp(error + size - tail, suffix); // Also reject an appended telemetry/other failure.
+}
+
+// The strict bridge reproduces the AVX2 accumulation order. Its real linked
+// reference must succeed on x86; ARM may instead demonstrate exact fail-closed
+// refusal. This is not a GPU-chain numerical pass or an injected CPU oracle.
+bool linked_bridge_probe(fixture_inputs & inputs, const char * label,
+        const kimi_cpu_sink_activation & activation, size_t & checks) {
+    scoped_selfcheck_reference reference(kimi_vram_mxfp4_selfcheck_reference_for_testing, nullptr);
+    fixture f;
+    f.type = f.down_type = GGML_TYPE_MXFP4;
+    f.latent = 512; f.hidden = 256; f.experts = 4;
+    make_synthetic(f, 20260916);
+    inputs.set("vram_budget", std::to_string(uint64_t(2 * f.experts) * triplet_bytes(f)).c_str());
+    inputs.set("tier.mxfp4_gpu_hidden", "0");
+    for (const char * name : {"vram_exclusive", "vram_async", "tier.global",
+                              "tier.keep_across_requests", "vram_deferred"}) {
+        inputs.set(name, "0");
+    }
+    auto sink = make_sink(inputs, f, 16, 2);
+    configure_cache(sink.get(), 0, {1, 2}, f.experts);
+    tensors meta(f, 1);
+    std::vector<int32_t> ids = {0, 1, 2};
+    std::vector<float> weights(3, 0.3f), input(f.latent), out(f.latent);
+    for (int i = 0; i < f.latent; ++i) { input[i] = std::sin(float(i)); }
+    bool supported = false;
+    std::string first_error;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        begin_cache(sink.get(), 50, uint64_t(attempt + 1));
+        kimi_cpu_sink_stats stats = {};
+        char error[512] = {};
+        const bool ok = kimi_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+            ids.data(), weights.data(), int(ids.size()), &activation, out.data(), &stats, error, sizeof(error));
+        if (!attempt) { supported = ok; first_error = error; }
+        require(ok == supported, "linked strict bridge changed capability on retry");
+        require(stats.pending_reads == 0 && stats.fallback_count == 0 && stats.read_errors == 0,
+                "linked bridge probe returned live work, read error or fallback");
+        if (ok) {
+            for (float value : out) { require(std::isfinite(value), "nonfinite linked bridge probe output"); }
+        } else {
+            require(parity_refusal(error), error); // No other failure is a capability result.
+#if !defined(__aarch64__)
+            require(false, error); // Never hide an x86 strict-parity regression.
+#endif
+            require(stats.read_requests == 0 && stats.read_completions == 0,
+                    "unsupported strict bridge issued reads");
+            require(first_error == error, "strict parity refusal changed on retry");
+        }
+        ++checks;
+    }
+    std::printf("MXFP4_LINKED_BRIDGE_CAPABILITY case=%s supported=%d reference=linked_cpu_vec_dot "
+        "attempts=2 pending_reads=0 fallback=0 error=\"%s\"\n", label, int(supported), first_error.c_str());
+    return supported;
+}
 
 float e8m0_half(uint8_t e) {
     const uint32_t bits = e < 2 ? uint32_t(0x00200000) << e : uint32_t(e - 1) << 23;
@@ -84,7 +160,7 @@ void selfcheck_mismatch(fixture_inputs & inputs, const char * label, ggml_vec_do
     for (int i = 0; i < f.latent; ++i) { input[i] = std::sin(float(i)); }
     tensors meta(f, 1);
     std::string first_error;
-    hook(reference);
+    scoped_selfcheck_reference held_reference(hook, reference);
     for (int attempt = 0; attempt < 2; ++attempt) {
         begin_cache(sink.get(), 51, uint64_t(attempt + 1));
         kimi_cpu_sink_stats stats = {};
@@ -97,7 +173,6 @@ void selfcheck_mismatch(fixture_inputs & inputs, const char * label, ggml_vec_do
         if (!attempt) { first_error = error; }
         checks += 2;
     }
-    hook(nullptr);
     std::printf("MXFP4_SELFCHECK_MISMATCH_PASS case=%s error=\"%s\"\n", label, first_error.c_str());
 }
 
@@ -125,7 +200,7 @@ void selfcheck_skipped_with_chain(fixture_inputs & inputs, size_t & checks) {
     for (int i = 0; i < f.latent; ++i) { input[i] = std::sin(float(i)); }
     tensors meta(f, 1);
     uint64_t first_reads = 0, last_reads = 0;
-    hook(scalar_order_dot);
+    scoped_selfcheck_reference held_reference(hook, scalar_order_dot);
     for (int token = 1; token <= 3; ++token) {
         begin_cache(sink.get(), 71, uint64_t(token));
         kimi_cpu_sink_stats stats = {};
@@ -138,7 +213,6 @@ void selfcheck_skipped_with_chain(fixture_inputs & inputs, size_t & checks) {
         last_reads = stats.read_requests;
         ++checks;
     }
-    hook(nullptr);
     inputs.set("tier.mxfp4_gpu_hidden", "0");
     require(last_reads < first_reads, "the chain served no VRAM hits after the skipped self-check");
     ++checks;
@@ -146,7 +220,8 @@ void selfcheck_skipped_with_chain(fixture_inputs & inputs, size_t & checks) {
         (unsigned long long) first_reads, (unsigned long long) last_reads);
 }
 
-void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, int tokens, size_t & compared, size_t & checks) {
+void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, int tokens, bool strict_bridge,
+        size_t & compared, size_t & checks, double & chain_worst) {
     fixture f;
     f.type = f.down_type = GGML_TYPE_MXFP4;
     f.latent = latent; f.hidden = hidden; f.experts = experts;
@@ -164,6 +239,7 @@ void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, int
                            tier_options{true, true, true, true, true, true, true, true, true},
                            tier_options{false, true, false, true, false, true, true, true, false},
                            tier_options{false, true, false, true, false, true, true, true, true}}) {
+        inputs.set("tier.mxfp4_gpu_hidden", strict_bridge ? "0" : "1");
         inputs.set("vram_budget", "0");
         inputs.set("early_up_gate", "0");
         inputs.set("role_major", "0");
@@ -215,7 +291,14 @@ void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, int
                     (arm ? token_mixed_reads : token_cpu_reads) += stats.read_requests;
                     ++checks;
                 }
-                require(!std::memcmp(a.data(), b.data(), a.size() * sizeof(float)), "VRAM tier changed an MXFP4 output bit");
+                if (strict_bridge) {
+                    require(!std::memcmp(a.data(), b.data(), a.size() * sizeof(float)), "VRAM tier changed an MXFP4 output bit");
+                } else {
+                    for (float value : b) { require(std::isfinite(value), "non-finite GPU chain mode output"); }
+                    const double rel = rel_l2(b, a);
+                    chain_worst = std::max(chain_worst, rel);
+                    require(rel <= 1e-3, "GPU chain mode differs from the CPU sink by more than 1e-3 relative L2");
+                }
                 compared += a.size();
             }
             // Token 6 follows the prefill boundary at token 5: a retained arena keeps
@@ -251,9 +334,10 @@ void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, int
         require(kimi_cpu_sink_run_activation(mixed.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
             ids.data(), weights.data(), 3, &activation, out.data(), &stats, error, sizeof(error)), error);
         checks += 2;
-        std::printf("MXFP4_TIER_MODE_PASS latent=%d hidden=%d exclusive=%d async=%d global=%d ram=%d keep=%d deferred=%d early_up_gate=%d role_major=%d nonblocking_down_sched=%d\n",
+        std::printf("MXFP4_TIER_MODE_PASS latent=%d hidden=%d exclusive=%d async=%d global=%d ram=%d keep=%d deferred=%d early_up_gate=%d role_major=%d nonblocking_down_sched=%d path=%s\n",
             latent, hidden, int(cfg.exclusive), int(cfg.async), int(cfg.global), int(cfg.ram), int(cfg.keep),
-            int(cfg.deferred), int(cfg.early_up_gate), int(cfg.role_major), int(cfg.nonblocking_down_sched));
+            int(cfg.deferred), int(cfg.early_up_gate), int(cfg.role_major), int(cfg.nonblocking_down_sched),
+            strict_bridge ? "strict_bridge" : "gpu_hidden_chain");
     }
     std::printf("MXFP4_TIER_SHAPE latent=%d hidden=%d cpu_reads=%llu mixed_reads=%llu\n", latent, hidden,
         (unsigned long long) cpu_reads, (unsigned long long) mixed_reads);
@@ -271,8 +355,10 @@ double rel_l2(const std::vector<float> & a, const std::vector<float> & b) {
 }
 
 // GGML_KIMI_CPU_SINK_VRAM_MXFP4_GPU_HIDDEN=1: layer 1 (SWIGLU_CLAMP, limits 0.75 and 10)
-// runs its VRAM hits through the GPU chain, layer 2 (SiTU) keeps the bitwise bridge.
-void run_chain_shape(fixture_inputs & inputs, int latent, int hidden, int experts, int tokens, size_t & checks, double & worst) {
+// runs its VRAM hits through the GPU chain. On a compatible host layer 2
+// (SiTU) keeps the bitwise bridge; otherwise both layers test the clamp chain.
+void run_chain_shape(fixture_inputs & inputs, int latent, int hidden, int experts, int tokens,
+        bool strict_bridge, size_t & checks, double & worst) {
     fixture f;
     f.type = f.down_type = GGML_TYPE_MXFP4;
     f.latent = latent; f.hidden = hidden; f.experts = experts;
@@ -306,7 +392,10 @@ void run_chain_shape(fixture_inputs & inputs, int latent, int hidden, int expert
             for (int s = 0; s < std::min(6, experts); ++s) { ids.push_back((token * (s + 1) + layer * s) % experts); }
             std::vector<float> weights(ids.size(), 0.1f);
             weights[0] = 0.5f;
-            const bool situ = layer == 2;
+            // SiTU routes through the strict host bridge even with the chain
+            // enabled. An incompatible linked reference is tested separately
+            // as a refusal, never relabelled as a successful SiTU computation.
+            const bool situ = strict_bridge && layer == 2;
             const kimi_cpu_sink_activation activation = situ ?
                 kimi_cpu_sink_activation{KIMI_CPU_SINK_ACTIVATION_SITU, 4.0f, 25.0f, 0.0f} :
                 kimi_cpu_sink_activation{KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, token % 2 ? 0.75f : 10.0f};
@@ -335,14 +424,14 @@ void run_chain_shape(fixture_inputs & inputs, int latent, int hidden, int expert
         }
     }
     inputs.set("tier.mxfp4_gpu_hidden", "0");
-    std::printf("MXFP4_CHAIN_SHAPE_PASS latent=%d hidden=%d worst_rel_l2=%.3e cpu_reads=%llu mixed_reads=%llu\n", latent, hidden,
-        worst, (unsigned long long) cpu_reads, (unsigned long long) mixed_reads);
+    std::printf("MXFP4_CHAIN_SHAPE_PASS latent=%d hidden=%d worst_rel_l2=%.3e cpu_reads=%llu mixed_reads=%llu situ_bridge=%d\n", latent, hidden,
+        worst, (unsigned long long) cpu_reads, (unsigned long long) mixed_reads, int(strict_bridge));
     require(mixed_reads < cpu_reads, "GPU chain served no hits; nothing was validated");
 }
 
 // batch: the default batched GPU expert prefill, which rounds differently from the CPU; otherwise the
 // per-expert path of GGML_KIMI_MXFP4_PREFILL_BATCH=0, which reproduces the CPU bitwise.
-void run_grouped_prefill_hybrid(fixture_inputs & inputs, bool batch, size_t & compared, size_t & checks) {
+void run_grouped_prefill_hybrid(fixture_inputs & inputs, bool batch, bool strict_bridge, size_t & compared, size_t & checks) {
     inputs.set("tier.mxfp4_batch", batch ? "1" : "0");
     fixture f;
     f.type = f.down_type = GGML_TYPE_MXFP4;
@@ -356,7 +445,7 @@ void run_grouped_prefill_hybrid(fixture_inputs & inputs, bool batch, size_t & co
     inputs.set("tier.keep_across_requests", "1");
     inputs.set("vram_prefill", "1");
     inputs.set("tier.global", "1");
-    inputs.set("tier.mxfp4_gpu_hidden", "0");
+    inputs.set("tier.mxfp4_gpu_hidden", strict_bridge || !batch ? "0" : "1");
     auto mixed = make_sink(inputs, f, 16, 2);
     configure_cache(cpu.get(), 0, {1, 2}, f.experts);
     configure_cache(mixed.get(), 0, {1, 2}, f.experts);
@@ -370,9 +459,30 @@ void run_grouped_prefill_hybrid(fixture_inputs & inputs, bool batch, size_t & co
     std::vector<float> warm_input(size_t(f.latent), 0.125f), warm_output(size_t(f.latent));
     begin_cache(mixed.get(), 81, 1);
     kimi_cpu_sink_stats warm_stats = {}; char error[512] = {};
-    require(kimi_cpu_sink_run_activation(mixed.get(), meta.role[0], meta.role[1], meta.role[2],
+    const bool warmed = kimi_cpu_sink_run_activation(mixed.get(), meta.role[0], meta.role[1], meta.role[2],
         warm_input.data(), all_ids.data(), all_weights.data(), f.experts, &activation,
-        warm_output.data(), &warm_stats, error, sizeof(error)), error);
+        warm_output.data(), &warm_stats, error, sizeof(error));
+    if (!strict_bridge && !batch) {
+        require(!warmed && parity_refusal(error), "unsupported per-expert bridge warmup did not refuse by exact parity gate");
+        require(warm_stats.pending_reads == 0 && warm_stats.fallback_count == 0 && warm_stats.read_requests == 0 &&
+                warm_stats.read_completions == 0 && warm_stats.read_errors == 0,
+                "unsupported per-expert bridge warmup left reads or fallback");
+        const std::string first_error = error;
+        begin_cache(mixed.get(), 81, 2);
+        warm_stats = {};
+        require(!kimi_cpu_sink_run_activation(mixed.get(), meta.role[0], meta.role[1], meta.role[2],
+            warm_input.data(), all_ids.data(), all_weights.data(), f.experts, &activation,
+            warm_output.data(), &warm_stats, error, sizeof(error)) && first_error == error,
+            "unsupported per-expert bridge warmup retry did not preserve refusal");
+        require(warm_stats.pending_reads == 0 && warm_stats.fallback_count == 0 && warm_stats.read_requests == 0 &&
+                warm_stats.read_completions == 0 && warm_stats.read_errors == 0,
+                "unsupported per-expert bridge retry left reads or fallback");
+        checks += 2;
+        std::printf("MXFP4_STRICT_BRIDGE_REFUSAL_PASS case=grouped_prefill_per_expert_warmup attempts=2 "
+            "pending_reads=0 fallback=0 error=\"%s\"\n", first_error.c_str());
+        return; // No prefill computation or compared count is claimed here.
+    }
+    require(warmed, error);
     require(warm_stats.read_requests == uint64_t(3 * f.experts), "VRAM warm pass did not read every expert");
 
     const int ntokens = 3, nslots = 6;
@@ -443,7 +553,7 @@ void run_grouped_prefill_hybrid(fixture_inputs & inputs, bool batch, size_t & co
 // expert on the CPU: the drive's line comes from the decode step's reads (the cost table fits it over decode's and
 // prefill's layers, so a start value no longer outlives them), and a CPU of 1 ns an expert (start values) is far
 // below it. The output stays within the batched path's rounding of the graph.
-void run_grouped_prefill_cold_transients(fixture_inputs & inputs, size_t & compared, size_t & checks) {
+void run_grouped_prefill_cold_transients(fixture_inputs & inputs, bool strict_bridge, size_t & compared, size_t & checks) {
     for (const bool drive_bound : {false, true}) {
         inputs.set("tier.mxfp4_batch", "1");
         inputs.set("place_costs", drive_bound ? "cpu_fixed_us=0.001,cpu_route_us=0.000001" : "gpu_fixed_us=2000");
@@ -455,7 +565,7 @@ void run_grouped_prefill_cold_transients(fixture_inputs & inputs, size_t & compa
         inputs.set("tier.keep_across_requests", "1");
         inputs.set("vram_prefill", "1");
         inputs.set("tier.global", "1");
-        inputs.set("tier.mxfp4_gpu_hidden", "0");
+        inputs.set("tier.mxfp4_gpu_hidden", strict_bridge ? "0" : "1");
         auto mixed = make_sink(inputs, f, 4, 2);
         configure_cache(mixed.get(), 0, {1, 2}, f.experts);
         tensors meta(f, 1);
@@ -551,23 +661,33 @@ int main() {
         inputs.set("role_major", "0");
         inputs.set("nonblocking_down_sched", "0");
         size_t compared = 0, checks = 0;
+        const kimi_cpu_sink_activation clamp = {KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 10.0f};
+        const bool strict_bridge = linked_bridge_probe(inputs, "strict_clamp", clamp, checks);
         // Mismatch path first; the shape runs below then create fresh engines
         // whose self-check passes against the linked CPU kernel.
         selfcheck_mismatch(inputs, "scalar_order", scalar_order_dot, "check=up_gate_c512/", checks);
-        flipped_columns = 256;
-        selfcheck_mismatch(inputs, "one_bit_down_stage", flipped_dot, "check=down_c256/scales input=0 row=0 ", checks);
+        if (strict_bridge) {
+            flipped_columns = 256;
+            selfcheck_mismatch(inputs, "one_bit_down_stage", flipped_dot, "check=down_c256/scales input=0 row=0 ", checks);
+        } else {
+            std::printf("MXFP4_STRICT_ONLY_CASE_UNAVAILABLE case=one_bit_down_stage reason=linked_reference_incompatible\n");
+            const kimi_cpu_sink_activation situ = {KIMI_CPU_SINK_ACTIVATION_SITU, 4.0f, 25.0f, 0.0f};
+            require(!linked_bridge_probe(inputs, "situ_strict_bridge", situ, checks), "unsupported SiTU bridge accepted");
+        }
         selfcheck_skipped_with_chain(inputs, checks);
-        run_shape(inputs, 512, 256, 8, 12, compared, checks);
-        run_shape(inputs, 5120, 2304, 4, 8, compared, checks);
         double chain_worst = 0;
-        run_chain_shape(inputs, 512, 256, 8, 10, checks, chain_worst);
-        run_chain_shape(inputs, 5120, 2304, 4, 8, checks, chain_worst);
-        run_grouped_prefill_hybrid(inputs, false, compared, checks);
-        run_grouped_prefill_hybrid(inputs, true, compared, checks);
-        run_grouped_prefill_cold_transients(inputs, compared, checks);
+        run_shape(inputs, 512, 256, 8, 12, strict_bridge, compared, checks, chain_worst);
+        run_shape(inputs, 5120, 2304, 4, 8, strict_bridge, compared, checks, chain_worst);
+        run_chain_shape(inputs, 512, 256, 8, 10, strict_bridge, checks, chain_worst);
+        run_chain_shape(inputs, 5120, 2304, 4, 8, strict_bridge, checks, chain_worst);
+        run_grouped_prefill_hybrid(inputs, false, strict_bridge, compared, checks);
+        run_grouped_prefill_hybrid(inputs, true, strict_bridge, compared, checks);
+        run_grouped_prefill_cold_transients(inputs, strict_bridge, compared, checks);
         // last: it sets the tier's environment for itself
+        inputs.set("tier.mxfp4_gpu_hidden", strict_bridge ? "0" : "1");
         run_host_jobs(inputs, GGML_TYPE_MXFP4, checks);
-        std::printf("REAL_GPU_MXFP4_TIER_PASS compared=%zu assertions=%zu chain_worst_rel_l2=%.3e\n", compared, checks, chain_worst);
+        require(compared > 0, "MXFP4 tier fixture compared no supported-path outputs");
+        std::printf("REAL_GPU_MXFP4_TIER_PASS compared=%zu assertions=%zu chain_worst_rel_l2=%.3e strict_bridge=%d\n", compared, checks, chain_worst, int(strict_bridge));
         return 0;
     } catch (const std::exception & e) {
         std::fprintf(stderr, "REAL_GPU_MXFP4_TIER_FAIL: %s\n", e.what());

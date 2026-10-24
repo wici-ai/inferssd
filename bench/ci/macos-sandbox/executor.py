@@ -376,6 +376,8 @@ class Session:
     def probe(self, record, *, light=False):
         require(type(light) is bool, "probe light flag must be boolean")
         result = dict(record)
+        result["resource_policy"] = {key: self.config["executor"][key] for key in (
+            "max_processes", "memory_budget_bytes", "host_reserve_bytes")}
         if record["state"] == "running":
             identity = birth(record["worker_pid"])
             require(identity == record["birth_identity"], "worker PID reused")
