@@ -5,6 +5,28 @@ Updated: 2026-10-24. Target: SSDash / InferSSD.
 This records manual research coverage; it does not configure a scheduled scanner.
 Review means selected source paths and patches, not a whole-repository audit.
 
+## Candidate update workflow
+
+The target repository is `https://github.com/wici-ai/inferssd.git`; the publication
+branch is `ready-to-pr-version`.
+
+1. Fetch current `main` and the remote candidate branch before each research round.
+   Record the exact main revision. A failed fetch does not establish freshness.
+2. Integrate main into the candidate while preserving prior unmerged candidate
+   work. Check whether main already implements each researched idea.
+3. Inspect upstream designs and model-support changes, record provenance and
+   dependencies, and implement only useful, independently reviewable changes.
+4. Run relevant regression and build checks; document platform limits and pending
+   model/performance qualification without claiming unmeasured improvements.
+5. Commit locally as `ustc-sunny`, then push to `ready-to-pr-version`. Fetch and
+   reconcile remote changes if a normal push is rejected; do not force-push.
+6. Verify the remote candidate revision. Do not push to main or create a PR;
+   PR creation remains a separate owner instruction.
+
+If connectivity prevents fetching or pushing, preserve local work and report
+which step is incomplete. Background research runners must be configured and
+authorized separately; this document does not change their publication controls.
+
 | Source | Focus | Current status |
 |---|---|---|
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | Model compatibility, vocabulary loading, graphs and kernels | Selective vocabulary and Nemotron dimension ports prepared; see the October 23 report |
