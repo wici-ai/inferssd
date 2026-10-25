@@ -2,7 +2,9 @@
 """Exact reviewed PR -> root-staged selected children -> terminal dedicated App check."""
 
 import argparse
+import html
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -15,7 +17,7 @@ from ci.contract import HASH, digest, load, policy_read, revision, save
 from ci.impact import fingerprint, plan as selection, selected, validate
 from ci.private_controller import API, admission, bind_context, check_body, context, current_ci, source_manifest, writable
 from ci.selected_aggregate import aggregate, operator_aggregate
-from ci.selection_contract import JOB, execution_scope
+from ci.selection_contract import JOB, execution_scope, FUNCTIONAL_MODE
 from ci import selection_dispatch
 
 
@@ -37,10 +39,10 @@ def changed_paths(api, pr):
     return paths
 
 
-def jobs_checked(jobs, impact, execution_devices=None):
+def jobs_checked(jobs, impact, execution_devices=None, validation_mode=FUNCTIONAL_MODE):
     devices = {cell["device"] for cell in selected(impact)}
     if execution_devices is not None:
-        scope = execution_scope(dict(validation_mode="functional-numerical", execution_devices=execution_devices))
+        scope = execution_scope(dict(validation_mode=validation_mode, execution_devices=execution_devices))
         if not set(scope["execution_devices"]) <= devices:
             raise ValueError("operator scope contains an unaffected device")
         devices = set(scope["execution_devices"])
@@ -109,7 +111,7 @@ def operator_envelope(value, policy, identity, actor):
             or not isinstance(prepared, dict) or prepared.get("login") != actor["login"]
             or type(prepared.get("id")) is not int or prepared["id"] != actor["id"]):
         raise ValueError("operator envelope source/actor/controller/policy identity differs")
-    jobs_checked(value["jobs"], impact, scope["execution_devices"])
+    jobs_checked(value["jobs"], impact, scope["execution_devices"], scope["validation_mode"])
     return value
 
 
@@ -190,7 +192,8 @@ def execute(args, env=os.environ):
                 or any(admitted.get(key) != value for key, value in envelope.items())
                 or admitted.get("operator") != actor):
             raise ValueError("admitted operator envelope changed")
-    jobs = jobs_checked(admitted["jobs"], impact, admitted["execution_devices"] if operator else None)
+    jobs = jobs_checked(admitted["jobs"], impact, admitted["execution_devices"] if operator else None,
+                        admitted["validation_mode"] if operator else FUNCTIONAL_MODE)
     if operator:
         operator_job_controls(args, jobs)
     # Source read credentials are not used to dispatch or sent to device runners.
@@ -215,12 +218,28 @@ def execute(args, env=os.environ):
             except Exception as error:
                 state["errors"][device] = f"{type(error).__name__}: {error}"
         for device, child in dispatched.items():
+            collection_attempted = False
             try:
                 run = selection_dispatch.wait(api, child, timeout_s=max(1, deadline - time.monotonic()))
                 state["children"][device] = run
+                collection_attempted = True
                 selection_dispatch.collect(api, run, jobs[device], args.artifacts / device, parent=parent)
             except Exception as error:
                 state["errors"][device] = f"{type(error).__name__}: {error}"
+                if not collection_attempted:
+                    # A complete inconclusive pair exits nonzero. Retain its raw
+                    # artifact once so the always report can recompute metrics;
+                    # cancellation/unknown state still cannot become a pass.
+                    try:
+                        run = api.call("actions/runs/" + str(child["id"]))
+                        selection_dispatch.run_identity(run, child["workflow_id"], child["controller_sha"], child["job_id"])
+                        if run.get("id") != child["id"] or run.get("status") != "completed":
+                            raise ValueError("failed child has no exact terminal run")
+                        state["children"][device] = run
+                        selection_dispatch.collect(api, run, jobs[device], args.artifacts / device, parent=parent)
+                        state.setdefault("retained_failed_children", {})[device] = run["id"]
+                    except Exception as retained_error:
+                        state["errors"][device] += "; raw retention: " + type(retained_error).__name__ + ": " + str(retained_error)
     finally:
         save(args.artifacts / "dispatch-state.json", state)
         try:
@@ -288,9 +307,86 @@ def cancel_children(args, env=os.environ):
     return 1 if uncertain else 0
 
 
+def summary_text(value):
+    return html.escape(str(value)).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
+def metric_text(metric, key):
+    value = metric.get(key)
+    if type(value) not in (int, float) or not math.isfinite(value):
+        return "unavailable"
+    return f"{value:+.3f}%" if key == "change_percent" else f"{value:.4f}"
+
+
+def operator_summary(stream, report):
+    """Render verified pair values, never turn missing/inconclusive into green."""
+    status = report.get("status", "passed" if report["passed"] else "failed")
+    stream.write("## Operator-authorized device report\n\n")
+    stream.write("Declared Linux scope: **" + summary_text(status) + "**. ")
+    stream.write("Full impact coverage: **" + str(report["full_impact_coverage_complete"]).lower() + "**.\n\n")
+    stream.write("PR publication is not enabled. These results identify sealed source; they do not attest the current PR head.\n\n")
+    for key in ("base", "head", "candidate"):
+        if key in report:
+            stream.write(key + ": `" + summary_text(report[key]) + "`\n\n")
+    stream.write("| Device | Model | Functional | Numerical | Performance | Outcome |\n|---|---|---|---|---|---|\n")
+    pairs = []
+    for row in report["cells"]:
+        performance = row.get("performance", row["status"])
+        if isinstance(performance, list):
+            pairs.extend((row, pair) for pair in performance)
+            performance = ", ".join(pair["tier"] + ": " + pair["status"] for pair in performance) or "not-measured"
+        deferred = row.get("performance_deferred_tiers", [])
+        if deferred:
+            performance += "; deferred tiers: " + ", ".join(deferred)
+        values = [row.get("device"), row.get("model"), row.get("functional", row["status"]),
+                  row.get("numerical", row["status"]), performance, row["status"]]
+        stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
+    if pairs:
+        stream.write("\n### 512 prompt / 256 decode: two decode segments\n\n")
+        stream.write("| Device | Model | Tier | 0–128 base tok/s | PR tok/s | Change | 128–256 base tok/s | PR tok/s | Change | Outcome |\n")
+        stream.write("|---|---|---|---:|---:|---:|---:|---:|---:|---|\n")
+        for row, pair in pairs:
+            metrics = pair.get("metrics", {})
+            first, second = metrics.get("decode_first128_tps", {}), metrics.get("decode_second128_tps", {})
+            values = [row["device"], row["model"], pair["tier"],
+                      *(metric_text(first, key) for key in ("base", "candidate", "change_percent")),
+                      *(metric_text(second, key) for key in ("base", "candidate", "change_percent")), pair["status"]]
+            stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
+        stream.write("\n| Device | Model | Tier | Metric | Base | PR | Change | Better direction |\n|---|---|---|---|---:|---:|---:|---|\n")
+        for row, pair in pairs:
+            for key, label in (("decode_tps", "Whole decode tok/s"), ("ttft_s", "Request TTFT seconds"),
+                               ("server_prefill_tps", "Native prefill tok/s")):
+                metric = pair.get("metrics", {}).get(key, {})
+                values = [row["device"], row["model"], pair["tier"], label,
+                          *(metric_text(metric, field) for field in ("base", "candidate", "change_percent")),
+                          "lower" if key == "ttft_s" else "higher"]
+                stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
+        stream.write("\nChange is (PR/base − 1) × 100; lower TTFT is better. TTFT starts at the request, not model loading. ")
+        stream.write("One sample per arm: observed slowdown or different generated tokens is inconclusive and does not pass.\n\n")
+        stream.write("<details><summary>Pair identities and retained raw evidence</summary>\n\n")
+        for row, pair in pairs:
+            identity = pair.get("measurement_identity", {})
+            stream.write("- " + summary_text(row["device"] + "/" + row["model"] + "/" + pair["tier"]) + ": ")
+            stream.write("prompt SHA `" + summary_text(identity.get("prompt_sha256", "unavailable")) + "`; ")
+            stream.write("template IDs SHA `" + summary_text(identity.get("prompt_ids_sha256", "unavailable")) + "`; ")
+            stream.write("conditions/settings SHA `" + summary_text(identity.get("conditions_sha256", "unavailable")) + "`.\n")
+            for side in ("base", "candidate"):
+                raw = pair.get("evidence", {}).get(side, {}).get("result.json", {})
+                path = "/".join((row["device"], row.get("job_id", "unknown-job"), raw.get("path", "unavailable")))
+                stream.write("  - " + side + " source `" + summary_text(pair.get("sources", {}).get(side, "unavailable"))
+                             + "`: `" + summary_text(path) + "`, SHA `" + summary_text(raw.get("sha256", "unavailable")) + "`.\n")
+        stream.write("\n</details>\n")
+    if report.get("error"):
+        stream.write("\nFailure: " + summary_text(report["error"]) + "\n")
+    for error in report.get("errors", []):
+        stream.write("\nFailure: " + summary_text(error) + "\n")
+    stream.write("\nMac/offline and any 4K deferred coverage are separate from this Linux scope. ")
+    stream.write("Formal benchmark samples: 0/16. Full comparison values and hashes are in aggregate.json; complete raw and cleanup evidence are in the retained selected-control artifacts.\n")
+
+
 def operator_report(args, env=os.environ):
     """A terminal Actions artifact/summary, with no source status/check writes."""
-    report = dict(schema_version=1, purpose=OPERATOR_PURPOSE, passed=False,
+    report = dict(schema_version=1, purpose=OPERATOR_PURPOSE, passed=False, status="failed", linux_scoped_status="failed",
                   full_impact_coverage_complete=False, pr_publication="not-enabled",
                   source_identity="sealed-source-not-current-pr", formal_samples=0,
                   cells=[], errors=[])
@@ -310,41 +406,40 @@ def operator_report(args, env=os.environ):
             raise ValueError("admitted operator envelope/control changed")
         impact = envelope["selection"]
         scope = execution_scope(envelope)
-        jobs = jobs_checked(envelope["jobs"], impact, scope["execution_devices"])
+        jobs = jobs_checked(envelope["jobs"], impact, scope["execution_devices"], scope["validation_mode"])
         operator_job_controls(args, jobs)
         state = load(args.artifacts / "dispatch-state.json")
-        if state["selection_plan_sha256"] != fingerprint(impact) or state["errors"]:
-            raise ValueError("one or more operator dispatches failed or are missing")
+        if state["selection_plan_sha256"] != fingerprint(impact):
+            raise ValueError("operator dispatch selection plan differs")
         if set(state["children"]) != set(jobs):
             raise ValueError("selected operator children are missing or unexpected")
         api = API(policy["controller_repository"], env["GITHUB_TOKEN"])
+        children = {}
         for device, child in state["children"].items():
             latest = api.call("actions/runs/" + str(child["id"]))
             selection_dispatch.run_identity(latest, child["workflow_id"], identity["workflow_sha"], jobs[device]["job_id"])
-            if latest.get("status") != "completed" or latest.get("conclusion") != "success":
-                raise ValueError("operator child is not a successful completed single attempt")
-        report = operator_aggregate(impact, policy, args.artifacts, jobs, state["children"], scope)
+            if latest.get("id") != child["id"] or latest.get("status") != "completed" or latest.get("conclusion") not in ("success", "failure"):
+                raise ValueError("operator child is not an exact completed single attempt")
+            children[device] = latest
+        report = operator_aggregate(impact, policy, args.artifacts, jobs, children, scope)
+        if state["errors"]:
+            inconclusive_devices = {row["device"] for row in report["cells"] if row["status"] == "inconclusive"}
+            retained = state.get("retained_failed_children", {})
+            complete = all(retained.get(device) == children[device]["id"] for device in state["errors"] if device in children)
+            if (not set(state["errors"]) <= inconclusive_devices or report.get("status") != "inconclusive"
+                    or not complete):
+                report.update(passed=False, status="failed", linux_scoped_status="failed", full_impact_coverage_complete=False)
+            report["child_workflow_errors"] = state["errors"]
         report.update(base=envelope["base"], head=envelope["head"], candidate=envelope["candidate"],
                       operator=actor, controller=identity, envelope_sha256=fingerprint(envelope))
     except Exception as error:
-        report.update(passed=False, full_impact_coverage_complete=False,
+        report.update(passed=False, status="failed", linux_scoped_status="failed", full_impact_coverage_complete=False,
                       error=f"{type(error).__name__}: {error}")
     save(args.output, report)
     summary = env.get("GITHUB_STEP_SUMMARY")
     if summary:
         with Path(summary).open("a", encoding="utf-8") as stream:
-            stream.write("## Operator-authorized device report\n\n")
-            stream.write("Declared scope: **" + ("passed" if report["passed"] else "failed") + "**. ")
-            stream.write("Full impact coverage: **" + str(report["full_impact_coverage_complete"]).lower() + "**.\n\n")
-            stream.write("PR publication is not enabled. These results identify sealed source; they do not attest the current PR head.\n\n")
-            for key in ("base", "head", "candidate"):
-                if key in report:
-                    stream.write(key + ": `" + report[key] + "`\n\n")
-            stream.write("| Device | Model | Functional | Numerical | Performance |\n|---|---|---|---|---|\n")
-            for row in report["cells"]:
-                stream.write("| " + " | ".join(str(row.get(key, row["status"])) for key in
-                             ("device", "model", "functional", "numerical", "performance")) + " |\n")
-            stream.write("\nFormal benchmark samples: 0/16. Complete raw and cleanup evidence are in the retained artifacts.\n")
+            operator_summary(stream, report)
     return 0 if report["passed"] else 1
 
 

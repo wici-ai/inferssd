@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poll exact-head `/ci linux` PR reviews on the trusted preparation host."""
+"""Poll exact-head `/ci test` PR reviews on the trusted preparation host."""
 
 import argparse
 from datetime import datetime
@@ -55,7 +55,7 @@ def marker(review):
     if review.get("state") not in ("COMMENTED", "APPROVED"):
         return None
     # A whole comment avoids authorizing quoted examples or incidental prose.
-    return {"/ci linux": "run", "/ci cancel": "cancel"}.get(
+    return {"/ci test": "run", "/ci cancel": "cancel"}.get(
         review.get("body", "").strip()
     )
 

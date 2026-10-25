@@ -1,6 +1,6 @@
 name: InferSSD device admission information
 
-# Physical execution and App publication belong to the separate private control.
+# Physical execution belongs to the separate private controller.
 # This preview has no device runner, App token, secret or dispatch permission.
 on:
   pull_request:
@@ -32,5 +32,6 @@ jobs:
       - name: Physical tests require separate private admission
         run: |
           echo "This is an unprivileged preview, not physical acceptance."
-          echo "The protected private controller independently reads the real PR and exact-head approval."
-          echo "It binds the same selected plan to root-staged config/manifests, execution and terminal App aggregation."
+          echo "A source maintainer submits a Comment review whose complete body is /ci test on the current PR head."
+          echo "The trusted operator seals base/candidate sources and runs the impact-selected Linux checks and 512/decode256 comparison."
+          echo "Results are in the private controller Actions Summary and artifacts; Mac coverage may remain deferred."

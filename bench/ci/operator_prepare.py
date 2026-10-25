@@ -22,12 +22,13 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci.contract import HASH, digest, load, policy_read, revision, save
-from ci.impact import fingerprint, plan
-from ci.selection_contract import JOB, bind, bound
+from ci.impact import fingerprint, plan, device_requirements
+from ci.selection_contract import JOB, bind, bound, runtime_requirements, performance_protocol
 
 
 DEVICES = ("cloud-5090", "dgx-spark")
-MODE = "functional-numerical"
+MODE = "functional-numerical-performance"
+LEGACY_MODE = "functional-numerical"
 PURPOSE = "operator-selected-report-only"
 MAX_INPUT = 60 * 1024
 WORKFLOW = ".github/workflows/device-performance.yml"
@@ -173,7 +174,7 @@ def replace_strings(value, replacements):
     return value
 
 
-def export_source(source, candidate, output):
+def export_source(source, candidate, output, side="candidate"):
     """One batch Git blob reader; no checkout, hooks, export-ignore or source execution."""
     rows = []
     for item in git(source, "ls-tree", "-rz", candidate).split(b"\0"):
@@ -185,7 +186,10 @@ def export_source(source, candidate, output):
         if kind != "blob" or mode not in ("100644", "100755"):
             raise ValueError("source export requires only regular tracked Git files")
         rows.append(dict(path=name, mode=mode, blob=blob))
-    archive_path = output / "candidate-source.tar.gz"
+    if side not in ("base", "candidate"):
+        raise ValueError("fixed source side required")
+    archive_name = side + "-source.tar.gz"
+    archive_path = output / archive_name
     process = subprocess.Popen(["git", "-C", str(source), "cat-file", "--batch"],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
@@ -213,45 +217,57 @@ def export_source(source, candidate, output):
             process.wait()
         process.stdout.close()
     value = dict(revision=candidate, tree=git(source, "rev-parse", candidate + "^{tree}").decode().strip(),
-                 archive="candidate-source.tar.gz", archive_sha256=digest(archive_path), files=rows)
-    save(output / "source-map.json", value)
+                 archive=archive_name, archive_sha256=digest(archive_path), files=rows)
+    save(output / ("source-map.json" if side == "candidate" else "base-source-map.json"), value)
     return value
 
 
-def normalize(template, manifest, declared, job_id, identities):
+def normalize(template, manifest, declared, job_id, identities, mode=MODE):
+    if mode not in (MODE, LEGACY_MODE):
+        raise ValueError("explicit supported operator validation mode required")
     old_job = manifest["job_id"]
-    old_candidate = template["sides"]["candidate"]["revision"]
-    replacements = [(old_job, job_id), ("{{job_id}}", job_id), ("/JOB/", "/" + job_id + "/"),
-                    (old_candidate, identities["candidate"])]
-    template, manifest = (replace_strings(value, replacements) for value in (template, manifest))
-    template["sides"]["base"] = replace_strings(template["sides"]["base"],
-        [(template["sides"]["base"]["revision"], identities["base"])])
-    source_root = "/var/lib/inferssd-ci-inputs/operator-" + job_id
-    old_source = manifest["sources"]["candidate"]
-    manifest["sources"] = {"candidate": source_root}
-    manifest["source_revisions"] = {"candidate": identities["candidate"]}
-    candidate = template["sides"]["candidate"]
-    manifest["builds"] = {"candidate": "candidate"}
-    manifest["models"] = {key: value for key, value in manifest["models"].items()
-                          if key in candidate["models"] or key in {"settings-" + m + "-candidate.ssd" for m in candidate["models"]}}
-    cache_treatment = "not-forced/uncontrolled; functional/numerical only; no cache-drop or cold-cache assertion"
+    template, manifest = (replace_strings(value, [(old_job, job_id), ("{{job_id}}", job_id),
+        ("/JOB/", "/" + job_id + "/")]) for value in (template, manifest))
+    sides = ("base", "candidate") if mode == MODE else ("candidate",)
+    root = "/var/lib/inferssd-ci-inputs/operator-" + job_id
+    source_roots = {side: root + "/" + side if mode == MODE else root for side in sides}
+    manifest["sources"] = source_roots
+    manifest["source_revisions"] = {side: identities[side] for side in sides}
+    manifest["builds"] = {side: side for side in sides}
+    mounts = {model: manifest["models"][model] for model in template["sides"]["candidate"]["models"]}
+    cache_treatment = (template["host"].get("os_page_cache_treatment") if mode == MODE else
+        "not-forced/uncontrolled; functional/numerical only; no cache-drop or cold-cache assertion")
+    if not isinstance(cache_treatment, str) or not cache_treatment.strip():
+        raise ValueError("explicit shared OS page cache treatment required")
     template["host"]["os_page_cache_treatment"] = cache_treatment
-    for side, spec in template["sides"].items():
+    for side, previous in list(template["sides"].items()):
+        spec = replace_strings(previous, [(previous["revision"], identities[side])])
+        template["sides"][side] = spec
         for model, data in spec["models"].items():
-            if side == "candidate":
-                data["template"]["host_path"] = data["template"]["host_path"].replace(old_source, source_root)
+            if side in sides:
+                prefix = "/source/" + side + "/"
+                path = data["template"]["runtime_path"]
+                if not path.startswith(prefix):
+                    raise ValueError("template must belong to its exact source side")
+                data["template"]["host_path"] = source_roots[side] + "/" + relative(path[len(prefix):])
+                settings = data["settings"]
+                settings["host_path"] = "/opt/inferssd-ci-integrations/" + job_id + "-" + model + "-" + side + "-settings.ssd"
+                settings["runtime_path"] = "/models/settings-" + model + "-" + side + ".ssd"
+                mounts["settings-" + model + "-" + side + ".ssd"] = settings["host_path"]
             if "model_identity" not in data:
                 data["model_identity"] = copy.deepcopy(template["model_identity"][model])
-            identity = data["model_identity"]
-            for row in identity["shards"]:
+            for row in data["model_identity"]["shards"]:
                 if "stat" not in row:
                     row["stat"] = {key: row[key] for key in ("device", "inode", "bytes", "mtime_ns", "ctime_ns")}
                 if "sha256" not in row:
                     row["sha256"] = row["historical_sha256"]
             data["smoke"]["os_page_cache_treatment"] = cache_treatment
-            if data.get("benchmarks"):
+            if mode == LEGACY_MODE and data.get("benchmarks"):
                 raise ValueError("operator functional/numerical input must not contain timed arms")
+    manifest["models"] = mounts
     template["manifest_path"] = "/var/lib/inferssd-ci-broker/jobs/" + job_id + "/manifest.json"
+    if mode == MODE:
+        template["performance_protocol"] = performance_protocol()
     for key in ("control_revision", "control_manifest_sha256"):
         template[key] = declared[key]
     revision(template["control_revision"])
@@ -260,8 +276,19 @@ def normalize(template, manifest, declared, job_id, identities):
     return template, manifest
 
 
+def staged_settings_name(model, side, mode):
+    return "settings-" + model + ("-" + side if mode == MODE else "") + ".ssd"
+
+
+def paired_settings(base, candidate):
+    # Only the side's source/build namespace is an identity difference. Every
+    # other byte (including typed resource values) must remain identical.
+    return base.replace(b"/build/base/", b"/build/candidate/").replace(
+        b"/source/base/", b"/source/candidate/") == candidate
+
+
 def root_policy(config, manifest, declared):
-    return dict(schema_version=1, purpose="operator-stage-policy", device=config["device"],
+    value = dict(schema_version=1, purpose="operator-stage-policy", device=config["device"],
         broker_config_sha256=config["broker_config_sha256"], lock_identity=declared["lock_identity"],
         control_revision=config["control_revision"], control_manifest_sha256=config["control_manifest_sha256"],
         resources_sha256=fingerprint(config["host"]["resources"]), min_free_bytes=declared["min_free_bytes"],
@@ -271,9 +298,20 @@ def root_policy(config, manifest, declared):
                 for model, data in config["sides"]["candidate"]["models"].items()},
         model_admission={key: config[key] for key in ("model_admission_path", "model_admission_sha256",
             "model_mount_proof_path", "model_mount_proof_sha256", "prior_model_job_id") if key in config})
+    if config.get("validation_mode") == MODE:
+        value.update(performance_protocol=performance_protocol(), side_settings_sha256={side: {
+            model: data["settings"]["sha256"] for model, data in config["sides"][side]["models"].items()}
+            for side in ("base", "candidate")})
+    return value
 
 
 def prepare(args, api=None):
+    mode = getattr(args, "validation_mode", MODE)
+    if mode not in (MODE, LEGACY_MODE):
+        raise ValueError("explicit supported operator validation mode required")
+    if mode == MODE:
+        import final_chat
+        final_chat.prompt_path("512")  # Trusted recorder input, never PR source.
     policy = policy_read(load(args.policy))
     specification = load(args.inputs)
     execution = list(args.execution_devices)
@@ -288,6 +326,9 @@ def prepare(args, api=None):
     identities = {key: revision(getattr(args, key)) for key in ("base", "head", "candidate")}
     source, paths, full_diff = source_identity(args.source, identities, api, policy["repository"])
     impact = plan(paths, policy, **identities)
+    execution = [device for device in execution if device_requirements(impact, device)["models"]]
+    if not execution:
+        raise ValueError("impact requires no enabled Linux device; do not stage or dispatch")
     root = args.inputs.resolve().parent
     devices, jobs, inputs = {}, {}, {}
     for device in execution:
@@ -296,15 +337,40 @@ def prepare(args, api=None):
         if not isinstance(job_id, str) or JOB.fullmatch(job_id) is None:
             raise ValueError("fresh 32-hex job ID required")
         template_path, manifest_path = (input_file(root, declared[key]) for key in ("template", "manifest"))
-        template, manifest = normalize(*(load(path) for path in (template_path, manifest_path)), declared, job_id, identities)
+        template, manifest = normalize(*(load(path) for path in (template_path, manifest_path)), declared, job_id, identities, mode)
         if template.get("device") != device or manifest.get("job_id") != job_id:
             raise ValueError("device/job template differs from selected slot")
-        template.update(execution_devices=execution, validation_mode=MODE)
+        template.update(execution_devices=execution, validation_mode=mode, selection_plan=impact)
+        admission_policy = root_policy(template, manifest, declared)
+        if mode == MODE:
+            for side, spec in template["sides"].items():
+                for data in spec["models"].values():
+                    prefix = "/source/" + side + "/"
+                    relative_template = relative(data["template"]["runtime_path"][len(prefix):])
+                    data["template"]["sha256"] = hashlib.sha256(git(args.source, "show", identities[side] + ":" + relative_template)).hexdigest()
+        needs = runtime_requirements(template)
+        for spec in template["sides"].values():
+            spec["models"] = {name: data for name, data in spec["models"].items() if name in needs["models"]}
+            for model, data in spec["models"].items():
+                tiers = needs["performance"].get(model, {}).get("tiers", [])
+                if not set(tiers) <= set(data.get("benchmarks", {})):
+                    raise ValueError("required performance launch is missing from reviewed profile")
+                data["benchmarks"] = {tier: data["benchmarks"][tier] for tier in tiers}
+        manifest["models"] = {name: path for name, path in manifest["models"].items() if name in needs["models"] or
+            any(name == "settings-" + model + "-" + side + ".ssd" for model in needs["models"] for side in ("base", "candidate"))}
+        active_sides = ("base", "candidate") if needs["performance"] else ("candidate",)
+        for key in ("sources", "source_revisions", "builds"):
+            manifest[key] = {side: manifest[key][side] for side in active_sides}
+        manifest["models"] = {name: path for name, path in manifest["models"].items() if name in needs["models"] or
+            any(name == "settings-" + model + "-" + side + ".ssd" for model in needs["models"] for side in active_sides)}
         config, manifest = bind(template, manifest, impact, policy)
-        if config.get("validation_mode") != MODE:
+        if mode == MODE:
+            from ci.selected_preflight import declarations
+            declarations(config, manifest, needs)
+        if config.get("validation_mode") != mode:
             raise ValueError("trusted selection contract does not support the explicit execution mode")
         # Functional/numerical mode must never silently retain timed arms.
-        if (manifest.get("source_revisions") != {"candidate": identities["candidate"]}
+        if mode == LEGACY_MODE and (manifest.get("source_revisions") != {"candidate": identities["candidate"]}
                 or any(data.get("benchmarks") for spec in config["sides"].values() for data in spec["models"].values())
                 or any("benchmark" in name or "preflight" in name for name in manifest.get("stages", {}))):
             raise ValueError("functional/numerical preparation cannot authorize a performance stage")
@@ -313,15 +379,30 @@ def prepare(args, api=None):
             raise ValueError("actual original device/inode lease identity required")
         if not isinstance(declared["gpu_uuid"], str) or not declared["gpu_uuid"].startswith("GPU-"):
             raise ValueError("explicit actual GPU UUID required")
-        devices[device] = dict(config=config, manifest=manifest, policy=root_policy(config, manifest, declared))
+        devices[device] = dict(config=config, manifest=manifest, policy=admission_policy)
         assets = {}
         for name, local in declared.get("rootstage_files", {}).items():
             path = input_file(root, local)
             if path.suffix == ".gguf" or path.stat().st_size > 128 << 20:
                 raise ValueError("root staging accepts small source/settings metadata, never model payload")
             assets[relative(name)] = dict(local_path=str(path.resolve()), bytes=path.stat().st_size, sha256=digest(path))
-        if set(assets) != {"settings-" + model + ".ssd" for model in config["sides"]["candidate"]["models"]}:
-            raise ValueError("explicit settings payloads for exactly the selected models required")
+        sides = ("base", "candidate") if needs["performance"] else ("candidate",)
+        expected_assets = {staged_settings_name(model, side, mode) for side in sides for model in needs["models"]}
+        if not expected_assets <= set(assets):
+            raise ValueError("explicit settings payloads for exactly the selected sides/models required")
+        assets = {name: row for name, row in assets.items() if name in expected_assets}
+        for side in sides:
+            for model, data in config["sides"][side]["models"].items():
+                name = staged_settings_name(model, side, mode)
+                if assets[name]["sha256"] != data["settings"]["sha256"]:
+                    raise ValueError("settings payload differs from declared side hash")
+        if needs["performance"]:
+            for model in needs["models"]:
+                base_data, candidate_data = (config["sides"][side]["models"][model] for side in ("base", "candidate"))
+                if (base_data["model_identity"] != candidate_data["model_identity"] or not paired_settings(
+                        Path(assets[staged_settings_name(model, "base", mode)]["local_path"]).read_bytes(),
+                        Path(assets[staged_settings_name(model, "candidate", mode)]["local_path"]).read_bytes())):
+                    raise ValueError("base/candidate model or effective settings differ")
         minimum = declared["min_free_bytes"]
         if type(minimum) is not int or minimum <= 0:
             raise ValueError("explicit positive staging free-space reserve required")
@@ -339,7 +420,9 @@ def prepare(args, api=None):
     save(args.output / "changed-paths.json", paths)
     (args.output / "source.diff").write_bytes(full_diff)
     save(args.output / "selection-plan.json", impact)
-    source_map = export_source(args.source, identities["candidate"], args.output)
+    required_sides = {side for row in devices.values() for side in row["manifest"]["sources"]}
+    source_maps = {side: export_source(args.source, identities[side], args.output, side) for side in ("base", "candidate") if side in required_sides}
+    source_map = source_maps["candidate"]
     for device, row in devices.items():
         folder = args.output / device
         folder.mkdir()
@@ -358,7 +441,7 @@ def prepare(args, api=None):
     envelope = dict(schema_version=1, purpose=PURPOSE, repository=policy["repository"],
         **identities, prepared_by=actor, controller_repository=policy["controller_repository"],
         controller_workflow_sha=workflow_sha, selection=impact, selection_plan_sha256=fingerprint(impact),
-        execution_devices=execution, validation_mode=MODE, jobs=jobs, policy_sha256=fingerprint(policy))
+        execution_devices=execution, validation_mode=mode, jobs=jobs, policy_sha256=fingerprint(policy))
     if len(json.dumps(envelope, separators=(",", ":"), allow_nan=False).encode()) > MAX_INPUT:
         raise ValueError("complete prepared envelope exceeds workflow input bound; never truncate impact")
     save(args.output / "envelope.json", envelope)
@@ -371,12 +454,18 @@ def prepare(args, api=None):
                            ("candidate-source.tar.gz", args.output / "candidate-source.tar.gz"),
                            ("envelope.json", args.output / "envelope.json")):
             files[name] = dict(local_path=str(path.resolve()), bytes=path.stat().st_size, sha256=digest(path))
+        if "base" in row["manifest"]["sources"]:
+            for name in ("base-source-map.json", "base-source.tar.gz"):
+                path = args.output / name
+                files[name] = dict(local_path=str(path.resolve()), bytes=path.stat().st_size, sha256=digest(path))
         request = dict(schema_version=1, job_id=inputs[device]["job_id"], device=device,
              candidate=identities["candidate"], source_tree=source_map["tree"],
              broker_config_sha256=row["config"]["broker_config_sha256"],
              min_free_bytes=inputs[device]["min_free_bytes"], operator_stage_sha256=helper_sha,
              policy_sha256=digest(folder / "policy.review.json"),
              files={name: {key: value[key] for key in ("bytes", "sha256")} for name, value in files.items()})
+        if mode == MODE:
+            request["sources"] = {side: {key: source_maps[side][key] for key in ("revision", "tree")} for side in row["manifest"]["sources"]}
         save(folder / "root-input.json", request)
         inputs[device].update(files=files, root_input_path=str((folder / "root-input.json").resolve()),
                              root_input_sha256=digest(folder / "root-input.json"), policy_sha256=digest(folder / "policy.review.json"))
@@ -499,6 +588,13 @@ def validate_root_receipt(envelope, inputs, device, receipt):
         existing_coordination_unmodified=True)
     if any(receipt.get(key) != value for key, value in required.items()):
         raise ValueError("actual root staging receipt/source/config/control identity differs")
+    if envelope.get("validation_mode") == MODE:
+        request = load(Path(data["root_input_path"]))
+        observed = receipt.get("sources", {})
+        if set(observed) != set(request["sources"]) or any(
+                observed[side].get("root_owned_readonly") is not True or any(observed[side].get(key) != value
+                    for key, value in expected.items()) for side, expected in request["sources"].items()):
+            raise ValueError("root staging did not seal the exact required source sides")
     if receipt.get("source", {}).get("root_owned_readonly") is not True:
         raise ValueError("root staging did not seal its source")
     if receipt.get("policy_sha256") != data["policy_sha256"]:
@@ -548,6 +644,7 @@ def main():
             for key in ("base", "head", "candidate"):
                 command.add_argument("--" + key, required=True)
             command.add_argument("--policy", type=Path, default=Path(__file__).with_name("policy.json"))
+            command.add_argument("--validation-mode", choices=(MODE, LEGACY_MODE), default=MODE)
             command.add_argument("--execution-devices", nargs="+", choices=DEVICES, default=list(DEVICES))
         else:
             command.add_argument("--prepared", type=Path, required=True)

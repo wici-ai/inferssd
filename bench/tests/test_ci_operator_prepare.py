@@ -2,6 +2,7 @@
 
 import json
 import io
+import copy
 from pathlib import Path
 import subprocess
 import sys
@@ -28,6 +29,7 @@ def source(tmp_path):
     command(root, "config", "user.name", "Synthetic operator")
     command(root, "config", "user.email", "operator@example.invalid")
     (root / "old.cpp").write_text("old\n")
+    (root / "chat.jinja").write_text("{{ messages }}\n")
     command(root, "add", ".")
     command(root, "commit", "-qm", "base")
     base = command(root, "rev-parse", "HEAD")
@@ -158,7 +160,7 @@ def test_api_json_rejects_ambiguous_evidence(raw):
         prepare.parsed(raw)
 
 
-def prepared_fixture(tmp_path, source, *, devices=None):
+def prepared_fixture(tmp_path, source, *, devices=None, mode=prepare.LEGACY_MODE):
     from test_ci_selection import template
     root, identity = source
     impact = prepare.plan(["old.cpp", "new.cpp"], POLICY, **identity)
@@ -169,12 +171,12 @@ def prepared_fixture(tmp_path, source, *, devices=None):
         config.update(model_identity={m: dict(shards=[dict(host_path="/admitted/" + m + "/model.gguf", runtime_path="/models/" + m + "/model.gguf",
                       device=1, inode=2, bytes=3, mtime_ns=4, ctime_ns=5, historical_sha256="8" * 64)])
                       for m in ("deepseek", "muse")}, broker_config_sha256="9" * 64,
-                      host=dict(resources=dict(memory_max=64 << 30)))
+                      host=dict(resources=dict(memory_max=64 << 30), os_page_cache_treatment="same reviewed cache treatment; not a cold-cache claim"))
         assets = {}
-        for side in config["sides"].values():
+        for side_name, side in config["sides"].items():
             for model, data in side["models"].items():
                 data["benchmarks"] = {}
-                data["template"] = dict(host_path="/old/source/template", runtime_path="/source/template", sha256="e" * 64)
+                data["template"] = dict(host_path="/old/source/chat.jinja", runtime_path="/source/" + side_name + "/chat.jinja", sha256=prepare.digest(root / "chat.jinja"))
                 data["settings"] = dict(host_path="/opt/inferssd-ci-integrations/" + old_job + "-" + model + "-candidate-settings.ssd",
                                         runtime_path="/models/settings-" + model + "-candidate.ssd", sha256="0" * 64)
         for model in ("deepseek", "muse"):
@@ -182,6 +184,19 @@ def prepared_fixture(tmp_path, source, *, devices=None):
             (tmp_path / name).write_text("[ssd]\n")
             config["sides"]["candidate"]["models"][model]["settings"]["sha256"] = prepare.digest(tmp_path / name)
             assets["settings-" + model + ".ssd"] = name
+        if mode == prepare.MODE:
+            assets = {}
+            for side_name, side in config["sides"].items():
+                for model, data in side["models"].items():
+                    name = device + "-" + model + "-" + side_name + ".ssd"
+                    (tmp_path / name).write_text('inferssd-settings 1\nexpert.source = ["/build/' + side_name + '/assets/' + model + '-alias.tsv"]\nvram.budget = 0\n')
+                    data["settings"].update(host_path="/opt/inferssd-ci-integrations/" + old_job + "-" + model + "-" + side_name + "-settings.ssd",
+                        runtime_path="/models/settings-" + model + "-" + side_name + ".ssd", sha256=prepare.digest(tmp_path / name))
+                    assets["settings-" + model + "-" + side_name + ".ssd"] = name
+                    data["smoke"].update(revision=identity[side_name], argv=["/build/" + side_name + "/bin/llama-server", "--ssd-settings", data["settings"]["runtime_path"]],
+                        environment={}, cwd="/scratch", port=18080, timeout_s=120, request_timeout_s=60,
+                        os_page_cache_treatment=config["host"]["os_page_cache_treatment"])
+                    data["benchmarks"] = {"512": dict(copy.deepcopy(data["smoke"]), preflight_argv=copy.deepcopy(data["smoke"]["argv"]))}
         mounts = {m: "/admitted/" + m for m in ("deepseek", "muse")}
         mounts.update({"settings-" + m + "-candidate.ssd": config["sides"]["candidate"]["models"][m]["settings"]["host_path"]
                        for m in ("deepseek", "muse")})
@@ -194,7 +209,7 @@ def prepared_fixture(tmp_path, source, *, devices=None):
                      root_argv=["/usr/bin/python3", "-I", "/opt/inferssd-ci-control/current/bench/ci/operator_stage.py"]))
     (tmp_path / "inputs.json").write_text(json.dumps(dict(schema_version=1, controller_workflow_sha="d" * 40, devices=profiles)))
     args = SimpleNamespace(source=root, inputs=tmp_path / "inputs.json", output=tmp_path / "prepared",
-        policy=Path(__file__).parents[1] / "ci/policy.json", gh="never-used", execution_devices=list(devices or prepare.DEVICES), **identity)
+        policy=Path(__file__).parents[1] / "ci/policy.json", gh="never-used", execution_devices=list(devices or prepare.DEVICES), validation_mode=mode, **identity)
     return args, API(root)
 
 
@@ -409,3 +424,135 @@ def test_ambiguous_dispatch_remains_claimed_and_is_never_reposted(tmp_path, sour
     with pytest.raises(FileExistsError):
         prepare.dispatch(args, api)
     assert api.posts == 1 and (args.output / "dispatch-attempt.json").is_file()
+
+
+def test_default_mode_is_performance_and_two_sources_are_exact(tmp_path, source):
+    args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
+    del args.validation_mode  # The public default, including the watcher API.
+    envelope = prepare.prepare(args, api)
+    assert envelope["validation_mode"] == prepare.MODE
+    for device in prepare.DEVICES:
+        config = load(args.output / device / "config.json")
+        manifest = load(args.output / device / "manifest.json")
+        request = load(args.output / device / "root-input.json")
+        assert manifest["source_revisions"] == {side: getattr(args, side) for side in ("base", "candidate")}
+        assert set(manifest["sources"]) == set(manifest["builds"]) == {"base", "candidate"}
+        for side in ("base", "candidate"):
+            assert request["sources"][side]["revision"] == getattr(args, side)
+            assert manifest["sources"][side].endswith("/" + side)
+            assert side + "-muse-benchmark-512" in manifest["stages"]
+            assert all(set(data["benchmarks"]) == {"512"} for data in config["sides"][side]["models"].values())
+        assert config["performance_protocol"] == prepare.performance_protocol()
+        assert {"base-source-map.json", "base-source.tar.gz", "source-map.json", "candidate-source.tar.gz"} <= set(request["files"])
+    assert load(args.output / "base-source-map.json")["revision"] == args.base
+    assert load(args.output / "source-map.json")["revision"] == args.candidate
+    prepare.verified(args.output)
+
+
+@pytest.mark.parametrize("mutation", ["missing-base", "different-budget", "model-identity", "payload-hash"])
+def test_performance_preparation_refuses_unpaired_inputs(tmp_path, source, mutation):
+    args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
+    inputs = load(args.inputs)
+    row = inputs["devices"]["cloud-5090"]
+    template_path = tmp_path / row["template"]
+    config = load(template_path)
+    if mutation == "missing-base": del row["rootstage_files"]["settings-muse-base.ssd"]
+    elif mutation == "different-budget":
+        name = row["rootstage_files"]["settings-muse-base.ssd"]
+        path = tmp_path / name
+        path.write_text(path.read_text().replace("vram.budget = 0", "vram.budget = 1"))
+        config["sides"]["base"]["models"]["muse"]["settings"]["sha256"] = prepare.digest(path)
+    elif mutation == "model-identity": config["sides"]["base"]["models"]["muse"]["model_identity"] = {"shards": []}
+    else: config["sides"]["base"]["models"]["muse"]["settings"]["sha256"] = "0" * 64
+    template_path.write_text(json.dumps(config))
+    args.inputs.write_text(json.dumps(inputs))
+    with pytest.raises(ValueError): prepare.prepare(args, api)
+    assert not args.output.exists()
+
+
+def test_performance_receipt_cannot_omit_or_mix_a_source(tmp_path, source):
+    args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"], mode=prepare.MODE)
+    envelope = prepare.prepare(args, api)
+    inputs = load(args.output / "rootstage-inputs.json")
+    device = "cloud-5090"
+    receipt = successful_receipt(envelope, inputs, device)
+    request = load(args.output / device / "root-input.json")
+    with pytest.raises(ValueError, match="source sides"):
+        prepare.validate_root_receipt(envelope, inputs, device, receipt)
+    receipt["sources"] = {side: dict(value, root_owned_readonly=True) for side, value in request["sources"].items()}
+    prepare.validate_root_receipt(envelope, inputs, device, receipt)
+    receipt["sources"]["base"]["revision"] = args.candidate
+    with pytest.raises(ValueError, match="source sides"):
+        prepare.validate_root_receipt(envelope, inputs, device, receipt)
+
+
+def changed_identity(args, path):
+    command(args.source, "checkout", "-q", args.base)
+    file = args.source / path
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text("changed\n")
+    command(args.source, "add", ".")
+    command(args.source, "commit", "-qm", "targeted change")
+    args.head = args.candidate = command(args.source, "rev-parse", "HEAD")
+
+
+def test_control_only_new_mode_does_not_stage_base_or_timed_arms(tmp_path, source):
+    args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"], mode=prepare.MODE)
+    changed_identity(args, "bench/ci/example.py")
+    prepare.prepare(args, api)
+    manifest = load(args.output / "cloud-5090/manifest.json")
+    request = load(args.output / "cloud-5090/root-input.json")
+    assert set(manifest["sources"]) == set(request["sources"]) == {"candidate"}
+    assert not any("benchmark" in name or "preflight" in name for name in manifest["stages"])
+    assert not (args.output / "base-source.tar.gz").exists()
+
+
+def test_subset_job_still_binds_full_fixed_root_policy(tmp_path, source):
+    args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
+    changed_identity(args, "engine/ggml/src/ggml-cuda/ssd/mxfp4-compute-adapter.cpp")
+    prepare.prepare(args, api)
+    for device in prepare.DEVICES:
+        config = load(args.output / device / "config.json")
+        policy = load(args.output / device / "policy.review.json")
+        assert set(config["sides"]["candidate"]["models"]) == {"deepseek"}
+        assert set(policy["models"]) == {"deepseek", "muse"}
+        assert set(policy["side_settings_sha256"]["base"]) == {"deepseek", "muse"}
+        assert not any("muse" in name for name in load(args.output / device / "root-input.json")["files"])
+
+
+def test_no_enabled_affected_linux_device_refuses_before_output(tmp_path, source):
+    args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
+    changed_identity(args, "engine/ggml/src/ggml-metal/example.m")
+    with pytest.raises(ValueError, match="no enabled Linux device"):
+        prepare.prepare(args, api)
+    assert not args.output.exists()
+
+
+@pytest.mark.parametrize("damage", [None, "collision", "missing-argv", "other-flags"])
+def test_performance_preflight_and_timed_private_writer_paths(tmp_path, source, damage):
+    args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"], mode=prepare.MODE)
+    path = tmp_path / "cloud-5090-template.json"
+    config = load(path)
+    for side, spec in config["sides"].items():
+        for model, data in spec["models"].items():
+            before = "/scratch/" + side + "/" + model + "-preflight.jsonl"
+            after = "/scratch/" + side + "/" + model + "-benchmark-512.jsonl"
+            data["smoke"]["argv"] += ["--ssd-telemetry", before]
+            timed = data["benchmarks"]["512"]
+            timed["preflight_argv"] = copy.deepcopy(data["smoke"]["argv"])
+            timed["argv"] = [*data["smoke"]["argv"][:-1], after]
+            if damage == "collision": timed["argv"][-1] = before
+            elif damage == "missing-argv": del timed["preflight_argv"]
+            elif damage == "other-flags": timed["preflight_argv"] += ["--different-budget"]
+    path.write_text(json.dumps(config))
+    if damage:
+        with pytest.raises(ValueError): prepare.prepare(args, api)
+        assert not args.output.exists()
+    else:
+        prepare.prepare(args, api)
+        actual = load(args.output / "cloud-5090/config.json")
+        for side, spec in actual["sides"].items():
+            for model, data in spec["models"].items():
+                timed = data["benchmarks"]["512"]
+                assert timed["preflight_argv"] == data["smoke"]["argv"]
+                assert timed["argv"][-1] != timed["preflight_argv"][-1]

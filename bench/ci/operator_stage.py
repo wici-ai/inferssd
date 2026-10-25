@@ -182,6 +182,19 @@ def model_identities(config):
     return len(seen)
 
 
+PERFORMANCE_MODE = "functional-numerical-performance"
+PERFORMANCE_PROTOCOL = dict(tier="512", prompt_sha256="17ac26b4a3bc13d6c51dd10b62eb54931651d48e41ca4071c587a931a662e283",
+                            output_tokens=256, samples_per_side=1)
+
+
+def source_sides(config):
+    mode = config.get("validation_mode", "functional-numerical")
+    if mode not in ("functional-numerical", PERFORMANCE_MODE):
+        fail("unsupported root operator validation mode")
+    return (("base", "candidate") if mode == PERFORMANCE_MODE and any(
+        data.get("benchmarks") for data in config["sides"]["candidate"]["models"].values()) else ("candidate",))
+
+
 def policy_check(policy, request, config, manifest, broker):
     """Local root policy wins over all caller-supplied paths and declarations."""
     job = request["job_id"]
@@ -194,27 +207,49 @@ def policy_check(policy, request, config, manifest, broker):
             or fingerprint(config["host"]["resources"]) != policy["resources_sha256"]
             or request["min_free_bytes"] != policy["min_free_bytes"]):
         fail("request differs from local root device/resource/control policy")
+    sides = source_sides(config)
+    if config.get("validation_mode") == PERFORMANCE_MODE:
+        if (config.get("performance_protocol") != PERFORMANCE_PROTOCOL
+                or policy.get("performance_protocol") != PERFORMANCE_PROTOCOL
+                or type(config["performance_protocol"].get("output_tokens")) is not int
+                or type(config["performance_protocol"].get("samples_per_side")) is not int
+                or set(policy.get("side_settings_sha256", {})) != {"base", "candidate"}):
+            fail("fixed performance protocol/side settings are outside root policy")
     models = config["sides"]["candidate"]["models"]
     if not models or not set(models) <= set(policy["models"]):
         fail("model set is outside local root admission policy")
     mounts = {}
-    for model, data in models.items():
-        admitted = policy["models"][model]
-        if (fingerprint(data["model_identity"]) != admitted["identity_sha256"]
-                or data["settings"]["sha256"] != admitted["settings_sha256"]
-                or data["settings"]["host_path"] != str(IROOT / (job + "-" + model + "-candidate-settings.ssd"))
-                or data["settings"]["runtime_path"] != "/models/settings-" + model + "-candidate.ssd"):
-            fail("model/settings declaration differs from local root admission")
-        mounts[model] = admitted["mount"]
-        mounts["settings-" + model + "-candidate.ssd"] = data["settings"]["host_path"]
-    if (manifest["models"] != mounts or manifest["builds"] != {"candidate": "candidate"}
-            or manifest["sources"] != {"candidate": str(SROOT / ("operator-" + job))}):
+    for side in sides:
+        side_models = config["sides"][side]["models"]
+        if set(side_models) != set(models):
+            fail("base/candidate model sets differ")
+        for model, data in side_models.items():
+            admitted = policy["models"][model]
+            expected_settings = (policy["side_settings_sha256"][side][model]
+                if config.get("validation_mode") == PERFORMANCE_MODE else admitted["settings_sha256"])
+            if (fingerprint(data["model_identity"]) != admitted["identity_sha256"]
+                    or data["settings"]["sha256"] != expected_settings
+                    or (side == "candidate" and expected_settings != admitted["settings_sha256"])
+                    or data["settings"]["host_path"] != str(IROOT / (job + "-" + model + "-" + side + "-settings.ssd"))
+                    or data["settings"]["runtime_path"] != "/models/settings-" + model + "-" + side + ".ssd"):
+                fail("model/settings declaration differs from local root admission")
+            mounts[model] = admitted["mount"]
+            mounts["settings-" + model + "-" + side + ".ssd"] = data["settings"]["host_path"]
+    source_root = SROOT / ("operator-" + job)
+    sources = {side: str(source_root / side) if config.get("validation_mode") == PERFORMANCE_MODE else str(source_root) for side in sides}
+    if (manifest["models"] != mounts or manifest["builds"] != {side: side for side in sides}
+            or manifest["sources"] != sources):
         fail("manifest host mapping is outside local root policy")
     expected_admission = policy.get("model_admission", {})
     actual_admission = {key: config[key] for key in ("model_admission_path", "model_admission_sha256",
         "model_mount_proof_path", "model_mount_proof_sha256", "prior_model_job_id") if key in config}
     if actual_admission != expected_admission:
         fail("model admission metadata path/hash differs from root policy")
+
+
+def paired_settings(base, candidate):
+    return base.replace(b"/build/base/", b"/build/candidate/").replace(
+        b"/source/base/", b"/source/candidate/") == candidate
 
 
 def gpu_idle(broker, policy):
@@ -304,25 +339,60 @@ def receive(expected_sha256, incoming=None):
                 seen.add(name)
             if seen != set(files):
                 fail("installation input missing")
-            config, manifest, source_map = (parsed((staging / name).read_bytes()) for name in ("config.json", "manifest.json", "source-map.json"))
+            config, manifest = (parsed((staging / name).read_bytes()) for name in ("config.json", "manifest.json"))
+            sides = source_sides(config)
+            sources = {side: str(source / side) if config.get("validation_mode") == PERFORMANCE_MODE else str(source) for side in sides}
+            maps = {side: parsed((staging / ("source-map.json" if side == "candidate" else "base-source-map.json")).read_bytes()) for side in sides}
+            expected_sources = {side: {"revision": config["sides"][side]["revision"], "tree": maps[side]["tree"]} for side in sides}
             if (config["manifest_path"] != str(jobdir / "manifest.json")
                     or config["manifest_sha256"] != sha(staging / "manifest.json")
-                    or manifest["job_id"] != job or manifest["sources"] != {"candidate": str(source)}
-                    or manifest["source_revisions"] != {"candidate": request["candidate"]}
+                    or manifest["job_id"] != job or manifest["sources"] != sources
+                    or manifest["source_revisions"] != {side: config["sides"][side]["revision"] for side in sides}
                     or config["revision"] != request["candidate"] or config["device"] != request["device"]
-                    or source_map["revision"] != request["candidate"] or source_map["tree"] != request["source_tree"]):
+                    or maps["candidate"]["revision"] != request["candidate"] or maps["candidate"]["tree"] != request["source_tree"]
+                    or any(maps[side]["revision"] != config["sides"][side]["revision"] for side in sides)
+                    or (config.get("validation_mode") == PERFORMANCE_MODE and request.get("sources") != expected_sources)):
                 fail("source/config/manifest binding differs")
             policy_check(policy, request, config, manifest, broker)
             control_identity(config)
+            if config.get("validation_mode") == PERFORMANCE_MODE and sha(protected(CONTROL / "bench/prompts/prompt-512.txt")) != PERFORMANCE_PROTOCOL["prompt_sha256"]:
+                fail("installed trusted fixed512 prompt differs")
             count = model_identities(config)
-            extracted = extract_source(staging / "candidate-source.tar.gz", source_map, source)
-            for model, data in config["sides"]["candidate"]["models"].items():
-                settings = data["settings"]
-                name = "settings-" + model + ".ssd"
-                path = IROOT / (job + "-" + model + "-candidate-settings.ssd")
-                if settings["host_path"] != str(path) or sha(staging / name) != settings["sha256"]:
-                    fail("settings payload/path differs")
-                write(path, (staging / name).read_bytes())
+            if config.get("validation_mode") == PERFORMANCE_MODE:
+                source.mkdir(mode=0o755, exist_ok=False)
+            extracted_sides = {}
+            for side in sides:
+                target = Path(sources[side])
+                extracted_sides[side] = dict(extract_source(staging / (side + "-source.tar.gz"), maps[side], target),
+                    revision=maps[side]["revision"], tree=maps[side]["tree"])
+                if sum(row["bytes"] for row in extracted_sides.values()) > LIMIT:
+                    fail("combined source bytes exceed staging bound")
+                if config.get("validation_mode") == PERFORMANCE_MODE:
+                    for model, data in config["sides"][side]["models"].items():
+                        template = data["template"]
+                        prefix = "/source/" + side + "/"
+                        if not template["runtime_path"].startswith(prefix):
+                            fail("chat template source side differs")
+                        expected = target / relative(template["runtime_path"][len(prefix):])
+                        if template["host_path"] != str(expected) or sha(protected(expected)) != template["sha256"]:
+                            fail("chat template differs from exact sealed source")
+            if config.get("validation_mode") == PERFORMANCE_MODE:
+                os.chmod(source, 0o555)
+            extracted = extracted_sides["candidate"]
+            for model in config["sides"]["candidate"]["models"]:
+                payloads = {}
+                for side in sides:
+                    data = config["sides"][side]["models"][model]
+                    settings = data["settings"]
+                    name = "settings-" + model + ("-" + side if config.get("validation_mode") == PERFORMANCE_MODE else "") + ".ssd"
+                    path = IROOT / (job + "-" + model + "-" + side + "-settings.ssd")
+                    if settings["host_path"] != str(path) or sha(staging / name) != settings["sha256"]:
+                        fail("settings payload/path differs")
+                    payloads[side] = (staging / name).read_bytes()
+                if len(sides) == 2 and not paired_settings(payloads["base"], payloads["candidate"]):
+                    fail("base/candidate effective settings differ")
+                for side, payload in payloads.items():
+                    write(IROOT / (job + "-" + model + "-" + side + "-settings.ssd"), payload)
             jobdir.mkdir(mode=0o711)
             write(jobdir / "manifest.json", (staging / "manifest.json").read_bytes())
             write(target_config, (staging / "config.json").read_bytes())
@@ -340,6 +410,9 @@ def receive(expected_sha256, incoming=None):
                 policy_sha256=request["policy_sha256"],
                 gpu=gpu,
                 broker_config_unchanged=True, existing_coordination_unmodified=True, finished_ns=time.time_ns())
+            if config.get("validation_mode") == PERFORMANCE_MODE:
+                proof["sources"] = extracted_sides
+                proof["performance_protocol"] = config["performance_protocol"]
             write(staging / "ROOT-STAGE-RECEIPT.json", (json.dumps(proof, indent=2) + "\n").encode())
             return proof
         finally:

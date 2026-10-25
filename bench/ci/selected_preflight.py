@@ -6,13 +6,52 @@ import time
 import final_chat
 from ci.compare import comparable
 from ci.contract import digest, load, save
-from ci.selection_contract import linux_stages
+from ci.selection_contract import linux_stages, PERFORMANCE_MODE
 from ci.staged_benchmark import verify_stopped
 from ci.staged_smoke import smoke
 from ci.selected_receipt import receipt
 
 
 LAUNCH = ("argv", "environment", "cwd", "port", "timeout_s", "request_timeout_s")
+
+
+def launch(spec, side, *, required=False):
+    """Use an explicit short argv; only its private event file may differ.
+
+    Native telemetry uses O_EXCL, so the preflight and timed server cannot own
+    the same output file. This is a launch identity, not a setting relaxation.
+    Historical configurations without this field retain their old contract.
+    """
+    if side not in ("base", "candidate"):
+        raise ValueError("explicit preflight source side required")
+    if "preflight_argv" not in spec:
+        if required:
+            raise ValueError("operator performance requires explicit preflight_argv")
+        return dict(spec)
+    timed, short = spec["argv"], spec["preflight_argv"]
+    if any(not isinstance(argv, list) or not argv or any(
+            not isinstance(arg, str) or not arg or "\0" in arg for arg in argv) for argv in (timed, short)):
+        raise ValueError("complete explicit timed and preflight argv required")
+    flag = "--ssd-telemetry"
+    if flag not in timed and flag not in short:
+        if timed != short:
+            raise ValueError("preflight may differ only in its private telemetry file")
+    else:
+        if timed.count(flag) != 1 or short.count(flag) != 1:
+            raise ValueError("preflight requires one private telemetry file per server")
+        index = timed.index(flag)
+        if index != short.index(flag) or index + 1 >= len(timed) or index + 1 >= len(short):
+            raise ValueError("preflight telemetry argument position differs")
+        for path in (timed[index + 1], short[index + 1]):
+            if (not path.startswith("/scratch/" + side + "/") or not path.endswith(".jsonl")
+                    or str(PurePosixPath(path)) != path
+                    or any(part in (".", "..") for part in path.split("/"))):
+                raise ValueError("preflight telemetry must use its canonical side scratch path")
+        if timed[index + 1] == short[index + 1]:
+            raise ValueError("preflight and timed telemetry files must be distinct")
+        if timed[:index + 1] + timed[index + 2:] != short[:index + 1] + short[index + 2:]:
+            raise ValueError("preflight may differ only in its private telemetry file")
+    return dict(spec, argv=list(short))
 
 
 def same_launch(functional, performance):
@@ -28,6 +67,9 @@ def declarations(config, manifest, needs):
         raise ValueError("preflight requires the actual root Mac resource policy")
     for model in needs["models"]:
         for tier in needs["performance"].get(model, {}).get("tiers", []):
+            # Check the already shipped Azure asset before opening the lease,
+            # not after the first model's long completion has begun.
+            final_chat.prompt_path(tier)
             pair = dict(model=model, tier=tier, sides={})
             for side in ("base", "candidate"):
                 data = config["sides"][side]
@@ -50,7 +92,11 @@ def declarations(config, manifest, needs):
                 stage = side + "-" + model + "-preflight-" + tier
                 if expected is not None and manifest["stages"].get(stage) != expected[stage]:
                     raise ValueError("root manifest does not authorize the exact preflight stage")
-                pair["sides"][side] = dict(spec, model=model, tier=tier, revision=data["revision"])
+                timed_stage = side + "-" + model + "-benchmark-" + tier
+                if expected is not None and manifest["stages"].get(timed_stage) != expected[timed_stage]:
+                    raise ValueError("root manifest does not authorize the exact timed stage")
+                short = launch(spec, side, required=config.get("validation_mode") == PERFORMANCE_MODE)
+                pair["sides"][side] = dict(short, model=model, tier=tier, revision=data["revision"])
             # These fields are required by the already existing functional run.
             # Reading them now prevents a missing reuse declaration being hidden
             # by a fallback after the lease or a timed request has started.
@@ -131,7 +177,9 @@ def retained(root, config, needs):
             if type(reused) is not bool or reused and side != "candidate":
                 raise ValueError("only an identical candidate functional run can be reused")
             model_data = config["sides"][side]["models"][model]
-            if reused and not same_launch(model_data["smoke"], model_data["benchmarks"][tier]):
+            short = launch(model_data["benchmarks"][tier], side,
+                           required=config.get("validation_mode") == PERFORMANCE_MODE)
+            if reused and not same_launch(model_data["smoke"], short):
                 raise ValueError("reused functional launch differs from the performance arm")
             raw = root / ("native-" + model) if reused else folder
             if data["raw"] != str(raw.relative_to(root)):

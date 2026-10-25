@@ -1,7 +1,7 @@
-# Review-authorized two-Linux operator entry
+# Review-authorized device test entry
 
 The source PR maintainer submits a comment-type review whose complete body is
-`/ci linux`. GitHub's review `commit_id` binds the exact current head. A current
+`/ci test`. GitHub's review `commit_id` binds the exact current head. A current
 writable maintainer may authorize their own PR; no special source branch,
 second-person approval, App or PAT is needed in this operator/report-only mode.
 An external fork author need not have source write access: a source maintainer's
@@ -11,6 +11,17 @@ write permission or equal `prepared_by`. Author-provided commands do not count
 unless that author independently has current source-maintainer permission.
 Ordinary issue comments, labels, quoted code/examples and prose are not commands.
 The test authorization does not approve a merge or publish a source PR check.
+
+The impact plan selects models and checks. This deployment executes cloud-5090
+and DGX Spark; Mac cells remain explicitly deferred. Required performance uses
+the unchanged Azure 512-tier prompt and decode 256, once per base and candidate
+on the same device/model/settings. It does not add 4K or formal benchmark samples.
+Functional-only success cannot satisfy a required performance comparison.
+
+The removed Linux-specific command is not an alias. Existing review/run records
+are retained without replay; upgrading the operator never extends an old review
+to a new performance run. Submit a fresh `/ci test` Comment review to authorize
+the current head. `/ci cancel` remains the cancellation command.
 
 The poller runs on the trusted preparation host with its existing gh login and
 reviewed source Git repository and two-device profiles. It does not run on or
@@ -64,6 +75,20 @@ retried on the next poll against the same freshly verified exact parent until
 acknowledgement or completion. Cancellation is idempotent; this never repeats a
 dispatch or measurement. A successful acknowledgement is not posted again.
 The record retains the Actions result and points to its summary/artifacts.
+
+Open the exact parent run in the private `inferssd-device-ci` repository, then
+read its Actions Summary. For each required Linux model it shows base and PR
+0–128/128–256 decode token/s and `(PR / base - 1) * 100%`, plus TTFT, prefill
+and whole decode. A positive throughput change means faster; a lower TTFT is
+better. Missing, failed and inconclusive performance stays non-passing. Mac
+deferral and full impact coverage are reported separately from Linux acceptance.
+The `selected-aggregate-RUN-ATTEMPT` artifact contains `aggregate.json`;
+`selected-control-RUN-ATTEMPT` retains the raw two-sided requests, timestamps,
+settings/source/prompt identities, observations and cleanup evidence.
+
+These request metrics exclude model/vocabulary loading before server readiness.
+The configured DeepSeek/Muse Linux profiles do not establish Mac cache or
+unconfigured model (for example Nemotron) correctness or performance coverage.
 
 Preparation/staging interruption and ambiguous dispatch are retained without
 automatic replay. A saved, already validated `dispatched-run.json` allows a

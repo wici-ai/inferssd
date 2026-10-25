@@ -1,6 +1,7 @@
 """Operator/report-only contracts. Synthetic API/raw only; no physical claims."""
 
 import copy
+import io
 import json
 from pathlib import Path
 import sys
@@ -11,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci import impact, selected_controller as controller, selected_aggregate as aggregation
 from ci import selection_contract as contract
+from ci import compare
 from ci.contract import digest, load, save
 from ci.stage_session import BrokerError
 from test_private_controller import event_context
@@ -400,6 +402,223 @@ def test_operator_execute_refuses_modified_admission_before_any_child(operator):
     a.args.plan.write_text(json.dumps(admitted))
     with pytest.raises(ValueError, match="envelope changed"): controller.execute(a.args, a.env)
     assert not a.args.artifacts.exists()
+
+
+def test_performance_envelope_is_admitted_without_changing_canonical_impact(operator):
+    a = operator
+    a.envelope["validation_mode"] = contract.PERFORMANCE_MODE
+    original = copy.deepcopy(a.envelope["selection"])
+    a.write_event()
+    assert controller.operator_preflight(a.args, a.env) == 0
+    admitted = load(a.args.plan)
+    assert admitted["validation_mode"] == contract.PERFORMANCE_MODE
+    assert admitted["selection"] == original
+
+
+def test_failed_terminal_child_retains_exact_raw_once_but_does_not_green_execution(operator, monkeypatch):
+    a = operator
+    controller.operator_preflight(a.args, a.env)
+    a.child["conclusion"] = "failure"
+    calls = []
+    monkeypatch.setattr(controller.selection_dispatch, "start", lambda api, job, sha, parent:
+        dict(id=73, workflow_id=91, controller_sha=sha, job_id=job["job_id"], inputs=dict(selection_parent=parent)))
+    monkeypatch.setattr(controller.selection_dispatch, "wait", lambda *a, **k:
+        (_ for _ in ()).throw(ValueError("selected child did not succeed")))
+    monkeypatch.setattr(controller.selection_dispatch, "collect", lambda api, run, job, output, **k:
+        calls.append((run["id"], run["conclusion"], job["job_id"])))
+    monkeypatch.setattr(controller, "cancel_children", lambda *a: 0)
+    assert controller.execute(a.args, a.env) == 1
+    assert calls == [(73, "failure", "f" * 32)]
+    state = load(a.args.artifacts / "dispatch-state.json")
+    assert state["errors"] and state["children"]["cloud-5090"]["conclusion"] == "failure"
+
+
+@pytest.mark.parametrize("retained", [True, False])
+def test_inconclusive_child_metrics_survive_report_without_success(operator, monkeypatch, retained):
+    a = operator
+    ready(a)
+    a.child["conclusion"] = "failure"
+    state = load(a.args.artifacts / "dispatch-state.json")
+    state["errors"] = {"cloud-5090": "child exited nonzero"}
+    if retained:
+        state["retained_failed_children"] = {"cloud-5090": 73}
+    a.args.artifacts.joinpath("dispatch-state.json").write_text(json.dumps(state))
+    monkeypatch.setattr(controller, "operator_aggregate", lambda *args:
+        dict(passed=False, status="inconclusive", linux_scoped_status="inconclusive",
+             full_impact_coverage_complete=False, cells=[dict(device="cloud-5090", model="muse",
+                 status="inconclusive", functional="passed", numerical="passed", performance=[])], errors=[]))
+    assert controller.operator_report(a.args, a.env) == 1
+    result = load(a.args.output)
+    assert result["status"] == ("inconclusive" if retained else "failed") and result["passed"] is False
+    assert result["child_workflow_errors"] == state["errors"]
+    assert "inconclusive" in Path(a.env["GITHUB_STEP_SUMMARY"]).read_text()
+
+
+@pytest.mark.parametrize("fault", ["missing", "inconclusive", "unclean"])
+def test_performance_scope_never_hides_missing_or_inconclusive_cell(operator, monkeypatch, fault):
+    a = operator
+    plan = impact.plan(["engine/ggml/src/ggml-cpu/ssd/cpu-sink.cpp"], POLICY,
+                       base=a.plan["base"], head=a.plan["head"], candidate=a.plan["candidate"])
+    scope = dict(validation_mode=contract.PERFORMANCE_MODE, execution_devices=["cloud-5090"])
+    original = copy.deepcopy(plan)
+    models = {cell["model"] for cell in plan["cells"] if cell["device"] == "cloud-5090" and cell["required"]}
+    def measured(*args):
+        if fault == "unclean":
+            raise ValueError("timed scope still active")
+        rows = [dict(device="cloud-5090", model=model, status="inconclusive" if fault == "inconclusive" else "passed",
+                     functional="passed", numerical="passed", performance=[dict(tier="512", status="inconclusive")],
+                     performance_deferred_tiers=["4096"]) for model in models]
+        return rows[:-1] if fault == "missing" else rows
+    monkeypatch.setattr(aggregation, "device_report", measured)
+    result = aggregation.operator_aggregate(plan, POLICY, Path("/unused"), a.envelope["jobs"], {"cloud-5090": a.child}, scope)
+    assert result["passed"] is False
+    assert result["status"] == ("inconclusive" if fault == "inconclusive" else "failed")
+    assert result["linux_scoped_status"] == result["status"] and not result["full_impact_coverage_complete"]
+    assert plan == original
+    assert all(row["status"] == "deferred-offline" for row in result["cells"] if row["device"] == "local-mbp")
+
+
+def test_successful_linux512_is_separate_from_required_4k_and_mac(operator, monkeypatch):
+    a = operator
+    plan = impact.plan(["engine/ggml/src/ggml-cpu/ssd/cpu-sink.cpp"], POLICY,
+                       base=a.plan["base"], head=a.plan["head"], candidate=a.plan["candidate"])
+    scope = dict(validation_mode=contract.PERFORMANCE_MODE, execution_devices=["cloud-5090"])
+    monkeypatch.setattr(aggregation, "device_report", lambda *args: [dict(device="cloud-5090", model=cell["model"],
+        status="passed", functional="passed", numerical="passed", performance=[dict(tier="512", status="passed")],
+        performance_deferred_tiers=["4096"]) for cell in plan["cells"] if cell["device"] == "cloud-5090" and cell["required"]])
+    result = aggregation.operator_aggregate(plan, POLICY, Path("/unused"), a.envelope["jobs"], {"cloud-5090": a.child}, scope)
+    assert result["passed"] and result["linux_scoped_status"] == "passed"
+    assert result["full_impact_coverage_complete"] is False
+
+
+def test_summary_shows_both_decode_windows_signed_percent_and_ttft_direction():
+    metrics = {name: dict(base=10, candidate=11, change_percent=10) for name in compare.METRICS}
+    metrics["ttft_s"] = dict(base=2, candidate=1.8, change_percent=-10)
+    pair = dict(tier="512", status="inconclusive", metrics=metrics,
+                measurement_identity=dict(prompt_sha256="a" * 64, prompt_ids_sha256="b" * 64,
+                                          conditions_sha256="c" * 64))
+    report = dict(passed=False, status="inconclusive", full_impact_coverage_complete=False,
+        base="d" * 40, head="e" * 40, candidate="f" * 40, cells=[dict(device="cloud-5090", model="muse",
+            status="inconclusive", functional="passed", numerical="passed", performance=[pair],
+            performance_deferred_tiers=["4096"])])
+    stream = io.StringIO()
+    controller.operator_summary(stream, report)
+    text = stream.getvalue()
+    assert "0–128 base tok/s" in text and "128–256 base tok/s" in text
+    assert "+10.000%" in text and "-10.000%" in text and "lower TTFT is better" in text
+    assert "Request TTFT seconds" in text and "Native prefill tok/s" in text and "Whole decode tok/s" in text
+    assert "Declared Linux scope: **inconclusive**" in text and "deferred tiers: 4096" in text
+    assert "template IDs SHA" in text and "conditions/settings SHA" in text and "0/16" in text
+
+
+@pytest.fixture
+def performance_raw(functional_raw):
+    """Real validators over synthetic SSE/probe bytes; no device or model runs."""
+    from test_final import write_artifacts
+    root, original, config, _ = functional_raw
+    plan = dict(base="a" * 40, candidate="c" * 40)
+    preflight = {}
+    for side, pid in (("base", 321), ("candidate", 123)):
+        config["sides"][side] = copy.deepcopy(config["sides"]["candidate"])
+        config["sides"][side]["revision"] = plan[side]
+        model = config["sides"][side]["models"]["deepseek"]
+        launch = copy.deepcopy(model["smoke"])
+        launch["argv"][0] = f"/build/{side}/bin/llama-server"
+        launch["preflight_argv"] = [*launch["argv"], "--ssd-telemetry", f"/scratch/{side}/preflight.jsonl"]
+        launch["argv"] += ["--ssd-telemetry", f"/scratch/{side}/benchmark512.jsonl"]
+        launch["request_timeout_s"] = 300
+        model["benchmarks"] = {"512": launch}
+        build = root / ("build-" + side)
+        build.mkdir(exist_ok=True)
+        (build / "build-receipt.json").write_text(json.dumps(dict(binary=dict(
+            runtime_path=launch["argv"][0], sha256="a" * 64))))
+        parent = root / "deepseek/512"
+        parent.mkdir(parents=True, exist_ok=True)
+        folder = parent / side
+        write_artifacts(folder, "512", dict(device="cloud-5090", model="deepseek", revision=plan[side], request_timeout_s=300))
+        for name in ("started.json", "runtime-before.json", "runtime-after.json", "stopped.json"):
+            data = json.loads((original / name).read_text().replace("/build/candidate", "/build/" + side))
+            if "worker_pid" in data:
+                data.update(worker_pid=pid, birth_identity="birth-" + side, scope_identity="scope-" + side)
+            if "cmdline" in data:
+                data["cmdline"] = launch["argv"]
+            (folder / name).write_text(json.dumps(data))
+        (folder / "stderr.log").write_bytes((original / "stderr.log").read_bytes())
+        receipt = json.loads((original / "runtime-receipt.json").read_text().replace("/build/candidate", "/build/" + side))
+        receipt["build"]["revision"] = plan[side]
+        receipt["server"] = dict(pid=pid, start_identity="birth-" + side)
+        receipt["host"].update(memory_budget_bytes=100, os_page_cache_treatment="uncontrolled")
+        save(folder / "comparison-receipt.json", receipt)
+        preflight["deepseek", "512", side] = copy.deepcopy(receipt)
+        save(folder / "benchmark.json", dict(status="passed", cleanup_confirmed=True, completion_requests=1,
+             revision=plan[side], tier="512", model="deepseek", result=load(folder / "result.json")))
+    def comparison():
+        results = {side: aggregation.run_final.read_result(root / "deepseek/512" / side / "result.json", "512", 300)
+                   for side in ("base", "candidate")}
+        receipts = {side: load(root / "deepseek/512" / side / "comparison-receipt.json") for side in results}
+        pair = compare.compare_pair(results["base"], results["candidate"], receipts["base"], receipts["candidate"], POLICY)
+        (root / "deepseek/512/comparison.json").write_text(json.dumps(pair))
+        return pair
+    comparison()
+    return root, config, plan, preflight, comparison
+
+
+def test_performance_retained_replays_sse_and_both_side_native_probes(performance_raw):
+    root, config, plan, preflight, _ = performance_raw
+    pair = aggregation.performance_retained(root, config, "deepseek", "512", plan, POLICY, preflight)
+    assert pair["passed"] and pair["status"] == "passed"
+    assert pair["measurement_identity"]["output_tokens"] == 256
+    assert pair["sources"] == plan
+    assert pair["evidence"]["base"]["result.events.sse"]["sha256"] == digest(root / "deepseek/512/base/result.events.sse")
+
+
+def test_performance_inconclusive_keeps_full_verified_pair_values(performance_raw):
+    root, config, plan, preflight, rebuild = performance_raw
+    folder = root / "deepseek/512/candidate"
+    records = [json.loads(line) for line in (folder / "result.events.jsonl").read_text().splitlines()]
+    records[-1]["event"]["timings"]["prompt_ms"] *= 1.01
+    (folder / "result.events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in records))
+    (folder / "result.events.sse").write_text("".join("data: " + json.dumps(row["event"]) + "\n\n" for row in records))
+    result = load(folder / "result.json")
+    rebuilt = aggregation.run_final.stream_chat.summarize(records, result["start_ns"], result["end_ns"], result["prompt_ids"], 256)
+    aggregation.run_final.final_chat.validate_timings(rebuilt)
+    result.update(rebuilt)
+    (folder / "result.json").write_text(json.dumps(result))
+    arm = load(folder / "benchmark.json"); arm["result"] = result
+    (folder / "benchmark.json").write_text(json.dumps(arm))
+    rebuild()
+    pair = aggregation.performance_retained(root, config, "deepseek", "512", plan, POLICY, preflight)
+    assert pair["status"] == "inconclusive" and not pair["passed"]
+    assert pair["observed_slowdowns"] == ["server_prefill_tps"]
+    assert pair["metrics"]["server_prefill_tps"]["change_percent"] < 0 and pair["evidence"]["candidate"]
+
+
+@pytest.mark.parametrize("fault", ["base-resource", "candidate-argv", "receipt-resource", "missing-sse", "unclean", "repeated", "source"])
+def test_performance_identity_raw_or_cleanup_failure_never_passes(performance_raw, fault):
+    root, config, plan, preflight, _ = performance_raw
+    folder = root / "deepseek/512/candidate"
+    if fault == "missing-sse":
+        (folder / "result.events.sse").unlink()
+    elif fault in ("base-resource", "candidate-argv"):
+        target = root / "deepseek/512/base/runtime-after.json" if fault == "base-resource" else folder / "runtime-after.json"
+        raw = load(target)
+        if fault == "base-resource": raw["cgroup_limits"]["memory_max"] = "200"
+        else: raw["cmdline"] = ["/other"]
+        target.write_text(json.dumps(raw))
+    elif fault == "receipt-resource":
+        path = folder / "comparison-receipt.json"; raw = load(path)
+        raw["host"]["effective_settings"]["native_resource_policy"]["memlock_bytes"] = 2
+        path.write_text(json.dumps(raw))
+    elif fault == "unclean":
+        path = folder / "stopped.json"; raw = load(path); raw["cleanup_confirmed"] = False
+        path.write_text(json.dumps(raw))
+    else:
+        path = folder / "benchmark.json"; raw = load(path)
+        raw["completion_requests"] = 2 if fault == "repeated" else 1
+        if fault == "source": raw["revision"] = plan["base"]
+        path.write_text(json.dumps(raw))
+    with pytest.raises((OSError, ValueError)):
+        aggregation.performance_retained(root, config, "deepseek", "512", plan, POLICY, preflight)
 
 
 def cancellation_dispatch(operator):

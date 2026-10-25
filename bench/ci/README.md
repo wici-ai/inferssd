@@ -2,6 +2,15 @@
 
 ## Delivery scope
 
+The deployed operator path accepts an exact-head `/ci test` Comment review from
+a source maintainer, including for an external fork. It uses existing account
+permissions and the private controller's Actions report, without a check App.
+It seals the required base/candidate sources and reuses `StageSession` for the
+impact-selected Linux functional/numerical checks and 512/decode256 comparison.
+Mac is deferred in this deployment. See [review entry, results and limits](REVIEW-ENTRY.md)
+and [operator preparation](OPERATOR-PREPARE.md). Historic functional-only runs
+remain functional-only; deployment is not performance evidence.
+
 The current private manual path uses `StageSession` and the independently
 provisioned per-stage broker. `controller/integration-smoke.workflow.yml` builds
 one reviewed source, requires actual CUDA/Metal numerical operations, and makes
@@ -14,10 +23,10 @@ See [the checkpoint instructions](controller/CHECKPOINT.md). Its actual
 `checkpoint.json` determines success, failure or inconclusive performance;
 installing this code or running the smoke is not a performance result.
 
-The full three-device/two-model PR workflow remains an **unactivated deployment
+The separate App-published three-device/two-model PR workflow remains an **unactivated deployment
 template**. Its admission/finalization contract and the current stage broker
 still require full end-to-end integration and native gates on all devices. Keep
-`INFERSSD_CI_ENABLED` unset or `false`; do not require or publish its App check
+that publication path inactive; do not require or publish its App check
 merely because the manual checkpoint or this aggregate code change succeeds.
 
 The public InferSSD repository must have **no physical self-hosted runner**.
@@ -28,12 +37,12 @@ GitHub documents persistent compromise and credential risks on self-hosted
 runners, including after environment approval. See [secure use](https://docs.github.com/en/actions/reference/security/secure-use#hardening-for-self-hosted-runners).
 
 Physical execution belongs only to the separately private
-`wici-ai/inferssd-device-ci`, using a protected `main` and a private manual
-workflow. `controller/device-performance.yml` is a deployment template, not an
-active workflow in the public repository. `INFERSSD_CI_ENABLED` stays unset or
-`false` until actual OS isolation, original-lock/STOP/guardian cleanup, and
-all three device configurations have passed their deployment gates. This code
-installs no runner and changes no host or GitHub settings.
+`wici-ai/inferssd-device-ci`. `controller/device-performance.yml` is exported to
+that controller; it is not an active workflow in the public source repository.
+The deployed operator requires its reviewed `INFERSSD_CI_ENABLED=true` activation
+gate. That variable alone does not authorize the separate App publication path
+or establish all-three-device coverage. This code installs no runner and changes
+no host or GitHub settings.
 
 ## Exact source authorization
 

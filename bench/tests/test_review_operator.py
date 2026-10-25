@@ -36,7 +36,7 @@ class API:
                 user={"login": "maintainer"},
                 state="COMMENTED",
                 commit_id=HEAD,
-                body="/ci linux",
+                body="/ci test",
                 submitted_at=datetime.now(timezone.utc).isoformat(),
             )
         ]
@@ -130,10 +130,11 @@ def test_exact_comment_self_pr_authorization(api):
 @pytest.mark.parametrize(
     "body",
     [
-        "/ci linux extra",
-        "> /ci linux",
-        "```\n/ci linux\n```",
-        "/ci linux\n/ci cancel",
+        "/ci test extra",
+        "> /ci test",
+        "```\n/ci test\n```",
+        "/ci test\n/ci cancel",
+        "/ci linux",
         "please run tests",
     ],
 )
@@ -255,6 +256,33 @@ def test_repeated_event_is_not_dispatched_again(api, args, monkeypatch):
     assert (
         len(list(args.state.glob("*.json"))) == 3
     )  # profile, policy, one durable event
+
+
+def test_removed_command_does_not_queue_or_rewrite_history(api, args, monkeypatch):
+    path, value = record(api, args)
+    entry.save_record(path, value, "completed", conclusion="success")
+    retained = path.read_bytes()
+    api.reviews[0]["body"] = "/ci linux"
+    api.reviews.append(dict(api.reviews[0], id=72))
+    monkeypatch.setattr(entry, "advance", lambda *_: pytest.fail("old command replay"))
+    entry.tick(args, api)
+    assert path.read_bytes() == retained
+    assert len(list(args.state.glob("*.json"))) == 3
+
+
+def test_fresh_test_review_gets_new_record_and_preserves_old_result(api, args, monkeypatch):
+    path, value = record(api, args)
+    entry.save_record(path, value, "completed", conclusion="success")
+    retained = path.read_bytes()
+    api.reviews[0]["body"] = "/ci linux"
+    fresh = dict(api.reviews[0], id=72, body="/ci test")
+    api.reviews.append(fresh)
+    advanced = []
+    monkeypatch.setattr(entry, "advance", lambda *values: advanced.append(values[-1]))
+    entry.tick(args, api)
+    assert path.read_bytes() == retained
+    assert [row["review_id"] for row in advanced] == [72]
+    assert (args.state / (entry.key(REPO, 58, fresh) + ".json")).is_file()
 
 
 def test_interrupted_ambiguous_dispatch_never_reposts(api, args, monkeypatch):

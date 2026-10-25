@@ -58,6 +58,21 @@ def test_equal_samples_pass_only_observed_gate(pair, policy):
     assert "not statistical proof" in result["interpretation"]
 
 
+def test_pair_reports_signed_changes_and_exact_prompt_conditions(pair, policy):
+    a, b, ar, br = pair
+    b["metrics"]["decode_first128_tps"] = 12
+    b["metrics"]["decode_second128_tps"] = 11
+    b["metrics"]["ttft_s"] = .9
+    result = compare.compare_pair(a, b, ar, br, policy)
+    assert result["metrics"]["decode_first128_tps"]["change_percent"] == pytest.approx(20)
+    assert result["metrics"]["decode_second128_tps"]["change_percent"] == pytest.approx(10)
+    assert result["metrics"]["ttft_s"]["change_percent"] == pytest.approx(-10)
+    assert result["metrics"]["ttft_s"]["direction"] == "lower-is-better"
+    assert result["measurement_identity"]["prompt_sha256"] == a["prompt_sha256"]
+    assert result["measurement_identity"]["output_tokens"] == 256
+    assert len(result["measurement_identity"]["conditions_sha256"]) == 64
+
+
 def test_faster_different_output_is_inconclusive_and_retains_metrics(pair, policy):
     a, b, ar, br = pair
     b["tokens"][64] = 12

@@ -1,8 +1,11 @@
 # Impact-selected physical CI
 
-This branch provides the trusted orchestration implementation. It has not been
-deployed or dispatched. Local tests validate protocol and failure handling; they
-are not physical-device or performance evidence. Formal benchmark samples: 0.
+The current operator entry is a maintainer's exact-head `/ci test` Comment review;
+see [review entry and results](REVIEW-ENTRY.md). It uses the preparer's existing
+permissions and reports in private Actions without a check App. This deployment
+executes the two Linux devices and only the 512/decode256 performance tier. Mac
+and any additional required tiers remain coverage gaps. Local protocol checks
+are separate from physical results. Formal benchmark samples: 0.
 The original guarded per-stage executors, device lease, STOP/quarantine, source
 freezer, exact PID/birth/listener and disconnect guardians remain authoritative.
 
@@ -28,7 +31,10 @@ best-of selection exists. Each cell records TTFT separately, native prefill and
 first/second 128-token and whole decode rates. The existing n=1 policy marks any
 observed slowdown inconclusive and blocks acceptance.
 
-## Trusted PR entry
+## Separate App publication mode
+
+The following protected-branch/App path is a separate optional mode. It is not
+required by the deployed review operator and does not describe its authorization.
 
 The source repository workflow provides an unprivileged hosted preview only. Its
 plan is not authorization. The private `device-performance.yml` independently
@@ -93,9 +99,12 @@ execution is used; see [GitHub's security guidance](https://docs.github.com/en/a
    model distribution, template and semantic typed settings. Native snapshots,
    real runtime image mappings and root-observed resources are checked.
    Before any selected 256-token request, every selected performance model/tier
-   runs both sides' eight-token preflight with that performance arm's exact
-   argv, environment and working directory. A candidate functional smoke is
-   reused only when its complete launch matches. Native typed snapshots, owned
+   runs both sides' eight-token preflight with that performance arm's environment,
+   working directory and arguments. The operator seals a separate `preflight_argv`;
+   only the single private `--ssd-telemetry` file may differ from the timed argv,
+   and both destinations are distinct canonical files within that side's scratch
+   directory. A candidate functional smoke is reused only when its complete
+   launch matches this preflight. Native typed snapshots, owned
    runtime images, resources and immutable inputs must compare equal for every
    pair first. Missing declarations or exact root stage authorization refuse
    before opening the lease. Timed arms retain their existing once-only checks

@@ -1,6 +1,7 @@
 """Block invalid evidence, changed output or slowdown; n=1 is not a variance test."""
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import math
@@ -140,8 +141,8 @@ def compare_pair(base, head, base_receipt, head_receipt, policy, *, comparison_b
     policy_read(policy)
     validate_metrics(base)
     validate_metrics(head)
-    if (comparable(base_receipt, comparison_binding, "base")
-            != comparable(head_receipt, comparison_binding, "candidate")):
+    conditions = comparable(base_receipt, comparison_binding, "base")
+    if conditions != comparable(head_receipt, comparison_binding, "candidate"):
         raise ValueError(
             "resource, placement, model, template, page-cache treatment or image set changed"
         )
@@ -180,6 +181,8 @@ def compare_pair(base, head, base_receipt, head_receipt, policy, *, comparison_b
             "base": before,
             "candidate": after,
             "ratio": ratio,
+            "change_percent": (ratio - 1) * 100,
+            "direction": "lower-is-better" if key == "ttft_s" else "higher-is-better",
             "limit_ratio": 1.0,
             "passed": passed,
         }
@@ -198,6 +201,13 @@ def compare_pair(base, head, base_receipt, head_receipt, policy, *, comparison_b
         "output_workload": output_workload,
         "interpretation": INTERPRETATION,
         "actual_input_tokens": head["input_tokens"],
+        "measurement_identity": {
+            "prompt_sha256": base["prompt_sha256"],
+            "prompt_ids_sha256": hashlib.sha256(json.dumps(base["prompt_ids"], separators=(",", ":")).encode()).hexdigest(),
+            "input_tokens": base["input_tokens"],
+            "output_tokens": 256,
+            "conditions_sha256": hashlib.sha256(json.dumps(conditions, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest(),
+        },
         "prefill_tps": {
             "base": base["metrics"]["server_prefill_tps"],
             "candidate": head["metrics"]["server_prefill_tps"],

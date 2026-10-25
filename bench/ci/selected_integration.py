@@ -45,6 +45,8 @@ def run(args):
         scope = execution_scope(config)
         if scope is not None:
             report.update(scope)
+            if "performance_protocol" in config:
+                report["performance_protocol"] = config["performance_protocol"]
         pairs = selected_preflight.declarations(config, manifest, needs)
         admitted = model_admission.enabled(config)
         model_admission.prepare(config, manifest, output)
@@ -111,8 +113,10 @@ def run(args):
                 cells[model]["runtime_receipt_sha256"] = digest(folder / "runtime-receipt.json")
         preflight = selected_preflight.run(session, config, manifest, pairs, builds, functional, output)
         report["performance_preflight_sha256"] = digest(output / "performance-preflight.json")
+        inconclusive = False
         for model in needs["models"]:
             cell = cells[model]
+            report["cells"].append(cell)
             for tier in needs["performance"].get(model, {}).get("tiers", []):
                 measurements, receipts = {}, {}
                 for side in ("base", "candidate"):
@@ -132,12 +136,14 @@ def run(args):
                 save(output / model / tier / "comparison.json", compared)
                 cell["performance"].append(dict(tier=tier, **compared))
                 if compared["passed"] is not True:
-                    raise RuntimeError("observed slowdown is inconclusive and blocks acceptance")
-            report["cells"].append(cell)
+                    # A measured slowdown/output-workload disagreement is a
+                    # retained outcome, not a reason to retry or erase metrics.
+                    # Finish the other already selected single-shot pairs.
+                    inconclusive = True
         model_admission.probe(session, config, manifest, "after", output)
         if watch is not None:
             watch.check()
-        report["status"] = "passed"
+        report["status"] = "inconclusive" if inconclusive else "passed"
     except Exception as error:
         report["error"] = f"{type(error).__name__}: {error}"
     finally:
