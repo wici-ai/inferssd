@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "inferssd"
 version = "0.1.0"
 description = "InferSSD typed settings and owned inference runtime"
+license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
 dependencies = []
 

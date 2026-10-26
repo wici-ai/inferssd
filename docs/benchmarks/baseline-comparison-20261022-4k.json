@@ -1,0 +1,491 @@
+{
+  "updated": "2026-10-26",
+  "scope": "4K only, for the four platforms presented in the README.",
+  "baseline": "llama.cpp",
+  "input_summary": "reported-comparison-20261022-4k.json",
+  "verified_mac_results": "performance-20261020-4k.json",
+  "method": "Speedup is engine throughput / llama.cpp throughput. Calculations use displayed summary rates; llama.cpp is 1.00×. Unsupported entries have no speedup.",
+  "rounding": "Displayed speedup: two decimal places, ROUND_HALF_UP. Numeric ratios and historical percentage fields retain their existing precision.",
+  "rows": [
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "MacBook Pro",
+      "prompt_tier": "4K",
+      "metric": "prefill",
+      "rates_tps": {
+        "llama.cpp": "5.929",
+        "Colibri": "0.708",
+        "SSD-Llama": "18.743"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "completed",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 3.161241356046551,
+      "throughput_change_percent": 216.1241356046551,
+      "displayed_comparison": "(3.16×)",
+      "engine_comparisons": {
+        "Colibri": {
+          "ratio": 0.11941305447798954,
+          "throughput_change_percent": -88.05869455220105,
+          "displayed_speedup": "(0.12×)"
+        },
+        "SSD-Llama": {
+          "ratio": 3.161241356046551,
+          "throughput_change_percent": 216.1241356046551,
+          "displayed_speedup": "(3.16×)"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "RTX 5060 Ti",
+      "prompt_tier": "4K",
+      "metric": "prefill",
+      "rates_tps": {
+        "llama.cpp": "6.95",
+        "Colibri": "7.02",
+        "SSD-Llama": "75.1"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "completed",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 10.805755395683454,
+      "throughput_change_percent": 980.5755395683453,
+      "displayed_comparison": "(10.81×)",
+      "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
+      "engine_comparisons": {
+        "Colibri": {
+          "ratio": 1.0100719424460431,
+          "throughput_change_percent": 1.0071942446043165,
+          "displayed_speedup": "(1.01×)"
+        },
+        "SSD-Llama": {
+          "ratio": 10.805755395683454,
+          "throughput_change_percent": 980.5755395683453,
+          "displayed_speedup": "(10.81×)"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "RTX 5090",
+      "prompt_tier": "4K",
+      "metric": "prefill",
+      "rates_tps": {
+        "llama.cpp": "7.37",
+        "Colibri": "36.81",
+        "SSD-Llama": "164.5"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "completed",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 22.3202170963365,
+      "throughput_change_percent": 2132.02170963365,
+      "displayed_comparison": "(22.32×)",
+      "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
+      "engine_comparisons": {
+        "Colibri": {
+          "ratio": 4.9945725915875165,
+          "throughput_change_percent": 399.4572591587517,
+          "displayed_speedup": "(4.99×)"
+        },
+        "SSD-Llama": {
+          "ratio": 22.3202170963365,
+          "throughput_change_percent": 2132.02170963365,
+          "displayed_speedup": "(22.32×)"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "DGX Spark",
+      "prompt_tier": "4K",
+      "metric": "prefill",
+      "rates_tps": {
+        "llama.cpp": "2.73",
+        "Colibri": "0.826",
+        "SSD-Llama": "127.5"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "completed",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 46.7032967032967,
+      "throughput_change_percent": 4570.32967032967,
+      "displayed_comparison": "(46.70×)",
+      "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
+      "engine_comparisons": {
+        "Colibri": {
+          "ratio": 0.30256410256410254,
+          "throughput_change_percent": -69.74358974358974,
+          "displayed_speedup": "(0.30×)"
+        },
+        "SSD-Llama": {
+          "ratio": 46.7032967032967,
+          "throughput_change_percent": 4570.32967032967,
+          "displayed_speedup": "(46.70×)"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "MacBook Pro",
+      "prompt_tier": "4K",
+      "metric": "decode",
+      "rates_tps": {
+        "llama.cpp": "0.873",
+        "Colibri": "0.437",
+        "SSD-Llama": "2.039"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "completed",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 2.3356242840778925,
+      "throughput_change_percent": 133.56242840778924,
+      "displayed_comparison": "(2.34×)",
+      "engine_comparisons": {
+        "Colibri": {
+          "ratio": 0.5005727376861397,
+          "throughput_change_percent": -49.942726231386025,
+          "displayed_speedup": "(0.50×)"
+        },
+        "SSD-Llama": {
+          "ratio": 2.3356242840778925,
+          "throughput_change_percent": 133.56242840778924,
+          "displayed_speedup": "(2.34×)"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "RTX 5060 Ti",
+      "prompt_tier": "4K",
+      "metric": "decode",
+      "rates_tps": {
+        "llama.cpp": "0.242",
+        "Colibri": "0.9",
+        "SSD-Llama": "2.55"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "completed",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 10.537190082644628,
+      "throughput_change_percent": 953.7190082644628,
+      "displayed_comparison": "(10.54×)",
+      "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
+      "engine_comparisons": {
+        "Colibri": {
+          "ratio": 3.71900826446281,
+          "throughput_change_percent": 271.900826446281,
+          "displayed_speedup": "(3.72×)"
+        },
+        "SSD-Llama": {
+          "ratio": 10.537190082644628,
+          "throughput_change_percent": 953.7190082644628,
+          "displayed_speedup": "(10.54×)"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "RTX 5090",
+      "prompt_tier": "4K",
+      "metric": "decode",
+      "rates_tps": {
+        "llama.cpp": "0.526",
+        "Colibri": "1.342",
+        "SSD-Llama": "7.27"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "completed",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 13.8212927756654,
+      "throughput_change_percent": 1282.12927756654,
+      "displayed_comparison": "(13.82×)",
+      "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
+      "engine_comparisons": {
+        "Colibri": {
+          "ratio": 2.5513307984790874,
+          "throughput_change_percent": 155.13307984790873,
+          "displayed_speedup": "(2.55×)"
+        },
+        "SSD-Llama": {
+          "ratio": 13.8212927756654,
+          "throughput_change_percent": 1282.12927756654,
+          "displayed_speedup": "(13.82×)"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "DGX Spark",
+      "prompt_tier": "4K",
+      "metric": "decode",
+      "rates_tps": {
+        "llama.cpp": "1.608",
+        "Colibri": "0.356",
+        "SSD-Llama": "7.26"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "completed",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 4.514925373134329,
+      "throughput_change_percent": 351.4925373134328,
+      "displayed_comparison": "(4.51×)",
+      "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
+      "engine_comparisons": {
+        "Colibri": {
+          "ratio": 0.22139303482587064,
+          "throughput_change_percent": -77.86069651741293,
+          "displayed_speedup": "(0.22×)"
+        },
+        "SSD-Llama": {
+          "ratio": 4.514925373134329,
+          "throughput_change_percent": 351.4925373134328,
+          "displayed_speedup": "(4.51×)"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "MacBook Pro",
+      "prompt_tier": "4K",
+      "metric": "prefill",
+      "rates_tps": {
+        "llama.cpp": "3.140",
+        "Colibri": null,
+        "SSD-Llama": "7.957"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "not_supported",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 2.5340764331210193,
+      "throughput_change_percent": 153.40764331210192,
+      "displayed_comparison": "(2.53×)",
+      "qualification": "Historical configuration comparison: baseline template and actual input count differ.",
+      "engine_comparisons": {
+        "Colibri": null,
+        "SSD-Llama": {
+          "ratio": 2.5340764331210193,
+          "throughput_change_percent": 153.40764331210192,
+          "displayed_speedup": "(2.53×)"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "RTX 5060 Ti",
+      "prompt_tier": "4K",
+      "metric": "prefill",
+      "rates_tps": {
+        "llama.cpp": "3.41",
+        "Colibri": null,
+        "SSD-Llama": "52.1"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "not_supported",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 15.27859237536657,
+      "throughput_change_percent": 1427.8592375366568,
+      "displayed_comparison": "(15.28×)",
+      "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
+      "engine_comparisons": {
+        "Colibri": null,
+        "SSD-Llama": {
+          "ratio": 15.27859237536657,
+          "throughput_change_percent": 1427.8592375366568,
+          "displayed_speedup": "(15.28×)"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "RTX 5090",
+      "prompt_tier": "4K",
+      "metric": "prefill",
+      "rates_tps": {
+        "llama.cpp": "3.85",
+        "Colibri": null,
+        "SSD-Llama": "106.6"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "not_supported",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 27.68831168831169,
+      "throughput_change_percent": 2668.8311688311687,
+      "displayed_comparison": "(27.69×)",
+      "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
+      "engine_comparisons": {
+        "Colibri": null,
+        "SSD-Llama": {
+          "ratio": 27.68831168831169,
+          "throughput_change_percent": 2668.8311688311687,
+          "displayed_speedup": "(27.69×)"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "DGX Spark",
+      "prompt_tier": "4K",
+      "metric": "prefill",
+      "rates_tps": {
+        "llama.cpp": "1.74",
+        "Colibri": null,
+        "SSD-Llama": "83.9"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "not_supported",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 48.2183908045977,
+      "throughput_change_percent": 4721.83908045977,
+      "displayed_comparison": "(48.22×)",
+      "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
+      "engine_comparisons": {
+        "Colibri": null,
+        "SSD-Llama": {
+          "ratio": 48.2183908045977,
+          "throughput_change_percent": 4721.83908045977,
+          "displayed_speedup": "(48.22×)"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "MacBook Pro",
+      "prompt_tier": "4K",
+      "metric": "decode",
+      "rates_tps": {
+        "llama.cpp": "0.153",
+        "Colibri": null,
+        "SSD-Llama": "0.766"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "not_supported",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 5.006535947712418,
+      "throughput_change_percent": 400.65359477124184,
+      "displayed_comparison": "(5.01×)",
+      "qualification": "Historical configuration comparison: baseline template and actual input count differ.",
+      "engine_comparisons": {
+        "Colibri": null,
+        "SSD-Llama": {
+          "ratio": 5.006535947712418,
+          "throughput_change_percent": 400.65359477124184,
+          "displayed_speedup": "(5.01×)"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "RTX 5060 Ti",
+      "prompt_tier": "4K",
+      "metric": "decode",
+      "rates_tps": {
+        "llama.cpp": "0.059",
+        "Colibri": null,
+        "SSD-Llama": "0.219"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "not_supported",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 3.711864406779661,
+      "throughput_change_percent": 271.1864406779661,
+      "displayed_comparison": "(3.71×)",
+      "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
+      "engine_comparisons": {
+        "Colibri": null,
+        "SSD-Llama": {
+          "ratio": 3.711864406779661,
+          "throughput_change_percent": 271.1864406779661,
+          "displayed_speedup": "(3.71×)"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "RTX 5090",
+      "prompt_tier": "4K",
+      "metric": "decode",
+      "rates_tps": {
+        "llama.cpp": "0.155",
+        "Colibri": null,
+        "SSD-Llama": "1.520"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "not_supported",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 9.806451612903226,
+      "throughput_change_percent": 880.6451612903226,
+      "displayed_comparison": "(9.81×)",
+      "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
+      "engine_comparisons": {
+        "Colibri": null,
+        "SSD-Llama": {
+          "ratio": 9.806451612903226,
+          "throughput_change_percent": 880.6451612903226,
+          "displayed_speedup": "(9.81×)"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "DGX Spark",
+      "prompt_tier": "4K",
+      "metric": "decode",
+      "rates_tps": {
+        "llama.cpp": "0.120",
+        "Colibri": null,
+        "SSD-Llama": "2.14"
+      },
+      "run_status": {
+        "llama.cpp": "completed",
+        "Colibri": "not_supported",
+        "SSD-Llama": "completed"
+      },
+      "ssd_vs_baseline_ratio": 17.833333333333332,
+      "throughput_change_percent": 1683.3333333333333,
+      "displayed_comparison": "(17.83×)",
+      "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
+      "engine_comparisons": {
+        "Colibri": null,
+        "SSD-Llama": {
+          "ratio": 17.833333333333332,
+          "throughput_change_percent": 1683.3333333333333,
+          "displayed_speedup": "(17.83×)"
+        }
+      }
+    }
+  ],
+  "display_format": "README cells show rate (speedup vs llama.cpp, ×); WICI-InferSSD is bold. Ratios below 1.00× indicate lower throughput. Numeric percentage fields are retained for compatibility.",
+  "decode_definition": "All platforms generate 256 output tokens; decode throughput is measured over tokens 129–256: 128 / (T256 - T128)."
+}
