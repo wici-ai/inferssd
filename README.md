@@ -1,43 +1,94 @@
-# InferSSD
+<p align="center">
+  <a href="https://wici.ai">
+    <img src="docs/assets/wicissdinfer.png" width="600" alt="WICI-InferSSD">
+  </a>
+</p>
 
-InferSSD is an SSD-backed inference framework for large mixture-of-experts models. It streams expert weights
-from local storage and manages execution across the CPU, host memory and GPU. The Python framework provides typed configuration, owned launch and Linux
-adaptive control; full live probe/bootstrap orchestration remains under integration.
+<p align="center"><b>Large MoE models, powered by your SSD.</b></p>
+<p align="center">macOS / Metal &nbsp;·&nbsp; Linux / CUDA &nbsp;·&nbsp; <a href="LICENSE">MIT</a></p>
 
-InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) and ggml. This repository includes the
-engine source with InferSSD's runtime extensions. The upstream baseline and component attribution are
-recorded in [PROVENANCE.md](PROVENANCE.md) and [NOTICE](NOTICE).
+<p align="center">
+  <a href="#performance-benchmarks"><b>Benchmarks</b></a> &nbsp;·&nbsp;
+  <a href="#test-hardware">Hardware</a> &nbsp;·&nbsp;
+  <a href="#get-started"><b>Get started</b></a> &nbsp;·&nbsp;
+  <a href="#models">Models</a> &nbsp;·&nbsp;
+  <a href="ARCHITECTURE.md">How it works</a> &nbsp;·&nbsp;
+  <a href="docs/benchmark.md">Methodology</a>
+</p>
 
-The initial source import is under development toward **v0.1.0**. Published performance results and a complete
-platform support matrix will follow validation of the release candidate. Historical engineering logs describe
-earlier code and are not release benchmarks.
+**Run models larger than your RAM or VRAM.** WICI-InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run **DeepSeek-V4.1-Flash-1017** and **Muse-Spark-Open** from SSD. Direct GGUF expert reads, bounded caches, and prompt batching reduce the cost of accessing weights while retaining browser chat and an OpenAI-compatible API.
 
-## Models and platforms
+## Performance benchmarks
 
-The supported targets are DeepSeek-V4.1 Flash with MXFP4 experts in the Q8_0 GGUF distribution, and Muse Spark
-Open UD-Q4_K_XL. Linux CUDA development targets RTX 5090, RTX 5060 Ti and GB10. Other inherited models and
-backends have not been qualified by this project. Apple Silicon integration includes a
-[GGUF launcher for both models](docs/mac-launcher.md); target-device qualification is in progress.
+**4K prompt tier · 256 output tokens · decode measured over tokens 129–256.** The 4K label describes the prompt tier, not the model's context-window capacity; actual input token counts depend on the chat template.
 
-The model files are large: allow approximately 505-508 GB for each model, plus working space. Linux reads
-expert ranges directly from the GGUF shards and does not require a separate expert pack.
+All rates are in **token/s**, with higher values indicating faster inference. **llama.cpp is the baseline (1.00×)**. **Speedup** below each Colibri and **WICI-InferSSD** rate is `engine throughput / llama.cpp throughput` on the same system. Values above 1.00× are faster; values below 1.00× are slower.
 
-## Linux prerequisites
+Mac InferSSD results were updated on **2026-10-26** using the optimized GGUF runtime; the comparison engines retain their recorded baseline runs. The remaining InferSSD rows are historical results from the source README, not a new benchmark of every platform on current main.
 
-- A supported NVIDIA GPU visible to `nvidia-smi`, with CUDA 13.x and a matching driver.
-- CMake, a C/C++ compiler, Python 3.9 or newer, and Bash 4.3 or newer.
-- Linux cgroup v2 and a systemd user instance with the memory controller delegated.
-- Local storage supporting `O_DIRECT`, and an enabled `io_uring` interface. Install `liburing-dev` for GPU
-  prefill reads. CUDA builds need `nvcc`; the typed runtime itself does not compile probe shims.
-- Exclusive use of the GPU during measurement. Build on the target machine; the build script selects its
-  CUDA architecture and CPU capabilities. Compilation and normal execution do not require root.
+These results compare complete inference configurations. In the Mac DeepSeek runs, Colibri uses official Safetensors on CPU, while the GGUF engines use Metal with CPU experts. See [measurement details](docs/benchmark.md) for the scope of the comparison.
 
-Docker, WSL and network filesystems have not been qualified. The framework may start several short-lived
-servers, read several GB of model data and evict model pages from the page cache while deriving settings.
+### Test hardware
 
-## Build and run
+| Specification | MacBook Pro (M5 Max) | RTX 5060 Ti | RTX 5090 | DGX Spark |
+| --- | --- | --- | --- | --- |
+| **CPU / SoC** | Apple M5 Max | Intel Core 3 100U | Intel Core Ultra 5 230F | NVIDIA GB10 |
+| **CPU cores** | 18 | 6 | 10 | 20 |
+| **GPU** | 40-core Apple GPU | RTX 5060 Ti | RTX 5090 | NVIDIA Blackwell |
+| **System memory** | 48 GB unified | 8 GB RAM | 16 GB RAM | 128 GB unified |
+| **GPU memory** | Shared | 16 GB VRAM | 32 GB VRAM | Shared |
+| **SSD capacity** | 2 TB | 2 TB | 2 TB | 4 TB |
+| **SSD interface** | Apple internal storage | PCIe 4.0 ×4 | PCIe 5.0 ×4 | PCIe 5.0 ×4 |
 
-Clone this repository and download every shard of one supported model after accepting its license:
+Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to system RAM. SSD capacities are nominal. See [hardware details](docs/benchmark.md#hardware-details) for SSD models, CPU core layouts, and configuration notes.
+
+### DeepSeek-V4.1-Flash-1017
+
+#### Prefill · 4K
+
+| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **WICI-InferSSD**<br>**token/s · Speedup** |
+| --- | ---: | ---: | ---: |
+| MacBook Pro (M5 Max) | 5.929 | 0.708<br>(0.12×) | **26.270**<br>**(4.43×)** |
+| RTX 5060 Ti | 6.950 | 7.020<br>(1.01×) | **75.100**<br>**(10.81×)** |
+| RTX 5090 | 8.060 | 39.210<br>(4.86×) | **164.500**<br>**(20.41×)** |
+| DGX Spark | 2.730 | 0.826<br>(0.30×) | **127.500**<br>**(46.70×)** |
+
+#### Decode · 4K
+
+| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **WICI-InferSSD**<br>**token/s · Speedup** |
+| --- | ---: | ---: | ---: |
+| MacBook Pro (M5 Max) | 0.873 | 0.437<br>(0.50×) | **2.704**<br>**(3.10×)** |
+| RTX 5060 Ti | 0.242 | 0.900<br>(3.72×) | **2.550**<br>**(10.54×)** |
+| RTX 5090 | 0.867 | 1.878<br>(2.17×) | **7.270**<br>**(8.39×)** |
+| DGX Spark | 1.608 | 0.356<br>(0.22×) | **7.260**<br>**(4.51×)** |
+
+### Muse-Spark-Open · 816B
+
+#### Prefill · 4K
+
+| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **WICI-InferSSD**<br>**token/s · Speedup** |
+| --- | ---: | ---: | ---: |
+| MacBook Pro (M5 Max)<sup>1</sup> | 3.140 | N/S | **12.480**<br>**(3.97×)** |
+| RTX 5060 Ti | 3.410 | N/S | **52.100**<br>**(15.28×)** |
+| RTX 5090 | 4.000 | N/S | **106.600**<br>**(26.65×)** |
+| DGX Spark | 1.740 | N/S | **83.900**<br>**(48.22×)** |
+
+#### Decode · 4K
+
+| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **WICI-InferSSD**<br>**token/s · Speedup** |
+| --- | ---: | ---: | ---: |
+| MacBook Pro (M5 Max)<sup>1</sup> | 0.153 | N/S | **0.944**<br>**(6.17×)** |
+| RTX 5060 Ti | 0.059 | N/S | **0.219**<br>**(3.71×)** |
+| RTX 5090 | 0.155 | N/S | **1.520**<br>**(9.81×)** |
+| DGX Spark | 0.120 | N/S | **2.140**<br>**(17.83×)** |
+
+**N/S:** Muse was not supported by the tested Colibri version. It is not a zero-throughput measurement.
+
+<sup>1</sup> The MacBook Pro Muse row uses a historical llama.cpp baseline with a different template and input token count. Its speedup ratios describe those recorded configurations, not a matched-input comparison.
+
+## Get started
+
+Both platforms use the `main` branch and the same typed launcher. Download every GGUF shard for your chosen model; the current runtime reads expert ranges directly from GGUF and does not require a separate expert pack.
 
 ```sh
 git clone https://github.com/wici-ai/inferssd.git
@@ -49,60 +100,67 @@ python3 scripts/engine-resources.py --build build-linux-cuda --output engine-res
 inferssd launch --help
 ```
 
-Use `macos-metal` on Apple Silicon, or `linux-cpu` for core/CPU development.
-The [typed launcher guide](framework/README.md) describes model paths,
-explicit resource policies, leases, settings receipts and launch artifacts.
-`inferssd launch --execute` is the production package entry point. It consumes
-`inferssd-settings 1`; native callers may use `llama-server --ssd-settings FILE
---ssd-telemetry FILE`. `llama-server --ssd-schema` emits the current registry.
-Historical launchers are retained for recorded comparisons. No binary packages
-or formal release are published by this source integration.
+| Platform | CMake preset | Setup |
+| --- | --- | --- |
+| macOS / Metal (Apple Silicon) | `macos-metal` | [Mac setup](docs/mac-launcher.md) |
+| Linux / NVIDIA CUDA | `linux-cuda` | [Typed launcher and resource policy](framework/README.md) |
+
+Use `build-macos-metal` in the build and resource commands on Mac. The launcher guide covers the required model, settings, resource policy and output directory; `inferssd launch --execute` starts the owned server. Mac currently uses static measured settings; online adaptive control on Mac remains future work.
+
+`x86_64` covers Intel and AMD CPUs; DGX Spark (GB10) uses `ARM64`. CUDA identifies the NVIDIA GPU backend, not the CPU vendor. The x86_64 benchmarks use Intel CPUs.
+
+Allow approximately **505–508 GB per model**, plus working space. Mac requires Xcode/Metal, CMake and Python. Linux requires a compatible CUDA toolkit (development uses CUDA 13.x), CMake, Python, `liburing`, and systemd/cgroup v2. The measured Mac presets target **M5 Max / 48 GB**; choose cache and batch budgets that fit your machine.
+
+## Models
+
+These GGUF references are recorded in the verified Mac runs. They are community conversions of the named model releases.
+
+| Model | Parameter count | GGUF reference |
+| --- | --- | --- |
+| DeepSeek-V4.1-Flash-1017 | 763B official release<br>748.49B in the text GGUF | [mrfakename · Q8_0 with native MXFP4 experts](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF) |
+| Muse-Spark-Open | 816B total / 42B active | [Unsloth · UD-Q4_K_XL](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF) |
+
+DeepSeek's **Q8_0 label does not mean every tensor is 8-bit**: routed experts retain MXFP4, while other tensors include Q8_0, BF16, and F32. This text GGUF omits the vision and MTP/DSpark modules. Expert packing copies the existing quantized expert bytes without requantization. See [weight-format details](docs/benchmark.md#checkpoint-formats).
+
+## Use it with your tools
+
+Once the server is ready, open its address in your browser or point an OpenAI-compatible client at its `/v1` endpoint.
+
+The example below assumes your server is listening on `127.0.0.1:8080`; use the host and port selected in your launch configuration. Its API base URL is `http://127.0.0.1:8080/v1`.
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messages": [{"role": "user", "content": "Explain how a mixture-of-experts model works."}],
+    "max_tokens": 256,
+    "temperature": 0,
+    "stream": true,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
+## Further reading
+
+- [How it works](ARCHITECTURE.md): runtime boundaries, model adapters, and backend execution.
+- [Engine configurations](docs/benchmark.md#engine-configurations) and [decode windows / request times](docs/benchmark.md#decode-windows-and-request-time).
+- [Reproducing a result](docs/benchmark.md#reproducing-a-result) and [4K data provenance](docs/benchmark.md#data-provenance).
 
 ## Repository layout
 
-- `engine/`: bundled native runtime, ggml backends, model resources and native tests.
-- `framework/`: installable Python configuration, planning and owned runtime package.
+- `engine/`: native runtime, ggml backends, model resources and native tests.
+- `framework/`: typed configuration, model adapters, planning and owned execution.
 - `bench/`: benchmark clients and real-device CI.
-- `tests/`: cross-component integration tests; native tests live in `engine/tests/ssd/`.
-- `scripts/` and `docs/`: product maintenance and documentation. Historical reports
-  live in `docs/history/`; consumed old implementations exist only as test fixtures.
+- `tests/`, `scripts/` and `docs/`: integration tests, maintenance and documentation.
 
-The root CMake entry point preserves `build*/bin` output paths. Installed deployments
-use an explicit [engine resource descriptor](docs/engine-resources.md), independent
-of the working directory or source checkout.
+See [architecture](ARCHITECTURE.md) for module boundaries and [contributing](CONTRIBUTING.md) for checks and review requirements.
 
-## Development
+## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for checks and review requirements, [PROVENANCE.md](PROVENANCE.md)
-for source history, and [the import manifest](docs/import-manifest.tsv) for the origin of every changed
-path. The baseline snapshot is commit `8884f8314ce8ea96d62cd602b6bbf7fc25758a09`, already included in main.
-`python3 scripts/inferssd/patch-surface.py` compares current engine files to that
-snapshot without counting the directory relocation as a code patch. The complete
-[path migration](docs/development/path-migration.tsv) records every original path.
+Hardware results and improvements to expert I/O, caching, and batching are welcome. Include the commit, checkpoint, hardware, command, cache state, actual prompt length, raw timings, and a correctness check. Use the [measurement checklist](docs/benchmark.md#reproducing-a-result).
 
-The core and backend executors, runtime assembly, common/server features and
-Python framework now follow the [module layout](ARCHITECTURE.md). Run
-`python3 scripts/inferssd/check-layering.py` for dependency checks and
-`python3 scripts/inferssd/check-layout.py` for whole-tree ownership checks. The
-[upstream patch inventory](PATCHES.md) identifies integration hooks and model/op
-exceptions. Real-device candidate qualification remains separate from source
-organization; formal benchmark samples have not been collected.
+## Acknowledgments and license
 
-Support is best effort and applies to the listed models on validated hardware. The first release will qualify
-the first request after server startup; concurrent serving and long-running conversation behavior need
-separate validation.
+Built on [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp), with thanks to their contributors and the model-adaptation community. [Strata](https://github.com/niko1221/strata) and [Colibri](https://github.com/JustVugg/colibri) are related projects exploring accessible local inference.
 
-## Models and licenses
-
-InferSSD ships no model weights. Obtain the model files from their publishers and accept their licenses:
-
-- [DeepSeek-V4.1 Flash 1017 GGUF](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF)
-  or [the original Flash GGUF](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF): MIT.
-- [Muse Spark Open GGUF](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF): the Muse Model
-  License and Usage Policy apply. Products using that model must display "Built with Muse Spark Open".
-  Review the publisher's full terms, including the separate agreement required for covered model-as-a-service use.
-
-The project code is distributed under [MIT](LICENSE), with third-party exceptions and attribution in
-[NOTICE](NOTICE) and the retained component licenses. Legacy K3 reference math is separately licensed and
-scheduled for removal before v0.1.0. DeepSeek, Muse, Meta, Kimi and llama.cpp are trademarks of their owners.
-InferSSD is not affiliated with or endorsed by them.
+WICI-InferSSD is licensed under [MIT](LICENSE), with component attribution and third-party exceptions in [NOTICE](NOTICE) and [PROVENANCE.md](PROVENANCE.md). Model weights remain subject to their publishers' licenses; Muse usage must comply with its Model License and Usage Policy.
