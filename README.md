@@ -5,26 +5,24 @@
 </p>
 
 <p align="center"><b>Large MoE models, powered by your SSD.</b></p>
-<p align="center">macOS / Metal &nbsp;·&nbsp; Linux / CUDA &nbsp;·&nbsp; <a href="LICENSE">MIT</a></p>
+<p align="center">macOS / Metal &nbsp;·&nbsp; Linux / CUDA &nbsp;·&nbsp; <a href="LICENSE">Apache-2.0</a></p>
 
 <p align="center">
   <a href="#performance-benchmarks"><b>Benchmarks</b></a> &nbsp;·&nbsp;
   <a href="#test-hardware">Hardware</a> &nbsp;·&nbsp;
   <a href="#get-started"><b>Get started</b></a> &nbsp;·&nbsp;
   <a href="#models">Models</a> &nbsp;·&nbsp;
-  <a href="ARCHITECTURE.md">How it works</a> &nbsp;·&nbsp;
+  <a href="docs/architecture.md">How it works</a> &nbsp;·&nbsp;
   <a href="docs/benchmark.md">Methodology</a>
 </p>
 
-**Run models larger than your RAM or VRAM.** WICI-InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run **DeepSeek-V4.1-Flash-1017** and **Muse-Spark-Open** from SSD. Direct GGUF expert reads, bounded caches, and prompt batching reduce the cost of accessing weights while retaining browser chat and an OpenAI-compatible API.
+**Run models larger than your RAM or VRAM.** WICI-InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run **DeepSeek-V4.1-Flash-1017** and **Muse-Spark-Open** from SSD. Expert packs, bounded caches, and prompt batching reduce the cost of accessing weights while retaining GGUF, browser chat, and an OpenAI-compatible API.
 
 ## Performance benchmarks
 
 **4K prompt tier · 256 output tokens · decode measured over tokens 129–256.** The 4K label describes the prompt tier, not the model's context-window capacity; actual input token counts depend on the chat template.
 
 All rates are in **token/s**, with higher values indicating faster inference. **llama.cpp is the baseline (1.00×)**. **Speedup** below each Colibri and **WICI-InferSSD** rate is `engine throughput / llama.cpp throughput` on the same system. Values above 1.00× are faster; values below 1.00× are slower.
-
-Mac InferSSD results were updated on **2026-10-26** using the optimized GGUF runtime; the comparison engines retain their recorded baseline runs. The remaining InferSSD rows are historical results from the source README, not a new benchmark of every platform on current main.
 
 These results compare complete inference configurations. In the Mac DeepSeek runs, Colibri uses official Safetensors on CPU, while the GGUF engines use Metal with CPU experts. See [measurement details](docs/benchmark.md) for the scope of the comparison.
 
@@ -88,28 +86,18 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 
 ## Get started
 
-Both platforms use the `main` branch and the same typed launcher. Download every GGUF shard for your chosen model; the current runtime reads expert ranges directly from GGUF and does not require a separate expert pack.
+Build from source using the branch for your platform. The setup guide includes pack creation, cache settings, and server launch commands.
 
-```sh
-git clone https://github.com/wici-ai/inferssd.git
-cd inferssd
-cmake --preset linux-cuda
-cmake --build build-linux-cuda --target llama-server --parallel 4
-python3 -m pip install ./framework
-python3 scripts/engine-resources.py --build build-linux-cuda --output engine-resources.json
-inferssd launch --help
-```
-
-| Platform | CMake preset | Setup |
+| Platform | Branch | Setup |
 | --- | --- | --- |
-| macOS / Metal (Apple Silicon) | `macos-metal` | [Mac setup](docs/mac-launcher.md) |
-| Linux / NVIDIA CUDA | `linux-cuda` | [Typed launcher and resource policy](framework/README.md) |
-
-Use `build-macos-metal` in the build and resource commands on Mac. The launcher guide covers the required model, settings, resource policy and output directory; `inferssd launch --execute` starts the owned server. Mac currently uses static measured settings; online adaptive control on Mac remains future work.
+| macOS / Metal (Apple Silicon) | `Support-Mac-ssd-llama` | [Mac setup](docs/quickstart.md#apple-silicon) · [Muse on Mac](docs/quickstart.md#muse-on-mac) |
+| Linux / NVIDIA CUDA | `main` | [Linux setup](docs/quickstart.md#linux--nvidia) |
 
 `x86_64` covers Intel and AMD CPUs; DGX Spark (GB10) uses `ARM64`. CUDA identifies the NVIDIA GPU backend, not the CPU vendor. The x86_64 benchmarks use Intel CPUs.
 
-Allow approximately **505–508 GB per model**, plus working space. Mac requires Xcode/Metal, CMake and Python. Linux requires a compatible CUDA toolkit (development uses CUDA 13.x), CMake, Python, `liburing`, and systemd/cgroup v2. The measured Mac presets target **M5 Max / 48 GB**; choose cache and batch budgets that fit your machine.
+DeepSeek needs approximately **473 GiB of GGUF weights + 269 GiB for the expert pack**. Muse's pack adds approximately **450 GiB** to its GGUF files. Keep the original shards and generate each pack from the exact checkpoint you load.
+
+Mac requires Xcode/Metal, CMake, Ninja, and Python. Linux requires a compatible CUDA toolkit, CMake, Python, and `liburing`; its launcher uses systemd/cgroup v2. The Mac example targets **M5 Max / 48 GB**; choose cache and batch budgets that fit your machine.
 
 ## Models
 
@@ -126,7 +114,12 @@ DeepSeek's **Q8_0 label does not mean every tensor is 8-bit**: routed experts re
 
 Once the server is ready, open its address in your browser or point an OpenAI-compatible client at its `/v1` endpoint.
 
-The example below assumes your server is listening on `127.0.0.1:8080`; use the host and port selected in your launch configuration. Its API base URL is `http://127.0.0.1:8080/v1`.
+| Setup | Browser | API base URL |
+| --- | --- | --- |
+| Mac quick start | `http://127.0.0.1:8080` | `http://127.0.0.1:8080/v1` |
+| Linux quick start | `http://127.0.0.1:18181` | `http://127.0.0.1:18181/v1` |
+
+For the Mac DeepSeek setup, send a request to port `8080`. For Linux, use port `18181`:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -142,18 +135,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ## Further reading
 
-- [How it works](ARCHITECTURE.md): runtime boundaries, model adapters, and backend execution.
+- [How it works](docs/architecture.md): expert packs, caching, batching, and the source map.
 - [Engine configurations](docs/benchmark.md#engine-configurations) and [decode windows / request times](docs/benchmark.md#decode-windows-and-request-time).
 - [Reproducing a result](docs/benchmark.md#reproducing-a-result) and [4K data provenance](docs/benchmark.md#data-provenance).
-
-## Repository layout
-
-- `engine/`: native runtime, ggml backends, model resources and native tests.
-- `framework/`: typed configuration, model adapters, planning and owned execution.
-- `bench/`: benchmark clients and real-device CI.
-- `tests/`, `scripts/` and `docs/`: integration tests, maintenance and documentation.
-
-See [architecture](ARCHITECTURE.md) for module boundaries and [contributing](CONTRIBUTING.md) for checks and review requirements.
 
 ## Contributing
 
@@ -163,4 +147,4 @@ Hardware results and improvements to expert I/O, caching, and batching are welco
 
 Built on [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp), with thanks to their contributors and the model-adaptation community. [Strata](https://github.com/niko1221/strata) and [Colibri](https://github.com/JustVugg/colibri) are related projects exploring accessible local inference.
 
-WICI-InferSSD is licensed under [MIT](LICENSE), with component attribution and third-party exceptions in [NOTICE](NOTICE) and [PROVENANCE.md](PROVENANCE.md). Model weights remain subject to their publishers' licenses; Muse usage must comply with its Model License and Usage Policy.
+WICI-InferSSD is licensed under [Apache-2.0](LICENSE). The upstream llama.cpp/ggml MIT notice is preserved in [NOTICE](NOTICE). Model weights remain subject to their publishers' licenses.
