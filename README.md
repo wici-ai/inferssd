@@ -86,16 +86,16 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 
 ## Get started
 
-Build from source using the branch for your platform. The setup guide includes pack creation, cache settings, and server launch commands.
+Build from `main` for either platform. The setup guide covers source indexing, typed settings, and server launch commands.
 
 | Platform | Branch | Setup |
 | --- | --- | --- |
-| macOS / Metal (Apple Silicon) | `Support-Mac-ssd-llama` | [Mac setup](docs/quickstart.md#apple-silicon) · [Muse on Mac](docs/quickstart.md#muse-on-mac) |
+| macOS / Metal (Apple Silicon) | `main` | [Mac setup](docs/quickstart.md#apple-silicon) · [Muse on Mac](docs/quickstart.md#muse-on-mac) |
 | Linux / NVIDIA CUDA | `main` | [Linux setup](docs/quickstart.md#linux--nvidia) |
 
 `x86_64` covers Intel and AMD CPUs; DGX Spark (GB10) uses `ARM64`. CUDA identifies the NVIDIA GPU backend, not the CPU vendor. The x86_64 benchmarks use Intel CPUs.
 
-DeepSeek needs approximately **473 GiB of GGUF weights + 269 GiB for the expert pack**. Muse's pack adds approximately **450 GiB** to its GGUF files. Keep the original shards and generate each pack from the exact checkpoint you load.
+Historical DeepSeek runs used approximately **473 GiB of GGUF weights + 269 GiB for the expert pack**; Muse's pack added approximately **450 GiB**. The current framework can index GGUF experts directly without a separate pack. When using a pack, keep the original shards and generate it from the exact checkpoint you load.
 
 Mac requires Xcode/Metal, CMake, Ninja, and Python. Linux requires a compatible CUDA toolkit, CMake, Python, and `liburing`; its launcher uses systemd/cgroup v2. The Mac example targets **M5 Max / 48 GB**; choose cache and batch budgets that fit your machine.
 

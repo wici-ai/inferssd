@@ -1,6 +1,6 @@
 # Contributing
 
-Contributions are accepted under the repository's MIT license. No CLA or DCO is required. AI-assisted
+Contributions are accepted under the repository's Apache-2.0 license. No CLA or DCO is required. AI-assisted
 contributions are welcome when the contributor understands the change, reviews it and takes responsibility
 for maintaining it. Support is best effort.
 

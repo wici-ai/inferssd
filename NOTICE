@@ -1,13 +1,19 @@
-InferSSD third-party notices
-=========================
+InferSSD notices
+===============
 
-Existing notices in AUTHORS, licenses/, vendor/ and individual source files
-remain applicable. The project-wide MIT license does not replace component
+Copyright (c) 2026 WiCi AI and the InferSSD contributors
+
+InferSSD additions and modifications are licensed under the Apache License,
+Version 2.0. See LICENSE. Components with their own license notices retain
+those licenses, including the MIT-licensed upstream engine.
+
+Existing notices in AUTHORS, engine/licenses/, engine/vendor/ and individual source files
+remain applicable. The project-wide Apache-2.0 license does not replace component
 licenses. No model weights are distributed with this source tree.
 
 1. llama.cpp and ggml
    https://github.com/ggml-org/llama.cpp
-   Copyright (c) 2023-2026 The ggml authors. MIT (LICENSE).
+   Copyright (c) 2023-2026 The ggml authors. MIT (engine/LICENSE).
 
 2. DeepSeek V4 support
    https://github.com/nisparks/llama.cpp
@@ -38,7 +44,12 @@ licenses. No model weights are distributed with this source tree.
    The imported glibc-derived copies retain their LGPL notices, as listed below;
    this attribution does not relicense those imported copies.
 
-MIT permission notice for entries 2-5
+6. ik_llama.cpp
+   https://github.com/ikawrakow/ik_llama.cpp
+   Copyright (c) 2024-2025 The ik_llama.cpp authors.
+   The MIT permission notice below applies.
+
+MIT permission notice for entries 1-6
 ------------------------------------
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -65,7 +76,7 @@ Historical reference math
 The former K3 parity component and its glibc/fdlibm reference math were removed
 from the live source before v0.1.0. Their original authorship and LGPL notices
 remain with the source snapshots in Git history; those historical notices are
-not replaced by the repository's MIT license.
+not replaced by the repository's Apache-2.0 license.
 
 External runtime dependencies
 -----------------------------
