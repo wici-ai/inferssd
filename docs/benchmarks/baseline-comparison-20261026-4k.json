@@ -1,0 +1,231 @@
+{
+  "date": "2026-10-26",
+  "input": "reported-comparison-20261026-4k.json",
+  "method": "engine throughput / llama.cpp throughput; displayed summary rates; ROUND_HALF_UP to two decimal places",
+  "rows": [
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "MacBook Pro",
+      "metric": "prefill_tps",
+      "baseline": "5.929",
+      "engines": {
+        "Colibri": {
+          "rate": "0.708",
+          "speedup": "0.12\u00d7"
+        },
+        "SSD-Llama": {
+          "rate": "26.270",
+          "speedup": "4.43\u00d7"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "MacBook Pro",
+      "metric": "decode_tps",
+      "baseline": "0.873",
+      "engines": {
+        "Colibri": {
+          "rate": "0.437",
+          "speedup": "0.50\u00d7"
+        },
+        "SSD-Llama": {
+          "rate": "2.704",
+          "speedup": "3.10\u00d7"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "RTX 5060 Ti",
+      "metric": "prefill_tps",
+      "baseline": "6.95",
+      "engines": {
+        "Colibri": {
+          "rate": "7.02",
+          "speedup": "1.01\u00d7"
+        },
+        "SSD-Llama": {
+          "rate": "75.1",
+          "speedup": "10.81\u00d7"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "RTX 5060 Ti",
+      "metric": "decode_tps",
+      "baseline": "0.242",
+      "engines": {
+        "Colibri": {
+          "rate": "0.9",
+          "speedup": "3.72\u00d7"
+        },
+        "SSD-Llama": {
+          "rate": "2.55",
+          "speedup": "10.54\u00d7"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "RTX 5090",
+      "metric": "prefill_tps",
+      "baseline": "8.06",
+      "engines": {
+        "Colibri": {
+          "rate": "39.21",
+          "speedup": "4.86\u00d7"
+        },
+        "SSD-Llama": {
+          "rate": "164.5",
+          "speedup": "20.41\u00d7"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "RTX 5090",
+      "metric": "decode_tps",
+      "baseline": "0.867",
+      "engines": {
+        "Colibri": {
+          "rate": "1.878",
+          "speedup": "2.17\u00d7"
+        },
+        "SSD-Llama": {
+          "rate": "7.27",
+          "speedup": "8.39\u00d7"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "DGX Spark",
+      "metric": "prefill_tps",
+      "baseline": "2.73",
+      "engines": {
+        "Colibri": {
+          "rate": "0.826",
+          "speedup": "0.30\u00d7"
+        },
+        "SSD-Llama": {
+          "rate": "127.5",
+          "speedup": "46.70\u00d7"
+        }
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "DGX Spark",
+      "metric": "decode_tps",
+      "baseline": "1.608",
+      "engines": {
+        "Colibri": {
+          "rate": "0.356",
+          "speedup": "0.22\u00d7"
+        },
+        "SSD-Llama": {
+          "rate": "7.26",
+          "speedup": "4.51\u00d7"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "MacBook Pro",
+      "metric": "prefill_tps",
+      "baseline": "3.140",
+      "engines": {
+        "SSD-Llama": {
+          "rate": "12.480",
+          "speedup": "3.97\u00d7"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "MacBook Pro",
+      "metric": "decode_tps",
+      "baseline": "0.153",
+      "engines": {
+        "SSD-Llama": {
+          "rate": "0.944",
+          "speedup": "6.17\u00d7"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "RTX 5060 Ti",
+      "metric": "prefill_tps",
+      "baseline": "3.41",
+      "engines": {
+        "SSD-Llama": {
+          "rate": "52.1",
+          "speedup": "15.28\u00d7"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "RTX 5060 Ti",
+      "metric": "decode_tps",
+      "baseline": "0.059",
+      "engines": {
+        "SSD-Llama": {
+          "rate": "0.219",
+          "speedup": "3.71\u00d7"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "RTX 5090",
+      "metric": "prefill_tps",
+      "baseline": "4.0",
+      "engines": {
+        "SSD-Llama": {
+          "rate": "106.6",
+          "speedup": "26.65\u00d7"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "RTX 5090",
+      "metric": "decode_tps",
+      "baseline": "0.155",
+      "engines": {
+        "SSD-Llama": {
+          "rate": "1.520",
+          "speedup": "9.81\u00d7"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "DGX Spark",
+      "metric": "prefill_tps",
+      "baseline": "1.74",
+      "engines": {
+        "SSD-Llama": {
+          "rate": "83.9",
+          "speedup": "48.22\u00d7"
+        }
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "DGX Spark",
+      "metric": "decode_tps",
+      "baseline": "0.120",
+      "engines": {
+        "SSD-Llama": {
+          "rate": "2.14",
+          "speedup": "17.83\u00d7"
+        }
+      }
+    }
+  ]
+}

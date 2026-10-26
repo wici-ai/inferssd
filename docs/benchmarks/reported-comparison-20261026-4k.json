@@ -1,0 +1,267 @@
+{
+  "updated": "2026-10-26",
+  "source": "Imported comparison matrix with tester-supplied RTX 5090 baseline updates and measured optimized Mac results on 2026-10-26.",
+  "scope": "4K prompt tier only, for MacBook Pro, RTX 5060 Ti, RTX 5090, and DGX Spark. Rates retain the supplied precision. Linux results are reported summaries, not newly verified raw runs.",
+  "units": "token/s",
+  "cell_format": "prefill / decode",
+  "decode_definition": "All platforms generate 256 output tokens; decode throughput is measured over tokens 129\u2013256: 128 / (T256 - T128).",
+  "notes": [
+    "This snapshot supersedes the earlier reported 4K rates; earlier protocols and thermal observations are not assumed to describe the latest runs.",
+    "Muse MacBook Pro llama.cpp uses a different chat template and input count; the reported 3.140 prefill value differs slightly from the archived rate.",
+    "RTX 5090 CPU is corrected to Intel Core Ultra 5 230F and SSD interface to PCIe Gen5 x4. Previously supplied 10 cores/10 threads, 32 GB VRAM, and 2 TB storage are retained.",
+    "Linux decode-window convention confirmed by the tester on 2026-10-25; existing throughput values are unchanged.",
+    "Mac InferSSD rows were measured on 2026-10-26 with the optimized GGUF configuration; other Mac engines remain historical baselines. See mac-optimized-20261026-4k.json for exact counts, settings and metrics.",
+    "RTX 5090 DeepSeek llama.cpp 8.06/0.867, Colibri 39.21/1.878 and Muse llama.cpp 4.0/0.155 supplied by the tester on 2026-10-26; no new baseline runs performed here."
+  ],
+  "hardware_configurations": [
+    {
+      "hardware": "MacBook Pro",
+      "cpu": "Apple M5 Max",
+      "cpu_cores": 18,
+      "core_layout": "6 super + 12 performance",
+      "gpu": "40-core Apple GPU",
+      "unified_memory_gb": 48,
+      "storage_tb": 2,
+      "storage_model": "Apple internal SSD",
+      "storage_connection": "Internal",
+      "display_size_inches": 16,
+      "os": "macOS 26.4"
+    },
+    {
+      "hardware": "RTX 5060 Ti",
+      "cpu": "Intel Core 3 100U",
+      "gpu": "NVIDIA RTX 5060 Ti",
+      "system_ram_gb": 8,
+      "vram_gb": 16,
+      "ssd_interface": "PCIe Gen4 x4",
+      "storage_tb": 2,
+      "storage_capacity_note": "2 TB, cross-checked against archived setup records on 2026-10-26.",
+      "cpu_cores": 6,
+      "cpu_threads": 8,
+      "core_layout": "2 performance + 4 efficient",
+      "storage_model": "ZHITAI TiPro9000"
+    },
+    {
+      "hardware": "RTX 5090",
+      "cpu": "Intel Core Ultra 5 230F",
+      "cpu_cores": 10,
+      "cpu_threads": 10,
+      "gpu": "NVIDIA RTX 5090",
+      "system_ram_gb": 16,
+      "vram_gb": 32,
+      "storage_tb": 2,
+      "ssd_interface": "PCIe Gen5 x4",
+      "core_layout": "6 performance + 4 efficient",
+      "storage_model": "ZHITAI TiPro9000",
+      "memory_configuration_note": "16 GB dataset configuration retained at the tester's direction on 2026-10-26. Archived experiments also include a 32 GB host and a 13.98 GB process limit; mapping to the final summary awaits the per-run audit."
+    },
+    {
+      "hardware": "DGX Spark",
+      "soc": "NVIDIA GB10",
+      "unified_memory_gb": 128,
+      "storage": "Native NVMe",
+      "reported_bandwidth_gib_s": [
+        8.4,
+        11
+      ],
+      "storage_tb": 4,
+      "cpu_cores": 20,
+      "cpu_architecture": "Arm64",
+      "cpu_spec_source": "https://docs.nvidia.com/dgx/dgx-spark/hardware.html",
+      "storage_model": "Samsung MZALC4T0HBL1",
+      "ssd_interface": "PCIe Gen5 x4",
+      "gpu": "NVIDIA Blackwell GPU",
+      "core_layout": "10 Cortex-X925 + 10 Cortex-A725"
+    }
+  ],
+  "rows": [
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "MacBook Pro",
+      "prompt_tier": "4K",
+      "llama.cpp": {
+        "status": "completed",
+        "prefill_tps": "5.929",
+        "decode_tps": "0.873"
+      },
+      "Colibri": {
+        "status": "completed",
+        "prefill_tps": "0.708",
+        "decode_tps": "0.437"
+      },
+      "SSD-Llama": {
+        "status": "completed",
+        "prefill_tps": "26.270",
+        "decode_tps": "2.704",
+        "source": "mac-optimized-20261026-4k.json"
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "RTX 5060 Ti",
+      "prompt_tier": "4K",
+      "llama.cpp": {
+        "status": "completed",
+        "prefill_tps": "6.95",
+        "decode_tps": "0.242"
+      },
+      "Colibri": {
+        "status": "completed",
+        "prefill_tps": "7.02",
+        "decode_tps": "0.9"
+      },
+      "SSD-Llama": {
+        "status": "completed",
+        "prefill_tps": "75.1",
+        "decode_tps": "2.55"
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "RTX 5090",
+      "prompt_tier": "4K",
+      "llama.cpp": {
+        "status": "completed",
+        "prefill_tps": "8.06",
+        "decode_tps": "0.867"
+      },
+      "Colibri": {
+        "status": "completed",
+        "prefill_tps": "39.21",
+        "decode_tps": "1.878"
+      },
+      "SSD-Llama": {
+        "status": "completed",
+        "prefill_tps": "164.5",
+        "decode_tps": "7.27"
+      }
+    },
+    {
+      "model": "DeepSeek V4.1 Flash-1017 763B",
+      "hardware": "DGX Spark",
+      "prompt_tier": "4K",
+      "llama.cpp": {
+        "status": "completed",
+        "prefill_tps": "2.73",
+        "decode_tps": "1.608"
+      },
+      "Colibri": {
+        "status": "completed",
+        "prefill_tps": "0.826",
+        "decode_tps": "0.356"
+      },
+      "SSD-Llama": {
+        "status": "completed",
+        "prefill_tps": "127.5",
+        "decode_tps": "7.26"
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "MacBook Pro",
+      "prompt_tier": "4K",
+      "llama.cpp": {
+        "status": "completed",
+        "prefill_tps": "3.140",
+        "decode_tps": "0.153"
+      },
+      "Colibri": {
+        "status": "not_supported"
+      },
+      "SSD-Llama": {
+        "status": "completed",
+        "prefill_tps": "12.480",
+        "decode_tps": "0.944",
+        "source": "mac-optimized-20261026-4k.json"
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "RTX 5060 Ti",
+      "prompt_tier": "4K",
+      "llama.cpp": {
+        "status": "completed",
+        "prefill_tps": "3.41",
+        "decode_tps": "0.059"
+      },
+      "Colibri": {
+        "status": "not_supported"
+      },
+      "SSD-Llama": {
+        "status": "completed",
+        "prefill_tps": "52.1",
+        "decode_tps": "0.219"
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "RTX 5090",
+      "prompt_tier": "4K",
+      "llama.cpp": {
+        "status": "completed",
+        "prefill_tps": "4.0",
+        "decode_tps": "0.155"
+      },
+      "Colibri": {
+        "status": "not_supported"
+      },
+      "SSD-Llama": {
+        "status": "completed",
+        "prefill_tps": "106.6",
+        "decode_tps": "1.520"
+      }
+    },
+    {
+      "model": "Muse-Spark-Open 816B",
+      "hardware": "DGX Spark",
+      "prompt_tier": "4K",
+      "llama.cpp": {
+        "status": "completed",
+        "prefill_tps": "1.74",
+        "decode_tps": "0.120"
+      },
+      "Colibri": {
+        "status": "not_supported"
+      },
+      "SSD-Llama": {
+        "status": "completed",
+        "prefill_tps": "83.9",
+        "decode_tps": "2.14"
+      }
+    }
+  ],
+  "protocol_confirmation": {
+    "date": "2026-10-25",
+    "source": "Maintainer-confirmed benchmark protocol",
+    "hardware": [
+      "RTX 5060 Ti",
+      "RTX 5090",
+      "DGX Spark"
+    ],
+    "generated_tokens": 256,
+    "decode_window_tokens": 128,
+    "decode_window": "last"
+  },
+  "hardware_review": {
+    "date": "2026-10-26",
+    "scope": "Hardware metadata and README presentation only; throughput values are unchanged.",
+    "source_records": [
+      {
+        "record": "default-config-20261020.md",
+        "sha256": "5e4976cc7bf3013b2f7a1c71ee9d7a1ebfcee8ce6d0a3847caa4b8ee323f771f",
+        "description": "Archived benchmark setup record; hardware section cross-checked, historical rates not substituted for the final dataset."
+      },
+      {
+        "record": "results-spark-20261021.md",
+        "sha256": "d48e988596fee5d1dabcb4e1868667753e39668d9a925aa70758a1c8005af5d9",
+        "description": "Archived benchmark setup record; hardware section cross-checked, historical rates not substituted for the final dataset."
+      }
+    ],
+    "confirmation": "The tester retained the 16 GB RTX 5090 dataset label and confirmed that current Muse baseline values reflect subsequent completed measurements using tokens 129\u2013256."
+  },
+  "readme_import": {
+    "repository": "wici-ai/ssd-llama",
+    "commit": "a755355f82bcc52869dd3c1085db59210ced068b",
+    "path": "README.md"
+  }
+}
