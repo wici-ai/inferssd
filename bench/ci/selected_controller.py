@@ -18,7 +18,7 @@ from ci.impact import fingerprint, plan as selection, selected, validate
 from ci.private_controller import API, admission, bind_context, check_body, context, current_ci, source_manifest, writable
 from ci.selected_aggregate import aggregate, operator_aggregate
 from ci.selection_contract import JOB, execution_scope, FUNCTIONAL_MODE
-from ci import selection_dispatch
+from ci import private_controller, selection_dispatch
 
 
 def changed_paths(api, pr):
@@ -180,7 +180,8 @@ class ChildMetadataAPI:
 
     Only a missing/known generic title may be pending. Every returned response
     is retained before classification; strict identity still gates all use.
-    This never retries a dispatch, cancellation, or failed HTTP request.
+    Only the canonical transport retries failed GETs, within this observer's
+    deadline. This observer never retries a dispatch or cancellation.
     """
 
     def __init__(self, api, child, artifacts, phase, *, sleep=None, clock=None):
@@ -203,7 +204,10 @@ class ChildMetadataAPI:
             return self.api.call(path, data, method)
         deadline = self.clock() + 10
         for attempt in range(6):
-            run = self.api.call(path)
+            if type(self.api) is private_controller.API:
+                run = self.api.call(path, deadline=deadline)
+            else:
+                run = self.api.call(path)
             actual = {key: run.get(key) for key in self.expected} if isinstance(run, dict) else {}
             differences = {key: dict(expected=value, actual=actual.get(key))
                 for key, value in self.expected.items()

@@ -77,6 +77,19 @@ acknowledgement or completion. Cancellation is idempotent; this never repeats a
 dispatch or measurement. A successful acknowledgement is not posted again.
 The record retains the Actions result and points to its summary/artifacts.
 
+Hosted API reads and the local `gh` adapter share `read_retry.py`'s error
+classification and finite backoff policy. Only a GET without a request body may
+recover from the listed temporary HTTP/transport failures, with at most three
+attempts and no cached authorization. Hosted calls share one monotonic scheduling
+budget (normally 30 seconds), each socket timeout is at most 10 seconds, and child
+metadata reads also retain their existing 10-second observation deadline.
+Socket inactivity timeouts do not establish a hard wall limit against a peer
+that continually delivers bytes. The local adapter reserves bounded process
+draining within its request budget. Permission denials, certificate failures and
+unknown errors stop immediately. Transport retries never repeat a dispatch,
+cancellation or model request. Fixed metadata diagnostics retain failures and
+recovery without URLs, credentials or response bodies.
+
 Open the exact parent run in the private `inferssd-device-ci` repository, then
 read its Actions Summary. For each required executed model it shows base and PR
 0–128/128–256 decode token/s and `(PR / base - 1) * 100%`, plus TTFT, prefill

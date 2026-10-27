@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+import urllib.error
 
 import pytest
 
@@ -830,3 +831,80 @@ def test_child_metadata_does_not_retry_an_ambiguous_post(operator):
     with pytest.raises(OSError, match="ambiguous write"):
         observed.call("actions/runs/73/cancel", {}, method="POST")
     assert api.calls == [("actions/runs/73", None, None), ("actions/runs/73/cancel", {}, "POST")] and pauses == []
+
+
+@pytest.mark.parametrize("wrong_job", [False, True])
+def test_real_canonical_get_retry_keeps_child_identity_and_every_successful_snapshot(
+    operator, monkeypatch, capsys, wrong_job
+):
+    a = operator
+    a.args.artifacts.mkdir(exist_ok=True)
+    now, pauses, calls = [100.0], [], []
+
+    def sleep(seconds):
+        pauses.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(controller.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(controller.time, "sleep", sleep)
+    pending = dict(a.child, status="queued", conclusion=None,
+                   display_title="InferSSD reviewed integration smoke")
+    exact = dict(a.child, status="queued", conclusion=None)
+    if wrong_job:
+        exact["display_title"] = "integration-" + "e" * 32
+    replies = [pending, 500, exact]
+    canonical = controller.private_controller
+
+    def open_request(request, *, timeout):
+        assert request.get_method() == "GET" and request.data is None
+        calls.append(timeout)
+        value = replies.pop(0)
+        if value == 500:
+            raise urllib.error.HTTPError(request.full_url, 500, "never-log", {}, None)
+        return io.BytesIO(json.dumps(value).encode())
+
+    monkeypatch.setattr(canonical.urllib.request, "urlopen", open_request)
+    child = dict(id=73, workflow_id=91, controller_sha=a.env["GITHUB_SHA"], job_id="f" * 32)
+    api = canonical.API(POLICY["controller_repository"], "never-log-secret")
+    observed = controller.ChildMetadataAPI(api, child, a.args.artifacts, "test")
+    if wrong_job:
+        with pytest.raises(ValueError, match="identity differs"):
+            observed.call("actions/runs/73")
+        assert observed.identity_confirmed is False
+    else:
+        assert observed.call("actions/runs/73") == exact
+        assert observed.identity_confirmed is True
+    assert calls == [10, 8, 7.75] and pauses == [2, .25]
+    snapshots = [load(path) for path in sorted(a.args.artifacts.glob("child-metadata-*.json"))]
+    assert [row["run"] for row in snapshots] == [pending, exact]
+    rows = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    assert [row["decision"] for row in rows] == ["return", "retry", "return"]
+    assert rows[1]["http_status"] == 500
+    assert "never-log" not in json.dumps(rows)
+
+
+def test_real_child_get_cannot_extend_the_ten_second_title_budget(operator, monkeypatch):
+    a = operator
+    a.args.artifacts.mkdir(exist_ok=True)
+    now, calls = [100.0], []
+    monkeypatch.setattr(controller.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(controller.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    canonical = controller.private_controller
+    pending = dict(a.child, status="queued", conclusion=None, display_title="")
+
+    def open_request(request, *, timeout):
+        calls.append(timeout)
+        if len(calls) == 1:
+            return io.BytesIO(json.dumps(pending).encode())
+        now[0] += timeout
+        raise TimeoutError("synthetic read timeout")
+
+    monkeypatch.setattr(canonical.urllib.request, "urlopen", open_request)
+    child = dict(id=73, workflow_id=91, controller_sha=a.env["GITHUB_SHA"], job_id="f" * 32)
+    observed = controller.ChildMetadataAPI(canonical.API(POLICY["controller_repository"], "synthetic"),
+                                          child, a.args.artifacts, "test")
+    with pytest.raises(TimeoutError):
+        observed.call("actions/runs/73")
+    assert calls == [10, 8] and now[0] == 110
+    assert observed.identity_confirmed is False
+    assert len(list(a.args.artifacts.glob("child-metadata-*.json"))) == 1
