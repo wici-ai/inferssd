@@ -686,3 +686,147 @@ def test_cancel_reentry_does_not_trust_a_prior_receipt_for_another_run(operator)
     assert controller.cancel_children(a.args, a.env) == 1
     recheck = load(next(a.args.artifacts.glob("cancellation-recheck-*.json")))
     assert recheck["results"]["cloud-5090-dispatch.json"]["prior_outcome_unknown"] is True
+
+
+class MetadataAPI:
+    def __init__(self, runs):
+        self.runs, self.calls = list(runs), []
+
+    def call(self, path, data=None, method=None):
+        self.calls.append((path, data, method))
+        if method == "POST":
+            return None
+        assert path == "actions/runs/73" and data is None
+        value = self.runs.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return copy.deepcopy(value)
+
+
+def metadata_observer(a, runs):
+    a.args.artifacts.mkdir(exist_ok=True)
+    child = dict(id=73, workflow_id=91, controller_sha=a.env["GITHUB_SHA"], job_id="f" * 32)
+    api, pauses, now = MetadataAPI(runs), [], [0]
+    def sleep(seconds):
+        pauses.append(seconds)
+        now[0] += seconds
+    observed = controller.ChildMetadataAPI(api, child, a.args.artifacts, "test",
+                                          sleep=sleep, clock=lambda: now[0])
+    return observed, api, pauses
+
+
+@pytest.mark.parametrize("title", [None, "", "InferSSD reviewed integration smoke"])
+@pytest.mark.parametrize("status", ["queued", "requested"])
+def test_child_metadata_pending_title_requires_later_full_identity_and_retains_every_get(operator, title, status):
+    a = operator
+    pending = dict(a.child, display_title=title, status=status, conclusion=None)
+    expected = dict(a.child, name="a workflow label is not the run title", actor={"login": "github-actions[bot]"})
+    observed, api, pauses = metadata_observer(a, [pending, expected])
+    assert observed.call("actions/runs/73") == expected
+    rows = [load(path) for path in sorted(a.args.artifacts.glob("child-metadata-*.json"))]
+    assert [row["run"] for row in rows] == [pending, expected]
+    assert rows[0]["differences"] == {"display_title": dict(expected=a.child["display_title"], actual=title)}
+    assert rows[0]["pending_title"] is True and rows[1]["differences"] == {}
+    assert rows[1]["pending_title"] is False and pauses == [2]
+    assert api.calls == [("actions/runs/73", None, None)] * 2
+
+
+@pytest.mark.parametrize("field,value", [("id", 74), ("workflow_id", 92), ("workflow_id", True),
+    ("path", ".github/workflows/other.yml"), ("event", "push"), ("head_branch", "other"),
+    ("head_sha", "0" * 40), ("run_attempt", 2), ("run_attempt", True),
+    ("display_title", "integration-" + "e" * 32), ("display_title", "unknown title"),
+    ("display_title", " ")])
+def test_child_metadata_definite_identity_mismatch_fails_without_wait_or_post(operator, field, value):
+    a = operator
+    run = dict(a.child, status="queued", conclusion=None, display_title="")
+    run[field] = value
+    observed, api, pauses = metadata_observer(a, [run])
+    with pytest.raises(ValueError, match="identity differs"):
+        controller.selection_dispatch.cancel(observed, observed.child)
+    row = load(next(a.args.artifacts.glob("child-metadata-*.json")))
+    assert row["run"] == run and field in row["differences"] and row["pending_title"] is False
+    assert len(api.calls) == 1 and pauses == []
+
+
+@pytest.mark.parametrize("status,conclusion", [("in_progress", None), ("completed", "failure"),
+    ("completed", "success"), ("queued", "failure"), ("waiting", None)])
+def test_child_metadata_generic_title_is_not_pending_after_execution_or_conclusion(operator, status, conclusion):
+    a = operator
+    observed, api, pauses = metadata_observer(a, [dict(a.child, status=status, conclusion=conclusion,
+                                                      display_title="InferSSD reviewed integration smoke")])
+    with pytest.raises(ValueError, match="identity differs"):
+        observed.call("actions/runs/73")
+    assert len(api.calls) == 1 and pauses == []
+
+
+def test_child_metadata_observation_is_finite_and_never_accepts_placeholder(operator):
+    a = operator
+    pending = dict(a.child, status="queued", conclusion=None, display_title=None)
+    observed, api, pauses = metadata_observer(a, [pending] * 6)
+    with pytest.raises(TimeoutError, match="finite observation"):
+        controller.selection_dispatch.cancel(observed, observed.child)
+    assert len(api.calls) == len(list(a.args.artifacts.glob("child-metadata-*.json"))) == 6
+    assert pauses == [2] * 5
+
+
+def test_child_metadata_missing_immutable_field_and_transport_error_do_not_retry(operator):
+    a = operator
+    run = dict(a.child, status="queued", conclusion=None, display_title="")
+    del run["head_sha"]
+    observed, api, pauses = metadata_observer(a, [run])
+    with pytest.raises(ValueError, match="head_sha"):
+        observed.call("actions/runs/73")
+    assert len(api.calls) == 1 and pauses == []
+    observed, api, pauses = metadata_observer(a, [OSError("synthetic transport failure")])
+    with pytest.raises(OSError, match="transport"):
+        observed.call("actions/runs/73")
+    assert len(api.calls) == 1 and pauses == []
+
+
+def test_child_metadata_cancel_posts_once_only_after_exact_observed_identity(operator, monkeypatch):
+    a = operator
+    child = cancellation_dispatch(a)
+    pending = dict(a.child, status="queued", conclusion=None, display_title="")
+    exact = dict(a.child, status="in_progress", conclusion=None)
+    api = MetadataAPI([pending, exact, dict(a.child)])
+    monkeypatch.setattr(controller, "API", lambda *args, **kwargs: api)
+    monkeypatch.setattr(controller.time, "sleep", lambda _: None)
+    assert controller.cancel_children(a.args, a.env) == 1
+    original = (a.args.artifacts / "cancellation-requests.json").read_bytes()
+    assert load(a.args.artifacts / "cancellation-cloud-5090-dispatch-attempt.json")["child_sha256"] == impact.fingerprint(child)
+    assert controller.cancel_children(a.args, a.env) == 0
+    assert (a.args.artifacts / "cancellation-requests.json").read_bytes() == original
+    assert api.calls == [("actions/runs/73", None, None)] * 2 + [
+        ("actions/runs/73/cancel", {}, "POST"), ("actions/runs/73", None, None)]
+    assert len(list(a.args.artifacts.glob("child-metadata-*.json"))) == 3
+
+
+def test_child_metadata_snapshot_failure_cannot_authorize_cancel(operator, monkeypatch):
+    observed, api, _ = metadata_observer(operator, [operator.child])
+    monkeypatch.setattr(controller, "save", lambda *args: (_ for _ in ()).throw(OSError("snapshot storage failed")))
+    with pytest.raises(OSError, match="snapshot storage"):
+        controller.selection_dispatch.cancel(observed, observed.child)
+    assert api.calls == [("actions/runs/73", None, None)]
+
+
+def test_child_metadata_wait_uses_returned_id_without_redispatch(operator):
+    a = operator
+    pending = dict(a.child, status="queued", conclusion=None, display_title="")
+    observed, api, pauses = metadata_observer(a, [pending, a.child])
+    assert controller.selection_dispatch.wait(observed, observed.child) == a.child
+    assert api.calls == [("actions/runs/73", None, None)] * 2 and pauses == [2]
+
+
+def test_child_metadata_does_not_retry_an_ambiguous_post(operator):
+    observed, api, pauses = metadata_observer(operator, [operator.child])
+    with pytest.raises(ValueError, match="fully observed exact identity"):
+        observed.call("actions/runs/73/cancel", {}, method="POST")
+    assert api.calls == []
+    observed.call("actions/runs/73")
+    def failed_post(path, data=None, method=None):
+        api.calls.append((path, data, method))
+        raise OSError("ambiguous write")
+    api.call = failed_post
+    with pytest.raises(OSError, match="ambiguous write"):
+        observed.call("actions/runs/73/cancel", {}, method="POST")
+    assert api.calls == [("actions/runs/73", None, None), ("actions/runs/73/cancel", {}, "POST")] and pauses == []
