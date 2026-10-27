@@ -8,6 +8,7 @@ import run_final
 from ci.compare import comparable, compare_pair
 from ci.contract import digest, load, save
 from ci.private_controller import API, source_manifest
+from ci.isolated_device import manifest_read_path
 from ci.selection_lifetime import ParentWatch
 from ci.selected_receipt import receipt
 from ci import selected_preflight, model_admission
@@ -39,8 +40,9 @@ def run(args):
                       config_sha256=args.config_sha256, control_revision=config["control_revision"],
                       control_manifest_sha256=config["control_manifest_sha256"], job_id=args.job_id)
         (output / "selected-config.json").write_bytes(args.config.read_bytes())
-        manifest = load(config["manifest_path"])
-        (output / "root-manifest.json").write_bytes(Path(config["manifest_path"]).read_bytes())
+        manifest_path = manifest_read_path(config)
+        manifest = load(manifest_path)
+        (output / "root-manifest.json").write_bytes(manifest_path.read_bytes())
         needs = runtime_requirements(config)
         scope = execution_scope(config)
         if scope is not None:

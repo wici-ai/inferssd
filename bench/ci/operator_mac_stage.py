@@ -335,6 +335,10 @@ def receive_packet(expected_sha256, incoming, deadline):
                         common.fail("Mac side effective settings differ")
                 for side, payload in payloads.items():
                     common.write(source / ("settings-" + model + "-" + side + ".ssd"), payload)
+            runner_manifest = source / "manifest.json"
+            common.write(runner_manifest, (staging / "manifest.json").read_bytes())
+            if common.sha(runner_manifest) != config["manifest_sha256"]:
+                common.fail("Mac runner manifest copy differs from the broker manifest")
             source.chmod(0o555)
             worker_idle(broker)
             current = os.stat(broker["lock"], follow_symlinks=False)
@@ -343,11 +347,15 @@ def receive_packet(expected_sha256, incoming, deadline):
                 common.fail("Mac broker/policy/lease/STOP changed during staging")
             common.remaining(deadline)
             common.write(target_manifest, (staging / "manifest.json").read_bytes())
+            if common.sha(target_manifest) != common.sha(runner_manifest):
+                common.fail("Mac private and runner manifest copies differ")
             common.write(target_config, (staging / "config.json").read_bytes())
             proof = dict(schema_version=1, status="passed", device="local-mbp", job_id=job, root_uid=0,
                 candidate=request["candidate"], source_tree=request["source_tree"], source=extracted["candidate"], sources=extracted,
                 root_input_sha256=expected_sha256, envelope_sha256=common.sha(staging / "envelope.json"),
                 config_sha256=common.sha(target_config), manifest_sha256=common.sha(target_manifest),
+                runner_manifest=dict(path=str(runner_manifest), sha256=common.sha(runner_manifest),
+                    broker_path=str(target_manifest), broker_sha256=common.sha(target_manifest), root_owned_readonly=True),
                 control_revision=config["control_revision"], control_manifest_sha256=config["control_manifest_sha256"],
                 original_lock=[held.st_dev, held.st_ino], policy_sha256=request["policy_sha256"],
                 operator_stage_sha256=request["operator_stage_sha256"], machine_identity=physical,

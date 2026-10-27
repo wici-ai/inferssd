@@ -210,15 +210,13 @@ def bound(config, manifest, job_id):
 
 
 def protected_binding(path, expected_config, expected_plan, job_id):
-    from ci.isolated_device import protected
+    from ci.isolated_device import protected, protected_manifest
     config_path = protected(path)
     if digest(config_path) != expected_config:
         raise ValueError("root-staged configuration hash differs")
     config = load(config_path)
     if config["selection_plan_sha256"] != expected_plan:
         raise ValueError("workflow expected plan is missing or differs")
-    manifest_path = protected(config["manifest_path"])
-    if digest(manifest_path) != config["manifest_sha256"]:
-        raise ValueError("root broker manifest hash differs")
+    manifest_path = protected_manifest(config)
     bound(config, load(manifest_path), job_id)
     return config

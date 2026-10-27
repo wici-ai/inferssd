@@ -700,6 +700,11 @@ def validate_root_receipt(envelope, inputs, device, receipt):
                 or recovered.get("status") != "ready"
                 or recovered.get("config_sha256") != request["broker_config_sha256"]):
             raise ValueError("actual Mac physical/resource/recovery receipt differs")
+        expected_manifest = dict(path="/Library/InferSSD-CI/inputs/operator-" + job["job_id"] + "/manifest.json",
+            sha256=required["manifest_sha256"], broker_path="/Library/InferSSD-CI/private/job-manifests/" + job["job_id"] + ".json",
+            broker_sha256=required["manifest_sha256"], root_owned_readonly=True)
+        if receipt.get("runner_manifest") != expected_manifest:
+            raise ValueError("actual Mac runner/private manifest copies differ")
 
 
 def dispatch(args, api=None):

@@ -183,6 +183,7 @@ def admitted(tmp_path, git_source, monkeypatch):
 
 def test_mac_receive_seals_without_precreating_worker_job(admitted):
     fake, request, files, constants = admitted
+    constants["MANIFESTS"].chmod(0o700)
     before = (fake / "lock").stat()
     raw, expected = packet(request, files)
     proof = mac.receive(expected, io.BytesIO(raw))
@@ -191,6 +192,14 @@ def test_mac_receive_seals_without_precreating_worker_job(admitted):
     assert proof["resource_enforcement"] == "sampled-UMA-guard-not-hard-cgroup"
     assert not (fake / "jobs" / job).exists()
     assert (constants["MANIFESTS"] / (job + ".json")).is_file()
+    private = constants["MANIFESTS"] / (job + ".json")
+    mirror = constants["SROOT"] / ("operator-" + job) / "manifest.json"
+    assert mirror.read_bytes() == private.read_bytes()
+    assert stat.S_IMODE(mirror.stat().st_mode) == 0o444
+    assert stat.S_IMODE(mirror.parent.stat().st_mode) == 0o555
+    assert stat.S_IMODE(constants["MANIFESTS"].stat().st_mode) == 0o700
+    assert proof["runner_manifest"] == dict(path=str(mirror), sha256=prepare.digest(mirror),
+        broker_path=str(private), broker_sha256=prepare.digest(private), root_owned_readonly=True)
     assert (constants["IROOT"] / (job + ".json")).is_file()
     assert (fake / "lock").stat().st_ino == before.st_ino
     assert not (fake / "STOP").exists()
@@ -199,6 +208,20 @@ def test_mac_receive_seals_without_precreating_worker_job(admitted):
     assert stat.S_IMODE(Path(proof["source"]["root"]).stat().st_mode) == 0o555
     with pytest.raises(ValueError, match="fresh Mac job"):
         mac.receive(expected, io.BytesIO(raw))
+
+
+def test_mac_receive_refuses_changed_runner_copy_before_publishing(admitted, monkeypatch):
+    _, request, files, constants = admitted
+    original = mac.common.write
+    mirror = constants["SROOT"] / ("operator-" + request["job_id"]) / "manifest.json"
+    def write(path, raw, *args, **kwargs):
+        return original(path, raw + b" " if path == mirror else raw, *args, **kwargs)
+    monkeypatch.setattr(mac.common, "write", write)
+    raw, expected = packet(request, files)
+    with pytest.raises(ValueError, match="runner manifest copy"):
+        mac.receive(expected, io.BytesIO(raw))
+    assert not (constants["IROOT"] / (request["job_id"] + ".json")).exists()
+    assert not (constants["MANIFESTS"] / (request["job_id"] + ".json")).exists()
 
 
 @pytest.mark.parametrize("mutation", ["machine", "lease", "stop", "resources", "protocol", "source-tree", "template-policy", "member", "busy"])
@@ -345,7 +368,7 @@ def test_recovery_precedes_lease_and_sealing_holds_original_inode(admitted, monk
     assert order == ["recovered", "sealed", "sealed"]
 
 
-@pytest.mark.parametrize("mutation", ["machine", "lock", "hard-cgroup", "recovery"])
+@pytest.mark.parametrize("mutation", ["machine", "lock", "hard-cgroup", "recovery", "mirror-path", "mirror-sha", "mirror-private-path", "mirror-private-sha", "mirror-writable", "mirror-missing"])
 def test_mac_sender_rejects_wrong_physical_or_recovery_receipt(tmp_path, git_source, mutation):
     from test_ci_operator_prepare import successful_receipt
     args, api = mac_prepared_fixture(tmp_path, git_source)
@@ -356,10 +379,20 @@ def test_mac_sender_rejects_wrong_physical_or_recovery_receipt(tmp_path, git_sou
     proof.update(sources={side:dict(value,root_owned_readonly=True) for side,value in request['sources'].items()},
         machine_identity=MACHINE, original_lock=[1,2], resource_enforcement='sampled-UMA-guard-not-hard-cgroup',
         broker_recovery=dict(status='ready',config_sha256=request['broker_config_sha256']))
+    job = proof["job_id"]
+    proof["runner_manifest"] = dict(path="/Library/InferSSD-CI/inputs/operator-" + job + "/manifest.json",
+        sha256=proof["manifest_sha256"], broker_path="/Library/InferSSD-CI/private/job-manifests/" + job + ".json",
+        broker_sha256=proof["manifest_sha256"], root_owned_readonly=True)
     prepare.validate_root_receipt(envelope, inputs, "local-mbp", proof)
     if mutation == "machine":proof['machine_identity'] = dict(MACHINE,hardware_model='other')
     elif mutation == "lock":proof['original_lock'] = [1,3]
     elif mutation == "hard-cgroup":proof['resource_enforcement'] = 'hard-cgroup'
-    else:proof['broker_recovery']['config_sha256'] = '0'*64
+    elif mutation == "recovery":proof['broker_recovery']['config_sha256'] = '0'*64
+    elif mutation == "mirror-path":proof['runner_manifest']['path'] = '/tmp/manifest.json'
+    elif mutation == "mirror-sha":proof['runner_manifest']['sha256'] = '0'*64
+    elif mutation == "mirror-private-path":proof['runner_manifest']['broker_path'] = '/tmp/private.json'
+    elif mutation == "mirror-private-sha":proof['runner_manifest']['broker_sha256'] = '0'*64
+    elif mutation == "mirror-writable":proof['runner_manifest']['root_owned_readonly'] = False
+    else:proof.pop('runner_manifest')
     with pytest.raises(ValueError,match='actual Mac'):
         prepare.validate_root_receipt(envelope, inputs, "local-mbp", proof)
