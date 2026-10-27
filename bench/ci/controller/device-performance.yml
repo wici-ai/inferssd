@@ -28,7 +28,7 @@ jobs:
         with:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
-      - name: Admit sealed operator source and Linux execution scope
+      - name: Admit sealed operator source and physical execution scope
         env:
           GITHUB_TOKEN: ${{ github.token }}
           INFERSSD_CI_ENABLED: ${{ vars.INFERSSD_CI_ENABLED }}

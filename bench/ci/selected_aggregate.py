@@ -13,7 +13,7 @@ from ci.staged_numerical import validate_csv
 from ci.staged_benchmark import verify_stopped, verify_runtime
 from ci.staged_checkpoint import mapped_files, native_settings
 from ci.selected_preflight import launch as preflight_launch, retained
-from ci.selected_receipt import retained_typed_settings
+from ci.selected_receipt import retained_typed_settings, mac_runtime_images, mac_stopped
 from ci import model_admission
 
 
@@ -63,6 +63,25 @@ def runtime_retained(root, config, side, model, folder, launch, receipt_path):
                 effective["native_launch_policy"]["typed_values"], config["sides"][side], model, build,
                 root / ("build-" + side) / "freeze-manifest.json", config.get("manifest_path"))):
         raise ValueError("retained typed inputs/host/receipt identity differs")
+    if config.get("paths", {}).get("platform") == "darwin":
+        manifest = load(root / "root-manifest.json")
+        probes = [load(folder / name) for name in ("runtime-before.json", "runtime-after.json")]
+        images = mac_runtime_images(config, manifest, side, model, launch, started, probes)[0]
+        mac_stopped(config, manifest, load(folder / "stopped.json"))
+        expected = [{"path": image["runtime_path"], "sha256": image["sha256"]}
+                    for image in [build["binary"], *build["images"]] if image["runtime_path"] in images]
+        if (build["binary"]["runtime_path"] not in images
+                or sorted(runtime["build"]["loaded_libraries"], key=lambda x: x["path"]) != sorted(expected, key=lambda x: x["path"])
+                or effective["ambient_environment"] != launch["environment"]
+                or effective.get("native_resource_enforcement") != "root-sampled-worker-rss-processes-host-reserve"):
+            raise ValueError("retained Mac loaded images or declared environment differs")
+        known = {image["path"] for image in expected}
+        systems = effective.get("system_images", [])
+        if {image["path"] for image in systems} != set(images) - known or any(not image["path"].startswith(
+                ("/usr/", "/lib/", "/lib64/", "/System/Library/", "/Library/Apple/", "/opt/inferssd-ci-toolchains/"))
+                for image in systems):
+            raise ValueError("retained Mac system-image inventory differs")
+        return runtime
     previous = None
     for name in ("runtime-before.json", "runtime-after.json"):
         probe = load(folder / name)
@@ -170,7 +189,8 @@ def device_report(root, plan, policy, job, child, scope=None):
             folder = root / data["raw"]
             model_data = config["sides"][side]["models"][model]
             launch = model_data["smoke"] if data["reused_functional"] else preflight_launch(
-                model_data["benchmarks"][tier], side, required=config.get("validation_mode") == PERFORMANCE_MODE)
+                model_data["benchmarks"][tier], side, required=config.get("validation_mode") == PERFORMANCE_MODE,
+                job_root=config["sides"][side]["paths"]["job_root"] if config["paths"]["platform"] == "darwin" else None)
             runtime_retained(root, config, side, model, folder, launch,
                              root / "preflight" / model / tier / side / "comparison-receipt.json")
     gate = load(root / "numerical/selected-numerical.json")
@@ -287,8 +307,12 @@ def operator_aggregate(plan, policy, artifacts, jobs, children, scope):
     complete = not errors and all(cell["status"] in ("passed", "not-required")
                                   and cell.get("performance") != "deferred-not-in-this-run"
                                   and not cell.get("performance_deferred_tiers") for cell in rows)
+    linux = [row for row in executed if row["device"] != "local-mbp"]
+    mac = [row for row in executed if row["device"] == "local-mbp"]
     return dict(schema_version=1, purpose="operator-selected-report-only", passed=status == "passed",
-                status=status, linux_scoped_status=status,
+                status=status, execution_scoped_status=status,
+                linux_scoped_status=outcome(linux) if linux else "not-in-this-run",
+                mac_scoped_status=outcome(mac) if mac else "not-in-this-run",
                 full_impact_coverage_complete=complete, pr_publication="not-enabled",
                 source_identity="sealed-source-not-current-pr", **scope,
                 selection_plan_sha256=fingerprint(plan), cells=rows, errors=errors, formal_samples=0)

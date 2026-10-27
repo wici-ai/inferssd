@@ -29,8 +29,10 @@ def collect_log(session, stage, output):
                 target.write(data)
                 if offset > 64 * 1024 * 1024:
                     raise ValueError("native smoke log bound exceeded")
-                if eof or not data:
+                if eof:
                     break
+                if not data:
+                    raise ValueError("stopped smoke output did not reach EOF")
 
 
 

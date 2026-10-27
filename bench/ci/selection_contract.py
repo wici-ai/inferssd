@@ -16,7 +16,7 @@ from ci.impact import CASES, device_requirements, fingerprint, validate
 
 
 JOB = re.compile(r"[0-9a-f]{32}")
-OPERATOR_DEVICES = ("cloud-5090", "dgx-spark")
+OPERATOR_DEVICES = DEVICES
 FUNCTIONAL_MODE = "functional-numerical"
 PERFORMANCE_MODE = "functional-numerical-performance"
 
@@ -35,7 +35,7 @@ def execution_scope(value):
     if (value.get("validation_mode") not in (FUNCTIONAL_MODE, PERFORMANCE_MODE) or not isinstance(devices, list)
             or not devices or any(not isinstance(device, str) or device not in OPERATOR_DEVICES for device in devices)
             or len(set(devices)) != len(devices)):
-        raise ValueError("operator scope requires a nonempty unique Linux device subset")
+        raise ValueError("operator scope requires a nonempty unique physical device subset")
     return dict(validation_mode=value["validation_mode"], execution_devices=devices)
 
 
@@ -94,11 +94,23 @@ def requirements(config):
     platform = "darwin" if device == "local-mbp" else "linux"
     if config["numerical"]["backend"] != ("MTL0" if platform == "darwin" else "CUDA0"):
         raise ValueError("selected numerical backend differs from physical device")
+    if platform == "darwin":
+        match = re.fullmatch(r"/Library/InferSSD-CI/private/job-manifests/([0-9a-f]{32})\.json", config["manifest_path"])
+        resources = config["host"]["resources"]
+        if (match is None or set(resources) != {"max_processes", "memory_budget_bytes", "host_reserve_bytes"}
+                or any(type(v) is not int or v <= 0 for v in resources.values())):
+            raise ValueError("Mac requires its fixed root manifest and explicit sampled resource policy")
+        mac_root = "/Library/InferSSD-CI/jobs/" + match[1]
     for side in ("base", "candidate"):
         spec = config["sides"][side]
         if (spec["revision"] != plan[side] or spec["paths"]["platform"] != platform
                 or set(spec["models"]) != set(needs["models"])):
             raise ValueError("staged side does not cover the exact selected source/models")
+        if platform == "darwin" and (spec["paths"].get("job_root") != mac_root
+                or spec["paths"]["build"] != mac_root + "/work/" + side
+                or spec["paths"]["frozen"] != mac_root + "/frozen/" + side
+                or spec["paths"]["source"] != "/Library/InferSSD-CI/inputs/operator-" + match[1] + "/" + side):
+            raise ValueError("Mac source/build/freeze paths must bind this exact job side")
         for model, data in spec["models"].items():
             tiers = needs["performance"].get(model, {}).get("tiers", [])
             if set(data.get("benchmarks", {})) != set(tiers):
@@ -134,6 +146,9 @@ def bind(config, manifest, plan, policy):
         manifest["stages"] = linux_stages(config, needs, sides)
     else:
         manifest["selection_resource_policy"] = config["host"]["resources"]
+        lock = manifest.get("selection_lock_identity")
+        if not isinstance(lock, list) or len(lock) != 2 or any(type(v) is not int or v < 0 for v in lock):
+            raise ValueError("Mac manifest must bind the original root device lease")
     manifest["selection"] = selection_identity(config)
     return config, manifest
 
@@ -185,6 +200,12 @@ def bound(config, manifest, job_id):
     if (not JOB.fullmatch(job_id) or manifest.get("job_id") != job_id
             or manifest.get("selection") != expected):
         raise ValueError("root broker manifest/config/selected source binding differs")
+    if config["paths"]["platform"] == "darwin":
+        lock = manifest.get("selection_lock_identity")
+        if (manifest.get("selection_resource_policy") != config["host"]["resources"]
+                or not isinstance(lock, list) or len(lock) != 2
+                or any(type(v) is not int or v < 0 for v in lock)):
+            raise ValueError("Mac root resource/lease binding differs")
     return needs
 
 

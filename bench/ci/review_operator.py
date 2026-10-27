@@ -320,9 +320,20 @@ def advance(args, api, policy, path, record):
         prepared = path.parent / path.stem / "prepared"
         if record["status"] == "queued":
             profiles = load(args.inputs)
+            declared = profiles.get("devices")
+            if (
+                profiles.get("schema_version") != 1
+                or not isinstance(declared, dict)
+                or not declared
+                or not set(declared) <= set(prepare.DEVICES)
+            ):
+                raise ValueError("nonempty reviewed device profiles required")
+            if digest(args.inputs) != record["inputs_sha256"]:
+                raise Stale("trusted profiles changed while reading execution scope")
+            execution = [device for device in prepare.DEVICES if device in declared]
             if any(
-                profiles["devices"][d]["ssh"].get("sudo_password_required") is not False
-                for d in prepare.DEVICES
+                declared[d]["ssh"].get("sudo_password_required") is not False
+                for d in execution
             ):
                 raise Waiting(
                     "background staging requires existing root access or the fixed narrow NOPASSWD helper"
@@ -336,7 +347,7 @@ def advance(args, api, policy, path, record):
                     inputs=args.inputs,
                     output=prepared,
                     policy=args.policy,
-                    execution_devices=list(prepare.DEVICES),
+                    execution_devices=execution,
                     gh=args.gh,
                     **{k: fresh[k] for k in ("base", "head", "candidate")},
                 ),

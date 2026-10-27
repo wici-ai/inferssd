@@ -12,8 +12,9 @@ unless that author independently has current source-maintainer permission.
 Ordinary issue comments, labels, quoted code/examples and prose are not commands.
 The test authorization does not approve a merge or publish a source PR check.
 
-The impact plan selects models and checks. This deployment executes cloud-5090
-and DGX Spark; Mac cells remain explicitly deferred. Required performance uses
+The impact plan selects models and checks. Reviewed execution profiles may select
+cloud-5090, DGX Spark and local-mbp; each omitted device stays explicitly deferred.
+Required performance uses
 the unchanged Azure 512-tier prompt and decode 256, once per base and candidate
 on the same device/model/settings. It does not add 4K or formal benchmark samples.
 Functional-only success cannot satisfy a required performance comparison.
@@ -24,8 +25,8 @@ to a new performance run. Submit a fresh `/ci test` Comment review to authorize
 the current head. `/ci cancel` remains the cancellation command.
 
 The poller runs on the trusted preparation host with its existing gh login and
-reviewed source Git repository and two-device profiles. It does not run on or
-depend on the offline tested M5. Its persistent state, exact command and process
+reviewed source Git repository and explicit device profiles. Its service must
+remain available independently of the tested M5. Its persistent state, exact command and process
 supervisor must be deployed on the chosen always-online preparation host; this
 source change alone does not establish that the background process is running.
 
@@ -77,18 +78,19 @@ dispatch or measurement. A successful acknowledgement is not posted again.
 The record retains the Actions result and points to its summary/artifacts.
 
 Open the exact parent run in the private `inferssd-device-ci` repository, then
-read its Actions Summary. For each required Linux model it shows base and PR
+read its Actions Summary. For each required executed model it shows base and PR
 0–128/128–256 decode token/s and `(PR / base - 1) * 100%`, plus TTFT, prefill
 and whole decode. A positive throughput change means faster; a lower TTFT is
-better. Missing, failed and inconclusive performance stays non-passing. Mac
-deferral and full impact coverage are reported separately from Linux acceptance.
+better. Missing, failed and inconclusive performance stays non-passing. Device
+deferrals and full impact coverage are reported separately from each execution scope.
 The `selected-aggregate-RUN-ATTEMPT` artifact contains `aggregate.json`;
 `selected-control-RUN-ATTEMPT` retains the raw two-sided requests, timestamps,
 settings/source/prompt identities, observations and cleanup evidence.
 
 These request metrics exclude model/vocabulary loading before server readiness.
-The configured DeepSeek/Muse Linux profiles do not establish Mac cache or
-unconfigured model (for example Nemotron) correctness or performance coverage.
+Each profile establishes only its own hardware, models, resource constraints and
+cache settings. Mac uses the root executor's sampled RSS/process/free-memory
+guards; its receipts do not assert Linux cgroup hard UMA or swap isolation.
 
 Preparation/staging interruption and ambiguous dispatch are retained without
 automatic replay. A saved, already validated `dispatched-run.json` allows a
@@ -99,8 +101,10 @@ sample or best result selection exists. Queue authorization expires after24h
 the existing workflow limit. Original completed attempts remain recorded after
 a source update and cannot satisfy a new head.
 
-Activation still requires deploying the final trusted controller/wheel, exact
-root policy/source/model staging and current job before/after probes on both
-Linux devices, then one real review→prepare→dispatch→Actions result plus a
-finite cancellation/cleanup case. Mac remains deferred and formal samples0/16.
+Activation requires deploying the final trusted controller/wheel, exact root
+policy/source/model staging and current job before/after probes on each enabled
+device, then one real review→prepare→dispatch→Actions result plus a finite
+cancellation/cleanup case. Mac uses the fixed SSH entry and recovery contract in
+[RECOVERY.md](macos-sandbox/RECOVERY.md). Code, a runner's online state and existing
+short readiness receipts alone do not establish a new performance run. Formal samples0/16.
 This module's contract tests execute none of those physical operations.

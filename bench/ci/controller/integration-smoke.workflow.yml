@@ -154,7 +154,8 @@ jobs:
         shell: bash
         run: |
           {
-            echo 'This attempt is an integration smoke test of one reviewed, root-staged source.'
-            echo 'Performance acceptance: false. Formal benchmark samples: 0.'
-            echo 'It does not replace the three-device PR performance gate or establish no regression.'
+            echo 'This child executes one exact root-staged device job; runner readiness is not model or performance acceptance.'
+            echo 'Selected jobs retain actual functional, numerical and required 512/decode256 pairs in integration.json and raw artifacts.'
+            echo 'Use the exact parent Actions Summary for the scoped verdict; failed or inconclusive measurements do not pass.'
+            echo 'Standalone readiness does not establish performance or full impact coverage. Formal benchmark samples: 0.'
           } >> "$GITHUB_STEP_SUMMARY"

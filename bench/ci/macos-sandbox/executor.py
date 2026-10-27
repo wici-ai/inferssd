@@ -482,8 +482,9 @@ class Session:
                 self.lock_fd = None
 
 
-def serve_connection(config, peer, broker_lifeline=None):
-    require(peer_identity(peer) == (config["runner_uid"], config["runner_gid"]), "unauthorized coordinator UID")
+def serve_connection(config, peer, broker_lifeline=None, broker_identity=None):
+    identity = peer_identity(peer)
+    require(identity in ((0, 0), (config["runner_uid"], config["runner_gid"])), "unauthorized coordinator UID")
     session, pending = None, b""
     try:
         while True:
@@ -503,6 +504,12 @@ def serve_connection(config, peer, broker_lifeline=None):
                 line, pending = pending.split(b"\n", 1)
                 request = json.loads(line)
                 if session is None:
+                    if request == {"schema_version": 1, "operation": "broker.status"}:
+                        require(identity == (0, 0) and broker_identity is not None,
+                                "root managed-broker status required")
+                        peer.sendall(json.dumps(broker_identity, sort_keys=True).encode() + b"\n")
+                        return
+                    require(identity == (config["runner_uid"], config["runner_gid"]), "root cannot open candidate jobs")
                     require(request.get("operation") == "job.open" and request.get("schema_version") == 1, "job.open required")
                     session = Session(config, peer, request["job_id"], broker_lifeline)
                     result = session.identity()
@@ -519,8 +526,20 @@ def serve_connection(config, peer, broker_lifeline=None):
             session.close()
 
 
-def serve(config):
+def serve(config, *, management_fd=None, bootstrap_lease_fd=None):
     require(config.get("executor", {}).get("enabled") is True, "stage executor remains disabled pending native proof")
+    # This is separate from the original device lease, which remains owned by
+    # each job guardian. Forked guardians retain the management lock too, so a
+    # dead broker cannot be replaced before its last guardian has exited.
+    if management_fd is None:
+        import recover
+        management_fd = recover.management_lock()
+    identity = {"schema_version": 1, "status": "ready", "protocol": "mac-executor-v1",
+                "broker_birth": birth(os.getpid()),
+                "config_sha256": core.sha(core.BASE / "control/config.json"),
+                "installed_files": dict(config["installed_files"]),
+                "lock_dev_inode": config["lock_dev_inode"],
+                "worker_uid": config["worker_uid"], "runner_uid": config["runner_uid"]}
     path = core.BASE / "control" / "executor.sock"
     require(not path.exists(), "broker socket already exists; inspect its owner")
     for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -530,6 +549,8 @@ def serve(config):
     os.chown(path, 0, config["runner_gid"])
     path.chmod(0o660)
     listener.listen(1)
+    if bootstrap_lease_fd is not None:
+        os.close(bootstrap_lease_fd)
     try:
         while True:
             peer, _ = listener.accept()
@@ -544,7 +565,7 @@ def serve(config):
                 os.setsid()
                 code = 0
                 try:
-                    serve_connection(config, peer, child_life)
+                    serve_connection(config, peer, child_life, identity)
                 except (ValueError, RuntimeError, OSError) as error:
                     code = 1
                     try:
@@ -566,6 +587,7 @@ def serve(config):
     finally:
         listener.close()
         path.unlink()
+        os.close(management_fd)
 
 
 def main():

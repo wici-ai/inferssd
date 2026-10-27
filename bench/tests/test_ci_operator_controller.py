@@ -507,7 +507,7 @@ def test_summary_shows_both_decode_windows_signed_percent_and_ttft_direction():
     assert "0–128 base tok/s" in text and "128–256 base tok/s" in text
     assert "+10.000%" in text and "-10.000%" in text and "lower TTFT is better" in text
     assert "Request TTFT seconds" in text and "Native prefill tok/s" in text and "Whole decode tok/s" in text
-    assert "Declared Linux scope: **inconclusive**" in text and "deferred tiers: 4096" in text
+    assert "Declared device scope: **inconclusive**" in text and "deferred tiers: 4096" in text
     assert "template IDs SHA" in text and "conditions/settings SHA" in text and "0/16" in text
 
 

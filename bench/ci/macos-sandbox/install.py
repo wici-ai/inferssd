@@ -110,8 +110,12 @@ def main():
     # Service account creation is deliberately separate from runner registration.
     user(*ACCOUNTS[0],BASE/'runner',resume=ACCOUNTS[0][0]in resume_accounts);user(*ACCOUNTS[1],pathlib.Path('/var/empty'),resume=ACCOUNTS[1][0]in resume_accounts)
     os.chown(BASE/'runner',62001,62001)
-    for name in ('supervisor.py','verify.py','stage_guard.py','executor.py','client.py','stage_models.py','verify_broker.py'):
+    for name in ('supervisor.py','verify.py','stage_guard.py','executor.py','client.py','stage_models.py','verify_broker.py','recover.py'):
         q=BASE/'control'/name;shutil.copyfile(HERE/name,q);q.chmod(0o755)
+    # A separate reviewed operator bootstrap may bind a forced SSH key and
+    # narrow sudo rule to these fixed entries. Installation grants no access.
+    for name in ('operator-ssh-entry','operator-root-entry'):
+        q=BASE/'control'/name;shutil.copyfile(HERE/'operator_entry.py',q);q.chmod(0o755)
     for name in ('probe.py','positive.py','disconnect.py','disconnect-client.py','metal-probe.mm'):
         q=BASE/'public'/name;shutil.copyfile(HERE/name,q);q.chmod(0o444)
     profile=(HERE/'worker.sb').read_text()

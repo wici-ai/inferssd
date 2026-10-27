@@ -92,6 +92,7 @@ def args(tmp_path):
     inputs.write_text(
         json.dumps(
             {
+                "schema_version": 1,
                 "devices": {
                     d: {"ssh": {"sudo_password_required": False}}
                     for d in entry.prepare.DEVICES
@@ -229,10 +230,49 @@ def test_prepared_then_staged_then_fresh_dispatch(api, args, monkeypatch):
     assert calls == ["prepare", "stage", "dispatch"] and value["status"] == "running"
 
 
+@pytest.mark.parametrize("devices", [
+    ["cloud-5090", "dgx-spark"], ["local-mbp"],
+    ["cloud-5090", "dgx-spark", "local-mbp"],
+])
+def test_review_prepares_only_explicit_current_profile_scope(api, args, monkeypatch, devices):
+    args.inputs.write_text(json.dumps(dict(schema_version=1, devices={
+        device: dict(ssh=dict(sudo_password_required=False)) for device in reversed(devices)
+    })))
+    path, value = record(api, args)
+    prepared = []
+    monkeypatch.setattr(entry, "fetch_objects", lambda *_: None)
+    monkeypatch.setattr(entry.prepare, "prepare", lambda actual, **_: prepared.append(actual.execution_devices))
+    monkeypatch.setattr(entry.prepare, "stage", lambda *_, **__: None)
+    monkeypatch.setattr(entry.prepare, "dispatch", lambda *_, **__: api.run)
+    entry.advance(args, api, POLICY, path, value)
+    assert value["status"] == "running" and prepared == [devices]
+
+
+@pytest.mark.parametrize("devices", [{}, {"unknown": {}}, ["local-mbp"]])
+def test_review_refuses_invalid_profile_scope_before_prepare(api, args, monkeypatch, devices):
+    args.inputs.write_text(json.dumps(dict(schema_version=1, devices=devices)))
+    path, value = record(api, args)
+    monkeypatch.setattr(entry, "fetch_objects", lambda *_: pytest.fail("invalid scope fetch"))
+    monkeypatch.setattr(entry.prepare, "prepare", lambda *_, **__: pytest.fail("invalid scope prepare"))
+    entry.advance(args, api, POLICY, path, value)
+    assert value["status"] == "interrupted" and "device profiles" in value["error"]
+
+
+def test_review_refuses_changed_profile_scope_before_prepare(api, args, monkeypatch):
+    path, value = record(api, args)
+    args.inputs.write_text(json.dumps(dict(schema_version=1, devices={
+        "local-mbp": dict(ssh=dict(sudo_password_required=False))
+    })))
+    monkeypatch.setattr(entry, "fetch_objects", lambda *_: pytest.fail("changed profile fetch"))
+    entry.advance(args, api, POLICY, path, value)
+    assert value["status"] == "stale" and "profile/policy changed" in value["error"]
+
+
 def test_background_never_prompts_or_stores_sudo_password(api, args, monkeypatch):
     args.inputs.write_text(
         json.dumps(
             {
+                "schema_version": 1,
                 "devices": {
                     d: {"ssh": {"sudo_password_required": True}}
                     for d in entry.prepare.DEVICES

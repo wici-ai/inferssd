@@ -171,7 +171,9 @@ class LightProbeTests(unittest.TestCase):
         from unittest.mock import patch
         from types import SimpleNamespace
         session = object.__new__(executor.Session)
-        session.config = {'worker_uid': 62002, 'executor': {'server_port': 18080}}
+        session.config = {'worker_uid': 62002, 'executor': {
+            'server_port': 18080, 'max_processes': 128,
+            'memory_budget_bytes': 40 << 30, 'host_reserve_bytes': 3 << 30}}
         record = dict(state='running', kind='server', handle='h', worker_pid=123,
                       worker_uid=62002, birth_identity='birth', scope_identity='scope')
         def run(argv, **kwargs):

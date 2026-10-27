@@ -66,6 +66,14 @@ def test_build_freeze_cache_validation_then_sandboxed_version(tmp_path, monkeypa
             events.append(("freeze", stage, fields))
             assert stage == "base-build"
             assert fields == ({"source": paths["build"], "name": "base"} if platform == "darwin" else {})
+            if platform == "darwin":
+                records = {str(p.relative_to(frozen)):dict(size=p.stat().st_size,
+                    sha256=hashlib.sha256(p.read_bytes()).hexdigest(), mode=0o444)
+                    for p in frozen.rglob("*") if p.is_file()}
+                manifest = frozen.parent / "base.manifest.json"
+                manifest.write_text(json.dumps(records)); manifest.chmod(0o444)
+                return dict(path=paths["frozen"], manifest_path=str(manifest),
+                    manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(), file_count=len(records), readonly=True)
             return {"path": paths["frozen"], "host_path": str(frozen), "manifest_sha256": "b" * 64}
 
     if bad_toolchain:

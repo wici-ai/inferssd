@@ -322,8 +322,10 @@ def operator_summary(stream, report):
     """Render verified pair values, never turn missing/inconclusive into green."""
     status = report.get("status", "passed" if report["passed"] else "failed")
     stream.write("## Operator-authorized device report\n\n")
-    stream.write("Declared Linux scope: **" + summary_text(status) + "**. ")
+    stream.write("Declared device scope: **" + summary_text(status) + "**. ")
     stream.write("Full impact coverage: **" + str(report["full_impact_coverage_complete"]).lower() + "**.\n\n")
+    stream.write("Linux scope: **" + summary_text(report.get("linux_scoped_status", "not-verified"))
+                 + "**. Mac scope: **" + summary_text(report.get("mac_scoped_status", "not-verified")) + "**.\n\n")
     stream.write("PR publication is not enabled. These results identify sealed source; they do not attest the current PR head.\n\n")
     for key in ("base", "head", "candidate"):
         if key in report:
@@ -380,13 +382,16 @@ def operator_summary(stream, report):
         stream.write("\nFailure: " + summary_text(report["error"]) + "\n")
     for error in report.get("errors", []):
         stream.write("\nFailure: " + summary_text(error) + "\n")
-    stream.write("\nMac/offline and any 4K deferred coverage are separate from this Linux scope. ")
+    stream.write("\nDevices outside this declared scope and any 4K deferred coverage remain separate. ")
+    if "local-mbp" in report.get("execution_devices", []):
+        stream.write("Mac memory protection monitors worker RSS/process count and host reserve; it does not disable swap or provide a Linux memory.max hard cap. ")
     stream.write("Formal benchmark samples: 0/16. Full comparison values and hashes are in aggregate.json; complete raw and cleanup evidence are in the retained selected-control artifacts.\n")
 
 
 def operator_report(args, env=os.environ):
     """A terminal Actions artifact/summary, with no source status/check writes."""
-    report = dict(schema_version=1, purpose=OPERATOR_PURPOSE, passed=False, status="failed", linux_scoped_status="failed",
+    report = dict(schema_version=1, purpose=OPERATOR_PURPOSE, passed=False, status="failed", execution_scoped_status="failed",
+                  linux_scoped_status="not-verified", mac_scoped_status="not-verified",
                   full_impact_coverage_complete=False, pr_publication="not-enabled",
                   source_identity="sealed-source-not-current-pr", formal_samples=0,
                   cells=[], errors=[])
@@ -428,12 +433,15 @@ def operator_report(args, env=os.environ):
             complete = all(retained.get(device) == children[device]["id"] for device in state["errors"] if device in children)
             if (not set(state["errors"]) <= inconclusive_devices or report.get("status") != "inconclusive"
                     or not complete):
-                report.update(passed=False, status="failed", linux_scoped_status="failed", full_impact_coverage_complete=False)
+                report.update(passed=False, status="failed", execution_scoped_status="failed", full_impact_coverage_complete=False)
+                for platform, devices in (("linux", {"cloud-5090", "dgx-spark"}), ("mac", {"local-mbp"})):
+                    if devices & set(state["errors"]):
+                        report[platform + "_scoped_status"] = "failed"
             report["child_workflow_errors"] = state["errors"]
         report.update(base=envelope["base"], head=envelope["head"], candidate=envelope["candidate"],
                       operator=actor, controller=identity, envelope_sha256=fingerprint(envelope))
     except Exception as error:
-        report.update(passed=False, status="failed", linux_scoped_status="failed", full_impact_coverage_complete=False,
+        report.update(passed=False, status="failed", execution_scoped_status="failed", full_impact_coverage_complete=False,
                       error=f"{type(error).__name__}: {error}")
     save(args.output, report)
     summary = env.get("GITHUB_STEP_SUMMARY")

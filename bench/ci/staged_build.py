@@ -53,6 +53,26 @@ def frozen_aliases(frozen, *, evidence_path=None):
     return aliases
 
 
+def retain_mac_freeze(frozen, evidence_path):
+    """Keep the root Mac freezer's exact bytes for hosted source/image checks."""
+    _, raw = sealed_file(frozen["manifest_path"], limit=32 << 20, contents=True)
+    if hashlib.sha256(raw).hexdigest() != frozen["manifest_sha256"] or frozen.get("readonly") is not True:
+        raise ValueError("Mac root freezer manifest differs from its receipt")
+    records = json.loads(raw)
+    if (not isinstance(records, dict) or type(frozen.get("file_count")) is not int
+            or not frozen["file_count"] or len(records) != frozen["file_count"]):
+        raise ValueError("Mac root freezer inventory count differs")
+    for name, row in records.items():
+        if (not relative(name) or not isinstance(row, dict)
+                or type(row.get("size")) is not int or row["size"] < 0
+                or row.get("mode") not in (0o444, 0o555)
+                or not isinstance(row.get("sha256"), str) or len(row["sha256"]) != 64
+                or any(c not in "0123456789abcdef" for c in row["sha256"])):
+            raise ValueError("Mac root freezer member is invalid")
+    with Path(evidence_path).open("xb") as target:
+        target.write(raw)
+
+
 def alias_identity(path, info, aliases):
     proof = (aliases or {}).get(path)
     if info.st_nlink == 1 and proof is None:
@@ -198,6 +218,10 @@ def run_build(session, side, settings, paths, output, revision):
             raise ValueError("broker freeze path differs from reviewed runtime layout")
         host = Path(absolute(frozen.get("host_path", frozen["path"])))
         aliases = frozen_aliases(frozen, evidence_path=output / "freeze-manifest.json") if paths["platform"] == "linux" and "manifest_path" in frozen else None
+        if paths["platform"] == "darwin":
+            if frozen["manifest_path"] != str(Path(paths["job_root"]) / "frozen" / (side + ".manifest.json")):
+                raise ValueError("Mac root freezer manifest is outside the exact owned side")
+            retain_mac_freeze(frozen, output / "freeze-manifest.json")
         cache, raw = sealed_file(host / "CMakeCache.txt", limit=8 << 20, contents=True, aliases=aliases)
         receipt["toolchain"] = compiler_cache(raw, settings["toolchain"])
         receipt.update(cmake_cache=cache, cmake_cache_sha256=cache["sha256"])

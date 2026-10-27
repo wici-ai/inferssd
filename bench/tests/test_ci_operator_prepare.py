@@ -166,7 +166,7 @@ def prepared_fixture(tmp_path, source, *, devices=None, mode=prepare.LEGACY_MODE
     impact = prepare.plan(["old.cpp", "new.cpp"], POLICY, **identity)
     profiles = {}
     old_job = "f" * 32
-    for index, device in enumerate(prepare.DEVICES):
+    for index, device in enumerate(prepare.LINUX_DEVICES):
         config = template(impact, device)
         config.update(model_identity={m: dict(shards=[dict(host_path="/admitted/" + m + "/model.gguf", runtime_path="/models/" + m + "/model.gguf",
                       device=1, inode=2, bytes=3, mtime_ns=4, ctime_ns=5, historical_sha256="8" * 64)])
@@ -209,7 +209,7 @@ def prepared_fixture(tmp_path, source, *, devices=None, mode=prepare.LEGACY_MODE
                      root_argv=["/usr/bin/python3", "-I", "/opt/inferssd-ci-control/current/bench/ci/operator_stage.py"]))
     (tmp_path / "inputs.json").write_text(json.dumps(dict(schema_version=1, controller_workflow_sha="d" * 40, devices=profiles)))
     args = SimpleNamespace(source=root, inputs=tmp_path / "inputs.json", output=tmp_path / "prepared",
-        policy=Path(__file__).parents[1] / "ci/policy.json", gh="never-used", execution_devices=list(devices or prepare.DEVICES), validation_mode=mode, **identity)
+        policy=Path(__file__).parents[1] / "ci/policy.json", gh="never-used", execution_devices=list(devices or prepare.LINUX_DEVICES), validation_mode=mode, **identity)
     return args, API(root)
 
 
@@ -220,8 +220,8 @@ def test_prepare_keeps_full_impact_but_seals_only_linux_functional_work(tmp_path
     assert envelope["prepared_by"]["id"] == 42
     assert len(envelope["selection"]["cells"]) == 6
     assert all(cell["required"] and cell["performance"]["required"] for cell in envelope["selection"]["cells"])
-    assert envelope["execution_devices"] == list(prepare.DEVICES)
-    for device in prepare.DEVICES:
+    assert envelope["execution_devices"] == list(prepare.LINUX_DEVICES)
+    for device in prepare.LINUX_DEVICES:
         manifest = load(args.output / device / "manifest.json")
         assert set(manifest["sources"]) == {"candidate"}
         assert not any("benchmark" in stage or "preflight" in stage for stage in manifest["stages"])
@@ -258,10 +258,10 @@ def test_staging_requires_exact_root_receipt_and_refuses_reissue(tmp_path, sourc
         called.append(device)
         return successful_receipt(envelope, inputs, device)
     prepare.stage(args, sender)
-    assert called == list(prepare.DEVICES)
+    assert called == list(prepare.LINUX_DEVICES)
     with pytest.raises(FileExistsError):
         prepare.stage(args, sender)
-    assert called == list(prepare.DEVICES)
+    assert called == list(prepare.LINUX_DEVICES)
 
 
 def test_first_stage_failure_does_not_dispatch_or_continue(tmp_path, source):
@@ -275,7 +275,7 @@ def test_first_stage_failure_does_not_dispatch_or_continue(tmp_path, source):
         return dict(successful_receipt(envelope, inputs, device), config_sha256="0" * 64)
     with pytest.raises(ValueError, match="actual root staging"):
         prepare.stage(args, sender)
-    assert called == [prepare.DEVICES[0]]
+    assert called == [prepare.LINUX_DEVICES[0]]
     assert not (args.output / "dispatch-attempt.json").exists()
 
 
@@ -431,7 +431,7 @@ def test_default_mode_is_performance_and_two_sources_are_exact(tmp_path, source)
     del args.validation_mode  # The public default, including the watcher API.
     envelope = prepare.prepare(args, api)
     assert envelope["validation_mode"] == prepare.MODE
-    for device in prepare.DEVICES:
+    for device in prepare.LINUX_DEVICES:
         config = load(args.output / device / "config.json")
         manifest = load(args.output / device / "manifest.json")
         request = load(args.output / device / "root-input.json")
@@ -511,7 +511,7 @@ def test_subset_job_still_binds_full_fixed_root_policy(tmp_path, source):
     args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
     changed_identity(args, "engine/ggml/src/ggml-cuda/ssd/mxfp4-compute-adapter.cpp")
     prepare.prepare(args, api)
-    for device in prepare.DEVICES:
+    for device in prepare.LINUX_DEVICES:
         config = load(args.output / device / "config.json")
         policy = load(args.output / device / "policy.review.json")
         assert set(config["sides"]["candidate"]["models"]) == {"deepseek"}
@@ -523,7 +523,7 @@ def test_subset_job_still_binds_full_fixed_root_policy(tmp_path, source):
 def test_no_enabled_affected_linux_device_refuses_before_output(tmp_path, source):
     args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
     changed_identity(args, "engine/ggml/src/ggml-metal/example.m")
-    with pytest.raises(ValueError, match="no enabled Linux device"):
+    with pytest.raises(ValueError, match="no enabled device"):
         prepare.prepare(args, api)
     assert not args.output.exists()
 
