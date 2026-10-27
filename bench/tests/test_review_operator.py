@@ -85,7 +85,7 @@ def api(monkeypatch):
 
 
 @pytest.fixture
-def args(tmp_path):
+def args(tmp_path, monkeypatch):
     policy = tmp_path / "policy.json"
     policy.write_text(json.dumps(POLICY))
     inputs = tmp_path / "profiles.json"
@@ -100,6 +100,13 @@ def args(tmp_path):
             }
         )
     )
+    def git(_, *argv):
+        if argv[0] == "cat-file":
+            return b""
+        assert argv[:2] == ("diff", "--name-only")
+        return b"bench/ci/review_operator.py\0"
+
+    monkeypatch.setattr(entry.prepare, "git", git)
     return SimpleNamespace(
         source=tmp_path,
         inputs=inputs,
@@ -120,6 +127,23 @@ def record(api, args):
     path = args.state / (entry.key(REPO, 58, api.reviews[0]) + ".json")
     entry.save_record(path, value, "queued")
     return path, value
+
+
+def prepared_envelope(actual, **_):
+    identities = {name: getattr(actual, name) for name in ("base", "head", "candidate")}
+    paths = []
+    for target in (actual.head, actual.candidate):
+        raw = entry.prepare.git(actual.source, "diff", "--name-only", "-z",
+                                "--no-renames", "--no-ext-diff", actual.base, target)
+        paths.extend(item.decode() for item in raw.split(b"\0") if item)
+    impact = entry.plan(paths, POLICY, **identities)
+    actual.output.mkdir(parents=True, exist_ok=True)
+    value = dict(**identities, selection=impact,
+                 selection_plan_sha256=entry.fingerprint(impact),
+                 execution_devices=actual.execution_devices,
+                 jobs={device: {} for device in actual.execution_devices})
+    (actual.output / "envelope.json").write_text(json.dumps(value))
+    return value
 
 
 def test_exact_comment_self_pr_authorization(api):
@@ -199,7 +223,7 @@ def test_hosted_ci_pending_is_persistently_queued(api, args, monkeypatch):
 def test_exact_head_changes_during_staging_never_dispatch(api, args, monkeypatch):
     path, value = record(api, args)
     monkeypatch.setattr(entry, "fetch_objects", lambda *_: None)
-    monkeypatch.setattr(entry.prepare, "prepare", lambda *_, **__: None)
+    monkeypatch.setattr(entry.prepare, "prepare", prepared_envelope)
 
     def stage(*_, **__):
         api.pr["head"]["sha"] = "e" * 40
@@ -216,9 +240,11 @@ def test_prepared_then_staged_then_fresh_dispatch(api, args, monkeypatch):
     path, value = record(api, args)
     calls = []
     monkeypatch.setattr(entry, "fetch_objects", lambda *_: None)
-    monkeypatch.setattr(
-        entry.prepare, "prepare", lambda *_, **__: calls.append("prepare")
-    )
+    def prepare(actual, **kwargs):
+        calls.append("prepare")
+        return prepared_envelope(actual, **kwargs)
+
+    monkeypatch.setattr(entry.prepare, "prepare", prepare)
     monkeypatch.setattr(entry.prepare, "stage", lambda *_, **__: calls.append("stage"))
 
     def dispatch(*_, **__):
@@ -230,22 +256,117 @@ def test_prepared_then_staged_then_fresh_dispatch(api, args, monkeypatch):
     assert calls == ["prepare", "stage", "dispatch"] and value["status"] == "running"
 
 
-@pytest.mark.parametrize("devices", [
-    ["cloud-5090", "dgx-spark"], ["local-mbp"],
-    ["cloud-5090", "dgx-spark", "local-mbp"],
+@pytest.mark.parametrize("exception,devices", [
+    (None, ["cloud-5090", "dgx-spark", "local-mbp"]),
+    ({"pull_request": 58, "head": HEAD}, ["local-mbp"]),
+    ({"pull_request": 64, "head": HEAD}, ["cloud-5090", "dgx-spark"]),
+    ({"pull_request": 58, "head": "e" * 40}, ["cloud-5090", "dgx-spark"]),
 ])
-def test_review_prepares_only_explicit_current_profile_scope(api, args, monkeypatch, devices):
-    args.inputs.write_text(json.dumps(dict(schema_version=1, devices={
+def test_review_scope_uses_exact_exception_or_canonical_default(
+    api, args, monkeypatch, exception, devices
+):
+    profiles = dict(schema_version=1, devices={
         device: dict(ssh=dict(sudo_password_required=False)) for device in reversed(devices)
-    })))
+    })
+    if exception is not None:
+        profiles["temporary_mac_acceptance"] = exception
+    args.inputs.write_text(json.dumps(profiles))
     path, value = record(api, args)
     prepared = []
     monkeypatch.setattr(entry, "fetch_objects", lambda *_: None)
-    monkeypatch.setattr(entry.prepare, "prepare", lambda actual, **_: prepared.append(actual.execution_devices))
+    def prepare(actual, **kwargs):
+        prepared.append(actual.execution_devices)
+        return prepared_envelope(actual, **kwargs)
+
+    monkeypatch.setattr(entry.prepare, "prepare", prepare)
     monkeypatch.setattr(entry.prepare, "stage", lambda *_, **__: None)
     monkeypatch.setattr(entry.prepare, "dispatch", lambda *_, **__: api.run)
     entry.advance(args, api, POLICY, path, value)
     assert value["status"] == "running" and prepared == [devices]
+
+
+@pytest.mark.parametrize("exception,missing", [
+    (None, ["cloud-5090", "dgx-spark"]),
+    ({"pull_request": 64, "head": HEAD}, ["cloud-5090", "dgx-spark"]),
+    ({"pull_request": 58, "head": "e" * 40}, ["cloud-5090", "dgx-spark"]),
+])
+def test_mac_only_profiles_never_silently_reduce_other_required_coverage(
+    api, args, monkeypatch, exception, missing
+):
+    profiles = dict(schema_version=1, devices={
+        "local-mbp": dict(ssh=dict(sudo_password_required=False))
+    })
+    if exception is not None:
+        profiles["temporary_mac_acceptance"] = exception
+    args.inputs.write_text(json.dumps(profiles))
+    path, value = record(api, args)
+    monkeypatch.setattr(entry.prepare, "prepare", lambda *_: pytest.fail("missing profiles"))
+    assert entry.advance(args, api, POLICY, path, value) is False
+    assert value["status"] == "queued"
+    assert value["waiting"] == "required device profiles unavailable: " + ", ".join(missing)
+
+
+def test_default_scope_filters_devices_by_both_complete_source_diffs(api, args, monkeypatch):
+    calls = []
+
+    def git(_, *argv):
+        if argv[0] == "cat-file":
+            return b""
+        calls.append(argv)
+        return (b"README.md\0" if argv[-1] == HEAD else
+                b"engine/ggml/src/ggml-cuda/ssd/kernel.cu\0")
+
+    monkeypatch.setattr(entry.prepare, "git", git)
+    identity = entry.authorization(api, POLICY, 58, 71, HEAD)
+    profiles = entry.load(args.inputs)
+    profiles["devices"].pop("local-mbp")
+    execution, impact = entry.review_scope(args, POLICY, identity, profiles)
+    assert execution == ["cloud-5090", "dgx-spark"]
+    assert impact["changed_paths"] == ["README.md", "engine/ggml/src/ggml-cuda/ssd/kernel.cu"]
+    assert [call[-2:] for call in calls] == [(BASE, HEAD), (BASE, CANDIDATE)]
+
+
+@pytest.mark.parametrize("exception", [
+    None, {}, {"pull_request": True, "head": HEAD},
+    {"pull_request": 58, "head": "bad"},
+    {"pull_request": 58, "head": HEAD, "devices": ["local-mbp"]},
+])
+def test_malformed_temporary_exception_refuses(api, args, monkeypatch, exception):
+    profiles = entry.load(args.inputs)
+    profiles["temporary_mac_acceptance"] = exception
+    args.inputs.write_text(json.dumps(profiles))
+    path, value = record(api, args)
+    monkeypatch.setattr(entry, "fetch_objects", lambda *_: pytest.fail("invalid exception fetch"))
+    entry.advance(args, api, POLICY, path, value)
+    assert value["status"] == "interrupted"
+
+
+@pytest.mark.parametrize("status", ["prepared", "staged"])
+@pytest.mark.parametrize("tamper", ["scope", "plan", "plan-hash", "identity", "jobs"])
+def test_old_prepared_scope_or_impact_cannot_stage_or_dispatch(
+    api, args, monkeypatch, status, tamper
+):
+    path, value = record(api, args)
+    output = path.parent / path.stem / "prepared"
+    prepared_envelope(SimpleNamespace(source=args.source, output=output,
+        execution_devices=list(entry.prepare.DEVICES), base=BASE, head=HEAD, candidate=CANDIDATE))
+    envelope = entry.load(output / "envelope.json")
+    if tamper == "scope":
+        envelope["execution_devices"] = ["local-mbp"]
+    elif tamper == "plan":
+        envelope["selection"]["changed_paths"] = ["README.md"]
+    elif tamper == "plan-hash":
+        envelope["selection_plan_sha256"] = "0" * 64
+    elif tamper == "identity":
+        envelope["head"] = "e" * 40
+    else:
+        envelope["jobs"].pop("dgx-spark")
+    (output / "envelope.json").write_text(json.dumps(envelope))
+    entry.save_record(path, value, status, prepared=str(output))
+    monkeypatch.setattr(entry.prepare, "stage", lambda *_ , **__: pytest.fail("old scope stage"))
+    monkeypatch.setattr(entry.prepare, "dispatch", lambda *_ , **__: pytest.fail("old scope dispatch"))
+    entry.advance(args, api, POLICY, path, value)
+    assert value["status"] == "stale" and "execution scope/impact" in value["error"]
 
 
 @pytest.mark.parametrize("devices", [{}, {"unknown": {}}, ["local-mbp"]])
@@ -296,6 +417,54 @@ def test_repeated_event_is_not_dispatched_again(api, args, monkeypatch):
     assert (
         len(list(args.state.glob("*.json"))) == 3
     )  # profile, policy, one durable event
+
+
+def test_unrelated_profile_wait_does_not_starve_exact_mac_acceptance(api, args, monkeypatch):
+    profiles = entry.load(args.inputs)
+    profiles["devices"] = {"local-mbp": profiles["devices"]["local-mbp"]}
+    profiles["temporary_mac_acceptance"] = dict(pull_request=64, head=HEAD)
+    args.inputs.write_text(json.dumps(profiles))
+    identity = entry.authorization(api, POLICY, 58, 71, HEAD)
+    records = []
+    for index, number in enumerate((58, 64)):
+        value = dict(identity, pr=number, inputs_sha256=entry.digest(args.inputs),
+                     policy_sha256=entry.digest(args.policy))
+        path = args.state / (str(index) * 64 + ".json")
+        entry.save_record(path, value, "queued")
+        records.append((path, value))
+    monkeypatch.setattr(entry, "authorization", lambda *values, **_: dict(identity, pr=values[2]))
+    monkeypatch.setattr(entry, "pages", lambda *_: [])
+    monkeypatch.setattr(entry.prepare, "prepare", prepared_envelope)
+    monkeypatch.setattr(entry.prepare, "stage", lambda *_, **__: None)
+    dispatched = []
+
+    def dispatch(actual, **_):
+        dispatched.append(entry.load(actual.prepared / "envelope.json"))
+        return api.run
+
+    monkeypatch.setattr(entry.prepare, "dispatch", dispatch)
+    entry.tick(args, api)
+    assert entry.load(records[0][0])["status"] == "queued"
+    assert "cloud-5090, dgx-spark" in entry.load(records[0][0])["waiting"]
+    assert entry.load(records[1][0])["status"] == "running"
+    assert len(dispatched) == 1 and dispatched[0]["execution_devices"] == ["local-mbp"]
+
+
+def test_tick_stops_after_one_actual_preparation_attempt(api, args, monkeypatch):
+    path, value = record(api, args)
+    entry.save_record(path, value, "queued")
+    other = dict(value, review_id=72)
+    entry.save_record(args.state / ("0" * 64 + ".json"), other, "queued")
+    monkeypatch.setattr(entry, "pages", lambda *_: [])
+    calls = []
+
+    def advance(*values):
+        calls.append(values[-1]["review_id"])
+        return True
+
+    monkeypatch.setattr(entry, "advance", advance)
+    entry.tick(args, api)
+    assert calls == [72]
 
 
 def test_removed_command_does_not_queue_or_rewrite_history(api, args, monkeypatch):
@@ -425,7 +594,7 @@ def test_external_fork_author_maintainer_review_service_dispatch(
         entry.prepare, "access", lambda *_: ({"login": "service-account"}, "d" * 40)
     )
     monkeypatch.setattr(entry, "fetch_objects", lambda *_: None)
-    monkeypatch.setattr(entry.prepare, "prepare", lambda *_, **__: None)
+    monkeypatch.setattr(entry.prepare, "prepare", prepared_envelope)
     monkeypatch.setattr(entry.prepare, "stage", lambda *_, **__: None)
     monkeypatch.setattr(entry.prepare, "dispatch", lambda *_, **__: api.run)
     entry.advance(args, api, POLICY, path, value)

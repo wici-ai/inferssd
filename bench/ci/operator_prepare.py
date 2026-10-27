@@ -97,7 +97,27 @@ class Gh:
         if result.returncode:
             # gh diagnostics may mention the active auth configuration. Do not
             # retain/forward authentication output into the device package.
-            raise RuntimeError("existing gh login/API request failed: " + path)
+            detail = ""
+            prefix = b"gh-ci-read-retry-v3: local-failure="
+            if len(result.stderr) <= 512 and result.stderr.startswith(prefix):
+                try:
+                    failure = parsed(result.stderr[len(prefix):])
+                except (ValueError, UnicodeError):
+                    failure = None
+                if (
+                    isinstance(failure, dict)
+                    and set(failure) == {"schema_version", "phase", "kind", "errno"}
+                    and type(failure["schema_version"]) is int and failure["schema_version"] == 1
+                    and isinstance(failure["phase"], str) and isinstance(failure["kind"], str)
+                    and failure["phase"] in {"audit-open", "audit-append", "diagnostic-write", "client-read"}
+                    and failure["kind"] in {"storage-exhausted", "unsafe-path", "reap-timeout", "io-failed"}
+                    and (failure["errno"] is None or type(failure["errno"]) is int and 0 <= failure["errno"] <= 4095)
+                ):
+                    detail = " (local " + failure["phase"] + "/" + failure["kind"] + ")"
+            raise RuntimeError(
+                "existing gh login/API request failed: " + path
+                + " (exit " + str(result.returncode) + ")" + detail
+            )
         return parsed(result.stdout) if result.stdout.strip() else None
 
 

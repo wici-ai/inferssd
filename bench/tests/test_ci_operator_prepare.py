@@ -154,6 +154,36 @@ def test_gh_errors_never_copy_auth_diagnostics(monkeypatch):
     assert "synthetic-sensitive" not in str(caught.value)
 
 
+@pytest.mark.parametrize("phase,kind", [
+    ("audit-open", "unsafe-path"), ("audit-append", "storage-exhausted"),
+    ("diagnostic-write", "io-failed"), ("client-read", "reap-timeout"),
+])
+def test_gh_fixed_local_failure_metadata_is_visible_without_auth_output(monkeypatch, phase, kind):
+    safe = dict(schema_version=1, phase=phase, kind=kind, errno=28)
+    stderr = b"gh-ci-read-retry-v3: local-failure=" + json.dumps(safe).encode() + b"\n"
+    monkeypatch.setattr(prepare.subprocess, "run", lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, 1, b"not retained", stderr))
+    with pytest.raises(RuntimeError, match=phase + "/" + kind) as caught:
+        prepare.Gh().call("user")
+    assert "exit 1" in str(caught.value) and "not retained" not in str(caught.value)
+
+
+@pytest.mark.parametrize("payload", [
+    {"schema_version": 1, "phase": "token-sensitive", "kind": "io-failed", "errno": 28},
+    {"schema_version": 1, "phase": [], "kind": "io-failed", "errno": 28},
+    {"schema_version": 1, "phase": "audit-open", "kind": "io-failed", "errno": "token-sensitive"},
+    {"schema_version": 1, "phase": "audit-open", "kind": "io-failed", "errno": 28, "secret": "token-sensitive"},
+    [], None, "token-sensitive",
+])
+def test_gh_malformed_or_unrecognized_failure_never_copies_diagnostics(monkeypatch, payload):
+    stderr = b"gh-ci-read-retry-v3: local-failure=" + json.dumps(payload).encode()
+    monkeypatch.setattr(prepare.subprocess, "run", lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, 1, b"", stderr))
+    with pytest.raises(RuntimeError) as caught:
+        prepare.Gh().call("user")
+    assert "local " not in str(caught.value) and "token-sensitive" not in str(caught.value)
+
+
 @pytest.mark.parametrize("raw", ['{"a":1,"a":2}', '{"a":NaN}'])
 def test_api_json_rejects_ambiguous_evidence(raw):
     with pytest.raises(ValueError):

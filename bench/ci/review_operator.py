@@ -18,6 +18,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci import operator_prepare as prepare
 from ci.contract import digest, load, policy_read, revision
+from ci.impact import device_requirements, fingerprint, plan
 from ci.private_controller import current_ci
 
 
@@ -210,6 +211,76 @@ def same_authorization(old, new):
         raise Stale("prepared source/base changed; a new review is required")
 
 
+def review_scope(args, policy, identity, profiles):
+    declared = profiles.get("devices")
+    if (
+        profiles.get("schema_version") != 1
+        or not isinstance(declared, dict)
+        or not declared
+        or not set(declared) <= set(prepare.DEVICES)
+    ):
+        raise ValueError("nonempty reviewed device profiles required")
+    enabled = prepare.DEVICES
+    if "temporary_mac_acceptance" in profiles:
+        exception = profiles["temporary_mac_acceptance"]
+        if (
+            not isinstance(exception, dict)
+            or set(exception) != {"pull_request", "head"}
+            or type(exception["pull_request"]) is not int
+            or exception["pull_request"] <= 0
+        ):
+            raise ValueError("exact temporary Mac acceptance PR/head required")
+        revision(exception["head"])
+        enabled = (
+            ("local-mbp",)
+            if exception["pull_request"] == identity["pr"]
+            and exception["head"] == identity["head"]
+            else prepare.LINUX_DEVICES
+        )
+    fetch_objects(args, identity, policy["repository"])
+    paths = []
+    # Include merge-resolution paths, exactly as the preparation plan does.
+    for target in (identity["head"], identity["candidate"]):
+        changed = prepare.git(
+            args.source, "diff", "--name-only", "-z", "--no-renames",
+            "--no-ext-diff", identity["base"], target,
+        )
+        paths.extend(item.decode("utf-8") for item in changed.split(b"\0") if item)
+    impact = plan(paths, policy, **{
+        name: identity[name] for name in ("base", "head", "candidate")
+    })
+    execution = [
+        device for device in enabled if device_requirements(impact, device)["models"]
+    ]
+    if not execution:
+        raise Waiting("canonical impact requires no currently enabled device; do not stage")
+    missing = [device for device in execution if device not in declared]
+    if missing:
+        raise Waiting("required device profiles unavailable: " + ", ".join(missing))
+    if any(
+        declared[d]["ssh"].get("sudo_password_required") is not False
+        for d in execution
+    ):
+        raise Waiting(
+            "background staging requires existing root access or the fixed narrow NOPASSWD helper"
+        )
+    return execution, impact
+
+
+def prepared_scope(prepared, execution, impact):
+    envelope = load(prepared / "envelope.json")
+    if (
+        envelope.get("execution_devices") != execution
+        or envelope.get("selection") != impact
+        or envelope.get("selection_plan_sha256") != fingerprint(impact)
+        or not isinstance(envelope.get("jobs"), dict)
+        or set(envelope["jobs"]) != set(execution)
+        or any(envelope.get(name) != impact[name]
+               for name in ("base", "head", "candidate"))
+    ):
+        raise Stale("prepared execution scope/impact differs from reviewed profile policy")
+
+
 def run_identity(run, saved):
     fields = (
         "id",
@@ -302,6 +373,7 @@ def monitor(args, api, policy, path, record):
 
 
 def advance(args, api, policy, path, record):
+    attempted = record["status"] != "queued"
     try:
         fresh = authorization(
             api,
@@ -318,27 +390,12 @@ def advance(args, api, policy, path, record):
         ):
             raise Stale("trusted profile/policy changed; authorize a fresh attempt")
         prepared = path.parent / path.stem / "prepared"
+        profiles = load(args.inputs)
+        if digest(args.inputs) != record["inputs_sha256"]:
+            raise Stale("trusted profiles changed while reading execution scope")
+        execution, impact = review_scope(args, policy, fresh, profiles)
         if record["status"] == "queued":
-            profiles = load(args.inputs)
-            declared = profiles.get("devices")
-            if (
-                profiles.get("schema_version") != 1
-                or not isinstance(declared, dict)
-                or not declared
-                or not set(declared) <= set(prepare.DEVICES)
-            ):
-                raise ValueError("nonempty reviewed device profiles required")
-            if digest(args.inputs) != record["inputs_sha256"]:
-                raise Stale("trusted profiles changed while reading execution scope")
-            execution = [device for device in prepare.DEVICES if device in declared]
-            if any(
-                declared[d]["ssh"].get("sudo_password_required") is not False
-                for d in execution
-            ):
-                raise Waiting(
-                    "background staging requires existing root access or the fixed narrow NOPASSWD helper"
-                )
-            fetch_objects(args, fresh, policy["repository"])
+            attempted = True
             prepared.parent.mkdir(mode=0o700, exist_ok=True)
             save_record(path, record, "preparing", prepared=str(prepared))
             prepare.prepare(
@@ -354,6 +411,7 @@ def advance(args, api, policy, path, record):
                 api=api,
             )
             save_record(path, record, "prepared")
+        prepared_scope(prepared, execution, impact)
         if record["status"] == "prepared":
             save_record(path, record, "staging")
             prepare.stage(SimpleNamespace(prepared=prepared, gh=args.gh), password=None)
@@ -373,6 +431,7 @@ def advance(args, api, policy, path, record):
             or digest(args.policy) != record["policy_sha256"]
         ):
             raise Stale("trusted profile/policy changed before dispatch")
+        prepared_scope(prepared, execution, impact)
         save_record(path, record, "dispatching")
         run = prepare.dispatch(SimpleNamespace(prepared=prepared, gh=args.gh), api=api)
         save_record(path, record, "running", run=run, dispatched_at=time.time())
@@ -391,6 +450,9 @@ def advance(args, api, policy, path, record):
             error=type(error).__name__ + ": " + str(error),
             no_automatic_retry=True,
         )
+    # A queued prerequisite wait has not begun preparation or acquired a device.
+    # It must not starve another independently authorized PR in this poll cycle.
+    return attempted or record["status"] != "queued"
 
 
 def tick(args, api=None):
@@ -471,8 +533,8 @@ def tick(args, api=None):
     if not active:
         for path, record in records:
             if record["status"] in ("queued", "prepared", "staged"):
-                advance(args, api, policy, path, record)
-                break
+                if advance(args, api, policy, path, record) is not False:
+                    break
     return dict(
         active_parent=active, pending_source_reviews=pending, records=len(records)
     )
