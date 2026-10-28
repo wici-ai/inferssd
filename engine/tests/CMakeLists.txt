@@ -881,9 +881,11 @@ if (APPLE AND TARGET ggml-cpu)
             endforeach()
         endforeach()
     endforeach()
+    # These cases cover threadpool lifecycle at fixed team sizes. The full
+    # 384/512 numerical workload remains in the default four-thread matrix above.
     foreach(threads 1 2 12)
         add_test(NAME mac_expert_operator_threads_${threads}
-            COMMAND test-mac-expert-operator 384 512 2 q8_0 ${threads})
+            COMMAND test-mac-expert-operator 384 8 2 q8_0 ${threads})
         set_tests_properties(mac_expert_operator_threads_${threads}
             PROPERTIES PROCESSORS ${threads} TIMEOUT 180 RUN_SERIAL TRUE)
     endforeach()

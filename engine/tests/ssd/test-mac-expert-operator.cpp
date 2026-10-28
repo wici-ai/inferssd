@@ -44,7 +44,9 @@ int main(int argc, char ** argv) {
         const bool vary_threads = argc == 7;
         require(!vary_threads || std::strcmp(argv[6], "vary") == 0, "invalid lifecycle mode");
         require(threads == 1 || threads == 2 || threads == 4 || threads == 12, "invalid fixture thread count");
-        require((experts == 384 || experts == 256) && (rows == 1 || rows == 32 || rows == 512) &&
+        const bool thread_lifecycle_fixture = argc == 6 && experts == 384 && rows == 8 && depth == 2 &&
+                std::strcmp(argv[4], "q8_0") == 0 && (threads == 1 || threads == 2 || threads == 12);
+        require((experts == 384 || experts == 256) && (rows == 1 || rows == 32 || rows == 512 || thread_lifecycle_fixture) &&
                 (depth == 0 || depth == 2 || depth == 4), "invalid fixture dimensions");
         const ggml_type type = std::strcmp(argv[4], "f32") == 0 ? GGML_TYPE_F32 : GGML_TYPE_Q8_0;
         require(type == GGML_TYPE_F32 || std::strcmp(argv[4], "q8_0") == 0, "invalid fixture type");
