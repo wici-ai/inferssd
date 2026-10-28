@@ -11,8 +11,8 @@ import pytest
 from inferssd.model import prefill_lane
 
 FIXTURES = Path(__file__).parent / "fixtures"
-ORACLE_PATH = FIXTURES / "oracle/prefill_f.py"
-SPEC = importlib.util.spec_from_file_location("prefill_lane_f_oracle", ORACLE_PATH)
+ORACLE_PATH = FIXTURES / "oracle/prefill_reference.py"
+SPEC = importlib.util.spec_from_file_location("prefill_lane_reference", ORACLE_PATH)
 ORACLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ORACLE)
 
@@ -28,7 +28,7 @@ def exact(value):
 
 
 def observe(module, case):
-    """Capture F's own return state, without calculating its timing or policy."""
+    """Capture the reference's own return state, without calculating its timing or policy."""
     fn = getattr(module, case["function"])
     fields = (
         ("high", "low", "n", "r")

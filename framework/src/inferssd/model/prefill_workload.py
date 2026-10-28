@@ -1,4 +1,4 @@
-"""F's pass geometry and weighted workload forms, without a planner or I/O."""
+"""The original pass geometry and weighted workload forms, without a planner or I/O."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ class PassSizing(TypedDict, total=False):
 
 
 def cut(m: PassSizing, p: str, n: int, ub: Optional[int] = None) -> list[int]:
-    """Split new tokens into full ubatches and a remainder, using F's truthy fallback."""
+    """Split new tokens into full ubatches and a remainder, using the original truthy fallback."""
     if n <= 0:
         return []
     ub = ub or (m.get("ubatch_p") or {}).get(p) or m.get("ubatch") or n
@@ -57,6 +57,6 @@ def offloaded(
 
 
 def cold_share(ps: Iterable[WeightedPass]) -> float:
-    """Return the cold weight fraction, preserving F's two traversals of ps."""
+    """Return the cold weight fraction, preserving the original two traversals of ps."""
     total = sum(w for _, _, w in ps)
     return sum(w for _, f, w in ps if f) / total if total else 0.0

@@ -1,4 +1,4 @@
-"""F-first source metadata/filesystem observations; generated headers contain no weights."""
+"""Reference-first source metadata/filesystem observations; generated headers contain no weights."""
 
 from __future__ import annotations
 
@@ -22,9 +22,9 @@ import pytest
 from test_offline_planner import exact, load
 
 FIXTURES = Path(__file__).parent / "fixtures"
-F_HEADER = load("gguf_header")
-with patch.dict(sys.modules, gguf_header=F_HEADER):
-    F_SOURCE = load("expert_source")
+REFERENCE_HEADER = load("gguf_header")
+with patch.dict(sys.modules, gguf_header=REFERENCE_HEADER):
+    REFERENCE_SOURCE = load("expert_source")
 GOLDENS = FIXTURES / "model-metadata-goldens.json"
 
 
@@ -39,9 +39,9 @@ def gguf(config):
         if t == 9:
             et, xs = v
             return struct.pack("<IQ", et, len(xs)) + b"".join(value(et, x) for x in xs)
-        if t not in F_HEADER.SCALARS:
+        if t not in REFERENCE_HEADER.SCALARS:
             return b""
-        return struct.pack("<" + F_HEADER.SCALARS[t], v)
+        return struct.pack("<" + REFERENCE_HEADER.SCALARS[t], v)
 
     tensors = config.get("tensors", default_tensors())
     kv = config.get("kv", [["general.architecture", 8, "toy"], ["general.alignment", 4, 32]])
@@ -254,21 +254,23 @@ class Files:
 
 
 @contextlib.contextmanager
-def f_api(fs):
+def reference_api(fs):
     with contextlib.ExitStack() as stack:
-        stack.enter_context(patch.object(F_HEADER, "open", fs.open, create=True))
+        stack.enter_context(patch.object(REFERENCE_HEADER, "open", fs.open, create=True))
         stack.enter_context(
-            patch.object(F_HEADER, "mmap", SimpleNamespace(mmap=fs.mmap, ACCESS_READ=1))
+            patch.object(REFERENCE_HEADER, "mmap", SimpleNamespace(mmap=fs.mmap, ACCESS_READ=1))
         )
         stack.enter_context(
             patch.object(
-                F_HEADER, "glob", SimpleNamespace(glob=fs.glob, escape=__import__("glob").escape)
+                REFERENCE_HEADER,
+                "glob",
+                SimpleNamespace(glob=fs.glob, escape=__import__("glob").escape),
             )
         )
-        stack.enter_context(patch.object(F_SOURCE, "open", fs.open, create=True))
+        stack.enter_context(patch.object(REFERENCE_SOURCE, "open", fs.open, create=True))
         stack.enter_context(
             patch.object(
-                F_SOURCE,
+                REFERENCE_SOURCE,
                 "os",
                 SimpleNamespace(
                     path=SimpleNamespace(
@@ -279,11 +281,13 @@ def f_api(fs):
                 ),
             )
         )
-        stack.enter_context(patch.object(F_SOURCE, "random", SimpleNamespace(Random=fs.rng)))
-        yield F_HEADER, F_SOURCE
+        stack.enter_context(
+            patch.object(REFERENCE_SOURCE, "random", SimpleNamespace(Random=fs.rng))
+        )
+        yield REFERENCE_HEADER, REFERENCE_SOURCE
 
 
-def observe(case, api=f_api):
+def observe(case, api=reference_api):
     fs, steps = Files(case), []
     with (
         api(fs) as (header, source),
@@ -297,7 +301,9 @@ def observe(case, api=f_api):
                     old = sys.argv
                     try:
                         sys.argv = ["expert_source.py", *args]
-                        tree = ast.parse((FIXTURES / "oracle/expert_source_f.py").read_text())
+                        tree = ast.parse(
+                            (FIXTURES / "oracle/expert_source_reference.py").read_text()
+                        )
                         main = next(n for n in tree.body if isinstance(n, ast.If))
                         # Original dispatch block, original function objects and output ports.
                         scope = dict(vars(source), __name__="__main__")
@@ -353,7 +359,7 @@ def data():
 
 
 @pytest.fixture(scope="module")
-def fixed_f_observations():
+def fixed_reference_observations():
     if os.environ.get("PYTHONHASHSEED") == "0":
         return {c["name"]: observe(c) for c in data()["cases"]}
     script = """
@@ -373,8 +379,8 @@ print(json.dumps({c['name']: observe(c) for c in data()['cases']}))
 
 
 @pytest.mark.parametrize("case", data()["cases"], ids=lambda c: c["name"])
-def test_f_source_metadata(case, fixed_f_observations):
-    assert fixed_f_observations[case["name"]] == case["expected"][runtime()]
+def test_reference_source_metadata(case, fixed_reference_observations):
+    assert fixed_reference_observations[case["name"]] == case["expected"][runtime()]
 
 
 def test_source_oracles():

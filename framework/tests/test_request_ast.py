@@ -1,4 +1,4 @@
-"""Whole commands and helpers retain executable F AST after explicit port extraction."""
+"""Whole commands and helpers retain executable reference AST after explicit port extraction."""
 
 from __future__ import annotations
 
@@ -114,7 +114,7 @@ def test_request_helpers_ast(name):
 
     module = client if name == "turn" else requests
     original = "client" if name == "turn" else "boot_client"
-    old = function(ast.parse((ORACLE / (original + "_f.py")).read_text()), name)
+    old = function(ast.parse((ORACLE / (original + "_reference.py")).read_text()), name)
     new = function(ast.parse(Path(inspect.getsourcefile(module)).read_text()), name)
     assert_same(old, new)
 
@@ -138,7 +138,7 @@ def test_complete_command_ast(original, candidate, start):
         "converse": conversation,
         "compare_online": report,
     }
-    old = ast.parse((ORACLE / (original + "_f.py")).read_text())
+    old = ast.parse((ORACLE / (original + "_reference.py")).read_text())
     new = function(ast.parse(Path(inspect.getsourcefile(modules[original])).read_text()), candidate)
     if original == "client":
         old = function(old, "main")

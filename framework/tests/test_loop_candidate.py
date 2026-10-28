@@ -1,4 +1,4 @@
-"""Candidate comparison to the independently committed full F transcripts."""
+"""Candidate comparison to the independently committed full reference transcripts."""
 
 from __future__ import annotations
 

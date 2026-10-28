@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 import pytest
-from observe_launch_F import header
+from observe_launch_reference import header
 
 from inferssd.cli import main
 from inferssd.launch.recorded import RecordedArtifacts

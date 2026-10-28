@@ -39,8 +39,8 @@ PLACEMENTS = ("groups_of", "pin_env", "split_env", "env")
 
 
 def load_oracle(name):
-    path = ORACLES / f"{name}_f.py"
-    spec = importlib.util.spec_from_file_location(f"settings_{name}_f_oracle", path)
+    path = ORACLES / f"{name}_reference.py"
+    spec = importlib.util.spec_from_file_location(f"settings_{name}_reference", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -48,17 +48,21 @@ def load_oracle(name):
 
 # Original modules retain their own imports; temporary aliases are restored before
 # any test returns, and no production path is imported as the oracle.
-F_PREFILL, F_SIM = load_oracle("prefill"), load_oracle("sim")
+REFERENCE_PREFILL, REFERENCE_SIM = load_oracle("prefill"), load_oracle("sim")
 saved_path = sys.path[:]
 try:
-    F_PLACEMENT = load_oracle("placement")
-    with patch.dict(sys.modules, placement=F_PLACEMENT, prefill=F_PREFILL, sim=F_SIM):
-        F_SETTINGS = load_oracle("settings")
-        with patch.dict(sys.modules, settings=F_SETTINGS):
-            F_MACHINE = load_oracle("machine")
+    REFERENCE_PLACEMENT = load_oracle("placement")
+    with patch.dict(
+        sys.modules, placement=REFERENCE_PLACEMENT, prefill=REFERENCE_PREFILL, sim=REFERENCE_SIM
+    ):
+        REFERENCE_SETTINGS = load_oracle("settings")
+        with patch.dict(sys.modules, settings=REFERENCE_SETTINGS):
+            REFERENCE_MACHINE = load_oracle("machine")
 finally:
     sys.path[:] = saved_path
-F = SimpleNamespace(settings=F_SETTINGS, placement=F_PLACEMENT, Replay=F_SIM.Replay)
+REFERENCE = SimpleNamespace(
+    settings=REFERENCE_SETTINGS, placement=REFERENCE_PLACEMENT, Replay=REFERENCE_SIM.Replay
+)
 
 
 def exact(value):
@@ -150,7 +154,7 @@ def observe(api, case):
             replay_events.append(["call", exact(key), tier, digest(segs)])
             if calls == case.get("replay_raise_on"):
                 raise RuntimeError("configured replay failure")
-            # F Machine.replay body, with its Replay dependency supplied by each arm.
+            # Reference Machine.replay body, with its Replay dependency supplied by each arm.
             r = cache.get(key)
             try:
                 if r is None or r.tier.cap != tier:
@@ -193,7 +197,7 @@ def observe(api, case):
         try:
             cpus = set()
             for path in ("/sys/devices/cpu_core/cpus", "/sys/devices/cpu_atom/cpus"):
-                cpus |= set(F_PLACEMENT.parse_list(open_host(path).read()))
+                cpus |= set(REFERENCE_PLACEMENT.parse_list(open_host(path).read()))
             if cpus:
                 return len(cpus)
         except OSError:
@@ -212,18 +216,18 @@ def observe(api, case):
     previous = sys.getprofile()
     sys.setprofile(profile)
     kwargs = dict(args)
-    saved_os = F_PLACEMENT.os
+    saved_os = REFERENCE_PLACEMENT.os
     outcome = None
     try:
-        with patch.object(F_PLACEMENT, "open", open_host, create=True):
-            F_PLACEMENT.os = SimpleNamespace(cpu_count=cpu_count)
-            if api is not F:
+        with patch.object(REFERENCE_PLACEMENT, "open", open_host, create=True):
+            REFERENCE_PLACEMENT.os = SimpleNamespace(cpu_count=cpu_count)
+            if api is not REFERENCE:
                 if fn_name == "configuration" or fn_name == "generate":
                     kwargs["host_threads"] = host_fallback
                 elif case.get("placement") and fn_name in ("env", "split_env"):
                     kwargs["host_threads"] = host_fallback
             if fn_name == "generate":
-                host_kwargs = {"host_threads": host_fallback} if api is not F else {}
+                host_kwargs = {"host_threads": host_fallback} if api is not REFERENCE else {}
                 out = api.settings.configuration(
                     machine, kwargs["tier"], kwargs["p"], **host_kwargs
                 )
@@ -258,7 +262,7 @@ def observe(api, case):
     ) as error:
         outcome = {"exception": [type(error).__name__, str(error)]}
     finally:
-        F_PLACEMENT.os = saved_os
+        REFERENCE_PLACEMENT.os = saved_os
         sys.setprofile(previous)
     if machine is not None:
         args.pop("m")
@@ -296,26 +300,27 @@ RUNTIME = f"{sys.version_info.major}.{sys.version_info.minor}"
 def test_frozen_settings_generation(case):
     if RUNTIME not in ("3.9", "3.12"):
         pytest.skip("recorded reference transcripts cover Python 3.9 and 3.12 only")
-    assert observe(F, case) == case["expected"][RUNTIME]
+    assert observe(REFERENCE, case) == case["expected"][RUNTIME]
 
 
 def test_frozen_sources_and_namedtuple_contract():
     manifest = json.loads((ORACLES / "settings-manifest.json").read_text())
     for name, source in manifest["files"].items():
         assert (
-            hashlib.sha256((ORACLES / f"{name}_f.py").read_bytes()).hexdigest() == source["sha256"]
+            hashlib.sha256((ORACLES / f"{name}_reference.py").read_bytes()).hexdigest()
+            == source["sha256"]
         )
-    assert F.settings.Setting._fields == ("name", "value", "source", "input", "pending")
-    assert F.settings.Setting._field_defaults == {"pending": False}
+    assert REFERENCE.settings.Setting._fields == ("name", "value", "source", "input", "pending")
+    assert REFERENCE.settings.Setting._field_defaults == {"pending": False}
 
 
 @pytest.mark.parametrize("case", GOLDENS["cases"], ids=lambda case: case["name"])
-def test_complete_settings_matches_f(case):
-    assert observe(CANDIDATE, case) == observe(F, case)
+def test_complete_settings_matches_reference(case):
+    assert observe(CANDIDATE, case) == observe(REFERENCE, case)
 
 
 def test_setting_tuple_semantics_are_preserved():
-    expected = F_SETTINGS.Setting("X", 0, "derived", "receipt")
+    expected = REFERENCE_SETTINGS.Setting("X", 0, "derived", "receipt")
     actual = settings.Setting("X", 0, "derived", "receipt")
     assert actual == expected
     assert repr(actual) == repr(expected)
@@ -339,18 +344,18 @@ def test_setting_tuple_semantics_are_preserved():
     ids=lambda case: case["name"],
 )
 def test_observed_cache_matches_original_machine_method(case):
-    # Verify the observer's thin replay wrapper against the unchanged F method,
+    # Verify the observer's thin replay wrapper against the unchanged reference method,
     # rather than using the same fixture implementation as its own reference.
     from types import MethodType
 
     args = copy.deepcopy(case["arguments"])
     m = SimpleNamespace(**args.pop("machine"), _replays={})
-    m.replay = MethodType(F_MACHINE.Machine.replay, m)
+    m.replay = MethodType(REFERENCE_MACHINE.Machine.replay, m)
     try:
-        F_SETTINGS.rank_costs(m, **args)
+        REFERENCE_SETTINGS.rank_costs(m, **args)
         if case.get("repeat"):
-            F_SETTINGS.rank_costs(m, **args)
+            REFERENCE_SETTINGS.rank_costs(m, **args)
     except ZeroDivisionError:
         assert case["name"] == "rank-zero-layers"
     expected = exact([(k, replay_state(v)) for k, v in m._replays.items()])
-    assert observe(F, case)["cache"] == expected
+    assert observe(REFERENCE, case)["cache"] == expected

@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 
 import pytest
-from observe_guardian_F import CASES, observe
+from observe_guardian_reference import CASES, observe
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

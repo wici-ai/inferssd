@@ -1,4 +1,4 @@
-"""F's served-turn and re-plan calculations, using explicit observation state."""
+"""The original served-turn and re-plan calculations, using explicit observation state."""
 
 from __future__ import annotations
 

@@ -42,7 +42,7 @@ def run_source(
     random_factory: Callable[[int], RandomChoice] = random.Random,
     emit: Callable[..., None] = print,
 ) -> None:
-    """Dispatch accepted arguments to the same source operations as F."""
+    """Dispatch accepted arguments to the same source operations as the original."""
     if args.source_command == "index":
         experts.index(args.model, args.pack, args.directory, filesystem=filesystem, emit=emit)
     elif args.source_command == "facts":

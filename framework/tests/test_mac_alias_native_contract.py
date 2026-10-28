@@ -1,4 +1,4 @@
-"""Compile the native type-trait geometry; never use the F metadata table."""
+"""Compile the native type-trait geometry; never use the reference metadata table."""
 
 from __future__ import annotations
 

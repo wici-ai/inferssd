@@ -3,13 +3,13 @@
   "files": [
     {
       "path": "tools/adaptive/gguf_header.py",
-      "file": "gguf_header_f.py",
+      "file": "gguf_header_reference.py",
       "sha256": "2d802d523d4f64dfde445414a0c5a3b3a12b4b4e7226865d37834ae78418b569",
       "git_blob": "6b85db8b642c1839a164ed240d6b72ca1cade6e0"
     },
     {
       "path": "tools/adaptive/expert_source.py",
-      "file": "expert_source_f.py",
+      "file": "expert_source_reference.py",
       "sha256": "77ceef661d23d0c6c66d7cd1688dcb4bea478d1788f616763e81ea78fe401914",
       "git_blob": "1dd0f03ae7d7e63160164392f6ae9c87517e6426"
     }

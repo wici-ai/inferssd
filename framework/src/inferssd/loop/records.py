@@ -1,4 +1,4 @@
-"""Caller-owned legacy arm cache; one session replaces one isolated F module."""
+"""Caller-owned legacy arm cache; one session replaces one isolated original module."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""F's prefill cost and threshold model, without artifact loading or validation."""
+"""The original prefill cost and threshold model, without artifact loading or validation."""
 
 from __future__ import annotations
 

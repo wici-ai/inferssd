@@ -1,4 +1,4 @@
-"""Execute only frozen F launchers against tiny assets and explicit fake effects."""
+"""Execute only frozen reference launchers against tiny assets and explicit fake effects."""
 
 from __future__ import annotations
 
@@ -94,9 +94,10 @@ else:os.execv("/usr/bin/"+name,[name,*a])
 def linux_case(case, output=None):
     if sys.platform != "linux":
         raise RuntimeError(
-            "The exact F shell observer requires Linux Bash; do not simulate Linux on Darwin"
+            "The exact reference shell observer requires Linux Bash; "
+            "do not simulate Linux on Darwin"
         )
-    with tempfile.TemporaryDirectory(prefix="ssdash-launch-F-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="inferssd-launch-reference-") as temporary:
         base = Path(temporary)
         repo = base / "repo"
         d = base / "case"
@@ -229,14 +230,14 @@ def linux_case(case, output=None):
 
 
 def mac_case(case):
-    with tempfile.TemporaryDirectory(prefix="ssdash-mac-launch-F-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="inferssd-mac-launch-reference-") as temporary:
         base = Path(temporary)
         repo = base / "repo"
         d = base / "case"
         d.mkdir()
         shutil.copytree(ORACLE, repo)
         spec = importlib.util.spec_from_file_location(
-            "f_mac_launcher", repo / "scripts/run-macos-ssd.py"
+            "reference_mac_launcher", repo / "scripts/run-macos-ssd.py"
         )
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)

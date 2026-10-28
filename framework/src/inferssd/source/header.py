@@ -1,4 +1,4 @@
-"""F header metadata parser. Type 42 is historical metadata, not native support."""
+"""Original header metadata parser. Type 42 is historical metadata, not native support."""
 
 from __future__ import annotations
 

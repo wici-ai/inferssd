@@ -1,5 +1,5 @@
 {
-  "engine_F": "8b12192920b339a4ef31c9006d1ebe20304ce45a",
+  "engine_reference": "8b12192920b339a4ef31c9006d1ebe20304ce45a",
   "ownership_base": "76dccf491181995981324e1e88201c87886911b9",
   "engine_cases": 36,
   "group_cases": 6,
@@ -10,7 +10,7 @@
   ],
   "files": [
     {
-      "path": "fixtures/oracle/controller_f.py",
+      "path": "fixtures/oracle/controller_reference.py",
       "sha256": "4d4d921966a45a260d5b1535119dbd5cf36b1c68f1f06d786c2f1d357af3ee26"
     },
     {
@@ -22,16 +22,16 @@
       "sha256": "f2611e57e766570f0f12a1547c94e1a425ca28a1f210998347562db098a1eaac"
     },
     {
-      "path": "observe_engine_F.py",
-      "sha256": "eeaacccf5b372e120eca40175ea44a600ad91dfa4981eeae204ce9634650abf7"
+      "path": "observe_engine_reference.py",
+      "sha256": "1b0c34693f33e00617b39ecebc15765175443b077d8b272e810b2048ecc14c12"
     },
     {
-      "path": "observe_ownership_F.py",
+      "path": "observe_ownership_reference.py",
       "sha256": "e355e6fa1930f4ae3296e2f10b6c1b19d9d683e45da967438e69bcb95fb5a055"
     },
     {
       "path": "fixtures/engine-lifecycle-goldens.json",
-      "sha256": "c21e6bb41ad0b6bba9209fda70be3d7d14c33450c6b11d13e9fc60f2079e6823"
+      "sha256": "9a58a83fd7664c3f48ed2f9d568877c3f11ddf951ccff38cfe5e4c479a22a40e"
     },
     {
       "path": "fixtures/ownership-core-goldens.json",

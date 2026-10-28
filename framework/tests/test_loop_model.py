@@ -1,4 +1,4 @@
-"""F-first complete observation/session/controller transcripts, with no native effects."""
+"""Reference-first complete observation/session/controller transcripts, with no native effects."""
 
 from __future__ import annotations
 
@@ -14,8 +14,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from test_log_records import F as F_LOG
-from test_offline_planner import F_MACHINE, F_PLACEMENT, F_PREFILL, digest, exact, load, state
+from test_log_records import REFERENCE as REFERENCE_LOG
+from test_offline_planner import (
+    REFERENCE_MACHINE,
+    REFERENCE_PLACEMENT,
+    REFERENCE_PREFILL,
+    digest,
+    exact,
+    load,
+    state,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GOLDENS = FIXTURES / "loop-model-goldens.json"
@@ -246,19 +254,19 @@ class Pricing:
 
 
 @contextlib.contextmanager
-def f_api(h):
+def reference_api(h):
     saved = sys.path[:]
     try:
-        with patch.dict(sys.modules, prefill=F_PREFILL, logparse=F_LOG):
+        with patch.dict(sys.modules, prefill=REFERENCE_PREFILL, logparse=REFERENCE_LOG):
             online = load("online")
-        with patch.dict(sys.modules, online=online, machine=F_MACHINE):
+        with patch.dict(sys.modules, online=online, machine=REFERENCE_MACHINE):
             controller = load("controller")
     finally:
         sys.path[:] = saved
 
     def machine(run):
         h.event("machine", run)
-        m = F_MACHINE.Machine(run)
+        m = REFERENCE_MACHINE.Machine(run)
         h.machines.append(m)
         return m
 
@@ -269,19 +277,21 @@ def f_api(h):
         return instance
 
     with contextlib.ExitStack() as stack:
-        stack.enter_context(patch.object(F_MACHINE, "open", h.open, create=True))
+        stack.enter_context(patch.object(REFERENCE_MACHINE, "open", h.open, create=True))
         stack.enter_context(
-            patch.object(F_MACHINE, "os", SimpleNamespace(path=SimpleNamespace(exists=h.exists)))
+            patch.object(
+                REFERENCE_MACHINE, "os", SimpleNamespace(path=SimpleNamespace(exists=h.exists))
+            )
         )
         stack.enter_context(
             patch.object(
-                F_PLACEMENT,
+                REFERENCE_PLACEMENT,
                 "default_threads",
                 lambda dev: int(dev["default_threads"]) if dev.get("default_threads") else 8,
             )
         )
-        stack.enter_context(patch.object(F_LOG, "open", h.open, create=True))
-        stack.enter_context(patch.object(F_LOG, "gzip", SimpleNamespace(open=h.gzip_open)))
+        stack.enter_context(patch.object(REFERENCE_LOG, "open", h.open, create=True))
+        stack.enter_context(patch.object(REFERENCE_LOG, "gzip", SimpleNamespace(open=h.gzip_open)))
         stack.enter_context(patch.object(online, "open", h.open, create=True))
         stack.enter_context(
             patch.object(
@@ -309,7 +319,7 @@ def f_api(h):
             live=online._LIVE,
             traced={
                 v.__code__: "machine." + k
-                for k, v in vars(F_MACHINE.Machine).items()
+                for k, v in vars(REFERENCE_MACHINE.Machine).items()
                 if callable(v)
             },
         )
@@ -354,7 +364,7 @@ def snapshot(ctl, api, h):
     return {"controller": exact(fields), "cache": cache_state(api)}
 
 
-def observe(case, api_factory=f_api):
+def observe(case, api_factory=reference_api):
     h = Effects(case)
     steps = []
     ctl = None
@@ -492,11 +502,11 @@ def runtime():
 @pytest.mark.parametrize(
     "case", data()["cases"] if GOLDENS.exists() else [], ids=lambda c: c["name"]
 )
-def test_f_loop(case):
+def test_reference_loop(case):
     assert observe(case) == case["expected"][runtime()]
 
 
-def test_f_loop_sources():
+def test_reference_loop_sources():
     for row in json.loads((FIXTURES / "oracle/loop-manifest.json").read_text())["files"]:
         assert (
             hashlib.sha256((FIXTURES / "oracle" / row["file"]).read_bytes()).hexdigest()

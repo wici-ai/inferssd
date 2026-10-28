@@ -33,8 +33,8 @@ def materialize(case, root):
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case["name"])
-def test_f_oracle_is_frozen(case, tmp_path):
-    oracle = FIXTURES / "oracle/device_profile_f.py"
+def test_reference_oracle_is_frozen(case, tmp_path):
+    oracle = FIXTURES / "oracle/device_profile_reference.py"
     manifest = json.loads((FIXTURES / "oracle/manifest.json").read_text())
     assert hashlib.sha256(oracle.read_bytes()).hexdigest() == manifest["sha256"]
     assert manifest["sha256"] == GOLDENS["oracle_sha256"]
@@ -52,7 +52,7 @@ def test_f_oracle_is_frozen(case, tmp_path):
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case["name"])
-def test_extracted_profile_matches_f_or_declared_boundary(case, tmp_path):
+def test_extracted_profile_matches_reference_or_declared_boundary(case, tmp_path):
     probe, experts = materialize(case, tmp_path)
     if "new_error" in case:
         errors = {

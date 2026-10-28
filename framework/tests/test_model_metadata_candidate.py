@@ -1,4 +1,4 @@
-"""Candidate observations against frozen and dynamic whole-F source behavior."""
+"""Candidate observations against frozen and dynamic whole-reference source behavior."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from test_model_metadata import FIXTURES, data, f_api, observe, runtime
+from test_model_metadata import FIXTURES, data, observe, reference_api, runtime
 
 from inferssd import cli
 from inferssd.source import experts, header
@@ -39,7 +39,8 @@ SOURCE_IO = {
 
 @contextlib.contextmanager
 def candidate_api(fs):
-    # Same in-memory port adapter as F; no replacement parser or candidate-derived inputs.
+    # Same in-memory port adapter as the reference; no replacement parser or
+    # candidate-derived inputs.
     port = SimpleNamespace(
         **{
             name: getattr(fs, name)
@@ -88,7 +89,7 @@ def test_frozen_candidate(case, frozen_candidate):
 
 
 @pytest.mark.parametrize("case", data()["cases"], ids=lambda c: c["name"])
-def test_same_process_f_equivalence(case):
+def test_same_process_reference_equivalence(case):
     # Compare set/stat iteration dynamically as well as under the frozen seed.
     assert candidate_observe(case) == observe(case)
 
@@ -101,7 +102,7 @@ from test_model_metadata import data, observe
 from test_model_metadata_candidate import candidate_observe
 for case in data()['cases']:
     assert candidate_observe(case) == observe(case), case['name']
-print('52 complete F/candidate observations matched under seed 17')
+print('52 complete reference/candidate observations matched under seed 17')
 """
     result = subprocess.run(
         [sys.executable, "-c", script, str(Path(__file__).parent)],
@@ -162,7 +163,7 @@ def normalized(node):
 
 @pytest.mark.parametrize("old,module", [("gguf_header", header), ("expert_source", experts)])
 def test_executable_ast_and_constants(old, module):
-    f = ast.parse((FIXTURES / f"oracle/{old}_f.py").read_text())
+    f = ast.parse((FIXTURES / f"oracle/{old}_reference.py").read_text())
     new = ast.parse(Path(module.__file__).read_text())
 
     def funcs(tree):
@@ -209,8 +210,8 @@ def test_real_cli_dispatch_with_original_io_observer(case_name):
                     ["source", "index", model, *([pack] if pack is not None else []), directory]
                 )
 
-            # F's argv block calls these adapters; each adapter invokes the new argparse
-            # CLI and its actual command implementation, not the frozen F function.
+            # The reference argv block calls these adapters; each adapter invokes the new argparse
+            # CLI and its actual command implementation, not the frozen reference function.
             s.index = lambda *a: dispatch(*a)
             s.facts = lambda model, alias=None: cli.main(
                 ["source", "facts", model, *([alias] if alias is not None else [])]
@@ -233,4 +234,4 @@ def test_real_cli_dispatch_with_original_io_observer(case_name):
             ):
                 yield h, s
 
-    assert observe(case, api=real_cli_api) == observe(case, api=f_api)
+    assert observe(case, api=real_cli_api) == observe(case, api=reference_api)

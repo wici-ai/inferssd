@@ -1,4 +1,4 @@
-"""F's complete machine model, with explicit lazy artifact and host inputs."""
+"""The original complete machine model, with explicit lazy artifact and host inputs."""
 
 from __future__ import annotations
 

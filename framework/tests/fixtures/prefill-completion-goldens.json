@@ -1,5 +1,5 @@
 {
-  "frozen_F": "8b12192920b339a4ef31c9006d1ebe20304ce45a",
+  "frozen_reference": "8b12192920b339a4ef31c9006d1ebe20304ce45a",
   "oracle_sha256": "72215b6b10d796096feddf7eb5cd81f0321de0b9ce5a102de5156979f1e21ccd",
   "runtimes": {
     "3.12": "3.12.13 (main, Mar  3 2026, 12:39:30) [Clang 17.0.0 (clang-1700.6.3.2)]",

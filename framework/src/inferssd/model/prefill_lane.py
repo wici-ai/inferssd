@@ -1,4 +1,4 @@
-"""F's pure grouped-prefill lane costs, preserving arithmetic and selection order.
+"""The original pure grouped-prefill lane costs, preserving arithmetic and selection order.
 
 Inputs retain the legacy numeric semantics, including negative values and absent,
 null, or zero lane rates. This leaf neither validates artifacts nor performs I/O.

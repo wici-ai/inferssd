@@ -1,4 +1,4 @@
-"""Complete recorded calibration command; ports run at their original F call points."""
+"""Complete recorded calibration command; ports run at their original call points."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ def run_calibration(
     # buffers take from the tier for decode, and each placement's tier loses it. A probe of the
     # older format (one number, the most the tier held) is that tier.  Neither prices the graph
     # route's workspace, which a graph prefill takes back from the tier on unified memory and
-    # decode refills afterwards (design F_g).
+    # decode refills afterwards.
     if a.ubatch_probe:
         ref_first = placements[next(iter(placements))].get("tier_slots_first")
         for ub, v in sorted(

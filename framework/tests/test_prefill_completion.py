@@ -20,8 +20,8 @@ from inferssd.model import (
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
-ORACLE_PATH = FIXTURES / "oracle/prefill_f.py"
-SPEC = importlib.util.spec_from_file_location("prefill_completion_f_oracle", ORACLE_PATH)
+ORACLE_PATH = FIXTURES / "oracle/prefill_reference.py"
+SPEC = importlib.util.spec_from_file_location("prefill_completion_reference", ORACLE_PATH)
 ORACLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ORACLE)
 
@@ -242,7 +242,7 @@ TYPED = SimpleNamespace(
 
 def test_frozen_oracle_identity():
     assert hashlib.sha256(ORACLE_PATH.read_bytes()).hexdigest() == GOLDENS["oracle_sha256"]
-    assert GOLDENS["frozen_F"] == "8b12192920b339a4ef31c9006d1ebe20304ce45a"
+    assert GOLDENS["frozen_reference"] == "8b12192920b339a4ef31c9006d1ebe20304ce45a"
 
 
 @pytest.mark.parametrize("case", GOLDENS["cases"], ids=lambda case: case["name"])

@@ -7,9 +7,9 @@ import json
 from dataclasses import asdict, replace
 
 import pytest
-from observe_engine_F import CASES, observe
-from observe_engine_F import Effects as FEffects
-from observe_engine_F import api as f_api
+from observe_engine_reference import CASES, observe
+from observe_engine_reference import Effects as FEffects
+from observe_engine_reference import api as reference_api
 
 from inferssd.engine import core, owned, runtime
 from inferssd.launch.typed import LaunchSpec
@@ -69,11 +69,11 @@ def test_environment_original_call_order(case):
 @pytest.mark.parametrize(
     "case", [c for c in CASES if c.get("action") == "post"], ids=lambda c: c["name"]
 )
-def test_post_exact_F_events(case, monkeypatch):
+def test_post_exact_reference_events(case, monkeypatch):
     f, candidate = FEffects(case), FEffects(case)
     results = []
     monkeypatch.setattr(core.urllib.request, "urlopen", candidate.urlopen)
-    for function in (f_api(f).post, core.post):
+    for function in (reference_api(f).post, core.post):
         try:
             results.append(
                 (

@@ -1,4 +1,4 @@
-"""F-only whole-command observer. Independent of the candidate package."""
+"""Reference-only whole-command observer. Independent of the candidate package."""
 
 import ast
 import builtins
@@ -101,7 +101,7 @@ def observe(case, execute=None):
     result = None
     error = None
     try:
-        result = (execute or execute_F)(case, host)
+        result = (execute or execute_reference)(case, host)
     except Exception as exception:
         error = [type(exception).__name__, str(exception)]
         return copy.deepcopy(
@@ -112,9 +112,9 @@ def observe(case, execute=None):
     )
 
 
-def execute_F(case, host):
+def execute_reference(case, host):
     name = "coresets" if case["kind"] in ("coresets", "parse_list") else "ubprobe"
-    source = (ORACLE / f"{name}_f.py").read_text()
+    source = (ORACLE / f"{name}_reference.py").read_text()
 
     def importing(module, *args, **kwargs):
         if module == "sys":
@@ -140,11 +140,11 @@ def execute_F(case, host):
                 and any(isinstance(t, ast.Name) and t.id == "TIER" for t in n.targets)
             )
         ]
-        exec(compile(tree, str(ORACLE / f"{name}_f.py"), "exec"), namespace)
+        exec(compile(tree, str(ORACLE / f"{name}_reference.py"), "exec"), namespace)
         value = case["value"] if case["kind"] == "parse_list" else iter(case["lines"])
         result = namespace[case["kind"]](value)
         return list(result) if isinstance(result, tuple) else result
-    exec(compile(tree, str(ORACLE / f"{name}_f.py"), "exec"), namespace)
+    exec(compile(tree, str(ORACLE / f"{name}_reference.py"), "exec"), namespace)
     return None
 
 
@@ -156,12 +156,12 @@ def runtime_key():
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case["name"])
-def test_F_bootstrap_records(case):
+def test_reference_bootstrap_records(case):
     expected = json.loads((FIXTURES / "bootstrap-records-goldens.json").read_text())
     assert observe(case) == expected[runtime_key()][case["name"]]
 
 
-def test_original_F_source_identity():
+def test_original_reference_source_identity():
     manifest = json.loads((ORACLE / "bootstrap-records-manifest.json").read_text())
     for source in manifest["sources"]:
         assert (

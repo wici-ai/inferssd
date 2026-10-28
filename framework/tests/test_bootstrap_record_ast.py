@@ -56,7 +56,9 @@ def body(source, function):
     ],
 )
 def test_complete_executable_body(module, original_name, candidate_name):
-    original = (ORACLE / ("coresets_f.py" if module is core_sets else "ubprobe_f.py")).read_text()
+    original = (
+        ORACLE / ("coresets_reference.py" if module is core_sets else "ubprobe_reference.py")
+    ).read_text()
     expected = ast.Module(body=body(original, original_name), type_ignores=[])
     actual = ast.Module(body=body(inspect.getsource(module), candidate_name), type_ignores=[])
     assert ast.dump(Normalize().visit(copy.deepcopy(expected))) == ast.dump(
@@ -64,7 +66,7 @@ def test_complete_executable_body(module, original_name, candidate_name):
     )
 
 
-def test_tier_regex_constant_is_original_F():
-    original = ast.parse((ORACLE / "ubprobe_f.py").read_text())
+def test_tier_regex_constant_is_original_reference():
+    original = ast.parse((ORACLE / "ubprobe_reference.py").read_text())
     expression = next(n.value for n in original.body if isinstance(n, ast.Assign))
     assert tier_slots.TIER.pattern == ast.literal_eval(expression.args[0])

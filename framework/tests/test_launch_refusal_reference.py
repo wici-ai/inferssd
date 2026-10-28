@@ -1,4 +1,4 @@
-"""F-only supplement for the native refusal branch omitted by dry-run extraction."""
+"""Reference-only supplement for the native refusal branch omitted by dry-run extraction."""
 
 from __future__ import annotations
 
@@ -7,9 +7,11 @@ import json
 from pathlib import Path
 
 import pytest
-from observe_launch_refusal_F import CASES, ORACLE, definitions, observe
+from observe_launch_refusal_reference import CASES, ORACLE, definitions, observe
 
-FROZEN = json.loads((Path(__file__).parent / "fixtures/launch-native-refusal-F.json").read_text())
+FROZEN = json.loads(
+    (Path(__file__).parent / "fixtures/launch-native-refusal-reference.json").read_text()
+)
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c["name"])

@@ -1,6 +1,6 @@
 """Explicit filesystem ports for legacy metadata artifacts.
 
-The local adapter has no initialization side effects. Calls keep F's modes,
+The local adapter has no initialization side effects. Calls keep the original modes,
 encoding defaults, mmap lifetime and replacement order; it adds no validation.
 """
 

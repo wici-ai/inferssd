@@ -1,8 +1,8 @@
-"""Freeze F's native versus dry-run refusal without executing a launcher.
+"""Freeze the reference native versus dry-run refusal without executing a launcher.
 
 Only the original die/refuse shell function definitions are loaded. Every
 operation in the subprocess is a Bash builtin; no host fact, tool or server is
-called. The source remains the already frozen F launcher, not candidate code.
+called. The source remains the already frozen reference launcher, not candidate code.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""Additional original F numeric-boundary observations; no candidate imports."""
+"""Additional reference numeric-boundary observations; no candidate imports."""
 NUMERIC_CASES = [
     {"name": "reserve-leading-zero", "env": {"VRAM_RESERVE_MIB": "010"}},
     {"name": "port-leading-zero", "env": {"LLAMA_SERVER_PORT": "010"}},

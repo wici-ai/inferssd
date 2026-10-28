@@ -8,13 +8,13 @@ from pathlib import Path
 import pytest
 from launch_test_paths import canonical_roots
 from observe_launch_candidate import mac_candidate
-from observe_launch_F import mac_case
+from observe_launch_reference import mac_case
 
 GOLDENS = json.loads((Path(__file__).parent / "fixtures/launch-mac-goldens.json").read_text())
 
 
 def original_cache_namespace(value):
-    """Project only the renamed alias-cache path components onto frozen F."""
+    """Project only the renamed alias-cache path components onto the frozen reference."""
     if isinstance(value, str):
         return re.sub(
             r"(^|/)cache/inferssd/mac-alias(?=/|['\"]|$)",
@@ -36,7 +36,7 @@ def original_cache_namespace(value):
 def original_helper_spelling(observation):
     """Normalize the explicit entrypoint and cache-namespace renames only.
 
-    Keep original F files and observations immutable. The actual new argv and
+    Keep reference files and observations immutable. The actual new argv and
     isolated installed-wheel execution are checked independently by alias tests.
     Every argument following the helper entrypoint, all effects, errors and
     partial-publication artifacts still compare against the original records.

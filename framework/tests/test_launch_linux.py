@@ -1,4 +1,4 @@
-"""Replay frozen Linux F observations without running a shell or host probe."""
+"""Replay frozen Linux reference observations without running a shell or host probe."""
 
 import json
 import shlex
@@ -130,7 +130,7 @@ def external_order(calls):
 
 
 @pytest.mark.parametrize("record", GOLDENS, ids=lambda r: r["case"]["name"])
-def test_host_and_artifact_requests_keep_f_order(record):
+def test_host_and_artifact_requests_keep_reference_order(record):
     names = {
         "filesystem",
         "index",
@@ -166,7 +166,7 @@ def test_complete_settings_command_feeds_resolver():
     assert generated == case["expected"][runtime_key()]
     record = next(
         r
-        for r in json.loads((fixtures / "launch-settings-composed-F.json").read_text())
+        for r in json.loads((fixtures / "launch-settings-composed-reference.json").read_text())
         if r["case"]["name"].endswith(runtime_key())
     )
     record = copy.deepcopy(record)

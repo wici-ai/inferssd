@@ -13,16 +13,16 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from test_offline_planner import F_PREFILL, F_SIM, exact, load
+from test_offline_planner import REFERENCE_PREFILL, REFERENCE_SIM, exact, load
 
 FIXTURES = Path(__file__).parent / "fixtures"
-with patch.dict(sys.modules, prefill=F_PREFILL):
-    F = load("logparse")
+with patch.dict(sys.modules, prefill=REFERENCE_PREFILL):
+    REFERENCE = load("logparse")
 
 
 def consumer(name):
     """Load frozen definitions without executing insitu's unguarded CLI."""
-    path = FIXTURES / "oracle" / f"{name}_f.py"
+    path = FIXTURES / "oracle" / f"{name}_reference.py"
     tree = ast.parse(path.read_text())
     if name == "insitu":
         tree.body = tree.body[
@@ -33,18 +33,20 @@ def consumer(name):
                 and any(isinstance(t, ast.Name) and t.id == "ap" for t in n.targets)
             )
         ]
-    module = ModuleType(f"log_consumer_{name}_F")
+    module = ModuleType(f"log_consumer_{name}_reference")
     module.__file__ = str(path)
     saved = sys.path[:]
     try:
-        with patch.dict(sys.modules, prefill=F_PREFILL, sim=F_SIM, logparse=F):
+        with patch.dict(
+            sys.modules, prefill=REFERENCE_PREFILL, sim=REFERENCE_SIM, logparse=REFERENCE
+        ):
             exec(compile(tree, str(path), "exec"), module.__dict__)
     finally:
         sys.path[:] = saved
     return module
 
 
-F_INSITU, F_ONLINE = consumer("insitu"), consumer("online")
+REFERENCE_INSITU, REFERENCE_ONLINE = consumer("insitu"), consumer("online")
 
 
 def runtime_key():
@@ -103,19 +105,19 @@ class Files:
 
 
 @contextlib.contextmanager
-def f_api(files):
+def reference_api(files):
     with (
-        patch.object(F, "open", files.open, create=True),
-        patch.object(F, "gzip", SimpleNamespace(open=files.gzip_open)),
+        patch.object(REFERENCE, "open", files.open, create=True),
+        patch.object(REFERENCE, "gzip", SimpleNamespace(open=files.gzip_open)),
     ):
         yield SimpleNamespace(
-            ArmParser=F.ArmParser,
+            ArmParser=REFERENCE.ArmParser,
             result=lambda p, d, s: p.result(d, s),
-            read_arm=F.read_arm,
-            ledger=F.ledger,
-            hits=F.hits,
-            window_rate=F.window_rate,
-            median=F.median,
+            read_arm=REFERENCE.read_arm,
+            ledger=REFERENCE.ledger,
+            hits=REFERENCE.hits,
+            window_rate=REFERENCE.window_rate,
+            median=REFERENCE.median,
         )
 
 
@@ -146,7 +148,7 @@ def aliases(p, result):
     return same
 
 
-def observe(case, api_factory=f_api):
+def observe(case, api_factory=reference_api):
     files = Files(case)
     steps, snapshots = [], []
     parser = None
@@ -174,11 +176,11 @@ def observe(case, api_factory=f_api):
                     value = api.median(action[1])
                 elif kind in ("measure", "measure_graph"):
                     with (
-                        patch.object(F_INSITU, "read_arm", api.read_arm),
-                        patch.object(F_INSITU, "hits", api.hits),
-                        patch.object(F_INSITU, "median", api.median),
+                        patch.object(REFERENCE_INSITU, "read_arm", api.read_arm),
+                        patch.object(REFERENCE_INSITU, "hits", api.hits),
+                        patch.object(REFERENCE_INSITU, "median", api.median),
                     ):
-                        value = getattr(F_INSITU, kind)("/case/run", *action[1:])
+                        value = getattr(REFERENCE_INSITU, kind)("/case/run", *action[1:])
                 elif kind == "served":
                     calls = []
 
@@ -194,16 +196,19 @@ def observe(case, api_factory=f_api):
                             return 2.5, 1.25
 
                     with (
-                        patch.object(F_ONLINE, "open", files.open, create=True),
+                        patch.object(REFERENCE_ONLINE, "open", files.open, create=True),
                         patch.object(
-                            F_ONLINE,
+                            REFERENCE_ONLINE,
                             "os",
                             SimpleNamespace(path=SimpleNamespace(exists=lambda p: p in files.data)),
                         ),
-                        patch.object(F_ONLINE, "_read_arm_cached", api.read_arm),
-                        patch.object(F_ONLINE, "window_rate", api.window_rate),
+                        patch.object(REFERENCE_ONLINE, "_read_arm_cached", api.read_arm),
+                        patch.object(REFERENCE_ONLINE, "window_rate", api.window_rate),
                     ):
-                        value = [F_ONLINE.served(Machine(), ["/case/run"], *action[1:]), calls]
+                        value = [
+                            REFERENCE_ONLINE.served(Machine(), ["/case/run"], *action[1:]),
+                            calls,
+                        ]
                 else:
                     raise AssertionError(kind)
                 steps.append([kind, "return", exact(value), digest(vars(parser))])
@@ -221,11 +226,11 @@ DATA = json.loads((FIXTURES / "log-records-goldens.json").read_text())
 
 
 @pytest.mark.parametrize("case", DATA["cases"], ids=lambda c: c["name"])
-def test_f_log_records(case):
+def test_reference_log_records(case):
     assert observe(case) == case["expected"][runtime_key()]
 
 
-def test_f_log_source_identity():
+def test_reference_log_source_identity():
     manifest = json.loads((FIXTURES / "oracle/logparse-manifest.json").read_text())
     for item in manifest["files"]:
         assert (

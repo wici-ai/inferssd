@@ -1,4 +1,4 @@
-"""F's graph-memory bounds on recorded observations; this module reads no device."""
+"""The original graph-memory bounds on recorded observations; this module reads no device."""
 
 from __future__ import annotations
 

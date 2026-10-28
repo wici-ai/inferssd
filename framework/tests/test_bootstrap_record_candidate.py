@@ -1,4 +1,4 @@
-"""Actual typed command/CLI comparisons against independently frozen whole F."""
+"""Actual typed command/CLI comparisons against the independently frozen whole reference."""
 
 import gzip
 import inspect
@@ -25,7 +25,7 @@ def execute_candidate(case, host):
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case["name"])
-def test_candidate_whole_F_transcript(case):
+def test_candidate_whole_reference_transcript(case):
     expected = json.loads((FIXTURES / "bootstrap-records-goldens.json").read_text())
     assert observe(case, execute_candidate) == expected[runtime_key()][case["name"]]
 

@@ -16,7 +16,7 @@ import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 
-ORACLE = Path(__file__).parent / "fixtures/oracle/controller_f.py"
+ORACLE = Path(__file__).parent / "fixtures/oracle/controller_reference.py"
 
 
 def scalar(value):
@@ -344,7 +344,10 @@ def observe(case):
 
 
 def generate():
-    return {"source": "controller_f.py:Engine/post/TRACE_ENV", "cases": [observe(c) for c in CASES]}
+    return {
+        "source": "controller_reference.py:Engine/post/TRACE_ENV",
+        "cases": [observe(c) for c in CASES],
+    }
 
 
 if __name__ == "__main__":

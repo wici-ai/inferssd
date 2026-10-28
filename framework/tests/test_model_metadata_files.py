@@ -12,18 +12,18 @@ import sys
 from unittest.mock import patch
 
 import pytest
-from test_model_metadata import F_HEADER, F_SOURCE, FIXTURES, gguf, pack
+from test_model_metadata import FIXTURES, REFERENCE_HEADER, REFERENCE_SOURCE, gguf, pack
 
 from inferssd.source import experts, header
 
 
 def original_command(argv):
-    tree = ast.parse((FIXTURES / "oracle/expert_source_f.py").read_text())
+    tree = ast.parse((FIXTURES / "oracle/expert_source_reference.py").read_text())
     block = next(n for n in tree.body if isinstance(n, ast.If))
     with patch.object(sys, "argv", ["expert_source.py", *argv]):
         exec(
             compile(ast.Module(body=[block], type_ignores=[]), "original-dispatch", "exec"),
-            dict(vars(F_SOURCE), __name__="__main__"),
+            dict(vars(REFERENCE_SOURCE), __name__="__main__"),
         )
 
 
@@ -65,7 +65,7 @@ def test_real_files_and_cli_bytes(tmp_path, kind):
         assert (result.stdout, result.stderr) == (stdout, stderr)
     assert {p.name: p.read_bytes() for p in target.iterdir()} == original_files
     # The local mmap adapter produces the same NamedTuple data after unmapping.
-    assert header.read_model(str(model)) == F_HEADER.read_model(str(model))
+    assert header.read_model(str(model)) == REFERENCE_HEADER.read_model(str(model))
 
 
 def test_real_mtime_and_glob_escape(tmp_path):
@@ -74,13 +74,13 @@ def test_real_mtime_and_glob_escape(tmp_path):
     (tmp_path / "model[1]-00002-of-00002.gguf").write_bytes(gguf({"tensors": []}))
     # Must not include this unmatched path: the shard prefix is glob-escaped.
     (tmp_path / "model1-00002-of-00002.gguf").write_bytes(b"bad")
-    assert header.shards(str(model)) == F_HEADER.shards(str(model))
+    assert header.shards(str(model)) == REFERENCE_HEADER.shards(str(model))
     target = str(tmp_path / "index")
-    expected = F_SOURCE.build(str(model), None, target)
+    expected = REFERENCE_SOURCE.build(str(model), None, target)
     assert experts.current(target, str(model), None) == expected
     made = os.path.getmtime(f"{target}/experts.json")
     os.utime(model, (made + 1, made + 1))
-    assert F_SOURCE.current(target, str(model), None) is None
+    assert REFERENCE_SOURCE.current(target, str(model), None) is None
     assert experts.current(target, str(model), None) is None
 
 
@@ -93,7 +93,7 @@ def test_real_missing_input_no_artifact(tmp_path):
     )
     assert result.returncode != 0
     assert "FileNotFoundError" in result.stderr
-    # F creates the directory before header access; preserve that failure side effect.
+    # The reference creates the directory before header access; preserve that failure side effect.
     assert out.is_dir() and not list(out.iterdir())
 
 

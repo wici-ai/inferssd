@@ -1,4 +1,4 @@
-"""F's placement formatting with an explicitly supplied lazy host fallback."""
+"""The original placement formatting with an explicitly supplied lazy host fallback."""
 
 from __future__ import annotations
 

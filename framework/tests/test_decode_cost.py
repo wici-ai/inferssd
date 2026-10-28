@@ -14,8 +14,8 @@ from inferssd.model.decode_cost import LayerResponse, fit_response, price_decode
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GOLDENS = json.loads((FIXTURES / "decode-cost-goldens.json").read_text())
-ORACLE_PATH = FIXTURES / "oracle/sim_f.py"
-SPEC = importlib.util.spec_from_file_location("decode_cost_f_oracle", ORACLE_PATH)
+ORACLE_PATH = FIXTURES / "oracle/sim_reference.py"
+SPEC = importlib.util.spec_from_file_location("decode_cost_reference", ORACLE_PATH)
 ORACLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ORACLE)
 
@@ -50,7 +50,7 @@ def test_oracle_identity():
 
 
 @pytest.mark.parametrize("case", GOLDENS["price_cases"], ids=lambda case: case["name"])
-def test_frozen_f_price(case):
+def test_frozen_reference_price(case):
     check_result(
         lambda: ORACLE.price(case["rows"], case["costs"], case["cpu_scale"]), case["legacy"]
     )
@@ -64,7 +64,7 @@ def test_typed_price_exact(case):
 
 
 @pytest.mark.parametrize("case", GOLDENS["fit_cases"], ids=lambda case: case["name"])
-def test_frozen_f_fit(case):
+def test_frozen_reference_fit(case):
     check_result(lambda: ORACLE.lstsq(case["x"], case["y"]), case["legacy"])
 
 

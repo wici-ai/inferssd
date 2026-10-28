@@ -1,4 +1,4 @@
-"""Typing views for F's settings generator; these do not validate or normalize data."""
+"""Typing views for the original settings generator; these do not validate or normalize data."""
 
 from __future__ import annotations
 
