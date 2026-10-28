@@ -2,8 +2,10 @@
 
 The installed framework does not discover a source checkout. Pass `--resources`
 to bind one deployment, or provide both `--binary` and `--template`. The optional
-`--repo` adapter selects `build/bin/llama-server` (`build-mac` on Darwin) and
-`engine/models/templates/` in a development checkout.
+`--repo` adapter uses `engine/models/templates/` in a development checkout and
+the first `bin/llama-server` it finds under the preset build directory
+(`build-linux-cuda`, then `build-linux-cpu` on Linux; `build-macos-metal` on
+Darwin), then under `build-mac` (Darwin only) or `build`.
 
 A descriptor is ordinary JSON. Relative paths resolve against its own directory:
 

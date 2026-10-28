@@ -188,11 +188,14 @@ def _resolve(
         raise ValueError("engine resource platform differs from the selected platform")
     binary_path = spec.binary or (resources.binary if resources else None)
     if not binary_path and s.inputs.repo:
-        binary_path = (
-            s.inputs.repo
-            + ("/build-mac" if platform == "darwin" else "/build")
-            + "/bin/llama-server"
+        # Preset build directories first, then the conventional ad hoc ones.
+        builds = (
+            ("build-macos-metal", "build-mac", "build")
+            if platform == "darwin"
+            else ("build-linux-cuda", "build-linux-cpu", "build")
         )
+        candidates = [s.inputs.repo + "/" + name + "/bin/llama-server" for name in builds]
+        binary_path = next((c for c in candidates if s.value("is_file", c)), candidates[0])
     if not binary_path:
         raise ValueError("provide --binary or an engine resource descriptor")
     binary = s.text("resolved_path", binary_path)

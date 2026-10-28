@@ -52,7 +52,8 @@ A model must be a local GGUF or the first shard of a complete set. An omitted
 `expert.source` generates a strict header-validated alias from that set; explicit
 sources must be nonempty existing alias paths. Native source validation remains
 a separate boundary. The launcher does not download models. Use `--binary` for
-an explicit server executable or the repository's `build[-mac]/bin/llama-server`.
+an explicit server executable; otherwise `--repo` selects the checkout's build as
+described in [engine resources](../docs/engine-resources.md).
 
 Dry-run requires recorded host facts and a fresh exclusively claimed output
 directory. It may create source metadata and `settings.ssd`, but does not query

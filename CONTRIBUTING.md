@@ -85,11 +85,13 @@ gitleaks git --log-opts="--all"
 ```
 
 Framework lint and type checks are listed in [development checks](framework/README.md#development-checks);
-the complete set of hosted checks is in [ci.yml](.github/workflows/ci.yml).
+the hosted checks are defined in [.github/workflows](.github/workflows).
 
-Python tests use synthetic inputs and do not start a model. Unexpected skipped tests are failures. Native
-test targets are described in [testing](docs/testing.md). CI builds and runs the CPU unit tests and the macOS
-cache tests on hosted runners.
+Python tests use synthetic inputs and do not start a model. Run them with Python 3.9 or 3.12; the recorded
+transcript checks are bound to those versions and skip on others. CI runs both. Unexpected skipped tests are
+failures. Native test targets are described in [testing](docs/testing.md). CI builds the documented CMake presets,
+runs the CPU unit tests and the macOS cache tests on hosted runners, and compiles the CUDA server whenever the
+engine or build configuration changes.
 
 Device performance checks are triggered by maintainers after review and run only for pull requests from
 branches in this repository; fork pull requests receive hosted CI only. See [device CI](bench/ci/README.md).
