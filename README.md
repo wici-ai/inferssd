@@ -33,7 +33,7 @@ These results compare complete inference configurations. In the Mac DeepSeek run
 | **CPU / SoC** | Apple M5 Max | Intel Core 3 100U | Intel Core Ultra 5 230F | NVIDIA GB10 |
 | **CPU cores** | 18 | 6 | 10 | 20 |
 | **GPU** | 40-core Apple GPU | RTX 5060 Ti | RTX 5090 | NVIDIA Blackwell |
-| **System memory** | 48 GB unified | 8 GB RAM | 16 GB RAM | 128 GB unified |
+| **System memory** | 48 GB unified | 8 GB RAM | 32 GB RAM | 128 GB unified |
 | **GPU memory** | Shared | 16 GB VRAM | 32 GB VRAM | Shared |
 | **SSD capacity** | 2 TB | 2 TB | 2 TB | 4 TB |
 | **SSD interface** | Apple internal storage | PCIe 4.0 ×4 | PCIe 5.0 ×4 | PCIe 5.0 ×4 |
