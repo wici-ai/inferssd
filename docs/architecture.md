@@ -22,7 +22,7 @@ flowchart LR
 
 Source indexes locate expert byte ranges in the original GGUF files or a matching v1 expert pack. Indexing GGUF headers does not copy the model payload. Packs group expert slices by layer and expert with **4 KiB alignment**, preserving the existing quantized bytes. The v1 format has no checkpoint fingerprint, so keep each pack paired with its source checkpoint.
 
-The runtime owns immutable source metadata, readers, host-budget accounting and telemetry for each context. Executors borrow those services. Linux and Windows run configured experts on the CPU sink, which reads through the OS read ring (`io_uring` on Linux, IoRing on Windows) into its RAM cache; Linux adds the CUDA cache tier. macOS still uses its native reader and cache path with an RSS guard; the sink builds and is tested there. Device and source validation remains necessary for the selected configuration.
+The runtime owns immutable source metadata, readers, host-budget accounting and telemetry for each context. Executors borrow those services. Linux, macOS and Windows run configured experts on the same CPU sink, which reads through the OS read ring (`io_uring` on Linux, IoRing on Windows, persistent reader threads with `F_NOCACHE` on macOS) into its RAM cache; with CUDA, Linux adds the GPU cache tier. A GPU backend without that tier, such as Metal, runs the dense layers, and the sink computes every routed expert on the CPU. Device and source validation remains necessary for the selected configuration.
 
 ## Threads
 
@@ -69,7 +69,7 @@ Run `python3 scripts/inferssd/check-layering.py` to check these boundaries.
 
 The context owns sources, host registration, the telemetry writer, transport and diagnostics; executors borrow them. Graph failure fences outstanding seed consumers before reset. A precompute transaction restores touched and purged KV metadata without allocating, and it ends before compute submission. Stateful memory that cannot roll back a submitted failure clears the affected sequences for checkpoint restore or replay. Backend destruction quiesces transport before destroying CUDA streams. The writer and source descriptors close after all borrowers stop.
 
-Allocation admission precedes allocation and first touch; committed allocations invalidate learning intervals when they are later freed or replaced. Linux uses finite cgroup constraints; the Mac cache keeps its platform RSS guard.
+Allocation admission precedes allocation and first touch; committed allocations invalidate learning intervals when they are later freed or replaced. Linux uses finite cgroup constraints; macOS and Windows use the process envelope described in [configuration](configuration.md).
 
 ## Settings and deployment
 

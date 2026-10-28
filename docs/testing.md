@@ -26,9 +26,8 @@ The CUDA SSD transport (`GGML_CUDA_KIMI_VRAM_TIER=ON`, set by the `linux-cuda`
 preset) additionally requires liburing; configuration fails without it. CPU-only
 builds do not need liburing: on Linux the CPU sink submits io_uring requests
 through system calls. System-ggml and runtime backend-plugin variants remain
-outside this store's supported build boundary. On macOS the runtime still reads
-configured experts through the Mac expert source; the store and the sink build
-there and their tests run. The OFF configuration is retained for explicit legacy
+outside this store's supported build boundary. Every OS runs configured experts
+through the store and the CPU sink. The OFF configuration is retained for explicit legacy
 comparison, not as a runtime fallback. `ssd_source_index` checks the store end to
 end on every OS.
 
@@ -93,35 +92,22 @@ historical failure totals; none is recorded in this repository yet.
 
 ## Apple Silicon integration
 
-`mac_expert_pack_cache` runs on Linux and macOS using a synthetic three-expert
-pack. It checks malformed headers and index entries, LFU retention/eviction and
-pinning while another expert is acquired. Linux uses the same reader/cache code
-without the Apple-only `F_NOCACHE` call. A malformed zero `data_start` is rejected
-before unsigned index-geometry arithmetic. ASan/UBSan are useful for this test.
-Four concurrent callers also exercise two decode and two prefill batches with a
-1 MiB cache, keeping three 1 MiB slices pinned until reverse-order release.
+macOS runs configured experts on the same CPU sink and store as Linux and
+Windows, so the sink, prefill, store, read-ring and platform suites above are its
+expert-path tests. `test-llama-mmap-dontneed` separately verifies Apple's mapping
+advice with a tiny temporary file; production memory/performance effects still
+require model runs. Launcher and metadata validation tests run with
+`python3 -m pytest -q tests/integration/test-macos-launcher.py`.
 
-`test-mac-expert-source` and its Python fixture runner cover pack and multi-shard
-GGUF alias sources, unaligned and exact-EOF slices, synchronous and asynchronous
-short reads, pinned entries, prefill cache isolation and staging backpressure.
-The large-budget fixture sets a 24 GiB limit but allocates only small selected
-slices. Run it with `python3 engine/tests/ssd/test-mac-expert-source.py build-macos-metal/bin/test-mac-expert-source`.
-It is model-free and supports ASan/UBSan and TSan builds. Launcher and metadata
-validation tests run with `python3 -m pytest -q tests/integration/test-macos-launcher.py`.
-
-On Apple Silicon, `mac_expert_operator_*` executes the production CPU source hook
-for 256/384 experts, 1/32/512 token rows, F32/Q8_0 weights, and read depths 0/2/4.
-Each case compares both broadcast and per-route inputs against a resident graph,
-then zeroes the resident weights before the alias computation. All output bytes
-must match, so a bypassed source hook cannot pass accidentally.
-`test-llama-mmap-dontneed` separately verifies Apple's mapping advice with a tiny
-temporary file; production memory/performance effects still require model runs.
-
-The Mac CI build enables Metal, runs that portable cache test, exercises Muse
-rendering with `test-chat --template muse-spark`, and checks the Q4_K/Q5_K/Q8_0
-CPU `MUL_MAT_ID` cases. This is a compilation and synthetic correctness gate.
-The separate target-device gate still needs matched model token sequences and
-memory/performance measurements; no model result follows from hosted CI.
+The Mac CI build enables Metal and runs a hosted-runner subset of those suites:
+the sink at one to three ggml threads, its SITU, SWIGLU_CLAMP and SWIGLU activations
+and grouped prefill, bit for bit against ggml reference graphs, the prefill llama
+graph, and the store's source index, read ring and platform layer. It also
+exercises Muse rendering with `test-chat --template muse-spark` and checks the
+Q4_K/Q5_K/Q8_0 CPU `MUL_MAT_ID` cases. This is a compilation and synthetic
+correctness gate. The separate target-device gate still needs matched model token
+sequences and memory/performance measurements; no model result follows from
+hosted CI.
 
 The unfiltered `test-chat` suite is outside the supported Muse rendering gate.
 It is not declared passing or silently allowlisted.

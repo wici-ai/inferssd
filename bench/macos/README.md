@@ -1,10 +1,13 @@
 # Mac expert-source experiments
 
-`measure.py` is a legacy experiment driver. It configures the Mac expert source
-through `SSD_LLAMA_MAC_*` and `GGML_MOE_*` environment variables, which current
-engine builds refuse at startup as retired controls. It applies only to builds
-that predate typed settings; current launches use the settings described in
-[configuration](../../docs/configuration.md).
+`measure.py` is a legacy experiment driver for the former Mac expert source, an
+LFU cache behind a CPU `MUL_MAT_ID` hook. It configures that source through
+`SSD_LLAMA_MAC_*` and `GGML_MOE_*` environment variables, which current engine
+builds refuse at startup as retired controls. It applies only to builds that
+predate typed settings and still contain that source. macOS now runs configured
+experts on the same CPU sink as Linux and Windows; current launches use the
+settings described in [configuration](../../docs/configuration.md) and report
+through native telemetry rather than the `[mac_expert_pack]` counters below.
 
 `measure.py` runs one fresh server for a specified model and configuration.
 The first request uses a fresh server, including its normal initialization probes;
@@ -112,11 +115,6 @@ responses and errors remain available for diagnosis. A complete receipt does not
 assert numerical equivalence: compare tokens and raw log probabilities with a
 matching baseline separately. Teacher/profile receipts are explicitly ineligible
 for throughput comparisons.
-
-The source test uses small synthetic files, including multiple sources, unaligned
-ranges, EOF, runtime truncation, duplicate keys, pinned entries and cache eviction.
-Depth 0/1/2/4 must return identical bytes and cache/read counters. Compile the test
-and reader as separate translation units with ASan/UBSan or TSan.
 
 Run protocol and image-identity tests without model weights:
 

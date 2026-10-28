@@ -21,12 +21,15 @@ directory. See the [quick start](quickstart.md#prepare-a-launch).
 
 The framework checks GGUF metadata and creates an alias index without duplicating
 model weights. It selects the matching chat template from the deployment
-resources. `host.expert_cache_mib` controls the supported cache, and `--threads`
-and `--batch-threads` select the decode `-t` and prefill `-tb` thread counts.
-macOS cannot pin threads to CPUs, so `--cpus` is refused there. The native
-process retains its RSS guard, cache pin ownership and drain behavior.
-Model-specific cache sizes need measured memory evidence and are not inferred
-from machine RAM alone.
+resources. The server runs the same SSD executor as on Linux: Metal computes the
+dense layers and the CPU sink reads and computes every routed expert, with its
+RAM cache sized within the process envelope (`host.budget_mib`, or the memory
+available at startup; see [configuration](configuration.md)). There is no GPU
+expert tier on macOS. `--threads` and `--batch-threads` select the decode `-t`
+and prefill `-tb` thread counts; macOS cannot pin threads to CPUs, so `--cpus` is
+refused there and `cpu.io_cpus` is only validated. Model-specific memory
+envelopes need measured memory evidence and are not inferred from machine RAM
+alone.
 
 Earlier environment-driven launch scripts are not supported interfaces. Copies
 kept under `framework/tests/fixtures` are test inputs only; do not run them as

@@ -19,7 +19,6 @@ Python resource. There are no environment mirrors or legacy-name aliases.
 | `vram.margin_mib` | integer / MiB | `64` | launch | linux |
 | `host.headroom_mib` | integer / MiB | `512` | plan | all |
 | `host.budget_mib` | integer / MiB | `0` | plan | darwin, windows |
-| `host.expert_cache_mib` | integer / MiB | `4096` | plan | darwin |
 | `model.engram_prefetch` | integer / boolean | `0` | model | all |
 | `model.hc_fused` | integer / boolean | `1` | model | all |
 
@@ -33,7 +32,12 @@ own I/O, prefetch and watch threads, and macOS, which cannot pin threads, only
 validates it. Zero decode participants leaves the measured/default policy; a
 positive value counts the leading ggml threads of each decode phase, and a
 decode call with fewer threads fails. The VRAM margin is at least reserve
-plus 64 MiB. Non-applicable platform keys cannot be explicitly set. On macOS the
+plus 64 MiB. Non-applicable platform keys cannot be explicitly set. The `vram.*`
+keys size the CUDA expert tier. `vram.budget = auto` gives the tier all the room
+the GPU admits and gives no tier where no CUDA backend runs: on macOS and
+Windows, on a CPU-only build, or with only Metal or another GPU backend, which
+then runs the dense layers while the CPU sink computes every routed expert. An
+explicit nonzero budget without a CUDA backend is an error. On macOS the
 interface supports static settings only; it does not include an online adaptive
 controller.
 
