@@ -26,7 +26,12 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     mode = launch.add_mutually_exclusive_group(required=True)
     mode.add_argument("--execute", action="store_true")
     mode.add_argument("--dry-run", action="store_true")
-    launch.add_argument("--platform", choices=("linux", "darwin"), required=True)
+    launch.add_argument(
+        "--platform",
+        choices=("linux", "darwin"),
+        default="darwin" if sys.platform == "darwin" else "linux",
+        help="defaults to this host",
+    )
     launch.add_argument("--repo", type=Path, help="optional development checkout adapter")
     launch.add_argument("--resources", type=Path, help="inferssd-engine 1 deployment descriptor")
     launch.add_argument("--template", type=Path, help="explicit chat template, overrides resources")

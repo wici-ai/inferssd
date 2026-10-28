@@ -116,10 +116,9 @@ Once the server is ready, open its address in your browser or point an OpenAI-co
 
 | Setup | Browser | API base URL |
 | --- | --- | --- |
-| Mac quick start | `http://127.0.0.1:8080` | `http://127.0.0.1:8080/v1` |
-| Linux quick start | `http://127.0.0.1:18181` | `http://127.0.0.1:18181/v1` |
+| Quick start | `http://127.0.0.1:8080` | `http://127.0.0.1:8080/v1` |
 
-For the Mac DeepSeek setup, send a request to port `8080`. For Linux, use port `18181`:
+Send a request to the default port `8080`:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
