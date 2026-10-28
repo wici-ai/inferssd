@@ -565,7 +565,7 @@ result<void> reject_retired_environment(const std::vector<std::string> & names) 
             }
             if (retired) {
                 return { status::invalid,
-                         "retired environment variable " + name + "; see docs/inferssd/migrating-from-ssd-llama.md" };
+                         "retired environment variable " + name + "; use typed settings, see docs/configuration.md" };
             }
         }
         return {};

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "models.h"
 #include "deepseek41-candidate.h"
 

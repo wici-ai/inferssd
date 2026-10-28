@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #pragma once
 
 #include <cmath>
@@ -18,6 +19,13 @@ static constexpr size_t LLAMA_DSV41_ENGRAM_SCALE_COUNT =
     LLAMA_DSV41_ENGRAM_DIM / LLAMA_DSV41_ENGRAM_SCALE_GROUP;
 static constexpr size_t LLAMA_DSV41_ENGRAM_ROW_BYTES =
     LLAMA_DSV41_ENGRAM_DIM + LLAMA_DSV41_ENGRAM_SCALE_COUNT;
+
+// The Engram decode arithmetic below is transcribed from antirez/ds4
+// ds4_engram.c at 8db1d1d155cb0400a86a86b9c62d0defb3a6148b.
+// Copyright (c) 2026 The ds4.c authors
+// Copyright (c) 2023-2026 The ggml authors
+// Copyright (c) 2023 DeepSeek
+// MIT License; see NOTICE, entry 4.
 
 // Round an F32 value to BF16 using round-to-nearest, ties-to-even, while
 // retaining F32 storage. This is the operation used by antirez's Engram reader.

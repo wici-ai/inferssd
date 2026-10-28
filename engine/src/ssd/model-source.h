@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include "llama-model-loader.h"
 void llama_coalesce_ranges(std::vector<llama_file_range> & ranges);

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 // Two-level candidate filter of DeepSeek-V4.1's sparse attention, as in vLLM deepseek_v41
