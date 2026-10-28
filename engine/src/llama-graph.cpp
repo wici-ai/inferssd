@@ -2068,6 +2068,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 descriptor->activation =
                     kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, execution.clamp };
                 break;
+            case llama_ssd::expert_activation::swiglu:
+                descriptor->activation =
+                    kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f };
+                break;
             case llama_ssd::expert_activation::unsupported:
                 GGML_ABORT("invalid accepted SSD expert activation");
         }

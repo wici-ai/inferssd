@@ -211,7 +211,7 @@ llama_context::llama_context(
     if (cpu_sink_enabled) {
         if (llama_ssd::describe_experts(model.arch, model.hparams, -1).activation ==
                 llama_ssd::expert_activation::unsupported) {
-            throw std::runtime_error("SSD CPU experts require DeepSeek-V4.1 or Muse Spark");
+            throw std::runtime_error("SSD CPU experts do not support this model architecture");
         }
         if (cparams.n_seq_max != 1) {
             throw std::runtime_error("SSD CPU experts require --parallel 1 (-np 1)");
@@ -248,7 +248,9 @@ llama_context::llama_context(
     reserve_horizon_enabled = true;
     cpu_prefill_actual_shape_enabled = cpu_sink_enabled;
     if (cpu_prefill_actual_shape_enabled) { cpu_prefill_configured_ubatch = cparams.n_ubatch; }
-    cpu_prefill_output_sizing_enabled = model.arch == LLM_ARCH_DEEPSEEK41 || model.arch == LLM_ARCH_MUSE_SPARK;
+    // The SSD expert architectures size the prompt graph's outputs by the request, not one per token.
+    cpu_prefill_output_sizing_enabled = llama_ssd::describe_experts(model.arch, model.hparams, -1).activation !=
+        llama_ssd::expert_activation::unsupported;
     if (cpu_prefill_output_sizing_enabled) { sched_reserve_n_outputs = cparams.n_seq_max; }
 
     cparams.op_offload = params.op_offload;

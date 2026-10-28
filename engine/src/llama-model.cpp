@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "ssd/model-adapter.h"
 #include "ssd/model-pages.h"
 
 #include "llama-arch.h"
@@ -3517,8 +3518,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_WARN("%s: deferred expert loading disabled because tensor validation would fault expert pages eagerly\n", __func__);
         defer_expert_mmap = false;
     }
-    const bool defer_kimi_experts_on_gpu = llama_should_defer_kimi_experts_on_gpu(arch, name);
-    if (defer_expert_mmap && defer_kimi_experts_on_gpu && !devices.empty() && n_gpu_layers > 0) {
+    // Deferred routed experts stay in mmap-backed CPU buffers with GPU layers: Kimi's, and those of every
+    // architecture the SSD expert adapter describes, which the SSD executor reads on the CPU.
+    const bool keep_experts_on_cpu = llama_should_defer_kimi_experts_on_gpu(arch, name) ||
+        llama_ssd::describe_experts(arch, hparams, -1).activation != llama_ssd::expert_activation::unsupported;
+    if (defer_expert_mmap && keep_experts_on_cpu && !devices.empty() && n_gpu_layers > 0) {
         deferred_expert_buft_override_patterns.reserve(n_layer);
         deferred_expert_buft_overrides.reserve(n_layer + 1);
 
