@@ -142,8 +142,8 @@ class Engine:
                 effects.sleep(1)
             self.start_s = effects.clock() - beginning
         except BaseException:
-            # F left an owned process/log behind on these failures. Cleanup is
-            # an intentional safety boundary, not claimed as F event equivalence.
+            # The original implementation left an owned process/log behind on these
+            # failures. Cleanup is an intentional safety boundary, not event equivalence.
             try:
                 if self._owner is not None:
                     self._owner.stop()

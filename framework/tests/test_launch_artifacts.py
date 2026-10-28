@@ -1,11 +1,11 @@
-"""Actual typed artifact effects against the already frozen original F transcripts."""
+"""Actual typed artifact effects against the already frozen reference transcripts."""
 
 import hashlib
 import os
 from pathlib import Path
 
 import pytest
-from observe_launch_F import header, normalize
+from observe_launch_reference import header, normalize
 from test_launch_linux import GOLDENS
 
 from inferssd.launch.linux import resolve_linux

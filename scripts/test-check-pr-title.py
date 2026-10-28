@@ -28,7 +28,7 @@ class TitleTests(unittest.TestCase):
     def test_invalid_titles_fail(self):
         # The blocked company-name fixture is split so that this file passes public-scan.
         for title in ("Compare reviewed PR performance",
-                      "test: freeze F settings",
+                      "test: freeze reference settings",
                       "docs: WI" + "CI-InferSSD",
                       "docs: Add the quickstart guide",
                       "docs: added the quickstart guide",
@@ -48,7 +48,7 @@ class TitleTests(unittest.TestCase):
 
     def test_test_area_names_the_rule(self):
         self.assertIn("use the area of the tested module instead of 'test'",
-                      self.problems("test: freeze F settings"))
+                      self.problems("test: freeze reference settings"))
 
     def test_public_scan_rejects_internal_name(self):
         self.assertTrue(any(problem.startswith("public-scan:")

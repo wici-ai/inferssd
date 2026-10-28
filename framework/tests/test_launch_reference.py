@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from launch_cases import LINUX_CASES, MAC_CASES
 from launch_test_paths import canonical_roots
-from observe_launch_F import mac_case
+from observe_launch_reference import mac_case
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

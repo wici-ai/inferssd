@@ -1,4 +1,4 @@
-"""F-first whole request/artifact commands; all effects are supplied in memory."""
+"""Reference-first whole request/artifact commands; all effects are supplied in memory."""
 
 from __future__ import annotations
 
@@ -16,9 +16,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from test_log_records import F as F_LOG
-from test_loop_model import Effects, f_api, model_files, snapshot, trace
-from test_offline_planner import F_PREFILL, exact, runtime_key
+from test_log_records import REFERENCE as REFERENCE_LOG
+from test_loop_model import Effects, model_files, reference_api, snapshot, trace
+from test_offline_planner import REFERENCE_PREFILL, exact, runtime_key
 
 FIXTURES = Path(__file__).parent / "fixtures"
 ORACLES = FIXTURES / "oracle"
@@ -165,9 +165,9 @@ class RequestEffects(Effects):
         return Response()
 
 
-def execute_f(name, h, api, argv=()):
+def execute_reference(name, h, api, argv=()):
     """Execute the complete frozen script, replacing imports only with supplied ports."""
-    source = ORACLES / (name + "_f.py")
+    source = ORACLES / (name + "_reference.py")
     fake_sys = SimpleNamespace(argv=[name + ".py", *argv], path=[], exit=sys.exit)
 
     class Environ:
@@ -197,8 +197,8 @@ def execute_f(name, h, api, argv=()):
         "urllib.request": SimpleNamespace(
             request=SimpleNamespace(Request=urllib.request.Request, urlopen=h.urlopen)
         ),
-        "prefill": F_PREFILL,
-        "logparse": F_LOG,
+        "prefill": REFERENCE_PREFILL,
+        "logparse": REFERENCE_LOG,
         "machine": SimpleNamespace(Machine=api.make_machine),
         "controller": SimpleNamespace(Controller=api.Controller),
     }
@@ -261,28 +261,28 @@ def argv_for(kind, case):
 
 @contextlib.contextmanager
 def original_api(h):
-    with f_api(h) as api:
-        execute_f("client", h, api)
+    with reference_api(h) as api:
+        execute_reference("client", h, api)
         yield SimpleNamespace(
             model=api,
             turn=lambda *a: h.turn(h.ns["client"]["turn"], *a),
-            script=lambda argv: script_f(h, api, argv),
-            bootstrap=lambda argv: execute_f("boot_client", h, api, argv),
-            conversation=lambda argv: execute_f("converse", h, api, argv),
-            report=lambda argv: execute_f("compare_online", h, api, argv),
+            script=lambda argv: script_reference(h, api, argv),
+            bootstrap=lambda argv: execute_reference("boot_client", h, api, argv),
+            conversation=lambda argv: execute_reference("converse", h, api, argv),
+            report=lambda argv: execute_reference("compare_online", h, api, argv),
         )
 
 
-def script_f(h, api, argv):
-    ns = execute_f("client", h, api, argv)
+def script_reference(h, api, argv):
+    ns = execute_reference("client", h, api, argv)
     fn = ns["turn"]
     ns["turn"] = lambda *a: h.turn(fn, *a)
     return ns["main"]()
 
 
 def pipeline(h, api, case):
-    """Actual F producer output feeds the already frozen fit→plan→settings call graph."""
-    from test_recorded_calibration import observe_f as fit
+    """Actual reference producer output feeds the already frozen fit→plan→settings call graph."""
+    from test_recorded_calibration import observe_reference as fit
     from test_recorded_calibration import synthetic_files
 
     raw = synthetic_files({})
@@ -369,7 +369,7 @@ def data():
 
 
 @pytest.mark.parametrize("case", data()["cases"], ids=lambda c: c["name"])
-def test_f_request_artifact(case):
+def test_reference_request_artifact(case):
     assert observe(case) == case["expected"][runtime_key()]
 
 

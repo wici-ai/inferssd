@@ -1,4 +1,4 @@
-"""Explicit typed-input tightening; original F observations remain unchanged."""
+"""Explicit typed-input tightening; reference observations remain unchanged."""
 
 import hashlib
 import json
@@ -8,13 +8,13 @@ import pytest
 from test_launch_linux import replay
 
 FIXTURES = Path(__file__).parent / "fixtures"
-NUMERIC = json.loads((FIXTURES / "launch-linux-numeric-F.json").read_text())
+NUMERIC = json.loads((FIXTURES / "launch-linux-numeric-reference.json").read_text())
 
 
 def test_numeric_frozen_bytes():
-    m = json.loads((FIXTURES / "launch-numeric-F-manifest.json").read_text())
+    m = json.loads((FIXTURES / "launch-numeric-reference-manifest.json").read_text())
     assert (
-        hashlib.sha256((FIXTURES / "launch-linux-numeric-F.json").read_bytes()).hexdigest()
+        hashlib.sha256((FIXTURES / "launch-linux-numeric-reference.json").read_bytes()).hexdigest()
         == m["golden_sha256"]
     )
     assert (

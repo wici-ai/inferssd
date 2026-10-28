@@ -1,4 +1,4 @@
-"""F source indexes, dense placement artifacts and fio text; no drive execution.
+"""Original source indexes, dense placement artifacts and fio text; no drive execution.
 
 JSON mappings remain unvalidated legacy views. Metadata does not certify the
 payload, full shard set, current native format support or Mac's strict alias path.

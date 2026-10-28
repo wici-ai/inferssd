@@ -1,4 +1,4 @@
-"""Synthetic inputs only. Expected observations come from whole frozen F scripts."""
+"""Synthetic inputs only. Expected observations come from whole frozen reference scripts."""
 
 from __future__ import annotations
 

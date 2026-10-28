@@ -84,7 +84,7 @@ class Normalize(ast.NodeTransformer):
                 node.body.pop(0)
         if node.name == "__init__" and node.body:
             # These two assignments only store the caller-owned ports. Check
-            # their exact form before removing them from the F comparison.
+            # their exact form before removing them from the reference comparison.
             expected = [
                 "self._engine_factory, self._post = engine_factory, post",
                 "self._effects, self._session = effects, session",
@@ -119,7 +119,7 @@ def test_online_calculation_ast(name):
     from inferssd.loop import model
 
     assert_equal(
-        functions(ORACLE / "online_f.py")[name],
+        functions(ORACLE / "online_reference.py")[name],
         functions(inspect.getsourcefile(model))[name],
     )
 
@@ -128,7 +128,7 @@ def test_session_read_ast():
     from inferssd.loop import records
 
     assert_equal(
-        functions(ORACLE / "online_f.py")["_read_arm_cached"],
+        functions(ORACLE / "online_reference.py")["_read_arm_cached"],
         functions(inspect.getsourcefile(records), "ObservationSession")["read_arm_cached"],
     )
 
@@ -152,6 +152,6 @@ def test_controller_transition_ast(name):
     from inferssd.loop import controller
 
     assert_equal(
-        functions(ORACLE / "controller_f.py", "Controller")[name],
+        functions(ORACLE / "controller_reference.py", "Controller")[name],
         functions(inspect.getsourcefile(controller), "Controller")[name],
     )

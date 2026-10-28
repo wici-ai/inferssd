@@ -1,10 +1,10 @@
-"""F's routing replay, preserving mutable state and its original update order.
+"""The original routing replay, preserving mutable state and its original update order.
 
 Inputs are already parsed integer expert IDs in ordered segments/tokens/layers.
 This leaf has no host, file or environment dependency and does not validate or
 normalize inputs. In particular, a replay checks only previous segment lengths;
 it does not compare their contents. Set iteration, stable score sorting, stale
-heap entries, duplicate hits and cached behind-tier queries retain F semantics.
+heap entries, duplicate hits and cached behind-tier queries retain original semantics.
 """
 
 from __future__ import annotations
@@ -197,7 +197,7 @@ class Replay:
         if slots not in self._behind_hits:
             hits = 0
             # behind=True is the caller contract. The cast is type-only: a call
-            # without tracking preserves F's AttributeError rather than silently
+            # without tracking preserves the original's AttributeError rather than silently
             # treating unrecorded routes as an empty history.
             for misses in cast(dict[int, list[BehindStep]], self.behind).values():
                 c = RamCache(slots)

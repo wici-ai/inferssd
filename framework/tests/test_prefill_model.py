@@ -13,8 +13,8 @@ import pytest
 from inferssd.model import prefill_model
 
 FIXTURES = Path(__file__).parent / "fixtures"
-ORACLE_PATH = FIXTURES / "oracle/prefill_f.py"
-SPEC = importlib.util.spec_from_file_location("prefill_model_f_oracle", ORACLE_PATH)
+ORACLE_PATH = FIXTURES / "oracle/prefill_reference.py"
+SPEC = importlib.util.spec_from_file_location("prefill_model_reference", ORACLE_PATH)
 ORACLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ORACLE)
 

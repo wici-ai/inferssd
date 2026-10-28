@@ -1,4 +1,4 @@
-"""F-first lifecycle and reviewed standalone ownership core receipts."""
+"""Reference-first lifecycle and reviewed standalone ownership core receipts."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import json
 from pathlib import Path
 
 import pytest
-from observe_engine_F import CASES, observe
-from observe_ownership_F import GROUP_CASES, LEASE_CASES, group_case, lease_case
+from observe_engine_reference import CASES, observe
+from observe_ownership_reference import GROUP_CASES, LEASE_CASES, group_case, lease_case
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

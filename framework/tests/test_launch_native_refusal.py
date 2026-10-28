@@ -7,7 +7,7 @@ from functools import partial
 
 import pytest
 import test_launch_linux as linux_fixture
-from observe_launch_refusal_F import CASES, observe
+from observe_launch_refusal_reference import CASES, observe
 
 from inferssd.engine import core
 from inferssd.launch.darwin import resolve_darwin
@@ -17,7 +17,7 @@ from inferssd.launch.types import Finished, LaunchInput, Reply
 
 
 def historical_engine(inputs, directory, port, observe, emit, platform="linux"):
-    """Test-only F resolver boundary. Production Runtime never calls it."""
+    """Test-only reference resolver boundary. Production Runtime never calls it."""
 
     def resolve(environment, extra):
         candidate = LaunchInput(

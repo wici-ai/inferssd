@@ -1,4 +1,4 @@
-"""Candidate call graph against independently frozen complete F observations."""
+"""Candidate call graph against independently frozen complete reference observations."""
 
 from __future__ import annotations
 
@@ -76,7 +76,9 @@ def candidate_api(h):
                 return h.getitem_env(key)
 
         with patch.object(
-            test_recorded_calibration, "observe_f", test_recorded_calibration.observe_candidate
+            test_recorded_calibration,
+            "observe_reference",
+            test_recorded_calibration.observe_candidate,
         ):
             yield SimpleNamespace(
                 model=model,
@@ -127,7 +129,7 @@ def test_execution_ports_have_no_default():
         assert all(p.default is inspect.Parameter.empty for p in ports)
 
 
-def test_offline_report_cli_matches_whole_f(tmp_path):
+def test_offline_report_cli_matches_whole_reference(tmp_path):
     import json
     import subprocess
 

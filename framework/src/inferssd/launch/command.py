@@ -18,7 +18,7 @@ from inferssd.launch.types import LaunchInput, Output
 
 def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     launch = commands.add_parser(
-        "launch-recorded", help="historical F resolver comparison; never execute a server"
+        "launch-recorded", help="compare with the historical resolver; never execute a server"
     )
     execution = launch.add_mutually_exclusive_group(required=True)
     execution.add_argument("--dry-run", action="store_true")

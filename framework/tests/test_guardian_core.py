@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from observe_guardian_F import CASES, observe
+from observe_guardian_reference import CASES, observe
 from test_ownership_core import WithoutTypes
 
 from inferssd.platform import guardian

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from test_log_records import F_ONLINE, F, exact
+from test_log_records import REFERENCE, REFERENCE_ONLINE, exact
 from test_offline_planner import DATA as PLAN_DATA
 from test_settings_command import DATA, CommandTranscript, runtime_key
 
@@ -30,8 +30,8 @@ def test_real_recorded_files_and_encoding(tmp_path, compressed):
         (tmp_path / "server.log").write_bytes(data)
     (tmp_path / "client.jsonl").write_text('{"tok_s":[0,null,1]}\n')
     (tmp_path / "meta.txt").write_text("load_s=1.25")
-    assert exact(recorded.read_arm(str(tmp_path))) == exact(F.read_arm(str(tmp_path)))
-    assert recorded.ledger(str(tmp_path)) == F.ledger(str(tmp_path))
+    assert exact(recorded.read_arm(str(tmp_path))) == exact(REFERENCE.read_arm(str(tmp_path)))
+    assert recorded.ledger(str(tmp_path)) == REFERENCE.ledger(str(tmp_path))
     (tmp_path / "client.jsonl").write_bytes(b"\xff")
     with pytest.raises(UnicodeDecodeError):
         recorded.read_arm(str(tmp_path))
@@ -79,21 +79,21 @@ def test_original_live_complete_line_consumer_accepts_new_parser(tmp_path):
     def run(parser, read_arm):
         snapshots = []
         with (
-            patch.object(F_ONLINE, "ArmParser", parser),
-            patch.object(F_ONLINE, "read_arm", read_arm),
-            patch.object(F_ONLINE, "_LIVE", {}),
-            patch.object(F_ONLINE, "_ARMS", {}),
+            patch.object(REFERENCE_ONLINE, "ArmParser", parser),
+            patch.object(REFERENCE_ONLINE, "read_arm", read_arm),
+            patch.object(REFERENCE_ONLINE, "_LIVE", {}),
+            patch.object(REFERENCE_ONLINE, "_ARMS", {}),
         ):
             path.write_bytes(b"")
             for data in (records[0][:40], records[0][40:] + records[1], records[2]):
                 with path.open("ab") as stream:
                     stream.write(data.encode())
-                result = F_ONLINE._read_arm_cached(str(tmp_path), 0)
+                result = REFERENCE_ONLINE._read_arm_cached(str(tmp_path), 0)
                 snapshots.append(exact(result))
-                snapshots.append(F_ONLINE._LIVE[str(path)][1])
+                snapshots.append(REFERENCE_ONLINE._LIVE[str(path)][1])
         return snapshots
 
-    assert run(legacy.ArmParser, recorded.read_arm) == run(F.ArmParser, F.read_arm)
+    assert run(legacy.ArmParser, recorded.read_arm) == run(REFERENCE.ArmParser, REFERENCE.read_arm)
 
 
 def populate(root, files):

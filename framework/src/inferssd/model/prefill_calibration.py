@@ -1,4 +1,4 @@
-"""F's prefill calibration from supplied observations, without artifact loading."""
+"""The original prefill calibration from supplied observations, without artifact loading."""
 
 from __future__ import annotations
 

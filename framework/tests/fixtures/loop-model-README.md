@@ -1,7 +1,7 @@
 # Controller and observation transcripts
 
 These 60 synthetic scenarios execute the online module and Controller class of
-the recorded reference revision (named `F` in fixture files; see the
+the recorded reference revision (see the
 [framework README](../../README.md#compatibility-and-failure-behavior)), with its
 original Machine, replay, price, prefill and log parser call graph. The loop
 sources are bound in `oracle/loop-manifest.json`; the other reference modules and

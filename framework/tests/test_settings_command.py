@@ -8,8 +8,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from test_log_records import Files, f_api, runtime_key
-from test_offline_planner import F_MACHINE, F_PLACEMENT, F_SETTINGS, Transcript, exact, state
+from test_log_records import Files, reference_api, runtime_key
+from test_offline_planner import (
+    REFERENCE_MACHINE,
+    REFERENCE_PLACEMENT,
+    REFERENCE_SETTINGS,
+    Transcript,
+    exact,
+    state,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -83,13 +90,16 @@ def snapshot(machine):
 def observe(case, *, full_host_boundary=False):
     tr, instances = CommandTranscript(case), []
     original_path = sys.path[:]
-    original_configuration, original_derive = F_SETTINGS.configuration, F_SETTINGS.derive
-    original_host = F_PLACEMENT.default_threads
+    original_configuration, original_derive = (
+        REFERENCE_SETTINGS.configuration,
+        REFERENCE_SETTINGS.derive,
+    )
+    original_host = REFERENCE_PLACEMENT.default_threads
 
     def missing_host_file(*args):
         raise OSError("synthetic host sysfs unavailable")
 
-    class Captured(F_MACHINE.Machine):
+    class Captured(REFERENCE_MACHINE.Machine):
         def __init__(self, *args, **kwargs):
             instances.append(self)
             super().__init__(*args, **kwargs)
@@ -108,35 +118,41 @@ def observe(case, *, full_host_boundary=False):
 
     try:
         with (
-            f_api(tr.logs) as logs,
+            reference_api(tr.logs) as logs,
             patch.dict(
                 sys.modules,
                 machine=SimpleNamespace(Machine=Captured),
                 logparse=SimpleNamespace(ledger=logs.ledger),
             ),
-            patch.object(F_MACHINE, "open", tr.open, create=True),
-            patch.object(F_MACHINE, "json", SimpleNamespace(load=lambda f: tr.read_json(f.name))),
-            patch.object(F_MACHINE, "os", SimpleNamespace(path=SimpleNamespace(exists=tr.exists))),
+            patch.object(REFERENCE_MACHINE, "open", tr.open, create=True),
             patch.object(
-                F_PLACEMENT,
+                REFERENCE_MACHINE, "json", SimpleNamespace(load=lambda f: tr.read_json(f.name))
+            ),
+            patch.object(
+                REFERENCE_MACHINE, "os", SimpleNamespace(path=SimpleNamespace(exists=tr.exists))
+            ),
+            patch.object(
+                REFERENCE_PLACEMENT,
                 "default_threads",
                 original_host if full_host_boundary else lambda _device: tr.host(),
             ),
-            patch.object(F_PLACEMENT, "open", missing_host_file, create=True),
-            patch.object(F_PLACEMENT, "os", SimpleNamespace(cpu_count=tr.host)),
-            patch.object(F_SETTINGS, "open", tr.open, create=True),
-            patch.object(F_SETTINGS, "json", SimpleNamespace(load=lambda f: tr.read_json(f.name))),
+            patch.object(REFERENCE_PLACEMENT, "open", missing_host_file, create=True),
+            patch.object(REFERENCE_PLACEMENT, "os", SimpleNamespace(cpu_count=tr.host)),
+            patch.object(REFERENCE_SETTINGS, "open", tr.open, create=True),
             patch.object(
-                F_SETTINGS,
+                REFERENCE_SETTINGS, "json", SimpleNamespace(load=lambda f: tr.read_json(f.name))
+            ),
+            patch.object(
+                REFERENCE_SETTINGS,
                 "os",
                 SimpleNamespace(path=SimpleNamespace(abspath=lambda p: p), replace=tr.replace),
             ),
-            patch.object(F_SETTINGS, "configuration", configuration),
-            patch.object(F_SETTINGS, "derive", derive),
+            patch.object(REFERENCE_SETTINGS, "configuration", configuration),
+            patch.object(REFERENCE_SETTINGS, "derive", derive),
             patch.object(sys, "argv", ["settings.py", "/case/run", *case["argv"]]),
             patch.object(sys, "stdout", SimpleNamespace(write=tr.stdout)),
         ):
-            F_SETTINGS.main()
+            REFERENCE_SETTINGS.main()
         outcome = ["return"]
     except Exception as error:
         outcome = [type(error).__name__, str(error)]
@@ -157,14 +173,14 @@ DATA = json.loads((FIXTURES / "settings-command-goldens.json").read_text())
 
 
 @pytest.mark.parametrize("case", DATA["cases"], ids=lambda c: c["name"])
-def test_f_settings_command(case):
+def test_reference_settings_command(case):
     assert observe(case) == case["expected"][runtime_key()]
 
 
 HOST_SUPPLEMENT = json.loads((FIXTURES / "settings-command-host-supplement.json").read_text())
 
 
-def test_f_original_host_boundary():
+def test_reference_original_host_boundary():
     case = next(c for c in DATA["cases"] if c["name"] == "host-needed")
     assert observe(case, full_host_boundary=True) == HOST_SUPPLEMENT["expected"][runtime_key()]
 

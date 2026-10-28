@@ -1,4 +1,4 @@
-"""F's complete settings derivation and ordered receipts, without file or host I/O."""
+"""The original complete settings derivation and ordered receipts, without file or host I/O."""
 
 from __future__ import annotations
 

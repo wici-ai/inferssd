@@ -1,6 +1,6 @@
 # Original launcher observations
 
-Expected outputs were produced only by the recorded reference revision `8b12192920b339a4ef31c9006d1ebe20304ce45a` (named `F` in fixture files), before the typed resolver existed. `oracle/launch-manifest.json` binds every original source. Linux uses Bash 5.2.21 on a Linux fixture host; Mac observations execute the original Python module with explicit Darwin/arm64 facts and intercepted process effects, under Python 3.9 and 3.12. No model or native engine is run.
+Expected outputs were produced only by the recorded reference revision `8b12192920b339a4ef31c9006d1ebe20304ce45a`, before the typed resolver existed. `oracle/launch-manifest.json` binds every original source. Linux uses Bash 5.2.21 on a Linux fixture host; Mac observations execute the original Python module with explicit Darwin/arm64 facts and intercepted process effects, under Python 3.9 and 3.12. No model or native engine is run.
 
 The 58 Linux cases include repeated index reuse/invalidation and preserve complete stdout/stderr/status, metadata command replies, ordered stub calls and artifact bytes. Native/service commands are fail-closed sentinels. CPU/memory/CUDA/port/service replies are fixture facts, not measurements of a GPU. The Linux uid and cgroup-v2 existence are explicit observations, not invented Mac behavior. The 28 Darwin cases capture would-exec argv/env, filesystem publication and all defined errors; they do not claim Apple hardware execution.
 

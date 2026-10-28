@@ -1,9 +1,9 @@
 {
-  "F": "8b12192920b339a4ef31c9006d1ebe20304ce45a",
+  "reference_revision": "8b12192920b339a4ef31c9006d1ebe20304ce45a",
   "oracle_commit": "0f33b283c78f60628528c905a6dbc436a16030b0",
-  "observer": "observe_launch_F.linux_case",
+  "observer": "observe_launch_reference.linux_case",
   "cases": "launch_numeric_cases.NUMERIC_CASES",
-  "cases_sha256": "c273252ff7f115346f34334e2120e19616e883f9dc320f88f4e9f816771ca6bb",
+  "cases_sha256": "16ba7d279112072732488af130530b5b6d53ad2b82a79cf85936c15b8e3512e5",
   "golden_sha256": "3e80c52fa62e858f2a9d6482d22abb4b02d402bd0760cbf7914f20c5967cb5b4",
   "cases_count": 9,
   "environment": "Same isolated Linux Bash5.2.21 fixture boundary as initial58. No candidate imports or engine execution."

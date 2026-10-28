@@ -1,4 +1,4 @@
-"""Candidate bodies execute against the unchanged F core transcripts, without OS effects."""
+"""Candidate bodies execute against the unchanged reference core transcripts, without OS effects."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from observe_ownership_F import GROUP_CASES, LEASE_CASES, group_case, lease_case
+from observe_ownership_reference import GROUP_CASES, LEASE_CASES, group_case, lease_case
 
 from inferssd.platform import lease, process
 

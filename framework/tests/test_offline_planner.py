@@ -18,7 +18,9 @@ ORACLES = FIXTURES / "oracle"
 
 
 def load(name):
-    spec = importlib.util.spec_from_file_location(f"planner_{name}_F", ORACLES / f"{name}_f.py")
+    spec = importlib.util.spec_from_file_location(
+        f"planner_{name}_reference", ORACLES / f"{name}_reference.py"
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -26,11 +28,17 @@ def load(name):
 
 saved_path = sys.path[:]
 try:
-    F_SIM, F_PREFILL, F_PLACEMENT = load("sim"), load("prefill"), load("placement")
-    with patch.dict(sys.modules, sim=F_SIM, prefill=F_PREFILL, placement=F_PLACEMENT):
-        F_SETTINGS = load("settings")
-        with patch.dict(sys.modules, settings=F_SETTINGS):
-            F_MACHINE = load("machine")
+    REFERENCE_SIM, REFERENCE_PREFILL, REFERENCE_PLACEMENT = (
+        load("sim"),
+        load("prefill"),
+        load("placement"),
+    )
+    with patch.dict(
+        sys.modules, sim=REFERENCE_SIM, prefill=REFERENCE_PREFILL, placement=REFERENCE_PLACEMENT
+    ):
+        REFERENCE_SETTINGS = load("settings")
+        with patch.dict(sys.modules, settings=REFERENCE_SETTINGS):
+            REFERENCE_MACHINE = load("machine")
 finally:
     sys.path[:] = saved_path
 
@@ -166,17 +174,17 @@ def actions(machine, case):
     return out
 
 
-def observe_f(case):
+def observe_reference(case):
     transcript, instances = Transcript(case), []
     output = io.StringIO()
     calls = []
 
-    class Captured(F_MACHINE.Machine):
+    class Captured(REFERENCE_MACHINE.Machine):
         def __init__(self, *args, **kwargs):
             instances.append(self)
             super().__init__(*args, **kwargs)
 
-    names = {v.__code__: k for k, v in vars(F_MACHINE.Machine).items() if callable(v)}
+    names = {v.__code__: k for k, v in vars(REFERENCE_MACHINE.Machine).items() if callable(v)}
 
     def profile(frame, event, arg):
         if event == "call" and frame.f_code in names:
@@ -186,9 +194,11 @@ def observe_f(case):
         load=lambda stream: transcript.read_json(stream.name), dump=json.dump, dumps=json.dumps
     )
     machine_api = SimpleNamespace(
-        Machine=Captured, layer_faults=F_MACHINE.layer_faults, row_faults=F_MACHINE.row_faults
+        Machine=Captured,
+        layer_faults=REFERENCE_MACHINE.layer_faults,
+        row_faults=REFERENCE_MACHINE.row_faults,
     )
-    original_host = F_PLACEMENT.default_threads
+    original_host = REFERENCE_PLACEMENT.default_threads
 
     def host(dev):
         if dev.get("default_threads"):
@@ -202,14 +212,18 @@ def observe_f(case):
         with contextlib.ExitStack() as stack:
             stack.enter_context(contextlib.redirect_stdout(output))
             stack.enter_context(patch.dict(sys.modules, machine=machine_api))
-            stack.enter_context(patch.object(F_MACHINE, "open", transcript.open, create=True))
-            stack.enter_context(patch.object(F_MACHINE, "json", fake_json))
+            stack.enter_context(
+                patch.object(REFERENCE_MACHINE, "open", transcript.open, create=True)
+            )
+            stack.enter_context(patch.object(REFERENCE_MACHINE, "json", fake_json))
             stack.enter_context(
                 patch.object(
-                    F_MACHINE, "os", SimpleNamespace(path=SimpleNamespace(exists=transcript.exists))
+                    REFERENCE_MACHINE,
+                    "os",
+                    SimpleNamespace(path=SimpleNamespace(exists=transcript.exists)),
                 )
             )
-            F_PLACEMENT.default_threads = host
+            REFERENCE_PLACEMENT.default_threads = host
             sys.setprofile(profile)
             if case.get("mode", "plan") == "machine":
                 pending = case.get("pending")
@@ -226,16 +240,18 @@ def observe_f(case):
                     ),
                 ):
                     exec(
-                        compile((ORACLES / "plan_f.py").read_text(), "frozen-plan.py", "exec"),
-                        {"__file__": "/oracle/plan_f.py", "open": transcript.open},
+                        compile(
+                            (ORACLES / "plan_reference.py").read_text(), "frozen-plan.py", "exec"
+                        ),
+                        {"__file__": "/oracle/plan_reference.py", "open": transcript.open},
                     )
                 outcome = ["return"]
                 if case.get("reload", True):
                     with (
-                        patch.object(F_SETTINGS, "open", transcript.open, create=True),
-                        patch.object(F_SETTINGS, "json", fake_json),
+                        patch.object(REFERENCE_SETTINGS, "open", transcript.open, create=True),
+                        patch.object(REFERENCE_SETTINGS, "json", fake_json),
                         patch.object(
-                            F_SETTINGS,
+                            REFERENCE_SETTINGS,
                             "os",
                             SimpleNamespace(
                                 path=SimpleNamespace(abspath=lambda p: p),
@@ -247,11 +263,11 @@ def observe_f(case):
                             sys, "argv", ["settings.py", "/case/run", "-o", "/case/settings.env"]
                         ),
                     ):
-                        F_SETTINGS.main()
+                        REFERENCE_SETTINGS.main()
     except (Exception, SystemExit) as error:
         outcome = [type(error).__name__, str(error)]
     finally:
-        F_PLACEMENT.default_threads = original_host
+        REFERENCE_PLACEMENT.default_threads = original_host
         sys.path[:] = previous_path
         sys.setprofile(previous_profile)
     return {
@@ -282,13 +298,16 @@ def runtime_key():
 
 
 @pytest.mark.parametrize("case", DATA["cases"], ids=lambda c: c["name"])
-def test_f_frozen(case):
-    assert observe_f(case) == case["expected"][runtime_key()]
+def test_reference_frozen(case):
+    assert observe_reference(case) == case["expected"][runtime_key()]
 
 
 def test_plan_oracle_identity():
     manifest = json.loads((ORACLES / "planner-manifest.json").read_text())
-    assert hashlib.sha256((ORACLES / "plan_f.py").read_bytes()).hexdigest() == manifest["sha256"]
+    assert (
+        hashlib.sha256((ORACLES / "plan_reference.py").read_bytes()).hexdigest()
+        == manifest["sha256"]
+    )
 
 
 def observe_candidate(case):

@@ -1,4 +1,4 @@
-"""F calibration calculations over recorded observations, without probes or validation."""
+"""Original calibration calculations over recorded observations, without probes or validation."""
 
 from __future__ import annotations
 

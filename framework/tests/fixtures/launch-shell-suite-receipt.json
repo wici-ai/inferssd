@@ -29,7 +29,7 @@
       "fail": 0
     }
   ],
-  "reason_for_initial_failure": "The capture directory omitted settings.py and its three imports. Four assertions that consume generated settings failed; original scripts were unchanged. The missing four F sources were added to the oracle closure before a fresh run.",
+  "reason_for_initial_failure": "The capture directory omitted settings.py and its three imports. Four assertions that consume generated settings failed; original scripts were unchanged. The missing four reference sources were added to the oracle closure before a fresh run.",
   "capture_boundary": "env exec wrapper records invocation; BASH_ENV rm wrapper copies fixture outputs before cleanup; production scripts and tests byte unchanged",
   "actual_engine_service_gpu_invocations": 0
 }

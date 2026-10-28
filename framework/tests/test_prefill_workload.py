@@ -10,8 +10,8 @@ import pytest
 from inferssd.model import prefill_workload
 
 FIXTURES = Path(__file__).parent / "fixtures"
-ORACLE_PATH = FIXTURES / "oracle/prefill_f.py"
-SPEC = importlib.util.spec_from_file_location("prefill_workload_f_oracle", ORACLE_PATH)
+ORACLE_PATH = FIXTURES / "oracle/prefill_reference.py"
+SPEC = importlib.util.spec_from_file_location("prefill_workload_reference", ORACLE_PATH)
 ORACLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ORACLE)
 
@@ -27,7 +27,7 @@ def exact(value):
 
 
 def observe(module, case):
-    """Call F's functions directly; keep generator consumption visible."""
+    """Call the reference functions directly; keep generator consumption visible."""
     args = dict(case["arguments"])
     if case.get("iterator"):
         key = "ps" if case["function"] == "cold_share" else "turns"

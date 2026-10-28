@@ -15,18 +15,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from observe_launch_F import ORACLE, normalize
+from observe_launch_reference import ORACLE, normalize
 
 
 def mac_candidate(case):
-    with tempfile.TemporaryDirectory(prefix="inferssd-mac-launch-F-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="inferssd-mac-launch-candidate-") as temporary:
         base = Path(temporary)
         repo = base / "repo"
         d = base / "case"
         d.mkdir()
         shutil.copytree(ORACLE, repo)
         spec = importlib.util.spec_from_file_location(
-            "f_mac_launcher", repo / "scripts/run-macos-ssd.py"
+            "reference_mac_launcher", repo / "scripts/run-macos-ssd.py"
         )
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)

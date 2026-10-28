@@ -1,6 +1,6 @@
-"""F's controller transitions with mandatory effect, engine and HTTP ports.
+"""The original controller transitions with mandatory effect, engine and HTTP ports.
 
-No native executor or live entry point is installed. Explicit close preserves F:
+No native executor or live entry point is installed. Explicit close preserves the original:
 it stops the engine and does not close the event stream.
 """
 

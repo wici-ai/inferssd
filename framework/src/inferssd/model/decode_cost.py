@@ -1,4 +1,4 @@
-"""F's decode response fit and pricing, preserving arithmetic and iteration order."""
+"""The original decode response fit and pricing, preserving arithmetic and iteration order."""
 
 from __future__ import annotations
 
@@ -121,9 +121,10 @@ def fit_response(x: Sequence[Sequence[Number]], y: Sequence[Number]) -> tuple[fl
 def price_decode(
     rows: Sequence[Sequence[LayerRow]], response: LayerResponse, cpu_scale: Number
 ) -> DecodeEstimate:
-    """Adapt the validated response to the one F Mapping pricing implementation. Uncapped null
-    readiness now raises F's native TypeError at exponentiation; the old adapter's bespoke error
-    text is not retained."""
+    """Adapt the validated response to the one original Mapping pricing implementation.
+
+    Uncapped null readiness now raises the original native TypeError at exponentiation;
+    the old adapter's bespoke error text is not retained."""
     inputs: PriceInputs = {
         "layer_table": dict(response.layer_table),
         "layer_beta": response.layer_beta,

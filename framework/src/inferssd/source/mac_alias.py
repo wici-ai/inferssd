@@ -29,7 +29,7 @@ from inferssd.source.header import SCALARS
 ALIGNMENT = 4096
 MAX_I64 = (1 << 63) - 1
 # Native ggml.c type_traits / ggml-common.h geometry. Keep this independent of
-# the historical F metadata table (in particular, its Q8_1 size is different).
+# the original metadata table (in particular, its Q8_1 size is different).
 # The repository native-contract gate checks every admitted type against the
 # compiled enum, block expression and sizeof expression from type_traits.
 NATIVE_TYPES = {

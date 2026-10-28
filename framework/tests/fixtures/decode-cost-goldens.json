@@ -1753,7 +1753,7 @@
       }
     },
     {
-      "name": "historical_input_replayed_by_F",
+      "name": "historical_input_replayed_by_reference",
       "rows": [
         [
           [
@@ -2479,5 +2479,5 @@
       }
     }
   ],
-  "historical_input_note": "An eight-token, three-layer projection of a historical routing artifact was replayed with frozen F code; this is a new offline function oracle, not a historical F device run."
+  "historical_input_note": "An eight-token, three-layer projection of a historical routing artifact was replayed with frozen reference code; this is a new offline function oracle, not a historical reference device run."
 }

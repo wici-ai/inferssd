@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from test_offline_planner import DATA, observe_candidate, observe_f, runtime_key
+from test_offline_planner import DATA, observe_candidate, observe_reference, runtime_key
 
 from inferssd import cli
 from inferssd.model.decode_cost import LayerResponse, price_decode, price_mapping
@@ -135,7 +135,7 @@ def test_shared_mapping_core_null_failure():
 
 @pytest.mark.parametrize("pending", [[], ["UBATCH"], ["UBATCH", "UBATCH"]])
 def test_later_replay_queries_and_feedback(pending):
-    # Additional direct whole-F observations; no new implementation computes expected.
+    # Additional direct whole-reference observations; no new implementation computes expected.
     case = copy.deepcopy(next(c for c in DATA["cases"] if c["name"] == "machine-no-plan"))
     case["pending"] = pending
     case["actions"] += [
@@ -164,14 +164,14 @@ def test_later_replay_queries_and_feedback(pending):
             },
         },
     ]
-    assert observe_candidate(case) == observe_f(case)
+    assert observe_candidate(case) == observe_reference(case)
 
 
 @pytest.mark.parametrize("case_name", ["complete-discrete", "reject-all"])
 def test_stdout_failure_keeps_original_publication_order(case_name):
     case = next(c for c in DATA["cases"] if c["name"] == case_name)
     with patch("builtins.print", side_effect=OSError("stdout failed")):
-        original = observe_f(case)
+        original = observe_reference(case)
     with patch("builtins.print", side_effect=OSError("stdout failed")):
         candidate = observe_candidate(case)
     assert candidate == original
@@ -180,7 +180,7 @@ def test_stdout_failure_keeps_original_publication_order(case_name):
 
 
 def test_pending_iterator_and_input_aliases():
-    from test_offline_planner import F_MACHINE, Transcript, exact
+    from test_offline_planner import REFERENCE_MACHINE, Transcript, exact
 
     from inferssd.model.machine import Machine
 
@@ -188,12 +188,12 @@ def test_pending_iterator_and_input_aliases():
     original_io, candidate_io = Transcript(case), Transcript(case)
     a, b = iter(["UBATCH", "CONTEXT"]), iter(["UBATCH", "CONTEXT"])
     with (
-        patch.object(F_MACHINE, "open", original_io.open, create=True),
+        patch.object(REFERENCE_MACHINE, "open", original_io.open, create=True),
         patch.object(
-            F_MACHINE, "json", SimpleNamespace(load=lambda f: original_io.read_json(f.name))
+            REFERENCE_MACHINE, "json", SimpleNamespace(load=lambda f: original_io.read_json(f.name))
         ),
     ):
-        original = F_MACHINE.Machine("/case/run", pending=a)
+        original = REFERENCE_MACHINE.Machine("/case/run", pending=a)
     candidate = Machine(candidate_io, pending=b, host_threads=candidate_io.host)
     assert original.pending is a and candidate.pending is b
     assert list(a) == list(b) == []
@@ -232,7 +232,7 @@ def test_complete_calibrated_lane_callgraph(in_place, locked):
         for point in p["prefill"]:
             point.update(lane=lane, layers_s=0.01)
     case["files"]["probe/device.json"]["gpu"]["integrated"] = in_place
-    original = observe_f(case)
+    original = observe_reference(case)
     assert original["outcome"] == ["return"]
     assert json.loads(original["writes"]["plan.json"])["prefill_model"]["lane"] is not None
     assert observe_candidate(case) == original

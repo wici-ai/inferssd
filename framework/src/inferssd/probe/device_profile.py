@@ -1,4 +1,4 @@
-"""Pure extraction of F's device profile arithmetic from recorded observations."""
+"""Pure extraction of the original's device profile arithmetic from recorded observations."""
 
 from __future__ import annotations
 

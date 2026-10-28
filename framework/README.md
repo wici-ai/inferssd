@@ -145,9 +145,8 @@ recorded machine's CPU count from the current host.
 ## Compatibility and failure behavior
 
 The package was extracted from earlier adaptive scripts. Their recorded
-reference revision is `8b12192920b339a4ef31c9006d1ebe20304ce45a` (fixture files
-call it `F`); verbatim reference sources and synthetic observations are under
-`tests/fixtures`. Extraction preserves arithmetic, sum and mapping order, stable
+reference revision is `8b12192920b339a4ef31c9006d1ebe20304ce45a`; verbatim
+reference sources and synthetic observations are under `tests/fixtures`. Extraction preserves arithmetic, sum and mapping order, stable
 ties, rounding, mutable replay state, borrowed references, callback order and
 exception timing. Composed expectations come from the complete reference call
 graph, including request output → calibration → plan → reload → settings →

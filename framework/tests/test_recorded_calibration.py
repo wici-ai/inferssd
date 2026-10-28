@@ -1,4 +1,4 @@
-"""Whole original F calibration program: synthetic records, state and I/O ordering."""
+"""Whole reference calibration program: synthetic records, state and I/O ordering."""
 
 from __future__ import annotations
 
@@ -12,16 +12,16 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from test_log_records import Files, f_api, runtime_key
-from test_offline_planner import F_PREFILL, F_SIM, exact
+from test_log_records import Files, reference_api, runtime_key
+from test_offline_planner import REFERENCE_PREFILL, REFERENCE_SIM, exact
 
 FIXTURES = Path(__file__).parent / "fixtures"
-ORACLE = FIXTURES / "oracle/insitu_f.py"
+ORACLE = FIXTURES / "oracle/insitu_reference.py"
 GOLDENS = FIXTURES / "recorded-calibration-goldens.json"
 
 
 def synthetic_files(config):
-    """Generate toy engine text, not expected calculations. Original F parses it."""
+    """Generate toy engine text, not expected calculations. The reference parses it."""
     n, layers = config.get("tokens", 68), config.get("layers", 2)
     lines = [
         "using device TOY0 synthetic - 8192 MiB free",
@@ -195,7 +195,7 @@ class CalibrationTranscript:
                         raise OSError("configured output close failure")
 
             def __del__(self):
-                # F gives json.dump an unbound temporary: close failure is ignored,
+                # The reference gives json.dump an unbound temporary: close failure is ignored,
                 # not converted to an explicit with-block exception.
                 try:
                     self.close()
@@ -280,7 +280,7 @@ def argv(case):
     )
 
 
-def observe_f(case):
+def observe_reference(case):
     tr, ns = CalibrationTranscript(case), {"__file__": str(ORACLE), "__name__": "__main__"}
     old_path, old_trace = sys.path[:], sys.gettrace()
 
@@ -296,11 +296,11 @@ def observe_f(case):
 
     try:
         with (
-            f_api(tr.logs) as api,
+            reference_api(tr.logs) as api,
             patch.dict(
                 sys.modules,
-                prefill=F_PREFILL,
-                sim=F_SIM,
+                prefill=REFERENCE_PREFILL,
+                sim=REFERENCE_SIM,
                 logparse=SimpleNamespace(
                     read_arm=lambda r, s: tr.arm(api.read_arm, r, s),
                     hits=api.hits,
@@ -327,7 +327,7 @@ def observe_f(case):
         sys.path[:] = old_path
     result = tr.result(ns, outcome)
     if case.get("chain") and outcome == ["return"]:
-        from test_offline_planner import observe_f as plan_observer
+        from test_offline_planner import observe_reference as plan_observer
 
         result["chain"] = plan_observer(chain_case(case, result["writes"]))
     return result
@@ -349,8 +349,8 @@ def data():
 
 
 @pytest.mark.parametrize("case", data()["cases"], ids=lambda c: c["name"])
-def test_f_complete_calibration(case):
-    assert observe_f(case) == case["expected"][runtime_key()]
+def test_reference_complete_calibration(case):
+    assert observe_reference(case) == case["expected"][runtime_key()]
 
 
 def test_calibration_source_identity():

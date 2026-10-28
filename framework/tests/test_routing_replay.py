@@ -13,8 +13,8 @@ from inferssd.model.decode_cost import LayerResponse, price_decode
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GOLDENS = json.loads((FIXTURES / "routing-replay-goldens.json").read_text())
-ORACLE_PATH = FIXTURES / "oracle/sim_f.py"
-SPEC = importlib.util.spec_from_file_location("routing_replay_f_oracle", ORACLE_PATH)
+ORACLE_PATH = FIXTURES / "oracle/sim_reference.py"
+SPEC = importlib.util.spec_from_file_location("routing_replay_reference", ORACLE_PATH)
 ORACLE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ORACLE)
 
@@ -107,7 +107,7 @@ def test_replay_oracle_identity():
 
 
 @pytest.mark.parametrize("case", GOLDENS["cases"], ids=lambda case: case["name"])
-def test_frozen_f_state_transcript(case):
+def test_frozen_reference_state_transcript(case):
     assert transcript(ORACLE, case) == case["legacy"]
 
 
