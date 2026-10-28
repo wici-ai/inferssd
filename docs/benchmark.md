@@ -37,7 +37,7 @@ The MacBook Pro is the 16-inch model running macOS 26.4. The TiPro9000 interface
 
 The RTX 5060 Ti's 16 GB VRAM and 2 TB SSD, and DGX Spark's 4 TB SSD, were checked against archived setup records on 2026-10-26. CPU details also agree with [Intel Core 3 100U specifications](https://www.intel.com/content/www/us/en/products/sku/238762/intel-core-3-processor-100u-10m-cache-up-to-4-70-ghz-with-ipu/specifications.html), [Intel Core Ultra 5 230F specifications](https://www.intel.com/content/www/us/en/products/sku/241875/intel-core-ultra-5-processor-230f-24m-cache-up-to-5-00-ghz/specifications.html), and [NVIDIA's DGX Spark hardware guide](https://docs.nvidia.com/dgx/dgx-spark/hardware.html).
 
-The RTX 5090 row retains the dataset's **16 GB system-memory configuration**. Archived experiments also include a 32 GB host and a 13.98 GB process-memory limit; installed RAM and a process limit are distinct. Those archived runs are not mapped to individual summary values, and the summary does not establish matched RAM budgets across all engines.
+The RTX 5090 host has **32 GB of system memory**; earlier summaries labelled it 16 GB. Archived experiments also include a 13.98 GB process-memory limit; installed RAM and a process limit are distinct. Those archived runs are not mapped to individual summary values, and the summary does not establish matched RAM budgets across all engines.
 
 Storage probe rates are omitted from the README because they are workload-dependent measurements, not device specifications or expert-loading throughput.
 

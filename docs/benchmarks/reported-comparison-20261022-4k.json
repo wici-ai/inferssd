@@ -45,13 +45,13 @@
       "cpu_cores": 10,
       "cpu_threads": 10,
       "gpu": "NVIDIA RTX 5090",
-      "system_ram_gb": 16,
+      "system_ram_gb": 32,
       "vram_gb": 32,
       "storage_tb": 2,
       "ssd_interface": "PCIe Gen5 x4",
       "core_layout": "6 performance + 4 efficient",
       "storage_model": "ZHITAI TiPro9000",
-      "memory_configuration_note": "16 GB dataset configuration confirmed by the tester on 2026-10-26. Archived experiments also include a 32 GB host and a 13.98 GB process limit; those runs are not mapped to individual summary values."
+      "memory_configuration_note": "System memory corrected from 16 GB to 32 GB on 2026-10-28. Archived experiments also include a 13.98 GB process limit; those runs are not mapped to individual summary values."
     },
     {
       "hardware": "DGX Spark",
@@ -253,6 +253,6 @@
         "description": "Archived benchmark setup record, not distributed with this repository; hardware section cross-checked, historical rates not substituted for the final dataset."
       }
     ],
-    "confirmation": "The tester retained the 16 GB RTX 5090 dataset label and confirmed that current Muse baseline values reflect subsequent completed measurements using tokens 129–256."
+    "confirmation": "The tester confirmed that current Muse baseline values reflect subsequent completed measurements using tokens 129–256."
   }
 }
