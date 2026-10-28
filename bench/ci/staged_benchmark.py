@@ -13,6 +13,7 @@ import re
 import final_chat
 import run_final
 from ci.contract import digest, revision, save
+from ci import mac_host_gate
 from ci.staged_chat import NativeHTTP, record
 
 
@@ -81,7 +82,7 @@ def verify_stopped(stopped):
     raise ValueError("native benchmark did not stop normally and cleanly")
 
 
-def benchmark(session, side, config, output):
+def benchmark(session, side, config, output, *, host_policy=None):
     """Run exactly one arm, retaining raw failure and cleanup evidence.
 
     Config requires model, full revision, argv, environment, cwd, port,
@@ -132,6 +133,8 @@ def benchmark(session, side, config, output):
         runtime["observations"][name] = dict(path=path.name, sha256=digest(path))
 
     try:
+        if host_policy is not None:
+            mac_host_gate.before_launch(output, host_policy)
         stage = session.start(prefix + "-benchmark-" + tier, "server", config["argv"],
                               config["environment"], config["cwd"], timeout)
         retain("started", asdict(stage))
@@ -167,6 +170,8 @@ def benchmark(session, side, config, output):
         before = session.call(stage, "stage.probe", port=config["port"])
         retain("runtime-before", before)
         verify_runtime(stage, before)
+        if host_policy is not None:
+            mac_host_gate.capture(output, "host-state-before-request.json")
         try:
             # The recorder saves raw success/failure; never promote its return
             # value directly into the checked measurement used for comparison.
@@ -175,6 +180,8 @@ def benchmark(session, side, config, output):
             after = session.call(stage, "stage.probe", port=config["port"])
             retain("runtime-after", after)
             verify_runtime(stage, after)
+            if host_policy is not None:
+                mac_host_gate.capture(output, "host-state-after-request.json")
         checked = run_final.read_result(output / "result.json", tier, request_timeout)
         if http.completions != 1:
             raise ValueError("benchmark must contain one completion on the fresh server")
@@ -190,6 +197,8 @@ def benchmark(session, side, config, output):
                 retain("stopped", stopped)
                 result["cleanup_confirmed"] = stopped.get("cleanup_confirmed") is True
                 result["stop_classification"] = verify_stopped(stopped)
+                if host_policy is not None:
+                    mac_host_gate.capture(output, "host-state-after-cleanup.json")
             except Exception as error:
                 result.update(status="failed", cleanup_error=f"{type(error).__name__}: {error}")
             # Drain each stream independently even if stop or the other stream

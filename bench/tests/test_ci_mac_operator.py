@@ -11,9 +11,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci import impact, selection_contract as contract, selected_aggregate as aggregate
 from ci import selected_controller as controller, selected_preflight as preflight
-from ci import selected_receipt as receipt
+from ci import selected_receipt as receipt, mac_host_gate, mac_host_state
 from ci.contract import digest, save
 from test_ci_selection import POLICY, plan, template
+from test_ci_mac_host_gate import snapshot as host_snapshot
 
 JOB = "a" * 32
 JOB_ROOT = "/Library/InferSSD-CI/jobs/" + JOB
@@ -26,7 +27,7 @@ def mac_config():
     config = template(value, "local-mbp")
     config.update(manifest_path=MANIFEST, validation_mode=contract.PERFORMANCE_MODE,
         execution_devices=["local-mbp"], performance_protocol=contract.performance_protocol(),
-        host=dict(resources=RESOURCES))
+        host=dict(hardware=dict(memory_total_bytes=48 << 30), resources=RESOURCES))
     config["numerical"]["backend"] = "MTL0"
     for side, data in config["sides"].items():
         data["paths"] = dict(platform="darwin", job_root=JOB_ROOT,
@@ -87,7 +88,7 @@ def mac_raw(tmp_path):
     data = dict(smoke=launch, model_identity=dict(shards=[dict(runtime_path="/Library/InferSSD-CI/models/frozen/model.gguf")]),
                 settings=dict(runtime_path="/Library/InferSSD-CI/inputs/operator-" + JOB + "/settings.ssd"), template=dict(runtime_path="/Library/InferSSD-CI/public/template.jinja", sha256="c" * 64))
     cfg = dict(revision="c" * 40, paths=dict(platform="darwin"), manifest_path=MANIFEST, manifest_sha256="f" * 64,
-        host=dict(hardware=dict(cpu="M5 Max"), os=dict(sysname="Darwin", release="fixture", machine="arm64"), resources=RESOURCES),
+        host=dict(hardware=dict(cpu="M5 Max", memory_total_bytes=48 << 30), os=dict(sysname="Darwin", release="fixture", machine="arm64"), resources=RESOURCES),
         sides=dict(candidate=dict(revision="c" * 40, paths=dict(frozen=frozen, job_root=JOB_ROOT), models=dict(deepseek=data))))
     manifest = dict(selection_resource_policy=RESOURCES, selection_lock_identity=[16777231, 81219804])
     save(tmp_path / "root-manifest.json", manifest)
@@ -119,7 +120,20 @@ def mac_raw(tmp_path):
     save(folder / "runtime-before.json", observed); save(folder / "runtime-after.json", observed)
     (folder / "stderr.log").write_text('[ssd.settings] ' + json.dumps(dict(values=native)) + '\n')
     save(folder / "runtime-receipt.json", runtime)
+    host_raw(folder, cfg)
     return tmp_path, cfg, manifest, folder, launch
+
+
+def host_raw(folder, config):
+    """Retain parseable synthetic OS output, not a mocked green gate result."""
+    expected = mac_host_gate.policy(config)
+    before, after = host_snapshot(1), host_snapshot(3.1)
+    save(folder / mac_host_gate.QUIET, dict(schema_version=1, purpose="mac-host-quiet",
+        policy=expected, before=before, after=after,
+        assessment=mac_host_state.compare_snapshots(before, after, expected["limits"])))
+    for name, second in zip(mac_host_gate.SNAPSHOTS, (4, 6, 8)):
+        save(folder / name, host_snapshot(second))
+    return mac_host_gate.retained_arm(folder, expected)
 
 
 def test_mac_runtime_retained_rechecks_real_shaped_probe_lsof_sampled_cap_and_stop(mac_raw):
@@ -327,7 +341,7 @@ def mac_performance_raw(mac_raw):
     source_build = json.loads((root / "build-candidate/build-receipt.json").read_text())
     source_receipt = json.loads((original / "runtime-receipt.json").read_text())
     plan = dict(base="a" * 40, candidate="c" * 40)
-    preflight = {}
+    preflight, host_states = {}, {}
     for side, pid in (("base", 124), ("candidate", 123)):
         def side_copy(value):
             return json.loads(json.dumps(value).replace("/frozen/candidate", "/frozen/" + side).replace("/work/candidate", "/work/" + side))
@@ -360,17 +374,24 @@ def mac_performance_raw(mac_raw):
         save(folder / "comparison-receipt.json", value); preflight["deepseek", "512", side] = value
         save(folder / "benchmark.json", dict(status="passed", cleanup_confirmed=True, completion_requests=1,
             revision=plan[side], tier="512", model="deepseek", result=json.loads((folder / "result.json").read_text())))
+        host_states[side] = host_raw(folder, config)
     results = {side:run_final.read_result(root / "deepseek/512" / side / "result.json", "512", 300) for side in plan}
     pair = compare_pair(results["base"], results["candidate"], preflight["deepseek", "512", "base"], preflight["deepseek", "512", "candidate"], POLICY)
+    pair = mac_host_gate.pair(pair, host_states["base"], host_states["candidate"])
     save(root / "deepseek/512/comparison.json", pair)
     return root, config, plan, preflight
 
 
-@pytest.mark.parametrize("damage", [None, "missing-sse", "different-job-source"])
+@pytest.mark.parametrize("damage", [None, "missing-sse", "different-job-source", "missing-host", "changed-host-raw"])
 def test_mac_timed_pair_replays_real_protocol_sse_and_both_side_runtime(mac_performance_raw, damage):
     root, config, plan, preflight = mac_performance_raw
     if damage == "missing-sse": (root / "deepseek/512/base/result.events.sse").unlink()
     elif damage == "different-job-source": config["manifest_path"] = MANIFEST.replace(JOB, "b" * 32)
+    elif damage == "missing-host": (root / "deepseek/512/base" / mac_host_gate.SNAPSHOTS[1]).unlink()
+    elif damage == "changed-host-raw":
+        path = root / "deepseek/512/candidate" / mac_host_gate.SNAPSHOTS[1]
+        value = json.loads(path.read_text()); value["raw"]["swap"]["stdout"] = "invalid observation"
+        path.write_text(json.dumps(value))
     if damage:
         with pytest.raises((ValueError, OSError)):
             aggregate.performance_retained(root, config, "deepseek", "512", plan, POLICY, preflight)
@@ -379,6 +400,8 @@ def test_mac_timed_pair_replays_real_protocol_sse_and_both_side_runtime(mac_perf
         assert pair["status"] == "passed" and pair["measurement_identity"]["output_tokens"] == 256
         assert pair["metrics"]["decode_first128_tps"]["base"] == pair["metrics"]["decode_second128_tps"]["candidate"] == 1
         assert pair["evidence"]["base"]["result.events.sse"]["sha256"] == digest(root / "deepseek/512/base/result.events.sse")
+        assert pair["environment"]["status"] == "passed"
+        assert pair["evidence"]["base"][mac_host_gate.QUIET]["sha256"] == digest(root / "deepseek/512/base" / mac_host_gate.QUIET)
 
 
 def test_selected_mac_failure_does_not_relabel_successful_linux_scope(monkeypatch):

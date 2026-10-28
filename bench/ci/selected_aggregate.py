@@ -14,7 +14,7 @@ from ci.staged_benchmark import verify_stopped, verify_runtime
 from ci.staged_checkpoint import mapped_files, native_settings
 from ci.selected_preflight import launch as preflight_launch, retained
 from ci.selected_receipt import retained_typed_settings, mac_runtime_images, mac_stopped, MAC_RESOURCE_ENFORCEMENT
-from ci import model_admission
+from ci import model_admission, mac_host_gate
 
 
 def sealed(root, report):
@@ -64,6 +64,7 @@ def runtime_retained(root, config, side, model, folder, launch, receipt_path):
                 root / ("build-" + side) / "freeze-manifest.json", config.get("manifest_path"))):
         raise ValueError("retained typed inputs/host/receipt identity differs")
     if config.get("paths", {}).get("platform") == "darwin":
+        mac_host_gate.retained_arm(folder, mac_host_gate.policy(config))
         manifest = load(root / "root-manifest.json")
         probes = [load(folder / name) for name in ("runtime-before.json", "runtime-after.json")]
         images = mac_runtime_images(config, manifest, side, model, launch, started, probes)[0]
@@ -110,7 +111,8 @@ def runtime_retained(root, config, side, model, folder, launch, receipt_path):
 
 def performance_retained(root, config, model, tier, plan, policy, preflight):
     """Reconstruct a complete one-pair comparison, preserving inconclusive data."""
-    data, receipts, evidence = {}, {}, {}
+    data, receipts, evidence, host_states = {}, {}, {}, {}
+    host_policy = mac_host_gate.policy(config) if config.get("paths", {}).get("platform") == "darwin" else None
     for side in ("base", "candidate"):
         folder = root / model / tier / side
         arm = load(folder / "benchmark.json")
@@ -125,6 +127,8 @@ def performance_retained(root, config, model, tier, plan, policy, preflight):
                 raise ValueError("timed prompt differs from the sealed performance protocol")
         receipts[side] = runtime_retained(root, config, side, model, folder, spec,
                                            folder / "comparison-receipt.json")
+        if host_policy is not None:
+            host_states[side] = mac_host_gate.retained_arm(folder, host_policy)
         if comparable(receipts[side]) != comparable(preflight[model, tier, side]):
             raise ValueError("timed runtime differs from retained short preflight")
         if arm["result"] != data[side]:
@@ -135,7 +139,14 @@ def performance_retained(root, config, model, tier, plan, policy, preflight):
                          "started.json", "stopped.json", "runtime-before.json", "runtime-after.json",
                          "result.events.jsonl", "result.events.sse", "stderr.log")
         }
+        if host_policy is not None:
+            evidence[side].update({name: dict(path=str((folder / name).relative_to(root)),
+                                             sha256=digest(folder / name)) for name in (
+                "host-quiet.json", "host-state-before-request.json", "host-state-after-request.json",
+                "host-state-after-cleanup.json")})
     compared = compare_pair(data["base"], data["candidate"], receipts["base"], receipts["candidate"], policy)
+    if host_policy is not None:
+        compared = mac_host_gate.pair(compared, host_states["base"], host_states["candidate"])
     if load(root / model / tier / "comparison.json") != compared:
         raise ValueError("selected comparison differs from verified raw pair")
     return dict(tier=tier, **compared, sources={side: plan[side] for side in ("base", "candidate")},

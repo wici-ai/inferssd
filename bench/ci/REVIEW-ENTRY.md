@@ -103,8 +103,37 @@ settings/source/prompt identities, observations and cleanup evidence.
 These request metrics exclude model/vocabulary loading before server readiness.
 Each profile establishes only its own hardware, models, resource constraints and
 cache settings. Mac uses the root executor's sampled worker physical footprint,
-process count and host free-memory guards; RSS is diagnostic only. Its receipts
+process count and host free-memory guards; worker RSS is diagnostic only. Its receipts
 do not assert Linux cgroup hard UMA or swap isolation.
+
+Before each Mac smoke, short preflight and timed arm launches, the coordinator
+takes exactly two host snapshots separated by a fixed 2-second wait. Collection,
+validation or quiet-policy failure refuses launch and retains `host-quiet.json`
+with raw observations. There is no automatic retry. Existing swap settings are
+preserved; the check does not disable swap, close applications or clear caches.
+The fixed quiet policy is:
+
+- Free plus inactive memory in both snapshots must be at least the smaller of
+  the sealed worker memory budget and 75% of sealed physical RAM.
+- Swap-in plus swap-out counter growth must be zero; compression plus
+  decompression growth must be at most 64 MiB, using the observed page size.
+- The memory-pressure level must be available and equal to 1 in both snapshots.
+- Non-CI CPU use must be at most 0.5 cores in total and 0.25 cores per process;
+  each non-CI process must use at most 512 MiB RSS. CPU uses cumulative CPU-time
+  differences over the observation interval. CI UIDs 62001/62002, each observer
+  and its recorded parent chain are excluded. Existing services are assessed
+  by these measurements, not rejected merely for being present.
+
+Snapshots before/after the request and after cleanup retain timed
+swap, compression, pressure and process activity. Timed swap activity, abnormal
+pressure or excess non-CI CPU flags the comparison as inconclusive; compression
+above 64 MiB with abnormal pressure is also flagged, while compression alone is
+not. Timed checks do not apply the quiet free-memory or RSS thresholds. A base/PR
+difference above 1 GiB in the final prelaunch free-plus-inactive sample also makes
+the comparison inconclusive. Measured slowdowns remain visible and non-passing.
+Swap or pressure may be induced by the model; these observations do not
+automatically establish external interference or justify a retry. This is
+resource sampling, not strict isolation or proof of identical cache conditions.
 
 Preparation/staging interruption and ambiguous dispatch are retained without
 automatic replay. A saved, already validated `dispatched-run.json` allows a

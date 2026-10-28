@@ -529,6 +529,65 @@ def test_summary_describes_mac_footprint_protection_and_diagnostic_rss(devices):
     assert "worker RSS/process count" not in text
 
 
+@pytest.mark.parametrize("slowdown,flagged", [(False, False), (True, False), (False, True), (True, True)])
+def test_summary_renders_mac_gate_environment_without_excusing_slowdown(slowdown, flagged):
+    from ci import mac_host_gate
+
+    metrics = {name: dict(base=10, candidate=9 if slowdown else 11,
+                         change_percent=-10 if slowdown else 10) for name in compare.METRICS}
+    metrics["ttft_s"] = dict(base=2, candidate=1.8, change_percent=-10)
+    measured = dict(tier="512", status="inconclusive" if slowdown else "passed", passed=not slowdown,
+        metrics=metrics, observed_slowdowns=["decode_tps"] if slowdown else [])
+    base = dict(schema_version=1, policy=dict(pair_free_tolerance_bytes=1 << 30),
+        quiet=dict(status="passed"), cleanup=dict(status="passed"),
+        prelaunch_free_inactive_bytes=38 * (1 << 30) + (1 << 29),
+        timed=dict(status="passed", reasons=[], swap_delta_bytes=0, compression_delta_bytes=2 << 20,
+            process_activity=dict(non_ci_cpu_cores=0.125), memory_pressure_levels=[1, 1]))
+    candidate = copy.deepcopy(base)
+    candidate["prelaunch_free_inactive_bytes"] = 38 << 30
+    candidate["timed"].update(status="flagged" if flagged else "passed",
+        reasons=["swap-activity|<diagnosis>\nretain"] if flagged else [], swap_delta_bytes=3 << 20,
+        compression_delta_bytes=80 << 20, process_activity=dict(non_ci_cpu_cores=0.375),
+        memory_pressure_levels=[1, 2])
+    pair = mac_host_gate.pair(measured, base, candidate)
+    original = copy.deepcopy(pair)
+    report = dict(passed=pair["passed"], status=pair["status"], full_impact_coverage_complete=False,
+        execution_devices=["local-mbp"], cells=[dict(device="local-mbp", model="muse", status=pair["status"],
+            functional="passed", numerical="passed", performance=[pair])])
+    stream = io.StringIO()
+    controller.operator_summary(stream, report)
+    text = stream.getvalue()
+    assert "Quiet free+inactive GiB" in text and "Timed swap Δ MiB" in text and "Timed compression Δ MiB" in text
+    assert "Non-CI CPU cores" in text
+    assert "| muse | 512 | base | 38.5000 | 0.0000 | 2.0000 | 0.1250 | 1 → 1 | passed |" in text
+    assert "| muse | 512 | candidate | 38.0000 | 3.0000 | 80.0000 | 0.3750 | 1 → 2 |" in text
+    if flagged:
+        assert "muse/512 environment: inconclusive; reasons: candidate:swap-activity\\|&lt;diagnosis&gt; retain." in text
+        assert "<diagnosis>" not in text
+    else:
+        assert "muse/512 environment: passed; reasons: none." in text
+    if slowdown or flagged:
+        assert "Declared device scope: **inconclusive**" in text
+    else:
+        assert "Declared device scope: **passed**" in text
+    if slowdown:
+        assert "| 10.0000 | 9.0000 | -10.000% |" in text
+    assert "Swap and pressure may be model-induced" in text
+    assert "do not establish external interference, excuse measured slowdowns, or trigger automatic retries" in text
+    assert pair == original and pair["observed_slowdowns"] == measured["observed_slowdowns"]
+
+
+def test_summary_does_not_render_missing_mac_environment_as_zero_or_passed():
+    report = dict(passed=False, status="failed", full_impact_coverage_complete=False,
+        execution_devices=["local-mbp"], cells=[dict(device="local-mbp", model="deepseek", status="failed",
+            functional="passed", numerical="passed", performance=[dict(tier="512", status="failed")])])
+    stream = io.StringIO()
+    controller.operator_summary(stream, report)
+    text = stream.getvalue()
+    assert "| deepseek | 512 | base | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |" in text
+    assert "deepseek/512 environment: unavailable; reasons: missing environment evidence." in text
+
+
 @pytest.fixture
 def performance_raw(functional_raw):
     """Real validators over synthetic SSE/probe bytes; no device or model runs."""

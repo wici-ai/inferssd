@@ -428,6 +428,39 @@ def operator_summary(stream, report):
                 stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
         stream.write("\nChange is (PR/base − 1) × 100; lower TTFT is better. TTFT starts at the request, not model loading. ")
         stream.write("One sample per arm: observed slowdown or different generated tokens is inconclusive and does not pass.\n\n")
+        mac_pairs = [(row, pair) for row, pair in pairs if row["device"] == "local-mbp"]
+        if mac_pairs:
+            def scaled(value, unit):
+                if type(value) not in (int, float) or not math.isfinite(value):
+                    return "unavailable"
+                return f"{value / unit:.4f}"
+
+            stream.write("### Mac sampled host conditions\n\n")
+            stream.write("| Model | Tier | Side | Quiet free+inactive GiB | Timed swap Δ MiB | Timed compression Δ MiB | Non-CI CPU cores | Pressure | Timed status |\n")
+            stream.write("|---|---|---|---:|---:|---:|---:|---|---|\n")
+            for row, pair in mac_pairs:
+                environment = pair.get("environment", {})
+                for side in ("base", "candidate"):
+                    arm = environment.get(side, {})
+                    timed = arm.get("timed", {})
+                    levels = timed.get("memory_pressure_levels")
+                    pressure = " → ".join(str(level) for level in levels) if isinstance(levels, list) else "unavailable"
+                    values = [row["model"], pair["tier"], side,
+                        scaled(arm.get("prelaunch_free_inactive_bytes"), 1 << 30),
+                        scaled(timed.get("swap_delta_bytes"), 1 << 20),
+                        scaled(timed.get("compression_delta_bytes"), 1 << 20),
+                        metric_text(timed.get("process_activity", {}), "non_ci_cpu_cores"),
+                        pressure, timed.get("status", "unavailable")]
+                    stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
+            stream.write("\n")
+            for row, pair in mac_pairs:
+                environment = pair.get("environment", {})
+                reasons = environment.get("reasons", ["missing environment evidence"])
+                stream.write("- " + summary_text(row["model"] + "/" + pair["tier"]) + " environment: "
+                    + summary_text(environment.get("status", "unavailable")) + "; reasons: "
+                    + summary_text(", ".join(reasons) if reasons else "none") + ".\n")
+            stream.write("\nQuiet memory is the final prelaunch sample; timed CPU is the sampled non-CI total. ")
+            stream.write("Swap and pressure may be model-induced. These observations do not establish external interference, excuse measured slowdowns, or trigger automatic retries; they are not strict isolation.\n\n")
         stream.write("<details><summary>Pair identities and retained raw evidence</summary>\n\n")
         for row, pair in pairs:
             identity = pair.get("measurement_identity", {})

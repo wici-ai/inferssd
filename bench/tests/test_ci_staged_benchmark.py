@@ -1,6 +1,7 @@
 """Synthetic orchestration only: no native execution or performance claim."""
 
 import base64
+import copy
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -13,6 +14,8 @@ from ci import staged_benchmark, staged_chat
 from ci.contract import digest, load
 from ci.stage_session import Stage
 from test_final import records
+from test_ci_mac_host_gate import CONFIG as HOST_CONFIG, snapshot as host_snapshot
+from ci import mac_host_gate, mac_host_state
 
 
 CONFIG = dict(model="muse", revision="a" * 40, argv=["/build/base/bin/inferssd"],
@@ -75,6 +78,92 @@ class Session:
         if self.failure == "log" and stream == "stdout":
             return b"", 0, False
         return b"native log\n", 11, True
+
+
+def host_observations(monkeypatch, events, *, quiet=True, failed_capture=None):
+    """Keep real gate parsing/retention while replacing only OS observations."""
+    expected = mac_host_gate.policy(HOST_CONFIG)
+    original_capture = mac_host_gate.capture
+    before, after = host_snapshot(1), host_snapshot(3.1, free=(38 if quiet else 20) << 30)
+
+    def quiet_check(policy, **kwargs):
+        events.append("quiet")
+        assert policy == expected["limits"] and kwargs == {"sample_interval_s": 2}
+        return dict(before=copy.deepcopy(before), after=copy.deepcopy(after),
+            assessment=mac_host_state.compare_snapshots(before, after, policy))
+
+    def capture(output, name):
+        events.append(name)
+        value = host_snapshot(4 + mac_host_gate.SNAPSHOTS.index(name) * 2)
+        if name == failed_capture:
+            value.update(status="failed", errors=["synthetic observation unavailable"])
+        monkeypatch.setattr(mac_host_state, "snapshot", lambda: copy.deepcopy(value))
+        return original_capture(output, name)
+
+    monkeypatch.setattr(mac_host_state, "quiet_check", quiet_check)
+    monkeypatch.setattr(mac_host_gate, "capture", capture)
+    return expected
+
+
+class ObservedSession(Session):
+    def __init__(self, events):
+        super().__init__()
+        self.events = events
+
+    def start(self, *args):
+        self.events.append("start")
+        return super().start(*args)
+
+    def call(self, stage, operation, **kwargs):
+        if operation == "stage.stop":
+            self.events.append("stop")
+        elif operation == "stage.client" and kwargs["request"]["path"] == "/completion":
+            self.events.append("completion")
+        return super().call(stage, operation, **kwargs)
+
+
+def test_host_gate_orders_retained_observations_around_one_benchmark(tmp_path, monkeypatch):
+    events = []
+    expected = host_observations(monkeypatch, events)
+    output, session = tmp_path / "arm", ObservedSession(events)
+    result = staged_benchmark.benchmark(session, "base", CONFIG, output, host_policy=expected)
+    assert result["status"] == "passed", result
+    assert result["completion_requests"] == session.completions == 1
+    assert events == ["quiet", "start", mac_host_gate.SNAPSHOTS[0], "completion",
+                      mac_host_gate.SNAPSHOTS[1], "stop", mac_host_gate.SNAPSHOTS[2]]
+    summary = mac_host_gate.retained_arm(output, expected)
+    assert summary["quiet"]["status"] == summary["timed"]["status"] == summary["cleanup"]["status"] == "passed"
+
+
+def test_nonquiet_host_prevents_benchmark_launch_and_completion(tmp_path, monkeypatch):
+    events = []
+    expected = host_observations(monkeypatch, events, quiet=False)
+    output, session = tmp_path / "arm", ObservedSession(events)
+    result = staged_benchmark.benchmark(session, "base", CONFIG, output, host_policy=expected)
+    assert result["status"] == "failed" and result["completion_requests"] == 0
+    assert session.started == [] and session.completions == 0 and events == ["quiet"]
+    assert "precondition" in result["error"] and (output / mac_host_gate.QUIET).exists()
+
+
+@pytest.mark.parametrize("name", mac_host_gate.SNAPSHOTS)
+def test_benchmark_host_capture_failure_keeps_raw_and_cleans_without_retry(tmp_path, monkeypatch, name):
+    events = []
+    expected = host_observations(monkeypatch, events, failed_capture=name)
+    output, session = tmp_path / "arm", ObservedSession(events)
+    result = staged_benchmark.benchmark(session, "base", CONFIG, output, host_policy=expected)
+    assert result["status"] == "failed" and result["cleanup_confirmed"] is True
+    assert result["completion_requests"] == session.completions == (0 if name == mac_host_gate.SNAPSHOTS[0] else 1)
+    assert len(session.started) == 1 and events.count("stop") == 1
+    assert load(output / name)["errors"] == ["synthetic observation unavailable"]
+    assert (output / "stderr.log").read_bytes() == b"native log\n"
+
+
+def test_benchmark_without_host_policy_does_not_collect_mac_state(tmp_path, monkeypatch):
+    def unexpected(*args):
+        pytest.fail("Mac gate called without an explicit host policy")
+    monkeypatch.setattr(mac_host_gate, "before_launch", unexpected)
+    monkeypatch.setattr(mac_host_gate, "capture", unexpected)
+    assert staged_benchmark.benchmark(Session(), "base", CONFIG, tmp_path / "arm")["status"] == "passed"
 
 
 def test_both_arms_share_session_and_revalidate_raw_result(tmp_path):

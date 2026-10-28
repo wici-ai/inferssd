@@ -11,7 +11,7 @@ from ci.private_controller import API, source_manifest
 from ci.isolated_device import manifest_read_path
 from ci.selection_lifetime import OBSERVATION_BUDGET_S, ParentWatch
 from ci.selected_receipt import receipt
-from ci import selected_preflight, model_admission
+from ci import selected_preflight, model_admission, mac_host_gate
 from ci.selection_contract import protected_binding, runtime_requirements, execution_scope
 from ci.stage_session import StageSession
 from ci.staged_benchmark import benchmark
@@ -44,6 +44,8 @@ def run(args):
         manifest = load(manifest_path)
         (output / "root-manifest.json").write_bytes(manifest_path.read_bytes())
         needs = runtime_requirements(config)
+        host_policy = mac_host_gate.policy(config) if config["paths"]["platform"] == "darwin" else None
+        host_options = {"host_policy": host_policy} if host_policy is not None else {}
         scope = execution_scope(config)
         if scope is not None:
             report.update(scope)
@@ -97,7 +99,7 @@ def run(args):
             native = dict(data["smoke"], revision=plan["candidate"])
             if native["argv"][0] != builds["candidate"]["binary"]["runtime_path"]:
                 raise ValueError("functional executable differs from sealed candidate")
-            result = smoke(session, native, output / ("native-" + model), stage_id="candidate-smoke-" + model)
+            result = smoke(session, native, output / ("native-" + model), stage_id="candidate-smoke-" + model, **host_options)
             if result["status"] != "passed":
                 raise RuntimeError("selected functional model request failed")
             functional[model] = dict(launch=native, output=output / ("native-" + model), result=result)
@@ -121,21 +123,25 @@ def run(args):
             cell = cells[model]
             report["cells"].append(cell)
             for tier in needs["performance"].get(model, {}).get("tiers", []):
-                measurements, receipts = {}, {}
+                measurements, receipts, host_states = {}, {}, {}
                 for side in ("base", "candidate"):
                     spec = config["sides"][side]["models"][model]["benchmarks"][tier]
                     launch = dict(spec, model=model, revision=plan[side], tier=tier, stage_prefix=side + "-" + model)
                     if launch["argv"][0] != builds[side]["binary"]["runtime_path"]:
                         raise ValueError("performance executable differs from sealed side")
                     folder = output / model / tier / side
-                    measured = benchmark(session, side, launch, folder)
+                    measured = benchmark(session, side, launch, folder, **host_options)
                     if measured["status"] != "passed" or measured["cleanup_confirmed"] is not True:
                         raise RuntimeError("selected single benchmark arm failed; no retry")
                     measurements[side] = run_final.read_result(folder / "result.json", tier, spec["request_timeout_s"])
                     receipts[side] = receipt(config, manifest, side, model, launch, builds[side], folder)
+                    if host_policy is not None:
+                        host_states[side] = mac_host_gate.retained_arm(folder, host_policy)
                     if comparable(receipts[side]) != comparable(preflight[model, tier, side]):
                         raise ValueError("timed runtime differs from its successful short preflight")
                 compared = compare_pair(measurements["base"], measurements["candidate"], receipts["base"], receipts["candidate"], config["policy"])
+                if host_policy is not None:
+                    compared = mac_host_gate.pair(compared, host_states["base"], host_states["candidate"])
                 save(output / model / tier / "comparison.json", compared)
                 cell["performance"].append(dict(tier=tier, **compared))
                 if compared["passed"] is not True:

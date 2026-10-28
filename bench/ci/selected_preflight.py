@@ -6,6 +6,7 @@ import time
 import final_chat
 from ci.compare import comparable
 from ci.contract import digest, load, save
+from ci import mac_host_gate
 from ci.selection_contract import linux_stages, PERFORMANCE_MODE
 from ci.staged_benchmark import verify_stopped
 from ci.staged_smoke import smoke
@@ -123,6 +124,8 @@ def run(session, config, manifest, pairs, builds, functional, output):
     gate = dict(schema_version=1, purpose="selected-performance-preflight", status="failed",
                 timed_samples=0, started_monotonic_ns=time.monotonic_ns(), cells=[])
     checked = {}
+    host_options = ({"host_policy": mac_host_gate.policy(config)}
+                    if config["paths"]["platform"] == "darwin" else {})
     try:
         for pair in pairs:
             model, tier = pair["model"], pair["tier"]
@@ -135,7 +138,7 @@ def run(session, config, manifest, pairs, builds, functional, output):
                 reuse = side == "candidate" and same_launch(functional[model]["launch"], spec)
                 raw = functional[model]["output"] if reuse else folder
                 result = functional[model]["result"] if reuse else smoke(
-                    session, spec, raw, stage_id=side + "-" + model + "-preflight-" + tier)
+                    session, spec, raw, stage_id=side + "-" + model + "-preflight-" + tier, **host_options)
                 if (result.get("status") != "passed" or result.get("cleanup_confirmed") is not True
                         or result.get("completion_requests") != 1):
                     raise RuntimeError("selected short preflight failed or was unclean; no timing or retry")
