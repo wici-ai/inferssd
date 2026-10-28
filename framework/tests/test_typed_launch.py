@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from test_engine_runtime import Effects, Owner, policy
-from test_mac_alias import fixture as gguf_fixture
+from test_gguf_alias import fixture as gguf_fixture
 
 from inferssd.cli import main
 from inferssd.configuration.derive import Selection, SelectionConflict, selection
@@ -19,7 +19,7 @@ from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.typed import LaunchSpec, reject_legacy_environment, resolve_typed
 from inferssd.launch.types import LaunchInput, Threads
 from inferssd.loop.typed_controller import TypedController
-from inferssd.source import mac_alias
+from inferssd.source import gguf_alias
 
 
 def setup(tmp_path, platform="linux", automatic=False):
@@ -59,9 +59,9 @@ def setup(tmp_path, platform="linux", automatic=False):
     seen = []
 
     def indexer(command):
-        assert command[:4] == ["metadata-python", "-I", "-m", "inferssd.source.mac_alias"]
+        assert command[:4] == ["metadata-python", "-I", "-m", "inferssd.source.gguf_alias"]
         seen.append(command)
-        assert mac_alias.main(command[4:]) == 0
+        assert gguf_alias.main(command[4:]) == 0
 
     adapter = RecordedArtifacts(
         inputs, host, run=indexer, replace=lambda a, b: Path(a).replace(b), python="metadata-python"
@@ -102,6 +102,8 @@ def test_settings_file_and_cli_provenance_reach_native_argv(tmp_path, platform):
     assert native.at("expert.source").origin == "file"
     assert not any("GGML_KIMI" in x for x in result.argv)
     assert ("MemoryMax=4294967296" in result.scope) == (platform == "linux")
+    # Every platform's SSD executor reads the routed experts; none stay with the model.
+    assert "--defer-experts" in result.argv and "--cpu-moe" not in result.argv
     assert not (out / "native-events.jsonl").exists()  # only the native writer owns creation
     with pytest.raises(FileExistsError):
         resolve(inputs, spec, adapter, out, platform)
@@ -147,6 +149,7 @@ def test_auto_alias_uses_real_strict_header_indexer(tmp_path):
     value = parse((out / "settings.ssd").read_text(), str(out / "settings.ssd"))
     alias = Path(value.at("expert.source").value[0])
     rows = alias.read_text().splitlines()
+    assert "--n-experts" not in calls[0]  # the expert count comes from the model
     assert len(rows) == 1 + 3 * 256 and "source_path" in rows[0]
     assert str(Path(spec.model)) in rows[-1]
     assert "source=generated" in value.at("expert.source").receipt

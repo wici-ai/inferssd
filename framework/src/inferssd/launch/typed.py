@@ -276,7 +276,7 @@ def _resolve(
             raise ValueError("typed launch requires a nonempty explicit expert.source")
         artifacts = spec.artifact_directory or directory + "/artifacts"
         s.ask("mkdir", artifacts)
-        alias = s.text("mac_alias", s.inputs.profile, artifacts, *paths)
+        alias = s.text("gguf_alias", artifacts, *paths)
         selected = Setting(
             "expert.source",
             (alias,),
@@ -366,9 +366,11 @@ def _resolve(
         str(spec.port),
         "-np",
         "1",
+        # The SSD executor reads the routed experts; their mapped pages stay unread.
+        "--defer-experts",
     ]
     if platform == "linux":
-        command += ["--defer-experts", "-fa", "on"]
+        command += ["-fa", "on"]
         s.scope = (
             ["systemd-run"]
             + (["--user"] if uid != 0 else [])
@@ -382,18 +384,6 @@ def _resolve(
                 "MemorySwapMax=0",
             ]
         )
-    else:
-        command += [
-            "--no-host",
-            "--cpu-moe",
-            "--no-op-offload",
-            "--reasoning",
-            "off",
-            "--cache-ram",
-            "0",
-        ]
-        if s.inputs.profile == "dsv":
-            command += ["-ot", r"blk\.[0-9]+\.engram_embd\.weight=CPU"]
     command += list(s.inputs.extra)
     s.argv = command
     s.emit(

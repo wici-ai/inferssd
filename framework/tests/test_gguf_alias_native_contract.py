@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from inferssd.source.mac_alias import NATIVE_TYPES
+from inferssd.source.gguf_alias import NATIVE_TYPES
 
 
 def test_strict_type_table_matches_compiled_native_traits(tmp_path):

@@ -104,7 +104,8 @@ fio input text and does not invoke fio or read the referenced payload ranges.
 legacy artifact formats and consumed-input errors. The new CLI uses argparse
 for missing/invalid command arguments rather than the old script's usage text.
 A generated alias is not a payload-integrity
-certificate or a substitute for the Mac launcher's stricter alias validation.
+certificate or a substitute for the stricter header-validated alias that a launch
+without `expert.source` generates.
 
 Recorded bootstrap inputs and results can be read separately:
 

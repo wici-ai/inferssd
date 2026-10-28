@@ -1,4 +1,4 @@
-"""Strict, standard-library GGUF alias builder for the static Mac runtime.
+"""Strict, standard-library GGUF alias index of the routed experts the SSD executor reads.
 
 The legacy metadata reader intentionally retains historical observation semantics.
 This separate reader checks the complete header and every tensor extent without
@@ -214,7 +214,7 @@ def read_header(path: Path) -> Header:
             version = struct.unpack("<I", version_bytes)[0]
             if version not in (2, 3):
                 if struct.unpack(">I", version_bytes)[0] in (2, 3):
-                    raise ValueError("big-endian GGUF is not supported by the Mac alias builder")
+                    raise ValueError("big-endian GGUF is not supported by the alias builder")
                 raise ValueError(f"unsupported GGUF version {version}")
             tensor_count, metadata_count = int(reader.take("Q")), int(reader.take("Q"))
             if metadata_count > (reader.length - reader.offset) // 12:
@@ -350,10 +350,15 @@ def _validate_shards(paths: list[Path]) -> list[int]:
 
 
 def build_rows(
-    model_paths: list[Path], include_kinds: set[str], n_experts: int, require_aligned: bool = False
+    model_paths: list[Path],
+    include_kinds: set[str],
+    n_experts: int | None,
+    require_aligned: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    if n_experts not in (256, 384):
-        raise RuntimeError("Mac aliases support exactly 256 or 384 experts")
+    """Index every selected expert tensor. Each has the same expert count: n_experts, or the
+    first selected tensor's when it is None."""
+    if n_experts is not None and n_experts < 1:
+        raise RuntimeError("the expert count must be positive")
     if not include_kinds or include_kinds - {"up", "gate", "down"}:
         raise RuntimeError("include kinds must be a nonempty subset of up,gate,down")
     shard_numbers = _validate_shards(model_paths)
@@ -395,9 +400,12 @@ def build_rows(
             seen.add(tensor.name)
             if len(tensor.name.encode("utf-8")) >= 128:
                 raise RuntimeError(f"tensor name too long for runtime key: {tensor.name}")
-            if len(tensor.shape) != 3 or tensor.shape[2] != n_experts:
+            count = tensor.shape[2] if len(tensor.shape) == 3 else 0
+            if n_experts is None:
+                n_experts = count
+            if not count or count != n_experts:
                 raise RuntimeError(
-                    f"{tensor.name}: expected 3D tensor with {n_experts} experts, "
+                    f"{tensor.name}: expected 3D tensor with {n_experts or 'routed'} experts, "
                     f"got {tensor.shape}"
                 )
             if tensor.nbytes <= 0 or tensor.nbytes % n_experts:
@@ -473,7 +481,7 @@ def _repo_head(repo: Path | None) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-glob", action="append", required=True)
-    parser.add_argument("--n-experts", type=int, default=384)
+    parser.add_argument("--n-experts", type=int, help="expected experts per tensor (default: read)")
     parser.add_argument("--include-kind", default="up,gate,down")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--summary-json", type=Path, required=True)

@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from inferssd.launch.recorded import generate_alias
-from inferssd.source import mac_alias as m
+from inferssd.source import gguf_alias as m
 
 EXPERT = "blk.0.ffn_up_exps.weight"
 
@@ -315,6 +315,28 @@ def test_selected_expert_geometry_is_not_inferred_or_transposed(tmp_path, shape)
         m.build_rows([path], {"up"}, 256)
 
 
+def test_expert_count_is_read_once_from_the_model(tmp_path):
+    path = tmp_path / "model.gguf"
+    fixture(
+        path,
+        tensors=[(EXPERT, (32, 2, 8), 8, 0), ("blk.0.ffn_gate_exps.weight", (32, 2, 8), 8, 544)],
+    )
+    rows, summary = m.build_rows([path], {"up", "gate"}, None)
+    assert len(rows) == 16 and summary["n_experts"] == 8
+    with pytest.raises(RuntimeError, match="expected 3D tensor with 6 experts"):
+        m.build_rows([path], {"up"}, 6)
+    mixed = tmp_path / "mixed.gguf"
+    fixture(
+        mixed,
+        tensors=[(EXPERT, (32, 2, 8), 8, 0), ("blk.0.ffn_gate_exps.weight", (32, 2, 4), 8, 544)],
+    )
+    with pytest.raises(RuntimeError, match="expected 3D tensor with 8 experts"):
+        m.build_rows([mixed], {"up", "gate"}, None)
+    fixture(path, tensors=[(EXPERT, (32, 8), 8, 0)])
+    with pytest.raises(RuntimeError, match="expected 3D tensor with routed experts"):
+        m.build_rows([path], {"up"}, None)
+
+
 def test_shards_and_optional_split_metadata_must_agree(tmp_path):
     a, b = (tmp_path / f"model-{i:05d}-of-00002.gguf" for i in (1, 2))
     fixture(a, kv=[("split.no", 2, 0), ("split.count", 2, 2), ("split.tensors.count", 5, 2)])
@@ -404,8 +426,8 @@ def test_path_controls_missing_empty_and_alignment(tmp_path):
     fixture(path)
     with pytest.raises(RuntimeError, match="unaligned offset"):
         m.build_rows([path], {"up"}, 256, True)
-    with pytest.raises(RuntimeError, match="256 or 384"):
-        m.build_rows([path], {"up"}, 2)
+    with pytest.raises(RuntimeError, match="must be positive"):
+        m.build_rows([path], {"up"}, 0)
     with pytest.raises(RuntimeError, match="nonempty subset"):
         m.build_rows([path], {"other"}, 256)
     with pytest.raises(RuntimeError, match="no expert tensors"):
@@ -486,7 +508,7 @@ def test_launch_retains_temporary_staging_and_ordered_atomic_failure_boundary(tm
     events = []
 
     def run(command):
-        assert command[:4] == ["/bound/python", "-I", "-m", "inferssd.source.mac_alias"]
+        assert command[:4] == ["/bound/python", "-I", "-m", "inferssd.source.gguf_alias"]
         assert command[command.index("--repo") + 1] == "/repo"
         Path(command[command.index("--out") + 1]).write_text("new alias")
         if failure == "build":

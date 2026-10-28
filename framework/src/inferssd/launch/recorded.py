@@ -14,7 +14,7 @@ import tempfile
 import traceback
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from inferssd.launch.darwin import PROFILES
 from inferssd.launch.types import Fact, LaunchInput, Reply
@@ -64,7 +64,7 @@ def metadata(name: str, arguments: tuple[str, ...]) -> Reply:
 
 def generate_alias(
     paths: tuple[str, ...],
-    profile: str,
+    profile: Optional[str],
     cache_dir: Path,
     *,
     repo: str,
@@ -72,9 +72,13 @@ def generate_alias(
     run: Callable[[list[str]], None],
     replace: Callable[[str, str], None],
 ) -> str:
-    """Retain the strict Mac indexer and its two ordered publications."""
+    """Run the strict GGUF alias indexer, then publish the index and its summary in order.
+
+    The historical launcher's profile also fixes the expert count it checks; without one
+    the indexer reads it from the model.
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    name = hashlib.sha256((profile + "\0" + paths[0]).encode()).hexdigest()[:20]
+    name = hashlib.sha256(((profile or "") + "\0" + paths[0]).encode()).hexdigest()[:20]
     alias, summary = cache_dir / f"{name}.tsv", cache_dir / f"{name}.json"
     with tempfile.TemporaryDirectory(prefix=".index-", dir=cache_dir) as temporary:
         pending_alias, pending_summary = (
@@ -85,14 +89,14 @@ def generate_alias(
             python,
             "-I",
             "-m",
-            "inferssd.source.mac_alias",
-            "--n-experts",
-            str(PROFILES[profile][0]),
+            "inferssd.source.gguf_alias",
             "--out",
             str(pending_alias),
             "--summary-json",
             str(pending_summary),
         ]
+        if profile:
+            command[4:4] = ["--n-experts", str(PROFILES[profile][0])]
         if repo:
             command[4:4] = ["--repo", repo]
         for path in paths:
@@ -168,12 +172,16 @@ class RecordedArtifacts:
             return Reply()
         if name in ("index", "source_facts", "dense"):
             return metadata(name, args)
-        if name == "mac_alias":
+        if name in ("mac_alias", "gguf_alias"):
+            # The historical Mac launcher names its profile first; the typed launch does not.
+            historical = name == "mac_alias"
+            profile = args[0] if historical else None
+            directory, *paths = args[1:] if historical else args
             return Reply(
                 generate_alias(
-                    tuple(args[2:]),
-                    args[0],
-                    Path(args[1]),
+                    tuple(paths),
+                    profile,
+                    Path(directory),
                     repo=self.inputs.repo,
                     python=self.python,
                     run=self.run,
