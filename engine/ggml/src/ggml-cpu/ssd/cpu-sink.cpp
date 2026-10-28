@@ -3257,8 +3257,7 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
             integer("vram.margin_mib") < integer("vram.reserve_mib") + 64 || integer("vram.margin_mib") > 8192) {
         throw std::runtime_error("invalid typed SSD executor dependencies");
     }
-    const auto * gpu_budget = out.settings.vram_budget();
-    if ((gpu_budget->automatic || gpu_budget->bytes) && !out.has_gpu) {
+    if (!out.has_gpu && out.settings.vram_budget()->tier_bytes(false)) {
         throw std::runtime_error("nonzero GPU tier budget requires an injected GPU provider");
     }
     auto & p = out.policy;

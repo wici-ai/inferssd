@@ -5,6 +5,7 @@
 #include "ggml-cpu.h"
 #include "ssd/cpu-sink.h"
 #include "ssd/cpu-prefill.h"
+#include "ggml-ssd/settings/settings.h"
 #include "ggml-ssd/gpu/kimi-cache-location-api.h"
 #include <thread>
 #include <array>
@@ -3513,6 +3514,29 @@ static void host_ledger_tests(fixture_inputs & inputs) {
 #include "configured-runtime-gate.h"
 #endif
 
+// The configured executor without a GPU provider, as on macOS, Windows and CPU-only Linux: vram.budget auto is
+// no GPU tier, and only an explicit nonzero budget is refused.
+static void tierless_budget_tests() {
+    fixture f;
+    auto owner = std::make_shared<ssd::host::process_arbiter>();
+    auto client = owner->make_client();
+    require(bool(client), "host client registration");
+    const ssd::runtime_services services{ nullptr, nullptr, client.value.get() };
+    for (const bool automatic : { true, false }) {
+        const auto settings = ssd::settings::parse("", "", { { "vram.budget", automatic ? "auto" : "1048576" } });
+        require(bool(settings), settings.error);
+        char error[512] = {};
+        sink_ptr sink(ssd::cpu::create_configured(&settings.value, &services, fixture::resolve, &f, error, sizeof(error)));
+        if (automatic) {
+            require(bool(sink), std::string("vram.budget auto without a GPU provider: ") + error);
+        } else {
+            require(!sink && std::strstr(error, "requires an injected GPU provider"),
+                "an explicit GPU tier budget without a provider was accepted");
+        }
+    }
+    std::printf("TIERLESS_BUDGET_OK\n");
+}
+
 // The production shape of a call: graphs of sink nodes that every thread of a ggml threadpool enters, ith 0 as the
 // coordinator that opens, runs and closes the call and the others as its participants, as
 // llama_kimi_cpu_sink_compute does. Chained decode layers with a dense op between them, a grouped prefill and a run
@@ -4070,6 +4094,7 @@ int main(int argc, char ** argv) {
 #else
             std::printf("case=host_ledger status=SKIP reason=linux_ledger_injection\n");
 #endif
+            tierless_budget_tests();
             synthetic_tests(inputs, options.threads, ring_set ? options.ring_experts : 2);
         }
         else { require(!prefix.empty(), "real pack requires fixture prefix"); real_test(inputs, pack, prefix, options); }

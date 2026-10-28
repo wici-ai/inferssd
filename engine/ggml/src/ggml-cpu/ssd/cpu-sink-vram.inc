@@ -79,7 +79,7 @@ struct sink_vram {
         if (configuration.production) {
             const auto * budget = configuration.settings.vram_budget();
             if (!budget) { throw std::runtime_error("missing typed vram.budget"); }
-            bytes = budget->automatic ? UINT64_MAX : budget->bytes;
+            bytes = budget->tier_bytes(configuration.has_gpu);
             async_upload = exclusive = deferred_upload = prefill_enabled = bytes != 0;
         }
         {

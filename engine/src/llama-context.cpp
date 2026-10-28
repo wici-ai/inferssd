@@ -221,26 +221,6 @@ llama_context::llama_context(
         }
         cpu_prefill_max_tokens = uint32_t(*ssd_runtime->settings.integer("prefill.cpu_max_tokens"));
         cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
-        std::vector<int32_t> routed_layers;
-        for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
-            const auto & layer = model.layers[il];
-            if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
-                routed_layers.push_back(int32_t(il));
-            }
-        }
-        cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer,
-            kimi_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
-            int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
-        if (*ssd_runtime->settings.integer("prefetch.depth") > 0) {
-            for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
-                const auto & layer = model.layers[il];
-                for (const ggml_tensor * experts : {layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
-                    if (experts) {
-                        cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = {experts->nb[2], experts->ne[2]};
-                    }
-                }
-            }
-        }
     }
     // The retained resource profile sizes each request's prompt graph, then
     // keeps a one-token decode graph. The configured ubatch remains available
@@ -340,6 +320,29 @@ llama_context::llama_context(
         if (ssd_runtime) {
             ssd_runtime->bind_cpu(backend_cpu);
             for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get()); }
+            // After the backends: the sink has a GPU tier only when one of them injected its provider.
+            if (cpu_sink_enabled) {
+                std::vector<int32_t> routed_layers;
+                for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+                    const auto & layer = model.layers[il];
+                    if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
+                        routed_layers.push_back(int32_t(il));
+                    }
+                }
+                cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer,
+                    kimi_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
+                    int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
+                if (*ssd_runtime->settings.integer("prefetch.depth") > 0) {
+                    for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+                        const auto & layer = model.layers[il];
+                        for (const ggml_tensor * experts : {layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
+                            if (experts) {
+                                cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = {experts->nb[2], experts->ne[2]};
+                            }
+                        }
+                    }
+                }
+            }
             auto * registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
             const auto get_api = reinterpret_cast<ssd::cpu::get_api_v2>(
                 ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v2"));

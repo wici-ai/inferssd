@@ -25,6 +25,10 @@ enum platform_scope : uint32_t {
 struct budget {
     bool     automatic;
     uint64_t bytes;
+
+    // The GPU tier's byte budget: auto is all a GPU provider admits, and no
+    // tier without one; an explicit budget stays as given.
+    uint64_t tier_bytes(bool provider) const noexcept { return automatic ? (provider ? UINT64_MAX : 0) : bytes; }
 };
 
 using cost_table = std::map<std::string, double>;

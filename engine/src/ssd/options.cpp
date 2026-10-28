@@ -185,13 +185,9 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend) {
     const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     const auto get = reinterpret_cast<ssd::gpu::get_provider_v1>(
         ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_ssd_api_v1"));
-    if (!get) {
-        const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend));
-        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            throw std::runtime_error("configured SSD sources require the GPU context transport provider");
-        }
-        return;
-    }
+    // A backend without the provider (the CPU, Metal) has no GPU tier: a GPU
+    // there runs the dense layers, and the CPU sink every routed expert.
+    if (!get) { return; }
     if (gpu_transport) { throw std::runtime_error("one configured CUDA executor per context is supported"); }
     const auto * provider = get();
     if (!provider || provider->version != 1 || provider->size != sizeof(*provider) ||

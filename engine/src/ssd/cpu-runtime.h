@@ -104,8 +104,7 @@ struct llama_kimi_cpu_sink_runtime {
         // fixed eight-expert read ring, no speculative cache-compute policy.
         cache_budget = std::numeric_limits<uint64_t>::max();
         cache_keep_across_requests = true;
-        const auto * budget = settings.vram_budget();
-        vram_budget = budget->automatic ? std::numeric_limits<uint64_t>::max() : budget->bytes;
+        vram_budget = settings.vram_budget()->tier_bytes(services.gpu != nullptr);
         cache_max_per_layer = int(std::min<int64_t>(n_expert, 896));
         for (int32_t layer : routed_layers) {
             if (layer >= 0 && layer < n_layers &&
