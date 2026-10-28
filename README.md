@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://wici.ai">
-    <img src="docs/assets/wicissdinfer.png" width="600" alt="WICI-InferSSD">
+    <img src="docs/assets/wicissdinfer.png" width="600" alt="InferSSD">
   </a>
 </p>
 
@@ -16,13 +16,13 @@
   <a href="docs/benchmark.md">Methodology</a>
 </p>
 
-**Run models larger than your RAM or VRAM.** WICI-InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run **DeepSeek-V4.1-Flash-1017** and **Muse-Spark-Open** from SSD. Expert packs, bounded caches, and prompt batching reduce the cost of accessing weights while retaining GGUF, browser chat, and an OpenAI-compatible API.
+**Run models larger than your RAM or VRAM.** InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run **DeepSeek-V4.1-Flash-1017** and **Muse-Spark-Open** from SSD. Expert packs, bounded caches, and prompt batching reduce the cost of accessing weights while retaining GGUF, browser chat, and an OpenAI-compatible API.
 
 ## Performance benchmarks
 
 **4K prompt tier · 256 output tokens · decode measured over tokens 129–256.** The 4K label describes the prompt tier, not the model's context-window capacity; actual input token counts depend on the chat template.
 
-All rates are in **token/s**, with higher values indicating faster inference. **llama.cpp is the baseline (1.00×)**. **Speedup** below each Colibri and **WICI-InferSSD** rate is `engine throughput / llama.cpp throughput` on the same system. Values above 1.00× are faster; values below 1.00× are slower.
+All rates are in **token/s**, with higher values indicating faster inference. **llama.cpp is the baseline (1.00×)**. **Speedup** below each Colibri and **InferSSD** rate is `engine throughput / llama.cpp throughput` on the same system. Values above 1.00× are faster; values below 1.00× are slower.
 
 These results compare complete inference configurations. In the Mac DeepSeek runs, Colibri uses official Safetensors on CPU, while the GGUF engines use Metal with CPU experts. See [measurement details](docs/benchmark.md) for the scope of the comparison.
 
@@ -44,7 +44,7 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 
 #### Prefill · 4K
 
-| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **WICI-InferSSD**<br>**token/s · Speedup** |
+| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **InferSSD**<br>**token/s · Speedup** |
 | --- | ---: | ---: | ---: |
 | MacBook Pro (M5 Max) | 5.929 | 0.708<br>(0.12×) | **26.270**<br>**(4.43×)** |
 | RTX 5060 Ti | 6.950 | 7.020<br>(1.01×) | **75.100**<br>**(10.81×)** |
@@ -53,7 +53,7 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 
 #### Decode · 4K
 
-| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **WICI-InferSSD**<br>**token/s · Speedup** |
+| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **InferSSD**<br>**token/s · Speedup** |
 | --- | ---: | ---: | ---: |
 | MacBook Pro (M5 Max) | 0.873 | 0.437<br>(0.50×) | **2.704**<br>**(3.10×)** |
 | RTX 5060 Ti | 0.242 | 0.900<br>(3.72×) | **2.550**<br>**(10.54×)** |
@@ -64,7 +64,7 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 
 #### Prefill · 4K
 
-| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **WICI-InferSSD**<br>**token/s · Speedup** |
+| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **InferSSD**<br>**token/s · Speedup** |
 | --- | ---: | ---: | ---: |
 | MacBook Pro (M5 Max)<sup>1</sup> | 3.140 | N/S | **12.480**<br>**(3.97×)** |
 | RTX 5060 Ti | 3.410 | N/S | **52.100**<br>**(15.28×)** |
@@ -73,7 +73,7 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 
 #### Decode · 4K
 
-| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **WICI-InferSSD**<br>**token/s · Speedup** |
+| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **InferSSD**<br>**token/s · Speedup** |
 | --- | ---: | ---: | ---: |
 | MacBook Pro (M5 Max)<sup>1</sup> | 0.153 | N/S | **0.944**<br>**(6.17×)** |
 | RTX 5060 Ti | 0.059 | N/S | **0.219**<br>**(3.71×)** |
@@ -135,7 +135,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ## Further reading
 
-- [How it works](docs/architecture.md): expert packs, caching, batching, and the source map.
+- [How it works](docs/architecture.md): expert packs, caching, batching, and the module map.
 - [Engine configurations](docs/benchmark.md#engine-configurations) and [decode windows / request times](docs/benchmark.md#decode-windows-and-request-time).
 - [Reproducing a result](docs/benchmark.md#reproducing-a-result) and [4K data provenance](docs/benchmark.md#data-provenance).
 
@@ -145,6 +145,6 @@ Hardware results and improvements to expert I/O, caching, and batching are welco
 
 ## Acknowledgments and license
 
-Built on [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp), with thanks to their contributors and the model-adaptation community. [Strata](https://github.com/niko1221/strata) and [Colibri](https://github.com/JustVugg/colibri) are related projects exploring accessible local inference.
+Built on [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp), with thanks to their contributors and the model-adaptation community.
 
-WICI-InferSSD is licensed under [Apache-2.0](LICENSE). The upstream llama.cpp/ggml MIT notice is preserved in [NOTICE](NOTICE). Model weights remain subject to their publishers' licenses.
+InferSSD is licensed under [Apache-2.0](LICENSE); bundled llama.cpp/ggml and other third-party components keep their original licenses and notices; see [NOTICE](NOTICE). Model weights remain subject to their publishers' licenses.

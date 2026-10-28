@@ -1,11 +1,11 @@
-# Private Muse checkpoint workflow
+# Muse checkpoint workflow
 
 Deploy `checkpoint.workflow.yml` as `.github/workflows/checkpoint.yml` on protected
-`main` in the **private** `wici-ai/inferssd-device-ci` repository. This manual
-workflow compares the fixed baseline `f5e6e26ff26d2014cccef0118048039b88163f54`
-with one explicitly reviewed candidate revision. It builds both sides and runs
-one fixed Muse 512-prompt/256-decode request per side in a single `StageSession`
-under the same device lease. It does not run 4K, retry a completion, publish an
+`main` in the private controller repository, `wici-ai/inferssd-device-ci`. This
+manual workflow compares the fixed legacy baseline (`LEGACY_REVISION` in
+`bench/ci/reference.py`) with one explicitly reviewed candidate revision. It
+builds both sides and runs one fixed Muse 512-prompt/256-decode request per side
+in a single `StageSession` under the same device lease. It does not run 4K, retry a completion, publish an
 App check, or replace the full three-device/two-model performance gate.
 
 ## Required deployment
@@ -68,5 +68,5 @@ produce no benchmark verdict; missing metrics are shown as unavailable.
 single cell had valid evidence, no observed slowdown in those five metrics and
 positive cleanup. `inconclusive` records an observed slowdown; `failed` records
 invalid or incomplete execution/evidence. Neither is reported as passing. Even
-a passed sample is not statistical proof of no regression, the final 512/4K
+a passed sample is not statistical proof of no regression, the formal 512/4K
 benchmark, or completion of the full device gate (`full_device_gate=false`).

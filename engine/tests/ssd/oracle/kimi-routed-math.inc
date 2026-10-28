@@ -1,4 +1,5 @@
-// Historical Kimi CPU mathematical variant, explicit test oracle only.
+// SPDX-License-Identifier: MIT
+// Historical Kimi CPU mathematical variant, explicit test reference only.
 // All retired observers and optional pruning are folded to the supported defaults.
 static void ggml_compute_forward_mul_mat_id_common_kimi(
         const struct ggml_compute_params * params,

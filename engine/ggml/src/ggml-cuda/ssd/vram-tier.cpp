@@ -1728,7 +1728,7 @@ struct tier {
     // The worker and the upload thread run on the CPUs of the thread that creates them. Every sink call that can
     // create the tier pins its caller to the sink's first compute CPU (sink_caller_affinity), so the worker shares
     // that core with the sink thread that waits for it; created from an unpinned thread they ran wherever the
-    // scheduler put them, and decode steps 129-256 were 9 % slower on the Spark (ysy9, 10-21). Logged so that a
+    // scheduler put them, and decode steps 129-256 were 9 % slower on a DGX Spark. Logged so that a
     // caller that does not pin shows (cpus > 1).
     void report_thread_cpus(){
         cpu_set_t set;CPU_ZERO(&set);

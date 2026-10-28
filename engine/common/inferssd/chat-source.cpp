@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #include "../chat.h"
 #include "../common.h"
 #include <algorithm>

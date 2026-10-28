@@ -28,16 +28,16 @@ well-formed event kinds remain inspectable. `effective_settings` requires one
 settings event, the complete registry-defined value/receipt set and typed values.
 It consumes actual C++ writer output in the cross-language contract test.
 
-The only new-core environment observations are in `telemetry/debug.cpp`:
-`INFERSSD_DEBUG=trace,profile,mrc,ledger` and `INFERSSD_TRACE_DIR`. They select output
-channels/destination only, never placement, numerical kernels or policy. There
-is no process-global mutable settings/telemetry owner. The old diagnostic
-readers still present outside this foundation module require the separate
-supported-profile retirement batch; this document does not imply they are gone.
+The SSD core reads only two environment variables, both in
+`telemetry/debug.cpp`: `INFERSSD_DEBUG=trace,profile,mrc,ledger` and
+`INFERSSD_TRACE_DIR`. They select output channels and their destination only,
+never placement, numerical kernels or policy. There is no process-global mutable
+settings or telemetry owner.
 
-The production integration contract is a `--ssd-telemetry FILE` option and
-context-owned writer, with all publishers joined before its destruction. The
-server/context connection is pending in this foundation batch. Defining this
-writer and its Python consumer does not by itself certify every old
-trace/profile/MRC emitter has been migrated. Numerical equality with channels enabled/disabled remains an
-engine integration gate, not a conclusion of JSON protocol unit tests.
+The server option `--ssd-telemetry FILE` creates the context-owned writer; all
+publishers are joined before it is destroyed. The writer publishes the effective
+settings first, then `ssd.controller.begin` (see
+[controller observations](architecture/controller-observations.md)).
+`inferssd launch` writes this stream to `native-events.jsonl` in its output
+directory. Numerical equality with channels enabled and disabled is an engine
+integration check, not a conclusion of the JSON protocol unit tests.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #include "ggml-ssd/store/index.h"
 #include <cerrno>
 #include <cstdlib>

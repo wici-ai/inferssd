@@ -1,23 +1,24 @@
 # macOS device stages
 
-This is a root-installed, default-disabled stage executor. No Actions runner is
-registered by the installer. The target is the inventoried M5 Max, and the
-installer preserves the original device lock inode and STOP path. The portable
-tests establish only request and file-copy behavior; native isolation and Metal
-execution must pass before activation.
+This is a root-installed, default-disabled stage executor for one reviewed
+Apple Silicon Mac (CI device `local-mbp`). No Actions runner is registered by
+the installer, and the installer preserves the original device lock inode and
+STOP path. The portable tests establish only request and file-copy behavior;
+native isolation and Metal execution must pass before activation.
 
-The earlier installed package's native C++/Metal and isolation evidence remains
-in the private archive under its original hashes. This public template now
-requires explicit reviewed installer target inputs and uses a public address for
-the no-payload external-connect denial probe. These adjusted template bytes have
-not received a new native pass; the package manifest marks that limitation.
+The template requires explicit reviewed installer target inputs and uses a
+public address for the no-payload external-connect denial probe.
+`MANIFEST.json` records that these template bytes still need a native rerun
+(`public-template-adjusted-native-rerun-required`); run the native checks on the
+target host before enabling it.
 
 ## Installation boundary
 
 Review `install.py` and the package hashes, then invoke its explicit installation
 flag through a root terminal. Supply `--reviewed-hostname`, `--personal-home`,
-`--personal-uid`, `--lock-path`, `--lock-device` and `--lock-inode` from the private,
-reviewed inventory. No target identity is guessed or defaulted. Installation
+`--personal-uid`, `--lock-path`, `--lock-device` and `--lock-inode` from the
+operator's reviewed host record; `--personal-*` identify the Mac's existing
+interactive account. No target identity is guessed or defaulted. Installation
 checks the actual hostname, home ownership/mode and original lock device/inode
 before changing any accounts or files. Never substitute a newly created lock.
 It creates `/Library/InferSSD-CI` and two hidden,
@@ -27,8 +28,8 @@ everyone/localaccounts; none may be wheel/staff/admin. Every actual worker and
 future runner service explicitly calls setgroups before dropping privilege;
 Darwin still reports implicit nonprivileged groups. Native proof records actual
 credentials and must prove protected-resource denial, without falsely claiming
-a primary-only group list. It never changes the personal account/home permissions, creates
-sudoers entries, or starts a service. Installation refuses an existing directory
+a primary-only group list. It never changes the interactive account or its home
+permissions, creates sudoers entries, or starts a service. Installation refuses an existing directory
 or account collision rather than modifying it implicitly. The only resume mode
 requires the exact root-owned empty-layout/partial-disabled-accounts checkpoint
 and supplied SHA-256, binds this package manifest, verifies all directory and
@@ -37,19 +38,18 @@ account identities, and never resets existing account attributes. The normal sys
 concrete Xcode descendants remain root-protected and neither service account may
 belong to admin. Actual tool ancestry and account memberships enter the receipt.
 
-The inherited `verify.py` performs one meaningful negative set, its child
-inheritance check, real C++ and Metal computations, disconnect cleanup, original
-lease reacquisition and STOP refusal. It deliberately cannot certify the newer
+`verify.py` performs one meaningful negative set, its child inheritance check,
+real C++ and Metal computations, disconnect cleanup, original lease
+reacquisition and STOP refusal. It deliberately cannot certify the staged
 production protocol, model staging or bounded server profile by implication.
-The earlier installed M5 package exercised these Metal permissions successfully.
-Concrete runtime corrections grant only root-directory data, explicit tool/system
-ancestor metadata, and the exact read-only libinfo lookup; protected content stays
-denied. Compiler/SDK paths are frozen directly instead of invoking Xcode shims.
-There is no broad-permission retry.
+Runtime allowances in the Seatbelt profile grant only root-directory data,
+explicit tool/system ancestor metadata, and the exact read-only libinfo lookup;
+protected content stays denied. Compiler/SDK paths are pinned directly
+instead of invoking Xcode shims. There is no broad-permission retry.
 
 `stage_models.py` APFS-clones complete-hash-bound model inputs into a new,
 root-owned read-only directory. It rejects a failed clone rather than falling
-back to a hardlink or unexpectedly consuming a terabyte. Original personal files
+back to a hardlink or unexpectedly consuming a terabyte. Original model files
 keep their owner and inode. Any incomplete staging directory remains private.
 
 ## Root job manifest
@@ -85,7 +85,7 @@ The installed invocation is:
 
 `<config.tools.python> -I /Library/InferSSD-CI/control/client.py`
 
-Use the frozen real Xcode Python interpreter, not the `/usr/bin/python3` shim;
+Use the pinned real Xcode Python interpreter, not the `/usr/bin/python3` shim;
 first use of the shim can start per-user LaunchServices helpers.
 
 It is a persistent JSONL bridge to the root Unix broker socket. The broker checks
@@ -166,8 +166,8 @@ accounting error. The configured budget and reserve are not raised for models.
 python3 -m unittest discover -s bench/ci/macos-sandbox/tests -v
 ```
 
-The tests cover safe regular/dylib sealing, hardlink/special-file/escape refusal,
-byte limits, stage/job handle binding, path constraints and environment/deadline
+The tests cover safe regular/dylib read-only copies,
+hardlink/special-file/escape refusal, byte limits, stage/job handle binding, path constraints and environment/deadline
 validation. They do not launch a GPU, certify a sandbox or alter a device.
 
 `verify_broker.py` is one fixed native SIGKILL check: a private in-memory config

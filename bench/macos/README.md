@@ -1,5 +1,11 @@
 # Mac expert-source experiments
 
+`measure.py` is a legacy experiment driver. It configures the Mac expert source
+through `SSD_LLAMA_MAC_*` and `GGML_MOE_*` environment variables, which current
+engine builds refuse at startup as retired controls. It applies only to builds
+that predate typed settings; current launches use the settings described in
+[configuration](../../docs/configuration.md).
+
 `measure.py` runs one fresh server for a specified model and configuration.
 The first request uses a fresh server, including its normal initialization probes;
 later requests reuse its application cache but disable prompt/KV reuse. Results label
@@ -15,7 +21,8 @@ admission order remain unchanged. This setting exists for controlled experiments
 a production default requires numerical, memory and end-to-end validation.
 
 `GGML_MOE_EXPERT_GGUF_ALIAS_TSV` selects the same index format as the Linux reader.
-The index is generated from GGUF metadata with `scripts/kimi-build-gguf-expert-alias-tsv.py`.
+Generate the index from GGUF metadata with `inferssd source index`
+(see the [framework README](../../framework/README.md)).
 It is mutually exclusive with `SSD_LLAMA_MAC_EXPERT_PACK`. GGUF slices can be unaligned
 and end exactly at EOF. With read alignment 1, the reader requests logical bytes.
 Alignment 4096 or 16384 expands the source interval to page boundaries, capped at
@@ -114,5 +121,6 @@ and reader as separate translation units with ASan/UBSan or TSan.
 Run protocol and image-identity tests without model weights:
 
 ```sh
-python3 -m pytest -q tests/test-macos-measurement.py tests/test-macos-measurement-images.py
+python3 -m pytest -q tests/integration/test-macos-measurement.py \
+  tests/integration/test-macos-measurement-images.py
 ```

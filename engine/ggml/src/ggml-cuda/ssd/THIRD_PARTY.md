@@ -1,7 +1,10 @@
-# Historical reference component
+# Third-party notices
 
-The retired K3 parity component contained glibc/fdlibm reference math with its
-own original notices and LGPL-2.1-or-later expf implementation. It is absent
-from the live source. Its source snapshots, authorship and license notices
-remain in Git history. The retained MXFP4 and generic-format implementations
-keep their own source notices and strict floating-point build settings.
+The sources in this directory are InferSSD code licensed under Apache-2.0. They
+build on ggml, whose MIT notice is in [engine/LICENSE](../../../../LICENSE).
+
+An earlier revision of this component included a CUDA float reference
+translated from glibc and fdlibm routines, with an expf algorithm that
+originates in ARM optimized-routines. That reference code is not part of this
+source tree. Its origin is recorded in the historical note in
+[NOTICE](../../../../../NOTICE).

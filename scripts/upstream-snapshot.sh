@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
 # Create a prefixed comparison tree without changing a branch or the worktree.
 set -eu
 if [ "$#" -ne 1 ]; then

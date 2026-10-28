@@ -1,4 +1,4 @@
-// Historical environment precedence adapter; test oracle only.
+// Historical environment precedence adapter; test reference only.
 #include "legacy-config.h"
 namespace c0 { namespace {
 static void expert_pack_append_env_list(std::vector<std::string> &paths, const char *env_name) {

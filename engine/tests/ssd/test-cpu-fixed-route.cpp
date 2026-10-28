@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include <algorithm>

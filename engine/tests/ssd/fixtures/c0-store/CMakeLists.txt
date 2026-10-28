@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.19)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   project(c0_store_tests LANGUAGES CXX)
 endif()
-# Immutable test oracle only. The production store never includes these files.
+# Fixed test reference only. The production store never includes these files.
 file(GLOB C0_ORACLE_INCLUDES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/oracle/*.inc")
 foreach(reference IN LISTS C0_ORACLE_INCLUDES)
   get_filename_component(name "${reference}" NAME)

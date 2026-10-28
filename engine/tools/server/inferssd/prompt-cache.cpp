@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "../server-task.h"
 
 #include "build-info.h"

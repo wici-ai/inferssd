@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #include "ggml-ssd/gpu/transport.h"
 #include "ggml-ssd/store/source.h"
 #include "ggml-ssd/host/arbiter.h"

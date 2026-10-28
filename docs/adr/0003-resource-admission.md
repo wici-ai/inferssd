@@ -1,6 +1,6 @@
 # 0003: Admit real allocations before first touch
 
-Status: accepted for the private v0.1 candidate.
+Status: accepted.
 
 Linux contexts share one process arbiter and register separate budget clients.
 Tickets cover full new allocations, including first touch, and are committed

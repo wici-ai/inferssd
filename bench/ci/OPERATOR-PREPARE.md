@@ -74,8 +74,8 @@ file, including files marked `export-ignore`; no checkout/filter/hook runs.
 performance cells. Separate `execution_devices` and `validation_mode` limit this
 run to the declared devices and the 512-tier performance comparison.
 Each required executed model runs decode 256 once per side; 4K and omitted devices'
-requirements remain explicit coverage gaps. Historical functional/numerical
-envelopes retain their old meaning. The complete workflow input must fit
+requirements remain explicit coverage gaps. Envelopes prepared with the older
+`--validation-mode functional-numerical` keep that meaning. The complete workflow input must fit
 60 KiB; exceeding that bound refuses without truncation. The report cannot claim
 PR check publication or full impact coverage when required devices/4K work is absent.
 
@@ -86,20 +86,20 @@ rather than a CUDA GPU UUID. The actual executor resources are exactly
 guards, without a hard UMA or swap limit. Keep each side's original cache/thread
 configuration explicit; the same model files and typed values apply to both sides.
 
-Mac staging uses the frozen Xcode Python with `-I -B` and the fixed
+Mac staging uses the pinned Xcode Python with `-I -B` and the fixed
 `/Library/InferSSD-CI/controller/current/bench/ci/operator_mac_stage.py` path.
 The dedicated SSH key forces `control/operator-ssh-entry`, which admits only
 that fixed argv plus one `--expected-sha256` digest. Its separately reviewed sudo
 rule grants only `control/operator-root-entry`; this revalidates the digest and
 executes the fixed stager. No candidate path, shell, arbitrary Python program or
-personal password is accepted. The root policy is
+interactive password is accepted. The root policy is
 `/Library/InferSSD-CI/control/operator-policy.json`; the private manifest is
-`/Library/InferSSD-CI/private/job-manifests/JOB.json`. Staging seals input data
-under `/Library/InferSSD-CI/inputs/operator-JOB`, leaving `jobs/JOB` fresh for the
-existing executor's `job.open`.
+`/Library/InferSSD-CI/private/job-manifests/JOB.json`. Staging copies input
+data read-only under `/Library/InferSSD-CI/inputs/operator-JOB`, leaving
+`jobs/JOB` fresh for the existing executor's `job.open`.
 
 The Mac settings templates pin all bytes, allowing one `{{job_id}}` only in the
-single `expert.source` array item under the exact frozen source side. Preparation
+single `expert.source` array item under the exact pinned source side. Preparation
 retains the template digest and generated payload digest; root staging reverses
 only that one namespace and checks both. No general settings rewrite is allowed.
 The existing SSH-context broker recovery runs before staging takes the original
@@ -113,7 +113,7 @@ controller export, including `operator_stage.py`, first. This is an administrato
 bootstrap operation, separate from candidate preparation. The helper cannot
 replace its policy. It binds the device, broker config and original lock inode,
 GPU UUID, control manifest, exact resource envelope, model mounts/identities,
-settings hashes and existing Spark admission/proof. Extra host mappings such as
+settings hashes and, on DGX Spark, the existing model admission and mount proof. Extra host mappings such as
 runner home or `/etc/shadow` are refused. All new destinations are fixed CI
 prefixes with fresh exclusive writes. Existing model bytes/mounts, broker config,
 lock and STOP are not changed.
@@ -153,7 +153,7 @@ authorization mechanism. The sender uses non-PTY SSH and a plain tar stream,
 matching the root receiver's `r|` contract. Root holds the original lease during
 staging, rejects STOP, verifies GPU UUID and absence of compute work, checks the
 entire installed control manifest, reads model stat/RO mount metadata, and
-verifies every extracted Git blob before sealing each required source readonly.
+verifies every extracted Git blob before making each required source read-only.
 It installs only the reviewed two-sided config/settings and job manifest, then returns an
 identity-bound root receipt.
 

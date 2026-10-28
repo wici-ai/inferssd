@@ -1,9 +1,10 @@
-# Upstream integration
+# Upstream patches
 
-Commit `8884f8314ce8ea96d62cd602b6bbf7fc25758a09` is the bundled llama.cpp snapshot described in
-[PROVENANCE.md](PROVENANCE.md). Owned SSD implementations are mapped in
-[ARCHITECTURE.md](ARCHITECTURE.md). Relocations preserve source attribution and
-retained license files; no upstream history is rewritten by these changes.
+InferSSD bundles a llama.cpp snapshot under `engine/`. The unmodified snapshot
+is commit `8884f8314ce8ea96d62cd602b6bbf7fc25758a09` in the history of `main`. Its attribution and license notices are listed in
+[NOTICE](../../NOTICE). The InferSSD modules are described in
+[How it works](../architecture.md). Relocating the snapshot under `engine/`
+preserves its source attribution and license files.
 
 | Integration group | Reason and boundary |
 | --- | --- |
@@ -16,17 +17,15 @@ retained license files; no upstream history is rewritten by these changes.
 | Common/server | CLI dispatch, rendering/parser hooks, prompt-cache/checkpoint and lifecycle calls. Owned implementations reside in `common/inferssd` and `tools/server/inferssd`. |
 | State serialization | Virtual/C API entry points call positional/range codecs under `src/inferssd`. |
 
-The original 3,000-line hook target is a planning budget, not evidence that every
-changed upstream line is a hook. The inventory below includes model/op additions
-and inherited downstream edits. Further reduction of those edits, formatting and
-comment cleanup are deferred; production dependency directions are checked now.
-Private candidate validation must finish before claiming operational acceptance.
+The inventory below lists every upstream file that differs from the snapshot.
+It includes model and operator additions as well as integration hooks; review
+those two kinds of change separately when assessing patch growth.
 
-Regenerate the path inventory with
-`python3 scripts/inferssd/patch-surface.py`. It compares the working tree with
-the immutable bundled source snapshot and compares matching files below `engine/`,
-excluding directory relocation and newly owned paths. Review model/op exceptions separately from integration hooks
-when assessing future patch growth.
+Regenerate the inventory with `python3 scripts/inferssd/patch-surface.py` and
+replace the block between the inventory markers. The script compares each file
+of snapshot commit `8884f83` (override with `--base`) in the `ggml`, `src`, `include`, `common` and `tools/server` trees with the
+matching file under `engine/`. Relocation into `engine/` and files added by
+InferSSD are not counted.
 
 <!-- BEGIN UPSTREAM INVENTORY -->
 | Upstream path (under engine/) | Added | Removed |
@@ -126,14 +125,14 @@ when assessing future patch growth.
 | `ggml/src/ggml.c` | 272 | 8 |
 | `ggml/src/gguf.cpp` | 7 | 0 |
 | `include/llama.h` | 88 | 1 |
-| `src/CMakeLists.txt` | 19 | 0 |
+| `src/CMakeLists.txt` | 20 | 0 |
 | `src/llama-arch.cpp` | 114 | 2 |
 | `src/llama-arch.h` | 77 | 2 |
-| `src/llama-context.cpp` | 1359 | 46 |
+| `src/llama-context.cpp` | 1361 | 46 |
 | `src/llama-context.h` | 150 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
-| `src/llama-graph.cpp` | 758 | 49 |
+| `src/llama-graph.cpp` | 747 | 49 |
 | `src/llama-graph.h` | 158 | 5 |
 | `src/llama-hparams.cpp` | 4 | 0 |
 | `src/llama-hparams.h` | 45 | 1 |
@@ -168,5 +167,5 @@ when assessing future patch growth.
 | `tools/server/server-task.cpp` | 195 | 183 |
 | `tools/server/server-task.h` | 23 | 80 |
 
-Total: 15583 added, 5632 removed across 136 upstream paths.
+Total: 15575 added, 5632 removed across 136 upstream paths.
 <!-- END UPSTREAM INVENTORY -->

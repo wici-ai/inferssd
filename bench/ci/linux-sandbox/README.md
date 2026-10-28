@@ -3,8 +3,9 @@
 The trusted controller holds one JSONL Unix socket connection to
 `/run/inferssd-ci-broker/broker.sock` for an entire job. The socket admits only
 `inferssd-runner`. Candidate code runs as `inferssd-worker`; the trusted HTTP
-client uses a third identity, `inferssd-client`. Neither worker inherits runner
-credentials, coordinator descriptors, the device lease, or writable evidence.
+client uses a third identity, `inferssd-client`. The broker is designed so that
+neither inherits runner credentials, coordinator descriptors, the device lease,
+or writable evidence; the native probe below checks this on each host.
 
 `install.py` prints the installation plan by default. `--apply` is a root-only,
 fresh installation: three non-login accounts, root-owned broker/state, original
@@ -80,8 +81,9 @@ All messages include `schema_version: 1`, `operation`, and `job_id`.
   Socket EOF cancels stages and follows the same cleanup path.
 
 Sources mount at `/source/<side>`, models at `/models/<name>`, shared worker
-scratch at `/scratch`, and sealed builds at `/build/<side>`. Tests and servers
-require a sealed build. Request argv never executes in the root coordinator.
+scratch at `/scratch`, and read-only builds from `job.freeze` at `/build/<side>`.
+Tests and servers require such a build. Request argv never executes in the
+root coordinator.
 
 A root supervisor owns both systemd unit launch and cleanup, retaining a
 separate lease descriptor. The trusted worker start barrier pins host PID/birth,
@@ -98,13 +100,13 @@ configured limit visibility and denied cgroup writes in its existing worker.
 ## Validation boundary
 
 Run `python3 bench/ci/linux-sandbox/test_contract.py` for the focused local
-artifact sealing, request admission and trusted HTTP timing tests. These tests
-are not proof of Linux isolation. Native `probe.py` is model-free and produces
+read-only artifact copy, request admission and trusted HTTP timing tests. These
+tests are not proof of Linux isolation. Native `probe.py` is model-free and produces
 no benchmark samples. Real CUDA toolchain/driver operation and performance
 comparison still require the independent trusted coordinator integration.
 
 For DGX Spark, install with `--device dgx-spark --existing-lock ... --stop-path ...`
-and the inventoried `--lock-device`, `--lock-inode`, `--operator-uid` and
+and the recorded `--lock-device`, `--lock-inode`, `--operator-uid` and
 `--operator-gid`. The installer preserves that existing operator-owned inode and
 its owner. Its protected configuration binds the identity; runner/worker/client
 identities cannot own or replace that path. Only the trusted broker receives

@@ -1,4 +1,4 @@
-// Legacy process-global publication contract, test oracle only.
+// Legacy process-global publication contract, test reference only.
 #pragma once
 #include "ggml-ssd/store/catalog.h"
 namespace c0 {

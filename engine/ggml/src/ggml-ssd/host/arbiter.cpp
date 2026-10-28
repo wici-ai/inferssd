@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #include "arbiter.h"
 #include <algorithm>
 #include <condition_variable>

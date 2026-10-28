@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
-"""Exercise JSON decoding without weakening public-content checks."""
+# SPDX-License-Identifier: Apache-2.0
+"""Exercise JSON decoding and company-name rules without weakening public-content checks."""
 import contextlib
 import importlib.util
 import io
@@ -75,6 +75,52 @@ class JsonLineTests(unittest.TestCase):
         for text in ("", '""', "42,", "  ]", '"a": 1,'):
             with self.subTest(text=text):
                 self.assertEqual(scanner.added_line_text("fixture.json", text), text)
+
+
+class CompanyNameTests(unittest.TestCase):
+    # Blocked fixtures are split so that this file does not match its own patterns.
+    def findings(self, text, strict):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            result = scanner.inspect(text, "fixture:1", strict)
+        return result, output.getvalue()
+
+    def test_company_domain_and_names_are_allowed(self):
+        for text in ("https://wici.ai", '<a href="https://wici.ai/">', "(https://wici.ai).",
+                     "WiCi AI", "wici-ai/inferssd"):
+            for strict in (False, True):
+                with self.subTest(text=text, strict=strict):
+                    self.assertEqual(self.findings(text, strict), (0, ""))
+
+    def test_other_company_spellings_are_blocked(self):
+        for text in ("WI" + "CI-InferSSD", "WI" + "CI InferSSD", "wi" + "ci.air", "wi" + "ci.ai.example"):
+            with self.subTest(text=text):
+                self.assertEqual(self.findings(text, True)[0], 1)
+                result, output = self.findings(text, False)
+                self.assertEqual(result, 0)
+                self.assertIn("REPORT", output)
+
+
+class TaskNumberTests(unittest.TestCase):
+    # Fixtures are split so that this file does not match its own patterns.
+    def findings(self, text, strict):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            result = scanner.inspect(text, "fixture:1", strict)
+        return result, output.getvalue()
+
+    def test_task_numbers_are_internal_wording(self):
+        for text in ("// " + "Ta" + "sk 132 probe", "# " + "TA" + "SK12", "// " + "ta" + "sk-7",
+                     "/* " + "Ta" + "sk #4 */"):
+            with self.subTest(text=text):
+                self.assertEqual(self.findings(text, True)[0], 1)
+                result, output = self.findings(text, False)
+                self.assertEqual(result, 0)
+                self.assertIn("REPORT", output)
+
+    def test_task_words_without_numbers_are_allowed(self):
+        for text in ("// the task queue drains first", "# one task per request", "taskId = 3"):
+            for strict in (False, True):
+                with self.subTest(text=text, strict=strict):
+                    self.assertEqual(self.findings(text, strict), (0, ""))
 
 
 if __name__ == "__main__":

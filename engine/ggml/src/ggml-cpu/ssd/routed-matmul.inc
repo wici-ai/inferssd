@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // CPU MoE extension, included in the CPU translation unit.
 struct mmid_row_mapping {
     int32_t i1;

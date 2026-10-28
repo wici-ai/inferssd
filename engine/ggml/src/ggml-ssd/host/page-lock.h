@@ -11,7 +11,7 @@
 //     tier times one copy of the first range registered), and no other slot is locked until then.
 //   - When: the registrar thread takes one wanted slot at a time, handed over only while a decode layer waits for reads
 //     expected to last longer than twice a registration (offer, "the drive's shadow"). A registration holds the CUDA
-//     driver for about a millisecond per DeepSeek slot (125: 1.1-1.3 ms for 19 MB, the same with huge pages) and
+//     driver for about a millisecond per DeepSeek slot (RTX 5090: 1.1-1.3 ms for 19 MB, the same with huge pages) and
 //     delays other threads' CUDA calls meanwhile; in that shadow none is on the critical path.
 //   - Until when: a locked slot stays locked until its pages are discarded or unmapped. The owner of the pages calls
 //     unlock(first, count) before MADV_DONTNEED or munmap (sink_cache::before_discard): a hand-off not yet taken is

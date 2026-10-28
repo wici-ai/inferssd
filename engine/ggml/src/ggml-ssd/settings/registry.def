@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // key, kind, min, max, default literal, unit, producer, scope, description
 SSD_SETTING("expert.source", paths, 0, 0, "[]", "path", "plan", "all", "Expert index source paths in declared order")
 SSD_SETTING("cpu.threads", integer, 1, 256, "2", "participants", "plan", "all", "Total CPU participants including the I/O participant")

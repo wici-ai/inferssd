@@ -817,7 +817,7 @@ if (TARGET gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
 
-# The default SSDash CI gate is model-free and requires neither GPU nor cgroup setup.
+# The default CI gate is model-free and requires neither GPU nor cgroup setup.
 # Keep this list explicit: other synthetic tests may still require Linux I/O facilities.
 foreach(unit_test moe_pack_copy_plan kimi_prefill_cost test-reasoning-budget
                   test-server-runtime-routing test-dsv41-engram
@@ -896,6 +896,6 @@ if (APPLE AND TARGET ggml-cpu)
 endif()
 
 if(TARGET ggml-ssd-c0-store)
-    # The frozen extraction oracle is test-only and never a production input.
+    # The fixed extraction reference is test-only and never a production input.
     add_subdirectory(ssd/fixtures/c0-store ${CMAKE_CURRENT_BINARY_DIR}/ssd-store)
 endif()

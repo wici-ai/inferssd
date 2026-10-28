@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only checks of the five Linux settings required by SSD-llama profiles."""
+"""Read-only checks of the five Linux settings required by InferSSD profiles."""
 
 import argparse
 import csv
@@ -171,7 +171,7 @@ def main():
     if args.json:
         print(json.dumps({'all_passed': good, 'checks': [asdict(result) for result in results]}, indent=2))
     else:
-        print('SSD-llama performance preflight (read-only)')
+        print('InferSSD performance preflight (read-only)')
         for result in results:
             print(f'[{result.status}] {result.name}')
             for detail in result.details:

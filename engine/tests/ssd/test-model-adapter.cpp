@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Real tensor metadata/ggml layout predicates; no payload or device execution.
 #include "ssd/model-adapter.h"
 #include "llama-hparams.h"

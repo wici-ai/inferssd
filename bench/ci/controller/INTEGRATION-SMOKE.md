@@ -1,16 +1,15 @@
-# Private three-device readiness workflow
+# Device readiness workflow
 
 Deploy `integration-smoke.workflow.yml` as
-`.github/workflows/integration-smoke.yml` on protected `main` in the **private**
-`wici-ai/inferssd-device-ci` repository. Export with `export_controller.py --workflow integration-smoke` to
-activate only this manual entry point; the full performance workflow remains a
-reviewed template under `control/bench/ci/controller/` until its own prerequisites
-are configured. This template checks no public PR out, requests no App/secret, and
+`.github/workflows/integration-smoke.yml` on protected `main` in the private
+controller repository, `wici-ai/inferssd-device-ci`. Export with
+`export_controller.py --workflow integration-smoke` to activate only this manual
+entry point; the full performance workflow remains a reviewed template under
+`control/bench/ci/controller/` until its own prerequisites are configured. This template checks no public PR out, requests no App/secret, and
 performs no source download or runner registration.
 
 The device allowlist is exactly `cloud-5090`, `dgx-spark` and `local-mbp`.
-Local 125 remains an independent performance comparison host; 233 and 125 have
-no CI slot. Readiness does not activate the full PR performance matrix.
+Readiness does not activate the full PR performance matrix.
 
 The operator provisions these fixed Linux paths before dispatch:
 
@@ -62,20 +61,22 @@ stage a new reviewed job if a correction requires another attempt.
 
 The config binds `device`, `paths.platform`, a `numerical` command and one or
 two distinct `smokes` (DeepSeek/Muse). Build targets include `test-backend-ops`;
-its exact sealed executable is included in `image_relatives`. The numerical
-stage performs small actual CUDA0/Metal ADD operations against the CPU
+its exact executable from the read-only build is included in `image_relatives`.
+The numerical stage performs small actual CUDA0/Metal ADD operations against the CPU
 reference and rejects an empty/skipped backend set. This is a backend smoke,
 not full model-logit parity. Each model gets a new process and one eight-token
 completion. Mac can validate both already installed models under the same lease
-without rebuilding. All server images must match that one sealed build.
+without rebuilding. All server images must match that one read-only build.
 
 The report separates `functional`, `evidence`, `cleanup` and `performance`.
-`evidence=sealed-locally` must still be independently verified after artifact
-collection; only then can an operator report uploaded evidence as verified.
+`evidence=sealed-locally` means the evidence was hashed on the device. It must
+still be independently verified after artifact collection; only then can an
+operator report uploaded evidence as verified.
 `performance=not-measured` never overwrites an older inconclusive comparison.
 The raw evidence manifest hashes build, native, numerical and cleanup records.
 
 The report remains `purpose=integration-smoke`, `performance_acceptance=false`,
 `benchmark_samples=0`. One successful model smoke demonstrates that the staged
-build/start/inference/cleanup chain works. Each device must actually complete this chain before all three are ready.
+build/start/inference/cleanup chain works. Each device must actually complete
+this chain before all three are ready.
 This is not a performance comparison, a merge gate, or a formal benchmark sample.

@@ -194,7 +194,7 @@ int main() {
         check(aliases->locate(name.c_str(), 5, 64, found) && found.offset % 4096 == 3811,
               "alias must retain unaligned logical offset");
 
-        // Preserve permissive legacy integer parsing; no cleanup disguised as C0.
+        // Preserve permissive legacy integer parsing unchanged.
         tsv(a1, "source_path\tmodel_offset\texpert\tnbytes\ttensor\r\n" + data.string() +
             "\t4097tail\t3tail\t64tail\t" + name + "\r\n");
         auto permissive = compare({{}, {a1.string()}, {}, false}, true);

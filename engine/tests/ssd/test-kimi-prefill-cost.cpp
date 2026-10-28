@@ -56,7 +56,7 @@ static void test_fit() {
 }
 
 static void test_overhead_fit() {
-    // Recorded 125 calibration: 2 tokens, 279.656 us outside the GPU experts; MXFP4's output row is 5120 floats,
+    // Recorded RTX 5090 calibration: 2 tokens, 279.656 us outside the GPU experts; MXFP4's output row is 5120 floats,
     // and its measured link rate was 33.617 GB/s. Inputs already have the lane's per-route charge. One token shape
     // does not identify the fixed and row terms: retain this geometry slope, not 279.656 / 2 us per future token.
     const double row_prior = (5120.0 * sizeof(float)) / 1e6 * (1e3 / 33.617);
@@ -129,13 +129,14 @@ static void test_coupled() {
         previous = t;
     }
     check(monotone, "coupled rises with the shorter side and stays above the max");
-    // The measured share on 233 (8-read ring): 0.136 with the lanes at the drive time, 0.002 with them at half of it.
+    // The measured share on an RTX 5060 Ti (8-read ring): 0.136 with the lanes at the drive time, 0.002 with them
+    // at half of it.
     std::printf("coupled n=8: equal %.4f, half %.4f, 0.95 %.4f\n", kimi_prefill_coupled(1, 1, 8) - 1,
         kimi_prefill_coupled(1, 0.5, 8) - 1, kimi_prefill_coupled(1, 0.95, 8) - 1);
 }
 
-// A layer of 330 cold experts like DeepSeek's at 4104 tokens on 233: routes 1..~500, CPU 520 + 297 us per route,
-// GPU 60 + 25 us per route plus an 18.8 MB upload at 5.4 GB/s, an 8-read ring.
+// A layer of 330 cold experts like DeepSeek's at 4104 tokens on an RTX 5060 Ti: routes 1..~500, CPU 520 + 297 us
+// per route, GPU 60 + 25 us per route plus an 18.8 MB upload at 5.4 GB/s, an 8-read ring.
 static std::vector<kimi_prefill_move> moves_for(kimi_prefill_layer & layer, int experts) {
     std::vector<int> routes;
     for (int i = 0; i < experts; ++i) { routes.push_back(1 + int(500.0 * std::pow(double(experts - i) / experts, 3.0))); }
@@ -258,8 +259,8 @@ static void test_same_choice() {
 
 // The in-ring list schedule and its choice, each value derived from kimi_place_ring_time's rules (us).
 static void test_ring() {
-    // 125's decode terms: a call 150 + 20 an expert from device memory, a page-locked copy 355, the CPU 470 an expert
-    // (320 of it up/gate). Three residents, two RAM hits, no read.
+    // RTX 5090 decode terms: a call 150 + 20 an expert from device memory, a page-locked copy 355, the CPU 470 an
+    // expert (320 of it up/gate). Three residents, two RAM hits, no read.
     //   no move:  GPU 150 + 3 * 20 = 210; CPU 470 + 470 = 940;              T = 940
     //   one:      copy 0..355; host call max(210, 355) + 150 + 20 = 525; CPU 470; T = 525
     //   two:      copies 0..355..710; call max(210, 710) + 150 + 40 = 900; CPU 0;  T = 900
@@ -290,7 +291,7 @@ static void test_ring() {
         "125: a CPU much slower beside copies: both move");
     lanes.cpu_moved = 1;
 
-    // 233's terms: the copy 2700 (6.9 GB/s), the CPU 900. One move: call max(210, 2700) + 170 = 2870 > 1800.
+    // RTX 5060 Ti terms: the copy 2700 (6.9 GB/s), the CPU 900. One move: call max(210, 2700) + 170 = 2870 > 1800.
     for (int i = 3; i < 5; ++i) { e[i].cpu = 900; e[i].early = 600; e[i].link = 2700; }
     check(kimi_place_ring_time(lanes, e.data(), 5, none) == 1800 && kimi_place_ring_time(lanes, e.data(), 5, one) == 2870,
         "233: 1800 and 2870");
@@ -473,9 +474,9 @@ static void test_pipeline() {
     uint64_t state = 99;
     auto unit = [&] { state = state * 6364136223846793005ull + 1442695040888963407ull; return double(state >> 11) / double(1ull << 53); };
     // Random layers: between the longer stage's sum and the serial sum. Where one stage is the longer of every pair
-    // (the runs: Muse's copies on 233 and 125 against its chain, DeepSeek's hand kernel against its copies), the
-    // streamed form's estimate, the longer sum plus min(c, d) of the first expert, is within one stage of the exact
-    // end; where they alternate the pipeline idles, and the estimate's shortfall is printed.
+    // (the runs: Muse's copies on an RTX 5060 Ti and an RTX 5090 against its chain, DeepSeek's hand kernel against
+    // its copies), the streamed form's estimate, the longer sum plus min(c, d) of the first expert, is within one
+    // stage of the exact end; where they alternate the pipeline idles, and the estimate's shortfall is printed.
     size_t bounded = 0, close = 0, total = 0;
     double worst_mixed = 0;
     for (int trial = 0; trial < 3000; ++trial) {
@@ -502,7 +503,7 @@ static void test_pipeline() {
         "alternating stages: the estimate short by at most %.1f%%\n", bounded, close, total, 100 * worst_mixed);
 }
 
-// A table and a layer's items for the planner tests: 233-like DeepSeek terms (us; MB).
+// A table and a layer's items for the planner tests: RTX 5060 Ti-like DeepSeek terms (us; MB).
 static kimi_place_table table_233() {
     kimi_place_table t;
     t.cpu_one_us = 900; t.cpu_fixed_us = 520; t.cpu_route_us = 297; t.cpu_early = 0.65;
@@ -538,7 +539,7 @@ static void test_place_one_token() {
     size_t same = 0, no_pageable = 0, total = 0, moved = 0;
     for (int trial = 0; trial < 2000; ++trial) {
         auto t = table_233();
-        if (trial % 3 == 0) { t.locked_us_per_mb = 1e3 / 40.0; t.cpu_one_us = 470; }   // 125-like
+        if (trial % 3 == 0) { t.locked_us_per_mb = 1e3 / 40.0; t.cpu_one_us = 470; }   // RTX 5090-like
         if (trial % 3 == 1) { t.in_place = true; t.cpu_one_us = 1300; t.vector.moved = { 150, 219, 0 }; } // Spark-like
         const auto items = layer_items(state, 1 + size_t(state % 16), 1, 0.4, 0.4, trial % 2 == 0);
         const auto a = kimi_place_layer(t, 1, 8, items.data(), items.size());
@@ -650,8 +651,8 @@ static void test_place_decode_same() {
 
 // The streamed form of a longer pass is M8's evaluator (kimi_prefill_best_prefix) over M8's moves with B3's transport:
 // each copy the pipeline's first stage on the link, page-locked DMA or pageable staging by the GPU's worker (which
-// blocks the worker, not the chains it launched), the GPU lane the chains alone; on random 233-like layers with a
-// pageable ring and RAM cache (M8's sources).
+// blocks the worker, not the chains it launched), the GPU lane the chains alone; on random RTX 5060 Ti-like layers
+// with a pageable ring and RAM cache (M8's sources).
 static void test_place_m8_same() {
     uint64_t state = 1618;
     auto unit = [&] { state = state * 6364136223846793005ull + 1442695040888963407ull; return double(state >> 11) / double(1ull << 53); };
@@ -706,7 +707,7 @@ static void test_place_m8_same() {
 // once; a pageable copy on both; in place no copy at all.
 static void test_place_lanes() {
     kimi_place_table t = table_233();
-    t.batched.device = { 0, 120, 1.7 };        // Muse's chain on 233, B2
+    t.batched.device = { 0, 120, 1.7 };        // Muse's chain on an RTX 5060 Ti, B2
     t.cpu_fixed_us = 175; t.cpu_route_us = 409;
     t.route_us = 8e-6 * t.locked_us_per_mb; t.token_us = 2.3;
     // 30 cold experts of 30.4 MB at 150 routes, a page-locked ring: every move's copy 4399 us on the link, its chain 375

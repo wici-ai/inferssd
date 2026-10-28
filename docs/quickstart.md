@@ -3,13 +3,13 @@
 
 [Back to README](../README.md)
 
-Both platforms use the `main` branch of **wici-ai/inferssd**. Choose **[Apple Silicon](#apple-silicon)** or **[Linux / NVIDIA](#linux--nvidia)**, then [prepare a launch](#prepare-a-launch).
+Both platforms use the `main` branch of `wici-ai/inferssd`. Choose **[Apple Silicon](#apple-silicon)** or **[Linux / NVIDIA](#linux--nvidia)**, then [prepare a launch](#prepare-a-launch).
 
 ## Before you start
 
 - Install Git, CMake, Ninja, a C/C++ compiler, and Python 3.9 or later. macOS also needs Xcode's command-line tools and Metal compiler; Linux needs a compatible CUDA toolkit and `liburing` development files.
 - Obtain a complete local [GGUF checkpoint](../README.md#models). Keep all shards together. The launcher reads local files and does not download weights.
-- Historical DeepSeek runs used about **473 GiB of GGUF files + 269 GiB of expert packs**. Muse packs added about **450 GiB**. The current framework can index GGUF experts directly; a separate pack is optional and must match its source checkpoint.
+- Plan storage for the checkpoint. The benchmarked DeepSeek GGUF files take about **473 GiB**; an optional DeepSeek expert pack adds about **269 GiB**, and a Muse pack about **450 GiB**. The framework can index GGUF experts directly, so a pack is optional and must match its source checkpoint.
 - Choose CPU, cache and process-memory budgets for your machine. The README benchmark settings describe their recorded runs, not universal deployment defaults.
 
 ```sh
@@ -22,6 +22,13 @@ python3 -m pip install ./framework
 
 ## Apple Silicon
 
+Install the command-line developer tools, then CMake and Ninja (for example with Homebrew):
+
+```sh
+xcode-select --install
+brew install cmake ninja
+```
+
 Build the Metal backend and describe the resulting deployment:
 
 ```sh
@@ -31,11 +38,11 @@ python3 scripts/engine-resources.py \
   --build build-macos-metal --output engine-resources.json
 ```
 
-Use `--platform darwin` when launching. The current Mac interface uses typed settings and static launch; online adaptive control is deferred. See [Apple Silicon deployment](mac-launcher.md) for cache settings and memory accounting.
+Use `--platform darwin` when launching. `inferssd launch` applies static typed settings on both platforms; Linux additionally exposes an online controller through the Python API (see the [framework README](../framework/README.md)). Routed experts run on the CPU from SSD, while dense layers use Metal; unified memory does not need to hold the full expert set. See [Apple Silicon deployment](mac-launcher.md) for cache and thread settings.
 
 ## Muse on Mac
 
-Use the same Metal build, select `--profile muse`, and point `--model` at the first Muse GGUF shard. The deployment descriptor selects `engine/models/templates/muse-spark.jinja`. Keep the complete shard set and use a separate source index or matching pack for each checkpoint.
+Use the same Metal build, select `--profile muse`, and point `--model` at the first Muse GGUF shard. The deployment descriptor selects `engine/models/templates/muse-spark.jinja`, which replaces the chat template embedded in the GGUF. Keep the complete shard set and use a separate source index or matching pack for each checkpoint.
 
 ## Linux / NVIDIA
 
@@ -72,8 +79,16 @@ inferssd launch --execute --platform linux \
 
 For macOS, use `--platform darwin`, a Darwin policy and `--port 8080`. For Muse, change `--profile dsv` to `--profile muse` and select its first GGUF shard. Batch sizes are explicit examples; tune them within the available memory budget.
 
-If `expert.source` is omitted, the framework builds an alias index from the GGUF metadata without duplicating weight payloads. An optional v1 pack can be indexed with `inferssd source index MODEL PACK DIR`; see [source preparation](../framework/README.md#prepare-a-typed-launch). Use the [deployment resources guide](engine-resources.md) when moving binaries and templates outside the checkout.
+If `expert.source` is omitted, the framework builds an alias index from the GGUF metadata without duplicating weight payloads. For the recorded planning commands, `inferssd source index MODEL PACK DIR` indexes an optional v1 pack; see [source preparation](../framework/README.md#prepare-a-typed-launch). Use the [deployment resources guide](engine-resources.md) when moving binaries and templates outside the checkout.
+
+To create a v1 pack, run the bundled builder on the shards you load. It needs NumPy and PyYAML for the bundled GGUF reader (`python3 -m pip install numpy pyyaml`):
+
+```sh
+python3 engine/tools/expert-pack/create-moe-expert-pack.py \
+  '/path/to/model-*-of-00010.gguf' -o /path/to/model.expert-pack --align 4096
+python3 engine/tools/expert-pack/create-moe-expert-pack.py --inspect -o /path/to/model.expert-pack
+```
+
+To launch with the pack, set `expert.source = ["/path/to/model.expert-pack"]` in the settings file. The v1 format records no checkpoint fingerprint, so rebuild the pack whenever the shards change.
 
 Open **http://127.0.0.1:18181** on Linux or **http://127.0.0.1:8080** on Mac after the server is ready, or [connect an API client](../README.md#use-it-with-your-tools). Stop the owned launcher with **Ctrl+C**.
-
-The earlier environment-based launch scripts are historical interfaces. Their commands remain in the [original readme-test guide](https://github.com/wici-ai/ssd-llama/blob/a755355f82bcc52869dd3c1085db59210ced068b/docs/quickstart.md); use the typed interface above for this repository.

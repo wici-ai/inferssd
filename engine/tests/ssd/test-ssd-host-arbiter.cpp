@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #include "../../ggml/src/ggml-ssd/host/arbiter.h"
 #include "../../ggml/src/ggml-ssd/host/ledger.h"
 #include <atomic>

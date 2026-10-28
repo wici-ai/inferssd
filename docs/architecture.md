@@ -3,7 +3,7 @@
 
 [Back to README](../README.md)
 
-The model router chooses the experts needed by each token. WICI-InferSSD manages how those expert weights are indexed, read from SSD, cached and executed.
+The model router chooses the experts needed by each token. InferSSD manages how those expert weights are indexed, read from SSD, cached and executed.
 
 ```mermaid
 flowchart LR
@@ -28,23 +28,47 @@ The runtime owns immutable source metadata, readers, host-budget accounting and 
 
 Prompt batching lets tokens share weight access. `inferssd launch --batch` and `--ubatch` set the native batch and micro-batch capacities. The Linux controller consumes native telemetry to inform placement and prefill decisions; see [controller observations](architecture/controller-observations.md).
 
-The current Mac launcher supports static settings; online Mac adaptation is deferred. The experimental environment-based adaptive prefill controller in the earlier Mac branch belongs to the historical benchmark implementation. Its recorded configuration is described in [benchmark methodology](benchmark.md#engine-configurations), rather than exposed as a current launch option.
+On macOS the launcher supports static settings only; it does not include an online adaptive controller. The settings used in the recorded Mac benchmark runs are listed in [benchmark methodology](benchmark.md#engine-configurations).
 
-## Source map
+## Modules
 
-This repository separates the native engine from the Python framework:
+The runtime extends the bundled llama.cpp snapshot. Its integration points are listed in [upstream patches](development/upstream-patches.md).
 
-| Component | Entry point |
-| --- | --- |
-| GGUF and pack metadata preparation | `framework/src/inferssd/source/` |
-| Source indexes and readers | `engine/ggml/src/ggml-ssd/store/`, `engine/ggml/src/ggml-ssd/io/` |
-| Host accounting and expert cache | `engine/ggml/src/ggml-ssd/host/` |
-| Placement and streaming policy | `engine/ggml/src/ggml-ssd/place/`, `engine/ggml/src/ggml-ssd/stream/` |
-| CPU and CUDA executors | `engine/ggml/src/ggml-cpu/ssd/`, `engine/ggml/src/ggml-cuda/ssd/` |
-| Model adaptation and context ownership | `engine/src/ssd/` |
-| Server request lifecycle | `engine/tools/server/inferssd/` |
-| Typed settings and owned launch | `framework/src/inferssd/configuration/`, `framework/src/inferssd/launch/` |
+| Layer | Directory | Owns |
+| --- | --- | --- |
+| Core | `engine/ggml/src/ggml-ssd/store` | Immutable per-context source indexes and explicit pack/alias parsing |
+| Core | `engine/ggml/src/ggml-ssd/io` | Independent syscall and liburing readers; portable pread |
+| Core | `engine/ggml/src/ggml-ssd/host` | Process host arbiter, per-context leases, expert cache and page accounting |
+| Core | `engine/ggml/src/ggml-ssd/place` | Shared placement cost evaluation, learning state and prefetch decisions |
+| Core | `engine/ggml/src/ggml-ssd/stream` | Expert ranges, dense lookahead, seed ordering and copy observations |
+| Core | `engine/ggml/src/ggml-ssd/settings`, `telemetry` | Immutable validated settings, source receipts and owned JSONL writers |
+| Executors | `engine/ggml/src/ggml-cpu/ssd`, `engine/ggml/src/ggml-cuda/ssd` | CPU scheduling and compute; CUDA tier, staging, events and format kernels |
+| Runtime | `engine/src/ssd` | Context assembly, backend registry binding, model sources, model adaptation, graph admission and diagnostics |
+| llama extensions | `engine/src/inferssd` | KV state codecs and positional state serialization |
+| Common | `engine/common/inferssd` | CLI glue, model chat parsing, reasoning budgets |
+| Server | `engine/tools/server/inferssd` | Prompt cache, checkpoints and request lifecycle |
+| Framework | `framework/src/inferssd` | Standard-library Python package: GGUF and pack metadata preparation (`source/`), probes, plans, typed settings (`configuration/`) and owned launch (`launch/`) |
 
-See the [architecture reference](../ARCHITECTURE.md) for ownership and layering, [configuration](configuration.md) for the typed settings contract, and [runtime resources](engine-resources.md) for deployment. The original [readme-test architecture](https://github.com/wici-ai/ssd-llama/blob/a755355f82bcc52869dd3c1085db59210ced068b/docs/architecture.md) describes the earlier source layout.
+## Dependency direction
+
+Core code depends only on ggml-base and platform facilities. A CPU executor never links CUDA; a CUDA executor never links CPU. The runtime obtains immutable, size-checked provider tables from the same build through the ordinary backend registries and supplies context-owned services. The scheduler calls a borrowed hook table, so ggml-base has no dependency on the core implementation. Kernels stay in their backend.
+
+Model-specific SSD requirements are described in `engine/src/ssd/model-adapter.h`: expert layout and quantization relationships, and activation and normalization requirements, are validated before the shared MoE bridge creates an executor node. The context uses the same descriptor for its early support check. Executors consume validated operations rather than model identities; the ordinary shared MoE implementation remains in place.
+
+`engine/ggml/src/ggml-ssd/place/runtime-policy.h` owns numeric learning state and placement and prefetch decisions. Executors supply workload, resource and measured cost inputs, execute the returned request and rank plans using their own caches, readers and workers, then publish feedback at fixed update points. Policy code holds no sink, device, file or worker handles. All executors share one placement evaluator, so they apply the same cost arithmetic and selection thresholds.
+
+Run `python3 scripts/inferssd/check-layering.py` to check these boundaries.
+
+## Runtime ownership
+
+The context owns sources, host registration, the telemetry writer, transport and diagnostics; executors borrow them. Graph failure fences outstanding seed consumers before reset. A precompute transaction restores touched and purged KV metadata without allocating, and it ends before compute submission. Stateful memory that cannot roll back a submitted failure clears the affected sequences for checkpoint restore or replay. Backend destruction quiesces transport before destroying CUDA streams. The writer and source descriptors close after all borrowers stop.
+
+Allocation admission precedes allocation and first touch; committed allocations invalidate learning intervals when they are later freed or replaced. Linux uses finite cgroup constraints; the Mac cache keeps its platform RSS guard.
+
+## Settings and deployment
+
+Production configuration uses the typed `inferssd-settings 1` format described in [configuration](configuration.md). Retired environment names are rejected by name without reporting their values. Only `INFERSSD_DEBUG` and `INFERSSD_TRACE_DIR` are observation channels, and trace or profile output requires an owned telemetry writer. Options inherited from llama.cpp keep their upstream behavior.
+
+Deployment paths and capabilities are declared as explicit [engine resources](engine-resources.md), so the installed framework needs no source checkout. Native probes live in `engine/tools/inferssd-probe` and run only when requested.
 
 The DeepSeek and Muse benchmark configurations retain native expert routing. Throughput alone does not establish model quality; record numerical checks, exact settings and workload evidence alongside each experiment.

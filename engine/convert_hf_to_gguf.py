@@ -13438,7 +13438,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--glm52-external-experts", action="store_true",
-        help="For GLM_MOE_DSA exports, omit routed expert tensors that will be served from a GLM5.2 colibri expert pack at runtime.",
+        help="For GLM_MOE_DSA exports, omit routed expert tensors that will be served from a separate expert pack at runtime.",
     )
 
     args = parser.parse_args()

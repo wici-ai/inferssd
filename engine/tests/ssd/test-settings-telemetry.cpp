@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #include "settings/json.h"
 #include "settings/settings.h"
 #include "telemetry/telemetry.h"

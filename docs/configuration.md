@@ -31,8 +31,8 @@ participants; one is the I/O participant. An explicit compute CPU list must
 contain `cpu.threads - 1` unique IDs in declared order. Zero decode participants
 leaves the measured/default policy; positive values cannot exceed compute
 participants. The VRAM margin is at least reserve plus 64 MiB. Non-applicable
-platform keys cannot be explicitly set. Mac M1 is a migration stage, not a chip
-generation; this interface does not implement the deferred Mac M2 controller.
+platform keys cannot be explicitly set. On macOS the interface supports static
+settings only; it does not include an online adaptive controller.
 
 ## File and CLI contract
 
@@ -79,7 +79,6 @@ inferssd configuration write --platform linux --set cpu.threads=4 --output setti
 ```
 
 Output creation is exclusive, and supplied receipts survive round-trip rendering.
-This module does not translate new settings to legacy environment variables.
-The existing `launch --execute` remains on its admitted runtime contract until
-the C++ production consumers and context binding are connected in the same
-integration. This foundation batch alone does not claim all old readers retired.
+Settings are never translated to environment variables. `inferssd launch --execute`
+passes the settings file to the server with `--ssd-settings`, and each setting
+with a command-line origin as the matching `--ssd-*` option.
