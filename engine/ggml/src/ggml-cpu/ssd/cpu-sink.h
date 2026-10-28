@@ -133,8 +133,9 @@ GGML_BACKEND_API void kimi_cpu_sink_cache_reset(struct kimi_cpu_sink * sink);
 // input); down may use another. Column counts must be multiples of the weight
 // and input block sizes. ids<0 are skipped; each live weight must be finite and
 // nonnegative. Caller supplies the final normalized weights. Each expert's down
-// output is multiplied by its weight, then added in slot order. On failure
-// output must be discarded. This is kimi_cpu_sink_run_activation with SITU.
+// output is multiplied by its weight, then added in slot order, starting from
+// the first live slot's product as the graph's sum does. On failure output
+// must be discarded. This is kimi_cpu_sink_run_activation with SITU.
 GGML_BACKEND_API bool kimi_cpu_sink_run(
         struct kimi_cpu_sink * sink,
         const struct ggml_tensor * up, const struct ggml_tensor * gate,

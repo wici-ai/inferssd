@@ -715,6 +715,7 @@ struct kimi_cpu_sink {
     int activation_kind = KIMI_CPU_SINK_ACTIVATION_SITU;
     float swiglu_limit = 0;
     float * output = nullptr;
+    bool first_down = false; // without READY_FIRST: this down phase starts the slot-order sum
     std::vector<float> activation;
     std::vector<uint8_t> quant_input, quant_hidden;
     const uint8_t * down_quant_data = nullptr;
@@ -1331,7 +1332,7 @@ struct kimi_cpu_sink {
                         // Preserve the separate multiply followed by the graph's slot-order
                         // addition even when the compiler enables floating point contraction.
                         volatile float scaled = post_exp_norm ? value : value * weight;
-                        if (ready_first) { output[row] = scaled; }
+                        if (ready_first || first_down) { output[row] = scaled; }
                         else { output[row] += scaled; }
                     }
                 }
@@ -3634,6 +3635,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
             }
             phase_start = sink_clock::now();
             if (sink->timeline_active) { sink->timeline[expert].cpu[6] = ggml_time_us(); }
+            sink->first_down = ordinal == 0;
             sink->compute_phase(true, ordinal + 1 == blocking_experts);
             if (sink->timeline_active) { sink->timeline[expert].cpu[7] = ggml_time_us(); }
             sink->current.down_reduce_us += elapsed_us(phase_start);
@@ -3661,19 +3663,22 @@ extern "C" bool kimi_cpu_sink_run_activation(
         if (sink->ready_first) {
             const auto reduce_start = sink_clock::now();
             const double cpu_start = sink->profile_enabled ? sink_thread_cpu_us() : 0;
-            // Each stored value is the same rounded multiply as the old path.
-            // Preserve every addition, including the initial addition to +0.
+            // Each stored value is the same rounded multiply as the old path. The slot-order sum starts at the
+            // first slot's product, as the graph's does: an addition to +0 would turn a -0 product into +0.
             for (size_t expert = 0; expert < sink->requests.size(); ++expert) {
                 float * contribution = sink->expert_output.data() + expert * size_t(sink->latent);
+                const bool first = expert == 0;
                 if (activation->post_exp_norm) {
                     kimi_cpu_sink_normalize_expert(contribution, sink->latent,
                         activation->post_exp_norm, activation->post_exp_norm_eps);
                     for (int row = 0; row < sink->latent; ++row) {
                         volatile float scaled = contribution[row] * sink->requests[expert].weight;
-                        output[row] += scaled;
+                        output[row] = first ? scaled : output[row] + scaled;
                     }
                 } else {
-                    for (int row = 0; row < sink->latent; ++row) { output[row] += contribution[row]; }
+                    for (int row = 0; row < sink->latent; ++row) {
+                        output[row] = first ? contribution[row] : output[row] + contribution[row];
+                    }
                 }
             }
             sink->current.ordered_reduce_us = elapsed_us(reduce_start);

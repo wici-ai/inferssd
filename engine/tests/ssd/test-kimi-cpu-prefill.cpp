@@ -345,7 +345,7 @@ static kimi_cpu_sink_cache_stats cache_snapshot(kimi_cpu_sink * sink, bool relea
 
 static sample_result run_checked(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, int layer, const batch & b,
         const std::vector<float> & expected, bool grouped = true, float linear_beta = 25,
-        uint64_t expected_hits = 0, uint64_t expected_admitted = 0, bool bit_exact = true) {
+        uint64_t expected_hits = 0, uint64_t expected_admitted = 0) {
     tensors meta(f, layer);
     sample_result r;
     require(expected.size() == size_t(b.tokens) * f.latent, "bad reference shape");
@@ -396,12 +396,7 @@ static sample_result run_checked(fixture_inputs & inputs, const std::string & na
     r.rel_l2 = std::sqrt(square / std::max(norm, 1e-30));
     const auto * bytes = reinterpret_cast<const uint8_t *>(guarded.data() + 1);
     for (size_t i = 0; i < expected.size() * sizeof(float); ++i) { r.hash ^= bytes[i]; r.hash *= 1099511628211ULL; }
-    if (bit_exact) {
-        require(r.max_abs == 0, name + ": strict CPU reference equality failed: " + std::to_string(r.max_abs));
-    } else {
-        require(r.max_abs < 2e-5 && r.rel_l2 < 2e-6,
-                name + ": bounded CPU reference tolerance failed: " + std::to_string(r.max_abs));
-    }
+    require(r.max_abs == 0, name + ": strict CPU reference equality failed: " + std::to_string(r.max_abs));
     return r;
 }
 
@@ -428,11 +423,6 @@ static void print_sample(const std::string & name, const batch & b, const sample
 static void compare_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, int layer, const batch & b, float linear_beta = 25) {
     const auto expected = reference_batch(f, layer, b, linear_beta);
     print_sample(name, b, run_checked(inputs, name, f, e, layer, b, expected, true, linear_beta));
-}
-
-static void compare_large_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, int layer, const batch & b) {
-    const auto expected = reference_batch(f, layer, b, 25);
-    print_sample(name, b, run_checked(inputs, name, f, e, layer, b, expected, true, 25, 0, 0, false));
 }
 
 static kimi_cpu_prefill_stats fail_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, batch b,
@@ -468,7 +458,7 @@ static void synthetic_tests(fixture_inputs & inputs, int threads, int depth) {
         }
         compare_case(inputs, "ub" + std::to_string(nt) + "_holes_duplicate_zero", small, e, 1, b);
     }
-    compare_large_case(inputs, "ub65_bounded_accumulator", small, e, 1, synthetic_batch(small, 65, 16));
+    compare_case(inputs, "ub65_slot_order", small, e, 1, synthetic_batch(small, 65, 16));
     auto full = synthetic_batch(small, 2, 16);
     compare_case(inputs, "full16_slots", small, e, 2, full);
     auto empty = synthetic_batch(small, 64);

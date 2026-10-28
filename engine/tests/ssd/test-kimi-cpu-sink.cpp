@@ -3043,8 +3043,8 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
 }
 
 // Native Muse expert semantics against an independent ordinary ggml MoE graph. Different
-// norm weights/epsilons and >64-token prefill catch normalization after the sum,
-// missing norm weights, and both grouped accumulation paths.
+// norm weights/epsilons and 3- and 65-token prefills catch normalization after the sum,
+// missing norm weights, and the grouped slot-order sum.
 static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int depth, ggml_type type, bool native_ranges = false) {
     scoped_fixture_input ready(inputs, "ready_first", "1");
     fixture f; f.type = f.down_type = type; make_synthetic(f, 20261017);

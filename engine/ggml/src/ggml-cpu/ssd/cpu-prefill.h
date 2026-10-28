@@ -49,11 +49,11 @@ GGML_BACKEND_API void kimi_cpu_prefill_destroy(struct kimi_cpu_prefill * prefill
 // Token-major contiguous input/output [ntokens][latent] and routes
 // [ntokens][nslots]. Token count follows the configured ubatch; 0..16 route slots. Tensor and
 // activation requirements match kimi_cpu_sink_run_activation. Every distinct
-// live expert is read once. Batches through 64 tokens preserve original slot
-// reduction order exactly; larger batches accumulate in deterministic expert
-// first-touch order to keep workspace bounded. Negative IDs are skipped. On
-// failure discard output; no hidden mmap/GPU fallback is attempted and in-flight
-// reads are drained.
+// live expert is read once. Each token's routes are added in slot order from its
+// first live slot's product, as the graph does, for every batch size; the route
+// workspace (about ntokens * nslots * latent floats) must fit 512 MiB, or the run
+// fails before any read. Negative IDs are skipped. On failure discard output; no
+// hidden mmap/GPU fallback is attempted and in-flight reads are drained.
 GGML_BACKEND_API bool kimi_cpu_prefill_run_activation(
         struct kimi_cpu_prefill * prefill,
         const struct ggml_tensor * up, const struct ggml_tensor * gate,
