@@ -25,6 +25,7 @@
 #include <iomanip>
 #include <sstream>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -134,6 +135,7 @@ struct fixture {
     int fault_role = -1;      // -1 faults every role; 0/1/2 selects up/gate/down
     int resolve_calls = 0;
     bool native_ranges = false;
+    std::vector<int32_t> stored; // the experts the file holds; empty: all of them
     ~fixture() { ssd::platform::close_fd(fd); if (remove_on_destroy) { test_resources::remove_file(path); } }
     static bool resolve(void * user, const char * name, int32_t id, kimi_cpu_sink_source * out) {
         auto & f = *static_cast<fixture *>(user);
@@ -183,6 +185,7 @@ static void make_synthetic(fixture & f, uint32_t seed = 20260908) {
             const std::vector<float> importance(
                 ggml_quantize_requires_imatrix(type) ? size_t(cols) : 0, 1.0f);
             for (int e = 0; e < f.experts; ++e) {
+                if (!f.stored.empty() && std::find(f.stored.begin(), f.stored.end(), e) == f.stored.end()) { continue; }
                 std::vector<float> values(size_t(cols) * rows);
                 for (auto & v : values) { v = sample(rng); }
                 entry item; item.raw_bytes = bytes; item.read_bytes = aligned(bytes); item.data.resize(bytes);
@@ -3519,6 +3522,7 @@ struct graph_layer {
     kimi_cpu_sink * sink = nullptr;
     kimi_cpu_prefill * prefill = nullptr;
     const tensors * meta = nullptr;
+    const kimi_cpu_sink_activation * activation = nullptr; // SiTU (4, 25) when absent
     bool fail = false;
     bool ok = false;
     int nth = 0; // the participants ggml gave the call
@@ -3542,12 +3546,19 @@ static void graph_layer_compute(ggml_tensor * dst, int ith, int nth, void * user
     const auto * in = static_cast<const float *>(x->data);
     const auto & m = *layer.meta;
     if (layer.prefill) {
-        layer.ok = kimi_cpu_prefill_run(layer.prefill, m.role[0], m.role[1], m.role[2], in, id, w, nslots, ntokens,
-            4.0f, 25.0f, out, nullptr, error, sizeof(error));
+        layer.ok = layer.activation ?
+            kimi_cpu_prefill_run_activation(layer.prefill, m.role[0], m.role[1], m.role[2], in, id, w, nslots, ntokens,
+                layer.activation, out, nullptr, error, sizeof(error)) :
+            kimi_cpu_prefill_run(layer.prefill, m.role[0], m.role[1], m.role[2], in, id, w, nslots, ntokens,
+                4.0f, 25.0f, out, nullptr, error, sizeof(error));
     } else {
         // an invalid slot count fails after the call opened: the joiners must still leave
-        layer.ok = kimi_cpu_sink_run(layer.sink, m.role[0], m.role[1], m.role[2], in, id, w, layer.fail ? -1 : nslots,
-            4.0f, 25.0f, out, nullptr, error, sizeof(error));
+        const int slots = layer.fail ? -1 : nslots;
+        layer.ok = layer.activation ?
+            kimi_cpu_sink_run_activation(layer.sink, m.role[0], m.role[1], m.role[2], in, id, w, slots,
+                layer.activation, out, nullptr, error, sizeof(error)) :
+            kimi_cpu_sink_run(layer.sink, m.role[0], m.role[1], m.role[2], in, id, w, slots,
+                4.0f, 25.0f, out, nullptr, error, sizeof(error));
     }
     layer.error = error;
     kimi_cpu_sink_call_close(layer.sink);
@@ -3666,6 +3677,272 @@ static void threadpool_tests(fixture_inputs & inputs, int depth) {
     std::printf("CPU_SINK_THREADPOOL_OK counts=%zu\n", counts.size());
 }
 
+// build_moe_ffn's CPU graph for SiLU-gated experts over ntokens: MUL_MAT_ID gate and up, ggml_swiglu_split,
+// MUL_MAT_ID down, MUL by the routing weights and ADD of per-slot views in slot order. Its expert tensors hold the
+// routed experts only, renumbered: no value the graph computes for one expert depends on another. A -1 route is
+// MUL_MAT_ID's zero row. It shares no code with the sink.
+static std::vector<float> reference_swiglu_graph(const fixture & f, int layer, const std::vector<float> & input,
+        const std::vector<int32_t> & ids, const std::vector<float> & weights, int ntokens, int threads) {
+    const int nslots = int(ids.size()) / ntokens;
+    require(nslots > 0 && ids.size() == size_t(nslots) * ntokens && weights.size() == ids.size() &&
+            input.size() == size_t(ntokens) * f.latent, "SwiGLU reference shape");
+    std::map<int32_t, int32_t> compact;
+    std::vector<int32_t> routed, selected(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] < 0) { selected[i] = -1; continue; }
+        const auto found = compact.emplace(ids[i], int32_t(routed.size()));
+        if (found.second) { routed.push_back(ids[i]); }
+        selected[i] = found.first->second;
+    }
+    require(!routed.empty(), "SwiGLU reference requires a live route");
+    const size_t max_nodes = 32 + 2 * size_t(nslots);
+    ggml_context * ctx = ggml_init({ ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false), nullptr, true });
+    require(ctx, "SwiGLU reference context failed");
+    ggml_backend_t backend = ggml_backend_cpu_init(); require(backend, "SwiGLU reference CPU backend failed");
+    ggml_backend_cpu_set_n_threads(backend, threads);
+    ggml_tensor * experts[3];
+    for (int role = 0; role < 3; ++role) {
+        experts[role] = ggml_new_tensor_3d(ctx, role == 2 ? f.down_type : f.type, role == 2 ? f.hidden : f.latent,
+                                          role == 2 ? f.latent : f.hidden, int64_t(routed.size()));
+    }
+    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, f.latent, 1, ntokens);
+    ggml_tensor * selection = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nslots, ntokens);
+    ggml_tensor * routing = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, nslots, ntokens);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, experts[1], x, selection);
+    ggml_tensor * up = ggml_mul_mat_id(ctx, experts[0], x, selection);
+    ggml_tensor * down = ggml_mul_mat_id(ctx, experts[2], ggml_swiglu_split(ctx, gate, up), selection);
+    ggml_tensor * weighted = ggml_mul(ctx, down, routing);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, max_nodes, false);
+    ggml_build_forward_expand(graph, weighted);
+    ggml_tensor * result = nullptr;
+    for (int slot = 0; slot < nslots; ++slot) {
+        ggml_tensor * view = ggml_view_2d(ctx, weighted, f.latent, ntokens, weighted->nb[2], size_t(slot) * weighted->nb[1]);
+        ggml_build_forward_expand(graph, view);
+        result = result ? ggml_add(ctx, result, view) : view;
+    }
+    if (nslots == 1) { result = ggml_cont(ctx, result); }
+    ggml_build_forward_expand(graph, result);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend); require(buffer, "SwiGLU reference allocation failed");
+    for (int role = 0; role < 3; ++role) {
+        for (size_t e = 0; e < routed.size(); ++e) {
+            const auto & item = f.entries.at({ tensor_name(layer, role), routed[e] });
+            require(item.raw_bytes == experts[role]->nb[2], "SwiGLU reference expert stride mismatch");
+            ggml_backend_tensor_set(experts[role], item.data.data(), e * experts[role]->nb[2], item.raw_bytes);
+        }
+    }
+    ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
+    ggml_backend_tensor_set(selection, selected.data(), 0, selected.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(routing, weights.data(), 0, weights.size() * sizeof(float));
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "SwiGLU reference CPU graph failed");
+    std::vector<float> output(size_t(ntokens) * f.latent);
+    ggml_backend_tensor_get(result, output.data(), 0, output.size() * sizeof(float));
+    ggml_backend_buffer_free(buffer); ggml_backend_free(backend); ggml_free(ctx);
+    return output;
+}
+
+static bool same_bits(const std::vector<float> & a, const std::vector<float> & b) {
+    return a.size() == b.size() && !std::memcmp(a.data(), b.data(), a.size() * sizeof(float));
+}
+
+// SiLU-gated experts as qwen4exp routes them (separate up/gate/down, softmax top-10, sum-normalized weights)
+// through sink nodes on a ggml threadpool of 1, 2, an odd count and all CPUs, against reference_swiglu_graph,
+// compared with memcmp: two chained decode layers with a dense op between, and grouped prefills. Shapes: the model's
+// (Q8_0, 2560 -> 640 -> 2560, 512 experts, of which the fixture holds 12), a narrow Q8_0 one for prefills of 2 to
+// 2048 tokens, and a BF16 one whose hidden width of 70 leaves a scalar tail at every fixed vector width.
+static void swiglu_tests(fixture_inputs & inputs, int depth) {
+    const kimi_cpu_sink_activation swiglu = { KIMI_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f };
+    const int cpus = int(test_resources::process_cpus().size());
+    std::vector<int> counts = { 1, 2, 3 };
+    if (cpus > 3) { counts.push_back(cpus); }
+    constexpr int nslots = 10;
+    struct shape {
+        const char * name;
+        ggml_type type;
+        int latent, hidden, experts;
+        std::vector<int32_t> stored;
+        std::vector<int> prefill_tokens;
+    };
+    const std::vector<shape> shapes = {
+        { "q8_0_model", GGML_TYPE_Q8_0, 2560, 640, 512, { 0, 7, 64, 129, 200, 255, 256, 333, 400, 450, 501, 511 }, { 2, 65 } },
+        { "q8_0_narrow", GGML_TYPE_Q8_0, 256, 96, 48, {}, { 2, 64, 65, 300, 2048 } },
+        { "bf16_tail", GGML_TYPE_BF16, 64, 70, 24, {}, { 2, 65, 300 } },
+    };
+    std::mt19937 rng(20261028);
+    std::normal_distribution<float> sample(0.0f, 0.3f);
+    size_t discriminating = 0; // batches whose outputs tell the graph's SwiGLU kernel from the scalar clamp kernel
+    // one token's route: nslots distinct experts of the fixture, softmax weights in descending order, normalized
+    auto route = [&](const fixture & f, std::vector<int32_t> & ids, std::vector<float> & weights) {
+        std::vector<int32_t> pool = f.stored;
+        if (pool.empty()) { pool.resize(size_t(f.experts)); std::iota(pool.begin(), pool.end(), 0); }
+        std::shuffle(pool.begin(), pool.end(), rng);
+        std::vector<float> w(nslots);
+        for (auto & v : w) { v = std::exp(4.0f * sample(rng)); }
+        std::sort(w.begin(), w.end(), std::greater<float>());
+        float sum = 0.0f;
+        for (float v : w) { sum += v; }
+        for (int slot = 0; slot < nslots; ++slot) { ids.push_back(pool[size_t(slot)]); weights.push_back(w[size_t(slot)] / sum); }
+    };
+    for (const auto & s : shapes) {
+        fixture f;
+        f.type = f.down_type = s.type; f.latent = s.latent; f.hidden = s.hidden; f.experts = s.experts; f.stored = s.stored;
+        make_synthetic(f, 20261028);
+        tensors meta1(f, 1), meta2(f, 2);
+        std::vector<float> x(f.latent);
+        for (auto & v : x) { v = s.type == GGML_TYPE_BF16 ? 5.0f * sample(rng) : sample(rng); }
+        std::vector<int32_t> ids1, ids2;
+        std::vector<float> w1, w2;
+        route(f, ids1, w1);
+        route(f, ids2, w2);
+        ids2[4] = -1; w2[4] = 0.0f; // a dropped route, as mass reduction leaves one
+        const auto layer1 = reference_swiglu_graph(f, 1, x, ids1, w1, 1, 1);
+        require(same_bits(layer1, reference_swiglu_graph(f, 1, x, ids1, w1, 1, 4)),
+            std::string(s.name) + ": SwiGLU reference output depends on its thread count");
+        auto decoded = layer1;
+        for (auto & v : decoded) { v *= .5f; }
+        decoded = reference_swiglu_graph(f, 2, decoded, ids2, w2, 1, 1);
+        struct batch { int ntokens; std::vector<float> x, weights, expected; std::vector<int32_t> ids; size_t experts; };
+        std::vector<batch> batches;
+        for (int ntokens : s.prefill_tokens) {
+            batch b; b.ntokens = ntokens;
+            b.x.resize(size_t(ntokens) * f.latent);
+            for (auto & v : b.x) { v = s.type == GGML_TYPE_BF16 ? 5.0f * sample(rng) : sample(rng); }
+            for (int t = 0; t < ntokens; ++t) { route(f, b.ids, b.weights); }
+            b.expected = reference_swiglu_graph(f, 2, b.x, b.ids, b.weights, ntokens, 1);
+            require(same_bits(b.expected, reference_swiglu_graph(f, 2, b.x, b.ids, b.weights, ntokens, 4)),
+                std::string(s.name) + ": SwiGLU prefill reference output depends on its thread count");
+            std::vector<int32_t> distinct(b.ids);
+            std::sort(distinct.begin(), distinct.end());
+            b.experts = size_t(std::unique(distinct.begin(), distinct.end()) - distinct.begin());
+            batches.push_back(std::move(b));
+        }
+
+        char error[512] = {};
+        // one participant: the sink computes on the threads of the graphs' calls, or alone
+        sink_ptr sink = inputs.create(2, depth, fixture::resolve, &f, error, sizeof(error));
+        require(bool(sink), std::string("SwiGLU sink create: ") + error);
+        std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)> prefill(
+            kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+        require(bool(prefill), std::string("SwiGLU prefill create: ") + error);
+
+        // the coordinator alone, with the run's I/O counters
+        {
+            std::vector<float> exact;
+            print_sample((std::string(s.name) + "_swiglu_decode").c_str(), run_checked(inputs, s.name, f, sink.get(), meta1,
+                x, ids1, w1, layer1, 1, 25.0f, 0, -1, &exact, &swiglu));
+            require(same_bits(exact, layer1), std::string(s.name) + ": SwiGLU decode differs from the graph");
+            const auto & b = batches.back();
+            std::vector<float> routed(b.expected.size());
+            kimi_cpu_prefill_stats stats = {};
+            require(kimi_cpu_prefill_run_activation(prefill.get(), meta2.role[0], meta2.role[1], meta2.role[2],
+                b.x.data(), b.ids.data(), b.weights.data(), nslots, b.ntokens, &swiglu, routed.data(), &stats,
+                error, sizeof(error)), std::string(s.name) + " SwiGLU prefill: " + error);
+            require(same_bits(routed, b.expected), std::string(s.name) + ": SwiGLU prefill differs from the graph");
+            // The scalar clamp kernel at an infinite limit is SwiGLU in value only. Over a few hundred tokens
+            // some hidden value it rounds otherwise survives the down input's quantization: such a batch tells
+            // the graph's vector kernel from the scalar one. Which batch does depends on the vector width.
+            const kimi_cpu_sink_activation clamp = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f,
+                std::numeric_limits<float>::infinity(), nullptr, 0.0f };
+            std::vector<float> scalar(b.expected.size());
+            require(kimi_cpu_prefill_run_activation(prefill.get(), meta2.role[0], meta2.role[1], meta2.role[2],
+                b.x.data(), b.ids.data(), b.weights.data(), nslots, b.ntokens, &clamp, scalar.data(), nullptr,
+                error, sizeof(error)), std::string(s.name) + " scalar clamp prefill: " + error);
+            size_t differing = 0;
+            for (size_t i = 0; i < scalar.size(); ++i) { differing += std::memcmp(&scalar[i], &b.expected[i], sizeof(float)) != 0; }
+            discriminating += differing != 0;
+            std::printf("case=%s_scalar_clamp_infinity tokens=%d differing=%zu of %zu\n", s.name, b.ntokens, differing,
+                scalar.size());
+            require(stats.routed_slots == b.ids.size() && stats.stream.experts == b.experts &&
+                stats.stream.read_requests == 3 * b.experts && !stats.stream.read_errors && !stats.stream.pending_reads,
+                std::string(s.name) + ": SwiGLU prefill counters");
+        }
+        if (s.experts == 512) {
+            // a batch whose route outputs exceed the workspace limit fails before any read
+            const int ntokens = int((512ull << 20) / (uint64_t(nslots) * f.latent * sizeof(float))) + 1;
+            std::vector<float> big(size_t(ntokens) * f.latent, .01f), out(big.size());
+            std::vector<int32_t> ids(size_t(ntokens) * nslots);
+            std::vector<float> weights(ids.size(), 1.0f / nslots);
+            for (size_t i = 0; i < ids.size(); ++i) { ids[i] = s.stored[i % nslots]; }
+            kimi_cpu_prefill_stats stats = {};
+            require(!kimi_cpu_prefill_run_activation(prefill.get(), meta2.role[0], meta2.role[1], meta2.role[2],
+                big.data(), ids.data(), weights.data(), nslots, ntokens, &swiglu, out.data(), &stats, error,
+                sizeof(error)) && std::strstr(error, "route workspace") && stats.stream.read_requests == 0,
+                std::string(s.name) + ": an oversized prefill batch was not refused before its reads");
+            std::printf("case=%s_prefill_workspace_limit tokens=%d status=PASS error=%s\n", s.name, ntokens, error);
+        }
+
+        for (int n : counts) {
+            ggml_threadpool_params params = ggml_threadpool_params_default(n);
+            std::unique_ptr<ggml_threadpool, decltype(&ggml_threadpool_free)> pool(ggml_threadpool_new(&params),
+                ggml_threadpool_free);
+            require(bool(pool), "ggml threadpool");
+            auto compute = [&](ggml_cgraph * graph) {
+                ggml_cplan plan = ggml_graph_plan(graph, n, pool.get());
+                std::vector<uint8_t> work(plan.work_size);
+                plan.work_data = work.data();
+                require(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS, "threadpool graph compute");
+            };
+            auto context = [&](size_t floats) {
+                ggml_context * ctx = ggml_init({ 64 * ggml_tensor_overhead() + ggml_graph_overhead() +
+                    4 * floats * sizeof(float) + (size_t(1) << 20), nullptr, false });
+                require(ctx, "threadpool graph context");
+                return ctx;
+            };
+            auto tensor = [](ggml_context * ctx, ggml_type type, int64_t n0, int64_t n1, const void * data) {
+                ggml_tensor * t = ggml_new_tensor_2d(ctx, type, n0, n1);
+                std::memcpy(t->data, data, ggml_nbytes(t));
+                return t;
+            };
+            auto node = [&](ggml_context * ctx, graph_layer & layer, const tensors & m, ggml_tensor * in, ggml_tensor * id,
+                    ggml_tensor * w) {
+                layer.sink = sink.get(); layer.meta = &m; layer.activation = &swiglu;
+                ggml_tensor * args[] = { in, id, w };
+                return ggml_custom_4d(ctx, GGML_TYPE_F32, f.latent, in->ne[1], 1, 1, args, 3, graph_layer_compute,
+                    GGML_N_TASKS_MAX, &layer);
+            };
+            {
+                ggml_context * ctx = context(size_t(4) * f.latent);
+                graph_layer layers[2];
+                ggml_tensor * y = node(ctx, layers[0], meta1, tensor(ctx, GGML_TYPE_F32, f.latent, 1, x.data()),
+                    tensor(ctx, GGML_TYPE_I32, nslots, 1, ids1.data()), tensor(ctx, GGML_TYPE_F32, nslots, 1, w1.data()));
+                y = ggml_scale(ctx, y, .5f);
+                y = node(ctx, layers[1], meta2, y, tensor(ctx, GGML_TYPE_I32, nslots, 1, ids2.data()),
+                    tensor(ctx, GGML_TYPE_F32, nslots, 1, w2.data()));
+                ggml_cgraph * graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, y);
+                compute(graph);
+                for (const auto & layer : layers) {
+                    require(layer.ok, std::string(s.name) + " threadpool SwiGLU decode: " + layer.error);
+                    require(layer.nth == n, "threadpool SwiGLU decode call participants " + std::to_string(layer.nth));
+                }
+                require(!std::memcmp(y->data, decoded.data(), decoded.size() * sizeof(float)),
+                    std::string(s.name) + ": threadpool SwiGLU decode differs from the graph threads=" + std::to_string(n));
+                ggml_free(ctx);
+            }
+            for (const auto & b : batches) {
+                ggml_context * ctx = context(b.x.size() + b.ids.size() + b.weights.size());
+                graph_layer grouped;
+                grouped.prefill = prefill.get();
+                ggml_tensor * p = node(ctx, grouped, meta2, tensor(ctx, GGML_TYPE_F32, f.latent, b.ntokens, b.x.data()),
+                    tensor(ctx, GGML_TYPE_I32, nslots, b.ntokens, b.ids.data()),
+                    tensor(ctx, GGML_TYPE_F32, nslots, b.ntokens, b.weights.data()));
+                ggml_cgraph * graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, p);
+                compute(graph);
+                require(grouped.ok, std::string(s.name) + " threadpool SwiGLU prefill: " + grouped.error);
+                require(grouped.nth == n, "threadpool SwiGLU prefill call participants " + std::to_string(grouped.nth));
+                require(!std::memcmp(p->data, b.expected.data(), b.expected.size() * sizeof(float)),
+                    std::string(s.name) + ": threadpool SwiGLU prefill differs from the graph tokens=" +
+                    std::to_string(b.ntokens) + " threads=" + std::to_string(n));
+                ggml_free(ctx);
+            }
+            std::printf("case=%s_swiglu_threadpool threads=%d prefill_batches=%zu bit_exact=1 status=PASS\n",
+                s.name, n, batches.size());
+        }
+    }
+    require(discriminating, "no batch tells the graph's SwiGLU kernel from the scalar clamp kernel at an infinite limit");
+    std::printf("CPU_SINK_SWIGLU_OK counts=%zu discriminating=%zu\n", counts.size(), discriminating);
+}
+
 int main(int argc, char ** argv) {
     fixture_inputs inputs;
     try {
@@ -3678,6 +3955,7 @@ int main(int argc, char ** argv) {
         bool cache_policy_mode = false, cache_large_mode = false, cache_pressure_transition = false, cache_unbounded = false;
         bool activation_mode = false, q2_activation_mode = false, muse_q8_mode = false, muse_bf16_mode = false;
         bool auto_ring_mode = false, prefetch_mode = false, cache_load_mode = false, threadpool_mode = false;
+        bool swiglu_mode = false;
         std::string pack, prefix;
         for (int i = 1; i < argc; ++i) {
             auto argument = [&]() { require(i + 1 < argc, "missing option argument"); return argv[++i]; };
@@ -3720,6 +3998,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--activation-tests")) { activation_mode = true; }
             else if (!std::strcmp(argv[i], "--q2-activation-test")) { q2_activation_mode = true; }
             else if (!std::strcmp(argv[i], "--threadpool-tests")) { threadpool_mode = true; }
+            else if (!std::strcmp(argv[i], "--swiglu-tests")) { swiglu_mode = true; }
             else { throw std::runtime_error("usage: test-kimi-cpu-sink [--registered-lifecycle|--cache-tests|--cache-pressure] [--threads N] [--fixture KEY=VALUE] [--real-pack FILE --fixture-prefix PREFIX --ring-experts N --repeats N --warmup N --policy fixture|top16|top8|mass085 --jsonl FILE --resident-dir TMPFS]"); }
         }
         require(options.threads >= 2 && options.threads <= 128 && options.ring_experts >= 1 && options.ring_experts <= 32, "invalid thread/ring count");
@@ -3772,6 +4051,7 @@ int main(int argc, char ** argv) {
         if (schedules_mode) { schedule_tests(inputs, options.threads, options.ring_experts, true); return 0; }
         if (schedule_invalid_mode) { schedule_invalid_tests(inputs); return 0; }
         if (threadpool_mode) { threadpool_tests(inputs, ring_set ? options.ring_experts : 2); return 0; }
+        if (swiglu_mode) { swiglu_tests(inputs, ring_set ? options.ring_experts : 2); return 0; }
         if (trace_profile_mode) { trace_profile_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (prefetch_mode) { prefetch_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (cache_policy_mode) { cache_policy_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }

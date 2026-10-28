@@ -17,6 +17,7 @@
 #include "ggml-ssd/platform/file.h"
 #include "ggml-ssd/platform/memory.h"
 #include "ggml-ssd/platform/threads.h"
+#include "vec.h"
 
 #include <algorithm>
 #include <array>
@@ -717,6 +718,7 @@ struct kimi_cpu_sink {
     float * output = nullptr;
     bool first_down = false; // without READY_FIRST: this down phase starts the slot-order sum
     std::vector<float> activation;
+    std::vector<float> activation_up; // SWIGLU: u, beside g in activation, until quantize_activation
     std::vector<uint8_t> quant_input, quant_hidden;
     const uint8_t * down_quant_data = nullptr;
     size_t quant_hidden_stride = 0;
@@ -1316,6 +1318,12 @@ struct kimi_cpu_sink {
                         const float up_value = std::clamp(u, -limit, limit);
                         activation[row] = gate_value / (1.f + expf(-gate_value)) * up_value;
                     }
+                } else if (!is_down && activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+                    // g and u as they are: the coordinator gates the whole row (quantize_activation)
+                    for (int row = begin; row < end; ++row) {
+                        dot_up(latent, &activation_up[row], 0, up_data + row * row_bytes_up, 0, quant_input.data(), 0, 1);
+                        dot_up(latent, &activation[row], 0, gate_data + row * row_bytes_up, 0, quant_input.data(), 0, 1);
+                    }
                 } else if (!is_down) {
                     for (int row = begin; row < end; ++row) {
                         float u, g;
@@ -1538,7 +1546,8 @@ struct kimi_cpu_sink {
     uint64_t held_bytes() {
         uint64_t ring_bytes = 0;
         for (const auto & slot : slots) { for (const auto & role : slot.role) { ring_bytes = sink_add(ring_bytes, role.size); } }
-        uint64_t scratch = sink_cache::multiply(expert_output.capacity() + activation.capacity(), sizeof(float));
+        uint64_t scratch = sink_cache::multiply(expert_output.capacity() + activation.capacity() +
+            activation_up.capacity(), sizeof(float));
         scratch = sink_cache::add(scratch, expert_computed.capacity());
         scratch = sink_cache::add(scratch, quant_input.capacity());
         scratch = sink_cache::add(scratch, quant_hidden.capacity());
@@ -1855,6 +1864,15 @@ struct kimi_cpu_sink {
         }
         compute_rows(0, is_down);
         wait_workers();
+    }
+
+    // The hidden row of the last up/gate phase, quantized for down. SWIGLU gates it first with the graph's kernel
+    // over the whole row: split elsewhere than at its vector width, elements would move into its scalar tail.
+    void quantize_activation(void * destination) {
+        if (activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+            ggml_vec_swiglu_f32(hidden, activation.data(), activation.data(), activation_up.data());
+        }
+        quantize_hidden(activation.data(), destination, hidden);
     }
 
     void wait_workers() {
@@ -2471,6 +2489,7 @@ struct kimi_cpu_sink {
         current.ring_bytes = allocated;
         current.experts = requests.size();
         resize_scratch(activation, hidden);
+        resize_scratch(activation_up, activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU ? size_t(hidden) : 0);
         resize_scratch(quant_input, ggml_row_size(up_traits->vec_dot_type, latent));
         quant_hidden_stride = ggml_row_size(down_traits->vec_dot_type, hidden);
         resize_scratch(quant_hidden, quant_hidden_stride);
@@ -2654,7 +2673,7 @@ struct kimi_cpu_sink {
                 phase_start = sink_clock::now();
                 const double quant_cpu_start = profile_enabled ? sink_thread_cpu_us() : 0.0;
                 if (timeline_active) { timeline[expert].cpu[4] = ggml_time_us(); }
-                quantize_hidden(activation.data(), staged_quant_hidden.data() + expert * quant_hidden_stride, hidden);
+                quantize_activation(staged_quant_hidden.data() + expert * quant_hidden_stride);
                 if (timeline_active) { timeline[expert].cpu[5] = ggml_time_us(); }
                 current.hidden_quantize_us += elapsed_us(phase_start);
                 if (profile_enabled) { current.compute_cpu_us += sink_thread_cpu_us() - quant_cpu_start; }
@@ -3425,6 +3444,8 @@ static bool sink_activation_valid(const kimi_cpu_sink_activation * activation) {
                 std::isfinite(activation->situ_linear_beta);
         case KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP:
             return !std::isnan(activation->swiglu_limit) && activation->swiglu_limit > 1e-6f;
+        case KIMI_CPU_SINK_ACTIVATION_SWIGLU:
+            return true;
         default:
             return false;
     }
@@ -3621,7 +3642,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
             phase_start = sink_clock::now();
             quant_cpu_start = sink->profile_enabled ? sink_thread_cpu_us() : 0.0;
             if (sink->timeline_active) { sink->timeline[expert].cpu[4] = ggml_time_us(); }
-            sink->quantize_hidden(sink->activation.data(), sink->quant_hidden.data(), sink->hidden);
+            sink->quantize_activation(sink->quant_hidden.data());
             if (sink->timeline_active) { sink->timeline[expert].cpu[5] = ggml_time_us(); }
             sink->current.hidden_quantize_us += elapsed_us(phase_start);
             if (sink->profile_enabled) { sink->current.compute_cpu_us += sink_thread_cpu_us() - quant_cpu_start; }

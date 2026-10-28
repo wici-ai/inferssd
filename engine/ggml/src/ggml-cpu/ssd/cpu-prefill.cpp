@@ -1,6 +1,7 @@
 #include "ssd/cpu-prefill.h"
 #include "ssd/cpu-sink-internal.h"
 #include "../quants.h"
+#include "../vec.h"
 
 #include <algorithm>
 #include <atomic>
@@ -45,6 +46,8 @@ static bool prefill_activation_valid(const kimi_cpu_sink_activation * activation
                 std::isfinite(activation->situ_linear_beta);
         case KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP:
             return !std::isnan(activation->swiglu_limit) && activation->swiglu_limit > 1e-6f;
+        case KIMI_CPU_SINK_ACTIVATION_SWIGLU:
+            return true;
         default:
             return false;
     }
@@ -98,7 +101,8 @@ struct kimi_cpu_prefill {
     std::vector<int32_t> group_of_expert; // expert ID -> group, -1 while untouched
     std::vector<int32_t> route_request_index;
     std::vector<uint8_t> consumed; // groups the CPU computed; the GPU tier added the others into output
-    std::vector<float> activation, routed_output, post_exp_output;
+    // activation_up: SWIGLU's u beside g in activation until the chunk is gated
+    std::vector<float> activation, activation_up, routed_output, post_exp_output;
     std::vector<uint8_t> quant_input, quant_hidden;
     ggml_vec_dot_t dot_up = nullptr, dot_down = nullptr;
     ggml_from_float_t quantize_input = nullptr, quantize_hidden = nullptr;
@@ -111,12 +115,14 @@ struct kimi_cpu_prefill {
     const prefill_group * active_group = nullptr;
     kimi_cpu_sink_activation activation_config = {};
 
-    // Dynamic row scheduling: threads claim fixed-size row chunks from a shared
-    // counter instead of a static rows*ith/nth split, so a slow core (e.g. an
-    // LP-E core) no longer gates every expert. Rows stay independent, so the
-    // arithmetic and the per-row accumulation order are unchanged.
-    bool dynamic_rows = true;
-    int dynamic_chunk_rows = 16;
+    // Threads claim row chunks from a shared counter instead of a static
+    // rows*ith/nth split, so a slow core (e.g. an LP-E core) no longer gates
+    // every expert. Rows stay independent, so the arithmetic and the per-row
+    // accumulation order are unchanged. A chunk starts at a multiple of 16 rows,
+    // a multiple of every fixed ggml_vec_swiglu_f32 vector width (the predicated
+    // ones have no scalar tail), and ends 16 rows later or at the row's end: gated
+    // alone, it splits into vector body and scalar tail as the whole row would.
+    static constexpr int row_chunk = 16;
     int column_block = 16; // 0 keeps the row-major order
     std::atomic<int> dynamic_next{0};
     bool down_phase = false;
@@ -200,10 +206,11 @@ struct kimi_cpu_prefill {
             }
         }
         const size_t columns = static_cast<size_t>(current.max_group_tokens);
+        const bool swiglu = activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU;
         // Each CPU route's weighted output, for the graph's slot-order sum per
         // token. A route the GPU tier serves is never written or read here.
         const uint64_t routed = uint64_t(ntokens) * uint64_t(nslots) * uint64_t(latent) * sizeof(float);
-        const uint64_t scratch = (uint64_t(columns) * hidden +
+        const uint64_t scratch = (uint64_t(columns) * hidden * (swiglu ? 2 : 1) +
                 (activation_config.post_exp_norm ? uint64_t(columns) * latent : 0)) * sizeof(float) +
                 uint64_t(columns) * quant_bytes_hidden + uint64_t(ntokens) * quant_bytes_input;
         if (routed + scratch > prefill_workspace_max) {
@@ -212,12 +219,13 @@ struct kimi_cpu_prefill {
                 std::to_string(prefill_workspace_max >> 20) + " MiB limit: use a smaller ubatch");
         }
         activation.resize(columns * hidden);
+        activation_up.resize(swiglu ? columns * hidden : 0);
         post_exp_output.resize(activation_config.post_exp_norm ? columns * latent : 0);
         quant_hidden.resize(columns * quant_bytes_hidden);
         quant_input.resize(static_cast<size_t>(ntokens) * quant_bytes_input);
         routed_output.resize(static_cast<size_t>(ntokens) * nslots * latent);
         consumed.assign(groups.size(), 0);
-        size_t workspace = activation.capacity() * sizeof(float) +
+        size_t workspace = (activation.capacity() + activation_up.capacity()) * sizeof(float) +
                 quant_hidden.capacity() + quant_input.capacity() + routed_output.capacity() * sizeof(float) +
                 post_exp_output.capacity() * sizeof(float) +
                 groups.capacity() * sizeof(prefill_group) + expert_ids.capacity() * sizeof(int32_t);
@@ -230,7 +238,7 @@ struct kimi_cpu_prefill {
         current.workspace_bytes = workspace;
     }
 
-    static void parallel_rows(void * userdata, int ith, int nth) {
+    static void parallel_rows(void * userdata, int, int) {
         auto & self = *static_cast<kimi_cpu_prefill *>(userdata);
         const auto & columns = self.active_group->columns;
         const int rows = self.down_phase ? self.latent : self.hidden;
@@ -269,7 +277,11 @@ struct kimi_cpu_prefill {
                     }
                     for (size_t offset = 0; offset < count; ++offset) {
                         float value;
-                        if (self.activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) {
+                        if (self.activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+                            // g and u as they are: the chunk is gated once complete
+                            self.activation_up[(column + offset) * self.hidden + row] = u[offset];
+                            value = g[offset];
+                        } else if (self.activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) {
                             const float limit = self.activation_config.swiglu_limit;
                             const float gate_value = std::min(g[offset], limit);
                             const float up_value = std::clamp(u[offset], -limit, limit);
@@ -333,15 +345,18 @@ struct kimi_cpu_prefill {
                 compute_row_columns(row, 0, columns.size());
             }
         }
-        };
-        if (self.dynamic_rows) {
-            for (;;) {
-                const int begin = self.dynamic_next.fetch_add(self.dynamic_chunk_rows, std::memory_order_relaxed);
-                if (begin >= rows) { break; }
-                compute_range(begin, std::min(rows, begin + self.dynamic_chunk_rows));
+        if (!self.down_phase && self.activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+            // ggml_swiglu_split's kernel on this chunk of every column (row_chunk)
+            for (size_t column = 0; column < columns.size(); ++column) {
+                float * gate = self.activation.data() + column * self.hidden + begin;
+                ggml_vec_swiglu_f32(end - begin, gate, gate, self.activation_up.data() + column * self.hidden + begin);
             }
-        } else {
-            compute_range(rows * ith / nth, rows * (ith + 1) / nth);
+        }
+        };
+        for (;;) {
+            const int begin = self.dynamic_next.fetch_add(row_chunk, std::memory_order_relaxed);
+            if (begin >= rows) { break; }
+            compute_range(begin, std::min(rows, begin + row_chunk));
         }
     }
 

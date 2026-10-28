@@ -1,6 +1,7 @@
 // Included after sink_cache. Private, default-off GPU tier adapter.
 static_assert(int(KIMI_VRAM_ACTIVATION_SITU) == int(KIMI_CPU_SINK_ACTIVATION_SITU) &&
-    int(KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP) == int(KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP),
+    int(KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP) == int(KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) &&
+    int(KIMI_VRAM_ACTIVATION_SWIGLU) == int(KIMI_CPU_SINK_ACTIVATION_SWIGLU),
     "VRAM tier and CPU sink activation kinds must match");
 struct sink_vram {
     const kimi_vram_tier_api * api = nullptr;

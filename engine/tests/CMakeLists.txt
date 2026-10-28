@@ -419,6 +419,15 @@ if (TARGET ggml-cpu)
     add_test(NAME kimi_cpu_sink_threadpool_poll COMMAND test-kimi-cpu-sink --threadpool-tests --ring-experts 1
         --fixture poll_us=100)
     set_tests_properties(kimi_cpu_sink_threadpool kimi_cpu_sink_threadpool_poll PROPERTIES TIMEOUT 180)
+    # SwiGLU experts (qwen4exp's geometry; a BF16 shape with a scalar tail) in decode and grouped prefill on a
+    # ggml threadpool, against build_moe_ffn's graph with ggml_swiglu_split: the production schedule and the
+    # ordinary one.
+    add_test(NAME kimi_cpu_sink_swiglu COMMAND test-kimi-cpu-sink --swiglu-tests --ring-experts 8
+        --fixture ready_first=1 --fixture early_up_gate=1 --fixture role_major=1
+        --fixture nonblocking_down_sched=1 --fixture dynamic_rows=1 --fixture dynamic_chunk_rows=64)
+    add_test(NAME kimi_cpu_sink_swiglu_ordinary COMMAND test-kimi-cpu-sink --swiglu-tests --ring-experts 1
+        --fixture ready_first=0)
+    set_tests_properties(kimi_cpu_sink_swiglu kimi_cpu_sink_swiglu_ordinary PROPERTIES TIMEOUT 300)
     # A decode microbenchmark, not a CTest: test-kimi-sink-bench --help.
     add_executable(test-kimi-sink-bench ssd/test-kimi-sink-bench.cpp)
     target_include_directories(test-kimi-sink-bench PRIVATE ../ggml/src ../ggml/src/ggml-cpu)
@@ -899,7 +908,7 @@ foreach(resource_test IN LISTS ssdash_registered_tests)
         else()
             set_property(TEST ${resource_test} APPEND PROPERTY LABELS device)
             set_property(TEST ${resource_test} PROPERTY SKIP_RETURN_CODE 77)
-            if (NOT resource_test MATCHES "^(kimi_cpu_sink|kimi_cpu_sink_schedule_invalid|kimi_cpu_sink_threadpool|kimi_cpu_sink_threadpool_poll|kimi_cpu_sink_registered|kimi_cpu_sink_trace_profile|dsv41_q2_cpu_sink_decode|kimi_cpu_prefill|kimi_cpu_prefill_registered)$")
+            if (NOT resource_test MATCHES "^(kimi_cpu_sink|kimi_cpu_sink_schedule_invalid|kimi_cpu_sink_threadpool|kimi_cpu_sink_threadpool_poll|kimi_cpu_sink_swiglu|kimi_cpu_sink_swiglu_ordinary|kimi_cpu_sink_registered|kimi_cpu_sink_trace_profile|dsv41_q2_cpu_sink_decode|kimi_cpu_prefill|kimi_cpu_prefill_registered)$")
                 set_property(TEST ${resource_test} APPEND PROPERTY LABELS ${ssd_envelope_label})
             endif()
         endif()

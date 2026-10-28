@@ -93,6 +93,7 @@ struct kimi_vram_residency_api {
 enum kimi_vram_activation_kind {
     KIMI_VRAM_ACTIVATION_SITU         = 0, // same values as kimi_cpu_sink_activation_kind
     KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP = 1,
+    KIMI_VRAM_ACTIVATION_SWIGLU       = 2, // a tier without its kernel refuses it
 };
 struct kimi_vram_activation {
     int32_t kind;

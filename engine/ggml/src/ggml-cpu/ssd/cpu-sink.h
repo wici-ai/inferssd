@@ -148,17 +148,21 @@ GGML_BACKEND_API bool kimi_cpu_sink_run(
 // SITU (Kimi-K3): beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb), where lb <= 0
 // keeps u linear; beta must be finite and positive and lb finite.
 // SWIGLU_CLAMP (DeepSeek-V4.1): silu(min(g, L)) * clamp(u, -L, L), computed as
-// the scalar GGML_GLU_OP_SWIGLU_CLAMP CPU kernel; L must be > 1e-6; +infinity is plain SwiGLU.
+// the scalar GGML_GLU_OP_SWIGLU_CLAMP CPU kernel; L must be > 1e-6. An infinite
+// L is SwiGLU in value but not in bits: the graph's SwiGLU kernel is vectorized.
+// SWIGLU: silu(g) * u as GGML_GLU_OP_SWIGLU (ggml_swiglu_split) computes it, the
+// vectorized CPU kernel over each whole hidden row; no parameter.
 enum kimi_cpu_sink_activation_kind {
     KIMI_CPU_SINK_ACTIVATION_SITU         = 0,
     KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP = 1,
+    KIMI_CPU_SINK_ACTIVATION_SWIGLU       = 2,
 };
 
 struct kimi_cpu_sink_activation {
     int32_t kind; // enum kimi_cpu_sink_activation_kind
     float   situ_beta;
     float   situ_linear_beta;
-    float   swiglu_limit; // +infinity means unclamped SwiGLU
+    float   swiglu_limit; // SWIGLU_CLAMP only
     const float * post_exp_norm; // optional latent-length weight, borrowed for run
     float post_exp_norm_eps;
 };
