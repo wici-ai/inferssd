@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from inferssd.configuration.settings import parse, render, schema
@@ -12,7 +13,12 @@ from inferssd.configuration.settings import parse, render, schema
 def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     config = commands.add_parser("configuration", help="typed SSD settings v1 schema/check/write")
     config.add_argument("action", choices=("schema", "check", "write"))
-    config.add_argument("--platform", choices=("linux", "darwin"), default="linux")
+    config.add_argument(
+        "--platform",
+        choices=("linux", "darwin"),
+        default="darwin" if sys.platform == "darwin" else "linux",
+        help="defaults to this host",
+    )
     config.add_argument("--input", type=Path)
     config.add_argument("--set", dest="overrides", action="append", default=[])
     config.add_argument("--output", type=Path)

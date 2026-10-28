@@ -38,7 +38,7 @@ python3 scripts/engine-resources.py \
   --build build-macos-metal --output engine-resources.json
 ```
 
-Use `--platform darwin` when launching. `inferssd launch` applies static typed settings on both platforms; Linux additionally exposes an online controller through the Python API (see the [framework README](../framework/README.md)). Routed experts run on the CPU from SSD, while dense layers use Metal; unified memory does not need to hold the full expert set. See [Apple Silicon deployment](mac-launcher.md) for cache and thread settings.
+`inferssd launch` applies static typed settings on both platforms; Linux additionally exposes an online controller through the Python API (see the [framework README](../framework/README.md)). Routed experts run on the CPU from SSD, while dense layers use Metal; unified memory does not need to hold the full expert set. See [Apple Silicon deployment](mac-launcher.md) for cache and thread settings.
 
 ## Muse on Mac
 
@@ -55,29 +55,41 @@ python3 scripts/engine-resources.py \
   --build build-linux-cuda --output engine-resources.json
 ```
 
-Use `--platform linux` when launching. The [Linux resource prerequisites](testing.md#linux-resource-prerequisites) describe I/O, cgroup and pinned-memory requirements.
+The [Linux resource prerequisites](testing.md#linux-resource-prerequisites) describe I/O, cgroup and pinned-memory requirements.
 
 ## Prepare a launch
 
-The public entry point is `inferssd launch`. It consumes a typed settings file, a deployment descriptor and an explicit runtime policy:
+The public entry point is `inferssd launch`. It takes a settings file, a deployment descriptor and a runtime policy:
 
-1. Prepare `settings.ssd` using the [configuration guide](configuration.md). Inspect supported settings with `inferssd configuration schema`.
-2. Prepare a policy JSON using the complete format in the [owned runtime guide](../framework/README.md#explicit-owned-server-execution). Set the platform, memory limits, host reserve, runtime and cleanup budgets for your deployment.
-3. Select a fresh output directory and a free loopback port. Replace every `/path/to/` placeholder below.
+1. Write a settings file with every setting at its default, then adjust it using the [configuration guide](configuration.md):
 
-For Linux DeepSeek:
+   ```sh
+   inferssd configuration write --output settings.ssd
+   ```
+
+2. Copy the example runtime policy for your platform, then set `memory_budget_bytes` and `host_reserve_bytes` for your machine:
+
+   ```sh
+   cp docs/examples/runtime-policy-linux.json runtime-policy.json   # macOS: runtime-policy-darwin.json
+   ```
+
+   The launcher stops the server after `runtime_seconds`. On macOS it also stops the server if memory-compressor or swap use grows beyond the policy's limits. The [owned runtime guide](../framework/README.md#explicit-owned-server-execution) describes every field.
+
+3. Choose a new output directory for each launch. Replace every `/path/to/` placeholder below.
+
+For DeepSeek:
 
 ```sh
-inferssd launch --execute --platform linux \
+inferssd launch --execute \
   --resources engine-resources.json \
   --model /path/to/model-00001-of-00010.gguf --profile dsv \
-  --settings /path/to/settings.ssd \
-  --runtime-policy /path/to/runtime-policy.json \
+  --settings settings.ssd \
+  --runtime-policy runtime-policy.json \
   --output-dir /path/to/runs/instance-001 \
-  --context 8192 --batch 512 --ubatch 512 --port 18181
+  --context 8192 --batch 512 --ubatch 512
 ```
 
-For macOS, use `--platform darwin`, a Darwin policy and `--port 8080`. For Muse, change `--profile dsv` to `--profile muse` and select its first GGUF shard. Batch sizes are explicit examples; tune them within the available memory budget.
+For Muse, change `--profile dsv` to `--profile muse` and select its first GGUF shard. Batch sizes are explicit examples; tune them within the available memory budget. The platform defaults to the current host, and the server listens on `127.0.0.1:8080`; pass `--port` to use another loopback port.
 
 If `expert.source` is omitted, the framework builds an alias index from the GGUF metadata without duplicating weight payloads. For the recorded planning commands, `inferssd source index MODEL PACK DIR` indexes an optional v1 pack; see [source preparation](../framework/README.md#prepare-a-typed-launch). Use the [deployment resources guide](engine-resources.md) when moving binaries and templates outside the checkout.
 
@@ -91,4 +103,4 @@ python3 engine/tools/expert-pack/create-moe-expert-pack.py --inspect -o /path/to
 
 To launch with the pack, set `expert.source = ["/path/to/model.expert-pack"]` in the settings file. The v1 format records no checkpoint fingerprint, so rebuild the pack whenever the shards change.
 
-Open **http://127.0.0.1:18181** on Linux or **http://127.0.0.1:8080** on Mac after the server is ready, or [connect an API client](../README.md#use-it-with-your-tools). Stop the owned launcher with **Ctrl+C**.
+Open **http://127.0.0.1:8080** after the server is ready, or [connect an API client](../README.md#use-it-with-your-tools). Stop the owned launcher with **Ctrl+C**.
