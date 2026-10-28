@@ -244,7 +244,7 @@ def scope_state(unit):
 def run_scope(profile, environment, lock_fd):
     if sys.platform != "linux":
         raise ValueError("Linux scope requires Linux")
-    out = Path(environment["SSDASH_RUN_DIR"])
+    out = Path(environment["INFERSSD_RUN_DIR"])
     unit = f"inferssd-final-{uuid.uuid4().hex}.scope"
     profile_path = out / "scope-profile.json"
     common.save(profile_path, profile)
@@ -257,7 +257,7 @@ def run_scope(profile, environment, lock_fd):
     common.save(out / "scope-launch.json", {"argv": argv, "unit": unit})
     signals, launcher, failure = [], None, None
     handlers = {s: signal.signal(s, lambda n, _f: signals.append(n)) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
-    deadline = time.monotonic() + profile["load_timeout_s"] + float(environment["SSDASH_REQUEST_TIMEOUT"]) + 60
+    deadline = time.monotonic() + profile["load_timeout_s"] + float(environment["INFERSSD_REQUEST_TIMEOUT"]) + 60
     try:
         with (out / "scope.log").open("xb") as log:
             launcher = subprocess.Popen(argv, env=environment, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -289,7 +289,7 @@ def run_scope(profile, environment, lock_fd):
             failure = failure or "scope cleanup uncertain; retaining inherited device lock"
             common.save(out / "quarantine.json", {"unit": unit, "controller_pid": os.getpid(), "reason": failure})
             time.sleep(1)
-        path = Path(environment["SSDASH_WRAPPER_RECEIPT"])
+        path = Path(environment["INFERSSD_WRAPPER_RECEIPT"])
         receipt = json.loads(path.read_text()) if path.exists() else {"status": "failed", "server": {}, "evidence": []}
         receipt["server"]["resource_scope_gone"] = True
         if failure or signals:
@@ -316,8 +316,8 @@ def main():
     try:
         import native_wrapper
         profile = common.validate_profile(json.loads(args.profile.read_text()))
-        environment = dict(os.environ, SSDASH_LOCK_FD=str(lease.fd))
-        runtime = LinuxRuntime(profile, Path(environment["SSDASH_RUN_DIR"]))
+        environment = dict(os.environ, INFERSSD_LOCK_FD=str(lease.fd))
+        runtime = LinuxRuntime(profile, Path(environment["INFERSSD_RUN_DIR"]))
         return native_wrapper.run_native(profile, environment, runtime, lease.fd, lease)
     finally:
         # Controller SIGKILL/disconnect must not release the last lease while

@@ -63,7 +63,7 @@ def worker_environment(environment: dict[str, str]) -> dict[str, str]:
         if key.startswith(prefixes) or key in ("PYTHONPATH", "PYTHONHOME")
     }
     control = {key: value for key, value in environment.items() if key not in moved}
-    control["SSDASH_INTERNAL_SERVER_ENV"] = json.dumps(moved)
+    control["INFERSSD_INTERNAL_SERVER_ENV"] = json.dumps(moved)
     return control
 
 

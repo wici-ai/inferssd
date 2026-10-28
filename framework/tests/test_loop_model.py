@@ -485,7 +485,7 @@ def data():
 def runtime():
     v = f"{sys.version_info[0]}.{sys.version_info[1]}"
     if v not in ("3.9", "3.12"):
-        pytest.skip("F transcripts verified on 3.9/3.12")
+        pytest.skip("recorded reference transcripts cover Python 3.9 and 3.12 only")
     return v
 
 

@@ -3,7 +3,7 @@
 `native_wrapper.py --profile /absolute/path/profile.json` is an argv for
 `run_final.py`, not a separate benchmark. It starts one owned server, checks its
 health and listener ownership, invokes the existing `final_chat.py` exactly once,
-and writes `wrapper.json` after cleanup. The driver supplies the `SSDASH_*`
+and writes `wrapper.json` after cleanup. The driver supplies the `INFERSSD_*`
 environment documented in [FINAL.md](FINAL.md), including its already-held lock
 descriptor. The wrapper does not acquire a different lock, tune settings, build,
 download models, purge page cache, pause applications or change power settings.
@@ -177,7 +177,7 @@ Use the exact `inferssd/platform` directory from the reviewed source or installe
 wheel. Copy the **entire** resulting directory, including `ownership/`,
 `native-core.json` and `bundle-manifest.json`, and verify every manifest member
 before an attempt. The wrapper loads that adjacent manifest automatically;
-`SSDASH_NATIVE_CORE_MANIFEST` can select an explicit manifest instead. Every
+`INFERSSD_NATIVE_CORE_MANIFEST` can select an explicit manifest instead. Every
 member is verified before either module is imported. A missing, changed or
 unsupported bundle fails; it never falls back to another installed copy. No
 search-path modification or ambient checkout is used. Archive the complete

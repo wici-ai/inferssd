@@ -218,7 +218,7 @@ def test_worker_cleanup_receipt_precedes_lease_release(tmp_path, monkeypatch, re
         events.append("spawn")
         assert kw["pass_fds"] == (88,)
         assert kw["env"]["GGML_TEST"] == "yes"
-        assert "SSDASH_INTERNAL_SERVER_ENV" not in kw["env"]
+        assert "INFERSSD_INTERNAL_SERVER_ENV" not in kw["env"]
         if reason == "spawn":
             raise OSError("spawn failed")
         return child
@@ -235,7 +235,7 @@ def test_worker_cleanup_receipt_precedes_lease_release(tmp_path, monkeypatch, re
     monkeypatch.setattr(worker.signal, "signal", lambda *a: None)
     monkeypatch.setattr(worker.time, "sleep", lambda _: None)
     monkeypatch.setenv(
-        "SSDASH_INTERNAL_SERVER_ENV", "[]" if reason == "environment" else '{"GGML_TEST":"yes"}'
+        "INFERSSD_INTERNAL_SERVER_ENV", "[]" if reason == "environment" else '{"GGML_TEST":"yes"}'
     )
     args = argparse.Namespace(socket="unused", lock_dev=1, lock_ino=2)
     result = worker.run_worker(args, {"directory": str(out), "argv": ["/fixture/server"]}, p)
@@ -273,7 +273,7 @@ def test_worker_stop_before_spawn_proves_empty_without_signalling(tmp_path, monk
     monkeypatch.setattr(worker, "Resources", Resources)
     monkeypatch.setattr(worker, "stop_owned", lambda *_: pytest.fail("no owned child"))
     monkeypatch.setattr(worker.signal, "signal", lambda *a: None)
-    monkeypatch.setenv("SSDASH_INTERNAL_SERVER_ENV", "{}")
+    monkeypatch.setenv("INFERSSD_INTERNAL_SERVER_ENV", "{}")
     assert (
         worker.run_worker(
             argparse.Namespace(socket="x", lock_dev=1, lock_ino=2),
@@ -340,7 +340,7 @@ def test_worker_waits_for_group_proof_before_releasing(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "stop_owned", stop)
     monkeypatch.setattr(worker.signal, "signal", lambda *a: None)
     monkeypatch.setattr(worker.time, "sleep", sleep)
-    monkeypatch.setenv("SSDASH_INTERNAL_SERVER_ENV", "{}")
+    monkeypatch.setenv("INFERSSD_INTERNAL_SERVER_ENV", "{}")
     assert (
         worker.run_worker(
             argparse.Namespace(socket="x", lock_dev=1, lock_ino=2),
@@ -442,7 +442,7 @@ def test_command_mode_checks_natural_exit_and_descendants(
         "stop_owned",
         lambda *a: {"group_gone": True, "forced_kill": force, "orphaned_descendants": orphan},
     )
-    monkeypatch.setenv("SSDASH_INTERNAL_SERVER_ENV", "{}")
+    monkeypatch.setenv("INFERSSD_INTERNAL_SERVER_ENV", "{}")
     result = worker.run_worker(
         argparse.Namespace(socket="unused", lock_dev=1, lock_ino=2),
         {"directory": str(out), "argv": ["fixture"], "command_mode": True},

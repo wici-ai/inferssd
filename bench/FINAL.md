@@ -40,8 +40,8 @@ The wrapper runs the client as follows after its own health check:
 
 ```sh
 python3 bench/final_chat.py --url "$SERVER_URL" \
-  --tier "$SSDASH_TIER" --output "$SSDASH_RESULT_PATH" \
-  --timeout "$SSDASH_REQUEST_TIMEOUT"
+  --tier "$INFERSSD_TIER" --output "$INFERSSD_RESULT_PATH" \
+  --timeout "$INFERSSD_REQUEST_TIMEOUT"
 ```
 
 It must capture the client's return code and perform cleanup even on failure.
@@ -84,10 +84,10 @@ intent. Any failure stops the sequence and records the other tier as `not_run`.
 Failed attempts must remain separate if a later fix justifies another attempt.
 No attempt here constitutes a numerical equivalence test or a CTest device gate.
 
-The wrapper receives `SSDASH_RUN_ID`, `SSDASH_RUN_DIR`, `SSDASH_RESULT_PATH`,
-`SSDASH_WRAPPER_RECEIPT`, `SSDASH_TIER`, `SSDASH_PROMPT_PATH`,
-`SSDASH_REQUEST_TIMEOUT`, `SSDASH_OUTPUT_TOKENS=256`, `SSDASH_DEVICE`,
-`SSDASH_MODEL`, `SSDASH_REVISION` and `SSDASH_LOCK_FD`. Paths are absolute except
+The wrapper receives `INFERSSD_RUN_ID`, `INFERSSD_RUN_DIR`, `INFERSSD_RESULT_PATH`,
+`INFERSSD_WRAPPER_RECEIPT`, `INFERSSD_TIER`, `INFERSSD_PROMPT_PATH`,
+`INFERSSD_REQUEST_TIMEOUT`, `INFERSSD_OUTPUT_TOKENS=256`, `INFERSSD_DEVICE`,
+`INFERSSD_MODEL`, `INFERSSD_REVISION` and `INFERSSD_LOCK_FD`. Paths are absolute except
 the operator's argv, which retains the invocation working directory. The lock FD
 is inherited by the wrapper; preserve that same open-file description in owned
 servers/lease holders where the device launcher supports it. Do not open a
@@ -103,7 +103,7 @@ of recovery after machine loss, SIGKILL, or a noncooperating external launcher.
 
 ## Wrapper receipt
 
-Write `SSDASH_WRAPPER_RECEIPT` after cleanup. Every following field is required
+Write `INFERSSD_WRAPPER_RECEIPT` after cleanup. Every following field is required
 on success; hashes must be lowercase SHA-256. `evidence` paths are relative to
 the arm directory and must exist with matching hashes. Preserve the raw commands,
 server logs, actual library inspection, model identity and resource observations.

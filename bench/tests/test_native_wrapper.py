@@ -124,7 +124,7 @@ def test_same_inherited_lock_stays_held_through_child(tmp_path):
     path = tmp_path / "device.lock"
     with path.open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fd = common.inherited_lock({"SSDASH_LOCK_FD": str(lock.fileno())})
+        fd = common.inherited_lock({"INFERSSD_LOCK_FD": str(lock.fileno())})
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"],
                                    pass_fds=(fd,), start_new_session=True)
         try:
@@ -239,10 +239,10 @@ s.server_close()
 
 
 def arm_environment(out, profile, fd, tier="512", timeout="5"):
-    return {"SSDASH_RUN_DIR": str(out), "SSDASH_RESULT_PATH": str(out / "result.json"),
-            "SSDASH_WRAPPER_RECEIPT": str(out / "wrapper.json"), "SSDASH_TIER": tier,
-            "SSDASH_REQUEST_TIMEOUT": timeout, "SSDASH_DEVICE": "mock", "SSDASH_MODEL": "mock",
-            "SSDASH_REVISION": profile["revision"], "SSDASH_OUTPUT_TOKENS": "256", "SSDASH_LOCK_FD": str(fd)}
+    return {"INFERSSD_RUN_DIR": str(out), "INFERSSD_RESULT_PATH": str(out / "result.json"),
+            "INFERSSD_WRAPPER_RECEIPT": str(out / "wrapper.json"), "INFERSSD_TIER": tier,
+            "INFERSSD_REQUEST_TIMEOUT": timeout, "INFERSSD_DEVICE": "mock", "INFERSSD_MODEL": "mock",
+            "INFERSSD_REVISION": profile["revision"], "INFERSSD_OUTPUT_TOKENS": "256", "INFERSSD_LOCK_FD": str(fd)}
 
 
 def test_mock_two_tiers_use_fresh_owned_servers_one_completion_each(profile, tmp_path):

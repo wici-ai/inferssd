@@ -253,13 +253,13 @@ def run(config, output, lock_path, stop_path, *, order=ORDER, purpose="formal", 
                         arm_dir = output / tier
                         arm_dir.mkdir()
                         result_path, receipt_path = arm_dir / "result.json", arm_dir / "wrapper.json"
-                        env = dict(os.environ if environment is None else environment, SSDASH_RUN_ID=run_id, SSDASH_RUN_DIR=str(arm_dir),
-                                   SSDASH_RESULT_PATH=str(result_path), SSDASH_WRAPPER_RECEIPT=str(receipt_path),
-                                   SSDASH_TIER=tier, SSDASH_PROMPT_PATH=str(final_chat.prompt_path(tier)),
-                                   SSDASH_REQUEST_TIMEOUT=str(config["request_timeout_s"]),
-                                   SSDASH_OUTPUT_TOKENS="256", SSDASH_DEVICE=config["device"],
-                                   SSDASH_MODEL=config["model"], SSDASH_REVISION=config["revision"],
-                                   SSDASH_LOCK_FD=str(lock.fileno()))
+                        env = dict(os.environ if environment is None else environment, INFERSSD_RUN_ID=run_id, INFERSSD_RUN_DIR=str(arm_dir),
+                                   INFERSSD_RESULT_PATH=str(result_path), INFERSSD_WRAPPER_RECEIPT=str(receipt_path),
+                                   INFERSSD_TIER=tier, INFERSSD_PROMPT_PATH=str(final_chat.prompt_path(tier)),
+                                   INFERSSD_REQUEST_TIMEOUT=str(config["request_timeout_s"]),
+                                   INFERSSD_OUTPUT_TOKENS="256", INFERSSD_DEVICE=config["device"],
+                                   INFERSSD_MODEL=config["model"], INFERSSD_REVISION=config["revision"],
+                                   INFERSSD_LOCK_FD=str(lock.fileno()))
                         process, start = None, time.monotonic()
                         try:
                             with (arm_dir / "stdout.log").open("xb") as log:

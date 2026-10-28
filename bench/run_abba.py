@@ -125,8 +125,8 @@ def run(config, output, lock_path, stop_path, timeout):
                         arm_dir = output / f"{index + 1:02d}-{label}"
                         arm_dir.mkdir()
                         result_path = arm_dir / "result.json"
-                        env = dict(os.environ, SSDASH_ARM=label, SSDASH_RUN_ID=run_id,
-                                   SSDASH_RUN_DIR=str(arm_dir), SSDASH_RESULT_PATH=str(result_path))
+                        env = dict(os.environ, INFERSSD_ARM=label, INFERSSD_RUN_ID=run_id,
+                                   INFERSSD_RUN_DIR=str(arm_dir), INFERSSD_RESULT_PATH=str(result_path))
                         start = time.monotonic()
                         process = None
                         try:

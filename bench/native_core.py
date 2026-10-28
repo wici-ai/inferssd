@@ -17,7 +17,7 @@ API_VERSION = 1
 
 
 def load_core(manifest_path=None):
-    explicit = manifest_path or os.environ.get("SSDASH_NATIVE_CORE_MANIFEST")
+    explicit = manifest_path or os.environ.get("INFERSSD_NATIVE_CORE_MANIFEST")
     adjacent = Path(__file__).with_name("native-core.json")
     manifest_path = Path(explicit) if explicit else adjacent if adjacent.exists() else None
     loaded, identity = {}, {}

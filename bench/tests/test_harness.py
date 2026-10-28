@@ -28,7 +28,7 @@ driver = module("abba_driver", BENCH / "run_abba.py")
 def setup(tmp_path):
     arm = tmp_path / "arm.py"
     arm.write_text('''import json, os, pathlib, signal, sys, time
-out = pathlib.Path(os.environ['SSDASH_RUN_DIR'])
+out = pathlib.Path(os.environ['INFERSSD_RUN_DIR'])
 (out / 'pid').write_text(str(os.getpid()))
 mode = sys.argv[1]
 if mode == 'wait':
@@ -42,9 +42,9 @@ if mode == 'fail':
     raise SystemExit(9)
 if mode != 'missing':
     result = {'input_tokens': 614, 'output_tokens': 96, 'prompt_sha256': 'a' * 64,
-              'metrics': {'ttft_s': 1 if os.environ['SSDASH_ARM'] == 'A' else 2}}
+              'metrics': {'ttft_s': 1 if os.environ['INFERSSD_ARM'] == 'A' else 2}}
     if mode == 'wrong': result['input_tokens'] = 613
-    pathlib.Path(os.environ['SSDASH_RESULT_PATH']).write_text(json.dumps(result))
+    pathlib.Path(os.environ['INFERSSD_RESULT_PATH']).write_text(json.dumps(result))
 ''')
     config = {"protocol": {"input_tokens": 614, "output_tokens": 96, "prompt_sha256": "a" * 64},
               "arms": {label: {"revision": label * 40, "argv": [sys.executable, str(arm), "ok"]}
@@ -174,14 +174,14 @@ def test_successful_wrapper_with_orphan_fails_before_unlocking_or_next_arm(setup
     root, config = setup
     wrapper = root / "orphan-wrapper.py"
     wrapper.write_text('''import json, os, pathlib, subprocess, sys, time
-out = pathlib.Path(os.environ['SSDASH_RUN_DIR'])
+out = pathlib.Path(os.environ['INFERSSD_RUN_DIR'])
 subprocess.Popen([sys.executable, '-c',
     'import os, pathlib, signal, sys, time; '
     'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
     'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)',
     str(out / 'child.pid')])
 while not (out / 'child.pid').exists(): time.sleep(.01)
-pathlib.Path(os.environ['SSDASH_RESULT_PATH']).write_text(json.dumps({
+pathlib.Path(os.environ['INFERSSD_RESULT_PATH']).write_text(json.dumps({
     'input_tokens': 614, 'output_tokens': 96, 'prompt_sha256': 'a' * 64,
     'metrics': {'ttft_s': 1}}))
 ''')

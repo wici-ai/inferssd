@@ -50,7 +50,7 @@ F_INSITU, F_ONLINE = consumer("insitu"), consumer("online")
 def runtime_key():
     version = sys.version_info[:2]
     if version not in ((3, 9), (3, 12)):
-        pytest.skip("frozen F transcripts cover Python 3.9 and 3.12 only")
+        pytest.skip("recorded reference transcripts cover Python 3.9 and 3.12 only")
     return f"{version[0]}.{version[1]}"
 
 

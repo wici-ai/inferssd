@@ -160,8 +160,8 @@ def write_artifacts(directory, tier, config):
 def setup(tmp_path):
     script = tmp_path / "wrapper.py"
     script.write_text('''import os, pathlib, shutil, signal, sys, time
-out = pathlib.Path(os.environ['SSDASH_RUN_DIR'])
-source = pathlib.Path(sys.argv[1]) / os.environ['SSDASH_TIER']
+out = pathlib.Path(os.environ['INFERSSD_RUN_DIR'])
+source = pathlib.Path(sys.argv[1]) / os.environ['INFERSSD_TIER']
 for child in source.iterdir(): shutil.copyfile(child, out / child.name)
 if sys.argv[2] == 'wait':
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))

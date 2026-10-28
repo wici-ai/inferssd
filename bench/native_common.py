@@ -215,7 +215,7 @@ def verify_inputs(profile):
 
 
 def inherited_lock(environment):
-    fd = int(environment["SSDASH_LOCK_FD"])
+    fd = int(environment["INFERSSD_LOCK_FD"])
     if fd < 3 or not stat.S_ISREG(os.fstat(fd).st_mode):
         raise ValueError("an inherited regular-file device-lock descriptor is required")
     # The existing open-file-description is reused. Never open a second lock.

@@ -344,7 +344,7 @@ def observe(case, api=f_api):
 def runtime():
     key = f"{sys.version_info[0]}.{sys.version_info[1]}"
     if key not in ("3.9", "3.12"):
-        pytest.skip("F transcript verified on Python 3.9/3.12")
+        pytest.skip("recorded reference transcripts cover Python 3.9 and 3.12 only")
     return key
 
 

@@ -261,7 +261,7 @@ def test_loader_environment_only_restored_for_server():
     transported = owned.worker_environment(env)
     assert not any(k in transported for k in env if k not in ("PATH", "TOKEN"))
     restored = dict(transported)
-    restored.update(json.loads(restored.pop("SSDASH_INTERNAL_SERVER_ENV")))
+    restored.update(json.loads(restored.pop("INFERSSD_INTERNAL_SERVER_ENV")))
     assert restored == env
 
 

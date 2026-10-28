@@ -146,11 +146,11 @@ def guard_worker(argv, environment, lock_fd, deadline_s):
 def run_guardian(profile, environment, lock_fd):
     if sys.platform != "darwin":
         raise ValueError("Mac guardian requires Darwin")
-    path = Path(environment["SSDASH_RUN_DIR"]) / "guardian-profile.json"
+    path = Path(environment["INFERSSD_RUN_DIR"]) / "guardian-profile.json"
     common.save(path, profile)
     argv = [sys.executable, str(Path(__file__).resolve()), "--worker", "--profile", str(path)]
     return guard_worker(argv, environment, lock_fd,
-                        profile["load_timeout_s"] + float(environment["SSDASH_REQUEST_TIMEOUT"]) + 60)
+                        profile["load_timeout_s"] + float(environment["INFERSSD_REQUEST_TIMEOUT"]) + 60)
 
 
 def main():
@@ -162,13 +162,13 @@ def main():
     parser.add_argument("--lock-ino", type=int, required=True)
     args = parser.parse_args()
     lease = Lease(args.socket, expected_identity=(args.lock_dev, args.lock_ino))
-    environment = dict(os.environ, SSDASH_LOCK_FD=str(lease.fd))
+    environment = dict(os.environ, INFERSSD_LOCK_FD=str(lease.fd))
     try:
         import native_wrapper
         profile = common.validate_profile(json.loads(args.profile.read_text()))
-        return native_wrapper.run_native(profile, environment, MacRuntime(profile, Path(environment["SSDASH_RUN_DIR"])), lease.fd, lease)
+        return native_wrapper.run_native(profile, environment, MacRuntime(profile, Path(environment["INFERSSD_RUN_DIR"])), lease.fd, lease)
     finally:
-        path = Path(environment["SSDASH_WRAPPER_RECEIPT"])
+        path = Path(environment["INFERSSD_WRAPPER_RECEIPT"])
         while not cleanup_confirmed(path):
             common.save(path.parent / "worker-quarantine.json", {"pid": os.getpid(), "retaining_lock": True})
             time.sleep(1)

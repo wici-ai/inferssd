@@ -249,7 +249,7 @@ def test_frozen_oracle_identity():
 def test_frozen_prefill_completion(case):
     key = f"{sys.version_info.major}.{sys.version_info.minor}"
     if key not in GOLDENS["runtimes"]:
-        pytest.skip("No frozen transcript recorded for this Python minor version")
+        pytest.skip("recorded reference transcripts cover Python 3.9 and 3.12 only")
     assert observe(ORACLE, case) == case["expected"][key]
 
 

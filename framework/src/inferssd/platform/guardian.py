@@ -53,8 +53,8 @@ def guard_worker(
     common = effects
     spawn_extras: _SpawnExtras = {"pass_fds": pass_fds} if pass_fds else {}
     out, receipt_path = (
-        Path(environment["SSDASH_RUN_DIR"]),
-        Path(environment["SSDASH_WRAPPER_RECEIPT"]),
+        Path(environment["INFERSSD_RUN_DIR"]),
+        Path(environment["INFERSSD_WRAPPER_RECEIPT"]),
     )
     lease = LeaseServer(lock_fd) if lease_unit is None else LeaseServer(lock_fd, lease_unit)
     identity = os.fstat(lock_fd)

@@ -135,7 +135,7 @@ from pathlib import Path
 import native_macos as mac
 out=Path(sys.argv[1]); lock=(out/"device.lock").open("a+")
 fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-env=dict(os.environ,SSDASH_RUN_DIR=str(out),SSDASH_WRAPPER_RECEIPT=str(out/"receipt.json"))
+env=dict(os.environ,INFERSSD_RUN_DIR=str(out),INFERSSD_WRAPPER_RECEIPT=str(out/"receipt.json"))
 sys.exit(mac.guard_worker([sys.executable,sys.argv[2],"--out",str(out),"--mode",sys.argv[3]],env,lock.fileno(),20))
 '''
     env = dict(os.environ, PYTHONPATH=bench)
