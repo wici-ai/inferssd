@@ -51,7 +51,7 @@
       "ssd_interface": "PCIe Gen5 x4",
       "core_layout": "6 performance + 4 efficient",
       "storage_model": "ZHITAI TiPro9000",
-      "memory_configuration_note": "System memory corrected from 16 GB to 32 GB on 2026-10-28. Archived experiments also include a 13.98 GB process limit; those runs are not mapped to individual summary values."
+      "memory_configuration_note": "Archived experiments include a 13.98 GB process limit; those runs are not mapped to individual summary values."
     },
     {
       "hardware": "DGX Spark",
