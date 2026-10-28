@@ -232,6 +232,12 @@ class Session:
                 path.mkdir(mode=mode)
                 if name == "work":
                     os.chown(path, config["worker_uid"], config["worker_gid"])
+                    # The first alias/configure stage uses this exact side as
+                    # cwd, before candidate code can create any directories.
+                    for side in ("base", "candidate"):
+                        workspace = path / side
+                        workspace.mkdir(mode=0o700)
+                        os.chown(workspace, config["worker_uid"], config["worker_gid"])
             self.evidence = core.BASE / "evidence" / job_id
             self.evidence.mkdir(mode=0o700)
             self.started = time.monotonic()

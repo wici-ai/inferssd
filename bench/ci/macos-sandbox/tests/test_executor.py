@@ -1,9 +1,11 @@
 """Portable contract/file-sealing checks; never claimed as native isolation proof."""
+from contextlib import ExitStack
 import os
 from pathlib import Path
 import tempfile
 import unittest
 import sys
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE))
@@ -143,6 +145,89 @@ class ContractTests(unittest.TestCase):
         request['stage_id'] = 'server'
         with self.assertRaisesRegex(ValueError, 'another job/stage'):
             session.check_handle(request)
+
+
+class FreshSideWorkspaceTests(unittest.TestCase):
+    """Exercise the real job initialization before its first alias/build RPC."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        for name in ('jobs', 'evidence', 'public'):
+            (self.root / name).mkdir()
+        for name in ('worker.sb', 'server.sb'):
+            (self.root / 'public' / name).write_text('(version 1)\n(deny default)\n')
+        self.config = {'worker_uid': 62002, 'worker_gid': 62002,
+                       'stop': str(self.root / 'STOP'),
+                       'lock_dev_inode': [1, 2],
+                       'tools': {'clt': '/Library/Developer/CommandLineTools'},
+                       'executor': {'max_stage_seconds': 60, 'max_processes': 128}}
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        self.chown = stack.enter_context(patch.object(executor.os, 'chown'))
+        stack.enter_context(patch.object(executor.core, 'BASE', self.root))
+        stack.enter_context(patch.object(executor.core, 'members', return_value=[]))
+        stack.enter_context(patch.object(executor, 'job_manifest', return_value={
+            'input_roots': [], 'model_roots': [], 'manifest_sha256': 'a' * 64}))
+        lease = self.root / 'original.lock'
+        lease.touch()
+        stack.enter_context(patch.object(executor.core, 'lease', side_effect=lambda _: os.open(lease, os.O_RDONLY)))
+        self.session = executor.Session(self.config, None, '1' * 32)
+        self.addCleanup(self.session.close)
+
+    def request(self, side):
+        return {'schema_version': 1, 'job_id': self.session.job.name,
+                'operation': 'stage.start', 'stage_id': side + '-alias',
+                'kind': 'build', 'argv': ['/usr/bin/true'], 'environment': {},
+                'cwd': str(self.session.job / 'work' / side), 'timeout_s': 30}
+
+    def test_first_alias_reaches_spawn_in_both_fresh_side_workspaces(self):
+        for side in ('base', 'candidate'):
+            with self.subTest(side=side):
+                path = self.session.job / 'work' / side
+                # Reaching Popen proves the actual first stage request passed
+                # cwd validation; no candidate or native process is executed.
+                with patch.object(executor.subprocess, 'Popen', side_effect=RuntimeError('spawn reached')) as spawn:
+                    with self.assertRaisesRegex(RuntimeError, '^spawn reached$'):
+                        self.session.dispatch(self.request(side))
+                    spawn.assert_called_once()
+                    self.assertEqual(spawn.call_args.kwargs['preexec_fn'].__name__, 'drop')
+                self.assertTrue(path.is_dir())
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+                self.chown.assert_any_call(path, 62002, 62002)
+                self.assertIsNone(self.session.stage)
+                self.assertEqual(self.session.records, {})
+
+    def test_missing_unreviewed_cwd_is_not_created(self):
+        request = self.request('other')
+        with patch.object(executor.subprocess, 'Popen') as spawn:
+            with self.assertRaisesRegex(ValueError, 'missing controlled path'):
+                self.session.dispatch(request)
+            spawn.assert_not_called()
+        self.assertFalse(Path(request['cwd']).exists())
+
+    def test_missing_side_reproduces_retained_refusal_without_starting_worker(self):
+        path = self.session.job / 'work' / 'base'
+        path.rmdir()
+        with patch.object(executor.subprocess, 'Popen') as spawn:
+            with self.assertRaisesRegex(ValueError, '^missing controlled path$'):
+                self.session.dispatch(self.request('base'))
+            spawn.assert_not_called()
+        self.assertFalse(path.exists())
+
+    def test_side_symlink_and_cross_job_cwd_still_rejected(self):
+        path = self.session.job / 'work' / 'base'
+        path.rmdir()
+        path.symlink_to(self.root, target_is_directory=True)
+        with patch.object(executor.subprocess, 'Popen') as spawn:
+            with self.assertRaisesRegex(ValueError, 'symlink'):
+                self.session.dispatch(self.request('base'))
+            request = self.request('candidate')
+            request['cwd'] = str(self.root / 'jobs' / ('2' * 32))
+            with self.assertRaisesRegex(ValueError, 'outside this job'):
+                self.session.dispatch(request)
+            spawn.assert_not_called()
 
 
 if __name__ == '__main__':
