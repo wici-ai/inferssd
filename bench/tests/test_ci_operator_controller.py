@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+import urllib.error
 
 import pytest
 
@@ -507,8 +508,84 @@ def test_summary_shows_both_decode_windows_signed_percent_and_ttft_direction():
     assert "0–128 base tok/s" in text and "128–256 base tok/s" in text
     assert "+10.000%" in text and "-10.000%" in text and "lower TTFT is better" in text
     assert "Request TTFT seconds" in text and "Native prefill tok/s" in text and "Whole decode tok/s" in text
-    assert "Declared Linux scope: **inconclusive**" in text and "deferred tiers: 4096" in text
+    assert "Declared device scope: **inconclusive**" in text and "deferred tiers: 4096" in text
     assert "template IDs SHA" in text and "conditions/settings SHA" in text and "0/16" in text
+
+
+@pytest.mark.parametrize("devices", [["local-mbp"], ["cloud-5090", "local-mbp"], ["cloud-5090"]])
+def test_summary_describes_mac_footprint_protection_and_diagnostic_rss(devices):
+    report = dict(passed=True, full_impact_coverage_complete=False,
+                  execution_devices=devices, cells=[])
+    stream = io.StringIO()
+    controller.operator_summary(stream, report)
+    text = stream.getvalue()
+    if "local-mbp" in devices:
+        assert "Mac memory protection monitors worker physical footprint/process count and host reserve" in text
+        assert "RSS is diagnostic only" in text
+        assert "does not disable swap or provide a Linux memory.max hard cap" in text
+    else:
+        assert "Mac memory protection" not in text
+        assert "RSS" not in text
+    assert "worker RSS/process count" not in text
+
+
+@pytest.mark.parametrize("slowdown,flagged", [(False, False), (True, False), (False, True), (True, True)])
+def test_summary_renders_mac_gate_environment_without_excusing_slowdown(slowdown, flagged):
+    from ci import mac_host_gate
+
+    metrics = {name: dict(base=10, candidate=9 if slowdown else 11,
+                         change_percent=-10 if slowdown else 10) for name in compare.METRICS}
+    metrics["ttft_s"] = dict(base=2, candidate=1.8, change_percent=-10)
+    measured = dict(tier="512", status="inconclusive" if slowdown else "passed", passed=not slowdown,
+        metrics=metrics, observed_slowdowns=["decode_tps"] if slowdown else [])
+    base = dict(schema_version=1, policy=dict(pair_free_tolerance_bytes=1 << 30),
+        quiet=dict(status="passed"), cleanup=dict(status="passed"),
+        prelaunch_free_inactive_bytes=38 * (1 << 30) + (1 << 29),
+        timed=dict(status="passed", reasons=[], swap_delta_bytes=0, compression_delta_bytes=2 << 20,
+            process_activity=dict(non_ci_cpu_cores=0.125), memory_pressure_levels=[1, 1]))
+    candidate = copy.deepcopy(base)
+    candidate["prelaunch_free_inactive_bytes"] = 38 << 30
+    candidate["timed"].update(status="flagged" if flagged else "passed",
+        reasons=["swap-activity|<diagnosis>\nretain"] if flagged else [], swap_delta_bytes=3 << 20,
+        compression_delta_bytes=80 << 20, process_activity=dict(non_ci_cpu_cores=0.375),
+        memory_pressure_levels=[1, 2])
+    pair = mac_host_gate.pair(measured, base, candidate)
+    original = copy.deepcopy(pair)
+    report = dict(passed=pair["passed"], status=pair["status"], full_impact_coverage_complete=False,
+        execution_devices=["local-mbp"], cells=[dict(device="local-mbp", model="muse", status=pair["status"],
+            functional="passed", numerical="passed", performance=[pair])])
+    stream = io.StringIO()
+    controller.operator_summary(stream, report)
+    text = stream.getvalue()
+    assert "Quiet free+inactive GiB" in text and "Timed swap Δ MiB" in text and "Timed compression Δ MiB" in text
+    assert "Non-CI CPU cores" in text
+    assert "| muse | 512 | base | 38.5000 | 0.0000 | 2.0000 | 0.1250 | 1 → 1 | passed |" in text
+    assert "| muse | 512 | candidate | 38.0000 | 3.0000 | 80.0000 | 0.3750 | 1 → 2 |" in text
+    if flagged:
+        assert "muse/512 environment: inconclusive; reasons: candidate:swap-activity\\|&lt;diagnosis&gt; retain." in text
+        assert "<diagnosis>" not in text
+    else:
+        assert "muse/512 environment: passed; reasons: none." in text
+    if slowdown or flagged:
+        assert "Declared device scope: **inconclusive**" in text
+    else:
+        assert "Declared device scope: **passed**" in text
+    if slowdown:
+        assert "| 10.0000 | 9.0000 | -10.000% |" in text
+    assert "Swap and pressure may be model-induced" in text
+    assert "do not establish external interference, excuse measured slowdowns, or trigger automatic retries" in text
+    assert pair == original and pair["observed_slowdowns"] == measured["observed_slowdowns"]
+
+
+def test_summary_does_not_render_missing_mac_environment_as_zero_or_passed():
+    report = dict(passed=False, status="failed", full_impact_coverage_complete=False,
+        execution_devices=["local-mbp"], cells=[dict(device="local-mbp", model="deepseek", status="failed",
+            functional="passed", numerical="passed", performance=[dict(tier="512", status="failed")])])
+    stream = io.StringIO()
+    controller.operator_summary(stream, report)
+    text = stream.getvalue()
+    assert "| deepseek | 512 | base | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |" in text
+    assert "deepseek/512 environment: unavailable; reasons: missing environment evidence." in text
 
 
 @pytest.fixture
@@ -686,3 +763,224 @@ def test_cancel_reentry_does_not_trust_a_prior_receipt_for_another_run(operator)
     assert controller.cancel_children(a.args, a.env) == 1
     recheck = load(next(a.args.artifacts.glob("cancellation-recheck-*.json")))
     assert recheck["results"]["cloud-5090-dispatch.json"]["prior_outcome_unknown"] is True
+
+
+class MetadataAPI:
+    def __init__(self, runs):
+        self.runs, self.calls = list(runs), []
+
+    def call(self, path, data=None, method=None):
+        self.calls.append((path, data, method))
+        if method == "POST":
+            return None
+        assert path == "actions/runs/73" and data is None
+        value = self.runs.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return copy.deepcopy(value)
+
+
+def metadata_observer(a, runs):
+    a.args.artifacts.mkdir(exist_ok=True)
+    child = dict(id=73, workflow_id=91, controller_sha=a.env["GITHUB_SHA"], job_id="f" * 32)
+    api, pauses, now = MetadataAPI(runs), [], [0]
+    def sleep(seconds):
+        pauses.append(seconds)
+        now[0] += seconds
+    observed = controller.ChildMetadataAPI(api, child, a.args.artifacts, "test",
+                                          sleep=sleep, clock=lambda: now[0])
+    return observed, api, pauses
+
+
+@pytest.mark.parametrize("title", [None, "", "InferSSD reviewed integration smoke"])
+@pytest.mark.parametrize("status", ["queued", "requested"])
+def test_child_metadata_pending_title_requires_later_full_identity_and_retains_every_get(operator, title, status):
+    a = operator
+    pending = dict(a.child, display_title=title, status=status, conclusion=None)
+    expected = dict(a.child, name="a workflow label is not the run title", actor={"login": "github-actions[bot]"})
+    observed, api, pauses = metadata_observer(a, [pending, expected])
+    assert observed.call("actions/runs/73") == expected
+    rows = [load(path) for path in sorted(a.args.artifacts.glob("child-metadata-*.json"))]
+    assert [row["run"] for row in rows] == [pending, expected]
+    assert rows[0]["differences"] == {"display_title": dict(expected=a.child["display_title"], actual=title)}
+    assert rows[0]["pending_title"] is True and rows[1]["differences"] == {}
+    assert rows[1]["pending_title"] is False and pauses == [2]
+    assert api.calls == [("actions/runs/73", None, None)] * 2
+
+
+@pytest.mark.parametrize("field,value", [("id", 74), ("workflow_id", 92), ("workflow_id", True),
+    ("path", ".github/workflows/other.yml"), ("event", "push"), ("head_branch", "other"),
+    ("head_sha", "0" * 40), ("run_attempt", 2), ("run_attempt", True),
+    ("display_title", "integration-" + "e" * 32), ("display_title", "unknown title"),
+    ("display_title", " ")])
+def test_child_metadata_definite_identity_mismatch_fails_without_wait_or_post(operator, field, value):
+    a = operator
+    run = dict(a.child, status="queued", conclusion=None, display_title="")
+    run[field] = value
+    observed, api, pauses = metadata_observer(a, [run])
+    with pytest.raises(ValueError, match="identity differs"):
+        controller.selection_dispatch.cancel(observed, observed.child)
+    row = load(next(a.args.artifacts.glob("child-metadata-*.json")))
+    assert row["run"] == run and field in row["differences"] and row["pending_title"] is False
+    assert len(api.calls) == 1 and pauses == []
+
+
+@pytest.mark.parametrize("status,conclusion", [("in_progress", None), ("completed", "failure"),
+    ("completed", "success"), ("queued", "failure"), ("waiting", None)])
+def test_child_metadata_generic_title_is_not_pending_after_execution_or_conclusion(operator, status, conclusion):
+    a = operator
+    observed, api, pauses = metadata_observer(a, [dict(a.child, status=status, conclusion=conclusion,
+                                                      display_title="InferSSD reviewed integration smoke")])
+    with pytest.raises(ValueError, match="identity differs"):
+        observed.call("actions/runs/73")
+    assert len(api.calls) == 1 and pauses == []
+
+
+def test_child_metadata_observation_is_finite_and_never_accepts_placeholder(operator):
+    a = operator
+    pending = dict(a.child, status="queued", conclusion=None, display_title=None)
+    observed, api, pauses = metadata_observer(a, [pending] * 6)
+    with pytest.raises(TimeoutError, match="finite observation"):
+        controller.selection_dispatch.cancel(observed, observed.child)
+    assert len(api.calls) == len(list(a.args.artifacts.glob("child-metadata-*.json"))) == 6
+    assert pauses == [2] * 5
+
+
+def test_child_metadata_missing_immutable_field_and_transport_error_do_not_retry(operator):
+    a = operator
+    run = dict(a.child, status="queued", conclusion=None, display_title="")
+    del run["head_sha"]
+    observed, api, pauses = metadata_observer(a, [run])
+    with pytest.raises(ValueError, match="head_sha"):
+        observed.call("actions/runs/73")
+    assert len(api.calls) == 1 and pauses == []
+    observed, api, pauses = metadata_observer(a, [OSError("synthetic transport failure")])
+    with pytest.raises(OSError, match="transport"):
+        observed.call("actions/runs/73")
+    assert len(api.calls) == 1 and pauses == []
+
+
+def test_child_metadata_cancel_posts_once_only_after_exact_observed_identity(operator, monkeypatch):
+    a = operator
+    child = cancellation_dispatch(a)
+    pending = dict(a.child, status="queued", conclusion=None, display_title="")
+    exact = dict(a.child, status="in_progress", conclusion=None)
+    api = MetadataAPI([pending, exact, dict(a.child)])
+    monkeypatch.setattr(controller, "API", lambda *args, **kwargs: api)
+    monkeypatch.setattr(controller.time, "sleep", lambda _: None)
+    assert controller.cancel_children(a.args, a.env) == 1
+    original = (a.args.artifacts / "cancellation-requests.json").read_bytes()
+    assert load(a.args.artifacts / "cancellation-cloud-5090-dispatch-attempt.json")["child_sha256"] == impact.fingerprint(child)
+    assert controller.cancel_children(a.args, a.env) == 0
+    assert (a.args.artifacts / "cancellation-requests.json").read_bytes() == original
+    assert api.calls == [("actions/runs/73", None, None)] * 2 + [
+        ("actions/runs/73/cancel", {}, "POST"), ("actions/runs/73", None, None)]
+    assert len(list(a.args.artifacts.glob("child-metadata-*.json"))) == 3
+
+
+def test_child_metadata_snapshot_failure_cannot_authorize_cancel(operator, monkeypatch):
+    observed, api, _ = metadata_observer(operator, [operator.child])
+    monkeypatch.setattr(controller, "save", lambda *args: (_ for _ in ()).throw(OSError("snapshot storage failed")))
+    with pytest.raises(OSError, match="snapshot storage"):
+        controller.selection_dispatch.cancel(observed, observed.child)
+    assert api.calls == [("actions/runs/73", None, None)]
+
+
+def test_child_metadata_wait_uses_returned_id_without_redispatch(operator):
+    a = operator
+    pending = dict(a.child, status="queued", conclusion=None, display_title="")
+    observed, api, pauses = metadata_observer(a, [pending, a.child])
+    assert controller.selection_dispatch.wait(observed, observed.child) == a.child
+    assert api.calls == [("actions/runs/73", None, None)] * 2 and pauses == [2]
+
+
+def test_child_metadata_does_not_retry_an_ambiguous_post(operator):
+    observed, api, pauses = metadata_observer(operator, [operator.child])
+    with pytest.raises(ValueError, match="fully observed exact identity"):
+        observed.call("actions/runs/73/cancel", {}, method="POST")
+    assert api.calls == []
+    observed.call("actions/runs/73")
+    def failed_post(path, data=None, method=None):
+        api.calls.append((path, data, method))
+        raise OSError("ambiguous write")
+    api.call = failed_post
+    with pytest.raises(OSError, match="ambiguous write"):
+        observed.call("actions/runs/73/cancel", {}, method="POST")
+    assert api.calls == [("actions/runs/73", None, None), ("actions/runs/73/cancel", {}, "POST")] and pauses == []
+
+
+@pytest.mark.parametrize("wrong_job", [False, True])
+def test_real_canonical_get_retry_keeps_child_identity_and_every_successful_snapshot(
+    operator, monkeypatch, capsys, wrong_job
+):
+    a = operator
+    a.args.artifacts.mkdir(exist_ok=True)
+    now, pauses, calls = [100.0], [], []
+
+    def sleep(seconds):
+        pauses.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(controller.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(controller.time, "sleep", sleep)
+    pending = dict(a.child, status="queued", conclusion=None,
+                   display_title="InferSSD reviewed integration smoke")
+    exact = dict(a.child, status="queued", conclusion=None)
+    if wrong_job:
+        exact["display_title"] = "integration-" + "e" * 32
+    replies = [pending, 500, exact]
+    canonical = controller.private_controller
+
+    def open_request(request, *, timeout):
+        assert request.get_method() == "GET" and request.data is None
+        calls.append(timeout)
+        value = replies.pop(0)
+        if value == 500:
+            raise urllib.error.HTTPError(request.full_url, 500, "never-log", {}, None)
+        return io.BytesIO(json.dumps(value).encode())
+
+    monkeypatch.setattr(canonical.urllib.request, "urlopen", open_request)
+    child = dict(id=73, workflow_id=91, controller_sha=a.env["GITHUB_SHA"], job_id="f" * 32)
+    api = canonical.API(POLICY["controller_repository"], "never-log-secret")
+    observed = controller.ChildMetadataAPI(api, child, a.args.artifacts, "test")
+    if wrong_job:
+        with pytest.raises(ValueError, match="identity differs"):
+            observed.call("actions/runs/73")
+        assert observed.identity_confirmed is False
+    else:
+        assert observed.call("actions/runs/73") == exact
+        assert observed.identity_confirmed is True
+    assert calls == [10, 8, 7.75] and pauses == [2, .25]
+    snapshots = [load(path) for path in sorted(a.args.artifacts.glob("child-metadata-*.json"))]
+    assert [row["run"] for row in snapshots] == [pending, exact]
+    rows = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    assert [row["decision"] for row in rows] == ["return", "retry", "return"]
+    assert rows[1]["http_status"] == 500
+    assert "never-log" not in json.dumps(rows)
+
+
+def test_real_child_get_cannot_extend_the_ten_second_title_budget(operator, monkeypatch):
+    a = operator
+    a.args.artifacts.mkdir(exist_ok=True)
+    now, calls = [100.0], []
+    monkeypatch.setattr(controller.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(controller.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+    canonical = controller.private_controller
+    pending = dict(a.child, status="queued", conclusion=None, display_title="")
+
+    def open_request(request, *, timeout):
+        calls.append(timeout)
+        if len(calls) == 1:
+            return io.BytesIO(json.dumps(pending).encode())
+        now[0] += timeout
+        raise TimeoutError("synthetic read timeout")
+
+    monkeypatch.setattr(canonical.urllib.request, "urlopen", open_request)
+    child = dict(id=73, workflow_id=91, controller_sha=a.env["GITHUB_SHA"], job_id="f" * 32)
+    observed = controller.ChildMetadataAPI(canonical.API(POLICY["controller_repository"], "synthetic"),
+                                          child, a.args.artifacts, "test")
+    with pytest.raises(TimeoutError):
+        observed.call("actions/runs/73")
+    assert calls == [10, 8] and now[0] == 110
+    assert observed.identity_confirmed is False
+    assert len(list(a.args.artifacts.glob("child-metadata-*.json"))) == 1

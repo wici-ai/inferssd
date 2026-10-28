@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -46,6 +47,27 @@ def protected(path, executable=False):
     info = path.stat()
     if not stat.S_ISREG(info.st_mode) or executable and not info.st_mode & 0o111:
         raise ValueError("broker/proof must be a regular file of the required type")
+    return path
+
+
+def manifest_read_path(config):
+    """Selected Mac runners read one fixed copy; all legacy paths stay unchanged."""
+    logical = config["manifest_path"]
+    if config.get("paths", {}).get("platform") != "darwin" or config.get("purpose") != "selected-integration":
+        return Path(logical)
+    match = re.fullmatch(r"/Library/InferSSD-CI/private/job-manifests/([0-9a-f]{32})\.json", logical) if isinstance(logical, str) else None
+    if match is None:
+        raise ValueError("Mac manifest read view requires the exact private job identity")
+    return Path("/Library/InferSSD-CI/inputs/operator-" + match[1] + "/manifest.json")
+
+
+def protected_manifest(config):
+    path = protected(manifest_read_path(config))
+    if (config.get("paths", {}).get("platform") == "darwin" and config.get("purpose") == "selected-integration"
+            and path.stat().st_mode & 0o222):
+        raise ValueError("Mac runner manifest copy must be root-owned and readonly")
+    if digest(path) != config["manifest_sha256"]:
+        raise ValueError("root broker manifest hash differs")
     return path
 
 

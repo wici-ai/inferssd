@@ -4,8 +4,11 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -13,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from ci.compare import aggregate
+from ci import read_retry
 from ci.contract import (
     DEVICES,
     HASH,
@@ -32,7 +36,7 @@ class API:
         self.version = version
         self.timeout = timeout
 
-    def call(self, path, data=None, method=None):
+    def call(self, path, data=None, method=None, *, deadline=None):
         request = urllib.request.Request(
             "https://api.github.com/repos/"
             + self.repository
@@ -45,9 +49,65 @@ class API:
             },
             method=method,
         )
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            raw = response.read()
-            return json.loads(raw) if raw else None
+        if request.get_method() != "GET" or data is not None:
+            # An ambiguous dispatch/cancel/write response must never be replayed.
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read()
+                return json.loads(raw) if raw else None
+        if (type(self.timeout) not in (int, float) or not math.isfinite(self.timeout)
+                or self.timeout <= 0 or (deadline is not None and (
+                    type(deadline) not in (int, float) or not math.isfinite(deadline)))):
+            raise ValueError("finite positive GET scheduling budget required")
+        started = time.monotonic()
+        deadline = min(started + self.timeout, deadline) if deadline is not None else started + self.timeout
+
+        def observe(attempt, category, status, decision):
+            # Fixed metadata only. Never serialize URLs, tokens, response bodies,
+            # headers or exception text into the hosted log.
+            print(json.dumps(dict(schema_version=1, method="GET",
+                endpoint_class=read_retry.endpoint_label(path), attempt=attempt,
+                category=category, http_status=status, decision=decision,
+                elapsed_ms=max(0, round((time.monotonic() - started) * 1000))),
+                sort_keys=True), file=sys.stderr, flush=True)
+
+        for attempt in range(1, read_retry.MAX_ATTEMPTS + 1):
+            timeout = read_retry.attempt_timeout(deadline, time.monotonic())
+            if timeout is None or timeout <= 0:
+                observe(attempt, "budget-exhausted", None, "raise")
+                raise TimeoutError("GET scheduling budget exhausted")
+            try:
+                # urllib's timeout is socket inactivity, not a hard total wall
+                # deadline against a peer that keeps slowly delivering bytes.
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("GET scheduling budget exhausted after open")
+                    raw = response.read()
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("GET scheduling budget exhausted after read")
+                    value = json.loads(raw) if raw else None
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("GET scheduling budget exhausted after JSON")
+                    status = getattr(response, "status", None)
+            except Exception as error:
+                category, status, retryable = read_retry.classify_exception(error)
+                if isinstance(error, urllib.error.HTTPError):
+                    error.close()
+                delay = (read_retry.retry_delay(attempt, deadline, time.monotonic())
+                         if retryable and attempt < read_retry.MAX_ATTEMPTS else None)
+                observe(attempt, category, status, "retry" if delay is not None else "raise")
+                if delay is None:
+                    raise
+                # Diagnostics and sleeps consume the same finite call budget.
+                if time.monotonic() + delay >= deadline:
+                    observe(attempt, "budget-exhausted", None, "raise")
+                    raise
+                time.sleep(delay)
+                if time.monotonic() >= deadline:
+                    observe(attempt, "budget-exhausted", None, "raise")
+                    raise
+            else:
+                observe(attempt, "success", status, "return")
+                return value
 
 
 def context(policy, env, event):

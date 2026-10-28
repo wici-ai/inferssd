@@ -15,6 +15,7 @@ import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci.contract import load, save
+from ci import mac_host_gate
 from ci.stage_session import StageSession
 from ci.staged_chat import NativeHTTP
 from ci.staged_benchmark import verify_stopped
@@ -29,8 +30,10 @@ def collect_log(session, stage, output):
                 target.write(data)
                 if offset > 64 * 1024 * 1024:
                     raise ValueError("native smoke log bound exceeded")
-                if eof or not data:
+                if eof:
                     break
+                if not data:
+                    raise ValueError("stopped smoke output did not reach EOF")
 
 
 
@@ -46,15 +49,23 @@ def host_memory(output, name):
     save(output / name, dict(platform="darwin", monotonic_ns=time.monotonic_ns(), **values))
 
 
-def smoke(session, config, output, *, stage_id="candidate-smoke"):
+def smoke(session, config, output, *, stage_id="candidate-smoke", host_policy=None):
     """The manifest independently fixes source/models/argv admission and lease."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     result = dict(schema_version=1, purpose="integration-smoke", model=config["model"],
                   revision=config["revision"], status="failed", benchmark_samples=0,
-                  performance_acceptance=False, output_tokens=8)
+                  performance_acceptance=False, output_tokens=8, completion_requests=0)
+    def capture_host(phase):
+        if host_policy is not None:
+            mac_host_gate.capture(output, "host-state-" + phase + ".json")
+        else:
+            host_memory(output, "host-memory-" + phase + ".json")
+
     stage = None
     try:
+        if host_policy is not None:
+            mac_host_gate.before_launch(output, host_policy)
         stage = session.start(stage_id, "server", config["argv"],
                               config["environment"], config["cwd"], config["timeout_s"])
         save(output / "started.json", stage.__dict__)
@@ -77,7 +88,7 @@ def smoke(session, config, output, *, stage_id="candidate-smoke"):
             time.sleep(0.2)
         before = session.call(stage, "stage.probe", port=config["port"])
         save(output / "runtime-before.json", before)
-        host_memory(output, "host-memory-before-request.json")
+        capture_host("before-request")
         chat = {"messages": [{"role": "user", "content": "Say hello in one short sentence."}],
                 "chat_template_kwargs": {"enable_thinking": False}, "reasoning_effort": "none"}
         templated = http.json("POST", "/apply-template", chat, 10)
@@ -91,13 +102,14 @@ def smoke(session, config, output, *, stage_id="candidate-smoke"):
                     samplers=["top_k"], seed=0, ignore_eos=True, cache_prompt=False,
                     return_tokens=True)
         save(output / "request.json", body)
+        result["completion_requests"] = 1
         response = http.json("POST", "/completion", body, config["request_timeout_s"])
         save(output / "response.json", response)
         if response.get("tokens_predicted") != 8 or response.get("truncated") is not False or response.get("stop_type") != "limit":
             raise ValueError("native completion did not finish the eight-token smoke")
         after = session.call(stage, "stage.probe", port=config["port"])
         save(output / "runtime-after.json", after)
-        host_memory(output, "host-memory-after-request.json")
+        capture_host("after-request")
         for key in ("worker_pid", "worker_uid", "birth_identity", "scope_identity"):
             if before.get(key) != after.get(key) or before.get(key) != getattr(stage, key):
                 raise ValueError("native runtime identity changed during smoke")
@@ -112,7 +124,7 @@ def smoke(session, config, output, *, stage_id="candidate-smoke"):
                 collect_log(session, stage, output)
                 result["stop_classification"] = verify_stopped(stopped)
                 result["cleanup_confirmed"] = True
-                host_memory(output, "host-memory-after-cleanup.json")
+                capture_host("after-cleanup")
             except Exception as error:
                 result.update(status="failed", cleanup_error=f"{type(error).__name__}: {error}")
         save(output / "smoke.json", result)

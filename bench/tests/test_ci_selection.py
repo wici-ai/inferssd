@@ -30,7 +30,7 @@ def template(value, device='cloud-5090'):
         targets = sorted({impact.CASES[c][0] for c in needs['numerical']})
         sides[side] = dict(revision=value[side], paths=dict(platform='linux', source='/source/'+side,
             build='/scratch/'+side, cwd='/scratch/'+side, frozen='/build/'+side),
-            build=dict(cmake='/usr/bin/cmake', targets=['llama-server', *targets],
+            build=dict(cmake='/usr/bin/cmake', cmake_flags=[], targets=['llama-server', *targets],
                        binary_relative='bin/llama-server', image_relatives=['bin/'+t for t in targets]),
             models={m: dict(smoke=dict(model=m, cwd='/scratch'),
                 benchmarks={t: dict(cwd='/scratch') for t in needs['performance'].get(m, {}).get('tiers', [])})

@@ -6,6 +6,7 @@ candidate Python, configuration, or results into the privileged interpreter.
 """
 import base64
 import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -26,6 +27,15 @@ IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}\Z")
 JOB_ID = re.compile(r"[0-9a-f]{32}\Z")
 ENV_KEYS = frozenset(("LANG", "LC_ALL", "TZ", "CMAKE_BUILD_PARALLEL_LEVEL", "CTEST_PARALLEL_LEVEL"))
 MAX_REQUEST = 1024 * 1024
+MEMORY_METRIC = "physical-footprint"
+
+
+class RusageInfoV0(ctypes.Structure):
+    """Stable macOS 10.9+ libproc ABI from sys/resource.h (96 bytes)."""
+    _fields_ = [("ri_uuid", ctypes.c_uint8 * 16)] + [(name, ctypes.c_uint64) for name in (
+        "ri_user_time", "ri_system_time", "ri_pkg_idle_wkups", "ri_interrupt_wkups",
+        "ri_pageins", "ri_wired_size", "ri_resident_size", "ri_phys_footprint",
+        "ri_proc_start_abstime", "ri_proc_exit_abstime")]
 
 
 class Shutdown(BaseException):
@@ -73,7 +83,7 @@ def peer_identity(peer):
     return uid.value, gid.value
 
 
-def birth(pid):
+def birth(pid, *, include_exited=False):
     """Kernel process start time, independent of candidate /proc-like output."""
     # PROC_PIDTBSDINFO=3, struct proc_bsdinfo (Darwin libproc.h).
     class Info(ctypes.Structure):
@@ -93,10 +103,66 @@ def birth(pid):
     function.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int)
     function.restype = ctypes.c_int
     info = Info()
-    size = function(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
-    if size != ctypes.sizeof(info) or info.pid != pid:
-        raise ProcessLookupError(pid)
+    ctypes.set_errno(0)
+    # PROC_PIDTBSDINFO's nonzero argument includes zombies, allowing memory
+    # accounting to validate their UID/birth before excluding cached rusage.
+    size = function(pid, 3, int(include_exited), ctypes.byref(info), ctypes.sizeof(info))
+    if size != ctypes.sizeof(info):
+        error = ctypes.get_errno()
+        if error == errno.ESRCH:
+            raise ProcessLookupError(error, "proc_pidinfo: " + str(pid))
+        if error:
+            raise OSError(error, "proc_pidinfo: " + str(pid))
+        raise RuntimeError("incomplete proc_pidinfo: " + str(pid))
+    require(info.pid == pid, "kernel process identity differs")
     return {"pid": pid, "uid": info.uid, "start_sec": info.start_sec, "start_usec": info.start_usec}
+
+
+def process_memory(pid):
+    """Read kernel accounting, including Metal and compressed private pages."""
+    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    function = library.proc_pid_rusage
+    function.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+    function.restype = ctypes.c_int
+    usage = RusageInfoV0()
+    ctypes.set_errno(0)
+    if function(pid, 0, ctypes.byref(usage)) != 0:
+        error = ctypes.get_errno()
+        if error:
+            raise OSError(error, "proc_pid_rusage: " + str(pid))
+        raise RuntimeError("proc_pid_rusage failed without errno: " + str(pid))
+    require(usage.ri_proc_start_abstime > 0, "missing kernel rusage process start")
+    return dict(physical_footprint_bytes=usage.ri_phys_footprint,
+                resident_bytes=usage.ri_resident_size, start_abstime=usage.ri_proc_start_abstime,
+                exit_abstime=usage.ri_proc_exit_abstime)
+
+
+def worker_memory(active, uid):
+    """Account each live worker without changing the cleanup UID inventory."""
+    samples, exited = [], []
+    for member in active:
+        pid = member["pid"]
+        try:
+            before = birth(pid, include_exited=True)
+            require(before["uid"] == uid, "memory sample worker UID differs")
+            usage = process_memory(pid)
+            after = birth(pid, include_exited=True)
+            require(before == after, "memory sample worker PID reused")
+        except ProcessLookupError:
+            # ESRCH alone is not enough: confirm the PID has left the dedicated
+            # UID. A new/reused worker remains unknown and must fail closed.
+            require(not any(row["pid"] == pid for row in core.members(uid)),
+                    "memory sample disappeared but worker PID remains inventoried")
+            exited.append(pid)
+            continue
+        if usage["exit_abstime"]:
+            # libproc serves cached rusage for zombies; it is not live memory.
+            exited.append(pid)
+            continue
+        samples.append(dict(member, birth_identity=before, **usage))
+    return dict(memory_metric=MEMORY_METRIC, physical_footprint_bytes=sum(
+        row["physical_footprint_bytes"] for row in samples), memory_members=samples,
+        memory_exited_pids=exited)
 
 
 def copy_frozen(source, destination, max_bytes):
@@ -232,6 +298,12 @@ class Session:
                 path.mkdir(mode=mode)
                 if name == "work":
                     os.chown(path, config["worker_uid"], config["worker_gid"])
+                    # The first alias/configure stage uses this exact side as
+                    # cwd, before candidate code can create any directories.
+                    for side in ("base", "candidate"):
+                        workspace = path / side
+                        workspace.mkdir(mode=0o700)
+                        os.chown(workspace, config["worker_uid"], config["worker_gid"])
             self.evidence = core.BASE / "evidence" / job_id
             self.evidence.mkdir(mode=0o700)
             self.started = time.monotonic()
@@ -333,8 +405,45 @@ class Session:
             active = core.members(self.config["worker_uid"])
             rss = sum(p["rss_bytes"] for p in active)
             policy = self.config["executor"]
-            if len(active) > policy["max_processes"] or rss > policy["memory_budget_bytes"] or core.free_memory() < policy["host_reserve_bytes"]:
-                reason = "process or memory reserve budget"
+            resource_reason = None
+            if len(active) > policy["max_processes"]:
+                resource_reason = "process count budget"
+            memory = dict(memory_metric=MEMORY_METRIC, physical_footprint_bytes=None)
+            try:
+                memory = worker_memory(active, self.config["worker_uid"])
+                if resource_reason is None and memory["physical_footprint_bytes"] > policy["memory_budget_bytes"]:
+                    resource_reason = "worker physical footprint budget"
+            except Exception as error:
+                memory["memory_accounting_error"] = f"{type(error).__name__}: {error}"
+                if resource_reason is None:
+                    resource_reason = "worker memory accounting unavailable"
+            available, memory_error = None, None
+            try:
+                available = core.free_memory()
+            except Exception as error:
+                if resource_reason is None:
+                    resource_reason = "host memory accounting unavailable"
+                memory_error = f"{type(error).__name__}: {error}"
+            if resource_reason is None and available < policy["host_reserve_bytes"]:
+                resource_reason = "host memory reserve"
+            observation = dict(
+                    **memory, monotonic_s=time.monotonic(),
+                    members=active, process_count=len(active), rss_bytes=rss,
+                    free_memory_bytes=available,
+                    resource_policy={key: policy[key] for key in (
+                        "max_processes", "memory_budget_bytes", "host_reserve_bytes")})
+            if memory_error is not None:
+                observation["free_memory_error"] = memory_error
+            record["resource_observation"] = observation
+            peak = record.setdefault("resource_peak", dict(
+                memory_metric=MEMORY_METRIC, physical_footprint_bytes=None, rss_bytes=0))
+            peak["rss_bytes"] = max(peak["rss_bytes"], rss)
+            if memory["physical_footprint_bytes"] is not None:
+                peak["physical_footprint_bytes"] = max(
+                    peak["physical_footprint_bytes"] or 0, memory["physical_footprint_bytes"])
+            if resource_reason is not None:
+                reason = resource_reason
+                record["resource_violation"] = dict(observation, reason=reason)
         if process.poll() is not None or reason:
             self.finish(reason)
 
@@ -383,6 +492,7 @@ class Session:
             require(identity == record["birth_identity"], "worker PID reused")
             result["members"] = core.members(self.config["worker_uid"])
             result["rss_bytes"] = sum(p["rss_bytes"] for p in result["members"])
+            result.update(worker_memory(result["members"], self.config["worker_uid"]))
             if not light:
                 # lsof is an installed Apple tool executed outside the candidate UID.
                 observed = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-u", str(self.config["worker_uid"]), "-F", "pcuftn"], capture_output=True, text=True, check=False)
@@ -482,8 +592,9 @@ class Session:
                 self.lock_fd = None
 
 
-def serve_connection(config, peer, broker_lifeline=None):
-    require(peer_identity(peer) == (config["runner_uid"], config["runner_gid"]), "unauthorized coordinator UID")
+def serve_connection(config, peer, broker_lifeline=None, broker_identity=None):
+    identity = peer_identity(peer)
+    require(identity in ((0, 0), (config["runner_uid"], config["runner_gid"])), "unauthorized coordinator UID")
     session, pending = None, b""
     try:
         while True:
@@ -503,6 +614,12 @@ def serve_connection(config, peer, broker_lifeline=None):
                 line, pending = pending.split(b"\n", 1)
                 request = json.loads(line)
                 if session is None:
+                    if request == {"schema_version": 1, "operation": "broker.status"}:
+                        require(identity == (0, 0) and broker_identity is not None,
+                                "root managed-broker status required")
+                        peer.sendall(json.dumps(broker_identity, sort_keys=True).encode() + b"\n")
+                        return
+                    require(identity == (config["runner_uid"], config["runner_gid"]), "root cannot open candidate jobs")
                     require(request.get("operation") == "job.open" and request.get("schema_version") == 1, "job.open required")
                     session = Session(config, peer, request["job_id"], broker_lifeline)
                     result = session.identity()
@@ -519,8 +636,20 @@ def serve_connection(config, peer, broker_lifeline=None):
             session.close()
 
 
-def serve(config):
+def serve(config, *, management_fd=None, bootstrap_lease_fd=None):
     require(config.get("executor", {}).get("enabled") is True, "stage executor remains disabled pending native proof")
+    # This is separate from the original device lease, which remains owned by
+    # each job guardian. Forked guardians retain the management lock too, so a
+    # dead broker cannot be replaced before its last guardian has exited.
+    if management_fd is None:
+        import recover
+        management_fd = recover.management_lock()
+    identity = {"schema_version": 1, "status": "ready", "protocol": "mac-executor-v1",
+                "broker_birth": birth(os.getpid()),
+                "config_sha256": core.sha(core.BASE / "control/config.json"),
+                "installed_files": dict(config["installed_files"]),
+                "lock_dev_inode": config["lock_dev_inode"],
+                "worker_uid": config["worker_uid"], "runner_uid": config["runner_uid"]}
     path = core.BASE / "control" / "executor.sock"
     require(not path.exists(), "broker socket already exists; inspect its owner")
     for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
@@ -530,6 +659,8 @@ def serve(config):
     os.chown(path, 0, config["runner_gid"])
     path.chmod(0o660)
     listener.listen(1)
+    if bootstrap_lease_fd is not None:
+        os.close(bootstrap_lease_fd)
     try:
         while True:
             peer, _ = listener.accept()
@@ -544,7 +675,7 @@ def serve(config):
                 os.setsid()
                 code = 0
                 try:
-                    serve_connection(config, peer, child_life)
+                    serve_connection(config, peer, child_life, identity)
                 except (ValueError, RuntimeError, OSError) as error:
                     code = 1
                     try:
@@ -566,6 +697,7 @@ def serve(config):
     finally:
         listener.close()
         path.unlink()
+        os.close(management_fd)
 
 
 def main():

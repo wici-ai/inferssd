@@ -13,8 +13,8 @@ from ci.staged_numerical import validate_csv
 from ci.staged_benchmark import verify_stopped, verify_runtime
 from ci.staged_checkpoint import mapped_files, native_settings
 from ci.selected_preflight import launch as preflight_launch, retained
-from ci.selected_receipt import retained_typed_settings
-from ci import model_admission
+from ci.selected_receipt import retained_typed_settings, mac_runtime_images, mac_stopped, MAC_RESOURCE_ENFORCEMENT
+from ci import model_admission, mac_host_gate
 
 
 def sealed(root, report):
@@ -63,6 +63,26 @@ def runtime_retained(root, config, side, model, folder, launch, receipt_path):
                 effective["native_launch_policy"]["typed_values"], config["sides"][side], model, build,
                 root / ("build-" + side) / "freeze-manifest.json", config.get("manifest_path"))):
         raise ValueError("retained typed inputs/host/receipt identity differs")
+    if config.get("paths", {}).get("platform") == "darwin":
+        mac_host_gate.retained_arm(folder, mac_host_gate.policy(config))
+        manifest = load(root / "root-manifest.json")
+        probes = [load(folder / name) for name in ("runtime-before.json", "runtime-after.json")]
+        images = mac_runtime_images(config, manifest, side, model, launch, started, probes)[0]
+        mac_stopped(config, manifest, load(folder / "stopped.json"))
+        expected = [{"path": image["runtime_path"], "sha256": image["sha256"]}
+                    for image in [build["binary"], *build["images"]] if image["runtime_path"] in images]
+        if (build["binary"]["runtime_path"] not in images
+                or sorted(runtime["build"]["loaded_libraries"], key=lambda x: x["path"]) != sorted(expected, key=lambda x: x["path"])
+                or effective["ambient_environment"] != launch["environment"]
+                or effective.get("native_resource_enforcement") != MAC_RESOURCE_ENFORCEMENT):
+            raise ValueError("retained Mac loaded images or declared environment differs")
+        known = {image["path"] for image in expected}
+        systems = effective.get("system_images", [])
+        if {image["path"] for image in systems} != set(images) - known or any(not image["path"].startswith(
+                ("/usr/", "/lib/", "/lib64/", "/System/Library/", "/Library/Apple/", "/opt/inferssd-ci-toolchains/"))
+                for image in systems):
+            raise ValueError("retained Mac system-image inventory differs")
+        return runtime
     previous = None
     for name in ("runtime-before.json", "runtime-after.json"):
         probe = load(folder / name)
@@ -91,7 +111,8 @@ def runtime_retained(root, config, side, model, folder, launch, receipt_path):
 
 def performance_retained(root, config, model, tier, plan, policy, preflight):
     """Reconstruct a complete one-pair comparison, preserving inconclusive data."""
-    data, receipts, evidence = {}, {}, {}
+    data, receipts, evidence, host_states = {}, {}, {}, {}
+    host_policy = mac_host_gate.policy(config) if config.get("paths", {}).get("platform") == "darwin" else None
     for side in ("base", "candidate"):
         folder = root / model / tier / side
         arm = load(folder / "benchmark.json")
@@ -106,6 +127,8 @@ def performance_retained(root, config, model, tier, plan, policy, preflight):
                 raise ValueError("timed prompt differs from the sealed performance protocol")
         receipts[side] = runtime_retained(root, config, side, model, folder, spec,
                                            folder / "comparison-receipt.json")
+        if host_policy is not None:
+            host_states[side] = mac_host_gate.retained_arm(folder, host_policy)
         if comparable(receipts[side]) != comparable(preflight[model, tier, side]):
             raise ValueError("timed runtime differs from retained short preflight")
         if arm["result"] != data[side]:
@@ -116,7 +139,14 @@ def performance_retained(root, config, model, tier, plan, policy, preflight):
                          "started.json", "stopped.json", "runtime-before.json", "runtime-after.json",
                          "result.events.jsonl", "result.events.sse", "stderr.log")
         }
+        if host_policy is not None:
+            evidence[side].update({name: dict(path=str((folder / name).relative_to(root)),
+                                             sha256=digest(folder / name)) for name in (
+                "host-quiet.json", "host-state-before-request.json", "host-state-after-request.json",
+                "host-state-after-cleanup.json")})
     compared = compare_pair(data["base"], data["candidate"], receipts["base"], receipts["candidate"], policy)
+    if host_policy is not None:
+        compared = mac_host_gate.pair(compared, host_states["base"], host_states["candidate"])
     if load(root / model / tier / "comparison.json") != compared:
         raise ValueError("selected comparison differs from verified raw pair")
     return dict(tier=tier, **compared, sources={side: plan[side] for side in ("base", "candidate")},
@@ -170,7 +200,8 @@ def device_report(root, plan, policy, job, child, scope=None):
             folder = root / data["raw"]
             model_data = config["sides"][side]["models"][model]
             launch = model_data["smoke"] if data["reused_functional"] else preflight_launch(
-                model_data["benchmarks"][tier], side, required=config.get("validation_mode") == PERFORMANCE_MODE)
+                model_data["benchmarks"][tier], side, required=config.get("validation_mode") == PERFORMANCE_MODE,
+                job_root=config["sides"][side]["paths"]["job_root"] if config["paths"]["platform"] == "darwin" else None)
             runtime_retained(root, config, side, model, folder, launch,
                              root / "preflight" / model / tier / side / "comparison-receipt.json")
     gate = load(root / "numerical/selected-numerical.json")
@@ -287,8 +318,12 @@ def operator_aggregate(plan, policy, artifacts, jobs, children, scope):
     complete = not errors and all(cell["status"] in ("passed", "not-required")
                                   and cell.get("performance") != "deferred-not-in-this-run"
                                   and not cell.get("performance_deferred_tiers") for cell in rows)
+    linux = [row for row in executed if row["device"] != "local-mbp"]
+    mac = [row for row in executed if row["device"] == "local-mbp"]
     return dict(schema_version=1, purpose="operator-selected-report-only", passed=status == "passed",
-                status=status, linux_scoped_status=status,
+                status=status, execution_scoped_status=status,
+                linux_scoped_status=outcome(linux) if linux else "not-in-this-run",
+                mac_scoped_status=outcome(mac) if mac else "not-in-this-run",
                 full_impact_coverage_complete=complete, pr_publication="not-enabled",
                 source_identity="sealed-source-not-current-pr", **scope,
                 selection_plan_sha256=fingerprint(plan), cells=rows, errors=errors, formal_samples=0)

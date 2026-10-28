@@ -154,6 +154,36 @@ def test_gh_errors_never_copy_auth_diagnostics(monkeypatch):
     assert "synthetic-sensitive" not in str(caught.value)
 
 
+@pytest.mark.parametrize("phase,kind", [
+    ("audit-open", "unsafe-path"), ("audit-append", "storage-exhausted"),
+    ("diagnostic-write", "io-failed"), ("client-read", "reap-timeout"),
+])
+def test_gh_fixed_local_failure_metadata_is_visible_without_auth_output(monkeypatch, phase, kind):
+    safe = dict(schema_version=1, phase=phase, kind=kind, errno=28)
+    stderr = b"gh-ci-read-retry-v3: local-failure=" + json.dumps(safe).encode() + b"\n"
+    monkeypatch.setattr(prepare.subprocess, "run", lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, 1, b"not retained", stderr))
+    with pytest.raises(RuntimeError, match=phase + "/" + kind) as caught:
+        prepare.Gh().call("user")
+    assert "exit 1" in str(caught.value) and "not retained" not in str(caught.value)
+
+
+@pytest.mark.parametrize("payload", [
+    {"schema_version": 1, "phase": "token-sensitive", "kind": "io-failed", "errno": 28},
+    {"schema_version": 1, "phase": [], "kind": "io-failed", "errno": 28},
+    {"schema_version": 1, "phase": "audit-open", "kind": "io-failed", "errno": "token-sensitive"},
+    {"schema_version": 1, "phase": "audit-open", "kind": "io-failed", "errno": 28, "secret": "token-sensitive"},
+    [], None, "token-sensitive",
+])
+def test_gh_malformed_or_unrecognized_failure_never_copies_diagnostics(monkeypatch, payload):
+    stderr = b"gh-ci-read-retry-v3: local-failure=" + json.dumps(payload).encode()
+    monkeypatch.setattr(prepare.subprocess, "run", lambda argv, **kw:
+                        subprocess.CompletedProcess(argv, 1, b"", stderr))
+    with pytest.raises(RuntimeError) as caught:
+        prepare.Gh().call("user")
+    assert "local " not in str(caught.value) and "token-sensitive" not in str(caught.value)
+
+
 @pytest.mark.parametrize("raw", ['{"a":1,"a":2}', '{"a":NaN}'])
 def test_api_json_rejects_ambiguous_evidence(raw):
     with pytest.raises(ValueError):
@@ -166,7 +196,7 @@ def prepared_fixture(tmp_path, source, *, devices=None, mode=prepare.LEGACY_MODE
     impact = prepare.plan(["old.cpp", "new.cpp"], POLICY, **identity)
     profiles = {}
     old_job = "f" * 32
-    for index, device in enumerate(prepare.DEVICES):
+    for index, device in enumerate(prepare.LINUX_DEVICES):
         config = template(impact, device)
         config.update(model_identity={m: dict(shards=[dict(host_path="/admitted/" + m + "/model.gguf", runtime_path="/models/" + m + "/model.gguf",
                       device=1, inode=2, bytes=3, mtime_ns=4, ctime_ns=5, historical_sha256="8" * 64)])
@@ -209,7 +239,7 @@ def prepared_fixture(tmp_path, source, *, devices=None, mode=prepare.LEGACY_MODE
                      root_argv=["/usr/bin/python3", "-I", "/opt/inferssd-ci-control/current/bench/ci/operator_stage.py"]))
     (tmp_path / "inputs.json").write_text(json.dumps(dict(schema_version=1, controller_workflow_sha="d" * 40, devices=profiles)))
     args = SimpleNamespace(source=root, inputs=tmp_path / "inputs.json", output=tmp_path / "prepared",
-        policy=Path(__file__).parents[1] / "ci/policy.json", gh="never-used", execution_devices=list(devices or prepare.DEVICES), validation_mode=mode, **identity)
+        policy=Path(__file__).parents[1] / "ci/policy.json", gh="never-used", execution_devices=list(devices or prepare.LINUX_DEVICES), validation_mode=mode, **identity)
     return args, API(root)
 
 
@@ -220,8 +250,8 @@ def test_prepare_keeps_full_impact_but_seals_only_linux_functional_work(tmp_path
     assert envelope["prepared_by"]["id"] == 42
     assert len(envelope["selection"]["cells"]) == 6
     assert all(cell["required"] and cell["performance"]["required"] for cell in envelope["selection"]["cells"])
-    assert envelope["execution_devices"] == list(prepare.DEVICES)
-    for device in prepare.DEVICES:
+    assert envelope["execution_devices"] == list(prepare.LINUX_DEVICES)
+    for device in prepare.LINUX_DEVICES:
         manifest = load(args.output / device / "manifest.json")
         assert set(manifest["sources"]) == {"candidate"}
         assert not any("benchmark" in stage or "preflight" in stage for stage in manifest["stages"])
@@ -258,10 +288,10 @@ def test_staging_requires_exact_root_receipt_and_refuses_reissue(tmp_path, sourc
         called.append(device)
         return successful_receipt(envelope, inputs, device)
     prepare.stage(args, sender)
-    assert called == list(prepare.DEVICES)
+    assert called == list(prepare.LINUX_DEVICES)
     with pytest.raises(FileExistsError):
         prepare.stage(args, sender)
-    assert called == list(prepare.DEVICES)
+    assert called == list(prepare.LINUX_DEVICES)
 
 
 def test_first_stage_failure_does_not_dispatch_or_continue(tmp_path, source):
@@ -275,7 +305,7 @@ def test_first_stage_failure_does_not_dispatch_or_continue(tmp_path, source):
         return dict(successful_receipt(envelope, inputs, device), config_sha256="0" * 64)
     with pytest.raises(ValueError, match="actual root staging"):
         prepare.stage(args, sender)
-    assert called == [prepare.DEVICES[0]]
+    assert called == [prepare.LINUX_DEVICES[0]]
     assert not (args.output / "dispatch-attempt.json").exists()
 
 
@@ -403,6 +433,26 @@ def test_sender_uses_plain_tar_after_memory_only_sudo_line(tmp_path, monkeypatch
         assert archive.getnames() == ["root-input.json", "settings-muse.ssd"]
 
 
+@pytest.mark.parametrize("early_exit", [False, True])
+def test_sender_retains_root_failure_even_when_upload_pipe_breaks(tmp_path, monkeypatch, early_exit):
+    import sys
+    request = tmp_path / "root-input.json"
+    request.write_text("{}")
+    payload = tmp_path / "source.tar.gz"
+    payload.write_bytes(b"x" * (1 << 20))
+    script = ("import sys; " + ("" if early_exit else "sys.stdin.buffer.read(); ")
+              + "sys.stderr.write('root sealing deadline exceeded\\n'); sys.exit(7)")
+    monkeypatch.setattr(prepare, "transport_profile", lambda *a, **kw: ([sys.executable, "-c", script], []))
+    data = dict(root_input_path=str(request), root_input_sha256=prepare.digest(request),
+                ssh=dict(sudo_password_required=False), files={"source.tar.gz": dict(
+                    local_path=str(payload), bytes=payload.stat().st_size, sha256=prepare.digest(payload))})
+    with pytest.raises(RuntimeError, match="exit 7.*root sealing deadline exceeded"):
+        prepare.send_stage("local-mbp", data)
+    saved = tmp_path / "staging-stderr.log"
+    assert saved.read_text() == "root sealing deadline exceeded\n"
+    assert saved.stat().st_mode & 0o777 == 0o600
+
+
 def test_ambiguous_dispatch_remains_claimed_and_is_never_reposted(tmp_path, source):
     args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"])
     envelope = prepare.prepare(args, api)
@@ -431,7 +481,7 @@ def test_default_mode_is_performance_and_two_sources_are_exact(tmp_path, source)
     del args.validation_mode  # The public default, including the watcher API.
     envelope = prepare.prepare(args, api)
     assert envelope["validation_mode"] == prepare.MODE
-    for device in prepare.DEVICES:
+    for device in prepare.LINUX_DEVICES:
         config = load(args.output / device / "config.json")
         manifest = load(args.output / device / "manifest.json")
         request = load(args.output / device / "root-input.json")
@@ -511,7 +561,7 @@ def test_subset_job_still_binds_full_fixed_root_policy(tmp_path, source):
     args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
     changed_identity(args, "engine/ggml/src/ggml-cuda/ssd/mxfp4-compute-adapter.cpp")
     prepare.prepare(args, api)
-    for device in prepare.DEVICES:
+    for device in prepare.LINUX_DEVICES:
         config = load(args.output / device / "config.json")
         policy = load(args.output / device / "policy.review.json")
         assert set(config["sides"]["candidate"]["models"]) == {"deepseek"}
@@ -523,7 +573,7 @@ def test_subset_job_still_binds_full_fixed_root_policy(tmp_path, source):
 def test_no_enabled_affected_linux_device_refuses_before_output(tmp_path, source):
     args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
     changed_identity(args, "engine/ggml/src/ggml-metal/example.m")
-    with pytest.raises(ValueError, match="no enabled Linux device"):
+    with pytest.raises(ValueError, match="no enabled device"):
         prepare.prepare(args, api)
     assert not args.output.exists()
 
@@ -556,3 +606,14 @@ def test_performance_preflight_and_timed_private_writer_paths(tmp_path, source, 
                 timed = data["benchmarks"]["512"]
                 assert timed["preflight_argv"] == data["smoke"]["argv"]
                 assert timed["argv"][-1] != timed["preflight_argv"][-1]
+
+
+def test_bad_platform_profile_fails_during_preparation(tmp_path, source):
+    args, api = prepared_fixture(tmp_path, source)
+    path = tmp_path / "cloud-5090-template.json"
+    config = json.loads(path.read_text())
+    config["sides"]["candidate"]["build"]["cmake_flags"] = ["-DBUILD_SHARED_LIBS=OFF", "-DLLAMA_SSD_STORE=ON"]
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="LLAMA_SSD_STORE requires Linux"):
+        prepare.prepare(args, api)
+    assert not (args.output / "prepared.json").exists()

@@ -7,10 +7,12 @@ socket; only the existing broker guardian owns worker termination and the lock.
 
 import re
 import threading
+import time
 
 
 PARENT = re.compile(r"([1-9][0-9]*)-([1-9][0-9]*)")
 WORKFLOW = ".github/workflows/device-performance.yml"
+OBSERVATION_BUDGET_S = 30
 
 
 def active_parent(api, parent, sha):
@@ -18,8 +20,11 @@ def active_parent(api, parent, sha):
     if not match:
         raise ValueError("invalid selected parent run/attempt")
     run_id, attempt = map(int, match.groups())
-    workflow = api.call("actions/workflows/device-performance.yml")
-    run = api.call("actions/runs/" + str(run_id))
+    # Keep one finite budget across all three reads, leaving room for the
+    # existing bounded transport retries after a 10-second socket timeout.
+    deadline = time.monotonic() + OBSERVATION_BUDGET_S
+    workflow = api.call("actions/workflows/device-performance.yml", deadline=deadline)
+    run = api.call("actions/runs/" + str(run_id), deadline=deadline)
     if (workflow.get("path") != WORKFLOW or workflow.get("state") != "active"
             or run.get("workflow_id") != workflow.get("id")
             or run.get("path") != WORKFLOW or run.get("event") != "workflow_dispatch"
@@ -29,7 +34,7 @@ def active_parent(api, parent, sha):
         raise ValueError("selected parent is no longer the exact active controller")
     # The publisher may still run after control was cancelled. It must not keep
     # an independently dispatched device child alive during that interval.
-    listing = api.call(f"actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100")
+    listing = api.call(f"actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100", deadline=deadline)
     jobs = listing["jobs"]
     if listing.get("total_count") != len(jobs) or len(jobs) >= 100:
         raise ValueError("incomplete parent job listing")
@@ -81,7 +86,7 @@ class ParentWatch:
     def stop(self):
         self.stopping.set()
         if self.thread is not None:
-            self.thread.join(35)  # Three parent API calls, each bounded to 10s.
+            self.thread.join(OBSERVATION_BUDGET_S + 5)
         with self.mutex:
             if self.error is not None:
                 raise RuntimeError(self.error)

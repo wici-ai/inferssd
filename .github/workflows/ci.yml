@@ -110,6 +110,10 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - name: Host CPU and memory
+        run: |
+          uname -m
+          sysctl hw.logicalcpu hw.physicalcpu hw.memsize
       - name: Build Metal and portable cache tests
         run: SSD_LLAMA_BUILD_JOBS=3 bash scripts/build-macos-metal.sh
       - name: Cache and Muse rendering tests

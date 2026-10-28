@@ -1,4 +1,4 @@
-# Operator preparation for two Linux devices
+# Operator preparation for reviewed devices
 
 `operator_prepare.py` uses the preparer's existing `gh` login and SSH access.
 It does not export a GitHub token, create a PAT, change the broker, register a
@@ -39,9 +39,9 @@ It contains reviewed device templates, model/settings identities and a profile:
 }
 ```
 
-The placeholder values above are not executable configuration. Both device
-profiles are required, but `--execution-devices` can choose one or both Linux
-devices. An optional per-device `job_id` must be fresh, distinct and 32 lowercase
+The placeholder values above are not executable configuration. Every enabled
+device needs an explicit profile. `--execution-devices` can select cloud-5090,
+dgx-spark and local-mbp. An optional per-device `job_id` must be fresh, distinct and 32 lowercase
 hex characters; otherwise preparation generates one. Old template job/source
 identities are replaced with the exact new identities. When the impact plan
 requires performance, both base and candidate are exported and built. Both sides
@@ -72,12 +72,39 @@ file, including files marked `export-ignore`; no checkout/filter/hook runs.
 
 `envelope.json` retains the canonical impact plan, including required Mac and
 performance cells. Separate `execution_devices` and `validation_mode` limit this
-run to the two available Linux devices and the 512-tier performance comparison.
-Each required Linux model runs decode 256 once per side; 4K and offline Mac
+run to the declared devices and the 512-tier performance comparison.
+Each required executed model runs decode 256 once per side; 4K and omitted devices'
 requirements remain explicit coverage gaps. Historical functional/numerical
 envelopes retain their old meaning. The complete workflow input must fit
 60 KiB; exceeding that bound refuses without truncation. The report cannot claim
-PR check publication or full impact coverage when required Mac/4K work is absent.
+PR check publication or full impact coverage when required devices/4K work is absent.
+
+Mac profiles use `broker_device: "mac-m5-max"` and a pinned `machine_identity`
+with the SHA256 of the uppercase hardware UUID, hardware model and CPU brand,
+rather than a CUDA GPU UUID. The actual executor resources are exactly
+`max_processes`, `memory_budget_bytes` and `host_reserve_bytes`. These are sampled
+guards, without a hard UMA or swap limit. Keep each side's original cache/thread
+configuration explicit; the same model files and typed values apply to both sides.
+
+Mac staging uses the frozen Xcode Python with `-I -B` and the fixed
+`/Library/InferSSD-CI/controller/current/bench/ci/operator_mac_stage.py` path.
+The dedicated SSH key forces `control/operator-ssh-entry`, which admits only
+that fixed argv plus one `--expected-sha256` digest. Its separately reviewed sudo
+rule grants only `control/operator-root-entry`; this revalidates the digest and
+executes the fixed stager. No candidate path, shell, arbitrary Python program or
+personal password is accepted. The root policy is
+`/Library/InferSSD-CI/control/operator-policy.json`; the private manifest is
+`/Library/InferSSD-CI/private/job-manifests/JOB.json`. Staging seals input data
+under `/Library/InferSSD-CI/inputs/operator-JOB`, leaving `jobs/JOB` fresh for the
+existing executor's `job.open`.
+
+The Mac settings templates pin all bytes, allowing one `{{job_id}}` only in the
+single `expert.source` array item under the exact frozen source side. Preparation
+retains the template digest and generated payload digest; root staging reverses
+only that one namespace and checks both. No general settings rewrite is allowed.
+The existing SSH-context broker recovery runs before staging takes the original
+lease; see [its identity and STOP contract](macos-sandbox/RECOVERY.md). A missing
+launchd service alone never authorizes replacing the broker or the lock.
 
 Before enabling root staging, review and install each generated
 `DEVICE/policy.review.json` as the local root-owned, nonwritable

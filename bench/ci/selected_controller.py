@@ -18,7 +18,7 @@ from ci.impact import fingerprint, plan as selection, selected, validate
 from ci.private_controller import API, admission, bind_context, check_body, context, current_ci, source_manifest, writable
 from ci.selected_aggregate import aggregate, operator_aggregate
 from ci.selection_contract import JOB, execution_scope, FUNCTIONAL_MODE
-from ci import selection_dispatch
+from ci import private_controller, selection_dispatch
 
 
 def changed_paths(api, pr):
@@ -175,6 +175,67 @@ def preflight(args, env=os.environ):
     return 0
 
 
+class ChildMetadataAPI:
+    """Observe the returned child ID until its queued title is fully bound.
+
+    Only a missing/known generic title may be pending. Every returned response
+    is retained before classification; strict identity still gates all use.
+    Only the canonical transport retries failed GETs, within this observer's
+    deadline. This observer never retries a dispatch or cancellation.
+    """
+
+    def __init__(self, api, child, artifacts, phase, *, sleep=None, clock=None):
+        self.api, self.child, self.artifacts, self.phase = api, child, artifacts, phase
+        self.sleep, self.clock = sleep or time.sleep, clock or time.monotonic
+        self.path = "actions/runs/" + str(child["id"])
+        self.expected = dict(id=child["id"], workflow_id=child["workflow_id"],
+            path=selection_dispatch.WORKFLOW, event="workflow_dispatch", head_branch="main",
+            head_sha=child["controller_sha"], run_attempt=1, display_title="integration-" + child["job_id"])
+        self.sequence = 0
+        self.identity_confirmed = False
+
+    def __getattr__(self, name):
+        return getattr(self.api, name)
+
+    def call(self, path, data=None, method=None):
+        if path == self.path + "/cancel" and method == "POST" and not self.identity_confirmed:
+            raise ValueError("child cancellation requires a fully observed exact identity")
+        if path != self.path or data is not None or method not in (None, "GET"):
+            return self.api.call(path, data, method)
+        deadline = self.clock() + 10
+        for attempt in range(6):
+            if type(self.api) is private_controller.API:
+                run = self.api.call(path, deadline=deadline)
+            else:
+                run = self.api.call(path)
+            actual = {key: run.get(key) for key in self.expected} if isinstance(run, dict) else {}
+            differences = {key: dict(expected=value, actual=actual.get(key))
+                for key, value in self.expected.items()
+                if type(actual.get(key)) is not type(value) or actual.get(key) != value}
+            pending = (isinstance(run, dict) and set(differences) == {"display_title"}
+                and run.get("status") in ("queued", "requested") and run.get("conclusion") is None
+                and run.get("display_title") in (None, "", "InferSSD reviewed integration smoke"))
+            self.sequence += 1
+            save(self.artifacts / (f"child-metadata-{self.child['id']}-{self.phase}-"
+                                  f"{time.time_ns()}-{self.sequence}.json"),
+                 dict(schema_version=1, child_sha256=fingerprint(self.child), phase=self.phase,
+                      observation=self.sequence, expected=self.expected, differences=differences,
+                      pending_title=pending, run=run))
+            if not differences:
+                selection_dispatch.run_identity(run, self.child["workflow_id"],
+                    self.child["controller_sha"], self.child["job_id"])
+                self.identity_confirmed = True
+                return run
+            if not pending:
+                raise ValueError("child workflow/ref/revision/job/attempt identity differs: "
+                                 + ", ".join(differences))
+            remaining = deadline - self.clock()
+            if attempt == 5 or remaining <= 0:
+                break
+            self.sleep(min(2, remaining))
+        raise TimeoutError("child title did not reach exact identity within finite observation window")
+
+
 def execute(args, env=os.environ):
     policy, _, _ = environment(args, env)
     admitted = load(args.plan)
@@ -219,8 +280,9 @@ def execute(args, env=os.environ):
                 state["errors"][device] = f"{type(error).__name__}: {error}"
         for device, child in dispatched.items():
             collection_attempted = False
+            observed = ChildMetadataAPI(api, child, args.artifacts, "wait")
             try:
-                run = selection_dispatch.wait(api, child, timeout_s=max(1, deadline - time.monotonic()))
+                run = selection_dispatch.wait(observed, child, timeout_s=max(1, deadline - time.monotonic()))
                 state["children"][device] = run
                 collection_attempted = True
                 selection_dispatch.collect(api, run, jobs[device], args.artifacts / device, parent=parent)
@@ -231,7 +293,7 @@ def execute(args, env=os.environ):
                     # artifact once so the always report can recompute metrics;
                     # cancellation/unknown state still cannot become a pass.
                     try:
-                        run = api.call("actions/runs/" + str(child["id"]))
+                        run = observed.call("actions/runs/" + str(child["id"]))
                         selection_dispatch.run_identity(run, child["workflow_id"], child["controller_sha"], child["job_id"])
                         if run.get("id") != child["id"] or run.get("status") != "completed":
                             raise ValueError("failed child has no exact terminal run")
@@ -267,6 +329,7 @@ def cancel_children(args, env=os.environ):
                     or child.get("inputs", {}).get("selection_parent") != parent):
                 raise ValueError("refuse cancellation of another controller's child")
             try:
+                observed = ChildMetadataAPI(api, child, args.artifacts, "cancel")
                 claim = args.artifacts / ("cancellation-" + path.stem + "-attempt.json")
                 expected_claim = dict(schema_version=1, parent=parent, child_sha256=fingerprint(child),
                                       run_id=child["id"], cleanup_confirmed=False)
@@ -281,7 +344,7 @@ def cancel_children(args, env=os.environ):
                 if attempted:
                     if claim.exists() and load(claim) != expected_claim:
                         raise ValueError("prior cancellation claim identifies another child")
-                    run = api.call("actions/runs/" + str(child["id"]))
+                    run = observed.call("actions/runs/" + str(child["id"]))
                     selection_dispatch.run_identity(run, child["workflow_id"], child["controller_sha"], child["job_id"])
                     previous = prior.get(path.name) if isinstance(prior, dict) else None
                     unknown = (not isinstance(previous, dict) or previous.get("run_id") != child["id"] or "error" in previous
@@ -291,7 +354,7 @@ def cancel_children(args, env=os.environ):
                         cancellation_requested=False, cleanup_confirmed=False)
                     uncertain |= unknown or run.get("status") != "completed"
                 else:
-                    results[path.name] = selection_dispatch.cancel(api, child)
+                    results[path.name] = selection_dispatch.cancel(observed, child)
                     uncertain |= results[path.name].get("cancellation_requested") is not False
             except Exception as error:
                 results[path.name] = dict(error=repr(error), cleanup_confirmed=False)
@@ -322,8 +385,10 @@ def operator_summary(stream, report):
     """Render verified pair values, never turn missing/inconclusive into green."""
     status = report.get("status", "passed" if report["passed"] else "failed")
     stream.write("## Operator-authorized device report\n\n")
-    stream.write("Declared Linux scope: **" + summary_text(status) + "**. ")
+    stream.write("Declared device scope: **" + summary_text(status) + "**. ")
     stream.write("Full impact coverage: **" + str(report["full_impact_coverage_complete"]).lower() + "**.\n\n")
+    stream.write("Linux scope: **" + summary_text(report.get("linux_scoped_status", "not-verified"))
+                 + "**. Mac scope: **" + summary_text(report.get("mac_scoped_status", "not-verified")) + "**.\n\n")
     stream.write("PR publication is not enabled. These results identify sealed source; they do not attest the current PR head.\n\n")
     for key in ("base", "head", "candidate"):
         if key in report:
@@ -363,6 +428,39 @@ def operator_summary(stream, report):
                 stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
         stream.write("\nChange is (PR/base − 1) × 100; lower TTFT is better. TTFT starts at the request, not model loading. ")
         stream.write("One sample per arm: observed slowdown or different generated tokens is inconclusive and does not pass.\n\n")
+        mac_pairs = [(row, pair) for row, pair in pairs if row["device"] == "local-mbp"]
+        if mac_pairs:
+            def scaled(value, unit):
+                if type(value) not in (int, float) or not math.isfinite(value):
+                    return "unavailable"
+                return f"{value / unit:.4f}"
+
+            stream.write("### Mac sampled host conditions\n\n")
+            stream.write("| Model | Tier | Side | Quiet free+inactive GiB | Timed swap Δ MiB | Timed compression Δ MiB | Non-CI CPU cores | Pressure | Timed status |\n")
+            stream.write("|---|---|---|---:|---:|---:|---:|---|---|\n")
+            for row, pair in mac_pairs:
+                environment = pair.get("environment", {})
+                for side in ("base", "candidate"):
+                    arm = environment.get(side, {})
+                    timed = arm.get("timed", {})
+                    levels = timed.get("memory_pressure_levels")
+                    pressure = " → ".join(str(level) for level in levels) if isinstance(levels, list) else "unavailable"
+                    values = [row["model"], pair["tier"], side,
+                        scaled(arm.get("prelaunch_free_inactive_bytes"), 1 << 30),
+                        scaled(timed.get("swap_delta_bytes"), 1 << 20),
+                        scaled(timed.get("compression_delta_bytes"), 1 << 20),
+                        metric_text(timed.get("process_activity", {}), "non_ci_cpu_cores"),
+                        pressure, timed.get("status", "unavailable")]
+                    stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
+            stream.write("\n")
+            for row, pair in mac_pairs:
+                environment = pair.get("environment", {})
+                reasons = environment.get("reasons", ["missing environment evidence"])
+                stream.write("- " + summary_text(row["model"] + "/" + pair["tier"]) + " environment: "
+                    + summary_text(environment.get("status", "unavailable")) + "; reasons: "
+                    + summary_text(", ".join(reasons) if reasons else "none") + ".\n")
+            stream.write("\nQuiet memory is the final prelaunch sample; timed CPU is the sampled non-CI total. ")
+            stream.write("Swap and pressure may be model-induced. These observations do not establish external interference, excuse measured slowdowns, or trigger automatic retries; they are not strict isolation.\n\n")
         stream.write("<details><summary>Pair identities and retained raw evidence</summary>\n\n")
         for row, pair in pairs:
             identity = pair.get("measurement_identity", {})
@@ -380,13 +478,16 @@ def operator_summary(stream, report):
         stream.write("\nFailure: " + summary_text(report["error"]) + "\n")
     for error in report.get("errors", []):
         stream.write("\nFailure: " + summary_text(error) + "\n")
-    stream.write("\nMac/offline and any 4K deferred coverage are separate from this Linux scope. ")
+    stream.write("\nDevices outside this declared scope and any 4K deferred coverage remain separate. ")
+    if "local-mbp" in report.get("execution_devices", []):
+        stream.write("Mac memory protection monitors worker physical footprint/process count and host reserve; RSS is diagnostic only. It does not disable swap or provide a Linux memory.max hard cap. ")
     stream.write("Formal benchmark samples: 0/16. Full comparison values and hashes are in aggregate.json; complete raw and cleanup evidence are in the retained selected-control artifacts.\n")
 
 
 def operator_report(args, env=os.environ):
     """A terminal Actions artifact/summary, with no source status/check writes."""
-    report = dict(schema_version=1, purpose=OPERATOR_PURPOSE, passed=False, status="failed", linux_scoped_status="failed",
+    report = dict(schema_version=1, purpose=OPERATOR_PURPOSE, passed=False, status="failed", execution_scoped_status="failed",
+                  linux_scoped_status="not-verified", mac_scoped_status="not-verified",
                   full_impact_coverage_complete=False, pr_publication="not-enabled",
                   source_identity="sealed-source-not-current-pr", formal_samples=0,
                   cells=[], errors=[])
@@ -428,12 +529,15 @@ def operator_report(args, env=os.environ):
             complete = all(retained.get(device) == children[device]["id"] for device in state["errors"] if device in children)
             if (not set(state["errors"]) <= inconclusive_devices or report.get("status") != "inconclusive"
                     or not complete):
-                report.update(passed=False, status="failed", linux_scoped_status="failed", full_impact_coverage_complete=False)
+                report.update(passed=False, status="failed", execution_scoped_status="failed", full_impact_coverage_complete=False)
+                for platform, devices in (("linux", {"cloud-5090", "dgx-spark"}), ("mac", {"local-mbp"})):
+                    if devices & set(state["errors"]):
+                        report[platform + "_scoped_status"] = "failed"
             report["child_workflow_errors"] = state["errors"]
         report.update(base=envelope["base"], head=envelope["head"], candidate=envelope["candidate"],
                       operator=actor, controller=identity, envelope_sha256=fingerprint(envelope))
     except Exception as error:
-        report.update(passed=False, status="failed", linux_scoped_status="failed", full_impact_coverage_complete=False,
+        report.update(passed=False, status="failed", execution_scoped_status="failed", full_impact_coverage_complete=False,
                       error=f"{type(error).__name__}: {error}")
     save(args.output, report)
     summary = env.get("GITHUB_STEP_SUMMARY")

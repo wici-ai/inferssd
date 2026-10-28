@@ -66,6 +66,14 @@ def test_build_freeze_cache_validation_then_sandboxed_version(tmp_path, monkeypa
             events.append(("freeze", stage, fields))
             assert stage == "base-build"
             assert fields == ({"source": paths["build"], "name": "base"} if platform == "darwin" else {})
+            if platform == "darwin":
+                records = {str(p.relative_to(frozen)):dict(size=p.stat().st_size,
+                    sha256=hashlib.sha256(p.read_bytes()).hexdigest(), mode=0o444)
+                    for p in frozen.rglob("*") if p.is_file()}
+                manifest = frozen.parent / "base.manifest.json"
+                manifest.write_text(json.dumps(records)); manifest.chmod(0o444)
+                return dict(path=paths["frozen"], manifest_path=str(manifest),
+                    manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest(), file_count=len(records), readonly=True)
             return {"path": paths["frozen"], "host_path": str(frozen), "manifest_sha256": "b" * 64}
 
     if bad_toolchain:
@@ -121,3 +129,24 @@ def test_only_complete_root_freezer_alias_groups_are_readable(tmp_path, monkeypa
         result = staged_build.sealed_file(root / names[1], aliases=aliases)
         assert result["sha256"] == sha256
         assert set(result["aliases"]) == {str(root / name) for name in names}
+
+
+@pytest.mark.parametrize("platform,flags", [
+    ("darwin", ["-DLLAMA_SSD_STORE=ON", "-DBUILD_SHARED_LIBS=OFF"]),
+    ("darwin", ["-DLLAMA_SSD_STORE:BOOL=TRUE"]),
+    ("linux", ["-DBUILD_SHARED_LIBS=OFF"]),
+    ("linux", ["-DLLAMA_USE_SYSTEM_GGML=ON"]),
+])
+def test_incompatible_store_profile_rejected_before_build(platform, flags):
+    with pytest.raises(ValueError, match="LLAMA_SSD_STORE requires Linux"):
+        staged_build.validate_platform_flags(platform, flags)
+
+
+@pytest.mark.parametrize("platform,flags", [
+    ("darwin", ["-DBUILD_SHARED_LIBS=OFF", "-DGGML_METAL=ON"]),
+    ("darwin", ["-DLLAMA_SSD_STORE=ON", "-DLLAMA_SSD_STORE:BOOL=OFF"]),
+    ("linux", ["-DLLAMA_SSD_STORE=ON", "-DBUILD_SHARED_LIBS=ON"]),
+    ("linux", ["-DLLAMA_SSD_STORE=OFF", "-DBUILD_SHARED_LIBS=OFF"]),
+])
+def test_supported_platform_profiles(platform, flags):
+    staged_build.validate_platform_flags(platform, flags)

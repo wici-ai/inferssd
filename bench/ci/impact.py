@@ -65,6 +65,8 @@ def requirements(path):
     Specific intersections precede shared rules. Unknown code expands to all
     six cells. No substring match such as `muse` narrows an unknown shared file.
     """
+    if path.startswith("bench/ci/macos-sandbox/") or path == "bench/ci/operator_mac_stage.py":
+        return MAC, MODELS, True, False, "Mac isolated execution/resource/lease path"
     if path.startswith("engine/ggml/src/ggml-cuda/"):
         models = ("deepseek",) if ("mxfp4" in PurePosixPath(path).name
                                   or PurePosixPath(path).name.startswith("dsv4-")) else MODELS

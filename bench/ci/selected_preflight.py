@@ -6,16 +6,17 @@ import time
 import final_chat
 from ci.compare import comparable
 from ci.contract import digest, load, save
+from ci import mac_host_gate
 from ci.selection_contract import linux_stages, PERFORMANCE_MODE
 from ci.staged_benchmark import verify_stopped
 from ci.staged_smoke import smoke
-from ci.selected_receipt import receipt
+from ci.selected_receipt import receipt, mac_job_root
 
 
 LAUNCH = ("argv", "environment", "cwd", "port", "timeout_s", "request_timeout_s")
 
 
-def launch(spec, side, *, required=False):
+def launch(spec, side, *, required=False, job_root=None):
     """Use an explicit short argv; only its private event file may differ.
 
     Native telemetry uses O_EXCL, so the preflight and timed server cannot own
@@ -24,6 +25,12 @@ def launch(spec, side, *, required=False):
     """
     if side not in ("base", "candidate"):
         raise ValueError("explicit preflight source side required")
+    prefix = "/scratch/" + side + "/"
+    if job_root is not None:
+        import re
+        if not re.fullmatch(r"/Library/InferSSD-CI/jobs/[0-9a-f]{32}", job_root):
+            raise ValueError("Mac preflight requires the current fixed job root")
+        prefix = job_root + "/work/" + side + "/"
     if "preflight_argv" not in spec:
         if required:
             raise ValueError("operator performance requires explicit preflight_argv")
@@ -43,7 +50,7 @@ def launch(spec, side, *, required=False):
         if index != short.index(flag) or index + 1 >= len(timed) or index + 1 >= len(short):
             raise ValueError("preflight telemetry argument position differs")
         for path in (timed[index + 1], short[index + 1]):
-            if (not path.startswith("/scratch/" + side + "/") or not path.endswith(".jsonl")
+            if (not path.startswith(prefix) or not path.endswith(".jsonl")
                     or str(PurePosixPath(path)) != path
                     or any(part in (".", "..") for part in path.split("/"))):
                 raise ValueError("preflight telemetry must use its canonical side scratch path")
@@ -95,7 +102,8 @@ def declarations(config, manifest, needs):
                 timed_stage = side + "-" + model + "-benchmark-" + tier
                 if expected is not None and manifest["stages"].get(timed_stage) != expected[timed_stage]:
                     raise ValueError("root manifest does not authorize the exact timed stage")
-                short = launch(spec, side, required=config.get("validation_mode") == PERFORMANCE_MODE)
+                short = launch(spec, side, required=config.get("validation_mode") == PERFORMANCE_MODE,
+                               job_root=mac_job_root(config["manifest_path"]) if platform == "darwin" else None)
                 pair["sides"][side] = dict(short, model=model, tier=tier, revision=data["revision"])
             # These fields are required by the already existing functional run.
             # Reading them now prevents a missing reuse declaration being hidden
@@ -116,6 +124,8 @@ def run(session, config, manifest, pairs, builds, functional, output):
     gate = dict(schema_version=1, purpose="selected-performance-preflight", status="failed",
                 timed_samples=0, started_monotonic_ns=time.monotonic_ns(), cells=[])
     checked = {}
+    host_options = ({"host_policy": mac_host_gate.policy(config)}
+                    if config["paths"]["platform"] == "darwin" else {})
     try:
         for pair in pairs:
             model, tier = pair["model"], pair["tier"]
@@ -128,7 +138,7 @@ def run(session, config, manifest, pairs, builds, functional, output):
                 reuse = side == "candidate" and same_launch(functional[model]["launch"], spec)
                 raw = functional[model]["output"] if reuse else folder
                 result = functional[model]["result"] if reuse else smoke(
-                    session, spec, raw, stage_id=side + "-" + model + "-preflight-" + tier)
+                    session, spec, raw, stage_id=side + "-" + model + "-preflight-" + tier, **host_options)
                 if (result.get("status") != "passed" or result.get("cleanup_confirmed") is not True
                         or result.get("completion_requests") != 1):
                     raise RuntimeError("selected short preflight failed or was unclean; no timing or retry")
@@ -178,7 +188,8 @@ def retained(root, config, needs):
                 raise ValueError("only an identical candidate functional run can be reused")
             model_data = config["sides"][side]["models"][model]
             short = launch(model_data["benchmarks"][tier], side,
-                           required=config.get("validation_mode") == PERFORMANCE_MODE)
+                           required=config.get("validation_mode") == PERFORMANCE_MODE,
+                           job_root=mac_job_root(config["manifest_path"]) if config["paths"]["platform"] == "darwin" else None)
             if reused and not same_launch(model_data["smoke"], short):
                 raise ValueError("reused functional launch differs from the performance arm")
             raw = root / ("native-" + model) if reused else folder

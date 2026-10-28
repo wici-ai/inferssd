@@ -12,12 +12,151 @@ import io
 import json
 from pathlib import Path, PurePosixPath
 import re
+from types import SimpleNamespace
 
 from ci.contract import digest, load, save
 from ci.staged_build import sealed_file
 from ci.staged_checkpoint import mapped_files, image_identity, native_settings
 from ci.model_admission import checked_model
-from ci.staged_benchmark import verify_runtime
+from ci.staged_benchmark import verify_runtime, verify_stopped
+
+
+MAC_MEMORY_METRIC = "physical-footprint"
+MAC_RESOURCE_ENFORCEMENT = "root-sampled-worker-physical-footprint-processes-host-reserve"
+
+
+def mac_job_root(manifest_path):
+    match = re.fullmatch(r"/Library/InferSSD-CI/private/job-manifests/([0-9a-f]{32})\.json", str(manifest_path))
+    if match is None:
+        raise ValueError("Mac receipt requires the fixed current root job manifest")
+    return "/Library/InferSSD-CI/jobs/" + match[1]
+
+
+def mac_stopped(config, manifest, stopped):
+    """A clean requested stop still needs this job's UID/domain/lease receipt."""
+    verify_stopped(stopped)
+    root = mac_job_root(config["manifest_path"])
+    cleanup = stopped.get("cleanup", {})
+    if not isinstance(cleanup, dict):
+        raise ValueError("Mac cleanup inventory is missing")
+    retired = cleanup.get("worker_user_domain_retired")
+    if (stopped.get("job_id") != PurePosixPath(root).name
+            or stopped.get("job_root") != root or stopped.get("scope_identity") != root
+            or stopped.get("worker_uid") != 62002
+            or stopped.get("manifest_sha256") != config["manifest_sha256"]
+            or stopped.get("lock_dev_inode") != manifest["selection_lock_identity"]
+            or cleanup.get("confirmed") is not True or cleanup.get("remaining") != []
+            or cleanup.get("error")
+            or not isinstance(retired, dict) or retired.get("returncode") != 0):
+        raise ValueError("Mac stop lacks exact job/lease and empty worker-domain cleanup")
+
+
+def mac_memory_sample(observed, resources):
+    """Verify the root executor's live footprint sum and exited-PID partition."""
+    members = observed.get("members")
+    samples = observed.get("memory_members")
+    exited = observed.get("memory_exited_pids")
+    footprint = observed.get("physical_footprint_bytes")
+    if (observed.get("memory_metric") != MAC_MEMORY_METRIC
+            or "memory_accounting_error" in observed
+            or observed.get("resource_violation") is not None
+            or type(footprint) is not int or footprint < 0
+            or observed.get("resource_policy") != resources
+            or not isinstance(members, list) or not members or len(members) > resources["max_processes"]
+            or not isinstance(samples, list) or not isinstance(exited, list)):
+        raise ValueError("Mac physical footprint accounting is missing or invalid")
+    inventory = {}
+    for row in members:
+        if (not isinstance(row, dict) or type(row.get("pid")) is not int or row["pid"] <= 1
+                or row["pid"] in inventory
+                or type(row.get("rss_bytes")) is not int or row["rss_bytes"] < 0):
+            raise ValueError("Mac worker memory inventory differs")
+        inventory[row["pid"]] = row
+    if (type(observed.get("rss_bytes")) is not int
+            or observed["rss_bytes"] != sum(row["rss_bytes"] for row in members)):
+        raise ValueError("Mac diagnostic RSS sum differs")
+    live, total = {}, 0
+    for row in samples:
+        if not isinstance(row, dict):
+            raise ValueError("Mac footprint member is invalid")
+        pid, birth = row.get("pid"), row.get("birth_identity")
+        if (type(pid) is not int or pid not in inventory or pid in live
+                or type(row.get("rss_bytes")) is not int or row["rss_bytes"] != inventory[pid]["rss_bytes"]
+                or not isinstance(birth, dict) or birth.get("pid") != pid or birth.get("uid") != 62002
+                or any(type(birth.get(key)) is not int for key in ("pid", "uid", "start_sec", "start_usec"))
+                or birth["start_sec"] <= 0 or not 0 <= birth["start_usec"] < 1000000
+                or any(type(row.get(key)) is not int or row[key] < 0 for key in (
+                    "physical_footprint_bytes", "resident_bytes", "start_abstime", "exit_abstime"))
+                or row["start_abstime"] == 0 or row["exit_abstime"] != 0):
+            raise ValueError("Mac live footprint member identity or accounting differs")
+        live[pid] = row
+        total += row["physical_footprint_bytes"]
+    if (any(type(pid) is not int or pid not in inventory for pid in exited)
+            or len(set(exited)) != len(exited) or set(exited) & live.keys()
+            or live.keys() | set(exited) != inventory.keys()
+            or observed.get("worker_pid") not in live
+            or live[observed["worker_pid"]]["birth_identity"] != observed.get("birth_identity")):
+        raise ValueError("Mac live/exited memory membership differs")
+    if footprint != total or footprint > resources["memory_budget_bytes"]:
+        raise ValueError("Mac physical footprint sum or budget differs")
+    return footprint
+
+
+def mac_runtime_images(config, manifest, side, model, spec, started, observations):
+    """Recheck root Mac samples without inventing a Linux hard memory limit.
+
+    The executor monitors worker physical footprint/process count and host reserve.
+    RSS is retained only as a diagnostic, including reclaimable file mappings.
+    These snapshots attest that sampled policy, not memory.max or swap=0.
+    """
+    root = mac_job_root(config["manifest_path"])
+    resources = config["host"]["resources"]
+    keys = {"max_processes", "memory_budget_bytes", "host_reserve_bytes"}
+    lease = manifest.get("selection_lock_identity")
+    if (set(resources) != keys or any(type(resources[k]) is not int or resources[k] <= 0 for k in keys)
+            or manifest.get("selection_resource_policy") != resources
+            or not isinstance(lease, list) or len(lease) != 2
+            or any(type(v) is not int or v < 0 for v in lease)
+            or config["sides"][side]["paths"]["job_root"] != root):
+        raise ValueError("Mac root resource policy or original lease is missing")
+    data = config["sides"][side]["models"][model]
+    readonly = {row["runtime_path"] for row in data["model_identity"]["shards"]}
+    readonly.update(data[key]["runtime_path"] for key in ("settings", "template"))
+    paths = []
+    for observed in observations:
+        verify_runtime(SimpleNamespace(**started), observed)
+        birth = observed["birth_identity"]
+        members = observed.get("members")
+        if (observed.get("worker_uid") != 62002 or not isinstance(birth, dict)
+                or birth.get("uid") != 62002 or birth.get("pid") != started["worker_pid"]
+                or any(type(birth.get(k)) is not int or birth[k] < 0 for k in ("start_sec", "start_usec"))
+                or birth["start_usec"] >= 1000000 or not birth["start_sec"]
+                or observed.get("job_id") != PurePosixPath(root).name
+                or observed.get("job_root") != root or observed["scope_identity"] != root
+                or observed.get("manifest_sha256") != config["manifest_sha256"]
+                or observed.get("lock_dev_inode") != lease
+                or observed.get("argv") != spec["argv"]
+                or observed.get("resource_policy") != resources
+                or not isinstance(members, list) or not members
+                or len(members) > resources["max_processes"]):
+            raise ValueError("Mac PID/birth/job/lease/launch/resource sample differs")
+        mac_memory_sample(observed, resources)
+        if (observed.get("listener_pids") != [started["worker_pid"]]
+                or not isinstance(observed.get("lsof"), str)):
+            raise ValueError("Mac worker listener/image inventory differs")
+        current, owner = None, []
+        for line in observed["lsof"].splitlines():
+            if line.startswith("p"):
+                current = int(line[1:])
+            elif line.startswith("u") and current == started["worker_pid"]:
+                owner.append(line[1:])
+        if owner != ["62002"]:
+            raise ValueError("Mac lsof inventory does not bind the execution UID")
+        paths.append({path: None for path in mac_images(observed["lsof"], started["worker_pid"])
+                      if path not in readonly})
+    if not paths or any(paths[0] != observed for observed in paths[1:]):
+        raise ValueError("Mac executable image set changed during completion")
+    return paths
 
 
 def normalize(value, frozen):
@@ -60,20 +199,39 @@ def retained_typed_settings(native, expected, side, model, build, freeze_manifes
             continue
         if assets is None:
             frozen = build["freeze"]
-            host = frozen["host_path"]
-            frozen_side = frozen.get("side")
-            if (not isinstance(manifest_path, str) or not re.fullmatch(
+            host = frozen.get("host_path", frozen["path"])
+            if str(manifest_path).startswith("/Library/InferSSD-CI/"):
+                root = mac_job_root(manifest_path)
+                runtime_root = side["paths"]["frozen"]
+                frozen_side = PurePosixPath(runtime_root).name
+                if (frozen_side not in ("base", "candidate")
+                        or side["paths"].get("job_root") != root
+                        or runtime_root != root + "/frozen/" + frozen_side
+                        or frozen["path"] != runtime_root or host != runtime_root
+                        or frozen.get("manifest_path") != root + "/frozen/" + frozen_side + ".manifest.json"
+                        or frozen.get("readonly") is not True
+                        or digest(freeze_manifest) != frozen["manifest_sha256"]):
+                    raise ValueError("retained Mac source does not bind the fixed side freeze")
+                inventory = load(freeze_manifest)
+                if (not isinstance(inventory, dict) or type(frozen.get("file_count")) is not int
+                        or not frozen["file_count"] or len(inventory) != frozen["file_count"]):
+                    raise ValueError("retained Mac source freezer inventory differs")
+                records = [dict(row, path=name) for name, row in inventory.items()]
+            else:
+                frozen_side = frozen.get("side")
+                runtime_root = "/build/" + str(frozen_side)
+                if (not isinstance(manifest_path, str) or not re.fullmatch(
                     r"/var/lib/inferssd-ci-broker/jobs/[0-9a-f]{32}/manifest\.json", manifest_path)
                     or frozen_side not in ("base", "candidate")
-                    or side["paths"]["frozen"] != "/build/" + frozen_side
-                    or frozen["path"] != "/build/" + frozen_side or not isinstance(host, str)
+                    or side["paths"]["frozen"] != runtime_root
+                    or frozen["path"] != runtime_root or not isinstance(host, str)
                     or host != str(PurePosixPath(manifest_path).parent / "frozen" / frozen_side)):
-                raise ValueError("retained source does not bind the fixed side freeze")
-            records = load(freeze_manifest)["files"]
-            encoded = json.dumps(records, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-            if (hashlib.sha256(encoded).hexdigest() != frozen["manifest_sha256"]
-                    or len(records) != frozen["files"]):
-                raise ValueError("retained source root freezer inventory differs")
+                    raise ValueError("retained source does not bind the fixed side freeze")
+                records = load(freeze_manifest)["files"]
+                encoded = json.dumps(records, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+                if (hashlib.sha256(encoded).hexdigest() != frozen["manifest_sha256"]
+                        or len(records) != frozen["files"]):
+                    raise ValueError("retained source root freezer inventory differs")
             assets = {}
             for row in records:
                 name = row["path"]
@@ -83,7 +241,7 @@ def retained_typed_settings(native, expected, side, model, build, freeze_manifes
                 assets[name] = row
         names = []
         for value in (observed, reference):
-            prefix = next((p for p in ("/build/" + frozen_side + "/", "<sealed-build>/") if value.startswith(p)), None)
+            prefix = next((p for p in (runtime_root + "/", "<sealed-build>/") if value.startswith(p)), None)
             name = value[len(prefix):] if prefix else ""
             if (not name.startswith("assets/") or "\\" in name
                     or any(part in ("", ".", "..") for part in name.split("/"))):
@@ -164,19 +322,9 @@ def receipt(config, manifest, side, model, spec, build, output, *, destination=N
     else:
         # Root executor policy is in the hash-bound job manifest, not supplied by
         # candidate output. A legacy manifest without it cannot pass performance.
-        if manifest["selection_resource_policy"] != resources:
-            raise ValueError("Mac root enforcement policy differs from the compared envelope")
         ambient = dict(spec["environment"])
-        for observed in (before, after):
-            if observed["argv"] != spec["argv"]:
-                raise ValueError("root executor launch differs from the reviewed native argv")
-            if (observed.get("members") is None or observed.get("resource_policy") != resources
-                    or observed["rss_bytes"] > resources["memory_budget_bytes"]):
-                raise ValueError("Mac process memory inventory missing or over budget")
-            # lsof labels mmap'ed GGUF inputs as txt too. They are separately
-            # verified readonly data, never an executable image or system DSO.
-            paths.append({path: None for path in mac_images(observed["lsof"], started["worker_pid"])
-                          if path not in readonly_data})
+        paths = mac_runtime_images(config, manifest, side, model, spec, started, (before, after))
+        mac_stopped(config, manifest, load(output / "stopped.json"))
     if set(paths[0]) != set(paths[1]):
         raise ValueError("actual executable image set changed during completion")
     frozen = config["sides"][side]["paths"]["frozen"]
@@ -232,7 +380,8 @@ def receipt(config, manifest, side, model, spec, build, output, *, destination=N
         if source in shard_sizes:
             continue
         relative = Path(source).relative_to(frozen)
-        _, alias_raw = sealed_file(Path(build["freeze"]["host_path"]) / relative, contents=True)
+        frozen_host = build["freeze"].get("host_path", build["freeze"]["path"])
+        _, alias_raw = sealed_file(Path(frozen_host) / relative, contents=True)
         rows = list(csv.DictReader(io.StringIO(alias_raw.decode()), delimiter="\t"))
         if not rows:
             raise ValueError("empty expert source alias")
@@ -264,5 +413,7 @@ def receipt(config, manifest, side, model, spec, build, output, *, destination=N
                             effective_settings=dict(native_launch_policy=normalize(dict(args=args, typed_values=expected,
                                 template_sha256=template["sha256"]), frozen), native_resource_policy=resources,
                                 ambient_environment=ambient, system_images=systems)))
+    if platform == "darwin":
+        result["host"]["effective_settings"]["native_resource_enforcement"] = MAC_RESOURCE_ENFORCEMENT
     save(destination if destination is not None else output / "comparison-receipt.json", result)
     return result

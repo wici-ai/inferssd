@@ -6,8 +6,9 @@ The deployed operator path accepts an exact-head `/ci test` Comment review from
 a source maintainer, including for an external fork. It uses existing account
 permissions and the private controller's Actions report, without a check App.
 It seals the required base/candidate sources and reuses `StageSession` for the
-impact-selected Linux functional/numerical checks and 512/decode256 comparison.
-Mac is deferred in this deployment. See [review entry, results and limits](REVIEW-ENTRY.md)
+impact-selected functional/numerical checks and 512/decode256 comparison on
+explicitly enabled Linux and Mac devices. Mac requires its existing root executor
+and separately reviewed SSH staging bootstrap. See [review entry, results and limits](REVIEW-ENTRY.md)
 and [operator preparation](OPERATOR-PREPARE.md). Historic functional-only runs
 remain functional-only; deployment is not performance evidence.
 

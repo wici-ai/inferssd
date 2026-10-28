@@ -26,7 +26,7 @@ import run_final
 
 from ci.compare import compare_pair
 from ci.contract import digest, load, policy_read, revision, save
-from ci.isolated_device import protected
+from ci.isolated_device import protected, protected_manifest
 from ci.reference import LEGACY_REVISION, identity, validate_binding
 from ci.resume_base import recover
 from ci.stage_session import StageSession, unique_object
@@ -326,9 +326,7 @@ def run(args):
         if "reference_profile" in config:
             report["reference_profile"] = copy.deepcopy(config["reference_profile"])
         policy_read(config["policy"])
-        manifest_path = protected(config["manifest_path"])
-        if digest(manifest_path) != config["manifest_sha256"]:
-            raise ValueError("root manifest hash differs")
+        manifest_path = protected_manifest(config)
         manifest = load(manifest_path)
         if manifest["job_id"] != args.job_id:
             raise ValueError("root manifest belongs to another job")

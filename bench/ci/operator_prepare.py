@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare operator-authorized Linux CI data; keep gh credentials on this host.
+"""Prepare operator-authorized device CI data; keep gh credentials on this host.
 
 Preparation exports immutable Git objects and explicit reviewed device inputs.
 It does not install, connect to a device, acquire a lease or execute source code.
@@ -23,15 +23,42 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci.contract import HASH, digest, load, policy_read, revision, save
 from ci.impact import fingerprint, plan, device_requirements
+from ci.staged_build import validate_platform_flags
 from ci.selection_contract import JOB, bind, bound, runtime_requirements, performance_protocol
 
 
-DEVICES = ("cloud-5090", "dgx-spark")
+LINUX_DEVICES = ("cloud-5090", "dgx-spark")
+DEVICES = (*LINUX_DEVICES, "local-mbp")
 MODE = "functional-numerical-performance"
 LEGACY_MODE = "functional-numerical"
 PURPOSE = "operator-selected-report-only"
 MAX_INPUT = 60 * 1024
 WORKFLOW = ".github/workflows/device-performance.yml"
+MAC_PYTHON = "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9"
+
+
+def device_layout(device, job_id):
+    if device == "local-mbp":
+        base = "/Library/InferSSD-CI"
+        return dict(platform="darwin", source=base + "/inputs/operator-" + job_id,
+                    manifest=base + "/private/job-manifests/" + job_id + ".json",
+                    config=base + "/integrations/" + job_id + ".json",
+                    stager=base + "/controller/current/bench/ci/operator_mac_stage.py")
+    if device not in LINUX_DEVICES:
+        raise ValueError("unknown operator device")
+    return dict(platform="linux", source="/var/lib/inferssd-ci-inputs/operator-" + job_id,
+                manifest="/var/lib/inferssd-ci-broker/jobs/" + job_id + "/manifest.json",
+                config="/opt/inferssd-ci-integrations/" + job_id + ".json",
+                stager="/opt/inferssd-ci-control/current/bench/ci/operator_stage.py")
+
+
+def machine_identity(value):
+    if (not isinstance(value, dict) or set(value) != {"hardware_uuid_sha256", "hardware_model", "cpu_brand"}
+            or HASH.fullmatch(value.get("hardware_uuid_sha256", "")) is None
+            or any(not isinstance(value[k], str) or not value[k] or "\0" in value[k]
+                   for k in ("hardware_model", "cpu_brand"))):
+        raise ValueError("explicit reviewed Mac physical machine identity required")
+    return value
 
 
 def parsed(raw):
@@ -71,7 +98,27 @@ class Gh:
         if result.returncode:
             # gh diagnostics may mention the active auth configuration. Do not
             # retain/forward authentication output into the device package.
-            raise RuntimeError("existing gh login/API request failed: " + path)
+            detail = ""
+            prefix = b"gh-ci-read-retry-v3: local-failure="
+            if len(result.stderr) <= 512 and result.stderr.startswith(prefix):
+                try:
+                    failure = parsed(result.stderr[len(prefix):])
+                except (ValueError, UnicodeError):
+                    failure = None
+                if (
+                    isinstance(failure, dict)
+                    and set(failure) == {"schema_version", "phase", "kind", "errno"}
+                    and type(failure["schema_version"]) is int and failure["schema_version"] == 1
+                    and isinstance(failure["phase"], str) and isinstance(failure["kind"], str)
+                    and failure["phase"] in {"audit-open", "audit-append", "diagnostic-write", "client-read"}
+                    and failure["kind"] in {"storage-exhausted", "unsafe-path", "reap-timeout", "io-failed"}
+                    and (failure["errno"] is None or type(failure["errno"]) is int and 0 <= failure["errno"] <= 4095)
+                ):
+                    detail = " (local " + failure["phase"] + "/" + failure["kind"] + ")"
+            raise RuntimeError(
+                "existing gh login/API request failed: " + path
+                + " (exit " + str(result.returncode) + ")" + detail
+            )
         return parsed(result.stdout) if result.stdout.strip() else None
 
 
@@ -229,7 +276,11 @@ def normalize(template, manifest, declared, job_id, identities, mode=MODE):
     template, manifest = (replace_strings(value, [(old_job, job_id), ("{{job_id}}", job_id),
         ("/JOB/", "/" + job_id + "/")]) for value in (template, manifest))
     sides = ("base", "candidate") if mode == MODE else ("candidate",)
-    root = "/var/lib/inferssd-ci-inputs/operator-" + job_id
+    layout = device_layout(template["device"], job_id)
+    mac = layout["platform"] == "darwin"
+    if mac and mode != MODE:
+        raise ValueError("Mac operator staging requires the explicit performance mode")
+    root = layout["source"]
     source_roots = {side: root + "/" + side if mode == MODE else root for side in sides}
     manifest["sources"] = source_roots
     manifest["source_revisions"] = {side: identities[side] for side in sides}
@@ -242,17 +293,31 @@ def normalize(template, manifest, declared, job_id, identities, mode=MODE):
     template["host"]["os_page_cache_treatment"] = cache_treatment
     for side, previous in list(template["sides"].items()):
         spec = replace_strings(previous, [(previous["revision"], identities[side])])
+        if mac and side in sides:
+            spec = replace_strings(spec, [(spec["paths"]["source"], source_roots[side])])
+        if side in sides:
+            validate_platform_flags(layout["platform"], spec["build"]["cmake_flags"])
         template["sides"][side] = spec
         for model, data in spec["models"].items():
             if side in sides:
-                prefix = "/source/" + side + "/"
+                prefix = spec["paths"]["source"].rstrip("/") + "/" if mac else "/source/" + side + "/"
                 path = data["template"]["runtime_path"]
                 if not path.startswith(prefix):
                     raise ValueError("template must belong to its exact source side")
-                data["template"]["host_path"] = source_roots[side] + "/" + relative(path[len(prefix):])
+                template_path = source_roots[side] + "/" + relative(path[len(prefix):])
+                data["template"]["host_path"] = template_path
                 settings = data["settings"]
-                settings["host_path"] = "/opt/inferssd-ci-integrations/" + job_id + "-" + model + "-" + side + "-settings.ssd"
-                settings["runtime_path"] = "/models/settings-" + model + "-" + side + ".ssd"
+                old_template, old_settings = path, settings["runtime_path"]
+                settings["host_path"] = (root + "/settings-" + model + "-" + side + ".ssd" if mac else
+                    "/opt/inferssd-ci-integrations/" + job_id + "-" + model + "-" + side + "-settings.ssd")
+                settings["runtime_path"] = settings["host_path"] if mac else "/models/settings-" + model + "-" + side + ".ssd"
+                if mac:
+                    data["template"]["runtime_path"] = template_path
+                    for launch in [data["smoke"], *data.get("benchmarks", {}).values()]:
+                        for key in ("argv", "preflight_argv"):
+                            if key in launch:
+                                launch[key] = [template_path if x == old_template else settings["runtime_path"]
+                                               if x == old_settings else x for x in launch[key]]
                 mounts["settings-" + model + "-" + side + ".ssd"] = settings["host_path"]
             if "model_identity" not in data:
                 data["model_identity"] = copy.deepcopy(template["model_identity"][model])
@@ -264,8 +329,14 @@ def normalize(template, manifest, declared, job_id, identities, mode=MODE):
             data["smoke"]["os_page_cache_treatment"] = cache_treatment
             if mode == LEGACY_MODE and data.get("benchmarks"):
                 raise ValueError("operator functional/numerical input must not contain timed arms")
+        if mac and side in sides:
+            spec["paths"]["source"] = source_roots[side]
     manifest["models"] = mounts
-    template["manifest_path"] = "/var/lib/inferssd-ci-broker/jobs/" + job_id + "/manifest.json"
+    template["manifest_path"] = layout["manifest"]
+    if mac:
+        manifest["input_roots"] = [root]
+        manifest["model_roots"] = sorted({mounts[model] for model in template["sides"]["candidate"]["models"]})
+        manifest["selection_lock_identity"] = declared["lock_identity"]
     if mode == MODE:
         template["performance_protocol"] = performance_protocol()
     for key in ("control_revision", "control_manifest_sha256"):
@@ -280,11 +351,15 @@ def staged_settings_name(model, side, mode):
     return "settings-" + model + ("-" + side if mode == MODE else "") + ".ssd"
 
 
-def paired_settings(base, candidate):
+def paired_settings(base, candidate, *, device=None, job_id=None):
     # Only the side's source/build namespace is an identity difference. Every
     # other byte (including typed resource values) must remain identical.
-    return base.replace(b"/build/base/", b"/build/candidate/").replace(
-        b"/source/base/", b"/source/candidate/") == candidate
+    if device == "local-mbp":
+        if not isinstance(job_id, str) or JOB.fullmatch(job_id) is None:
+            raise ValueError("exact Mac job namespace required")
+        root = ("/Library/InferSSD-CI/jobs/" + job_id + "/frozen/").encode()
+        return base.replace(root + b"base/", root + b"candidate/") == candidate
+    return base.replace(b"/build/base/", b"/build/candidate/").replace(b"/source/base/", b"/source/candidate/") == candidate
 
 
 def root_policy(config, manifest, declared):
@@ -292,16 +367,23 @@ def root_policy(config, manifest, declared):
         broker_config_sha256=config["broker_config_sha256"], lock_identity=declared["lock_identity"],
         control_revision=config["control_revision"], control_manifest_sha256=config["control_manifest_sha256"],
         resources_sha256=fingerprint(config["host"]["resources"]), min_free_bytes=declared["min_free_bytes"],
-        gpu_uuid=declared["gpu_uuid"],
         models={model: dict(mount=manifest["models"][model], identity_sha256=fingerprint(data["model_identity"]),
                            settings_sha256=data["settings"]["sha256"])
                 for model, data in config["sides"]["candidate"]["models"].items()},
         model_admission={key: config[key] for key in ("model_admission_path", "model_admission_sha256",
             "model_mount_proof_path", "model_mount_proof_sha256", "prior_model_job_id") if key in config})
+    if config["device"] == "local-mbp":
+        value.update(broker_device=declared["broker_device"], machine_identity=machine_identity(declared["machine_identity"]))
+        for model in value["models"].values():
+            model["settings_template_sha256"] = model.pop("settings_sha256")
+    else:
+        value["gpu_uuid"] = declared["gpu_uuid"]
     if config.get("validation_mode") == MODE:
         value.update(performance_protocol=performance_protocol(), side_settings_sha256={side: {
             model: data["settings"]["sha256"] for model, data in config["sides"][side]["models"].items()}
             for side in ("base", "candidate")})
+        if config["device"] == "local-mbp":
+            value["side_settings_template_sha256"] = value.pop("side_settings_sha256")
     return value
 
 
@@ -317,8 +399,9 @@ def prepare(args, api=None):
     execution = list(args.execution_devices)
     if (not execution or len(set(execution)) != len(execution) or not set(execution) <= set(DEVICES)
             or specification.get("schema_version") != 1
-            or set(specification.get("devices", {})) != set(DEVICES)):
-        raise ValueError("explicit reviewed inputs for exactly both Linux devices required")
+            or not set(execution) <= set(specification.get("devices", {}))
+            or not set(specification.get("devices", {})) <= set(DEVICES)):
+        raise ValueError("explicit reviewed inputs for each selected device required")
     actor, workflow_sha = access(api or Gh(args.gh), policy)
     api = api or Gh(args.gh)
     if workflow_sha != revision(specification["controller_workflow_sha"]):
@@ -328,9 +411,9 @@ def prepare(args, api=None):
     impact = plan(paths, policy, **identities)
     execution = [device for device in execution if device_requirements(impact, device)["models"]]
     if not execution:
-        raise ValueError("impact requires no enabled Linux device; do not stage or dispatch")
+        raise ValueError("impact requires no enabled device; do not stage or dispatch")
     root = args.inputs.resolve().parent
-    devices, jobs, inputs = {}, {}, {}
+    devices, jobs, inputs, pending_assets = {}, {}, {}, {}
     for device in execution:
         declared = specification["devices"][device]
         job_id = declared.get("job_id", uuid.uuid4().hex)
@@ -342,10 +425,21 @@ def prepare(args, api=None):
             raise ValueError("device/job template differs from selected slot")
         template.update(execution_devices=execution, validation_mode=mode, selection_plan=impact)
         admission_policy = root_policy(template, manifest, declared)
+        if device == "local-mbp":
+            from ci.operator_mac_stage import settings_payload
+            for side, spec in template["sides"].items():
+                for model, data in spec["models"].items():
+                    name = staged_settings_name(model, side, mode)
+                    raw = input_file(root, declared["rootstage_files"][name]).read_bytes()
+                    if hashlib.sha256(raw).hexdigest() != data["settings"]["sha256"]:
+                        raise ValueError("Mac settings template differs from its reviewed hash")
+                    raw = settings_payload(raw, job_id, side)
+                    pending_assets[device, name] = raw
+                    data["settings"]["sha256"] = hashlib.sha256(raw).hexdigest()
         if mode == MODE:
             for side, spec in template["sides"].items():
                 for data in spec["models"].values():
-                    prefix = "/source/" + side + "/"
+                    prefix = template["sides"][side]["paths"]["source"].rstrip("/") + "/" if device == "local-mbp" else "/source/" + side + "/"
                     relative_template = relative(data["template"]["runtime_path"][len(prefix):])
                     data["template"]["sha256"] = hashlib.sha256(git(args.source, "show", identities[side] + ":" + relative_template)).hexdigest()
         needs = runtime_requirements(template)
@@ -363,6 +457,8 @@ def prepare(args, api=None):
             manifest[key] = {side: manifest[key][side] for side in active_sides}
         manifest["models"] = {name: path for name, path in manifest["models"].items() if name in needs["models"] or
             any(name == "settings-" + model + "-" + side + ".ssd" for model in needs["models"] for side in active_sides)}
+        if device == "local-mbp":
+            manifest["model_roots"] = sorted({manifest["models"][model] for model in needs["models"]})
         config, manifest = bind(template, manifest, impact, policy)
         if mode == MODE:
             from ci.selected_preflight import declarations
@@ -377,7 +473,11 @@ def prepare(args, api=None):
         lock = declared["lock_identity"]
         if not isinstance(lock, list) or len(lock) != 2 or any(type(x) is not int or x < 0 for x in lock):
             raise ValueError("actual original device/inode lease identity required")
-        if not isinstance(declared["gpu_uuid"], str) or not declared["gpu_uuid"].startswith("GPU-"):
+        if device == "local-mbp":
+            machine_identity(declared.get("machine_identity"))
+            if not isinstance(declared.get("broker_device"), str) or not declared["broker_device"]:
+                raise ValueError("explicit installed Mac broker device required")
+        elif not isinstance(declared["gpu_uuid"], str) or not declared["gpu_uuid"].startswith("GPU-"):
             raise ValueError("explicit actual GPU UUID required")
         devices[device] = dict(config=config, manifest=manifest, policy=admission_policy)
         assets = {}
@@ -386,6 +486,10 @@ def prepare(args, api=None):
             if path.suffix == ".gguf" or path.stat().st_size > 128 << 20:
                 raise ValueError("root staging accepts small source/settings metadata, never model payload")
             assets[relative(name)] = dict(local_path=str(path.resolve()), bytes=path.stat().st_size, sha256=digest(path))
+            if (device, name) in pending_assets:
+                raw = pending_assets[device, name]
+                assets[name] = dict(local_path=str((args.output / device / name).resolve()),
+                                    bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
         sides = ("base", "candidate") if needs["performance"] else ("candidate",)
         expected_assets = {staged_settings_name(model, side, mode) for side in sides for model in needs["models"]}
         if not expected_assets <= set(assets):
@@ -399,19 +503,23 @@ def prepare(args, api=None):
         if needs["performance"]:
             for model in needs["models"]:
                 base_data, candidate_data = (config["sides"][side]["models"][model] for side in ("base", "candidate"))
+                def payload(side):
+                    name = staged_settings_name(model, side, mode)
+                    return pending_assets[device, name] if device == "local-mbp" else Path(assets[name]["local_path"]).read_bytes()
                 if (base_data["model_identity"] != candidate_data["model_identity"] or not paired_settings(
-                        Path(assets[staged_settings_name(model, "base", mode)]["local_path"]).read_bytes(),
-                        Path(assets[staged_settings_name(model, "candidate", mode)]["local_path"]).read_bytes())):
+                        payload("base"), payload("candidate"), device=device, job_id=job_id)):
                     raise ValueError("base/candidate model or effective settings differ")
         minimum = declared["min_free_bytes"]
         if type(minimum) is not int or minimum <= 0:
             raise ValueError("explicit positive staging free-space reserve required")
         if not HASH.fullmatch(config.get("broker_config_sha256", "")):
             raise ValueError("explicit existing broker configuration hash required")
-        transport_profile(declared["ssh"])
+        transport_profile(declared["ssh"], device=device)
         inputs[device] = dict(job_id=job_id, reviewed_template_sha256=digest(template_path),
                               reviewed_manifest_sha256=digest(manifest_path), files=assets,
                               ssh=declared["ssh"], min_free_bytes=minimum)
+        if device == "local-mbp":
+            inputs[device].update(machine_identity=declared["machine_identity"], lock_identity=lock)
     if len({row["manifest"]["job_id"] for row in devices.values()}) != len(execution):
         raise ValueError("each device needs a distinct fresh job")
     args.output.mkdir(parents=True, exist_ok=False)
@@ -426,6 +534,9 @@ def prepare(args, api=None):
     for device, row in devices.items():
         folder = args.output / device
         folder.mkdir()
+        for name in inputs[device]["files"]:
+            if (device, name) in pending_assets:
+                (folder / name).write_bytes(pending_assets[device, name])
         save(folder / "manifest.json", row["manifest"])
         row["config"]["manifest_sha256"] = digest(folder / "manifest.json")
         bound(row["config"], row["manifest"], row["manifest"]["job_id"])
@@ -445,8 +556,8 @@ def prepare(args, api=None):
     if len(json.dumps(envelope, separators=(",", ":"), allow_nan=False).encode()) > MAX_INPUT:
         raise ValueError("complete prepared envelope exceeds workflow input bound; never truncate impact")
     save(args.output / "envelope.json", envelope)
-    helper_sha = digest(Path(__file__).with_name("operator_stage.py"))
     for device, row in devices.items():
+        helper_sha = digest(Path(__file__).with_name("operator_mac_stage.py" if device == "local-mbp" else "operator_stage.py"))
         folder = args.output / device
         files = dict(inputs[device]["files"])
         for name, path in (("config.json", folder / "config.json"), ("manifest.json", folder / "manifest.json"),
@@ -477,7 +588,7 @@ def prepare(args, api=None):
     return envelope
 
 
-def transport_profile(value):
+def transport_profile(value, *, device="cloud-5090"):
     argv = value.get("argv")
     if (not isinstance(argv, list) or not argv or Path(argv[0]).name != "ssh" or "-T" not in argv
             or any(not isinstance(x, str) or not x or "\0" in x for x in argv)
@@ -485,8 +596,12 @@ def transport_profile(value):
         raise ValueError("reviewed SSH profile must disable PTY and agent forwarding")
     if "-a" not in argv:
         raise ValueError("SSH profile must explicitly disable agent forwarding")
-    expected = ["/usr/bin/python3", "-I", "/opt/inferssd-ci-control/current/bench/ci/operator_stage.py"]
+    expected = [MAC_PYTHON if device == "local-mbp" else "/usr/bin/python3", "-I",
+                *(["-B"] if device == "local-mbp" else []), device_layout(device, "0" * 32)["stager"]]
     root_argv = value.get("root_argv")
+    if device == "local-mbp" and (value.get("sudo_password_required") is not False
+            or value.get("sudo_mode", "root") != "root"):
+        raise ValueError("Mac background stage requires the fixed forced SSH entry without sudo wrapping")
     if value.get("sudo_password_required") is True:
         expected = ["/usr/bin/sudo", "-S", "-p", "", *expected]
     elif value.get("sudo_password_required") is not False:
@@ -520,7 +635,7 @@ def claim(path, value):
 
 
 def send_stage(device, data, *, password=None):
-    argv, root_argv = transport_profile(data["ssh"])
+    argv, root_argv = transport_profile(data["ssh"], device=device)
     if data["ssh"]["sudo_password_required"] and (not isinstance(password, str) or "\n" in password or "\r" in password):
         raise ValueError("one in-memory sudo password required")
     request = Path(data["root_input_path"])
@@ -538,31 +653,50 @@ def send_stage(device, data, *, password=None):
     # are neither in argv/package nor inherited for accidental SendEnv rules.
     environment = {key: value for key, value in os.environ.items()
                    if key in ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "SSH_AUTH_SOCK")}
-    process = subprocess.Popen([*argv, command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, env=environment)
-    try:
-        if data["ssh"]["sudo_password_required"]:
-            process.stdin.write((password + "\n").encode())
-            process.stdin.flush()
-        with tarfile.open(fileobj=process.stdin, mode="w|", format=tarfile.PAX_FORMAT) as archive:
-            for name, row in members.items():
-                item = tarfile.TarInfo(name)
-                item.size, item.mode = row["bytes"], 0o400
-                with Path(row["local_path"]).open("rb") as source:
-                    archive.addfile(item, source)
-        process.stdin.close()
-        process.stdin = None
-        raw, _ = process.communicate(timeout=300)
-        if process.returncode or len(raw) > 1 << 20:
-            raise RuntimeError("root staging failed; retain fresh job and stop without retry")
-        receipt = parsed(raw)
-        if receipt.get("device") != device:
-            raise ValueError("root stage returned another physical device")
-        return receipt
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+    # A file avoids a stderr pipe deadlock during synchronous source upload and
+    # retains the actual SSH/root error for the once-only attempt.
+    error_path = request.with_name("staging-stderr.log")
+    fd = os.open(error_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as errors:
+        process = subprocess.Popen([*argv, command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=errors, env=environment)
+        try:
+            broken_pipe = False
+            try:
+                if data["ssh"]["sudo_password_required"]:
+                    process.stdin.write((password + "\n").encode())
+                    process.stdin.flush()
+                with tarfile.open(fileobj=process.stdin, mode="w|", format=tarfile.PAX_FORMAT) as archive:
+                    for name, row in members.items():
+                        item = tarfile.TarInfo(name)
+                        item.size, item.mode = row["bytes"], 0o400
+                        with Path(row["local_path"]).open("rb") as source:
+                            archive.addfile(item, source)
+            except BrokenPipeError:
+                broken_pipe = True
+            finally:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    broken_pipe = True
+                process.stdin = None
+            # Upload has ended; this bound is only for root validation/sealing.
+            raw, _ = process.communicate(timeout=330)
+            if broken_pipe or process.returncode or len(raw) > 1 << 20:
+                errors.flush()
+                with error_path.open("rb") as saved:
+                    saved.seek(max(0, error_path.stat().st_size - 4096))
+                    detail = saved.read(4096).decode("utf-8", "replace").strip()
+                raise RuntimeError(f"root staging failed (exit {process.returncode}); "
+                                   f"retain fresh job and stop without retry: {detail}")
+            receipt = parsed(raw)
+            if receipt.get("device") != device:
+                raise ValueError("root stage returned another physical device")
+            return receipt
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
 
 def stage(args, sender=send_stage, *, password=None):
@@ -599,6 +733,20 @@ def validate_root_receipt(envelope, inputs, device, receipt):
         raise ValueError("root staging did not seal its source")
     if receipt.get("policy_sha256") != data["policy_sha256"]:
         raise ValueError("root stage did not use the reviewed local admission policy")
+    if device == "local-mbp":
+        recovered = receipt.get("broker_recovery", {})
+        request = load(Path(data["root_input_path"]))
+        if (receipt.get("machine_identity") != data["machine_identity"]
+                or receipt.get("original_lock") != data["lock_identity"]
+                or receipt.get("resource_enforcement") != "sampled-UMA-guard-not-hard-cgroup"
+                or recovered.get("status") != "ready"
+                or recovered.get("config_sha256") != request["broker_config_sha256"]):
+            raise ValueError("actual Mac physical/resource/recovery receipt differs")
+        expected_manifest = dict(path="/Library/InferSSD-CI/inputs/operator-" + job["job_id"] + "/manifest.json",
+            sha256=required["manifest_sha256"], broker_path="/Library/InferSSD-CI/private/job-manifests/" + job["job_id"] + ".json",
+            broker_sha256=required["manifest_sha256"], root_owned_readonly=True)
+        if receipt.get("runner_manifest") != expected_manifest:
+            raise ValueError("actual Mac runner/private manifest copies differ")
 
 
 def dispatch(args, api=None):

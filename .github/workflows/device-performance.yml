@@ -33,5 +33,5 @@ jobs:
         run: |
           echo "This is an unprivileged preview, not physical acceptance."
           echo "A source maintainer submits a Comment review whose complete body is /ci test on the current PR head."
-          echo "The trusted operator seals base/candidate sources and runs the impact-selected Linux checks and 512/decode256 comparison."
-          echo "Results are in the private controller Actions Summary and artifacts; Mac coverage may remain deferred."
+          echo "The trusted operator seals base/candidate sources and runs the impact-selected physical checks and 512/decode256 comparison."
+          echo "Results are in the private controller Actions Summary and artifacts; unselected devices and extra tiers remain explicit."

@@ -117,7 +117,7 @@ one original device lease across every stage and both sides. All requests have
   pipes only; the guardian drains them into bounded root-owned logs. No private
   evidence file descriptor reaches the candidate.
 - `stage.probe` returns kernel PID/birth identity, actual dedicated-UID members,
-  aggregate RSS and trusted `/usr/sbin/lsof` output. `stage.client` verifies the
+  aggregate physical footprint, diagnostic RSS and trusted `/usr/sbin/lsof` output. `stage.client` verifies the
   exact owned listener at `127.0.0.1:18080` and returns its URL and listener PIDs.
   Optional boolean `light: true` omits the full open-file inventory while keeping
   PID/birth/UID and listener checks; HTTP admission uses this mode. Default
@@ -137,6 +137,28 @@ The root broker is `executor.py`; it refuses to start while
 `config.executor.enabled` is false. Enabling remains a separate operator step
 only after actual native gates and adapter verification. Mac memory/process
 checks are sampled safeguards, not a hard UMA/swap isolation claim.
+
+The executor applies `memory_budget_bytes` to the sum of live dedicated-worker
+`ri_phys_footprint` values from `proc_pid_rusage(RUSAGE_INFO_V0)`, with
+`memory_metric: physical-footprint` in reports. The existing process limit and
+host free-plus-inactive reserve remain separate checks. RSS remains diagnostic:
+read-only GGUF pages can be resident while still reclaimable, so RSS can exceed
+the memory budget without equivalent committed pressure. Apple's
+[memory-accounting explanation](https://developer.apple.com/videos/play/wwdc2022/10106/)
+includes CPU and GPU objects, compressed pages and swapped private pages in
+footprint; clean file mappings are excluded. The
+[XNU accounting implementation](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/kern/task.c)
+also avoids double-counting internal IOKit mappings. This is kernel-charged
+footprint, not a guarantee that all GPU allocations or shared pages are uniquely
+attributed across processes; the independent host reserve remains necessary.
+
+Memory sampling verifies each PID's UID and birth identity. It excludes confirmed
+exited processes, including cached zombie rusage, and fails the stage on unknown
+accounting instead of assuming zero usage. Process cleanup uses its unchanged
+UID inventory. Each result retains the last compact `resource_observation` and
+the peak sampled footprint and RSS in `resource_peak`, even after workers exit;
+failures retain `resource_violation` with the exact metric, sample and any
+accounting error. The configured budget and reserve are not raised for models.
 
 ## Focused local checks
 
