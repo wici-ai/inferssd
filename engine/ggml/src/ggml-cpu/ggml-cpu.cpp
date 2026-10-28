@@ -115,7 +115,6 @@ struct ggml_backend_cpu_context {
     void *              abort_callback_data;
 
     bool                use_ref;  // use reference implementation
-    void *              ssd_mac_cache; // context-owned; workers borrow while computing
     const ssd::runtime_services * ssd_services;
     size_t              ssd_plans;
 };
@@ -186,7 +185,6 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
-    cpu_plan->cplan.ssd_mac_cache       = cpu_ctx->ssd_mac_cache;
     ++cpu_ctx->ssd_plans;
 
     return cpu_plan;
@@ -206,12 +204,10 @@ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backen
 
 static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
-    const auto * cpu_ctx = static_cast<ggml_backend_cpu_context *>(backend->context);
-    // A quiescent detach must also affect plans created before the detach.
-    cpu_plan->cplan.ssd_mac_cache = cpu_ctx->ssd_mac_cache;
 
     return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
 
+    GGML_UNUSED(backend);
 }
 
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -238,7 +234,6 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
-    cplan.ssd_mac_cache       = cpu_ctx->ssd_mac_cache;
 
     return ggml_graph_compute(cgraph, &cplan);
 }
@@ -284,7 +279,6 @@ ggml_backend_t ggml_backend_cpu_init(void) {
     ctx->abort_callback      = NULL;
     ctx->abort_callback_data = NULL;
     ctx->use_ref             = false;
-    ctx->ssd_mac_cache       = nullptr;
     ctx->ssd_services        = nullptr;
     ctx->ssd_plans           = 0;
 
@@ -305,16 +299,6 @@ ggml_backend_t ggml_backend_cpu_init(void) {
 
 bool ggml_backend_is_cpu(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cpu_guid());
-}
-
-// Private registry contract: the owner joins graph callers before changing
-// this borrowed handle. A nonempty binding cannot be silently replaced.
-static bool ggml_backend_cpu_set_ssd_mac_cache(ggml_backend_t backend, void * cache) noexcept {
-    if (!ggml_backend_is_cpu(backend)) { return false; }
-    auto * context = static_cast<ggml_backend_cpu_context *>(backend->context);
-    if (cache && context->ssd_mac_cache && cache != context->ssd_mac_cache) { return false; }
-    context->ssd_mac_cache = cache;
-    return true;
 }
 
 static bool ggml_backend_cpu_set_ssd_runtime_services(
@@ -716,29 +700,6 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
     GGML_UNUSED(reg);
 }
 
-// Normal links bind these callbacks to this CPU backend, including with local
-// dynamic loading. Consumers do not search process-global symbols.
-static ggml_ssd_mac_cache * ggml_backend_cpu_ssd_mac_create(
-        const ssd::settings::snapshot * settings, const ssd::runtime_services * services,
-        char * error, size_t size) noexcept {
-#if defined(__APPLE__)
-    return ssd::mac::create_configured(settings, services, error, size);
-#else
-    GGML_UNUSED(settings);
-    GGML_UNUSED(services);
-    if (error && size) { std::snprintf(error, size, "Mac expert sources require an Apple CPU backend"); }
-    return nullptr;
-#endif
-}
-
-static void ggml_backend_cpu_ssd_mac_destroy(ggml_ssd_mac_cache * cache) noexcept {
-#if defined(__APPLE__)
-    ssd::mac::destroy(cache);
-#else
-    GGML_UNUSED(cache);
-#endif
-}
-
 static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
     static const ssd::cpu::api_v2 api = {
         2, sizeof(ssd::cpu::api_v2),
@@ -762,9 +723,6 @@ static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
         &kimi_cpu_prefill_run,
         &kimi_cpu_prefill_run_activation,
         &kimi_cpu_prefill_destroy,
-        &ggml_backend_cpu_ssd_mac_create,
-        &ggml_backend_cpu_ssd_mac_destroy,
-        &ggml_backend_cpu_set_ssd_mac_cache,
         &ssd::cpu::take_room_configured,
         &ggml_backend_cpu_set_ssd_runtime_services,
         sizeof(ssd::runtime_services),
@@ -775,9 +733,6 @@ static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_cpu_set_ssd_runtime_services") == 0) {
         return (void *) ggml_backend_cpu_set_ssd_runtime_services;
-    }
-    if (strcmp(name, "ggml_backend_cpu_set_ssd_mac_cache") == 0) {
-        return (void *) ggml_backend_cpu_set_ssd_mac_cache;
     }
     if (strcmp(name, "ggml_backend_cpu_ssd_kernels_v1") == 0) {
         return (void *) ssd::cpu::kernels;

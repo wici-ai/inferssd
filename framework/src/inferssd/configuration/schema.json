@@ -230,19 +230,6 @@
             "maximum": 17592186044415,
             "default": 0
         },
-        "host.expert_cache_mib": {
-            "description": "Mac M1 expert cache in MiB; M1 is a migration stage",
-            "kind": "integer",
-            "unit": "MiB",
-            "producer": "plan",
-            "scope": "darwin",
-            "cli": "--ssd-host-expert-cache-mib",
-            "default_literal": "4096",
-            "type": "integer",
-            "minimum": 0,
-            "maximum": 17592186044415,
-            "default": 4096
-        },
         "model.engram_prefetch": {
             "description": "Read ahead DeepSeek Engram rows; changes I/O timing only",
             "kind": "integer",

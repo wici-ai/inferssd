@@ -63,7 +63,7 @@ def test_registry_generated_schema_exact(native_contract):
             'expert.source=["/path # 1", "unicode-🐈"]\n'
             "place.costs=cpu_fixed_us=204,link_gbps=12.3\n",
         ),
-        ("darwin", "inferssd-settings 1\nhost.expert_cache_mib=12288\nprefetch.depth=8\n"),
+        ("darwin", "inferssd-settings 1\nprefetch.depth=8\n"),
         (
             "darwin",
             "inferssd-settings 1\ncpu.decode_participants=4\ncpu.io_cpus=0-2\n"
@@ -135,7 +135,7 @@ def test_invalid_contract_refused_by_both(native_contract, tmp_path, body):
     [
         ("windows", "prefill.cpu_max_tokens=1"),
         ("windows", "vram.budget=auto"),
-        ("windows", "host.expert_cache_mib=1"),
+        ("windows", "vram.reserve_mib=0"),
         ("darwin", "vram.max_slots=1"),
         ("darwin", "vram.reserve_mib=64"),
     ],

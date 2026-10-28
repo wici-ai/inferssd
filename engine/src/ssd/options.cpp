@@ -125,8 +125,7 @@ size_t llama_ssd_schema_json(char * output, size_t size) {
 
 llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
     : settings(options.settings), debug(options.debug), stream(services) {
-    // The Mac expert source keeps its own reader and budget until macOS runs on the CPU sink.
-    if (!llama_ssd_mac_expert_source && !settings.sources()->empty()) {
+    if (!settings.sources()->empty()) {
         host_owner = ::host_owner();
         auto registered = host_owner->make_client();
         if (!registered) { throw std::runtime_error(registered.error); }
@@ -163,12 +162,6 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
         throw std::runtime_error("CUDA allocation reserve is not representable in bytes");
     }
     services.gpu_reserve_bytes = static_cast<size_t>(*reserve_mib) * mib;
-}
-
-llama_ssd_context::~llama_ssd_context() {
-    // Context backends have already synchronized and been destroyed. This
-    // callback joins the Mac reader jobs before events closes below.
-    if (mac_cache) { destroy_mac(mac_cache); }
 }
 
 void llama_ssd_context::bind_cpu(ggml_backend_t backend) {

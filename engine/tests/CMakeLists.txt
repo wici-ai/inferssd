@@ -920,52 +920,6 @@ foreach(gpu_test dsv41_q2_pack_load kimi_dense_stream)
     endif()
 endforeach()
 
-if (UNIX)
-    add_executable(test-mac-expert-pack-cache ssd/test-mac-expert-pack-cache.cpp)
-    target_compile_features(test-mac-expert-pack-cache PRIVATE cxx_std_17)
-    target_link_libraries(test-mac-expert-pack-cache PRIVATE Threads::Threads ggml-ssd-pread ggml-ssd-settings ggml-base)
-    add_test(NAME mac_expert_pack_cache COMMAND test-mac-expert-pack-cache)
-    set_tests_properties(mac_expert_pack_cache PROPERTIES LABELS unit)
-
-    add_executable(test-mac-expert-source ssd/test-mac-expert-source.cpp
-        ../ggml/src/ggml-cpu/ssd/mac-expert-source.cpp)
-    target_compile_features(test-mac-expert-source PRIVATE cxx_std_17)
-    target_compile_definitions(test-mac-expert-source PRIVATE GGML_MAC_EXPERT_CACHE_TESTING)
-    target_include_directories(test-mac-expert-source PRIVATE ../ggml/src/ggml-cpu)
-    target_link_libraries(test-mac-expert-source PRIVATE Threads::Threads ggml-ssd-pread ggml-ssd-settings ggml-base)
-endif()
-
-if (APPLE AND TARGET ggml-cpu)
-    add_executable(test-mac-expert-operator ssd/test-mac-expert-operator.cpp)
-    target_compile_features(test-mac-expert-operator PRIVATE cxx_std_17)
-    target_link_libraries(test-mac-expert-operator PRIVATE ggml-cpu ggml-base)
-    target_include_directories(test-mac-expert-operator PRIVATE ../ggml/src/ggml-cpu)
-    foreach(experts 256 384)
-        foreach(rows 1 32 512)
-            foreach(depth 0 2 4)
-                foreach(type f32 q8_0)
-                    add_test(NAME mac_expert_operator_${experts}_${rows}_${depth}_${type}
-                        COMMAND test-mac-expert-operator ${experts} ${rows} ${depth} ${type})
-                    set_tests_properties(mac_expert_operator_${experts}_${rows}_${depth}_${type}
-                        PROPERTIES PROCESSORS 4 TIMEOUT 180)
-                endforeach()
-            endforeach()
-        endforeach()
-    endforeach()
-    # These cases cover threadpool lifecycle at fixed team sizes. The full
-    # 384/512 numerical workload remains in the default four-thread matrix above.
-    foreach(threads 1 2 12)
-        add_test(NAME mac_expert_operator_threads_${threads}
-            COMMAND test-mac-expert-operator 384 8 2 q8_0 ${threads})
-        set_tests_properties(mac_expert_operator_threads_${threads}
-            PROPERTIES PROCESSORS ${threads} TIMEOUT 180 RUN_SERIAL TRUE)
-    endforeach()
-    add_test(NAME mac_expert_operator_vary_threads
-        COMMAND test-mac-expert-operator 256 32 2 f32 4 vary)
-    set_tests_properties(mac_expert_operator_vary_threads
-        PROPERTIES PROCESSORS 12 TIMEOUT 180 RUN_SERIAL TRUE)
-endif()
-
 # The legacy fixtures keep their Linux scope: they model Linux CUDA provider
 # publication with dlopen, O_DIRECT and raw descriptors.
 if(TARGET ggml-ssd-c0-store AND CMAKE_SYSTEM_NAME STREQUAL "Linux")

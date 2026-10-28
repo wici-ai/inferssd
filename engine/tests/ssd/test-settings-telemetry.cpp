@@ -47,7 +47,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
     using namespace ssd::settings;
-    assert(registry().size() == 15);
+    assert(registry().size() == 14);
     assert(parse("inferssd-settings 1\nmodel.engram_prefetch=1\nmodel.hc_fused=0\n", "model.ssd"));
     assert(!parse("inferssd-settings 1\nmodel.hc_fused=2\n", "model-invalid.ssd"));
     auto base = parse("", "");
@@ -91,7 +91,8 @@ int main(int argc, char ** argv) {
     assert(!parse("inferssd-settings 1\nprefetch.depth=2\nprefetch.depth=4\n", "duplicate.ssd"));
     assert(!parse("", "empty.ssd"));
     assert(!parse("inferssd-settings 2\n", "version.ssd"));
-    assert(parse("inferssd-settings 1\nhost.expert_cache_mib=12288\nprefetch.depth=8\n", "mac.ssd", {}, "darwin"));
+    assert(parse("inferssd-settings 1\nprefetch.depth=8\n", "mac.ssd", {}, "darwin"));
+    assert(!parse("inferssd-settings 1\nhost.expert_cache_mib=12288\n", "mac.ssd", {}, "darwin"));
     assert(!parse("inferssd-settings 1\nvram.budget=auto\n", "mac.ssd", {}, "darwin"));
     // The executor's keys apply on every platform; the CUDA and Linux prefill keys stay Linux-only.
     assert(parse("inferssd-settings 1\ncpu.io_cpus=3\ncpu.decode_participants=2\nprefetch.depth=4\n"
@@ -99,7 +100,7 @@ int main(int argc, char ** argv) {
                  "model.hc_fused=0\n", "win.ssd", {}, "windows"));
     assert(parse("inferssd-settings 1\ncpu.io_cpus=0-2\ncpu.decode_participants=1\nhost.budget_mib=8192\n", "mac.ssd", {},
                  "darwin"));
-    for (const std::string bad : { "vram.budget = auto", "prefill.cpu_max_tokens = 1", "host.expert_cache_mib = 1" }) {
+    for (const std::string bad : { "vram.budget = auto", "prefill.cpu_max_tokens = 1", "vram.reserve_mib = 0" }) {
         const auto rejected = parse("inferssd-settings 1\n" + bad + "\n", "win.ssd", {}, "windows");
         assert(!rejected && rejected.error.find("win.ssd:2") != std::string::npos);
     }
@@ -125,7 +126,7 @@ int main(int argc, char ** argv) {
     const auto schema = schema_json();
     assert(schema && ssd::json::parse(schema.value).value.object.at("properties").object.size() == registry().size());
     const auto help_text = help();
-    assert(help_text && help_text.value.find("--ssd-host-expert-cache-mib") != std::string::npos);
+    assert(help_text && help_text.value.find("--ssd-host-budget-mib") != std::string::npos);
 
     char directory[] = "/tmp/ssdash-config-test-XXXXXX";
     assert(mkdtemp(directory));

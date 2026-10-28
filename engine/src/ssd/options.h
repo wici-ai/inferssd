@@ -12,22 +12,12 @@
 
 #include <memory>
 
-// Temporary: macOS runs configured SSD experts on its Mac expert source, with
-// no host client or source index, and every other OS on the CPU sink. This
-// constant and its uses go away when macOS moves onto the sink.
-#if defined(__APPLE__)
-inline constexpr bool llama_ssd_mac_expert_source = true;
-#else
-inline constexpr bool llama_ssd_mac_expert_source = false;
-#endif
-
 struct llama_ssd_options {
     ssd::settings::snapshot settings;
     ssd::telemetry::debug_channels debug;
     std::string telemetry_file;
 };
 
-struct ggml_ssd_mac_cache;
 struct llama_model;
 struct llama_ssd_source_delete {
     void (*close)(void *) noexcept = nullptr;
@@ -49,11 +39,8 @@ struct llama_ssd_context {
     ssd::runtime_services services;
     std::unique_ptr<void, llama_ssd_source_delete> gpu_transport;
     ssd::stream::runtime stream;
-    ggml_ssd_mac_cache * mac_cache = nullptr;
-    void (*destroy_mac)(ggml_ssd_mac_cache *) noexcept = nullptr;
 
     explicit llama_ssd_context(const llama_ssd_options & options);
-    ~llama_ssd_context();
     void bind_cpu(ggml_backend_t backend);
     void attach_backend(ggml_backend_t backend);
     void prepare_dense(const llama_model & model);
