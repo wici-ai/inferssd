@@ -3,7 +3,8 @@ add_library(ggml-ssd-host STATIC arbiter.cpp cache-policy.cpp cache-policy.h
 target_compile_features(ggml-ssd-host PUBLIC cxx_std_17)
 target_include_directories(ggml-ssd-host PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
 find_package(Threads REQUIRED)
-target_link_libraries(ggml-ssd-host PUBLIC Threads::Threads ggml-base)
+# expert-cache.h reaches the OS only through the platform layer.
+target_link_libraries(ggml-ssd-host PUBLIC Threads::Threads ggml-base ggml-ssd-platform)
 set_target_properties(ggml-ssd-host PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # The host budget sources: cgroup v2 and /proc on Linux (ledger.h), native ones on macOS and Windows.
 if (APPLE OR WIN32)

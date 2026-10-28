@@ -1,12 +1,10 @@
 #include "parser.h"
+#include "../platform/file.h"
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
 #include <memory>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -16,20 +14,10 @@ namespace {
 struct close_file {
     void operator()(FILE * file) const { std::fclose(file); }
 };
-// Opening a FIFO must not block startup. Validate the opened handle rather
-// than a path stat, so path replacement cannot bypass the regular-file check.
+// Opening a FIFO must not block startup. The platform layer validates the
+// opened handle, so path replacement cannot bypass the regular-file check.
 FILE * open_regular_file(const char * path) noexcept {
-#if !defined(_WIN32)
-    const int fd = ::open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0) { return nullptr; }
-    struct stat info {};
-    if (fstat(fd, &info) || !S_ISREG(info.st_mode)) { ::close(fd); return nullptr; }
-    FILE * file = fdopen(fd, "rb");
-    if (!file) { ::close(fd); }
-    return file;
-#else
-    return std::fopen(path, "rb");
-#endif
+    return ssd::platform::open_stream(path);
 }
 // A source is borrowed by the catalog only after vector insertion succeeds.
 struct pending_source_handles {
@@ -38,9 +26,7 @@ struct pending_source_handles {
     ~pending_source_handles() {
         if (!transferred) {
             if (source.file) { std::fclose(source.file); }
-#if !defined(_WIN32)
-            if (source.fd_direct >= 0) { ::close(source.fd_direct); }
-#endif
+            ssd::platform::close_fd(source.fd_direct);
         }
     }
 };
@@ -101,21 +87,16 @@ bool expert_pack_open_data_source(
     source.page_cache = page_cache_source;
     source.direct_required = direct_required;
     std::snprintf(source.path, sizeof(source.path), "%s", path);
-#if !defined(_WIN32)
-    struct stat source_status = {};
-    if (fstat(fileno(file), &source_status) != 0 || source_status.st_size < 0) {
+    if (!ssd::platform::file_size(ssd::platform::stream_fd(file), source.file_size)) {
         std::fprintf(stderr, "[moe_stream_batch] %s: stat failed: %s\n", label, path);
         return false;
     }
-    source.file_size = static_cast<uint64_t>(source_status.st_size);
     source.fd_direct = -1;
     if (!page_cache_source && (g_expert_pack.io_backend == 1 || g_expert_pack.io_backend == 2)) {
-#if defined(O_DIRECT)
-        source.fd_direct = ::open(path, O_RDONLY | O_DIRECT | O_NONBLOCK | O_CLOEXEC);
-#endif
+        source.fd_direct = ssd::platform::open_direct(path);
         if (source.fd_direct < 0) {
             if (direct_required) {
-                std::fprintf(stderr, "[moe_stream_batch] %s: required O_DIRECT open failed: %s\n", label, path);
+                std::fprintf(stderr, "[moe_stream_batch] %s: required direct open failed: %s\n", label, path);
                 return false;
             }
             std::fprintf(stderr, "[moe_stream_batch] %s: direct open failed; using buffered reads: %s\n", label, path);
@@ -136,16 +117,6 @@ bool expert_pack_open_data_source(
         if (hooks.page_cache_source_opened) { hooks.page_cache_source_opened(); }
         std::fprintf(stderr, "[moe_stream_batch] %s: page-cache buffered source enabled: %s\n", label, path);
     }
-#else
-    if (g_expert_pack.io_backend == 1 || g_expert_pack.io_backend == 2) {
-        if (direct_required) {
-            std::fprintf(stderr, "[moe_stream_batch] %s: required O_DIRECT is unsupported on this platform\n", label);
-            return false;
-        }
-        std::fprintf(stderr, "[moe_stream_batch] %s: direct/io_uring reads are not supported on this platform; using buffered reads\n", label);
-        g_expert_pack.io_backend = 0;
-    }
-#endif
 
     g_expert_pack.sources.push_back(source);
     pending.transferred = true;
@@ -187,7 +158,7 @@ bool expert_pack_load_source(const char *path, int32_t source_idx, std::vector<e
         return false;
     }
     expert_pack_source &source = g_expert_pack.sources.back();
-    if (::fseeko(source.file, 40, SEEK_SET) != 0) {
+    if (std::fseek(source.file, 40, SEEK_SET) != 0) {
         std::fprintf(stderr, "[moe_stream_batch] expert pack: seek index failed: %s\n", path);
         return false;
     }

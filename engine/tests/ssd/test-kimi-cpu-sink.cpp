@@ -1,5 +1,5 @@
 #include "explicit-fixture-inputs.h"
-// Independent CPU-only O_DIRECT/io_uring and numerical coverage for the Kimi sink.
+// Independent CPU-only direct-read, read-ring and numerical coverage for the Kimi sink.
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -29,19 +29,19 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "test-resources.h"
 
 #if defined(__linux__)
-#include <fcntl.h>
 #include <linux/capability.h>
-#include <sched.h>
 #include <unistd.h>
 #include <sys/resource.h>
-#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
 #include "../../ggml/src/ggml-ssd/host/ledger.h"
-#include "linux-test-resources.h"
+#endif
+
+using test_resources::anonymous_bytes;
 
 static void require(bool ok, const std::string & what) { if (!ok) { throw std::runtime_error(what); } }
 static size_t aligned(size_t n) { return (n + 4095) & ~size_t(4095); }
@@ -50,6 +50,9 @@ static std::string tensor_name(int layer, int role) {
     return "blk." + std::to_string(layer) + ".ffn_" + roles[role] + "_exps.weight";
 }
 
+#if defined(__linux__)
+// Linux only: the hold interposes libc's pread by symbol name and recognizes /proc/meminfo, the
+// Linux ledger's system term. The cases that need it stay Linux-only.
 // pread, ahead of libc's in this process (the sink's library calls it through the dynamic linker): a read of an armed
 // (fd, offset) waits in it until the test lets it go, so that a prefetch read runs past windows for as long as a test
 // needs, without timing assumptions. before_meminfo runs once, at the next read of /proc/meminfo: the host ledger
@@ -112,6 +115,7 @@ struct pread_hold_guard {
         h.cv.notify_all();
     }
 };
+#endif
 
 struct entry {
     uint64_t offset = 0;
@@ -130,7 +134,7 @@ struct fixture {
     int fault_role = -1;      // -1 faults every role; 0/1/2 selects up/gate/down
     int resolve_calls = 0;
     bool native_ranges = false;
-    ~fixture() { if (fd >= 0) { close(fd); } if (remove_on_destroy) { unlink(path.c_str()); } }
+    ~fixture() { ssd::platform::close_fd(fd); if (remove_on_destroy) { test_resources::remove_file(path); } }
     static bool resolve(void * user, const char * name, int32_t id, kimi_cpu_sink_source * out) {
         auto & f = *static_cast<fixture *>(user);
         ++f.resolve_calls;
@@ -153,9 +157,9 @@ struct fixture {
         if (fault == wrong_size) { out->nbytes += 4096; }
         if (fault == past_eof) { out->offset = uint64_t(1) << 50; }
         if (fault == short_tail) {
-            struct stat status = {};
-            if (fstat(f.fd, &status) || status.st_size < 4096) { return false; }
-            out->offset = uint64_t(status.st_size) - 4096; // positive but incomplete CQE
+            uint64_t size = 0;
+            if (!ssd::platform::file_size(f.fd, size) || size < 4096) { return false; }
+            out->offset = size - 4096; // positive but incomplete CQE
         }
         return true;
     }
@@ -166,11 +170,7 @@ static void put_bytes(std::ofstream & f, const void * data, size_t n) {
 }
 
 static void make_synthetic(fixture & f, uint32_t seed = 20260908) {
-    const char * temp = std::getenv("TMPDIR");
-    std::string pattern = std::string(temp && *temp ? temp : "/tmp") + "/kimi-cpu-sink-test-XXXXXX";
-    std::vector<char> name(pattern.begin(), pattern.end()); name.push_back(0);
-    int tfd = mkstemp(name.data()); require(tfd >= 0, "mkstemp failed"); close(tfd);
-    f.path = name.data(); f.remove_on_destroy = true;
+    f.path = test_resources::temp_file("kimi-cpu-sink-test"); f.remove_on_destroy = true;
     std::mt19937 rng(seed);
     std::normal_distribution<float> sample(0.0f, 0.06f);
     // Keep the full on-disk GGMLMOEPACKv1 layout, including index and padding.
@@ -289,8 +289,6 @@ struct sample_result {
     uint64_t output_hash = 1469598103934665603ULL;
 };
 
-static double timeval_us(const timeval & value) { return value.tv_sec * 1e6 + value.tv_usec; }
-
 static void check_io_targets(fixture_inputs & inputs, const kimi_cpu_sink_stats & stats, bool succeeded) {
     require(stats.cache_fill_read_requests + stats.ring_read_requests == stats.read_requests &&
             stats.cache_fill_read_bytes + stats.ring_read_bytes == stats.read_bytes,
@@ -314,6 +312,15 @@ static void check_io_targets(fixture_inputs & inputs, const kimi_cpu_sink_stats 
     }
 }
 
+// The RAM cache's slot for a triplet of reads: a slot that gives its own pages back (elastic or partial reclaim)
+// starts on a page, which makes it larger only on pages above 4 KiB.
+static uint64_t cache_slot_bytes(const fixture_inputs & inputs, uint64_t triplet) {
+    const auto on = [&](const char * key) { const char * value = inputs.get(key); return value && !std::strcmp(value, "1"); };
+    if (!on("cache_elastic") && !on("cache_partial_reclaim")) { return triplet; }
+    const uint64_t page = ssd::platform::page_size();
+    return (triplet + page - 1) / page * page;
+}
+
 static sample_result run_checked(fixture_inputs & inputs, const char * name, fixture & f, kimi_cpu_sink * sink, tensors & meta,
         const std::vector<float> & input, const std::vector<int32_t> & ids,
         const std::vector<float> & weights, const std::vector<float> & expected, int layer, float linear_beta,
@@ -321,8 +328,7 @@ static sample_result run_checked(fixture_inputs & inputs, const char * name, fix
         const kimi_cpu_sink_activation * activation = nullptr) {
     sample_result result;
     std::vector<float> guarded(f.latent + 2, -12345.25f); char error[512] = {};
-    rusage before = {}, after = {};
-    require(getrusage(RUSAGE_SELF, &before) == 0, "getrusage before failed");
+    const auto before = test_resources::usage();
     const auto begin = std::chrono::steady_clock::now();
     bool ok = activation ?
         kimi_cpu_sink_run_activation(sink, meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(),
@@ -330,14 +336,14 @@ static sample_result run_checked(fixture_inputs & inputs, const char * name, fix
         kimi_cpu_sink_run(sink, meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(), weights.data(),
                                int(ids.size()), 4.0f, linear_beta, guarded.data() + 1, &result.stats, error, sizeof(error));
     result.wall_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count();
-    require(getrusage(RUSAGE_SELF, &after) == 0, "getrusage after failed");
-    result.user_us = timeval_us(after.ru_utime) - timeval_us(before.ru_utime);
-    result.system_us = timeval_us(after.ru_stime) - timeval_us(before.ru_stime);
-    result.voluntary_switches = after.ru_nvcsw - before.ru_nvcsw;
-    result.involuntary_switches = after.ru_nivcsw - before.ru_nivcsw;
-    result.minor_faults = after.ru_minflt - before.ru_minflt;
-    result.major_faults = after.ru_majflt - before.ru_majflt;
-    result.max_rss_kib = after.ru_maxrss;
+    const auto after = test_resources::usage();
+    result.user_us = after.user_us - before.user_us;
+    result.system_us = after.system_us - before.system_us;
+    result.voluntary_switches = after.voluntary_switches - before.voluntary_switches;
+    result.involuntary_switches = after.involuntary_switches - before.involuntary_switches;
+    result.minor_faults = after.minor_faults - before.minor_faults;
+    result.major_faults = after.major_faults - before.major_faults;
+    result.max_rss_kib = after.max_rss_kib;
     require(ok, std::string(name) + ": " + error);
     require(guarded.front() == -12345.25f && guarded.back() == -12345.25f, "output canary overwritten");
     if (exact_output) { exact_output->assign(guarded.begin() + 1, guarded.end() - 1); }
@@ -365,7 +371,8 @@ static sample_result run_checked(fixture_inputs & inputs, const char * name, fix
     require(stats.cache_hits == expected_hits && stats.cache_misses == live - expected_hits, "cache hit/miss count mismatch");
     if (expected_admitted >= 0) {
         require(stats.cache_admitted == size_t(expected_admitted) &&
-                stats.cache_admitted_bytes == size_t(expected_admitted) * triplet_bytes, "cache admission count mismatch");
+                stats.cache_admitted_bytes == size_t(expected_admitted) * cache_slot_bytes(inputs, triplet_bytes),
+                "cache admission count mismatch");
     }
     require(close_enough, std::string(name) + " diagnostic numerical tolerance exceeded; max_abs=" + std::to_string(result.max_abs));
     require(result.max_abs == 0, std::string(name) + " strict elementwise equality failed; max_abs=" + std::to_string(result.max_abs));
@@ -483,6 +490,8 @@ static void apply_policy(std::vector<int32_t> & ids, std::vector<float> & weight
 
 struct unsupported_resident : std::runtime_error { using std::runtime_error::runtime_error; };
 
+#if defined(__linux__)
+// Linux only: the control copy lives on tmpfs, recognized by its statfs magic.
 static void make_resident_copy(fixture & f, const std::string & directory) {
     struct statfs fs = {};
     if (statfs(directory.c_str(), &fs) || uint64_t(fs.f_type) != 0x01021994ULL) {
@@ -505,6 +514,7 @@ static void make_resident_copy(fixture & f, const std::string & directory) {
     f.fd = test_resources::open_direct(f.path);
     std::printf("resident_control=tmpfs_O_DIRECT_accepted note=RAM_file_read_path_not_zero_IO_compute_control bytes=%llu\n", (unsigned long long) offset);
 }
+#endif
 
 static void write_sample_json(std::ostream & out, const sample_result & result, const real_options & options,
         const std::string & phase, int iteration, int layer, double reference_us) {
@@ -566,7 +576,13 @@ static void real_test(fixture_inputs & inputs, const std::string & pack, const s
         file.seekg(item.offset); file.read(reinterpret_cast<char *>(item.data.data()), item.raw_bytes); require(bool(file), "short reference pack read");
     }
     file.close(); f.path = pack; f.fd = test_resources::open_direct(f.path);
-    if (!options.resident_dir.empty()) { make_resident_copy(f, options.resident_dir); }
+    if (!options.resident_dir.empty()) {
+#if defined(__linux__)
+        make_resident_copy(f, options.resident_dir);
+#else
+        throw unsupported_resident("resident control requires a Linux tmpfs directory");
+#endif
+    }
     const auto reference_begin = std::chrono::steady_clock::now();
     const auto expected = reference(f, layer, input, ids, weights, 4.0f, 25.0f);
     const double reference_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - reference_begin).count();
@@ -591,6 +607,8 @@ struct fixture_selector {
     }
 };
 
+#if defined(__linux__)
+// Linux only: io_uring fixed buffers are charged to RLIMIT_MEMLOCK; a forked child lowers it.
 static void drop_child_memlock() {
     rlimit limit = { 0, 0 };
     require(setrlimit(RLIMIT_MEMLOCK, &limit) == 0, "lowering child memlock failed");
@@ -636,13 +654,18 @@ static void registration_failure_child(fixture_inputs & inputs, fixture & f) {
     require(result == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
             "registration failure child did not pass");
 }
+#endif
 
 static void registered_lifecycle_tests(fixture_inputs & inputs) {
     const char * mode = inputs.get("read_fixed");
     require(mode && !std::strcmp(mode, "1"), "run this lifecycle test with --fixture read_fixed=1");
     fixture small, large;
     make_synthetic(small);
+#if defined(__linux__)
     registration_failure_child(inputs, small);
+#else
+    std::printf("case=registration_failure_child status=SKIP reason=linux_rlimit_memlock\n");
+#endif
     large.latent = large.hidden = 512;
     make_synthetic(large);
     fixture_selector selector; selector.active = &small;
@@ -870,10 +893,7 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
         "dynamic_rows", "dynamic_chunk_rows" };
     std::map<std::string, std::string> original;
     for (const char * name : names) { if (inputs.get(name)) { original[name] = inputs.get(name); } }
-    cpu_set_t original_affinity;
-    require(!sched_getaffinity(0, sizeof(original_affinity), &original_affinity), "read fixture affinity");
-    std::vector<int> allowed;
-    for (int i = 0; i < CPU_SETSIZE; ++i) { if (CPU_ISSET(i, &original_affinity)) { allowed.push_back(i); } }
+    const ssd::platform::cpu_list allowed = test_resources::process_cpus();
     // The schedule matrix pins every participant to its own CPU; fewer CPUs is a missing resource.
     test_resources::need(!schedules || int(allowed.size()) >= threads,
             "schedule fixture pins " + std::to_string(threads) + " participants but affinity has " + std::to_string(allowed.size()) + " CPUs");
@@ -916,9 +936,7 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
         else { inputs.unset(name); }
     }
     auto check_affinity = [&] {
-        cpu_set_t current;
-        require(!sched_getaffinity(0, sizeof(current), &current) && CPU_EQUAL(&current, &original_affinity),
-            "sink failed to restore caller affinity");
+        require(test_resources::process_cpus() == allowed, "sink failed to restore caller affinity");
     };
     check_affinity();
     uint64_t token = 0;
@@ -1072,20 +1090,6 @@ static void schedule_invalid_tests(fixture_inputs & inputs) {
     std::printf("SCHEDULE_INVALID_SETTINGS_REJECTED cases=%zu\n", sizeof(invalid) / sizeof(invalid[0]));
 }
 
-static uint64_t anonymous_bytes() {
-    std::ifstream file("/proc/self/smaps_rollup");
-    require(bool(file), "cannot open smaps_rollup for physical release check");
-    std::string line;
-    while (std::getline(file, line)) {
-        std::istringstream in(line); std::string label, unit; uint64_t kib = 0;
-        if (in >> label >> kib >> unit && label == "Anonymous:") {
-            require(unit == "kB", "unexpected smaps_rollup units");
-            return kib * 1024;
-        }
-    }
-    throw std::runtime_error("smaps_rollup has no Anonymous counter");
-}
-
 static void cache_release_test(fixture_inputs & inputs, int threads, int depth) {
     fixture f; f.experts = 32; make_synthetic(f);
     auto sink = make_sink(inputs, f, threads, depth);
@@ -1105,9 +1109,9 @@ static void cache_release_test(fixture_inputs & inputs, int threads, int depth) 
     const auto empty = cache_snapshot(sink.get());
     require(empty.mapped_bytes == 0 && empty.committed_bytes == 0 && empty.valid_bytes == 0 &&
             empty.capacity_bytes == full.capacity_bytes, "prefill retained payload or lost capacity configuration");
-    // Dedicated anonymous mmap must actually release pages. Allow small libc and
-    // /proc parsing noise, but not an allocator retaining the whole payload.
-    require(before >= after && before - after >= bytes - 256 * 1024,
+    // Dedicated arena slots must actually release pages. Allow small allocator and
+    // counter noise, but not an allocator retaining the whole payload.
+    require(before >= after && before - after >= bytes - test_resources::anonymous_noise_bytes,
             "prefill zeroed accounting without releasing anonymous cache pages");
     std::printf("case=cache_prefill_physical_release payload=%llu anonymous_before=%llu anonymous_after=%llu status=PASS\n",
             (unsigned long long) bytes, (unsigned long long) before, (unsigned long long) after);
@@ -1119,6 +1123,11 @@ static void cache_release_test(fixture_inputs & inputs, int threads, int depth) 
 static void direct_cache_memlock_child(fixture_inputs & inputs, fixture & f, const std::vector<float> & input) {
     const char * mode = inputs.get("read_fixed");
     if (!mode || std::strcmp(mode, "1")) { return; }
+#if !defined(__linux__)
+    // Linux only: io_uring fixed buffers count against RLIMIT_MEMLOCK; other rings have no such budget.
+    (void) f; (void) input;
+    std::printf("case=direct_cache_memlock_child status=SKIP reason=linux_rlimit_memlock\n");
+#else
     // No parent sink exists yet. Lower limits/capabilities only in this child.
     std::fflush(nullptr);
     const pid_t child = fork(); require(child >= 0, "direct cache memlock fork failed");
@@ -1159,6 +1168,7 @@ static void direct_cache_memlock_child(fixture_inputs & inputs, fixture & f, con
     int status = 0; pid_t result;
     do { result = waitpid(child, &status, 0); } while (result < 0 && errno == EINTR);
     require(result == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, "direct cache memlock child did not pass");
+#endif
 }
 
 static void direct_cache_target_tests(fixture_inputs & inputs, fixture & f, const std::vector<float> & input, int threads, int depth) {
@@ -1519,7 +1529,7 @@ static void cache_tests(fixture_inputs & inputs, int threads, int depth) {
     // caller replacing the source without changing epoch, including fd reuse.
     selector.active = &other; begin_cache(identities.get(), 102, 5);
     cache_case(inputs, "cache_same_epoch_different_pack_fd", other, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
-    require(f.fd != other.fd && dup2(f.fd, other.fd) == other.fd, "pack fd reuse fixture failed");
+    require(f.fd != other.fd && test_resources::fd_dup2(f.fd, other.fd) == other.fd, "pack fd reuse fixture failed");
     begin_cache(identities.get(), 102, 6);
     // The resolver still returns other's fd number and identical offsets, but
     // that descriptor now names A. The independent reference uses A's bytes.
@@ -1609,6 +1619,8 @@ static std::vector<int32_t> all_cache_layers() {
     return layers;
 }
 
+#if defined(__linux__)
+// Linux only: plans the automatic capacity against a dedicated cgroup scope's memory.max/current.
 static void cache_auto_ring_test(fixture_inputs & inputs, int threads, int depth) {
     // A dedicated small scope tests planned capacity without filling it or
     // manufacturing an OOM. The fixture and its file pages stay charged.
@@ -1714,6 +1726,7 @@ static void cache_auto_ring_test(fixture_inputs & inputs, int threads, int depth
             (unsigned long long) full.pressure_stops);
     std::printf("AUTO_CACHE_RING_OK output_hash=%llu\n", (unsigned long long) hit.output_hash);
 }
+#endif
 
 static void cache_large_test(fixture_inputs & inputs, int threads, int depth) {
     // Only three experts are materialized. The metadata exposes ID 895 and
@@ -1750,7 +1763,9 @@ static void cache_large_test(fixture_inputs & inputs, int threads, int depth) {
             "large quota was clipped or virtual budget was eagerly committed");
     require(stats.page_table_bytes > 0 && stats.last_guard_extra_bytes > 2 * unit &&
             stats.last_guard_extra_bytes < 3 * unit && stats.peak_guard_extra_bytes < 128ull * 1024 * 1024,
-            "large cache guard omitted page tables or charged unused slots");
+            "large cache guard omitted page tables or charged unused slots: page_tables=" +
+            std::to_string(stats.page_table_bytes) + " last_guard=" + std::to_string(stats.last_guard_extra_bytes) +
+            " peak_guard=" + std::to_string(stats.peak_guard_extra_bytes) + " unit=" + std::to_string(unit));
     require(anonymous_bytes() < before + 128ull * 1024 * 1024, "large virtual cache prefaulted payload");
     begin_cache(sink.get(), 1, 2);
     cache_case(inputs, "cache_large_hit_and_high_id", f, sink.get(), 1, input, { 1, 895 }, { .4f, .6f }, 1, 1);
@@ -1766,6 +1781,8 @@ static void cache_large_test(fixture_inputs & inputs, int threads, int depth) {
             (unsigned long long) stats.page_table_bytes, (unsigned long long) stats.peak_guard_extra_bytes);
 }
 
+#if defined(__linux__)
+// Linux only: these two lower and read cgroup v2 memory.max to create pressure.
 static void cache_pressure_transition_test(fixture_inputs & inputs, int threads, int depth) {
     // Explicit opt-in, dedicated scope only. Lowering its limit leaves the
     // selected reserve minus a small, known deficit, so this exercises the
@@ -1792,7 +1809,7 @@ static void cache_pressure_transition_test(fixture_inputs & inputs, int threads,
     const char * partial_value = inputs.get("cache_partial_reclaim");
     const bool partial = partial_value && !std::strcmp(partial_value, "1");
     fixture f; make_synthetic(f); auto sink = make_sink(inputs, f, threads, depth);
-    const uint64_t unit = triplet_bytes(f);
+    const uint64_t unit = cache_slot_bytes(inputs, triplet_bytes(f));
     if (partial) { configure_cache(sink.get(), 4 * unit, { 1, 2 }, 2); }
     else { configure_cache(sink.get(), 594000000000, all_cache_layers(), 896); }
     std::vector<float> input(f.latent, .13f);
@@ -1899,23 +1916,31 @@ static void cache_pressure_test(fixture_inputs & inputs, int threads, int depth,
             (unsigned long long) stats.pressure_stops, (unsigned long long) stats.mapped_bytes);
     if (unbounded) { std::printf("CACHE_UNBOUNDED_REJECT_OK\n"); }
 }
+#endif
 
 // Validate the emitted records, not just the counters used to format them.
 // No cgroup/cache admission is required; cache-hit transport has separate tests.
 // The sink's stderr lines (trace, profile, reports) while it lives; read() restores stderr.
 struct stderr_capture {
-    FILE * file = std::tmpfile();
+    std::string path = test_resources::temp_file("kimi-cpu-sink-stderr");
+    FILE * file = std::fopen(path.c_str(), "w+b");
     int saved = -1;
     stderr_capture() {
-        require(file != nullptr, "trace capture tmpfile");
+        require(file != nullptr, "trace capture file");
         std::fflush(stderr);
-        saved = dup(STDERR_FILENO);
-        require(saved >= 0 && dup2(fileno(file), STDERR_FILENO) >= 0, "redirect trace stderr");
+        saved = test_resources::fd_dup(test_resources::fd_of(stderr));
+        require(saved >= 0 && test_resources::fd_dup2(test_resources::fd_of(file), test_resources::fd_of(stderr)) >= 0,
+                "redirect trace stderr");
     }
     void restore() {
-        if (saved >= 0) { std::fflush(stderr); dup2(saved, STDERR_FILENO); close(saved); saved = -1; }
+        if (saved >= 0) {
+            std::fflush(stderr);
+            test_resources::fd_dup2(saved, test_resources::fd_of(stderr));
+            test_resources::fd_close(saved);
+            saved = -1;
+        }
     }
-    ~stderr_capture() { restore(); if (file) { std::fclose(file); } }
+    ~stderr_capture() { restore(); if (file) { std::fclose(file); } test_resources::remove_file(path); }
     std::string read() {
         restore(); std::rewind(file);
         std::string result; char buffer[4096];
@@ -1984,8 +2009,9 @@ static void trace_profile_test(fixture_inputs & inputs, int threads, int depth) 
         const double other = p.at("other_wall_us");
         require(compute > 0 && wait >= 0 && other >= 0 && std::abs(total - compute - wait - other) < .01,
                 "profile disjoint caller wall times do not sum to total");
-        require(p.at("compute_thread_cpu_us").get<double>() > 0 &&
-                p.at("caller_thread_cpu_us").get<double>() > 0 && p.at("io_thread_cpu_us").get<double>() > 0,
+        auto clocked = [](double us) { return test_resources::thread_clock_ticks ? us >= 0 : us > 0; };
+        require(clocked(p.at("compute_thread_cpu_us").get<double>()) &&
+                clocked(p.at("caller_thread_cpu_us").get<double>()) && clocked(p.at("io_thread_cpu_us").get<double>()),
                 "profile CPU clocks missing");
         double worker_cpu = 0;
         for (const auto & w : p.at("workers")) {
@@ -2085,6 +2111,7 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
                 (spills || (field("spill_us") == "0" && spill_r == "0,0,0,0")), "prefetch report spill: " + report);
         std::printf("case=prefetch_depth%d status=PASS %s\n", k, report.c_str());
     }
+#if defined(__linux__)
     {
         // The reads of 6, hinted for layer 2 and not selected there, held in pread (pread_hold) for as long as a case
         // needs, without timing assumptions. A prefetch lands only in resident slots, so both layers are warmed
@@ -2157,6 +2184,10 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
                 "reads spilled past a run without reads of its own and without a hint: " + last);
         std::printf("case=prefetch_spill_last status=PASS %s\n", last.c_str());
     }
+#else
+    std::printf("case=prefetch_spill_twice status=SKIP reason=linux_pread_interposition\n");
+    std::printf("case=prefetch_spill_last status=SKIP reason=linux_pread_interposition\n");
+#endif
     std::printf("CPU_SINK_PREFETCH_OK\n");
 }
 // build_moe_ffn's one-token CPU graph: MUL_MAT_ID gate/up over the full expert
@@ -2243,7 +2274,7 @@ static void elastic_cache_tests(fixture_inputs & inputs, int threads, int depth)
     scoped_fixture_input quotas_env(inputs, "cache_layer_quotas", nullptr);
 
     fixture f; make_synthetic(f);
-    const uint64_t unit = triplet_bytes(f);
+    const uint64_t unit = cache_slot_bytes(inputs, triplet_bytes(f));
     std::vector<float> input(f.latent, .13f);
     auto sink = make_sink(inputs, f, threads, depth);
     configure_cache(sink.get(), 6 * unit, { 1, 2 }, 3);
@@ -2403,6 +2434,7 @@ static void q2_activation_test(fixture_inputs & inputs, int threads, int depth) 
 // The room the host ledger's terms leave before its reserve (CACHE_RESERVE_BYTES, also the floor's margin off unified
 // memory): the least of memory.max less memory.current over this process's cgroup and its ancestors with a finite
 // limit, and MemAvailable. 0 without a finite cgroup.
+#if defined(__linux__)
 static uint64_t host_room() {
     std::ifstream groups("/proc/self/cgroup");
     std::string line, path;
@@ -2426,6 +2458,13 @@ static uint64_t host_room() {
     }
     return finite ? room : 0;
 }
+#endif
+// The ledger the sink's host arbiter measures with on this OS.
+#if defined(__linux__)
+using probe_ledger = kimi_host_ledger;
+#else
+using probe_ledger = ssd::host::native_ledger;
+#endif
 static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
     scoped_fixture_input policy_env(inputs, "cache_policy", "lru");
     scoped_fixture_input allocation_env(inputs, "cache_allocation", "uniform");
@@ -2437,6 +2476,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
     fixture f; f.native_ranges = true; make_synthetic(f);
     uint64_t stride = 0; // a role as a decode request reserves it: its bytes and a page prefix, in whole pages
     for (int role = 0; role < 3; ++role) { stride += (f.entries.at({ tensor_name(1, role), 0 }).raw_bytes + 8190) / 4096 * 4096; }
+    stride = cache_slot_bytes(inputs, stride);
     std::vector<float> input(f.latent);
     for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int(i % 23) - 11) * .019f; }
     auto load = [&](kimi_cpu_sink * sink, std::string * receipt) {
@@ -2563,6 +2603,8 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         begin_cache(d.get(), 11, 5);
         require(cache_snapshot(d.get()).enabled_bytes == 12 * stride, kind + "a later decode token changed the slots");
     }
+#if defined(__linux__)
+    // Linux only: the drift is injected between the Linux ledger's cgroup and /proc/meminfo reads.
     {
         // An automatic budget whose room shrinks between geometry's reading of it and the load step's own, as when
         // the server allocates while it loads: the load step commits fewer slots than geometry enabled, and those owe
@@ -2576,9 +2618,10 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         };
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
-        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096, slot = 3 * role;
+        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096;
+        const uint64_t slot = cache_slot_bytes(inputs, 3 * role);
         const uint64_t cost = slot + slot / 128; // a slot and its page tables, until geometry's receipt prices it
-        const uint64_t ring = uint64_t(depth) * slot, room = host_room();
+        const uint64_t ring = uint64_t(depth) * 3 * role, room = host_room();
         test_resources::need(room > ring + 7 * cost + (1ull << 30), "the owed slots' case needs a finite cgroup with room");
         // geometry sees 6.5 slots of room, after the read ring the load step resizes first
         scoped_fixture_input reserve_env(inputs, "cache_reserve_bytes",
@@ -2652,6 +2695,9 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
                 "owed slots: the first decode did not price the owed slots first: " + regrow);
         std::printf("case=load_regrow_owed status=PASS %s | %s\n", loaded.c_str(), regrow.c_str());
     }
+#else
+    std::printf("case=load_regrow_owed status=SKIP reason=linux_ledger_injection\n");
+#endif
     {
         // A prefill's room, held before it allocates anything (kimi_cpu_sink_cache_prefill_room): its pages and its
         // compute buffers take their room in one give-back at its start; its later checks keep the rest; the first
@@ -2665,7 +2711,8 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         };
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
-        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096, slot = 3 * role;
+        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096;
+        const uint64_t slot = cache_slot_bytes(inputs, 3 * role);
         auto h = make_sink(inputs, big, threads, depth);
         configure_cache(h.get(), 6 * slot, { 1, 2 }, 6);
         {
@@ -2676,7 +2723,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         }
         require(cache_snapshot(h.get()).committed_bytes == 6 * slot, "prefill room: the load step did not commit 6 slots");
         begin_cache(h.get(), 13, 1, false);
-        kimi_host_ledger probe;
+        probe_ledger probe;
         inputs.configure(probe, false);
         const uint64_t room = probe.measure(0).surplus(), pages = room + 5 * slot / 2, host = 1 << 20;
         require(room != UINT64_MAX && room > 0, "prefill room: no finite room to measure");
@@ -2722,9 +2769,10 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         };
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
-        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096, slot = 3 * role;
-        const uint64_t cost = slot + slot / 128, ring = uint64_t(depth) * slot;
-        kimi_host_ledger probe;
+        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096;
+        const uint64_t slot = cache_slot_bytes(inputs, 3 * role);
+        const uint64_t cost = slot + slot / 128, ring = uint64_t(depth) * 3 * role;
+        probe_ledger probe;
         inputs.configure(probe, false);
         const uint64_t room = probe.measure(0).surplus() + probe.reserve;
         require(room != UINT64_MAX && room > ring + 7 * cost + (1ull << 30), "load hold: the case needs a finite cgroup with room");
@@ -2786,12 +2834,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         // first decode charges it). Experts of 51 MiB (Q8_0 4096 x 4096, no file) make the ring's pages, a slot for each
         // of the depth's reads, show in the process's resident memory.
         scoped_fixture_input partial(inputs, "cache_partial_reclaim", nullptr);
-        auto resident = [] {
-            std::ifstream statm("/proc/self/statm");
-            uint64_t size = 0, pages = 0;
-            statm >> size >> pages;
-            return pages * uint64_t(sysconf(_SC_PAGESIZE));
-        };
+        auto resident = [] { return test_resources::resident_bytes(); };
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
         const uint64_t slot = 3 * ((ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096);
@@ -2983,10 +3026,6 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
     std::printf("CPU_SINK_ACTIVATION_OK threads=%d ring_experts=%d refusals=%d\n", threads, depth, refusals);
 }
 
-#endif
-
-
-#if defined(__linux__)
 // Native Muse expert semantics against an independent ordinary ggml MoE graph. Different
 // norm weights/epsilons and >64-token prefill catch normalization after the sum,
 // missing norm weights, and both grouped accumulation paths.
@@ -2996,7 +3035,7 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
     if (native_ranges) {
         // Rebuild a tiny native-weight source with mixed zero/128-byte page prefixes and
         // no EOF padding. Keep the independent reference payload unchanged.
-        close(f.fd); f.fd = -1;
+        ssd::platform::close_fd(f.fd); f.fd = -1;
         for (auto it = f.entries.begin(); it != f.entries.end();) {
             if (it->first.first.rfind("blk.2.", 0) == 0) { it = f.entries.erase(it); }
             else { ++it; }
@@ -3095,12 +3134,11 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
                     "page-prefix variation cleared native cached payloads"); }
             }
         }
-        // EOF padding may be absent, but one missing logical byte must fail.
-        const int writable = open(f.path.c_str(), O_WRONLY);
-        struct stat status = {};
-        require(writable >= 0 && fstat(writable, &status) == 0 &&
-            ftruncate(writable, status.st_size - 1) == 0, "native fixture truncate");
-        close(writable);
+        // EOF padding may be absent, but one missing logical byte must fail. Windows shares a direct
+        // descriptor for reading only, so the file is truncated between two opens.
+        ssd::platform::close_fd(f.fd); f.fd = -1;
+        std::filesystem::resize_file(f.path, std::filesystem::file_size(f.path) - 1);
+        f.fd = test_resources::open_direct(f.path);
         auto truncated = make_sink(inputs, f, threads, depth);
         std::vector<float> actual(f.latent); kimi_cpu_sink_stats stats = {};
         require(!kimi_cpu_sink_run_activation(truncated.get(), meta.role[0], meta.role[1], meta.role[2],
@@ -3110,10 +3148,10 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
     std::printf("MUSE_EXPERT_POST_NORM_OK type=%s native_ranges=%d\n", ggml_type_name(type), int(native_ranges));
 }
 
-#endif
-
-// The host-memory ledger (kimi-host-ledger.h) with injected /proc and cgroup files, a fake GPU tier and a fake RAM
-// cache: which term binds where, the make_room order, and the refault-driven file reserve.
+#if defined(__linux__)
+// Linux only (the native ledger has test-ssd-host-budget): the host-memory ledger (kimi-host-ledger.h) with injected
+// /proc and cgroup files, a fake GPU tier and a fake RAM cache: which term binds where, the make_room order, and the
+// refault-driven file reserve.
 static void host_ledger_tests(fixture_inputs & inputs) {
     constexpr uint64_t MiB = 1ull << 20, GiB = 1ull << 30;
     scoped_fixture_input margin_env(inputs, "cache_reserve_bytes", "536870912");
@@ -3452,13 +3490,12 @@ static void host_ledger_tests(fixture_inputs & inputs) {
     std::printf("HOST_LEDGER_OK\n");
 }
 
-#if defined(__linux__)
+// Linux only: counts /proc/self/task and forks a child under RLIMIT_FSIZE.
 #include "configured-runtime-gate.h"
 #endif
 
 int main(int argc, char ** argv) {
     fixture_inputs inputs;
-#if defined(__linux__)
     try {
         real_options options; bool ring_set = false, registered_lifecycle = false, cache_mode = false, cache_pressure = false;
         bool configured_runtime_mode = false;
@@ -3517,16 +3554,30 @@ int main(int argc, char ** argv) {
         if (!schedule_invalid_mode) {
             const int required = registered_lifecycle ? 4 : options.threads;
             test_resources::cpu_participants(required - 1, 1);
-            test_resources::io_uring();
+            test_resources::io_ring();
         }
         if (cache_mode || hitrate_mode || elastic_cache_mode || cache_load_mode || max_cache_mode ||
                 cache_location_mode || cache_compute_mode || early_up_gate_mode ||
                 role_major_mode || nonblocking_down_mode || poll_mode || poll_early_mode || schedules_mode ||
                 prefetch_mode || cache_policy_mode || cache_large_mode || activation_mode || muse_q8_mode || muse_bf16_mode) {
-            test_resources::finite_cgroup();
+            test_resources::finite_envelope();
         }
+#if defined(__linux__)
         if (configured_runtime_mode) { configured_runtime_tests(inputs); return 0; }
         if (auto_ring_mode) { cache_auto_ring_test(inputs, options.threads, ring_set ? options.ring_experts : 8); return 0; }
+        if (cache_pressure_transition) { cache_pressure_transition_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (cache_unbounded) { cache_pressure_test(inputs, options.threads, ring_set ? options.ring_experts : 2, true); return 0; }
+        if (cache_pressure) {
+            require(!cache_mode && !registered_lifecycle && pack.empty() && prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(),
+                    "cache tests cannot be combined with other test modes or real-pack measurement");
+            cache_pressure_test(inputs, options.threads, ring_set ? options.ring_experts : 2);
+            std::printf("CPU_SINK_TEST_OK\n"); return 0;
+        }
+#else
+        if (configured_runtime_mode || auto_ring_mode || cache_pressure_transition || cache_unbounded || cache_pressure) {
+            throw test_resources::unavailable("this mode reads the Linux task inventory or cgroup v2 memory limits");
+        }
+#endif
         if (muse_q8_mode) { muse_expert_norm_test(inputs, options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_Q8_0); return 0; }
         if (muse_bf16_mode) {
             muse_expert_norm_test(inputs, options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_BF16);
@@ -3551,23 +3602,24 @@ int main(int argc, char ** argv) {
         if (prefetch_mode) { prefetch_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (cache_policy_mode) { cache_policy_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (cache_large_mode) { cache_large_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (cache_pressure_transition) { cache_pressure_transition_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (cache_unbounded) { cache_pressure_test(inputs, options.threads, ring_set ? options.ring_experts : 2, true); return 0; }
-        if (cache_mode || cache_pressure) {
-            require(!(cache_mode && cache_pressure) && !registered_lifecycle && pack.empty() && prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(),
+        if (cache_mode) {
+            require(!registered_lifecycle && pack.empty() && prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(),
                     "cache tests cannot be combined with other test modes or real-pack measurement");
-            if (cache_pressure) { cache_pressure_test(inputs, options.threads, ring_set ? options.ring_experts : 2); }
-            else { cache_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); }
+            cache_tests(inputs, options.threads, ring_set ? options.ring_experts : 2);
         } else if (registered_lifecycle) {
             require(pack.empty() && prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(), "registered lifecycle cannot be combined with real-pack measurement");
             registered_lifecycle_tests(inputs);
-        } else if (pack.empty()) { require(prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(), "measurement options require real pack"); host_ledger_tests(inputs); synthetic_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); }
+        } else if (pack.empty()) {
+            require(prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(), "measurement options require real pack");
+#if defined(__linux__)
+            host_ledger_tests(inputs);
+#else
+            std::printf("case=host_ledger status=SKIP reason=linux_ledger_injection\n");
+#endif
+            synthetic_tests(inputs, options.threads, ring_set ? options.ring_experts : 2);
+        }
         else { require(!prefix.empty(), "real pack requires fixture prefix"); real_test(inputs, pack, prefix, options); }
         std::printf("CPU_SINK_TEST_OK\n"); return 0;
     } catch (const unsupported_resident & e) { std::fprintf(stderr, "CPU_SINK_RESIDENT_UNSUPPORTED: %s\n", e.what()); return 77; }
       catch (const std::exception & e) { return test_resources::report("CPU_SINK_TEST", e); }
-#else
-    (void) argc; (void) argv;
-    std::printf("SKIP: CPU sink requires Linux io_uring/O_DIRECT\n"); return 77;
-#endif
 }

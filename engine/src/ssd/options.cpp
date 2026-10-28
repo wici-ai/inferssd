@@ -24,7 +24,6 @@ extern char ** environ;
 namespace {
 // One factory in the llama DSO. Backend copies of core code never create a
 // process singleton; every executor borrows this context's registration.
-#if defined(__linux__)
 std::shared_ptr<ssd::host::process_arbiter> host_owner() {
     static std::mutex mutex;
     static std::weak_ptr<ssd::host::process_arbiter> current;
@@ -33,7 +32,6 @@ std::shared_ptr<ssd::host::process_arbiter> host_owner() {
     if (!owner) { owner = std::make_shared<ssd::host::process_arbiter>(); current = owner; }
     return owner;
 }
-#endif
 
 void error_text(char * output, size_t size, const char * message) noexcept {
     if (output && size) { std::snprintf(output, size, "%s", message); }
@@ -127,8 +125,8 @@ size_t llama_ssd_schema_json(char * output, size_t size) {
 
 llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
     : settings(options.settings), debug(options.debug), stream(services) {
-#if defined(__linux__)
-    if (!settings.sources()->empty()) {
+    // The Mac expert source keeps its own reader and budget until macOS runs on the CPU sink.
+    if (!llama_ssd_mac_expert_source && !settings.sources()->empty()) {
         host_owner = ::host_owner();
         auto registered = host_owner->make_client();
         if (!registered) { throw std::runtime_error(registered.error); }
@@ -143,7 +141,6 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
         throw std::runtime_error("SSD experts require LLAMA_SSD_STORE=ON");
 #endif
     }
-#endif
     if (!options.telemetry_file.empty()) {
         auto opened = ssd::telemetry::writer::open(options.telemetry_file);
         if (!opened) { throw std::runtime_error(opened.error); }

@@ -178,16 +178,14 @@ license_add_file("llama.cpp" "LICENSE")
 # 3rd-party
 #
 
-set(LLAMA_SSD_STORE_DEFAULT OFF)
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(LLAMA_SSD_STORE_DEFAULT ON)
-endif()
-option(LLAMA_SSD_STORE "Link the shared SSD expert store (OFF is legacy comparison only)" ${LLAMA_SSD_STORE_DEFAULT})
+# The SSD expert store, on Linux, macOS and Windows alike.
+option(LLAMA_SSD_STORE "Link the SSD expert store (OFF is legacy comparison only)" ON)
 if (DEFINED LLAMA_C0_LINKED_STORE_PROTOTYPE)
     message(FATAL_ERROR "LLAMA_C0_LINKED_STORE_PROTOTYPE was replaced by LLAMA_SSD_STORE; remove the old cache option")
 endif()
-if (LLAMA_SSD_STORE AND (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR LLAMA_USE_SYSTEM_GGML OR NOT BUILD_SHARED_LIBS))
-    message(FATAL_ERROR "LLAMA_SSD_STORE requires Linux, bundled ggml and BUILD_SHARED_LIBS=ON; static/system-ggml store builds are unsupported")
+# The store is a static library that only llama links, so static and shared builds both carry it.
+if (LLAMA_SSD_STORE AND LLAMA_USE_SYSTEM_GGML)
+    message(FATAL_ERROR "LLAMA_SSD_STORE requires the bundled ggml; system-ggml store builds are unsupported")
 endif()
 
 if (LLAMA_USE_SYSTEM_GGML)

@@ -141,11 +141,7 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
         if (params.defer_experts && params.use_mmap) {
-#ifdef __linux__
             ml.build_expert_tensor_index(model.hparams);
-#else
-            LLAMA_LOG_WARN("%s: deferred expert loading is only supported on Linux; ignoring defer_experts\n", __func__);
-#endif
         }
         if (model.arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");

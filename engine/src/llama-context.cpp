@@ -206,11 +206,7 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
-#if defined(__linux__)
-    cpu_sink_enabled = ssd_runtime && !ssd_runtime->settings.sources()->empty();
-#else
-    cpu_sink_enabled = false;
-#endif
+    cpu_sink_enabled = !llama_ssd_mac_expert_source && ssd_runtime && !ssd_runtime->settings.sources()->empty();
     dense_gpu_phase_gate_enabled = cpu_sink_enabled;
     if (cpu_sink_enabled) {
         if (llama_ssd::describe_experts(model.arch, model.hparams, -1).activation ==
@@ -356,8 +352,7 @@ llama_context::llama_context(
                 throw std::runtime_error("cannot attach context-owned CPU runtime services");
             }
             ssd_runtime->prepare_dense(model);
-#if defined(__APPLE__)
-            if (!ssd_runtime->settings.sources()->empty()) {
+            if (llama_ssd_mac_expert_source && !ssd_runtime->settings.sources()->empty()) {
             char error[512] {};
             ssd_runtime->mac_cache = api->mac_create(&ssd_runtime->settings, &ssd_runtime->services, error, sizeof(error));
             ssd_runtime->destroy_mac = api->mac_destroy;
@@ -366,7 +361,6 @@ llama_context::llama_context(
                 throw std::runtime_error("cannot attach context-owned Mac expert cache");
             }
             }
-#endif
         }
 
         // create a list of the set_n_threads functions in the backends

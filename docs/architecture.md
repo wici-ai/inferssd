@@ -22,7 +22,7 @@ flowchart LR
 
 Source indexes locate expert byte ranges in the original GGUF files or a matching v1 expert pack. Indexing GGUF headers does not copy the model payload. Packs group expert slices by layer and expert with **4 KiB alignment**, preserving the existing quantized bytes. The v1 format has no checkpoint fingerprint, so keep each pack paired with its source checkpoint.
 
-The runtime owns immutable source metadata, readers, host-budget accounting and telemetry for each context. Executors borrow those services. Linux uses `io_uring` and CPU/CUDA cache tiers; macOS uses its native reader and cache path with an RSS guard. Device and source validation remains necessary for the selected configuration.
+The runtime owns immutable source metadata, readers, host-budget accounting and telemetry for each context. Executors borrow those services. Linux and Windows run configured experts on the CPU sink, which reads through the OS read ring (`io_uring` on Linux, IoRing on Windows) into its RAM cache; Linux adds the CUDA cache tier. macOS still uses its native reader and cache path with an RSS guard; the sink builds and is tested there. Device and source validation remains necessary for the selected configuration.
 
 ## Batching
 

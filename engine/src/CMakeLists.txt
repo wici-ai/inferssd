@@ -73,9 +73,8 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
 
-# CPU sink and CUDA transport borrow from the same shared owner.
+# llama owns each context's source index; the CPU sink and the CUDA transport borrow its source view.
 if (LLAMA_SSD_STORE)
     target_link_libraries(llama PRIVATE ggml-ssd-c0-store)
     target_compile_definitions(llama PRIVATE LLAMA_SSD_STORE=1)
-    set_property(TARGET llama APPEND PROPERTY INSTALL_RPATH "$ORIGIN")
 endif()

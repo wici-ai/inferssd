@@ -19,8 +19,8 @@
 //    A failed OS query leaves the term unreadable, and the RAM cache then admits nothing.
 //  - system: memory available to a new allocation, less the floor and the open prefill's pages.
 //      Windows: min(ullAvailPhys, ullAvailPageFile), as commit is a hard limit there.
-//      macOS: free, file-backed and purgeable pages (host_statistics64): what the kernel gives without
-//      compressing or swapping anyone's anonymous memory, the counterpart of MemAvailable.
+//      macOS: free, file-backed, purgeable and reusable pages (the kernel's live counters, through sysctl): what
+//      the kernel gives without compressing or swapping anyone's anonymous memory, the counterpart of MemAvailable.
 // floor = margin + explicit reserves, as on Linux.
 //
 // How the Linux-specific parts carry over:

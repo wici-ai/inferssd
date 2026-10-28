@@ -612,8 +612,8 @@ def test_bad_platform_profile_fails_during_preparation(tmp_path, source):
     args, api = prepared_fixture(tmp_path, source)
     path = tmp_path / "cloud-5090-template.json"
     config = json.loads(path.read_text())
-    config["sides"]["candidate"]["build"]["cmake_flags"] = ["-DBUILD_SHARED_LIBS=OFF", "-DLLAMA_SSD_STORE=ON"]
+    config["sides"]["candidate"]["build"]["cmake_flags"] = ["-DLLAMA_USE_SYSTEM_GGML=ON", "-DLLAMA_SSD_STORE=ON"]
     path.write_text(json.dumps(config))
-    with pytest.raises(ValueError, match="LLAMA_SSD_STORE requires Linux"):
+    with pytest.raises(ValueError, match="LLAMA_SSD_STORE requires the bundled ggml"):
         prepare.prepare(args, api)
     assert not (args.output / "prepared.json").exists()

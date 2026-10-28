@@ -289,7 +289,6 @@ struct llama_kimi_cpu_sink_runtime {
         std::lock_guard<std::mutex> lock(mutex);
         if ((!vram_budget && !cache_budget) || !registry) { return; }
         initialize(registry);
-#if defined(__linux__)
         const auto reserve = cpu_api->vram_reserve;
         // the load-time graph's pages, held from here to the first decode token: the load step leaves their room
         if (prefill_pages && cache_prefill_room) { cache_prefill_room(sink, &settings, &services, prefill_pages, 0, 0); }
@@ -297,7 +296,6 @@ struct llama_kimi_cpu_sink_runtime {
         if (reserve && !reserve(sink, up, gate, down, experts_used, error, sizeof(error))) {
             std::fprintf(stderr, "[kimi_vram_elastic] event=reserve status=fail error=%s\n", error);
         }
-#endif
     }
 
     // Room for `host_bytes` of host memory and `device_bytes` of GPU memory the caller is about to allocate, from

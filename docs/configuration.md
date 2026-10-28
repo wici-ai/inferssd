@@ -48,8 +48,8 @@ the process's own memory (Windows PrivateUsage, macOS phys_footprint). With
 process's use plus the memory then available, so its room starts at the
 available memory less the reserve. The system term is the memory available now
 less the floor: Linux MemAvailable, Windows the smaller of available physical
-memory and available commit, macOS free, file-backed and purgeable pages. The
-RAM expert cache admits only under a readable envelope.
+memory and available commit, macOS free, file-backed, purgeable and reusable
+pages. The RAM expert cache admits only under a readable envelope.
 
 ## File and CLI contract
 

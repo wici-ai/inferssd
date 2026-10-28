@@ -36,7 +36,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ssd/cpu-sink.cpp
         ggml-cpu/ssd/cpu-sink.h
         ggml-cpu/ssd/cpu-sink-internal.h
-        ggml-ssd/host/ledger.h
         ggml-cpu/ssd/cpu-prefill.cpp
         ggml-cpu/ssd/cpu-prefill.h
         ggml-cpu/repack.cpp

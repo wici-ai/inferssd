@@ -5,9 +5,7 @@
 #include <cerrno>
 #include <cstring>
 #include <limits>
-#include <mutex>
 #include <new>
-#include <unordered_set>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -17,11 +15,16 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <winternl.h>
 #include <fcntl.h>
 #include <io.h>
 #include <stdlib.h>
+// ntdll export, declared by the driver kit; the SDK's winternl.h has its types.
+extern "C" NTSYSAPI NTSTATUS NTAPI NtQueryInformationFile(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
+                                                           FILE_INFORMATION_CLASS);
 #else
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -38,36 +41,6 @@ void describe(std::string * error, const char * path, const char * what, int cod
         error->clear();
     }
 }
-
-#if !defined(__linux__)
-// macOS and Windows cannot read the no-cache mode back from a descriptor, so
-// open_direct records its descriptors until close_fd.
-struct direct_registry {
-    std::mutex mutex;
-    std::unordered_set<int> fds;
-};
-direct_registry & direct_fds() {
-    static direct_registry registry;
-    return registry;
-}
-bool remember_direct(int fd) noexcept {
-    auto & registry = direct_fds();
-    std::lock_guard<std::mutex> lock(registry.mutex);
-    try { registry.fds.insert(fd); } catch (...) { return false; }
-    return true;
-}
-// Forget before closing, so a racing open cannot receive this number first.
-void forget_direct(int fd) noexcept {
-    auto & registry = direct_fds();
-    std::lock_guard<std::mutex> lock(registry.mutex);
-    registry.fds.erase(fd);
-}
-bool known_direct(int fd) noexcept {
-    auto & registry = direct_fds();
-    std::lock_guard<std::mutex> lock(registry.mutex);
-    return registry.fds.count(fd) != 0;
-}
-#endif
 
 #if defined(_WIN32)
 void ignore_invalid_parameter(const wchar_t *, const wchar_t *, const wchar_t *, unsigned int, uintptr_t) {}
@@ -227,21 +200,13 @@ void * native_handle(int fd) { return handle_of(fd); }
 int open_direct(const char * utf8_path, std::string * error) {
     // Overlapped: the read rings keep many reads in flight on one handle, which
     // a synchronous handle would serialize.
-    const int fd = open_windows(utf8_path, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, error);
-    if (fd >= 0 && !remember_direct(fd)) {
-        _close(fd);
-        describe(error, utf8_path, "out of memory", 0);
-        errno = ENOMEM;
-        return -1;
-    }
-    return fd;
+    return open_windows(utf8_path, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, error);
 }
 
 int open_buffered(const char * utf8_path, std::string * error) { return open_windows(utf8_path, 0, error); }
 
 void close_fd(int fd) {
     if (fd < 0) { return; }
-    forget_direct(fd);
     quiet_crt quiet;
     _close(fd);
 }
@@ -254,7 +219,15 @@ bool file_size(int fd, uint64_t & bytes) {
     return true;
 }
 
-bool is_direct(int fd) { return fd >= 0 && known_direct(fd); }
+bool is_direct(int fd) {
+    const HANDLE handle = handle_of(fd);
+    if (handle == INVALID_HANDLE_VALUE) { return false; }
+    // FILE_FLAG_NO_BUFFERING shows as this mode bit (FileModeInformation = 16).
+    IO_STATUS_BLOCK status {};
+    ULONG mode = 0;
+    if (NtQueryInformationFile(handle, &status, &mode, sizeof(mode), FILE_INFORMATION_CLASS(16)) < 0) { return false; }
+    return (mode & FILE_NO_INTERMEDIATE_BUFFERING) != 0;
+}
 
 size_t direct_alignment(int fd) {
     const HANDLE handle = handle_of(fd);
@@ -317,9 +290,7 @@ int64_t pread_some(int fd, void * data, size_t bytes, uint64_t offset) {
 }
 #else
 int open_direct(const char * utf8_path, std::string * error) {
-#if defined(__linux__)
-    return open_posix(utf8_path, O_DIRECT, error);
-#elif defined(__APPLE__)
+#if defined(__APPLE__)
     const int fd = open_posix(utf8_path, 0, error);
     if (fd < 0) { return -1; }
     if (fcntl(fd, F_NOCACHE, 1) == -1) {
@@ -329,29 +300,16 @@ int open_direct(const char * utf8_path, std::string * error) {
         errno = code;
         return -1;
     }
-#else
-    const int fd = open_posix(utf8_path, O_DIRECT, error);
-    if (fd < 0) { return -1; }
-#endif
-#if !defined(__linux__)
-    if (!remember_direct(fd)) {
-        ::close(fd);
-        describe(error, utf8_path, "out of memory", 0);
-        errno = ENOMEM;
-        return -1;
-    }
     return fd;
+#else
+    return open_posix(utf8_path, O_DIRECT, error);
 #endif
 }
 
 int open_buffered(const char * utf8_path, std::string * error) { return open_posix(utf8_path, 0, error); }
 
 void close_fd(int fd) {
-    if (fd < 0) { return; }
-#if !defined(__linux__)
-    forget_direct(fd);
-#endif
-    ::close(fd);
+    if (fd >= 0) { ::close(fd); }
 }
 
 bool file_size(int fd, uint64_t & bytes) {
@@ -363,11 +321,14 @@ bool file_size(int fd, uint64_t & bytes) {
 
 bool is_direct(int fd) {
     if (fd < 0) { return false; }
-#if defined(__linux__)
     const int flags = fcntl(fd, F_GETFL);
-    return flags >= 0 && (flags & O_DIRECT);
+#if defined(__APPLE__)
+    // F_GETFL reports XNU's FNOCACHE file flag, which F_NOCACHE sets; the SDK
+    // keeps its name kernel-only.
+    constexpr int fnocache = 0x40000;
+    return flags >= 0 && (flags & fnocache);
 #else
-    return known_direct(fd);
+    return flags >= 0 && (flags & O_DIRECT);
 #endif
 }
 
@@ -409,6 +370,42 @@ int64_t pread_some(int fd, void * data, size_t bytes, uint64_t offset) {
     }
 }
 #endif
+
+std::FILE * open_stream(const char * utf8_path, std::string * error) {
+    const int fd = open_buffered(utf8_path, error);
+    if (fd < 0) { return nullptr; }
+#if defined(_WIN32)
+    std::FILE * stream = _fdopen(fd, "rb");
+#else
+    std::FILE * stream = fdopen(fd, "rb");
+#endif
+    if (!stream) {
+        const int code = errno;
+        close_fd(fd);
+        describe(error, utf8_path, "fdopen", code);
+        errno = code;
+    }
+    return stream;
+}
+
+int stream_fd(std::FILE * stream) {
+    if (!stream) { return -1; }
+#if defined(_WIN32)
+    return _fileno(stream);
+#else
+    return fileno(stream);
+#endif
+}
+
+bool unmap_view(void * base, size_t bytes) {
+    if (!base) { return true; }
+#if defined(_WIN32)
+    (void) bytes;
+    return UnmapViewOfFile(base) != 0;
+#else
+    return munmap(base, bytes) == 0;
+#endif
+}
 
 bool pread_exact(int fd, void * data, size_t bytes, uint64_t offset, int * error) {
     auto * target = static_cast<unsigned char *>(data);

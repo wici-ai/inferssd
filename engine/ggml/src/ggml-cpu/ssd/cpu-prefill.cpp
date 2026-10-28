@@ -129,7 +129,7 @@ struct kimi_cpu_prefill {
     void prepare(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down,
             const int32_t * ids, const float * route_weights, int nslots, int ntokens) {
         // Check before sizing any workspace. The shared stream validates the
-        // exact packed ranges, O_DIRECT descriptors, padding and tensor strides.
+        // exact packed ranges, direct-read descriptors, padding and tensor strides.
         const ggml_tensor * tensors[] = { up, gate, down };
         for (const auto * tensor : tensors) {
             if (!tensor || !ggml_is_contiguous(tensor) ||

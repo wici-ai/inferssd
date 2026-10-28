@@ -27,7 +27,8 @@ typedef bool (*kimi_cpu_sink_resolver)(
 
 
 
-// Linux io_uring and O_DIRECT are required. total_threads includes the calling
+// Sources are direct-read descriptors (platform::open_direct), read through the
+// OS read ring (io/read-ring.h). total_threads includes the calling
 // compute thread and one I/O thread; all other threads sleep between phases.
 // A context serializes run calls. This unconfigured factory is for explicit
 // CPU-only callers. Production uses ssd::cpu::create_configured with an owned
@@ -44,18 +45,20 @@ GGML_BACKEND_API void kimi_cpu_sink_prefetch_hint(struct kimi_cpu_sink * sink, i
 // Configure while no run is in progress. Layer quotas are assigned in priority
 // order, up to max_experts_per_layer each; a final layer may receive a partial
 // quota. Layer IDs refer to canonical blk.N.ffn_{up,gate,down}_exps.weight names.
-// Payload uses ordinary anonymous mmap, never pinned/registered. Configuration
-// does not touch payload pages. budget=0 disables the cache. Reconfiguration
-// releases the old mapping first. max_experts_per_layer must be 1..896.
-// Admission requires readable finite cgroup-v2 limits and the context's host
-// budget client. Only newly resident slots and conservative metadata/page-table
-// costs are charged; the virtual payload budget is not prefaulted wholesale.
+// Payload is an ordinary anonymous arena (platform/memory.h), never
+// pinned/registered. Configuration does not touch payload pages. budget=0
+// disables the cache. Reconfiguration releases the old arena first.
+// max_experts_per_layer must be 1..896.
+// Admission requires a readable host-ledger envelope (Linux: finite cgroup v2
+// limits) and the context's host budget client. Only newly resident slots and
+// conservative metadata/page-table costs are charged; the virtual payload
+// budget is not prefaulted wholesale.
 // Production fixes count_decay2/uniform retention with partial reclaim and
 // reclaimable-file accounting. Explicit test policies exercise other supported
 // algorithms through the testing factory. Unreadable resource guards reject
 // admission; known shortages may discard low-score pages while retaining the
-// mapping and policy heat. The caller must use swap0 and keep cgroup membership
-// fixed until workers stop and resident mappings are released.
+// mapping and policy heat. On Linux the caller must use swap0 and keep cgroup
+// membership fixed until workers stop and resident mappings are released.
 GGML_BACKEND_API bool kimi_cpu_sink_cache_configure(
         struct kimi_cpu_sink * sink, uint64_t budget_bytes,
         const int32_t * layer_priority, int n_layers, int max_experts_per_layer,
@@ -94,7 +97,7 @@ GGML_BACKEND_API void kimi_cpu_sink_cache_get_stats(
 // Room in host memory for other memory about to be allocated, decided by the host-memory ledger
 // (kimi-host-ledger.h): `host_bytes` of host memory (host compute buffers, checkpoints, prompt-cache blobs) and
 // `device_bytes` of GPU memory (device compute buffers), which count only where the GPU allocates out of the same
-// DRAM. The tightest finite cgroup limit and MemAvailable less the floor must both still hold. On a unified-memory
+// DRAM. Both ledger terms, the envelope and the available memory less the floor, must still hold. On a unified-memory
 // GPU the GPU tier gives blocks back first, then RAM cache slots go. Returns false when either would still be
 // exceeded. With a null sink (before the first graph creates one) the ledger alone decides.
 GGML_BACKEND_API bool kimi_cpu_sink_cache_make_room(struct kimi_cpu_sink * sink, uint64_t host_bytes, uint64_t device_bytes);

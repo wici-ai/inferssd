@@ -217,8 +217,15 @@ struct fixture_inputs {
             return nullptr;
         }
     }
-    template<class Ledger> void configure(Ledger & ledger, bool unified) const {
+    // The Linux ledger finds its cgroup and derives the margin and device reserve here; the native ledger
+    // (macOS, Windows) has its envelope from the OS and no such terms.
+    template<class Ledger> auto configure_terms(Ledger & ledger, bool unified, int) const
+            -> decltype(ledger.configure(unified, 0u, 0u), void()) {
         ledger.configure(unified, uint32_t(integer("host_headroom_mib", 512)), uint32_t(integer("device_reserve_mib", 0)));
+    }
+    template<class Ledger> void configure_terms(Ledger & ledger, bool unified, long) const { ledger.unified = unified; }
+    template<class Ledger> void configure(Ledger & ledger, bool unified) const {
+        configure_terms(ledger, unified, 0);
         ledger.reserve = integer("cache_reserve_bytes", 2ull << 30);
         if (ledger.reserve < (512ull << 20)) { throw std::runtime_error("fixture reserve below safe floor"); }
         ledger.margin = std::max(ledger.margin, ledger.reserve);

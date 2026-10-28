@@ -15,5 +15,9 @@ endif()
 # Thread placement (CPU topology, pinning, roles) and arena memory primitives.
 target_sources(ggml-ssd-platform PRIVATE threads.cpp threads.h memory.cpp memory.h)
 
-# Files: direct and buffered opens, positional reads and file identity.
+# Files: direct and buffered opens, positional reads and file identity. Windows
+# reads a handle's no-buffering mode back through ntdll.
 target_sources(ggml-ssd-platform PRIVATE file.cpp file.h)
+if (WIN32)
+    target_link_libraries(ggml-ssd-platform PRIVATE ntdll)
+endif()

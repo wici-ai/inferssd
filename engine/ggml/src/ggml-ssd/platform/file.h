@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 namespace ssd { namespace platform {
@@ -23,12 +24,19 @@ int open_direct(const char * utf8_path, std::string * error = nullptr);
 // Ordinary cached reads, for metadata. The Windows handle is synchronous, so
 // the descriptor also works with the CRT and stdio.
 int open_buffered(const char * utf8_path, std::string * error = nullptr);
-// Closes a descriptor from either open. Direct descriptors must be closed here:
-// macOS and Windows track them for is_direct().
+// Closes a descriptor from either open.
 void close_fd(int fd);
+// open_buffered as a binary stdio stream, for metadata parsed with stdio.
+// fclose releases it.
+std::FILE * open_stream(const char * utf8_path, std::string * error = nullptr);
+// The descriptor behind a stream, or -1.
+int stream_fd(std::FILE * stream);
+// Unmaps a whole file view that starts at base and spans bytes.
+bool unmap_view(void * base, size_t bytes);
 
 bool file_size(int fd, uint64_t & bytes);
-// True for a descriptor that bypasses the page cache.
+// True for a descriptor that bypasses the page cache. It asks the descriptor
+// itself, so every module of the process gets the same answer.
 bool is_direct(int fd);
 // The offset, length and address granularity of direct reads on fd.
 size_t direct_alignment(int fd);

@@ -287,7 +287,7 @@ struct sink_vram {
             for (int role = 0; role < 3; ++role) {
                 const auto k = sink_cache::key(source[i].role[role]);
                 r.role[role] = { k.device, k.inode, k.size, k.offset, k.bytes,
-                                k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns };
+                                k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns, k.inode_hi };
             }
         }
         char error[512] = {};
@@ -436,7 +436,7 @@ struct sink_vram {
             for (int role = 0; role < 3; ++role) {
                 const auto k = sink_cache::key(source[i].role[role]);
                 r.role[role] = { k.device, k.inode, k.size, k.offset, k.bytes,
-                                k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns };
+                                k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns, k.inode_hi };
             }
         }
         const kimi_vram_expert_format f = { latent, hidden, int32_t(up->type), int32_t(down->type),
@@ -743,7 +743,8 @@ struct sink_vram {
         for (int r = 0; r < 3; ++r) {
             const auto & x = a.role[r];
             const auto & y = b.role[r];
-            if (x.device != y.device || x.inode != y.inode || x.size != y.size || x.offset != y.offset || x.bytes != y.bytes ||
+            if (x.device != y.device || x.inode != y.inode || x.inode_hi != y.inode_hi || x.size != y.size ||
+                    x.offset != y.offset || x.bytes != y.bytes ||
                     x.mtime_s != y.mtime_s || x.mtime_ns != y.mtime_ns || x.ctime_s != y.ctime_s || x.ctime_ns != y.ctime_ns) {
                 return false;
             }
@@ -845,7 +846,7 @@ struct sink_vram {
             request.layer=candidates[i].layer;request.expert=source.id;request.weight=1;
             for(int role=0;role<3;++role){
                 source.role[role]=candidates[i].role[role];const auto k=sink_cache::key(source.role[role]);
-                request.role[role]={k.device,k.inode,k.size,k.offset,k.bytes,k.mtime_s,k.mtime_ns,k.ctime_s,k.ctime_ns};
+                request.role[role]={k.device,k.inode,k.size,k.offset,k.bytes,k.mtime_s,k.mtime_ns,k.ctime_s,k.ctime_ns,k.inode_hi};
             }
         }
     }

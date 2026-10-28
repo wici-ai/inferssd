@@ -8,6 +8,10 @@ namespace ssd { namespace platform {
 
 // The commit and discard granularity: 4 KiB on x86, 16 KiB on Apple silicon.
 size_t page_size();
+// The largest page an ordinary heap allocation may land on: Linux's PMD-sized
+// transparent huge page (page_size() * page_size() / 8); page_size() on macOS
+// and Windows, whose heaps use ordinary pages.
+size_t heap_page_size();
 
 // Heap blocks with a power-of-two alignment that is a multiple of
 // sizeof(void *); nullptr on failure. Release only with aligned_free.
@@ -23,9 +27,9 @@ void aligned_free(void * p);
 //
 // commit is where Windows charges commit, as the host ledger charges; Linux
 // charges at first touch, macOS takes the slot back into phys_footprint.
-// discard drops the slot's memory and accounting without keeping its contents;
-// a discarded slot must be committed again before it is touched. Ranges are
-// page aligned.
+// discard drops the slot's memory and accounting without keeping its contents
+// (macOS keeps the pages as reusable until the kernel needs them); a discarded
+// slot must be committed again before it is touched. Ranges are page aligned.
 
 // Address space only: the ledger admits each resident slot, so the OS must not
 // refuse an arena larger than RAM plus swap. nullptr, with the reason in *why.

@@ -23,6 +23,9 @@ struct llama_file_range {
     size_t last  = 0;
 };
 
+// The expert tensors' file ranges under --defer-experts, on every OS. Their files
+// are mapped without prefetch (MAP_POPULATE, WILLNEED, PrefetchVirtualMemory),
+// so only dense tensors are paged in at load; the SSD executor reads experts.
 struct llama_expert_tensor_index {
     size_t deferred_bytes = 0;
     size_t dense_bytes = 0;

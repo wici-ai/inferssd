@@ -193,7 +193,7 @@ struct tier {
     std::vector<pending_seed> seeds;
     std::set<int> seed_planned;uint64_t seed_plan_generation=UINT64_MAX;
     bool seed_registered=false;cudaStream_t seed_stream=nullptr;cudaEvent_t seed_done=nullptr;
-    std::map<int,struct stat> seed_files; // fstat of the resolver's descriptors, for the seeds' keys
+    std::map<int,ssd::platform::file_identity> seed_files; // the resolver's descriptors' identities, for the seeds' keys
     // the expert-pack resolver (ggml-cuda's, found at registration): tensor name, expert, logical bytes, experts ->
     // descriptor, logical offset, bytes
     using resolve_fn=bool (*)(const char *,int,size_t,int64_t,int *,uint64_t *,size_t *);
@@ -518,8 +518,8 @@ struct tier {
                 seed_resolve(name,expert,role_bytes[i],n_experts,&fd,&offset,&bytes);
             if(!resolved || fd<0 || bytes!=role_bytes[i])return false;
             auto it=seed_files.find(fd);
-            if(it==seed_files.end()){struct stat st={};if(fstat(fd,&st))return false;it=seed_files.emplace(fd,st).first;}
-            r.role[i]=kimi_vram_source_identity(&it->second,offset,role_bytes[i]);
+            if(it==seed_files.end()){ssd::platform::file_identity file;if(!ssd::platform::identity(fd,file))return false;it=seed_files.emplace(fd,file).first;}
+            r.role[i]=kimi_vram_source_identity(it->second,offset,role_bytes[i]);
         }
         return true;
     }

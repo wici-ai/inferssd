@@ -11,6 +11,7 @@
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/vm_page_size.h>
+#include <sys/sysctl.h>
 #else
 #error "ledger-native is the macOS and Windows budget source; Linux uses ledger.h"
 #endif
@@ -78,22 +79,39 @@ bool process_use(uint64_t & bytes) {
     return true;
 }
 
+// One of the kernel's page counters, read live. host_statistics64 holds the same counters, but the kernel rate
+// limits it for unentitled processes: past a few calls a second it repeats its last answer, so room that a
+// give-back has just made would not show.
+struct page_counter {
+    int mib[CTL_MAXNAME] = {};
+    size_t length = CTL_MAXNAME;
+    bool named = false;
+    explicit page_counter(const char * name) : named(sysctlnametomib(name, mib, &length) == 0) {}
+    bool read(uint64_t & pages) const {
+        uint64_t value = 0; // the counters are 32-bit, read into the low half on these little-endian targets
+        size_t size = sizeof(value);
+        if (!named || sysctl(const_cast<int *>(mib), u_int(length), &value, &size, nullptr, 0) != 0 ||
+                (size != sizeof(uint32_t) && size != sizeof(uint64_t))) {
+            return false;
+        }
+        pages = size == sizeof(uint32_t) ? uint64_t(uint32_t(value)) : value;
+        return true;
+    }
+};
+
 bool available(uint64_t & bytes) {
-    // Each mach_host_self() call adds a send-right reference; keep one for the process.
-    static const mach_port_t host = mach_host_self();
-    vm_statistics64_data_t vm{};
-    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm), &count) != KERN_SUCCESS) {
+    // Free pages (without the speculative ones, which the file-backed count holds), file-backed, purgeable and
+    // reusable pages (MADV_FREE_REUSABLE: the RAM cache's discarded slots and the allocator's free blocks), which
+    // the kernel frees without compressing. Other inactive anonymous pages are not available: the kernel must
+    // compress or swap them first.
+    static const page_counter free_pages("vm.page_free_count"), file_pages("vm.page_pageable_external_count"),
+            purgeable_pages("vm.page_purgeable_count"), reusable_pages("vm.page_reusable_count");
+    uint64_t free = 0, file = 0, purgeable = 0, reusable = 0;
+    if (!free_pages.read(free) || !file_pages.read(file) || !purgeable_pages.read(purgeable) ||
+            !reusable_pages.read(reusable)) {
         return false;
     }
-    // free_count includes the speculative pages (vm_stat prints free - speculative), and the file-backed
-    // external_page_count includes them again (internal + external = active + inactive + speculative). Purgeable
-    // pages are anonymous, so neither count holds them. Inactive anonymous pages are not available: the kernel
-    // must compress or swap them first.
-    const uint64_t free_count = vm.free_count, speculative = vm.speculative_count;
-    const uint64_t pages = free_count - std::min(free_count, speculative) + uint64_t(vm.external_page_count) +
-                           uint64_t(vm.purgeable_count);
-    bytes = pages * uint64_t(vm_kernel_page_size);
+    bytes = (free + file + purgeable + reusable) * uint64_t(vm_kernel_page_size);
     return true;
 }
 

@@ -2,6 +2,7 @@
 #include "memory.h"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,6 +34,14 @@ size_t page_size() {
 #endif
     }();
     return value;
+}
+
+size_t heap_page_size() {
+#if defined(__linux__)
+    return page_size() * (page_size() / sizeof(uint64_t));
+#else
+    return page_size();
+#endif
 }
 
 void * aligned_alloc_bytes(size_t alignment, size_t bytes) {
@@ -88,6 +97,8 @@ bool arena_discard(void * p, size_t bytes) {
 #if defined(_WIN32)
     return VirtualFree(p, bytes, MEM_DECOMMIT) != 0;
 #elif defined(__APPLE__)
+    // Reusable pages leave phys_footprint at once and the kernel frees them without compressing when it needs
+    // them; the ledger counts them as available. A fresh mapping over part of the arena would not free its pages.
     return madvise(p, bytes, MADV_FREE_REUSABLE) == 0;
 #else
     return madvise(p, bytes, MADV_DONTNEED) == 0;

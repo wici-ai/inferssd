@@ -153,10 +153,8 @@ def validate_platform_flags(platform, flags):
     def enabled(key, default):
         value = values.get(key, default)
         return value not in false and not value.endswith("-NOTFOUND")
-    if enabled("LLAMA_SSD_STORE", "ON" if platform == "linux" else "OFF"):
-        if (platform != "linux" or not enabled("BUILD_SHARED_LIBS", "ON")
-                or enabled("LLAMA_USE_SYSTEM_GGML", "OFF")):
-            raise ValueError("LLAMA_SSD_STORE requires Linux, BUILD_SHARED_LIBS=ON and bundled ggml")
+    if enabled("LLAMA_SSD_STORE", "ON") and enabled("LLAMA_USE_SYSTEM_GGML", "OFF"):
+        raise ValueError("LLAMA_SSD_STORE requires the bundled ggml")
 
 
 def run_build(session, side, settings, paths, output, revision):

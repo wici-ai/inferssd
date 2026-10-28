@@ -2,7 +2,9 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
-#include <sys/stat.h>
+#ifdef __cplusplus
+#include "../platform/file.h"
+#endif
 
 // Private optional transport ABI. The CPU backend remains CUDA independent.
 // Every function except destroy returns 0 on success. Errors must drain work
@@ -10,30 +12,27 @@
 struct kimi_vram_source {
     uint64_t device, inode, size, offset, bytes;
     int64_t mtime_s, mtime_ns, ctime_s, ctime_ns;
+    uint64_t inode_hi; // the upper half of a 128-bit file id (Windows); 0 on POSIX
 };
 struct kimi_vram_request {
     struct kimi_vram_source role[3]; // up, gate, down, same packed-file identity
     int32_t layer, expert;
     float weight;
 };
+#ifdef __cplusplus
 // A role's payload as the RAM cache and the VRAM tier know it: the file behind the expert-pack resolver's
-// descriptor (st, from fstat), the role's logical offset in it (where the resolver says its bytes start, before a
-// read aligns it) and its logical bytes. The sink keys what it reads by it and a prefill seed what it copies, so
-// that decode finds the seed: both build it here.
-static inline struct kimi_vram_source kimi_vram_source_identity(const struct stat * st, uint64_t offset, uint64_t bytes) {
-#if defined(__APPLE__)
-    const int64_t mtime_s = st->st_mtimespec.tv_sec, mtime_ns = st->st_mtimespec.tv_nsec;
-    const int64_t ctime_s = st->st_ctimespec.tv_sec, ctime_ns = st->st_ctimespec.tv_nsec;
-#elif defined(_WIN32)
-    const int64_t mtime_s = st->st_mtime, mtime_ns = 0, ctime_s = st->st_ctime, ctime_ns = 0;
-#else
-    const int64_t mtime_s = st->st_mtim.tv_sec, mtime_ns = st->st_mtim.tv_nsec;
-    const int64_t ctime_s = st->st_ctim.tv_sec, ctime_ns = st->st_ctim.tv_nsec;
-#endif
-    struct kimi_vram_source s = { (uint64_t) st->st_dev, (uint64_t) st->st_ino, (uint64_t) st->st_size, offset, bytes,
-        mtime_s, mtime_ns, ctime_s, ctime_ns };
+// descriptor (from ssd::platform::identity), the role's logical offset in it (where the resolver says its bytes
+// start, before a read aligns it) and its logical bytes. The sink keys what it reads by it and a prefill seed what it
+// copies, so that decode finds the seed: both build it here. Times split as POSIX stat reports them.
+static inline kimi_vram_source kimi_vram_source_identity(const ssd::platform::file_identity & file, uint64_t offset,
+        uint64_t bytes) {
+    const auto seconds = [](int64_t ns) { return ns / 1000000000 - (ns % 1000000000 < 0); };
+    const int64_t mtime_s = seconds(file.mtime_ns), ctime_s = seconds(file.ctime_ns);
+    kimi_vram_source s = { file.device, file.id_lo, file.size, offset, bytes,
+        mtime_s, file.mtime_ns - mtime_s * 1000000000, ctime_s, file.ctime_ns - ctime_s * 1000000000, file.id_hi };
     return s;
 }
+#endif
 struct kimi_vram_tier_api {
     uint32_t version; // 2
     uint32_t size;

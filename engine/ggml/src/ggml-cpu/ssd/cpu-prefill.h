@@ -20,7 +20,7 @@ struct kimi_cpu_prefill_stats {
     uint64_t gpu_transient_routes;
     uint64_t gpu_transient_upload_bytes;
     double gpu_transient_upload_us;
-    uint64_t gpu_ssd_transient_candidates; // O_DIRECT Q2 experts passing the SSD scheduler gate
+    uint64_t gpu_ssd_transient_candidates; // direct-read Q2 experts passing the SSD scheduler gate
     uint64_t gpu_ssd_transient_experts;    // staged SSD experts computed through scratch
     uint64_t gpu_ssd_transient_routes;
     uint64_t gpu_ssd_transient_upload_bytes;
@@ -34,8 +34,8 @@ struct kimi_cpu_prefill_stats {
     uint64_t ram_experts;              // distinct read-only retained RAM hits
     uint64_t ram_routes;               // token/slot routes sourced from retained RAM
     uint64_t ram_bytes;
-    uint64_t ssd_experts;              // distinct O_DIRECT misses
-    uint64_t ssd_routes;               // token/slot routes sourced from O_DIRECT
+    uint64_t ssd_experts;              // distinct direct-read misses
+    uint64_t ssd_routes;               // token/slot routes sourced from direct reads
     uint64_t ssd_bytes;
 };
 
