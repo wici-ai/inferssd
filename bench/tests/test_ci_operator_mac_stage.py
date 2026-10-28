@@ -210,6 +210,74 @@ def test_mac_receive_seals_without_precreating_worker_job(admitted):
         mac.receive(expected, io.BytesIO(raw))
 
 
+def test_slow_mac_upload_leaves_full_processing_budget(monkeypatch):
+    clock, alarms, progress = [100.0], [], {}
+    spool = io.BytesIO()
+    monkeypatch.setattr(mac.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(mac.sys, "platform", "darwin")
+    monkeypatch.setattr(mac.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(mac.tempfile, "TemporaryFile", lambda: spool)
+    def slow_input(incoming, deadline):
+        assert deadline == 100.0 + mac.TRANSFER_TIMEOUT
+        clock[0] += mac.TRANSFER_TIMEOUT - 1
+        mac.common.remaining(deadline)
+        yield b"complete wire"
+    def seal(expected, incoming, deadline):
+        assert incoming.read() == b"complete wire"
+        assert deadline == clock[0] + mac.PROCESSING_TIMEOUT
+        clock[0] += mac.PROCESSING_TIMEOUT - 1
+        mac.common.remaining(deadline)
+        return {"status": "passed"}
+    monkeypatch.setattr(mac.common, "input_chunks", slow_input)
+    monkeypatch.setattr(mac, "receive_packet", seal)
+    assert mac.receive("a" * 64, io.BytesIO(), progress=progress, arm_deadline=alarms.append) == {"status": "passed"}
+    assert alarms == [mac.TRANSFER_TIMEOUT, mac.PROCESSING_TIMEOUT]
+    assert progress == dict(phase="processing", received_bytes=len(b"complete wire"))
+    assert spool.closed
+
+
+def test_expired_mac_upload_closes_anonymous_spool_without_sealing(monkeypatch):
+    clock, progress = [100.0], {}
+    spool = io.BytesIO()
+    monkeypatch.setattr(mac.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(mac.sys, "platform", "darwin")
+    monkeypatch.setattr(mac.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(mac.tempfile, "TemporaryFile", lambda: spool)
+    def expired_input(incoming, deadline):
+        yield b"partial"
+        clock[0] = deadline
+        mac.common.remaining(deadline)
+    monkeypatch.setattr(mac.common, "input_chunks", expired_input)
+    monkeypatch.setattr(mac, "receive_packet", lambda *args: pytest.fail("expired input cannot seal or publish"))
+    with pytest.raises(TimeoutError):
+        mac.receive("a" * 64, io.BytesIO(), progress=progress)
+    assert spool.closed
+    assert progress == dict(phase="transfer", received_bytes=len(b"partial"))
+
+
+@pytest.mark.parametrize("phase,budget", [("transfer", mac.TRANSFER_TIMEOUT), ("processing", mac.PROCESSING_TIMEOUT)])
+def test_root_timeout_reports_phase_and_bytes_and_disarms(monkeypatch, capsys, phase, budget):
+    handlers, alarms = {}, []
+    monkeypatch.setattr(mac.sys, "argv", ["operator_mac_stage.py", "--expected-sha256", "a" * 64])
+    monkeypatch.setattr(mac.signal, "signal", lambda number, handler: handlers.update({number: handler}))
+    monkeypatch.setattr(mac.signal, "alarm", alarms.append)
+    def expire(expected, *, progress, arm_deadline):
+        progress.update(phase=phase, received_bytes=12345)
+        arm_deadline(budget)
+        handlers[mac.signal.SIGALRM](mac.signal.SIGALRM, None)
+    monkeypatch.setattr(mac, "receive", expire)
+    with pytest.raises(SystemExit) as error:
+        mac.main()
+    assert error.value.code == 1
+    output = capsys.readouterr()
+    assert not output.out
+    detail = json.loads(output.err)
+    assert detail["status"] == "failed" and detail["phase"] == phase and detail["received_bytes"] == 12345
+    assert detail["error"] == "TimeoutError: fixed Mac root staging " + phase + " deadline exceeded"
+    assert detail["elapsed_seconds"] >= 0
+    assert alarms == [budget, 0]
+
+
 def test_mac_receive_refuses_changed_runner_copy_before_publishing(admitted, monkeypatch):
     _, request, files, constants = admitted
     original = mac.common.write

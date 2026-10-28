@@ -433,6 +433,26 @@ def test_sender_uses_plain_tar_after_memory_only_sudo_line(tmp_path, monkeypatch
         assert archive.getnames() == ["root-input.json", "settings-muse.ssd"]
 
 
+@pytest.mark.parametrize("early_exit", [False, True])
+def test_sender_retains_root_failure_even_when_upload_pipe_breaks(tmp_path, monkeypatch, early_exit):
+    import sys
+    request = tmp_path / "root-input.json"
+    request.write_text("{}")
+    payload = tmp_path / "source.tar.gz"
+    payload.write_bytes(b"x" * (1 << 20))
+    script = ("import sys; " + ("" if early_exit else "sys.stdin.buffer.read(); ")
+              + "sys.stderr.write('root sealing deadline exceeded\\n'); sys.exit(7)")
+    monkeypatch.setattr(prepare, "transport_profile", lambda *a, **kw: ([sys.executable, "-c", script], []))
+    data = dict(root_input_path=str(request), root_input_sha256=prepare.digest(request),
+                ssh=dict(sudo_password_required=False), files={"source.tar.gz": dict(
+                    local_path=str(payload), bytes=payload.stat().st_size, sha256=prepare.digest(payload))})
+    with pytest.raises(RuntimeError, match="exit 7.*root sealing deadline exceeded"):
+        prepare.send_stage("local-mbp", data)
+    saved = tmp_path / "staging-stderr.log"
+    assert saved.read_text() == "root sealing deadline exceeded\n"
+    assert saved.stat().st_mode & 0o777 == 0o600
+
+
 def test_ambiguous_dispatch_remains_claimed_and_is_never_reposted(tmp_path, source):
     args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"])
     envelope = prepare.prepare(args, api)

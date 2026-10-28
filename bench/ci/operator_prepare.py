@@ -653,31 +653,50 @@ def send_stage(device, data, *, password=None):
     # are neither in argv/package nor inherited for accidental SendEnv rules.
     environment = {key: value for key, value in os.environ.items()
                    if key in ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "SSH_AUTH_SOCK")}
-    process = subprocess.Popen([*argv, command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, env=environment)
-    try:
-        if data["ssh"]["sudo_password_required"]:
-            process.stdin.write((password + "\n").encode())
-            process.stdin.flush()
-        with tarfile.open(fileobj=process.stdin, mode="w|", format=tarfile.PAX_FORMAT) as archive:
-            for name, row in members.items():
-                item = tarfile.TarInfo(name)
-                item.size, item.mode = row["bytes"], 0o400
-                with Path(row["local_path"]).open("rb") as source:
-                    archive.addfile(item, source)
-        process.stdin.close()
-        process.stdin = None
-        raw, _ = process.communicate(timeout=300)
-        if process.returncode or len(raw) > 1 << 20:
-            raise RuntimeError("root staging failed; retain fresh job and stop without retry")
-        receipt = parsed(raw)
-        if receipt.get("device") != device:
-            raise ValueError("root stage returned another physical device")
-        return receipt
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+    # A file avoids a stderr pipe deadlock during synchronous source upload and
+    # retains the actual SSH/root error for the once-only attempt.
+    error_path = request.with_name("staging-stderr.log")
+    fd = os.open(error_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as errors:
+        process = subprocess.Popen([*argv, command], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=errors, env=environment)
+        try:
+            broken_pipe = False
+            try:
+                if data["ssh"]["sudo_password_required"]:
+                    process.stdin.write((password + "\n").encode())
+                    process.stdin.flush()
+                with tarfile.open(fileobj=process.stdin, mode="w|", format=tarfile.PAX_FORMAT) as archive:
+                    for name, row in members.items():
+                        item = tarfile.TarInfo(name)
+                        item.size, item.mode = row["bytes"], 0o400
+                        with Path(row["local_path"]).open("rb") as source:
+                            archive.addfile(item, source)
+            except BrokenPipeError:
+                broken_pipe = True
+            finally:
+                try:
+                    process.stdin.close()
+                except BrokenPipeError:
+                    broken_pipe = True
+                process.stdin = None
+            # Upload has ended; this bound is only for root validation/sealing.
+            raw, _ = process.communicate(timeout=330)
+            if broken_pipe or process.returncode or len(raw) > 1 << 20:
+                errors.flush()
+                with error_path.open("rb") as saved:
+                    saved.seek(max(0, error_path.stat().st_size - 4096))
+                    detail = saved.read(4096).decode("utf-8", "replace").strip()
+                raise RuntimeError(f"root staging failed (exit {process.returncode}); "
+                                   f"retain fresh job and stop without retry: {detail}")
+            receipt = parsed(raw)
+            if receipt.get("device") != device:
+                raise ValueError("root stage returned another physical device")
+            return receipt
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
 
 def stage(args, sender=send_stage, *, password=None):

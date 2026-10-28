@@ -33,7 +33,8 @@ POLICY = BASE / "control/operator-policy.json"
 IROOT = BASE / "integrations"
 SROOT = BASE / "inputs"
 MANIFESTS = BASE / "private/job-manifests"
-TIMEOUT = 300
+TRANSFER_TIMEOUT = 900
+PROCESSING_TIMEOUT = 300
 MAC_PYTHON = "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9"
 JOB = re.compile(r"[0-9a-f]{32}\Z")
 HASH = re.compile(r"[0-9a-f]{64}\Z")
@@ -209,20 +210,31 @@ def policy_check(policy, request, config, manifest, broker):
         common.fail("Mac root-owned model contract does not admit the Linux readonly-view seam")
 
 
-def receive(expected_sha256, incoming=None):
+def receive(expected_sha256, incoming=None, *, progress=None, arm_deadline=None):
     if os.geteuid() != 0 or sys.platform != "darwin":
         raise PermissionError("root Darwin operator staging required")
     if not isinstance(expected_sha256, str) or HASH.fullmatch(expected_sha256) is None:
         common.fail("exact reviewed root input SHA required")
-    deadline = time.monotonic() + TIMEOUT
+    progress = {} if progress is None else progress
+    progress.update(phase="transfer", received_bytes=0)
+    deadline = time.monotonic() + TRANSFER_TIMEOUT
+    if arm_deadline is not None:
+        arm_deadline(TRANSFER_TIMEOUT)
     with tempfile.TemporaryFile() as spool:
         total = 0
         for block in common.input_chunks(incoming or sys.stdin.buffer, deadline):
             total += len(block)
+            progress["received_bytes"] = total
             if total > common.WIRE_LIMIT:
                 common.fail("Mac stage wire exceeds bound")
             spool.write(block)
         spool.seek(0)
+        # A slow, progressing upload must not consume the independent budget
+        # for verifying and sealing both complete source trees.
+        progress["phase"] = "processing"
+        deadline = time.monotonic() + PROCESSING_TIMEOUT
+        if arm_deadline is not None:
+            arm_deadline(PROCESSING_TIMEOUT)
         return receive_packet(expected_sha256, spool, deadline)
 
 
@@ -372,12 +384,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expected-sha256", required=True)
     args = parser.parse_args()
+    progress = dict(phase="validation", received_bytes=0)
+    started = time.monotonic()
     def expired(_number, _frame):
-        raise TimeoutError("fixed Mac root staging deadline exceeded")
+        raise TimeoutError("fixed Mac root staging " + progress["phase"] + " deadline exceeded")
     signal.signal(signal.SIGALRM, expired)
-    signal.alarm(TIMEOUT)
     try:
-        print(json.dumps(receive(args.expected_sha256), allow_nan=False))
+        print(json.dumps(receive(args.expected_sha256, progress=progress, arm_deadline=signal.alarm), allow_nan=False))
+    except Exception as error:
+        detail = dict(status="failed", phase=progress["phase"], received_bytes=progress["received_bytes"],
+                      elapsed_seconds=round(time.monotonic() - started, 3),
+                      error=type(error).__name__ + ": " + str(error)[:2048])
+        print(json.dumps(detail, allow_nan=False), file=sys.stderr)
+        raise SystemExit(1) from None
     finally:
         signal.alarm(0)
 
