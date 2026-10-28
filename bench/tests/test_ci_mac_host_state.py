@@ -165,6 +165,20 @@ def test_total_cpu_single_cpu_and_rss_limits_are_independent(limit, value, reaso
     assert [row["pid"] for row in activity["processes"]] == [222, 111]
 
 
+@pytest.mark.parametrize("timed", [False, True])
+def test_cpu_total_replays_native_python39_rounding_exactly(timed):
+    before, after = pair()
+    template = before["processes"][0]
+    before["processes"] = [dict(template, pid=pid, cpu_time_ms=0) for pid in range(10, 20)]
+    after["processes"] = [dict(row, cpu_time_ms=50) for row in before["processes"]]
+    result = host.compare_snapshots(before, after, {}, timed=timed)
+    # Ten 0.025-core observations, as retained by the native 3.9 runner.
+    # Compensated sum in Python 3.12 instead returns 0.25; no tolerance applies.
+    assert result["process_activity"]["non_ci_cpu_cores"] == 0.24999999999999997
+    after["processes"] = []
+    assert host.compare_snapshots(before, after, {}, timed=timed)["process_activity"]["non_ci_cpu_cores"] == 0
+
+
 def test_quiet_threshold_equality_passes_and_low_memory_either_sample_fails():
     before, after = pair()
     after["processes"][0]["cpu_time_ms"] += 1000

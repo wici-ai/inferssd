@@ -227,7 +227,11 @@ def compare_snapshots(before, after, policy, *, timed=False):
         activity.append(dict(pid=pid, uid=row["uid"], name=row["name"], comm=row["comm"],
             cpu_delta_ms=cpu, cpu_cores=cpu / (elapsed * 1000), rss_bytes=row["rss_bytes"]))
     activity.sort(key=lambda row: (-row["cpu_cores"], row["pid"]))
-    total_cpu = sum(row["cpu_cores"] for row in activity)
+    # Preserve the native Python 3.9 accumulation order when replaying evidence.
+    # Built-in float sum changed in 3.12, breaking exact retained comparisons.
+    total_cpu = 0
+    for row in activity:
+        total_cpu += row["cpu_cores"]
     max_cpu = max((row["cpu_cores"] for row in activity), default=0)
     max_rss = max((row["rss_bytes"] for row in activity), default=0)
     available = [sum(value["vm_stat"]["pages"][key] for key in ("free", "inactive")) * page_size for value in (before, after)]
