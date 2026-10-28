@@ -15,7 +15,7 @@ import time
 import uuid
 
 BENCH = Path(__file__).resolve().parents[1]
-if os.environ.get("SSDASH_NATIVE_CORE_MANIFEST"):
+if os.environ.get("INFERSSD_NATIVE_CORE_MANIFEST"):
     raise RuntimeError(
         "CI requires the pinned installed control core, not an ambient bundle"
     )

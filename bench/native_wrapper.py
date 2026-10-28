@@ -19,17 +19,17 @@ HERE = Path(__file__).resolve().parent
 
 
 def inputs(environment, profile):
-    required = ("SSDASH_RUN_DIR", "SSDASH_RESULT_PATH", "SSDASH_WRAPPER_RECEIPT", "SSDASH_TIER",
-                "SSDASH_REQUEST_TIMEOUT", "SSDASH_DEVICE", "SSDASH_MODEL", "SSDASH_REVISION", "SSDASH_OUTPUT_TOKENS")
+    required = ("INFERSSD_RUN_DIR", "INFERSSD_RESULT_PATH", "INFERSSD_WRAPPER_RECEIPT", "INFERSSD_TIER",
+                "INFERSSD_REQUEST_TIMEOUT", "INFERSSD_DEVICE", "INFERSSD_MODEL", "INFERSSD_REVISION", "INFERSSD_OUTPUT_TOKENS")
     if any(not environment.get(key) for key in required):
         raise ValueError("invoke through bench/run_final.py with its full wrapper environment")
-    if environment["SSDASH_REVISION"] != profile["revision"] or environment["SSDASH_OUTPUT_TOKENS"] != "256":
+    if environment["INFERSSD_REVISION"] != profile["revision"] or environment["INFERSSD_OUTPUT_TOKENS"] != "256":
         raise ValueError("profile differs from final source/output contract")
-    tier = environment["SSDASH_TIER"]
+    tier = environment["INFERSSD_TIER"]
     final_chat.prompt_path(tier)
-    final_chat.bounded_timeout(float(environment["SSDASH_REQUEST_TIMEOUT"]))
-    out = Path(environment["SSDASH_RUN_DIR"]).resolve(strict=True)
-    for key in ("SSDASH_RESULT_PATH", "SSDASH_WRAPPER_RECEIPT"):
+    final_chat.bounded_timeout(float(environment["INFERSSD_REQUEST_TIMEOUT"]))
+    out = Path(environment["INFERSSD_RUN_DIR"]).resolve(strict=True)
+    for key in ("INFERSSD_RESULT_PATH", "INFERSSD_WRAPPER_RECEIPT"):
         path = Path(environment[key]).resolve()
         if path.parent != out or path.exists():
             raise ValueError("fresh result/receipt paths must be directly in the arm directory")
@@ -76,10 +76,10 @@ def confirm_first_request(log_before, log_after):
 
 def run_native(profile, environment, runtime, lock_fd, lease=None):
     out = inputs(environment, profile)
-    receipt_path = Path(environment["SSDASH_WRAPPER_RECEIPT"])
+    receipt_path = Path(environment["INFERSSD_WRAPPER_RECEIPT"])
     receipt = {"schema_version": 1, "status": "failed", "protocol": final_chat.PROTOCOL,
-               "tier": environment["SSDASH_TIER"], "device": environment["SSDASH_DEVICE"],
-               "model": environment["SSDASH_MODEL"], "revision": profile["revision"],
+               "tier": environment["INFERSSD_TIER"], "device": environment["INFERSSD_DEVICE"],
+               "model": environment["INFERSSD_MODEL"], "revision": profile["revision"],
                "server": {"owned_processes_gone": False, "resource_scope_gone": False}, "evidence": []}
     server = client = None
     signals = []
@@ -122,9 +122,9 @@ def run_native(profile, environment, runtime, lock_fd, lease=None):
         common.save(out / "before-request.json", {"process_identity": start_identity, "completion_requests": 0})
         evidence.append(out / "before-request.json")
         client_argv = [sys.executable, str(HERE / "final_chat.py"), "--url", f"http://127.0.0.1:{port}",
-                       "--tier", environment["SSDASH_TIER"], "--output", environment["SSDASH_RESULT_PATH"],
-                       "--timeout", environment["SSDASH_REQUEST_TIMEOUT"]]
-        guard.deadline = time.monotonic() + float(environment["SSDASH_REQUEST_TIMEOUT"]) + 5
+                       "--tier", environment["INFERSSD_TIER"], "--output", environment["INFERSSD_RESULT_PATH"],
+                       "--timeout", environment["INFERSSD_REQUEST_TIMEOUT"]]
+        guard.deadline = time.monotonic() + float(environment["INFERSSD_REQUEST_TIMEOUT"]) + 5
         with (out / "client.log").open("xb") as log:
             client = subprocess.Popen(client_argv, stdout=log, stderr=subprocess.STDOUT,
                                       start_new_session=True, pass_fds=(lock_fd,))
@@ -220,8 +220,8 @@ def main():
     except (KeyError, ValueError, OSError, RuntimeError) as error:
         # No child was started if input/platform validation failed before the
         # adapter took ownership. The driver need not quarantine an empty arm.
-        out = Path(os.environ.get("SSDASH_RUN_DIR", ".")).resolve()
-        path = Path(os.environ.get("SSDASH_WRAPPER_RECEIPT", ".")).resolve()
+        out = Path(os.environ.get("INFERSSD_RUN_DIR", ".")).resolve()
+        path = Path(os.environ.get("INFERSSD_WRAPPER_RECEIPT", ".")).resolve()
         if not adapter_entered and path.parent == out and out.is_dir() and not path.exists():
             common.save(path, {"status": "failed", "error": f"{type(error).__name__}: {error}",
                                "server": {"owned_processes_gone": True, "resource_scope_gone": True}})

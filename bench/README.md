@@ -103,10 +103,10 @@ The driver supports 1–1024 actual input tokens and 1–512 output tokens. Long
 protocols need an explicitly reviewed extension. It sets these environment values
 for each command:
 
-- `SSDASH_ARM`: `A` or `B`.
-- `SSDASH_RUN_ID`: the cycle's unique ID.
-- `SSDASH_RUN_DIR`: that arm's new artifact directory.
-- `SSDASH_RESULT_PATH`: the required JSON result file.
+- `INFERSSD_ARM`: `A` or `B`.
+- `INFERSSD_RUN_ID`: the cycle's unique ID.
+- `INFERSSD_RUN_DIR`: that arm's new artifact directory.
+- `INFERSSD_RESULT_PATH`: the required JSON result file.
 
 The command must exit successfully and write the actual token counts and prompt
 SHA-256 from `protocol`, plus a nonempty `metrics` mapping of finite nonnegative

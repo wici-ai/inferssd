@@ -151,7 +151,7 @@ def execute_F(case, host):
 def runtime_key():
     version = sys.version_info[:2]
     if version not in ((3, 9), (3, 12)):
-        pytest.skip("F transcripts are only bound to Python 3.9 and 3.12")
+        pytest.skip("recorded reference transcripts cover Python 3.9 and 3.12 only")
     return f"{version[0]}.{version[1]}"
 
 

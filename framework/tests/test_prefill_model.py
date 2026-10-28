@@ -121,7 +121,7 @@ def frozen_expected(case):
         return OLDER_GOLDENS["overrides"].get(case["name"], case["expected"])
     if sys.version_info[:2] == (3, 12):
         return case["expected"]
-    pytest.skip("Frozen runtime transcripts were recorded on Python 3.9 and 3.12")
+    pytest.skip("recorded reference transcripts cover Python 3.9 and 3.12 only")
 
 
 def test_frozen_oracle_identity():

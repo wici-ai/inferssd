@@ -13,6 +13,12 @@ from test_ownership_core import WithoutTypes
 
 from inferssd.platform import guardian
 
+# The recorded caller passes these variables under their historical names.
+HISTORICAL = {
+    "INFERSSD_RUN_DIR": "SSDASH_RUN_DIR",
+    "INFERSSD_WRAPPER_RECEIPT": "SSDASH_WRAPPER_RECEIPT",
+}
+
 
 class DefaultPorts(WithoutTypes):
     def visit_AnnAssign(self, node):
@@ -28,6 +34,11 @@ class DefaultPorts(WithoutTypes):
             if node.targets[0].id == "common":
                 return None
         return self.generic_visit(node)
+
+    def visit_Constant(self, node):
+        if isinstance(node.value, str) and node.value in HISTORICAL:
+            return ast.copy_location(ast.Constant(HISTORICAL[node.value]), node)
+        return node
 
     def visit_Name(self, node):
         if isinstance(node.ctx, ast.Load) and node.id in (

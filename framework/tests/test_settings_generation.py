@@ -295,7 +295,7 @@ RUNTIME = f"{sys.version_info.major}.{sys.version_info.minor}"
 @pytest.mark.parametrize("case", GOLDENS["cases"], ids=lambda case: case["name"])
 def test_frozen_settings_generation(case):
     if RUNTIME not in ("3.9", "3.12"):
-        pytest.skip("frozen F transcripts were measured only on Python 3.9 and 3.12")
+        pytest.skip("recorded reference transcripts cover Python 3.9 and 3.12 only")
     assert observe(F, case) == case["expected"][RUNTIME]
 
 

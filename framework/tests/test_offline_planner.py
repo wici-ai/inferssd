@@ -277,7 +277,7 @@ DATA = json.loads((FIXTURES / "offline-planner-goldens.json").read_text())
 def runtime_key():
     key = f"{sys.version_info.major}.{sys.version_info.minor}"
     if key not in ("3.9", "3.12"):
-        pytest.skip("F byte observations currently recorded for Python 3.9 and 3.12 only")
+        pytest.skip("recorded reference transcripts cover Python 3.9 and 3.12 only")
     return key
 
 

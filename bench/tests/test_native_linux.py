@@ -130,8 +130,8 @@ def test_scope_uncertainty_retains_lease_and_invalidates_result(tmp_path, monkey
     # The platform operations are mocked; this tests the actual controller's
     # ordering, not a claim of native systemd support on the test host.
     receipt_path = tmp_path / "wrapper.json"
-    environment = {"SSDASH_RUN_DIR": str(tmp_path), "SSDASH_WRAPPER_RECEIPT": str(receipt_path),
-                   "SSDASH_REQUEST_TIMEOUT": "10"}
+    environment = {"INFERSSD_RUN_DIR": str(tmp_path), "INFERSSD_WRAPPER_RECEIPT": str(receipt_path),
+                   "INFERSSD_REQUEST_TIMEOUT": "10"}
     profile = {"resources": {"memory_budget_bytes": 4 << 30}, "load_timeout_s": 10}
     events = []
     class Lease:

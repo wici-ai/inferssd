@@ -94,7 +94,7 @@ def run_guardian(args: argparse.Namespace, specification: dict[str, Any], policy
     receipt = out / "ownership.json"
     connection = socket.socket(fileno=args.controller_fd)
     connection.setblocking(False)
-    environment = dict(os.environ, SSDASH_RUN_DIR=str(out), SSDASH_WRAPPER_RECEIPT=str(receipt))
+    environment = dict(os.environ, INFERSSD_RUN_DIR=str(out), INFERSSD_WRAPPER_RECEIPT=str(receipt))
     prefix: list[str] = specification["scope"]
     unit: Optional[str] = specification["unit"]
     user = "--user" in prefix
@@ -199,13 +199,13 @@ def run_worker(args: argparse.Namespace, specification: dict[str, Any], policy: 
     clean = False
     try:
         server_environment = dict(os.environ)
-        overrides = json.loads(server_environment.pop("SSDASH_INTERNAL_SERVER_ENV"))
+        overrides = json.loads(server_environment.pop("INFERSSD_INTERNAL_SERVER_ENV"))
         if not isinstance(overrides, dict) or any(
             not isinstance(k, str) or not isinstance(v, str) for k, v in overrides.items()
         ):
             raise ValueError("invalid private server environment transport")
         server_environment.update(overrides)
-        for name in ("SSDASH_RUN_DIR", "SSDASH_WRAPPER_RECEIPT"):
+        for name in ("INFERSSD_RUN_DIR", "INFERSSD_WRAPPER_RECEIPT"):
             server_environment.pop(name, None)
         if Path(policy.stop_path).exists() or (out / "STOP").exists():
             raise InterruptedError("STOP exists before native launch")
