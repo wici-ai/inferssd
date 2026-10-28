@@ -34,12 +34,6 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
-#if defined(__GNUC__) || defined(__clang__)
-extern "C" void ggml_cuda_moe_stream_batch_phase_report(const char * label) __attribute__((weak));
-#else
-extern "C" void ggml_cuda_moe_stream_batch_phase_report(const char * label);
-#endif
-
 static llama_context           ** g_ctx;
 static llama_model             ** g_model;
 static common_sampler          ** g_smpl;
@@ -187,14 +181,6 @@ static void kimi_phase_report(const char * label, int n_past, int n_consumed, in
             label ? label : "unknown", n_past, n_consumed, embd_size,
             current, peak, anon, file, active_file, inactive_file,
             pgfault, pgmajfault, refault_file, pgscan_direct, pgsteal_direct);
-
-#if defined(__GNUC__) || defined(__clang__)
-    if (ggml_cuda_moe_stream_batch_phase_report) {
-        ggml_cuda_moe_stream_batch_phase_report(label);
-    }
-#else
-    ggml_cuda_moe_stream_batch_phase_report(label);
-#endif
 }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
