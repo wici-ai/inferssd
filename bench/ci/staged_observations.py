@@ -7,14 +7,23 @@ from ci.contract import digest, save
 from ci.staged_smoke import collect_log
 
 
-def observe(session, config, model, output):
+def observe(session, config, model, output, *, platform):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     path = Path(config["path"])
     if not path.is_absolute() or ".." in path.parts or path.suffix != ".jsonl":
         raise ValueError("explicit reviewed native observation path required")
+    if platform == "darwin":
+        # The Mac broker maps this to its fixed Xcode Python. No extra sandbox
+        # executable permission is needed to read the worker's own telemetry.
+        argv = ["/usr/bin/python3", "-I", "-c",
+                "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())", str(path)]
+    elif platform == "linux":
+        argv = ["/usr/bin/cat", str(path)]
+    else:
+        raise ValueError("explicit supported observation platform required")
     stage = session.start("candidate-observations-" + model, "test",
-                          ["/usr/bin/cat", str(path)], {}, config["cwd"], 30)
+                          argv, {}, config["cwd"], 30)
     completed = session.wait(stage, deadline=time.monotonic() + 30)
     save(output / "stage.json", completed)
     collect_log(session, stage, output)

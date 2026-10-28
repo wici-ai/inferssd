@@ -106,7 +106,8 @@ def run(args):
                 argv = native["argv"]
                 if argv.count("--ssd-telemetry") != 1 or argv[argv.index("--ssd-telemetry") + 1] != observation["path"]:
                     raise ValueError("observations do not bind actual native telemetry")
-                observe(session, observation, model, output / ("observations-" + model))
+                observe(session, observation, model, output / ("observations-" + model),
+                        platform=config["paths"]["platform"])
             cells[model] = dict(model=model, functional="passed", numerical={case: numeric[case] for case in needs["numerical"]}, performance=[])
             if scope is not None:
                 folder = output / ("native-" + model)

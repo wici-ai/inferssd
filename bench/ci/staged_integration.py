@@ -88,7 +88,8 @@ def run(args):
             if result["status"] != "passed":
                 raise RuntimeError("native smoke failed; see retained raw evidence")
             if observation:
-                observe(session, observation, native["model"], output / ("observations-" + native["model"]))
+                observe(session, observation, native["model"], output / ("observations-" + native["model"]),
+                        platform=config["paths"]["platform"])
         report.update(status="passed", functional="passed", binary_sha256=build["binary"]["sha256"],
                       actual_server_version=build["actual_server_version"],
                       numerical_tests=gate["tests_executed"], completion_requests=len(results))

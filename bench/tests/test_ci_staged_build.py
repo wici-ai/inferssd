@@ -129,3 +129,24 @@ def test_only_complete_root_freezer_alias_groups_are_readable(tmp_path, monkeypa
         result = staged_build.sealed_file(root / names[1], aliases=aliases)
         assert result["sha256"] == sha256
         assert set(result["aliases"]) == {str(root / name) for name in names}
+
+
+@pytest.mark.parametrize("platform,flags", [
+    ("darwin", ["-DLLAMA_SSD_STORE=ON", "-DBUILD_SHARED_LIBS=OFF"]),
+    ("darwin", ["-DLLAMA_SSD_STORE:BOOL=TRUE"]),
+    ("linux", ["-DBUILD_SHARED_LIBS=OFF"]),
+    ("linux", ["-DLLAMA_USE_SYSTEM_GGML=ON"]),
+])
+def test_incompatible_store_profile_rejected_before_build(platform, flags):
+    with pytest.raises(ValueError, match="LLAMA_SSD_STORE requires Linux"):
+        staged_build.validate_platform_flags(platform, flags)
+
+
+@pytest.mark.parametrize("platform,flags", [
+    ("darwin", ["-DBUILD_SHARED_LIBS=OFF", "-DGGML_METAL=ON"]),
+    ("darwin", ["-DLLAMA_SSD_STORE=ON", "-DLLAMA_SSD_STORE:BOOL=OFF"]),
+    ("linux", ["-DLLAMA_SSD_STORE=ON", "-DBUILD_SHARED_LIBS=ON"]),
+    ("linux", ["-DLLAMA_SSD_STORE=OFF", "-DBUILD_SHARED_LIBS=OFF"]),
+])
+def test_supported_platform_profiles(platform, flags):
+    staged_build.validate_platform_flags(platform, flags)

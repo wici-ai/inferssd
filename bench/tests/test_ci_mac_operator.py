@@ -125,6 +125,55 @@ def test_mac_runtime_retained_rechecks_real_shaped_probe_lsof_sampled_cap_and_st
     assert value["host"]["effective_settings"]["native_resource_enforcement"].startswith("root-sampled")
 
 
+def test_mac_live_receipt_reads_alias_from_native_freeze_path(mac_raw, monkeypatch):
+    from hashlib import sha256
+    from inferssd.configuration.settings import parse
+
+    root, config, manifest, folder, launch = mac_raw
+    build = json.loads((root / "build-candidate/build-receipt.json").read_text())
+    assert "host_path" not in build["freeze"]
+    frozen = build["freeze"]["path"]
+    data = config["sides"]["candidate"]["models"]["deepseek"]
+    shard = data["model_identity"]["shards"][0]
+    shard["stat"] = dict(bytes=128)
+    alias_path = frozen + "/assets/source.tsv"
+    settings_raw = ('inferssd-settings 1\nexpert.source = ["' + alias_path + '"]\n').encode()
+    payloads = {data["settings"]["runtime_path"]: settings_raw,
+                data["template"]["runtime_path"]: b"template fixture",
+                alias_path: ("source_path\texpert_idx\toffset\tnbytes\n" +
+                             shard["runtime_path"] + "\t0\t0\t32\n").encode()}
+    for key in ("settings", "template"):
+        item = data[key]
+        item.update(host_path=item["runtime_path"], sha256=sha256(payloads[item["runtime_path"]]).hexdigest())
+    launch["argv"] = [build["binary"]["runtime_path"], "-m", shard["runtime_path"],
+                      "--ssd-settings", data["settings"]["runtime_path"],
+                      "--chat-template-file", data["template"]["runtime_path"]]
+    launch["os_page_cache_treatment"] = "not-forced; uncontrolled"
+    for name in ("runtime-before.json", "runtime-after.json"):
+        observed = json.loads((folder / name).read_text())
+        observed["argv"] = launch["argv"]
+        (folder / name).write_text(json.dumps(observed))
+    native = parse(settings_raw.decode(), data["settings"]["runtime_path"], platform="darwin").document()
+    (folder / "stderr.log").write_text("[ssd.settings] " + json.dumps(native) + "\n")
+    uname = receipt.os.uname()
+    config["host"]["os"] = dict(sysname=uname.sysname, release=uname.release, machine=uname.machine)
+    reads = []
+
+    def sealed_file(path, *, contents=False):
+        path = str(path)
+        reads.append(path)
+        raw = payloads[path]
+        identity = dict(path=path, bytes=len(raw), sha256=sha256(raw).hexdigest())
+        return (identity, raw) if contents else identity
+
+    monkeypatch.setattr(receipt, "sealed_file", sealed_file)
+    monkeypatch.setattr(receipt, "checked_model", lambda *a: data["model_identity"])
+    result = receipt.receipt(config, manifest, "candidate", "deepseek", launch, build, folder)
+    assert reads.count(alias_path) == 1
+    assert result["host"]["effective_settings"]["native_launch_policy"]["typed_values"]["expert.source"] == [
+        "<sealed-build>/assets/source.tsv"]
+
+
 @pytest.mark.parametrize("fault", ["pid", "uid", "birth", "scope", "argv", "policy", "rss", "rss-sum", "members", "listener", "lsof", "lsof-owner", "lock", "manifest", "loaded-sha", "enforcement", "stop-residual", "stop-domain", "stop-lock", "source-job", "source-inventory"])
 def test_mac_raw_identity_resource_image_or_cleanup_failure_is_not_green(mac_raw, fault):
     root, config, manifest, folder, launch = mac_raw

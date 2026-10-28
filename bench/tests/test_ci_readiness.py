@@ -59,8 +59,10 @@ def test_negative_finish_receipt_never_reports_ready(tmp_path, monkeypatch):
     assert (result / 'evidence-manifest.json').is_file()
 
 
-def test_native_observation_stage_uses_the_real_consumer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_native_observation_stage_uses_the_real_consumer(tmp_path, monkeypatch, platform):
     import json
+    import subprocess
     from ci import staged_observations as observations
 
     values = [
@@ -70,12 +72,22 @@ def test_native_observation_stage_uses_the_real_consumer(tmp_path, monkeypatch):
              vram_hit=[False], cache_hit=[True], wall_us=9, wait_io_us=2, compute_us=5),
     ]
     raw = "".join(json.dumps(value) + "\n" for value in values).encode()
+    source = tmp_path / "native events.jsonl"
+    source.write_bytes(raw)
+    path = str(source) if platform == "darwin" else "/scratch/run/native-events.jsonl"
 
     class Session:
         def start(self, name, kind, argv, environment, cwd, timeout):
-            assert (name, kind, argv, environment, cwd, timeout) == (
-                "candidate-observations-muse", "test",
-                ["/usr/bin/cat", "/scratch/run/native-events.jsonl"], {}, "/scratch", 30)
+            assert (name, kind, environment, cwd, timeout) == (
+                "candidate-observations-muse", "test", {}, "/scratch", 30)
+            if platform == "linux":
+                assert argv == ["/usr/bin/cat", path]
+            else:
+                assert argv[:3] == ["/usr/bin/python3", "-I", "-c"]
+                assert argv[-1] == path and len(argv) == 5
+                # Exercise the reader itself, including an argument with spaces;
+                # the real Mac broker selects its installed Python interpreter.
+                assert subprocess.check_output([sys.executable, *argv[1:]]) == raw
             return "stage"
 
         def wait(self, stage, *, deadline):
@@ -87,8 +99,8 @@ def test_native_observation_stage_uses_the_real_consumer(tmp_path, monkeypatch):
 
     monkeypatch.setattr(observations, "collect_log", collect_log)
     output = tmp_path / "observation"
-    receipt = observations.observe(Session(), dict(path="/scratch/run/native-events.jsonl",
-                                                  cwd="/scratch"), "muse", output)
+    receipt = observations.observe(Session(), dict(path=path, cwd="/scratch"), "muse", output,
+                                   platform=platform)
     assert receipt["status"] == "passed"
     assert (receipt["groups"], receipt["trace"], receipt["prof"]) == (1, 1, 1)
     assert receipt["legacy_log_present"] is False

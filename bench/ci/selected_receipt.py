@@ -329,7 +329,8 @@ def receipt(config, manifest, side, model, spec, build, output, *, destination=N
         if source in shard_sizes:
             continue
         relative = Path(source).relative_to(frozen)
-        _, alias_raw = sealed_file(Path(build["freeze"]["host_path"]) / relative, contents=True)
+        frozen_host = build["freeze"].get("host_path", build["freeze"]["path"])
+        _, alias_raw = sealed_file(Path(frozen_host) / relative, contents=True)
         rows = list(csv.DictReader(io.StringIO(alias_raw.decode()), delimiter="\t"))
         if not rows:
             raise ValueError("empty expert source alias")

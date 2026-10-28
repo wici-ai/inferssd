@@ -586,3 +586,14 @@ def test_performance_preflight_and_timed_private_writer_paths(tmp_path, source, 
                 timed = data["benchmarks"]["512"]
                 assert timed["preflight_argv"] == data["smoke"]["argv"]
                 assert timed["argv"][-1] != timed["preflight_argv"][-1]
+
+
+def test_bad_platform_profile_fails_during_preparation(tmp_path, source):
+    args, api = prepared_fixture(tmp_path, source)
+    path = tmp_path / "cloud-5090-template.json"
+    config = json.loads(path.read_text())
+    config["sides"]["candidate"]["build"]["cmake_flags"] = ["-DBUILD_SHARED_LIBS=OFF", "-DLLAMA_SSD_STORE=ON"]
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="LLAMA_SSD_STORE requires Linux"):
+        prepare.prepare(args, api)
+    assert not (args.output / "prepared.json").exists()

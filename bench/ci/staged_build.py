@@ -138,6 +138,27 @@ def compiler_cache(raw, expected):
     return observed
 
 
+def validate_platform_flags(platform, flags):
+    """Reject known incompatible profiles before acquiring a device lease.
+
+    CMake remains authoritative for other options. Read the last definition,
+    matching CMake, including typed -DKEY:BOOL=VALUE forms.
+    """
+    values = {}
+    for flag in flags:
+        if flag.startswith("-D") and "=" in flag:
+            key, value = flag[2:].split("=", 1)
+            values[key.split(":", 1)[0]] = value.upper()
+    false = {"0", "OFF", "NO", "FALSE", "N", "IGNORE", "NOTFOUND", ""}
+    def enabled(key, default):
+        value = values.get(key, default)
+        return value not in false and not value.endswith("-NOTFOUND")
+    if enabled("LLAMA_SSD_STORE", "ON" if platform == "linux" else "OFF"):
+        if (platform != "linux" or not enabled("BUILD_SHARED_LIBS", "ON")
+                or enabled("LLAMA_USE_SYSTEM_GGML", "OFF")):
+            raise ValueError("LLAMA_SSD_STORE requires Linux, BUILD_SHARED_LIBS=ON and bundled ggml")
+
+
 def run_build(session, side, settings, paths, output, revision):
     """Paths: platform/source/build/cwd/frozen, plus job_root for Darwin.
 
@@ -154,6 +175,7 @@ def run_build(session, side, settings, paths, output, revision):
     for key in ("cmake_flags", "targets", "image_relatives"):
         if not isinstance(settings[key], list) or any(not isinstance(v, str) or not v or "\0" in v for v in settings[key]):
             raise ValueError("explicit reviewed list required: " + key)
+    validate_platform_flags(paths["platform"], settings["cmake_flags"])
     if (not settings["targets"] or not settings["image_relatives"]
             or not relative(settings["binary_relative"])
             or any(not relative(path) for path in settings["image_relatives"])):

@@ -23,6 +23,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci.contract import HASH, digest, load, policy_read, revision, save
 from ci.impact import fingerprint, plan, device_requirements
+from ci.staged_build import validate_platform_flags
 from ci.selection_contract import JOB, bind, bound, runtime_requirements, performance_protocol
 
 
@@ -294,6 +295,8 @@ def normalize(template, manifest, declared, job_id, identities, mode=MODE):
         spec = replace_strings(previous, [(previous["revision"], identities[side])])
         if mac and side in sides:
             spec = replace_strings(spec, [(spec["paths"]["source"], source_roots[side])])
+        if side in sides:
+            validate_platform_flags(layout["platform"], spec["build"]["cmake_flags"])
         template["sides"][side] = spec
         for model, data in spec["models"].items():
             if side in sides:
