@@ -59,6 +59,18 @@ def test_negative_finish_receipt_never_reports_ready(tmp_path, monkeypatch):
     assert (result / 'evidence-manifest.json').is_file()
 
 
+def mac_cache_events():
+    from inferssd.configuration.settings import parse
+
+    settings = parse('inferssd-settings 1\nhost.expert_cache_mib = 1\n', platform="darwin").document()
+    return [dict(v=1, seq=0, ev="ssd.settings", **settings),
+            dict(v=1, seq=1, ev="ssd.controller.begin", schema=1),
+            dict(v=1, seq=2, ev="ssd.mac.cache", reason="periodic", requests=1024, hits=256,
+                 misses=768, cache_bytes=512, budget_bytes=1 << 20, read_bytes=4096, peak_staging_bytes=128),
+            dict(v=1, seq=3, ev="ssd.mac.cache", reason="shutdown", requests=1536, hits=512,
+                 misses=1024, cache_bytes=1024, budget_bytes=1 << 20, read_bytes=8192, peak_staging_bytes=256)]
+
+
 @pytest.mark.parametrize("platform", ["linux", "darwin"])
 def test_native_observation_stage_uses_the_real_consumer(tmp_path, monkeypatch, platform):
     import json
@@ -71,6 +83,8 @@ def test_native_observation_stage_uses_the_real_consumer(tmp_path, monkeypatch, 
              decode=True, success=True, has_token=True, selected_experts=[7],
              vram_hit=[False], cache_hit=[True], wall_us=9, wait_io_us=2, compute_us=5),
     ]
+    if platform == "darwin":
+        values = mac_cache_events()
     raw = "".join(json.dumps(value) + "\n" for value in values).encode()
     source = tmp_path / "native events.jsonl"
     source.write_bytes(raw)
@@ -102,10 +116,58 @@ def test_native_observation_stage_uses_the_real_consumer(tmp_path, monkeypatch, 
     receipt = observations.observe(Session(), dict(path=path, cwd="/scratch"), "muse", output,
                                    platform=platform)
     assert receipt["status"] == "passed"
-    assert (receipt["groups"], receipt["trace"], receipt["prof"]) == (1, 1, 1)
+    if platform == "linux":
+        assert (receipt["groups"], receipt["trace"], receipt["prof"]) == (1, 1, 1)
+    else:
+        assert receipt["observation_kind"] == "mac-cache" and receipt["cache_samples"] == 2
+        assert (receipt["requests"], receipt["hits"], receipt["misses"], receipt["read_bytes"]) == (1536, 512, 1024, 8192)
+        assert not {"groups", "trace", "prof"} & receipt.keys()
     assert receipt["legacy_log_present"] is False
     assert (output / "native-events.jsonl").read_bytes() == raw
     assert json.loads((output / "observation.json").read_text()) == receipt
+
+
+@pytest.mark.parametrize("damage", ["sequence", "settings", "no-cache", "no-shutdown", "early-shutdown",
+                                    "accounting", "budget", "over-budget", "decreased-requests",
+                                    "decreased-hits", "decreased-misses", "decreased-reads", "no-requests", "no-reads"])
+def test_mac_cache_observations_reject_incomplete_or_inconsistent_events(tmp_path, damage):
+    import json
+    from ci.staged_observations import mac_cache_observations
+
+    values = mac_cache_events()
+    final = values[-1]
+    if damage == "sequence": final["seq"] += 1
+    elif damage == "settings": values[0]["values"].pop("host.expert_cache_mib")
+    elif damage == "no-cache": values = values[:2]
+    elif damage == "no-shutdown": final["reason"] = "periodic"
+    elif damage == "early-shutdown": values[-2]["reason"] = "shutdown"
+    elif damage == "accounting": final["requests"] += 1
+    elif damage == "budget": final["budget_bytes"] += 1
+    elif damage == "over-budget": final["cache_bytes"] = final["budget_bytes"] + 1
+    elif damage == "decreased-requests": final.update(requests=512, hits=256, misses=256)
+    elif damage == "decreased-hits": final.update(hits=255, misses=1281)
+    elif damage == "decreased-misses": final.update(hits=769, misses=767)
+    elif damage == "decreased-reads": final["read_bytes"] = 4095
+    elif damage == "no-requests":
+        for row in values[2:]: row.update(requests=0, hits=0, misses=0)
+    elif damage == "no-reads":
+        for row in values[2:]: row["read_bytes"] = 0
+    path = tmp_path / "native-events.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in values))
+    with pytest.raises(ValueError): mac_cache_observations(path)
+
+
+@pytest.mark.parametrize("field", ["requests", "hits", "misses", "cache_bytes", "budget_bytes", "read_bytes", "peak_staging_bytes"])
+@pytest.mark.parametrize("invalid", [-1, True])
+def test_mac_cache_counters_require_nonnegative_integers(tmp_path, field, invalid):
+    import json
+    from ci.staged_observations import mac_cache_observations
+
+    values = mac_cache_events()
+    values[-1][field] = invalid
+    path = tmp_path / "native-events.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in values))
+    with pytest.raises(ValueError, match="nonnegative integers"): mac_cache_observations(path)
 
 
 def test_smoke_waits_through_health_timeout_and_sends_one_completion(tmp_path, monkeypatch):
