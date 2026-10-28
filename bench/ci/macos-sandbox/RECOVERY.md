@@ -70,7 +70,7 @@ Installation of these files alone grants no SSH or sudo access.
 
 Local tests exercise identity/refusal/stale-socket contracts without starting a
 broker, acquiring a device lease, changing a Mac or running a model. They are not
-native isolation or TCC evidence. The existing Mac memory policy remains sampled
-RSS/free-memory/process safeguards; it is not Linux cgroup hard UMA/swap
-isolation. Normal job cleanup still relies on the existing dedicated-UID
+native isolation or TCC evidence. The Mac memory policy samples worker physical
+footprint, host free memory and process count; RSS is diagnostic only. It is not
+Linux cgroup hard UMA/swap isolation. Normal job cleanup still relies on the existing dedicated-UID
 guardian, not a recovery response or runner online status.

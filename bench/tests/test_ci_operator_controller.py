@@ -512,6 +512,23 @@ def test_summary_shows_both_decode_windows_signed_percent_and_ttft_direction():
     assert "template IDs SHA" in text and "conditions/settings SHA" in text and "0/16" in text
 
 
+@pytest.mark.parametrize("devices", [["local-mbp"], ["cloud-5090", "local-mbp"], ["cloud-5090"]])
+def test_summary_describes_mac_footprint_protection_and_diagnostic_rss(devices):
+    report = dict(passed=True, full_impact_coverage_complete=False,
+                  execution_devices=devices, cells=[])
+    stream = io.StringIO()
+    controller.operator_summary(stream, report)
+    text = stream.getvalue()
+    if "local-mbp" in devices:
+        assert "Mac memory protection monitors worker physical footprint/process count and host reserve" in text
+        assert "RSS is diagnostic only" in text
+        assert "does not disable swap or provide a Linux memory.max hard cap" in text
+    else:
+        assert "Mac memory protection" not in text
+        assert "RSS" not in text
+    assert "worker RSS/process count" not in text
+
+
 @pytest.fixture
 def performance_raw(functional_raw):
     """Real validators over synthetic SSE/probe bytes; no device or model runs."""

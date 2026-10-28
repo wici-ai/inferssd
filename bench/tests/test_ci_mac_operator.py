@@ -100,13 +100,16 @@ def mac_raw(tmp_path):
     started = dict(worker_pid=123, worker_uid=62002, birth_identity=dict(pid=123, uid=62002, start_sec=1700000000, start_usec=1), scope_identity=JOB_ROOT)
     common = dict(**started, job_id=JOB, job_root=JOB_ROOT, manifest_sha256=cfg["manifest_sha256"], lock_dev_inode=manifest["selection_lock_identity"])
     observed = dict(common, running=True, ready=True, argv=launch["argv"], resource_policy=RESOURCES,
-        members=[dict(pid=123, rss_bytes=1024)], rss_bytes=1024, listener_pids=[123],
+        members=[dict(pid=123, rss_bytes=45 << 30)], rss_bytes=45 << 30, listener_pids=[123],
+        memory_metric="physical-footprint", physical_footprint_bytes=20 << 30, memory_exited_pids=[],
+        memory_members=[dict(pid=123, rss_bytes=45 << 30, birth_identity=copy.deepcopy(started["birth_identity"]),
+            physical_footprint_bytes=20 << 30, resident_bytes=45 << 30, start_abstime=100, exit_abstime=0)],
         lsof="p123\nu62002\nftxt\nn" + binary + "\nfmem\nn" + frozen + "/lib/libggml.dylib\nfmem\nn/usr/lib/libSystem.B.dylib\nftxt\nn/Library/InferSSD-CI/models/frozen/model.gguf\n")
     stopped = dict(common, running=False, state="failed", reason="requested stop", returncode=0, cleanup_confirmed=True,
                    cleanup=dict(confirmed=True, remaining=[], worker_user_domain_retired=dict(returncode=0)))
     native = {"expert.source":[frozen + "/assets/source.tsv"], "cpu.threads":4}
     effective = dict(ambient_environment=launch["environment"], native_resource_policy=RESOURCES,
-        native_resource_enforcement="root-sampled-worker-rss-processes-host-reserve",
+        native_resource_enforcement="root-sampled-worker-physical-footprint-processes-host-reserve",
         native_launch_policy=dict(template_sha256="c" * 64, typed_values=dict(native, **{"expert.source":["<sealed-build>/assets/source.tsv"]})),
         system_images=[dict(path="/usr/lib/libSystem.B.dylib", sha256="e" * 64)])
     runtime = dict(model_identity=data["model_identity"], build=dict(revision="c" * 40,
@@ -121,8 +124,47 @@ def mac_raw(tmp_path):
 
 def test_mac_runtime_retained_rechecks_real_shaped_probe_lsof_sampled_cap_and_stop(mac_raw):
     root, config, _, folder, launch = mac_raw
+    probe = json.loads((folder / "runtime-after.json").read_text())
+    assert probe["rss_bytes"] > RESOURCES["memory_budget_bytes"]
+    assert receipt.mac_memory_sample(probe, RESOURCES) == 20 << 30
     value = aggregate.runtime_retained(root, config, "candidate", "deepseek", folder, launch, folder / "runtime-receipt.json")
-    assert value["host"]["effective_settings"]["native_resource_enforcement"].startswith("root-sampled")
+    assert value["host"]["effective_settings"]["native_resource_enforcement"] == receipt.MAC_RESOURCE_ENFORCEMENT
+
+
+@pytest.mark.parametrize("fault", [None, "duplicate-exit", "foreign-exit", "live-exit", "server-exit", "unaccounted"])
+def test_mac_memory_partition_preserves_exited_inventory_without_charging_it(mac_raw, fault):
+    _, _, _, folder, _ = mac_raw
+    probe = json.loads((folder / "runtime-after.json").read_text())
+    # ps can retain a zombie's old RSS; the root rusage sampler excludes it.
+    probe["members"].append(dict(pid=124, rss_bytes=2 << 30))
+    probe["rss_bytes"] += 2 << 30
+    probe["memory_exited_pids"] = [124]
+    if fault == "duplicate-exit": probe["memory_exited_pids"].append(124)
+    elif fault == "foreign-exit": probe["memory_exited_pids"] = [125]
+    elif fault == "live-exit": probe["memory_exited_pids"].append(123)
+    elif fault == "server-exit":
+        probe["memory_members"] = []
+        probe["memory_exited_pids"].append(123)
+        probe["physical_footprint_bytes"] = 0
+    elif fault == "unaccounted": probe["memory_exited_pids"] = []
+    if fault:
+        with pytest.raises(ValueError): receipt.mac_memory_sample(probe, RESOURCES)
+    else:
+        assert receipt.mac_memory_sample(probe, RESOURCES) == 20 << 30
+        assert len(probe["members"]) == 2 and probe["rss_bytes"] == 47 << 30
+
+
+def test_mac_memory_sums_multiple_live_workers_at_exact_budget(mac_raw):
+    _, _, _, folder, _ = mac_raw
+    probe = json.loads((folder / "runtime-after.json").read_text())
+    child = dict(pid=124, rss_bytes=1 << 30)
+    probe["members"].append(child)
+    probe["rss_bytes"] += child["rss_bytes"]
+    probe["memory_members"].append(dict(child,
+        birth_identity=dict(pid=124, uid=62002, start_sec=1700000001, start_usec=2),
+        physical_footprint_bytes=20 << 30, resident_bytes=1 << 30, start_abstime=101, exit_abstime=0))
+    probe["physical_footprint_bytes"] = 40 << 30
+    assert receipt.mac_memory_sample(probe, RESOURCES) == RESOURCES["memory_budget_bytes"]
 
 
 def test_mac_live_receipt_reads_alias_from_native_freeze_path(mac_raw, monkeypatch):
@@ -170,11 +212,15 @@ def test_mac_live_receipt_reads_alias_from_native_freeze_path(mac_raw, monkeypat
     monkeypatch.setattr(receipt, "checked_model", lambda *a: data["model_identity"])
     result = receipt.receipt(config, manifest, "candidate", "deepseek", launch, build, folder)
     assert reads.count(alias_path) == 1
+    assert result["host"]["effective_settings"]["native_resource_enforcement"] == receipt.MAC_RESOURCE_ENFORCEMENT
     assert result["host"]["effective_settings"]["native_launch_policy"]["typed_values"]["expert.source"] == [
         "<sealed-build>/assets/source.tsv"]
+    assert aggregate.runtime_retained(root, config, "candidate", "deepseek", folder, launch,
+        folder / "comparison-receipt.json") == result
 
 
-@pytest.mark.parametrize("fault", ["pid", "uid", "birth", "scope", "argv", "policy", "rss", "rss-sum", "members", "listener", "lsof", "lsof-owner", "lock", "manifest", "loaded-sha", "enforcement", "stop-residual", "stop-domain", "stop-lock", "source-job", "source-inventory"])
+@pytest.mark.parametrize("fault", ["pid", "uid", "birth", "scope", "argv", "policy", "footprint", "rss-sum", "members", "listener", "lsof", "lsof-owner", "lock", "manifest", "loaded-sha", "enforcement", "legacy-enforcement", "stop-residual", "stop-domain", "stop-lock", "source-job", "source-inventory",
+    "memory-metric", "legacy-metric", "unknown-memory", "accounting-error", "footprint-sum", "memory-member-missing", "memory-member-duplicate", "memory-member-foreign", "memory-member-uid", "memory-member-birth", "memory-member-rss", "memory-member-start", "memory-member-exited"])
 def test_mac_raw_identity_resource_image_or_cleanup_failure_is_not_green(mac_raw, fault):
     root, config, manifest, folder, launch = mac_raw
     probe = json.loads((folder / "runtime-after.json").read_text())
@@ -186,7 +232,7 @@ def test_mac_raw_identity_resource_image_or_cleanup_failure_is_not_green(mac_raw
     elif fault == "scope": probe["scope_identity"] = JOB_ROOT.replace(JOB, "b" * 32)
     elif fault == "argv": probe["argv"].append("--other")
     elif fault == "policy": probe["resource_policy"]["host_reserve_bytes"] += 1
-    elif fault == "rss": probe["members"][0]["rss_bytes"] = probe["rss_bytes"] = RESOURCES["memory_budget_bytes"] + 1
+    elif fault == "footprint": probe["memory_members"][0]["physical_footprint_bytes"] = probe["physical_footprint_bytes"] = RESOURCES["memory_budget_bytes"] + 1
     elif fault == "rss-sum": probe["rss_bytes"] += 1
     elif fault == "members": probe["members"].append(probe["members"][0])
     elif fault == "listener": probe["listener_pids"] = [124]
@@ -196,11 +242,25 @@ def test_mac_raw_identity_resource_image_or_cleanup_failure_is_not_green(mac_raw
     elif fault == "manifest": probe["manifest_sha256"] = "0" * 64
     elif fault == "loaded-sha": value["build"]["loaded_libraries"][0]["sha256"] = "0" * 64
     elif fault == "enforcement": value["host"]["effective_settings"].pop("native_resource_enforcement")
+    elif fault == "legacy-enforcement": value["host"]["effective_settings"]["native_resource_enforcement"] = "root-sampled-worker-rss-processes-host-reserve"
     elif fault == "stop-residual": stopped["cleanup"]["remaining"] = [dict(pid=124)]
     elif fault == "stop-domain": stopped["cleanup"]["worker_user_domain_retired"]["returncode"] = 1
     elif fault == "stop-lock": stopped["lock_dev_inode"][1] += 1
     elif fault == "source-job": config["manifest_path"] = MANIFEST.replace(JOB, "b" * 32)
-    else: (root / "build-candidate/freeze-manifest.json").write_text('{}\n')
+    elif fault == "source-inventory": (root / "build-candidate/freeze-manifest.json").write_text('{}\n')
+    elif fault == "memory-metric": probe.pop("memory_metric")
+    elif fault == "legacy-metric": probe["memory_metric"] = "rss"
+    elif fault == "unknown-memory": probe["physical_footprint_bytes"] = None
+    elif fault == "accounting-error": probe["memory_accounting_error"] = "PermissionError: proc_pid_rusage refused"
+    elif fault == "footprint-sum": probe["physical_footprint_bytes"] += 1
+    elif fault == "memory-member-missing": probe["memory_members"] = []
+    elif fault == "memory-member-duplicate": probe["memory_members"].append(probe["memory_members"][0])
+    elif fault == "memory-member-foreign": probe["memory_members"][0]["pid"] = 124
+    elif fault == "memory-member-uid": probe["memory_members"][0]["birth_identity"]["uid"] = 501
+    elif fault == "memory-member-birth": probe["memory_members"][0]["birth_identity"]["start_usec"] += 1
+    elif fault == "memory-member-rss": probe["memory_members"][0]["rss_bytes"] += 1
+    elif fault == "memory-member-start": probe["memory_members"][0]["start_abstime"] = 0
+    elif fault == "memory-member-exited": probe["memory_members"][0]["exit_abstime"] = 1
     (folder / "runtime-after.json").write_text(json.dumps(probe)); (folder / "stopped.json").write_text(json.dumps(stopped))
     (folder / "runtime-receipt.json").write_text(json.dumps(value))
     with pytest.raises(ValueError): aggregate.runtime_retained(root, config, "candidate", "deepseek", folder, launch, folder / "runtime-receipt.json")
@@ -289,6 +349,8 @@ def mac_performance_raw(mac_raw):
             value["worker_pid"] = pid; value["birth_identity"]["pid"] = pid
             if "members" in value:
                 value["members"][0]["pid"] = pid; value["listener_pids"] = [pid]
+                value["memory_members"][0]["pid"] = pid
+                value["memory_members"][0]["birth_identity"]["pid"] = pid
                 value["lsof"] = value["lsof"].replace("p123\n", "p" + str(pid) + "\n")
             (folder / name).write_text(json.dumps(value))
         (folder / "stderr.log").write_text((original / "stderr.log").read_text().replace("/frozen/candidate", "/frozen/" + side))

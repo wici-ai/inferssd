@@ -447,7 +447,7 @@ def operator_summary(stream, report):
         stream.write("\nFailure: " + summary_text(error) + "\n")
     stream.write("\nDevices outside this declared scope and any 4K deferred coverage remain separate. ")
     if "local-mbp" in report.get("execution_devices", []):
-        stream.write("Mac memory protection monitors worker RSS/process count and host reserve; it does not disable swap or provide a Linux memory.max hard cap. ")
+        stream.write("Mac memory protection monitors worker physical footprint/process count and host reserve; RSS is diagnostic only. It does not disable swap or provide a Linux memory.max hard cap. ")
     stream.write("Formal benchmark samples: 0/16. Full comparison values and hashes are in aggregate.json; complete raw and cleanup evidence are in the retained selected-control artifacts.\n")
 
 

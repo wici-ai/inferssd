@@ -13,7 +13,7 @@ from ci.staged_numerical import validate_csv
 from ci.staged_benchmark import verify_stopped, verify_runtime
 from ci.staged_checkpoint import mapped_files, native_settings
 from ci.selected_preflight import launch as preflight_launch, retained
-from ci.selected_receipt import retained_typed_settings, mac_runtime_images, mac_stopped
+from ci.selected_receipt import retained_typed_settings, mac_runtime_images, mac_stopped, MAC_RESOURCE_ENFORCEMENT
 from ci import model_admission
 
 
@@ -73,7 +73,7 @@ def runtime_retained(root, config, side, model, folder, launch, receipt_path):
         if (build["binary"]["runtime_path"] not in images
                 or sorted(runtime["build"]["loaded_libraries"], key=lambda x: x["path"]) != sorted(expected, key=lambda x: x["path"])
                 or effective["ambient_environment"] != launch["environment"]
-                or effective.get("native_resource_enforcement") != "root-sampled-worker-rss-processes-host-reserve"):
+                or effective.get("native_resource_enforcement") != MAC_RESOURCE_ENFORCEMENT):
             raise ValueError("retained Mac loaded images or declared environment differs")
         known = {image["path"] for image in expected}
         systems = effective.get("system_images", [])

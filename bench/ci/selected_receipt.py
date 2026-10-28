@@ -21,6 +21,10 @@ from ci.model_admission import checked_model
 from ci.staged_benchmark import verify_runtime, verify_stopped
 
 
+MAC_MEMORY_METRIC = "physical-footprint"
+MAC_RESOURCE_ENFORCEMENT = "root-sampled-worker-physical-footprint-processes-host-reserve"
+
+
 def mac_job_root(manifest_path):
     match = re.fullmatch(r"/Library/InferSSD-CI/private/job-manifests/([0-9a-f]{32})\.json", str(manifest_path))
     if match is None:
@@ -47,10 +51,62 @@ def mac_stopped(config, manifest, stopped):
         raise ValueError("Mac stop lacks exact job/lease and empty worker-domain cleanup")
 
 
+def mac_memory_sample(observed, resources):
+    """Verify the root executor's live footprint sum and exited-PID partition."""
+    members = observed.get("members")
+    samples = observed.get("memory_members")
+    exited = observed.get("memory_exited_pids")
+    footprint = observed.get("physical_footprint_bytes")
+    if (observed.get("memory_metric") != MAC_MEMORY_METRIC
+            or "memory_accounting_error" in observed
+            or observed.get("resource_violation") is not None
+            or type(footprint) is not int or footprint < 0
+            or observed.get("resource_policy") != resources
+            or not isinstance(members, list) or not members or len(members) > resources["max_processes"]
+            or not isinstance(samples, list) or not isinstance(exited, list)):
+        raise ValueError("Mac physical footprint accounting is missing or invalid")
+    inventory = {}
+    for row in members:
+        if (not isinstance(row, dict) or type(row.get("pid")) is not int or row["pid"] <= 1
+                or row["pid"] in inventory
+                or type(row.get("rss_bytes")) is not int or row["rss_bytes"] < 0):
+            raise ValueError("Mac worker memory inventory differs")
+        inventory[row["pid"]] = row
+    if (type(observed.get("rss_bytes")) is not int
+            or observed["rss_bytes"] != sum(row["rss_bytes"] for row in members)):
+        raise ValueError("Mac diagnostic RSS sum differs")
+    live, total = {}, 0
+    for row in samples:
+        if not isinstance(row, dict):
+            raise ValueError("Mac footprint member is invalid")
+        pid, birth = row.get("pid"), row.get("birth_identity")
+        if (type(pid) is not int or pid not in inventory or pid in live
+                or type(row.get("rss_bytes")) is not int or row["rss_bytes"] != inventory[pid]["rss_bytes"]
+                or not isinstance(birth, dict) or birth.get("pid") != pid or birth.get("uid") != 62002
+                or any(type(birth.get(key)) is not int for key in ("pid", "uid", "start_sec", "start_usec"))
+                or birth["start_sec"] <= 0 or not 0 <= birth["start_usec"] < 1000000
+                or any(type(row.get(key)) is not int or row[key] < 0 for key in (
+                    "physical_footprint_bytes", "resident_bytes", "start_abstime", "exit_abstime"))
+                or row["start_abstime"] == 0 or row["exit_abstime"] != 0):
+            raise ValueError("Mac live footprint member identity or accounting differs")
+        live[pid] = row
+        total += row["physical_footprint_bytes"]
+    if (any(type(pid) is not int or pid not in inventory for pid in exited)
+            or len(set(exited)) != len(exited) or set(exited) & live.keys()
+            or live.keys() | set(exited) != inventory.keys()
+            or observed.get("worker_pid") not in live
+            or live[observed["worker_pid"]]["birth_identity"] != observed.get("birth_identity")):
+        raise ValueError("Mac live/exited memory membership differs")
+    if footprint != total or footprint > resources["memory_budget_bytes"]:
+        raise ValueError("Mac physical footprint sum or budget differs")
+    return footprint
+
+
 def mac_runtime_images(config, manifest, side, model, spec, started, observations):
     """Recheck root Mac samples without inventing a Linux hard memory limit.
 
-    The executor monitors aggregate worker-UID RSS/process count and host reserve.
+    The executor monitors worker physical footprint/process count and host reserve.
+    RSS is retained only as a diagnostic, including reclaimable file mappings.
     These snapshots attest that sampled policy, not memory.max or swap=0.
     """
     root = mac_job_root(config["manifest_path"])
@@ -84,15 +140,10 @@ def mac_runtime_images(config, manifest, side, model, spec, started, observation
                 or not isinstance(members, list) or not members
                 or len(members) > resources["max_processes"]):
             raise ValueError("Mac PID/birth/job/lease/launch/resource sample differs")
-        if (any(not isinstance(row, dict) or type(row.get("pid")) is not int or row["pid"] <= 1
-                or type(row.get("rss_bytes")) is not int or row["rss_bytes"] < 0 for row in members)
-                or len({row["pid"] for row in members}) != len(members)
-                or started["worker_pid"] not in {row["pid"] for row in members}
-                or observed.get("rss_bytes") != sum(row["rss_bytes"] for row in members)
-                or observed["rss_bytes"] > resources["memory_budget_bytes"]
-                or observed.get("listener_pids") != [started["worker_pid"]]
+        mac_memory_sample(observed, resources)
+        if (observed.get("listener_pids") != [started["worker_pid"]]
                 or not isinstance(observed.get("lsof"), str)):
-            raise ValueError("Mac worker membership/RSS/listener/image inventory differs")
+            raise ValueError("Mac worker listener/image inventory differs")
         current, owner = None, []
         for line in observed["lsof"].splitlines():
             if line.startswith("p"):
@@ -363,6 +414,6 @@ def receipt(config, manifest, side, model, spec, build, output, *, destination=N
                                 template_sha256=template["sha256"]), frozen), native_resource_policy=resources,
                                 ambient_environment=ambient, system_images=systems)))
     if platform == "darwin":
-        result["host"]["effective_settings"]["native_resource_enforcement"] = "root-sampled-worker-rss-processes-host-reserve"
+        result["host"]["effective_settings"]["native_resource_enforcement"] = MAC_RESOURCE_ENFORCEMENT
     save(destination if destination is not None else output / "comparison-receipt.json", result)
     return result

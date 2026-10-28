@@ -102,8 +102,9 @@ settings/source/prompt identities, observations and cleanup evidence.
 
 These request metrics exclude model/vocabulary loading before server readiness.
 Each profile establishes only its own hardware, models, resource constraints and
-cache settings. Mac uses the root executor's sampled RSS/process/free-memory
-guards; its receipts do not assert Linux cgroup hard UMA or swap isolation.
+cache settings. Mac uses the root executor's sampled worker physical footprint,
+process count and host free-memory guards; RSS is diagnostic only. Its receipts
+do not assert Linux cgroup hard UMA or swap isolation.
 
 Preparation/staging interruption and ambiguous dispatch are retained without
 automatic replay. A saved, already validated `dispatched-run.json` allows a
