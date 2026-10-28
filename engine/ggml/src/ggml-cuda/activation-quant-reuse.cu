@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "activation-quant-reuse.cuh"
 
 #include <cstdlib>

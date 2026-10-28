@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "hc-weighted-sum.cuh"
 
 // Per-batch n_embd-major layout. Each (block.y, thread block on x) pair

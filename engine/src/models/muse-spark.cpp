@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "models.h"
 
 // Text graph ported from llama.cpp ba3c05f71d.

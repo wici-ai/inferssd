@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "dsv4-hc.cuh"
 
 // Fused DeepSeek-V4 hyper-connection kernels, ported from vcruz305/llama.cpp@5210c7c (dsv4-hc.cu).

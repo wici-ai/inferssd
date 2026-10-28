@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "mmvf-f32-cpu.cuh"
 #include "dense-parity.cuh"
 

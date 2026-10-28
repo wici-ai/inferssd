@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 #include "mmvq-q8k.cuh"
 #include "activation-quant-reuse.cuh"
 #include "dense-parity.cuh"

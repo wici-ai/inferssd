@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "common.cuh"
 
 #define CUDA_HC_WEIGHTED_SUM_BLOCK_SIZE 256

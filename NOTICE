@@ -33,13 +33,17 @@ source tree.
 
 3. DeepSeek V4.1 runtime
    https://github.com/vcruz305/llama.cpp
-   Source revision 5210c7c5ed61. Copyright (c) 2023-2026 The ggml authors.
-   The MIT permission notice below applies.
+   Source revision 5210c7c5ed61. The DeepSeek-V4.1 graph, the DeepSeek V4 KV
+   cache and the fused hyper-connection CUDA kernels are ported from it; the
+   latter two originate in upstream llama.cpp pull requests 24162 and 25585.
+   Copyright (c) 2023-2026 The ggml authors. The MIT permission notice below
+   applies.
 
-4. Engram decode test reference
+4. Engram decode reference
    https://github.com/antirez/ds4
-   Source revision 8db1d1d155cb, ds4_engram.c. A short reference in
-   engine/tests/ssd/test-dsv41-engram.cpp is transcribed from that
+   Source revision 8db1d1d155cb, ds4_engram.c. The Engram decode arithmetic in
+   engine/src/llama-engram.h and a short reference in
+   engine/tests/ssd/test-dsv41-engram.cpp are transcribed from that
    implementation.
    Copyright (c) 2026 The ds4.c authors
    Copyright (c) 2023-2026 The ggml authors
@@ -48,6 +52,8 @@ source tree.
 
 5. ik_llama.cpp
    https://github.com/ikawrakow/ik_llama.cpp
+   The deferred expert mmap residency loader in engine/src/ssd/model-source.cpp
+   is adapted from pull request 1634 (revision 4f4bcfbe6712).
    Copyright (c) 2024-2025 The ik_llama.cpp authors.
    The MIT permission notice below applies.
 
