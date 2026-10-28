@@ -211,6 +211,8 @@ def test_known_mac_requested_stop_is_not_a_resource_failure():
 
 
 @pytest.mark.parametrize("case", ["STOP", "stage deadline", "process or memory reserve budget",
+                                  "process count budget", "worker physical footprint budget", "host memory reserve",
+                                  "worker memory accounting unavailable", "host memory accounting unavailable",
                                   "code", "remaining", "domain", "scope", "quarantine"])
 def test_mac_stop_never_accepts_other_failed_or_unclean_status(case):
     value = copy.deepcopy(mac_stop())

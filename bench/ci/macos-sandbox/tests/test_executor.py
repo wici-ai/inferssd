@@ -1,11 +1,14 @@
 """Portable contract/file-sealing checks; never claimed as native isolation proof."""
 from contextlib import ExitStack
+import ctypes
+import errno
+import json
 import os
 from pathlib import Path
 import tempfile
 import unittest
 import sys
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE))
@@ -230,6 +233,209 @@ class FreshSideWorkspaceTests(unittest.TestCase):
             spawn.assert_not_called()
 
 
+class ResourceViolationTests(unittest.TestCase):
+    """Retain the root guard's actual sample, without changing its thresholds."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.policy = dict(max_processes=2, memory_budget_bytes=40 << 30,
+                           host_reserve_bytes=3 << 30)
+        self.session = object.__new__(executor.Session)
+        self.session.config = dict(worker_uid=62002, stop=str(self.root / 'STOP'),
+                                   executor=self.policy)
+        self.session.peer = self.session.broker_lifeline = None
+        self.record = dict(started_monotonic=0, timeout_s=30,
+                           evidence=str(self.root), running=True)
+        self.process = Mock(stdout=None, stderr=None, returncode=-15)
+        self.process.poll.return_value = None
+        self.session.stage = (self.process, self.record, {}, {})
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(executor.time, 'monotonic', return_value=10))
+        stack.enter_context(patch.object(executor.core, 'disconnected', return_value=False))
+        stack.enter_context(patch.object(executor.core, 'drain_logs'))
+        stack.enter_context(patch.object(executor.core, 'cleanup', return_value={
+            'confirmed': True, 'remaining': [], 'signals': []}))
+        self.members = stack.enter_context(patch.object(executor.core, 'members'))
+        self.available = stack.enter_context(patch.object(executor.core, 'free_memory'))
+        self.memory = stack.enter_context(patch.object(executor, 'worker_memory', side_effect=lambda members, uid: dict(
+            memory_metric=executor.MEMORY_METRIC, physical_footprint_bytes=sum(
+                p.get('physical_footprint_bytes', p['rss_bytes']) for p in members),
+            memory_members=[], memory_exited_pids=[])))
+
+    def tick(self, members, available):
+        self.members.return_value = members
+        self.available.return_value = available
+        self.session.tick()
+        self.members.assert_called_once_with(62002)
+        self.available.assert_called_once_with()
+
+    def test_distinguishes_and_persists_each_resource_violation(self):
+        cases = (
+            ([dict(pid=1, rss_bytes=1), dict(pid=2, rss_bytes=1), dict(pid=3, rss_bytes=1)],
+             4 << 30, 'process count budget'),
+            ([dict(pid=1, rss_bytes=1, physical_footprint_bytes=(40 << 30) + 1)],
+             4 << 30, 'worker physical footprint budget'),
+            ([dict(pid=1, rss_bytes=1)], (3 << 30) - 1, 'host memory reserve'),
+        )
+        for members, available, reason in cases:
+            with self.subTest(reason=reason):
+                folder = self.root / reason
+                folder.mkdir()
+                self.record['evidence'] = str(folder)
+                self.session.stage = (self.process, self.record, {}, {})
+                self.members.reset_mock()
+                self.available.reset_mock()
+                self.tick(members, available)
+                result = json.loads((folder / 'result.json').read_text())
+                self.assertEqual(result['reason'], reason)
+                self.assertEqual(result['resource_violation'], dict(
+                    reason=reason, monotonic_s=10, members=members,
+                    process_count=len(members), rss_bytes=sum(p['rss_bytes'] for p in members),
+                    memory_metric=executor.MEMORY_METRIC, physical_footprint_bytes=sum(
+                        p.get('physical_footprint_bytes', p['rss_bytes']) for p in members),
+                    memory_members=[], memory_exited_pids=[],
+                    free_memory_bytes=available, resource_policy=self.policy))
+                self.assertEqual(result['returncode'], -15)
+                self.assertTrue(result['cleanup_confirmed'])
+
+    def test_exact_boundaries_remain_allowed(self):
+        self.tick([dict(pid=1, rss_bytes=45 << 30, physical_footprint_bytes=40 << 30),
+                   dict(pid=2, rss_bytes=0)], 3 << 30)
+        self.assertIsNotNone(self.session.stage)
+        self.assertNotIn('resource_violation', self.record)
+        self.assertEqual(self.record['resource_observation']['physical_footprint_bytes'], 40 << 30)
+        self.assertEqual(self.record['resource_observation']['rss_bytes'], 45 << 30)
+        self.assertFalse((self.root / 'result.json').exists())
+
+    def test_first_exceeded_limit_keeps_original_precedence(self):
+        self.tick([dict(pid=1, rss_bytes=40 << 30), dict(pid=2, rss_bytes=1),
+                   dict(pid=3, rss_bytes=1)], 0)
+        result = json.loads((self.root / 'result.json').read_text())
+        self.assertEqual(result['reason'], 'process count budget')
+        self.assertEqual(result['resource_violation']['rss_bytes'], (40 << 30) + 2)
+        self.assertEqual(result['resource_violation']['free_memory_bytes'], 0)
+
+    def test_peak_survives_an_empty_final_inventory(self):
+        self.tick([dict(pid=1, rss_bytes=45 << 30, physical_footprint_bytes=20 << 30)], 6 << 30)
+        self.members.return_value = []
+        self.session.tick()
+        self.assertEqual(self.record['resource_observation']['physical_footprint_bytes'], 0)
+        self.assertEqual(self.record['resource_peak'], dict(
+            memory_metric=executor.MEMORY_METRIC, physical_footprint_bytes=20 << 30, rss_bytes=45 << 30))
+
+    def test_diagnostic_failure_does_not_mask_existing_footprint_violation(self):
+        self.available.side_effect = OSError('vm_stat unavailable')
+        self.tick([dict(pid=1, rss_bytes=(40 << 30) + 1)], None)
+        result = json.loads((self.root / 'result.json').read_text())
+        self.assertEqual(result['reason'], 'worker physical footprint budget')
+        self.assertIsNone(result['resource_violation']['free_memory_bytes'])
+        self.assertEqual(result['resource_violation']['free_memory_error'],
+                         'OSError: vm_stat unavailable')
+        self.assertTrue(result['cleanup_confirmed'])
+
+    def test_unavailable_guard_sample_still_fails_closed(self):
+        self.members.return_value = [dict(pid=1, rss_bytes=1)]
+        self.available.side_effect = OSError('vm_stat unavailable')
+        self.session.tick()
+        self.available.assert_called_once_with()
+        result = json.loads((self.root / 'result.json').read_text())
+        self.assertEqual(result['reason'], 'host memory accounting unavailable')
+        self.assertIn('vm_stat unavailable', result['resource_violation']['free_memory_error'])
+        self.assertTrue(result['cleanup_confirmed'])
+
+    def test_unknown_footprint_fails_closed_and_retains_error(self):
+        self.memory.side_effect = PermissionError('proc_pid_rusage refused')
+        self.tick([dict(pid=1, rss_bytes=1)], 12 << 30)
+        result = json.loads((self.root / 'result.json').read_text())
+        self.assertEqual(result['reason'], 'worker memory accounting unavailable')
+        self.assertIsNone(result['resource_violation']['physical_footprint_bytes'])
+        self.assertEqual(result['resource_violation']['memory_accounting_error'],
+                         'PermissionError: proc_pid_rusage refused')
+        self.assertEqual(result['resource_violation']['rss_bytes'], 1)
+        self.assertTrue(result['cleanup_confirmed'])
+
+
+class PhysicalFootprintTests(unittest.TestCase):
+    def identity(self, pid, **kwargs):
+        self.assertEqual(kwargs, dict(include_exited=True))
+        return dict(pid=pid, uid=62002, start_sec=100, start_usec=pid)
+
+    def memory(self, pid):
+        return dict(physical_footprint_bytes=pid * 10, resident_bytes=pid * 100,
+                    start_abstime=pid, exit_abstime=0)
+
+    def test_v0_sdk_layout_and_kernel_bytes_are_preserved(self):
+        self.assertEqual(ctypes.sizeof(executor.RusageInfoV0), 96)
+        self.assertEqual(executor.RusageInfoV0.ri_phys_footprint.offset, 72)
+        function = Mock()
+        def sample(pid, flavor, pointer):
+            self.assertEqual((pid, flavor), (123, 0))
+            usage = ctypes.cast(pointer, ctypes.POINTER(executor.RusageInfoV0)).contents
+            usage.ri_proc_start_abstime = 456
+            usage.ri_phys_footprint = 3 << 30
+            usage.ri_resident_size = 1 << 30  # Compressed/GPU charges can exceed RSS.
+            return 0
+        function.side_effect = sample
+        with patch.object(executor.ctypes, 'CDLL', return_value=Mock(proc_pid_rusage=function)):
+            self.assertEqual(executor.process_memory(123), dict(
+                physical_footprint_bytes=3 << 30, resident_bytes=1 << 30,
+                start_abstime=456, exit_abstime=0))
+
+    def test_api_permission_failure_is_not_zero_usage_or_process_exit(self):
+        def fail(*args):
+            ctypes.set_errno(errno.EPERM)
+            return -1
+        with patch.object(executor.ctypes, 'CDLL', return_value=Mock(proc_pid_rusage=Mock(side_effect=fail))):
+            with self.assertRaises(PermissionError):
+                executor.process_memory(123)
+        with patch.object(executor.ctypes, 'CDLL', return_value=Mock(proc_pidinfo=Mock(side_effect=fail))):
+            with self.assertRaises(PermissionError):
+                executor.birth(123)
+
+    def test_sums_each_live_worker_and_retains_separate_rss(self):
+        active = [dict(pid=1, rss_bytes=100), dict(pid=2, rss_bytes=200)]
+        with patch.object(executor, 'birth', side_effect=self.identity), \
+             patch.object(executor, 'process_memory', side_effect=self.memory):
+            result = executor.worker_memory(active, 62002)
+        self.assertEqual(result['physical_footprint_bytes'], 30)
+        self.assertEqual(result['memory_metric'], 'physical-footprint')
+        self.assertEqual([row['rss_bytes'] for row in result['memory_members']], [100, 200])
+        self.assertEqual(result['memory_exited_pids'], [])
+
+    def test_cached_zombie_usage_is_not_charged_as_live_memory(self):
+        with patch.object(executor, 'birth', side_effect=self.identity), \
+             patch.object(executor, 'process_memory', return_value=dict(self.memory(1), exit_abstime=99)):
+            result = executor.worker_memory([dict(pid=1, rss_bytes=0)], 62002)
+        self.assertEqual(result['physical_footprint_bytes'], 0)
+        self.assertEqual(result['memory_exited_pids'], [1])
+
+    def test_disappeared_pid_requires_fresh_uid_inventory(self):
+        for inventory in ([], [dict(pid=1, rss_bytes=1)]):
+            with self.subTest(inventory=inventory), \
+                 patch.object(executor, 'birth', side_effect=ProcessLookupError(errno.ESRCH, 'exited')), \
+                 patch.object(executor.core, 'members', return_value=inventory) as members:
+                if inventory:
+                    with self.assertRaisesRegex(ValueError, 'remains inventoried'):
+                        executor.worker_memory(inventory, 62002)
+                else:
+                    result = executor.worker_memory([dict(pid=1, rss_bytes=1)], 62002)
+                    self.assertEqual(result['memory_exited_pids'], [1])
+                members.assert_called_once_with(62002)
+
+    def test_uid_change_or_pid_reuse_fails_closed(self):
+        original = dict(pid=1, uid=62002, start_sec=100, start_usec=1)
+        for identities in ([dict(original, uid=501)],
+                           [original, dict(original, start_usec=99)]):
+            with self.subTest(identities=identities), \
+                 patch.object(executor, 'birth', side_effect=identities), \
+                 patch.object(executor, 'process_memory', side_effect=self.memory):
+                with self.assertRaisesRegex(ValueError, 'UID differs|PID reused'):
+                    executor.worker_memory([dict(pid=1, rss_bytes=1)], 62002)
+
+
 if __name__ == '__main__':
     unittest.main()
 
@@ -267,6 +473,8 @@ class LightProbeTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout='p123\nn127.0.0.1:18080\n')
         with patch.object(executor, 'birth', return_value='birth'), \
              patch.object(executor.core, 'members', return_value=[dict(pid=123, rss_bytes=1)]), \
+             patch.object(executor, 'worker_memory', return_value=dict(
+                 memory_metric=executor.MEMORY_METRIC, physical_footprint_bytes=1)), \
              patch.object(executor.subprocess, 'run', side_effect=run):
             with self.assertRaisesRegex(OSError, 'full file inventory'):
                 session.probe(record)
