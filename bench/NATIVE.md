@@ -22,8 +22,11 @@ publishing. Use a fresh output directory for every attempt and preserve failures
 
 ## Profile
 
-The following is a shape example, not a runnable configuration. Replace every
-placeholder and enumerate **all** project shared libraries and model shards.
+The following is a shape example, not a runnable configuration. It shows the
+legacy environment-controlled form; current engine builds refuse retired
+`GGML_MOE_*` variables, so use the
+[typed extension](#typed-profile-extension-for-inferssd-ci) for them. Replace
+every placeholder and enumerate **all** project shared libraries and model shards.
 Byte budgets must come from the reviewed configuration. Never use zero to hide
 an automatically sized cache: document its configured ceiling/reserve, and keep
 its runtime capacity/admission telemetry in the server log. Zero means that a
@@ -110,9 +113,9 @@ are recorded in raw maps but are outside the project-image hash allowlist.
 The controller stops and inspects only its unique unit. It retains its lease
 while scope state is uncertain. A worker that loses its controller stops its
 owned groups and retains its lease until no other scope process remains. This
-is the same ownership protocol used by the separately validated tiny gates,
-parameterized for the profile's budget. It is not recovery after machine loss
-or arbitrary noncooperating processes. A server that exits leaving descendants,
+is the shared ownership protocol described below, parameterized for the
+profile's budget. It is not recovery after machine loss or arbitrary
+noncooperating processes. A server that exits leaving descendants,
 requires forced kill, changes identity or fails to exit normally cannot pass.
 
 Mac profiles set `platform: "macos"` and add
@@ -167,10 +170,10 @@ For standalone deployment, prepare a new bundle explicitly:
 
 ```sh
 python3 bench/bundle_native.py --output /path/to/new-wrapper-bundle \
-  --core /path/to/admitted/inferssd/platform
+  --core /path/to/reviewed/inferssd/platform
 ```
 
-Use the exact `inferssd/platform` directory from the admitted source or installed
+Use the exact `inferssd/platform` directory from the reviewed source or installed
 wheel. Copy the **entire** resulting directory, including `ownership/`,
 `native-core.json` and `bundle-manifest.json`, and verify every manifest member
 before an attempt. The wrapper loads that adjacent manifest automatically;

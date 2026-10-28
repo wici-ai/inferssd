@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsv4.h"

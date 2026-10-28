@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
+# SPDX-License-Identifier: Apache-2.0
 """Check public changes without exposing matched values in diagnostics."""
 import argparse
 import ipaddress
@@ -12,8 +12,10 @@ from pathlib import Path
 PATH = re.compile(r"(?<![\w$}])/(?:home|Users|var/tmp)/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/|\b)|(?<![\w$}])/root/")
 LOGIN = re.compile(r"(?<![\w./-])[A-Za-z_][A-Za-z0-9_.%+-]*@([A-Za-z_][A-Za-z0-9.-]*)")
 IP = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
-INTERNAL = re.compile(r"HANDOFF-20\d\d|MEMORY\.md|another session|\bwici\b(?! AI|-ai/)", re.IGNORECASE)
-TASK = re.compile(r"\bTASK[0-9]+\b", re.IGNORECASE)
+# The company is written "WiCi AI", its GitHub owner "wici-ai/" and its domain "wici.ai".
+INTERNAL = re.compile(r"HANDOFF-20\d\d|MEMORY\.md|another session|\bwici\b(?! AI|-ai/|\.ai(?![\w-]|\.\w))",
+                      re.IGNORECASE)
+TASK = re.compile(r"\btask[ -]?#?[0-9]+\b", re.IGNORECASE)
 HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 COMMENT = re.compile(r"^\s*(?://|/\*|\*|#)")
 SELF = "scripts/public-scan.py"

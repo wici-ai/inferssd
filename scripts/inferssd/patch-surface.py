@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """Compare engine files to the immutable source snapshot, excluding path relocation."""
 import argparse
 import pathlib

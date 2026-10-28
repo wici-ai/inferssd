@@ -1,6 +1,6 @@
 {
   "updated": "2026-10-26",
-  "source": "Latest user-supplied benchmark matrix; only the requested 4K entries are saved in this snapshot.",
+  "source": "Tester-supplied benchmark matrix; this snapshot contains the 4K entries only.",
   "scope": "4K prompt tier only, for MacBook Pro, RTX 5060 Ti, RTX 5090, and DGX Spark. Rates retain the supplied precision. Linux results are reported summaries, not newly verified raw runs.",
   "units": "token/s",
   "cell_format": "prefill / decode",
@@ -51,7 +51,7 @@
       "ssd_interface": "PCIe Gen5 x4",
       "core_layout": "6 performance + 4 efficient",
       "storage_model": "ZHITAI TiPro9000",
-      "memory_configuration_note": "16 GB dataset configuration retained at the tester's direction on 2026-10-26. Archived experiments also include a 32 GB host and a 13.98 GB process limit; mapping to the final summary awaits the per-run audit."
+      "memory_configuration_note": "16 GB dataset configuration confirmed by the tester on 2026-10-26. Archived experiments also include a 32 GB host and a 13.98 GB process limit; those runs are not mapped to individual summary values."
     },
     {
       "hardware": "DGX Spark",
@@ -87,7 +87,7 @@
         "prefill_tps": "0.708",
         "decode_tps": "0.437"
       },
-      "SSD-Llama": {
+      "InferSSD": {
         "status": "completed",
         "prefill_tps": "18.743",
         "decode_tps": "2.039"
@@ -107,7 +107,7 @@
         "prefill_tps": "7.02",
         "decode_tps": "0.9"
       },
-      "SSD-Llama": {
+      "InferSSD": {
         "status": "completed",
         "prefill_tps": "75.1",
         "decode_tps": "2.55"
@@ -127,7 +127,7 @@
         "prefill_tps": "36.81",
         "decode_tps": "1.342"
       },
-      "SSD-Llama": {
+      "InferSSD": {
         "status": "completed",
         "prefill_tps": "164.5",
         "decode_tps": "7.27"
@@ -147,7 +147,7 @@
         "prefill_tps": "0.826",
         "decode_tps": "0.356"
       },
-      "SSD-Llama": {
+      "InferSSD": {
         "status": "completed",
         "prefill_tps": "127.5",
         "decode_tps": "7.26"
@@ -165,7 +165,7 @@
       "Colibri": {
         "status": "not_supported"
       },
-      "SSD-Llama": {
+      "InferSSD": {
         "status": "completed",
         "prefill_tps": "7.957",
         "decode_tps": "0.766"
@@ -183,7 +183,7 @@
       "Colibri": {
         "status": "not_supported"
       },
-      "SSD-Llama": {
+      "InferSSD": {
         "status": "completed",
         "prefill_tps": "52.1",
         "decode_tps": "0.219"
@@ -201,7 +201,7 @@
       "Colibri": {
         "status": "not_supported"
       },
-      "SSD-Llama": {
+      "InferSSD": {
         "status": "completed",
         "prefill_tps": "106.6",
         "decode_tps": "1.520"
@@ -219,7 +219,7 @@
       "Colibri": {
         "status": "not_supported"
       },
-      "SSD-Llama": {
+      "InferSSD": {
         "status": "completed",
         "prefill_tps": "83.9",
         "decode_tps": "2.14"
@@ -228,7 +228,7 @@
   ],
   "protocol_confirmation": {
     "date": "2026-10-25",
-    "source": "Tester confirmation in this conversation",
+    "source": "Tester confirmation",
     "hardware": [
       "RTX 5060 Ti",
       "RTX 5090",
@@ -245,12 +245,12 @@
       {
         "record": "default-config-20261020.md",
         "sha256": "5e4976cc7bf3013b2f7a1c71ee9d7a1ebfcee8ce6d0a3847caa4b8ee323f771f",
-        "description": "Archived benchmark setup record; hardware section cross-checked, historical rates not substituted for the final dataset."
+        "description": "Archived benchmark setup record, not distributed with this repository; hardware section cross-checked, historical rates not substituted for the final dataset."
       },
       {
         "record": "results-spark-20261021.md",
         "sha256": "d48e988596fee5d1dabcb4e1868667753e39668d9a925aa70758a1c8005af5d9",
-        "description": "Archived benchmark setup record; hardware section cross-checked, historical rates not substituted for the final dataset."
+        "description": "Archived benchmark setup record, not distributed with this repository; hardware section cross-checked, historical rates not substituted for the final dataset."
       }
     ],
     "confirmation": "The tester retained the 16 GB RTX 5090 dataset label and confirmed that current Muse baseline values reflect subsequent completed measurements using tokens 129–256."

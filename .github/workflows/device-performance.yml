@@ -1,7 +1,7 @@
 name: InferSSD device admission information
 
-# Physical execution belongs to the separate private controller.
-# This preview has no device runner, App token, secret or dispatch permission.
+# Device performance checks run on maintainer-operated hardware outside this
+# workflow. This preview has no device runner, App token, secret or dispatch permission.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -29,9 +29,9 @@ jobs:
           name: device-selection-preview
           path: selection-preview.json
           if-no-files-found: warn
-      - name: Physical tests require separate private admission
+      - name: Device checks require maintainer review
         run: |
-          echo "This is an unprivileged preview, not physical acceptance."
-          echo "A source maintainer submits a Comment review whose complete body is /ci test on the current PR head."
-          echo "The trusted operator seals base/candidate sources and runs the impact-selected physical checks and 512/decode256 comparison."
-          echo "Results are in the private controller Actions Summary and artifacts; unselected devices and extra tiers remain explicit."
+          echo "This job previews which device checks a change selects; it does not run them."
+          echo "After review, a maintainer triggers them with a Comment review whose complete body is /ci test on the current PR head."
+          echo "The selected device checks and the 512-token prompt, 256-token decode comparison then run on maintainer-operated hardware."
+          echo "Device checks run only for pull requests from branches in this repository; fork pull requests receive hosted CI only."

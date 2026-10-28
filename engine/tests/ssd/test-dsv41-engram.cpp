@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 #include "llama-engram.h"
 
 #include <array>
@@ -22,8 +23,12 @@ static uint32_t bits_of(float value) {
 // Direct transcription of antirez/ds4 ds4_engram.c at commit
 // 8db1d1d155cb0400a86a86b9c62d0defb3a6148b (source SHA-256
 // 02785ce48599fa4f514a530697efd0f4483d405c42367332748f8facb2c106cc).
-// Keep this oracle separate from llama_dsv41_engram_decode_value so changes to
-// either side cannot silently redefine the test expectation.
+// Copyright (c) 2026 The ds4.c authors
+// Copyright (c) 2023-2026 The ggml authors
+// Copyright (c) 2023 DeepSeek
+// MIT License; see NOTICE, entry 4.
+// Keep this reference separate from llama_dsv41_engram_decode_value so changes
+// to either side cannot silently redefine the test expectation.
 static bool antirez_reference(uint8_t code, uint8_t scale, float & out) {
     if ((code & 127) == 127 || scale == 255) {
         return false;

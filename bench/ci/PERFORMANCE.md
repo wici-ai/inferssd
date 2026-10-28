@@ -1,10 +1,10 @@
-# Performance acceptance during structural migration
+# Device performance acceptance
 
-The reference and candidate are built once from the frozen plan on the **same
-physical device**. No old development-5090 result can serve as the cloud-5090
-reference. Both sides need the same model shards, prompt/template, actual settings,
-CPU/GPU placement, memory/cache/resource budgets, toolchain and recorded OS-cache
-treatment. Direct GGUF and unrestricted H2D remain mandatory. The protected broker
+The reference and candidate are built once from the pinned plan on the **same
+physical device**. A result from another machine, even one with the same GPU
+model, cannot serve as the reference. Both sides need the same model shards,
+prompt/template, actual settings, CPU/GPU placement, memory/cache/resource
+budgets, toolchain and recorded OS-cache treatment. Direct GGUF and unrestricted H2D remain mandatory. The protected broker
 owns source/build/observation evidence; candidate output cannot certify itself.
 
 Each planned model/tier has one attempt per side. The comparator re-reads the raw
@@ -21,8 +21,8 @@ Five metrics are gated independently:
 - Second-half decode = `128 / (t256 - t128)`.
 - Whole decode = `255 / (t256 - t1)`.
 
-All metrics must be finite and positive. There is **no permitted 5% decode or
-10% TTFT regression**. Those earlier provisional limits were not accepted.
+All metrics must be finite and positive. **No percentage regression allowance**
+applies to any metric.
 
 | Result | Meaning | Check behavior |
 | --- | --- | --- |
@@ -39,7 +39,7 @@ variance or significance, and no mean, best attempt or automatic retry is used.
 ## Bounded follow-up, not repeated matrices
 
 An inconclusive cell opens a separate diagnosis for that device/model and affected
-phase. Freeze its hypothesis, budgets and stop rule before running; start with
+phase. Fix its hypothesis, budgets and stop rule before running; start with
 existing I/O/resource traces and only the shortest request that can distinguish
 the cause. At most one additional planned base/candidate pair is the default
 diagnostic budget; if still unresolved, report the blocker rather than repeatedly
@@ -53,17 +53,18 @@ with evidence and limitations. Fixing code creates a new reviewed candidate; it
 does not mutate the old report. No complex statistical framework or mandatory
 whole-matrix repetition is needed for this initial gate.
 
-CI samples have `purpose=ci` and do not increment the formal 16-row ledger. The
-formal benchmark still runs each prescribed 512/4K cell once on final S, retaining
-all attempts without choosing a best result.
+CI samples have `purpose=ci` and are not formal benchmark samples. The formal
+benchmark ([FINAL.md](../FINAL.md)) runs each prescribed 512/4K cell once on the
+release source, retaining all attempts without choosing a best result.
 
-## Required reference adapter before first migration comparison
+## Legacy reference adapter
 
-The accepted old main `f5e6e26ff26d2014cccef0118048039b88163f54` does not implement
-the typed-settings launcher. Its `bench/native_common.py` has no `typed_snapshot`
+The legacy reference revision (`LEGACY_REVISION` in `reference.py`, also the
+fixed baseline of the checkpoint workflow) does not implement the
+typed-settings launcher. Its `bench/native_common.py` has no `typed_snapshot`
 or `native_launch_policy`, and its `server_argv` does not emit `--ssd-settings`.
-The current CI driver requires `typed_settings` for both builds, so it cannot yet
-compare that reference directly to the final typed-settings candidate.
+The CI driver requires `typed_settings` for both builds, so it cannot compare
+that reference directly to a typed-settings candidate.
 
 The controlled adapter in `reference.py` belongs to the protected controller,
 with an exact reference-SHA allowlist. Integration must launch the **unchanged old binary** using its
@@ -79,9 +80,9 @@ Without an explicit binding, the comparator requires equal loaded-image basename
 Directory moves and renaming/splitting libraries can legitimately change these.
 Use an exact reviewed base/candidate **library-role mapping** together with each
 side's actual loaded hashes, rather than globally ignoring image identity. Until
-that mapping and the reference adapter are installed and verified, the migration
-comparison must remain blocked. Future PRs against a typed-settings main can use
-the existing equal-policy path without this one-time legacy adaptation.
+that mapping and the reference adapter are installed and verified, a comparison
+against the legacy reference must remain blocked. PRs whose base already uses
+typed settings take the equal-policy path without this adaptation.
 
 ### Reviewed binding contract
 
@@ -92,8 +93,8 @@ The protected runner config may carry `comparison_bindings` with exactly `tiny`,
 - `semantic_settings`: all keys of the explicitly bound 14- or 16-key registry generation, including inapplicable platform
   defaults. Values must have the registry's actual JSON types.
 - `sides.base` and `sides.candidate`: full `revision`, `profile_sha256`, complete
-  `launch_policy`, `images` and `build` objects. The base must be the exact accepted
-  legacy SHA above; candidate must match the plan's **merge candidate**, not merely
+  `launch_policy`, `images` and `build` objects. The base must be exactly
+  `LEGACY_REVISION`; candidate must match the plan's **merge candidate**, not merely
   the PR head. Profile hashes use `native_profile_sha256`'s canonical JSON algorithm.
 - `legacy_mapping`: every semantic key has its exact `value`, nonempty
   `explanation`, and nonempty `inputs` list. No mapping is inferred automatically.

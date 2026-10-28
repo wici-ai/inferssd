@@ -10,10 +10,9 @@ models, choose settings, publish results, retry failures, discard slow values or
 start long-prompt runs. The default per-arm timeout is 300 seconds. A timeout is
 a failed arm retained in the record, not an outlier to remove.
 
-The client below accepts an operator-supplied plaintext prompt. The actual model
-and audited prompt assets are still being consolidated. Do not treat this harness
-alone as a reproducible public model benchmark or as a completed device acceptance
-gate.
+The client below accepts an operator-supplied plaintext prompt; the fixed
+benchmark prompts are in [prompts](prompts/). This harness alone is not a
+reproducible public model benchmark or a device acceptance gate.
 
 ## Record one short chat
 
@@ -128,11 +127,11 @@ STOP and termination signals stop the current arm's newly created process group
 and prevent subsequent arms. An arm that exits successfully but leaves descendants
 in its process group is still failed: the driver cleans up that group while
 holding the device lock, then records the remaining arms as `not_run`.
-Arm commands that create systemd scopes or otherwise
-move server processes outside that group must trap termination and stop their
-own exact scope, as the adaptive arm launcher does. No process-name or port-wide
-kill is used. Unexpected machine/process death can leave an incomplete run;
-never combine partial runs or fill in missing measurements silently.
+Arm commands that create systemd scopes or otherwise move server processes
+outside that group must trap termination and stop their own exact scope. No
+process-name or port-wide kill is used. Unexpected machine/process death can
+leave an incomplete run; never combine partial runs or fill in missing
+measurements silently.
 
 ## Device test gate
 

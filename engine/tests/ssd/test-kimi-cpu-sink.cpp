@@ -3341,7 +3341,7 @@ static void host_ledger_tests(fixture_inputs & inputs) {
         }
     }
 
-    // MemAvailable at the kernel's full watermark boost (kimi-memory-boost.h). The zones of the GB10 Spark ysy9 (4 KiB
+    // MemAvailable at the kernel's full watermark boost (kimi-memory-boost.h). The zones of a DGX Spark (GB10, 4 KiB
     // pages, 2 MiB pageblocks): DMA low 235 / high 409, Normal low 42934 / high 74638 pages without the boost, whose
     // largest boost is high * 15000 / 10000 = 111957 pages (437 MiB). /proc/zoneinfo prints low and high with the
     // boost added; a per-CPU pageset's "high:" is not the zone's.

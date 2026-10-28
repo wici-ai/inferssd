@@ -4,13 +4,12 @@ The `unit` CTest label contains only model-free tests that require neither a GPU
 nor cgroup setup. Build the targets before running `ctest -L unit`; a missing
 executable, skipped test or zero selected tests is not a passing gate. CI uses an
 explicit subset to keep the default check small. GPU compilation is a separate,
-manual check while this repository is private; it does not establish GPU runtime
-correctness. Device runs must record both the selected and actually executed tests.
+manual check; it does not establish GPU runtime correctness. Device runs must
+record both the selected and actually executed tests.
 
 The Linux CPU sink suite also exercises io_uring, O_DIRECT, affinity, cgroup memory
 limits and experimental scheduling paths. It is not interchangeable with the
-portable unit gate. `kimi_runtime_routing` initializes the Linux sink and is
-registered only on Linux under `device`, even though it generates its own model. Do not interpret a full-suite run on a small hosted runner as
+portable unit gate. Do not interpret a full-suite run on a small hosted runner as
 a production device acceptance test. GPU and cgroup suites need dedicated launchers
 and explicit resource prerequisites before they can become automated gates.
 
@@ -26,13 +25,13 @@ unchanged. The OFF configuration is retained for explicit legacy comparison,
 not as a runtime fallback.
 
 `test-c0-store` and `test-c0-config` link the actual production store target and
-compare it with the frozen test reference. `test-c0-parser-failures` injects
+compare it with a fixed test reference. `test-c0-parser-failures` injects
 allocation and callback failures into the parser to verify handle cleanup.
 Their CTest names `c0-store`, `c0-config` and `c0-parser-failures` carry `unit`
 and run in hosted CPU CI. The cross-DSO/mock-provider, source-open-hook and direct
 I/O fixtures carry `device`; they do not silently join the hosted unit gate.
-The production store CMake target does not read oracle includes or execute
-Python. The fixed reference is copied only in the test configuration.
+The production store CMake target does not read the fixture's reference includes
+or execute Python. The fixed reference is copied only in the test configuration.
 
 Successful shared initialization emits one receipt:
 `[ssd_store] provider=cuda|portable sources=N entries=N published=1`.
@@ -40,28 +39,12 @@ Together with loaded-library hashes and direct-file descriptor identity, this
 records which provider populated the single owner. It is not a replacement for
 the finite-RAM same-sink numerical comparison or normal reader-shutdown checks.
 
-## Known failures retained for investigation
+## Device failures
 
-The following 12 inherited cases are disabled and carry the `known-failure` label:
-
-- `kimi_cpu_sink_schedule_t{2,12,16}_d{1,8}`
-- `kimi_cpu_sink_expert_job_t{2,12,16}_d{1,8}`
-
-They exercise the experimental expert-job scheduling path. The recorded numerical
-failure is `max_abs=0.024879`; the production settings leave `EXPERT_JOB` off. The
-first-call SIGFPE was separately reproduced with two threads and no cache:
-expert-job dispatch left the active participant count at zero. The dispatch now
-initializes it, and `kimi_cpu_sink_expert_first_call` compares fresh two- and
-four-thread sinks with the ordinary phase path. This does not resolve the recorded
-numerical failure. The twelve cases remain disabled pending numerical validation
-or removal with the unused implementation during code organization. Track the
-decision and validation in
-[issue #1](https://github.com/wici-ai/inferssd/issues/1) and resolve it before v0.1.0.
-
-Other previously reported device failures are not allowlisted: their full names,
-reproduction conditions and outcomes still need to be collected on the current
-hardware. In particular the GB10 MXFP4 parity test needs a separately documented
-numeric expectation; it must not silently become a generic skip.
+Device failures are not allowlisted. Record each one with its full test name,
+reproduction conditions and outcome on the current hardware. A test with a
+hardware-specific numeric expectation, such as MXFP4 parity on GB10, must
+document that expectation rather than become a generic skip.
 
 ## Linux resource prerequisites
 
@@ -91,9 +74,9 @@ CTest preserves 77 as skipped in JUnit. The device gate compares every status wi
 an explicit reviewed baseline and rejects an all-skipped selection. ASan cannot
 establish the prefill cache's process-RSS release assertion: that lifecycle test
 executes its other assertions but returns 77, requiring a separate normal-build
-pass for physical-release acceptance. Current device allowlists and hosted
-runner capability measurements must be collected; they are not inferred from
-historical failure totals.
+pass for physical-release acceptance. Device allowlists and hosted runner
+capabilities must be measured on the current hardware, not inferred from
+historical failure totals; none is recorded in this repository yet.
 
 ## Apple Silicon integration
 
@@ -127,7 +110,5 @@ CPU `MUL_MAT_ID` cases. This is a compilation and synthetic correctness gate.
 The separate target-device gate still needs matched model token sequences and
 memory/performance measurements; no model result follows from hosted CI.
 
-The unfiltered historical `test-chat` suite also reaches a failing Kimi-K3 marker
-case. It remains outside the supported Muse rendering gate and is not declared
-passing or silently allowlisted. Code organization must resolve it with the
-retired K3 implementation rather than changing a generic assertion tolerance.
+The unfiltered `test-chat` suite is outside the supported Muse rendering gate.
+It is not declared passing or silently allowlisted.

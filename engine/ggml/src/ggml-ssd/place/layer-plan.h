@@ -12,8 +12,8 @@
 // The choice is the same for both: of the moves taken in their order, the fewest whose predicted time is within the
 // form's resolution of the lowest, kimi_place_best_prefix. The coupled form does not resolve below one read (the
 // drive hands the lanes their work one expert at a time); the list schedule places every read's landing, so it keeps
-// no margin. On the Spark's decode traces one read kept 0.1 of 33 profitable moves a token (wf-unify/calc/
-// spark_plan_replay2.py): a layer's gain is often below one read, and the token is the sum of 40 layers.
+// no margin. On DGX Spark decode traces one read kept 0.1 of 33 profitable moves a token: a layer's gain is often
+// below one read, and the token is the sum of 40 layers.
 #include <algorithm>
 #include <cmath>
 #include <cstddef>

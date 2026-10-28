@@ -1,5 +1,5 @@
 #pragma once
-// Experimental C0 link boundary; not a stable public ABI.
+// Experimental store link boundary; not a stable public ABI.
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

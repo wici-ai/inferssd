@@ -262,8 +262,8 @@ class GraphRoute(unittest.TestCase):
             for n, mib in others.items():
                 self.assertLess(abs(g['role'] + g['slope'] * n - mib) / mib, 0.01)
             self.assertAlmostEqual(g['host'] * 8192, reserves[-1][2])
-        # the sink's reserves (DeepSeek's bootstrap on 233, every pass the sink's) say nothing of the graph's: no line,
-        # and no graph pass is admitted
+        # the sink's reserves (DeepSeek's bootstrap on an RTX 5060 Ti, every pass the sink's) say nothing of the
+        # graph's: no line, and no graph pass is admitted
         mem = {'free_mib': 15712, 'dense_mib': 8530.2, 'kv_mib': 970, 'compute_mib': 4640.22, 'n_ubatch': 8192,
                'reserves': [[1, 18.77, 0.13, 0], [3323, 1726.49, 237.72, 0], [8192, 4640.22, 585.95, 0]]}
         m = model(memory=mem, E=384, role=6266880)
@@ -272,7 +272,7 @@ class GraphRoute(unittest.TestCase):
         # a graph pass's reserve below the role copy did not hold one: not the graph's line either
         mem = dict(mem, reserves=[[1, 18.77, 0.13, 0], [64, 300.0, 2.0, 1]])
         self.assertIsNone(prefill.graph_line(model(memory=mem, E=384, role=6266880), 'all'))
-        # the bootstrap's own graph passes (a threshold below its prefills) give the line: Muse on 233, 2026-10-21
+        # the bootstrap's own graph passes (a threshold below its prefills) give the line: Muse on an RTX 5060 Ti
         mem = {'free_mib': 15712, 'dense_mib': 9906.78, 'kv_mib': 1116.0, 'compute_mib': 4290.83, 'n_ubatch': 4352,
                'reserves': [[1, 68.18, 0.10, 0], [669, 3042.71, 65.36, 1], [4352, 4290.83, 425.17, 1]]}
         g = prefill.graph_line(model(memory=mem), 'all')
@@ -442,7 +442,7 @@ class Route(unittest.TestCase):
     def test_graph_pass_fits_by_memory(self):
         m = model()
         self.assertEqual(prefill.graph_pass_max(m, 'all', 4608), 4608)
-        # DeepSeek on 233 (2026-10-20): the sink's reserves only, the graph's compute not measured
+        # DeepSeek on an RTX 5060 Ti: the sink's reserves only, the graph's compute not measured
         small = model(memory={'free_mib': 15712, 'dense_mib': 8530, 'kv_mib': 970, 'compute_mib': 4640, 'n_ubatch': 8192,
                               'reserves': [[8192, 4640.0, 585.95, 0]]})
         self.assertEqual(prefill.graph_pass_max(small, 'all', 8192), 0)
@@ -761,7 +761,7 @@ class Prefetch(unittest.TestCase):
         self.assertEqual(settings.depth(self.NU, self.P, 0.0, None, gain=1.3), (1, 0, 8, 1))
 
     def test_the_stored_runs_keep_their_depth(self):
-        # the stored Spark bootstraps (spark-dsv1, DeepSeek-V4.1-Flash-1017; spark-run1, Muse-Spark-Open), as their
+        # the stored DGX Spark bootstraps (DeepSeek-V4.1-Flash-1017 and Muse-Spark-Open), as their
         # settings receipts give them, with the demand time a read saves from their layer fits ([nm] - [nr]) and the
         # readers' time from their reports (10.42 s and 44.41 s, against windows of 19929 x 3004 and 31171 x 3345 us):
         # no spill, so every rank that starts inside the window pays, and the depths stay 6 and 5
@@ -781,7 +781,7 @@ class Prefetch(unittest.TestCase):
                                         [0.859, 0.766, 0.662, 0.540, 0.461, 0.377, 0.298, 0.235], 1.32,
                                         [0.0, 0.0443, 0.0448, 0.0480, 0.0495, 0.0545, 0.0523, 0.0551],
                                         g_muse / t_muse, muse / t_muse)[0], 5)
-        # 125 (RTX 5090), the same model, its bootstrap (placement all, depth 2): the readers' 24.87 s against windows
+        # an RTX 5090, the same model, its bootstrap (placement all, depth 2): the readers' 24.87 s against windows
         # of 19929 x 927 us spill 649 us a read over 9858 reads, less than a used read saves (1.29 ms, the layer fit)
         # at ranks 1 and 2; rank 3 starts after the window (700 us, 0.46 reads of 1535 us): 2, as before
         spill, how = settings.read_spill({'issued': 9858, 'reader_busy_us': 24872641, 'windows': 19929,
@@ -1045,7 +1045,7 @@ class LaneModel(unittest.TestCase):
 
 class PrefillStart(unittest.TestCase):
     """The cost table's start values from the probe's lanes (B4)."""
-    # GB10 (ysy9) at Muse's shape, run 2 of results-bytes-20261022.md: busy lines, the copy, the drive at its knee
+    # DGX Spark (GB10) at Muse's shape: busy lines, the copy, the drive at its knee
     LANES = {'format': 'q4_K/q5_K', 'latent': 4096, 'hidden': 4096, 'threads': 20,
              'gpu': {'fixed_us': 212.0, 'per_route_us': 2.527, 'at150_us': 591.0, 'load': 'busy'},
              'gpu_host': {'fixed_us': 173.6, 'per_route_us': 2.186, 'at150_us': 501.6, 'load': 'busy'},
@@ -1136,7 +1136,7 @@ class Render(unittest.TestCase):
 
 
 class LayerFit(unittest.TestCase):
-    # the per-layer table of DeepSeek-V4.1-Flash-1017's bootstrap on the Spark ysy9 (placement all, depth 2, top-6):
+    # the per-layer table of DeepSeek-V4.1-Flash-1017's bootstrap on a DGX Spark (placement all, depth 2, top-6):
     # class (tier hits, ready, read): [layers, mean ms]
     TABLE = {(6, 0, 0): [10569, 1.8732], (5, 0, 1): [3438, 3.7726], (4, 0, 2): [585, 5.3636], (5, 1, 0): [415, 2.0285],
              (4, 1, 1): [175, 3.845], (3, 0, 3): [69, 7.5655], (3, 1, 2): [42, 6.131], (2, 1, 3): [11, 8.0256],
@@ -1170,7 +1170,7 @@ class LayerFit(unittest.TestCase):
 
 class PlanGuard(unittest.TestCase):
     """plan.py sets aside a configuration priced at a time or a rate at or below zero, or on a placement whose layer
-    table prices a class so: the first decision on the Spark ysy9 (the singular fit's betas, a 16-slot tier from the
+    table prices a class so: the first decision on a DGX Spark (the singular fit's betas, a 16-slot tier from the
     one-block ubatch probe) chose all@16384 at -373 s."""
     TABLE = {'6,0,0': [10569, 1.8732, 0.0131], '5,0,1': [3438, 3.7726, 0.2267], '4,1,1': [175, 3.845, 0.5455]}
 

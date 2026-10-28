@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #include "options.h"
 #include "../common.h"
 #include "llama-ssd.h"

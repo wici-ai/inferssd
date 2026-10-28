@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Context-owned dense transport on a synthetic direct-I/O file. The original
 // 1/64-token, reshape, resident-buffer and bitwise device-reference cases remain.
 // Invalid source ranges fail at startup; a later short read fails the graph and

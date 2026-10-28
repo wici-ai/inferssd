@@ -15,12 +15,12 @@
       "rates_tps": {
         "llama.cpp": "5.929",
         "Colibri": "0.708",
-        "SSD-Llama": "18.743"
+        "InferSSD": "18.743"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "completed",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 3.161241356046551,
       "throughput_change_percent": 216.1241356046551,
@@ -31,7 +31,7 @@
           "throughput_change_percent": -88.05869455220105,
           "displayed_speedup": "(0.12×)"
         },
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 3.161241356046551,
           "throughput_change_percent": 216.1241356046551,
           "displayed_speedup": "(3.16×)"
@@ -46,12 +46,12 @@
       "rates_tps": {
         "llama.cpp": "6.95",
         "Colibri": "7.02",
-        "SSD-Llama": "75.1"
+        "InferSSD": "75.1"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "completed",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 10.805755395683454,
       "throughput_change_percent": 980.5755395683453,
@@ -63,7 +63,7 @@
           "throughput_change_percent": 1.0071942446043165,
           "displayed_speedup": "(1.01×)"
         },
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 10.805755395683454,
           "throughput_change_percent": 980.5755395683453,
           "displayed_speedup": "(10.81×)"
@@ -78,12 +78,12 @@
       "rates_tps": {
         "llama.cpp": "7.37",
         "Colibri": "36.81",
-        "SSD-Llama": "164.5"
+        "InferSSD": "164.5"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "completed",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 22.3202170963365,
       "throughput_change_percent": 2132.02170963365,
@@ -95,7 +95,7 @@
           "throughput_change_percent": 399.4572591587517,
           "displayed_speedup": "(4.99×)"
         },
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 22.3202170963365,
           "throughput_change_percent": 2132.02170963365,
           "displayed_speedup": "(22.32×)"
@@ -110,12 +110,12 @@
       "rates_tps": {
         "llama.cpp": "2.73",
         "Colibri": "0.826",
-        "SSD-Llama": "127.5"
+        "InferSSD": "127.5"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "completed",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 46.7032967032967,
       "throughput_change_percent": 4570.32967032967,
@@ -127,7 +127,7 @@
           "throughput_change_percent": -69.74358974358974,
           "displayed_speedup": "(0.30×)"
         },
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 46.7032967032967,
           "throughput_change_percent": 4570.32967032967,
           "displayed_speedup": "(46.70×)"
@@ -142,12 +142,12 @@
       "rates_tps": {
         "llama.cpp": "0.873",
         "Colibri": "0.437",
-        "SSD-Llama": "2.039"
+        "InferSSD": "2.039"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "completed",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 2.3356242840778925,
       "throughput_change_percent": 133.56242840778924,
@@ -158,7 +158,7 @@
           "throughput_change_percent": -49.942726231386025,
           "displayed_speedup": "(0.50×)"
         },
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 2.3356242840778925,
           "throughput_change_percent": 133.56242840778924,
           "displayed_speedup": "(2.34×)"
@@ -173,12 +173,12 @@
       "rates_tps": {
         "llama.cpp": "0.242",
         "Colibri": "0.9",
-        "SSD-Llama": "2.55"
+        "InferSSD": "2.55"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "completed",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 10.537190082644628,
       "throughput_change_percent": 953.7190082644628,
@@ -190,7 +190,7 @@
           "throughput_change_percent": 271.900826446281,
           "displayed_speedup": "(3.72×)"
         },
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 10.537190082644628,
           "throughput_change_percent": 953.7190082644628,
           "displayed_speedup": "(10.54×)"
@@ -205,12 +205,12 @@
       "rates_tps": {
         "llama.cpp": "0.526",
         "Colibri": "1.342",
-        "SSD-Llama": "7.27"
+        "InferSSD": "7.27"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "completed",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 13.8212927756654,
       "throughput_change_percent": 1282.12927756654,
@@ -222,7 +222,7 @@
           "throughput_change_percent": 155.13307984790873,
           "displayed_speedup": "(2.55×)"
         },
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 13.8212927756654,
           "throughput_change_percent": 1282.12927756654,
           "displayed_speedup": "(13.82×)"
@@ -237,12 +237,12 @@
       "rates_tps": {
         "llama.cpp": "1.608",
         "Colibri": "0.356",
-        "SSD-Llama": "7.26"
+        "InferSSD": "7.26"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "completed",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 4.514925373134329,
       "throughput_change_percent": 351.4925373134328,
@@ -254,7 +254,7 @@
           "throughput_change_percent": -77.86069651741293,
           "displayed_speedup": "(0.22×)"
         },
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 4.514925373134329,
           "throughput_change_percent": 351.4925373134328,
           "displayed_speedup": "(4.51×)"
@@ -269,12 +269,12 @@
       "rates_tps": {
         "llama.cpp": "3.140",
         "Colibri": null,
-        "SSD-Llama": "7.957"
+        "InferSSD": "7.957"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "not_supported",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 2.5340764331210193,
       "throughput_change_percent": 153.40764331210192,
@@ -282,7 +282,7 @@
       "qualification": "Historical configuration comparison: baseline template and actual input count differ.",
       "engine_comparisons": {
         "Colibri": null,
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 2.5340764331210193,
           "throughput_change_percent": 153.40764331210192,
           "displayed_speedup": "(2.53×)"
@@ -297,12 +297,12 @@
       "rates_tps": {
         "llama.cpp": "3.41",
         "Colibri": null,
-        "SSD-Llama": "52.1"
+        "InferSSD": "52.1"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "not_supported",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 15.27859237536657,
       "throughput_change_percent": 1427.8592375366568,
@@ -310,7 +310,7 @@
       "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
       "engine_comparisons": {
         "Colibri": null,
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 15.27859237536657,
           "throughput_change_percent": 1427.8592375366568,
           "displayed_speedup": "(15.28×)"
@@ -325,12 +325,12 @@
       "rates_tps": {
         "llama.cpp": "3.85",
         "Colibri": null,
-        "SSD-Llama": "106.6"
+        "InferSSD": "106.6"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "not_supported",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 27.68831168831169,
       "throughput_change_percent": 2668.8311688311687,
@@ -338,7 +338,7 @@
       "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
       "engine_comparisons": {
         "Colibri": null,
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 27.68831168831169,
           "throughput_change_percent": 2668.8311688311687,
           "displayed_speedup": "(27.69×)"
@@ -353,12 +353,12 @@
       "rates_tps": {
         "llama.cpp": "1.74",
         "Colibri": null,
-        "SSD-Llama": "83.9"
+        "InferSSD": "83.9"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "not_supported",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 48.2183908045977,
       "throughput_change_percent": 4721.83908045977,
@@ -366,7 +366,7 @@
       "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
       "engine_comparisons": {
         "Colibri": null,
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 48.2183908045977,
           "throughput_change_percent": 4721.83908045977,
           "displayed_speedup": "(48.22×)"
@@ -381,12 +381,12 @@
       "rates_tps": {
         "llama.cpp": "0.153",
         "Colibri": null,
-        "SSD-Llama": "0.766"
+        "InferSSD": "0.766"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "not_supported",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 5.006535947712418,
       "throughput_change_percent": 400.65359477124184,
@@ -394,7 +394,7 @@
       "qualification": "Historical configuration comparison: baseline template and actual input count differ.",
       "engine_comparisons": {
         "Colibri": null,
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 5.006535947712418,
           "throughput_change_percent": 400.65359477124184,
           "displayed_speedup": "(5.01×)"
@@ -409,12 +409,12 @@
       "rates_tps": {
         "llama.cpp": "0.059",
         "Colibri": null,
-        "SSD-Llama": "0.219"
+        "InferSSD": "0.219"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "not_supported",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 3.711864406779661,
       "throughput_change_percent": 271.1864406779661,
@@ -422,7 +422,7 @@
       "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
       "engine_comparisons": {
         "Colibri": null,
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 3.711864406779661,
           "throughput_change_percent": 271.1864406779661,
           "displayed_speedup": "(3.71×)"
@@ -437,12 +437,12 @@
       "rates_tps": {
         "llama.cpp": "0.155",
         "Colibri": null,
-        "SSD-Llama": "1.520"
+        "InferSSD": "1.520"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "not_supported",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 9.806451612903226,
       "throughput_change_percent": 880.6451612903226,
@@ -450,7 +450,7 @@
       "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
       "engine_comparisons": {
         "Colibri": null,
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 9.806451612903226,
           "throughput_change_percent": 880.6451612903226,
           "displayed_speedup": "(9.81×)"
@@ -465,12 +465,12 @@
       "rates_tps": {
         "llama.cpp": "0.120",
         "Colibri": null,
-        "SSD-Llama": "2.14"
+        "InferSSD": "2.14"
       },
       "run_status": {
         "llama.cpp": "completed",
         "Colibri": "not_supported",
-        "SSD-Llama": "completed"
+        "InferSSD": "completed"
       },
       "ssd_vs_baseline_ratio": 17.833333333333332,
       "throughput_change_percent": 1683.3333333333333,
@@ -478,7 +478,7 @@
       "qualification": "Tester-reported 4K result; decode uses tokens 129–256 of a 256-token output, as confirmed on 2026-10-25.",
       "engine_comparisons": {
         "Colibri": null,
-        "SSD-Llama": {
+        "InferSSD": {
           "ratio": 17.833333333333332,
           "throughput_change_percent": 1683.3333333333333,
           "displayed_speedup": "(17.83×)"
@@ -486,6 +486,6 @@
       }
     }
   ],
-  "display_format": "README cells show rate (speedup vs llama.cpp, ×); WICI-InferSSD is bold. Ratios below 1.00× indicate lower throughput. Numeric percentage fields are retained for compatibility.",
+  "display_format": "README cells show rate (speedup vs llama.cpp, ×); InferSSD is bold. Ratios below 1.00× indicate lower throughput. Numeric percentage fields are retained for compatibility.",
   "decode_definition": "All platforms generate 256 output tokens; decode throughput is measured over tokens 129–256: 128 / (T256 - T128)."
 }

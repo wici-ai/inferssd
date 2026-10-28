@@ -1,11 +1,12 @@
 # Recorded M5 Mac raw-output reference
 
-These are executed reference outputs from the frozen F engine on an Apple M5
-Max with macOS 26.4, Apple Clang 21 and SDK 26.5. Three synthetic GGUF models
-cover DeepSeek4.1 MXFP4 and Muse Q4_K/Q5_K. Each model ran in two independent
-processes; each process made two KV-cleared requests. All four full-vocabulary
-float32 rows matched across those repetitions. The files here retain the first
-original F recording's first request, never regenerated expected outputs.
+These are executed reference outputs from the original reference engine on an
+Apple M5 Max with macOS 26.4, Apple Clang 21 and SDK 26.5. Three synthetic GGUF
+models cover DeepSeek4.1 MXFP4 and Muse Q4_K/Q5_K. Each model ran in two
+independent processes; each process made two KV-cleared requests. All four
+full-vocabulary float32 rows matched across those repetitions. The files here
+retain the first request of the first original recording, never regenerated
+expected outputs.
 
 The profile uses the actual Mac GGUF-alias reader, a 4 MiB LFU expert cache,
 read-ahead depth 2, 4096-byte alignment and expert prefill. Experts execute on
@@ -32,16 +33,17 @@ profiles and cannot be substituted for these bytes.
 
 ## Inputs and offline comparison
 
-`make-inputs.py` wraps the unchanged `experiments/c0-store/make-tiny.py` generator
-using NumPy 2.0.2, seed 20261022 and the recorded `gguf-py` source. Only the expert
+`make-inputs.py` wraps the unchanged `c0-store/make-tiny.py` generator using
+NumPy 2.0.2, seed 20261022 and the recorded `gguf-py` source. Only the expert
 count changes: DeepSeek=384 and Muse=256, so the actual production Mac reader
 guard is entered. The embedding width remains 256, with two layers and two
 selected experts. The original 16-expert Linux inputs do not cover this reader.
-Use source revision `27a69e724e36d8c054e42f64913d24c02a89eb4d` (F-prime) for
-the recipe: it contains the generator and exact recorded GGUF Python sources.
-The earlier F engine reference is unchanged and does not itself contain the
-later input generator. Verify all generated GGUF hashes against this manifest. The generator also
-writes auxiliary packs, but the Mac gate executes only GGUF aliases.
+The recipe was recorded at revision `27a69e724e36d8c054e42f64913d24c02a89eb4d`
+of this repository, which contains the generator and the
+exact recorded GGUF Python sources. The reference engine revision is earlier and
+does not itself contain the input generator. Verify all generated GGUF hashes
+against this manifest. The generator also writes auxiliary packs, but the Mac
+gate executes only GGUF aliases.
 
 ```sh
 python3 make-inputs.py --repo path/to/pinned/source --out path/to/new/inputs
@@ -75,9 +77,10 @@ cgroup or proof of an instantaneous unified-memory upper bound. The original
 gap remains documented and is not rewritten as a passing resource measurement.
 
 This reference is specific to the recorded M5/native/compiler/OS profile. On a
-different platform, first record frozen F on that same host/profile, then keep
-the byte-exact comparison. These tiny inputs omit DeepSeek compressed attention
-and do not revalidate production long contexts, large cache pressure, failure
-recovery, full-model quality or throughput. Run the included runner only under
-a reviewed controller with the device lock, STOP, deadlines, source/library
-identities and cleanup checks; this directory is an offline reference artifact.
+different platform, first record the reference engine on that same host/profile,
+then keep the byte-exact comparison. These tiny inputs omit DeepSeek compressed
+attention and do not revalidate production long contexts, large cache pressure,
+failure recovery, full-model quality or throughput. Run the included runner only
+under a reviewed controller with the device lock, STOP, deadlines,
+source/library identities and cleanup checks; this directory is an offline
+reference artifact.

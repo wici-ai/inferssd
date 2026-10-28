@@ -48,5 +48,5 @@ Use the [typed runtime guide](../framework/README.md#explicit-owned-server-execu
 for the required resource policy and settings. Replacing `--repo` with
 `--resources /deployment/engine.json` works from any current directory. The
 optional `probes` map names `io` and `memory` executable resources; it does not
-trigger automatic probing. Complete live bootstrap orchestration remains a
-separate feature.
+trigger automatic probing, and the launcher does not orchestrate a live
+bootstrap.

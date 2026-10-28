@@ -13,13 +13,13 @@ across requests, partial reclaim and reclaimable file accounting. The cgroup
 reserve is 512 MiB. Typed CPU affinity, participant count, prefetch depth,
 placement costs, host headroom, GPU budget, slot cap and margins remain inputs.
 Hardware topology, memory limits and device sharing are measured from the real
-host. No reader in this batch reads an environment variable.
+host. Readers do not read environment variables.
 
 The null-reader admission callbacks take the same context snapshot. They build
 an independent ledger with the explicit host headroom and device reserve, so an
 early graph allocation cannot silently use another context's defaults. Mutable
-prefill pages and interval accounting remain local; a process-wide admission
-owner is a separate integration layer.
+prefill pages and interval accounting remain local; process-wide admission
+belongs to the separate host arbiter.
 
 The CUDA reader uses a same-build typed-settings extension and refuses an absent
 or incompatible extension. Its supported profile fixes asynchronous/deferred
@@ -63,11 +63,10 @@ failure while preserving direct cache reads and fail-closed ring bypass checks.
 
 ## Integration and validation boundary
 
-This batch requires the typed settings/telemetry foundation and the separate
-native-location retirement closure. CLI/context/provider wiring, Mac source
-configuration, process-wide memory admission and the Python production launcher
-are separate modules. Test-only policy inputs are not a legacy environment
-translation layer.
+The reader depends on the typed settings and telemetry modules.
+CLI/context/provider wiring, Mac source configuration, process-wide memory
+admission and the Python launcher are separate modules. Test-only policy inputs are not an
+environment translation layer.
 
 Linux validation uses real io_uring and fresh 4 GiB memory scopes with swap
 disabled. The configured-reader gate compares two contexts against the CPU
@@ -76,6 +75,6 @@ checks pre-worker affinity refusal, early admission, real telemetry write
 failure, complete drain and joined workers. Additional gates cover direct and
 fixed reads, cache leases/reclaim, grouped prefill, trace/profile and prefetch
 fault paths. CUDA host syntax uses only official SDK headers; it does not count
-as CUDA execution. The integrated owned-device numerical/lifecycle gate remains
-required before accepting production CUDA integration. These are development
-checks and supply no formal benchmark samples.
+as CUDA execution. Accepting a CUDA build also requires the numerical and
+lifecycle checks on an owned device. These are development checks and supply no
+formal benchmark samples.

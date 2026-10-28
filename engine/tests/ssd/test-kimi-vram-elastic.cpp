@@ -205,7 +205,7 @@ int main() {
     // minimum count (2.5 here) decides. From the second token a free slot follows the price, not the minimum count,
     // and one expensive layer does not make the upload look cheap. In a table two tokens old one selection is a
     // count of 2 over its memory (half-life 2), worth 2.1 hits by the prior: a count-1 miss takes a free slot where
-    // an upload costs 0.3 misses (the Spark) and 2.1 (233) alike, and not where it costs 4.
+    // an upload costs 0.3 misses (a DGX Spark) and 2.1 (an RTX 5060 Ti) alike, and not where it costs 4.
     inputs.set("tier.global", "1");
     inputs.set("tier.policy", "count_decay2");
     inputs.set("tier.min_count", "2.5");

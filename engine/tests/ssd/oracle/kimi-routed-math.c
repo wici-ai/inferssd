@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Explicit historical math oracle; never linked into a production backend.
+// Explicit historical math reference; never linked into a production backend.
 #include "../../../ggml/src/ggml-cpu/ggml-cpu.c"
 #include "kimi-routed-math.inc"
 

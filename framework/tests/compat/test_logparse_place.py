@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""logparse.py on the decode plan's receipts (a stored snippet of 125's DSV log, 10-22): the destroy summaries of the
-plan and of the page-locking, the tier's host-path line with its v2 fields, and an engine before them (no receipt).
+"""logparse.py on the decode plan's receipts (a stored snippet of a DeepSeek log from an RTX 5090 host): the destroy
+summaries of the plan and of the page-locking, the tier's host-path line with its v2 fields, and an engine before them
+(no receipt).
 usage: python3 framework/tests/compat/test_logparse_place.py   (unittest; exit 1 on a failure)"""
 import os
 import sys

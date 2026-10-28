@@ -1,26 +1,35 @@
 InferSSD notices
-===============
+================
 
 Copyright (c) 2026 WiCi AI and the InferSSD contributors
 
-InferSSD additions and modifications are licensed under the Apache License,
-Version 2.0. See LICENSE. Components with their own license notices retain
-those licenses, including the MIT-licensed upstream engine.
+InferSSD is licensed under the Apache License, Version 2.0. See LICENSE.
 
-Existing notices in AUTHORS, engine/licenses/, engine/vendor/ and individual source files
-remain applicable. The project-wide Apache-2.0 license does not replace component
-licenses. No model weights are distributed with this source tree.
+InferSSD includes upstream and third-party components that keep their original
+licenses and notices. The MIT notices of llama.cpp, ggml and the projects
+adapted into InferSSD are listed below and in engine/LICENSE. They apply
+wherever that code appears, including code moved or adapted into the InferSSD
+paths listed under "InferSSD source under engine/". The Apache License does not
+replace them.
+
+The notices in engine/AUTHORS, engine/licenses/, engine/vendor/ and individual
+source files also remain applicable. No model weights are distributed with this
+source tree.
 
 1. llama.cpp and ggml
    https://github.com/ggml-org/llama.cpp
-   Copyright (c) 2023-2026 The ggml authors. MIT (engine/LICENSE).
+   The bundled engine is based on llama.cpp revision
+   f42e29fdf199481effd31f281bf095ec6067757b (upstream build b8961,
+   2026-04-28). Muse Spark model support is ported from upstream revision
+   ba3c05f71d. Copyright (c) 2023-2026 The ggml authors. MIT (engine/LICENSE).
 
 2. DeepSeek V4 support
    https://github.com/nisparks/llama.cpp
    Ported from Nicholas Sparks' MIT-licensed fork. Copyright (c) 2023-2026
-   The ggml authors. This includes the lightning-indexer kernel by Stanislaw
-   Szymczyk (llama.cpp PR 21149, via cchuter/llama.cpp), and a server fix by
-   tokencube / Zero (JARVIS). The MIT permission notice below applies.
+   The ggml authors. Earlier revisions also included the lightning-indexer
+   kernel by Stanislaw Szymczyk (llama.cpp PR 21149, via cchuter/llama.cpp),
+   which is no longer part of this source tree. The port includes a server fix
+   by tokencube / Zero (JARVIS). The MIT permission notice below applies.
 
 3. DeepSeek V4.1 runtime
    https://github.com/vcruz305/llama.cpp
@@ -30,27 +39,20 @@ licenses. No model weights are distributed with this source tree.
 4. Engram decode test reference
    https://github.com/antirez/ds4
    Source revision 8db1d1d155cb, ds4_engram.c. A short reference in
-   tests/test-dsv41-engram.cpp is transcribed from that implementation.
+   engine/tests/ssd/test-dsv41-engram.cpp is transcribed from that
+   implementation.
    Copyright (c) 2026 The ds4.c authors
    Copyright (c) 2023-2026 The ggml authors
    Copyright (c) 2023 DeepSeek
    The MIT permission notice below applies.
 
-5. ARM optimized-routines
-   https://github.com/ARM-software/optimized-routines
-   The expf algorithm and 32-entry exp2f table originate in math/expf.c and
-   math/exp2f_data.c. Copyright (c) 2017-2018 Arm Limited.
-   The MIT permission notice below applies to that original implementation.
-   The imported glibc-derived copies retain their LGPL notices, as listed below;
-   this attribution does not relicense those imported copies.
-
-6. ik_llama.cpp
+5. ik_llama.cpp
    https://github.com/ikawrakow/ik_llama.cpp
    Copyright (c) 2024-2025 The ik_llama.cpp authors.
    The MIT permission notice below applies.
 
-MIT permission notice for entries 1-6
-------------------------------------
+MIT permission notice for entries 1-5
+-------------------------------------
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -70,17 +72,43 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Historical reference math
--------------------------
+InferSSD source under engine/
+-----------------------------
 
-The former K3 parity component and its glibc/fdlibm reference math were removed
-from the live source before v0.1.0. Their original authorship and LGPL notices
-remain with the source snapshots in Git history; those historical notices are
-not replaced by the repository's Apache-2.0 license.
+These paths under engine/ hold InferSSD source:
+
+  common/inferssd/            src/inferssd/
+  ggml/src/ggml-cpu/ssd/      src/ssd/
+  ggml/src/ggml-cuda/ssd/     tests/ssd/
+  ggml/src/ggml-ssd/          tools/expert-pack/
+  include/llama-ssd.h         tools/inferssd-probe/
+                              tools/server/inferssd/
+
+Files in these paths are licensed under Apache-2.0 unless they carry a
+different SPDX-License-Identifier. Files there marked MIT contain code adapted
+from llama.cpp, ggml or a project listed above; that code keeps the MIT
+license. InferSSD changes and additions in those files are licensed under
+Apache-2.0.
+
+Elsewhere under engine/, engine/LICENSE covers the llama.cpp and ggml code and
+the code adapted from the projects listed above, unless a file carries a
+different SPDX-License-Identifier. InferSSD changes and additions there are
+licensed under Apache-2.0.
+
+Historical note: reference float math
+-------------------------------------
+
+Earlier InferSSD development revisions included a CUDA float reference
+component translated from glibc and fdlibm routines. Its expf algorithm and
+32-entry exp2f table originate in ARM optimized-routines
+(https://github.com/ARM-software/optimized-routines, math/expf.c and
+math/exp2f_data.c, Copyright (c) 2017-2018 Arm Limited, MIT). The glibc
+copies carried LGPL-2.1-or-later notices and the fdlibm copies carried Sun
+Microsystems notices. That component is not part of this source tree. This
+note acknowledges its origin and does not relicense it.
 
 External runtime dependencies
 -----------------------------
 
 liburing is not vendored. Binary distributions must comply with its selected
 license (the MIT option is available) and the NVIDIA CUDA runtime terms.
-No binary release is supplied by this source import.

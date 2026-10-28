@@ -1,11 +1,23 @@
 # Security policy
 
-The inference server binds to loopback by default and is intended to run on a trusted machine. Do not expose
-it directly to an untrusted network. Model files and configuration files must come from trusted sources.
+## Deployment
 
-Use this repository's private vulnerability-reporting channel when it is available. Do not put credentials,
-model data, deployment addresses or exploit details in a public issue. While private reporting is unavailable,
-contact the repository administrators through an existing private channel.
+The inference server binds to the loopback address by default and is intended to run on a trusted machine.
+Do not expose it directly to an untrusted network. Load only model files and configuration files from
+trusted sources.
 
-No released InferSSD version has been qualified yet. Security fixes will target the current development branch
-until the first release establishes the supported-version policy.
+## Reporting a vulnerability
+
+Report vulnerabilities privately through
+[GitHub private vulnerability reporting](https://github.com/wici-ai/inferssd/security/advisories/new).
+If you cannot use GitHub, email contact@wici.ai with "InferSSD security" in the subject.
+
+Do not open a public issue for a security problem, and do not post credentials, model data, deployment
+addresses or exploit details publicly.
+
+## Supported versions
+
+InferSSD has no formal release yet. Security fixes land on `main`.
+
+InferSSD bundles llama.cpp and ggml. Security advisories for those projects are assessed against the bundled
+version, and applicable fixes are backported.

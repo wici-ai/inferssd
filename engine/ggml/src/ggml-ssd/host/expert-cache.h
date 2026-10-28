@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 // Linux RAM expert-cache owner. Payload mappings, budget admission, first touch,
 // retention, reclaim and leases live here; executors borrow ranges for compute.
@@ -889,10 +889,10 @@ struct expert_cache {
     // role as a decode request reserves it; max_requests: the model's experts a token, as the first decode layer's
     // requests price the frequency nodes its admissions add), the arena, and the slots the guard admits now (all of
     // them when the cache was sized from this room) committed and paged in from `threads` threads, so that no decode
-    // token pays their first touch (13.8 ms a token over decode tokens 1-128 on 125, 1.77 s a cold start). Only a
-    // cache kept across requests keeps them through the first prefill, which may give slots back through the ledger
-    // as every later request's prefill does; the first decode adopts the arena whatever its epoch, and takes back
-    // what the room allows then (regrow). So only a cache that can give room back takes its storage here
+    // token pays their first touch (13.8 ms a token over decode tokens 1-128 on an RTX 5090, 1.77 s a cold start).
+    // Only a cache kept across requests keeps them through the first prefill, which may give slots back through the
+    // ledger as every later request's prefill does; the first decode adopts the arena whatever its epoch, and takes
+    // back what the room allows then (regrow). So only a cache that can give room back takes its storage here
     // (partial reclaim, or elastic): an arena that cannot would refuse the first prefill's ledger requests, where a
     // cache sized at the first decode token comes after them. The arena has the slots the first decode token would
     // size, when no prefill holds room; the slots committed leave the room the ledger holds for the first prefill's

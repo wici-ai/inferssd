@@ -1,13 +1,16 @@
 # Impact-selected physical CI
 
-The current operator entry is a maintainer's exact-head `/ci test` Comment review;
-see [review entry and results](REVIEW-ENTRY.md). It uses the preparer's existing
-permissions and reports in private Actions without a check App. This deployment
-executes the two Linux devices and only the 512/decode256 performance tier. Mac
-and any additional required tiers remain coverage gaps. Local protocol checks
-are separate from physical results. Formal benchmark samples: 0.
-The original guarded per-stage executors, device lease, STOP/quarantine, source
-freezer, exact PID/birth/listener and disconnect guardians remain authoritative.
+The current operator entry is a maintainer's exact-head `/ci test` Comment review
+on a PR from a branch in the source repository; see
+[review entry and results](REVIEW-ENTRY.md). It uses the preparer's existing
+permissions and reports in the private controller's Actions without a check App.
+It executes the explicitly enabled devices (`cloud-5090`, `dgx-spark`,
+`local-mbp`) and only the 512/decode256 performance tier. Omitted devices and any
+additional required tiers remain coverage gaps. Local protocol checks are
+separate from physical results, and these runs add no formal benchmark samples.
+The guarded per-stage executors, device lease, STOP/quarantine, read-only source
+and build copies, exact PID/birth/listener checks and disconnect guardians remain
+authoritative.
 
 ## Plan and scope
 
@@ -17,16 +20,17 @@ and shared runtime changes require all three allowlisted devices and both models
 CUDA-only changes select the two CUDA devices; Metal/Mac changes select the Mac.
 Explicit model graph files select that model. Current operator/format cases are
 listed in the fixed `CASES` catalogue. Model-adapter and runtime-policy changes
-also require their frozen descriptor/policy equivalence executables.
+also require their pinned descriptor/policy equivalence executables.
 
 A selected cell requires a real model request and its related numerical gates.
 A successful ADD row cannot satisfy MXFP4/Q8_0/Q4_K/Q5_K, normalization or SWIGLU.
 Unsupported/zero executed rows fail. CUDA tier cases retain their normal-provider
-CPU-reference oracles and original thresholds; no synthetic replacement runs on
-the device. Test/control-only changes still select functional and numerical gates;
+CPU reference comparisons and original thresholds; no synthetic replacement runs
+on the device. Test/control-only changes still select functional and numerical gates;
 changes affecting runtime/placement/resources require base/candidate performance.
-Ordinary performance uses the fixed Azure 512 prompt with decode 256. Only the
-explicit compressed long-context rule adds 4K. No automatic completion retry or
+Ordinary performance uses the fixed 512-token CI prompt
+(`bench/prompts/prompt-512.txt`) with decode 256. Only the explicit DeepSeek
+compressed long-context rule adds 4K. No automatic completion retry or
 best-of selection exists. Each cell records TTFT separately, native prefill and
 first/second 128-token and whole decode rates. The existing n=1 policy marks any
 observed slowdown inconclusive and blocks acceptance.
@@ -69,7 +73,7 @@ execution is used; see [GitHub's security guidance](https://docs.github.com/en/a
 
 ## Operator preparation (no deployment command)
 
-1. Freeze source base/head/candidate and the reviewed control commit. Export
+1. Pin source base/head/candidate and the reviewed control commit. Export
    control and both private workflow templates with `export_controller.py`, then
    review/install through the existing root operator process. Read the device's
    actual installed `control-source.json` revision and whole-file hash. The
@@ -90,17 +94,17 @@ execution is used; see [GitHub's security guidance](https://docs.github.com/en/a
    optional sandboxed `alias`, and `models` keyed by the exact selected models.
    Each model contains the existing eight-token `smoke` spec, `settings` and
    `template` (`host_path`, `runtime_path`, `sha256`), `model_identity.shards`
-   (`host_path`, `runtime_path`, historical hash, `stat` with device/inode/bytes/
+   (`host_path`, `runtime_path`, recorded hash, `stat` with device/inode/bytes/
    mtime_ns/ctime_ns), and `benchmarks` keyed by selected tier. Each benchmark
    uses the existing `staged_benchmark.benchmark` argv/environment/cwd/port,
    timeout_s/request_timeout_s and honest os_page_cache_treatment contract.
-   Candidate targets AND sealed image_relatives must cover every selected
-   numerical executable. Both arms must use the same resource cap, placement,
+   Candidate targets and the read-only build's `image_relatives` must cover
+   every selected numerical executable. Both arms must use the same resource cap, placement,
    model distribution, template and semantic typed settings. Native snapshots,
    real runtime image mappings and root-observed resources are checked.
    Before any selected 256-token request, every selected performance model/tier
    runs both sides' eight-token preflight with that performance arm's environment,
-   working directory and arguments. The operator seals a separate `preflight_argv`;
+   working directory and arguments. The operator pins a separate `preflight_argv`;
    only the single private `--ssd-telemetry` file may differ from the timed argv,
    and both destinations are distinct canonical files within that side's scratch
    directory. A candidate functional smoke is reused only when its complete
@@ -140,42 +144,42 @@ returns zero. Only that exact reason, dedicated job scope and positive empty
 worker/domain cleanup is classified as a requested stop. Deadline, resource,
 STOP, quarantine, nonzero server exit or incomplete cleanup is still rejected.
 
-macOS control must include the read-only `resource_policy` probe field added in
-this branch, so the compared envelope is the actual continuously enforced root
-executor policy. Old probes fail closed. An unresolved model admission cannot be
+macOS control must include the read-only `resource_policy` probe field, so the
+compared envelope is the actual continuously enforced root executor policy. Old probes fail closed. An unresolved model admission cannot be
 converted to a skip, an alternate model, a smaller budget or a green result.
 
-## Activation boundary observed on 2026-10-24
+## App-mode activation prerequisites
 
-The real private controller main was `769dde5b9b37b8b462c3f65bbfce62331b548511`;
-its branch API reported `protected=false`. The source repository had no open PR
-and therefore no exact-head approval for this batch. Those are actual activation
-blocks, not permission to relax the contract. Existing root-stage readiness runs
-use a different manual authorization path. Cloud DeepSeek and Spark Muse model
-admission gaps also remain explicit; inventory alone is not model admission.
-No settings, protection rule, runner installation or dispatch was changed here.
+The App publication mode requires a protected controller `main` and an
+exact-head approval on an open source PR. A missing prerequisite blocks
+activation; it is not permission to relax the contract. Root-stage readiness
+runs use a separate manual authorization path. Model admission gaps on any
+device remain explicit; a file inventory alone is not model admission.
 
-Spark's existing UID1001/0664 GGUF originals may be used only through their
-root-controlled per-file readonly views. A selected root configuration must
-explicitly bind the existing `model_admission_path`/`model_admission_sha256`,
+## Read-only model views
+
+GGUF originals owned by an operator account (for example, group-writable files
+on a shared development host) may be used only through root-controlled per-file
+read-only views. A selected root configuration must explicitly bind the
+existing `model_admission_path`/`model_admission_sha256`,
 `model_mount_proof_path`/`model_mount_proof_sha256`, and `prior_model_job_id`.
 Those small metadata files remain protected and immutable; `protected()` is not
 relaxed for GGUFs, settings, code, or proofs. The receipt checks the exact selected
 shards, original payload hashes and source/view identities, current view stats,
 and exact host readonly mounts without copying, chowning, or rehashing payloads.
-The proof's `source_path` is historical provenance; live checks cover the actually
+The proof's `source_path` is recorded provenance; live checks cover the actually
 consumed readonly view and never fall back to the original source path.
-Missing or previously removed views refuse admission. This connection does not
-provision views or turn the old manual proof into automatic PR authorization.
+Missing or previously removed views refuse admission. This path does not
+provision views or turn a manual mount proof into automatic PR authorization.
 
 The existing StageSession protocol runs `model-readonly-before` as a build stage
 before freeze and `model-readonly-after` as a test stage after native work. Both
 use the fixed Python probe: GGUF magic readable, model/source O_RDWR denied, and
-model-parent O_TMPFILE denied. Counts derive from the selected mount set. The
-old proof's “required separately” text is not a passed worker check. The retained
-admission gate binds the two real probes to this job's manifest, handles, PID and
+model-parent O_TMPFILE denied. Counts derive from the selected mount set. A
+mount proof that only states a check is required is not a passed worker check.
+The retained admission gate binds the two real probes to this job's manifest, handles, PID and
 birth identities, scopes, original lease and positive guardian/job cleanup. The
 hosted aggregate reconstructs that gate and rejects missing or stale evidence.
-Ordinary root-owned model inputs and the existing Mac protocol retain their
-previous contract. Root staging and actual device readiness remain separate
+Ordinary root-owned model inputs and the Mac protocol keep their own
+contracts. Root staging and actual device readiness remain separate
 operator prerequisites; local contract tests establish neither.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include "ggml-ssd/store/object-identity.h"
 #include "ggml-ssd/io/object-uring.h"

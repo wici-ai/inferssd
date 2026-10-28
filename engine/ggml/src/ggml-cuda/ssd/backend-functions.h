@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include "ggml-cuda.h"
 #include <cuda_runtime_api.h>

@@ -17,10 +17,10 @@ The initial deployment needs root installation of the reviewed control files,
 their `config.installed_files` hashes, and a dedicated restricted SSH key whose
 forced command allows only the fixed root stager. Any sudo grant must name that
 fixed installed interpreter/script/argument shape; no general Python, shell,
-user-supplied script, personal password storage or candidate credential is
+user-supplied script, stored account password or candidate credential is
 required. Recovery does not install keys, sudo rules or services itself. The
-original Documents lock and STOP paths stay unchanged. No TCC, Full Disk Access,
-sshd or personal-home policy is changed.
+original device lock and STOP paths stay unchanged. No TCC, Full Disk Access,
+sshd or home-directory policy is changed.
 
 `broker.status` is a root-only operation and does not create a job or acquire the
 device lease. It returns the startup configuration SHA256, installed-file table,
@@ -48,17 +48,17 @@ still cleaning a worker. Recovery never kills a broker, guardian or worker.
 Startup failure retains its private log and does not retry a native operation.
 An active broker's configuration cannot be silently refreshed in place.
 
-The previously installed detached broker has no `broker.status` contract. Its
-one-time migration requires a separate reviewed root operation that proves the
-exact PID/birth, worker emptiness, original-lease availability and STOP absence
-before retiring it. A missing launchctl service or an existing socket is
-insufficient. After this migration each fresh authorized stage can recover a
-missing broker through the fixed SSH entry, including after reboot. Native
+A broker that predates the `broker.status` contract cannot be recovered this
+way. Retiring it requires a separate reviewed root operation that proves the
+exact PID/birth, worker emptiness, original-lease availability and STOP absence.
+A missing launchctl service or an existing socket is insufficient. Once only
+status-capable brokers remain, each fresh authorized stage can recover a missing
+broker through the fixed SSH entry, including after reboot. Native
 TCC/Metal, disconnect and fresh human-authorized `/ci test` validation remain
 required before claiming unattended device CI is active.
 
 The reviewed `operator_entry.py` is installed with identical bytes at the fixed
-`control/operator-ssh-entry` and `control/operator-root-entry` paths. Its frozen
+`control/operator-ssh-entry` and `control/operator-root-entry` paths. Its pinned
 Xcode Python shebang uses isolated mode. The first admits only the exact fixed
 stager argv and one lowercase SHA256 from `SSH_ORIGINAL_COMMAND`, then invokes
 `sudo -n` on the second. The second requires root and revalidates that sole digest

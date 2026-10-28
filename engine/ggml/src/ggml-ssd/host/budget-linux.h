@@ -7,7 +7,7 @@
 // zone's boost by a pageblock whenever an allocation falls back to another migratetype (mm/page_alloc.c,
 // boost_watermark), up to max(pageblock, high watermark * vm.watermark_boost_factor / 10000), and kswapd takes it
 // back once the zone is balanced. So MemAvailable falls and rises by up to that much with nothing allocated or
-// freed, and large allocations into a nearly full DRAM are what raise the boost (on the GB10 Spark ysy9 the Normal
+// freed, and large allocations into a nearly full DRAM are what raise the boost (on a DGX Spark (GB10) the Normal
 // zone's largest boost is 437 MiB and MemAvailable moves by about 560 MiB between no boost and the largest).
 //
 // Whoever fills the DRAM up to a floor measured on MemAvailable must not take what the boost can withdraw: memory

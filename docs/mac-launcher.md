@@ -1,8 +1,9 @@
 # Apple Silicon deployment
 
 Apple Silicon uses the same installed `inferssd launch` entry point and typed
-settings contract as Linux. The current support stage is static M1; online
-adaptive Mac M2 remains a separate task.
+settings contract as Linux. `inferssd launch` applies static settings on both
+platforms; the online controller is exposed only on Linux through the Python
+API and is not implemented on macOS.
 
 ```sh
 cmake --preset macos-metal
@@ -24,9 +25,9 @@ supported cache and thread settings; the native process retains its RSS guard,
 cache pin ownership and drain behavior. Model-specific cache sizes need measured
 memory evidence and are not inferred from machine RAM alone.
 
-Environment-driven launch scripts are retired public interfaces. Their preserved
-copies are test oracles only; do not run them as production commands. Historical
-Mac reports describe their original settings and do not validate the current
-revision. See [deployment resources](engine-resources.md) for a wheel installation
-that works without a checkout and [measurement tools](../bench/macos/README.md)
-for separate numerical and performance evidence.
+Earlier environment-driven launch scripts are not supported interfaces. Copies
+kept under `framework/tests/fixtures` are test inputs only; do not run them as
+production commands. See [deployment resources](engine-resources.md) for a wheel
+installation that works without a checkout and
+[measurement tools](../bench/README.md) for separate numerical and
+performance evidence.

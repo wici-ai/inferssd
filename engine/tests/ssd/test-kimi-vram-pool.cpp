@@ -195,11 +195,11 @@ int main() { try {
     }
     // A young table's counts read low: after two tokens an expert has at most 1.96 selections, where one selected
     // every token reaches about 23 (half-life 16). Where counts meet what admissions earned they are taken over the
-    // table's memory. Four experts admitted at count 1 in the second token, priced as on 233 (0.59 hits an upload),
-    // turn out hot: hit in each of the next 30 tokens. They are recorded with the hottest counts, so the expected
-    // hits of a count-1 admission stay the prior's, and in the mature table a new count-1 miss priced at 2 hits is
-    // refused (recorded at count 1 they made it 15.6). The fixed minimum count keeps raw counts: the first token
-    // admits nothing at 2.5, though one selection is 23.6 over the memory.
+    // table's memory. Four experts admitted at count 1 in the second token, priced as on an RTX 5060 Ti (0.59 hits an
+    // upload), turn out hot: hit in each of the next 30 tokens. They are recorded with the hottest counts, so the
+    // expected hits of a count-1 admission stay the prior's, and in the mature table a new count-1 miss priced at 2
+    // hits is refused (recorded at count 1 they made it 15.6). The fixed minimum count keeps raw counts: the first
+    // token admits nothing at 2.5, though one selection is 23.6 over the memory.
     {
         vram_slot_table t(8,{1},true,2.5,true,16);
         kimi_vram_request first[4],cohort[4];

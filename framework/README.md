@@ -4,8 +4,8 @@ The package supplies typed settings, source metadata, an owned inference runtime
 and recorded calibration/planning tools. The production `launch` command consumes
 `inferssd-settings 1` and explicit CLI overrides. It supervises one local server;
 Linux also exposes a typed controller factory. Mac currently supports static
-launch only; online adaptive Mac M2 remains deferred. The runtime uses only the
-Python standard library.
+launch only; online adaptive control on Mac is not implemented yet. The runtime
+uses only the Python standard library.
 
 ## Commands and artifacts
 
@@ -74,8 +74,8 @@ creation `user_manager` and `memory_controller`. GPU-enabled Linux settings also
 require `gpu_available` and empty `gpu_processes`. These observations do not
 certify native source formats, GPU kernels or real resource enforcement.
 
-The old Linux/Darwin resolvers and their F observations are retained behind
-`launch-recorded --dry-run`. They still describe the historical settings/env
+The old Linux/Darwin resolvers and their recorded reference observations are
+retained behind `launch-recorded --dry-run`. They still describe the historical settings/env
 contract, and cannot execute a server. Their golden outputs are not observations
 of the new typed production launch. Header-only source and recorded planning
 commands below continue to accept their documented historical artifact formats.
@@ -143,37 +143,39 @@ recorded machine's CPU count from the current host.
 
 ## Compatibility and failure behavior
 
-The reference framework F is frozen at
-`8b12192920b339a4ef31c9006d1ebe20304ce45a`; verbatim source oracles and synthetic
-observations are under `tests/fixtures`. Extraction preserves arithmetic, sum and
-mapping order, stable ties, rounding, mutable replay state, borrowed references,
-callback order and exception timing. Composed expectations come from the complete
-original F call graph, including request output → calibration → plan → reload → settings
-→ Controller → recorded report.
+The package was extracted from earlier adaptive scripts. Their recorded
+reference revision is `8b12192920b339a4ef31c9006d1ebe20304ce45a` (fixture files
+call it `F`); verbatim reference sources and synthetic observations are under
+`tests/fixtures`. Extraction preserves arithmetic, sum and mapping order, stable
+ties, rounding, mutable replay state, borrowed references, callback order and
+exception timing. Composed expectations come from the complete reference call
+graph, including request output → calibration → plan → reload → settings →
+Controller → recorded report.
 Toy logs are synthetic inputs, not claimed engine-run evidence. Historical
 archives establish only their actual recorded input coverage.
 
-The installation requires Python 3.9 or later. Normal-wheel regression and exact
-F transcripts are verified on Python 3.9 and 3.12. Their original results can
-differ because of float summation, resident-set iteration or native exception
-wording. Tests retain separate runtime transcripts and compare exactly within
-each runtime, without a numeric tolerance or production version branch. Frozen
-transcript checks select only those two versions; direct F comparisons that do
-not require a recorded transcript still run. Future versions are not assumed
-identical to either verified runtime.
+The installation requires Python 3.9 or later. Normal-wheel regression and
+exact reference transcripts are verified on Python 3.9 and 3.12. Their original
+results can differ because of float summation, resident-set iteration or native
+exception wording. Tests retain separate runtime transcripts and compare exactly
+within each runtime, without a numeric tolerance or production version branch.
+Recorded transcript checks run only on those two versions; direct comparisons
+with the reference sources that do not require a recorded transcript still run.
+Future versions are not assumed identical to either verified runtime.
 
 Most legacy artifact and model mappings are typing views, not new schemas. They
 are not copied, normalized, validated or filled with defaults on ingestion.
 Missing, null, empty and zero values retain distinct behavior, including failures
-when consumed. For example, replay keeps F's length-only incremental-segment
-check and duplicate-hit behavior; workload iterators retain their consumption
-order; singular/empty fits are not repaired. `fit_response` returns a tuple rather
-than F's list, and calibration immediately consumes it in the original rounded
-list comprehension. Complete-command tests bind those results and failures.
+when consumed. For example, replay keeps the reference's length-only
+incremental-segment check and duplicate-hit behavior; workload iterators retain
+their consumption order; singular/empty fits are not repaired. `fit_response`
+returns a tuple rather than the reference's list, and calibration immediately
+consumes it in the original rounded list comprehension. Complete-command tests
+bind those results and failures.
 
 Two explicit typed APIs have stricter boundaries:
 
-- `DeviceProfile` validates schema 2 and uses frozen nested records. It rejects
+- `DeviceProfile` validates schema 2 and uses immutable nested records. It rejects
   unknown schema versions and lane fields, missing required fields, numeric
   strings, booleans as
   numbers, non-finite/out-of-range numbers and non-integer expert byte sizes.
@@ -181,10 +183,11 @@ Two explicit typed APIs have stricter boundaries:
   preserve arbitrary JSON whitespace or unknown extension fields. Old artifacts
   missing required observations need an explicit adapter, not fabricated facts.
 - `LayerResponse` validates finite layer/count/beta values and integer `pf_k`.
-  Its `price_decode` adapter uses the single Mapping-based F pricing core,
-  `price_mapping`, and preserves successful results. Uncapped null readiness
-  raises F's native `TypeError` at exponentiation rather than the adapter's former
-  custom message; the exception class and empty-range behavior are unchanged.
+  Its `price_decode` adapter uses the single Mapping-based reference pricing
+  core, `price_mapping`, and preserves successful results. Uncapped null
+  readiness raises the reference's native `TypeError` at exponentiation rather
+  than the adapter's former custom message; the exception class and empty-range
+  behavior are unchanged.
 
 The recorded probe loader preserves the full-path queue-depth regex, even when a
 parent directory's `qd8` precedes the filename's `qd1`. Malformed/unreadable read
@@ -198,16 +201,16 @@ Source header reads retain the original mmap lifetime and decoding: metadata
 strings use replacement decoding, while textual artifacts and pack tensor names
 use strict decoding. Split-model discovery uses the original sorted glob and does
 not newly reject missing shards. Type 42 (`F8_E4M3_B128`) remains recognized as
-historical header metadata; this does not claim native execution support. Its
-metadata compatibility is separate from the C1 native format retirement work.
+historical header metadata; this does not claim native execution support.
 
 `source index` retains mtime-based reuse, including the original set iteration over
-source paths. Frozen filesystem transcripts use `PYTHONHASHSEED=0` as a test
+source paths. Recorded filesystem transcripts use `PYTHONHASHSEED=0` as a test
 condition; dynamic comparisons also check another seed. Production iteration is
 unchanged. GGUF alias output is closed and replaced before the expert JSON is
 written. Failure can leave a directory, temporary file or the already-published
-alias, as in F. Pack indexing does not create a GGUF alias. Dense placement keeps
-input order and validates each consumed line before writing its alias. No new
+alias, as in the reference. Pack indexing does not create a GGUF alias. Dense
+placement keeps input order and validates each consumed line before writing its
+alias. No new
 whole-artifact validation, transaction, random seed default or filesystem probe
 is inserted into these paths.
 
@@ -222,8 +225,8 @@ host or process work.
 `fit` directly writes the compact model profile before drive normalization and
 optional ubatch processing. It writes the indented insitu artifact before printing
 the report. Later errors can leave one or both files, including partial output.
-The temporary streams passed to `json.dump` retain F's implicit-close behavior;
-there is no transaction or new explicit `with` block.
+The temporary streams passed to `json.dump` retain the reference's implicit-close
+behavior; there is no transaction or new explicit `with` block.
 
 `plan` reads insitu, device and model artifacts in that order. A saved plan is
 read lazily only when `pending is None`; an explicitly empty pending sequence
@@ -236,7 +239,7 @@ the actual elapsed time.
 including its historical `framework/tests/fixtures/adaptive/settings.py` comment label. The label
 identifies the retained format, not the executable used. Writing to a file uses
 `OUT.tmp` followed by replacement; write, close or replacement failure can leave
-the temporary file, as in F. With no `-o`, output goes to stdout.
+the temporary file, as in the reference. With no `-o`, output goes to stdout.
 
 `report` keeps the complete legacy comparison: static prefill predictions by route
 and tier state, controller decisions, decode-placement flags and final ordered
@@ -252,7 +255,7 @@ Report text and field names remain legacy formats, not new measurement claims.
 | Area | Modules and boundary |
 | --- | --- |
 | Source metadata | `source.header`, `source.experts`, `source.files`, `source.command`: header/parser and legacy artifact operations with explicit filesystem, output and random ports |
-| Device facts | `contracts`, `probe.device_profile`: frozen validated device records and pure report aggregation |
+| Device facts | `contracts`, `probe.device_profile`: immutable validated device records and pure report aggregation |
 | Recorded I/O | `probe.recorded`, `telemetry.files`, `telemetry.recorded`, `telemetry.legacy`: injectable file access and legacy arm observations |
 | Cost and replay | `model.decode_cost`, `model.routing_replay`: fitting/pricing and mutable tier/RAM/replay state |
 | Prefill | `model.prefill_lane`, `prefill_workload`, `prefill_model`, `prefill_calibration`, `prefill_memory`, `prefill_feedback`: pure costs, geometry, calibration and explicit feedback callbacks |
@@ -273,9 +276,9 @@ validated contract.
 ### Controller model and observation ownership
 
 `ObservationSession(files=...)` owns the arm cache and incremental parser/offsets.
-One session preserves one isolated F online module's behavior; independent sessions
-are isolated rather than sharing F's hidden globals. Reusing a session explicitly
-shares its cache. A gzip key retains directory, skip, size and mtime; a live stream
+One session reproduces one isolated instance of the reference online module;
+independent sessions are isolated rather than sharing that module's hidden
+globals. Reusing a session explicitly shares its cache. A gzip key retains directory, skip, size and mtime; a live stream
 keeps incomplete trailing lines and the original stale-offset behavior after
 truncation. This is the legacy observation format, not versioned engine telemetry.
 
@@ -286,10 +289,10 @@ HTTP, files, environment, clock and stdout calls occur at their original sites.
 No native Engine, HTTP default, process discovery or live CLI is provided.
 The old Engine's port-based termination fallback is not copied into the package.
 
-Transitions retain F's mutation and failure behavior: `prepare` returns borrowed
+Transitions retain the reference's mutation and failure behavior: `prepare` returns borrowed
 lists, `note` mutates its supplied record, and `after` appends the turn before its
 event/count update. A displacement catches only `OSError`. `close()` stops the
-current engine without explicitly closing the event stream, as in F. Applications
+current engine without explicitly closing the event stream, as in the reference. Applications
 must not treat this model-only extraction as a complete native resource owner.
 The synthetic tests use fake engines and HTTP callbacks; they establish no real
 server lifecycle, online performance or device integration claim.
@@ -314,7 +317,7 @@ catches only OSError; other failures do not acquire a newly invented finally
 cleanup. Its normal path still stops the Controller then records done. These
 interfaces are not a native resource-ownership adapter or a live CLI.
 
-The F observations freeze at command return. A fixture may later close its retained
+Recorded reference observations end at command return. A fixture may later close its retained
 event stream during object collection; that test cleanup cannot mutate a returned
 transcript. Tests separately preserve the original open event stream and internal
 borrowed-reference behavior.
@@ -420,15 +423,13 @@ adaptation or live probe/bootstrap orchestration.
 
 ## Remaining integration boundaries
 
-Live probe/bootstrap orchestration and replacing the old `tools/adaptive` command
-remain separate work. The native C3/context integration must be validated with
-this installed package on each target host; Python substitutes for OS effects
+Live probe/bootstrap orchestration remains separate work. The native context
+integration must be validated with this installed package on each target host; Python substitutes for OS effects
 or synthetic model headers do not establish native execution correctness.
 No new performance conclusion follows from these package tests.
 
-Mac automatic framework planning and the common CPU executor/cache belong to the
-later **Mac M2 migration stage**; “M2” names a project stage, not an Apple chip.
-The static Darwin production path rejects the adaptive factory. Importing these
+Mac automatic framework planning and a common CPU executor/cache are not
+implemented yet. The static Darwin production path rejects the adaptive factory. Importing these
 modules starts no process, host probe or network call.
 
 ## Development checks
@@ -442,8 +443,8 @@ ruff format --check framework
 
 Use a mypy release supporting the configured Python 3.9 target (verified with
 1.18.2). CI installs the normal package before running its tests and these checks.
-The preserved oracle sources are intentionally excluded from formatting/lint
-rewrites.
+The preserved reference sources under `tests/fixtures` are intentionally
+excluded from formatting/lint rewrites.
 
 ## Installed engine resources
 

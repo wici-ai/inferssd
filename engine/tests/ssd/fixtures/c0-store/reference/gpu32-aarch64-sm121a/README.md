@@ -1,10 +1,10 @@
 # Recorded GPU32 raw-output reference
 
-These outputs were recorded from the original F engine in six tiny model/source
-cases, then compared with the extracted shared-provider candidate. Every case
-matched all four complete float32 rows and all four independently selected
-argmax tokens exactly. The files here retain the original F rows. They are
-executed reference outputs, not generated expectations.
+These outputs were recorded from the original reference engine in six tiny
+model/source cases, then compared with the extracted shared-provider candidate.
+Every case matched all four complete float32 rows and all four independently
+selected argmax tokens exactly. The files here retain the original reference
+rows. They are executed reference outputs, not generated expectations.
 
 The profile uses 32 input tokens, GPU graph prefill with BATCH1 io_uring expert
 transport, then three single-token CPU-sink decode calls. Those four calls yield
@@ -62,8 +62,8 @@ per process; Muse exercised three. This does not require every prefill layer to
 run on GPU: the engine can prune the final layer to its requested output.
 
 This is a reference for this exact architecture, compiler/ISA profile, inputs
-and request protocol. It is not a cross-platform checksum, GPU-decode or VRAM-tier
-golden, throughput benchmark, proof of explicit main-ring queue destruction,
-failed-drain recovery, or hot backend unloading. On another architecture or
-compiler profile, first record the frozen baseline on that same host/profile;
-keep the byte-exact comparison requirement.
+and request protocol. It is not a cross-platform checksum, GPU-decode or
+VRAM-tier golden, throughput benchmark, proof of explicit main-ring queue
+destruction, failed-drain recovery, or hot backend unloading. On another
+architecture or compiler profile, first record a baseline on that same
+host/profile; keep the byte-exact comparison requirement.

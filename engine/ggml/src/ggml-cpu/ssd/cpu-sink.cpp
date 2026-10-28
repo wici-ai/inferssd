@@ -1579,9 +1579,9 @@ struct kimi_cpu_sink {
         // share of the time they would save, and goes to the registrar once that reaches one registration (the
         // registrar's measured mean, before the first one slot at 13.6 GB/s). Before a page-locked copy is measured a
         // copy is priced free, which is no price: nothing accrues, and only the first slot even a free copy would move
-        // from is locked, whose registration measures the copy (the tier times one copy of the first range). On 125 a
-        // registration in the server takes 2-8 ms against a move's 0.1-0.4 ms: only slots the plan keeps wanting are
-        // locked, and a short decode locks few.
+        // from is locked, whose registration measures the copy (the tier times one copy of the first range). On an
+        // RTX 5090 a registration in the server takes 2-8 ms against a move's 0.1-0.4 ms: only slots the plan keeps
+        // wanting are locked, and a short decode locks few.
         if (in_place) { return; }
         const auto wanted = ssd::place::plan_locks(table, slots.size(), items, limits, placed.time);
         if (!wanted.considered) { return; }
@@ -1692,7 +1692,7 @@ struct kimi_cpu_sink {
     // In a decode layer's wait for reads (io_mutex held): the reads left, at the drive's decode rate, as the shadow a
     // registration may take (kimi_host_lock::offer; before the first registration its price is one slot at 13.6 GB/s).
     // Only wanted slots: a page-locked slot's admission upload is a DMA copy, cheaper, and the tier's admission rule
-    // then admits more; with every slot page-locked (25cbe36) 125 admitted 15% more, evicted 25% more and, the RAM
+    // then admits more; with every slot page-locked an RTX 5090 admitted 15% more, evicted 25% more and, the RAM
     // copies of admitted experts dropped (exclusive), read 2.5% more experts from the drive.
     void host_lock_in_shadow() {
         host_lock_decide();

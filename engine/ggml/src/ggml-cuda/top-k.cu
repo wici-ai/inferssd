@@ -237,9 +237,9 @@ static bool top_k_warp(const float * src, int * dst, const int ncols, const int 
             }
             return true;
         case 896:
-            // Private canonical for the Task 132 K3 spike.  With the guard
-            // absent, the legacy 896-column path remains byte-for-byte on its
-            // former CUB fallback.
+            // Kimi K3 pipeline top-k (k = 16 over 896 columns). With the guard
+            // absent, the 896-column path stays byte-for-byte on its former
+            // CUB fallback.
             if (k != 16 || !kimi_pipeline_top_k_enabled()) {
                 return false;
             }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 // Small strict JSON boundary shared by settings path lists and JSONL payloads.

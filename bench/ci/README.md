@@ -1,164 +1,186 @@
-# Private physical-device CI admission
+# Physical-device CI
 
-## Delivery scope
+InferSSD's normal CI runs on GitHub-hosted runners. Checks that need real
+hardware (CUDA and Metal builds, numerical operator checks, real model requests
+and a base/candidate performance comparison) run separately on
+maintainer-operated devices. This directory contains the controller code, the
+per-device stage brokers and their contracts.
 
-The deployed operator path accepts an exact-head `/ci test` Comment review from
-a source maintainer, including for an external fork. It uses existing account
-permissions and the private controller's Actions report, without a check App.
-It seals the required base/candidate sources and reuses `StageSession` for the
-impact-selected functional/numerical checks and 512/decode256 comparison on
-explicitly enabled Linux and Mac devices. Mac requires its existing root executor
-and separately reviewed SSH staging bootstrap. See [review entry, results and limits](REVIEW-ENTRY.md)
-and [operator preparation](OPERATOR-PREPARE.md). Historic functional-only runs
-remain functional-only; deployment is not performance evidence.
+This repository has **no physical self-hosted runner**. Its
+`.github/workflows/device-performance.yml` only previews the impact selection on
+a GitHub-hosted runner. Physical execution is coordinated by a separate private
+controller repository, `wici-ai/inferssd-device-ci`, which receives a reviewed
+export of this directory. A different workflow could otherwise request the same
+runner labels and bypass the controller's checks; runner labels and fork-workflow
+approval are not access controls. GitHub documents the persistent compromise and
+credential risks of self-hosted runners in its
+[secure use guidance](https://docs.github.com/en/actions/reference/security/secure-use#hardening-for-self-hosted-runners).
 
-The current private manual path uses `StageSession` and the independently
-provisioned per-stage broker. `controller/integration-smoke.workflow.yml` builds
-one reviewed source, requires actual CUDA/Metal numerical operations, and makes
-one eight-token request per selected model on any of the three admitted devices.
-Its readiness/evidence/cleanup/performance states are separate; 233 and 125 are
-not CI devices.
-`controller/checkpoint.workflow.yml` builds the fixed f5 baseline and reviewed
-candidate, then records one Muse 512/256 request per side under the same lease.
-See [the checkpoint instructions](controller/CHECKPOINT.md). Its actual
-`checkpoint.json` determines success, failure or inconclusive performance;
-installing this code or running the smoke is not a performance result.
+## Authorization
 
-The separate App-published three-device/two-model PR workflow remains an **unactivated deployment
-template**. Its admission/finalization contract and the current stage broker
-still require full end-to-end integration and native gates on all devices. Keep
-that publication path inactive; do not require or publish its App check
-merely because the manual checkpoint or this aggregate code change succeeds.
+Device checks are authorized by a maintainer for PRs from branches in this
+repository. A maintainer with current write access submits a Comment review whose
+complete body is `/ci test`; GitHub binds the review to the exact current head.
+See [review entry, results and limits](REVIEW-ENTRY.md).
 
-The public InferSSD repository must have **no physical self-hosted runner**.
-Its device workflow is informational and GitHub-hosted only. A different
-workflow could otherwise request the same labels and bypass this module's
-preflight. Runner labels and fork-workflow approval are not access controls.
-GitHub documents persistent compromise and credential risks on self-hosted
-runners, including after environment approval. See [secure use](https://docs.github.com/en/actions/reference/security/secure-use#hardening-for-self-hosted-runners).
+External fork PRs do not currently run on physical devices. Admission requires
+the latest successful hosted CI run for the exact head to be associated with
+exactly that PR, and GitHub does not associate workflow runs from forks with the
+PR. Fork PRs therefore receive hosted CI only. To test an external contribution
+on devices, a maintainer can open a PR from a branch in this repository with the
+reviewed change and authorize that head.
 
-Physical execution belongs only to the separately private
-`wici-ai/inferssd-device-ci`. `controller/device-performance.yml` is exported to
-that controller; it is not an active workflow in the public source repository.
-The deployed operator requires its reviewed `INFERSSD_CI_ENABLED=true` activation
-gate. That variable alone does not authorize the separate App publication path
-or establish all-three-device coverage. This code installs no runner and changes
-no host or GitHub settings.
+An authorization is valid only for its exact head, base and GitHub test merge.
+A new push, base change, dismissal, later `/ci cancel` or change request, or loss
+of write permission withdraws it. Ordinary issue comments, labels and prose are
+not commands, and a test authorization does not approve a merge.
 
-## Exact source authorization
+## Execution paths
 
-A maintainer supplies both a PR number and the full SHA. Admission requires:
+- **Review-authorized operator (deployed).** `review_operator.py` runs on a
+  trusted preparation host. It prepares exact sources with
+  [operator preparation](OPERATOR-PREPARE.md), stages them on each enabled
+  device through a root-owned stager, and dispatches the private controller's
+  `device-performance.yml`. The controller runs the
+  [impact-selected](SELECTIVE-CI.md) functional, numerical and 512/256
+  performance checks with `StageSession` on the explicitly enabled devices, and
+  reports in its Actions Summary and artifacts. It does not publish a check on
+  the source PR.
+- **Manual readiness and checkpoint workflows.**
+  `controller/integration-smoke.workflow.yml` builds one reviewed source and makes
+  one short request per selected model on one device
+  ([instructions](controller/INTEGRATION-SMOKE.md)).
+  `controller/checkpoint.workflow.yml` compares a fixed legacy baseline with one
+  reviewed candidate on one Muse 512/256 cell
+  ([instructions](controller/CHECKPOINT.md)). Neither replaces the full device
+  gate.
+- **App-published check (inactive template).** A dedicated check App would
+  publish `InferSSD device performance` on the source PR. Its admission and
+  finalization contract still requires full end-to-end integration and native
+  gates on all devices, so it stays inactive. Do not require or publish its check
+  because a manual workflow or the review operator succeeded.
 
-- An open non-draft same-repository PR into `main`, from a protected
+The controller requires the reviewed `INFERSSD_CI_ENABLED=true` activation
+variable. That variable alone does not enable the App publication path or
+establish coverage of every device. This code installs no runner and changes no
+host or GitHub settings.
+
+## App-mode source admission
+
+The inactive App mode uses a stricter admission. A maintainer supplies both a PR
+number and the full SHA, and admission requires:
+
+- An open, nondraft same-repository PR into `main`, from a protected
   `device-ci/approved/` staging branch, still at the supplied SHA.
-- An independent maintainer's latest non-comment review explicitly approving
-  that SHA, with a standalone review-body line
-  `[device-ci-approved:FULL_40_CHARACTER_SHA]` explicitly authorizing physical
-  execution. An ordinary code review is insufficient. Dismissal, requested changes, lost write permission, or a different
-  commit blocks execution. Author association alone grants no permission.
-- A current merge candidate whose parents are exactly the frozen base and head.
-- The latest normal CI run/attempt for that head and base, with the expected
-  workflow ID/path, completed successfully. An older success is not selected.
-- A private controller dispatch on the protected workflow/ref, with current
-  actor permission. Controller workflow SHA, run ID and attempt, source origin,
-  review IDs, base/head/candidate and complete changed-file listing enter the plan.
+- An independent maintainer's latest non-comment review approving that SHA,
+  with a standalone review-body line `[device-ci-approved:FULL_40_CHARACTER_SHA]`
+  explicitly authorizing physical execution. An ordinary code review is
+  insufficient. Dismissal, requested changes, lost write permission or a
+  different commit blocks execution. Author association alone grants nothing.
+- A current merge candidate whose parents are exactly the pinned base and head.
+- The latest normal CI run and attempt for that head and base, with the expected
+  workflow ID and path, completed successfully. An older success is not used.
+- A controller dispatch on the protected workflow and ref, with current actor
+  permission. Controller workflow SHA, run ID and attempt, source origin, review
+  IDs, base/head/candidate and the complete changed-file listing enter the plan.
 
-Forks and unreviewed code get hosted-only checks. Version one never runs a fork
-head directly on physical hardware. A maintainer can import a reviewed patch
-into a protected internal staging branch, preserving its authorship and origin,
-then obtain a new independent exact-SHA review and dispatch. This transfers trust
-explicitly; reviewing code does not make arbitrary code harmless.
+A maintainer can import a reviewed external patch into a protected staging
+branch, preserving its authorship, and obtain a new exact-SHA review. This
+transfers trust explicitly; reviewing code does not make arbitrary code harmless.
 
-The public `workflow_run` entry is removed. GitHub notes that this trigger can
-receive secrets/write tokens independently of the preceding run; it is not a
-trust upgrade for preceding code. Manual dispatch can also target non-default
-refs, so both job conditions and the controller verify the protected ref.
-See [workflow events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows).
+There is no public `workflow_run` entry: that trigger can receive secrets or
+write tokens independently of the preceding run, so it is not a trust upgrade
+for that code. Manual dispatch can target non-default refs, so both job
+conditions and the controller verify the protected ref. See
+[workflow events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows).
 
-## OS execution boundary
+## Execution boundary
 
 No candidate is checked out on a runner. Hosted preparation exports immutable
 Git objects as `source.bundle`, validates both candidate parents, and binds its
-hash into the current plan. The runner checks out only the protected private
-controller at its exact workflow SHA. Source-read credentials stay on the hosted
-preparer. Device jobs have only the controller's read-only Actions/content token;
-no publishing App key or token reaches them.
+hash into the plan. The runner checks out only the protected controller at its
+exact workflow SHA. Source-read credentials stay on the hosted preparer. Device
+jobs have only the controller's read-only Actions/content token; no publishing
+App key or token reaches them.
 
 `isolated_device.py` invokes an operator-pinned, root-owned broker client with a
-fixed JSON protocol. The broker/client, proof file and all their ancestors must
+fixed JSON protocol. The broker, client, proof file and all their ancestors must
 be root-owned, not symlinks, and not group/world writable. Whole-file hashes
-must match the reviewed per-host config. A fresh nonce binds describe/run replies.
-The proof and describe response must identify separate controller/execution UIDs,
-root supervisor, sandboxed execution stages, and every required negative gate:
+must match the reviewed per-host config. A fresh nonce binds describe/run
+replies. The proof and describe response must identify separate controller and
+execution UIDs, a root supervisor, sandboxed execution stages, and the result of
+every required negative check:
 
-- Candidate cannot read controller HOME, runner/SSH credentials or host service
-  sockets; cannot modify control or evidence; cannot signal/trace the coordinator.
-- No sudo/privilege escalation, Docker socket, external network or escape through
-  user systemd/DBus. Model/source inputs are read-only; scratch is bounded.
-- Disconnect cleanup, original lock inode, STOP quarantine and verified reset.
+- The candidate cannot read the controller's home directory, runner/SSH
+  credentials or host service sockets, modify control or evidence, or
+  signal/trace the coordinator.
+- No sudo or privilege escalation, Docker socket, external network, or escape
+  through user systemd/DBus. Model and source inputs are read-only; scratch is
+  bounded.
+- Disconnect cleanup, the original lock inode, STOP quarantine and verified reset.
 
-The trusted coordinator must remain outside each candidate stage's sandbox.
-Running the entire driver and candidate as one worker UID permits evidence
-forgery and is refused by the protocol. MemoryMax, swap controls, process-group
-cleanup, inherited flock descriptions and ephemeral runner registration address
-resources/lifecycle; they are not malicious-code isolation. macOS physical Metal
-needs actual per-stage OS isolation too. A disposable runner registration does
-not reset the host or isolate a personal account.
+These checks are host-specific: a proof covers only what it tested on that host.
+The trusted coordinator stays outside each candidate stage's sandbox. Running
+the entire driver and candidate as one worker UID would permit evidence forgery
+and is refused by the protocol. MemoryMax, swap controls, process-group cleanup,
+inherited flock descriptions and ephemeral runner registration address resources
+and lifecycle; they are not malicious-code isolation. macOS Metal execution needs
+per-stage OS isolation too. A disposable runner registration does not reset the
+host or isolate the operator's own account.
 
-`controller/broker-unprovisioned.py` deliberately exits 78. It is not a sandbox.
-A config boolean or synthetic test result cannot replace native negative gates.
-Backend implementation/provisioning is a separate reviewed module; if any host
-cannot prove the boundary, leave its runner and overall activation disabled.
+`controller/broker-unprovisioned.py` deliberately exits 78; it is not a sandbox.
+A config boolean or synthetic test result cannot replace native negative checks.
+If a host cannot prove the boundary, leave its runner and overall activation
+disabled. The device brokers are documented in
+[linux-sandbox](linux-sandbox/README.md) and [macos-sandbox](macos-sandbox/README.md).
 
-The full-gate `isolated_device.py` contract expects `describe` and `run`; it is
-not the current manual checkpoint protocol. The staged checkpoint uses
-`job.open`, `stage.start/poll/probe/client/output/stop`, `job.freeze` and
-`job.finish` on one persistent connection. Wiring the full-gate contract to
-those stages remains pending. In that planned contract, `run` receives the exact
-plan,
-device/config path, source bundle, pinned control root and output directory;
-it accepts no arbitrary shell command from the job. It must validate and copy
+The full-gate `isolated_device.py` contract expects `describe` and `run`. The
+staged workflows instead use `job.open`, `stage.start/poll/probe/client/output/stop`,
+`job.freeze` and `job.finish` on one persistent connection; wiring the full-gate
+contract to those stages is not done yet. In that contract, `run` receives the
+exact plan, device/config path, source bundle, pinned control root and output
+directory, and accepts no arbitrary shell command. It must validate and copy
 inputs before candidate access, enforce the per-stage boundary, hold the existing
-lease until all owned work is gone, and emit the complete original device result
-plus protected isolation/cleanup evidence. Its daemon must survive controller
-loss and quarantine uncertain cleanup rather than release the lease.
+lease until all owned work is gone, and emit the complete device result plus
+protected isolation/cleanup evidence. Its daemon must survive controller loss and
+quarantine uncertain cleanup rather than release the lease.
 
 ## Tests and comparison
 
-Inside that boundary the existing driver algorithm is retained: build exact base
-and candidate once; run the complete operator-reviewed small numerical/lifecycle
-CTest set on both; compare tiny greedy IDs and pre-sampling top-five records;
-then measure DeepSeek/Muse 512/256 once per side, plus 4K/256 for resource/executor/
-benchmark changes. Both builds precede timing. Same model shards, toolchain,
-templates, typed settings and real resource policy are required. Raw SSE, input
-IDs, image hashes, CTest XML and cleanup are revalidated, including the broker
-receipt for a private-controller plan. Missing/failed/partial data cannot pass.
+Inside that boundary the driver builds the exact base and candidate once each,
+runs the reviewed small numerical/lifecycle CTest set on both, compares short
+greedy token IDs and pre-sampling top-five records, then measures DeepSeek/Muse
+512/256 once per side. The impact plan adds 4K/256 only for DeepSeek
+compressed long-context changes; the review operator runs the 512 tier and
+reports any required 4K cell as a coverage gap. Both builds
+precede timing. The same model shards, toolchain, templates, typed settings and
+resource policy are required. Raw SSE, input IDs, image hashes, CTest XML and
+cleanup are revalidated, including the broker receipt. Missing, failed or partial
+data cannot pass.
 
-These are `purpose=ci` samples, separate from the formal 0/16 ledger. All five
-metrics, including native prefill, must show no observed slowdown. Any valid
-slowdown is `inconclusive` and blocks acceptance pending bounded independent
-diagnosis; invalid evidence is `failed`. Neither a 5% decode nor a 10% TTFT
-regression is permitted. A passing one-sample comparison is only an observation,
-not proof of statistical equivalence. See [performance acceptance](PERFORMANCE.md)
-for outcomes, diagnosis limits and the old-main reference-adapter prerequisite.
-There are no hardware results in this deployment template. Local synthetic tests
-do not prove OS isolation.
+These are `purpose=ci` samples, separate from the formal benchmark in
+[FINAL.md](../FINAL.md). All five metrics, including native prefill, must show no
+observed slowdown. Any valid slowdown is `inconclusive` and blocks acceptance
+pending bounded diagnosis; invalid evidence is `failed`. No percentage regression
+allowance applies. A passing one-sample comparison is an observation, not proof
+of statistical equivalence. See [performance acceptance](PERFORMANCE.md) for
+outcomes, diagnosis limits and the legacy reference adapter. Local synthetic
+tests do not prove OS isolation.
 
 ## Publication and deployment
 
-Only the GitHub-hosted publisher mints the dedicated check App's short-lived
-installation token. It has checks-write and source read permissions for InferSSD,
-not access to device hosts. It rechecks current head/base/candidate, review and
-normal-CI attempt **after** evidence processing. Old controller runs/attempts,
-changed sources or incomplete broker evidence cannot be replayed. The check is
-published on the exact head with a run/attempt/plan-derived external ID.
+In App mode, only the GitHub-hosted publisher mints the dedicated check App's
+short-lived installation token. It has checks-write and source-read permissions,
+not access to device hosts. It rechecks the current head/base/candidate, review
+and normal-CI attempt **after** evidence processing. Old controller runs or
+attempts, changed sources or incomplete broker evidence cannot be replayed. The
+check is published on the exact head with a run/attempt/plan-derived external ID.
 
-Require `InferSSD device performance` specifically from this dedicated App,
-not from “any source” or the GitHub Actions App: another workflow can produce an
-identically named Actions check. Require branches up to date, protect the staging
-and controller branches, and disallow bypass. The finalizer's last check cannot
-prevent a future base update by itself. See [required-check sources and strict
-status checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging).
+Require `InferSSD device performance` specifically from this dedicated App, not
+from "any source" or the GitHub Actions App: another workflow can produce an
+identically named Actions check. Require branches to be up to date, protect the
+staging and controller branches, and disallow bypass. See
+[required-check sources and strict status checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging).
 
 Deploy control bytes from a reviewed commit, never a dirty checkout:
 
@@ -167,25 +189,24 @@ python3 bench/ci/export_controller.py --source /path/to/inferssd \
   --revision FULL_REVIEWED_40_CHARACTER_SHA --output /path/to/new-controller-export
 ```
 
-The final structure already contains `framework/`; export it directly.
-Do not pass `--registry-revision` when that package is present; that option is
-only for the older control branch that needed a separately pinned registry.
+The source tree contains `framework/`, so export it directly. `--registry-revision`
+exists only for older control trees that needed a separately pinned settings
+registry; do not pass it when `framework/` is present. `--workflow` selects
+`device-performance` (default), `integration-smoke` or `checkpoint`.
 
-Review and commit that export into the private controller repository. The export
-contains a source-origin/file-hash manifest; the private workflow is separately
-protected. Provision read-only source credentials only for hosted preparation,
-the dedicated App only for hosted publication, and the immutable device configs.
-Where supported, environment required reviewers with self-review disabled
-supplement the explicit exact-SHA review marker. GitHub Team does not provide
-that extra reviewer rule for a private environment; this version relies on the
-independent maintainer marker plus the separately permission-checked private
-dispatch. It does not claim an environment review occurred. See
+Review and commit that export into the controller repository. The export carries
+a source-origin/file-hash manifest; the controller workflow is protected
+separately. Provision read-only source credentials only for hosted preparation,
+the dedicated App only for hosted publication, and immutable device configs.
+Where available, environment required reviewers with self-review disabled can
+supplement the exact-SHA review marker; this design does not depend on them. See
 [deployment protection availability](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments).
+Organization runner groups can restrict repositories and workflow refs, but this
+design does not rely on that feature either; never grant this repository access
+to the device runners. See
+[runner-group access](https://docs.github.com/en/enterprise-cloud@latest/actions/how-tos/manage-runners/self-hosted-runners/manage-access).
 
-Organization runner groups can restrict selected repository/workflow refs when
-available, but this design does not rely on that feature. Never add public-repo
-access. See [runner-group access](https://docs.github.com/en/enterprise-cloud@latest/actions/how-tos/manage-runners/self-hosted-runners/manage-access).
-
-After actual isolation and native cleanup gates pass on every intended device,
-review all receipts before enabling `INFERSSD_CI_ENABLED` or requiring the App
-check. Do not publish, install, or activate merely by merging this module.
+Enable `INFERSSD_CI_ENABLED` or require the App check only after the isolation
+and native cleanup checks pass on every intended device and their receipts have
+been reviewed. Merging changes to this directory does not publish, install or
+activate anything.

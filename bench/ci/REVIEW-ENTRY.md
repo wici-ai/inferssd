@@ -1,44 +1,54 @@
 # Review-authorized device test entry
 
-The source PR maintainer submits a comment-type review whose complete body is
-`/ci test`. GitHub's review `commit_id` binds the exact current head. A current
-writable maintainer may authorize their own PR; no special source branch,
-second-person approval, App or PAT is needed in this operator/report-only mode.
-An external fork author need not have source write access: a source maintainer's
-review authorizes that exact head, while the separate preparation service account
-uses its own existing permissions. Reviewer need not have controller-repository
-write permission or equal `prepared_by`. Author-provided commands do not count
-unless that author independently has current source-maintainer permission.
-Ordinary issue comments, labels, quoted code/examples and prose are not commands.
-The test authorization does not approve a merge or publish a source PR check.
+Device checks are authorized by a maintainer for PRs from branches in the
+source repository. The maintainer submits a comment-type review whose complete
+body is `/ci test`. GitHub's review `commit_id` binds the exact current head. A
+maintainer with current write access may authorize their own PR; no special
+source branch, second-person approval, App or PAT is needed in this
+operator/report-only mode. The preparation service account uses its own existing
+permissions, and the reviewer does not need controller-repository write
+permission. Commands from anyone without current source write permission do not
+count. Ordinary issue comments, labels, quoted code/examples and prose are not
+commands. The test authorization does not approve a merge or publish a source PR
+check.
+
+External fork PRs do not currently run on physical devices. Authorization also
+requires the latest successful hosted CI run for the exact head to be associated
+with exactly that PR (`pull_requests` must contain one entry), and GitHub does not
+associate workflow runs from forks with the PR. A `/ci test` review on a fork PR
+therefore stays waiting until it expires. To test an external contribution on
+devices, a maintainer can open a PR from a branch in the source repository with
+the reviewed change and authorize that head.
 
 The impact plan selects models and checks. Reviewed execution profiles may select
-cloud-5090, DGX Spark and local-mbp; each omitted device stays explicitly deferred.
-Required performance uses
-the unchanged Azure 512-tier prompt and decode 256, once per base and candidate
-on the same device/model/settings. It does not add 4K or formal benchmark samples.
+cloud-5090, dgx-spark and local-mbp; each omitted device stays explicitly deferred.
+Required performance uses the fixed 512-token CI prompt
+(`bench/prompts/prompt-512.txt`) and decode 256, once per base and candidate on
+the same device/model/settings. It does not add 4K or formal benchmark samples.
 Functional-only success cannot satisfy a required performance comparison.
 
-The removed Linux-specific command is not an alias. Existing review/run records
-are retained without replay; upgrading the operator never extends an old review
-to a new performance run. Submit a fresh `/ci test` Comment review to authorize
-the current head. `/ci cancel` remains the cancellation command.
+Review and run records are retained without replay; upgrading the operator
+never extends an old review to a new performance run. Submit a fresh `/ci test`
+Comment review to authorize the current head. `/ci cancel` is the cancellation
+command.
 
 The poller runs on the trusted preparation host with its existing gh login and
 reviewed source Git repository and explicit device profiles. Its service must
-remain available independently of the tested M5. Its persistent state, exact command and process
-supervisor must be deployed on the chosen always-online preparation host; this
-source change alone does not establish that the background process is running.
+remain available independently of the tested devices. Its persistent state,
+exact command and process supervisor must be deployed on an always-online
+preparation host; this code alone does not establish that the background
+process is running.
 
 ```
 python3 -I bench/ci/review_operator.py \
-  --source /ABSOLUTE/TRUSTED/SOURCE_REPO --fetch-remote ssdash \
+  --source /ABSOLUTE/TRUSTED/SOURCE_REPO --fetch-remote origin \
   --inputs /ABSOLUTE/REVIEWED/profiles.json \
   --state /ABSOLUTE/PRIVATE/review-operator-state --gh /path/to/existing/gh
 ```
 
-Default polling is30 seconds; `--once` is a diagnostic, not sustained activation.
-The private state directory is owner-only. A held local flock excludes duplicate
+`--fetch-remote` names a remote of that local repository whose URL identifies the
+fixed source repository. Default polling is 30 seconds; `--once` is a diagnostic,
+not sustained activation. The private state directory is owner-only. A held local flock excludes duplicate
 pollers. Each repo/PR/review_id/head tuple has one durable record. Status files and
 atomic records are fsynced, so a stopped host queues authorization in GitHub and
 resumes observing it later. `poll-status.json` exposes blocked API/authorization
@@ -66,7 +76,7 @@ does not edit sudoers. Missing unattended staging permission stays queued
 with an explicit reason.
 
 After dispatch it monitors only the returned exact parent run ID, workflow,
-controller SHA, actor and attempt1. A new head/base, edited/dismissed authorization,
+controller SHA, actor and attempt 1. A new head/base, edited/dismissed authorization,
 later current-head maintainer `/ci cancel` review or request for changes, lost
 authorization or finite deadline requests cancellation of that exact parent.
 The existing parent's cancellation/always-run cleanup and child guardian chain
@@ -90,7 +100,8 @@ unknown errors stop immediately. Transport retries never repeat a dispatch,
 cancellation or model request. Fixed metadata diagnostics retain failures and
 recovery without URLs, credentials or response bodies.
 
-Open the exact parent run in the private `inferssd-device-ci` repository, then
+Results are visible to maintainers with access to the private controller
+repository, `wici-ai/inferssd-device-ci`. Open the exact parent run there, then
 read its Actions Summary. For each required executed model it shows base and PR
 0–128/128–256 decode token/s and `(PR / base - 1) * 100%`, plus TTFT, prefill
 and whole decode. A positive throughput change means faster; a lower TTFT is
@@ -114,7 +125,7 @@ preserved; the check does not disable swap, close applications or clear caches.
 The fixed quiet policy is:
 
 - Free plus inactive memory in both snapshots must be at least the smaller of
-  the sealed worker memory budget and 75% of sealed physical RAM.
+  the pinned worker memory budget and 75% of the recorded physical RAM.
 - Swap-in plus swap-out counter growth must be zero; compression plus
   decompression growth must be at most 64 MiB, using the observed page size.
 - The memory-pressure level must be available and equal to 1 in both snapshots.
@@ -139,9 +150,9 @@ Preparation/staging interruption and ambiguous dispatch are retained without
 automatic replay. A saved, already validated `dispatched-run.json` allows a
 restart to resume monitoring without another POST. Otherwise it requires
 inspection and a fresh review authorization; no guessed run, repeated model
-sample or best result selection exists. Queue authorization expires after24h
-(configurable bounded lifetime); parent monitoring is bounded by4h, matching
-the existing workflow limit. Original completed attempts remain recorded after
+sample or best result selection exists. Queue authorization expires after 24 h
+(configurable bounded lifetime); parent monitoring is bounded by 4 h, matching
+the workflow limit. Original completed attempts remain recorded after
 a source update and cannot satisfy a new head.
 
 Activation requires deploying the final trusted controller/wheel, exact root
@@ -149,5 +160,6 @@ policy/source/model staging and current job before/after probes on each enabled
 device, then one real review→prepare→dispatch→Actions result plus a finite
 cancellation/cleanup case. Mac uses the fixed SSH entry and recovery contract in
 [RECOVERY.md](macos-sandbox/RECOVERY.md). Code, a runner's online state and existing
-short readiness receipts alone do not establish a new performance run. Formal samples0/16.
-This module's contract tests execute none of those physical operations.
+short readiness receipts alone do not establish a new performance run. These runs
+add no formal benchmark samples. This module's contract tests execute none of
+those physical operations.

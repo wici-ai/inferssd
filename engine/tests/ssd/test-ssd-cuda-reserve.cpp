@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #include "ggml-cuda/ssd/reserve-registry.h"
 #include "ggml-ssd/runtime-services.h"
 

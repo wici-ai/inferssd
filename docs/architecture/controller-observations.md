@@ -30,7 +30,7 @@ lines. Unknown event names remain forward-compatible. The live boundary exposes
 only groups, routes, layer costs and prefill summaries actually used by the
 controller. It does not claim that all historical log fields are now a public API.
 
-Tests compare the live observer with frozen legacy records through served-turn
+Tests compare the live observer with recorded legacy records through served-turn
 aggregation, feedback and the real decision function, including reused token
 positions. A native unit verifies production prefill events with debug channels
 off. Device readiness additionally consumes a real short Linux model request's

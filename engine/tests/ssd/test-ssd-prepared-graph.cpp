@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // Exercise real scheduler copies/allocator and CPU math across incompatible
 // memory domains. The second domain is host-backed; this is not a GPU gate.
 #include "ggml.h"

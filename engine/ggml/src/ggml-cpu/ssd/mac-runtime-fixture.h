@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 // Private deterministic fixture controls. Production settings never read these.
 #include "mac-runtime.h"

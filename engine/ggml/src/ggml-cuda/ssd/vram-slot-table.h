@@ -75,7 +75,7 @@ public:
     // selected every token reaches about 23 with half-life 16. Where a count meets what admissions earned (an
     // admission's or an eviction's price, an admission's record) it is taken over the memory, count / (1 -
     // 2^(-age/half-life)) for a steady selection rate. Taken as they were, a young table's admissions were priced
-    // as cold experts and recorded as such while they were hot (233, 10-22: the count-1 admissions of the second
+    // as cold experts and recorded as such while they were hot (RTX 5060 Ti: the count-1 admissions of the second
     // decode token earned 20 hits each and raised the expected hits at count 1 from 1.1 to 2.2 by the tenth token,
     // 27.5 after two requests, as high as at any count; a candidate then gained nothing over a resident, and the
     // tier replaced a third fewer entries in tokens 33-128). Nothing changes once the table is a few half-lives
