@@ -8,10 +8,8 @@ Python resource. There are no environment mirrors or legacy-name aliases.
 | Key | Kind / unit | Default literal | Producer | Scope |
 |---|---|---|---|---|
 | `expert.source` | paths / path | `[]` | plan | all |
-| `cpu.threads` | integer / participants | `2` | plan | all |
-| `cpu.compute_cpus` | cpus / CPU ID | `empty` | plan | all |
 | `cpu.io_cpus` | cpus / CPU ID | `empty` | plan | all |
-| `cpu.decode_participants` | integer / compute participants | `0` | plan | linux |
+| `cpu.decode_participants` | integer / compute participants | `0` | plan | all |
 | `prefetch.depth` | integer / predicted experts | `2` | plan | all |
 | `place.costs` | costs / named us and GB/s terms | `empty` | plan | all |
 | `prefill.cpu_max_tokens` | integer / tokens | `4294967295` | plan | linux |
@@ -28,13 +26,13 @@ Python resource. There are no environment mirrors or legacy-name aliases.
 These are conservative parser defaults and retained policy priors, not claimed
 per-device performance optima. The framework must provide its measured CPU,
 cache and placement configuration. The platforms are `linux`, `darwin` and
-`windows`; a scope is `all` or the platforms it lists. Linux and Windows require
-at least two total CPU participants; one is the I/O participant. The current
-macOS expert reader keeps one participant. An explicit compute CPU list must
-contain `cpu.threads - 1` unique IDs in declared order on every platform; macOS
-cannot pin threads, so there the lists are validated and only their lengths are
-used. Zero decode participants leaves the measured/default policy; positive
-values cannot exceed compute participants. The VRAM margin is at least reserve
+`windows`; a scope is `all` or the platforms it lists. Expert compute runs on
+ggml's threads (`-t`, `-tb`, `-C`, `-Cb`, `--cpu-strict`; see
+[how it works](architecture.md#threads)); `cpu.io_cpus` places the executor's
+own I/O, prefetch and watch threads, and macOS, which cannot pin threads, only
+validates it. Zero decode participants leaves the measured/default policy; a
+positive value counts the leading ggml threads of each decode phase, and a
+decode call with fewer threads fails. The VRAM margin is at least reserve
 plus 64 MiB. Non-applicable platform keys cannot be explicitly set. On macOS the
 interface supports static settings only; it does not include an online adaptive
 controller.
@@ -55,8 +53,7 @@ pages. The RAM expert cache admits only under a readable envelope.
 
 ```text
 inferssd-settings 1
-cpu.threads = 4  # source=derived; input=measured CPU placement
-cpu.compute_cpus = "2-4"
+cpu.io_cpus = "3"  # source=derived; input=measured CPU placement
 cpu.decode_participants = 2
 expert.source = ["/path/to/index # 1.tsv", "/path/to/other.tsv"]
 place.costs = "cpu_fixed_us=204,link_gbps=12.3"
@@ -92,10 +89,13 @@ The Python package exposes independent usable preparation commands:
 ```sh
 inferssd configuration schema
 inferssd configuration check --platform linux --input settings.ssd
-inferssd configuration write --platform linux --set cpu.threads=4 --output settings.ssd
+inferssd configuration write --platform linux --set prefetch.depth=4 --output settings.ssd
 ```
 
 Output creation is exclusive, and supplied receipts survive round-trip rendering.
 Settings are never translated to environment variables. `inferssd launch --execute`
 passes the settings file to the server with `--ssd-settings`, and each setting
-with a command-line origin as the matching `--ssd-*` option.
+with a command-line origin as the matching `--ssd-*` option. CPU thread counts and
+placement are server threadpool arguments, not settings: the launcher passes
+`--threads`/`--batch-threads` as `-t`/`-tb` and `--cpus` as a strict `-C`/`-Cb`
+mask; see the [framework guide](../framework/README.md).

@@ -32,9 +32,8 @@ int main() {
         }
         const size_t cpus = process_cpus().size();
         require(cpus >= 1, "read actual process CPUs");
-        cpu_threads(1, 0);
-        if (cpus <= 128) { skipped([&] { cpu_threads(int(cpus), 1); }); }
-        failed([&] { cpu_threads(0, 1); }, "invalid threads must fail");
+        cpu_participants(1, 0);
+        failed([&] { cpu_participants(0, 1); }, "invalid threads must fail");
         failed([&] { cpu_participants(1, 256); }, "invalid participants must fail");
         // A missing ring is the fixtures' skip; the checks here still run.
         try { io_ring(); } catch (const unavailable & e) { std::printf("read ring unavailable: %s\n", e.what()); }

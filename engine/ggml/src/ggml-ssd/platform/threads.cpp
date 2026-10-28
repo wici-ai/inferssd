@@ -7,8 +7,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 
 #if defined(_WIN32)
@@ -20,19 +18,28 @@
 #endif
 #include <windows.h>
 #elif defined(__APPLE__)
+#include <os/os_sync_wait_on_address.h>
 #include <pthread.h>
+#include <sched.h>
 #include <sys/sysctl.h>
 #include <time.h>
 #elif defined(__linux__)
+#include <climits>
 #include <fstream>
+#include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/syscall.h>
 #include <time.h>
+#include <unistd.h>
 #else
 #error "InferSSD platform layer: unsupported OS"
 #endif
 
 namespace ssd { namespace platform {
+
+static_assert(sizeof(std::atomic<uint32_t>) == sizeof(uint32_t) && std::atomic<uint32_t>::is_always_lock_free,
+              "a parking word is a plain 32-bit word");
 
 static void set_why(std::string * why, std::string text) {
     if (why) { *why = std::move(text); }
@@ -57,13 +64,6 @@ bool split_fastest(const std::vector<std::pair<int, double>> & values, cpu_topol
     return true;
 }
 } // namespace detail
-
-scoped_affinity::~scoped_affinity() {
-    if (active_ && !restore()) {
-        std::fprintf(stderr, "[ssd_platform] cannot restore thread affinity; aborting\n");
-        std::abort();
-    }
-}
 
 bool pin_current_thread(const cpu_list & cpus) {
 #if defined(_WIN32)
@@ -130,34 +130,18 @@ bool pin_thread(std::thread::native_handle_type thread, const cpu_list & cpus) {
         pthread_getaffinity_np(thread, sizeof(actual), &actual) == 0 && CPU_EQUAL(&wanted, &actual);
 }
 
-static_assert(sizeof(cpu_set_t) <= sizeof(uint64_t[16]), "saved affinity storage too small");
-
-scoped_affinity::scoped_affinity(const cpu_list & cpus) {
-    if (cpus.empty()) { return; }
-    cpu_set_t saved;
-    if (pthread_getaffinity_np(pthread_self(), sizeof(saved), &saved) != 0) {
-        ok_ = false;
-        return;
-    }
-    std::memcpy(saved_, &saved, sizeof(saved));
-    if (!pin_current_thread(cpus)) {
-        restore();
-        ok_ = false;
-        return;
-    }
-    active_ = true;
-}
-
-bool scoped_affinity::restore() const {
-    cpu_set_t saved;
-    std::memcpy(&saved, saved_, sizeof(saved));
-    return pthread_setaffinity_np(pthread_self(), sizeof(saved), &saved) == 0;
-}
-
 // The kernel scheduler needs no hints; Linux behaviour stays as it is.
 bool set_thread_role(thread_role) { return true; }
 
 int current_cpu() { return sched_getcpu(); }
+
+void wait_on(const std::atomic<uint32_t> & word, uint32_t expected) noexcept {
+    syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, expected, nullptr, nullptr, 0);
+}
+
+void wake_all(const std::atomic<uint32_t> & word) noexcept {
+    syscall(SYS_futex, &word, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+}
 
 #elif defined(__APPLE__)
 
@@ -195,18 +179,29 @@ bool affinity_supported() { return false; }
 
 bool pin_thread(std::thread::native_handle_type, const cpu_list &) { return true; }
 
-scoped_affinity::scoped_affinity(const cpu_list &) {}
-
-bool scoped_affinity::restore() const { return true; }
-
 bool set_thread_role(thread_role role) {
-    const qos_class_t qos = role == thread_role::compute ? QOS_CLASS_USER_INTERACTIVE :
-                            role == thread_role::io      ? QOS_CLASS_USER_INITIATED :
-                                                           QOS_CLASS_UTILITY;
+    const qos_class_t qos = role == thread_role::io ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY;
     return pthread_set_qos_class_self_np(qos, 0) == 0;
 }
 
 int current_cpu() { return -1; }
+
+// Before macOS 14.4 there is no public wait on an address; the waiter yields and rechecks.
+void wait_on(const std::atomic<uint32_t> & word, uint32_t expected) noexcept {
+    if (__builtin_available(macOS 14.4, *)) {
+        os_sync_wait_on_address(const_cast<std::atomic<uint32_t> *>(&word), expected, sizeof(uint32_t),
+                                OS_SYNC_WAIT_ON_ADDRESS_NONE);
+    } else {
+        sched_yield();
+    }
+}
+
+void wake_all(const std::atomic<uint32_t> & word) noexcept {
+    if (__builtin_available(macOS 14.4, *)) {
+        os_sync_wake_by_address_all(const_cast<std::atomic<uint32_t> *>(&word), sizeof(uint32_t),
+                                    OS_SYNC_WAKE_BY_ADDRESS_NONE);
+    }
+}
 
 #elif defined(_WIN32)
 
@@ -356,48 +351,8 @@ bool pin_thread(std::thread::native_handle_type handle, const cpu_list & cpus) {
         actual.Group == 0 && actual.Mask == affinity.Mask;
 }
 
-// saved_: [0] 1 = selected CPU Sets, 2 = group affinity; [1] mask; [2] group.
-scoped_affinity::scoped_affinity(const cpu_list & cpus) {
-    if (cpus.empty()) { return; }
-    const HANDLE self = GetCurrentThread();
-    const auto & sets = cpu_sets();
-    if (sets.available) {
-        DWORD_PTR mask = 0;
-        if (!selected_mask(self, sets, mask)) {
-            ok_ = false;
-            return;
-        }
-        saved_[0] = 1;
-        saved_[1] = uint64_t(mask);
-    } else {
-        GROUP_AFFINITY affinity = {};
-        if (!GetThreadGroupAffinity(self, &affinity)) {
-            ok_ = false;
-            return;
-        }
-        saved_[0] = 2;
-        saved_[1] = uint64_t(affinity.Mask);
-        saved_[2] = affinity.Group;
-    }
-    if (!pin_current_thread(cpus)) {
-        restore();
-        ok_ = false;
-        return;
-    }
-    active_ = true;
-}
-
-bool scoped_affinity::restore() const {
-    const HANDLE self = GetCurrentThread();
-    if (saved_[0] == 1) { return select_mask(self, cpu_sets(), DWORD_PTR(saved_[1])); }
-    GROUP_AFFINITY affinity = {};
-    affinity.Mask = KAFFINITY(saved_[1]);
-    affinity.Group = WORD(saved_[2]);
-    return SetThreadGroupAffinity(self, &affinity, nullptr) != 0;
-}
-
 // Windows 11 parks cores and moves throttled (EcoQoS) threads onto efficiency
-// cores; compute and io threads opt out, as ggml's own workers do.
+// cores; io threads opt out, as ggml's own workers do.
 bool set_thread_role(thread_role role) {
     THREAD_POWER_THROTTLING_STATE state = {};
     state.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
@@ -417,6 +372,14 @@ int current_cpu() {
     PROCESSOR_NUMBER number = {};
     GetCurrentProcessorNumberEx(&number);
     return number.Group == 0 ? int(number.Number) : -1;
+}
+
+void wait_on(const std::atomic<uint32_t> & word, uint32_t expected) noexcept {
+    WaitOnAddress(const_cast<std::atomic<uint32_t> *>(&word), &expected, sizeof(uint32_t), INFINITE);
+}
+
+void wake_all(const std::atomic<uint32_t> & word) noexcept {
+    WakeByAddressAll(const_cast<std::atomic<uint32_t> *>(&word));
 }
 
 #endif

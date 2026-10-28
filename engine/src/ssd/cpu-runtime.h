@@ -201,7 +201,6 @@ struct llama_kimi_cpu_sink_runtime {
         vram_phase_complete = cpu_api->vram_phase_complete;
         cache_get_stats = cpu_api->cache_get_stats;
         prefetch_hint = cpu_api->prefetch_hint;
-        const int threads = int(*settings.integer("cpu.threads"));
         constexpr int ring_experts = 8;
         char error[512] = {};
         sink = create(&settings, &services, resolve_source, this, error, sizeof(error));
@@ -213,10 +212,17 @@ struct llama_kimi_cpu_sink_runtime {
             throw std::runtime_error(std::string("CPU sink cache configuration failed: ") + error + "; no fallback");
         }
         std::fprintf(stderr,
-            "[kimi_cpu_sink] enabled threads=%d ring_experts=%d n_tokens=1 expert_h2d_bytes=0"
+            "[kimi_cpu_sink] enabled ring_experts=%d n_tokens=1 expert_h2d_bytes=0"
             " cache_budget=%" PRIu64 " cache_max_experts_per_layer=%d epoch=%" PRIu64
             " cache_admission=direct_read fixed_scope=ring_only\n",
-            threads, ring_experts, cache_budget, cache_max_per_layer, epoch);
+            ring_experts, cache_budget, cache_max_per_layer, epoch);
+    }
+
+    // Before a graph with sink nodes runs: its CPU threads join this executor's calls
+    // (llama_kimi_cpu_sink_compute), so it exists before the first of them.
+    void prepare_graph(ggml_backend_reg_t registry) {
+        std::lock_guard<std::mutex> lock(mutex);
+        initialize(registry);
     }
 
     void print_cache_stats(const char * reason, bool decode, uint64_t token) {
@@ -338,24 +344,37 @@ struct llama_kimi_cpu_sink_runtime {
     }
 };
 
+// One call of the executor per node: the CPU backend's ggml threads are its
+// compute participants. ith 0 opens it and runs the layer; the call closes on
+// every exit, after all nth - 1 others joined.
+struct llama_kimi_cpu_sink_call {
+    const llama_kimi_cpu_sink_runtime & runtime;
+    llama_kimi_cpu_sink_call(const llama_kimi_cpu_sink_runtime & owner, int nth) : runtime(owner) {
+        char error[256] = {};
+        if (!runtime.cpu_api->call_open(runtime.sink, nth, error, sizeof(error))) {
+            GGML_ABORT("CPU sink call failed to open: %s", error);
+        }
+    }
+    ~llama_kimi_cpu_sink_call() { runtime.cpu_api->call_close(runtime.sink); }
+    llama_kimi_cpu_sink_call(const llama_kimi_cpu_sink_call &) = delete;
+    llama_kimi_cpu_sink_call & operator=(const llama_kimi_cpu_sink_call &) = delete;
+};
+
 inline void llama_kimi_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    // The sink owns its expert pool. Other ggml workers wait at the graph's
-    // outer barrier; they may compute CPU dense matrices in the same graph.
+    // Every CPU-backend ggml thread enters (n_tasks = GGML_N_TASKS_MAX). No C++
+    // exception may escape this callback.
     GGML_ASSERT(ith >= 0 && ith < nth);
-    if (ith != 0) { return; }
     auto & node = *static_cast<llama_kimi_cpu_sink_node *>(userdata);
     GGML_ASSERT(node.runtime);
     auto & runtime = *node.runtime;
-    std::lock_guard<std::mutex> lock(runtime.mutex);
-    try {
-        runtime.initialize(node.cpu_reg);
-    } catch (const std::exception & error) {
-        // No C++ exception may escape the ggml worker callback. Normal
-        // configured startup initializes this executor before graph execution.
-        GGML_ABORT("CPU sink initialization failed in worker: %s; no fallback", error.what());
-    } catch (...) {
-        GGML_ABORT("CPU sink initialization failed in worker; no fallback");
+    // The graph prepared the executor before it started (prepare_graph).
+    GGML_ASSERT(runtime.sink && runtime.cpu_api);
+    if (ith != 0) {
+        runtime.cpu_api->call_join(runtime.sink, ith, nth);
+        return;
     }
+    const llama_kimi_cpu_sink_call call(runtime, nth);
+    std::lock_guard<std::mutex> lock(runtime.mutex);
     runtime.active_node = &node;
 
     const ggml_tensor * input = dst->src[0];

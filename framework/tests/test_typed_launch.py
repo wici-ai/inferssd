@@ -11,13 +11,13 @@ from test_engine_runtime import Effects, Owner, policy
 from test_mac_alias import fixture as gguf_fixture
 
 from inferssd.cli import main
-from inferssd.configuration.derive import SelectionConflict, selection
+from inferssd.configuration.derive import Selection, SelectionConflict, selection
 from inferssd.configuration.settings import parse
 from inferssd.engine import runtime
 from inferssd.launch.prepare import prepare
 from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.typed import LaunchSpec, reject_legacy_environment, resolve_typed
-from inferssd.launch.types import LaunchInput
+from inferssd.launch.types import LaunchInput, Threads
 from inferssd.loop.typed_controller import TypedController
 from inferssd.source import mac_alias
 
@@ -40,11 +40,11 @@ def setup(tmp_path, platform="linux", automatic=False):
     settings = root / "input.ssd"
     source = root / "provided.tsv"
     source.write_text("explicit source fixture; resolver does not validate payloads")
-    text = "inferssd-settings 1\ncpu.threads=4 # measured CPU count\n"
+    text = "inferssd-settings 1\nprefetch.depth=4 # measured predictor depth\n"
     if not automatic:
         text += "expert.source=" + json.dumps([str(source)]) + " # provided index\n"
     settings.write_text(text)
-    spec = LaunchSpec(str(model), 8080, str(settings), (("cpu.threads", "2"),), str(binary))
+    spec = LaunchSpec(str(model), 8080, str(settings), (("prefetch.depth", "2"),), str(binary))
     host = {
         "platform_system": "Linux" if platform == "linux" else "Darwin",
         "platform_machine": "arm64",
@@ -91,12 +91,13 @@ def test_settings_file_and_cli_provenance_reach_native_argv(tmp_path, platform):
     result = resolve(inputs, spec, adapter, out, platform)
     assert result.code == 0 and not result.assigned_environment
     assert "--ssd-settings" in result.argv and "--ssd-telemetry" in result.argv
-    assert result.argv[result.argv.index("--ssd-cpu-threads") + 1] == "2"
+    assert result.argv[result.argv.index("--ssd-prefetch-depth") + 1] == "2"
+    assert not {"-t", "-tb", "-C", "-Cb"} & set(result.argv)  # unset counts keep server defaults
     body = (out / "settings.ssd").read_text()
     assert "expert.source" in body and "provided index" in body
-    assert "cpu.threads" not in body  # actual CLI wins, registry defaults stay defaults
+    assert "prefetch.depth" not in body  # actual CLI wins, registry defaults stay defaults
     native = parse(body, str(out / "settings.ssd"), overrides=spec.overrides, platform=platform)
-    assert native.at("cpu.threads").origin == "cli"
+    assert native.at("prefetch.depth").origin == "cli"
     assert native.at("vram.budget").origin == "default"
     assert native.at("expert.source").origin == "file"
     assert not any("GGML_KIMI" in x for x in result.argv)
@@ -166,9 +167,11 @@ def test_retired_inputs_fail_by_name_without_value(name):
         ("-mwrong",),
         ("--model=wrong",),
         ("--port=8",),
-        ("--ssd-cpu-threads", "8"),
+        ("--ssd-prefetch-depth", "8"),
+        ("--ssd_prefetch_depth", "8"),
         ("-np2",),
         ("--threads=9",),
+        ("--threads_batch", "9"),
         ("--ubatch-size", "64"),
     ],
 )
@@ -269,19 +272,54 @@ def test_measured_selection_changes_actual_typed_values_without_env_bridge():
     )
     base = parse()
     chosen = selection(model, 4, "split", base, lambda: pytest.fail("measured count exists"))
-    assert chosen.at("cpu.threads").value == 4
-    assert chosen.at("cpu.compute_cpus").value == (0, 1, 3)
-    assert chosen.at("cpu.io_cpus").value == (2,)
-    assert chosen.at("cpu.decode_participants").value == 2
-    assert chosen.at("vram.max_slots").value == 4
-    assert chosen.at("vram.budget").value == 4096
-    assert chosen.at("prefetch.depth").value == 3
-    assert "source=planner" in chosen.at("cpu.threads").receipt
-    assert base.at("cpu.threads").value == 2
+    # Decode takes the first two ggml threads, strictly placed on the fast CPUs 0 and 1.
+    assert chosen.threads == Threads(3, 3, (0, 1, 3))
+    settings = chosen.settings
+    assert settings.at("cpu.io_cpus").value == (2,)
+    assert settings.at("cpu.decode_participants").value == 2
+    assert settings.at("vram.max_slots").value == 4
+    assert settings.at("vram.budget").value == 4096
+    assert settings.at("prefetch.depth").value == 3
+    assert "source=planner" in settings.at("cpu.io_cpus").receipt
+    assert base.at("cpu.io_cpus").value == ()
+
+
+@pytest.mark.parametrize(
+    "placement,threads,io,participants",
+    [
+        ("all", Threads(3, 3), (), 0),
+        ("pin", Threads(2, 2, (0, 1)), (2,), 2),
+        ("split", Threads(3, 3, (0, 1, 3)), (2,), 2),
+    ],
+)
+def test_placements_choose_ggml_threadpools_beside_the_io_cpu(placement, threads, io, participants):
+    model = SimpleNamespace(
+        P={placement: {}},
+        caps={placement: 8},
+        ref=placement,
+        dev={"default_threads": 4, "coresets": {"g1": {"cpus": [0, 1, 2]}, "g2": {"cpus": [3, 4]}}},
+        PF={"memory": {}},
+    )
+    chosen = selection(model, 0, placement, parse(), lambda: 4)
+    assert chosen.threads == threads
+    assert chosen.settings.at("cpu.io_cpus").value == io
+    assert chosen.settings.at("cpu.decode_participants").value == participants
+
+
+def test_split_refuses_a_fast_group_above_the_lowest_compute_cpus():
+    model = SimpleNamespace(
+        P={"split": {}},
+        caps={"split": 8},
+        ref="split",
+        dev={"default_threads": 5, "coresets": {"g1": {"cpus": [2, 3, 4]}, "g2": {"cpus": [0, 1]}}},
+        PF={"memory": {}},
+    )
+    with pytest.raises(ValueError, match="lowest compute CPU IDs"):
+        selection(model, 0, "split", parse(), lambda: 5)
 
 
 def test_typed_controller_never_calls_machine_env():
-    snapshot = parse()
+    snapshot = Selection(parse(), Threads(3, 3, (0, 1, 2)))
     model = SimpleNamespace(env=lambda *_: pytest.fail("historical env path"))
     controller = object.__new__(TypedController)
     captured = {}
@@ -294,6 +332,7 @@ def test_typed_controller_never_calls_machine_env():
     controller.note = lambda record: captured.update(record=record)
     controller._start(4, "all")
     assert captured["args"][-1] is snapshot and "settings" in captured["record"]
+    assert captured["record"]["threads"] == {"decode": 3, "batch": 3, "cpus": (0, 1, 2)}
     assert "env" not in captured["record"]
 
 
@@ -323,7 +362,11 @@ def test_typed_command_prepares_native_file_without_executing_or_recording_secre
                 "--settings",
                 spec.settings_file,
                 "--set",
-                "cpu.threads=2",
+                "prefetch.depth=2",
+                "--cpus",
+                "0-2,4",
+                "--batch-threads",
+                "3",
                 "--runtime-policy",
                 str(contract),
                 "--host-facts",
@@ -339,7 +382,11 @@ def test_typed_command_prepares_native_file_without_executing_or_recording_secre
     assert (out / "settings.ssd").exists() and (out / ".inferssd-owner").exists()
     assert not (out / "runtime.json").exists()
     assert "never-persist" not in receipt.read_text()
-    assert "--ssd-cpu-threads" in json.loads(receipt.read_text())["argv"]
+    argv = json.loads(receipt.read_text())["argv"]
+    assert "--ssd-prefetch-depth" in argv
+    pools = argv[argv.index("-t") : argv.index("--chat-template-file")]
+    strict = ["--cpu-strict", "1", "--cpu-strict-batch", "1"]
+    assert pools == ["-t", "4", "-tb", "3", "-C", "0x17", "-Cb", "0x17"] + strict
 
 
 def test_omitted_output_directory_creates_a_new_run_directory(tmp_path, monkeypatch, capsys):
@@ -375,12 +422,32 @@ def test_measured_selection_respects_explicit_cli_and_preserves_matching_receipt
         dev={"default_threads": 4},
         PF={"memory": {}},
     )
-    matching = parse(overrides=[("cpu.threads", "4")])
-    chosen = selection(model, 4, "all", matching, lambda: 4)
-    assert chosen.at("cpu.threads") is matching.at("cpu.threads")
-    conflicting = parse(overrides=[("cpu.threads", "2")])
-    with pytest.raises(SelectionConflict, match="cpu.threads"):
+    matching = parse(overrides=[("cpu.decode_participants", "0")])
+    chosen = selection(model, 4, "all", matching, lambda: 4, threads=Threads(3, 12))
+    key = "cpu.decode_participants"
+    assert chosen.settings.at(key) is matching.at(key)
+    assert chosen.threads == Threads(3, 12)  # an explicit batch count is kept
+    conflicting = parse(overrides=[("cpu.decode_participants", "1")])
+    with pytest.raises(SelectionConflict, match="cpu.decode_participants"):
         selection(model, 4, "all", conflicting, lambda: 4)
+    for threads in (Threads(2), Threads(cpus=(0, 1, 2))):
+        with pytest.raises(SelectionConflict, match="explicit launch threads"):
+            selection(model, 4, "all", matching, lambda: 4, threads=threads)
+
+
+def test_explicit_strict_cpus_select_only_the_matching_pinned_placement():
+    model = SimpleNamespace(
+        P={"pin": {}},
+        caps={"pin": 8},
+        ref="pin",
+        dev={"coresets": {"g1": {"cpus": [0, 1, 2]}, "g2": {"cpus": [3, 4]}}},
+        PF={"memory": {}},
+    )
+    chosen = selection(model, 0, "pin", parse(), lambda: 4, threads=Threads(cpus=(1, 0)))
+    assert chosen.threads == Threads(2, 2, (0, 1))
+    for threads in (Threads(cpus=(0, 3)), Threads(batch=3)):
+        with pytest.raises(SelectionConflict, match="explicit launch threads"):
+            selection(model, 0, "pin", parse(), lambda: 4, threads=threads)
 
 
 def test_controller_filters_conflicting_measurements_before_start(tmp_path, monkeypatch):
@@ -404,14 +471,14 @@ def test_controller_filters_conflicting_measurements_before_start(tmp_path, monk
         policy(tmp_path, "linux"),
         host=object(),
         emit=lambda _: None,
-        configuration=LaunchSpec("/fixture/model.gguf", 8080, overrides=(("cpu.threads", "4"),)),
+        configuration=LaunchSpec("/fixture/model.gguf", 8080, threads=Threads(3)),
     )
     value.controller(
         "/recorded", "/output", 8080, (4, "all"), [], host_threads=lambda: 4, stdout=None
     )
     selected = captured["machine_factory"]("/recorded")
     assert selected.configs == [(4, "all")]
-    assert selected.settings(4, "all").at("cpu.threads").value == 4
+    assert selected.selected(4, "all").threads == Threads(3, 3)
     assert selected.ubatch("all") == 512
     assert selected.route("all") is None
     value.controller(
@@ -452,18 +519,68 @@ def test_controller_rejects_unconfigured_history_persistence(tmp_path):
 @pytest.mark.parametrize("threads", [4, 8])
 def test_mac_measured_prefill_threads_are_explicit_and_preserved(tmp_path, threads):
     inputs, spec, _, adapter, out, _ = setup(tmp_path, "darwin")
-    spec = replace(spec, overrides=(("cpu.threads", str(threads)),), batch_threads=12)
+    spec = replace(spec, threads=Threads(threads, 12))
     result = resolve(inputs, spec, adapter, out, "darwin")
     assert result.argv[result.argv.index("-t") + 1] == str(threads)
     assert result.argv[result.argv.index("-tb") + 1] == "12"
-    assert json.loads(result.outputs[-1].text)["launch"]["batch_threads"] == 12
+    assert "-C" not in result.argv and "--cpu-strict" not in result.argv
+    launch = json.loads(result.outputs[-1].text)["launch"]
+    assert launch["decode_threads"] == threads and launch["batch_threads"] == 12
 
 
-@pytest.mark.parametrize("batch_threads", [0, -1, 257, True])
-def test_bad_explicit_batch_threads_refused_before_native_file(tmp_path, batch_threads):
+@pytest.mark.parametrize(
+    "threads,decode,batch,mask",
+    [
+        (Threads(6), "6", "6", None),
+        (Threads(batch=5), None, "5", None),
+        (Threads(cpus=(5, 0, 9)), "3", "3", "0x221"),
+        (Threads(2, 3, (64, 1, 2)), "2", "3", hex((1 << 64) | 6)),
+    ],
+)
+def test_threadpool_counts_and_strict_cpu_masks_reach_native_argv(
+    tmp_path, threads, decode, batch, mask
+):
     inputs, spec, _, adapter, out, _ = setup(tmp_path)
-    with pytest.raises(ValueError, match="batch_threads"):
-        resolve(inputs, replace(spec, batch_threads=batch_threads), adapter, out)
+    # Decode participants bound only the decode pool, the one that runs decode.
+    spec = replace(spec, overrides=spec.overrides + (("cpu.decode_participants", "2"),))
+    result = resolve(inputs, replace(spec, threads=threads), adapter, out)
+    argv = list(result.argv)
+    assert (argv[argv.index("-t") + 1] if "-t" in argv else None) == decode
+    assert argv[argv.index("-tb") + 1] == batch
+    if mask is None:
+        assert not {"-C", "-Cb", "--cpu-strict", "--cpu-strict-batch"} & set(argv)
+    else:
+        assert argv[argv.index("-C") + 1] == argv[argv.index("-Cb") + 1] == mask
+        assert argv[argv.index("--cpu-strict") + 1] == "1"
+        assert argv[argv.index("--cpu-strict-batch") + 1] == "1"
+    launch = json.loads(result.outputs[-1].text)["launch"]
+    assert launch["cpus"] == sorted(threads.cpus)
+
+
+@pytest.mark.parametrize(
+    "platform,threads,overrides,message",
+    [
+        ("linux", Threads(batch=0), (), "thread counts"),
+        ("linux", Threads(batch=-1), (), "thread counts"),
+        ("linux", Threads(batch=257), (), "thread counts"),
+        ("linux", Threads(batch=True), (), "thread counts"),
+        ("linux", Threads(decode=0), (), "thread counts"),
+        ("linux", Threads(cpus=(512,)), (), "strict CPUs"),
+        ("linux", Threads(cpus=(1, 1)), (), "strict CPUs"),
+        ("linux", Threads(3, cpus=(0, 1)), (), "exceed the strict CPUs"),
+        ("linux", Threads(batch=3, cpus=(0, 1)), (), "exceed the strict CPUs"),
+        ("darwin", Threads(cpus=(0, 1)), (), "cannot pin"),
+        ("linux", Threads(cpus=(0, 1)), (("cpu.io_cpus", "1"),), "overlaps"),
+        ("linux", Threads(2, 4), (("cpu.decode_participants", "3"),), "decode_participants"),
+    ],
+)
+def test_bad_explicit_threads_refused_before_native_file(
+    tmp_path, platform, threads, overrides, message
+):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
+    spec = replace(spec, threads=threads, overrides=spec.overrides + overrides)
+    with pytest.raises(ValueError, match=message):
+        resolve(inputs, spec, adapter, out, platform)
     assert not (out / "settings.ssd").exists()
 
 
@@ -477,6 +594,11 @@ def test_bad_explicit_batch_threads_refused_before_native_file(tmp_path, batch_t
         ("--no-host",),
         ("--tensor-split=1,0",),
         ("-otbad",),
+        ("--cpu-mask=ff",),
+        ("-Cr", "0-3"),
+        ("-Cb0xff",),
+        ("--cpu_strict", "0"),
+        ("--cpu-strict-batch", "0"),
     ],
 )
 def test_extra_cannot_replace_selected_native_placement(tmp_path, extra):

@@ -178,7 +178,6 @@ static std::vector<float> reference(const fixture & f, int layer, const std::vec
     return output;
 }
 
-using sink_ptr = std::unique_ptr<kimi_cpu_sink, decltype(&kimi_cpu_sink_destroy)>;
 using prefill_ptr = std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)>;
 
 struct executor {
@@ -188,11 +187,11 @@ struct executor {
     static bool resolve(void * user, const char * name, int32_t id, kimi_cpu_sink_source * out) {
         return fixture::resolve(static_cast<executor *>(user)->active, name, id, out);
     }
-    executor(fixture_inputs & inputs, fixture & f, int threads, int depth) : active(&f), sink(nullptr, kimi_cpu_sink_destroy),
+    executor(fixture_inputs & inputs, fixture & f, int threads, int depth) : active(&f),
             prefill(nullptr, kimi_cpu_prefill_destroy) {
         test_resources::cpu_participants(threads - 1, 1);
         char error[512] = {};
-        sink.reset(inputs.create(threads, depth, resolve, this, error, sizeof(error)));
+        sink = inputs.create(threads, depth, resolve, this, error, sizeof(error));
         require(bool(sink), std::string("sink create: ") + error);
         prefill.reset(kimi_cpu_prefill_create(sink.get(), error, sizeof(error)));
         require(bool(prefill), std::string("prefill create: ") + error);

@@ -2092,8 +2092,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(args[0], "ffn_moe_cpu_sink_in", il);
         cb(args[1], "ffn_moe_cpu_sink_ids", il);
         cb(args[2], "ffn_moe_cpu_sink_weights", il);
+        // every CPU thread of the graph is a compute participant of the node's call
         ggml_tensor * result = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1,
-            args, hint ? 6 : cache_compute ? 5 : post_exp_norm ? 4 : 3, llama_kimi_cpu_sink_compute, 1, descriptor.get());
+            args, hint ? 6 : cache_compute ? 5 : post_exp_norm ? 4 : 3, llama_kimi_cpu_sink_compute,
+            GGML_N_TASKS_MAX, descriptor.get());
         res->cpu_sink_nodes.emplace_back(std::move(descriptor));
         cb(result, "ffn_moe_cpu_sink", il);
         ggml_backend_sched_set_tensor_backend(sched, result, backend_cpu);

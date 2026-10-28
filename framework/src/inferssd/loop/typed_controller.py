@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import asdict
 from typing import Any, cast
 
-from inferssd.configuration.settings import Snapshot
+from inferssd.configuration.derive import Selection
 from inferssd.loop.controller import Controller
 from inferssd.loop.ports import Engine
 from inferssd.model.machine import Machine
@@ -15,8 +16,8 @@ class TypedController(Controller):
     def __init__(
         self,
         *args: Any,
-        configuration: Callable[[Machine, int, str], Snapshot],
-        typed_engine: Callable[[str, int, int, str, Sequence[str], Snapshot], Engine],
+        configuration: Callable[[Machine, int, str], Selection],
+        typed_engine: Callable[[str, int, int, str, Sequence[str], Selection], Engine],
         keeps_history: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -36,7 +37,8 @@ class TypedController(Controller):
                 "inst": len(self.insts) - 1,
                 "tier": tier,
                 "cpus": cpus,
-                "settings": selected.document(),
+                "settings": selected.settings.document(),
+                "threads": asdict(selected.threads),
                 "ok": self.engine.ok,
                 "start_s": round(self.engine.start_s, 1),
             }

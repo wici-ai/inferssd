@@ -12,11 +12,12 @@ from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 
+from inferssd.configuration.settings import cpus
 from inferssd.launch.prepare import prepare
 from inferssd.launch.recorded import RecordedArtifacts, run_indexer
 from inferssd.launch.resources import read_resources
 from inferssd.launch.typed import LaunchSpec, resolve_typed
-from inferssd.launch.types import LaunchInput, Output
+from inferssd.launch.types import LaunchInput, Output, Threads
 from inferssd.platform.policy import Policy
 from inferssd.platform.run_directory import reserve
 
@@ -59,7 +60,16 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     launch.add_argument("--batch", type=int, default=512)
     launch.add_argument("--ubatch", type=int, default=512)
     launch.add_argument(
-        "--batch-threads", type=int, help="native prefill threads (1..256; defaults to cpu.threads)"
+        "--threads", type=int, help="decode ggml threads, -t (1..256; default: the server's)"
+    )
+    launch.add_argument(
+        "--batch-threads", type=int, help="prefill ggml threads, -tb (1..256; default: --threads)"
+    )
+    launch.add_argument(
+        "--cpus",
+        type=cpus,
+        default=(),
+        help="pin both ggml threadpools one thread per CPU, e.g. 0-6 (default: unpinned)",
     )
     launch.add_argument("--result", type=Path, help="dry-run resolution receipt")
     launch.add_argument("extra", nargs=argparse.REMAINDER)
@@ -83,7 +93,7 @@ def specification(args: argparse.Namespace) -> LaunchSpec:
         args.context,
         args.batch,
         args.ubatch,
-        args.batch_threads,
+        Threads(args.threads, args.batch_threads, args.cpus),
         str(args.template.resolve()) if args.template else None,
         read_resources(args.resources) if args.resources else None,
     )

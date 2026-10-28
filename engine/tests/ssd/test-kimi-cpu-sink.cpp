@@ -273,13 +273,12 @@ static std::vector<float> reference(const fixture & f, int layer, const std::vec
     return output;
 }
 
-using sink_ptr = std::unique_ptr<kimi_cpu_sink, decltype(&kimi_cpu_sink_destroy)>;
 static sink_ptr make_sink(fixture_inputs & inputs, fixture & f, int threads, int depth) {
     test_resources::cpu_participants(threads - 1, 1);
     char error[512] = {};
-    auto * sink = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
-    require(sink, std::string("create: ") + error);
-    return sink_ptr(sink, kimi_cpu_sink_destroy);
+    auto sink = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
+    require(bool(sink), std::string("create: ") + error);
+    return sink;
 }
 
 struct sample_result {
@@ -670,8 +669,7 @@ static void registered_lifecycle_tests(fixture_inputs & inputs) {
     make_synthetic(large);
     fixture_selector selector; selector.active = &small;
     char error[512] = {};
-    sink_ptr sink(inputs.create(4, 2, fixture_selector::resolve, &selector, error, sizeof(error)),
-                  kimi_cpu_sink_destroy);
+    sink_ptr sink = inputs.create(4, 2, fixture_selector::resolve, &selector, error, sizeof(error));
     require(bool(sink), std::string("create: ") + error);
     std::vector<float> xs(small.latent), xl(large.latent);
     for (size_t i = 0; i < xs.size(); ++i) { xs[i] = float(int(i % 23) - 11) * 0.02f; }
@@ -885,23 +883,19 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
     make_synthetic(small);
     large.latent = 512; large.hidden = 1024; make_synthetic(large);
     fixture_selector selector; selector.active = &small;
-    const char * names[] = { "split_cv",
+    const char * names[] = {
         "ready_first", "row_weights",
-        "compute_cpus", "io_cpus",
+        "io_cpus",
         "early_up_gate", "poll_us",
         "role_major", "nonblocking_down_sched",
         "dynamic_rows", "dynamic_chunk_rows" };
     std::map<std::string, std::string> original;
     for (const char * name : names) { if (inputs.get(name)) { original[name] = inputs.get(name); } }
+    // The sink pins only its own I/O threads (modes 6 and 7, on one CPU); its compute participants are the
+    // caller's threads, whose placement it never changes.
     const ssd::platform::cpu_list allowed = test_resources::process_cpus();
-    // The schedule matrix pins every participant to its own CPU; fewer CPUs is a missing resource.
-    test_resources::need(!schedules || int(allowed.size()) >= threads,
-            "schedule fixture pins " + std::to_string(threads) + " participants but affinity has " + std::to_string(allowed.size()) + " CPUs");
-    std::string weighted, cpus;
-    for (int i = 0; i < threads - 1; ++i) {
-        weighted += std::string(i ? "," : "") + (i < 4 ? "1" : "0.6");
-        if (schedules) { cpus += std::string(i ? "," : "") + std::to_string(allowed[i]); }
-    }
+    std::string weighted;
+    for (int i = 0; i < threads - 1; ++i) { weighted += std::string(i ? "," : "") + (i < 4 ? "1" : "0.6"); }
     // Preserve original ordinary schedule IDs, independently of vector indices.
     const std::vector<int> mode_ids = schedules ? std::vector<int>{ 0, 1, 6, 7 } : std::vector<int>{ 0, 1 };
     const int modes = int(mode_ids.size());
@@ -909,25 +903,22 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
     std::vector<bool> ready(modes, false);
     for (int index = 0; index < modes; ++index) {
         const int mode = mode_ids[index];
-        inputs.set(names[5], role_major || nonblocking_down_sched || (early_up_gate && mode) ? "1" : "0");
-        inputs.set(names[6], poll && mode ? std::to_string(poll).c_str() : "0");
-        inputs.set(names[7], (role_major || nonblocking_down_sched) && mode ? "1" : "0");
-        inputs.set(names[8], nonblocking_down_sched && mode ? "1" : "0");
+        inputs.set(names[3], role_major || nonblocking_down_sched || (early_up_gate && mode) ? "1" : "0");
+        inputs.set(names[4], poll && mode ? std::to_string(poll).c_str() : "0");
+        inputs.set(names[5], (role_major || nonblocking_down_sched) && mode ? "1" : "0");
+        inputs.set(names[6], nonblocking_down_sched && mode ? "1" : "0");
         const bool dynamic = schedules ? mode >= 7 : nonblocking_down_sched && mode;
-        inputs.set(names[9], dynamic ? "1" : "0");
-        inputs.set(names[10], "16");
+        inputs.set(names[7], dynamic ? "1" : "0");
+        inputs.set(names[8], "16");
         if (schedules) {
             ready[index] = mode == 1 || mode == 7;
-            inputs.set(names[0], mode == 1 || mode == 6 ? "1" : "0");
-            inputs.set(names[1], ready[index] ? "1" : "0");
-            inputs.set(names[2], mode == 6 ? weighted.c_str() : "");
-            inputs.set(names[3], mode >= 3 ? cpus.c_str() : "");
-            inputs.set(names[4], mode >= 3 ? std::to_string(allowed[threads - 1]).c_str() : "");
+            inputs.set(names[0], ready[index] ? "1" : "0");
+            inputs.set(names[1], mode == 6 ? weighted.c_str() : "");
+            inputs.set(names[2], mode >= 3 ? std::to_string(allowed.back()).c_str() : "");
             // Mode 7 exercises dynamic rows through ordinary compute_phase.
         }
         char error[512] = {};
-        sinks.emplace_back(inputs.create(threads, depth, fixture_selector::resolve,
-            &selector, error, sizeof(error)), kimi_cpu_sink_destroy);
+        sinks.push_back(inputs.create(threads, depth, fixture_selector::resolve, &selector, error, sizeof(error)));
         require(bool(sinks[index]), std::string("schedule create: ") + error);
         configure_cache(sinks[index].get(), 8 * triplet_bytes(large), { 1, 2 }, 4);
     }
@@ -936,7 +927,7 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
         else { inputs.unset(name); }
     }
     auto check_affinity = [&] {
-        require(test_resources::process_cpus() == allowed, "sink failed to restore caller affinity");
+        require(test_resources::process_cpus() == allowed, "sink changed the caller's affinity");
     };
     check_affinity();
     uint64_t token = 0;
@@ -1044,50 +1035,76 @@ static void schedule_invalid_tests(fixture_inputs & inputs) {
         { "dynamic_chunk_rows", "17" },
         { "dynamic_chunk_rows", "16385" },
         { "dynamic_chunk_rows", "64x" },
-        { "row_weights", "1,1" }, // 4 total threads needs 3 weights
         { "row_weights", "1,0,1" },
         { "row_weights", "1,nan,1" },
         { "row_weights", "1,inf,1" },
         { "row_weights", "1,1,-1" },
         { "row_weights", "1,1,1," },
-        { "compute_cpus", "0,0,0" },
-        { "compute_cpus", "1024,1025,1026" },
         { "io_cpus", "-1" },
         { "io_cpus", "1x" },
+        { "io_cpus", "0,0" },
+        { "io_cpus", "1024" },
+        { "decode_participants", "513" },
     };
     for (const auto & item : invalid) {
         inputs.set(item.first, item.second);
         char error[512] = {};
-        sink_ptr sink(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        sink_ptr sink = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
         inputs.unset(item.first);
         require(!sink && error[0], std::string("invalid schedule accepted: ") + item.first + "=" + item.second);
     }
     char error[512] = {};
-    sink_ptr incompatible(nullptr, kimi_cpu_sink_destroy);
+    sink_ptr incompatible;
     inputs.set("dynamic_rows", "1");
     inputs.set("row_weights", "1,1,1");
-    incompatible.reset(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)));
+    incompatible = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
     inputs.unset("dynamic_rows");
     inputs.unset("row_weights");
     require(!incompatible && std::strstr(error, "mutually exclusive"), "dynamic rows accepted static row weights");
     inputs.set("role_major", "1");
-    incompatible.reset(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)));
+    incompatible = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
     inputs.unset("role_major");
     require(!incompatible && std::strstr(error, "EARLY_UP_GATE=1"), "role-major accepted without early up/gate");
 
     inputs.set("nonblocking_down_sched", "1");
-    incompatible.reset(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)));
+    incompatible = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
     require(!incompatible && std::strstr(error, "ROLE_MAJOR=1"), "nonblocking scheduler accepted without role-major");
     inputs.set("role_major", "1");
     inputs.set("early_up_gate", "1");
     inputs.set("ready_first", "0");
-    incompatible.reset(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)));
+    incompatible = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
     require(!incompatible && std::strstr(error, "READY_FIRST=1"), "nonblocking scheduler accepted unordered reduction");
     inputs.unset("nonblocking_down_sched");
     inputs.unset("role_major");
     inputs.unset("early_up_gate");
     inputs.unset("ready_first");
-    std::printf("SCHEDULE_INVALID_SETTINGS_REJECTED cases=%zu\n", sizeof(invalid) / sizeof(invalid[0]));
+    // Inputs counted in participants are checked against each run's: three here.
+    tensors meta(f, 1);
+    std::vector<float> input(f.latent, .1f), output(f.latent);
+    const int32_t id = 1; const float weight = 1;
+    const std::pair<const char *, const char *> per_run[] = {
+        { "row_weights", "1,1" },
+        { "decode_participants", "4" },
+    };
+    for (const auto & item : per_run) {
+        inputs.set(item.first, item.second);
+        sink_ptr sink = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
+        inputs.unset(item.first);
+        require(bool(sink), std::string("per-run schedule rejected at creation: ") + error);
+        require(!kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight, 1,
+            4, 25, output.data(), nullptr, error, sizeof(error)) && error[0],
+            std::string("per-run schedule accepted: ") + item.first + "=" + item.second);
+        std::printf("case=per_run_%s status=PASS error=%s\n", item.first, error);
+    }
+    // One call at a time, of 1..512 participants.
+    sink_ptr sink = inputs.create(2, 1, fixture::resolve, &f, error, sizeof(error));
+    require(bool(sink), std::string("create: ") + error);
+    require(!kimi_cpu_sink_call_open(sink.get(), 0, error, sizeof(error)) && error[0], "empty call accepted");
+    require(!kimi_cpu_sink_call_open(sink.get(), 513, error, sizeof(error)) && error[0], "oversized call accepted");
+    require(kimi_cpu_sink_call_open(sink.get(), 1, error, sizeof(error)), error);
+    require(!kimi_cpu_sink_call_open(sink.get(), 1, error, sizeof(error)) && error[0], "second open call accepted");
+    kimi_cpu_sink_call_close(sink.get());
+    std::printf("SCHEDULE_INVALID_SETTINGS_REJECTED cases=%zu\n", sizeof(invalid) / sizeof(invalid[0]) + 2);
 }
 
 static void cache_release_test(fixture_inputs & inputs, int threads, int depth) {
@@ -1513,8 +1530,7 @@ static void cache_tests(fixture_inputs & inputs, int threads, int depth) {
     fixture other; make_synthetic(other, 20260909);
     fixture_selector selector; selector.active = &f;
     char error[512] = {};
-    sink_ptr identities(inputs.create(threads, depth, fixture_selector::resolve, &selector, error, sizeof(error)),
-            kimi_cpu_sink_destroy);
+    sink_ptr identities = inputs.create(threads, depth, fixture_selector::resolve, &selector, error, sizeof(error));
     require(bool(identities), std::string("identity sink create: ") + error);
     configure_cache(identities.get(), 2 * unit, { 1 }, 2);
     begin_cache(identities.get(), 100, 1);
@@ -1557,13 +1573,13 @@ static void cache_hitrate_tests(fixture_inputs & inputs, int threads, int depth)
     unsigned rejected = 0;
     for (const char * value : { "", "1", "1:", ":1", "1:2,", "1:2,,2:2", "1:2,1:2", "1:-1", "1024:1", "1:897", "1:2x", "1:1:2" }) {
         inputs.set(quotas, value); char error[512] = {};
-        sink_ptr s(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        sink_ptr s = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
         require(!s && error[0], "invalid layer quota accepted"); ++rejected;
     }
     inputs.unset(quotas);
     for (const char * value : { "", "0", "536870911", "-1", "536870912x", "18446744073709551616" }) {
         inputs.set(reserve, value); char error[512] = {};
-        sink_ptr s(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        sink_ptr s = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
         require(!s && error[0], "invalid cache reserve accepted"); ++rejected;
     }
     for (const char * value : { "2147483649", "2466374752", "12884901888", "18446744073709551615" }) {
@@ -2048,8 +2064,8 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
     for (const int k : { 10, 65 }) {
         require(inputs.set("prefetch_depth", std::to_string(k).c_str()) == 0, "set prefetch depth");
         char error[512] = {};
-        sink_ptr sink(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
-        require(k == 10 ? sink != nullptr : sink == nullptr && std::strstr(error, "must be 0..64"),
+        sink_ptr sink = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
+        require(k == 10 ? bool(sink) : !sink && std::strstr(error, "must be 0..64"),
                 "prefetch depth " + std::to_string(k) + ": " + error);
     }
     for (const int k : { 2, 0 }) {
@@ -2332,7 +2348,7 @@ static void elastic_cache_tests(fixture_inputs & inputs, int threads, int depth)
 
     auto rejected = [&](const char * message) {
         char error[512] = {};
-        sink_ptr value(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        sink_ptr value = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
         require(!value && error[0], message);
     };
     {
@@ -2920,7 +2936,7 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
         for (const char * bad : { "", "2", "yes" }) {
             scoped_fixture_input env(inputs, "cache_reclaimable_file", bad);
             char error[512] = {};
-            sink_ptr rejected(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+            sink_ptr rejected = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
             require(!rejected && error[0], "invalid CACHE_RECLAIMABLE_FILE was accepted");
         }
         scoped_fixture_input reclaim_env(inputs, "cache_reclaimable_file", "1");
@@ -3494,6 +3510,162 @@ static void host_ledger_tests(fixture_inputs & inputs) {
 #include "configured-runtime-gate.h"
 #endif
 
+// The production shape of a call: graphs of sink nodes that every thread of a ggml threadpool enters, ith 0 as the
+// coordinator that opens, runs and closes the call and the others as its participants, as
+// llama_kimi_cpu_sink_compute does. Chained decode layers with a dense op between them, a grouped prefill and a run
+// that fails inside its call, at 1, 2, an odd count and all CPUs, with every decode participant and with a fixed
+// first few, bit for bit against the ggml reference graphs.
+struct graph_layer {
+    kimi_cpu_sink * sink = nullptr;
+    kimi_cpu_prefill * prefill = nullptr;
+    const tensors * meta = nullptr;
+    bool fail = false;
+    bool ok = false;
+    int nth = 0; // the participants ggml gave the call
+    std::string error;
+};
+
+static void graph_layer_compute(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    auto & layer = *static_cast<graph_layer *>(userdata);
+    if (ith) { kimi_cpu_sink_call_join(layer.sink, ith, nth); return; }
+    char error[512] = {};
+    if (!kimi_cpu_sink_call_open(layer.sink, nth, error, sizeof(error))) {
+        std::fprintf(stderr, "graph call open: %s\n", error);
+        std::abort();
+    }
+    layer.nth = nth;
+    const ggml_tensor * x = dst->src[0], * ids = dst->src[1], * weights = dst->src[2];
+    const int ntokens = int(dst->ne[1]), nslots = int(ggml_nelements(ids) / ntokens);
+    const auto * id = static_cast<const int32_t *>(ids->data);
+    const auto * w = static_cast<const float *>(weights->data);
+    auto * out = static_cast<float *>(dst->data);
+    const auto * in = static_cast<const float *>(x->data);
+    const auto & m = *layer.meta;
+    if (layer.prefill) {
+        layer.ok = kimi_cpu_prefill_run(layer.prefill, m.role[0], m.role[1], m.role[2], in, id, w, nslots, ntokens,
+            4.0f, 25.0f, out, nullptr, error, sizeof(error));
+    } else {
+        // an invalid slot count fails after the call opened: the joiners must still leave
+        layer.ok = kimi_cpu_sink_run(layer.sink, m.role[0], m.role[1], m.role[2], in, id, w, layer.fail ? -1 : nslots,
+            4.0f, 25.0f, out, nullptr, error, sizeof(error));
+    }
+    layer.error = error;
+    kimi_cpu_sink_call_close(layer.sink);
+}
+
+static void threadpool_tests(fixture_inputs & inputs, int depth) {
+    fixture f; make_synthetic(f);
+    tensors meta1(f, 1), meta2(f, 2);
+    const int cpus = int(test_resources::process_cpus().size());
+    std::vector<int> counts = { 1, 2, 3 };
+    if (cpus > 3) { counts.push_back(cpus); }
+    const std::vector<int32_t> ids1 = { 17, 0, 8, 2, 19, 4, 11, 6 }, ids2 = { 3, 9, -1, 13, 5, 3, 1, 12 };
+    const std::vector<float> w1 = { .2f, .1f, .15f, .05f, .1f, .1f, .2f, .1f }, w2 = { .3f, .1f, 0, .2f, .1f, .1f, .1f, .1f };
+    std::vector<float> x(f.latent);
+    for (int i = 0; i < f.latent; ++i) { x[i] = std::sin(float(i) * .37f) * .3f; }
+    // decode: layer 1, x0.5, layer 2, layer 1 (three calls a graph); then the reference chain
+    auto expected = reference(f, 1, x, ids1, w1, 4, 25);
+    for (auto & v : expected) { v *= .5f; }
+    expected = reference(f, 2, expected, ids2, w2, 4, 25);
+    expected = reference(f, 1, expected, ids1, w1, 4, 25);
+    constexpr int ntokens = 5, nslots = 4;
+    std::vector<float> xs(size_t(ntokens) * f.latent);
+    std::vector<int32_t> prefill_ids(size_t(ntokens) * nslots);
+    std::vector<float> prefill_weights(prefill_ids.size()), prefill_expected;
+    for (size_t i = 0; i < xs.size(); ++i) { xs[i] = std::cos(float(i) * .11f) * .25f; }
+    for (int t = 0; t < ntokens; ++t) {
+        for (int s = 0; s < nslots; ++s) {
+            prefill_ids[size_t(t) * nslots + s] = (t * 5 + s * 7 + 1) % f.experts;
+            prefill_weights[size_t(t) * nslots + s] = float(t + s + 1) / 17.0f;
+        }
+        const auto y = reference(f, 2, { xs.begin() + size_t(t) * f.latent, xs.begin() + size_t(t + 1) * f.latent },
+            { prefill_ids.begin() + size_t(t) * nslots, prefill_ids.begin() + size_t(t + 1) * nslots },
+            { prefill_weights.begin() + size_t(t) * nslots, prefill_weights.begin() + size_t(t + 1) * nslots }, 4, 25);
+        prefill_expected.insert(prefill_expected.end(), y.begin(), y.end());
+    }
+    char error[512] = {};
+    for (int fixed : { 0, 2 }) {
+        scoped_fixture_input participants(inputs, "decode_participants", fixed ? std::to_string(fixed).c_str() : nullptr);
+        // one participant only: the sink computes on the callers' threads
+        sink_ptr sink = inputs.create(2, depth, fixture::resolve, &f, error, sizeof(error));
+        require(bool(sink), std::string("threadpool create: ") + error);
+        std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)> prefill(
+            kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+        require(bool(prefill), std::string("threadpool prefill create: ") + error);
+        for (int n : counts) {
+            if (fixed > n) { continue; }
+            ggml_threadpool_params params = ggml_threadpool_params_default(n);
+            std::unique_ptr<ggml_threadpool, decltype(&ggml_threadpool_free)> pool(ggml_threadpool_new(&params),
+                ggml_threadpool_free);
+            require(bool(pool), "ggml threadpool");
+            auto compute = [&](ggml_cgraph * graph) {
+                ggml_cplan plan = ggml_graph_plan(graph, n, pool.get());
+                std::vector<uint8_t> work(plan.work_size);
+                plan.work_data = work.data();
+                require(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS, "threadpool graph compute");
+            };
+            const size_t bytes = 64 * ggml_tensor_overhead() + ggml_graph_overhead() + (size_t(4) << 20);
+            for (int repeat = 0; repeat < 3; ++repeat) {
+                ggml_context * ctx = ggml_init({ bytes, nullptr, false });
+                require(ctx, "threadpool graph context");
+                auto vector = [&](ggml_type type, int64_t n0, int64_t n1, const void * data) {
+                    ggml_tensor * t = ggml_new_tensor_2d(ctx, type, n0, n1);
+                    std::memcpy(t->data, data, ggml_nbytes(t));
+                    return t;
+                };
+                graph_layer layers[4];
+                ggml_tensor * i1 = vector(GGML_TYPE_I32, 8, 1, ids1.data()), * i2 = vector(GGML_TYPE_I32, 8, 1, ids2.data());
+                ggml_tensor * v1 = vector(GGML_TYPE_F32, 8, 1, w1.data()), * v2 = vector(GGML_TYPE_F32, 8, 1, w2.data());
+                auto node = [&](graph_layer & layer, const tensors & m, ggml_tensor * in, ggml_tensor * id, ggml_tensor * w) {
+                    layer.sink = sink.get(); layer.meta = &m;
+                    ggml_tensor * args[] = { in, id, w };
+                    return ggml_custom_4d(ctx, GGML_TYPE_F32, f.latent, in->ne[1], 1, 1, args, 3, graph_layer_compute,
+                        GGML_N_TASKS_MAX, &layer);
+                };
+                ggml_cgraph * graph = ggml_new_graph(ctx);
+                ggml_tensor * y = node(layers[0], meta1, vector(GGML_TYPE_F32, f.latent, 1, x.data()), i1, v1);
+                y = ggml_scale(ctx, y, .5f);
+                // a run that fails between successful ones (its own output): no participant waits for it, and the
+                // next call still runs
+                const bool failing = repeat == 1;
+                if (failing) {
+                    layers[3].fail = true;
+                    ggml_build_forward_expand(graph, node(layers[3], meta2, y, i2, v2));
+                }
+                y = node(layers[1], meta2, y, i2, v2);
+                y = node(layers[2], meta1, y, i1, v1);
+                ggml_build_forward_expand(graph, y);
+                compute(graph);
+                for (int l = 0; l < 3; ++l) {
+                    require(layers[l].ok, "threadpool decode layer: " + layers[l].error);
+                    require(layers[l].nth == n, "threadpool decode call participants " + std::to_string(layers[l].nth));
+                }
+                require(!failing || (!layers[3].ok && !layers[3].error.empty()), "threadpool accepted an invalid run");
+                require(!std::memcmp(y->data, expected.data(), expected.size() * sizeof(float)),
+                    "threadpool decode differs from the reference graph threads=" + std::to_string(n));
+                ggml_free(ctx);
+                ctx = ggml_init({ bytes, nullptr, false });
+                require(ctx, "threadpool prefill context");
+                graph_layer grouped;
+                grouped.prefill = prefill.get();
+                ggml_tensor * p = node(grouped, meta2, vector(GGML_TYPE_F32, f.latent, ntokens, xs.data()),
+                    vector(GGML_TYPE_I32, nslots, ntokens, prefill_ids.data()),
+                    vector(GGML_TYPE_F32, nslots, ntokens, prefill_weights.data()));
+                graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, p);
+                compute(graph);
+                require(grouped.ok, "threadpool prefill: " + grouped.error);
+                require(grouped.nth == n, "threadpool prefill call participants " + std::to_string(grouped.nth));
+                require(!std::memcmp(p->data, prefill_expected.data(), prefill_expected.size() * sizeof(float)),
+                    "threadpool prefill differs from the reference graph threads=" + std::to_string(n));
+                ggml_free(ctx);
+            }
+            std::printf("case=threadpool threads=%d decode_participants=%d bit_exact=1 status=PASS\n", n, fixed);
+        }
+    }
+    std::printf("CPU_SINK_THREADPOOL_OK counts=%zu\n", counts.size());
+}
+
 int main(int argc, char ** argv) {
     fixture_inputs inputs;
     try {
@@ -3505,7 +3677,7 @@ int main(int argc, char ** argv) {
         bool poll_mode = false, poll_early_mode = false, cache_compute_mode = false, cache_location_mode = false;
         bool cache_policy_mode = false, cache_large_mode = false, cache_pressure_transition = false, cache_unbounded = false;
         bool activation_mode = false, q2_activation_mode = false, muse_q8_mode = false, muse_bf16_mode = false;
-        bool auto_ring_mode = false, prefetch_mode = false, cache_load_mode = false;
+        bool auto_ring_mode = false, prefetch_mode = false, cache_load_mode = false, threadpool_mode = false;
         std::string pack, prefix;
         for (int i = 1; i < argc; ++i) {
             auto argument = [&]() { require(i + 1 < argc, "missing option argument"); return argv[++i]; };
@@ -3547,6 +3719,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--muse-bf16-test")) { muse_bf16_mode = true; }
             else if (!std::strcmp(argv[i], "--activation-tests")) { activation_mode = true; }
             else if (!std::strcmp(argv[i], "--q2-activation-test")) { q2_activation_mode = true; }
+            else if (!std::strcmp(argv[i], "--threadpool-tests")) { threadpool_mode = true; }
             else { throw std::runtime_error("usage: test-kimi-cpu-sink [--registered-lifecycle|--cache-tests|--cache-pressure] [--threads N] [--fixture KEY=VALUE] [--real-pack FILE --fixture-prefix PREFIX --ring-experts N --repeats N --warmup N --policy fixture|top16|top8|mass085 --jsonl FILE --resident-dir TMPFS]"); }
         }
         require(options.threads >= 2 && options.threads <= 128 && options.ring_experts >= 1 && options.ring_experts <= 32, "invalid thread/ring count");
@@ -3598,6 +3771,7 @@ int main(int argc, char ** argv) {
         if (poll_mode || poll_early_mode) { schedule_tests(inputs, options.threads, options.ring_experts, false, poll_early_mode, 100); return 0; }
         if (schedules_mode) { schedule_tests(inputs, options.threads, options.ring_experts, true); return 0; }
         if (schedule_invalid_mode) { schedule_invalid_tests(inputs); return 0; }
+        if (threadpool_mode) { threadpool_tests(inputs, ring_set ? options.ring_experts : 2); return 0; }
         if (trace_profile_mode) { trace_profile_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (prefetch_mode) { prefetch_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (cache_policy_mode) { cache_policy_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }

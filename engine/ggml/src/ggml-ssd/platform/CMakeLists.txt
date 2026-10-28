@@ -12,8 +12,12 @@ else()
     target_compile_options(ggml-ssd-platform PRIVATE -Wall -Wextra -Wpedantic -Wshadow)
 endif()
 
-# Thread placement (CPU topology, pinning, roles) and arena memory primitives.
+# Thread placement (CPU topology, pinning, roles), parking words and arena
+# memory primitives. Windows parks on addresses through Synchronization.lib.
 target_sources(ggml-ssd-platform PRIVATE threads.cpp threads.h memory.cpp memory.h)
+if (WIN32)
+    target_link_libraries(ggml-ssd-platform PRIVATE synchronization)
+endif()
 
 # Files: direct and buffered opens, positional reads and file identity. Windows
 # reads a handle's no-buffering mode back through ntdll.

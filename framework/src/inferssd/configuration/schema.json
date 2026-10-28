@@ -19,37 +19,6 @@
             },
             "default": []
         },
-        "cpu.threads": {
-            "description": "Total CPU participants including the I/O participant",
-            "kind": "integer",
-            "unit": "participants",
-            "producer": "plan",
-            "scope": "all",
-            "cli": "--ssd-cpu-threads",
-            "default_literal": "2",
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 256,
-            "default": 2
-        },
-        "cpu.compute_cpus": {
-            "description": "Ordered unique CPU IDs for compute participants",
-            "kind": "cpus",
-            "unit": "CPU ID",
-            "producer": "plan",
-            "scope": "all",
-            "cli": "--ssd-cpu-compute-cpus",
-            "default_literal": "",
-            "type": "array",
-            "uniqueItems": true,
-            "maxItems": 65536,
-            "items": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 2147483647
-            },
-            "default": []
-        },
         "cpu.io_cpus": {
             "description": "Ordered unique CPU IDs for I/O participants",
             "kind": "cpus",
@@ -73,7 +42,7 @@
             "kind": "integer",
             "unit": "compute participants",
             "producer": "plan",
-            "scope": "linux",
+            "scope": "all",
             "cli": "--ssd-cpu-decode-participants",
             "default_literal": "0",
             "type": "integer",

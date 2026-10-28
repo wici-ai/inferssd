@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -50,32 +51,11 @@ bool affinity_supported();
 bool pin_current_thread(const cpu_list & cpus);
 bool pin_thread(std::thread::native_handle_type thread, const cpu_list & cpus);
 
-// Pins the calling thread for one scope and restores its previous placement
-// on every exit path; a failed restore aborts, as a caller running unrelated
-// work afterwards must never stay pinned. An empty list is a no-op. Destroy
-// it on the thread that made it.
-class scoped_affinity {
-public:
-    explicit scoped_affinity(const cpu_list & cpus);
-    ~scoped_affinity();
-    scoped_affinity(const scoped_affinity &) = delete;
-    scoped_affinity & operator=(const scoped_affinity &) = delete;
-    // False when the previous placement could not be saved or the pin failed;
-    // the thread is then left as it was.
-    bool ok() const { return ok_; }
-
-private:
-    bool restore() const;
-    bool ok_ = true;
-    bool active_ = false;
-    [[maybe_unused]] uint64_t saved_[16] = {}; // the OS's saved placement (none on macOS)
-};
-
-// Scheduler hints for the calling thread. compute and io opt out of Windows
-// EcoQoS throttling and take the macOS user-interactive / user-initiated QoS;
-// background returns to the system-managed default (macOS: utility QoS).
-// Linux: no-op.
-enum class thread_role { compute, io, background };
+// Scheduler hints for the calling thread. io opts out of Windows EcoQoS
+// throttling and takes the macOS user-initiated QoS; background returns to the
+// system-managed default (macOS: utility QoS). Linux: no-op. Compute threads
+// are ggml's, placed by its threadpool.
+enum class thread_role { io, background };
 bool set_thread_role(thread_role role);
 
 // CPU time consumed by the calling thread; 0 if unreadable. Windows advances
@@ -84,6 +64,14 @@ uint64_t thread_cpu_time_ns();
 
 // The CPU the calling thread runs on, or -1 (macOS, or not in group 0).
 int current_cpu();
+
+// A 32-bit word that threads park on until another thread changes it and
+// wakes them, with no lock (Linux futex, macOS os_sync_wait_on_address,
+// Windows WaitOnAddress). wait_on returns once the word differs from
+// `expected`, after a wake_all, or spuriously, so callers recheck their
+// condition; wake_all wakes every thread parked on the word.
+void wait_on(const std::atomic<uint32_t> & word, uint32_t expected) noexcept;
+void wake_all(const std::atomic<uint32_t> & word) noexcept;
 
 // Spin-wait hint. _mm_pause works with every x86 compiler, including MSVC,
 // which defines only _M_X64 and has no GCC builtins.

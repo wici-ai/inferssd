@@ -184,9 +184,9 @@ struct sink_configuration {
     ssd::cpu::testing::execution_policy policy;
 };
 
-// CPU lists name CPUs this process may run on. Where the OS cannot pin
-// (macOS), they are still validated and only their lengths are used.
-static std::vector<int> sink_cpus(const std::vector<int> & cpus, int count) {
+// The CPUs of the sink's own threads (cpu.io_cpus), within those this process
+// may run on. Where the OS cannot pin (macOS) they are still validated.
+static std::vector<int> sink_cpus(const std::vector<int> & cpus) {
     if (cpus.empty()) { return {}; }
     ssd::platform::cpu_list allowed;
     std::string why;
@@ -199,9 +199,6 @@ static std::vector<int> sink_cpus(const std::vector<int> & cpus, int count) {
         }
         result.push_back(cpu);
     }
-    if (count && result.size() != size_t(count)) {
-        throw std::runtime_error("cpu.compute_cpus requires cpu.threads - 1 CPUs, including the caller");
-    }
     return result;
 }
 
@@ -211,13 +208,54 @@ static void sink_pin(std::thread & thread, const std::vector<int> & cpus) {
     }
 }
 
-// The graph caller also runs unrelated work. Pin it to the first compute CPU
-// only for this sink call; the scope restores it on every exit path.
-struct sink_caller_affinity : ssd::platform::scoped_affinity {
-    explicit sink_caller_affinity(const std::vector<int> & caller_cpu) : scoped_affinity(caller_cpu) {
-        if (!ok()) { throw std::runtime_error("CPU sink affinity could not be applied exactly (no fallback)"); }
+// A call's participants are ggml threads.
+constexpr int sink_max_participants = GGML_MAX_N_THREADS;
+
+// Parks threads until a notify, without a lock: an event count. A waiter registers as a sleeper and rechecks its
+// condition before it parks, so a notify either finds it registered or the condition already changed; a notify
+// with nobody parked costs no system call. Conditions and the stores they observe are sequentially consistent.
+struct sink_event {
+    alignas(64) std::atomic<uint32_t> count{0};
+    std::atomic<uint32_t> sleepers{0};
+
+    // Parks once unless ready(); true if it parked.
+    template <typename Ready> bool park(Ready ready) {
+        const uint32_t seen = count.load();
+        sleepers.fetch_add(1);
+        const bool parks = !ready();
+        if (parks) { ssd::platform::wait_on(count, seen); }
+        sleepers.fetch_sub(1, std::memory_order_relaxed);
+        return parks;
+    }
+    void notify() {
+        count.fetch_add(1);
+        if (sleepers.load()) { ssd::platform::wake_all(count); }
     }
 };
+
+// The phase word the coordinator publishes: the phase generation (bits 0-31), its active participants (32-47), its
+// kind (48-50: a down phase, a parallel one, the run's last), the call's id (51-62) and whether it is open (63).
+struct sink_phase {
+    static constexpr uint64_t down = 1ull << 48, parallel = 1ull << 49, last = 1ull << 50, open = 1ull << 63;
+    uint64_t word = 0;
+    static uint64_t make(uint32_t generation, int active, uint64_t kind, uint32_t call) {
+        return uint64_t(generation) | uint64_t(uint16_t(active)) << 32 | kind | uint64_t(call & 0xfffu) << 51;
+    }
+    uint32_t generation() const { return uint32_t(word); }
+    int active() const { return int(uint16_t(word >> 32)); }
+    bool is(uint64_t kind) const { return (word & kind) != 0; }
+    uint32_t call() const { return uint32_t(word >> 51 & 0xfffu); }
+};
+
+// The waits at a node's boundaries, for the open at its start and for the close after the run's last phase, spin
+// briefly before they park; 20 us measured best on macOS and Windows, where longer spins slowed the runs.
+constexpr int sink_node_spin_us = 20;
+
+// The CPUs this process may run on; 1 when they cannot be read.
+static int sink_process_cpus() {
+    ssd::platform::cpu_list cpus;
+    return ssd::platform::process_cpus(cpus) && !cpus.empty() ? int(cpus.size()) : 1;
+}
 
 static double sink_thread_cpu_us() { return double(ssd::platform::thread_cpu_time_ns()) * 1e-3; }
 
@@ -233,7 +271,7 @@ using sink_request = ssd::host::expert_request;
 
 // How many CPUs this process may run on belong to the fastest cluster of a heterogeneous CPU (Arm big.LITTLE,
 // Intel P/E cores); every CPU on a homogeneous or unreadable machine, 0 when the CPUs cannot be read. Only a
-// candidate: decode measures it against all threads (sink_thread_choice).
+// candidate: decode measures it against all threads (decode_threads_setup).
 static int sink_fast_cpus() {
     ssd::platform::cpu_topology topology;
     return ssd::platform::topology(topology) ? int(topology.fast.size()) : 0;
@@ -472,7 +510,6 @@ struct sink_mrc {
 
 struct kimi_cpu_sink {
     const sink_configuration configuration;
-    const int compute_threads;
     const int ring_experts;
     kimi_cpu_sink_resolver resolver;
     void * userdata;
@@ -587,10 +624,6 @@ struct kimi_cpu_sink {
     std::string io_error;
     kimi_cpu_sink_stats current = {};
 
-    std::mutex compute_mutex;
-    std::condition_variable compute_cv;
-    std::condition_variable compute_done_cv;
-    const bool split_cv;
     const bool ready_first;
     bool cache_compute_active = false;
     kimi_cache_location_api locations = {};
@@ -599,14 +632,11 @@ struct kimi_cpu_sink {
     const bool role_major;
     const bool nonblocking_down_sched;
     const int poll_us;
-    alignas(64) std::atomic<uint64_t> poll_generation{0};
-    alignas(64) std::atomic<int> poll_pending{0};
     const bool dynamic_rows;
     const int dynamic_chunk_rows;
     sink_dynamic_row_counter dynamic_row_counter;
     const std::vector<double> row_weights;
-    const std::vector<int> compute_cpus, io_cpus;
-    const std::vector<int> caller_cpu; // the first compute CPU, for the graph caller during a sink call
+    const std::vector<int> io_cpus;
     std::vector<int> up_bounds, down_bounds;
     std::vector<float> expert_output;
     std::vector<uint8_t> expert_computed;
@@ -649,19 +679,32 @@ struct kimi_cpu_sink {
     sink_mrc mrc;
     double caller_cpu_start = 0;
     sink_clock::time_point phase_dispatch;
-    std::vector<sink_worker_profile> worker_profiles;
-    std::vector<std::thread> workers;
-    bool compute_stop = false;
-    uint64_t generation = 0;
-    int pending = 0;
-    bool down_phase = false;
+    std::vector<sink_worker_profile> worker_profiles; // one per participant of the open call
+    // The call's participants (kimi_cpu_sink_call_open) take no lock. The coordinator publishes each phase, and the
+    // call's open and close, as one word; joiners read it, compute their share of an active phase and park on
+    // `participants` in between, and the coordinator parks on `coordinator` for completions and arrivals.
+    sink_event participants, coordinator;
+    alignas(64) std::atomic<uint64_t> phase{0};   // sink_phase
+    alignas(64) std::atomic<uint32_t> pending{0}; // active joiners still computing the published phase
+    alignas(64) std::atomic<uint32_t> joined{0};  // joiners of the open call
+    // The coordinator's state, written before the phase word that publishes it: whether a call is open, its
+    // participants, its id and the generation it opened at, and the latest phase generation.
+    bool call_open = false;
+    int call_participants = 1;
+    uint32_t call_id = 0, call_generation = 0, generation = 0;
+    // Participants of the run in progress: the open call's, or the coordinator alone. Set by the run's thread
+    // before its first phase.
+    int threads = 1;
     // Participants of a compute phase: all for prefill; for decode, the choice below.
     int active_threads = 0;
     // Decode compute is a few short matvecs per expert, so a slow core's last chunk can hold every expert
-    // back, while prefill wants every core. Decode compares the fastest cluster's participants with all of
-    // them on live experts (mean CPU time per expert over probe_experts each) and keeps the faster one,
-    // re-checking every recheck_experts.
+    // back, while prefill wants every core. Decode compares the participants that fit the fastest cluster with
+    // all of them on live experts (mean CPU time per expert over probe_experts each) and keeps the faster one,
+    // re-checking every recheck_experts. Learned for decode_threads_for participants; a run with another count
+    // starts over.
     ssd::place::thread_learning decode_threads;
+    int decode_threads_for = 0;
+    const int fast_cpus; // CPUs of the fastest cluster (sink_fast_cpus)
     kimi_cpu_sink_parallel_fn parallel_fn = nullptr;
     void * parallel_userdata = nullptr;
     int latent = 0, hidden = 0;
@@ -680,22 +723,20 @@ struct kimi_cpu_sink {
     ggml_vec_dot_t dot_up = nullptr, dot_down = nullptr;
     ggml_from_float_t quantize_input = nullptr, quantize_hidden = nullptr;
 
-    kimi_cpu_sink(int threads, int depth, kimi_cpu_sink_resolver resolve, void * user,
-                  const sink_configuration & input = {}) :
-        configuration(input), compute_threads(threads - 1), ring_experts(depth), resolver(resolve), userdata(user), slots(depth),
+    kimi_cpu_sink(int depth, kimi_cpu_sink_resolver resolve, void * user, const sink_configuration & input = {}) :
+        configuration(input), ring_experts(depth), resolver(resolve), userdata(user), slots(depth),
         cache(sink_cache_options(configuration)),
-        split_cv(configuration.policy.split_cv), ready_first(configuration.policy.ready_first),
+        ready_first(configuration.policy.ready_first),
         early_up_gate(configuration.policy.early_up_gate), role_major(configuration.policy.role_major),
         nonblocking_down_sched(configuration.policy.nonblocking_down_sched), poll_us(configuration.policy.poll_us),
         dynamic_rows(configuration.policy.dynamic_rows), dynamic_chunk_rows(configuration.policy.dynamic_chunk_rows),
         row_weights(configuration.policy.row_weights),
-        compute_cpus(sink_cpus(configuration.policy.compute_cpus, threads - 1)),
-        io_cpus(sink_cpus(configuration.policy.io_cpus, 0)),
-        caller_cpu(compute_cpus.empty() ? std::vector<int>() : std::vector<int>{ compute_cpus[0] }),
+        io_cpus(sink_cpus(configuration.policy.io_cpus)),
         profile_enabled(configuration.debug.profile), trace_enabled(configuration.debug.trace),
-        timeline_enabled(configuration.debug.trace), mrc(configuration.debug.mrc), worker_profiles(threads - 1) {
+        timeline_enabled(configuration.debug.trace), mrc(configuration.debug.mrc), worker_profiles(1),
+        fast_cpus(sink_fast_cpus()) {
         if (poll_us < 0 || poll_us > 1000 || dynamic_chunk_rows < 16 || dynamic_chunk_rows > 16384 || dynamic_chunk_rows % 16 ||
-                configuration.policy.decode_participants < 0 || configuration.policy.decode_participants > compute_threads) {
+                configuration.policy.decode_participants < 0 || configuration.policy.decode_participants > sink_max_participants) {
             throw std::runtime_error("invalid explicit executor schedule");
         }
         if (configuration.policy.prefetch_depth < 0 || configuration.policy.prefetch_depth > 64) {
@@ -703,9 +744,6 @@ struct kimi_cpu_sink {
         }
         if (configuration.policy.prefetch_depth && (!ready_first || !nonblocking_down_sched)) {
             throw std::runtime_error("next-layer prefetch requires the ordered nonblocking scheduler");
-        }
-        if (!row_weights.empty() && row_weights.size() != size_t(compute_threads)) {
-            throw std::runtime_error("row weights require cpu.threads - 1 entries");
         }
         for (double value : row_weights) {
             if (!std::isfinite(value) || value <= 0) { throw std::runtime_error("invalid explicit row weight"); }
@@ -741,37 +779,7 @@ struct kimi_cpu_sink {
             throw std::runtime_error("NONBLOCKING_DOWN_SCHED requires READY_FIRST=1");
         }
         sink_io_value(ring.init(static_cast<unsigned>(3 * depth), configuration.policy.read_fixed));
-        {
-            // One CPU of the fastest cluster stays with the I/O thread, as THREADS counts it.
-            const int fast = sink_fast_cpus();
-            const int fast_participants = std::max(1, std::min(compute_threads, fast - 1));
-            decode_threads.candidates[0] = compute_threads;
-            decode_threads.candidates[1] = fast > 0 && fast_participants < compute_threads ? fast_participants : compute_threads;
-            if (decode_threads.candidates[1] == compute_threads || !decode_thread_choice) {
-                decode_threads.decided = 0;
-                decode_threads.locked = true;
-            }
-            // Per-phase pools: decode on the first N participants (the fastest CPUs when COMPUTE_CPUS lists them
-            // first), prefill on all.
-            if (configuration.policy.decode_participants) {
-                decode_threads.candidates[1] = configuration.policy.decode_participants;
-                decode_threads.decided = 1;
-                decode_threads.locked = true;
-            }
-            std::fprintf(stderr, "[kimi_cpu_sink_threads] participants=%d fast_cluster_cpus=%d decode_candidates=%d,%d"
-                    " decode_fixed=%d\n", compute_threads, fast, decode_threads.candidates[0],
-                    decode_threads.candidates[1], decode_threads.locked ? decode_threads.candidates[decode_threads.decided] : 0);
-        }
-        // Reserve before starting threads so vector growth cannot strand a thread.
-        workers.reserve(static_cast<size_t>(std::max(0, compute_threads - 1)));
         try {
-            for (int ith = 1; ith < compute_threads; ++ith) {
-                workers.emplace_back([this, ith] {
-                    (void) ssd::platform::set_thread_role(ssd::platform::thread_role::compute);
-                    compute_loop(ith);
-                });
-                if (!compute_cpus.empty()) { sink_pin(workers.back(), { compute_cpus[ith] }); }
-            }
             io_thread = std::thread([this] {
                 (void) ssd::platform::set_thread_role(ssd::platform::thread_role::io);
                 io_loop();
@@ -792,8 +800,6 @@ struct kimi_cpu_sink {
                      ready_first ? 1 : 0, early_up_gate ? 1 : 0, role_major ? 1 : 0,
                      nonblocking_down_sched ? 1 : 0, poll_us, dynamic_rows ? 1 : 0, dynamic_chunk_rows);
         for (size_t i = 0; i < row_weights.size(); ++i) { std::fprintf(stderr, "%s%.9g", i ? "," : "", row_weights[i]); }
-        std::fprintf(stderr, " compute_cpus=");
-        for (size_t i = 0; i < compute_cpus.size(); ++i) { std::fprintf(stderr, "%s%d", i ? "," : "", compute_cpus[i]); }
         std::fprintf(stderr, " io_cpus=");
         for (size_t i = 0; i < io_cpus.size(); ++i) { std::fprintf(stderr, "%s%d", i ? "," : "", io_cpus[i]); }
         std::fprintf(stderr, "\n");
@@ -1201,6 +1207,10 @@ struct kimi_cpu_sink {
     }
 
     ~kimi_cpu_sink() {
+        if (call_open) {
+            std::fprintf(stderr, "[kimi_cpu_sink] destroyed inside an open call; aborting\n");
+            std::abort();
+        }
         prefetch_stop();
         host_lock_stop(); // the tier and the arena are both still here
         place_report("destroy");
@@ -1260,17 +1270,11 @@ struct kimi_cpu_sink {
         watch_cv.notify_all();
         if (watch_thread.joinable()) { watch_thread.join(); }
         {
-            std::lock_guard<std::mutex> lock(compute_mutex);
-            compute_stop = true;
-        }
-        compute_cv.notify_all();
-        {
             std::lock_guard<std::mutex> lock(io_mutex);
             io_stop = true;
         }
         io_cv.notify_all();
         if (io_thread.joinable()) { io_thread.join(); }
-        for (auto & worker : workers) { if (worker.joinable()) { worker.join(); } }
     }
 
     int dynamic_first_row(bool is_down) const {
@@ -1289,14 +1293,14 @@ struct kimi_cpu_sink {
 
     void compute_rows(int ith, bool is_down) {
         sink_timeline_worker * timing = timeline_active ?
-            &timeline[timeline_expert].workers[(is_down ? compute_threads : 0) + ith] : nullptr;
+            &timeline[timeline_expert].workers[(is_down ? threads : 0) + ith] : nullptr;
         if (timing) { timing->begin = ggml_time_us(); timing->core = ssd::platform::current_cpu(); }
         const auto profile_start = profile_enabled ? sink_clock::now() : sink_clock::time_point();
         const double cpu_start = profile_enabled ? sink_thread_cpu_us() : 0.0;
         const int rows = is_down ? latent : hidden;
         const auto & bounds = is_down ? down_bounds : up_bounds;
         if (parallel_fn) {
-            parallel_fn(parallel_userdata, ith, compute_threads);
+            parallel_fn(parallel_userdata, ith, active_threads);
         } else {
             auto compute_range = [&](int begin, int end) {
                 if (!is_down && activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) {
@@ -1364,38 +1368,123 @@ struct kimi_cpu_sink {
         }
     }
 
-    void compute_loop(int ith) {
-        uint64_t seen = 0;
-        bool poll_next = false;
-        std::unique_lock<std::mutex> lock(compute_mutex);
-        for (;;) {
-            if (poll_next && !compute_stop && generation == seen) {
-                // Poll outside the sleep mutex. Always reacquire it before
-                // inspecting the job, so publication and CV wakeup rules stay
-                // identical. Long I/O waits and idle requests still park.
-                lock.unlock();
-                sink_poll(poll_us, [&] { return poll_generation.load(std::memory_order_acquire) != seen; });
-                lock.lock();
-            }
-            while (!compute_stop && generation == seen) {
-                compute_cv.wait(lock);
-                if (profile_enabled && !compute_stop && generation == seen) {
-                    ++worker_profiles[ith].no_work_wakeups;
-                }
-            }
-            if (compute_stop) { return; }
-            seen = generation;
-            poll_next = poll_us && !parallel_fn;
-            if (ith >= active_threads) { continue; }
-            lock.unlock();
-            compute_rows(ith, down_phase);
-            lock.lock();
-            if (--pending == 0) {
-                if (poll_us) { poll_pending.store(0, std::memory_order_release); }
-                if (split_cv) { compute_done_cv.notify_one(); }
-                else { compute_cv.notify_all(); }
-            }
+    // The coordinator's state as the phase word; it wakes parked joiners.
+    void publish_phase(int active, uint64_t kind) {
+        phase.store(sink_phase::make(generation, active, kind | (call_open ? sink_phase::open : 0), call_id));
+        participants.notify();
+    }
+
+    bool open_call(int nth, std::string & why) {
+        if (nth < 1 || nth > sink_max_participants) { why = "CPU sink call needs 1.." + std::to_string(sink_max_participants) +
+            " participants"; return false; }
+        if (call_open) { why = "CPU sink call already open"; return false; }
+        // Sized before any participant indexes it; the open call keeps the size.
+        worker_profiles.assign(size_t(nth), sink_worker_profile());
+        call_open = true;
+        call_participants = nth;
+        call_generation = generation;
+        ++call_id;
+        joined.store(0);
+        publish_phase(0, 0);
+        return true;
+    }
+
+    // After every joiner arrived, so none can still be on its way into this call; one that has not yet seen the
+    // close tells it, or a later call, by the call's id.
+    void close_call() {
+        if (!call_open) { return; }
+        const auto arrived = [&] { return joined.load() == uint32_t(call_participants - 1); };
+        while (!arrived()) { coordinator.park(arrived); }
+        call_open = false;
+        publish_phase(0, 0);
+    }
+
+    // A participant of the open call (ith 1..nth-1) computes its share of every phase the run's thread publishes,
+    // until the call closes. One that joins late takes up the phase in progress: no phase it is active in can finish
+    // without it. After a phase it polls for the next for poll_us, then parks; it waits for the open, and for the
+    // close after the run's last phase, as at a node boundary (sink_node_spin_us). A wakeup without work counts into
+    // the participant's next phase profile.
+    void join_call(int ith, int nth) {
+        // A ggml node starts on every thread at once and its coordinator opens the call at entry. The previous call
+        // closed only after this thread joined it, and ggml's barrier after that node released no thread before this
+        // one left it, so the next call to open is this node's.
+        sink_phase now;
+        const auto opened = [&] { now.word = phase.load(); return now.is(sink_phase::open); };
+        sink_poll(std::max(poll_us, sink_node_spin_us), opened);
+        while (!opened()) { participants.park(opened); }
+        if (nth != call_participants || ith < 1 || ith >= nth) {
+            std::fprintf(stderr, "[kimi_cpu_sink] participant %d of %d joined a call of %d; aborting\n", ith, nth,
+                call_participants);
+            std::abort();
         }
+        const uint32_t call = now.call();
+        uint32_t seen = call_generation;
+        if (joined.fetch_add(1) + 1 == uint32_t(nth - 1)) { coordinator.notify(); }
+        int poll_next = 0;
+        uint64_t idle_wakeups = 0;
+        for (;;) {
+            now.word = phase.load();
+            if (!now.is(sink_phase::open) || now.call() != call) { return; }
+            if (now.generation() == seen) {
+                const uint64_t waited = now.word;
+                const auto changed = [&] { return phase.load() != waited; };
+                if (poll_next) {
+                    sink_poll(poll_next, changed);
+                    poll_next = 0;
+                } else if (participants.park(changed) && !changed()) {
+                    ++idle_wakeups;
+                }
+                continue;
+            }
+            seen = now.generation();
+            poll_next = now.is(sink_phase::last) ? std::max(poll_us, sink_node_spin_us) :
+                now.is(sink_phase::parallel) ? 0 : poll_us;
+            if (ith >= now.active()) { continue; }
+            if (profile_enabled) { worker_profiles[ith].no_work_wakeups += idle_wakeups; }
+            idle_wakeups = 0;
+            compute_rows(ith, now.is(sink_phase::down));
+            if (pending.fetch_sub(1) == 1) { coordinator.notify(); }
+        }
+    }
+
+    // A run starts with the participants of the open call, or alone; per-participant state is sized for them. A
+    // decode run also sets up its thread choice (decode_threads_setup).
+    void begin_participants(bool decode) {
+        threads = call_open ? call_participants : 1;
+        if (!row_weights.empty() && row_weights.size() != size_t(threads)) {
+            throw std::runtime_error("explicit row weights need one entry per participant: " +
+                std::to_string(row_weights.size()) + " for " + std::to_string(threads));
+        }
+        if (decode) { decode_threads_setup(); }
+    }
+
+    // The decode participants for this run's threads: all of them, or the first ones that fit the fastest cluster,
+    // one of whose CPUs stays with the I/O thread; cpu.decode_participants fixes the count. With strict placement
+    // ggml thread i runs on the i-th CPU of its mask.
+    void decode_threads_setup() {
+        const int fixed = configuration.policy.decode_participants;
+        if (fixed > threads) {
+            throw std::runtime_error("cpu.decode_participants=" + std::to_string(fixed) + " exceeds the call's " +
+                std::to_string(threads) + " threads");
+        }
+        if (decode_threads_for == threads) { return; }
+        decode_threads = {};
+        decode_threads_for = threads;
+        const int fast_participants = std::max(1, std::min(threads, fast_cpus - 1));
+        decode_threads.candidates[0] = threads;
+        decode_threads.candidates[1] = fast_cpus > 0 && fast_participants < threads ? fast_participants : threads;
+        if (decode_threads.candidates[1] == threads || !decode_thread_choice) {
+            decode_threads.decided = 0;
+            decode_threads.locked = true;
+        }
+        if (fixed) {
+            decode_threads.candidates[1] = fixed;
+            decode_threads.decided = 1;
+            decode_threads.locked = true;
+        }
+        std::fprintf(stderr, "[kimi_cpu_sink_threads] participants=%d fast_cluster_cpus=%d decode_candidates=%d,%d"
+                " decode_fixed=%d\n", threads, fast_cpus, decode_threads.candidates[0], decode_threads.candidates[1],
+                decode_threads.locked ? decode_threads.candidates[decode_threads.decided] : 0);
     }
 
     // At load, storage before any request, so that no request waits for its page population. On unified memory the
@@ -1426,7 +1515,8 @@ struct kimi_cpu_sink {
         }
         if (cache.stats.budget_bytes == sink_cache::auto_budget) { reserve_ring(bytes, true); }
         double us = 0;
-        cache.reserve_at_load(bytes, up, size_t(std::max(1, experts_used)), compute_threads + 1, us);
+        // load time: nothing else runs, so every CPU pages the arena in
+        cache.reserve_at_load(bytes, up, size_t(std::max(1, experts_used)), sink_process_cpus(), us);
     }
     // The ledger's floor moves with the file reserve on unified memory; the GPU tier keeps it free.
     void refresh_floor(const char * reason) {
@@ -1747,33 +1837,29 @@ struct kimi_cpu_sink {
         std::fprintf(stderr, "[kimi_cpu_sink_threads] decode_participants=%d us_per_expert=%.1f (%d participants: %.1f)\n",
                 c.candidates[c.decided], c.decided ? mean1 : mean0, c.candidates[1 - c.decided], c.decided ? mean0 : mean1);
     }
-    void compute_phase(bool is_down) {
-        {
-            std::lock_guard<std::mutex> lock(compute_mutex);
-            down_phase = is_down;
-            begin_dynamic_phase(is_down);
-            // Row weights fix one bound per participant, so they keep every thread.
-            active_threads = parallel_fn || !row_weights.empty() ? compute_threads :
-                decode_threads.candidates[decode_threads.decided >= 0 ? decode_threads.decided : decode_threads.current];
-            pending = active_threads - 1;
-            if (poll_us) { poll_pending.store(pending, std::memory_order_relaxed); }
-            if (profile_enabled) { phase_dispatch = sink_clock::now(); }
-            ++generation;
-            if (poll_us) { poll_generation.store(generation, std::memory_order_release); }
+    // `last`: the run dispatches no phase after this one, so its participants next wait for the close.
+    void compute_phase(bool is_down, bool last = false) {
+        begin_dynamic_phase(is_down);
+        // Row weights fix one bound per participant, so they keep every thread.
+        active_threads = parallel_fn || !row_weights.empty() ? threads :
+            decode_threads.candidates[decode_threads.decided >= 0 ? decode_threads.decided : decode_threads.current];
+        pending.store(uint32_t(active_threads - 1));
+        if (profile_enabled) { phase_dispatch = sink_clock::now(); }
+        ++generation;
+        // A phase of the coordinator alone stays unpublished unless it is the last: a participant left out skips
+        // the generation.
+        if (active_threads > 1 || last) {
+            publish_phase(active_threads, (is_down ? sink_phase::down : 0) | (parallel_fn ? sink_phase::parallel : 0) |
+                (last ? sink_phase::last : 0));
         }
-        compute_cv.notify_all();
         compute_rows(0, is_down);
         wait_workers();
     }
 
     void wait_workers() {
-        if (poll_us && !parallel_fn) {
-            sink_poll(poll_us, [&] { return poll_pending.load(std::memory_order_acquire) == 0; });
-            if (poll_pending.load(std::memory_order_acquire) == 0) { return; }
-        }
-        std::unique_lock<std::mutex> lock(compute_mutex);
-        if (split_cv) { compute_done_cv.wait(lock, [&] { return pending == 0; }); }
-        else { compute_cv.wait(lock, [&] { return pending == 0; }); }
+        const auto done = [&] { return pending.load() == 0; };
+        if (poll_us && !parallel_fn) { sink_poll(poll_us, done); }
+        while (!done()) { coordinator.park(done); }
     }
 
     void cancel_and_wait() {
@@ -1806,7 +1892,7 @@ struct kimi_cpu_sink {
                 consumed && !up->name[consumed]) { trace_layer = layer; }
         if (profile_enabled) {
             caller_cpu_start = sink_thread_cpu_us();
-            std::lock_guard<std::mutex> lock(compute_mutex);
+            // between phases: no participant writes its profile
             std::fill(worker_profiles.begin(), worker_profiles.end(), sink_worker_profile());
         }
     }
@@ -1816,7 +1902,7 @@ struct kimi_cpu_sink {
         // Called after the worker barrier and io_done acquire. These counters
         // are separate thread CPU samples, never additions to elapsed wall time.
         current.caller_cpu_us = sink_thread_cpu_us() - caller_cpu_start;
-        for (size_t i = trace_decode ? 0 : 1; i < worker_profiles.size(); ++i) {
+        for (size_t i = trace_decode ? 0 : 1; i < size_t(threads); ++i) {
             const auto & p = worker_profiles[i];
             current.compute_cpu_us += p.up_gate_cpu_us + p.down_cpu_us + p.parallel_cpu_us;
         }
@@ -1952,7 +2038,7 @@ struct kimi_cpu_sink {
         if (profile_enabled) {
             out.append("[kimi_cpu_sink_profile] {\"schema\":1,\"event\":\"layer\",\"phase\":\"%s\","
                 "\"scope\":\"%s\",\"has_token\":%s,\"epoch\":%llu,\"token\":%llu,\"layer\":%d,\"call\":%llu,\"success\":%s,"
-                "\"experts\":%llu,\"threads\":%d,\"split_cv\":%d,\"expert_job\":%d,\"total_us\":%.3f,\"compute_wall_us\":%.3f,"
+                "\"experts\":%llu,\"threads\":%d,\"expert_job\":%d,\"total_us\":%.3f,\"compute_wall_us\":%.3f,"
                 "\"wait_io_us\":%.3f,\"other_wall_us\":%.3f,\"io_job_wall_us\":%.3f,\"io_wait_wall_us\":%.3f,"
                 "\"io_credit_wait_wall_us\":%.3f,\"compute_thread_cpu_us\":%.3f,\"caller_thread_cpu_us\":%.3f,"
                 "\"io_thread_cpu_us\":%.3f,\"input_quantize_us\":%.3f,\"hidden_quantize_us\":%.3f,"
@@ -1961,12 +2047,11 @@ struct kimi_cpu_sink {
                 trace_has_token ? "true" : "false", (unsigned long long) trace_epoch,
                 (unsigned long long) trace_token, trace_layer,
                 (unsigned long long) trace_call, success ? "true" : "false", (unsigned long long) current.experts,
-                compute_threads + 1, split_cv ? 1 : 0, 0, current.total_us, current.compute_us, current.wait_io_us,
+                threads + 1, 0, current.total_us, current.compute_us, current.wait_io_us,
                 current.other_us, current.io_us, current.io_wait_us, current.io_credit_wait_us,
                 current.compute_cpu_us, current.caller_cpu_us, current.io_cpu_us, current.input_quantize_us,
                 current.hidden_quantize_us, current.up_gate_us, current.down_reduce_us);
-            std::lock_guard<std::mutex> lock(compute_mutex);
-            for (int i = 0; i < compute_threads; ++i) {
+            for (int i = 0; i < threads; ++i) {
                 const auto & p = worker_profiles[i];
                 out.append("%s{\"ith\":%d,\"phases\":%llu,\"up_gate_wall_us\":%.3f,\"down_wall_us\":%.3f,"
                     "\"up_gate_cpu_us\":%.3f,\"down_cpu_us\":%.3f,\"parallel_wall_us\":%.3f,\"parallel_cpu_us\":%.3f,"
@@ -2285,9 +2370,9 @@ struct kimi_cpu_sink {
             const double scale = *std::max_element(row_weights.begin(), row_weights.end());
             double total = 0, cumulative = 0;
             for (double w : row_weights) { total += w / scale; }
-            up_bounds.resize(compute_threads + 1); down_bounds.resize(compute_threads + 1);
+            up_bounds.resize(threads + 1); down_bounds.resize(threads + 1);
             up_bounds[0] = down_bounds[0] = 0;
-            for (int ith = 0; ith < compute_threads; ++ith) {
+            for (int ith = 0; ith < threads; ++ith) {
                 cumulative += row_weights[ith] / scale;
                 up_bounds[ith + 1] = std::min(hidden, int(hidden * cumulative / total));
                 down_bounds[ith + 1] = std::min(latent, int(latent * cumulative / total));
@@ -2590,7 +2675,8 @@ struct kimi_cpu_sink {
             down_quant_data = staged_quant_hidden.data() + expert * quant_hidden_stride;
             const auto phase_start = sink_clock::now();
             if (timeline_active) { timeline[expert].cpu[6] = ggml_time_us(); }
-            compute_phase(true);
+            // the last unfinished expert's down projection ends the layer's CPU work
+            compute_phase(true, finished + 1 == cpu_experts);
             if (timeline_active) { timeline[expert].cpu[7] = ggml_time_us(); }
             current.down_reduce_us += elapsed_us(phase_start);
             current.compute_us += elapsed_us(compute_start);
@@ -2652,8 +2738,9 @@ struct kimi_cpu_sink {
     }
 };
 
-// A prefill consumer runs while the stream owns run_mutex, so these workers
-// and the role buffers cannot concurrently be used by decode.
+// A prefill consumer runs while the stream owns run_mutex, so its phases and
+// the role buffers cannot concurrently be used by decode. The phase runs on
+// every participant of the open call.
 void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,
         kimi_cpu_sink_parallel_fn function, void * userdata) {
     sink->parallel_fn = function;
@@ -2685,7 +2772,7 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
     sink->requests.clear();
     sink->begin_observation(up, false);
     try {
-        sink_caller_affinity affinity(sink->caller_cpu);
+        sink->begin_participants(false);
         // The default remains ring-only. CACHE_PREFILL_READ may borrow retained
         // decode entries under explicit leases after the phase headroom check.
         sink->refresh_floor("prefill");
@@ -3095,18 +3182,36 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
 }
 
 extern "C" struct kimi_cpu_sink * kimi_cpu_sink_create(
-        int total_threads, int ring_experts, kimi_cpu_sink_resolver resolver,
-        void * userdata, char * error, size_t error_size) {
+        int ring_experts, kimi_cpu_sink_resolver resolver, void * userdata, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     try {
-        if (total_threads < 2 || total_threads > 256 || ring_experts < 1 || ring_experts > 32 || !resolver) {
-            throw std::runtime_error("CPU sink requires 2..256 total threads, 1..32 ring experts, and a resolver");
+        if (ring_experts < 1 || ring_experts > 32 || !resolver) {
+            throw std::runtime_error("CPU sink requires 1..32 ring experts and a resolver");
         }
-        return new kimi_cpu_sink(total_threads, ring_experts, resolver, userdata);
+        return new kimi_cpu_sink(ring_experts, resolver, userdata);
     } catch (const std::exception & e) {
         sink_error(error, error_size, e.what());
         return nullptr;
     }
+}
+
+extern "C" bool kimi_cpu_sink_call_open(struct kimi_cpu_sink * sink, int nth, char * error, size_t error_size) {
+    sink_error(error, error_size, "");
+    if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
+    try {
+        std::string why;
+        if (sink->open_call(nth, why)) { return true; }
+        sink_error(error, error_size, why.c_str());
+    } catch (const std::exception & e) { sink_error(error, error_size, e.what()); }
+    return false;
+}
+
+extern "C" void kimi_cpu_sink_call_close(struct kimi_cpu_sink * sink) {
+    if (sink) { sink->close_call(); }
+}
+
+extern "C" void kimi_cpu_sink_call_join(struct kimi_cpu_sink * sink, int ith, int nth) {
+    if (sink) { sink->join_call(ith, nth); }
 }
 
 namespace ssd {
@@ -3124,11 +3229,9 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
         if (!value) { throw std::runtime_error(std::string("missing typed ") + key); }
         return *value;
     };
-    const uint64_t threads = integer("cpu.threads");
     const uint64_t participants = integer("cpu.decode_participants");
     const uint64_t prefetch = integer("prefetch.depth");
-    if (threads < 2 || threads > 256 || participants > threads - 1 || prefetch > 64 ||
-            !out.settings.cpus("cpu.compute_cpus") || !out.settings.cpus("cpu.io_cpus") ||
+    if (participants > uint64_t(sink_max_participants) || prefetch > 64 || !out.settings.cpus("cpu.io_cpus") ||
             !out.settings.vram_budget() || !out.settings.costs() || !out.settings.sources() ||
             integer("host.headroom_mib") > UINT32_MAX || integer("vram.reserve_mib") > 8192 ||
             integer("vram.margin_mib") < integer("vram.reserve_mib") + 64 || integer("vram.margin_mib") > 8192) {
@@ -3139,11 +3242,10 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
         throw std::runtime_error("nonzero GPU tier budget requires an injected GPU provider");
     }
     auto & p = out.policy;
-    p.split_cv = p.ready_first = p.early_up_gate = p.role_major = p.nonblocking_down_sched = p.dynamic_rows = true;
+    p.ready_first = p.early_up_gate = p.role_major = p.nonblocking_down_sched = p.dynamic_rows = true;
     p.dynamic_chunk_rows = 64;
     p.decode_participants = int(participants);
     p.prefetch_depth = int(prefetch);
-    for (uint32_t cpu : *out.settings.cpus("cpu.compute_cpus")) { p.compute_cpus.push_back(int(cpu)); }
     for (uint32_t cpu : *out.settings.cpus("cpu.io_cpus")) { p.io_cpus.push_back(int(cpu)); }
     p.cache_policy = "count_decay2";
     p.cache_allocation = "uniform";
@@ -3159,7 +3261,7 @@ kimi_cpu_sink * create_configured(const settings::snapshot * input, const runtim
     try {
         const auto value = configured(input, services);
         if (!resolver) { throw std::runtime_error("missing SSD expert resolver"); }
-        return new kimi_cpu_sink(int(*value.settings.integer("cpu.threads")), 8, resolver, userdata, value);
+        return new kimi_cpu_sink(8, resolver, userdata, value);
     } catch (const std::exception & e) {
         sink_error(error, error_size, e.what());
         return nullptr;
@@ -3167,19 +3269,19 @@ kimi_cpu_sink * create_configured(const settings::snapshot * input, const runtim
 }
 
 namespace testing {
-kimi_cpu_sink * create(int total_threads, int ring_experts, const execution_policy & policy,
+kimi_cpu_sink * create(int ring_experts, const execution_policy & policy,
         const runtime_services * services, kimi_cpu_sink_resolver resolver, void * userdata,
         char * error, size_t error_size) noexcept {
     sink_error(error, error_size, "");
     try {
-        if (total_threads < 2 || total_threads > 256 || ring_experts < 1 || ring_experts > 32 || !resolver) {
+        if (ring_experts < 1 || ring_experts > 32 || !resolver) {
             throw std::runtime_error("invalid explicit CPU test executor dimensions");
         }
         sink_configuration value;
         value.policy = policy;
         sink_copy_services(value, services);
         if (policy.vram_budget && !value.has_gpu) { throw std::runtime_error("explicit GPU fixture requires an injected provider"); }
-        return new kimi_cpu_sink(total_threads, ring_experts, resolver, userdata, value);
+        return new kimi_cpu_sink(ring_experts, resolver, userdata, value);
     } catch (const std::exception & e) {
         sink_error(error, error_size, e.what());
         return nullptr;
@@ -3277,9 +3379,6 @@ extern "C" bool kimi_cpu_sink_vram_reserve(struct kimi_cpu_sink * sink, const st
     if (!sink || !up || !gate || !down) { sink_error(error, error_size, "null CPU sink or expert tensor"); return false; }
     std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try {
-        // The tier's threads take the affinity of the thread that creates them: that of a sink call, as when
-        // the first decode or prefill call creates them.
-        sink_caller_affinity affinity(sink->caller_cpu);
         sink->reserve_tier(up, gate, down, experts_used);
         return true;
     }
@@ -3393,7 +3492,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
     sink->requests.clear();
     sink->begin_observation(up, true);
     try {
-        sink_caller_affinity affinity(sink->caller_cpu);
+        sink->begin_participants(true);
         if (!input || !ids || !weights || !output || nslots < 0 || nslots > 1024 ||
             !sink_activation_valid(activation)) {
             throw std::runtime_error(activation && activation->kind == KIMI_CPU_SINK_ACTIVATION_SITU ?
@@ -3424,7 +3523,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
         sink->prefetch_count_used();
         if (sink->timeline_active) {
             sink->timeline.resize(sink->requests.size());
-            for (auto & t : sink->timeline) { t.workers.resize(2 * sink->compute_threads); }
+            for (auto & t : sink->timeline) { t.workers.resize(2 * size_t(sink->threads)); }
             sink->timeline_call[1] = ggml_time_us();
         }
         sink->output = output;
@@ -3535,7 +3634,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
             }
             phase_start = sink_clock::now();
             if (sink->timeline_active) { sink->timeline[expert].cpu[6] = ggml_time_us(); }
-            sink->compute_phase(true);
+            sink->compute_phase(true, ordinal + 1 == blocking_experts);
             if (sink->timeline_active) { sink->timeline[expert].cpu[7] = ggml_time_us(); }
             sink->current.down_reduce_us += elapsed_us(phase_start);
             sink->current.compute_us += elapsed_us(compute_start) - down_wait_us;

@@ -124,7 +124,7 @@ extern "C" bool kimi_cpu_sink_run_cache_compute(kimi_cpu_sink * sink,
         }
     };
     try {
-        sink_caller_affinity affinity(sink->caller_cpu);
+        sink->begin_participants(true);
         if(!sink->ready_first || sink->early_up_gate || !std::isfinite(situ_beta) || situ_beta<=0 ||
                 !std::isfinite(situ_linear_beta) || sink->poisoned) {
             throw std::runtime_error("cache-compute requires READY_FIRST=1, EARLY_UP_GATE=0 and a healthy sink");

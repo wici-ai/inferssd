@@ -17,21 +17,21 @@ int main() {
     const std::string first = std::string(directory) + "/first.jsonl";
     const std::string second = std::string(directory) + "/second.jsonl";
     char error[1024] = {};
-    const llama_ssd_override initial[] = {{"cpu.threads", "4"}};
+    const llama_ssd_override initial[] = {{"prefetch.depth", "4"}};
     auto * options = llama_ssd_options_create(nullptr, initial, 1, first.c_str(), error, sizeof(error));
     require(options, error);
     auto context = std::make_unique<llama_ssd_context>(*options);
     llama_ssd_options_free(options);
-    require(*context->settings.integer("cpu.threads") == 4, "context borrowed freed options");
+    require(*context->settings.integer("prefetch.depth") == 4, "context borrowed freed options");
     require(context->services.events == context->events.get() && context->services.debug == &context->debug,
         "context service pointers differ from owned objects");
 
-    const llama_ssd_override other[] = {{"cpu.threads", "3"}};
+    const llama_ssd_override other[] = {{"prefetch.depth", "3"}};
     options = llama_ssd_options_create(nullptr, other, 1, second.c_str(), error, sizeof(error));
     require(options, error);
     auto independent = std::make_unique<llama_ssd_context>(*options);
     llama_ssd_options_free(options);
-    require(*context->settings.integer("cpu.threads") == 4 && *independent->settings.integer("cpu.threads") == 3,
+    require(*context->settings.integer("prefetch.depth") == 4 && *independent->settings.integer("prefetch.depth") == 3,
         "one context changed another context's settings");
     require(bool(context->events->event("ssd.io.read", "{\"bytes\":4096}")), "event publication failed");
     context.reset();
@@ -57,7 +57,7 @@ int main() {
             "controller observation contract is missing");
         require(event.find("\"seq\":2") != std::string::npos, "per-context sequence differs");
     }
-    const llama_ssd_override invalid[] = {{"cpu.threads", "0"}};
+    const llama_ssd_override invalid[] = {{"prefetch.depth", "65"}};
     require(!llama_ssd_options_create(nullptr, invalid, 1, nullptr, error, sizeof(error)) && error[0],
         "invalid setting escaped C API status boundary");
     require(!llama_ssd_options_create(nullptr, nullptr, 1, nullptr, error, sizeof(error)), "missing override array accepted");

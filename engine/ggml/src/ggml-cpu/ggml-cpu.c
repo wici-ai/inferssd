@@ -3000,9 +3000,12 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     ggml_cond_init(&threadpool->cond);
 
     // Spin the threads for all workers, and update CPU placements.
-    // Place the main thread last (towards the higher numbered CPU cores).
+    // With a strict mask thread i takes its i-th CPU in increasing order, the
+    // main thread first, as with OpenMP.
 
     int32_t cpumask_iter = 0;
+
+    ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
 
     for (int j = 1; j < tpp->n_threads; j++) {
         ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
@@ -3010,8 +3013,6 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
         GGML_ASSERT(rc == 0);
     }
-
-    ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
 
     if (!threadpool->pause) {
         // Update main thread prio and affinity at the start, otherwise we'll do it in resume

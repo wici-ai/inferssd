@@ -12,7 +12,7 @@ from typing import Optional, cast
 from inferssd.configuration.settings import Setting, Snapshot, parse, render, uncomment
 from inferssd.launch.darwin import MODEL_OPTIONS, PROFILES
 from inferssd.launch.resources import EngineResources
-from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State
+from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,7 @@ class LaunchSpec:
     context: int = 8192
     batch: int = 512
     ubatch: int = 512
-    batch_threads: Optional[int] = None
+    threads: Threads = Threads()
     template: Optional[str] = None
     resources: Optional[EngineResources] = None
 
@@ -67,6 +67,26 @@ def literal(item: Setting, platform: str) -> str:
     return body.partition("=")[2].strip(" \t\r\n")
 
 
+def threadpools(threads: Threads, platform: str) -> Threads:
+    """Resolve the counts; a strict CPU set sizes the pools and bounds both counts."""
+    for count in (threads.decode, threads.batch):
+        if count is not None and (type(count) is not int or not 1 <= count <= 256):
+            raise ValueError("thread counts must be integers in 1..256")
+    cpus = threads.cpus
+    # A server CPU mask holds GGML_MAX_N_THREADS bits.
+    if len(set(cpus)) != len(cpus) or any(type(x) is not int or not 0 <= x < 512 for x in cpus):
+        raise ValueError("strict CPUs must be unique CPU IDs in 0..511")
+    if not cpus:
+        return Threads(threads.decode, threads.batch or threads.decode)
+    if platform == "darwin":
+        raise ValueError("macOS cannot pin threads to CPUs")
+    decode = threads.decode or len(cpus)
+    batch = threads.batch or decode
+    if max(decode, batch) > len(cpus):
+        raise ValueError("thread counts exceed the strict CPUs")
+    return Threads(decode, batch, tuple(sorted(cpus)))
+
+
 def materialized_settings(value: Snapshot) -> str:
     # Preserve native CLI provenance and registry defaults. Only file/derived
     # settings belong in the generated file; original receipts stay intact.
@@ -92,10 +112,7 @@ def _resolve(
         raise ValueError("owned typed launch currently supports server mode")
     if not 1 <= spec.port <= 65535 or min(spec.context, spec.batch, spec.ubatch) < 1:
         raise ValueError("invalid port, context or batch size")
-    if spec.batch_threads is not None and (
-        type(spec.batch_threads) is not int or not 1 <= spec.batch_threads <= 256
-    ):
-        raise ValueError("batch_threads must be an integer in 1..256")
+    threads = threadpools(spec.threads, platform)
     protected = {
         "-m",
         "--model",
@@ -116,6 +133,16 @@ def _resolve(
         "--threads",
         "-tb",
         "--threads-batch",
+        "-C",
+        "--cpu-mask",
+        "-Cr",
+        "--cpu-range",
+        "--cpu-strict",
+        "-Cb",
+        "--cpu-mask-batch",
+        "-Crb",
+        "--cpu-range-batch",
+        "--cpu-strict-batch",
         "--fit",
         "--chat-template-file",
         "--chat-template",
@@ -152,16 +179,27 @@ def _resolve(
         "--main-gpu",
     }
     protected.update(MODEL_OPTIONS)
-    if any(
-        x.split("=", 1)[0] in protected
-        or x.startswith("--ssd-")
-        or x.startswith(
-            ("-m", "-hf", "-np", "-t", "-b", "-c", "-ub", "-ngl", "-ncmoe", "-fa", "-ot", "-sm")
-        )
-        and not x.startswith("--")
-        for x in s.inputs.extra
-    ):
-        raise ValueError("model, listener and SSD settings use explicit typed launch options")
+    glued = (
+        "-m",
+        "-hf",
+        "-np",
+        "-t",
+        "-C",
+        "-b",
+        "-c",
+        "-ub",
+        "-ngl",
+        "-ncmoe",
+        "-fa",
+        "-ot",
+        "-sm",
+    )
+    for x in s.inputs.extra:
+        name = x.split("=", 1)[0]
+        if name.startswith("--"):
+            name = name.replace("_", "-")  # the server's long option spelling
+        if name in protected or name.startswith(("--ssd-",) + glued):
+            raise ValueError("model, listener and SSD settings use explicit typed launch options")
     expected = "Linux" if platform == "linux" else "Darwin"
     if (
         s.text("platform_system") != expected
@@ -281,11 +319,15 @@ def _resolve(
                 raise ValueError("typed GPU execution requires nvidia-smi")
             if s.text("gpu_processes").strip():
                 raise ValueError("the GPU already has a compute process")
+    # The sink's I/O thread keeps its own CPUs; decode runs on the first decode threads.
+    if set(cast(tuple[int, ...], value.at("cpu.io_cpus").value)) & set(threads.cpus):
+        raise ValueError("cpu.io_cpus overlaps the strict compute CPUs")
+    participants = cast(int, value.at("cpu.decode_participants").value)
+    if threads.decode is not None and participants > threads.decode:
+        raise ValueError("cpu.decode_participants exceeds the decode thread count")
     settings = directory + "/settings.ssd"
     telemetry = directory + "/native-events.jsonl"
     s.ask("write_exclusive", settings, materialized_settings(value))
-    threads = str(value.at("cpu.threads").value)
-    batch_threads = str(spec.batch_threads) if spec.batch_threads is not None else threads
     command = [binary, "-m", model, "--ssd-settings", settings, "--ssd-telemetry", telemetry]
     for item in value.entries:
         if item.origin == "cli":
@@ -307,10 +349,15 @@ def _resolve(
         str(spec.batch),
         "-ub",
         str(spec.ubatch),
-        "-t",
-        threads,
-        "-tb",
-        batch_threads,
+    ]
+    if threads.decode is not None:
+        command += ["-t", str(threads.decode)]
+    if threads.batch is not None:
+        command += ["-tb", str(threads.batch)]
+    if threads.cpus:
+        mask = hex(sum(1 << cpu for cpu in threads.cpus))
+        command += ["-C", mask, "-Cb", mask, "--cpu-strict", "1", "--cpu-strict-batch", "1"]
+    command += [
         "--chat-template-file",
         template,
         "--host",
@@ -356,8 +403,9 @@ def _resolve(
                 "telemetry": telemetry,
                 "effective": value.document(),
                 "launch": {
-                    "decode_threads": int(threads),
-                    "batch_threads": int(batch_threads),
+                    "decode_threads": threads.decode,
+                    "batch_threads": threads.batch,
+                    "cpus": list(threads.cpus),
                     "context": spec.context,
                     "batch": spec.batch,
                     "ubatch": spec.ubatch,

@@ -12,7 +12,60 @@
 #include <stdexcept>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
+
+// A sink under test and the compute participants a ggml graph gives its calls: the test thread coordinates and
+// participants - 1 joiner threads enter through kimi_cpu_sink_call_join, as ggml's other threads do. One call stays
+// open from creation to release, so every run in between computes on all participants.
+class sink_ptr {
+public:
+    sink_ptr() = default;
+    explicit sink_ptr(kimi_cpu_sink * sink, int participants = 1) : sink_(sink) {
+        if (!sink_ || participants <= 1) { return; }
+        char error[256] = {};
+        if (!kimi_cpu_sink_call_open(sink_, participants, error, sizeof(error))) {
+            kimi_cpu_sink_destroy(sink_);
+            throw std::runtime_error(std::string("sink call open: ") + error);
+        }
+        // A joiner that cannot start leaves the call waiting for it forever.
+        try {
+            joiners_.reserve(size_t(participants - 1));
+            for (int ith = 1; ith < participants; ++ith) {
+                joiners_.emplace_back([sink, ith, participants] { kimi_cpu_sink_call_join(sink, ith, participants); });
+            }
+        } catch (...) { std::fprintf(stderr, "sink joiner thread failed to start\n"); std::abort(); }
+    }
+    sink_ptr(sink_ptr && other) noexcept : sink_(std::exchange(other.sink_, nullptr)), joiners_(std::move(other.joiners_)) {}
+    sink_ptr & operator=(sink_ptr && other) noexcept {
+        if (this != &other) {
+            reset();
+            sink_ = std::exchange(other.sink_, nullptr);
+            joiners_ = std::move(other.joiners_);
+        }
+        return *this;
+    }
+    sink_ptr(const sink_ptr &) = delete;
+    sink_ptr & operator=(const sink_ptr &) = delete;
+    ~sink_ptr() { reset(); }
+    void reset() {
+        if (!sink_) { return; }
+        if (!joiners_.empty()) {
+            kimi_cpu_sink_call_close(sink_);
+            for (auto & joiner : joiners_) { joiner.join(); }
+            joiners_.clear();
+        }
+        kimi_cpu_sink_destroy(sink_);
+        sink_ = nullptr;
+    }
+    kimi_cpu_sink * get() const { return sink_; }
+    explicit operator bool() const { return sink_ != nullptr; }
+
+private:
+    kimi_cpu_sink * sink_ = nullptr;
+    std::vector<std::thread> joiners_;
+};
 
 // Locally owned fixture construction inputs, passed explicitly to a real sink
 // or CUDA factory. This helper never reads or mutates the process environment.
@@ -38,8 +91,8 @@ struct fixture_inputs {
         if (equal == std::string::npos || !equal) { throw std::runtime_error("fixture argument must be key=value"); }
         const std::string key = value.substr(0, equal);
         static const char * recognized[] = {
-            "split_cv", "ready_first", "early_up_gate", "role_major", "nonblocking_down_sched",
-            "dynamic_rows", "read_fixed", "poll_us", "dynamic_chunk_rows", "row_weights", "compute_cpus",
+            "ready_first", "early_up_gate", "role_major", "nonblocking_down_sched",
+            "dynamic_rows", "read_fixed", "poll_us", "dynamic_chunk_rows", "row_weights",
             "io_cpus", "decode_participants", "prefetch_depth", "prefetch_fail_every", "prefetch_throw_drain",
             "prefetch_throw_schedule", "cache_policy", "cache_allocation", "cache_keep", "cache_prefill_read",
             "cache_elastic", "cache_partial_reclaim", "cache_reclaimable_file", "cache_reserve_bytes",
@@ -132,7 +185,7 @@ struct fixture_inputs {
         ssd::cpu::testing::execution_policy out;
 #define FIXTURE_BOOL(field) out.field = boolean(#field, out.field)
 #define FIXTURE_INT(field) out.field = integer(#field, out.field)
-        FIXTURE_BOOL(split_cv); FIXTURE_BOOL(ready_first); FIXTURE_BOOL(early_up_gate); FIXTURE_BOOL(role_major);
+        FIXTURE_BOOL(ready_first); FIXTURE_BOOL(early_up_gate); FIXTURE_BOOL(role_major);
         FIXTURE_BOOL(nonblocking_down_sched); FIXTURE_BOOL(dynamic_rows); FIXTURE_BOOL(read_fixed);
         FIXTURE_BOOL(cache_keep); FIXTURE_BOOL(cache_prefill_read); FIXTURE_BOOL(cache_elastic);
         FIXTURE_BOOL(cache_partial_reclaim); FIXTURE_BOOL(cache_reclaimable_file);
@@ -146,7 +199,6 @@ struct fixture_inputs {
 #undef FIXTURE_INT
         if (const char * value = get("cache_policy")) { out.cache_policy = value; }
         if (const char * value = get("cache_allocation")) { out.cache_allocation = value; }
-        out.compute_cpus = cpus("compute_cpus");
         out.io_cpus = cpus("io_cpus");
         out.tier = tier_policy();
         if (const char * costs = get("place_costs")) {
@@ -204,18 +256,20 @@ struct fixture_inputs {
         if (!out.cache_elastic && get("cache_prefill_slots")) { throw std::runtime_error("fixture slots need elasticity"); }
         return out;
     }
-    kimi_cpu_sink * create(int threads, int depth, kimi_cpu_sink_resolver resolver, void * userdata,
-            char * error, size_t size) const noexcept {
+    // threads counts the I/O thread, as the fixtures' CTest names do: threads - 1 compute participants.
+    sink_ptr create(int threads, int depth, kimi_cpu_sink_resolver resolver, void * userdata,
+            char * error, size_t size) const {
+        kimi_cpu_sink * sink = nullptr;
         try {
             const auto selection = debug();
             auto services = runtime;
             services.events = events ? events : runtime.events;
             services.debug = &selection;
-            return ssd::cpu::testing::create(threads, depth, policy(), &services, resolver, userdata, error, size);
+            sink = ssd::cpu::testing::create(depth, policy(), &services, resolver, userdata, error, size);
         } catch (const std::exception & e) {
             if (error && size) { std::snprintf(error, size, "%s", e.what()); }
-            return nullptr;
         }
+        return sink_ptr(sink, threads - 1);
     }
     // The Linux ledger finds its cgroup and derives the margin and device reserve here; the native ledger
     // (macOS, Windows) has its envelope from the OS and no such terms.

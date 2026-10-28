@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // key, kind, min, max, default literal, unit, producer, scope (platform bits), description
 SSD_SETTING("expert.source", paths, 0, 0, "[]", "path", "plan", scope_all, "Expert index source paths in declared order")
-SSD_SETTING("cpu.threads", integer, 1, 256, "2", "participants", "plan", scope_all, "Total CPU participants including the I/O participant")
-SSD_SETTING("cpu.compute_cpus", cpus, 0, 2147483647, "", "CPU ID", "plan", scope_all, "Ordered unique CPU IDs for compute participants")
 SSD_SETTING("cpu.io_cpus", cpus, 0, 2147483647, "", "CPU ID", "plan", scope_all, "Ordered unique CPU IDs for I/O participants")
-SSD_SETTING("cpu.decode_participants", integer, 0, 255, "0", "compute participants", "plan", scope_linux, "Decode compute participants; zero selects the measured/default policy")
+SSD_SETTING("cpu.decode_participants", integer, 0, 255, "0", "compute participants", "plan", scope_all, "Decode compute participants; zero selects the measured/default policy")
 SSD_SETTING("prefetch.depth", integer, 0, 64, "2", "predicted experts", "plan", scope_all, "Next-layer predicted experts, not a layer count or Mac read window")
 SSD_SETTING("place.costs", costs, 0, 1000000, "", "named us and GB/s terms", "plan", scope_all, "Measured placement cost terms; omitted terms retain calibrated priors")
 SSD_SETTING("prefill.cpu_max_tokens", integer, 0, 4294967295, "4294967295", "tokens", "plan", scope_linux, "Largest CPU prefill ubatch; transitional v0.1 setting")

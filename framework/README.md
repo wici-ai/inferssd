@@ -41,9 +41,15 @@ so native effective telemetry preserves that priority. There is no environment
 translation. Retired settings/launcher environment names fail by name without
 printing their values.
 
+CPU threads are server arguments, not settings. The SSD executor computes in the
+server's ggml threadpools and adds only its I/O, prefetch-reader and watch
+threads, which `cpu.io_cpus` places. `--threads` and `--batch-threads` select the
+decode `-t` and prefill `-tb` counts; `--cpus LIST` pins both pools one thread per
+CPU.
+
 ```text
 inferssd-settings 1
-cpu.threads = 8 # measured host allocation
+prefetch.depth = 4 # measured predictor depth
 host.headroom_mib = 3072 # operator resource reserve
 vram.budget = auto # use admitted capacity
 ```
@@ -65,7 +71,7 @@ inferssd launch --dry-run --platform linux --repo . \
   --model models/model.gguf --settings recorded/settings.ssd \
   --runtime-policy recorded/policy-linux.json \
   --host-facts recorded/host-linux.json --output-dir recorded/prepared-001 \
-  --set cpu.threads=8 --result recorded/launch-001.json
+  --threads 7 --result recorded/launch-001.json
 ```
 
 Recorded host facts are consumed lazily without falling back to the current
@@ -397,19 +403,29 @@ The Python `inferssd.engine.runtime.Runtime` requires explicit `LaunchInput`,
 the measured Linux Machine decision algorithm to typed snapshots and owned
 Engines. Each selection reads measured placement/CPU/tier/prefetch/cost fields
 directly, validates through the registry-defined parser, and records its sources.
-Explicit CLI values exclude incompatible measured candidates; they are never
-silently replaced by a planner. Model prefill predictions use the selected
-snapshot's actual route and native ubatch. Cross-server prompt persistence is not
-configured by typed launch; the production controller predicts a full prefill on
-switch and refuses `keeps_history=True`. Each Engine receives its own immutable snapshot
-and fresh native files. No production path calls `Machine.env` or accepts the
+It also selects the threadpools: `all` runs the measured thread count less one
+CPU for the I/O thread, unpinned; `pin` and `split` pin one ggml thread per
+measured compute CPU and keep the I/O CPU apart. Decode runs on the threads at
+the lowest CPU IDs of the mask, so `split` requires its fast CPU group there.
+Explicit CLI values, including `--threads` and `--cpus`, exclude incompatible
+measured candidates; they are never silently replaced by a planner. Model
+prefill predictions use the selected snapshot's actual route and native ubatch.
+Cross-server prompt persistence is not configured by typed launch; the production
+controller predicts a full prefill on switch and refuses `keeps_history=True`.
+Each Engine receives its own immutable snapshot, threadpools and fresh native
+files. No production path calls `Machine.env` or accepts the
 old Engine environment-control string. Model/listener/parallel/thread/batch
 arguments must use the explicit launch options so extra flags cannot silently
-replace those owned values. `--batch-threads` selects native prefill `-tb`
-independently of `cpu.threads`/decode `-t` (default: the same count; range1..256).
-This preserves measured Mac choices such as t4/tb12 or t8/tb12 without adding a
-additional SSD setting. The launch receipt and argv record both counts. Extra
-flags cannot override fixed placement, template, fit, cache or offload decisions.
+replace those owned values. `--threads` and `--batch-threads` select decode `-t`
+and prefill `-tb` (range 1..256; batch defaults to decode, and unset counts keep
+the server default). `--cpus` passes the same `-C`/`-Cb` mask with
+`--cpu-strict 1`/`--cpu-strict-batch 1`; the counts then default to its size and
+cannot exceed it, and it must not share a CPU with `cpu.io_cpus`. macOS cannot pin
+threads and refuses `--cpus`. A positive `cpu.decode_participants` cannot exceed
+the decode count. This preserves measured Mac choices such as t4/tb12 or t8/tb12
+without an SSD setting. The launch receipt and argv record the counts and CPUs.
+Extra flags cannot override fixed placement, threadpool, template, fit, cache or
+offload decisions.
 
 The production controller uses `NativeObservationSession` to consume the owned
 `native-events.jsonl` stream. It requires `ssd.controller.begin` schema 1 and

@@ -21,10 +21,12 @@ directory. See the [quick start](quickstart.md#prepare-a-launch).
 
 The framework checks GGUF metadata and creates an alias index without duplicating
 model weights. It selects the matching chat template from the deployment
-resources. `host.expert_cache_mib`, `cpu.threads`, and `--batch-threads` control the
-supported cache and thread settings; the native process retains its RSS guard,
-cache pin ownership and drain behavior. Model-specific cache sizes need measured
-memory evidence and are not inferred from machine RAM alone.
+resources. `host.expert_cache_mib` controls the supported cache, and `--threads`
+and `--batch-threads` select the decode `-t` and prefill `-tb` thread counts.
+macOS cannot pin threads to CPUs, so `--cpus` is refused there. The native
+process retains its RSS guard, cache pin ownership and drain behavior.
+Model-specific cache sizes need measured memory evidence and are not inferred
+from machine RAM alone.
 
 Earlier environment-driven launch scripts are not supported interfaces. Copies
 kept under `framework/tests/fixtures` are test inputs only; do not run them as

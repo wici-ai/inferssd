@@ -14,6 +14,7 @@ from functools import partial
 from pathlib import Path
 from typing import BinaryIO, Optional, TextIO, cast
 
+from inferssd.configuration.derive import Selection
 from inferssd.configuration.settings import Snapshot, parse
 from inferssd.engine.core import Engine, NativeEffects, post
 from inferssd.engine.owned import OwnedProcess
@@ -214,10 +215,12 @@ class Runtime:
             tier: int,
             cpus: str,
             extra: Sequence[str],
-            snapshot: Snapshot,
+            chosen: Selection,
         ) -> Engine:
             suffix = cpus.partition("@")[2]
-            selected = replace(specification, ubatch=int(suffix)) if suffix else specification
+            selected = replace(specification, threads=chosen.threads)
+            if suffix:
+                selected = replace(selected, ubatch=int(suffix))
             return self.engine(
                 directory,
                 selected_port,
@@ -225,7 +228,7 @@ class Runtime:
                 cpus,
                 "",
                 list(extra),
-                configured=snapshot,
+                configured=chosen.settings,
                 specification=selected,
             )
 
@@ -233,6 +236,7 @@ class Runtime:
             machine = TypedMachine(
                 DirectoryArtifacts(Path(path)),
                 base=base,
+                threads=specification.threads,
                 native_ubatch=specification.ubatch,
                 host_threads=host_threads,
             )
@@ -254,7 +258,7 @@ class Runtime:
             horizon,
             machine_factory=machine_factory,
             engine_factory=self.engine,
-            configuration=lambda machine, tier, cpus: cast(TypedMachine, machine).settings(
+            configuration=lambda machine, tier, cpus: cast(TypedMachine, machine).selected(
                 tier, cpus
             ),
             typed_engine=typed_engine,

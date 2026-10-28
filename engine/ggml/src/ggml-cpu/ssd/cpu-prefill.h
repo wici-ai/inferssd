@@ -39,8 +39,9 @@ struct kimi_cpu_prefill_stats {
     uint64_t ssd_bytes;
 };
 
-// Borrow the decode sink's I/O ring and worker pool. The sink must outlive this
-// context. Do not concurrently destroy either context while a run is active.
+// Borrow the decode sink's I/O ring and calls (kimi_cpu_sink_call_open): a run
+// computes on the participants of the sink's open call. The sink must outlive
+// this context. Do not concurrently destroy either context while a run is active.
 GGML_BACKEND_API struct kimi_cpu_prefill * kimi_cpu_prefill_create(
         struct kimi_cpu_sink * sink, char * error, size_t error_size);
 GGML_BACKEND_API void kimi_cpu_prefill_destroy(struct kimi_cpu_prefill * prefill);

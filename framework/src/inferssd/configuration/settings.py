@@ -82,6 +82,23 @@ def integer(literal: str, low: int, high: int) -> int:
     return int(literal)
 
 
+def cpus(literal: str) -> tuple[int, ...]:
+    """An ordered CPU list of unique IDs and inclusive ranges, such as "0-2,5"."""
+    result: list[int] = []
+    for item in literal.split(",") if literal else []:
+        endpoints = item.split("-")
+        if len(endpoints) > 2:
+            raise ValueError("invalid CPU list")
+        low = integer(endpoints[0], 0, 2147483647)
+        high = integer(endpoints[-1], 0, 2147483647)
+        if high < low or high - low > 65535 or len(result) + high - low + 1 > 65536:
+            raise ValueError("invalid or excessive CPU list")
+        result.extend(range(low, high + 1))
+    if len(set(result)) != len(result):
+        raise ValueError("duplicate CPU ID")
+    return tuple(result)
+
+
 def typed(prop: Mapping[str, Any], literal: str) -> Value:
     literal.encode("utf-8")
     literal = literal.strip(" \t\r\n")
@@ -109,19 +126,7 @@ def typed(prop: Mapping[str, Any], literal: str) -> Value:
             path.encode("utf-8")
         return tuple(paths)
     if kind == "cpus":
-        result: list[int] = []
-        for item in literal.split(",") if literal else []:
-            endpoints = item.split("-")
-            if len(endpoints) > 2:
-                raise ValueError("invalid CPU list")
-            low = integer(endpoints[0], 0, 2147483647)
-            high = integer(endpoints[-1], 0, 2147483647)
-            if high < low or high - low > 65535 or len(result) + high - low + 1 > 65536:
-                raise ValueError("invalid or excessive CPU list")
-            result.extend(range(low, high + 1))
-        if len(set(result)) != len(result):
-            raise ValueError("duplicate CPU ID")
-        return tuple(result)
+        return cpus(literal)
     costs: dict[str, float] = {}
     for word in filter(None, re.split(r"[ \t\r\n\v\f]+", literal.replace(",", " "))):
         key, equal, number = word.partition("=")
@@ -202,20 +207,6 @@ def parse(
             apply(key, literal, "file", f"{source}:{n}", receipt)
     for key, literal in overrides:
         apply(key, literal, "cli", "--ssd-" + key.replace(".", "-").replace("_", "-"), "")
-    threads = cast(int, values["cpu.threads"].value)
-    cpus = cast(tuple[int, ...], values["cpu.compute_cpus"].value)
-    participants = cast(int, values["cpu.decode_participants"].value)
-    # The executor needs an I/O participant beside compute; the macOS M1 reader keeps one
-    # participant until macOS moves onto it. macOS cannot pin: there a CPU list only counts.
-    executor = platform in ("linux", "windows")
-    if executor and threads < 2 or cpus and len(cpus) != threads - 1 or participants > threads - 1:
-        raise ValueError(
-            "CPU setting dependencies failed: "
-            + ", ".join(
-                f"{k} ({values[k].location})"
-                for k in ("cpu.threads", "cpu.compute_cpus", "cpu.decode_participants")
-            )
-        )
     if (
         platform == "linux"
         and cast(int, values["vram.margin_mib"].value)

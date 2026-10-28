@@ -16,11 +16,11 @@ static size_t configured_task_count() {
     return count;
 }
 
-static ssd::settings::snapshot configured_settings(int threads, bool invalid_affinity = false, int prefetch = 0) {
+static ssd::settings::snapshot configured_settings(bool invalid_affinity = false, int prefetch = 0) {
     std::vector<ssd::settings::override_value> values = {
-        { "cpu.threads", std::to_string(threads) }, { "prefetch.depth", std::to_string(prefetch) }, { "vram.budget", "0" },
+        { "prefetch.depth", std::to_string(prefetch) }, { "vram.budget", "0" },
     };
-    if (invalid_affinity) { values.push_back({ "cpu.compute_cpus", std::to_string(CPU_SETSIZE) }); }
+    if (invalid_affinity) { values.push_back({ "cpu.io_cpus", std::to_string(CPU_SETSIZE) }); }
     const auto parsed = ssd::settings::parse("", "", values);
     require(bool(parsed), parsed.error);
     return parsed.value;
@@ -37,8 +37,7 @@ static void configured_writer_failure_test(fixture & f, const ssd::settings::sna
         auto client = std::move(made.value);
         const ssd::runtime_services services{ writer.value.get(), nullptr, client.get() };
         char error[512] = {};
-        sink_ptr sink(ssd::cpu::create_configured(&settings, &services, fixture::resolve, &f, error, sizeof(error)),
-            kimi_cpu_sink_destroy);
+        sink_ptr sink(ssd::cpu::create_configured(&settings, &services, fixture::resolve, &f, error, sizeof(error)));
         if (!sink) { _exit(2); }
         signal(SIGXFSZ, SIG_IGN);
         const struct rlimit limit = { 0, 0 };
@@ -59,7 +58,7 @@ static void configured_writer_failure_test(fixture & f, const ssd::settings::sna
 static void configured_runtime_tests(fixture_inputs & inputs) {
     fixture f; make_synthetic(f);
     const size_t before = configured_task_count();
-    auto settings = configured_settings(2);
+    auto settings = configured_settings();
     const auto original = settings;
     const std::string path = f.path + ".jsonl";
     struct cleanup { std::string path; ~cleanup() { unlink(path.c_str()); } } cleanup{ path };
@@ -84,21 +83,19 @@ static void configured_runtime_tests(fixture_inputs & inputs) {
     require(kernel_getter && ssd::gpu::valid(kernel_getter()), "normal CPU quant/reference registry");
     auto bad_services = services;
     auto bad_kernels = *kernel_getter(); bad_kernels.size = 0; bad_services.cpu = &bad_kernels;
-    sink_ptr rejected_kernels(ssd::cpu::create_configured(&settings, &bad_services, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+    sink_ptr rejected_kernels(ssd::cpu::create_configured(&settings, &bad_services, fixture::resolve, &f, error, sizeof(error)));
     require(!rejected_kernels && error[0] && configured_task_count() == before, "kernel ABI rejection started a worker");
     ssd::gpu::provider_v1 missing_gpu{}; bad_services.cpu = kernel_getter(); bad_services.gpu = &missing_gpu;
-    sink_ptr rejected_gpu(ssd::cpu::create_configured(&settings, &bad_services, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+    sink_ptr rejected_gpu(ssd::cpu::create_configured(&settings, &bad_services, fixture::resolve, &f, error, sizeof(error)));
     require(!rejected_gpu && error[0] && configured_task_count() == before, "GPU ABI rejection started a worker");
-    sink_ptr first(ssd::cpu::create_configured(&settings, &services, fixture::resolve, &f, error, sizeof(error)),
-        kimi_cpu_sink_destroy);
-    require(bool(first) && configured_task_count() == before + 1, std::string("configured two-thread create: ") + error);
-    settings = configured_settings(2, false, 1); debug.profile = false;
+    sink_ptr first(ssd::cpu::create_configured(&settings, &services, fixture::resolve, &f, error, sizeof(error)));
+    require(bool(first) && configured_task_count() == before + 1, std::string("configured create: ") + error);
+    settings = configured_settings(false, 1); debug.profile = false;
     const ssd::runtime_services second_services{ nullptr, &debug, second_client.get() };
-    sink_ptr second(ssd::cpu::create_configured(&settings, &second_services, fixture::resolve, &f, error, sizeof(error)),
-        kimi_cpu_sink_destroy);
+    sink_ptr second(ssd::cpu::create_configured(&settings, &second_services, fixture::resolve, &f, error, sizeof(error)));
     require(bool(second) && configured_task_count() == before + 5, "independent second context thread count");
-    auto invalid = configured_settings(2, true);
-    sink_ptr rejected(ssd::cpu::create_configured(&invalid, &services, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+    auto invalid = configured_settings(true);
+    sink_ptr rejected(ssd::cpu::create_configured(&invalid, &services, fixture::resolve, &f, error, sizeof(error)));
     require(!rejected && error[0] && configured_task_count() == before + 5, "affinity rejection leaked a started worker");
     require(!ssd::cpu::cache_make_room_configured(nullptr, &original, nullptr, 0, 0),
         "missing early registration silently admitted allocation");
@@ -131,7 +128,7 @@ static void configured_runtime_tests(fixture_inputs & inputs) {
     while (std::getline(records, line)) {
         const auto event = nlohmann::json::parse(line);
         require(event.at("v") == 1 && event.at("seq") == sequence++, "configured JSONL sequence/version");
-        if (event.at("ev") == "ssd.settings") { require(event.at("values").at("cpu.threads") == 2 && event.at("values").at("prefetch.depth") == 0, "owned settings receipt changed"); }
+        if (event.at("ev") == "ssd.settings") { require(event.at("values").at("cpu.decode_participants") == 0 && event.at("values").at("prefetch.depth") == 0, "owned settings receipt changed"); }
         else { profile |= event.at("compute_thread_cpu_us").get<double>() > 0; }
     }
     require(sequence == 3 && profile, "copied debug selection or actual layer telemetry missing");

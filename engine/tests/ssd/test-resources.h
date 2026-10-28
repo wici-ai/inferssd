@@ -64,16 +64,8 @@ inline ssd::platform::cpu_list process_cpus() {
     return cpus;
 }
 
-// Pinned fixtures (cpu.compute_cpus/io_cpus): every participant needs its own CPU.
-inline void cpu_threads(int compute, int io) {
-    check_counts(compute, io);
-    const int available = int(process_cpus().size());
-    need(available >= compute + io, "CPU affinity has " + std::to_string(available) +
-            " CPUs; fixture needs compute=" + std::to_string(compute) + " IO=" + std::to_string(io));
-}
-
-// Unpinned fixtures (no cpu.compute_cpus/io_cpus): participants may share CPUs. Placement
-// changes timing only, never results, so a small machine still runs the correctness cases.
+// Compute participants and I/O threads may share CPUs. Placement changes timing only, never
+// results, so a small machine still runs the correctness cases.
 inline void cpu_participants(int compute, int io) { check_counts(compute, io); }
 
 // The read ring of this OS. io_uring can be compiled out (ENOSYS) or forbidden (EPERM, EACCES);

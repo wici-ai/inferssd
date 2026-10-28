@@ -105,7 +105,6 @@ int main(int argc, char ** argv) {
     int threads = 4;
     if (argc == 3 && !std::strcmp(argv[1], "--threads")) { threads = std::stoi(argv[2]); }
     else { require(argc == 1, "usage: test-kimi-prefetch-tier [--threads N]"); }
-    inputs.set("split_cv", "1");
     test_resources::io_ring();
     test_resources::finite_envelope();
     for (const auto & kv : { std::pair<const char *, const char *>{ "ready_first", "1" },

@@ -148,22 +148,6 @@ static void test_pin(const cpu_list & cpus) {
     const auto before = placement();
     require(pin_current_thread({}), "an empty pin is a no-op");
     require(placement() == before, "an empty pin leaves the thread as it was");
-    {
-        scoped_affinity scope({ cpus.back() });
-        require(scope.ok(), "scoped pin");
-        require(runs_within({ cpus.back() }), "a scoped pin moves the thread");
-        require(!affinity_supported() || cpus.size() == 1 || placement() != before, "a scoped pin changes the placement");
-    }
-    require(placement() == before, "scope exit restores the placement");
-    {
-        scoped_affinity none({});
-        require(none.ok(), "an empty scope is a no-op");
-    }
-    {
-        scoped_affinity bad({ -1 });
-        require(!affinity_supported() || !bad.ok(), "a scope on an invalid CPU fails");
-    }
-    require(placement() == before, "a failed scope leaves the thread as it was");
     if (affinity_supported()) {
         require(!pin_current_thread({ -1 }) && !pin_current_thread({ 100000 }), "invalid CPUs are refused");
         require(placement() == before, "a refused pin leaves the thread as it was");
@@ -200,14 +184,12 @@ static void test_pin(const cpu_list & cpus) {
 }
 
 static void test_roles() {
-    for (thread_role role : { thread_role::compute, thread_role::io, thread_role::background }) {
+    for (thread_role role : { thread_role::io, thread_role::background }) {
         bool ok = false;
         std::thread([&] {
             ok = set_thread_role(role);
 #if defined(__APPLE__)
-            const qos_class_t want = role == thread_role::compute ? QOS_CLASS_USER_INTERACTIVE :
-                                     role == thread_role::io      ? QOS_CLASS_USER_INITIATED :
-                                                                    QOS_CLASS_UTILITY;
+            const qos_class_t want = role == thread_role::io ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY;
             ok = ok && qos_class_self() == want;
 #endif
         }).join();

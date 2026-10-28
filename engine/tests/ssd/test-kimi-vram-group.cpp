@@ -716,7 +716,7 @@ struct gpu_lane {
 struct cpu_lane {
     const time_options & o;
     fixture f;
-    sink_ptr sink{ nullptr, kimi_cpu_sink_destroy };
+    sink_ptr sink;
     std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)> prefill{ nullptr, kimi_cpu_prefill_destroy };
     std::unique_ptr<tensors> meta;
     std::vector<float> input, output, weights;
@@ -891,7 +891,6 @@ int main(int argc, char ** argv) {
     try {
         ggml_cpu_init();
         inputs.set("ready_first", "1");
-        inputs.set("split_cv", "1");
         inputs.set("vram_budget", "0");
         cuda(cudaSetDevice(0), "cudaSetDevice");
         bool timing = false;

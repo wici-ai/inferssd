@@ -28,16 +28,30 @@ typedef bool (*kimi_cpu_sink_resolver)(
 
 
 // Sources are direct-read descriptors (platform::open_direct), read through the
-// OS read ring (io/read-ring.h). total_threads includes the calling
-// compute thread and one I/O thread; all other threads sleep between phases.
+// OS read ring (io/read-ring.h). The sink owns an I/O thread (and, with
+// prefetch, its readers); it computes on the threads of its calls (below).
 // A context serializes run calls. This unconfigured factory is for explicit
 // CPU-only callers. Production uses ssd::cpu::create_configured with an owned
 // typed snapshot and borrowed context services. Test policies are explicit
 // constructor inputs; no environment configuration is read here.
 GGML_BACKEND_API struct kimi_cpu_sink * kimi_cpu_sink_create(
-        int total_threads, int ring_experts, kimi_cpu_sink_resolver resolver,
+        int ring_experts, kimi_cpu_sink_resolver resolver,
         void * userdata, char * error, size_t error_size);
+// No call may be open.
 GGML_BACKEND_API void kimi_cpu_sink_destroy(struct kimi_cpu_sink * sink);
+
+// A call: nth compute participants for the runs in between, as a ggml graph's
+// CPU threads enter a node. The coordinator (ith 0) opens it with nth, runs,
+// and closes it; every other thread joins with its (ith, nth). Each compute
+// phase of a run splits its rows over the participants, a decode phase over
+// the first ones the decode thread choice takes. Without an open call the
+// coordinator computes alone. Joining blocks until the call closes; closing
+// waits until all nth - 1 have joined, so close on every path, errors
+// included. A call may span several runs; one is open at a time. Open fails
+// only for nth outside 1..512 or a call already open.
+GGML_BACKEND_API bool kimi_cpu_sink_call_open(struct kimi_cpu_sink * sink, int nth, char * error, size_t error_size);
+GGML_BACKEND_API void kimi_cpu_sink_call_close(struct kimi_cpu_sink * sink);
+GGML_BACKEND_API void kimi_cpu_sink_call_join(struct kimi_cpu_sink * sink, int ith, int nth);
 // Next-layer expert prefetch: the experts that `layer` is predicted to select,
 // best first, given before the decode run of the layer before it. Ignored when prefetch is off.
 GGML_BACKEND_API void kimi_cpu_sink_prefetch_hint(struct kimi_cpu_sink * sink, int32_t layer, const int32_t * experts, int n);

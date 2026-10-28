@@ -3198,15 +3198,21 @@ ggml_status llama_context::graph_compute(
         }
     }
 
+    // The CPU threads of a graph with sink nodes are the compute participants
+    // of their calls; the executor they join exists before the graph runs.
+    if (gf_res_prev && gf_res_prev->get_gf() == gf && !gf_res_prev->cpu_sink_nodes.empty()) {
+        GGML_ASSERT(cpu_sink_runtime && backend_cpu);
+        try {
+            cpu_sink_runtime->prepare_graph(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)));
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: %s; no fallback\n", __func__, e.what());
+            return GGML_STATUS_FAILED;
+        }
+    }
+
     // set the number of threads for all the backends
-    // The sink owns its persistent compute/I/O pool. Keep the other ggml CPU
-    // workers asleep during its custom op instead of spinning at its barrier.
-    const bool cpu_sink_graph = gf_res_prev &&
-        gf_res_prev->get_gf() == gf && !gf_res_prev->cpu_sink_nodes.empty();
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
-        const bool sink_cpu_backend = cpu_sink_graph &&
-            set_n_threads_fn.first == backend_cpu;
-        set_n_threads_fn.second(set_n_threads_fn.first, sink_cpu_backend ? 1 : n_threads);
+        set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
     if (ssd_runtime && !ssd_runtime->diagnostics.good()) {

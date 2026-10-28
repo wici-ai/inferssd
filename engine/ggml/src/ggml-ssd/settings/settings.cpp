@@ -309,21 +309,8 @@ result<void> validate_dependencies(const snapshot & out, uint32_t platform) {
         const auto * v = out.find(key);
         return failure<void>(status::invalid, key + " (" + v->location + "): " + message);
     };
-    const uint64_t threads = *out.integer("cpu.threads"), participants = *out.integer("cpu.decode_participants");
-    // The executor runs its compute participants beside one I/O participant; the macOS M1 reader, which has
-    // none, keeps one participant until macOS moves onto the executor.
-    if ((platform & (scope_linux | scope_windows)) && threads < 2) {
-        return dependency("cpu.threads", "the executor requires at least compute and I/O participants");
-    }
-    // The same rule on every platform; macOS cannot pin, so there only the list's length is used.
-    const auto &      cpus          = *out.cpus("cpu.compute_cpus");
-    const std::string thread_source = "cpu.threads (" + out.find("cpu.threads")->location + ")";
-    if (!cpus.empty() && cpus.size() != threads - 1) {
-        return dependency("cpu.compute_cpus", "list length must equal " + thread_source + " minus the I/O participant");
-    }
-    if (participants > threads - 1) {
-        return dependency("cpu.decode_participants", "exceeds " + thread_source + " minus I/O participant");
-    }
+    // Compute runs on ggml's threads (-t, -tb, --cpu-mask): cpu.decode_participants is checked against
+    // each decode call's thread count.
     if ((platform & scope_linux) && *out.integer("vram.margin_mib") < *out.integer("vram.reserve_mib") + 64) {
         return dependency("vram.margin_mib",
                           "must be at least vram.reserve_mib (" + out.find("vram.reserve_mib")->location + ") plus 64");

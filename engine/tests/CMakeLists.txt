@@ -411,6 +411,18 @@ if (TARGET ggml-cpu)
     endforeach()
 
     add_test(NAME kimi_cpu_sink_schedule_invalid COMMAND test-kimi-cpu-sink --schedule-invalid)
+    # Sink nodes in ggml graphs on a ggml threadpool of 1, 2, 3 and all CPUs: the production schedule, and a
+    # polling one.
+    add_test(NAME kimi_cpu_sink_threadpool COMMAND test-kimi-cpu-sink --threadpool-tests --ring-experts 8
+        --fixture ready_first=1 --fixture early_up_gate=1 --fixture role_major=1
+        --fixture nonblocking_down_sched=1 --fixture dynamic_rows=1 --fixture dynamic_chunk_rows=64)
+    add_test(NAME kimi_cpu_sink_threadpool_poll COMMAND test-kimi-cpu-sink --threadpool-tests --ring-experts 1
+        --fixture poll_us=100)
+    set_tests_properties(kimi_cpu_sink_threadpool kimi_cpu_sink_threadpool_poll PROPERTIES TIMEOUT 180)
+    # A decode microbenchmark, not a CTest: test-kimi-sink-bench --help.
+    add_executable(test-kimi-sink-bench ssd/test-kimi-sink-bench.cpp)
+    target_include_directories(test-kimi-sink-bench PRIVATE ../ggml/src ../ggml/src/ggml-cpu)
+    target_link_libraries(test-kimi-sink-bench PRIVATE ggml-ssd-host ggml-cpu ggml-base Threads::Threads)
     # Trait-selected kernels (MXFP4/Q8_0, Q8_0 down, Q3_K) and the SiTU and
     # SWIGLU_CLAMP activations against a MUL_MAT_ID graph; the RAM cache cases
     # require a finite cgroup memory limit like the other cache tests.
@@ -420,7 +432,7 @@ if (TARGET ggml-cpu)
                 set(activation_test kimi_cpu_sink_activation_t${activation_threads}_d${activation_depth}_ready${activation_ready})
                 add_test(NAME ${activation_test} COMMAND test-kimi-cpu-sink --activation-tests
                     --threads ${activation_threads} --ring-experts ${activation_depth}
-                    --fixture ready_first=${activation_ready} --fixture read_fixed=${activation_ready} --fixture split_cv=1 --fixture profile=0)
+                    --fixture ready_first=${activation_ready} --fixture read_fixed=${activation_ready} --fixture profile=0)
                 set_tests_properties(${activation_test} PROPERTIES TIMEOUT 180)
             endforeach()
         endforeach()
@@ -431,12 +443,12 @@ if (TARGET ggml-cpu)
                 set(early_test kimi_cpu_sink_early_t${early_threads}_d${early_depth}_ready${early_ready})
                 add_test(NAME ${early_test} COMMAND test-kimi-cpu-sink --early-up-gate-tests
                     --threads ${early_threads} --ring-experts ${early_depth}
-                    --fixture cache_policy=lru --fixture cache_allocation=uniform --fixture ready_first=${early_ready} --fixture read_fixed=${early_ready} --fixture split_cv=1 --fixture profile=0)
+                    --fixture cache_policy=lru --fixture cache_allocation=uniform --fixture ready_first=${early_ready} --fixture read_fixed=${early_ready} --fixture profile=0)
                 set_tests_properties(${early_test} PROPERTIES TIMEOUT 180)
                 set(poll_test kimi_cpu_sink_poll_t${early_threads}_d${early_depth}_ready${early_ready})
                 add_test(NAME ${poll_test} COMMAND test-kimi-cpu-sink --poll-tests
                     --threads ${early_threads} --ring-experts ${early_depth}
-                    --fixture cache_policy=lru --fixture cache_allocation=uniform --fixture ready_first=${early_ready} --fixture read_fixed=${early_ready} --fixture split_cv=1 --fixture profile=0)
+                    --fixture cache_policy=lru --fixture cache_allocation=uniform --fixture ready_first=${early_ready} --fixture read_fixed=${early_ready} --fixture profile=0)
                 set_tests_properties(${poll_test} PROPERTIES TIMEOUT 180)
             endforeach()
         endforeach()
@@ -447,7 +459,7 @@ if (TARGET ggml-cpu)
                 set(role_test kimi_cpu_sink_role_major_t${role_threads}_d${role_depth}_ready${role_ready})
                 add_test(NAME ${role_test} COMMAND test-kimi-cpu-sink --role-major-tests
                     --threads ${role_threads} --ring-experts ${role_depth}
-                    --fixture cache_policy=lru --fixture cache_allocation=uniform --fixture ready_first=${role_ready} --fixture read_fixed=${role_ready} --fixture split_cv=1 --fixture profile=0)
+                    --fixture cache_policy=lru --fixture cache_allocation=uniform --fixture ready_first=${role_ready} --fixture read_fixed=${role_ready} --fixture profile=0)
                 set_tests_properties(${role_test} PROPERTIES TIMEOUT 180)
             endforeach()
         endforeach()
@@ -458,16 +470,16 @@ if (TARGET ggml-cpu)
                 set(nonblocking_test kimi_cpu_sink_nonblocking_down_t${nonblocking_threads}_d${nonblocking_depth}_fixed${nonblocking_fixed})
                 add_test(NAME ${nonblocking_test} COMMAND test-kimi-cpu-sink --nonblocking-down-tests
                     --threads ${nonblocking_threads} --ring-experts ${nonblocking_depth}
-                    --fixture cache_policy=lru --fixture cache_allocation=uniform --fixture ready_first=1 --fixture read_fixed=${nonblocking_fixed} --fixture split_cv=1 --fixture profile=0)
+                    --fixture cache_policy=lru --fixture cache_allocation=uniform --fixture ready_first=1 --fixture read_fixed=${nonblocking_fixed} --fixture profile=0)
                 set_tests_properties(${nonblocking_test} PROPERTIES TIMEOUT 180)
             endforeach()
         endforeach()
     endforeach()
     add_test(NAME kimi_cpu_sink_early_cache COMMAND test-kimi-cpu-sink --cache-tests --threads 16 --ring-experts 8
-                    --fixture early_up_gate=1 --fixture ready_first=1 --fixture read_fixed=1 --fixture split_cv=1)
+                    --fixture early_up_gate=1 --fixture ready_first=1 --fixture read_fixed=1)
     set_tests_properties(kimi_cpu_sink_early_cache PROPERTIES TIMEOUT 180)
     add_test(NAME kimi_cpu_sink_poll_early COMMAND test-kimi-cpu-sink --poll-early-tests --threads 16 --ring-experts 8
-                    --fixture cache_policy=lru --fixture cache_allocation=uniform --fixture ready_first=1 --fixture read_fixed=0 --fixture split_cv=1 --fixture profile=0)
+                    --fixture cache_policy=lru --fixture cache_allocation=uniform --fixture ready_first=1 --fixture read_fixed=0 --fixture profile=0)
     set_tests_properties(kimi_cpu_sink_poll_early PROPERTIES TIMEOUT 180)
     foreach(schedule_threads 2 12 16)
         foreach(schedule_depth 1 8)
@@ -479,15 +491,15 @@ if (TARGET ggml-cpu)
         endforeach()
     endforeach()
     add_test(NAME kimi_cpu_sink_trace_profile COMMAND test-kimi-cpu-sink --trace-profile --threads 4 --ring-experts 1
-                    --fixture read_fixed=0 --fixture split_cv=1)
+                    --fixture read_fixed=0)
     set_tests_properties(kimi_cpu_sink_trace_profile PROPERTIES TIMEOUT 180)
     # the RAM cache cases require a finite cgroup memory limit like the other cache tests
     add_test(NAME kimi_cpu_sink_prefetch COMMAND test-kimi-cpu-sink --prefetch-tests --threads 4 --ring-experts 2
-                    --fixture read_fixed=0 --fixture split_cv=1 --fixture profile=0)
+                    --fixture read_fixed=0 --fixture profile=0)
     set_tests_properties(kimi_cpu_sink_prefetch PROPERTIES TIMEOUT 180)
     # the RAM cache's storage at load (a finite cgroup memory limit, like the other cache cases)
     add_test(NAME kimi_cpu_sink_cache_load COMMAND test-kimi-cpu-sink --cache-load-tests --threads 4 --ring-experts 2
-                    --fixture read_fixed=0 --fixture split_cv=1 --fixture profile=0)
+                    --fixture read_fixed=0 --fixture profile=0)
     set_tests_properties(kimi_cpu_sink_cache_load PROPERTIES TIMEOUT 180)
     # the prefetch against the GPU tier's residency, with a stand-in tier the executable exports (no GPU)
     add_executable(test-kimi-prefetch-tier ssd/test-kimi-prefetch-tier.cpp)
@@ -496,23 +508,16 @@ if (TARGET ggml-cpu)
     add_test(NAME kimi_prefetch_tier COMMAND test-kimi-prefetch-tier)
     set_tests_properties(kimi_prefetch_tier PROPERTIES TIMEOUT 180)
     add_test(NAME kimi_cpu_sink_registered COMMAND test-kimi-cpu-sink --registered-lifecycle
-                    --fixture read_fixed=1 --fixture split_cv=1)
+                    --fixture read_fixed=1)
 
-    foreach(cache_cv RANGE 0 1)
+    # A single compute participant and ring=1, and several participants with ring wraparound.
+    foreach(cache_threads 2 4)
+        math(EXPR cache_depth "${cache_threads} / 2")
         foreach(cache_fixed RANGE 0 1)
-            # Cover a single compute participant and ring=1 in addition to
-            # persistent multiworker scheduling and ring wraparound.
-            if (cache_cv EQUAL cache_fixed)
-                set(cache_threads 2)
-                set(cache_depth 1)
-            else()
-                set(cache_threads 4)
-                set(cache_depth 2)
-            endif()
-            set(cache_test kimi_cpu_sink_cache_cv${cache_cv}_fixed${cache_fixed})
+            set(cache_test kimi_cpu_sink_cache_t${cache_threads}_fixed${cache_fixed})
             add_test(NAME ${cache_test} COMMAND test-kimi-cpu-sink --cache-tests
                 --threads ${cache_threads} --ring-experts ${cache_depth}
-                    --fixture read_fixed=${cache_fixed} --fixture split_cv=${cache_cv} --fixture profile=0)
+                    --fixture read_fixed=${cache_fixed} --fixture profile=0)
             set_tests_properties(${cache_test} PROPERTIES TIMEOUT 180)
         endforeach()
     endforeach()
@@ -521,7 +526,7 @@ if (TARGET ggml-cpu)
             set(max_cache_test kimi_cpu_sink_max_cache_t${cache_threads}_d${cache_depth})
             add_test(NAME ${max_cache_test} COMMAND test-kimi-cpu-sink --max-cache-tests
                 --threads ${cache_threads} --ring-experts ${cache_depth}
-                    --fixture cache_allocation=uniform --fixture ready_first=1 --fixture split_cv=1 --fixture read_fixed=0 --fixture profile=0)
+                    --fixture cache_allocation=uniform --fixture ready_first=1 --fixture read_fixed=0 --fixture profile=0)
             set_tests_properties(${max_cache_test} PROPERTIES TIMEOUT 180)
         endforeach()
     endforeach()
@@ -529,12 +534,12 @@ if (TARGET ggml-cpu)
         foreach(cache_allocation priority uniform global)
             set(large_test kimi_cpu_sink_large_${cache_policy}_${cache_allocation})
             add_test(NAME ${large_test} COMMAND test-kimi-cpu-sink --cache-large-tests --threads 4 --ring-experts 1
-                    --fixture cache_policy=${cache_policy} --fixture cache_allocation=${cache_allocation} --fixture read_fixed=1 --fixture split_cv=1 --fixture profile=0)
+                    --fixture cache_policy=${cache_policy} --fixture cache_allocation=${cache_allocation} --fixture read_fixed=1 --fixture profile=0)
             set_tests_properties(${large_test} PROPERTIES TIMEOUT 180)
             foreach(cache_transport RANGE 0 1)
                 set(policy_test kimi_cpu_sink_policy_${cache_policy}_${cache_allocation}_fixed${cache_transport})
                 add_test(NAME ${policy_test} COMMAND test-kimi-cpu-sink --cache-policy-tests --threads 4 --ring-experts 2
-                    --fixture cache_policy=${cache_policy} --fixture cache_allocation=${cache_allocation} --fixture read_fixed=${cache_transport} --fixture split_cv=${cache_transport} --fixture profile=0)
+                    --fixture cache_policy=${cache_policy} --fixture cache_allocation=${cache_allocation} --fixture read_fixed=${cache_transport} --fixture profile=0)
                 set_tests_properties(${policy_test} PROPERTIES TIMEOUT 180)
             endforeach()
         endforeach()
@@ -560,25 +565,19 @@ if (TARGET ggml-cpu)
     foreach(retain_depth 1 8)
         add_test(NAME kimi_cpu_prefill_retain_d${retain_depth} COMMAND test-kimi-cpu-prefill
             --cache-retention --threads 4 --ring-experts ${retain_depth}
-                    --fixture read_fixed=0 --fixture split_cv=1 --fixture ready_first=1 --fixture cache_allocation=uniform)
+                    --fixture read_fixed=0 --fixture ready_first=1 --fixture cache_allocation=uniform)
         set_tests_properties(kimi_cpu_prefill_retain_d${retain_depth} PROPERTIES TIMEOUT 180)
     endforeach()
     add_test(NAME kimi_cpu_prefill_registered COMMAND test-kimi-cpu-prefill --threads 4 --ring-experts 2
-                    --fixture read_fixed=1 --fixture split_cv=1)
+                    --fixture read_fixed=1)
 
-    foreach(lifecycle_cv RANGE 0 1)
+    foreach(lifecycle_threads 2 4)
+        math(EXPR lifecycle_depth "${lifecycle_threads} / 2")
         foreach(lifecycle_fixed RANGE 0 1)
-            if (lifecycle_cv EQUAL lifecycle_fixed)
-                set(lifecycle_threads 2)
-                set(lifecycle_depth 1)
-            else()
-                set(lifecycle_threads 4)
-                set(lifecycle_depth 2)
-            endif()
-            set(lifecycle_test kimi_cpu_prefill_cache_cv${lifecycle_cv}_fixed${lifecycle_fixed})
+            set(lifecycle_test kimi_cpu_prefill_cache_t${lifecycle_threads}_fixed${lifecycle_fixed})
             add_test(NAME ${lifecycle_test} COMMAND test-kimi-cpu-prefill --cache-lifecycle
                 --threads ${lifecycle_threads} --ring-experts ${lifecycle_depth}
-                    --fixture read_fixed=${lifecycle_fixed} --fixture split_cv=${lifecycle_cv} --fixture profile=0)
+                    --fixture read_fixed=${lifecycle_fixed} --fixture profile=0)
             set_tests_properties(${lifecycle_test} PROPERTIES TIMEOUT 180)
         endforeach()
     endforeach()
@@ -900,7 +899,7 @@ foreach(resource_test IN LISTS ssdash_registered_tests)
         else()
             set_property(TEST ${resource_test} APPEND PROPERTY LABELS device)
             set_property(TEST ${resource_test} PROPERTY SKIP_RETURN_CODE 77)
-            if (NOT resource_test MATCHES "^(kimi_cpu_sink|kimi_cpu_sink_schedule_invalid|kimi_cpu_sink_registered|kimi_cpu_sink_trace_profile|dsv41_q2_cpu_sink_decode|kimi_cpu_prefill|kimi_cpu_prefill_registered)$")
+            if (NOT resource_test MATCHES "^(kimi_cpu_sink|kimi_cpu_sink_schedule_invalid|kimi_cpu_sink_threadpool|kimi_cpu_sink_threadpool_poll|kimi_cpu_sink_registered|kimi_cpu_sink_trace_profile|dsv41_q2_cpu_sink_decode|kimi_cpu_prefill|kimi_cpu_prefill_registered)$")
                 set_property(TEST ${resource_test} APPEND PROPERTY LABELS ${ssd_envelope_label})
             endif()
         endif()

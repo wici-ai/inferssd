@@ -17,7 +17,7 @@ inline void kimi_cpu_sink_normalize_expert(float * values, int rows, const float
 
 
 // Private executor hooks. The stream serializes all accesses to the shared
-// decode ring and worker pool. Call parallel only from the stream consumer;
+// decode ring and compute phases. Call parallel only from the stream consumer;
 // callbacks must not recursively enter either executor or allocate/throw.
 // Streaming is a prefill operation: it disables decode cache (normally releases
 // it; optional cross-request retention checks the same memory guard) and

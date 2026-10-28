@@ -5,16 +5,25 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from inferssd.configuration.settings import Setting, Snapshot, parse, render
+from inferssd.launch.types import Threads
 from inferssd.model.machine import Machine
 from inferssd.plan import _prefill as prefill
 
 
 class SelectionConflict(ValueError):
     """An explicit CLI setting excludes a measured adaptive selection."""
+
+
+@dataclass(frozen=True)
+class Selection:
+    """A measured choice: the native SSD settings and the server's ggml threadpools."""
+
+    settings: Snapshot
+    threads: Threads
 
 
 def selection(
@@ -25,7 +34,8 @@ def selection(
     host_threads: Callable[[], Optional[int]],
     *,
     native_ubatch: Optional[int] = None,
-) -> Snapshot:
+    threads: Threads = Threads(),
+) -> Selection:
     if base.platform != "linux":
         raise ValueError("Darwin online adaptive placement M2 remains unimplemented")
     if placement not in machine.P or tier < 0 or tier > machine.caps[placement]:
@@ -45,30 +55,40 @@ def selection(
     if name not in ("all", "pin", "split"):
         raise ValueError("unimplemented typed CPU placement " + name)
     total = 0 if name == "pin" else int(machine.dev.get("default_threads") or host_threads() or 0)
+    # One CPU of the measured total stays with the sink's I/O thread; the ggml
+    # threadpools compute on the others, pinned one thread per CPU except in "all".
     if name == "all":
         if total < 2:
             raise ValueError("all placement requires a measured or explicit host thread count")
-        compute, io, participants = [], [], 0
+        count, compute, io, participants = total - 1, [], [], 0
     else:
         if len(groups) < 2 or len(groups[0]) < 3:
             raise ValueError("pin/split requires measured CPU groups")
         io = [groups[0][-1]]
+        fast = groups[0][:-1]
         if name == "pin":
-            compute = groups[0][:-1]
-            total = len(compute) + 1
+            compute = fast
             participants = len(compute)
         else:
             compute = [cpu for group in groups for cpu in group][:total]
             compute = [cpu for cpu in compute if cpu not in io]
             if len(compute) != total - 1:
                 raise ValueError("split placement has insufficient measured CPU IDs")
-            participants = len(groups[0]) - 1
-    choose("cpu.threads", total, "device.default_threads and measured placement " + placement)
-    choose(
-        "cpu.compute_cpus",
-        json.dumps(",".join(map(str, compute))),
-        "measured compute CPU IDs " + placement,
-    )
+            participants = len(fast)
+            # Decode participants run on the lowest CPU IDs of the strict mask.
+            if sorted(compute)[:participants] != sorted(fast):
+                raise ValueError(
+                    "split placement requires the fast CPU group at the lowest compute CPU IDs"
+                )
+        count = len(compute)
+    cpus = tuple(sorted(compute))
+    batch = threads.batch or count
+    if (
+        threads.decode not in (None, count)
+        or (threads.cpus and sorted(threads.cpus) != list(cpus))
+        or (cpus and batch > len(cpus))
+    ):
+        raise SelectionConflict("explicit launch threads exclude measured placement " + placement)
     choose("cpu.io_cpus", json.dumps(",".join(map(str, io))), "measured I/O CPU ID " + placement)
     choose("cpu.decode_participants", participants, "measured fast CPU group " + placement)
     choose(
@@ -166,4 +186,4 @@ def selection(
             )
         else:
             entries.append(item)
-    return replace(base, entries=tuple(entries))
+    return Selection(replace(base, entries=tuple(entries)), Threads(count, batch, cpus))
