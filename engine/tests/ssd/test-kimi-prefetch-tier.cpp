@@ -49,7 +49,7 @@ extern "C" const kimi_vram_format_api * kimi_vram_format_get_api() {
 }
 extern "C" const ssd::gpu::testing::api * ggml_ssd_tier_testing_get_api() {
     static const ssd::gpu::testing::api api = { 1, sizeof(ssd::gpu::testing::api),
-        [](uint64_t, const ssd::gpu::testing::tier_options *, char *, size_t) noexcept -> void * { return &tier_context; } };
+        [](uint64_t, const ssd::gpu::testing::tier_options *, const ssd::gpu::cpu_kernels_v1 *, char *, size_t) noexcept -> void * { return &tier_context; } };
     return &api;
 }
 extern "C" const kimi_vram_residency_api * kimi_vram_residency_get_api() {
