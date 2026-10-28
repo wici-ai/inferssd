@@ -35,6 +35,7 @@ add_library(llama
             inferssd/state-dsv4.cpp
             inferssd/state-dsv4-constants.h
             llama-memory.cpp
+            llama-memory-hybrid-idx.cpp
             llama-memory-hybrid.cpp
             llama-memory-hybrid-iswa.cpp
             llama-memory-recurrent.cpp

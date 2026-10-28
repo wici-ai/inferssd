@@ -213,6 +213,9 @@ struct llama_model_loader {
     bool should_defer_expert_mmaps() const;
     void drop_mmap_expert_pages() const;
 
+    std::map<size_t, std::pair<size_t, size_t>> ple_lazy_ranges;
+    void mark_ple_lazy(const llama_tensor_weight & weight);
+
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
