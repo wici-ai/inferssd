@@ -73,7 +73,8 @@ def classify_exception(error):
     if isinstance(reason, socket.gaierror):
         retry = reason.errno == socket.EAI_AGAIN
         return "transport-dns-temporary" if retry else "transport-dns-terminal", None, retry
-    if isinstance(reason, TimeoutError):
+    # Python 3.9 still has a distinct socket.timeout class (with errno=None).
+    if isinstance(reason, (TimeoutError, socket.timeout)):
         return "transport-timeout", None, True
     if isinstance(reason, (http.client.RemoteDisconnected, http.client.IncompleteRead, EOFError)):
         return "transport-eof", None, True

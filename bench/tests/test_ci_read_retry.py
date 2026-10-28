@@ -59,6 +59,19 @@ def test_only_known_typed_transport_errors_are_retryable(error):
     assert read_retry.classify_exception(error)[2] is True
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_python39_distinct_socket_timeout_is_retryable(monkeypatch, wrapped):
+    class LegacySocketTimeout(OSError):
+        pass
+
+    monkeypatch.setattr(read_retry.socket, "timeout", LegacySocketTimeout)
+    error = LegacySocketTimeout("hidden")
+    assert not isinstance(error, TimeoutError) and error.errno is None
+    if wrapped:
+        error = urllib.error.URLError(error)
+    assert read_retry.classify_exception(error) == ("transport-timeout", None, True)
+
+
 @pytest.mark.parametrize("error", [
     ssl.SSLCertVerificationError("hidden"),
     urllib.error.URLError(ssl.SSLCertVerificationError("hidden")),

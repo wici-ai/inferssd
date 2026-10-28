@@ -1,19 +1,22 @@
 """Protocol-only cancellation and refusal; no device or performance evidence."""
 
 import copy
+import io
+import json
 from pathlib import Path
 import signal
 import socket
 import sys
 import threading
 from types import SimpleNamespace
+import urllib.error
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci import impact, selected_controller, selection_dispatch, selection_lifetime
 from ci.contract import load, save
-from ci.private_controller import context
+from ci.private_controller import API, context
 from ci.stage_session import StageSession
 from ci.staged_benchmark import verify_stopped
 
@@ -27,13 +30,80 @@ class ParentAPI:
                         run_attempt=2, status="in_progress", conclusion=None)
         self.jobs = [dict(name="control", status="in_progress", conclusion=None)]
 
-    def call(self, path):
+    def call(self, path, *, deadline=None):
         if path == "actions/workflows/device-performance.yml":
             return dict(id=3, path=selection_lifetime.WORKFLOW, state="active")
         if path == "actions/runs/1":
             return self.run
         assert path == "actions/runs/1/attempts/2/jobs?per_page=100"
         return dict(total_count=len(self.jobs), jobs=self.jobs)
+
+
+@pytest.mark.parametrize("endpoint", ["workflow", "run", "jobs"])
+@pytest.mark.parametrize("revoked", [False, True])
+def test_parent_observation_recovers_one_full_socket_timeout(monkeypatch, endpoint, revoked):
+    from ci import private_controller
+
+    class LegacySocketTimeout(OSError):
+        pass
+
+    clock = SimpleNamespace(now=0.0, sleeps=[], calls=[])
+    monkeypatch.setattr(socket, "timeout", LegacySocketTimeout)
+    monkeypatch.setattr(selection_lifetime.time, "monotonic", lambda: clock.now)
+    def sleep(delay):
+        clock.sleeps.append(delay)
+        clock.now += delay
+    monkeypatch.setattr(private_controller.time, "sleep", sleep)
+    replies = ParentAPI()
+    failed = False
+    def urlopen(request, *, timeout):
+        nonlocal failed
+        path = request.full_url.split("/repos/example/controller/", 1)[1]
+        label = "workflow" if path.startswith("actions/workflows/") else "jobs" if "/jobs?" in path else "run"
+        clock.calls.append((label, timeout))
+        if label == endpoint and not failed:
+            failed = True
+            clock.now += timeout
+            raise urllib.error.URLError(LegacySocketTimeout("timed out"))
+        clock.now += 0.1
+        if revoked and failed:
+            raise urllib.error.HTTPError(request.full_url, 403, "refused", {}, io.BytesIO(b""))
+        return io.BytesIO(json.dumps(replies.call(path)).encode())
+    monkeypatch.setattr(private_controller.urllib.request, "urlopen", urlopen)
+    watch = selection_lifetime.ParentWatch(
+        API("example/controller", "synthetic", timeout=selection_lifetime.OBSERVATION_BUDGET_S),
+        "1-2", "a" * 40)
+    if revoked:
+        with pytest.raises(urllib.error.HTTPError) as error:
+            watch.check()
+        assert error.value.code == 403
+    else:
+        watch.check()
+        assert len(clock.calls) == 4
+    assert clock.sleeps == [.25] and 10 < clock.now < 30
+
+
+def test_parent_observation_spends_one_budget_across_endpoints(monkeypatch):
+    from ci import private_controller
+
+    clock = SimpleNamespace(now=0.0, timeouts=[])
+    monkeypatch.setattr(selection_lifetime.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(private_controller.time, "sleep", lambda delay: setattr(clock, "now", clock.now + delay))
+    replies = ParentAPI()
+    def urlopen(request, *, timeout):
+        path = request.full_url.split("/repos/example/controller/", 1)[1]
+        clock.timeouts.append(timeout)
+        if path.endswith("/jobs?per_page=100"):
+            clock.now += timeout
+            raise socket.timeout("timed out")
+        clock.now += 5
+        return io.BytesIO(json.dumps(replies.call(path)).encode())
+    monkeypatch.setattr(private_controller.urllib.request, "urlopen", urlopen)
+    with pytest.raises((TimeoutError, socket.timeout)):
+        selection_lifetime.active_parent(
+            API("example/controller", "synthetic", timeout=30), "1-2", "a" * 40)
+    assert clock.now == 30
+    assert clock.timeouts == [10, 10, 10, 9.75]
 
 
 @pytest.mark.parametrize("field,value", [("head_sha", "b" * 40), ("run_attempt", 3),
@@ -61,7 +131,7 @@ def test_parent_lost_or_cancelled_interrupts_borrowed_socket(lost):
     watch = selection_lifetime.ParentWatch(api, "1-2", "a" * 40, interval=.001)
     watch.attach(SimpleNamespace(abort=aborted.set))
     if lost:
-        api.call = lambda _: (_ for _ in ()).throw(OSError("parent unavailable"))
+        api.call = lambda _, **kwargs: (_ for _ in ()).throw(OSError("parent unavailable"))
     else:
         api.run["conclusion"] = "cancelled"
     # Exercise the exact monitor branch without launching a process or broker.

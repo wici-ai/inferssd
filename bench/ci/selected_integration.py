@@ -9,7 +9,7 @@ from ci.compare import comparable, compare_pair
 from ci.contract import digest, load, save
 from ci.private_controller import API, source_manifest
 from ci.isolated_device import manifest_read_path
-from ci.selection_lifetime import ParentWatch
+from ci.selection_lifetime import OBSERVATION_BUDGET_S, ParentWatch
 from ci.selected_receipt import receipt
 from ci import selected_preflight, model_admission
 from ci.selection_contract import protected_binding, runtime_requirements, execution_scope
@@ -63,7 +63,7 @@ def run(args):
                     or os.environ.get("GITHUB_SHA") != sha
                     or os.environ.get("GITHUB_WORKFLOW_REF") != repository + "/.github/workflows/integration-smoke.yml@refs/heads/main"):
                 raise ValueError("selected child must use the protected private main workflow")
-            watch = ParentWatch(API(repository, os.environ["GITHUB_TOKEN"], timeout=10), parent, sha)
+            watch = ParentWatch(API(repository, os.environ["GITHUB_TOKEN"], timeout=OBSERVATION_BUDGET_S), parent, sha)
             watch.start()
         session = StageSession(args.socket, args.job_id, controller_uid=os.getuid())
         if watch is not None:
