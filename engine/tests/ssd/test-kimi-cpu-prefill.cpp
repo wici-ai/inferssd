@@ -197,7 +197,7 @@ struct executor {
     }
     executor(fixture_inputs & inputs, fixture & f, int threads, int depth) : active(&f), sink(nullptr, kimi_cpu_sink_destroy),
             prefill(nullptr, kimi_cpu_prefill_destroy) {
-        test_resources::cpu_threads(threads - 1, 1);
+        test_resources::cpu_participants(threads - 1, 1);
         char error[512] = {};
         sink.reset(inputs.create(threads, depth, resolve, this, error, sizeof(error)));
         require(bool(sink), std::string("sink create: ") + error);
@@ -971,7 +971,7 @@ int main(int argc, char ** argv) {
         require(o.threads >= 2 && o.threads <= 128 && o.ring >= 1 && o.ring <= 32 &&
                 o.repeats >= 1 && o.repeats <= 1000 && o.warmup >= 0 && o.warmup <= 1000, "invalid thread/ring/repeat count");
         require(o.mode == "both" || o.mode == "grouped" || o.mode == "per-token", "invalid benchmark mode");
-        test_resources::cpu_threads(o.threads - 1, 1);
+        test_resources::cpu_participants(o.threads - 1, 1);
         test_resources::io_uring();
         if (cache_lifecycle || cache_retention || cache_prefill_read) { test_resources::finite_cgroup(); }
         if (cache_prefill_read) {

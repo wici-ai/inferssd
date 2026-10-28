@@ -275,7 +275,7 @@ static std::vector<float> reference(const fixture & f, int layer, const std::vec
 
 using sink_ptr = std::unique_ptr<kimi_cpu_sink, decltype(&kimi_cpu_sink_destroy)>;
 static sink_ptr make_sink(fixture_inputs & inputs, fixture & f, int threads, int depth) {
-    test_resources::cpu_threads(threads - 1, 1);
+    test_resources::cpu_participants(threads - 1, 1);
     char error[512] = {};
     auto * sink = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
     require(sink, std::string("create: ") + error);
@@ -874,7 +874,9 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
     require(!sched_getaffinity(0, sizeof(original_affinity), &original_affinity), "read fixture affinity");
     std::vector<int> allowed;
     for (int i = 0; i < CPU_SETSIZE; ++i) { if (CPU_ISSET(i, &original_affinity)) { allowed.push_back(i); } }
-    require(!schedules || int(allowed.size()) >= threads, "schedule fixture needs total_threads allowed CPUs");
+    // The schedule matrix pins every participant to its own CPU; fewer CPUs is a missing resource.
+    test_resources::need(!schedules || int(allowed.size()) >= threads,
+            "schedule fixture pins " + std::to_string(threads) + " participants but affinity has " + std::to_string(allowed.size()) + " CPUs");
     std::string weighted, cpus;
     for (int i = 0; i < threads - 1; ++i) {
         weighted += std::string(i ? "," : "") + (i < 4 ? "1" : "0.6");
@@ -3514,7 +3516,7 @@ int main(int argc, char ** argv) {
         require(options.repeats >= 1 && options.repeats <= 10000 && options.warmup >= 0 && options.warmup <= 10000, "invalid repeat/warmup count");
         if (!schedule_invalid_mode) {
             const int required = registered_lifecycle ? 4 : options.threads;
-            test_resources::cpu_threads(required - 1, 1);
+            test_resources::cpu_participants(required - 1, 1);
             test_resources::io_uring();
         }
         if (cache_mode || hitrate_mode || elastic_cache_mode || cache_load_mode || max_cache_mode ||

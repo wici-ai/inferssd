@@ -36,6 +36,14 @@ inline void cpu_threads(int compute, int io) {
             " CPUs; fixture needs compute=" + std::to_string(compute) + " IO=" + std::to_string(io));
 }
 
+// Unpinned fixtures (no cpu.compute_cpus/io_cpus): participants may share CPUs. Placement
+// changes timing only, never results, so a small machine still runs the correctness cases.
+inline void cpu_participants(int compute, int io) {
+    if (compute < 1 || io < 0 || compute > 255 || io > 255) {
+        throw std::runtime_error("invalid test compute/IO thread count");
+    }
+}
+
 inline void io_uring() {
     io_uring_params parameters = {};
     const int fd = int(syscall(__NR_io_uring_setup, 2, &parameters));
