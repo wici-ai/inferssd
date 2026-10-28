@@ -67,6 +67,15 @@ class Snapshot:
         }
 
 
+PLATFORMS = ("linux", "darwin", "windows")
+
+
+def applies(prop: Mapping[str, Any], platform: str) -> bool:
+    """A schema scope is "all" or the platform names joined by commas."""
+    scope = cast(str, prop["scope"])
+    return scope == "all" or platform in scope.split(",")
+
+
 def integer(literal: str, low: int, high: int) -> int:
     if re.fullmatch(r"[0-9]+", literal) is None or not low <= int(literal) <= high:
         raise ValueError(f"expected decimal integer in {low}..{high}")
@@ -156,7 +165,7 @@ def parse(
     source.encode("utf-8")
     if text is not None:
         text.encode("utf-8")
-    if platform not in ("linux", "darwin"):
+    if platform not in PLATFORMS:
         raise ValueError("unknown settings platform " + platform)
     properties: dict[str, Any] = schema()["properties"]
     values = {
@@ -169,7 +178,7 @@ def parse(
             prop = properties.get(key)
             if prop is None:
                 raise ValueError("unknown key")
-            if prop["scope"] not in ("all", platform):
+            if not applies(prop, platform):
                 raise ValueError("setting is only supported on " + prop["scope"])
             value = typed(prop, literal)
         except ValueError as error:
@@ -193,28 +202,31 @@ def parse(
             apply(key, literal, "file", f"{source}:{n}", receipt)
     for key, literal in overrides:
         apply(key, literal, "cli", "--ssd-" + key.replace(".", "-").replace("_", "-"), "")
-    if platform == "linux":
-        threads = cast(int, values["cpu.threads"].value)
-        cpus = cast(tuple[int, ...], values["cpu.compute_cpus"].value)
-        participants = cast(int, values["cpu.decode_participants"].value)
-        if threads < 2 or cpus and len(cpus) != threads - 1 or participants > threads - 1:
-            raise ValueError(
-                "CPU setting dependencies failed: "
-                + ", ".join(
-                    f"{k} ({values[k].location})"
-                    for k in ("cpu.threads", "cpu.compute_cpus", "cpu.decode_participants")
-                )
+    threads = cast(int, values["cpu.threads"].value)
+    cpus = cast(tuple[int, ...], values["cpu.compute_cpus"].value)
+    participants = cast(int, values["cpu.decode_participants"].value)
+    # The executor needs an I/O participant beside compute; the macOS M1 reader keeps one
+    # participant until macOS moves onto it. macOS cannot pin: there a CPU list only counts.
+    executor = platform in ("linux", "windows")
+    if executor and threads < 2 or cpus and len(cpus) != threads - 1 or participants > threads - 1:
+        raise ValueError(
+            "CPU setting dependencies failed: "
+            + ", ".join(
+                f"{k} ({values[k].location})"
+                for k in ("cpu.threads", "cpu.compute_cpus", "cpu.decode_participants")
             )
-        if (
-            cast(int, values["vram.margin_mib"].value)
-            < cast(int, values["vram.reserve_mib"].value) + 64
-        ):
-            raise ValueError(
-                "VRAM margin must exceed reserve by 64 MiB: "
-                + ", ".join(
-                    f"{k} ({values[k].location})" for k in ("vram.margin_mib", "vram.reserve_mib")
-                )
+        )
+    if (
+        platform == "linux"
+        and cast(int, values["vram.margin_mib"].value)
+        < cast(int, values["vram.reserve_mib"].value) + 64
+    ):
+        raise ValueError(
+            "VRAM margin must exceed reserve by 64 MiB: "
+            + ", ".join(
+                f"{k} ({values[k].location})" for k in ("vram.margin_mib", "vram.reserve_mib")
             )
+        )
     return Snapshot(tuple(values.values()), platform)
 
 
@@ -223,7 +235,7 @@ def render(snapshot: Snapshot) -> str:
     lines = ["inferssd-settings 1"]
     for item in snapshot.entries:
         prop = properties[item.key]
-        if prop["scope"] not in ("all", snapshot.platform):
+        if not applies(prop, snapshot.platform):
             continue
         literal = str(item.value)
         if prop["kind"] == "costs":

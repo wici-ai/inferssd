@@ -9,30 +9,47 @@ Python resource. There are no environment mirrors or legacy-name aliases.
 |---|---|---|---|---|
 | `expert.source` | paths / path | `[]` | plan | all |
 | `cpu.threads` | integer / participants | `2` | plan | all |
-| `cpu.compute_cpus` | cpus / CPU ID | `empty` | plan | linux |
-| `cpu.io_cpus` | cpus / CPU ID | `empty` | plan | linux |
+| `cpu.compute_cpus` | cpus / CPU ID | `empty` | plan | all |
+| `cpu.io_cpus` | cpus / CPU ID | `empty` | plan | all |
 | `cpu.decode_participants` | integer / compute participants | `0` | plan | linux |
-| `prefetch.depth` | integer / predicted experts | `2` | plan | linux |
-| `place.costs` | costs / named us and GB/s terms | `empty` | plan | linux |
+| `prefetch.depth` | integer / predicted experts | `2` | plan | all |
+| `place.costs` | costs / named us and GB/s terms | `empty` | plan | all |
 | `prefill.cpu_max_tokens` | integer / tokens | `4294967295` | plan | linux |
 | `vram.budget` | budget / bytes | `auto` | plan | linux |
 | `vram.max_slots` | integer / slots | `0` | plan | linux |
 | `vram.reserve_mib` | integer / MiB | `0` | launch | linux |
 | `vram.margin_mib` | integer / MiB | `64` | launch | linux |
-| `host.headroom_mib` | integer / MiB | `512` | plan | linux |
+| `host.headroom_mib` | integer / MiB | `512` | plan | all |
+| `host.budget_mib` | integer / MiB | `0` | plan | darwin, windows |
 | `host.expert_cache_mib` | integer / MiB | `4096` | plan | darwin |
 | `model.engram_prefetch` | integer / boolean | `0` | model | all |
 | `model.hc_fused` | integer / boolean | `1` | model | all |
 
 These are conservative parser defaults and retained policy priors, not claimed
 per-device performance optima. The framework must provide its measured CPU,
-cache and placement configuration. Linux requires at least two total CPU
-participants; one is the I/O participant. An explicit compute CPU list must
-contain `cpu.threads - 1` unique IDs in declared order. Zero decode participants
-leaves the measured/default policy; positive values cannot exceed compute
-participants. The VRAM margin is at least reserve plus 64 MiB. Non-applicable
-platform keys cannot be explicitly set. On macOS the interface supports static
-settings only; it does not include an online adaptive controller.
+cache and placement configuration. The platforms are `linux`, `darwin` and
+`windows`; a scope is `all` or the platforms it lists. Linux and Windows require
+at least two total CPU participants; one is the I/O participant. The current
+macOS expert reader keeps one participant. An explicit compute CPU list must
+contain `cpu.threads - 1` unique IDs in declared order on every platform; macOS
+cannot pin threads, so there the lists are validated and only their lengths are
+used. Zero decode participants leaves the measured/default policy; positive
+values cannot exceed compute participants. The VRAM margin is at least reserve
+plus 64 MiB. Non-applicable platform keys cannot be explicitly set. On macOS the
+interface supports static settings only; it does not include an online adaptive
+controller.
+
+The host memory ledger has two terms on every platform. The envelope is a finite
+limit on this process's memory less a 512 MiB reserve: on Linux the tightest
+cgroup v2 `memory.max`; on Windows a memory limit of the process's job, when the
+job sets one, against commit; and on macOS and Windows `host.budget_mib` against
+the process's own memory (Windows PrivateUsage, macOS phys_footprint). With
+`host.budget_mib = 0` and no job limit, the envelope is fixed at startup as the
+process's use plus the memory then available, so its room starts at the
+available memory less the reserve. The system term is the memory available now
+less the floor: Linux MemAvailable, Windows the smaller of available physical
+memory and available commit, macOS free, file-backed and purgeable pages. The
+RAM expert cache admits only under a readable envelope.
 
 ## File and CLI contract
 

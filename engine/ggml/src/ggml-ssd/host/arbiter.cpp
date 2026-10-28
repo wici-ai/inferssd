@@ -8,23 +8,13 @@
 #include <stdexcept>
 #include <utility>
 
-#if !defined(_WIN32)
-#include "ledger.h"
+// One arbiter on every OS; only the budget sources differ.
+#if defined(__linux__)
+#include "ledger.h" // cgroup v2 and /proc
+namespace ssd { namespace host { using host_ledger = ::kimi_host_ledger; } }
 #else
-// No Linux budget provider on Windows. Preserve ownership ABI but refuse
-// admission without any readable resource term.
-struct kimi_host_ledger {
-    ssd::host::process_arbiter::reader read;
-    bool unified = false, reclaimable_file = false;
-    uint64_t reserve = 0, margin = 0, explicit_reserve = 0, prefill_pages = 0;
-    uint64_t file_reserve = 0, refaults = 0, file_updates = 0, page_size = 4096;
-    std::string cgroup;
-    bool get(const std::string & p, std::string & text) const { return read && read(p, text); }
-    uint64_t floor() const { return margin; }
-    ssd::host::room measure(uint64_t, bool) const { return {}; }
-    bool memory_available_at_full_boost(uint64_t &, uint64_t &) const { return false; }
-    bool update_file_reserve() { return false; }
-};
+#include "ledger-native.h" // job objects or host.budget_mib, and the OS memory status
+namespace ssd { namespace host { using host_ledger = native_ledger; } }
 #endif
 
 namespace ssd { namespace host {
@@ -42,7 +32,7 @@ template<class T, class F> result<T> guarded(F && call) noexcept {
 bool same_config(const client_config & a, const client_config & b) noexcept {
     return a.unified == b.unified && a.reserve_bytes == b.reserve_bytes &&
         a.margin_bytes == b.margin_bytes && a.explicit_reserve_bytes == b.explicit_reserve_bytes &&
-        a.reclaimable_file == b.reclaimable_file;
+        a.reclaimable_file == b.reclaimable_file && a.budget_bytes == b.budget_bytes;
 }
 }
 namespace detail {
@@ -68,7 +58,7 @@ uint64_t room::surplus() const noexcept {
 struct process_arbiter::impl {
     std::mutex mutex;
     std::condition_variable changed;
-    kimi_host_ledger budget;
+    host_ledger budget;
     uint64_t next_client = 1, next_ticket = 1, pending = 0, margin_updates = 0;
     bool domain_set = false, domain_unified = false, domain_reclaimable = true;
     std::map<uint64_t, std::shared_ptr<detail::client_state>> clients;
@@ -80,12 +70,12 @@ struct process_arbiter::impl {
     std::map<uint64_t, pending_ticket> tickets;
 
     explicit impl(reader injected) {
-        budget.read = std::move(injected);
         budget.reserve = budget.margin = 512ull << 20;
-#if !defined(_WIN32)
+#if defined(__linux__)
+        // The Linux ledger reads /proc and cgroup v2 files, through the injected reader in tests.
+        budget.read = std::move(injected);
         const long page = sysconf(_SC_PAGESIZE);
         budget.page_size = page > 0 ? uint64_t(page) : 4096;
-#endif
         std::string groups;
         if (budget.get("/proc/self/cgroup", groups)) {
             for (size_t at = 0; at < groups.size();) {
@@ -96,6 +86,9 @@ struct process_arbiter::impl {
                 at = end + 1;
             }
         }
+#else
+        (void) injected; // the native ledger asks the OS, not files
+#endif
     }
     static const char * invalid(const detail::client_state & state, bool configured = true) noexcept {
         if (state.closing || state.closed) { return "host context is closing"; }
@@ -133,7 +126,7 @@ struct process_arbiter::impl {
         return total;
     }
     void refresh_config() noexcept {
-        uint64_t reserve = 512ull << 20, margin = reserve, explicit_reserve = 0;
+        uint64_t reserve = 512ull << 20, margin = reserve, explicit_reserve = 0, envelope = 0;
         bool unified = domain_unified, reclaimable = domain_reclaimable;
         for (const auto & pair : clients) {
             if (!pair.second->configured) { continue; }
@@ -142,10 +135,17 @@ struct process_arbiter::impl {
             reserve = std::max(reserve, config.reserve_bytes);
             margin = std::max(margin, config.margin_bytes);
             explicit_reserve = std::max(explicit_reserve, config.unified ? config.explicit_reserve_bytes : 0);
+            // The tightest explicit envelope binds every client of the process.
+            if (config.budget_bytes) { envelope = envelope ? std::min(envelope, config.budget_bytes) : config.budget_bytes; }
         }
         budget.unified = unified; budget.reclaimable_file = reclaimable;
         budget.reserve = reserve; budget.margin = std::max(budget.margin, std::max(margin, reserve));
         budget.explicit_reserve = explicit_reserve;
+#if defined(__linux__)
+        (void) envelope; // the cgroup's memory.max is the Linux envelope
+#else
+        budget.budget = envelope;
+#endif
     }
     room measure(uint64_t extra, bool full_boost, uint64_t excluding = 0) const {
         // Copies share only the cached descriptor reader. Projection never

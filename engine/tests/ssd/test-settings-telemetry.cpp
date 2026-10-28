@@ -47,7 +47,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
     using namespace ssd::settings;
-    assert(registry().size() == 16);
+    assert(registry().size() == 17);
     assert(parse("inferssd-settings 1\nmodel.engram_prefetch=1\nmodel.hc_fused=0\n", "model.ssd"));
     assert(!parse("inferssd-settings 1\nmodel.hc_fused=2\n", "model-invalid.ssd"));
     auto base = parse("", "");
@@ -93,6 +93,27 @@ int main(int argc, char ** argv) {
     assert(!parse("inferssd-settings 2\n", "version.ssd"));
     assert(parse("inferssd-settings 1\nhost.expert_cache_mib=12288\ncpu.threads=8\n", "mac.ssd", {}, "darwin"));
     assert(!parse("inferssd-settings 1\nvram.budget=auto\n", "mac.ssd", {}, "darwin"));
+    // The executor's keys apply on every platform; the CUDA and Linux prefill keys stay Linux-only.
+    assert(parse("inferssd-settings 1\ncpu.threads=4\ncpu.compute_cpus=0-2\ncpu.io_cpus=3\nprefetch.depth=4\n"
+                 "place.costs=cpu_fixed_us=204\nhost.headroom_mib=1024\nhost.budget_mib=8192\n"
+                 "model.hc_fused=0\n", "win.ssd", {}, "windows"));
+    assert(parse("inferssd-settings 1\ncpu.threads=4\ncpu.compute_cpus=0-2\nhost.budget_mib=8192\n", "mac.ssd", {}, "darwin"));
+    assert(parse("inferssd-settings 1\ncpu.threads=1\n", "mac.ssd", {}, "darwin"));
+    for (const std::string bad : { "cpu.threads = 1", "cpu.compute_cpus = 0-1", "vram.budget = auto",
+                                   "cpu.decode_participants = 1", "prefill.cpu_max_tokens = 1",
+                                   "host.expert_cache_mib = 1" }) {
+        const auto rejected = parse("inferssd-settings 1\n" + bad + "\n", "win.ssd", {}, "windows");
+        assert(!rejected && rejected.error.find("win.ssd:2") != std::string::npos);
+    }
+    assert(!parse("inferssd-settings 1\ncpu.compute_cpus=0-1\n", "mac.ssd", {}, "darwin"));
+    assert(!parse("inferssd-settings 1\nhost.budget_mib=1\n", "linux.ssd"));
+    assert(!parse("", "", {}, "freebsd"));
+    {
+        const auto scopes = ssd::json::parse(schema_json().value).value.object.at("properties").object;
+        assert(scopes.at("host.budget_mib").object.at("scope").text == "darwin,windows");
+        assert(scopes.at("cpu.compute_cpus").object.at("scope").text == "all");
+        assert(scopes.at("vram.budget").object.at("scope").text == "linux");
+    }
     assert(reject_retired_environment({ "TASKRC", "TASKDATA", "INFERSSD_DEBUG" }));
     assert(!reject_retired_environment({ "TASK123_PROBE" }));
     assert(!reject_retired_environment({ "GGML_KIMI_CPU_SINK" }));

@@ -12,6 +12,7 @@
 #include <set>
 #include <sstream>
 #include <type_traits>
+#include <utility>
 
 namespace ssd {
 namespace settings {
@@ -274,29 +275,58 @@ result<void> read_settings_file(const std::string & text, const std::string & so
     return {};
 }
 
-result<void> validate_dependencies(const snapshot & out, const std::string & platform) {
+// The settings platforms with their scope bits, in schema order.
+constexpr std::pair<uint32_t, const char *> platform_names[] = { { scope_linux, "linux" },
+                                                                 { scope_darwin, "darwin" },
+                                                                 { scope_windows, "windows" } };
+
+// The scope bit of a settings platform; 0 when unknown.
+uint32_t platform_bit(const std::string & platform) {
+    for (const auto & item : platform_names) {
+        if (platform == item.second) {
+            return item.first;
+        }
+    }
+    return 0;
+}
+
+// "all", or the platform names joined by commas: the schema's and the errors' spelling of a scope.
+std::string scope_name(uint32_t scope) {
+    if (scope == scope_all) {
+        return "all";
+    }
+    std::string out;
+    for (const auto & item : platform_names) {
+        if (scope & item.first) {
+            out += (out.empty() ? "" : ",") + std::string(item.second);
+        }
+    }
+    return out;
+}
+
+result<void> validate_dependencies(const snapshot & out, uint32_t platform) {
     auto dependency = [&](const std::string & key, const std::string & message) {
         const auto * v = out.find(key);
         return failure<void>(status::invalid, key + " (" + v->location + "): " + message);
     };
-    if (platform == "linux") {
-        const uint64_t threads = *out.integer("cpu.threads"), participants = *out.integer("cpu.decode_participants");
-        if (threads < 2) {
-            return dependency("cpu.threads", "Linux executor requires at least compute and I/O participants");
-        }
-        const auto &      cpus          = *out.cpus("cpu.compute_cpus");
-        const std::string thread_source = "cpu.threads (" + out.find("cpu.threads")->location + ")";
-        if (!cpus.empty() && cpus.size() != threads - 1) {
-            return dependency("cpu.compute_cpus",
-                              "list length must equal " + thread_source + " minus the I/O participant");
-        }
-        if (participants > threads - 1) {
-            return dependency("cpu.decode_participants", "exceeds " + thread_source + " minus I/O participant");
-        }
-        if (*out.integer("vram.margin_mib") < *out.integer("vram.reserve_mib") + 64) {
-            return dependency("vram.margin_mib", "must be at least vram.reserve_mib (" +
-                                                     out.find("vram.reserve_mib")->location + ") plus 64");
-        }
+    const uint64_t threads = *out.integer("cpu.threads"), participants = *out.integer("cpu.decode_participants");
+    // The executor runs its compute participants beside one I/O participant; the macOS M1 reader, which has
+    // none, keeps one participant until macOS moves onto the executor.
+    if ((platform & (scope_linux | scope_windows)) && threads < 2) {
+        return dependency("cpu.threads", "the executor requires at least compute and I/O participants");
+    }
+    // The same rule on every platform; macOS cannot pin, so there only the list's length is used.
+    const auto &      cpus          = *out.cpus("cpu.compute_cpus");
+    const std::string thread_source = "cpu.threads (" + out.find("cpu.threads")->location + ")";
+    if (!cpus.empty() && cpus.size() != threads - 1) {
+        return dependency("cpu.compute_cpus", "list length must equal " + thread_source + " minus the I/O participant");
+    }
+    if (participants > threads - 1) {
+        return dependency("cpu.decode_participants", "exceeds " + thread_source + " minus I/O participant");
+    }
+    if ((platform & scope_linux) && *out.integer("vram.margin_mib") < *out.integer("vram.reserve_mib") + 64) {
+        return dependency("vram.margin_mib",
+                          "must be at least vram.reserve_mib (" + out.find("vram.reserve_mib")->location + ") plus 64");
     }
     return {};
 }
@@ -353,7 +383,8 @@ result<snapshot> parse(const std::string &                 text,
         if (!json::valid_utf8(text) || !json::valid_utf8(source)) {
             return failure<snapshot>(status::invalid, "settings source/text must be UTF-8");
         }
-        if (platform != "linux" && platform != "darwin") {
+        const uint32_t target = platform_bit(platform);
+        if (!target) {
             return failure<snapshot>(status::invalid, "unknown settings platform " + platform);
         }
         snapshot out;
@@ -371,8 +402,8 @@ result<snapshot> parse(const std::string &                 text,
             if (!d) {
                 return { status::invalid, where + ": unknown key" };
             }
-            if (std::string(d->scope) != "all" && d->scope != platform) {
-                return { status::invalid, where + ": setting is only supported on " + d->scope };
+            if (!(d->scope & target)) {
+                return { status::invalid, where + ": setting is only supported on " + scope_name(d->scope) };
             }
             const auto v = typed(*d, literal);
             if (!v) {
@@ -391,7 +422,7 @@ result<snapshot> parse(const std::string &                 text,
                 return failure<snapshot>(done.code, done.error);
             }
         }
-        const auto checked = validate_dependencies(out, platform);
+        const auto checked = validate_dependencies(out, target);
         if (!checked) {
             return failure<snapshot>(checked.code, checked.error);
         }
@@ -497,7 +528,7 @@ result<std::string> schema_json() noexcept {
 
             out += json::quote(d.key) + ":{\"description\":" + json::quote(d.description) +
                    ",\"kind\":" + json::quote(type) + ",\"unit\":" + json::quote(d.unit) +
-                   ",\"producer\":" + json::quote(d.producer) + ",\"scope\":" + json::quote(d.scope) +
+                   ",\"producer\":" + json::quote(d.producer) + ",\"scope\":" + json::quote(scope_name(d.scope)) +
                    ",\"cli\":" + json::quote(cli_option(d.key)) +
                    ",\"default_literal\":" + json::quote(d.default_literal);
             if (d.type == kind::integer) {

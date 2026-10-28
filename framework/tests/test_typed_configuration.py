@@ -64,6 +64,16 @@ def test_registry_generated_schema_exact(native_contract):
             "place.costs=cpu_fixed_us=204,link_gbps=12.3\n",
         ),
         ("darwin", "inferssd-settings 1\nhost.expert_cache_mib=12288\ncpu.threads=8\n"),
+        (
+            "darwin",
+            "inferssd-settings 1\ncpu.threads=4\ncpu.compute_cpus=0-2\nhost.budget_mib=8192\n"
+            "prefetch.depth=4\nhost.headroom_mib=1024\n",
+        ),
+        (
+            "windows",
+            "inferssd-settings 1\ncpu.threads=4\ncpu.compute_cpus=0-2\ncpu.io_cpus=3\n"
+            "place.costs=cpu_fixed_us=204\nhost.budget_mib=8192\nmodel.hc_fused=0\n",
+        ),
         ("linux", 'inferssd-settings 1\nexpert.source=["/path-\u2028-file"]\n'),
     ],
 )
@@ -103,6 +113,7 @@ def test_cpp_python_snapshot_exact(native_contract, tmp_path, platform, text):
         'vram.budget="123"',
         "expert.source=[1]",
         "host.expert_cache_mib=0",
+        "host.budget_mib=1",
         "prefetch.depth=65",
     ],
 )
@@ -114,6 +125,30 @@ def test_invalid_contract_refused_by_both(native_contract, tmp_path, body):
         parse(text, str(source))
     result = subprocess.run(
         [str(native_contract), "--parse", str(source), "linux"], capture_output=True, text=True
+    )
+    assert result.returncode == 1 and str(source) in result.stderr
+
+
+@pytest.mark.parametrize(
+    "platform,body",
+    [
+        ("windows", "cpu.threads=1"),
+        ("windows", "cpu.compute_cpus=0-1"),
+        ("windows", "cpu.decode_participants=1"),
+        ("windows", "vram.budget=auto"),
+        ("windows", "host.expert_cache_mib=1"),
+        ("darwin", "cpu.compute_cpus=0-1"),
+        ("darwin", "vram.reserve_mib=64"),
+    ],
+)
+def test_platform_scope_refused_by_both(native_contract, tmp_path, platform, body):
+    text = "inferssd-settings 1\n" + body + "\n"
+    source = tmp_path / "platform.ssd"
+    source.write_text(text)
+    with pytest.raises(ValueError):
+        parse(text, str(source), platform=platform)
+    result = subprocess.run(
+        [str(native_contract), "--parse", str(source), platform], capture_output=True, text=True
     )
     assert result.returncode == 1 and str(source) in result.stderr
 

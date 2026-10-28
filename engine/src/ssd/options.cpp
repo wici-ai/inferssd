@@ -82,6 +82,8 @@ llama_ssd_options * llama_ssd_options_create(const char * file,
         }
 #if defined(__APPLE__)
         const char * platform = "darwin";
+#elif defined(_WIN32)
+        const char * platform = "windows";
 #else
         const char * platform = "linux";
 #endif

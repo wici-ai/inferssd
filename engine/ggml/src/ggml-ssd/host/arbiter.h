@@ -30,6 +30,9 @@ struct client_config {
     uint64_t margin_bytes = 512ull << 20;
     uint64_t explicit_reserve_bytes = 0;
     bool reclaimable_file = true;
+    // host.budget_mib in bytes: the macOS/Windows envelope against process memory; 0 derives it at startup.
+    // Linux ignores it: its envelope is the cgroup's memory.max.
+    uint64_t budget_bytes = 0;
 };
 
 // Only the requesting context's reclaimers run, synchronously and without the

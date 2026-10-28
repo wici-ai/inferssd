@@ -2373,7 +2373,7 @@ struct kimi_cpu_sink {
             }
         }
         if (ring.read_fixed() && has_ring_reads && !ring.buffers_registered()) {
-            std::vector<iovec> buffers;
+            std::vector<ssd::io::buffer_span> buffers;
             buffers.reserve(3 * slots.size());
             for (const auto & slot : slots) {
                 for (const auto & buffer : slot.role) { buffers.push_back({ buffer.data, buffer.size }); }
