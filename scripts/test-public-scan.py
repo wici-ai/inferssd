@@ -86,7 +86,7 @@ class CompanyNameTests(unittest.TestCase):
 
     def test_company_domain_and_names_are_allowed(self):
         for text in ("https://wici.ai", '<a href="https://wici.ai/">', "(https://wici.ai).",
-                     "contact@wici.ai", "WiCi AI", "wici-ai/inferssd"):
+                     "WiCi AI", "wici-ai/inferssd"):
             for strict in (False, True):
                 with self.subTest(text=text, strict=strict):
                     self.assertEqual(self.findings(text, strict), (0, ""))

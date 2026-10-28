@@ -10,7 +10,6 @@ trusted sources.
 
 Report vulnerabilities privately through
 [GitHub private vulnerability reporting](https://github.com/wici-ai/inferssd/security/advisories/new).
-If you cannot use GitHub, email contact@wici.ai with "InferSSD security" in the subject.
 
 Do not open a public issue for a security problem, and do not post credentials, model data, deployment
 addresses or exploit details publicly.
