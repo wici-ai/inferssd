@@ -936,7 +936,7 @@ def test_real_canonical_get_retry_keeps_child_identity_and_every_successful_snap
         calls.append(timeout)
         value = replies.pop(0)
         if value == 500:
-            raise urllib.error.HTTPError(request.full_url, 500, "never-log", {}, None)
+            raise urllib.error.HTTPError(request.full_url, 500, "never-log", {}, io.BytesIO(b""))
         return io.BytesIO(json.dumps(value).encode())
 
     monkeypatch.setattr(canonical.urllib.request, "urlopen", open_request)

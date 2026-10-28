@@ -50,14 +50,20 @@ jobs:
 
   python:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          # The recorded transcripts are bound to these two versions; 3.12 is the default.
+          python-version: |
+            3.9
+            3.12
       - name: Install test dependencies
         run: |
-          python3 -m venv .venv
+          python3.12 -m venv .venv
           .venv/bin/python -m pip install pytest==9.1.1 ruff==0.17.1 mypy==1.18.2
           .venv/bin/python -m pip install ./framework
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
@@ -70,6 +76,11 @@ jobs:
           mypy --config-file framework/pyproject.toml framework/src
       - name: Framework tests
         run: python3 -m pytest -q bench/tests framework/tests
+      - name: Framework tests on Python 3.9
+        run: |
+          python3.9 -m venv .venv39
+          .venv39/bin/python -m pip install pytest==8.4.2 ./framework
+          .venv39/bin/python -m pytest -q bench/tests framework/tests tests/integration/test-macos-launcher.py tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
       - name: Mac launcher and alias-index checks
         run: |
           ruff check --isolated --select F framework/tests/fixtures/macos/run-macos-ssd.py framework/tests/fixtures/macos/kimi-build-gguf-expert-alias-tsv.py tests/integration/test-macos-launcher.py bench/macos/measure.py bench/macos/measurement_images.py tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
@@ -92,19 +103,19 @@ jobs:
         with:
           persist-credentials: false
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_WEBUI=OFF
+        run: cmake --preset linux-cpu -DGGML_NATIVE=OFF
       - name: Build
-        run: cmake --build build --parallel 2 --target llama-server test-ssd-model-adapter test-ssd-runtime-policy test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan test-reasoning-budget test-ssd-prepared-graph test-ssd-precompute-memory test-ssd-cuda-reserve test-ssd-context-telemetry test-graph-overhead test-linux-test-resources test-mac-expert-pack-cache test-mac-expert-source test-c0-store test-c0-config test-c0-parser-failures test-ssd-settings-telemetry test-ssd-runtime-options test-ssd-cpu-api test-ssd-source-index test-ssd-host-arbiter test-ssd-host-prefault
+        run: cmake --build build-linux-cpu --parallel 4 --target llama-server test-ssd-model-adapter test-ssd-runtime-policy test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan test-reasoning-budget test-ssd-prepared-graph test-ssd-precompute-memory test-ssd-cuda-reserve test-ssd-context-telemetry test-graph-overhead test-linux-test-resources test-mac-expert-pack-cache test-mac-expert-source test-c0-store test-c0-config test-c0-parser-failures test-ssd-settings-telemetry test-ssd-runtime-options test-ssd-cpu-api test-ssd-source-index test-ssd-host-arbiter test-ssd-host-prefault
       - name: Synthetic tests
         shell: bash
         run: |
           set -o pipefail
-          ctest --test-dir build --output-on-failure --no-tests=error -R '^(ssd_model_adapter|ssd_runtime_policy|test-dsv41-engram|kimi_prefill_cost|moe_pack_copy_plan|test-reasoning-budget|ssd_prepared_graph|ssd_precompute_memory|ssd_cuda_reserve|ssd_context_telemetry|test-graph-overhead|linux_test_resources|mac_expert_pack_cache|c0-store|c0-config|c0-parser-failures|ssd_settings_telemetry|ssd_runtime_options|ssd_cpu_api|ssd_source_index|ssd_host_arbiter|ssd_host_prefault)$' | tee cpu-tests.log
+          ctest --test-dir build-linux-cpu --output-on-failure --no-tests=error -R '^(ssd_model_adapter|ssd_runtime_policy|test-dsv41-engram|kimi_prefill_cost|moe_pack_copy_plan|test-reasoning-budget|ssd_prepared_graph|ssd_precompute_memory|ssd_cuda_reserve|ssd_context_telemetry|test-graph-overhead|linux_test_resources|mac_expert_pack_cache|c0-store|c0-config|c0-parser-failures|ssd_settings_telemetry|ssd_runtime_options|ssd_cpu_api|ssd_source_index|ssd_host_arbiter|ssd_host_prefault)$' | tee cpu-tests.log
           if grep -E '\bSKIP\b|\*\*\*Not Run|\*\*\*Skipped' cpu-tests.log; then exit 1; fi
-          python3 engine/tests/ssd/test-mac-expert-source.py build/bin/test-mac-expert-source
+          python3 engine/tests/ssd/test-mac-expert-source.py build-linux-cpu/bin/test-mac-expert-source
 
   macos:
-    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
+    if: github.event_name == 'workflow_dispatch' || (!github.event.repository.private && (github.event_name != 'pull_request' || !github.event.pull_request.draft))
     runs-on: macos-15
     timeout-minutes: 25
     steps:
@@ -116,45 +127,18 @@ jobs:
           uname -m
           sysctl hw.logicalcpu hw.physicalcpu hw.memsize
       - name: Build Metal and portable cache tests
-        run: SSD_LLAMA_BUILD_JOBS=3 bash scripts/build-macos-metal.sh
+        run: |
+          cmake --preset macos-metal
+          cmake --build build-macos-metal --parallel 3 --target llama-cli llama-server test-chat test-backend-ops test-mac-expert-pack-cache test-mac-expert-source test-mac-expert-operator test-llama-mmap-dontneed
       - name: Cache and Muse rendering tests
         run: |
-          ctest --test-dir build-mac --output-on-failure --no-tests=error -R '^(mac_expert_pack_cache|mac_expert_operator_.*|test-llama-mmap-dontneed)$'
-          python3 engine/tests/ssd/test-mac-expert-source.py build-mac/bin/test-mac-expert-source
-          (cd engine && ../build-mac/bin/test-chat --template muse-spark)
+          ctest --test-dir build-macos-metal --output-on-failure --no-tests=error -R '^(mac_expert_pack_cache|mac_expert_operator_.*|test-llama-mmap-dontneed)$'
+          python3 engine/tests/ssd/test-mac-expert-source.py build-macos-metal/bin/test-mac-expert-source
+          (cd engine && ../build-macos-metal/bin/test-chat --template muse-spark)
       - name: Quantized CPU operator checks on Apple Silicon
         shell: bash
         run: |
           set -o pipefail
-          build-mac/bin/test-backend-ops test -b CPU -o MUL_MAT_ID -p 'type_a=(q4_K|q5_K|q8_0)' | tee mac-operators.log
+          build-macos-metal/bin/test-backend-ops test -b CPU -o MUL_MAT_ID -p 'type_a=(q4_K|q5_K|q8_0)' | tee mac-operators.log
           grep -q '148/148 tests passed' mac-operators.log
 
-  cuda-compile:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    container: nvidia/cuda:13.0.2-devel-ubuntu24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [120a, 121a]
-    steps:
-      - run: apt-get update && apt-get install -y cmake ninja-build git liburing-dev libssl-dev
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-      - name: Prepare the driver stub for link-only validation
-        shell: bash
-        run: |
-          set -eu
-          stub=/usr/local/cuda/lib64/stubs/libcuda.so
-          test -f "$stub"
-          link_dir="$RUNNER_TEMP/cuda-driver-link"
-          mkdir -p "$link_dir"
-          # The toolkit stub has SONAME libcuda.so.1 but ships as libcuda.so.
-          # Resolve that transitive dependency without a GPU driver or runtime RPATH.
-          ln -s "$stub" "$link_dir/libcuda.so.1"
-          printf 'CUDA_DRIVER_LINK_DIR=%s\n' "$link_dir" >> "$GITHUB_ENV"
-      - name: Configure CUDA
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }} -DGGML_CUDA_MOE_STREAM_BATCH=ON -DGGML_CUDA_KIMI_VRAM_TIER=ON -DCMAKE_CXX_FLAGS=-ffp-contract=off "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath-link,$CUDA_DRIVER_LINK_DIR" -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_WEBUI=OFF
-      - run: cmake --build build --parallel 2 --target llama-server kimi-vram-tier kimi-mxfp4-parity

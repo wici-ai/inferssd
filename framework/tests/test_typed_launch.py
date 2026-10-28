@@ -106,6 +106,39 @@ def test_settings_file_and_cli_provenance_reach_native_argv(tmp_path, platform):
         resolve(inputs, spec, adapter, out, platform)
 
 
+@pytest.mark.parametrize(
+    "platform,present,chosen",
+    [
+        ("linux", ["build", "build-linux-cpu", "build-linux-cuda"], "build-linux-cuda"),
+        ("linux", ["build", "build-linux-cpu"], "build-linux-cpu"),
+        ("linux", ["build", "build-mac"], "build"),
+        ("darwin", ["build", "build-mac", "build-macos-metal"], "build-macos-metal"),
+        ("darwin", ["build", "build-mac"], "build-mac"),
+        ("darwin", ["build", "build-linux-cpu"], "build"),
+    ],
+)
+def test_repo_adapter_prefers_preset_build_directories(tmp_path, platform, present, chosen):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
+    for name in present:
+        binary = Path(inputs.repo) / name / "bin/llama-server"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("must never execute")
+        binary.chmod(0o755)
+    result = resolve(inputs, replace(spec, binary=None), adapter, out, platform)
+    assert result.code == 0
+    assert str((Path(inputs.repo) / chosen / "bin/llama-server").resolve()) in result.argv
+
+
+@pytest.mark.parametrize(
+    "platform,first", [("linux", "build-linux-cuda"), ("darwin", "build-macos-metal")]
+)
+def test_repo_adapter_reports_the_preset_build_when_none_exists(tmp_path, platform, first):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
+    missing = "missing server executable: .*/" + first + "/bin/llama-server"
+    with pytest.raises(ValueError, match=missing):
+        resolve(inputs, replace(spec, binary=None), adapter, out, platform)
+
+
 def test_auto_alias_uses_real_strict_header_indexer(tmp_path):
     inputs, spec, _, adapter, out, calls = setup(tmp_path, automatic=True)
     result = resolve(inputs, spec, adapter, out)

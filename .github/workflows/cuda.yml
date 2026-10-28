@@ -1,0 +1,59 @@
+name: CUDA
+
+# Compile-only validation without a GPU. It runs whenever the engine or the
+# build configuration changes and does not establish GPU runtime correctness.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "engine/**"
+      - CMakeLists.txt
+      - CMakePresets.json
+      - .github/workflows/cuda.yml
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "engine/**"
+      - CMakeLists.txt
+      - CMakePresets.json
+      - .github/workflows/cuda.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cuda-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cuda-compile:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    container: nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [120a, 121a]
+    steps:
+      - run: apt-get update && apt-get install -y cmake ninja-build git liburing-dev libssl-dev
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Prepare the driver stub for link-only validation
+        shell: bash
+        run: |
+          set -eu
+          stub=/usr/local/cuda/lib64/stubs/libcuda.so
+          test -f "$stub"
+          link_dir="$RUNNER_TEMP/cuda-driver-link"
+          mkdir -p "$link_dir"
+          # The toolkit stub has SONAME libcuda.so.1 but ships as libcuda.so.
+          # Resolve that transitive dependency without a GPU driver or runtime RPATH.
+          ln -s "$stub" "$link_dir/libcuda.so.1"
+          printf 'CUDA_DRIVER_LINK_DIR=%s\n' "$link_dir" >> "$GITHUB_ENV"
+      - name: Configure
+        run: cmake --preset linux-cuda -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }} "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath-link,$CUDA_DRIVER_LINK_DIR"
+      - name: Build
+        run: cmake --build build-linux-cuda --parallel 4 --target llama-server kimi-vram-tier kimi-mxfp4-parity

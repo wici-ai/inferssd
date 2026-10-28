@@ -19,7 +19,12 @@ templates = {
 }
 # Only inspect the schema; never start inference or probe a device.
 subprocess.run([str(binary), "--ssd-schema"], check=True, stdout=subprocess.DEVNULL)
-revision = subprocess.check_output(["git", "-C", str(engine), "rev-parse", "HEAD"], text=True).strip()
+# A source archive has no Git metadata to name the revision.
+try:
+    revision = subprocess.run(["git", "-C", str(engine), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip() or "unknown"
+except (OSError, subprocess.CalledProcessError):
+    revision = "unknown"
 value = {
     "schema": "inferssd-engine 1", "binary": str(binary), "revision": revision,
     "capabilities": {"settings": "inferssd-settings 1", "telemetry": 1,

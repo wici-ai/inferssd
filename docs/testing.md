@@ -3,9 +3,10 @@
 The `unit` CTest label contains only model-free tests that require neither a GPU
 nor cgroup setup. Build the targets before running `ctest -L unit`; a missing
 executable, skipped test or zero selected tests is not a passing gate. CI uses an
-explicit subset to keep the default check small. GPU compilation is a separate,
-manual check; it does not establish GPU runtime correctness. Device runs must
-record both the selected and actually executed tests.
+explicit subset to keep the default check small. The CUDA workflow compiles the
+server for `sm_120a` and `sm_121a` on `main` and on pull requests that change the
+engine or build configuration; it does not establish GPU runtime correctness.
+Device runs must record both the selected and actually executed tests.
 
 The Linux CPU sink suite also exercises io_uring, O_DIRECT, affinity, cgroup memory
 limits and experimental scheduling paths. It is not interchangeable with the
@@ -17,12 +18,13 @@ and explicit resource prerequisites before they can become automated gates.
 
 Linux enables `LLAMA_SSD_STORE` by default. The supported configuration uses
 bundled ggml, shared libraries, the CPU backend, and linked backends
-(`GGML_BACKEND_DL=OFF`, `GGML_CPU_ALL_VARIANTS=OFF`). CUDA additionally requires
-`GGML_CUDA_MOE_STREAM=ON` and `GGML_CUDA_MOE_STREAM_BATCH=ON`; a missing provider
-fails configuration. Static, system-ggml and runtime backend-plugin variants
-remain outside this store's supported build boundary. Mac's reader path is
-unchanged. The OFF configuration is retained for explicit legacy comparison,
-not as a runtime fallback.
+(`GGML_BACKEND_DL=OFF`, `GGML_CPU_ALL_VARIANTS=OFF`). The CUDA SSD transport
+(`GGML_CUDA_KIMI_VRAM_TIER=ON`, set by the `linux-cuda` preset) additionally
+requires liburing; configuration fails without it. CPU-only builds do not need
+liburing: the CPU sink submits io_uring requests through system calls. Static,
+system-ggml and runtime backend-plugin variants remain outside this store's
+supported build boundary. Mac's reader path is unchanged. The OFF configuration
+is retained for explicit legacy comparison, not as a runtime fallback.
 
 `test-c0-store` and `test-c0-config` link the actual production store target and
 compare it with a fixed test reference. `test-c0-parser-failures` injects
@@ -92,7 +94,7 @@ Four concurrent callers also exercise two decode and two prefill batches with a
 GGUF alias sources, unaligned and exact-EOF slices, synchronous and asynchronous
 short reads, pinned entries, prefill cache isolation and staging backpressure.
 The large-budget fixture sets a 24 GiB limit but allocates only small selected
-slices. Run it with `python3 engine/tests/ssd/test-mac-expert-source.py build-mac/bin/test-mac-expert-source`.
+slices. Run it with `python3 engine/tests/ssd/test-mac-expert-source.py build-macos-metal/bin/test-mac-expert-source`.
 It is model-free and supports ASan/UBSan and TSan builds. Launcher and metadata
 validation tests run with `python3 -m pytest -q tests/integration/test-macos-launcher.py`.
 

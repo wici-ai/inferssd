@@ -79,7 +79,7 @@ def test_permission_failure_propagates_once_without_path_fallback(monkeypatch, s
 
     def refuse(request, **kwargs):
         requests.append(request)
-        raise urllib.error.HTTPError(request.full_url, status, "refused", {}, None)
+        raise urllib.error.HTTPError(request.full_url, status, "refused", {}, io.BytesIO(b""))
 
     monkeypatch.setattr(controller.urllib.request, "urlopen", refuse)
     with pytest.raises(urllib.error.HTTPError) as error:
@@ -105,7 +105,7 @@ def test_operator_access_uses_real_canonical_metadata_and_permission_urls(monkey
         ):
             value = dict(permission="write")
         else:
-            raise urllib.error.HTTPError(url, 404, "wrong URL", {}, None)
+            raise urllib.error.HTTPError(url, 404, "wrong URL", {}, io.BytesIO(b""))
         return io.BytesIO(json.dumps(value).encode())
 
     monkeypatch.setattr(controller.urllib.request, "urlopen", open_request)
