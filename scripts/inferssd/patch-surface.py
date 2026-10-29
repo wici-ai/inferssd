@@ -26,6 +26,9 @@ def main():
         for path in paths:
             if not path.startswith(("ggml/", "src/", "include/", "common/", "tools/server/")):
                 continue
+            # Upstream documentation is not bundled; only code changes are inventoried.
+            if path.endswith(".md"):
+                continue
             original = git("show", args.base + ":" + path)
             current = ROOT / "engine" / path
             replacement = current.read_bytes() if current.is_file() else b""

@@ -201,7 +201,7 @@ static nl::json api_get(const std::string & url,
     auto [cli, parts] = common_http_client(url);
 
     httplib::Headers headers = {
-        {"User-Agent", "llama-cpp/" + std::string(llama_build_info())},
+        {"User-Agent", "inferssd/" + std::string(llama_build_info())},
         {"Accept", "application/json"}
     };
 
