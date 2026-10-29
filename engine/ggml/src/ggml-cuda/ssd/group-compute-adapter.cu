@@ -311,7 +311,7 @@ struct group_engine {
             if (!std::isfinite(a.situ_beta) || a.situ_beta <= 0.0f || !std::isfinite(a.situ_linear_beta)) {
                 throw std::runtime_error("grouped VRAM engine invalid SiTU parameters");
             }
-        } else {
+        } else if (a.kind != KIMI_VRAM_ACTIVATION_SWIGLU) {
             throw std::runtime_error("grouped VRAM engine activation kind");
         }
         if (activation_->post_norm && (!std::isfinite(activation_->post_norm_eps) || activation_->post_norm_eps <= 0.0f)) {

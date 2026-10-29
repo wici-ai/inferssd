@@ -1906,7 +1906,10 @@ struct tier {
         const size_t expected=!mxfp4?size_t(latent)*sizeof(float):
             (input_type < int(GGML_TYPE_COUNT) ? ggml_row_size(ggml_type(input_type),latent):0);
         if((mxfp4 && input_type == int(GGML_TYPE_COUNT)) || bytes!=expected)throw std::runtime_error("VRAM input bytes");
-        if(a->kind!=KIMI_VRAM_ACTIVATION_SITU && a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP)throw std::runtime_error("VRAM activation kind");
+        // MXFP4's engines compute SiTU and clamped SwiGLU; the generic engine also plain SwiGLU
+        if(a->kind!=KIMI_VRAM_ACTIVATION_SITU && a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP &&
+                (mxfp4 || a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU))
+            throw std::runtime_error("VRAM activation kind");
         std::lock_guard<std::mutex> lock(mutex);if(!done)throw std::runtime_error("GPU job already outstanding");
         work.clear();output_rows.clear();failure.clear();host_done.clear();host_down.clear();
         for(size_t j=0;j<table->hits.size();++j){
@@ -2247,7 +2250,8 @@ struct tier {
         const size_t expected=f32?size_t(latent)*sizeof(float):
             (input_type < int(GGML_TYPE_COUNT) ? ggml_row_size(ggml_type(input_type),latent):0);
         if((!f32 && input_type == int(GGML_TYPE_COUNT)) || input_stride!=expected ||
-                (a->kind!=KIMI_VRAM_ACTIVATION_SITU && a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP))
+                (a->kind!=KIMI_VRAM_ACTIVATION_SITU && a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP &&
+                 (!f32 || a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU)))
             throw std::runtime_error("grouped-prefill input or activation format");
         const size_t route_count=size_t(nslots)*size_t(ntokens);
         for(size_t i=0;i<route_count;++i){

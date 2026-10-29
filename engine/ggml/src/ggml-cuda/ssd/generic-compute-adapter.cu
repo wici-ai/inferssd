@@ -168,7 +168,7 @@ struct generic_engine {
                     !std::isfinite(activation.situ_linear_beta)) {
                 throw std::runtime_error("generic VRAM engine invalid SiTU parameters");
             }
-        } else {
+        } else if (activation.kind != KIMI_VRAM_ACTIVATION_SWIGLU) {
             throw std::runtime_error("generic VRAM engine activation kind");
         }
 
