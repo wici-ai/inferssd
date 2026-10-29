@@ -165,3 +165,43 @@ def test_all_placement_merges_without_conflicts():
 )
 def test_server_arguments_yield_to_the_user(extra, environment, expected):
     assert server_arguments(strategy(), extra, environment) == expected
+
+
+DECODE_ON_FAST = Threads(10, 19, (), (5, 6, 7, 8, 9, 15, 16, 17, 18, 19))
+
+
+def test_decode_cpus_are_taken_with_their_counts():
+    result = apply(strategy(threads=DECODE_ON_FAST), parse(None, platform="linux"))
+    assert result.threads == DECODE_ON_FAST and (result.kept, result.dropped) == ((), ())
+    assert threadpools(result.threads, "linux") == DECODE_ON_FAST
+
+
+@pytest.mark.parametrize(
+    "user, threads, kept, dropped",
+    [
+        # The user's CPU set pins both pools and replaces the decode CPUs.
+        (
+            Threads(cpus=(0, 1, 2, 3)),
+            Threads(None, None, (0, 1, 2, 3)),
+            ("threads.decode_cpus",),
+            ("threads.decode", "threads.batch"),
+        ),
+        # More decode threads than decode CPUs: the decode CPUs go.
+        (Threads(12), Threads(12, 19), (), ("threads.decode_cpus",)),
+        # A smaller count fits on the decode CPUs.
+        (Threads(8), Threads(8, 19, (), DECODE_ON_FAST.decode_cpus), (), ()),
+    ],
+)
+def test_user_threads_against_decode_cpus(user, threads, kept, dropped):
+    result = apply(strategy(threads=DECODE_ON_FAST), parse(None, platform="linux"), user)
+    assert result.threads == threads
+    assert set(kept) <= set(result.kept)
+    assert result.dropped == dropped
+    assert launch_conflicts(result.threads, (), 0, "linux") == []
+
+
+def test_user_io_cpus_on_a_decode_cpu_drop_the_decode_cpus():
+    user = parse(None, overrides=[("cpu.io_cpus", '"5"')], platform="linux")
+    result = apply(strategy(threads=DECODE_ON_FAST), user)
+    assert result.threads == Threads(10, 19, ())
+    assert result.dropped == ("threads.decode_cpus",)

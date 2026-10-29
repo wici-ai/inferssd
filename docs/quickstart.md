@@ -98,11 +98,10 @@ For DeepSeek:
 inferssd launch --execute \
   --resources engine-resources.json \
   --model /path/to/model-00001-of-00010.gguf --profile dsv \
-  --runtime-policy runtime-policy.json \
-  --context 8192 --batch 512 --ubatch 512
+  --runtime-policy runtime-policy.json
 ```
 
-For Muse, change `--profile dsv` to `--profile muse`, and for Qwen3.8-Flash-Next to `--profile qwen4exp`, which keeps the chat template embedded in its GGUF; select the model's first GGUF shard. Batch sizes are explicit examples; tune them within the available memory budget. The platform defaults to the current host, and the server listens on `127.0.0.1:8080`; pass `--port` to use another loopback port.
+For Muse, change `--profile dsv` to `--profile muse`, and for Qwen3.8-Flash-Next to `--profile qwen4exp`, which keeps the chat template embedded in its GGUF; select the model's first GGUF shard. The context defaults to 8192 tokens and the batch sizes to what the launch chooses for this machine; `--context`, `--batch` and `--ubatch` set them yourself. The platform defaults to the current host, and the server listens on `127.0.0.1:8080`; pass `--port` to use another loopback port.
 
 If `expert.source` is omitted, the framework builds an alias index from the GGUF metadata without duplicating weight payloads. For the recorded planning commands, `inferssd source index MODEL PACK DIR` indexes an optional v1 pack; see [source preparation](../framework/README.md#prepare-a-typed-launch). Use the [deployment resources guide](engine-resources.md) when moving binaries and templates outside the checkout.
 

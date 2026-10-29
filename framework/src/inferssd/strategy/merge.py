@@ -37,7 +37,9 @@ class Applied:
 
     ``kept`` names the strategy proposals a user value replaced; ``dropped``
     those left out because they contradict a user value. Thread pool fields
-    are named ``threads.decode``, ``threads.batch`` and ``threads.cpus``.
+    are named ``threads.decode``, ``threads.batch``, ``threads.cpus`` and
+    ``threads.decode_cpus``; the user's CPU set for both pools replaces a
+    decode CPU set.
     """
 
     settings: Snapshot
@@ -70,22 +72,28 @@ def apply(strategy: Strategy, snapshot: Snapshot, threads: Threads = Threads()) 
         "decode": user.decode is None and own.decode is not None,
         "batch": user.batch is None and own.batch is not None,
         "cpus": not user.cpus and bool(own.cpus),
+        "decode_cpus": not user.cpus and not user.decode_cpus and bool(own.decode_cpus),
     }
-    kept += [
-        "threads." + name
-        for name, given in (("decode", user.decode), ("batch", user.batch), ("cpus", user.cpus))
-        if given and getattr(own, name)
-    ]
+    given = (
+        ("decode", user.decode),
+        ("batch", user.batch),
+        ("cpus", user.cpus),
+        ("decode_cpus", user.decode_cpus or user.cpus),
+    )
+    kept += ["threads." + name for name, value in given if value and getattr(own, name)]
     merged = Threads(
         own.decode if fields["decode"] else user.decode,
         own.batch if fields["batch"] else user.batch,
         own.cpus if fields["cpus"] else user.cpus,
+        own.decode_cpus if fields["decode_cpus"] else user.decode_cpus,
     )
 
     def drop(name: str) -> None:
         nonlocal merged
         if name == "cpus":
             merged = replace(merged, cpus=())
+        elif name == "decode_cpus":
+            merged = replace(merged, decode_cpus=())
         elif name == "decode":
             merged = replace(merged, decode=None)
         else:
@@ -105,14 +113,21 @@ def apply(strategy: Strategy, snapshot: Snapshot, threads: Threads = Threads()) 
             drop("cpus")
         elif fields[name]:
             drop(name)
+    if merged.decode_cpus and (merged.decode or 0) > len(merged.decode_cpus):
+        drop("decode_cpus" if fields["decode_cpus"] else "decode")
+    if merged.decode_cpus and merged.batch is None:
+        # Without a count of its own the batch pool would take the decode CPUs.
+        drop("decode_cpus")
     # I/O CPUs outside the strict compute CPUs.
     io = set(cast(tuple[int, ...], current("cpu.io_cpus")))
-    if io & set(merged.cpus):
+    if io & set(merged.cpus + merged.decode_cpus):
         if "cpu.io_cpus" in proposed:
             del proposed["cpu.io_cpus"]
             dropped.append("cpu.io_cpus")
         elif fields["cpus"]:
             drop("cpus")
+        elif fields["decode_cpus"]:
+            drop("decode_cpus")
     # Decode participants within the decode threads (a strict CPU set sizes an unset count).
     participants = cast(int, current("cpu.decode_participants"))
     decode = merged.decode or (len(merged.cpus) if merged.cpus else None)

@@ -66,13 +66,20 @@ it reads at that moment (the CPUs it may use, the usable GPUs and their free
 memory, the available memory) to choose:
 
 - the decode and prefill thread counts and, where the CPUs allow it, which
-  CPUs the compute threads and the I/O thread use;
+  CPUs the decode threads use: the performance cluster alone, one thread
+  pinned to each CPU, when one token streams the model's weight format faster
+  there than on every CPU;
 - the starting estimates the engine uses to place experts between the CPU and
   the GPU (it refines them as it runs);
 - `vram.budget = 0` when no CUDA GPU is usable, and on macOS the host memory
-  budget from the runtime policy.
+  budget from the runtime policy;
+- with one usable CUDA GPU on Linux, which prompt passes the CPU prefills
+  (`prefill.cpu_max_tokens`, the longest pass the CPU prefills no slower than
+  the GPU graph reading the same experts) and one prefill pass per prompt; on
+  a GPU sharing host memory, a host margin of 4096 MiB (`host.headroom_mib`).
 
-None of these changes the model's output. The launch fills only the settings
+Only the prefill route and the pass size change the model's output, the way
+any GPU kernel or batch shape does; the rest keeps it bit for bit. The launch fills only the settings
 you left at their defaults and the thread options you did not give: a value
 from `--set`, from the settings file or from `--threads`, `--batch-threads` or
 `--cpus` always wins, and a choice that contradicts one of your values is left
@@ -86,7 +93,7 @@ not use a profile yet.
 | --- | --- | --- |
 | `cpu` | sysfs on Linux, `sysctl` on macOS; ISA from `inferssd-cpuprobe` | Logical CPUs with core, package, SMT siblings, `cpu_capacity` and maximum frequency; performance and efficiency clusters; whether threads can be pinned; the instruction-set features ggml reports (build options such as OpenMP or repacking are left out) |
 | `memory` | `/proc/meminfo` or `hw.memsize`; `inferssd-cpuprobe` | Total memory, page size, whether the GPU shares system memory, DRAM read bandwidth per thread count |
-| `compute` | `inferssd-cpuprobe` | ggml CPU matrix-multiply speed per weight format and thread count: weight bytes per second for one token, FLOP/s for more tokens |
+| `compute` | `inferssd-cpuprobe` | ggml CPU matrix-multiply speed per weight format and thread count: weight bytes per second for one token, FLOP/s for more tokens; on Linux machines with several CPU clusters, also one token with a thread pinned to each CPU of each cluster and of every CPU (rows with `cpus`) |
 | `gpus` | `inferssd-memprobe` (Linux with NVIDIA GPUs) | VRAM size, host-to-device (pinned and pageable), device-to-host and device-to-device copy rates, and device read bandwidth, for every GPU `nvidia-smi` lists |
 | `storage:<drive>` | `inferssd-ssdprobe`, one per drive | Random-read bandwidth and latency by request size and queue depth, read with the engine's own reader; the knee queue depth per size |
 

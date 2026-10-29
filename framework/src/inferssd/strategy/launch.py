@@ -31,6 +31,8 @@ class Planned:
     threads: Threads
     server_args: tuple[str, ...]
     receipt: dict[str, object]
+    # Prefill each prompt in one pass: -b and -ub as large as the context.
+    one_pass: bool = False
 
 
 def plan(
@@ -80,7 +82,7 @@ def plan(
     left = set(kept) | set(applied.dropped)
     pools = {
         name: getattr(applied.threads, name)
-        for name in ("decode", "batch", "cpus")
+        for name in ("decode", "batch", "cpus", "decode_cpus")
         if getattr(strategy.threads, name) and "threads." + name not in left
     }
     receipt: dict[str, object] = {
@@ -97,12 +99,14 @@ def plan(
                 if name not in left
             },
             "threads": {
-                name: list(value) if name == "cpus" else value for name, value in pools.items()
+                name: list(value) if name.endswith("cpus") else value
+                for name, value in pools.items()
             },
+            "one_pass": strategy.one_pass,
             "server_args": list(arguments),
         },
         "kept": kept,
         "dropped": list(applied.dropped),
         "notes": list(strategy.notes),
     }
-    return Planned(applied.settings, applied.threads, arguments, receipt)
+    return Planned(applied.settings, applied.threads, arguments, receipt, strategy.one_pass)

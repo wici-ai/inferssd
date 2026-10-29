@@ -22,11 +22,14 @@ class Threads:
 
     An unset count keeps the server default and an unset batch count follows decode.
     The CPU set pins one thread per CPU in both pools; empty leaves them unpinned.
+    The decode CPU set instead pins the decode pool alone (strict -C) and leaves
+    the batch pool unpinned; it excludes a CPU set for both pools.
     """
 
     decode: Optional[int] = None
     batch: Optional[int] = None
     cpus: tuple[int, ...] = ()
+    decode_cpus: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)

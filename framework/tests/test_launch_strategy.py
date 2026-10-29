@@ -92,7 +92,16 @@ def test_recorded_strategy_fills_what_the_user_left_unset(tmp_path):
     argv = list(result.argv)
     # 61 uniform CPUs: 60 unpinned threads, one left for the I/O thread.
     assert argv[argv.index("-t") : argv.index("-t") + 4] == ["-t", "60", "-tb", "60"]
-    assert "-C" not in argv and argv[-2:] == ["--ctx-checkpoints", "0"]
+    assert "-C" not in argv and argv[-2:] == ["--ctx-checkpoints", "1"]
+    # With the CUDA GPU a prompt is prefilled in one pass as large as the context.
+    assert argv[argv.index("-c") : argv.index("-c") + 6] == [
+        "-c",
+        "8192",
+        "-b",
+        "8192",
+        "-ub",
+        "8192",
+    ]
     settings = native(out, spec)
     for key in ("cpu.io_cpus", "cpu.decode_participants", "place.costs"):
         item = settings.at(key)
@@ -117,8 +126,19 @@ def test_recorded_strategy_fills_what_the_user_left_unset(tmp_path):
         "cpu.io_cpus",
         "place.costs",
     ]
+    # The toy model's experts are so small that the CPU prefills any pass no slower.
+    assert settings.at("prefill.cpu_max_tokens").origin == "default"
+    assert any(
+        note.startswith("prefill: the CPU route for every pass") for note in receipt["notes"]
+    )
     assert receipt["chosen"]["threads"] == {"decode": 60, "batch": 60}
-    assert receipt["chosen"]["server_args"] == ["--ctx-checkpoints", "0"]
+    assert receipt["chosen"]["server_args"] == ["--ctx-checkpoints", "1"]
+    assert receipt["chosen"]["one_pass"] is True
+    assert (line["launch"]["context"], line["launch"]["batch"], line["launch"]["ubatch"]) == (
+        8192,
+        8192,
+        8192,
+    )
     assert (receipt["kept"], receipt["dropped"]) == ([], [])
     assert any(note.startswith("threads: all placement") for note in receipt["notes"])
 
@@ -557,7 +577,7 @@ def test_dry_run_takes_characteristics_from_machine(tmp_path, monkeypatch):
     command = words + ["--dry-run", "--host-facts", str(facts), "--machine", str(X86_FILE)]
     assert main(command + ["--result", str(receipt)]) == 0
     result = json.loads(receipt.read_text())
-    assert result["argv"][-2:] == ["--ctx-checkpoints", "0"]
+    assert result["argv"][-2:] == ["--ctx-checkpoints", "1"]
     assert json.loads((out / "strategy.json").read_text())["inputs"]["model_drive"] == X86_DRIVE
 
 

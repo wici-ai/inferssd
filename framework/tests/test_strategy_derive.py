@@ -9,13 +9,20 @@ import math
 from pathlib import Path
 
 import pytest
-from test_strategy_inputs import Q3_K, Q8_0, deepseek_like, moe, muse_like, write_gguf
+from test_strategy_inputs import Q3_K, Q4_K, Q5_K, Q8_0, deepseek_like, moe, muse_like, write_gguf
 
 from inferssd.configuration.settings import parse, render, schema
 from inferssd.launch.typed import threadpools
 from inferssd.launch.types import Threads
 from inferssd.machine.characteristics import dumps, load
-from inferssd.strategy.derive import SERVER_ARGS, cpu_line, derive, launch_conflicts, literal
+from inferssd.strategy.derive import (
+    SERVER_ARGS,
+    cpu_line,
+    derive,
+    launch_conflicts,
+    literal,
+    prefill_split,
+)
 from inferssd.strategy.inputs import GPUState, RuntimeFacts, model_facts
 
 MACHINES = Path(__file__).parent / "fixtures" / "machine"
@@ -86,7 +93,13 @@ def test_x86_uniform_machine_with_a_discrete_gpu(models):
     # faster still but deeper than the engine queues.
     assert terms["drive_gbps"] == pytest.approx(9.623315)
     assert "4 MiB reads at QD 16" in s.settings["place.costs"].reason
-    assert s.server_args == SERVER_ARGS == ("--ctx-checkpoints", "0")
+    assert s.server_args == SERVER_ARGS == ("--ctx-checkpoints", "1")
+    # The 5090 graph reads at the drive's rate, slower than its link: the CPU
+    # prefills passes up to 2848 tokens no slower, each prompt in one pass.
+    assert s.settings["prefill.cpu_max_tokens"].value_text == "2848"
+    assert "GPU graph reading 9.62 GB/s" in s.settings["prefill.cpu_max_tokens"].reason
+    assert s.one_pass
+    assert "host.headroom_mib" not in s.settings  # a discrete GPU
     assert s.inputs.platform == "linux"
     assert s.inputs.model_paths == models["dsv"].paths
     assert s.inputs.characteristics_sha256 == hashlib.sha256(dumps(c).encode()).hexdigest()
@@ -167,14 +180,14 @@ def test_cpu_line_keeps_both_terms_nonnegative(models, scale):
         assert line == pytest.approx(((one + many) / 2, 0.0))
 
 
-def test_arm_split_needs_the_performance_cluster_at_the_lowest_ids(models):
+def test_arm_unified_memory(models):
     c = machine(ARM)
     gpu = GPUState(ARM_GPU, None, 0)
     s = derive(c, models["muse"], runtime(range(20), [gpu]), "linux", model_drive_key=drive(c))
-    # The performance cores are CPUs 5-9 and 15-19, but decode runs on the lowest IDs.
+    # Without pinned measurements decode stays on every CPU but one, unpinned.
     assert s.threads == Threads(19, 19, ())
     assert s.settings["cpu.io_cpus"].value_text == '""'
-    assert "not the lowest compute CPU IDs" in s.settings["cpu.io_cpus"].reason
+    assert "no pinned one-token Q4_K measurement" in s.settings["cpu.io_cpus"].reason
     terms = costs(s)
     # GB10 shares host memory: no copy over a link is priced.
     assert sorted(terms) == ["cpu_fixed_us", "cpu_route_us", "drive_gbps"]
@@ -183,6 +196,10 @@ def test_arm_split_needs_the_performance_cluster_at_the_lowest_ids(models):
     # The automatic VRAM tier shares the host memory envelope with the RAM cache there.
     assert "vram.budget" not in s.settings
     assert any(note.startswith("vram.budget: default auto for ") for note in s.notes)
+    assert s.settings["host.headroom_mib"].value_text == "4096"
+    # The graph reads at the drive's rate too: passes past 456 tokens go to the GPU.
+    assert s.settings["prefill.cpu_max_tokens"].value_text == "456"
+    assert s.one_pass
 
 
 def two_clusters(fast, slow):
@@ -201,32 +218,82 @@ def two_clusters(fast, slow):
     return c
 
 
-def test_split_placement(models):
-    c = two_clusters(list(range(6)), list(range(6, 12)))
-    s = derive(c, models["dsv"], runtime(range(12)), "linux", model_drive_key=drive(c))
-    compute = (0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11)
-    assert s.threads == Threads(11, 11, compute)
-    assert s.settings["cpu.io_cpus"].value_text == '"5"'
-    assert s.settings["cpu.decode_participants"].value_text == "0"
+def pin(c, cpus, rate, fmt="MXFP4"):
+    """A pinned one-token measurement of FMT on CPUS, at RATE weight bytes/s."""
+    row = {
+        "format": fmt,
+        "threads": len(cpus),
+        "rows": 4096,
+        "cols": 4096,
+        "weight_bytes": 8912896,
+        "points": [{"tokens": 1, "us": 8912896 / rate * 1e6, "weight_Bps": rate}],
+        "cpus": sorted(cpus),
+    }
+    c["compute"]["cpu"].append(row)
+
+
+@pytest.mark.parametrize("fast, slow", [(list(range(6, 12)), list(range(6))), ([0, 1], [2, 3, 4])])
+def test_decode_on_the_performance_cluster_measured_faster(models, fast, slow):
+    c = two_clusters(fast, slow)
+    pin(c, fast, 110e9)
+    pin(c, fast + slow, 80e9)
+    allowed = sorted(fast + slow)
+    s = derive(c, models["dsv"], runtime(allowed), "linux", model_drive_key=drive(c))
+    count = len(allowed) - 1
+    assert s.threads == Threads(len(fast), count, (), tuple(fast))
+    assert s.settings["cpu.io_cpus"].value_text == '""'
+    assert "110.0 GB/s there against 80.0 GB/s" in s.settings["cpu.io_cpus"].reason
     assert threadpools(s.threads, "linux") == s.threads
-    assert launch_conflicts(s.threads, (5,), 0, "linux") == []
+    assert launch_conflicts(s.threads, (), 0, "linux") == []
+    # The pinned rows do not enter the CPU cost line, which prices the batch pool.
+    assert f"on {count} threads (the 1- and 61-thread measurements)" in (
+        s.settings["place.costs"].reason
+    )
 
 
 @pytest.mark.parametrize(
-    "fast, slow, allowed, reason",
+    "allowed, rates, reason",
     [
-        ([0, 1], list(range(2, 8)), range(8), "2 performance CPUs"),
-        (list(range(6)), list(range(6, 12)), range(6), "one CPU cluster"),
-        (list(range(6)), list(range(6, 12)), [0, 1, 6, 7, 8], "2 performance CPUs"),
+        (range(12), None, "no pinned one-token MXFP4 measurement"),
+        (range(12), (80e9, 80e9), "every CPU streams MXFP4 at one token as fast or faster"),
+        (range(12), (80e9, 90e9), "(90.0 against 80.0 GB/s pinned)"),
+        ([0, 1, 6, 7, 8], (110e9, 80e9), "no pinned one-token MXFP4 measurement"),
+        (range(6), (110e9, 80e9), "one CPU cluster"),
     ],
 )
-def test_all_placement_without_a_usable_split(models, fast, slow, allowed, reason):
+def test_decode_on_every_cpu(models, allowed, rates, reason):
+    fast, slow = list(range(6)), list(range(6, 12))
     c = two_clusters(fast, slow)
+    if rates:
+        pin(c, fast, rates[0])
+        pin(c, fast + slow, rates[1])
     s = derive(c, models["dsv"], runtime(allowed), "linux", model_drive_key=drive(c))
     count = len(list(allowed)) - 1
     assert s.threads == Threads(count, count, ())
     assert s.settings["cpu.io_cpus"].value_text == '""'
     assert reason in s.settings["cpu.io_cpus"].reason
+
+
+def test_prefill_split_crossing(models):
+    dsv = models["dsv"]
+    line = (176.7, 114.28)
+    split, why = prefill_split(dsv, line, 11.85, 11.85)
+    assert split == 789 and "40 layers of 384 experts, 6 a token" in why
+
+    def seconds(n, graph):
+        touched = dsv.layers * dsv.experts * (1 - (1 - 6 / dsv.experts) ** n)
+        read = touched * dsv.expert_read_bytes / 11.85e9
+        if graph:
+            return read
+        return max(read, (touched * line[0] + n * 6 * dsv.layers * line[1]) * 1e-6)
+
+    assert seconds(789, False) <= seconds(789, True) and seconds(790, False) > seconds(790, True)
+    # A slower link makes the graph slower: the CPU keeps longer passes.
+    assert prefill_split(dsv, line, 11.85, 5.0)[0] > 789
+    # A CPU that is slower even for one token leaves every pass to the graph.
+    assert prefill_split(dsv, (1e6, 1e6), 11.85, 11.85)[0] == 0
+    # A CPU that is never slower within the bound leaves the engine's default.
+    assert prefill_split(dsv, (0.0, 0.0), 11.85, 11.85)[0] is None
 
 
 def test_affinity_limits_the_threads_and_the_cpu_line(models):
@@ -381,3 +448,30 @@ def test_dense_only_shapes_do_not_reach_the_cpu_line(models, tmp_path):
     facts = model_facts(str(write_gguf(tmp_path / "q8.gguf", tensors, kv)))
     line, why = cpu_line(machine(X86), facts, 60)
     assert line is not None and "latent 4096 hidden 1024" in why
+
+
+def test_experts_mixing_formats_across_layers_keep_the_gpu_tier_off(tmp_path):
+    """Like a Q4_K_S Muse: Q5_K down experts in the first layers, Q4_K after them."""
+    down = [Q5_K] * 2 + [Q4_K] * 6
+    tensors, kv = moe(
+        "muse-spark",
+        layers=8,
+        experts=16,
+        used=4,
+        latent=4096,
+        hidden=1024,
+        gate=Q4_K,
+        up=Q4_K,
+        down=down,
+    )
+    mixed = model_facts(str(write_gguf(tmp_path / "mixed.gguf", tensors, kv)))
+    c = machine(X86)
+    gpu = GPUState(X86_GPU, 30 << 30, 0)
+    s = derive(c, mixed, runtime(range(61), [gpu]), "linux", model_drive_key=drive(c))
+    assert s.settings["vram.budget"].value_text == "0"
+    assert s.settings["vram.budget"].reason == (
+        "the GPU tier computes one expert format a role, and this model's down experts are "
+        "Q4_K in 6 layers, Q5_K in 2 layers"
+    )
+    # The graph still prefills long passes.
+    assert s.one_pass and "prefill.cpu_max_tokens" in s.settings

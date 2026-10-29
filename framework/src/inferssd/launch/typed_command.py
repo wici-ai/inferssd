@@ -16,7 +16,7 @@ from inferssd.configuration.settings import PLATFORMS, cpus, host_platform
 from inferssd.launch.prepare import prepare
 from inferssd.launch.recorded import RecordedArtifacts, run_indexer
 from inferssd.launch.resources import read_resources
-from inferssd.launch.typed import PROFILES, LaunchSpec, resolve_typed
+from inferssd.launch.typed import BATCH, CONTEXT, PROFILES, LaunchSpec, resolve_typed
 from inferssd.launch.types import LaunchInput, Output, Threads
 from inferssd.machine.characteristics import dumps, load
 from inferssd.platform.policy import Policy
@@ -54,9 +54,19 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     launch.add_argument("--artifact-dir", type=Path)
     launch.add_argument("--profile", choices=tuple(PROFILES), default="muse")
     launch.add_argument("--port", type=int, default=8080)
-    launch.add_argument("--context", type=int, default=8192)
-    launch.add_argument("--batch", type=int, default=512)
-    launch.add_argument("--ubatch", type=int, default=512)
+    launch.add_argument("--context", type=int, help=f"-c (default: {CONTEXT})")
+    launch.add_argument(
+        "--batch",
+        type=int,
+        help=f"-b (default: the context where the strategy prefills a prompt in one pass, "
+        f"else {BATCH})",
+    )
+    launch.add_argument(
+        "--ubatch",
+        type=int,
+        help=f"-ub (default: --batch where the strategy prefills a prompt in one pass, "
+        f"else {BATCH})",
+    )
     launch.add_argument(
         "--threads", type=int, help="decode ggml threads, -t (1..256; default: the server's)"
     )
@@ -71,6 +81,12 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     )
     launch.add_argument("--result", type=Path, help="dry-run resolution receipt")
     launch.add_argument(
+        "--prompt-cache",
+        metavar="DIR|off",
+        help="keep each model's prompt cache on disk under DIR, across restarts "
+        "(default: inferssd/prompts in this user's cache directory); off runs without one",
+    )
+    launch.add_argument(
         "--reprofile",
         action="store_true",
         help="measure this machine again before launching (the first launch measures it)",
@@ -83,6 +99,17 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     )
     launch.add_argument("extra", nargs=argparse.REMAINDER)
     launch.set_defaults(mode="server")
+
+
+def prompt_cache_directory() -> Path:
+    """This user's cache directory for inferssd prompt caches."""
+    if sys.platform == "darwin":
+        root = Path.home() / "Library" / "Caches"
+    elif sys.platform == "win32":
+        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    else:
+        root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return root / "inferssd" / "prompts"
 
 
 def specification(args: argparse.Namespace, *, strategy: bool = False) -> LaunchSpec:
@@ -106,6 +133,9 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         str(args.template.resolve()) if args.template else None,
         read_resources(args.resources) if args.resources else None,
         strategy,
+        None
+        if args.prompt_cache == "off"
+        else str(Path(args.prompt_cache or prompt_cache_directory()).resolve()),
     )
 
 

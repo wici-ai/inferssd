@@ -24,7 +24,7 @@ from inferssd.launch.machine import characteristics as machine_characteristics
 from inferssd.launch.prepare import prepare
 from inferssd.launch.recorded import run_indexer
 from inferssd.launch.resources import probe_paths, server_binary
-from inferssd.launch.typed import LaunchSpec, reject_legacy_environment, resolve_typed
+from inferssd.launch.typed import BATCH, LaunchSpec, reject_legacy_environment, resolve_typed
 from inferssd.launch.types import LaunchInput, Output, Resolution
 from inferssd.loop.controller import Controller
 from inferssd.loop.typed_controller import TypedController
@@ -268,7 +268,7 @@ class Runtime:
                 DirectoryArtifacts(Path(path)),
                 base=base,
                 threads=specification.threads,
-                native_ubatch=specification.ubatch,
+                native_ubatch=specification.ubatch or BATCH,
                 host_threads=host_threads,
             )
             if start not in machine.configs:

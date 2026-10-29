@@ -33,15 +33,29 @@ class LaunchSpec:
     overrides: tuple[tuple[str, str], ...] = ()
     binary: Optional[str] = None
     artifact_directory: Optional[str] = None
-    context: int = 8192
-    batch: int = 512
-    ubatch: int = 512
+    # Unset sizes take CONTEXT and BATCH, or one pass per prompt where the
+    # strategy prefills that way: -b and -ub as large as the context.
+    context: Optional[int] = None
+    batch: Optional[int] = None
+    ubatch: Optional[int] = None
     threads: Threads = Threads()
     template: Optional[str] = None
     resources: Optional[EngineResources] = None
     # Derive the launch strategy from the machine characteristics fact. Without
     # it the launch resolves from its settings and options alone.
     strategy: bool = False
+    # The directory that keeps each model's prompt cache across restarts, in a
+    # subdirectory named after the model; None runs without a prompt cache.
+    prompt_cache: Optional[str] = None
+
+
+CONTEXT = 8192
+BATCH = 512
+# The disk prompt cache's size limit per model.
+PROMPT_CACHE_MIB = 16384
+# DeepSeek-V4.1's template drops earlier turns' thinking by default, so a
+# history rendered again differs from the cached prompt; keep it.
+DSV_TEMPLATE_KWARGS = '{"drop_thinking": false}'
 
 
 def reject_legacy_environment(environment: Mapping[str, str]) -> None:
@@ -81,18 +95,31 @@ def literal(item: Setting, platform: str) -> str:
 
 
 def threadpools(threads: Threads, platform: str) -> Threads:
-    """Resolve the counts; a strict CPU set sizes the pools and bounds both counts."""
+    """Resolve the counts; a strict CPU set sizes the pools and bounds both counts.
+
+    A decode CPU set sizes and bounds the decode count alone; the batch count
+    is then always given, so the server's batch pool never inherits the decode
+    pool's CPUs.
+    """
     for count in (threads.decode, threads.batch):
         if count is not None and (type(count) is not int or not 1 <= count <= 256):
             raise ValueError("thread counts must be integers in 1..256")
-    cpus = threads.cpus
+    cpus, decode_cpus = threads.cpus, threads.decode_cpus
     # A server CPU mask holds GGML_MAX_N_THREADS bits.
-    if len(set(cpus)) != len(cpus) or any(type(x) is not int or not 0 <= x < 512 for x in cpus):
-        raise ValueError("strict CPUs must be unique CPU IDs in 0..511")
-    if not cpus:
+    for ids in (cpus, decode_cpus):
+        if len(set(ids)) != len(ids) or any(type(x) is not int or not 0 <= x < 512 for x in ids):
+            raise ValueError("strict CPUs must be unique CPU IDs in 0..511")
+    if cpus and decode_cpus:
+        raise ValueError("a decode CPU set excludes a CPU set for both thread pools")
+    if not cpus and not decode_cpus:
         return Threads(threads.decode, threads.batch or threads.decode)
     if platform == "darwin":
         raise ValueError("macOS cannot pin threads to CPUs")
+    if decode_cpus:
+        decode = threads.decode or len(decode_cpus)
+        if decode > len(decode_cpus):
+            raise ValueError("the decode thread count exceeds the decode CPUs")
+        return Threads(decode, threads.batch or decode, (), tuple(sorted(decode_cpus)))
     decode = threads.decode or len(cpus)
     batch = threads.batch or decode
     if max(decode, batch) > len(cpus):
@@ -125,7 +152,8 @@ def _resolve(
         raise ValueError("unknown model profile; choose " + ", ".join(PROFILES))
     if s.inputs.mode != "server":
         raise ValueError("owned typed launch currently supports server mode")
-    if not 1 <= spec.port <= 65535 or min(spec.context, spec.batch, spec.ubatch) < 1:
+    sizes = [size for size in (spec.context, spec.batch, spec.ubatch) if size is not None]
+    if not 1 <= spec.port <= 65535 or any(size < 1 for size in sizes):
         raise ValueError("invalid port, context or batch size")
     threads = threadpools(spec.threads, platform)
     protected = {
@@ -161,6 +189,7 @@ def _resolve(
         "--fit",
         "--chat-template-file",
         "--chat-template",
+        "--chat-template-kwargs",
         "--reasoning",
         "-ngl",
         "--gpu-layers",
@@ -340,7 +369,9 @@ def _resolve(
             if s.text("gpu_processes").strip():
                 raise ValueError("the GPU already has a compute process")
     # The sink's I/O thread keeps its own CPUs; decode runs on the first decode threads.
-    if set(cast(tuple[int, ...], value.at("cpu.io_cpus").value)) & set(threads.cpus):
+    if set(cast(tuple[int, ...], value.at("cpu.io_cpus").value)) & set(
+        threads.cpus + threads.decode_cpus
+    ):
         raise ValueError("cpu.io_cpus overlaps the strict compute CPUs")
     participants = cast(int, value.at("cpu.decode_participants").value)
     if threads.decode is not None and participants > threads.decode:
@@ -351,6 +382,13 @@ def _resolve(
     if planned is not None:
         receipt = json.dumps(planned.receipt, ensure_ascii=False, indent=2) + "\n"
         s.ask("write_exclusive", os_path.join(directory, "strategy.json"), receipt)
+    context = spec.context or CONTEXT
+    one_pass = planned is not None and planned.one_pass
+    batch = spec.batch or (context if one_pass else BATCH)
+    ubatch = spec.ubatch or (batch if one_pass else BATCH)
+    if planned is not None and one_pass:
+        given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
+        cast(list[str], planned.receipt["kept"]).extend("server " + name for name in given)
     command = [binary, "-m", model, "--ssd-settings", settings, "--ssd-telemetry", telemetry]
     for item in value.entries:
         if item.origin == "cli":
@@ -367,11 +405,11 @@ def _resolve(
         "-ngl",
         "99",
         "-c",
-        str(spec.context),
+        str(context),
         "-b",
-        str(spec.batch),
+        str(batch),
         "-ub",
-        str(spec.ubatch),
+        str(ubatch),
     ]
     if threads.decode is not None:
         command += ["-t", str(threads.decode)]
@@ -380,8 +418,26 @@ def _resolve(
     if threads.cpus:
         mask = hex(sum(1 << cpu for cpu in threads.cpus))
         command += ["-C", mask, "-Cb", mask, "--cpu-strict", "1", "--cpu-strict-batch", "1"]
+    elif threads.decode_cpus:
+        # The batch pool has its own count (-tb above), so it keeps no CPU mask.
+        command += ["-C", hex(sum(1 << cpu for cpu in threads.decode_cpus)), "--cpu-strict", "1"]
     if template is not None:
         command += ["--chat-template-file", template]
+    if s.inputs.profile == "dsv":
+        command += ["--chat-template-kwargs", DSV_TEMPLATE_KWARGS]
+    if spec.prompt_cache is None:
+        command += ["--cache-ram", "0"]
+    else:
+        # One directory per model, named as its file is without the shard suffix.
+        name = match.group(1) if match else os_path.basename(model)
+        if name.endswith(".gguf"):
+            name = name[: -len(".gguf")]
+        command += [
+            "--cache-disk",
+            os_path.join(spec.prompt_cache, name),
+            "--cache-disk-mib",
+            str(PROMPT_CACHE_MIB),
+        ]
     command += [
         "--host",
         "127.0.0.1",
@@ -422,9 +478,10 @@ def _resolve(
             "decode_threads": threads.decode,
             "batch_threads": threads.batch,
             "cpus": list(threads.cpus),
-            "context": spec.context,
-            "batch": spec.batch,
-            "ubatch": spec.ubatch,
+            "decode_cpus": list(threads.decode_cpus),
+            "context": context,
+            "batch": batch,
+            "ubatch": ubatch,
         },
     }
     if planned is not None:

@@ -335,7 +335,12 @@ def test_typed_controller_never_calls_machine_env():
     controller.note = lambda record: captured.update(record=record)
     controller._start(4, "all")
     assert captured["args"][-1] is snapshot and "settings" in captured["record"]
-    assert captured["record"]["threads"] == {"decode": 3, "batch": 3, "cpus": (0, 1, 2)}
+    assert captured["record"]["threads"] == {
+        "decode": 3,
+        "batch": 3,
+        "cpus": (0, 1, 2),
+        "decode_cpus": (),
+    }
     assert "env" not in captured["record"]
 
 
@@ -575,6 +580,10 @@ def test_threadpool_counts_and_strict_cpu_masks_reach_native_argv(
         ("darwin", Threads(cpus=(0, 1)), (), "cannot pin"),
         ("linux", Threads(cpus=(0, 1)), (("cpu.io_cpus", "1"),), "overlaps"),
         ("linux", Threads(2, 4), (("cpu.decode_participants", "3"),), "decode_participants"),
+        ("linux", Threads(cpus=(0, 1), decode_cpus=(0, 1)), (), "excludes a CPU set"),
+        ("linux", Threads(3, 8, (), (0, 1)), (), "exceeds the decode CPUs"),
+        ("darwin", Threads(decode_cpus=(0, 1)), (), "cannot pin"),
+        ("linux", Threads(2, 8, (), (0, 1)), (("cpu.io_cpus", "1"),), "overlaps"),
     ],
 )
 def test_bad_explicit_threads_refused_before_native_file(
@@ -587,11 +596,46 @@ def test_bad_explicit_threads_refused_before_native_file(
     assert not (out / "settings.ssd").exists()
 
 
+def test_decode_cpus_pin_only_the_decode_pool(tmp_path):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    threads = Threads(None, 19, (), (5, 6, 7, 8, 9, 15, 16, 17, 18, 19))
+    result = resolve(inputs, replace(spec, threads=threads), adapter, out)
+    argv = list(result.argv)
+    assert argv[argv.index("-t") : argv.index("-t") + 4] == ["-t", "10", "-tb", "19"]
+    assert argv[argv.index("-C") + 1] == hex(0b11111000001111100000)
+    assert argv[argv.index("--cpu-strict") + 1] == "1"
+    # The batch pool has its own count and no mask: it never inherits the decode CPUs.
+    assert not {"-Cb", "--cpu-strict-batch"} & set(argv)
+    launch = json.loads(result.outputs[-1].text)["launch"]
+    assert (launch["cpus"], launch["decode_cpus"]) == ([], list(threads.decode_cpus))
+
+
+def test_prompt_cache_on_disk_per_model(tmp_path):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    result = resolve(inputs, spec, adapter, out)
+    assert result.argv[result.argv.index("--cache-ram") + 1] == "0"
+    assert "--cache-disk" not in result.argv
+    second = tmp_path / "second"
+    second.mkdir()
+    cache = str(tmp_path / "prompts")
+    result = resolve(inputs, replace(spec, prompt_cache=cache), adapter, second)
+    argv = list(result.argv)
+    assert argv[argv.index("--cache-disk") + 1] == str(Path(cache) / "model")
+    assert argv[argv.index("--cache-disk-mib") + 1] == "16384" and "--cache-ram" not in argv
+
+
+def test_sizes_default_to_the_context_and_batch():
+    assert (LaunchSpec("m", 1).context, LaunchSpec("m", 1).batch) == (None, None)
+
+
 @pytest.mark.parametrize(
     "extra",
     [
         ("--fit=on",),
         ("--chat-template-file", "other"),
+        ("--chat-template-kwargs", "{}"),
+        ("--cache-disk", "/tmp/x"),
+        ("--cache-ram", "8192"),
         ("-ngl0",),
         ("--cpu-moe",),
         ("--no-host",),
@@ -629,6 +673,10 @@ def test_deepseek_profile_materializes_model_policy_and_preserves_explicit_value
     native = parse((out / "settings.ssd").read_text(), overrides=spec.overrides)
     assert native.at("model.engram_prefetch").value == expected
     assert native.at("model.hc_fused").value == expected
+    # Earlier turns keep their thinking, so a history rendered again matches the cache.
+    argv = list(result.argv)
+    assert argv[argv.index("--chat-template-kwargs") + 1] == '{"drop_thinking": false}'
+    assert argv.index("--chat-template-kwargs") == argv.index("--chat-template-file") + 2
 
 
 def test_qwen4exp_launches_with_the_template_in_its_gguf(tmp_path):

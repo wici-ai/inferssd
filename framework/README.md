@@ -54,13 +54,24 @@ characteristics file and measures nothing); see [machine profile](../docs/machin
 From that file, the model's GGUF header and the CPUs, GPUs and memory it finds
 at that moment, the launch chooses thread counts, CPU placement, `place.costs`
 and, without a usable CUDA GPU, `vram.budget = 0` (on macOS also
-`host.budget_mib` from the runtime policy). It fills only settings left at their
-registry defaults and thread options not given, so explicit values always win.
+`host.budget_mib` from the runtime policy). With one usable CUDA GPU on Linux it
+also chooses `prefill.cpu_max_tokens`, the longest prompt pass the CPU prefills
+no slower than the GPU graph, and prefills each prompt in one pass (`-b` and
+`-ub` as large as the context); on a GPU that shares host memory it keeps
+`host.headroom_mib = 4096`. It fills only settings left at their registry
+defaults and thread options and sizes not given, so explicit values always win.
 The choices are written to the generated `settings.ssd` with `source=strategy`
 receipts and to `strategy.json`, with the values your settings kept and the
-choices left out because they contradicted them. Context checkpoints are off
-(`--ctx-checkpoints 0`) unless you set them with `--ctx-checkpoints` or
+choices left out because they contradicted them. The server keeps one context
+checkpoint (`--ctx-checkpoints 1`) unless you set `--ctx-checkpoints` or
 `LLAMA_ARG_CTX_CHECKPOINTS`.
+
+The prompt cache lives on disk, one directory per model under
+`inferssd/prompts` in your user cache directory, and survives restarts
+(`--cache-disk`, 16 GiB per model); `--prompt-cache DIR` moves it and
+`--prompt-cache off` runs without one. With `--profile dsv` the DeepSeek-V4.1
+template keeps earlier turns' thinking (`drop_thinking` false), so a
+conversation's history renders as the server cached it.
 
 ```text
 inferssd-settings 1

@@ -2,10 +2,12 @@
 """Derive one launch's native settings, thread pools and server arguments.
 
 ``derive`` is a pure function of the machine characteristics, the model's
-header facts, the runtime facts and the platform. It only chooses values that
-keep the computation bit-exact: thread counts and CPU placement, placement cost
-priors and the host memory budget. Batch sizes, the prefill route and the VRAM
-budget's behaviour stay as the launch has them.
+header facts, the runtime facts and the platform. It chooses thread counts and
+CPU placement, placement cost priors, the host memory budget and margin, and,
+with a CUDA GPU on Linux, which prompt passes the GPU graph prefills and that a
+prompt is prefilled in one pass. The last two change the computation (GPU
+against CPU kernels, the pass shape) for speed; everything else keeps it
+bit-exact. The VRAM budget's behaviour stays as the engine has it.
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ import hashlib
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, cast
 
 from inferssd.configuration.settings import PLATFORMS, Setting, Snapshot, parse, render, uncomment
 from inferssd.launch.types import Threads
@@ -29,10 +31,15 @@ MAX_THREADS = 256  # the launcher's bound on a thread pool
 MAX_CPU = 511  # the highest CPU a server CPU mask holds
 # Role reads the engine keeps in flight: 8 ring experts of 3 roles each.
 IN_FLIGHT = 24
-# Context checkpoints stay off to work around a known engine issue: once the RAM
-# cache fills host.budget_mib, growing the CPU work buffers fails the request
-# with HTTP 500.
-SERVER_ARGS = ("--ctx-checkpoints", "0")
+# One context checkpoint: a conversation's next turn most often returns to the
+# end of the previous prompt. The engine makes room for it from the RAM expert
+# cache, and the server's default of 32 would hold far more memory.
+SERVER_ARGS = ("--ctx-checkpoints", "1")
+# The host margin on memory a GPU shares with the host: the smallest margin that
+# held under stress with the automatic VRAM tier growing into host memory.
+UNIFIED_HEADROOM_MIB = 4096
+# The longest prompt pass the prefill route is priced for.
+MAX_PASS = 1 << 20
 
 
 @dataclass(frozen=True)
@@ -57,6 +64,8 @@ class Strategy:
     server_args: tuple[str, ...]
     inputs: Inputs
     notes: tuple[str, ...]
+    # Prefill each prompt in one pass: -b and -ub as large as the context.
+    one_pass: bool = False
 
 
 def span(cpus: Sequence[int]) -> str:
@@ -99,6 +108,11 @@ def _performance(characteristics: Characteristics) -> set[int]:
     return set((fast or clusters)[0]["cpus"]) if clusters else set()
 
 
+def _unpinned(characteristics: Characteristics) -> list[ComputeRow]:
+    """The compute rows measured with threads the scheduler places."""
+    return [row for row in characteristics["compute"]["cpu"] if not row.get("cpus")]
+
+
 def _measured_counts(
     characteristics: Characteristics, model: ModelFacts, allowed: Sequence[int], notes: list[str]
 ) -> Threads:
@@ -106,7 +120,7 @@ def _measured_counts(
     name = model.dominant_format.upper()
     rows = [
         row
-        for row in characteristics["compute"]["cpu"]
+        for row in _unpinned(characteristics)
         if row["format"].upper() == name and row["threads"] <= len(allowed)
     ]
     one = [
@@ -147,10 +161,30 @@ def _measured_counts(
     return Threads(min(decode, MAX_THREADS), min(batch, MAX_THREADS), ())
 
 
+def pinned_rate(
+    characteristics: Characteristics, model: ModelFacts, cpus: Sequence[int]
+) -> Optional[float]:
+    """The dominant format's weight bytes/s at one token, one thread pinned to each of CPUS."""
+    name, want = model.dominant_format.upper(), sorted(cpus)
+    for row in characteristics["compute"]["cpu"]:
+        if row["format"].upper() == name and sorted(row.get("cpus", ())) == want:
+            for point in row["points"]:
+                if point["tokens"] == 1 and point.get("weight_Bps", 0) > 0:
+                    return point["weight_Bps"]
+    return None
+
+
 def placement(
     characteristics: Characteristics, model: ModelFacts, runtime: RuntimeFacts, notes: list[str]
 ) -> tuple[Threads, tuple[int, ...], str]:
-    """The thread pools, the I/O CPUs and the reason for both."""
+    """The thread pools, the I/O CPUs and the reason for both.
+
+    Decode streams each expert's weights once a token, so it runs where one
+    token streams them fastest: on the performance cluster alone, pinned one
+    thread a CPU, when the profile measured that faster than every CPU;
+    otherwise on every allowed CPU but one, unpinned. A prompt pass computes,
+    so the batch pool always takes every allowed CPU but one, unpinned.
+    """
     logical = {row["id"] for row in characteristics["cpu"]["logical"]}
     allowed = sorted(set(runtime.cpus) & logical)
     if not allowed:
@@ -161,41 +195,41 @@ def placement(
     performance = _performance(characteristics)
     fast = [cpu for cpu in allowed if cpu in performance]
     slow = [cpu for cpu in allowed if cpu not in performance]
-    shape = f"{len(fast)} performance and {len(slow)} other" if fast and slow else "uniform"
-    unsplit = "" if fast and slow else "one CPU cluster"
-    if fast and slow and len(fast) < 3:
-        unsplit = f"{len(fast)} performance CPUs"
-    elif fast and slow:
-        io = fast[-1]
-        compute = [cpu for cpu in allowed if cpu != io]
-        lead = fast[:-1]
-        # The engine runs decode on the lowest CPU IDs of the strict mask.
-        if compute[: len(lead)] != lead:
-            unsplit = f"the performance CPUs {span(lead)} are not the lowest compute CPU IDs"
-        elif len(compute) > MAX_THREADS or compute[-1] > MAX_CPU:
-            unsplit = f"{len(compute)} compute CPUs up to CPU {compute[-1]} exceed a CPU mask"
-        else:
-            count = len(compute)
-            notes.append(
-                f"threads: split placement, {count} pinned threads on CPUs {span(compute)}, "
-                f"I/O on CPU {io}"
-            )
-            return (
-                Threads(count, count, tuple(compute)),
-                (io,),
-                f"split placement: I/O on CPU {io}, the last allowed CPU of the performance "
-                f"cluster {span(fast)}; compute on {span(compute)}",
-            )
     count = min(MAX_THREADS, max(1, len(allowed) - 1))
+    shape = f"{len(fast)} performance and {len(slow)} other" if fast and slow else "uniform"
+    why = "one CPU cluster"
+    if fast and slow:
+        name = model.dominant_format.upper()
+        on_fast = pinned_rate(characteristics, model, fast) if fast == sorted(performance) else None
+        on_all = (
+            pinned_rate(characteristics, model, allowed) if allowed == sorted(logical) else None
+        )
+        if on_fast is None or on_all is None:
+            why = f"no pinned one-token {name} measurement of the performance cluster and every CPU"
+        elif on_fast <= on_all:
+            why = (
+                f"every CPU streams {name} at one token as fast or faster "
+                f"({on_all / GB:.1f} against {on_fast / GB:.1f} GB/s pinned)"
+            )
+        elif fast[-1] > MAX_CPU:
+            why = f"the performance CPUs up to CPU {fast[-1]} exceed a CPU mask"
+        else:
+            reason = (
+                f"decode on the performance cluster {span(fast)}: pinned, one token streams "
+                f"{name} at {on_fast / GB:.1f} GB/s there against {on_all / GB:.1f} GB/s on every "
+                f"CPU; prefill on {count} unpinned threads; no I/O CPU"
+            )
+            notes.append("threads: " + reason)
+            return Threads(len(fast), count, (), tuple(fast)), (), reason
     notes.append(
         f"threads: all placement, {count} unpinned threads for the {len(allowed)} allowed CPUs "
-        f"{span(allowed)} ({shape}); no split: {unsplit}"
+        f"{span(allowed)} ({shape}); decode not on a cluster alone: {why}"
     )
     return (
         Threads(count, count, ()),
         (),
         f"all placement: no I/O CPU, {count} unpinned threads for the {len(allowed)} allowed "
-        f"CPUs {span(allowed)}; no split: {unsplit}",
+        f"CPUs {span(allowed)}; decode not on a cluster alone: {why}",
     )
 
 
@@ -207,14 +241,19 @@ def launch_conflicts(
     counts = [count for count in (threads.decode, threads.batch) if count is not None]
     if any(type(count) is not int or not 1 <= count <= MAX_THREADS for count in counts):
         found.append(f"thread counts must be integers in 1..{MAX_THREADS}")
-    cpus = threads.cpus
-    if len(set(cpus)) != len(cpus) or any(not 0 <= cpu <= MAX_CPU for cpu in cpus):
-        found.append(f"strict CPUs must be unique CPU IDs in 0..{MAX_CPU}")
-    if cpus and platform == "darwin":
+    cpus, decode_cpus = threads.cpus, threads.decode_cpus
+    for ids in (cpus, decode_cpus):
+        if len(set(ids)) != len(ids) or any(not 0 <= cpu <= MAX_CPU for cpu in ids):
+            found.append(f"strict CPUs must be unique CPU IDs in 0..{MAX_CPU}")
+    if cpus and decode_cpus:
+        found.append("a decode CPU set excludes a CPU set for both thread pools")
+    if (cpus or decode_cpus) and platform == "darwin":
         found.append("macOS cannot pin threads to CPUs")
     if cpus and any(count > len(cpus) for count in counts):
         found.append("thread counts exceed the strict CPUs")
-    if set(io) & set(cpus):
+    if decode_cpus and (threads.decode or 0) > len(decode_cpus):
+        found.append("the decode thread count exceeds the decode CPUs")
+    if set(io) & set(cpus + decode_cpus):
         found.append("cpu.io_cpus overlaps the strict compute CPUs")
     decode = threads.decode or (len(cpus) if cpus else None)
     if decode is not None and participants > decode:
@@ -261,9 +300,7 @@ def cpu_line(
     nearest one outside them.
     """
     names = [role.format.upper() for role in model.roles]
-    rows = {
-        (row["format"].upper(), row["threads"]): row for row in characteristics["compute"]["cpu"]
-    }
+    rows = {(row["format"].upper(), row["threads"]): row for row in _unpinned(characteristics)}
     missing = sorted(set(names) - {name for name, _ in rows})
     if missing:
         return None, "no CPU compute measurement of " + ", ".join(missing)
@@ -390,35 +427,54 @@ def link_rates(
     return terms, f"{gpu['name']} host-to-device " + (", ".join(parts) or "not measured")
 
 
-def _costs(
-    characteristics: Characteristics,
-    model: ModelFacts,
-    runtime: RuntimeFacts,
-    threads: int,
-    key: Optional[str],
-    notes: list[str],
-) -> Optional[tuple[str, str]]:
-    terms: dict[str, float] = {}
-    reasons: list[str] = []
-    line, why = cpu_line(characteristics, model, threads)
-    if line is not None:
-        terms["cpu_fixed_us"], terms["cpu_route_us"] = line
-        reasons.append(f"cpu {line[0]:.1f} + {line[1]:.2f} us a route for {why}")
-    notes.append(
-        "place.costs: cpu "
-        + (f"{line[0]:.1f} + {line[1]:.2f} us a route for " if line else "omitted, ")
-        + why
+def prefill_split(
+    model: ModelFacts, line: tuple[float, float], drive_gbps: float, io_gbps: float
+) -> tuple[Optional[int], str]:
+    """The longest prompt pass the CPU prefills no slower than the GPU graph, and why.
+
+    A pass of n tokens touches U(n) = E (1 - (1 - k/E)^n) of a layer's E
+    experts when each token routes to k of them uniformly. The CPU route reads
+    those experts from the drive while it computes them, n k routes a layer on
+    the CPU line, so it takes the longer of the two; the graph reads the same
+    experts into the GPU at the slower of the drive and the link, and its
+    compute is taken as free. The CPU is faster for short passes, while U(n)
+    still grows with n, and slower past the crossing. None when the GPU never
+    wins within MAX_PASS tokens.
+    """
+    k = model.experts_used
+    E, L, B = model.experts, model.layers, model.expert_read_bytes
+    fixed, route = line
+    if not k:
+        return None, "the GGUF header gives no experts per token"
+
+    def cpu_no_slower(n: int) -> bool:
+        touched = L * E * (1 - (1 - k / E) ** n)
+        read = touched * B / (drive_gbps * GB)
+        cpu = (touched * fixed + n * k * L * route) * 1e-6
+        return max(read, cpu) <= touched * B / (io_gbps * GB)
+
+    why = (
+        f"{L} layers of {E} experts, {k} a token, {size(B)} read an expert; CPU {fixed:.1f} + "
+        f"{route:.2f} us a route reading {drive_gbps:.2f} GB/s, "
+        f"GPU graph reading {io_gbps:.2f} GB/s"
     )
-    link, why = link_rates(characteristics, runtime)
-    terms.update(link)
-    if link:
-        reasons.append(why)
-    notes.append("place.costs: link " + ("" if link else "omitted, ") + why)
-    rate, why = drive_rate(characteristics, model, key)
-    if rate is not None:
-        terms["drive_gbps"] = rate
-        reasons.append(why)
-    notes.append("place.costs: drive " + ("" if rate is not None else "omitted, ") + why)
+    if not cpu_no_slower(1):
+        return 0, why
+    lo, hi = 1, 2
+    while cpu_no_slower(hi):
+        lo, hi = hi, hi * 2
+        if hi > MAX_PASS:
+            return None, why + f": the CPU is no slower up to {MAX_PASS} tokens"
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if cpu_no_slower(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo, why
+
+
+def _costs(terms: Mapping[str, float], reasons: Sequence[str]) -> Optional[tuple[str, str]]:
     if not terms:
         return None
     value = ",".join(f"{term}={number:.17g}" for term, number in sorted(terms.items()))
@@ -447,9 +503,34 @@ def derive(
     conflicts = launch_conflicts(threads, io, 0, platform)
     if conflicts or threads.batch is None:
         raise AssertionError("derived thread pools the launcher refuses: " + "; ".join(conflicts))
-    costs = _costs(characteristics, model, runtime, threads.batch, model_drive_key, notes)
+
+    terms: dict[str, float] = {}
+    reasons: list[str] = []
+    line, why = cpu_line(characteristics, model, threads.batch)
+    if line is not None:
+        terms["cpu_fixed_us"], terms["cpu_route_us"] = line
+        reasons.append(f"cpu {line[0]:.1f} + {line[1]:.2f} us a route for {why}")
+    notes.append(
+        "place.costs: cpu "
+        + (f"{line[0]:.1f} + {line[1]:.2f} us a route for " if line else "omitted, ")
+        + why
+    )
+    link, why = link_rates(characteristics, runtime)
+    terms.update(link)
+    if link:
+        reasons.append(why)
+    notes.append("place.costs: link " + ("" if link else "omitted, ") + why)
+    drive, why = drive_rate(characteristics, model, model_drive_key)
+    if drive is not None:
+        terms["drive_gbps"] = drive
+        reasons.append(why)
+    notes.append("place.costs: drive " + ("" if drive is not None else "omitted, ") + why)
+    costs = _costs(terms, reasons)
     if costs is not None:
         choices["place.costs"] = costs
+
+    one_pass = False
+    mixed = [role for role in model.roles if len(role.formats) > 1]
     if platform == "linux":
         listed = {
             gpu["uuid"]
@@ -462,6 +543,15 @@ def derive(
             extra = f", although the machine has {len(listed)}" if listed else ""
             choices["vram.budget"] = ("0", "no CUDA GPU is usable now" + extra)
             notes.append("vram.budget: 0, no CUDA GPU is usable now" + extra)
+        elif mixed:
+            # The VRAM tier and its prefill lane compute one expert format a role.
+            why = "the GPU tier computes one expert format a role, and this model's " + "; ".join(
+                f"{role.name} experts are "
+                + ", ".join(f"{name} in {n} layers" for name, n in role.formats)
+                for role in mixed
+            )
+            choices["vram.budget"] = ("0", why)
+            notes.append("vram.budget: 0, " + why)
         else:
             known = [gpu for gpu in runtime.gpus if gpu.uuid in listed]
             if known:
@@ -477,6 +567,49 @@ def derive(
                         f"vram.budget: {gpu.uuid} runs {gpu.processes} compute process(es); "
                         "the launch refuses a GPU in use"
                     )
+        device = next(
+            (
+                row
+                for row in characteristics["gpus"]
+                if runtime.gpus and len(runtime.gpus) == 1 and row["uuid"] == runtime.gpus[0].uuid
+            ),
+            None,
+        )
+        if device is not None and device["integrated"]:
+            choices["host.headroom_mib"] = (
+                str(UNIFIED_HEADROOM_MIB),
+                f"{device['name']} shares host memory: the smallest host margin that held under "
+                "stress with the automatic VRAM tier",
+            )
+            notes.append(f"host.headroom_mib: {UNIFIED_HEADROOM_MIB}, the GPU shares host memory")
+        rates = (
+            None
+            if device is None or line is None or drive is None
+            else (
+                drive,
+                drive if device["integrated"] else min(drive, link.get("link_gbps", drive)),
+            )
+        )
+        if rates is None:
+            notes.append(
+                "prefill: the CPU route for every pass and passes of the launch's batch; "
+                "no single profiled CUDA GPU with a CPU line and a drive rate"
+            )
+        else:
+            split, why = prefill_split(model, cast(tuple[float, float], line), *rates)
+            if split is None:
+                notes.append("prefill: the CPU route for every pass; " + why)
+            else:
+                choices["prefill.cpu_max_tokens"] = (
+                    str(split),
+                    f"the longest pass the CPU prefills no slower than the GPU graph: {why}",
+                )
+                notes.append(f"prefill.cpu_max_tokens: {split}; {why}")
+            one_pass = True
+            notes.append(
+                "prefill: one pass a prompt, -b and -ub as large as the context; a pass reads "
+                "every expert it routes to once"
+            )
     if platform in ("darwin", "windows") and runtime.memory_budget_bytes:
         mib = runtime.memory_budget_bytes >> 20
         if mib:
@@ -485,11 +618,12 @@ def derive(
                 f"the memory budget of {runtime.memory_budget_bytes} bytes",
             )
             notes.append(f"host.budget_mib: {mib} from the memory budget")
-    notes.append("server: --ctx-checkpoints 0")
+    notes.append("server: " + " ".join(SERVER_ARGS))
     return Strategy(
         settings=_validated(choices, platform),
         threads=threads,
         server_args=SERVER_ARGS,
         inputs=Inputs(hashlib.sha256(text.encode()).hexdigest(), model.paths, platform),
         notes=tuple(notes),
+        one_pass=one_pass,
     )
