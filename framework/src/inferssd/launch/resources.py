@@ -3,11 +3,24 @@
 from __future__ import annotations
 
 import json
+import ntpath
+import posixpath
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from inferssd.configuration.settings import PLATFORMS
+
+# A checkout's build directories, searched in this order: the presets first,
+# then the conventional ad hoc ones.
+BUILDS = {
+    "linux": ("build-linux-cuda", "build-linux-cpu", "build"),
+    "darwin": ("build-macos-metal", "build-mac", "build"),
+    "windows": ("build-x64-windows-llvm-release", "build"),
+}
+# The machine probes by the name a resource descriptor's probes map gives them.
+PROBES = {"ssd": "inferssd-ssdprobe", "cpu": "inferssd-cpuprobe", "memory": "inferssd-memprobe"}
 
 
 @dataclass(frozen=True)
@@ -64,3 +77,56 @@ def read_resources(path: Path) -> EngineResources:
         platform,
         revision,
     )
+
+
+def executable(platform: str, name: str) -> str:
+    return name + ".exe" if platform == "windows" else name
+
+
+def server_binary(
+    platform: str,
+    binary: Optional[str],
+    resources: Optional[EngineResources],
+    repo: str,
+    is_file: Callable[[str], bool],
+) -> Optional[str]:
+    """The server executable: BINARY, else the descriptor's, else the first REPO build with one.
+
+    Without one in any build, the first build's path is named, so the error
+    names where it was expected. None when there is nowhere to look.
+    """
+    path = binary or (resources.binary if resources else None)
+    if path or not repo:
+        return path
+    join = ntpath.join if platform == "windows" else posixpath.join
+    server = executable(platform, "inferssd-server")
+    candidates = [join(repo, name, "bin", server) for name in BUILDS[platform]]
+    return next((candidate for candidate in candidates if is_file(candidate)), candidates[0])
+
+
+def probe_paths(
+    platform: str,
+    binary: Optional[str],
+    resources: Optional[EngineResources],
+    repo: str,
+    is_file: Callable[[str], bool],
+) -> dict[str, str]:
+    """Each probe found: next to the server BINARY, else in the descriptor, else in a REPO build.
+
+    The repo's builds are searched in the order the server is. A probe found
+    nowhere is left out.
+    """
+    join = ntpath.join if platform == "windows" else posixpath.join
+    dirname = ntpath.dirname if platform == "windows" else posixpath.dirname
+    named = dict(resources.probes) if resources else {}
+    found = {}
+    for name, program in PROBES.items():
+        filename = executable(platform, program)
+        candidates = [join(dirname(binary), filename)] if binary else []
+        candidates += [named[name]] if name in named else []
+        if repo:
+            candidates += [join(repo, build, "bin", filename) for build in BUILDS[platform]]
+        path = next((candidate for candidate in candidates if is_file(candidate)), None)
+        if path is not None:
+            found[name] = path
+    return found

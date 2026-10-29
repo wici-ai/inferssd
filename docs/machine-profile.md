@@ -1,11 +1,14 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 # Machine profile
 
-`inferssd profile` measures this machine once and keeps the result in a
-characteristics file. The file describes the machine only: its CPUs, memory,
-NVIDIA GPUs and the drives that hold models. It holds no model data, no
-placement and no cache sizes; those depend on the model and are worked out
-later from the model's GGUF header and this file.
+InferSSD measures each machine once and keeps the result in a characteristics
+file. The file describes the machine only: its CPUs, memory, NVIDIA GPUs and
+the drives that hold models. It holds no model data, no placement and no cache
+sizes; each launch works those out from the model's GGUF header and this file.
+
+You do not need to run anything for this: the first `inferssd launch` on a
+machine measures it, and later launches reuse the file (see
+[launches](#launches)). `inferssd profile` measures or shows it on its own.
 
 Linux and macOS are supported. Windows is not supported yet.
 
@@ -38,6 +41,44 @@ failed. It exits with status 1 when a section measured in this run failed (the
 file is still saved, with the reason recorded), and with status 2 on a usage
 error, a `--model` path without files, or when another `inferssd profile` is
 running.
+
+## Launches
+
+Before `inferssd launch --execute` starts the server, it checks that the
+characteristics file exists and is current for this machine and for the drive
+that holds the model. When it is not, the launch measures what is missing
+first, printing its progress on stderr. On a new machine this takes one to
+three minutes; later launches find the file current and measure nothing.
+
+The launch finds the probes next to the server executable, then in the
+[engine resource descriptor](engine-resources.md)'s `probes` map, then in the
+checkout's build directories. A probe that is missing or fails is reported as
+a warning: its section is recorded as failed and the launch continues without
+what it would have measured.
+
+| Option | Meaning |
+| --- | --- |
+| `--reprofile` | Measure every section again before launching. |
+| `--machine PATH` | Use this characteristics file as it is and measure nothing, for example one file measured once and shared by several runs. A dry-run reads it too. |
+
+Each launch then combines the file with the model's GGUF header and with what
+it reads at that moment (the CPUs it may use, the usable GPUs and their free
+memory, the available memory) to choose:
+
+- the decode and prefill thread counts and, where the CPUs allow it, which
+  CPUs the compute threads and the I/O thread use;
+- the starting estimates the engine uses to place experts between the CPU and
+  the GPU (it refines them as it runs);
+- `vram.budget = 0` when no CUDA GPU is usable, and on macOS the host memory
+  budget from the runtime policy.
+
+None of these changes the model's output. The launch fills only the settings
+you left at their defaults and the thread options you did not give: a value
+from `--set`, from the settings file or from `--threads`, `--batch-threads` or
+`--cpus` always wins, and a choice that contradicts one of your values is left
+out. Every choice and its reason is written to `strategy.json` in the run
+directory and to the settings file the launch generates. Windows launches do
+not use a profile yet.
 
 ## What is measured
 

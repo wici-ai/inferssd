@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from inferssd.contracts import ContractError
-from inferssd.launch.resources import read_resources
+from inferssd.launch.resources import PROBES, read_resources
 from inferssd.machine.characteristics import (
     COUNT,
     GPU,
@@ -44,11 +44,7 @@ from inferssd.machine.characteristics import (
 )
 from inferssd.machine.identity import Drive
 
-EXECUTABLES = {
-    "ssd": "inferssd-ssdprobe",
-    "cpu": "inferssd-cpuprobe",
-    "memory": "inferssd-memprobe",
-}
+EXECUTABLES = PROBES
 TIMEOUT_S = {"ssd": 1800.0, "cpu": 1800.0, "memory": 900.0}
 # The profile describes the whole machine, so a probe sees every device.
 HIDDEN = {"memory": ("CUDA_VISIBLE_DEVICES",)}

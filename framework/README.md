@@ -35,7 +35,7 @@ python3 -m pip install ./framework
 
 Use `--settings FILE` for the versioned registry-defined configuration and repeat
 `--set key=literal` for explicit overrides. CLI values take precedence over file
-values, then registry defaults. Comments following a file value are preserved as
+values, then the launch's own choices for this machine, then registry defaults. Comments following a file value are preserved as
 source receipts. The generated native file contains file/generated values;
 CLI-origin values become the matching registry-generated native `--ssd-*` option
 so native effective telemetry preserves that priority. There is no environment
@@ -47,6 +47,20 @@ server's ggml threadpools and adds only its I/O, prefetch-reader and watch
 threads, which `cpu.io_cpus` places. `--threads` and `--batch-threads` select the
 decode `-t` and prefill `-tb` counts; `--cpus LIST` pins both pools one thread per
 CPU.
+
+An executed launch measures the machine before its first launch and reuses the
+result afterwards (`--reprofile` measures again; `--machine PATH` uses a given
+characteristics file and measures nothing); see [machine profile](../docs/machine-profile.md).
+From that file, the model's GGUF header and the CPUs, GPUs and memory it finds
+at that moment, the launch chooses thread counts, CPU placement, `place.costs`
+and, without a usable CUDA GPU, `vram.budget = 0` (on macOS also
+`host.budget_mib` from the runtime policy). It fills only settings left at their
+registry defaults and thread options not given, so explicit values always win.
+The choices are written to the generated `settings.ssd` with `source=strategy`
+receipts and to `strategy.json`, with the values your settings kept and the
+choices left out because they contradicted them. Context checkpoints are off
+(`--ctx-checkpoints 0`) unless you set them with `--ctx-checkpoints` or
+`LLAMA_ARG_CTX_CHECKPOINTS`.
 
 ```text
 inferssd-settings 1
@@ -76,7 +90,12 @@ inferssd launch --dry-run --platform linux --repo . \
 ```
 
 Recorded host facts are consumed lazily without falling back to the current
-machine. Every platform requires `platform_system` (`Linux`, `Darwin` or
+machine. A recording with `machine_characteristics` (an `inferssd-machine/1`
+object, or `--machine PATH`) also derives the launch's choices; it then needs
+`runtime_facts` (`cpus`, `gpus` as `{uuid, free_bytes, processes}` or `null`,
+`available_bytes`), and may give `model_drive_key` and `model_facts` (read from
+the model's headers when absent). Without `machine_characteristics` the dry-run
+resolves exactly as before. Every platform requires `platform_system` (`Linux`, `Darwin` or
 `Windows`); Darwin also requires `platform_machine=arm64`. Linux uses
 `cgroup_v2`, `euid`, and for non-root scope creation `user_manager` and
 `memory_controller`. GPU-enabled Linux settings also require `gpu_available`

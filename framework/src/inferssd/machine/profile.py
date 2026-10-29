@@ -21,6 +21,7 @@ import posixpath
 import sys
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from inferssd.configuration.settings import cpus
@@ -62,7 +63,7 @@ from inferssd.machine.probes import (
     skipped_devices,
     storage_entry,
 )
-from inferssd.machine.store import CPU_GROUP, plan_refresh
+from inferssd.machine.store import CPU_GROUP, Refresh, plan_refresh
 from inferssd.source.header import SHARD
 
 MIN_FILE_BYTES = 1 << 30
@@ -387,17 +388,30 @@ def measure_drive(
     return entry, section(start, clock(), f"{method}, {entry['reader']} reader", "ok")
 
 
-def profile(
+@dataclass(frozen=True)
+class Survey:
+    """What a profile run would measure: the live identity, the model drives and the plan."""
+
+    identity: Identity
+    gpu_failure: str  # why nvidia-smi failed, or ""
+    saved_unified: bool  # the saved file's unified memory, kept while the GPUs are unknown
+    drives: dict[str, tuple[Drive, list[tuple[str, int]]]]
+    refresh: Refresh
+
+    @property
+    def current(self) -> bool:
+        """Nothing needs measuring: a saved profile can be used as it is."""
+        return not self.refresh.sections and not self.refresh.stale_storage
+
+
+def survey(
     host: Host,
-    probes: Probes,
     model_paths: Sequence[str],
     previous: Optional[Characteristics] = None,
     reprofile: bool = False,
-    clock: Clock = time.time,
     progress: Progress = stderr_progress,
-) -> Characteristics:
-    """New characteristics; PREVIOUS itself when nothing needs measuring."""
-    progress("reading machine identity")
+) -> Survey:
+    """Read the live identity and the model drives, and plan what to measure. Runs no probe."""
     gpu_failure, saved_unified = "", False
     try:
         identity = live_identity(host)
@@ -413,7 +427,33 @@ def profile(
     refresh = plan_refresh(previous, identity, list(drives), reprofile)
     if gpu_failure:
         refresh = refresh.including("gpus", "nvidia-smi failed")
-    if previous is not None and not refresh.sections and not refresh.stale_storage:
+    return Survey(identity, gpu_failure, saved_unified, drives, refresh)
+
+
+def profile(
+    host: Host,
+    probes: Probes,
+    model_paths: Sequence[str],
+    previous: Optional[Characteristics] = None,
+    reprofile: bool = False,
+    clock: Clock = time.time,
+    progress: Progress = stderr_progress,
+    surveyed: Optional[Survey] = None,
+) -> Characteristics:
+    """New characteristics; PREVIOUS itself when nothing needs measuring.
+
+    SURVEYED, when given, is the survey of these same arguments made just before.
+    """
+    if surveyed is None:
+        progress("reading machine identity")
+        surveyed = survey(host, model_paths, previous, reprofile, progress)
+    identity, gpu_failure, saved_unified = (
+        surveyed.identity,
+        surveyed.gpu_failure,
+        surveyed.saved_unified,
+    )
+    drives, refresh = surveyed.drives, surveyed.refresh
+    if previous is not None and surveyed.current:
         progress("the saved profile is up to date")
         return previous
     for name, reason in refresh.sections:

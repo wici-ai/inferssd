@@ -18,7 +18,17 @@ from dataclasses import dataclass
 from typing import Optional, Protocol, cast
 
 from inferssd.configuration.settings import cpus as cpu_list
+from inferssd.contracts import ContractError
 from inferssd.machine import identity
+from inferssd.machine.characteristics import (
+    COUNT,
+    POSITIVE,
+    TEXT,
+    Check,
+    array,
+    nullable,
+    record,
+)
 from inferssd.source import header as gguf_header
 from inferssd.source.experts import ROLE, is_role, widened
 from inferssd.source.files import LOCAL_FILES, SourceFiles
@@ -148,6 +158,99 @@ def model_facts(path: str, *, filesystem: SourceFiles = LOCAL_FILES) -> ModelFac
     return facts_from_headers(gguf_header.read_model(path, filesystem=filesystem))
 
 
+def shard_facts(paths: Sequence[str], *, filesystem: SourceFiles = LOCAL_FILES) -> ModelFacts:
+    """ModelFacts of exactly the shards PATHS, in their order."""
+    return facts_from_headers([gguf_header.read(path, filesystem=filesystem) for path in paths])
+
+
+def _type_counts(value: object, field: str) -> None:
+    """A nonempty list of [ggml type name, positive count] pairs."""
+    if not isinstance(value, list) or not value:
+        raise ContractError(f"{field} must be a nonempty array")
+    for index, item in enumerate(value):
+        if not isinstance(item, list) or len(item) != 2 or item[0] not in BLOCKS:
+            raise ContractError(f"{field}[{index}] must be [a ggml type name, a count]")
+        POSITIVE(item[1], f"{field}[{index}][1]")
+
+
+PAIRS: Check = _type_counts
+ROLE_RECORD = record({"formats": PAIRS, "rows": POSITIVE, "cols": POSITIVE})
+MODEL_RECORD = record(
+    {
+        "paths": array(TEXT, minimum=1),
+        "architecture": nullable(TEXT),
+        "layers": POSITIVE,
+        "experts": POSITIVE,
+        "experts_used": nullable(POSITIVE),
+        "roles": record({role: ROLE_RECORD for role in ROLES}),
+        "expert_bytes": POSITIVE,
+        "expert_read_bytes": POSITIVE,
+        "dense_bytes": COUNT,
+        "format_bytes": PAIRS,
+    }
+)
+
+
+def _pairs(value: Sequence[tuple[str, int]]) -> list[list[object]]:
+    return [[name, count] for name, count in value]
+
+
+def model_facts_json(facts: ModelFacts) -> dict[str, object]:
+    """FACTS as a JSON object; model_facts_from reads it back."""
+    return {
+        "paths": list(facts.paths),
+        "architecture": facts.architecture,
+        "layers": facts.layers,
+        "experts": facts.experts,
+        "experts_used": facts.experts_used,
+        "roles": {
+            role.name: {"formats": _pairs(role.formats), "rows": role.rows, "cols": role.cols}
+            for role in facts.roles
+        },
+        "expert_bytes": facts.expert_bytes,
+        "expert_read_bytes": facts.expert_read_bytes,
+        "dense_bytes": facts.dense_bytes,
+        "format_bytes": _pairs(facts.format_bytes),
+    }
+
+
+def _ranked_pairs(value: object) -> tuple[tuple[str, int], ...]:
+    return tuple((name, count) for name, count in cast(list[tuple[str, int]], value))
+
+
+def model_facts_from(value: object) -> ModelFacts:
+    """ModelFacts from their JSON object; errors name the offending field."""
+    MODEL_RECORD(value, "model_facts")
+    item = cast(dict[str, object], value)
+    roles = cast(dict[str, dict[str, object]], item["roles"])
+    built = {
+        name: Role(
+            name,
+            _ranked_pairs(roles[name]["formats"]),
+            cast(int, roles[name]["rows"]),
+            cast(int, roles[name]["cols"]),
+        )
+        for name in ROLES
+    }
+    for role in built.values():
+        if any(role.cols % BLOCKS[name][0] for name, _ in role.formats):
+            raise ContractError(f"model_facts.roles.{role.name}: cols fit no block of its types")
+    return ModelFacts(
+        paths=tuple(cast(list[str], item["paths"])),
+        architecture=cast(Optional[str], item["architecture"]),
+        layers=cast(int, item["layers"]),
+        experts=cast(int, item["experts"]),
+        experts_used=cast(Optional[int], item["experts_used"]),
+        gate=built["gate"],
+        up=built["up"],
+        down=built["down"],
+        expert_bytes=cast(int, item["expert_bytes"]),
+        expert_read_bytes=cast(int, item["expert_read_bytes"]),
+        dense_bytes=cast(int, item["dense_bytes"]),
+        format_bytes=_ranked_pairs(item["format_bytes"]),
+    )
+
+
 def model_drive_key(paths: Sequence[str], host: Optional[identity.Host] = None) -> Optional[str]:
     """The storage key of the drive holding most of the model's bytes, or None when unknown."""
     live = host or identity.NativeHost()
@@ -195,14 +298,70 @@ class Host(identity.Host, Protocol):
     def environment(self) -> Mapping[str, str]: ...
 
 
+GPU_RECORD = record({"uuid": TEXT, "free_bytes": nullable(COUNT), "processes": COUNT})
+RUNTIME_RECORD = record(
+    {
+        "cpus": array(COUNT, minimum=1),
+        "gpus": nullable(array(GPU_RECORD)),
+        "available_bytes": nullable(COUNT),
+    },
+    {"memory_budget_bytes": nullable(POSITIVE)},
+)
+
+
+def runtime_facts_json(facts: RuntimeFacts) -> dict[str, object]:
+    """FACTS as a JSON object; runtime_facts_from reads it back."""
+    return {
+        "cpus": list(facts.cpus),
+        "gpus": None
+        if facts.gpus is None
+        else [
+            {"uuid": gpu.uuid, "free_bytes": gpu.free_bytes, "processes": gpu.processes}
+            for gpu in facts.gpus
+        ],
+        "available_bytes": facts.available_bytes,
+        "memory_budget_bytes": facts.memory_budget_bytes,
+    }
+
+
+def runtime_facts_from(value: object) -> RuntimeFacts:
+    """RuntimeFacts from their JSON object; errors name the offending field."""
+    RUNTIME_RECORD(value, "runtime_facts")
+    item = cast(dict[str, object], value)
+    cpus = cast(list[int], item["cpus"])
+    if len(set(cpus)) != len(cpus):
+        raise ContractError("runtime_facts.cpus must not repeat a CPU")
+    gpus = cast(Optional[list[dict[str, object]]], item["gpus"])
+    return RuntimeFacts(
+        tuple(cpus),
+        None
+        if gpus is None
+        else tuple(
+            GPUState(
+                cast(str, gpu["uuid"]),
+                cast(Optional[int], gpu["free_bytes"]),
+                cast(int, gpu["processes"]),
+            )
+            for gpu in gpus
+        ),
+        cast(Optional[int], item["available_bytes"]),
+        cast(Optional[int], item.get("memory_budget_bytes")),
+    )
+
+
 class NativeHost(identity.NativeHost):
+    """This host; ENVIRONMENT, the launch's (default: this process's), selects the CUDA GPUs."""
+
+    def __init__(self, environment: Optional[Mapping[str, str]] = None) -> None:
+        self.env = environment
+
     def affinity(self) -> Optional[tuple[int, ...]]:
         if not hasattr(os, "sched_getaffinity"):
             return None
         return tuple(sorted(os.sched_getaffinity(0)))
 
     def environment(self) -> Mapping[str, str]:
-        return os.environ
+        return os.environ if self.env is None else self.env
 
 
 def visible_gpus(listed: Sequence[tuple[int, str]], value: Optional[str]) -> list[tuple[int, str]]:

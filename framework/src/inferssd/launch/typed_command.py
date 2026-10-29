@@ -18,6 +18,7 @@ from inferssd.launch.recorded import RecordedArtifacts, run_indexer
 from inferssd.launch.resources import read_resources
 from inferssd.launch.typed import PROFILES, LaunchSpec, resolve_typed
 from inferssd.launch.types import LaunchInput, Output, Threads
+from inferssd.machine.characteristics import dumps, load
 from inferssd.platform.policy import Policy
 from inferssd.platform.run_directory import reserve
 
@@ -69,11 +70,22 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
         help="pin both ggml threadpools one thread per CPU, e.g. 0-6 (default: unpinned)",
     )
     launch.add_argument("--result", type=Path, help="dry-run resolution receipt")
+    launch.add_argument(
+        "--reprofile",
+        action="store_true",
+        help="measure this machine again before launching (the first launch measures it)",
+    )
+    launch.add_argument(
+        "--machine",
+        type=Path,
+        metavar="PATH",
+        help="use this machine characteristics file as it is, without measuring",
+    )
     launch.add_argument("extra", nargs=argparse.REMAINDER)
     launch.set_defaults(mode="server")
 
 
-def specification(args: argparse.Namespace) -> LaunchSpec:
+def specification(args: argparse.Namespace, *, strategy: bool = False) -> LaunchSpec:
     overrides = []
     for item in args.overrides:
         key, equal, value = item.partition("=")
@@ -93,6 +105,7 @@ def specification(args: argparse.Namespace) -> LaunchSpec:
         Threads(args.threads, args.batch_threads, args.cpus),
         str(args.template.resolve()) if args.template else None,
         read_resources(args.resources) if args.resources else None,
+        strategy,
     )
 
 
@@ -118,6 +131,10 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError(
             "owned execution supports linux and darwin; prepare a windows launch with --dry-run"
         )
+    if args.machine is not None and args.reprofile:
+        raise ValueError("--machine is used as it is; --reprofile measures this machine instead")
+    if args.dry_run and args.reprofile:
+        raise ValueError("--reprofile measures this machine; a dry-run never observes it")
     launch_input = inputs(args)
     if args.output_dir is None:
         args.output_dir = default_output_directory()
@@ -133,6 +150,8 @@ def run(args: argparse.Namespace) -> int:
     host = json.loads(args.host_facts.read_text(encoding="utf-8"))
     if not isinstance(host, dict):
         raise ValueError("recorded host facts must be an object")
+    if args.machine is not None:
+        host = dict(host, machine_characteristics=dumps(load(args.machine)))
     data = json.loads(args.runtime_policy.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("runtime policy must be an object")
@@ -151,7 +170,8 @@ def run(args: argparse.Namespace) -> int:
         launch_input,
         resolver=partial(
             resolve_typed,
-            spec=specification(args),
+            # A recording with machine characteristics derives the strategy from them.
+            spec=specification(args, strategy="machine_characteristics" in host),
             platform=args.platform,
             directory=str(claim.directory),
             memory=policy.memory_budget_bytes,

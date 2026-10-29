@@ -18,7 +18,9 @@ from typing import Any, Optional
 
 from inferssd.launch.darwin import PROFILES
 from inferssd.launch.types import Fact, LaunchInput, Reply
+from inferssd.machine import characteristics
 from inferssd.source import experts
+from inferssd.strategy import inputs as strategy_inputs
 
 
 def metadata(name: str, arguments: tuple[str, ...]) -> Reply:
@@ -188,6 +190,13 @@ class RecordedArtifacts:
                     replace=self.replace,
                 )
             )
+        if name == "model_facts" and name not in self.host:
+            # Read from the model's own headers, as the alias index is.
+            header = strategy_inputs.shard_facts(args)
+            return Reply(strategy_inputs.model_facts_json(header))
+        if name in ("machine_characteristics", "model_drive_key") and name not in self.host:
+            # Absent: no strategy, or no drive term in it.
+            return Reply(None)
         if name == "systemd" and name not in self.host:
             # Recordings made before this fact existed came from systemd hosts.
             return Reply(True)
@@ -213,6 +222,28 @@ class RecordedArtifacts:
             "platform_machine",
         }
         converted = {"default_threads", "physical_memory", "disk_free"}
+        if name == "machine_characteristics":
+            # An inferssd-machine/1 object, or its text; the resolver gets canonical text.
+            try:
+                if isinstance(value, str):
+                    return Reply(characteristics.dumps(characteristics.loads(value)))
+                return Reply(characteristics.dumps(characteristics.validate(value)))
+            except ValueError as error:
+                raise ValueError(f"Recorded host fact {name}: {error}") from error
+        if name in ("model_facts", "runtime_facts"):
+            # Serialised strategy inputs, read back strictly and written out again.
+            try:
+                if name == "model_facts":
+                    facts = strategy_inputs.model_facts_from(value)
+                    return Reply(strategy_inputs.model_facts_json(facts))
+                runtime = strategy_inputs.runtime_facts_from(value)
+                return Reply(strategy_inputs.runtime_facts_json(runtime))
+            except ValueError as error:
+                raise ValueError(f"Recorded host fact {name}: {error}") from error
+        if name == "model_drive_key":
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"Recorded host fact {name}: expected text or null")
+            return Reply(value)
         if name in boolean:
             if not isinstance(value, bool):
                 raise ValueError(f"Recorded host fact {name}: expected a JSON boolean")

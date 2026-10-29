@@ -74,7 +74,10 @@ accept the eleven schema-listed `name=value` terms separated by commas or
 whitespace; values must be finite, nonnegative and at most 1e6, with positive
 `link_gbps`. Omitted cost terms retain the executor priors until measured.
 
-The precedence is command line > file > registry defaults. A file must have
+The precedence is command line > file > registry defaults. `inferssd launch`
+fills keys still at their registry default with choices for the machine (see
+[machine profile](machine-profile.md#launches)) before it writes the native
+file. A file must have
 exactly the v1 header. Duplicate file keys, unknown keys, wrong types, bad ranges
 and dependency errors fail with key/source context; later CLI occurrences win.
 Trailing file comments are retained exactly after the `#` byte. CLI overrides

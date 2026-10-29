@@ -12,8 +12,9 @@ from typing import Optional, cast
 
 from inferssd.configuration.settings import PLATFORMS, Setting, Snapshot, parse, render, uncomment
 from inferssd.launch.darwin import MODEL_OPTIONS
-from inferssd.launch.resources import EngineResources
+from inferssd.launch.resources import EngineResources, server_binary
 from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
+from inferssd.strategy.launch import Planned, plan
 
 # Each model profile's chat template: a bundled template replaces the GGUF's,
 # and None keeps the template in the GGUF. The expert count comes from the model.
@@ -38,6 +39,9 @@ class LaunchSpec:
     threads: Threads = Threads()
     template: Optional[str] = None
     resources: Optional[EngineResources] = None
+    # Derive the launch strategy from the machine characteristics fact. Without
+    # it the launch resolves from its settings and options alone.
+    strategy: bool = False
 
 
 def reject_legacy_environment(environment: Mapping[str, str]) -> None:
@@ -237,17 +241,9 @@ def _resolve(
     resources = spec.resources
     if resources is not None and resources.platform not in (None, platform):
         raise ValueError("engine resource platform differs from the selected platform")
-    binary_path = spec.binary or (resources.binary if resources else None)
-    if not binary_path and s.inputs.repo:
-        # Preset build directories first, then the conventional ad hoc ones.
-        builds = {
-            "linux": ("build-linux-cuda", "build-linux-cpu", "build"),
-            "darwin": ("build-macos-metal", "build-mac", "build"),
-            "windows": ("build-x64-windows-llvm-release", "build"),
-        }[platform]
-        server = "inferssd-server.exe" if platform == "windows" else "inferssd-server"
-        candidates = [os_path.join(s.inputs.repo, name, "bin", server) for name in builds]
-        binary_path = next((c for c in candidates if s.value("is_file", c)), candidates[0])
+    binary_path = server_binary(
+        platform, spec.binary, resources, s.inputs.repo, lambda path: bool(s.value("is_file", path))
+    )
     if not binary_path:
         raise ValueError("provide --binary or an engine resource descriptor")
     binary = s.text("resolved_path", binary_path)
@@ -288,6 +284,13 @@ def _resolve(
                 for item in value.entries
             ),
         )
+    planned: Optional[Planned] = None
+    if spec.strategy:
+        # The strategy fills what the user left unset; the checks below see the result.
+        planned = plan(s, platform, memory, paths, value, spec.threads)
+        value, threads = planned.settings, threadpools(planned.threads, platform)
+        if any(argument in protected for argument in planned.server_args[::2]):
+            raise ValueError("the launch strategy names a protected server option")
     if not value.at("expert.source").value:
         if value.at("expert.source").origin != "default":
             raise ValueError("typed launch requires a nonempty explicit expert.source")
@@ -345,6 +348,9 @@ def _resolve(
     settings = os_path.join(directory, "settings.ssd")
     telemetry = os_path.join(directory, "native-events.jsonl")
     s.ask("write_exclusive", settings, materialized_settings(value))
+    if planned is not None:
+        receipt = json.dumps(planned.receipt, ensure_ascii=False, indent=2) + "\n"
+        s.ask("write_exclusive", os_path.join(directory, "strategy.json"), receipt)
     command = [binary, "-m", model, "--ssd-settings", settings, "--ssd-telemetry", telemetry]
     for item in value.entries:
         if item.origin == "cli":
@@ -404,27 +410,26 @@ def _resolve(
     # Elsewhere Flash Attention keeps the server's auto choice, on for each layer
     # whose device runs it (every CPU layer), and the settings' host.budget_mib,
     # passed as given, bounds the process in place of a scope.
+    if planned is not None:
+        command += list(planned.server_args)
     command += list(s.inputs.extra)
     s.argv = command
-    s.emit(
-        json.dumps(
-            {
-                "settings": settings,
-                "telemetry": telemetry,
-                "effective": value.document(),
-                "launch": {
-                    "decode_threads": threads.decode,
-                    "batch_threads": threads.batch,
-                    "cpus": list(threads.cpus),
-                    "context": spec.context,
-                    "batch": spec.batch,
-                    "ubatch": spec.ubatch,
-                },
-            },
-            ensure_ascii=False,
-        )
-        + "\n"
-    )
+    output: dict[str, object] = {
+        "settings": settings,
+        "telemetry": telemetry,
+        "effective": value.document(),
+        "launch": {
+            "decode_threads": threads.decode,
+            "batch_threads": threads.batch,
+            "cpus": list(threads.cpus),
+            "context": spec.context,
+            "batch": spec.batch,
+            "ubatch": spec.ubatch,
+        },
+    }
+    if planned is not None:
+        output["strategy"] = planned.receipt
+    s.emit(json.dumps(output, ensure_ascii=False) + "\n")
 
 
 def resolve_typed(

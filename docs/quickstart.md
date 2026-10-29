@@ -33,7 +33,7 @@ Build the Metal backend and describe the resulting deployment:
 
 ```sh
 cmake --preset macos-metal
-cmake --build build-macos-metal --target inferssd-server --parallel 4
+cmake --build build-macos-metal --target inferssd-server inferssd-cpuprobe inferssd-ssdprobe --parallel 4
 python3 scripts/engine-resources.py \
   --build build-macos-metal --output engine-resources.json
 ```
@@ -50,7 +50,8 @@ Install `liburing-dev` on Debian/Ubuntu, or your distribution's equivalent. The 
 
 ```sh
 cmake --preset linux-cuda
-cmake --build build-linux-cuda --target inferssd-server --parallel 4
+cmake --build build-linux-cuda --parallel 4 \
+  --target inferssd-server inferssd-cpuprobe inferssd-ssdprobe inferssd-memprobe
 python3 scripts/engine-resources.py \
   --build build-linux-cuda --output engine-resources.json
 ```
@@ -69,13 +70,17 @@ The launcher checks these before it starts the server and reports the first one 
 
 ## Prepare a launch
 
-The public entry point is `inferssd launch`. It takes a settings file, a deployment descriptor and a runtime policy:
+The public entry point is `inferssd launch`. It takes a deployment descriptor, a runtime policy and, optionally, a settings file.
 
-1. Write a settings file with every setting at its default, then adjust it using the [configuration guide](configuration.md):
+The first launch on a machine starts by measuring it: CPUs, memory, GPUs and the drive that holds the model. This takes one to three minutes and prints its progress; the result is saved, and later launches reuse it. Each launch then chooses thread counts, CPU placement and similar machine-dependent settings from that measurement and the model. These choices do not change the model's output. The launch finds the measuring tools next to `inferssd-server`, which is why the build commands above build them too. See [machine profile](machine-profile.md) for what is measured, `--reprofile` and `--machine`.
+
+1. Settings are optional. A settings file fixes every value it lists, so list only the values you want to fix; the rest are chosen for your machine at each launch. To see every setting and its default, write them all to a separate file and copy the lines you need, as described in the [configuration guide](configuration.md):
 
    ```sh
-   inferssd configuration write --output settings.ssd
+   inferssd configuration write --output settings-defaults.ssd
    ```
+
+   Pass your own file with `--settings settings.ssd`.
 
 2. Copy the example runtime policy for your platform, then set `memory_budget_bytes` and `host_reserve_bytes` for your machine:
 
@@ -93,7 +98,6 @@ For DeepSeek:
 inferssd launch --execute \
   --resources engine-resources.json \
   --model /path/to/model-00001-of-00010.gguf --profile dsv \
-  --settings settings.ssd \
   --runtime-policy runtime-policy.json \
   --context 8192 --batch 512 --ubatch 512
 ```
