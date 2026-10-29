@@ -90,7 +90,7 @@ The protected runner config may carry `comparison_bindings` with exactly `tiny`,
 `deepseek` and `muse`. Each model's binding is a JSON object with:
 
 - `schema_version: 1`, `kind: "legacy-to-typed"`.
-- `semantic_settings`: all keys of the explicitly bound 14- or 16-key registry generation, including inapplicable platform
+- `semantic_settings`: all keys of the reviewed 14-key registry generation, including inapplicable platform
   defaults. Values must have the registry's actual JSON types.
 - `sides.base` and `sides.candidate`: full `revision`, `profile_sha256`, complete
   `launch_policy`, `images` and `build` objects. The base must be exactly
@@ -131,8 +131,9 @@ bound by the full profile/build identity and is not added to the library list
 when the native wrapper excludes it.
 
 `build` has `server_target`, `binary_relative`, `image_relatives`, and
-`template_relatives` (exactly the three model keys). Paths must be safe source/build
-relative paths. `build_spec(binding, side, revision)` returns a copy for the trusted
+`template_relatives` (a nonempty subset of the three model keys; the Muse checkpoint
+needs `muse`). Paths must be safe source/build relative paths.
+`build_spec(binding, side, revision)` returns a copy for the trusted
 build owner; it never edits source or chooses defaults. Supported explicit server
 targets are `llama-server`, `inferssd`, and `inferssd-server`.
 

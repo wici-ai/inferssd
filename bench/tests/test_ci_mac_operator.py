@@ -108,7 +108,7 @@ def mac_raw(tmp_path):
         lsof="p123\nu62002\nftxt\nn" + binary + "\nfmem\nn" + frozen + "/lib/libggml.dylib\nfmem\nn/usr/lib/libSystem.B.dylib\nftxt\nn/Library/InferSSD-CI/models/frozen/model.gguf\n")
     stopped = dict(common, running=False, state="failed", reason="requested stop", returncode=0, cleanup_confirmed=True,
                    cleanup=dict(confirmed=True, remaining=[], worker_user_domain_retired=dict(returncode=0)))
-    native = {"expert.source":[frozen + "/assets/source.tsv"], "cpu.threads":4}
+    native = {"expert.source":[frozen + "/assets/source.tsv"], "host.budget_mib":4096}
     effective = dict(ambient_environment=launch["environment"], native_resource_policy=RESOURCES,
         native_resource_enforcement="root-sampled-worker-physical-footprint-processes-host-reserve",
         native_launch_policy=dict(template_sha256="c" * 64, typed_values=dict(native, **{"expert.source":["<sealed-build>/assets/source.tsv"]})),
@@ -301,7 +301,7 @@ def test_mac_source_alias_is_exact_for_each_current_job_side(mac_raw):
     side = copy.deepcopy(config["sides"]["candidate"])
     side["paths"]["frozen"] = frozen
     build = json.loads((root / "build-candidate/build-receipt.json").read_text().replace("/frozen/candidate", "/frozen/base"))
-    expected = {"expert.source":["<sealed-build>/assets/source.tsv"], "cpu.threads":4}
+    expected = {"expert.source":["<sealed-build>/assets/source.tsv"], "host.budget_mib":4096}
     actual = dict(expected, **{"expert.source":[frozen + "/assets/source.tsv"]})
     manifest = root / "build-candidate/freeze-manifest.json"
     assert receipt.retained_typed_settings(actual, expected, side, "deepseek", build, manifest, MANIFEST)

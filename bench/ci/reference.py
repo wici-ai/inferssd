@@ -7,8 +7,6 @@ turn operator-reviewed source defaults into claimed runtime telemetry.
 
 import copy
 import hashlib
-import importlib
-import importlib.util
 import json
 import subprocess
 from pathlib import Path, PurePosixPath
@@ -17,14 +15,12 @@ from ci.contract import HASH, MODELS, revision
 
 LEGACY_REVISION = "f5e6e26ff26d2014cccef0118048039b88163f54"
 SETTING_KEYS = frozenset((
-    "expert.source", "cpu.threads", "cpu.compute_cpus", "cpu.io_cpus",
-    "cpu.decode_participants", "prefetch.depth", "place.costs",
-    "prefill.cpu_max_tokens", "vram.budget", "vram.max_slots",
-    "vram.reserve_mib", "vram.margin_mib", "host.headroom_mib",
-    "host.expert_cache_mib",
+    "expert.source", "cpu.io_cpus", "cpu.decode_participants", "prefetch.depth",
+    "place.costs", "prefill.cpu_max_tokens", "vram.budget", "vram.max_slots",
+    "vram.reserve_mib", "vram.margin_mib", "host.headroom_mib", "host.budget_mib",
+    "model.engram_prefetch", "model.hc_fused",
 ))
-MODEL_SETTING_KEYS = frozenset(("model.engram_prefetch", "model.hc_fused"))
-SETTING_GENERATIONS = (SETTING_KEYS, SETTING_KEYS | MODEL_SETTING_KEYS)
+SETTING_GENERATIONS = (SETTING_KEYS,)
 
 
 def identity(value):
@@ -47,13 +43,11 @@ def relative(value):
 
 
 def validate_semantics(values):
-    package = "inferssd" if importlib.util.find_spec("inferssd") is not None else "ssdash"
-    registry = importlib.import_module(package + ".configuration.settings")
-    schema, typed = registry.schema, registry.typed
+    from inferssd.configuration.settings import schema, typed
 
     properties = schema()["properties"]
     if frozenset(properties) not in SETTING_GENERATIONS or frozenset(values) not in SETTING_GENERATIONS:
-        raise ValueError("reference adapter requires an explicit reviewed 14- or 16-key schema")
+        raise ValueError("reference adapter requires the explicit reviewed 14-key schema")
     if not set(values) <= set(properties):
         raise ValueError("installed settings registry cannot validate this binding generation")
     for key, value in values.items():
@@ -168,7 +162,7 @@ def validate_binding(binding):
             or not isinstance(binding["semantic_settings"], dict)
             or frozenset(binding["semantic_settings"]) not in SETTING_GENERATIONS
             or not isinstance(binding["sides"], dict) or set(binding["sides"]) != {"base", "candidate"}):
-        raise ValueError("explicit legacy-to-typed binding with all 14 or 16 settings required")
+        raise ValueError("explicit legacy-to-typed binding with all 14 settings required")
     identity(binding)
     validate_semantics(binding["semantic_settings"])
     for side, spec in binding["sides"].items():

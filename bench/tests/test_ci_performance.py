@@ -29,7 +29,7 @@ def pair():
         "model_identity": {"shards": [{"sha256": "b" * 64}]},
         "host": {"hardware": "synthetic", "os": "synthetic", "memory_budget_bytes": 1024,
                  "os_page_cache_treatment": "uncontrolled",
-                 "effective_settings": {"native_launch_policy": {"typed_values": {"cpu.threads": 2}}}},
+                 "effective_settings": {"native_launch_policy": {"typed_values": {"prefetch.depth": 2}}}},
         "build": {"loaded_libraries": [{"path": "libsynthetic.so"}]},
         "server": {"pid": 1, "start_identity": "base"},
     }

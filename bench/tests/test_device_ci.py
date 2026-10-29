@@ -250,7 +250,7 @@ def synthetic_device(tmp_path, device, plan, policy):
             receipt = load(parent / "512/wrapper.json")
             receipt["server"]["start_identity"] = side
             receipt["host"]["effective_settings"]["native_launch_policy"] = {
-                "typed_values": {"cpu.threads": 2},
+                "typed_values": {"prefetch.depth": 2},
                 "args": [],
             }
             (parent / "512/wrapper.json").write_text(json.dumps(receipt))
@@ -585,7 +585,7 @@ def test_driver_builds_and_validates_both_sources_before_single_attempt_cells(
         receipt = load(target / "512/wrapper.json")
         receipt["server"]["start_identity"] = cfg["revision"]
         receipt["host"]["effective_settings"]["native_launch_policy"] = {
-            "typed_values": {"cpu.threads": 2}
+            "typed_values": {"prefetch.depth": 2}
         }
         (target / "512/wrapper.json").write_text(json.dumps(receipt))
         result = load(target / "512/result.json")

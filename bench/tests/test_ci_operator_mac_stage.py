@@ -45,7 +45,7 @@ def mac_prepared_fixture(tmp_path, source):
             settings_path = "/Library/InferSSD-CI/inputs/old/settings-" + model + "-" + side + ".ssd"
             name = "mac-" + model + "-" + side + ".ssd"
             raw = ('inferssd-settings 1\nexpert.source = ["/Library/InferSSD-CI/jobs/{{job_id}}/frozen/' + side +
-                   '/assets/' + model + '-alias.tsv"]\nhost.expert_cache_mib = 4096\n').encode()
+                   '/assets/' + model + '-alias.tsv"]\nhost.budget_mib = 4096\n').encode()
             (tmp_path / name).write_bytes(raw)
             assets["settings-" + model + "-" + side + ".ssd"] = name
             data["settings"].update(host_path=settings_path, runtime_path=settings_path, sha256=prepare.digest(tmp_path / name))
