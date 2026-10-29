@@ -135,7 +135,7 @@ jobs:
           set -o pipefail
           # The sink and grouped prefill against ggml reference graphs, bit for bit, on ggml threadpools of
           # 1 to 3 threads, with the store, read ring and platform layer they run on.
-          ctest --test-dir build-macos-metal --output-on-failure --no-tests=error -R '^(kimi_cpu_sink|kimi_cpu_sink_threadpool|kimi_cpu_sink_threadpool_poll|kimi_cpu_sink_activation_t2_d1_ready1|kimi_cpu_sink_swiglu|kimi_cpu_sink_registered|kimi_cpu_prefill|kimi_cpu_prefill_graph|kimi_cpu_prefill_registered|ssd_source_index|ssd_read_ring|ssd_platform_threads|ssd_platform_memory|test-llama-mmap-dontneed)$' | tee mac-tests.log
+          ctest --test-dir build-macos-metal --output-on-failure --no-tests=error -R '^(kimi_cpu_sink|kimi_cpu_sink_threadpool|kimi_cpu_sink_threadpool_poll|kimi_cpu_sink_activation_t2_d1_ready1|kimi_cpu_sink_swiglu|kimi_cpu_sink_muse_q8_0|kimi_cpu_sink_muse_bf16|kimi_cpu_sink_registered|kimi_cpu_prefill|kimi_cpu_prefill_graph|kimi_cpu_prefill_registered|ssd_source_index|ssd_read_ring|ssd_platform_threads|ssd_platform_memory|test-llama-mmap-dontneed)$' | tee mac-tests.log
           if grep -E '\bSKIP\b|\*\*\*Not Run|\*\*\*Skipped' mac-tests.log; then exit 1; fi
           (cd engine && ../build-macos-metal/bin/test-chat --template muse-spark)
       - name: Quantized CPU operator checks on Apple Silicon

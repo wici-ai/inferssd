@@ -77,9 +77,9 @@ bool compare(llm_arch arch, float clamp, const llama_ssd::expert_inputs & in, in
     ++comparisons;
     if (actual.accepted) {
         const auto & out = actual.execution;
-        CHECK(out.activation == (arch == LLM_ARCH_QWEN4EXP ? llama_ssd::expert_activation::swiglu :
-            llama_ssd::expert_activation::swiglu_clamp));
-        CHECK(same_bits(out.clamp, arch == LLM_ARCH_MUSE_SPARK ? INFINITY : old_clamp));
+        CHECK(out.activation == (arch == LLM_ARCH_DEEPSEEK41 ? llama_ssd::expert_activation::swiglu_clamp :
+            llama_ssd::expert_activation::swiglu));
+        CHECK(same_bits(out.clamp, old_clamp));
         CHECK(out.post_norm == (in.post_norm != nullptr));
         CHECK(same_bits(out.post_norm_eps, in.post_norm_eps));
         CHECK(same_bits(out.routed_scale, in.routed_scale == 0.0f ? 1.0f : in.routed_scale));

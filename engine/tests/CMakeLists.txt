@@ -428,6 +428,11 @@ if (TARGET ggml-cpu)
     add_test(NAME kimi_cpu_sink_swiglu_ordinary COMMAND test-kimi-cpu-sink --swiglu-tests --ring-experts 1
         --fixture ready_first=0)
     set_tests_properties(kimi_cpu_sink_swiglu kimi_cpu_sink_swiglu_ordinary PROPERTIES TIMEOUT 300)
+    # Muse Spark's experts with their post norm (Q8_0; BF16, also from native payload ranges and the RAM cache) in
+    # decode and grouped prefill, against the MoE graph Muse builds, bit for bit.
+    add_test(NAME kimi_cpu_sink_muse_q8_0 COMMAND test-kimi-cpu-sink --muse-q8-test --threads 2)
+    add_test(NAME kimi_cpu_sink_muse_bf16 COMMAND test-kimi-cpu-sink --muse-bf16-test --threads 2)
+    set_tests_properties(kimi_cpu_sink_muse_q8_0 kimi_cpu_sink_muse_bf16 PROPERTIES TIMEOUT 180)
     # A decode microbenchmark, not a CTest: test-kimi-sink-bench --help.
     add_executable(test-kimi-sink-bench ssd/test-kimi-sink-bench.cpp)
     target_include_directories(test-kimi-sink-bench PRIVATE ../ggml/src ../ggml/src/ggml-cpu)

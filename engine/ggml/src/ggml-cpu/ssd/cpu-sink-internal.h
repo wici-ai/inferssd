@@ -4,12 +4,12 @@
 #include <cmath>
 #include "ggml-ssd/telemetry/telemetry.h"
 
-// Matches mul(weight) followed by RMS normalization, then route scaling.
+// Matches mul(weight) followed by ggml_rms_norm, which squares in float and sums in double, then route scaling.
 inline void kimi_cpu_sink_normalize_expert(float * values, int rows, const float * norm, float eps) {
     double sum = 0.0;
     for (int row = 0; row < rows; ++row) {
         values[row] *= norm[row];
-        sum += double(values[row]) * values[row];
+        sum += double(values[row] * values[row]);
     }
     const float scale = 1.0f / std::sqrt(float(sum / rows) + eps);
     for (int row = 0; row < rows; ++row) { values[row] *= scale; }

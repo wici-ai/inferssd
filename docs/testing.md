@@ -100,9 +100,9 @@ require model runs. Launcher and metadata validation tests run with
 `python3 -m pytest -q tests/integration/test-macos-launcher.py`.
 
 The Mac CI build enables Metal and runs a hosted-runner subset of those suites:
-the sink at one to three ggml threads, its SITU, SWIGLU_CLAMP and SWIGLU activations
-and grouped prefill, bit for bit against ggml reference graphs, the prefill llama
-graph, and the store's source index, read ring and platform layer. It also
+the sink at one to three ggml threads, its SITU, SWIGLU_CLAMP and SWIGLU activations,
+Muse Spark's experts with their post norm and grouped prefill, bit for bit against
+ggml reference graphs, the prefill llama graph, and the store's source index, read ring and platform layer. It also
 exercises Muse rendering with `test-chat --template muse-spark` and checks the
 Q4_K/Q5_K/Q8_0 CPU `MUL_MAT_ID` cases. This is a compilation and synthetic
 correctness gate. The separate target-device gate still needs matched model token

@@ -2236,6 +2236,8 @@ static std::vector<float> reference_moe_graph(const fixture & f, int layer, cons
     ggml_tensor * act = nullptr;
     if (activation.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) {
         act = ggml_swiglu_clamp(ctx, gate, up, activation.swiglu_limit);
+    } else if (activation.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+        act = ggml_swiglu_split(ctx, gate, up);
     } else {
         const float beta = activation.situ_beta, lb = activation.situ_linear_beta;
         act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f / beta)), beta);
@@ -3046,9 +3048,9 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
     std::printf("CPU_SINK_ACTIVATION_OK threads=%d ring_experts=%d refusals=%d\n", threads, depth, refusals);
 }
 
-// Native Muse expert semantics against an independent ordinary ggml MoE graph. Different
-// norm weights/epsilons and 3- and 65-token prefills catch normalization after the sum,
-// missing norm weights, and the grouped slot-order sum.
+// Native Muse expert semantics against the ordinary ggml MoE graph Muse builds (ggml_swiglu_split, then mul and
+// rms_norm by the post norm), bit for bit. Different norm weights/epsilons and 3- and 65-token prefills catch
+// normalization after the sum, missing norm weights, and the grouped slot-order sum.
 static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int depth, ggml_type type, bool native_ranges = false) {
     scoped_fixture_input ready(inputs, "ready_first", "1");
     fixture f; f.type = f.down_type = type; make_synthetic(f, 20261017);
@@ -3081,19 +3083,13 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
     }
     const std::vector<int32_t> ids = { 9, 1, native_ranges ? 19 : 17, 6, 3, 12, 0, 15 };
     const std::vector<float> weights = { .21f, .19f, .15f, .13f, .11f, .09f, .07f, .05f };
-    kimi_cpu_sink_activation activation = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP,
-        0.0f, 0.0f, std::numeric_limits<float>::infinity(), norm.data(), 1e-8f };
+    kimi_cpu_sink_activation activation = { KIMI_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, norm.data(), 1e-8f };
     char error[512] = {};
     auto compare = [&](const std::vector<float> & actual, const std::vector<float> & expected) {
-        require(actual.size() == expected.size(), "Muse Q8 output size");
-        double maximum = 0;
-        for (size_t i = 0; i < actual.size(); ++i) {
-            const double diff = std::abs(double(actual[i]) - expected[i]);
-            maximum = std::max(maximum, diff);
-            require(std::isfinite(actual[i]) && diff <= 3e-5 + 3e-5 * std::abs(expected[i]),
-                "Muse Q8 expert post norm mismatch at " + std::to_string(i));
-        }
-        std::printf("MUSE_EXPERT_COMPARE type=%s native_ranges=%d values=%zu max_abs=%.9g PASS\n", ggml_type_name(type), int(native_ranges), actual.size(), maximum);
+        require(actual.size() == expected.size(), "Muse output size");
+        require(!std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)),
+            "Muse experts with their post norm differ from the graph");
+        std::printf("MUSE_EXPERT_COMPARE type=%s native_ranges=%d values=%zu bit_exact=1 PASS\n", ggml_type_name(type), int(native_ranges), actual.size());
     };
     for (float eps : { 1e-8f, .2f }) {
         activation.post_exp_norm_eps = eps;
@@ -3107,23 +3103,27 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
             "Muse Q8 decode I/O counters");
     }
     auto * prefill = kimi_cpu_prefill_create(sink.get(), error, sizeof(error)); require(prefill, error);
-    for (int tokens : { 3, 65 }) {
-        std::vector<float> x, w, expected;
-        std::vector<int32_t> selected;
-        for (int token = 0; token < tokens; ++token) {
-            auto xt = input; auto it = ids;
-            for (auto & value : xt) { value += float(token) * .003f; }
-            for (auto & id : it) { id = (id + token) % f.experts; }
-            auto y = reference_moe_graph(f, 1, xt, it, weights, activation, 1);
-            x.insert(x.end(), xt.begin(), xt.end()); selected.insert(selected.end(), it.begin(), it.end());
-            w.insert(w.end(), weights.begin(), weights.end()); expected.insert(expected.end(), y.begin(), y.end());
+    // both epsilons: one far above the mean square, which hides how the squares are rounded
+    for (float eps : { 1e-8f, .2f }) {
+        activation.post_exp_norm_eps = eps;
+        for (int tokens : { 3, 65 }) {
+            std::vector<float> x, w, expected;
+            std::vector<int32_t> selected;
+            for (int token = 0; token < tokens; ++token) {
+                auto xt = input; auto it = ids;
+                for (auto & value : xt) { value += float(token) * .003f; }
+                for (auto & id : it) { id = (id + token) % f.experts; }
+                auto y = reference_moe_graph(f, 1, xt, it, weights, activation, 1);
+                x.insert(x.end(), xt.begin(), xt.end()); selected.insert(selected.end(), it.begin(), it.end());
+                w.insert(w.end(), weights.begin(), weights.end()); expected.insert(expected.end(), y.begin(), y.end());
+            }
+            std::vector<float> actual(expected.size()); kimi_cpu_prefill_stats stats = {};
+            require(kimi_cpu_prefill_run_activation(prefill, meta.role[0], meta.role[1], meta.role[2],
+                x.data(), selected.data(), w.data(), 8, tokens, &activation, actual.data(), &stats, error, sizeof(error)), error);
+            compare(actual, expected);
+            require(stats.stream.pending_reads == 0 && !stats.stream.read_errors && !stats.stream.fallback_count,
+                "Muse Q8 prefill I/O counters");
         }
-        std::vector<float> actual(expected.size()); kimi_cpu_prefill_stats stats = {};
-        require(kimi_cpu_prefill_run_activation(prefill, meta.role[0], meta.role[1], meta.role[2],
-            x.data(), selected.data(), w.data(), 8, tokens, &activation, actual.data(), &stats, error, sizeof(error)), error);
-        compare(actual, expected);
-        require(stats.stream.pending_reads == 0 && !stats.stream.read_errors && !stats.stream.fallback_count,
-            "Muse Q8 prefill I/O counters");
     }
     kimi_cpu_prefill_destroy(prefill);
     if (native_ranges) {
