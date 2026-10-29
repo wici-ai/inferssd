@@ -64,11 +64,11 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/include/ggml-backend.h` | 58 | 0 |
 | `ggml/include/ggml-cuda.h` | 23 | 0 |
 | `ggml/include/ggml-rpc.h` | 2 | 2 |
-| `ggml/include/ggml.h` | 106 | 1 |
+| `ggml/include/ggml.h` | 158 | 1 |
 | `ggml/src/CMakeLists.txt` | 2 | 0 |
 | `ggml/src/ggml-alloc.c` | 38 | 2 |
 | `ggml/src/ggml-backend-impl.h` | 5 | 0 |
-| `ggml/src/ggml-backend-meta.cpp` | 14 | 1 |
+| `ggml/src/ggml-backend-meta.cpp` | 29 | 1 |
 | `ggml/src/ggml-backend.cpp` | 386 | 64 |
 | `ggml/src/ggml-blas/ggml-blas.cpp` | 1 | 0 |
 | `ggml/src/ggml-cann/ggml-cann.cpp` | 1 | 0 |
@@ -76,10 +76,10 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-cpu/CMakeLists.txt` | 8 | 0 |
 | `ggml/src/ggml-cpu/arch/arm/quants.c` | 0 | 1 |
 | `ggml/src/ggml-cpu/arch/x86/quants.c` | 138 | 7 |
-| `ggml/src/ggml-cpu/ggml-cpu.c` | 3692 | 3650 |
+| `ggml/src/ggml-cpu/ggml-cpu.c` | 3708 | 3650 |
 | `ggml/src/ggml-cpu/ggml-cpu.cpp` | 144 | 6 |
-| `ggml/src/ggml-cpu/ops.cpp` | 539 | 12 |
-| `ggml/src/ggml-cpu/ops.h` | 4 | 0 |
+| `ggml/src/ggml-cpu/ops.cpp` | 751 | 12 |
+| `ggml/src/ggml-cpu/ops.h` | 6 | 0 |
 | `ggml/src/ggml-cpu/quants.c` | 1 | 0 |
 | `ggml/src/ggml-cpu/quants.h` | 7 | 0 |
 | `ggml/src/ggml-cpu/unary-ops.cpp` | 271 | 1 |
@@ -94,7 +94,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-cuda/fattn-common.cuh` | 35 | 7 |
 | `ggml/src/ggml-cuda/fattn.cu` | 10 | 0 |
 | `ggml/src/ggml-cuda/fattn.cuh` | 3 | 0 |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1433 | 125 |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1430 | 125 |
 | `ggml/src/ggml-cuda/mmq.cu` | 54 | 3 |
 | `ggml/src/ggml-cuda/mmq.cuh` | 28 | 10 |
 | `ggml/src/ggml-cuda/mmvf.cu` | 22 | 0 |
@@ -124,7 +124,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-webgpu/ggml-webgpu.cpp` | 1 | 0 |
 | `ggml/src/ggml-zdnn/ggml-zdnn.cpp` | 1 | 0 |
 | `ggml/src/ggml-zendnn/ggml-zendnn.cpp` | 1 | 0 |
-| `ggml/src/ggml.c` | 272 | 8 |
+| `ggml/src/ggml.c` | 374 | 8 |
 | `ggml/src/gguf.cpp` | 7 | 0 |
 | `include/llama.h` | 88 | 1 |
 | `src/CMakeLists.txt` | 20 | 0 |
@@ -134,16 +134,16 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-context.h` | 150 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
-| `src/llama-graph.cpp` | 753 | 49 |
+| `src/llama-graph.cpp` | 757 | 50 |
 | `src/llama-graph.h` | 158 | 5 |
 | `src/llama-hparams.cpp` | 21 | 0 |
-| `src/llama-hparams.h` | 72 | 1 |
+| `src/llama-hparams.h` | 73 | 1 |
 | `src/llama-impl.h` | 35 | 0 |
 | `src/llama-kv-cache-iswa.cpp` | 41 | 3 |
 | `src/llama-kv-cache-iswa.h` | 28 | 0 |
-| `src/llama-kv-cache.cpp` | 317 | 132 |
-| `src/llama-kv-cache.h` | 64 | 2 |
-| `src/llama-kv-cells.h` | 132 | 25 |
+| `src/llama-kv-cache.cpp` | 327 | 132 |
+| `src/llama-kv-cache.h` | 70 | 4 |
+| `src/llama-kv-cells.h` | 140 | 25 |
 | `src/llama-memory-recurrent.cpp` | 41 | 1 |
 | `src/llama-memory-recurrent.h` | 2 | 0 |
 | `src/llama-memory.h` | 70 | 0 |
@@ -152,7 +152,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-model-loader.cpp` | 164 | 7 |
 | `src/llama-model-loader.h` | 36 | 0 |
 | `src/llama-model-saver.cpp` | 7 | 2 |
-| `src/llama-model.cpp` | 1035 | 39 |
+| `src/llama-model.cpp` | 1093 | 39 |
 | `src/llama-model.h` | 107 | 0 |
 | `src/llama-quant.cpp` | 22 | 1 |
 | `src/llama-sampler.cpp` | 1 | 0 |
@@ -160,7 +160,11 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-vocab.h` | 5 | 0 |
 | `src/llama.cpp` | 4 | 1 |
 | `src/models/deepseek2.cpp` | 10 | 4 |
-| `src/models/models.h` | 152 | 0 |
+| `src/models/kimi-linear.cpp` | 2 | 2 |
+| `src/models/models.h` | 165 | 0 |
+| `src/models/qwen35.cpp` | 2 | 2 |
+| `src/models/qwen35moe.cpp` | 2 | 2 |
+| `src/models/qwen3next.cpp` | 2 | 2 |
 | `tools/server/CMakeLists.txt` | 13 | 5 |
 | `tools/server/server-chat.cpp` | 66 | 16 |
 | `tools/server/server-common.cpp` | 288 | 5 |
@@ -170,5 +174,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 16444 added, 5659 removed across 139 upstream paths.
+Total: 16948 added, 5670 removed across 143 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
