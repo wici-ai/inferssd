@@ -5,7 +5,7 @@
     "client.py": "a5dc802adfdf3619df6fea1aba40b353e1e1a4218d38b164d73cd30e45de8acc",
     "disconnect-client.py": "697049afb7b62eb5927c52edcfa0cfc1e583debe441305a2ed55a7ecc1e74c49",
     "disconnect.py": "44ee53e4f097bdf97278db88b66e964b77ac0b2bca986c7afaa7300a22d94617",
-    "executor.py": "2262032020f03d220006618329d54026f7a712bb8d454122dfdeec66a7369020",
+    "executor.py": "913ae5820ef2f17bab5d3ff29aa23896ff03c6157b3ba0eb9b6c8001402d8c6e",
     "install.py": "1a9b080c0e22bfd2447272db5bb2ffc7e7cef58b1f97367adcc81fd50a8bb0d6",
     "metal-probe.mm": "920e836b0d325df93a9cacf535bd45479f23d305750e58af99c192c1006d5077",
     "operator_entry.py": "0e172569e3d48a263472cb4565415eb471cac55567b4affb68675bd933d3c0bd",
@@ -20,7 +20,7 @@
     "tests/test_recover.py": "dea6b16a6b71e907747e49907d68a8146bcb49bf9d33875fd4c9593cfdcf0d07",
     "verify.py": "bac8ea9880ea8712ca5ce6f5eedef6c1d77ea50f39635f9afb383b3eb1420fb5",
     "verify_broker.py": "785fa7d10d0f87dcd6a5de1880054349e6f6e34f27b058ebd2a67ed63d70c044",
-    "worker.sb": "a92acf749f96710421fb3f9d756e77dfa70de2e5f64be8ddea637cd59204630c"
+    "worker.sb": "a089fa1852c674de34b40efc895cca88e1114477485df28e56ccae5adc951c7a"
   },
   "status": "public-template-adjusted-native-rerun-required"
 }
