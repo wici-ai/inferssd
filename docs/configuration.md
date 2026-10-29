@@ -82,3 +82,67 @@ Output creation is exclusive, and supplied receipts survive round-trip rendering
 Settings are never translated to environment variables. `inferssd launch --execute`
 passes the settings file to the server with `--ssd-settings`, and each setting
 with a command-line origin as the matching `--ssd-*` option.
+
+## Exact model optimization rules
+
+`model.optimizations` is a typed `strings` array in the same settings snapshot.
+Its registry default is `[]`: no new optimization overrides are enabled. Both
+`inferssd configuration write --set` and native `--ssd-model-optimizations`
+accept the JSON array literal; launch forwards it through `--ssd-settings` or
+its typed CLI override, without environment variables. For example:
+
+```text
+inferssd-settings 1
+model.optimizations = ["reviewed-example|off|example-uuid|deepseek41|36|2|Example GPU|1|0"]
+```
+
+This is a **disabled synthetic example**, not a validated model or recommended
+setting. Each string has exactly nine `|`-separated fields:
+
+```text
+rule_id|off_or_on|general.uuid|general.architecture|general.file_type|general.quantization_version|hardware|engram_prefetch|hc_fused
+```
+
+Use the exact scalar values from the loaded GGUF metadata. `hardware` is the
+semicolon-joined backend device descriptions in the loaded model's device
+order. This scope does not identify the host CPU, driver version or firmware;
+a future candidate sensitive to those must extend the binding before enabling it.
+Effective values are visible in the native startup `model options` log
+and, when telemetry is enabled, the `ssd.model.options` event. An empty device
+list or missing identity/quantization metadata cannot match. All identity fields
+must match exactly; filenames, launch profile names, model families, substrings
+and wildcards do not participate. Models without `general.uuid` retain their
+existing settings. The UUID must have been validated against the exact model
+artifact and quantization, including mixed tensor types; metadata is an identity
+claim, not an integrity check of the weights.
+
+`off` keeps a rule inactive. `on` is the operator's explicit declaration that the
+exact model, quantization, hardware and **final gated source** have been validated;
+the runtime does not certify benchmark evidence. Do not enable an unvalidated
+entry. Each option is `0`, `1`, or `-` to keep its existing setting. Options
+currently gate the existing Engram read-ahead and fused hyper-connection graph
+paths in `engine/src/models/deepseek41.cpp`. Matching rule values overlay file
+settings; explicit per-option native/launch CLI values win. Existing direct
+`model.engram_prefetch` and `model.hc_fused` settings and the launcher's existing
+`dsv` defaults retain their behavior when rules are absent, disabled or unmatched.
+
+Resolution happens in each native `llama_context`, before graph construction,
+from its owned immutable snapshot and loaded model facts. It changes only that
+context's graph options. Consecutive and simultaneous contexts do not share a
+mutable feature flag. The startup receipt includes all match fields, the matched
+rule ID (empty on fallback), and both effective options. Malformed rules,
+duplicate IDs and multiple enabled matching rules reject context creation rather
+than choosing an arbitrary winner. There are at most 64 rules, each at most 4096
+bytes; empty fields, `*`, newlines and invalid option/state values are rejected.
+The configuration parser checks the typed array; semantic rule validation occurs
+at native context creation before graph execution.
+
+No production rule is shipped or hardware validated by this infrastructure
+change, and no speedup is claimed. CPU build, native resolver/settings/context
+ownership tests, cross-language schema/round-trip tests and production launch
+materialization tests use synthetic fixtures, not model benchmarks. No allocator
+or THP policy is changed. A future process-global allocator candidate needs a
+separate context-specific opt-in allocation integration, fallback and tests;
+adding a rule alone cannot make a process-global operation model-local. Future
+features must add real consumer gates and measure the final gated code, with
+correctness and exact source/model/settings/hardware evidence recorded separately.

@@ -12,7 +12,7 @@
 namespace ssd {
 namespace settings {
 
-enum class kind { integer, paths, cpus, costs, budget };
+enum class kind { integer, paths, strings, cpus, costs, budget };
 
 struct budget {
     bool     automatic;

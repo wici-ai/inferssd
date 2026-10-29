@@ -18,6 +18,21 @@
 
 **Run models larger than your RAM or VRAM.** InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run **DeepSeek-V4.1-Flash-1017** and **Muse-Spark-Open** from SSD. Expert packs, bounded caches, and prompt batching reduce the cost of accessing weights while retaining GGUF, browser chat, and an OpenAI-compatible API.
 
+## Model-specific configuration
+
+The typed settings registry now accepts default-empty `model.optimizations`
+rules. Native contexts resolve exact loaded GGUF UUID, architecture, file type,
+quantization version and runtime hardware matches into the existing Engram and
+hyper-connection graph options. Unknown, unmatched and disabled rules preserve
+existing settings and launch defaults; explicit per-option CLI values win.
+See [configuration syntax and limits](docs/configuration.md#exact-model-optimization-rules).
+Effective match fields and options appear in native startup logs and telemetry.
+
+No production optimization rule is enabled or newly hardware validated. The
+native CPU build, resolver/context ownership tests and typed Python/native
+configuration and launch tests use synthetic fixtures; they establish no speedup.
+Allocator/THP optimizations require a separate context-specific gated integration.
+
 ## Performance benchmarks
 
 **4K prompt tier · 256 output tokens · decode measured over tokens 129–256.** The 4K label describes the prompt tier, not the model's context-window capacity; actual input token counts depend on the chat template.

@@ -107,7 +107,7 @@ result<cost_table> cost_values(const std::string & literal) {
 
 result<value> typed(const descriptor & d, std::string literal) {
     literal = trim(literal);
-    if (!literal.empty() && literal.front() == '"' && d.type != kind::paths) {
+    if (!literal.empty() && literal.front() == '"' && d.type != kind::paths && d.type != kind::strings) {
         if (d.type == kind::integer) {
             return failure<value>(status::invalid, "integer must not be quoted");
         }
@@ -493,6 +493,7 @@ result<std::string> schema_json() noexcept {
                                 d.type == kind::budget  ? "budget" :
                                 d.type == kind::costs   ? "costs" :
                                 d.type == kind::paths   ? "paths" :
+                                d.type == kind::strings ? "strings" :
                                                           "cpus";
 
             out += json::quote(d.key) + ":{\"description\":" + json::quote(d.description) +
@@ -518,7 +519,7 @@ result<std::string> schema_json() noexcept {
                            (name == "link_gbps" ? "\"exclusiveMinimum\":0}" : "\"minimum\":0}");
                 }
                 out += '}';
-            } else if (d.type == kind::paths) {
+            } else if (d.type == kind::paths || d.type == kind::strings) {
                 out += ",\"type\":\"array\",\"items\":{\"type\":\"string\",\"minLength\":1}";
             } else {
                 out +=

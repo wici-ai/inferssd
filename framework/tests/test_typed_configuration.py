@@ -65,6 +65,7 @@ def test_registry_generated_schema_exact(native_contract):
         ),
         ("darwin", "inferssd-settings 1\nhost.expert_cache_mib=12288\ncpu.threads=8\n"),
         ("linux", 'inferssd-settings 1\nexpert.source=["/path-\u2028-file"]\n'),
+        ("linux", 'inferssd-settings 1\nmodel.optimizations=["example|off|uuid|deepseek41|36|2|Example GPU|1|0"]\n'),
     ],
 )
 def test_cpp_python_snapshot_exact(native_contract, tmp_path, platform, text):

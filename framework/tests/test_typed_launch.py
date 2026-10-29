@@ -504,3 +504,16 @@ def test_deepseek_profile_materializes_model_policy_and_preserves_explicit_value
     native = parse((out / "settings.ssd").read_text(), overrides=spec.overrides)
     assert native.at("model.engram_prefetch").value == expected
     assert native.at("model.hc_fused").value == expected
+
+
+def test_model_rules_reach_native_settings_without_profile_inference(tmp_path):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    rule = "fixture|off|example-uuid|deepseek41|36|2|Example GPU|1|0"
+    source = Path(spec.settings_file)
+    source.write_text(source.read_text() + "model.optimizations=" + json.dumps([rule]) + "\n")
+    resolve(inputs, spec, adapter, out)
+    # The production materialized file is the native --ssd-settings input.
+    files = list(out.glob("*.ssd"))
+    assert files
+    assert any(parse(path.read_text(), str(path)).at("model.optimizations").value == (rule,)
+               for path in files)
