@@ -167,7 +167,10 @@ REPORTS: Mapping[str, Check] = {
                 )
             ),
         },
-        {"skipped": array(record({"format": TEXT, "reason": TEXT}, extra=True))},
+        {
+            "skipped": array(record({"format": TEXT, "reason": TEXT}, extra=True)),
+            "cpus": array(COUNT),
+        },
         extra=True,
     ),
     "memory": record(
@@ -301,7 +304,9 @@ def dram_rates(report: Any) -> list[ThreadRate]:
 
 
 def compute_rows(report: Any) -> list[ComputeRow]:
+    """The report's rows; a report pinned to CPUs names them in every row."""
     rows: list[ComputeRow] = []
+    pinned = sorted(report.get("cpus", []))
     for row in report["compute"]:
         points: list[ComputePoint] = []
         for point in row["points"]:
@@ -311,16 +316,17 @@ def compute_rows(report: Any) -> list[ComputeRow]:
             else:
                 value["flops"] = float(point["flops"])
             points.append(value)
-        rows.append(
-            {
-                "format": row["format"],
-                "threads": row["threads"],
-                "rows": row["rows"],
-                "cols": row["cols"],
-                "weight_bytes": row["weight_bytes"],
-                "points": points,
-            }
-        )
+        value_row: ComputeRow = {
+            "format": row["format"],
+            "threads": row["threads"],
+            "rows": row["rows"],
+            "cols": row["cols"],
+            "weight_bytes": row["weight_bytes"],
+            "points": points,
+        }
+        if pinned:
+            value_row["cpus"] = pinned
+        rows.append(value_row)
     return rows
 
 

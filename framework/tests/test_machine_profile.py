@@ -405,3 +405,68 @@ def test_darwin_profile_end_to_end(tmp_path):
     (drive,) = value["storage"]
     assert drive["drive_key"].startswith("darwin:apple:APPLE SSD AP0512Z:")
     assert (drive["reader"], drive["qd_cap"], drive["alignment_bytes"]) == ("pool", 8, 16384)
+
+
+class PinnedRunner(FakeRunner):
+    """A CPU probe that reports pinned runs as pinned, at a rate set by their CPUs."""
+
+    def __init__(self, rates, failing=()):
+        super().__init__(replies())
+        self.rates, self.failing = rates, failing
+
+    def __call__(self, argv, timeout_s, env):
+        if "--cpus" not in argv:
+            return super().__call__(argv, timeout_s, env)
+        self.calls.append((list(argv), timeout_s))
+        listed = argv[argv.index("--cpus") + 1]
+        if listed in self.failing:
+            return Completed(1, "", "CPU 3 is not available to this process")
+        cpus = [int(cpu) for cpu in listed.split(",")]
+        row = {
+            "format": "Q4_K",
+            "threads": len(cpus),
+            "rows": 4096,
+            "cols": 4096,
+            "weight_bytes": 9437184,
+            "points": [{"tokens": 1, "us": 100.0, "weight_Bps": self.rates[listed]}],
+        }
+        return Completed(0, json.dumps(dict(CPU_REPORT, compute=[row], cpus=cpus, skipped=[])))
+
+
+def test_two_clusters_measure_one_token_pinned_to_each_and_to_every_cpu(tmp_path):
+    host, files = linux_machine(tmp_path, capacities=(512, 1024, 1024, 512))
+    runner = PinnedRunner({"1,2": 6e10, "0,3": 2e10, "0,1,2,3": 5e10})
+    value, lines = run(host, [files[0]], runner)
+    assert validate(value) is value
+    assert value["cpu"]["clusters"] == [
+        {"id": 0, "cpus": [1, 2], "kind": "performance"},
+        {"id": 1, "cpus": [0, 3], "kind": "efficiency"},
+    ]
+    pinned = [argv[1:] for argv, _ in runner.calls if "--cpus" in argv]
+    assert pinned == [
+        ["--cpus", "1,2", "--threads", "2", "--tokens", "1"],
+        ["--cpus", "0,3", "--threads", "2", "--tokens", "1"],
+        ["--cpus", "0,1,2,3", "--threads", "4", "--tokens", "1"],
+    ]
+    rows = value["compute"]["cpu"]
+    assert rows[0] == CPU_REPORT["compute"][0] and "cpus" not in rows[0]
+    assert [(row["cpus"], row["points"][0]["weight_Bps"]) for row in rows[1:]] == [
+        ([1, 2], 6e10),
+        ([0, 3], 2e10),
+        ([0, 1, 2, 3], 5e10),
+    ]
+    assert value["sections"]["compute"]["status"] == "ok"
+    assert value["sections"]["compute"]["method"].endswith(
+        "; one token pinned to each cluster and to every CPU"
+    )
+    assert any("pinned to each of CPUs 1,2" in line for line in lines)
+
+
+def test_a_failed_pinned_run_is_noted_and_left_out(tmp_path):
+    host, files = linux_machine(tmp_path, capacities=(512, 1024, 1024, 512))
+    runner = PinnedRunner({"1,2": 6e10, "0,3": 2e10}, failing=("0,1,2,3",))
+    value, _ = run(host, [files[0]], runner)
+    assert [row.get("cpus") for row in value["compute"]["cpu"]] == [None, [1, 2], [0, 3]]
+    detail = value["sections"]["compute"]["detail"]
+    assert detail.startswith("skipped MXFP4 (no CPU kernel); pinned to CPUs 0,1,2,3: ")
+    assert value["sections"]["compute"]["status"] == "ok"

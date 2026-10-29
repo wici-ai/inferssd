@@ -175,13 +175,17 @@ class ComputePoint(_ComputePoint, total=False):
     flops: float  # tokens > 1, FLOP/s
 
 
-class ComputeRow(TypedDict):
+class _ComputeRow(TypedDict):
     format: str
     threads: int
     rows: int
     cols: int
     weight_bytes: int
     points: list[ComputePoint]
+
+
+class ComputeRow(_ComputeRow, total=False):
+    cpus: list[int]  # one thread pinned to each, ascending; absent where the threads are unpinned
 
 
 class Compute(TypedDict):
@@ -325,7 +329,8 @@ COMPUTE_ROW = record(
         "cols": POSITIVE,
         "weight_bytes": POSITIVE,
         "points": array(COMPUTE_POINT),
-    }
+    },
+    {"cpus": array(COUNT, minimum=1)},
 )
 GPU_ROW = record(
     {

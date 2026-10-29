@@ -189,6 +189,18 @@ def probe_threads(cpu: CPU) -> list[int]:
     return sorted({1, fast, total})
 
 
+def pinned_sets(cpu: CPU) -> list[list[int]]:
+    """Each cluster's CPUs and every CPU, where threads can be pinned and there are clusters.
+
+    One token streams a format's weights at a rate the strategy compares
+    between them, a thread pinned to each CPU, to place decode.
+    """
+    if not cpu["affinity_supported"] or len(cpu["clusters"]) < 2:
+        return []
+    sets = [sorted(row["cpus"]) for row in cpu["clusters"]]
+    return sets + [sorted(row["id"] for row in cpu["logical"])]
+
+
 def model_files(host: Host, paths: Sequence[str]) -> list[tuple[str, int]]:
     """Regular files under PATHS (directories recursively); a split GGUF adds all its shards."""
     found: dict[str, int] = {}
@@ -268,12 +280,25 @@ def measure_cpu(
         report = probes.run("cpu", ["--threads", ",".join(map(str, threads))])
     except ProbeError as error:
         probe_error = str(error)
-    end = clock()
     compute: Compute = {"cpu": []}
+    unpinned: list[str] = []
     if report is not None:
         cpu["isa"] = [name for name in report["ggml_features"] if name not in BUILD_OPTIONS]
         memory["dram_read_Bps"] = dram_rates(report)
         compute["cpu"] = compute_rows(report)
+        for group in pinned_sets(cpu):
+            listed = ",".join(map(str, group))
+            progress(f"CPU probe: one token with a thread pinned to each of CPUs {listed}")
+            arguments = ["--cpus", listed, "--threads", str(len(group)), "--tokens", "1"]
+            try:
+                pinned = probes.run("cpu", arguments)
+            except ProbeError as error:
+                unpinned.append(f"pinned to CPUs {listed}: {error}")
+                continue
+            compute["cpu"] += compute_rows(pinned)
+        if pinned_sets(cpu):
+            method += "; one token pinned to each cluster and to every CPU"
+    end = clock()
     source = "sysfs" if system == "linux" else "sysctl"
     failed = "the CPU probe failed (see compute)" if probe_error else ""
     isa_missing = f"ISA unknown: {failed}" if failed else ""
@@ -281,6 +306,7 @@ def measure_cpu(
     cpu_status = "failed" if topology_error and probe_error else "partial" if errors else "ok"
     dram_missing = failed or ("" if memory["dram_read_Bps"] else "the probe reported none")
     skip = "skipped " + ", ".join(skipped(report)) if report is not None and skipped(report) else ""
+    skip = "; ".join(filter(None, [skip] + unpinned))
     compute_error = probe_error or ("" if compute["cpu"] else "the probe measured no format")
     return (
         cpu,

@@ -48,6 +48,7 @@ namespace {
 const char * const USAGE =
     "usage: inferssd-cpuprobe [--threads 1,8,16] [--formats Q8_0,Q4_K,Q5_K,Q6_K,Q2_K,MXFP4,F16]\n"
     "                         [--rows 4096] [--cols 4096] [--tokens 1,32,512] [--min-seconds 0.5]\n"
+    "                         [--cpus 0,1,2]\n"
     "\n"
     "Measures DRAM read bandwidth and ggml CPU matrix multiplication throughput per weight format and\n"
     "prints one JSON object (schema inferssd-cpuprobe/1) on stdout.\n"
@@ -58,6 +59,7 @@ const char * const USAGE =
     "  --cols N            weight columns (the reduction dimension)\n"
     "  --tokens LIST       activation columns; 1 reports weight bytes/s, more report FLOP/s\n"
     "  --min-seconds S     timed repetitions per point after one warm-up call\n"
+    "  --cpus LIST         pin compute thread i to the i-th of these CPU IDs, ascending (Linux; default: unpinned)\n"
     "\n"
     "DRAM: one buffer of max(1 GiB, 8 x last-level cache) is read with each thread count (disjoint slices).\n"
     "Compute: the median time of ggml_mul_mat on the CPU backend with a persistent ggml threadpool. At\n"
@@ -388,6 +390,28 @@ struct compute_row {
     std::vector<compute_point> points;
 };
 
+// A threadpool of THREADS; with CPUS, strict: thread i runs on the i-th CPU in ascending order.
+ggml_threadpool_t new_pool(int threads, const std::vector<int> & cpus) {
+    ggml_threadpool_params tpp = ggml_threadpool_params_default(threads);
+    if (!cpus.empty()) {
+        for (int cpu : cpus) { tpp.cpumask[cpu] = true; }
+        tpp.strict_cpu = true;
+    }
+    return ggml_threadpool_new(&tpp);
+}
+
+// A pinned pool also pins the calling thread to its first CPU; this gives it back the CPUs it had.
+struct affinity_guard {
+#if defined(__linux__)
+    cpu_set_t saved;
+    bool      valid;
+    affinity_guard() { CPU_ZERO(&saved); valid = sched_getaffinity(0, sizeof(saved), &saved) == 0; }
+    ~affinity_guard() {
+        if (valid) { sched_setaffinity(0, sizeof(saved), &saved); }
+    }
+#endif
+};
+
 struct ggml_context_deleter {
     void operator()(ggml_context * ctx) const { ggml_free(ctx); }
 };
@@ -417,8 +441,9 @@ double time_calls(ggml_backend_t backend, const std::vector<ggml_cgraph *> & gra
 
 // Runs every thread count for one format. Returns false (with *why) when the CPU backend cannot run it.
 bool measure_format(ggml_backend_t backend, const format_spec & format, int64_t rows, int64_t cols,
-                    const std::vector<int> & tokens, const std::vector<int> & thread_counts, double min_seconds,
-                    uint64_t rotate_bytes, std::vector<compute_row> & out, std::string * why) {
+                    const std::vector<int> & tokens, const std::vector<int> & thread_counts,
+                    const std::vector<int> & cpus, double min_seconds, uint64_t rotate_bytes,
+                    std::vector<compute_row> & out, std::string * why) {
     *why = unsupported_reason(format.type, cols);
     if (!why->empty()) { return false; }
 
@@ -476,8 +501,8 @@ bool measure_format(ggml_backend_t backend, const format_spec & format, int64_t 
     }
 
     for (int threads : thread_counts) {
-        ggml_threadpool_params tpp = ggml_threadpool_params_default(threads);
-        ggml_threadpool_t pool = ggml_threadpool_new(&tpp);
+        affinity_guard affinity;
+        ggml_threadpool_t pool = new_pool(threads, cpus);
         if (!pool) {
             throw std::runtime_error("ggml_threadpool_new failed for " + std::to_string(threads) + " threads");
         }
@@ -531,6 +556,7 @@ struct options {
     int64_t                  cols        = 4096;
     std::vector<int>         tokens      = { 1, 32, 512 };
     double                   min_seconds = 0.5;
+    std::vector<int>         cpus;  // ascending; empty: unpinned
 };
 
 options parse_args(int argc, char ** argv) {
@@ -554,6 +580,24 @@ options parse_args(int argc, char ** argv) {
             o.cols = parse_int(arg, value, 1, 1 << 20);
         } else if (arg == "--tokens") {
             o.tokens = parse_int_list(arg, value, 1, 1 << 16);
+        } else if (arg == "--cpus") {
+#if defined(__linux__)
+            o.cpus = parse_int_list(arg, value, 0, GGML_MAX_N_THREADS - 1);
+            std::sort(o.cpus.begin(), o.cpus.end());
+            // A thread cannot be pinned outside this process's CPUs; it would run unpinned unnoticed.
+            cpu_set_t allowed;
+            CPU_ZERO(&allowed);
+            if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+                throw std::runtime_error("cannot read the CPUs this process may use");
+            }
+            for (int cpu : o.cpus) {
+                if (cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &allowed)) {
+                    throw std::runtime_error("CPU " + std::to_string(cpu) + " is not available to this process");
+                }
+            }
+#else
+            throw usage_error("--cpus: pinning threads is measured on Linux only");
+#endif
         } else if (arg == "--min-seconds") {
             char * end = nullptr;
             o.min_seconds = std::strtod(value.c_str(), &end);
@@ -568,6 +612,12 @@ options parse_args(int argc, char ** argv) {
         o.threads = { 1 };
         const int all = std::min(GGML_MAX_N_THREADS, available_cpus());
         if (all != 1) { o.threads.push_back(all); }
+    }
+    for (int threads : o.threads) {
+        if (!o.cpus.empty() && threads > (int) o.cpus.size()) {
+            throw usage_error("--threads: " + std::to_string(threads) + " threads exceed the " +
+                              std::to_string(o.cpus.size()) + " CPUs of --cpus");
+        }
     }
     for (const std::string & item : split_list(formats)) {
         format_spec f = parse_format(item);
@@ -602,8 +652,8 @@ int run(int argc, char ** argv) {
     std::vector<std::pair<std::string, std::string>> skipped;
     for (const format_spec & format : o.formats) {
         std::string why;
-        if (!measure_format(backend, format, o.rows, o.cols, o.tokens, o.threads, o.min_seconds, rotate_bytes, compute,
-                            &why)) {
+        if (!measure_format(backend, format, o.rows, o.cols, o.tokens, o.threads, o.cpus, o.min_seconds, rotate_bytes,
+                            compute, &why)) {
             std::fprintf(stderr, "cpuprobe: %s skipped: %s\n", format.name.c_str(), why.c_str());
             skipped.emplace_back(format.name, why);
         }
@@ -612,6 +662,8 @@ int run(int argc, char ** argv) {
     std::string json = "{\"schema\": \"inferssd-cpuprobe/1\",\n \"ggml_features\": [";
     const std::vector<std::string> features = ggml_features();
     for (size_t i = 0; i < features.size(); ++i) { json += (i ? ", " : "") + quote(features[i]); }
+    json += "],\n \"cpus\": [";
+    for (size_t i = 0; i < o.cpus.size(); ++i) { json += (i ? ", " : "") + std::to_string(o.cpus[i]); }
     json += "],\n \"dram\": [";
     for (size_t i = 0; i < dram.size(); ++i) {
         json += std::string(i ? ",\n          " : "") + "{\"threads\": " + std::to_string(dram[i].threads) +
