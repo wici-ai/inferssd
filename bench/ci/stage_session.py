@@ -13,6 +13,10 @@ import time
 
 
 MAX_RESPONSE = 1024 * 1024
+# Freezing seals every file of a build tree (hash and fsync), and a baseline job's
+# build is then copied into the broker's build cache; a CUDA build on a slow
+# disk takes minutes, not the 30 s of an ordinary request.
+FREEZE_TIMEOUT_S = 900
 
 
 class BrokerError(RuntimeError):
@@ -157,7 +161,7 @@ class StageSession:
                 raise BrokerError("stage status lacks running state")
 
     def freeze(self, stage, **fields):
-        return self.call(stage, "job.freeze", **fields)
+        return self.call(stage, "job.freeze", timeout=FREEZE_TIMEOUT_S, **fields)
 
     def finish(self):
         result = self.request("job.finish", timeout=60)

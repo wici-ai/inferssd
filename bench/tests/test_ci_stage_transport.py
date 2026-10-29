@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ci.stage_session import BrokerError, StageSession
+from ci.stage_session import FREEZE_TIMEOUT_S, BrokerError, Stage, StageSession
 from ci import staged_chat
 from test_final import records
 import run_final
@@ -114,3 +114,20 @@ def test_broker_timeout_retains_type_operation_stage_and_closes_session():
     with pytest.raises(socket.timeout, match='stage.probe stage=candidate-smoke'):
         session.request('stage.probe', stage_id='candidate-smoke', handle='h')
     assert session.closed and connection.closed
+
+
+def test_freeze_waits_for_the_whole_build_tree():
+    timeouts = []
+
+    class Connection:
+        def settimeout(self, value): timeouts.append(value)
+        def connect(self, address): pass
+        def sendall(self, value): pass
+        def recv(self, size): return b'{"ok": true, "stage_id": "candidate-build", "handle": "h"}\n'
+        def close(self): pass
+    session = StageSession('/unused', 'a' * 32, controller_uid=1000, connect=lambda *args: Connection())
+    stage = Stage(stage_id='candidate-build', handle='h', worker_pid=2, worker_uid=5,
+                  birth_identity='b', scope_identity='s')
+    session.stages[stage.stage_id] = stage
+    session.freeze(stage)
+    assert timeouts[-1] == FREEZE_TIMEOUT_S == 900
