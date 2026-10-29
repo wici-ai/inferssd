@@ -114,9 +114,10 @@ execution is used; see [GitHub's security guidance](https://docs.github.com/en/a
    every selected numerical executable. Both arms must use the same resource cap,
    model distribution and template. A model may instead carry a `launch` request
    and no argv or port, as operator performance jobs must: each side then
-   resolves its launch on the device with its own `inferssd launch`, from one
-   `inferssd profile` of the machine per job, and its settings and thread pools
-   may differ from the other side's (see
+   resolves its launch on the device with its own `inferssd launch`, from the
+   machine characteristics a baseline job profiled (a PR job takes those of the
+   device's most recent baseline job), and its settings and thread pools may
+   differ from the other side's (see
    [performance acceptance](PERFORMANCE.md#launches)). Native snapshots,
    real runtime image mappings and root-observed resources are checked.
    Before any selected 256-token request, every selected performance model/tier

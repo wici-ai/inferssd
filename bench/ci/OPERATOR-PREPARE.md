@@ -41,11 +41,23 @@ It contains reviewed device templates, model/settings identities and a profile:
 
 The placeholder values above are not executable configuration. Every enabled
 device needs an explicit profile. The same directory holds `baseline-history/`,
-the verified baseline records the review operator writes (see
-[performance acceptance](PERFORMANCE.md)). Preparation re-verifies every record
-and seals the executing devices' records into every device's `config.json` as
-`baseline_history`; `envelope.json` carries their `baseline_history_sha256`.
-Neither the root stager nor the installed root policy reads or pins them. A
+the verified baseline records the review operator writes and, per device, the
+characteristics files its baseline jobs profiled (see
+[performance acceptance](PERFORMANCE.md#baseline-history)). Preparation
+re-verifies every record and characteristics file and seals the executing
+devices' records into every device's `config.json` as `baseline_history`;
+`envelope.json` carries their `baseline_history_sha256`. Neither the root stager
+nor the installed root policy reads or pins them. A PR job also seals, per
+device, the characteristics file of that device's most recent baseline job as
+`machine_characteristics` (the file's text, its SHA-256, the baseline job and
+commit it comes from, and its staged paths); `envelope.json` names each
+device's hash in `machine_characteristics_sha256`. The root stager writes it
+read-only to `/opt/inferssd-ci-integrations/JOB-machine.json`, mounted in the
+Linux sandbox as `/models/machine.json`, or to `machine.json` in the Mac job's
+input root, after checking its fixed path and its hash and that the job is not a
+baseline job: a baseline job seals none and profiles the machine itself. Preparing a PR job for
+a device without baseline characteristics fails with "DEVICE has no baseline
+machine characteristics yet; a baseline job must run on it first". A
 Linux profile may set `"base_build_cache": true` (a boolean; the Mac does not
 support it): a baseline job then asks the broker to keep its build, and a PR
 job offers the base commit's recorded build to the broker for its base side.
@@ -70,9 +82,11 @@ environment, working directory, deadlines and OS-cache treatment, and carry no
 other key, because the strategy derives those or the engine decides them. The
 template's `host.resources` is the machine policy the launches take: its memory
 budget is the runtime policy's budget, and its CPU set and the device lock bind
-every stage as before. Templates must build the probes that `inferssd profile`
-runs: `inferssd-cpuprobe` and `inferssd-ssdprobe`, plus `inferssd-memprobe` on
-the CUDA devices.
+every stage as before. The memory budget and the CPU set are also part of the
+baseline history conditions, so changing either starts a new history for the
+device. Templates must build the probes that `inferssd profile` runs in a
+baseline job: `inferssd-cpuprobe` and `inferssd-ssdprobe`, plus
+`inferssd-memprobe` on the CUDA devices.
 
 Each server gets the resolved argv with its own event file in the side's launch
 directory: the functional request and the short preflight of a tier use
@@ -106,21 +120,22 @@ run to the declared devices and the 512-tier performance comparison.
 Each required executed model runs decode 256 three times on the candidate and
 once on the base, in the order candidate, base, candidate, candidate; the sealed
 `performance_protocol` records that order, and the Linux stage allowlist
-contains one `<side>-<model>-r<k>-benchmark-<tier>` stage per run, one
-`machine-profile` stage for the side built first and one `<side>-<model>-launch`
-stage per resolved launch, both running `/usr/bin/python3`. 4K and omitted devices' requirements remain explicit coverage
-gaps. Envelopes prepared with the older
-`--validation-mode functional-numerical` keep that meaning. The complete workflow input must fit
+contains one `<side>-<model>-r<k>-benchmark-<tier>` stage per run and one
+`<side>-<model>-launch` stage per resolved launch, running `/usr/bin/python3`;
+a baseline job also has one `machine-profile` stage, and a PR job has none. 4K
+and omitted devices' requirements remain explicit coverage gaps. Envelopes
+prepared with the older `--validation-mode functional-numerical` keep that
+meaning. The complete workflow input must fit
 60 KiB; exceeding that bound refuses without truncation. The report cannot claim
 PR check publication or full impact coverage when required devices/4K work is absent.
 
 `--baseline` prepares the baseline job of one `main` commit instead (the review
 operator does this for every new `main` head). Base, head and candidate must be
 that commit; the plan then selects every enabled device and both models
-although the diff is empty, only the candidate side is exported and built, and
-each model runs four times. The root policy stays the same: the root stager
-admits the fixed PR protocol, or the baseline protocol only when both sides
-name the same revision.
+although the diff is empty, only the candidate side is exported and built, the
+machine is profiled once and each model runs four times. The root policy stays
+the same: the root stager admits the fixed PR protocol, or the baseline protocol
+only when both sides name the same revision.
 
 Mac profiles use `broker_device: "mac-m5-max"` and a pinned `machine_identity`
 with the SHA256 of the uppercase hardware UUID, hardware model and CPU brand,
@@ -198,8 +213,9 @@ matching the root receiver's `r|` contract. Root holds the original lease during
 staging, rejects STOP, verifies GPU UUID and absence of compute work, checks the
 entire installed control manifest, reads model stat/RO mount metadata, and
 verifies every extracted Git blob before making each required source read-only.
-It installs only the reviewed two-sided config/settings and job manifest, then returns an
-identity-bound root receipt.
+It installs only the reviewed two-sided config/settings, a PR job's sealed
+characteristics file and the job manifest, then returns an identity-bound root
+receipt.
 
 Dispatch requires all chosen root receipts and an unchanged local account and
 private controller main. It sends only `prepared_envelope` to the fixed
