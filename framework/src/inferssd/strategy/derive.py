@@ -464,7 +464,17 @@ def derive(
             notes.append("vram.budget: 0, no CUDA GPU is usable now" + extra)
         else:
             known = [gpu for gpu in runtime.gpus if gpu.uuid in listed]
-            if known:
+            shared = {
+                row["uuid"]: row["name"] for row in characteristics["gpus"] if row["integrated"]
+            }
+            if known and all(gpu.uuid in shared for gpu in known):
+                # On a GPU that shares host memory the automatic VRAM tier grows into
+                # the host's memory and starves prompt processing, so it stays off.
+                names = ", ".join(sorted({shared[gpu.uuid] for gpu in known}))
+                reason = f"{names} shares host memory with the CPU"
+                choices["vram.budget"] = ("0", reason)
+                notes.append("vram.budget: 0, " + reason)
+            elif known:
                 notes.append("vram.budget: default auto for " + ", ".join(g.uuid for g in known))
             else:
                 notes.append(

@@ -180,7 +180,9 @@ def test_arm_split_needs_the_performance_cluster_at_the_lowest_ids(models):
     assert sorted(terms) == ["cpu_fixed_us", "cpu_route_us", "drive_gbps"]
     # A 10136235-byte mean role read takes the 16 MiB reads, best at the knee, QD 2.
     assert terms["drive_gbps"] == pytest.approx(12.6298)
-    assert "vram.budget" not in s.settings
+    # Its automatic VRAM tier would grow into host memory, so the tier stays off.
+    assert s.settings["vram.budget"].value_text == "0"
+    assert "shares host memory" in s.settings["vram.budget"].reason
     assert any("shares host memory" in note for note in s.notes)
 
 
