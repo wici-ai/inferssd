@@ -77,7 +77,7 @@ class API:
 
 @pytest.fixture
 def api(monkeypatch):
-    monkeypatch.setattr(entry, "current_ci", lambda *_: {"id": 12, "attempt": 1})
+    monkeypatch.setattr(entry, "current_ci", lambda *_, **__: {"id": 12, "attempt": 1})
     monkeypatch.setattr(
         entry.prepare, "access", lambda *_: ({"login": "maintainer"}, "d" * 40)
     )
@@ -282,7 +282,7 @@ def test_expired_authorization(api):
 def test_hosted_ci_pending_is_persistently_queued(api, args, monkeypatch):
     path, value = record(api, args)
 
-    def pending(*_):
+    def pending(*_, **__):
         raise ValueError("normal hosted CI has not completed")
 
     monkeypatch.setattr(entry, "current_ci", pending)
@@ -697,3 +697,96 @@ def test_fork_fetch_uses_source_pull_refs_not_fork_remote(api, args, monkeypatch
     entry.fetch_objects(args, value, REPO)
     assert calls[-1][-3:] == ("refs/pull/58/head", "refs/pull/58/merge", BASE)
     assert "external/fork" not in str(calls)
+
+
+def calibrate_record(api, args):
+    api.reviews[0]["body"] = "/ci calibrate"
+    path, value = record(api, args)
+    value["calibration_pairs"] = 4
+    return path, value
+
+
+def test_calibrate_needs_no_test_merge_and_binds_the_head_only(api, monkeypatch):
+    seen = []
+    monkeypatch.setattr(entry, "current_ci", lambda api_, value, policy, **kwargs:
+                        seen.append((value["head"], kwargs)) or {"id": 12, "attempt": 1})
+    api.reviews[0]["body"] = "/ci calibrate"
+    api.pr["merge_commit_sha"] = None
+    value = entry.authorization(api, POLICY, 58, 71, HEAD)
+    assert (value["base"], value["head"], value["candidate"], value["command"]) == (HEAD, HEAD, HEAD, "calibrate")
+    assert seen == [(HEAD, {"require_base": False})]
+    api.reviews[0]["body"] = "/ci test"
+    with pytest.raises(entry.Waiting, match="test merge"):
+        entry.authorization(api, POLICY, 58, 71, HEAD)
+
+
+def test_calibrate_still_waits_for_hosted_ci_on_its_head(api, args, monkeypatch):
+    path, value = calibrate_record(api, args)
+    monkeypatch.setattr(entry, "current_ci", lambda *_, **__: (_ for _ in ()).throw(ValueError("hosted CI pending")))
+    monkeypatch.setattr(entry.prepare, "prepare", lambda *_, **__: pytest.fail("must wait for hosted CI"))
+    entry.advance(args, api, POLICY, path, value)
+    assert value["status"] == "queued" and "hosted CI" in value["waiting"]
+
+
+def test_moving_pr_base_neither_stales_nor_cancels_a_calibration(api, args, monkeypatch):
+    path, value = calibrate_record(api, args)
+    entry.save_record(path, value, "running", run=copy.deepcopy(api.run), dispatched_at=entry.time.time())
+    api.pr["base"]["sha"] = "e" * 40
+    api.pr["merge_commit_sha"] = None
+    entry.monitor(args, api, POLICY, path, value)
+    assert api.posts == [] and value["status"] == "running"
+    # The same base move cancels an ordinary /ci test run.
+    test_path, test_value = record(api, args)
+    api.reviews[0]["body"] = "/ci test"
+    api.pr["merge_commit_sha"] = CANDIDATE
+    entry.save_record(test_path, test_value, "running", run=copy.deepcopy(api.run), dispatched_at=entry.time.time())
+    entry.monitor(args, api, POLICY, test_path, test_value)
+    assert test_value["status"] == "cancelling"
+
+
+def test_calibration_fetches_only_the_reviewed_head(api, args, monkeypatch):
+    calls = []
+
+    def git(_, *argv):
+        calls.append(argv)
+        if argv[0] == "cat-file":
+            raise ValueError("missing object")
+        if argv[:2] == ("remote", "get-url"):
+            return ("git@github.com:" + REPO + ".git\n").encode()
+        return b""
+
+    monkeypatch.setattr(entry.prepare, "git", git)
+    api.reviews[0]["body"] = "/ci calibrate"
+    api.pr["merge_commit_sha"] = None
+    entry.fetch_objects(args, entry.authorization(api, POLICY, 58, 71, HEAD), REPO)
+    assert calls[-1][-2:] == ("ssdash", "refs/pull/58/head")
+    assert [argv for argv in calls if argv[0] == "cat-file"] == [("cat-file", "-e", HEAD + "^{commit}")]
+
+
+def test_changed_noise_bands_cancel_a_running_parent(api, args):
+    from test_ci_performance_series import banded
+    path, value = record(api, args)
+    entry.save_record(path, value, "running", run=copy.deepcopy(api.run), dispatched_at=entry.time.time())
+    entry.monitor(args, api, POLICY, path, value)
+    assert api.posts == [] and value["status"] == "running"
+    args.inputs.with_name(entry.prepare.BANDS_FILE).write_text(
+        json.dumps(banded({("cloud-5090", "muse", "512"): "c" * 64})))
+    entry.monitor(args, api, POLICY, path, value)
+    assert api.posts == [(f"repos/{POLICY['controller_repository']}/actions/runs/87/cancel", {})]
+    assert value["status"] == "cancelling" and "noise bands" in value["cancellation_reason"]
+
+
+def test_noise_bands_changed_during_staging_never_dispatch(api, args, monkeypatch):
+    from test_ci_performance_series import banded
+    path, value = record(api, args)
+    monkeypatch.setattr(entry, "fetch_objects", lambda *_: None)
+    monkeypatch.setattr(entry.prepare, "prepare", prepared_envelope)
+
+    def stage(*_, **__):
+        args.inputs.with_name(entry.prepare.BANDS_FILE).write_text(
+            json.dumps(banded({("cloud-5090", "muse", "512"): "c" * 64})))
+
+    monkeypatch.setattr(entry.prepare, "stage", stage)
+    monkeypatch.setattr(entry.prepare, "dispatch", lambda *_, **__: pytest.fail("stale dispatch"))
+    entry.advance(args, api, POLICY, path, value)
+    assert value["status"] == "stale" and "before dispatch" in value["error"]

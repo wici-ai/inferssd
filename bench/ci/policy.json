@@ -15,7 +15,6 @@
     "mode": "calibrated-noise-band",
     "pairs": 2,
     "order": "ABBA",
-    "k": 3,
     "floor_fraction": {
       "decode_first128_tps": 0.01,
       "decode_second128_tps": 0.01,

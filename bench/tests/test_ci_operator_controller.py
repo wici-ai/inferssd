@@ -534,10 +534,13 @@ def test_summary_shows_per_pair_values_d_threshold_and_decision():
     assert "Each cell ran 2 base/PR pairs in ABBA order" in text
     assert "| Base per pair | PR per pair | Change | d per pair | Mean d | Threshold | Result |" in text
     assert ("| cloud-5090 | muse | 512 | Whole decode tok/s | 10.0000, 10.0000 | 9.0000, 9.0000 | -10.000% "
-            "| +0.1054, +0.1054 | +0.1054 | 0.0212 | beyond band, every pair slower |") in text
+            "| +0.1054, +0.1054 | +0.1054 | 0.0302 | beyond band, every pair slower |") in text
     assert ("| cloud-5090 | muse | 512 | Request TTFT seconds | 1.0000, 1.0000 | 1.0000, 1.0000 | +0.000% "
-            "| +0.0000, +0.0000 | +0.0000 | 0.0212 | within band |") in text
-    assert "cloud-5090/muse/512: **regressed**. Noise band: matched (8 calibration pairs, 2026-10-29" in text
+            "| +0.0000, +0.0000 | +0.0000 | 0.0302 | within band |") in text
+    assert ("| cloud-5090 | muse | 512 | Decode 0–128 tok/s | 10.0000, 10.0000 | 10.0000, 10.0000 | +0.000% "
+            "| +0.0000, +0.0000 | +0.0000 | 0.0302 | information only |") in text
+    assert "cloud-5090/muse/512: **regressed**. Noise band: matched (8 calibration pairs, k 4.277, 2026-10-29" in text
+    assert "Only whole decode, TTFT and native prefill decide" in text
     assert "Threshold = max(ln(1 + floor), k·σ/√pairs)" in text and "lower TTFT is better" in text
     assert "Declared device scope: **regressed**" in text and "deferred tiers: 4096" in text
     assert "template IDs SHA" in text and "conditions/settings SHA" in text and "0/16" in text
@@ -644,11 +647,18 @@ def test_summary_does_not_render_missing_mac_environment_as_zero_or_passed():
 
 @pytest.fixture
 def performance_raw(functional_raw):
+    return build_performance_raw(functional_raw)
+
+
+def build_performance_raw(functional_raw, pairs=2, calibration=False):
     """Real validators over synthetic SSE/probe bytes; no device or model runs."""
     from test_ci_performance_series import banded, write_arm
     root, original, config, _ = functional_raw
     config["device"] = "cloud-5090"
-    plan = dict(base="a" * 40, candidate="c" * 40)
+    plan = dict(base="c" * 40 if calibration else "a" * 40, candidate="c" * 40)
+    protocol = contract.performance_protocol(pairs if calibration else None)
+    config["performance_protocol"] = protocol
+    config["selection_plan"] = dict(purpose="noise-calibration" if calibration else "impact-selection")
     preflight = {}
     for side in ("base", "candidate"):
         config["sides"][side] = copy.deepcopy(config["sides"]["candidate"])
@@ -664,7 +674,7 @@ def performance_raw(functional_raw):
         build.mkdir(exist_ok=True)
         (build / "build-receipt.json").write_text(json.dumps(dict(binary=dict(
             runtime_path=launch["argv"][0], sha256="a" * 64))))
-    for position, (index, side) in enumerate(compare.schedule(2)):
+    for position, (index, side) in enumerate(compare.schedule(pairs)):
         pid = 300 + position
         launch = aggregation.arm_launch(config["sides"][side]["models"]["deepseek"]["benchmarks"]["512"], side, index)
         folder = root / "deepseek/512" / ("r" + str(index)) / side
@@ -695,24 +705,45 @@ def performance_raw(functional_raw):
     policy = POLICY
 
     def comparison():
-        keys = compare.schedule(2)
+        keys = compare.schedule(pairs)
         folders = {key: root / "deepseek/512" / ("r" + str(key[0])) / key[1] for key in keys}
         results = {key: aggregation.run_final.read_result(folders[key] / "result.json", "512", 300) for key in keys}
         receipts = {key: load(folders[key] / "comparison-receipt.json") for key in keys}
-        pairs = []
-        for index in (1, 2):
+        compared = []
+        for index in range(1, pairs + 1):
             pair = compare.compare_pair(results[index, "base"], results[index, "candidate"],
                                         receipts[index, "base"], receipts[index, "candidate"], policy)
             target = root / "deepseek/512" / ("r" + str(index)) / "comparison.json"
             target.unlink(missing_ok=True)
             save(target, pair)
-            pairs.append(pair)
-        cell = compare.compare_series(results, receipts, pairs, policy, protocol=contract.performance_protocol(), bands=bands,
+            compared.append(pair)
+        cell = compare.compare_series(results, receipts, compared, policy, protocol=protocol, bands=bands,
             cell=dict(device="cloud-5090", model="deepseek", tier="512", job_id="f" * 32, **plan))
         (root / "deepseek/512/comparison.json").write_text(json.dumps(cell))
         return cell
     comparison()
     return root, config, plan, preflight, comparison, policy
+
+
+@pytest.mark.parametrize("damage", [None, "missing-arm", "pair-index"])
+def test_calibration_replays_every_arm_of_the_four_pair_protocol(functional_raw, damage):
+    root, config, plan, preflight, _, policy = build_performance_raw(functional_raw, pairs=4, calibration=True)
+    if damage == "missing-arm":
+        import shutil
+        shutil.rmtree(root / "deepseek/512/r4/base")
+    elif damage == "pair-index":
+        path = root / "deepseek/512/r3/candidate/benchmark.json"; raw = load(path); raw["pair"] = 2
+        path.write_text(json.dumps(raw))
+    if damage:
+        with pytest.raises((OSError, ValueError)):
+            aggregation.performance_retained(root, config, "deepseek", "512", plan, policy, preflight, "f" * 32)
+        return
+    cell = aggregation.performance_retained(root, config, "deepseek", "512", plan, policy, preflight, "f" * 32)
+    assert cell["status"] == "calibrated" and cell["protocol"]["samples_per_side"] == 4
+    assert cell["order"] == ["r1/base", "r1/candidate", "r2/candidate", "r2/base",
+                             "r3/base", "r3/candidate", "r4/candidate", "r4/base"]
+    assert set(cell["evidence"]) == set(cell["order"]) and len(cell["pairs"]) == 4
+    assert cell["metrics"]["decode_tps"]["rms_d"] == 0.0 and "noise_band" not in cell
 
 
 def test_performance_retained_replays_sse_and_every_arm_native_probes(performance_raw):

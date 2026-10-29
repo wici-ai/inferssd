@@ -400,7 +400,8 @@ METRIC_LABELS = (("decode_first128_tps", "Decode 0–128 tok/s"), ("decode_secon
                  ("decode_tps", "Whole decode tok/s"), ("ttft_s", "Request TTFT seconds"),
                  ("server_prefill_tps", "Native prefill tok/s"))
 RESULT_LABELS = {"within-band": "within band", "regressed": "beyond band, every pair slower",
-                 "pairs-disagree": "beyond band, pairs disagree", "no-matching-band": "no matching band"}
+                 "pairs-disagree": "beyond band, pairs disagree", "no-matching-band": "no matching band",
+                 "informational": "information only"}
 
 
 def band_text(entry):
@@ -410,6 +411,9 @@ def band_text(entry):
     if band.get("status") == "missing":
         return "no band for this device/model/tier"
     text = summary_text(band.get("status", "unavailable")) + " (" + summary_text(band.get("pairs", "?")) + " calibration pairs"
+    k = entry.get("decision_rule", {}).get("k")
+    if k is not None:
+        text += ", k " + summary_text(k)
     return text + ", " + summary_text(band.get("date", "undated")) + ", revision `" + summary_text(str(band.get("engine_revision", "unknown"))[:12]) + "`)"
 
 
@@ -483,9 +487,12 @@ def operator_summary(stream, report):
                      "minus 1, in percent; lower TTFT is better. TTFT starts at the request, not model loading. ")
         if not calibration:
             stream.write("Threshold = max(ln(1 + floor), k·σ/√pairs), with σ from an A/A calibration on the same device, "
-                         "model and measured conditions. Regressed: mean d above the threshold and every pair slower. "
-                         "Needs review: above the threshold with disagreeing pairs, different generated tokens, no matching "
-                         "noise band, or a flagged host check. Passed: no slowdown beyond measured noise.")
+                         "model and measured conditions, and k the one-sided Student-t quantile for the band's pooled pairs "
+                         "that matches a normal 3σ tail. Only whole decode, TTFT and native prefill decide; the two decode "
+                         "half-windows are sub-windows of whole decode and are shown for information. Regressed: a deciding "
+                         "metric's mean d above its threshold and every pair slower. Needs review: above the threshold with "
+                         "disagreeing pairs, different generated tokens, no matching noise band, or a flagged host check. "
+                         "Passed: no slowdown beyond measured noise.")
         stream.write("\n\n")
         mac_cells = [(row, entry) for row, entry in cells if row["device"] == "local-mbp"]
         if mac_cells:

@@ -232,7 +232,8 @@ def admission(api, pr, policy, expected_head):
     }
 
 
-def current_ci(api, plan, policy):
+def current_ci(api, plan, policy, *, require_base=True):
+    """Latest normal CI run for the exact head; a calibration does not bind the base."""
     workflow = api.call("actions/workflows/" + Path(policy["upstream_workflow"]).name)
     runs = api.call(
         "actions/workflows/"
@@ -251,11 +252,11 @@ def current_ci(api, plan, policy):
         or run.get("event") != "pull_request"
         or run.get("status") != "completed"
         or run.get("conclusion") != "success"
-        or run.get("head_sha") not in (plan["head"], plan["candidate"])
+        or run.get("head_sha") not in ((plan["head"], plan["candidate"]) if require_base else (plan["head"],))
         or len(prs) != 1
         or prs[0].get("number") != plan["pr"]
         or prs[0].get("head", {}).get("sha") != plan["head"]
-        or prs[0].get("base", {}).get("sha") != plan["base"]
+        or (require_base and prs[0].get("base", {}).get("sha") != plan["base"])
     ):
         raise ValueError(
             "normal CI is not the successful latest attempt for this exact head/base"
@@ -391,7 +392,7 @@ def check_body(plan, report, app_id):
             "title": "Three device gates passed"
             if report["passed"]
             else "Device gate blocked",
-            "summary": "Exact reviewed head/base/candidate; interleaved base/candidate pairs per cell, decided against calibrated noise bands. Regressed, needs-review, missing or failed cells block acceptance; no automatic retries. Formal samples 0.\n"
+            "summary": "Exact reviewed head/base/candidate; one base/candidate pair per cell. Any slower metric or different output needs review; missing or failed cells block acceptance; no automatic retries. Formal samples 0.\n"
             + report.get("error", ""),
         },
         "_expected_app_id": positive(app_id, "device check App id"),

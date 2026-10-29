@@ -37,8 +37,8 @@ def synthetic_receipt(model, side, spec, output, fault=None):
     return result
 
 
-def setup(tmp_path, monkeypatch, *, change=None, fault=None, paths=None):
-    value = plan(paths or ["engine/src/ssd/model-adapter.cpp"])
+def setup(tmp_path, monkeypatch, *, change=None, fault=None, paths=None, value=None):
+    value = value or plan(paths or ["engine/src/ssd/model-adapter.cpp"])
     config = template(value)
     needs = impact.device_requirements(value, config["device"])
     manifest_path = tmp_path / "manifest.json"

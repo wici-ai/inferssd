@@ -47,18 +47,40 @@ T_m = max(ln(1 + floor_fraction_m), k * sigma_log_m / sqrt(pairs))
 
 where `sigma_log_m` is the per-pair spread of `d` (its root mean square)
 measured by an A/A calibration on the same device, model and tier (see below).
-The fixed constants `k` (3) and `floor_fraction` (1% for every metric) are set
-in `thresholds` in [policy.json](policy.json); the measured bands are not.
+`floor_fraction` (1% for every metric) is set in `thresholds` in
+[policy.json](policy.json). Because `sigma_log_m` is itself estimated from a
+limited number of calibration pairs, `k` is the one-sided Student-t quantile
+whose upper tail equals a normal 3σ tail (P = 0.99865), with the band's pooled
+pairs as degrees of freedom. A fixed table in `compare.py` gives the same value
+everywhere: 4.277 at 8 pairs, 3.765 at 12, 3.545 at 16, 3.345 at 24, 3.253 at
+32, 3.122 at 64 (a count between entries uses the nearest lower entry) and the
+normal value 3.0 above 64. Each cell records the `k` it used.
+
+Only whole decode, TTFT and native prefill decide a cell. The first and second
+128-token decode rates are sub-windows of whole decode; they are measured,
+compared and shown, but cannot make a cell `regressed` or out of band.
 
 | Result | Meaning | Check behavior |
 | --- | --- | --- |
-| `passed` | Every metric's `d̄` is at or below its threshold, the generated tokens are identical in every arm, a noise band matches the measured conditions and the host check flagged nothing. | Passes. It means no slowdown beyond measured noise, not proof that none exists. |
-| `regressed` | Some metric's `d̄` is above its threshold and every pair is slower. | Blocks acceptance. Any other review reasons are listed with it. |
-| `needs-review` | A metric's `d̄` is above its threshold but the pairs disagree; a generated token sequence differs (between the sides, or between the two arms of one side); the cell has no noise band, or its band was calibrated under different measured conditions; or the Mac host check flagged an arm. | Blocks acceptance until a person reviews the evidence. |
+| `passed` | Every deciding metric's `d̄` is at or below its threshold, the generated tokens are identical in every arm, a noise band matches the measured conditions and the host check flagged nothing. | Passes. It means no slowdown beyond measured noise, not proof that none exists. |
+| `regressed` | Some deciding metric's `d̄` is above its threshold and every pair is slower. | Blocks acceptance. Any other review reasons are listed with it. |
+| `needs-review` | A deciding metric's `d̄` is above its threshold but the pairs disagree; a generated token sequence differs (between the sides, or between the two arms of one side); the cell has no noise band, or its band was calibrated under different measured conditions; or the Mac host check flagged an arm. | Blocks acceptance until a person reviews the evidence. |
 | `failed` | Missing or invalid evidence, mismatched conditions, incomplete cleanup or a failed arm. | Blocks acceptance; fix the evidence or implementation first. |
 
 Without a matching band no regression can be established, so such a cell is
-`needs-review` even when it is clearly slower. When cells are combined, the
+`needs-review` even when it is clearly slower. Bands come only from 512-tier
+calibrations of operator runs, so a 4096-tier cell, and any cell of a job
+prepared without the operator bands file (for example with
+`stage_selection.py`), has no band and is `needs-review`.
+
+With no real change, a simulation of the A/A case (two pairs per cell, normally
+distributed `d`, a band estimated from the stated number of pooled pairs, the
+1% floor) gives a false `regressed` rate of about 0.13% per deciding metric per
+cell for bands of 8, 16 or 64 pairs, close to the normal 3σ tail of 0.135%, and
+about 0.19% just above 64 pairs, where the normal value 3.0 applies. A cell has
+three deciding metrics, so its false `regressed` rate is at most about 0.4%.
+
+When cells are combined, the
 most severe result wins: `failed`, then `regressed`, then `needs-review`, then
 `passed`. A device job succeeds only when all of its cells passed.
 
@@ -94,7 +116,7 @@ head, exported and built separately exactly as in a normal comparison, so the
 noise includes separate builds. The run selects every enabled device and both
 models even though the diff is empty, and runs 4 pairs per cell by default (2 to
 4, set on the preparation host) in the same alternation: pair k runs base first
-when k is odd. Instead of a decision, each cell reports its per-pair `d` values,
+when k is odd. A band needs at least 8 pairs, so it takes two default runs. Instead of a decision, each cell reports its per-pair `d` values,
 their mean and root mean square, and the status `calibrated`, or `needs-review`
 when tokens differed or the host check flagged an arm. A device job with only
 `calibrated` cells succeeds.
@@ -111,9 +133,11 @@ python3 -I bench/ci/noise_band.py --merge noise-bands.json run-1/aggregate.json 
 For each cell it pools every input's per-pair `d`. Since base and candidate are
 the same revision, the expected `d` is zero, and `sigma_log` is the root mean
 square of the pooled values. Results from different revisions or measured
-conditions are refused rather than pooled; flagged cells are skipped with a
-note. A band needs at least 4 pairs; pooling two or more runs gives a steadier
-estimate. Review the output before replacing `noise-bands.json`. As with a
+conditions are refused rather than pooled. Flagged cells, cells with fewer
+than 8 pooled pairs, device rows without a verified result and report errors
+are listed as skipped, never silently dropped. More pooled pairs give a smaller
+`k` and a steadier estimate. Review the output before replacing
+`noise-bands.json`. As with a
 profile or policy change, a changed bands file makes a queued authorization
 stale and cancels a running one, so update it between runs; the next prepared
 job seals the new bands.
@@ -125,12 +149,18 @@ files, settings, template, resource limits, OS and loaded libraries all enter
 
 ## Time budget
 
-From recorded arm durations, one pair of both models takes about 15 minutes on
-cloud-5090 and 22 minutes on dgx-spark and local-mbp, on top of about 12 to 18
-minutes for builds, numerical checks and short preflights. A `/ci test` with two
-pairs therefore takes about 47 to 59 minutes per device, and a 4-pair
-calibration about 77 to 103 minutes, within the 120-minute device job limit.
-Each arm stays far below the 7200-second Mac stage limit.
+From recorded runs, each device job has a fixed part for builds, numerical
+checks, short requests and preflights, and one pair of both models adds a
+timed part:
+
+| Device | Fixed part | One pair, both models | `/ci test` (2 pairs) | Calibration (4 pairs) |
+| --- | ---: | ---: | ---: | ---: |
+| cloud-5090 | about 18 min | about 14.7 min | about 47 min | about 77 min |
+| dgx-spark | about 15 min | about 22.0 min | about 59 min | about 103 min |
+| local-mbp | about 12 min | about 22.3 min | about 57 min | about 101 min |
+
+All stay within the 120-minute device job limit, and each arm stays far below
+the 7200-second Mac stage limit.
 
 CI samples have `purpose=ci` and are not formal benchmark samples. The formal
 benchmark ([FINAL.md](../FINAL.md)) runs each prescribed 512/4K cell once on the

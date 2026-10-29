@@ -129,6 +129,17 @@ def authorization(
             and writable(api, repo, row.get("user", {}).get("login"))
         ):
             raise Stale("a later maintainer review cancelled physical testing")
+    if command == "calibrate":
+        # A calibration measures the reviewed head against itself. It binds no
+        # base or test merge, so a moving PR base neither blocks nor stales it.
+        value = dict(repository=repo, pr=number, review_id=review_id, reviewer=login,
+                     review_commit_id=actual, base=actual, head=actual, candidate=actual, command=command)
+        if require_ci:
+            try:
+                value["hosted_ci"] = current_ci(SourceAPI(api, repo), value, policy, require_base=False)
+            except ValueError as error:
+                raise Waiting(str(error)) from error
+        return value
     base = revision(pr["base"]["sha"])
     candidate = pr.get("merge_commit_sha")
     if not candidate:
@@ -182,8 +193,9 @@ def save_record(path, value, status, **fields):
 
 
 def fetch_objects(args, identity, repository):
+    calibration = identity["command"] == "calibrate"
     try:
-        for name in ("base", "head", "candidate"):
+        for name in ("head",) if calibration else ("base", "head", "candidate"):
             prepare.git(args.source, "cat-file", "-e", identity[name] + "^{commit}")
         return
     except ValueError:
@@ -211,8 +223,7 @@ def fetch_objects(args, identity, repository):
         "--no-recurse-submodules",
         args.fetch_remote,
         "refs/pull/" + str(identity["pr"]) + "/head",
-        "refs/pull/" + str(identity["pr"]) + "/merge",
-        identity["base"],
+        *(() if calibration else ("refs/pull/" + str(identity["pr"]) + "/merge", identity["base"])),
     )
 
 
@@ -228,10 +239,11 @@ def trusted_inputs_changed(args, record):
 
 def same_authorization(old, new):
     # Records written before `/ci calibrate` existed were all `/ci test` runs.
-    if old.get("command", "run") != new["command"] or any(
-        old[name] != new[name]
-        for name in ("repository", "pr", "review_id", "base", "head", "candidate")
-    ):
+    # A calibration is bound to its reviewed head only, never to the PR base.
+    names = ("repository", "pr", "review_id", "head")
+    if new["command"] != "calibrate":
+        names += ("base", "candidate")
+    if old.get("command", "run") != new["command"] or any(old[name] != new[name] for name in names):
         raise Stale("prepared source/base/command changed; a new review is required")
 
 

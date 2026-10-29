@@ -137,7 +137,11 @@ def requirements(config):
     if calibration and (scope is None or scope["validation_mode"] != PERFORMANCE_MODE):
         raise ValueError("noise calibration requires the explicit operator performance scope")
     if scope is not None and scope["validation_mode"] == PERFORMANCE_MODE:
-        protocol_checked(config.get("performance_protocol"), calibration=calibration)
+        protocol = protocol_checked(config.get("performance_protocol"), calibration=calibration)
+        thresholds = policy["thresholds"]
+        if not calibration and (thresholds["pairs"] != protocol["samples_per_side"]
+                                or thresholds["order"] != protocol["order"]):
+            raise ValueError("decision policy pairs/order differ from the sealed performance protocol")
         if "noise_bands" not in config:
             raise ValueError("operator performance requires explicitly sealed noise bands")
     sealed_bands(config)

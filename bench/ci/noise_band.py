@@ -22,16 +22,30 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ci.compare import CALIBRATION, log_ratio
-from ci.contract import NOISE_BAND_STATISTIC, PERFORMANCE_METRICS, load, noise_band, noise_bands
+from ci.compare import CALIBRATION, log_ratio, rms
+from ci.contract import NOISE_BAND_MIN_PAIRS, NOISE_BAND_STATISTIC, PERFORMANCE_METRICS, load, noise_band, noise_bands
 
 
-def series(value):
-    """Every cell result in an operator report, or the single result of a cell file."""
+def series(value, skipped):
+    """Every cell result in an operator report, or the single result of a cell file.
+
+    Report errors and rows without verified results (failed replay, deferred
+    devices) are recorded in `skipped`; nothing is silently ignored.
+    """
     if isinstance(value, dict) and isinstance(value.get("cells"), list):
+        for error in value.get("errors", []):
+            device = error.get("device", "report") if isinstance(error, dict) else "report"
+            detail = error.get("error", error) if isinstance(error, dict) else error
+            skipped.append(dict(cell=str(device), status="error", reasons=[str(detail)]))
         for row in value["cells"]:
-            if isinstance(row, dict) and isinstance(row.get("performance"), list):
+            if not isinstance(row, dict):
+                raise ValueError("operator report row is not an object")
+            if isinstance(row.get("performance"), list):
                 yield from row["performance"]
+            elif row.get("status") != "not-required":
+                skipped.append(dict(cell=str(row.get("device")) + "/" + str(row.get("model")),
+                                    status=row.get("status"),
+                                    reasons=[str(row.get("error", row.get("performance", "no verified result")))]))
     elif isinstance(value, dict) and isinstance(value.get("protocol"), dict):
         yield value
     else:
@@ -58,7 +72,7 @@ def bands(values, *, date):
     """Return (bands, skipped) for the calibration results in `values`."""
     pooled, skipped = {}, []
     for value in values:
-        for entry in series(value):
+        for entry in series(value, skipped):
             protocol, cell = entry.get("protocol", {}), entry.get("cell", {})
             name = "/".join(str(cell.get(key)) for key in ("device", "model", "tier", "job_id"))
             if protocol.get("purpose") != CALIBRATION or cell.get("base") != cell.get("candidate"):
@@ -81,8 +95,11 @@ def bands(values, *, date):
             raise ValueError("calibrations from different revisions or measured conditions cannot be pooled: "
                              + "/".join((device, model, tier)))
         count = len(group["d"][PERFORMANCE_METRICS[0]])
-        band = dict(sigma_log={metric: math.sqrt(sum(x * x for x in group["d"][metric]) / count)
-                               for metric in PERFORMANCE_METRICS},
+        if count < NOISE_BAND_MIN_PAIRS:
+            skipped.append(dict(cell="/".join((device, model, tier)), status="too-few-pairs",
+                                reasons=[f"{count} pooled pairs; a band needs at least {NOISE_BAND_MIN_PAIRS}"]))
+            continue
+        band = dict(sigma_log={metric: rms(group["d"][metric]) for metric in PERFORMANCE_METRICS},
                     pairs=count, statistic=NOISE_BAND_STATISTIC,
                     conditions_sha256=next(iter(group["conditions"])),
                     engine_revision=next(iter(group["revisions"])),

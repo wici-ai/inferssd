@@ -35,7 +35,9 @@ ABBA order on fresh servers and records TTFT, native prefill and first/second
 128-token and whole decode rates for every arm. No automatic completion retry or
 best-of selection exists. The cell is `regressed`, `needs-review` or `passed`
 against a calibrated noise band, as described in
-[performance acceptance](PERFORMANCE.md).
+[performance acceptance](PERFORMANCE.md). Bands are sealed only by operator
+preparation and exist only for the 512 tier, so 4096-tier cells and jobs
+generated with `stage_selection.py` have no band and report `needs-review`.
 
 A noise calibration (`/ci calibrate`) is the one case with an empty diff: it
 compares one revision with itself and selects every device and both models with

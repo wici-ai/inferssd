@@ -139,11 +139,11 @@ def band(**changes):
 def test_shipped_policy_holds_gate_constants_but_no_bands(policy):
     thresholds = policy["thresholds"]
     assert thresholds["mode"] == "calibrated-noise-band" and "bands" not in thresholds
-    assert thresholds["pairs"] == 2 and thresholds["order"] == "ABBA" and thresholds["k"] == 3
+    assert thresholds["pairs"] == 2 and thresholds["order"] == "ABBA" and "k" not in thresholds
     assert thresholds["floor_fraction"] == {metric: 0.01 for metric in compare.METRICS}
 
 
-@pytest.mark.parametrize("damage", ["old-mode", "extra-key", "pairs", "bool-pairs", "order", "k-zero", "k-nan",
+@pytest.mark.parametrize("damage", ["old-mode", "extra-key", "pairs", "bool-pairs", "order", "fixed-k",
                                     "floor-negative", "floor-one", "floor-missing", "bands-in-policy"])
 def test_policy_thresholds_are_explicit_and_finite(policy, damage):
     thresholds = policy["thresholds"]
@@ -152,8 +152,7 @@ def test_policy_thresholds_are_explicit_and_finite(policy, damage):
     elif damage == "pairs": thresholds["pairs"] = 1
     elif damage == "bool-pairs": thresholds["pairs"] = True
     elif damage == "order": thresholds["order"] = "ABAB"
-    elif damage == "k-zero": thresholds["k"] = 0
-    elif damage == "k-nan": thresholds["k"] = float("nan")
+    elif damage == "fixed-k": thresholds["k"] = 3  # The multiplier is the fixed t quantile, not policy.
     elif damage == "floor-negative": thresholds["floor_fraction"]["ttft_s"] = -0.01
     elif damage == "floor-one": thresholds["floor_fraction"]["decode_tps"] = 1
     elif damage == "floor-missing": del thresholds["floor_fraction"]["server_prefill_tps"]
@@ -170,7 +169,7 @@ def test_noise_band_entries_are_complete_and_well_formed(damage):
     if damage == "sigma-missing": del value["sigma_log"]["ttft_s"]
     elif damage == "sigma-negative": value["sigma_log"]["ttft_s"] = -1
     elif damage == "sigma-inf": value["sigma_log"]["ttft_s"] = float("inf")
-    elif damage == "few-pairs": value["pairs"] = 3
+    elif damage == "few-pairs": value["pairs"] = 7  # Two default calibration runs give 8.
     elif damage == "statistic": value["statistic"] = "median"
     elif damage == "conditions": value["conditions_sha256"] = "C" * 64
     elif damage == "revision": value["engine_revision"] = "a" * 39
@@ -237,3 +236,15 @@ def test_observed_native_prefill_slowdown_blocks_complete_three_device_report(sy
     assert report["status"] == "needs-review" and not report["passed"]
     row = next(row for row in report["devices"][0]["rows"] if row["model"] == "muse")
     assert row["evidence_valid"] and row["observed_slowdowns"] == ["server_prefill_tps"]
+
+
+def test_legacy_single_pair_paths_describe_what_they_actually_decide(synthetic):
+    from ci.private_controller import check_body
+    roots, plan, policy = synthetic
+    report = compare.aggregate(roots, plan, policy)
+    assert report["interpretation"] == compare.LEGACY_INTERPRETATION
+    assert all(device["interpretation"] == compare.LEGACY_INTERPRETATION for device in report["devices"])
+    controller = dict(repository="wici-ai/inferssd-device-ci", run_id=1, run_attempt=1)
+    summary = check_body(dict(controller=controller, head="b" * 40), report, 88)["output"]["summary"]
+    for text in (compare.LEGACY_INTERPRETATION, summary):
+        assert "one base/candidate pair" in text.lower() and "noise" not in text and "band" not in text

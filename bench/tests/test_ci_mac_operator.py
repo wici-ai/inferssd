@@ -419,9 +419,13 @@ def test_mac_timed_pairs_replay_real_protocol_sse_and_every_arm_runtime(mac_perf
         value = json.loads(path.read_text()); value["pair"] = 1
         path.write_text(json.dumps(value))
     elif damage == "swapped-order":
-        # Exchange whole arm folders of one pair: identities stay valid, the order does not.
-        first, second = root / "deepseek/512/r2/candidate", root / "deepseek/512/r2/base"
-        first.rename(root / "swap"); second.rename(first); (root / "swap").rename(second)
+        # Pair 2 ran base before candidate: every identity stays valid, only the order is wrong.
+        from test_ci_performance_series import shift_arm
+        shift_arm(root / "deepseek/512/r2/candidate", 300_000_000_000)
+        shift_arm(root / "deepseek/512/r2/base", -300_000_000_000)
+        with pytest.raises(ValueError, match="interleaved order"):
+            aggregate.performance_retained(root, config, "deepseek", "512", plan, policy, preflight, JOB)
+        return
     if damage:
         with pytest.raises((ValueError, OSError)):
             aggregate.performance_retained(root, config, "deepseek", "512", plan, policy, preflight, JOB)

@@ -34,9 +34,12 @@ It has the same authorization rules as `/ci test` and runs the exact head agains
 itself: base and candidate are both that commit, built separately. Every enabled
 device and both models are selected even though the diff is empty, and each cell
 runs 4 pairs by default (`--calibration-pairs`, 2 to 4; the value is recorded
-when the review is queued). The report lists per-pair log ratios instead of a
-decision; `bench/ci/noise_band.py` turns one or more such reports into the
-`noise-bands.json` file kept next to the device profiles, for review.
+when the review is queued). A calibration binds only the reviewed head: it
+needs no test merge, a moving PR base neither blocks nor cancels it, and the
+latest normal CI for that head must still have succeeded. The report lists
+per-pair log ratios instead of a decision; `bench/ci/noise_band.py` turns two or
+more such reports (at least 8 pairs per cell) into the `noise-bands.json` file
+kept next to the device profiles, for review.
 
 Review and run records are retained without replay; upgrading the operator
 never extends an old review to a new performance run. Submit a fresh `/ci test`

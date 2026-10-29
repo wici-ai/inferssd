@@ -19,7 +19,7 @@ PERFORMANCE_METRICS = (
 )
 NOISE_BAND_MODE = "calibrated-noise-band"
 NOISE_BAND_STATISTIC = "rms-paired-log-ratio"
-NOISE_BAND_MIN_PAIRS = 4
+NOISE_BAND_MIN_PAIRS = 8  # two default calibration runs
 BAND_TIERS = ("512", "4096")
 
 
@@ -139,16 +139,16 @@ def noise_band(value):
 
 
 def noise_thresholds(value):
-    """Fixed decision constants. Calibrated bands are separate operator data."""
-    fields = {"mode", "pairs", "order", "k", "floor_fraction"}
+    """Fixed decision constants. Calibrated bands are separate operator data, and
+    the band multiplier is a fixed Student-t quantile in compare.py."""
+    fields = {"mode", "pairs", "order", "floor_fraction"}
     if not isinstance(value, dict) or set(value) != fields or value["mode"] != NOISE_BAND_MODE:
         raise ValueError("performance thresholds must use the calibrated noise-band mode")
     floors = value["floor_fraction"]
     if (type(value["pairs"]) is not int or value["pairs"] < 2 or value["order"] != "ABBA"
-            or not finite(value["k"], inclusive=False)
             or not isinstance(floors, dict) or set(floors) != set(PERFORMANCE_METRICS)
             or not all(finite(floors[metric], below=1) for metric in PERFORMANCE_METRICS)):
-        raise ValueError("noise-band pairs, order, k and per-metric floors must be explicit and finite")
+        raise ValueError("noise-band pairs, order and per-metric floors must be explicit and finite")
     return value
 
 

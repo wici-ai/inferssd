@@ -33,6 +33,25 @@ CALIBRATION = "noise-calibration"
 # Most severe first. "calibrated" only appears in A/A calibration runs.
 SEVERITY = ("failed", "regressed", "needs-review", "calibrated", "passed")
 SUCCESS = ("passed", "calibrated")
+# Only these metrics can make a cell regressed or out of band. The two decode
+# half-windows are sub-windows of whole decode and are shown for information.
+GATED_METRICS = ("decode_tps", "ttft_s", "server_prefill_tps")
+# One-sided Student-t quantiles whose upper tail equals the normal 3-sigma tail
+# (P = 0.99865), keyed by the band's pooled pairs (its degrees of freedom).
+# Values are rounded up, a degree count between entries uses the nearest lower
+# entry, and above 64 the normal value 3.0 applies. A fixed table keeps the
+# multiplier identical on every device and in the hosted replay.
+BAND_QUANTILE = "one-sided Student-t, P = 0.99865 (normal 3 sigma), df = pooled band pairs"
+T_QUANTILES = ((8, 4.277), (9, 4.095), (10, 3.957), (11, 3.850), (12, 3.765), (13, 3.695),
+               (14, 3.636), (15, 3.587), (16, 3.545), (18, 3.476), (20, 3.423), (24, 3.345),
+               (28, 3.292), (32, 3.253), (40, 3.199), (48, 3.165), (56, 3.140), (64, 3.122))
+NORMAL_QUANTILE = 3.0
+LEGACY_INTERPRETATION = (
+    "One base/candidate pair per cell, each arm a fresh server with one completion. Any "
+    "slower metric or different generated tokens needs review; a single pair is an "
+    "observation, not a statistical test. No automatic retries or selection of a best "
+    "attempt. OS cache treatment is recorded, not assumed cold."
+)
 PAIR_INTERPRETATION = (
     "One base/candidate pair, each arm a fresh server with one completion. "
     "needs-review here marks any slower metric or different generated tokens in this "
@@ -43,10 +62,12 @@ INTERPRETATION = (
     "Each cell runs interleaved base/candidate pairs in ABBA order (base, candidate, "
     "candidate, base), each arm a fresh server with one completion. Every arm is kept; "
     "nothing is retried or selected. For each metric, d is the per-pair log ratio, signed "
-    "so that a positive value means the candidate is slower. The cell is regressed when "
-    "the mean d is above the calibrated noise threshold and every pair is slower. It needs "
-    "review when the threshold is exceeded but the pairs disagree, generated tokens differ, "
-    "no noise band matches the measured conditions, or the host check flagged an arm. "
+    "so that a positive value means the candidate is slower. The cell is regressed when, "
+    "for whole decode, TTFT or native prefill, the mean d is above the calibrated noise "
+    "threshold and every pair is slower; the decode half-windows are shown for information. "
+    "It needs review when such a threshold is exceeded but the pairs disagree, generated "
+    "tokens differ, no noise band matches the measured conditions, or the host check "
+    "flagged an arm. "
     "Otherwise it passes: no slowdown beyond measured noise, which is not proof that none "
     "exists. OS cache treatment is recorded, not assumed cold."
 )
@@ -74,6 +95,24 @@ def schedule(pairs):
 
 def arm_name(k, side):
     return "r" + str(k) + "/" + side
+
+
+def band_multiplier(pairs):
+    """Threshold multiplier for a band calibrated from `pairs` pooled A/A pairs."""
+    if type(pairs) is not int or pairs < T_QUANTILES[0][0]:
+        raise ValueError("noise band has too few pairs for a decision")
+    if pairs > T_QUANTILES[-1][0]:
+        return NORMAL_QUANTILE
+    return [value for df, value in T_QUANTILES if df <= pairs][-1]  # nearest lower entry
+
+
+def mean(values):
+    """Correctly rounded everywhere: plain sum() of floats changed in Python 3.12."""
+    return math.fsum(values) / len(values)
+
+
+def rms(values):
+    return math.sqrt(math.fsum(value * value for value in values) / len(values))
 
 
 # Device runs and the hosted replay use different C math libraries. Decimal's
@@ -357,32 +396,34 @@ def compare_series(results, receipts, pairs, policy, *, cell, protocol, bands):
                      status="matched" if band["conditions_sha256"] == identity["conditions_sha256"] else "conditions-differ")
         if noise["status"] != "matched":
             reasons.append("noise-band-conditions-differ")
+    multiplier = band_multiplier(band["pairs"]) if noise is not None and noise["status"] == "matched" else None
     metrics, regressions = {}, []
     for metric in METRICS:
         base = [results[k, "base"]["metrics"][metric] for k in range(1, count + 1)]
         candidate = [results[k, "candidate"]["metrics"][metric] for k in range(1, count + 1)]
         d = [log_ratio(metric, before, after) for before, after in zip(base, candidate)]
-        mean = sum(d) / count
+        average = mean(d)
         entry = dict(direction="lower-is-better" if metric == "ttft_s" else "higher-is-better",
-                     base=base, candidate=candidate, d=d, mean_d=mean,
-                     change_percent=(exp(mean if metric == "ttft_s" else -mean) - 1) * 100,
+                     gated=metric in GATED_METRICS, base=base, candidate=candidate, d=d, mean_d=average,
+                     change_percent=(exp(average if metric == "ttft_s" else -average) - 1) * 100,
                      all_pairs_worse=all(value > 0 for value in d))
         if purpose == CALIBRATION:
-            entry["rms_d"] = math.sqrt(sum(value * value for value in d) / count)
+            entry["rms_d"] = rms(d)
         elif noise["status"] == "matched":
             sigma = band["sigma_log"][metric]
             floor = float(EXACT.ln(Decimal(1) + Decimal(thresholds["floor_fraction"][metric])))
-            threshold = max(floor, thresholds["k"] * sigma / math.sqrt(count))
-            beyond = mean > threshold
+            threshold = max(floor, multiplier * sigma / math.sqrt(count))
+            beyond = average > threshold
+            result = ("regressed" if entry["all_pairs_worse"] else "pairs-disagree") if beyond else "within-band"
             entry.update(sigma_log=sigma, threshold=threshold, beyond_band=beyond,
-                         result=("regressed" if entry["all_pairs_worse"] else "pairs-disagree")
-                         if beyond else "within-band")
+                         result=result if entry["gated"] else "informational")
             if entry["result"] == "regressed":
                 regressions.append(metric)
             elif entry["result"] == "pairs-disagree":
                 reasons.append("pairs-disagree:" + metric)
         else:
-            entry.update(sigma_log=None, threshold=None, beyond_band=None, result="no-matching-band")
+            entry.update(sigma_log=None, threshold=None, beyond_band=None,
+                         result="no-matching-band" if entry["gated"] else "informational")
         metrics[metric] = entry
     if differences:
         reasons.append("generated-tokens-differ")
@@ -401,7 +442,8 @@ def compare_series(results, receipts, pairs, policy, *, cell, protocol, bands):
                   interpretation=CALIBRATION_INTERPRETATION if purpose == CALIBRATION else INTERPRETATION)
     if purpose == REGRESSION_GATE:
         result.update(noise_band=noise, decision_rule=dict(
-            k=thresholds["k"], floor_fraction=thresholds["floor_fraction"], pairs=count,
+            k=multiplier, k_quantile=BAND_QUANTILE, floor_fraction=thresholds["floor_fraction"], pairs=count,
+            gated_metrics=list(GATED_METRICS),
             threshold="max(ln(1 + floor_fraction), k * sigma_log / sqrt(pairs))",
             noise_bands_sha256=conditions_digest(bands)))
     return result
@@ -524,7 +566,7 @@ def device_report(root, plan, policy):
         "status": outcome(rows),
         "rows": rows,
         "thresholds": policy["thresholds"],
-        "interpretation": PAIR_INTERPRETATION,
+        "interpretation": LEGACY_INTERPRETATION,
     }
 
 
@@ -543,7 +585,7 @@ def aggregate(roots, plan, policy):
         "devices": reports,
         "thresholds": policy["thresholds"],
         "formal_samples": 0,
-        "interpretation": PAIR_INTERPRETATION,
+        "interpretation": LEGACY_INTERPRETATION,
     }
 
 

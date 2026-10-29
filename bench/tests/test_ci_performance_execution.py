@@ -52,9 +52,10 @@ def test_operator_preserves_impact_but_stages_only_the_explicit_512_checkpoint()
 
 
 @pytest.mark.parametrize("damage", ["missing-protocol", "wrong-prompt", "output-count", "bool-count", "extra-tier", "missing-base",
-                                    "missing-bands", "invalid-bands"])
+                                    "missing-bands", "invalid-bands", "policy-pairs", "policy-order"])
 def test_new_mode_never_silently_defaults_or_accepts_one_sided_performance(damage):
     config, manifest = bound_config(["engine/src/models/muse.cpp"])
+    policy = copy.deepcopy(POLICY)
     if damage == "missing-protocol": config.pop("performance_protocol")
     elif damage == "wrong-prompt": config["performance_protocol"]["prompt_sha256"] = "0" * 64
     elif damage == "output-count": config["performance_protocol"]["output_tokens"] = 8
@@ -62,9 +63,37 @@ def test_new_mode_never_silently_defaults_or_accepts_one_sided_performance(damag
     elif damage == "extra-tier": config["sides"]["base"]["models"]["muse"]["benchmarks"]["4096"] = {}
     elif damage == "missing-bands": config.pop("noise_bands")
     elif damage == "invalid-bands": config["noise_bands"] = {"cloud-5090": {"muse": {"512": {}}}}
+    # A decision policy that no longer matches the sealed protocol fails before any device runs.
+    elif damage == "policy-pairs": policy["thresholds"]["pairs"] = 3
+    elif damage == "policy-order": policy["thresholds"]["order"] = "ABAB"
     else: manifest["source_revisions"].pop("base")
     with pytest.raises(ValueError):
-        contract.bind(config, manifest, config["selection_plan"], POLICY)
+        contract.bind(config, manifest, config["selection_plan"], policy)
+
+
+def test_calibration_runs_every_planned_arm_end_to_end_and_succeeds_without_a_decision(tmp_path, monkeypatch):
+    from ci import impact
+    head = "b" * 40
+    value = impact.plan([], POLICY, base=head, head=head, candidate=head, calibration=True)
+
+    def calibration(config):
+        performance(config)
+        config["performance_protocol"] = contract.performance_protocol(4)
+
+    args, config, manifest, needs, events, sessions = setup(tmp_path, monkeypatch, value=value, change=calibration)
+    assert execution.run(args) == 0
+    report = load(args.output / "integration.json")
+    assert report["status"] == "calibrated" and report["performance_protocol"]["samples_per_side"] == 4
+    order = [("1", "base"), ("1", "candidate"), ("2", "candidate"), ("2", "base"),
+             ("3", "base"), ("3", "candidate"), ("4", "candidate"), ("4", "base")]
+    assert args.stages == [side + "-" + model + "-r" + pair + "-benchmark-512"
+                           for model in ("deepseek", "muse") for pair, side in order]
+    for cell in report["cells"]:
+        entry = cell["performance"][0]
+        assert entry["status"] == "calibrated" and len(entry["pairs"]) == 4 and "noise_band" not in entry
+        assert entry["cell"]["base"] == entry["cell"]["candidate"] == head
+        assert entry["metrics"]["decode_tps"]["d"] == [0.0] * 4 and entry["metrics"]["decode_tps"]["rms_d"] == 0.0
+    assert sessions[0].closed
 
 
 def test_control_only_scope_keeps_performance_not_required_and_candidate_only():
