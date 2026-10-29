@@ -353,11 +353,11 @@ borrowed-reference behavior.
 ## Explicit owned server execution
 
 `inferssd launch --execute` resolves typed Linux or Darwin inputs with lazy live
-host facts, then starts one supervised server. On Windows, `--dry-run` prepares
-the server command; owned execution is not implemented there. Owned execution
-requires an explicit policy and writes to a new run directory: `--output-dir`,
-or `runs/<UTC time>` under the current directory. The server listens on a
-loopback port:
+host facts, then starts one supervised server. Windows support is in progress:
+`--dry-run` prepares the server command there, and owned execution is not
+implemented yet. Owned execution requires an explicit policy and writes to a new
+run directory: `--output-dir`, or `runs/<UTC time>` under the current directory.
+The server listens on a loopback port:
 
 ```sh
 inferssd launch --execute --platform linux --repo /path/to/inferssd \

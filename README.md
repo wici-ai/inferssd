@@ -93,6 +93,8 @@ Build from `main` for either platform. The setup guide covers source indexing, t
 | macOS / Metal (Apple Silicon) | `main` | [Mac setup](docs/quickstart.md#apple-silicon) · [Muse on Mac](docs/quickstart.md#muse-on-mac) |
 | Linux / NVIDIA CUDA | `main` | [Linux setup](docs/quickstart.md#linux--nvidia) |
 
+Windows support is in progress. The engine, the server and the SSD expert path build and pass their tests on Windows x64 (CPU), and `inferssd launch --dry-run` prepares the server command there; supervised launch (`--execute`) is not available on Windows yet.
+
 `x86_64` covers Intel and AMD CPUs; DGX Spark (GB10) uses `ARM64`. CUDA identifies the NVIDIA GPU backend, not the CPU vendor. The x86_64 benchmarks use Intel CPUs.
 
 Historical DeepSeek runs used approximately **473 GiB of GGUF weights + 269 GiB for the expert pack**; Muse's pack added approximately **450 GiB**. The current framework can index GGUF experts directly without a separate pack. When using a pack, keep the original shards and generate it from the exact checkpoint you load.
