@@ -46,7 +46,7 @@ Use the same Metal build, select `--profile muse`, and point `--model` at the fi
 
 ## Linux / NVIDIA
 
-Install `liburing-dev` on Debian/Ubuntu, or your distribution's equivalent. The production launcher also requires systemd and cgroup v2 with a usable memory controller. Ensure the CUDA compiler is available to CMake; set `CMAKE_CUDA_ARCHITECTURES` if your toolchain needs an explicit target for your GPU.
+Install `liburing-dev` on Debian/Ubuntu, or your distribution's equivalent. The launcher also has [system requirements](#linux-requirements). Ensure the CUDA compiler is available to CMake; set `CMAKE_CUDA_ARCHITECTURES` if your toolchain needs an explicit target for your GPU.
 
 ```sh
 cmake --preset linux-cuda
@@ -56,6 +56,16 @@ python3 scripts/engine-resources.py \
 ```
 
 The [Linux resource prerequisites](testing.md#linux-resource-prerequisites) describe I/O, cgroup and pinned-memory requirements.
+
+### Linux requirements
+
+`inferssd launch` runs the server in a systemd scope whose memory limit is the policy's `memory_budget_bytes` and which forbids the server to swap; other programs may still use swap. This needs:
+
+- systemd as the init system. Most containers, and WSL without systemd enabled, do not provide it.
+- The cgroup v2 unified hierarchy. It is the default on current distributions, for example Ubuntu 22.04 and later, Debian 11 and later, Fedora and RHEL 9.
+- When you do not launch as root: a systemd user manager for your account (a login session, or `loginctl enable-linger`), with the memory controller delegated to it (`Delegate=memory` in a `user@.service` drop-in if your distribution does not already delegate it).
+
+The launcher checks these before it starts the server and reports the first one that is missing.
 
 ## Prepare a launch
 

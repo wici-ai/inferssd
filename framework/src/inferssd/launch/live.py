@@ -93,7 +93,7 @@ class NativeHost:
 
 
 HOST_FACTS = frozenset(
-    "gpu_available ss_available has_uring cgroup_v2 user_manager memory_controller euid "
+    "gpu_available ss_available has_uring systemd cgroup_v2 user_manager memory_controller euid "
     "memory_kib filesystem gpu_memory gpu_processes port_busy scope_suffix "
     "platform_system platform_machine default_threads physical_memory disk_free".split()
 )
@@ -147,6 +147,9 @@ class LiveArtifacts:
             return self.output(["ss", "-Hltn", "sport = :" + args[0]], check=False)
         if name == "has_uring":
             return any(host.contains(path, b"io_uring_queue_init") for path in args)
+        if name == "systemd":
+            # The same test as sd_booted(): systemd is running as the init system.
+            return host.exists("/run/systemd/system")
         if name == "cgroup_v2":
             return host.exists("/sys/fs/cgroup/cgroup.controllers")
         if name == "memory_kib":

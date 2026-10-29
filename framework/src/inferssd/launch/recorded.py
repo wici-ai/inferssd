@@ -180,6 +180,9 @@ class RecordedArtifacts:
                     replace=self.replace,
                 )
             )
+        if name == "systemd" and name not in self.host:
+            # Recordings made before this fact existed came from systemd hosts.
+            return Reply(True)
         if name not in self.host:
             raise ValueError(f"Missing recorded host fact: {name}")
         value = self.host[name]
@@ -187,6 +190,7 @@ class RecordedArtifacts:
             "gpu_available",
             "ss_available",
             "has_uring",
+            "systemd",
             "cgroup_v2",
             "user_manager",
             "memory_controller",

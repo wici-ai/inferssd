@@ -253,14 +253,29 @@ def _resolve(
         if not isinstance(path, str) or not s.value("is_file", path):
             raise ValueError("missing typed expert source: " + str(path))
     if platform == "linux":
+        guide = "; see docs/quickstart.md#linux-requirements"
+        if not s.value("systemd"):
+            raise ValueError(
+                "systemd is required for owned Linux execution: it is not the init system "
+                "here, as in most containers" + guide
+            )
         if not s.value("cgroup_v2"):
-            raise ValueError("cgroup v2 is required for owned Linux execution")
+            raise ValueError(
+                "cgroup v2 is required for owned Linux execution: "
+                "/sys/fs/cgroup/cgroup.controllers is missing" + guide
+            )
         uid = s.value("euid")
         if uid != 0:
             if not s.value("user_manager"):
-                raise ValueError("no systemd user manager is available")
+                raise ValueError(
+                    "no systemd user manager is available: start a login session, "
+                    "run `loginctl enable-linger`, or launch as root" + guide
+                )
             if not s.value("memory_controller", str(uid)):
-                raise ValueError("the memory controller is not delegated")
+                raise ValueError(
+                    "the memory controller is not delegated to your systemd user manager: "
+                    "add Delegate=memory to a user@.service drop-in, or launch as root" + guide
+                )
         if value.at("vram.budget").value != 0:
             if not s.value("gpu_available"):
                 raise ValueError("typed GPU execution requires nvidia-smi")
