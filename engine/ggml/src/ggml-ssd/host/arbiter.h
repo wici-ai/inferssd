@@ -35,13 +35,29 @@ struct client_config {
     uint64_t budget_bytes = 0;
 };
 
-// Only the requesting context's reclaimers run, synchronously and without the
-// arbiter mutex. No callback or raw context pointer is stored in the owner.
+// What the arbiter may ask of a context's expert caches before it refuses an
+// admission of that context, in this order. The executor that owns the caches
+// registers them with its context (context_client::set_reclaimer), so every
+// take() and make_room() of the context runs them and no allocation has to name
+// them. Only the requesting context's reclaimer runs, synchronously on the
+// admitting thread and without the arbiter mutex: each step makes the caches
+// safe to change itself.
 struct actions {
+    // Publishes the GPU tier's finished deferred uploads and returns their RAM leases.
     std::function<void()> collect_deferred;
-    std::function<bool(uint64_t)> reclaim_tier;
-    std::function<bool(uint64_t)> reclaim_cache;
+    // Unified memory: the GPU tier gives blocks back for `bytes` more (false when it could not).
+    std::function<bool(uint64_t bytes)> reclaim_tier;
+    // The RAM cache gives slots back until room for `bytes` fits (false when it cannot).
+    std::function<bool(uint64_t bytes)> reclaim_cache;
 };
+// Who an admission is for, which decides what the reclaimer gives back for it.
+// An allocation outside the caches (compute and work buffers, scratch,
+// checkpoints) has the GPU tier give room first on unified memory while the
+// system term is short, as the tier grows back into memory that is free again
+// at a later decode token, then the RAM cache. The RAM cache's own growth has
+// its colder slots give room. The GPU tier's growth takes free room only: it
+// keeps the floor and the RAM cache's demand free itself.
+enum class requester { outside, ram_cache, gpu_tier };
 
 struct snapshot {
     bool configured = false, unified = false, reclaimable_file = false;
@@ -116,11 +132,17 @@ class context_client {
     [[nodiscard]] result<uint64_t> dram_bytes(uint64_t host, uint64_t device) const noexcept;
     [[nodiscard]] result<room> measure(uint64_t extra, bool full_boost = false) const noexcept;
     [[nodiscard]] result<room> project_decode_capacity(uint64_t extra = 0, bool full_boost = false) const noexcept;
+    // The reclaimer every admission of this context runs before it refuses. One
+    // per context, registered by the executor that owns the caches once it can
+    // run it; clearing waits for the reclaims running on other threads, so the
+    // executor must not hold anything they wait for.
+    [[nodiscard]] result<void> set_reclaimer(const actions &) noexcept;
+    void clear_reclaimer() noexcept;
     // Observation/reclaim compatibility seam. It does not reserve a future
     // allocation. Production allocations must keep the returned take ticket.
-    [[nodiscard]] result<room> make_room(uint64_t extra, const actions & = {}) noexcept;
-    [[nodiscard]] result<allocation_ticket> take(uint64_t host, uint64_t device = 0, const actions & = {},
-                           bool require_finite_cgroup = false,
+    [[nodiscard]] result<room> make_room(uint64_t extra) noexcept;
+    [[nodiscard]] result<allocation_ticket> take(uint64_t host, uint64_t device = 0,
+                           requester who = requester::outside, bool require_finite_cgroup = false,
                            allocation_class classification = allocation_class::external) noexcept;
     [[nodiscard]] result<bool> update_file_reserve() noexcept;
     [[nodiscard]] result<void> begin_interval(uint64_t held) noexcept;

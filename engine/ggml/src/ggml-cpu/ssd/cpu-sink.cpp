@@ -353,6 +353,25 @@ static ssd::host::expert_cache_options sink_cache_options(const sink_configurati
 
 #include "ssd/cpu-sink-vram.inc"
 
+// The run lock and the thread holding it. The host arbiter runs the sink's reclaimer on the admitting thread: in a
+// run of the sink (its scratch, ring and cache slots) the caches are that thread's already, and any other thread
+// takes the lock first (kimi_cpu_sink::quiescent).
+class sink_run_mutex {
+public:
+    void lock() { mutex.lock(); owner.store(std::this_thread::get_id(), std::memory_order_relaxed); }
+    bool try_lock() {
+        if (!mutex.try_lock()) { return false; }
+        owner.store(std::this_thread::get_id(), std::memory_order_relaxed);
+        return true;
+    }
+    void unlock() { owner.store(std::thread::id(), std::memory_order_relaxed); mutex.unlock(); }
+    // only the holder ever stores its own id, and clears it before it unlocks
+    bool held() const { return owner.load(std::memory_order_relaxed) == std::this_thread::get_id(); }
+private:
+    std::mutex mutex;
+    std::atomic<std::thread::id> owner{};
+};
+
 struct sink_slot {
     sink_buffer role[3];
     enum state_type { empty, reading, ready } state = empty;
@@ -514,7 +533,7 @@ struct kimi_cpu_sink {
     const int ring_experts;
     kimi_cpu_sink_resolver resolver;
     void * userdata;
-    std::mutex run_mutex;
+    sink_run_mutex run_mutex;
     sink_ring ring;
     std::vector<sink_slot> slots;
     // The read ring's buffers page-locked for the GPU tier's copies (ring_lock, kimi-host-lock.h): once per
@@ -808,12 +827,34 @@ struct kimi_cpu_sink {
         std::fprintf(stderr, "\n");
         try {
             prefetch_start();
+            // last: from here on any admission of the context may run it
+            sink_host_value(cache.ledger.client->set_reclaimer(reclaimer()));
         } catch (...) {
             prefetch_stop();
             stop_threads();
             throw;
         }
         if (prefetch.topk) { std::fprintf(stderr, "[kimi_cpu_sink_prefetch] enabled topk=%d readers=3\n", prefetch.topk); }
+    }
+
+    // The context's reclaimer (ssd::host::actions), which the host arbiter runs for every admission of the context
+    // that does not fit: the GPU tier's deferred uploads and blocks, then the RAM cache's slots. full_boost: the
+    // arbiter admits at the full watermark boost, so the cache gives back until the room fits as measured there.
+    ssd::host::actions reclaimer() {
+        ssd::host::actions out;
+        out.collect_deferred = [this] { quiescent([this] { vram.collect_deferred(cache, -1); return true; }); };
+        out.reclaim_tier = [this](uint64_t bytes) { return quiescent([&] { return vram.reclaim_host(bytes); }); };
+        out.reclaim_cache = [this](uint64_t bytes) {
+            return quiescent([&] { return cache.arena && cache.reclaim_for_guard(bytes, "host_room", true); });
+        };
+        return out;
+    }
+    // Runs a reclaimer's step with the caches safe to change: as it is on the thread in a run of this sink, and on any
+    // other thread under the run lock with the prefetch drained, as every entry runs.
+    template<class F> bool quiescent(F && step) {
+        if (run_mutex.held()) { return step(); }
+        std::lock_guard<sink_run_mutex> serial(run_mutex); prefetch_drain();
+        return step();
     }
 
     void prefetch_start() {
@@ -1214,6 +1255,7 @@ struct kimi_cpu_sink {
             std::fprintf(stderr, "[kimi_cpu_sink] destroyed inside an open call; aborting\n");
             std::abort();
         }
+        cache.ledger.client->clear_reclaimer(); // before anything a reclaim on another thread uses
         prefetch_stop();
         host_lock_stop(); // the tier and the arena are both still here
         place_report("destroy");
@@ -1247,7 +1289,7 @@ struct kimi_cpu_sink {
         while (!watch_cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return watch_stop; })) {
             lock.unlock();
             {
-                std::unique_lock<std::mutex> run(run_mutex, std::try_to_lock);
+                std::unique_lock<sink_run_mutex> run(run_mutex, std::try_to_lock);
                 if (run.owns_lock()) {
                     try {
                         refresh_floor("watch");
@@ -1579,16 +1621,12 @@ struct kimi_cpu_sink {
     // Room for an allocation outside the expert caches (llama_host_reserve, compute buffers): `host` bytes of host
     // memory and `device` bytes of GPU memory, which count only where the GPU shares the DRAM, beside the pages the
     // ledger holds for an open prefill. No run is in flight: the caller holds run_mutex and has drained the prefetch.
-    bool make_room(uint64_t host, uint64_t device, const char * reason = "host_reserve") {
+    bool make_room(uint64_t host, uint64_t device) {
         const uint64_t extra = cache.ledger.dram_bytes(host, device);
         // nothing comes out of this DRAM (device memory of a discrete GPU) and no prefill holds room
         if (!extra && !cache.ledger.state().prefill_pages) { return true; }
         refresh_floor("make_room");
-        ssd::host::actions actions;
-        actions.collect_deferred = [this] { vram.collect_deferred(cache, -1); };
-        actions.reclaim_tier = [this](uint64_t bytes) { return vram.reclaim_host(bytes); };
-        actions.reclaim_cache = [this, reason](uint64_t bytes) { return cache.arena && cache.reclaim_for_guard(bytes, reason, true); };
-        const auto room = cache.ledger.make_room(extra, actions);
+        const auto room = cache.ledger.make_room(extra);
         if (!room.fits()) {
             ++ledger_refusals;
             std::fprintf(stderr, "[kimi_host_ledger] event=refused extra=%llu term=%s cgroup_shortage=%llu system_shortage=%llu available=%llu floor=%llu\n",
@@ -1605,7 +1643,7 @@ struct kimi_cpu_sink {
         cache.ledger.set_prefill_pages(pages);
         const size_t before = cache.enabled_slots();
         const uint64_t committed = cache.stats.committed_bytes;
-        const bool fits = make_room(host, device, "prefill_room");
+        const bool fits = make_room(host, device);
         // (a refusal has its own receipt, with the short term)
         std::fprintf(stderr, "[kimi_host_ledger] event=prefill_room pages=%llu host=%llu device=%llu fits=%d slots_before=%zu slots_after=%zu released_bytes=%llu\n",
                 (unsigned long long) pages, (unsigned long long) host, (unsigned long long) device, int(fits),
@@ -2272,11 +2310,7 @@ struct kimi_cpu_sink {
     template<class T> void resize_scratch(std::vector<T> & values, size_t count) {
         if (count <= values.capacity()) { values.resize(count); return; }
         const uint64_t bytes = sink_cache::multiply(count, sizeof(T));
-        ssd::host::actions actions;
-        actions.collect_deferred = [this] { vram.collect_deferred(cache, -1); };
-        actions.reclaim_tier = [this](uint64_t need) { return vram.reclaim_host(need); };
-        actions.reclaim_cache = [this](uint64_t need) { return cache.reclaim_for_guard(need, "scratch"); };
-        auto ticket = cache.ledger.client->take(cache.allocation_cost(bytes), 0, actions, false,
+        auto ticket = cache.ledger.client->take(cache.allocation_cost(bytes), 0, ssd::host::requester::outside, false,
             ssd::host::allocation_class::tracked);
         if (!ticket) { throw std::runtime_error(ticket.error); }
         // Value initialization materializes the new working pages. Keep old
@@ -2308,11 +2342,8 @@ struct kimi_cpu_sink {
         for (const auto & slot : slots) { for (int role = 0; role < 3; ++role) {
             if (slot.role[role].size < max_bytes[role]) { growth = sink_cache::add(growth, max_bytes[role]); }
         } }
-        ssd::host::actions actions;
-        actions.collect_deferred = [this] { vram.collect_deferred(cache, -1); };
-        actions.reclaim_tier = [this](uint64_t bytes) { return vram.reclaim_host(bytes); };
-        actions.reclaim_cache = [this](uint64_t bytes) { return cache.reclaim_for_guard(bytes, "ring"); };
-        auto ticket = cache.ledger.client->take(growth, 0, actions, false, ssd::host::allocation_class::tracked);
+        auto ticket = cache.ledger.client->take(growth, 0, ssd::host::requester::outside, false,
+            ssd::host::allocation_class::tracked);
         if (!ticket) { throw std::runtime_error(ticket.error); }
         if (needs_resize) { sink_io_value(ring.unregister_buffers()); ring_unlock(); }
         for (auto & slot : slots) {
@@ -2785,7 +2816,7 @@ void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,
 // closes, so its participants then wait for the close as at a node boundary.
 void kimi_cpu_sink_parallel_last(struct kimi_cpu_sink * sink,
         kimi_cpu_sink_parallel_fn function, void * userdata) {
-    std::lock_guard<std::mutex> serial(sink->run_mutex);
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
     sink->begin_participants(false);
     sink->parallel_phase(function, userdata, true);
 }
@@ -2799,7 +2830,7 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
     sink_error(error, error_size, "");
     if (stats) { *stats = {}; }
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
-    std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     const auto start = sink_clock::now();
     const uint64_t completed_before = sink->ring.completed();
     sink->current = {};
@@ -3333,7 +3364,7 @@ extern "C" void kimi_cpu_sink_destroy(struct kimi_cpu_sink * sink) { delete sink
 
 extern "C" void kimi_cpu_sink_prefetch_hint(struct kimi_cpu_sink * sink, int32_t layer, const int32_t * experts, int n) {
     if (!sink || !experts || n <= 0) { return; }
-    std::lock_guard<std::mutex> serial(sink->run_mutex);
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
     sink->prefetch.hint_n = std::min(n, 64);
     std::copy(experts, experts + sink->prefetch.hint_n, sink->prefetch.hint);
     sink->prefetch.hint_layer = layer;
@@ -3341,7 +3372,7 @@ extern "C" void kimi_cpu_sink_prefetch_hint(struct kimi_cpu_sink * sink, int32_t
 
 extern "C" void kimi_cpu_sink_cache_reset(struct kimi_cpu_sink * sink) {
     if (!sink) { return; }
-    std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     sink->vram.cancel();
     sink->cache.release();
     sink->cache.active = sink->cache.has_token = sink->cache.paused = false;
@@ -3351,7 +3382,7 @@ extern "C" bool kimi_cpu_sink_cache_configure(struct kimi_cpu_sink * sink, uint6
         const int32_t * priority, int n, int quota, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
-    std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try { sink->vram.begin(0, 0, false, sink->cache); sink->cache.configure(budget, priority, n, quota); return true; }
     catch (const std::exception & e) { sink_error(error, error_size, e.what()); return false; }
 }
@@ -3360,7 +3391,7 @@ extern "C" bool kimi_cpu_sink_cache_begin(struct kimi_cpu_sink * sink, uint64_t 
         uint64_t token, bool decode, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
-    std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try {
         sink->end_margin_interval(decode, epoch, token);
         sink->refresh_floor(decode ? "decode" : "prefill");
@@ -3387,7 +3418,7 @@ extern "C" bool kimi_cpu_sink_vram_phase_complete(
         struct kimi_cpu_sink * sink, bool decode, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
-    std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try {
         sink->vram.phase_complete(decode);
         return true;
@@ -3401,7 +3432,7 @@ extern "C" bool kimi_cpu_sink_vram_reserve_accumulator(
         struct kimi_cpu_sink * sink, int tokens, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
-    std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try { sink->vram.reserve_accumulate(tokens); return true; }
     catch (const std::exception & e) { sink_error(error, error_size, e.what()); return false; }
 }
@@ -3410,7 +3441,7 @@ extern "C" bool kimi_cpu_sink_vram_reserve(struct kimi_cpu_sink * sink, const st
         const struct ggml_tensor * gate, const struct ggml_tensor * down, int experts_used, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink || !up || !gate || !down) { sink_error(error, error_size, "null CPU sink or expert tensor"); return false; }
-    std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try {
         sink->reserve_tier(up, gate, down, experts_used);
         return true;
@@ -3422,7 +3453,7 @@ extern "C" void kimi_cpu_sink_cache_get_stats(struct kimi_cpu_sink * sink, kimi_
     if (!stats) { return; }
     *stats = {};
     if (!sink) { return; }
-    std::lock_guard<std::mutex> serial(sink->run_mutex);
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
     *stats = sink->cache.stats;
 }
 
@@ -3430,7 +3461,7 @@ extern "C" void kimi_cpu_sink_cache_get_stats(struct kimi_cpu_sink * sink, kimi_
 // A null sink is therefore a refusal, never a new independent production ledger.
 extern "C" bool kimi_cpu_sink_cache_make_room(struct kimi_cpu_sink * sink, uint64_t host_bytes, uint64_t device_bytes) {
     if (!sink) { return false; }
-    std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try { return sink->make_room(host_bytes, device_bytes); }
     catch (const std::exception & e) {
         std::fprintf(stderr, "[kimi_cpu_sink_cache] make_room failed: %s\n", e.what());
@@ -3441,7 +3472,7 @@ extern "C" bool kimi_cpu_sink_cache_make_room(struct kimi_cpu_sink * sink, uint6
 extern "C" bool kimi_cpu_sink_cache_prefill_room(struct kimi_cpu_sink * sink, uint64_t pages, uint64_t host_bytes,
         uint64_t device_bytes) {
     if (!sink) { return false; }
-    std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try { return sink->prefill_room(pages, host_bytes, device_bytes); }
     catch (const std::exception & e) {
         std::fprintf(stderr, "[kimi_cpu_sink_cache] prefill_room failed: %s\n", e.what());
@@ -3475,14 +3506,10 @@ result<host::allocation_ticket> take_room_configured(kimi_cpu_sink * sink, const
             if (sink->cache.ledger.client != value.host) {
                 return {{}, status::invalid, "host client does not own executor"};
             }
-            std::lock_guard<std::mutex> serial(sink->run_mutex); sink->prefetch_drain();
+            std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
             if (pages != UINT64_MAX) { sink->cache.ledger.set_prefill_pages(pages); }
             sink->refresh_floor("take_room");
-            host::actions actions;
-            actions.collect_deferred = [sink] { sink->vram.collect_deferred(sink->cache, -1); };
-            actions.reclaim_tier = [sink](uint64_t bytes) { return sink->vram.reclaim_host(bytes); };
-            actions.reclaim_cache = [sink](uint64_t bytes) { return sink->cache.arena && sink->cache.reclaim_for_guard(bytes, "take_room", true); };
-            return value.host->take(host_bytes, device_bytes, actions);
+            return value.host->take(host_bytes, device_bytes);
         }
         // Early graph reserve and a later sink configure the same registration
         // with observed device topology and the identical immutable settings.
@@ -3520,7 +3547,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
     sink_error(error, error_size, "");
     if (stats) { *stats = {}; }
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
-    std::lock_guard<std::mutex> serial(sink->run_mutex);
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
     const auto start = sink_clock::now();
     const uint64_t completed_before = sink->ring.completed();
     sink->current = {};

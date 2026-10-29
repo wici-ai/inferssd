@@ -2885,6 +2885,133 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
             (unsigned long long) first_touch, receipt.c_str());
 }
 
+// An allocation outside the caches that names no reclaimer gets the RAM cache's room: the CPU backend's work buffer
+// (ggml_backend_cpu_graph_compute), which a prefill grows when its graph needs more than every graph before it. The
+// sink and the backend share one host client, as in a context. The cache takes the envelope's room at load (an
+// automatic budget with partial reclaim) and leaves half a slot; a matrix product then needs a work buffer of three
+// slots. The host arbiter runs the sink's reclaimer before it would refuse: the cache gives back the slots the
+// shortage needs and no more, the ledger holds no pending debit and has granted the buffer, and the sink computes bit
+// for bit after it.
+static void work_buffer_reclaim_tests(fixture_inputs & inputs, int threads, int depth) {
+    scoped_fixture_input policy_env(inputs, "cache_policy", "lru");
+    scoped_fixture_input allocation_env(inputs, "cache_allocation", "uniform");
+    scoped_fixture_input keep_env(inputs, "cache_keep", "1");
+    scoped_fixture_input partial_env(inputs, "cache_partial_reclaim", "1");
+    scoped_fixture_input elastic_env(inputs, "cache_elastic", nullptr);
+    scoped_fixture_input quotas_env(inputs, "cache_layer_quotas", nullptr);
+    auto number = [](const std::string & line, const std::string & key) {
+        const size_t at = line.find(" " + key + "=");
+        require(at != std::string::npos, "the receipt lacks " + key + ": " + line);
+        return uint64_t(std::stoull(line.substr(at + key.size() + 2)));
+    };
+    // Experts of 13 MiB (Q8_0 2048 x 2048) keep the process's own movements far below a slot.
+    fixture f; f.latent = f.hidden = 2048; f.type = f.down_type = GGML_TYPE_Q8_0; f.experts = 4; f.native_ranges = true;
+    make_synthetic(f);
+    const std::vector<int32_t> ids = { 0, 2 };
+    const std::vector<float> weights = { .35f, .65f };
+    std::vector<float> input(f.latent);
+    for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int(i % 29) - 14) * .011f; }
+    const auto expected = reference(f, 1, input, ids, weights, 4, 25);
+    // a role as a decode request reserves it: its bytes and a page prefix, in whole pages
+    const uint64_t role = (f.entries.at({ tensor_name(1, 0), 0 }).raw_bytes + 8190) / 4096 * 4096;
+    const uint64_t slot = cache_slot_bytes(inputs, 3 * role), cost = slot + slot / 128, ring = uint64_t(depth) * 3 * role;
+
+    // F16 weights: the backend converts the F32 input to F16 into its work buffer, three slots of it.
+    const int64_t k = 4096, n = int64_t(3 * slot / (2 * k));
+    ggml_context * ctx = ggml_init({ ggml_tensor_overhead() * 4 + ggml_graph_overhead(), nullptr, true });
+    require(ctx, "work buffer: graph context");
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, 1), * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, ggml_mul_mat(ctx, a, b));
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend, "work buffer: CPU backend");
+    ggml_backend_cpu_set_n_threads(backend, threads);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer, "work buffer: graph tensors");
+    ggml_backend_tensor_memset(a, 0x3c, 0, ggml_nbytes(a));
+    ggml_backend_tensor_memset(b, 0x3c, 0, ggml_nbytes(b));
+    const uint64_t work = ggml_graph_plan(graph, threads, nullptr).work_size;
+    require(work > 5 * slot / 2, "work buffer: the product's work buffer is below the shortage it is meant to make");
+
+    // One host client for the sink and the backend; everything the case allocates outside them is resident by now.
+    auto owner = std::make_shared<ssd::host::process_arbiter>();
+    auto made = owner->make_client();
+    require(bool(made), made.error);
+    auto client = std::move(made.value);
+    const auto saved = inputs.runtime;
+    struct restore { fixture_inputs & inputs; ssd::runtime_services value; ~restore() { inputs.set_runtime_services(value); } }
+        restore_runtime{ inputs, saved };
+    ssd::runtime_services services = saved;
+    services.host = client.get();
+    inputs.set_runtime_services(services);
+    using attach_fn = bool (*)(ggml_backend_t, const ssd::runtime_services *) noexcept;
+    const auto attach = reinterpret_cast<attach_fn>(
+        ggml_backend_reg_get_proc_address(ggml_backend_cpu_reg(), "ggml_backend_cpu_set_ssd_runtime_services"));
+    require(attach && attach(backend, &services), "work buffer: the backend did not take the context's services");
+    probe_ledger probe;
+    inputs.configure(probe, false);
+    const uint64_t room = probe.measure(0).surplus() + probe.reserve;
+    require(room != UINT64_MAX && room > ring + 7 * cost + (1ull << 30), "work buffer: the case needs a finite envelope with room");
+    // geometry sees 6.5 slots of room after the read ring, and the load step commits what it sized
+    scoped_fixture_input reserve_env(inputs, "cache_reserve_bytes", std::to_string(room - ring - 13 * cost / 2).c_str());
+    auto sink = make_sink(inputs, f, threads, depth);
+    configure_cache(sink.get(), std::numeric_limits<uint64_t>::max(), { 1, 2 }, 6);
+    std::string loaded;
+    {
+        tensors meta(f, 1);
+        char error[512] = {};
+        stderr_capture log;
+        const bool ok = kimi_cpu_sink_vram_reserve(sink.get(), meta.role[0], meta.role[1], meta.role[2], int(ids.size()),
+            error, sizeof(error));
+        std::istringstream lines(log.read());
+        for (std::string l; std::getline(lines, l);) {
+            if (l.rfind("[kimi_cpu_sink_cache] reason=load ", 0) == 0) { loaded = l; }
+        }
+        require(ok, error);
+    }
+    require(!loaded.empty() && number(loaded, "slot_bytes") == slot && number(loaded, "slots") >= 4,
+            "work buffer: the load step did not take the envelope's room: " + loaded);
+    begin_cache(sink.get(), 21, 1, false); // a prefill keeps the arena
+    const auto before = cache_snapshot(sink.get());
+    const auto left = client->measure(work, true);
+    require(bool(left) && !left.value.fits(), "work buffer: the cache left room for the work buffer");
+    const uint64_t shortage = left.value.shortage(), granted = client->state().value.granted;
+
+    std::string shrink;
+    ggml_status status;
+    {
+        stderr_capture log;
+        status = ggml_backend_graph_compute(backend, graph);
+        std::istringstream lines(log.read());
+        for (std::string l; std::getline(lines, l);) {
+            if (l.rfind("[kimi_cpu_sink_cache] cache_shrink=1 ", 0) == 0) { shrink = l; }
+        }
+    }
+    require(status == GGML_STATUS_SUCCESS, "work buffer: the backend's work buffer was refused while the cache held the room");
+    const auto after = cache_snapshot(sink.get());
+    const uint64_t released = after.released_bytes - before.released_bytes;
+    require(after.shrink_ops == before.shrink_ops + 1 && after.guard_reclaims == before.guard_reclaims + 1 &&
+            released >= shortage && released < shortage + slot && before.committed_bytes - after.committed_bytes == released,
+            "work buffer: the cache did not give back the shortage's slots in one step: shortage " + std::to_string(shortage) +
+            ", released " + std::to_string(released) + ", shrinks " + std::to_string(after.shrink_ops - before.shrink_ops) +
+            ", committed " + std::to_string(before.committed_bytes) + " -> " + std::to_string(after.committed_bytes) + ": " + shrink);
+    const auto state = client->state();
+    require(bool(state) && state.value.pending_bytes == 0 && state.value.granted == granted + work,
+            "work buffer: the ledger kept a pending debit or did not grant the buffer");
+    require(client->measure(0, true).value.fits(), "work buffer: the grant overdrew the envelope");
+
+    begin_cache(sink.get(), 21, 2); // the first decode token takes back what the room allows now
+    tensors meta(f, 1);
+    run_checked(inputs, "work_reclaim_decode", f, sink.get(), meta, input, ids, weights, expected, 1, 25, 0, -1);
+    std::printf("case=work_buffer_reclaim status=PASS work=%llu shortage=%llu released=%llu slot=%llu %s\n",
+            (unsigned long long) work, (unsigned long long) shortage, (unsigned long long) released,
+            (unsigned long long) slot, shrink.c_str());
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+    std::printf("WORK_BUFFER_RECLAIM_OK\n");
+}
+
 static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
     const kimi_cpu_sink_activation clamp10 = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 10.0f };
     const kimi_cpu_sink_activation clamp = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f };
@@ -3978,7 +4105,7 @@ int main(int argc, char ** argv) {
         bool poll_mode = false, poll_early_mode = false, cache_compute_mode = false, cache_location_mode = false;
         bool cache_policy_mode = false, cache_large_mode = false, cache_pressure_transition = false, cache_unbounded = false;
         bool activation_mode = false, q2_activation_mode = false, muse_q8_mode = false, muse_bf16_mode = false;
-        bool auto_ring_mode = false, prefetch_mode = false, cache_load_mode = false, threadpool_mode = false;
+        bool auto_ring_mode = false, prefetch_mode = false, cache_load_mode = false, work_reclaim_mode = false, threadpool_mode = false;
         bool swiglu_mode = false;
         std::string pack, prefix;
         for (int i = 1; i < argc; ++i) {
@@ -4012,6 +4139,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--cache-hitrate-tests")) { hitrate_mode = true; }
             else if (!std::strcmp(argv[i], "--elastic-cache-tests")) { elastic_cache_mode = true; }
             else if (!std::strcmp(argv[i], "--cache-load-tests")) { cache_load_mode = true; }
+            else if (!std::strcmp(argv[i], "--work-reclaim-tests")) { work_reclaim_mode = true; }
             else if (!std::strcmp(argv[i], "--max-cache-tests")) { max_cache_mode = true; }
             else if (!std::strcmp(argv[i], "--cache-large-tests")) { cache_large_mode = true; }
             else if (!std::strcmp(argv[i], "--cache-pressure-transition")) { cache_pressure_transition = true; }
@@ -4032,7 +4160,7 @@ int main(int argc, char ** argv) {
             test_resources::cpu_participants(required - 1, 1);
             test_resources::io_ring();
         }
-        if (cache_mode || hitrate_mode || elastic_cache_mode || cache_load_mode || max_cache_mode ||
+        if (cache_mode || hitrate_mode || elastic_cache_mode || cache_load_mode || work_reclaim_mode || max_cache_mode ||
                 cache_location_mode || cache_compute_mode || early_up_gate_mode ||
                 role_major_mode || nonblocking_down_mode || poll_mode || poll_early_mode || schedules_mode ||
                 prefetch_mode || cache_policy_mode || cache_large_mode || activation_mode || muse_q8_mode || muse_bf16_mode) {
@@ -4067,6 +4195,7 @@ int main(int argc, char ** argv) {
         if (hitrate_mode) { cache_hitrate_tests(inputs, options.threads, options.ring_experts); return 0; }
         if (elastic_cache_mode) { elastic_cache_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (cache_load_mode) { cache_load_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (work_reclaim_mode) { work_buffer_reclaim_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (max_cache_mode) { max_cache_tests(inputs, options.threads, options.ring_experts); return 0; }
         if (early_up_gate_mode) { schedule_tests(inputs, options.threads, options.ring_experts, false, true); return 0; }
         if (role_major_mode) { schedule_tests(inputs, options.threads, options.ring_experts, false, false, 0, true); return 0; }

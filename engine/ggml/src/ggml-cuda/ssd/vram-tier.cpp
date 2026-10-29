@@ -631,7 +631,7 @@ struct tier {
         if (!state || !state.value.configured || !state.value.unified) {
             throw std::runtime_error("unified tier has no configured shared DRAM budget");
         }
-        auto reservation = host_client->take(0, bytes, {}, false, ssd::host::allocation_class::tracked);
+        auto reservation = host_client->take(0, bytes, ssd::host::requester::gpu_tier, false, ssd::host::allocation_class::tracked);
         if (!reservation) {
             if (reservation.code == ssd::status::resource) { throw host_budget_refused(reservation.error); }
             throw std::runtime_error(reservation.error);

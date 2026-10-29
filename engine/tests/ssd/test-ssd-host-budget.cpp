@@ -78,11 +78,11 @@ static void admission(const char * label, context_client & c, uint64_t past) {
     print(label, measured.value);
     require(measured.value.cgroup == room_ok, "envelope readable with room");
     {
-        auto small = c.take(64 * MiB, 0, {}, true);
+        auto small = c.take(64 * MiB, 0, requester::outside, true);
         require(bool(small) && bool(small.value), "small take admitted");
         small.value.cancel();
     }
-    auto large = c.take(measured.value.cgroup_surplus + past, 0, {}, true);
+    auto large = c.take(measured.value.cgroup_surplus + past, 0, requester::outside, true);
     require(!large && large.code == ssd::status::resource && !large.value, "take past the envelope refused");
     require(large.value.observation().cgroup_shortage > 0, "the envelope refused it");
 }
@@ -158,7 +158,7 @@ static void explicit_budget() {
     admission("budget arbiter", *tight, 64 * MiB);
     config.budget_bytes = budget + 4 * GiB;
     auto loose = client(owner, config);
-    auto refused = loose->take(512 * MiB, 0, {}, true);
+    auto refused = loose->take(512 * MiB, 0, requester::outside, true);
     require(!refused && refused.code == ssd::status::resource, "the tighter budget binds every client");
     require(!client(std::make_shared<process_arbiter>(), config)->configure(client_config{}), "budget change refused");
 }

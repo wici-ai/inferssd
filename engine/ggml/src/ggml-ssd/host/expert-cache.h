@@ -90,9 +90,7 @@ struct cache_client_view {
     bool end_interval(bool consecutive, uint64_t held, uint64_t & unknown) {
         return detail::cache_host_value(client->end_interval(consecutive, held, unknown));
     }
-    ssd::host::room make_room(uint64_t extra, const ssd::host::actions & actions) {
-        return detail::cache_host_value(client->make_room(extra, actions));
-    }
+    ssd::host::room make_room(uint64_t extra) { return detail::cache_host_value(client->make_room(extra)); }
     bool memory_available_at_full_boost(uint64_t & available, uint64_t & headroom) const {
         const auto r = measure(0, true); available = r.available; headroom = r.boost_headroom; return r.system;
     }
@@ -216,12 +214,11 @@ struct expert_cache {
         stats.peak_guard_extra_bytes = std::max(stats.peak_guard_extra_bytes, extra);
         return check_room(extra, nullptr) == room_ok;
     }
-    ssd::result<ssd::host::allocation_ticket> take_guard(uint64_t extra, const char * reason) {
+    // The cache's own growth: the context's reclaimer gives back colder slots for it (requester::ram_cache).
+    ssd::result<ssd::host::allocation_ticket> take_guard(uint64_t extra) {
         stats.last_guard_extra_bytes = extra;
         stats.peak_guard_extra_bytes = std::max(stats.peak_guard_extra_bytes, extra);
-        ssd::host::actions actions;
-        actions.reclaim_cache = [this, reason](uint64_t bytes) { return reclaim_for_guard(bytes, reason); };
-        auto ticket = ledger.client->take(extra, 0, actions, true, ssd::host::allocation_class::tracked);
+        auto ticket = ledger.client->take(extra, 0, ssd::host::requester::ram_cache, true, ssd::host::allocation_class::tracked);
         last_room = ticket.value.observation();
         return ticket;
     }
@@ -552,8 +549,9 @@ struct expert_cache {
                     before, entries.size(), (unsigned long long) stats.committed_bytes);
         }
     }
-    // Slots given back until the room for `extra` fits; full_boost for the ledger's make_room, which then measures at the
-    // full watermark boost: stopping at MemAvailable as it is would leave make_room short by the boost's headroom.
+    // Slots given back until the room for `extra` fits; full_boost for the host arbiter's admissions (the context's
+    // reclaimer), which measure at the full watermark boost: stopping at MemAvailable as it is would leave them short by
+    // the boost's headroom.
     bool reclaim_for_guard(uint64_t extra, const char * reason, bool full_boost = false) {
         stats.last_guard_extra_bytes = extra;
         stats.peak_guard_extra_bytes = std::max(stats.peak_guard_extra_bytes, extra);
@@ -678,7 +676,7 @@ struct expert_cache {
         }
         // Check before vector value-initialization can touch metadata pages.
         // Existing allocations are already included in memory.current.
-        auto metadata_ticket = take_guard(allocation_cost(multiply(count, sizeof(entry))), "cgroup_metadata_headroom");
+        auto metadata_ticket = take_guard(allocation_cost(multiply(count, sizeof(entry))));
         if (!metadata_ticket) { return false; }
         std::vector<entry> next(count);
         metadata_ticket.value.commit();
@@ -745,8 +743,7 @@ struct expert_cache {
         if (policy == count_decay2) {
             size_t nodes = 0;
             for (const auto & r : requests) { nodes += !r.cache_only && l.count_frequency.find(r.id) == l.count_frequency.end(); }
-            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, double>) + 4 * sizeof(void *))),
-                    "cgroup_count_frequency_headroom");
+            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, double>) + 4 * sizeof(void *))));
             if (!frequency_ticket) {
                 reject_admission(requests, current, "cgroup_count_frequency_headroom"); return;
             }
@@ -770,8 +767,7 @@ struct expert_cache {
             for (const auto & r : requests) { nodes += !r.cache_only && l.frequency.find(r.id) == l.frequency.end(); }
             // Each map node may fault a different allocator page/THP. Duplicate
             // IDs deliberately overcount; no allocation occurs before this guard.
-            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, uint64_t>) + 4 * sizeof(void *))),
-                    "cgroup_frequency_headroom");
+            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, uint64_t>) + 4 * sizeof(void *))));
             if (!frequency_ticket) {
                 reject_admission(requests, current, "cgroup_frequency_headroom"); return;
             }
@@ -843,7 +839,7 @@ struct expert_cache {
         const uint64_t payload_pages = multiply(slot_pages, page_size);
         const uint64_t new_tables = multiply(new_slots, page_tables(payload_pages));
         const uint64_t extra = add(add(multiply(new_slots, payload_pages), new_tables), arena ? 0 : 64 * 1024);
-        auto slot_ticket = take_guard(extra, "cgroup_headroom");
+        auto slot_ticket = take_guard(extra);
         if (!slot_ticket) {
             reject_admission(requests, current, "cgroup_headroom"); return;
         }
@@ -929,7 +925,7 @@ struct expert_cache {
         if (check_room(0, nullptr, &surplus) == room_unreadable) { return 0; }
         size_t n = std::min<size_t>(entries.size(), surplus > 64 * 1024 ? (surplus - 64 * 1024) / add(payload_pages, tables) : 0);
         if (!n) { return 0; }
-        auto load_ticket = take_guard(cost(n), "load");
+        auto load_ticket = take_guard(cost(n));
         if (!load_ticket) { return 0; }
         if (map_arena() || !commit_slots(0, n)) { release(); return 0; }
         const auto start = detail::cache_clock::now();

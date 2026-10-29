@@ -51,7 +51,10 @@ process's use plus the memory then available, so its room starts at the
 available memory less the reserve. The system term is the memory available now
 less the floor: Linux MemAvailable, Windows the smaller of available physical
 memory and available commit, macOS free, file-backed, purgeable and reusable
-pages. The RAM expert cache admits only under a readable envelope.
+pages. The RAM expert cache admits only under a readable envelope. An allocation
+that does not fit, such as a compute or work buffer, a scratch buffer or a
+server checkpoint, first takes room back from the expert caches: on unified
+memory from the GPU tier, then from the RAM cache's coldest slots.
 
 ## File and CLI contract
 

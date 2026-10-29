@@ -14,7 +14,7 @@ static void sink_location_provider_initialize(kimi_cpu_sink * sink) {
 extern "C" bool kimi_cpu_sink_set_cache_locations(kimi_cpu_sink * sink,
         const kimi_cache_location_api * api, void * context, char * error, size_t size) {
     sink_error(error,size,""); if (!sink) { sink_error(error,size,"null sink"); return false; }
-    std::lock_guard<std::mutex> lock(sink->run_mutex);
+    std::lock_guard<sink_run_mutex> lock(sink->run_mutex);
     if (api && (api->version!=1 || api->size!=sizeof(*api) || !api->acquire_native || !api->begin_layer ||
             !api->launch || !api->finish || !api->cancel || !api->release)) {
         sink_error(error,size,"invalid cache location API v1"); return false;
@@ -92,7 +92,7 @@ extern "C" bool kimi_cpu_sink_run_cache_compute(kimi_cpu_sink * sink,
         if(stats){*stats=local;}if(decision){*decision=a;}
         cache_compute_print(a,sink->cache.epoch,sink->cache.token,layer,local,ok);return ok;
     }
-    std::lock_guard<std::mutex> serial(sink->run_mutex);
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
     const auto start=sink_clock::now();const uint64_t completed_before=sink->ring.completed();
     sink->current={};sink->requests.clear();sink->begin_observation(up,true);
     // The dedicated trace represents uncomputed/dropped slots too; legacy

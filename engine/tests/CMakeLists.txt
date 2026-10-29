@@ -515,6 +515,11 @@ if (TARGET ggml-cpu)
     add_test(NAME kimi_cpu_sink_cache_load COMMAND test-kimi-cpu-sink --cache-load-tests --threads 4 --ring-experts 2
                     --fixture read_fixed=0 --fixture profile=0)
     set_tests_properties(kimi_cpu_sink_cache_load PROPERTIES TIMEOUT 180)
+    # an allocation outside the caches, the CPU backend's work buffer, takes room from a RAM cache that took the
+    # envelope at load (a finite memory envelope, like the other cache cases)
+    add_test(NAME kimi_cpu_sink_work_reclaim COMMAND test-kimi-cpu-sink --work-reclaim-tests --threads 2 --ring-experts 2
+                    --fixture read_fixed=0 --fixture profile=0)
+    set_tests_properties(kimi_cpu_sink_work_reclaim PROPERTIES TIMEOUT 180)
     # the prefetch against the GPU tier's residency, with a stand-in tier the executable exports (no GPU)
     add_executable(test-kimi-prefetch-tier ssd/test-kimi-prefetch-tier.cpp)
     target_include_directories(test-kimi-prefetch-tier PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../vendor)
