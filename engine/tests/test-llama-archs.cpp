@@ -634,10 +634,11 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         }
                     }
 
-                    FILE * file = tmpfile(); // Can be null on Windows without administrator privileges.
                     // FIXME: when adding a tensor to a gguf_context a copy is made, this changes the pointer which the meta backend
                     //     in turn uses to map the tensors to their simple equivalents - this is fundamentally incompatible
-                    if (file != nullptr && llama_model_saver_supports_arch(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                    // tmpfile() can be null on Windows without administrator privileges.
+                    FILE * file = llama_model_saver_supports_arch(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR ? tmpfile() : nullptr;
+                    if (file != nullptr) {
                         GGML_ASSERT(model_and_ctx_dev.first && model_and_ctx_dev.second);
                         llama_model_saver ms = llama_model_saver(model_and_ctx_dev.first.get());
                         ms.add_kv_from_model();
@@ -645,18 +646,23 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         ms.save(file);
                         rewind(file);
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
-                        const std::vector<float> logits_roundtrip = get_logits(
-                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
-                        status_roundtrip = "\033[1;32mOK\033[0m";
-                        GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
-                        for (size_t i = 0; i < logits_roundtrip.size(); i++) {
-                            if (logits_roundtrip[i] != logits_dev[i]) {
-                                all_ok = false;
-                                status_roundtrip = "\033[1;31mFAIL\033[0m";
-                                break;
+                        {
+                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
+                            const std::vector<float> logits_roundtrip = get_logits(
+                                model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+                            status_roundtrip = "\033[1;32mOK\033[0m";
+                            GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
+                            for (size_t i = 0; i < logits_roundtrip.size(); i++) {
+                                if (logits_roundtrip[i] != logits_dev[i]) {
+                                    all_ok = false;
+                                    status_roundtrip = "\033[1;31mFAIL\033[0m";
+                                    break;
+                                }
                             }
                         }
+                        // the loaded model does not own the stream, and an open stream per row exhausts the
+                        // descriptor limit, after which every later round trip is silently skipped
+                        fclose(file);
                     }
                 }
 
