@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 from ci.contract import digest, load, save
 from ci.staged_build import sealed_file
-from ci.staged_checkpoint import mapped_files, image_identity, native_settings
+from ci.staged_checkpoint import mapped_files, image_identity, native_settings, within_cpus
 from ci.model_admission import checked_model
 from ci.staged_benchmark import verify_runtime, verify_stopped
 
@@ -303,7 +303,7 @@ def receipt(config, manifest, side, model, spec, build, output, *, destination=N
             if (observed["cmdline"] != spec["argv"]
                     or observed["executable"] != build["binary"]["runtime_path"]
                     or observed["executable_sha256"] != build["binary"]["sha256"]
-                    or observed["cpus_allowed_list"] != resources["cpus_allowed_list"]
+                    or not within_cpus(observed["cpus_allowed_list"], resources["cpus_allowed_list"])
                     or observed["cgroup_limits"] != resources["cgroup_limits"]):
                 raise ValueError("actual argv, executable or enforced resources differ")
             limit = re.search(r"^Max locked memory\s+(\S+)\s+(\S+)\s+bytes\s*$", observed["proc_limits"], re.M)

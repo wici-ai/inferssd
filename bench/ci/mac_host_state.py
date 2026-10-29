@@ -22,7 +22,7 @@ COMMANDS = {
     "memory_pressure_level": ("/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"),
     "processes": ("/bin/ps", "-axo", "pid=,ppid=,uid=,time=,etime=,rss=,comm="),
 }
-LIMITS = ("min_free_inactive_bytes", "max_swap_delta_bytes", "max_compression_delta_bytes",
+LIMITS = ("min_available_bytes", "max_swap_delta_bytes", "max_compression_delta_bytes",
           "max_non_ci_cpu_cores", "max_non_ci_process_cpu_cores", "max_non_ci_process_rss_bytes")
 
 
@@ -73,7 +73,7 @@ def parse_vm_stat(raw):
     header = re.search(r"page size of (\d+) bytes", raw)
     fields = {key.strip('"').lower().replace(" ", "_").replace("-", "_"): int(value)
               for key, value in re.findall(r"(?m)^([^:\n]+):\s*(\d+)\.\s*$", raw)}
-    if not header or int(header[1]) <= 0 or any(key not in fields for key in (*COUNTERS, "pages_free", "pages_inactive")):
+    if not header or int(header[1]) <= 0 or any(key not in fields for key in (*COUNTERS, "pages_free", "file_backed_pages")):
         raise ValueError("incomplete vm_stat counters")
     pages = {key[6:]: value for key, value in fields.items() if key.startswith("pages_")}
     pages.update({key[:-6]: value for key, value in fields.items() if key.endswith("_pages")})
@@ -234,11 +234,15 @@ def compare_snapshots(before, after, policy, *, timed=False):
         total_cpu += row["cpu_cores"]
     max_cpu = max((row["cpu_cores"] for row in activity), default=0)
     max_rss = max((row["rss_bytes"] for row in activity), default=0)
-    available = [sum(value["vm_stat"]["pages"][key] for key in ("free", "inactive")) * page_size for value in (before, after)]
+    # Available as the kernel counts it: free pages plus file-backed pages, which
+    # the system reclaims without compression or swap. A model mapped by the
+    # previous run stays cached on the active queue until pressure ages it, so
+    # free plus inactive would refuse every run after the first.
+    available = [sum(value["vm_stat"]["pages"][key] for key in ("free", "file_backed")) * page_size for value in (before, after)]
     result.update(elapsed_s=elapsed, counter_delta_pages=delta, counter_delta_bytes=delta_bytes,
         swap_delta_bytes=swap_delta, compression_delta_bytes=compression_delta,
         swap_used_delta_bytes=after["swap"]["used_bytes"] - before["swap"]["used_bytes"],
-        memory_pressure_levels=levels, free_inactive_bytes=available, flags=flags,
+        memory_pressure_levels=levels, available_bytes=available, flags=flags,
         process_activity=dict(non_ci_cpu_cores=total_cpu, max_non_ci_process_cpu_cores=max_cpu,
             max_non_ci_process_rss_bytes=max_rss, processes=activity,
             ignored_pids=sorted(ignored),
@@ -264,8 +268,8 @@ def compare_snapshots(before, after, policy, *, timed=False):
             "max_non_ci_cpu_cores": total_cpu, "max_non_ci_process_cpu_cores": max_cpu,
             "max_non_ci_process_rss_bytes": max_rss}
         reasons.extend(key + "-exceeded" for key, value in checks.items() if key in policy and value > policy[key])
-        if "min_free_inactive_bytes" in policy and min(available) < policy["min_free_inactive_bytes"]:
-            reasons.append("free-inactive-below-minimum")
+        if "min_available_bytes" in policy and min(available) < policy["min_available_bytes"]:
+            reasons.append("available-below-minimum")
         result["status"] = "failed" if reasons else "passed"
     return result
 

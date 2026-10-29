@@ -30,7 +30,7 @@ def policy(config):
     return dict(schema_version=1, memory_total_bytes=total, sample_interval_s=2,
         pair_free_tolerance_bytes=1 << 30, limits=dict(
             ci_uids=[62001, 62002], ignore_pids=[], normal_pressure_levels=[1], require_pressure_level=True,
-            min_free_inactive_bytes=min(budget, total * 3 // 4), max_swap_delta_bytes=0,
+            min_available_bytes=min(budget, total * 3 // 4), max_swap_delta_bytes=0,
             max_compression_delta_bytes=64 << 20, max_non_ci_cpu_cores=0.5,
             max_non_ci_process_cpu_cores=0.25, max_non_ci_process_rss_bytes=512 << 20))
 
@@ -108,7 +108,7 @@ def retained_quiet(folder, expected):
     value = _read(folder, QUIET)
     assessment = _quiet(value, expected)
     return dict(schema_version=1, policy=copy.deepcopy(expected), quiet=assessment,
-        prelaunch_free_inactive_bytes=assessment["free_inactive_bytes"][-1],
+        prelaunch_available_bytes=assessment["available_bytes"][-1],
         artifacts={QUIET: digest(Path(folder) / QUIET)})
 
 
@@ -133,8 +133,8 @@ def retained_arm(folder, expected):
 def cell(summaries):
     """Check every timed run of one cell: {run name: reconstructed arm summary}.
 
-    A flagged run, or prelaunch free memory that differs by more than the free-memory
-    tolerance between any two runs, makes an otherwise passing cell needs-review.
+    A flagged run, or prelaunch available memory that differs by more than the
+    free-memory tolerance between any two runs, makes an otherwise passing cell needs-review.
     Measured values are never changed, excused or retried.
     """
     if not isinstance(summaries, dict) or len(summaries) < 2:
@@ -150,10 +150,10 @@ def cell(summaries):
             raise ValueError("Mac cell requires complete reconstructed host evidence")
         if summary["timed"]["status"] == "flagged":
             reasons.extend(name + ":" + reason for reason in summary["timed"]["reasons"])
-    free = [summary["prelaunch_free_inactive_bytes"] for summary in summaries.values()]
+    free = [summary["prelaunch_available_bytes"] for summary in summaries.values()]
     spread = max(free) - min(free)
     if spread > policies[0]["pair_free_tolerance_bytes"]:
-        reasons.append("prelaunch-free-inactive-difference")
+        reasons.append("prelaunch-available-difference")
     return dict(schema_version=1, status="needs-review" if reasons else "passed", reasons=reasons,
                 runs=copy.deepcopy(summaries), prelaunch_free_spread_bytes=spread,
                 interpretation="Sampled host conditions, not isolation or equal-cache proof. Swap/pressure may be model-induced; no automatic attribution to external interference, exemption of measured slowdowns, or retry.")

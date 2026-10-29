@@ -17,7 +17,7 @@ CONFIG = dict(host=dict(hardware=dict(memory_total_bytes=48 << 30), resources=di
 
 def snapshot(second, *, free=38 << 30, swapouts=100, compressions=100):
     page = 16384
-    vm = f'Mach Virtual Memory Statistics: (page size of {page} bytes)\nPages free: {free // page}.\nPages inactive: 0.\n'
+    vm = f'Mach Virtual Memory Statistics: (page size of {page} bytes)\nPages free: {free // page}.\nPages inactive: 0.\nFile-backed pages: 0.\n'
     vm += ''.join(f'{name}: {value}.\n' for name, value in (
         ('Swapins', 100), ('Swapouts', swapouts), ('Compressions', compressions),
         ('Decompressions', 100), ('Pageins', 100), ('Pageouts', 100)))
@@ -48,7 +48,7 @@ def arm(folder, monkeypatch, *, free=38 << 30, swapouts=100, compressions=100):
 
 def test_policy_uses_sealed_ram_and_fixed_thresholds():
     value = gate.policy(CONFIG)
-    assert value['limits']['min_free_inactive_bytes'] == 36 << 30
+    assert value['limits']['min_available_bytes'] == 36 << 30
     assert value['limits']['max_non_ci_process_rss_bytes'] == 512 << 20
     assert value['limits']['max_non_ci_process_cpu_cores'] == .25
     assert value['limits']['max_non_ci_cpu_cores'] == .5
@@ -110,7 +110,7 @@ def test_cell_flags_any_run_or_free_memory_spread_without_touching_measurements(
     if reason is None:
         assert result['status'] == 'passed' and result['reasons'] == []
     elif reason == 'free':
-        assert result['status'] == 'needs-review' and result['reasons'] == ['prelaunch-free-inactive-difference']
+        assert result['status'] == 'needs-review' and result['reasons'] == ['prelaunch-available-difference']
     else:
         assert result['status'] == 'needs-review' and result['reasons'][0].startswith('r3/candidate:')
 

@@ -297,7 +297,15 @@ def test_functional_aggregate_rechecks_retained_probes_not_just_receipt_hash(fun
     aggregation.functional_retained(root, config, "deepseek", cell)
 
 
-@pytest.mark.parametrize("fault", ["argv", "resource", "pid", "memlock", "maps", "ambient", "settings", "model", "template", "cleanup"])
+def test_functional_aggregate_accepts_threads_pinned_within_the_enforced_cpus(functional_raw):
+    root, folder, config, cell = functional_raw
+    raw = load(folder / "runtime-after.json")
+    raw["cpus_allowed_list"] = "2"
+    (folder / "runtime-after.json").write_text(json.dumps(raw))
+    aggregation.functional_retained(root, config, "deepseek", cell)
+
+
+@pytest.mark.parametrize("fault", ["argv", "resource", "cpus", "pid", "memlock", "maps", "ambient", "settings", "model", "template", "cleanup"])
 def test_functional_retained_identity_or_resources_cannot_be_rehashed_into_acceptance(functional_raw, fault):
     root, folder, cfg, cell = functional_raw
     if fault in ("model", "template"):
@@ -312,6 +320,7 @@ def test_functional_retained_identity_or_resources_cannot_be_rehashed_into_accep
         raw = load(folder / "runtime-after.json")
         if fault == "argv": raw["cmdline"] = ["/other"]
         elif fault == "resource": raw["cgroup_limits"]["memory_max"] = "200"
+        elif fault == "cpus": raw["cpus_allowed_list"] = "2-4"
         elif fault == "pid": raw["worker_pid"] = 124
         elif fault == "memlock": raw["proc_limits"] = "Max locked memory 2 2 bytes\n"
         elif fault == "maps": raw["proc_maps"] = raw["proc_maps"].replace("08:01 9", "08:01 10")
@@ -607,11 +616,11 @@ def test_summary_renders_mac_host_conditions_per_run_without_excusing_slowdown(f
     from test_ci_performance_series import candidates, decide, scaled
     base = dict(schema_version=1, policy=dict(pair_free_tolerance_bytes=1 << 30),
         quiet=dict(status="passed"), cleanup=dict(status="passed"),
-        prelaunch_free_inactive_bytes=38 * (1 << 30) + (1 << 29),
+        prelaunch_available_bytes=38 * (1 << 30) + (1 << 29),
         timed=dict(status="passed", reasons=[], swap_delta_bytes=0, compression_delta_bytes=2 << 20,
             process_activity=dict(non_ci_cpu_cores=0.125), memory_pressure_levels=[1, 1]))
     other = copy.deepcopy(base)
-    other["prelaunch_free_inactive_bytes"] = 38 << 30
+    other["prelaunch_available_bytes"] = 38 << 30
     other["timed"].update(status="flagged" if flagged else "passed",
         reasons=["swap-activity|<diagnosis>\nretain"] if flagged else [], swap_delta_bytes=3 << 20,
         compression_delta_bytes=80 << 20, process_activity=dict(non_ci_cpu_cores=0.375),
@@ -625,7 +634,7 @@ def test_summary_renders_mac_host_conditions_per_run_without_excusing_slowdown(f
         execution_devices=["local-mbp"], cells=[dict(device="local-mbp", model="muse", status=entry["status"],
             functional="passed", numerical="passed", performance=[dict(tier="512", **entry)])])
     text = summary(report)
-    assert "Quiet free+inactive GiB" in text and "Timed swap Δ MiB" in text and "Non-CI CPU cores" in text
+    assert "Quiet available GiB" in text and "Timed swap Δ MiB" in text and "Non-CI CPU cores" in text
     assert "| muse | 512 | r1/base | 38.5000 | 0.0000 | 2.0000 | 0.1250 | 1 → 1 | passed |" in text
     assert "| muse | 512 | r2/candidate | 38.0000 | 3.0000 | 80.0000 | 0.3750 | 1 → 2 |" in text
     if flagged:

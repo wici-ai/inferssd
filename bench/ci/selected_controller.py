@@ -555,7 +555,7 @@ def operator_summary(stream, report):
                 return f"{value / unit:.4f}"
 
             stream.write("### Mac sampled host conditions\n\n")
-            stream.write("| Model | Tier | Run | Quiet free+inactive GiB | Timed swap Δ MiB | Timed compression Δ MiB | Non-CI CPU cores | Pressure | Timed status |\n")
+            stream.write("| Model | Tier | Run | Quiet available GiB | Timed swap Δ MiB | Timed compression Δ MiB | Non-CI CPU cores | Pressure | Timed status |\n")
             stream.write("|---|---|---|---:|---:|---:|---:|---|---|\n")
             for row, entry in mac_cells:
                 runs = entry.get("environment", {}).get("runs") or {"unavailable": {}}
@@ -564,7 +564,7 @@ def operator_summary(stream, report):
                     levels = timed.get("memory_pressure_levels")
                     pressure = " → ".join(str(level) for level in levels) if isinstance(levels, list) else "unavailable"
                     values = [row["model"], entry["tier"], name,
-                        scaled(arm.get("prelaunch_free_inactive_bytes"), 1 << 30),
+                        scaled(arm.get("prelaunch_available_bytes"), 1 << 30),
                         scaled(timed.get("swap_delta_bytes"), 1 << 20),
                         scaled(timed.get("compression_delta_bytes"), 1 << 20),
                         metric_text(timed.get("process_activity", {}), "non_ci_cpu_cores"),
