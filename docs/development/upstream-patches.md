@@ -159,7 +159,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-vocab.cpp` | 67 | 8 |
 | `src/llama-vocab.h` | 5 | 0 |
 | `src/llama.cpp` | 4 | 1 |
-| `src/models/deepseek2.cpp` | 10 | 4 |
+| `src/models/deepseek2.cpp` | 7 | 2 |
 | `src/models/kimi-linear.cpp` | 2 | 2 |
 | `src/models/models.h` | 165 | 0 |
 | `src/models/qwen35.cpp` | 2 | 2 |
@@ -174,5 +174,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 16891 added, 5670 removed across 143 upstream paths.
+Total: 16888 added, 5668 removed across 143 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
