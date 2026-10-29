@@ -6074,41 +6074,23 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             const int64_t n_cols  = (int64_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
                             const int64_t key_len = hparams.engram_key_length;
 
-                            // hundreds of millions of rows, but each token touches only n_cols of them; the
-                            // table is pinned to a plain CPU buffer (see the override above) so rows page in on demand
-                            const std::string embd_name = tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i).str();
-                            const auto * embd_meta = ml.get_tensor_meta(embd_name.c_str());
-                            if (embd_meta == nullptr) {
-                                throw std::runtime_error(format("%s is missing", embd_name.c_str()));
-                            }
-                            const int64_t n_rows = embd_meta->ne[1];
-                            int64_t row_width = key_len;
-                            if (hparams.engram_e4m3_e8m0_32_row264) {
-                                row_width = 264;
-                                if (embd_meta->type != GGML_TYPE_I8 || embd_meta->ne[0] != row_width ||
-                                        embd_meta->ne[2] != 1 || embd_meta->ne[3] != 1) {
-                                    throw std::runtime_error(format(
-                                        "%s must be I8 [264, rows] for e4m3_e8m0_32_row264", embd_name.c_str()));
-                                }
-                                if ((uint64_t) n_rows != engram_rows[eg]) {
-                                    throw std::runtime_error(format(
-                                        "%s has %" PRId64 " rows, metadata declares %" PRIu64,
-                                        embd_name.c_str(), n_rows, engram_rows[eg]));
-                                }
-                            }
-
-                            // a row index is a bucket offset plus a hash, so the last bucket has to end inside
-                            uint64_t max_row = 0;
+                            // a row index is a bucket offset plus a hash and the buckets lie back to back, so the
+                            // table ends where the last bucket does; the e4m3_e8m0_32_row264 row count was checked
+                            // against the same bucket sum when the metadata was read
+                            int64_t n_rows = 0;
                             for (int64_t b = 0; b < n_cols; ++b) {
                                 const size_t k = (size_t) eg*n_cols + b;
-                                max_row = std::max(max_row, engram_offsets[k] + engram_primes[k]);
+                                n_rows = std::max(n_rows, (int64_t) (engram_offsets[k] + engram_primes[k]));
                             }
-                            if ((int64_t) max_row > n_rows) {
-                                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the engram buckets (%" PRIu64 ")",
-                                                                embd_name.c_str(), n_rows, max_row));
-                            }
+                            const int64_t row_width = hparams.engram_e4m3_e8m0_32_row264 ? 264 : key_len;
 
+                            // hundreds of millions of rows, but each token touches only n_cols of them; the
+                            // table is pinned to a plain CPU buffer (see the override above) so rows page in on demand
                             layer.engram_embd = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {row_width, n_rows}, 0);
+                            if (hparams.engram_e4m3_e8m0_32_row264 && layer.engram_embd->type != GGML_TYPE_I8) {
+                                throw std::runtime_error(format("%s must be I8 for e4m3_e8m0_32_row264",
+                                                                layer.engram_embd->name));
+                            }
                             layer.engram_wkv  = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV,  "weight", i), {n_cols * key_len, n_embd * (hc_mult + 1)}, 0);
                             layer.engram_q    = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,    "weight", i), {n_embd, hc_mult}, 0);
                             layer.engram_k    = create_tensor(tn(LLM_TENSOR_ENGRAM_K,    "weight", i), {n_embd, hc_mult}, 0);

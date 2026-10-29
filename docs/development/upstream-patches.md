@@ -128,7 +128,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/gguf.cpp` | 7 | 0 |
 | `include/llama.h` | 88 | 1 |
 | `src/CMakeLists.txt` | 20 | 0 |
-| `src/llama-arch.cpp` | 167 | 2 |
+| `src/llama-arch.cpp` | 168 | 2 |
 | `src/llama-arch.h` | 109 | 2 |
 | `src/llama-context.cpp` | 1316 | 45 |
 | `src/llama-context.h` | 148 | 2 |
@@ -151,8 +151,8 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-mmap.h` | 7 | 0 |
 | `src/llama-model-loader.cpp` | 164 | 7 |
 | `src/llama-model-loader.h` | 36 | 0 |
-| `src/llama-model-saver.cpp` | 8 | 2 |
-| `src/llama-model.cpp` | 1093 | 39 |
+| `src/llama-model-saver.cpp` | 9 | 2 |
+| `src/llama-model.cpp` | 1075 | 39 |
 | `src/llama-model.h` | 107 | 0 |
 | `src/llama-quant.cpp` | 22 | 1 |
 | `src/llama-sampler.cpp` | 1 | 0 |
@@ -174,5 +174,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 16907 added, 5670 removed across 143 upstream paths.
+Total: 16891 added, 5670 removed across 143 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
