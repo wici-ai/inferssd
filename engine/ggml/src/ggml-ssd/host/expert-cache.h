@@ -31,6 +31,9 @@ struct expert_cache_options {
     context_client * host = nullptr;
     client_config budget;
     bool require_shared = true;
+    // A GPU tier keeps experts in this DRAM (a unified-memory GPU with a nonzero vram.budget): an automatic RAM
+    // cache then keeps only the slots the next-layer prefetch lands in.
+    bool gpu_tier = false;
     std::string cache_policy = "window", cache_allocation = "priority";
     bool cache_keep = false, cache_prefill_read = false, cache_elastic = false, cache_partial_reclaim = false;
     size_t cache_prefill_slots = 0;
@@ -138,7 +141,8 @@ struct expert_cache {
     // Room for the cache comes from the host-memory ledger, which every other host allocation asks too. Its cgroup
     // reserve is CACHE_RESERVE_BYTES; opt-in CACHE_RECLAIMABLE_FILE counts file-backed pages as cgroup headroom.
     cache_client_view ledger;
-    const bool unified_memory;
+    // The GPU tier keeps the cached experts in this DRAM (expert_cache_options::gpu_tier on unified memory).
+    const bool tier_caches;
     // The last answer check_room got and the rejections per short term, for the receipts: on a discrete GPU the
     // cgroup term is meant to bind, so a system-term rejection there points at memory the cgroup does not see.
     mutable ssd::host::room last_room;
@@ -258,7 +262,7 @@ struct expert_cache {
         return "unknown";
     }
 
-    explicit expert_cache(const expert_cache_options & configuration) : ledger(configuration.host, configuration.budget, configuration.require_shared), unified_memory(configuration.budget.unified) {
+    explicit expert_cache(const expert_cache_options & configuration) : ledger(configuration.host, configuration.budget, configuration.require_shared), tier_caches(configuration.budget.unified && configuration.gpu_tier) {
         if (page_size < 4096 || page_size > 65536 || (page_size & (page_size - 1))) {
             throw std::runtime_error("CPU sink cache requires a supported system page size");
         }
@@ -609,25 +613,25 @@ struct expert_cache {
         const size_t next_stride = size_t(sum);
         uint64_t budget = stats.budget_bytes;
         if (budget == auto_budget) {
-            // With a unified-memory GPU the GPU tier keeps the same experts in the same DRAM and computes
-            // them faster, so the RAM cache keeps only the slots the next-layer prefetch lands in. Otherwise
-            // it takes what the cgroup guard would admit now.
+            // With a GPU tier on a unified-memory GPU the tier keeps the same experts in the same DRAM and
+            // computes them faster, so the RAM cache keeps only the slots the next-layer prefetch lands in.
+            // Otherwise, a unified GPU without a tier included, it takes what the cgroup guard would admit now.
             // The receipt names both terms: on a discrete GPU the cgroup term should be the smaller one.
             uint64_t surplus = 0;
             const bool readable = check_room(0, nullptr, &surplus) == room_ok;
-            budget = unified_memory
+            budget = tier_caches
                     ? multiply(multiply(layers.size(), uint64_t(std::max(1, staging_per_layer))), next_stride)
                     : (readable ? surplus : 0);
             const auto & r = last_room;
-            std::fprintf(stderr, "[kimi_cpu_sink_cache] auto_budget=%llu unified=%d slot_bytes=%zu cgroup_surplus=%llu system_surplus=%llu available=%llu floor=%llu binding=%s\n",
-                    (unsigned long long) budget, int(unified_memory), next_stride,
+            std::fprintf(stderr, "[kimi_cpu_sink_cache] auto_budget=%llu unified=%d tier=%d slot_bytes=%zu cgroup_surplus=%llu system_surplus=%llu available=%llu floor=%llu binding=%s\n",
+                    (unsigned long long) budget, int(ledger.state().unified), int(tier_caches), next_stride,
                     (unsigned long long) (r.cgroup == room_unreadable ? 0 : r.cgroup_surplus), (unsigned long long) r.system_surplus,
                     (unsigned long long) r.available, (unsigned long long) r.floor,
                     !readable ? "unreadable" : !r.system || r.cgroup_surplus <= r.system_surplus ? "cgroup" : "system");
         }
         size_t count = static_cast<size_t>(std::min(budget / next_stride,
                                                   multiply(layers.size(), uint64_t(quota))));
-        if (stats.budget_bytes == auto_budget && !unified_memory) {
+        if (stats.budget_bytes == auto_budget && !tier_caches) {
             // Price the same page rounding/tables and allocation guards used
             // by admission. Payload-only division can spend their headroom,
             // making an automatically chosen arena pause before it fills.
@@ -995,8 +999,8 @@ struct expert_cache {
     }
     // Host memory the cache may still commit before a reset: its enabled but not yet resident slots (an elastic
     // cache enables all of them again at the next decode phase), or before the first decode token maps the arena,
-    // what geometry() will size it to for this slot size. Off unified memory the automatic size depends on the
-    // cgroup at that time, and only the GPU tier of a unified device asks.
+    // what geometry() will size it to for this slot size. Without a unified GPU tier the automatic size depends on
+    // the cgroup at that time, and only the GPU tier of a unified device asks.
     uint64_t pending_bytes(size_t slot_bytes) const {
         if (!stats.budget_bytes || paused) { return 0; }
         if (arena) {
@@ -1006,7 +1010,7 @@ struct expert_cache {
         if (!slot_bytes || layers.empty()) { return 0; }
         uint64_t budget = stats.budget_bytes;
         if (budget == auto_budget) {
-            if (!unified_memory) { return 0; }
+            if (!tier_caches) { return 0; }
             budget = multiply(multiply(layers.size(), uint64_t(std::max(1, staging_per_layer))), slot_bytes);
         }
         return multiply(std::min(budget / slot_bytes, multiply(layers.size(), uint64_t(quota))), slot_bytes);

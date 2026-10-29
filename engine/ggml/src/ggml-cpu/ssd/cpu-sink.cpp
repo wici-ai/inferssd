@@ -339,6 +339,8 @@ static ssd::host::expert_cache_options sink_cache_options(const sink_configurati
     out.host = value.host;
     out.budget = sink_host_configuration(value);
     out.require_shared = value.production;
+    const auto * tier = value.settings.vram_budget();
+    out.gpu_tier = value.production ? tier && tier->tier_bytes(value.has_gpu) : value.policy.vram_budget != 0;
     const auto & policy = value.policy;
     out.cache_policy = policy.cache_policy;
     out.cache_allocation = policy.cache_allocation;
@@ -1541,10 +1543,10 @@ struct kimi_cpu_sink {
     // At load, storage before any request, so that no request waits for its page population. On unified memory the
     // GPU tier's (sink_vram::reserve), with the floor and the RAM cache's demand published first, as the first decode
     // layer publishes them before the tier sizes itself there; the RAM cache there only lands the prefetch and follows
-    // at the first decode token, from the demand the tier left. Elsewhere the RAM cache's (reserve_cache), with a GPU
-    // tier or without one, when the cache can give room back (partial reclaim or elastic).
+    // at the first decode token, from the demand the tier left. Elsewhere, unified memory without a GPU tier included,
+    // the RAM cache's (reserve_cache), when the cache can give room back (partial reclaim or elastic).
     void reserve_tier(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down, int experts_used) {
-        if (!cache.ledger.state().unified) { reserve_cache(up, gate, down, experts_used); }
+        if (!cache.ledger.state().unified || !vram.context) { reserve_cache(up, gate, down, experts_used); }
         if (!vram.context || cache.layers.empty()) { return; }
         refresh_floor("reserve");
         if (!cache.arena) { vram.set_host_demand(cache.pending_bytes(size_t(up->nb[2] + gate->nb[2] + down->nb[2]))); }
