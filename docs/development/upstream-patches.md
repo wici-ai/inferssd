@@ -32,8 +32,8 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | --- | ---: | ---: |
 | `common/CMakeLists.txt` | 16 | 22 |
 | `common/arg.cpp` | 61 | 3 |
-| `common/build-info.cpp.in` | 7 | 2 |
-| `common/build-info.h` | 1 | 0 |
+| `common/build-info.cpp.in` | 13 | 2 |
+| `common/build-info.h` | 2 | 0 |
 | `common/chat-auto-parser-generator.cpp` | 1 | 1 |
 | `common/chat-peg-parser.cpp` | 4 | 2 |
 | `common/chat-peg-parser.h` | 3 | 0 |
@@ -170,5 +170,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.cpp` | 195 | 183 |
 | `tools/server/server-task.h` | 23 | 80 |
 
-Total: 15586 added, 5638 removed across 139 upstream paths.
+Total: 15593 added, 5638 removed across 139 upstream paths.
 <!-- END UPSTREAM INVENTORY -->

@@ -29,12 +29,18 @@ const char * inferssd_version(void) {
     return INFERSSD_VERSION;
 }
 
+const char * inferssd_build_name(void) {
+    static std::string s = std::string("InferSSD ") +
+        (*INFERSSD_VERSION ? std::string(INFERSSD_VERSION) + " " : "") + "(" + LLAMA_COMMIT + ")";
+    return s.c_str();
+}
+
 const char * llama_build_info(void) {
-    static std::string s = std::string("inferssd-") + INFERSSD_VERSION + "-" + LLAMA_COMMIT;
+    static std::string s = *INFERSSD_VERSION ? std::string(INFERSSD_VERSION) + "-" + LLAMA_COMMIT : LLAMA_COMMIT;
     return s.c_str();
 }
 
 void llama_print_build_info(void) {
-    fprintf(stderr, "%s: InferSSD %s (%s)\n",     __func__, inferssd_version(), llama_commit());
+    fprintf(stderr, "%s: %s\n",                   __func__, inferssd_build_name());
     fprintf(stderr, "%s: built with %s for %s\n", __func__, llama_compiler(), llama_build_target());
 }

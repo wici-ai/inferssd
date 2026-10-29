@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.19...3.28)
-project(InferSSD VERSION 0.1.0 LANGUAGES C CXX)
+project(InferSSD LANGUAGES C CXX)
 
 # Keep product build commands and output paths stable while the bundled engine
 # retains its own source-relative layout and can also be built directly.

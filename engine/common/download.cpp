@@ -304,7 +304,7 @@ static int common_download_file_single_online(const std::string & url,
         headers.emplace(h.first, h.second);
     }
     if (headers.find("User-Agent") == headers.end()) {
-        headers.emplace("User-Agent", "inferssd/" + std::string(inferssd_version()));
+        headers.emplace("User-Agent", "inferssd/" + std::string(llama_build_info()));
     }
     if (!opts.bearer_token.empty()) {
         headers.emplace("Authorization", "Bearer " + opts.bearer_token);
@@ -442,7 +442,7 @@ std::pair<long, std::vector<char>> common_remote_get_content(const std::string  
         headers.emplace(h.first, h.second);
     }
     if (headers.find("User-Agent") == headers.end()) {
-        headers.emplace("User-Agent", "inferssd/" + std::string(inferssd_version()));
+        headers.emplace("User-Agent", "inferssd/" + std::string(llama_build_info()));
     }
 
     if (params.timeout > 0) {
