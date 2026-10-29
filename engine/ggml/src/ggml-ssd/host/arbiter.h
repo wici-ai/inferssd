@@ -45,24 +45,24 @@ struct client_config {
 struct actions {
     // Publishes the GPU tier's finished deferred uploads and returns their RAM leases.
     std::function<void()> collect_deferred;
-    // Unified memory: the GPU tier gives blocks back for `bytes` more (false when it could not).
+    // Unified memory: the GPU tier gives blocks back for `bytes` more in both terms (false when it could not).
     std::function<bool(uint64_t bytes)> reclaim_tier;
     // The RAM cache gives slots back until room for `bytes` fits (false when it cannot).
     std::function<bool(uint64_t bytes)> reclaim_cache;
 };
 // Who an admission is for, which decides what the reclaimer gives back for it.
 // An allocation outside the caches (compute and work buffers, scratch,
-// checkpoints) has the GPU tier give room first on unified memory while the
-// system term is short, as the tier grows back into memory that is free again
-// at a later decode token, then the RAM cache. The RAM cache's own growth has
-// its colder slots give room. The GPU tier's growth takes free room only: it
-// keeps the floor and the RAM cache's demand free itself.
+// checkpoints) has the GPU tier give room first on unified memory while a term
+// is short, as the tier grows back into memory that is free again at a later
+// decode token, then the RAM cache. The RAM cache's own growth has its colder
+// slots give room. The GPU tier's growth takes free room only: it keeps the
+// floor and the RAM cache's demand free itself.
 enum class requester { outside, ram_cache, gpu_tier };
 
 struct snapshot {
     bool configured = false, unified = false, reclaimable_file = false;
     uint64_t client_id = 0, reserve = 0, margin = 0, explicit_reserve = 0, floor = 0;
-    uint64_t prefill_pages = 0, all_prefill_pages = 0, pending_bytes = 0;
+    uint64_t prefill_pages = 0, all_prefill_pages = 0, pending_bytes = 0, device_held = 0, all_device_held = 0;
     uint64_t file_reserve = 0, refaults = 0, file_updates = 0;
     uint64_t granted = 0, margin_updates = 0, overlap_skips = 0;
     std::string cgroup;
@@ -128,6 +128,11 @@ class context_client {
     [[nodiscard]] result<void> configure(const client_config &) noexcept;
     [[nodiscard]] result<snapshot> state() const noexcept;
     [[nodiscard]] result<void> set_prefill_pages(uint64_t) noexcept;
+    // Unified memory: the device memory this context's caches hold in the host's DRAM (the GPU tier's blocks and
+    // buffers), which the cgroup does not charge to the process. The envelope counts every context's as used, so the
+    // GPU tier and the RAM cache share it. The owner publishes its total before it commits an allocation's ticket and
+    // after it frees. Off unified memory device memory is not this DRAM and the value is ignored.
+    [[nodiscard]] result<void> set_device_held(uint64_t) noexcept;
     [[nodiscard]] result<void> clear_prefill_pages() noexcept { return set_prefill_pages(0); }
     [[nodiscard]] result<uint64_t> dram_bytes(uint64_t host, uint64_t device) const noexcept;
     [[nodiscard]] result<room> measure(uint64_t extra, bool full_boost = false) const noexcept;

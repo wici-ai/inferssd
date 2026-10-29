@@ -40,7 +40,7 @@ struct client_state {
     uint64_t id = 0;
     bool configured = false, closing = false, closed = false;
     client_config config;
-    uint64_t prefill_pages = 0, committed_grants = 0, pending = 0, external_pending = 0;
+    uint64_t prefill_pages = 0, committed_grants = 0, pending = 0, external_pending = 0, device_held = 0;
     size_t operations = 0, tickets = 0;
     bool interval_open = false, interval_overlap = false;
     uint64_t interval_available = 0, interval_known = 0, overlap_skips = 0;
@@ -127,6 +127,13 @@ struct process_arbiter::impl {
         }
         return total;
     }
+    // What the cgroup does not charge: the caches' device memory, on unified memory only.
+    uint64_t held_device() const noexcept {
+        uint64_t total = 0;
+        if (!budget.unified) { return 0; }
+        for (const auto & pair : clients) { total = add(total, pair.second->device_held); }
+        return total;
+    }
     void refresh_config() noexcept {
         uint64_t reserve = 512ull << 20, margin = reserve, explicit_reserve = 0, envelope = 0;
         bool unified = domain_unified, reclaimable = domain_reclaimable;
@@ -154,6 +161,9 @@ struct process_arbiter::impl {
         // mutates published holds or the owner's learning state.
         auto view = budget;
         view.prefill_pages = pages(excluding);
+#if defined(__linux__)
+        view.device_held = held_device(); // the native ledgers' envelopes charge device memory to the process
+#endif
         const auto observed = view.measure(add(extra, pending), full_boost);
         room out;
         out.cgroup = static_cast<room_state>(observed.cgroup);
@@ -203,7 +213,7 @@ struct process_arbiter::impl {
         }
         const running done{ *this, *state, std::move(registered) };
         const actions & callbacks = *done.callbacks;
-        if (observed.system_shortage && unified && who == requester::outside && callbacks.reclaim_tier) {
+        if (unified && who == requester::outside && callbacks.reclaim_tier) {
             if (callbacks.collect_deferred) { callbacks.collect_deferred(); }
             uint64_t need;
             {
@@ -276,6 +286,7 @@ result<snapshot> context_client::state() const noexcept {
         out.reserve = owner.budget.reserve; out.margin = owner.budget.margin;
         out.explicit_reserve = owner.budget.explicit_reserve; out.floor = owner.budget.floor();
         out.prefill_pages = state_->prefill_pages; out.all_prefill_pages = owner.pages(); out.pending_bytes = owner.pending;
+        out.device_held = state_->device_held; out.all_device_held = owner.held_device();
         out.file_reserve = owner.budget.file_reserve; out.refaults = owner.budget.refaults;
         out.file_updates = owner.budget.file_updates; out.granted = add(state_->committed_grants, state_->external_pending);
         out.margin_updates = owner.margin_updates; out.overlap_skips = state_->overlap_skips; out.cgroup = owner.budget.cgroup;
@@ -288,6 +299,16 @@ result<void> context_client::set_prefill_pages(uint64_t pages) noexcept {
         if (operation.error) { return {status::invalid, operation.error}; }
         std::lock_guard<std::mutex> lock(owner.mutex);
         if (state_->prefill_pages != pages) { state_->prefill_pages = pages; owner.invalidate_peers(state_->id); }
+        return {};
+    });
+}
+result<void> context_client::set_device_held(uint64_t bytes) noexcept {
+    return guarded<void>([&]() -> result<void> {
+        auto & owner = *owner_->impl_; process_arbiter::impl::operation operation(owner, state_);
+        if (operation.error) { return {status::invalid, operation.error}; }
+        std::lock_guard<std::mutex> lock(owner.mutex);
+        const uint64_t held = state_->config.unified ? bytes : 0;
+        if (state_->device_held != held) { state_->device_held = held; owner.invalidate_peers(state_->id); }
         return {};
     });
 }
@@ -453,7 +474,8 @@ void context_client::close() noexcept {
     if (state_->closed) { return; }
     state_->closing = true;
     owner.changed.wait(lock, [&] { return !state_->operations && !state_->tickets; });
-    state_->interval_open = false; state_->prefill_pages = 0; state_->reclaimer.reset(); state_->closed = true;
+    state_->interval_open = false; state_->prefill_pages = 0; state_->device_held = 0; state_->reclaimer.reset();
+    state_->closed = true;
     owner.invalidate_peers(state_->id); owner.clients.erase(state_->id); owner.refresh_config();
 }
 allocation_ticket::allocation_ticket(std::shared_ptr<process_arbiter> owner,

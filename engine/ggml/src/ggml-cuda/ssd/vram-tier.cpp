@@ -304,12 +304,28 @@ struct tier {
     }
     // Free memory the tier may still take. On unified memory that is MemAvailable, as it reads at the kernel's full
     // watermark boost (ggml's device-memory query), less the ledger's floor and the RAM cache's demand: a boost the
-    // kernel raises after the tier grew cannot take MemAvailable under the floor.
+    // kernel raises after the tier grew cannot take MemAvailable under the floor. The envelope bounds it too: the
+    // cgroup's room, in which the ledger counts the tier's storage (publish_storage), less the RAM cache's demand.
     void mem_info(size_t * free_bytes,size_t * total){
         const auto & q=ggml_memory_query::instance();
         if(q.get)q.get(device,free_bytes,total);else cuda_check(cudaMemGetInfo(free_bytes,total));
         const size_t keep=host_floor+host_demand;
         if(unified)*free_bytes=*free_bytes>keep?*free_bytes-keep:0;
+        if(unified && host_client){
+            const auto r=host_client->measure(0);
+            if(r && r.value.cgroup!=ssd::host::room_unreadable){
+                const uint64_t room=r.value.cgroup_shortage?0:r.value.cgroup_surplus;
+                *free_bytes=size_t(std::min<uint64_t>(*free_bytes,room>host_demand?room-host_demand:0));
+            }
+        }
+    }
+    // The tier's storage in this DRAM on unified memory: its slots, the prefill's transient slots and the host jobs'
+    // scratch slots. The cgroup does not charge it, so the host-memory ledger counts it in the envelope, which the RAM
+    // cache then shares with the tier. Published before a new allocation's ticket commits (with its bytes) and after
+    // storage is freed.
+    uint64_t storage_bytes() const{return capacity_bytes+prefill_transient_bytes+(host_scratch?stride*host_scratch_slots:0);}
+    void publish_storage(uint64_t adding=0){
+        if(unified && host_client)(void)host_client->set_device_held(storage_bytes()+adding);
     }
     void publish_reserve(){
         const auto & q=ggml_memory_query::instance();
@@ -644,13 +660,16 @@ struct tier {
         ssd::host::allocation_ticket ticket;
         try { ticket = take_unified(bytes); }
         catch (const host_budget_refused &) { return cudaErrorMemoryAllocation; } // optional cache growth stops safely
-        cudaError_t rc = cudaMalloc(reinterpret_cast<void **>(output), bytes);
+        char * data = nullptr;
+        cudaError_t rc = cudaMalloc(reinterpret_cast<void **>(&data), bytes);
         if (rc == cudaSuccess && unified && host_client) {
-            rc = cudaMemset(*output, 0, bytes);
+            rc = cudaMemset(data, 0, bytes);
             if (rc == cudaSuccess) { rc = cudaDeviceSynchronize(); }
-            if (rc != cudaSuccess) { (void) cudaFree(*output); *output = nullptr; }
+            if (rc != cudaSuccess) { (void) cudaFree(data); data = nullptr; }
         }
-        if (rc == cudaSuccess) { ticket.commit(); }
+        // the caller adds the storage to its own counts after this returns
+        if (rc == cudaSuccess) { publish_storage(bytes); ticket.commit(); }
+        *output = rc == cudaSuccess ? data : nullptr;
         return rc;
     }
     bool free_last_block(const char * reason,bool reactive){
@@ -662,7 +681,7 @@ struct tier {
         cuda_check(cudaSetDevice(device));const cudaError_t rc=cudaFree(block.data);
         if(rc!=cudaSuccess){(void)cudaGetLastError();poisoned=true;throw std::runtime_error(std::string("elastic cudaFree failed: ")+cudaGetErrorString(rc));}
         if(table)table->resize_global(block.first_slot);
-        slot_locations.resize(block.first_slot);blocks.pop_back();capacity_bytes-=block.slot_count*stride;
+        slot_locations.resize(block.first_slot);blocks.pop_back();capacity_bytes-=block.slot_count*stride;publish_storage();
         if(reactive){++reactive_blocks;if(block.first_slot<base_slots)++base_blocks_reclaimed;}
         else if(!std::strcmp(reason,"prefill"))++proactive_blocks;
         std::fprintf(stderr,"[kimi_vram_elastic] event=shrink status=pass reason=%s generation=%llu class=%s freed_slots=%zu freed_bytes=%zu slots=%zu blocks=%zu\n",
@@ -981,7 +1000,7 @@ struct tier {
                 scratch=prefill_transient_arena;prefill_transient_arena=nullptr;}
             cuda_check(cudaSetDevice(device));cuda_check(cudaFree(scratch));
             std::fprintf(stderr,"[kimi_vram_prefill_scratch] status=released bytes=%zu phase=decode\n",prefill_transient_bytes);
-            prefill_transient_bytes=0;
+            prefill_transient_bytes=0;publish_storage();
         }
         if(!elastic_active)return;
         // The server restores and reserves the decode graph before the first
@@ -1042,7 +1061,7 @@ struct tier {
         {std::lock_guard<std::mutex> lock(mutex);
             for(auto & task:host_pending)return_host_events(task);
             host_pending.clear();host_done.clear();host_down.clear();host_queued=false;layer_input_ready=false;}
-        free_host_scratch();
+        free_host_scratch();publish_storage();
         if(memory_trace)memory_sample("after_release",micros(release_start));
     }
     void begin(uint64_t e,uint64_t t,bool decode){
@@ -2046,7 +2065,7 @@ struct tier {
         if(!host_scratch)return;
         cuda_check(cudaSetDevice(device));
         if(host_copy_stream)cuda_check(cudaStreamSynchronize(host_copy_stream));
-        cuda_check(cudaFree(host_scratch));host_scratch=nullptr;
+        cuda_check(cudaFree(host_scratch));host_scratch=nullptr;publish_storage();
         {std::lock_guard<std::mutex> lock(mutex);host_scratch_busy.clear();}
         host_scratch_failed=false;
     }

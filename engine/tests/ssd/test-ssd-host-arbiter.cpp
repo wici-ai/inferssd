@@ -306,11 +306,52 @@ static void result_errors_and_tracked_allocations() {
     auto exhausted = std::make_shared<process_arbiter>([](const std::string &, std::string &) -> bool { throw std::bad_alloc(); });
     require(exhausted->make_client().code == ssd::status::resource, "allocation failure escaped owner construction");
 }
+// On unified memory the cgroup does not charge the GPU tier's device memory. The envelope counts what the caches
+// publish as held, so the RAM cache and the tier share it, and the system term (MemAvailable) does not count it
+// twice. Off unified memory device memory is not this DRAM.
+static void unified_device_held() {
+    files f; f.limit = 8*GiB; f.current = GiB; f.available = 64*GiB;
+    auto owner = std::make_shared<test_owner>(f.reader()); auto a = owner->make_client(), b = owner->make_client();
+    a->configure(config(true)); b->configure(config(true));
+    const auto before = b->measure(0);
+    require(before.cgroup_surplus == 8*GiB - GiB - 512*MiB, "fixture envelope changed");
+    checked(a->raw->set_device_held(5*GiB));
+    require(a->state().device_held == 5*GiB && b->state().device_held == 0 && b->state().all_device_held == 5*GiB,
+        "device memory was not published for the process");
+    require(b->measure(0).cgroup_surplus == before.cgroup_surplus - 5*GiB &&
+        b->measure(0).system_surplus == before.system_surplus,
+        "the envelope did not count the tier's device memory, or MemAvailable counted it twice");
+    // Neither the RAM cache nor the tier grows past the envelope the tier holds.
+    require(!b->take(2*GiB, 0, requester::ram_cache, false, allocation_class::tracked),
+        "the RAM cache grew into the envelope the GPU tier holds");
+    require(!a->take(0, 2*GiB, requester::gpu_tier, false, allocation_class::tracked), "the GPU tier grew past the envelope");
+    auto grows = a->take(0, GiB, requester::gpu_tier, false, allocation_class::tracked);
+    require(bool(grows), "the GPU tier could not grow within the envelope");
+    grows.cancel();
+    // An allocation outside the caches that only the envelope refuses has the GPU tier give room first.
+    std::vector<int> order;
+    actions reclaim;
+    reclaim.reclaim_tier = [&](uint64_t) { order.push_back(2); checked(a->raw->set_device_held(GiB)); return true; };
+    reclaim.reclaim_cache = [&](uint64_t) { order.push_back(3); return false; };
+    a->set_reclaimer(reclaim);
+    auto outside = a->take(3*GiB);
+    require(bool(outside) && order == std::vector<int>({2}), "the GPU tier did not give room in the envelope");
+    outside.cancel(); a->clear_reclaimer();
+    a->close();
+    require(b->state().all_device_held == 0 && b->measure(0).cgroup_surplus == before.cgroup_surplus,
+        "a closed context's device memory stayed in the envelope");
+    files g; auto discrete = std::make_shared<test_owner>(g.reader()); auto d = discrete->make_client();
+    d->configure(config(false));
+    const auto plain = d->measure(0);
+    checked(d->raw->set_device_held(5*GiB));
+    require(d->state().device_held == 0 && d->measure(0).cgroup_surplus == plain.cgroup_surplus,
+        "a discrete GPU's memory was counted in the host envelope");
+}
 int main() {
     try {
         serial_equivalence(); holds_and_pending(); races_and_reclaim(); process_reserves_and_rollback();
         interval_isolation_and_close(); close_waits_for_reclaimer();
-        result_errors_and_tracked_allocations();
-        std::cout << "host arbiter: serial equations, holds, atomic tickets, reclaim, interval and close gates passed\n";
+        result_errors_and_tracked_allocations(); unified_device_held();
+        std::cout << "host arbiter: serial equations, holds, atomic tickets, reclaim, interval, close and unified device gates passed\n";
     } catch (const std::exception & error) { std::cerr << error.what() << '\n'; return 1; }
 }
