@@ -38,6 +38,10 @@ native CPU build, UUID-free/name/quantization/device fallback, CLI precedence,
 resolver/context ownership tests and typed Python/native
 configuration and launch tests use synthetic fixtures; they establish no speedup.
 Allocator/THP optimizations require a separate context-specific gated integration.
+The historical benchmark bridge recognizes the new installed registry while
+retaining its explicit 14/16-setting bindings. It does not drop or translate model
+rules into legacy evidence; a binding containing rules still requires separate
+reviewed support. Full bench/framework tests cover this compatibility boundary.
 
 ## Performance benchmarks
 

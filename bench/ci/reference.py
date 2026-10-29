@@ -25,6 +25,10 @@ SETTING_KEYS = frozenset((
 ))
 MODEL_SETTING_KEYS = frozenset(("model.engram_prefetch", "model.hc_fused"))
 SETTING_GENERATIONS = (SETTING_KEYS, SETTING_KEYS | MODEL_SETTING_KEYS)
+# New installed registries may validate historical bindings without projecting
+# model rules into legacy semantics. Bindings still require the reviewed 14/16 keys.
+REGISTRY_GENERATIONS = (*SETTING_GENERATIONS,
+                        SETTING_KEYS | MODEL_SETTING_KEYS | {"model.optimizations"})
 
 
 def identity(value):
@@ -52,8 +56,8 @@ def validate_semantics(values):
     schema, typed = registry.schema, registry.typed
 
     properties = schema()["properties"]
-    if frozenset(properties) not in SETTING_GENERATIONS or frozenset(values) not in SETTING_GENERATIONS:
-        raise ValueError("reference adapter requires an explicit reviewed 14- or 16-key schema")
+    if frozenset(properties) not in REGISTRY_GENERATIONS or frozenset(values) not in SETTING_GENERATIONS:
+        raise ValueError("reference adapter requires a reviewed registry and explicit 14- or 16-key binding")
     if not set(values) <= set(properties):
         raise ValueError("installed settings registry cannot validate this binding generation")
     for key, value in values.items():

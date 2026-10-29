@@ -216,3 +216,30 @@ def test_private_config_binding_must_name_merge_candidate_not_pr_head(binding, s
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="exact base/merge candidate"):
         compare.device_report(root, plan, policy)
+
+
+def test_model_rule_registry_keeps_historical_binding_explicit(binding, monkeypatch):
+    original_schema = settings_registry.schema
+    properties = original_schema()["properties"]
+    assert "model.optimizations" in properties
+    assert reference.validate_binding(binding) is binding
+    assert "model.optimizations" not in binding["semantic_settings"]
+
+    # A registry extension is not permission to reinterpret a legacy binding.
+    for rules in ([], ["example|on|name:Example|deepseek41|36|2|Example GPU|1|0"]):
+        changed = copy.deepcopy(binding)
+        changed["semantic_settings"]["model.optimizations"] = rules
+        changed["sides"]["candidate"]["launch_policy"]["typed_values"]["model.optimizations"] = rules
+        mapping = copy.deepcopy(changed["legacy_mapping"]["host.expert_cache_mib"])
+        changed["legacy_mapping"]["model.optimizations"] = dict(mapping, value=rules)
+        with pytest.raises(ValueError, match="14 or 16 settings"):
+            reference.validate_binding(changed)
+
+    def unknown_schema():
+        value = copy.deepcopy(original_schema())
+        value["properties"]["model.future_option"] = copy.deepcopy(properties["model.optimizations"])
+        return value
+
+    monkeypatch.setattr(settings_registry, "schema", unknown_schema)
+    with pytest.raises(ValueError, match="reviewed registry"):
+        reference.validate_binding(binding)
