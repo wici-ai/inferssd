@@ -301,21 +301,6 @@
                 "minLength": 1
             },
             "default": []
-        },
-        "model.content_manifest": {
-            "description": "Optional exact SHA-256 per loaded GGUF shard; native loader verifies all content",
-            "kind": "strings",
-            "unit": "ordered shard SHA-256",
-            "producer": "model",
-            "scope": "all",
-            "cli": "--ssd-model-content-manifest",
-            "default_literal": "[]",
-            "type": "array",
-            "items": {
-                "type": "string",
-                "minLength": 1
-            },
-            "default": []
         }
     }
 }

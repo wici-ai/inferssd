@@ -35,7 +35,7 @@ int main() {
     require(options, error);
     auto independent = std::make_unique<llama_ssd_context>(*options);
     llama_ssd_options_free(options);
-    const ssd::settings::model_identity identity {"uuid-a", "deepseek41", "36", "2", "Example GPU"};
+    const ssd::settings::model_identity identity {"uuid-a", "deepseek41", "36", "2", "Example GPU", ""};
     auto first_model = ssd::settings::resolve_model(context->settings, identity);
     auto other_model = ssd::settings::resolve_model(independent->settings, identity);
     auto unknown_model = ssd::settings::resolve_model(context->settings, {});

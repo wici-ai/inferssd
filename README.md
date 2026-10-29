@@ -21,27 +21,22 @@
 ## Model-specific configuration
 
 The typed settings registry now accepts default-empty `model.optimizations`
-rules. For models missing `general.uuid` (including the inspected DeepSeek
-`general.name=Src` and Muse metadata), optional `model.content_manifest` lists
-the SHA-256 of every selected GGUF shard in loader order. The native loader
-streams the actual open shards and binds successful verification to that model;
-contexts require the same manifest and admitted external expert byte ranges.
-Names and filenames never supply identity. Native contexts resolve exact loaded
-GGUF UUID or verified content identity, architecture, file type,
+rules. Native contexts match an exact loaded GGUF name or UUID, architecture, file type,
 quantization version and runtime hardware matches into the existing Engram and
 hyper-connection graph options. Unknown, unmatched and disabled rules preserve
 existing settings and launch defaults; explicit per-option CLI values win.
 See [configuration syntax and limits](docs/configuration.md#exact-model-optimization-rules).
-Effective match fields and options appear in native startup logs and telemetry.
+Matching happens once per context before graph construction, using metadata
+already parsed by the loader. It never hashes or rereads weight payloads. Empty
+rules take the original direct-option path with no model-rule logging; configured
+rules emit one startup receipt. The previous unmerged `model.content_manifest`
+setting and content-hash selector are removed. Weight integrity checks belong to
+download/experiment preparation; metadata matching does not certify an artifact.
 
 No production optimization rule is enabled or newly hardware validated. The
-native CPU build, resolver/context ownership tests and typed Python/native
-configuration and launch tests use tiny multi-shard GGUF fixtures; they establish
-no speedup. Manifest verification adds one full startup read of the weights
-(1 MiB buffer), separate from inference; A/B runs must use identical validation.
-Absent, wrong or stale manifests fall back. Direct I/O, Windows, and external
-packed/Mac sources without admitted descriptor bindings cannot use this fallback.
-Weights must remain immutable while loaded. No actual large weights were scanned.
+native CPU build, UUID-free/name/quantization/device fallback, CLI precedence,
+resolver/context ownership tests and typed Python/native
+configuration and launch tests use synthetic fixtures; they establish no speedup.
 Allocator/THP optimizations require a separate context-specific gated integration.
 
 ## Performance benchmarks

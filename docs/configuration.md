@@ -23,8 +23,6 @@ Python resource. There are no environment mirrors or legacy-name aliases.
 | `host.expert_cache_mib` | integer / MiB | `4096` | plan | darwin |
 | `model.engram_prefetch` | integer / boolean | `0` | model | all |
 | `model.hc_fused` | integer / boolean | `1` | model | all |
-| `model.optimizations` | strings / exact model rules | `[]` | model | all |
-| `model.content_manifest` | strings / ordered shard SHA-256 | `[]` | model | all |
 
 These are conservative parser defaults and retained policy priors, not claimed
 per-device performance optima. The framework must provide its measured CPU,
@@ -95,14 +93,14 @@ its typed CLI override, without environment variables. For example:
 
 ```text
 inferssd-settings 1
-model.optimizations = ["reviewed-example|off|example-uuid|deepseek41|36|2|Example GPU|1|0"]
+model.optimizations = ["reviewed-example|off|name:Example Model|deepseek41|36|2|Example GPU|1|0"]
 ```
 
 This is a **disabled synthetic example**, not a validated model or recommended
 setting. Each string has exactly nine `|`-separated fields:
 
 ```text
-rule_id|off_or_on|uuid_or_verified_content|general.architecture|general.file_type|general.quantization_version|hardware|engram_prefetch|hc_fused
+rule_id|off_or_on|selector|general.architecture|general.file_type|general.quantization_version|hardware|engram_prefetch|hc_fused
 ```
 
 Use the exact scalar values from the loaded GGUF metadata. `hardware` is the
@@ -113,11 +111,24 @@ Effective values are visible in the native startup `model options` log
 and, when telemetry is enabled, the `ssd.model.options` event. An empty device
 list or missing identity/quantization metadata cannot match. All identity fields
 must match exactly; filenames, launch profile names, model families, substrings
-and wildcards do not participate. Models without `general.uuid` can use the
-verified content fallback below; otherwise they retain existing settings.
-The UUID must have been validated against the exact model
-artifact and quantization, including mixed tensor types; metadata is an identity
-claim, not an integrity check of the weights.
+and wildcards do not participate. Use `name:<general.name>` for an exact loaded
+model-name match, including models without a UUID, or `uuid:<general.uuid>` for
+an exact UUID match. Bare UUIDs remain compatible with the initial rule format.
+Missing or different selected metadata keeps the original settings. Name rules
+also work when a model has a UUID; the selector explicitly chooses the field.
+
+These are metadata selectors, not cryptographic identities. Names can be reused
+between revisions, and the GGUF file type does not prove every tensor's format.
+Only enable a rule for the tested deployment; model artifact hashes, exact
+quantization and benchmark evidence belong to experiment preparation and records.
+Full payload checks should run separately after download or before a campaign,
+with the same cache treatment for A and B, never as part of option selection.
+
+Runtime selection performs no weight hashing, extra shard reads or per-token
+identity checks. The unmerged `model.content_manifest` setting and `sha256:`
+selector have been removed; old configurations using them are rejected rather
+than silently claiming that payload integrity was checked. Existing model loading
+and expert-source behavior is unchanged.
 
 `off` keeps a rule inactive. `on` is the operator's explicit declaration that the
 exact model, quantization, hardware and **final gated source** have been validated;
@@ -129,9 +140,11 @@ settings; explicit per-option native/launch CLI values win. Existing direct
 `model.engram_prefetch` and `model.hc_fused` settings and the launcher's existing
 `dsv` defaults retain their behavior when rules are absent, disabled or unmatched.
 
-Resolution happens in each native `llama_context`, before graph construction,
+Resolution happens once in each native `llama_context`, before graph construction,
 from its owned immutable snapshot and loaded model facts. It changes only that
-context's graph options. Consecutive and simultaneous contexts do not share a
+context's graph options. An empty rule list takes the original direct-option path,
+without constructing model identity, serializing options, or emitting a model-rule
+receipt. Configured rules emit one startup receipt, not per-token logs. Consecutive and simultaneous contexts do not share a
 mutable feature flag. The startup receipt includes all match fields, the matched
 rule ID (empty on fallback), and both effective options. Malformed rules,
 duplicate IDs and multiple enabled matching rules reject context creation rather
@@ -149,76 +162,3 @@ separate context-specific opt-in allocation integration, fallback and tests;
 adding a rule alone cannot make a process-global operation model-local. Future
 features must add real consumer gates and measure the final gated code, with
 correctness and exact source/model/settings/hardware evidence recorded separately.
-
-### Missing UUID: native verified content admission
-
-Actual inspected metadata receipts have no `general.uuid`: DeepSeek reports
-`general.architecture=deepseek41`, `general.name=Src`, `general.file_type=38`,
-`general.quantization_version=2`; Muse reports `muse-spark`, `Muse Spark Open`,
-`14`, `2`. Names are not usable artifact identities. These receipts establish
-metadata shape only; they do not establish content hashes or performance profiles.
-
-`model.content_manifest` is a typed string array, default `[]`, containing one
-lowercase 64-digit SHA-256 per complete GGUF shard, in the native loader's order.
-Use hashes from a trusted artifact receipt, then enable verification at launch:
-
-```text
-model.content_manifest = ["<sha256-of-complete-first-shard>", "<sha256-of-complete-second-shard>"]
-```
-
-The placeholders above are deliberately invalid. The manifest has no paths and
-cannot select another model. It passes through the production launcher's owned
-settings file or `--ssd-model-content-manifest` CLI override, with existing
-precedence. Native common code passes the same typed options into model loading
-and context creation. No environment identity, global flag, extra credential or
-authentication mechanism is involved. This is native content verification, not
-an unchecked identity asserted by the Python launcher.
-
-When explicitly requested, before tensor loading the native loader hashes the
-actual open shard descriptors with the existing vendored public-domain SHA-256
-implementation. It checks every shard against the manifest, including all tensor
-bytes (and thus mixed quantizations). The fallback identity is exactly:
-
-```python
-"sha256:" + sha256("".join(shard_sha256 + "\n" for shard_sha256 in ordered_manifest).encode("ascii")).hexdigest()
-```
-
-Use that value in the rule's third field only when UUID is absent. Architecture,
-file type, quantization version, hardware, opt-in state and option CLI precedence
-still match independently. A UUID-bearing model continues using its UUID.
-There are no enabled or validated latest-main profiles shipped here.
-
-The verified manifest, descriptor receipts and shard handles belong to the loaded
-model. Each context must supply the same manifest; another model or a stale
-claim cannot inherit it. Descriptor device/inode, size, modification and change
-timestamps are checked around hashing and again at context creation. Handles
-remain open until model destruction. External expert indices must resolve every
-expert to the same admitted shard inode and exact byte range; an unrelated,
-reordered or packed source is not assumed equivalent. This reuses the native
-source-view resolver rather than duplicating source-index parsing/admission.
-No applicable source view, an unbound external source, malformed/absent/wrong
-manifest, unsupported direct I/O, or Windows descriptor validation leaves content
-identity unknown and preserves existing options. In particular, the current Mac
-external cache has no source-view binding and cannot yet use this fallback.
-I/O exceptions fail loading; they never become admission success. Existing UUID
-behavior and direct option settings are retained.
-
-Treat loaded weights and expert sources as immutable for the model lifetime.
-This admission guards accidental stale configuration and file replacement; it
-is not a defense against an adversary mutating live mapped files after admission.
-The startup log reports `content validation startup_us` and the admitted loader
-identity; context telemetry reports the usable content identity and matching rule.
-Hashing costs one sequential full read of all shards, bounded to a 1 MiB buffer,
-plus small per-shard receipts and expert range checks. It can warm the page cache
-and adds to model load time. Report it separately from inference throughput and
-latency. A/B must use the same manifest, validation and cache conditions; do not
-compare a hash-warmed candidate against an unvalidated baseline. Each model load
-validates again; there is no persistent verification cache.
-
-Verification uses tiny synthetic two-shard GGUF fixtures with the actual metadata
-shapes, independent Python SHA-256 receipts, wrong content/shard lists, absent and
-stale claims, quantization mismatches, owned typed model/context plumbing, and
-sequential/concurrent admission isolation. These are controller/runtime regression
-tests, not model benchmark results. No hundreds-of-GB model was scanned for this
-change. THP remains unintegrated: it requires a separate context-safe consumer gate
-and new measurements of the final code. Repeated execution remains unimplemented.

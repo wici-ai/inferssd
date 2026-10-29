@@ -17,4 +17,3 @@ SSD_SETTING("host.expert_cache_mib", integer, 0, 17592186044415, "4096", "MiB", 
 SSD_SETTING("model.engram_prefetch", integer, 0, 1, "0", "boolean", "model", "all", "Read ahead DeepSeek Engram rows; changes I/O timing only")
 SSD_SETTING("model.hc_fused", integer, 0, 1, "1", "boolean", "model", "all", "Use fused DeepSeek hyper connection operations")
 SSD_SETTING("model.optimizations", strings, 0, 0, "[]", "exact model rules", "model", "all", "Explicit model/quantization/hardware rules; empty disables all new overrides")
-SSD_SETTING("model.content_manifest", strings, 0, 0, "[]", "ordered shard SHA-256", "model", "all", "Optional exact SHA-256 per loaded GGUF shard; native loader verifies all content")

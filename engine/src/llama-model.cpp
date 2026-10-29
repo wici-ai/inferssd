@@ -9,8 +9,6 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
-#include "ssd/model-source.h"
-#include "ssd/options.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -668,7 +666,6 @@ struct llama_model::impl {
 
     // model memory mapped files
     llama_mmaps mappings;
-    llama_ssd::content_identity content;
     std::vector<std::vector<llama_file_range>> expert_mmap_ranges;
 
     // objects representing data potentially being locked in memory
@@ -3306,13 +3303,6 @@ void llama_model::load_vocab(llama_model_loader & ml) {
 }
 
 bool llama_model::load_tensors(llama_model_loader & ml) {
-    // Verify only explicitly requested manifests, using the loader's open shards.
-    if (params.ssd_options && !params.no_alloc) {
-        const auto start = ggml_time_us();
-        pimpl->content.verify(params.ssd_options->settings, ml.files);
-        LLAMA_LOG_INFO("%s: content validation startup_us=%lld identity=%s\n", __func__,
-            (long long) (ggml_time_us() - start), pimpl->content.digest.c_str());
-    }
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
     const auto & tensor_split = params.tensor_split;
@@ -8751,23 +8741,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    if (!pimpl->content.digest.empty()) {
-        for (const auto & item : ml.weights_map) {
-            uint32_t layer;
-            if (llama_is_expert_tensor_name(item.first, layer)) {
-                const auto & w = item.second;
-                pimpl->content.experts.push_back({item.first, w.idx, w.offs,
-                    ggml_nbytes(w.tensor) / size_t(w.tensor->ne[2]), w.tensor->ne[2]});
-            }
-        }
-        pimpl->content.files = std::move(ml.files);
-    }
     return true;
-}
-
-std::string llama_model::verified_content(const ssd::settings::snapshot & settings,
-                                         const ssd::store::source_view & sources) const {
-    return pimpl->content.for_context(settings, sources);
 }
 
 std::string llama_model::arch_name() const {
@@ -9869,7 +9843,6 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.defer_experts               =*/ false,
         /*.no_alloc                    =*/ false,
-        /*.ssd_options                 =*/ nullptr,
     };
 
     return result;

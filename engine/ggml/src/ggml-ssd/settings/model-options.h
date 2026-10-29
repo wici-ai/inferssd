@@ -8,10 +8,10 @@
 
 namespace ssd { namespace settings {
 
-// Facts from loaded GGUF metadata, verified bytes and runtime devices, never a path/profile name.
+// Facts from loaded GGUF metadata and runtime devices, never a path/profile name.
 struct model_identity {
     std::string uuid, architecture, file_type, quantization_version, hardware;
-    std::string content; // loader-verified; never copied from a settings claim
+    std::string name; // general.name, already parsed by the GGUF loader
 };
 struct model_options {
     bool engram_prefetch = false;
@@ -19,7 +19,7 @@ struct model_options {
     std::string matched_rule;
 
     std::string json(const model_identity & m) const {
-        return "{\"content\":" + json::quote(m.content) + ",\"uuid\":" + json::quote(m.uuid) + ",\"architecture\":" + json::quote(m.architecture) +
+        return "{\"name\":" + json::quote(m.name) + ",\"uuid\":" + json::quote(m.uuid) + ",\"architecture\":" + json::quote(m.architecture) +
             ",\"file_type\":" + json::quote(m.file_type) + ",\"quantization_version\":" +
             json::quote(m.quantization_version) + ",\"hardware\":" + json::quote(m.hardware) +
             ",\"matched_rule\":" + json::quote(matched_rule) + ",\"engram_prefetch\":" +
@@ -27,7 +27,14 @@ struct model_options {
     }
 };
 
-// Rule: id|off/on|uuid-or-content|architecture|file_type|quantization_version|hardware|engram|hc
+// Empty rules preserve the original context setup without identity/log construction.
+inline bool has_model_rules(const snapshot & settings) noexcept {
+    const auto * entry = settings.find("model.optimizations");
+    const auto * rules = entry ? std::get_if<std::vector<std::string>>(&entry->data) : nullptr;
+    return rules && !rules->empty();
+}
+
+// Rule: id|off/on|selector|architecture|file_type|quantization_version|hardware|engram|hc
 // '-' retains the existing option. No wildcard or family inference is supported.
 inline result<model_options> resolve_model(const snapshot & settings, const model_identity & model) noexcept {
     try {
@@ -36,7 +43,7 @@ inline result<model_options> resolve_model(const snapshot & settings, const mode
         if (auto v = settings.integer("model.hc_fused")) { out.hc_fused = *v != 0; }
         const auto * entry = settings.find("model.optimizations");
         const auto * rules = entry ? std::get_if<std::vector<std::string>>(&entry->data) : nullptr;
-        if (!rules) { return {out, status::ok, {}}; }
+        if (!rules || rules->empty()) { return {out, status::ok, {}}; }
         if (rules->size() > 64) { return {{}, status::invalid, "at most 64 model optimization rules"}; }
         std::set<std::string> ids;
         for (const auto & rule : *rules) {
@@ -58,7 +65,17 @@ inline result<model_options> resolve_model(const snapshot & settings, const mode
                 (fields[8] != "-" && fields[8] != "0" && fields[8] != "1")) {
                 return {{}, status::invalid, "invalid model optimization state/options"};
             }
-            if (fields[1] != "on" || fields[2] != (model.uuid.empty() ? model.content : model.uuid) || fields[3] != model.architecture ||
+            const auto & selector = fields[2];
+            const bool by_name = selector.compare(0, 5, "name:") == 0;
+            const bool by_uuid = selector.compare(0, 5, "uuid:") == 0;
+            if (((by_name || by_uuid) && (selector.size() == 5 || selector.substr(5) == "*")) ||
+                (!by_name && !by_uuid && selector.find(':') != std::string::npos)) {
+                return {{}, status::invalid, "model selector must be name:<general.name> or uuid:<general.uuid>"};
+            }
+            // Bare UUID selectors remain compatible with the initial rule format.
+            const bool identity_matches = by_name ? !model.name.empty() && selector.substr(5) == model.name :
+                !model.uuid.empty() && (by_uuid ? selector.substr(5) : selector) == model.uuid;
+            if (fields[1] != "on" || !identity_matches || fields[3] != model.architecture ||
                 fields[4] != model.file_type || fields[5] != model.quantization_version ||
                 fields[6] != model.hardware) { continue; }
             if (!out.matched_rule.empty()) { return {{}, status::invalid, "ambiguous model optimization rules"}; }

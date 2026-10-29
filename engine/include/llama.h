@@ -321,9 +321,6 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool defer_experts;   // defer expert mmap residency to avoid eager host RSS growth
         bool no_alloc;        // only load metadata and simulate memory allocations
-
-        // Borrowed during model loading; verified content is owned by the model.
-        const struct llama_ssd_options * ssd_options;
     };
 
     struct llama_sampler_seq_config {

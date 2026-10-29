@@ -1,6 +1,4 @@
 #pragma once
-#include "ggml-ssd/settings/settings.h"
-#include "ggml-ssd/store/source.h"
 
 #include "llama.h"
 #include "llama-arch.h"
@@ -658,7 +656,6 @@ struct llama_model {
     explicit llama_model(const struct llama_model_params & params);
     ~llama_model();
 
-    std::string verified_content(const ssd::settings::snapshot &, const ssd::store::source_view &) const;
     void load_stats  (llama_model_loader & ml);
     void load_arch   (llama_model_loader & ml);
     void load_hparams(llama_model_loader & ml);
