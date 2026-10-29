@@ -336,8 +336,10 @@ def run(args):
         if not config["host"]["hardware"]:
             raise ValueError("root-observed hardware fingerprint is required")
         resources = config["host"]["resources"]
-        if resources["cgroup_limits"]["memory_max"] != str(64 << 30) or resources["cgroup_limits"]["memory_swap_max"] != "0":
-            raise ValueError("checkpoint requires exactly 64 GiB host limit and no swap")
+        limit = resources["cgroup_limits"]["memory_max"]
+        if (not isinstance(limit, str) or not limit.isdigit() or not 128 << 20 <= int(limit) <= 1 << 50
+                or resources["cgroup_limits"]["memory_swap_max"] != "0"):
+            raise ValueError("checkpoint requires a host memory limit and no swap")
         binding = copy.deepcopy(config["comparison_binding"])
         check_declaration(binding)
         report["measurement_settings"] = dict(

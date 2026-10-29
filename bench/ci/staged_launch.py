@@ -14,7 +14,11 @@ resolves its launch from that file with `inferssd launch --dry-run`, given the
 runtime facts its live launch reads, and the broker starts exactly the resolved
 argv as the server stage, in place of the launcher's own process scope. A
 change to the launch strategy is therefore measured with the settings it
-derives.
+derives. A request names the context and batch sizes only to pin them; left
+out, the side's strategy chooses them as it does for a user. Every timed run
+starts a fresh server on the same prompt, so the launch keeps no prompt cache
+(`--prompt-cache off`): a cache on disk would carry one run's prompt into the
+next.
 
 The characteristics' SHA-256 seals the file, and every resolution must name it.
 Settings that the strategy leaves alone stay at their defaults, decided by the
@@ -35,7 +39,8 @@ from ci.staged_smoke import collect_log
 PROFILE_STAGE = "machine-profile"
 PROFILE_TIMEOUT_S = 1800
 RESOLVE_TIMEOUT_S = 300
-REQUEST = {"profile", "context", "batch", "ubatch", "port", "extra"}
+REQUEST = {"profile", "port", "extra"}
+SIZES = ("context", "batch", "ubatch")  # optional: the strategy chooses what a request leaves out
 # A PR job's sealed characteristics: the file, its hash, the baseline job it
 # comes from and where root stages it.
 SEALED = {"sha256", "text", "job_id", "commit", "host_path", "runtime_path"}
@@ -106,12 +111,13 @@ def derived(config):
 
 def request_checked(value):
     """The reviewed inputs of one model's launch; everything else is derived on the device."""
-    if (not isinstance(value, dict) or set(value) != REQUEST
+    if (not isinstance(value, dict) or not REQUEST <= set(value) <= REQUEST | set(SIZES)
             or not isinstance(value["profile"], str) or not value["profile"]
-            or any(type(value[key]) is not int or value[key] < 1 for key in ("context", "batch", "ubatch", "port"))
+            or any(type(value[key]) is not int or value[key] < 1 for key in ("port", *SIZES) if key in value)
             or value["port"] > 65535 or not isinstance(value["extra"], list)
             or any(not isinstance(arg, str) or not arg or "\0" in arg for arg in value["extra"])):
-        raise ValueError("a launch request has exactly profile, context, batch, ubatch, port and extra server arguments")
+        raise ValueError("a launch request has profile, port and extra server arguments, "
+                         "and optionally context, batch and ubatch")
     return value
 
 
@@ -281,8 +287,10 @@ def resolve(session, config, side, model, machine, output):
             json.dumps(runtime_policy(config, folder), sort_keys=True), folder, json.dumps(files),
             "--platform", spec["paths"]["platform"], "--model", files[0], "--settings", data["settings"]["runtime_path"],
             "--binary", binary(config, side), "--template", data["template"]["runtime_path"],
-            "--profile", request["profile"], "--port", str(request["port"]), "--context", str(request["context"]),
-            "--batch", str(request["batch"]), "--ubatch", str(request["ubatch"])]
+            "--profile", request["profile"], "--port", str(request["port"]), "--prompt-cache", "off"]
+    for key in SIZES:
+        if key in request:
+            argv += ["--" + key, str(request[key])]
     if request["extra"]:
         argv += ["--", *request["extra"]]
     run_stage(session, side + "-" + model + "-launch", argv, spec["paths"]["cwd"], RESOLVE_TIMEOUT_S, output)

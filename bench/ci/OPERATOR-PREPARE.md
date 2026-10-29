@@ -72,10 +72,10 @@ settings payload hashes must match their declarations.
 Server launches are not written into the template: each side resolves them on
 the device with its own `inferssd launch` (see
 [performance acceptance](PERFORMANCE.md#launches)). Every model of both sides
-carries the same `launch` request, exactly `{"profile", "context", "batch",
-"ubatch", "port", "extra"}` (the launcher's model profile, its context and batch
-sizes, the server port and extra server arguments, which the side's launcher
-checks like a user's). Its `smoke` and `benchmarks` entries keep the
+carries the same `launch` request: `{"profile", "port", "extra"}` (the
+launcher's model profile, the server port and extra server arguments, which the
+side's launcher checks like a user's), and `context`, `batch` or `ubatch` only to
+pin a size the side's strategy would otherwise choose. Its `smoke` and `benchmarks` entries keep the
 environment, working directory, deadlines and OS-cache treatment, and carry no
 `argv`, `preflight_argv` or `port`. The reviewed settings payload sets only
 `expert.source`; the device refuses a resolution whose settings file sets any

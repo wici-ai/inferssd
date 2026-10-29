@@ -31,7 +31,7 @@ from inferssd.machine.characteristics import dumps, load as load_machine
 
 MACHINE = dumps(load_machine(ROOT / "framework/tests/fixtures/machine/linux-x86-rtx5090.json"))
 CHARACTERISTICS = compare.hashlib.sha256(MACHINE.encode()).hexdigest()
-REQUEST = dict(profile="muse", context=8192, batch=512, ubatch=512, port=18080, extra=[])
+REQUEST = dict(profile="muse", port=18080, extra=[])
 BASE, CANDIDATE = "a" * 40, "c" * 40
 
 
@@ -103,8 +103,7 @@ def sandbox_record(tmp_path, side="candidate", model="muse", patch=None, setting
             json.dumps(staged_launch.runtime_policy(config, folder)), folder, json.dumps([str(shard)]),
             "--platform", "linux", "--model", str(shard), "--settings", str(settings), "--binary", str(server),
             "--template", str(root / "source" / side / "chat.jinja"), "--profile", request["profile"],
-            "--port", str(request["port"]), "--context", str(request["context"]), "--batch", str(request["batch"]),
-            "--ubatch", str(request["ubatch"])]
+            "--port", str(request["port"]), "--prompt-cache", "off"]
     run = subprocess.run(argv, capture_output=True, text=True, timeout=120, env={"PATH": os.environ["PATH"]})
     assert run.returncode == 0, run.stderr
     text = [line for line in run.stdout.splitlines() if line.startswith(staged_launch.MARKER)][-1][len(staged_launch.MARKER):]
@@ -140,7 +139,9 @@ def test_the_sides_own_dry_run_resolves_the_launch_from_the_job_characteristics(
     assert launch["settings"]["cpu.decode_participants"]["origin"] == "strategy"
     assert launch["settings"]["cpu.decode_participants"]["reason"]
     assert launch["settings"]["prefetch.depth"]["origin"] == "launcher"
-    assert launch["threads"]["decode"]["origin"] == "strategy" and launch["server_args"] == ["--ctx-checkpoints", "0"]
+    assert launch["threads"]["decode"]["origin"] == "strategy" and launch["server_args"] == ["--ctx-checkpoints", "1"]
+    # No prompt cache: every timed run starts its server cold on the same prompt.
+    assert staged_launch.argument(value["argv"], "--cache-ram") == ["0"] and "--cache-disk" not in value["argv"]
     assert "<private-events>" in launch["argv"] and "/scratch/candidate" not in json.dumps(launch)
 
 
@@ -257,7 +258,7 @@ def test_every_other_condition_still_must_match(records, damage):
     head = receipts[3, "candidate"]
     policy = head["host"]["effective_settings"]["native_launch_policy"]
     if damage == "characteristics": head["derived_launch"]["characteristics_sha256"] = "0" * 64
-    elif damage == "request": policy["request"]["context"] = 4096
+    elif damage == "request": policy["request"]["extra"] = ["--temp", "0.5"]
     elif damage == "budget": head["host"]["memory_budget_bytes"] = 1
     elif damage == "typed-values": policy["typed_values"]["cpu.decode_participants"] = 2
     else: head["derived_launch"]["threads"]["decode"]["value"] = 99
@@ -381,6 +382,8 @@ def test_a_baseline_job_profiles_once_and_replays_from_its_stage_output(records,
     assert launch["argv"][7:9] == ["/scratch/candidate/launch-muse", '["/models/muse/model.gguf"]']
     assert launch["cwd"] == "/scratch/candidate" and launch["kind"] == "test"
     assert json.loads(launch["argv"][6])["memory_budget_bytes"] == 64 << 30
+    # The request leaves the sizes to the strategy, and the launch keeps no prompt cache.
+    assert launch["argv"][-6:] == ["--profile", "muse", "--port", "18080", "--prompt-cache", "off"]
     assert machine == dict(load(output / "machine/profile.json")) and machine["side"] == "candidate"
     # The hosted report carries the profiled file, so the operator can store it with the history.
     assert staged_launch.profiled(output / "machine") == MACHINE
@@ -634,3 +637,13 @@ def test_the_hosted_replay_binds_a_functional_receipt_to_its_resolved_launch(rec
                 selected_aggregate.functional_retained(root, cfg, "deepseek", cell)
         else:
             selected_aggregate.functional_retained(root, cfg, "deepseek", cell)
+
+
+@pytest.mark.parametrize("sizes", [{}, dict(context=4096), dict(context=8192, batch=512, ubatch=512)])
+def test_a_request_pins_only_the_sizes_it_names(sizes):
+    request = dict(REQUEST, **sizes)
+    assert staged_launch.request_checked(request) == request
+    for bad in (dict(request, context=0), dict(request, batch="512"), dict(request, threads=4),
+                {key: value for key, value in request.items() if key != "port"}):
+        with pytest.raises(ValueError, match="optionally context, batch and ubatch"):
+            staged_launch.request_checked(bad)

@@ -67,14 +67,17 @@ exactly the resolved argv for the functional request, the short preflight and
 every timed run; only the event file differs per server. A PR that changes the
 strategy is therefore measured with the settings it derives.
 
-The reviewed launch request (model profile, context, batch sizes, port and any
-extra server arguments) and its settings file are the same for both sides. The
-settings file sets only `expert.source`: everything the strategy chooses
-(thread pools, CPU placement, placement cost priors, the VRAM budget when no GPU
-is usable, the Mac memory budget) is derived, and everything it leaves alone
-(the RAM cache size, the VRAM tier in automatic mode, the read backend, the
-prefill route and numerics) stays at its default, decided by the engine. A
-resolution in which the settings file sets anything else is refused.
+The reviewed launch request (model profile, port, any extra server arguments
+and any context or batch size it pins) and its settings file are the same for
+both sides. The settings file sets only `expert.source`: everything the strategy
+chooses (thread pools, CPU placement, placement cost priors, the prefill route
+and pass size with a CUDA GPU, the host margin on shared memory, the VRAM budget
+when no GPU is usable, the Mac memory budget) is derived, and everything it
+leaves alone (the RAM cache size, the VRAM tier in automatic mode, the read
+backend and numerics) stays at its default, decided by the engine. A resolution
+in which the settings file sets anything else is refused. Every launch runs
+without a prompt cache (`--prompt-cache off`), so no timed run starts from an
+earlier run's prompt.
 
 Each run's receipt records its side's derived launch: every setting with its
 value and origin (`strategy` with the strategy's reason, `launcher` for a
