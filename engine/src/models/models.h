@@ -787,10 +787,13 @@ struct llm_build_xverse : public llm_graph_context {
 class llama_memory_hybrid_idx_context;
 
 struct llm_build_qwen4exp : public llm_build_delta_net_base {
-    class llm_graph_input_qsa;
+    class llm_graph_input_kpool;
 
         llm_build_qwen4exp(const llama_model & model, const llm_graph_params & params);
     private:
+        // whether the device of layer il implements the fused op
+        bool fused_supported(const ggml_tensor * op, int il) const;
+
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -810,31 +813,32 @@ struct llm_build_qwen4exp : public llm_build_delta_net_base {
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,
   const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                             int * sections,
                             int   il);
 
-        // dense self-attention restricted to the cells that top_k names
+        // dense self-attention over the cells the QSA mask keeps
         ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * top_k,
+                    ggml_tensor * sel,
+                        int64_t   n_sel,
                           float   kq_scale,
                             int   il);
 
-        // the QSA cache layout inputs do not depend on the layer, only on its compress ratio,
-        // so the layers sharing a ratio share one input set
-        std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
+        // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
+        llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
-        // QSA: token indices this layer's queries may attend to, or nullptr for dense
-        ggml_tensor * build_qsa_top_k(
+        // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail
+        ggml_tensor * build_qsa_sel(
   const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
-                    ggml_tensor * kq_mask,
                             int * sections,
                             int   il);
 

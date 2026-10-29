@@ -221,6 +221,7 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    uint32_t indexer_kpool     = 0; // k-pool size: the indexer keys are pooled per block of this many cells
 
     // DeepSeek-V4.1 (LLM_ARCH_DEEPSEEK41). Field names follow upstream so the model code ports as is;
     // this fork's own DEEPSEEK4 port does not read them.

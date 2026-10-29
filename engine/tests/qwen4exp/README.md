@@ -33,9 +33,10 @@ and decode.
 
 The probe also compiles against llama.cpp eaf9376 with `-DQWEN_UPSTREAM`, which
 adapts it to that revision's load-mode API. Compare the logits files from the
-same fixture and text. That revision has a known separate-stream sequence-copy
-failure: its indexer update context omits the pending stream copy. This
-engine's Qwen memory wrapper applies the indexer update alongside attention.
+same fixture and text. That revision's indexer update context omits a pending
+separate-stream sequence copy; later upstream revisions, whose graph and
+indexer memory this engine follows, apply the indexer update alongside
+attention.
 
 Environment variables:
 

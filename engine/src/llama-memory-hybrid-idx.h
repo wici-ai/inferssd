@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
-// Ported from llama.cpp 6c84c7d5d8.
+// Ported from llama.cpp 2e0d86bebc.
 #pragma once
 
 #include "llama-memory-hybrid.h"
 
+#include <array>
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -11,8 +14,9 @@
 // llama_memory_hybrid_idx
 //
 
-// llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
+// llama_memory_hybrid plus a third cache with one indexer row per token, for block-sparse attention (qwen4exp QSA)
 // the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
+// a row holds the token's raw indexer key and, in the last cell of a pool, the pool's pooled key
 
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
@@ -40,7 +44,8 @@ public:
                             /* the indexer cache exists only if this is given */
     const layer_filter_cb & filter_idx);
 
-    ~llama_memory_hybrid_idx() = default;
+    // defined out of line because kpool_layout is incomplete here
+    ~llama_memory_hybrid_idx();
 
     //
     // llama_memory_i
@@ -76,6 +81,32 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // the model's indexer pool size
+    uint32_t get_kpool() const { return hparams_idx.indexer_kpool; }
+
+    // Which cells of a sequence make up which pool: kpool consecutive cells in sequence order.
+    // It is kept here because it outlives the batch: a ubatch only ever appends to it.
+    // Sequence edits drop it, see mem_idx_stale.
+    struct kpool_layout;
+
+    const kpool_layout & kpool_layout_update();
+    const kpool_layout & kpool_layout_get() const;
+
+    // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools
+    // from some position on, which stales every pooled key at or after it. POS_CLEAN means none.
+    using stale_pos_t = std::array<llama_pos, LLAMA_MAX_SEQ>;
+
+    static constexpr llama_pos POS_CLEAN = std::numeric_limits<llama_pos>::max();
+
+    static stale_pos_t stale_pos_clean() {
+        stale_pos_t res;
+        res.fill(POS_CLEAN);
+        return res;
+    }
+
+    const stale_pos_t & mem_idx_stale_get() const { return mem_idx_stale; }
+    void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
+
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
@@ -86,10 +117,38 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    // unique_ptr because kpool_layout is incomplete here
+    std::unique_ptr<kpool_layout> kpool_lay;
+
+    // seq_id < 0 stales every sequence, p0 < 0 stales the sequence from its first position
+    void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);
+
+    // the position an edit at p0 stales the sequence from
+    llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
+
+    stale_pos_t mem_idx_stale = stale_pos_clean();
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
 public:
+    // the raw keys and the pooled keys of one layer's idx cache, across all streams
+    class kpool_access {
+    public:
+        ggml_tensor * gather_keys(ggml_tensor * idxs) const;
+        ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
+        ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
+
+    private:
+        friend class llama_memory_hybrid_idx_context;
+
+        kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd);
+
+        ggml_context * ctx;
+        ggml_tensor  * keys;
+        ggml_tensor  * pooled;
+    };
+
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
 
     // used for errors
@@ -111,7 +170,8 @@ public:
                     slot_info_vec_t   sinfos_idx,
           std::vector<llama_ubatch>   ubatches);
 
-    ~llama_memory_hybrid_idx_context() = default;
+    // defined out of line because kpool_state is incomplete here
+    ~llama_memory_hybrid_idx_context();
 
     //
     // llama_memory_context_i
@@ -131,28 +191,53 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
-    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
-    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
-    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
-    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
-    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
-    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
-    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
-    // the caller then adds the attention mask, the only part of the bias that varies within a block
-    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
-                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+    // complete pools of kpool cells per sequence, scored as whole pools (qwen4exp QSA)
+    uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
+    uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
+    kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
+    //   pool_cells    I32 [n_pool]         cell caching each pool's pooled key
+    //   pool_idxs     I32 [kpool, n_pool]  member cells per pool, the n_kv sentinel for padded pools
+    //   pool_mask     F16 [n_pool, n_tokens]
+    //   tail_idxs     I32 [kpool - 1, n_tokens] the incomplete tail of each token, the n_kv sentinel for missing cells
+    //   new_pool_idxs I32 [kpool*n_new]    members of the pools to re-pool this ubatch, kpool per pool
+    //   new_pool_rep  I64 [n_new]          cell to write each new pooled key into
+    //   new_pool_pos  I32 [4*n_new]        M-RoPE position of each new pool's first member
+    void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
+                         ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep, ggml_tensor * new_pool_pos,
+                         const llama_ubatch * ubatch) const;
 
 private:
-    const llama_memory_hybrid_idx * mem = nullptr;
+    llama_memory_hybrid_idx * mem = nullptr;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
 
-    // null unless the model has an indexer and this is a batch or full context
+    // the indexer cells of each ubatch, kept for pools in cache order: token s*n + i of ubatch u
+    // sits in cell idxs[s][i] of stream strm[s] of sinfos_kpool[u], and several cells can share a position
+    const slot_info_vec_t sinfos_kpool;
+
+    // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;
 
     // mirrors the base class's ubatch cursor, which is private there
     size_t i_cur = 0;
+
+    // Which pools of the layout this ubatch must re-pool. The layout itself belongs to the memory.
+    struct kpool_state;
+    kpool_state kpool_build_sizes() const;
+    void kpool_build_state(const llama_ubatch & ubatch);
+    const kpool_state & kpool_cur() const;
+
+    // unique_ptr because kpool_state is incomplete here
+    std::unique_ptr<kpool_state> kpool_st;
+
+    // the ubatch kpool_st was built for, guards against reads before apply
+    size_t i_kpool = SIZE_MAX;
+
+    // whether this context tracks k-pool states
+    bool kpool_track() const;
+
+    // positions each sequence must re-pool from, cleared only after the first ubatch succeeds
+    llama_memory_hybrid_idx::stale_pos_t mem_idx_stale_batch = llama_memory_hybrid_idx::stale_pos_clean();
 };

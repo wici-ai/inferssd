@@ -244,7 +244,7 @@
             "default": 0
         },
         "model.hc_fused": {
-            "description": "Use fused DeepSeek hyper connection operations",
+            "description": "Use the fused hyper connection operations of DeepSeek-V4.1 and Qwen3.8-Flash-Next",
             "kind": "integer",
             "unit": "boolean",
             "producer": "model",

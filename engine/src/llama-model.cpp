@@ -723,6 +723,23 @@ void llama_model::load_arch(llama_model_loader & ml) {
     }
 }
 
+// bad metadata must be catchable: GGML_ASSERT aborts the whole process
+static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
+    if (value == 0) {
+        throw std::runtime_error(format("%s must be greater than zero, got %u", ml.llm_kv(kid).c_str(), value));
+    }
+}
+
+// get_arr() copies a short array as-is, leaving a zero tail the n-gram hash silently drops
+static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32_t n_min) {
+    uint32_t n_arr = 0;
+    ml.get_arr_n(kid, n_arr, true);
+    if (n_arr < n_min) {
+        throw std::runtime_error(format("%s has %u entries, but at least %u are required",
+                                        ml.llm_kv(kid).c_str(), n_arr, n_min));
+    }
+}
+
 void llama_model::load_hparams(llama_model_loader & ml) {
     const gguf_context * ctx = ml.metadata;
 
@@ -3115,22 +3132,47 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
             ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
             ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
-            GGML_ASSERT(hparams.ssm_d_conv  > 0 && hparams.ssm_d_inner > 0 && hparams.ssm_d_state > 0 &&
-                        hparams.ssm_dt_rank > 0 && hparams.ssm_n_group > 0);
+            qwen4exp_require_nonzero(ml, LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
+            qwen4exp_require_nonzero(ml, LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
+            qwen4exp_require_nonzero(ml, LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
+            qwen4exp_require_nonzero(ml, LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
+            qwen4exp_require_nonzero(ml, LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
             // HC; low_rank is qwen4exp-specific, DeepSeek-V4 leaves it absent (full rank)
             ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
             ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
-            GGML_ASSERT(hparams.dsv4_hc_mult > 0 && hparams.hc_low_rank > 0);
+            // a count of 1 has nothing to mix, and the reference configurations reject it
+            if (hparams.dsv4_hc_mult <= 1) {
+                throw std::runtime_error(format("%s must be greater than one, got %u",
+                                                ml.llm_kv(LLM_KV_HYPER_CONNECTION_COUNT).c_str(), hparams.dsv4_hc_mult));
+            }
+            qwen4exp_require_nonzero(ml, LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
             hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
             ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
             ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
             ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
-            GGML_ASSERT(hparams.indexer_n_head > 0
-                     && hparams.indexer_head_size > 0
-                     && hparams.indexer_top_k > 0);
+            qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
+            qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
+            qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
             ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer, false);
+
+            // QSA pools the indexer keys of blocks of compress_ratio cells, one block size for the whole model
+            hparams.indexer_kpool = 0;
+            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                const uint32_t r = hparams.dsv4_compress_ratios[il];
+                if (r == 0) {
+                    continue;
+                }
+                if (hparams.indexer_kpool != 0 && r != hparams.indexer_kpool) {
+                    throw std::runtime_error(format("QSA layers must share one compress ratio, got %u and %u", hparams.indexer_kpool, r));
+                }
+                hparams.indexer_kpool = r;
+            }
+            if (hparams.indexer_kpool == 1 || (hparams.indexer_kpool > 0 && hparams.indexer_top_k % hparams.indexer_kpool != 0)) {
+                throw std::runtime_error(format("QSA needs a compress ratio above 1 that divides the budget, got %u and %u",
+                                                hparams.indexer_kpool, hparams.indexer_top_k));
+            }
 
             // PLE n-gram hash embeddings; if the key group is absent every field stays zero
             hparams.is_ple_impl.reset();
@@ -3141,7 +3183,11 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             if (n_ple > 0) {
                 std::vector<uint32_t> ple_layers;
                 ml.get_arr(LLM_KV_PLE_LAYERS, ple_layers);
-                GGML_ASSERT(n_ple == 1 && "qwen4exp supports only one PLE layer");
+                if (n_ple != 1) {
+                    // hparams holds one set of hash constants, so several PLE modules cannot be represented
+                    throw std::runtime_error(format("%s lists %u layers, but only one PLE layer is supported",
+                                                    ml.llm_kv(LLM_KV_PLE_LAYERS).c_str(), n_ple));
+                }
                 for (uint32_t il : ple_layers) {
                     if (il >= hparams.n_layer) {
                         throw std::runtime_error(format("PLE layer %u is out of range", il));
@@ -3156,7 +3202,8 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 // optional: files written before this key fall back to the EOS token
                 ml.get_key(LLM_KV_PLE_IMAGE_TOKEN_ID,  hparams.ple_image_token_id, false);
                 ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
-                GGML_ASSERT(hparams.ple_conv_kernel > 0 && hparams.n_embd_per_layer > 0);
+                qwen4exp_require_nonzero(ml, LLM_KV_PLE_CONV_KERNEL,            hparams.ple_conv_kernel);
+                qwen4exp_require_nonzero(ml, LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
 
                 hparams.ple_n_heads  = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
                 hparams.ple_head_dim = hparams.n_embd_per_layer;
@@ -3166,6 +3213,10 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 if (hparams.ple_n_heads == 0 || hparams.ple_n_heads > LLAMA_MAX_PLE_HEADS) {
                     throw std::runtime_error(format("PLE head count %u is out of range", hparams.ple_n_heads));
                 }
+
+                qwen4exp_require_arr_len(ml, LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_ngram_size);
+                qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_n_heads);
+                qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_VOCAB_SIZES,  hparams.ple_n_heads);
 
                 ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
 
@@ -3190,9 +3241,16 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.recurrent_layer_arr, hparams.n_layer, false)) {
                 uint32_t full_attn_interval = 4;
                 ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
-                GGML_ASSERT(full_attn_interval > 0);
+                qwen4exp_require_nonzero(ml, LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
                 for (uint32_t i = 0; i < hparams.n_layer; ++i) {
                     hparams.recurrent_layer_arr[i] = (i < hparams.n_layer) && ((i + 1) % full_attn_interval != 0);
+                }
+            }
+
+            // the PLE conv history is a row of the recurrent cache, which linear layers alone have
+            for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                if (hparams.is_ple(i) && !hparams.is_recurrent(i)) {
+                    throw std::runtime_error(format("PLE layer %u is not a linear attention layer", i));
                 }
             }
 

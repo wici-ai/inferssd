@@ -171,8 +171,12 @@ public:
     // llama_kv_cache specific API
     //
 
-    uint32_t get_size()     const;
-    uint32_t get_n_stream() const;
+    uint32_t get_size()      const;
+    uint32_t get_n_seq_max() const;
+    uint32_t get_n_stream()  const;
+
+    // the stream holding seq_id's cells
+    uint32_t get_stream(llama_seq_id seq_id) const;
 
     // state_write() of only the cells at positions in [p0, p1], for an owner that saves part of what the cache holds
     void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) const;
