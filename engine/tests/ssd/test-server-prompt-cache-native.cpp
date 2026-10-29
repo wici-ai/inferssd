@@ -22,7 +22,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
-extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(llama_context *, int, uint32_t, uint32_t);
 static void require(bool ok, const char * why) { if (!ok) { throw std::runtime_error(why); } }
 static std::string read_text(const std::string & path) {
     std::ifstream stream(path); require(bool(stream), "resource observation unreadable");

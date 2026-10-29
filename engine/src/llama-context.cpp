@@ -28,20 +28,6 @@
 #include <string>
 #include <vector>
 
-
-extern "C" bool llama_moe_prefill_phase_workspace(
-        llama_context * ctx,
-        int active);
-extern "C" bool llama_moe_prefill_phase_workspace_sized(
-        llama_context * ctx,
-        int active,
-        uint32_t requested_tokens);
-extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(
-        llama_context * ctx,
-        int active,
-        uint32_t prompt_tokens,
-        uint32_t prefill_tokens);
-
 //
 // llama_context
 //
@@ -943,14 +929,6 @@ void llama_context::host_note_memory_change() noexcept {
     if (ssd_runtime && ssd_runtime->host) {
         (void) ssd_runtime->host->note_known_memory_change();
     }
-}
-
-bool llama_context::moe_prefill_phase_workspace(bool active) {
-    return moe_prefill_phase_workspace(active, 0);
-}
-
-bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_tokens) {
-    return moe_prefill_phase_workspace(active, requested_tokens, requested_tokens);
 }
 
 bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_tokens, uint32_t prefill_tokens) {
@@ -4198,24 +4176,6 @@ bool llama_ssd_prefill_phase(llama_context * ctx, bool active,
     catch (const std::exception & failure) { LLAMA_LOG_ERROR("SSD phase transition failed: %s\n", failure.what()); }
     catch (...) { LLAMA_LOG_ERROR("SSD phase transition failed\n"); }
     return false;
-}
-
-extern "C" bool llama_moe_prefill_phase_workspace(
-        llama_context * ctx,
-        int active) {
-    return ctx && ctx->moe_prefill_phase_workspace(active != 0);
-}
-
-extern "C" bool llama_moe_prefill_phase_workspace_sized(
-        llama_context * ctx,
-        int active,
-        uint32_t requested_tokens) {
-    return ctx && ctx->moe_prefill_phase_workspace(active != 0, requested_tokens);
-}
-
-extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(
-    llama_context * ctx, int active, uint32_t prompt_tokens, uint32_t prefill_tokens) {
-    return ctx && ctx->moe_prefill_phase_workspace(active != 0, prompt_tokens, prefill_tokens);
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

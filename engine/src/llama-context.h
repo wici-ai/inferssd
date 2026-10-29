@@ -104,9 +104,7 @@ struct llama_context {
 
     // Request-scoped scheduler/cache exchange used by the default-off K3
     // grouped-prefill capacity ladder.
-    bool moe_prefill_phase_workspace(bool active);
     bool moe_prefill_phase_workspace(bool active, uint32_t requested_tokens, uint32_t prefill_tokens);
-    bool moe_prefill_phase_workspace(bool active, uint32_t requested_tokens);
 
     // whether a prefill ubatch of n_tokens runs on the CPU sink (llama_cpu_sink_prefill_route) in this context, at
     // this request's threshold or at max_tokens

@@ -15,7 +15,7 @@
 #include <stdexcept>
 #include <vector>
 #ifndef QWEN_UPSTREAM
-extern "C" bool llama_moe_prefill_phase_workspace_sized(llama_context *, int, uint32_t);
+#include "llama-ssd.h"
 #endif
 static void require(bool v, const char * msg) { if (!v) throw std::runtime_error(msg); }
 static std::vector<float> decode(llama_context * c, const std::vector<llama_token> & t, int lo, int hi, int chunk, int seq=0) {
@@ -86,7 +86,7 @@ int main(int argc,char **argv){try{
     const int chunk=std::atoi(argv[4]);require(chunk>0,"bad chunk");
     auto phase = [&](bool active, int tokens) {
 #ifndef QWEN_UPSTREAM
-        if (std::getenv("QWEN_STREAMED")) require(llama_moe_prefill_phase_workspace_sized(c,active,tokens),"phase transition failed");
+        if (std::getenv("QWEN_STREAMED")) require(llama_ssd_prefill_phase(c,active,tokens,tokens),"phase transition failed");
 #endif
     };
     if (std::getenv("QWEN_WARMUP")) {

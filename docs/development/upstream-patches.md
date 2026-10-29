@@ -130,8 +130,8 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/CMakeLists.txt` | 20 | 0 |
 | `src/llama-arch.cpp` | 167 | 2 |
 | `src/llama-arch.h` | 109 | 2 |
-| `src/llama-context.cpp` | 1356 | 45 |
-| `src/llama-context.h` | 150 | 2 |
+| `src/llama-context.cpp` | 1316 | 45 |
+| `src/llama-context.h` | 148 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
 | `src/llama-graph.cpp` | 757 | 50 |
@@ -174,5 +174,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 16948 added, 5670 removed across 143 upstream paths.
+Total: 16906 added, 5670 removed across 143 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
