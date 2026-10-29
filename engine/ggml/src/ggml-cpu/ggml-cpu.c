@@ -1830,17 +1830,21 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
             } break;
-        case GGML_OP_HC_WEIGHTED_SUM:
-            {
-                ggml_compute_forward_hc_weighted_sum(params, tensor);
-            } break;
         case GGML_OP_DSV4_HC_COMB:
             {
                 ggml_compute_forward_dsv4_hc_comb(params, tensor);
             } break;
+        case GGML_OP_DSV4_HC_PRE:
+            {
+                ggml_compute_forward_dsv4_hc_pre(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_POST:
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
+            } break;
+        case GGML_OP_TOP_K_MASK:
+            {
+                ggml_compute_forward_top_k_mask(params, tensor);
             } break;
         case GGML_OP_OUT_PROD:
             {
@@ -2060,6 +2064,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                ggml_compute_forward_lightning_indexer(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2240,6 +2248,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;
             } break;
@@ -2317,9 +2326,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CONCAT:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
-        case GGML_OP_HC_WEIGHTED_SUM:
         case GGML_OP_DSV4_HC_COMB:
+        case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_TOP_K_MASK:
         case GGML_OP_OUT_PROD:
             {
                 n_tasks = n_threads;
@@ -2974,6 +2984,12 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const int64_t S_v = node->src[2]->ne[0];
                         cur = S_v * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_LIGHTNING_INDEXER:
+                    {
+                        // temp buffer for dequantizing lightning indexer keys
+                        const int64_t ne10 = node->src[1]->ne[0];
+                        cur += sizeof(float)*ne10*n_tasks;
                     } break;
                 case GGML_OP_COUNT:
                     {

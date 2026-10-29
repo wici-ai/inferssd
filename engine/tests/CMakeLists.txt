@@ -809,7 +809,7 @@ if (APPLE)
 endif()
 
 set(LLAMA_BACKEND_OPS_SMOKE_FILTER
-    "HC_WEIGHTED_SUM(n_embd=64,hc_mult=4,slice_x=0,slice_w=0),\
+    "DSV4_HC_PRE(n_embd=64,hc_mult=4,n_tokens=1,gated=0,slice=0),\
 MUL_MAT(type_a=iq4_xs,type_b=f32,m=16,n=1,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1),\
 MUL_MAT(type_a=iq1_s,type_b=f32,m=16,n=1,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1),\
 MUL_MAT(type_a=iq1_m,type_b=f32,m=16,n=1,k=256,bs=[1,1],nr=[1,1],per=[0,1,2,3],k_v=0,o=1),\
