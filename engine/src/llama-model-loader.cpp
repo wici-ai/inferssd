@@ -1394,10 +1394,6 @@ void llama_model_loader::done_getting_tensors() const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
-#if defined(__APPLE__)
-    // Deferred expert mappings can exceed unified memory by an order of magnitude.
-    if (defer_experts) { prefetch = false; }
-#endif
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
