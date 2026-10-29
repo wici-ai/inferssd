@@ -11,9 +11,17 @@ from dataclasses import dataclass, replace
 from typing import Optional, cast
 
 from inferssd.configuration.settings import PLATFORMS, Setting, Snapshot, parse, render, uncomment
-from inferssd.launch.darwin import MODEL_OPTIONS, PROFILES
+from inferssd.launch.darwin import MODEL_OPTIONS
 from inferssd.launch.resources import EngineResources
 from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
+
+# Each model profile's chat template: a bundled template replaces the GGUF's,
+# and None keeps the template in the GGUF. The expert count comes from the model.
+PROFILES: dict[str, Optional[str]] = {
+    "dsv": "deepseek-ai-DeepSeek-V4.1.jinja",
+    "muse": "muse-spark.jinja",
+    "qwen4exp": None,  # Qwen3.8-Flash-Next
+}
 
 
 @dataclass(frozen=True)
@@ -245,14 +253,16 @@ def _resolve(
     binary = s.text("resolved_path", binary_path)
     if not s.value("is_file", binary) or not s.value("is_executable", binary):
         raise ValueError("missing server executable: " + binary)
-    template_path = spec.template or (resources.template(s.inputs.profile) if resources else None)
-    if not template_path and s.inputs.repo:
-        bundled = PROFILES[s.inputs.profile][1]
-        template_path = os_path.join(s.inputs.repo, "engine", "models", "templates", bundled)
-    if not template_path:
-        raise ValueError("provide --template or an engine resource descriptor")
-    template = s.text("resolved_path", template_path)
-    if not s.value("is_file", template):
+    bundled = PROFILES[s.inputs.profile]
+    template_path = spec.template
+    if not template_path and bundled:
+        template_path = resources.template(s.inputs.profile) if resources else None
+        if not template_path and s.inputs.repo:
+            template_path = os_path.join(s.inputs.repo, "engine", "models", "templates", bundled)
+        if not template_path:
+            raise ValueError("provide --template or an engine resource descriptor")
+    template = s.text("resolved_path", template_path) if template_path else None
+    if template is not None and not s.value("is_file", template):
         raise ValueError("missing chat template: " + template)
     if configured is None:
         text = s.text("read_text", spec.settings_file) if spec.settings_file else None
@@ -364,9 +374,9 @@ def _resolve(
     if threads.cpus:
         mask = hex(sum(1 << cpu for cpu in threads.cpus))
         command += ["-C", mask, "-Cb", mask, "--cpu-strict", "1", "--cpu-strict-batch", "1"]
+    if template is not None:
+        command += ["--chat-template-file", template]
     command += [
-        "--chat-template-file",
-        template,
         "--host",
         "127.0.0.1",
         "--port",

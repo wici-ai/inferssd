@@ -265,6 +265,149 @@
   },
   {
     "case": {
+      "name": "linux-qwen4exp",
+      "platform": "linux",
+      "profile": "qwen4exp",
+      "repo": "/src/inferssd",
+      "model": "/models/Qwen3.8-Flash-Next-Q8_0-00001-of-00002.gguf",
+      "shards": [
+        "/models/Qwen3.8-Flash-Next-Q8_0-00001-of-00002.gguf",
+        "/models/Qwen3.8-Flash-Next-Q8_0-00002-of-00002.gguf"
+      ],
+      "files": [
+        "/models/Qwen3.8-Flash-Next-Q8_0-00001-of-00002.gguf",
+        "/models/Qwen3.8-Flash-Next-Q8_0-00002-of-00002.gguf",
+        "/src/inferssd/build-linux-cpu/bin/inferssd-server"
+      ],
+      "settings_file": "/runs/cpu.ssd",
+      "settings": "inferssd-settings 1\nvram.budget = 0\n",
+      "overrides": [],
+      "threads": {},
+      "directory": "/runs/qwen4exp",
+      "alias": "/runs/qwen4exp/artifacts/experts.tsv",
+      "host": {
+        "platform_system": "Linux",
+        "systemd": true,
+        "cgroup_v2": true,
+        "euid": 0
+      }
+    },
+    "argv": [
+      "/src/inferssd/build-linux-cpu/bin/inferssd-server",
+      "-m",
+      "/models/Qwen3.8-Flash-Next-Q8_0-00001-of-00002.gguf",
+      "--ssd-settings",
+      "/runs/qwen4exp/settings.ssd",
+      "--ssd-telemetry",
+      "/runs/qwen4exp/native-events.jsonl",
+      "--mmap",
+      "--no-repack",
+      "--fit",
+      "off",
+      "--no-warmup",
+      "-ngl",
+      "99",
+      "-c",
+      "8192",
+      "-b",
+      "512",
+      "-ub",
+      "512",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8080",
+      "-np",
+      "1",
+      "--defer-experts",
+      "-fa",
+      "on"
+    ],
+    "scope": [
+      "systemd-run",
+      "--scope",
+      "--quiet",
+      "--unit=inferssd-pending.scope",
+      "-p",
+      "MemoryMax=17179869184",
+      "-p",
+      "MemorySwapMax=0"
+    ],
+    "settings": {
+      "/runs/qwen4exp/settings.ssd": "inferssd-settings 1\nexpert.source = [\"/runs/qwen4exp/artifacts/experts.tsv\"]  # source=generated; input=complete GGUF shard/header validation\nvram.budget = 0  # source=file; input=/runs/cpu.ssd:2\n"
+    }
+  },
+  {
+    "case": {
+      "name": "windows-qwen4exp",
+      "platform": "windows",
+      "profile": "qwen4exp",
+      "repo": "C:\\inferssd",
+      "model": "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf",
+      "shards": [
+        "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf",
+        "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00002-of-00006.gguf",
+        "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf",
+        "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00004-of-00006.gguf",
+        "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00005-of-00006.gguf",
+        "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf"
+      ],
+      "files": [
+        "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf",
+        "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00002-of-00006.gguf",
+        "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf",
+        "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00004-of-00006.gguf",
+        "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00005-of-00006.gguf",
+        "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf",
+        "C:\\inferssd\\build-x64-windows-llvm-release\\bin\\inferssd-server.exe",
+        "C:\\inferssd\\build\\bin\\inferssd-server.exe"
+      ],
+      "settings_file": "C:\\inferssd\\settings.ssd",
+      "settings": "inferssd-settings 1\nhost.budget_mib = 14336\n",
+      "overrides": [],
+      "threads": {},
+      "directory": "C:\\inferssd\\runs\\qwen4exp",
+      "alias": "C:\\inferssd\\runs\\qwen4exp\\artifacts\\experts.tsv",
+      "host": {
+        "platform_system": "Windows"
+      }
+    },
+    "argv": [
+      "C:\\inferssd\\build-x64-windows-llvm-release\\bin\\inferssd-server.exe",
+      "-m",
+      "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf",
+      "--ssd-settings",
+      "C:\\inferssd\\runs\\qwen4exp\\settings.ssd",
+      "--ssd-telemetry",
+      "C:\\inferssd\\runs\\qwen4exp\\native-events.jsonl",
+      "--mmap",
+      "--no-repack",
+      "--fit",
+      "off",
+      "--no-warmup",
+      "-ngl",
+      "99",
+      "-c",
+      "8192",
+      "-b",
+      "512",
+      "-ub",
+      "512",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8080",
+      "-np",
+      "1",
+      "--defer-experts"
+    ],
+    "scope": [],
+    "settings": {
+      "C:\\inferssd\\runs\\qwen4exp\\settings.ssd": "inferssd-settings 1\nexpert.source = [\"C:\\\\inferssd\\\\runs\\\\qwen4exp\\\\artifacts\\\\experts.tsv\"]  # source=generated; input=complete GGUF shard/header validation\nhost.budget_mib = 14336  # source=file; input=C:\\inferssd\\settings.ssd:2\n"
+    }
+  },
+  {
+    "case": {
       "name": "windows-dsv",
       "platform": "windows",
       "profile": "dsv",

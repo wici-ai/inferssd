@@ -16,7 +16,7 @@ from inferssd.configuration.settings import PLATFORMS, cpus, host_platform
 from inferssd.launch.prepare import prepare
 from inferssd.launch.recorded import RecordedArtifacts, run_indexer
 from inferssd.launch.resources import read_resources
-from inferssd.launch.typed import LaunchSpec, resolve_typed
+from inferssd.launch.typed import PROFILES, LaunchSpec, resolve_typed
 from inferssd.launch.types import LaunchInput, Output, Threads
 from inferssd.platform.policy import Policy
 from inferssd.platform.run_directory import reserve
@@ -51,7 +51,7 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     )
     launch.add_argument("--binary", type=Path)
     launch.add_argument("--artifact-dir", type=Path)
-    launch.add_argument("--profile", choices=("dsv", "muse"), default="muse")
+    launch.add_argument("--profile", choices=tuple(PROFILES), default="muse")
     launch.add_argument("--port", type=int, default=8080)
     launch.add_argument("--context", type=int, default=8192)
     launch.add_argument("--batch", type=int, default=512)

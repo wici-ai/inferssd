@@ -629,3 +629,23 @@ def test_deepseek_profile_materializes_model_policy_and_preserves_explicit_value
     native = parse((out / "settings.ssd").read_text(), overrides=spec.overrides)
     assert native.at("model.engram_prefetch").value == expected
     assert native.at("model.hc_fused").value == expected
+
+
+def test_qwen4exp_launches_with_the_template_in_its_gguf(tmp_path):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs = replace(inputs, profile="qwen4exp")
+    result = resolve(inputs, spec, adapter, out)
+    assert result.code == 0 and "--chat-template-file" not in result.argv
+    explicit = tmp_path / "chosen.jinja"
+    explicit.write_text("chosen")
+    second = tmp_path / "second"
+    second.mkdir()
+    result = resolve(inputs, replace(spec, template=str(explicit)), adapter, second)
+    assert result.argv[result.argv.index("--chat-template-file") + 1] == str(explicit)
+
+
+def test_unknown_profile_refused_before_native_file(tmp_path):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    with pytest.raises(ValueError, match="dsv, muse, qwen4exp"):
+        resolve(replace(inputs, profile="qwen"), spec, adapter, out)
+    assert not (out / "settings.ssd").exists()

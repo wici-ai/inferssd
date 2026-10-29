@@ -79,12 +79,34 @@ def test_typed_launch_command_matches_golden(expected):
     assert render(expected["case"]) == {key: expected[key] for key in ("argv", "scope", "settings")}
 
 
+def test_windows_qwen4exp_command_uses_the_model_template_and_settings_envelope():
+    expected = golden("windows-qwen4exp")
+    argv, case = expected["argv"], expected["case"]
+    assert argv[:3] == [
+        "C:\\inferssd\\build-x64-windows-llvm-release\\bin\\inferssd-server.exe",
+        "-m",
+        case["model"],
+    ]
+    # The GGUF's own chat template; Flash Attention keeps the server's auto choice.
+    assert "--chat-template-file" not in argv and "-fa" not in argv
+    # No scope: host.budget_mib reaches the server through its settings file, as given.
+    assert expected["scope"] == [] and not any(word.startswith("--ssd-host") for word in argv)
+    settings = expected["settings"]["C:\\inferssd\\runs\\qwen4exp\\settings.ssd"]
+    assert "host.budget_mib = 14336" in settings and json.dumps([case["alias"]]) in settings
+
+
 def test_windows_passes_cli_settings_and_pins_threads():
     argv = golden("windows-dsv")["argv"]
     assert argv[argv.index("--ssd-host-budget-mib") + 1] == "14336"
     assert argv[argv.index("-C") + 1] == argv[argv.index("-Cb") + 1] == "0xf"
     template = argv[argv.index("--chat-template-file") + 1]
     assert template == "C:\\inferssd\\engine\\models\\templates\\deepseek-ai-DeepSeek-V4.1.jinja"
+
+
+def test_linux_qwen4exp_keeps_the_linux_launch():
+    expected = golden("linux-qwen4exp")
+    assert "--chat-template-file" not in expected["argv"]
+    assert expected["argv"][-2:] == ["-fa", "on"] and "MemoryMax=17179869184" in expected["scope"]
 
 
 @pytest.mark.parametrize(
