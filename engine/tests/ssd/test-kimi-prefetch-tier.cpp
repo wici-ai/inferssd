@@ -2,7 +2,8 @@
 // holds is not novel and not read, and a read whose expert the tier came to hold before its run is not needed by
 // that run. The tier here is a stand-in provider the test injects: it holds the experts the test names and serves
 // none (every expert is the CPU's), so the outputs are the CPU's and only the prefetch's decisions change. Like the
-// other cache cases it needs a finite memory envelope.
+// other cache cases it needs a finite memory envelope. The same tier records where the sink places its threads
+// (kimi_vram_policy_api set_thread_cpus): on the CPUs of the runs' coordinator, again only when they change.
 #define main original_sink_test_main
 #include "test-kimi-cpu-sink.cpp"
 #undef main
@@ -11,6 +12,7 @@
 
 namespace {
 std::set<std::pair<int32_t, int32_t>> tier_holds; // (layer, expert)
+std::vector<ssd::platform::cpu_list> tier_placements; // set_thread_cpus, in call order
 int tier_context = 0;
 void * tier_create(uint64_t, char *, size_t) { return &tier_context; }
 void tier_destroy(void *) {}
@@ -36,6 +38,10 @@ int no_slots(void *, const kimi_vram_request *, int count, const kimi_vram_exper
     std::fill(slots, slots + count, -1); return 0;
 }
 int refuse(void *, char * e, size_t n) { std::snprintf(e, n, "not served by this tier"); return 1; }
+int tier_place(void *, const int * cpus, int count, char *, size_t) {
+    tier_placements.emplace_back(cpus, cpus + count);
+    return 0;
+}
 
 // A stand-in GPU provider, injected through runtime_services as llama_ssd_context injects the CUDA one. Its tier
 // holds the experts the test names and serves none; the extensions the sink binds are inert, and the ones this
@@ -69,9 +75,9 @@ const ssd::gpu::provider_v1 * stand_in_provider() {
         [](void *, double * resident, double * hosted) { *resident = *hosted = 0; },
         [](void *, const void *, size_t, char *, size_t) { return 0; }, [](void *, const void *, char *, size_t) { return 0; },
         [](void *, kimi_vram_host_costs * costs) { *costs = {}; } };
-    static const kimi_vram_policy_api policy = { 3, sizeof(kimi_vram_policy_api), [](void *, double) {},
+    static const kimi_vram_policy_api policy = { 4, sizeof(kimi_vram_policy_api), [](void *, double) {},
         [](void *, uint64_t) {}, [](void *, uint64_t) {}, [](void *, uint64_t) { return 0; },
-        [](void *) { return uint64_t(0); } };
+        [](void *) { return uint64_t(0); }, tier_place };
     static const kimi_vram_location_api location = {};
     static const ssd::gpu::settings_api settings = {};
     static const ssd::gpu::testing::api testing = { 2, sizeof(ssd::gpu::testing::api),
@@ -163,6 +169,32 @@ int main(int argc, char ** argv) {
             "the tier's residency did not decide the novelty: " + report);
     require(field("started_r") == "1,0,0,0" && field("spills") == "0" && field("spill_us") == "0" &&
             field("spill_us_r") == "0,0,0,0", "a read inside its window was counted as a spill: " + report);
-    std::printf("PREFETCH_TIER_OK %s\n", report.c_str());
+    // The coordinator here is the test thread: one placement for its four runs on two tokens.
+    ssd::platform::cpu_list own;
+    require(ssd::platform::current_thread_cpus(own), "read the test thread's CPUs");
+    require(tier_placements.size() == 1 && tier_placements[0] == own,
+            "the tier's threads were not placed once on the coordinator's CPUs");
+    if (ssd::platform::affinity_supported() && own.size() > 1) {
+        // A coordinator that moves is seen at the first layer after the next begin, as ggml moves its thread 0 only
+        // between graphs; the tier is told each move and nothing else.
+        tier_placements.clear();
+        tier_holds.clear();
+        const ssd::platform::cpu_list moved = { own.back() };
+        auto sink = make_sink(inputs, f, threads, 2);
+        configure_cache(sink.get(), 12 * unit, { 1, 2 }, 6);
+        begin_cache(sink.get(), 2, 1);
+        cache_case(inputs, "place_first", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+        require(ssd::platform::pin_current_thread(moved), "move the coordinator");
+        cache_case(inputs, "place_same_token", f, sink.get(), 2, input, { 10, 11 }, { .5f, .5f }, 0, 2);
+        begin_cache(sink.get(), 2, 2);
+        cache_case(inputs, "place_moved", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
+        cache_case(inputs, "place_moved_layer2", f, sink.get(), 2, input, { 10, 11 }, { .5f, .5f }, 2, 0);
+        require(ssd::platform::pin_current_thread(own), "move the coordinator back");
+        begin_cache(sink.get(), 2, 3);
+        cache_case(inputs, "place_back", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
+        require(tier_placements == std::vector<ssd::platform::cpu_list>{ own, moved, own },
+                "the tier's threads did not follow the coordinator's moves");
+    }
+    std::printf("PREFETCH_TIER_OK %s placements=%zu\n", report.c_str(), tier_placements.size());
     return 0;
 } catch (const std::exception & e) { return test_resources::report("PREFETCH_TIER", e); } }

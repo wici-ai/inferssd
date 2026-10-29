@@ -14,6 +14,7 @@ extern "C" const ssd::gpu::transport_v1 * ggml_backend_cuda_ssd_transport_v1();
 #include "../../ggml-ssd/settings/settings.h"
 #include "../../ggml-ssd/telemetry/telemetry.h"
 #include "../../ggml-ssd/host/arbiter.h"
+#include "../../ggml-ssd/platform/threads.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
 #include <chrono>
@@ -30,8 +31,6 @@ extern "C" const ssd::gpu::transport_v1 * ggml_backend_cuda_ssd_transport_v1();
 #include <string>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <pthread.h>
-#include <sched.h>
 #include <unistd.h>
 #include <map>
 #include <set>
@@ -1725,16 +1724,19 @@ struct tier {
             cv.notify_all();
         }
     }
-    // The worker and the upload thread run on the CPUs of the thread that creates them. Every sink call that can
-    // create the tier pins its caller to the sink's first compute CPU (sink_caller_affinity), so the worker shares
-    // that core with the sink thread that waits for it; created from an unpinned thread they ran wherever the
-    // scheduler put them, and decode steps 129-256 were 9 % slower on a DGX Spark. Logged so that a
-    // caller that does not pin shows (cpus > 1).
-    void report_thread_cpus(){
-        cpu_set_t set;CPU_ZERO(&set);
-        if(pthread_getaffinity_np(pthread_self(),sizeof(set),&set))return;
-        int first=-1;for(int c=0;c<CPU_SETSIZE && first<0;++c)if(CPU_ISSET(c,&set))first=c;
-        std::fprintf(stderr,"[kimi_vram_tier] event=threads cpus=%d first_cpu=%d\n",CPU_COUNT(&set),first);
+    // The worker and the upload thread run on the CPUs of the sink thread that waits for them, the coordinator of
+    // its calls (set_thread_cpus), and share its core with it; until it places them they keep the CPUs of the thread
+    // that started them. Left where the scheduler put them, decode steps 129-256 were 9 % slower on a DGX Spark.
+    // Logged at their start and at each placement (cpus > 1: not on one core).
+    ssd::platform::cpu_list thread_cpus;
+    void place_threads(){
+        if(!worker.joinable())return; // placed when they start
+        for(std::thread * t:{&worker,&upload_thread})
+            if(t->joinable() && !ssd::platform::pin_thread(t->native_handle(),thread_cpus)) // none yet: a no-op
+                throw std::runtime_error("GPU tier threads could not be placed on the sink coordinator's CPUs");
+        ssd::platform::cpu_list cpus=thread_cpus;
+        if(cpus.empty())ssd::platform::current_thread_cpus(cpus); // their starter's, which they inherit
+        std::fprintf(stderr,"[kimi_vram_tier] event=threads cpus=%zu first_cpu=%d\n",cpus.size(),cpus.empty()?-1:cpus.front());
     }
     // The upload's cost before the first admission, so that admissions are priced from the second decode token,
     // once the first token's misses are measured: one slot's roles copied, as an admission copies them, from pageable
@@ -1813,7 +1815,7 @@ struct tier {
             latent=f.latent;hidden=f.hidden;weight_type=f.weight_type;down_type=f.down_type;n_experts=f.n_experts;format_mode=true;
             worker=std::thread([this]{worker_loop();});
             if(deferred_upload)upload_thread=std::thread([this]{upload_loop();});
-            report_thread_cpus();
+            place_threads();
             // The batched prefill engine for a format without an engine of its own. A format the CUDA backend's
             // products do not serve keeps the CPU for its grouped prefill, as before.
             if(!mxfp4){
@@ -2600,6 +2602,11 @@ int policy_reclaim_host(void * p,uint64_t bytes){
 void policy_set_miss_cost(void * p,double us){
     auto * t=static_cast<tier *>(p);if(!t || !std::isfinite(us) || us<0)return;
     std::lock_guard<std::mutex> lock(t->mutex);t->miss_us=t->miss_us>0?0.9*t->miss_us+0.1*us:us;}
+int policy_set_thread_cpus(void * p,const int * cpus,int count,char * e,size_t n){
+    auto * t=static_cast<tier *>(p);
+    if(!t || !cpus || count<1){if(n)std::snprintf(e,n,"invalid GPU tier thread CPUs");return 1;}
+    try{t->thread_cpus.assign(cpus,cpus+count);t->place_threads();return 0;}
+    catch(const std::exception & x){if(n)std::snprintf(e,n,"%s",x.what());return 1;}}
 void * create_test_tier(uint64_t bytes, const tier_options * options, const ssd::gpu::cpu_kernels_v1 * kernels, char * error, size_t size) noexcept {
     try {
         if (!options) { throw std::runtime_error("missing explicit CUDA fixture policy"); }
@@ -2653,8 +2660,8 @@ void * create_configured_tier(const ssd::settings::snapshot * input, const ssd::
 }
 } // namespace
 extern "C" const kimi_vram_policy_api * kimi_vram_policy_get_api(){
-    static const kimi_vram_policy_api api={3,sizeof(kimi_vram_policy_api),policy_set_miss_cost,policy_set_host_demand,
-        policy_set_host_floor,policy_reclaim_host,policy_host_bytes};return &api;
+    static const kimi_vram_policy_api api={4,sizeof(kimi_vram_policy_api),policy_set_miss_cost,policy_set_host_demand,
+        policy_set_host_floor,policy_reclaim_host,policy_host_bytes,policy_set_thread_cpus};return &api;
 }
 extern "C" const kimi_vram_host_api * kimi_vram_host_get_api(){
     static const kimi_vram_host_api api={3,sizeof(kimi_vram_host_api),host_available,host_launch,host_costs,

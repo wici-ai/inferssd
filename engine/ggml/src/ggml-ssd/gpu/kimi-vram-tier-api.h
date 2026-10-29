@@ -358,13 +358,18 @@ struct kimi_vram_host_api {
 // aborted). 0 when that much is free; 1 when a layer is live (nothing waits or is freed) or not enough could go.
 // host_bytes (version 3): on unified memory, the DRAM the tier holds (its blocks and prefill scratch); 0 on a
 // discrete GPU. The ledger subtracts it from MemAvailable changes it learns its margin from.
+// set_thread_cpus (version 4): the CPUs (ssd::platform numbers, count >= 1) of the thread that waits for the tier's
+// threads, the coordinator of a sink call. The tier moves its worker and upload threads there, or places them there
+// when it starts them; until the first call they keep the CPUs of the thread that started them. The sink calls it
+// at its first layer on the tier and again when the coordinator's CPUs change.
 struct kimi_vram_policy_api {
-    uint32_t version, size;   // 3
+    uint32_t version, size;   // 4
     void (*set_miss_cost)(void * context, double miss_us);
     void (*set_host_demand)(void * context, uint64_t bytes);
     void (*set_host_floor)(void * context, uint64_t bytes);
     int (*reclaim_host)(void * context, uint64_t bytes);
     uint64_t (*host_bytes)(void * context);
+    int (*set_thread_cpus)(void * context, const int * cpus, int count, char * error, size_t error_size);
 };
 #ifdef __cplusplus
 extern "C" {
