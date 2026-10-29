@@ -128,6 +128,14 @@ if (NOT DEFINED LLAMA_BUILD_COMMIT)
     set(LLAMA_BUILD_COMMIT        ${BUILD_COMMIT})
 endif()
 set(LLAMA_INSTALL_VERSION 0.0.${LLAMA_BUILD_NUMBER})
+# The InferSSD product version reported by the binaries; the root project sets it.
+if (NOT DEFINED INFERSSD_VERSION)
+    if (DEFINED InferSSD_VERSION)
+        set(INFERSSD_VERSION ${InferSSD_VERSION})
+    else()
+        set(INFERSSD_VERSION unknown)
+    endif()
+endif()
 
 # override ggml options
 set(GGML_ALL_WARNINGS   ${LLAMA_ALL_WARNINGS})

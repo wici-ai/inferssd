@@ -31,4 +31,3 @@
 - [Upstream patches](development/upstream-patches.md): integration points in the bundled llama.cpp snapshot.
 - [GPU prefill overhead](development/prefill-overhead.md): the placement cost model for batched GPU work.
 
-Upstream llama.cpp documentation is under [engine/docs](../engine/docs/).

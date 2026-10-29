@@ -24,22 +24,26 @@ those two kinds of change separately when assessing patch growth.
 Regenerate the inventory with `python3 scripts/inferssd/patch-surface.py` and
 replace the block between the inventory markers. The script compares each file
 of snapshot commit `8884f83` (override with `--base`) in the `ggml`, `src`, `include`, `common` and `tools/server` trees with the
-matching file under `engine/`. Relocation into `engine/` and files added by
-InferSSD are not counted.
+matching file under `engine/`. Relocation into `engine/`, files added by
+InferSSD and upstream documentation, which is not bundled, are not counted.
 
 <!-- BEGIN UPSTREAM INVENTORY -->
 | Upstream path (under engine/) | Added | Removed |
 | --- | ---: | ---: |
 | `common/CMakeLists.txt` | 16 | 22 |
-| `common/arg.cpp` | 60 | 2 |
+| `common/arg.cpp` | 61 | 3 |
+| `common/build-info.cpp.in` | 7 | 2 |
+| `common/build-info.h` | 1 | 0 |
 | `common/chat-auto-parser-generator.cpp` | 1 | 1 |
 | `common/chat-peg-parser.cpp` | 4 | 2 |
 | `common/chat-peg-parser.h` | 3 | 0 |
 | `common/chat.cpp` | 175 | 199 |
 | `common/chat.h` | 34 | 3 |
-| `common/common.cpp` | 2 | 0 |
+| `common/common.cpp` | 3 | 1 |
 | `common/common.h` | 13 | 2 |
 | `common/debug.cpp` | 16 | 13 |
+| `common/download.cpp` | 2 | 2 |
+| `common/hf-cache.cpp` | 1 | 1 |
 | `common/jinja/caps.cpp` | 1 | 1 |
 | `common/jinja/parser.cpp` | 10 | 2 |
 | `common/jinja/runtime.cpp` | 6 | 1 |
@@ -159,7 +163,6 @@ InferSSD are not counted.
 | `src/models/deepseek2.cpp` | 10 | 4 |
 | `src/models/models.h` | 56 | 0 |
 | `tools/server/CMakeLists.txt` | 10 | 2 |
-| `tools/server/README.md` | 2 | 1 |
 | `tools/server/server-chat.cpp` | 66 | 16 |
 | `tools/server/server-common.cpp` | 288 | 5 |
 | `tools/server/server-common.h` | 22 | 1 |
@@ -167,5 +170,5 @@ InferSSD are not counted.
 | `tools/server/server-task.cpp` | 195 | 183 |
 | `tools/server/server-task.h` | 23 | 80 |
 
-Total: 15575 added, 5632 removed across 136 upstream paths.
+Total: 15586 added, 5638 removed across 139 upstream paths.
 <!-- END UPSTREAM INVENTORY -->

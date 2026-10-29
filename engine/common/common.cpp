@@ -374,7 +374,7 @@ void common_init() {
     const char * build_type = " (debug)";
 #endif
 
-    LOG_DBG("build: %d (%s) with %s for %s%s\n", llama_build_number(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
+    LOG_DBG("InferSSD %s (%s) with %s for %s%s\n", inferssd_version(), llama_commit(), llama_compiler(), llama_build_target(), build_type);
 }
 
 std::string common_params_get_system_info(const common_params & params) {
