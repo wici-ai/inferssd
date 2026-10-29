@@ -16,6 +16,12 @@ interchangeable with the portable unit gate. Do not interpret a full-suite run o
 a production device acceptance test. GPU and cgroup suites need dedicated launchers
 and explicit resource prerequisites before they can become automated gates.
 
+Some bundled upstream tests in a full run depend on outside resources: `test-download-model`
+fetches the model that `test-thread-safety` and `test-state-restore-fragmented` use,
+`test-tokenizers-ggml-vocabs` clones vocabularies with Git LFS, `test-quant-type-selection`
+compares its recorded snapshots with the current Hugging Face files, and `test-jinja-py`
+needs `python3` with `jinja2`; exclude them with `ctest -E` where these are unavailable or have changed.
+
 ## Shared expert store
 
 `LLAMA_SSD_STORE` is on by default on Linux, macOS and Windows. The store is a
