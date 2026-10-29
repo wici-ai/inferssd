@@ -3131,7 +3131,9 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
                 std::lock_guard<std::mutex> lock(sink->io_mutex);
                 slot->state = sink_slot::empty;
             }
-            if (slot) { sink->io_cv.notify_one(); }
+            // Every waiter: with streamed GPU transients the tier's worker waits on io_cv for its read beside the
+            // I/O thread waiting for this ring slot, and a single wakeup that reached the worker left both asleep.
+            if (slot) { sink->io_cv.notify_all(); }
         }
         {
             const auto wait_start = sink_clock::now();
