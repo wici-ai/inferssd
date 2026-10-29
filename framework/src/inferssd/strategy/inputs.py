@@ -182,7 +182,11 @@ class RuntimeFacts:
 
     cpus: tuple[int, ...]  # CPUs this process may run on
     gpus: Optional[tuple[GPUState, ...]]  # usable CUDA GPUs; None when they cannot be read
-    available_bytes: Optional[int]  # memory available now, within the cgroup's limit
+    # The launcher's view of the memory available now: MemAvailable within the
+    # room of every bounded cgroup (file cache counted as reclaimable), or on
+    # macOS the free, inactive and speculative pages. None when it cannot be
+    # read. The engine sizes its caches from its own reading at run time.
+    available_bytes: Optional[int]
     memory_budget_bytes: Optional[int] = None  # the user's memory budget, when given
 
 
@@ -260,28 +264,40 @@ def _gpus(host: Host) -> Optional[tuple[GPUState, ...]]:
     return tuple(GPUState(uuid, memory[uuid], busy[uuid]) for _, uuid in chosen)
 
 
-def _cgroup_room(host: Host) -> Optional[int]:
-    """The tightest memory.max minus memory.current along this process's cgroup v2 path."""
+def _cgroup_room(host: Host) -> tuple[bool, Optional[int]]:
+    """Whether the cgroup v2 limits could be read, and the room the tightest one leaves.
+
+    At each ancestor with a finite memory.max the room is that limit less
+    memory.current, where the file cache (active_file and inactive_file in
+    memory.stat) counts as reclaimable, as the engine's host ledger counts it.
+    A bounded level without memory.current or memory.stat gives no reading.
+    """
     try:
         line = next(
             (row for row in host.text("/proc/self/cgroup").splitlines() if row.startswith("0::")),
             None,
         )
     except OSError:
-        return None
+        return True, None
     if line is None:
-        return None
+        return True, None
     path = line[3:].strip().rstrip("/")
     room: Optional[int] = None
     while True:
         base = "/sys/fs/cgroup" + path
         limit = identity.read(host, base + "/memory.max")
-        used = identity.read(host, base + "/memory.current")
-        if limit and limit.isdigit() and used and used.isdigit():
-            value = max(0, int(limit) - int(used))
+        if limit and limit.isdigit():
+            used = identity.read(host, base + "/memory.current")
+            stat = identity.read(host, base + "/memory.stat")
+            fields = dict(row.split(None, 1) for row in (stat or "").splitlines() if " " in row)
+            file = [fields.get(name, "").strip() for name in ("active_file", "inactive_file")]
+            if not used or not used.isdigit() or not all(value.isdigit() for value in file):
+                return False, None
+            anonymous = max(0, int(used) - sum(int(value) for value in file))
+            value = max(0, int(limit) - anonymous)
             room = value if room is None else min(room, value)
         if not path:
-            return room
+            return True, room
         path = path.rsplit("/", 1)[0]
 
 
@@ -291,7 +307,9 @@ def _available(host: Host, system: str) -> Optional[int]:
             value: Optional[int] = identity.meminfo_bytes(host, "MemAvailable")
         except (OSError, ValueError):
             value = None
-        room = _cgroup_room(host)
+        readable, room = _cgroup_room(host)
+        if not readable:
+            return None
         if room is not None:
             value = room if value is None else min(value, room)
         return value

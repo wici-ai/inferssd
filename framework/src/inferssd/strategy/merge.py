@@ -12,17 +12,23 @@ the strict compute CPUs, and thread counts within those CPUs.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import Optional, cast
 
 from inferssd.configuration.settings import Setting, Snapshot, parse, render
 from inferssd.launch.types import Threads
 from inferssd.strategy.derive import Strategy
 
 LOCATION = "strategy"
-# Server options of a strategy argument, by the spelling the strategy uses.
-SERVER_OPTIONS = {"--ctx-checkpoints": ("-ctxcp", "--ctx-checkpoints", "--swa-checkpoints")}
+# Each strategy server option, by the spelling the strategy uses: every spelling
+# of it and the environment variable the server also reads it from.
+SERVER_OPTIONS: dict[str, tuple[tuple[str, ...], Optional[str]]] = {
+    "--ctx-checkpoints": (
+        ("-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"),
+        "LLAMA_ARG_CTX_CHECKPOINTS",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -127,8 +133,14 @@ def apply(strategy: Strategy, snapshot: Snapshot, threads: Threads = Threads()) 
     return Applied(result, merged, tuple(kept), tuple(dropped))
 
 
-def server_arguments(strategy: Strategy, extra: Sequence[str]) -> tuple[str, ...]:
-    """The strategy's server arguments that the user's EXTRA arguments do not set themselves."""
+def server_arguments(
+    strategy: Strategy, extra: Sequence[str], environment: Mapping[str, str]
+) -> tuple[str, ...]:
+    """The strategy's server arguments that the user sets neither in EXTRA nor in ENVIRONMENT.
+
+    A command-line option overrides the server's environment variable, so an
+    option the user configured either way is left to the user.
+    """
     given = set()
     for argument in extra:
         name = argument.split("=", 1)[0]
@@ -136,6 +148,7 @@ def server_arguments(strategy: Strategy, extra: Sequence[str]) -> tuple[str, ...
     arguments: list[str] = []
     pairs = strategy.server_args
     for option, value in zip(pairs[::2], pairs[1::2]):
-        if given.isdisjoint(SERVER_OPTIONS.get(option, (option,))):
+        spellings, variable = SERVER_OPTIONS.get(option, ((option,), None))
+        if given.isdisjoint(spellings) and (variable is None or variable not in environment):
             arguments += [option, value]
     return tuple(arguments)

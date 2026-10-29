@@ -215,7 +215,9 @@ def linux_runtime(root, *, gpus="0, GPU-aaaa, 30000\n1, GPU-bbbb, [N/A]\n", apps
     write(root, "/proc/meminfo", "MemTotal: 64000000 kB\nMemAvailable: 48000000 kB\n")
     write(root, "/proc/self/cgroup", "0::/user.slice/run.scope\n")
     write(root, "/sys/fs/cgroup/user.slice/memory.max", f"{40 << 30}\n")
-    write(root, "/sys/fs/cgroup/user.slice/memory.current", f"{10 << 30}\n")
+    write(root, "/sys/fs/cgroup/user.slice/memory.current", f"{14 << 30}\n")
+    stat = f"anon {9 << 30}\nfile {5 << 30}\nactive_file {3 << 30}\ninactive_file {1 << 30}\n"
+    write(root, "/sys/fs/cgroup/user.slice/memory.stat", stat)
     write(root, "/sys/fs/cgroup/user.slice/run.scope/memory.max", "max\n")
     write(root, "/sys/fs/cgroup/user.slice/run.scope/memory.current", "4096\n")
     return {SMI_GPUS: ok(gpus), SMI_APPS: ok(apps)}
@@ -228,9 +230,28 @@ def test_linux_runtime_facts(tmp_path):
     assert facts == RuntimeFacts(
         (0, 2, 3),
         (GPUState("GPU-aaaa", 30000 << 20, 0), GPUState("GPU-bbbb", None, 1)),
-        30 << 30,  # the cgroup's room is below MemAvailable
+        30 << 30,  # 40 GiB less 14 in use, 4 of them file cache: below MemAvailable
         1 << 34,
     )
+
+
+def test_cgroup_room_counts_file_cache_and_needs_memory_stat(tmp_path):
+    linux_runtime(tmp_path)
+    # A deeper, tighter limit whose memory is mostly file cache.
+    write(tmp_path, "/sys/fs/cgroup/user.slice/run.scope/memory.max", f"{8 << 30}\n")
+    write(tmp_path, "/sys/fs/cgroup/user.slice/run.scope/memory.current", f"{9 << 30}\n")
+    stat = f"active_file {6 << 30}\ninactive_file {2 << 30}\n"
+    write(tmp_path, "/sys/fs/cgroup/user.slice/run.scope/memory.stat", stat)
+    assert read_runtime(host=RuntimeHost(tmp_path, affinity=(0,))).available_bytes == 7 << 30
+    # More file cache than memory.current: nothing counts as in use.
+    write(tmp_path, "/sys/fs/cgroup/user.slice/run.scope/memory.current", f"{1 << 30}\n")
+    assert read_runtime(host=RuntimeHost(tmp_path, affinity=(0,))).available_bytes == 8 << 30
+    # Over the limit in anonymous memory: no room, never negative.
+    write(tmp_path, "/sys/fs/cgroup/user.slice/run.scope/memory.current", f"{20 << 30}\n")
+    assert read_runtime(host=RuntimeHost(tmp_path, affinity=(0,))).available_bytes == 0
+    # A bounded level without memory.stat gives no reading.
+    (tmp_path / "sys/fs/cgroup/user.slice/run.scope/memory.stat").unlink()
+    assert read_runtime(host=RuntimeHost(tmp_path, affinity=(0,))).available_bytes is None
 
 
 def test_linux_runtime_respects_cuda_visible_devices(tmp_path):

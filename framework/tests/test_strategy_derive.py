@@ -81,8 +81,11 @@ def test_x86_uniform_machine_with_a_discrete_gpu(models):
     # The largest copies: 28.2812e9 B/s pinned and 16.563e9 pageable, in 1e9 bytes per second.
     assert terms["link_gbps"] == pytest.approx(28.2812)
     assert terms["pageable_gbps"] == pytest.approx(16.563)
-    # A 6266880-byte role read takes the 4 MiB knee, QD 4.
-    assert terms["drive_gbps"] == pytest.approx(7.38329)
+    # A 6266880-byte role read takes the 4 MiB reads: the best median from the
+    # knee (QD 4) up to the engine's 24 reads in flight is at QD 16; QD 32 is
+    # faster still but deeper than the engine queues.
+    assert terms["drive_gbps"] == pytest.approx(9.623315)
+    assert "4 MiB reads at QD 16" in s.settings["place.costs"].reason
     assert s.server_args == SERVER_ARGS == ("--ctx-checkpoints", "0")
     assert s.inputs.platform == "linux"
     assert s.inputs.model_paths == models["dsv"].paths
@@ -113,6 +116,26 @@ def test_cpu_line_mixes_role_formats(models):
     many = 2 * flop / point(c, "Q4_K", 10, 512, "flops") + flop / point(c, "Q5_K", 10, 512, "flops")
     route = (many - one) * 1e6 / 511
     assert line == pytest.approx((one * 1e6 - route, route))
+
+
+def test_drive_rate_stays_within_the_readers_cap(models):
+    c = machine(MAC)
+    # The macOS reader pool runs at most 8 reads at once: 16 MiB reads from the knee, QD 8.
+    s = derive(c, models["muse"], runtime(range(10)), "darwin", model_drive_key=drive(c))
+    assert costs(s)["drive_gbps"] == pytest.approx(6.84916)
+    assert "16 MiB reads at QD 8, the best from its knee QD 8 up to QD 8" in (
+        s.settings["place.costs"].reason
+    )
+
+
+def test_a_point_without_flops_is_dropped(models):
+    c = machine(MAC)
+    for row in c["compute"]["cpu"]:
+        if row["format"] == "MXFP4" and row["threads"] == 10:
+            del next(p for p in row["points"] if p["tokens"] == 512)["flops"]
+    line, why = cpu_line(c, models["dsv"], 10)
+    # The 10-thread row keeps its 32-token point; 512 tokens come from no row at 10 threads.
+    assert line is not None and "at 32 tokens" in why
 
 
 def test_cpu_line_interpolates_between_measured_thread_counts(models):
@@ -155,7 +178,7 @@ def test_arm_split_needs_the_performance_cluster_at_the_lowest_ids(models):
     terms = costs(s)
     # GB10 shares host memory: no copy over a link is priced.
     assert sorted(terms) == ["cpu_fixed_us", "cpu_route_us", "drive_gbps"]
-    # A 10136235-byte mean role read takes the 16 MiB knee, QD 2.
+    # A 10136235-byte mean role read takes the 16 MiB reads, best at the knee, QD 2.
     assert terms["drive_gbps"] == pytest.approx(12.6298)
     assert "vram.budget" not in s.settings
     assert any("shares host memory" in note for note in s.notes)

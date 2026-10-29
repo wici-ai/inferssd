@@ -27,6 +27,8 @@ GB = 1e9
 COST_MAX = 1e6  # the registry's bound on every place.costs term
 MAX_THREADS = 256  # the launcher's bound on a thread pool
 MAX_CPU = 511  # the highest CPU a server CPU mask holds
+# Role reads the engine keeps in flight: 8 ring experts of 3 roles each.
+IN_FLIGHT = 24
 # Context checkpoints stay off to work around a known engine issue: once the RAM
 # cache fills host.budget_mib, growing the CPU work buffers fails the request
 # with HTTP 500.
@@ -237,7 +239,7 @@ def _rates(row: ComputeRow) -> tuple[Optional[float], dict[int, float]]:
         (p["weight_Bps"] for p in row["points"] if p["tokens"] == 1 and p.get("weight_Bps", 0) > 0),
         None,
     )
-    many = {p["tokens"]: p["flops"] for p in row["points"] if p["tokens"] > 1}
+    many = {p["tokens"]: p.get("flops", 0) for p in row["points"] if p["tokens"] > 1}
     return one, {tokens: flops for tokens, flops in many.items() if flops > 0}
 
 
@@ -320,11 +322,13 @@ def cpu_line(
 def drive_rate(
     characteristics: Characteristics, model: ModelFacts, key: Optional[str]
 ) -> tuple[Optional[float], str]:
-    """The model drive's read rate in GB/s at the knee of the request size the engine issues.
+    """The model drive's read rate in GB/s for the requests the engine issues.
 
     The engine reads each role of an expert as its own request, so the size
     looked up is the largest expert's mean role read; the nearest measured size
-    is taken on a log scale.
+    is taken on a log scale. The engine keeps up to IN_FLIGHT of those reads
+    queued, so the rate is the best median between the size's knee and that
+    depth (or the reader's own cap).
     """
     if key is None:
         return None, "the drive holding the model is not known"
@@ -334,22 +338,23 @@ def drive_rate(
     name = key if entry["model"] == "unknown" else entry["model"]
     request = model.expert_read_bytes / 3
     knee = min(entry["knee"], key=lambda row: (abs(math.log(row["bytes"] / request)), row["bytes"]))
-    point = next(
-        (
-            row
-            for row in entry["random_read"]
-            if row["bytes"] == knee["bytes"] and row["qd"] == knee["qd"]
-        ),
-        None,
-    )
-    if point is None or point["Bps"] <= 0:
-        return None, f"no read rate at the knee of {size(knee['bytes'])} reads on {name}"
-    rate = point["Bps"] / GB
+    deepest = min(IN_FLIGHT, entry["qd_cap"] or IN_FLIGHT)
+    points = [
+        row
+        for row in entry["random_read"]
+        if row["bytes"] == knee["bytes"] and knee["qd"] <= row["qd"] <= deepest and row["Bps"] > 0
+    ]
+    if not points:
+        return None, f"no read rate of {size(knee['bytes'])} reads on {name} up to QD {deepest}"
+    # The fastest median wins; between equal rates, the shallower queue.
+    best = max(points, key=lambda row: (row["Bps"], -row["qd"]))
+    rate = best["Bps"] / GB
     if rate > COST_MAX:
         return None, f"a read rate of {rate} GB/s is beyond the cost term range"
     return rate, (
-        f"the drive {name} reads {rate:.2f} GB/s at the knee of {size(knee['bytes'])} reads, "
-        f"QD {knee['qd']} (a role read is {size(request)} on average)"
+        f"the drive {name} reads {rate:.2f} GB/s with {size(knee['bytes'])} reads at QD "
+        f"{best['qd']}, the best from its knee QD {knee['qd']} up to QD {deepest} "
+        f"(a role read is {size(request)} on average)"
     )
 
 

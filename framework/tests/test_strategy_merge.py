@@ -151,14 +151,17 @@ def test_all_placement_merges_without_conflicts():
 
 
 @pytest.mark.parametrize(
-    "extra, expected",
+    "extra, environment, expected",
     [
-        ((), ("--ctx-checkpoints", "0")),
-        (("--temp", "0.6"), ("--ctx-checkpoints", "0")),
-        (("-ctxcp", "4"), ()),
-        (("--ctx_checkpoints=2",), ()),
-        (("--swa-checkpoints", "1"), ()),
+        ((), {}, ("--ctx-checkpoints", "0")),
+        (("--temp", "0.6"), {"LLAMA_ARG_THREADS": "4"}, ("--ctx-checkpoints", "0")),
+        (("-ctxcp", "4"), {}, ()),
+        (("--ctx_checkpoints=2",), {}, ()),
+        (("--swa-checkpoints", "1"), {}, ()),
+        # The server reads the same option from its environment; the option would override it.
+        ((), {"LLAMA_ARG_CTX_CHECKPOINTS": "8"}, ()),
+        ((), {"LLAMA_ARG_CTX_CHECKPOINTS": ""}, ()),
     ],
 )
-def test_server_arguments_yield_to_the_user(extra, expected):
-    assert server_arguments(strategy(), extra) == expected
+def test_server_arguments_yield_to_the_user(extra, environment, expected):
+    assert server_arguments(strategy(), extra, environment) == expected
