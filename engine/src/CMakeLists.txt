@@ -12,6 +12,7 @@ add_library(llama
             ../include/llama.h
             ../include/llama-ssd.h
             ssd/options.cpp
+            ../examples/gguf-hash/deps/sha256/sha256.c
             ssd/model-adapter.cpp
             ssd/model-source.cpp
             ssd/model-pages.cpp
@@ -57,7 +58,7 @@ set_target_properties(llama PROPERTIES
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
-target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE . ../examples/gguf-hash/deps)
 target_include_directories(llama PRIVATE ../ggml/src/ggml-cpu)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump

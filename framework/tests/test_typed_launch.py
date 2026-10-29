@@ -517,3 +517,16 @@ def test_model_rules_reach_native_settings_without_profile_inference(tmp_path):
     assert files
     assert any(parse(path.read_text(), str(path)).at("model.optimizations").value == (rule,)
                for path in files)
+
+
+def test_content_manifest_preserves_typed_launch_provenance(tmp_path):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    manifest = json.dumps(["a" * 64, "b" * 64])
+    spec = replace(spec, overrides=spec.overrides + (("model.content_manifest", manifest),))
+    result = resolve(inputs, spec, adapter, out)
+    assert result.code == 0
+    assert result.argv[result.argv.index("--ssd-model-content-manifest") + 1] == manifest
+    assert "model.content_manifest" not in (out / "settings.ssd").read_text()
+    native = parse((out / "settings.ssd").read_text(), overrides=spec.overrides, platform="linux")
+    assert native.at("model.content_manifest").value == ("a" * 64, "b" * 64)
+    assert native.at("model.content_manifest").origin == "cli"

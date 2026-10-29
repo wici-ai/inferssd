@@ -47,7 +47,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
     using namespace ssd::settings;
-    assert(registry().size() == 17);
+    assert(registry().size() == 18);
     assert(parse("inferssd-settings 1\nmodel.engram_prefetch=1\nmodel.hc_fused=0\n", "model.ssd"));
     assert(!parse("inferssd-settings 1\nmodel.hc_fused=2\n", "model-invalid.ssd"));
     auto base = parse("", "");

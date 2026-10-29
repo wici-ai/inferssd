@@ -8,9 +8,10 @@
 
 namespace ssd { namespace settings {
 
-// Facts from loaded GGUF metadata and runtime devices, never a path/profile name.
+// Facts from loaded GGUF metadata, verified bytes and runtime devices, never a path/profile name.
 struct model_identity {
     std::string uuid, architecture, file_type, quantization_version, hardware;
+    std::string content; // loader-verified; never copied from a settings claim
 };
 struct model_options {
     bool engram_prefetch = false;
@@ -18,7 +19,7 @@ struct model_options {
     std::string matched_rule;
 
     std::string json(const model_identity & m) const {
-        return "{\"uuid\":" + json::quote(m.uuid) + ",\"architecture\":" + json::quote(m.architecture) +
+        return "{\"content\":" + json::quote(m.content) + ",\"uuid\":" + json::quote(m.uuid) + ",\"architecture\":" + json::quote(m.architecture) +
             ",\"file_type\":" + json::quote(m.file_type) + ",\"quantization_version\":" +
             json::quote(m.quantization_version) + ",\"hardware\":" + json::quote(m.hardware) +
             ",\"matched_rule\":" + json::quote(matched_rule) + ",\"engram_prefetch\":" +
@@ -26,7 +27,7 @@ struct model_options {
     }
 };
 
-// Rule: id|off/on|uuid|architecture|file_type|quantization_version|hardware|engram|hc
+// Rule: id|off/on|uuid-or-content|architecture|file_type|quantization_version|hardware|engram|hc
 // '-' retains the existing option. No wildcard or family inference is supported.
 inline result<model_options> resolve_model(const snapshot & settings, const model_identity & model) noexcept {
     try {
@@ -57,7 +58,7 @@ inline result<model_options> resolve_model(const snapshot & settings, const mode
                 (fields[8] != "-" && fields[8] != "0" && fields[8] != "1")) {
                 return {{}, status::invalid, "invalid model optimization state/options"};
             }
-            if (fields[1] != "on" || fields[2] != model.uuid || fields[3] != model.architecture ||
+            if (fields[1] != "on" || fields[2] != (model.uuid.empty() ? model.content : model.uuid) || fields[3] != model.architecture ||
                 fields[4] != model.file_type || fields[5] != model.quantization_version ||
                 fields[6] != model.hardware) { continue; }
             if (!out.matched_rule.empty()) { return {{}, status::invalid, "ambiguous model optimization rules"}; }

@@ -1,10 +1,16 @@
 // SPDX-License-Identifier: MIT
-#include "llama-model-loader.h"
+#include "model-source.h"
 #include "llama-hparams.h"
 #include <algorithm>
 #include <regex>
 #include <stdexcept>
 #include <cstdio>
+extern "C" {
+#include "../../examples/gguf-hash/deps/sha256/sha256.h"
+}
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 void llama_coalesce_ranges(std::vector<llama_file_range> & ranges) {
     if (ranges.empty()) {
@@ -100,3 +106,103 @@ void llama_model_loader::drop_mmap_expert_pages() const {
     }
 }
 
+namespace llama_ssd {
+namespace {
+std::vector<std::string> requested(const ssd::settings::snapshot & settings) {
+    const auto * e = settings.find("model.content_manifest");
+    const auto * v = e ? std::get_if<std::vector<std::string>>(&e->data) : nullptr;
+    return v ? *v : std::vector<std::string>{};
+}
+std::string stamp(int fd) {
+#ifdef _WIN32
+    (void) fd;
+    return {}; // no native stable descriptor receipt on this platform yet
+#else
+    struct stat s;
+    if (fstat(fd, &s)) { return {}; }
+#ifdef __APPLE__
+    const auto m = s.st_mtimespec, c = s.st_ctimespec;
+#else
+    const auto m = s.st_mtim, c = s.st_ctim;
+#endif
+    return std::to_string(s.st_dev) + ":" + std::to_string(s.st_ino) + ":" +
+        std::to_string(s.st_size) + ":" + std::to_string(m.tv_sec) + ":" +
+        std::to_string(m.tv_nsec) + ":" + std::to_string(c.tv_sec) + ":" + std::to_string(c.tv_nsec);
+#endif
+}
+std::string finish(sha256_t & hash) {
+    unsigned char bytes[32];
+    sha256_final(&hash, bytes);
+    std::string out;
+    for (auto b : bytes) { out += "0123456789abcdef"[b >> 4]; out += "0123456789abcdef"[b & 15]; }
+    return out;
+}
+}
+void content_identity::verify(const ssd::settings::snapshot & settings, const llama_files & loaded) {
+    digest.clear(); manifest.clear(); experts.clear(); files.clear(); stamps.clear();
+    const auto claims = requested(settings);
+    if (claims.empty() || claims.size() != loaded.size() || claims.size() > 100000) { return; }
+    for (const auto & c : claims) {
+        if (c.size() != 64 || c.find_first_not_of("0123456789abcdef") != std::string::npos) { return; }
+    }
+    sha256_t combined; sha256_init(&combined);
+    // Fixed-size reads, one full sequential pass over each loader descriptor.
+    std::vector<unsigned char> buffer(1024 * 1024);
+    for (size_t i = 0; i < loaded.size(); ++i) {
+        auto & file = *loaded[i];
+        if (file.has_direct_io()) { return; } // unaligned streaming is unsupported
+        const auto before = stamp(file.file_id());
+        if (before.empty()) { return; }
+        const auto position = file.tell();
+        const auto size = file.size();
+        sha256_t hash; sha256_init(&hash);
+        try {
+            file.seek(0, SEEK_SET);
+            for (size_t offset = 0; offset < size;) {
+                const auto n = std::min(buffer.size(), size - offset);
+                file.read_raw(buffer.data(), n);
+                sha256_update(&hash, buffer.data(), n);
+                offset += n;
+            }
+            file.seek(position, SEEK_SET);
+        } catch (...) {
+            file.seek(position, SEEK_SET);
+            throw; // I/O failure cannot be reported as successful admission
+        }
+        if (stamp(file.file_id()) != before || file.size() != size || finish(hash) != claims[i]) { return; }
+        stamps.push_back(before);
+        const auto line = claims[i] + "\n";
+        sha256_update(&combined, reinterpret_cast<const unsigned char *>(line.data()), line.size());
+    }
+    manifest = claims;
+    digest = "sha256:" + finish(combined);
+}
+std::string content_identity::for_context(const ssd::settings::snapshot & settings,
+                                         const ssd::store::source_view & sources) const {
+    if (digest.empty() || requested(settings) != manifest) { return {}; }
+    if (files.size() != stamps.size()) { return {}; }
+    for (size_t i = 0; i < files.size(); ++i) {
+        if (stamp(files[i]->file_id()) != stamps[i]) { return {}; }
+    }
+    // External expert indices must resolve to the same admitted GGUF byte ranges.
+    // A packed/replaced source needs separate admission; never assume equivalence.
+    if (settings.sources() && !settings.sources()->empty() && !sources.resolve) { return {}; }
+    if (sources.resolve) {
+#ifdef _WIN32
+        return {};
+#else
+        if (files.empty() || experts.empty()) { return {}; }
+        for (const auto & e : experts) {
+            if (e.shard >= files.size()) { return {}; }
+            for (int64_t expert = 0; expert < e.count; ++expert) {
+                int fd; uint64_t offset; size_t bytes;
+                if (!sources.resolve(sources.userdata, e.name.c_str(), int(expert), e.bytes, e.count,
+                                     &fd, &offset, &bytes) || stamp(fd) != stamps[e.shard] ||
+                    offset != e.offset + size_t(expert) * e.bytes || bytes != e.bytes) { return {}; }
+            }
+        }
+#endif
+    }
+    return digest;
+}
+}

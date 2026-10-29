@@ -99,7 +99,8 @@ llama_context::llama_context(
         // An empty device list remains unknown; it cannot match a nonempty rule.
         const ssd::settings::model_identity identity {
             fact("general.uuid"), fact("general.architecture"), fact("general.file_type"),
-            fact("general.quantization_version"), hardware
+            fact("general.quantization_version"), hardware,
+            model.verified_content(ssd_runtime->settings, ssd_runtime->sources)
         };
         const auto resolved = ssd::settings::resolve_model(ssd_runtime->settings, identity);
         if (!resolved) { throw std::runtime_error(resolved.error); }
