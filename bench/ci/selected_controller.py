@@ -399,6 +399,19 @@ def values_text(values, signed=False):
 METRIC_LABELS = (("decode_first128_tps", "Decode 0–128 tok/s"), ("decode_second128_tps", "Decode 128–256 tok/s"),
                  ("decode_tps", "Whole decode tok/s"), ("ttft_s", "Request TTFT seconds"),
                  ("server_prefill_tps", "Native prefill tok/s"))
+def launch_text(launch, name):
+    """One derived setting or thread pool of a side, with its origin."""
+    if not isinstance(launch, dict):
+        return "unavailable"
+    if name in ("server_args", "argv"):
+        return " ".join(map(str, launch.get(name, []))) if name == "server_args" else "see aggregate.json"
+    group, key = ("threads", name.split(".", 1)[1]) if name.startswith("threads.") else ("settings", name)
+    entry = launch.get(group, {}).get(key)
+    if not isinstance(entry, dict):
+        return "unset"
+    return json.dumps(entry.get("value"), separators=(",", ":")) + " (" + str(entry.get("origin")) + ")"
+
+
 RESULT_LABELS = {"within-noise": "within noise", "improved": "improved: faster beyond noise",
                  "regressed": "regressed: slower beyond noise, every PR run slower",
                  "candidates-disagree": "slower beyond noise, PR runs disagree",
@@ -467,7 +480,7 @@ def operator_summary(stream, report):
             stream.write("\nChange is the PR's geometric mean over the base estimate (the four history runs and the "
                          "in-run base), minus 1, in percent; lower TTFT is better. TTFT starts at the request, not model "
                          "loading. Threshold is on the log scale: max(ln(1 + floor), t·σ·√(1/3 + 1/5)), where σ is the "
-                         "pooled within-commit spread of the device's baseline history under the same measured conditions "
+                         "pooled within-commit spread of the device's baseline history for the same machine, OS, model and template "
                          "and t the one-sided Student-t quantile for its degrees of freedom, matching a normal 3σ tail. "
                          "Only whole decode, TTFT and native prefill decide; the two decode half-windows are shown for "
                          "information. Regressed: a deciding metric beyond its threshold with every PR run slower than the "
@@ -479,7 +492,7 @@ def operator_summary(stream, report):
         if baseline:
             stream.write("\n### 512 prompt / 256 decode: baseline runs of a main commit\n\n")
             stream.write("One build measured four times; no pass or regression decision. σ and df include this record "
-                         "and the device's earlier records under the same measured conditions.\n\n")
+                         "and the device's earlier records for the same machine, OS, model and template.\n\n")
             stream.write("| Device | Model | Tier | Metric | Runs | Mean ln | σ (log) | df |\n|---|---|---|---|---:|---:|---:|---:|\n")
             for row, entry in baseline:
                 for key, label in METRIC_LABELS:
@@ -494,6 +507,36 @@ def operator_summary(stream, report):
                 stream.write("- " + summary_text(row["device"] + "/" + row["model"] + "/" + entry["tier"]) + ": **"
                              + summary_text(entry.get("status", "unavailable")) + "**. Review reasons: "
                              + summary_text(", ".join(reasons) if reasons else "none") + ".\n")
+            stream.write("\n")
+        launches = [(row, entry) for row, entry in cells if isinstance(entry.get("derived_launch"), dict)]
+        if launches:
+            stream.write("\n### Derived launches\n\n")
+            stream.write("Each side started its servers the way `inferssd launch` does: that side's own launch strategy "
+                         "derived the settings, thread pools and server arguments from the job's one machine profile, the "
+                         "model's GGUF header and the job's memory budget. Origin is strategy, launcher (the registry "
+                         "default or the launcher's model profile) or user (the reviewed launch request). The thread pools "
+                         "are always shown; other rows are what the PR's launch sets differently.\n\n")
+            profiles = {}
+            for row, _ in launches:
+                profiles.setdefault(row["device"], row.get("machine_profile"))
+            for device, machine in profiles.items():
+                machine = machine if isinstance(machine, dict) else {}
+                weak = [name + " " + status for name, status in machine.get("sections", {}).items() if status != "ok"]
+                stream.write("- " + summary_text(device) + ": machine characteristics SHA `"
+                             + summary_text(machine.get("sha256", "unavailable")) + "`, profiled by the "
+                             + summary_text(machine.get("side", "unavailable")) + " side; sections not ok: "
+                             + summary_text(", ".join(weak) or "none") + ".\n")
+            stream.write("\n| Device | Model | Tier | Setting | Base | PR or measured commit |\n|---|---|---|---|---|---|\n")
+            for row, entry in launches:
+                derived = entry["derived_launch"]
+                sides = derived.get("sides", {})
+                names = ["threads.decode", "threads.batch", "threads.cpus"]
+                names += [name for name in derived.get("changes", []) if name not in names]
+                for name in names:
+                    values = [row["device"], row["model"], entry["tier"], name,
+                              launch_text(sides.get("base"), name) if "base" in sides else "not run",
+                              launch_text(sides.get("candidate"), name)]
+                    stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
             stream.write("\n")
         mac_cells = [(row, entry) for row, entry in cells if row["device"] == "local-mbp"]
         if mac_cells:
@@ -533,7 +576,7 @@ def operator_summary(stream, report):
             stream.write("- " + summary_text(row["device"] + "/" + row["model"] + "/" + entry["tier"]) + ": ")
             stream.write("prompt SHA `" + summary_text(identity.get("prompt_sha256", "unavailable")) + "`; ")
             stream.write("template IDs SHA `" + summary_text(identity.get("prompt_ids_sha256", "unavailable")) + "`; ")
-            stream.write("conditions/settings SHA `" + summary_text(identity.get("conditions_sha256", "unavailable")) + "`.\n")
+            stream.write("baseline-history conditions SHA `" + summary_text(identity.get("conditions_sha256", "unavailable")) + "`.\n")
             for arm in entry.get("order", []):
                 raw = entry.get("evidence", {}).get(arm, {}).get("result.json", {})
                 side = arm.split("/")[-1]

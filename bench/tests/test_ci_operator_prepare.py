@@ -223,10 +223,12 @@ def prepared_fixture(tmp_path, source, *, devices=None, mode=prepare.LEGACY_MODE
                     data["settings"].update(host_path="/opt/inferssd-ci-integrations/" + old_job + "-" + model + "-" + side_name + "-settings.ssd",
                         runtime_path="/models/settings-" + model + "-" + side_name + ".ssd", sha256=prepare.digest(tmp_path / name))
                     assets["settings-" + model + "-" + side_name + ".ssd"] = name
-                    data["smoke"].update(revision=identity[side_name], argv=["/build/" + side_name + "/bin/llama-server", "--ssd-settings", data["settings"]["runtime_path"]],
-                        environment={}, cwd="/scratch", port=18080, timeout_s=120, request_timeout_s=60,
-                        os_page_cache_treatment=config["host"]["os_page_cache_treatment"])
-                    data["benchmarks"] = {"512": dict(copy.deepcopy(data["smoke"]), preflight_argv=copy.deepcopy(data["smoke"]["argv"]))}
+                    # The device resolves argv and port with each side's own framework.
+                    data["launch"] = dict(profile="dsv" if model == "deepseek" else "muse", context=8192,
+                                          batch=512, ubatch=512, port=18080, extra=[])
+                    data["smoke"].update(revision=identity[side_name], environment={}, cwd="/scratch/" + side_name,
+                        timeout_s=120, request_timeout_s=60, os_page_cache_treatment=config["host"]["os_page_cache_treatment"])
+                    data["benchmarks"] = {"512": copy.deepcopy(data["smoke"])}
         mounts = {m: "/admitted/" + m for m in ("deepseek", "muse")}
         mounts.update({"settings-" + m + "-candidate.ssd": config["sides"]["candidate"]["models"][m]["settings"]["host_path"]
                        for m in ("deepseek", "muse")})
@@ -731,34 +733,35 @@ def test_no_enabled_affected_linux_device_refuses_before_output(tmp_path, source
     assert not args.output.exists()
 
 
-@pytest.mark.parametrize("damage", [None, "collision", "missing-argv", "other-flags"])
-def test_performance_preflight_and_timed_private_writer_paths(tmp_path, source, damage):
+@pytest.mark.parametrize("damage", [None, "fixed-argv", "fixed-port", "missing-request", "different-request", "bad-request"])
+def test_performance_launches_are_resolved_on_the_device_from_one_reviewed_request(tmp_path, source, damage):
     args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"], mode=prepare.MODE)
     path = tmp_path / "cloud-5090-template.json"
     config = load(path)
-    for side, spec in config["sides"].items():
-        for model, data in spec["models"].items():
-            before = "/scratch/" + side + "/" + model + "-preflight.jsonl"
-            after = "/scratch/" + side + "/" + model + "-benchmark-512.jsonl"
-            data["smoke"]["argv"] += ["--ssd-telemetry", before]
-            timed = data["benchmarks"]["512"]
-            timed["preflight_argv"] = copy.deepcopy(data["smoke"]["argv"])
-            timed["argv"] = [*data["smoke"]["argv"][:-1], after]
-            if damage == "collision": timed["argv"][-1] = before
-            elif damage == "missing-argv": del timed["preflight_argv"]
-            elif damage == "other-flags": timed["preflight_argv"] += ["--different-budget"]
+    muse = config["sides"]["base"]["models"]["muse"]
+    if damage == "fixed-argv": muse["benchmarks"]["512"]["argv"] = ["/build/base/bin/llama-server"]
+    elif damage == "fixed-port": muse["smoke"]["port"] = 18080
+    elif damage == "missing-request":
+        for side in config["sides"].values():
+            for data in side["models"].values():
+                del data["launch"]
+    elif damage == "different-request": muse["launch"]["context"] = 4096
+    elif damage == "bad-request": muse["launch"]["extra"] = [""]
     path.write_text(json.dumps(config))
     if damage:
         with pytest.raises(ValueError): prepare.prepare(args, api)
         assert not args.output.exists()
-    else:
-        prepare.prepare(args, api)
-        actual = load(args.output / "cloud-5090/config.json")
-        for side, spec in actual["sides"].items():
-            for model, data in spec["models"].items():
-                timed = data["benchmarks"]["512"]
-                assert timed["preflight_argv"] == data["smoke"]["argv"]
-                assert timed["argv"][-1] != timed["preflight_argv"][-1]
+        return
+    prepare.prepare(args, api)
+    actual = load(args.output / "cloud-5090/config.json")
+    stages = load(args.output / "cloud-5090/manifest.json")["stages"]
+    for side, spec in actual["sides"].items():
+        for model, data in spec["models"].items():
+            assert data["launch"]["port"] == 18080
+            assert not any(key in data["benchmarks"]["512"] for key in ("argv", "preflight_argv", "port"))
+            assert stages[side + "-" + model + "-launch"] == dict(kind="test", side=side, executables=["/usr/bin/python3"],
+                                                                 cwd="/scratch/" + side, gpu=True)
+    assert stages["machine-profile"]["side"] == "base"
 
 
 def test_bad_platform_profile_fails_during_preparation(tmp_path, source):

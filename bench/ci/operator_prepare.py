@@ -26,7 +26,7 @@ from ci.impact import fingerprint, plan, device_requirements
 from ci.staged_build import validate_platform_flags
 from ci.selection_contract import (BASELINE_JOB, GATE, JOB, bind, bound, build_cache_key, job_sides,
                                    performance_protocol, runtime_requirements)
-from ci import history as baseline_history
+from ci import history as baseline_history, staged_launch
 
 
 LINUX_DEVICES = ("cloud-5090", "dgx-spark")
@@ -452,6 +452,10 @@ def prepare(args, api=None):
                                        identities, mode, protocol)
         if template.get("device") != device or manifest.get("job_id") != job_id:
             raise ValueError("device/job template differs from selected slot")
+        # Timed servers start the way a user's `inferssd launch` starts them: each
+        # side resolves its launch on the device from a reviewed request.
+        if mode == MODE and not staged_launch.derived(template):
+            raise ValueError("operator performance launches are derived on the device; every model needs a launch request")
         template.update(execution_devices=execution, validation_mode=mode, selection_plan=impact)
         if mode == MODE:
             template["baseline_history"] = history

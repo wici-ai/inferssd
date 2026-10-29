@@ -74,7 +74,10 @@ INTERPRETATION = (
     "measured noise, which is not proof that none exists. A deciding metric whose candidate "
     "mean is below the base estimate by more than the same threshold is labelled improved "
     "(faster beyond noise); within the threshold either way it is within noise. The label "
-    "does not change the status. OS cache treatment is recorded, not assumed cold."
+    "does not change the status. Where a side's launch was derived on the device, that side's "
+    "own launch strategy chose its settings and thread pools from the job's one machine "
+    "profile; what the PR's launch sets differently is listed with the cell, and it is not a "
+    "reason to refuse the comparison. OS cache treatment is recorded, not assumed cold."
 )
 BASELINE_INTERPRETATION = (
     "Baseline job: one build of a main commit measured four times, every run a fresh "
@@ -153,6 +156,14 @@ def validate_metrics(result):
 
 
 def comparable(receipt, comparison_binding=None, side=None):
+    """Conditions two runs must share to be compared.
+
+    A run whose launch was derived on the device carries `derived_launch`: its
+    side's own strategy chose the settings, thread pools and server arguments
+    from the job's one machine profile. Those choices are results to report,
+    so the typed values and argv leave the comparison; the launch request, the
+    template, the machine characteristics and everything else must still match.
+    """
     if comparison_binding is not None:
         from ci.reference import comparable as reference_comparable
         return reference_comparable(receipt, comparison_binding, side)
@@ -168,7 +179,7 @@ def comparable(receipt, comparison_binding=None, side=None):
         raise ValueError(
             "comparison requires real typed configuration and exact launch policy"
         )
-    return {
+    conditions = {
         "model": receipt["model_identity"],
         "host": {
             k: host[k]
@@ -184,13 +195,33 @@ def comparable(receipt, comparison_binding=None, side=None):
             Path(x["path"]).name for x in receipt["build"]["loaded_libraries"]
         ),
     }
+    derived = receipt.get("derived_launch")
+    if derived is not None:
+        policy = settings["native_launch_policy"]
+        if {key: entry["value"] for key, entry in derived["settings"].items()} != policy["typed_values"]:
+            raise ValueError("derived launch settings differ from the typed values the server ran")
+        settings["native_launch_policy"] = {key: value for key, value in policy.items() if key not in ("args", "typed_values")}
+        conditions["machine_characteristics_sha256"] = derived["characteristics_sha256"]
+    return conditions
+
+
+def history_conditions(receipt):
+    """What baseline history is keyed on: the machine, its OS, the model files and the chat template.
+
+    Settings are not part of it. Each commit derives its own from the machine
+    characteristics, so the history of main stays usable for a PR whose
+    strategy derives different settings.
+    """
+    host = receipt["host"]
+    return {"model": receipt["model_identity"], "hardware": host["hardware"], "os": host["os"],
+            "template_sha256": host["effective_settings"]["native_launch_policy"]["template_sha256"]}
 
 
 def conditions_digest(conditions):
     """SHA-256 of canonical JSON, as for the plan and the sealed baseline history.
 
-    Applied to `comparable()` it is the measured-conditions identity that a
-    baseline record was measured under.
+    Applied to `history_conditions()` it is the identity a baseline record was
+    measured under.
     """
     return hashlib.sha256(json.dumps(conditions, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
@@ -405,7 +436,21 @@ def arms_checked(results, receipts, order):
     return {"prompt_sha256": first["prompt_sha256"],
             "prompt_ids_sha256": hashlib.sha256(json.dumps(first["prompt_ids"], separators=(",", ":")).encode()).hexdigest(),
             "input_tokens": first["input_tokens"], "output_tokens": 256,
-            "conditions_sha256": conditions_digest(conditions)}
+            "conditions_sha256": conditions_digest(history_conditions(receipts[keys[0]]))}
+
+
+def launches_checked(receipts, keys):
+    """Each side's derived launch, the same for all of that side's runs; None for fixed launches."""
+    launches = {}
+    for k, side in keys:
+        value = receipts[k, side].get("derived_launch")
+        if launches.setdefault(side, value) != value:
+            raise ValueError("runs of one side used different derived launches")
+    if all(value is None for value in launches.values()):
+        return None
+    from ci.staged_launch import changes
+    changed = changes(launches["base"], launches["candidate"]) if len(launches) == 2 else []
+    return dict(sides=launches, changes=changed)
 
 
 def decide_cell(results, receipts, policy, *, cell, protocol, history, environment=None):
@@ -429,6 +474,7 @@ def decide_cell(results, receipts, policy, *, cell, protocol, history, environme
     order = protocol["order"]
     keys = schedule(order)
     identity = arms_checked(results, receipts, order)
+    launches = launches_checked(receipts, keys)
     reference = results[keys[0]]["tokens"]
     differences = []
     for k, side in keys:
@@ -534,6 +580,8 @@ def decide_cell(results, receipts, policy, *, cell, protocol, history, environme
                                      threshold="max(ln(1 + floor_fraction), t_df * sigma * sqrt(1/candidate runs + 1/(history runs + 1)))",
                                      anchor="|base run - history mean| <= t_df * sigma * sqrt(1 + 1/history runs)"),
                   interpretation=BASELINE_INTERPRETATION if purpose == BASELINE else INTERPRETATION)
+    if launches is not None:
+        result["derived_launch"] = launches
     if environment is not None:
         result["environment"] = environment
     return result

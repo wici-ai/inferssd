@@ -222,14 +222,14 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
     from ci import selected_preflight
     from test_ci_staged_benchmark import Session as Recorder, CONFIG
     from test_ci_performance_series import record
-    from ci.compare import comparable, conditions_digest
+    from ci.compare import conditions_digest, history_conditions
     value = plan(['engine/ggml/src/ggml-cuda/ssd/mxfp4-compute-adapter.cpp'])
     config = template(value)
 
     def synthetic(side, folder):
         return dict(model_identity={'synthetic': True}, server=dict(pid=1 if side=='base' else 2, start_identity=str(folder)),
             build=dict(loaded_libraries=[]), host=dict(hardware='synthetic', os='synthetic', memory_budget_bytes=1,
-                os_page_cache_treatment='uncontrolled', effective_settings=dict(native_launch_policy=dict(typed_values={}))))
+                os_page_cache_treatment='uncontrolled', effective_settings=dict(native_launch_policy=dict(typed_values={}, template_sha256='c' * 64))))
 
     config.update(selection_plan=value, selection_plan_sha256=impact.fingerprint(value),
                   manifest_sha256='a'*64, paths=config['sides']['candidate']['paths'],
@@ -289,7 +289,7 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
     measured = load(output/'deepseek/512/r1/base/result.json')
     history = [record(value['base'], model='deepseek', base={metric: measured['metrics'][metric] for metric in METRICS},
                       tokens=measured['tokens'],
-                      conditions=conditions_digest(comparable(synthetic('base', tmp_path))))]
+                      conditions=conditions_digest(history_conditions(synthetic('base', tmp_path))))]
     code, result, output = run(history, 'out')
     assert code == (0 if clean else 1)
     assert result['cleanup_confirmed'] is clean and (result['status']=='passed') is clean

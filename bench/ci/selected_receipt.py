@@ -367,7 +367,11 @@ def receipt(config, manifest, side, model, spec, build, output, *, destination=N
             or settings["sha256"] != data["settings"]["sha256"]):
         raise ValueError("typed settings or template changed")
     from inferssd.configuration.settings import parse
-    expected = parse(settings_raw.decode(), data["settings"]["runtime_path"], platform=platform).document()["values"]
+    reviewed = parse(settings_raw.decode(), data["settings"]["runtime_path"], platform=platform).document()
+    # A derived launch runs the settings its side's own strategy resolved on the
+    # device; the reviewed file is only that resolution's input.
+    resolved = data.get("derived")
+    expected = reviewed["values"] if resolved is None else resolved["effective"]["values"]
     native = native_settings(output / "stderr.log")
     if native["values"] != expected:
         raise ValueError("actual native settings differ from root-sealed configuration")
@@ -392,7 +396,7 @@ def receipt(config, manifest, side, model, spec, build, output, *, destination=N
                 raise ValueError("expert source alias escapes the root-bound model shards")
     args, index = [], 1
     argv = spec["argv"]
-    substitutions = {"--ssd-settings": data["settings"]["runtime_path"],
+    substitutions = {"--ssd-settings": data["settings"]["runtime_path"] if resolved is None else resolved["settings"],
                      "--chat-template-file": data["template"]["runtime_path"]}
     for flag, path in substitutions.items():
         if argv.count(flag) != 1 or argv[argv.index(flag) + 1] != path:
@@ -404,15 +408,22 @@ def receipt(config, manifest, side, model, spec, build, output, *, destination=N
         else:
             args.append(argv[index])
             index += 1
+    policy = dict(args=args, typed_values=expected, template_sha256=template["sha256"])
+    if resolved is not None:
+        # Equal on both sides: what the launch was asked for, not what it derived.
+        policy["request"] = dict(data["launch"], settings={key: reviewed["values"][key] for key, source
+                                                           in sorted(reviewed["sources"].items()) if source["origin"] != "default"})
     result = dict(model_identity=model_identity,
                   build=dict(revision=config["sides"][side]["revision"], loaded_libraries=loaded),
                   server=dict(pid=started["worker_pid"], start_identity=started["birth_identity"]),
                   host=dict(hardware=host["hardware"], os=host["os"],
                             memory_budget_bytes=resources.get("memory_budget_bytes", int(resources.get("cgroup_limits", {}).get("memory_max", 0))),
                             os_page_cache_treatment=spec["os_page_cache_treatment"],
-                            effective_settings=dict(native_launch_policy=normalize(dict(args=args, typed_values=expected,
-                                template_sha256=template["sha256"]), frozen), native_resource_policy=resources,
+                            effective_settings=dict(native_launch_policy=normalize(policy, frozen), native_resource_policy=resources,
                                 ambient_environment=ambient, system_images=systems)))
+    if resolved is not None:
+        from ci.staged_launch import summary
+        result["derived_launch"] = summary(config, side, model, resolved)
     if platform == "darwin":
         result["host"]["effective_settings"]["native_resource_enforcement"] = MAC_RESOURCE_ENFORCEMENT
     save(destination if destination is not None else output / "comparison-receipt.json", result)

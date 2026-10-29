@@ -45,14 +45,13 @@ def mac_prepared_fixture(tmp_path, source):
             settings_path = "/Library/InferSSD-CI/inputs/old/settings-" + model + "-" + side + ".ssd"
             name = "mac-" + model + "-" + side + ".ssd"
             raw = ('inferssd-settings 1\nexpert.source = ["/Library/InferSSD-CI/jobs/{{job_id}}/frozen/' + side +
-                   '/assets/' + model + '-alias.tsv"]\nhost.budget_mib = 4096\n').encode()
+                   '/assets/' + model + '-alias.tsv"]\n').encode()
             (tmp_path / name).write_bytes(raw)
             assets["settings-" + model + "-" + side + ".ssd"] = name
             data["settings"].update(host_path=settings_path, runtime_path=settings_path, sha256=prepare.digest(tmp_path / name))
-            data["smoke"].update(argv=[spec["paths"]["frozen"] + "/bin/llama-server", "--ssd-settings", settings_path,
-                "--chat-template-file", source_path], cwd=spec["paths"]["cwd"], environment={},
+            data["smoke"].update(cwd=spec["paths"]["cwd"], environment={},
                 os_page_cache_treatment=config["host"]["os_page_cache_treatment"])
-            data["benchmarks"] = {"512": dict(copy.deepcopy(data["smoke"]), preflight_argv=copy.deepcopy(data["smoke"]["argv"]))}
+            data["benchmarks"] = {"512": copy.deepcopy(data["smoke"])}
     config["paths"] = config["sides"]["candidate"]["paths"]
     manifest["models"] = {model: "/Library/InferSSD-CI/models/" + model for model in ("muse", "deepseek")}
     declared.update(job_id="3" * 32, template="mac-template.json", manifest="mac-manifest.json", rootstage_files=assets,

@@ -25,10 +25,11 @@ RECEIPT = {
     "model_identity": {"shards": [{"sha256": "b" * 64}]},
     "host": {"hardware": "synthetic", "os": "synthetic", "memory_budget_bytes": 1024,
              "os_page_cache_treatment": "uncontrolled",
-             "effective_settings": {"native_launch_policy": {"typed_values": {"prefetch.depth": 2}}}},
+             "effective_settings": {"native_launch_policy": {"typed_values": {"prefetch.depth": 2},
+                                                             "template_sha256": "c" * 64}}},
     "build": {"loaded_libraries": [{"path": "libsynthetic.so"}]},
 }
-CONDITIONS = compare.conditions_digest(compare.comparable(RECEIPT))
+CONDITIONS = compare.conditions_digest(compare.history_conditions(RECEIPT))
 BASE_METRICS = dict(decode_first128_tps=10.0, decode_second128_tps=10.0, decode_tps=10.0, ttft_s=1.0,
                     server_prefill_tps=100.0)
 BUILD = dict(freeze_manifest_sha256="1" * 64, binary_sha256="2" * 64, cache_key="3" * 64,

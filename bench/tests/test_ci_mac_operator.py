@@ -335,7 +335,7 @@ def test_mac_and_linux_smoke_do_not_hide_missing_stop_log_eof(tmp_path):
 @pytest.fixture
 def mac_performance_raw(mac_raw):
     from test_ci_performance_series import record, write_arm
-    from ci.compare import METRICS, comparable, conditions_digest, decide_cell, schedule
+    from ci.compare import METRICS, conditions_digest, decide_cell, history_conditions, schedule
     import run_final
     root, config, _, original, _ = mac_raw
     config["device"] = "local-mbp"
@@ -391,7 +391,7 @@ def mac_performance_raw(mac_raw):
     measured = results[1, "base"]
     config["baseline_history"] = [record(plan["base"], device="local-mbp", model="deepseek", tokens=measured["tokens"],
                                          base={metric: measured["metrics"][metric] for metric in METRICS},
-                                         conditions=conditions_digest(comparable(receipts[1, "base"])))]
+                                         conditions=conditions_digest(history_conditions(receipts[1, "base"])))]
     policy = POLICY
     environment = mac_host_gate.cell({"r" + str(k) + "/" + side: state for (k, side), state in host_states.items()})
     save(root / "deepseek/512/comparison.json", decide_cell(

@@ -243,6 +243,18 @@ def requirements(config):
             raise ValueError("sealed build identity omits selected numerical images")
     if config["paths"] != config["sides"]["candidate"]["paths"]:
         raise ValueError("workflow platform guard must use the exact candidate paths")
+    from ci.staged_launch import derived, request_checked
+    if derived(config):
+        # Each side resolves its launch from the same request on the device.
+        for model in needs["models"]:
+            requests = [config["sides"][side]["models"][model]["launch"] for side in ("base", "candidate")]
+            if request_checked(requests[0]) != request_checked(requests[1]):
+                raise ValueError("base and candidate launch requests differ")
+            for side in ("base", "candidate"):
+                data = config["sides"][side]["models"][model]
+                if any(key in launch for launch in (data["smoke"], *data.get("benchmarks", {}).values())
+                       for key in ("argv", "preflight_argv", "port")):
+                    raise ValueError("a launch derived on the device takes its argv and port from its resolution")
     from ci.model_admission import enabled
     enabled(config)
     return needs
@@ -311,6 +323,14 @@ def linux_stages(config, needs, sides):
                 add(side + "-" + model + "-preflight-" + tier, "server", side, binary, arm["cwd"], True)
                 for run in range(1, run_count(protocol, side) + 1):
                     add(arm_prefix(side, model, run) + "-benchmark-" + tier, "server", side, binary, arm["cwd"], True)
+    from ci.staged_launch import PROFILE_STAGE, derived, launch_models, profile_side
+    if derived(config):
+        # The job's one machine profile, then each side's own launch resolution.
+        first = profile_side(config, needs)
+        add(PROFILE_STAGE, "test", first, "/usr/bin/python3", config["sides"][first]["paths"]["cwd"], True)
+        for side in sides:
+            for model in launch_models(config, needs, side):
+                add(side + "-" + model + "-launch", "test", side, "/usr/bin/python3", config["sides"][side]["paths"]["cwd"], True)
     root = config["sides"]["candidate"]["paths"]["frozen"]
     for case in needs["numerical"]:
         add("candidate-numerical-" + case, "test", "candidate", root + "/bin/" + CASES[case][0], config["numerical"]["cwd"], True)

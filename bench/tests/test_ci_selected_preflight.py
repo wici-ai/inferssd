@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci import selected_integration as execution, selected_preflight as preflight
-from ci.compare import METRICS, comparable, conditions_digest
+from ci.compare import METRICS, conditions_digest, history_conditions
 from ci.contract import digest, load, save
 from ci.selection_contract import linux_stages
 from test_ci_selection import impact, plan, template, POLICY
@@ -29,7 +29,7 @@ def synthetic_receipt(model, side, spec, output, fault=None):
         build=dict(loaded_libraries=[dict(path="/build/" + side + "/libggml-cuda.so", sha256=side)]),
         host=dict(hardware="synthetic", os="synthetic", memory_budget_bytes=1,
             os_page_cache_treatment=spec["os_page_cache_treatment"],
-            effective_settings=dict(native_launch_policy=dict(typed_values=typed),
+            effective_settings=dict(native_launch_policy=dict(typed_values=typed, template_sha256="c" * 64),
                                     actual_resource_policy=dict(memory_max=1))))
     if model == "muse" and side == "candidate":
         if fault == "resource-mismatch": result["host"]["memory_budget_bytes"] = 2
@@ -56,7 +56,7 @@ def setup(tmp_path, monkeypatch, *, change=None, fault=None, paths=None, value=N
         change(config)
     # Operator-sealed baseline history of the base, measured under exactly these synthetic conditions.
     config["baseline_history"] = sealed({
-        (config["device"], model, tier): conditions_digest(comparable(synthetic_receipt(
+        (config["device"], model, tier): conditions_digest(history_conditions(synthetic_receipt(
             model, "base", dict({"os_page_cache_treatment": ""}, **config["sides"]["base"]["models"][model]["benchmarks"][tier]),
             tmp_path)))
         for model in needs["models"] for tier in config["sides"]["base"]["models"][model]["benchmarks"]},

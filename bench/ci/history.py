@@ -5,7 +5,9 @@
 Each new main commit gets one baseline job: one build, four timed runs per
 model on every device. The hosted report of that job is replayed from sealed
 evidence; only its verified cells become records here, one file per device,
-model, tier, commit and measured conditions. Records live in the
+model, tier, commit and history conditions (the machine, its OS, the model
+files and the chat template; settings are derived per commit and not part of
+them). Records live in the
 `baseline-history` directory next to the reviewed device profiles
 (`inputs.json`) on the preparation host. Every job seals its devices' records
 into its job configuration, so the device and the hosted replay decide with

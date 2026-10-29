@@ -14,8 +14,9 @@ from ci.staged_numerical import validate_csv
 from ci.staged_benchmark import verify_stopped, verify_runtime
 from ci.staged_checkpoint import mapped_files, native_settings
 from ci.selected_preflight import arm_launch, launch as preflight_launch, retained
-from ci.selected_receipt import retained_typed_settings, mac_job_root, mac_runtime_images, mac_stopped, MAC_RESOURCE_ENFORCEMENT
-from ci import model_admission, mac_host_gate
+from ci.selected_receipt import (retained_typed_settings, mac_job_root, mac_runtime_images, mac_stopped,
+                                 MAC_RESOURCE_ENFORCEMENT, normalize)
+from ci import model_admission, mac_host_gate, staged_launch
 
 
 def sealed(root, report):
@@ -64,6 +65,12 @@ def runtime_retained(root, config, side, model, folder, launch, receipt_path):
                 effective["native_launch_policy"]["typed_values"], config["sides"][side], model, build,
                 root / ("build-" + side) / "freeze-manifest.json", config.get("manifest_path"))):
         raise ValueError("retained typed inputs/host/receipt identity differs")
+    resolved = data.get("derived")
+    if resolved is not None and (
+            effective["native_launch_policy"]["typed_values"] != normalize(resolved["effective"]["values"],
+                                                                         config["sides"][side]["paths"]["frozen"])
+            or runtime.get("derived_launch") != staged_launch.summary(config, side, model, resolved)):
+        raise ValueError("retained receipt differs from the side's resolved launch")
     if config.get("paths", {}).get("platform") == "darwin":
         mac_host_gate.retained_arm(folder, mac_host_gate.policy(config))
         manifest = load(root / "root-manifest.json")
@@ -217,6 +224,11 @@ def device_report(root, plan, policy, job, child, scope=None, history_sha256=Non
     if (report.get("base_build") or {}).get("source") != expected_source:
         raise ValueError("reported base build source differs from the retained build receipt")
     model_admission.retained(root, config, manifest, report)
+    # Derived launches are rebuilt from the retained profile and resolution output
+    # before any server evidence is checked against them.
+    machine = staged_launch.retained(root, config, needs) if staged_launch.derived(config) else None
+    if report.get("machine_profile") != machine:
+        raise ValueError("reported machine profile differs from its retained stage output")
     if digest(root / "performance-preflight.json") != report.get("performance_preflight_sha256"):
         raise ValueError("selected preflight gate missing or changed")
     preflight = retained(root, config, needs)
@@ -283,6 +295,8 @@ def device_report(root, plan, policy, job, child, scope=None, history_sha256=Non
                          numerical="passed", performance=performance or (
                              "deferred-not-in-this-run" if deferred else "not-required"),
                          performance_deferred_tiers=deferred_tiers))
+        if machine is not None:
+            rows[-1]["machine_profile"] = machine
     if outcome(rows) != report["status"]:
         raise ValueError("integration outcome differs from verified required evidence")
     return rows

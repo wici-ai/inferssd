@@ -256,6 +256,10 @@ def test_scoped_executor_builds_only_candidate_and_never_calls_performance(tmp_p
 
 @pytest.fixture
 def functional_raw(tmp_path):
+    return functional_artifacts(tmp_path)
+
+
+def functional_artifacts(tmp_path):
     root = tmp_path; folder = root / "native-deepseek"; folder.mkdir()
     (root / "build-candidate").mkdir()
     binary = dict(runtime_path="/build/candidate/bin/llama-server", sha256="a" * 64)
@@ -545,7 +549,7 @@ def test_summary_shows_history_base_run_pr_runs_change_threshold_and_decision():
     assert "Only whole decode, TTFT and native prefill decide" in text and "lower TTFT is better" in text
     assert "max(ln(1 + floor), t·σ·√(1/3 + 1/5))" in text
     assert "Declared device scope: **regressed**" in text and "deferred tiers: 4096" in text
-    assert "template IDs SHA" in text and "conditions/settings SHA" in text and "0/16" in text
+    assert "template IDs SHA" in text and "baseline-history conditions SHA" in text and "0/16" in text
 
 
 def test_summary_labels_a_faster_pr_improved_and_keeps_the_cell_passed():
@@ -703,7 +707,7 @@ def build_performance_raw(functional_raw, baseline=False):
     measured = load(first / "result.json")
     config["baseline_history"] = [] if baseline else [record(
         plan["base"], model="deepseek", base={metric: measured["metrics"][metric] for metric in compare.METRICS},
-        tokens=measured["tokens"], conditions=compare.conditions_digest(compare.comparable(preflight["deepseek", "512", "base"])))]
+        tokens=measured["tokens"], conditions=compare.conditions_digest(compare.history_conditions(preflight["deepseek", "512", "base"])))]
     policy = POLICY
 
     def comparison():

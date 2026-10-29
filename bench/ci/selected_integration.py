@@ -11,7 +11,7 @@ from ci.private_controller import API, source_manifest
 from ci.isolated_device import manifest_read_path
 from ci.selection_lifetime import OBSERVATION_BUDGET_S, ParentWatch
 from ci.selected_receipt import mac_job_root, receipt
-from ci import selected_preflight, model_admission, mac_host_gate
+from ci import selected_preflight, model_admission, mac_host_gate, staged_launch
 from ci.impact import fingerprint
 from ci.selection_contract import (PERFORMANCE_MODE, arm_prefix, baseline_build_identity, execution_scope,
                                    job_sides, protected_binding, runtime_requirements, sealed_history,
@@ -56,6 +56,8 @@ def run(args):
             report.update(scope)
             if "performance_protocol" in config:
                 report["performance_protocol"] = config["performance_protocol"]
+        # A derived launch is complete only once its side resolved it on the device.
+        derived = staged_launch.derived(config)
         pairs = selected_preflight.declarations(config, manifest, needs)
         admitted = model_admission.enabled(config)
         model_admission.prepare(config, manifest, output)
@@ -93,23 +95,37 @@ def run(args):
             report["base_build"] = dict(source="cache" if adopted is not None else "built", offered=offer,
                                         refused=opened.get("prebuilt_refused", {}).get("base"))
         # The candidate always builds; the base reuses its verified cached build when offered.
+        machine = None
         for side in sides:
             spec = config["sides"][side]
             if side == "base" and adopted is not None:
                 builds[side] = run_build(session, side, spec["build"], spec["paths"], output / ("build-" + side),
                                          spec["revision"], adopted=adopted)
-                continue
-            alias = spec.get("alias")
-            if alias:
-                target = output / (side + "-alias")
-                target.mkdir()
-                stage = session.start(side + "-alias", "build", alias["argv"], alias.get("environment", {}), alias["cwd"], alias["timeout_s"])
-                completed = session.wait(stage, deadline=time.monotonic() + alias["timeout_s"])
-                save(target / "stage.json", completed)
-                collect_log(session, stage, target)
-                if completed.get("returncode") != 0 or completed.get("cleanup_confirmed") is not True:
-                    raise RuntimeError("sandboxed alias preparation failed")
-            builds[side] = run_build(session, side, spec["build"], spec["paths"], output / ("build-" + side), spec["revision"])
+            else:
+                alias = spec.get("alias")
+                if alias:
+                    target = output / (side + "-alias")
+                    target.mkdir()
+                    stage = session.start(side + "-alias", "build", alias["argv"], alias.get("environment", {}), alias["cwd"], alias["timeout_s"])
+                    completed = session.wait(stage, deadline=time.monotonic() + alias["timeout_s"])
+                    save(target / "stage.json", completed)
+                    collect_log(session, stage, target)
+                    if completed.get("returncode") != 0 or completed.get("cleanup_confirmed") is not True:
+                        raise RuntimeError("sandboxed alias preparation failed")
+                builds[side] = run_build(session, side, spec["build"], spec["paths"], output / ("build-" + side), spec["revision"])
+            if derived:
+                # The first built side profiles the machine once, before any
+                # candidate code has run in a PR job; each side then resolves
+                # its own launches from that one characteristics file.
+                if machine is None:
+                    machine = staged_launch.profile(session, config, side, needs["models"], output / "machine")
+                    report["machine_profile"] = machine
+                for model in staged_launch.launch_models(config, needs, side):
+                    resolved = staged_launch.resolve(session, config, side, model, machine,
+                                                     output / "launch" / (side + "-" + model))
+                    staged_launch.fill(config, side, model, resolved, staged_launch.tiers(needs, model))
+        if derived:
+            pairs = selected_preflight.declarations(config, manifest, needs)
         if len(builds) == 2 and builds["base"]["toolchain"] != builds["candidate"]["toolchain"]:
             raise ValueError("actual compiler paths differ between compared arms")
         numeric = selected_numerical(session, config["numerical"], builds["candidate"], needs["numerical"], output / "numerical")
