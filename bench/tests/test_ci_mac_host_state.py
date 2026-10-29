@@ -179,7 +179,7 @@ def test_cpu_total_replays_native_python39_rounding_exactly(timed):
     assert host.compare_snapshots(before, after, {}, timed=timed)["process_activity"]["non_ci_cpu_cores"] == 0
 
 
-def test_quiet_threshold_equality_passes_and_low_memory_either_sample_fails():
+def test_quiet_threshold_counts_free_and_file_backed_pages_and_low_memory_either_sample_fails():
     before, after = pair()
     after["processes"][0]["cpu_time_ms"] += 1000
     after["vm_stat"]["counters"]["swapins"] += 1
@@ -187,11 +187,12 @@ def test_quiet_threshold_equality_passes_and_low_memory_either_sample_fails():
     policy = dict(max_non_ci_cpu_cores=0.5, max_non_ci_process_cpu_cores=0.5,
                   max_non_ci_process_rss_bytes=2 * 1024 ** 2,
                   max_swap_delta_bytes=16384, max_compression_delta_bytes=16384,
-                  min_free_inactive_bytes=3000 * 16384)
-    assert host.compare_snapshots(before, after, policy)["status"] == "passed"
+                  min_available_bytes=11000 * 16384)
+    result = host.compare_snapshots(before, after, policy)
+    assert result["status"] == "passed" and result["available_bytes"] == [11000 * 16384] * 2
     before["vm_stat"]["pages"]["free"] -= 1
     result = host.compare_snapshots(before, after, policy)
-    assert result["reasons"] == ["free-inactive-below-minimum"]
+    assert result["reasons"] == ["available-below-minimum"]
 
 
 @pytest.mark.parametrize("changed", ["uid", "comm", "elapsed_ms", "cpu_time_ms"])
@@ -271,7 +272,7 @@ def test_timed_mode_flags_swap_and_pressure_without_idle_memory_limits(
     policy = dict(normal_pressure_levels=[1], max_compression_delta_bytes=16384,
                   max_swap_delta_bytes=0, max_non_ci_cpu_cores=0,
                   max_non_ci_process_cpu_cores=0, max_non_ci_process_rss_bytes=0,
-                  min_free_inactive_bytes=100 * 1024 ** 3)
+                  min_available_bytes=100 * 1024 ** 3)
     result = host.compare_snapshots(before, after, policy, timed=True)
     assert result["status"] == expected and result["reasons"] == reasons
     assert result["flags"]["swap_activity"] == bool(swap)

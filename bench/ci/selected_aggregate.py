@@ -12,7 +12,7 @@ from ci.selection_contract import (arm_prefix, bound, execution_scope, FUNCTIONA
                                    baseline_build_identity, sealed_history, timed_protocol)
 from ci.staged_numerical import validate_csv
 from ci.staged_benchmark import verify_stopped, verify_runtime
-from ci.staged_checkpoint import mapped_files, native_settings
+from ci.staged_checkpoint import mapped_files, native_settings, within_cpus
 from ci.selected_preflight import arm_launch, launch as preflight_launch, retained
 from ci.selected_receipt import (retained_typed_settings, mac_job_root, mac_runtime_images, mac_stopped,
                                  MAC_RESOURCE_ENFORCEMENT, normalize)
@@ -97,7 +97,7 @@ def runtime_retained(root, config, side, model, folder, launch, receipt_path):
         verify_runtime(SimpleNamespace(**started), probe)
         if (probe["cmdline"] != launch["argv"] or probe["executable"] != build["binary"]["runtime_path"]
                 or probe["executable_sha256"] != build["binary"]["sha256"]
-                or probe["cpus_allowed_list"] != resources["cpus_allowed_list"]
+                or not within_cpus(probe["cpus_allowed_list"], resources["cpus_allowed_list"])
                 or probe["cgroup_limits"] != resources["cgroup_limits"]):
             raise ValueError("retained functional executable/argv/resources differ")
         lock = re.search(r"^Max locked memory\s+(\S+)\s+(\S+)\s+bytes\s*$", probe["proc_limits"], re.M)

@@ -146,8 +146,11 @@ with raw observations. There is no automatic retry. Existing swap settings are
 preserved; the check does not disable swap, close applications or clear caches.
 The fixed quiet policy is:
 
-- Free plus inactive memory in both snapshots must be at least the smaller of
-  the pinned worker memory budget and 75% of the recorded physical RAM.
+- Available memory in both snapshots must be at least the smaller of the pinned
+  worker memory budget and 75% of the recorded physical RAM. Available memory is
+  free plus file-backed pages, as the kernel counts it: a model the previous run
+  mapped stays cached on the active queue until pressure ages it, and the system
+  reclaims it without compression or swap.
 - Swap-in plus swap-out counter growth must be zero; compression plus
   decompression growth must be at most 64 MiB, using the observed page size.
 - The memory-pressure level must be available and equal to 1 in both snapshots.
@@ -162,7 +165,7 @@ swap, compression, pressure and process activity. Timed swap activity, abnormal
 pressure or excess non-CI CPU flags that run; compression above 64 MiB with
 abnormal pressure is also flagged, while compression alone is not. Timed checks
 do not apply the quiet free-memory or RSS thresholds. A difference above 1 GiB
-between any two of a cell's final prelaunch free-plus-inactive samples also
+between any two of a cell's final prelaunch available-memory samples also
 flags the cell. A flag makes an otherwise passing cell `needs-review` (and keeps
 a baseline cell out of the history); it never hides a `regressed` result, and
 measured slowdowns remain visible.
