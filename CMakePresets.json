@@ -124,6 +124,7 @@
             "release"
         ],
         "cacheVariables": {
+            "GGML_OPENMP": "OFF",
             "LLAMA_BUILD_SERVER": "ON",
             "LLAMA_BUILD_TESTS": "ON",
             "LLAMA_BUILD_WEBUI": "OFF",
@@ -139,6 +140,7 @@
             "release"
         ],
         "cacheVariables": {
+            "GGML_OPENMP": "OFF",
             "LLAMA_BUILD_SERVER": "ON",
             "LLAMA_BUILD_TESTS": "ON",
             "LLAMA_BUILD_WEBUI": "OFF",
