@@ -20,7 +20,8 @@ Build the CPU library, then compile the probe against that build:
 
 ```sh
 c++ -std=c++17 -O2 tests/qwen4exp/probe.cpp -Iinclude -Iggml/include \
-  -Lbuild-cpu/bin -Wl,-rpath,"$PWD/build-cpu/bin" -lllama -o /tmp/qwen4exp-probe
+  -Lbuild-cpu/bin -Wl,-rpath,"$PWD/build-cpu/bin" -lllama -lggml-base -lggml \
+  -o /tmp/qwen4exp-probe
 /tmp/qwen4exp-probe /tmp/qwen4exp-fixture.gguf /path/to/text.txt /tmp/logits.bin 8 0
 ```
 
