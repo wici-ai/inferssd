@@ -162,13 +162,14 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama.cpp` | 8 | 1 |
 | `src/models/deepseek2.cpp` | 10 | 4 |
 | `src/models/models.h` | 56 | 0 |
-| `tools/server/CMakeLists.txt` | 10 | 2 |
+| `tools/server/CMakeLists.txt` | 13 | 5 |
 | `tools/server/server-chat.cpp` | 66 | 16 |
 | `tools/server/server-common.cpp` | 288 | 5 |
 | `tools/server/server-common.h` | 22 | 1 |
 | `tools/server/server-context.cpp` | 685 | 127 |
 | `tools/server/server-task.cpp` | 195 | 183 |
 | `tools/server/server-task.h` | 23 | 80 |
+| `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 15593 added, 5638 removed across 139 upstream paths.
+Total: 15598 added, 5643 removed across 140 upstream paths.
 <!-- END UPSTREAM INVENTORY -->

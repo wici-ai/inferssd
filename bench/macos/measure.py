@@ -336,7 +336,7 @@ def main():
     if args.ctx_checkpoints is not None and args.ctx_checkpoints < 0:
         parser.error("ctx-checkpoints must be nonnegative")
     repo = Path(__file__).resolve().parents[2]
-    binary = (args.binary or repo / "build-mac-pipeline/bin/llama-server").resolve()
+    binary = (args.binary or repo / "build-mac-pipeline/bin/inferssd-server").resolve()
     model = args.model_file.resolve()
     args.out = args.out.resolve()
     if args.source == "alias" and (args.alias is None or not args.alias.is_file()):

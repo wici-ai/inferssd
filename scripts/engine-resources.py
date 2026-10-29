@@ -11,7 +11,7 @@ parser.add_argument("--build", required=True, type=Path)
 parser.add_argument("--output", required=True, type=Path)
 parser.add_argument("--engine", type=Path, default=Path(__file__).resolve().parents[1] / "engine")
 args = parser.parse_args()
-binary = (args.build / "bin/llama-server").resolve(strict=True)
+binary = (args.build / "bin/inferssd-server").resolve(strict=True)
 engine = args.engine.resolve(strict=True)
 templates = {
     "dsv": (engine / "models/templates/deepseek-ai-DeepSeek-V4.1.jinja").resolve(strict=True),
