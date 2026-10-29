@@ -151,7 +151,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-mmap.h` | 7 | 0 |
 | `src/llama-model-loader.cpp` | 164 | 7 |
 | `src/llama-model-loader.h` | 36 | 0 |
-| `src/llama-model-saver.cpp` | 7 | 2 |
+| `src/llama-model-saver.cpp` | 8 | 2 |
 | `src/llama-model.cpp` | 1093 | 39 |
 | `src/llama-model.h` | 107 | 0 |
 | `src/llama-quant.cpp` | 22 | 1 |
@@ -174,5 +174,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 16906 added, 5670 removed across 143 upstream paths.
+Total: 16907 added, 5670 removed across 143 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
