@@ -515,5 +515,7 @@ def test_model_rules_reach_native_settings_without_profile_inference(tmp_path):
     # The production materialized file is the native --ssd-settings input.
     files = list(out.glob("*.ssd"))
     assert files
-    assert any(parse(path.read_text(), str(path)).at("model.optimizations").value == (rule,)
-               for path in files)
+    assert any(
+        parse(path.read_text(), str(path)).at("model.optimizations").value == (rule,)
+        for path in files
+    )
