@@ -2821,7 +2821,7 @@ void kimi_cpu_sink_parallel_last(struct kimi_cpu_sink * sink,
     sink->parallel_phase(function, userdata, true);
 }
 
-static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
+bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         const struct ggml_tensor * up, const struct ggml_tensor * gate,
         const struct ggml_tensor * down, const int32_t * ids, int nexperts,
         struct kimi_cpu_sink_prefill_batch * batch,
@@ -2843,34 +2843,32 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
         sink->refresh_floor("prefill");
         sink->vram.begin(0, 0, false, sink->cache);
         sink->cache.begin(0, 0, false);
-        if (!ids || !consumer || nexperts < 0 || nexperts > 1024 ||
-                (batch && (!batch->quantized_input || !batch->f32_input || !batch->output ||
-                    (batch->nslots && (!batch->route_request_index || !batch->weights)) || batch->nslots < 0 || batch->nslots > 16 ||
-                    batch->ntokens < 1 || (batch->nslots &&
-                    batch->ntokens > std::numeric_limits<int>::max() / batch->nslots)))) {
+        if (!ids || !consumer || nexperts < 0 || nexperts > 1024 || !batch ||
+                !batch->quantized_input || !batch->f32_input || !batch->output ||
+                (batch->nslots && (!batch->route_request_index || !batch->weights)) || batch->nslots < 0 || batch->nslots > 16 ||
+                batch->ntokens < 1 || (batch->nslots &&
+                batch->ntokens > std::numeric_limits<int>::max() / batch->nslots)) {
             throw std::runtime_error("invalid CPU expert stream arguments");
         }
         if (sink->poisoned) { throw std::runtime_error("CPU sink ring is poisoned after an I/O failure"); }
-        if (batch) {
-            sink->post_exp_norm = batch->activation.post_exp_norm;
-            sink->activation_kind = batch->activation.kind;
-            sink->beta = batch->activation.situ_beta;
-            sink->linear_beta = batch->activation.situ_linear_beta;
-            sink->swiglu_limit = batch->activation.swiglu_limit;
-            batch->gpu_experts = batch->gpu_routes = 0;
-            batch->gpu_transient_experts = batch->gpu_transient_routes = 0;
-            batch->gpu_transient_upload_bytes = 0;
-            batch->gpu_transient_upload_us = batch->gpu_worker_us = 0.0;
-            batch->gpu_expert_us = batch->gpu_read_wait_us = 0.0;
-            batch->gpu_ssd_transient_candidates = batch->gpu_ssd_transient_experts = 0;
-            batch->gpu_ssd_transient_routes = batch->gpu_ssd_transient_upload_bytes = 0;
-            batch->gpu_ssd_transient_upload_us = 0.0;
-            batch->gpu_cold_admit_candidates = batch->gpu_cold_admit_experts = 0;
-            batch->gpu_cold_admit_routes = batch->gpu_cold_admit_upload_bytes = 0;
-            batch->gpu_cold_admit_upload_us = 0.0;
-            batch->ram_experts = batch->ram_routes = batch->ram_bytes = 0;
-            batch->ssd_experts = batch->ssd_routes = batch->ssd_bytes = 0;
-        }
+        sink->post_exp_norm = batch->activation.post_exp_norm;
+        sink->activation_kind = batch->activation.kind;
+        sink->beta = batch->activation.situ_beta;
+        sink->linear_beta = batch->activation.situ_linear_beta;
+        sink->swiglu_limit = batch->activation.swiglu_limit;
+        batch->gpu_experts = batch->gpu_routes = 0;
+        batch->gpu_transient_experts = batch->gpu_transient_routes = 0;
+        batch->gpu_transient_upload_bytes = 0;
+        batch->gpu_transient_upload_us = batch->gpu_worker_us = 0.0;
+        batch->gpu_expert_us = batch->gpu_read_wait_us = 0.0;
+        batch->gpu_ssd_transient_candidates = batch->gpu_ssd_transient_experts = 0;
+        batch->gpu_ssd_transient_routes = batch->gpu_ssd_transient_upload_bytes = 0;
+        batch->gpu_ssd_transient_upload_us = 0.0;
+        batch->gpu_cold_admit_candidates = batch->gpu_cold_admit_experts = 0;
+        batch->gpu_cold_admit_routes = batch->gpu_cold_admit_upload_bytes = 0;
+        batch->gpu_cold_admit_upload_us = 0.0;
+        batch->ram_experts = batch->ram_routes = batch->ram_bytes = 0;
+        batch->ssd_experts = batch->ssd_routes = batch->ssd_bytes = 0;
         std::vector<float> weights(static_cast<size_t>(nexperts), 1.0f);
         sink->prepare(up, gate, down, ids, weights.data(), nexperts, false);
         if (sink->requests.size() != static_cast<size_t>(nexperts)) {
@@ -2907,153 +2905,151 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
             owner->io_cv.notify_all();
             return 1;
         };
-        if (batch) {
-            std::vector<int32_t> vram_layers;
-            vram_layers.reserve(sink->cache.layers.size());
-            for (const auto & layer : sink->cache.layers) { vram_layers.push_back(layer.id); }
-            batch->gpu_experts = sink->vram.prepare_prefill(sink->requests, up, down, sink->latent, sink->hidden,
-                vram_layers, batch->ntokens, batch->activation.post_exp_norm != nullptr);
-            // the batched lanes stream their SSD transients through the ring (MXFP4's hand engine, the batched engine)
-            streaming_ssd = sink->vram.prefill_batched;
-            route_bytes = double(sink->vram.prefill_lane.route_bytes);
-            // no read of this layer has started and the tier is idle: a quiescent point to page-lock the ring
-            if (streaming_ssd) { sink->ring_lock(); }
-            if (batch->gpu_experts) {
-                const size_t route_count = size_t(batch->nslots) * size_t(batch->ntokens);
-                for (size_t route = 0; route < route_count; ++route) {
-                    const int request = batch->route_request_index[route];
-                    if (request >= 0 && size_t(request) < sink->requests.size() &&
-                            sink->requests[size_t(request)].vram_slot >= 0) {
-                        ++batch->gpu_routes;
-                    }
-                }
-            }
-            // Source order is strict: retained VRAM, then a read-only leased
-            // RAM entry, then a direct read. This lookup does not train or admit the
-            // decode cache and an SSD miss never receives a duplicate RAM slot.
-            sink->cache.prepare_prefill_read(sink->requests, up, gate, down, sink->current);
-            // Streamed transients hold a ring slot and a device slot each (in place, a ring slot alone), whatever their
-            // number, so only the optional cap limits them.
-            const int streaming_cap = sink->vram.prefill_ssd_gpu_max_experts_per_layer;
-            const size_t staging_limit = !streaming_ssd ? sink->slots.size() :
-                streaming_cap < 0 ? sink->requests.size() : size_t(streaming_cap);
-            if (streaming_ssd) {
-                std::fprintf(stderr,
-                    "[kimi_mxfp4_prefill_staging] selected_cap=%zu ring_buffers=%zu streaming=1\n",
-                    staging_limit, sink->slots.size());
-            }
-            sink->vram.select_prefill_transient(
-                sink->requests, *batch, sink->cache, staging_limit, sink->slots.size(),
-                sink->place_table(batch->ntokens, route_bytes));
-
-            size_t ssd_transient_count = 0;
-            for (const auto & request : sink->requests) {
-                if (!request.vram_ssd_transient) { continue; }
-                if (request.vram_ssd_staging < 0) {
-                    throw std::runtime_error("SSD prefill staging index is absent");
-                }
-                ssd_transient_count = std::max(
-                    ssd_transient_count, size_t(request.vram_ssd_staging) + 1);
-            }
-            if (ssd_transient_count > staging_limit) {
-                throw std::runtime_error("SSD prefill staging exceeds the allowed capacity");
-            }
-            ssd_transient_requests.assign(ssd_transient_count, std::numeric_limits<size_t>::max());
-            for (size_t i = 0; i < sink->requests.size(); ++i) {
-                auto & request = sink->requests[i];
-                if (!request.vram_ssd_transient) { continue; }
-                const size_t staging = size_t(request.vram_ssd_staging);
-                if (staging >= ssd_transient_requests.size() ||
-                        ssd_transient_requests[staging] != std::numeric_limits<size_t>::max()) {
-                    throw std::runtime_error("invalid duplicate SSD prefill staging index");
-                }
-                ssd_transient_requests[staging] = i;
-                if (!streaming_ssd) { throw std::runtime_error("SSD transient requires a batched streaming lane"); }
-                request.vram_ssd_streaming = true;
-            }
-            if (std::find(ssd_transient_requests.begin(), ssd_transient_requests.end(),
-                    std::numeric_limits<size_t>::max()) != ssd_transient_requests.end()) {
-                throw std::runtime_error("non-contiguous SSD prefill staging indices");
-            }
-
-            sink->io_requests.clear();
-            auto append_io_request = [&](size_t i) {
-                auto & request = sink->requests[i];
-                request.io_slot = sink->io_requests.size() % sink->slots.size();
-                if (!request.vram_ssd_transient || request.vram_ssd_streaming) {
-                    for (int role = 0; role < 3; ++role) {
-                        request.read_target[role] = sink->slots[request.io_slot].role[role].data;
-                    }
-                }
-                sink->io_requests.push_back(i);
-            };
-            std::vector<size_t> cpu_ssd_requests;
-            for (size_t i = 0; i < sink->requests.size(); ++i) {
-                const auto & request = sink->requests[i];
-                if (request.vram_slot < 0 && request.cache_hit < 0 && !request.vram_transient) {
-                    cpu_ssd_requests.push_back(i);
-                }
-            }
-            if (streaming_ssd && !sink->vram.prefill_legacy_schedule) {
-                // Issue the reads in the order the two consumers need them: by each expert's predicted start
-                // on its lane (the makespan rule's lane_start_us), so that both lanes run through the whole
-                // layer. Each consumer keeps its own order, so a ring credit is always returned by an earlier
-                // read of a consumer that is not waiting on a later one.
-                size_t gpu_next = 0, cpu_next = 0;
-                while (gpu_next < ssd_transient_requests.size() || cpu_next < cpu_ssd_requests.size()) {
-                    const bool gpu_first = cpu_next == cpu_ssd_requests.size() ||
-                        (gpu_next < ssd_transient_requests.size() &&
-                         sink->requests[ssd_transient_requests[gpu_next]].lane_start_us <=
-                         sink->requests[cpu_ssd_requests[cpu_next]].lane_start_us);
-                    append_io_request(gpu_first ? ssd_transient_requests[gpu_next++] : cpu_ssd_requests[cpu_next++]);
-                }
-            } else if (streaming_ssd) {
-                // Keep each consumer's request order while sharing the eight
-                // ring credits. CPU reads start before the GPU backlog drains.
-                size_t gpu_next = 0, cpu_next = 0;
-                while (gpu_next < ssd_transient_requests.size() || cpu_next < cpu_ssd_requests.size()) {
-                    for (int j = 0; j < 4 && gpu_next < ssd_transient_requests.size(); ++j) {
-                        append_io_request(ssd_transient_requests[gpu_next++]);
-                    }
-                    for (int j = 0; j < 4 && cpu_next < cpu_ssd_requests.size(); ++j) {
-                        append_io_request(cpu_ssd_requests[cpu_next++]);
-                    }
-                }
-            } else {
-                // With no streamed GPU transients, only the CPU reads remain.
-                for (size_t i : ssd_transient_requests) { append_io_request(i); }
-                for (size_t i : cpu_ssd_requests) { append_io_request(i); }
-            }
-            if (streaming_ssd) {
-                for (size_t i : ssd_transient_requests) {
-                    const auto & request = sink->requests[i];
-                    const void * data[3] = {
-                        static_cast<const char *>(request.read_target[0]) + request.role[0].data_offset,
-                        static_cast<const char *>(request.read_target[1]) + request.role[1].data_offset,
-                        static_cast<const char *>(request.read_target[2]) + request.role[2].data_offset,
-                    };
-                    sink->vram.bind_prefill_ssd_transient(i, data, streaming_stage, sink);
-                }
-            }
-            sink->current.cache_misses = sink->io_requests.size();
-            sink->cache.stats.prefill_misses += sink->current.cache_misses;
-            batch->ram_experts = sink->current.cache_hits;
-            batch->ram_bytes = sink->current.cache_hit_bytes;
-            batch->ssd_experts = sink->io_requests.size();
+        std::vector<int32_t> vram_layers;
+        vram_layers.reserve(sink->cache.layers.size());
+        for (const auto & layer : sink->cache.layers) { vram_layers.push_back(layer.id); }
+        batch->gpu_experts = sink->vram.prepare_prefill(sink->requests, up, down, sink->latent, sink->hidden,
+            vram_layers, batch->ntokens, batch->activation.post_exp_norm != nullptr);
+        // the batched lanes stream their SSD transients through the ring (MXFP4's hand engine, the batched engine)
+        streaming_ssd = sink->vram.prefill_batched;
+        route_bytes = double(sink->vram.prefill_lane.route_bytes);
+        // no read of this layer has started and the tier is idle: a quiescent point to page-lock the ring
+        if (streaming_ssd) { sink->ring_lock(); }
+        if (batch->gpu_experts) {
             const size_t route_count = size_t(batch->nslots) * size_t(batch->ntokens);
             for (size_t route = 0; route < route_count; ++route) {
                 const int request = batch->route_request_index[route];
-                if (request < 0 || size_t(request) >= sink->requests.size()) { continue; }
-                const auto & source = sink->requests[size_t(request)];
-                if (source.vram_slot >= 0) { continue; }
-                if (source.cache_hit >= 0) { ++batch->ram_routes; }
-                else { ++batch->ssd_routes; }
+                if (request >= 0 && size_t(request) < sink->requests.size() &&
+                        sink->requests[size_t(request)].vram_slot >= 0) {
+                    ++batch->gpu_routes;
+                }
             }
-            if (ssd_transient_requests.empty()) {
-                sink->vram.launch_prefill(batch->quantized_input, batch->quantized_stride,
-                    batch->f32_input, batch->f32_stride, batch->route_request_index, batch->weights,
-                    batch->nslots, batch->ntokens, batch->activation);
+        }
+        // Source order is strict: retained VRAM, then a read-only leased
+        // RAM entry, then a direct read. This lookup does not train or admit the
+        // decode cache and an SSD miss never receives a duplicate RAM slot.
+        sink->cache.prepare_prefill_read(sink->requests, up, gate, down, sink->current);
+        // Streamed transients hold a ring slot and a device slot each (in place, a ring slot alone), whatever their
+        // number, so only the optional cap limits them.
+        const int streaming_cap = sink->vram.prefill_ssd_gpu_max_experts_per_layer;
+        const size_t staging_limit = !streaming_ssd ? sink->slots.size() :
+            streaming_cap < 0 ? sink->requests.size() : size_t(streaming_cap);
+        if (streaming_ssd) {
+            std::fprintf(stderr,
+                "[kimi_mxfp4_prefill_staging] selected_cap=%zu ring_buffers=%zu streaming=1\n",
+                staging_limit, sink->slots.size());
+        }
+        sink->vram.select_prefill_transient(
+            sink->requests, *batch, sink->cache, staging_limit, sink->slots.size(),
+            sink->place_table(batch->ntokens, route_bytes));
+
+        size_t ssd_transient_count = 0;
+        for (const auto & request : sink->requests) {
+            if (!request.vram_ssd_transient) { continue; }
+            if (request.vram_ssd_staging < 0) {
+                throw std::runtime_error("SSD prefill staging index is absent");
             }
+            ssd_transient_count = std::max(
+                ssd_transient_count, size_t(request.vram_ssd_staging) + 1);
+        }
+        if (ssd_transient_count > staging_limit) {
+            throw std::runtime_error("SSD prefill staging exceeds the allowed capacity");
+        }
+        ssd_transient_requests.assign(ssd_transient_count, std::numeric_limits<size_t>::max());
+        for (size_t i = 0; i < sink->requests.size(); ++i) {
+            auto & request = sink->requests[i];
+            if (!request.vram_ssd_transient) { continue; }
+            const size_t staging = size_t(request.vram_ssd_staging);
+            if (staging >= ssd_transient_requests.size() ||
+                    ssd_transient_requests[staging] != std::numeric_limits<size_t>::max()) {
+                throw std::runtime_error("invalid duplicate SSD prefill staging index");
+            }
+            ssd_transient_requests[staging] = i;
+            if (!streaming_ssd) { throw std::runtime_error("SSD transient requires a batched streaming lane"); }
+            request.vram_ssd_streaming = true;
+        }
+        if (std::find(ssd_transient_requests.begin(), ssd_transient_requests.end(),
+                std::numeric_limits<size_t>::max()) != ssd_transient_requests.end()) {
+            throw std::runtime_error("non-contiguous SSD prefill staging indices");
+        }
+
+        sink->io_requests.clear();
+        auto append_io_request = [&](size_t i) {
+            auto & request = sink->requests[i];
+            request.io_slot = sink->io_requests.size() % sink->slots.size();
+            if (!request.vram_ssd_transient || request.vram_ssd_streaming) {
+                for (int role = 0; role < 3; ++role) {
+                    request.read_target[role] = sink->slots[request.io_slot].role[role].data;
+                }
+            }
+            sink->io_requests.push_back(i);
+        };
+        std::vector<size_t> cpu_ssd_requests;
+        for (size_t i = 0; i < sink->requests.size(); ++i) {
+            const auto & request = sink->requests[i];
+            if (request.vram_slot < 0 && request.cache_hit < 0 && !request.vram_transient) {
+                cpu_ssd_requests.push_back(i);
+            }
+        }
+        if (streaming_ssd && !sink->vram.prefill_legacy_schedule) {
+            // Issue the reads in the order the two consumers need them: by each expert's predicted start
+            // on its lane (the makespan rule's lane_start_us), so that both lanes run through the whole
+            // layer. Each consumer keeps its own order, so a ring credit is always returned by an earlier
+            // read of a consumer that is not waiting on a later one.
+            size_t gpu_next = 0, cpu_next = 0;
+            while (gpu_next < ssd_transient_requests.size() || cpu_next < cpu_ssd_requests.size()) {
+                const bool gpu_first = cpu_next == cpu_ssd_requests.size() ||
+                    (gpu_next < ssd_transient_requests.size() &&
+                     sink->requests[ssd_transient_requests[gpu_next]].lane_start_us <=
+                     sink->requests[cpu_ssd_requests[cpu_next]].lane_start_us);
+                append_io_request(gpu_first ? ssd_transient_requests[gpu_next++] : cpu_ssd_requests[cpu_next++]);
+            }
+        } else if (streaming_ssd) {
+            // Keep each consumer's request order while sharing the eight
+            // ring credits. CPU reads start before the GPU backlog drains.
+            size_t gpu_next = 0, cpu_next = 0;
+            while (gpu_next < ssd_transient_requests.size() || cpu_next < cpu_ssd_requests.size()) {
+                for (int j = 0; j < 4 && gpu_next < ssd_transient_requests.size(); ++j) {
+                    append_io_request(ssd_transient_requests[gpu_next++]);
+                }
+                for (int j = 0; j < 4 && cpu_next < cpu_ssd_requests.size(); ++j) {
+                    append_io_request(cpu_ssd_requests[cpu_next++]);
+                }
+            }
+        } else {
+            // With no streamed GPU transients, only the CPU reads remain.
+            for (size_t i : ssd_transient_requests) { append_io_request(i); }
+            for (size_t i : cpu_ssd_requests) { append_io_request(i); }
+        }
+        if (streaming_ssd) {
+            for (size_t i : ssd_transient_requests) {
+                const auto & request = sink->requests[i];
+                const void * data[3] = {
+                    static_cast<const char *>(request.read_target[0]) + request.role[0].data_offset,
+                    static_cast<const char *>(request.read_target[1]) + request.role[1].data_offset,
+                    static_cast<const char *>(request.read_target[2]) + request.role[2].data_offset,
+                };
+                sink->vram.bind_prefill_ssd_transient(i, data, streaming_stage, sink);
+            }
+        }
+        sink->current.cache_misses = sink->io_requests.size();
+        sink->cache.stats.prefill_misses += sink->current.cache_misses;
+        batch->ram_experts = sink->current.cache_hits;
+        batch->ram_bytes = sink->current.cache_hit_bytes;
+        batch->ssd_experts = sink->io_requests.size();
+        const size_t route_count = size_t(batch->nslots) * size_t(batch->ntokens);
+        for (size_t route = 0; route < route_count; ++route) {
+            const int request = batch->route_request_index[route];
+            if (request < 0 || size_t(request) >= sink->requests.size()) { continue; }
+            const auto & source = sink->requests[size_t(request)];
+            if (source.vram_slot >= 0) { continue; }
+            if (source.cache_hit >= 0) { ++batch->ram_routes; }
+            else { ++batch->ssd_routes; }
+        }
+        if (ssd_transient_requests.empty()) {
+            sink->vram.launch_prefill(batch->quantized_input, batch->quantized_stride,
+                batch->f32_input, batch->f32_stride, batch->route_request_index, batch->weights,
+                batch->nslots, batch->ntokens, batch->activation);
         }
         {
             std::lock_guard<std::mutex> lock(sink->io_mutex);
@@ -3061,12 +3057,12 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
             if (!sink->io_requests.empty()) { sink->io_done = false; sink->io_job = true; }
         }
         sink->io_cv.notify_one();
-        if (batch && streaming_ssd && !ssd_transient_requests.empty()) {
+        if (streaming_ssd && !ssd_transient_requests.empty()) {
             sink->vram.launch_prefill(batch->quantized_input, batch->quantized_stride,
                 batch->f32_input, batch->f32_stride, batch->route_request_index, batch->weights,
                 batch->nslots, batch->ntokens, batch->activation);
         }
-        if (batch && !ssd_transient_requests.empty() && !streaming_ssd) {
+        if (!ssd_transient_requests.empty() && !streaming_ssd) {
             // launch_prefill() borrows the staging pointers until finish. Wait
             // for every selected read, then return only the I/O credits; never
             // expose recyclable ring storage to the asynchronous GPU worker.
@@ -3129,7 +3125,7 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
             const double compute_us = elapsed_us(compute_start);
             sink->current.compute_us += compute_us;
             // the grouped path's line, from the passes of the batched engine (a one-token pass is priced as decode)
-            if (batch) { sink->vram.observe_prefill_cpu(request.prefill_routes, compute_us); }
+            sink->vram.observe_prefill_cpu(request.prefill_routes, compute_us);
             if (sink->profile_enabled) { sink->current.compute_cpu_us += sink_thread_cpu_us() - cpu_start; }
             if (slot) {
                 std::lock_guard<std::mutex> lock(sink->io_mutex);
@@ -3144,57 +3140,53 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
             sink->current.wait_io_us += elapsed_us(wait_start);
             if (!sink->io_error.empty()) { throw std::runtime_error(sink->io_error); }
         }
-        if (batch && (batch->gpu_experts || !sink->vram.prefill_transient.empty())) {
+        if (batch->gpu_experts || !sink->vram.prefill_transient.empty()) {
             sink->vram.finish_prefill(batch->output, size_t(sink->latent), *batch);
         }
-        if (batch) {
-            sink->vram.calibrate_prefill(sink->current.compute_us, *batch, sink->current.read_bytes,
-                sink->current.io_us - sink->current.io_credit_wait_us, elapsed_us(start),
-                [&] { return sink->place_table(batch->ntokens, route_bytes); });
-        }
+        sink->vram.calibrate_prefill(sink->current.compute_us, *batch, sink->current.read_bytes,
+            sink->current.io_us - sink->current.io_credit_wait_us, elapsed_us(start),
+            [&] { return sink->place_table(batch->ntokens, route_bytes); });
         if (!sink->requests.empty()) {
             const auto & r = sink->requests.front();
             sink->vram.set_host_demand(sink->cache.pending_bytes(r.role[0].nbytes + r.role[1].nbytes + r.role[2].nbytes));
         }
-        if (batch) {
-            // CPU-consumed RAM leases were released immediately. Transient GPU
-            // sources remain leased until finish drained H2D and compute.
-            sink->cache.release_prefill_leases(sink->requests);
-            batch->ssd_bytes = sink->current.read_bytes;
-            std::fprintf(stderr,
-                "[kimi_cpu_prefill_sources] tensor=%s vram_experts=%llu vram_routes=%llu "
-                "ram_gpu_experts=%llu ram_gpu_routes=%llu ram_gpu_upload_bytes=%llu ram_gpu_upload_us=%.3f "
-                "ssd_gpu_candidates=%llu ssd_gpu_experts=%llu ssd_gpu_routes=%llu "
-                "ssd_gpu_upload_bytes=%llu ssd_gpu_upload_us=%.3f gpu_worker_us=%.3f "
-                "gpu_expert_us=%.3f gpu_read_wait_us=%.3f gpu_dma_us=%.3f gpu_upload_wait_us=%.3f ring_locked=%d "
-                "cold_admit_candidates=%llu cold_admit_experts=%llu "
-                "cold_admit_routes=%llu cold_admit_upload_bytes=%llu cold_admit_upload_us=%.3f "
-                "ram_experts=%llu ram_routes=%llu ram_bytes=%llu "
-                "ssd_experts=%llu ssd_routes=%llu ssd_bytes=%llu ssd_read_us=%.1f\n",
-                up->name, (unsigned long long) batch->gpu_experts,
-                (unsigned long long) batch->gpu_routes,
-                (unsigned long long) batch->gpu_transient_experts,
-                (unsigned long long) batch->gpu_transient_routes,
-                (unsigned long long) batch->gpu_transient_upload_bytes,
-                batch->gpu_transient_upload_us,
-                (unsigned long long) batch->gpu_ssd_transient_candidates,
-                (unsigned long long) batch->gpu_ssd_transient_experts,
-                (unsigned long long) batch->gpu_ssd_transient_routes,
-                (unsigned long long) batch->gpu_ssd_transient_upload_bytes,
-                batch->gpu_ssd_transient_upload_us,batch->gpu_worker_us,
-                batch->gpu_expert_us,batch->gpu_read_wait_us,sink->vram.prefill_stats.transient_dma_us,
-                sink->vram.prefill_stats.transient_wait_us,int(sink->vram.ring_locked),
-                (unsigned long long) batch->gpu_cold_admit_candidates,
-                (unsigned long long) batch->gpu_cold_admit_experts,
-                (unsigned long long) batch->gpu_cold_admit_routes,
-                (unsigned long long) batch->gpu_cold_admit_upload_bytes,
-                batch->gpu_cold_admit_upload_us,
-                (unsigned long long) batch->ram_experts,
-                (unsigned long long) batch->ram_routes,
-                (unsigned long long) batch->ram_bytes, (unsigned long long) batch->ssd_experts,
-                (unsigned long long) batch->ssd_routes,
-                (unsigned long long) batch->ssd_bytes, sink->current.io_us - sink->current.io_credit_wait_us);
-        }
+        // CPU-consumed RAM leases were released immediately. Transient GPU
+        // sources remain leased until finish drained H2D and compute.
+        sink->cache.release_prefill_leases(sink->requests);
+        batch->ssd_bytes = sink->current.read_bytes;
+        std::fprintf(stderr,
+            "[kimi_cpu_prefill_sources] tensor=%s vram_experts=%llu vram_routes=%llu "
+            "ram_gpu_experts=%llu ram_gpu_routes=%llu ram_gpu_upload_bytes=%llu ram_gpu_upload_us=%.3f "
+            "ssd_gpu_candidates=%llu ssd_gpu_experts=%llu ssd_gpu_routes=%llu "
+            "ssd_gpu_upload_bytes=%llu ssd_gpu_upload_us=%.3f gpu_worker_us=%.3f "
+            "gpu_expert_us=%.3f gpu_read_wait_us=%.3f gpu_dma_us=%.3f gpu_upload_wait_us=%.3f ring_locked=%d "
+            "cold_admit_candidates=%llu cold_admit_experts=%llu "
+            "cold_admit_routes=%llu cold_admit_upload_bytes=%llu cold_admit_upload_us=%.3f "
+            "ram_experts=%llu ram_routes=%llu ram_bytes=%llu "
+            "ssd_experts=%llu ssd_routes=%llu ssd_bytes=%llu ssd_read_us=%.1f\n",
+            up->name, (unsigned long long) batch->gpu_experts,
+            (unsigned long long) batch->gpu_routes,
+            (unsigned long long) batch->gpu_transient_experts,
+            (unsigned long long) batch->gpu_transient_routes,
+            (unsigned long long) batch->gpu_transient_upload_bytes,
+            batch->gpu_transient_upload_us,
+            (unsigned long long) batch->gpu_ssd_transient_candidates,
+            (unsigned long long) batch->gpu_ssd_transient_experts,
+            (unsigned long long) batch->gpu_ssd_transient_routes,
+            (unsigned long long) batch->gpu_ssd_transient_upload_bytes,
+            batch->gpu_ssd_transient_upload_us,batch->gpu_worker_us,
+            batch->gpu_expert_us,batch->gpu_read_wait_us,sink->vram.prefill_stats.transient_dma_us,
+            sink->vram.prefill_stats.transient_wait_us,int(sink->vram.ring_locked),
+            (unsigned long long) batch->gpu_cold_admit_candidates,
+            (unsigned long long) batch->gpu_cold_admit_experts,
+            (unsigned long long) batch->gpu_cold_admit_routes,
+            (unsigned long long) batch->gpu_cold_admit_upload_bytes,
+            batch->gpu_cold_admit_upload_us,
+            (unsigned long long) batch->ram_experts,
+            (unsigned long long) batch->ram_routes,
+            (unsigned long long) batch->ram_bytes, (unsigned long long) batch->ssd_experts,
+            (unsigned long long) batch->ssd_routes,
+            (unsigned long long) batch->ssd_bytes, sink->current.io_us - sink->current.io_credit_wait_us);
         if (sink->timeline_active) { sink->timeline_call[5] = ggml_time_us(); }
         sink->current.total_us = elapsed_us(start);
         sink->current.read_completions = sink->ring.completed() - completed_before;
@@ -3209,8 +3201,8 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
         // Stop new submissions and drain before returning, including an
         // unexpected exception in a consumer. No user buffer may outlive I/O.
         sink->cancel_and_wait();
-        if (batch) { sink->vram.cancel_prefill(); }
-        if (batch) { sink->cache.release_prefill_leases(sink->requests); }
+        sink->vram.cancel_prefill();
+        sink->cache.release_prefill_leases(sink->requests);
         sink->cache.release();
         if (sink->timeline_active) { sink->timeline_call[5] = ggml_time_us(); }
         sink->current.total_us = elapsed_us(start);
@@ -3225,25 +3217,6 @@ static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,
         } else { sink_error(error, error_size, e.what()); }
         return false;
     }
-}
-
-bool kimi_cpu_sink_stream(struct kimi_cpu_sink * sink,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate,
-        const struct ggml_tensor * down, const int32_t * ids, int nexperts,
-        kimi_cpu_sink_consumer_fn consumer, void * userdata,
-        struct kimi_cpu_sink_stats * stats, char * error, size_t error_size) {
-    return kimi_cpu_sink_stream_impl(sink, up, gate, down, ids, nexperts, nullptr,
-            consumer, userdata, stats, error, error_size);
-}
-
-bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate,
-        const struct ggml_tensor * down, const int32_t * ids, int nexperts,
-        struct kimi_cpu_sink_prefill_batch * batch,
-        kimi_cpu_sink_consumer_fn consumer, void * userdata,
-        struct kimi_cpu_sink_stats * stats, char * error, size_t error_size) {
-    return kimi_cpu_sink_stream_impl(sink, up, gate, down, ids, nexperts, batch,
-            consumer, userdata, stats, error, error_size);
 }
 
 extern "C" struct kimi_cpu_sink * kimi_cpu_sink_create(

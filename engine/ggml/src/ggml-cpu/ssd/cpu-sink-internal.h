@@ -70,11 +70,6 @@ void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,
         kimi_cpu_sink_parallel_fn function, void * userdata);
 void kimi_cpu_sink_parallel_last(struct kimi_cpu_sink * sink,
         kimi_cpu_sink_parallel_fn function, void * userdata);
-bool kimi_cpu_sink_stream(struct kimi_cpu_sink * sink,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate,
-        const struct ggml_tensor * down, const int32_t * ids, int nexperts,
-        kimi_cpu_sink_consumer_fn consumer, void * userdata,
-        struct kimi_cpu_sink_stats * stats, char * error, size_t error_size);
 bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         const struct ggml_tensor * up, const struct ggml_tensor * gate,
         const struct ggml_tensor * down, const int32_t * ids, int nexperts,
