@@ -56,15 +56,33 @@ identities are replaced with the exact new identities. When the impact plan
 requires performance, both base and candidate are exported and built. Both sides
 use the same reviewed model/settings/resource values and unchanged prompt bytes;
 settings payload hashes must match their declarations.
-Each benchmark declares its timed `argv` and an explicit `preflight_argv`. They
-differ only in the single `--ssd-telemetry` destination, using distinct canonical
-files in that side's private scratch directory. Every other argument remains
-identical. Each timed run is a fresh server, so the controller gives run k of a
-side its own event file by inserting `-r<k>` before `.jsonl` in the timed name
-(for example `deepseek-benchmark-512-r2.jsonl`); it refuses a derived name that
-equals the preflight or functional event file. Existing events are retained; the
-telemetry writer's exclusive-create contract is preserved. An identical
-functional launch can supply the short preflight without another request.
+
+Server launches are not written into the template: each side resolves them on
+the device with its own `inferssd launch` (see
+[performance acceptance](PERFORMANCE.md#launches)). Every model of both sides
+carries the same `launch` request, exactly `{"profile", "context", "batch",
+"ubatch", "port", "extra"}` (the launcher's model profile, its context and batch
+sizes, the server port and extra server arguments, which the side's launcher
+checks like a user's). Its `smoke` and `benchmarks` entries keep the
+environment, working directory, deadlines and OS-cache treatment, and carry no
+`argv`, `preflight_argv` or `port`. The reviewed settings payload sets only
+`expert.source`; the device refuses a resolution whose settings file sets any
+other key, because the strategy derives those or the engine decides them. The
+template's `host.resources` is the machine policy the launches take: its memory
+budget is the runtime policy's budget, and its CPU set and the device lock bind
+every stage as before. Templates must build the probes that `inferssd profile`
+runs: `inferssd-cpuprobe` and `inferssd-ssdprobe`, plus `inferssd-memprobe` on
+the CUDA devices.
+
+Each server gets the resolved argv with its own event file in the side's launch
+directory: the functional request and the short preflight of a tier use
+`native-events-preflight-<tier>.jsonl`, timed run k uses
+`native-events-<tier>-r<k>.jsonl`, and a functional request of a model without
+timed runs keeps the launcher's own `native-events.jsonl`. The controller refuses a timed name that
+equals the preflight or functional event file. Existing events are retained;
+the telemetry writer's exclusive-create contract is preserved. The functional
+launch is the first tier's preflight launch, so it supplies that preflight
+without another request when the two entries' other fields match.
 
 Prepare a reviewable package without connecting to a device:
 
@@ -88,7 +106,9 @@ run to the declared devices and the 512-tier performance comparison.
 Each required executed model runs decode 256 three times on the candidate and
 once on the base, in the order candidate, base, candidate, candidate; the sealed
 `performance_protocol` records that order, and the Linux stage allowlist
-contains one `<side>-<model>-r<k>-benchmark-<tier>` stage per run. 4K and omitted devices' requirements remain explicit coverage
+contains one `<side>-<model>-r<k>-benchmark-<tier>` stage per run, one
+`machine-profile` stage for the side built first and one `<side>-<model>-launch`
+stage per resolved launch, both running `/usr/bin/python3`. 4K and omitted devices' requirements remain explicit coverage
 gaps. Envelopes prepared with the older
 `--validation-mode functional-numerical` keep that meaning. The complete workflow input must fit
 60 KiB; exceeding that bound refuses without truncation. The report cannot claim
@@ -106,8 +126,9 @@ Mac profiles use `broker_device: "mac-m5-max"` and a pinned `machine_identity`
 with the SHA256 of the uppercase hardware UUID, hardware model and CPU brand,
 rather than a CUDA GPU UUID. The actual executor resources are exactly
 `max_processes`, `memory_budget_bytes` and `host_reserve_bytes`. These are sampled
-guards, without a hard UMA or swap limit. Keep each side's original cache/thread
-configuration explicit; the same model files and typed values apply to both sides.
+guards, without a hard UMA or swap limit. The memory budget is also the launch
+strategy's budget, from which it derives the Mac `host.budget_mib`; the same
+model files and launch request apply to both sides.
 
 Mac staging uses the pinned Xcode Python with `-I -B` and the fixed
 `/Library/InferSSD-CI/controller/current/bench/ci/operator_mac_stage.py` path.

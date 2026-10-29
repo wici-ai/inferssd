@@ -24,7 +24,8 @@ The impact plan selects models and checks. Reviewed execution profiles may selec
 cloud-5090, dgx-spark and local-mbp; each omitted device stays explicitly deferred.
 Required performance uses the fixed 512-token CI prompt
 (`bench/prompts/prompt-512.txt`) and decode 256: three PR runs and one base run
-(PR, base, PR, PR) on the same device/model/settings, decided against the base
+(PR, base, PR, PR) on the same device, model and launch request, each side
+launching with the settings its own strategy derives, decided against the base
 commit's baseline history on that device (see
 [performance acceptance](PERFORMANCE.md)). It does not add 4K or formal benchmark
 samples. Functional-only success cannot satisfy a required performance comparison.
@@ -129,7 +130,8 @@ freedom after adding them. Device
 deferrals and full impact coverage are reported separately from each execution scope.
 The `selected-aggregate-RUN-ATTEMPT` artifact contains `aggregate.json`;
 `selected-control-RUN-ATTEMPT` retains every run's raw requests, timestamps,
-settings/source/prompt identities, observations and cleanup evidence.
+machine profile, derived launches, settings/source/prompt identities,
+observations and cleanup evidence.
 
 These request metrics exclude model/vocabulary loading before server readiness.
 Each profile establishes only its own hardware, models, resource constraints and

@@ -157,8 +157,12 @@ base commit was measured four times before, by the baseline job the operator
 runs for every new `main` commit. The impact plan adds
 4K/256 only for DeepSeek compressed long-context changes; the review operator
 runs the 512 tier and reports any required 4K cell as a coverage gap. Both
-builds precede timing. The same model shards, toolchain, templates, typed
-settings and resource policy are required. Raw SSE, input IDs, image hashes,
+builds precede timing. Each job profiles the machine once with `inferssd
+profile`, and each side starts its servers the way `inferssd launch` does: its
+own launch strategy derives the settings and thread pools from that one machine
+profile, the model's GGUF header and the job's memory budget, and the report
+shows what the PR's launch sets differently. The same model shards, toolchain,
+templates, launch request and resource policy are required. Raw SSE, input IDs, image hashes,
 CTest XML and cleanup are revalidated for every run, including the broker
 receipt. Missing, failed or partial data cannot pass.
 
@@ -168,7 +172,7 @@ the log scale with the base estimate (the base commit's history and the in-run
 base), against a threshold from the noise of the device's baseline history. A
 cell is `regressed` when a metric is slower beyond that threshold and every
 candidate run is slower; `needs-review` when the candidate runs disagree,
-generated tokens differ, the base has no history under the measured conditions,
+generated tokens differ, the base has no history for this machine, OS, model and template,
 the in-run base differs from its history or the host check flagged a run;
 otherwise `passed`. A metric faster beyond the threshold is labelled `improved`
 without changing the status. Invalid evidence is `failed`. A pass means no

@@ -3,9 +3,12 @@
 The reference and candidate are built once from the pinned plan on the **same
 physical device**. A result from another machine, even one with the same GPU
 model, cannot serve as the reference. Both sides need the same model shards,
-prompt/template, actual settings, CPU/GPU placement, memory/cache/resource
-budgets, toolchain and recorded OS-cache treatment. Direct GGUF and unrestricted H2D remain mandatory. The protected broker
-owns source/build/observation evidence; candidate output cannot certify itself.
+prompt/template, launch request, machine characteristics, memory and resource
+budgets, toolchain and recorded OS-cache treatment. Each side's settings, thread
+pools and server arguments are derived by that side's own launch strategy, as
+described in [launches](#launches). Direct GGUF and unrestricted H2D remain
+mandatory. The protected broker owns source/build/observation evidence;
+candidate output cannot certify itself.
 
 ## Runs
 
@@ -23,6 +26,51 @@ request/template IDs, the runtime receipt and cleanup, and checks that the runs
 ran in the declared order on one clock, each on its own server, under equal
 measured conditions. The controller binds the enclosing artifact to the current
 run/attempt, reviewed source identities and reviewed device config.
+
+## Launches
+
+Every server is started the way `inferssd launch` starts it on a user's machine.
+Before either side's first server, the job runs `inferssd profile` once on the
+device, with the framework and probes of the side built first (the base in a PR
+job, the measured commit in a baseline job), before any PR code has run. It
+measures every section afresh and writes the characteristics file in the
+framework's own format at `/scratch/machine/machine.json` in the job's Linux
+sandbox (`work/machine/machine.json` under the Mac job root). The controller
+keeps the file as the stage printed it and records its SHA-256 and the status
+of each section; a section that failed is reported and left out, as a user's
+launch leaves it out.
+
+Then each side resolves each model's launch with its own framework: `inferssd
+launch --dry-run --machine` that file, with the runtime facts (usable CPUs and
+GPUs, available memory, the drive holding the model) read in the sandbox by the
+side's own code, the model's GGUF header and the job's memory budget as the
+runtime policy. The broker runs the server stage in its own resource scope, so
+the launcher's checks for a scope of its own are stated rather than probed. The
+resolution must name the job's characteristics hash and run the side's own
+server with its generated settings file. The broker then starts exactly the
+resolved argv for the functional request, the short preflight and every timed
+run; only the event file differs per server. A PR that changes the strategy is
+therefore measured with the settings it derives.
+
+The reviewed launch request (model profile, context, batch sizes, port and any
+extra server arguments) and its settings file are the same for both sides. The
+settings file sets only `expert.source`: everything the strategy chooses
+(thread pools, CPU placement, placement cost priors, the VRAM budget when no GPU
+is usable, the Mac memory budget) is derived, and everything it leaves alone
+(the RAM cache size, the VRAM tier in automatic mode, the read backend, the
+prefill route and numerics) stays at its default, decided by the engine. A
+resolution in which the settings file sets anything else is refused.
+
+Each run's receipt records its side's derived launch: every setting with its
+value and origin (`strategy` with the strategy's reason, `launcher` for a
+registry default or the launcher's model profile, `user` for the reviewed
+settings file), the thread pools, the strategy's server arguments and the argv.
+The receipts of one side must agree. The comparison then allows the derived
+settings and argv to differ between the sides and still requires the same model
+files, machine and characteristics, template, prompt, launch request, token
+budget, resources, OS-cache treatment and loaded-library set. The cell lists
+what the PR's launch sets differently, and the summary shows both sides' thread
+pools and every changed setting.
 
 Five metrics are measured:
 
@@ -43,13 +91,17 @@ with one completion, after the same short preflight requests. Jobs run one at a
 time in the order they were queued, so a PR queued after a merge normally finds
 its base already measured. Each clean cell of a baseline job becomes a record in
 the device's baseline history: the four values of every metric, their natural
-logs, the generated-token hash, the measured conditions, the job and run IDs,
+logs, the generated-token hash, the history conditions, the job and run IDs,
 the build identity and the date. A cell whose runs produced different tokens,
 or whose Mac host check flagged a run, is reported and not recorded.
 
 The history lives in the `baseline-history` directory next to the reviewed
 device profiles (`inputs.json`) on the preparation host, one read-only file per
-device, model, tier, commit and measured conditions.
+device, model, tier, commit and history conditions. The history conditions are
+the machine's hardware identity, its OS, the model files and the chat template.
+Settings are not part of them: each commit derives its own launch, so the
+history of `main` stays usable for a PR whose strategy derives different
+settings.
 [history.py](history.py) lists, verifies and prunes it:
 
 ```sh
@@ -72,7 +124,7 @@ one metric of one cell:
 - `h` is the mean of the base commit's four history runs (`n_h = 4`), `a` the
   in-run base, and `c̄` the mean of the three candidate runs.
 - `σ` is the pooled within-commit standard deviation of every history record of
-  that device, model and tier under the same measured conditions:
+  that device, model and tier under the same history conditions:
   `σ² = Σ_c Σ_i (x_ci − x̄_c)² / Σ_c (n_c − 1)`, with `df = Σ_c (n_c − 1)`
   degrees of freedom. One record gives `df = 3`; each new main commit adds 3.
 - `t` is the one-sided Student-t quantile for `df` whose upper tail equals a
@@ -93,12 +145,12 @@ compared and shown for information only.
 
 | Result | Meaning | Check behavior |
 | --- | --- | --- |
-| `passed` | For every deciding metric `d ≤ T`, the generated tokens are identical in every run and in the base history, the history matches the measured conditions, the in-run base agrees with its history and the host check flagged nothing. | Passes. It means no slowdown beyond measured noise, not proof that none exists. |
+| `passed` | For every deciding metric `d ≤ T`, the generated tokens are identical in every run and in the base history, the history matches the history conditions, the in-run base agrees with its history and the host check flagged nothing. | Passes. It means no slowdown beyond measured noise, not proof that none exists. |
 | `regressed` | Some deciding metric has `d > T` and every candidate run is slower than `b`. | Blocks acceptance. Any other review reasons are listed with it. |
-| `needs-review` | A deciding metric has `d > T` but the candidate runs disagree; a generated token sequence differs (among the runs or from the base history); the base has no history under the measured conditions; the in-run base differs from its history; or the Mac host check flagged a run. | Blocks acceptance until a person reviews the evidence. |
+| `needs-review` | A deciding metric has `d > T` but the candidate runs disagree; a generated token sequence differs (among the runs or from the base history); the base has no history under the history conditions; the in-run base differs from its history; or the Mac host check flagged a run. | Blocks acceptance until a person reviews the evidence. |
 | `failed` | Missing or invalid evidence, mismatched conditions, incomplete cleanup or a failed run. | Blocks acceptance; fix the evidence or implementation first. |
 
-Without base history under the measured conditions no regression can be
+Without base history under the history conditions no regression can be
 established, so such a cell is `needs-review` even when it is clearly slower.
 The history covers the 512 tier of operator jobs only, so a 4096-tier cell, and
 any cell of a job prepared without the history (for example with
@@ -133,10 +185,11 @@ no decision; a job whose cells are all `baseline` succeeds.
 A `regressed` or `needs-review` cell is never cleared by a later run of the same
 candidate. A reviewer decides whether it shows a software regression or an
 identified environmental cause; a code fix is a new candidate with a new run.
-The measured conditions include the model files, settings, template, resource
-limits, OS and loaded libraries. When one of them changes, PR cells are
+When the machine, its OS, the model files or the template changes, PR cells are
 `needs-review` until the next main commit's baseline job measures the device
-under the new conditions.
+under the new history conditions. Resource limits, loaded libraries and the
+launch request are compared between the runs of a job instead; a difference
+there is invalid evidence.
 
 ## Base build cache
 
@@ -165,7 +218,10 @@ fixed amount:
 | local-mbp | about 12 min | about 11.2 min | about 57 min | under 57 min |
 
 A PR job whose base build comes from the cache saves one build. A baseline job
-runs every device at once, as one child job per device. All stay within the
+runs every device at once, as one child job per device. Each job also profiles
+the machine once (one to three minutes on a new machine, and at most about three
+minutes per model drive for the SSD probe; the stage is bounded at 30 minutes)
+and resolves each side's launches (seconds each). All stay within the
 120-minute device job limit, and every run stays far below the 7200-second Mac
 stage limit.
 

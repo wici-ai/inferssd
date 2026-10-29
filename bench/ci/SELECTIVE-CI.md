@@ -111,22 +111,30 @@ execution is used; see [GitHub's security guidance](https://docs.github.com/en/a
    uses the existing `staged_benchmark.benchmark` argv/environment/cwd/port,
    timeout_s/request_timeout_s and honest os_page_cache_treatment contract.
    Candidate targets and the read-only build's `image_relatives` must cover
-   every selected numerical executable. Both arms must use the same resource cap, placement,
-   model distribution, template and semantic typed settings. Native snapshots,
+   every selected numerical executable. Both arms must use the same resource cap,
+   model distribution and template. A model may instead carry a `launch` request
+   and no argv or port, as operator performance jobs must: each side then
+   resolves its launch on the device with its own `inferssd launch`, from one
+   `inferssd profile` of the machine per job, and its settings and thread pools
+   may differ from the other side's (see
+   [performance acceptance](PERFORMANCE.md#launches)). Native snapshots,
    real runtime image mappings and root-observed resources are checked.
    Before any selected 256-token request, every selected performance model/tier
    runs both sides' eight-token preflight with that performance arm's environment,
-   working directory and arguments. The operator pins a separate `preflight_argv`;
-   only the single private `--ssd-telemetry` file may differ from the timed argv,
+   working directory and arguments. The operator pins a separate `preflight_argv`
+   (a resolved launch gets one per tier); only the single private
+   `--ssd-telemetry` file may differ from the timed argv,
    and both destinations are distinct canonical files within that side's scratch
    directory. Timed run k of a side uses the timed file name with `-r<k>`
    inserted before `.jsonl`, so every fresh server owns its own event file, and
    each run has its own `<side>-<model>-r<k>-benchmark-<tier>` stage. A candidate functional smoke is reused only when its complete
    launch matches this preflight. Native typed snapshots, owned
    runtime images, resources and immutable inputs must compare equal for every
-   pair first. Missing declarations or exact root stage authorization refuse
-   before opening the lease. Timed arms retain their existing once-only checks
-   and must still match their successful short preflight; no request is retried.
+   pair first, apart from each side's derived launch. Missing declarations or
+   exact root stage authorization refuse before opening the lease; a derived
+   launch is checked completely once both sides have resolved it. Timed arms
+   retain their existing once-only checks and must still match their successful
+   short preflight; no request is retried.
 5. `python3 -I bench/ci/stage_selection.py --template template.json --manifest
    manifest.json --plan plan.json --policy bench/ci/policy.json --output fresh`
    produces three reviewable local files only. The generator derives the Linux
