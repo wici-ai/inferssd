@@ -710,7 +710,10 @@ struct tier {
         if(!freed)return -1;
         *freed=0;
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
-        if(!elastic_active || !reclaimer_armed || poisoned)return poisoned?-1:0;
+        // On unified memory every allocation comes out of the DRAM the tier holds, whatever the phase: its blocks answer
+        // any that would fail while no layer holds them. A discrete GPU gives them back only while a phase armed the
+        // reclaimer (a prefill's reserve).
+        if(!elastic_active || poisoned || (!reclaimer_armed && !unified))return poisoned?-1:0;
         // A live layer holds its slots: the allocation fails as it would without the tier. Deferred uploads alone do
         // not stop a reclaim (reclaim_last_block waits for them and aborts the ones in the freed block).
         if(busy()){
@@ -1099,12 +1102,8 @@ struct tier {
         }
         epoch=e;token=t;active=decode;
         if(next_token){
-            if(unified && elastic_active){
-                // Device allocations of a decode step come out of the same DRAM (graph and pool growth): arm the
-                // reclaimer at every token, and give blocks back first if the floor or the demand grew.
-                {std::lock_guard<std::mutex> lock(lifecycle_mutex);reclaimer_armed=!poisoned;}
-                reclaim_host(0,"floor");
-            }
+            // Give blocks back first if the floor or the demand grew.
+            if(unified && elastic_active)reclaim_host(0,"floor");
             grow_after_first_token();watermark_tick();finish_host_probe();allocate_host_scratch();start_host_probe();update_admission();
         }
         if(decode)adopt_next_decode=false;

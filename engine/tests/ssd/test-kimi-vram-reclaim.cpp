@@ -13,7 +13,8 @@
 //    copying instead of skipping; a demand rise at a token boundary gives blocks back while an upload into them is
 //    in flight, and collect reports that upload as aborted;
 //  - with the host-memory ledger's envelope (a cgroup memory.max) tighter than the modeled DRAM: the ledger counts
-//    the tier's storage, which the cgroup does not charge, so auto grows to the envelope less the RAM cache's demand.
+//    the tier's storage, which the cgroup does not charge, so auto grows to the envelope less the RAM cache's demand;
+//    a tier no phase armed gives a block back to an allocation that would fail.
 // Shared lifecycle assertions use the retained explicit Q4_K format engine.
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
@@ -129,7 +130,7 @@ int main() {
         t.begin(52, 1, true);
         lifecycle_prepare(t,&g, 1,&slot);
         require(t.elastic_active && t.blocks.size() == 1 && t.table->admissions[0] >= 0, "reclaim fixture has no admission");
-        t.reclaimer_armed = true; // armed at every decode token on unified memory
+        t.reclaimer_armed = true; // a prefill arms it on a discrete GPU; unified memory reclaims in any phase
         size_t freed = 0;
         require(t.reclaim_one(4096, &freed) == 0 && !freed && !t.poisoned && t.blocks.size() == 1 && t.live_reclaim_refusals == 1,
                 "a reclaim inside a live layer was not refused cleanly");
@@ -282,7 +283,8 @@ int main() {
         modeled = nullptr;
     }
     // The envelope binds before the modeled DRAM: the ledger counts the tier's storage in it, so auto grows to the
-    // envelope less the RAM cache's demand (30 slots) although MemAvailable has room for the slot cap (40).
+    // envelope less the RAM cache's demand (30 slots) although MemAvailable has room for the slot cap (40); a tier no
+    // phase armed (a load-time reserve, a disarmed prefill) still gives a block back to an allocation that would fail.
     {
         envelope_files files;
         const uint64_t reserve = uint64_t(512) << 20;
@@ -307,6 +309,11 @@ int main() {
         require(t.grow_events == 1 && t.slot_locations.size() == 30 && client->state().value.device_held == 30 * stride &&
                 bool(room) && room.value.cgroup_surplus >= demand && model_free() > floor + demand + 20 * stride,
                 "auto did not grow to the envelope less the RAM cache's demand");
+        t.reclaimer_armed = false;
+        size_t freed = 0;
+        require(t.reclaim_one(4096, &freed) == 1 && freed == 14 * stride && t.slot_locations.size() == 16 &&
+                client->state().value.device_held == 16 * stride && !t.poisoned,
+                "an unarmed tier did not give a block back on unified memory");
         modeled = nullptr;
     }
     std::printf("REAL_CUDA_VRAM_RECLAIM_PASS assertions=%d unified=%d\n", assertions, int(unified));
