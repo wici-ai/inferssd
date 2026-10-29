@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import posixpath
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Optional, cast
 
-from inferssd.configuration.settings import Setting, Snapshot, parse, render, uncomment
+from inferssd.configuration.settings import PLATFORMS, Setting, Snapshot, parse, render, uncomment
 from inferssd.launch.darwin import MODEL_OPTIONS, PROFILES
 from inferssd.launch.resources import EngineResources
 from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
@@ -106,8 +107,10 @@ def _resolve(
     configured: Optional[Snapshot],
 ) -> None:
     reject_legacy_environment(s.env)
-    if platform not in ("linux", "darwin") or s.inputs.profile not in PROFILES:
-        raise ValueError("production launch requires linux/darwin and profile dsv/muse")
+    if platform not in PLATFORMS:
+        raise ValueError("unknown launch platform " + platform)
+    if s.inputs.profile not in PROFILES:
+        raise ValueError("unknown model profile; choose " + ", ".join(PROFILES))
     if s.inputs.mode != "server":
         raise ValueError("owned typed launch currently supports server mode")
     if not 1 <= spec.port <= 65535 or min(spec.context, spec.batch, spec.ubatch) < 1:
@@ -200,22 +203,24 @@ def _resolve(
             name = name.replace("_", "-")  # the server's long option spelling
         if name in protected or name.startswith(("--ssd-",) + glued):
             raise ValueError("model, listener and SSD settings use explicit typed launch options")
-    expected = "Linux" if platform == "linux" else "Darwin"
+    expected = {"linux": "Linux", "darwin": "Darwin", "windows": "Windows"}[platform]
     if (
         s.text("platform_system") != expected
         or platform == "darwin"
         and s.text("platform_machine") != "arm64"
     ):
         raise ValueError("launch platform differs from the observed host")
+    # Host paths follow the launch platform's conventions, wherever this resolver runs.
+    os_path = ntpath if platform == "windows" else posixpath
     model = s.text("resolved_path", spec.model)
-    match = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", posixpath.basename(model))
+    match = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", os_path.basename(model))
     paths = [model]
     if match:
         prefix, first, count = match.groups()
         if first != "00001" or not 1 <= int(count) <= 100000:
             raise ValueError("--model must name the first GGUF shard")
         paths = [
-            posixpath.join(posixpath.dirname(model), f"{prefix}-{i:05d}-of-{count}.gguf")
+            os_path.join(os_path.dirname(model), f"{prefix}-{i:05d}-of-{count}.gguf")
             for i in range(1, int(count) + 1)
         ]
     for path in paths:
@@ -227,12 +232,13 @@ def _resolve(
     binary_path = spec.binary or (resources.binary if resources else None)
     if not binary_path and s.inputs.repo:
         # Preset build directories first, then the conventional ad hoc ones.
-        builds = (
-            ("build-macos-metal", "build-mac", "build")
-            if platform == "darwin"
-            else ("build-linux-cuda", "build-linux-cpu", "build")
-        )
-        candidates = [s.inputs.repo + "/" + name + "/bin/inferssd-server" for name in builds]
+        builds = {
+            "linux": ("build-linux-cuda", "build-linux-cpu", "build"),
+            "darwin": ("build-macos-metal", "build-mac", "build"),
+            "windows": ("build-x64-windows-llvm-release", "build"),
+        }[platform]
+        server = "inferssd-server.exe" if platform == "windows" else "inferssd-server"
+        candidates = [os_path.join(s.inputs.repo, name, "bin", server) for name in builds]
         binary_path = next((c for c in candidates if s.value("is_file", c)), candidates[0])
     if not binary_path:
         raise ValueError("provide --binary or an engine resource descriptor")
@@ -241,7 +247,8 @@ def _resolve(
         raise ValueError("missing server executable: " + binary)
     template_path = spec.template or (resources.template(s.inputs.profile) if resources else None)
     if not template_path and s.inputs.repo:
-        template_path = s.inputs.repo + "/engine/models/templates/" + PROFILES[s.inputs.profile][1]
+        bundled = PROFILES[s.inputs.profile][1]
+        template_path = os_path.join(s.inputs.repo, "engine", "models", "templates", bundled)
     if not template_path:
         raise ValueError("provide --template or an engine resource descriptor")
     template = s.text("resolved_path", template_path)
@@ -274,7 +281,7 @@ def _resolve(
     if not value.at("expert.source").value:
         if value.at("expert.source").origin != "default":
             raise ValueError("typed launch requires a nonempty explicit expert.source")
-        artifacts = spec.artifact_directory or directory + "/artifacts"
+        artifacts = spec.artifact_directory or os_path.join(directory, "artifacts")
         s.ask("mkdir", artifacts)
         alias = s.text("gguf_alias", artifacts, *paths)
         selected = Setting(
@@ -325,8 +332,8 @@ def _resolve(
     participants = cast(int, value.at("cpu.decode_participants").value)
     if threads.decode is not None and participants > threads.decode:
         raise ValueError("cpu.decode_participants exceeds the decode thread count")
-    settings = directory + "/settings.ssd"
-    telemetry = directory + "/native-events.jsonl"
+    settings = os_path.join(directory, "settings.ssd")
+    telemetry = os_path.join(directory, "native-events.jsonl")
     s.ask("write_exclusive", settings, materialized_settings(value))
     command = [binary, "-m", model, "--ssd-settings", settings, "--ssd-telemetry", telemetry]
     for item in value.entries:
@@ -384,6 +391,9 @@ def _resolve(
                 "MemorySwapMax=0",
             ]
         )
+    # Elsewhere Flash Attention keeps the server's auto choice, on for each layer
+    # whose device runs it (every CPU layer), and the settings' host.budget_mib,
+    # passed as given, bounds the process in place of a scope.
     command += list(s.inputs.extra)
     s.argv = command
     s.emit(

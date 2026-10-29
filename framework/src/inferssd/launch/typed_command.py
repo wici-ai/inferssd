@@ -12,7 +12,7 @@ from dataclasses import asdict
 from functools import partial
 from pathlib import Path
 
-from inferssd.configuration.settings import cpus
+from inferssd.configuration.settings import PLATFORMS, cpus, host_platform
 from inferssd.launch.prepare import prepare
 from inferssd.launch.recorded import RecordedArtifacts, run_indexer
 from inferssd.launch.resources import read_resources
@@ -30,10 +30,7 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     mode.add_argument("--execute", action="store_true")
     mode.add_argument("--dry-run", action="store_true")
     launch.add_argument(
-        "--platform",
-        choices=("linux", "darwin"),
-        default="darwin" if sys.platform == "darwin" else "linux",
-        help="defaults to this host",
+        "--platform", choices=PLATFORMS, default=host_platform(), help="defaults to this host"
     )
     launch.add_argument("--repo", type=Path, help="optional development checkout adapter")
     launch.add_argument("--resources", type=Path, help="inferssd-engine 1 deployment descriptor")
@@ -116,6 +113,11 @@ def default_output_directory() -> Path:
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.execute and args.platform == "windows":
+        # The owned process, its lock lease and its resource sampling are POSIX.
+        raise ValueError(
+            "owned execution supports linux and darwin; prepare a windows launch with --dry-run"
+        )
     launch_input = inputs(args)
     if args.output_dir is None:
         args.output_dir = default_output_directory()

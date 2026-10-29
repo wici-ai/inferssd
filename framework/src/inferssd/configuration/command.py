@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from pathlib import Path
 
-from inferssd.configuration.settings import PLATFORMS, parse, render, schema
+from inferssd.configuration.settings import PLATFORMS, host_platform, parse, render, schema
 
 
 def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -16,7 +15,7 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     config.add_argument(
         "--platform",
         choices=PLATFORMS,
-        default={"darwin": "darwin", "win32": "windows"}.get(sys.platform, "linux"),
+        default=host_platform(),
         help="defaults to this host",
     )
     config.add_argument("--input", type=Path)

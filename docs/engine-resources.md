@@ -5,7 +5,8 @@ to bind one deployment, or provide both `--binary` and `--template`. The optiona
 `--repo` adapter uses `engine/models/templates/` in a development checkout and
 the first `bin/inferssd-server` it finds under the preset build directory
 (`build-linux-cuda`, then `build-linux-cpu` on Linux; `build-macos-metal` on
-Darwin), then under `build-mac` (Darwin only) or `build`.
+Darwin; `build-x64-windows-llvm-release` on Windows, where the server is
+`bin\inferssd-server.exe`), then under `build-mac` (Darwin only) or `build`.
 
 A descriptor is ordinary JSON. Relative paths resolve against its own directory:
 
@@ -27,8 +28,8 @@ A descriptor is ordinary JSON. Relative paths resolve against its own directory:
 }
 ```
 
-Use `darwin` for an Apple Silicon deployment. `--binary` and `--template` override
-those individual descriptor paths. Missing selected resources or incompatible
+Use `darwin` for an Apple Silicon deployment and `windows` for a Windows one.
+`--binary` and `--template` override those individual descriptor paths. Missing selected resources or incompatible
 contract versions fail before engine startup. The descriptor is an operator's
 explicit deployment contract, not a claim that untrusted binaries were verified.
 Normal process ownership, memory policy and runtime evidence checks still apply.

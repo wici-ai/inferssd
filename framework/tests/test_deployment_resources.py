@@ -72,3 +72,15 @@ def test_incompatible_capabilities_refuse_before_preparation(tmp_path, capabilit
     with pytest.raises(ValueError):
         read_resources(path)
     assert not list(out.iterdir())
+
+
+def test_windows_descriptor_binds_only_a_windows_launch(tmp_path):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    path = descriptor(tmp_path, spec)
+    value = json.loads(path.read_text())
+    value["capabilities"]["platform"] = "windows"
+    path.write_text(json.dumps(value))
+    resources = read_resources(path)
+    assert resources.platform == "windows"
+    with pytest.raises(ValueError, match="resource platform differs"):
+        resolve(inputs, replace(spec, binary=None, resources=resources), adapter, out)

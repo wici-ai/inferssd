@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
@@ -68,6 +69,11 @@ class Snapshot:
 
 
 PLATFORMS = ("linux", "darwin", "windows")
+
+
+def host_platform() -> str:
+    """The platform name of this host, the default of every platform option."""
+    return {"darwin": "darwin", "win32": "windows"}.get(sys.platform, "linux")
 
 
 def applies(prop: Mapping[str, Any], platform: str) -> bool:

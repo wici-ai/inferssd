@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from inferssd.configuration.settings import PLATFORMS
+
 
 @dataclass(frozen=True)
 class EngineResources:
@@ -36,7 +38,7 @@ def read_resources(path: Path) -> EngineResources:
     if capabilities.get("telemetry") != 1:
         raise ValueError("engine resources must declare telemetry version 1")
     platform = capabilities.get("platform")
-    if platform not in (None, "linux", "darwin"):
+    if platform is not None and platform not in PLATFORMS:
         raise ValueError("unsupported engine resource platform")
     revision = data.get("revision", "unknown")
     if not isinstance(revision, str) or not revision:

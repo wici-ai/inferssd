@@ -75,11 +75,12 @@ inferssd launch --dry-run --platform linux --repo . \
 ```
 
 Recorded host facts are consumed lazily without falling back to the current
-machine. Both platforms require `platform_system`; Darwin also requires
-`platform_machine=arm64`. Linux uses `cgroup_v2`, `euid`, and for non-root scope
-creation `user_manager` and `memory_controller`. GPU-enabled Linux settings also
-require `gpu_available` and empty `gpu_processes`. These observations do not
-certify native source formats, GPU kernels or real resource enforcement.
+machine. Every platform requires `platform_system` (`Linux`, `Darwin` or
+`Windows`); Darwin also requires `platform_machine=arm64`. Linux uses
+`cgroup_v2`, `euid`, and for non-root scope creation `user_manager` and
+`memory_controller`. GPU-enabled Linux settings also require `gpu_available`
+and empty `gpu_processes`. These observations do not certify native source
+formats, GPU kernels or real resource enforcement.
 
 The old Linux/Darwin resolvers and their recorded reference observations are
 retained behind `launch-recorded --dry-run`. They still describe the historical settings/env
@@ -332,9 +333,11 @@ borrowed-reference behavior.
 ## Explicit owned server execution
 
 `inferssd launch --execute` resolves typed Linux or Darwin inputs with lazy live
-host facts, then starts one supervised server. It requires an explicit
-policy and writes to a new run directory: `--output-dir`, or `runs/<UTC time>`
-under the current directory. The server listens on a loopback port:
+host facts, then starts one supervised server. On Windows, `--dry-run` prepares
+the server command; owned execution is not implemented there. Owned execution
+requires an explicit policy and writes to a new run directory: `--output-dir`,
+or `runs/<UTC time>` under the current directory. The server listens on a
+loopback port:
 
 ```sh
 inferssd launch --execute --platform linux --repo /path/to/inferssd \

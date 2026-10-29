@@ -1,0 +1,353 @@
+[
+  {
+    "case": {
+      "name": "linux-dsv",
+      "platform": "linux",
+      "profile": "dsv",
+      "repo": "/src/inferssd",
+      "model": "/models/DeepSeek-V4.1-00001-of-00002.gguf",
+      "shards": [
+        "/models/DeepSeek-V4.1-00001-of-00002.gguf",
+        "/models/DeepSeek-V4.1-00002-of-00002.gguf"
+      ],
+      "files": [
+        "/models/DeepSeek-V4.1-00001-of-00002.gguf",
+        "/models/DeepSeek-V4.1-00002-of-00002.gguf",
+        "/models/DeepSeek-V4.1.experts.tsv",
+        "/src/inferssd/build-linux-cuda/bin/inferssd-server",
+        "/src/inferssd/engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja"
+      ],
+      "settings_file": "/runs/settings-input.ssd",
+      "settings": "inferssd-settings 1\nexpert.source = [\"/models/DeepSeek-V4.1.experts.tsv\"]  # prepared index\nprefetch.depth = 4\n",
+      "overrides": [
+        [
+          "cpu.decode_participants",
+          "4"
+        ]
+      ],
+      "threads": {
+        "decode": 7,
+        "batch": 8,
+        "cpus": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ]
+      },
+      "directory": "/runs/dsv",
+      "host": {
+        "platform_system": "Linux",
+        "systemd": true,
+        "cgroup_v2": true,
+        "euid": 1000,
+        "user_manager": true,
+        "memory_controller": true,
+        "gpu_available": true,
+        "gpu_processes": ""
+      }
+    },
+    "argv": [
+      "/src/inferssd/build-linux-cuda/bin/inferssd-server",
+      "-m",
+      "/models/DeepSeek-V4.1-00001-of-00002.gguf",
+      "--ssd-settings",
+      "/runs/dsv/settings.ssd",
+      "--ssd-telemetry",
+      "/runs/dsv/native-events.jsonl",
+      "--ssd-cpu-decode-participants",
+      "4",
+      "--mmap",
+      "--no-repack",
+      "--fit",
+      "off",
+      "--no-warmup",
+      "-ngl",
+      "99",
+      "-c",
+      "8192",
+      "-b",
+      "512",
+      "-ub",
+      "512",
+      "-t",
+      "7",
+      "-tb",
+      "8",
+      "-C",
+      "0xff",
+      "-Cb",
+      "0xff",
+      "--cpu-strict",
+      "1",
+      "--cpu-strict-batch",
+      "1",
+      "--chat-template-file",
+      "/src/inferssd/engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8080",
+      "-np",
+      "1",
+      "--defer-experts",
+      "-fa",
+      "on"
+    ],
+    "scope": [
+      "systemd-run",
+      "--user",
+      "--scope",
+      "--quiet",
+      "--unit=inferssd-pending.scope",
+      "-p",
+      "MemoryMax=17179869184",
+      "-p",
+      "MemorySwapMax=0"
+    ],
+    "settings": {
+      "/runs/dsv/settings.ssd": "inferssd-settings 1\nexpert.source = [\"/models/DeepSeek-V4.1.experts.tsv\"]  # prepared index\nprefetch.depth = 4  # source=file; input=/runs/settings-input.ssd:3\nmodel.engram_prefetch = 1  # source=model; profile=dsv\nmodel.hc_fused = 1  # source=model; profile=dsv\n"
+    }
+  },
+  {
+    "case": {
+      "name": "linux-muse",
+      "platform": "linux",
+      "profile": "muse",
+      "repo": "/src/inferssd",
+      "model": "/models/muse-spark.gguf",
+      "shards": [
+        "/models/muse-spark.gguf"
+      ],
+      "files": [
+        "/models/muse-spark.gguf",
+        "/src/inferssd/build/bin/inferssd-server",
+        "/src/inferssd/engine/models/templates/muse-spark.jinja"
+      ],
+      "settings_file": null,
+      "settings": null,
+      "overrides": [],
+      "threads": {},
+      "directory": "/runs/muse",
+      "alias": "/runs/muse/artifacts/experts.tsv",
+      "host": {
+        "platform_system": "Linux",
+        "systemd": true,
+        "cgroup_v2": true,
+        "euid": 0,
+        "gpu_available": true,
+        "gpu_processes": ""
+      }
+    },
+    "argv": [
+      "/src/inferssd/build/bin/inferssd-server",
+      "-m",
+      "/models/muse-spark.gguf",
+      "--ssd-settings",
+      "/runs/muse/settings.ssd",
+      "--ssd-telemetry",
+      "/runs/muse/native-events.jsonl",
+      "--mmap",
+      "--no-repack",
+      "--fit",
+      "off",
+      "--no-warmup",
+      "-ngl",
+      "99",
+      "-c",
+      "8192",
+      "-b",
+      "512",
+      "-ub",
+      "512",
+      "--chat-template-file",
+      "/src/inferssd/engine/models/templates/muse-spark.jinja",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8080",
+      "-np",
+      "1",
+      "--defer-experts",
+      "-fa",
+      "on"
+    ],
+    "scope": [
+      "systemd-run",
+      "--scope",
+      "--quiet",
+      "--unit=inferssd-pending.scope",
+      "-p",
+      "MemoryMax=17179869184",
+      "-p",
+      "MemorySwapMax=0"
+    ],
+    "settings": {
+      "/runs/muse/settings.ssd": "inferssd-settings 1\nexpert.source = [\"/runs/muse/artifacts/experts.tsv\"]  # source=generated; input=complete GGUF shard/header validation\n"
+    }
+  },
+  {
+    "case": {
+      "name": "darwin-muse",
+      "platform": "darwin",
+      "profile": "muse",
+      "repo": "/opt/inferssd",
+      "model": "/Volumes/models/muse-spark-00001-of-00003.gguf",
+      "shards": [
+        "/Volumes/models/muse-spark-00001-of-00003.gguf",
+        "/Volumes/models/muse-spark-00002-of-00003.gguf",
+        "/Volumes/models/muse-spark-00003-of-00003.gguf"
+      ],
+      "files": [
+        "/Volumes/models/muse-spark-00001-of-00003.gguf",
+        "/Volumes/models/muse-spark-00002-of-00003.gguf",
+        "/Volumes/models/muse-spark-00003-of-00003.gguf",
+        "/opt/inferssd/build-macos-metal/bin/inferssd-server",
+        "/opt/inferssd/engine/models/templates/muse-spark.jinja"
+      ],
+      "settings_file": "/opt/inferssd/settings.ssd",
+      "settings": "inferssd-settings 1\nhost.budget_mib = 20480\n",
+      "overrides": [],
+      "threads": {
+        "decode": 8,
+        "batch": 12
+      },
+      "directory": "/opt/inferssd/runs/muse",
+      "alias": "/opt/inferssd/runs/muse/artifacts/experts.tsv",
+      "host": {
+        "platform_system": "Darwin",
+        "platform_machine": "arm64"
+      }
+    },
+    "argv": [
+      "/opt/inferssd/build-macos-metal/bin/inferssd-server",
+      "-m",
+      "/Volumes/models/muse-spark-00001-of-00003.gguf",
+      "--ssd-settings",
+      "/opt/inferssd/runs/muse/settings.ssd",
+      "--ssd-telemetry",
+      "/opt/inferssd/runs/muse/native-events.jsonl",
+      "--mmap",
+      "--no-repack",
+      "--fit",
+      "off",
+      "--no-warmup",
+      "-ngl",
+      "99",
+      "-c",
+      "8192",
+      "-b",
+      "512",
+      "-ub",
+      "512",
+      "-t",
+      "8",
+      "-tb",
+      "12",
+      "--chat-template-file",
+      "/opt/inferssd/engine/models/templates/muse-spark.jinja",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8080",
+      "-np",
+      "1",
+      "--defer-experts"
+    ],
+    "scope": [],
+    "settings": {
+      "/opt/inferssd/runs/muse/settings.ssd": "inferssd-settings 1\nexpert.source = [\"/opt/inferssd/runs/muse/artifacts/experts.tsv\"]  # source=generated; input=complete GGUF shard/header validation\nhost.budget_mib = 20480  # source=file; input=/opt/inferssd/settings.ssd:2\n"
+    }
+  },
+  {
+    "case": {
+      "name": "windows-dsv",
+      "platform": "windows",
+      "profile": "dsv",
+      "repo": "C:\\inferssd",
+      "model": "D:\\models\\DeepSeek-V4.1.gguf",
+      "shards": [
+        "D:\\models\\DeepSeek-V4.1.gguf"
+      ],
+      "files": [
+        "D:\\models\\DeepSeek-V4.1.gguf",
+        "C:\\inferssd\\build\\bin\\inferssd-server.exe",
+        "C:\\inferssd\\engine\\models\\templates\\deepseek-ai-DeepSeek-V4.1.jinja"
+      ],
+      "settings_file": null,
+      "settings": null,
+      "overrides": [
+        [
+          "host.budget_mib",
+          "14336"
+        ]
+      ],
+      "threads": {
+        "cpus": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      "directory": "C:\\inferssd\\runs\\dsv",
+      "alias": "C:\\inferssd\\runs\\dsv\\artifacts\\experts.tsv",
+      "host": {
+        "platform_system": "Windows"
+      }
+    },
+    "argv": [
+      "C:\\inferssd\\build\\bin\\inferssd-server.exe",
+      "-m",
+      "D:\\models\\DeepSeek-V4.1.gguf",
+      "--ssd-settings",
+      "C:\\inferssd\\runs\\dsv\\settings.ssd",
+      "--ssd-telemetry",
+      "C:\\inferssd\\runs\\dsv\\native-events.jsonl",
+      "--ssd-host-budget-mib",
+      "14336",
+      "--mmap",
+      "--no-repack",
+      "--fit",
+      "off",
+      "--no-warmup",
+      "-ngl",
+      "99",
+      "-c",
+      "8192",
+      "-b",
+      "512",
+      "-ub",
+      "512",
+      "-t",
+      "4",
+      "-tb",
+      "4",
+      "-C",
+      "0xf",
+      "-Cb",
+      "0xf",
+      "--cpu-strict",
+      "1",
+      "--cpu-strict-batch",
+      "1",
+      "--chat-template-file",
+      "C:\\inferssd\\engine\\models\\templates\\deepseek-ai-DeepSeek-V4.1.jinja",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8080",
+      "-np",
+      "1",
+      "--defer-experts"
+    ],
+    "scope": [],
+    "settings": {
+      "C:\\inferssd\\runs\\dsv\\settings.ssd": "inferssd-settings 1\nexpert.source = [\"C:\\\\inferssd\\\\runs\\\\dsv\\\\artifacts\\\\experts.tsv\"]  # source=generated; input=complete GGUF shard/header validation\nmodel.engram_prefetch = 1  # source=model; profile=dsv\nmodel.hc_fused = 1  # source=model; profile=dsv\n"
+    }
+  }
+]

@@ -28,6 +28,9 @@ from inferssd.source.header import SCALARS
 
 ALIGNMENT = 4096
 MAX_I64 = (1 << 63) - 1
+# Binary reads on Windows, where os.open otherwise translates text; on POSIX a
+# FIFO must not block the open before the regular-file check rejects it.
+OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
 # Native ggml.c type_traits / ggml-common.h geometry. Keep this independent of
 # the original metadata table (in particular, its Q8_1 size is different).
 # The repository native-contract gate checks every admitted type against the
@@ -172,7 +175,9 @@ class Header:
 
 
 def _identity(info: os.stat_result) -> tuple[int, ...]:
-    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+    # The fields that an open file and its path report alike on every OS; on
+    # Windows, os.fstat and os.stat give st_ctime different meanings.
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
 def _tensor_size(name: str, shape: tuple[int, ...], type_id: int) -> int:
@@ -197,7 +202,7 @@ def read_header(path: Path) -> Header:
     resolved = path.resolve(strict=True)
     if any(char in str(resolved) for char in "\t\r\n"):
         raise RuntimeError("expert source path cannot contain tabs or newlines")
-    descriptor = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK)
+    descriptor = os.open(resolved, OPEN_FLAGS)
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode) or not 0 <= before.st_size <= MAX_I64:
