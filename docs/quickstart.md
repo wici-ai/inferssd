@@ -33,7 +33,7 @@ Build the Metal backend and describe the resulting deployment:
 
 ```sh
 cmake --preset macos-metal
-cmake --build build-macos-metal --target llama-server --parallel 4
+cmake --build build-macos-metal --target inferssd-server --parallel 4
 python3 scripts/engine-resources.py \
   --build build-macos-metal --output engine-resources.json
 ```
@@ -50,7 +50,7 @@ Install `liburing-dev` on Debian/Ubuntu, or your distribution's equivalent. The 
 
 ```sh
 cmake --preset linux-cuda
-cmake --build build-linux-cuda --target llama-server --parallel 4
+cmake --build build-linux-cuda --target inferssd-server --parallel 4
 python3 scripts/engine-resources.py \
   --build build-linux-cuda --output engine-resources.json
 ```

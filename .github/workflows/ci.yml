@@ -105,7 +105,7 @@ jobs:
       - name: Configure
         run: cmake --preset linux-cpu -DGGML_NATIVE=OFF
       - name: Build
-        run: cmake --build build-linux-cpu --parallel 4 --target llama-server test-ssd-model-adapter test-ssd-runtime-policy test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan test-reasoning-budget test-ssd-prepared-graph test-ssd-precompute-memory test-ssd-cuda-reserve test-ssd-context-telemetry test-graph-overhead test-linux-test-resources test-mac-expert-pack-cache test-mac-expert-source test-c0-store test-c0-config test-c0-parser-failures test-ssd-settings-telemetry test-ssd-runtime-options test-ssd-cpu-api test-ssd-source-index test-ssd-host-arbiter test-ssd-host-prefault
+        run: cmake --build build-linux-cpu --parallel 4 --target inferssd-server test-ssd-model-adapter test-ssd-runtime-policy test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan test-reasoning-budget test-ssd-prepared-graph test-ssd-precompute-memory test-ssd-cuda-reserve test-ssd-context-telemetry test-graph-overhead test-linux-test-resources test-mac-expert-pack-cache test-mac-expert-source test-c0-store test-c0-config test-c0-parser-failures test-ssd-settings-telemetry test-ssd-runtime-options test-ssd-cpu-api test-ssd-source-index test-ssd-host-arbiter test-ssd-host-prefault
       - name: Synthetic tests
         shell: bash
         run: |
@@ -129,7 +129,7 @@ jobs:
       - name: Build Metal and portable cache tests
         run: |
           cmake --preset macos-metal
-          cmake --build build-macos-metal --parallel 3 --target llama-cli llama-server test-chat test-backend-ops test-mac-expert-pack-cache test-mac-expert-source test-mac-expert-operator test-llama-mmap-dontneed
+          cmake --build build-macos-metal --parallel 3 --target llama-cli inferssd-server test-chat test-backend-ops test-mac-expert-pack-cache test-mac-expert-source test-mac-expert-operator test-llama-mmap-dontneed
       - name: Cache and Muse rendering tests
         run: |
           ctest --test-dir build-macos-metal --output-on-failure --no-tests=error -R '^(mac_expert_pack_cache|mac_expert_operator_.*|test-llama-mmap-dontneed)$'

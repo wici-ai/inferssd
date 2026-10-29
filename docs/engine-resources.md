@@ -3,7 +3,7 @@
 The installed framework does not discover a source checkout. Pass `--resources`
 to bind one deployment, or provide both `--binary` and `--template`. The optional
 `--repo` adapter uses `engine/models/templates/` in a development checkout and
-the first `bin/llama-server` it finds under the preset build directory
+the first `bin/inferssd-server` it finds under the preset build directory
 (`build-linux-cuda`, then `build-linux-cpu` on Linux; `build-macos-metal` on
 Darwin), then under `build-mac` (Darwin only) or `build`.
 
@@ -12,7 +12,7 @@ A descriptor is ordinary JSON. Relative paths resolve against its own directory:
 ```json
 {
   "schema": "inferssd-engine 1",
-  "binary": "bin/llama-server",
+  "binary": "bin/inferssd-server",
   "revision": "the-deployed-source-revision",
   "templates": {
     "dsv": "templates/deepseek-ai-DeepSeek-V4.1.jinja",

@@ -29,9 +29,10 @@ def build(args):
     }
     cmake = settings["cmake"]
     flags, targets = settings["cmake_flags"], settings["targets"]
-    if not targets or "llama-server" not in targets:
+    # Revisions before the server rename build it as llama-server.
+    if not targets or not {"inferssd-server", "llama-server"} & set(targets):
         raise ValueError(
-            "build must include llama-server and the reviewed fixture targets"
+            "build must include the server and the reviewed fixture targets"
         )
     configured = subprocess.run(
         [cmake, "-S", str(source), "-B", str(output), *flags],

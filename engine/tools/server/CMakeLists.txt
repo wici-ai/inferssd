@@ -1,6 +1,6 @@
 include_directories(${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
-# server-context containing the core server logic, used by llama-server and CLI
+# server-context containing the core server logic, used by inferssd-server and CLI
 
 set(TARGET server-context)
 
@@ -36,9 +36,9 @@ if (GGML_CUDA)
 endif()
 
 
-# llama-server executable
+# inferssd-server executable
 
-set(TARGET llama-server)
+set(TARGET inferssd-server)
 
 set(TARGET_SRCS
     server.cpp

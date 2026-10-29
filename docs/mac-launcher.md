@@ -7,7 +7,7 @@ API and is not implemented on macOS.
 
 ```sh
 cmake --preset macos-metal
-cmake --build build-macos-metal --target llama-server --parallel 4
+cmake --build build-macos-metal --target inferssd-server --parallel 4
 python3 -m pip install ./framework
 python3 scripts/engine-resources.py --build build-macos-metal --output engine-resources.json
 inferssd launch --help

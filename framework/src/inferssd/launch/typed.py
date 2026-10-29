@@ -194,7 +194,7 @@ def _resolve(
             if platform == "darwin"
             else ("build-linux-cuda", "build-linux-cpu", "build")
         )
-        candidates = [s.inputs.repo + "/" + name + "/bin/llama-server" for name in builds]
+        candidates = [s.inputs.repo + "/" + name + "/bin/inferssd-server" for name in builds]
         binary_path = next((c for c in candidates if s.value("is_file", c)), candidates[0])
     if not binary_path:
         raise ValueError("provide --binary or an engine resource descriptor")

@@ -120,13 +120,13 @@ def test_settings_file_and_cli_provenance_reach_native_argv(tmp_path, platform):
 def test_repo_adapter_prefers_preset_build_directories(tmp_path, platform, present, chosen):
     inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
     for name in present:
-        binary = Path(inputs.repo) / name / "bin/llama-server"
+        binary = Path(inputs.repo) / name / "bin/inferssd-server"
         binary.parent.mkdir(parents=True)
         binary.write_text("must never execute")
         binary.chmod(0o755)
     result = resolve(inputs, replace(spec, binary=None), adapter, out, platform)
     assert result.code == 0
-    assert str((Path(inputs.repo) / chosen / "bin/llama-server").resolve()) in result.argv
+    assert str((Path(inputs.repo) / chosen / "bin/inferssd-server").resolve()) in result.argv
 
 
 @pytest.mark.parametrize(
@@ -134,7 +134,7 @@ def test_repo_adapter_prefers_preset_build_directories(tmp_path, platform, prese
 )
 def test_repo_adapter_reports_the_preset_build_when_none_exists(tmp_path, platform, first):
     inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
-    missing = "missing server executable: .*/" + first + "/bin/llama-server"
+    missing = "missing server executable: .*/" + first + "/bin/inferssd-server"
     with pytest.raises(ValueError, match=missing):
         resolve(inputs, replace(spec, binary=None), adapter, out, platform)
 
