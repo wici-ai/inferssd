@@ -16,7 +16,6 @@ struct runtime_owner {
     bool started = false;
     std::atomic<bool> retired{false};
     std::atomic<bool> published{false};
-    std::atomic<int> shape{0};
 };
 runtime_owner & owner() { static runtime_owner value; return value; }
 
@@ -125,25 +124,11 @@ bool initialize_shared_catalog() {
 }
 } // namespace c0
 
-extern "C" void ggml_ssd_c0_select_model_shape(int64_t experts, size_t bytes, const char * source) {
-    if (experts <= 0 || !bytes) { return; }
-    auto & state = owner();
-    constexpr int requested = 1;
-    int expected = 0;
-    if (state.shape.compare_exchange_strong(expected, requested, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        std::fprintf(stderr, "[moe_adapter] dispatch=%s source=%s n_experts=%lld expert_bytes=%zu selection=model-shape\n",
-                "common", source ? source : "unknown", (long long)experts, bytes);
-    }
-}
-extern "C" bool ggml_ssd_c0_uses_common() { return true; }
-extern "C" bool ggml_ssd_c0_shape_selected() { return owner().shape.load(std::memory_order_acquire) != 0; }
-
 extern "C" bool ggml_ssd_c0_resolve_raw_direct_shape(
         const char * name, int expert, size_t bytes, int64_t experts,
         int * fd, uint64_t * offset, size_t * logical_bytes) {
     if (!name || expert < 0 || experts <= 0 || expert >= experts || !bytes) { return false; }
-    ggml_ssd_c0_select_model_shape(experts, bytes, "cpu-sink-raw-range");
-    if (!ggml_ssd_c0_uses_common() || !fd || !offset || !logical_bytes) { return false; }
+    if (!fd || !offset || !logical_bytes) { return false; }
     try {
         if (!c0::initialize_shared_catalog()) { return false; }
         const char * disabled = std::getenv("GGML_MOE_EXPERT_PACK_RUNTIME_DISABLE");

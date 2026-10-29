@@ -99,5 +99,3 @@ extern "C" int mock_direct() { return observed_direct; }
 extern "C" const void * mock_mapping() { return observed_mapping; }
 extern "C" bool mock_half_ready() { return half_ready.load(std::memory_order_acquire); }
 extern "C" void mock_finish_load() { finish_load.store(true, std::memory_order_release); }
-extern "C" void mock_shape(int64_t experts, size_t bytes) { ggml_ssd_c0_select_model_shape(experts, bytes, "mock-cuda"); }
-extern "C" bool mock_common() { return ggml_ssd_c0_uses_common(); }
