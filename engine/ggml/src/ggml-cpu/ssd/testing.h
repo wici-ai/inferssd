@@ -14,11 +14,11 @@ namespace testing {
 // production configured factory always builds its canonical policy and never
 // consumes this structure or any ambient policy input.
 struct execution_policy {
-    bool split_cv = false, ready_first = false, early_up_gate = false, role_major = false;
+    bool ready_first = false, early_up_gate = false, role_major = false;
     bool nonblocking_down_sched = false, dynamic_rows = false, read_fixed = false;
     int poll_us = 0, dynamic_chunk_rows = 64;
-    std::vector<double> row_weights;
-    std::vector<int> compute_cpus, io_cpus;
+    std::vector<double> row_weights; // one per participant of each run
+    std::vector<int> io_cpus;
     int decode_participants = 0, prefetch_depth = 0;
     uint64_t prefetch_fail_every = 0, prefetch_throw_drain = 0, prefetch_throw_schedule = 0;
     std::string cache_policy = "window", cache_allocation = "priority";
@@ -35,9 +35,9 @@ struct execution_policy {
 };
 
 // Test callers own explicit policy inputs until this call returns; the executor
-// copies them before starting workers. No process-wide mutation is involved.
+// copies them before starting its threads. No process-wide mutation is involved.
 [[nodiscard]] GGML_BACKEND_API kimi_cpu_sink * create(
-    int total_threads, int ring_experts, const execution_policy & policy,
+    int ring_experts, const execution_policy & policy,
     const runtime_services * services, kimi_cpu_sink_resolver resolver, void * userdata,
     char * error, size_t error_size) noexcept;
 }  // namespace testing

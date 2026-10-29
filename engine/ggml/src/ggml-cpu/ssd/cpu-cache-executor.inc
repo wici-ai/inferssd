@@ -14,7 +14,7 @@ static void sink_location_provider_initialize(kimi_cpu_sink * sink) {
 extern "C" bool kimi_cpu_sink_set_cache_locations(kimi_cpu_sink * sink,
         const kimi_cache_location_api * api, void * context, char * error, size_t size) {
     sink_error(error,size,""); if (!sink) { sink_error(error,size,"null sink"); return false; }
-    std::lock_guard<std::mutex> lock(sink->run_mutex);
+    std::lock_guard<sink_run_mutex> lock(sink->run_mutex);
     if (api && (api->version!=1 || api->size!=sizeof(*api) || !api->acquire_native || !api->begin_layer ||
             !api->launch || !api->finish || !api->cancel || !api->release)) {
         sink_error(error,size,"invalid cache location API v1"); return false;
@@ -92,7 +92,7 @@ extern "C" bool kimi_cpu_sink_run_cache_compute(kimi_cpu_sink * sink,
         if(stats){*stats=local;}if(decision){*decision=a;}
         cache_compute_print(a,sink->cache.epoch,sink->cache.token,layer,local,ok);return ok;
     }
-    std::lock_guard<std::mutex> serial(sink->run_mutex);
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
     const auto start=sink_clock::now();const uint64_t completed_before=sink->ring.completed();
     sink->current={};sink->requests.clear();sink->begin_observation(up,true);
     // The dedicated trace represents uncomputed/dropped slots too; legacy
@@ -124,7 +124,7 @@ extern "C" bool kimi_cpu_sink_run_cache_compute(kimi_cpu_sink * sink,
         }
     };
     try {
-        sink_caller_affinity affinity(sink->compute_cpus);
+        sink->begin_participants(true);
         if(!sink->ready_first || sink->early_up_gate || !std::isfinite(situ_beta) || situ_beta<=0 ||
                 !std::isfinite(situ_linear_beta) || sink->poisoned) {
             throw std::runtime_error("cache-compute requires READY_FIRST=1, EARLY_UP_GATE=0 and a healthy sink");
@@ -144,6 +144,7 @@ extern "C" bool kimi_cpu_sink_run_cache_compute(kimi_cpu_sink * sink,
                 down->ne[0]!=up->ne[1]||down->ne[1]!=up->ne[0]||down->ne[2]!=up->ne[2]) {
                 throw std::runtime_error("cache location tensor shape mismatch");
             }
+            sink_direct_check direct;
             for(int n=0;n<native_count;++n) {
                 auto & c=candidates[n];c.epoch=sink->cache.epoch;c.token=sink->cache.token;c.layer=layer;c.expert=native_ids[n];
                 if(native_ids[n]>=up->ne[2]){throw std::runtime_error("native ID exceeds tensor metadata");}
@@ -153,8 +154,7 @@ extern "C" bool kimi_cpu_sink_run_cache_compute(kimi_cpu_sink * sink,
                         throw std::runtime_error("cache location source resolve failed");
                     }
                     const size_t bytes=tensors[role]->nb[2];
-                    const int flags=fcntl(source.fd_direct,F_GETFL);
-                    if(flags<0||!(flags&O_DIRECT)||source.offset%4096||source.nbytes%4096||source.nbytes<bytes||source.nbytes>bytes+4095) {
+                    if(!direct(source.fd_direct)||source.offset%4096||source.nbytes%4096||source.nbytes<bytes||source.nbytes>bytes+4095) {
                         throw std::runtime_error("invalid cache location direct source");
                     }
                 }
@@ -201,7 +201,7 @@ extern "C" bool kimi_cpu_sink_run_cache_compute(kimi_cpu_sink * sink,
         if(!stride){for(const auto * tensor:{up,gate,down}){stride+=(tensor->nb[2]+4095)&~size_t(4095);}}
         // prepare() sees only the CPU subset. Keep ordinary demand accounting
         // independent of location; cache-only GPU jobs are not SSD demand.
-        sink->current.demand_bytes+=uint64_t(__builtin_popcount(a.plan.base_mask&gpu_mask))*stride;
+        sink->current.demand_bytes+=uint64_t(std::bitset<32>(a.plan.base_mask&gpu_mask).count())*stride;
         for(int n=0;n<native_count;++n){if((a.plan.original_mask&~before)&(1u<<n)){a.baseline_miss_bytes+=stride;}}
         a.prepared_us=ggml_time_us();
         sink->activation_kind=KIMI_CPU_SINK_ACTIVATION_SITU;sink->swiglu_limit=0.0f;

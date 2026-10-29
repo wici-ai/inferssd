@@ -155,7 +155,7 @@ jobs:
         run: |
           {
             echo 'This child executes one exact root-staged device job; runner readiness is not model or performance acceptance.'
-            echo 'Selected jobs retain actual functional, numerical and required 512/decode256 pairs in integration.json and raw artifacts.'
-            echo 'Use the exact parent Actions Summary for the scoped verdict; failed or inconclusive measurements do not pass.'
+            echo 'Selected jobs retain actual functional, numerical and every required 512/decode256 timed run in integration.json and raw artifacts.'
+            echo 'Use the exact parent Actions Summary for the scoped verdict; failed, regressed or needs-review measurements do not pass.'
             echo 'Standalone readiness does not establish performance or full impact coverage. Formal benchmark samples: 0.'
           } >> "$GITHUB_STEP_SUMMARY"

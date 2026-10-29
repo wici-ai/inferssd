@@ -28,20 +28,6 @@
 #include <string>
 #include <vector>
 
-
-extern "C" bool llama_moe_prefill_phase_workspace(
-        llama_context * ctx,
-        int active);
-extern "C" bool llama_moe_prefill_phase_workspace_sized(
-        llama_context * ctx,
-        int active,
-        uint32_t requested_tokens);
-extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(
-        llama_context * ctx,
-        int active,
-        uint32_t prompt_tokens,
-        uint32_t prefill_tokens);
-
 //
 // llama_context
 //
@@ -206,16 +192,12 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
-#if defined(__linux__)
     cpu_sink_enabled = ssd_runtime && !ssd_runtime->settings.sources()->empty();
-#else
-    cpu_sink_enabled = false;
-#endif
     dense_gpu_phase_gate_enabled = cpu_sink_enabled;
     if (cpu_sink_enabled) {
         if (llama_ssd::describe_experts(model.arch, model.hparams, -1).activation ==
                 llama_ssd::expert_activation::unsupported) {
-            throw std::runtime_error("SSD CPU experts require DeepSeek-V4.1 or Muse Spark");
+            throw std::runtime_error("SSD CPU experts do not support this model architecture");
         }
         if (cparams.n_seq_max != 1) {
             throw std::runtime_error("SSD CPU experts require --parallel 1 (-np 1)");
@@ -225,26 +207,6 @@ llama_context::llama_context(
         }
         cpu_prefill_max_tokens = uint32_t(*ssd_runtime->settings.integer("prefill.cpu_max_tokens"));
         cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
-        std::vector<int32_t> routed_layers;
-        for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
-            const auto & layer = model.layers[il];
-            if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
-                routed_layers.push_back(int32_t(il));
-            }
-        }
-        cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer,
-            kimi_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
-            int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
-        if (*ssd_runtime->settings.integer("prefetch.depth") > 0) {
-            for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
-                const auto & layer = model.layers[il];
-                for (const ggml_tensor * experts : {layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
-                    if (experts) {
-                        cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = {experts->nb[2], experts->ne[2]};
-                    }
-                }
-            }
-        }
     }
     // The retained resource profile sizes each request's prompt graph, then
     // keeps a one-token decode graph. The configured ubatch remains available
@@ -252,7 +214,9 @@ llama_context::llama_context(
     reserve_horizon_enabled = true;
     cpu_prefill_actual_shape_enabled = cpu_sink_enabled;
     if (cpu_prefill_actual_shape_enabled) { cpu_prefill_configured_ubatch = cparams.n_ubatch; }
-    cpu_prefill_output_sizing_enabled = model.arch == LLM_ARCH_DEEPSEEK41 || model.arch == LLM_ARCH_MUSE_SPARK;
+    // The SSD expert architectures size the prompt graph's outputs by the request, not one per token.
+    cpu_prefill_output_sizing_enabled = llama_ssd::describe_experts(model.arch, model.hparams, -1).activation !=
+        llama_ssd::expert_activation::unsupported;
     if (cpu_prefill_output_sizing_enabled) { sched_reserve_n_outputs = cparams.n_seq_max; }
 
     cparams.op_offload = params.op_offload;
@@ -342,6 +306,29 @@ llama_context::llama_context(
         if (ssd_runtime) {
             ssd_runtime->bind_cpu(backend_cpu);
             for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get()); }
+            // After the backends: the sink has a GPU tier only when one of them injected its provider.
+            if (cpu_sink_enabled) {
+                std::vector<int32_t> routed_layers;
+                for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+                    const auto & layer = model.layers[il];
+                    if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
+                        routed_layers.push_back(int32_t(il));
+                    }
+                }
+                cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer,
+                    kimi_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
+                    int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
+                if (*ssd_runtime->settings.integer("prefetch.depth") > 0) {
+                    for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+                        const auto & layer = model.layers[il];
+                        for (const ggml_tensor * experts : {layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
+                            if (experts) {
+                                cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = {experts->nb[2], experts->ne[2]};
+                            }
+                        }
+                    }
+                }
+            }
             auto * registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
             const auto get_api = reinterpret_cast<ssd::cpu::get_api_v2>(
                 ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v2"));
@@ -356,17 +343,6 @@ llama_context::llama_context(
                 throw std::runtime_error("cannot attach context-owned CPU runtime services");
             }
             ssd_runtime->prepare_dense(model);
-#if defined(__APPLE__)
-            if (!ssd_runtime->settings.sources()->empty()) {
-            char error[512] {};
-            ssd_runtime->mac_cache = api->mac_create(&ssd_runtime->settings, &ssd_runtime->services, error, sizeof(error));
-            ssd_runtime->destroy_mac = api->mac_destroy;
-            if (!ssd_runtime->mac_cache) { throw std::runtime_error(error[0] ? error : "cannot create Mac expert cache"); }
-            if (!api->mac_attach(backend_cpu, ssd_runtime->mac_cache)) {
-                throw std::runtime_error("cannot attach context-owned Mac expert cache");
-            }
-            }
-#endif
         }
 
         // create a list of the set_n_threads functions in the backends
@@ -953,14 +929,6 @@ void llama_context::host_note_memory_change() noexcept {
     if (ssd_runtime && ssd_runtime->host) {
         (void) ssd_runtime->host->note_known_memory_change();
     }
-}
-
-bool llama_context::moe_prefill_phase_workspace(bool active) {
-    return moe_prefill_phase_workspace(active, 0);
-}
-
-bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_tokens) {
-    return moe_prefill_phase_workspace(active, requested_tokens, requested_tokens);
 }
 
 bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_tokens, uint32_t prefill_tokens) {
@@ -2901,7 +2869,7 @@ void llama_context::output_reorder() {
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR ||
-        model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
+        model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN4EXP) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
     if (model.arch == LLM_ARCH_DEEPSEEK41) {
@@ -3204,15 +3172,21 @@ ggml_status llama_context::graph_compute(
         }
     }
 
+    // The CPU threads of a graph with sink nodes are the compute participants
+    // of their calls; the executor they join exists before the graph runs.
+    if (gf_res_prev && gf_res_prev->get_gf() == gf && !gf_res_prev->cpu_sink_nodes.empty()) {
+        GGML_ASSERT(cpu_sink_runtime && backend_cpu);
+        try {
+            cpu_sink_runtime->prepare_graph(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)));
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: %s; no fallback\n", __func__, e.what());
+            return GGML_STATUS_FAILED;
+        }
+    }
+
     // set the number of threads for all the backends
-    // The sink owns its persistent compute/I/O pool. Keep the other ggml CPU
-    // workers asleep during its custom op instead of spinning at its barrier.
-    const bool cpu_sink_graph = gf_res_prev &&
-        gf_res_prev->get_gf() == gf && !gf_res_prev->cpu_sink_nodes.empty();
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
-        const bool sink_cpu_backend = cpu_sink_graph &&
-            set_n_threads_fn.first == backend_cpu;
-        set_n_threads_fn.second(set_n_threads_fn.first, sink_cpu_backend ? 1 : n_threads);
+        set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
     if (ssd_runtime && !ssd_runtime->diagnostics.good()) {
@@ -4202,24 +4176,6 @@ bool llama_ssd_prefill_phase(llama_context * ctx, bool active,
     catch (const std::exception & failure) { LLAMA_LOG_ERROR("SSD phase transition failed: %s\n", failure.what()); }
     catch (...) { LLAMA_LOG_ERROR("SSD phase transition failed\n"); }
     return false;
-}
-
-extern "C" bool llama_moe_prefill_phase_workspace(
-        llama_context * ctx,
-        int active) {
-    return ctx && ctx->moe_prefill_phase_workspace(active != 0);
-}
-
-extern "C" bool llama_moe_prefill_phase_workspace_sized(
-        llama_context * ctx,
-        int active,
-        uint32_t requested_tokens) {
-    return ctx && ctx->moe_prefill_phase_workspace(active != 0, requested_tokens);
-}
-
-extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(
-    llama_context * ctx, int active, uint32_t prompt_tokens, uint32_t prefill_tokens) {
-    return ctx && ctx->moe_prefill_phase_workspace(active != 0, prompt_tokens, prefill_tokens);
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

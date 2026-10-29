@@ -21,7 +21,8 @@ credential risks of self-hosted runners in its
 Device checks are authorized by a maintainer for PRs from branches in this
 repository. A maintainer with current write access submits a Comment review whose
 complete body is `/ci test`; GitHub binds the review to the exact current head.
-See [review entry, results and limits](REVIEW-ENTRY.md).
+The operator also measures every new `main` commit on the devices; PR results
+are compared with that history. See [review entry, results and limits](REVIEW-ENTRY.md).
 
 External fork PRs do not currently run on physical devices. Admission requires
 the latest successful hosted CI run for the exact head to be associated with
@@ -148,24 +149,42 @@ quarantine uncertain cleanup rather than release the lease.
 ## Tests and comparison
 
 Inside that boundary the driver builds the exact base and candidate once each,
-runs the reviewed small numerical/lifecycle CTest set on both, compares short
-greedy token IDs and pre-sampling top-five records, then measures DeepSeek/Muse
-512/256 once per side. The impact plan adds 4K/256 only for DeepSeek
-compressed long-context changes; the review operator runs the 512 tier and
-reports any required 4K cell as a coverage gap. Both builds
-precede timing. The same model shards, toolchain, templates, typed settings and
-resource policy are required. Raw SSE, input IDs, image hashes, CTest XML and
-cleanup are revalidated, including the broker receipt. Missing, failed or partial
-data cannot pass.
+runs the reviewed small numerical/lifecycle CTest set on both, and compares short
+greedy token IDs and pre-sampling top-five records. The deployed review operator
+measures DeepSeek/Muse 512/256 with three candidate runs and one base run, in
+the order candidate, base, candidate, candidate, each run a fresh server. The
+base commit was measured four times before, by the baseline job the operator
+runs for every new `main` commit. The impact plan adds
+4K/256 only for DeepSeek compressed long-context changes; the review operator
+runs the 512 tier and reports any required 4K cell as a coverage gap. Both
+builds precede timing. Only the baseline job profiles the machine, once per
+`main` commit and device with that commit's `inferssd profile`; the operator
+stores the characteristics file with the device's baseline history. A PR job
+takes the file of the device's most recent baseline job, sealed into the job
+and staged read-only by root, and cannot run on a device that has none yet.
+Each side starts its servers the way `inferssd launch` does: its own launch
+strategy derives the settings and thread pools from that characteristics file,
+the model's GGUF header and the job's memory budget, and the report shows what
+the PR's launch sets differently. The same model shards, toolchain, templates,
+launch request and resource policy are required. Raw SSE, input IDs, image hashes,
+CTest XML and cleanup are revalidated for every run, including the broker
+receipt. Missing, failed or partial data cannot pass.
 
 These are `purpose=ci` samples, separate from the formal benchmark in
-[FINAL.md](../FINAL.md). All five metrics, including native prefill, must show no
-observed slowdown. Any valid slowdown is `inconclusive` and blocks acceptance
-pending bounded diagnosis; invalid evidence is `failed`. No percentage regression
-allowance applies. A passing one-sample comparison is an observation, not proof
-of statistical equivalence. See [performance acceptance](PERFORMANCE.md) for
-outcomes, diagnosis limits and the legacy reference adapter. Local synthetic
-tests do not prove OS isolation.
+[FINAL.md](../FINAL.md). Whole decode, TTFT and native prefill are compared on
+the log scale with the base estimate (the base commit's history and the in-run
+base), against a threshold from the noise of the device's baseline history. A
+cell is `regressed` when a metric is slower beyond that threshold and every
+candidate run is slower; `needs-review` when the candidate runs disagree,
+generated tokens differ, the base has no history for this machine, OS, model,
+template, memory budget and CPU set, the in-run base differs from its history or
+the host check flagged a run; otherwise `passed`. A metric faster beyond the
+threshold is labelled `improved` without changing the status. Invalid evidence
+is `failed`. A pass means no slowdown beyond measured noise, not proof that none
+exists. See
+[performance acceptance](PERFORMANCE.md) for the decision rule, the baseline
+history, the base build cache and the legacy reference adapter.
+Local synthetic tests do not prove OS isolation.
 
 ## Publication and deployment
 

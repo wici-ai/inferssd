@@ -6,6 +6,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
 
+from inferssd.configuration.settings import PLATFORMS
+
 
 @dataclass(frozen=True)
 class Policy:
@@ -28,8 +30,8 @@ class Policy:
         for name in ("platform", "lock_path", "stop_path"):
             if not isinstance(data[name], str) or not data[name]:
                 raise ValueError("runtime policy " + name + " must be nonempty text")
-        if data["platform"] not in ("linux", "darwin"):
-            raise ValueError("runtime policy platform must be linux or darwin")
+        if data["platform"] not in PLATFORMS:
+            raise ValueError("runtime policy platform must be one of " + ", ".join(PLATFORMS))
         numeric = expected - {"platform", "lock_path", "stop_path"}
         for name in numeric:
             value = data[name]

@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "ssd/model-adapter.h"
 #include "ssd/model-pages.h"
 
 #include "llama-arch.h"
@@ -14,6 +15,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-idx.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
@@ -21,6 +23,11 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+
+#if defined(__unix__) || defined(__APPLE__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #include <cassert>
 #include <cfloat>
@@ -474,6 +481,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_MEDIUM:        return "0.4B";
         case LLM_TYPE_LARGE:         return "0.8B";
         case LLM_TYPE_XL:            return "1.5B";
+        case LLM_TYPE_A3B:           return "A3B";
         case LLM_TYPE_A1_7B:         return "A1.7B";
         case LLM_TYPE_A2_7B:         return "A2.7B";
         case LLM_TYPE_8x7B:          return "8x7B";
@@ -712,6 +720,23 @@ void llama_model::load_arch(llama_model_loader & ml) {
     }
     if (!devices.empty() && devices[0].is_meta && !llm_arch_supports_sm_tensor(arch)) {
         throw std::runtime_error(std::string("LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '") + llm_arch_name(arch) + "'");
+    }
+}
+
+// bad metadata must be catchable: GGML_ASSERT aborts the whole process
+static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
+    if (value == 0) {
+        throw std::runtime_error(format("%s must be greater than zero, got %u", ml.llm_kv(kid).c_str(), value));
+    }
+}
+
+// get_arr() copies a short array as-is, leaving a zero tail the n-gram hash silently drops
+static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32_t n_min) {
+    uint32_t n_arr = 0;
+    ml.get_arr_n(kid, n_arr, true);
+    if (n_arr < n_min) {
+        throw std::runtime_error(format("%s has %u entries, but at least %u are required",
+                                        ml.llm_kv(kid).c_str(), n_arr, n_min));
     }
 }
 
@@ -3092,6 +3117,148 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_QWEN4EXP: {
+            // Qwen uses normalized top-k weights and unclamped SwiGLU.
+            hparams.expert_weights_scale = 1.0f;
+
+            ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+            ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+            ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+
+            ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
+
+            ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
+            ml.get_key(LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
+            ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
+            ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
+            ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
+            qwen4exp_require_nonzero(ml, LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
+            qwen4exp_require_nonzero(ml, LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
+            qwen4exp_require_nonzero(ml, LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
+            qwen4exp_require_nonzero(ml, LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
+            qwen4exp_require_nonzero(ml, LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
+
+            // HC; low_rank is qwen4exp-specific, DeepSeek-V4 leaves it absent (full rank)
+            ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
+            ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
+            // a count of 1 has nothing to mix, and the reference configurations reject it
+            if (hparams.dsv4_hc_mult <= 1) {
+                throw std::runtime_error(format("%s must be greater than one, got %u",
+                                                ml.llm_kv(LLM_KV_HYPER_CONNECTION_COUNT).c_str(), hparams.dsv4_hc_mult));
+            }
+            qwen4exp_require_nonzero(ml, LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
+            hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
+
+            ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
+            ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
+            ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+            qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
+            qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
+            qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+            ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer, false);
+
+            // QSA pools the indexer keys of blocks of compress_ratio cells, one block size for the whole model
+            hparams.indexer_kpool = 0;
+            for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                const uint32_t r = hparams.dsv4_compress_ratios[il];
+                if (r == 0) {
+                    continue;
+                }
+                if (hparams.indexer_kpool != 0 && r != hparams.indexer_kpool) {
+                    throw std::runtime_error(format("QSA layers must share one compress ratio, got %u and %u", hparams.indexer_kpool, r));
+                }
+                hparams.indexer_kpool = r;
+            }
+            if (hparams.indexer_kpool == 1 || (hparams.indexer_kpool > 0 && hparams.indexer_top_k % hparams.indexer_kpool != 0)) {
+                throw std::runtime_error(format("QSA needs a compress ratio above 1 that divides the budget, got %u and %u",
+                                                hparams.indexer_kpool, hparams.indexer_top_k));
+            }
+
+            // PLE n-gram hash embeddings; if the key group is absent every field stays zero
+            hparams.is_ple_impl.reset();
+            hparams.ple_n_heads = 0;
+
+            uint32_t n_ple = 0;
+            ml.get_arr_n(LLM_KV_PLE_LAYERS, n_ple, false);
+            if (n_ple > 0) {
+                std::vector<uint32_t> ple_layers;
+                ml.get_arr(LLM_KV_PLE_LAYERS, ple_layers);
+                if (n_ple != 1) {
+                    // hparams holds one set of hash constants, so several PLE modules cannot be represented
+                    throw std::runtime_error(format("%s lists %u layers, but only one PLE layer is supported",
+                                                    ml.llm_kv(LLM_KV_PLE_LAYERS).c_str(), n_ple));
+                }
+                for (uint32_t il : ple_layers) {
+                    if (il >= hparams.n_layer) {
+                        throw std::runtime_error(format("PLE layer %u is out of range", il));
+                    }
+                    hparams.is_ple_impl.set(il);
+                }
+
+                ml.get_key(LLM_KV_PLE_NGRAM_SIZE,      hparams.ple_ngram_size);
+                ml.get_key(LLM_KV_PLE_HEADS_PER_NGRAM, hparams.ple_heads_per_ngram);
+                ml.get_key(LLM_KV_PLE_CONV_KERNEL,     hparams.ple_conv_kernel);
+                ml.get_key(LLM_KV_PLE_EOS_TOKEN_ID,    hparams.ple_eos_token_id);
+                // optional: files written before this key fall back to the EOS token
+                ml.get_key(LLM_KV_PLE_IMAGE_TOKEN_ID,  hparams.ple_image_token_id, false);
+                ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
+                qwen4exp_require_nonzero(ml, LLM_KV_PLE_CONV_KERNEL,            hparams.ple_conv_kernel);
+                qwen4exp_require_nonzero(ml, LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
+
+                hparams.ple_n_heads  = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
+                hparams.ple_head_dim = hparams.n_embd_per_layer;
+                if (hparams.ple_ngram_size < 2 || hparams.ple_ngram_size > LLAMA_MAX_PLE_NGRAM) {
+                    throw std::runtime_error(format("PLE n-gram size %u is out of range", hparams.ple_ngram_size));
+                }
+                if (hparams.ple_n_heads == 0 || hparams.ple_n_heads > LLAMA_MAX_PLE_HEADS) {
+                    throw std::runtime_error(format("PLE head count %u is out of range", hparams.ple_n_heads));
+                }
+
+                qwen4exp_require_arr_len(ml, LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_ngram_size);
+                qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_OFFSETS,      hparams.ple_n_heads);
+                qwen4exp_require_arr_len(ml, LLM_KV_PLE_HEAD_VOCAB_SIZES,  hparams.ple_n_heads);
+
+                ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS, hparams.ple_layer_multipliers);
+
+                // the file stores the head ranges as uint64, so read at that width and narrow to the int32 the gather uses
+                std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_offsets     = {};
+                std::array<uint64_t, LLAMA_MAX_PLE_HEADS> head_vocab_sizes = {};
+                ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,     head_offsets);
+                ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES, head_vocab_sizes);
+                for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+                    if (head_vocab_sizes[h] == 0 ||
+                        head_offsets[h]     > INT32_MAX ||
+                        head_vocab_sizes[h] > INT32_MAX ||
+                        head_offsets[h] + head_vocab_sizes[h] > INT32_MAX) {
+                        throw std::runtime_error(format("PLE head %u range does not fit the int32 row index", h));
+                    }
+                    hparams.ple_head_offsets[h]     = (uint32_t) head_offsets[h];
+                    hparams.ple_head_vocab_sizes[h] = (uint32_t) head_vocab_sizes[h];
+                }
+            }
+
+            // linear attention everywhere except every full_attention_interval-th layer
+            if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.recurrent_layer_arr, hparams.n_layer, false)) {
+                uint32_t full_attn_interval = 4;
+                ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+                qwen4exp_require_nonzero(ml, LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    hparams.recurrent_layer_arr[i] = (i < hparams.n_layer) && ((i + 1) % full_attn_interval != 0);
+                }
+            }
+
+            // the PLE conv history is a row of the recurrent cache, which linear layers alone have
+            for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                if (hparams.is_ple(i) && !hparams.is_recurrent(i)) {
+                    throw std::runtime_error(format("PLE layer %u is not a linear attention layer", i));
+                }
+            }
+
+            switch (hparams.n_layer) {
+                case 48: type = LLM_TYPE_A3B; break;
+                default: type = LLM_TYPE_UNKNOWN;
+            }
+        } break;
         case LLM_ARCH_QWEN3NEXT:
             {
                 ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -3310,8 +3477,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
     const llama_model_tensor_buft_override * original_tensor_buft_overrides = ml.tensor_buft_overrides;
-    std::vector<llama_model_tensor_buft_override> deferred_expert_buft_overrides;
-    std::vector<std::string> deferred_expert_buft_override_patterns;
 
     const bool use_mmap_buffer = true;
 
@@ -3409,29 +3574,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_WARN("%s: deferred expert loading disabled because tensor validation would fault expert pages eagerly\n", __func__);
         defer_expert_mmap = false;
     }
-    const bool defer_kimi_experts_on_gpu = llama_should_defer_kimi_experts_on_gpu(arch, name);
-    if (defer_expert_mmap && defer_kimi_experts_on_gpu && !devices.empty() && n_gpu_layers > 0) {
-        deferred_expert_buft_override_patterns.reserve(n_layer);
-        deferred_expert_buft_overrides.reserve(n_layer + 1);
-
-        for (int il = 0; il < n_layer; ++il) {
-            deferred_expert_buft_override_patterns.emplace_back(
-                    "blk\\." + std::to_string(il) + "\\.(ffn_(up|down|gate|gate_up)_(ch)?exps\\.(weight|scale|bias))");
-            deferred_expert_buft_overrides.push_back({
-                    deferred_expert_buft_override_patterns.back().c_str(),
-                    ggml_backend_cpu_buffer_type(),
-            });
-        }
-        if (original_tensor_buft_overrides) {
-            for (const llama_model_tensor_buft_override * override = original_tensor_buft_overrides; override->pattern != nullptr; ++override) {
-                deferred_expert_buft_overrides.push_back(*override);
-            }
-        }
-        deferred_expert_buft_overrides.push_back({ nullptr, nullptr });
-        ml.tensor_buft_overrides = deferred_expert_buft_overrides.data();
-
-        LLAMA_LOG_INFO("%s: keeping deferred expert tensors on CPU with %d overrides while applying %d GPU layers (arch=%s name='%s')\n",
-                __func__, n_layer, n_gpu_layers, llm_arch_name(arch), name.c_str());
+    // Deferred routed experts stay in plain mmap-backed CPU buffers, with or without GPU layers: Kimi's, and those
+    // of every architecture the SSD expert adapter describes, which the SSD executor reads from the drive. A
+    // repacked or device copy would hold every expert in memory.
+    ml.map_deferred_experts = defer_expert_mmap && (llama_should_map_kimi_experts(arch, name) ||
+        llama_ssd::describe_experts(arch, hparams, -1).activation != llama_ssd::expert_activation::unsupported);
+    if (ml.map_deferred_experts) {
+        LLAMA_LOG_INFO("%s: keeping deferred expert tensors in mapped CPU buffers (arch=%s name='%s')\n",
+                __func__, llm_arch_name(arch), name.c_str());
     }
 
     // DeepSeek-V4.1 engram tables are about 100 GB each and a token reads only a few rows. Pin them
@@ -5924,41 +6074,23 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             const int64_t n_cols  = (int64_t) (hparams.engram_max_ngram_size - 1) * hparams.engram_n_head;
                             const int64_t key_len = hparams.engram_key_length;
 
-                            // hundreds of millions of rows, but each token touches only n_cols of them; the
-                            // table is pinned to a plain CPU buffer (see the override above) so rows page in on demand
-                            const std::string embd_name = tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i).str();
-                            const auto * embd_meta = ml.get_tensor_meta(embd_name.c_str());
-                            if (embd_meta == nullptr) {
-                                throw std::runtime_error(format("%s is missing", embd_name.c_str()));
-                            }
-                            const int64_t n_rows = embd_meta->ne[1];
-                            int64_t row_width = key_len;
-                            if (hparams.engram_e4m3_e8m0_32_row264) {
-                                row_width = 264;
-                                if (embd_meta->type != GGML_TYPE_I8 || embd_meta->ne[0] != row_width ||
-                                        embd_meta->ne[2] != 1 || embd_meta->ne[3] != 1) {
-                                    throw std::runtime_error(format(
-                                        "%s must be I8 [264, rows] for e4m3_e8m0_32_row264", embd_name.c_str()));
-                                }
-                                if ((uint64_t) n_rows != engram_rows[eg]) {
-                                    throw std::runtime_error(format(
-                                        "%s has %" PRId64 " rows, metadata declares %" PRIu64,
-                                        embd_name.c_str(), n_rows, engram_rows[eg]));
-                                }
-                            }
-
-                            // a row index is a bucket offset plus a hash, so the last bucket has to end inside
-                            uint64_t max_row = 0;
+                            // a row index is a bucket offset plus a hash and the buckets lie back to back, so the
+                            // table ends where the last bucket does; the e4m3_e8m0_32_row264 row count was checked
+                            // against the same bucket sum when the metadata was read
+                            int64_t n_rows = 0;
                             for (int64_t b = 0; b < n_cols; ++b) {
                                 const size_t k = (size_t) eg*n_cols + b;
-                                max_row = std::max(max_row, engram_offsets[k] + engram_primes[k]);
+                                n_rows = std::max(n_rows, (int64_t) (engram_offsets[k] + engram_primes[k]));
                             }
-                            if ((int64_t) max_row > n_rows) {
-                                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the engram buckets (%" PRIu64 ")",
-                                                                embd_name.c_str(), n_rows, max_row));
-                            }
+                            const int64_t row_width = hparams.engram_e4m3_e8m0_32_row264 ? 264 : key_len;
 
+                            // hundreds of millions of rows, but each token touches only n_cols of them; the
+                            // table is pinned to a plain CPU buffer (see the override above) so rows page in on demand
                             layer.engram_embd = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {row_width, n_rows}, 0);
+                            if (hparams.engram_e4m3_e8m0_32_row264 && layer.engram_embd->type != GGML_TYPE_I8) {
+                                throw std::runtime_error(format("%s must be I8 for e4m3_e8m0_32_row264",
+                                                                layer.engram_embd->name));
+                            }
                             layer.engram_wkv  = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV,  "weight", i), {n_cols * key_len, n_embd * (hc_mult + 1)}, 0);
                             layer.engram_q    = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,    "weight", i), {n_embd, hc_mult}, 0);
                             layer.engram_k    = create_tensor(tn(LLM_TENSOR_ENGRAM_K,    "weight", i), {n_embd, hc_mult}, 0);
@@ -8060,6 +8192,112 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
                     }
                 } break;
+            case LLM_ARCH_QWEN4EXP: {
+
+
+
+                const int64_t hc     = hparams.dsv4_hc_mult;
+                const int64_t hc_dim = hc * n_embd;
+                const int64_t hc_lr  = hparams.hc_low_rank;
+
+                tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+
+                // there is no output_norm: the final hyper-connection mixer carries it
+                hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { hc_dim }, 0);
+                hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, 0);
+                hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, 0);
+
+                output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
+                if (output == NULL) {
+                    output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
+                }
+
+                // flat [ple_head_dim, n_rows] gather target; n_rows is padded, so read it back
+                if (hparams.ple_n_heads > 0) {
+                    const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+                    const auto & ple_w = ml.require_weight(ple_name.c_str());
+                    const int64_t ple_rows = ple_w.tensor->ne[1];
+
+                    ml.mark_ple_lazy(ple_w);
+
+                    // sanity check
+                    for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+                        if ((int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h] > ple_rows) {
+                            throw std::runtime_error(format("PLE head %u range exceeds the %" PRId64 " table rows", h, ple_rows));
+                        }
+                    }
+                    per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                                       { hparams.ple_head_dim, ple_rows }, 0);
+                }
+
+                for (int il = 0; il < n_layer; ++il) {
+                    auto & layer = layers[il];
+
+                    const int64_t n_ff_exp   = hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used;
+                    const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
+
+                    const int64_t head_k_dim = hparams.ssm_d_state;
+                    const int64_t head_v_dim = hparams.ssm_d_state;
+                    const int64_t n_k_heads  = hparams.ssm_n_group;
+                    const int64_t n_v_heads  = hparams.ssm_dt_rank;
+                    const int64_t key_dim    = head_k_dim * n_k_heads;
+                    const int64_t value_dim  = head_v_dim * n_v_heads;
+                    const int64_t conv_dim   = key_dim * 2 + value_dim;
+
+                    // two HC modules per layer: before the token mixer, before the MoE
+                    layer.hc_attn_norm   = create_tensor(tn(LLM_TENSOR_HC_ATTN_NORM,   "weight", il), { hc_dim }, 0);
+                    layer.hc_attn_down   = create_tensor(tn(LLM_TENSOR_HC_ATTN_DOWN,   "weight", il), { hc_dim, hc_lr }, 0);
+                    layer.hc_attn_up     = create_tensor(tn(LLM_TENSOR_HC_ATTN_UP,     "weight", il), { hc_lr, hc_dim }, 0);
+                    layer.hc_attn_inject = create_tensor(tn(LLM_TENSOR_HC_ATTN_INJECT, "weight", il), { hc_dim, hc }, 0);
+                    layer.hc_ffn_norm    = create_tensor(tn(LLM_TENSOR_HC_FFN_NORM,    "weight", il), { hc_dim }, 0);
+                    layer.hc_ffn_down    = create_tensor(tn(LLM_TENSOR_HC_FFN_DOWN,    "weight", il), { hc_dim, hc_lr }, 0);
+                    layer.hc_ffn_up      = create_tensor(tn(LLM_TENSOR_HC_FFN_UP,      "weight", il), { hc_lr, hc_dim }, 0);
+                    layer.hc_ffn_inject  = create_tensor(tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", il), { hc_dim, hc }, 0);
+
+                    if (!hparams.is_recurrent(il)) {
+                        // full attention: wq holds [q|gate] interleaved per head
+                        create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, 0);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, 0);
+
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, 0);
+                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, 0);
+
+                        const int64_t idx_dim = hparams.indexer_head_size;
+                        layer.index_q_proj = create_tensor(tn(LLM_TENSOR_INDEXER_Q_PROJ, "weight", il), { n_embd, hparams.indexer_n_head * idx_dim }, 0);
+                        layer.index_k_proj = create_tensor(tn(LLM_TENSOR_INDEXER_K_PROJ, "weight", il), { n_embd, idx_dim }, 0);
+                        layer.index_q_norm = create_tensor(tn(LLM_TENSOR_INDEXER_Q_NORM, "weight", il), { idx_dim }, 0);
+                        layer.index_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", il), { idx_dim }, 0);
+                    } else {
+                        layer.wqkv       = create_tensor(tn(LLM_TENSOR_ATTN_QKV,   "weight", il), { n_embd, key_dim * 2 + value_dim }, 0);
+                        layer.wqkv_gate  = create_tensor(tn(LLM_TENSOR_ATTN_GATE,  "weight", il), { n_embd, value_dim }, 0);
+                        layer.ssm_conv1d = create_tensor(tn(LLM_TENSOR_SSM_CONV1D, "weight", il), { hparams.ssm_d_conv, conv_dim }, 0);
+                        layer.ssm_dt     = create_tensor(tn(LLM_TENSOR_SSM_DT,     "bias",   il), { hparams.ssm_dt_rank }, 0);
+                        layer.ssm_a      = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,         il), { hparams.ssm_dt_rank }, 0);
+                        layer.ssm_beta   = create_tensor(tn(LLM_TENSOR_SSM_BETA,   "weight", il), { n_embd, n_v_heads }, 0);
+                        layer.ssm_alpha  = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,  "weight", il), { n_embd, n_v_heads }, 0);
+                        layer.ssm_norm   = create_tensor(tn(LLM_TENSOR_SSM_NORM,   "weight", il), { head_v_dim }, 0);
+                        layer.ssm_out    = create_tensor(tn(LLM_TENSOR_SSM_OUT,    "weight", il), { value_dim, n_embd }, 0);
+                    }
+
+                    if (hparams.is_ple(il)) {
+                        layer.ple_key        = create_tensor(tn(LLM_TENSOR_PLE_KEY,        "weight", il), { n_embd, hc_dim }, 0);
+                        layer.ple_value      = create_tensor(tn(LLM_TENSOR_PLE_VALUE,      "weight", il), { n_embd, n_embd }, 0);
+                        layer.ple_norm_key   = create_tensor(tn(LLM_TENSOR_PLE_NORM_KEY,   "weight", il), { hc_dim }, 0);
+                        layer.ple_norm_query = create_tensor(tn(LLM_TENSOR_PLE_NORM_QUERY, "weight", il), { hc_dim }, 0);
+                        layer.ple_norm_conv  = create_tensor(tn(LLM_TENSOR_PLE_NORM_CONV,  "weight", il), { hc_dim }, 0);
+                        layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, 0);
+                    }
+
+                    layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, 0);
+                    layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
+                    create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
+
+                    layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
+                    layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, 0);
+                    layer.ffn_up_shexp       = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,       "weight", il), { n_embd, n_ff_shexp }, 0);
+                    layer.ffn_down_shexp     = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,     "weight", il), { n_ff_shexp, n_embd }, 0);
+                }
+            } break;
             case LLM_ARCH_QWEN3NEXT:
                 {
                     if (n_expert == 0) {
@@ -9196,7 +9434,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
                     }
 
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    if (arch == LLM_ARCH_QWEN4EXP) {
+                        llama_memory_i::layer_filter_cb idx = hparams.indexer_n_head > 0 ? llama_memory_i::layer_filter_cb([&](int32_t il) { return !hparams.is_recurrent(il); }) : nullptr;
+                        res = new llama_memory_hybrid_idx(*this, params.type_k, params.type_v, !cparams.flash_attn,
+                            cparams.n_ctx_seq, 1, hparams.n_swa, hparams.swa_type,
+                            GGML_TYPE_F32, GGML_TYPE_F32, std::max((uint32_t) 1, cparams.n_seq_max),
+                            cparams.n_seq_max, cparams.offload_kqv, cparams.kv_unified,
+                            filter_attn, filter_recr, idx);
+                    } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
@@ -9769,6 +10014,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_pangu_embedded>(*this, params);
             } break;
+        case LLM_ARCH_QWEN4EXP:
+            llm = std::make_unique<llm_build_qwen4exp>(*this, params);
+            break;
         case LLM_ARCH_QWEN3NEXT:
             {
                 llm = std::make_unique<llm_build_qwen3next>(*this, params);
@@ -10065,6 +10313,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3VL:
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_QWEN35MOE:
             return LLAMA_ROPE_TYPE_IMROPE;
 
@@ -10232,4 +10481,45 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
         return nullptr;
     }
     return model->devices[i].dev;
+}
+
+void llama_model::prefetch_ple_rows(const int32_t * rows, size_t count) const {
+#if defined(__unix__) || defined(__APPLE__)
+    if (!per_layer_tok_embd || !per_layer_tok_embd->data || count == 0) return;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(per_layer_tok_embd->data);
+    const size_t bytes = ggml_nbytes(per_layer_tok_embd);
+    // Only issue advice against a live file mapping, never a repacked/virtual buffer.
+    bool mapped = false;
+    for (const auto & map : pimpl->mappings) {
+        const uintptr_t lo = reinterpret_cast<uintptr_t>(map->addr());
+        if (base >= lo && base-lo <= map->size() && bytes <= map->size()-(base-lo)) {
+            mapped = true; break;
+        }
+    }
+    if (!mapped) return;
+    const long page_query = sysconf(_SC_PAGESIZE);
+    if (page_query <= 0) return;
+    const size_t page_size = static_cast<size_t>(page_query);
+    const size_t row_bytes = ggml_row_size(per_layer_tok_embd->type, per_layer_tok_embd->ne[0]);
+    std::vector<uintptr_t> pages;
+    pages.reserve(count * (2 + row_bytes / page_size));
+    for (size_t i = 0; i < count; ++i) {
+        if (rows[i] < 0 || rows[i] >= per_layer_tok_embd->ne[1]) throw std::runtime_error("PLE prefetch row out of bounds");
+        const uintptr_t first = base + static_cast<size_t>(rows[i]) * row_bytes;
+        const uintptr_t last = first + row_bytes - 1;
+        for (uintptr_t page = first-first%page_size; page <= last-last%page_size; page += page_size) pages.push_back(page);
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    for (size_t i = 0; i < pages.size();) {
+        size_t j = i+1;
+        while (j < pages.size() && pages[j] == pages[j-1]+page_size) ++j;
+        if (madvise(reinterpret_cast<void *>(pages[i]), (j-i)*page_size, MADV_WILLNEED) != 0) {
+            LLAMA_LOG_WARN("PLE exact-page prefetch failed\n");
+        }
+        i = j;
+    }
+#else
+    (void) rows; (void) count;
+#endif
 }

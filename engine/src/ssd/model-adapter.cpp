@@ -14,8 +14,9 @@ expert_requirements describe_experts(
             return {expert_quantization::all_mxfp4, expert_activation::swiglu_clamp,
                 layer >= 0 ? hparams.swiglu_clamp_exp[layer] : 0.0f, true, false, true};
         case LLM_ARCH_MUSE_SPARK:
-            return {expert_quantization::matching_up_gate, expert_activation::swiglu_clamp,
-                INFINITY, false, true, false};
+            return {expert_quantization::matching_up_gate, expert_activation::swiglu, 0.0f, false, true, false};
+        case LLM_ARCH_QWEN4EXP:
+            return {expert_quantization::matching_up_gate, expert_activation::swiglu, 0.0f, false, false, false};
         default:
             return {};
     }
@@ -50,13 +51,13 @@ expert_validation validate_experts(const expert_requirements & requirements, con
         }
     }
     const bool accepted = layout && quantization &&
-        requirements.activation == expert_activation::swiglu_clamp && in.silu && !in.cache_compute &&
+        requirements.activation != expert_activation::unsupported && in.silu && !in.cache_compute &&
         (!requirements.single_token_or_prefill || in.n_tokens == 1 || in.prefill) &&
         (!requirements.finite_clamp || (std::isfinite(requirements.clamp) && requirements.clamp > 1e-6f)) &&
         (!requirements.require_post_norm || in.post_norm);
     if (!accepted) {
-        return {false, {}, " requires contiguous DeepSeek-V4.1 clamped SwiGLU experts in all-MXFP4, or "
-            "Muse Spark SwiGLU with per-expert post norm, without LoRA/bias/scales; no fallback"};
+        return {false, {}, " requires the model's routed experts as contiguous, separate up/gate/down "
+            "SiLU-gated tensors of a supported format, without LoRA, biases or scales; no fallback"};
     }
     return {true, {requirements.activation, requirements.clamp, in.post_norm != nullptr,
         in.post_norm_eps, in.routed_scale == 0.0f ? 1.0f : in.routed_scale}, nullptr};

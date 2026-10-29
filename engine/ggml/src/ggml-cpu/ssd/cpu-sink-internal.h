@@ -4,12 +4,12 @@
 #include <cmath>
 #include "ggml-ssd/telemetry/telemetry.h"
 
-// Matches mul(weight) followed by RMS normalization, then route scaling.
+// Matches mul(weight) followed by ggml_rms_norm, which squares in float and sums in double, then route scaling.
 inline void kimi_cpu_sink_normalize_expert(float * values, int rows, const float * norm, float eps) {
     double sum = 0.0;
     for (int row = 0; row < rows; ++row) {
         values[row] *= norm[row];
-        sum += double(values[row]) * values[row];
+        sum += double(values[row] * values[row]);
     }
     const float scale = 1.0f / std::sqrt(float(sum / rows) + eps);
     for (int row = 0; row < rows; ++row) { values[row] *= scale; }
@@ -17,8 +17,10 @@ inline void kimi_cpu_sink_normalize_expert(float * values, int rows, const float
 
 
 // Private executor hooks. The stream serializes all accesses to the shared
-// decode ring and worker pool. Call parallel only from the stream consumer;
-// callbacks must not recursively enter either executor or allocate/throw.
+// decode ring and compute phases. Call parallel only from the stream consumer,
+// and parallel_last only from the caller of a stream that returned, as the
+// open call's last phase; callbacks must not recursively enter either executor
+// or allocate/throw.
 // Streaming is a prefill operation: it disables decode cache (normally releases
 // it; optional cross-request retention checks the same memory guard) and
 // always uses ring targets. Cache admission requires a subsequent decode begin.
@@ -66,11 +68,8 @@ struct kimi_cpu_sink_prefill_batch {
 
 void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,
         kimi_cpu_sink_parallel_fn function, void * userdata);
-bool kimi_cpu_sink_stream(struct kimi_cpu_sink * sink,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate,
-        const struct ggml_tensor * down, const int32_t * ids, int nexperts,
-        kimi_cpu_sink_consumer_fn consumer, void * userdata,
-        struct kimi_cpu_sink_stats * stats, char * error, size_t error_size);
+void kimi_cpu_sink_parallel_last(struct kimi_cpu_sink * sink,
+        kimi_cpu_sink_parallel_fn function, void * userdata);
 bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         const struct ggml_tensor * up, const struct ggml_tensor * gate,
         const struct ggml_tensor * down, const int32_t * ids, int nexperts,

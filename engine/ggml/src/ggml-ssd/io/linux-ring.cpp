@@ -10,6 +10,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <type_traits>
 #include <unistd.h>
 
@@ -100,13 +101,15 @@ struct linux_ring::impl {
         sq_entries = p.sq_entries;
     }
 
-    void register_buffers(const std::vector<iovec> & buffers) {
+    void register_buffers(const std::vector<buffer_span> & buffers) {
         if (!read_fixed || buffers_registered || pending || buffers.empty() || buffers.size() > UINT16_MAX) {
             throw std::runtime_error("invalid CPU sink fixed-buffer registration state");
         }
         // Retain the indexed ranges for submission checks. Allocate before the
         // syscall so a C++ allocation failure cannot lose a live registration.
-        fixed_buffers = buffers;
+        fixed_buffers.clear();
+        fixed_buffers.reserve(buffers.size());
+        for (const auto & buffer : buffers) { fixed_buffers.push_back({buffer.base, buffer.len}); }
         int result;
         do {
             result = static_cast<int>(syscall(__NR_io_uring_register, fd, IORING_REGISTER_BUFFERS,
@@ -221,7 +224,7 @@ result<void> linux_ring::init(unsigned depth, bool fixed) noexcept {
     });
 }
 void linux_ring::close_ring() noexcept { if (state_) { state_->close_ring(); } }
-result<void> linux_ring::register_buffers(const std::vector<iovec> & buffers) noexcept {
+result<void> linux_ring::register_buffers(const std::vector<buffer_span> & buffers) noexcept {
     return boundary<void>([&] { if (!state_) { throw std::runtime_error("ring not initialized"); } state_->register_buffers(buffers); });
 }
 result<void> linux_ring::unregister_buffers() noexcept {

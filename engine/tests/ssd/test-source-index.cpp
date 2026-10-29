@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ggml-ssd/store/index.h"
-#include <cerrno>
+#include "ggml-ssd/platform/file.h"
+#include "ggml-ssd/platform/memory.h"
+#include <chrono>
 #include <cstdlib>
-#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
+#include <string>
+#include <vector>
+#if !defined(_WIN32)
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <signal.h>
 #include <unistd.h>
+#endif
 
-[[maybe_unused]] static void require(bool ok, const char * message) { if (!ok) { throw std::runtime_error(message); } }
+static void require(bool ok, const char * message) { if (!ok) { throw std::runtime_error(message); } }
 
 int main() {
-#if !defined(__linux__)
-    return 77;
-#else
-    char pattern[] = "/tmp/ssdash-source-index-XXXXXX";
-    require(mkdtemp(pattern), "temporary directory failed");
-    const std::filesystem::path directory(pattern);
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / ("inferssd-source-index-" + std::to_string(stamp));
+    require(std::filesystem::create_directory(directory), "temporary directory failed");
     std::vector<std::string> aliases;
     for (int seed = 1; seed <= 2; ++seed) {
         const auto data = directory / (std::to_string(seed) + ".bin");
@@ -45,13 +48,13 @@ int main() {
     require(!b.resolve(b.userdata, name, 3, 5000, 3, &fd_b, &offset, &bytes), "expert-count bound ignored");
     require(!b.resolve(b.userdata, name, 3, 5001, 4, &fd_b, &offset, &bytes), "tensor byte bound ignored");
     first.value.reset();
-    errno = 0;
-    require(fcntl(fd_a, F_GETFD) == -1 && errno == EBADF, "source descriptor survived its owner");
-    require(fcntl(fd_b, F_GETFL) & O_DIRECT, "second context lost direct I/O");
-    void * buffer = nullptr;
-    require(posix_memalign(&buffer, 4096, 8192) == 0, "aligned buffer failed");
-    std::unique_ptr<void, decltype(&std::free)> owned(buffer, std::free);
-    require(pread(fd_b, buffer, 8192, 4096) == 8192, "actual direct read failed");
+    uint64_t size = 0;
+    require(!ssd::platform::file_size(fd_a, size), "source descriptor survived its owner");
+    require(ssd::platform::is_direct(fd_b), "second context lost direct I/O");
+    void * buffer = ssd::platform::aligned_alloc_bytes(4096, 8192);
+    require(buffer != nullptr, "aligned buffer failed");
+    std::unique_ptr<void, decltype(&ssd::platform::aligned_free)> owned(buffer, ssd::platform::aligned_free);
+    require(ssd::platform::pread_exact(fd_b, buffer, 8192, 4096), "actual direct read failed");
     const auto * payload = static_cast<unsigned char *>(buffer);
     for (size_t i = 0; i < 5000; ++i) { require(payload[i + 1] == (4097 + i + 2) % 251, "direct payload changed"); }
     second.value.reset();
@@ -60,6 +63,8 @@ int main() {
         << name << "\t3\t5000\t" << (directory / "1.bin").string() << "\t16000\n";
     require(!ssd::store::source_index::open({bad.string()}), "out-of-file source published");
     require(!ssd::store::source_index::open({aliases[0], (directory / "missing.tsv").string()}), "partial source set published");
+#if !defined(_WIN32)
+    // A FIFO index or payload must neither block startup nor be published.
     const auto fifo = directory / "fifo";
     require(mkfifo(fifo.c_str(), 0600) == 0, "FIFO creation failed");
     const pid_t child = fork();
@@ -74,7 +79,7 @@ int main() {
     int child_status = 0;
     require(waitpid(child, &child_status, 0) == child && WIFEXITED(child_status) && !WEXITSTATUS(child_status),
         "non-regular index/payload blocked startup or was published");
+#endif
     std::filesystem::remove_all(directory);
     std::puts("SSD_CONTEXT_SOURCE_DIRECT_IO_PASS");
-#endif
 }

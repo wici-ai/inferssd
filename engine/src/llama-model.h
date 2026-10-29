@@ -103,6 +103,7 @@ enum llm_type {
     LLM_TYPE_MEDIUM,
     LLM_TYPE_LARGE,
     LLM_TYPE_XL,
+    LLM_TYPE_A3B,
     LLM_TYPE_A1_7B,
     LLM_TYPE_A2_7B,
     LLM_TYPE_8x7B,
@@ -212,6 +213,26 @@ struct llama_layer_nextn {
 };
 
 struct llama_layer {
+    ggml_tensor * index_q_proj = nullptr;
+    ggml_tensor * index_k_proj = nullptr;
+    ggml_tensor * index_q_norm = nullptr;
+    ggml_tensor * index_k_norm = nullptr;
+
+    ggml_tensor * hc_attn_down = nullptr;
+    ggml_tensor * hc_attn_inject = nullptr;
+    ggml_tensor * hc_attn_norm = nullptr;
+    ggml_tensor * hc_attn_up = nullptr;
+    ggml_tensor * hc_ffn_down = nullptr;
+    ggml_tensor * hc_ffn_inject = nullptr;
+    ggml_tensor * hc_ffn_norm = nullptr;
+    ggml_tensor * hc_ffn_up = nullptr;
+    ggml_tensor * ple_conv1d = nullptr;
+    ggml_tensor * ple_key = nullptr;
+    ggml_tensor * ple_norm_conv = nullptr;
+    ggml_tensor * ple_norm_key = nullptr;
+    ggml_tensor * ple_norm_query = nullptr;
+    ggml_tensor * ple_value = nullptr;
+
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
     struct ggml_tensor * attn_norm_b     = nullptr;
@@ -551,6 +572,11 @@ struct llama_meta_device_get_split_state_userdata {
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
 struct llama_model {
+    ggml_tensor * hc_head_norm = nullptr;
+    ggml_tensor * hc_head_down = nullptr;
+    ggml_tensor * hc_head_up = nullptr;
+    void prefetch_ple_rows(const int32_t * rows, size_t count) const;
+
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 

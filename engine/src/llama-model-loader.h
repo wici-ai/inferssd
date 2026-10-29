@@ -23,6 +23,9 @@ struct llama_file_range {
     size_t last  = 0;
 };
 
+// The expert tensors' file ranges under --defer-experts, on every OS. Their files
+// are mapped without prefetch (MAP_POPULATE, WILLNEED, PrefetchVirtualMemory),
+// so only dense tensors are paged in at load; the SSD executor reads experts.
 struct llama_expert_tensor_index {
     size_t deferred_bytes = 0;
     size_t dense_bytes = 0;
@@ -99,6 +102,9 @@ struct llama_model_loader {
     bool use_direct_io = false;
     bool check_tensors;
     bool defer_experts = false;
+    // Set by load_tensors while expert loading is deferred for an SSD executor: the
+    // routed-expert tensors take the plain CPU buffer type, an ordinary mmap.
+    bool map_deferred_experts = false;
     bool no_alloc;
 
     llama_files files;
@@ -212,6 +218,9 @@ struct llama_model_loader {
     void build_expert_tensor_index(const llama_hparams & hparams);
     bool should_defer_expert_mmaps() const;
     void drop_mmap_expert_pages() const;
+
+    std::map<size_t, std::pair<size_t, size_t>> ple_lazy_ranges;
+    void mark_ple_lazy(const llama_tensor_weight & weight);
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

@@ -16,6 +16,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include <functional>
 #include <map>
 #include <new>
@@ -48,9 +51,16 @@ struct aligned_buffer {
 
     aligned_buffer() = default;
     explicit aligned_buffer(size_t n) : size(n) {
+#if defined(_WIN32)
+        data = static_cast<uint8_t *>(_aligned_malloc(n, 4096));
+        if (!data) {
+            throw std::bad_alloc();
+        }
+#else
         if (posix_memalign(reinterpret_cast<void **>(&data), 4096, n) != 0) {
             throw std::bad_alloc();
         }
+#endif
     }
     aligned_buffer(const aligned_buffer &) = delete;
     aligned_buffer & operator=(const aligned_buffer &) = delete;
@@ -60,7 +70,7 @@ struct aligned_buffer {
     }
     aligned_buffer & operator=(aligned_buffer && other) noexcept {
         if (this != &other) {
-            std::free(data);
+            release(data);
             data = other.data;
             size = other.size;
             other.data = nullptr;
@@ -68,7 +78,15 @@ struct aligned_buffer {
         }
         return *this;
     }
-    ~aligned_buffer() { std::free(data); }
+    ~aligned_buffer() { release(data); }
+
+    static void release(uint8_t * p) noexcept {
+#if defined(_WIN32)
+        _aligned_free(p);
+#else
+        std::free(p);
+#endif
+    }
 };
 
 struct quant_data {

@@ -3,7 +3,9 @@
 
 // Fused DeepSeek-V4 hyper-connection kernels, ported from vcruz305/llama.cpp@5210c7c (dsv4-hc.cu).
 // The plain-op graph spends one tiny kernel per add/div/sum_rows on 4x4 matrices; these do a whole
-// Sinkhorn or a whole expansion per token (comb) or per output element (post).
+// Sinkhorn or a whole expansion per token (comb), a whole reduction per output element (pre) or a
+// whole expansion per output element (post). The gated reduction and the identity expansion follow
+// llama.cpp 2e0d86bebc.
 
 #define CUDA_DSV4_HC_BLOCK_SIZE 256
 
@@ -100,6 +102,112 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
+// Per-batch n_embd-major layout. Each (block.y, thread block on x) pair
+// owns one batch and a slice of n_embd. The h4 specialization keeps the
+// 4 weights in registers.
+static __global__ void dsv4_hc_pre_h4_f32(
+        const char * __restrict__ x,
+        const char * __restrict__ w,
+        float      * __restrict__ dst,
+        const int64_t n_embd,
+        const int64_t nbx0,
+        const int64_t nbx1,
+        const int64_t nbx2,
+        const int64_t nbw0,
+        const int64_t nbw1,
+        const int64_t nbd0,
+        const int64_t nbd1) {
+    const int64_t b      = blockIdx.y;
+    const int64_t tid    = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = (int64_t) blockDim.x * gridDim.x;
+
+    const char * xb = x + b*nbx2;
+    const char * wb = w + b*nbw1;
+    char       * db = ((char *) dst) + b*nbd1;
+
+    const float w0 = *(const float *) (wb + 0*nbw0);
+    const float w1 = *(const float *) (wb + 1*nbw0);
+    const float w2 = *(const float *) (wb + 2*nbw0);
+    const float w3 = *(const float *) (wb + 3*nbw0);
+
+    for (int64_t e = tid; e < n_embd; e += stride) {
+        const char * xe = xb + e*nbx0;
+        const float v = *(const float *) (xe + 0*nbx1) * w0
+                      + *(const float *) (xe + 1*nbx1) * w1
+                      + *(const float *) (xe + 2*nbx1) * w2
+                      + *(const float *) (xe + 3*nbx1) * w3;
+        *(float *) (db + e*nbd0) = v;
+    }
+}
+
+static __global__ void dsv4_hc_pre_f32(
+        const char * __restrict__ x,
+        const char * __restrict__ w,
+        float      * __restrict__ dst,
+        const int64_t n_embd,
+        const int64_t hc,
+        const int64_t nbx0,
+        const int64_t nbx1,
+        const int64_t nbx2,
+        const int64_t nbw0,
+        const int64_t nbw1,
+        const int64_t nbd0,
+        const int64_t nbd1) {
+    const int64_t b      = blockIdx.y;
+    const int64_t tid    = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t stride = (int64_t) blockDim.x * gridDim.x;
+
+    const char * xb = x + b*nbx2;
+    const char * wb = w + b*nbw1;
+    char       * db = ((char *) dst) + b*nbd1;
+
+    for (int64_t e = tid; e < n_embd; e += stride) {
+        const char * xe = xb + e*nbx0;
+        float sum = 0.0f;
+        for (int64_t h = 0; h < hc; ++h) {
+            sum += *(const float *) (xe + h*nbx1) * *(const float *) (wb + h*nbw0);
+        }
+        *(float *) (db + e*nbd0) = sum;
+    }
+}
+
+// result[i, t] = scale*sum_h x[i, h, t]*sigmoid(gate[i, h, t])
+static __global__ void dsv4_hc_pre_gated_f32(
+        const float * x,
+        const float * gate,
+        float * dst,
+        int64_t n_embd,
+        int64_t hc,
+        int64_t n_tokens,
+        int64_t sx0,
+        int64_t sx1,
+        int64_t sx2,
+        int64_t sg0,
+        int64_t sg1,
+        int64_t sg2,
+        int64_t sd0,
+        int64_t sd1,
+        float   scale) {
+    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t nr = n_embd * n_tokens;
+    if (ir >= nr) {
+        return;
+    }
+
+    const int64_t i0 = ir % n_embd;
+    const int64_t it = ir / n_embd;
+
+    float sum = 0.0f;
+    for (int64_t ih = 0; ih < hc; ++ih) {
+        const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
+        const float wv = 1.0f / (1.0f + expf(-gate[i0*sg0 + ih*sg1 + it*sg2]));
+        sum += xv * wv;
+    }
+
+    dst[i0*sd0 + it*sd1] = scale * sum;
+}
+
+template <bool has_comb>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
         const float * residual,
@@ -133,8 +241,12 @@ static __global__ void dsv4_hc_post_f32(
     const int64_t it   = ir / (n_embd * hc);
 
     float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
-    for (int64_t isrc = 0; isrc < hc; ++isrc) {
-        sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
+    if constexpr (has_comb) {
+        for (int64_t isrc = 0; isrc < hc; ++isrc) {
+            sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
+        }
+    } else {
+        sum += residual[i0*sr0 + idst*sr1 + it*sr2];
     }
 
     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
@@ -176,6 +288,60 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             eps, n_iter);
 }
 
+void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x       = dst->src[0];
+    const ggml_tensor * weights = dst->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc       = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+
+    if (gated) {
+        const int64_t nr = n_embd * n_tokens;
+        const dim3 block_dims(CUDA_DSV4_HC_BLOCK_SIZE, 1, 1);
+        const dim3 block_nums((unsigned int) ((nr + CUDA_DSV4_HC_BLOCK_SIZE - 1) / CUDA_DSV4_HC_BLOCK_SIZE), 1, 1);
+
+        dsv4_hc_pre_gated_f32<<<block_nums, block_dims, 0, ctx.stream()>>>(
+                (const float *) x->data, (const float *) weights->data, (float *) dst->data,
+                n_embd, hc, n_tokens,
+                x->nb[0] / sizeof(float), x->nb[1] / sizeof(float), x->nb[2] / sizeof(float),
+                weights->nb[0] / sizeof(float), weights->nb[1] / sizeof(float), weights->nb[2] / sizeof(float),
+                dst->nb[0] / sizeof(float), dst->nb[1] / sizeof(float),
+                scale);
+        return;
+    }
+
+    // the plain reduction has a unit scale
+    const int64_t num_blocks_x = (n_embd + CUDA_DSV4_HC_BLOCK_SIZE - 1) / CUDA_DSV4_HC_BLOCK_SIZE;
+    const dim3 block_nums((unsigned int) num_blocks_x, (unsigned int) n_tokens, 1);
+    const dim3 block_dims(CUDA_DSV4_HC_BLOCK_SIZE, 1, 1);
+
+    const char * x_d = (const char *) x->data;
+    const char * w_d = (const char *) weights->data;
+    float * dst_d = (float *) dst->data;
+
+    if (hc == 4) {
+        dsv4_hc_pre_h4_f32<<<block_nums, block_dims, 0, ctx.stream()>>>(
+                x_d, w_d, dst_d, n_embd,
+                x->nb[0], x->nb[1], x->nb[2],
+                weights->nb[0], weights->nb[1],
+                dst->nb[0], dst->nb[1]);
+    } else {
+        dsv4_hc_pre_f32<<<block_nums, block_dims, 0, ctx.stream()>>>(
+                x_d, w_d, dst_d, n_embd, hc,
+                x->nb[0], x->nb[1], x->nb[2],
+                weights->nb[0], weights->nb[1],
+                dst->nb[0], dst->nb[1]);
+    }
+}
+
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
@@ -185,7 +351,7 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
     GGML_ASSERT(post->type == GGML_TYPE_F32);
-    GGML_ASSERT(comb->type == GGML_TYPE_F32);
+    GGML_ASSERT(comb == nullptr || comb->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     const int64_t n_embd   = x->ne[0];
@@ -196,13 +362,18 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const dim3 block_dims(CUDA_DSV4_HC_BLOCK_SIZE, 1, 1);
     const dim3 block_nums((unsigned int) ((nr + CUDA_DSV4_HC_BLOCK_SIZE - 1) / CUDA_DSV4_HC_BLOCK_SIZE), 1, 1);
 
-    dsv4_hc_post_f32<<<block_nums, block_dims, 0, ctx.stream()>>>(
+    const int64_t sc0 = comb ? comb->nb[0] / sizeof(float) : 0;
+    const int64_t sc1 = comb ? comb->nb[1] / sizeof(float) : 0;
+    const int64_t sc2 = comb ? comb->nb[2] / sizeof(float) : 0;
+
+    auto kernel = comb ? dsv4_hc_post_f32<true> : dsv4_hc_post_f32<false>;
+    kernel<<<block_nums, block_dims, 0, ctx.stream()>>>(
             (const float *) x->data, (const float *) residual->data,
-            (const float *) post->data, (const float *) comb->data, (float *) dst->data,
+            (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
             n_embd, hc, n_tokens,
             x->nb[0] / sizeof(float), x->nb[1] / sizeof(float),
             residual->nb[0] / sizeof(float), residual->nb[1] / sizeof(float), residual->nb[2] / sizeof(float),
             post->nb[0] / sizeof(float), post->nb[1] / sizeof(float),
-            comb->nb[0] / sizeof(float), comb->nb[1] / sizeof(float), comb->nb[2] / sizeof(float),
+            sc0, sc1, sc2,
             dst->nb[0] / sizeof(float), dst->nb[1] / sizeof(float), dst->nb[2] / sizeof(float));
 }

@@ -11,7 +11,6 @@ int main() {
     fixture_inputs inputs; inputs.set_runtime_services(test_gpu_services()); try {
     ggml_cpu_init();
     inputs.set("ready_first", "1");
-    inputs.set("split_cv", "1");
     inputs.set("cache_policy", "lru");
     inputs.set("cache_allocation", "uniform");
     inputs.set("cache_keep", "0");

@@ -100,6 +100,7 @@ public:
     std::vector<mem_cell> cells;
 
     // per layer
+    std::vector<ggml_tensor *> p_l;
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
 
@@ -159,6 +160,7 @@ public:
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
 
+    ggml_tensor * get_p_l(int32_t il) const;
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
 

@@ -320,7 +320,7 @@ ggml_tensor * llm_build_deepseek41::build_hc_pre(
     GGML_ASSERT(x->ne[1] == hparams.dsv4_hc_mult);
 
     if (cparams.ssd_hc_fused) {
-        return ggml_hc_weighted_sum(ctx0, x, weights);
+        return ggml_dsv4_hc_pre(ctx0, x, weights);
     }
 
     const int64_t hc = hparams.dsv4_hc_mult;

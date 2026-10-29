@@ -1,6 +1,7 @@
 // Included after sink_cache. Private, default-off GPU tier adapter.
 static_assert(int(KIMI_VRAM_ACTIVATION_SITU) == int(KIMI_CPU_SINK_ACTIVATION_SITU) &&
-    int(KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP) == int(KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP),
+    int(KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP) == int(KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) &&
+    int(KIMI_VRAM_ACTIVATION_SWIGLU) == int(KIMI_CPU_SINK_ACTIVATION_SWIGLU),
     "VRAM tier and CPU sink activation kinds must match");
 struct sink_vram {
     const kimi_vram_tier_api * api = nullptr;
@@ -64,6 +65,10 @@ struct sink_vram {
     const kimi_vram_host_api * host_api = nullptr;
     uint64_t host_experts = 0;
     const kimi_vram_policy_api * policy_api = nullptr; // optional: miss cost, host demand and floor, host reclaim
+    // The CPUs the tier's threads were given (policy set_thread_cpus): those of the run's coordinator, which waits for
+    // them. Read at the first layer on the tier after each begin, once ggml has placed the graph's threads.
+    ssd::platform::cpu_list thread_cpus, coordinator_cpus;
+    bool placement_due = true;
 
     void initialize(bool ready_first, const sink_configuration & configuration) {
         const bool use_locations = !configuration.production && configuration.policy.vram_locations;
@@ -78,7 +83,7 @@ struct sink_vram {
         if (configuration.production) {
             const auto * budget = configuration.settings.vram_budget();
             if (!budget) { throw std::runtime_error("missing typed vram.budget"); }
-            bytes = budget->automatic ? UINT64_MAX : budget->bytes;
+            bytes = budget->tier_bytes(configuration.has_gpu);
             async_upload = exclusive = deferred_upload = prefill_enabled = bytes != 0;
         }
         {
@@ -177,9 +182,9 @@ struct sink_vram {
         if (!context) { throw std::runtime_error(std::string("GPU tier create: ") + error); }
         if (configuration.gpu.policy) {
             policy_api = configuration.gpu.policy;
-            if (!policy_api || policy_api->version != 3 || policy_api->size != sizeof(*policy_api) ||
+            if (!policy_api || policy_api->version != 4 || policy_api->size != sizeof(*policy_api) ||
                     !policy_api->set_miss_cost || !policy_api->set_host_demand || !policy_api->set_host_floor ||
-                    !policy_api->reclaim_host || !policy_api->host_bytes) {
+                    !policy_api->reclaim_host || !policy_api->host_bytes || !policy_api->set_thread_cpus) {
                 throw std::runtime_error("GPU tier admission-policy ABI mismatch");
             }
         }
@@ -212,8 +217,24 @@ struct sink_vram {
     void check(int result, const char * error) {
         if (result) { throw std::runtime_error(std::string("GPU tier: ") + error); }
     }
+    // The tier's threads on the CPUs of this thread, the coordinator, when they changed since the last placement.
+    void place_threads() {
+        if (!placement_due || !policy_api) { return; }
+        std::string why;
+        if (!ssd::platform::current_thread_cpus(coordinator_cpus, &why)) {
+            throw std::runtime_error("GPU tier thread placement: " + why);
+        }
+        if (coordinator_cpus != thread_cpus) {
+            char error[512] = {};
+            check(policy_api->set_thread_cpus(context, coordinator_cpus.data(), int(coordinator_cpus.size()),
+                error, sizeof(error)), error);
+            thread_cpus = coordinator_cpus;
+        }
+        placement_due = false;
+    }
     void begin(uint64_t epoch, uint64_t token, bool decode, sink_cache & cache) {
         if (!context) { return; }
+        placement_due = true;
         // Graph-layer prefill calls repeat the context boundary transition.
         // The first transition owns shrink/reclaimer arming; repeating it after
         // scheduler reserve would incorrectly re-arm OOM reclamation mid-graph.
@@ -266,6 +287,7 @@ struct sink_vram {
                  int latent, int hidden, const std::vector<int32_t> & layer_ids, sink_cache & cache, bool unweighted = false) {
         hits = 0;
         if (!context) { return; }
+        place_threads();
         int layer = -1, consumed = 0;
         const char * tensor_name = up->name;
         if (std::sscanf(tensor_name, "blk.%d.ffn_up_exps.weight%n", &layer, &consumed) != 1 ||
@@ -287,7 +309,7 @@ struct sink_vram {
             for (int role = 0; role < 3; ++role) {
                 const auto k = sink_cache::key(source[i].role[role]);
                 r.role[role] = { k.device, k.inode, k.size, k.offset, k.bytes,
-                                k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns };
+                                k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns, k.inode_hi };
             }
         }
         char error[512] = {};
@@ -421,6 +443,7 @@ struct sink_vram {
         prefill_stats = {};
         prefill_batched = prefill_in_place = false;
         if (!context || !prefill_enabled || source.empty()) { return 0; }
+        place_threads();
         int layer = -1, consumed = 0;
         const char * tensor_name = up->name;
         if (std::sscanf(tensor_name, "blk.%d.ffn_up_exps.weight%n", &layer, &consumed) != 1 ||
@@ -436,7 +459,7 @@ struct sink_vram {
             for (int role = 0; role < 3; ++role) {
                 const auto k = sink_cache::key(source[i].role[role]);
                 r.role[role] = { k.device, k.inode, k.size, k.offset, k.bytes,
-                                k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns };
+                                k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns, k.inode_hi };
             }
         }
         const kimi_vram_expert_format f = { latent, hidden, int32_t(up->type), int32_t(down->type),
@@ -743,7 +766,8 @@ struct sink_vram {
         for (int r = 0; r < 3; ++r) {
             const auto & x = a.role[r];
             const auto & y = b.role[r];
-            if (x.device != y.device || x.inode != y.inode || x.size != y.size || x.offset != y.offset || x.bytes != y.bytes ||
+            if (x.device != y.device || x.inode != y.inode || x.inode_hi != y.inode_hi || x.size != y.size ||
+                    x.offset != y.offset || x.bytes != y.bytes ||
                     x.mtime_s != y.mtime_s || x.mtime_ns != y.mtime_ns || x.ctime_s != y.ctime_s || x.ctime_ns != y.ctime_ns) {
                 return false;
             }
@@ -836,6 +860,7 @@ struct sink_vram {
     }
     void capture_locations(const kimi_cache_location_candidate * candidates,int count,int latent,int hidden) {
         if(!location_api)return;
+        place_threads();
         if(count<=0 || count>16)throw std::runtime_error("invalid VRAM native candidate count");
         char error[512]={};check(location_api->configure(context,latent,hidden,error,sizeof(error)),error);
         requests.resize(count);location_sources.assign(count,{});
@@ -845,7 +870,7 @@ struct sink_vram {
             request.layer=candidates[i].layer;request.expert=source.id;request.weight=1;
             for(int role=0;role<3;++role){
                 source.role[role]=candidates[i].role[role];const auto k=sink_cache::key(source.role[role]);
-                request.role[role]={k.device,k.inode,k.size,k.offset,k.bytes,k.mtime_s,k.mtime_ns,k.ctime_s,k.ctime_ns};
+                request.role[role]={k.device,k.inode,k.size,k.offset,k.bytes,k.mtime_s,k.mtime_ns,k.ctime_s,k.ctime_ns,k.inode_hi};
             }
         }
     }

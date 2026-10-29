@@ -12,6 +12,7 @@ from typing import Optional
 from inferssd.engine.core import Engine
 from inferssd.engine.runtime import Runtime
 from inferssd.launch.live import NativeHost
+from inferssd.launch.machine import MachineSource
 from inferssd.launch.typed_command import specification
 from inferssd.launch.types import LaunchInput, Output
 from inferssd.platform.policy import Policy
@@ -42,7 +43,12 @@ def run_native(args: argparse.Namespace, inputs: LaunchInput) -> int:
         raise KeyboardInterrupt(f"signal {number}")
 
     runtime = Runtime(
-        inputs, policy, host=NativeHost(), emit=emit, configuration=specification(args)
+        inputs,
+        policy,
+        host=NativeHost(),
+        emit=emit,
+        configuration=specification(args, strategy=True),
+        machine=MachineSource(args.machine, args.reprofile),
     )
     engine: Optional[Engine] = None
     handlers = {

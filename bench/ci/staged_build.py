@@ -153,18 +153,20 @@ def validate_platform_flags(platform, flags):
     def enabled(key, default):
         value = values.get(key, default)
         return value not in false and not value.endswith("-NOTFOUND")
-    if enabled("LLAMA_SSD_STORE", "ON" if platform == "linux" else "OFF"):
-        if (platform != "linux" or not enabled("BUILD_SHARED_LIBS", "ON")
-                or enabled("LLAMA_USE_SYSTEM_GGML", "OFF")):
-            raise ValueError("LLAMA_SSD_STORE requires Linux, BUILD_SHARED_LIBS=ON and bundled ggml")
+    if enabled("LLAMA_SSD_STORE", "ON") and enabled("LLAMA_USE_SYSTEM_GGML", "OFF"):
+        raise ValueError("LLAMA_SSD_STORE requires the bundled ggml")
 
 
-def run_build(session, side, settings, paths, output, revision):
+def run_build(session, side, settings, paths, output, revision, *, adopted=None):
     """Paths: platform/source/build/cwd/frozen, plus job_root for Darwin.
 
     Settings require cmake, cmake_flags, jobs, targets, timeout_s, toolchain,
     binary_relative and image_relatives. Output is a fresh evidence directory.
     Every command, including the final --version, runs as a sandboxed stage.
+
+    `adopted` is the broker's job.open description of a cached frozen tree it
+    verified and copied into this job's frozen side. Configure and build are
+    then skipped; the toolchain, image and --version checks below still apply.
     """
     full_revision(revision)
     if side not in ("base", "candidate") or paths.get("platform") not in ("linux", "darwin"):
@@ -230,11 +232,18 @@ def run_build(session, side, settings, paths, output, revision):
         return stage, logs["stdout"] + b"\n" + logs["stderr"]
 
     try:
-        _, configured = command("configure", "build", [cmake, "-S", paths["source"], "-B", paths["build"], *settings["cmake_flags"]], paths["cwd"])
-        if b"Manually-specified variables were not used by the project" in configured:
-            raise ValueError("reviewed CMake flags include unused or retired controls")
-        built, _ = command("build", "build", [cmake, "--build", paths["build"], "--parallel", str(jobs), "--target", *settings["targets"]], paths["cwd"])
-        frozen = session.freeze(built, **freeze_fields)
+        if adopted is None:
+            _, configured = command("configure", "build", [cmake, "-S", paths["source"], "-B", paths["build"], *settings["cmake_flags"]], paths["cwd"])
+            if b"Manually-specified variables were not used by the project" in configured:
+                raise ValueError("reviewed CMake flags include unused or retired controls")
+            built, _ = command("build", "build", [cmake, "--build", paths["build"], "--parallel", str(jobs), "--target", *settings["targets"]], paths["cwd"])
+            frozen = session.freeze(built, **freeze_fields)
+        else:
+            if paths["platform"] != "linux" or not isinstance(adopted, dict) or adopted.get("side") != side:
+                raise ValueError("a cached build is adopted only by the Linux broker for its exact side")
+            frozen = {key: adopted[key] for key in ("side", "path", "host_path", "manifest_path",
+                                                    "manifest_sha256", "bytes", "files", "lease")}
+            receipt["adopted"] = dict(key=adopted["key"], manifest_sha256=adopted["manifest_sha256"])
         receipt["freeze"] = frozen
         if frozen.get("path") != paths["frozen"]:
             raise ValueError("broker freeze path differs from reviewed runtime layout")

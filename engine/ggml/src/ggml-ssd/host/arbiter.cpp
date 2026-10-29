@@ -8,23 +8,13 @@
 #include <stdexcept>
 #include <utility>
 
-#if !defined(_WIN32)
-#include "ledger.h"
+// One arbiter on every OS; only the budget sources differ.
+#if defined(__linux__)
+#include "ledger.h" // cgroup v2 and /proc
+namespace ssd { namespace host { using host_ledger = ::kimi_host_ledger; } }
 #else
-// No Linux budget provider on Windows. Preserve ownership ABI but refuse
-// admission without any readable resource term.
-struct kimi_host_ledger {
-    ssd::host::process_arbiter::reader read;
-    bool unified = false, reclaimable_file = false;
-    uint64_t reserve = 0, margin = 0, explicit_reserve = 0, prefill_pages = 0;
-    uint64_t file_reserve = 0, refaults = 0, file_updates = 0, page_size = 4096;
-    std::string cgroup;
-    bool get(const std::string & p, std::string & text) const { return read && read(p, text); }
-    uint64_t floor() const { return margin; }
-    ssd::host::room measure(uint64_t, bool) const { return {}; }
-    bool memory_available_at_full_boost(uint64_t &, uint64_t &) const { return false; }
-    bool update_file_reserve() { return false; }
-};
+#include "ledger-native.h" // job objects or host.budget_mib, and the OS memory status
+namespace ssd { namespace host { using host_ledger = native_ledger; } }
 #endif
 
 namespace ssd { namespace host {
@@ -42,7 +32,7 @@ template<class T, class F> result<T> guarded(F && call) noexcept {
 bool same_config(const client_config & a, const client_config & b) noexcept {
     return a.unified == b.unified && a.reserve_bytes == b.reserve_bytes &&
         a.margin_bytes == b.margin_bytes && a.explicit_reserve_bytes == b.explicit_reserve_bytes &&
-        a.reclaimable_file == b.reclaimable_file;
+        a.reclaimable_file == b.reclaimable_file && a.budget_bytes == b.budget_bytes;
 }
 }
 namespace detail {
@@ -50,10 +40,12 @@ struct client_state {
     uint64_t id = 0;
     bool configured = false, closing = false, closed = false;
     client_config config;
-    uint64_t prefill_pages = 0, committed_grants = 0, pending = 0, external_pending = 0;
+    uint64_t prefill_pages = 0, committed_grants = 0, pending = 0, external_pending = 0, device_held = 0;
     size_t operations = 0, tickets = 0;
     bool interval_open = false, interval_overlap = false;
     uint64_t interval_available = 0, interval_known = 0, overlap_skips = 0;
+    std::shared_ptr<const actions> reclaimer; // set_reclaimer
+    size_t reclaims = 0;                      // reclaimer runs in progress, outside the mutex
 };
 }
 uint64_t room::shortage() const noexcept { return std::max(cgroup_shortage, system_shortage); }
@@ -68,7 +60,7 @@ uint64_t room::surplus() const noexcept {
 struct process_arbiter::impl {
     std::mutex mutex;
     std::condition_variable changed;
-    kimi_host_ledger budget;
+    host_ledger budget;
     uint64_t next_client = 1, next_ticket = 1, pending = 0, margin_updates = 0;
     bool domain_set = false, domain_unified = false, domain_reclaimable = true;
     std::map<uint64_t, std::shared_ptr<detail::client_state>> clients;
@@ -80,12 +72,12 @@ struct process_arbiter::impl {
     std::map<uint64_t, pending_ticket> tickets;
 
     explicit impl(reader injected) {
-        budget.read = std::move(injected);
         budget.reserve = budget.margin = 512ull << 20;
-#if !defined(_WIN32)
+#if defined(__linux__)
+        // The Linux ledger reads /proc and cgroup v2 files, through the injected reader in tests.
+        budget.read = std::move(injected);
         const long page = sysconf(_SC_PAGESIZE);
         budget.page_size = page > 0 ? uint64_t(page) : 4096;
-#endif
         std::string groups;
         if (budget.get("/proc/self/cgroup", groups)) {
             for (size_t at = 0; at < groups.size();) {
@@ -96,6 +88,9 @@ struct process_arbiter::impl {
                 at = end + 1;
             }
         }
+#else
+        (void) injected; // the native ledger asks the OS, not files
+#endif
     }
     static const char * invalid(const detail::client_state & state, bool configured = true) noexcept {
         if (state.closing || state.closed) { return "host context is closing"; }
@@ -132,8 +127,15 @@ struct process_arbiter::impl {
         }
         return total;
     }
+    // What the cgroup does not charge: the caches' device memory, on unified memory only.
+    uint64_t held_device() const noexcept {
+        uint64_t total = 0;
+        if (!budget.unified) { return 0; }
+        for (const auto & pair : clients) { total = add(total, pair.second->device_held); }
+        return total;
+    }
     void refresh_config() noexcept {
-        uint64_t reserve = 512ull << 20, margin = reserve, explicit_reserve = 0;
+        uint64_t reserve = 512ull << 20, margin = reserve, explicit_reserve = 0, envelope = 0;
         bool unified = domain_unified, reclaimable = domain_reclaimable;
         for (const auto & pair : clients) {
             if (!pair.second->configured) { continue; }
@@ -142,16 +144,26 @@ struct process_arbiter::impl {
             reserve = std::max(reserve, config.reserve_bytes);
             margin = std::max(margin, config.margin_bytes);
             explicit_reserve = std::max(explicit_reserve, config.unified ? config.explicit_reserve_bytes : 0);
+            // The tightest explicit envelope binds every client of the process.
+            if (config.budget_bytes) { envelope = envelope ? std::min(envelope, config.budget_bytes) : config.budget_bytes; }
         }
         budget.unified = unified; budget.reclaimable_file = reclaimable;
         budget.reserve = reserve; budget.margin = std::max(budget.margin, std::max(margin, reserve));
         budget.explicit_reserve = explicit_reserve;
+#if defined(__linux__)
+        (void) envelope; // the cgroup's memory.max is the Linux envelope
+#else
+        budget.budget = envelope;
+#endif
     }
     room measure(uint64_t extra, bool full_boost, uint64_t excluding = 0) const {
         // Copies share only the cached descriptor reader. Projection never
         // mutates published holds or the owner's learning state.
         auto view = budget;
         view.prefill_pages = pages(excluding);
+#if defined(__linux__)
+        view.device_held = held_device(); // the native ledgers' envelopes charge device memory to the process
+#endif
         const auto observed = view.measure(add(extra, pending), full_boost);
         room out;
         out.cgroup = static_cast<room_state>(observed.cgroup);
@@ -179,33 +191,43 @@ struct process_arbiter::impl {
         }
         return true;
     }
-    result<room> reclaim(uint64_t extra, const std::shared_ptr<detail::client_state> & state, const actions & callbacks) {
-        room observed; bool unified = false;
+    // An admission of `extra` bytes that `observed` found short: the context's reclaimer gives back what `who` may
+    // ask of it, its steps run without the mutex. False when there is nothing to run.
+    result<bool> reclaim(uint64_t extra, room observed, const std::shared_ptr<detail::client_state> & state, requester who) {
+        // clear_reclaimer waits for the count; the callbacks go before it drops
+        struct running {
+            impl & owner; detail::client_state & state; std::shared_ptr<const actions> callbacks;
+            ~running() {
+                callbacks.reset();
+                std::lock_guard<std::mutex> lock(owner.mutex);
+                --state.reclaims; owner.changed.notify_all();
+            }
+        };
+        std::shared_ptr<const actions> registered;
+        bool unified = false;
         {
             std::lock_guard<std::mutex> lock(mutex);
-            if (const auto * error = invalid(*state)) { return failed<room>(status::invalid, error); }
-            observed = measure(extra, true); unified = budget.unified;
+            if (const auto * error = invalid(*state)) { return failed<bool>(status::invalid, error); }
+            if (who == requester::gpu_tier || !state->reclaimer) { return passed(false); }
+            registered = state->reclaimer; ++state->reclaims; unified = budget.unified;
         }
-        if (!observed.fits() && observed.system_shortage && unified && callbacks.reclaim_tier) {
+        const running done{ *this, *state, std::move(registered) };
+        const actions & callbacks = *done.callbacks;
+        if (unified && who == requester::outside && callbacks.reclaim_tier) {
             if (callbacks.collect_deferred) { callbacks.collect_deferred(); }
             uint64_t need;
             {
                 std::lock_guard<std::mutex> lock(mutex);
-                if (const auto * error = invalid(*state)) { return failed<room>(status::invalid, error); }
+                if (const auto * error = invalid(*state)) { return failed<bool>(status::invalid, error); }
                 need = add(add(extra, pages()), pending);
             }
             callbacks.reclaim_tier(need);
             std::lock_guard<std::mutex> lock(mutex);
-            if (const auto * error = invalid(*state)) { return failed<room>(status::invalid, error); }
+            if (const auto * error = invalid(*state)) { return failed<bool>(status::invalid, error); }
             observed = measure(extra, true);
         }
-        if (!observed.fits() && callbacks.reclaim_cache) {
-            callbacks.reclaim_cache(extra);
-            std::lock_guard<std::mutex> lock(mutex);
-            if (const auto * error = invalid(*state)) { return failed<room>(status::invalid, error); }
-            observed = measure(extra, true);
-        }
-        return passed(observed);
+        if (!observed.fits() && callbacks.reclaim_cache) { callbacks.reclaim_cache(extra); }
+        return passed(true);
     }
 };
 process_arbiter::process_arbiter(reader injected) noexcept {
@@ -264,6 +286,7 @@ result<snapshot> context_client::state() const noexcept {
         out.reserve = owner.budget.reserve; out.margin = owner.budget.margin;
         out.explicit_reserve = owner.budget.explicit_reserve; out.floor = owner.budget.floor();
         out.prefill_pages = state_->prefill_pages; out.all_prefill_pages = owner.pages(); out.pending_bytes = owner.pending;
+        out.device_held = state_->device_held; out.all_device_held = owner.held_device();
         out.file_reserve = owner.budget.file_reserve; out.refaults = owner.budget.refaults;
         out.file_updates = owner.budget.file_updates; out.granted = add(state_->committed_grants, state_->external_pending);
         out.margin_updates = owner.margin_updates; out.overlap_skips = state_->overlap_skips; out.cgroup = owner.budget.cgroup;
@@ -276,6 +299,16 @@ result<void> context_client::set_prefill_pages(uint64_t pages) noexcept {
         if (operation.error) { return {status::invalid, operation.error}; }
         std::lock_guard<std::mutex> lock(owner.mutex);
         if (state_->prefill_pages != pages) { state_->prefill_pages = pages; owner.invalidate_peers(state_->id); }
+        return {};
+    });
+}
+result<void> context_client::set_device_held(uint64_t bytes) noexcept {
+    return guarded<void>([&]() -> result<void> {
+        auto & owner = *owner_->impl_; process_arbiter::impl::operation operation(owner, state_);
+        if (operation.error) { return {status::invalid, operation.error}; }
+        std::lock_guard<std::mutex> lock(owner.mutex);
+        const uint64_t held = state_->config.unified ? bytes : 0;
+        if (state_->device_held != held) { state_->device_held = held; owner.invalidate_peers(state_->id); }
         return {};
     });
 }
@@ -302,14 +335,39 @@ result<room> context_client::project_decode_capacity(uint64_t extra, bool full_b
         std::lock_guard<std::mutex> lock(owner.mutex); return passed(owner.measure(extra, full_boost, state_->id));
     });
 }
-result<room> context_client::make_room(uint64_t extra, const actions & callbacks) noexcept {
+result<void> context_client::set_reclaimer(const actions & callbacks) noexcept {
+    return guarded<void>([&]() -> result<void> {
+        auto & owner = *owner_->impl_;
+        auto registered = std::make_shared<const actions>(callbacks);
+        std::lock_guard<std::mutex> lock(owner.mutex);
+        if (const auto * error = owner.invalid(*state_, false)) { return {status::invalid, error}; }
+        if (state_->reclaimer) { return {status::invalid, "host context already has a reclaimer"}; }
+        state_->reclaimer = std::move(registered);
+        return {};
+    });
+}
+void context_client::clear_reclaimer() noexcept {
+    auto & owner = *owner_->impl_; std::unique_lock<std::mutex> lock(owner.mutex);
+    state_->reclaimer.reset();
+    owner.changed.wait(lock, [&] { return !state_->reclaims; });
+}
+result<room> context_client::make_room(uint64_t extra) noexcept {
     return guarded<room>([&]() -> result<room> {
         auto & owner = *owner_->impl_; process_arbiter::impl::operation operation(owner, state_);
         if (operation.error) { return failed<room>(status::invalid, operation.error); }
-        return owner.reclaim(extra, state_, callbacks);
+        const auto measured = [&]() -> result<room> {
+            std::lock_guard<std::mutex> lock(owner.mutex);
+            if (const auto * error = owner.invalid(*state_)) { return failed<room>(status::invalid, error); }
+            return passed(owner.measure(extra, true));
+        };
+        auto observed = measured();
+        if (!observed || observed.value.fits()) { return observed; }
+        const auto reclaimed = owner.reclaim(extra, observed.value, state_, requester::outside);
+        if (!reclaimed) { return failed<room>(reclaimed.code, reclaimed.error.c_str()); }
+        return reclaimed.value ? measured() : observed;
     });
 }
-result<allocation_ticket> context_client::take(uint64_t host, uint64_t device, const actions & callbacks,
+result<allocation_ticket> context_client::take(uint64_t host, uint64_t device, requester who,
         bool finite, allocation_class classification) noexcept {
     return guarded<allocation_ticket>([&]() -> result<allocation_ticket> {
         auto & owner = *owner_->impl_; process_arbiter::impl::operation operation(owner, state_);
@@ -317,32 +375,42 @@ result<allocation_ticket> context_client::take(uint64_t host, uint64_t device, c
         if (classification != allocation_class::external && classification != allocation_class::tracked) {
             return failed<allocation_ticket>(status::invalid, "host allocation class");
         }
+        if (who != requester::outside && who != requester::ram_cache && who != requester::gpu_tier) {
+            return failed<allocation_ticket>(status::invalid, "host requester");
+        }
         if (state_->config.unified && device > UINT64_MAX - host) {
             return failed<allocation_ticket>(status::resource, "host byte overflow");
         }
         const uint64_t extra = add(host, state_->config.unified ? device : 0);
-        auto reclaimed = owner.reclaim(extra, state_, callbacks);
+        // The room measured under the mutex, and the ticket issued under the same lock when it fits.
+        const auto admit = [&]() -> result<allocation_ticket> {
+            std::lock_guard<std::mutex> lock(owner.mutex);
+            if (const auto * error = owner.invalid(*state_)) { return failed<allocation_ticket>(status::invalid, error); }
+            auto observed = owner.measure(extra, true);
+            const bool readable = observed.system || observed.cgroup != room_unreadable;
+            const bool missing_cgroup = observed.cgroup == room_unreadable && (finite || !owner.unbounded_cgroup());
+            if (!observed.fits() || !readable || missing_cgroup) {
+                const auto code = !readable || missing_cgroup ? status::io : status::resource;
+                return {allocation_ticket({}, {}, 0, observed), code, "host budget refused"};
+            }
+            const uint64_t held_pages = owner.pages();
+            if (extra == UINT64_MAX || held_pages == UINT64_MAX || extra > UINT64_MAX - owner.pending ||
+                    held_pages > UINT64_MAX - owner.pending - extra || !owner.next_ticket) {
+                return failed<allocation_ticket>(status::resource, "host pending overflow");
+            }
+            const uint64_t id = owner.next_ticket++;
+            owner.tickets.emplace(id, process_arbiter::impl::pending_ticket{state_, extra, classification});
+            owner.pending += extra; state_->pending += extra;
+            if (classification == allocation_class::external) { state_->external_pending += extra; }
+            ++state_->tickets; owner.invalidate_peers(state_->id);
+            return passed(allocation_ticket(owner_, state_, id, observed));
+        };
+        // One measurement when the room is there. A shortage runs the context's reclaimer, then measures again.
+        auto ticket = admit();
+        if (ticket.code != status::resource) { return ticket; }
+        const auto reclaimed = owner.reclaim(extra, ticket.value.observation(), state_, who);
         if (!reclaimed) { return failed<allocation_ticket>(reclaimed.code, reclaimed.error.c_str()); }
-        std::lock_guard<std::mutex> lock(owner.mutex);
-        if (const auto * error = owner.invalid(*state_)) { return failed<allocation_ticket>(status::invalid, error); }
-        auto observed = owner.measure(extra, true);
-        const bool readable = observed.system || observed.cgroup != room_unreadable;
-        const bool missing_cgroup = observed.cgroup == room_unreadable && (finite || !owner.unbounded_cgroup());
-        if (!observed.fits() || !readable || missing_cgroup) {
-            const auto code = !readable || missing_cgroup ? status::io : status::resource;
-            return {allocation_ticket({}, {}, 0, observed), code, "host budget refused"};
-        }
-        const uint64_t held_pages = owner.pages();
-        if (extra == UINT64_MAX || held_pages == UINT64_MAX || extra > UINT64_MAX - owner.pending ||
-                held_pages > UINT64_MAX - owner.pending - extra || !owner.next_ticket) {
-            return failed<allocation_ticket>(status::resource, "host pending overflow");
-        }
-        const uint64_t id = owner.next_ticket++;
-        owner.tickets.emplace(id, process_arbiter::impl::pending_ticket{state_, extra, classification});
-        owner.pending += extra; state_->pending += extra;
-        if (classification == allocation_class::external) { state_->external_pending += extra; }
-        ++state_->tickets; owner.invalidate_peers(state_->id);
-        return passed(allocation_ticket(owner_, state_, id, observed));
+        return reclaimed.value ? admit() : std::move(ticket);
     });
 }
 result<bool> context_client::update_file_reserve() noexcept {
@@ -406,7 +474,8 @@ void context_client::close() noexcept {
     if (state_->closed) { return; }
     state_->closing = true;
     owner.changed.wait(lock, [&] { return !state_->operations && !state_->tickets; });
-    state_->interval_open = false; state_->prefill_pages = 0; state_->closed = true;
+    state_->interval_open = false; state_->prefill_pages = 0; state_->device_held = 0; state_->reclaimer.reset();
+    state_->closed = true;
     owner.invalidate_peers(state_->id); owner.clients.erase(state_->id); owner.refresh_config();
 }
 allocation_ticket::allocation_ticket(std::shared_ptr<process_arbiter> owner,

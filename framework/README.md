@@ -15,6 +15,7 @@ uses only the Python standard library.
 | `inferssd launch --dry-run` | Same configuration, recorded host facts | Prepared settings/source indexes and native argv; no server |
 | `inferssd launch-recorded --dry-run` | Historical launcher inputs and recorded facts | Historical resolution for comparison; cannot execute |
 | `inferssd configuration` | Typed settings and `--set` overrides | Effective values/source receipts, schema or canonical settings |
+| `inferssd profile` | This machine, optional model paths and the native probes | Machine characteristics file and a summary per section; see [machine profile](../docs/machine-profile.md) |
 | `inferssd source` | GGUF headers, optional v1 pack index, dense placement text | Expert JSON/alias TSV, source facts, lane arguments or fio iolog |
 | `inferssd probe` | Existing probe reports and expert metadata | Device schema-2 JSON |
 | `inferssd validate` | Device schema-2 JSON | Validation result |
@@ -34,16 +35,47 @@ python3 -m pip install ./framework
 
 Use `--settings FILE` for the versioned registry-defined configuration and repeat
 `--set key=literal` for explicit overrides. CLI values take precedence over file
-values, then registry defaults. Comments following a file value are preserved as
+values, then the launch's own choices for this machine, then registry defaults. Comments following a file value are preserved as
 source receipts. The generated native file contains file/generated values;
 CLI-origin values become the matching registry-generated native `--ssd-*` option
 so native effective telemetry preserves that priority. There is no environment
 translation. Retired settings/launcher environment names fail by name without
 printing their values.
 
+CPU threads are server arguments, not settings. The SSD executor computes in the
+server's ggml threadpools and adds only its I/O, prefetch-reader and watch
+threads, which `cpu.io_cpus` places. `--threads` and `--batch-threads` select the
+decode `-t` and prefill `-tb` counts; `--cpus LIST` pins both pools one thread per
+CPU.
+
+An executed launch measures the machine before its first launch and reuses the
+result afterwards (`--reprofile` measures again; `--machine PATH` uses a given
+characteristics file and measures nothing); see [machine profile](../docs/machine-profile.md).
+From that file, the model's GGUF header and the CPUs, GPUs and memory it finds
+at that moment, the launch chooses thread counts, CPU placement, `place.costs`
+and, without a usable CUDA GPU, `vram.budget = 0` (on macOS also
+`host.budget_mib` from the runtime policy). With one usable CUDA GPU on Linux it
+also chooses `prefill.cpu_max_tokens`, the longest prompt pass the CPU prefills
+no slower than the GPU graph, and prefills each prompt in one pass (`-b` and
+`-ub` as large as the context); on a GPU that shares host memory it keeps
+`host.headroom_mib = 4096`, and on macOS a quarter of the machine's memory. It fills only settings left at their registry
+defaults and thread options and sizes not given, so explicit values always win.
+The choices are written to the generated `settings.ssd` with `source=strategy`
+receipts and to `strategy.json`, with the values your settings kept and the
+choices left out because they contradicted them. The server keeps one context
+checkpoint (`--ctx-checkpoints 1`) unless you set `--ctx-checkpoints` or
+`LLAMA_ARG_CTX_CHECKPOINTS`.
+
+The prompt cache lives on disk, one directory per model under
+`inferssd/prompts` in your user cache directory, and survives restarts
+(`--cache-disk`, 16 GiB per model); `--prompt-cache DIR` moves it and
+`--prompt-cache off` runs without one. With `--profile dsv` the DeepSeek-V4.1
+template keeps earlier turns' thinking (`drop_thinking` false), so a
+conversation's history renders as the server cached it.
+
 ```text
 inferssd-settings 1
-cpu.threads = 8 # measured host allocation
+prefetch.depth = 4 # measured predictor depth
 host.headroom_mib = 3072 # operator resource reserve
 vram.budget = auto # use admitted capacity
 ```
@@ -65,15 +97,21 @@ inferssd launch --dry-run --platform linux --repo . \
   --model models/model.gguf --settings recorded/settings.ssd \
   --runtime-policy recorded/policy-linux.json \
   --host-facts recorded/host-linux.json --output-dir recorded/prepared-001 \
-  --set cpu.threads=8 --result recorded/launch-001.json
+  --threads 7 --result recorded/launch-001.json
 ```
 
 Recorded host facts are consumed lazily without falling back to the current
-machine. Both platforms require `platform_system`; Darwin also requires
-`platform_machine=arm64`. Linux uses `cgroup_v2`, `euid`, and for non-root scope
-creation `user_manager` and `memory_controller`. GPU-enabled Linux settings also
-require `gpu_available` and empty `gpu_processes`. These observations do not
-certify native source formats, GPU kernels or real resource enforcement.
+machine. A recording with `machine_characteristics` (an `inferssd-machine/1`
+object, or `--machine PATH`) also derives the launch's choices; it then needs
+`runtime_facts` (`cpus`, `gpus` as `{uuid, free_bytes, processes}` or `null`,
+`available_bytes`), and may give `model_drive_key` and `model_facts` (read from
+the model's headers when absent). Without `machine_characteristics` the dry-run
+resolves exactly as before. Every platform requires `platform_system` (`Linux`, `Darwin` or
+`Windows`); Darwin also requires `platform_machine=arm64`. Linux uses
+`cgroup_v2`, `euid`, and for non-root scope creation `user_manager` and
+`memory_controller`. GPU-enabled Linux settings also require `gpu_available`
+and empty `gpu_processes`. These observations do not certify native source
+formats, GPU kernels or real resource enforcement.
 
 The old Linux/Darwin resolvers and their recorded reference observations are
 retained behind `launch-recorded --dry-run`. They still describe the historical settings/env
@@ -98,7 +136,8 @@ fio input text and does not invoke fio or read the referenced payload ranges.
 legacy artifact formats and consumed-input errors. The new CLI uses argparse
 for missing/invalid command arguments rather than the old script's usage text.
 A generated alias is not a payload-integrity
-certificate or a substitute for the Mac launcher's stricter alias validation.
+certificate or a substitute for the stricter header-validated alias that a launch
+without `expert.source` generates.
 
 Recorded bootstrap inputs and results can be read separately:
 
@@ -325,9 +364,11 @@ borrowed-reference behavior.
 ## Explicit owned server execution
 
 `inferssd launch --execute` resolves typed Linux or Darwin inputs with lazy live
-host facts, then starts one supervised server. It requires an explicit
-policy and writes to a new run directory: `--output-dir`, or `runs/<UTC time>`
-under the current directory. The server listens on a loopback port:
+host facts, then starts one supervised server. Windows support is in progress:
+`--dry-run` prepares the server command there, and owned execution is not
+implemented yet. Owned execution requires an explicit policy and writes to a new
+run directory: `--output-dir`, or `runs/<UTC time>` under the current directory.
+The server listens on a loopback port:
 
 ```sh
 inferssd launch --execute --platform linux --repo /path/to/inferssd \
@@ -397,19 +438,29 @@ The Python `inferssd.engine.runtime.Runtime` requires explicit `LaunchInput`,
 the measured Linux Machine decision algorithm to typed snapshots and owned
 Engines. Each selection reads measured placement/CPU/tier/prefetch/cost fields
 directly, validates through the registry-defined parser, and records its sources.
-Explicit CLI values exclude incompatible measured candidates; they are never
-silently replaced by a planner. Model prefill predictions use the selected
-snapshot's actual route and native ubatch. Cross-server prompt persistence is not
-configured by typed launch; the production controller predicts a full prefill on
-switch and refuses `keeps_history=True`. Each Engine receives its own immutable snapshot
-and fresh native files. No production path calls `Machine.env` or accepts the
+It also selects the threadpools: `all` runs the measured thread count less one
+CPU for the I/O thread, unpinned; `pin` and `split` pin one ggml thread per
+measured compute CPU and keep the I/O CPU apart. Decode runs on the threads at
+the lowest CPU IDs of the mask, so `split` requires its fast CPU group there.
+Explicit CLI values, including `--threads` and `--cpus`, exclude incompatible
+measured candidates; they are never silently replaced by a planner. Model
+prefill predictions use the selected snapshot's actual route and native ubatch.
+Cross-server prompt persistence is not configured by typed launch; the production
+controller predicts a full prefill on switch and refuses `keeps_history=True`.
+Each Engine receives its own immutable snapshot, threadpools and fresh native
+files. No production path calls `Machine.env` or accepts the
 old Engine environment-control string. Model/listener/parallel/thread/batch
 arguments must use the explicit launch options so extra flags cannot silently
-replace those owned values. `--batch-threads` selects native prefill `-tb`
-independently of `cpu.threads`/decode `-t` (default: the same count; range1..256).
-This preserves measured Mac choices such as t4/tb12 or t8/tb12 without adding a
-additional SSD setting. The launch receipt and argv record both counts. Extra
-flags cannot override fixed placement, template, fit, cache or offload decisions.
+replace those owned values. `--threads` and `--batch-threads` select decode `-t`
+and prefill `-tb` (range 1..256; batch defaults to decode, and unset counts keep
+the server default). `--cpus` passes the same `-C`/`-Cb` mask with
+`--cpu-strict 1`/`--cpu-strict-batch 1`; the counts then default to its size and
+cannot exceed it, and it must not share a CPU with `cpu.io_cpus`. macOS cannot pin
+threads and refuses `--cpus`. A positive `cpu.decode_participants` cannot exceed
+the decode count. This preserves measured Mac choices such as t4/tb12 or t8/tb12
+without an SSD setting. The launch receipt and argv record the counts and CPUs.
+Extra flags cannot override fixed placement, threadpool, template, fit, cache or
+offload decisions.
 
 The production controller uses `NativeObservationSession` to consume the owned
 `native-events.jsonl` stream. It requires `ssd.controller.begin` schema 1 and

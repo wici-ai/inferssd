@@ -24,7 +24,6 @@ extern char ** environ;
 namespace {
 // One factory in the llama DSO. Backend copies of core code never create a
 // process singleton; every executor borrows this context's registration.
-#if defined(__linux__)
 std::shared_ptr<ssd::host::process_arbiter> host_owner() {
     static std::mutex mutex;
     static std::weak_ptr<ssd::host::process_arbiter> current;
@@ -33,7 +32,6 @@ std::shared_ptr<ssd::host::process_arbiter> host_owner() {
     if (!owner) { owner = std::make_shared<ssd::host::process_arbiter>(); current = owner; }
     return owner;
 }
-#endif
 
 void error_text(char * output, size_t size, const char * message) noexcept {
     if (output && size) { std::snprintf(output, size, "%s", message); }
@@ -82,6 +80,8 @@ llama_ssd_options * llama_ssd_options_create(const char * file,
         }
 #if defined(__APPLE__)
         const char * platform = "darwin";
+#elif defined(_WIN32)
+        const char * platform = "windows";
 #else
         const char * platform = "linux";
 #endif
@@ -125,7 +125,6 @@ size_t llama_ssd_schema_json(char * output, size_t size) {
 
 llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
     : settings(options.settings), debug(options.debug), stream(services) {
-#if defined(__linux__)
     if (!settings.sources()->empty()) {
         host_owner = ::host_owner();
         auto registered = host_owner->make_client();
@@ -141,7 +140,6 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
         throw std::runtime_error("SSD experts require LLAMA_SSD_STORE=ON");
 #endif
     }
-#endif
     if (!options.telemetry_file.empty()) {
         auto opened = ssd::telemetry::writer::open(options.telemetry_file);
         if (!opened) { throw std::runtime_error(opened.error); }
@@ -166,12 +164,6 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
     services.gpu_reserve_bytes = static_cast<size_t>(*reserve_mib) * mib;
 }
 
-llama_ssd_context::~llama_ssd_context() {
-    // Context backends have already synchronized and been destroyed. This
-    // callback joins the Mac reader jobs before events closes below.
-    if (mac_cache) { destroy_mac(mac_cache); }
-}
-
 void llama_ssd_context::bind_cpu(ggml_backend_t backend) {
     const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     const auto get = reinterpret_cast<ssd::gpu::get_cpu_kernels_v1>(
@@ -186,13 +178,9 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend) {
     const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     const auto get = reinterpret_cast<ssd::gpu::get_provider_v1>(
         ggml_backend_reg_get_proc_address(registry, "ggml_backend_cuda_ssd_api_v1"));
-    if (!get) {
-        const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend));
-        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
-            throw std::runtime_error("configured SSD sources require the GPU context transport provider");
-        }
-        return;
-    }
+    // A backend without the provider (the CPU, Metal) has no GPU tier: a GPU
+    // there runs the dense layers, and the CPU sink every routed expert.
+    if (!get) { return; }
     if (gpu_transport) { throw std::runtime_error("one configured CUDA executor per context is supported"); }
     const auto * provider = get();
     if (!provider || provider->version != 1 || provider->size != sizeof(*provider) ||

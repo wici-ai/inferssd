@@ -12,12 +12,14 @@
     "muse"
   ],
   "thresholds": {
-    "provisional": true,
-    "mode": "observed-no-slowdown",
-    "slowdown_outcome": "inconclusive",
-    "decode_regression_fraction": 0,
-    "ttft_regression_fraction": 0,
-    "prefill_regression_fraction": 0
+    "mode": "baseline-history",
+    "floor_fraction": {
+      "decode_first128_tps": 0.01,
+      "decode_second128_tps": 0.01,
+      "decode_tps": 0.01,
+      "ttft_s": 0.01,
+      "server_prefill_tps": 0.01
+    }
   },
   "extended_prefixes": [
     "engine/ggml/",

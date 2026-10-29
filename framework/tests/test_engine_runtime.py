@@ -201,7 +201,7 @@ def test_resolve_failure_does_not_spawn_and_closes_log():
 @pytest.mark.parametrize(
     "key,value",
     [
-        ("platform", "windows"),
+        ("platform", "win32"),
         ("memory_budget_bytes", True),
         ("runtime_seconds", 0),
         ("host_reserve_bytes", -1),

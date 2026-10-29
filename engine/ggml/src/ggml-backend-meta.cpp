@@ -516,7 +516,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         return handle_generic(src_ss, /*scalar_only =*/ false);
     };
 
-    auto handle_hc_weighted_sum = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+    auto handle_dsv4_hc_pre = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (ggml_get_op_params_i32(tensor, 1) != 0) {
+            // the gate has the shape of x
+            return handle_generic(src_ss, /*scalar_only =*/ true);
+        }
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         GGML_ASSERT(src_ss[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
         return src_ss[0];
@@ -763,6 +767,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, 1};
     };
 
+    auto handle_lightning_indexer = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        for (size_t i = 0; i < 4; i++) {
+            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1};
+    };
+
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
@@ -963,11 +974,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
             } break;
-            case GGML_OP_HC_WEIGHTED_SUM: {
-                split_state = handle_hc_weighted_sum(src_ss);
+            case GGML_OP_LIGHTNING_INDEXER: {
+                split_state = handle_lightning_indexer(src_ss);
+            } break;
+            case GGML_OP_DSV4_HC_PRE: {
+                split_state = handle_dsv4_hc_pre(src_ss);
             } break;
             case GGML_OP_DSV4_HC_COMB:
-            case GGML_OP_DSV4_HC_POST: {
+            case GGML_OP_DSV4_HC_POST:
+            case GGML_OP_TOP_K_MASK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_UNARY: {

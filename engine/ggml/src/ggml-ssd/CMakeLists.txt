@@ -6,6 +6,8 @@ add_subdirectory(host)
 target_link_libraries(ggml-ssd INTERFACE ggml-ssd-host)
 add_subdirectory(settings)
 target_link_libraries(ggml-ssd INTERFACE ggml-ssd-settings)
+add_subdirectory(platform)
+target_link_libraries(ggml-ssd INTERFACE ggml-ssd-platform)
 
 if (LLAMA_SSD_STORE)
     # These constraints belong to production executor integration, not the pure index.
@@ -17,9 +19,8 @@ if (LLAMA_SSD_STORE)
     endif()
     add_subdirectory(store)
 endif()
-if (UNIX)
-    add_subdirectory(io)
-endif()
+# Read rings and the expert-pack reader, on every OS.
+add_subdirectory(io)
 
 add_subdirectory(stream)
 target_link_libraries(ggml-ssd INTERFACE ggml-ssd-stream)

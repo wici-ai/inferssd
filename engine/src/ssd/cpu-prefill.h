@@ -3,7 +3,7 @@
 #include "ssd/api.h"
 
 // Companion to the decode runtime. It borrows the same sink, so prefill adds
-// neither a second read ring nor another persistent thread pool.
+// neither a second read ring nor threads of its own.
 struct llama_kimi_cpu_prefill_runtime {
     kimi_cpu_prefill * context = nullptr;
     decltype(&kimi_cpu_prefill_run) run = nullptr;

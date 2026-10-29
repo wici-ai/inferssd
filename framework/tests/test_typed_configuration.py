@@ -59,11 +59,21 @@ def test_registry_generated_schema_exact(native_contract):
         ("linux", "inferssd-settings 1\n"),
         (
             "linux",
-            "inferssd-settings 1\ncpu.threads=4 # source=measured\ncpu.compute_cpus=2-4\n"
+            "inferssd-settings 1\ncpu.io_cpus=2-4 # source=measured\ncpu.decode_participants=3\n"
             'expert.source=["/path # 1", "unicode-🐈"]\n'
             "place.costs=cpu_fixed_us=204,link_gbps=12.3\n",
         ),
-        ("darwin", "inferssd-settings 1\nhost.expert_cache_mib=12288\ncpu.threads=8\n"),
+        ("darwin", "inferssd-settings 1\nprefetch.depth=8\n"),
+        (
+            "darwin",
+            "inferssd-settings 1\ncpu.decode_participants=4\ncpu.io_cpus=0-2\n"
+            "host.budget_mib=8192\nprefetch.depth=4\nhost.headroom_mib=1024\n",
+        ),
+        (
+            "windows",
+            "inferssd-settings 1\ncpu.decode_participants=3\ncpu.io_cpus=3\n"
+            "place.costs=cpu_fixed_us=204\nhost.budget_mib=8192\nmodel.hc_fused=0\n",
+        ),
         ("linux", 'inferssd-settings 1\nexpert.source=["/path-\u2028-file"]\n'),
     ],
 )
@@ -88,12 +98,13 @@ def test_cpp_python_snapshot_exact(native_contract, tmp_path, platform, text):
 @pytest.mark.parametrize(
     "body",
     [
-        "cpu.threads=0",
-        'cpu.threads="4"',
-        "cpu.threads=18446744073709551616",
-        "cpu.compute_cpus=1,1",
-        "cpu.compute_cpus=2-0",
-        "cpu.decode_participants=2",
+        "cpu.threads=4",
+        "cpu.compute_cpus=0-2",
+        'cpu.decode_participants="4"',
+        "cpu.decode_participants=256",
+        "vram.max_slots=18446744073709551616",
+        "cpu.io_cpus=1,1",
+        "cpu.io_cpus=2-0",
         "unknown=0",
         "vram.reserve_mib=64",
         "place.costs=cpu_fixed_us=nan",
@@ -103,6 +114,7 @@ def test_cpp_python_snapshot_exact(native_contract, tmp_path, platform, text):
         'vram.budget="123"',
         "expert.source=[1]",
         "host.expert_cache_mib=0",
+        "host.budget_mib=1",
         "prefetch.depth=65",
     ],
 )
@@ -114,6 +126,28 @@ def test_invalid_contract_refused_by_both(native_contract, tmp_path, body):
         parse(text, str(source))
     result = subprocess.run(
         [str(native_contract), "--parse", str(source), "linux"], capture_output=True, text=True
+    )
+    assert result.returncode == 1 and str(source) in result.stderr
+
+
+@pytest.mark.parametrize(
+    "platform,body",
+    [
+        ("windows", "prefill.cpu_max_tokens=1"),
+        ("windows", "vram.budget=auto"),
+        ("windows", "vram.reserve_mib=0"),
+        ("darwin", "vram.max_slots=1"),
+        ("darwin", "vram.reserve_mib=64"),
+    ],
+)
+def test_platform_scope_refused_by_both(native_contract, tmp_path, platform, body):
+    text = "inferssd-settings 1\n" + body + "\n"
+    source = tmp_path / "platform.ssd"
+    source.write_text(text)
+    with pytest.raises(ValueError):
+        parse(text, str(source), platform=platform)
+    result = subprocess.run(
+        [str(native_contract), "--parse", str(source), platform], capture_output=True, text=True
     )
     assert result.returncode == 1 and str(source) in result.stderr
 
@@ -132,13 +166,13 @@ def test_unicode_header_whitespace_refused_by_both(native_contract, tmp_path):
 
 def test_cli_precedence_and_snapshot_owned():
     value = parse(
-        "inferssd-settings 1\ncpu.threads=4 # source=derived\n",
+        "inferssd-settings 1\nprefetch.depth=4 # source=derived\n",
         "input.ssd",
-        overrides=[("cpu.threads", "6")],
+        overrides=[("prefetch.depth", "6")],
     )
-    assert value.at("cpu.threads").value == 6
-    assert value.at("cpu.threads").origin == "cli"
-    assert parse().at("cpu.threads").value == 2
+    assert value.at("prefetch.depth").value == 6
+    assert value.at("prefetch.depth").origin == "cli"
+    assert parse().at("prefetch.depth").value == 2
 
 
 def test_real_cpp_jsonl_consumed(native_contract, tmp_path):
@@ -155,7 +189,7 @@ def test_effective_settings_requires_registry_and_typed_receipts():
     with pytest.raises(ValueError, match="registered settings"):
         effective_settings([Event(1, "ssd.settings", 0, {"values": {}, "sources": {}})])
     payload = parse().document()
-    payload["values"]["cpu.threads"] = True
+    payload["values"]["prefetch.depth"] = True
     with pytest.raises(ValueError, match="expected integer"):
         effective_settings([Event(1, "ssd.settings", 0, payload)])
 
@@ -179,7 +213,7 @@ def test_telemetry_protocol_rejects_invalid(line):
 @pytest.mark.parametrize(
     "text,source",
     [
-        ("inferssd-settings 1\ncpu.threads=2 # \ud800\n", "input.ssd"),
+        ("inferssd-settings 1\nprefetch.depth=2 # \ud800\n", "input.ssd"),
         ("inferssd-settings 1\n", "input-\udfff.ssd"),
     ],
 )
@@ -189,6 +223,6 @@ def test_unpaired_surrogate_rejected_even_in_receipts(text, source):
 
 
 def test_unicode_source_and_receipt_preserved():
-    value = parse("inferssd-settings 1\ncpu.threads=2 # 来源=测量🐈\n", "设置🐈.ssd")
-    assert value.at("cpu.threads").location == "设置🐈.ssd:2"
-    assert value.at("cpu.threads").receipt == " 来源=测量🐈"
+    value = parse("inferssd-settings 1\nprefetch.depth=2 # 来源=测量🐈\n", "设置🐈.ssd")
+    assert value.at("prefetch.depth").location == "设置🐈.ssd:2"
+    assert value.at("prefetch.depth").receipt == " 来源=测量🐈"

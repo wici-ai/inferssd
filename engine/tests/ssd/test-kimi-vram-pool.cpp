@@ -18,7 +18,7 @@ static void rejected(const std::function<void()> & fn) {
 static kimi_vram_request request(int layer, int expert) {
     kimi_vram_request r = {};
     r.layer=layer;r.expert=expert;r.weight=1;
-    for (int i=0;i<3;++i) r.role[i]={1,7,1000000,uint64_t(expert*3+i)*4096,4096,3,4,5,6};
+    for (int i=0;i<3;++i) r.role[i]={1,7,1000000,uint64_t(expert*3+i)*4096,4096,3,4,5,6,0};
     return r;
 }
 static void publish(vram_slot_table & table) {

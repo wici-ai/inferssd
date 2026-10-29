@@ -381,14 +381,15 @@ namespace GGUFMeta {
             GGUFMeta::GKV<GGUFMeta::ArrayInfo>::get_kv(ctx, kid);
 
         switch (arr_info.gt) {
-            case GGUF_TYPE_BOOL:
+            case GGUF_TYPE_BOOL:    GGML_ASSERT((std::is_same<T, bool>::value) || (std::is_same<T, uint32_t>::value) || (std::is_same<T, int32_t>::value)); break;
             case GGUF_TYPE_UINT32:
             case GGUF_TYPE_INT32:   GGML_ASSERT((std::is_same<T,     int32_t>::value) ||
                                                 (std::is_same<T,    uint32_t>::value)); break;
+            case GGUF_TYPE_UINT64:  GGML_ASSERT((std::is_same<T, uint64_t>::value)); break;
             case GGUF_TYPE_FLOAT32: GGML_ASSERT((std::is_same<T,       float>::value)); break;
             case GGUF_TYPE_STRING:  GGML_ASSERT((std::is_same<T, std::string>::value)); break;
             default:
-                throw std::runtime_error(format("%s is not a string/float32/uint32/int32 array", key.c_str()));
+                throw std::runtime_error(format("%s is not a string/float32/uint64/uint32/int32/bool array", key.c_str()));
         }
 
         if (arr_info.length > N_MAX) {
@@ -421,6 +422,8 @@ namespace GGUFMeta {
         return get_arr(llm_kv(kid), result, required);
     }
 
+    template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_NGRAM> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<uint64_t, LLAMA_MAX_PLE_HEADS>>(enum llm_kv kid, std::array<uint64_t, LLAMA_MAX_PLE_HEADS> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
     template bool llama_model_loader::get_arr<std::vector<uint32_t>>(enum llm_kv kid, std::vector<uint32_t> & result, bool required);
@@ -540,6 +543,7 @@ namespace GGUFMeta {
     }
 
     // TODO: this is not very clever - figure out something better
+    template bool llama_model_loader::get_key_or_arr<std::array<bool, LLAMA_MAX_LAYERS>>(enum llm_kv kid, std::array<bool, LLAMA_MAX_LAYERS> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<int, 4>>(enum llm_kv kid, std::array<int, 4> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum llm_kv kid, std::array<float, 512> & result, uint32_t n, bool required);
@@ -1203,8 +1207,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_backend_buffer_type_t buft = nullptr;
         bool keep_host_buft_override = false;
 
-        // check overrides
-        if (tensor_buft_overrides) {
+        // PLE and the deferred routed experts must remain ordinary CPU mmaps, including when other weights are
+        // overridden: never a repacked, host or device copy.
+        uint32_t expert_layer = 0;
+        const bool plain_mmap = (get_arch() == LLM_ARCH_QWEN4EXP && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD) ||
+            (map_deferred_experts && llama_is_expert_tensor_name(tn.str(), expert_layer));
+        if (plain_mmap) {
+            buft = ggml_backend_cpu_buffer_type();
+        }
+        if (!plain_mmap && tensor_buft_overrides) {
             std::string tensor_name = tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
@@ -1386,10 +1397,6 @@ void llama_model_loader::done_getting_tensors() const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
-#if defined(__APPLE__)
-    // Deferred expert mappings can exceed unified memory by an order of magnitude.
-    if (defer_experts) { prefetch = false; }
-#endif
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
@@ -1405,7 +1412,20 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            const auto lazy = ple_lazy_ranges.find(mappings.size());
+            // Disable MAP_POPULATE and whole-file WILLNEED on the shard containing PLE.
+            // Other tensors in a mixed shard load normally; the current Q8_0 PLE shard is dedicated.
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch && lazy == ple_lazy_ranges.end() ? -1 : 0, is_numa);
+            if (lazy != ple_lazy_ranges.end()) {
+                if (mlock_mmaps) throw std::runtime_error("PLE lazy mapping is incompatible with mlock");
+                size_t advised = 0;
+                // Access-pattern advice only: it never changes the bytes read, so a platform without it continues.
+                if (!mapping->advise_random_fragment(lazy->second.first, lazy->second.second, &advised)) {
+                    LLAMA_LOG_WARN("%s: PLE random-access advice unavailable; continuing without it\n", __func__);
+                }
+                LLAMA_LOG_INFO("%s: PLE lazy mmap: file=%zu offset=%zu bytes=%zu advised=%zu\n", __func__, mappings.size(),
+                               lazy->second.first, lazy->second.second-lazy->second.first, advised);
+            }
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1817,4 +1837,16 @@ void llama_model_loader::print_info() const {
     } else {
         LLAMA_LOG_INFO("%s: file size   = %.2f GiB (%.2f BPW) \n", __func__, n_bytes/1024.0/1024.0/1024.0, n_bytes*8.0/n_elements);
     }
+}
+
+void llama_model_loader::mark_ple_lazy(const llama_tensor_weight & weight) {
+    if (no_alloc || files.empty()) return; // metadata-only or virtual architecture checks
+    if (!use_mmap || check_tensors) {
+        throw std::runtime_error("Qwen PLE requires mmap without whole-table tensor validation");
+    }
+    const size_t bytes = ggml_nbytes(weight.tensor);
+    if (weight.offs > files.at(weight.idx)->size() || bytes > files.at(weight.idx)->size() - weight.offs) {
+        throw std::runtime_error("PLE tensor exceeds its GGUF shard");
+    }
+    ple_lazy_ranges[weight.idx] = {weight.offs, weight.offs + bytes};
 }

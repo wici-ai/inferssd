@@ -98,6 +98,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_head = 1;
         n_ff   = 96;
         n_layer = 22; // hparams.n_layer_kv_from_start = 20 is hardcoded
+    } else if (arch == LLM_ARCH_DEEPSEEK41) {
+        // window-only, ratio-2 and ratio-1 layers; 8 heads to fill the 8 output groups
+        n_embd  = 512;
+        n_head  = 8;
+        n_ff    = 1024;
+        n_layer = 6;
     } else if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
@@ -150,11 +156,15 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, arch == LLM_ARCH_DEEPSEEK41 ? uint32_t(1) : n_head);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
-    if (arch == LLM_ARCH_DEEPSEEK2
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,   n_embd_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH, n_embd_head);
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,   n_embd_head/2);
+    } else if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_GLM_DSA
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_MISTRAL4) {
@@ -169,7 +179,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_GROUPS,       uint32_t(8));
-    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            uint32_t(512));
+    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            arch == LLM_ARCH_DEEPSEEK41 ? uint32_t(64) : uint32_t(512));
     ms.add_kv(LLM_KV_ATTENTION_KV_LORA_RANK,           uint32_t(512));
     ms.add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT, uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,         n_ctx/8);
@@ -182,7 +192,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
         // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
-    } else if (arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35) {
+    } else if (arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_MUSE_SPARK) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
@@ -193,8 +203,59 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(2));
     }
 
+    if (arch == LLM_ARCH_MUSE_SPARK) {
+        ms.add_kv(LLM_KV_POST_NORM_EPS,           1e-5f);
+        ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,      10000.0f);
+        ms.add_kv(LLM_KV_FINAL_LOGIT_SOFTCAPPING, 30.0f);
+        ms.add_kv(LLM_KV_MOE_LATENT_SIZE,         n_embd/2);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,    1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,     true);
+    }
+
+    if (arch == LLM_ARCH_QWEN4EXP) {
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
+        // without this the QSA layers fall back to dense and go uncovered
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+    }
+
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         uint32_t(8));
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           uint32_t(32));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,            std::vector<uint32_t>({0, 0, 2, 2, 1, 1}));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,    160000.0f);
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             1.0e-6f);
+        ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                     uint32_t(0));
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                     10.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                  true);
+
+        // two Engram layers of 3-grams with 2 heads each: 4 buckets per layer, each table laid out from row 0
+        const std::vector<uint64_t> multipliers = { 76632096046245ull, 4839876093313ull, 35959672319349ull,
+                                                    67716810739261ull, 51510806800915ull, 30921347202721ull };
+        const std::vector<uint64_t> primes      = { 101, 103, 107, 109,   113, 127, 131, 137 };
+        const std::vector<uint64_t> offsets     = {   0, 101, 204, 311,     0, 113, 240, 371 };
+        std::vector<int32_t> token_map(n_vocab);
+        for (uint32_t i = 0; i < n_vocab; ++i) {
+            token_map[i] = (int32_t) (i % 61);
+        }
+        const LLM_KV kv(arch);
+        ms.add_kv(LLM_KV_ENGRAM_LAYER_IDS,     std::vector<uint32_t>({1, 3}));
+        ms.add_kv(LLM_KV_ENGRAM_HEAD_COUNT,    uint32_t(2));
+        ms.add_kv(LLM_KV_ENGRAM_KEY_LENGTH,    uint32_t(64));
+        ms.add_kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, uint32_t(3));
+        ms.add_kv(LLM_KV_ENGRAM_PAD_ID,        uint32_t(2));
+        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_ENGRAM_MULTIPLIERS).c_str(), GGUF_TYPE_UINT64, multipliers.data(), multipliers.size());
+        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_ENGRAM_PRIMES).c_str(),      GGUF_TYPE_UINT64, primes.data(),      primes.size());
+        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_ENGRAM_OFFSETS).c_str(),     GGUF_TYPE_UINT64, offsets.data(),     offsets.size());
+        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_ENGRAM_TOKEN_MAP).c_str(),   GGUF_TYPE_INT32,  token_map.data(),   token_map.size());
+    }
+
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, uint32_t(1));
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, uint32_t(64));
+    // qwen4exp ropes indexer keys with the main rotary width, so its head can't be < n_rot
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
+              arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(64));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,      uint32_t(8));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
     ms.add_kv(LLM_KV_TOKENIZER_MODEL,         "no_vocab");
@@ -207,7 +268,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
-        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         uint32_t(2)); // sigmoid
+        ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK41 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,       1.0f);
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
         ms.add_kv(LLM_KV_EXPERTS_PER_GROUP,          uint32_t(1));
@@ -221,7 +282,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_XIELU_ALPHA_P,             1.0f);
     ms.add_kv(LLM_KV_XIELU_BETA,                1.0f);
     ms.add_kv(LLM_KV_XIELU_EPS,                 1.0e-7f);
-    ms.add_kv(LLM_KV_SSM_INNER_SIZE,            arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ? 256 : 2*n_embd);
+    ms.add_kv(LLM_KV_SSM_INNER_SIZE,            arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP ? 256 : 2*n_embd);
     ms.add_kv(LLM_KV_SSM_CONV_KERNEL,           uint32_t(4));
     ms.add_kv(LLM_KV_SSM_STATE_SIZE,            uint32_t(128));
     ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        n_head);
@@ -326,12 +387,15 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_PHIMOE:
         case LLM_ARCH_DBRX:
         case LLM_ARCH_OLMOE:
+        case LLM_ARCH_MUSE_SPARK:
         case LLM_ARCH_ARCTIC:
         case LLM_ARCH_DEEPSEEK:
         case LLM_ARCH_DEEPSEEK2:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_EXAONE_MOE:
@@ -570,10 +634,11 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         }
                     }
 
-                    FILE * file = tmpfile(); // Can be null on Windows without administrator privileges.
                     // FIXME: when adding a tensor to a gguf_context a copy is made, this changes the pointer which the meta backend
                     //     in turn uses to map the tensors to their simple equivalents - this is fundamentally incompatible
-                    if (file != nullptr && llama_model_saver_supports_arch(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                    // tmpfile() can be null on Windows without administrator privileges.
+                    FILE * file = llama_model_saver_supports_arch(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR ? tmpfile() : nullptr;
+                    if (file != nullptr) {
                         GGML_ASSERT(model_and_ctx_dev.first && model_and_ctx_dev.second);
                         llama_model_saver ms = llama_model_saver(model_and_ctx_dev.first.get());
                         ms.add_kv_from_model();
@@ -581,18 +646,23 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                         ms.save(file);
                         rewind(file);
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
-                        const std::vector<float> logits_roundtrip = get_logits(
-                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
-                        status_roundtrip = "\033[1;32mOK\033[0m";
-                        GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
-                        for (size_t i = 0; i < logits_roundtrip.size(); i++) {
-                            if (logits_roundtrip[i] != logits_dev[i]) {
-                                all_ok = false;
-                                status_roundtrip = "\033[1;31mFAIL\033[0m";
-                                break;
+                        {
+                            auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
+                            const std::vector<float> logits_roundtrip = get_logits(
+                                model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+                            status_roundtrip = "\033[1;32mOK\033[0m";
+                            GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
+                            for (size_t i = 0; i < logits_roundtrip.size(); i++) {
+                                if (logits_roundtrip[i] != logits_dev[i]) {
+                                    all_ok = false;
+                                    status_roundtrip = "\033[1;31mFAIL\033[0m";
+                                    break;
+                                }
                             }
                         }
+                        // the loaded model does not own the stream, and an open stream per row exhausts the
+                        // descriptor limit, after which every later round trip is silently skipped
+                        fclose(file);
                     }
                 }
 

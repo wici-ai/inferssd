@@ -183,14 +183,45 @@ def model_identities(config):
 
 
 PERFORMANCE_MODE = "functional-numerical-performance"
+# A PR runs candidate, base, candidate, candidate; a baseline job measures one
+# main commit (built once, as the candidate side) four times.
 PERFORMANCE_PROTOCOL = dict(tier="512", prompt_sha256="17ac26b4a3bc13d6c51dd10b62eb54931651d48e41ca4071c587a931a662e283",
-                            output_tokens=256, samples_per_side=1)
+                            output_tokens=256, purpose="regression-gate",
+                            order=["candidate", "base", "candidate", "candidate"])
+BASELINE_PROTOCOL = dict(PERFORMANCE_PROTOCOL, purpose="baseline", order=["candidate"] * 4)
+
+
+def protocol_admitted(config):
+    """The fixed gate protocol, or the baseline protocol for one main commit."""
+    value = config.get("performance_protocol")
+    if not isinstance(value, dict) or type(value.get("output_tokens")) is not int:
+        return False
+    if value == PERFORMANCE_PROTOCOL:
+        return True
+    return (value == BASELINE_PROTOCOL
+            and len({config["sides"][side]["revision"] for side in ("base", "candidate")}) == 1)
+
+
+def sealed_machine(config, host_path, runtime_path):
+    """A PR job's machine characteristics as bytes to stage read-only, or None (a baseline job profiles)."""
+    value = config.get("machine_characteristics")
+    if value is None:
+        return None
+    fields = {"sha256", "text", "job_id", "commit", "host_path", "runtime_path"}
+    if (not isinstance(value, dict) or set(value) != fields or not isinstance(value["text"], str)
+            or value["host_path"] != host_path or value["runtime_path"] != runtime_path
+            or config.get("performance_protocol") == BASELINE_PROTOCOL
+            or hashlib.sha256(value["text"].encode()).hexdigest() != value["sha256"]):
+        fail("sealed machine characteristics differ from their fixed path or hash, or are given to a baseline job")
+    return value["text"].encode()
 
 
 def source_sides(config):
     mode = config.get("validation_mode", "functional-numerical")
     if mode not in ("functional-numerical", PERFORMANCE_MODE):
         fail("unsupported root operator validation mode")
+    if mode == PERFORMANCE_MODE and config.get("performance_protocol") == BASELINE_PROTOCOL:
+        return ("candidate",)
     return (("base", "candidate") if mode == PERFORMANCE_MODE and any(
         data.get("benchmarks") for data in config["sides"]["candidate"]["models"].values()) else ("candidate",))
 
@@ -209,10 +240,8 @@ def policy_check(policy, request, config, manifest, broker):
         fail("request differs from local root device/resource/control policy")
     sides = source_sides(config)
     if config.get("validation_mode") == PERFORMANCE_MODE:
-        if (config.get("performance_protocol") != PERFORMANCE_PROTOCOL
+        if (not protocol_admitted(config)
                 or policy.get("performance_protocol") != PERFORMANCE_PROTOCOL
-                or type(config["performance_protocol"].get("output_tokens")) is not int
-                or type(config["performance_protocol"].get("samples_per_side")) is not int
                 or set(policy.get("side_settings_sha256", {})) != {"base", "candidate"}):
             fail("fixed performance protocol/side settings are outside root policy")
     models = config["sides"]["candidate"]["models"]
@@ -235,6 +264,8 @@ def policy_check(policy, request, config, manifest, broker):
                 fail("model/settings declaration differs from local root admission")
             mounts[model] = admitted["mount"]
             mounts["settings-" + model + "-" + side + ".ssd"] = data["settings"]["host_path"]
+    if sealed_machine(config, str(IROOT / (job + "-machine.json")), "/models/machine.json") is not None:
+        mounts["machine.json"] = str(IROOT / (job + "-machine.json"))
     source_root = SROOT / ("operator-" + job)
     sources = {side: str(source_root / side) if config.get("validation_mode") == PERFORMANCE_MODE else str(source_root) for side in sides}
     if (manifest["models"] != mounts or manifest["builds"] != {side: side for side in sides}
@@ -393,6 +424,9 @@ def receive(expected_sha256, incoming=None):
                     fail("base/candidate effective settings differ")
                 for side, payload in payloads.items():
                     write(IROOT / (job + "-" + model + "-" + side + "-settings.ssd"), payload)
+            machine = sealed_machine(config, str(IROOT / (job + "-machine.json")), "/models/machine.json")
+            if machine is not None:
+                write(IROOT / (job + "-machine.json"), machine)
             jobdir.mkdir(mode=0o711)
             write(jobdir / "manifest.json", (staging / "manifest.json").read_bytes())
             write(target_config, (staging / "config.json").read_bytes())

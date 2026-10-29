@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#undef NDEBUG
 #include "ggml-ssd/gpu/provider.h"
 #include <cassert>
 #include <stdexcept>
@@ -22,19 +23,15 @@ int main() {
     value = good; value.vec_dot_type = nullptr; assert(!ssd::gpu::valid(&value));
     value = good; value.vec_dot_type = invalid_type; assert(!ssd::gpu::valid(&value));
     value = good; value.vec_dot_type = throwing_type; assert(!ssd::gpu::valid(&value));
-    struct stat st{};
-    st.st_dev = 7; st.st_ino = 11; st.st_size = 4096;
-#if defined(__APPLE__)
-    st.st_mtimespec = {13, 17}; st.st_ctimespec = {19, 23};
-#elif defined(_WIN32)
-    st.st_mtime = 13; st.st_ctime = 19;
-#else
-    st.st_mtim = {13, 17}; st.st_ctim = {19, 23};
-#endif
-    const auto source = kimi_vram_source_identity(&st, 32, 64);
-    assert(source.device == 7 && source.inode == 11 && source.size == 4096 && source.offset == 32 && source.bytes == 64);
-    assert(source.mtime_s == 13 && source.ctime_s == 19);
-#if !defined(_WIN32)
-    assert(source.mtime_ns == 17 && source.ctime_ns == 23);
-#endif
+    ssd::platform::file_identity file;
+    file.device = 7; file.id_lo = 11; file.id_hi = 29; file.size = 4096;
+    file.mtime_ns = 13000000017; file.ctime_ns = -1000000000 + 23; // before the epoch: -1 s + 23 ns
+    const auto source = kimi_vram_source_identity(file, 32, 64);
+    assert(source.device == 7 && source.inode == 11 && source.inode_hi == 29 && source.size == 4096 &&
+           source.offset == 32 && source.bytes == 64);
+    // Seconds and nanoseconds as POSIX stat splits them.
+    assert(source.mtime_s == 13 && source.mtime_ns == 17 && source.ctime_s == -1 && source.ctime_ns == 23);
+    file.ctime_ns = -1; // 1 ns before the epoch
+    const auto early = kimi_vram_source_identity(file, 32, 64);
+    assert(early.ctime_s == -1 && early.ctime_ns == 999999999);
 }

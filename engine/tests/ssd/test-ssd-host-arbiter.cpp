@@ -33,9 +33,11 @@ struct checked_client {
     void clear_prefill_pages() { checked(raw->clear_prefill_pages()); }
     room measure(uint64_t x, bool full = false) const { return checked(raw->measure(x, full)); }
     room project_decode_capacity(uint64_t x = 0, bool full = false) const { return checked(raw->project_decode_capacity(x, full)); }
-    allocation_ticket take(uint64_t h, uint64_t d = 0, const actions & a = {}, bool finite = false,
+    void set_reclaimer(const actions & a) { checked(raw->set_reclaimer(a)); }
+    void clear_reclaimer() { raw->clear_reclaimer(); }
+    allocation_ticket take(uint64_t h, uint64_t d = 0, requester who = requester::outside, bool finite = false,
             allocation_class kind = allocation_class::external) {
-        auto out = raw->take(h, d, a, finite, kind);
+        auto out = raw->take(h, d, who, finite, kind);
         if (!out && out.code == ssd::status::invalid) { throw std::runtime_error(out.error); }
         return std::move(out.value);
     }
@@ -150,14 +152,33 @@ static void races_and_reclaim() {
     std::thread ta(run, std::ref(*a)), tb(run, std::ref(*b)); ta.join(); tb.join();
     require(granted == 1 && a->state().pending_bytes == 0, "barrier race over-admitted");
     require(!a->take(UINT64_MAX, 1), "DRAM overflow admitted");
-    std::vector<int> order; f.current = 2*GiB; f.available = 0;
+    std::vector<int> order;
     actions reclaim;
     reclaim.collect_deferred = [&] { (void)b->state(); order.push_back(1); };
     reclaim.reclaim_tier = [&](uint64_t) { (void)a->measure(0); order.push_back(2); f.available = GiB; return true; };
     reclaim.reclaim_cache = [&](uint64_t) { (void)b->state(); order.push_back(3); f.current = 0; return true; };
-    auto ticket = a->take(256*MiB, 0, reclaim);
+    a->set_reclaimer(reclaim);
+    must_throw([&] { a->set_reclaimer(reclaim); }, "a second reclaimer replaced the context's");
+    // A take that fits measures once and asks nothing.
+    auto fits = a->take(256*MiB); require(bool(fits) && order.empty(), "a fitting take ran the reclaimer");
+    fits.cancel();
+    // Every take of the context runs its reclaimer, in order, without naming it; a peer's take runs none.
+    f.current = 2*GiB; f.available = 0;
+    require(!b->take(256*MiB) && order.empty(), "a peer's take ran this context's reclaimer");
+    auto ticket = a->take(256*MiB);
     require(bool(ticket) && order == std::vector<int>({1,2,3}), "reclaim order or unlocked reentry changed");
     ticket.cancel();
+    // The RAM cache's own growth asks only the RAM cache (the system term stays short); the GPU tier's growth
+    // asks nothing.
+    order.clear(); f.current = 2*GiB; f.available = 0;
+    require(!a->take(256*MiB, 0, requester::ram_cache, false, allocation_class::tracked) &&
+        order == std::vector<int>({3}), "the RAM cache's growth asked the GPU tier");
+    order.clear(); f.current = 2*GiB; f.available = 0;
+    require(!a->take(0, 256*MiB, requester::gpu_tier, false, allocation_class::tracked) && order.empty(),
+        "the GPU tier's growth ran the reclaimer");
+    a->clear_reclaimer();
+    require(!a->take(256*MiB) && order.empty(), "a cleared reclaimer still ran");
+    f.current = 0; f.available = 2*GiB;
     auto changed = config(true); changed.margin_bytes = GiB;
     must_throw([&] { a->configure(changed); }, "client changed immutable config");
     auto c = owner->make_client(); must_throw([&] { c->configure(config(false)); }, "incompatible physical domain admitted");
@@ -211,8 +232,9 @@ static void close_waits_for_reclaimer() {
     reclaim.collect_deferred = [&] { entered.set_value(); proceed.wait(); };
     reclaim.reclaim_tier = [](uint64_t) { return false; };
     std::atomic<bool> rejected{false}, closed{false};
+    a->set_reclaimer(reclaim);
     std::thread worker([&] {
-        try { auto t = a->take(1, 0, reclaim); }
+        try { auto t = a->take(1); }
         catch (const std::runtime_error &) { rejected = true; }
     });
     entered.get_future().wait();
@@ -224,6 +246,23 @@ static void close_waits_for_reclaimer() {
     }
     const bool waited = !closed.load(); release.set_value(); worker.join(); closer.join();
     require(waited && rejected && closed, "close did not wait for an active reclaimer");
+    // Clearing the reclaimer drops it at once, so later takes run none, and waits for a reclaim still running on
+    // another thread.
+    std::promise<void> slow_entered, resume; auto go = resume.get_future(); std::atomic<int> calls{0};
+    actions slow;
+    slow.reclaim_cache = [&](uint64_t) { if (!calls++) { slow_entered.set_value(); go.wait(); } return false; };
+    b->set_reclaimer(slow);
+    std::atomic<bool> cleared{false};
+    std::thread taker([&] { auto t = b->take(1); });
+    slow_entered.get_future().wait();
+    std::thread clearer([&] { b->clear_reclaimer(); cleared = true; });
+    for (int before = calls;; before = calls) {
+        (void)b->take(1);
+        if (calls == before) { break; } // this take found no reclaimer
+        std::this_thread::yield();
+    }
+    const bool waited_for_run = !cleared.load(); resume.set_value(); taker.join(); clearer.join();
+    require(waited_for_run && cleared, "clearing did not wait for a running reclaim");
 }
 static void result_errors_and_tracked_allocations() {
     files f;
@@ -235,7 +274,7 @@ static void result_errors_and_tracked_allocations() {
     require(a->take(1).code == ssd::status::io, "missing bounded cgroup usage fell through to system-only admission");
     f.fail_usage = false;
     checked(a->begin_interval(0));
-    auto tracked = a->take(GiB, 0, {}, false, allocation_class::tracked);
+    auto tracked = a->take(GiB, 0, requester::outside, false, allocation_class::tracked);
     require(bool(tracked), "tracked ticket setup failed");
     f.available = 6*GiB; f.current = 2*GiB; tracked.value.commit();
     uint64_t unknown = 0;
@@ -258,7 +297,8 @@ static void result_errors_and_tracked_allocations() {
     zero.value.cancel();
     f.current = f.limit.load(); f.available = 0;
     actions reclaim; reclaim.reclaim_cache = [](uint64_t) -> bool { throw std::runtime_error("fixture callback"); };
-    auto refused = a->take(1, 0, reclaim);
+    checked(a->set_reclaimer(reclaim));
+    auto refused = a->take(1);
     require(!refused && refused.code == ssd::status::io && checked(a->state()).pending_bytes == 0,
         "callback exception escaped core or leaked pending");
     auto broken = std::make_shared<process_arbiter>([](const std::string &, std::string &) -> bool { throw std::runtime_error("fixture reader"); });
@@ -266,11 +306,52 @@ static void result_errors_and_tracked_allocations() {
     auto exhausted = std::make_shared<process_arbiter>([](const std::string &, std::string &) -> bool { throw std::bad_alloc(); });
     require(exhausted->make_client().code == ssd::status::resource, "allocation failure escaped owner construction");
 }
+// On unified memory the cgroup does not charge the GPU tier's device memory. The envelope counts what the caches
+// publish as held, so the RAM cache and the tier share it, and the system term (MemAvailable) does not count it
+// twice. Off unified memory device memory is not this DRAM.
+static void unified_device_held() {
+    files f; f.limit = 8*GiB; f.current = GiB; f.available = 64*GiB;
+    auto owner = std::make_shared<test_owner>(f.reader()); auto a = owner->make_client(), b = owner->make_client();
+    a->configure(config(true)); b->configure(config(true));
+    const auto before = b->measure(0);
+    require(before.cgroup_surplus == 8*GiB - GiB - 512*MiB, "fixture envelope changed");
+    checked(a->raw->set_device_held(5*GiB));
+    require(a->state().device_held == 5*GiB && b->state().device_held == 0 && b->state().all_device_held == 5*GiB,
+        "device memory was not published for the process");
+    require(b->measure(0).cgroup_surplus == before.cgroup_surplus - 5*GiB &&
+        b->measure(0).system_surplus == before.system_surplus,
+        "the envelope did not count the tier's device memory, or MemAvailable counted it twice");
+    // Neither the RAM cache nor the tier grows past the envelope the tier holds.
+    require(!b->take(2*GiB, 0, requester::ram_cache, false, allocation_class::tracked),
+        "the RAM cache grew into the envelope the GPU tier holds");
+    require(!a->take(0, 2*GiB, requester::gpu_tier, false, allocation_class::tracked), "the GPU tier grew past the envelope");
+    auto grows = a->take(0, GiB, requester::gpu_tier, false, allocation_class::tracked);
+    require(bool(grows), "the GPU tier could not grow within the envelope");
+    grows.cancel();
+    // An allocation outside the caches that only the envelope refuses has the GPU tier give room first.
+    std::vector<int> order;
+    actions reclaim;
+    reclaim.reclaim_tier = [&](uint64_t) { order.push_back(2); checked(a->raw->set_device_held(GiB)); return true; };
+    reclaim.reclaim_cache = [&](uint64_t) { order.push_back(3); return false; };
+    a->set_reclaimer(reclaim);
+    auto outside = a->take(3*GiB);
+    require(bool(outside) && order == std::vector<int>({2}), "the GPU tier did not give room in the envelope");
+    outside.cancel(); a->clear_reclaimer();
+    a->close();
+    require(b->state().all_device_held == 0 && b->measure(0).cgroup_surplus == before.cgroup_surplus,
+        "a closed context's device memory stayed in the envelope");
+    files g; auto discrete = std::make_shared<test_owner>(g.reader()); auto d = discrete->make_client();
+    d->configure(config(false));
+    const auto plain = d->measure(0);
+    checked(d->raw->set_device_held(5*GiB));
+    require(d->state().device_held == 0 && d->measure(0).cgroup_surplus == plain.cgroup_surplus,
+        "a discrete GPU's memory was counted in the host envelope");
+}
 int main() {
     try {
         serial_equivalence(); holds_and_pending(); races_and_reclaim(); process_reserves_and_rollback();
         interval_isolation_and_close(); close_waits_for_reclaimer();
-        result_errors_and_tracked_allocations();
-        std::cout << "host arbiter: serial equations, holds, atomic tickets, reclaim, interval and close gates passed\n";
+        result_errors_and_tracked_allocations(); unified_device_held();
+        std::cout << "host arbiter: serial equations, holds, atomic tickets, reclaim, interval, close and unified device gates passed\n";
     } catch (const std::exception & error) { std::cerr << error.what() << '\n'; return 1; }
 }

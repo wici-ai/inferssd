@@ -19,43 +19,12 @@
             },
             "default": []
         },
-        "cpu.threads": {
-            "description": "Total CPU participants including the I/O participant",
-            "kind": "integer",
-            "unit": "participants",
-            "producer": "plan",
-            "scope": "all",
-            "cli": "--ssd-cpu-threads",
-            "default_literal": "2",
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 256,
-            "default": 2
-        },
-        "cpu.compute_cpus": {
-            "description": "Ordered unique CPU IDs for compute participants",
-            "kind": "cpus",
-            "unit": "CPU ID",
-            "producer": "plan",
-            "scope": "linux",
-            "cli": "--ssd-cpu-compute-cpus",
-            "default_literal": "",
-            "type": "array",
-            "uniqueItems": true,
-            "maxItems": 65536,
-            "items": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 2147483647
-            },
-            "default": []
-        },
         "cpu.io_cpus": {
             "description": "Ordered unique CPU IDs for I/O participants",
             "kind": "cpus",
             "unit": "CPU ID",
             "producer": "plan",
-            "scope": "linux",
+            "scope": "all",
             "cli": "--ssd-cpu-io-cpus",
             "default_literal": "",
             "type": "array",
@@ -73,7 +42,7 @@
             "kind": "integer",
             "unit": "compute participants",
             "producer": "plan",
-            "scope": "linux",
+            "scope": "all",
             "cli": "--ssd-cpu-decode-participants",
             "default_literal": "0",
             "type": "integer",
@@ -86,7 +55,7 @@
             "kind": "integer",
             "unit": "predicted experts",
             "producer": "plan",
-            "scope": "linux",
+            "scope": "all",
             "cli": "--ssd-prefetch-depth",
             "default_literal": "2",
             "type": "integer",
@@ -99,7 +68,7 @@
             "kind": "costs",
             "unit": "named us and GB/s terms",
             "producer": "plan",
-            "scope": "linux",
+            "scope": "all",
             "cli": "--ssd-place-costs",
             "default_literal": "",
             "type": "object",
@@ -240,7 +209,7 @@
             "kind": "integer",
             "unit": "MiB",
             "producer": "plan",
-            "scope": "linux",
+            "scope": "all",
             "cli": "--ssd-host-headroom-mib",
             "default_literal": "512",
             "type": "integer",
@@ -248,18 +217,18 @@
             "maximum": 4294967295,
             "default": 512
         },
-        "host.expert_cache_mib": {
-            "description": "Mac M1 expert cache in MiB; M1 is a migration stage",
+        "host.budget_mib": {
+            "description": "Host memory envelope in MiB against this process's own memory; zero derives it at startup",
             "kind": "integer",
             "unit": "MiB",
             "producer": "plan",
-            "scope": "darwin",
-            "cli": "--ssd-host-expert-cache-mib",
-            "default_literal": "4096",
+            "scope": "darwin,windows",
+            "cli": "--ssd-host-budget-mib",
+            "default_literal": "0",
             "type": "integer",
             "minimum": 0,
             "maximum": 17592186044415,
-            "default": 4096
+            "default": 0
         },
         "model.engram_prefetch": {
             "description": "Read ahead DeepSeek Engram rows; changes I/O timing only",
@@ -275,7 +244,7 @@
             "default": 0
         },
         "model.hc_fused": {
-            "description": "Use fused DeepSeek hyper connection operations",
+            "description": "Use the fused hyper connection operations of DeepSeek-V4.1 and Qwen3.8-Flash-Next",
             "kind": "integer",
             "unit": "boolean",
             "producer": "model",

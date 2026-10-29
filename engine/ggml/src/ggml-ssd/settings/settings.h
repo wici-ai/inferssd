@@ -14,9 +14,21 @@ namespace settings {
 
 enum class kind { integer, paths, cpus, costs, budget };
 
+// The platforms a setting applies to, one bit each: the registry's scope column.
+enum platform_scope : uint32_t {
+    scope_linux   = 1u << 0,
+    scope_darwin  = 1u << 1,
+    scope_windows = 1u << 2,
+    scope_all     = scope_linux | scope_darwin | scope_windows,
+};
+
 struct budget {
     bool     automatic;
     uint64_t bytes;
+
+    // The GPU tier's byte budget: auto is all a GPU provider admits, and no
+    // tier without one; an explicit budget stays as given.
+    uint64_t tier_bytes(bool provider) const noexcept { return automatic ? (provider ? UINT64_MAX : 0) : bytes; }
 };
 
 using cost_table = std::map<std::string, double>;
@@ -29,7 +41,7 @@ struct descriptor {
     const char * default_literal;
     const char * unit;
     const char * producer;
-    const char * scope;
+    uint32_t     scope;  // platform_scope bits
     const char * description;
 };
 
@@ -71,7 +83,8 @@ std::string                       cli_option(const std::string & key);
                                                const std::string &           literal,
                                                std::vector<override_value> & overrides) noexcept;
 // Empty file_text and source together mean no settings file. A supplied file must start with
-// 'inferssd-settings 1'. Unknown keys, duplicate file keys and invalid dependencies fail.
+// 'inferssd-settings 1'. Unknown keys, duplicate file keys and invalid dependencies fail. The platform is
+// "linux", "darwin" or "windows".
 [[nodiscard]] result<snapshot>    parse(const std::string &                 file_text,
                                         const std::string &                 source,
                                         const std::vector<override_value> & overrides = {},

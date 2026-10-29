@@ -1,10 +1,11 @@
 #include "explicit-fixture-inputs.h"
-// Independent CPU-only O_DIRECT/io_uring and numerical coverage for the Kimi sink.
+// Independent CPU-only direct-read, read-ring and numerical coverage for the Kimi sink.
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ssd/cpu-sink.h"
 #include "ssd/cpu-prefill.h"
+#include "ggml-ssd/settings/settings.h"
 #include "ggml-ssd/gpu/kimi-cache-location-api.h"
 #include <thread>
 #include <array>
@@ -25,23 +26,24 @@
 #include <iomanip>
 #include <sstream>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "test-resources.h"
 
 #if defined(__linux__)
-#include <fcntl.h>
 #include <linux/capability.h>
-#include <sched.h>
 #include <unistd.h>
 #include <sys/resource.h>
-#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/vfs.h>
 #include <sys/wait.h>
 #include "../../ggml/src/ggml-ssd/host/ledger.h"
-#include "linux-test-resources.h"
+#endif
+
+using test_resources::anonymous_bytes;
 
 static void require(bool ok, const std::string & what) { if (!ok) { throw std::runtime_error(what); } }
 static size_t aligned(size_t n) { return (n + 4095) & ~size_t(4095); }
@@ -50,6 +52,9 @@ static std::string tensor_name(int layer, int role) {
     return "blk." + std::to_string(layer) + ".ffn_" + roles[role] + "_exps.weight";
 }
 
+#if defined(__linux__)
+// Linux only: the hold interposes libc's pread by symbol name and recognizes /proc/meminfo, the
+// Linux ledger's system term. The cases that need it stay Linux-only.
 // pread, ahead of libc's in this process (the sink's library calls it through the dynamic linker): a read of an armed
 // (fd, offset) waits in it until the test lets it go, so that a prefetch read runs past windows for as long as a test
 // needs, without timing assumptions. before_meminfo runs once, at the next read of /proc/meminfo: the host ledger
@@ -112,6 +117,7 @@ struct pread_hold_guard {
         h.cv.notify_all();
     }
 };
+#endif
 
 struct entry {
     uint64_t offset = 0;
@@ -130,7 +136,8 @@ struct fixture {
     int fault_role = -1;      // -1 faults every role; 0/1/2 selects up/gate/down
     int resolve_calls = 0;
     bool native_ranges = false;
-    ~fixture() { if (fd >= 0) { close(fd); } if (remove_on_destroy) { unlink(path.c_str()); } }
+    std::vector<int32_t> stored; // the experts the file holds; empty: all of them
+    ~fixture() { ssd::platform::close_fd(fd); if (remove_on_destroy) { test_resources::remove_file(path); } }
     static bool resolve(void * user, const char * name, int32_t id, kimi_cpu_sink_source * out) {
         auto & f = *static_cast<fixture *>(user);
         ++f.resolve_calls;
@@ -153,9 +160,9 @@ struct fixture {
         if (fault == wrong_size) { out->nbytes += 4096; }
         if (fault == past_eof) { out->offset = uint64_t(1) << 50; }
         if (fault == short_tail) {
-            struct stat status = {};
-            if (fstat(f.fd, &status) || status.st_size < 4096) { return false; }
-            out->offset = uint64_t(status.st_size) - 4096; // positive but incomplete CQE
+            uint64_t size = 0;
+            if (!ssd::platform::file_size(f.fd, size) || size < 4096) { return false; }
+            out->offset = size - 4096; // positive but incomplete CQE
         }
         return true;
     }
@@ -166,11 +173,7 @@ static void put_bytes(std::ofstream & f, const void * data, size_t n) {
 }
 
 static void make_synthetic(fixture & f, uint32_t seed = 20260908) {
-    const char * temp = std::getenv("TMPDIR");
-    std::string pattern = std::string(temp && *temp ? temp : "/tmp") + "/kimi-cpu-sink-test-XXXXXX";
-    std::vector<char> name(pattern.begin(), pattern.end()); name.push_back(0);
-    int tfd = mkstemp(name.data()); require(tfd >= 0, "mkstemp failed"); close(tfd);
-    f.path = name.data(); f.remove_on_destroy = true;
+    f.path = test_resources::temp_file("kimi-cpu-sink-test"); f.remove_on_destroy = true;
     std::mt19937 rng(seed);
     std::normal_distribution<float> sample(0.0f, 0.06f);
     // Keep the full on-disk GGMLMOEPACKv1 layout, including index and padding.
@@ -183,6 +186,7 @@ static void make_synthetic(fixture & f, uint32_t seed = 20260908) {
             const std::vector<float> importance(
                 ggml_quantize_requires_imatrix(type) ? size_t(cols) : 0, 1.0f);
             for (int e = 0; e < f.experts; ++e) {
+                if (!f.stored.empty() && std::find(f.stored.begin(), f.stored.end(), e) == f.stored.end()) { continue; }
                 std::vector<float> values(size_t(cols) * rows);
                 for (auto & v : values) { v = sample(rng); }
                 entry item; item.raw_bytes = bytes; item.read_bytes = aligned(bytes); item.data.resize(bytes);
@@ -273,13 +277,12 @@ static std::vector<float> reference(const fixture & f, int layer, const std::vec
     return output;
 }
 
-using sink_ptr = std::unique_ptr<kimi_cpu_sink, decltype(&kimi_cpu_sink_destroy)>;
 static sink_ptr make_sink(fixture_inputs & inputs, fixture & f, int threads, int depth) {
-    test_resources::cpu_threads(threads - 1, 1);
+    test_resources::cpu_participants(threads - 1, 1);
     char error[512] = {};
-    auto * sink = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
-    require(sink, std::string("create: ") + error);
-    return sink_ptr(sink, kimi_cpu_sink_destroy);
+    auto sink = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
+    require(bool(sink), std::string("create: ") + error);
+    return sink;
 }
 
 struct sample_result {
@@ -288,8 +291,6 @@ struct sample_result {
     long voluntary_switches = 0, involuntary_switches = 0, minor_faults = 0, major_faults = 0, max_rss_kib = 0;
     uint64_t output_hash = 1469598103934665603ULL;
 };
-
-static double timeval_us(const timeval & value) { return value.tv_sec * 1e6 + value.tv_usec; }
 
 static void check_io_targets(fixture_inputs & inputs, const kimi_cpu_sink_stats & stats, bool succeeded) {
     require(stats.cache_fill_read_requests + stats.ring_read_requests == stats.read_requests &&
@@ -314,6 +315,15 @@ static void check_io_targets(fixture_inputs & inputs, const kimi_cpu_sink_stats 
     }
 }
 
+// The RAM cache's slot for a triplet of reads: a slot that gives its own pages back (elastic or partial reclaim)
+// starts on a page, which makes it larger only on pages above 4 KiB.
+static uint64_t cache_slot_bytes(const fixture_inputs & inputs, uint64_t triplet) {
+    const auto on = [&](const char * key) { const char * value = inputs.get(key); return value && !std::strcmp(value, "1"); };
+    if (!on("cache_elastic") && !on("cache_partial_reclaim")) { return triplet; }
+    const uint64_t page = ssd::platform::page_size();
+    return (triplet + page - 1) / page * page;
+}
+
 static sample_result run_checked(fixture_inputs & inputs, const char * name, fixture & f, kimi_cpu_sink * sink, tensors & meta,
         const std::vector<float> & input, const std::vector<int32_t> & ids,
         const std::vector<float> & weights, const std::vector<float> & expected, int layer, float linear_beta,
@@ -321,8 +331,7 @@ static sample_result run_checked(fixture_inputs & inputs, const char * name, fix
         const kimi_cpu_sink_activation * activation = nullptr) {
     sample_result result;
     std::vector<float> guarded(f.latent + 2, -12345.25f); char error[512] = {};
-    rusage before = {}, after = {};
-    require(getrusage(RUSAGE_SELF, &before) == 0, "getrusage before failed");
+    const auto before = test_resources::usage();
     const auto begin = std::chrono::steady_clock::now();
     bool ok = activation ?
         kimi_cpu_sink_run_activation(sink, meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(),
@@ -330,14 +339,14 @@ static sample_result run_checked(fixture_inputs & inputs, const char * name, fix
         kimi_cpu_sink_run(sink, meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(), weights.data(),
                                int(ids.size()), 4.0f, linear_beta, guarded.data() + 1, &result.stats, error, sizeof(error));
     result.wall_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count();
-    require(getrusage(RUSAGE_SELF, &after) == 0, "getrusage after failed");
-    result.user_us = timeval_us(after.ru_utime) - timeval_us(before.ru_utime);
-    result.system_us = timeval_us(after.ru_stime) - timeval_us(before.ru_stime);
-    result.voluntary_switches = after.ru_nvcsw - before.ru_nvcsw;
-    result.involuntary_switches = after.ru_nivcsw - before.ru_nivcsw;
-    result.minor_faults = after.ru_minflt - before.ru_minflt;
-    result.major_faults = after.ru_majflt - before.ru_majflt;
-    result.max_rss_kib = after.ru_maxrss;
+    const auto after = test_resources::usage();
+    result.user_us = after.user_us - before.user_us;
+    result.system_us = after.system_us - before.system_us;
+    result.voluntary_switches = after.voluntary_switches - before.voluntary_switches;
+    result.involuntary_switches = after.involuntary_switches - before.involuntary_switches;
+    result.minor_faults = after.minor_faults - before.minor_faults;
+    result.major_faults = after.major_faults - before.major_faults;
+    result.max_rss_kib = after.max_rss_kib;
     require(ok, std::string(name) + ": " + error);
     require(guarded.front() == -12345.25f && guarded.back() == -12345.25f, "output canary overwritten");
     if (exact_output) { exact_output->assign(guarded.begin() + 1, guarded.end() - 1); }
@@ -365,7 +374,8 @@ static sample_result run_checked(fixture_inputs & inputs, const char * name, fix
     require(stats.cache_hits == expected_hits && stats.cache_misses == live - expected_hits, "cache hit/miss count mismatch");
     if (expected_admitted >= 0) {
         require(stats.cache_admitted == size_t(expected_admitted) &&
-                stats.cache_admitted_bytes == size_t(expected_admitted) * triplet_bytes, "cache admission count mismatch");
+                stats.cache_admitted_bytes == size_t(expected_admitted) * cache_slot_bytes(inputs, triplet_bytes),
+                "cache admission count mismatch");
     }
     require(close_enough, std::string(name) + " diagnostic numerical tolerance exceeded; max_abs=" + std::to_string(result.max_abs));
     require(result.max_abs == 0, std::string(name) + " strict elementwise equality failed; max_abs=" + std::to_string(result.max_abs));
@@ -483,6 +493,8 @@ static void apply_policy(std::vector<int32_t> & ids, std::vector<float> & weight
 
 struct unsupported_resident : std::runtime_error { using std::runtime_error::runtime_error; };
 
+#if defined(__linux__)
+// Linux only: the control copy lives on tmpfs, recognized by its statfs magic.
 static void make_resident_copy(fixture & f, const std::string & directory) {
     struct statfs fs = {};
     if (statfs(directory.c_str(), &fs) || uint64_t(fs.f_type) != 0x01021994ULL) {
@@ -505,6 +517,7 @@ static void make_resident_copy(fixture & f, const std::string & directory) {
     f.fd = test_resources::open_direct(f.path);
     std::printf("resident_control=tmpfs_O_DIRECT_accepted note=RAM_file_read_path_not_zero_IO_compute_control bytes=%llu\n", (unsigned long long) offset);
 }
+#endif
 
 static void write_sample_json(std::ostream & out, const sample_result & result, const real_options & options,
         const std::string & phase, int iteration, int layer, double reference_us) {
@@ -566,7 +579,13 @@ static void real_test(fixture_inputs & inputs, const std::string & pack, const s
         file.seekg(item.offset); file.read(reinterpret_cast<char *>(item.data.data()), item.raw_bytes); require(bool(file), "short reference pack read");
     }
     file.close(); f.path = pack; f.fd = test_resources::open_direct(f.path);
-    if (!options.resident_dir.empty()) { make_resident_copy(f, options.resident_dir); }
+    if (!options.resident_dir.empty()) {
+#if defined(__linux__)
+        make_resident_copy(f, options.resident_dir);
+#else
+        throw unsupported_resident("resident control requires a Linux tmpfs directory");
+#endif
+    }
     const auto reference_begin = std::chrono::steady_clock::now();
     const auto expected = reference(f, layer, input, ids, weights, 4.0f, 25.0f);
     const double reference_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - reference_begin).count();
@@ -591,6 +610,8 @@ struct fixture_selector {
     }
 };
 
+#if defined(__linux__)
+// Linux only: io_uring fixed buffers are charged to RLIMIT_MEMLOCK; a forked child lowers it.
 static void drop_child_memlock() {
     rlimit limit = { 0, 0 };
     require(setrlimit(RLIMIT_MEMLOCK, &limit) == 0, "lowering child memlock failed");
@@ -636,19 +657,23 @@ static void registration_failure_child(fixture_inputs & inputs, fixture & f) {
     require(result == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
             "registration failure child did not pass");
 }
+#endif
 
 static void registered_lifecycle_tests(fixture_inputs & inputs) {
     const char * mode = inputs.get("read_fixed");
     require(mode && !std::strcmp(mode, "1"), "run this lifecycle test with --fixture read_fixed=1");
     fixture small, large;
     make_synthetic(small);
+#if defined(__linux__)
     registration_failure_child(inputs, small);
+#else
+    std::printf("case=registration_failure_child status=SKIP reason=linux_rlimit_memlock\n");
+#endif
     large.latent = large.hidden = 512;
     make_synthetic(large);
     fixture_selector selector; selector.active = &small;
     char error[512] = {};
-    sink_ptr sink(inputs.create(4, 2, fixture_selector::resolve, &selector, error, sizeof(error)),
-                  kimi_cpu_sink_destroy);
+    sink_ptr sink = inputs.create(4, 2, fixture_selector::resolve, &selector, error, sizeof(error));
     require(bool(sink), std::string("create: ") + error);
     std::vector<float> xs(small.latent), xl(large.latent);
     for (size_t i = 0; i < xs.size(); ++i) { xs[i] = float(int(i % 23) - 11) * 0.02f; }
@@ -862,24 +887,19 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
     make_synthetic(small);
     large.latent = 512; large.hidden = 1024; make_synthetic(large);
     fixture_selector selector; selector.active = &small;
-    const char * names[] = { "split_cv",
+    const char * names[] = {
         "ready_first", "row_weights",
-        "compute_cpus", "io_cpus",
+        "io_cpus",
         "early_up_gate", "poll_us",
         "role_major", "nonblocking_down_sched",
         "dynamic_rows", "dynamic_chunk_rows" };
     std::map<std::string, std::string> original;
     for (const char * name : names) { if (inputs.get(name)) { original[name] = inputs.get(name); } }
-    cpu_set_t original_affinity;
-    require(!sched_getaffinity(0, sizeof(original_affinity), &original_affinity), "read fixture affinity");
-    std::vector<int> allowed;
-    for (int i = 0; i < CPU_SETSIZE; ++i) { if (CPU_ISSET(i, &original_affinity)) { allowed.push_back(i); } }
-    require(!schedules || int(allowed.size()) >= threads, "schedule fixture needs total_threads allowed CPUs");
-    std::string weighted, cpus;
-    for (int i = 0; i < threads - 1; ++i) {
-        weighted += std::string(i ? "," : "") + (i < 4 ? "1" : "0.6");
-        if (schedules) { cpus += std::string(i ? "," : "") + std::to_string(allowed[i]); }
-    }
+    // The sink pins only its own I/O threads (modes 6 and 7, on one CPU); its compute participants are the
+    // caller's threads, whose placement it never changes.
+    const ssd::platform::cpu_list allowed = test_resources::process_cpus();
+    std::string weighted;
+    for (int i = 0; i < threads - 1; ++i) { weighted += std::string(i ? "," : "") + (i < 4 ? "1" : "0.6"); }
     // Preserve original ordinary schedule IDs, independently of vector indices.
     const std::vector<int> mode_ids = schedules ? std::vector<int>{ 0, 1, 6, 7 } : std::vector<int>{ 0, 1 };
     const int modes = int(mode_ids.size());
@@ -887,25 +907,22 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
     std::vector<bool> ready(modes, false);
     for (int index = 0; index < modes; ++index) {
         const int mode = mode_ids[index];
-        inputs.set(names[5], role_major || nonblocking_down_sched || (early_up_gate && mode) ? "1" : "0");
-        inputs.set(names[6], poll && mode ? std::to_string(poll).c_str() : "0");
-        inputs.set(names[7], (role_major || nonblocking_down_sched) && mode ? "1" : "0");
-        inputs.set(names[8], nonblocking_down_sched && mode ? "1" : "0");
+        inputs.set(names[3], role_major || nonblocking_down_sched || (early_up_gate && mode) ? "1" : "0");
+        inputs.set(names[4], poll && mode ? std::to_string(poll).c_str() : "0");
+        inputs.set(names[5], (role_major || nonblocking_down_sched) && mode ? "1" : "0");
+        inputs.set(names[6], nonblocking_down_sched && mode ? "1" : "0");
         const bool dynamic = schedules ? mode >= 7 : nonblocking_down_sched && mode;
-        inputs.set(names[9], dynamic ? "1" : "0");
-        inputs.set(names[10], "16");
+        inputs.set(names[7], dynamic ? "1" : "0");
+        inputs.set(names[8], "16");
         if (schedules) {
             ready[index] = mode == 1 || mode == 7;
-            inputs.set(names[0], mode == 1 || mode == 6 ? "1" : "0");
-            inputs.set(names[1], ready[index] ? "1" : "0");
-            inputs.set(names[2], mode == 6 ? weighted.c_str() : "");
-            inputs.set(names[3], mode >= 3 ? cpus.c_str() : "");
-            inputs.set(names[4], mode >= 3 ? std::to_string(allowed[threads - 1]).c_str() : "");
+            inputs.set(names[0], ready[index] ? "1" : "0");
+            inputs.set(names[1], mode == 6 ? weighted.c_str() : "");
+            inputs.set(names[2], mode >= 3 ? std::to_string(allowed.back()).c_str() : "");
             // Mode 7 exercises dynamic rows through ordinary compute_phase.
         }
         char error[512] = {};
-        sinks.emplace_back(inputs.create(threads, depth, fixture_selector::resolve,
-            &selector, error, sizeof(error)), kimi_cpu_sink_destroy);
+        sinks.push_back(inputs.create(threads, depth, fixture_selector::resolve, &selector, error, sizeof(error)));
         require(bool(sinks[index]), std::string("schedule create: ") + error);
         configure_cache(sinks[index].get(), 8 * triplet_bytes(large), { 1, 2 }, 4);
     }
@@ -914,9 +931,7 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
         else { inputs.unset(name); }
     }
     auto check_affinity = [&] {
-        cpu_set_t current;
-        require(!sched_getaffinity(0, sizeof(current), &current) && CPU_EQUAL(&current, &original_affinity),
-            "sink failed to restore caller affinity");
+        require(test_resources::process_cpus() == allowed, "sink changed the caller's affinity");
     };
     check_affinity();
     uint64_t token = 0;
@@ -1024,64 +1039,76 @@ static void schedule_invalid_tests(fixture_inputs & inputs) {
         { "dynamic_chunk_rows", "17" },
         { "dynamic_chunk_rows", "16385" },
         { "dynamic_chunk_rows", "64x" },
-        { "row_weights", "1,1" }, // 4 total threads needs 3 weights
         { "row_weights", "1,0,1" },
         { "row_weights", "1,nan,1" },
         { "row_weights", "1,inf,1" },
         { "row_weights", "1,1,-1" },
         { "row_weights", "1,1,1," },
-        { "compute_cpus", "0,0,0" },
-        { "compute_cpus", "1024,1025,1026" },
         { "io_cpus", "-1" },
         { "io_cpus", "1x" },
+        { "io_cpus", "0,0" },
+        { "io_cpus", "1024" },
+        { "decode_participants", "513" },
     };
     for (const auto & item : invalid) {
         inputs.set(item.first, item.second);
         char error[512] = {};
-        sink_ptr sink(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        sink_ptr sink = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
         inputs.unset(item.first);
         require(!sink && error[0], std::string("invalid schedule accepted: ") + item.first + "=" + item.second);
     }
     char error[512] = {};
-    sink_ptr incompatible(nullptr, kimi_cpu_sink_destroy);
+    sink_ptr incompatible;
     inputs.set("dynamic_rows", "1");
     inputs.set("row_weights", "1,1,1");
-    incompatible.reset(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)));
+    incompatible = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
     inputs.unset("dynamic_rows");
     inputs.unset("row_weights");
     require(!incompatible && std::strstr(error, "mutually exclusive"), "dynamic rows accepted static row weights");
     inputs.set("role_major", "1");
-    incompatible.reset(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)));
+    incompatible = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
     inputs.unset("role_major");
     require(!incompatible && std::strstr(error, "EARLY_UP_GATE=1"), "role-major accepted without early up/gate");
 
     inputs.set("nonblocking_down_sched", "1");
-    incompatible.reset(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)));
+    incompatible = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
     require(!incompatible && std::strstr(error, "ROLE_MAJOR=1"), "nonblocking scheduler accepted without role-major");
     inputs.set("role_major", "1");
     inputs.set("early_up_gate", "1");
     inputs.set("ready_first", "0");
-    incompatible.reset(inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error)));
+    incompatible = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
     require(!incompatible && std::strstr(error, "READY_FIRST=1"), "nonblocking scheduler accepted unordered reduction");
     inputs.unset("nonblocking_down_sched");
     inputs.unset("role_major");
     inputs.unset("early_up_gate");
     inputs.unset("ready_first");
-    std::printf("SCHEDULE_INVALID_SETTINGS_REJECTED cases=%zu\n", sizeof(invalid) / sizeof(invalid[0]));
-}
-
-static uint64_t anonymous_bytes() {
-    std::ifstream file("/proc/self/smaps_rollup");
-    require(bool(file), "cannot open smaps_rollup for physical release check");
-    std::string line;
-    while (std::getline(file, line)) {
-        std::istringstream in(line); std::string label, unit; uint64_t kib = 0;
-        if (in >> label >> kib >> unit && label == "Anonymous:") {
-            require(unit == "kB", "unexpected smaps_rollup units");
-            return kib * 1024;
-        }
+    // Inputs counted in participants are checked against each run's: three here.
+    tensors meta(f, 1);
+    std::vector<float> input(f.latent, .1f), output(f.latent);
+    const int32_t id = 1; const float weight = 1;
+    const std::pair<const char *, const char *> per_run[] = {
+        { "row_weights", "1,1" },
+        { "decode_participants", "4" },
+    };
+    for (const auto & item : per_run) {
+        inputs.set(item.first, item.second);
+        sink_ptr sink = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
+        inputs.unset(item.first);
+        require(bool(sink), std::string("per-run schedule rejected at creation: ") + error);
+        require(!kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight, 1,
+            4, 25, output.data(), nullptr, error, sizeof(error)) && error[0],
+            std::string("per-run schedule accepted: ") + item.first + "=" + item.second);
+        std::printf("case=per_run_%s status=PASS error=%s\n", item.first, error);
     }
-    throw std::runtime_error("smaps_rollup has no Anonymous counter");
+    // One call at a time, of 1..512 participants.
+    sink_ptr sink = inputs.create(2, 1, fixture::resolve, &f, error, sizeof(error));
+    require(bool(sink), std::string("create: ") + error);
+    require(!kimi_cpu_sink_call_open(sink.get(), 0, error, sizeof(error)) && error[0], "empty call accepted");
+    require(!kimi_cpu_sink_call_open(sink.get(), 513, error, sizeof(error)) && error[0], "oversized call accepted");
+    require(kimi_cpu_sink_call_open(sink.get(), 1, error, sizeof(error)), error);
+    require(!kimi_cpu_sink_call_open(sink.get(), 1, error, sizeof(error)) && error[0], "second open call accepted");
+    kimi_cpu_sink_call_close(sink.get());
+    std::printf("SCHEDULE_INVALID_SETTINGS_REJECTED cases=%zu\n", sizeof(invalid) / sizeof(invalid[0]) + 2);
 }
 
 static void cache_release_test(fixture_inputs & inputs, int threads, int depth) {
@@ -1103,9 +1130,9 @@ static void cache_release_test(fixture_inputs & inputs, int threads, int depth) 
     const auto empty = cache_snapshot(sink.get());
     require(empty.mapped_bytes == 0 && empty.committed_bytes == 0 && empty.valid_bytes == 0 &&
             empty.capacity_bytes == full.capacity_bytes, "prefill retained payload or lost capacity configuration");
-    // Dedicated anonymous mmap must actually release pages. Allow small libc and
-    // /proc parsing noise, but not an allocator retaining the whole payload.
-    require(before >= after && before - after >= bytes - 256 * 1024,
+    // Dedicated arena slots must actually release pages. Allow small allocator and
+    // counter noise, but not an allocator retaining the whole payload.
+    require(before >= after && before - after >= bytes - test_resources::anonymous_noise_bytes,
             "prefill zeroed accounting without releasing anonymous cache pages");
     std::printf("case=cache_prefill_physical_release payload=%llu anonymous_before=%llu anonymous_after=%llu status=PASS\n",
             (unsigned long long) bytes, (unsigned long long) before, (unsigned long long) after);
@@ -1117,6 +1144,11 @@ static void cache_release_test(fixture_inputs & inputs, int threads, int depth) 
 static void direct_cache_memlock_child(fixture_inputs & inputs, fixture & f, const std::vector<float> & input) {
     const char * mode = inputs.get("read_fixed");
     if (!mode || std::strcmp(mode, "1")) { return; }
+#if !defined(__linux__)
+    // Linux only: io_uring fixed buffers count against RLIMIT_MEMLOCK; other rings have no such budget.
+    (void) f; (void) input;
+    std::printf("case=direct_cache_memlock_child status=SKIP reason=linux_rlimit_memlock\n");
+#else
     // No parent sink exists yet. Lower limits/capabilities only in this child.
     std::fflush(nullptr);
     const pid_t child = fork(); require(child >= 0, "direct cache memlock fork failed");
@@ -1157,6 +1189,7 @@ static void direct_cache_memlock_child(fixture_inputs & inputs, fixture & f, con
     int status = 0; pid_t result;
     do { result = waitpid(child, &status, 0); } while (result < 0 && errno == EINTR);
     require(result == child && WIFEXITED(status) && WEXITSTATUS(status) == 0, "direct cache memlock child did not pass");
+#endif
 }
 
 static void direct_cache_target_tests(fixture_inputs & inputs, fixture & f, const std::vector<float> & input, int threads, int depth) {
@@ -1501,8 +1534,7 @@ static void cache_tests(fixture_inputs & inputs, int threads, int depth) {
     fixture other; make_synthetic(other, 20260909);
     fixture_selector selector; selector.active = &f;
     char error[512] = {};
-    sink_ptr identities(inputs.create(threads, depth, fixture_selector::resolve, &selector, error, sizeof(error)),
-            kimi_cpu_sink_destroy);
+    sink_ptr identities = inputs.create(threads, depth, fixture_selector::resolve, &selector, error, sizeof(error));
     require(bool(identities), std::string("identity sink create: ") + error);
     configure_cache(identities.get(), 2 * unit, { 1 }, 2);
     begin_cache(identities.get(), 100, 1);
@@ -1517,7 +1549,7 @@ static void cache_tests(fixture_inputs & inputs, int threads, int depth) {
     // caller replacing the source without changing epoch, including fd reuse.
     selector.active = &other; begin_cache(identities.get(), 102, 5);
     cache_case(inputs, "cache_same_epoch_different_pack_fd", other, identities.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
-    require(f.fd != other.fd && dup2(f.fd, other.fd) == other.fd, "pack fd reuse fixture failed");
+    require(f.fd != other.fd && test_resources::fd_dup2(f.fd, other.fd) == other.fd, "pack fd reuse fixture failed");
     begin_cache(identities.get(), 102, 6);
     // The resolver still returns other's fd number and identical offsets, but
     // that descriptor now names A. The independent reference uses A's bytes.
@@ -1545,13 +1577,13 @@ static void cache_hitrate_tests(fixture_inputs & inputs, int threads, int depth)
     unsigned rejected = 0;
     for (const char * value : { "", "1", "1:", ":1", "1:2,", "1:2,,2:2", "1:2,1:2", "1:-1", "1024:1", "1:897", "1:2x", "1:1:2" }) {
         inputs.set(quotas, value); char error[512] = {};
-        sink_ptr s(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        sink_ptr s = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
         require(!s && error[0], "invalid layer quota accepted"); ++rejected;
     }
     inputs.unset(quotas);
     for (const char * value : { "", "0", "536870911", "-1", "536870912x", "18446744073709551616" }) {
         inputs.set(reserve, value); char error[512] = {};
-        sink_ptr s(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        sink_ptr s = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
         require(!s && error[0], "invalid cache reserve accepted"); ++rejected;
     }
     for (const char * value : { "2147483649", "2466374752", "12884901888", "18446744073709551615" }) {
@@ -1607,6 +1639,8 @@ static std::vector<int32_t> all_cache_layers() {
     return layers;
 }
 
+#if defined(__linux__)
+// Linux only: plans the automatic capacity against a dedicated cgroup scope's memory.max/current.
 static void cache_auto_ring_test(fixture_inputs & inputs, int threads, int depth) {
     // A dedicated small scope tests planned capacity without filling it or
     // manufacturing an OOM. The fixture and its file pages stay charged.
@@ -1712,6 +1746,7 @@ static void cache_auto_ring_test(fixture_inputs & inputs, int threads, int depth
             (unsigned long long) full.pressure_stops);
     std::printf("AUTO_CACHE_RING_OK output_hash=%llu\n", (unsigned long long) hit.output_hash);
 }
+#endif
 
 static void cache_large_test(fixture_inputs & inputs, int threads, int depth) {
     // Only three experts are materialized. The metadata exposes ID 895 and
@@ -1748,7 +1783,9 @@ static void cache_large_test(fixture_inputs & inputs, int threads, int depth) {
             "large quota was clipped or virtual budget was eagerly committed");
     require(stats.page_table_bytes > 0 && stats.last_guard_extra_bytes > 2 * unit &&
             stats.last_guard_extra_bytes < 3 * unit && stats.peak_guard_extra_bytes < 128ull * 1024 * 1024,
-            "large cache guard omitted page tables or charged unused slots");
+            "large cache guard omitted page tables or charged unused slots: page_tables=" +
+            std::to_string(stats.page_table_bytes) + " last_guard=" + std::to_string(stats.last_guard_extra_bytes) +
+            " peak_guard=" + std::to_string(stats.peak_guard_extra_bytes) + " unit=" + std::to_string(unit));
     require(anonymous_bytes() < before + 128ull * 1024 * 1024, "large virtual cache prefaulted payload");
     begin_cache(sink.get(), 1, 2);
     cache_case(inputs, "cache_large_hit_and_high_id", f, sink.get(), 1, input, { 1, 895 }, { .4f, .6f }, 1, 1);
@@ -1764,6 +1801,8 @@ static void cache_large_test(fixture_inputs & inputs, int threads, int depth) {
             (unsigned long long) stats.page_table_bytes, (unsigned long long) stats.peak_guard_extra_bytes);
 }
 
+#if defined(__linux__)
+// Linux only: these two lower and read cgroup v2 memory.max to create pressure.
 static void cache_pressure_transition_test(fixture_inputs & inputs, int threads, int depth) {
     // Explicit opt-in, dedicated scope only. Lowering its limit leaves the
     // selected reserve minus a small, known deficit, so this exercises the
@@ -1790,7 +1829,7 @@ static void cache_pressure_transition_test(fixture_inputs & inputs, int threads,
     const char * partial_value = inputs.get("cache_partial_reclaim");
     const bool partial = partial_value && !std::strcmp(partial_value, "1");
     fixture f; make_synthetic(f); auto sink = make_sink(inputs, f, threads, depth);
-    const uint64_t unit = triplet_bytes(f);
+    const uint64_t unit = cache_slot_bytes(inputs, triplet_bytes(f));
     if (partial) { configure_cache(sink.get(), 4 * unit, { 1, 2 }, 2); }
     else { configure_cache(sink.get(), 594000000000, all_cache_layers(), 896); }
     std::vector<float> input(f.latent, .13f);
@@ -1897,23 +1936,31 @@ static void cache_pressure_test(fixture_inputs & inputs, int threads, int depth,
             (unsigned long long) stats.pressure_stops, (unsigned long long) stats.mapped_bytes);
     if (unbounded) { std::printf("CACHE_UNBOUNDED_REJECT_OK\n"); }
 }
+#endif
 
 // Validate the emitted records, not just the counters used to format them.
 // No cgroup/cache admission is required; cache-hit transport has separate tests.
 // The sink's stderr lines (trace, profile, reports) while it lives; read() restores stderr.
 struct stderr_capture {
-    FILE * file = std::tmpfile();
+    std::string path = test_resources::temp_file("kimi-cpu-sink-stderr");
+    FILE * file = std::fopen(path.c_str(), "w+b");
     int saved = -1;
     stderr_capture() {
-        require(file != nullptr, "trace capture tmpfile");
+        require(file != nullptr, "trace capture file");
         std::fflush(stderr);
-        saved = dup(STDERR_FILENO);
-        require(saved >= 0 && dup2(fileno(file), STDERR_FILENO) >= 0, "redirect trace stderr");
+        saved = test_resources::fd_dup(test_resources::fd_of(stderr));
+        require(saved >= 0 && test_resources::fd_dup2(test_resources::fd_of(file), test_resources::fd_of(stderr)) >= 0,
+                "redirect trace stderr");
     }
     void restore() {
-        if (saved >= 0) { std::fflush(stderr); dup2(saved, STDERR_FILENO); close(saved); saved = -1; }
+        if (saved >= 0) {
+            std::fflush(stderr);
+            test_resources::fd_dup2(saved, test_resources::fd_of(stderr));
+            test_resources::fd_close(saved);
+            saved = -1;
+        }
     }
-    ~stderr_capture() { restore(); if (file) { std::fclose(file); } }
+    ~stderr_capture() { restore(); if (file) { std::fclose(file); } test_resources::remove_file(path); }
     std::string read() {
         restore(); std::rewind(file);
         std::string result; char buffer[4096];
@@ -1982,8 +2029,9 @@ static void trace_profile_test(fixture_inputs & inputs, int threads, int depth) 
         const double other = p.at("other_wall_us");
         require(compute > 0 && wait >= 0 && other >= 0 && std::abs(total - compute - wait - other) < .01,
                 "profile disjoint caller wall times do not sum to total");
-        require(p.at("compute_thread_cpu_us").get<double>() > 0 &&
-                p.at("caller_thread_cpu_us").get<double>() > 0 && p.at("io_thread_cpu_us").get<double>() > 0,
+        auto clocked = [](double us) { return test_resources::thread_clock_ticks ? us >= 0 : us > 0; };
+        require(clocked(p.at("compute_thread_cpu_us").get<double>()) &&
+                clocked(p.at("caller_thread_cpu_us").get<double>()) && clocked(p.at("io_thread_cpu_us").get<double>()),
                 "profile CPU clocks missing");
         double worker_cpu = 0;
         for (const auto & w : p.at("workers")) {
@@ -2020,8 +2068,8 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
     for (const int k : { 10, 65 }) {
         require(inputs.set("prefetch_depth", std::to_string(k).c_str()) == 0, "set prefetch depth");
         char error[512] = {};
-        sink_ptr sink(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
-        require(k == 10 ? sink != nullptr : sink == nullptr && std::strstr(error, "must be 0..64"),
+        sink_ptr sink = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
+        require(k == 10 ? bool(sink) : !sink && std::strstr(error, "must be 0..64"),
                 "prefetch depth " + std::to_string(k) + ": " + error);
     }
     for (const int k : { 2, 0 }) {
@@ -2083,6 +2131,7 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
                 (spills || (field("spill_us") == "0" && spill_r == "0,0,0,0")), "prefetch report spill: " + report);
         std::printf("case=prefetch_depth%d status=PASS %s\n", k, report.c_str());
     }
+#if defined(__linux__)
     {
         // The reads of 6, hinted for layer 2 and not selected there, held in pread (pread_hold) for as long as a case
         // needs, without timing assumptions. A prefetch lands only in resident slots, so both layers are warmed
@@ -2155,6 +2204,10 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
                 "reads spilled past a run without reads of its own and without a hint: " + last);
         std::printf("case=prefetch_spill_last status=PASS %s\n", last.c_str());
     }
+#else
+    std::printf("case=prefetch_spill_twice status=SKIP reason=linux_pread_interposition\n");
+    std::printf("case=prefetch_spill_last status=SKIP reason=linux_pread_interposition\n");
+#endif
     std::printf("CPU_SINK_PREFETCH_OK\n");
 }
 // build_moe_ffn's one-token CPU graph: MUL_MAT_ID gate/up over the full expert
@@ -2183,6 +2236,8 @@ static std::vector<float> reference_moe_graph(const fixture & f, int layer, cons
     ggml_tensor * act = nullptr;
     if (activation.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) {
         act = ggml_swiglu_clamp(ctx, gate, up, activation.swiglu_limit);
+    } else if (activation.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+        act = ggml_swiglu_split(ctx, gate, up);
     } else {
         const float beta = activation.situ_beta, lb = activation.situ_linear_beta;
         act = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f / beta)), beta);
@@ -2241,7 +2296,7 @@ static void elastic_cache_tests(fixture_inputs & inputs, int threads, int depth)
     scoped_fixture_input quotas_env(inputs, "cache_layer_quotas", nullptr);
 
     fixture f; make_synthetic(f);
-    const uint64_t unit = triplet_bytes(f);
+    const uint64_t unit = cache_slot_bytes(inputs, triplet_bytes(f));
     std::vector<float> input(f.latent, .13f);
     auto sink = make_sink(inputs, f, threads, depth);
     configure_cache(sink.get(), 6 * unit, { 1, 2 }, 3);
@@ -2299,7 +2354,7 @@ static void elastic_cache_tests(fixture_inputs & inputs, int threads, int depth)
 
     auto rejected = [&](const char * message) {
         char error[512] = {};
-        sink_ptr value(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+        sink_ptr value = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
         require(!value && error[0], message);
     };
     {
@@ -2401,6 +2456,7 @@ static void q2_activation_test(fixture_inputs & inputs, int threads, int depth) 
 // The room the host ledger's terms leave before its reserve (CACHE_RESERVE_BYTES, also the floor's margin off unified
 // memory): the least of memory.max less memory.current over this process's cgroup and its ancestors with a finite
 // limit, and MemAvailable. 0 without a finite cgroup.
+#if defined(__linux__)
 static uint64_t host_room() {
     std::ifstream groups("/proc/self/cgroup");
     std::string line, path;
@@ -2424,6 +2480,13 @@ static uint64_t host_room() {
     }
     return finite ? room : 0;
 }
+#endif
+// The ledger the sink's host arbiter measures with on this OS.
+#if defined(__linux__)
+using probe_ledger = kimi_host_ledger;
+#else
+using probe_ledger = ssd::host::native_ledger;
+#endif
 static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
     scoped_fixture_input policy_env(inputs, "cache_policy", "lru");
     scoped_fixture_input allocation_env(inputs, "cache_allocation", "uniform");
@@ -2435,6 +2498,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
     fixture f; f.native_ranges = true; make_synthetic(f);
     uint64_t stride = 0; // a role as a decode request reserves it: its bytes and a page prefix, in whole pages
     for (int role = 0; role < 3; ++role) { stride += (f.entries.at({ tensor_name(1, role), 0 }).raw_bytes + 8190) / 4096 * 4096; }
+    stride = cache_slot_bytes(inputs, stride);
     std::vector<float> input(f.latent);
     for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int(i % 23) - 11) * .019f; }
     auto load = [&](kimi_cpu_sink * sink, std::string * receipt) {
@@ -2561,6 +2625,8 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         begin_cache(d.get(), 11, 5);
         require(cache_snapshot(d.get()).enabled_bytes == 12 * stride, kind + "a later decode token changed the slots");
     }
+#if defined(__linux__)
+    // Linux only: the drift is injected between the Linux ledger's cgroup and /proc/meminfo reads.
     {
         // An automatic budget whose room shrinks between geometry's reading of it and the load step's own, as when
         // the server allocates while it loads: the load step commits fewer slots than geometry enabled, and those owe
@@ -2574,9 +2640,10 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         };
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
-        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096, slot = 3 * role;
+        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096;
+        const uint64_t slot = cache_slot_bytes(inputs, 3 * role);
         const uint64_t cost = slot + slot / 128; // a slot and its page tables, until geometry's receipt prices it
-        const uint64_t ring = uint64_t(depth) * slot, room = host_room();
+        const uint64_t ring = uint64_t(depth) * 3 * role, room = host_room();
         test_resources::need(room > ring + 7 * cost + (1ull << 30), "the owed slots' case needs a finite cgroup with room");
         // geometry sees 6.5 slots of room, after the read ring the load step resizes first
         scoped_fixture_input reserve_env(inputs, "cache_reserve_bytes",
@@ -2650,6 +2717,9 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
                 "owed slots: the first decode did not price the owed slots first: " + regrow);
         std::printf("case=load_regrow_owed status=PASS %s | %s\n", loaded.c_str(), regrow.c_str());
     }
+#else
+    std::printf("case=load_regrow_owed status=SKIP reason=linux_ledger_injection\n");
+#endif
     {
         // A prefill's room, held before it allocates anything (kimi_cpu_sink_cache_prefill_room): its pages and its
         // compute buffers take their room in one give-back at its start; its later checks keep the rest; the first
@@ -2663,7 +2733,8 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         };
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
-        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096, slot = 3 * role;
+        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096;
+        const uint64_t slot = cache_slot_bytes(inputs, 3 * role);
         auto h = make_sink(inputs, big, threads, depth);
         configure_cache(h.get(), 6 * slot, { 1, 2 }, 6);
         {
@@ -2674,7 +2745,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         }
         require(cache_snapshot(h.get()).committed_bytes == 6 * slot, "prefill room: the load step did not commit 6 slots");
         begin_cache(h.get(), 13, 1, false);
-        kimi_host_ledger probe;
+        probe_ledger probe;
         inputs.configure(probe, false);
         const uint64_t room = probe.measure(0).surplus(), pages = room + 5 * slot / 2, host = 1 << 20;
         require(room != UINT64_MAX && room > 0, "prefill room: no finite room to measure");
@@ -2720,9 +2791,10 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         };
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
-        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096, slot = 3 * role;
-        const uint64_t cost = slot + slot / 128, ring = uint64_t(depth) * slot;
-        kimi_host_ledger probe;
+        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096;
+        const uint64_t slot = cache_slot_bytes(inputs, 3 * role);
+        const uint64_t cost = slot + slot / 128, ring = uint64_t(depth) * 3 * role;
+        probe_ledger probe;
         inputs.configure(probe, false);
         const uint64_t room = probe.measure(0).surplus() + probe.reserve;
         require(room != UINT64_MAX && room > ring + 7 * cost + (1ull << 30), "load hold: the case needs a finite cgroup with room");
@@ -2784,12 +2856,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         // first decode charges it). Experts of 51 MiB (Q8_0 4096 x 4096, no file) make the ring's pages, a slot for each
         // of the depth's reads, show in the process's resident memory.
         scoped_fixture_input partial(inputs, "cache_partial_reclaim", nullptr);
-        auto resident = [] {
-            std::ifstream statm("/proc/self/statm");
-            uint64_t size = 0, pages = 0;
-            statm >> size >> pages;
-            return pages * uint64_t(sysconf(_SC_PAGESIZE));
-        };
+        auto resident = [] { return test_resources::resident_bytes(); };
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
         const uint64_t slot = 3 * ((ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096);
@@ -2816,6 +2883,133 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
     }
     std::printf("CACHE_LOAD_OK stride=%llu first_touch=%llu receipt=%s\n", (unsigned long long) stride,
             (unsigned long long) first_touch, receipt.c_str());
+}
+
+// An allocation outside the caches that names no reclaimer gets the RAM cache's room: the CPU backend's work buffer
+// (ggml_backend_cpu_graph_compute), which a prefill grows when its graph needs more than every graph before it. The
+// sink and the backend share one host client, as in a context. The cache takes the envelope's room at load (an
+// automatic budget with partial reclaim) and leaves half a slot; a matrix product then needs a work buffer of three
+// slots. The host arbiter runs the sink's reclaimer before it would refuse: the cache gives back the slots the
+// shortage needs and no more, the ledger holds no pending debit and has granted the buffer, and the sink computes bit
+// for bit after it.
+static void work_buffer_reclaim_tests(fixture_inputs & inputs, int threads, int depth) {
+    scoped_fixture_input policy_env(inputs, "cache_policy", "lru");
+    scoped_fixture_input allocation_env(inputs, "cache_allocation", "uniform");
+    scoped_fixture_input keep_env(inputs, "cache_keep", "1");
+    scoped_fixture_input partial_env(inputs, "cache_partial_reclaim", "1");
+    scoped_fixture_input elastic_env(inputs, "cache_elastic", nullptr);
+    scoped_fixture_input quotas_env(inputs, "cache_layer_quotas", nullptr);
+    auto number = [](const std::string & line, const std::string & key) {
+        const size_t at = line.find(" " + key + "=");
+        require(at != std::string::npos, "the receipt lacks " + key + ": " + line);
+        return uint64_t(std::stoull(line.substr(at + key.size() + 2)));
+    };
+    // Experts of 13 MiB (Q8_0 2048 x 2048) keep the process's own movements far below a slot.
+    fixture f; f.latent = f.hidden = 2048; f.type = f.down_type = GGML_TYPE_Q8_0; f.experts = 4; f.native_ranges = true;
+    make_synthetic(f);
+    const std::vector<int32_t> ids = { 0, 2 };
+    const std::vector<float> weights = { .35f, .65f };
+    std::vector<float> input(f.latent);
+    for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int(i % 29) - 14) * .011f; }
+    const auto expected = reference(f, 1, input, ids, weights, 4, 25);
+    // a role as a decode request reserves it: its bytes and a page prefix, in whole pages
+    const uint64_t role = (f.entries.at({ tensor_name(1, 0), 0 }).raw_bytes + 8190) / 4096 * 4096;
+    const uint64_t slot = cache_slot_bytes(inputs, 3 * role), cost = slot + slot / 128, ring = uint64_t(depth) * 3 * role;
+
+    // F16 weights: the backend converts the F32 input to F16 into its work buffer, three slots of it.
+    const int64_t k = 4096, n = int64_t(3 * slot / (2 * k));
+    ggml_context * ctx = ggml_init({ ggml_tensor_overhead() * 4 + ggml_graph_overhead(), nullptr, true });
+    require(ctx, "work buffer: graph context");
+    ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, 1), * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, ggml_mul_mat(ctx, a, b));
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    require(backend, "work buffer: CPU backend");
+    ggml_backend_cpu_set_n_threads(backend, threads);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    require(buffer, "work buffer: graph tensors");
+    ggml_backend_tensor_memset(a, 0x3c, 0, ggml_nbytes(a));
+    ggml_backend_tensor_memset(b, 0x3c, 0, ggml_nbytes(b));
+    const uint64_t work = ggml_graph_plan(graph, threads, nullptr).work_size;
+    require(work > 5 * slot / 2, "work buffer: the product's work buffer is below the shortage it is meant to make");
+
+    // One host client for the sink and the backend; everything the case allocates outside them is resident by now.
+    auto owner = std::make_shared<ssd::host::process_arbiter>();
+    auto made = owner->make_client();
+    require(bool(made), made.error);
+    auto client = std::move(made.value);
+    const auto saved = inputs.runtime;
+    struct restore { fixture_inputs & inputs; ssd::runtime_services value; ~restore() { inputs.set_runtime_services(value); } }
+        restore_runtime{ inputs, saved };
+    ssd::runtime_services services = saved;
+    services.host = client.get();
+    inputs.set_runtime_services(services);
+    using attach_fn = bool (*)(ggml_backend_t, const ssd::runtime_services *) noexcept;
+    const auto attach = reinterpret_cast<attach_fn>(
+        ggml_backend_reg_get_proc_address(ggml_backend_cpu_reg(), "ggml_backend_cpu_set_ssd_runtime_services"));
+    require(attach && attach(backend, &services), "work buffer: the backend did not take the context's services");
+    probe_ledger probe;
+    inputs.configure(probe, false);
+    const uint64_t room = probe.measure(0).surplus() + probe.reserve;
+    require(room != UINT64_MAX && room > ring + 7 * cost + (1ull << 30), "work buffer: the case needs a finite envelope with room");
+    // geometry sees 6.5 slots of room after the read ring, and the load step commits what it sized
+    scoped_fixture_input reserve_env(inputs, "cache_reserve_bytes", std::to_string(room - ring - 13 * cost / 2).c_str());
+    auto sink = make_sink(inputs, f, threads, depth);
+    configure_cache(sink.get(), std::numeric_limits<uint64_t>::max(), { 1, 2 }, 6);
+    std::string loaded;
+    {
+        tensors meta(f, 1);
+        char error[512] = {};
+        stderr_capture log;
+        const bool ok = kimi_cpu_sink_vram_reserve(sink.get(), meta.role[0], meta.role[1], meta.role[2], int(ids.size()),
+            error, sizeof(error));
+        std::istringstream lines(log.read());
+        for (std::string l; std::getline(lines, l);) {
+            if (l.rfind("[kimi_cpu_sink_cache] reason=load ", 0) == 0) { loaded = l; }
+        }
+        require(ok, error);
+    }
+    require(!loaded.empty() && number(loaded, "slot_bytes") == slot && number(loaded, "slots") >= 4,
+            "work buffer: the load step did not take the envelope's room: " + loaded);
+    begin_cache(sink.get(), 21, 1, false); // a prefill keeps the arena
+    const auto before = cache_snapshot(sink.get());
+    const auto left = client->measure(work, true);
+    require(bool(left) && !left.value.fits(), "work buffer: the cache left room for the work buffer");
+    const uint64_t shortage = left.value.shortage(), granted = client->state().value.granted;
+
+    std::string shrink;
+    ggml_status status;
+    {
+        stderr_capture log;
+        status = ggml_backend_graph_compute(backend, graph);
+        std::istringstream lines(log.read());
+        for (std::string l; std::getline(lines, l);) {
+            if (l.rfind("[kimi_cpu_sink_cache] cache_shrink=1 ", 0) == 0) { shrink = l; }
+        }
+    }
+    require(status == GGML_STATUS_SUCCESS, "work buffer: the backend's work buffer was refused while the cache held the room");
+    const auto after = cache_snapshot(sink.get());
+    const uint64_t released = after.released_bytes - before.released_bytes;
+    require(after.shrink_ops == before.shrink_ops + 1 && after.guard_reclaims == before.guard_reclaims + 1 &&
+            released >= shortage && released < shortage + slot && before.committed_bytes - after.committed_bytes == released,
+            "work buffer: the cache did not give back the shortage's slots in one step: shortage " + std::to_string(shortage) +
+            ", released " + std::to_string(released) + ", shrinks " + std::to_string(after.shrink_ops - before.shrink_ops) +
+            ", committed " + std::to_string(before.committed_bytes) + " -> " + std::to_string(after.committed_bytes) + ": " + shrink);
+    const auto state = client->state();
+    require(bool(state) && state.value.pending_bytes == 0 && state.value.granted == granted + work,
+            "work buffer: the ledger kept a pending debit or did not grant the buffer");
+    require(client->measure(0, true).value.fits(), "work buffer: the grant overdrew the envelope");
+
+    begin_cache(sink.get(), 21, 2); // the first decode token takes back what the room allows now
+    tensors meta(f, 1);
+    run_checked(inputs, "work_reclaim_decode", f, sink.get(), meta, input, ids, weights, expected, 1, 25, 0, -1);
+    std::printf("case=work_buffer_reclaim status=PASS work=%llu shortage=%llu released=%llu slot=%llu %s\n",
+            (unsigned long long) work, (unsigned long long) shortage, (unsigned long long) released,
+            (unsigned long long) slot, shrink.c_str());
+    ggml_backend_buffer_free(buffer);
+    ggml_backend_free(backend);
+    ggml_free(ctx);
+    std::printf("WORK_BUFFER_RECLAIM_OK\n");
 }
 
 static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
@@ -2875,7 +3069,7 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
         for (const char * bad : { "", "2", "yes" }) {
             scoped_fixture_input env(inputs, "cache_reclaimable_file", bad);
             char error[512] = {};
-            sink_ptr rejected(inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error)), kimi_cpu_sink_destroy);
+            sink_ptr rejected = inputs.create(threads, depth, fixture::resolve, &f, error, sizeof(error));
             require(!rejected && error[0], "invalid CACHE_RECLAIMABLE_FILE was accepted");
         }
         scoped_fixture_input reclaim_env(inputs, "cache_reclaimable_file", "1");
@@ -2981,20 +3175,16 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
     std::printf("CPU_SINK_ACTIVATION_OK threads=%d ring_experts=%d refusals=%d\n", threads, depth, refusals);
 }
 
-#endif
-
-
-#if defined(__linux__)
-// Native Muse expert semantics against an independent ordinary ggml MoE graph. Different
-// norm weights/epsilons and >64-token prefill catch normalization after the sum,
-// missing norm weights, and both grouped accumulation paths.
+// Native Muse expert semantics against the ordinary ggml MoE graph Muse builds (ggml_swiglu_split, then mul and
+// rms_norm by the post norm), bit for bit. Different norm weights/epsilons and 3- and 65-token prefills catch
+// normalization after the sum, missing norm weights, and the grouped slot-order sum.
 static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int depth, ggml_type type, bool native_ranges = false) {
     scoped_fixture_input ready(inputs, "ready_first", "1");
     fixture f; f.type = f.down_type = type; make_synthetic(f, 20261017);
     if (native_ranges) {
         // Rebuild a tiny native-weight source with mixed zero/128-byte page prefixes and
         // no EOF padding. Keep the independent reference payload unchanged.
-        close(f.fd); f.fd = -1;
+        ssd::platform::close_fd(f.fd); f.fd = -1;
         for (auto it = f.entries.begin(); it != f.entries.end();) {
             if (it->first.first.rfind("blk.2.", 0) == 0) { it = f.entries.erase(it); }
             else { ++it; }
@@ -3020,19 +3210,13 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
     }
     const std::vector<int32_t> ids = { 9, 1, native_ranges ? 19 : 17, 6, 3, 12, 0, 15 };
     const std::vector<float> weights = { .21f, .19f, .15f, .13f, .11f, .09f, .07f, .05f };
-    kimi_cpu_sink_activation activation = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP,
-        0.0f, 0.0f, std::numeric_limits<float>::infinity(), norm.data(), 1e-8f };
+    kimi_cpu_sink_activation activation = { KIMI_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, norm.data(), 1e-8f };
     char error[512] = {};
     auto compare = [&](const std::vector<float> & actual, const std::vector<float> & expected) {
-        require(actual.size() == expected.size(), "Muse Q8 output size");
-        double maximum = 0;
-        for (size_t i = 0; i < actual.size(); ++i) {
-            const double diff = std::abs(double(actual[i]) - expected[i]);
-            maximum = std::max(maximum, diff);
-            require(std::isfinite(actual[i]) && diff <= 3e-5 + 3e-5 * std::abs(expected[i]),
-                "Muse Q8 expert post norm mismatch at " + std::to_string(i));
-        }
-        std::printf("MUSE_EXPERT_COMPARE type=%s native_ranges=%d values=%zu max_abs=%.9g PASS\n", ggml_type_name(type), int(native_ranges), actual.size(), maximum);
+        require(actual.size() == expected.size(), "Muse output size");
+        require(!std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)),
+            "Muse experts with their post norm differ from the graph");
+        std::printf("MUSE_EXPERT_COMPARE type=%s native_ranges=%d values=%zu bit_exact=1 PASS\n", ggml_type_name(type), int(native_ranges), actual.size());
     };
     for (float eps : { 1e-8f, .2f }) {
         activation.post_exp_norm_eps = eps;
@@ -3046,23 +3230,27 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
             "Muse Q8 decode I/O counters");
     }
     auto * prefill = kimi_cpu_prefill_create(sink.get(), error, sizeof(error)); require(prefill, error);
-    for (int tokens : { 3, 65 }) {
-        std::vector<float> x, w, expected;
-        std::vector<int32_t> selected;
-        for (int token = 0; token < tokens; ++token) {
-            auto xt = input; auto it = ids;
-            for (auto & value : xt) { value += float(token) * .003f; }
-            for (auto & id : it) { id = (id + token) % f.experts; }
-            auto y = reference_moe_graph(f, 1, xt, it, weights, activation, 1);
-            x.insert(x.end(), xt.begin(), xt.end()); selected.insert(selected.end(), it.begin(), it.end());
-            w.insert(w.end(), weights.begin(), weights.end()); expected.insert(expected.end(), y.begin(), y.end());
+    // both epsilons: one far above the mean square, which hides how the squares are rounded
+    for (float eps : { 1e-8f, .2f }) {
+        activation.post_exp_norm_eps = eps;
+        for (int tokens : { 3, 65 }) {
+            std::vector<float> x, w, expected;
+            std::vector<int32_t> selected;
+            for (int token = 0; token < tokens; ++token) {
+                auto xt = input; auto it = ids;
+                for (auto & value : xt) { value += float(token) * .003f; }
+                for (auto & id : it) { id = (id + token) % f.experts; }
+                auto y = reference_moe_graph(f, 1, xt, it, weights, activation, 1);
+                x.insert(x.end(), xt.begin(), xt.end()); selected.insert(selected.end(), it.begin(), it.end());
+                w.insert(w.end(), weights.begin(), weights.end()); expected.insert(expected.end(), y.begin(), y.end());
+            }
+            std::vector<float> actual(expected.size()); kimi_cpu_prefill_stats stats = {};
+            require(kimi_cpu_prefill_run_activation(prefill, meta.role[0], meta.role[1], meta.role[2],
+                x.data(), selected.data(), w.data(), 8, tokens, &activation, actual.data(), &stats, error, sizeof(error)), error);
+            compare(actual, expected);
+            require(stats.stream.pending_reads == 0 && !stats.stream.read_errors && !stats.stream.fallback_count,
+                "Muse Q8 prefill I/O counters");
         }
-        std::vector<float> actual(expected.size()); kimi_cpu_prefill_stats stats = {};
-        require(kimi_cpu_prefill_run_activation(prefill, meta.role[0], meta.role[1], meta.role[2],
-            x.data(), selected.data(), w.data(), 8, tokens, &activation, actual.data(), &stats, error, sizeof(error)), error);
-        compare(actual, expected);
-        require(stats.stream.pending_reads == 0 && !stats.stream.read_errors && !stats.stream.fallback_count,
-            "Muse Q8 prefill I/O counters");
     }
     kimi_cpu_prefill_destroy(prefill);
     if (native_ranges) {
@@ -3093,12 +3281,11 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
                     "page-prefix variation cleared native cached payloads"); }
             }
         }
-        // EOF padding may be absent, but one missing logical byte must fail.
-        const int writable = open(f.path.c_str(), O_WRONLY);
-        struct stat status = {};
-        require(writable >= 0 && fstat(writable, &status) == 0 &&
-            ftruncate(writable, status.st_size - 1) == 0, "native fixture truncate");
-        close(writable);
+        // EOF padding may be absent, but one missing logical byte must fail. Windows shares a direct
+        // descriptor for reading only, so the file is truncated between two opens.
+        ssd::platform::close_fd(f.fd); f.fd = -1;
+        std::filesystem::resize_file(f.path, std::filesystem::file_size(f.path) - 1);
+        f.fd = test_resources::open_direct(f.path);
         auto truncated = make_sink(inputs, f, threads, depth);
         std::vector<float> actual(f.latent); kimi_cpu_sink_stats stats = {};
         require(!kimi_cpu_sink_run_activation(truncated.get(), meta.role[0], meta.role[1], meta.role[2],
@@ -3108,10 +3295,10 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
     std::printf("MUSE_EXPERT_POST_NORM_OK type=%s native_ranges=%d\n", ggml_type_name(type), int(native_ranges));
 }
 
-#endif
-
-// The host-memory ledger (kimi-host-ledger.h) with injected /proc and cgroup files, a fake GPU tier and a fake RAM
-// cache: which term binds where, the make_room order, and the refault-driven file reserve.
+#if defined(__linux__)
+// Linux only (the native ledger has test-ssd-host-budget): the host-memory ledger (kimi-host-ledger.h) with injected
+// /proc and cgroup files, a fake GPU tier and a fake RAM cache: which term binds where, the make_room order, and the
+// refault-driven file reserve.
 static void host_ledger_tests(fixture_inputs & inputs) {
     constexpr uint64_t MiB = 1ull << 20, GiB = 1ull << 30;
     scoped_fixture_input margin_env(inputs, "cache_reserve_bytes", "536870912");
@@ -3450,13 +3637,465 @@ static void host_ledger_tests(fixture_inputs & inputs) {
     std::printf("HOST_LEDGER_OK\n");
 }
 
-#if defined(__linux__)
+// Linux only: counts /proc/self/task and forks a child under RLIMIT_FSIZE.
 #include "configured-runtime-gate.h"
 #endif
 
+// The configured executor without a GPU provider, as on macOS, Windows and CPU-only Linux: vram.budget auto is
+// no GPU tier, and only an explicit nonzero budget is refused.
+static void tierless_budget_tests() {
+    fixture f;
+    auto owner = std::make_shared<ssd::host::process_arbiter>();
+    auto client = owner->make_client();
+    require(bool(client), "host client registration");
+    const ssd::runtime_services services{ nullptr, nullptr, client.value.get() };
+    for (const bool automatic : { true, false }) {
+        const auto settings = ssd::settings::parse("", "", { { "vram.budget", automatic ? "auto" : "1048576" } });
+        require(bool(settings), settings.error);
+        char error[512] = {};
+        sink_ptr sink(ssd::cpu::create_configured(&settings.value, &services, fixture::resolve, &f, error, sizeof(error)));
+        if (automatic) {
+            require(bool(sink), std::string("vram.budget auto without a GPU provider: ") + error);
+        } else {
+            require(!sink && std::strstr(error, "requires an injected GPU provider"),
+                "an explicit GPU tier budget without a provider was accepted");
+        }
+    }
+    std::printf("TIERLESS_BUDGET_OK\n");
+}
+
+// The production shape of a call: graphs of sink nodes that every thread of a ggml threadpool enters, ith 0 as the
+// coordinator that opens, runs and closes the call and the others as its participants, as
+// llama_kimi_cpu_sink_compute does. Chained decode layers with a dense op between them, a grouped prefill and a run
+// that fails inside its call, at 1, 2, an odd count and all CPUs, with every decode participant and with a fixed
+// first few, bit for bit against the ggml reference graphs.
+struct graph_layer {
+    kimi_cpu_sink * sink = nullptr;
+    kimi_cpu_prefill * prefill = nullptr;
+    const tensors * meta = nullptr;
+    const kimi_cpu_sink_activation * activation = nullptr; // SiTU (4, 25) when absent
+    bool fail = false;
+    bool ok = false;
+    int nth = 0; // the participants ggml gave the call
+    std::string error;
+};
+
+static void graph_layer_compute(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    auto & layer = *static_cast<graph_layer *>(userdata);
+    if (ith) { kimi_cpu_sink_call_join(layer.sink, ith, nth); return; }
+    char error[512] = {};
+    if (!kimi_cpu_sink_call_open(layer.sink, nth, error, sizeof(error))) {
+        std::fprintf(stderr, "graph call open: %s\n", error);
+        std::abort();
+    }
+    layer.nth = nth;
+    const ggml_tensor * x = dst->src[0], * ids = dst->src[1], * weights = dst->src[2];
+    const int ntokens = int(dst->ne[1]), nslots = int(ggml_nelements(ids) / ntokens);
+    const auto * id = static_cast<const int32_t *>(ids->data);
+    const auto * w = static_cast<const float *>(weights->data);
+    auto * out = static_cast<float *>(dst->data);
+    const auto * in = static_cast<const float *>(x->data);
+    const auto & m = *layer.meta;
+    if (layer.prefill) {
+        layer.ok = layer.activation ?
+            kimi_cpu_prefill_run_activation(layer.prefill, m.role[0], m.role[1], m.role[2], in, id, w, nslots, ntokens,
+                layer.activation, out, nullptr, error, sizeof(error)) :
+            kimi_cpu_prefill_run(layer.prefill, m.role[0], m.role[1], m.role[2], in, id, w, nslots, ntokens,
+                4.0f, 25.0f, out, nullptr, error, sizeof(error));
+    } else {
+        // an invalid slot count fails after the call opened: the joiners must still leave
+        const int slots = layer.fail ? -1 : nslots;
+        layer.ok = layer.activation ?
+            kimi_cpu_sink_run_activation(layer.sink, m.role[0], m.role[1], m.role[2], in, id, w, slots,
+                layer.activation, out, nullptr, error, sizeof(error)) :
+            kimi_cpu_sink_run(layer.sink, m.role[0], m.role[1], m.role[2], in, id, w, slots,
+                4.0f, 25.0f, out, nullptr, error, sizeof(error));
+    }
+    layer.error = error;
+    kimi_cpu_sink_call_close(layer.sink);
+}
+
+static void threadpool_tests(fixture_inputs & inputs, int depth) {
+    fixture f; make_synthetic(f);
+    tensors meta1(f, 1), meta2(f, 2);
+    const int cpus = int(test_resources::process_cpus().size());
+    std::vector<int> counts = { 1, 2, 3 };
+    if (cpus > 3) { counts.push_back(cpus); }
+    const std::vector<int32_t> ids1 = { 17, 0, 8, 2, 19, 4, 11, 6 }, ids2 = { 3, 9, -1, 13, 5, 3, 1, 12 };
+    const std::vector<float> w1 = { .2f, .1f, .15f, .05f, .1f, .1f, .2f, .1f }, w2 = { .3f, .1f, 0, .2f, .1f, .1f, .1f, .1f };
+    std::vector<float> x(f.latent);
+    for (int i = 0; i < f.latent; ++i) { x[i] = std::sin(float(i) * .37f) * .3f; }
+    // decode: layer 1, x0.5, layer 2, layer 1 (three calls a graph); then the reference chain
+    auto expected = reference(f, 1, x, ids1, w1, 4, 25);
+    for (auto & v : expected) { v *= .5f; }
+    expected = reference(f, 2, expected, ids2, w2, 4, 25);
+    expected = reference(f, 1, expected, ids1, w1, 4, 25);
+    constexpr int ntokens = 5, nslots = 4;
+    std::vector<float> xs(size_t(ntokens) * f.latent);
+    std::vector<int32_t> prefill_ids(size_t(ntokens) * nslots);
+    std::vector<float> prefill_weights(prefill_ids.size()), prefill_expected;
+    for (size_t i = 0; i < xs.size(); ++i) { xs[i] = std::cos(float(i) * .11f) * .25f; }
+    for (int t = 0; t < ntokens; ++t) {
+        for (int s = 0; s < nslots; ++s) {
+            prefill_ids[size_t(t) * nslots + s] = (t * 5 + s * 7 + 1) % f.experts;
+            prefill_weights[size_t(t) * nslots + s] = float(t + s + 1) / 17.0f;
+        }
+        const auto y = reference(f, 2, { xs.begin() + size_t(t) * f.latent, xs.begin() + size_t(t + 1) * f.latent },
+            { prefill_ids.begin() + size_t(t) * nslots, prefill_ids.begin() + size_t(t + 1) * nslots },
+            { prefill_weights.begin() + size_t(t) * nslots, prefill_weights.begin() + size_t(t + 1) * nslots }, 4, 25);
+        prefill_expected.insert(prefill_expected.end(), y.begin(), y.end());
+    }
+    char error[512] = {};
+    for (int fixed : { 0, 2 }) {
+        scoped_fixture_input participants(inputs, "decode_participants", fixed ? std::to_string(fixed).c_str() : nullptr);
+        // one participant only: the sink computes on the callers' threads
+        sink_ptr sink = inputs.create(2, depth, fixture::resolve, &f, error, sizeof(error));
+        require(bool(sink), std::string("threadpool create: ") + error);
+        std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)> prefill(
+            kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+        require(bool(prefill), std::string("threadpool prefill create: ") + error);
+        for (int n : counts) {
+            if (fixed > n) { continue; }
+            ggml_threadpool_params params = ggml_threadpool_params_default(n);
+            std::unique_ptr<ggml_threadpool, decltype(&ggml_threadpool_free)> pool(ggml_threadpool_new(&params),
+                ggml_threadpool_free);
+            require(bool(pool), "ggml threadpool");
+            auto compute = [&](ggml_cgraph * graph) {
+                ggml_cplan plan = ggml_graph_plan(graph, n, pool.get());
+                std::vector<uint8_t> work(plan.work_size);
+                plan.work_data = work.data();
+                require(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS, "threadpool graph compute");
+            };
+            const size_t bytes = 64 * ggml_tensor_overhead() + ggml_graph_overhead() + (size_t(4) << 20);
+            for (int repeat = 0; repeat < 3; ++repeat) {
+                ggml_context * ctx = ggml_init({ bytes, nullptr, false });
+                require(ctx, "threadpool graph context");
+                auto vector = [&](ggml_type type, int64_t n0, int64_t n1, const void * data) {
+                    ggml_tensor * t = ggml_new_tensor_2d(ctx, type, n0, n1);
+                    std::memcpy(t->data, data, ggml_nbytes(t));
+                    return t;
+                };
+                graph_layer layers[4];
+                ggml_tensor * i1 = vector(GGML_TYPE_I32, 8, 1, ids1.data()), * i2 = vector(GGML_TYPE_I32, 8, 1, ids2.data());
+                ggml_tensor * v1 = vector(GGML_TYPE_F32, 8, 1, w1.data()), * v2 = vector(GGML_TYPE_F32, 8, 1, w2.data());
+                auto node = [&](graph_layer & layer, const tensors & m, ggml_tensor * in, ggml_tensor * id, ggml_tensor * w) {
+                    layer.sink = sink.get(); layer.meta = &m;
+                    ggml_tensor * args[] = { in, id, w };
+                    return ggml_custom_4d(ctx, GGML_TYPE_F32, f.latent, in->ne[1], 1, 1, args, 3, graph_layer_compute,
+                        GGML_N_TASKS_MAX, &layer);
+                };
+                ggml_cgraph * graph = ggml_new_graph(ctx);
+                ggml_tensor * y = node(layers[0], meta1, vector(GGML_TYPE_F32, f.latent, 1, x.data()), i1, v1);
+                y = ggml_scale(ctx, y, .5f);
+                // a run that fails between successful ones (its own output): no participant waits for it, and the
+                // next call still runs
+                const bool failing = repeat == 1;
+                if (failing) {
+                    layers[3].fail = true;
+                    ggml_build_forward_expand(graph, node(layers[3], meta2, y, i2, v2));
+                }
+                y = node(layers[1], meta2, y, i2, v2);
+                y = node(layers[2], meta1, y, i1, v1);
+                ggml_build_forward_expand(graph, y);
+                compute(graph);
+                for (int l = 0; l < 3; ++l) {
+                    require(layers[l].ok, "threadpool decode layer: " + layers[l].error);
+                    require(layers[l].nth == n, "threadpool decode call participants " + std::to_string(layers[l].nth));
+                }
+                require(!failing || (!layers[3].ok && !layers[3].error.empty()), "threadpool accepted an invalid run");
+                require(!std::memcmp(y->data, expected.data(), expected.size() * sizeof(float)),
+                    "threadpool decode differs from the reference graph threads=" + std::to_string(n));
+                ggml_free(ctx);
+                ctx = ggml_init({ bytes, nullptr, false });
+                require(ctx, "threadpool prefill context");
+                graph_layer grouped;
+                grouped.prefill = prefill.get();
+                ggml_tensor * p = node(grouped, meta2, vector(GGML_TYPE_F32, f.latent, ntokens, xs.data()),
+                    vector(GGML_TYPE_I32, nslots, ntokens, prefill_ids.data()),
+                    vector(GGML_TYPE_F32, nslots, ntokens, prefill_weights.data()));
+                graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, p);
+                compute(graph);
+                require(grouped.ok, "threadpool prefill: " + grouped.error);
+                require(grouped.nth == n, "threadpool prefill call participants " + std::to_string(grouped.nth));
+                require(!std::memcmp(p->data, prefill_expected.data(), prefill_expected.size() * sizeof(float)),
+                    "threadpool prefill differs from the reference graph threads=" + std::to_string(n));
+                ggml_free(ctx);
+            }
+            std::printf("case=threadpool threads=%d decode_participants=%d bit_exact=1 status=PASS\n", n, fixed);
+        }
+    }
+    std::printf("CPU_SINK_THREADPOOL_OK counts=%zu\n", counts.size());
+}
+
+// build_moe_ffn's CPU graph for SiLU-gated experts over ntokens: MUL_MAT_ID gate and up, ggml_swiglu_split,
+// MUL_MAT_ID down, MUL by the routing weights and ADD of per-slot views in slot order. Its expert tensors hold the
+// routed experts only, renumbered: no value the graph computes for one expert depends on another. A -1 route is
+// MUL_MAT_ID's zero row. It shares no code with the sink.
+static std::vector<float> reference_swiglu_graph(const fixture & f, int layer, const std::vector<float> & input,
+        const std::vector<int32_t> & ids, const std::vector<float> & weights, int ntokens, int threads) {
+    const int nslots = int(ids.size()) / ntokens;
+    require(nslots > 0 && ids.size() == size_t(nslots) * ntokens && weights.size() == ids.size() &&
+            input.size() == size_t(ntokens) * f.latent, "SwiGLU reference shape");
+    std::map<int32_t, int32_t> compact;
+    std::vector<int32_t> routed, selected(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] < 0) { selected[i] = -1; continue; }
+        const auto found = compact.emplace(ids[i], int32_t(routed.size()));
+        if (found.second) { routed.push_back(ids[i]); }
+        selected[i] = found.first->second;
+    }
+    require(!routed.empty(), "SwiGLU reference requires a live route");
+    const size_t max_nodes = 32 + 2 * size_t(nslots);
+    ggml_context * ctx = ggml_init({ ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false), nullptr, true });
+    require(ctx, "SwiGLU reference context failed");
+    ggml_backend_t backend = ggml_backend_cpu_init(); require(backend, "SwiGLU reference CPU backend failed");
+    ggml_backend_cpu_set_n_threads(backend, threads);
+    ggml_tensor * experts[3];
+    for (int role = 0; role < 3; ++role) {
+        experts[role] = ggml_new_tensor_3d(ctx, role == 2 ? f.down_type : f.type, role == 2 ? f.hidden : f.latent,
+                                          role == 2 ? f.latent : f.hidden, int64_t(routed.size()));
+    }
+    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, f.latent, 1, ntokens);
+    ggml_tensor * selection = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, nslots, ntokens);
+    ggml_tensor * routing = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, nslots, ntokens);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx, experts[1], x, selection);
+    ggml_tensor * up = ggml_mul_mat_id(ctx, experts[0], x, selection);
+    ggml_tensor * down = ggml_mul_mat_id(ctx, experts[2], ggml_swiglu_split(ctx, gate, up), selection);
+    ggml_tensor * weighted = ggml_mul(ctx, down, routing);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx, max_nodes, false);
+    ggml_build_forward_expand(graph, weighted);
+    ggml_tensor * result = nullptr;
+    for (int slot = 0; slot < nslots; ++slot) {
+        ggml_tensor * view = ggml_view_2d(ctx, weighted, f.latent, ntokens, weighted->nb[2], size_t(slot) * weighted->nb[1]);
+        ggml_build_forward_expand(graph, view);
+        result = result ? ggml_add(ctx, result, view) : view;
+    }
+    if (nslots == 1) { result = ggml_cont(ctx, result); }
+    ggml_build_forward_expand(graph, result);
+    ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend); require(buffer, "SwiGLU reference allocation failed");
+    for (int role = 0; role < 3; ++role) {
+        for (size_t e = 0; e < routed.size(); ++e) {
+            const auto & item = f.entries.at({ tensor_name(layer, role), routed[e] });
+            require(item.raw_bytes == experts[role]->nb[2], "SwiGLU reference expert stride mismatch");
+            ggml_backend_tensor_set(experts[role], item.data.data(), e * experts[role]->nb[2], item.raw_bytes);
+        }
+    }
+    ggml_backend_tensor_set(x, input.data(), 0, input.size() * sizeof(float));
+    ggml_backend_tensor_set(selection, selected.data(), 0, selected.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(routing, weights.data(), 0, weights.size() * sizeof(float));
+    require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "SwiGLU reference CPU graph failed");
+    std::vector<float> output(size_t(ntokens) * f.latent);
+    ggml_backend_tensor_get(result, output.data(), 0, output.size() * sizeof(float));
+    ggml_backend_buffer_free(buffer); ggml_backend_free(backend); ggml_free(ctx);
+    return output;
+}
+
+static bool same_bits(const std::vector<float> & a, const std::vector<float> & b) {
+    return a.size() == b.size() && !std::memcmp(a.data(), b.data(), a.size() * sizeof(float));
+}
+
+// SiLU-gated experts as qwen4exp routes them (separate up/gate/down, softmax top-10, sum-normalized weights)
+// through sink nodes on a ggml threadpool of 1, 2, an odd count and all CPUs, against reference_swiglu_graph,
+// compared with memcmp: two chained decode layers with a dense op between, and grouped prefills. Shapes: the model's
+// (Q8_0, 2560 -> 640 -> 2560, 512 experts, of which the fixture holds 12), a narrow Q8_0 one for prefills of 2 to
+// 2048 tokens, and a BF16 one whose hidden width of 70 leaves a scalar tail at every fixed vector width.
+static void swiglu_tests(fixture_inputs & inputs, int depth) {
+    const kimi_cpu_sink_activation swiglu = { KIMI_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f };
+    const int cpus = int(test_resources::process_cpus().size());
+    std::vector<int> counts = { 1, 2, 3 };
+    if (cpus > 3) { counts.push_back(cpus); }
+    constexpr int nslots = 10;
+    struct shape {
+        const char * name;
+        ggml_type type;
+        int latent, hidden, experts;
+        std::vector<int32_t> stored;
+        std::vector<int> prefill_tokens;
+    };
+    const std::vector<shape> shapes = {
+        { "q8_0_model", GGML_TYPE_Q8_0, 2560, 640, 512, { 0, 7, 64, 129, 200, 255, 256, 333, 400, 450, 501, 511 }, { 2, 65 } },
+        { "q8_0_narrow", GGML_TYPE_Q8_0, 256, 96, 48, {}, { 2, 64, 65, 300, 2048 } },
+        { "bf16_tail", GGML_TYPE_BF16, 64, 70, 24, {}, { 2, 65, 300 } },
+    };
+    std::mt19937 rng(20261028);
+    std::normal_distribution<float> sample(0.0f, 0.3f);
+    size_t discriminating = 0; // batches whose outputs tell the graph's SwiGLU kernel from the scalar clamp kernel
+    // one token's route: nslots distinct experts of the fixture, softmax weights in descending order, normalized
+    auto route = [&](const fixture & f, std::vector<int32_t> & ids, std::vector<float> & weights) {
+        std::vector<int32_t> pool = f.stored;
+        if (pool.empty()) { pool.resize(size_t(f.experts)); std::iota(pool.begin(), pool.end(), 0); }
+        std::shuffle(pool.begin(), pool.end(), rng);
+        std::vector<float> w(nslots);
+        for (auto & v : w) { v = std::exp(4.0f * sample(rng)); }
+        std::sort(w.begin(), w.end(), std::greater<float>());
+        float sum = 0.0f;
+        for (float v : w) { sum += v; }
+        for (int slot = 0; slot < nslots; ++slot) { ids.push_back(pool[size_t(slot)]); weights.push_back(w[size_t(slot)] / sum); }
+    };
+    for (const auto & s : shapes) {
+        fixture f;
+        f.type = f.down_type = s.type; f.latent = s.latent; f.hidden = s.hidden; f.experts = s.experts; f.stored = s.stored;
+        make_synthetic(f, 20261028);
+        tensors meta1(f, 1), meta2(f, 2);
+        std::vector<float> x(f.latent);
+        for (auto & v : x) { v = s.type == GGML_TYPE_BF16 ? 5.0f * sample(rng) : sample(rng); }
+        std::vector<int32_t> ids1, ids2;
+        std::vector<float> w1, w2;
+        route(f, ids1, w1);
+        route(f, ids2, w2);
+        ids2[4] = -1; w2[4] = 0.0f; // a dropped route, as mass reduction leaves one
+        const auto layer1 = reference_swiglu_graph(f, 1, x, ids1, w1, 1, 1);
+        require(same_bits(layer1, reference_swiglu_graph(f, 1, x, ids1, w1, 1, 4)),
+            std::string(s.name) + ": SwiGLU reference output depends on its thread count");
+        auto decoded = layer1;
+        for (auto & v : decoded) { v *= .5f; }
+        decoded = reference_swiglu_graph(f, 2, decoded, ids2, w2, 1, 1);
+        struct batch { int ntokens; std::vector<float> x, weights, expected; std::vector<int32_t> ids; size_t experts; };
+        std::vector<batch> batches;
+        for (int ntokens : s.prefill_tokens) {
+            batch b; b.ntokens = ntokens;
+            b.x.resize(size_t(ntokens) * f.latent);
+            for (auto & v : b.x) { v = s.type == GGML_TYPE_BF16 ? 5.0f * sample(rng) : sample(rng); }
+            for (int t = 0; t < ntokens; ++t) { route(f, b.ids, b.weights); }
+            b.expected = reference_swiglu_graph(f, 2, b.x, b.ids, b.weights, ntokens, 1);
+            require(same_bits(b.expected, reference_swiglu_graph(f, 2, b.x, b.ids, b.weights, ntokens, 4)),
+                std::string(s.name) + ": SwiGLU prefill reference output depends on its thread count");
+            std::vector<int32_t> distinct(b.ids);
+            std::sort(distinct.begin(), distinct.end());
+            b.experts = size_t(std::unique(distinct.begin(), distinct.end()) - distinct.begin());
+            batches.push_back(std::move(b));
+        }
+
+        char error[512] = {};
+        // one participant: the sink computes on the threads of the graphs' calls, or alone
+        sink_ptr sink = inputs.create(2, depth, fixture::resolve, &f, error, sizeof(error));
+        require(bool(sink), std::string("SwiGLU sink create: ") + error);
+        std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)> prefill(
+            kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+        require(bool(prefill), std::string("SwiGLU prefill create: ") + error);
+
+        // the coordinator alone, with the run's I/O counters
+        {
+            std::vector<float> exact;
+            print_sample((std::string(s.name) + "_swiglu_decode").c_str(), run_checked(inputs, s.name, f, sink.get(), meta1,
+                x, ids1, w1, layer1, 1, 25.0f, 0, -1, &exact, &swiglu));
+            require(same_bits(exact, layer1), std::string(s.name) + ": SwiGLU decode differs from the graph");
+            const auto & b = batches.back();
+            std::vector<float> routed(b.expected.size());
+            kimi_cpu_prefill_stats stats = {};
+            require(kimi_cpu_prefill_run_activation(prefill.get(), meta2.role[0], meta2.role[1], meta2.role[2],
+                b.x.data(), b.ids.data(), b.weights.data(), nslots, b.ntokens, &swiglu, routed.data(), &stats,
+                error, sizeof(error)), std::string(s.name) + " SwiGLU prefill: " + error);
+            require(same_bits(routed, b.expected), std::string(s.name) + ": SwiGLU prefill differs from the graph");
+            // The scalar clamp kernel at an infinite limit is SwiGLU in value only. Over a few hundred tokens
+            // some hidden value it rounds otherwise survives the down input's quantization: such a batch tells
+            // the graph's vector kernel from the scalar one. Which batch does depends on the vector width.
+            const kimi_cpu_sink_activation clamp = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f,
+                std::numeric_limits<float>::infinity(), nullptr, 0.0f };
+            std::vector<float> scalar(b.expected.size());
+            require(kimi_cpu_prefill_run_activation(prefill.get(), meta2.role[0], meta2.role[1], meta2.role[2],
+                b.x.data(), b.ids.data(), b.weights.data(), nslots, b.ntokens, &clamp, scalar.data(), nullptr,
+                error, sizeof(error)), std::string(s.name) + " scalar clamp prefill: " + error);
+            size_t differing = 0;
+            for (size_t i = 0; i < scalar.size(); ++i) { differing += std::memcmp(&scalar[i], &b.expected[i], sizeof(float)) != 0; }
+            discriminating += differing != 0;
+            std::printf("case=%s_scalar_clamp_infinity tokens=%d differing=%zu of %zu\n", s.name, b.ntokens, differing,
+                scalar.size());
+            require(stats.routed_slots == b.ids.size() && stats.stream.experts == b.experts &&
+                stats.stream.read_requests == 3 * b.experts && !stats.stream.read_errors && !stats.stream.pending_reads,
+                std::string(s.name) + ": SwiGLU prefill counters");
+        }
+        if (s.experts == 512) {
+            // a batch whose route outputs exceed the workspace limit fails before any read
+            const int ntokens = int((512ull << 20) / (uint64_t(nslots) * f.latent * sizeof(float))) + 1;
+            std::vector<float> big(size_t(ntokens) * f.latent, .01f), out(big.size());
+            std::vector<int32_t> ids(size_t(ntokens) * nslots);
+            std::vector<float> weights(ids.size(), 1.0f / nslots);
+            for (size_t i = 0; i < ids.size(); ++i) { ids[i] = s.stored[i % nslots]; }
+            kimi_cpu_prefill_stats stats = {};
+            require(!kimi_cpu_prefill_run_activation(prefill.get(), meta2.role[0], meta2.role[1], meta2.role[2],
+                big.data(), ids.data(), weights.data(), nslots, ntokens, &swiglu, out.data(), &stats, error,
+                sizeof(error)) && std::strstr(error, "route workspace") && stats.stream.read_requests == 0,
+                std::string(s.name) + ": an oversized prefill batch was not refused before its reads");
+            std::printf("case=%s_prefill_workspace_limit tokens=%d status=PASS error=%s\n", s.name, ntokens, error);
+        }
+
+        for (int n : counts) {
+            ggml_threadpool_params params = ggml_threadpool_params_default(n);
+            std::unique_ptr<ggml_threadpool, decltype(&ggml_threadpool_free)> pool(ggml_threadpool_new(&params),
+                ggml_threadpool_free);
+            require(bool(pool), "ggml threadpool");
+            auto compute = [&](ggml_cgraph * graph) {
+                ggml_cplan plan = ggml_graph_plan(graph, n, pool.get());
+                std::vector<uint8_t> work(plan.work_size);
+                plan.work_data = work.data();
+                require(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS, "threadpool graph compute");
+            };
+            auto context = [&](size_t floats) {
+                ggml_context * ctx = ggml_init({ 64 * ggml_tensor_overhead() + ggml_graph_overhead() +
+                    4 * floats * sizeof(float) + (size_t(1) << 20), nullptr, false });
+                require(ctx, "threadpool graph context");
+                return ctx;
+            };
+            auto tensor = [](ggml_context * ctx, ggml_type type, int64_t n0, int64_t n1, const void * data) {
+                ggml_tensor * t = ggml_new_tensor_2d(ctx, type, n0, n1);
+                std::memcpy(t->data, data, ggml_nbytes(t));
+                return t;
+            };
+            auto node = [&](ggml_context * ctx, graph_layer & layer, const tensors & m, ggml_tensor * in, ggml_tensor * id,
+                    ggml_tensor * w) {
+                layer.sink = sink.get(); layer.meta = &m; layer.activation = &swiglu;
+                ggml_tensor * args[] = { in, id, w };
+                return ggml_custom_4d(ctx, GGML_TYPE_F32, f.latent, in->ne[1], 1, 1, args, 3, graph_layer_compute,
+                    GGML_N_TASKS_MAX, &layer);
+            };
+            {
+                ggml_context * ctx = context(size_t(4) * f.latent);
+                graph_layer layers[2];
+                ggml_tensor * y = node(ctx, layers[0], meta1, tensor(ctx, GGML_TYPE_F32, f.latent, 1, x.data()),
+                    tensor(ctx, GGML_TYPE_I32, nslots, 1, ids1.data()), tensor(ctx, GGML_TYPE_F32, nslots, 1, w1.data()));
+                y = ggml_scale(ctx, y, .5f);
+                y = node(ctx, layers[1], meta2, y, tensor(ctx, GGML_TYPE_I32, nslots, 1, ids2.data()),
+                    tensor(ctx, GGML_TYPE_F32, nslots, 1, w2.data()));
+                ggml_cgraph * graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, y);
+                compute(graph);
+                for (const auto & layer : layers) {
+                    require(layer.ok, std::string(s.name) + " threadpool SwiGLU decode: " + layer.error);
+                    require(layer.nth == n, "threadpool SwiGLU decode call participants " + std::to_string(layer.nth));
+                }
+                require(!std::memcmp(y->data, decoded.data(), decoded.size() * sizeof(float)),
+                    std::string(s.name) + ": threadpool SwiGLU decode differs from the graph threads=" + std::to_string(n));
+                ggml_free(ctx);
+            }
+            for (const auto & b : batches) {
+                ggml_context * ctx = context(b.x.size() + b.ids.size() + b.weights.size());
+                graph_layer grouped;
+                grouped.prefill = prefill.get();
+                ggml_tensor * p = node(ctx, grouped, meta2, tensor(ctx, GGML_TYPE_F32, f.latent, b.ntokens, b.x.data()),
+                    tensor(ctx, GGML_TYPE_I32, nslots, b.ntokens, b.ids.data()),
+                    tensor(ctx, GGML_TYPE_F32, nslots, b.ntokens, b.weights.data()));
+                ggml_cgraph * graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, p);
+                compute(graph);
+                require(grouped.ok, std::string(s.name) + " threadpool SwiGLU prefill: " + grouped.error);
+                require(grouped.nth == n, "threadpool SwiGLU prefill call participants " + std::to_string(grouped.nth));
+                require(!std::memcmp(p->data, b.expected.data(), b.expected.size() * sizeof(float)),
+                    std::string(s.name) + ": threadpool SwiGLU prefill differs from the graph tokens=" +
+                    std::to_string(b.ntokens) + " threads=" + std::to_string(n));
+                ggml_free(ctx);
+            }
+            std::printf("case=%s_swiglu_threadpool threads=%d prefill_batches=%zu bit_exact=1 status=PASS\n",
+                s.name, n, batches.size());
+        }
+    }
+    require(discriminating, "no batch tells the graph's SwiGLU kernel from the scalar clamp kernel at an infinite limit");
+    std::printf("CPU_SINK_SWIGLU_OK counts=%zu discriminating=%zu\n", counts.size(), discriminating);
+}
+
 int main(int argc, char ** argv) {
     fixture_inputs inputs;
-#if defined(__linux__)
     try {
         real_options options; bool ring_set = false, registered_lifecycle = false, cache_mode = false, cache_pressure = false;
         bool configured_runtime_mode = false;
@@ -3466,7 +4105,8 @@ int main(int argc, char ** argv) {
         bool poll_mode = false, poll_early_mode = false, cache_compute_mode = false, cache_location_mode = false;
         bool cache_policy_mode = false, cache_large_mode = false, cache_pressure_transition = false, cache_unbounded = false;
         bool activation_mode = false, q2_activation_mode = false, muse_q8_mode = false, muse_bf16_mode = false;
-        bool auto_ring_mode = false, prefetch_mode = false, cache_load_mode = false;
+        bool auto_ring_mode = false, prefetch_mode = false, cache_load_mode = false, work_reclaim_mode = false, threadpool_mode = false;
+        bool swiglu_mode = false;
         std::string pack, prefix;
         for (int i = 1; i < argc; ++i) {
             auto argument = [&]() { require(i + 1 < argc, "missing option argument"); return argv[++i]; };
@@ -3499,6 +4139,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--cache-hitrate-tests")) { hitrate_mode = true; }
             else if (!std::strcmp(argv[i], "--elastic-cache-tests")) { elastic_cache_mode = true; }
             else if (!std::strcmp(argv[i], "--cache-load-tests")) { cache_load_mode = true; }
+            else if (!std::strcmp(argv[i], "--work-reclaim-tests")) { work_reclaim_mode = true; }
             else if (!std::strcmp(argv[i], "--max-cache-tests")) { max_cache_mode = true; }
             else if (!std::strcmp(argv[i], "--cache-large-tests")) { cache_large_mode = true; }
             else if (!std::strcmp(argv[i], "--cache-pressure-transition")) { cache_pressure_transition = true; }
@@ -3508,23 +4149,39 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--muse-bf16-test")) { muse_bf16_mode = true; }
             else if (!std::strcmp(argv[i], "--activation-tests")) { activation_mode = true; }
             else if (!std::strcmp(argv[i], "--q2-activation-test")) { q2_activation_mode = true; }
+            else if (!std::strcmp(argv[i], "--threadpool-tests")) { threadpool_mode = true; }
+            else if (!std::strcmp(argv[i], "--swiglu-tests")) { swiglu_mode = true; }
             else { throw std::runtime_error("usage: test-kimi-cpu-sink [--registered-lifecycle|--cache-tests|--cache-pressure] [--threads N] [--fixture KEY=VALUE] [--real-pack FILE --fixture-prefix PREFIX --ring-experts N --repeats N --warmup N --policy fixture|top16|top8|mass085 --jsonl FILE --resident-dir TMPFS]"); }
         }
         require(options.threads >= 2 && options.threads <= 128 && options.ring_experts >= 1 && options.ring_experts <= 32, "invalid thread/ring count");
         require(options.repeats >= 1 && options.repeats <= 10000 && options.warmup >= 0 && options.warmup <= 10000, "invalid repeat/warmup count");
         if (!schedule_invalid_mode) {
             const int required = registered_lifecycle ? 4 : options.threads;
-            test_resources::cpu_threads(required - 1, 1);
-            test_resources::io_uring();
+            test_resources::cpu_participants(required - 1, 1);
+            test_resources::io_ring();
         }
-        if (cache_mode || hitrate_mode || elastic_cache_mode || cache_load_mode || max_cache_mode ||
+        if (cache_mode || hitrate_mode || elastic_cache_mode || cache_load_mode || work_reclaim_mode || max_cache_mode ||
                 cache_location_mode || cache_compute_mode || early_up_gate_mode ||
                 role_major_mode || nonblocking_down_mode || poll_mode || poll_early_mode || schedules_mode ||
                 prefetch_mode || cache_policy_mode || cache_large_mode || activation_mode || muse_q8_mode || muse_bf16_mode) {
-            test_resources::finite_cgroup();
+            test_resources::finite_envelope();
         }
+#if defined(__linux__)
         if (configured_runtime_mode) { configured_runtime_tests(inputs); return 0; }
         if (auto_ring_mode) { cache_auto_ring_test(inputs, options.threads, ring_set ? options.ring_experts : 8); return 0; }
+        if (cache_pressure_transition) { cache_pressure_transition_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (cache_unbounded) { cache_pressure_test(inputs, options.threads, ring_set ? options.ring_experts : 2, true); return 0; }
+        if (cache_pressure) {
+            require(!cache_mode && !registered_lifecycle && pack.empty() && prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(),
+                    "cache tests cannot be combined with other test modes or real-pack measurement");
+            cache_pressure_test(inputs, options.threads, ring_set ? options.ring_experts : 2);
+            std::printf("CPU_SINK_TEST_OK\n"); return 0;
+        }
+#else
+        if (configured_runtime_mode || auto_ring_mode || cache_pressure_transition || cache_unbounded || cache_pressure) {
+            throw test_resources::unavailable("this mode reads the Linux task inventory or cgroup v2 memory limits");
+        }
+#endif
         if (muse_q8_mode) { muse_expert_norm_test(inputs, options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_Q8_0); return 0; }
         if (muse_bf16_mode) {
             muse_expert_norm_test(inputs, options.threads, ring_set ? options.ring_experts : 2, GGML_TYPE_BF16);
@@ -3538,6 +4195,7 @@ int main(int argc, char ** argv) {
         if (hitrate_mode) { cache_hitrate_tests(inputs, options.threads, options.ring_experts); return 0; }
         if (elastic_cache_mode) { elastic_cache_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (cache_load_mode) { cache_load_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (work_reclaim_mode) { work_buffer_reclaim_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (max_cache_mode) { max_cache_tests(inputs, options.threads, options.ring_experts); return 0; }
         if (early_up_gate_mode) { schedule_tests(inputs, options.threads, options.ring_experts, false, true); return 0; }
         if (role_major_mode) { schedule_tests(inputs, options.threads, options.ring_experts, false, false, 0, true); return 0; }
@@ -3545,27 +4203,31 @@ int main(int argc, char ** argv) {
         if (poll_mode || poll_early_mode) { schedule_tests(inputs, options.threads, options.ring_experts, false, poll_early_mode, 100); return 0; }
         if (schedules_mode) { schedule_tests(inputs, options.threads, options.ring_experts, true); return 0; }
         if (schedule_invalid_mode) { schedule_invalid_tests(inputs); return 0; }
+        if (threadpool_mode) { threadpool_tests(inputs, ring_set ? options.ring_experts : 2); return 0; }
+        if (swiglu_mode) { swiglu_tests(inputs, ring_set ? options.ring_experts : 2); return 0; }
         if (trace_profile_mode) { trace_profile_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (prefetch_mode) { prefetch_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (cache_policy_mode) { cache_policy_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (cache_large_mode) { cache_large_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (cache_pressure_transition) { cache_pressure_transition_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
-        if (cache_unbounded) { cache_pressure_test(inputs, options.threads, ring_set ? options.ring_experts : 2, true); return 0; }
-        if (cache_mode || cache_pressure) {
-            require(!(cache_mode && cache_pressure) && !registered_lifecycle && pack.empty() && prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(),
+        if (cache_mode) {
+            require(!registered_lifecycle && pack.empty() && prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(),
                     "cache tests cannot be combined with other test modes or real-pack measurement");
-            if (cache_pressure) { cache_pressure_test(inputs, options.threads, ring_set ? options.ring_experts : 2); }
-            else { cache_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); }
+            cache_tests(inputs, options.threads, ring_set ? options.ring_experts : 2);
         } else if (registered_lifecycle) {
             require(pack.empty() && prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(), "registered lifecycle cannot be combined with real-pack measurement");
             registered_lifecycle_tests(inputs);
-        } else if (pack.empty()) { require(prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(), "measurement options require real pack"); host_ledger_tests(inputs); synthetic_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); }
+        } else if (pack.empty()) {
+            require(prefix.empty() && options.jsonl.empty() && options.resident_dir.empty(), "measurement options require real pack");
+#if defined(__linux__)
+            host_ledger_tests(inputs);
+#else
+            std::printf("case=host_ledger status=SKIP reason=linux_ledger_injection\n");
+#endif
+            tierless_budget_tests();
+            synthetic_tests(inputs, options.threads, ring_set ? options.ring_experts : 2);
+        }
         else { require(!prefix.empty(), "real pack requires fixture prefix"); real_test(inputs, pack, prefix, options); }
         std::printf("CPU_SINK_TEST_OK\n"); return 0;
     } catch (const unsupported_resident & e) { std::fprintf(stderr, "CPU_SINK_RESIDENT_UNSUPPORTED: %s\n", e.what()); return 77; }
       catch (const std::exception & e) { return test_resources::report("CPU_SINK_TEST", e); }
-#else
-    (void) argc; (void) argv;
-    std::printf("SKIP: CPU sink requires Linux io_uring/O_DIRECT\n"); return 77;
-#endif
 }

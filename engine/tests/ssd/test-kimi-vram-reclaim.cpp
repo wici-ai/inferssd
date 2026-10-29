@@ -11,7 +11,10 @@
 //    host-memory ledger's floor and the RAM cache's demand, published before the first prepare, bound the base and
 //    the growth and are ggml's reserve; growth at the second decode boundary waits for a deferred upload still
 //    copying instead of skipping; a demand rise at a token boundary gives blocks back while an upload into them is
-//    in flight, and collect reports that upload as aborted.
+//    in flight, and collect reports that upload as aborted;
+//  - with the host-memory ledger's envelope (a cgroup memory.max) tighter than the modeled DRAM: the ledger counts
+//    the tier's storage, which the cgroup does not charge, so auto grows to the envelope less the RAM cache's demand;
+//    a tier no phase armed gives a block back to an allocation that would fail.
 // Shared lifecycle assertions use the retained explicit Q4_K format engine.
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
@@ -49,6 +52,19 @@ void model_get(int, size_t * free_bytes, size_t * total) {
 bool model_unified(int) { return true; }
 void model_reserve(int, size_t bytes) { published = bytes; }
 size_t model_free() { size_t free_bytes = 0, total = 0; model_get(0, &free_bytes, &total); return free_bytes; }
+// The envelope the host-memory ledger reads: a cgroup memory.max, its usage, and a MemAvailable that never binds.
+struct envelope_files {
+    uint64_t limit = 0, current = uint64_t(1) << 30;
+    bool read(const std::string & path, std::string & text) const {
+        if (path == "/proc/self/cgroup") { text = "0::/fixture\n"; }
+        else if (path == "/sys/fs/cgroup/fixture/memory.max") { text = std::to_string(limit); }
+        else if (path == "/sys/fs/cgroup/fixture/memory.current") { text = std::to_string(current); }
+        else if (path == "/sys/fs/cgroup/fixture/memory.stat") { text = "active_file 0\ninactive_file 0\nfile 0\nworkingset_refault_file 0\n"; }
+        else if (path == "/proc/meminfo") { text = "MemAvailable: " + std::to_string((uint64_t(256) << 30) / 1024) + " kB\n"; }
+        else { return false; }
+        return true;
+    }
+};
 int assertions = 0;
 void require(bool ok, const char * what) { ++assertions; if (!ok) throw std::runtime_error(what); }
 const size_t role = lifecycle_role_bytes(), stride = 3 * role;
@@ -114,7 +130,7 @@ int main() {
         t.begin(52, 1, true);
         lifecycle_prepare(t,&g, 1,&slot);
         require(t.elastic_active && t.blocks.size() == 1 && t.table->admissions[0] >= 0, "reclaim fixture has no admission");
-        t.reclaimer_armed = true; // armed at every decode token on unified memory
+        t.reclaimer_armed = true; // a prefill arms it on a discrete GPU; unified memory reclaims in any phase
         size_t freed = 0;
         require(t.reclaim_one(4096, &freed) == 0 && !freed && !t.poisoned && t.blocks.size() == 1 && t.live_reclaim_refusals == 1,
                 "a reclaim inside a live layer was not refused cleanly");
@@ -264,6 +280,40 @@ int main() {
         lifecycle_prepare(t,&keys[16], 1,&slot);
         require(slot < 0, "an aborted upload served a hit");
         t.finish(out.data(), 256);
+        modeled = nullptr;
+    }
+    // The envelope binds before the modeled DRAM: the ledger counts the tier's storage in it, so auto grows to the
+    // envelope less the RAM cache's demand (30 slots) although MemAvailable has room for the slot cap (40); a tier no
+    // phase armed (a load-time reserve, a disarmed prefill) still gives a block back to an allocation that would fail.
+    {
+        envelope_files files;
+        const uint64_t reserve = uint64_t(512) << 20;
+        files.limit = files.current + reserve + demand + 30 * stride + safety + stride / 2;
+        auto owner = std::make_shared<ssd::host::process_arbiter>(
+            [&files](const std::string & path, std::string & text) { return files.read(path, text); });
+        auto made = owner->make_client();
+        require(bool(made), "the host-memory client was not created");
+        auto client = std::move(made.value);
+        ssd::host::client_config config; config.unified = true;
+        require(bool(client->configure(config)), "the host-memory client was not configured");
+        tier t(tier::automatic_budget, inputs.tier_policy(), client.get(), test_cpu_kernels());
+        modeled = &t; pool = floor + demand + safety + 60 * stride; published = 0;
+        policy_set_host_floor(&t, floor); policy_set_host_demand(&t, demand);
+        const auto k = key(5, 0);
+        int slot = -1;
+        t.begin(63, 1, true); lifecycle_prepare(t, &k, 1, &slot); t.finish(out.data(), 256);
+        require(t.slot_locations.size() == tier::elastic_block_slots && client->state().value.device_held == 16 * stride,
+                "the auto base did not publish its storage to the envelope");
+        t.begin(63, 2, true);
+        const auto room = client->measure(0);
+        require(t.grow_events == 1 && t.slot_locations.size() == 30 && client->state().value.device_held == 30 * stride &&
+                bool(room) && room.value.cgroup_surplus >= demand && model_free() > floor + demand + 20 * stride,
+                "auto did not grow to the envelope less the RAM cache's demand");
+        t.reclaimer_armed = false;
+        size_t freed = 0;
+        require(t.reclaim_one(4096, &freed) == 1 && freed == 14 * stride && t.slot_locations.size() == 16 &&
+                client->state().value.device_held == 16 * stride && !t.poisoned,
+                "an unarmed tier did not give a block back on unified memory");
         modeled = nullptr;
     }
     std::printf("REAL_CUDA_VRAM_RECLAIM_PASS assertions=%d unified=%d\n", assertions, int(unified));

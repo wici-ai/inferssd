@@ -13,6 +13,4 @@ int mock_direct();
 const void * mock_mapping();
 bool mock_half_ready();
 void mock_finish_load();
-void mock_shape(int64_t experts, size_t bytes);
-bool mock_common();
 }

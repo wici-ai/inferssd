@@ -30,10 +30,21 @@ on the device. Test/control-only changes still select functional and numerical g
 changes affecting runtime/placement/resources require base/candidate performance.
 Ordinary performance uses the fixed 512-token CI prompt
 (`bench/prompts/prompt-512.txt`) with decode 256. Only the explicit DeepSeek
-compressed long-context rule adds 4K. No automatic completion retry or
-best-of selection exists. Each cell records TTFT separately, native prefill and
-first/second 128-token and whole decode rates. The existing n=1 policy marks any
-observed slowdown inconclusive and blocks acceptance.
+compressed long-context rule adds 4K. Each cell runs the candidate three times
+and the base once (candidate, base, candidate, candidate) on fresh servers and
+records TTFT, native prefill and first/second 128-token and whole decode rates
+for every run. No automatic completion retry or best-of selection exists. The
+cell is `regressed`, `needs-review` or `passed` against the device's baseline
+history, as described in [performance acceptance](PERFORMANCE.md). The history
+is sealed only by operator preparation and covers only the 512 tier, so
+4096-tier cells and jobs generated with `stage_selection.py` have no history and
+report `needs-review`.
+
+A baseline job is the one case with an empty diff: the operator measures each
+new `main` commit on its own, built once, four runs per model, selecting every
+device and both models with the 512 tier. Its plan has
+`purpose: "baseline-history"`, and the trusted rules rebuild it only for an
+empty diff and identical base, head and candidate.
 
 ## Separate App publication mode
 
@@ -63,7 +74,8 @@ requested source PR/head when artifacts or admission are missing. It rechecks
 source, exact-head approval, complete changed paths and the latest hosted CI
 before publishing success. The stable check is `InferSSD device performance`.
 There are no required workflow path filters. Unselected cells are explicitly
-`not-required`; selected missing, failed, unclean or inconclusive cells are red.
+`not-required`; selected missing, failed, unclean, regressed or needs-review
+cells are red.
 
 GitHub's [dispatch REST contract](https://docs.github.com/en/rest/actions/workflows)
 supports `return_run_details`; [GITHUB_TOKEN dispatch exceptions](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
@@ -99,20 +111,31 @@ execution is used; see [GitHub's security guidance](https://docs.github.com/en/a
    uses the existing `staged_benchmark.benchmark` argv/environment/cwd/port,
    timeout_s/request_timeout_s and honest os_page_cache_treatment contract.
    Candidate targets and the read-only build's `image_relatives` must cover
-   every selected numerical executable. Both arms must use the same resource cap, placement,
-   model distribution, template and semantic typed settings. Native snapshots,
+   every selected numerical executable. Both arms must use the same resource cap,
+   model distribution and template. A model may instead carry a `launch` request
+   and no argv or port, as operator performance jobs must: each side then
+   resolves its launch on the device with its own `inferssd launch`, from the
+   machine characteristics a baseline job profiled (a PR job takes those of the
+   device's most recent baseline job), and its settings and thread pools may
+   differ from the other side's (see
+   [performance acceptance](PERFORMANCE.md#launches)). Native snapshots,
    real runtime image mappings and root-observed resources are checked.
    Before any selected 256-token request, every selected performance model/tier
    runs both sides' eight-token preflight with that performance arm's environment,
-   working directory and arguments. The operator pins a separate `preflight_argv`;
-   only the single private `--ssd-telemetry` file may differ from the timed argv,
+   working directory and arguments. The operator pins a separate `preflight_argv`
+   (a resolved launch gets one per tier); only the single private
+   `--ssd-telemetry` file may differ from the timed argv,
    and both destinations are distinct canonical files within that side's scratch
-   directory. A candidate functional smoke is reused only when its complete
+   directory. Timed run k of a side uses the timed file name with `-r<k>`
+   inserted before `.jsonl`, so every fresh server owns its own event file, and
+   each run has its own `<side>-<model>-r<k>-benchmark-<tier>` stage. A candidate functional smoke is reused only when its complete
    launch matches this preflight. Native typed snapshots, owned
    runtime images, resources and immutable inputs must compare equal for every
-   pair first. Missing declarations or exact root stage authorization refuse
-   before opening the lease. Timed arms retain their existing once-only checks
-   and must still match their successful short preflight; no request is retried.
+   pair first, apart from each side's derived launch. Missing declarations or
+   exact root stage authorization refuse before opening the lease; a derived
+   launch is checked completely once both sides have resolved it. Timed arms
+   retain their existing once-only checks and must still match their successful
+   short preflight; no request is retried.
 5. `python3 -I bench/ci/stage_selection.py --template template.json --manifest
    manifest.json --plan plan.json --policy bench/ci/policy.json --output fresh`
    produces three reviewable local files only. The generator derives the Linux

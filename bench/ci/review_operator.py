@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Poll exact-head `/ci test` PR reviews on the trusted preparation host."""
+"""Poll exact-head `/ci test` PR reviews and main's head on the trusted preparation host.
+
+Each new main head queues one baseline job: that commit profiles the machine
+and is measured four times per model on every enabled device. When it
+completes, its verified cells and the characteristics file it profiled join the
+baseline history next to the device profiles. PR and baseline jobs run one at a
+time in the order they were queued, so a PR queued after a merge finds its base
+measured; a PR whose base has no history gets needs-review cells. A PR job
+launches from the characteristics of each device's most recent baseline job,
+and cannot be prepared for a device that has none yet.
+"""
 
 import argparse
 from datetime import datetime
@@ -16,8 +26,10 @@ from types import SimpleNamespace
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci import history
 from ci import operator_prepare as prepare
-from ci.contract import digest, load, policy_read, revision
+from ci import selection_dispatch
+from ci.contract import MEASURED_AT, digest, load, policy_read, revision
 from ci.impact import device_requirements, fingerprint, plan
 from ci.private_controller import current_ci
 
@@ -168,7 +180,8 @@ def save_record(path, value, status, **fields):
     atomic(path, value)
 
 
-def fetch_objects(args, identity, repository):
+def fetch_objects(args, identity, repository, refs=None):
+    """Fetch missing source objects: a PR's refs and base, or the given exact refs."""
     try:
         for name in ("base", "head", "candidate"):
             prepare.git(args.source, "cat-file", "-e", identity[name] + "^{commit}")
@@ -197,9 +210,8 @@ def fetch_objects(args, identity, repository):
         "--no-write-fetch-head",
         "--no-recurse-submodules",
         args.fetch_remote,
-        "refs/pull/" + str(identity["pr"]) + "/head",
-        "refs/pull/" + str(identity["pr"]) + "/merge",
-        identity["base"],
+        *(refs or ("refs/pull/" + str(identity["pr"]) + "/head", "refs/pull/" + str(identity["pr"]) + "/merge",
+                   identity["base"])),
     )
 
 
@@ -313,6 +325,7 @@ def monitor(args, api, policy, path, record):
             "completed",
             conclusion=run.get("conclusion"),
             html_url=run.get("html_url"),
+            completed_at=run.get("updated_at"),
             cleanup_source="Actions selected report/artifacts; not inferred here",
         )
         return
@@ -320,21 +333,22 @@ def monitor(args, api, policy, path, record):
         record.get("cancellation_reason") if record["status"] == "cancelling" else None
     )
     try:
-        prepare.access(api, policy)
-        fresh = authorization(
-            api,
-            policy,
-            record["pr"],
-            record["review_id"],
-            record["head"],
-            max_age=args.max_authorization_age_s,
-        )
-        same_authorization(record, fresh)
-        if (
-            digest(args.inputs) != record["inputs_sha256"]
-            or digest(args.policy) != record["policy_sha256"]
-        ):
-            raise Stale("trusted profile/policy changed during preparation")
+        if record.get("kind") != "baseline":  # a baseline job has no review to re-check
+            prepare.access(api, policy)
+            fresh = authorization(
+                api,
+                policy,
+                record["pr"],
+                record["review_id"],
+                record["head"],
+                max_age=args.max_authorization_age_s,
+            )
+            same_authorization(record, fresh)
+            if (
+                digest(args.inputs) != record["inputs_sha256"]
+                or digest(args.policy) != record["policy_sha256"]
+            ):
+                raise Stale("trusted profile/policy changed during preparation")
         if time.time() - record["dispatched_at"] > args.run_timeout_s:
             raise Stale("recorded parent exceeded its finite deadline")
     except (ValueError, RuntimeError) as error:
@@ -455,6 +469,93 @@ def advance(args, api, policy, path, record):
     return attempted or record["status"] != "queued"
 
 
+def baseline_key(repository, commit):
+    return hashlib.sha256(f"baseline#{repository}#{commit}".encode()).hexdigest()
+
+
+def advance_baseline(args, api, policy, path, record):
+    """Prepare, stage and dispatch the baseline job of one main commit; never retried."""
+    commit = record["commit"]
+    try:
+        profiles = load(args.inputs)
+        declared = profiles.get("devices", {})
+        exception = profiles.get("temporary_mac_acceptance")
+        enabled = prepare.LINUX_DEVICES if exception is not None else prepare.DEVICES
+        # Only devices staged unattended; a device needing a sudo password is left out.
+        execution = [device for device in enabled if device in declared
+                     and declared[device]["ssh"].get("sudo_password_required") is False]
+        if not execution:
+            raise ValueError("no enabled device can be staged unattended")
+        impact = plan([], policy, baseline=True, base=commit, head=commit, candidate=commit)
+        prepared = path.parent / path.stem / "prepared"
+        if record["status"] == "queued":
+            prepared.parent.mkdir(mode=0o700, exist_ok=True)
+            save_record(path, record, "preparing", prepared=str(prepared))
+            fetch_objects(args, dict(base=commit, head=commit, candidate=commit), policy["repository"], (commit,))
+            prepare.prepare(SimpleNamespace(source=args.source, inputs=args.inputs, output=prepared,
+                                            policy=args.policy, execution_devices=execution, gh=args.gh,
+                                            baseline=True, base=commit, head=commit, candidate=commit), api=api)
+            save_record(path, record, "prepared")
+        prepared_scope(prepared, execution, impact)
+        if record["status"] == "prepared":
+            save_record(path, record, "staging")
+            prepare.stage(SimpleNamespace(prepared=prepared, gh=args.gh), password=None)
+            save_record(path, record, "staged")
+        prepared_scope(prepared, execution, impact)
+        save_record(path, record, "dispatching")
+        run = prepare.dispatch(SimpleNamespace(prepared=prepared, gh=args.gh), api=api)
+        save_record(path, record, "running", run=run, dispatched_at=time.time())
+    except Exception as error:
+        save_record(path, record, "interrupted", error=type(error).__name__ + ": " + str(error),
+                    no_automatic_retry=True)
+    return True
+
+
+def fetch_aggregate(api, policy, run_id, output):
+    """The hosted report of one parent run, from its exact artifact."""
+    listing = api.call("repos/" + policy["controller_repository"] + "/actions/runs/" + str(run_id)
+                       + "/artifacts?per_page=100")
+    name = "selected-aggregate-" + str(run_id) + "-1"
+    matches = [item for item in listing.get("artifacts", []) if item.get("name") == name and item.get("expired") is False]
+    if len(matches) != 1:
+        raise ValueError("hosted report artifact missing or duplicated")
+    raw = api.raw("repos/" + policy["controller_repository"] + "/actions/artifacts/" + str(matches[0]["id"]) + "/zip")
+    expected = matches[0].get("digest")
+    if expected is not None and expected != "sha256:" + hashlib.sha256(raw).hexdigest():
+        raise ValueError("hosted report artifact digest differs")
+    selection_dispatch.unpack(raw, output)
+    return load(Path(output) / "aggregate.json")
+
+
+def ingest_baseline(args, api, policy, path, record):
+    """Add the verified cells of a completed baseline job to the history; no retry."""
+    try:
+        prepared = Path(record["prepared"])
+        envelope = load(prepared / "envelope.json")
+        report = fetch_aggregate(api, policy, record["run"]["id"], prepared.parent / ("aggregate-" + uuid.uuid4().hex))
+        if report.get("envelope_sha256") != fingerprint(envelope):
+            raise ValueError("hosted report belongs to another prepared job")
+        finished = record.get("completed_at")
+        measured_at = (finished if isinstance(finished, str) and MEASURED_AT.fullmatch(finished)
+                       else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        stored, skipped = [], []
+        root = history.store_root(args.inputs)
+        for device in envelope["execution_devices"]:
+            records, missed, characteristics = history.records_from_report(
+                report, device=device, job_id=envelope["jobs"][device]["job_id"], commit=record["commit"],
+                run_id=record["run"]["id"], run_attempt=1, measured_at=measured_at)
+            # The characteristics file first: every record names it, and later PR jobs seal it.
+            if characteristics is not None:
+                history.write_characteristics(root, device, characteristics)
+            stored += [dict(device=device, model=item["model"], tier=item["tier"],
+                            result=history.write(root, item)) for item in records]
+            skipped += missed
+        save_record(path, record, "ingested", stored=stored, skipped=skipped)
+    except Exception as error:
+        save_record(path, record, "ingest-failed", error=type(error).__name__ + ": " + str(error),
+                    no_automatic_retry=True)
+
+
 def tick(args, api=None):
     policy = policy_read(load(args.policy))
     api = api or prepare.Gh(args.gh)
@@ -490,6 +591,8 @@ def tick(args, api=None):
         if record["status"] in ("running", "cancelling"):
             monitor(args, api, policy, path, record)
             active |= record["status"] in ("running", "cancelling")
+        if record.get("kind") == "baseline" and record["status"] == "completed":
+            ingest_baseline(args, api, policy, path, record)
     prepare.access(api, policy)
     pending = []
     for pr in pages(api, f"repos/{policy['repository']}/pulls?state=open"):
@@ -530,13 +633,22 @@ def tick(args, api=None):
         )
         save_record(path, record, "queued")
         records.append((path, record))
+    head = revision(api.call("repos/" + policy["repository"] + "/branches/main")["commit"]["sha"])
+    path = args.state / (baseline_key(policy["repository"], head) + ".json")
+    if not path.exists():
+        record = dict(schema_version=1, kind="baseline", repository=policy["repository"], commit=head,
+                      created_at=time.time())
+        save_record(path, record, "queued")
+        records.append((path, record))
     if not active:
-        for path, record in records:
+        # One queue: PR and baseline jobs start in the order they were queued.
+        for path, record in sorted(records, key=lambda item: (item[1].get("created_at", 0), item[0].name)):
             if record["status"] in ("queued", "prepared", "staged"):
-                if advance(args, api, policy, path, record) is not False:
+                step = advance_baseline if record.get("kind") == "baseline" else advance
+                if step(args, api, policy, path, record) is not False:
                     break
     return dict(
-        active_parent=active, pending_source_reviews=pending, records=len(records)
+        active_parent=active, pending_source_reviews=pending, records=len(records), main_head=head
     )
 
 

@@ -223,10 +223,12 @@ def prepared_fixture(tmp_path, source, *, devices=None, mode=prepare.LEGACY_MODE
                     data["settings"].update(host_path="/opt/inferssd-ci-integrations/" + old_job + "-" + model + "-" + side_name + "-settings.ssd",
                         runtime_path="/models/settings-" + model + "-" + side_name + ".ssd", sha256=prepare.digest(tmp_path / name))
                     assets["settings-" + model + "-" + side_name + ".ssd"] = name
-                    data["smoke"].update(revision=identity[side_name], argv=["/build/" + side_name + "/bin/llama-server", "--ssd-settings", data["settings"]["runtime_path"]],
-                        environment={}, cwd="/scratch", port=18080, timeout_s=120, request_timeout_s=60,
-                        os_page_cache_treatment=config["host"]["os_page_cache_treatment"])
-                    data["benchmarks"] = {"512": dict(copy.deepcopy(data["smoke"]), preflight_argv=copy.deepcopy(data["smoke"]["argv"]))}
+                    # The device resolves argv and port with each side's own framework.
+                    data["launch"] = dict(profile="dsv" if model == "deepseek" else "muse", context=8192,
+                                          batch=512, ubatch=512, port=18080, extra=[])
+                    data["smoke"].update(revision=identity[side_name], environment={}, cwd="/scratch/" + side_name,
+                        timeout_s=120, request_timeout_s=60, os_page_cache_treatment=config["host"]["os_page_cache_treatment"])
+                    data["benchmarks"] = {"512": copy.deepcopy(data["smoke"])}
         mounts = {m: "/admitted/" + m for m in ("deepseek", "muse")}
         mounts.update({"settings-" + m + "-candidate.ssd": config["sides"]["candidate"]["models"][m]["settings"]["host_path"]
                        for m in ("deepseek", "muse")})
@@ -238,6 +240,9 @@ def prepared_fixture(tmp_path, source, *, devices=None, mode=prepare.LEGACY_MODE
             ssh=dict(argv=["ssh", "-T", "-a", "operator@example.invalid"], sudo_password_required=False,
                      root_argv=["/usr/bin/python3", "-I", "/opt/inferssd-ci-control/current/bench/ci/operator_stage.py"]))
     (tmp_path / "inputs.json").write_text(json.dumps(dict(schema_version=1, controller_workflow_sha="d" * 40, devices=profiles)))
+    if mode == prepare.MODE:
+        # PR jobs launch from the characteristics of each device's most recent baseline job.
+        history_store(tmp_path, [earlier_baseline(device) for device in prepare.DEVICES])
     args = SimpleNamespace(source=root, inputs=tmp_path / "inputs.json", output=tmp_path / "prepared",
         policy=Path(__file__).parents[1] / "ci/policy.json", gh="never-used", execution_devices=list(devices or prepare.LINUX_DEVICES), validation_mode=mode, **identity)
     return args, API(root)
@@ -490,13 +495,239 @@ def test_default_mode_is_performance_and_two_sources_are_exact(tmp_path, source)
         for side in ("base", "candidate"):
             assert request["sources"][side]["revision"] == getattr(args, side)
             assert manifest["sources"][side].endswith("/" + side)
-            assert side + "-muse-benchmark-512" in manifest["stages"]
             assert all(set(data["benchmarks"]) == {"512"} for data in config["sides"][side]["models"].values())
+        # One base run and three PR runs per model, each with its own stage.
+        assert {name for name in manifest["stages"] if name.startswith(("base-muse-r", "candidate-muse-r"))} == {
+            "base-muse-r1-benchmark-512", *("candidate-muse-r" + run + "-benchmark-512" for run in "123")}
         assert config["performance_protocol"] == prepare.performance_protocol()
         assert {"base-source-map.json", "base-source.tar.gz", "source-map.json", "candidate-source.tar.gz"} <= set(request["files"])
     assert load(args.output / "base-source-map.json")["revision"] == args.base
     assert load(args.output / "source-map.json")["revision"] == args.candidate
     prepare.verified(args.output)
+
+
+def test_baseline_job_builds_one_commit_once_on_every_device_and_model_with_an_empty_diff(tmp_path, source):
+    from ci import operator_stage
+    root, identity = source
+    head = identity["head"]
+    args, api = prepared_fixture(tmp_path, (root, dict(base=head, head=head, candidate=head)), mode=prepare.MODE)
+    args.baseline = True
+    envelope = prepare.prepare(args, api)
+    plan = envelope["selection"]
+    assert plan["purpose"] == "baseline-history" and plan["changed_paths"] == []
+    assert {plan[key] for key in ("base", "head", "candidate")} == {head}
+    assert all(cell["required"] and cell["performance"]["tiers"] == ["512"] for cell in plan["cells"])
+    assert envelope["execution_devices"] == list(prepare.LINUX_DEVICES)
+    for device in prepare.LINUX_DEVICES:
+        config = load(args.output / device / "config.json")
+        manifest = load(args.output / device / "manifest.json")
+        request = load(args.output / device / "root-input.json")
+        assert config["performance_protocol"] == prepare.performance_protocol("baseline")
+        assert manifest["source_revisions"] == {"candidate": head} and set(manifest["builds"]) == {"candidate"}
+        assert {side: value["revision"] for side, value in request["sources"].items()} == {"candidate": head}
+        assert {name for name in manifest["stages"] if "-benchmark-" in name} == {
+            "candidate-" + model + "-r" + str(index) + "-benchmark-512"
+            for model in ("deepseek", "muse") for index in range(1, 5)}
+        assert not any(name.startswith("base-") for name in manifest["stages"])
+        # A baseline job profiles the machine itself, with the commit it measures.
+        assert manifest["stages"]["machine-profile"]["side"] == "candidate"
+        assert "machine_characteristics" not in config and "machine.json" not in manifest["models"]
+        # The installed root policy pins the gate protocol and admits the baseline form of one commit.
+        assert load(args.output / device / "policy.review.json")["performance_protocol"] == prepare.performance_protocol()
+        assert operator_stage.protocol_admitted(config)
+    assert not (args.output / "base-source-map.json").exists()
+    assert load(args.output / "source-map.json")["revision"] == head
+    assert envelope["machine_characteristics_sha256"] == {}
+    prepare.verified(args.output)
+
+
+def history_store(tmp_path, records):
+    """Baseline records next to inputs.json, each after the characteristics file it names."""
+    from ci import history
+    from test_ci_performance_series import MACHINE
+    root = tmp_path / history.DIRECTORY
+    for record in records:
+        history.write_characteristics(root, record["device"], MACHINE)
+        history.write(root, record)
+    return root
+
+
+def earlier_baseline(device):
+    """One record of an earlier main commit's baseline job on the device."""
+    from test_ci_performance_series import record
+    return record("0" * 40, device=device, model="deepseek", measured_at="2026-10-01T10:00:00Z", job="0" * 32)
+
+
+def test_device_history_is_sealed_into_every_config_and_named_by_the_envelope(tmp_path, source):
+    from test_ci_performance_series import record
+    root, identity = source
+    stored = [record(identity["base"], device="cloud-5090"),
+              record("e" * 40, device="cloud-5090", model="deepseek", measured_at="2026-10-27T10:00:00Z", job="d" * 32),
+              record(identity["base"], device="local-mbp")]
+    history_store(tmp_path, stored)
+    args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"], mode=prepare.MODE)
+    envelope = prepare.prepare(args, api)
+    sealed = load(args.output / "cloud-5090/config.json")["baseline_history"]
+    # Only the executing devices' records, in the store's verified order.
+    assert sorted((item["model"], item["commit"]) for item in sealed) == [
+        ("deepseek", "0" * 40), ("deepseek", "e" * 40), ("muse", identity["base"])]
+    assert envelope["baseline_history_sha256"] == prepare.fingerprint(sealed)
+    # The root stager and its installed policy never see or pin the history.
+    assert "baseline_history" not in json.dumps(load(args.output / "cloud-5090/policy.review.json"))
+    (tmp_path / "empty").mkdir()
+    empty, api = prepared_fixture(tmp_path / "empty", source, devices=["dgx-spark"], mode=prepare.MODE)
+    sealed = [earlier_baseline("dgx-spark")]
+    assert prepare.prepare(empty, api)["baseline_history_sha256"] == prepare.fingerprint(sealed)
+
+
+def test_a_pr_job_seals_the_characteristics_of_each_devices_most_recent_baseline_job(tmp_path, source):
+    from ci import history, selection_contract
+    from test_ci_performance_series import MACHINE, record
+    root, identity = source
+    newer = MACHINE.replace("synthetic", "reprofiled")
+    store = history_store(tmp_path, [])
+    history.write_characteristics(store, "cloud-5090", newer)
+    history.write(store, record(identity["base"], device="cloud-5090", job="e" * 32,
+                                characteristics=prepare.hashlib.sha256(newer.encode()).hexdigest()))
+    args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
+    envelope = prepare.prepare(args, api)
+    for device in prepare.LINUX_DEVICES:
+        config = load(args.output / device / "config.json")
+        manifest = load(args.output / device / "manifest.json")
+        job = envelope["jobs"][device]["job_id"]
+        text, source_job, commit = ((newer, "e" * 32, identity["base"]) if device == "cloud-5090"
+                                    else (MACHINE, "0" * 32, "0" * 40))
+        sha = prepare.hashlib.sha256(text.encode()).hexdigest()
+        assert config["machine_characteristics"] == dict(
+            sha256=sha, text=text, job_id=source_job, commit=commit,
+            host_path="/opt/inferssd-ci-integrations/" + job + "-machine.json", runtime_path="/models/machine.json")
+        assert envelope["machine_characteristics_sha256"][device] == sha
+        # Root mounts it read-only; no stage profiles the machine.
+        assert manifest["models"]["machine.json"] == config["machine_characteristics"]["host_path"]
+        assert "machine-profile" not in manifest["stages"]
+        assert "machine_characteristics" not in json.dumps(load(args.output / device / "policy.review.json"))
+        unsealed = dict(config)
+        del unsealed["machine_characteristics"]
+        with pytest.raises(ValueError, match="a baseline job must run on it first"):
+            selection_contract.requirements(unsealed)
+    assert set(envelope["machine_characteristics_sha256"]) == set(prepare.LINUX_DEVICES)
+
+
+@pytest.mark.parametrize("damage", ["none", "missing", "tampered"])
+def test_a_pr_job_without_intact_baseline_characteristics_refuses_preparation(tmp_path, source, damage):
+    import shutil
+    from ci import history
+    from test_ci_performance_series import MACHINE_SHA
+    args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"], mode=prepare.MODE)
+    store = history.store_root(args.inputs)
+    path = history.characteristics_path(store, "cloud-5090", MACHINE_SHA)
+    path.chmod(0o600)
+    if damage == "none":
+        shutil.rmtree(store / "cloud-5090")
+        expected = "cloud-5090 has no baseline machine characteristics yet; a baseline job must run on it first"
+    elif damage == "missing":
+        path.unlink()
+        expected = "are missing"
+    else:
+        path.write_text(MACHINE_SHA)
+        expected = "differ from their hash"
+    with pytest.raises(ValueError, match=expected):
+        prepare.prepare(args, api)
+    assert not args.output.exists()
+
+
+def test_tampered_history_file_refuses_preparation(tmp_path, source):
+    from ci import history
+    from test_ci_performance_series import record
+    root, identity = source
+    store = history_store(tmp_path, [record(identity["base"])])
+    path = history.record_path(store, record(identity["base"]))
+    value = json.loads(path.read_text())
+    value["runs"][0]["metrics"]["decode_tps"] = 99.0
+    path.chmod(0o600)
+    path.write_text(json.dumps(value))
+    args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
+    with pytest.raises(ValueError, match="logs differ"):
+        prepare.prepare(args, api)
+    assert not args.output.exists()
+
+
+def cache_fixture(tmp_path, source, flag=True, device="cloud-5090"):
+    args, api = prepared_fixture(tmp_path, source, devices=[device], mode=prepare.MODE)
+    inputs = load(args.inputs)
+    inputs["devices"][device]["base_build_cache"] = flag
+    template_path = tmp_path / inputs["devices"][device]["template"]
+    config = load(template_path)
+    for side in config["sides"].values():
+        side["build"]["toolchain"] = {"CMAKE_CXX_COMPILER": "/usr/bin/g++-12"}
+    template_path.write_text(json.dumps(config))
+    args.inputs.write_text(json.dumps(inputs))
+    return args, api
+
+
+def test_base_build_cache_stores_a_baseline_build_and_offers_it_to_a_pr_on_that_base(tmp_path, source):
+    from ci.selection_contract import build_cache_key
+    from test_ci_performance_series import record
+    root, identity = source
+    base = identity["base"]
+    # Baseline job of the base commit: the broker keeps its candidate build under the exact key.
+    args, api = cache_fixture(tmp_path, (root, dict(base=base, head=base, candidate=base)))
+    args.baseline = True
+    prepare.prepare(args, api)
+    config = load(args.output / "cloud-5090/config.json")
+    manifest = load(args.output / "cloud-5090/manifest.json")
+    key = build_cache_key(config, "candidate")
+    assert config["cache_build_as"] == key and manifest["cache_as"] == {"candidate": key}
+    assert "prebuilt_offer" not in manifest and "base_build" not in config
+    # A PR on that base gets the offer named by the base commit's record.
+    built = record(base)
+    built["build"] = dict(built["build"], cache_key=key, freeze_manifest_sha256="7" * 64)
+    (tmp_path / "pr").mkdir()
+    args, api = cache_fixture(tmp_path / "pr", source)
+    history_store(tmp_path / "pr", [built])
+    prepare.prepare(args, api)
+    config = load(args.output / "cloud-5090/config.json")
+    manifest = load(args.output / "cloud-5090/manifest.json")
+    assert config["base_build"] == dict(key=key, source_job=built["job_id"], freeze_manifest_sha256="7" * 64)
+    assert manifest["prebuilt_offer"] == {"base": dict(key=key, manifest_sha256="7" * 64)}
+    assert "cache_as" not in manifest
+
+
+@pytest.mark.parametrize("case", ["no-record", "other-key", "flag-off"])
+def test_no_cache_offer_without_a_matching_base_build(tmp_path, source, case):
+    from test_ci_performance_series import record
+    root, identity = source
+    args, api = cache_fixture(tmp_path, source, flag=case != "flag-off")
+    if case != "no-record":
+        history_store(tmp_path, [record(identity["base"])])  # cache key "3" * 64 is not this build's key
+    prepare.prepare(args, api)
+    config = load(args.output / "cloud-5090/config.json")
+    assert "base_build" not in config and "prebuilt_offer" not in load(args.output / "cloud-5090/manifest.json")
+
+
+@pytest.mark.parametrize("damage", ["not-bool", "mac"])
+def test_cache_flag_is_an_explicit_boolean_for_a_linux_device(tmp_path, source, damage):
+    args, api = cache_fixture(tmp_path, source, flag="yes" if damage == "not-bool" else True)
+    if damage == "mac":
+        inputs = load(args.inputs)
+        inputs["devices"]["local-mbp"] = dict(inputs["devices"]["cloud-5090"])
+        args.inputs.write_text(json.dumps(inputs))
+        args.execution_devices = ["local-mbp"]
+    with pytest.raises(ValueError, match="base_build_cache must be a boolean"):
+        prepare.prepare(args, api)
+
+
+@pytest.mark.parametrize("damage", ["different-revisions", "legacy-mode", "not-bool"])
+def test_baseline_job_is_explicit_and_only_for_one_commit(tmp_path, source, damage):
+    root, identity = source
+    head = identity["head"]
+    same = dict(base=head, head=head, candidate=head)
+    args, api = prepared_fixture(tmp_path, (root, identity if damage == "different-revisions" else same),
+                                 mode=prepare.LEGACY_MODE if damage == "legacy-mode" else prepare.MODE)
+    args.baseline = "yes" if damage == "not-bool" else True
+    with pytest.raises(ValueError):
+        prepare.prepare(args, api)
+    assert not args.output.exists()
 
 
 @pytest.mark.parametrize("mutation", ["missing-base", "different-budget", "model-identity", "payload-hash"])
@@ -578,42 +809,43 @@ def test_no_enabled_affected_linux_device_refuses_before_output(tmp_path, source
     assert not args.output.exists()
 
 
-@pytest.mark.parametrize("damage", [None, "collision", "missing-argv", "other-flags"])
-def test_performance_preflight_and_timed_private_writer_paths(tmp_path, source, damage):
+@pytest.mark.parametrize("damage", [None, "fixed-argv", "fixed-port", "missing-request", "different-request", "bad-request"])
+def test_performance_launches_are_resolved_on_the_device_from_one_reviewed_request(tmp_path, source, damage):
     args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"], mode=prepare.MODE)
     path = tmp_path / "cloud-5090-template.json"
     config = load(path)
-    for side, spec in config["sides"].items():
-        for model, data in spec["models"].items():
-            before = "/scratch/" + side + "/" + model + "-preflight.jsonl"
-            after = "/scratch/" + side + "/" + model + "-benchmark-512.jsonl"
-            data["smoke"]["argv"] += ["--ssd-telemetry", before]
-            timed = data["benchmarks"]["512"]
-            timed["preflight_argv"] = copy.deepcopy(data["smoke"]["argv"])
-            timed["argv"] = [*data["smoke"]["argv"][:-1], after]
-            if damage == "collision": timed["argv"][-1] = before
-            elif damage == "missing-argv": del timed["preflight_argv"]
-            elif damage == "other-flags": timed["preflight_argv"] += ["--different-budget"]
+    muse = config["sides"]["base"]["models"]["muse"]
+    if damage == "fixed-argv": muse["benchmarks"]["512"]["argv"] = ["/build/base/bin/llama-server"]
+    elif damage == "fixed-port": muse["smoke"]["port"] = 18080
+    elif damage == "missing-request":
+        for side in config["sides"].values():
+            for data in side["models"].values():
+                del data["launch"]
+    elif damage == "different-request": muse["launch"]["context"] = 4096
+    elif damage == "bad-request": muse["launch"]["extra"] = [""]
     path.write_text(json.dumps(config))
     if damage:
         with pytest.raises(ValueError): prepare.prepare(args, api)
         assert not args.output.exists()
-    else:
-        prepare.prepare(args, api)
-        actual = load(args.output / "cloud-5090/config.json")
-        for side, spec in actual["sides"].items():
-            for model, data in spec["models"].items():
-                timed = data["benchmarks"]["512"]
-                assert timed["preflight_argv"] == data["smoke"]["argv"]
-                assert timed["argv"][-1] != timed["preflight_argv"][-1]
+        return
+    prepare.prepare(args, api)
+    actual = load(args.output / "cloud-5090/config.json")
+    stages = load(args.output / "cloud-5090/manifest.json")["stages"]
+    for side, spec in actual["sides"].items():
+        for model, data in spec["models"].items():
+            assert data["launch"]["port"] == 18080
+            assert not any(key in data["benchmarks"]["512"] for key in ("argv", "preflight_argv", "port"))
+            assert stages[side + "-" + model + "-launch"] == dict(kind="test", side=side, executables=["/usr/bin/python3"],
+                                                                 cwd="/scratch/" + side, gpu=True)
+    assert "machine-profile" not in stages
 
 
 def test_bad_platform_profile_fails_during_preparation(tmp_path, source):
     args, api = prepared_fixture(tmp_path, source)
     path = tmp_path / "cloud-5090-template.json"
     config = json.loads(path.read_text())
-    config["sides"]["candidate"]["build"]["cmake_flags"] = ["-DBUILD_SHARED_LIBS=OFF", "-DLLAMA_SSD_STORE=ON"]
+    config["sides"]["candidate"]["build"]["cmake_flags"] = ["-DLLAMA_USE_SYSTEM_GGML=ON", "-DLLAMA_SSD_STORE=ON"]
     path.write_text(json.dumps(config))
-    with pytest.raises(ValueError, match="LLAMA_SSD_STORE requires Linux"):
+    with pytest.raises(ValueError, match="LLAMA_SSD_STORE requires the bundled ggml"):
         prepare.prepare(args, api)
     assert not (args.output / "prepared.json").exists()
