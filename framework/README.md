@@ -326,7 +326,8 @@ borrowed-reference behavior.
 
 `inferssd launch --execute` resolves typed Linux or Darwin inputs with lazy live
 host facts, then starts one supervised server. It requires an explicit
-policy, an unused execution directory and a loopback port:
+policy and writes to a new run directory: `--output-dir`, or `runs/<UTC time>`
+under the current directory. The server listens on a loopback port:
 
 ```sh
 inferssd launch --execute --platform linux --repo /path/to/inferssd \

@@ -341,6 +341,25 @@ def test_typed_command_prepares_native_file_without_executing_or_recording_secre
     assert "--ssd-cpu-threads" in json.loads(receipt.read_text())["argv"]
 
 
+def test_omitted_output_directory_creates_a_new_run_directory(tmp_path, monkeypatch, capsys):
+    inputs, spec, host, _, _, _ = setup(tmp_path)
+    contract = tmp_path / "policy.json"
+    contract.write_text(json.dumps(asdict(policy(tmp_path, "linux"))))
+    facts = tmp_path / "facts.json"
+    facts.write_text(json.dumps(host))
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    monkeypatch.setattr("os.environ", dict(inputs.environment))
+    command = ["launch", "--dry-run", "--platform", "linux", "--model", spec.model]
+    command += ["--binary", spec.binary, "--repo", inputs.repo, "--settings", spec.settings_file]
+    command += ["--runtime-policy", str(contract), "--host-facts", str(facts)]
+    assert main(command) == 0 and main(command) == 0
+    runs = sorted((work / "runs").iterdir())
+    assert len(runs) == 2 and all((run / "settings.ssd").exists() for run in runs)
+    assert str(runs[0]) in capsys.readouterr().err
+
+
 def test_historical_entry_cannot_execute(tmp_path):
     with pytest.raises(SystemExit) as error:
         main(["launch-recorded", "--execute", "--platform", "linux", "--repo", str(tmp_path)])

@@ -15,9 +15,9 @@ inferssd launch --help
 
 Use `--resources engine-resources.json`, `--profile dsv` or `--profile muse`, and
 `--model` pointing to the first GGUF shard. All shards must be present. Supply a
-settings file, a new output directory and a Darwin runtime policy such as
-[the example](examples/runtime-policy-darwin.json); see the
-[quick start](quickstart.md#prepare-a-launch).
+settings file and a Darwin runtime policy such as
+[the example](examples/runtime-policy-darwin.json); each launch writes to a new run
+directory. See the [quick start](quickstart.md#prepare-a-launch).
 
 The framework checks GGUF metadata and creates an alias index without duplicating
 model weights. It selects the matching chat template from the deployment
