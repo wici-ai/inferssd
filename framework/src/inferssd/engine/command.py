@@ -23,7 +23,7 @@ def run_native(args: argparse.Namespace, inputs: LaunchInput) -> int:
     if args.host_facts is not None:
         raise ValueError("--execute observes the live host; recorded --host-facts are dry-run only")
     if args.runtime_policy is None or args.output_dir is None or args.port is None:
-        raise ValueError("--execute requires --runtime-policy, --output-dir and --port")
+        raise ValueError("--execute requires a runtime policy, a run directory and a port")
     if inputs.mode != "server":
         raise ValueError("owned execution currently supports server mode only")
     data = json.loads(args.runtime_policy.read_text())

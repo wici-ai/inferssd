@@ -6,6 +6,8 @@ import argparse
 import json
 import os
 import sys
+import time
+import uuid
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
@@ -38,7 +40,9 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     launch.add_argument("--model", type=Path, required=True)
     launch.add_argument("--runtime-policy", type=Path, required=True)
     launch.add_argument(
-        "--output-dir", type=Path, required=True, help="fresh exclusive artifact directory"
+        "--output-dir",
+        type=Path,
+        help="new directory for this launch's logs and receipts (default: runs/<UTC time>)",
     )
     launch.add_argument(
         "--host-facts", type=Path, help="required recorded host observations for dry-run"
@@ -95,8 +99,17 @@ def inputs(args: argparse.Namespace) -> LaunchInput:
     )
 
 
+def default_output_directory() -> Path:
+    """A new directory under ./runs; an existing run directory is never reused."""
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    return Path("runs") / (stamp + "-" + uuid.uuid4().hex[:6])
+
+
 def run(args: argparse.Namespace) -> int:
     launch_input = inputs(args)
+    if args.output_dir is None:
+        args.output_dir = default_output_directory()
+        print("run directory: " + str(args.output_dir.resolve()), file=sys.stderr)
     if args.execute:
         from inferssd.engine.command import run_native
 

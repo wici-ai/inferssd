@@ -75,7 +75,7 @@ The public entry point is `inferssd launch`. It takes a settings file, a deploym
 
    The launcher stops the server after `runtime_seconds`. On macOS it also stops the server if memory-compressor or swap use grows beyond the policy's limits. The [owned runtime guide](../framework/README.md#explicit-owned-server-execution) describes every field.
 
-3. Choose a new output directory for each launch. Replace every `/path/to/` placeholder below.
+3. Replace every `/path/to/` placeholder below. Each launch writes its logs and receipts to a new directory, `runs/<UTC time>` under the current directory; pass `--output-dir` to choose another new directory.
 
 For DeepSeek:
 
@@ -85,7 +85,6 @@ inferssd launch --execute \
   --model /path/to/model-00001-of-00010.gguf --profile dsv \
   --settings settings.ssd \
   --runtime-policy runtime-policy.json \
-  --output-dir /path/to/runs/instance-001 \
   --context 8192 --batch 512 --ubatch 512
 ```
 
