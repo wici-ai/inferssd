@@ -13,7 +13,7 @@ preserves its source attribution and license files.
 | Backend operation files | New model operations and narrow native kernel entry points stay with their upstream operation/architecture files. Strict MXFP4 math is compiled separately with contraction and FTZ disabled. |
 | llama context | Runtime assembly, request phases, resource-aware graph reservation and failure recovery. Source, cache and telemetry owners reside in `src/ssd`. |
 | Model loading/mapping | Deferred expert ranges and compact Muse Metal allocations; fixed complete-page advice. Source/range helpers reside in `src/ssd`. |
-| Model/architecture support | DeepSeek V4.1, Engram and Muse architecture, metadata, graph and KV operations follow upstream model/op organization. They are intentional model exceptions. |
+| Model/architecture support | DeepSeek V4.1, Engram, Muse and Qwen3.8-Flash-Next (qwen4exp) architecture, metadata, graph and KV operations follow upstream model/op organization. They are intentional model exceptions. |
 | Common/server | CLI dispatch, rendering/parser hooks, prompt-cache/checkpoint and lifecycle calls. Owned implementations reside in `common/inferssd` and `tools/server/inferssd`. |
 | State serialization | Virtual/C API entry points call positional/range codecs under `src/inferssd`. |
 
@@ -62,7 +62,6 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/CMakeLists.txt` | 1 | 0 |
 | `ggml/include/ggml-alloc.h` | 4 | 0 |
 | `ggml/include/ggml-backend.h` | 58 | 0 |
-| `ggml/include/ggml-cpu.h` | 3 | 0 |
 | `ggml/include/ggml-cuda.h` | 23 | 0 |
 | `ggml/include/ggml-rpc.h` | 2 | 2 |
 | `ggml/include/ggml.h` | 106 | 1 |
@@ -74,12 +73,11 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-blas/ggml-blas.cpp` | 1 | 0 |
 | `ggml/src/ggml-cann/ggml-cann.cpp` | 1 | 0 |
 | `ggml/src/ggml-common.h` | 1 | 0 |
-| `ggml/src/ggml-cpu/CMakeLists.txt` | 17 | 0 |
+| `ggml/src/ggml-cpu/CMakeLists.txt` | 8 | 0 |
 | `ggml/src/ggml-cpu/arch/arm/quants.c` | 0 | 1 |
 | `ggml/src/ggml-cpu/arch/x86/quants.c` | 138 | 7 |
-| `ggml/src/ggml-cpu/ggml-cpu-impl.h` | 3 | 0 |
-| `ggml/src/ggml-cpu/ggml-cpu.c` | 3445 | 3650 |
-| `ggml/src/ggml-cpu/ggml-cpu.cpp` | 187 | 7 |
+| `ggml/src/ggml-cpu/ggml-cpu.c` | 3692 | 3650 |
+| `ggml/src/ggml-cpu/ggml-cpu.cpp` | 144 | 6 |
 | `ggml/src/ggml-cpu/ops.cpp` | 539 | 12 |
 | `ggml/src/ggml-cpu/ops.h` | 4 | 0 |
 | `ggml/src/ggml-cpu/quants.c` | 1 | 0 |
@@ -130,38 +128,39 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/gguf.cpp` | 7 | 0 |
 | `include/llama.h` | 88 | 1 |
 | `src/CMakeLists.txt` | 20 | 0 |
-| `src/llama-arch.cpp` | 114 | 2 |
-| `src/llama-arch.h` | 77 | 2 |
-| `src/llama-context.cpp` | 1361 | 46 |
+| `src/llama-arch.cpp` | 167 | 2 |
+| `src/llama-arch.h` | 109 | 2 |
+| `src/llama-context.cpp` | 1356 | 45 |
 | `src/llama-context.h` | 150 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
-| `src/llama-graph.cpp` | 747 | 49 |
+| `src/llama-graph.cpp` | 753 | 49 |
 | `src/llama-graph.h` | 158 | 5 |
-| `src/llama-hparams.cpp` | 4 | 0 |
-| `src/llama-hparams.h` | 45 | 1 |
+| `src/llama-hparams.cpp` | 21 | 0 |
+| `src/llama-hparams.h` | 72 | 1 |
 | `src/llama-impl.h` | 35 | 0 |
 | `src/llama-kv-cache-iswa.cpp` | 41 | 3 |
 | `src/llama-kv-cache-iswa.h` | 28 | 0 |
-| `src/llama-kv-cache.cpp` | 250 | 123 |
-| `src/llama-kv-cache.h` | 57 | 0 |
+| `src/llama-kv-cache.cpp` | 317 | 132 |
+| `src/llama-kv-cache.h` | 64 | 2 |
 | `src/llama-kv-cells.h` | 132 | 25 |
-| `src/llama-memory-recurrent.cpp` | 6 | 0 |
+| `src/llama-memory-recurrent.cpp` | 41 | 1 |
+| `src/llama-memory-recurrent.h` | 2 | 0 |
 | `src/llama-memory.h` | 70 | 0 |
 | `src/llama-mmap.cpp` | 132 | 3 |
 | `src/llama-mmap.h` | 7 | 0 |
-| `src/llama-model-loader.cpp` | 127 | 2 |
-| `src/llama-model-loader.h` | 27 | 0 |
-| `src/llama-model-saver.cpp` | 6 | 2 |
-| `src/llama-model.cpp` | 784 | 38 |
-| `src/llama-model.h` | 81 | 0 |
+| `src/llama-model-loader.cpp` | 164 | 7 |
+| `src/llama-model-loader.h` | 36 | 0 |
+| `src/llama-model-saver.cpp` | 7 | 2 |
+| `src/llama-model.cpp` | 1035 | 39 |
+| `src/llama-model.h` | 107 | 0 |
 | `src/llama-quant.cpp` | 22 | 1 |
 | `src/llama-sampler.cpp` | 1 | 0 |
 | `src/llama-vocab.cpp` | 67 | 8 |
 | `src/llama-vocab.h` | 5 | 0 |
-| `src/llama.cpp` | 8 | 1 |
+| `src/llama.cpp` | 4 | 1 |
 | `src/models/deepseek2.cpp` | 10 | 4 |
-| `src/models/models.h` | 56 | 0 |
+| `src/models/models.h` | 152 | 0 |
 | `tools/server/CMakeLists.txt` | 13 | 5 |
 | `tools/server/server-chat.cpp` | 66 | 16 |
 | `tools/server/server-common.cpp` | 288 | 5 |
@@ -171,5 +170,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 15598 added, 5643 removed across 140 upstream paths.
+Total: 16444 added, 5659 removed across 139 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
