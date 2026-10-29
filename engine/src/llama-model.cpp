@@ -3419,8 +3419,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     const int n_layer      = hparams.n_layer;
     const int n_gpu_layers = this->n_gpu_layers();
     const llama_model_tensor_buft_override * original_tensor_buft_overrides = ml.tensor_buft_overrides;
-    std::vector<llama_model_tensor_buft_override> deferred_expert_buft_overrides;
-    std::vector<std::string> deferred_expert_buft_override_patterns;
 
     const bool use_mmap_buffer = true;
 
@@ -3518,32 +3516,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         LLAMA_LOG_WARN("%s: deferred expert loading disabled because tensor validation would fault expert pages eagerly\n", __func__);
         defer_expert_mmap = false;
     }
-    // Deferred routed experts stay in mmap-backed CPU buffers with GPU layers: Kimi's, and those of every
-    // architecture the SSD expert adapter describes, which the SSD executor reads on the CPU.
-    const bool keep_experts_on_cpu = llama_should_defer_kimi_experts_on_gpu(arch, name) ||
-        llama_ssd::describe_experts(arch, hparams, -1).activation != llama_ssd::expert_activation::unsupported;
-    if (defer_expert_mmap && keep_experts_on_cpu && !devices.empty() && n_gpu_layers > 0) {
-        deferred_expert_buft_override_patterns.reserve(n_layer);
-        deferred_expert_buft_overrides.reserve(n_layer + 1);
-
-        for (int il = 0; il < n_layer; ++il) {
-            deferred_expert_buft_override_patterns.emplace_back(
-                    "blk\\." + std::to_string(il) + "\\.(ffn_(up|down|gate|gate_up)_(ch)?exps\\.(weight|scale|bias))");
-            deferred_expert_buft_overrides.push_back({
-                    deferred_expert_buft_override_patterns.back().c_str(),
-                    ggml_backend_cpu_buffer_type(),
-            });
-        }
-        if (original_tensor_buft_overrides) {
-            for (const llama_model_tensor_buft_override * override = original_tensor_buft_overrides; override->pattern != nullptr; ++override) {
-                deferred_expert_buft_overrides.push_back(*override);
-            }
-        }
-        deferred_expert_buft_overrides.push_back({ nullptr, nullptr });
-        ml.tensor_buft_overrides = deferred_expert_buft_overrides.data();
-
-        LLAMA_LOG_INFO("%s: keeping deferred expert tensors on CPU with %d overrides while applying %d GPU layers (arch=%s name='%s')\n",
-                __func__, n_layer, n_gpu_layers, llm_arch_name(arch), name.c_str());
+    // Deferred routed experts stay in plain mmap-backed CPU buffers, with or without GPU layers: Kimi's, and those
+    // of every architecture the SSD expert adapter describes, which the SSD executor reads from the drive. A
+    // repacked or device copy would hold every expert in memory.
+    ml.map_deferred_experts = defer_expert_mmap && (llama_should_map_kimi_experts(arch, name) ||
+        llama_ssd::describe_experts(arch, hparams, -1).activation != llama_ssd::expert_activation::unsupported);
+    if (ml.map_deferred_experts) {
+        LLAMA_LOG_INFO("%s: keeping deferred expert tensors in mapped CPU buffers (arch=%s name='%s')\n",
+                __func__, llm_arch_name(arch), name.c_str());
     }
 
     // DeepSeek-V4.1 engram tables are about 100 GB each and a token reads only a few rows. Pin them

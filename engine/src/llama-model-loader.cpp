@@ -1207,12 +1207,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_backend_buffer_type_t buft = nullptr;
         bool keep_host_buft_override = false;
 
-        const bool is_ple_table = get_arch() == LLM_ARCH_QWEN4EXP && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD;
-        if (is_ple_table) {
+        // PLE and the deferred routed experts must remain ordinary CPU mmaps, including when other weights are
+        // overridden: never a repacked, host or device copy.
+        uint32_t expert_layer = 0;
+        const bool plain_mmap = (get_arch() == LLM_ARCH_QWEN4EXP && tn.tensor == LLM_TENSOR_PER_LAYER_TOKEN_EMBD) ||
+            (map_deferred_experts && llama_is_expert_tensor_name(tn.str(), expert_layer));
+        if (plain_mmap) {
             buft = ggml_backend_cpu_buffer_type();
         }
-        // PLE must remain an ordinary CPU mmap, including when other weights are overridden.
-        if (!is_ple_table && tensor_buft_overrides) {
+        if (!plain_mmap && tensor_buft_overrides) {
             std::string tensor_name = tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);

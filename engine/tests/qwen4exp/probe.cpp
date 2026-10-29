@@ -76,7 +76,7 @@ int main(int argc,char **argv){try{
     for (uint32_t il=0;il<m->hparams.n_layer;++il) {
         require(m->hparams.swiglu_clamp_exp[il]==0.0f,"Qwen expert activation is clamped");
         if (std::getenv("QWEN_STREAMED")) for(auto * t:{m->layers[il].ffn_up_exps,m->layers[il].ffn_gate_exps,m->layers[il].ffn_down_exps})
-            require(t && ggml_backend_buffer_is_host(t->buffer),"deferred expert is not host resident");
+            require(t && !std::strcmp(ggml_backend_buffer_name(t->buffer),"CPU_Mapped"),"deferred expert is not in a mapped CPU buffer");
     }
     if(std::getenv("QWEN_LOAD_ONLY")){std::cout<<"QWEN_DEFERRED_LOAD_PASS\n";llama_model_free(m);llama_backend_free();return 0;}
     std::cout << "PLE_ADDR=" << m->per_layer_tok_embd->data << " PLE_BYTES=" << ggml_nbytes(m->per_layer_tok_embd) << " ROW_BYTES=" << ggml_row_size(m->per_layer_tok_embd->type,m->per_layer_tok_embd->ne[0]) << std::endl;

@@ -69,13 +69,13 @@ int main() {
     rc |= expect_false(llama_model_name_is_kimi("DeepSeek-V3"), "DeepSeek model names are not Kimi");
 
     rc |= expect_true(
-            llama_should_defer_kimi_experts_on_gpu(LLM_ARCH_KIMI_LINEAR, "any-name"),
-            "native Kimi arch defers expert tensors under GPU offload");
+            llama_should_map_kimi_experts(LLM_ARCH_KIMI_LINEAR, "any-name"),
+            "native Kimi arch keeps deferred expert tensors mapped");
     rc |= expect_true(
-            llama_should_defer_kimi_experts_on_gpu(LLM_ARCH_DEEPSEEK2, "Kimi-K2-Instruct"),
-            "Kimi K2 reports deepseek2 but still defers expert tensors");
+            llama_should_map_kimi_experts(LLM_ARCH_DEEPSEEK2, "Kimi-K2-Instruct"),
+            "Kimi K2 reports deepseek2 but still keeps deferred expert tensors mapped");
     rc |= expect_false(
-            llama_should_defer_kimi_experts_on_gpu(LLM_ARCH_DEEPSEEK2, "DeepSeek-V3"),
+            llama_should_map_kimi_experts(LLM_ARCH_DEEPSEEK2, "DeepSeek-V3"),
             "ordinary DeepSeek2 keeps merged DeepSeek tensor placement");
 
     rc |= expect_true(

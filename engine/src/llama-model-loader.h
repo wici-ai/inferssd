@@ -102,6 +102,9 @@ struct llama_model_loader {
     bool use_direct_io = false;
     bool check_tensors;
     bool defer_experts = false;
+    // Set by load_tensors while expert loading is deferred for an SSD executor: the
+    // routed-expert tensors take the plain CPU buffer type, an ordinary mmap.
+    bool map_deferred_experts = false;
     bool no_alloc;
 
     llama_files files;

@@ -53,4 +53,5 @@ Environment variables:
 
 Compile with `-DQWEN_INTERNAL -Isrc -lggml-base` to check model hparams, print
 the mapped PLE address, and confirm with `QWEN_STREAMED=1` that deferred expert
-buffers stay on the host. Adding `QWEN_LOAD_ONLY=1` stops after that load check.
+tensors stay in mapped CPU buffers, never repacked or uploaded copies. Adding
+`QWEN_LOAD_ONLY=1` stops after that load check.
