@@ -89,6 +89,9 @@ bool process_cpus(cpu_list & cpus, std::string * why) {
     return true;
 }
 
+// sched_getaffinity(0) reads the calling thread's mask.
+bool current_thread_cpus(cpu_list & cpus, std::string * why) { return process_cpus(cpus, why); }
+
 // Per-CPU capacity from the kernel (Arm big.LITTLE, Intel P/E cores), else the
 // maximum frequency. One unreadable CPU makes the machine one cluster.
 bool topology(cpu_topology & out, std::string * why) {
@@ -161,6 +164,9 @@ bool process_cpus(cpu_list & cpus, std::string * why) {
     for (int cpu = 0; cpu < count; ++cpu) { cpus.push_back(cpu); }
     return true;
 }
+
+// No thread affinity: every thread may run on every CPU.
+bool current_thread_cpus(cpu_list & cpus, std::string * why) { return process_cpus(cpus, why); }
 
 // perflevel0 is the fastest level; the other levels (perflevel1 on current
 // Apple silicon) are the rest. Intel Macs report no levels: one cluster.
@@ -326,6 +332,35 @@ static bool select_mask(HANDLE thread, const cpu_set_table & sets, DWORD_PTR mas
         if ((mask >> cpu) & 1) { ids.push_back(sets.id[cpu]); }
     }
     return SetThreadSelectedCpuSets(thread, ids.empty() ? nullptr : ids.data(), ULONG(ids.size())) != 0;
+}
+
+// The hard affinity, narrowed by the selected CPU Sets when they meet it; the
+// scheduler ignores sets outside it.
+bool current_thread_cpus(cpu_list & cpus, std::string * why) {
+    cpus.clear();
+    if (!single_group()) {
+        set_why(why, "more than one processor group (over 64 logical CPUs) is not supported");
+        return false;
+    }
+    const HANDLE thread = GetCurrentThread();
+    GROUP_AFFINITY hard = {};
+    if (!GetThreadGroupAffinity(thread, &hard) || hard.Group != 0) {
+        set_why(why, "GetThreadGroupAffinity failed: error " + std::to_string(GetLastError()));
+        return false;
+    }
+    DWORD_PTR mask = DWORD_PTR(hard.Mask), selected = 0;
+    const auto & sets = cpu_sets();
+    if (sets.available) {
+        if (!selected_mask(thread, sets, selected)) {
+            set_why(why, "GetThreadSelectedCpuSets failed: error " + std::to_string(GetLastError()));
+            return false;
+        }
+        if (mask & selected) { mask &= selected; }
+    }
+    for (int cpu = 0; cpu < mask_bits; ++cpu) {
+        if ((mask >> cpu) & 1) { cpus.push_back(cpu); }
+    }
+    return true;
 }
 
 bool pin_thread(std::thread::native_handle_type handle, const cpu_list & cpus) {

@@ -67,6 +67,14 @@ static std::vector<unsigned long long> placement() {
     return out;
 }
 
+// The calling thread's CPUs as the platform layer reads them.
+static cpu_list thread_cpus_now() {
+    cpu_list cpus;
+    std::string why;
+    require(current_thread_cpus(cpus, &why), "current_thread_cpus: " + why);
+    return cpus;
+}
+
 // The scheduler moves a pinned thread at its next dispatch.
 static bool runs_within(const cpu_list & cpus) {
     if (!affinity_supported()) { return true; }
@@ -146,6 +154,7 @@ static cpu_list test_topology(int expect_fast, int expect_slow) {
 
 static void test_pin(const cpu_list & cpus) {
     const auto before = placement();
+    require(thread_cpus_now() == cpus, "an unpinned thread runs on the process CPUs");
     require(pin_current_thread({}), "an empty pin is a no-op");
     require(placement() == before, "an empty pin leaves the thread as it was");
     if (affinity_supported()) {
@@ -155,6 +164,8 @@ static void test_pin(const cpu_list & cpus) {
     for (int cpu : { cpus.front(), cpus.back() }) {
         require(pin_current_thread({ cpu }), "pin the calling thread to CPU " + std::to_string(cpu));
         require(runs_within({ cpu }), "the calling thread runs on CPU " + std::to_string(cpu));
+        require(thread_cpus_now() == (affinity_supported() ? cpu_list{ cpu } : cpus),
+                "the calling thread reads its pin back as CPU " + std::to_string(cpu));
     }
 #if defined(_WIN32)
     if (cpus.size() > 1) {
@@ -163,6 +174,7 @@ static void test_pin(const cpu_list & cpus) {
         require(GetThreadGroupAffinity(GetCurrentThread(), &saved) != 0, "GetThreadGroupAffinity");
         hard.Mask = KAFFINITY(1) << cpus.front();
         require(SetThreadGroupAffinity(GetCurrentThread(), &hard, nullptr) != 0, "SetThreadGroupAffinity");
+        require(thread_cpus_now() == cpu_list{ cpus.front() }, "selected CPU Sets outside the hard affinity are ignored");
         const bool pinned = pin_current_thread({ cpus.back() });
         const bool moved = pinned && runs_within({ cpus.back() });
         require(SetThreadGroupAffinity(GetCurrentThread(), &saved, nullptr) != 0, "restore the group affinity");
@@ -170,6 +182,7 @@ static void test_pin(const cpu_list & cpus) {
     }
 #endif
     require(pin_current_thread(cpus), "pin the calling thread to every process CPU");
+    require(thread_cpus_now() == cpus, "the calling thread reads every process CPU back");
 
     const int target = cpus.front();
     std::atomic<int> go{0}, seen{-1};

@@ -25,6 +25,11 @@ using cpu_list = std::vector<int>;
 // macOS: 0 .. hw.logicalcpu - 1.
 bool process_cpus(cpu_list & cpus, std::string * why = nullptr);
 
+// The CPUs the calling thread runs on now, ascending: its affinity mask
+// (Linux, as process_cpus reads it); its group-0 affinity narrowed by the CPU
+// Sets it selected where they meet it (Windows); process_cpus (macOS).
+bool current_thread_cpus(cpu_list & cpus, std::string * why = nullptr);
+
 // The process CPUs split into the fastest cluster and the rest. A homogeneous
 // or unreadable machine has every CPU in `fast`. Only a candidate for thread
 // placement; callers still measure.
