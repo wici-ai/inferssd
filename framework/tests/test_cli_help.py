@@ -10,7 +10,7 @@ def test_help_lists_public_commands_only(capsys):
     with pytest.raises(SystemExit) as error:
         main(["--help"])
     text = capsys.readouterr().out
-    assert error.value.code == 0 and "{launch,configuration,source}" in text
+    assert error.value.code == 0 and "{launch,configuration,source,profile}" in text
     assert "launch-recorded" not in text and "bootstrap-records" not in text
 
 

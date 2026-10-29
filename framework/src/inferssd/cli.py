@@ -22,6 +22,8 @@ from inferssd.launch.command import run_launch
 from inferssd.launch.typed_command import add_command as add_launch_command
 from inferssd.launch.typed_command import run as run_typed_launch
 from inferssd.loop.report import run_report
+from inferssd.machine.command import add_command as add_profile_command
+from inferssd.machine.command import run as run_profile
 from inferssd.model.machine import Machine
 from inferssd.plan.planner import run_plan
 from inferssd.plan.planner_types import PlanArguments
@@ -44,6 +46,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     add_launch_command(commands)
     add_historical_launch_command(commands)
     add_configuration_command(commands)
+    add_profile_command(commands)
     bootstrap = commands.add_parser(
         "bootstrap-records", help="read recorded CPU rows and ubatch logs; never run a probe"
     )
@@ -95,7 +98,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     fit.add_argument("--profile", required=True)
     fit.add_argument("-o", "--out", required=True)
     # Commands for recorded artifacts remain available but are not listed in the help.
-    public = ("launch", "configuration", "source")
+    public = ("launch", "configuration", "source", "profile")
     commands.metavar = "{" + ",".join(public) + "}"
     commands._choices_actions = [a for a in commands._choices_actions if a.dest in public]
     args = parser.parse_args(argv)
@@ -113,6 +116,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             return run_configuration(args)
         except (OSError, ValueError) as error:
+            parser.error(str(error))
+    if args.command == "profile":
+        try:
+            return run_profile(args)
+        except (OSError, ValueError, RuntimeError) as error:
             parser.error(str(error))
     if args.command == "bootstrap-records":
         if args.bootstrap_command == "coresets":

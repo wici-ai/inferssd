@@ -15,6 +15,7 @@ uses only the Python standard library.
 | `inferssd launch --dry-run` | Same configuration, recorded host facts | Prepared settings/source indexes and native argv; no server |
 | `inferssd launch-recorded --dry-run` | Historical launcher inputs and recorded facts | Historical resolution for comparison; cannot execute |
 | `inferssd configuration` | Typed settings and `--set` overrides | Effective values/source receipts, schema or canonical settings |
+| `inferssd profile` | This machine, optional model paths and the native probes | Machine characteristics file and a summary per section; see [machine profile](../docs/machine-profile.md) |
 | `inferssd source` | GGUF headers, optional v1 pack index, dense placement text | Expert JSON/alias TSV, source facts, lane arguments or fio iolog |
 | `inferssd probe` | Existing probe reports and expert metadata | Device schema-2 JSON |
 | `inferssd validate` | Device schema-2 JSON | Validation result |

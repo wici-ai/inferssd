@@ -9,6 +9,7 @@
 - [Apple Silicon deployment](mac-launcher.md): Metal build, cache and thread settings.
 - [Configuration](configuration.md): the typed `inferssd-settings 1` contract.
 - [Deployment resources](engine-resources.md): engine descriptors for installations outside a checkout.
+- [Machine profile](machine-profile.md): what `inferssd profile` measures and where it keeps the result.
 - [Framework commands](../framework/README.md): source preparation, planning and owned launch.
 
 ## Design
