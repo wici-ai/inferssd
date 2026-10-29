@@ -107,6 +107,7 @@ struct kimi_cpu_prefill {
     ggml_vec_dot_t dot_up = nullptr, dot_down = nullptr;
     ggml_from_float_t quantize_input = nullptr, quantize_hidden = nullptr;
     int latent = 0, hidden = 0;
+    int ntokens = 0, nslots = 0;
     size_t row_bytes_up = 0, row_bytes_down = 0;
     size_t quant_bytes_input = 0, quant_bytes_hidden = 0;
     const char * up_data = nullptr, * gate_data = nullptr, * down_data = nullptr;
@@ -122,6 +123,7 @@ struct kimi_cpu_prefill {
     // a multiple of every fixed ggml_vec_swiglu_f32 vector width (the predicated
     // ones have no scalar tail), and ends 16 rows later or at the row's end: gated
     // alone, it splits into vector body and scalar tail as the whole row would.
+    // The final slot-order sums claim whole tokens from the same counter.
     static constexpr int row_chunk = 16;
     int column_block = 16; // 0 keeps the row-major order
     std::atomic<int> dynamic_next{0};
@@ -399,6 +401,37 @@ struct kimi_cpu_prefill {
         }
         self.current.stream.down_reduce_us += elapsed_us(start);
     }
+
+    // Each token's CPU routes in slot order. The sum starts at the first one's
+    // product, as the graph's does (an addition to +0 would turn a -0 product
+    // into +0), unless GPU-served routes of the token already added theirs into
+    // output. A participant claims a whole token and sums it alone, so no
+    // element's order depends on the split.
+    static void reduce_tokens(void * userdata, int, int) {
+        auto & self = *static_cast<kimi_cpu_prefill *>(userdata);
+        const int latent = self.latent, nslots = self.nslots, ntokens = self.ntokens;
+        const int32_t * group = self.route_request_index.data();
+        const uint8_t * consumed = self.consumed.data();
+        const float * routed = self.routed_output.data();
+        for (;;) {
+            const int token = self.dynamic_next.fetch_add(1, std::memory_order_relaxed);
+            if (token >= ntokens) { break; }
+            float * destination = self.output + static_cast<size_t>(token) * latent;
+            const int first = token * nslots, last = first + nslots;
+            bool started = false;
+            for (int route = first; route < last; ++route) { started |= group[route] >= 0 && !consumed[group[route]]; }
+            for (int route = first; route < last; ++route) {
+                if (group[route] < 0 || !consumed[group[route]]) { continue; }
+                const float * value = routed + static_cast<size_t>(route) * latent;
+                if (started) {
+                    for (int row = 0; row < latent; ++row) { destination[row] += value[row]; }
+                } else {
+                    std::copy(value, value + latent, destination);
+                    started = true;
+                }
+            }
+        }
+    }
 };
 
 extern "C" struct kimi_cpu_prefill * kimi_cpu_prefill_create(
@@ -472,6 +505,8 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         }
         prefill->activation_config = *activation;
         prefill->output = output;
+        prefill->ntokens = ntokens;
+        prefill->nslots = nslots;
         std::fill(output, output + static_cast<size_t>(ntokens) * prefill->latent, 0.0f);
         auto phase_start = prefill_clock::now();
         for (int token = 0; token < ntokens; ++token) {
@@ -530,29 +565,11 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         stream.compute_us += input_us;
         prefill->current.stream = stream;
         if (ok) {
+            // The slot-order sums, on every participant of the call, after the
+            // stream returned with the GPU tier's routes in output.
             phase_start = prefill_clock::now();
-            // Each token's CPU routes in slot order. The sum starts at the first
-            // one's product, as the graph's does (an addition to +0 would turn a
-            // -0 product into +0), unless GPU-served routes of the token already
-            // added theirs into output.
-            const auto & consumed = prefill->consumed;
-            const int32_t * group = prefill->route_request_index.data();
-            for (int token = 0; token < ntokens; ++token) {
-                float * destination = output + static_cast<size_t>(token) * prefill->latent;
-                const int first = token * nslots, last = first + nslots;
-                bool started = false;
-                for (int route = first; route < last; ++route) { started |= group[route] >= 0 && !consumed[size_t(group[route])]; }
-                for (int route = first; route < last; ++route) {
-                    if (group[route] < 0 || !consumed[size_t(group[route])]) { continue; }
-                    const float * value = prefill->routed_output.data() + static_cast<size_t>(route) * prefill->latent;
-                    if (started) {
-                        for (int row = 0; row < prefill->latent; ++row) { destination[row] += value[row]; }
-                    } else {
-                        std::copy(value, value + prefill->latent, destination);
-                        started = true;
-                    }
-                }
-            }
+            prefill->dynamic_next.store(0, std::memory_order_relaxed);
+            kimi_cpu_sink_parallel_last(prefill->sink, kimi_cpu_prefill::reduce_tokens, prefill);
             const double reduce_us = elapsed_us(phase_start);
             prefill->current.stream.down_reduce_us += reduce_us;
             prefill->current.stream.compute_us += reduce_us;

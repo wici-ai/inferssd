@@ -1881,6 +1881,21 @@ struct kimi_cpu_sink {
         while (!done()) { coordinator.park(done); }
     }
 
+    // One phase in which every participant runs function(userdata, ith, nth); `last` as for compute_phase.
+    void parallel_phase(kimi_cpu_sink_parallel_fn function, void * userdata, bool last) {
+        parallel_fn = function;
+        parallel_userdata = userdata;
+        try { compute_phase(false, last); }
+        catch (...) {
+            wait_workers();
+            parallel_fn = nullptr;
+            parallel_userdata = nullptr;
+            throw;
+        }
+        parallel_fn = nullptr;
+        parallel_userdata = nullptr;
+    }
+
     void cancel_and_wait() {
         // A provider cancellation must retain its native leases until the
         // consumer has drained and explicitly released them.
@@ -2763,17 +2778,16 @@ struct kimi_cpu_sink {
 // every participant of the open call.
 void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,
         kimi_cpu_sink_parallel_fn function, void * userdata) {
-    sink->parallel_fn = function;
-    sink->parallel_userdata = userdata;
-    try { sink->compute_phase(false); }
-    catch (...) {
-        sink->wait_workers();
-        sink->parallel_fn = nullptr;
-        sink->parallel_userdata = nullptr;
-        throw;
-    }
-    sink->parallel_fn = nullptr;
-    sink->parallel_userdata = nullptr;
+    sink->parallel_phase(function, userdata, false);
+}
+
+// After a stream returned, on the same participants: a run of one parallel phase, the call's last before it
+// closes, so its participants then wait for the close as at a node boundary.
+void kimi_cpu_sink_parallel_last(struct kimi_cpu_sink * sink,
+        kimi_cpu_sink_parallel_fn function, void * userdata) {
+    std::lock_guard<std::mutex> serial(sink->run_mutex);
+    sink->begin_participants(false);
+    sink->parallel_phase(function, userdata, true);
 }
 
 static bool kimi_cpu_sink_stream_impl(struct kimi_cpu_sink * sink,

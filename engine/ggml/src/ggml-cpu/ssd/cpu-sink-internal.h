@@ -17,8 +17,10 @@ inline void kimi_cpu_sink_normalize_expert(float * values, int rows, const float
 
 
 // Private executor hooks. The stream serializes all accesses to the shared
-// decode ring and compute phases. Call parallel only from the stream consumer;
-// callbacks must not recursively enter either executor or allocate/throw.
+// decode ring and compute phases. Call parallel only from the stream consumer,
+// and parallel_last only from the caller of a stream that returned, as the
+// open call's last phase; callbacks must not recursively enter either executor
+// or allocate/throw.
 // Streaming is a prefill operation: it disables decode cache (normally releases
 // it; optional cross-request retention checks the same memory guard) and
 // always uses ring targets. Cache admission requires a subsequent decode begin.
@@ -65,6 +67,8 @@ struct kimi_cpu_sink_prefill_batch {
 };
 
 void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,
+        kimi_cpu_sink_parallel_fn function, void * userdata);
+void kimi_cpu_sink_parallel_last(struct kimi_cpu_sink * sink,
         kimi_cpu_sink_parallel_fn function, void * userdata);
 bool kimi_cpu_sink_stream(struct kimi_cpu_sink * sink,
         const struct ggml_tensor * up, const struct ggml_tensor * gate,
