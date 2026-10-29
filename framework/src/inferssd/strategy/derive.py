@@ -38,6 +38,10 @@ SERVER_ARGS = ("--ctx-checkpoints", "1")
 # The host margin on memory a GPU shares with the host: the smallest margin that
 # held under stress with the automatic VRAM tier growing into host memory.
 UNIFIED_HEADROOM_MIB = 4096
+# On macOS the share of memory kept out of the RAM expert cache: macOS compresses
+# a cache's cold pages long before free memory runs out, and every hit on a
+# compressed slot then decompresses it.
+DARWIN_HEADROOM_SHARE = 4
 # The longest prompt pass the prefill route is priced for.
 MAX_PASS = 1 << 20
 
@@ -610,6 +614,14 @@ def derive(
                 "prefill: one pass a prompt, -b and -ub as large as the context; a pass reads "
                 "every expert it routes to once"
             )
+    if platform == "darwin":
+        mib = characteristics["memory"]["total_bytes"] // DARWIN_HEADROOM_SHARE >> 20
+        choices["host.headroom_mib"] = (
+            str(mib),
+            f"a quarter of the {size(characteristics['memory']['total_bytes'])} of memory: macOS "
+            "compresses a RAM cache's cold pages long before free memory runs out",
+        )
+        notes.append(f"host.headroom_mib: {mib}, a quarter of the machine's memory")
     if platform in ("darwin", "windows") and runtime.memory_budget_bytes:
         mib = runtime.memory_budget_bytes >> 20
         if mib:

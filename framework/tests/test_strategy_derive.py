@@ -316,6 +316,10 @@ def test_macos_measured_thread_counts_and_budget(models):
     assert s.threads == Threads(10, 10, ())
     assert s.settings["cpu.io_cpus"].value_text == '""'
     assert s.settings["host.budget_mib"].value_text == "12288"
+    # A quarter of the machine's memory stays out of the RAM cache.
+    quarter = c["memory"]["total_bytes"] // 4 >> 20
+    assert s.settings["host.headroom_mib"].value_text == str(quarter)
+    assert "macOS compresses" in s.settings["host.headroom_mib"].reason
     assert "vram.budget" not in s.settings
     assert sorted(costs(s)) == ["cpu_fixed_us", "cpu_route_us", "drive_gbps"]
     assert threadpools(s.threads, "darwin") == s.threads
