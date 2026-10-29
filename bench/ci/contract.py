@@ -1,5 +1,6 @@
 """Strict CI identities and classifications. No device connections or defaults."""
 
+import datetime
 import hashlib
 import json
 import math
@@ -10,6 +11,16 @@ DEVICES = ("cloud-5090", "dgx-spark", "local-mbp")
 MODELS = ("deepseek", "muse")
 SHA = re.compile(r"[0-9a-f]{40}")
 HASH = re.compile(r"[0-9a-f]{64}")
+JOB_ID = re.compile(r"[0-9a-f]{32}")
+DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+PERFORMANCE_METRICS = (
+    "decode_first128_tps", "decode_second128_tps", "decode_tps", "ttft_s",
+    "server_prefill_tps",
+)
+NOISE_BAND_MODE = "calibrated-noise-band"
+NOISE_BAND_STATISTIC = "rms-paired-log-ratio"
+NOISE_BAND_MIN_PAIRS = 4
+BAND_TIERS = ("512", "4096")
 
 
 def load(path):
@@ -80,19 +91,7 @@ def policy_read(value):
             or value.get("staging_prefix") != "device-ci/approved/"
             or value.get("upstream_workflow") != ".github/workflows/ci.yml"):
         raise ValueError("physical CI requires the separate protected private controller policy")
-    thresholds = value["thresholds"]
-    if (thresholds.get("provisional") is not True
-            or thresholds.get("mode") != "observed-no-slowdown"
-            or thresholds.get("slowdown_outcome") != "inconclusive"):
-        raise ValueError("n=1 policy must block observed slowdown as inconclusive")
-    for key in ("decode_regression_fraction", "ttft_regression_fraction", "prefill_regression_fraction"):
-        number = thresholds.get(key)
-        if (
-            type(number) not in (int, float)
-            or not math.isfinite(number)
-            or number != 0
-        ):
-            raise ValueError("no permitted regression fraction: " + key)
+    noise_thresholds(value.get("thresholds"))
     for name in (
         "extended_prefixes",
         "extended_names",
@@ -106,6 +105,65 @@ def policy_read(value):
             or any(not isinstance(item, str) or not item for item in value[name])
         ):
             raise ValueError("policy requires explicit nonempty " + name)
+    return value
+
+
+def finite(value, *, minimum=0.0, inclusive=True, below=None):
+    return (type(value) in (int, float) and math.isfinite(value)
+            and (value >= minimum if inclusive else value > minimum)
+            and (below is None or value < below))
+
+
+def noise_band(value):
+    """One A/A calibration result for a device/model/tier cell."""
+    fields = {"sigma_log", "pairs", "statistic", "conditions_sha256", "engine_revision",
+              "calibration_jobs", "date"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("noise band requires exactly " + ", ".join(sorted(fields)))
+    sigma = value["sigma_log"]
+    if (not isinstance(sigma, dict) or set(sigma) != set(PERFORMANCE_METRICS)
+            or not all(finite(sigma[metric]) for metric in PERFORMANCE_METRICS)):
+        raise ValueError("noise band needs a finite nonnegative sigma_log for every gated metric")
+    jobs = value["calibration_jobs"]
+    if (type(value["pairs"]) is not int or value["pairs"] < NOISE_BAND_MIN_PAIRS
+            or value["statistic"] != NOISE_BAND_STATISTIC
+            or not isinstance(value["conditions_sha256"], str) or HASH.fullmatch(value["conditions_sha256"]) is None
+            or not isinstance(value["engine_revision"], str) or SHA.fullmatch(value["engine_revision"]) is None
+            or not isinstance(jobs, list) or not jobs
+            or any(not isinstance(job, str) or JOB_ID.fullmatch(job) is None for job in jobs)
+            or len(set(jobs)) != len(jobs)
+            or not isinstance(value["date"], str) or DATE.fullmatch(value["date"]) is None):
+        raise ValueError("noise band pairs, statistic, conditions, revision, jobs or date are invalid")
+    datetime.date.fromisoformat(value["date"])
+    return value
+
+
+def noise_thresholds(value):
+    """Fixed decision constants. Calibrated bands are separate operator data."""
+    fields = {"mode", "pairs", "order", "k", "floor_fraction"}
+    if not isinstance(value, dict) or set(value) != fields or value["mode"] != NOISE_BAND_MODE:
+        raise ValueError("performance thresholds must use the calibrated noise-band mode")
+    floors = value["floor_fraction"]
+    if (type(value["pairs"]) is not int or value["pairs"] < 2 or value["order"] != "ABBA"
+            or not finite(value["k"], inclusive=False)
+            or not isinstance(floors, dict) or set(floors) != set(PERFORMANCE_METRICS)
+            or not all(finite(floors[metric], below=1) for metric in PERFORMANCE_METRICS)):
+        raise ValueError("noise-band pairs, order, k and per-metric floors must be explicit and finite")
+    return value
+
+
+def noise_bands(value):
+    """Calibrated bands keyed device -> model -> tier; any missing cell is allowed."""
+    if not isinstance(value, dict) or not set(value) <= set(DEVICES):
+        raise ValueError("noise bands are keyed by known physical device")
+    for models in value.values():
+        if not isinstance(models, dict) or not set(models) <= set(MODELS):
+            raise ValueError("noise bands are keyed by known model")
+        for tiers in models.values():
+            if not isinstance(tiers, dict) or not set(tiers) <= set(BAND_TIERS):
+                raise ValueError("noise bands are keyed by prompt tier")
+            for band in tiers.values():
+                noise_band(band)
     return value
 
 

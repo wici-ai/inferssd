@@ -391,7 +391,7 @@ def check_body(plan, report, app_id):
             "title": "Three device gates passed"
             if report["passed"]
             else "Device gate blocked",
-            "summary": "Exact reviewed head/base/candidate; one sample per side/cell. Observed slowdown blocks acceptance as inconclusive; no automatic retries. Formal samples 0.\n"
+            "summary": "Exact reviewed head/base/candidate; interleaved base/candidate pairs per cell, decided against calibrated noise bands. Regressed, needs-review, missing or failed cells block acceptance; no automatic retries. Formal samples 0.\n"
             + report.get("error", ""),
         },
         "_expected_app_id": positive(app_id, "device check App id"),

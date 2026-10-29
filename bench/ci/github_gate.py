@@ -190,9 +190,8 @@ def finalize(args):
         if report["passed"]
         else "Device gate blocked"
     )
-    limits = policy["thresholds"]
     summary = (
-        f"One sample per side/cell. Provisional decode{100 * limits['decode_regression_fraction']:g}%/TTFT{100 * limits['ttft_regression_fraction']:g}% policy; no statistical claim. "
+        "Legacy single-pair comparison per cell; any slower metric or different output needs review. "
         "Raw evidence and JSON comparison are in private workflow artifacts. Formal samples:0.\n\n"
     )
     if "error" in report:

@@ -66,7 +66,7 @@ prefill. It displays base, candidate and their ratio. Missing or invalid reports
 produce no benchmark verdict; missing metrics are shown as unavailable.
 `performance_acceptance=true`, when actually reported, means only that this
 single cell had valid evidence, no observed slowdown in those five metrics and
-positive cleanup. `inconclusive` records an observed slowdown; `failed` records
+positive cleanup. `needs-review` records an observed slowdown; `failed` records
 invalid or incomplete execution/evidence. Neither is reported as passing. Even
 a passed sample is not statistical proof of no regression, the formal 512/4K
 benchmark, or completion of the full device gate (`full_device_gate=false`).

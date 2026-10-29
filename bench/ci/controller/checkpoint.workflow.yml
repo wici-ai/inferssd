@@ -126,7 +126,7 @@ jobs:
               value = json.loads(report.read_text())
               if (value.get("purpose") != "integration-checkpoint" or value.get("device") != "cloud-5090"
                       or value.get("model") != "muse" or value.get("tier") != "512"
-                      or value.get("status") not in ("passed", "failed", "inconclusive")
+                      or value.get("status") not in ("passed", "failed", "needs-review")
                       or value.get("full_device_gate") is not False):
                   raise ValueError("unexpected checkpoint report identity or scope")
           except (OSError, ValueError, AttributeError):

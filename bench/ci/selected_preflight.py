@@ -7,7 +7,7 @@ import final_chat
 from ci.compare import comparable
 from ci.contract import digest, load, save
 from ci import mac_host_gate
-from ci.selection_contract import linux_stages, PERFORMANCE_MODE
+from ci.selection_contract import arm_prefix, linux_stages, PERFORMANCE_MODE, timed_protocol
 from ci.staged_benchmark import verify_stopped
 from ci.staged_smoke import smoke
 from ci.selected_receipt import receipt, mac_job_root
@@ -61,6 +61,36 @@ def launch(spec, side, *, required=False, job_root=None):
     return dict(spec, argv=list(short))
 
 
+TELEMETRY = "--ssd-telemetry"
+
+
+def arm_launch(spec, side, pair, *, required=False, job_root=None, functional=None):
+    """Derive one timed arm's launch from the single reviewed timed argv.
+
+    Every arm is a fresh server, and native telemetry uses O_EXCL, so each arm
+    gets its own event file: `<timed name>-r<pair>.jsonl` next to the reviewed
+    path. Nothing else differs between arms, and the timed argv must still match
+    its short preflight exactly apart from the telemetry file.
+    """
+    if type(pair) is not int or pair < 1:
+        raise ValueError("explicit timed arm pair required")
+    short = launch(spec, side, required=required, job_root=job_root)
+    argv = list(spec["argv"])
+    if TELEMETRY not in argv:
+        return dict(spec, argv=argv)
+    prefix = (job_root + "/work/" + side + "/") if job_root is not None else "/scratch/" + side + "/"
+    index = argv.index(TELEMETRY)
+    path = argv[index + 1] if argv.count(TELEMETRY) == 1 and index + 1 < len(argv) else ""
+    if (not path.startswith(prefix) or not path.endswith(".jsonl")
+            or str(PurePosixPath(path)) != path or any(part in (".", "..") for part in path.split("/"))):
+        raise ValueError("timed telemetry must be one canonical file in its side scratch directory")
+    argv[index + 1] = path[:-len(".jsonl")] + "-r" + str(pair) + ".jsonl"
+    others = [short["argv"], *([functional["argv"]] if functional is not None else [])]
+    if argv[index + 1] in {other[i + 1] for other in others for i, arg in enumerate(other[:-1]) if arg == TELEMETRY}:
+        raise ValueError("timed arm telemetry collides with another server's event file")
+    return dict(spec, argv=argv)
+
+
 def same_launch(functional, performance):
     return all(functional[key] == performance[key] for key in LAUNCH)
 
@@ -70,6 +100,7 @@ def declarations(config, manifest, needs):
     result = []
     platform = config["paths"]["platform"]
     expected = linux_stages(config, needs, ("base", "candidate")) if platform == "linux" else None
+    pairs = timed_protocol(config)["samples_per_side"]
     if platform == "darwin" and manifest.get("selection_resource_policy") != config["host"]["resources"]:
         raise ValueError("preflight requires the actual root Mac resource policy")
     for model in needs["models"]:
@@ -99,11 +130,15 @@ def declarations(config, manifest, needs):
                 stage = side + "-" + model + "-preflight-" + tier
                 if expected is not None and manifest["stages"].get(stage) != expected[stage]:
                     raise ValueError("root manifest does not authorize the exact preflight stage")
-                timed_stage = side + "-" + model + "-benchmark-" + tier
-                if expected is not None and manifest["stages"].get(timed_stage) != expected[timed_stage]:
-                    raise ValueError("root manifest does not authorize the exact timed stage")
-                short = launch(spec, side, required=config.get("validation_mode") == PERFORMANCE_MODE,
-                               job_root=mac_job_root(config["manifest_path"]) if platform == "darwin" else None)
+                job_root = mac_job_root(config["manifest_path"]) if platform == "darwin" else None
+                required = config.get("validation_mode") == PERFORMANCE_MODE
+                functional = data["models"][model]["smoke"] if side == "candidate" else None
+                for index in range(1, pairs + 1):
+                    timed_stage = arm_prefix(side, model, index) + "-benchmark-" + tier
+                    if expected is not None and manifest["stages"].get(timed_stage) != expected[timed_stage]:
+                        raise ValueError("root manifest does not authorize the exact timed stage")
+                    arm_launch(spec, side, index, required=required, job_root=job_root, functional=functional)
+                short = launch(spec, side, required=required, job_root=job_root)
                 pair["sides"][side] = dict(short, model=model, tier=tier, revision=data["revision"])
             # These fields are required by the already existing functional run.
             # Reading them now prevents a missing reuse declaration being hidden

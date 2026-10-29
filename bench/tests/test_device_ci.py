@@ -350,7 +350,7 @@ def test_observed_slowdown_blocks_both_windows_and_separate_ttft(synthetic):
     b["metrics"]["ttft_s"] *= 1.11
     result = compare.compare_pair(a, b, ar, br, policy)
     assert result["regressions"] == ["decode_first128_tps", "ttft_s"]
-    assert result["status"] == "inconclusive" and not result["passed"]
+    assert result["status"] == "needs-review" and not result["passed"]
     br["host"]["memory_budget_bytes"] += 1
     with pytest.raises(ValueError, match="resource"):
         compare.compare_pair(a, b, ar, br, policy)

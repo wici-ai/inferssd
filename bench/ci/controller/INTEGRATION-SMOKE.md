@@ -72,7 +72,7 @@ The report separates `functional`, `evidence`, `cleanup` and `performance`.
 `evidence=sealed-locally` means the evidence was hashed on the device. It must
 still be independently verified after artifact collection; only then can an
 operator report uploaded evidence as verified.
-`performance=not-measured` never overwrites an older inconclusive comparison.
+`performance=not-measured` never overwrites an older needs-review comparison.
 The raw evidence manifest hashes build, native, numerical and cleanup records.
 
 The report remains `purpose=integration-smoke`, `performance_acceptance=false`,

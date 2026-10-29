@@ -23,14 +23,25 @@ the reviewed change and authorize that head.
 The impact plan selects models and checks. Reviewed execution profiles may select
 cloud-5090, dgx-spark and local-mbp; each omitted device stays explicitly deferred.
 Required performance uses the fixed 512-token CI prompt
-(`bench/prompts/prompt-512.txt`) and decode 256, once per base and candidate on
-the same device/model/settings. It does not add 4K or formal benchmark samples.
-Functional-only success cannot satisfy a required performance comparison.
+(`bench/prompts/prompt-512.txt`) and decode 256, as two base/candidate pairs in
+ABBA order (base, candidate, candidate, base) on the same device/model/settings,
+decided against a calibrated noise band (see
+[performance acceptance](PERFORMANCE.md)). It does not add 4K or formal benchmark
+samples. Functional-only success cannot satisfy a required performance comparison.
+
+A Comment review whose complete body is `/ci calibrate` measures noise instead.
+It has the same authorization rules as `/ci test` and runs the exact head against
+itself: base and candidate are both that commit, built separately. Every enabled
+device and both models are selected even though the diff is empty, and each cell
+runs 4 pairs by default (`--calibration-pairs`, 2 to 4; the value is recorded
+when the review is queued). The report lists per-pair log ratios instead of a
+decision; `bench/ci/noise_band.py` turns one or more such reports into the
+`noise-bands.json` file kept next to the device profiles, for review.
 
 Review and run records are retained without replay; upgrading the operator
 never extends an old review to a new performance run. Submit a fresh `/ci test`
-Comment review to authorize the current head. `/ci cancel` is the cancellation
-command.
+or `/ci calibrate` Comment review to authorize the current head; the latest one
+on that head is used. `/ci cancel` is the cancellation command for either.
 
 The poller runs on the trusted preparation host with its existing gh login and
 reviewed source Git repository and explicit device profiles. Its service must
@@ -62,7 +73,8 @@ fetches a fork URL, pushes/copies a branch, checks out or executes candidate cod
 the preparation host. Before preparation and again after root staging, it checks
 the PR is open/nondraft with the fixed source base repository, the review remains present/authorized on
 the exact head, current base/merge identity and latest normal hosted CI success.
-Profile/policy changes cannot be silently applied to an existing authorization.
+Profile, policy or noise-band changes cannot be silently applied to an existing
+authorization.
 
 Background staging accepts already reviewed root transport or the fixed
 stager's restricted local socket client. An existing permitted narrow
@@ -102,13 +114,16 @@ recovery without URLs, credentials or response bodies.
 
 Results are visible to maintainers with access to the private controller
 repository, `wici-ai/inferssd-device-ci`. Open the exact parent run there, then
-read its Actions Summary. For each required executed model it shows base and PR
-0–128/128–256 decode token/s and `(PR / base - 1) * 100%`, plus TTFT, prefill
-and whole decode. A positive throughput change means faster; a lower TTFT is
-better. Missing, failed and inconclusive performance stays non-passing. Device
+read its Actions Summary. For each required executed cell it lists, per metric
+(0–128/128–256 and whole decode token/s, TTFT and native prefill), the base and
+PR values of every pair, the change of their geometric mean
+(`(PR / base - 1) * 100%`), the per-pair log ratio `d`, its mean, the noise
+threshold and the result, followed by the cell decision and its reasons. A
+positive throughput change means faster; a lower TTFT is better. Missing,
+failed, regressed and needs-review performance stays non-passing. Device
 deferrals and full impact coverage are reported separately from each execution scope.
 The `selected-aggregate-RUN-ATTEMPT` artifact contains `aggregate.json`;
-`selected-control-RUN-ATTEMPT` retains the raw two-sided requests, timestamps,
+`selected-control-RUN-ATTEMPT` retains every arm's raw requests, timestamps,
 settings/source/prompt identities, observations and cleanup evidence.
 
 These request metrics exclude model/vocabulary loading before server readiness.
@@ -117,7 +132,7 @@ cache settings. Mac uses the root executor's sampled worker physical footprint,
 process count and host free-memory guards; worker RSS is diagnostic only. Its receipts
 do not assert Linux cgroup hard UMA or swap isolation.
 
-Before each Mac smoke, short preflight and timed arm launches, the coordinator
+Before each Mac smoke, short preflight and timed arm launch, the coordinator
 takes exactly two host snapshots separated by a fixed 2-second wait. Collection,
 validation or quiet-policy failure refuses launch and retains `host-quiet.json`
 with raw observations. There is no automatic retry. Existing swap settings are
@@ -137,11 +152,12 @@ The fixed quiet policy is:
 
 Snapshots before/after the request and after cleanup retain timed
 swap, compression, pressure and process activity. Timed swap activity, abnormal
-pressure or excess non-CI CPU flags the comparison as inconclusive; compression
-above 64 MiB with abnormal pressure is also flagged, while compression alone is
-not. Timed checks do not apply the quiet free-memory or RSS thresholds. A base/PR
-difference above 1 GiB in the final prelaunch free-plus-inactive sample also makes
-the comparison inconclusive. Measured slowdowns remain visible and non-passing.
+pressure or excess non-CI CPU flags that pair; compression above 64 MiB with
+abnormal pressure is also flagged, while compression alone is not. Timed checks
+do not apply the quiet free-memory or RSS thresholds. A difference above 1 GiB
+between a pair's two final prelaunch free-plus-inactive samples also flags the
+pair. A flagged pair makes an otherwise passing cell `needs-review`; it never
+hides a `regressed` result, and measured slowdowns remain visible.
 Swap or pressure may be induced by the model; these observations do not
 automatically establish external interference or justify a retry. This is
 resource sampling, not strict isolation or proof of identical cache conditions.

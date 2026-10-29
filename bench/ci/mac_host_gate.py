@@ -131,8 +131,12 @@ def retained_arm(folder, expected):
 
 
 def pair(compared, base_summary, candidate_summary):
-    """Keep all measured values and slowdowns; environment flags only demote."""
-    if (compared.get("status") not in ("passed", "inconclusive")
+    """Check one base/candidate pair of an interleaved cell.
+
+    Keep all measured values and slowdowns; environment flags only demote a
+    passing pair to needs-review, and the cell decision reads them per pair.
+    """
+    if (compared.get("status") not in ("passed", "needs-review")
             or not _same(base_summary.get("policy"), candidate_summary.get("policy"))):
         raise ValueError("Mac pair requires matching reconstructed host policies")
     reasons = []
@@ -146,12 +150,12 @@ def pair(compared, base_summary, candidate_summary):
     difference = abs(candidate_summary["prelaunch_free_inactive_bytes"] - base_summary["prelaunch_free_inactive_bytes"])
     if difference > base_summary["policy"]["pair_free_tolerance_bytes"]:
         reasons.append("prelaunch-free-inactive-difference")
-    environment = dict(schema_version=1, status="inconclusive" if reasons else "passed", reasons=reasons,
+    environment = dict(schema_version=1, status="needs-review" if reasons else "passed", reasons=reasons,
         base=base_summary, candidate=candidate_summary, prelaunch_free_difference_bytes=difference,
         compression_delta_difference_bytes=candidate_summary["timed"]["compression_delta_bytes"] - base_summary["timed"]["compression_delta_bytes"],
         interpretation="Sampled host conditions, not isolation or equal-cache proof. Swap/pressure may be model-induced; no automatic attribution to external interference, exemption of measured slowdowns, or retry.")
     result = copy.deepcopy(compared)
     result["environment"] = copy.deepcopy(environment)
     if reasons:
-        result.update(passed=False, status="inconclusive", diagnostic_required=True)
+        result.update(passed=False, status="needs-review", diagnostic_required=True)
     return result

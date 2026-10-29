@@ -40,7 +40,14 @@ It contains reviewed device templates, model/settings identities and a profile:
 ```
 
 The placeholder values above are not executable configuration. Every enabled
-device needs an explicit profile. `--execution-devices` can select cloud-5090,
+device needs an explicit profile. The same directory may hold `noise-bands.json`,
+the calibrated noise bands printed by `noise_band.py` (see
+[performance acceptance](PERFORMANCE.md)). Preparation validates it strictly,
+refuses a symlink, and treats a missing file as no bands. The bands are sealed
+into every device's `config.json` as `noise_bands`, and `envelope.json` carries
+their `noise_bands_sha256`. Neither the root stager nor the installed root policy
+reads or pins them, so updating the bands needs no controller or root policy
+change. `--execution-devices` can select cloud-5090,
 dgx-spark and local-mbp. An optional per-device `job_id` must be fresh, distinct and 32 lowercase
 hex characters; otherwise preparation generates one. Old template job/source
 identities are replaced with the exact new identities. When the impact plan
@@ -50,9 +57,12 @@ settings payload hashes must match their declarations.
 Each benchmark declares its timed `argv` and an explicit `preflight_argv`. They
 differ only in the single `--ssd-telemetry` destination, using distinct canonical
 files in that side's private scratch directory. Every other argument remains
-identical. Existing events are retained; the telemetry writer's exclusive-create
-contract is preserved. An identical functional launch can supply the short
-preflight without another request.
+identical. Each timed arm is a fresh server, so the controller gives arm k its
+own event file by inserting `-r<k>` before `.jsonl` in the timed name (for
+example `deepseek-benchmark-512-r2.jsonl`); it refuses a derived name that equals
+the preflight or functional event file. Existing events are retained; the
+telemetry writer's exclusive-create contract is preserved. An identical
+functional launch can supply the short preflight without another request.
 
 Prepare a reviewable package without connecting to a device:
 
@@ -73,11 +83,21 @@ file, including files marked `export-ignore`; no checkout/filter/hook runs.
 `envelope.json` retains the canonical impact plan, including required Mac and
 performance cells. Separate `execution_devices` and `validation_mode` limit this
 run to the declared devices and the 512-tier performance comparison.
-Each required executed model runs decode 256 once per side; 4K and omitted devices'
-requirements remain explicit coverage gaps. Envelopes prepared with the older
+Each required executed model runs decode 256 as two base/candidate pairs in ABBA
+order; the sealed `performance_protocol` records the pair count and order, and
+the Linux stage allowlist contains one `<side>-<model>-r<k>-benchmark-<tier>`
+stage per arm. 4K and omitted devices' requirements remain explicit coverage
+gaps. Envelopes prepared with the older
 `--validation-mode functional-numerical` keep that meaning. The complete workflow input must fit
 60 KiB; exceeding that bound refuses without truncation. The report cannot claim
 PR check publication or full impact coverage when required devices/4K work is absent.
+
+`--calibration-pairs N` (2 to 4) prepares an A/A noise calibration instead. Base,
+head and candidate must be the same commit; the plan then selects every enabled
+device and both models although the diff is empty, both sides are exported and
+built separately from that commit, and each cell runs N pairs. The root policy
+stays the same: the root stager admits the fixed gate protocol, or its
+calibration form only when both sides have the same revision.
 
 Mac profiles use `broker_device: "mac-m5-max"` and a pinned `machine_identity`
 with the SHA256 of the uppercase hardware UUID, hardware model and CPU brand,

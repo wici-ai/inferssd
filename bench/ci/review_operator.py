@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poll exact-head `/ci test` PR reviews on the trusted preparation host."""
+"""Poll exact-head `/ci test` and `/ci calibrate` PR reviews on the trusted preparation host."""
 
 import argparse
 from datetime import datetime
@@ -20,6 +20,7 @@ from ci import operator_prepare as prepare
 from ci.contract import digest, load, policy_read, revision
 from ci.impact import device_requirements, fingerprint, plan
 from ci.private_controller import current_ci
+from ci.selection_contract import CALIBRATION_PAIRS, DEFAULT_CALIBRATION_PAIRS
 
 
 class Stale(ValueError):
@@ -56,9 +57,19 @@ def marker(review):
     if review.get("state") not in ("COMMENTED", "APPROVED"):
         return None
     # A whole comment avoids authorizing quoted examples or incidental prose.
-    return {"/ci test": "run", "/ci cancel": "cancel"}.get(
+    return {"/ci test": "run", "/ci calibrate": "calibrate", "/ci cancel": "cancel"}.get(
         review.get("body", "").strip()
     )
+
+
+AUTHORIZING = ("run", "calibrate")
+
+
+def prepared_identity(identity):
+    """A calibration measures the reviewed head against itself."""
+    if identity["command"] == "calibrate":
+        return {name: identity["head"] for name in ("base", "head", "candidate")}
+    return {name: identity[name] for name in ("base", "head", "candidate")}
 
 
 def writable(api, repository, login):
@@ -97,8 +108,9 @@ def authorization(
         raise Stale("review is missing or ambiguous")
     review = found[0]
     login = review.get("user", {}).get("login")
+    command = marker(review)
     if (
-        marker(review) != "run"
+        command not in AUTHORIZING
         or review.get("commit_id") != actual
         or not writable(api, repo, login)
     ):
@@ -136,6 +148,7 @@ def authorization(
         base=base,
         head=actual,
         candidate=candidate,
+        command=command,
     )
     if require_ci:
         try:
@@ -203,12 +216,23 @@ def fetch_objects(args, identity, repository):
     )
 
 
+def trusted_inputs(args):
+    """Operator data an authorization is bound to: profiles, policy and noise bands."""
+    return dict(inputs_sha256=digest(args.inputs), policy_sha256=digest(args.policy),
+                noise_bands_sha256=fingerprint(prepare.operator_bands(args.inputs)))
+
+
+def trusted_inputs_changed(args, record):
+    return any(record.get(key) != value for key, value in trusted_inputs(args).items())
+
+
 def same_authorization(old, new):
-    if any(
+    # Records written before `/ci calibrate` existed were all `/ci test` runs.
+    if old.get("command", "run") != new["command"] or any(
         old[name] != new[name]
         for name in ("repository", "pr", "review_id", "base", "head", "candidate")
     ):
-        raise Stale("prepared source/base changed; a new review is required")
+        raise Stale("prepared source/base/command changed; a new review is required")
 
 
 def review_scope(args, policy, identity, profiles):
@@ -238,17 +262,16 @@ def review_scope(args, policy, identity, profiles):
             else prepare.LINUX_DEVICES
         )
     fetch_objects(args, identity, policy["repository"])
+    sources = prepared_identity(identity)
     paths = []
     # Include merge-resolution paths, exactly as the preparation plan does.
-    for target in (identity["head"], identity["candidate"]):
+    for target in (sources["head"], sources["candidate"]):
         changed = prepare.git(
             args.source, "diff", "--name-only", "-z", "--no-renames",
-            "--no-ext-diff", identity["base"], target,
+            "--no-ext-diff", sources["base"], target,
         )
         paths.extend(item.decode("utf-8") for item in changed.split(b"\0") if item)
-    impact = plan(paths, policy, **{
-        name: identity[name] for name in ("base", "head", "candidate")
-    })
+    impact = plan(paths, policy, calibration=identity["command"] == "calibrate", **sources)
     execution = [
         device for device in enabled if device_requirements(impact, device)["models"]
     ]
@@ -330,11 +353,8 @@ def monitor(args, api, policy, path, record):
             max_age=args.max_authorization_age_s,
         )
         same_authorization(record, fresh)
-        if (
-            digest(args.inputs) != record["inputs_sha256"]
-            or digest(args.policy) != record["policy_sha256"]
-        ):
-            raise Stale("trusted profile/policy changed during preparation")
+        if trusted_inputs_changed(args, record):
+            raise Stale("trusted profile/policy changed (profiles, policy or noise bands) during preparation")
         if time.time() - record["dispatched_at"] > args.run_timeout_s:
             raise Stale("recorded parent exceeded its finite deadline")
     except (ValueError, RuntimeError) as error:
@@ -384,16 +404,16 @@ def advance(args, api, policy, path, record):
             max_age=args.max_authorization_age_s,
         )
         same_authorization(record, fresh)
-        if (
-            digest(args.inputs) != record["inputs_sha256"]
-            or digest(args.policy) != record["policy_sha256"]
-        ):
-            raise Stale("trusted profile/policy changed; authorize a fresh attempt")
+        if trusted_inputs_changed(args, record):
+            raise Stale("trusted profile/policy changed (profiles, policy or noise bands); authorize a fresh attempt")
         prepared = path.parent / path.stem / "prepared"
         profiles = load(args.inputs)
         if digest(args.inputs) != record["inputs_sha256"]:
             raise Stale("trusted profiles changed while reading execution scope")
         execution, impact = review_scope(args, policy, fresh, profiles)
+        pairs = record.get("calibration_pairs") if fresh["command"] == "calibrate" else None
+        if fresh["command"] == "calibrate" and pairs not in CALIBRATION_PAIRS:
+            raise Stale("calibration record lacks its bounded pair count")
         if record["status"] == "queued":
             attempted = True
             prepared.parent.mkdir(mode=0o700, exist_ok=True)
@@ -406,7 +426,8 @@ def advance(args, api, policy, path, record):
                     policy=args.policy,
                     execution_devices=execution,
                     gh=args.gh,
-                    **{k: fresh[k] for k in ("base", "head", "candidate")},
+                    calibration_pairs=pairs,
+                    **prepared_identity(fresh),
                 ),
                 api=api,
             )
@@ -426,11 +447,8 @@ def advance(args, api, policy, path, record):
             max_age=args.max_authorization_age_s,
         )
         same_authorization(record, fresh)
-        if (
-            digest(args.inputs) != record["inputs_sha256"]
-            or digest(args.policy) != record["policy_sha256"]
-        ):
-            raise Stale("trusted profile/policy changed before dispatch")
+        if trusted_inputs_changed(args, record):
+            raise Stale("trusted profile/policy changed (profiles, policy or noise bands) before dispatch")
         prepared_scope(prepared, execution, impact)
         save_record(path, record, "dispatching")
         run = prepare.dispatch(SimpleNamespace(prepared=prepared, gh=args.gh), api=api)
@@ -498,7 +516,7 @@ def tick(args, api=None):
         runs = [
             r
             for r in reviews
-            if marker(r) == "run"
+            if marker(r) in AUTHORIZING
             and r.get("commit_id") == pr["head"]["sha"]
             and writable(api, policy["repository"], r.get("user", {}).get("login"))
         ]
@@ -525,9 +543,11 @@ def tick(args, api=None):
             schema_version=1,
             **value,
             created_at=time.time(),
-            inputs_sha256=digest(args.inputs),
-            policy_sha256=digest(args.policy),
+            **trusted_inputs(args),
         )
+        if value["command"] == "calibrate":
+            # Bound when queued so a restarted poller cannot change the run.
+            record["calibration_pairs"] = getattr(args, "calibration_pairs", DEFAULT_CALIBRATION_PAIRS)
         save_record(path, record, "queued")
         records.append((path, record))
     if not active:
@@ -552,14 +572,16 @@ def main():
     parser.add_argument("--poll-interval-s", type=int, default=30)
     parser.add_argument("--max-authorization-age-s", type=int, default=86400)
     parser.add_argument("--run-timeout-s", type=int, default=14400)
+    parser.add_argument("--calibration-pairs", type=int, default=DEFAULT_CALIBRATION_PAIRS)
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     if (
         not 10 <= args.poll_interval_s <= 300
         or not 60 <= args.run_timeout_s <= 14400
         or not 60 <= args.max_authorization_age_s <= 604800
+        or args.calibration_pairs not in CALIBRATION_PAIRS
     ):
-        parser.error("finite polling/authorization/run limits required")
+        parser.error("finite polling/authorization/run/calibration limits required")
     args.state = args.state.resolve()
     args.state.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = args.state.lstat()

@@ -11,20 +11,73 @@ from pathlib import PurePosixPath
 
 import final_chat
 
-from ci.contract import DEVICES, digest, load, policy_read
-from ci.impact import CASES, device_requirements, fingerprint, validate
+from ci.contract import DEVICES, digest, load, noise_bands, policy_read
+from ci.impact import CALIBRATION, CASES, device_requirements, fingerprint, validate
 
 
 JOB = re.compile(r"[0-9a-f]{32}")
 OPERATOR_DEVICES = DEVICES
 FUNCTIONAL_MODE = "functional-numerical"
 PERFORMANCE_MODE = "functional-numerical-performance"
+GATE_PAIRS = 2
+CALIBRATION_PAIRS = range(2, 5)  # 4 pairs per cell already uses ~100 of the 120 child minutes
+DEFAULT_CALIBRATION_PAIRS = 4
 
 
-def performance_protocol():
-    """The operator performance checkpoint is fixed, and is never a formal sample."""
-    return dict(tier="512", prompt_sha256=final_chat.PROMPTS["512"][1],
-                output_tokens=256, samples_per_side=1)
+def performance_protocol(calibration_pairs=None):
+    """The fixed operator performance protocol; it never adds formal samples.
+
+    Each timed cell runs `samples_per_side` interleaved base/candidate pairs in
+    ABBA order, every arm a fresh server with one completion. A calibration run
+    uses the same protocol with base and candidate at one revision and a
+    bounded, explicit number of pairs.
+    """
+    value = dict(tier="512", prompt_sha256=final_chat.PROMPTS["512"][1], output_tokens=256,
+                 samples_per_side=GATE_PAIRS, order="ABBA", purpose="regression-gate")
+    if calibration_pairs is not None:
+        if type(calibration_pairs) is not int or calibration_pairs not in CALIBRATION_PAIRS:
+            raise ValueError("noise calibration needs an explicit pair count from %d to %d"
+                             % (CALIBRATION_PAIRS[0], CALIBRATION_PAIRS[-1]))
+        value.update(samples_per_side=calibration_pairs, purpose="noise-calibration")
+    return value
+
+
+def protocol_checked(protocol, *, calibration):
+    """Accept only the fixed gate protocol, or its calibration form for an A/A plan."""
+    if (not isinstance(protocol, dict) or type(protocol.get("output_tokens")) is not int
+            or type(protocol.get("samples_per_side")) is not int):
+        raise ValueError("operator performance requires the fixed interleaved 512/256 protocol")
+    try:
+        expected = performance_protocol(protocol["samples_per_side"] if calibration else None)
+    except ValueError as error:
+        raise ValueError("operator performance requires the fixed interleaved 512/256 protocol") from error
+    if protocol != expected:
+        raise ValueError("operator performance requires the fixed interleaved 512/256 protocol")
+    return protocol
+
+
+def timed_protocol(config):
+    """The sealed protocol of an operator run; other configurations use the gate."""
+    protocol = config.get("performance_protocol")
+    if protocol is None:
+        return performance_protocol()
+    return protocol_checked(protocol, calibration=config.get("selection_plan", {}).get("purpose") == CALIBRATION)
+
+
+def sealed_bands(config):
+    """Noise bands sealed into this job by the operator; none means every cell needs review.
+
+    Operator performance configs always carry the field (possibly empty), so a
+    dropped field cannot be confused with an explicit empty calibration set.
+    """
+    return noise_bands(config.get("noise_bands", {}))
+
+
+def arm_prefix(side, model, pair):
+    """Stage prefix of one timed arm; the broker stage is `<prefix>-benchmark-<tier>`."""
+    if side not in ("base", "candidate") or type(pair) is not int or pair < 1:
+        raise ValueError("explicit timed arm side and pair required")
+    return side + "-" + model + "-r" + str(pair)
 
 
 def execution_scope(value):
@@ -80,12 +133,14 @@ def requirements(config):
         raise ValueError("unknown physical device")
     needs = runtime_requirements(config)
     scope = execution_scope(config)
+    calibration = plan["purpose"] == CALIBRATION
+    if calibration and (scope is None or scope["validation_mode"] != PERFORMANCE_MODE):
+        raise ValueError("noise calibration requires the explicit operator performance scope")
     if scope is not None and scope["validation_mode"] == PERFORMANCE_MODE:
-        protocol = config.get("performance_protocol")
-        if (protocol != performance_protocol()
-                or type(protocol.get("output_tokens")) is not int
-                or type(protocol.get("samples_per_side")) is not int):
-            raise ValueError("operator performance requires the fixed Azure 512/256 single-sample protocol")
+        protocol_checked(config.get("performance_protocol"), calibration=calibration)
+        if "noise_bands" not in config:
+            raise ValueError("operator performance requires explicitly sealed noise bands")
+    sealed_bands(config)
     if not needs["models"]:
         raise ValueError("unselected device must not be dispatched")
     if (config.get("schema_version") != 1 or config.get("purpose") != "selected-integration"
@@ -164,6 +219,7 @@ def linux_stages(config, needs, sides):
     def add(name, kind, side, executable, cwd, gpu):
         stages[name] = dict(kind=kind, side=side, executables=[executable], cwd=cwd, gpu=gpu)
 
+    pairs = timed_protocol(config)["samples_per_side"]
     for side in sides:
         spec = config["sides"][side]
         paths, build = spec["paths"], spec["build"]
@@ -182,7 +238,8 @@ def linux_stages(config, needs, sides):
                     add("candidate-observations-" + model, "test", side, "/usr/bin/cat", data["smoke"]["observations"]["cwd"], False)
             for tier, arm in data.get("benchmarks", {}).items():
                 add(side + "-" + model + "-preflight-" + tier, "server", side, binary, arm["cwd"], True)
-                add(side + "-" + model + "-benchmark-" + tier, "server", side, binary, arm["cwd"], True)
+                for pair in range(1, pairs + 1):
+                    add(arm_prefix(side, model, pair) + "-benchmark-" + tier, "server", side, binary, arm["cwd"], True)
     root = config["sides"]["candidate"]["paths"]["frozen"]
     for case in needs["numerical"]:
         add("candidate-numerical-" + case, "test", "candidate", root + "/bin/" + CASES[case][0], config["numerical"]["cwd"], True)

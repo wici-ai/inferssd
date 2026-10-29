@@ -12,6 +12,8 @@ from ci.contract import DEVICES, MODELS, revision
 
 
 RULES_VERSION = 1
+SELECTION = "impact-selection"
+CALIBRATION = "noise-calibration"
 CUDA = DEVICES[:2]
 MAC = (DEVICES[2],)
 # Each ID resolves to a fixed trusted invocation in staged_numerical.py.
@@ -102,14 +104,28 @@ def numerical_cases(device, models):
     return sorted(cases)
 
 
-def plan(paths, policy, *, base, head, candidate):
+def plan(paths, policy, *, base, head, candidate, calibration=False):
+    """Select cells from changed paths, or every cell for an A/A noise calibration.
+
+    A calibration measures one exact revision against itself, so its diff is
+    empty. It selects every device and model with the 512 performance tier.
+    """
     paths = paths_checked(paths)
     identities = {k: revision(v) for k, v in (
         ("base", base), ("head", head), ("candidate", candidate))}
+    if type(calibration) is not bool:
+        raise ValueError("explicit calibration flag required")
     cells = {(d, m): dict(device=d, model=m, required=False, reasons=[],
                           numerical=[], functional=False,
                           performance=dict(required=False, tiers=[], output_tokens=256))
              for d in DEVICES for m in MODELS}
+    if calibration:
+        if paths or len(set(identities.values())) != 1:
+            raise ValueError("noise calibration measures one exact revision with an empty diff")
+        for cell in cells.values():
+            cell.update(required=True, functional=True)
+            cell["reasons"].append(dict(rule="A/A noise calibration of one revision"))
+            cell["performance"].update(required=True, tiers=["512"])
     for path in paths:
         if documentation(path, policy):
             continue
@@ -133,7 +149,7 @@ def plan(paths, policy, *, base, head, candidate):
             cell["numerical"].sort()
         else:
             cell["reason"] = "not-required: no affected path"
-    return dict(schema_version=1, purpose="impact-selection", rules_version=RULES_VERSION,
+    return dict(schema_version=1, purpose=CALIBRATION if calibration else SELECTION, rules_version=RULES_VERSION,
                 repository=policy["repository"], **identities, changed_paths=paths,
                 changed_paths_sha256=fingerprint(paths), cells=list(cells.values()),
                 formal_samples=0)
@@ -142,7 +158,7 @@ def plan(paths, policy, *, base, head, candidate):
 def validate(value, policy):
     if not isinstance(value, dict):
         raise ValueError("impact selection plan required")
-    expected = plan(value["changed_paths"], policy, **{
+    expected = plan(value["changed_paths"], policy, calibration=value.get("purpose") == CALIBRATION, **{
         key: value[key] for key in ("base", "head", "candidate")})
     if value != expected:
         raise ValueError("selection differs from the trusted rules/source identities")

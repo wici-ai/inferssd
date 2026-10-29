@@ -1,6 +1,11 @@
-"""Block invalid evidence, changed output or slowdown; n=1 is not a variance test."""
+"""Compare interleaved base/candidate pairs against calibrated noise bands.
+
+Invalid evidence fails. A cell regresses only when its mean paired log ratio is
+beyond the measured noise threshold and every pair is slower.
+"""
 
 import argparse
+from decimal import Context, Decimal
 import hashlib
 import importlib.util
 import json
@@ -12,7 +17,7 @@ BENCH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BENCH))
 import compare_outputs
 import run_final
-from ci.contract import DEVICES, MODELS, digest, load, policy_read, runner_config, save
+from ci.contract import DEVICES, MODELS, PERFORMANCE_METRICS, digest, load, noise_bands, policy_read, runner_config, save
 
 _spec = importlib.util.spec_from_file_location(
     "inferssd_comparison_test_gate", BENCH / "device/gate.py"
@@ -20,24 +25,79 @@ _spec = importlib.util.spec_from_file_location(
 GATE = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(GATE)
 
-METRICS = (
-    "decode_first128_tps", "decode_second128_tps", "decode_tps", "ttft_s",
-    "server_prefill_tps",
+METRICS = PERFORMANCE_METRICS
+SIDES = ("base", "candidate")
+ORDER = "ABBA"
+REGRESSION_GATE = "regression-gate"
+CALIBRATION = "noise-calibration"
+# Most severe first. "calibrated" only appears in A/A calibration runs.
+SEVERITY = ("failed", "regressed", "needs-review", "calibrated", "passed")
+SUCCESS = ("passed", "calibrated")
+PAIR_INTERPRETATION = (
+    "One base/candidate pair, each arm a fresh server with one completion. "
+    "needs-review here marks any slower metric or different generated tokens in this "
+    "pair alone; a cell is decided from all of its pairs together. OS cache treatment "
+    "is recorded, not assumed cold."
 )
 INTERPRETATION = (
-    "One attempt per side/cell. Passed means no observed slowdown in these samples, "
-    "not statistical proof of no regression. Any slowdown is inconclusive and blocks "
-    "acceptance pending a bounded independent diagnosis; no automatic retries or "
-    "selection of a best attempt. OS cache treatment is recorded, not assumed cold."
-    " Different generated token sequences are inconclusive even when every metric improves."
+    "Each cell runs interleaved base/candidate pairs in ABBA order (base, candidate, "
+    "candidate, base), each arm a fresh server with one completion. Every arm is kept; "
+    "nothing is retried or selected. For each metric, d is the per-pair log ratio, signed "
+    "so that a positive value means the candidate is slower. The cell is regressed when "
+    "the mean d is above the calibrated noise threshold and every pair is slower. It needs "
+    "review when the threshold is exceeded but the pairs disagree, generated tokens differ, "
+    "no noise band matches the measured conditions, or the host check flagged an arm. "
+    "Otherwise it passes: no slowdown beyond measured noise, which is not proof that none "
+    "exists. OS cache treatment is recorded, not assumed cold."
+)
+CALIBRATION_INTERPRETATION = (
+    "Calibration run: base and candidate are the same revision, so d measures run-to-run "
+    "noise. No pass or regression decision is made; the per-pair values feed the noise "
+    "bands used by later comparisons."
 )
 
 
 def outcome(rows):
     statuses = {row["status"] for row in rows}
-    if "failed" in statuses:
-        return "failed"
-    return "inconclusive" if "inconclusive" in statuses else "passed"
+    unknown = statuses - set(SEVERITY)
+    if unknown:
+        raise ValueError("unknown cell status: " + ", ".join(sorted(map(str, unknown))))
+    return next((status for status in SEVERITY if status in statuses), "passed")
+
+
+def schedule(pairs):
+    """Executed arm order: pair k runs base first when k is odd, candidate first otherwise."""
+    if type(pairs) is not int or pairs < 1:
+        raise ValueError("positive pair count required")
+    return [(k, side) for k in range(1, pairs + 1) for side in (SIDES if k % 2 else SIDES[::-1])]
+
+
+def arm_name(k, side):
+    return "r" + str(k) + "/" + side
+
+
+# Device runs and the hosted replay use different C math libraries. Decimal's
+# ln/exp are correctly rounded in software, so every derived value is
+# bit-identical wherever the evidence is recomputed.
+EXACT = Context(prec=40)
+
+
+def ln(value):
+    return float(EXACT.ln(Decimal(value)))
+
+
+def exp(value):
+    return float(EXACT.exp(Decimal(value)))
+
+
+def log_ratio(metric, base, candidate):
+    """Signed so that a positive value means the candidate is slower."""
+    ratio = candidate / base
+    if not math.isfinite(ratio) or ratio <= 0:
+        raise ValueError("non-finite or underflowed metric ratio " + metric)
+    value = ln(ratio)
+    # Adding 0.0 turns a negated zero into plain 0.0 for readable reports.
+    return (value if metric == "ttft_s" else -value) + 0.0
 
 
 def validate_metrics(result):
@@ -85,6 +145,15 @@ def comparable(receipt, comparison_binding=None, side=None):
             Path(x["path"]).name for x in receipt["build"]["loaded_libraries"]
         ),
     }
+
+
+def conditions_digest(conditions):
+    """SHA-256 of canonical JSON, as for the plan and sealed noise bands.
+
+    Applied to `comparable()` it is the measured-conditions identity that a
+    noise band is calibrated under.
+    """
+    return hashlib.sha256(json.dumps(conditions, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
 def cell(root, model, side, tier, revision, device, *, expected_order=None):
@@ -190,7 +259,7 @@ def compare_pair(base, head, base_receipt, head_receipt, policy, *, comparison_b
             failures.append(key)
     return {
         "passed": not failures and output_workload["same_tokens"],
-        "status": "inconclusive" if failures or difference is not None else "passed",
+        "status": "needs-review" if failures or difference is not None else "passed",
         "evidence_valid": True,
         "metrics": metrics,
         # Retain the old field for consumers; these are observations, not a
@@ -199,20 +268,143 @@ def compare_pair(base, head, base_receipt, head_receipt, policy, *, comparison_b
         "observed_slowdowns": failures,
         "diagnostic_required": bool(failures) or difference is not None,
         "output_workload": output_workload,
-        "interpretation": INTERPRETATION,
+        "interpretation": PAIR_INTERPRETATION,
         "actual_input_tokens": head["input_tokens"],
         "measurement_identity": {
             "prompt_sha256": base["prompt_sha256"],
             "prompt_ids_sha256": hashlib.sha256(json.dumps(base["prompt_ids"], separators=(",", ":")).encode()).hexdigest(),
             "input_tokens": base["input_tokens"],
             "output_tokens": 256,
-            "conditions_sha256": hashlib.sha256(json.dumps(conditions, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest(),
+            "conditions_sha256": conditions_digest(conditions),
         },
         "prefill_tps": {
             "base": base["metrics"]["server_prefill_tps"],
             "candidate": head["metrics"]["server_prefill_tps"],
         },
     }
+
+
+def first_difference(reference, tokens):
+    return next((i for i, (before, after) in enumerate(zip(reference, tokens)) if before != after), None)
+
+
+def compare_series(results, receipts, pairs, policy, *, cell, protocol, bands):
+    """Decide one cell from every planned arm; nothing is dropped, retried or selected.
+
+    `results` and `receipts` map (pair, side) to each arm's verified measurement and
+    comparison receipt. `pairs` holds the per-pair `compare_pair` results in pair
+    order (with the Mac host check applied). `cell` names the device, model, tier,
+    job and both source revisions. `bands` are the noise bands sealed into the job;
+    a cell without one cannot pass or regress. Any inconsistency is invalid evidence.
+    """
+    policy_read(policy)
+    noise_bands(bands)
+    thresholds = policy["thresholds"]
+    count, purpose = protocol.get("samples_per_side"), protocol.get("purpose")
+    if (protocol.get("order") != ORDER or purpose not in (REGRESSION_GATE, CALIBRATION)
+            or type(count) is not int or count < 2):
+        raise ValueError("timed cells require the interleaved paired protocol")
+    if set(cell) != {"device", "model", "tier", "job_id", "base", "candidate"}:
+        raise ValueError("series cell identity is incomplete")
+    if purpose == CALIBRATION and cell["base"] != cell["candidate"]:
+        raise ValueError("noise calibration compares one revision with itself")
+    if purpose == REGRESSION_GATE and (thresholds["pairs"] != count or thresholds["order"] != ORDER):
+        raise ValueError("decision policy and executed protocol differ")
+    order = schedule(count)
+    if (set(results) != set(order) or set(receipts) != set(order)
+            or not isinstance(pairs, list) or len(pairs) != count):
+        raise ValueError("every planned arm and pair is required; none may be dropped or added")
+    previous = None
+    for key in order:
+        start, end = results[key].get("start_ns"), results[key].get("end_ns")
+        if (type(start) is not int or type(end) is not int or start > end
+                or (previous is not None and start < previous)):
+            raise ValueError("timed arms did not run in the declared interleaved order")
+        previous = end
+    servers = [json.dumps(receipts[key]["server"], sort_keys=True) for key in order]
+    if len(set(servers)) != len(servers):
+        raise ValueError("timed arms reused a server process")
+    identity = pairs[0].get("measurement_identity")
+    reasons, host = [], []
+    for k, pair in enumerate(pairs, 1):
+        if pair.get("evidence_valid") is not True or pair.get("measurement_identity") != identity:
+            raise ValueError("pair evidence or measurement conditions differ within the cell")
+        for metric in METRICS:
+            if any(pair["metrics"][metric][side] != results[k, side]["metrics"][metric] for side in SIDES):
+                raise ValueError("pair evidence differs from its retained arms")
+        if pair["output_workload"]["same_tokens"] != (results[k, "base"]["tokens"] == results[k, "candidate"]["tokens"]):
+            raise ValueError("pair token evidence differs from its retained arms")
+        environment = pair.get("environment")
+        if environment is not None:
+            if environment.get("status") not in ("passed", "needs-review"):
+                raise ValueError("unrecognized host check status")
+            host.extend("r" + str(k) + ":" + reason for reason in environment["reasons"])
+    reference = results[1, "base"]["tokens"]
+    differences = []
+    for k, side in order:
+        index = first_difference(reference, results[k, side]["tokens"])
+        if index is not None:
+            differences.append(dict(arm=arm_name(k, side), first_difference_one_based=index + 1,
+                                    reference_token=reference[index], token=results[k, side]["tokens"][index]))
+    band = bands.get(cell["device"], {}).get(cell["model"], {}).get(cell["tier"])
+    if purpose == CALIBRATION:
+        noise = None
+    elif band is None:
+        noise = dict(status="missing")
+        reasons.append("no-noise-band")
+    else:
+        noise = dict({key: value for key, value in band.items() if key != "sigma_log"},
+                     status="matched" if band["conditions_sha256"] == identity["conditions_sha256"] else "conditions-differ")
+        if noise["status"] != "matched":
+            reasons.append("noise-band-conditions-differ")
+    metrics, regressions = {}, []
+    for metric in METRICS:
+        base = [results[k, "base"]["metrics"][metric] for k in range(1, count + 1)]
+        candidate = [results[k, "candidate"]["metrics"][metric] for k in range(1, count + 1)]
+        d = [log_ratio(metric, before, after) for before, after in zip(base, candidate)]
+        mean = sum(d) / count
+        entry = dict(direction="lower-is-better" if metric == "ttft_s" else "higher-is-better",
+                     base=base, candidate=candidate, d=d, mean_d=mean,
+                     change_percent=(exp(mean if metric == "ttft_s" else -mean) - 1) * 100,
+                     all_pairs_worse=all(value > 0 for value in d))
+        if purpose == CALIBRATION:
+            entry["rms_d"] = math.sqrt(sum(value * value for value in d) / count)
+        elif noise["status"] == "matched":
+            sigma = band["sigma_log"][metric]
+            floor = float(EXACT.ln(Decimal(1) + Decimal(thresholds["floor_fraction"][metric])))
+            threshold = max(floor, thresholds["k"] * sigma / math.sqrt(count))
+            beyond = mean > threshold
+            entry.update(sigma_log=sigma, threshold=threshold, beyond_band=beyond,
+                         result=("regressed" if entry["all_pairs_worse"] else "pairs-disagree")
+                         if beyond else "within-band")
+            if entry["result"] == "regressed":
+                regressions.append(metric)
+            elif entry["result"] == "pairs-disagree":
+                reasons.append("pairs-disagree:" + metric)
+        else:
+            entry.update(sigma_log=None, threshold=None, beyond_band=None, result="no-matching-band")
+        metrics[metric] = entry
+    if differences:
+        reasons.append("generated-tokens-differ")
+    reasons.extend("host:" + reason for reason in host)
+    if purpose == CALIBRATION:
+        status = "needs-review" if reasons else "calibrated"
+    else:
+        status = "regressed" if regressions else "needs-review" if reasons else "passed"
+    result = dict(status=status, passed=status == "passed", evidence_valid=True, cell=dict(cell),
+                  protocol=dict(protocol), order=[arm_name(k, side) for k, side in order],
+                  statistic="mean-paired-log-ratio", metrics=metrics, regressions=regressions,
+                  review_reasons=reasons,
+                  output_workload=dict(same_tokens=not differences, reference_arm=arm_name(1, "base"),
+                                       differences=differences),
+                  measurement_identity=identity, pairs=list(pairs),
+                  interpretation=CALIBRATION_INTERPRETATION if purpose == CALIBRATION else INTERPRETATION)
+    if purpose == REGRESSION_GATE:
+        result.update(noise_band=noise, decision_rule=dict(
+            k=thresholds["k"], floor_fraction=thresholds["floor_fraction"], pairs=count,
+            threshold="max(ln(1 + floor_fraction), k * sigma_log / sqrt(pairs))",
+            noise_bands_sha256=conditions_digest(bands)))
+    return result
 
 
 def device_report(root, plan, policy):
@@ -332,7 +524,7 @@ def device_report(root, plan, policy):
         "status": outcome(rows),
         "rows": rows,
         "thresholds": policy["thresholds"],
-        "interpretation": INTERPRETATION,
+        "interpretation": PAIR_INTERPRETATION,
     }
 
 
@@ -351,7 +543,7 @@ def aggregate(roots, plan, policy):
         "devices": reports,
         "thresholds": policy["thresholds"],
         "formal_samples": 0,
-        "interpretation": INTERPRETATION,
+        "interpretation": PAIR_INTERPRETATION,
     }
 
 

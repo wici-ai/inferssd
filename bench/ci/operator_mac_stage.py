@@ -177,10 +177,8 @@ def policy_check(policy, request, config, manifest, broker):
             or common.fingerprint(resources) != policy["resources_sha256"]
             or request["min_free_bytes"] != policy["min_free_bytes"]
             or config.get("validation_mode") != common.PERFORMANCE_MODE
-            or config.get("performance_protocol") != common.PERFORMANCE_PROTOCOL
-            or policy.get("performance_protocol") != common.PERFORMANCE_PROTOCOL
-            or type(config["performance_protocol"].get("output_tokens")) is not int
-            or type(config["performance_protocol"].get("samples_per_side")) is not int):
+            or not common.protocol_admitted(config)
+            or policy.get("performance_protocol") != common.PERFORMANCE_PROTOCOL):
         common.fail("Mac request differs from fixed root device/resources/protocol policy")
     if (manifest.get("selection_resource_policy") != resources
             or manifest.get("selection_lock_identity") != broker["lock_dev_inode"]

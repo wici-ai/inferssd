@@ -21,7 +21,8 @@ credential risks of self-hosted runners in its
 Device checks are authorized by a maintainer for PRs from branches in this
 repository. A maintainer with current write access submits a Comment review whose
 complete body is `/ci test`; GitHub binds the review to the exact current head.
-See [review entry, results and limits](REVIEW-ENTRY.md).
+`/ci calibrate` uses the same rules to measure the noise of that head against
+itself. See [review entry, results and limits](REVIEW-ENTRY.md).
 
 External fork PRs do not currently run on physical devices. Admission requires
 the latest successful hosted CI run for the exact head to be associated with
@@ -148,24 +149,27 @@ quarantine uncertain cleanup rather than release the lease.
 ## Tests and comparison
 
 Inside that boundary the driver builds the exact base and candidate once each,
-runs the reviewed small numerical/lifecycle CTest set on both, compares short
-greedy token IDs and pre-sampling top-five records, then measures DeepSeek/Muse
-512/256 once per side. The impact plan adds 4K/256 only for DeepSeek
-compressed long-context changes; the review operator runs the 512 tier and
-reports any required 4K cell as a coverage gap. Both builds
-precede timing. The same model shards, toolchain, templates, typed settings and
-resource policy are required. Raw SSE, input IDs, image hashes, CTest XML and
-cleanup are revalidated, including the broker receipt. Missing, failed or partial
-data cannot pass.
+runs the reviewed small numerical/lifecycle CTest set on both, and compares short
+greedy token IDs and pre-sampling top-five records. The deployed review operator
+measures DeepSeek/Muse 512/256 as two base/candidate pairs in ABBA order (base,
+candidate, candidate, base), each arm a fresh server. The impact plan adds
+4K/256 only for DeepSeek compressed long-context changes; the review operator
+runs the 512 tier and reports any required 4K cell as a coverage gap. Both
+builds precede timing. The same model shards, toolchain, templates, typed
+settings and resource policy are required. Raw SSE, input IDs, image hashes,
+CTest XML and cleanup are revalidated for every arm, including the broker
+receipt. Missing, failed or partial data cannot pass.
 
 These are `purpose=ci` samples, separate from the formal benchmark in
-[FINAL.md](../FINAL.md). All five metrics, including native prefill, must show no
-observed slowdown. Any valid slowdown is `inconclusive` and blocks acceptance
-pending bounded diagnosis; invalid evidence is `failed`. No percentage regression
-allowance applies. A passing one-sample comparison is an observation, not proof
-of statistical equivalence. See [performance acceptance](PERFORMANCE.md) for
-outcomes, diagnosis limits and the legacy reference adapter. Local synthetic
-tests do not prove OS isolation.
+[FINAL.md](../FINAL.md). Each of the five metrics, including native prefill, is
+compared through its mean per-pair log ratio against a noise band calibrated on
+the same device. A cell is `regressed` when a metric is beyond its band and
+every pair is slower; `needs-review` when the pairs disagree, generated tokens
+differ, no matching band exists or the host check flagged an arm; otherwise
+`passed`. Invalid evidence is `failed`. A pass means no slowdown beyond measured
+noise, not proof that none exists. See [performance acceptance](PERFORMANCE.md)
+for the decision rule, noise-band calibration and the legacy reference adapter.
+Local synthetic tests do not prove OS isolation.
 
 ## Publication and deployment
 

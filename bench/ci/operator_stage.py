@@ -184,7 +184,22 @@ def model_identities(config):
 
 PERFORMANCE_MODE = "functional-numerical-performance"
 PERFORMANCE_PROTOCOL = dict(tier="512", prompt_sha256="17ac26b4a3bc13d6c51dd10b62eb54931651d48e41ca4071c587a931a662e283",
-                            output_tokens=256, samples_per_side=1)
+                            output_tokens=256, samples_per_side=2, order="ABBA", purpose="regression-gate")
+CALIBRATION_PAIRS = range(2, 5)
+
+
+def protocol_admitted(config):
+    """The fixed gate protocol, or its A/A calibration form on one revision."""
+    value = config.get("performance_protocol")
+    if (not isinstance(value, dict) or type(value.get("output_tokens")) is not int
+            or type(value.get("samples_per_side")) is not int):
+        return False
+    if value == PERFORMANCE_PROTOCOL:
+        return True
+    revisions = {config["sides"][side]["revision"] for side in ("base", "candidate")}
+    return (value["samples_per_side"] in CALIBRATION_PAIRS and len(revisions) == 1
+            and value == dict(PERFORMANCE_PROTOCOL, samples_per_side=value["samples_per_side"],
+                              purpose="noise-calibration"))
 
 
 def source_sides(config):
@@ -209,10 +224,8 @@ def policy_check(policy, request, config, manifest, broker):
         fail("request differs from local root device/resource/control policy")
     sides = source_sides(config)
     if config.get("validation_mode") == PERFORMANCE_MODE:
-        if (config.get("performance_protocol") != PERFORMANCE_PROTOCOL
+        if (not protocol_admitted(config)
                 or policy.get("performance_protocol") != PERFORMANCE_PROTOCOL
-                or type(config["performance_protocol"].get("output_tokens")) is not int
-                or type(config["performance_protocol"].get("samples_per_side")) is not int
                 or set(policy.get("side_settings_sha256", {})) != {"base", "candidate"}):
             fail("fixed performance protocol/side settings are outside root policy")
     models = config["sides"]["candidate"]["models"]

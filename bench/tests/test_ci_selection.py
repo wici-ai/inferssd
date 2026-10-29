@@ -100,7 +100,8 @@ def test_root_config_and_manifest_cross_bind_and_exact_stage_allowlist():
     needs = contract.bound(config, manifest, 'f'*32)
     assert needs['models'] == ['deepseek', 'muse']
     assert 'candidate-numerical-model-adapter' in manifest['stages']
-    assert 'base-deepseek-benchmark-512' in manifest['stages']
+    assert {'base-deepseek-r1-benchmark-512', 'base-deepseek-r2-benchmark-512'} <= set(manifest['stages'])
+    assert 'base-deepseek-benchmark-512' not in manifest['stages']
     assert not any('4096' in key for key in manifest['stages'])
     for target in ('config', 'manifest'):
         c, m = copy.deepcopy(config), copy.deepcopy(manifest)
@@ -219,11 +220,20 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
     from ci import selected_integration as execution
     from ci import selected_preflight
     from test_ci_staged_benchmark import Session as Recorder, CONFIG
+    from test_ci_performance_series import banded
+    from ci.compare import comparable, conditions_digest
     value = plan(['engine/ggml/src/ggml-cuda/ssd/mxfp4-compute-adapter.cpp'])
     config = template(value)
+
+    def synthetic(side, folder):
+        return dict(model_identity={'synthetic': True}, server=dict(pid=1 if side=='base' else 2, start_identity=str(folder)),
+            build=dict(loaded_libraries=[]), host=dict(hardware='synthetic', os='synthetic', memory_budget_bytes=1,
+                os_page_cache_treatment='uncontrolled', effective_settings=dict(native_launch_policy=dict(typed_values={}))))
+
+    bands = banded({('cloud-5090', 'deepseek', '512'): conditions_digest(comparable(synthetic('base', tmp_path)))})
     config.update(selection_plan=value, selection_plan_sha256=impact.fingerprint(value),
                   manifest_sha256='a'*64, paths=config['sides']['candidate']['paths'],
-                  control_revision='d'*40, control_manifest_sha256='e'*64, policy=POLICY)
+                  control_revision='d'*40, control_manifest_sha256='e'*64, policy=POLICY, noise_bands=bands)
     manifest = tmp_path/'manifest.json'
     config['manifest_path'] = str(manifest)
     for side, spec in config['sides'].items():
@@ -256,9 +266,7 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
         dict(status='passed', cleanup_confirmed=True, completion_requests=1))
     monkeypatch.setattr(selected_preflight, 'smoke', execution.smoke)
     def receipt(cfg, mf, side, model, launch, build, folder, *, destination=None):
-        result = dict(model_identity={'synthetic': True}, server=dict(pid=1 if side=='base' else 2, start_identity=side),
-            build=dict(loaded_libraries=[]), host=dict(hardware='synthetic', os='synthetic', memory_budget_bytes=1,
-                os_page_cache_treatment='uncontrolled', effective_settings=dict(native_launch_policy=dict(typed_values={}))))
+        result = synthetic(side, folder)
         if destination is not None:
             from ci.contract import save
             save(destination, result)
@@ -271,7 +279,9 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
     result = load(args.output/'integration.json')
     assert result['cleanup_confirmed'] is clean and (result['status']=='passed') is clean
     assert len(sessions) == 1 and sessions[0].closed
-    assert sessions[0].started == ['base-deepseek-benchmark-512', 'candidate-deepseek-benchmark-512']
-    assert sessions[0].completions == 2
+    assert sessions[0].started == ['base-deepseek-r1-benchmark-512', 'candidate-deepseek-r1-benchmark-512',
+                                   'candidate-deepseek-r2-benchmark-512', 'base-deepseek-r2-benchmark-512']
+    assert sessions[0].completions == 4
     assert result['selection_plan_sha256'] == impact.fingerprint(value)
+    assert result['noise_bands_sha256'] == impact.fingerprint(bands)
     assert result['formal_samples'] == 0

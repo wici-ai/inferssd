@@ -20,7 +20,7 @@ from test_ci_staged_benchmark import CONFIG, Session
 def performance(config):
     config.update(validation_mode=contract.PERFORMANCE_MODE,
                   execution_devices=["cloud-5090"],
-                  performance_protocol=contract.performance_protocol())
+                  performance_protocol=contract.performance_protocol(), noise_bands={})
     for side in config["sides"].values():
         for data in side["models"].values():
             data["benchmarks"] = {tier: spec for tier, spec in data["benchmarks"].items() if tier == "512"}
@@ -47,10 +47,12 @@ def test_operator_preserves_impact_but_stages_only_the_explicit_512_checkpoint()
     assert config["selection_plan"] == original
     assert manifest["source_revisions"] == {side: original[side] for side in ("base", "candidate")}
     assert all("4096" not in name for name in manifest["stages"])
-    assert {side + "-deepseek-benchmark-512" for side in ("base", "candidate")} <= set(manifest["stages"])
+    timed = {name for name in manifest["stages"] if "-benchmark-" in name}
+    assert timed == {side + "-deepseek-r" + pair + "-benchmark-512" for side in ("base", "candidate") for pair in "12"}
 
 
-@pytest.mark.parametrize("damage", ["missing-protocol", "wrong-prompt", "output-count", "bool-count", "extra-tier", "missing-base"])
+@pytest.mark.parametrize("damage", ["missing-protocol", "wrong-prompt", "output-count", "bool-count", "extra-tier", "missing-base",
+                                    "missing-bands", "invalid-bands"])
 def test_new_mode_never_silently_defaults_or_accepts_one_sided_performance(damage):
     config, manifest = bound_config(["engine/src/models/muse.cpp"])
     if damage == "missing-protocol": config.pop("performance_protocol")
@@ -58,6 +60,8 @@ def test_new_mode_never_silently_defaults_or_accepts_one_sided_performance(damag
     elif damage == "output-count": config["performance_protocol"]["output_tokens"] = 8
     elif damage == "bool-count": config["performance_protocol"]["samples_per_side"] = True
     elif damage == "extra-tier": config["sides"]["base"]["models"]["muse"]["benchmarks"]["4096"] = {}
+    elif damage == "missing-bands": config.pop("noise_bands")
+    elif damage == "invalid-bands": config["noise_bands"] = {"cloud-5090": {"muse": {"512": {}}}}
     else: manifest["source_revisions"].pop("base")
     with pytest.raises(ValueError):
         contract.bind(config, manifest, config["selection_plan"], POLICY)
@@ -70,11 +74,17 @@ def test_control_only_scope_keeps_performance_not_required_and_candidate_only():
     assert not any("benchmark" in name for name in manifest["stages"])
 
 
-def test_new_mode_never_runs_4k_or_repeats_a_selected_arm(tmp_path, monkeypatch):
+def test_new_mode_never_runs_4k_and_runs_each_planned_arm_once_in_abba_order(tmp_path, monkeypatch):
     args, config, manifest, _, events, sessions = setup(tmp_path, monkeypatch,
         paths=["engine/src/llama-kv-cache-dsv4.cpp"], change=performance)
     assert execution.run(args) == 0
-    assert [e for e in events if e[0] == "timed"] == [("timed", "deepseek", "base"), ("timed", "deepseek", "candidate")]
+    assert [e for e in events if e[0] == "timed"] == [("timed", "deepseek", side)
+                                                      for side in ("base", "candidate", "candidate", "base")]
+    assert args.stages == ["base-deepseek-r1-benchmark-512", "candidate-deepseek-r1-benchmark-512",
+                           "candidate-deepseek-r2-benchmark-512", "base-deepseek-r2-benchmark-512"]
+    assert all((args.output / "deepseek/512" / pair / "comparison.json").is_file() for pair in ("r1", "r2"))
+    cell = load(args.output / "deepseek/512/comparison.json")
+    assert cell["status"] == "passed" and cell["order"] == ["r1/base", "r1/candidate", "r2/candidate", "r2/base"]
     assert not any("4096" in str(event) for event in events)
     gate = load(args.output / "performance-preflight.json")
     assert [(cell["model"], cell["tier"]) for cell in gate["cells"]] == [("deepseek", "512")]
@@ -82,27 +92,31 @@ def test_new_mode_never_runs_4k_or_repeats_a_selected_arm(tmp_path, monkeypatch)
     assert len(sessions) == 1 and sessions[0].closed
 
 
-def test_inconclusive_retains_first_pair_and_completes_other_single_shot_pair(tmp_path, monkeypatch):
+def test_needs_review_retains_every_arm_and_completes_the_other_cell(tmp_path, monkeypatch):
     args, config, manifest, _, events, sessions = setup(tmp_path, monkeypatch, change=performance)
-    real_compare = execution.compare_pair
 
-    def diverged(base, candidate, before, after, policy):
-        if before["model_identity"]["model"] == "deepseek":
-            candidate = copy.deepcopy(candidate)
-            candidate["tokens"][64] = 99
-        return real_compare(base, candidate, before, after, policy)
+    def diverged(path, *args):
+        value = load(path)
+        if "deepseek/512/r2/candidate" in str(path):
+            value["tokens"][64] = 99
+        return value
 
-    monkeypatch.setattr(execution, "compare_pair", diverged)
+    monkeypatch.setattr(execution.run_final, "read_result", diverged)
     assert execution.run(args) == 1
     report = load(args.output / "integration.json")
-    assert report["status"] == "inconclusive" and report["cleanup_confirmed"]
+    assert report["status"] == "needs-review" and report["cleanup_confirmed"]
     assert len(report["cells"]) == 2
-    assert report["cells"][0]["performance"][0]["passed"] is False
-    assert report["cells"][1]["performance"][0]["passed"] is True
+    deepseek, muse = (cell["performance"][0] for cell in report["cells"])
+    assert deepseek["status"] == "needs-review" and deepseek["review_reasons"] == ["generated-tokens-differ"]
+    assert deepseek["output_workload"]["differences"] == [dict(
+        arm="r2/candidate", first_difference_one_based=65, reference_token=11, token=99)]
+    assert muse["status"] == "passed"
     assert [e for e in events if e[0] == "timed"] == [("timed", model, side)
-        for model in ("deepseek", "muse") for side in ("base", "candidate")]
-    assert (args.output / "deepseek/512/comparison.json").is_file()
-    assert (args.output / "muse/512/comparison.json").is_file()
+        for model in ("deepseek", "muse") for side in ("base", "candidate", "candidate", "base")]
+    for model in ("deepseek", "muse"):
+        assert (args.output / model / "512/comparison.json").is_file()
+        assert all((args.output / model / "512" / pair / side / "result.json").is_file()
+                   for pair in ("r1", "r2") for side in ("base", "candidate"))
     assert sessions[0].closed
 
 
@@ -110,7 +124,7 @@ def test_inconclusive_retains_first_pair_and_completes_other_single_shot_pair(tm
 def test_all_timed_authorization_and_fixed_prompt_are_checked_before_lease(tmp_path, monkeypatch, fault):
     args, config, manifest, _, events, sessions = setup(tmp_path, monkeypatch, change=performance)
     if fault == "missing-stage":
-        del manifest["stages"]["candidate-muse-benchmark-512"]
+        del manifest["stages"]["candidate-muse-r2-benchmark-512"]
         Path(config["manifest_path"]).unlink()
         save(config["manifest_path"], manifest)
     else:
@@ -138,6 +152,32 @@ def test_explicit_preflight_launch_refuses_collisions_or_unrelated_differences(d
     elif damage == "traversal": spec["preflight_argv"][-1] = "/scratch/base/../short.jsonl"
     else: spec["preflight_argv"] += ["--ssd-telemetry", "/scratch/base/other.jsonl"]
     with pytest.raises(ValueError): selected_preflight.launch(spec, "base", required=True)
+
+
+@pytest.mark.parametrize("damage", [None, "no-telemetry", "preflight-collision", "functional-collision",
+                                    "outside-scratch", "pair-zero", "unpaired-preflight"])
+def test_each_timed_arm_derives_its_own_private_event_file(damage):
+    binary = "/build/base/bin/inferssd-server"
+    spec = dict(argv=[binary, "--ssd-telemetry", "/scratch/base/deepseek-benchmark-512.jsonl"],
+                preflight_argv=[binary, "--ssd-telemetry", "/scratch/base/deepseek-preflight.jsonl"])
+    functional, pair = None, 1
+    if damage == "no-telemetry": spec = dict(argv=[binary, "--fixture"], preflight_argv=[binary, "--fixture"])
+    elif damage == "preflight-collision": spec["preflight_argv"][-1] = "/scratch/base/deepseek-benchmark-512-r1.jsonl"
+    elif damage == "functional-collision": functional = dict(argv=[binary, "--ssd-telemetry", "/scratch/base/deepseek-benchmark-512-r1.jsonl"])
+    elif damage == "outside-scratch": spec["argv"][-1] = "/scratch/base/../deepseek.jsonl"
+    elif damage == "pair-zero": pair = 0
+    elif damage == "unpaired-preflight": spec["preflight_argv"].append("--other")
+    if damage in (None, "no-telemetry"):
+        arms = [selected_preflight.arm_launch(spec, "base", k, required=True)["argv"] for k in (1, 2)]
+        if damage is None:
+            assert [argv[-1] for argv in arms] == ["/scratch/base/deepseek-benchmark-512-r1.jsonl",
+                                                   "/scratch/base/deepseek-benchmark-512-r2.jsonl"]
+            assert all(argv[:-1] == spec["argv"][:-1] for argv in arms)
+        else:
+            assert arms == [spec["argv"]] * 2
+    else:
+        with pytest.raises(ValueError):
+            selected_preflight.arm_launch(spec, "base", pair, required=True, functional=functional)
 
 
 def test_real_exclusive_event_files_survive_short_and_timed_servers_without_deletion(tmp_path, monkeypatch):
@@ -176,12 +216,15 @@ def test_real_exclusive_event_files_survive_short_and_timed_servers_without_dele
     monkeypatch.setattr(selected_preflight, "smoke", smoke)
     monkeypatch.setattr(execution, "benchmark", timed)
     assert execution.run(args) == 0
-    assert len(paths) == len(set(paths)) == 8
+    assert len(paths) == len(set(paths)) == 12
     assert all(path.read_bytes() == b"retained\n" for path in paths)
     assert len([event for event in events if event[0] == "smoke"]) == 4
-    assert len([event for event in events if event[0] == "timed"]) == 4
+    assert len([event for event in events if event[0] == "timed"]) == 8
+    assert {path.name for path in paths if "benchmark" in path.name} == {
+        model + "-benchmark512-r" + pair + ".jsonl" for model in ("deepseek", "muse") for pair in "12"}
     with pytest.raises(FileExistsError):
-        open_events(config["sides"]["base"]["models"]["muse"]["benchmarks"]["512"])
+        open_events(selected_preflight.arm_launch(config["sides"]["base"]["models"]["muse"]["benchmarks"]["512"],
+                                                  "base", 2, required=True))
     assert all(path.is_file() for path in paths)
     assert sessions[0].closed
 

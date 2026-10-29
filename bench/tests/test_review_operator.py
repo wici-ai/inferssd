@@ -104,7 +104,8 @@ def args(tmp_path, monkeypatch):
         if argv[0] == "cat-file":
             return b""
         assert argv[:2] == ("diff", "--name-only")
-        return b"bench/ci/review_operator.py\0"
+        # A revision compared with itself has no changed paths.
+        return b"" if argv[-2] == argv[-1] else b"bench/ci/review_operator.py\0"
 
     monkeypatch.setattr(entry.prepare, "git", git)
     return SimpleNamespace(
@@ -121,9 +122,7 @@ def args(tmp_path, monkeypatch):
 
 def record(api, args):
     value = entry.authorization(api, POLICY, 58, 71, HEAD)
-    value.update(
-        inputs_sha256=entry.digest(args.inputs), policy_sha256=entry.digest(args.policy)
-    )
+    value.update(entry.trusted_inputs(args))
     path = args.state / (entry.key(REPO, 58, api.reviews[0]) + ".json")
     entry.save_record(path, value, "queued")
     return path, value
@@ -136,7 +135,8 @@ def prepared_envelope(actual, **_):
         raw = entry.prepare.git(actual.source, "diff", "--name-only", "-z",
                                 "--no-renames", "--no-ext-diff", actual.base, target)
         paths.extend(item.decode() for item in raw.split(b"\0") if item)
-    impact = entry.plan(paths, POLICY, **identities)
+    impact = entry.plan(paths, POLICY, calibration=getattr(actual, "calibration_pairs", None) is not None,
+                        **identities)
     actual.output.mkdir(parents=True, exist_ok=True)
     value = dict(**identities, selection=impact,
                  selection_plan_sha256=entry.fingerprint(impact),
@@ -199,6 +199,79 @@ def test_later_maintainer_can_revoke(api, state, body):
     api.reviews.append(dict(api.reviews[0], id=72, state=state, body=body))
     with pytest.raises(entry.Stale, match="cancelled"):
         entry.authorization(api, POLICY, 58, 71, HEAD)
+
+
+def test_calibrate_command_has_the_same_exact_head_authorization(api):
+    api.reviews[0]["body"] = "/ci calibrate"
+    value = entry.authorization(api, POLICY, 58, 71, HEAD)
+    assert value["command"] == "calibrate" and value["head"] == HEAD
+    assert entry.prepared_identity(value) == dict(base=HEAD, head=HEAD, candidate=HEAD)
+    api.permission = "read"
+    with pytest.raises(entry.Stale):
+        entry.authorization(api, POLICY, 58, 71, HEAD)
+
+
+def test_later_cancel_also_revokes_a_calibration(api):
+    api.reviews[0]["body"] = "/ci calibrate"
+    api.reviews.append(dict(api.reviews[0], id=72, body="/ci cancel"))
+    with pytest.raises(entry.Stale, match="cancelled"):
+        entry.authorization(api, POLICY, 58, 71, HEAD)
+
+
+def test_calibrate_review_queues_bounded_pairs_and_prepares_head_against_itself(api, args, monkeypatch):
+    api.reviews[0]["body"] = "/ci calibrate"
+    args.calibration_pairs = 3
+    monkeypatch.setattr(entry, "fetch_objects", lambda *_: None)
+    prepared = []
+
+    def prepare(actual, **kwargs):
+        prepared.append(actual)
+        return prepared_envelope(actual, **kwargs)
+
+    monkeypatch.setattr(entry.prepare, "prepare", prepare)
+    monkeypatch.setattr(entry.prepare, "stage", lambda *_, **__: None)
+    monkeypatch.setattr(entry.prepare, "dispatch", lambda *_, **__: api.run)
+    entry.tick(args, api)
+    record = entry.load(args.state / (entry.key(REPO, 58, api.reviews[0]) + ".json"))
+    assert record["command"] == "calibrate" and record["calibration_pairs"] == 3 and record["status"] == "running"
+    actual = prepared[0]
+    assert (actual.base, actual.head, actual.candidate, actual.calibration_pairs) == (HEAD, HEAD, HEAD, 3)
+    envelope = entry.load(actual.output / "envelope.json")
+    assert envelope["selection"]["purpose"] == "noise-calibration"
+    assert envelope["execution_devices"] == list(entry.prepare.DEVICES)
+
+
+@pytest.mark.parametrize("pairs", [None, 5, True])
+def test_calibration_record_without_a_bounded_pair_count_never_prepares(api, args, monkeypatch, pairs):
+    api.reviews[0]["body"] = "/ci calibrate"
+    path, value = record(api, args)
+    if pairs is not None:
+        value["calibration_pairs"] = pairs
+    monkeypatch.setattr(entry.prepare, "prepare", lambda *_, **__: pytest.fail("unbounded calibration"))
+    entry.advance(args, api, POLICY, path, value)
+    assert value["status"] == "stale" and "pair count" in value["error"]
+
+
+@pytest.mark.parametrize("change", ["new-bands", "invalid-bands"])
+def test_noise_bands_changed_after_queueing_never_prepare(api, args, monkeypatch, change):
+    from test_ci_performance_series import banded
+    path, value = record(api, args)
+    assert value["noise_bands_sha256"] == entry.fingerprint({})
+    bands = args.inputs.with_name(entry.prepare.BANDS_FILE)
+    bands.write_text(json.dumps(banded({("cloud-5090", "muse", "512"): "c" * 64}))
+                     if change == "new-bands" else '{"other": {}}')
+    monkeypatch.setattr(entry.prepare, "prepare", lambda *_, **__: pytest.fail("changed operator bands"))
+    entry.advance(args, api, POLICY, path, value)
+    assert value["status"] == ("stale" if change == "new-bands" else "interrupted")
+    assert ("noise bands" if change == "new-bands" else "noise bands are keyed") in value["error"]
+
+
+def test_edited_command_after_queueing_is_stale(api, args, monkeypatch):
+    path, value = record(api, args)
+    api.reviews[0]["body"] = "/ci calibrate"
+    monkeypatch.setattr(entry.prepare, "prepare", lambda *_, **__: pytest.fail("command changed"))
+    entry.advance(args, api, POLICY, path, value)
+    assert value["status"] == "stale" and "command" in value["error"]
 
 
 def test_expired_authorization(api):
@@ -427,8 +500,7 @@ def test_unrelated_profile_wait_does_not_starve_exact_mac_acceptance(api, args, 
     identity = entry.authorization(api, POLICY, 58, 71, HEAD)
     records = []
     for index, number in enumerate((58, 64)):
-        value = dict(identity, pr=number, inputs_sha256=entry.digest(args.inputs),
-                     policy_sha256=entry.digest(args.policy))
+        value = dict(identity, pr=number, **entry.trusted_inputs(args))
         path = args.state / (str(index) * 64 + ".json")
         entry.save_record(path, value, "queued")
         records.append((path, value))

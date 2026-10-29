@@ -30,10 +30,17 @@ on the device. Test/control-only changes still select functional and numerical g
 changes affecting runtime/placement/resources require base/candidate performance.
 Ordinary performance uses the fixed 512-token CI prompt
 (`bench/prompts/prompt-512.txt`) with decode 256. Only the explicit DeepSeek
-compressed long-context rule adds 4K. No automatic completion retry or
-best-of selection exists. Each cell records TTFT separately, native prefill and
-first/second 128-token and whole decode rates. The existing n=1 policy marks any
-observed slowdown inconclusive and blocks acceptance.
+compressed long-context rule adds 4K. Each cell runs two base/candidate pairs in
+ABBA order on fresh servers and records TTFT, native prefill and first/second
+128-token and whole decode rates for every arm. No automatic completion retry or
+best-of selection exists. The cell is `regressed`, `needs-review` or `passed`
+against a calibrated noise band, as described in
+[performance acceptance](PERFORMANCE.md).
+
+A noise calibration (`/ci calibrate`) is the one case with an empty diff: it
+compares one revision with itself and selects every device and both models with
+the 512 tier. Its plan has `purpose: "noise-calibration"`, and the trusted rules
+rebuild it only for an empty diff and identical base, head and candidate.
 
 ## Separate App publication mode
 
@@ -63,7 +70,8 @@ requested source PR/head when artifacts or admission are missing. It rechecks
 source, exact-head approval, complete changed paths and the latest hosted CI
 before publishing success. The stable check is `InferSSD device performance`.
 There are no required workflow path filters. Unselected cells are explicitly
-`not-required`; selected missing, failed, unclean or inconclusive cells are red.
+`not-required`; selected missing, failed, unclean, regressed or needs-review
+cells are red.
 
 GitHub's [dispatch REST contract](https://docs.github.com/en/rest/actions/workflows)
 supports `return_run_details`; [GITHUB_TOKEN dispatch exceptions](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
@@ -107,7 +115,9 @@ execution is used; see [GitHub's security guidance](https://docs.github.com/en/a
    working directory and arguments. The operator pins a separate `preflight_argv`;
    only the single private `--ssd-telemetry` file may differ from the timed argv,
    and both destinations are distinct canonical files within that side's scratch
-   directory. A candidate functional smoke is reused only when its complete
+   directory. Timed arm k uses the timed file name with `-r<k>` inserted before
+   `.jsonl`, so every fresh server owns its own event file, and each arm has its
+   own `<side>-<model>-r<k>-benchmark-<tier>` stage. A candidate functional smoke is reused only when its complete
    launch matches this preflight. Native typed snapshots, owned
    runtime images, resources and immutable inputs must compare equal for every
    pair first. Missing declarations or exact root stage authorization refuse

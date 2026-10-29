@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci import compare
-from ci.contract import load, policy_read
+from ci.contract import load, noise_bands, policy_read
 import test_device_ci
 
 policy = test_device_ci.policy
@@ -39,14 +39,14 @@ def pair():
 
 
 @pytest.mark.parametrize("metric", compare.METRICS)
-def test_even_small_slowdown_is_inconclusive_not_permitted_regression(pair, policy, metric):
+def test_single_pair_slowdown_is_marked_for_review_not_a_regression(pair, policy, metric):
     a, b, ar, br = pair
     b["metrics"][metric] *= 1.001 if metric == "ttft_s" else .999
     if metric == "server_prefill_tps":
         b["timings"]["prompt_ms"] = b["input_tokens"] * 1000 / b["metrics"][metric]
         b["metrics"][metric] = b["input_tokens"] * 1000 / b["timings"]["prompt_ms"]
     result = compare.compare_pair(a, b, ar, br, policy)
-    assert result["status"] == "inconclusive" and not result["passed"]
+    assert result["status"] == "needs-review" and not result["passed"]
     assert result["observed_slowdowns"] == [metric]
     assert result["diagnostic_required"] and result["evidence_valid"]
 
@@ -55,7 +55,7 @@ def test_equal_samples_pass_only_observed_gate(pair, policy):
     result = compare.compare_pair(*pair, policy)
     assert result["passed"] and result["status"] == "passed"
     assert not result["diagnostic_required"]
-    assert "not statistical proof" in result["interpretation"]
+    assert "decided from all of its pairs together" in result["interpretation"]
 
 
 def test_pair_reports_signed_changes_and_exact_prompt_conditions(pair, policy):
@@ -73,14 +73,14 @@ def test_pair_reports_signed_changes_and_exact_prompt_conditions(pair, policy):
     assert len(result["measurement_identity"]["conditions_sha256"]) == 64
 
 
-def test_faster_different_output_is_inconclusive_and_retains_metrics(pair, policy):
+def test_faster_different_output_needs_review_and_retains_metrics(pair, policy):
     a, b, ar, br = pair
     b["tokens"][64] = 12
     for metric in compare.METRICS:
         b["metrics"][metric] *= .5 if metric == "ttft_s" else 2
     b["timings"]["prompt_ms"] /= 2
     result = compare.compare_pair(a, b, ar, br, policy)
-    assert not result["passed"] and result["status"] == "inconclusive"
+    assert not result["passed"] and result["status"] == "needs-review"
     assert result["diagnostic_required"] and result["evidence_valid"]
     assert result["observed_slowdowns"] == []
     assert all(value["passed"] for value in result["metrics"].values())
@@ -128,11 +128,64 @@ def test_metric_ratio_overflow_is_invalid_not_a_speedup(pair, policy):
         compare.compare_pair(*pair, policy)
 
 
-@pytest.mark.parametrize("key", ["decode_regression_fraction", "ttft_regression_fraction", "prefill_regression_fraction"])
-def test_policy_cannot_reintroduce_a_positive_allowed_regression(policy, key):
-    policy["thresholds"][key] = .01
-    with pytest.raises(ValueError, match="no permitted"):
+def band(**changes):
+    value = dict(sigma_log={metric: 0.01 for metric in compare.METRICS}, pairs=8,
+                 statistic="rms-paired-log-ratio", conditions_sha256="c" * 64, engine_revision="a" * 40,
+                 calibration_jobs=["f" * 32], date="2026-10-29")
+    value.update(changes)
+    return value
+
+
+def test_shipped_policy_holds_gate_constants_but_no_bands(policy):
+    thresholds = policy["thresholds"]
+    assert thresholds["mode"] == "calibrated-noise-band" and "bands" not in thresholds
+    assert thresholds["pairs"] == 2 and thresholds["order"] == "ABBA" and thresholds["k"] == 3
+    assert thresholds["floor_fraction"] == {metric: 0.01 for metric in compare.METRICS}
+
+
+@pytest.mark.parametrize("damage", ["old-mode", "extra-key", "pairs", "bool-pairs", "order", "k-zero", "k-nan",
+                                    "floor-negative", "floor-one", "floor-missing", "bands-in-policy"])
+def test_policy_thresholds_are_explicit_and_finite(policy, damage):
+    thresholds = policy["thresholds"]
+    if damage == "old-mode": thresholds["mode"] = "observed-no-slowdown"
+    elif damage == "extra-key": thresholds["decode_regression_fraction"] = 0
+    elif damage == "pairs": thresholds["pairs"] = 1
+    elif damage == "bool-pairs": thresholds["pairs"] = True
+    elif damage == "order": thresholds["order"] = "ABAB"
+    elif damage == "k-zero": thresholds["k"] = 0
+    elif damage == "k-nan": thresholds["k"] = float("nan")
+    elif damage == "floor-negative": thresholds["floor_fraction"]["ttft_s"] = -0.01
+    elif damage == "floor-one": thresholds["floor_fraction"]["decode_tps"] = 1
+    elif damage == "floor-missing": del thresholds["floor_fraction"]["server_prefill_tps"]
+    else: thresholds["bands"] = {}  # Bands are operator data sealed per job, never policy.
+    with pytest.raises(ValueError):
         policy_read(policy)
+
+
+@pytest.mark.parametrize("damage", [None, "sigma-missing", "sigma-negative", "sigma-inf", "few-pairs", "statistic",
+                                    "conditions", "revision", "no-jobs", "bad-job", "duplicate-job", "date",
+                                    "impossible-date", "extra"])
+def test_noise_band_entries_are_complete_and_well_formed(damage):
+    value = band()
+    if damage == "sigma-missing": del value["sigma_log"]["ttft_s"]
+    elif damage == "sigma-negative": value["sigma_log"]["ttft_s"] = -1
+    elif damage == "sigma-inf": value["sigma_log"]["ttft_s"] = float("inf")
+    elif damage == "few-pairs": value["pairs"] = 3
+    elif damage == "statistic": value["statistic"] = "median"
+    elif damage == "conditions": value["conditions_sha256"] = "C" * 64
+    elif damage == "revision": value["engine_revision"] = "a" * 39
+    elif damage == "no-jobs": value["calibration_jobs"] = []
+    elif damage == "bad-job": value["calibration_jobs"] = ["f" * 31]
+    elif damage == "duplicate-job": value["calibration_jobs"] = ["f" * 32] * 2
+    elif damage == "date": value["date"] = "29/10/2026"
+    elif damage == "impossible-date": value["date"] = "2026-02-30"
+    elif damage == "extra": value["k"] = 3
+    bands = {"cloud-5090": {"muse": {"512": value}}}
+    if damage is None:
+        noise_bands(bands)
+    else:
+        with pytest.raises(ValueError):
+            noise_bands(bands)
 
 
 @pytest.mark.parametrize("tamper", ["run-id", "ledger", "tier-order", "native-time", "interrupted"])
@@ -181,6 +234,6 @@ def test_observed_native_prefill_slowdown_blocks_complete_three_device_report(sy
     summary["rows"][0]["result"] = result
     test_device_ci.measurement_manifest(folder, manifest["config"], summary["rows"])
     report = compare.aggregate(roots, plan, policy)
-    assert report["status"] == "inconclusive" and not report["passed"]
+    assert report["status"] == "needs-review" and not report["passed"]
     row = next(row for row in report["devices"][0]["rows"] if row["model"] == "muse")
     assert row["evidence_valid"] and row["observed_slowdowns"] == ["server_prefill_tps"]

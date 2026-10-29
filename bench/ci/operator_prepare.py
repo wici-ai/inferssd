@@ -21,7 +21,7 @@ import tarfile
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ci.contract import HASH, digest, load, policy_read, revision, save
+from ci.contract import HASH, digest, load, noise_bands, policy_read, revision, save
 from ci.impact import fingerprint, plan, device_requirements
 from ci.staged_build import validate_platform_flags
 from ci.selection_contract import JOB, bind, bound, runtime_requirements, performance_protocol
@@ -35,6 +35,7 @@ PURPOSE = "operator-selected-report-only"
 MAX_INPUT = 60 * 1024
 WORKFLOW = ".github/workflows/device-performance.yml"
 MAC_PYTHON = "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9"
+BANDS_FILE = "noise-bands.json"
 
 
 def device_layout(device, job_id):
@@ -199,6 +200,20 @@ def input_file(root, name):
     return path
 
 
+def operator_bands(inputs):
+    """Calibrated noise bands kept beside the reviewed profiles, not in the control export.
+
+    The file holds the `bands` object printed by noise_band.py. A missing file
+    means no bands, so every timed cell needs review. A symlink or an invalid
+    band refuses preparation.
+    """
+    root = Path(inputs).resolve().parent
+    path = root / BANDS_FILE
+    if not path.exists() and not path.is_symlink():
+        return {}
+    return noise_bands(load(input_file(root, BANDS_FILE)))
+
+
 def substitute(value, job_id):
     if isinstance(value, str):
         return value.replace("{{job_id}}", job_id)
@@ -269,7 +284,7 @@ def export_source(source, candidate, output, side="candidate"):
     return value
 
 
-def normalize(template, manifest, declared, job_id, identities, mode=MODE):
+def normalize(template, manifest, declared, job_id, identities, mode=MODE, protocol=None):
     if mode not in (MODE, LEGACY_MODE):
         raise ValueError("explicit supported operator validation mode required")
     old_job = manifest["job_id"]
@@ -338,7 +353,7 @@ def normalize(template, manifest, declared, job_id, identities, mode=MODE):
         manifest["model_roots"] = sorted({mounts[model] for model in template["sides"]["candidate"]["models"]})
         manifest["selection_lock_identity"] = declared["lock_identity"]
     if mode == MODE:
-        template["performance_protocol"] = performance_protocol()
+        template["performance_protocol"] = protocol if protocol is not None else performance_protocol()
     for key in ("control_revision", "control_manifest_sha256"):
         template[key] = declared[key]
     revision(template["control_revision"])
@@ -391,6 +406,14 @@ def prepare(args, api=None):
     mode = getattr(args, "validation_mode", MODE)
     if mode not in (MODE, LEGACY_MODE):
         raise ValueError("explicit supported operator validation mode required")
+    # A calibration measures one exact revision against itself: both sides are
+    # exported, staged and built separately from the same commit, exactly like
+    # a comparison, and every enabled device/model is selected.
+    calibration_pairs = getattr(args, "calibration_pairs", None)
+    calibration = calibration_pairs is not None
+    protocol = performance_protocol(calibration_pairs) if calibration else None
+    if calibration and (mode != MODE or len({getattr(args, key) for key in ("base", "head", "candidate")}) != 1):
+        raise ValueError("noise calibration needs performance mode and one base/head/candidate revision")
     if mode == MODE:
         import final_chat
         final_chat.prompt_path("512")  # Trusted recorder input, never PR source.
@@ -408,11 +431,12 @@ def prepare(args, api=None):
         raise ValueError("private controller main changed from reviewed input")
     identities = {key: revision(getattr(args, key)) for key in ("base", "head", "candidate")}
     source, paths, full_diff = source_identity(args.source, identities, api, policy["repository"])
-    impact = plan(paths, policy, **identities)
+    impact = plan(paths, policy, calibration=calibration, **identities)
     execution = [device for device in execution if device_requirements(impact, device)["models"]]
     if not execution:
         raise ValueError("impact requires no enabled device; do not stage or dispatch")
     root = args.inputs.resolve().parent
+    bands = operator_bands(args.inputs)
     devices, jobs, inputs, pending_assets = {}, {}, {}, {}
     for device in execution:
         declared = specification["devices"][device]
@@ -420,10 +444,14 @@ def prepare(args, api=None):
         if not isinstance(job_id, str) or JOB.fullmatch(job_id) is None:
             raise ValueError("fresh 32-hex job ID required")
         template_path, manifest_path = (input_file(root, declared[key]) for key in ("template", "manifest"))
-        template, manifest = normalize(*(load(path) for path in (template_path, manifest_path)), declared, job_id, identities, mode)
+        template, manifest = normalize(*(load(path) for path in (template_path, manifest_path)), declared, job_id,
+                                       identities, mode, protocol)
         if template.get("device") != device or manifest.get("job_id") != job_id:
             raise ValueError("device/job template differs from selected slot")
-        template.update(execution_devices=execution, validation_mode=mode, selection_plan=impact)
+        # Bands are hash-bound job data: the config hash covers them and the
+        # envelope names their digest for the hosted replay.
+        template.update(execution_devices=execution, validation_mode=mode, selection_plan=impact,
+                        noise_bands=bands)
         admission_policy = root_policy(template, manifest, declared)
         if device == "local-mbp":
             from ci.operator_mac_stage import settings_payload
@@ -552,7 +580,8 @@ def prepare(args, api=None):
     envelope = dict(schema_version=1, purpose=PURPOSE, repository=policy["repository"],
         **identities, prepared_by=actor, controller_repository=policy["controller_repository"],
         controller_workflow_sha=workflow_sha, selection=impact, selection_plan_sha256=fingerprint(impact),
-        execution_devices=execution, validation_mode=mode, jobs=jobs, policy_sha256=fingerprint(policy))
+        execution_devices=execution, validation_mode=mode, jobs=jobs, policy_sha256=fingerprint(policy),
+        noise_bands_sha256=fingerprint(bands))
     if len(json.dumps(envelope, separators=(",", ":"), allow_nan=False).encode()) > MAX_INPUT:
         raise ValueError("complete prepared envelope exceeds workflow input bound; never truncate impact")
     save(args.output / "envelope.json", envelope)
@@ -794,6 +823,8 @@ def main():
             command.add_argument("--policy", type=Path, default=Path(__file__).with_name("policy.json"))
             command.add_argument("--validation-mode", choices=(MODE, LEGACY_MODE), default=MODE)
             command.add_argument("--execution-devices", nargs="+", choices=DEVICES, default=list(DEVICES))
+            command.add_argument("--calibration-pairs", type=int, default=None,
+                                 help="A/A noise calibration with this many pairs; base, head and candidate must be one commit")
         else:
             command.add_argument("--prepared", type=Path, required=True)
         command.add_argument("--gh", default="gh", help="Existing authorized gh executable; no token export")

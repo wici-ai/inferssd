@@ -107,11 +107,18 @@ def test_pair_demotes_without_erasing_metrics_or_rerunning(tmp_path, monkeypatch
     compared = dict(status='passed', passed=True, metrics={'decode_first128_tps':{'base':1, 'candidate':2}},
         observed_slowdowns=[], diagnostic_required=False)
     if reason == 'prior-slowdown':
-        compared.update(status='inconclusive', passed=False, observed_slowdowns=['decode_first128_tps'])
+        compared.update(status='needs-review', passed=False, observed_slowdowns=['decode_first128_tps'])
     original = copy.deepcopy(compared)
     result = gate.pair(compared, base, candidate)
-    assert result['status'] == 'inconclusive' and result['passed'] is False
+    assert result['status'] == 'needs-review' and result['passed'] is False
     assert result['metrics'] == original['metrics'] and result['observed_slowdowns'] == original['observed_slowdowns']
     assert compared == original
     if reason == 'prior-slowdown': assert result['environment']['status'] == 'passed'
-    else: assert result['environment']['status'] == 'inconclusive'
+    else: assert result['environment']['status'] == 'needs-review'
+
+
+def test_pair_refuses_a_retired_status_name(tmp_path, monkeypatch):
+    base = arm(tmp_path / 'base', monkeypatch)
+    candidate = arm(tmp_path / 'candidate', monkeypatch, free=38 << 30, swapouts=100)
+    with pytest.raises(ValueError):
+        gate.pair(dict(status='inconclusive', passed=False, metrics={}), base, candidate)
