@@ -51,6 +51,6 @@ source files or requiring a separate GGUF Python installation.
 Use the [typed runtime guide](../framework/README.md#explicit-owned-server-execution)
 for the required resource policy and settings. Replacing `--repo` with
 `--resources /deployment/engine.json` works from any current directory. The
-optional `probes` map names `io` and `memory` executable resources; it does not
-trigger automatic probing, and the launcher does not orchestrate a live
-bootstrap.
+optional `probes` map names `io`, `memory`, `ssd` and `cpu` executable
+resources; it does not trigger automatic probing, and the launcher does not
+orchestrate a live bootstrap.

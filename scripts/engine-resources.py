@@ -34,6 +34,8 @@ value = {
     "probes": {name: str(path.resolve()) for name, path in {
         "io": args.build / ("bin/inferssd-ioreplay" + executable),
         "memory": args.build / ("bin/inferssd-memprobe" + executable),
+        "ssd": args.build / ("bin/inferssd-ssdprobe" + executable),
+        "cpu": args.build / ("bin/inferssd-cpuprobe" + executable),
     }.items() if path.is_file()},
 }
 args.output.parent.mkdir(parents=True, exist_ok=True)
