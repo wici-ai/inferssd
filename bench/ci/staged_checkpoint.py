@@ -150,6 +150,21 @@ def native_settings(stderr):
     return rows[0]
 
 
+def within_cpus(observed, enforced):
+    """Whether an observed Linux CPU list such as `0-3,8` stays within the enforced one.
+
+    A server asked to pin its threads (-C) narrows its own affinity within the
+    enforced CPUs; it may never reach outside them.
+    """
+    def cpus(text):
+        found = set()
+        for item in text.split(","):
+            first, _, last = item.partition("-")
+            found.update(range(int(first), int(last or first) + 1))
+        return found
+    return cpus(observed) <= cpus(enforced)
+
+
 def mapped_files(probe):
     files = {}
     for line in probe["proc_maps"].splitlines():
@@ -230,7 +245,7 @@ def runtime_receipt(config, side, spec, build, output, binding, model, *, eviden
         if (probe["cmdline"] != spec["benchmark"]["argv"]
                 or probe["executable"] != build["binary"]["runtime_path"]
                 or probe["executable_sha256"] != build["binary"]["sha256"]
-                or probe["cpus_allowed_list"] != resources["cpus_allowed_list"]
+                or not within_cpus(probe["cpus_allowed_list"], resources["cpus_allowed_list"])
                 or probe["cgroup_limits"] != resources["cgroup_limits"]):
             raise ValueError("native executable, argv or resource envelope differs")
         lock = re.search(r"^Max locked memory\s+(\S+)\s+(\S+)\s+bytes\s*$", probe["proc_limits"], re.M)
