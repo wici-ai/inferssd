@@ -99,26 +99,27 @@ def test_failed_quiet_or_capture_retains_raw_evidence(tmp_path, monkeypatch):
     assert json.loads((tmp_path / gate.SNAPSHOTS[0]).read_text())['errors'] == ['timeout']
 
 
-@pytest.mark.parametrize('reason', ['swap', 'free', 'prior-slowdown'])
-def test_pair_demotes_without_erasing_metrics_or_rerunning(tmp_path, monkeypatch, reason):
-    base = arm(tmp_path / 'base', monkeypatch)
-    candidate = arm(tmp_path / 'candidate', monkeypatch, free=36 << 30 if reason == 'free' else 38 << 30,
-        swapouts=101 if reason == 'swap' else 100)
-    compared = dict(status='passed', passed=True, metrics={'decode_first128_tps':{'base':1, 'candidate':2}},
-        observed_slowdowns=[], diagnostic_required=False)
-    if reason == 'prior-slowdown':
-        compared.update(status='needs-review', passed=False, observed_slowdowns=['decode_first128_tps'])
-    original = copy.deepcopy(compared)
-    result = gate.pair(compared, base, candidate)
-    assert result['status'] == 'needs-review' and result['passed'] is False
-    assert result['metrics'] == original['metrics'] and result['observed_slowdowns'] == original['observed_slowdowns']
-    assert compared == original
-    if reason == 'prior-slowdown': assert result['environment']['status'] == 'passed'
-    else: assert result['environment']['status'] == 'needs-review'
+@pytest.mark.parametrize('reason', [None, 'swap', 'free'])
+def test_cell_flags_any_run_or_free_memory_spread_without_touching_measurements(tmp_path, monkeypatch, reason):
+    runs = {name: arm(tmp_path / name.replace('/', '-'), monkeypatch) for name in ('r1/candidate', 'r1/base', 'r2/candidate')}
+    runs['r3/candidate'] = arm(tmp_path / 'r3', monkeypatch, free=36 << 30 if reason == 'free' else 38 << 30,
+                               swapouts=101 if reason == 'swap' else 100)
+    original = copy.deepcopy(runs)
+    result = gate.cell(runs)
+    assert runs == original and result['runs'] == original
+    if reason is None:
+        assert result['status'] == 'passed' and result['reasons'] == []
+    elif reason == 'free':
+        assert result['status'] == 'needs-review' and result['reasons'] == ['prelaunch-free-inactive-difference']
+    else:
+        assert result['status'] == 'needs-review' and result['reasons'][0].startswith('r3/candidate:')
 
 
-def test_pair_refuses_a_retired_status_name(tmp_path, monkeypatch):
-    base = arm(tmp_path / 'base', monkeypatch)
-    candidate = arm(tmp_path / 'candidate', monkeypatch, free=38 << 30, swapouts=100)
+@pytest.mark.parametrize('damage', ['one-run', 'policy', 'quiet'])
+def test_cell_refuses_incomplete_or_mismatched_host_evidence(tmp_path, monkeypatch, damage):
+    runs = {name: arm(tmp_path / name.replace('/', '-'), monkeypatch) for name in ('r1/candidate', 'r1/base')}
+    if damage == 'one-run': runs.pop('r1/base')
+    elif damage == 'policy': runs['r1/base']['policy'] = dict(runs['r1/base']['policy'], pair_free_tolerance_bytes=1)
+    else: runs['r1/base']['quiet'] = dict(status='failed')
     with pytest.raises(ValueError):
-        gate.pair(dict(status='inconclusive', passed=False, metrics={}), base, candidate)
+        gate.cell(runs)

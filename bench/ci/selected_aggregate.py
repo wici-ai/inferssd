@@ -5,11 +5,11 @@ import re
 from types import SimpleNamespace
 
 import run_final
-from ci.compare import SEVERITY, SUCCESS, comparable, compare_pair, compare_series, outcome, schedule
+from ci.compare import BASELINE, SEVERITY, SUCCESS, arm_name, comparable, decide_cell, outcome, schedule
 from ci.contract import digest, load
 from ci.impact import CASES, MARKERS, fingerprint, validate
 from ci.selection_contract import (arm_prefix, bound, execution_scope, FUNCTIONAL_MODE, PERFORMANCE_MODE,
-                                   sealed_bands, timed_protocol)
+                                   baseline_build_identity, sealed_history, timed_protocol)
 from ci.staged_numerical import validate_csv
 from ci.staged_benchmark import verify_stopped, verify_runtime
 from ci.staged_checkpoint import mapped_files, native_settings
@@ -111,20 +111,20 @@ def runtime_retained(root, config, side, model, folder, launch, receipt_path):
 
 
 def performance_retained(root, config, model, tier, plan, policy, preflight, job_id):
-    """Reconstruct every arm and pair of one cell, then its series decision."""
+    """Reconstruct every timed run of one cell, then its decision with the sealed history."""
     protocol = timed_protocol(config)
     data, receipts, evidence, host_states = {}, {}, {}, {}
     host_policy = mac_host_gate.policy(config) if config.get("paths", {}).get("platform") == "darwin" else None
     job_root = mac_job_root(config["manifest_path"]) if host_policy is not None else None
-    for index, side in schedule(protocol["samples_per_side"]):
+    for index, side in schedule(protocol["order"]):
         folder = root / model / tier / ("r" + str(index)) / side
         arm = load(folder / "benchmark.json")
         if (arm.get("status") != "passed" or arm.get("cleanup_confirmed") is not True
                 or arm.get("completion_requests") != 1 or arm.get("revision") != plan[side]
-                or arm.get("tier") != tier or arm.get("model") != model or arm.get("pair") != index):
-            raise ValueError("selected benchmark arm is missing, failed, repeated or unclean")
+                or arm.get("tier") != tier or arm.get("model") != model or arm.get("run") != index):
+            raise ValueError("selected timed run is missing, failed, repeated or unclean")
         if load(folder / "started.json").get("stage_id") != arm_prefix(side, model, index) + "-benchmark-" + tier:
-            raise ValueError("timed arm evidence belongs to another stage")
+            raise ValueError("timed run evidence belongs to another stage")
         spec = config["sides"][side]["models"][model]["benchmarks"][tier]
         launch = arm_launch(spec, side, index, required=config.get("validation_mode") == PERFORMANCE_MODE,
                             job_root=job_root)
@@ -147,25 +147,21 @@ def performance_retained(root, config, model, tier, plan, policy, preflight, job
                       "host-state-after-cleanup.json"]
         evidence["r" + str(index) + "/" + side] = {
             name: dict(path=str((folder / name).relative_to(root)), sha256=digest(folder / name)) for name in names}
-    pairs = []
-    for index in range(1, protocol["samples_per_side"] + 1):
-        compared = compare_pair(data[index, "base"], data[index, "candidate"],
-                                receipts[index, "base"], receipts[index, "candidate"], policy)
-        if host_policy is not None:
-            compared = mac_host_gate.pair(compared, host_states[index, "base"], host_states[index, "candidate"])
-        if load(root / model / tier / ("r" + str(index)) / "comparison.json") != compared:
-            raise ValueError("selected pair comparison differs from verified raw arms")
-        pairs.append(compared)
-    series = compare_series(data, receipts, pairs, policy, protocol=protocol, bands=sealed_bands(config),
-                            cell=dict(device=config["device"], model=model, tier=tier, job_id=job_id,
-                                      base=plan["base"], candidate=plan["candidate"]))
-    if load(root / model / tier / "comparison.json") != series:
-        raise ValueError("selected cell decision differs from verified raw pairs")
-    return dict(tier=tier, **series, sources={side: plan[side] for side in ("base", "candidate")},
+    environment = (mac_host_gate.cell({arm_name(*key): value for key, value in host_states.items()})
+                   if host_policy is not None else None)
+    decision = decide_cell(data, receipts, policy, protocol=protocol, history=sealed_history(config),
+                           environment=environment,
+                           cell=dict(device=config["device"], model=model, tier=tier, job_id=job_id,
+                                     base=plan["base"], candidate=plan["candidate"]))
+    if protocol["purpose"] == BASELINE:
+        decision["build"] = baseline_build_identity(config, load(root / "build-candidate" / "build-receipt.json"))
+    if load(root / model / tier / "comparison.json") != decision:
+        raise ValueError("selected cell decision differs from verified raw runs")
+    return dict(tier=tier, **decision, sources={side: plan[side] for side in ("base", "candidate")},
                 evidence=evidence)
 
 
-def device_report(root, plan, policy, job, child, scope=None, bands_sha256=None):
+def device_report(root, plan, policy, job, child, scope=None, history_sha256=None):
     root = Path(root)
     report = load(root / "integration.json")
     sealed(root, report)
@@ -203,11 +199,23 @@ def device_report(root, plan, policy, job, child, scope=None, bands_sha256=None)
         # bound() above already admitted the sealed config protocol for this plan.
         if report.get("performance_protocol") != timed_protocol(config):
             raise ValueError("required interleaved 512/256 performance protocol differs")
-    # The operator envelope names the bands it sealed into every device config;
-    # the child decided with them and this replay recomputes with the same bytes.
-    bands = fingerprint(sealed_bands(config))
-    if ((scope is not None and bands != bands_sha256) or report.get("noise_bands_sha256") != bands):
-        raise ValueError("sealed noise bands differ from the operator envelope or the executed job")
+    # The operator envelope names the history it sealed into every device config;
+    # the child decided with it and this replay recomputes with the same records.
+    history = fingerprint(sealed_history(config))
+    if (scope is not None and history != history_sha256) or report.get("baseline_history_sha256") != history:
+        raise ValueError("sealed baseline history differs from the operator envelope or the executed job")
+    base_build = load(root / "build-base" / "build-receipt.json") if (root / "build-base").exists() else None
+    offer = config.get("base_build")
+    expected_source = None
+    if base_build is not None:
+        adopted = base_build.get("adopted")
+        if (adopted is not None and (offer is None or adopted != dict(key=offer["key"],
+                                                                       manifest_sha256=offer["freeze_manifest_sha256"])
+                                     or base_build["freeze"]["manifest_sha256"] != offer["freeze_manifest_sha256"])):
+            raise ValueError("adopted base build differs from the sealed cache offer")
+        expected_source = "cache" if adopted is not None else "built"
+    if (report.get("base_build") or {}).get("source") != expected_source:
+        raise ValueError("reported base build source differs from the retained build receipt")
     model_admission.retained(root, config, manifest, report)
     if digest(root / "performance-preflight.json") != report.get("performance_preflight_sha256"):
         raise ValueError("selected preflight gate missing or changed")
@@ -303,7 +311,7 @@ def failed_cells(plan, device, error):
             for cell in plan["cells"] if cell["required"] and cell["device"] == device]
 
 
-def operator_aggregate(plan, policy, artifacts, jobs, children, scope, bands_sha256):
+def operator_aggregate(plan, policy, artifacts, jobs, children, scope, history_sha256):
     """Report this authorized run without claiming the entire impact is covered."""
     validate(plan, policy)
     if execution_scope(scope) != scope:
@@ -323,7 +331,7 @@ def operator_aggregate(plan, policy, artifacts, jobs, children, scope, bands_sha
     for device in scope["execution_devices"]:
         try:
             actual = device_report(Path(artifacts) / device / jobs[device]["job_id"], plan, policy,
-                                   jobs[device], children[device], scope, bands_sha256)
+                                   jobs[device], children[device], scope, history_sha256)
             expected = {cell["model"] for cell in plan["cells"] if cell["required"] and cell["device"] == device}
             if len(actual) != len(expected) or {row["model"] for row in actual} != expected:
                 raise ValueError("selected device/model cells missing, repeated or unexpected")
@@ -343,5 +351,5 @@ def operator_aggregate(plan, policy, artifacts, jobs, children, scope, bands_sha
                 linux_scoped_status=outcome(linux) if linux else "not-in-this-run",
                 mac_scoped_status=outcome(mac) if mac else "not-in-this-run",
                 full_impact_coverage_complete=complete, pr_publication="not-enabled",
-                source_identity="sealed-source-not-current-pr", noise_bands_sha256=bands_sha256, **scope,
+                source_identity="sealed-source-not-current-pr", baseline_history_sha256=history_sha256, **scope,
                 selection_plan_sha256=fingerprint(plan), cells=rows, errors=errors, formal_samples=0)

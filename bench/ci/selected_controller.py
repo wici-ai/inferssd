@@ -96,7 +96,7 @@ def operator_envelope(value, policy, identity, actor):
     fields = {"schema_version", "purpose", "repository", "base", "head", "candidate",
               "selection", "selection_plan_sha256", "execution_devices", "validation_mode",
               "prepared_by", "controller_repository", "controller_workflow_sha", "policy_sha256",
-              "noise_bands_sha256", "jobs"}
+              "baseline_history_sha256", "jobs"}
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("complete sealed operator envelope required")
     impact = validate(value["selection"], policy)
@@ -107,7 +107,7 @@ def operator_envelope(value, policy, identity, actor):
             or value["controller_repository"] != policy["controller_repository"]
             or value["controller_workflow_sha"] != identity["workflow_sha"]
             or value["policy_sha256"] != fingerprint(policy)
-            or not isinstance(value["noise_bands_sha256"], str) or not HASH.fullmatch(value["noise_bands_sha256"])
+            or not isinstance(value["baseline_history_sha256"], str) or not HASH.fullmatch(value["baseline_history_sha256"])
             or value["selection_plan_sha256"] != fingerprint(impact)
             or any(value[key] != impact[key] for key in ("base", "head", "candidate"))
             or not isinstance(prepared, dict) or prepared.get("login") != actor["login"]
@@ -399,22 +399,10 @@ def values_text(values, signed=False):
 METRIC_LABELS = (("decode_first128_tps", "Decode 0–128 tok/s"), ("decode_second128_tps", "Decode 128–256 tok/s"),
                  ("decode_tps", "Whole decode tok/s"), ("ttft_s", "Request TTFT seconds"),
                  ("server_prefill_tps", "Native prefill tok/s"))
-RESULT_LABELS = {"within-band": "within band", "regressed": "beyond band, every pair slower",
-                 "pairs-disagree": "beyond band, pairs disagree", "no-matching-band": "no matching band",
-                 "informational": "information only"}
-
-
-def band_text(entry):
-    band = entry.get("noise_band")
-    if not isinstance(band, dict):
-        return "unavailable"
-    if band.get("status") == "missing":
-        return "no band for this device/model/tier"
-    text = summary_text(band.get("status", "unavailable")) + " (" + summary_text(band.get("pairs", "?")) + " calibration pairs"
-    k = entry.get("decision_rule", {}).get("k")
-    if k is not None:
-        text += ", k " + summary_text(k)
-    return text + ", " + summary_text(band.get("date", "undated")) + ", revision `" + summary_text(str(band.get("engine_revision", "unknown"))[:12]) + "`)"
+RESULT_LABELS = {"within-noise": "within noise", "improved": "improved: faster beyond noise",
+                 "regressed": "regressed: slower beyond noise, every PR run slower",
+                 "candidates-disagree": "slower beyond noise, PR runs disagree",
+                 "no-baseline-history": "no matching baseline history", "informational": "information only"}
 
 
 def operator_summary(stream, report):
@@ -429,8 +417,8 @@ def operator_summary(stream, report):
     for key in ("base", "head", "candidate"):
         if key in report:
             stream.write(key + ": `" + summary_text(report[key]) + "`\n\n")
-    if report.get("noise_bands_sha256"):
-        stream.write("Sealed noise bands SHA-256: `" + summary_text(report["noise_bands_sha256"]) + "`\n\n")
+    if report.get("baseline_history_sha256"):
+        stream.write("Sealed baseline history SHA-256: `" + summary_text(report["baseline_history_sha256"]) + "`\n\n")
     stream.write("| Device | Model | Functional | Numerical | Performance | Outcome |\n|---|---|---|---|---|---|\n")
     cells = []
     for row in report["cells"]:
@@ -445,55 +433,68 @@ def operator_summary(stream, report):
                   row.get("numerical", row["status"]), performance, row["status"]]
         stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
     if cells:
-        calibration = any(entry.get("protocol", {}).get("purpose") == "noise-calibration" for _, entry in cells)
-        stream.write("\n### 512 prompt / 256 decode: interleaved base/PR pairs\n\n")
-        counts = sorted({entry.get("protocol", {}).get("samples_per_side") for _, entry in cells} - {None}, key=str)
-        stream.write("Each cell ran " + summary_text(", ".join(map(str, counts)) or "the planned") + " base/PR pairs in ABBA order "
-                     "(base, PR, PR, base, …). Every arm is a fresh server with one completion; all arms are kept, "
-                     "none is retried or selected. Values are listed in pair order.\n\n")
-        if calibration:
-            stream.write("Calibration run: base and PR are the same revision, so d measures run-to-run noise. "
-                         "No pass or regression decision is made.\n\n")
-            stream.write("| Device | Model | Tier | Metric | Base per pair | PR per pair | d per pair | Mean d | RMS d |\n")
-            stream.write("|---|---|---|---|---:|---:|---:|---:|---:|\n")
-        else:
-            stream.write("| Device | Model | Tier | Metric | Base per pair | PR per pair | Change | d per pair | Mean d | Threshold | Result |\n")
-            stream.write("|---|---|---|---|---:|---:|---:|---:|---:|---:|---|\n")
-        for row, entry in cells:
-            for key, label in METRIC_LABELS:
-                metric = entry.get("metrics", {}).get(key, {})
-                values = [row["device"], row["model"], entry["tier"], label,
-                          values_text(metric.get("base")), values_text(metric.get("candidate"))]
-                if calibration:
-                    values += [values_text(metric.get("d"), True), number_text(metric.get("mean_d"), True),
-                               number_text(metric.get("rms_d"))]
-                else:
+        baseline = [(row, entry) for row, entry in cells if entry.get("protocol", {}).get("purpose") == "baseline"]
+        gate = [(row, entry) for row, entry in cells if (row, entry) not in baseline]
+        if gate:
+            stream.write("\n### 512 prompt / 256 decode: PR runs against the base and its baseline history\n\n")
+            stream.write("Each PR cell ran the PR three times and the base once, in the order PR, base, PR, PR. "
+                         "Every run is a fresh server with one completion; all runs are kept, none is retried or "
+                         "selected. The base history holds the four runs of the base commit's baseline job on the "
+                         "same device.\n\n")
+            stream.write("| Device | Model | Tier | Metric | Base history | Base run | PR runs | Change | Threshold | Result |\n")
+            stream.write("|---|---|---|---|---:|---:|---:|---:|---:|---|\n")
+            for row, entry in gate:
+                for key, label in METRIC_LABELS:
+                    metric = entry.get("metrics", {}).get(key, {})
                     threshold = metric.get("threshold")
-                    values += [metric_text(metric, "change_percent"), values_text(metric.get("d"), True),
-                               number_text(metric.get("mean_d"), True),
-                               number_text(threshold) if threshold is not None else "none",
-                               RESULT_LABELS.get(metric.get("result"), metric.get("result", "unavailable"))]
-                stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
-        stream.write("\n")
-        for row, entry in cells:
-            reasons = entry.get("review_reasons", [])
-            stream.write("- " + summary_text(row["device"] + "/" + row["model"] + "/" + entry["tier"]) + ": **"
-                         + summary_text(entry.get("status", "unavailable")) + "**")
-            if not calibration:
-                stream.write(". Noise band: " + band_text(entry))
-            stream.write(". Review reasons: " + summary_text(", ".join(reasons) if reasons else "none") + ".\n")
-        stream.write("\nd is the natural log of PR/base per pair, signed so that a positive value means the PR is slower "
-                     "(for throughput, −ln(PR/base); for TTFT, ln(PR/base)). Change is the geometric mean of PR/base "
-                     "minus 1, in percent; lower TTFT is better. TTFT starts at the request, not model loading. ")
-        if not calibration:
-            stream.write("Threshold = max(ln(1 + floor), k·σ/√pairs), with σ from an A/A calibration on the same device, "
-                         "model and measured conditions, and k the one-sided Student-t quantile for the band's pooled pairs "
-                         "that matches a normal 3σ tail. Only whole decode, TTFT and native prefill decide; the two decode "
-                         "half-windows are sub-windows of whole decode and are shown for information. Regressed: a deciding "
-                         "metric's mean d above its threshold and every pair slower. Needs review: above the threshold with "
-                         "disagreeing pairs, different generated tokens, no matching noise band, or a flagged host check. "
-                         "Passed: no slowdown beyond measured noise.")
-        stream.write("\n\n")
+                    values = [row["device"], row["model"], entry["tier"], label, values_text(metric.get("history")),
+                              number_text(metric.get("base_run")), values_text(metric.get("candidate")),
+                              metric_text(metric, "change_percent"),
+                              number_text(threshold) if threshold is not None else "none",
+                              RESULT_LABELS.get(metric.get("result"), metric.get("result", "unavailable"))]
+                    stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
+            stream.write("\n")
+            for row, entry in gate:
+                reasons = entry.get("review_reasons", [])
+                deciding = entry.get("metrics", {}).get("decode_tps", {})
+                stream.write("- " + summary_text(row["device"] + "/" + row["model"] + "/" + entry["tier"]) + ": **"
+                             + summary_text(entry.get("status", "unavailable")) + "**. Baseline history: "
+                             + summary_text(len(entry.get("history_pool", []))) + " records, df "
+                             + summary_text(deciding.get("df", "none")) + ", t "
+                             + summary_text(deciding.get("k", "none")) + ". Improved: "
+                             + summary_text(", ".join(entry.get("improvements", [])) or "none") + ". Review reasons: "
+                             + summary_text(", ".join(reasons) if reasons else "none") + ".\n")
+            stream.write("\nChange is the PR's geometric mean over the base estimate (the four history runs and the "
+                         "in-run base), minus 1, in percent; lower TTFT is better. TTFT starts at the request, not model "
+                         "loading. Threshold is on the log scale: max(ln(1 + floor), t·σ·√(1/3 + 1/5)), where σ is the "
+                         "pooled within-commit spread of the device's baseline history under the same measured conditions "
+                         "and t the one-sided Student-t quantile for its degrees of freedom, matching a normal 3σ tail. "
+                         "Only whole decode, TTFT and native prefill decide; the two decode half-windows are shown for "
+                         "information. Regressed: a deciding metric beyond its threshold with every PR run slower than the "
+                         "base estimate. Needs review: the in-run base differs from its history, PR runs disagree, generated "
+                         "tokens differ, no matching history, or a flagged host check. Passed: no slowdown beyond measured "
+                         "noise. Improved: a deciding metric whose PR mean is faster than the base estimate by more than "
+                         "the same threshold; it is a label on that metric, and the cell status stays passed. Within "
+                         "noise: inside the threshold either way.\n\n")
+        if baseline:
+            stream.write("\n### 512 prompt / 256 decode: baseline runs of a main commit\n\n")
+            stream.write("One build measured four times; no pass or regression decision. σ and df include this record "
+                         "and the device's earlier records under the same measured conditions.\n\n")
+            stream.write("| Device | Model | Tier | Metric | Runs | Mean ln | σ (log) | df |\n|---|---|---|---|---:|---:|---:|---:|\n")
+            for row, entry in baseline:
+                for key, label in METRIC_LABELS:
+                    metric = entry.get("metrics", {}).get(key, {})
+                    values = [row["device"], row["model"], entry["tier"], label, values_text(metric.get("values")),
+                              number_text(metric.get("mean_log"), True), number_text(metric.get("sigma_log")),
+                              summary_text(metric.get("df", "none"))]
+                    stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
+            stream.write("\n")
+            for row, entry in baseline:
+                reasons = entry.get("review_reasons", [])
+                stream.write("- " + summary_text(row["device"] + "/" + row["model"] + "/" + entry["tier"]) + ": **"
+                             + summary_text(entry.get("status", "unavailable")) + "**. Review reasons: "
+                             + summary_text(", ".join(reasons) if reasons else "none") + ".\n")
+            stream.write("\n")
         mac_cells = [(row, entry) for row, entry in cells if row["device"] == "local-mbp"]
         if mac_cells:
             def scaled(value, unit):
@@ -502,34 +503,28 @@ def operator_summary(stream, report):
                 return f"{value / unit:.4f}"
 
             stream.write("### Mac sampled host conditions\n\n")
-            stream.write("| Model | Tier | Pair | Side | Quiet free+inactive GiB | Timed swap Δ MiB | Timed compression Δ MiB | Non-CI CPU cores | Pressure | Timed status |\n")
-            stream.write("|---|---|---|---|---:|---:|---:|---:|---|---|\n")
+            stream.write("| Model | Tier | Run | Quiet free+inactive GiB | Timed swap Δ MiB | Timed compression Δ MiB | Non-CI CPU cores | Pressure | Timed status |\n")
+            stream.write("|---|---|---|---:|---:|---:|---:|---|---|\n")
             for row, entry in mac_cells:
-                pairs = entry.get("pairs") if isinstance(entry.get("pairs"), list) and entry.get("pairs") else [{}]
-                for index, pair in enumerate(pairs, 1):
-                    environment = pair.get("environment", {})
-                    for side in ("base", "candidate"):
-                        arm = environment.get(side, {})
-                        timed = arm.get("timed", {})
-                        levels = timed.get("memory_pressure_levels")
-                        pressure = " → ".join(str(level) for level in levels) if isinstance(levels, list) else "unavailable"
-                        values = [row["model"], entry["tier"], index if pair else "unavailable", side,
-                            scaled(arm.get("prelaunch_free_inactive_bytes"), 1 << 30),
-                            scaled(timed.get("swap_delta_bytes"), 1 << 20),
-                            scaled(timed.get("compression_delta_bytes"), 1 << 20),
-                            metric_text(timed.get("process_activity", {}), "non_ci_cpu_cores"),
-                            pressure, timed.get("status", "unavailable")]
-                        stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
+                runs = entry.get("environment", {}).get("runs") or {"unavailable": {}}
+                for name, arm in runs.items():
+                    timed = arm.get("timed", {})
+                    levels = timed.get("memory_pressure_levels")
+                    pressure = " → ".join(str(level) for level in levels) if isinstance(levels, list) else "unavailable"
+                    values = [row["model"], entry["tier"], name,
+                        scaled(arm.get("prelaunch_free_inactive_bytes"), 1 << 30),
+                        scaled(timed.get("swap_delta_bytes"), 1 << 20),
+                        scaled(timed.get("compression_delta_bytes"), 1 << 20),
+                        metric_text(timed.get("process_activity", {}), "non_ci_cpu_cores"),
+                        pressure, timed.get("status", "unavailable")]
+                    stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
             stream.write("\n")
             for row, entry in mac_cells:
-                pairs = entry.get("pairs") if isinstance(entry.get("pairs"), list) and entry.get("pairs") else [{}]
-                for index, pair in enumerate(pairs, 1):
-                    environment = pair.get("environment", {})
-                    reasons = environment.get("reasons", ["missing environment evidence"])
-                    stream.write("- " + summary_text(row["model"] + "/" + entry["tier"]) + " pair "
-                        + (str(index) if pair else "unavailable") + " environment: "
-                        + summary_text(environment.get("status", "unavailable")) + "; reasons: "
-                        + summary_text(", ".join(reasons) if reasons else "none") + ".\n")
+                environment = entry.get("environment", {})
+                reasons = environment.get("reasons", ["missing environment evidence"])
+                stream.write("- " + summary_text(row["model"] + "/" + entry["tier"]) + " environment: "
+                    + summary_text(environment.get("status", "unavailable")) + "; reasons: "
+                    + summary_text(", ".join(reasons) if reasons else "none") + ".\n")
             stream.write("\nQuiet memory is the final prelaunch sample; timed CPU is the sampled non-CI total. ")
             stream.write("Swap and pressure may be model-induced. These observations do not establish external interference, excuse measured slowdowns, or trigger automatic retries; they are not strict isolation.\n\n")
         stream.write("<details><summary>Cell identities and retained raw evidence</summary>\n\n")
@@ -594,7 +589,7 @@ def operator_report(args, env=os.environ):
             if latest.get("id") != child["id"] or latest.get("status") != "completed" or latest.get("conclusion") not in ("success", "failure"):
                 raise ValueError("operator child is not an exact completed single attempt")
             children[device] = latest
-        report = operator_aggregate(impact, policy, args.artifacts, jobs, children, scope, envelope["noise_bands_sha256"])
+        report = operator_aggregate(impact, policy, args.artifacts, jobs, children, scope, envelope["baseline_history_sha256"])
         if state["errors"]:
             # Only a verified regressed/needs-review decision explains a child
             # that exited nonzero; any other child error fails the report.
@@ -619,8 +614,8 @@ def operator_report(args, env=os.environ):
     if summary:
         with Path(summary).open("a", encoding="utf-8") as stream:
             operator_summary(stream, report)
-    # A clean calibration has no pass/fail decision, but it is a complete run.
-    return 0 if report["passed"] or report.get("status") == "calibrated" else 1
+    # A clean baseline job has no pass/fail decision, but it is a complete run.
+    return 0 if report["passed"] or report.get("status") == "baseline" else 1
 
 
 def finalize(args, env=os.environ):

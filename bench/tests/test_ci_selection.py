@@ -100,7 +100,8 @@ def test_root_config_and_manifest_cross_bind_and_exact_stage_allowlist():
     needs = contract.bound(config, manifest, 'f'*32)
     assert needs['models'] == ['deepseek', 'muse']
     assert 'candidate-numerical-model-adapter' in manifest['stages']
-    assert {'base-deepseek-r1-benchmark-512', 'base-deepseek-r2-benchmark-512'} <= set(manifest['stages'])
+    assert {'base-deepseek-r1-benchmark-512', 'candidate-deepseek-r3-benchmark-512'} <= set(manifest['stages'])
+    assert 'base-deepseek-r2-benchmark-512' not in manifest['stages']
     assert 'base-deepseek-benchmark-512' not in manifest['stages']
     assert not any('4096' in key for key in manifest['stages'])
     for target in ('config', 'manifest'):
@@ -220,7 +221,7 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
     from ci import selected_integration as execution
     from ci import selected_preflight
     from test_ci_staged_benchmark import Session as Recorder, CONFIG
-    from test_ci_performance_series import banded
+    from test_ci_performance_series import record
     from ci.compare import comparable, conditions_digest
     value = plan(['engine/ggml/src/ggml-cuda/ssd/mxfp4-compute-adapter.cpp'])
     config = template(value)
@@ -230,10 +231,9 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
             build=dict(loaded_libraries=[]), host=dict(hardware='synthetic', os='synthetic', memory_budget_bytes=1,
                 os_page_cache_treatment='uncontrolled', effective_settings=dict(native_launch_policy=dict(typed_values={}))))
 
-    bands = banded({('cloud-5090', 'deepseek', '512'): conditions_digest(comparable(synthetic('base', tmp_path)))})
     config.update(selection_plan=value, selection_plan_sha256=impact.fingerprint(value),
                   manifest_sha256='a'*64, paths=config['sides']['candidate']['paths'],
-                  control_revision='d'*40, control_manifest_sha256='e'*64, policy=POLICY, noise_bands=bands)
+                  control_revision='d'*40, control_manifest_sha256='e'*64, policy=POLICY, baseline_history=[])
     manifest = tmp_path/'manifest.json'
     config['manifest_path'] = str(manifest)
     for side, spec in config['sides'].items():
@@ -258,7 +258,7 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
     monkeypatch.setattr(execution, 'source_manifest', lambda *args: 'd'*40)
     real_digest = execution.digest
     monkeypatch.setattr(execution, 'digest', lambda p: 'e'*64 if Path(p).name == 'control-source.json' else real_digest(p))
-    monkeypatch.setattr(execution, 'run_build', lambda session, side, *args:
+    monkeypatch.setattr(execution, 'run_build', lambda session, side, *args, **kwargs:
         dict(binary=dict(runtime_path='/build/'+side+'/bin/llama-server', sha256='0'*64), toolchain={}, actual_server_version='synthetic', images=[]))
     monkeypatch.setattr(execution, 'selected_numerical', lambda session, cfg, build, cases, output:
         {c: dict(status='passed', synthetic=True) for c in cases})
@@ -273,15 +273,30 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
         return result
     monkeypatch.setattr(execution, 'receipt', receipt)
     monkeypatch.setattr(selected_preflight, 'receipt', receipt)
-    args = SimpleNamespace(output=tmp_path/'out', config=path, config_sha256=real_digest(path),
-                           selection_plan_sha256=impact.fingerprint(value), job_id='f'*32, socket='/unused')
-    assert execution.run(args) == (0 if clean else 1)
-    result = load(args.output/'integration.json')
+    def run(history, output):
+        config['baseline_history'] = history
+        path.write_text(json.dumps(config))
+        args = SimpleNamespace(output=tmp_path/output, config=path, config_sha256=real_digest(path),
+                               selection_plan_sha256=impact.fingerprint(value), job_id='f'*32, socket='/unused')
+        return execution.run(args), load(args.output/'integration.json'), args.output
+
+    # Without history the cell needs review; nothing else changes.
+    code, result, output = run([], 'first')
+    assert code == 1
+    assert result['cells'][0]['performance'][0]['review_reasons'] == ['no-baseline-history']
+    # The base commit's baseline record, measured like the in-run base under the same conditions.
+    from ci.compare import METRICS
+    measured = load(output/'deepseek/512/r1/base/result.json')
+    history = [record(value['base'], model='deepseek', base={metric: measured['metrics'][metric] for metric in METRICS},
+                      tokens=measured['tokens'],
+                      conditions=conditions_digest(comparable(synthetic('base', tmp_path))))]
+    code, result, output = run(history, 'out')
+    assert code == (0 if clean else 1)
     assert result['cleanup_confirmed'] is clean and (result['status']=='passed') is clean
-    assert len(sessions) == 1 and sessions[0].closed
-    assert sessions[0].started == ['base-deepseek-r1-benchmark-512', 'candidate-deepseek-r1-benchmark-512',
-                                   'candidate-deepseek-r2-benchmark-512', 'base-deepseek-r2-benchmark-512']
-    assert sessions[0].completions == 4
+    assert len(sessions) == 2 and sessions[-1].closed
+    assert sessions[-1].started == ['candidate-deepseek-r1-benchmark-512', 'base-deepseek-r1-benchmark-512',
+                                    'candidate-deepseek-r2-benchmark-512', 'candidate-deepseek-r3-benchmark-512']
+    assert sessions[-1].completions == 4
     assert result['selection_plan_sha256'] == impact.fingerprint(value)
-    assert result['noise_bands_sha256'] == impact.fingerprint(bands)
+    assert result['baseline_history_sha256'] == impact.fingerprint(history)
     assert result['formal_samples'] == 0

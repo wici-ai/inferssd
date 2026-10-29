@@ -21,10 +21,12 @@ import tarfile
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ci.contract import HASH, digest, load, noise_bands, policy_read, revision, save
+from ci.contract import HASH, digest, load, policy_read, revision, save
 from ci.impact import fingerprint, plan, device_requirements
 from ci.staged_build import validate_platform_flags
-from ci.selection_contract import JOB, bind, bound, runtime_requirements, performance_protocol
+from ci.selection_contract import (BASELINE_JOB, GATE, JOB, bind, bound, build_cache_key, job_sides,
+                                   performance_protocol, runtime_requirements)
+from ci import history as baseline_history
 
 
 LINUX_DEVICES = ("cloud-5090", "dgx-spark")
@@ -35,7 +37,6 @@ PURPOSE = "operator-selected-report-only"
 MAX_INPUT = 60 * 1024
 WORKFLOW = ".github/workflows/device-performance.yml"
 MAC_PYTHON = "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9"
-BANDS_FILE = "noise-bands.json"
 
 
 def device_layout(device, job_id):
@@ -122,6 +123,16 @@ class Gh:
             )
         return parsed(result.stdout) if result.stdout.strip() else None
 
+    def raw(self, path, limit=64 << 20):
+        """Bytes of one GET (an artifact zip); gh follows the signed redirect without its token."""
+        result = subprocess.run([self.executable, "api", "--hostname", "github.com", path],
+                                capture_output=True, timeout=300)
+        if result.returncode:
+            raise RuntimeError("existing gh login/API download failed: " + path + " (exit " + str(result.returncode) + ")")
+        if len(result.stdout) > limit:
+            raise ValueError("downloaded artifact exceeds its bound")
+        return result.stdout
+
 
 def git(source, *args):
     result = subprocess.run(["git", "-C", str(source), *args], capture_output=True, timeout=60)
@@ -198,20 +209,6 @@ def input_file(root, name):
     if path.resolve() != root.resolve().joinpath(*PurePosixPath(name).parts):
         raise ValueError("reviewed input path has a symlink ancestor")
     return path
-
-
-def operator_bands(inputs):
-    """Calibrated noise bands kept beside the reviewed profiles, not in the control export.
-
-    The file holds the `bands` object printed by noise_band.py. A missing file
-    means no bands, so every timed cell needs review. A symlink or an invalid
-    band refuses preparation.
-    """
-    root = Path(inputs).resolve().parent
-    path = root / BANDS_FILE
-    if not path.exists() and not path.is_symlink():
-        return {}
-    return noise_bands(load(input_file(root, BANDS_FILE)))
 
 
 def substitute(value, job_id):
@@ -406,14 +403,14 @@ def prepare(args, api=None):
     mode = getattr(args, "validation_mode", MODE)
     if mode not in (MODE, LEGACY_MODE):
         raise ValueError("explicit supported operator validation mode required")
-    # A calibration measures one exact revision against itself: both sides are
-    # exported, staged and built separately from the same commit, exactly like
-    # a comparison, and every enabled device/model is selected.
-    calibration_pairs = getattr(args, "calibration_pairs", None)
-    calibration = calibration_pairs is not None
-    protocol = performance_protocol(calibration_pairs) if calibration else None
-    if calibration and (mode != MODE or len({getattr(args, key) for key in ("base", "head", "candidate")}) != 1):
-        raise ValueError("noise calibration needs performance mode and one base/head/candidate revision")
+    # A baseline job measures one main commit on its own: base, head and
+    # candidate are that commit, it is built once (as the candidate side), and
+    # every enabled device/model is selected although the diff is empty.
+    baseline = getattr(args, "baseline", False)
+    if type(baseline) is not bool or (baseline and (
+            mode != MODE or len({getattr(args, key) for key in ("base", "head", "candidate")}) != 1)):
+        raise ValueError("a baseline job needs performance mode and one base/head/candidate commit")
+    protocol = performance_protocol(BASELINE_JOB if baseline else GATE)
     if mode == MODE:
         import final_chat
         final_chat.prompt_path("512")  # Trusted recorder input, never PR source.
@@ -431,12 +428,19 @@ def prepare(args, api=None):
         raise ValueError("private controller main changed from reviewed input")
     identities = {key: revision(getattr(args, key)) for key in ("base", "head", "candidate")}
     source, paths, full_diff = source_identity(args.source, identities, api, policy["repository"])
-    impact = plan(paths, policy, calibration=calibration, **identities)
+    impact = plan(paths, policy, baseline=baseline, **identities)
     execution = [device for device in execution if device_requirements(impact, device)["models"]]
     if not execution:
         raise ValueError("impact requires no enabled device; do not stage or dispatch")
+    # Opt-in per device: the Linux broker keeps a baseline job's build for later PR base sides.
+    cache = {device: specification["devices"][device].get("base_build_cache", False) for device in execution}
+    if any(type(value) is not bool for value in cache.values()) or cache.get("local-mbp"):
+        raise ValueError("base_build_cache must be a boolean, and only the Linux broker keeps builds")
     root = args.inputs.resolve().parent
-    bands = operator_bands(args.inputs)
+    # The verified baseline records of the executing devices, sealed into every
+    # device config and named by hash in the envelope for the hosted replay.
+    history = ([record for record in baseline_history.load_all(baseline_history.store_root(args.inputs))
+                if record["device"] in execution] if mode == MODE else [])
     devices, jobs, inputs, pending_assets = {}, {}, {}, {}
     for device in execution:
         declared = specification["devices"][device]
@@ -448,10 +452,19 @@ def prepare(args, api=None):
                                        identities, mode, protocol)
         if template.get("device") != device or manifest.get("job_id") != job_id:
             raise ValueError("device/job template differs from selected slot")
-        # Bands are hash-bound job data: the config hash covers them and the
-        # envelope names their digest for the hosted replay.
-        template.update(execution_devices=execution, validation_mode=mode, selection_plan=impact,
-                        noise_bands=bands)
+        template.update(execution_devices=execution, validation_mode=mode, selection_plan=impact)
+        if mode == MODE:
+            template["baseline_history"] = history
+            if cache[device] and baseline:
+                template["cache_build_as"] = build_cache_key(template, "candidate")
+            elif cache[device]:
+                # Offer the base commit's baseline build. The broker re-hashes it; a
+                # pruned or missing entry is refused there and the base side is built.
+                built = next((record for record in history
+                              if record["device"] == device and record["commit"] == identities["base"]), None)
+                if built is not None and built["build"]["cache_key"] == build_cache_key(template, "base"):
+                    template["base_build"] = dict(key=built["build"]["cache_key"], source_job=built["job_id"],
+                                                  freeze_manifest_sha256=built["build"]["freeze_manifest_sha256"])
         admission_policy = root_policy(template, manifest, declared)
         if device == "local-mbp":
             from ci.operator_mac_stage import settings_payload
@@ -480,7 +493,7 @@ def prepare(args, api=None):
                 data["benchmarks"] = {tier: data["benchmarks"][tier] for tier in tiers}
         manifest["models"] = {name: path for name, path in manifest["models"].items() if name in needs["models"] or
             any(name == "settings-" + model + "-" + side + ".ssd" for model in needs["models"] for side in ("base", "candidate"))}
-        active_sides = ("base", "candidate") if needs["performance"] else ("candidate",)
+        active_sides = job_sides(template, needs)
         for key in ("sources", "source_revisions", "builds"):
             manifest[key] = {side: manifest[key][side] for side in active_sides}
         manifest["models"] = {name: path for name, path in manifest["models"].items() if name in needs["models"] or
@@ -518,7 +531,7 @@ def prepare(args, api=None):
                 raw = pending_assets[device, name]
                 assets[name] = dict(local_path=str((args.output / device / name).resolve()),
                                     bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
-        sides = ("base", "candidate") if needs["performance"] else ("candidate",)
+        sides = job_sides(config, needs)
         expected_assets = {staged_settings_name(model, side, mode) for side in sides for model in needs["models"]}
         if not expected_assets <= set(assets):
             raise ValueError("explicit settings payloads for exactly the selected sides/models required")
@@ -528,7 +541,7 @@ def prepare(args, api=None):
                 name = staged_settings_name(model, side, mode)
                 if assets[name]["sha256"] != data["settings"]["sha256"]:
                     raise ValueError("settings payload differs from declared side hash")
-        if needs["performance"]:
+        if len(sides) == 2:
             for model in needs["models"]:
                 base_data, candidate_data = (config["sides"][side]["models"][model] for side in ("base", "candidate"))
                 def payload(side):
@@ -581,7 +594,7 @@ def prepare(args, api=None):
         **identities, prepared_by=actor, controller_repository=policy["controller_repository"],
         controller_workflow_sha=workflow_sha, selection=impact, selection_plan_sha256=fingerprint(impact),
         execution_devices=execution, validation_mode=mode, jobs=jobs, policy_sha256=fingerprint(policy),
-        noise_bands_sha256=fingerprint(bands))
+        baseline_history_sha256=fingerprint(history))
     if len(json.dumps(envelope, separators=(",", ":"), allow_nan=False).encode()) > MAX_INPUT:
         raise ValueError("complete prepared envelope exceeds workflow input bound; never truncate impact")
     save(args.output / "envelope.json", envelope)
@@ -823,8 +836,8 @@ def main():
             command.add_argument("--policy", type=Path, default=Path(__file__).with_name("policy.json"))
             command.add_argument("--validation-mode", choices=(MODE, LEGACY_MODE), default=MODE)
             command.add_argument("--execution-devices", nargs="+", choices=DEVICES, default=list(DEVICES))
-            command.add_argument("--calibration-pairs", type=int, default=None,
-                                 help="A/A noise calibration with this many pairs; base, head and candidate must be one commit")
+            command.add_argument("--baseline", action="store_true",
+                                 help="baseline job of one main commit; base, head and candidate must be that commit")
         else:
             command.add_argument("--prepared", type=Path, required=True)
         command.add_argument("--gh", default="gh", help="Existing authorized gh executable; no token export")

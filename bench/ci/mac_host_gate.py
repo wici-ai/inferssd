@@ -130,32 +130,30 @@ def retained_arm(folder, expected):
     return summary
 
 
-def pair(compared, base_summary, candidate_summary):
-    """Check one base/candidate pair of an interleaved cell.
+def cell(summaries):
+    """Check every timed run of one cell: {run name: reconstructed arm summary}.
 
-    Keep all measured values and slowdowns; environment flags only demote a
-    passing pair to needs-review, and the cell decision reads them per pair.
+    A flagged run, or prelaunch free memory that differs by more than the free-memory
+    tolerance between any two runs, makes an otherwise passing cell needs-review.
+    Measured values are never changed, excused or retried.
     """
-    if (compared.get("status") not in ("passed", "needs-review")
-            or not _same(base_summary.get("policy"), candidate_summary.get("policy"))):
-        raise ValueError("Mac pair requires matching reconstructed host policies")
+    if not isinstance(summaries, dict) or len(summaries) < 2:
+        raise ValueError("Mac cell check requires every timed run")
+    policies = [summary.get("policy") for summary in summaries.values()]
+    if any(not _same(policies[0], other) for other in policies[1:]):
+        raise ValueError("Mac cell requires matching reconstructed host policies")
     reasons = []
-    for side, summary in (("base", base_summary), ("candidate", candidate_summary)):
+    for name, summary in summaries.items():
         if (summary.get("schema_version") != 1 or summary.get("quiet", {}).get("status") != "passed"
                 or summary.get("timed", {}).get("status") not in ("passed", "flagged")
                 or summary.get("cleanup", {}).get("status") not in ("passed", "flagged")):
-            raise ValueError("Mac pair requires complete reconstructed host evidence")
+            raise ValueError("Mac cell requires complete reconstructed host evidence")
         if summary["timed"]["status"] == "flagged":
-            reasons.extend(side + ":" + reason for reason in summary["timed"]["reasons"])
-    difference = abs(candidate_summary["prelaunch_free_inactive_bytes"] - base_summary["prelaunch_free_inactive_bytes"])
-    if difference > base_summary["policy"]["pair_free_tolerance_bytes"]:
+            reasons.extend(name + ":" + reason for reason in summary["timed"]["reasons"])
+    free = [summary["prelaunch_free_inactive_bytes"] for summary in summaries.values()]
+    spread = max(free) - min(free)
+    if spread > policies[0]["pair_free_tolerance_bytes"]:
         reasons.append("prelaunch-free-inactive-difference")
-    environment = dict(schema_version=1, status="needs-review" if reasons else "passed", reasons=reasons,
-        base=base_summary, candidate=candidate_summary, prelaunch_free_difference_bytes=difference,
-        compression_delta_difference_bytes=candidate_summary["timed"]["compression_delta_bytes"] - base_summary["timed"]["compression_delta_bytes"],
-        interpretation="Sampled host conditions, not isolation or equal-cache proof. Swap/pressure may be model-induced; no automatic attribution to external interference, exemption of measured slowdowns, or retry.")
-    result = copy.deepcopy(compared)
-    result["environment"] = copy.deepcopy(environment)
-    if reasons:
-        result.update(passed=False, status="needs-review", diagnostic_required=True)
-    return result
+    return dict(schema_version=1, status="needs-review" if reasons else "passed", reasons=reasons,
+                runs=copy.deepcopy(summaries), prelaunch_free_spread_bytes=spread,
+                interpretation="Sampled host conditions, not isolation or equal-cache proof. Swap/pressure may be model-induced; no automatic attribution to external interference, exemption of measured slowdowns, or retry.")

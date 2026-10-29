@@ -40,7 +40,7 @@ def operator(tmp_path, monkeypatch):
         execution_devices=devices, validation_mode=contract.FUNCTIONAL_MODE,
         prepared_by=dict(login="maintainer", id=17), controller_repository=POLICY["controller_repository"],
         controller_workflow_sha=env["GITHUB_WORKFLOW_SHA"], policy_sha256=impact.fingerprint(POLICY),
-        noise_bands_sha256=impact.fingerprint({}), jobs=jobs)
+        baseline_history_sha256=impact.fingerprint([]), jobs=jobs)
     event["inputs"] = dict(prepared_envelope=json.dumps(envelope))
     args = SimpleNamespace(policy=Path(__file__).parents[1] / "ci/policy.json", control=tmp_path / "control",
                            plan=tmp_path / "admission.json", artifacts=tmp_path / "artifacts", output=tmp_path / "report.json")
@@ -131,9 +131,9 @@ def ready(a):
 
 def test_report_only_returns_scoped_pass_without_source_api_or_publication(operator, monkeypatch):
     a = operator; ready(a)
-    def raw_aggregate(plan, policy, artifacts, jobs, children, scope, bands_sha256):
+    def raw_aggregate(plan, policy, artifacts, jobs, children, scope, history_sha256):
         assert scope == dict(validation_mode=contract.FUNCTIONAL_MODE, execution_devices=["cloud-5090"])
-        assert bands_sha256 == impact.fingerprint({})
+        assert history_sha256 == impact.fingerprint([])
         return dict(passed=True, full_impact_coverage_complete=False, cells=[], **scope)
     monkeypatch.setattr(controller, "operator_aggregate", raw_aggregate)
     assert controller.operator_report(a.args, a.env) == 0
@@ -458,8 +458,8 @@ def test_decided_child_metrics_survive_report_without_success(operator, monkeypa
     assert decision in Path(a.env["GITHUB_STEP_SUMMARY"]).read_text()
 
 
-@pytest.mark.parametrize("status", ["passed", "calibrated"])
-def test_child_error_is_never_explained_by_a_passing_or_calibrated_cell(operator, monkeypatch, status):
+@pytest.mark.parametrize("status", ["passed", "baseline"])
+def test_child_error_is_never_explained_by_a_passing_or_baseline_cell(operator, monkeypatch, status):
     a = operator
     ready(a)
     state = load(a.args.artifacts / "dispatch-state.json")
@@ -472,13 +472,13 @@ def test_child_error_is_never_explained_by_a_passing_or_calibrated_cell(operator
     assert load(a.args.output)["status"] == "failed"
 
 
-def test_clean_calibration_report_exits_zero_without_claiming_a_pass(operator, monkeypatch):
+def test_clean_baseline_report_exits_zero_without_claiming_a_pass(operator, monkeypatch):
     a = operator; ready(a)
     monkeypatch.setattr(controller, "operator_aggregate", lambda *args:
-        dict(passed=False, status="calibrated", full_impact_coverage_complete=True, cells=[], errors=[]))
+        dict(passed=False, status="baseline", full_impact_coverage_complete=False, cells=[], errors=[]))
     assert controller.operator_report(a.args, a.env) == 0
     report = load(a.args.output)
-    assert report["status"] == "calibrated" and report["passed"] is False
+    assert report["status"] == "baseline" and report["passed"] is False
 
 
 @pytest.mark.parametrize("fault", ["missing", "needs-review", "regressed", "unclean"])
@@ -519,52 +519,60 @@ def test_successful_linux512_is_separate_from_required_4k_and_mac(operator, monk
     assert result["full_impact_coverage_complete"] is False
 
 
-def test_summary_shows_per_pair_values_d_threshold_and_decision():
-    from test_ci_performance_series import decide
-    slower = {"decode_tps": 9.0}
-    entry = decide({(1, "candidate"): slower, (2, "candidate"): slower})
-    assert entry["status"] == "regressed" and entry["regressions"] == ["decode_tps"]
-    report = dict(passed=False, status="regressed", full_impact_coverage_complete=False,
-        base="d" * 40, head="e" * 40, candidate="f" * 40, cells=[dict(device="cloud-5090", model="muse",
-            status="regressed", functional="passed", numerical="passed", performance=[dict(tier="512", **entry)],
-            performance_deferred_tiers=["4096"])])
+def summary(report):
     stream = io.StringIO()
     controller.operator_summary(stream, report)
-    text = stream.getvalue()
-    assert "Each cell ran 2 base/PR pairs in ABBA order" in text
-    assert "| Base per pair | PR per pair | Change | d per pair | Mean d | Threshold | Result |" in text
-    assert ("| cloud-5090 | muse | 512 | Whole decode tok/s | 10.0000, 10.0000 | 9.0000, 9.0000 | -10.000% "
-            "| +0.1054, +0.1054 | +0.1054 | 0.0302 | beyond band, every pair slower |") in text
-    assert ("| cloud-5090 | muse | 512 | Request TTFT seconds | 1.0000, 1.0000 | 1.0000, 1.0000 | +0.000% "
-            "| +0.0000, +0.0000 | +0.0000 | 0.0302 | within band |") in text
-    assert ("| cloud-5090 | muse | 512 | Decode 0–128 tok/s | 10.0000, 10.0000 | 10.0000, 10.0000 | +0.000% "
-            "| +0.0000, +0.0000 | +0.0000 | 0.0302 | information only |") in text
-    assert "cloud-5090/muse/512: **regressed**. Noise band: matched (8 calibration pairs, k 4.277, 2026-10-29" in text
-    assert "Only whole decode, TTFT and native prefill decide" in text
-    assert "Threshold = max(ln(1 + floor), k·σ/√pairs)" in text and "lower TTFT is better" in text
+    return stream.getvalue()
+
+
+def test_summary_shows_history_base_run_pr_runs_change_threshold_and_decision():
+    from test_ci_performance_series import candidates, decide, scaled
+    entry = decide(candidates(scaled(0.10)))
+    assert entry["status"] == "regressed" and entry["regressions"] == ["decode_tps"]
+    report = dict(passed=False, status="regressed", full_impact_coverage_complete=False,
+        base="d" * 40, head="e" * 40, candidate="f" * 40, baseline_history_sha256="9" * 64,
+        cells=[dict(device="cloud-5090", model="muse", status="regressed", functional="passed", numerical="passed",
+                    performance=[dict(tier="512", **entry)], performance_deferred_tiers=["4096"])])
+    text = summary(report)
+    assert "Each PR cell ran the PR three times and the base once, in the order PR, base, PR, PR." in text
+    assert "| Device | Model | Tier | Metric | Base history | Base run | PR runs | Change | Threshold | Result |" in text
+    assert ("| cloud-5090 | muse | 512 | Whole decode tok/s | 9.9000, 10.1000, 9.9500, 10.0500 | 10.0000 "
+            "| 9.0909, 9.0909, 9.0909 | -9.089% | 0.0615 | regressed: slower beyond noise, every PR run slower |") in text
+    assert "| Decode 0–128 tok/s |" in text and "| information only |" in text
+    assert ("cloud-5090/muse/512: **regressed**. Baseline history: 1 records, df 3, t 9.219. Improved: none. "
+            "Review reasons: none.") in text
+    assert "Sealed baseline history SHA-256: `" + "9" * 64 + "`" in text
+    assert "Only whole decode, TTFT and native prefill decide" in text and "lower TTFT is better" in text
+    assert "max(ln(1 + floor), t·σ·√(1/3 + 1/5))" in text
     assert "Declared device scope: **regressed**" in text and "deferred tiers: 4096" in text
     assert "template IDs SHA" in text and "conditions/settings SHA" in text and "0/16" in text
-    assert "One sample per arm" not in text and "inconclusive" not in text
 
 
-def test_summary_marks_missing_band_and_calibration_without_a_decision():
-    from test_ci_performance_series import CELL, decide
-    missing = decide(bands={})
-    calibration = decide(pairs=4, purpose="noise-calibration", cell=dict(CELL, candidate=CELL["base"]))
-    for entry, expected in ((missing, "needs-review"), (calibration, "calibrated")):
-        assert entry["status"] == expected
-        report = dict(passed=False, status=expected, full_impact_coverage_complete=False, cells=[dict(
-            device="cloud-5090", model="muse", status=expected, performance=[dict(tier="512", **entry)])])
-        stream = io.StringIO()
-        controller.operator_summary(stream, report)
-        text = stream.getvalue()
-        if entry is missing:
-            assert "Noise band: no band for this device/model/tier. Review reasons: no-noise-band." in text
-            assert "| none | no matching band |" in text
-        else:
-            assert "Each cell ran 4 base/PR pairs" in text and "Calibration run" in text and "RMS d" in text
-            assert "Threshold =" not in text and "Noise band" not in text
-            assert "| cloud-5090 | muse | 512 | Decode 0–128 tok/s | 10.0000, 10.0000, 10.0000, 10.0000 |" in text
+def test_summary_labels_a_faster_pr_improved_and_keeps_the_cell_passed():
+    from test_ci_performance_series import candidates, decide, scaled
+    entry = decide(candidates(scaled(-0.10, "server_prefill_tps")))
+    assert entry["status"] == "passed" and entry["improvements"] == ["server_prefill_tps"]
+    text = summary(dict(passed=True, status="passed", full_impact_coverage_complete=False, cells=[dict(
+        device="cloud-5090", model="muse", status="passed", performance=[dict(tier="512", **entry)])]))
+    assert "| Native prefill tok/s |" in text and "| +11.114% | 0.0615 | improved: faster beyond noise |" in text
+    assert "| Whole decode tok/s |" in text and "| within noise |" in text
+    assert "cloud-5090/muse/512: **passed**." in text and "Improved: server_prefill_tps." in text
+    assert "Declared device scope: **passed**" in text
+
+
+def test_summary_marks_missing_history_and_shows_a_baseline_job_without_a_decision():
+    from test_ci_performance_series import BASE, CELL, decide
+    missing = decide(history_records=[])
+    text = summary(dict(passed=False, status="needs-review", full_impact_coverage_complete=False, cells=[dict(
+        device="cloud-5090", model="muse", status="needs-review", performance=[dict(tier="512", **missing)])]))
+    assert "Review reasons: no-baseline-history." in text and "| none | no matching baseline history |" in text
+    baseline = decide(purpose="baseline", cell=dict(CELL, candidate=BASE), history_records=[])
+    assert baseline["status"] == "baseline"
+    text = summary(dict(passed=False, status="baseline", full_impact_coverage_complete=False, cells=[dict(
+        device="cloud-5090", model="muse", status="baseline", performance=[dict(tier="512", **baseline)])]))
+    assert "baseline runs of a main commit" in text and "| Runs | Mean ln | σ (log) | df |" in text
+    assert "| cloud-5090 | muse | 512 | Whole decode tok/s | 10.0000, 10.0000, 10.0000, 10.0000 | +2.3026 | 0.0000 | 3 |" in text
+    assert "Threshold is on the log scale" not in text and "PR runs against the base" not in text
 
 
 @pytest.mark.parametrize("devices", [["local-mbp"], ["cloud-5090", "local-mbp"], ["cloud-5090"]])
@@ -584,64 +592,51 @@ def test_summary_describes_mac_footprint_protection_and_diagnostic_rss(devices):
     assert "worker RSS/process count" not in text
 
 
-@pytest.mark.parametrize("slowdown,flagged", [(False, False), (True, False), (False, True), (True, True)])
-def test_summary_renders_mac_gate_environment_per_pair_without_excusing_slowdown(slowdown, flagged):
+@pytest.mark.parametrize("flagged", [False, True])
+def test_summary_renders_mac_host_conditions_per_run_without_excusing_slowdown(flagged):
     from ci import mac_host_gate
-
-    metrics = {name: dict(base=10, candidate=9 if slowdown else 11,
-                         change_percent=-10 if slowdown else 10) for name in compare.METRICS}
-    metrics["ttft_s"] = dict(base=2, candidate=1.8, change_percent=-10)
-    measured = dict(tier="512", status="needs-review" if slowdown else "passed", passed=not slowdown,
-        metrics=metrics, observed_slowdowns=["decode_tps"] if slowdown else [])
+    from test_ci_performance_series import candidates, decide, scaled
     base = dict(schema_version=1, policy=dict(pair_free_tolerance_bytes=1 << 30),
         quiet=dict(status="passed"), cleanup=dict(status="passed"),
         prelaunch_free_inactive_bytes=38 * (1 << 30) + (1 << 29),
         timed=dict(status="passed", reasons=[], swap_delta_bytes=0, compression_delta_bytes=2 << 20,
             process_activity=dict(non_ci_cpu_cores=0.125), memory_pressure_levels=[1, 1]))
-    candidate = copy.deepcopy(base)
-    candidate["prelaunch_free_inactive_bytes"] = 38 << 30
-    candidate["timed"].update(status="flagged" if flagged else "passed",
+    other = copy.deepcopy(base)
+    other["prelaunch_free_inactive_bytes"] = 38 << 30
+    other["timed"].update(status="flagged" if flagged else "passed",
         reasons=["swap-activity|<diagnosis>\nretain"] if flagged else [], swap_delta_bytes=3 << 20,
         compression_delta_bytes=80 << 20, process_activity=dict(non_ci_cpu_cores=0.375),
         memory_pressure_levels=[1, 2])
-    clean = mac_host_gate.pair(dict(measured, status="passed", passed=True, observed_slowdowns=[]), base, copy.deepcopy(base))
-    pair = mac_host_gate.pair(measured, base, candidate)
-    original = copy.deepcopy(pair)
-    status = "needs-review" if slowdown or flagged else "passed"
-    entry = dict(tier="512", status=status, pairs=[clean, pair],
-                 review_reasons=["host:r2:candidate:swap-activity"] if flagged else [])
-    report = dict(passed=status == "passed", status=status, full_impact_coverage_complete=False,
-        execution_devices=["local-mbp"], cells=[dict(device="local-mbp", model="muse", status=status,
-            functional="passed", numerical="passed", performance=[entry])])
-    stream = io.StringIO()
-    controller.operator_summary(stream, report)
-    text = stream.getvalue()
-    assert "Quiet free+inactive GiB" in text and "Timed swap Δ MiB" in text and "Timed compression Δ MiB" in text
-    assert "Non-CI CPU cores" in text
-    assert "| muse | 512 | 1 | base | 38.5000 | 0.0000 | 2.0000 | 0.1250 | 1 → 1 | passed |" in text
-    assert "| muse | 512 | 2 | base | 38.5000 | 0.0000 | 2.0000 | 0.1250 | 1 → 1 | passed |" in text
-    assert "| muse | 512 | 2 | candidate | 38.0000 | 3.0000 | 80.0000 | 0.3750 | 1 → 2 |" in text
-    assert "muse/512 pair 1 environment: passed; reasons: none." in text
+    runs = {"r1/candidate": base, "r1/base": copy.deepcopy(base), "r2/candidate": other, "r3/candidate": copy.deepcopy(base)}
+    environment = mac_host_gate.cell(runs)
+    assert environment["status"] == ("needs-review" if flagged else "passed")
+    entry = decide(candidates(scaled(0.10)), environment=environment)
+    entry["cell"] = dict(entry["cell"], device="local-mbp")
+    report = dict(passed=False, status=entry["status"], full_impact_coverage_complete=False,
+        execution_devices=["local-mbp"], cells=[dict(device="local-mbp", model="muse", status=entry["status"],
+            functional="passed", numerical="passed", performance=[dict(tier="512", **entry)])])
+    text = summary(report)
+    assert "Quiet free+inactive GiB" in text and "Timed swap Δ MiB" in text and "Non-CI CPU cores" in text
+    assert "| muse | 512 | r1/base | 38.5000 | 0.0000 | 2.0000 | 0.1250 | 1 → 1 | passed |" in text
+    assert "| muse | 512 | r2/candidate | 38.0000 | 3.0000 | 80.0000 | 0.3750 | 1 → 2 |" in text
     if flagged:
-        assert "muse/512 pair 2 environment: needs-review; reasons: candidate:swap-activity\\|&lt;diagnosis&gt; retain." in text
+        assert "muse/512 environment: needs-review; reasons: r2/candidate:swap-activity\\|&lt;diagnosis&gt; retain." in text
         assert "<diagnosis>" not in text
     else:
-        assert "muse/512 pair 2 environment: passed; reasons: none." in text
-    assert ("Declared device scope: **needs-review**" if slowdown or flagged else "Declared device scope: **passed**") in text
+        assert "muse/512 environment: passed; reasons: none." in text
+    # A flagged host check never excuses the measured regression.
+    assert "Declared device scope: **regressed**" in text and entry["regressions"] == ["decode_tps"]
     assert "Swap and pressure may be model-induced" in text
     assert "do not establish external interference, excuse measured slowdowns, or trigger automatic retries" in text
-    assert pair == original and pair["observed_slowdowns"] == measured["observed_slowdowns"]
 
 
 def test_summary_does_not_render_missing_mac_environment_as_zero_or_passed():
     report = dict(passed=False, status="failed", full_impact_coverage_complete=False,
         execution_devices=["local-mbp"], cells=[dict(device="local-mbp", model="deepseek", status="failed",
             functional="passed", numerical="passed", performance=[dict(tier="512", status="failed")])])
-    stream = io.StringIO()
-    controller.operator_summary(stream, report)
-    text = stream.getvalue()
-    assert "| deepseek | 512 | unavailable | base | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |" in text
-    assert "deepseek/512 pair unavailable environment: unavailable; reasons: missing environment evidence." in text
+    text = summary(report)
+    assert "| deepseek | 512 | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable | unavailable |" in text
+    assert "deepseek/512 environment: unavailable; reasons: missing environment evidence." in text
     assert "| local-mbp | deepseek | 512 | Whole decode tok/s | unavailable | unavailable | unavailable |" in text
 
 
@@ -650,19 +645,22 @@ def performance_raw(functional_raw):
     return build_performance_raw(functional_raw)
 
 
-def build_performance_raw(functional_raw, pairs=2, calibration=False):
+def build_performance_raw(functional_raw, baseline=False):
     """Real validators over synthetic SSE/probe bytes; no device or model runs."""
-    from test_ci_performance_series import banded, write_arm
+    from test_ci_performance_series import record, write_arm
     root, original, config, _ = functional_raw
     config["device"] = "cloud-5090"
-    plan = dict(base="c" * 40 if calibration else "a" * 40, candidate="c" * 40)
-    protocol = contract.performance_protocol(pairs if calibration else None)
+    plan = dict(base="c" * 40 if baseline else "a" * 40, candidate="c" * 40)
+    protocol = contract.performance_protocol("baseline" if baseline else "regression-gate")
     config["performance_protocol"] = protocol
-    config["selection_plan"] = dict(purpose="noise-calibration" if calibration else "impact-selection")
+    config["selection_plan"] = dict(purpose="baseline-history" if baseline else "impact-selection")
     preflight = {}
     for side in ("base", "candidate"):
         config["sides"][side] = copy.deepcopy(config["sides"]["candidate"])
         config["sides"][side]["revision"] = plan[side]
+        config["sides"][side].setdefault("build", {})["toolchain"] = {"CMAKE_CXX_COMPILER": "/usr/bin/c++"}
+        config["sides"][side].setdefault("paths", dict(platform="linux", source="/source/" + side, build="/scratch/" + side,
+                                                       cwd="/scratch/" + side, frozen="/build/" + side))
         model = config["sides"][side]["models"]["deepseek"]
         launch = copy.deepcopy(model["smoke"])
         launch["argv"][0] = f"/build/{side}/bin/llama-server"
@@ -673,8 +671,9 @@ def build_performance_raw(functional_raw, pairs=2, calibration=False):
         build = root / ("build-" + side)
         build.mkdir(exist_ok=True)
         (build / "build-receipt.json").write_text(json.dumps(dict(binary=dict(
-            runtime_path=launch["argv"][0], sha256="a" * 64))))
-    for position, (index, side) in enumerate(compare.schedule(pairs)):
+            runtime_path=launch["argv"][0], sha256="a" * 64), freeze=dict(manifest_sha256="b" * 64),
+            toolchain={"CMAKE_CXX_COMPILER": "/usr/bin/c++"})))
+    for position, (index, side) in enumerate(compare.schedule(protocol["order"])):
         pid = 300 + position
         launch = aggregation.arm_launch(config["sides"][side]["models"]["deepseek"]["benchmarks"]["512"], side, index)
         folder = root / "deepseek/512" / ("r" + str(index)) / side
@@ -697,53 +696,54 @@ def build_performance_raw(functional_raw, pairs=2, calibration=False):
         receipt["host"].update(memory_budget_bytes=100, os_page_cache_treatment="uncontrolled")
         save(folder / "comparison-receipt.json", receipt)
         preflight["deepseek", "512", side] = copy.deepcopy(receipt)
-        save(folder / "benchmark.json", dict(status="passed", cleanup_confirmed=True, completion_requests=1, pair=index,
+        save(folder / "benchmark.json", dict(status="passed", cleanup_confirmed=True, completion_requests=1, run=index,
              revision=plan[side], tier="512", model="deepseek", result=load(folder / "result.json")))
-    bands = banded({("cloud-5090", "deepseek", "512"): compare.conditions_digest(
-        compare.comparable(preflight["deepseek", "512", "base"]))})
-    config["noise_bands"] = bands
+    # The base commit's baseline record: the same synthetic measurement with a small spread.
+    first = root / "deepseek/512/r1" / ("candidate" if baseline else "base")
+    measured = load(first / "result.json")
+    config["baseline_history"] = [] if baseline else [record(
+        plan["base"], model="deepseek", base={metric: measured["metrics"][metric] for metric in compare.METRICS},
+        tokens=measured["tokens"], conditions=compare.conditions_digest(compare.comparable(preflight["deepseek", "512", "base"])))]
     policy = POLICY
 
     def comparison():
-        keys = compare.schedule(pairs)
+        keys = compare.schedule(protocol["order"])
         folders = {key: root / "deepseek/512" / ("r" + str(key[0])) / key[1] for key in keys}
         results = {key: aggregation.run_final.read_result(folders[key] / "result.json", "512", 300) for key in keys}
         receipts = {key: load(folders[key] / "comparison-receipt.json") for key in keys}
-        compared = []
-        for index in range(1, pairs + 1):
-            pair = compare.compare_pair(results[index, "base"], results[index, "candidate"],
-                                        receipts[index, "base"], receipts[index, "candidate"], policy)
-            target = root / "deepseek/512" / ("r" + str(index)) / "comparison.json"
-            target.unlink(missing_ok=True)
-            save(target, pair)
-            compared.append(pair)
-        cell = compare.compare_series(results, receipts, compared, policy, protocol=protocol, bands=bands,
+        cell = compare.decide_cell(results, receipts, policy, protocol=protocol, history=config["baseline_history"],
             cell=dict(device="cloud-5090", model="deepseek", tier="512", job_id="f" * 32, **plan))
+        if baseline:
+            cell["build"] = contract.baseline_build_identity(config, load(root / "build-candidate/build-receipt.json"))
         (root / "deepseek/512/comparison.json").write_text(json.dumps(cell))
         return cell
     comparison()
     return root, config, plan, preflight, comparison, policy
 
 
-@pytest.mark.parametrize("damage", [None, "missing-arm", "pair-index"])
-def test_calibration_replays_every_arm_of_the_four_pair_protocol(functional_raw, damage):
-    root, config, plan, preflight, _, policy = build_performance_raw(functional_raw, pairs=4, calibration=True)
-    if damage == "missing-arm":
+@pytest.mark.parametrize("damage", [None, "missing-run", "run-index"])
+def test_baseline_job_replays_every_candidate_run_and_its_build(functional_raw, damage):
+    root, config, plan, preflight, _, policy = build_performance_raw(functional_raw, baseline=True)
+    if damage == "missing-run":
         import shutil
-        shutil.rmtree(root / "deepseek/512/r4/base")
-    elif damage == "pair-index":
-        path = root / "deepseek/512/r3/candidate/benchmark.json"; raw = load(path); raw["pair"] = 2
+        shutil.rmtree(root / "deepseek/512/r4/candidate")
+    elif damage == "run-index":
+        path = root / "deepseek/512/r3/candidate/benchmark.json"; raw = load(path); raw["run"] = 2
         path.write_text(json.dumps(raw))
     if damage:
         with pytest.raises((OSError, ValueError)):
             aggregation.performance_retained(root, config, "deepseek", "512", plan, policy, preflight, "f" * 32)
         return
     cell = aggregation.performance_retained(root, config, "deepseek", "512", plan, policy, preflight, "f" * 32)
-    assert cell["status"] == "calibrated" and cell["protocol"]["samples_per_side"] == 4
-    assert cell["order"] == ["r1/base", "r1/candidate", "r2/candidate", "r2/base",
-                             "r3/base", "r3/candidate", "r4/candidate", "r4/base"]
-    assert set(cell["evidence"]) == set(cell["order"]) and len(cell["pairs"]) == 4
-    assert cell["metrics"]["decode_tps"]["rms_d"] == 0.0 and "noise_band" not in cell
+    assert cell["status"] == "baseline" and cell["protocol"]["order"] == ["candidate"] * 4
+    assert cell["order"] == ["r1/candidate", "r2/candidate", "r3/candidate", "r4/candidate"]
+    assert set(cell["evidence"]) == set(cell["order"]) and cell["metrics"]["decode_tps"]["df"] == 3
+    assert cell["build"]["freeze_manifest_sha256"] == "b" * 64 and cell["build"]["binary_sha256"] == "a" * 64
+    # The build identity a later PR's cache offer relies on is replayed too.
+    raw = load(root / "build-candidate/build-receipt.json"); raw["freeze"]["manifest_sha256"] = "c" * 64
+    (root / "build-candidate/build-receipt.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="differs from verified raw runs"):
+        aggregation.performance_retained(root, config, "deepseek", "512", plan, policy, preflight, "f" * 32)
 
 
 def test_performance_retained_replays_sse_and_every_arm_native_probes(performance_raw):
@@ -751,14 +751,14 @@ def test_performance_retained_replays_sse_and_every_arm_native_probes(performanc
     cell = aggregation.performance_retained(root, config, "deepseek", "512", plan, policy, preflight, "f" * 32)
     assert cell["passed"] and cell["status"] == "passed"
     assert cell["measurement_identity"]["output_tokens"] == 256
-    assert cell["sources"] == plan and cell["order"] == ["r1/base", "r1/candidate", "r2/candidate", "r2/base"]
-    assert cell["evidence"]["r2/base"]["result.events.sse"]["sha256"] == digest(root / "deepseek/512/r2/base/result.events.sse")
-    assert [pair["status"] for pair in cell["pairs"]] == ["passed", "passed"]
+    assert cell["sources"] == plan and cell["order"] == ["r1/candidate", "r1/base", "r2/candidate", "r3/candidate"]
+    assert cell["evidence"]["r1/base"]["result.events.sse"]["sha256"] == digest(root / "deepseek/512/r1/base/result.events.sse")
+    assert cell["metrics"]["decode_tps"]["history"] and cell["history_pool"][0]["commit"] == plan["base"]
 
 
-def test_performance_slowdown_beyond_band_regresses_with_full_verified_values(performance_raw):
+def test_performance_slowdown_beyond_noise_regresses_with_full_verified_values(performance_raw):
     root, config, plan, preflight, rebuild, policy = performance_raw
-    for index in ("r1", "r2"):
+    for index in ("r1", "r2", "r3"):
         folder = root / "deepseek/512" / index / "candidate"
         records = [json.loads(line) for line in (folder / "result.events.jsonl").read_text().splitlines()]
         records[-1]["event"]["timings"]["prompt_ms"] *= 1.1
@@ -775,15 +775,15 @@ def test_performance_slowdown_beyond_band_regresses_with_full_verified_values(pe
     cell = aggregation.performance_retained(root, config, "deepseek", "512", plan, policy, preflight, "f" * 32)
     assert cell["status"] == "regressed" and not cell["passed"] and cell["regressions"] == ["server_prefill_tps"]
     prefill = cell["metrics"]["server_prefill_tps"]
-    assert prefill["all_pairs_worse"] and prefill["mean_d"] > prefill["threshold"] and prefill["change_percent"] < 0
-    assert all(pair["observed_slowdowns"] == ["server_prefill_tps"] for pair in cell["pairs"])
-    assert cell["evidence"]["r2/candidate"]
+    assert prefill["all_candidates_worse"] and prefill["difference"] > prefill["threshold"] and prefill["change_percent"] < 0
+    assert cell["evidence"]["r3/candidate"]
 
 
 @pytest.mark.parametrize("fault", ["base-resource", "candidate-argv", "receipt-resource", "missing-sse", "unclean",
-                                   "repeated", "source", "missing-arm", "pair-file", "cell-file", "shared-telemetry",
+                                   "repeated", "source", "missing-arm", "history", "cell-file", "shared-telemetry",
                                    "other-stage"])
 def test_performance_identity_raw_or_cleanup_failure_never_passes(performance_raw, fault):
+    from test_ci_performance_series import record
     root, config, plan, preflight, _, policy = performance_raw
     folder = root / "deepseek/512/r2/candidate"
     if fault == "missing-sse":
@@ -803,10 +803,14 @@ def test_performance_identity_raw_or_cleanup_failure_never_passes(performance_ra
         path.write_text(json.dumps(raw))
     elif fault == "missing-arm":
         import shutil
-        shutil.rmtree(root / "deepseek/512/r2/base")
-    elif fault in ("pair-file", "cell-file"):
-        path = root / "deepseek/512" / ("r1/comparison.json" if fault == "pair-file" else "comparison.json")
-        raw = load(path); raw["status"] = "passed" if raw["status"] != "passed" else "needs-review"
+        shutil.rmtree(root / "deepseek/512/r1/base")
+    elif fault == "history":
+        # A different (valid) sealed history decides differently from the retained decision.
+        config["baseline_history"] = config["baseline_history"] + [record("e" * 40, model="deepseek",
+            spread=(0.5, 1.5, 1.0, 1.0), conditions=config["baseline_history"][0]["conditions_sha256"])]
+    elif fault == "cell-file":
+        path = root / "deepseek/512/comparison.json"
+        raw = load(path); raw["status"] = "needs-review"
         path.write_text(json.dumps(raw))
     elif fault == "other-stage":
         path = folder / "started.json"; raw = load(path); raw["stage_id"] = "candidate-deepseek-r1-benchmark-512"

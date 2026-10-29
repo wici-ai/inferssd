@@ -232,8 +232,7 @@ def admission(api, pr, policy, expected_head):
     }
 
 
-def current_ci(api, plan, policy, *, require_base=True):
-    """Latest normal CI run for the exact head; a calibration does not bind the base."""
+def current_ci(api, plan, policy):
     workflow = api.call("actions/workflows/" + Path(policy["upstream_workflow"]).name)
     runs = api.call(
         "actions/workflows/"
@@ -252,11 +251,11 @@ def current_ci(api, plan, policy, *, require_base=True):
         or run.get("event") != "pull_request"
         or run.get("status") != "completed"
         or run.get("conclusion") != "success"
-        or run.get("head_sha") not in ((plan["head"], plan["candidate"]) if require_base else (plan["head"],))
+        or run.get("head_sha") not in (plan["head"], plan["candidate"])
         or len(prs) != 1
         or prs[0].get("number") != plan["pr"]
         or prs[0].get("head", {}).get("sha") != plan["head"]
-        or (require_base and prs[0].get("base", {}).get("sha") != plan["base"])
+        or prs[0].get("base", {}).get("sha") != plan["base"]
     ):
         raise ValueError(
             "normal CI is not the successful latest attempt for this exact head/base"

@@ -20,8 +20,9 @@ from test_ci_staged_benchmark import CONFIG, Session
 def performance(config):
     config.update(validation_mode=contract.PERFORMANCE_MODE,
                   execution_devices=["cloud-5090"],
-                  performance_protocol=contract.performance_protocol(), noise_bands={})
+                  performance_protocol=contract.performance_protocol(), baseline_history=[])
     for side in config["sides"].values():
+        side["build"]["toolchain"] = {"CMAKE_CXX_COMPILER": "/usr/bin/c++"}
         for data in side["models"].values():
             data["benchmarks"] = {tier: spec for tier, spec in data["benchmarks"].items() if tier == "512"}
             for spec in data["benchmarks"].values():
@@ -48,51 +49,51 @@ def test_operator_preserves_impact_but_stages_only_the_explicit_512_checkpoint()
     assert manifest["source_revisions"] == {side: original[side] for side in ("base", "candidate")}
     assert all("4096" not in name for name in manifest["stages"])
     timed = {name for name in manifest["stages"] if "-benchmark-" in name}
-    assert timed == {side + "-deepseek-r" + pair + "-benchmark-512" for side in ("base", "candidate") for pair in "12"}
+    assert timed == {"base-deepseek-r1-benchmark-512"} | {"candidate-deepseek-r" + run + "-benchmark-512" for run in "123"}
 
 
 @pytest.mark.parametrize("damage", ["missing-protocol", "wrong-prompt", "output-count", "bool-count", "extra-tier", "missing-base",
-                                    "missing-bands", "invalid-bands", "policy-pairs", "policy-order"])
+                                    "missing-history", "invalid-history", "policy-pool", "order", "baseline-protocol"])
 def test_new_mode_never_silently_defaults_or_accepts_one_sided_performance(damage):
     config, manifest = bound_config(["engine/src/models/muse.cpp"])
     policy = copy.deepcopy(POLICY)
     if damage == "missing-protocol": config.pop("performance_protocol")
     elif damage == "wrong-prompt": config["performance_protocol"]["prompt_sha256"] = "0" * 64
     elif damage == "output-count": config["performance_protocol"]["output_tokens"] = 8
-    elif damage == "bool-count": config["performance_protocol"]["samples_per_side"] = True
+    elif damage == "bool-count": config["performance_protocol"]["output_tokens"] = True
     elif damage == "extra-tier": config["sides"]["base"]["models"]["muse"]["benchmarks"]["4096"] = {}
-    elif damage == "missing-bands": config.pop("noise_bands")
-    elif damage == "invalid-bands": config["noise_bands"] = {"cloud-5090": {"muse": {"512": {}}}}
-    # A decision policy that no longer matches the sealed protocol fails before any device runs.
-    elif damage == "policy-pairs": policy["thresholds"]["pairs"] = 3
-    elif damage == "policy-order": policy["thresholds"]["order"] = "ABAB"
+    elif damage == "missing-history": config.pop("baseline_history")
+    elif damage == "invalid-history": config["baseline_history"] = [{}]
+    elif damage == "policy-pool": policy["thresholds"]["pool_records"] = 16
+    elif damage == "order": config["performance_protocol"]["order"] = ["base", "candidate", "candidate", "candidate"]
+    elif damage == "baseline-protocol": config["performance_protocol"] = contract.performance_protocol("baseline")
     else: manifest["source_revisions"].pop("base")
     with pytest.raises(ValueError):
         contract.bind(config, manifest, config["selection_plan"], policy)
 
 
-def test_calibration_runs_every_planned_arm_end_to_end_and_succeeds_without_a_decision(tmp_path, monkeypatch):
+def test_baseline_job_builds_once_and_runs_four_candidate_arms_without_a_decision(tmp_path, monkeypatch):
     from ci import impact
     head = "b" * 40
-    value = impact.plan([], POLICY, base=head, head=head, candidate=head, calibration=True)
+    value = impact.plan([], POLICY, base=head, head=head, candidate=head, baseline=True)
 
-    def calibration(config):
+    def baseline(config):
         performance(config)
-        config["performance_protocol"] = contract.performance_protocol(4)
+        config["performance_protocol"] = contract.performance_protocol("baseline")
 
-    args, config, manifest, needs, events, sessions = setup(tmp_path, monkeypatch, value=value, change=calibration)
+    args, config, manifest, needs, events, sessions = setup(tmp_path, monkeypatch, value=value, change=baseline)
     assert execution.run(args) == 0
     report = load(args.output / "integration.json")
-    assert report["status"] == "calibrated" and report["performance_protocol"]["samples_per_side"] == 4
-    order = [("1", "base"), ("1", "candidate"), ("2", "candidate"), ("2", "base"),
-             ("3", "base"), ("3", "candidate"), ("4", "candidate"), ("4", "base")]
-    assert args.stages == [side + "-" + model + "-r" + pair + "-benchmark-512"
-                           for model in ("deepseek", "muse") for pair, side in order]
+    assert report["status"] == "baseline" and report["performance_protocol"]["order"] == ["candidate"] * 4
+    assert "base_build" not in report
+    assert args.stages == ["candidate-" + model + "-r" + run + "-benchmark-512"
+                           for model in ("deepseek", "muse") for run in "1234"]
     for cell in report["cells"]:
         entry = cell["performance"][0]
-        assert entry["status"] == "calibrated" and len(entry["pairs"]) == 4 and "noise_band" not in entry
-        assert entry["cell"]["base"] == entry["cell"]["candidate"] == head
-        assert entry["metrics"]["decode_tps"]["d"] == [0.0] * 4 and entry["metrics"]["decode_tps"]["rms_d"] == 0.0
+        assert entry["status"] == "baseline" and entry["cell"]["base"] == entry["cell"]["candidate"] == head
+        assert entry["metrics"]["decode_tps"]["values"] == [1] * 4 and entry["metrics"]["decode_tps"]["df"] == 3
+        assert entry["build"]["freeze_manifest_sha256"] == "1" * 64 and entry["build"]["binary_sha256"] == "2" * 64
+        assert entry["build"]["cache_key"] == contract.build_cache_key(config, "candidate")
     assert sessions[0].closed
 
 
@@ -103,17 +104,19 @@ def test_control_only_scope_keeps_performance_not_required_and_candidate_only():
     assert not any("benchmark" in name for name in manifest["stages"])
 
 
-def test_new_mode_never_runs_4k_and_runs_each_planned_arm_once_in_abba_order(tmp_path, monkeypatch):
+def test_new_mode_never_runs_4k_and_runs_each_planned_arm_once_candidate_first(tmp_path, monkeypatch):
     args, config, manifest, _, events, sessions = setup(tmp_path, monkeypatch,
         paths=["engine/src/llama-kv-cache-dsv4.cpp"], change=performance)
     assert execution.run(args) == 0
     assert [e for e in events if e[0] == "timed"] == [("timed", "deepseek", side)
-                                                      for side in ("base", "candidate", "candidate", "base")]
-    assert args.stages == ["base-deepseek-r1-benchmark-512", "candidate-deepseek-r1-benchmark-512",
-                           "candidate-deepseek-r2-benchmark-512", "base-deepseek-r2-benchmark-512"]
-    assert all((args.output / "deepseek/512" / pair / "comparison.json").is_file() for pair in ("r1", "r2"))
+                                                      for side in ("candidate", "base", "candidate", "candidate")]
+    assert args.stages == ["candidate-deepseek-r1-benchmark-512", "base-deepseek-r1-benchmark-512",
+                           "candidate-deepseek-r2-benchmark-512", "candidate-deepseek-r3-benchmark-512"]
+    assert all((args.output / "deepseek/512" / run / side / "result.json").is_file()
+               for run, side in (("r1", "candidate"), ("r1", "base"), ("r2", "candidate"), ("r3", "candidate")))
     cell = load(args.output / "deepseek/512/comparison.json")
-    assert cell["status"] == "passed" and cell["order"] == ["r1/base", "r1/candidate", "r2/candidate", "r2/base"]
+    assert cell["status"] == "passed" and cell["order"] == ["r1/candidate", "r1/base", "r2/candidate", "r3/candidate"]
+    assert cell["metrics"]["decode_tps"]["result"] == "within-noise" and cell["improvements"] == []
     assert not any("4096" in str(event) for event in events)
     gate = load(args.output / "performance-preflight.json")
     assert [(cell["model"], cell["tier"]) for cell in gate["cells"]] == [("deepseek", "512")]
@@ -126,7 +129,7 @@ def test_needs_review_retains_every_arm_and_completes_the_other_cell(tmp_path, m
 
     def diverged(path, *args):
         value = load(path)
-        if "deepseek/512/r2/candidate" in str(path):
+        if "deepseek/512/r3/candidate" in str(path):
             value["tokens"][64] = 99
         return value
 
@@ -138,14 +141,14 @@ def test_needs_review_retains_every_arm_and_completes_the_other_cell(tmp_path, m
     deepseek, muse = (cell["performance"][0] for cell in report["cells"])
     assert deepseek["status"] == "needs-review" and deepseek["review_reasons"] == ["generated-tokens-differ"]
     assert deepseek["output_workload"]["differences"] == [dict(
-        arm="r2/candidate", first_difference_one_based=65, reference_token=11, token=99)]
+        run="r3/candidate", first_difference_one_based=65, reference_token=11, token=99)]
     assert muse["status"] == "passed"
     assert [e for e in events if e[0] == "timed"] == [("timed", model, side)
-        for model in ("deepseek", "muse") for side in ("base", "candidate", "candidate", "base")]
+        for model in ("deepseek", "muse") for side in ("candidate", "base", "candidate", "candidate")]
     for model in ("deepseek", "muse"):
         assert (args.output / model / "512/comparison.json").is_file()
-        assert all((args.output / model / "512" / pair / side / "result.json").is_file()
-                   for pair in ("r1", "r2") for side in ("base", "candidate"))
+        assert all((args.output / model / "512" / run / side / "result.json").is_file()
+                   for run, side in (("r1", "candidate"), ("r1", "base"), ("r2", "candidate"), ("r3", "candidate")))
     assert sessions[0].closed
 
 
@@ -153,7 +156,7 @@ def test_needs_review_retains_every_arm_and_completes_the_other_cell(tmp_path, m
 def test_all_timed_authorization_and_fixed_prompt_are_checked_before_lease(tmp_path, monkeypatch, fault):
     args, config, manifest, _, events, sessions = setup(tmp_path, monkeypatch, change=performance)
     if fault == "missing-stage":
-        del manifest["stages"]["candidate-muse-r2-benchmark-512"]
+        del manifest["stages"]["candidate-muse-r3-benchmark-512"]
         Path(config["manifest_path"]).unlink()
         save(config["manifest_path"], manifest)
     else:
@@ -249,11 +252,12 @@ def test_real_exclusive_event_files_survive_short_and_timed_servers_without_dele
     assert all(path.read_bytes() == b"retained\n" for path in paths)
     assert len([event for event in events if event[0] == "smoke"]) == 4
     assert len([event for event in events if event[0] == "timed"]) == 8
-    assert {path.name for path in paths if "benchmark" in path.name} == {
-        model + "-benchmark512-r" + pair + ".jsonl" for model in ("deepseek", "muse") for pair in "12"}
+    assert {path.parent.name + "/" + path.name for path in paths if "benchmark" in path.name} == {
+        side + "/" + model + "-benchmark512-r" + run + ".jsonl" for model in ("deepseek", "muse")
+        for side, runs in (("base", "1"), ("candidate", "123")) for run in runs}
     with pytest.raises(FileExistsError):
-        open_events(selected_preflight.arm_launch(config["sides"]["base"]["models"]["muse"]["benchmarks"]["512"],
-                                                  "base", 2, required=True))
+        open_events(selected_preflight.arm_launch(config["sides"]["candidate"]["models"]["muse"]["benchmarks"]["512"],
+                                                  "candidate", 3, required=True))
     assert all(path.is_file() for path in paths)
     assert sessions[0].closed
 

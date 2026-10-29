@@ -490,8 +490,10 @@ def test_default_mode_is_performance_and_two_sources_are_exact(tmp_path, source)
         for side in ("base", "candidate"):
             assert request["sources"][side]["revision"] == getattr(args, side)
             assert manifest["sources"][side].endswith("/" + side)
-            assert {side + "-muse-r1-benchmark-512", side + "-muse-r2-benchmark-512"} <= set(manifest["stages"])
             assert all(set(data["benchmarks"]) == {"512"} for data in config["sides"][side]["models"].values())
+        # One base run and three PR runs per model, each with its own stage.
+        assert {name for name in manifest["stages"] if name.startswith(("base-muse-r", "candidate-muse-r"))} == {
+            "base-muse-r1-benchmark-512", *("candidate-muse-r" + run + "-benchmark-512" for run in "123")}
         assert config["performance_protocol"] == prepare.performance_protocol()
         assert {"base-source-map.json", "base-source.tar.gz", "source-map.json", "candidate-source.tar.gz"} <= set(request["files"])
     assert load(args.output / "base-source-map.json")["revision"] == args.base
@@ -499,15 +501,15 @@ def test_default_mode_is_performance_and_two_sources_are_exact(tmp_path, source)
     prepare.verified(args.output)
 
 
-def test_calibration_builds_one_commit_twice_on_every_device_and_model_with_an_empty_diff(tmp_path, source):
+def test_baseline_job_builds_one_commit_once_on_every_device_and_model_with_an_empty_diff(tmp_path, source):
     from ci import operator_stage
     root, identity = source
     head = identity["head"]
     args, api = prepared_fixture(tmp_path, (root, dict(base=head, head=head, candidate=head)), mode=prepare.MODE)
-    args.calibration_pairs = 4
+    args.baseline = True
     envelope = prepare.prepare(args, api)
     plan = envelope["selection"]
-    assert plan["purpose"] == "noise-calibration" and plan["changed_paths"] == []
+    assert plan["purpose"] == "baseline-history" and plan["changed_paths"] == []
     assert {plan[key] for key in ("base", "head", "candidate")} == {head}
     assert all(cell["required"] and cell["performance"]["tiers"] == ["512"] for cell in plan["cells"])
     assert envelope["execution_devices"] == list(prepare.LINUX_DEVICES)
@@ -515,61 +517,136 @@ def test_calibration_builds_one_commit_twice_on_every_device_and_model_with_an_e
         config = load(args.output / device / "config.json")
         manifest = load(args.output / device / "manifest.json")
         request = load(args.output / device / "root-input.json")
-        assert config["performance_protocol"] == prepare.performance_protocol(4)
-        assert config["performance_protocol"]["purpose"] == "noise-calibration"
-        assert manifest["source_revisions"] == {"base": head, "candidate": head}
-        assert {side: value["revision"] for side, value in request["sources"].items()} == {"base": head, "candidate": head}
+        assert config["performance_protocol"] == prepare.performance_protocol("baseline")
+        assert manifest["source_revisions"] == {"candidate": head} and set(manifest["builds"]) == {"candidate"}
+        assert {side: value["revision"] for side, value in request["sources"].items()} == {"candidate": head}
         assert {name for name in manifest["stages"] if "-benchmark-" in name} == {
-            side + "-" + model + "-r" + str(index) + "-benchmark-512"
-            for side in ("base", "candidate") for model in ("deepseek", "muse") for index in range(1, 5)}
-        # The installed root policy is shared by gate and calibration jobs.
+            "candidate-" + model + "-r" + str(index) + "-benchmark-512"
+            for model in ("deepseek", "muse") for index in range(1, 5)}
+        assert not any(name.startswith("base-") for name in manifest["stages"])
+        # The installed root policy pins the gate protocol and admits the baseline form of one commit.
         assert load(args.output / device / "policy.review.json")["performance_protocol"] == prepare.performance_protocol()
         assert operator_stage.protocol_admitted(config)
-    assert load(args.output / "base-source-map.json")["revision"] == load(args.output / "source-map.json")["revision"] == head
+    assert not (args.output / "base-source-map.json").exists()
+    assert load(args.output / "source-map.json")["revision"] == head
     prepare.verified(args.output)
 
 
-@pytest.mark.parametrize("present", [False, True])
-def test_operator_bands_file_is_sealed_into_every_config_and_named_by_the_envelope(tmp_path, source, present):
-    from test_ci_performance_series import banded
-    args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
-    bands = banded({("cloud-5090", "muse", "512"): "c" * 64}) if present else {}
-    if present:
-        (tmp_path / prepare.BANDS_FILE).write_text(json.dumps(bands))
+def history_store(tmp_path, records):
+    from ci import history
+    root = tmp_path / history.DIRECTORY
+    for record in records:
+        history.write(root, record)
+    return root
+
+
+def test_device_history_is_sealed_into_every_config_and_named_by_the_envelope(tmp_path, source):
+    from test_ci_performance_series import record
+    root, identity = source
+    stored = [record(identity["base"], device="cloud-5090"), record("e" * 40, device="cloud-5090", model="deepseek"),
+              record(identity["base"], device="local-mbp")]
+    history_store(tmp_path, stored)
+    args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"], mode=prepare.MODE)
     envelope = prepare.prepare(args, api)
-    assert envelope["noise_bands_sha256"] == prepare.fingerprint(bands)
-    for device in prepare.LINUX_DEVICES:
-        assert load(args.output / device / "config.json")["noise_bands"] == bands
-        # The root stager and its installed policy never see or pin the bands.
-        assert "noise_bands" not in json.dumps(load(args.output / device / "policy.review.json"))
-    if present:
-        assert "bands" not in load(args.output / "policy.json")["thresholds"]
+    sealed = load(args.output / "cloud-5090/config.json")["baseline_history"]
+    # Only the executing devices' records, in the store's verified order.
+    assert sorted((item["model"], item["commit"]) for item in sealed) == [("deepseek", "e" * 40), ("muse", identity["base"])]
+    assert envelope["baseline_history_sha256"] == prepare.fingerprint(sealed)
+    # The root stager and its installed policy never see or pin the history.
+    assert "baseline_history" not in json.dumps(load(args.output / "cloud-5090/policy.review.json"))
+    (tmp_path / "empty").mkdir()
+    empty, api = prepared_fixture(tmp_path / "empty", source, devices=["dgx-spark"], mode=prepare.MODE)
+    assert prepare.prepare(empty, api)["baseline_history_sha256"] == prepare.fingerprint([])
 
 
-@pytest.mark.parametrize("damage", ["invalid-band", "unknown-device", "symlink", "not-json"])
-def test_invalid_operator_bands_file_refuses_preparation(tmp_path, source, damage):
-    from test_ci_performance_series import band
+def test_tampered_history_file_refuses_preparation(tmp_path, source):
+    from test_ci_performance_series import record
+    root, identity = source
+    store = history_store(tmp_path, [record(identity["base"])])
+    path = next(store.rglob("*.json"))
+    value = json.loads(path.read_text())
+    value["runs"][0]["metrics"]["decode_tps"] = 99.0
+    path.chmod(0o600)
+    path.write_text(json.dumps(value))
     args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
-    path = tmp_path / prepare.BANDS_FILE
-    if damage == "invalid-band": path.write_text(json.dumps({"cloud-5090": {"muse": {"512": band("c" * 64, pairs=2)}}}))
-    elif damage == "unknown-device": path.write_text(json.dumps({"other": {}}))
-    elif damage == "symlink":
-        (tmp_path / "elsewhere.json").write_text("{}")
-        path.symlink_to(tmp_path / "elsewhere.json")
-    else: path.write_text("{")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="logs differ"):
         prepare.prepare(args, api)
     assert not args.output.exists()
 
 
-@pytest.mark.parametrize("damage", ["no-calibration", "different-revisions", "legacy-mode", "too-many", "bool"])
-def test_calibration_is_explicit_bounded_and_only_for_one_commit(tmp_path, source, damage):
+def cache_fixture(tmp_path, source, flag=True, device="cloud-5090"):
+    args, api = prepared_fixture(tmp_path, source, devices=[device], mode=prepare.MODE)
+    inputs = load(args.inputs)
+    inputs["devices"][device]["base_build_cache"] = flag
+    template_path = tmp_path / inputs["devices"][device]["template"]
+    config = load(template_path)
+    for side in config["sides"].values():
+        side["build"]["toolchain"] = {"CMAKE_CXX_COMPILER": "/usr/bin/g++-12"}
+    template_path.write_text(json.dumps(config))
+    args.inputs.write_text(json.dumps(inputs))
+    return args, api
+
+
+def test_base_build_cache_stores_a_baseline_build_and_offers_it_to_a_pr_on_that_base(tmp_path, source):
+    from ci.selection_contract import build_cache_key
+    from test_ci_performance_series import record
+    root, identity = source
+    base = identity["base"]
+    # Baseline job of the base commit: the broker keeps its candidate build under the exact key.
+    args, api = cache_fixture(tmp_path, (root, dict(base=base, head=base, candidate=base)))
+    args.baseline = True
+    prepare.prepare(args, api)
+    config = load(args.output / "cloud-5090/config.json")
+    manifest = load(args.output / "cloud-5090/manifest.json")
+    key = build_cache_key(config, "candidate")
+    assert config["cache_build_as"] == key and manifest["cache_as"] == {"candidate": key}
+    assert "prebuilt_offer" not in manifest and "base_build" not in config
+    # A PR on that base gets the offer named by the base commit's record.
+    built = record(base)
+    built["build"] = dict(built["build"], cache_key=key, freeze_manifest_sha256="7" * 64)
+    (tmp_path / "pr").mkdir()
+    args, api = cache_fixture(tmp_path / "pr", source)
+    history_store(tmp_path / "pr", [built])
+    prepare.prepare(args, api)
+    config = load(args.output / "cloud-5090/config.json")
+    manifest = load(args.output / "cloud-5090/manifest.json")
+    assert config["base_build"] == dict(key=key, source_job=built["job_id"], freeze_manifest_sha256="7" * 64)
+    assert manifest["prebuilt_offer"] == {"base": dict(key=key, manifest_sha256="7" * 64)}
+    assert "cache_as" not in manifest
+
+
+@pytest.mark.parametrize("case", ["no-record", "other-key", "flag-off"])
+def test_no_cache_offer_without_a_matching_base_build(tmp_path, source, case):
+    from test_ci_performance_series import record
+    root, identity = source
+    args, api = cache_fixture(tmp_path, source, flag=case != "flag-off")
+    if case != "no-record":
+        history_store(tmp_path, [record(identity["base"])])  # cache key "3" * 64 is not this build's key
+    prepare.prepare(args, api)
+    config = load(args.output / "cloud-5090/config.json")
+    assert "base_build" not in config and "prebuilt_offer" not in load(args.output / "cloud-5090/manifest.json")
+
+
+@pytest.mark.parametrize("damage", ["not-bool", "mac"])
+def test_cache_flag_is_an_explicit_boolean_for_a_linux_device(tmp_path, source, damage):
+    args, api = cache_fixture(tmp_path, source, flag="yes" if damage == "not-bool" else True)
+    if damage == "mac":
+        inputs = load(args.inputs)
+        inputs["devices"]["local-mbp"] = dict(inputs["devices"]["cloud-5090"])
+        args.inputs.write_text(json.dumps(inputs))
+        args.execution_devices = ["local-mbp"]
+    with pytest.raises(ValueError, match="base_build_cache must be a boolean"):
+        prepare.prepare(args, api)
+
+
+@pytest.mark.parametrize("damage", ["different-revisions", "legacy-mode", "not-bool"])
+def test_baseline_job_is_explicit_and_only_for_one_commit(tmp_path, source, damage):
     root, identity = source
     head = identity["head"]
     same = dict(base=head, head=head, candidate=head)
     args, api = prepared_fixture(tmp_path, (root, identity if damage == "different-revisions" else same),
                                  mode=prepare.LEGACY_MODE if damage == "legacy-mode" else prepare.MODE)
-    args.calibration_pairs = {"no-calibration": None, "too-many": 5, "bool": True}.get(damage, 4)
+    args.baseline = "yes" if damage == "not-bool" else True
     with pytest.raises(ValueError):
         prepare.prepare(args, api)
     assert not args.output.exists()

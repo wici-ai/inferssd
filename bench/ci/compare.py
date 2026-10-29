@@ -1,7 +1,8 @@
-"""Compare interleaved base/candidate pairs against calibrated noise bands.
+"""Decide performance cells from repeated runs against device baseline history.
 
-Invalid evidence fails. A cell regresses only when its mean paired log ratio is
-beyond the measured noise threshold and every pair is slower.
+Invalid evidence fails. A cell regresses only when the candidate mean of a
+deciding metric is beyond the noise threshold measured on the same device and
+every candidate run is slower than the base estimate.
 """
 
 import argparse
@@ -17,7 +18,7 @@ BENCH = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BENCH))
 import compare_outputs
 import run_final
-from ci.contract import DEVICES, MODELS, PERFORMANCE_METRICS, digest, load, noise_bands, policy_read, runner_config, save
+from ci.contract import DEVICES, MODELS, PERFORMANCE_METRICS, digest, history_record, load, policy_read, runner_config, save
 
 _spec = importlib.util.spec_from_file_location(
     "inferssd_comparison_test_gate", BENCH / "device/gate.py"
@@ -27,24 +28,25 @@ _spec.loader.exec_module(GATE)
 
 METRICS = PERFORMANCE_METRICS
 SIDES = ("base", "candidate")
-ORDER = "ABBA"
 REGRESSION_GATE = "regression-gate"
-CALIBRATION = "noise-calibration"
-# Most severe first. "calibrated" only appears in A/A calibration runs.
-SEVERITY = ("failed", "regressed", "needs-review", "calibrated", "passed")
-SUCCESS = ("passed", "calibrated")
-# Only these metrics can make a cell regressed or out of band. The two decode
-# half-windows are sub-windows of whole decode and are shown for information.
+BASELINE = "baseline"
+# Most severe first. "baseline" only appears in baseline jobs of a main commit.
+SEVERITY = ("failed", "regressed", "needs-review", "baseline", "passed")
+SUCCESS = ("passed", "baseline")
+# Only these metrics can make a cell regressed or needs-review on their values.
+# The two decode half-windows are sub-windows of whole decode, shown for information.
 GATED_METRICS = ("decode_tps", "ttft_s", "server_prefill_tps")
 # One-sided Student-t quantiles whose upper tail equals the normal 3-sigma tail
-# (P = 0.99865), keyed by the band's pooled pairs (its degrees of freedom).
-# Values are rounded up, a degree count between entries uses the nearest lower
-# entry, and above 64 the normal value 3.0 applies. A fixed table keeps the
+# (P = 0.99865), keyed by degrees of freedom of the pooled baseline variance.
+# Values are rounded up, a count between entries uses the nearest lower entry,
+# and above 128 the normal value 3.0 applies. A fixed table keeps the
 # multiplier identical on every device and in the hosted replay.
-BAND_QUANTILE = "one-sided Student-t, P = 0.99865 (normal 3 sigma), df = pooled band pairs"
-T_QUANTILES = ((8, 4.277), (9, 4.095), (10, 3.957), (11, 3.850), (12, 3.765), (13, 3.695),
-               (14, 3.636), (15, 3.587), (16, 3.545), (18, 3.476), (20, 3.423), (24, 3.345),
-               (28, 3.292), (32, 3.253), (40, 3.199), (48, 3.165), (56, 3.140), (64, 3.122))
+T_QUANTILE = "one-sided Student-t, P = 0.99865 (normal 3 sigma), df = pooled baseline degrees of freedom"
+T_QUANTILES = ((3, 9.219), (4, 6.621), (5, 5.508), (6, 4.905), (7, 4.530), (8, 4.277), (9, 4.095),
+               (10, 3.957), (11, 3.850), (12, 3.765), (13, 3.695), (14, 3.636), (15, 3.587),
+               (16, 3.545), (18, 3.476), (20, 3.423), (24, 3.345), (28, 3.292), (32, 3.253),
+               (40, 3.199), (48, 3.165), (56, 3.140), (64, 3.122), (72, 3.108), (80, 3.097),
+               (96, 3.081), (128, 3.060))
 NORMAL_QUANTILE = 3.0
 LEGACY_INTERPRETATION = (
     "One base/candidate pair per cell, each arm a fresh server with one completion. Any "
@@ -53,28 +55,31 @@ LEGACY_INTERPRETATION = (
     "attempt. OS cache treatment is recorded, not assumed cold."
 )
 PAIR_INTERPRETATION = (
-    "One base/candidate pair, each arm a fresh server with one completion. "
-    "needs-review here marks any slower metric or different generated tokens in this "
-    "pair alone; a cell is decided from all of its pairs together. OS cache treatment "
-    "is recorded, not assumed cold."
+    "One base/candidate pair, each arm a fresh server with one completion. Any slower "
+    "metric or different generated tokens needs review; a single pair is an observation, "
+    "not a statistical test. OS cache treatment is recorded, not assumed cold."
 )
 INTERPRETATION = (
-    "Each cell runs interleaved base/candidate pairs in ABBA order (base, candidate, "
-    "candidate, base), each arm a fresh server with one completion. Every arm is kept; "
-    "nothing is retried or selected. For each metric, d is the per-pair log ratio, signed "
-    "so that a positive value means the candidate is slower. The cell is regressed when, "
-    "for whole decode, TTFT or native prefill, the mean d is above the calibrated noise "
-    "threshold and every pair is slower; the decode half-windows are shown for information. "
-    "It needs review when such a threshold is exceeded but the pairs disagree, generated "
-    "tokens differ, no noise band matches the measured conditions, or the host check "
-    "flagged an arm. "
-    "Otherwise it passes: no slowdown beyond measured noise, which is not proof that none "
-    "exists. OS cache treatment is recorded, not assumed cold."
+    "Each cell runs the candidate three times and the base once, in the order candidate, "
+    "base, candidate, candidate, every run a fresh server with one completion. All runs are "
+    "kept; nothing is retried or selected. The base is also measured four times by the "
+    "baseline job of the base commit on the same device. Values are compared as natural "
+    "logs, signed so that a positive difference means the candidate is slower. The cell is "
+    "regressed when, for whole decode, TTFT or native prefill, the candidate mean is above "
+    "the base estimate by more than the noise threshold and every candidate run is slower; "
+    "the decode half-windows are shown for information. It needs review when the in-run "
+    "base differs from its baseline history, the threshold is exceeded but the candidate "
+    "runs disagree, generated tokens differ, no baseline history matches the measured "
+    "conditions, or the host check flagged a run. Otherwise it passes: no slowdown beyond "
+    "measured noise, which is not proof that none exists. A deciding metric whose candidate "
+    "mean is below the base estimate by more than the same threshold is labelled improved "
+    "(faster beyond noise); within the threshold either way it is within noise. The label "
+    "does not change the status. OS cache treatment is recorded, not assumed cold."
 )
-CALIBRATION_INTERPRETATION = (
-    "Calibration run: base and candidate are the same revision, so d measures run-to-run "
-    "noise. No pass or regression decision is made; the per-pair values feed the noise "
-    "bands used by later comparisons."
+BASELINE_INTERPRETATION = (
+    "Baseline job: one build of a main commit measured four times, every run a fresh "
+    "server with one completion. No pass or regression decision is made; the verified "
+    "values join the device's baseline history used by later comparisons."
 )
 
 
@@ -86,24 +91,29 @@ def outcome(rows):
     return next((status for status in SEVERITY if status in statuses), "passed")
 
 
-def schedule(pairs):
-    """Executed arm order: pair k runs base first when k is odd, candidate first otherwise."""
-    if type(pairs) is not int or pairs < 1:
-        raise ValueError("positive pair count required")
-    return [(k, side) for k in range(1, pairs + 1) for side in (SIDES if k % 2 else SIDES[::-1])]
+def schedule(order):
+    """Executed (run index per side, side) sequence for a protocol's side order."""
+    if not isinstance(order, list) or not order or any(side not in SIDES for side in order):
+        raise ValueError("explicit timed run order required")
+    seen = {side: 0 for side in SIDES}
+    result = []
+    for side in order:
+        seen[side] += 1
+        result.append((seen[side], side))
+    return result
 
 
 def arm_name(k, side):
     return "r" + str(k) + "/" + side
 
 
-def band_multiplier(pairs):
-    """Threshold multiplier for a band calibrated from `pairs` pooled A/A pairs."""
-    if type(pairs) is not int or pairs < T_QUANTILES[0][0]:
-        raise ValueError("noise band has too few pairs for a decision")
-    if pairs > T_QUANTILES[-1][0]:
+def t_quantile(df):
+    """Threshold multiplier for a pooled variance with `df` degrees of freedom."""
+    if type(df) is not int or df < T_QUANTILES[0][0]:
+        raise ValueError("baseline history has too few degrees of freedom for a decision")
+    if df > T_QUANTILES[-1][0]:
         return NORMAL_QUANTILE
-    return [value for df, value in T_QUANTILES if df <= pairs][-1]  # nearest lower entry
+    return [value for key, value in T_QUANTILES if key <= df][-1]  # nearest lower entry
 
 
 def mean(values):
@@ -127,16 +137,6 @@ def ln(value):
 
 def exp(value):
     return float(EXACT.exp(Decimal(value)))
-
-
-def log_ratio(metric, base, candidate):
-    """Signed so that a positive value means the candidate is slower."""
-    ratio = candidate / base
-    if not math.isfinite(ratio) or ratio <= 0:
-        raise ValueError("non-finite or underflowed metric ratio " + metric)
-    value = ln(ratio)
-    # Adding 0.0 turns a negated zero into plain 0.0 for readable reports.
-    return (value if metric == "ttft_s" else -value) + 0.0
 
 
 def validate_metrics(result):
@@ -187,10 +187,10 @@ def comparable(receipt, comparison_binding=None, side=None):
 
 
 def conditions_digest(conditions):
-    """SHA-256 of canonical JSON, as for the plan and sealed noise bands.
+    """SHA-256 of canonical JSON, as for the plan and the sealed baseline history.
 
     Applied to `comparable()` it is the measured-conditions identity that a
-    noise band is calibrated under.
+    baseline record was measured under.
     """
     return hashlib.sha256(json.dumps(conditions, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
@@ -327,125 +327,215 @@ def first_difference(reference, tokens):
     return next((i for i, (before, after) in enumerate(zip(reference, tokens)) if before != after), None)
 
 
-def compare_series(results, receipts, pairs, policy, *, cell, protocol, bands):
-    """Decide one cell from every planned arm; nothing is dropped, retried or selected.
+def signed_log(metric, value):
+    """Natural log of a measured value, signed so that a larger result is worse."""
+    if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+        raise ValueError("invalid measured value for " + metric)
+    log = ln(value)
+    return (log if metric == "ttft_s" else -log) + 0.0
 
-    `results` and `receipts` map (pair, side) to each arm's verified measurement and
-    comparison receipt. `pairs` holds the per-pair `compare_pair` results in pair
-    order (with the Mac host check applied). `cell` names the device, model, tier,
-    job and both source revisions. `bands` are the noise bands sealed into the job;
-    a cell without one cannot pass or regress. Any inconsistency is invalid evidence.
+
+def tokens_digest(tokens):
+    return hashlib.sha256(json.dumps(tokens, separators=(",", ":")).encode()).hexdigest()
+
+
+def history_checked(records):
+    """Validate sealed baseline records; their logs are recomputed, never trusted."""
+    if not isinstance(records, list):
+        raise ValueError("sealed baseline history must be a list of records")
+    seen = set()
+    for record in records:
+        history_record(record)
+        key = tuple(record[name] for name in ("device", "model", "tier", "commit", "conditions_sha256"))
+        if key in seen:
+            raise ValueError("sealed baseline history repeats a record")
+        seen.add(key)
+        for run in record["runs"]:
+            if any(run["logs"][metric] != ln(run["metrics"][metric]) for metric in METRICS):
+                raise ValueError("baseline record logs differ from its measured values")
+    return records
+
+
+def pooled(records, metric):
+    """Pooled within-commit standard deviation of the log values, and its degrees of freedom.
+
+    Each record holds the four runs of one commit's baseline job.
     """
-    policy_read(policy)
-    noise_bands(bands)
-    thresholds = policy["thresholds"]
-    count, purpose = protocol.get("samples_per_side"), protocol.get("purpose")
-    if (protocol.get("order") != ORDER or purpose not in (REGRESSION_GATE, CALIBRATION)
-            or type(count) is not int or count < 2):
-        raise ValueError("timed cells require the interleaved paired protocol")
-    if set(cell) != {"device", "model", "tier", "job_id", "base", "candidate"}:
-        raise ValueError("series cell identity is incomplete")
-    if purpose == CALIBRATION and cell["base"] != cell["candidate"]:
-        raise ValueError("noise calibration compares one revision with itself")
-    if purpose == REGRESSION_GATE and (thresholds["pairs"] != count or thresholds["order"] != ORDER):
-        raise ValueError("decision policy and executed protocol differ")
-    order = schedule(count)
-    if (set(results) != set(order) or set(receipts) != set(order)
-            or not isinstance(pairs, list) or len(pairs) != count):
-        raise ValueError("every planned arm and pair is required; none may be dropped or added")
+    squares, df = [], 0
+    for record in records:
+        logs = [run["logs"][metric] for run in record["runs"]]
+        centre = mean(logs)
+        squares.extend((value - centre) * (value - centre) for value in logs)
+        df += len(logs) - 1
+    if df < 1:
+        raise ValueError("pooled baseline variance needs at least two runs of one commit")
+    return math.sqrt(math.fsum(squares) / df), df
+
+
+def arms_checked(results, receipts, order):
+    """Every planned run is present, ran in order on its own server, under equal conditions."""
+    keys = schedule(order)
+    if set(results) != set(keys) or set(receipts) != set(keys):
+        raise ValueError("every planned timed run is required; none may be dropped or added")
     previous = None
-    for key in order:
+    for key in keys:
         start, end = results[key].get("start_ns"), results[key].get("end_ns")
         if (type(start) is not int or type(end) is not int or start > end
                 or (previous is not None and start < previous)):
-            raise ValueError("timed arms did not run in the declared interleaved order")
+            raise ValueError("timed runs did not run in the declared order")
         previous = end
-    servers = [json.dumps(receipts[key]["server"], sort_keys=True) for key in order]
+    servers = [json.dumps(receipts[key]["server"], sort_keys=True) for key in keys]
     if len(set(servers)) != len(servers):
-        raise ValueError("timed arms reused a server process")
-    identity = pairs[0].get("measurement_identity")
-    reasons, host = [], []
-    for k, pair in enumerate(pairs, 1):
-        if pair.get("evidence_valid") is not True or pair.get("measurement_identity") != identity:
-            raise ValueError("pair evidence or measurement conditions differ within the cell")
-        for metric in METRICS:
-            if any(pair["metrics"][metric][side] != results[k, side]["metrics"][metric] for side in SIDES):
-                raise ValueError("pair evidence differs from its retained arms")
-        if pair["output_workload"]["same_tokens"] != (results[k, "base"]["tokens"] == results[k, "candidate"]["tokens"]):
-            raise ValueError("pair token evidence differs from its retained arms")
-        environment = pair.get("environment")
-        if environment is not None:
-            if environment.get("status") not in ("passed", "needs-review"):
-                raise ValueError("unrecognized host check status")
-            host.extend("r" + str(k) + ":" + reason for reason in environment["reasons"])
-    reference = results[1, "base"]["tokens"]
+        raise ValueError("timed runs reused a server process")
+    first, conditions = results[keys[0]], None
+    for key in keys:
+        result = results[key]
+        validate_metrics(result)
+        tokens = result.get("tokens")
+        if (type(result.get("output_tokens")) is not int or result["output_tokens"] != 256
+                or not isinstance(tokens, list) or len(tokens) != 256
+                or any(type(token) is not int or token < 0 for token in tokens)):
+            raise ValueError("performance comparison requires complete output token evidence")
+        if result["prompt_ids"] != first["prompt_ids"] or result["prompt_sha256"] != first["prompt_sha256"]:
+            raise ValueError("authoritative template IDs or fixed prompt changed between runs")
+        current = comparable(receipts[key])
+        if conditions is not None and current != conditions:
+            raise ValueError("resource, placement, model, template, page-cache treatment or image set changed between runs")
+        conditions = current
+    return {"prompt_sha256": first["prompt_sha256"],
+            "prompt_ids_sha256": hashlib.sha256(json.dumps(first["prompt_ids"], separators=(",", ":")).encode()).hexdigest(),
+            "input_tokens": first["input_tokens"], "output_tokens": 256,
+            "conditions_sha256": conditions_digest(conditions)}
+
+
+def decide_cell(results, receipts, policy, *, cell, protocol, history, environment=None):
+    """Decide one cell from all of its timed runs and the sealed baseline history.
+
+    `results` and `receipts` map (run index, side) to each run's verified measurement
+    and comparison receipt. `history` is the list of baseline records sealed into the
+    job. `environment` is the Mac host check over all runs, or None. Nothing is dropped,
+    retried or selected; any inconsistency is invalid evidence.
+    """
+    policy_read(policy)
+    thresholds = policy["thresholds"]
+    history_checked(history)
+    purpose = protocol.get("purpose")
+    if purpose not in (REGRESSION_GATE, BASELINE):
+        raise ValueError("timed cells require the gate or baseline protocol")
+    if set(cell) != {"device", "model", "tier", "job_id", "base", "candidate"}:
+        raise ValueError("cell identity is incomplete")
+    if purpose == BASELINE and cell["base"] != cell["candidate"]:
+        raise ValueError("a baseline job measures one main commit")
+    order = protocol["order"]
+    keys = schedule(order)
+    identity = arms_checked(results, receipts, order)
+    reference = results[keys[0]]["tokens"]
     differences = []
-    for k, side in order:
+    for k, side in keys:
         index = first_difference(reference, results[k, side]["tokens"])
         if index is not None:
-            differences.append(dict(arm=arm_name(k, side), first_difference_one_based=index + 1,
+            differences.append(dict(run=arm_name(k, side), first_difference_one_based=index + 1,
                                     reference_token=reference[index], token=results[k, side]["tokens"][index]))
-    band = bands.get(cell["device"], {}).get(cell["model"], {}).get(cell["tier"])
-    if purpose == CALIBRATION:
-        noise = None
-    elif band is None:
-        noise = dict(status="missing")
-        reasons.append("no-noise-band")
+    host = []
+    if environment is not None:
+        if environment.get("status") not in ("passed", "needs-review") or not isinstance(environment.get("reasons"), list):
+            raise ValueError("unrecognized host check result")
+        host = ["host:" + reason for reason in environment["reasons"]]
+    same_cell = [record for record in history if (record["device"], record["model"], record["tier"])
+                 == (cell["device"], cell["model"], cell["tier"])]
+    # The noise pool: every record of this cell measured under the same conditions.
+    matching = sorted((record for record in same_cell if record["conditions_sha256"] == identity["conditions_sha256"]),
+                      key=lambda record: (record["measured_at"], record["commit"]))
+    floor = {metric: float(EXACT.ln(Decimal(1) + Decimal(thresholds["floor_fraction"][metric]))) for metric in METRICS}
+    metrics, regressions, improvements, blocking, reasons = {}, [], [], [], []
+    if purpose == BASELINE:
+        runs = [results[k, side] for k, side in keys]
+        prior = [record for record in matching if record["commit"] != cell["candidate"]]
+        current = dict(runs=[dict(logs={metric: ln(run["metrics"][metric]) for metric in METRICS}) for run in runs])
+        for metric in METRICS:
+            logs = [run["logs"][metric] for run in current["runs"]]
+            sigma, df = pooled([*prior, current], metric)
+            metrics[metric] = dict(direction="lower-is-better" if metric == "ttft_s" else "higher-is-better",
+                                   gated=metric in GATED_METRICS, values=[run["metrics"][metric] for run in runs],
+                                   logs=logs, mean_log=mean(logs), sigma_log=sigma, df=df)
+        pool = [dict(commit=record["commit"], job_id=record["job_id"], measured_at=record["measured_at"]) for record in prior]
     else:
-        noise = dict({key: value for key, value in band.items() if key != "sigma_log"},
-                     status="matched" if band["conditions_sha256"] == identity["conditions_sha256"] else "conditions-differ")
-        if noise["status"] != "matched":
-            reasons.append("noise-band-conditions-differ")
-    multiplier = band_multiplier(band["pairs"]) if noise is not None and noise["status"] == "matched" else None
-    metrics, regressions = {}, []
-    for metric in METRICS:
-        base = [results[k, "base"]["metrics"][metric] for k in range(1, count + 1)]
-        candidate = [results[k, "candidate"]["metrics"][metric] for k in range(1, count + 1)]
-        d = [log_ratio(metric, before, after) for before, after in zip(base, candidate)]
-        average = mean(d)
-        entry = dict(direction="lower-is-better" if metric == "ttft_s" else "higher-is-better",
-                     gated=metric in GATED_METRICS, base=base, candidate=candidate, d=d, mean_d=average,
-                     change_percent=(exp(average if metric == "ttft_s" else -average) - 1) * 100,
-                     all_pairs_worse=all(value > 0 for value in d))
-        if purpose == CALIBRATION:
-            entry["rms_d"] = rms(d)
-        elif noise["status"] == "matched":
-            sigma = band["sigma_log"][metric]
-            floor = float(EXACT.ln(Decimal(1) + Decimal(thresholds["floor_fraction"][metric])))
-            threshold = max(floor, multiplier * sigma / math.sqrt(count))
-            beyond = average > threshold
-            result = ("regressed" if entry["all_pairs_worse"] else "pairs-disagree") if beyond else "within-band"
-            entry.update(sigma_log=sigma, threshold=threshold, beyond_band=beyond,
-                         result=result if entry["gated"] else "informational")
-            if entry["result"] == "regressed":
-                regressions.append(metric)
-            elif entry["result"] == "pairs-disagree":
-                reasons.append("pairs-disagree:" + metric)
+        base_record = next((record for record in matching if record["commit"] == cell["base"]), None)
+        pool = []
+        if base_record is None:
+            blocking.append("baseline-conditions-differ" if any(record["commit"] == cell["base"] for record in same_cell)
+                            else "no-baseline-history")
         else:
-            entry.update(sigma_log=None, threshold=None, beyond_band=None,
-                         result="no-matching-band" if entry["gated"] else "informational")
-        metrics[metric] = entry
+            pool = [dict(commit=record["commit"], job_id=record["job_id"], measured_at=record["measured_at"])
+                    for record in matching]
+            if any(run["tokens_sha256"] != tokens_digest(reference) for run in base_record["runs"]):
+                differences.append(dict(run="baseline-history", tokens_sha256=[run["tokens_sha256"] for run in base_record["runs"]]))
+        candidates = [k for k, side in keys if side == "candidate"]
+        for metric in METRICS:
+            entry = dict(direction="lower-is-better" if metric == "ttft_s" else "higher-is-better",
+                         gated=metric in GATED_METRICS, base_run=results[1, "base"]["metrics"][metric],
+                         candidate=[results[k, "candidate"]["metrics"][metric] for k in candidates],
+                         history=None if base_record is None else [run["metrics"][metric] for run in base_record["runs"]])
+            if base_record is not None:
+                history_logs = [signed_log(metric, value) for value in entry["history"]]
+                anchor = signed_log(metric, entry["base_run"])
+                candidate_logs = [signed_log(metric, value) for value in entry["candidate"]]
+                sigma, df = pooled(matching, metric)
+                k = t_quantile(df)
+                base_estimate = mean([*history_logs, anchor])
+                difference = mean(candidate_logs) - base_estimate
+                anchor_limit = k * sigma * math.sqrt(1 + 1 / len(history_logs))
+                standard_error = sigma * math.sqrt(1 / len(candidate_logs) + 1 / (len(history_logs) + 1))
+                threshold = max(floor[metric], k * standard_error)
+                anchored = abs(anchor - mean(history_logs)) <= anchor_limit
+                beyond = difference > threshold
+                worse = all(value > base_estimate for value in candidate_logs)
+                # Faster beyond the same threshold is reported, never a status of its own.
+                improved = difference < -threshold
+                result = (("regressed" if worse else "candidates-disagree") if beyond
+                          else "improved" if improved else "within-noise")
+                entry.update(history_mean_log=mean(history_logs), base_run_log=anchor, candidate_logs=candidate_logs,
+                             base_estimate=base_estimate, difference=difference,
+                             change_percent=(exp(difference if metric == "ttft_s" else -difference) - 1) * 100,
+                             sigma_log=sigma, df=df, k=k, anchor_limit=anchor_limit, base_run_matches_history=anchored,
+                             threshold=threshold, beyond_threshold=beyond, all_candidates_worse=worse,
+                             improved_beyond_threshold=improved,
+                             result=result if entry["gated"] else "informational")
+                if entry["gated"] and not anchored:
+                    blocking.append("base-run-differs-from-baseline-history:" + metric)
+                if entry["result"] == "regressed":
+                    regressions.append(metric)
+                elif entry["result"] == "improved":
+                    improvements.append(metric)
+                elif entry["result"] == "candidates-disagree":
+                    reasons.append("candidates-disagree:" + metric)
+            else:
+                entry.update(threshold=None, result="no-baseline-history" if entry["gated"] else "informational")
+            metrics[metric] = entry
     if differences:
         reasons.append("generated-tokens-differ")
-    reasons.extend("host:" + reason for reason in host)
-    if purpose == CALIBRATION:
-        status = "needs-review" if reasons else "calibrated"
+    reasons.extend(host)
+    if purpose == BASELINE:
+        status = "needs-review" if reasons else "baseline"
     else:
-        status = "regressed" if regressions else "needs-review" if reasons else "passed"
+        # A device whose base no longer matches its history cannot establish a regression.
+        status = "needs-review" if blocking else "regressed" if regressions else "needs-review" if reasons else "passed"
     result = dict(status=status, passed=status == "passed", evidence_valid=True, cell=dict(cell),
-                  protocol=dict(protocol), order=[arm_name(k, side) for k, side in order],
-                  statistic="mean-paired-log-ratio", metrics=metrics, regressions=regressions,
-                  review_reasons=reasons,
-                  output_workload=dict(same_tokens=not differences, reference_arm=arm_name(1, "base"),
-                                       differences=differences),
-                  measurement_identity=identity, pairs=list(pairs),
-                  interpretation=CALIBRATION_INTERPRETATION if purpose == CALIBRATION else INTERPRETATION)
-    if purpose == REGRESSION_GATE:
-        result.update(noise_band=noise, decision_rule=dict(
-            k=multiplier, k_quantile=BAND_QUANTILE, floor_fraction=thresholds["floor_fraction"], pairs=count,
-            gated_metrics=list(GATED_METRICS),
-            threshold="max(ln(1 + floor_fraction), k * sigma_log / sqrt(pairs))",
-            noise_bands_sha256=conditions_digest(bands)))
+                  protocol=dict(protocol), order=[arm_name(k, side) for k, side in keys],
+                  statistic="pooled-within-commit-log-variance", metrics=metrics, regressions=regressions,
+                  improvements=improvements,
+                  review_reasons=[*blocking, *reasons],
+                  output_workload=dict(same_tokens=not differences, reference_run=arm_name(*keys[0]),
+                                       tokens_sha256=tokens_digest(reference), differences=differences),
+                  measurement_identity=identity, history_pool=pool,
+                  decision_rule=dict(t_quantile=T_QUANTILE, floor_fraction=thresholds["floor_fraction"],
+                                     gated_metrics=list(GATED_METRICS),
+                                     baseline_history_sha256=conditions_digest(history),
+                                     threshold="max(ln(1 + floor_fraction), t_df * sigma * sqrt(1/candidate runs + 1/(history runs + 1)))",
+                                     anchor="|base run - history mean| <= t_df * sigma * sqrt(1 + 1/history runs)"),
+                  interpretation=BASELINE_INTERPRETATION if purpose == BASELINE else INTERPRETATION)
+    if environment is not None:
+        result["environment"] = environment
     return result
 
 

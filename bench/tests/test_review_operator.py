@@ -17,6 +17,7 @@ POLICY = json.loads(
 )
 REPO = POLICY["repository"]
 BASE, HEAD, CANDIDATE = "a" * 40, "b" * 40, "c" * 40
+MAIN = "f" * 40
 
 
 class API:
@@ -54,11 +55,17 @@ class API:
             html_url="https://example.invalid/run/87",
         )
         self.posts = []
+        self.main = MAIN
+        self.artifacts, self.downloads = [], {}
 
     def call(self, path, data=None):
         if data is not None:
             self.posts.append((path, data))
             return None
+        if path == f"repos/{REPO}/branches/main":
+            return {"commit": {"sha": self.main}}
+        if path.endswith("/artifacts?per_page=100"):
+            return {"artifacts": copy.deepcopy(self.artifacts)}
         if "/collaborators/" in path:
             return {"permission": self.permission}
         if path == f"repos/{REPO}/pulls/58":
@@ -74,10 +81,13 @@ class API:
             return copy.deepcopy(self.run)
         raise AssertionError(path)
 
+    def raw(self, path):
+        return self.downloads[path]
+
 
 @pytest.fixture
 def api(monkeypatch):
-    monkeypatch.setattr(entry, "current_ci", lambda *_, **__: {"id": 12, "attempt": 1})
+    monkeypatch.setattr(entry, "current_ci", lambda *_: {"id": 12, "attempt": 1})
     monkeypatch.setattr(
         entry.prepare, "access", lambda *_: ({"login": "maintainer"}, "d" * 40)
     )
@@ -104,10 +114,13 @@ def args(tmp_path, monkeypatch):
         if argv[0] == "cat-file":
             return b""
         assert argv[:2] == ("diff", "--name-only")
-        # A revision compared with itself has no changed paths.
-        return b"" if argv[-2] == argv[-1] else b"bench/ci/review_operator.py\0"
+        return b"bench/ci/review_operator.py\0"
 
     monkeypatch.setattr(entry.prepare, "git", git)
+    # Main's head already has its baseline job, so PR-only tests queue nothing else.
+    entry.save_record(tmp_path / (entry.baseline_key(REPO, MAIN) + ".json"),
+                      dict(schema_version=1, kind="baseline", repository=REPO, commit=MAIN, created_at=0.0),
+                      "ingested")
     return SimpleNamespace(
         source=tmp_path,
         inputs=inputs,
@@ -122,7 +135,9 @@ def args(tmp_path, monkeypatch):
 
 def record(api, args):
     value = entry.authorization(api, POLICY, 58, 71, HEAD)
-    value.update(entry.trusted_inputs(args))
+    value.update(
+        inputs_sha256=entry.digest(args.inputs), policy_sha256=entry.digest(args.policy)
+    )
     path = args.state / (entry.key(REPO, 58, api.reviews[0]) + ".json")
     entry.save_record(path, value, "queued")
     return path, value
@@ -135,8 +150,7 @@ def prepared_envelope(actual, **_):
         raw = entry.prepare.git(actual.source, "diff", "--name-only", "-z",
                                 "--no-renames", "--no-ext-diff", actual.base, target)
         paths.extend(item.decode() for item in raw.split(b"\0") if item)
-    impact = entry.plan(paths, POLICY, calibration=getattr(actual, "calibration_pairs", None) is not None,
-                        **identities)
+    impact = entry.plan(paths, POLICY, **identities)
     actual.output.mkdir(parents=True, exist_ok=True)
     value = dict(**identities, selection=impact,
                  selection_plan_sha256=entry.fingerprint(impact),
@@ -201,79 +215,6 @@ def test_later_maintainer_can_revoke(api, state, body):
         entry.authorization(api, POLICY, 58, 71, HEAD)
 
 
-def test_calibrate_command_has_the_same_exact_head_authorization(api):
-    api.reviews[0]["body"] = "/ci calibrate"
-    value = entry.authorization(api, POLICY, 58, 71, HEAD)
-    assert value["command"] == "calibrate" and value["head"] == HEAD
-    assert entry.prepared_identity(value) == dict(base=HEAD, head=HEAD, candidate=HEAD)
-    api.permission = "read"
-    with pytest.raises(entry.Stale):
-        entry.authorization(api, POLICY, 58, 71, HEAD)
-
-
-def test_later_cancel_also_revokes_a_calibration(api):
-    api.reviews[0]["body"] = "/ci calibrate"
-    api.reviews.append(dict(api.reviews[0], id=72, body="/ci cancel"))
-    with pytest.raises(entry.Stale, match="cancelled"):
-        entry.authorization(api, POLICY, 58, 71, HEAD)
-
-
-def test_calibrate_review_queues_bounded_pairs_and_prepares_head_against_itself(api, args, monkeypatch):
-    api.reviews[0]["body"] = "/ci calibrate"
-    args.calibration_pairs = 3
-    monkeypatch.setattr(entry, "fetch_objects", lambda *_: None)
-    prepared = []
-
-    def prepare(actual, **kwargs):
-        prepared.append(actual)
-        return prepared_envelope(actual, **kwargs)
-
-    monkeypatch.setattr(entry.prepare, "prepare", prepare)
-    monkeypatch.setattr(entry.prepare, "stage", lambda *_, **__: None)
-    monkeypatch.setattr(entry.prepare, "dispatch", lambda *_, **__: api.run)
-    entry.tick(args, api)
-    record = entry.load(args.state / (entry.key(REPO, 58, api.reviews[0]) + ".json"))
-    assert record["command"] == "calibrate" and record["calibration_pairs"] == 3 and record["status"] == "running"
-    actual = prepared[0]
-    assert (actual.base, actual.head, actual.candidate, actual.calibration_pairs) == (HEAD, HEAD, HEAD, 3)
-    envelope = entry.load(actual.output / "envelope.json")
-    assert envelope["selection"]["purpose"] == "noise-calibration"
-    assert envelope["execution_devices"] == list(entry.prepare.DEVICES)
-
-
-@pytest.mark.parametrize("pairs", [None, 5, True])
-def test_calibration_record_without_a_bounded_pair_count_never_prepares(api, args, monkeypatch, pairs):
-    api.reviews[0]["body"] = "/ci calibrate"
-    path, value = record(api, args)
-    if pairs is not None:
-        value["calibration_pairs"] = pairs
-    monkeypatch.setattr(entry.prepare, "prepare", lambda *_, **__: pytest.fail("unbounded calibration"))
-    entry.advance(args, api, POLICY, path, value)
-    assert value["status"] == "stale" and "pair count" in value["error"]
-
-
-@pytest.mark.parametrize("change", ["new-bands", "invalid-bands"])
-def test_noise_bands_changed_after_queueing_never_prepare(api, args, monkeypatch, change):
-    from test_ci_performance_series import banded
-    path, value = record(api, args)
-    assert value["noise_bands_sha256"] == entry.fingerprint({})
-    bands = args.inputs.with_name(entry.prepare.BANDS_FILE)
-    bands.write_text(json.dumps(banded({("cloud-5090", "muse", "512"): "c" * 64}))
-                     if change == "new-bands" else '{"other": {}}')
-    monkeypatch.setattr(entry.prepare, "prepare", lambda *_, **__: pytest.fail("changed operator bands"))
-    entry.advance(args, api, POLICY, path, value)
-    assert value["status"] == ("stale" if change == "new-bands" else "interrupted")
-    assert ("noise bands" if change == "new-bands" else "noise bands are keyed") in value["error"]
-
-
-def test_edited_command_after_queueing_is_stale(api, args, monkeypatch):
-    path, value = record(api, args)
-    api.reviews[0]["body"] = "/ci calibrate"
-    monkeypatch.setattr(entry.prepare, "prepare", lambda *_, **__: pytest.fail("command changed"))
-    entry.advance(args, api, POLICY, path, value)
-    assert value["status"] == "stale" and "command" in value["error"]
-
-
 def test_expired_authorization(api):
     with pytest.raises(entry.Stale, match="expired"):
         entry.authorization(api, POLICY, 58, 71, HEAD, now=9e9)
@@ -282,7 +223,7 @@ def test_expired_authorization(api):
 def test_hosted_ci_pending_is_persistently_queued(api, args, monkeypatch):
     path, value = record(api, args)
 
-    def pending(*_, **__):
+    def pending(*_):
         raise ValueError("normal hosted CI has not completed")
 
     monkeypatch.setattr(entry, "current_ci", pending)
@@ -488,8 +429,8 @@ def test_repeated_event_is_not_dispatched_again(api, args, monkeypatch):
     monkeypatch.setattr(entry, "advance", lambda *_: pytest.fail("duplicate event"))
     entry.tick(args, api)
     assert (
-        len(list(args.state.glob("*.json"))) == 3
-    )  # profile, policy, one durable event
+        len(list(args.state.glob("*.json"))) == 4
+    )  # profile, policy, main's baseline job, one durable event
 
 
 def test_unrelated_profile_wait_does_not_starve_exact_mac_acceptance(api, args, monkeypatch):
@@ -500,7 +441,8 @@ def test_unrelated_profile_wait_does_not_starve_exact_mac_acceptance(api, args, 
     identity = entry.authorization(api, POLICY, 58, 71, HEAD)
     records = []
     for index, number in enumerate((58, 64)):
-        value = dict(identity, pr=number, **entry.trusted_inputs(args))
+        value = dict(identity, pr=number, inputs_sha256=entry.digest(args.inputs),
+                     policy_sha256=entry.digest(args.policy))
         path = args.state / (str(index) * 64 + ".json")
         entry.save_record(path, value, "queued")
         records.append((path, value))
@@ -548,7 +490,7 @@ def test_removed_command_does_not_queue_or_rewrite_history(api, args, monkeypatc
     monkeypatch.setattr(entry, "advance", lambda *_: pytest.fail("old command replay"))
     entry.tick(args, api)
     assert path.read_bytes() == retained
-    assert len(list(args.state.glob("*.json"))) == 3
+    assert len(list(args.state.glob("*.json"))) == 4
 
 
 def test_fresh_test_review_gets_new_record_and_preserves_old_result(api, args, monkeypatch):
@@ -699,94 +641,168 @@ def test_fork_fetch_uses_source_pull_refs_not_fork_remote(api, args, monkeypatch
     assert "external/fork" not in str(calls)
 
 
-def calibrate_record(api, args):
-    api.reviews[0]["body"] = "/ci calibrate"
-    path, value = record(api, args)
-    value["calibration_pairs"] = 4
-    return path, value
+def baseline_path(args, commit=MAIN):
+    return args.state / (entry.baseline_key(REPO, commit) + ".json")
 
 
-def test_calibrate_needs_no_test_merge_and_binds_the_head_only(api, monkeypatch):
+def test_new_main_head_queues_one_baseline_job_that_measures_it_on_every_unattended_device(api, args, monkeypatch):
+    api.main = "e" * 40
+    monkeypatch.setattr(entry, "pages", lambda *_: [])
+    fetched, prepared, dispatched = [], [], []
+    monkeypatch.setattr(entry, "fetch_objects", lambda *values: fetched.append(values[-1]))
+
+    def prepare(actual, **kwargs):
+        prepared.append(actual)
+        value = entry.plan([], POLICY, baseline=True, base=actual.base, head=actual.head, candidate=actual.candidate)
+        actual.output.mkdir(parents=True)
+        (actual.output / "envelope.json").write_text(json.dumps(dict(
+            base=actual.base, head=actual.head, candidate=actual.candidate, selection=value,
+            selection_plan_sha256=entry.fingerprint(value), execution_devices=actual.execution_devices,
+            jobs={device: {} for device in actual.execution_devices})))
+
+    monkeypatch.setattr(entry.prepare, "prepare", prepare)
+    monkeypatch.setattr(entry.prepare, "stage", lambda *_, **__: None)
+    monkeypatch.setattr(entry.prepare, "dispatch", lambda *_, **__: dispatched.append(1) or api.run)
+    observed = entry.tick(args, api)
+    record = entry.load(baseline_path(args, "e" * 40))
+    assert observed["main_head"] == "e" * 40 and record["status"] == "running" and record["kind"] == "baseline"
+    actual = prepared[0]
+    assert actual.baseline is True and (actual.base, actual.head, actual.candidate) == ("e" * 40,) * 3
+    assert actual.execution_devices == list(entry.prepare.DEVICES) and fetched == [("e" * 40,)]
+    # The same head never queues a second job, and a running parent blocks every other start.
+    api.run["status"] = "in_progress"
+    entry.tick(args, api)
+    assert len(prepared) == 1 and len(dispatched) == 1
+    assert len(list(args.state.glob("*.json"))) == 4
+
+
+@pytest.mark.parametrize("change,devices", [
+    ("sudo", ["cloud-5090", "local-mbp"]),
+    ("mac-acceptance", ["cloud-5090", "dgx-spark"]),
+])
+def test_baseline_job_runs_only_on_devices_staged_unattended(api, args, monkeypatch, change, devices):
+    profiles = entry.load(args.inputs)
+    if change == "sudo":
+        profiles["devices"]["dgx-spark"]["ssh"]["sudo_password_required"] = True
+    else:
+        profiles["temporary_mac_acceptance"] = dict(pull_request=64, head=HEAD)
+    args.inputs.write_text(json.dumps(profiles))
+    path = baseline_path(args, "e" * 40)
+    record = dict(schema_version=1, kind="baseline", repository=REPO, commit="e" * 40, created_at=1.0)
+    entry.save_record(path, record, "queued")
     seen = []
-    monkeypatch.setattr(entry, "current_ci", lambda api_, value, policy, **kwargs:
-                        seen.append((value["head"], kwargs)) or {"id": 12, "attempt": 1})
-    api.reviews[0]["body"] = "/ci calibrate"
-    api.pr["merge_commit_sha"] = None
-    value = entry.authorization(api, POLICY, 58, 71, HEAD)
-    assert (value["base"], value["head"], value["candidate"], value["command"]) == (HEAD, HEAD, HEAD, "calibrate")
-    assert seen == [(HEAD, {"require_base": False})]
-    api.reviews[0]["body"] = "/ci test"
-    with pytest.raises(entry.Waiting, match="test merge"):
-        entry.authorization(api, POLICY, 58, 71, HEAD)
+    monkeypatch.setattr(entry, "fetch_objects", lambda *_: None)
+    monkeypatch.setattr(entry.prepare, "prepare", lambda actual, **_: seen.append(actual.execution_devices)
+                        or (_ for _ in ()).throw(RuntimeError("stop after scope")))
+    entry.advance_baseline(args, api, POLICY, path, record)
+    assert seen == [devices] and record["status"] == "interrupted" and record["no_automatic_retry"] is True
 
 
-def test_calibrate_still_waits_for_hosted_ci_on_its_head(api, args, monkeypatch):
-    path, value = calibrate_record(api, args)
-    monkeypatch.setattr(entry, "current_ci", lambda *_, **__: (_ for _ in ()).throw(ValueError("hosted CI pending")))
-    monkeypatch.setattr(entry.prepare, "prepare", lambda *_, **__: pytest.fail("must wait for hosted CI"))
-    entry.advance(args, api, POLICY, path, value)
-    assert value["status"] == "queued" and "hosted CI" in value["waiting"]
-
-
-def test_moving_pr_base_neither_stales_nor_cancels_a_calibration(api, args, monkeypatch):
-    path, value = calibrate_record(api, args)
-    entry.save_record(path, value, "running", run=copy.deepcopy(api.run), dispatched_at=entry.time.time())
-    api.pr["base"]["sha"] = "e" * 40
-    api.pr["merge_commit_sha"] = None
-    entry.monitor(args, api, POLICY, path, value)
-    assert api.posts == [] and value["status"] == "running"
-    # The same base move cancels an ordinary /ci test run.
-    test_path, test_value = record(api, args)
-    api.reviews[0]["body"] = "/ci test"
-    api.pr["merge_commit_sha"] = CANDIDATE
-    entry.save_record(test_path, test_value, "running", run=copy.deepcopy(api.run), dispatched_at=entry.time.time())
-    entry.monitor(args, api, POLICY, test_path, test_value)
-    assert test_value["status"] == "cancelling"
-
-
-def test_calibration_fetches_only_the_reviewed_head(api, args, monkeypatch):
-    calls = []
-
-    def git(_, *argv):
-        calls.append(argv)
-        if argv[0] == "cat-file":
-            raise ValueError("missing object")
-        if argv[:2] == ("remote", "get-url"):
-            return ("git@github.com:" + REPO + ".git\n").encode()
-        return b""
-
-    monkeypatch.setattr(entry.prepare, "git", git)
-    api.reviews[0]["body"] = "/ci calibrate"
-    api.pr["merge_commit_sha"] = None
-    entry.fetch_objects(args, entry.authorization(api, POLICY, 58, 71, HEAD), REPO)
-    assert calls[-1][-2:] == ("ssdash", "refs/pull/58/head")
-    assert [argv for argv in calls if argv[0] == "cat-file"] == [("cat-file", "-e", HEAD + "^{commit}")]
-
-
-def test_changed_noise_bands_cancel_a_running_parent(api, args):
-    from test_ci_performance_series import banded
+@pytest.mark.parametrize("first", ["pr", "baseline"])
+def test_pr_and_baseline_jobs_start_in_queue_order(api, args, monkeypatch, first):
     path, value = record(api, args)
-    entry.save_record(path, value, "running", run=copy.deepcopy(api.run), dispatched_at=entry.time.time())
-    entry.monitor(args, api, POLICY, path, value)
-    assert api.posts == [] and value["status"] == "running"
-    args.inputs.with_name(entry.prepare.BANDS_FILE).write_text(
-        json.dumps(banded({("cloud-5090", "muse", "512"): "c" * 64})))
-    entry.monitor(args, api, POLICY, path, value)
-    assert api.posts == [(f"repos/{POLICY['controller_repository']}/actions/runs/87/cancel", {})]
-    assert value["status"] == "cancelling" and "noise bands" in value["cancellation_reason"]
+    entry.save_record(path, value, "queued", created_at=2.0 if first == "baseline" else 1.0)
+    entry.save_record(baseline_path(args, "e" * 40), dict(schema_version=1, kind="baseline", repository=REPO,
+                      commit="e" * 40, created_at=1.0 if first == "baseline" else 2.0), "queued")
+    api.main = "e" * 40
+    monkeypatch.setattr(entry, "pages", lambda *_: [])
+    started = []
+    monkeypatch.setattr(entry, "advance", lambda *values: started.append("pr"))
+    monkeypatch.setattr(entry, "advance_baseline", lambda *values: started.append("baseline"))
+    entry.tick(args, api)
+    assert started == [first]
 
 
-def test_noise_bands_changed_during_staging_never_dispatch(api, args, monkeypatch):
-    from test_ci_performance_series import banded
+def test_pr_without_base_history_is_prepared_and_decided_needs_review_not_delayed(api, args, monkeypatch):
+    # No scheduling for a missing base: the PR runs in queue order and its cells say so.
     path, value = record(api, args)
     monkeypatch.setattr(entry, "fetch_objects", lambda *_: None)
-    monkeypatch.setattr(entry.prepare, "prepare", prepared_envelope)
-
-    def stage(*_, **__):
-        args.inputs.with_name(entry.prepare.BANDS_FILE).write_text(
-            json.dumps(banded({("cloud-5090", "muse", "512"): "c" * 64})))
-
-    monkeypatch.setattr(entry.prepare, "stage", stage)
-    monkeypatch.setattr(entry.prepare, "dispatch", lambda *_, **__: pytest.fail("stale dispatch"))
+    calls = []
+    monkeypatch.setattr(entry.prepare, "prepare", lambda actual, **kwargs: calls.append(actual) or
+                        prepared_envelope(actual, **kwargs))
+    monkeypatch.setattr(entry.prepare, "stage", lambda *_, **__: None)
+    monkeypatch.setattr(entry.prepare, "dispatch", lambda *_, **__: api.run)
     entry.advance(args, api, POLICY, path, value)
-    assert value["status"] == "stale" and "before dispatch" in value["error"]
+    assert value["status"] == "running" and len(calls) == 1 and not getattr(calls[0], "baseline", False)
+
+
+def test_failed_staging_of_a_baseline_job_is_never_retried(api, args, monkeypatch):
+    path = baseline_path(args, "e" * 40)
+    record = dict(schema_version=1, kind="baseline", repository=REPO, commit="e" * 40, created_at=1.0)
+    entry.save_record(path, record, "queued")
+    monkeypatch.setattr(entry, "fetch_objects", lambda *_: None)
+    monkeypatch.setattr(entry.prepare, "prepare", lambda actual, **kwargs: (actual.output.mkdir(parents=True),
+        (actual.output / "envelope.json").write_text(json.dumps(dict(
+            base="e" * 40, head="e" * 40, candidate="e" * 40,
+            selection=entry.plan([], POLICY, baseline=True, base="e" * 40, head="e" * 40, candidate="e" * 40),
+            selection_plan_sha256=entry.fingerprint(entry.plan([], POLICY, baseline=True, base="e" * 40,
+                                                               head="e" * 40, candidate="e" * 40)),
+            execution_devices=actual.execution_devices, jobs={d: {} for d in actual.execution_devices})))))
+
+    def held(*_, **__):
+        raise RuntimeError("root staging failed (exit 1); retain fresh job and stop without retry: lease held")
+
+    monkeypatch.setattr(entry.prepare, "stage", held)
+    monkeypatch.setattr(entry.prepare, "dispatch", lambda *_, **__: pytest.fail("dispatch after failed staging"))
+    entry.advance_baseline(args, api, POLICY, path, record)
+    assert record["status"] == "interrupted" and record["no_automatic_retry"] is True
+    monkeypatch.setattr(entry, "advance_baseline", lambda *_: pytest.fail("automatic retry"))
+    monkeypatch.setattr(entry, "pages", lambda *_: [])
+    api.main = "e" * 40
+    entry.tick(args, api)
+
+
+def test_baseline_parent_is_cancelled_only_at_its_deadline_and_needs_no_review(api, args, monkeypatch):
+    path = baseline_path(args, "e" * 40)
+    record = dict(schema_version=1, kind="baseline", repository=REPO, commit="e" * 40, created_at=1.0)
+    entry.save_record(path, record, "running", run=copy.deepcopy(api.run), dispatched_at=entry.time.time())
+    monkeypatch.setattr(entry, "authorization", lambda *_, **__: pytest.fail("a baseline job has no review"))
+    entry.monitor(args, api, POLICY, path, record)
+    assert record["status"] == "running" and not api.posts
+    record["dispatched_at"] -= args.run_timeout_s + 1
+    entry.monitor(args, api, POLICY, path, record)
+    assert record["status"] == "cancelling" and "deadline" in record["cancellation_reason"]
+
+
+def aggregate_zip(report):
+    import io
+    import zipfile
+    raw = io.BytesIO()
+    with zipfile.ZipFile(raw, "w") as archive:
+        archive.writestr("aggregate.json", json.dumps(report))
+    return raw.getvalue()
+
+
+@pytest.mark.parametrize("damage", [None, "other-envelope", "missing-artifact", "digest"])
+def test_completed_baseline_job_adds_only_its_verified_cells_to_the_history(api, args, damage):
+    from test_ci_performance_series import baseline_row, report_for
+    commit = "a" * 40  # the synthetic baseline cells measure BASE
+    path = baseline_path(args, commit)
+    prepared = path.parent / path.stem / "prepared"
+    prepared.mkdir(parents=True)
+    envelope = dict(base=commit, head=commit, candidate=commit, execution_devices=["cloud-5090"],
+                    jobs={"cloud-5090": dict(job_id="f" * 32)})
+    (prepared / "envelope.json").write_text(json.dumps(envelope))
+    record = dict(schema_version=1, kind="baseline", repository=REPO, commit=commit, created_at=1.0,
+                  prepared=str(prepared))
+    entry.save_record(path, record, "running", run=copy.deepcopy(api.run), dispatched_at=entry.time.time())
+    report = report_for([baseline_row(), baseline_row("deepseek", token_change=(2, "candidate"))])
+    report["envelope_sha256"] = "0" * 64 if damage == "other-envelope" else entry.fingerprint(envelope)
+    raw = aggregate_zip(report)
+    if damage != "missing-artifact":
+        api.artifacts = [dict(id=5, name="selected-aggregate-87-1", expired=False,
+                              digest="sha256:" + ("0" * 64 if damage == "digest" else entry.hashlib.sha256(raw).hexdigest()))]
+    api.downloads[f"repos/{POLICY['controller_repository']}/actions/artifacts/5/zip"] = raw
+    api.run.update(status="completed", conclusion="failure", updated_at="2026-10-29T08:00:00Z")
+    entry.monitor(args, api, POLICY, path, record)
+    entry.ingest_baseline(args, api, POLICY, path, record)
+    root = entry.history.store_root(args.inputs)
+    if damage is None:
+        assert record["status"] == "ingested"
+        assert record["stored"] == [dict(device="cloud-5090", model="muse", tier="512", result="stored")]
+        assert record["skipped"][0]["cell"] == "cloud-5090/deepseek/512"
+        stored = entry.history.load_all(root)
+        assert len(stored) == 1 and stored[0]["run_id"] == 87 and stored[0]["measured_at"] == "2026-10-29T08:00:00Z"
+    else:
+        assert record["status"] == "ingest-failed" and record["no_automatic_retry"] is True
+        assert entry.history.load_all(root) == []

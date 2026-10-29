@@ -183,29 +183,31 @@ def model_identities(config):
 
 
 PERFORMANCE_MODE = "functional-numerical-performance"
+# A PR runs candidate, base, candidate, candidate; a baseline job measures one
+# main commit (built once, as the candidate side) four times.
 PERFORMANCE_PROTOCOL = dict(tier="512", prompt_sha256="17ac26b4a3bc13d6c51dd10b62eb54931651d48e41ca4071c587a931a662e283",
-                            output_tokens=256, samples_per_side=2, order="ABBA", purpose="regression-gate")
-CALIBRATION_PAIRS = range(2, 5)
+                            output_tokens=256, purpose="regression-gate",
+                            order=["candidate", "base", "candidate", "candidate"])
+BASELINE_PROTOCOL = dict(PERFORMANCE_PROTOCOL, purpose="baseline", order=["candidate"] * 4)
 
 
 def protocol_admitted(config):
-    """The fixed gate protocol, or its A/A calibration form on one revision."""
+    """The fixed gate protocol, or the baseline protocol for one main commit."""
     value = config.get("performance_protocol")
-    if (not isinstance(value, dict) or type(value.get("output_tokens")) is not int
-            or type(value.get("samples_per_side")) is not int):
+    if not isinstance(value, dict) or type(value.get("output_tokens")) is not int:
         return False
     if value == PERFORMANCE_PROTOCOL:
         return True
-    revisions = {config["sides"][side]["revision"] for side in ("base", "candidate")}
-    return (value["samples_per_side"] in CALIBRATION_PAIRS and len(revisions) == 1
-            and value == dict(PERFORMANCE_PROTOCOL, samples_per_side=value["samples_per_side"],
-                              purpose="noise-calibration"))
+    return (value == BASELINE_PROTOCOL
+            and len({config["sides"][side]["revision"] for side in ("base", "candidate")}) == 1)
 
 
 def source_sides(config):
     mode = config.get("validation_mode", "functional-numerical")
     if mode not in ("functional-numerical", PERFORMANCE_MODE):
         fail("unsupported root operator validation mode")
+    if mode == PERFORMANCE_MODE and config.get("performance_protocol") == BASELINE_PROTOCOL:
+        return ("candidate",)
     return (("base", "candidate") if mode == PERFORMANCE_MODE and any(
         data.get("benchmarks") for data in config["sides"]["candidate"]["models"].values()) else ("candidate",))
 

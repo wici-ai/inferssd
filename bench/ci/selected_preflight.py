@@ -1,5 +1,6 @@
 """Check every selected pair's actual short runtime before any timed request."""
 
+import json
 from pathlib import Path, PurePosixPath
 import time
 
@@ -7,7 +8,7 @@ import final_chat
 from ci.compare import comparable
 from ci.contract import digest, load, save
 from ci import mac_host_gate
-from ci.selection_contract import arm_prefix, linux_stages, PERFORMANCE_MODE, timed_protocol
+from ci.selection_contract import arm_prefix, linux_stages, PERFORMANCE_MODE, run_count, timed_protocol, timed_sides
 from ci.staged_benchmark import verify_stopped
 from ci.staged_smoke import smoke
 from ci.selected_receipt import receipt, mac_job_root
@@ -64,16 +65,16 @@ def launch(spec, side, *, required=False, job_root=None):
 TELEMETRY = "--ssd-telemetry"
 
 
-def arm_launch(spec, side, pair, *, required=False, job_root=None, functional=None):
-    """Derive one timed arm's launch from the single reviewed timed argv.
+def arm_launch(spec, side, run, *, required=False, job_root=None, functional=None):
+    """Derive one timed run's launch from the single reviewed timed argv.
 
-    Every arm is a fresh server, and native telemetry uses O_EXCL, so each arm
-    gets its own event file: `<timed name>-r<pair>.jsonl` next to the reviewed
-    path. Nothing else differs between arms, and the timed argv must still match
+    Every run is a fresh server, and native telemetry uses O_EXCL, so each run
+    gets its own event file: `<timed name>-r<run>.jsonl` next to the reviewed
+    path. Nothing else differs between runs, and the timed argv must still match
     its short preflight exactly apart from the telemetry file.
     """
-    if type(pair) is not int or pair < 1:
-        raise ValueError("explicit timed arm pair required")
+    if type(run) is not int or run < 1:
+        raise ValueError("explicit timed run index required")
     short = launch(spec, side, required=required, job_root=job_root)
     argv = list(spec["argv"])
     if TELEMETRY not in argv:
@@ -84,7 +85,7 @@ def arm_launch(spec, side, pair, *, required=False, job_root=None, functional=No
     if (not path.startswith(prefix) or not path.endswith(".jsonl")
             or str(PurePosixPath(path)) != path or any(part in (".", "..") for part in path.split("/"))):
         raise ValueError("timed telemetry must be one canonical file in its side scratch directory")
-    argv[index + 1] = path[:-len(".jsonl")] + "-r" + str(pair) + ".jsonl"
+    argv[index + 1] = path[:-len(".jsonl")] + "-r" + str(run) + ".jsonl"
     others = [short["argv"], *([functional["argv"]] if functional is not None else [])]
     if argv[index + 1] in {other[i + 1] for other in others for i, arg in enumerate(other[:-1]) if arg == TELEMETRY}:
         raise ValueError("timed arm telemetry collides with another server's event file")
@@ -100,7 +101,7 @@ def declarations(config, manifest, needs):
     result = []
     platform = config["paths"]["platform"]
     expected = linux_stages(config, needs, ("base", "candidate")) if platform == "linux" else None
-    pairs = timed_protocol(config)["samples_per_side"]
+    protocol = timed_protocol(config)
     if platform == "darwin" and manifest.get("selection_resource_policy") != config["host"]["resources"]:
         raise ValueError("preflight requires the actual root Mac resource policy")
     for model in needs["models"]:
@@ -109,7 +110,7 @@ def declarations(config, manifest, needs):
             # not after the first model's long completion has begun.
             final_chat.prompt_path(tier)
             pair = dict(model=model, tier=tier, sides={})
-            for side in ("base", "candidate"):
+            for side in timed_sides(protocol):
                 data = config["sides"][side]
                 spec = data["models"][model]["benchmarks"][tier]
                 if not set((*LAUNCH, "os_page_cache_treatment")) <= set(spec):
@@ -133,7 +134,7 @@ def declarations(config, manifest, needs):
                 job_root = mac_job_root(config["manifest_path"]) if platform == "darwin" else None
                 required = config.get("validation_mode") == PERFORMANCE_MODE
                 functional = data["models"][model]["smoke"] if side == "candidate" else None
-                for index in range(1, pairs + 1):
+                for index in range(1, run_count(protocol, side) + 1):
                     timed_stage = arm_prefix(side, model, index) + "-benchmark-" + tier
                     if expected is not None and manifest["stages"].get(timed_stage) != expected[timed_stage]:
                         raise ValueError("root manifest does not authorize the exact timed stage")
@@ -185,7 +186,7 @@ def run(session, config, manifest, pairs, builds, functional, output):
                 comparable_pair[side] = comparable(observed)
                 checked[model, tier, side] = observed
             save(output / "preflight" / model / tier / "comparable.json", comparable_pair)
-            if comparable_pair["base"] != comparable_pair["candidate"]:
+            if len({json.dumps(value, sort_keys=True) for value in comparable_pair.values()}) != 1:
                 raise ValueError("short preflight resources, typed settings, model or loaded image roles differ")
             gate["cells"].append(cell)
         gate.update(status="passed", finished_monotonic_ns=time.monotonic_ns())
@@ -213,8 +214,8 @@ def retained(root, config, needs):
     checked = {}
     for cell in gate["cells"]:
         model, tier = cell["model"], cell["tier"]
-        if set(cell["sides"]) != {"base", "candidate"}:
-            raise ValueError("preflight must contain both runtime arms")
+        if set(cell["sides"]) != set(timed_sides(timed_protocol(config))):
+            raise ValueError("preflight must contain every timed side")
         pair = {}
         for side, data in cell["sides"].items():
             folder = root / "preflight" / model / tier / side
@@ -245,6 +246,6 @@ def retained(root, config, needs):
             checked[model, tier, side] = load(path)
             pair[side] = comparable(checked[model, tier, side])
         if (load(root / "preflight" / model / tier / "comparable.json") != pair
-                or pair["base"] != pair["candidate"]):
+                or len({json.dumps(value, sort_keys=True) for value in pair.values()}) != 1):
             raise ValueError("retained preflight arms are not comparable")
     return checked

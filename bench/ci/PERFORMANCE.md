@@ -7,24 +7,24 @@ prompt/template, actual settings, CPU/GPU placement, memory/cache/resource
 budgets, toolchain and recorded OS-cache treatment. Direct GGUF and unrestricted H2D remain mandatory. The protected broker
 owns source/build/observation evidence; candidate output cannot certify itself.
 
-## Interleaved pairs
+## Runs
 
-Each selected cell (device, model and prompt tier) runs two base/candidate pairs
-in ABBA order: base, candidate, candidate, base. Pair 1 is the first base arm
-with the first candidate arm; pair 2 is the second candidate arm with the second
-base arm. Alternating which side runs first keeps a steady drift, or an effect
-of running first, out of the mean. Every arm starts a fresh server and makes one
-completion of the fixed 512-token prompt with 256 output tokens. All arms are
-kept: nothing is retried and no best arm is chosen. A failed arm makes the cell
-`failed`.
+Each selected cell (device, model and prompt tier) runs the PR's merge
+candidate three times and the base once, in the order candidate, base,
+candidate, candidate. The base does not run first: whatever effect the first
+timed run after the short preflight requests has falls on one of three candidate
+runs, not on the single base run. Every run starts a fresh server
+and makes one completion of the fixed 512-token prompt with 256 output tokens.
+All runs are kept: nothing is retried and no best run is chosen. A failed run
+makes the cell `failed`.
 
-For every arm the comparator re-reads the raw SSE and timestamps, exact
-request/template IDs, the runtime receipt and cleanup, and checks that the arms
-ran in the declared order on one clock, each on its own server. The controller
-binds the enclosing artifact to the current run/attempt, reviewed source
-identities and reviewed device config.
+For every run the comparator re-reads the raw SSE and timestamps, exact
+request/template IDs, the runtime receipt and cleanup, and checks that the runs
+ran in the declared order on one clock, each on its own server, under equal
+measured conditions. The controller binds the enclosing artifact to the current
+run/attempt, reviewed source identities and reviewed device config.
 
-Five metrics are compared:
+Five metrics are measured:
 
 - Native prefill = server `prompt_n * 1000 / prompt_ms`.
 - TTFT = completion request to first token, separate from native prefill.
@@ -34,133 +34,140 @@ Five metrics are compared:
 
 All metrics must be finite and positive.
 
+## Baseline history
+
+The base side is also measured before the PR runs. For every new commit on
+`main`, the operator queues one baseline job: on every enabled device, that
+commit is built once and each model runs four times, each run a fresh server
+with one completion, after the same short preflight requests. Jobs run one at a
+time in the order they were queued, so a PR queued after a merge normally finds
+its base already measured. Each clean cell of a baseline job becomes a record in
+the device's baseline history: the four values of every metric, their natural
+logs, the generated-token hash, the measured conditions, the job and run IDs,
+the build identity and the date. A cell whose runs produced different tokens,
+or whose Mac host check flagged a run, is reported and not recorded.
+
+The history lives in the `baseline-history` directory next to the reviewed
+device profiles (`inputs.json`) on the preparation host, one read-only file per
+device, model, tier, commit and measured conditions.
+[history.py](history.py) lists, verifies and prunes it:
+
+```sh
+python3 -I bench/ci/history.py --root baseline-history verify
+python3 -I bench/ci/history.py --root baseline-history prune --keep 50
+```
+
+Every prepared job seals its devices' records into each device's job
+configuration and names their hash (`baseline_history_sha256`) in the operator
+envelope. The device job decides with exactly those records and records the
+same hash; the hosted replay requires the envelope, the sealed configuration
+and the device report to agree before it recomputes any decision.
+
 ## Decision
 
-For metric m and pair k, `d_k = ln(candidate / base)` for TTFT and
-`d_k = -ln(candidate / base)` for the four throughput metrics, so a positive
-value always means the candidate is slower. The cell statistic is the mean
-`d̄` over the pairs. Its threshold is
+All values are compared as natural logs, signed so that a larger value is
+worse: `x = ln(TTFT)` and `x = -ln(rate)` for the four throughput metrics. For
+one metric of one cell:
 
-```
-T_m = max(ln(1 + floor_fraction_m), k * sigma_log_m / sqrt(pairs))
-```
-
-where `sigma_log_m` is the per-pair spread of `d` (its root mean square)
-measured by an A/A calibration on the same device, model and tier (see below).
-`floor_fraction` (1% for every metric) is set in `thresholds` in
-[policy.json](policy.json). Because `sigma_log_m` is itself estimated from a
-limited number of calibration pairs, `k` is the one-sided Student-t quantile
-whose upper tail equals a normal 3σ tail (P = 0.99865), with the band's pooled
-pairs as degrees of freedom. A fixed table in `compare.py` gives the same value
-everywhere: 4.277 at 8 pairs, 3.765 at 12, 3.545 at 16, 3.345 at 24, 3.253 at
-32, 3.122 at 64 (a count between entries uses the nearest lower entry) and the
-normal value 3.0 above 64. Each cell records the `k` it used.
+- `h` is the mean of the base commit's four history runs (`n_h = 4`), `a` the
+  in-run base, and `c̄` the mean of the three candidate runs.
+- `σ` is the pooled within-commit standard deviation of every history record of
+  that device, model and tier under the same measured conditions:
+  `σ² = Σ_c Σ_i (x_ci − x̄_c)² / Σ_c (n_c − 1)`, with `df = Σ_c (n_c − 1)`
+  degrees of freedom. One record gives `df = 3`; each new main commit adds 3.
+- `t` is the one-sided Student-t quantile for `df` whose upper tail equals a
+  normal 3σ tail (P = 0.99865). A fixed table in `compare.py` gives the same
+  value everywhere: 9.219 at df 3, 4.905 at 6, 3.765 at 12, 3.545 at 16, 3.122
+  at 64 and 3.060 at 128 (a df between entries uses the nearest lower entry),
+  and the normal value 3.0 above 128.
+- Anchor check: if `|a − h| > t·σ·√(1 + 1/n_h)`, the device has changed since the
+  baseline job, and the cell is `needs-review`.
+- The base estimate is `b`, the mean of the four history logs and `a`; the
+  difference is `d = c̄ − b`, with standard error `SE = σ·√(1/3 + 1/5)`, and the
+  threshold is `T = max(ln(1 + floor), t·SE)`. `floor` (1% for every metric) is
+  set in `thresholds` in [policy.json](policy.json).
 
 Only whole decode, TTFT and native prefill decide a cell. The first and second
 128-token decode rates are sub-windows of whole decode; they are measured,
-compared and shown, but cannot make a cell `regressed` or out of band.
+compared and shown for information only.
 
 | Result | Meaning | Check behavior |
 | --- | --- | --- |
-| `passed` | Every deciding metric's `d̄` is at or below its threshold, the generated tokens are identical in every arm, a noise band matches the measured conditions and the host check flagged nothing. | Passes. It means no slowdown beyond measured noise, not proof that none exists. |
-| `regressed` | Some deciding metric's `d̄` is above its threshold and every pair is slower. | Blocks acceptance. Any other review reasons are listed with it. |
-| `needs-review` | A deciding metric's `d̄` is above its threshold but the pairs disagree; a generated token sequence differs (between the sides, or between the two arms of one side); the cell has no noise band, or its band was calibrated under different measured conditions; or the Mac host check flagged an arm. | Blocks acceptance until a person reviews the evidence. |
-| `failed` | Missing or invalid evidence, mismatched conditions, incomplete cleanup or a failed arm. | Blocks acceptance; fix the evidence or implementation first. |
+| `passed` | For every deciding metric `d ≤ T`, the generated tokens are identical in every run and in the base history, the history matches the measured conditions, the in-run base agrees with its history and the host check flagged nothing. | Passes. It means no slowdown beyond measured noise, not proof that none exists. |
+| `regressed` | Some deciding metric has `d > T` and every candidate run is slower than `b`. | Blocks acceptance. Any other review reasons are listed with it. |
+| `needs-review` | A deciding metric has `d > T` but the candidate runs disagree; a generated token sequence differs (among the runs or from the base history); the base has no history under the measured conditions; the in-run base differs from its history; or the Mac host check flagged a run. | Blocks acceptance until a person reviews the evidence. |
+| `failed` | Missing or invalid evidence, mismatched conditions, incomplete cleanup or a failed run. | Blocks acceptance; fix the evidence or implementation first. |
 
-Without a matching band no regression can be established, so such a cell is
-`needs-review` even when it is clearly slower. Bands come only from 512-tier
-calibrations of operator runs, so a 4096-tier cell, and any cell of a job
-prepared without the operator bands file (for example with
-`stage_selection.py`), has no band and is `needs-review`.
+Without base history under the measured conditions no regression can be
+established, so such a cell is `needs-review` even when it is clearly slower.
+The history covers the 512 tier of operator jobs only, so a 4096-tier cell, and
+any cell of a job prepared without the history (for example with
+`stage_selection.py`), is `needs-review`. A base run that differs from its
+history also blocks `regressed`: the comparison would no longer describe the
+device the history measured.
 
-With no real change, a simulation of the A/A case (two pairs per cell, normally
-distributed `d`, a band estimated from the stated number of pooled pairs, the
-1% floor) gives a false `regressed` rate of about 0.13% per deciding metric per
-cell for bands of 8, 16 or 64 pairs, close to the normal 3σ tail of 0.135%, and
-about 0.19% just above 64 pairs, where the normal value 3.0 applies. A cell has
-three deciding metrics, so its false `regressed` rate is at most about 0.4%.
+A deciding metric with `d < −T` is labelled `improved` (faster beyond noise);
+within `±T` it is `within noise`. The label is part of the cell result, shown in
+the summary and replayed like the decision, but it never changes the cell
+status: a PR that is faster everywhere still just passes.
 
-When cells are combined, the
-most severe result wins: `failed`, then `regressed`, then `needs-review`, then
-`passed`. A device job succeeds only when all of its cells passed.
+With no real change, a simulation of the A/A case (all runs from one normal
+distribution with a 2% spread, the anchor check and the 1% floor) gives these
+rates per deciding metric per cell:
 
-Each pair is also kept on its own (`<model>/<tier>/r<k>/comparison.json`) with
-its measured values and changes. There, a pair is `needs-review` if any metric
-was slower or the tokens differed; this explains the cell but does not decide
-it. The cell result is in `<model>/<tier>/comparison.json`.
+| History df | False `regressed` | Statistical `needs-review` | False `improved` label |
+| ---: | ---: | ---: | ---: |
+| 3 | 0.081% | 0.29% | 0.13% |
+| 6 | 0.113% | 0.28% | 0.13% |
+| 12 | 0.126% | 0.28% | 0.13% |
+
+The false `regressed` rate stays below the normal 3σ tail of 0.135% because a
+regression also needs every candidate run to be slower; a cell has three
+deciding metrics, so its false `regressed` rate is below 0.4%.
+
+When cells are combined, the most severe result wins: `failed`, then
+`regressed`, then `needs-review`, then `passed`. A device job succeeds only
+when all of its cells passed. A baseline job's cells report `baseline` and make
+no decision; a job whose cells are all `baseline` succeeds.
 
 A `regressed` or `needs-review` cell is never cleared by a later run of the same
 candidate. A reviewer decides whether it shows a software regression or an
 identified environmental cause; a code fix is a new candidate with a new run.
+The measured conditions include the model files, settings, template, resource
+limits, OS and loaded libraries. When one of them changes, PR cells are
+`needs-review` until the next main commit's baseline job measures the device
+under the new conditions.
 
-## Noise bands and calibration
+## Base build cache
 
-Bands are operator data, kept outside the controller code so that calibrating
-needs no controller release. They live in `noise-bands.json` next to the
-reviewed device profiles (`inputs.json`) on the preparation host, keyed by
-device, model and tier. Each band records `sigma_log` for every metric, the
-number of pooled `pairs`, the `conditions_sha256` it was measured under, the
-`engine_revision`, the `calibration_jobs` and the `date`. Preparation validates
-the file and seals its contents into every device's job configuration, whose
-hash the root-staged manifest and the operator envelope already bind; the
-envelope also carries `noise_bands_sha256`. The device job decides with exactly
-those bands, records their hash, and the hosted replay requires the envelope,
-the sealed configuration and the device report to agree before recomputing any
-decision. A missing file means no bands, so every timed cell is `needs-review`
-until a calibration has been reviewed into the file.
-
-A calibration measures one revision against itself. A maintainer submits a
-`/ci calibrate` review, with the same authorization rules as `/ci test`, on a PR
-whose head is the revision to measure. Base and candidate are then both that
-head, exported and built separately exactly as in a normal comparison, so the
-noise includes separate builds. The run selects every enabled device and both
-models even though the diff is empty, and runs 4 pairs per cell by default (2 to
-4, set on the preparation host) in the same alternation: pair k runs base first
-when k is odd. A band needs at least 8 pairs, so it takes two default runs. Instead of a decision, each cell reports its per-pair `d` values,
-their mean and root mean square, and the status `calibrated`, or `needs-review`
-when tokens differed or the host check flagged an arm. A device job with only
-`calibrated` cells succeeds.
-
-[noise_band.py](noise_band.py) turns calibration results into bands. It reads
-calibration reports (`aggregate.json`) or retained cell `comparison.json` files
-and prints the bands object; `--merge` keeps the cells of an existing file that
-the new results do not cover:
-
-```sh
-python3 -I bench/ci/noise_band.py --merge noise-bands.json run-1/aggregate.json run-2/aggregate.json > noise-bands.new.json
-```
-
-For each cell it pools every input's per-pair `d`. Since base and candidate are
-the same revision, the expected `d` is zero, and `sigma_log` is the root mean
-square of the pooled values. Results from different revisions or measured
-conditions are refused rather than pooled. Flagged cells, cells with fewer
-than 8 pooled pairs, device rows without a verified result and report errors
-are listed as skipped, never silently dropped. More pooled pairs give a smaller
-`k` and a steadier estimate. Review the output before replacing
-`noise-bands.json`. As with a
-profile or policy change, a changed bands file makes a queued authorization
-stale and cancels a running one, so update it between runs; the next prepared
-job seals the new bands.
-
-A band applies only while the measured conditions stay the same: the model
-files, settings, template, resource limits, OS and loaded libraries all enter
-`conditions_sha256`. When one changes, the affected cells report
-`needs-review` until they are calibrated again.
+A Linux device whose profile sets `"base_build_cache": true` keeps the build of
+each baseline job: after the broker freezes it, it copies the frozen tree into
+its own state directory (`<state_root>/build-cache/<key>`), read-only, keyed by
+the commit, the side-independent build configuration and the reviewed
+toolchain. It keeps the three most recently stored or used entries. The history
+record names the build's freeze-manifest hash and cache key, so a PR whose base
+commit has a record offers that build for its base side. When the job opens, the
+broker re-hashes every cached file while copying it into the job, exactly as a
+freeze would leave it; any mismatch or a missing entry is refused and the base
+side is built as usual. The candidate always builds. The report states whether
+the base build came from the cache. The Mac does not use the cache.
 
 ## Time budget
 
-From recorded runs, each device job has a fixed part for builds, numerical
-checks, short requests and preflights, and one pair of both models adds a
-timed part:
+From recorded runs, each device job has a fixed part for two builds, numerical
+checks, short requests and preflights, and each timed run of both models adds a
+fixed amount:
 
-| Device | Fixed part | One pair, both models | `/ci test` (2 pairs) | Calibration (4 pairs) |
+| Device | Fixed part (two builds) | One run, both models | PR job (4 runs) | Baseline job (one build, 4 runs) |
 | --- | ---: | ---: | ---: | ---: |
-| cloud-5090 | about 18 min | about 14.7 min | about 47 min | about 77 min |
-| dgx-spark | about 15 min | about 22.0 min | about 59 min | about 103 min |
-| local-mbp | about 12 min | about 22.3 min | about 57 min | about 101 min |
+| cloud-5090 | about 18 min | about 7.4 min | about 47 min | under 47 min |
+| dgx-spark | about 15 min | about 11.0 min | about 59 min | under 59 min |
+| local-mbp | about 12 min | about 11.2 min | about 57 min | under 57 min |
 
-All stay within the 120-minute device job limit, and each arm stays far below
-the 7200-second Mac stage limit.
+A PR job whose base build comes from the cache saves one build. A baseline job
+runs every device at once, as one child job per device. All stay within the
+120-minute device job limit, and every run stays far below the 7200-second Mac
+stage limit.
 
 CI samples have `purpose=ci` and are not formal benchmark samples. The formal
 benchmark ([FINAL.md](../FINAL.md)) runs each prescribed 512/4K cell once on the

@@ -26,7 +26,7 @@ def mac_config():
     value = plan(["bench/ci/macos-sandbox/executor.py"])
     config = template(value, "local-mbp")
     config.update(manifest_path=MANIFEST, validation_mode=contract.PERFORMANCE_MODE,
-        execution_devices=["local-mbp"], performance_protocol=contract.performance_protocol(), noise_bands={},
+        execution_devices=["local-mbp"], performance_protocol=contract.performance_protocol(), baseline_history=[],
         host=dict(hardware=dict(memory_total_bytes=48 << 30), resources=RESOURCES))
     config["numerical"]["backend"] = "MTL0"
     for side, data in config["sides"].items():
@@ -334,8 +334,8 @@ def test_mac_and_linux_smoke_do_not_hide_missing_stop_log_eof(tmp_path):
 
 @pytest.fixture
 def mac_performance_raw(mac_raw):
-    from test_ci_performance_series import banded, write_arm
-    from ci.compare import comparable, compare_pair, compare_series, conditions_digest, schedule
+    from test_ci_performance_series import record, write_arm
+    from ci.compare import METRICS, comparable, conditions_digest, decide_cell, schedule
     import run_final
     root, config, _, original, _ = mac_raw
     config["device"] = "local-mbp"
@@ -343,7 +343,8 @@ def mac_performance_raw(mac_raw):
     source_receipt = json.loads((original / "runtime-receipt.json").read_text())
     plan = dict(base="a" * 40, candidate="c" * 40)
     preflight, host_states, results = {}, {}, {}
-    pids = {(1, "base"): 124, (1, "candidate"): 123, (2, "candidate"): 125, (2, "base"): 126}
+    order = contract.performance_protocol()["order"]
+    pids = {(1, "candidate"): 123, (1, "base"): 124, (2, "candidate"): 125, (3, "candidate"): 126}
 
     def side_copy(value, side):
         return json.loads(json.dumps(value).replace("/frozen/candidate", "/frozen/" + side).replace("/work/candidate", "/work/" + side))
@@ -358,7 +359,7 @@ def mac_performance_raw(mac_raw):
         (build_dir / "build-receipt.json").write_text(json.dumps(side_copy(source_build, side)))
         if side == "base":
             (build_dir / "freeze-manifest.json").write_bytes((root / "build-candidate/freeze-manifest.json").read_bytes())
-    for position, (index, side) in enumerate(schedule(2)):
+    for position, (index, side) in enumerate(schedule(order)):
         pid = pids[index, side]
         folder = root / "deepseek/512" / ("r" + str(index)) / side
         folder.parent.mkdir(parents=True, exist_ok=True)
@@ -381,49 +382,45 @@ def mac_performance_raw(mac_raw):
         value["host"].update(memory_budget_bytes=RESOURCES["memory_budget_bytes"], os_page_cache_treatment="not-forced; uncontrolled")
         save(folder / "comparison-receipt.json", value)
         preflight["deepseek", "512", side] = value
-        save(folder / "benchmark.json", dict(status="passed", cleanup_confirmed=True, completion_requests=1, pair=index,
+        save(folder / "benchmark.json", dict(status="passed", cleanup_confirmed=True, completion_requests=1, run=index,
             revision=plan[side], tier="512", model="deepseek", result=json.loads((folder / "result.json").read_text())))
         host_states[index, side] = host_raw(folder, config)
         results[index, side] = run_final.read_result(folder / "result.json", "512", 300)
     receipts = {key: json.loads((root / "deepseek/512" / ("r" + str(key[0])) / key[1] / "comparison-receipt.json").read_text())
                 for key in results}
-    bands = banded({("local-mbp", "deepseek", "512"): conditions_digest(comparable(receipts[1, "base"]))})
-    config["noise_bands"] = bands
+    measured = results[1, "base"]
+    config["baseline_history"] = [record(plan["base"], device="local-mbp", model="deepseek", tokens=measured["tokens"],
+                                         base={metric: measured["metrics"][metric] for metric in METRICS},
+                                         conditions=conditions_digest(comparable(receipts[1, "base"])))]
     policy = POLICY
-    pairs = []
-    for index in (1, 2):
-        pair = compare_pair(results[index, "base"], results[index, "candidate"],
-                            receipts[index, "base"], receipts[index, "candidate"], policy)
-        pair = mac_host_gate.pair(pair, host_states[index, "base"], host_states[index, "candidate"])
-        save(root / "deepseek/512" / ("r" + str(index)) / "comparison.json", pair)
-        pairs.append(pair)
-    save(root / "deepseek/512/comparison.json", compare_series(
-        results, receipts, pairs, policy, protocol=contract.performance_protocol(), bands=bands,
-        cell=dict(device="local-mbp", model="deepseek", tier="512", job_id=JOB, **plan)))
+    environment = mac_host_gate.cell({"r" + str(k) + "/" + side: state for (k, side), state in host_states.items()})
+    save(root / "deepseek/512/comparison.json", decide_cell(
+        results, receipts, policy, protocol=contract.performance_protocol(), history=config["baseline_history"],
+        environment=environment, cell=dict(device="local-mbp", model="deepseek", tier="512", job_id=JOB, **plan)))
     return root, config, plan, preflight, policy
 
 
 @pytest.mark.parametrize("damage", [None, "missing-sse", "different-job-source", "missing-host", "changed-host-raw",
-                                    "pair-index", "swapped-order"])
-def test_mac_timed_pairs_replay_real_protocol_sse_and_every_arm_runtime(mac_performance_raw, damage):
+                                    "run-index", "swapped-order"])
+def test_mac_timed_runs_replay_real_protocol_sse_and_every_run_runtime(mac_performance_raw, damage):
     root, config, plan, preflight, policy = mac_performance_raw
-    if damage == "missing-sse": (root / "deepseek/512/r2/base/result.events.sse").unlink()
+    if damage == "missing-sse": (root / "deepseek/512/r1/base/result.events.sse").unlink()
     elif damage == "different-job-source": config["manifest_path"] = MANIFEST.replace(JOB, "b" * 32)
     elif damage == "missing-host": (root / "deepseek/512/r1/base" / mac_host_gate.SNAPSHOTS[1]).unlink()
     elif damage == "changed-host-raw":
         path = root / "deepseek/512/r2/candidate" / mac_host_gate.SNAPSHOTS[1]
         value = json.loads(path.read_text()); value["raw"]["swap"]["stdout"] = "invalid observation"
         path.write_text(json.dumps(value))
-    elif damage == "pair-index":
-        path = root / "deepseek/512/r2/base/benchmark.json"
-        value = json.loads(path.read_text()); value["pair"] = 1
+    elif damage == "run-index":
+        path = root / "deepseek/512/r3/candidate/benchmark.json"
+        value = json.loads(path.read_text()); value["run"] = 2
         path.write_text(json.dumps(value))
     elif damage == "swapped-order":
-        # Pair 2 ran base before candidate: every identity stays valid, only the order is wrong.
+        # The base ran before the first PR run: every identity stays valid, only the order is wrong.
         from test_ci_performance_series import shift_arm
-        shift_arm(root / "deepseek/512/r2/candidate", 300_000_000_000)
-        shift_arm(root / "deepseek/512/r2/base", -300_000_000_000)
-        with pytest.raises(ValueError, match="interleaved order"):
+        shift_arm(root / "deepseek/512/r1/candidate", 300_000_000_000)
+        shift_arm(root / "deepseek/512/r1/base", -300_000_000_000)
+        with pytest.raises(ValueError, match="declared order"):
             aggregate.performance_retained(root, config, "deepseek", "512", plan, policy, preflight, JOB)
         return
     if damage:
@@ -432,11 +429,11 @@ def test_mac_timed_pairs_replay_real_protocol_sse_and_every_arm_runtime(mac_perf
     else:
         cell = aggregate.performance_retained(root, config, "deepseek", "512", plan, policy, preflight, JOB)
         assert cell["status"] == "passed" and cell["measurement_identity"]["output_tokens"] == 256
-        assert cell["metrics"]["decode_first128_tps"]["base"] == cell["metrics"]["decode_second128_tps"]["candidate"] == [1, 1]
-        assert cell["metrics"]["decode_tps"]["d"] == [0.0, 0.0] and cell["noise_band"]["status"] == "matched"
-        assert set(cell["evidence"]) == {"r1/base", "r1/candidate", "r2/candidate", "r2/base"}
-        assert cell["evidence"]["r2/base"]["result.events.sse"]["sha256"] == digest(root / "deepseek/512/r2/base/result.events.sse")
-        assert [pair["environment"]["status"] for pair in cell["pairs"]] == ["passed", "passed"]
+        assert cell["metrics"]["decode_first128_tps"]["base_run"] == 1 and cell["metrics"]["decode_tps"]["candidate"] == [1, 1, 1]
+        assert cell["metrics"]["decode_tps"]["result"] == "within-noise"
+        assert set(cell["evidence"]) == {"r1/candidate", "r1/base", "r2/candidate", "r3/candidate"}
+        assert cell["evidence"]["r1/base"]["result.events.sse"]["sha256"] == digest(root / "deepseek/512/r1/base/result.events.sse")
+        assert cell["environment"]["status"] == "passed" and set(cell["environment"]["runs"]) == set(cell["evidence"])
         assert cell["evidence"]["r1/base"][mac_host_gate.QUIET]["sha256"] == digest(root / "deepseek/512/r1/base" / mac_host_gate.QUIET)
 
 
@@ -444,7 +441,7 @@ def test_selected_mac_failure_does_not_relabel_successful_linux_scope(monkeypatc
     value = plan(["engine/src/llama-model.cpp"])
     scope = dict(validation_mode=contract.PERFORMANCE_MODE, execution_devices=list(contract.OPERATOR_DEVICES))
     jobs = {d:dict(job_id=JOB) for d in contract.OPERATOR_DEVICES}
-    def reports(root, plan, policy, job, child, scope, bands_sha256):
+    def reports(root, plan, policy, job, child, scope, history_sha256):
         device = root.parent.name
         if device == "local-mbp": raise ValueError("Mac stopped UID cleanup missing")
         return [dict(device=device, model=m, status="passed", functional="passed", numerical="passed", performance=[dict(tier="512", status="passed")]) for m in ("deepseek", "muse")]

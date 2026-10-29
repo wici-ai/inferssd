@@ -30,19 +30,21 @@ on the device. Test/control-only changes still select functional and numerical g
 changes affecting runtime/placement/resources require base/candidate performance.
 Ordinary performance uses the fixed 512-token CI prompt
 (`bench/prompts/prompt-512.txt`) with decode 256. Only the explicit DeepSeek
-compressed long-context rule adds 4K. Each cell runs two base/candidate pairs in
-ABBA order on fresh servers and records TTFT, native prefill and first/second
-128-token and whole decode rates for every arm. No automatic completion retry or
-best-of selection exists. The cell is `regressed`, `needs-review` or `passed`
-against a calibrated noise band, as described in
-[performance acceptance](PERFORMANCE.md). Bands are sealed only by operator
-preparation and exist only for the 512 tier, so 4096-tier cells and jobs
-generated with `stage_selection.py` have no band and report `needs-review`.
+compressed long-context rule adds 4K. Each cell runs the candidate three times
+and the base once (candidate, base, candidate, candidate) on fresh servers and
+records TTFT, native prefill and first/second 128-token and whole decode rates
+for every run. No automatic completion retry or best-of selection exists. The
+cell is `regressed`, `needs-review` or `passed` against the device's baseline
+history, as described in [performance acceptance](PERFORMANCE.md). The history
+is sealed only by operator preparation and covers only the 512 tier, so
+4096-tier cells and jobs generated with `stage_selection.py` have no history and
+report `needs-review`.
 
-A noise calibration (`/ci calibrate`) is the one case with an empty diff: it
-compares one revision with itself and selects every device and both models with
-the 512 tier. Its plan has `purpose: "noise-calibration"`, and the trusted rules
-rebuild it only for an empty diff and identical base, head and candidate.
+A baseline job is the one case with an empty diff: the operator measures each
+new `main` commit on its own, built once, four runs per model, selecting every
+device and both models with the 512 tier. Its plan has
+`purpose: "baseline-history"`, and the trusted rules rebuild it only for an
+empty diff and identical base, head and candidate.
 
 ## Separate App publication mode
 
@@ -117,9 +119,9 @@ execution is used; see [GitHub's security guidance](https://docs.github.com/en/a
    working directory and arguments. The operator pins a separate `preflight_argv`;
    only the single private `--ssd-telemetry` file may differ from the timed argv,
    and both destinations are distinct canonical files within that side's scratch
-   directory. Timed arm k uses the timed file name with `-r<k>` inserted before
-   `.jsonl`, so every fresh server owns its own event file, and each arm has its
-   own `<side>-<model>-r<k>-benchmark-<tier>` stage. A candidate functional smoke is reused only when its complete
+   directory. Timed run k of a side uses the timed file name with `-r<k>`
+   inserted before `.jsonl`, so every fresh server owns its own event file, and
+   each run has its own `<side>-<model>-r<k>-benchmark-<tier>` stage. A candidate functional smoke is reused only when its complete
    launch matches this preflight. Native typed snapshots, owned
    runtime images, resources and immutable inputs must compare equal for every
    pair first. Missing declarations or exact root stage authorization refuse

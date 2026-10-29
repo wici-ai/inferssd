@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 
 import run_final
-from ci.compare import SUCCESS, comparable, compare_pair, compare_series, outcome, schedule
+from ci.compare import BASELINE, SUCCESS, arm_name, comparable, decide_cell, outcome, schedule
 from ci.contract import digest, load, save
 from ci.private_controller import API, source_manifest
 from ci.isolated_device import manifest_read_path
@@ -13,8 +13,9 @@ from ci.selection_lifetime import OBSERVATION_BUDGET_S, ParentWatch
 from ci.selected_receipt import mac_job_root, receipt
 from ci import selected_preflight, model_admission, mac_host_gate
 from ci.impact import fingerprint
-from ci.selection_contract import (PERFORMANCE_MODE, arm_prefix, execution_scope, protected_binding,
-                                   runtime_requirements, sealed_bands, timed_protocol)
+from ci.selection_contract import (PERFORMANCE_MODE, arm_prefix, baseline_build_identity, execution_scope,
+                                   job_sides, protected_binding, runtime_requirements, sealed_history,
+                                   timed_protocol)
 from ci.stage_session import StageSession
 from ci.staged_benchmark import benchmark
 from ci.staged_build import run_build
@@ -46,8 +47,8 @@ def run(args):
         manifest = load(manifest_path)
         (output / "root-manifest.json").write_bytes(manifest_path.read_bytes())
         needs = runtime_requirements(config)
-        bands = sealed_bands(config)
-        report["noise_bands_sha256"] = fingerprint(bands)
+        history = sealed_history(config)
+        report["baseline_history_sha256"] = fingerprint(history)
         host_policy = mac_host_gate.policy(config) if config["paths"]["platform"] == "darwin" else None
         host_options = {"host_policy": host_policy} if host_policy is not None else {}
         scope = execution_scope(config)
@@ -80,9 +81,24 @@ def run(args):
             raise ValueError("active broker job differs from root-staged selection")
         model_admission.probe(session, config, manifest, "before", output)
         builds = {}
-        sides = ("base", "candidate") if needs["performance"] else ("candidate",)
+        sides = job_sides(config, needs)
+        offer = config.get("base_build")
+        adopted = opened.get("prebuilt", {}).get("base") if offer is not None else None
+        if offer is None and opened.get("prebuilt"):
+            raise ValueError("broker adopted a cached build that was not offered")
+        if adopted is not None and (adopted.get("key") != offer["key"]
+                                    or adopted.get("manifest_sha256") != offer["freeze_manifest_sha256"]):
+            raise ValueError("broker adopted a cached build other than the offered one")
+        if "base" in sides:
+            report["base_build"] = dict(source="cache" if adopted is not None else "built", offered=offer,
+                                        refused=opened.get("prebuilt_refused", {}).get("base"))
+        # The candidate always builds; the base reuses its verified cached build when offered.
         for side in sides:
             spec = config["sides"][side]
+            if side == "base" and adopted is not None:
+                builds[side] = run_build(session, side, spec["build"], spec["paths"], output / ("build-" + side),
+                                         spec["revision"], adopted=adopted)
+                continue
             alias = spec.get("alias")
             if alias:
                 target = output / (side + "-alias")
@@ -128,41 +144,38 @@ def run(args):
             cell = cells[model]
             report["cells"].append(cell)
             for tier in needs["performance"].get(model, {}).get("tiers", []):
-                # Every planned arm runs in the fixed ABBA order and is kept.
+                # Every planned run executes once in the fixed order and is kept.
                 # A slower or different result is a retained outcome, never a
-                # reason to retry an arm or drop it from the cell.
+                # reason to retry a run or drop it from the cell.
                 measurements, receipts, host_states = {}, {}, {}
-                for index, side in schedule(protocol["samples_per_side"]):
+                for index, side in schedule(protocol["order"]):
                     spec = config["sides"][side]["models"][model]["benchmarks"][tier]
                     launch = dict(selected_preflight.arm_launch(
                         spec, side, index, required=config.get("validation_mode") == PERFORMANCE_MODE,
                         job_root=job_root), model=model, revision=plan[side], tier=tier,
-                        stage_prefix=arm_prefix(side, model, index), pair=index)
+                        stage_prefix=arm_prefix(side, model, index), run=index)
                     if launch["argv"][0] != builds[side]["binary"]["runtime_path"]:
                         raise ValueError("performance executable differs from sealed side")
                     folder = output / model / tier / ("r" + str(index)) / side
                     measured = benchmark(session, side, launch, folder, **host_options)
                     if measured["status"] != "passed" or measured["cleanup_confirmed"] is not True:
-                        raise RuntimeError("selected benchmark arm failed; no retry")
+                        raise RuntimeError("selected timed run failed; no retry")
                     measurements[index, side] = run_final.read_result(folder / "result.json", tier, spec["request_timeout_s"])
                     receipts[index, side] = receipt(config, manifest, side, model, launch, builds[side], folder)
                     if host_policy is not None:
                         host_states[index, side] = mac_host_gate.retained_arm(folder, host_policy)
                     if comparable(receipts[index, side]) != comparable(preflight[model, tier, side]):
                         raise ValueError("timed runtime differs from its successful short preflight")
-                compared = []
-                for index in range(1, protocol["samples_per_side"] + 1):
-                    value = compare_pair(measurements[index, "base"], measurements[index, "candidate"],
-                                         receipts[index, "base"], receipts[index, "candidate"], config["policy"])
-                    if host_policy is not None:
-                        value = mac_host_gate.pair(value, host_states[index, "base"], host_states[index, "candidate"])
-                    save(output / model / tier / ("r" + str(index)) / "comparison.json", value)
-                    compared.append(value)
-                series = compare_series(measurements, receipts, compared, config["policy"], protocol=protocol, bands=bands,
-                    cell=dict(device=device, model=model, tier=tier, job_id=args.job_id,
-                              base=plan["base"], candidate=plan["candidate"]))
-                save(output / model / tier / "comparison.json", series)
-                cell["performance"].append(dict(tier=tier, **series))
+                environment = (mac_host_gate.cell({arm_name(*key): value for key, value in host_states.items()})
+                               if host_policy is not None else None)
+                decision = decide_cell(measurements, receipts, config["policy"], protocol=protocol, history=history,
+                                       environment=environment,
+                                       cell=dict(device=device, model=model, tier=tier, job_id=args.job_id,
+                                                 base=plan["base"], candidate=plan["candidate"]))
+                if protocol["purpose"] == BASELINE:
+                    decision["build"] = baseline_build_identity(config, builds["candidate"])
+                save(output / model / tier / "comparison.json", decision)
+                cell["performance"].append(dict(tier=tier, **decision))
         model_admission.probe(session, config, manifest, "after", output)
         if watch is not None:
             watch.check()

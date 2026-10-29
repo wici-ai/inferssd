@@ -9,12 +9,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci import selected_integration as execution, selected_preflight as preflight
-from ci.compare import comparable, conditions_digest
+from ci.compare import METRICS, comparable, conditions_digest
 from ci.contract import digest, load, save
 from ci.selection_contract import linux_stages
 from test_ci_selection import impact, plan, template, POLICY
 from test_ci_staged_benchmark import CONFIG
-from test_ci_performance_series import banded
+from test_ci_performance_series import sealed
 
 
 def synthetic_receipt(model, side, spec, output, fault=None):
@@ -54,12 +54,13 @@ def setup(tmp_path, monkeypatch, *, change=None, fault=None, paths=None, value=N
                 for tier in needs["performance"][model]["tiers"]}
     if change:
         change(config)
-    # Operator-sealed noise bands calibrated under exactly these synthetic conditions.
-    config["noise_bands"] = banded({
+    # Operator-sealed baseline history of the base, measured under exactly these synthetic conditions.
+    config["baseline_history"] = sealed({
         (config["device"], model, tier): conditions_digest(comparable(synthetic_receipt(
             model, "base", dict({"os_page_cache_treatment": ""}, **config["sides"]["base"]["models"][model]["benchmarks"][tier]),
             tmp_path)))
-        for model in needs["models"] for tier in config["sides"]["base"]["models"][model]["benchmarks"]})
+        for model in needs["models"] for tier in config["sides"]["base"]["models"][model]["benchmarks"]},
+        commit=value["base"], base={metric: 1.0 for metric in METRICS})
     manifest = dict(stages=linux_stages(config, needs, ("base", "candidate")))
     save(manifest_path, manifest)
     config_path = tmp_path / "config.json"
@@ -118,8 +119,9 @@ def setup(tmp_path, monkeypatch, *, change=None, fault=None, paths=None, value=N
     real_digest = execution.digest
     monkeypatch.setattr(execution, "digest", lambda p: "e" * 64 if Path(p).name == "control-source.json" else real_digest(p))
     monkeypatch.setattr(execution, "StageSession", Session)
-    monkeypatch.setattr(execution, "run_build", lambda session, side, *args:
-        dict(binary=dict(runtime_path="/build/" + side + "/bin/llama-server"), toolchain={}))
+    monkeypatch.setattr(execution, "run_build", lambda session, side, *args, **kwargs:
+        dict(binary=dict(runtime_path="/build/" + side + "/bin/llama-server", sha256="2" * 64),
+             freeze=dict(manifest_sha256="1" * 64), toolchain={"CMAKE_CXX_COMPILER": "/usr/bin/c++"}))
     monkeypatch.setattr(execution, "selected_numerical", lambda session, config, build, cases, output:
         {case: dict(status="passed") for case in cases})
     monkeypatch.setattr(execution, "smoke", smoke)
@@ -141,8 +143,9 @@ def test_every_cell_is_checked_before_first_timing_and_identical_functional_is_r
     assert len([e for e in events[:timed] if e[0] == "receipt"]) == 4
     assert [e[1] for e in events if e[0] == "smoke"] == ["candidate-smoke-deepseek", "candidate-smoke-muse",
         "base-deepseek-preflight-512", "base-muse-preflight-512"]
-    assert args.stages == [side + "-" + model + "-r" + pair + "-benchmark-512" for model in ("deepseek", "muse")
-                           for pair, side in (("1", "base"), ("1", "candidate"), ("2", "candidate"), ("2", "base"))]
+    # Per model: candidate, base, candidate, candidate, each with its own exact stage.
+    assert args.stages == [side + "-" + model + "-r" + run + "-benchmark-512" for model in ("deepseek", "muse")
+                           for run, side in (("1", "candidate"), ("1", "base"), ("2", "candidate"), ("3", "candidate"))]
     assert len(sessions) == 1 and sessions[0].closed and events[-1] == ("finish",)
     assert set(preflight.retained(args.output, config, needs)) == {
         (model, "512", side) for model in needs["models"] for side in ("base", "candidate")}
@@ -189,7 +192,8 @@ def test_missing_declaration_refuses_before_session(tmp_path, monkeypatch, missi
     assert "explicit performance launch field" in load(args.output / "integration.json")["error"]
 
 
-@pytest.mark.parametrize("stage", ["base-muse-preflight-512", "candidate-smoke-muse", "base-muse-r2-benchmark-512"])
+@pytest.mark.parametrize("stage", ["base-muse-preflight-512", "candidate-smoke-muse", "base-muse-r1-benchmark-512",
+                                   "candidate-muse-r3-benchmark-512"])
 def test_missing_exact_stage_authorization_refuses_before_session(tmp_path, monkeypatch, stage):
     args, config, manifest, needs, events, sessions = setup(tmp_path, monkeypatch)
     del manifest["stages"][stage]
@@ -202,7 +206,7 @@ def test_missing_exact_stage_authorization_refuses_before_session(tmp_path, monk
 def test_timed_runtime_drift_stops_after_one_arm_without_retry(tmp_path, monkeypatch):
     args, config, manifest, needs, events, sessions = setup(tmp_path, monkeypatch, fault="timed-drift")
     assert execution.run(args) == 1
-    assert [e for e in events if e[0] == "timed"] == [("timed", "deepseek", "base")]
+    assert [e for e in events if e[0] == "timed"] == [("timed", "deepseek", "candidate")]
     assert "differs from its successful short preflight" in load(args.output / "integration.json")["error"]
 
 

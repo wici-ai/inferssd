@@ -33,17 +33,17 @@ def packet(request, files, extra=None):
     return output.getvalue(), hashlib.sha256(members[0][1]).hexdigest()
 
 
-@pytest.fixture(params=[prepare.LEGACY_MODE, prepare.MODE, "control-only", "calibration"])
+@pytest.fixture(params=[prepare.LEGACY_MODE, prepare.MODE, "control-only", "baseline"])
 def staged(tmp_path, git_source, monkeypatch, request):
     mode = prepare.LEGACY_MODE if request.param == prepare.LEGACY_MODE else prepare.MODE
-    if request.param == "calibration":
+    if request.param == "baseline":
         head = git_source[1]["head"]
         git_source = (git_source[0], dict(base=head, head=head, candidate=head))
     args, api = prepared_fixture(tmp_path, git_source, devices=["cloud-5090"], mode=mode)
     if request.param == "control-only":
         changed_identity(args, "bench/ci/example.py")
-    if request.param == "calibration":
-        args.calibration_pairs = 4
+    if request.param == "baseline":
+        args.baseline = True
     prepare.prepare(args, api)
     root = tmp_path / "fake-host"
     root.mkdir()
@@ -119,13 +119,12 @@ def test_plain_packet_seals_exact_git_bytes_and_preserves_lease_config(staged):
     if "sources" in request:
         assert proof["performance_protocol"] == load(root / "config.json")["performance_protocol"]
         assert set(proof["sources"]) == set(request["sources"])
+        # A baseline job seals its one commit once, as the candidate side.
+        if proof["performance_protocol"] == stage.BASELINE_PROTOCOL:
+            assert set(proof["sources"]) == {"candidate"}
         if "base" in proof["sources"]:
-            calibration = request["sources"]["base"] == request["sources"]["candidate"]
-            assert calibration == (proof["performance_protocol"] != stage.PERFORMANCE_PROTOCOL)
-            # A calibration seals the same commit twice, as two separate sides.
-            present, absent = ("new.cpp", "old.cpp") if calibration else ("old.cpp", "new.cpp")
-            assert Path(proof["sources"]["base"]["root"], present).read_bytes() == b"old\n"
-            assert not Path(proof["sources"]["base"]["root"], absent).exists()
+            assert Path(proof["sources"]["base"]["root"], "old.cpp").read_bytes() == b"old\n"
+            assert not Path(proof["sources"]["base"]["root"], "new.cpp").exists()
             assert proof["sources"]["base"]["root"] != proof["sources"]["candidate"]["root"]
             for model in ("muse", "deepseek"):
                 left, right = ((constants["IROOT"] / (request["job_id"] + "-" + model + "-" + side + "-settings.ssd")).read_bytes() for side in ("base", "candidate"))
@@ -231,22 +230,19 @@ def test_double_source_root_admission_refuses_mixed_inputs(staged, mutation):
 
 
 @pytest.mark.parametrize("case,admitted", [
-    ("gate", True), ("calibration", True), ("calibration-two-revisions", False), ("calibration-too-many", False),
-    ("calibration-bool", False), ("single-sample", False), ("gate-other-pairs", False), ("other-order", False),
-    ("missing", False)])
-def test_root_admits_only_the_gate_protocol_or_its_one_revision_calibration(case, admitted):
+    ("gate", True), ("baseline", True), ("baseline-two-revisions", False), ("baseline-five-runs", False),
+    ("old-pair-protocol", False), ("gate-other-order", False), ("bool-tokens", False), ("missing", False)])
+def test_root_admits_only_the_gate_protocol_or_the_baseline_protocol_of_one_commit(case, admitted):
     sides = {side: dict(revision="c" * 40) for side in ("base", "candidate")}
-    protocol = dict(stage.PERFORMANCE_PROTOCOL)
-    if case.startswith("calibration"):
-        protocol.update(samples_per_side=4, purpose="noise-calibration")
-    if case == "calibration-two-revisions": sides["base"]["revision"] = "a" * 40
-    elif case == "calibration-too-many": protocol["samples_per_side"] = 5
-    elif case == "calibration-bool": protocol["samples_per_side"] = True
-    elif case == "single-sample": protocol.update(samples_per_side=1)
-    elif case == "gate-other-pairs": protocol["samples_per_side"] = 3
-    elif case == "other-order": protocol["order"] = "ABAB"
+    protocol = dict(stage.BASELINE_PROTOCOL if case.startswith("baseline") else stage.PERFORMANCE_PROTOCOL)
+    if case == "baseline-two-revisions": sides["base"]["revision"] = "a" * 40
+    elif case == "baseline-five-runs": protocol["order"] = ["candidate"] * 5
+    elif case == "old-pair-protocol": protocol.update(samples_per_side=2, order="ABBA")
+    elif case == "gate-other-order": protocol["order"] = ["base", "candidate", "candidate", "candidate"]
+    elif case == "bool-tokens": protocol["output_tokens"] = True
     config = dict(sides=sides, performance_protocol=None if case == "missing" else protocol)
     assert stage.protocol_admitted(config) is admitted
     # The trusted controller derives the same protocol values.
     from ci.selection_contract import performance_protocol
     assert stage.PERFORMANCE_PROTOCOL == performance_protocol()
+    assert stage.BASELINE_PROTOCOL == performance_protocol("baseline")
