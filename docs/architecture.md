@@ -30,6 +30,8 @@ CPU compute runs on one pool, ggml's threadpool, for dense and expert work alike
 
 Placement is ggml's. `-t` and `-tb` set the decode and batch thread counts, `-C` and `-Cb` their CPU masks, and `--cpu-strict` and `--cpu-strict-batch` place thread i on the i-th CPU of its mask in increasing order; `--prio` and `--poll` set priority and polling. The sink keeps only its own I/O thread, its prefetch readers and, on unified memory, a watch thread, all placed by `cpu.io_cpus`.
 
+The CUDA cache tier's worker and upload threads run with thread 0, which waits for them: the sink gives the tier thread 0's CPUs at its first layer on the tier and again whenever they change, so with `--cpu-strict` they share thread 0's core.
+
 ## Batching
 
 Prompt batching lets tokens share weight access. `inferssd launch --batch` and `--ubatch` set the native batch and micro-batch capacities. The Linux controller consumes native telemetry to inform placement and prefill decisions; see [controller observations](architecture/controller-observations.md).
