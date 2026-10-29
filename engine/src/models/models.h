@@ -7,6 +7,15 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 
+// gated delta net q/k normalization: x*rsqrt(sum(x*x) + eps), with eps inside the root
+// rms_norm already carries eps inside the root, so rms_norm(x, eps/n)*(1/sqrt(n)) is exactly that
+// ref: https://github.com/ggml-org/llama.cpp/pull/28068
+static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
+    const float n = x->ne[0];
+
+    return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
+}
+
 //
 // base classes
 //
