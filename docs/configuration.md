@@ -34,9 +34,13 @@ positive value counts the leading ggml threads of each decode phase, and a
 decode call with fewer threads fails. The VRAM margin is at least reserve
 plus 64 MiB. Non-applicable platform keys cannot be explicitly set. The `vram.*`
 keys size the CUDA expert tier. `vram.budget = auto` gives the tier all the room
-the GPU admits and gives no tier where no CUDA backend runs: on macOS and
-Windows, on a CPU-only build, or with only Metal or another GPU backend, which
-then runs the dense layers while the CPU sink computes every routed expert. An
+the GPU admits; on a GPU that shares the host's memory, such as GB10, that is
+the host memory envelope below less the slots the next-layer prefetch lands in,
+which are all the RAM cache keeps beside a tier there (with `vram.budget = 0`
+the RAM cache takes the envelope). Auto gives no tier where no CUDA backend
+runs: on macOS and Windows, on a CPU-only build, or with only Metal or another
+GPU backend, which then runs the dense layers while the CPU sink computes every
+routed expert. An
 explicit nonzero budget without a CUDA backend is an error. On macOS the
 interface supports static settings only; it does not include an online adaptive
 controller.
@@ -51,10 +55,16 @@ process's use plus the memory then available, so its room starts at the
 available memory less the reserve. The system term is the memory available now
 less the floor: Linux MemAvailable, Windows the smaller of available physical
 memory and available commit, macOS free, file-backed, purgeable and reusable
-pages. The RAM expert cache admits only under a readable envelope. An allocation
-that does not fit, such as a compute or work buffer, a scratch buffer or a
-server checkpoint, first takes room back from the expert caches: on unified
-memory from the GPU tier, then from the RAM cache's coldest slots.
+pages. The RAM expert cache admits only under a readable envelope. On a GPU
+that shares the host's memory (unified memory, such as GB10), a CUDA allocation
+is not charged to the cgroup, so the Linux envelope counts the CUDA expert
+tier's storage as used beside the cgroup's own usage: the tier and the RAM
+cache share one envelope, and the tier also stays within MemAvailable less the
+floor. An allocation that does not fit, such as a compute or work buffer, a
+scratch buffer or a server checkpoint, first takes room back from the expert
+caches: on unified memory from the GPU tier, whose blocks also answer any CUDA
+allocation that would fail while no layer holds them, then from the RAM
+cache's coldest slots.
 
 ## File and CLI contract
 
