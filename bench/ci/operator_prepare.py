@@ -438,10 +438,12 @@ def prepare(args, api=None):
         raise ValueError("base_build_cache must be a boolean, and only the Linux broker keeps builds")
     root = args.inputs.resolve().parent
     # The verified baseline records of the executing devices, sealed into every
-    # device config and named by hash in the envelope for the hosted replay.
-    history = ([record for record in baseline_history.load_all(baseline_history.store_root(args.inputs))
-                if record["device"] in execution] if mode == MODE else [])
-    devices, jobs, inputs, pending_assets = {}, {}, {}, {}
+    # performance device config and named by hash in the envelope for the hosted
+    # replay. They also name each device's most recent baseline characteristics.
+    store = baseline_history.store_root(args.inputs)
+    records = [record for record in baseline_history.load_all(store) if record["device"] in execution]
+    history = records if mode == MODE else []
+    devices, jobs, inputs, pending_assets, machines = {}, {}, {}, {}, {}
     for device in execution:
         declared = specification["devices"][device]
         job_id = declared.get("job_id", uuid.uuid4().hex)
@@ -457,6 +459,14 @@ def prepare(args, api=None):
         if mode == MODE and not staged_launch.derived(template):
             raise ValueError("operator performance launches are derived on the device; every model needs a launch request")
         template.update(execution_devices=execution, validation_mode=mode, selection_plan=impact)
+        if not baseline and staged_launch.derived(template):
+            # Only a baseline job profiles the machine. A PR job launches from the
+            # characteristics file of the device's most recent baseline job, which
+            # root stages read-only; a device without one refuses here.
+            template["machine_characteristics"] = dict(
+                baseline_history.latest_characteristics(store, records, device),
+                **staged_launch.sealed_paths(device_layout(device, job_id)["platform"], job_id))
+            machines[device] = template["machine_characteristics"]["sha256"]
         if mode == MODE:
             template["baseline_history"] = history
             if cache[device] and baseline:
@@ -504,6 +514,9 @@ def prepare(args, api=None):
             any(name == "settings-" + model + "-" + side + ".ssd" for model in needs["models"] for side in active_sides)}
         if device == "local-mbp":
             manifest["model_roots"] = sorted({manifest["models"][model] for model in needs["models"]})
+        elif "machine_characteristics" in template:
+            # The Linux sandbox reads it as /models/machine.json; the Mac reads it in its input root.
+            manifest["models"]["machine.json"] = template["machine_characteristics"]["host_path"]
         config, manifest = bind(template, manifest, impact, policy)
         if mode == MODE:
             from ci.selected_preflight import declarations
@@ -598,7 +611,7 @@ def prepare(args, api=None):
         **identities, prepared_by=actor, controller_repository=policy["controller_repository"],
         controller_workflow_sha=workflow_sha, selection=impact, selection_plan_sha256=fingerprint(impact),
         execution_devices=execution, validation_mode=mode, jobs=jobs, policy_sha256=fingerprint(policy),
-        baseline_history_sha256=fingerprint(history))
+        baseline_history_sha256=fingerprint(history), machine_characteristics_sha256=machines)
     if len(json.dumps(envelope, separators=(",", ":"), allow_nan=False).encode()) > MAX_INPUT:
         raise ValueError("complete prepared envelope exceeds workflow input bound; never truncate impact")
     save(args.output / "envelope.json", envelope)

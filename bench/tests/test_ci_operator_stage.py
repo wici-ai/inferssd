@@ -82,6 +82,9 @@ def staged(tmp_path, git_source, monkeypatch, request):
             data["settings"]["host_path"] = str(constants["IROOT"] / (job + "-" + model + "-" + side + "-settings.ssd"))
             manifest["models"]["settings-" + model + "-" + side + ".ssd"] = data["settings"]["host_path"]
             data["template"]["host_path"] = manifest["sources"][side] + "/chat.jinja"
+    if "machine_characteristics" in config:
+        config["machine_characteristics"]["host_path"] = str(constants["IROOT"] / (job + "-machine.json"))
+        manifest["models"]["machine.json"] = config["machine_characteristics"]["host_path"]
     if mode == prepare.MODE:
         import final_chat
         path = constants["CONTROL"] / "bench/prompts/prompt-512.txt"
@@ -129,8 +132,62 @@ def test_plain_packet_seals_exact_git_bytes_and_preserves_lease_config(staged):
             for model in ("muse", "deepseek"):
                 left, right = ((constants["IROOT"] / (request["job_id"] + "-" + model + "-" + side + "-settings.ssd")).read_bytes() for side in ("base", "candidate"))
                 assert left != right and stage.paired_settings(left, right)
+    # A PR job's sealed characteristics are written read-only where its sandbox mounts them.
+    machine = load(root / "config.json").get("machine_characteristics")
+    staged_machine = constants["IROOT"] / (request["job_id"] + "-machine.json")
+    if machine is None:
+        assert not staged_machine.exists()
+    else:
+        assert staged_machine.read_text() == machine["text"] and stat.S_IMODE(staged_machine.stat().st_mode) == 0o444
     with pytest.raises(ValueError, match="fresh job"):
         stage.receive(expected, io.BytesIO(raw))
+
+
+def rewrite(files, request, name, change):
+    """Edit one staged JSON member and keep its declared size and hash."""
+    path = Path(files[name]["local_path"])
+    value = load(path)
+    change(value)
+    path.write_text(json.dumps(value))
+    for row in (files[name], request["files"][name]):
+        row.update(bytes=path.stat().st_size, sha256=prepare.digest(path))
+
+
+@pytest.mark.parametrize("staged", [prepare.MODE], indirect=True)
+@pytest.mark.parametrize("damage", ["text", "path", "unmounted"])
+def test_root_stages_only_exact_sealed_characteristics_of_a_pr_job(staged, damage):
+    root, request, files, constants = staged
+    def change(config):
+        machine = config["machine_characteristics"]
+        if damage == "text": machine["text"] += " "
+        else: machine["host_path"] = str(constants["IROOT"] / "other-machine.json")
+    if damage == "unmounted":
+        rewrite(files, request, "manifest.json", lambda manifest: manifest["models"].pop("machine.json"))
+        rewrite(files, request, "config.json", lambda config: config.update(
+            manifest_sha256=prepare.digest(Path(files["manifest.json"]["local_path"]))))
+    else:
+        rewrite(files, request, "config.json", change)
+    raw, expected = packet(request, files)
+    with pytest.raises(ValueError):
+        stage.receive(expected, io.BytesIO(raw))
+    assert not (constants["IROOT"] / (request["job_id"] + "-machine.json")).exists()
+    assert not (constants["IROOT"] / (request["job_id"] + ".json")).exists()
+
+
+@pytest.mark.parametrize("staged", ["baseline"], indirect=True)
+def test_root_refuses_sealed_characteristics_for_a_baseline_job(staged):
+    root, request, files, constants = staged
+    path = str(constants["IROOT"] / (request["job_id"] + "-machine.json"))
+    text = json.dumps(dict(sections=dict(cpu=dict(status="ok"))))
+    rewrite(files, request, "manifest.json", lambda manifest: manifest["models"].update({"machine.json": path}))
+    rewrite(files, request, "config.json", lambda config: config.update(
+        manifest_sha256=prepare.digest(Path(files["manifest.json"]["local_path"])),
+        machine_characteristics=dict(sha256=hashlib.sha256(text.encode()).hexdigest(), text=text, job_id="e" * 32,
+                                     commit="e" * 40, host_path=path, runtime_path="/models/machine.json")))
+    raw, expected = packet(request, files)
+    with pytest.raises(ValueError, match="given to a baseline job"):
+        stage.receive(expected, io.BytesIO(raw))
+    assert not Path(path).exists()
 
 
 @pytest.mark.parametrize("kind", ["extra", "duplicate", "wrong-hash"])

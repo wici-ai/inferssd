@@ -441,7 +441,7 @@ def test_selected_mac_failure_does_not_relabel_successful_linux_scope(monkeypatc
     value = plan(["engine/src/llama-model.cpp"])
     scope = dict(validation_mode=contract.PERFORMANCE_MODE, execution_devices=list(contract.OPERATOR_DEVICES))
     jobs = {d:dict(job_id=JOB) for d in contract.OPERATOR_DEVICES}
-    def reports(root, plan, policy, job, child, scope, history_sha256):
+    def reports(root, plan, policy, job, child, scope, history_sha256, characteristics_sha256):
         device = root.parent.name
         if device == "local-mbp": raise ValueError("Mac stopped UID cleanup missing")
         return [dict(device=device, model=m, status="passed", functional="passed", numerical="passed", performance=[dict(tier="512", status="passed")]) for m in ("deepseek", "muse")]

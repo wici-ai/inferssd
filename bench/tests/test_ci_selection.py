@@ -229,7 +229,9 @@ def test_selected_executor_consumes_one_plan_and_one_lease(tmp_path, monkeypatch
     def synthetic(side, folder):
         return dict(model_identity={'synthetic': True}, server=dict(pid=1 if side=='base' else 2, start_identity=str(folder)),
             build=dict(loaded_libraries=[]), host=dict(hardware='synthetic', os='synthetic', memory_budget_bytes=1,
-                os_page_cache_treatment='uncontrolled', effective_settings=dict(native_launch_policy=dict(typed_values={}, template_sha256='c' * 64))))
+                os_page_cache_treatment='uncontrolled',
+                effective_settings=dict(native_launch_policy=dict(typed_values={}, template_sha256='c' * 64),
+                                        native_resource_policy=dict(memory_budget_bytes=1))))
 
     config.update(selection_plan=value, selection_plan_sha256=impact.fingerprint(value),
                   manifest_sha256='a'*64, paths=config['sides']['candidate']['paths'],

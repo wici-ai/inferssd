@@ -199,6 +199,8 @@ def policy_check(policy, request, config, manifest, broker):
                 common.fail("Mac model/settings path differs from root admission")
             mounts[model] = admitted["mount"]
             mounts["settings-" + model + "-" + side + ".ssd"] = settings
+    # A PR job's sealed characteristics are staged in its input root, not mounted.
+    common.sealed_machine(config, str(source / "machine.json"), str(source / "machine.json"))
     if (manifest["models"] != mounts or manifest["sources"] != {side: str(source / side) for side in sides}
             or manifest["builds"] != {side: side for side in sides}
             or manifest.get("input_roots") != [str(source)]
@@ -345,6 +347,9 @@ def receive_packet(expected_sha256, incoming, deadline):
                         common.fail("Mac side effective settings differ")
                 for side, payload in payloads.items():
                     common.write(source / ("settings-" + model + "-" + side + ".ssd"), payload)
+            machine = common.sealed_machine(config, str(source / "machine.json"), str(source / "machine.json"))
+            if machine is not None:
+                common.write(source / "machine.json", machine)
             runner_manifest = source / "manifest.json"
             common.write(runner_manifest, (staging / "manifest.json").read_bytes())
             if common.sha(runner_manifest) != config["manifest_sha256"]:

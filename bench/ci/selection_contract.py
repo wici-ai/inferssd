@@ -243,8 +243,15 @@ def requirements(config):
             raise ValueError("sealed build identity omits selected numerical images")
     if config["paths"] != config["sides"]["candidate"]["paths"]:
         raise ValueError("workflow platform guard must use the exact candidate paths")
-    from ci.staged_launch import derived, request_checked
+    from ci.staged_launch import derived, request_checked, sealed
     if derived(config):
+        # Only a baseline job profiles the machine; a PR job reads the file its
+        # device's most recent baseline job stored.
+        if baseline and sealed(config) is not None:
+            raise ValueError("a baseline job profiles the machine; it takes no sealed characteristics")
+        if not baseline and sealed(config) is None:
+            raise ValueError("no baseline machine characteristics are sealed for " + device
+                             + "; a baseline job must run on it first")
         # Each side resolves its launch from the same request on the device.
         for model in needs["models"]:
             requests = [config["sides"][side]["models"][model]["launch"] for side in ("base", "candidate")]
@@ -323,11 +330,12 @@ def linux_stages(config, needs, sides):
                 add(side + "-" + model + "-preflight-" + tier, "server", side, binary, arm["cwd"], True)
                 for run in range(1, run_count(protocol, side) + 1):
                     add(arm_prefix(side, model, run) + "-benchmark-" + tier, "server", side, binary, arm["cwd"], True)
-    from ci.staged_launch import PROFILE_STAGE, derived, launch_models, profile_side
+    from ci.staged_launch import PROFILE_STAGE, derived, launch_models, profile_side, sealed
     if derived(config):
-        # The job's one machine profile, then each side's own launch resolution.
-        first = profile_side(config, needs)
-        add(PROFILE_STAGE, "test", first, "/usr/bin/python3", config["sides"][first]["paths"]["cwd"], True)
+        # A baseline job's one machine profile, then each side's own launch resolution.
+        if sealed(config) is None:
+            first = profile_side(config, needs)
+            add(PROFILE_STAGE, "test", first, "/usr/bin/python3", config["sides"][first]["paths"]["cwd"], True)
         for side in sides:
             for model in launch_models(config, needs, side):
                 add(side + "-" + model + "-launch", "test", side, "/usr/bin/python3", config["sides"][side]["paths"]["cwd"], True)

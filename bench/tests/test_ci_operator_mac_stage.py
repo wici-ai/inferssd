@@ -95,6 +95,11 @@ def test_mac_prepare_seals_two_sources_and_fixed_template_policy(tmp_path, git_s
             assert data["template"]["runtime_path"] == data["template"]["host_path"] == manifest["sources"][side] + "/chat.jinja"
     assert prepare.paired_settings((folder / "settings-muse-base.ssd").read_bytes(),
         (folder / "settings-muse-candidate.ssd").read_bytes(), device="local-mbp", job_id=job)
+    # The Mac worker reads the sealed characteristics in its read-only input root; nothing is mounted.
+    machine = config["machine_characteristics"]
+    assert machine["host_path"] == machine["runtime_path"] == layout["source"] + "/machine.json"
+    assert envelope["machine_characteristics_sha256"] == {"local-mbp": machine["sha256"]}
+    assert "machine.json" not in manifest["models"]
 
 
 @pytest.mark.parametrize("raw", [
@@ -166,6 +171,8 @@ def admitted(tmp_path, git_source, monkeypatch):
             data["settings"].update(host_path=path, runtime_path=path)
             manifest["models"]["settings-" + model + "-" + side + ".ssd"] = path
             data["template"].update(host_path=str(source / side / "chat.jinja"), runtime_path=str(source / side / "chat.jinja"))
+    machine = str(source / "machine.json")
+    config["machine_characteristics"].update(host_path=machine, runtime_path=machine)
     for name, value in (("manifest.json", manifest), ("config.json", config)):
         if name == "config.json":
             value["manifest_sha256"] = prepare.digest(fake / "manifest.json")
@@ -205,8 +212,30 @@ def test_mac_receive_seals_without_precreating_worker_job(admitted):
     assert Path(proof["sources"]["base"]["root"], "old.cpp").read_bytes() == b"old\n"
     assert Path(proof["sources"]["candidate"]["root"], "new.cpp").read_bytes() == b"old\n"
     assert stat.S_IMODE(Path(proof["source"]["root"]).stat().st_mode) == 0o555
+    # The PR job's sealed characteristics, read-only in its input root, where the worker reads them.
+    machine = mirror.parent / "machine.json"
+    assert machine.read_text() == load(fake / "config.json")["machine_characteristics"]["text"]
+    assert stat.S_IMODE(machine.stat().st_mode) == 0o444
     with pytest.raises(ValueError, match="fresh Mac job"):
         mac.receive(expected, io.BytesIO(raw))
+
+
+@pytest.mark.parametrize("damage", ["text", "path"])
+def test_mac_root_stages_only_exact_sealed_characteristics(admitted, damage):
+    fake, request, files, constants = admitted
+    path = Path(files["config.json"]["local_path"])
+    config = load(path)
+    machine = config["machine_characteristics"]
+    if damage == "text": machine["text"] += " "
+    else: machine["runtime_path"] = "/Library/InferSSD-CI/jobs/" + request["job_id"] + "/work/machine/machine.json"
+    path.write_text(json.dumps(config))
+    for row in (files["config.json"], request["files"]["config.json"]):
+        row.update(bytes=path.stat().st_size, sha256=prepare.digest(path))
+    raw, expected = packet(request, files)
+    with pytest.raises(ValueError, match="sealed machine characteristics"):
+        mac.receive(expected, io.BytesIO(raw))
+    assert not (constants["SROOT"] / ("operator-" + request["job_id"]) / "machine.json").exists()
+    assert not (constants["IROOT"] / (request["job_id"] + ".json")).exists()
 
 
 def test_slow_mac_upload_leaves_full_processing_budget(monkeypatch):

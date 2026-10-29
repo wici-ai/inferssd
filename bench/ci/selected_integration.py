@@ -114,11 +114,13 @@ def run(args):
                         raise RuntimeError("sandboxed alias preparation failed")
                 builds[side] = run_build(session, side, spec["build"], spec["paths"], output / ("build-" + side), spec["revision"])
             if derived:
-                # The first built side profiles the machine once, before any
-                # candidate code has run in a PR job; each side then resolves
-                # its own launches from that one characteristics file.
+                # A baseline job profiles the machine once with the commit it
+                # measures. A PR job takes the sealed file of its device's most
+                # recent baseline job instead. Each side then resolves its own
+                # launches from that one characteristics file.
                 if machine is None:
-                    machine = staged_launch.profile(session, config, side, needs["models"], output / "machine")
+                    machine = (staged_launch.adopt(config) if staged_launch.sealed(config) is not None else
+                               staged_launch.profile(session, config, side, needs["models"], output / "machine"))
                     report["machine_profile"] = machine
                 for model in staged_launch.launch_models(config, needs, side):
                     resolved = staged_launch.resolve(session, config, side, model, machine,

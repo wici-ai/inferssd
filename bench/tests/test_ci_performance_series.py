@@ -26,10 +26,15 @@ RECEIPT = {
     "host": {"hardware": "synthetic", "os": "synthetic", "memory_budget_bytes": 1024,
              "os_page_cache_treatment": "uncontrolled",
              "effective_settings": {"native_launch_policy": {"typed_values": {"prefetch.depth": 2},
-                                                             "template_sha256": "c" * 64}}},
+                                                             "template_sha256": "c" * 64},
+                                    "native_resource_policy": {"cpus_allowed_list": "0-3", "memlock_bytes": 1024,
+                                                               "cgroup_limits": {"memory_max": "1024"}}}},
     "build": {"loaded_libraries": [{"path": "libsynthetic.so"}]},
 }
 CONDITIONS = compare.conditions_digest(compare.history_conditions(RECEIPT))
+# A characteristics file as a baseline job's profile stage printed it.
+MACHINE = json.dumps(dict(schema="synthetic", sections=dict(cpu=dict(status="ok"), gpus=dict(status="failed"))))
+MACHINE_SHA = compare.hashlib.sha256(MACHINE.encode()).hexdigest()
 BASE_METRICS = dict(decode_first128_tps=10.0, decode_second128_tps=10.0, decode_tps=10.0, ttft_s=1.0,
                     server_prefill_tps=100.0)
 BUILD = dict(freeze_manifest_sha256="1" * 64, binary_sha256="2" * 64, cache_key="3" * 64,
@@ -37,7 +42,8 @@ BUILD = dict(freeze_manifest_sha256="1" * 64, binary_sha256="2" * 64, cache_key=
 
 
 def record(commit=BASE, spread=SPREAD, scale=1.0, conditions=CONDITIONS, device="cloud-5090", model="muse",
-           tier="512", measured_at="2026-10-28T10:00:00Z", job="e" * 32, tokens=TOKENS, base=BASE_METRICS):
+           tier="512", measured_at="2026-10-28T10:00:00Z", job="e" * 32, tokens=TOKENS, base=BASE_METRICS,
+           characteristics=MACHINE_SHA):
     """One verified baseline record: four runs of `commit`, each metric scaled by a spread factor."""
     runs = []
     for factor in spread:
@@ -47,7 +53,8 @@ def record(commit=BASE, spread=SPREAD, scale=1.0, conditions=CONDITIONS, device=
     identity = dict(prompt_sha256="a" * 64, prompt_ids_sha256="d" * 64, input_tokens=100, output_tokens=256,
                     conditions_sha256=conditions)
     return dict(schema_version=1, purpose="baseline-history", device=device, model=model, tier=tier, commit=commit,
-                conditions_sha256=conditions, runs=runs, measurement_identity=identity,
+                conditions_sha256=conditions, characteristics_sha256=characteristics, runs=runs,
+                measurement_identity=identity,
                 build=dict(BUILD), job_id=job, run_id=7, run_attempt=1, measured_at=measured_at)
 
 
@@ -554,26 +561,48 @@ def report_for(cells, commit=BASE, job="f" * 32):
                 cells=cells, errors=[])
 
 
-def baseline_row(model="muse", job="f" * 32, **kwargs):
+def baseline_row(model="muse", job="f" * 32, machine=MACHINE, **kwargs):
+    """One verified row of a baseline job's hosted report, with the characteristics file its job profiled."""
     cell = baseline_cell(**kwargs)
     cell["cell"] = dict(cell["cell"], model=model, job_id=job)
     cell["build"] = dict(BUILD)
+    cell["derived_launch"] = dict(sides=dict(candidate=dict(characteristics_sha256=MACHINE_SHA)), changes=[])
+    profile = dict(sha256=compare.hashlib.sha256(machine.encode()).hexdigest(), returncode=1, side="candidate",
+                   sections=dict(cpu="ok", gpus="failed"), characteristics=machine)
     return dict(device="cloud-5090", model=model, job_id=job, status=cell["status"],
-                performance=[dict(cell, tier="512")])
+                performance=[dict(cell, tier="512")], machine_profile=profile)
+
+
+def store(root, records):
+    """A baseline-history directory holding these records and the characteristics file they name."""
+    history.write_characteristics(root, "cloud-5090", MACHINE)
+    for item in records:
+        history.write(root, item)
+    return root
 
 
 def test_history_tool_ingests_verified_baseline_cells_and_skips_others(tmp_path):
     flagged = baseline_row("deepseek", token_change=(2, "candidate"))
     report = report_for([baseline_row(), flagged, dict(device="dgx-spark", model="muse", status="deferred-not-in-this-run",
                                                          performance="deferred-not-in-this-run")])
-    records, skipped = history.records_from_report(report, device="cloud-5090", job_id="f" * 32, commit=BASE,
-                                                   run_id=12, run_attempt=1, measured_at="2026-10-29T08:00:00Z")
+    records, skipped, machine = history.records_from_report(
+        report, device="cloud-5090", job_id="f" * 32, commit=BASE, run_id=12, run_attempt=1,
+        measured_at="2026-10-29T08:00:00Z")
     assert [item["model"] for item in records] == ["muse"]
     assert skipped == [dict(cell="cloud-5090/deepseek/512", status="needs-review", reasons=["generated-tokens-differ"])]
     value = records[0]
     assert [run["metrics"]["decode_tps"] for run in value["runs"]] == pytest.approx([10.0 * f for f in SPREAD])
     assert value["build"] == BUILD and value["conditions_sha256"] == CONDITIONS and value["run_id"] == 12
+    # The record names the characteristics file the job profiled; that file is stored first, by its hash.
+    assert machine == MACHINE and value["characteristics_sha256"] == MACHINE_SHA
     root = tmp_path / "baseline-history"
+    with pytest.raises(ValueError, match="characteristics .* are missing"):
+        history.write(root, value)
+    assert history.write_characteristics(root, "cloud-5090", machine) == "stored"
+    assert history.write_characteristics(root, "cloud-5090", machine) == "present"
+    saved = history.characteristics_path(root, "cloud-5090", MACHINE_SHA)
+    assert saved == root / "cloud-5090/characteristics" / (MACHINE_SHA + ".json")
+    assert saved.read_text() == MACHINE and saved.stat().st_mode & 0o777 == 0o400
     assert history.write(root, value) == "stored" and history.write(root, value) == "present"
     assert history.load_all(root) == [value]
     path = history.record_path(root, value)
@@ -585,13 +614,23 @@ def test_history_tool_ingests_verified_baseline_cells_and_skips_others(tmp_path)
     assert history.load_all(root) == [value]
 
 
-@pytest.mark.parametrize("damage", ["other-commit", "gate-cell", "other-job", "not-a-report"])
+@pytest.mark.parametrize("damage", ["other-commit", "gate-cell", "other-job", "not-a-report", "no-characteristics",
+                                    "characteristics-hash", "other-characteristics", "two-profiles"])
 def test_history_tool_refuses_a_report_that_is_not_this_baseline_job(damage):
     row = baseline_row()
     report = report_for([row])
     if damage == "other-commit": report["candidate"] = CANDIDATE
     elif damage == "gate-cell": row["performance"][0]["protocol"] = protocol_for()
     elif damage == "other-job": row["job_id"] = "1" * 32
+    elif damage == "no-characteristics": del row["machine_profile"]["characteristics"]
+    elif damage == "characteristics-hash": row["machine_profile"]["characteristics"] += " "
+    elif damage == "other-characteristics":
+        row["performance"][0]["derived_launch"]["sides"]["candidate"]["characteristics_sha256"] = "0" * 64
+    elif damage == "two-profiles":
+        other = baseline_row("deepseek", machine=MACHINE + " ")
+        other["performance"][0]["derived_launch"]["sides"]["candidate"]["characteristics_sha256"] = \
+            other["machine_profile"]["sha256"]
+        report["cells"].append(other)
     else: report = dict(cells="not a list")
     with pytest.raises(ValueError):
         history.records_from_report(report, device="cloud-5090", job_id="f" * 32, commit=BASE,
@@ -599,13 +638,14 @@ def test_history_tool_refuses_a_report_that_is_not_this_baseline_job(damage):
 
 
 def test_history_files_are_verified_on_load_and_pruned_newest_first(tmp_path):
-    root = tmp_path / "baseline-history"
+    root = store(tmp_path / "baseline-history", [])
     for day in range(1, 6):
         history.write(root, record("%040x" % day, measured_at="2026-10-%02dT10:00:00Z" % day))
     removed = history.prune(root, 2, dry_run=True)
     assert len(removed) == 3 and len(history.load_all(root)) == 5
     history.prune(root, 2)
     assert [item["commit"] for item in history.load_all(root)] == ["%040x" % 4, "%040x" % 5]
+    assert history.characteristics_path(root, "cloud-5090", MACHINE_SHA).exists()
     wrong = root / "cloud-5090/muse/512" / ("f" * 40 + "." + CONDITIONS + ".json")
     wrong.write_text(json.dumps(record("%040x" % 5)))
     with pytest.raises(ValueError, match="file name differs"):
@@ -620,6 +660,42 @@ def test_history_files_are_verified_on_load_and_pruned_newest_first(tmp_path):
         history.load_all(root)
 
 
+def test_a_pr_job_takes_the_characteristics_of_the_most_recent_baseline_job(tmp_path):
+    root = store(tmp_path / "baseline-history", [record("1" * 40, measured_at="2026-10-01T10:00:00Z", job="1" * 32)])
+    newer = MACHINE.replace("synthetic", "reprofiled")
+    sha = compare.hashlib.sha256(newer.encode()).hexdigest()
+    history.write_characteristics(root, "cloud-5090", newer)
+    history.write(root, record("2" * 40, model="deepseek", measured_at="2026-10-02T10:00:00Z", job="2" * 32,
+                               characteristics=sha))
+    records = history.load_all(root)
+    assert history.latest_characteristics(root, records, "cloud-5090") == dict(
+        sha256=sha, job_id="2" * 32, commit="2" * 40, text=newer)
+    with pytest.raises(ValueError, match="dgx-spark has no baseline machine characteristics yet; a baseline job "
+                                         "must run on it first"):
+        history.latest_characteristics(root, records, "dgx-spark")
+    # Pruning the older job's record removes the characteristics file only it named.
+    history.write(root, record("3" * 40, measured_at="2026-10-03T10:00:00Z", job="3" * 32, characteristics=sha))
+    assert history.prune(root, 1) == ["cloud-5090/muse/512/" + "1" * 40 + "." + CONDITIONS + ".json",
+                                      "cloud-5090/characteristics/" + MACHINE_SHA + ".json"]
+    assert history.latest_characteristics(root, history.load_all(root), "cloud-5090")["commit"] == "3" * 40
+
+
+@pytest.mark.parametrize("damage", ["tampered", "missing", "misnamed"])
+def test_a_tampered_or_missing_characteristics_file_is_refused(tmp_path, damage):
+    root = store(tmp_path / "baseline-history", [record()])
+    path = history.characteristics_path(root, "cloud-5090", MACHINE_SHA)
+    path.chmod(0o600)
+    if damage == "tampered":
+        path.write_text(MACHINE.replace("ok", "failed"))
+    elif damage == "missing":
+        path.unlink()
+    else:
+        path.rename(path.with_name("0" * 64 + ".json"))
+    with pytest.raises(ValueError, match="differ from their hash" if damage != "missing" else "are missing"):
+        history.load_all(root)
+    assert history.main(["--root", str(root), "verify"]) == 1
+
+
 def test_history_cli_lists_verifies_prunes_and_ingests(tmp_path, capsys):
     root = tmp_path / "baseline-history"
     report = tmp_path / "aggregate.json"
@@ -627,7 +703,8 @@ def test_history_cli_lists_verifies_prunes_and_ingests(tmp_path, capsys):
     arguments = ["--root", str(root), "ingest", "--report", str(report), "--device", "cloud-5090", "--job-id", "f" * 32,
                  "--commit", BASE, "--measured-at", "2026-10-29T08:00:00Z", "--run-id", "12"]
     assert history.main(arguments) == 0
-    assert "stored cloud-5090/muse/512/" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "stored characteristics " + MACHINE_SHA[:12] in out and "stored cloud-5090/muse/512/" in out
     assert history.main(["--root", str(root), "verify"]) == 0
     assert "verified 1 baseline records" in capsys.readouterr().out
     assert history.main(["--root", str(root), "list"]) == 0
@@ -636,7 +713,8 @@ def test_history_cli_lists_verifies_prunes_and_ingests(tmp_path, capsys):
     assert history.main(arguments[:-2] + ["--run-id", "12", "--commit", CANDIDATE]) == 1
 
 
-@pytest.mark.parametrize("damage", [None, "envelope", "child-report", "config-edit"])
+@pytest.mark.parametrize("damage", [None, "envelope", "child-report", "config-edit", "characteristics-envelope",
+                                    "characteristics-unsealed"])
 def test_aggregate_replays_with_exactly_the_history_named_by_the_envelope(tmp_path, monkeypatch, damage):
     """Synthetic retained child: only the seal checks before the evidence replay are exercised."""
     from ci import selected_aggregate
@@ -645,6 +723,11 @@ def test_aggregate_replays_with_exactly_the_history_named_by_the_envelope(tmp_pa
     records = [record()]
     contract, config, manifest, value = job_config(selection_contract.performance_protocol("baseline"),
                                                    history_records=records)
+    if damage == "characteristics-envelope":
+        # Sealed like the history: the envelope must name the hash of the file in the config.
+        config["machine_characteristics"] = dict(sha256=MACHINE_SHA, text=MACHINE, job_id="e" * 32, commit=BASE,
+                                                 host_path="/opt/inferssd-ci-integrations/machine.json",
+                                                 runtime_path="/models/machine.json")
     config, manifest = contract.bind(config, manifest, value, POLICY)
     root = tmp_path / "cloud-5090" / ("f" * 32)
     root.mkdir(parents=True)
@@ -670,11 +753,14 @@ def test_aggregate_replays_with_exactly_the_history_named_by_the_envelope(tmp_pa
                                       "control_revision", "control_manifest_sha256")}))
     monkeypatch.setattr(selected_aggregate, "sealed", lambda *a: None)
     expected = "0" * 64 if damage == "envelope" else impact.fingerprint(records)
+    machine = {"characteristics-envelope": "0" * 64, "characteristics-unsealed": MACHINE_SHA}.get(damage)
     with pytest.raises((ValueError, OSError)) as caught:
         selected_aggregate.device_report(root, value, POLICY, job, dict(conclusion="success", run_attempt=1),
-                                         scope, expected)
+                                         scope, expected, machine)
     # Editing the history after sealing already breaks the root-manifest config hash.
-    expected_error = {None: None, "config-edit": "selected source binding differs"}.get(
+    envelope_error = "sealed machine characteristics differ from the operator envelope"
+    expected_error = {None: None, "config-edit": "selected source binding differs",
+                      "characteristics-envelope": envelope_error, "characteristics-unsealed": envelope_error}.get(
         damage, "sealed baseline history differs")
     if expected_error is None:
         assert "performance-preflight.json" in str(caught.value) or "admission" in str(caught.value)

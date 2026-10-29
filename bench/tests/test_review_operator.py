@@ -775,7 +775,7 @@ def aggregate_zip(report):
 
 @pytest.mark.parametrize("damage", [None, "other-envelope", "missing-artifact", "digest"])
 def test_completed_baseline_job_adds_only_its_verified_cells_to_the_history(api, args, damage):
-    from test_ci_performance_series import baseline_row, report_for
+    from test_ci_performance_series import MACHINE, MACHINE_SHA, baseline_row, report_for
     commit = "a" * 40  # the synthetic baseline cells measure BASE
     path = baseline_path(args, commit)
     prepared = path.parent / path.stem / "prepared"
@@ -803,6 +803,10 @@ def test_completed_baseline_job_adds_only_its_verified_cells_to_the_history(api,
         assert record["skipped"][0]["cell"] == "cloud-5090/deepseek/512"
         stored = entry.history.load_all(root)
         assert len(stored) == 1 and stored[0]["run_id"] == 87 and stored[0]["measured_at"] == "2026-10-29T08:00:00Z"
+        # The file the job profiled is stored with the history; later PR jobs on the device seal it.
+        assert stored[0]["characteristics_sha256"] == MACHINE_SHA
+        assert entry.history.latest_characteristics(root, stored, "cloud-5090")["text"] == MACHINE
     else:
         assert record["status"] == "ingest-failed" and record["no_automatic_retry"] is True
         assert entry.history.load_all(root) == []
+        assert not root.exists()

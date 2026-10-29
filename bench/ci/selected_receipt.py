@@ -422,8 +422,12 @@ def receipt(config, manifest, side, model, spec, build, output, *, destination=N
                             effective_settings=dict(native_launch_policy=normalize(policy, frozen), native_resource_policy=resources,
                                 ambient_environment=ambient, system_images=systems)))
     if resolved is not None:
-        from ci.staged_launch import summary
+        from ci.staged_launch import sealed, summary
         result["derived_launch"] = summary(config, side, model, resolved)
+        # A PR job's launches derive from the characteristics sealed into the job.
+        value = sealed(config)
+        if value is not None and result["derived_launch"]["characteristics_sha256"] != value["sha256"]:
+            raise ValueError("the launch was not derived from the job's sealed machine characteristics")
     if platform == "darwin":
         result["host"]["effective_settings"]["native_resource_enforcement"] = MAC_RESOURCE_ENFORCEMENT
     save(destination if destination is not None else output / "comparison-receipt.json", result)

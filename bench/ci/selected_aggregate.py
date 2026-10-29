@@ -168,7 +168,7 @@ def performance_retained(root, config, model, tier, plan, policy, preflight, job
                 evidence=evidence)
 
 
-def device_report(root, plan, policy, job, child, scope=None, history_sha256=None):
+def device_report(root, plan, policy, job, child, scope=None, history_sha256=None, characteristics_sha256=None):
     root = Path(root)
     report = load(root / "integration.json")
     sealed(root, report)
@@ -224,11 +224,19 @@ def device_report(root, plan, policy, job, child, scope=None, history_sha256=Non
     if (report.get("base_build") or {}).get("source") != expected_source:
         raise ValueError("reported base build source differs from the retained build receipt")
     model_admission.retained(root, config, manifest, report)
-    # Derived launches are rebuilt from the retained profile and resolution output
-    # before any server evidence is checked against them.
+    # A PR job's characteristics are sealed like its history: the envelope names
+    # the hash of the file sealed into the device config.
+    taken = staged_launch.sealed(config)
+    if scope is not None and (taken["sha256"] if taken is not None else None) != characteristics_sha256:
+        raise ValueError("sealed machine characteristics differ from the operator envelope")
+    # Derived launches are rebuilt from the job's characteristics and the retained
+    # resolution output before any server evidence is checked against them.
     machine = staged_launch.retained(root, config, needs) if staged_launch.derived(config) else None
     if report.get("machine_profile") != machine:
         raise ValueError("reported machine profile differs from its retained stage output")
+    if machine is not None and taken is None:
+        # The operator stores a baseline job's characteristics file from this report.
+        machine = dict(machine, characteristics=staged_launch.profiled(root / "machine"))
     if digest(root / "performance-preflight.json") != report.get("performance_preflight_sha256"):
         raise ValueError("selected preflight gate missing or changed")
     preflight = retained(root, config, needs)
@@ -325,8 +333,12 @@ def failed_cells(plan, device, error):
             for cell in plan["cells"] if cell["required"] and cell["device"] == device]
 
 
-def operator_aggregate(plan, policy, artifacts, jobs, children, scope, history_sha256):
-    """Report this authorized run without claiming the entire impact is covered."""
+def operator_aggregate(plan, policy, artifacts, jobs, children, scope, history_sha256, characteristics=None):
+    """Report this authorized run without claiming the entire impact is covered.
+
+    `characteristics` maps each device of a PR job to the hash of the machine
+    characteristics the envelope sealed for it; a baseline job seals none.
+    """
     validate(plan, policy)
     if execution_scope(scope) != scope:
         raise ValueError("explicit operator execution scope required")
@@ -345,7 +357,8 @@ def operator_aggregate(plan, policy, artifacts, jobs, children, scope, history_s
     for device in scope["execution_devices"]:
         try:
             actual = device_report(Path(artifacts) / device / jobs[device]["job_id"], plan, policy,
-                                   jobs[device], children[device], scope, history_sha256)
+                                   jobs[device], children[device], scope, history_sha256,
+                                   (characteristics or {}).get(device))
             expected = {cell["model"] for cell in plan["cells"] if cell["required"] and cell["device"] == device}
             if len(actual) != len(expected) or {row["model"] for row in actual} != expected:
                 raise ValueError("selected device/model cells missing, repeated or unexpected")

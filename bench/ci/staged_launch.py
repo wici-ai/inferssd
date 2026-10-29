@@ -4,18 +4,22 @@
 A user starts a server with `inferssd launch`: the machine is profiled once,
 and every launch derives its settings, thread pools and server arguments from
 the machine characteristics, the model's GGUF header and the memory budget.
-Device CI does the same inside the broker sandbox. One `inferssd profile` per
-job writes the characteristics file, in the framework's own format, in the
-job's scratch. Each side's own framework then resolves its launch from that
-file with `inferssd launch --dry-run`, given the runtime facts its live launch
-reads, and the broker starts exactly the resolved argv as the server stage, in
-place of the launcher's own process scope. A change to the launch strategy is
-therefore measured with the settings it derives.
+Device CI does the same inside the broker sandbox. The baseline job of a main
+commit runs that commit's `inferssd profile` once per device and writes the
+characteristics file, in the framework's own format, in the job's scratch; the
+operator stores it with the device's baseline history. A PR job does not
+profile: it takes the file of the device's most recent baseline job, sealed
+into the job and staged read-only by root. Each side's own framework then
+resolves its launch from that file with `inferssd launch --dry-run`, given the
+runtime facts its live launch reads, and the broker starts exactly the resolved
+argv as the server stage, in place of the launcher's own process scope. A
+change to the launch strategy is therefore measured with the settings it
+derives.
 
-The controller keeps the stage's output: the characteristics' SHA-256 seals the
-profile, and every resolution must name it. Settings that the strategy leaves
-alone stay at their defaults, decided by the engine; the reviewed settings file
-of a launch request sets only `expert.source`.
+The characteristics' SHA-256 seals the file, and every resolution must name it.
+Settings that the strategy leaves alone stay at their defaults, decided by the
+engine; the reviewed settings file of a launch request sets only
+`expert.source`.
 """
 
 import hashlib
@@ -32,6 +36,9 @@ PROFILE_STAGE = "machine-profile"
 PROFILE_TIMEOUT_S = 1800
 RESOLVE_TIMEOUT_S = 300
 REQUEST = {"profile", "context", "batch", "ubatch", "port", "extra"}
+# A PR job's sealed characteristics: the file, its hash, the baseline job it
+# comes from and where root stages it.
+SEALED = {"sha256", "text", "job_id", "commit", "host_path", "runtime_path"}
 TELEMETRY = "--ssd-telemetry"
 MARKER = "inferssd-ci-result "
 
@@ -112,8 +119,35 @@ def tiers(needs, model):
     return list(needs["performance"].get(model, {}).get("tiers", []))
 
 
+def sealed_paths(platform, job_id):
+    """Where root stages a PR job's characteristics file, and where its sandbox reads it."""
+    if platform == "darwin":
+        path = "/Library/InferSSD-CI/inputs/operator-" + job_id + "/machine.json"
+        return dict(host_path=path, runtime_path=path)
+    return dict(host_path="/opt/inferssd-ci-integrations/" + job_id + "-machine.json",
+                runtime_path="/models/machine.json")
+
+
+def sealed(config):
+    """A PR job's characteristics, sealed from its device's most recent baseline job; None in a baseline job.
+
+    A baseline job profiles the machine itself. A PR job never does: every
+    resolution reads the sealed file, which root staged read-only, so nothing
+    a PR stage writes is read as characteristics.
+    """
+    value = config.get("machine_characteristics")
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != SEALED
+            or any(not isinstance(value[key], str) or not value[key] for key in SEALED)
+            or hashlib.sha256(value["text"].encode()).hexdigest() != value["sha256"]):
+        raise ValueError("the sealed machine characteristics are incomplete or differ from their hash")
+    sections(value["text"])
+    return value
+
+
 def profile_side(config, needs):
-    """The side whose framework profiles the machine: the base when the job builds it."""
+    """The side whose framework profiles the machine in a baseline job: its one measured commit."""
     return job_sides(config, needs)[0]
 
 
@@ -128,7 +162,10 @@ def scratch(config, side):
 
 
 def machine_path(config):
-    """The job's characteristics file, side-neutral in the job's writable scratch."""
+    """The characteristics file every resolution reads: the sealed one, or a baseline job's own profile in scratch."""
+    value = sealed(config)
+    if value is not None:
+        return value["runtime_path"]
     paths = config["paths"]
     return (paths["job_root"] + "/work" if paths["platform"] == "darwin" else "/scratch") + "/machine/machine.json"
 
@@ -176,18 +213,47 @@ def final_record(folder):
     return json.loads(lines[-1][len(MARKER):])
 
 
+def sections(text):
+    """Each section's status in a characteristics file."""
+    value = json.loads(text)
+    value = value.get("sections") if isinstance(value, dict) else None
+    if (not isinstance(value, dict) or not value
+            or any(not isinstance(item, dict) or not isinstance(item.get("status"), str) for item in value.values())):
+        raise ValueError("the machine characteristics have no section statuses")
+    return {name: item["status"] for name, item in sorted(value.items())}
+
+
 def machine_read(folder):
-    """The job's machine characteristics: their SHA-256 and each section's status."""
+    """A baseline job's machine characteristics: their SHA-256 and each section's status."""
     record = final_record(folder)
     text = record.get("characteristics") if isinstance(record, dict) else None
     if not isinstance(text, str) or record.get("returncode") not in (0, 1):
         raise ValueError("the machine profile did not produce a characteristics file")
-    sections = json.loads(text).get("sections")
-    if (not isinstance(sections, dict) or not sections
-            or any(not isinstance(value, dict) or not isinstance(value.get("status"), str) for value in sections.values())):
-        raise ValueError("the machine characteristics have no section statuses")
     return dict(sha256=hashlib.sha256(text.encode()).hexdigest(), returncode=record["returncode"],
-                sections={name: value["status"] for name, value in sorted(sections.items())})
+                sections=sections(text))
+
+
+def profiled(folder):
+    """The characteristics file a baseline job's profile stage printed, as the operator stores it."""
+    machine_read(folder)
+    return final_record(folder)["characteristics"]
+
+
+def machine_sealed(config):
+    """A PR job's machine characteristics: their SHA-256, each section's status and the baseline job they come from."""
+    value = sealed(config)
+    return dict(sha256=value["sha256"], sections=sections(value["text"]),
+                baseline=dict(job_id=value["job_id"], commit=value["commit"]))
+
+
+def adopt(config):
+    """Check that root staged exactly the sealed characteristics, before any resolution reads them."""
+    from ci.staged_build import sealed_file
+    value = sealed(config)
+    _, raw = sealed_file(value["host_path"], limit=16 << 20, contents=True)
+    if raw != value["text"].encode():
+        raise ValueError("the staged machine characteristics differ from the sealed file")
+    return machine_sealed(config)
 
 
 def profile(session, config, side, models, output):
@@ -306,11 +372,14 @@ def fill(config, side, model, resolved, timed):
 
 
 def retained(root, config, needs):
-    """Replay the job's machine profile and every resolved launch from retained stage output."""
+    """Replay the job's machine characteristics and every resolved launch from retained stage output."""
     root = Path(root)
-    machine = dict(machine_read(root / "machine"), side=profile_side(config, needs))
-    if load(root / "machine" / "profile.json") != machine:
-        raise ValueError("retained machine profile differs from its stage output")
+    if sealed(config) is not None:
+        machine = machine_sealed(config)
+    else:
+        machine = dict(machine_read(root / "machine"), side=profile_side(config, needs))
+        if load(root / "machine" / "profile.json") != machine:
+            raise ValueError("retained machine profile differs from its stage output")
     for side in job_sides(config, needs):
         for model in launch_models(config, needs, side):
             folder = root / "launch" / (side + "-" + model)

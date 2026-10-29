@@ -30,7 +30,8 @@ def synthetic_receipt(model, side, spec, output, fault=None):
         host=dict(hardware="synthetic", os="synthetic", memory_budget_bytes=1,
             os_page_cache_treatment=spec["os_page_cache_treatment"],
             effective_settings=dict(native_launch_policy=dict(typed_values=typed, template_sha256="c" * 64),
-                                    actual_resource_policy=dict(memory_max=1))))
+                                    native_resource_policy=dict(memory_budget_bytes=1, max_processes=1,
+                                                                host_reserve_bytes=1))))
     if model == "muse" and side == "candidate":
         if fault == "resource-mismatch": result["host"]["memory_budget_bytes"] = 2
         if fault == "image-mismatch": result["build"]["loaded_libraries"][0]["path"] = "/unexpected/libggml-cpu.so"

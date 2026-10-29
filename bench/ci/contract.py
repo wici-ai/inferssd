@@ -128,13 +128,16 @@ def noise_thresholds(value):
 def history_record(value):
     """Schema of one verified baseline record: four runs of one main commit on one device."""
     fields = {"schema_version", "purpose", "device", "model", "tier", "commit", "conditions_sha256",
-              "runs", "measurement_identity", "build", "job_id", "run_id", "run_attempt", "measured_at"}
+              "characteristics_sha256", "runs", "measurement_identity", "build", "job_id", "run_id",
+              "run_attempt", "measured_at"}
     if (not isinstance(value, dict) or set(value) != fields or value["schema_version"] != 1
             or value["purpose"] != "baseline-history"):
         raise ValueError("baseline record requires exactly " + ", ".join(sorted(fields)))
     if (value["device"] not in DEVICES or value["model"] not in MODELS or value["tier"] not in HISTORY_TIERS
             or not isinstance(value["commit"], str) or SHA.fullmatch(value["commit"]) is None
             or not isinstance(value["conditions_sha256"], str) or HASH.fullmatch(value["conditions_sha256"]) is None
+            or not isinstance(value["characteristics_sha256"], str)
+            or HASH.fullmatch(value["characteristics_sha256"]) is None
             or not isinstance(value["job_id"], str) or JOB_ID.fullmatch(value["job_id"]) is None
             or type(value["run_id"]) is not int or value["run_id"] <= 0
             or type(value["run_attempt"]) is not int or value["run_attempt"] != 1

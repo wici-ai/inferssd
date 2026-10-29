@@ -57,6 +57,14 @@ def config_for(models=("muse",)):
                                          cgroup_limits=dict(memory_max=str(64 << 30), memory_swap_max="0"))))
 
 
+def seal(config, text=MACHINE, host_path="/opt/inferssd-ci-integrations/" + "1" * 32 + "-machine.json"):
+    """A PR job's characteristics, sealed by the operator from the device's most recent baseline job."""
+    config["machine_characteristics"] = dict(sha256=compare.hashlib.sha256(text.encode()).hexdigest(), text=text,
+                                             job_id="b" * 32, commit=BASE, host_path=host_path,
+                                             runtime_path="/models/machine.json")
+    return config
+
+
 def framework(tmp_path, side, patch=None):
     """The side's framework source; PATCH replaces one line of its strategy."""
     if patch is None:
@@ -259,23 +267,35 @@ def test_every_other_condition_still_must_match(records, damage):
                                       base=BASE, candidate=CANDIDATE))
 
 
-def test_baseline_history_is_keyed_on_machine_os_model_and_template_only(records):
+def test_baseline_history_is_keyed_on_machine_os_model_template_and_machine_policy(records):
     _, receipts = cell_inputs(records)
     base = receipts[1, "base"]
     key = compare.conditions_digest(compare.history_conditions(base))
+    policy = dict(memory_budget_bytes=None, memory_max=str(64 << 30), memlock_bytes=1, cpus="0-3")
+    assert compare.history_conditions(base)["machine_policy"] == policy
+    # Derived settings are not part of the key, and neither is what the launch derived them to.
     other = copy.deepcopy(base)
     other["host"]["effective_settings"]["native_launch_policy"]["typed_values"]["cpu.io_cpus"] = [9]
-    other["host"]["memory_budget_bytes"] = 1
+    other["derived_launch"]["threads"]["decode"]["value"] = 99
     assert compare.conditions_digest(compare.history_conditions(other)) == key
+    resources = ("host", "effective_settings", "native_resource_policy")
     for path, value in ((("host", "os"), dict(sysname="Linux", release="6.1", machine="x86_64")),
                         (("host", "hardware"), "another"), (("model_identity",), dict(shards=[])),
-                        (("host", "effective_settings", "native_launch_policy", "template_sha256"), "0" * 64)):
+                        (("host", "effective_settings", "native_launch_policy", "template_sha256"), "0" * 64),
+                        ((*resources, "cgroup_limits", "memory_max"), str(32 << 30)),
+                        ((*resources, "memlock_bytes"), 2), ((*resources, "cpus_allowed_list"), "0-7")):
         changed = copy.deepcopy(base)
         target = changed
         for name in path[:-1]:
             target = target[name]
         target[path[-1]] = value
         assert compare.conditions_digest(compare.history_conditions(changed)) != key
+    # The Mac executor states a sampled budget and pins no CPUs.
+    mac = dict(max_processes=64, memory_budget_bytes=24 << 30, host_reserve_bytes=8 << 30)
+    assert compare.machine_policy(mac) == dict(memory_budget_bytes=24 << 30, memory_max=None, memlock_bytes=None,
+                                               cpus=None)
+    assert compare.machine_policy(dict(mac, memory_budget_bytes=16 << 30)) != compare.machine_policy(mac)
+    assert compare.machine_policy(dict(mac, host_reserve_bytes=1)) == compare.machine_policy(mac)
 
 
 def fake_framework(tmp_path, code):
@@ -332,46 +352,110 @@ class Session:
         return data, offset + len(data), True
 
 
-def test_profile_and_resolve_run_as_fixed_sandbox_stages_and_replay_from_their_output(records, tmp_path):
-    from ci.selection_contract import performance_protocol
+NEEDS = dict(models=["muse"], performance={"muse": dict(required=True, tiers=["512"], output_tokens=256)})
 
-    def job():
-        return dict(config_for(), performance_protocol=performance_protocol())
+
+def baseline_job():
+    from ci.selection_contract import performance_protocol
+    return dict(config_for(), performance_protocol=performance_protocol("baseline"),
+                selection_plan=dict(purpose="baseline-history"))
+
+
+def test_a_baseline_job_profiles_once_and_replays_from_its_stage_output(records, tmp_path):
+    job = baseline_job
 
     config = job()
-    needs = dict(models=["muse"], performance={"muse": dict(required=True, tiers=["512"], output_tokens=256)})
     machine_line = staged_launch.MARKER + json.dumps(dict(returncode=0, characteristics=MACHINE))
     session = Session({"machine-profile": "framework output\n" + machine_line + "\n",
-                       "base-muse-launch": staged_launch.MARKER + json.dumps(records["base"]) + "\n",
-                       "candidate-muse-launch": staged_launch.MARKER + json.dumps(records["changed"]) + "\n"})
+                       "candidate-muse-launch": staged_launch.MARKER + json.dumps(records["candidate"]) + "\n"})
     output = tmp_path / "out"
-    machine = staged_launch.profile(session, config, "base", ["muse"], output / "machine")
-    for side in ("base", "candidate"):
-        value = staged_launch.resolve(session, config, side, "muse", machine, output / "launch" / (side + "-muse"))
-        staged_launch.fill(config, side, "muse", value, ["512"])
-    assert [stage["stage_id"] for stage in session.started] == ["machine-profile", "base-muse-launch", "candidate-muse-launch"]
-    profile, launch = session.started[0], session.started[2]
+    machine = staged_launch.profile(session, config, "candidate", ["muse"], output / "machine")
+    value = staged_launch.resolve(session, config, "candidate", "muse", machine, output / "launch/candidate-muse")
+    staged_launch.fill(config, "candidate", "muse", value, ["512"])
+    assert [stage["stage_id"] for stage in session.started] == ["machine-profile", "candidate-muse-launch"]
+    profile, launch = session.started
     assert profile["argv"][:4] == ["/usr/bin/python3", "-I", "-c", staged_launch.PROFILE]
-    assert profile["argv"][4:] == ["/source/base/framework/src", "/scratch/machine/machine.json", "--build", "/build/base",
-                                   "--model", "/models/muse/model.gguf"]
+    assert profile["argv"][4:] == ["/source/candidate/framework/src", "/scratch/machine/machine.json", "--build",
+                                   "/build/candidate", "--model", "/models/muse/model.gguf"]
     assert launch["argv"][4:6] == ["/source/candidate/framework/src", "/scratch/machine/machine.json"]
     assert launch["argv"][7:9] == ["/scratch/candidate/launch-muse", '["/models/muse/model.gguf"]']
     assert launch["cwd"] == "/scratch/candidate" and launch["kind"] == "test"
     assert json.loads(launch["argv"][6])["memory_budget_bytes"] == 64 << 30
-    assert machine == dict(load(output / "machine/profile.json")) and machine["side"] == "base"
+    assert machine == dict(load(output / "machine/profile.json")) and machine["side"] == "candidate"
+    # The hosted report carries the profiled file, so the operator can store it with the history.
+    assert staged_launch.profiled(output / "machine") == MACHINE
     unfilled = job()
-    replayed = staged_launch.retained(output, unfilled, needs)
-    assert replayed == machine and unfilled["sides"] == config["sides"]
+    replayed = staged_launch.retained(output, unfilled, NEEDS)
+    assert replayed == machine and unfilled["sides"]["candidate"] == config["sides"]["candidate"]
     (output / "launch/candidate-muse/stdout.log").write_text(
-        staged_launch.MARKER + json.dumps(records["candidate"]) + "\n")
+        staged_launch.MARKER + json.dumps(records["changed"]) + "\n")
     with pytest.raises(ValueError, match="resolved launch differs"):
-        staged_launch.retained(output, job(), needs)
+        staged_launch.retained(output, job(), NEEDS)
 
 
-def derived_job(tmp_path, monkeypatch):
-    """The selected-integration fixture with every launch derived on the device from real resolutions."""
+def test_a_pr_job_resolves_both_sides_from_the_sealed_characteristics_without_profiling(records, tmp_path):
+    from ci.selection_contract import performance_protocol
+
+    def job(text=MACHINE):
+        return seal(dict(config_for(), performance_protocol=performance_protocol()), text)
+
+    config = job()
+    session = Session({"base-muse-launch": staged_launch.MARKER + json.dumps(records["base"]) + "\n",
+                       "candidate-muse-launch": staged_launch.MARKER + json.dumps(records["changed"]) + "\n"})
+    output = tmp_path / "out"
+    machine = staged_launch.machine_sealed(config)
+    assert machine == dict(sha256=CHARACTERISTICS, baseline=dict(job_id="b" * 32, commit=BASE),
+                           sections={name: value["status"] for name, value in json.loads(MACHINE)["sections"].items()})
+    for side in ("base", "candidate"):
+        value = staged_launch.resolve(session, config, side, "muse", machine, output / "launch" / (side + "-muse"))
+        staged_launch.fill(config, side, "muse", value, ["512"])
+    # No profile stage: both sides read the read-only file root staged, never one in scratch.
+    assert [stage["stage_id"] for stage in session.started] == ["base-muse-launch", "candidate-muse-launch"]
+    assert [stage["argv"][5] for stage in session.started] == ["/models/machine.json"] * 2
+    unfilled = job()
+    assert staged_launch.retained(output, unfilled, NEEDS) == machine and unfilled["sides"] == config["sides"]
+    assert not (output / "machine").exists()
+    # Sealed characteristics of another machine: the resolutions do not name them.
+    with pytest.raises(ValueError, match="machine characteristics"):
+        staged_launch.retained(output, job(json.dumps(dict(json.loads(MACHINE), note="another machine"))), NEEDS)
+    tampered = job()
+    tampered["machine_characteristics"]["text"] += " "
+    with pytest.raises(ValueError, match="differ from their hash"):
+        staged_launch.retained(output, tampered, NEEDS)
+
+
+def test_a_pr_job_adopts_only_the_exact_sealed_file_root_staged(tmp_path, monkeypatch):
+    from ci import staged_build
+    from ci.selection_contract import performance_protocol
+    monkeypatch.setattr(staged_build, "protected", lambda path: Path(path))
+    staged = tmp_path / "machine.json"
+    config = seal(dict(config_for(), performance_protocol=performance_protocol()), host_path=str(staged))
+    for raw in (MACHINE.encode(), MACHINE.encode() + b" "):
+        if staged.exists():
+            staged.chmod(0o600)
+        staged.write_bytes(raw)
+        staged.chmod(0o444)
+        if raw == MACHINE.encode():
+            assert staged_launch.adopt(config) == staged_launch.machine_sealed(config)
+        else:
+            with pytest.raises(ValueError, match="differ from the sealed file"):
+                staged_launch.adopt(config)
+    staged.chmod(0o600)
+    staged.unlink()
+    with pytest.raises(OSError):
+        staged_launch.adopt(config)
+
+
+def derived_job(tmp_path, monkeypatch, baseline=False):
+    """The selected-integration fixture with every launch derived on the device from real resolutions.
+
+    A PR job takes the sealed characteristics, which root staged at `staged`;
+    a baseline job of one commit profiles the machine itself.
+    """
     from test_ci_selected_preflight import setup, synthetic_receipt
-    from ci import selected_integration as execution, selected_preflight as preflight
+    from test_ci_selection import POLICY as SELECTION_POLICY
+    from ci import impact, selected_integration as execution, selected_preflight as preflight, staged_build
+    from ci.selection_contract import performance_protocol
     patch = ('choices["cpu.decode_participants"] = ("0", "the engine measures its decode participants")',
              'choices["cpu.decode_participants"] = ("1", "one decode participant")')
     outputs = {"machine-profile": staged_launch.MARKER + json.dumps(dict(returncode=1, characteristics=MACHINE))}
@@ -380,10 +464,22 @@ def derived_job(tmp_path, monkeypatch):
             changed = patch if (side, model) == ("candidate", "muse") else None
             outputs[side + "-" + model + "-launch"] = staged_launch.MARKER + json.dumps(
                 sandbox_record(tmp_path / "records", side, model, patch=changed, label=side + "-" + model))
+    staged = tmp_path / "staged-machine.json"
+    staged.write_text(MACHINE)
+    staged.chmod(0o444)
+    monkeypatch.setattr(staged_build, "protected", lambda path: Path(path))
+    value = impact.plan([], SELECTION_POLICY, baseline=True, base=CANDIDATE, head=CANDIDATE,
+                        candidate=CANDIDATE) if baseline else None
 
     def derive(config):
         config["host"] = config_for()["host"]
+        if baseline:
+            config.update(performance_protocol=performance_protocol("baseline"),
+                          validation_mode=execution.PERFORMANCE_MODE, execution_devices=["cloud-5090"])
+        else:
+            seal(config, host_path=str(staged))
         for side, spec in config["sides"].items():
+            spec["build"]["toolchain"] = {"CMAKE_CXX_COMPILER": "/usr/bin/c++"}
             for model, data in spec["models"].items():
                 data.update(launch=dict(REQUEST), settings=dict(runtime_path="/models/settings-" + model + "-" + side + ".ssd"),
                             template=dict(runtime_path="/source/" + side + "/chat.jinja"),
@@ -392,11 +488,13 @@ def derived_job(tmp_path, monkeypatch):
                     for key in ("argv", "preflight_argv", "port"):
                         launch.pop(key, None)
 
-    args, config, manifest, needs, events, sessions = setup(tmp_path, monkeypatch, change=derive)
+    args, config, manifest, needs, events, sessions = setup(tmp_path, monkeypatch, change=derive, value=value)
     stages = []
 
     def run_stage(session, stage_id, argv, cwd, timeout, output):
         assert manifest["stages"][stage_id]["executables"] == [argv[0]] and manifest["stages"][stage_id]["cwd"] == cwd
+        if stage_id.endswith("-launch"):
+            assert argv[5] == staged_launch.machine_path(config)
         stages.append(stage_id)
         save(output / "stage.json", dict(returncode=0, cleanup_confirmed=True))
         (output / "stdout.log").write_text("framework output\n" + outputs[stage_id] + "\n")
@@ -417,19 +515,22 @@ def derived_job(tmp_path, monkeypatch):
     monkeypatch.setattr(staged_launch, "run_stage", run_stage)
     monkeypatch.setattr(preflight, "receipt", receipt)
     monkeypatch.setattr(execution, "receipt", receipt)
-    return args, config, needs, events, stages, builds, execution
+    return args, config, needs, events, stages, builds, execution, staged
 
 
-def test_a_job_profiles_once_resolves_each_side_with_its_own_code_and_reports_what_changed(tmp_path, monkeypatch):
-    args, config, needs, events, stages, builds, execution = derived_job(tmp_path, monkeypatch)
+SECTIONS = {name: value["status"] for name, value in json.loads(MACHINE)["sections"].items()}
+
+
+def test_a_pr_job_resolves_each_side_from_the_sealed_characteristics_and_reports_what_changed(tmp_path, monkeypatch):
+    args, config, needs, events, stages, builds, execution, _ = derived_job(tmp_path, monkeypatch)
     assert execution.run(args) == 0
     report = load(args.output / "integration.json")
-    # The base builds, profiles the machine and resolves before the candidate is built.
-    assert stages == ["machine-profile", "base-deepseek-launch", "base-muse-launch",
-                      "candidate-deepseek-launch", "candidate-muse-launch"]
-    assert builds == [0, 3]
-    assert report["machine_profile"] == dict(sha256=CHARACTERISTICS, returncode=1, side="base",
-                                             sections={name: value["status"] for name, value in json.loads(MACHINE)["sections"].items()})
+    # No machine profile: the base resolves before the candidate is built, from the sealed file.
+    assert stages == ["base-deepseek-launch", "base-muse-launch", "candidate-deepseek-launch", "candidate-muse-launch"]
+    assert builds == [0, 2]
+    assert report["machine_profile"] == dict(sha256=CHARACTERISTICS, sections=SECTIONS,
+                                             baseline=dict(job_id="b" * 32, commit=BASE))
+    assert not (args.output / "machine").exists()
     assert args.stages == [side + "-" + model + "-r" + run + "-benchmark-512" for model in ("deepseek", "muse")
                            for side, run in (("candidate", "1"), ("base", "1"), ("candidate", "2"), ("candidate", "3"))]
     cells = {cell["model"]: cell["performance"][0] for cell in report["cells"]}
@@ -444,8 +545,33 @@ def test_a_job_profiles_once_resolves_each_side_with_its_own_code_and_reports_wh
         config["sides"]["candidate"]["models"]["muse"]["smoke"]["argv"]
 
 
+def test_a_baseline_job_profiles_the_machine_once_with_the_commit_it_measures(tmp_path, monkeypatch):
+    args, config, needs, events, stages, builds, execution, _ = derived_job(tmp_path, monkeypatch, baseline=True)
+    assert execution.run(args) == 0
+    report = load(args.output / "integration.json")
+    assert stages == ["machine-profile", "candidate-deepseek-launch", "candidate-muse-launch"]
+    assert builds == [0]
+    assert report["status"] == "baseline"
+    assert report["machine_profile"] == dict(sha256=CHARACTERISTICS, returncode=1, side="candidate", sections=SECTIONS)
+    assert staged_launch.profiled(args.output / "machine") == MACHINE
+    replayed = load(args.config)
+    assert staged_launch.retained(args.output, replayed, needs) == report["machine_profile"]
+
+
+def test_a_pr_job_whose_staged_characteristics_differ_from_the_sealed_file_runs_no_resolution(tmp_path, monkeypatch):
+    args, config, needs, events, stages, builds, execution, staged = derived_job(tmp_path, monkeypatch)
+    staged.chmod(0o600)
+    staged.write_text(MACHINE + " ")
+    staged.chmod(0o444)
+    assert execution.run(args) == 1
+    report = load(args.output / "integration.json")
+    assert report["status"] == "failed" and report["cleanup_confirmed"]
+    assert "staged machine characteristics differ from the sealed file" in report["error"]
+    assert stages == [] and not [event for event in events if event[0] in ("smoke", "timed")]
+
+
 def test_a_failed_resolution_fails_the_job_before_any_server_starts(tmp_path, monkeypatch):
-    args, config, needs, events, stages, builds, execution = derived_job(tmp_path, monkeypatch)
+    args, config, needs, events, stages, builds, execution, _ = derived_job(tmp_path, monkeypatch)
     real = staged_launch.resolution
 
     def refused(config, side, model, record, sha):
@@ -467,15 +593,19 @@ def test_the_report_shows_each_sides_derived_thread_pools_and_the_changed_settin
     entry = compare.decide_cell(results, receipts, POLICY, protocol=protocol_for(), history=history_for(receipts),
                                 cell=dict(device="cloud-5090", model="muse", tier="512", job_id="f" * 32,
                                           base=BASE, candidate=CANDIDATE))
-    machine = dict(sha256=CHARACTERISTICS, returncode=1, side="base", sections=dict(cpu="ok", gpus="failed"))
+    machine = dict(sha256=CHARACTERISTICS, baseline=dict(job_id="b" * 32, commit=BASE),
+                   sections=dict(cpu="ok", gpus="failed"))
     stream = io.StringIO()
     selected_controller.operator_summary(stream, dict(passed=True, status="passed", full_impact_coverage_complete=False,
         cells=[dict(device="cloud-5090", model="muse", status="passed", machine_profile=machine,
-                    performance=[dict(tier="512", **entry)])]))
+                    performance=[dict(tier="512", **entry)]),
+               dict(device="dgx-spark", model="muse", status="baseline", performance=[dict(tier="512", **entry)],
+                    machine_profile=dict(sha256="9" * 64, returncode=0, side="candidate", sections=dict(cpu="ok")))]))
     text = stream.getvalue()
     assert "### Derived launches" in text and "the way `inferssd launch` does" in text
-    assert ("- cloud-5090: machine characteristics SHA `" + CHARACTERISTICS + "`, profiled by the base side; "
-            "sections not ok: gpus failed.") in text
+    assert ("- cloud-5090: machine characteristics SHA `" + CHARACTERISTICS + "`, taken from the baseline job of `"
+            + BASE + "`; sections not ok: gpus failed.") in text
+    assert "- dgx-spark: machine characteristics SHA `" + "9" * 64 + "`, profiled by this baseline job; " in text
     assert "| cloud-5090 | muse | 512 | cpu.decode_participants | 0 (strategy) | 1 (strategy) |" in text
     assert "| cloud-5090 | muse | 512 | threads.decode | " in text
 

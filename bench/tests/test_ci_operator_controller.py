@@ -40,7 +40,7 @@ def operator(tmp_path, monkeypatch):
         execution_devices=devices, validation_mode=contract.FUNCTIONAL_MODE,
         prepared_by=dict(login="maintainer", id=17), controller_repository=POLICY["controller_repository"],
         controller_workflow_sha=env["GITHUB_WORKFLOW_SHA"], policy_sha256=impact.fingerprint(POLICY),
-        baseline_history_sha256=impact.fingerprint([]), jobs=jobs)
+        baseline_history_sha256=impact.fingerprint([]), machine_characteristics_sha256={}, jobs=jobs)
     event["inputs"] = dict(prepared_envelope=json.dumps(envelope))
     args = SimpleNamespace(policy=Path(__file__).parents[1] / "ci/policy.json", control=tmp_path / "control",
                            plan=tmp_path / "admission.json", artifacts=tmp_path / "artifacts", output=tmp_path / "report.json")
@@ -84,7 +84,9 @@ def test_operator_admission_uses_only_private_token_and_sealed_source(operator):
     assert not any("pulls" in p or "check-runs" in p or "statuses" in p for p in a.calls)
 
 
-@pytest.mark.parametrize("fault", ["actor", "actor-id", "controller", "policy", "scope", "empty", "duplicate", "missing-job", "source", "plan", "unknown-field", "job-control", "job-manifest"])
+@pytest.mark.parametrize("fault", ["actor", "actor-id", "controller", "policy", "scope", "empty", "duplicate",
+                                   "missing-job", "source", "plan", "unknown-field", "job-control", "job-manifest",
+                                   "characteristics-device", "characteristics-hash", "characteristics-missing"])
 def test_operator_seal_or_scope_changes_fail_before_admission(operator, fault):
     a = operator; e = a.envelope
     if fault == "actor": e["prepared_by"]["login"] = "other"
@@ -99,6 +101,9 @@ def test_operator_seal_or_scope_changes_fail_before_admission(operator, fault):
     elif fault == "plan": e["selection"]["cells"][-1]["required"] = False
     elif fault == "job-control": e["jobs"]["cloud-5090"]["control_revision"] = "0" * 40
     elif fault == "job-manifest": e["jobs"]["cloud-5090"]["control_manifest_sha256"] = "0" * 64
+    elif fault == "characteristics-device": e["machine_characteristics_sha256"] = {"dgx-spark": "0" * 64}
+    elif fault == "characteristics-hash": e["machine_characteristics_sha256"] = {"cloud-5090": "not a hash"}
+    elif fault == "characteristics-missing": del e["machine_characteristics_sha256"]
     else: e["runtime_token"] = "forbidden"
     a.write_event()
     with pytest.raises((ValueError, KeyError)):
@@ -131,9 +136,9 @@ def ready(a):
 
 def test_report_only_returns_scoped_pass_without_source_api_or_publication(operator, monkeypatch):
     a = operator; ready(a)
-    def raw_aggregate(plan, policy, artifacts, jobs, children, scope, history_sha256):
+    def raw_aggregate(plan, policy, artifacts, jobs, children, scope, history_sha256, characteristics):
         assert scope == dict(validation_mode=contract.FUNCTIONAL_MODE, execution_devices=["cloud-5090"])
-        assert history_sha256 == impact.fingerprint([])
+        assert history_sha256 == impact.fingerprint([]) and characteristics == {}
         return dict(passed=True, full_impact_coverage_complete=False, cells=[], **scope)
     monkeypatch.setattr(controller, "operator_aggregate", raw_aggregate)
     assert controller.operator_report(a.args, a.env) == 0
@@ -183,8 +188,8 @@ def test_functional_scope_preserves_canonical_required_and_defers_perf():
 def test_operator_aggregate_reports_omitted_devices_without_editing_required(operator, monkeypatch):
     a = operator
     scope = contract.execution_scope(a.envelope)
-    def result(root, plan, policy, job, child, received, bands_sha256):
-        assert received == scope
+    def result(root, plan, policy, job, child, received, bands_sha256, characteristics_sha256):
+        assert received == scope and characteristics_sha256 is None
         return [dict(device=job["device"], model=m, status="passed", functional="passed",
                      numerical="passed", performance="not-required") for m in ("deepseek", "muse")]
     monkeypatch.setattr(aggregation, "device_report", result)

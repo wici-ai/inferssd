@@ -240,6 +240,9 @@ def prepared_fixture(tmp_path, source, *, devices=None, mode=prepare.LEGACY_MODE
             ssh=dict(argv=["ssh", "-T", "-a", "operator@example.invalid"], sudo_password_required=False,
                      root_argv=["/usr/bin/python3", "-I", "/opt/inferssd-ci-control/current/bench/ci/operator_stage.py"]))
     (tmp_path / "inputs.json").write_text(json.dumps(dict(schema_version=1, controller_workflow_sha="d" * 40, devices=profiles)))
+    if mode == prepare.MODE:
+        # PR jobs launch from the characteristics of each device's most recent baseline job.
+        history_store(tmp_path, [earlier_baseline(device) for device in prepare.DEVICES])
     args = SimpleNamespace(source=root, inputs=tmp_path / "inputs.json", output=tmp_path / "prepared",
         policy=Path(__file__).parents[1] / "ci/policy.json", gh="never-used", execution_devices=list(devices or prepare.LINUX_DEVICES), validation_mode=mode, **identity)
     return args, API(root)
@@ -526,46 +529,119 @@ def test_baseline_job_builds_one_commit_once_on_every_device_and_model_with_an_e
             "candidate-" + model + "-r" + str(index) + "-benchmark-512"
             for model in ("deepseek", "muse") for index in range(1, 5)}
         assert not any(name.startswith("base-") for name in manifest["stages"])
+        # A baseline job profiles the machine itself, with the commit it measures.
+        assert manifest["stages"]["machine-profile"]["side"] == "candidate"
+        assert "machine_characteristics" not in config and "machine.json" not in manifest["models"]
         # The installed root policy pins the gate protocol and admits the baseline form of one commit.
         assert load(args.output / device / "policy.review.json")["performance_protocol"] == prepare.performance_protocol()
         assert operator_stage.protocol_admitted(config)
     assert not (args.output / "base-source-map.json").exists()
     assert load(args.output / "source-map.json")["revision"] == head
+    assert envelope["machine_characteristics_sha256"] == {}
     prepare.verified(args.output)
 
 
 def history_store(tmp_path, records):
+    """Baseline records next to inputs.json, each after the characteristics file it names."""
     from ci import history
+    from test_ci_performance_series import MACHINE
     root = tmp_path / history.DIRECTORY
     for record in records:
+        history.write_characteristics(root, record["device"], MACHINE)
         history.write(root, record)
     return root
+
+
+def earlier_baseline(device):
+    """One record of an earlier main commit's baseline job on the device."""
+    from test_ci_performance_series import record
+    return record("0" * 40, device=device, model="deepseek", measured_at="2026-10-01T10:00:00Z", job="0" * 32)
 
 
 def test_device_history_is_sealed_into_every_config_and_named_by_the_envelope(tmp_path, source):
     from test_ci_performance_series import record
     root, identity = source
-    stored = [record(identity["base"], device="cloud-5090"), record("e" * 40, device="cloud-5090", model="deepseek"),
+    stored = [record(identity["base"], device="cloud-5090"),
+              record("e" * 40, device="cloud-5090", model="deepseek", measured_at="2026-10-27T10:00:00Z", job="d" * 32),
               record(identity["base"], device="local-mbp")]
     history_store(tmp_path, stored)
     args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"], mode=prepare.MODE)
     envelope = prepare.prepare(args, api)
     sealed = load(args.output / "cloud-5090/config.json")["baseline_history"]
     # Only the executing devices' records, in the store's verified order.
-    assert sorted((item["model"], item["commit"]) for item in sealed) == [("deepseek", "e" * 40), ("muse", identity["base"])]
+    assert sorted((item["model"], item["commit"]) for item in sealed) == [
+        ("deepseek", "0" * 40), ("deepseek", "e" * 40), ("muse", identity["base"])]
     assert envelope["baseline_history_sha256"] == prepare.fingerprint(sealed)
     # The root stager and its installed policy never see or pin the history.
     assert "baseline_history" not in json.dumps(load(args.output / "cloud-5090/policy.review.json"))
     (tmp_path / "empty").mkdir()
     empty, api = prepared_fixture(tmp_path / "empty", source, devices=["dgx-spark"], mode=prepare.MODE)
-    assert prepare.prepare(empty, api)["baseline_history_sha256"] == prepare.fingerprint([])
+    sealed = [earlier_baseline("dgx-spark")]
+    assert prepare.prepare(empty, api)["baseline_history_sha256"] == prepare.fingerprint(sealed)
+
+
+def test_a_pr_job_seals_the_characteristics_of_each_devices_most_recent_baseline_job(tmp_path, source):
+    from ci import history, selection_contract
+    from test_ci_performance_series import MACHINE, record
+    root, identity = source
+    newer = MACHINE.replace("synthetic", "reprofiled")
+    store = history_store(tmp_path, [])
+    history.write_characteristics(store, "cloud-5090", newer)
+    history.write(store, record(identity["base"], device="cloud-5090", job="e" * 32,
+                                characteristics=prepare.hashlib.sha256(newer.encode()).hexdigest()))
+    args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
+    envelope = prepare.prepare(args, api)
+    for device in prepare.LINUX_DEVICES:
+        config = load(args.output / device / "config.json")
+        manifest = load(args.output / device / "manifest.json")
+        job = envelope["jobs"][device]["job_id"]
+        text, source_job, commit = ((newer, "e" * 32, identity["base"]) if device == "cloud-5090"
+                                    else (MACHINE, "0" * 32, "0" * 40))
+        sha = prepare.hashlib.sha256(text.encode()).hexdigest()
+        assert config["machine_characteristics"] == dict(
+            sha256=sha, text=text, job_id=source_job, commit=commit,
+            host_path="/opt/inferssd-ci-integrations/" + job + "-machine.json", runtime_path="/models/machine.json")
+        assert envelope["machine_characteristics_sha256"][device] == sha
+        # Root mounts it read-only; no stage profiles the machine.
+        assert manifest["models"]["machine.json"] == config["machine_characteristics"]["host_path"]
+        assert "machine-profile" not in manifest["stages"]
+        assert "machine_characteristics" not in json.dumps(load(args.output / device / "policy.review.json"))
+        unsealed = dict(config)
+        del unsealed["machine_characteristics"]
+        with pytest.raises(ValueError, match="a baseline job must run on it first"):
+            selection_contract.requirements(unsealed)
+    assert set(envelope["machine_characteristics_sha256"]) == set(prepare.LINUX_DEVICES)
+
+
+@pytest.mark.parametrize("damage", ["none", "missing", "tampered"])
+def test_a_pr_job_without_intact_baseline_characteristics_refuses_preparation(tmp_path, source, damage):
+    import shutil
+    from ci import history
+    from test_ci_performance_series import MACHINE_SHA
+    args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"], mode=prepare.MODE)
+    store = history.store_root(args.inputs)
+    path = history.characteristics_path(store, "cloud-5090", MACHINE_SHA)
+    path.chmod(0o600)
+    if damage == "none":
+        shutil.rmtree(store / "cloud-5090")
+        expected = "cloud-5090 has no baseline machine characteristics yet; a baseline job must run on it first"
+    elif damage == "missing":
+        path.unlink()
+        expected = "are missing"
+    else:
+        path.write_text(MACHINE_SHA)
+        expected = "differ from their hash"
+    with pytest.raises(ValueError, match=expected):
+        prepare.prepare(args, api)
+    assert not args.output.exists()
 
 
 def test_tampered_history_file_refuses_preparation(tmp_path, source):
+    from ci import history
     from test_ci_performance_series import record
     root, identity = source
     store = history_store(tmp_path, [record(identity["base"])])
-    path = next(store.rglob("*.json"))
+    path = history.record_path(store, record(identity["base"]))
     value = json.loads(path.read_text())
     value["runs"][0]["metrics"]["decode_tps"] = 99.0
     path.chmod(0o600)
@@ -761,7 +837,7 @@ def test_performance_launches_are_resolved_on_the_device_from_one_reviewed_reque
             assert not any(key in data["benchmarks"]["512"] for key in ("argv", "preflight_argv", "port"))
             assert stages[side + "-" + model + "-launch"] == dict(kind="test", side=side, executables=["/usr/bin/python3"],
                                                                  cwd="/scratch/" + side, gpu=True)
-    assert stages["machine-profile"]["side"] == "base"
+    assert "machine-profile" not in stages
 
 
 def test_bad_platform_profile_fails_during_preparation(tmp_path, source):

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Poll exact-head `/ci test` PR reviews and main's head on the trusted preparation host.
 
-Each new main head queues one baseline job: that commit measured four times per
-model on every enabled device. When it completes, its verified cells join the
+Each new main head queues one baseline job: that commit profiles the machine
+and is measured four times per model on every enabled device. When it
+completes, its verified cells and the characteristics file it profiled join the
 baseline history next to the device profiles. PR and baseline jobs run one at a
 time in the order they were queued, so a PR queued after a merge finds its base
-measured; a PR whose base has no history gets needs-review cells.
+measured; a PR whose base has no history gets needs-review cells. A PR job
+launches from the characteristics of each device's most recent baseline job,
+and cannot be prepared for a device that has none yet.
 """
 
 import argparse
@@ -536,12 +539,16 @@ def ingest_baseline(args, api, policy, path, record):
         measured_at = (finished if isinstance(finished, str) and MEASURED_AT.fullmatch(finished)
                        else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         stored, skipped = [], []
+        root = history.store_root(args.inputs)
         for device in envelope["execution_devices"]:
-            records, missed = history.records_from_report(
+            records, missed, characteristics = history.records_from_report(
                 report, device=device, job_id=envelope["jobs"][device]["job_id"], commit=record["commit"],
                 run_id=record["run"]["id"], run_attempt=1, measured_at=measured_at)
+            # The characteristics file first: every record names it, and later PR jobs seal it.
+            if characteristics is not None:
+                history.write_characteristics(root, device, characteristics)
             stored += [dict(device=device, model=item["model"], tier=item["tier"],
-                            result=history.write(history.store_root(args.inputs), item)) for item in records]
+                            result=history.write(root, item)) for item in records]
             skipped += missed
         save_record(path, record, "ingested", stored=stored, skipped=skipped)
     except Exception as error:

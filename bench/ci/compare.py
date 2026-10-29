@@ -75,9 +75,10 @@ INTERPRETATION = (
     "mean is below the base estimate by more than the same threshold is labelled improved "
     "(faster beyond noise); within the threshold either way it is within noise. The label "
     "does not change the status. Where a side's launch was derived on the device, that side's "
-    "own launch strategy chose its settings and thread pools from the job's one machine "
-    "profile; what the PR's launch sets differently is listed with the cell, and it is not a "
-    "reason to refuse the comparison. OS cache treatment is recorded, not assumed cold."
+    "own launch strategy chose its settings and thread pools from the machine characteristics "
+    "of the device's most recent baseline job; what the PR's launch sets differently is listed "
+    "with the cell, and it is not a reason to refuse the comparison. OS cache treatment is "
+    "recorded, not assumed cold."
 )
 BASELINE_INTERPRETATION = (
     "Baseline job: one build of a main commit measured four times, every run a fresh "
@@ -160,7 +161,7 @@ def comparable(receipt, comparison_binding=None, side=None):
 
     A run whose launch was derived on the device carries `derived_launch`: its
     side's own strategy chose the settings, thread pools and server arguments
-    from the job's one machine profile. Those choices are results to report,
+    from the job's one characteristics file. Those choices are results to report,
     so the typed values and argv leave the comparison; the launch request, the
     template, the machine characteristics and everything else must still match.
     """
@@ -205,16 +206,30 @@ def comparable(receipt, comparison_binding=None, side=None):
     return conditions
 
 
+def machine_policy(resources):
+    """The job's machine policy as the device template's `host.resources` states it: memory budget and CPU set.
+
+    On Linux the budget is the cgroup memory limit and the memory lock limit,
+    and the CPU set is the allowed CPU list. The Mac executor has a sampled
+    memory budget and pins no CPUs. What a platform does not state is None.
+    """
+    return {"memory_budget_bytes": resources.get("memory_budget_bytes"),
+            "memory_max": resources.get("cgroup_limits", {}).get("memory_max"),
+            "memlock_bytes": resources.get("memlock_bytes"), "cpus": resources.get("cpus_allowed_list")}
+
+
 def history_conditions(receipt):
-    """What baseline history is keyed on: the machine, its OS, the model files and the chat template.
+    """What baseline history is keyed on: the machine, its OS, model files, chat template and machine policy.
 
     Settings are not part of it. Each commit derives its own from the machine
     characteristics, so the history of main stays usable for a PR whose
-    strategy derives different settings.
+    strategy derives different settings. The memory budget and CPU set they are
+    derived within are part of it: a change to either starts a new history.
     """
     host = receipt["host"]
     return {"model": receipt["model_identity"], "hardware": host["hardware"], "os": host["os"],
-            "template_sha256": host["effective_settings"]["native_launch_policy"]["template_sha256"]}
+            "template_sha256": host["effective_settings"]["native_launch_policy"]["template_sha256"],
+            "machine_policy": machine_policy(host["effective_settings"]["native_resource_policy"])}
 
 
 def conditions_digest(conditions):

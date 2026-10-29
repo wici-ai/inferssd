@@ -96,18 +96,21 @@ def operator_envelope(value, policy, identity, actor):
     fields = {"schema_version", "purpose", "repository", "base", "head", "candidate",
               "selection", "selection_plan_sha256", "execution_devices", "validation_mode",
               "prepared_by", "controller_repository", "controller_workflow_sha", "policy_sha256",
-              "baseline_history_sha256", "jobs"}
+              "baseline_history_sha256", "machine_characteristics_sha256", "jobs"}
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("complete sealed operator envelope required")
     impact = validate(value["selection"], policy)
     scope = execution_scope(value)
     prepared = value["prepared_by"]
+    machines = value["machine_characteristics_sha256"]
     if (value["schema_version"] != 1 or value["purpose"] != OPERATOR_PURPOSE or scope is None
             or value["repository"] != policy["repository"]
             or value["controller_repository"] != policy["controller_repository"]
             or value["controller_workflow_sha"] != identity["workflow_sha"]
             or value["policy_sha256"] != fingerprint(policy)
             or not isinstance(value["baseline_history_sha256"], str) or not HASH.fullmatch(value["baseline_history_sha256"])
+            or not isinstance(machines, dict) or not set(machines) <= set(value["execution_devices"])
+            or any(not isinstance(item, str) or not HASH.fullmatch(item) for item in machines.values())
             or value["selection_plan_sha256"] != fingerprint(impact)
             or any(value[key] != impact[key] for key in ("base", "head", "candidate"))
             or not isinstance(prepared, dict) or prepared.get("login") != actor["login"]
@@ -480,7 +483,8 @@ def operator_summary(stream, report):
             stream.write("\nChange is the PR's geometric mean over the base estimate (the four history runs and the "
                          "in-run base), minus 1, in percent; lower TTFT is better. TTFT starts at the request, not model "
                          "loading. Threshold is on the log scale: max(ln(1 + floor), t·σ·√(1/3 + 1/5)), where σ is the "
-                         "pooled within-commit spread of the device's baseline history for the same machine, OS, model and template "
+                         "pooled within-commit spread of the device's baseline history for the same machine, OS, "
+                         "model, template, memory budget and CPU set "
                          "and t the one-sided Student-t quantile for its degrees of freedom, matching a normal 3σ tail. "
                          "Only whole decode, TTFT and native prefill decide; the two decode half-windows are shown for "
                          "information. Regressed: a deciding metric beyond its threshold with every PR run slower than the "
@@ -492,7 +496,8 @@ def operator_summary(stream, report):
         if baseline:
             stream.write("\n### 512 prompt / 256 decode: baseline runs of a main commit\n\n")
             stream.write("One build measured four times; no pass or regression decision. σ and df include this record "
-                         "and the device's earlier records for the same machine, OS, model and template.\n\n")
+                         "and the device's earlier records for the same machine, OS, model, template, memory "
+                         "budget and CPU set.\n\n")
             stream.write("| Device | Model | Tier | Metric | Runs | Mean ln | σ (log) | df |\n|---|---|---|---|---:|---:|---:|---:|\n")
             for row, entry in baseline:
                 for key, label in METRIC_LABELS:
@@ -512,20 +517,24 @@ def operator_summary(stream, report):
         if launches:
             stream.write("\n### Derived launches\n\n")
             stream.write("Each side started its servers the way `inferssd launch` does: that side's own launch strategy "
-                         "derived the settings, thread pools and server arguments from the job's one machine profile, the "
-                         "model's GGUF header and the job's memory budget. Origin is strategy, launcher (the registry "
-                         "default or the launcher's model profile) or user (the reviewed launch request). The thread pools "
-                         "are always shown; other rows are what the PR's launch sets differently.\n\n")
+                         "derived the settings, thread pools and server arguments from the device's machine "
+                         "characteristics (a baseline job profiles them; a PR job takes those of the device's most "
+                         "recent baseline job), the model's GGUF header and the job's memory budget. Origin is "
+                         "strategy, launcher (the registry default or the launcher's model profile) or user (the "
+                         "reviewed launch request). The thread pools are always shown; other rows are what the PR's "
+                         "launch sets differently.\n\n")
             profiles = {}
             for row, _ in launches:
                 profiles.setdefault(row["device"], row.get("machine_profile"))
             for device, machine in profiles.items():
                 machine = machine if isinstance(machine, dict) else {}
                 weak = [name + " " + status for name, status in machine.get("sections", {}).items() if status != "ok"]
+                source = machine.get("baseline")
+                origin = ("taken from the baseline job of `" + summary_text(source.get("commit", "unavailable")) + "`"
+                          if isinstance(source, dict) else "profiled by this baseline job")
                 stream.write("- " + summary_text(device) + ": machine characteristics SHA `"
-                             + summary_text(machine.get("sha256", "unavailable")) + "`, profiled by the "
-                             + summary_text(machine.get("side", "unavailable")) + " side; sections not ok: "
-                             + summary_text(", ".join(weak) or "none") + ".\n")
+                             + summary_text(machine.get("sha256", "unavailable")) + "`, " + origin
+                             + "; sections not ok: " + summary_text(", ".join(weak) or "none") + ".\n")
             stream.write("\n| Device | Model | Tier | Setting | Base | PR or measured commit |\n|---|---|---|---|---|---|\n")
             for row, entry in launches:
                 derived = entry["derived_launch"]
@@ -632,7 +641,8 @@ def operator_report(args, env=os.environ):
             if latest.get("id") != child["id"] or latest.get("status") != "completed" or latest.get("conclusion") not in ("success", "failure"):
                 raise ValueError("operator child is not an exact completed single attempt")
             children[device] = latest
-        report = operator_aggregate(impact, policy, args.artifacts, jobs, children, scope, envelope["baseline_history_sha256"])
+        report = operator_aggregate(impact, policy, args.artifacts, jobs, children, scope,
+                                    envelope["baseline_history_sha256"], envelope["machine_characteristics_sha256"])
         if state["errors"]:
             # Only a verified regressed/needs-review decision explains a child
             # that exited nonzero; any other child error fails the report.

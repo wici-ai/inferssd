@@ -202,6 +202,20 @@ def protocol_admitted(config):
             and len({config["sides"][side]["revision"] for side in ("base", "candidate")}) == 1)
 
 
+def sealed_machine(config, host_path, runtime_path):
+    """A PR job's machine characteristics as bytes to stage read-only, or None (a baseline job profiles)."""
+    value = config.get("machine_characteristics")
+    if value is None:
+        return None
+    fields = {"sha256", "text", "job_id", "commit", "host_path", "runtime_path"}
+    if (not isinstance(value, dict) or set(value) != fields or not isinstance(value["text"], str)
+            or value["host_path"] != host_path or value["runtime_path"] != runtime_path
+            or config.get("performance_protocol") == BASELINE_PROTOCOL
+            or hashlib.sha256(value["text"].encode()).hexdigest() != value["sha256"]):
+        fail("sealed machine characteristics differ from their fixed path or hash, or are given to a baseline job")
+    return value["text"].encode()
+
+
 def source_sides(config):
     mode = config.get("validation_mode", "functional-numerical")
     if mode not in ("functional-numerical", PERFORMANCE_MODE):
@@ -250,6 +264,8 @@ def policy_check(policy, request, config, manifest, broker):
                 fail("model/settings declaration differs from local root admission")
             mounts[model] = admitted["mount"]
             mounts["settings-" + model + "-" + side + ".ssd"] = data["settings"]["host_path"]
+    if sealed_machine(config, str(IROOT / (job + "-machine.json")), "/models/machine.json") is not None:
+        mounts["machine.json"] = str(IROOT / (job + "-machine.json"))
     source_root = SROOT / ("operator-" + job)
     sources = {side: str(source_root / side) if config.get("validation_mode") == PERFORMANCE_MODE else str(source_root) for side in sides}
     if (manifest["models"] != mounts or manifest["builds"] != {side: side for side in sides}
@@ -408,6 +424,9 @@ def receive(expected_sha256, incoming=None):
                     fail("base/candidate effective settings differ")
                 for side, payload in payloads.items():
                     write(IROOT / (job + "-" + model + "-" + side + "-settings.ssd"), payload)
+            machine = sealed_machine(config, str(IROOT / (job + "-machine.json")), "/models/machine.json")
+            if machine is not None:
+                write(IROOT / (job + "-machine.json"), machine)
             jobdir.mkdir(mode=0o711)
             write(jobdir / "manifest.json", (staging / "manifest.json").read_bytes())
             write(target_config, (staging / "config.json").read_bytes())
