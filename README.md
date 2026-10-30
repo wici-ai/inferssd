@@ -4,7 +4,12 @@
   </a>
 </p>
 
-<p align="center"><b>Large MoE models, powered by your SSD.</b></p>
+<h1 align="center">Large MoE models, powered by your SSD</h1>
+
+<p align="center">
+  <a href="https://wici.ai/inferssd"><b>Website</b></a> &nbsp;·&nbsp;
+  <a href="https://wici.ai/research"><b>Blog</b></a>
+</p>
 <p align="center">macOS / Metal &nbsp;·&nbsp; Linux / CUDA &nbsp;·&nbsp; <a href="LICENSE">Apache-2.0</a></p>
 
 <p align="center">
@@ -42,43 +47,29 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 
 ### DeepSeek-V4.1-Flash-1017
 
-#### Prefill · 4K
-
-| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **InferSSD**<br>**token/s · Speedup** |
-| --- | ---: | ---: | ---: |
-| MacBook Pro (M5 Max) | 5.929 | 0.708<br>(0.12×) | **26.270**<br>**(4.43×)** |
-| RTX 5060 Ti | 6.950 | 7.020<br>(1.01×) | **75.100**<br>**(10.81×)** |
-| RTX 5090 | 8.060 | 39.210<br>(4.86×) | **164.500**<br>**(20.41×)** |
-| DGX Spark | 2.730 | 0.826<br>(0.30×) | **127.500**<br>**(46.70×)** |
-
-#### Decode · 4K
-
-| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **InferSSD**<br>**token/s · Speedup** |
-| --- | ---: | ---: | ---: |
-| MacBook Pro (M5 Max) | 0.873 | 0.437<br>(0.50×) | **2.704**<br>**(3.10×)** |
-| RTX 5060 Ti | 0.242 | 0.900<br>(3.72×) | **2.550**<br>**(10.54×)** |
-| RTX 5090 | 0.867 | 1.878<br>(2.17×) | **7.270**<br>**(8.39×)** |
-| DGX Spark | 1.608 | 0.356<br>(0.22×) | **7.260**<br>**(4.51×)** |
+| System | Stage · 4K | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **InferSSD**<br>**token/s · Speedup** |
+| --- | --- | ---: | ---: | ---: |
+| MacBook Pro (M5 Max) | Prefill | 5.929 | 0.708<br>(0.12×) | **26.270**<br>**(4.43×)** |
+| | Decode | 0.873 | 0.437<br>(0.50×) | **2.704**<br>**(3.10×)** |
+| RTX 5060 Ti | Prefill | 6.950 | 7.020<br>(1.01×) | **75.100**<br>**(10.81×)** |
+| | Decode | 0.242 | 0.900<br>(3.72×) | **2.550**<br>**(10.54×)** |
+| RTX 5090 | Prefill | 8.060 | 39.210<br>(4.86×) | **164.500**<br>**(20.41×)** |
+| | Decode | 0.867 | 1.878<br>(2.17×) | **7.270**<br>**(8.39×)** |
+| DGX Spark | Prefill | 2.730 | 0.826<br>(0.30×) | **127.500**<br>**(46.70×)** |
+| | Decode | 1.608 | 0.356<br>(0.22×) | **7.260**<br>**(4.51×)** |
 
 ### Muse-Spark-Open · 816B
 
-#### Prefill · 4K
-
-| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **InferSSD**<br>**token/s · Speedup** |
-| --- | ---: | ---: | ---: |
-| MacBook Pro (M5 Max)<sup>1</sup> | 3.140 | N/S | **12.480**<br>**(3.97×)** |
-| RTX 5060 Ti | 3.410 | N/S | **52.100**<br>**(15.28×)** |
-| RTX 5090 | 4.000 | N/S | **106.600**<br>**(26.65×)** |
-| DGX Spark | 1.740 | N/S | **83.900**<br>**(48.22×)** |
-
-#### Decode · 4K
-
-| System | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **InferSSD**<br>**token/s · Speedup** |
-| --- | ---: | ---: | ---: |
-| MacBook Pro (M5 Max)<sup>1</sup> | 0.153 | N/S | **0.944**<br>**(6.17×)** |
-| RTX 5060 Ti | 0.059 | N/S | **0.219**<br>**(3.71×)** |
-| RTX 5090 | 0.155 | N/S | **1.520**<br>**(9.81×)** |
-| DGX Spark | 0.120 | N/S | **2.140**<br>**(17.83×)** |
+| System | Stage · 4K | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **InferSSD**<br>**token/s · Speedup** |
+| --- | --- | ---: | ---: | ---: |
+| MacBook Pro (M5 Max)<sup>1</sup> | Prefill | 3.140 | N/S | **12.480**<br>**(3.97×)** |
+| | Decode | 0.153 | N/S | **0.944**<br>**(6.17×)** |
+| RTX 5060 Ti | Prefill | 3.410 | N/S | **52.100**<br>**(15.28×)** |
+| | Decode | 0.059 | N/S | **0.219**<br>**(3.71×)** |
+| RTX 5090 | Prefill | 4.000 | N/S | **106.600**<br>**(26.65×)** |
+| | Decode | 0.155 | N/S | **1.520**<br>**(9.81×)** |
+| DGX Spark | Prefill | 1.740 | N/S | **83.900**<br>**(48.22×)** |
+| | Decode | 0.120 | N/S | **2.140**<br>**(17.83×)** |
 
 **N/S:** Muse was not supported by the tested Colibri version. It is not a zero-throughput measurement.
 
@@ -86,52 +77,44 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 
 ## Get started
 
-Install on Apple Silicon macOS or NVIDIA CUDA Linux:
-
 ```sh
-curl -LsSf https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
+git clone https://github.com/wici-ai/inferssd.git
+cd inferssd
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install ./framework
 ```
 
-The installer builds from source in a private environment. Install the
-[platform prerequisites](docs/quickstart.md#before-you-start) first, and follow the
-printed PATH instruction if needed. No `sudo` is used by the installer.
-
-Once installed:
+macOS / Metal:
 
 ```sh
-# Download the tested DeepSeek Q8_0 GGUF and chat in your terminal
-inferssd cli -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF
-
-# Launch an OpenAI-compatible API at http://127.0.0.1:8080/v1
-inferssd serve -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF
-
-# Or use the tested Muse UD-Q4_K_XL GGUF (works with cli too)
-inferssd serve -hf unsloth/Muse-Spark-Open-816B-A42B-GGUF
+cmake --preset macos-metal
+cmake --build build-macos-metal --parallel 4 \
+  --target inferssd-server inferssd-cpuprobe inferssd-ssdprobe
+python3 scripts/engine-resources.py \
+  --build build-macos-metal --output engine-resources.json
+cp docs/examples/runtime-policy-darwin.json runtime-policy.json
 ```
 
-The first run downloads **hundreds of GB** of model shards to
-`~/.local/share/inferssd/models`; use `--model-dir /path/on/ssd` to choose the drive.
-Later runs reuse downloaded files, and interrupted downloads can resume. The
-launcher indexes the GGUF directly and measures your hardware before starting;
-no separate expert pack is needed. Terminal chat and API serving use the same
-owned SSD runtime. Stop with **Ctrl+C** (or `/exit` in chat).
+Linux / CUDA:
 
-See [one-command installation](docs/quickstart.md#one-command-installation) for
-local models, authentication, upgrades and uninstalling. The
-source-build instructions remain available for either platform:
+```sh
+cmake --preset linux-cuda
+cmake --build build-linux-cuda --parallel 4 \
+  --target inferssd-server inferssd-cpuprobe inferssd-ssdprobe inferssd-memprobe
+python3 scripts/engine-resources.py \
+  --build build-linux-cuda --output engine-resources.json
+cp docs/examples/runtime-policy-linux.json runtime-policy.json
+```
 
-| Platform | Branch | Setup |
-| --- | --- | --- |
-| macOS / Metal (Apple Silicon) | `main` | [Mac setup](docs/quickstart.md#apple-silicon) · [Muse on Mac](docs/quickstart.md#muse-on-mac) |
-| Linux / NVIDIA CUDA | `main` | [Linux setup](docs/quickstart.md#linux--nvidia) |
+Launch (`--profile dsv` for DeepSeek, `--profile muse` for Muse):
 
-Windows support is in progress. The engine, the server and the SSD expert path build and pass their tests on Windows x64 (CPU), and `inferssd launch --dry-run` prepares the server command there; supervised launch (`--execute`) is not available on Windows yet.
-
-`x86_64` covers Intel and AMD CPUs; DGX Spark (GB10) uses `ARM64`. CUDA identifies the NVIDIA GPU backend, not the CPU vendor. The x86_64 benchmarks use Intel CPUs.
-
-Historical DeepSeek runs used approximately **473 GiB of GGUF weights + 269 GiB for the expert pack**; Muse's pack added approximately **450 GiB**. The current framework can index GGUF experts directly without a separate pack. When using a pack, keep the original shards and generate it from the exact checkpoint you load.
-
-Mac requires Xcode/Metal, CMake, Ninja, and Python. Linux requires a compatible CUDA toolkit, CMake, Python, and `liburing`; its launcher uses systemd/cgroup v2. The Mac example targets **M5 Max / 48 GB**; choose cache and batch budgets that fit your machine.
+```sh
+inferssd launch --execute \
+  --resources engine-resources.json \
+  --model /path/to/model-00001-of-00010.gguf --profile dsv \
+  --runtime-policy runtime-policy.json
+```
 
 ## Models
 
