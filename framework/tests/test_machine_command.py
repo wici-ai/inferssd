@@ -55,7 +55,7 @@ def test_help_lists_profile(capsys):
     with pytest.raises(SystemExit) as error:
         main(["--help"])
     text = capsys.readouterr().out
-    assert error.value.code == 0 and "{launch,configuration,source,profile}" in text
+    assert error.value.code == 0 and "{cli,serve,launch,configuration,source,profile}" in text
     assert "measure this machine" in text
     with pytest.raises(SystemExit) as error:
         main(["profile", "--help"])
