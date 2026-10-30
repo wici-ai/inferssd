@@ -16,6 +16,15 @@
 
 **Run models larger than your RAM or VRAM.** InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run large mixture-of-experts (MoE) models from SSD, using standard GGUF files, with browser chat and an OpenAI-compatible API. It currently supports **DeepSeek-V4.1-Flash-1017** and **Muse-Spark-Open**, with more models coming.
 
+## Models
+
+These are the tested GGUF files, community conversions of the named model releases. See [weight-format details](docs/benchmark.md#checkpoint-formats).
+
+| Model | Parameter count | GGUF reference |
+| --- | --- | --- |
+| DeepSeek-V4.1-Flash-1017 | 763B total / 8–16B active | [mrfakename · Q8_0](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF) |
+| Muse-Spark-Open | 816B total / 42B active | [Unsloth · UD-Q4_K_XL](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF) |
+
 ## Performance benchmarks
 
 **4K prompt tier · 256 output tokens · decode measured over tokens 129–256.**
@@ -94,15 +103,6 @@ For Muse, use `unsloth/Muse-Spark-Open-816B-A42B-GGUF`. With `serve`, open `http
 The first run downloads about 470 GiB of model files to `~/.local/share/inferssd/models` and measures your machine. Use `--model-dir /path/on/ssd` to choose the drive, or `-m /path/to/first-shard.gguf` for files you already have. There is no memory setting to choose: InferSSD uses the memory available. Stop with **Ctrl+C**, or `/exit` in chat.
 
 See the [quick start](docs/quickstart.md#one-command-installation) for upgrades and uninstalling.
-
-## Models
-
-These are the tested GGUF files, community conversions of the named model releases. See [weight-format details](docs/benchmark.md#checkpoint-formats).
-
-| Model | Parameter count | GGUF reference |
-| --- | --- | --- |
-| DeepSeek-V4.1-Flash-1017 | 763B total / 8–16B active | [mrfakename · Q8_0](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF) |
-| Muse-Spark-Open | 816B total / 42B active | [Unsloth · UD-Q4_K_XL](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF) |
 
 ## Further reading
 
