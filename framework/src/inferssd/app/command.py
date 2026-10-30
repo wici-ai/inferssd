@@ -14,6 +14,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from inferssd.app.hub import download, selection
+from inferssd.app.memory import admit, aligned_budget, available_memory
 from inferssd.launch import typed_command
 from inferssd.launch.resources import read_resources
 from inferssd.platform.policy import Policy
@@ -67,6 +68,7 @@ def physical_memory() -> int:
 
 def default_policy(total: int, budget: int, state: Path, seconds: int) -> Policy:
     reserve = max(2 * GIB, total // 5)
+    budget = aligned_budget(budget)
     if budget <= 0 or budget > total - reserve:
         raise ValueError("server RAM budget must leave at least 2 GiB / 20% for the host")
     return Policy.read(
@@ -121,17 +123,25 @@ def run(args: argparse.Namespace) -> int:
         policy = Policy.read(json.loads(policy_path.read_text()))
         if policy.platform != sys.platform:
             raise ValueError("runtime policy platform differs from this host")
+        if aligned_budget(policy.memory_budget_bytes) != policy.memory_budget_bytes:
+            raise ValueError("runtime policy memory_budget_bytes must be page-aligned on Linux")
     else:
         total = physical_memory()
-        budget = (
-            int(args.memory_gib * GIB)
-            if args.memory_gib is not None
-            else total - max(2 * GIB, total // 5)
-        )
-        policy = default_policy(total, budget, state, args.runtime_seconds)
+        requested = int(args.memory_gib * GIB) if args.memory_gib is not None else None
+        admission = admit(total, available_memory(), requested)
+        policy = default_policy(total, admission.memory_budget_bytes, state, args.runtime_seconds)
         policy_path = state / ("policy-" + uuid.uuid4().hex + ".json")
         # Keep the policy alongside launch receipts for reproducibility.
         policy_path.write_text(json.dumps(asdict(policy), indent=2) + "\n")
+        policy_path.with_suffix(".memory.json").write_text(
+            json.dumps(asdict(admission), indent=2) + "\n"
+        )
+        print(
+            f"Available RAM: {admission.available_bytes / GIB:.2f} GiB; "
+            f"startup margin: {admission.startup_margin_bytes / GIB:.2f} GiB "
+            "(in addition to host reserve).",
+            file=sys.stderr,
+        )
     print(
         f"Server RAM budget: {policy.memory_budget_bytes / GIB:.1f} GiB; "
         f"host reserve: {policy.host_reserve_bytes / GIB:.1f} GiB; "

@@ -113,6 +113,7 @@ def ready_app(tmp_path, monkeypatch):
         ),
     )
     monkeypatch.setattr(command, "physical_memory", lambda: 48 * command.GIB)
+    monkeypatch.setattr(command, "available_memory", lambda: 40 * command.GIB)
     monkeypatch.setattr(sys, "platform", "darwin")
     model = tmp_path / "model.gguf"
     model.write_bytes(b"GGUF")
@@ -164,6 +165,30 @@ def test_invalid_budget_fails_before_download(ready_app, monkeypatch):
     with pytest.raises(SystemExit):
         main(["serve", "-hf", next(iter(hub.MODELS)), "--memory-gib", "48"])
     download.assert_not_called()
+
+
+def test_available_ram_rejects_oversized_budget_before_download(ready_app, monkeypatch):
+    monkeypatch.setattr(command, "available_memory", lambda: 20 * command.GIB)
+    download = Mock()
+    launch = Mock()
+    monkeypatch.setattr(command, "download", download)
+    monkeypatch.setattr(command.typed_command, "run", launch)
+    with pytest.raises(SystemExit):
+        main(["serve", "-hf", next(iter(hub.MODELS)), "--memory-gib", "24"])
+    download.assert_not_called()
+    launch.assert_not_called()
+
+
+def test_default_budget_and_snapshot_receipt(ready_app, monkeypatch):
+    launch = Mock(return_value=0)
+    monkeypatch.setattr(command.typed_command, "run", launch)
+    assert main(["serve", "-m", str(ready_app)]) == 0
+    path = launch.call_args.args[0].runtime_policy
+    policy = json.loads(path.read_text())
+    receipt = json.loads(path.with_suffix(".memory.json").read_text())
+    assert receipt["available_bytes"] == 40 * command.GIB
+    assert receipt["memory_budget_bytes"] == policy["memory_budget_bytes"]
+    assert receipt["requested_bytes"] is None
 
 
 @pytest.mark.parametrize("outcome", [0, RuntimeError("request failed"), KeyboardInterrupt()])

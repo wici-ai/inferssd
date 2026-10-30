@@ -64,7 +64,17 @@ The source alias index references the GGUF payloads without an extra expert pack
 
 Both commands use `inferssd launch`'s owned runtime, machine measurement, model
 profile selection and chat templates. By default, the process memory budget is
-total system RAM minus the larger of **2 GiB or 20%** reserved for the host.
+**currently available RAM** minus the larger of **2 GiB or 20% of total RAM**
+reserved for the host, and a startup margin of **1 GiB or 5% of total RAM**
+(whichever is larger). Linux uses `MemAvailable`; macOS uses free plus inactive
+pages, matching the runtime guard. Linux budgets are rounded down to the actual
+page size so the policy and cgroup hard limit agree. `--memory-gib` is checked
+against the same current safe ceiling; oversized requests fail before loading.
+The input estimates and selected budget are saved next to the generated policy
+as `policy-*.memory.json`. These are launch-time estimates, not reserved memory:
+other workloads, profiling and model downloads can change availability later.
+Runtime host-reserve, ancestor-cgroup, zero-swap and OOM checks remain active.
+An explicit Linux policy must supply a page-aligned byte budget.
 This is a starting resource limit, not a benchmark configuration or a guarantee
 that every machine has enough memory. `--memory-gib` lowers the budget; supply
 `--runtime-policy FILE` for an explicit policy, including a larger custom budget.
