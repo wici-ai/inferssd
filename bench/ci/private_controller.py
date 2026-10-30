@@ -245,6 +245,22 @@ def current_ci(api, plan, policy):
         raise ValueError("normal hosted CI has not completed for the reviewed SHA")
     run = api.call("actions/runs/" + str(max(runs, key=lambda r: r["id"])["id"]))
     prs = run.get("pull_requests", [])
+    fork = plan.get("head_repository", policy["repository"])
+    if fork == policy["repository"]:
+        linked = (
+            len(prs) == 1
+            and prs[0].get("number") == plan["pr"]
+            and prs[0].get("head", {}).get("sha") == plan["head"]
+            and prs[0].get("base", {}).get("sha") == plan["base"]
+        )
+    else:
+        # GitHub links no PR to a run from a fork, so the fork and the exact head
+        # bind it instead. It records no base for such a run.
+        linked = (
+            not prs
+            and (run.get("head_repository") or {}).get("full_name") == fork
+            and run.get("head_sha") == plan["head"]
+        )
     if (
         run.get("workflow_id") != workflow["id"]
         or run.get("path") != policy["upstream_workflow"]
@@ -252,10 +268,7 @@ def current_ci(api, plan, policy):
         or run.get("status") != "completed"
         or run.get("conclusion") != "success"
         or run.get("head_sha") not in (plan["head"], plan["candidate"])
-        or len(prs) != 1
-        or prs[0].get("number") != plan["pr"]
-        or prs[0].get("head", {}).get("sha") != plan["head"]
-        or prs[0].get("base", {}).get("sha") != plan["base"]
+        or not linked
     ):
         raise ValueError(
             "normal CI is not the successful latest attempt for this exact head/base"

@@ -18,18 +18,16 @@ credential risks of self-hosted runners in its
 
 ## Authorization
 
-Device checks are authorized by a maintainer for PRs from branches in this
-repository. A maintainer with current write access submits a Comment review whose
+Device checks are authorized by a maintainer, for PRs from branches in this
+repository and from forks alike. A maintainer with current write access submits a Comment review whose
 complete body is `/ci test`; GitHub binds the review to the exact current head.
 The operator also measures every new `main` commit on the devices; PR results
 are compared with that history. See [review entry, results and limits](REVIEW-ENTRY.md).
 
-External fork PRs do not currently run on physical devices. Admission requires
-the latest successful hosted CI run for the exact head to be associated with
-exactly that PR, and GitHub does not associate workflow runs from forks with the
-PR. Fork PRs therefore receive hosted CI only. To test an external contribution
-on devices, a maintainer can open a PR from a branch in this repository with the
-reviewed change and authorize that head.
+A fork PR's code reaches the devices only after a maintainer has reviewed its
+exact head; read the diff before submitting `/ci test`. Admission requires the
+latest successful hosted CI run for that head. GitHub links no PR to a run from
+a fork, so that run is bound by the PR's fork and exact head instead.
 
 An authorization is valid only for its exact head, base and GitHub test merge.
 A new push, base change, dismissal, later `/ci cancel` or change request, or loss

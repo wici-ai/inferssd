@@ -1,7 +1,7 @@
 # Review-authorized device test entry
 
-Device checks are authorized by a maintainer for PRs from branches in the
-source repository. The maintainer submits a comment-type review whose complete
+Device checks are authorized by a maintainer, for PRs from branches in the
+source repository and from forks alike. The maintainer submits a comment-type review whose complete
 body is `/ci test`. GitHub's review `commit_id` binds the exact current head. A
 maintainer with current write access may authorize their own PR; no special
 source branch, second-person approval, App or PAT is needed in this
@@ -12,13 +12,16 @@ count. Ordinary issue comments, labels, quoted code/examples and prose are not
 commands. The test authorization does not approve a merge or publish a source PR
 check.
 
-External fork PRs do not currently run on physical devices. Authorization also
-requires the latest successful hosted CI run for the exact head to be associated
-with exactly that PR (`pull_requests` must contain one entry), and GitHub does not
-associate workflow runs from forks with the PR. A `/ci test` review on a fork PR
-therefore stays waiting until it expires. To test an external contribution on
-devices, a maintainer can open a PR from a branch in the source repository with
-the reviewed change and authorize that head.
+Authorization also requires the latest successful hosted CI run for the exact
+head. For a PR from a branch in the source repository, that run must name exactly
+this PR, head and base (`pull_requests` must contain one entry). GitHub links no
+PR to a run from a fork, so for a fork PR the run must instead come from the PR's
+fork with the exact head; GitHub records no base for it. GitHub may hold a
+first-time contributor's hosted run until a maintainer approves it. A fork's code
+reaches the devices only through this repository's `refs/pull/N/head` and
+`refs/pull/N/merge`, after a maintainer has reviewed that exact head: read the
+diff before submitting `/ci test`. On the devices, PR code runs as a separate user
+without network access.
 
 The impact plan selects models and checks. Reviewed execution profiles may select
 cloud-5090, dgx-spark and local-mbp; each omitted device stays explicitly deferred.

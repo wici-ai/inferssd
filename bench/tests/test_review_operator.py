@@ -164,6 +164,22 @@ def test_exact_comment_self_pr_authorization(api):
     value = entry.authorization(api, POLICY, 58, 71, HEAD)
     assert value["reviewer"] == api.pr["user"]["login"]
     assert value["head"] == HEAD and value["candidate"] == CANDIDATE
+    assert value["head_repository"] == REPO
+
+
+def test_fork_pr_is_authorized_by_a_maintainer_review_like_any_other(api):
+    api.pr["head"]["repo"] = {"full_name": "contributor/inferssd"}
+    api.pr["user"] = {"login": "contributor"}
+    value = entry.authorization(api, POLICY, 58, 71, HEAD)
+    assert value["head_repository"] == "contributor/inferssd"
+    assert value["reviewer"] == "maintainer" and value["head"] == HEAD
+
+
+@pytest.mark.parametrize("repo", [None, {}, {"full_name": "no-slash"}, {"full_name": "a/b; rm -rf /"}])
+def test_pr_without_a_head_repository_refuses(api, repo):
+    api.pr["head"]["repo"] = repo
+    with pytest.raises(entry.Stale, match="head repository"):
+        entry.authorization(api, POLICY, 58, 71, HEAD)
 
 
 @pytest.mark.parametrize(

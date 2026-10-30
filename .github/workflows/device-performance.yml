@@ -34,4 +34,4 @@ jobs:
           echo "This job previews which device checks a change selects; it does not run them."
           echo "After review, a maintainer triggers them with a Comment review whose complete body is /ci test on the current PR head."
           echo "The selected device checks and the 512-token prompt, 256-token decode comparison then run on maintainer-operated hardware."
-          echo "Device checks run only for pull requests from branches in this repository; fork pull requests receive hosted CI only."
+          echo "Device checks run for pull requests from branches in this repository and from forks, once a maintainer has reviewed the exact head."
