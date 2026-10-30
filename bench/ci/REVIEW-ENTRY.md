@@ -151,8 +151,9 @@ The fixed quiet policy is:
   free plus file-backed pages, as the kernel counts it: a model the previous run
   mapped stays cached on the active queue until pressure ages it, and the system
   reclaims it without compression or swap.
-- Swap-in plus swap-out counter growth must be zero; compression plus
-  decompression growth must be at most 64 MiB, using the observed page size.
+- Swap-out counter growth must be zero; compression plus decompression growth
+  must be at most 64 MiB, using the observed page size. Swap-ins are recorded
+  but not limited: they bring back pages put out at another time.
 - The memory-pressure level must be available and equal to 1 in both snapshots.
 - Non-CI CPU use must be at most 0.5 cores in total and 0.25 cores per process;
   each non-CI process must use at most 512 MiB RSS. CPU uses cumulative CPU-time
@@ -161,7 +162,7 @@ The fixed quiet policy is:
   by these measurements, not rejected merely for being present.
 
 Snapshots before/after the request and after cleanup retain timed
-swap, compression, pressure and process activity. Timed swap activity, abnormal
+swap, compression, pressure and process activity. Timed swap-out activity, abnormal
 pressure or excess non-CI CPU flags that run; compression above 64 MiB with
 abnormal pressure is also flagged, while compression alone is not. Timed checks
 do not apply the quiet free-memory or RSS thresholds. A difference above 1 GiB

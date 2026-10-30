@@ -74,20 +74,21 @@ def test_pair_reports_signed_changes_and_exact_prompt_conditions(pair, policy):
     assert len(result["measurement_identity"]["conditions_sha256"]) == 64
 
 
-def test_faster_different_output_needs_review_and_retains_metrics(pair, policy):
+def test_different_output_is_recorded_without_review_and_retains_metrics(pair, policy):
     a, b, ar, br = pair
     b["tokens"][64] = 12
     for metric in compare.METRICS:
         b["metrics"][metric] *= .5 if metric == "ttft_s" else 2
     b["timings"]["prompt_ms"] /= 2
     result = compare.compare_pair(a, b, ar, br, policy)
-    assert not result["passed"] and result["status"] == "needs-review"
-    assert result["diagnostic_required"] and result["evidence_valid"]
+    # Generated tokens are not yet required to match (compare.REQUIRE_SAME_TOKENS).
+    assert result["passed"] and result["status"] == "passed"
+    assert not result["diagnostic_required"] and result["evidence_valid"]
     assert result["observed_slowdowns"] == []
     assert all(value["passed"] for value in result["metrics"].values())
     assert result["metrics"]["decode_tps"]["candidate"] == 20
     assert result["output_workload"] == {
-        "same_tokens": False, "first_difference_one_based": 65,
+        "same_tokens": False, "same_tokens_required": False, "first_difference_one_based": 65,
         "base_token": 11, "candidate_token": 12,
     }
 

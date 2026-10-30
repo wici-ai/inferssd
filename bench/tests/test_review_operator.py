@@ -786,7 +786,8 @@ def test_completed_baseline_job_adds_only_its_verified_cells_to_the_history(api,
     record = dict(schema_version=1, kind="baseline", repository=REPO, commit=commit, created_at=1.0,
                   prepared=str(prepared))
     entry.save_record(path, record, "running", run=copy.deepcopy(api.run), dispatched_at=entry.time.time())
-    report = report_for([baseline_row(), baseline_row("deepseek", token_change=(2, "candidate"))])
+    report = report_for([baseline_row(), baseline_row("deepseek", environment=dict(
+        status="needs-review", reasons=["r2/candidate:swapout-activity"]))])
     report["envelope_sha256"] = "0" * 64 if damage == "other-envelope" else entry.fingerprint(envelope)
     raw = aggregate_zip(report)
     if damage != "missing-artifact":
