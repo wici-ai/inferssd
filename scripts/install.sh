@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
-# Usage: curl -LsSf https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
+# Usage: curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 set -eu
 
 # The release workflow replaces this with the tag it publishes.

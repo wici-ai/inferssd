@@ -14,7 +14,7 @@ First public release of InferSSD, which runs mixture-of-experts models larger th
 ### Install
 
 ```sh
-curl -LsSf https://github.com/wici-ai/inferssd/releases/download/v0.1.0/install.sh | sh
+curl -fsSL https://github.com/wici-ai/inferssd/releases/download/v0.1.0/install.sh | sh
 ```
 
 This release installs from source, so the engine is compiled for your machine's CPU and GPU. Prebuilt packages are not available yet. Building takes about 2 to 12 minutes, depending on the machine.

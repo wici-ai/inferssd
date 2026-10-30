@@ -73,7 +73,7 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 Install on Apple Silicon macOS or on Linux with an NVIDIA GPU:
 
 ```sh
-curl -LsSf https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 ```
 
 InferSSD currently installs from source, so the engine is compiled for your machine's CPU and GPU; prebuilt packages are not available yet. Building takes about 2 to 12 minutes, depending on the machine.
