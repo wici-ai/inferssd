@@ -160,6 +160,44 @@ def test_latest_hosted_ci_must_bind_current_base_workflow_and_success(change):
         controller.current_ci(api, admitted(), policy())
 
 
+def fork_run(api):
+    # GitHub's run for a fork PR names the fork and links no PR.
+    api.run.update(pull_requests=[], head_repository={"full_name": "contributor/inferssd"})
+    return dict(admitted(), head_repository="contributor/inferssd")
+
+
+def test_fork_hosted_ci_is_bound_by_the_fork_and_exact_head():
+    api = API()
+    plan = fork_run(api)
+    assert controller.current_ci(api, plan, policy())["head"] == "b" * 40
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda r: r.update(head_repository={"full_name": "someone-else/inferssd"}),
+        lambda r: r.update(head_repository=None),
+        lambda r: r.update(head_sha="c" * 40),
+        lambda r: r.update(pull_requests=[{"number": 12, "head": {"sha": "b" * 40}, "base": {"sha": "a" * 40}}]),
+        lambda r: r.update(conclusion="failure"),
+        lambda r: r.update(event="pull_request_target"),
+    ],
+)
+def test_fork_hosted_ci_refuses_another_fork_head_or_result(change):
+    api = API()
+    plan = fork_run(api)
+    change(api.run)
+    with pytest.raises(ValueError):
+        controller.current_ci(api, plan, policy())
+
+
+def test_same_repository_pr_still_needs_the_pr_link():
+    api = API()
+    api.run.update(pull_requests=[], head_repository={"full_name": "wici-ai/inferssd"})
+    with pytest.raises(ValueError):
+        controller.current_ci(api, dict(admitted(), head_repository="wici-ai/inferssd"), policy())
+
+
 def event_context(tmp_path):
     p = policy()
     event = {
