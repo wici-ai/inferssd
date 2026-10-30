@@ -149,3 +149,33 @@ Hardware results and improvements to expert I/O, caching, and batching are welco
 Built on [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp), with thanks to their contributors and the model-adaptation community.
 
 InferSSD is licensed under [Apache-2.0](LICENSE); bundled llama.cpp/ggml and other third-party components keep their original licenses and notices; see [NOTICE](NOTICE). Model weights remain subject to their publishers' licenses.
+
+
+## Exact per-model option rules
+
+The benchmark reference adapter requires the complete 15-setting snapshot,
+including `model.optimizations`, its explicit reviewed legacy mapping and the
+matching candidate launch values. Regression tests reject omitted, mistyped or
+drifting rules; existing source and evidence checks remain mandatory.
+Hosted CPU CI also builds and runs the native model-options resolver test.
+
+
+The optional `model.optimizations` setting accepts exact loaded GGUF metadata and
+backend-device rules for the existing `model.engram_prefetch` and `model.hc_fused`
+options. It defaults to `[]`. Empty rules keep the original context setup path,
+without model identity construction or rule telemetry; no weight hashing or
+per-token selection is added. Unknown models keep their effective defaults.
+Configured rules resolve once per context before graph setup, with explicit
+per-option CLI settings taking precedence. No production rules are enabled.
+See [configuration](docs/configuration.md#exact-model-optimization-rules) for the
+format, precedence, validation, metadata identity limits and startup receipts.
+
+This feature preserves the main branch's architecture-driven launch profiles,
+DeepSeek option defaults, chat templates, sampling and threadpool policy. Profile
+selection remains in the framework; exact optimization matching remains in the
+native context and does not create a second profile detector. Native resolver and
+context-ownership tests cover matching, fallback, ambiguity, neutral recognition
+and CLI precedence. Framework tests compare the generated native schema and
+materialized launch settings. These are synthetic CPU contract tests, not model
+benchmarks. GPU performance and numerical validation remain pending; no speedup
+or measured zero-overhead claim is made.
