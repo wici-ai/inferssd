@@ -64,9 +64,8 @@ The source alias index references the GGUF payloads without an extra expert pack
 
 Both commands use `inferssd launch`'s owned runtime, machine measurement, model
 profile selection and chat templates. They need no memory settings: the engine
-uses the memory it finds available and keeps its own margin for the host. For an
-explicit budget, supply `--runtime-policy FILE`. The runtime enforces its Linux
-cgroup requirements.
+uses the memory it finds available and keeps its own margin for the host. The
+runtime enforces its Linux cgroup requirements.
 
 Use `--context`, `--settings`, `--set`, `--machine` and `--reprofile` to override
 launch choices. `--resources` selects a manually built engine descriptor. The

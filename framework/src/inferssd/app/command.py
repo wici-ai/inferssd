@@ -14,7 +14,6 @@ from pathlib import Path
 from inferssd.app.hub import download, selection
 from inferssd.launch import typed_command
 from inferssd.launch.resources import read_resources
-from inferssd.platform.policy import Policy
 
 
 def data_directory() -> Path:
@@ -35,15 +34,15 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
         source.add_argument("-m", "--model", type=Path, help="local first GGUF shard (no download)")
         parser.add_argument("--revision", default="main", help="Hugging Face revision")
         parser.add_argument("--model-dir", type=Path, default=data_directory() / "models")
-        parser.add_argument("--resources", type=Path, help="engine descriptor (installer sets it)")
-        parser.add_argument(
-            "--runtime-policy", type=Path, help="override the automatic memory policy"
-        )
+        # For developers: the installer sets the descriptor and the launch derives the rest.
+        parser.add_argument("--resources", type=Path, help=argparse.SUPPRESS)
         parser.add_argument("--port", type=int, default=8080)
         parser.add_argument("--context", type=int, default=8192)
-        parser.add_argument("--settings", type=Path)
-        parser.add_argument("--set", dest="overrides", action="append", default=[])
-        parser.add_argument("--machine", type=Path)
+        parser.add_argument("--settings", type=Path, help=argparse.SUPPRESS)
+        parser.add_argument(
+            "--set", dest="overrides", action="append", default=[], help=argparse.SUPPRESS
+        )
+        parser.add_argument("--machine", type=Path, help=argparse.SUPPRESS)
         parser.add_argument("--reprofile", action="store_true")
         if mode == "cli":
             parser.add_argument("-p", "--prompt", help="answer one prompt and exit")
@@ -98,14 +97,9 @@ def run(args: argparse.Namespace) -> int:
             raise ValueError("engine chat template is missing; rerun the installer")
     state = (data_directory() / "state").resolve()
     state.mkdir(parents=True, exist_ok=True)
-    if args.runtime_policy:
-        policy_path = args.runtime_policy.resolve()
-        if Policy.read(json.loads(policy_path.read_text())).platform != sys.platform:
-            raise ValueError("runtime policy platform differs from this host")
-    else:
-        policy_path = state / ("policy-" + uuid.uuid4().hex + ".json")
-        # Keep the policy alongside launch receipts for reproducibility.
-        policy_path.write_text(json.dumps(default_policy(state), indent=2) + "\n")
+    policy_path = state / ("policy-" + uuid.uuid4().hex + ".json")
+    # Keep the policy alongside launch receipts for reproducibility.
+    policy_path.write_text(json.dumps(default_policy(state), indent=2) + "\n")
     if args.hf_repo:
         selection(args.hf_repo)
         model = download(args.hf_repo, args.revision, args.model_dir.expanduser().resolve())

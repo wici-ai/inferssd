@@ -42,7 +42,7 @@ from inferssd.telemetry.recorded import ledger, read_arm
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="InferSSD launch and configuration tools")
+    parser = argparse.ArgumentParser(description="Run large GGUF models from SSD")
     commands = parser.add_subparsers(dest="command", required=True)
     add_app_commands(commands)
     add_source_commands(commands)
@@ -101,7 +101,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     fit.add_argument("--profile", required=True)
     fit.add_argument("-o", "--out", required=True)
     # Commands for recorded artifacts remain available but are not listed in the help.
-    public = ("cli", "serve", "launch", "configuration", "source", "profile")
+    public = ("cli", "serve")
     commands.metavar = "{" + ",".join(public) + "}"
     commands._choices_actions = [a for a in commands._choices_actions if a.dest in public]
     args = parser.parse_args(argv)
