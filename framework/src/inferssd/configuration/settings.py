@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
@@ -67,10 +68,41 @@ class Snapshot:
         }
 
 
+PLATFORMS = ("linux", "darwin", "windows")
+
+
+def host_platform() -> str:
+    """The platform name of this host, the default of every platform option."""
+    return {"darwin": "darwin", "win32": "windows"}.get(sys.platform, "linux")
+
+
+def applies(prop: Mapping[str, Any], platform: str) -> bool:
+    """A schema scope is "all" or the platform names joined by commas."""
+    scope = cast(str, prop["scope"])
+    return scope == "all" or platform in scope.split(",")
+
+
 def integer(literal: str, low: int, high: int) -> int:
     if re.fullmatch(r"[0-9]+", literal) is None or not low <= int(literal) <= high:
         raise ValueError(f"expected decimal integer in {low}..{high}")
     return int(literal)
+
+
+def cpus(literal: str) -> tuple[int, ...]:
+    """An ordered CPU list of unique IDs and inclusive ranges, such as "0-2,5"."""
+    result: list[int] = []
+    for item in literal.split(",") if literal else []:
+        endpoints = item.split("-")
+        if len(endpoints) > 2:
+            raise ValueError("invalid CPU list")
+        low = integer(endpoints[0], 0, 2147483647)
+        high = integer(endpoints[-1], 0, 2147483647)
+        if high < low or high - low > 65535 or len(result) + high - low + 1 > 65536:
+            raise ValueError("invalid or excessive CPU list")
+        result.extend(range(low, high + 1))
+    if len(set(result)) != len(result):
+        raise ValueError("duplicate CPU ID")
+    return tuple(result)
 
 
 def typed(prop: Mapping[str, Any], literal: str) -> Value:
@@ -100,19 +132,7 @@ def typed(prop: Mapping[str, Any], literal: str) -> Value:
             path.encode("utf-8")
         return tuple(paths)
     if kind == "cpus":
-        result: list[int] = []
-        for item in literal.split(",") if literal else []:
-            endpoints = item.split("-")
-            if len(endpoints) > 2:
-                raise ValueError("invalid CPU list")
-            low = integer(endpoints[0], 0, 2147483647)
-            high = integer(endpoints[-1], 0, 2147483647)
-            if high < low or high - low > 65535 or len(result) + high - low + 1 > 65536:
-                raise ValueError("invalid or excessive CPU list")
-            result.extend(range(low, high + 1))
-        if len(set(result)) != len(result):
-            raise ValueError("duplicate CPU ID")
-        return tuple(result)
+        return cpus(literal)
     costs: dict[str, float] = {}
     for word in filter(None, re.split(r"[ \t\r\n\v\f]+", literal.replace(",", " "))):
         key, equal, number = word.partition("=")
@@ -156,7 +176,7 @@ def parse(
     source.encode("utf-8")
     if text is not None:
         text.encode("utf-8")
-    if platform not in ("linux", "darwin"):
+    if platform not in PLATFORMS:
         raise ValueError("unknown settings platform " + platform)
     properties: dict[str, Any] = schema()["properties"]
     values = {
@@ -169,7 +189,7 @@ def parse(
             prop = properties.get(key)
             if prop is None:
                 raise ValueError("unknown key")
-            if prop["scope"] not in ("all", platform):
+            if not applies(prop, platform):
                 raise ValueError("setting is only supported on " + prop["scope"])
             value = typed(prop, literal)
         except ValueError as error:
@@ -193,28 +213,17 @@ def parse(
             apply(key, literal, "file", f"{source}:{n}", receipt)
     for key, literal in overrides:
         apply(key, literal, "cli", "--ssd-" + key.replace(".", "-").replace("_", "-"), "")
-    if platform == "linux":
-        threads = cast(int, values["cpu.threads"].value)
-        cpus = cast(tuple[int, ...], values["cpu.compute_cpus"].value)
-        participants = cast(int, values["cpu.decode_participants"].value)
-        if threads < 2 or cpus and len(cpus) != threads - 1 or participants > threads - 1:
-            raise ValueError(
-                "CPU setting dependencies failed: "
-                + ", ".join(
-                    f"{k} ({values[k].location})"
-                    for k in ("cpu.threads", "cpu.compute_cpus", "cpu.decode_participants")
-                )
+    if (
+        platform == "linux"
+        and cast(int, values["vram.margin_mib"].value)
+        < cast(int, values["vram.reserve_mib"].value) + 64
+    ):
+        raise ValueError(
+            "VRAM margin must exceed reserve by 64 MiB: "
+            + ", ".join(
+                f"{k} ({values[k].location})" for k in ("vram.margin_mib", "vram.reserve_mib")
             )
-        if (
-            cast(int, values["vram.margin_mib"].value)
-            < cast(int, values["vram.reserve_mib"].value) + 64
-        ):
-            raise ValueError(
-                "VRAM margin must exceed reserve by 64 MiB: "
-                + ", ".join(
-                    f"{k} ({values[k].location})" for k in ("vram.margin_mib", "vram.reserve_mib")
-                )
-            )
+        )
     return Snapshot(tuple(values.values()), platform)
 
 
@@ -223,7 +232,7 @@ def render(snapshot: Snapshot) -> str:
     lines = ["inferssd-settings 1"]
     for item in snapshot.entries:
         prop = properties[item.key]
-        if prop["scope"] not in ("all", snapshot.platform):
+        if not applies(prop, snapshot.platform):
             continue
         literal = str(item.value)
         if prop["kind"] == "costs":

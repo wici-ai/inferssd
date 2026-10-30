@@ -24,12 +24,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include "test-resources.h"
 
-#if defined(__linux__)
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include "linux-test-resources.h"
+using test_resources::anonymous_bytes;
 
 static void require(bool ok, const std::string & what) { if (!ok) { throw std::runtime_error(what); } }
 static size_t aligned(size_t n) { return (n + 4095) & ~size_t(4095); }
@@ -53,7 +50,7 @@ struct fixture {
     int32_t fault_expert = -1;
     int fault_role = -1;
     int resolve_calls = 0;
-    ~fixture() { if (fd >= 0) { close(fd); } if (remove_on_destroy) { unlink(path.c_str()); } }
+    ~fixture() { ssd::platform::close_fd(fd); if (remove_on_destroy) { test_resources::remove_file(path); } }
     static bool resolve(void * user, const char * name, int32_t id, kimi_cpu_sink_source * out) {
         auto & f = *static_cast<fixture *>(user);
         ++f.resolve_calls;
@@ -69,9 +66,9 @@ struct fixture {
         if (fault == wrong_size) { out->nbytes += 4096; }
         if (fault == past_eof) { out->offset = uint64_t(1) << 50; }
         if (fault == short_tail) {
-            struct stat status = {};
-            if (fstat(f.fd, &status) || status.st_size < 4096) { return false; }
-            out->offset = uint64_t(status.st_size) - 4096;
+            uint64_t size = 0;
+            if (!ssd::platform::file_size(f.fd, size) || size < 4096) { return false; }
+            out->offset = size - 4096;
         }
         return true;
     }
@@ -82,11 +79,7 @@ static void put_bytes(std::ofstream & f, const void * data, size_t n) {
 }
 
 static void make_synthetic(fixture & f) {
-    const char * temp = std::getenv("TMPDIR");
-    std::string pattern = std::string(temp && *temp ? temp : "/tmp") + "/kimi-cpu-prefill-test-XXXXXX";
-    std::vector<char> name(pattern.begin(), pattern.end()); name.push_back(0);
-    int tfd = mkstemp(name.data()); require(tfd >= 0, "mkstemp failed"); close(tfd);
-    f.path = name.data(); f.remove_on_destroy = true;
+    f.path = test_resources::temp_file("kimi-cpu-prefill-test"); f.remove_on_destroy = true;
     std::mt19937 rng(20260908);
     std::normal_distribution<float> sample(0.0f, 0.06f);
     // Keep the full on-disk GGMLMOEPACKv1 layout, including index and padding.
@@ -185,7 +178,6 @@ static std::vector<float> reference(const fixture & f, int layer, const std::vec
     return output;
 }
 
-using sink_ptr = std::unique_ptr<kimi_cpu_sink, decltype(&kimi_cpu_sink_destroy)>;
 using prefill_ptr = std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)>;
 
 struct executor {
@@ -195,11 +187,11 @@ struct executor {
     static bool resolve(void * user, const char * name, int32_t id, kimi_cpu_sink_source * out) {
         return fixture::resolve(static_cast<executor *>(user)->active, name, id, out);
     }
-    executor(fixture_inputs & inputs, fixture & f, int threads, int depth) : active(&f), sink(nullptr, kimi_cpu_sink_destroy),
+    executor(fixture_inputs & inputs, fixture & f, int threads, int depth) : active(&f),
             prefill(nullptr, kimi_cpu_prefill_destroy) {
-        test_resources::cpu_threads(threads - 1, 1);
+        test_resources::cpu_participants(threads - 1, 1);
         char error[512] = {};
-        sink.reset(inputs.create(threads, depth, resolve, this, error, sizeof(error)));
+        sink = inputs.create(threads, depth, resolve, this, error, sizeof(error));
         require(bool(sink), std::string("sink create: ") + error);
         prefill.reset(kimi_cpu_prefill_create(sink.get(), error, sizeof(error)));
         require(bool(prefill), std::string("prefill create: ") + error);
@@ -353,7 +345,7 @@ static kimi_cpu_sink_cache_stats cache_snapshot(kimi_cpu_sink * sink, bool relea
 
 static sample_result run_checked(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, int layer, const batch & b,
         const std::vector<float> & expected, bool grouped = true, float linear_beta = 25,
-        uint64_t expected_hits = 0, uint64_t expected_admitted = 0, bool bit_exact = true) {
+        uint64_t expected_hits = 0, uint64_t expected_admitted = 0) {
     tensors meta(f, layer);
     sample_result r;
     require(expected.size() == size_t(b.tokens) * f.latent, "bad reference shape");
@@ -404,12 +396,7 @@ static sample_result run_checked(fixture_inputs & inputs, const std::string & na
     r.rel_l2 = std::sqrt(square / std::max(norm, 1e-30));
     const auto * bytes = reinterpret_cast<const uint8_t *>(guarded.data() + 1);
     for (size_t i = 0; i < expected.size() * sizeof(float); ++i) { r.hash ^= bytes[i]; r.hash *= 1099511628211ULL; }
-    if (bit_exact) {
-        require(r.max_abs == 0, name + ": strict CPU reference equality failed: " + std::to_string(r.max_abs));
-    } else {
-        require(r.max_abs < 2e-5 && r.rel_l2 < 2e-6,
-                name + ": bounded CPU reference tolerance failed: " + std::to_string(r.max_abs));
-    }
+    require(r.max_abs == 0, name + ": strict CPU reference equality failed: " + std::to_string(r.max_abs));
     return r;
 }
 
@@ -436,11 +423,6 @@ static void print_sample(const std::string & name, const batch & b, const sample
 static void compare_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, int layer, const batch & b, float linear_beta = 25) {
     const auto expected = reference_batch(f, layer, b, linear_beta);
     print_sample(name, b, run_checked(inputs, name, f, e, layer, b, expected, true, linear_beta));
-}
-
-static void compare_large_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, int layer, const batch & b) {
-    const auto expected = reference_batch(f, layer, b, 25);
-    print_sample(name, b, run_checked(inputs, name, f, e, layer, b, expected, true, 25, 0, 0, false));
 }
 
 static kimi_cpu_prefill_stats fail_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, batch b,
@@ -476,7 +458,7 @@ static void synthetic_tests(fixture_inputs & inputs, int threads, int depth) {
         }
         compare_case(inputs, "ub" + std::to_string(nt) + "_holes_duplicate_zero", small, e, 1, b);
     }
-    compare_large_case(inputs, "ub65_bounded_accumulator", small, e, 1, synthetic_batch(small, 65, 16));
+    compare_case(inputs, "ub65_slot_order", small, e, 1, synthetic_batch(small, 65, 16));
     auto full = synthetic_batch(small, 2, 16);
     compare_case(inputs, "full16_slots", small, e, 2, full);
     auto empty = synthetic_batch(small, 64);
@@ -516,10 +498,10 @@ static void synthetic_tests(fixture_inputs & inputs, int threads, int depth) {
     fail_case(inputs, "wrong_gate_type", small, e, bad, -1, -1, false, 2);
     fail_case(inputs, "wrong_down_shape", small, e, bad, -1, -1, false, 3);
     const int direct_fd = small.fd;
-    small.fd = open(small.path.c_str(), O_RDONLY | O_CLOEXEC);
+    small.fd = ssd::platform::open_buffered(small.path.c_str());
     require(small.fd >= 0, "buffered test open failed");
     fail_case(inputs, "buffered_fd_rejected", small, e, bad);
-    close(small.fd); small.fd = direct_fd;
+    ssd::platform::close_fd(small.fd); small.fd = direct_fd;
     compare_case(inputs, "recovery_after_invalid_inputs", small, e, 2, synthetic_batch(small, 2));
     for (auto fault : { fixture::missing, fixture::unaligned_offset, fixture::wrong_size, fixture::past_eof }) {
         small.fault = fault;
@@ -569,20 +551,6 @@ static sample_result decode_cache_case(fixture_inputs & inputs, const std::strin
     auto result = run_checked(inputs, name, f, e, layer, b, expected, false, 25, hits, admitted);
     print_sample(name, b, result);
     return result;
-}
-
-static uint64_t anonymous_bytes() {
-    std::ifstream file("/proc/self/smaps_rollup");
-    require(bool(file), "cannot read Anonymous for fused cache release");
-    std::string line;
-    while (std::getline(file, line)) {
-        std::istringstream in(line); std::string label, unit; uint64_t kib = 0;
-        if (in >> label >> kib >> unit && label == "Anonymous:") {
-            require(unit == "kB", "unexpected smaps Anonymous unit");
-            return kib * 1024;
-        }
-    }
-    throw std::runtime_error("smaps Anonymous missing");
 }
 
 static void require_cache_counters_unchanged(const kimi_cpu_sink_cache_stats & before, executor & e) {
@@ -734,7 +702,7 @@ static void cache_lifecycle_tests(fixture_inputs & inputs, int threads, int dept
             " status=SKIP reason=asan_process_rss\n",
             (unsigned long long) resident.committed_bytes, (unsigned long long) before, (unsigned long long) after);
     } else {
-        require(before >= after && before - after >= resident.committed_bytes - 256 * 1024,
+        require(before >= after && before - after >= resident.committed_bytes - test_resources::anonymous_noise_bytes,
                 "grouped prefill zeroed cache accounting without releasing Anonymous pages");
         std::printf("case=fused_prefill_physical_release payload=%llu anonymous_before=%llu anonymous_after=%llu status=PASS\n",
             (unsigned long long) resident.committed_bytes, (unsigned long long) before, (unsigned long long) after);
@@ -940,11 +908,9 @@ static void real_test(fixture_inputs & inputs, const options & o) {
     }
     std::printf("REAL_CPU_PREFILL_OK single_layer_only=1 gpu_validation=not_run\n");
 }
-#endif
 
 int main(int argc, char ** argv) {
     fixture_inputs inputs;
-#if defined(__linux__)
     try {
         options o; bool ring_set = false, cache_lifecycle = false, cache_retention = false,
             cache_prefill_read = false;
@@ -971,9 +937,9 @@ int main(int argc, char ** argv) {
         require(o.threads >= 2 && o.threads <= 128 && o.ring >= 1 && o.ring <= 32 &&
                 o.repeats >= 1 && o.repeats <= 1000 && o.warmup >= 0 && o.warmup <= 1000, "invalid thread/ring/repeat count");
         require(o.mode == "both" || o.mode == "grouped" || o.mode == "per-token", "invalid benchmark mode");
-        test_resources::cpu_threads(o.threads - 1, 1);
-        test_resources::io_uring();
-        if (cache_lifecycle || cache_retention || cache_prefill_read) { test_resources::finite_cgroup(); }
+        test_resources::cpu_participants(o.threads - 1, 1);
+        test_resources::io_ring();
+        if (cache_lifecycle || cache_retention || cache_prefill_read) { test_resources::finite_envelope(); }
         if (cache_prefill_read) {
             cache_prefill_read_tests(inputs, o.threads, ring_set ? o.ring : 2);
         } else if (cache_retention) {
@@ -990,8 +956,4 @@ int main(int argc, char ** argv) {
         }
         std::printf("CPU_PREFILL_TEST_OK\n"); return 0;
     } catch (const std::exception & e) { return test_resources::report("CPU_PREFILL_TEST", e); }
-#else
-    (void) argc; (void) argv;
-    std::printf("SKIP: CPU grouped prefill requires Linux io_uring/O_DIRECT\n"); return 77;
-#endif
 }

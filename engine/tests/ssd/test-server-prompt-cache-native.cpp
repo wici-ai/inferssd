@@ -22,7 +22,6 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
-extern "C" bool llama_moe_prefill_phase_workspace_sized_ex(llama_context *, int, uint32_t, uint32_t);
 static void require(bool ok, const char * why) { if (!ok) { throw std::runtime_error(why); } }
 static std::string read_text(const std::string & path) {
     std::ifstream stream(path); require(bool(stream), "resource observation unreadable");
@@ -113,11 +112,11 @@ int main(int argc, char ** argv) {
         using model_ptr = std::unique_ptr<llama_model, decltype(&llama_model_free)>;
         model_ptr model(llama_model_load_from_file(argv[1], mp), llama_model_free); require(bool(model), "model load failed");
         const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get())); require(vocab > 6, "tiny vocabulary too small");
-        const llama_ssd_override values[] = {{"expert.source", argv[2]}, {"cpu.threads", "2"},
+        const llama_ssd_override values[] = {{"expert.source", argv[2]},
             {"prefetch.depth", "0"}, {"vram.budget", "0"}, {"prefill.cpu_max_tokens", "0"}};
         char error[512] = {};
         using option_ptr = std::unique_ptr<llama_ssd_options, decltype(&llama_ssd_options_free)>;
-        option_ptr options(llama_ssd_options_create(nullptr, values, 5, argv[4], error, sizeof(error)), llama_ssd_options_free);
+        option_ptr options(llama_ssd_options_create(nullptr, values, 4, argv[4], error, sizeof(error)), llama_ssd_options_free);
         require(bool(options), error);
         auto cp = llama_context_default_params(); cp.ssd_options = options.get();
         cp.n_ctx = 128; cp.n_batch = 4; cp.n_ubatch = 4; cp.n_seq_max = 1;

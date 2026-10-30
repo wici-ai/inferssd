@@ -46,7 +46,7 @@ def original_helper_spelling(observation):
     assert len(runs) <= 1
     for event in runs:
         command = event[1]
-        assert command[:5] == ["@python", "-I", "-m", "inferssd.source.mac_alias", "--repo"]
+        assert command[:5] == ["@python", "-I", "-m", "inferssd.source.gguf_alias", "--repo"]
         assert canonical_roots(command[5]) == "@repo"
         original = [
             "@python",

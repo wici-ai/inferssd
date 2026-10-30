@@ -5,13 +5,54 @@
 #include "../settings/settings.h"
 
 #include <fcntl.h>
-#include <unistd.h>
+#if defined(_WIN32)
+#    define WIN32_LEAN_AND_MEAN
+#    include <windows.h>
+#    include <io.h>
+#    include <sys/stat.h>
+#else
+#    include <unistd.h>
+#endif
 
 #include <cerrno>
 #include <cstring>
 
 namespace ssd {
 namespace telemetry {
+
+namespace {
+// Exclusive, non-inheritable creation of the owned JSONL file.
+int open_exclusive(const std::string & path) {
+#if defined(_WIN32)
+    const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(), -1, nullptr, 0);
+    if (n <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    std::wstring wide(size_t(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(), -1, wide.data(), n);
+    return _wopen(wide.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY | _O_NOINHERIT, _S_IREAD | _S_IWRITE);
+#else
+    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+#endif
+}
+
+void close_fd(int fd) {
+#if defined(_WIN32)
+    _close(fd);
+#else
+    ::close(fd);
+#endif
+}
+
+std::FILE * stream_of(int fd) {
+#if defined(_WIN32)
+    return _fdopen(fd, "wb");
+#else
+    return fdopen(fd, "w");
+#endif
+}
+} // namespace
 
 result<std::unique_ptr<writer>> writer::open(const std::string & path) noexcept {
     // The fd and FILE must have exactly one owner even while constructing an
@@ -25,17 +66,17 @@ result<std::unique_ptr<writer>> writer::open(const std::string & path) noexcept 
             if (stream) {
                 std::fclose(stream);
             } else if (fd >= 0) {
-                ::close(fd);
+                close_fd(fd);
             }
         }
     } owned;
 
     try {
-        owned.fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        owned.fd = open_exclusive(path);
         if (owned.fd < 0) {
             return { nullptr, status::io, path + ": " + std::strerror(errno) };
         }
-        owned.stream = fdopen(owned.fd, "w");
+        owned.stream = stream_of(owned.fd);
         if (!owned.stream) {
             const int code = errno;
             return { nullptr, status::io, path + ": " + std::strerror(code) };

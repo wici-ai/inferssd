@@ -8,8 +8,11 @@
 //    (a fixed 512 MiB). It is what the RAM cache was always checked
 //    against, and on a discrete GPU it is the term that binds.
 //  - system: MemAvailable less the floor. On a unified-memory GPU (DGX Spark, Jetson) a device allocation comes out
-//    of the same DRAM without being charged to the cgroup, so only this term sees the GPU tier, the KV cache, the
-//    dense weights and pinned buffers.
+//    of the same DRAM without being charged to the cgroup, so this term sees the GPU tier, the KV cache, the dense
+//    weights and pinned buffers.
+// On a unified-memory GPU the cgroup term also counts the device memory the expert caches hold (device_held: the GPU
+// tier's blocks and buffers) as used, since the cgroup does not charge it: the GPU tier and the RAM cache come out of
+// one envelope, the cgroup's memory.max.
 // floor = file reserve + margin + explicit reserves:
 //  - file reserve (unified memory only): MemAvailable counts the server's own page cache as available, but the
 //    kernel evicts it before it can touch the tier's pinned blocks. Keep the file pages the server holds when the
@@ -110,6 +113,9 @@ struct kimi_host_ledger {
     uint64_t explicit_reserve = 0;
     // The open prefill's file pages (the weight rows its graph gathers), held in both terms until the first decode.
     uint64_t prefill_pages = 0;
+    // Unified memory: device memory the expert caches hold in this DRAM, which the cgroup does not charge. The cgroup
+    // term counts it as used; MemAvailable already leaves it out.
+    uint64_t device_held = 0;
     uint64_t file_reserve = 0, refaults = 0, page_size = 4096, file_updates = 0;
     bool file_measured = false;
     // Host memory make_room has granted so far (callers allocate it right after), for the margin's intervals.
@@ -199,8 +205,8 @@ struct kimi_host_ledger {
         return true;
     }
     // cgroup term: every finite memory.max ancestor must keep the reserve and the open prefill's pages free after
-    // `extra`. Unreadable controller files below the root disable the term (and with it RAM cache admission)
-    // conservatively.
+    // `extra`, the device memory the caches hold on unified memory counted as used beside memory.current. Unreadable
+    // controller files below the root disable the term (and with it RAM cache admission) conservatively.
     void cgroup_term(uint64_t extra, room & r) const {
         if (cgroup.empty()) { return; }
         const size_t root = std::strlen("/sys/fs/cgroup");
@@ -228,6 +234,7 @@ struct kimi_host_ledger {
                     const uint64_t file = add(active, inactive);
                     used -= std::min(used, reclaimable_file ? file : std::min(file, prefill_pages));
                 }
+                used = add(used, device_held);
                 const uint64_t required = add(add(reserve, prefill_pages), extra);
                 uint64_t deficit = 0;
                 if (used >= limit) { deficit = add(used - limit, required); }

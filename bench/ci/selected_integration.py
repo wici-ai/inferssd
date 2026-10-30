@@ -5,14 +5,17 @@ from pathlib import Path
 import time
 
 import run_final
-from ci.compare import comparable, compare_pair
+from ci.compare import BASELINE, SUCCESS, arm_name, comparable, decide_cell, outcome, schedule
 from ci.contract import digest, load, save
 from ci.private_controller import API, source_manifest
 from ci.isolated_device import manifest_read_path
 from ci.selection_lifetime import OBSERVATION_BUDGET_S, ParentWatch
-from ci.selected_receipt import receipt
-from ci import selected_preflight, model_admission, mac_host_gate
-from ci.selection_contract import protected_binding, runtime_requirements, execution_scope
+from ci.selected_receipt import mac_job_root, receipt
+from ci import selected_preflight, model_admission, mac_host_gate, staged_launch
+from ci.impact import fingerprint
+from ci.selection_contract import (PERFORMANCE_MODE, arm_prefix, baseline_build_identity, execution_scope,
+                                   job_sides, protected_binding, runtime_requirements, sealed_history,
+                                   timed_protocol)
 from ci.stage_session import StageSession
 from ci.staged_benchmark import benchmark
 from ci.staged_build import run_build
@@ -44,6 +47,8 @@ def run(args):
         manifest = load(manifest_path)
         (output / "root-manifest.json").write_bytes(manifest_path.read_bytes())
         needs = runtime_requirements(config)
+        history = sealed_history(config)
+        report["baseline_history_sha256"] = fingerprint(history)
         host_policy = mac_host_gate.policy(config) if config["paths"]["platform"] == "darwin" else None
         host_options = {"host_policy": host_policy} if host_policy is not None else {}
         scope = execution_scope(config)
@@ -51,6 +56,8 @@ def run(args):
             report.update(scope)
             if "performance_protocol" in config:
                 report["performance_protocol"] = config["performance_protocol"]
+        # A derived launch is complete only once its side resolved it on the device.
+        derived = staged_launch.derived(config)
         pairs = selected_preflight.declarations(config, manifest, needs)
         admitted = model_admission.enabled(config)
         model_admission.prepare(config, manifest, output)
@@ -76,20 +83,51 @@ def run(args):
             raise ValueError("active broker job differs from root-staged selection")
         model_admission.probe(session, config, manifest, "before", output)
         builds = {}
-        sides = ("base", "candidate") if needs["performance"] else ("candidate",)
+        sides = job_sides(config, needs)
+        offer = config.get("base_build")
+        adopted = opened.get("prebuilt", {}).get("base") if offer is not None else None
+        if offer is None and opened.get("prebuilt"):
+            raise ValueError("broker adopted a cached build that was not offered")
+        if adopted is not None and (adopted.get("key") != offer["key"]
+                                    or adopted.get("manifest_sha256") != offer["freeze_manifest_sha256"]):
+            raise ValueError("broker adopted a cached build other than the offered one")
+        if "base" in sides:
+            report["base_build"] = dict(source="cache" if adopted is not None else "built", offered=offer,
+                                        refused=opened.get("prebuilt_refused", {}).get("base"))
+        # The candidate always builds; the base reuses its verified cached build when offered.
+        machine = None
         for side in sides:
             spec = config["sides"][side]
-            alias = spec.get("alias")
-            if alias:
-                target = output / (side + "-alias")
-                target.mkdir()
-                stage = session.start(side + "-alias", "build", alias["argv"], alias.get("environment", {}), alias["cwd"], alias["timeout_s"])
-                completed = session.wait(stage, deadline=time.monotonic() + alias["timeout_s"])
-                save(target / "stage.json", completed)
-                collect_log(session, stage, target)
-                if completed.get("returncode") != 0 or completed.get("cleanup_confirmed") is not True:
-                    raise RuntimeError("sandboxed alias preparation failed")
-            builds[side] = run_build(session, side, spec["build"], spec["paths"], output / ("build-" + side), spec["revision"])
+            if side == "base" and adopted is not None:
+                builds[side] = run_build(session, side, spec["build"], spec["paths"], output / ("build-" + side),
+                                         spec["revision"], adopted=adopted)
+            else:
+                alias = spec.get("alias")
+                if alias:
+                    target = output / (side + "-alias")
+                    target.mkdir()
+                    stage = session.start(side + "-alias", "build", alias["argv"], alias.get("environment", {}), alias["cwd"], alias["timeout_s"])
+                    completed = session.wait(stage, deadline=time.monotonic() + alias["timeout_s"])
+                    save(target / "stage.json", completed)
+                    collect_log(session, stage, target)
+                    if completed.get("returncode") != 0 or completed.get("cleanup_confirmed") is not True:
+                        raise RuntimeError("sandboxed alias preparation failed")
+                builds[side] = run_build(session, side, spec["build"], spec["paths"], output / ("build-" + side), spec["revision"])
+            if derived:
+                # A baseline job profiles the machine once with the commit it
+                # measures. A PR job takes the sealed file of its device's most
+                # recent baseline job instead. Each side then resolves its own
+                # launches from that one characteristics file.
+                if machine is None:
+                    machine = (staged_launch.adopt(config) if staged_launch.sealed(config) is not None else
+                               staged_launch.profile(session, config, side, needs["models"], output / "machine"))
+                    report["machine_profile"] = machine
+                for model in staged_launch.launch_models(config, needs, side):
+                    resolved = staged_launch.resolve(session, config, side, model, machine,
+                                                     output / "launch" / (side + "-" + model))
+                    staged_launch.fill(config, side, model, resolved, staged_launch.tiers(needs, model))
+        if derived:
+            pairs = selected_preflight.declarations(config, manifest, needs)
         if len(builds) == 2 and builds["base"]["toolchain"] != builds["candidate"]["toolchain"]:
             raise ValueError("actual compiler paths differ between compared arms")
         numeric = selected_numerical(session, config["numerical"], builds["candidate"], needs["numerical"], output / "numerical")
@@ -118,41 +156,48 @@ def run(args):
                 cells[model]["runtime_receipt_sha256"] = digest(folder / "runtime-receipt.json")
         preflight = selected_preflight.run(session, config, manifest, pairs, builds, functional, output)
         report["performance_preflight_sha256"] = digest(output / "performance-preflight.json")
-        inconclusive = False
+        protocol = timed_protocol(config)
+        job_root = mac_job_root(config["manifest_path"]) if config["paths"]["platform"] == "darwin" else None
         for model in needs["models"]:
             cell = cells[model]
             report["cells"].append(cell)
             for tier in needs["performance"].get(model, {}).get("tiers", []):
+                # Every planned run executes once in the fixed order and is kept.
+                # A slower or different result is a retained outcome, never a
+                # reason to retry a run or drop it from the cell.
                 measurements, receipts, host_states = {}, {}, {}
-                for side in ("base", "candidate"):
+                for index, side in schedule(protocol["order"]):
                     spec = config["sides"][side]["models"][model]["benchmarks"][tier]
-                    launch = dict(spec, model=model, revision=plan[side], tier=tier, stage_prefix=side + "-" + model)
+                    launch = dict(selected_preflight.arm_launch(
+                        spec, side, index, required=config.get("validation_mode") == PERFORMANCE_MODE,
+                        job_root=job_root), model=model, revision=plan[side], tier=tier,
+                        stage_prefix=arm_prefix(side, model, index), run=index)
                     if launch["argv"][0] != builds[side]["binary"]["runtime_path"]:
                         raise ValueError("performance executable differs from sealed side")
-                    folder = output / model / tier / side
+                    folder = output / model / tier / ("r" + str(index)) / side
                     measured = benchmark(session, side, launch, folder, **host_options)
                     if measured["status"] != "passed" or measured["cleanup_confirmed"] is not True:
-                        raise RuntimeError("selected single benchmark arm failed; no retry")
-                    measurements[side] = run_final.read_result(folder / "result.json", tier, spec["request_timeout_s"])
-                    receipts[side] = receipt(config, manifest, side, model, launch, builds[side], folder)
+                        raise RuntimeError("selected timed run failed; no retry")
+                    measurements[index, side] = run_final.read_result(folder / "result.json", tier, spec["request_timeout_s"])
+                    receipts[index, side] = receipt(config, manifest, side, model, launch, builds[side], folder)
                     if host_policy is not None:
-                        host_states[side] = mac_host_gate.retained_arm(folder, host_policy)
-                    if comparable(receipts[side]) != comparable(preflight[model, tier, side]):
+                        host_states[index, side] = mac_host_gate.retained_arm(folder, host_policy)
+                    if comparable(receipts[index, side]) != comparable(preflight[model, tier, side]):
                         raise ValueError("timed runtime differs from its successful short preflight")
-                compared = compare_pair(measurements["base"], measurements["candidate"], receipts["base"], receipts["candidate"], config["policy"])
-                if host_policy is not None:
-                    compared = mac_host_gate.pair(compared, host_states["base"], host_states["candidate"])
-                save(output / model / tier / "comparison.json", compared)
-                cell["performance"].append(dict(tier=tier, **compared))
-                if compared["passed"] is not True:
-                    # A measured slowdown/output-workload disagreement is a
-                    # retained outcome, not a reason to retry or erase metrics.
-                    # Finish the other already selected single-shot pairs.
-                    inconclusive = True
+                environment = (mac_host_gate.cell({arm_name(*key): value for key, value in host_states.items()})
+                               if host_policy is not None else None)
+                decision = decide_cell(measurements, receipts, config["policy"], protocol=protocol, history=history,
+                                       environment=environment,
+                                       cell=dict(device=device, model=model, tier=tier, job_id=args.job_id,
+                                                 base=plan["base"], candidate=plan["candidate"]))
+                if protocol["purpose"] == BASELINE:
+                    decision["build"] = baseline_build_identity(config, builds["candidate"])
+                save(output / model / tier / "comparison.json", decision)
+                cell["performance"].append(dict(tier=tier, **decision))
         model_admission.probe(session, config, manifest, "after", output)
         if watch is not None:
             watch.check()
-        report["status"] = "inconclusive" if inconclusive else "passed"
+        report["status"] = outcome([item for cell in report["cells"] for item in cell["performance"]])
     except Exception as error:
         report["error"] = f"{type(error).__name__}: {error}"
     finally:
@@ -182,4 +227,4 @@ def run(args):
         save(output / "evidence-manifest.json", dict(schema_version=1, files=files))
         report["evidence_manifest_sha256"] = digest(output / "evidence-manifest.json")
         save(output / "integration.json", report)
-    return 0 if report["status"] == "passed" else 1
+    return 0 if report["status"] in SUCCESS else 1

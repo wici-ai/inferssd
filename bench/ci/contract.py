@@ -1,5 +1,6 @@
 """Strict CI identities and classifications. No device connections or defaults."""
 
+import datetime
 import hashlib
 import json
 import math
@@ -10,6 +11,15 @@ DEVICES = ("cloud-5090", "dgx-spark", "local-mbp")
 MODELS = ("deepseek", "muse")
 SHA = re.compile(r"[0-9a-f]{40}")
 HASH = re.compile(r"[0-9a-f]{64}")
+JOB_ID = re.compile(r"[0-9a-f]{32}")
+PERFORMANCE_METRICS = (
+    "decode_first128_tps", "decode_second128_tps", "decode_tps", "ttft_s",
+    "server_prefill_tps",
+)
+HISTORY_MODE = "baseline-history"
+HISTORY_RUNS = 4  # timed runs of one main commit in a baseline job
+HISTORY_TIERS = ("512", "4096")
+MEASURED_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 
 
 def load(path):
@@ -80,19 +90,7 @@ def policy_read(value):
             or value.get("staging_prefix") != "device-ci/approved/"
             or value.get("upstream_workflow") != ".github/workflows/ci.yml"):
         raise ValueError("physical CI requires the separate protected private controller policy")
-    thresholds = value["thresholds"]
-    if (thresholds.get("provisional") is not True
-            or thresholds.get("mode") != "observed-no-slowdown"
-            or thresholds.get("slowdown_outcome") != "inconclusive"):
-        raise ValueError("n=1 policy must block observed slowdown as inconclusive")
-    for key in ("decode_regression_fraction", "ttft_regression_fraction", "prefill_regression_fraction"):
-        number = thresholds.get(key)
-        if (
-            type(number) not in (int, float)
-            or not math.isfinite(number)
-            or number != 0
-        ):
-            raise ValueError("no permitted regression fraction: " + key)
+    noise_thresholds(value.get("thresholds"))
     for name in (
         "extended_prefixes",
         "extended_names",
@@ -106,6 +104,69 @@ def policy_read(value):
             or any(not isinstance(item, str) or not item for item in value[name])
         ):
             raise ValueError("policy requires explicit nonempty " + name)
+    return value
+
+
+def finite(value, *, minimum=0.0, inclusive=True, below=None):
+    return (type(value) in (int, float) and math.isfinite(value)
+            and (value >= minimum if inclusive else value > minimum)
+            and (below is None or value < below))
+
+
+def noise_thresholds(value):
+    """Fixed decision constants. Baseline history is separate operator data, and
+    the threshold multiplier is a fixed Student-t quantile in compare.py."""
+    if not isinstance(value, dict) or set(value) != {"mode", "floor_fraction"} or value["mode"] != HISTORY_MODE:
+        raise ValueError("performance thresholds must use the baseline-history mode")
+    floors = value["floor_fraction"]
+    if (not isinstance(floors, dict) or set(floors) != set(PERFORMANCE_METRICS)
+            or not all(finite(floors[metric], below=1) for metric in PERFORMANCE_METRICS)):
+        raise ValueError("per-metric floors must be explicit and finite")
+    return value
+
+
+def history_record(value):
+    """Schema of one verified baseline record: four runs of one main commit on one device."""
+    fields = {"schema_version", "purpose", "device", "model", "tier", "commit", "conditions_sha256",
+              "characteristics_sha256", "runs", "measurement_identity", "build", "job_id", "run_id",
+              "run_attempt", "measured_at"}
+    if (not isinstance(value, dict) or set(value) != fields or value["schema_version"] != 1
+            or value["purpose"] != "baseline-history"):
+        raise ValueError("baseline record requires exactly " + ", ".join(sorted(fields)))
+    if (value["device"] not in DEVICES or value["model"] not in MODELS or value["tier"] not in HISTORY_TIERS
+            or not isinstance(value["commit"], str) or SHA.fullmatch(value["commit"]) is None
+            or not isinstance(value["conditions_sha256"], str) or HASH.fullmatch(value["conditions_sha256"]) is None
+            or not isinstance(value["characteristics_sha256"], str)
+            or HASH.fullmatch(value["characteristics_sha256"]) is None
+            or not isinstance(value["job_id"], str) or JOB_ID.fullmatch(value["job_id"]) is None
+            or type(value["run_id"]) is not int or value["run_id"] <= 0
+            or type(value["run_attempt"]) is not int or value["run_attempt"] != 1
+            or not isinstance(value["measured_at"], str) or MEASURED_AT.fullmatch(value["measured_at"]) is None):
+        raise ValueError("baseline record identity is invalid")
+    datetime.datetime.strptime(value["measured_at"], "%Y-%m-%dT%H:%M:%SZ")
+    identity = value["measurement_identity"]
+    if (not isinstance(identity, dict) or identity.get("conditions_sha256") != value["conditions_sha256"]
+            or identity.get("output_tokens") != 256):
+        raise ValueError("baseline record measurement identity differs")
+    build = value["build"]
+    if (not isinstance(build, dict) or set(build) != {"freeze_manifest_sha256", "binary_sha256", "cache_key",
+                                                       "build_config_sha256", "toolchain"}
+            or any(not isinstance(build[key], str) or HASH.fullmatch(build[key]) is None
+                   for key in ("freeze_manifest_sha256", "binary_sha256", "cache_key", "build_config_sha256"))
+            or not isinstance(build["toolchain"], dict) or not build["toolchain"]):
+        raise ValueError("baseline record build identity is invalid")
+    runs = value["runs"]
+    if not isinstance(runs, list) or len(runs) != HISTORY_RUNS:
+        raise ValueError("baseline record requires exactly four runs")
+    for run in runs:
+        if (not isinstance(run, dict) or set(run) != {"metrics", "logs", "tokens_sha256"}
+                or not isinstance(run["metrics"], dict) or set(run["metrics"]) != set(PERFORMANCE_METRICS)
+                or not isinstance(run["logs"], dict) or set(run["logs"]) != set(PERFORMANCE_METRICS)
+                or not all(finite(run["metrics"][metric], inclusive=False) for metric in PERFORMANCE_METRICS)
+                or not all(type(run["logs"][metric]) is float and math.isfinite(run["logs"][metric])
+                           for metric in PERFORMANCE_METRICS)
+                or not isinstance(run["tokens_sha256"], str) or HASH.fullmatch(run["tokens_sha256"]) is None):
+            raise ValueError("baseline record run values are invalid")
     return value
 
 

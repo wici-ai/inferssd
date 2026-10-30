@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import shutil
 import stat
 import subprocess
 import threading
@@ -434,6 +435,90 @@ def freeze_tree(source, destination, max_bytes):
     return {'files': records, 'bytes': total, 'manifest_sha256': hashlib.sha256(encoded).hexdigest()}
 
 
+CACHE_KEY = re.compile(r'[0-9a-f]{64}\Z')
+CACHE_KEEP = 3  # cached base builds kept per device (most recently stored or used)
+
+
+def records_sha256(records):
+    return hashlib.sha256(json.dumps(records, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def copy_sealed_tree(source, destination, records, max_bytes):
+    """Copy a tree described by freeze records, re-hashing every byte.
+
+    Alias rows become hard links to their canonical copy, as freeze_tree made
+    them. Any missing, changed, special or extra-large file refuses the copy.
+    """
+    source, destination = Path(source), Path(destination)
+    if not isinstance(records, list) or len(records) > 100000:
+        raise ValueError('invalid sealed tree records')
+    destination.mkdir(mode=0o755)
+    total, copied = 0, {}
+    for row in records:
+        if not isinstance(row.get('path'), str) or '\0' in row['path'] or row['path'] != str(Path(row['path'])):
+            raise ValueError('unsafe sealed tree path')
+        relative = Path(row['path'])
+        if (relative.is_absolute() or not relative.parts
+                or any(len(part) > 255 or part in ('.', '..') for part in relative.parts)):
+            raise ValueError('unsafe sealed tree path')
+        target = destination / relative
+        for parent in reversed(list(relative.parents)[:-1]):  # Path.parents slices need Python 3.10
+            folder = destination / parent
+            if not folder.exists():
+                folder.mkdir(mode=0o755)
+        if 'alias_of' in row:
+            canonical = copied.get(row['alias_of'])
+            if canonical is None or canonical != (row['size'], row['sha256']):
+                raise ValueError('sealed tree alias does not name an earlier identical file')
+            os.link(destination / row['alias_of'], target)
+            total += row['size']  # counted per path, as freeze_tree does
+            continue
+        descriptor = os.open(source / relative, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as stream:
+            opened = os.fstat(stream.fileno())
+            if not stat.S_ISREG(opened.st_mode) or opened.st_size != row['size']:
+                raise ValueError('cached build file differs from its sealed record')
+            total += opened.st_size
+            if total > max_bytes:
+                raise ValueError('cached build exceeds the frozen output bound')
+            sha = hashlib.sha256()
+            with target.open('xb') as writer:
+                while block := stream.read(1024 * 1024):
+                    sha.update(block)
+                    writer.write(block)
+                writer.flush()
+                os.fsync(writer.fileno())
+        if sha.hexdigest() != row['sha256']:
+            raise ValueError('cached build file hash differs from its sealed record')
+        target.chmod(0o555 if opened.st_mode & 0o111 else 0o444)
+        copied[row['path']] = (row['size'], row['sha256'])
+    for directory, _, _ in os.walk(destination, topdown=False):
+        Path(directory).chmod(0o555)
+    return {'files': records, 'bytes': total, 'manifest_sha256': records_sha256(records)}
+
+
+def cache_root(config):
+    root = Path(config['state_root']) / 'build-cache'
+    if not root.exists():
+        root.mkdir(mode=0o700)
+    return protected(root, directory=True)
+
+
+def prune_cache(root, keep=CACHE_KEEP, protect=()):
+    """Keep the `keep` most recently stored or used entries; drop unfinished stores.
+
+    One job holds the device lease at a time, so no other store is in progress.
+    """
+    entries = sorted((entry for entry in root.iterdir() if CACHE_KEY.fullmatch(entry.name)),
+                     key=lambda entry: entry.stat().st_mtime_ns, reverse=True)
+    unfinished = [entry for entry in root.iterdir() if re.fullmatch(r'\.[0-9a-f]{64}-[0-9a-f]{32}', entry.name)]
+    for entry in [*entries[keep:], *unfinished]:
+        if entry.name not in protect:
+            for directory, _, _ in os.walk(entry):
+                Path(directory).chmod(0o700)
+            shutil.rmtree(entry)
+
+
 class JobSession:
     def __init__(self, config, job_id):
         if os.geteuid() != 0 or not JOB.fullmatch(job_id):
@@ -467,9 +552,81 @@ class JobSession:
             (self.root / 'stages').chmod(0o711)
             (self.root / 'frozen').mkdir(mode=0o755)
             (self.root / 'frozen').chmod(0o755)
+            self.prebuilt, self.prebuilt_refused = {}, {}
+            self.adopt_cached_builds()
         except BaseException:
             self.lease.__exit__()
             raise
+
+    def adopt_cached_builds(self):
+        """Offer a verified cached build to a side before any stage runs.
+
+        The manifest names the cache key and the sealed manifest hash. The tree
+        is re-hashed while it is copied into this job's frozen side, exactly as
+        a freeze would leave it. Any problem leaves the side unfrozen, so the
+        controller builds it normally; nothing from the cache is mounted.
+        """
+        offers = self.manifest.get('prebuilt_offer', {})
+        if (not isinstance(offers, dict) or not set(offers) <= set(self.manifest['builds'])
+                or any(not isinstance(offer, dict) or set(offer) != {'key', 'manifest_sha256'}
+                       or not all(isinstance(offer[name], str) and CACHE_KEY.fullmatch(offer[name]) for name in offer)
+                       for offer in offers.values())):
+            raise ValueError('invalid cached build offer')
+        for side, offer in offers.items():
+            destination = self.root / 'frozen' / side
+            try:
+                entry = cache_root(self.config) / offer['key']
+                stored = json.loads(protected(entry / 'manifest.json').read_text())
+                if (stored.get('key') != offer['key'] or stored.get('manifest_sha256') != offer['manifest_sha256']
+                        or records_sha256(stored.get('files')) != offer['manifest_sha256']):
+                    raise ValueError('cached build manifest differs from the offer')
+                result = copy_sealed_tree(protected(entry / 'tree', directory=True), destination, stored['files'],
+                                          self.config.get('build_max_bytes', 32 * 1024**3))
+                manifest_path = self.root / ('frozen-' + side + '.json')
+                save(manifest_path, result)
+                manifest_path.chmod(0o444)
+                os.utime(entry)
+            except Exception as error:
+                if destination.exists():
+                    for directory, _, _ in os.walk(destination):
+                        Path(directory).chmod(0o700)
+                    shutil.rmtree(destination)
+                self.prebuilt_refused[side] = type(error).__name__ + ': ' + str(error)
+                continue
+            self.frozen[side] = result
+            self.prebuilt[side] = {'side': side, 'path': '/build/' + side, 'host_path': str(destination),
+                                   'manifest_path': str(manifest_path), 'manifest_sha256': result['manifest_sha256'],
+                                   'bytes': result['bytes'], 'files': len(result['files']), 'lease': self.lease.identity,
+                                   'key': offer['key']}
+
+    def store_cached_build(self, side, result):
+        """Keep a baseline job's frozen build for later jobs; never fails the job."""
+        key = self.manifest.get('cache_as', {}).get(side)
+        if key is None:
+            return {'status': 'not-requested'}
+        try:
+            if not isinstance(key, str) or not CACHE_KEY.fullmatch(key):
+                raise ValueError('invalid cache key')
+            root = cache_root(self.config)
+            entry = root / key
+            if entry.exists():
+                stored = json.loads(protected(entry / 'manifest.json').read_text())
+                status = 'present' if stored.get('manifest_sha256') == result['manifest_sha256'] else 'conflict'
+            else:
+                staging = root / ('.' + key + '-' + uuid.uuid4().hex)
+                staging.mkdir(mode=0o700)
+                copy_sealed_tree(self.root / 'frozen' / side, staging / 'tree', result['files'],
+                                 self.config.get('build_max_bytes', 32 * 1024**3))
+                save(staging / 'manifest.json', {'key': key, 'manifest_sha256': result['manifest_sha256'],
+                                                 'files': result['files'], 'job_id': self.job_id})
+                (staging / 'manifest.json').chmod(0o444)
+                staging.chmod(0o555)
+                staging.rename(entry)
+                status = 'stored'
+            prune_cache(root, protect=(key,))
+            return {'status': status, 'key': key}
+        except Exception as error:
+            return {'status': 'failed', 'key': key, 'error': type(error).__name__ + ': ' + str(error)}
 
     def request(self, value):
         if self.closed or self.cancel.is_set() or value.get('schema_version') != 1 or value.get('job_id') != self.job_id:
@@ -481,7 +638,8 @@ class JobSession:
             if set(value) != {'schema_version', 'operation', 'job_id'}:
                 raise ValueError('unknown job.open field')
             return {'job_id': self.job_id, 'manifest_sha256': self.manifest_sha256,
-                    'lease': self.lease.identity, 'opened': True}
+                    'lease': self.lease.identity, 'opened': True,
+                    'prebuilt': self.prebuilt, 'prebuilt_refused': self.prebuilt_refused}
         if operation == 'job.finish':
             if set(value) != {'schema_version', 'operation', 'job_id'}:
                 raise ValueError('unknown finish field')
@@ -558,7 +716,8 @@ class JobSession:
             self.frozen[side] = result
             return {'side': side, 'path': '/build/' + side, 'manifest_sha256': result['manifest_sha256'],
                     'host_path': str(self.root / 'frozen' / side), 'manifest_path': str(manifest_path),
-                    'bytes': result['bytes'], 'files': len(result['files']), 'lease': self.lease.identity}
+                    'bytes': result['bytes'], 'files': len(result['files']), 'lease': self.lease.identity,
+                    'cache': self.store_cached_build(side, result)}
         raise AssertionError('unreachable operation')
 
     def close(self):

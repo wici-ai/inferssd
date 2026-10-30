@@ -50,11 +50,6 @@ static void ggml_compute_forward_mul_mat_id_common_kimi(
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
 
-    const void ** fallback_pack_mmap_ptrs =
-        incr_ptr_aligned(&wdata_cur, n_as*sizeof(void *), sizeof(void *));
-
-    (void) incr_ptr_aligned(&wdata_cur, n_as*sizeof(uint64_t), sizeof(uint64_t)); // preserve the existing scratch layout
-
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
     if (src1->type != vec_dot_type) {
@@ -124,14 +119,6 @@ static void ggml_compute_forward_mul_mat_id_common_kimi(
 
     ggml_barrier(params->threadpool);
 
-    {
-        if (ith == 0) {
-            memset(fallback_pack_mmap_ptrs, 0, (size_t) n_as * sizeof(void *));
-
-        }
-        ggml_barrier(params->threadpool);
-    }
-
     const int64_t * cpu_row_counts = matrix_row_counts;
     const struct mmid_row_mapping * cpu_matrix_rows =
         matrix_rows;
@@ -143,9 +130,7 @@ static void ggml_compute_forward_mul_mat_id_common_kimi(
             continue;
         }
 
-        const char * src0_cur = fallback_pack_mmap_ptrs[cur_a] ?
-            (const char *) fallback_pack_mmap_ptrs[cur_a] :
-            (const char *) src0->data + cur_a * nb02;
+        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 

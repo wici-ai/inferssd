@@ -9,14 +9,37 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci import selected_integration as execution, selected_preflight as preflight
+from ci.compare import METRICS, conditions_digest, history_conditions
 from ci.contract import digest, load, save
 from ci.selection_contract import linux_stages
 from test_ci_selection import impact, plan, template, POLICY
 from test_ci_staged_benchmark import CONFIG
+from test_ci_performance_series import sealed
 
 
-def setup(tmp_path, monkeypatch, *, change=None, fault=None, paths=None):
-    value = plan(paths or ["engine/src/ssd/model-adapter.cpp"])
+def synthetic_receipt(model, side, spec, output, fault=None):
+    typed = {"placement.vram_experts": 32}
+    if model == "muse" and side == "candidate" and fault == "typed-mismatch":
+        typed["placement.vram_experts"] = 0
+    if fault == "timed-drift" and (output / "result.json").exists():
+        typed["placement.vram_experts"] = 0
+    # Every server, short or timed, is a distinct process.
+    result = dict(model_identity=dict(model=model),
+        server=dict(pid=1 if side == "base" else 2, start_identity=str(output)),
+        build=dict(loaded_libraries=[dict(path="/build/" + side + "/libggml-cuda.so", sha256=side)]),
+        host=dict(hardware="synthetic", os="synthetic", memory_budget_bytes=1,
+            os_page_cache_treatment=spec["os_page_cache_treatment"],
+            effective_settings=dict(native_launch_policy=dict(typed_values=typed, template_sha256="c" * 64),
+                                    native_resource_policy=dict(memory_budget_bytes=1, max_processes=1,
+                                                                host_reserve_bytes=1))))
+    if model == "muse" and side == "candidate":
+        if fault == "resource-mismatch": result["host"]["memory_budget_bytes"] = 2
+        if fault == "image-mismatch": result["build"]["loaded_libraries"][0]["path"] = "/unexpected/libggml-cpu.so"
+    return result
+
+
+def setup(tmp_path, monkeypatch, *, change=None, fault=None, paths=None, value=None):
+    value = value or plan(paths or ["engine/src/ssd/model-adapter.cpp"])
     config = template(value)
     needs = impact.device_requirements(value, config["device"])
     manifest_path = tmp_path / "manifest.json"
@@ -32,11 +55,18 @@ def setup(tmp_path, monkeypatch, *, change=None, fault=None, paths=None):
                 for tier in needs["performance"][model]["tiers"]}
     if change:
         change(config)
+    # Operator-sealed baseline history of the base, measured under exactly these synthetic conditions.
+    config["baseline_history"] = sealed({
+        (config["device"], model, tier): conditions_digest(history_conditions(synthetic_receipt(
+            model, "base", dict({"os_page_cache_treatment": ""}, **config["sides"]["base"]["models"][model]["benchmarks"][tier]),
+            tmp_path)))
+        for model in needs["models"] for tier in config["sides"]["base"]["models"][model]["benchmarks"]},
+        commit=value["base"], base={metric: 1.0 for metric in METRICS})
     manifest = dict(stages=linux_stages(config, needs, ("base", "candidate")))
     save(manifest_path, manifest)
     config_path = tmp_path / "config.json"
     save(config_path, config)
-    events, sessions = [], []
+    events, sessions, clock = [], [], [0]
 
     class Session:
         closed = False
@@ -65,33 +95,23 @@ def setup(tmp_path, monkeypatch, *, change=None, fault=None, paths=None):
 
     def receipt(config, manifest, side, model, spec, build, output, *, destination=None):
         events.append(("receipt", model, side, "timed" if "result.json" in {p.name for p in output.iterdir()} else "short"))
-        typed = {"placement.vram_experts": 32}
-        if model == "muse" and side == "candidate" and fault == "typed-mismatch":
-            typed["placement.vram_experts"] = 0
-        if fault == "timed-drift" and (output / "result.json").exists():
-            typed["placement.vram_experts"] = 0
-        result = dict(model_identity=dict(model=model),
-            server=dict(pid=1 if side == "base" else 2, start_identity=side),
-            build=dict(loaded_libraries=[dict(path="/build/" + side + "/libggml-cuda.so", sha256=side)]),
-            host=dict(hardware="synthetic", os="synthetic", memory_budget_bytes=1,
-                os_page_cache_treatment=spec["os_page_cache_treatment"],
-                effective_settings=dict(native_launch_policy=dict(typed_values=typed),
-                                        actual_resource_policy=dict(memory_max=1))))
-        if model == "muse" and side == "candidate":
-            if fault == "resource-mismatch": result["host"]["memory_budget_bytes"] = 2
-            if fault == "image-mismatch": result["build"]["loaded_libraries"][0]["path"] = "/unexpected/libggml-cpu.so"
-            if fault == "receipt-failure": raise ValueError("retained synthetic native snapshot refusal")
+        if model == "muse" and side == "candidate" and fault == "receipt-failure":
+            raise ValueError("retained synthetic native snapshot refusal")
+        result = synthetic_receipt(model, side, spec, output, fault)
         save(destination if destination is not None else output / "comparison-receipt.json", result)
         return result
 
     def benchmark(session, side, spec, output):
         events.append(("timed", spec["model"], side))
+        stages.append(spec["stage_prefix"] + "-benchmark-" + spec["tier"])
         assert load(args.output / "performance-preflight.json")["status"] == "passed"
         output.mkdir(parents=True, exist_ok=False)
+        start = clock[0] + 1
+        clock[0] = start + 10
         measured = dict(metrics=dict(decode_first128_tps=1, decode_second128_tps=1,
             decode_tps=1, ttft_s=1, server_prefill_tps=1),
             input_tokens=1, timings=dict(prompt_n=1, prompt_ms=1000), prompt_ids=[1], prompt_sha256="a" * 64,
-            output_tokens=256, tokens=[11] * 256)
+            output_tokens=256, tokens=[11] * 256, start_ns=start, end_ns=clock[0])
         save(output / "result.json", measured)
         return dict(status="passed", cleanup_confirmed=True, completion_requests=1)
 
@@ -100,8 +120,9 @@ def setup(tmp_path, monkeypatch, *, change=None, fault=None, paths=None):
     real_digest = execution.digest
     monkeypatch.setattr(execution, "digest", lambda p: "e" * 64 if Path(p).name == "control-source.json" else real_digest(p))
     monkeypatch.setattr(execution, "StageSession", Session)
-    monkeypatch.setattr(execution, "run_build", lambda session, side, *args:
-        dict(binary=dict(runtime_path="/build/" + side + "/bin/llama-server"), toolchain={}))
+    monkeypatch.setattr(execution, "run_build", lambda session, side, *args, **kwargs:
+        dict(binary=dict(runtime_path="/build/" + side + "/bin/llama-server", sha256="2" * 64),
+             freeze=dict(manifest_sha256="1" * 64), toolchain={"CMAKE_CXX_COMPILER": "/usr/bin/c++"}))
     monkeypatch.setattr(execution, "selected_numerical", lambda session, config, build, cases, output:
         {case: dict(status="passed") for case in cases})
     monkeypatch.setattr(execution, "smoke", smoke)
@@ -110,8 +131,9 @@ def setup(tmp_path, monkeypatch, *, change=None, fault=None, paths=None):
     monkeypatch.setattr(execution, "receipt", receipt)
     monkeypatch.setattr(execution, "benchmark", benchmark)
     monkeypatch.setattr(execution.run_final, "read_result", lambda path, *args: load(path))
+    stages = []
     args = SimpleNamespace(output=tmp_path / "out", config=config_path, config_sha256=digest(config_path),
-        selection_plan_sha256=impact.fingerprint(value), job_id="f" * 32, socket="/unused")
+        selection_plan_sha256=impact.fingerprint(value), job_id="f" * 32, socket="/unused", stages=stages)
     return args, config, manifest, needs, events, sessions
 
 
@@ -122,7 +144,9 @@ def test_every_cell_is_checked_before_first_timing_and_identical_functional_is_r
     assert len([e for e in events[:timed] if e[0] == "receipt"]) == 4
     assert [e[1] for e in events if e[0] == "smoke"] == ["candidate-smoke-deepseek", "candidate-smoke-muse",
         "base-deepseek-preflight-512", "base-muse-preflight-512"]
-    assert len([e for e in events if e[0] == "timed"]) == 4
+    # Per model: candidate, base, candidate, candidate, each with its own exact stage.
+    assert args.stages == [side + "-" + model + "-r" + run + "-benchmark-512" for model in ("deepseek", "muse")
+                           for run, side in (("1", "candidate"), ("1", "base"), ("2", "candidate"), ("3", "candidate"))]
     assert len(sessions) == 1 and sessions[0].closed and events[-1] == ("finish",)
     assert set(preflight.retained(args.output, config, needs)) == {
         (model, "512", side) for model in needs["models"] for side in ("base", "candidate")}
@@ -155,7 +179,7 @@ def test_every_selected_tier_is_preflighted_before_any_timing(tmp_path, monkeypa
     timed = next(i for i, event in enumerate(events) if event[0] == "timed")
     assert len([e for e in events[:timed] if e[0] == "receipt"]) == 4
     assert ("smoke", "base-deepseek-preflight-4096") in events[:timed]
-    assert len([e for e in events if e[0] == "timed"]) == 4
+    assert len([e for e in events if e[0] == "timed"]) == 8
     assert set(preflight.retained(args.output, config, needs)) == {
         ("deepseek", tier, side) for tier in ("512", "4096") for side in ("base", "candidate")}
 
@@ -169,7 +193,8 @@ def test_missing_declaration_refuses_before_session(tmp_path, monkeypatch, missi
     assert "explicit performance launch field" in load(args.output / "integration.json")["error"]
 
 
-@pytest.mark.parametrize("stage", ["base-muse-preflight-512", "candidate-smoke-muse"])
+@pytest.mark.parametrize("stage", ["base-muse-preflight-512", "candidate-smoke-muse", "base-muse-r1-benchmark-512",
+                                   "candidate-muse-r3-benchmark-512"])
 def test_missing_exact_stage_authorization_refuses_before_session(tmp_path, monkeypatch, stage):
     args, config, manifest, needs, events, sessions = setup(tmp_path, monkeypatch)
     del manifest["stages"][stage]
@@ -182,7 +207,7 @@ def test_missing_exact_stage_authorization_refuses_before_session(tmp_path, monk
 def test_timed_runtime_drift_stops_after_one_arm_without_retry(tmp_path, monkeypatch):
     args, config, manifest, needs, events, sessions = setup(tmp_path, monkeypatch, fault="timed-drift")
     assert execution.run(args) == 1
-    assert [e for e in events if e[0] == "timed"] == [("timed", "deepseek", "base")]
+    assert [e for e in events if e[0] == "timed"] == [("timed", "deepseek", "candidate")]
     assert "differs from its successful short preflight" in load(args.output / "integration.json")["error"]
 
 

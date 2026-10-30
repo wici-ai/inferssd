@@ -1,5 +1,6 @@
 """Check every selected pair's actual short runtime before any timed request."""
 
+import json
 from pathlib import Path, PurePosixPath
 import time
 
@@ -7,7 +8,7 @@ import final_chat
 from ci.compare import comparable
 from ci.contract import digest, load, save
 from ci import mac_host_gate
-from ci.selection_contract import linux_stages, PERFORMANCE_MODE
+from ci.selection_contract import arm_prefix, linux_stages, PERFORMANCE_MODE, run_count, timed_protocol, timed_sides
 from ci.staged_benchmark import verify_stopped
 from ci.staged_smoke import smoke
 from ci.selected_receipt import receipt, mac_job_root
@@ -61,28 +62,84 @@ def launch(spec, side, *, required=False, job_root=None):
     return dict(spec, argv=list(short))
 
 
+TELEMETRY = "--ssd-telemetry"
+
+
+def arm_launch(spec, side, run, *, required=False, job_root=None, functional=None):
+    """Derive one timed run's launch from the single reviewed timed argv.
+
+    Every run is a fresh server, and native telemetry uses O_EXCL, so each run
+    gets its own event file: `<timed name>-r<run>.jsonl` next to the reviewed
+    path. Nothing else differs between runs, and the timed argv must still match
+    its short preflight exactly apart from the telemetry file.
+    """
+    if type(run) is not int or run < 1:
+        raise ValueError("explicit timed run index required")
+    short = launch(spec, side, required=required, job_root=job_root)
+    argv = list(spec["argv"])
+    if TELEMETRY not in argv:
+        return dict(spec, argv=argv)
+    prefix = (job_root + "/work/" + side + "/") if job_root is not None else "/scratch/" + side + "/"
+    index = argv.index(TELEMETRY)
+    path = argv[index + 1] if argv.count(TELEMETRY) == 1 and index + 1 < len(argv) else ""
+    if (not path.startswith(prefix) or not path.endswith(".jsonl")
+            or str(PurePosixPath(path)) != path or any(part in (".", "..") for part in path.split("/"))):
+        raise ValueError("timed telemetry must be one canonical file in its side scratch directory")
+    argv[index + 1] = path[:-len(".jsonl")] + "-r" + str(run) + ".jsonl"
+    others = [short["argv"], *([functional["argv"]] if functional is not None else [])]
+    if argv[index + 1] in {other[i + 1] for other in others for i, arg in enumerate(other[:-1]) if arg == TELEMETRY}:
+        raise ValueError("timed arm telemetry collides with another server's event file")
+    return dict(spec, argv=argv)
+
+
 def same_launch(functional, performance):
     return all(functional[key] == performance[key] for key in LAUNCH)
 
 
 def declarations(config, manifest, needs):
-    """Require complete, authorized short launches before opening the lease."""
+    """Require complete, authorized short launches before opening the lease.
+
+    A launch derived on the device has no argv or port until its side resolved
+    it. Before that only its other fields are checked, and argv must be absent;
+    the job checks the complete launches again once they are resolved, before
+    the first short request.
+    """
     result = []
     platform = config["paths"]["platform"]
     expected = linux_stages(config, needs, ("base", "candidate")) if platform == "linux" else None
+    protocol = timed_protocol(config)
     if platform == "darwin" and manifest.get("selection_resource_policy") != config["host"]["resources"]:
         raise ValueError("preflight requires the actual root Mac resource policy")
+
+    def fields(data, launch):
+        if "launch" not in data or "derived" in data:
+            return set(LAUNCH)
+        if any(key in launch for key in ("argv", "preflight_argv", "port")):
+            raise ValueError("a launch derived on the device takes its argv and port from its resolution")
+        return set(LAUNCH) - {"argv", "port"}
+
     for model in needs["models"]:
         for tier in needs["performance"].get(model, {}).get("tiers", []):
             # Check the already shipped Azure asset before opening the lease,
             # not after the first model's long completion has begun.
             final_chat.prompt_path(tier)
             pair = dict(model=model, tier=tier, sides={})
-            for side in ("base", "candidate"):
+            for side in timed_sides(protocol):
                 data = config["sides"][side]
                 spec = data["models"][model]["benchmarks"][tier]
-                if not set((*LAUNCH, "os_page_cache_treatment")) <= set(spec):
+                required = fields(data["models"][model], spec)
+                if not {*required, "os_page_cache_treatment"} <= set(spec):
                     raise ValueError("preflight requires every explicit performance launch field")
+                stages = [side + "-" + model + "-preflight-" + tier] + [arm_prefix(side, model, index) + "-benchmark-" + tier
+                                                                        for index in range(1, run_count(protocol, side) + 1)]
+                if expected is not None and any(manifest["stages"].get(stage) != expected[stage] for stage in stages):
+                    raise ValueError("root manifest does not authorize the exact preflight and timed stages")
+                if "argv" not in required:
+                    for key in ("timeout_s", "request_timeout_s"):
+                        final_chat.bounded_timeout(spec[key])
+                    if spec["timeout_s"] <= spec["request_timeout_s"]:
+                        raise ValueError("preflight deadline must leave startup time")
+                    continue
                 if (not isinstance(spec["argv"], list) or not spec["argv"]
                         or not all(isinstance(arg, str) and arg for arg in spec["argv"])
                         or spec["argv"][0] != str(PurePosixPath(data["paths"]["frozen"]) / data["build"]["binary_relative"])
@@ -96,20 +153,18 @@ def declarations(config, manifest, needs):
                     final_chat.bounded_timeout(spec[key])
                 if spec["timeout_s"] <= spec["request_timeout_s"]:
                     raise ValueError("preflight deadline must leave startup time")
-                stage = side + "-" + model + "-preflight-" + tier
-                if expected is not None and manifest["stages"].get(stage) != expected[stage]:
-                    raise ValueError("root manifest does not authorize the exact preflight stage")
-                timed_stage = side + "-" + model + "-benchmark-" + tier
-                if expected is not None and manifest["stages"].get(timed_stage) != expected[timed_stage]:
-                    raise ValueError("root manifest does not authorize the exact timed stage")
-                short = launch(spec, side, required=config.get("validation_mode") == PERFORMANCE_MODE,
-                               job_root=mac_job_root(config["manifest_path"]) if platform == "darwin" else None)
+                job_root = mac_job_root(config["manifest_path"]) if platform == "darwin" else None
+                required = config.get("validation_mode") == PERFORMANCE_MODE
+                functional = data["models"][model]["smoke"] if side == "candidate" else None
+                for index in range(1, run_count(protocol, side) + 1):
+                    arm_launch(spec, side, index, required=required, job_root=job_root, functional=functional)
+                short = launch(spec, side, required=required, job_root=job_root)
                 pair["sides"][side] = dict(short, model=model, tier=tier, revision=data["revision"])
             # These fields are required by the already existing functional run.
             # Reading them now prevents a missing reuse declaration being hidden
             # by a fallback after the lease or a timed request has started.
             functional = config["sides"]["candidate"]["models"][model]["smoke"]
-            if not set(LAUNCH) <= set(functional):
+            if not fields(config["sides"]["candidate"]["models"][model], functional) <= set(functional):
                 raise ValueError("preflight requires the complete candidate functional launch")
             stage = "candidate-smoke-" + model
             if expected is not None and manifest["stages"].get(stage) != expected[stage]:
@@ -150,7 +205,7 @@ def run(session, config, manifest, pairs, builds, functional, output):
                 comparable_pair[side] = comparable(observed)
                 checked[model, tier, side] = observed
             save(output / "preflight" / model / tier / "comparable.json", comparable_pair)
-            if comparable_pair["base"] != comparable_pair["candidate"]:
+            if len({json.dumps(value, sort_keys=True) for value in comparable_pair.values()}) != 1:
                 raise ValueError("short preflight resources, typed settings, model or loaded image roles differ")
             gate["cells"].append(cell)
         gate.update(status="passed", finished_monotonic_ns=time.monotonic_ns())
@@ -178,8 +233,8 @@ def retained(root, config, needs):
     checked = {}
     for cell in gate["cells"]:
         model, tier = cell["model"], cell["tier"]
-        if set(cell["sides"]) != {"base", "candidate"}:
-            raise ValueError("preflight must contain both runtime arms")
+        if set(cell["sides"]) != set(timed_sides(timed_protocol(config))):
+            raise ValueError("preflight must contain every timed side")
         pair = {}
         for side, data in cell["sides"].items():
             folder = root / "preflight" / model / tier / side
@@ -210,6 +265,6 @@ def retained(root, config, needs):
             checked[model, tier, side] = load(path)
             pair[side] = comparable(checked[model, tier, side])
         if (load(root / "preflight" / model / tier / "comparable.json") != pair
-                or pair["base"] != pair["candidate"]):
+                or len({json.dumps(value, sort_keys=True) for value in pair.values()}) != 1):
             raise ValueError("retained preflight arms are not comparable")
     return checked

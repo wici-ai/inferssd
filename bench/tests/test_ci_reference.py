@@ -2,22 +2,18 @@
 
 import copy
 import hashlib
-import importlib
-import importlib.util
 import json
 import sys
 from pathlib import Path
 
 import pytest
+from inferssd.configuration import settings as settings_registry
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import test_ci_performance
 import test_device_ci
 
 from ci import compare, reference
-
-SETTINGS_PACKAGE = "inferssd" if importlib.util.find_spec("inferssd") is not None else "ssdash"
-settings_registry = importlib.import_module(SETTINGS_PACKAGE + ".configuration.settings")
 
 pair = test_ci_performance.pair
 policy = test_device_ci.policy
@@ -26,10 +22,9 @@ synthetic = test_device_ci.synthetic
 
 @pytest.fixture
 def binding():
-    values = settings_registry.parse(SETTINGS_PACKAGE + '-settings 1\nexpert.source=["/models/experts.tsv"]\n').document()["values"]
-    values = {key: value for key, value in values.items() if key in reference.SETTING_KEYS}
+    values = settings_registry.parse('inferssd-settings 1\nexpert.source=["/models/experts.tsv"]\n').document()["values"]
     policy = {
-        "args": ["-t", "2"], "environment": {"THREADS": "2", "ALIAS": "/models/experts.tsv"},
+        "args": ["--prefetch", "2"], "environment": {"PREFETCH": "2", "ALIAS": "/models/experts.tsv"},
         "template_sha256": "a" * 64, "alias_sha256": ["b" * 64],
     }
     default = {"kind": "source-default", "revision": reference.LEGACY_REVISION,
@@ -41,7 +36,7 @@ def binding():
                            for key, value in values.items()},
         "sides": {},
     }
-    result["legacy_mapping"]["cpu.threads"]["inputs"] = [{"kind": "environment", "name": "THREADS", "value": "2"}]
+    result["legacy_mapping"]["prefetch.depth"]["inputs"] = [{"kind": "environment", "name": "PREFETCH", "value": "2"}]
     result["legacy_mapping"]["expert.source"]["inputs"] = [{"kind": "environment", "name": "ALIAS", "value": "/models/experts.tsv"}]
     for side, revision, target, library, mark in (
         ("base", reference.LEGACY_REVISION, "llama-server", "libllama.so", "c"),
@@ -107,10 +102,10 @@ def test_reviewed_bridge_does_not_allow_identity_or_configuration_drift(bound_pa
 @pytest.mark.parametrize("change", [
     lambda b: b["sides"]["base"].update(revision="f" * 40),
     lambda b: b["sides"]["base"]["launch_policy"].update(typed_values=b["semantic_settings"]),
-    lambda b: b["sides"]["candidate"]["launch_policy"]["typed_values"].update(**{"cpu.threads": 3}),
-    lambda b: b["semantic_settings"].pop("host.expert_cache_mib"),
-    lambda b: b["legacy_mapping"].pop("cpu.threads"),
-    lambda b: b["legacy_mapping"]["cpu.threads"]["inputs"][0].update(value="3"),
+    lambda b: b["sides"]["candidate"]["launch_policy"]["typed_values"].update(**{"prefetch.depth": 3}),
+    lambda b: b["semantic_settings"].pop("host.budget_mib"),
+    lambda b: b["legacy_mapping"].pop("prefetch.depth"),
+    lambda b: b["legacy_mapping"]["prefetch.depth"]["inputs"][0].update(value="3"),
     lambda b: b["sides"]["candidate"]["images"][0].update(role="unreviewed-other-role"),
     lambda b: b["sides"]["candidate"]["build"].update(binary_relative="../escape"),
     lambda b: b["sides"]["candidate"]["build"]["template_relatives"].update(tiny="/external/template"),
@@ -130,30 +125,29 @@ def test_build_layout_is_revision_bound_and_copied(binding):
         reference.build_spec(binding, "candidate", "e" * 40)
 
 
-def test_explicit_sixteen_key_muse_binding_preserves_historical_fourteen(binding, bound_pair, policy):
-    if not reference.MODEL_SETTING_KEYS <= settings_registry.schema()["properties"].keys():
-        pytest.skip("sixteen-key test needs the reviewed InferSSD registry")
-    old = copy.deepcopy(binding)
-    values = {"model.engram_prefetch": 0, "model.hc_fused": 1}
-    for key, value in values.items():
-        binding["semantic_settings"][key] = value
-        mapping = copy.deepcopy(binding["legacy_mapping"]["host.expert_cache_mib"])
-        binding["legacy_mapping"][key] = dict(mapping, value=value)
-    binding["sides"]["candidate"]["launch_policy"]["typed_values"].update(values)
-    for side, receipt in (("base", bound_pair[2]), ("candidate", bound_pair[3])):
-        spec = binding["sides"][side]
-        spec["build"]["template_relatives"] = {"muse": "models/muse.jinja"}
-        receipt["host"]["effective_settings"]["native_launch_policy"] = copy.deepcopy(spec["launch_policy"])
+def test_the_reviewed_generation_is_exactly_the_installed_registry(binding, monkeypatch):
+    properties = settings_registry.schema()["properties"]
+    assert reference.SETTING_GENERATIONS == (frozenset(properties),)
+    assert set(binding["semantic_settings"]) == reference.SETTING_KEYS
+    unreviewed = copy.deepcopy(settings_registry.schema())
+    del unreviewed["properties"]["host.budget_mib"]
+    monkeypatch.setattr(settings_registry, "schema", lambda: unreviewed)
+    with pytest.raises(ValueError, match="reviewed 15-key schema"):
+        reference.validate_semantics(binding["semantic_settings"])
+
+
+def test_muse_checkpoint_binding_keeps_the_complete_typed_snapshot(binding, bound_pair, policy):
+    for side in ("base", "candidate"):
+        binding["sides"][side]["build"]["template_relatives"] = {"muse": "models/muse.jinja"}
     assert compare.compare_pair(*bound_pair, policy, comparison_binding=binding)["passed"]
-    assert reference.validate_binding(old) is old
-    assert set(old["semantic_settings"]) == reference.SETTING_KEYS
     binding["sides"]["candidate"]["launch_policy"]["typed_values"].pop("model.hc_fused")
     with pytest.raises(ValueError, match="complete reviewed"):
         reference.validate_binding(binding)
 
 
 @pytest.mark.parametrize("change", [
-    lambda b: b["semantic_settings"].update({"model.hc_fused": 1}),
+    lambda b: [b["semantic_settings"].pop(key) for key in ("model.engram_prefetch", "model.hc_fused")],
+    lambda b: b["semantic_settings"].update({"cpu.threads": 2}),
     lambda b: b["sides"]["base"]["build"].update(template_relatives={}),
     lambda b: b["sides"]["base"]["build"].update(template_relatives={"unknown": "models/muse.jinja"}),
 ])
@@ -190,7 +184,7 @@ def test_exact_source_defaults_are_checked_without_running_a_candidate(binding, 
 
 
 def test_explicit_argv_and_observed_setting_inputs_are_verified(binding, bound_pair):
-    mapping = binding["legacy_mapping"]["cpu.threads"]
+    mapping = binding["legacy_mapping"]["prefetch.depth"]
     mapping["inputs"] = [{"kind": "argument", "index": 1, "value": "2"},
                          {"kind": "effective-setting", "name": "expert_cache_budget_bytes", "value": 4096}]
     reference.comparable(bound_pair[2], binding, "base")
@@ -218,28 +212,27 @@ def test_private_config_binding_must_name_merge_candidate_not_pr_head(binding, s
         compare.device_report(root, plan, policy)
 
 
-def test_model_rule_registry_keeps_historical_binding_explicit(binding, monkeypatch):
-    original_schema = settings_registry.schema
-    properties = original_schema()["properties"]
-    assert "model.optimizations" in properties
-    assert reference.validate_binding(binding) is binding
-    assert "model.optimizations" not in binding["semantic_settings"]
+@pytest.mark.parametrize("change", [
+    lambda b: b["semantic_settings"].pop("model.optimizations"),
+    lambda b: b["legacy_mapping"].pop("model.optimizations"),
+    lambda b: b["sides"]["candidate"]["launch_policy"]["typed_values"].pop("model.optimizations"),
+    lambda b: b["semantic_settings"].update({"model.optimizations": "[]"}),
+])
+def test_model_rules_require_complete_typed_binding_and_mapping(binding, change):
+    assert binding["semantic_settings"]["model.optimizations"] == []
+    reference.validate_binding(binding)
+    change(binding)
+    with pytest.raises(ValueError):
+        reference.validate_binding(binding)
 
-    # A registry extension is not permission to reinterpret a legacy binding.
-    for rules in ([], ["example|on|name:Example|deepseek41|36|2|Example GPU|1|0"]):
-        changed = copy.deepcopy(binding)
-        changed["semantic_settings"]["model.optimizations"] = rules
-        changed["sides"]["candidate"]["launch_policy"]["typed_values"]["model.optimizations"] = rules
-        mapping = copy.deepcopy(changed["legacy_mapping"]["host.expert_cache_mib"])
-        changed["legacy_mapping"]["model.optimizations"] = dict(mapping, value=rules)
-        with pytest.raises(ValueError, match="14 or 16 settings"):
-            reference.validate_binding(changed)
 
-    def unknown_schema():
-        value = copy.deepcopy(original_schema())
-        value["properties"]["model.future_option"] = copy.deepcopy(properties["model.optimizations"])
-        return value
-
-    monkeypatch.setattr(settings_registry, "schema", unknown_schema)
-    with pytest.raises(ValueError, match="reviewed registry"):
+def test_model_rules_cannot_drift_from_reviewed_snapshot(binding):
+    rule = "reviewed|on|name:Example Model|deepseek41|38|2|Example GPU|0|1"
+    values = [rule]
+    binding["semantic_settings"]["model.optimizations"] = values.copy()
+    binding["legacy_mapping"]["model.optimizations"]["value"] = values.copy()
+    binding["sides"]["candidate"]["launch_policy"]["typed_values"]["model.optimizations"] = values.copy()
+    reference.validate_binding(binding)
+    binding["sides"]["candidate"]["launch_policy"]["typed_values"]["model.optimizations"] = []
+    with pytest.raises(ValueError, match="complete reviewed"):
         reference.validate_binding(binding)

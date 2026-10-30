@@ -1,11 +1,10 @@
 #pragma once
 // Per-index owned parser records. Production publishes only a context-owned
 // immutable source_index; no singleton or backend registration lives here.
+#include "../platform/file.h"
 #include <cstdint>
 #include <cstdio>
 #include <vector>
-#include <sys/mman.h>
-#include <unistd.h>
 
 namespace c0 {
 struct expert_pack_entry {
@@ -22,10 +21,8 @@ struct expert_pack_entry {
 };
 
 struct expert_pack_source {
-    FILE *file = nullptr;
-#if !defined(_WIN32)
-    int fd_direct = -1;
-#endif
+    FILE *file = nullptr; // buffered metadata (platform::open_stream)
+    int fd_direct = -1;   // page-cache bypassing payload reads (platform::open_direct)
     void *mmap_base = nullptr;
     size_t mmap_size = 0;
     bool mmap_attempted = false;
@@ -51,9 +48,9 @@ struct parser_state {
     ~parser_state() { reset(); }
     void reset() {
         for (auto & source : sources) {
-            if (source.mmap_base && source.mmap_size) { ::munmap(source.mmap_base, source.mmap_size); }
+            if (source.mmap_base && source.mmap_size) { ssd::platform::unmap_view(source.mmap_base, source.mmap_size); }
             if (source.file) { std::fclose(source.file); }
-            if (source.fd_direct >= 0) { ::close(source.fd_direct); }
+            ssd::platform::close_fd(source.fd_direct);
         }
         sources.clear(); entries.clear(); file = nullptr; fd_direct = -1;
         inited = false; enabled = false; io_backend = 0; page_cache_sources = 0;

@@ -95,17 +95,22 @@ def operator_access(policy, event, identity, env):
 def operator_envelope(value, policy, identity, actor):
     fields = {"schema_version", "purpose", "repository", "base", "head", "candidate",
               "selection", "selection_plan_sha256", "execution_devices", "validation_mode",
-              "prepared_by", "controller_repository", "controller_workflow_sha", "policy_sha256", "jobs"}
+              "prepared_by", "controller_repository", "controller_workflow_sha", "policy_sha256",
+              "baseline_history_sha256", "machine_characteristics_sha256", "jobs"}
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("complete sealed operator envelope required")
     impact = validate(value["selection"], policy)
     scope = execution_scope(value)
     prepared = value["prepared_by"]
+    machines = value["machine_characteristics_sha256"]
     if (value["schema_version"] != 1 or value["purpose"] != OPERATOR_PURPOSE or scope is None
             or value["repository"] != policy["repository"]
             or value["controller_repository"] != policy["controller_repository"]
             or value["controller_workflow_sha"] != identity["workflow_sha"]
             or value["policy_sha256"] != fingerprint(policy)
+            or not isinstance(value["baseline_history_sha256"], str) or not HASH.fullmatch(value["baseline_history_sha256"])
+            or not isinstance(machines, dict) or not set(machines) <= set(value["execution_devices"])
+            or any(not isinstance(item, str) or not HASH.fullmatch(item) for item in machines.values())
             or value["selection_plan_sha256"] != fingerprint(impact)
             or any(value[key] != impact[key] for key in ("base", "head", "candidate"))
             or not isinstance(prepared, dict) or prepared.get("login") != actor["login"]
@@ -289,9 +294,10 @@ def execute(args, env=os.environ):
             except Exception as error:
                 state["errors"][device] = f"{type(error).__name__}: {error}"
                 if not collection_attempted:
-                    # A complete inconclusive pair exits nonzero. Retain its raw
-                    # artifact once so the always report can recompute metrics;
-                    # cancellation/unknown state still cannot become a pass.
+                    # A complete regressed or needs-review cell exits nonzero.
+                    # Retain its raw artifact once so the always report can
+                    # recompute metrics; cancellation/unknown state still
+                    # cannot become a pass.
                     try:
                         run = observed.call("actions/runs/" + str(child["id"]))
                         selection_dispatch.run_identity(run, child["workflow_id"], child["controller_sha"], child["job_id"])
@@ -381,8 +387,42 @@ def metric_text(metric, key):
     return f"{value:+.3f}%" if key == "change_percent" else f"{value:.4f}"
 
 
+def number_text(value, signed=False):
+    if type(value) not in (int, float) or not math.isfinite(value):
+        return "unavailable"
+    return f"{value:+.4f}" if signed else f"{value:.4f}"
+
+
+def values_text(values, signed=False):
+    if not isinstance(values, list) or not values:
+        return "unavailable"
+    return ", ".join(number_text(value, signed) for value in values)
+
+
+METRIC_LABELS = (("decode_first128_tps", "Decode 0–128 tok/s"), ("decode_second128_tps", "Decode 128–256 tok/s"),
+                 ("decode_tps", "Whole decode tok/s"), ("ttft_s", "Request TTFT seconds"),
+                 ("server_prefill_tps", "Native prefill tok/s"))
+def launch_text(launch, name):
+    """One derived setting or thread pool of a side, with its origin."""
+    if not isinstance(launch, dict):
+        return "unavailable"
+    if name in ("server_args", "argv"):
+        return " ".join(map(str, launch.get(name, []))) if name == "server_args" else "see aggregate.json"
+    group, key = ("threads", name.split(".", 1)[1]) if name.startswith("threads.") else ("settings", name)
+    entry = launch.get(group, {}).get(key)
+    if not isinstance(entry, dict):
+        return "unset"
+    return json.dumps(entry.get("value"), separators=(",", ":")) + " (" + str(entry.get("origin")) + ")"
+
+
+RESULT_LABELS = {"within-noise": "within noise", "improved": "improved: faster beyond noise",
+                 "regressed": "regressed: slower beyond noise, every PR run slower",
+                 "candidates-disagree": "slower beyond noise, PR runs disagree",
+                 "no-baseline-history": "no matching baseline history", "informational": "information only"}
+
+
 def operator_summary(stream, report):
-    """Render verified pair values, never turn missing/inconclusive into green."""
+    """Render verified series values; never turn missing or needs-review into green."""
     status = report.get("status", "passed" if report["passed"] else "failed")
     stream.write("## Operator-authorized device report\n\n")
     stream.write("Declared device scope: **" + summary_text(status) + "**. ")
@@ -393,85 +433,164 @@ def operator_summary(stream, report):
     for key in ("base", "head", "candidate"):
         if key in report:
             stream.write(key + ": `" + summary_text(report[key]) + "`\n\n")
+    if report.get("baseline_history_sha256"):
+        stream.write("Sealed baseline history SHA-256: `" + summary_text(report["baseline_history_sha256"]) + "`\n\n")
     stream.write("| Device | Model | Functional | Numerical | Performance | Outcome |\n|---|---|---|---|---|---|\n")
-    pairs = []
+    cells = []
     for row in report["cells"]:
         performance = row.get("performance", row["status"])
         if isinstance(performance, list):
-            pairs.extend((row, pair) for pair in performance)
-            performance = ", ".join(pair["tier"] + ": " + pair["status"] for pair in performance) or "not-measured"
+            cells.extend((row, entry) for entry in performance)
+            performance = ", ".join(entry["tier"] + ": " + entry["status"] for entry in performance) or "not-measured"
         deferred = row.get("performance_deferred_tiers", [])
         if deferred:
             performance += "; deferred tiers: " + ", ".join(deferred)
         values = [row.get("device"), row.get("model"), row.get("functional", row["status"]),
                   row.get("numerical", row["status"]), performance, row["status"]]
         stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
-    if pairs:
-        stream.write("\n### 512 prompt / 256 decode: two decode segments\n\n")
-        stream.write("| Device | Model | Tier | 0–128 base tok/s | PR tok/s | Change | 128–256 base tok/s | PR tok/s | Change | Outcome |\n")
-        stream.write("|---|---|---|---:|---:|---:|---:|---:|---:|---|\n")
-        for row, pair in pairs:
-            metrics = pair.get("metrics", {})
-            first, second = metrics.get("decode_first128_tps", {}), metrics.get("decode_second128_tps", {})
-            values = [row["device"], row["model"], pair["tier"],
-                      *(metric_text(first, key) for key in ("base", "candidate", "change_percent")),
-                      *(metric_text(second, key) for key in ("base", "candidate", "change_percent")), pair["status"]]
-            stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
-        stream.write("\n| Device | Model | Tier | Metric | Base | PR | Change | Better direction |\n|---|---|---|---|---:|---:|---:|---|\n")
-        for row, pair in pairs:
-            for key, label in (("decode_tps", "Whole decode tok/s"), ("ttft_s", "Request TTFT seconds"),
-                               ("server_prefill_tps", "Native prefill tok/s")):
-                metric = pair.get("metrics", {}).get(key, {})
-                values = [row["device"], row["model"], pair["tier"], label,
-                          *(metric_text(metric, field) for field in ("base", "candidate", "change_percent")),
-                          "lower" if key == "ttft_s" else "higher"]
-                stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
-        stream.write("\nChange is (PR/base − 1) × 100; lower TTFT is better. TTFT starts at the request, not model loading. ")
-        stream.write("One sample per arm: observed slowdown or different generated tokens is inconclusive and does not pass.\n\n")
-        mac_pairs = [(row, pair) for row, pair in pairs if row["device"] == "local-mbp"]
-        if mac_pairs:
+    if cells:
+        baseline = [(row, entry) for row, entry in cells if entry.get("protocol", {}).get("purpose") == "baseline"]
+        gate = [(row, entry) for row, entry in cells if (row, entry) not in baseline]
+        if gate:
+            stream.write("\n### 512 prompt / 256 decode: PR runs against the base and its baseline history\n\n")
+            stream.write("Each PR cell ran the PR three times and the base once, in the order PR, base, PR, PR. "
+                         "Every run is a fresh server with one completion; all runs are kept, none is retried or "
+                         "selected. The base history holds the four runs of the base commit's baseline job on the "
+                         "same device.\n\n")
+            stream.write("| Device | Model | Tier | Metric | Base history | Base run | PR runs | Change | Threshold | Result |\n")
+            stream.write("|---|---|---|---|---:|---:|---:|---:|---:|---|\n")
+            for row, entry in gate:
+                for key, label in METRIC_LABELS:
+                    metric = entry.get("metrics", {}).get(key, {})
+                    threshold = metric.get("threshold")
+                    values = [row["device"], row["model"], entry["tier"], label, values_text(metric.get("history")),
+                              number_text(metric.get("base_run")), values_text(metric.get("candidate")),
+                              metric_text(metric, "change_percent"),
+                              number_text(threshold) if threshold is not None else "none",
+                              RESULT_LABELS.get(metric.get("result"), metric.get("result", "unavailable"))]
+                    stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
+            stream.write("\n")
+            for row, entry in gate:
+                reasons = entry.get("review_reasons", [])
+                deciding = entry.get("metrics", {}).get("decode_tps", {})
+                stream.write("- " + summary_text(row["device"] + "/" + row["model"] + "/" + entry["tier"]) + ": **"
+                             + summary_text(entry.get("status", "unavailable")) + "**. Baseline history: "
+                             + summary_text(len(entry.get("history_pool", []))) + " records, df "
+                             + summary_text(deciding.get("df", "none")) + ", t "
+                             + summary_text(deciding.get("k", "none")) + ". Improved: "
+                             + summary_text(", ".join(entry.get("improvements", [])) or "none") + ". Review reasons: "
+                             + summary_text(", ".join(reasons) if reasons else "none") + ".\n")
+            stream.write("\nChange is the PR's geometric mean over the base estimate (the four history runs and the "
+                         "in-run base), minus 1, in percent; lower TTFT is better. TTFT starts at the request, not model "
+                         "loading. Threshold is on the log scale: max(ln(1 + floor), t·σ·√(1/3 + 1/5)), where σ is the "
+                         "pooled within-commit spread of the device's baseline history for the same machine, OS, "
+                         "model, template, memory budget and CPU set "
+                         "and t the one-sided Student-t quantile for its degrees of freedom, matching a normal 3σ tail. "
+                         "Only whole decode, TTFT and native prefill decide; the two decode half-windows are shown for "
+                         "information. Regressed: a deciding metric beyond its threshold with every PR run slower than the "
+                         "base estimate. Needs review: the in-run base differs from its history, PR runs disagree, generated "
+                         "tokens differ, no matching history, or a flagged host check. Passed: no slowdown beyond measured "
+                         "noise. Improved: a deciding metric whose PR mean is faster than the base estimate by more than "
+                         "the same threshold; it is a label on that metric, and the cell status stays passed. Within "
+                         "noise: inside the threshold either way.\n\n")
+        if baseline:
+            stream.write("\n### 512 prompt / 256 decode: baseline runs of a main commit\n\n")
+            stream.write("One build measured four times; no pass or regression decision. σ and df include this record "
+                         "and the device's earlier records for the same machine, OS, model, template, memory "
+                         "budget and CPU set.\n\n")
+            stream.write("| Device | Model | Tier | Metric | Runs | Mean ln | σ (log) | df |\n|---|---|---|---|---:|---:|---:|---:|\n")
+            for row, entry in baseline:
+                for key, label in METRIC_LABELS:
+                    metric = entry.get("metrics", {}).get(key, {})
+                    values = [row["device"], row["model"], entry["tier"], label, values_text(metric.get("values")),
+                              number_text(metric.get("mean_log"), True), number_text(metric.get("sigma_log")),
+                              summary_text(metric.get("df", "none"))]
+                    stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
+            stream.write("\n")
+            for row, entry in baseline:
+                reasons = entry.get("review_reasons", [])
+                stream.write("- " + summary_text(row["device"] + "/" + row["model"] + "/" + entry["tier"]) + ": **"
+                             + summary_text(entry.get("status", "unavailable")) + "**. Review reasons: "
+                             + summary_text(", ".join(reasons) if reasons else "none") + ".\n")
+            stream.write("\n")
+        launches = [(row, entry) for row, entry in cells if isinstance(entry.get("derived_launch"), dict)]
+        if launches:
+            stream.write("\n### Derived launches\n\n")
+            stream.write("Each side started its servers the way `inferssd launch` does: that side's own launch strategy "
+                         "derived the settings, thread pools and server arguments from the device's machine "
+                         "characteristics (a baseline job profiles them; a PR job takes those of the device's most "
+                         "recent baseline job), the model's GGUF header and the job's memory budget. Origin is "
+                         "strategy, launcher (the registry default or the launcher's model profile) or user (the "
+                         "reviewed launch request). The thread pools are always shown; other rows are what the PR's "
+                         "launch sets differently.\n\n")
+            profiles = {}
+            for row, _ in launches:
+                profiles.setdefault(row["device"], row.get("machine_profile"))
+            for device, machine in profiles.items():
+                machine = machine if isinstance(machine, dict) else {}
+                weak = [name + " " + status for name, status in machine.get("sections", {}).items() if status != "ok"]
+                source = machine.get("baseline")
+                origin = ("taken from the baseline job of `" + summary_text(source.get("commit", "unavailable")) + "`"
+                          if isinstance(source, dict) else "profiled by this baseline job")
+                stream.write("- " + summary_text(device) + ": machine characteristics SHA `"
+                             + summary_text(machine.get("sha256", "unavailable")) + "`, " + origin
+                             + "; sections not ok: " + summary_text(", ".join(weak) or "none") + ".\n")
+            stream.write("\n| Device | Model | Tier | Setting | Base | PR or measured commit |\n|---|---|---|---|---|---|\n")
+            for row, entry in launches:
+                derived = entry["derived_launch"]
+                sides = derived.get("sides", {})
+                names = ["threads.decode", "threads.batch", "threads.cpus"]
+                names += [name for name in derived.get("changes", []) if name not in names]
+                for name in names:
+                    values = [row["device"], row["model"], entry["tier"], name,
+                              launch_text(sides.get("base"), name) if "base" in sides else "not run",
+                              launch_text(sides.get("candidate"), name)]
+                    stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
+            stream.write("\n")
+        mac_cells = [(row, entry) for row, entry in cells if row["device"] == "local-mbp"]
+        if mac_cells:
             def scaled(value, unit):
                 if type(value) not in (int, float) or not math.isfinite(value):
                     return "unavailable"
                 return f"{value / unit:.4f}"
 
             stream.write("### Mac sampled host conditions\n\n")
-            stream.write("| Model | Tier | Side | Quiet free+inactive GiB | Timed swap Δ MiB | Timed compression Δ MiB | Non-CI CPU cores | Pressure | Timed status |\n")
+            stream.write("| Model | Tier | Run | Quiet available GiB | Timed swap-out MiB | Timed compressed MiB | Non-CI CPU cores | Pressure | Timed status |\n")
             stream.write("|---|---|---|---:|---:|---:|---:|---|---|\n")
-            for row, pair in mac_pairs:
-                environment = pair.get("environment", {})
-                for side in ("base", "candidate"):
-                    arm = environment.get(side, {})
+            for row, entry in mac_cells:
+                runs = entry.get("environment", {}).get("runs") or {"unavailable": {}}
+                for name, arm in runs.items():
                     timed = arm.get("timed", {})
                     levels = timed.get("memory_pressure_levels")
                     pressure = " → ".join(str(level) for level in levels) if isinstance(levels, list) else "unavailable"
-                    values = [row["model"], pair["tier"], side,
-                        scaled(arm.get("prelaunch_free_inactive_bytes"), 1 << 30),
-                        scaled(timed.get("swap_delta_bytes"), 1 << 20),
-                        scaled(timed.get("compression_delta_bytes"), 1 << 20),
+                    values = [row["model"], entry["tier"], name,
+                        scaled(arm.get("prelaunch_available_bytes"), 1 << 30),
+                        scaled(timed.get("swapout_bytes"), 1 << 20),
+                        scaled(timed.get("compressed_bytes"), 1 << 20),
                         metric_text(timed.get("process_activity", {}), "non_ci_cpu_cores"),
                         pressure, timed.get("status", "unavailable")]
                     stream.write("| " + " | ".join(summary_text(value) for value in values) + " |\n")
             stream.write("\n")
-            for row, pair in mac_pairs:
-                environment = pair.get("environment", {})
+            for row, entry in mac_cells:
+                environment = entry.get("environment", {})
                 reasons = environment.get("reasons", ["missing environment evidence"])
-                stream.write("- " + summary_text(row["model"] + "/" + pair["tier"]) + " environment: "
+                stream.write("- " + summary_text(row["model"] + "/" + entry["tier"]) + " environment: "
                     + summary_text(environment.get("status", "unavailable")) + "; reasons: "
                     + summary_text(", ".join(reasons) if reasons else "none") + ".\n")
             stream.write("\nQuiet memory is the final prelaunch sample; timed CPU is the sampled non-CI total. ")
             stream.write("Swap and pressure may be model-induced. These observations do not establish external interference, excuse measured slowdowns, or trigger automatic retries; they are not strict isolation.\n\n")
-        stream.write("<details><summary>Pair identities and retained raw evidence</summary>\n\n")
-        for row, pair in pairs:
-            identity = pair.get("measurement_identity", {})
-            stream.write("- " + summary_text(row["device"] + "/" + row["model"] + "/" + pair["tier"]) + ": ")
+        stream.write("<details><summary>Cell identities and retained raw evidence</summary>\n\n")
+        for row, entry in cells:
+            identity = entry.get("measurement_identity", {})
+            stream.write("- " + summary_text(row["device"] + "/" + row["model"] + "/" + entry["tier"]) + ": ")
             stream.write("prompt SHA `" + summary_text(identity.get("prompt_sha256", "unavailable")) + "`; ")
             stream.write("template IDs SHA `" + summary_text(identity.get("prompt_ids_sha256", "unavailable")) + "`; ")
-            stream.write("conditions/settings SHA `" + summary_text(identity.get("conditions_sha256", "unavailable")) + "`.\n")
-            for side in ("base", "candidate"):
-                raw = pair.get("evidence", {}).get(side, {}).get("result.json", {})
+            stream.write("baseline-history conditions SHA `" + summary_text(identity.get("conditions_sha256", "unavailable")) + "`.\n")
+            for arm in entry.get("order", []):
+                raw = entry.get("evidence", {}).get(arm, {}).get("result.json", {})
+                side = arm.split("/")[-1]
                 path = "/".join((row["device"], row.get("job_id", "unknown-job"), raw.get("path", "unavailable")))
-                stream.write("  - " + side + " source `" + summary_text(pair.get("sources", {}).get(side, "unavailable"))
+                stream.write("  - " + summary_text(arm) + " source `" + summary_text(entry.get("sources", {}).get(side, "unavailable"))
                              + "`: `" + summary_text(path) + "`, SHA `" + summary_text(raw.get("sha256", "unavailable")) + "`.\n")
         stream.write("\n</details>\n")
     if report.get("error"):
@@ -522,12 +641,16 @@ def operator_report(args, env=os.environ):
             if latest.get("id") != child["id"] or latest.get("status") != "completed" or latest.get("conclusion") not in ("success", "failure"):
                 raise ValueError("operator child is not an exact completed single attempt")
             children[device] = latest
-        report = operator_aggregate(impact, policy, args.artifacts, jobs, children, scope)
+        report = operator_aggregate(impact, policy, args.artifacts, jobs, children, scope,
+                                    envelope["baseline_history_sha256"], envelope["machine_characteristics_sha256"])
         if state["errors"]:
-            inconclusive_devices = {row["device"] for row in report["cells"] if row["status"] == "inconclusive"}
+            # Only a verified regressed/needs-review decision explains a child
+            # that exited nonzero; any other child error fails the report.
+            decided = ("regressed", "needs-review")
+            decided_devices = {row["device"] for row in report["cells"] if row["status"] in decided}
             retained = state.get("retained_failed_children", {})
             complete = all(retained.get(device) == children[device]["id"] for device in state["errors"] if device in children)
-            if (not set(state["errors"]) <= inconclusive_devices or report.get("status") != "inconclusive"
+            if (not set(state["errors"]) <= decided_devices or report.get("status") not in decided
                     or not complete):
                 report.update(passed=False, status="failed", execution_scoped_status="failed", full_impact_coverage_complete=False)
                 for platform, devices in (("linux", {"cloud-5090", "dgx-spark"}), ("mac", {"local-mbp"})):
@@ -544,7 +667,8 @@ def operator_report(args, env=os.environ):
     if summary:
         with Path(summary).open("a", encoding="utf-8") as stream:
             operator_summary(stream, report)
-    return 0 if report["passed"] else 1
+    # A clean baseline job has no pass/fail decision, but it is a complete run.
+    return 0 if report["passed"] or report.get("status") == "baseline" else 1
 
 
 def finalize(args, env=os.environ):

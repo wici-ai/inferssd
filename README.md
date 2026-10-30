@@ -38,10 +38,12 @@ native CPU build, UUID-free/name/quantization/device fallback, CLI precedence,
 resolver/context ownership tests and typed Python/native
 configuration and launch tests use synthetic fixtures; they establish no speedup.
 Allocator/THP optimizations require a separate context-specific gated integration.
-The historical benchmark bridge recognizes the new installed registry while
-retaining its explicit 14/16-setting bindings. It does not drop or translate model
-rules into legacy evidence; a binding containing rules still requires separate
-reviewed support. Full bench/framework tests cover this compatibility boundary.
+Model rules preserve architecture-based profile selection and explicit CLI
+overrides. The benchmark reference adapter binds all 15 current settings,
+including the exact rule array and its reviewed mapping. Regression coverage
+checks profile/rule coexistence, CLI precedence, missing or drifting rule
+bindings, and context-local ownership. This reconciliation enables no production
+rule and makes no new performance claim.
 
 ## Performance benchmarks
 
@@ -117,6 +119,8 @@ Build from `main` for either platform. The setup guide covers source indexing, t
 | --- | --- | --- |
 | macOS / Metal (Apple Silicon) | `main` | [Mac setup](docs/quickstart.md#apple-silicon) · [Muse on Mac](docs/quickstart.md#muse-on-mac) |
 | Linux / NVIDIA CUDA | `main` | [Linux setup](docs/quickstart.md#linux--nvidia) |
+
+Windows support is in progress. The engine, the server and the SSD expert path build and pass their tests on Windows x64 (CPU), and `inferssd launch --dry-run` prepares the server command there; supervised launch (`--execute`) is not available on Windows yet.
 
 `x86_64` covers Intel and AMD CPUs; DGX Spark (GB10) uses `ARM64`. CUDA identifies the NVIDIA GPU backend, not the CPU vendor. The x86_64 benchmarks use Intel CPUs.
 

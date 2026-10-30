@@ -177,10 +177,8 @@ def policy_check(policy, request, config, manifest, broker):
             or common.fingerprint(resources) != policy["resources_sha256"]
             or request["min_free_bytes"] != policy["min_free_bytes"]
             or config.get("validation_mode") != common.PERFORMANCE_MODE
-            or config.get("performance_protocol") != common.PERFORMANCE_PROTOCOL
-            or policy.get("performance_protocol") != common.PERFORMANCE_PROTOCOL
-            or type(config["performance_protocol"].get("output_tokens")) is not int
-            or type(config["performance_protocol"].get("samples_per_side")) is not int):
+            or not common.protocol_admitted(config)
+            or policy.get("performance_protocol") != common.PERFORMANCE_PROTOCOL):
         common.fail("Mac request differs from fixed root device/resources/protocol policy")
     if (manifest.get("selection_resource_policy") != resources
             or manifest.get("selection_lock_identity") != broker["lock_dev_inode"]
@@ -201,6 +199,8 @@ def policy_check(policy, request, config, manifest, broker):
                 common.fail("Mac model/settings path differs from root admission")
             mounts[model] = admitted["mount"]
             mounts["settings-" + model + "-" + side + ".ssd"] = settings
+    # A PR job's sealed characteristics are staged in its input root, not mounted.
+    common.sealed_machine(config, str(source / "machine.json"), str(source / "machine.json"))
     if (manifest["models"] != mounts or manifest["sources"] != {side: str(source / side) for side in sides}
             or manifest["builds"] != {side: side for side in sides}
             or manifest.get("input_roots") != [str(source)]
@@ -347,6 +347,9 @@ def receive_packet(expected_sha256, incoming, deadline):
                         common.fail("Mac side effective settings differ")
                 for side, payload in payloads.items():
                     common.write(source / ("settings-" + model + "-" + side + ".ssd"), payload)
+            machine = common.sealed_machine(config, str(source / "machine.json"), str(source / "machine.json"))
+            if machine is not None:
+                common.write(source / "machine.json", machine)
             runner_manifest = source / "manifest.json"
             common.write(runner_manifest, (staging / "manifest.json").read_bytes())
             if common.sha(runner_manifest) != config["manifest_sha256"]:

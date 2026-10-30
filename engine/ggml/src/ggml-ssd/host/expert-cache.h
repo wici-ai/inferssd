@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
-// Linux RAM expert-cache owner. Payload mappings, budget admission, first touch,
+// RAM expert-cache owner. Payload arena, budget admission, first touch,
 // retention, reclaim and leases live here; executors borrow ranges for compute.
 #include "arbiter.h"
 #include "cache-stats.h"
 #include "expert-request.h"
 #include "../gpu/kimi-vram-tier-api.h"
+#include "../platform/file.h"
+#include "../platform/memory.h"
 #include "ggml.h"
 #include <algorithm>
 #include <atomic>
@@ -23,15 +25,15 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace ssd { namespace host {
 struct expert_cache_options {
     context_client * host = nullptr;
     client_config budget;
     bool require_shared = true;
+    // A GPU tier keeps experts in this DRAM (a unified-memory GPU with a nonzero vram.budget): an automatic RAM
+    // cache then keeps only the slots the next-layer prefetch lands in.
+    bool gpu_tier = false;
     std::string cache_policy = "window", cache_allocation = "priority";
     bool cache_keep = false, cache_prefill_read = false, cache_elastic = false, cache_partial_reclaim = false;
     size_t cache_prefill_slots = 0;
@@ -91,9 +93,7 @@ struct cache_client_view {
     bool end_interval(bool consecutive, uint64_t held, uint64_t & unknown) {
         return detail::cache_host_value(client->end_interval(consecutive, held, unknown));
     }
-    ssd::host::room make_room(uint64_t extra, const ssd::host::actions & actions) {
-        return detail::cache_host_value(client->make_room(extra, actions));
-    }
+    ssd::host::room make_room(uint64_t extra) { return detail::cache_host_value(client->make_room(extra)); }
     bool memory_available_at_full_boost(uint64_t & available, uint64_t & headroom) const {
         const auto r = measure(0, true); available = r.available; headroom = r.boost_headroom; return r.system;
     }
@@ -102,9 +102,10 @@ struct expert_cache {
     struct source_key {
         uint64_t device, inode, size, offset, bytes;
         int64_t mtime_s, mtime_ns, ctime_s, ctime_ns;
+        uint64_t inode_hi;
         bool operator==(const source_key & o) const {
-            return device == o.device && inode == o.inode && size == o.size && offset == o.offset &&
-                bytes == o.bytes && mtime_s == o.mtime_s && mtime_ns == o.mtime_ns &&
+            return device == o.device && inode == o.inode && inode_hi == o.inode_hi && size == o.size &&
+                offset == o.offset && bytes == o.bytes && mtime_s == o.mtime_s && mtime_ns == o.mtime_ns &&
                 ctime_s == o.ctime_s && ctime_ns == o.ctime_ns;
         }
     };
@@ -140,7 +141,8 @@ struct expert_cache {
     // Room for the cache comes from the host-memory ledger, which every other host allocation asks too. Its cgroup
     // reserve is CACHE_RESERVE_BYTES; opt-in CACHE_RECLAIMABLE_FILE counts file-backed pages as cgroup headroom.
     cache_client_view ledger;
-    const bool unified_memory;
+    // The GPU tier keeps the cached experts in this DRAM (expert_cache_options::gpu_tier on unified memory).
+    const bool tier_caches;
     // The last answer check_room got and the rejections per short term, for the receipts: on a discrete GPU the
     // cgroup term is meant to bind, so a system-term rejection there points at memory the cgroup does not see.
     mutable ssd::host::room last_room;
@@ -173,14 +175,14 @@ struct expert_cache {
     void * before_release_arg = nullptr;
     void (*before_unmap)(void *) = nullptr; // waits for prefetch reads into the arena
     void * before_unmap_arg = nullptr;
-    // Before slots' pages are discarded (MADV_DONTNEED) or unmapped: entries [first, first + count). The decode
+    // Before slots' pages are discarded or the arena released: entries [first, first + count). The decode
     // registrar's page-locks must go first, or the device would keep the old pages.
     void (*before_discard)(void *, size_t first, size_t count) = nullptr;
     void * before_discard_arg = nullptr;
     // Optional fixed geometry learned from earlier requests. This only assigns
     // physical RAM slots; source identity, admission and leases stay unchanged.
     std::map<int32_t, size_t> layer_quotas;
-    const uint64_t page_size = uint64_t(sysconf(_SC_PAGESIZE));
+    const uint64_t page_size = uint64_t(ssd::platform::page_size());
 
     static uint64_t add(uint64_t a, uint64_t b) {
         if (b > UINT64_MAX - a) { throw std::runtime_error("CPU sink cache size addition overflow"); }
@@ -205,9 +207,9 @@ struct expert_cache {
     uint64_t allocation_cost(uint64_t bytes) const {
         if (!bytes) { return 0; }
         // std::vector/map storage belongs to libc. Allow allocator headers,
-        // unaligned ends and PMD-sized THP at both boundaries. Payload itself
-        // is MADV_NOHUGEPAGE and uses the much smaller ordinary-page bound.
-        const uint64_t huge = multiply(page_size, page_size / sizeof(uint64_t));
+        // unaligned ends and the heap's largest page (Linux THP) at both boundaries. Payload
+        // itself has no huge pages (arena_no_hugepage) and uses the much smaller ordinary-page bound.
+        const uint64_t huge = uint64_t(ssd::platform::heap_page_size());
         const uint64_t resident = add(multiply(ceil_div(add(bytes, 64), huge), huge), huge);
         return add(add(resident, page_tables(resident)), 64 * 1024);
     }
@@ -216,12 +218,11 @@ struct expert_cache {
         stats.peak_guard_extra_bytes = std::max(stats.peak_guard_extra_bytes, extra);
         return check_room(extra, nullptr) == room_ok;
     }
-    ssd::result<ssd::host::allocation_ticket> take_guard(uint64_t extra, const char * reason) {
+    // The cache's own growth: the context's reclaimer gives back colder slots for it (requester::ram_cache).
+    ssd::result<ssd::host::allocation_ticket> take_guard(uint64_t extra) {
         stats.last_guard_extra_bytes = extra;
         stats.peak_guard_extra_bytes = std::max(stats.peak_guard_extra_bytes, extra);
-        ssd::host::actions actions;
-        actions.reclaim_cache = [this, reason](uint64_t bytes) { return reclaim_for_guard(bytes, reason); };
-        auto ticket = ledger.client->take(extra, 0, actions, true, ssd::host::allocation_class::tracked);
+        auto ticket = ledger.client->take(extra, 0, ssd::host::requester::ram_cache, true, ssd::host::allocation_class::tracked);
         last_room = ticket.value.observation();
         return ticket;
     }
@@ -261,7 +262,7 @@ struct expert_cache {
         return "unknown";
     }
 
-    explicit expert_cache(const expert_cache_options & configuration) : ledger(configuration.host, configuration.budget, configuration.require_shared), unified_memory(configuration.budget.unified) {
+    explicit expert_cache(const expert_cache_options & configuration) : ledger(configuration.host, configuration.budget, configuration.require_shared), tier_caches(configuration.budget.unified && configuration.gpu_tier) {
         if (page_size < 4096 || page_size > 65536 || (page_size & (page_size - 1))) {
             throw std::runtime_error("CPU sink cache requires a supported system page size");
         }
@@ -309,7 +310,7 @@ struct expert_cache {
         if (arena && before_discard) { before_discard(before_discard_arg, 0, entries.size()); }
         ++generation;
         if (arena) {
-            if (munmap(arena, stats.mapped_bytes) != 0) { std::abort(); }
+            ssd::platform::arena_release(arena, stats.mapped_bytes);
             arena = nullptr;
             ++stats.clears;
         }
@@ -421,7 +422,7 @@ struct expert_cache {
             return;
         }
         // A retained mapping is bound to the model/context epoch even after
-        // prefill cleared has_token. Per-entry fstat keys also reject fd reuse.
+        // prefill cleared has_token. Per-entry file identity keys also reject fd reuse.
         if (keep_across_requests && arena && next_epoch != epoch && !adopt) { release(); }
         // The first decode token after a prefill: the ledger no longer holds the prefill's pages, and the slots the
         // prefill gave back come back as far as the room allows now.
@@ -504,8 +505,8 @@ struct expert_cache {
                 entry & e = entries[candidates[offset]];
                 if (e.resident) {
                     if (arena && before_discard) { before_discard(before_discard_arg, candidates[offset], 1); }
-                    if (!arena || madvise(arena + candidates[offset] * stride, stride, MADV_DONTNEED) != 0) {
-                        const auto error = detail::cache_sys_error("CPU sink cache MADV_DONTNEED");
+                    if (!arena || !ssd::platform::arena_discard(arena + candidates[offset] * stride, stride)) {
+                        const auto error = detail::cache_sys_error("CPU sink cache slot discard");
                         release();
                         throw error;
                     }
@@ -552,8 +553,9 @@ struct expert_cache {
                     before, entries.size(), (unsigned long long) stats.committed_bytes);
         }
     }
-    // Slots given back until the room for `extra` fits; full_boost for the ledger's make_room, which then measures at the
-    // full watermark boost: stopping at MemAvailable as it is would leave make_room short by the boost's headroom.
+    // Slots given back until the room for `extra` fits; full_boost for the host arbiter's admissions (the context's
+    // reclaimer), which measure at the full watermark boost: stopping at MemAvailable as it is would leave them short by
+    // the boost's headroom.
     bool reclaim_for_guard(uint64_t extra, const char * reason, bool full_boost = false) {
         stats.last_guard_extra_bytes = extra;
         stats.peak_guard_extra_bytes = std::max(stats.peak_guard_extra_bytes, extra);
@@ -587,10 +589,10 @@ struct expert_cache {
                 (unsigned long long) stats.last_guard_extra_bytes, enabled_slots());
     }
     static source_key key(const kimi_cpu_sink_source & s) {
-        struct stat st;
-        if (fstat(s.fd_direct, &st) != 0) { throw detail::cache_sys_error("CPU sink cache fstat"); }
-        const auto v = kimi_vram_source_identity(&st, s.offset + s.data_offset, s.payload_nbytes ? s.payload_nbytes : s.nbytes);
-        return { v.device, v.inode, v.size, v.offset, v.bytes, v.mtime_s, v.mtime_ns, v.ctime_s, v.ctime_ns };
+        ssd::platform::file_identity file;
+        if (!ssd::platform::identity(s.fd_direct, file)) { throw detail::cache_sys_error("CPU sink cache file identity"); }
+        const auto v = kimi_vram_source_identity(file, s.offset + s.data_offset, s.payload_nbytes ? s.payload_nbytes : s.nbytes);
+        return { v.device, v.inode, v.size, v.offset, v.bytes, v.mtime_s, v.mtime_ns, v.ctime_s, v.ctime_ns, v.inode_hi };
     }
     static bool matches(const entry & e, const expert_request & r) {
         for (int role = 0; role < 3; ++role) { if (!(e.source[role] == key(r.role[role]))) { return false; } }
@@ -603,30 +605,33 @@ struct expert_cache {
         const size_t bytes[3] = { std::max(requested[0], role_bytes[0]),
             std::max(requested[1], role_bytes[1]), std::max(requested[2], role_bytes[2]) };
         if (std::equal(bytes, bytes + 3, role_bytes)) { return true; }
-        const uint64_t sum = add(add(bytes[0], bytes[1]), bytes[2]);
+        uint64_t sum = add(add(bytes[0], bytes[1]), bytes[2]);
+        // A slot that gives its own pages back starts on a page. Roles pad to 4 KiB, which is less than the 16 KiB
+        // pages of Apple silicon.
+        if (gives_room_back() && sum) { sum = multiply(ceil_div(sum, page_size), page_size); }
         if (!sum || sum > std::numeric_limits<size_t>::max()) { throw std::runtime_error("invalid CPU sink cache stride"); }
         const size_t next_stride = size_t(sum);
         uint64_t budget = stats.budget_bytes;
         if (budget == auto_budget) {
-            // With a unified-memory GPU the GPU tier keeps the same experts in the same DRAM and computes
-            // them faster, so the RAM cache keeps only the slots the next-layer prefetch lands in. Otherwise
-            // it takes what the cgroup guard would admit now.
+            // With a GPU tier on a unified-memory GPU the tier keeps the same experts in the same DRAM and
+            // computes them faster, so the RAM cache keeps only the slots the next-layer prefetch lands in.
+            // Otherwise, a unified GPU without a tier included, it takes what the cgroup guard would admit now.
             // The receipt names both terms: on a discrete GPU the cgroup term should be the smaller one.
             uint64_t surplus = 0;
             const bool readable = check_room(0, nullptr, &surplus) == room_ok;
-            budget = unified_memory
+            budget = tier_caches
                     ? multiply(multiply(layers.size(), uint64_t(std::max(1, staging_per_layer))), next_stride)
                     : (readable ? surplus : 0);
             const auto & r = last_room;
-            std::fprintf(stderr, "[kimi_cpu_sink_cache] auto_budget=%llu unified=%d slot_bytes=%zu cgroup_surplus=%llu system_surplus=%llu available=%llu floor=%llu binding=%s\n",
-                    (unsigned long long) budget, int(unified_memory), next_stride,
+            std::fprintf(stderr, "[kimi_cpu_sink_cache] auto_budget=%llu unified=%d tier=%d slot_bytes=%zu cgroup_surplus=%llu system_surplus=%llu available=%llu floor=%llu binding=%s\n",
+                    (unsigned long long) budget, int(ledger.state().unified), int(tier_caches), next_stride,
                     (unsigned long long) (r.cgroup == room_unreadable ? 0 : r.cgroup_surplus), (unsigned long long) r.system_surplus,
                     (unsigned long long) r.available, (unsigned long long) r.floor,
                     !readable ? "unreadable" : !r.system || r.cgroup_surplus <= r.system_surplus ? "cgroup" : "system");
         }
         size_t count = static_cast<size_t>(std::min(budget / next_stride,
                                                   multiply(layers.size(), uint64_t(quota))));
-        if (stats.budget_bytes == auto_budget && !unified_memory) {
+        if (stats.budget_bytes == auto_budget && !tier_caches) {
             // Price the same page rounding/tables and allocation guards used
             // by admission. Payload-only division can spend their headroom,
             // making an automatically chosen arena pause before it fills.
@@ -659,9 +664,6 @@ struct expert_cache {
                     (unsigned long long) node_storage, (unsigned long long) node_guard);
         }
         const uint64_t capacity = multiply(count, next_stride);
-        if ((elastic || partial_reclaim) && next_stride % page_size) {
-            throw std::runtime_error("CACHE_ELASTIC and CACHE_PARTIAL_RECLAIM require a page-aligned expert slot stride");
-        }
         if (elastic && prefill_slots > count) {
             throw std::runtime_error("CACHE_PREFILL_SLOTS exceeds the decode cache slot count");
         }
@@ -678,7 +680,7 @@ struct expert_cache {
         }
         // Check before vector value-initialization can touch metadata pages.
         // Existing allocations are already included in memory.current.
-        auto metadata_ticket = take_guard(allocation_cost(multiply(count, sizeof(entry))), "cgroup_metadata_headroom");
+        auto metadata_ticket = take_guard(allocation_cost(multiply(count, sizeof(entry))));
         if (!metadata_ticket) { return false; }
         std::vector<entry> next(count);
         metadata_ticket.value.commit();
@@ -745,8 +747,7 @@ struct expert_cache {
         if (policy == count_decay2) {
             size_t nodes = 0;
             for (const auto & r : requests) { nodes += !r.cache_only && l.count_frequency.find(r.id) == l.count_frequency.end(); }
-            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, double>) + 4 * sizeof(void *))),
-                    "cgroup_count_frequency_headroom");
+            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, double>) + 4 * sizeof(void *))));
             if (!frequency_ticket) {
                 reject_admission(requests, current, "cgroup_count_frequency_headroom"); return;
             }
@@ -770,8 +771,7 @@ struct expert_cache {
             for (const auto & r : requests) { nodes += !r.cache_only && l.frequency.find(r.id) == l.frequency.end(); }
             // Each map node may fault a different allocator page/THP. Duplicate
             // IDs deliberately overcount; no allocation occurs before this guard.
-            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, uint64_t>) + 4 * sizeof(void *))),
-                    "cgroup_frequency_headroom");
+            auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, uint64_t>) + 4 * sizeof(void *))));
             if (!frequency_ticket) {
                 reject_admission(requests, current, "cgroup_frequency_headroom"); return;
             }
@@ -843,14 +843,14 @@ struct expert_cache {
         const uint64_t payload_pages = multiply(slot_pages, page_size);
         const uint64_t new_tables = multiply(new_slots, page_tables(payload_pages));
         const uint64_t extra = add(add(multiply(new_slots, payload_pages), new_tables), arena ? 0 : 64 * 1024);
-        auto slot_ticket = take_guard(extra, "cgroup_headroom");
+        auto slot_ticket = take_guard(extra);
         if (!slot_ticket) {
             reject_admission(requests, current, "cgroup_headroom"); return;
         }
         if (!arena && stats.capacity_bytes && !requests.empty()) {
             if (const char * failed = map_arena()) { pause(requests, current, failed); return; }
         }
-        // MADV_DONTNEED may retain upper-level page tables. Keep a lifetime
+        // A discard may retain upper-level page tables. Keep a lifetime
         // upper bound, while capping refaults so repeated phase churn cannot
         // make the diagnostic grow beyond one per mapped slot.
         const uint64_t maximum_tables = multiply(entries.size(), page_tables(payload_pages));
@@ -864,6 +864,7 @@ struct expert_cache {
             }
             // Finish the admitted first touch before publishing resident slots
             // or asynchronous read targets. Only this new slot is written.
+            if (!commit_slots(size_t(r.cache_admit), 1)) { pause(requests, current, "commit_failed"); return; }
             touch_pages(arena + size_t(r.cache_admit) * stride, stride, size_t(page_size));
             entries[r.cache_admit].resident = true;
             stats.committed_bytes = add(stats.committed_bytes, stride);
@@ -874,13 +875,20 @@ struct expert_cache {
     }
     // The arena, address space only: the guard admits each resident slot against the cgroup, so the kernel's
     // overcommit heuristic must not refuse a mapping larger than RAM plus swap. Ordinary pages: partial reclaim gives
-    // single slots back (MADV_DONTNEED). nullptr, or why it failed.
+    // single slots back (arena_discard). nullptr, or why it failed.
     const char * map_arena() {
-        void * memory = mmap(nullptr, stats.capacity_bytes, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (memory == MAP_FAILED) { return "mmap_failed"; }
+        void * memory = ssd::platform::arena_reserve(stats.capacity_bytes);
+        if (!memory) { return "mmap_failed"; }
         arena = static_cast<char *>(memory); stats.mapped_bytes = stats.capacity_bytes;
-        return madvise(arena, stats.mapped_bytes, MADV_NOHUGEPAGE) != 0 ? "nohugepage_failed" : nullptr;
+        return ssd::platform::arena_no_hugepage(arena, stats.mapped_bytes) ? nullptr : "nohugepage_failed";
+    }
+    // Commits the pages of slots [first, first + count) before their first touch, and again after a discard: Windows
+    // charges commit here and macOS takes the pages back; Linux charges at the touch. Pages a neighbouring slot shares
+    // stay as they are.
+    bool commit_slots(size_t first, size_t count) const {
+        const uint64_t begin = multiply(first, stride) / page_size * page_size;
+        const uint64_t end = ceil_div(multiply(add(first, count), stride), page_size) * page_size;
+        return ssd::platform::arena_commit(arena + begin, size_t(end - begin));
     }
     // A cache that can give room back to the ledger: partial reclaim, or elastic (its prefill shrinks to its prefill
     // slots).
@@ -921,19 +929,15 @@ struct expert_cache {
         if (check_room(0, nullptr, &surplus) == room_unreadable) { return 0; }
         size_t n = std::min<size_t>(entries.size(), surplus > 64 * 1024 ? (surplus - 64 * 1024) / add(payload_pages, tables) : 0);
         if (!n) { return 0; }
-        auto load_ticket = take_guard(cost(n), "load");
+        auto load_ticket = take_guard(cost(n));
         if (!load_ticket) { return 0; }
-        if (map_arena()) { release(); return 0; }
+        if (map_arena() || !commit_slots(0, n)) { release(); return 0; }
         const auto start = detail::cache_clock::now();
         const size_t workers = size_t(std::max(1, std::min(threads, int(n))));
         std::atomic<bool> touched{false};
         auto populate = [&](size_t w) {
             char * begin = arena + n * w / workers * stride, * end = arena + n * (w + 1) / workers * stride;
-#ifdef MADV_POPULATE_WRITE
-            if (begin == end || madvise(begin, size_t(end - begin), MADV_POPULATE_WRITE) == 0) { return; }
-#endif
-            touched = true;
-            for (char * page = begin; page < end; page += page_size) { *reinterpret_cast<volatile char *>(page) = 0; }
+            if (!ssd::platform::arena_populate(begin, size_t(end - begin))) { touched = true; }
         };
         // this thread takes part 0 and whatever no started thread took (the pool's storage is reserved, so only a
         // thread's creation can fail, and then nothing was added)
@@ -995,8 +999,8 @@ struct expert_cache {
     }
     // Host memory the cache may still commit before a reset: its enabled but not yet resident slots (an elastic
     // cache enables all of them again at the next decode phase), or before the first decode token maps the arena,
-    // what geometry() will size it to for this slot size. Off unified memory the automatic size depends on the
-    // cgroup at that time, and only the GPU tier of a unified device asks.
+    // what geometry() will size it to for this slot size. Without a unified GPU tier the automatic size depends on
+    // the cgroup at that time, and only the GPU tier of a unified device asks.
     uint64_t pending_bytes(size_t slot_bytes) const {
         if (!stats.budget_bytes || paused) { return 0; }
         if (arena) {
@@ -1006,7 +1010,7 @@ struct expert_cache {
         if (!slot_bytes || layers.empty()) { return 0; }
         uint64_t budget = stats.budget_bytes;
         if (budget == auto_budget) {
-            if (!unified_memory) { return 0; }
+            if (!tier_caches) { return 0; }
             budget = multiply(multiply(layers.size(), uint64_t(std::max(1, staging_per_layer))), slot_bytes);
         }
         return multiply(std::min(budget / slot_bytes, multiply(layers.size(), uint64_t(quota))), slot_bytes);

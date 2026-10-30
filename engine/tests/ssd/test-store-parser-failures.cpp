@@ -55,7 +55,7 @@ struct fixture {
     ~fixture() { std::filesystem::remove_all(directory); }
 };
 
-void throwing_hook() { throw std::runtime_error("injected hook failure"); }
+[[noreturn]] void throwing_hook() { throw std::runtime_error("injected hook failure"); }
 void check_hook_cleanup(const fixture & files) {
     const auto before = open_fds();
     c0::parser_state state;

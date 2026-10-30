@@ -359,7 +359,7 @@ class Session:
                       "FROZEN": str(self.job / "frozen"), "MODELS": str(self.job / "input")}
         for key, value in parameters.items():
             command.extend(("-D", key + "=" + value))
-        env = {"PATH": "/usr/bin:/bin", "HOME": str(self.job / "work/home"),
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(self.job / "work/home"),
                "TMPDIR": str(self.job / "work/tmp"), "LANG": "C", "LC_ALL": "C",
                "PYTHONDONTWRITEBYTECODE": "1", **extra}
         handle = uuid.uuid4().hex

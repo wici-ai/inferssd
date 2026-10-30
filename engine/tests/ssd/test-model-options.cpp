@@ -99,4 +99,18 @@ int main() {
     auto name_cli = parse("inferssd-settings 1\nmodel.optimizations=[" + ssd::json::quote(named_rule) + "]\n", "cli-name",
                           {{"model.engram_prefetch", "0"}, {"model.hc_fused", "1"}});
     assert(name_cli && !resolve_model(name_cli.value, named).value.engram_prefetch && resolve_model(name_cli.value, named).value.hc_fused);
+    // Neutral recognition preserves upstream profile/file defaults for every architecture.
+    for (const auto & arch : {"deepseek41", "muse-spark", "qwen4exp"}) {
+        const model_identity facts {"", arch, "36", "2", "Test GPU", "Synthetic Model"};
+        const auto neutral_rule = std::string("neutral|on|name:Synthetic Model|") + arch + "|36|2|Test GPU|-|-";
+        auto neutral = parse("inferssd-settings 1\nmodel.engram_prefetch=1\nmodel.hc_fused=0\nmodel.optimizations=[" +
+                             ssd::json::quote(neutral_rule) + "]\n", "upstream-profile");
+        assert(neutral);
+        const auto receipt = resolve_model(neutral.value, facts);
+        assert(receipt && receipt.value.matched_rule == "neutral");
+        assert(receipt.value.engram_prefetch && !receipt.value.hc_fused);
+        const auto unknown = resolve_model(neutral.value, {});
+        assert(unknown && unknown.value.matched_rule.empty());
+        assert(unknown.value.engram_prefetch && !unknown.value.hc_fused);
+    }
 }

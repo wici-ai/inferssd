@@ -12,19 +12,124 @@ from pathlib import PurePosixPath
 import final_chat
 
 from ci.contract import DEVICES, digest, load, policy_read
-from ci.impact import CASES, device_requirements, fingerprint, validate
+from ci.impact import BASELINE, CASES, device_requirements, fingerprint, validate
 
 
 JOB = re.compile(r"[0-9a-f]{32}")
 OPERATOR_DEVICES = DEVICES
 FUNCTIONAL_MODE = "functional-numerical"
 PERFORMANCE_MODE = "functional-numerical-performance"
+GATE = "regression-gate"
+BASELINE_JOB = "baseline"
+# Timed runs per model, in execution order. A PR runs its candidate three times
+# and its base once, not first. A baseline job builds one main commit (as the
+# candidate side) and measures it four times.
+RUN_ORDERS = {GATE: ["candidate", "base", "candidate", "candidate"], BASELINE_JOB: ["candidate"] * 4}
 
 
-def performance_protocol():
-    """The operator performance checkpoint is fixed, and is never a formal sample."""
-    return dict(tier="512", prompt_sha256=final_chat.PROMPTS["512"][1],
-                output_tokens=256, samples_per_side=1)
+def performance_protocol(purpose=GATE):
+    """The fixed operator performance protocol; it never adds formal samples."""
+    if purpose not in RUN_ORDERS:
+        raise ValueError("operator performance purpose must be the gate or a baseline job")
+    return dict(tier="512", prompt_sha256=final_chat.PROMPTS["512"][1], output_tokens=256,
+                purpose=purpose, order=list(RUN_ORDERS[purpose]))
+
+
+def protocol_checked(protocol, *, baseline):
+    """Accept only the fixed gate protocol, or the baseline protocol for a baseline plan."""
+    if not isinstance(protocol, dict) or type(protocol.get("output_tokens")) is not int:
+        raise ValueError("operator performance requires the fixed 512/256 run protocol")
+    if protocol != performance_protocol(BASELINE_JOB if baseline else GATE):
+        raise ValueError("operator performance requires the fixed 512/256 run protocol")
+    return protocol
+
+
+def timed_protocol(config):
+    """The sealed protocol of an operator run; other configurations use the gate."""
+    protocol = config.get("performance_protocol")
+    if protocol is None:
+        return performance_protocol()
+    return protocol_checked(protocol, baseline=config.get("selection_plan", {}).get("purpose") == BASELINE)
+
+
+def timed_sides(protocol):
+    """Sides that are built and timed: a baseline job builds only the candidate side."""
+    return tuple(side for side in ("base", "candidate") if side in protocol["order"])
+
+
+def run_count(protocol, side):
+    return protocol["order"].count(side)
+
+
+def job_sides(config, needs):
+    """Sides staged and built: both for a PR with timed cells, the candidate otherwise.
+
+    A baseline job builds its one main commit once, as the candidate side.
+    """
+    if not needs["performance"]:
+        return ("candidate",)
+    return timed_sides(timed_protocol(config))
+
+
+def build_config_sha256(spec):
+    """Side-independent build settings that determine the frozen output.
+
+    A side's own source, scratch and frozen paths (for example the
+    `LD_LIBRARY_PATH` naming `/build/base/bin`) are written as placeholders, so
+    the base side of a PR and the candidate side of the baseline job that built
+    the same commit have the same identity. Jobs, timeout and log bound do not
+    change the output.
+    """
+    paths = spec["paths"]
+    names = sorted({paths[name]: name for name in ("frozen", "source", "build", "cwd")}.items(),
+                   key=lambda item: -len(item[0]))
+    pattern = re.compile("|".join(re.escape(path) + r"(?![^/:\s=\"])" for path, _ in names))
+    placeholders = dict(names)
+
+    def neutral(value):
+        if isinstance(value, str):
+            return pattern.sub(lambda match: "{" + placeholders[match.group(0)] + "}", value)
+        if isinstance(value, list):
+            return [neutral(item) for item in value]
+        if isinstance(value, dict):
+            return {key: neutral(item) for key, item in value.items()}
+        return value
+
+    build = {key: neutral(value) for key, value in spec["build"].items()
+             if key not in ("jobs", "timeout_s", "output_max_bytes")}
+    return fingerprint(dict(platform=paths["platform"], build=build))
+
+
+def build_cache_key(config, side):
+    """Device build-cache key: exact commit, build configuration and reviewed toolchain."""
+    spec = config["sides"][side]
+    return fingerprint(dict(schema_version=1, revision=spec["revision"], build_config_sha256=build_config_sha256(spec),
+                            toolchain=spec["build"]["toolchain"]))
+
+
+def baseline_build_identity(config, build):
+    """Build identity a baseline record keeps: what a later PR can adopt as its base."""
+    spec = config["sides"]["candidate"]
+    return dict(freeze_manifest_sha256=build["freeze"]["manifest_sha256"], binary_sha256=build["binary"]["sha256"],
+                cache_key=build_cache_key(config, "candidate"), build_config_sha256=build_config_sha256(spec),
+                toolchain=build["toolchain"])
+
+
+def sealed_history(config):
+    """Baseline records sealed into this job by the operator.
+
+    Operator performance configs always carry the field (possibly empty), so a
+    dropped field cannot be confused with a device that has no history yet.
+    """
+    from ci.compare import history_checked
+    return history_checked(config.get("baseline_history", []))
+
+
+def arm_prefix(side, model, run):
+    """Stage prefix of one timed run; the broker stage is `<prefix>-benchmark-<tier>`."""
+    if side not in ("base", "candidate") or type(run) is not int or run < 1:
+        raise ValueError("explicit timed run side and index required")
+    return side + "-" + model + "-r" + str(run)
 
 
 def execution_scope(value):
@@ -80,12 +185,26 @@ def requirements(config):
         raise ValueError("unknown physical device")
     needs = runtime_requirements(config)
     scope = execution_scope(config)
+    baseline = plan["purpose"] == BASELINE
+    if baseline and (scope is None or scope["validation_mode"] != PERFORMANCE_MODE):
+        raise ValueError("a baseline job requires the explicit operator performance scope")
     if scope is not None and scope["validation_mode"] == PERFORMANCE_MODE:
-        protocol = config.get("performance_protocol")
-        if (protocol != performance_protocol()
-                or type(protocol.get("output_tokens")) is not int
-                or type(protocol.get("samples_per_side")) is not int):
-            raise ValueError("operator performance requires the fixed Azure 512/256 single-sample protocol")
+        protocol_checked(config.get("performance_protocol"), baseline=baseline)
+        if "baseline_history" not in config:
+            raise ValueError("operator performance requires explicitly sealed baseline history")
+    sealed_history(config)
+    if "base_build" in config:
+        offer = config["base_build"]
+        if (baseline or config["paths"]["platform"] != "linux" or not isinstance(offer, dict)
+                or set(offer) != {"key", "freeze_manifest_sha256", "source_job"}
+                or offer["key"] != build_cache_key(config, "base")
+                or not isinstance(offer["freeze_manifest_sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", offer["freeze_manifest_sha256"]) is None
+                or not isinstance(offer["source_job"], str) or JOB.fullmatch(offer["source_job"]) is None):
+            raise ValueError("a cached base build is offered only to a Linux PR job, for its exact base build")
+    if "cache_build_as" in config and (not baseline or config["paths"]["platform"] != "linux"
+                                       or config["cache_build_as"] != build_cache_key(config, "candidate")):
+        raise ValueError("only a Linux baseline job stores its build, under its exact cache key")
     if not needs["models"]:
         raise ValueError("unselected device must not be dispatched")
     if (config.get("schema_version") != 1 or config.get("purpose") != "selected-integration"
@@ -124,6 +243,25 @@ def requirements(config):
             raise ValueError("sealed build identity omits selected numerical images")
     if config["paths"] != config["sides"]["candidate"]["paths"]:
         raise ValueError("workflow platform guard must use the exact candidate paths")
+    from ci.staged_launch import derived, request_checked, sealed
+    if derived(config):
+        # Only a baseline job profiles the machine; a PR job reads the file its
+        # device's most recent baseline job stored.
+        if baseline and sealed(config) is not None:
+            raise ValueError("a baseline job profiles the machine; it takes no sealed characteristics")
+        if not baseline and sealed(config) is None:
+            raise ValueError("no baseline machine characteristics are sealed for " + device
+                             + "; a baseline job must run on it first")
+        # Each side resolves its launch from the same request on the device.
+        for model in needs["models"]:
+            requests = [config["sides"][side]["models"][model]["launch"] for side in ("base", "candidate")]
+            if request_checked(requests[0]) != request_checked(requests[1]):
+                raise ValueError("base and candidate launch requests differ")
+            for side in ("base", "candidate"):
+                data = config["sides"][side]["models"][model]
+                if any(key in launch for launch in (data["smoke"], *data.get("benchmarks", {}).values())
+                       for key in ("argv", "preflight_argv", "port")):
+                    raise ValueError("a launch derived on the device takes its argv and port from its resolution")
     from ci.model_admission import enabled
     enabled(config)
     return needs
@@ -139,11 +277,18 @@ def bind(config, manifest, plan, policy):
                   paths=config["sides"]["candidate"]["paths"])
     config.pop("manifest_sha256", None)
     needs = requirements(config)
-    sides = ("base", "candidate") if needs["performance"] else ("candidate",)
+    sides = job_sides(config, needs)
     if manifest.get("source_revisions") != {side: plan[side] for side in sides}:
         raise ValueError("operator manifest must stage the exact required source revisions")
     if config["paths"]["platform"] == "linux":
         manifest["stages"] = linux_stages(config, needs, sides)
+        # The broker re-hashes a cached tree before adopting it, and only a
+        # baseline job of a main commit stores its frozen build for later jobs.
+        if "base_build" in config:
+            manifest["prebuilt_offer"] = {"base": dict(key=config["base_build"]["key"],
+                                                       manifest_sha256=config["base_build"]["freeze_manifest_sha256"])}
+        if "cache_build_as" in config:
+            manifest["cache_as"] = {"candidate": config["cache_build_as"]}
     else:
         manifest["selection_resource_policy"] = config["host"]["resources"]
         lock = manifest.get("selection_lock_identity")
@@ -164,6 +309,7 @@ def linux_stages(config, needs, sides):
     def add(name, kind, side, executable, cwd, gpu):
         stages[name] = dict(kind=kind, side=side, executables=[executable], cwd=cwd, gpu=gpu)
 
+    protocol = timed_protocol(config)
     for side in sides:
         spec = config["sides"][side]
         paths, build = spec["paths"], spec["build"]
@@ -182,7 +328,17 @@ def linux_stages(config, needs, sides):
                     add("candidate-observations-" + model, "test", side, "/usr/bin/cat", data["smoke"]["observations"]["cwd"], False)
             for tier, arm in data.get("benchmarks", {}).items():
                 add(side + "-" + model + "-preflight-" + tier, "server", side, binary, arm["cwd"], True)
-                add(side + "-" + model + "-benchmark-" + tier, "server", side, binary, arm["cwd"], True)
+                for run in range(1, run_count(protocol, side) + 1):
+                    add(arm_prefix(side, model, run) + "-benchmark-" + tier, "server", side, binary, arm["cwd"], True)
+    from ci.staged_launch import PROFILE_STAGE, derived, launch_models, profile_side, sealed
+    if derived(config):
+        # A baseline job's one machine profile, then each side's own launch resolution.
+        if sealed(config) is None:
+            first = profile_side(config, needs)
+            add(PROFILE_STAGE, "test", first, "/usr/bin/python3", config["sides"][first]["paths"]["cwd"], True)
+        for side in sides:
+            for model in launch_models(config, needs, side):
+                add(side + "-" + model + "-launch", "test", side, "/usr/bin/python3", config["sides"][side]["paths"]["cwd"], True)
     root = config["sides"]["candidate"]["paths"]["frozen"]
     for case in needs["numerical"]:
         add("candidate-numerical-" + case, "test", "candidate", root + "/bin/" + CASES[case][0], config["numerical"]["cwd"], True)
@@ -200,6 +356,11 @@ def bound(config, manifest, job_id):
     if (not JOB.fullmatch(job_id) or manifest.get("job_id") != job_id
             or manifest.get("selection") != expected):
         raise ValueError("root broker manifest/config/selected source binding differs")
+    offer = ({"base": dict(key=config["base_build"]["key"], manifest_sha256=config["base_build"]["freeze_manifest_sha256"])}
+             if "base_build" in config else None)
+    cache_as = {"candidate": config["cache_build_as"]} if "cache_build_as" in config else None
+    if manifest.get("prebuilt_offer") != offer or manifest.get("cache_as") != cache_as:
+        raise ValueError("root broker build-cache instructions differ from the sealed configuration")
     if config["paths"]["platform"] == "darwin":
         lock = manifest.get("selection_lock_identity")
         if (manifest.get("selection_resource_policy") != config["host"]["resources"]

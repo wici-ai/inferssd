@@ -14,7 +14,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-from stages import JobSession, RunningStage, freeze_tree
+import stages
+from stages import JobSession, RunningStage, copy_sealed_tree, freeze_tree, prune_cache
 
 
 class FreezeTests(unittest.TestCase):
@@ -93,6 +94,149 @@ class FreezeTests(unittest.TestCase):
         (self.source / 'second').symlink_to('first')
         with self.assertRaises((RuntimeError, OSError)):
             freeze_tree(self.source, self.output, 1024)
+
+
+class BuildCacheTests(unittest.TestCase):
+    """The base build cache: a verified copy in, a verified copy out, nothing mounted from it."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.build = self.root / 'scratch'
+        self.build.mkdir()
+        library = self.build / 'libengine.so.1'
+        library.write_bytes(b'compiled-library')
+        library.chmod(0o755)
+        (self.build / 'libengine.so').symlink_to('libengine.so.1')
+        (self.build / 'bin').mkdir()
+        (self.build / 'bin' / 'inferssd-server').write_bytes(b'server')
+        (self.build / 'CMakeCache.txt').write_bytes(b'CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/g++-12')
+        self.frozen = freeze_tree(self.build, self.root / 'frozen', 1 << 20)
+        self.key = 'a' * 64
+        # Tests run unprivileged; root ownership checks are the broker's own contract tests.
+        patcher = patch.object(stages, 'protected', lambda path, directory=False: Path(path))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        for directory in self.root.rglob('*'):
+            if directory.is_dir() and not directory.is_symlink():
+                directory.chmod(0o700)
+        self.temp.cleanup()
+
+    def session(self, manifest, side='candidate'):
+        session = object.__new__(JobSession)
+        session.config = {'state_root': str(self.root / 'state'), 'build_max_bytes': 1 << 20}
+        (self.root / 'state').mkdir(exist_ok=True)
+        session.job_id = 'b' * 32
+        session.root = self.root / 'job'
+        (session.root / 'frozen').mkdir(parents=True, exist_ok=True)
+        session.manifest = {'builds': {'base': 'base', 'candidate': 'candidate'}, **manifest}
+        session.frozen, session.prebuilt, session.prebuilt_refused = {}, {}, {}
+        session.lease = type('Lease', (), {'identity': [1, 2]})()
+        return session
+
+    def store(self):
+        """A baseline job stores its frozen candidate under the cache key."""
+        session = self.session({'cache_as': {'candidate': self.key}})
+        frozen = session.root / 'frozen' / 'candidate'
+        if not frozen.exists():
+            copy = copy_sealed_tree(self.root / 'frozen', frozen, self.frozen['files'], 1 << 20)
+            self.assertEqual(copy['manifest_sha256'], self.frozen['manifest_sha256'])
+        return session.store_cached_build('candidate', self.frozen)
+
+    def test_copy_reproduces_the_sealed_tree_and_its_hash(self):
+        result = copy_sealed_tree(self.root / 'frozen', self.root / 'copy', self.frozen['files'], 1 << 20)
+        self.assertEqual(result, self.frozen)
+        copied = self.root / 'copy'
+        self.assertEqual((copied / 'bin' / 'inferssd-server').read_bytes(), b'server')
+        self.assertEqual((copied / 'libengine.so').stat().st_ino, (copied / 'libengine.so.1').stat().st_ino)
+        self.assertEqual((copied / 'libengine.so.1').stat().st_mode & 0o777, 0o555)
+
+    def test_copy_refuses_changed_missing_or_unsafe_files(self):
+        changed = self.root / 'frozen' / 'bin' / 'inferssd-server'
+        changed.chmod(0o644)
+        changed.write_bytes(b'SERVER')  # Same size, different bytes.
+        with self.assertRaisesRegex(ValueError, 'hash differs'):
+            copy_sealed_tree(self.root / 'frozen', self.root / 'copy', self.frozen['files'], 1 << 20)
+        for index, (rows, message) in enumerate((
+                ([{'path': 'missing', 'size': 1, 'sha256': '0' * 64}], 'No such file'),
+                ([{'path': '../escape', 'size': 1, 'sha256': '0' * 64}], 'unsafe'),
+                ([{'path': '/abs', 'size': 1, 'sha256': '0' * 64}], 'unsafe'))):
+            target = self.root / ('copy-' + str(index))
+            with self.assertRaisesRegex((ValueError, OSError), message):
+                copy_sealed_tree(self.root / 'frozen', target, rows, 1 << 20)
+
+    def test_baseline_job_stores_once_and_a_pr_adopts_a_verified_copy(self):
+        self.assertEqual(self.store(), {'status': 'stored', 'key': self.key})
+        self.assertEqual(self.store()['status'], 'present')
+        entry = self.root / 'state' / 'build-cache' / self.key
+        self.assertEqual(json.loads((entry / 'manifest.json').read_text())['manifest_sha256'],
+                         self.frozen['manifest_sha256'])
+        session = self.session({'prebuilt_offer': {'base': {'key': self.key,
+                                                            'manifest_sha256': self.frozen['manifest_sha256']}}})
+        session.adopt_cached_builds()
+        self.assertEqual(session.prebuilt_refused, {})
+        adopted = session.prebuilt['base']
+        self.assertEqual((adopted['path'], adopted['key'], adopted['manifest_sha256']),
+                         ('/build/base', self.key, self.frozen['manifest_sha256']))
+        self.assertEqual(session.frozen['base']['files'], self.frozen['files'])
+        self.assertEqual((session.root / 'frozen' / 'base' / 'bin' / 'inferssd-server').read_bytes(), b'server')
+        self.assertEqual(json.loads(Path(adopted['manifest_path']).read_text())['manifest_sha256'],
+                         self.frozen['manifest_sha256'])
+
+    def test_missing_or_mismatched_cache_entry_leaves_the_side_to_be_built(self):
+        offer = {'key': self.key, 'manifest_sha256': self.frozen['manifest_sha256']}
+        session = self.session({'prebuilt_offer': {'base': offer}})
+        session.adopt_cached_builds()  # miss: nothing stored yet
+        self.assertEqual(session.prebuilt, {})
+        self.assertIn('base', session.prebuilt_refused)
+        self.assertNotIn('base', session.frozen)
+        self.store()
+        for damage in ('offer-hash', 'tree-bytes'):
+            if damage == 'offer-hash':
+                current = dict(offer, manifest_sha256='0' * 64)
+            else:
+                current = offer
+                tampered = self.root / 'state' / 'build-cache' / self.key / 'tree' / 'bin' / 'inferssd-server'
+                (tampered.parent).chmod(0o755)
+                tampered.chmod(0o644)
+                tampered.write_bytes(b'SERVER')
+            session = self.session({'prebuilt_offer': {'base': current}})
+            session.adopt_cached_builds()
+            self.assertEqual(session.prebuilt, {}, damage)
+            self.assertRegex(session.prebuilt_refused['base'], 'differs', damage)
+            self.assertFalse((session.root / 'frozen' / 'base').exists(), damage)
+
+    def test_conflicting_store_is_reported_not_replaced(self):
+        self.store()
+        other = dict(self.frozen, manifest_sha256='f' * 64)
+        session = self.session({'cache_as': {'candidate': self.key}})
+        self.assertEqual(session.store_cached_build('candidate', other), {'status': 'conflict', 'key': self.key})
+        entry = self.root / 'state' / 'build-cache' / self.key
+        self.assertEqual(json.loads((entry / 'manifest.json').read_text())['manifest_sha256'],
+                         self.frozen['manifest_sha256'])
+        self.assertEqual(self.session({}).store_cached_build('candidate', self.frozen), {'status': 'not-requested'})
+
+    def test_invalid_offer_is_refused_before_any_copy(self):
+        for offers in ({'other': {'key': self.key, 'manifest_sha256': '0' * 64}},
+                       {'base': {'key': 'short', 'manifest_sha256': '0' * 64}},
+                       {'base': {'key': self.key}}):
+            with self.assertRaisesRegex(ValueError, 'offer'):
+                self.session({'prebuilt_offer': offers}).adopt_cached_builds()
+
+    def test_prune_keeps_the_newest_entries_and_the_protected_key(self):
+        cache = self.root / 'cache'
+        cache.mkdir()
+        for index in range(5):
+            entry = cache / (str(index) * 64)
+            (entry / 'tree').mkdir(parents=True)
+            (entry / 'tree' / 'file').write_bytes(b'x')
+            entry.chmod(0o555)
+            os.utime(entry, ns=(index * 10**9, index * 10**9))
+        (cache / ('.' + 'e' * 64 + '-' + 'f' * 32)).mkdir()
+        prune_cache(cache, keep=3, protect=('0' * 64,))
+        self.assertEqual(sorted(entry.name[0] for entry in cache.iterdir()), ['0', '2', '3', '4'])
 
 
 class RequestTests(unittest.TestCase):

@@ -17,7 +17,7 @@ CONFIG = dict(host=dict(hardware=dict(memory_total_bytes=48 << 30), resources=di
 
 def snapshot(second, *, free=38 << 30, swapouts=100, compressions=100):
     page = 16384
-    vm = f'Mach Virtual Memory Statistics: (page size of {page} bytes)\nPages free: {free // page}.\nPages inactive: 0.\n'
+    vm = f'Mach Virtual Memory Statistics: (page size of {page} bytes)\nPages free: {free // page}.\nPages inactive: 0.\nFile-backed pages: 0.\n'
     vm += ''.join(f'{name}: {value}.\n' for name, value in (
         ('Swapins', 100), ('Swapouts', swapouts), ('Compressions', compressions),
         ('Decompressions', 100), ('Pageins', 100), ('Pageouts', 100)))
@@ -48,11 +48,11 @@ def arm(folder, monkeypatch, *, free=38 << 30, swapouts=100, compressions=100):
 
 def test_policy_uses_sealed_ram_and_fixed_thresholds():
     value = gate.policy(CONFIG)
-    assert value['limits']['min_free_inactive_bytes'] == 36 << 30
+    assert value['limits']['min_available_bytes'] == 36 << 30
     assert value['limits']['max_non_ci_process_rss_bytes'] == 512 << 20
     assert value['limits']['max_non_ci_process_cpu_cores'] == .25
     assert value['limits']['max_non_ci_cpu_cores'] == .5
-    assert value['limits']['max_compression_delta_bytes'] == 64 << 20
+    assert value['limits']['max_compressed_bytes'] == 64 << 20
     for ram in (True, 0, '48', 30 << 30):
         changed = copy.deepcopy(CONFIG); changed['host']['hardware']['memory_total_bytes'] = ram
         with pytest.raises(ValueError): gate.policy(changed)
@@ -61,7 +61,7 @@ def test_policy_uses_sealed_ram_and_fixed_thresholds():
 def test_valid_retention_accepts_static_swap_and_compression_only(tmp_path, monkeypatch):
     summary = arm(tmp_path / 'arm', monkeypatch, compressions=100 + (128 << 20) // 16384)
     assert summary['quiet']['status'] == summary['timed']['status'] == 'passed'
-    assert summary['timed']['compression_delta_bytes'] == 128 << 20
+    assert summary['timed']['compressed_bytes'] == 128 << 20
     assert set(summary['artifacts']) == {gate.QUIET, *gate.SNAPSHOTS}
     assert gate.retained_quiet(tmp_path / 'arm', gate.policy(CONFIG))['quiet']['status'] == 'passed'
 
@@ -78,7 +78,7 @@ def test_retained_missing_or_changed_evidence_is_refused(tmp_path, monkeypatch, 
         if fault == 'raw': value['raw']['swap']['stdout'] = 'invalid'
         elif fault == 'parsed': value['swap']['used_bytes'] += 1
         elif fault == 'quiet-result': value['assessment']['elapsed_s'] += 1
-        elif fault == 'quiet-policy': value['policy']['limits']['max_swap_delta_bytes'] += 1
+        elif fault == 'quiet-policy': value['policy']['limits']['max_swapout_bytes'] += 1
         elif fault == 'order': value['started_monotonic_ns'] = 1
         elif fault == 'ram':
             value['memory_bytes'] = 64 << 30; value['raw']['memory_bytes']['stdout'] = str(64 << 30)
@@ -99,19 +99,27 @@ def test_failed_quiet_or_capture_retains_raw_evidence(tmp_path, monkeypatch):
     assert json.loads((tmp_path / gate.SNAPSHOTS[0]).read_text())['errors'] == ['timeout']
 
 
-@pytest.mark.parametrize('reason', ['swap', 'free', 'prior-slowdown'])
-def test_pair_demotes_without_erasing_metrics_or_rerunning(tmp_path, monkeypatch, reason):
-    base = arm(tmp_path / 'base', monkeypatch)
-    candidate = arm(tmp_path / 'candidate', monkeypatch, free=36 << 30 if reason == 'free' else 38 << 30,
-        swapouts=101 if reason == 'swap' else 100)
-    compared = dict(status='passed', passed=True, metrics={'decode_first128_tps':{'base':1, 'candidate':2}},
-        observed_slowdowns=[], diagnostic_required=False)
-    if reason == 'prior-slowdown':
-        compared.update(status='inconclusive', passed=False, observed_slowdowns=['decode_first128_tps'])
-    original = copy.deepcopy(compared)
-    result = gate.pair(compared, base, candidate)
-    assert result['status'] == 'inconclusive' and result['passed'] is False
-    assert result['metrics'] == original['metrics'] and result['observed_slowdowns'] == original['observed_slowdowns']
-    assert compared == original
-    if reason == 'prior-slowdown': assert result['environment']['status'] == 'passed'
-    else: assert result['environment']['status'] == 'inconclusive'
+@pytest.mark.parametrize('reason', [None, 'swap', 'free'])
+def test_cell_flags_any_run_or_free_memory_spread_without_touching_measurements(tmp_path, monkeypatch, reason):
+    runs = {name: arm(tmp_path / name.replace('/', '-'), monkeypatch) for name in ('r1/candidate', 'r1/base', 'r2/candidate')}
+    runs['r3/candidate'] = arm(tmp_path / 'r3', monkeypatch, free=36 << 30 if reason == 'free' else 38 << 30,
+                               swapouts=101 if reason == 'swap' else 100)
+    original = copy.deepcopy(runs)
+    result = gate.cell(runs)
+    assert runs == original and result['runs'] == original
+    if reason is None:
+        assert result['status'] == 'passed' and result['reasons'] == []
+    elif reason == 'free':
+        assert result['status'] == 'needs-review' and result['reasons'] == ['prelaunch-available-difference']
+    else:
+        assert result['status'] == 'needs-review' and result['reasons'][0].startswith('r3/candidate:')
+
+
+@pytest.mark.parametrize('damage', ['one-run', 'policy', 'quiet'])
+def test_cell_refuses_incomplete_or_mismatched_host_evidence(tmp_path, monkeypatch, damage):
+    runs = {name: arm(tmp_path / name.replace('/', '-'), monkeypatch) for name in ('r1/candidate', 'r1/base')}
+    if damage == 'one-run': runs.pop('r1/base')
+    elif damage == 'policy': runs['r1/base']['policy'] = dict(runs['r1/base']['policy'], pair_free_tolerance_bytes=1)
+    else: runs['r1/base']['quiet'] = dict(status='failed')
+    with pytest.raises(ValueError):
+        gate.cell(runs)

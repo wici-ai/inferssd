@@ -7,24 +7,14 @@
 // pages (and one page for the boundary). The host-memory ledger holds this room for a prefill until the first decode
 // token (kimi_cpu_sink_cache_prefill_room).
 #include "ggml.h"
+#include "ggml-ssd/platform/memory.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <map>
 
-#if !defined(_WIN32)
-#include <unistd.h>
-#endif
-
-static inline uint64_t llama_host_page_size() {
-#if defined(_WIN32)
-    return 4096;
-#else
-    const long page = sysconf(_SC_PAGESIZE);
-    return page > 0 ? uint64_t(page) : 4096;
-#endif
-}
+static inline uint64_t llama_host_page_size() { return uint64_t(ssd::platform::page_size()); }
 
 static inline uint64_t llama_host_gather_bytes(ggml_cgraph * gf, uint64_t page,
         const std::function<bool(const ggml_tensor *)> & file_mapped) {

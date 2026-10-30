@@ -183,7 +183,6 @@ struct json_writer {
 
 static void configure_environment(fixture_inputs & inputs) {
     inputs.set("ready_first", "1");
-    inputs.set("split_cv", "1");
     inputs.set("early_up_gate", "1");
     inputs.set("role_major", "1");
     inputs.set("nonblocking_down_sched", "1");

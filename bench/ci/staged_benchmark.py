@@ -96,8 +96,11 @@ def benchmark(session, side, config, output, *, host_policy=None):
     revision(config["revision"])
     tier = config.get("tier", "512")
     prefix = config.get("stage_prefix", side)
+    run = config.get("run")
     if tier not in ("512", "4096") or not re.fullmatch(r"[a-z0-9-]{1,64}", prefix):
         raise ValueError("fixed prompt tier and bounded stage identity required")
+    if run is not None and (type(run) is not int or run < 1):
+        raise ValueError("timed run index must be a positive integer")
     # Validate the trusted asset before a candidate process starts. record()
     # and read_result() independently retain and recheck the same fixed hash.
     final_chat.prompt_path(tier)
@@ -119,6 +122,8 @@ def benchmark(session, side, config, output, *, host_policy=None):
                   completion_requests=0, performance_acceptance=False,
                   cleanup_confirmed=False, formal_samples=0,
                   prompt_sha256=final_chat.PROMPTS[tier][1])
+    if run is not None:
+        result["run"] = run
     runtime = dict(schema_version=1, purpose="staged-benchmark-runtime", side=side,
                    job_id=session.job_id, observations={},
                    launch={key: config[key] for key in (

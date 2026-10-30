@@ -867,7 +867,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // leave the mask unallocated if all attention layers have their own (e.g. qwen4exp QSA)
+    if (inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -2068,6 +2071,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 descriptor->activation =
                     kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, execution.clamp };
                 break;
+            case llama_ssd::expert_activation::swiglu:
+                descriptor->activation =
+                    kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f };
+                break;
             case llama_ssd::expert_activation::unsupported:
                 GGML_ABORT("invalid accepted SSD expert activation");
         }
@@ -2092,8 +2099,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(args[0], "ffn_moe_cpu_sink_in", il);
         cb(args[1], "ffn_moe_cpu_sink_ids", il);
         cb(args[2], "ffn_moe_cpu_sink_weights", il);
+        // every CPU thread of the graph is a compute participant of the node's call
         ggml_tensor * result = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1,
-            args, hint ? 6 : cache_compute ? 5 : post_exp_norm ? 4 : 3, llama_kimi_cpu_sink_compute, 1, descriptor.get());
+            args, hint ? 6 : cache_compute ? 5 : post_exp_norm ? 4 : 3, llama_kimi_cpu_sink_compute,
+            GGML_N_TASKS_MAX, descriptor.get());
         res->cpu_sink_nodes.emplace_back(std::move(descriptor));
         cb(result, "ffn_moe_cpu_sink", il);
         ggml_backend_sched_set_tensor_backend(sched, result, backend_cpu);

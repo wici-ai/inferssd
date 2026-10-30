@@ -3,7 +3,6 @@
 
 #include "cpu-prefill.h"
 #include "runtime.h"
-#include "mac-runtime.h"
 #include "../../ggml-ssd/host/arbiter.h"
 #include <cstddef>
 #include <cstdint>
@@ -19,6 +18,9 @@ struct api_v2 {
     decltype(&kimi_cpu_sink_run) run;
     decltype(&kimi_cpu_sink_run_activation) run_activation;
     decltype(&kimi_cpu_sink_destroy) destroy;
+    decltype(&kimi_cpu_sink_call_open) call_open;
+    decltype(&kimi_cpu_sink_call_close) call_close;
+    decltype(&kimi_cpu_sink_call_join) call_join;
     decltype(&kimi_cpu_sink_cache_configure) cache_configure;
     decltype(&kimi_cpu_sink_cache_begin) cache_begin;
     decltype(&kimi_cpu_sink_vram_phase_complete) vram_phase_complete;
@@ -31,9 +33,6 @@ struct api_v2 {
     decltype(&kimi_cpu_prefill_run) prefill_run;
     decltype(&kimi_cpu_prefill_run_activation) prefill_run_activation;
     decltype(&kimi_cpu_prefill_destroy) prefill_destroy;
-    decltype(&ssd::mac::create_configured) mac_create;
-    decltype(&ssd::mac::destroy) mac_destroy;
-    ssd::mac::set_backend_cache mac_attach;
     ssd::result<ssd::host::allocation_ticket> (*take_room)(
         kimi_cpu_sink *, const ssd::settings::snapshot *, const ssd::runtime_services *,
         uint64_t, uint64_t, uint64_t) noexcept;
@@ -51,6 +50,7 @@ inline bool valid(const api_v2 * api) noexcept {
         api->run &&
         api->run_activation &&
         api->destroy &&
+        api->call_open && api->call_close && api->call_join &&
         api->cache_configure &&
         api->cache_begin &&
         api->vram_phase_complete &&
@@ -62,7 +62,7 @@ inline bool valid(const api_v2 * api) noexcept {
         api->prefill_create &&
         api->prefill_run &&
         api->prefill_run_activation &&
-        api->prefill_destroy && api->mac_create && api->mac_destroy && api->mac_attach &&
+        api->prefill_destroy &&
         api->take_room && api->attach_services;
 }
 } } // namespace ssd::cpu

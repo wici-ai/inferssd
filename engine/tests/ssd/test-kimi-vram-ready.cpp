@@ -12,7 +12,7 @@ static void rejected(const std::function<void()> & fn) {
 int main() { try {
     vram_slot_table table(2, {1}, false);
     kimi_vram_request r = {}; r.layer = 1; r.expert = 0; r.weight = .3f;
-    for (int i = 0; i < 3; ++i) r.role[i] = {1,2,1000000,uint64_t(i)*4096,4096,3,4,5,6};
+    for (int i = 0; i < 3; ++i) r.role[i] = {1,2,1000000,uint64_t(i)*4096,4096,3,4,5,6,0};
     table.next_token(); table.prepare(&r,1); int ready = -1;
     rejected([&] { table.acquire_ready(&r,1,&ready); });
     table.publish(0); table.finish();

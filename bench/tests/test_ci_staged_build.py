@@ -132,21 +132,22 @@ def test_only_complete_root_freezer_alias_groups_are_readable(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("platform,flags", [
-    ("darwin", ["-DLLAMA_SSD_STORE=ON", "-DBUILD_SHARED_LIBS=OFF"]),
-    ("darwin", ["-DLLAMA_SSD_STORE:BOOL=TRUE"]),
-    ("linux", ["-DBUILD_SHARED_LIBS=OFF"]),
+    ("darwin", ["-DLLAMA_USE_SYSTEM_GGML=ON"]),
+    ("darwin", ["-DLLAMA_SSD_STORE:BOOL=TRUE", "-DLLAMA_USE_SYSTEM_GGML:BOOL=TRUE"]),
     ("linux", ["-DLLAMA_USE_SYSTEM_GGML=ON"]),
+    ("linux", ["-DLLAMA_SSD_STORE=OFF", "-DLLAMA_SSD_STORE=ON", "-DLLAMA_USE_SYSTEM_GGML=ON"]),
 ])
 def test_incompatible_store_profile_rejected_before_build(platform, flags):
-    with pytest.raises(ValueError, match="LLAMA_SSD_STORE requires Linux"):
+    with pytest.raises(ValueError, match="LLAMA_SSD_STORE requires the bundled ggml"):
         staged_build.validate_platform_flags(platform, flags)
 
 
 @pytest.mark.parametrize("platform,flags", [
     ("darwin", ["-DBUILD_SHARED_LIBS=OFF", "-DGGML_METAL=ON"]),
-    ("darwin", ["-DLLAMA_SSD_STORE=ON", "-DLLAMA_SSD_STORE:BOOL=OFF"]),
+    ("darwin", ["-DLLAMA_SSD_STORE=ON", "-DBUILD_SHARED_LIBS=ON"]),
     ("linux", ["-DLLAMA_SSD_STORE=ON", "-DBUILD_SHARED_LIBS=ON"]),
-    ("linux", ["-DLLAMA_SSD_STORE=OFF", "-DBUILD_SHARED_LIBS=OFF"]),
+    ("linux", ["-DBUILD_SHARED_LIBS=OFF"]),
+    ("linux", ["-DLLAMA_SSD_STORE=OFF", "-DLLAMA_USE_SYSTEM_GGML=ON"]),
 ])
 def test_supported_platform_profiles(platform, flags):
     staged_build.validate_platform_flags(platform, flags)

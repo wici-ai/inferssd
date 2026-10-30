@@ -14,13 +14,17 @@ from functools import partial
 from pathlib import Path
 from typing import BinaryIO, Optional, TextIO, cast
 
+from inferssd.configuration.derive import Selection
 from inferssd.configuration.settings import Snapshot, parse
 from inferssd.engine.core import Engine, NativeEffects, post
 from inferssd.engine.owned import OwnedProcess
 from inferssd.launch.live import Host, LiveArtifacts
+from inferssd.launch.machine import MachineSource
+from inferssd.launch.machine import characteristics as machine_characteristics
 from inferssd.launch.prepare import prepare
 from inferssd.launch.recorded import run_indexer
-from inferssd.launch.typed import LaunchSpec, reject_legacy_environment, resolve_typed
+from inferssd.launch.resources import probe_paths, server_binary
+from inferssd.launch.typed import BATCH, LaunchSpec, reject_legacy_environment, resolve_typed
 from inferssd.launch.types import LaunchInput, Output, Resolution
 from inferssd.loop.controller import Controller
 from inferssd.loop.typed_controller import TypedController
@@ -68,9 +72,30 @@ class Runtime:
         host: Host,
         emit: Callable[[Output], None],
         configuration: Optional[LaunchSpec] = None,
+        machine: Optional[MachineSource] = None,
     ) -> None:
+        """MACHINE is where a launch with a strategy takes the characteristics from."""
         self.inputs, self.policy, self.host, self.emit = inputs, policy, host, emit
         self.configuration = configuration
+        self.machine = machine
+        self.characteristics_text: Optional[tuple[Optional[str]]] = None
+
+    def characteristics(self, specification: Optional[LaunchSpec]) -> Optional[str]:
+        """The machine characteristics for SPECIFICATION's strategy, measured first if needed.
+
+        Measured once per runtime, before the first server is prepared.
+        """
+        if self.machine is None or specification is None or not specification.strategy:
+            return None
+        if self.characteristics_text is None:
+            platform, repo = self.policy.platform, self.inputs.repo
+            resources = specification.resources
+            binary = server_binary(platform, specification.binary, resources, repo, os.path.isfile)
+            binary = os.path.realpath(binary) if binary else None
+            probes = probe_paths(platform, binary, resources, repo, os.path.isfile)
+            text = machine_characteristics(self.machine, platform, specification.model, probes)
+            self.characteristics_text = (text,)
+        return self.characteristics_text[0]
 
     def resolve(
         self,
@@ -92,7 +117,12 @@ class Runtime:
             self.inputs.mode,
         )
         adapter = LiveArtifacts(
-            inputs, host=self.host, run=run_indexer, replace=os.replace, python=sys.executable
+            inputs,
+            host=self.host,
+            run=run_indexer,
+            replace=os.replace,
+            python=sys.executable,
+            machine=self.characteristics(specification),
         )
         value = prepare(
             inputs,
@@ -153,6 +183,8 @@ class Runtime:
                 raise ValueError("owned Engine requires its exact loopback health host and port")
             return value
 
+        # Measure the machine, if it must be, before the run directory exists.
+        self.characteristics(specification or self.configuration)
         effects = NativeEffects()
 
         def own(result: Resolution, path: str) -> OwnedProcess:
@@ -214,10 +246,12 @@ class Runtime:
             tier: int,
             cpus: str,
             extra: Sequence[str],
-            snapshot: Snapshot,
+            chosen: Selection,
         ) -> Engine:
             suffix = cpus.partition("@")[2]
-            selected = replace(specification, ubatch=int(suffix)) if suffix else specification
+            selected = replace(specification, threads=chosen.threads)
+            if suffix:
+                selected = replace(selected, ubatch=int(suffix))
             return self.engine(
                 directory,
                 selected_port,
@@ -225,7 +259,7 @@ class Runtime:
                 cpus,
                 "",
                 list(extra),
-                configured=snapshot,
+                configured=chosen.settings,
                 specification=selected,
             )
 
@@ -233,7 +267,8 @@ class Runtime:
             machine = TypedMachine(
                 DirectoryArtifacts(Path(path)),
                 base=base,
-                native_ubatch=specification.ubatch,
+                threads=specification.threads,
+                native_ubatch=specification.ubatch or BATCH,
                 host_threads=host_threads,
             )
             if start not in machine.configs:
@@ -254,7 +289,7 @@ class Runtime:
             horizon,
             machine_factory=machine_factory,
             engine_factory=self.engine,
-            configuration=lambda machine, tier, cpus: cast(TypedMachine, machine).settings(
+            configuration=lambda machine, tier, cpus: cast(TypedMachine, machine).selected(
                 tier, cpus
             ),
             typed_engine=typed_engine,

@@ -30,7 +30,8 @@ static std::set<const ggml_tensor *> graph_dependencies(ggml_cgraph * graph) {
     return visited;
 }
 
-static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decode, const char * label, ggml_type weight_type = GGML_TYPE_MXFP4) {
+static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decode, const char * label,
+        ggml_type weight_type = GGML_TYPE_MXFP4, llm_arch arch = LLM_ARCH_DEEPSEEK41) {
     constexpr int latent = 256, hidden = 512, experts = 20, slots = 8;
     // Metadata-only runtimes: no pool, ring, resolver or cache is initialized.
     const auto configured = ssd::settings::parse("", "");
@@ -46,7 +47,7 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
     require(bool(scheduler), "CPU scheduler allocation failed");
     llama_adapter_loras loras;
     llm_graph_params params = {};
-    params.arch = LLM_ARCH_DEEPSEEK41;
+    params.arch = arch;
     params.hparams.n_embd = latent;
     params.hparams.n_layer = 1;
     params.hparams.n_expert = experts;
@@ -101,7 +102,8 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
     ggml_set_name(gate, "blk.0.ffn_gate_exps.weight");
     ggml_set_name(down, "blk.0.ffn_down_exps.weight");
     ggml_tensor * output = context.build_moe_ffn(input, nullptr, up, gate, down, nullptr,
-        experts, slots, LLM_FFN_SILU, true, 1.0f, LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, 0, logits);
+        experts, slots, LLM_FFN_SILU, true, 1.0f, arch == LLM_ARCH_QWEN4EXP ? LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX :
+        LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, 0, logits);
     ggml_build_forward_expand(result.get_gf(), output);
     require(output->type == GGML_TYPE_F32 && output->ne[0] == latent && output->ne[1] == ntokens &&
             output->ne[2] == 1 && output->ne[3] == 1, "MoE output shape mismatch");
@@ -121,6 +123,9 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
         const auto & descriptor = *result.cpu_sink_nodes[0];
         require(descriptor.runtime == &runtime && descriptor.prefill == prefill,
                 "custom node lost its context runtime or execution phase");
+        require(arch == LLM_ARCH_QWEN4EXP ? descriptor.activation.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU :
+                descriptor.activation.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP && descriptor.activation.swiglu_limit == 7.0f,
+                "custom node carries another activation than the model's");
         for (const auto * metadata : { &descriptor.up, &descriptor.gate, &descriptor.down }) {
             require(!metadata->data && !metadata->buffer && !metadata->extra && !metadata->view_src,
                     "expert descriptor retained payload ownership");
@@ -163,11 +168,13 @@ int main() {
         graph_case(cpu.get(), 1, false, true, "decode_one");
         graph_case(cpu.get(), 2, false, false, "disabled_two");
         graph_case(cpu.get(), 2, false, true, "decode_two_legacy");
+        graph_case(cpu.get(), 64, true, false, "qwen4exp_prefill_ub64", GGML_TYPE_Q8_0, LLM_ARCH_QWEN4EXP);
+        graph_case(cpu.get(), 1, false, true, "qwen4exp_decode_one", GGML_TYPE_Q8_0, LLM_ARCH_QWEN4EXP);
         bool refused = false;
         try {
             graph_case(cpu.get(), 1, false, true, "unsupported_f16", GGML_TYPE_F16);
         } catch (const std::runtime_error & error) {
-            refused = std::string(error.what()).find("all-MXFP4") != std::string::npos;
+            refused = std::string(error.what()).find("supported format") != std::string::npos;
         }
         require(refused, "unsupported expert layout did not refuse with a recoverable graph error");
         std::printf("CPU_PREFILL_GRAPH_OK execution=not_run kda_validation=not_run\n");

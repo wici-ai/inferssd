@@ -1,6 +1,7 @@
 // Inspect private metadata without creating workers, a GPU context or a payload
 // arena. Real file identities exercise version rejection and RAM lease vetoes.
 #include "ggml-ssd/host/expert-cache.h"
+#include "test-resources.h"
 #include <stdexcept>
 using sink_cache = ssd::host::expert_cache;
 using sink_request = ssd::host::expert_request;
@@ -8,8 +9,8 @@ int main() {
     try {
     int checks = 0;
     auto require = [&](bool ok) { ++checks; if (!ok) throw std::runtime_error("cache lease assertion"); };
-    char path[] = "/tmp/kimi-cache-lease-XXXXXX";
-    const int fd = mkstemp(path); require(fd >= 0); unlink(path);
+    const std::string path = test_resources::temp_file("kimi-cache-lease");
+    const int fd = ssd::platform::open_buffered(path.c_str()); require(fd >= 0);
     ssd::host::expert_cache_options configuration;
     configuration.require_shared = false; configuration.cache_policy = "lru";
     sink_cache cache(configuration); sink_cache::layer layer; layer.id = 1; layer.count = 1;
@@ -30,5 +31,5 @@ int main() {
     require(cache.drop_duplicate(1,r) == 1 && !e.valid && e.resident);
     require(cache.stats.valid_bytes == 0 && cache.stats.committed_bytes == cache.stride);
     require(cache.drop_duplicate(1,r) == 0);
-    close(fd); std::printf("CACHE_LEASE_PASS assertions=%d payload_allocated=0\n",checks); return 0;
+    ssd::platform::close_fd(fd); test_resources::remove_file(path); std::printf("CACHE_LEASE_PASS assertions=%d payload_allocated=0\n",checks); return 0;
 } catch (const std::exception & e) { std::fprintf(stderr,"CACHE_LEASE_FAIL: %s\n",e.what()); return 1; } }

@@ -96,8 +96,6 @@ int main(int argc, char ** argv) {
         auto mapping = plugin.symbol<decltype(&mock_mapping)>("mock_mapping");
         auto half_ready = plugin.symbol<decltype(&mock_half_ready)>("mock_half_ready");
         auto finish_load = plugin.symbol<decltype(&mock_finish_load)>("mock_finish_load");
-        auto select_shape = plugin.symbol<decltype(&mock_shape)>("mock_shape");
-        auto uses_common = plugin.symbol<decltype(&mock_common)>("mock_common");
         check(catalog_address() == &c0::shared_catalog(), "DSOs have distinct owners");
         if (mode == "late" || mode == "missing") {
             const bool initialized = c0::initialize_shared_catalog();
@@ -128,15 +126,6 @@ int main(int argc, char ** argv) {
             check(loader.get() == (failure == 4) && observer.get() == (failure == 4), "partial initialization result mismatch");
             if (failure == 5) { released_mapping = mapping_absent(mapping()); }
             check(waited && !prematurely_visible, "half catalog published or consumer bypassed once");
-        }
-        if (mode == "shape-k3") {
-            select_shape(896, 3612672);
-            check(ggml_ssd_c0_shape_selected() && !ggml_ssd_c0_uses_common(), "CUDA shape not visible in CPU");
-            ggml_ssd_c0_select_model_shape(16, 5000, "mock-cpu");
-            check(!uses_common(), "second shape replaced first shape");
-            check(calls() == 0, "shape selection initialized catalog");
-            std::puts("PASS: one first-shape decision across DSOs");
-            return 0;
         }
         int fd = -1; uint64_t offset = 0; size_t count = 0;
         auto resolve = [&] { return ggml_ssd_c0_resolve_raw_direct_shape("blk.0.ffn_up_exps.weight", 3, 5000, 16, &fd, &offset, &count); };
@@ -176,9 +165,6 @@ int main(int argc, char ** argv) {
         check(catalog.sources.size() == 1 && catalog.entries.size() == 1, "wrong catalog size");
         check(c0::catalog_available(), "successful catalog was not published");
         check(entries_address() == catalog.entries.data() && sources_address() == catalog.sources.data(), "DSO array addresses differ");
-        ggml_ssd_c0_select_model_shape(16, 5000, "mock-cpu");
-        select_shape(896, 3612672);
-        check(uses_common() && ggml_ssd_c0_uses_common(), "CUDA replaced CPU's first shape");
 #if defined(__linux__)
         check(resolve() == (failure != 3), "direct/page-cache capability mismatch");
         if (failure != 3) { check(fd == catalog.sources[0].fd_direct && offset == 4097 && count == 5000, "logical direct range changed"); }
@@ -198,7 +184,7 @@ int main(int argc, char ** argv) {
             check(!c0::initialize_shared_catalog() && !resolve(), "unloaded provider allowed replacement/fallback");
             check(::fcntl(buffered, F_GETFD) >= 0, "module unload closed shared-owner fd");
         }
-        std::puts("PASS: shared owner, once load, stable arrays, source identity, shape and final descriptor cleanup");
+        std::puts("PASS: shared owner, once load, stable arrays, source identity and final descriptor cleanup");
         return 0;
     } catch (const std::exception & error) { std::fprintf(stderr, "FAIL: %s\n", error.what()); return 1; }
 }

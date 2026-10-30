@@ -106,7 +106,8 @@ public:
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+              const char * name_tag = "");
 
     // same as above, but with explicit hparams instead of model.hparams
     // note: the cache keeps a reference to hparams, so it must outlive the cache
@@ -125,7 +126,8 @@ public:
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+              const char * name_tag = "");
 
     ~llama_kv_cache() = default;
 
@@ -159,6 +161,9 @@ public:
 
     // state write/load
 
+    const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+    void state_read_sinfo(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, slot_info_vec_t * sinfos_out, const slot_info_vec_t * sinfos_in);
+
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
@@ -166,8 +171,12 @@ public:
     // llama_kv_cache specific API
     //
 
-    uint32_t get_size()     const;
-    uint32_t get_n_stream() const;
+    uint32_t get_size()      const;
+    uint32_t get_n_seq_max() const;
+    uint32_t get_n_stream()  const;
+
+    // the stream holding seq_id's cells
+    uint32_t get_stream(llama_seq_id seq_id) const;
 
     // state_write() of only the cells at positions in [p0, p1], for an owner that saves part of what the cache holds
     void state_write_range(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos p0, llama_pos p1) const;
@@ -352,7 +361,7 @@ private:
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
 
-    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
+    bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
 

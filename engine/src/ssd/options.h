@@ -18,7 +18,6 @@ struct llama_ssd_options {
     std::string telemetry_file;
 };
 
-struct ggml_ssd_mac_cache;
 struct llama_model;
 struct llama_ssd_source_delete {
     void (*close)(void *) noexcept = nullptr;
@@ -40,11 +39,8 @@ struct llama_ssd_context {
     ssd::runtime_services services;
     std::unique_ptr<void, llama_ssd_source_delete> gpu_transport;
     ssd::stream::runtime stream;
-    ggml_ssd_mac_cache * mac_cache = nullptr;
-    void (*destroy_mac)(ggml_ssd_mac_cache *) noexcept = nullptr;
 
     explicit llama_ssd_context(const llama_ssd_options & options);
-    ~llama_ssd_context();
     void bind_cpu(ggml_backend_t backend);
     void attach_backend(ggml_backend_t backend);
     void prepare_dense(const llama_model & model);

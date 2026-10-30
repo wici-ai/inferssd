@@ -48,8 +48,7 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    const bool allow_unsplit_mla = model.arch == LLM_ARCH_GLM_DSA;
-    auto * inp_attn_kv = (!is_mla || allow_unsplit_mla) ? build_attn_inp_kv() : nullptr;
+    auto * inp_attn_kv = !is_mla ? build_attn_inp_kv() : nullptr;
     auto * inp_attn_k  =  is_mla ? build_attn_inp_k()  : nullptr;
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
@@ -151,7 +150,7 @@ llm_build_deepseek2::llm_build_deepseek2(const llama_model & model, const llm_gr
             kv_cmpr = build_norm(kv_cmpr, model.layers[il].attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
             cb(kv_cmpr, "kv_cmpr", il);
 
-            if (is_mla && model.layers[il].wk_b && model.layers[il].wv_b) {
+            if (is_mla) {
                 // {n_embd_head_qk_nope, n_tokens, n_head}
                 q_nope = ggml_permute(ctx0, q_nope, 0, 2, 1, 3);
                 cb(q_nope, "q_nope_perm", il);

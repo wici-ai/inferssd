@@ -1,0 +1,1239 @@
+{
+  "compute": {
+    "cpu": [
+      {
+        "cols": 4096,
+        "format": "Q8_0",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 622.864,
+            "weight_Bps": 28619100000.0
+          },
+          {
+            "flops": 61259300000.0,
+            "tokens": 32,
+            "us": 17527.8
+          },
+          {
+            "flops": 61092100000.0,
+            "tokens": 512,
+            "us": 281213.0
+          }
+        ],
+        "rows": 4096,
+        "threads": 1,
+        "weight_bytes": 17825792
+      },
+      {
+        "cols": 4096,
+        "format": "Q8_0",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 146.784,
+            "weight_Bps": 121442000000.0
+          },
+          {
+            "flops": 596441000000.0,
+            "tokens": 32,
+            "us": 1800.25
+          },
+          {
+            "flops": 603044000000.0,
+            "tokens": 512,
+            "us": 28488.6
+          }
+        ],
+        "rows": 4096,
+        "threads": 10,
+        "weight_bytes": 17825792
+      },
+      {
+        "cols": 4096,
+        "format": "Q8_0",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 208.504,
+            "weight_Bps": 85493800000.0
+          },
+          {
+            "flops": 734482000000.0,
+            "tokens": 32,
+            "us": 1461.9
+          },
+          {
+            "flops": 755139000000.0,
+            "tokens": 512,
+            "us": 22750.6
+          }
+        ],
+        "rows": 4096,
+        "threads": 20,
+        "weight_bytes": 17825792
+      },
+      {
+        "cols": 4096,
+        "format": "Q4_K",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 575.983,
+            "weight_Bps": 16384500000.0
+          },
+          {
+            "flops": 63904200000.0,
+            "tokens": 32,
+            "us": 16802.4
+          },
+          {
+            "flops": 63847400000.0,
+            "tokens": 512,
+            "us": 269077.0
+          }
+        ],
+        "rows": 4096,
+        "threads": 1,
+        "weight_bytes": 9437184
+      },
+      {
+        "cols": 4096,
+        "format": "Q4_K",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 83.52,
+            "weight_Bps": 112993000000.0
+          },
+          {
+            "flops": 598839000000.0,
+            "tokens": 32,
+            "us": 1793.04
+          },
+          {
+            "flops": 605911000000.0,
+            "tokens": 512,
+            "us": 28353.8
+          }
+        ],
+        "rows": 4096,
+        "threads": 10,
+        "weight_bytes": 9437184
+      },
+      {
+        "cols": 4096,
+        "format": "Q4_K",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 117.232,
+            "weight_Bps": 80500100000.0
+          },
+          {
+            "flops": 778534000000.0,
+            "tokens": 32,
+            "us": 1379.18
+          },
+          {
+            "flops": 762305000000.0,
+            "tokens": 512,
+            "us": 22536.7
+          }
+        ],
+        "rows": 4096,
+        "threads": 20,
+        "weight_bytes": 9437184
+      },
+      {
+        "cols": 4096,
+        "format": "Q5_K",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 807.768,
+            "weight_Bps": 14279300000.0
+          },
+          {
+            "flops": 44973300000.0,
+            "tokens": 32,
+            "us": 23875.1
+          },
+          {
+            "flops": 44924200000.0,
+            "tokens": 512,
+            "us": 382419.0
+          }
+        ],
+        "rows": 4096,
+        "threads": 1,
+        "weight_bytes": 11534336
+      },
+      {
+        "cols": 4096,
+        "format": "Q5_K",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 114.432,
+            "weight_Bps": 100796000000.0
+          },
+          {
+            "flops": 443463000000.0,
+            "tokens": 32,
+            "us": 2421.26
+          },
+          {
+            "flops": 448644000000.0,
+            "tokens": 512,
+            "us": 38292.9
+          }
+        ],
+        "rows": 4096,
+        "threads": 10,
+        "weight_bytes": 11534336
+      },
+      {
+        "cols": 4096,
+        "format": "Q5_K",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 165.2,
+            "weight_Bps": 69820400000.0
+          },
+          {
+            "flops": 403952000000.0,
+            "tokens": 32,
+            "us": 2658.1
+          },
+          {
+            "flops": 542008000000.0,
+            "tokens": 512,
+            "us": 31696.7
+          }
+        ],
+        "rows": 4096,
+        "threads": 20,
+        "weight_bytes": 11534336
+      },
+      {
+        "cols": 4096,
+        "format": "Q6_K",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 843.287,
+            "weight_Bps": 16320100000.0
+          },
+          {
+            "flops": 43906700000.0,
+            "tokens": 32,
+            "us": 24455.1
+          },
+          {
+            "flops": 44014100000.0,
+            "tokens": 512,
+            "us": 390327.0
+          }
+        ],
+        "rows": 4096,
+        "threads": 1,
+        "weight_bytes": 13762560
+      },
+      {
+        "cols": 4096,
+        "format": "Q6_K",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 158.464,
+            "weight_Bps": 86849700000.0
+          },
+          {
+            "flops": 405641000000.0,
+            "tokens": 32,
+            "us": 2647.02
+          },
+          {
+            "flops": 406688000000.0,
+            "tokens": 512,
+            "us": 42243.4
+          }
+        ],
+        "rows": 4096,
+        "threads": 10,
+        "weight_bytes": 13762560
+      },
+      {
+        "cols": 4096,
+        "format": "Q6_K",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 177.68,
+            "weight_Bps": 77457000000.0
+          },
+          {
+            "flops": 496164000000.0,
+            "tokens": 32,
+            "us": 2164.09
+          },
+          {
+            "flops": 551516000000.0,
+            "tokens": 512,
+            "us": 31150.2
+          }
+        ],
+        "rows": 4096,
+        "threads": 20,
+        "weight_bytes": 13762560
+      },
+      {
+        "cols": 4096,
+        "format": "Q2_K",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 655.856,
+            "weight_Bps": 8393650000.0
+          },
+          {
+            "flops": 54144500000.0,
+            "tokens": 32,
+            "us": 19831.0
+          },
+          {
+            "flops": 54006700000.0,
+            "tokens": 512,
+            "us": 318106.0
+          }
+        ],
+        "rows": 4096,
+        "threads": 1,
+        "weight_bytes": 5505024
+      },
+      {
+        "cols": 4096,
+        "format": "Q2_K",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 79.36,
+            "weight_Bps": 69367800000.0
+          },
+          {
+            "flops": 514994000000.0,
+            "tokens": 32,
+            "us": 2084.96
+          },
+          {
+            "flops": 522838000000.0,
+            "tokens": 512,
+            "us": 32858.9
+          }
+        ],
+        "rows": 4096,
+        "threads": 10,
+        "weight_bytes": 5505024
+      },
+      {
+        "cols": 4096,
+        "format": "Q2_K",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 113.904,
+            "weight_Bps": 48330400000.0
+          },
+          {
+            "flops": 662840000000.0,
+            "tokens": 32,
+            "us": 1619.91
+          },
+          {
+            "flops": 651398000000.0,
+            "tokens": 512,
+            "us": 26373.8
+          }
+        ],
+        "rows": 4096,
+        "threads": 20,
+        "weight_bytes": 5505024
+      },
+      {
+        "cols": 4096,
+        "format": "MXFP4",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 685.439,
+            "weight_Bps": 13003200000.0
+          },
+          {
+            "flops": 53261900000.0,
+            "tokens": 32,
+            "us": 20159.7
+          },
+          {
+            "flops": 53305800000.0,
+            "tokens": 512,
+            "us": 322289.0
+          }
+        ],
+        "rows": 4096,
+        "threads": 1,
+        "weight_bytes": 8912896
+      },
+      {
+        "cols": 4096,
+        "format": "MXFP4",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 91.088,
+            "weight_Bps": 97849300000.0
+          },
+          {
+            "flops": 508166000000.0,
+            "tokens": 32,
+            "us": 2112.98
+          },
+          {
+            "flops": 513937000000.0,
+            "tokens": 512,
+            "us": 33428.0
+          }
+        ],
+        "rows": 4096,
+        "threads": 10,
+        "weight_bytes": 8912896
+      },
+      {
+        "cols": 4096,
+        "format": "MXFP4",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 146.288,
+            "weight_Bps": 60927000000.0
+          },
+          {
+            "flops": 638530000000.0,
+            "tokens": 32,
+            "us": 1681.58
+          },
+          {
+            "flops": 628970000000.0,
+            "tokens": 512,
+            "us": 27314.3
+          }
+        ],
+        "rows": 4096,
+        "threads": 20,
+        "weight_bytes": 8912896
+      },
+      {
+        "cols": 4096,
+        "format": "F16",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 1310.77,
+            "weight_Bps": 25599100000.0
+          },
+          {
+            "flops": 52326600000.0,
+            "tokens": 32,
+            "us": 20520.0
+          },
+          {
+            "flops": 57887300000.0,
+            "tokens": 512,
+            "us": 296782.0
+          }
+        ],
+        "rows": 4096,
+        "threads": 1,
+        "weight_bytes": 33554432
+      },
+      {
+        "cols": 4096,
+        "format": "F16",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 271.112,
+            "weight_Bps": 123766000000.0
+          },
+          {
+            "flops": 512395000000.0,
+            "tokens": 32,
+            "us": 2095.54
+          },
+          {
+            "flops": 550038000000.0,
+            "tokens": 512,
+            "us": 31234.0
+          }
+        ],
+        "rows": 4096,
+        "threads": 10,
+        "weight_bytes": 33554432
+      },
+      {
+        "cols": 4096,
+        "format": "F16",
+        "points": [
+          {
+            "tokens": 1,
+            "us": 1775.09,
+            "weight_Bps": 18903000000.0
+          },
+          {
+            "flops": 723975000000.0,
+            "tokens": 32,
+            "us": 1483.12
+          },
+          {
+            "flops": 702402000000.0,
+            "tokens": 512,
+            "us": 24458.7
+          }
+        ],
+        "rows": 4096,
+        "threads": 20,
+        "weight_bytes": 33554432
+      }
+    ]
+  },
+  "cpu": {
+    "affinity_supported": true,
+    "clusters": [
+      {
+        "cpus": [
+          5,
+          6,
+          7,
+          8,
+          9,
+          15,
+          16,
+          17,
+          18,
+          19
+        ],
+        "id": 0,
+        "kind": "performance"
+      },
+      {
+        "cpus": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          10,
+          11,
+          12,
+          13,
+          14
+        ],
+        "id": 1,
+        "kind": "efficiency"
+      }
+    ],
+    "isa": [
+      "NEON",
+      "ARM_FMA"
+    ],
+    "logical": [
+      {
+        "capacity": 718,
+        "cluster": 1,
+        "core": 0,
+        "id": 0,
+        "max_khz": 2808000,
+        "package": 36,
+        "smt_siblings": [
+          0
+        ]
+      },
+      {
+        "capacity": 718,
+        "cluster": 1,
+        "core": 1,
+        "id": 1,
+        "max_khz": 2808000,
+        "package": 36,
+        "smt_siblings": [
+          1
+        ]
+      },
+      {
+        "capacity": 718,
+        "cluster": 1,
+        "core": 2,
+        "id": 2,
+        "max_khz": 2808000,
+        "package": 36,
+        "smt_siblings": [
+          2
+        ]
+      },
+      {
+        "capacity": 718,
+        "cluster": 1,
+        "core": 3,
+        "id": 3,
+        "max_khz": 2808000,
+        "package": 36,
+        "smt_siblings": [
+          3
+        ]
+      },
+      {
+        "capacity": 718,
+        "cluster": 1,
+        "core": 4,
+        "id": 4,
+        "max_khz": 2808000,
+        "package": 36,
+        "smt_siblings": [
+          4
+        ]
+      },
+      {
+        "capacity": 997,
+        "cluster": 0,
+        "core": 5,
+        "id": 5,
+        "max_khz": 3900000,
+        "package": 36,
+        "smt_siblings": [
+          5
+        ]
+      },
+      {
+        "capacity": 997,
+        "cluster": 0,
+        "core": 6,
+        "id": 6,
+        "max_khz": 3900000,
+        "package": 36,
+        "smt_siblings": [
+          6
+        ]
+      },
+      {
+        "capacity": 997,
+        "cluster": 0,
+        "core": 7,
+        "id": 7,
+        "max_khz": 3900000,
+        "package": 36,
+        "smt_siblings": [
+          7
+        ]
+      },
+      {
+        "capacity": 997,
+        "cluster": 0,
+        "core": 8,
+        "id": 8,
+        "max_khz": 3900000,
+        "package": 36,
+        "smt_siblings": [
+          8
+        ]
+      },
+      {
+        "capacity": 997,
+        "cluster": 0,
+        "core": 9,
+        "id": 9,
+        "max_khz": 3900000,
+        "package": 36,
+        "smt_siblings": [
+          9
+        ]
+      },
+      {
+        "capacity": 731,
+        "cluster": 1,
+        "core": 10,
+        "id": 10,
+        "max_khz": 2860000,
+        "package": 36,
+        "smt_siblings": [
+          10
+        ]
+      },
+      {
+        "capacity": 731,
+        "cluster": 1,
+        "core": 11,
+        "id": 11,
+        "max_khz": 2860000,
+        "package": 36,
+        "smt_siblings": [
+          11
+        ]
+      },
+      {
+        "capacity": 731,
+        "cluster": 1,
+        "core": 12,
+        "id": 12,
+        "max_khz": 2860000,
+        "package": 36,
+        "smt_siblings": [
+          12
+        ]
+      },
+      {
+        "capacity": 731,
+        "cluster": 1,
+        "core": 13,
+        "id": 13,
+        "max_khz": 2860000,
+        "package": 36,
+        "smt_siblings": [
+          13
+        ]
+      },
+      {
+        "capacity": 731,
+        "cluster": 1,
+        "core": 14,
+        "id": 14,
+        "max_khz": 2860000,
+        "package": 36,
+        "smt_siblings": [
+          14
+        ]
+      },
+      {
+        "capacity": 1017,
+        "cluster": 0,
+        "core": 15,
+        "id": 15,
+        "max_khz": 3978000,
+        "package": 36,
+        "smt_siblings": [
+          15
+        ]
+      },
+      {
+        "capacity": 1017,
+        "cluster": 0,
+        "core": 16,
+        "id": 16,
+        "max_khz": 3978000,
+        "package": 36,
+        "smt_siblings": [
+          16
+        ]
+      },
+      {
+        "capacity": 1017,
+        "cluster": 0,
+        "core": 17,
+        "id": 17,
+        "max_khz": 3978000,
+        "package": 36,
+        "smt_siblings": [
+          17
+        ]
+      },
+      {
+        "capacity": 1017,
+        "cluster": 0,
+        "core": 18,
+        "id": 18,
+        "max_khz": 3978000,
+        "package": 36,
+        "smt_siblings": [
+          18
+        ]
+      },
+      {
+        "capacity": 1024,
+        "cluster": 0,
+        "core": 19,
+        "id": 19,
+        "max_khz": 4004000,
+        "package": 36,
+        "smt_siblings": [
+          19
+        ]
+      }
+    ]
+  },
+  "created_utc": "2026-10-29T07:48:21Z",
+  "gpus": [
+    {
+      "d2d_Bps": 115574000000.0,
+      "d2h": {
+        "pinned": [
+          {
+            "Bps": 46365600000.0,
+            "bytes": 262144
+          },
+          {
+            "Bps": 55296300000.0,
+            "bytes": 1048576
+          },
+          {
+            "Bps": 58079200000.0,
+            "bytes": 4194304
+          },
+          {
+            "Bps": 59036900000.0,
+            "bytes": 16777216
+          },
+          {
+            "Bps": 59144300000.0,
+            "bytes": 67108864
+          }
+        ]
+      },
+      "h2d": {
+        "pageable": [
+          {
+            "Bps": 3768550000.0,
+            "bytes": 262144
+          },
+          {
+            "Bps": 1720900000.0,
+            "bytes": 1048576
+          },
+          {
+            "Bps": 6153940000.0,
+            "bytes": 4194304
+          },
+          {
+            "Bps": 12718100000.0,
+            "bytes": 16777216
+          },
+          {
+            "Bps": 27410700000.0,
+            "bytes": 67108864
+          }
+        ],
+        "pinned": [
+          {
+            "Bps": 40782200000.0,
+            "bytes": 262144
+          },
+          {
+            "Bps": 53384000000.0,
+            "bytes": 1048576
+          },
+          {
+            "Bps": 57462500000.0,
+            "bytes": 4194304
+          },
+          {
+            "Bps": 58722800000.0,
+            "bytes": 16777216
+          },
+          {
+            "Bps": 58962300000.0,
+            "bytes": 67108864
+          }
+        ]
+      },
+      "index": 0,
+      "integrated": true,
+      "name": "NVIDIA GB10",
+      "pci_bus_id": "000f:01:00.0",
+      "read_Bps": 257173000000.0,
+      "uuid": "GPU-00000000-0000-4000-8000-000000000032",
+      "vram_total_bytes": 130669424640
+    }
+  ],
+  "identity": {
+    "hard": {
+      "arch": "aarch64",
+      "cpu_brand": "Arm implementer 0x41 parts 0xd85,0xd87",
+      "gpus": [
+        {
+          "backend": "CUDA",
+          "name": "NVIDIA GB10",
+          "uuid": "GPU-00000000-0000-4000-8000-000000000032",
+          "vram_bytes": 0
+        }
+      ],
+      "logical_cpus": 20,
+      "machine_id_sha256": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+      "model": "NVIDIA_DGX_Spark",
+      "platform": "linux",
+      "ram_bytes": 130669424640
+    },
+    "soft": {
+      "gpu_driver": "580.82.09",
+      "kernel": "6.11.0-1014-nvidia",
+      "os_release": "Ubuntu 24.04.3 LTS",
+      "probe_versions": {
+        "cpu": "inferssd-cpuprobe/1",
+        "memory": "inferssd-memprobe/1",
+        "ssd": "inferssd-ssdprobe/1"
+      }
+    }
+  },
+  "memory": {
+    "dram_read_Bps": [
+      {
+        "Bps": 34755600000.0,
+        "threads": 1
+      },
+      {
+        "Bps": 99307700000.0,
+        "threads": 10
+      },
+      {
+        "Bps": 104845000000.0,
+        "threads": 20
+      }
+    ],
+    "page_bytes": 4096,
+    "total_bytes": 130669424640,
+    "unified": true
+  },
+  "schema": "inferssd-machine/1",
+  "sections": {
+    "compute": {
+      "detail": "",
+      "duration_s": 37.948,
+      "measured_utc": "2026-10-29T07:47:31Z",
+      "method": "inferssd-cpuprobe/1 ggml_mul_mat, threads 1,10,20",
+      "status": "ok"
+    },
+    "cpu": {
+      "detail": "",
+      "duration_s": 0.003,
+      "measured_utc": "2026-10-29T07:47:31Z",
+      "method": "sysfs topology; ISA from inferssd-cpuprobe/1",
+      "status": "ok"
+    },
+    "gpus": {
+      "detail": "",
+      "duration_s": 3.304,
+      "measured_utc": "2026-10-29T07:48:09Z",
+      "method": "inferssd-memprobe/1",
+      "status": "ok"
+    },
+    "memory": {
+      "detail": "",
+      "duration_s": 37.951,
+      "measured_utc": "2026-10-29T07:47:31Z",
+      "method": "sysfs memory size; DRAM read from inferssd-cpuprobe/1",
+      "status": "ok"
+    },
+    "storage:linux:nvme:SAMSUNG MZALC4T0HBL1-00B07:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2": {
+      "detail": "",
+      "duration_s": 8.795,
+      "measured_utc": "2026-10-29T07:48:12Z",
+      "method": "inferssd-ssdprobe/1 read-only random extents in 8 existing files, io_uring reader",
+      "status": "ok"
+    }
+  },
+  "storage": [
+    {
+      "alignment_bytes": 4096,
+      "bus": "nvme",
+      "drive_key": "linux:nvme:SAMSUNG MZALC4T0HBL1-00B07:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+      "knee": [
+        {
+          "bytes": 1048576,
+          "qd": 8
+        },
+        {
+          "bytes": 4194304,
+          "qd": 4
+        },
+        {
+          "bytes": 16777216,
+          "qd": 2
+        }
+      ],
+      "measured_files": 8,
+      "model": "SAMSUNG MZALC4T0HBL1-00B07",
+      "qd_cap": null,
+      "random_read": [
+        {
+          "Bps": 3073505000.0,
+          "Bps_runs": [
+            3164960000.0,
+            2982050000.0
+          ],
+          "bytes": 1048576,
+          "lat_us": {
+            "mean": 351.39,
+            "p50": 273.543,
+            "p90": 487.68,
+            "p99": 992.386
+          },
+          "qd": 1
+        },
+        {
+          "Bps": 5972860000.0,
+          "Bps_runs": [
+            5972220000.0,
+            5973500000.0
+          ],
+          "bytes": 1048576,
+          "lat_us": {
+            "mean": 350.856,
+            "p50": 319.968,
+            "p90": 450.773,
+            "p99": 880.981
+          },
+          "qd": 2
+        },
+        {
+          "Bps": 9277890000.0,
+          "Bps_runs": [
+            9707860000.0,
+            8847920000.0
+          ],
+          "bytes": 1048576,
+          "lat_us": {
+            "mean": 473.59,
+            "p50": 448.696,
+            "p90": 616.0,
+            "p99": 903.0
+          },
+          "qd": 4
+        },
+        {
+          "Bps": 10412350000.0,
+          "Bps_runs": [
+            10395100000.0,
+            10429600000.0
+          ],
+          "bytes": 1048576,
+          "lat_us": {
+            "mean": 805.327,
+            "p50": 799.472,
+            "p90": 918.568,
+            "p99": 1106.13
+          },
+          "qd": 8
+        },
+        {
+          "Bps": 10427950000.0,
+          "Bps_runs": [
+            10466600000.0,
+            10389300000.0
+          ],
+          "bytes": 1048576,
+          "lat_us": {
+            "mean": 1608.45,
+            "p50": 1602.91,
+            "p90": 1735.62,
+            "p99": 1939.52
+          },
+          "qd": 16
+        },
+        {
+          "Bps": 10384300000.0,
+          "Bps_runs": [
+            10329500000.0,
+            10439100000.0
+          ],
+          "bytes": 1048576,
+          "lat_us": {
+            "mean": 3223.68,
+            "p50": 3206.1,
+            "p90": 3396.23,
+            "p99": 4536.62
+          },
+          "qd": 32
+        },
+        {
+          "Bps": 5876135000.0,
+          "Bps_runs": [
+            5371510000.0,
+            6380760000.0
+          ],
+          "bytes": 4194304,
+          "lat_us": {
+            "mean": 780.501,
+            "p50": 722.4,
+            "p90": 1020.58,
+            "p99": 1435.94
+          },
+          "qd": 1
+        },
+        {
+          "Bps": 11437550000.0,
+          "Bps_runs": [
+            11202300000.0,
+            11672800000.0
+          ],
+          "bytes": 4194304,
+          "lat_us": {
+            "mean": 748.072,
+            "p50": 738.392,
+            "p90": 826.562,
+            "p99": 1341.72
+          },
+          "qd": 2
+        },
+        {
+          "Bps": 11846650000.0,
+          "Bps_runs": [
+            11801000000.0,
+            11892300000.0
+          ],
+          "bytes": 4194304,
+          "lat_us": {
+            "mean": 1417.35,
+            "p50": 1423.67,
+            "p90": 1509.3,
+            "p99": 1647.69
+          },
+          "qd": 4
+        },
+        {
+          "Bps": 11824050000.0,
+          "Bps_runs": [
+            11840700000.0,
+            11807400000.0
+          ],
+          "bytes": 4194304,
+          "lat_us": {
+            "mean": 2822.84,
+            "p50": 2837.37,
+            "p90": 2960.27,
+            "p99": 3163.39
+          },
+          "qd": 8
+        },
+        {
+          "Bps": 11816550000.0,
+          "Bps_runs": [
+            11819600000.0,
+            11813500000.0
+          ],
+          "bytes": 4194304,
+          "lat_us": {
+            "mean": 5595.84,
+            "p50": 5657.28,
+            "p90": 5831.18,
+            "p99": 6029.9
+          },
+          "qd": 16
+        },
+        {
+          "Bps": 11628050000.0,
+          "Bps_runs": [
+            11874400000.0,
+            11381700000.0
+          ],
+          "bytes": 4194304,
+          "lat_us": {
+            "mean": 11447.4,
+            "p50": 11366.8,
+            "p90": 13892.8,
+            "p99": 20659.4
+          },
+          "qd": 32
+        },
+        {
+          "Bps": 10278205000.0,
+          "Bps_runs": [
+            9956710000.0,
+            10599700000.0
+          ],
+          "bytes": 16777216,
+          "lat_us": {
+            "mean": 1684.77,
+            "p50": 1698.28,
+            "p90": 1801.41,
+            "p99": 1902.02
+          },
+          "qd": 1
+        },
+        {
+          "Bps": 12629800000.0,
+          "Bps_runs": [
+            12664500000.0,
+            12595100000.0
+          ],
+          "bytes": 16777216,
+          "lat_us": {
+            "mean": 2654.13,
+            "p50": 2651.7,
+            "p90": 2787.16,
+            "p99": 3269.23
+          },
+          "qd": 2
+        },
+        {
+          "Bps": 12600700000.0,
+          "Bps_runs": [
+            12604100000.0,
+            12597300000.0
+          ],
+          "bytes": 16777216,
+          "lat_us": {
+            "mean": 5266.74,
+            "p50": 5311.17,
+            "p90": 5481.66,
+            "p99": 5954.44
+          },
+          "qd": 4
+        },
+        {
+          "Bps": 12440450000.0,
+          "Bps_runs": [
+            12437100000.0,
+            12443800000.0
+          ],
+          "bytes": 16777216,
+          "lat_us": {
+            "mean": 10497.2,
+            "p50": 10567.0,
+            "p90": 11059.0,
+            "p99": 17551.0
+          },
+          "qd": 8
+        },
+        {
+          "Bps": 10782650000.0,
+          "Bps_runs": [
+            10376400000.0,
+            11188900000.0
+          ],
+          "bytes": 16777216,
+          "lat_us": {
+            "mean": 24533.0,
+            "p50": 26216.2,
+            "p90": 30717.9,
+            "p99": 33579.6
+          },
+          "qd": 16
+        },
+        {
+          "Bps": 11090700000.0,
+          "Bps_runs": [
+            10481900000.0,
+            11699500000.0
+          ],
+          "bytes": 16777216,
+          "lat_us": {
+            "mean": 46307.9,
+            "p50": 56745.7,
+            "p90": 59184.4,
+            "p99": 59443.7
+          },
+          "qd": 32
+        }
+      ],
+      "reader": "io_uring"
+    }
+  ]
+}

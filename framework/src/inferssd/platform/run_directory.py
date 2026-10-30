@@ -10,6 +10,7 @@ from pathlib import Path
 
 RESERVED = (
     "settings.ssd",
+    "strategy.json",
     "native-events.jsonl",
     "server.log",
     "server.log.gz",

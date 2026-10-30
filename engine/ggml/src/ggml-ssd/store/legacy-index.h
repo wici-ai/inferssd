@@ -6,11 +6,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fcntl.h>
 #include <memory>
 #include <string>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -22,16 +19,17 @@ namespace c0 {
 struct source_identity {
     uint64_t device = 0;
     uint64_t inode = 0;
+    uint64_t inode_hi = 0; // the upper half of a 128-bit file id (Windows)
     uint64_t size = 0;
     bool operator==(const source_identity & other) const {
-        return device == other.device && inode == other.inode && size == other.size;
+        return device == other.device && inode == other.inode && inode_hi == other.inode_hi && size == other.size;
     }
 };
 
 inline source_identity identity(const expert_pack_source & source) {
-    struct stat info = {};
-    if (!source.file || ::fstat(::fileno(source.file), &info) || info.st_size < 0) { return {}; }
-    return {uint64_t(info.st_dev), uint64_t(info.st_ino), uint64_t(info.st_size)};
+    ssd::platform::file_identity file;
+    if (!source.file || !ssd::platform::identity(ssd::platform::stream_fd(source.file), file)) { return {}; }
+    return {file.device, file.id_lo, file.id_hi, file.size};
 }
 
 struct extent {
@@ -71,10 +69,10 @@ public:
     }
     // Borrowed descriptor, valid until this index is destroyed; never close it.
     // Buffered handles support file-identity tests. Typed source_index separately
-    // requires O_DIRECT on Linux before publishing a source view.
+    // requires a direct descriptor before publishing a source view.
     int borrowed_fd(int source_id) const {
         if (source_id < 0 || size_t(source_id) >= state_->sources.size()) { return -1; }
-        return ::fileno(state_->sources[size_t(source_id)].file);
+        return ssd::platform::stream_fd(state_->sources[size_t(source_id)].file);
     }
     int borrowed_direct_fd(int source_id) const {
         if (source_id < 0 || size_t(source_id) >= state_->sources.size()) { return -1; }

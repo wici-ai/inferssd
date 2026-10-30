@@ -1,9 +1,13 @@
 #pragma once
 #include "ggml-ssd/gpu/kimi-vram-tier-api.h"
-// The routed experts' activation on the GPU, shared by the tier's engines: SwiGLU with its clamp (an infinite limit
-// leaves it unclamped), or SiTU with its optional linear soft cap. The CPU sink computes the same (compute_rows).
+// The routed experts' activation on the GPU, shared by the tier's engines: SwiGLU, SwiGLU with its clamp (an
+// infinite limit leaves it unclamped), or SiTU with its optional linear soft cap. The CPU sink computes the same
+// (compute_rows).
 static __device__ __forceinline__ float kimi_vram_activate(float up, float gate, int kind, float situ_beta,
         float situ_linear_beta, float swiglu_limit) {
+    if (kind == KIMI_VRAM_ACTIVATION_SWIGLU) {
+        return gate / (1.0f + expf(-gate)) * up;
+    }
     if (kind == KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP) {
         const float g = fminf(gate, swiglu_limit);
         const float u = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);

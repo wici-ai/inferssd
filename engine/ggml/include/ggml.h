@@ -584,9 +584,11 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
-        GGML_OP_HC_WEIGHTED_SUM,
+        GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
+        GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_TOP_K_MASK,
         GGML_OP_ROW_MASK,
 
         GGML_OP_COUNT,
@@ -1449,13 +1451,6 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
 
-    // weighted sum over the HC dimension:
-    // a: [n_embd, hc_mult], b: [hc_mult] => result: [n_embd]
-    GGML_API struct ggml_tensor * ggml_hc_weighted_sum(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * a,
-            struct ggml_tensor  * b);
-
     // DeepSeek-V4 hyper-connection Sinkhorn combination, hc = 4:
     //   mixes [(2 + hc)*hc, n_tokens], scale [>= 3], base [(2 + hc)*hc] -> [hc, hc, n_tokens]
     //   logits[dst, src, t] = mixes[2*hc + dst + hc*src, t]*scale[2] + base[2*hc + dst + hc*src]
@@ -1469,10 +1464,27 @@ extern "C" {
             float                 eps,
             int32_t               n_iter);
 
+    // DeepSeek-V4 hyper-connection reduction:
+    //   x [n_embd, hc, n_tokens], weights [hc, n_tokens] -> [n_embd, n_tokens]
+    //   result[i, t] = sum_h x[i, h, t]*weights[h, t]
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * weights);
+
+    // hc_pre with a per-element gate (Qwen3.8-Flash-Next): gate [n_embd, hc, n_tokens]
+    //   result[i, t] = scale*sum_h x[i, h, t]*sigmoid(gate[i, h, t])
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_gated(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * gate,
+            float                 scale);
+
     // DeepSeek-V4 hyper-connection expansion:
     //   x [n_embd, n_tokens], residual [n_embd, hc, n_tokens], post [hc, n_tokens],
     //   comb [dst_hc, src_hc, n_tokens] -> [n_embd, hc, n_tokens]
     //   result[i, dst, t] = x[i, t]*post[dst, t] + sum_src residual[i, src, t]*comb[dst, src, t]
+    //   comb == NULL uses the identity: result[i, dst, t] = x[i, t]*post[dst, t] + residual[i, dst, t]
     GGML_API struct ggml_tensor * ggml_dsv4_hc_post(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
@@ -2643,6 +2655,46 @@ extern "C" {
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
+
+    // DSA lightning indexer
+    //
+    // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
+    // k:       [n_embd_idx, 1,          n_kv,    ne3 ]
+    // weights: [n_head_idx, n_batch,    1,       ne3 ] !! prescaled !!
+    // mask:    [n_kv,       n_batch,    1,       ne33] !! f16 !!
+    // res:     [n_kv,       n_batch,    1,       ne3 ]
+    //
+    // res[kv, t] = sum_h weights[h, t]*relu(q[:, h, t].k[:, kv]) + mask[kv, t]
+    //
+    // broadcast:
+    //   ne3 % ne33 == 0
+    //
+    GGML_API struct ggml_tensor * ggml_lightning_indexer(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * mask);
+
+    // top-k sparse attention mask: keep the mask cells of the live picks and the extra cells, set the rest to -inf
+    //
+    // mask:   [n_kv,    m1,  m2,  m3]  f16 or f32, broadcast to the rows of top_k
+    // top_k:  [n_top,   ne1, ne2, ne3] i32, picks of each row
+    // score:  [n_pick,  ne1, ne2, ne3] f32, can be NULL: a pick is live when its score is above -inf, else every pick is live
+    // blocks: [n_blk,   n_pick]        i32, can be NULL: the member cells of each pick, else a pick is a cell
+    // extra:  [n_extra, ne1, ne2, ne3] i32, can be NULL: cells of each row kept without a pick
+    // res:    [n_kv,    ne1, ne2, ne3] same type as mask
+    //
+    // res[c, i] = mask[c, i % m] when c is a cell of a live pick of row i or an extra cell of row i, else -inf
+    // picks and cells out of range are skipped
+    //
+    GGML_API struct ggml_tensor * ggml_top_k_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * blocks,
+            struct ggml_tensor  * extra);
 
     // custom operators
 

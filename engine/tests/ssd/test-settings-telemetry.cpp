@@ -47,18 +47,18 @@ int main(int argc, char ** argv) {
         return 0;
     }
     using namespace ssd::settings;
-    assert(registry().size() == 17);
+    assert(registry().size() == 15);
     assert(parse("inferssd-settings 1\nmodel.engram_prefetch=1\nmodel.hc_fused=0\n", "model.ssd"));
     assert(!parse("inferssd-settings 1\nmodel.hc_fused=2\n", "model-invalid.ssd"));
     auto base = parse("", "");
     assert(base);
-    assert(*base.value.integer("cpu.threads") == 2);
+    assert(*base.value.integer("prefetch.depth") == 2);
     assert(base.value.integer("expert.source") == nullptr);
     assert(base.value.find("unknown") == nullptr);
     const std::string text =
         "inferssd-settings 1\n"
-        "cpu.threads = 4 # source=derived; input=measured CPUs\n"
-        "cpu.compute_cpus = 2-4\n"
+        "prefetch.depth = 4 # source=derived; input=measured CPUs\n"
+        "cpu.io_cpus = 2-4\n"
         "expert.source = [\"/path # 1\",\"/unicode-\\ud83d\\udc08\"] # preserved\n"
         "place.costs = cpu_fixed_us=204,link_gbps=12.3\n";
     auto parsed = parse(text, "fixture.ssd",
@@ -66,18 +66,18 @@ int main(int argc, char ** argv) {
                             { "cpu.decode_participants", "2" }
     });
     assert(parsed);
-    assert(*parsed.value.integer("cpu.threads") == 4);
-    assert(*parsed.value.cpus("cpu.compute_cpus") == std::vector<uint32_t>({ 2, 3, 4 }));
+    assert(*parsed.value.integer("prefetch.depth") == 4);
+    assert(*parsed.value.cpus("cpu.io_cpus") == std::vector<uint32_t>({ 2, 3, 4 }));
     assert(parsed.value.sources()->at(0) == "/path # 1");
     assert(parsed.value.sources()->at(1) == "/unicode-\xf0\x9f\x90\x88");
-    assert(parsed.value.find("cpu.threads")->receipt == " source=derived; input=measured CPUs");
+    assert(parsed.value.find("prefetch.depth")->receipt == " source=derived; input=measured CPUs");
     assert(parsed.value.find("cpu.decode_participants")->origin == "cli");
     auto copy = parsed.value;
     parsed    = parse("", "");
-    assert(*copy.integer("cpu.threads") == 4 && *parsed.value.integer("cpu.threads") == 2);
+    assert(*copy.integer("prefetch.depth") == 4 && *parsed.value.integer("prefetch.depth") == 2);
     for (const std::string bad :
-         { "cpu.threads = 0", "cpu.threads = \"4\"", "cpu.threads = 18446744073709551616", "cpu.compute_cpus = 1,1",
-           "cpu.compute_cpus = 2-0", "cpu.compute_cpus = 1-99999999", "cpu.decode_participants = 2", "unknown = 0",
+         { "cpu.threads = 4", "cpu.compute_cpus = 0-1", "prefetch.depth = \"4\"", "prefetch.depth = 18446744073709551616",
+           "cpu.io_cpus = 1,1", "cpu.io_cpus = 2-0", "cpu.io_cpus = 1-99999999", "cpu.decode_participants = 256", "unknown = 0",
            "vram.reserve_mib = 64", "place.costs = cpu_fixed_us=nan", "place.costs = link_gbps=0",
            "place.costs = unknown=1", "place.costs = cpu_fixed_us=1,cpu_fixed_us=2", "vram.budget = \"123\"",
            "expert.source = [1]", "host.expert_cache_mib = 0", "prefetch.depth = 65" }) {
@@ -88,24 +88,45 @@ int main(int argc, char ** argv) {
         assert(!rejected && rejected.code == ssd::status::invalid &&
                rejected.error.find("bad.ssd:2") != std::string::npos);
     }
-    assert(!parse("inferssd-settings 1\ncpu.threads=2\ncpu.threads=4\n", "duplicate.ssd"));
+    assert(!parse("inferssd-settings 1\nprefetch.depth=2\nprefetch.depth=4\n", "duplicate.ssd"));
     assert(!parse("", "empty.ssd"));
     assert(!parse("inferssd-settings 2\n", "version.ssd"));
-    assert(parse("inferssd-settings 1\nhost.expert_cache_mib=12288\ncpu.threads=8\n", "mac.ssd", {}, "darwin"));
+    assert(parse("inferssd-settings 1\nprefetch.depth=8\n", "mac.ssd", {}, "darwin"));
+    assert(!parse("inferssd-settings 1\nhost.expert_cache_mib=12288\n", "mac.ssd", {}, "darwin"));
     assert(!parse("inferssd-settings 1\nvram.budget=auto\n", "mac.ssd", {}, "darwin"));
+    // The executor's keys apply on every platform; the CUDA and Linux prefill keys stay Linux-only.
+    assert(parse("inferssd-settings 1\ncpu.io_cpus=3\ncpu.decode_participants=2\nprefetch.depth=4\n"
+                 "place.costs=cpu_fixed_us=204\nhost.headroom_mib=1024\nhost.budget_mib=8192\n"
+                 "model.hc_fused=0\n", "win.ssd", {}, "windows"));
+    assert(parse("inferssd-settings 1\ncpu.io_cpus=0-2\ncpu.decode_participants=1\nhost.budget_mib=8192\n", "mac.ssd", {},
+                 "darwin"));
+    for (const std::string bad : { "vram.budget = auto", "prefill.cpu_max_tokens = 1", "vram.reserve_mib = 0" }) {
+        const auto rejected = parse("inferssd-settings 1\n" + bad + "\n", "win.ssd", {}, "windows");
+        assert(!rejected && rejected.error.find("win.ssd:2") != std::string::npos);
+    }
+    assert(!parse("inferssd-settings 1\nhost.budget_mib=1\n", "linux.ssd"));
+    assert(!parse("", "", {}, "freebsd"));
+    {
+        const auto scopes = ssd::json::parse(schema_json().value).value.object.at("properties").object;
+        assert(scopes.at("host.budget_mib").object.at("scope").text == "darwin,windows");
+        assert(scopes.at("cpu.io_cpus").object.at("scope").text == "all");
+        assert(scopes.at("cpu.decode_participants").object.at("scope").text == "all");
+        assert(scopes.at("vram.budget").object.at("scope").text == "linux");
+    }
     assert(reject_retired_environment({ "TASKRC", "TASKDATA", "INFERSSD_DEBUG" }));
     assert(!reject_retired_environment({ "TASK123_PROBE" }));
     assert(!reject_retired_environment({ "GGML_KIMI_CPU_SINK" }));
     std::vector<override_value> cli;
-    assert(cli_override("--ssd-cpu-threads", "6", cli));
-    assert(cli.size() == 1 && cli[0].key == "cpu.threads");
+    assert(cli_override("--ssd-prefetch-depth", "6", cli));
+    assert(cli.size() == 1 && cli[0].key == "prefetch.depth");
+    assert(!cli_override("--ssd-cpu-threads", "6", cli));
     assert(!cli_override("--ssd-unknown", "3", cli));
     const auto unrelated = cli_override("--port", "8080", cli);
     assert(unrelated && !unrelated.value);
     const auto schema = schema_json();
     assert(schema && ssd::json::parse(schema.value).value.object.at("properties").object.size() == registry().size());
     const auto help_text = help();
-    assert(help_text && help_text.value.find("--ssd-host-expert-cache-mib") != std::string::npos);
+    assert(help_text && help_text.value.find("--ssd-host-budget-mib") != std::string::npos);
 
     char directory[] = "/tmp/ssdash-config-test-XXXXXX";
     assert(mkdtemp(directory));

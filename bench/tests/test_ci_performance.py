@@ -29,7 +29,7 @@ def pair():
         "model_identity": {"shards": [{"sha256": "b" * 64}]},
         "host": {"hardware": "synthetic", "os": "synthetic", "memory_budget_bytes": 1024,
                  "os_page_cache_treatment": "uncontrolled",
-                 "effective_settings": {"native_launch_policy": {"typed_values": {"cpu.threads": 2}}}},
+                 "effective_settings": {"native_launch_policy": {"typed_values": {"prefetch.depth": 2}}}},
         "build": {"loaded_libraries": [{"path": "libsynthetic.so"}]},
         "server": {"pid": 1, "start_identity": "base"},
     }
@@ -39,14 +39,14 @@ def pair():
 
 
 @pytest.mark.parametrize("metric", compare.METRICS)
-def test_even_small_slowdown_is_inconclusive_not_permitted_regression(pair, policy, metric):
+def test_single_pair_slowdown_is_marked_for_review_not_a_regression(pair, policy, metric):
     a, b, ar, br = pair
     b["metrics"][metric] *= 1.001 if metric == "ttft_s" else .999
     if metric == "server_prefill_tps":
         b["timings"]["prompt_ms"] = b["input_tokens"] * 1000 / b["metrics"][metric]
         b["metrics"][metric] = b["input_tokens"] * 1000 / b["timings"]["prompt_ms"]
     result = compare.compare_pair(a, b, ar, br, policy)
-    assert result["status"] == "inconclusive" and not result["passed"]
+    assert result["status"] == "needs-review" and not result["passed"]
     assert result["observed_slowdowns"] == [metric]
     assert result["diagnostic_required"] and result["evidence_valid"]
 
@@ -55,7 +55,8 @@ def test_equal_samples_pass_only_observed_gate(pair, policy):
     result = compare.compare_pair(*pair, policy)
     assert result["passed"] and result["status"] == "passed"
     assert not result["diagnostic_required"]
-    assert "not statistical proof" in result["interpretation"]
+    assert result["interpretation"] == compare.PAIR_INTERPRETATION
+    assert "a single pair is an observation, not a statistical test" in result["interpretation"]
 
 
 def test_pair_reports_signed_changes_and_exact_prompt_conditions(pair, policy):
@@ -73,20 +74,21 @@ def test_pair_reports_signed_changes_and_exact_prompt_conditions(pair, policy):
     assert len(result["measurement_identity"]["conditions_sha256"]) == 64
 
 
-def test_faster_different_output_is_inconclusive_and_retains_metrics(pair, policy):
+def test_different_output_is_recorded_without_review_and_retains_metrics(pair, policy):
     a, b, ar, br = pair
     b["tokens"][64] = 12
     for metric in compare.METRICS:
         b["metrics"][metric] *= .5 if metric == "ttft_s" else 2
     b["timings"]["prompt_ms"] /= 2
     result = compare.compare_pair(a, b, ar, br, policy)
-    assert not result["passed"] and result["status"] == "inconclusive"
-    assert result["diagnostic_required"] and result["evidence_valid"]
+    # Generated tokens are not yet required to match (compare.REQUIRE_SAME_TOKENS).
+    assert result["passed"] and result["status"] == "passed"
+    assert not result["diagnostic_required"] and result["evidence_valid"]
     assert result["observed_slowdowns"] == []
     assert all(value["passed"] for value in result["metrics"].values())
     assert result["metrics"]["decode_tps"]["candidate"] == 20
     assert result["output_workload"] == {
-        "same_tokens": False, "first_difference_one_based": 65,
+        "same_tokens": False, "same_tokens_required": False, "first_difference_one_based": 65,
         "base_token": 11, "candidate_token": 12,
     }
 
@@ -128,10 +130,24 @@ def test_metric_ratio_overflow_is_invalid_not_a_speedup(pair, policy):
         compare.compare_pair(*pair, policy)
 
 
-@pytest.mark.parametrize("key", ["decode_regression_fraction", "ttft_regression_fraction", "prefill_regression_fraction"])
-def test_policy_cannot_reintroduce_a_positive_allowed_regression(policy, key):
-    policy["thresholds"][key] = .01
-    with pytest.raises(ValueError, match="no permitted"):
+def test_shipped_policy_holds_decision_constants_but_no_history(policy):
+    thresholds = policy["thresholds"]
+    assert thresholds == {"mode": "baseline-history", "floor_fraction": {metric: 0.01 for metric in compare.METRICS}}
+
+
+@pytest.mark.parametrize("damage", ["old-mode", "extra-key", "pool-size", "fixed-k",
+                                    "floor-negative", "floor-one", "floor-missing", "history-in-policy"])
+def test_policy_thresholds_are_explicit_and_finite(policy, damage):
+    thresholds = policy["thresholds"]
+    if damage == "old-mode": thresholds["mode"] = "calibrated-noise-band"
+    elif damage == "extra-key": thresholds["pairs"] = 2
+    elif damage == "pool-size": thresholds["pool_records"] = 16  # Every same-conditions record pools.
+    elif damage == "fixed-k": thresholds["k"] = 3  # The multiplier is the fixed t quantile, not policy.
+    elif damage == "floor-negative": thresholds["floor_fraction"]["ttft_s"] = -0.01
+    elif damage == "floor-one": thresholds["floor_fraction"]["decode_tps"] = 1
+    elif damage == "floor-missing": del thresholds["floor_fraction"]["server_prefill_tps"]
+    else: thresholds["history"] = []  # Baseline history is operator data sealed per job, never policy.
+    with pytest.raises(ValueError):
         policy_read(policy)
 
 
@@ -181,6 +197,18 @@ def test_observed_native_prefill_slowdown_blocks_complete_three_device_report(sy
     summary["rows"][0]["result"] = result
     test_device_ci.measurement_manifest(folder, manifest["config"], summary["rows"])
     report = compare.aggregate(roots, plan, policy)
-    assert report["status"] == "inconclusive" and not report["passed"]
+    assert report["status"] == "needs-review" and not report["passed"]
     row = next(row for row in report["devices"][0]["rows"] if row["model"] == "muse")
     assert row["evidence_valid"] and row["observed_slowdowns"] == ["server_prefill_tps"]
+
+
+def test_legacy_single_pair_paths_describe_what_they_actually_decide(synthetic):
+    from ci.private_controller import check_body
+    roots, plan, policy = synthetic
+    report = compare.aggregate(roots, plan, policy)
+    assert report["interpretation"] == compare.LEGACY_INTERPRETATION
+    assert all(device["interpretation"] == compare.LEGACY_INTERPRETATION for device in report["devices"])
+    controller = dict(repository="wici-ai/inferssd-device-ci", run_id=1, run_attempt=1)
+    summary = check_body(dict(controller=controller, head="b" * 40), report, 88)["output"]["summary"]
+    for text in (compare.LEGACY_INTERPRETATION, summary):
+        assert "one base/candidate pair" in text.lower() and "noise" not in text and "band" not in text

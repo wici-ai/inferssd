@@ -70,7 +70,9 @@ class Session:
             elif path == "/props":
                 body = {"total_slots": 1, "default_generation_settings": {"n_ctx": 8192}}
             chunks.append(dict(elapsed_ns=1, data_b64=base64.b64encode(json.dumps(body).encode()).decode()))
-        return dict(status=200, started_monotonic_ns=100, ended_monotonic_ns=257_000_000_100, chunks=chunks)
+        # One trusted monotonic clock per job: each started stage is later.
+        offset = 100 + len(self.started) * 10**12
+        return dict(status=200, started_monotonic_ns=offset, ended_monotonic_ns=offset + 257_000_000_000, chunks=chunks)
 
     def output(self, stage, stream, offset):
         self.calls.append((stage.stage_id, "output-" + stream))

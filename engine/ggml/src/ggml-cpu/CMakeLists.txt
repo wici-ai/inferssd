@@ -30,13 +30,11 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     list (APPEND GGML_CPU_SOURCES
         ggml-cpu/ggml-cpu.c
         ggml-cpu/ggml-cpu.cpp
-        ggml-cpu/ssd/routed-matmul.inc
         ggml-cpu/ssd/cpu-cache-executor.inc
         ggml-cpu/ssd/kernels.cpp
         ggml-cpu/ssd/cpu-sink.cpp
         ggml-cpu/ssd/cpu-sink.h
         ggml-cpu/ssd/cpu-sink-internal.h
-        ggml-ssd/host/ledger.h
         ggml-cpu/ssd/cpu-prefill.cpp
         ggml-cpu/ssd/cpu-prefill.h
         ggml-cpu/repack.cpp
@@ -63,13 +61,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/ops.h
         ggml-cpu/ops.cpp
         )
-
-    if (APPLE)
-        list(APPEND GGML_CPU_SOURCES
-            ggml-cpu/ssd/mac-expert-source.cpp
-            ggml-cpu/ssd/mac-expert-source.h)
-        target_link_libraries(${GGML_CPU_NAME} PRIVATE ggml-ssd-pread)
-    endif()
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
     target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)

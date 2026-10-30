@@ -1102,13 +1102,15 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
-    "HC_WEIGHTED_SUM",
+    "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
+    "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "TOP_K_MASK",
     "ROW_MASK",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1216,13 +1218,15 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
-    "hc_weighted_sum(x,w)",
+    "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
+    "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "top_k_mask(mask, top_k, score, blocks, extra)",
     "row_mask(n_visible)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3323,28 +3327,6 @@ struct ggml_tensor * ggml_mul_mat(
     return result;
 }
 
-// ggml_hc_weighted_sum
-
-struct ggml_tensor * ggml_hc_weighted_sum(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * a,
-        struct ggml_tensor  * b) {
-    GGML_ASSERT(a->type == GGML_TYPE_F32);
-    GGML_ASSERT(b->type == GGML_TYPE_F32);
-
-    GGML_ASSERT(a->ne[1] == b->ne[0]);
-    GGML_ASSERT(a->ne[3] == 1);
-    GGML_ASSERT(b->ne[1] == a->ne[2] && b->ne[2] == 1 && b->ne[3] == 1);
-
-    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[2]);
-
-    result->op     = GGML_OP_HC_WEIGHTED_SUM;
-    result->src[0] = a;
-    result->src[1] = b;
-
-    return result;
-}
-
 // ggml_dsv4_hc_comb
 
 struct ggml_tensor * ggml_dsv4_hc_comb(
@@ -3383,6 +3365,61 @@ struct ggml_tensor * ggml_dsv4_hc_comb(
     return result;
 }
 
+// ggml_dsv4_hc_pre
+
+static struct ggml_tensor * ggml_dsv4_hc_pre_impl(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weights,
+        float                 scale,
+        bool                  gated) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t hc       = x->ne[1];
+    const int64_t n_tokens = x->ne[2];
+
+    GGML_ASSERT(hc > 0);
+    GGML_ASSERT(x->ne[3] == 1);
+    if (gated) {
+        GGML_ASSERT(weights->ne[0] == n_embd);
+        GGML_ASSERT(weights->ne[1] == hc);
+        GGML_ASSERT(weights->ne[2] == n_tokens);
+    } else {
+        GGML_ASSERT(weights->ne[0] == hc);
+        GGML_ASSERT(weights->ne[1] == n_tokens);
+        GGML_ASSERT(weights->ne[2] == 1);
+    }
+    GGML_ASSERT(weights->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, gated ? 1 : 0);
+
+    result->op     = GGML_OP_DSV4_HC_PRE;
+    result->src[0] = x;
+    result->src[1] = weights;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_dsv4_hc_pre(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * weights) {
+    return ggml_dsv4_hc_pre_impl(ctx, x, weights, 1.0f, false);
+}
+
+struct ggml_tensor * ggml_dsv4_hc_pre_gated(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * gate,
+        float                 scale) {
+    return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+}
+
 // ggml_dsv4_hc_post
 
 struct ggml_tensor * ggml_dsv4_hc_post(
@@ -3394,7 +3431,6 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
     GGML_ASSERT(post->type == GGML_TYPE_F32);
-    GGML_ASSERT(comb->type == GGML_TYPE_F32);
 
     const int64_t n_embd   = x->ne[0];
     const int64_t n_tokens = x->ne[1];
@@ -3404,7 +3440,10 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
     GGML_ASSERT(residual->ne[0] == n_embd && residual->ne[2] == n_tokens && residual->ne[3] == 1);
     GGML_ASSERT(post->ne[0] == hc && post->ne[1] == n_tokens && post->ne[2] == 1 && post->ne[3] == 1);
-    GGML_ASSERT(comb->ne[0] == hc && comb->ne[1] == hc && comb->ne[2] == n_tokens && comb->ne[3] == 1);
+    if (comb) {
+        GGML_ASSERT(comb->type == GGML_TYPE_F32);
+        GGML_ASSERT(comb->ne[0] == hc && comb->ne[1] == hc && comb->ne[2] == n_tokens && comb->ne[3] == 1);
+    }
 
     struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
 
@@ -6461,6 +6500,84 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+// ggml_lightning_indexer
+
+struct ggml_tensor * ggml_lightning_indexer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask) {
+
+    GGML_ASSERT(       q->type == GGML_TYPE_F32);
+    GGML_ASSERT( weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(      q->ne[0] == k->ne[0]);
+    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
+    GGML_ASSERT(      q->ne[1] == weights->ne[0]);
+    GGML_ASSERT(      k->ne[1] == 1);
+    GGML_ASSERT(   mask->ne[1] == q->ne[2]);
+    GGML_ASSERT(      q->ne[2] == weights->ne[1]);
+    GGML_ASSERT(weights->ne[2] == 1);
+    GGML_ASSERT(   mask->ne[2] == 1);
+    GGML_ASSERT(      q->ne[3] == k->ne[3]);
+    GGML_ASSERT(      k->ne[3] == weights->ne[3]);
+    GGML_ASSERT(weights->ne[3] % mask->ne[3] == 0);
+
+    int64_t ne[4] = { k->ne[2], q->ne[2], 1, q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_LIGHTNING_INDEXER;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = weights;
+    result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_top_k_mask
+
+struct ggml_tensor * ggml_top_k_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * blocks,
+        struct ggml_tensor  * extra) {
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask->nb[0] == ggml_type_size(mask->type));
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(top_k->ne[1] % mask->ne[1] == 0 && top_k->ne[2] % mask->ne[2] == 0 && top_k->ne[3] % mask->ne[3] == 0);
+
+    if (score) {
+        GGML_ASSERT(score->type == GGML_TYPE_F32);
+        GGML_ASSERT(score->ne[1] == top_k->ne[1] && score->ne[2] == top_k->ne[2] && score->ne[3] == top_k->ne[3]);
+    }
+
+    if (blocks) {
+        GGML_ASSERT(blocks->type == GGML_TYPE_I32);
+        GGML_ASSERT(blocks->ne[2] == 1 && blocks->ne[3] == 1);
+        GGML_ASSERT(!score || blocks->ne[1] == score->ne[0]);
+    }
+
+    if (extra) {
+        GGML_ASSERT(extra->type == GGML_TYPE_I32);
+        GGML_ASSERT(extra->ne[1] == top_k->ne[1] && extra->ne[2] == top_k->ne[2] && extra->ne[3] == top_k->ne[3]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, mask->type, mask->ne[0], top_k->ne[1], top_k->ne[2], top_k->ne[3]);
+
+    result->op     = GGML_OP_TOP_K_MASK;
+    result->src[0] = mask;
+    result->src[1] = top_k;
+    result->src[2] = score;
+    result->src[3] = blocks;
+    result->src[4] = extra;
+
+    return result;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 
 struct ggml_hash_set ggml_hash_set_new(size_t size) {
@@ -6800,21 +6917,6 @@ static void ggml_compute_backward(
                             src0,               // [n,m,q1,r1]
                             ggml_transpose(ctx, // [p,m,qq,rr]
                                 grad)));        // [m,p,qq,rr]
-            }
-        } break;
-        case GGML_OP_HC_WEIGHTED_SUM: {
-            if (src0_needs_grads || src1_needs_grads) {
-                struct ggml_tensor * grad_x = ggml_repeat(ctx, grad, src0);
-
-                if (src0_needs_grads) {
-                    struct ggml_tensor * src1_cont = ggml_is_contiguous(src1) ? src1 : ggml_cont(ctx, src1);
-                    struct ggml_tensor * weights = ggml_reshape_2d(ctx, src1_cont, 1, src1->ne[0]);
-                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad_x, weights));
-                }
-                if (src1_needs_grads) {
-                    struct ggml_tensor * weighted_grad = ggml_mul(ctx, src0, grad_x);
-                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_sum_rows(ctx, weighted_grad), src1));
-                }
             }
         } break;
         case GGML_OP_SCALE: {

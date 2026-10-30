@@ -143,7 +143,7 @@ public:
         }
     }
     static bool same_source(const kimi_vram_source & a,const kimi_vram_source & b) {
-        return a.device==b.device && a.inode==b.inode && a.size==b.size && a.offset==b.offset &&
+        return a.device==b.device && a.inode==b.inode && a.inode_hi==b.inode_hi && a.size==b.size && a.offset==b.offset &&
             a.bytes==b.bytes && a.mtime_s==b.mtime_s && a.mtime_ns==b.mtime_ns &&
             a.ctime_s==b.ctime_s && a.ctime_ns==b.ctime_ns;
     }

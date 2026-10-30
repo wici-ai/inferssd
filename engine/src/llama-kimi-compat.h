@@ -43,13 +43,10 @@ static inline bool llama_is_kimi_k2_deepseek2_layout(llm_arch arch, const llama_
         hparams.n_expert_groups == 1;
 }
 
-// With --defer-experts (mmap), keep routed-expert tensors in mmap-backed CPU
-// buffers even when layers are offloaded, so they are never uploaded to VRAM.
-// DeepSeek-V4.1 streams them from an expert pack through the CPU sink.
-static inline bool llama_should_defer_kimi_experts_on_gpu(llm_arch arch, const std::string & name) {
+// With --defer-experts (mmap), Kimi's routed-expert tensors stay in plain mmap-backed
+// CPU buffers, with or without offloaded layers: never repacked or uploaded to VRAM.
+static inline bool llama_should_map_kimi_experts(llm_arch arch, const std::string & name) {
     return arch == LLM_ARCH_KIMI_LINEAR ||
-        arch == LLM_ARCH_DEEPSEEK41 ||
-        arch == LLM_ARCH_MUSE_SPARK ||
         (arch == LLM_ARCH_DEEPSEEK2 && llama_model_name_is_kimi(name));
 }
 

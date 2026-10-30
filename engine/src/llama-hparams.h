@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <array>
+#include <bitset>
 #include <cassert>
 #include <cmath>
 
@@ -34,6 +35,9 @@ struct llama_hparams_convnext {
     uint32_t n_embd;
     uint32_t n_layer;
 };
+
+#define LLAMA_MAX_PLE_NGRAM 8  // qwen4exp
+#define LLAMA_MAX_PLE_HEADS 64 // qwen4exp
 
 struct llama_hparams {
     bool vocab_only;
@@ -217,6 +221,7 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    uint32_t indexer_kpool     = 0; // k-pool size: the indexer keys are pooled per block of this many cells
 
     // DeepSeek-V4.1 (LLM_ARCH_DEEPSEEK41). Field names follow upstream so the model code ports as is;
     // this fork's own DEEPSEEK4 port does not read them.
@@ -228,6 +233,25 @@ struct llama_hparams {
     float    dsv4_compress_rope_base   = 0.0f;
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
+
+    // Qwen4Exp low-rank hyper-connections and n-gram PLE.
+    uint32_t hc_low_rank = 0;
+
+    uint32_t ple_ngram_size      = 0;
+    uint32_t ple_heads_per_ngram = 0;
+    uint32_t ple_conv_kernel     = 0;
+    uint32_t ple_n_heads         = 0;   // (ngram_size - 1) * heads_per_ngram
+    uint32_t ple_head_dim        = 0;
+    uint32_t ple_eos_token_id    = 0;
+    // the id the PLE hash stands in at image positions; 0 makes the loader fall back to EOS
+    uint32_t ple_image_token_id  = 0;
+    // the file lists PLE layer indices, so this is never a per-layer gguf array and can hold one bit per layer
+    std::bitset<LLAMA_MAX_LAYERS> is_ple_impl;
+    // the hash multipliers reach ~2e13 and have to stay 64-bit
+    std::array<uint64_t, LLAMA_MAX_PLE_NGRAM>  ple_layer_multipliers = {};
+    // head offsets and vocab sizes are token-space indices; the gather truncates them to int32 anyway
+    std::array<uint32_t, LLAMA_MAX_PLE_HEADS>  ple_head_offsets = {};
+    std::array<uint32_t, LLAMA_MAX_PLE_HEADS>  ple_head_vocab_sizes = {};
 
     // Engram n-gram lookup tables
     uint32_t engram_n_head          = 0;
@@ -338,6 +362,10 @@ struct llama_hparams {
 
     // whether or not the given layer is recurrent (for hybrid models)
     bool is_recurrent(uint32_t il) const;
+
+    // PLE conv history rows: (kernel - 1) * ngram_size; 0 without a PLE module
+    uint32_t ple_conv_state() const;
+    bool is_ple(uint32_t il) const;
 
     uint32_t n_pos_per_embd() const;
 

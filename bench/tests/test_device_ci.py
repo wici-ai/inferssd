@@ -250,7 +250,7 @@ def synthetic_device(tmp_path, device, plan, policy):
             receipt = load(parent / "512/wrapper.json")
             receipt["server"]["start_identity"] = side
             receipt["host"]["effective_settings"]["native_launch_policy"] = {
-                "typed_values": {"cpu.threads": 2},
+                "typed_values": {"prefetch.depth": 2},
                 "args": [],
             }
             (parent / "512/wrapper.json").write_text(json.dumps(receipt))
@@ -350,7 +350,7 @@ def test_observed_slowdown_blocks_both_windows_and_separate_ttft(synthetic):
     b["metrics"]["ttft_s"] *= 1.11
     result = compare.compare_pair(a, b, ar, br, policy)
     assert result["regressions"] == ["decode_first128_tps", "ttft_s"]
-    assert result["status"] == "inconclusive" and not result["passed"]
+    assert result["status"] == "needs-review" and not result["passed"]
     br["host"]["memory_budget_bytes"] += 1
     with pytest.raises(ValueError, match="resource"):
         compare.compare_pair(a, b, ar, br, policy)
@@ -585,7 +585,7 @@ def test_driver_builds_and_validates_both_sources_before_single_attempt_cells(
         receipt = load(target / "512/wrapper.json")
         receipt["server"]["start_identity"] = cfg["revision"]
         receipt["host"]["effective_settings"]["native_launch_policy"] = {
-            "typed_values": {"cpu.threads": 2}
+            "typed_values": {"prefetch.depth": 2}
         }
         (target / "512/wrapper.json").write_text(json.dumps(receipt))
         result = load(target / "512/result.json")

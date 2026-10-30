@@ -27,16 +27,31 @@ typedef bool (*kimi_cpu_sink_resolver)(
 
 
 
-// Linux io_uring and O_DIRECT are required. total_threads includes the calling
-// compute thread and one I/O thread; all other threads sleep between phases.
+// Sources are direct-read descriptors (platform::open_direct), read through the
+// OS read ring (io/read-ring.h). The sink owns an I/O thread (and, with
+// prefetch, its readers); it computes on the threads of its calls (below).
 // A context serializes run calls. This unconfigured factory is for explicit
 // CPU-only callers. Production uses ssd::cpu::create_configured with an owned
 // typed snapshot and borrowed context services. Test policies are explicit
 // constructor inputs; no environment configuration is read here.
 GGML_BACKEND_API struct kimi_cpu_sink * kimi_cpu_sink_create(
-        int total_threads, int ring_experts, kimi_cpu_sink_resolver resolver,
+        int ring_experts, kimi_cpu_sink_resolver resolver,
         void * userdata, char * error, size_t error_size);
+// No call may be open.
 GGML_BACKEND_API void kimi_cpu_sink_destroy(struct kimi_cpu_sink * sink);
+
+// A call: nth compute participants for the runs in between, as a ggml graph's
+// CPU threads enter a node. The coordinator (ith 0) opens it with nth, runs,
+// and closes it; every other thread joins with its (ith, nth). Each compute
+// phase of a run splits its rows over the participants, a decode phase over
+// the first ones the decode thread choice takes. Without an open call the
+// coordinator computes alone. Joining blocks until the call closes; closing
+// waits until all nth - 1 have joined, so close on every path, errors
+// included. A call may span several runs; one is open at a time. Open fails
+// only for nth outside 1..512 or a call already open.
+GGML_BACKEND_API bool kimi_cpu_sink_call_open(struct kimi_cpu_sink * sink, int nth, char * error, size_t error_size);
+GGML_BACKEND_API void kimi_cpu_sink_call_close(struct kimi_cpu_sink * sink);
+GGML_BACKEND_API void kimi_cpu_sink_call_join(struct kimi_cpu_sink * sink, int ith, int nth);
 // Next-layer expert prefetch: the experts that `layer` is predicted to select,
 // best first, given before the decode run of the layer before it. Ignored when prefetch is off.
 GGML_BACKEND_API void kimi_cpu_sink_prefetch_hint(struct kimi_cpu_sink * sink, int32_t layer, const int32_t * experts, int n);
@@ -44,18 +59,20 @@ GGML_BACKEND_API void kimi_cpu_sink_prefetch_hint(struct kimi_cpu_sink * sink, i
 // Configure while no run is in progress. Layer quotas are assigned in priority
 // order, up to max_experts_per_layer each; a final layer may receive a partial
 // quota. Layer IDs refer to canonical blk.N.ffn_{up,gate,down}_exps.weight names.
-// Payload uses ordinary anonymous mmap, never pinned/registered. Configuration
-// does not touch payload pages. budget=0 disables the cache. Reconfiguration
-// releases the old mapping first. max_experts_per_layer must be 1..896.
-// Admission requires readable finite cgroup-v2 limits and the context's host
-// budget client. Only newly resident slots and conservative metadata/page-table
-// costs are charged; the virtual payload budget is not prefaulted wholesale.
+// Payload is an ordinary anonymous arena (platform/memory.h), never
+// pinned/registered. Configuration does not touch payload pages. budget=0
+// disables the cache. Reconfiguration releases the old arena first.
+// max_experts_per_layer must be 1..896.
+// Admission requires a readable host-ledger envelope (Linux: finite cgroup v2
+// limits) and the context's host budget client. Only newly resident slots and
+// conservative metadata/page-table costs are charged; the virtual payload
+// budget is not prefaulted wholesale.
 // Production fixes count_decay2/uniform retention with partial reclaim and
 // reclaimable-file accounting. Explicit test policies exercise other supported
 // algorithms through the testing factory. Unreadable resource guards reject
 // admission; known shortages may discard low-score pages while retaining the
-// mapping and policy heat. The caller must use swap0 and keep cgroup membership
-// fixed until workers stop and resident mappings are released.
+// mapping and policy heat. On Linux the caller must use swap0 and keep cgroup
+// membership fixed until workers stop and resident mappings are released.
 GGML_BACKEND_API bool kimi_cpu_sink_cache_configure(
         struct kimi_cpu_sink * sink, uint64_t budget_bytes,
         const int32_t * layer_priority, int n_layers, int max_experts_per_layer,
@@ -94,7 +111,7 @@ GGML_BACKEND_API void kimi_cpu_sink_cache_get_stats(
 // Room in host memory for other memory about to be allocated, decided by the host-memory ledger
 // (kimi-host-ledger.h): `host_bytes` of host memory (host compute buffers, checkpoints, prompt-cache blobs) and
 // `device_bytes` of GPU memory (device compute buffers), which count only where the GPU allocates out of the same
-// DRAM. The tightest finite cgroup limit and MemAvailable less the floor must both still hold. On a unified-memory
+// DRAM. Both ledger terms, the envelope and the available memory less the floor, must still hold. On a unified-memory
 // GPU the GPU tier gives blocks back first, then RAM cache slots go. Returns false when either would still be
 // exceeded. With a null sink (before the first graph creates one) the ledger alone decides.
 GGML_BACKEND_API bool kimi_cpu_sink_cache_make_room(struct kimi_cpu_sink * sink, uint64_t host_bytes, uint64_t device_bytes);
@@ -116,8 +133,9 @@ GGML_BACKEND_API void kimi_cpu_sink_cache_reset(struct kimi_cpu_sink * sink);
 // input); down may use another. Column counts must be multiples of the weight
 // and input block sizes. ids<0 are skipped; each live weight must be finite and
 // nonnegative. Caller supplies the final normalized weights. Each expert's down
-// output is multiplied by its weight, then added in slot order. On failure
-// output must be discarded. This is kimi_cpu_sink_run_activation with SITU.
+// output is multiplied by its weight, then added in slot order, starting from
+// the first live slot's product as the graph's sum does. On failure output
+// must be discarded. This is kimi_cpu_sink_run_activation with SITU.
 GGML_BACKEND_API bool kimi_cpu_sink_run(
         struct kimi_cpu_sink * sink,
         const struct ggml_tensor * up, const struct ggml_tensor * gate,
@@ -130,17 +148,21 @@ GGML_BACKEND_API bool kimi_cpu_sink_run(
 // SITU (Kimi-K3): beta*tanh(g/beta)*sigmoid(g) * lb*tanh(u/lb), where lb <= 0
 // keeps u linear; beta must be finite and positive and lb finite.
 // SWIGLU_CLAMP (DeepSeek-V4.1): silu(min(g, L)) * clamp(u, -L, L), computed as
-// the scalar GGML_GLU_OP_SWIGLU_CLAMP CPU kernel; L must be > 1e-6; +infinity is plain SwiGLU.
+// the scalar GGML_GLU_OP_SWIGLU_CLAMP CPU kernel; L must be > 1e-6. An infinite
+// L is SwiGLU in value but not in bits: the graph's SwiGLU kernel is vectorized.
+// SWIGLU: silu(g) * u as GGML_GLU_OP_SWIGLU (ggml_swiglu_split) computes it, the
+// vectorized CPU kernel over each whole hidden row; no parameter.
 enum kimi_cpu_sink_activation_kind {
     KIMI_CPU_SINK_ACTIVATION_SITU         = 0,
     KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP = 1,
+    KIMI_CPU_SINK_ACTIVATION_SWIGLU       = 2,
 };
 
 struct kimi_cpu_sink_activation {
     int32_t kind; // enum kimi_cpu_sink_activation_kind
     float   situ_beta;
     float   situ_linear_beta;
-    float   swiglu_limit; // +infinity means unclamped SwiGLU
+    float   swiglu_limit; // SWIGLU_CLAMP only
     const float * post_exp_norm; // optional latent-length weight, borrowed for run
     float post_exp_norm_eps;
 };

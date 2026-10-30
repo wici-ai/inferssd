@@ -14,11 +14,13 @@ import tempfile
 import traceback
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from inferssd.launch.darwin import PROFILES
 from inferssd.launch.types import Fact, LaunchInput, Reply
+from inferssd.machine import characteristics
 from inferssd.source import experts
+from inferssd.strategy import inputs as strategy_inputs
 
 
 def metadata(name: str, arguments: tuple[str, ...]) -> Reply:
@@ -64,7 +66,7 @@ def metadata(name: str, arguments: tuple[str, ...]) -> Reply:
 
 def generate_alias(
     paths: tuple[str, ...],
-    profile: str,
+    profile: Optional[str],
     cache_dir: Path,
     *,
     repo: str,
@@ -72,9 +74,13 @@ def generate_alias(
     run: Callable[[list[str]], None],
     replace: Callable[[str, str], None],
 ) -> str:
-    """Retain the strict Mac indexer and its two ordered publications."""
+    """Run the strict GGUF alias indexer, then publish the index and its summary in order.
+
+    The historical launcher's profile also fixes the expert count it checks; without one
+    the indexer reads it from the model.
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    name = hashlib.sha256((profile + "\0" + paths[0]).encode()).hexdigest()[:20]
+    name = hashlib.sha256(((profile or "") + "\0" + paths[0]).encode()).hexdigest()[:20]
     alias, summary = cache_dir / f"{name}.tsv", cache_dir / f"{name}.json"
     with tempfile.TemporaryDirectory(prefix=".index-", dir=cache_dir) as temporary:
         pending_alias, pending_summary = (
@@ -85,14 +91,14 @@ def generate_alias(
             python,
             "-I",
             "-m",
-            "inferssd.source.mac_alias",
-            "--n-experts",
-            str(PROFILES[profile][0]),
+            "inferssd.source.gguf_alias",
             "--out",
             str(pending_alias),
             "--summary-json",
             str(pending_summary),
         ]
+        if profile:
+            command[4:4] = ["--n-experts", str(PROFILES[profile][0])]
         if repo:
             command[4:4] = ["--repo", repo]
         for path in paths:
@@ -168,18 +174,29 @@ class RecordedArtifacts:
             return Reply()
         if name in ("index", "source_facts", "dense"):
             return metadata(name, args)
-        if name == "mac_alias":
+        if name in ("mac_alias", "gguf_alias"):
+            # The historical Mac launcher names its profile first; the typed launch does not.
+            historical = name == "mac_alias"
+            profile = args[0] if historical else None
+            directory, *paths = args[1:] if historical else args
             return Reply(
                 generate_alias(
-                    tuple(args[2:]),
-                    args[0],
-                    Path(args[1]),
+                    tuple(paths),
+                    profile,
+                    Path(directory),
                     repo=self.inputs.repo,
                     python=self.python,
                     run=self.run,
                     replace=self.replace,
                 )
             )
+        if name == "model_facts" and name not in self.host:
+            # Read from the model's own headers, as the alias index is.
+            header = strategy_inputs.shard_facts(args)
+            return Reply(strategy_inputs.model_facts_json(header))
+        if name in ("machine_characteristics", "model_drive_key") and name not in self.host:
+            # Absent: no strategy, or no drive term in it.
+            return Reply(None)
         if name == "systemd" and name not in self.host:
             # Recordings made before this fact existed came from systemd hosts.
             return Reply(True)
@@ -205,6 +222,28 @@ class RecordedArtifacts:
             "platform_machine",
         }
         converted = {"default_threads", "physical_memory", "disk_free"}
+        if name == "machine_characteristics":
+            # An inferssd-machine/1 object, or its text; the resolver gets canonical text.
+            try:
+                if isinstance(value, str):
+                    return Reply(characteristics.dumps(characteristics.loads(value)))
+                return Reply(characteristics.dumps(characteristics.validate(value)))
+            except ValueError as error:
+                raise ValueError(f"Recorded host fact {name}: {error}") from error
+        if name in ("model_facts", "runtime_facts"):
+            # Serialised strategy inputs, read back strictly and written out again.
+            try:
+                if name == "model_facts":
+                    facts = strategy_inputs.model_facts_from(value)
+                    return Reply(strategy_inputs.model_facts_json(facts))
+                runtime = strategy_inputs.runtime_facts_from(value)
+                return Reply(strategy_inputs.runtime_facts_json(runtime))
+            except ValueError as error:
+                raise ValueError(f"Recorded host fact {name}: {error}") from error
+        if name == "model_drive_key":
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"Recorded host fact {name}: expected text or null")
+            return Reply(value)
         if name in boolean:
             if not isinstance(value, bool):
                 raise ValueError(f"Recorded host fact {name}: expected a JSON boolean")
