@@ -35,7 +35,7 @@ These results compare complete inference configurations. In the Mac DeepSeek run
 
 Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [hardware details](docs/benchmark.md#hardware-details) for SSD models, CPU core layouts, and configuration notes.
 
-### DeepSeek-V4.1-Flash-1017
+### DeepSeek-V4.1-Flash-1017 · 763B
 
 <table>
 <thead>
@@ -65,9 +65,9 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 </tbody>
 </table>
 
-**N/S:** Muse was not supported by the tested Colibri version. It is not a zero-throughput measurement.
+**N/S:** Muse is not currently supported by Colibri.
 
-<sup>1</sup> The MacBook Pro Muse row uses a historical llama.cpp baseline with a different template and input token count. Its speedup ratios describe those recorded configurations, not a matched-input comparison.
+<sup>1</sup> The llama.cpp baseline here is an older run with a different template and input length, so these multiples are not a matched comparison.
 
 ## Get started
 
