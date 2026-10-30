@@ -6,6 +6,7 @@ It does not install, connect to a device, acquire a lease or execute source code
 """
 
 import argparse
+import ast
 import copy
 import gzip
 import hashlib
@@ -363,6 +364,27 @@ def staged_settings_name(model, side, mode):
     return "settings-" + model + ("-" + side if mode == MODE else "") + ".ssd"
 
 
+def selected_alias(alias, models):
+    # A reviewed side runs one gguf_alias command per model in a single alias stage, but a job
+    # mounts only the models it selected, so an unselected model's glob would match no file.
+    # Keep the selected models' commands, each exactly as reviewed.
+    commands = [ast.literal_eval(node) for node in ast.walk(ast.parse(alias["argv"][-1]))
+                if isinstance(node, ast.List) and node.elts
+                and all(isinstance(x, ast.Constant) and isinstance(x.value, str) for x in node.elts)]
+    by_model = {}
+    for argv in commands:
+        out = argv[argv.index("--out") + 1] if argv.count("--out") == 1 and argv[-1] != "--out" else ""
+        model = PurePosixPath(out).name[:-len("-alias.tsv")]
+        if not out.endswith("-alias.tsv") or not model or model in by_model:
+            raise ValueError("reviewed alias stage must write one alias table per model")
+        by_model[model] = argv
+    if not set(models) <= set(by_model):
+        raise ValueError("reviewed alias stage does not map a selected model")
+    kept = [by_model[model] for model in models]
+    code = "import subprocess; [subprocess.run(argv, check=True) for argv in " + repr(kept) + "]"
+    return dict(alias, argv=alias["argv"][:-1] + [code])
+
+
 def paired_settings(base, candidate, *, device=None, job_id=None):
     # Only the side's source/build namespace is an identity difference. Every
     # other byte (including typed resource values) must remain identical.
@@ -499,7 +521,10 @@ def prepare(args, api=None):
                     data["template"]["sha256"] = hashlib.sha256(git(args.source, "show", identities[side] + ":" + relative_template)).hexdigest()
         needs = runtime_requirements(template)
         for spec in template["sides"].values():
-            spec["models"] = {name: data for name, data in spec["models"].items() if name in needs["models"]}
+            selected = {name: data for name, data in spec["models"].items() if name in needs["models"]}
+            if spec.get("alias") and len(selected) < len(spec["models"]):
+                spec["alias"] = selected_alias(spec["alias"], list(selected))
+            spec["models"] = selected
             for model, data in spec["models"].items():
                 tiers = needs["performance"].get(model, {}).get("tiers", [])
                 if not set(tiers) <= set(data.get("benchmarks", {})):
