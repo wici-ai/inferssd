@@ -18,7 +18,7 @@ SETTING_KEYS = frozenset((
     "expert.source", "cpu.io_cpus", "cpu.decode_participants", "prefetch.depth",
     "place.costs", "prefill.cpu_max_tokens", "vram.budget", "vram.max_slots",
     "vram.reserve_mib", "vram.margin_mib", "host.headroom_mib", "host.budget_mib",
-    "model.engram_prefetch", "model.hc_fused",
+    "model.engram_prefetch", "model.hc_fused", "model.optimizations",
 ))
 SETTING_GENERATIONS = (SETTING_KEYS,)
 
@@ -47,7 +47,7 @@ def validate_semantics(values):
 
     properties = schema()["properties"]
     if frozenset(properties) not in SETTING_GENERATIONS or frozenset(values) not in SETTING_GENERATIONS:
-        raise ValueError("reference adapter requires the explicit reviewed 14-key schema")
+        raise ValueError("reference adapter requires the explicit reviewed 15-key schema")
     if not set(values) <= set(properties):
         raise ValueError("installed settings registry cannot validate this binding generation")
     for key, value in values.items():
@@ -64,7 +64,7 @@ def validate_semantics(values):
         else:
             literal = json.dumps(value, allow_nan=False)
         parsed = typed(prop, literal)
-        canonical = dict(parsed) if kind == "costs" else list(parsed) if kind in ("cpus", "paths") else parsed
+        canonical = dict(parsed) if kind == "costs" else list(parsed) if kind in ("cpus", "paths", "strings") else parsed
         if identity(canonical) != identity(value):
             raise ValueError("canonical setting type/value differs from registry: " + key)
 
@@ -162,7 +162,7 @@ def validate_binding(binding):
             or not isinstance(binding["semantic_settings"], dict)
             or frozenset(binding["semantic_settings"]) not in SETTING_GENERATIONS
             or not isinstance(binding["sides"], dict) or set(binding["sides"]) != {"base", "candidate"}):
-        raise ValueError("explicit legacy-to-typed binding with all 14 settings required")
+        raise ValueError("explicit legacy-to-typed binding with all 15 settings required")
     identity(binding)
     validate_semantics(binding["semantic_settings"])
     for side, spec in binding["sides"].items():

@@ -132,7 +132,7 @@ def test_the_reviewed_generation_is_exactly_the_installed_registry(binding, monk
     unreviewed = copy.deepcopy(settings_registry.schema())
     del unreviewed["properties"]["host.budget_mib"]
     monkeypatch.setattr(settings_registry, "schema", lambda: unreviewed)
-    with pytest.raises(ValueError, match="reviewed 14-key schema"):
+    with pytest.raises(ValueError, match="reviewed 15-key schema"):
         reference.validate_semantics(binding["semantic_settings"])
 
 
@@ -210,3 +210,29 @@ def test_private_config_binding_must_name_merge_candidate_not_pr_head(binding, s
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="exact base/merge candidate"):
         compare.device_report(root, plan, policy)
+
+
+@pytest.mark.parametrize("change", [
+    lambda b: b["semantic_settings"].pop("model.optimizations"),
+    lambda b: b["legacy_mapping"].pop("model.optimizations"),
+    lambda b: b["sides"]["candidate"]["launch_policy"]["typed_values"].pop("model.optimizations"),
+    lambda b: b["semantic_settings"].update({"model.optimizations": "[]"}),
+])
+def test_model_rules_require_complete_typed_binding_and_mapping(binding, change):
+    assert binding["semantic_settings"]["model.optimizations"] == []
+    reference.validate_binding(binding)
+    change(binding)
+    with pytest.raises(ValueError):
+        reference.validate_binding(binding)
+
+
+def test_model_rules_cannot_drift_from_reviewed_snapshot(binding):
+    rule = "reviewed|on|name:Example Model|deepseek41|38|2|Example GPU|0|1"
+    values = [rule]
+    binding["semantic_settings"]["model.optimizations"] = values.copy()
+    binding["legacy_mapping"]["model.optimizations"]["value"] = values.copy()
+    binding["sides"]["candidate"]["launch_policy"]["typed_values"]["model.optimizations"] = values.copy()
+    reference.validate_binding(binding)
+    binding["sides"]["candidate"]["launch_policy"]["typed_values"]["model.optimizations"] = []
+    with pytest.raises(ValueError, match="complete reviewed"):
+        reference.validate_binding(binding)

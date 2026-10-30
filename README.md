@@ -153,6 +153,13 @@ InferSSD is licensed under [Apache-2.0](LICENSE); bundled llama.cpp/ggml and oth
 
 ## Exact per-model option rules
 
+The benchmark reference adapter requires the complete 15-setting snapshot,
+including `model.optimizations`, its explicit reviewed legacy mapping and the
+matching candidate launch values. Regression tests reject omitted, mistyped or
+drifting rules; existing source and evidence checks remain mandatory.
+Hosted CPU CI also builds and runs the native model-options resolver test.
+
+
 The optional `model.optimizations` setting accepts exact loaded GGUF metadata and
 backend-device rules for the existing `model.engram_prefetch` and `model.hc_fused`
 options. It defaults to `[]`. Empty rules keep the original context setup path,
