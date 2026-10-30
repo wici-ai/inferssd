@@ -111,9 +111,14 @@ after a merge normally finds its base already measured. Each clean cell of a
 baseline job becomes a record in the device's baseline history: the four values
 of every metric, their natural logs, the generated-token hash, the history
 conditions, the SHA-256 of the characteristics file its runs launched from, the
-job and run IDs, the build identity and the date. A cell whose runs produced
-different tokens, or whose Mac host check flagged a run, is reported and not
-recorded.
+job and run IDs, the build identity and the date. A cell whose Mac host check
+flagged a run is reported and not recorded.
+
+Generated tokens are recorded for every run but, for now, not required to
+match. Where the CUDA GPU tier computes experts, the experts it holds when each
+one is needed depend on timing, so runs of one build can generate different
+tokens. A difference is shown in `output_workload` and does not make a cell
+need review (`REQUIRE_SAME_TOKENS` in [compare.py](compare.py)).
 
 The history lives in the `baseline-history` directory next to the reviewed
 device profiles (`inputs.json`) on the preparation host, one read-only file per
@@ -178,9 +183,9 @@ compared and shown for information only.
 
 | Result | Meaning | Check behavior |
 | --- | --- | --- |
-| `passed` | For every deciding metric `d ≤ T`, the generated tokens are identical in every run and in the base history, the history matches the history conditions, the in-run base agrees with its history and the host check flagged nothing. | Passes. It means no slowdown beyond measured noise, not proof that none exists. |
+| `passed` | For every deciding metric `d ≤ T`, the history matches the history conditions, the in-run base agrees with its history and the host check flagged nothing. | Passes. It means no slowdown beyond measured noise, not proof that none exists. |
 | `regressed` | Some deciding metric has `d > T` and every candidate run is slower than `b`. | Blocks acceptance. Any other review reasons are listed with it. |
-| `needs-review` | A deciding metric has `d > T` but the candidate runs disagree; a generated token sequence differs (among the runs or from the base history); the base has no history under the history conditions; the in-run base differs from its history; or the Mac host check flagged a run. | Blocks acceptance until a person reviews the evidence. |
+| `needs-review` | A deciding metric has `d > T` but the candidate runs disagree; the base has no history under the history conditions; the in-run base differs from its history; or the Mac host check flagged a run. | Blocks acceptance until a person reviews the evidence. |
 | `failed` | Missing or invalid evidence, mismatched conditions, incomplete cleanup or a failed run. | Blocks acceptance; fix the evidence or implementation first. |
 
 Without base history under the history conditions no regression can be

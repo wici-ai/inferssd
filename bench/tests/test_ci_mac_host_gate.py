@@ -78,7 +78,7 @@ def test_retained_missing_or_changed_evidence_is_refused(tmp_path, monkeypatch, 
         if fault == 'raw': value['raw']['swap']['stdout'] = 'invalid'
         elif fault == 'parsed': value['swap']['used_bytes'] += 1
         elif fault == 'quiet-result': value['assessment']['elapsed_s'] += 1
-        elif fault == 'quiet-policy': value['policy']['limits']['max_swap_delta_bytes'] += 1
+        elif fault == 'quiet-policy': value['policy']['limits']['max_swapout_bytes'] += 1
         elif fault == 'order': value['started_monotonic_ns'] = 1
         elif fault == 'ram':
             value['memory_bytes'] = 64 << 30; value['raw']['memory_bytes']['stdout'] = str(64 << 30)

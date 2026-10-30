@@ -320,6 +320,7 @@ def compare_pair(base, head, base_receipt, head_receipt, policy, *, comparison_b
                        if before != after), None)
     output_workload = {
         "same_tokens": difference is None,
+        "same_tokens_required": REQUIRE_SAME_TOKENS,
         "first_difference_one_based": None if difference is None else difference + 1,
         "base_token": None if difference is None else base["tokens"][difference],
         "candidate_token": None if difference is None else head["tokens"][difference],
@@ -343,15 +344,15 @@ def compare_pair(base, head, base_receipt, head_receipt, policy, *, comparison_b
         if not passed:
             failures.append(key)
     return {
-        "passed": not failures and output_workload["same_tokens"],
-        "status": "needs-review" if failures or difference is not None else "passed",
+        "passed": not failures and (output_workload["same_tokens"] or not REQUIRE_SAME_TOKENS),
+        "status": "needs-review" if failures or (difference is not None and REQUIRE_SAME_TOKENS) else "passed",
         "evidence_valid": True,
         "metrics": metrics,
         # Retain the old field for consumers; these are observations, not a
         # claim that a single pair established a reproducible regression.
         "regressions": failures,
         "observed_slowdowns": failures,
-        "diagnostic_required": bool(failures) or difference is not None,
+        "diagnostic_required": bool(failures) or (difference is not None and REQUIRE_SAME_TOKENS),
         "output_workload": output_workload,
         "interpretation": PAIR_INTERPRETATION,
         "actual_input_tokens": head["input_tokens"],
@@ -367,6 +368,13 @@ def compare_pair(base, head, base_receipt, head_receipt, policy, *, comparison_b
             "candidate": head["metrics"]["server_prefill_tps"],
         },
     }
+
+
+# Generated tokens are recorded for every run but, for now, not required to match.
+# Where the CUDA GPU tier computes experts, the experts it holds when each is needed
+# depend on timing, so runs of one build can generate different tokens. A
+# difference is reported in output_workload and does not make a cell need review.
+REQUIRE_SAME_TOKENS = False
 
 
 def first_difference(reference, tokens):
@@ -573,7 +581,7 @@ def decide_cell(results, receipts, policy, *, cell, protocol, history, environme
             else:
                 entry.update(threshold=None, result="no-baseline-history" if entry["gated"] else "informational")
             metrics[metric] = entry
-    if differences:
+    if differences and REQUIRE_SAME_TOKENS:
         reasons.append("generated-tokens-differ")
     reasons.extend(host)
     if purpose == BASELINE:
@@ -586,7 +594,8 @@ def decide_cell(results, receipts, policy, *, cell, protocol, history, environme
                   statistic="pooled-within-commit-log-variance", metrics=metrics, regressions=regressions,
                   improvements=improvements,
                   review_reasons=[*blocking, *reasons],
-                  output_workload=dict(same_tokens=not differences, reference_run=arm_name(*keys[0]),
+                  output_workload=dict(same_tokens=not differences, same_tokens_required=REQUIRE_SAME_TOKENS,
+                                       reference_run=arm_name(*keys[0]),
                                        tokens_sha256=tokens_digest(reference), differences=differences),
                   measurement_identity=identity, history_pool=pool,
                   decision_rule=dict(t_quantile=T_QUANTILE, floor_fraction=thresholds["floor_fraction"],

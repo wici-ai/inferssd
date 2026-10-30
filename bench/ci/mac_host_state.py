@@ -22,7 +22,7 @@ COMMANDS = {
     "memory_pressure_level": ("/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"),
     "processes": ("/bin/ps", "-axo", "pid=,ppid=,uid=,time=,etime=,rss=,comm="),
 }
-LIMITS = ("min_available_bytes", "max_swap_delta_bytes", "max_compression_delta_bytes",
+LIMITS = ("min_available_bytes", "max_swapout_bytes", "max_compression_delta_bytes",
           "max_non_ci_cpu_cores", "max_non_ci_process_cpu_cores", "max_non_ci_process_rss_bytes")
 
 
@@ -199,13 +199,15 @@ def compare_snapshots(before, after, policy, *, timed=False):
         reasons.append("vm-counter-reset")
         return result
     delta_bytes = {key: value * page_size for key, value in delta.items()}
-    swap_delta = delta_bytes["swapins"] + delta_bytes["swapouts"]
+    # A swap-out means memory ran short in the window; a swap-in only brings back a page
+    # put out at another time, and every count stays in counter_delta_bytes.
+    swapout = delta_bytes["swapouts"]
     compression_delta = delta_bytes["compressions"] + delta_bytes["decompressions"]
     levels = [value.get("memory_pressure_level") for value in (before, after)]
     pressure_unknown = None in levels and policy.get("require_pressure_level", False)
     pressure_bad = any(level is not None and level not in policy.get("normal_pressure_levels", [level]) for level in levels)
     compression_large = compression_delta > policy.get("max_compression_delta_bytes", 0)
-    flags = dict(swap_activity=swap_delta > 0, compression_activity=compression_delta > 0,
+    flags = dict(swapout_activity=swapout > 0, compression_activity=compression_delta > 0,
         pagein_activity=delta["pageins"] > 0, pageout_activity=delta["pageouts"] > 0,
         swap_usage_changed=before["swap"]["used_bytes"] != after["swap"]["used_bytes"],
         memory_pressure_changed=levels[0] != levels[1], memory_pressure_abnormal=pressure_bad,
@@ -240,7 +242,7 @@ def compare_snapshots(before, after, policy, *, timed=False):
     # free plus inactive would refuse every run after the first.
     available = [sum(value["vm_stat"]["pages"][key] for key in ("free", "file_backed")) * page_size for value in (before, after)]
     result.update(elapsed_s=elapsed, counter_delta_pages=delta, counter_delta_bytes=delta_bytes,
-        swap_delta_bytes=swap_delta, compression_delta_bytes=compression_delta,
+        swapout_bytes=swapout, compression_delta_bytes=compression_delta,
         swap_used_delta_bytes=after["swap"]["used_bytes"] - before["swap"]["used_bytes"],
         memory_pressure_levels=levels, available_bytes=available, flags=flags,
         process_activity=dict(non_ci_cpu_cores=total_cpu, max_non_ci_process_cpu_cores=max_cpu,
@@ -251,8 +253,8 @@ def compare_snapshots(before, after, policy, *, timed=False):
     if pressure_unknown:
         reasons.append("memory-pressure-unavailable")
     if timed:
-        if flags["swap_activity"]:
-            reasons.append("swap-activity")
+        if flags["swapout_activity"]:
+            reasons.append("swapout-activity")
         if flags["compression_with_pressure"]:
             reasons.append("compression-with-abnormal-pressure")
         if pressure_bad:
@@ -264,7 +266,7 @@ def compare_snapshots(before, after, policy, *, timed=False):
     else:
         if pressure_bad:
             reasons.append("memory-pressure-abnormal")
-        checks = {"max_swap_delta_bytes": swap_delta, "max_compression_delta_bytes": compression_delta,
+        checks = {"max_swapout_bytes": swapout, "max_compression_delta_bytes": compression_delta,
             "max_non_ci_cpu_cores": total_cpu, "max_non_ci_process_cpu_cores": max_cpu,
             "max_non_ci_process_rss_bytes": max_rss}
         reasons.extend(key + "-exceeded" for key, value in checks.items() if key in policy and value > policy[key])
