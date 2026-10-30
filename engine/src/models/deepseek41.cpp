@@ -622,7 +622,10 @@ ggml_tensor * llm_build_deepseek41::build_top_k_mask(
     ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1,
             top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
 
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+    // f32 rows whatever the mask type: set_rows writes them into kq_mask_all in place, so it has to run
+    // where kq_mask_all lives, and Metal only takes f32 rows. Left to the CPU, the scheduler copied the
+    // mask before the rows landed and every compressed position stayed masked. 0 is exact in f16.
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
     zeros = ggml_fill(ctx0, zeros, 0.0f);
 
     ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
