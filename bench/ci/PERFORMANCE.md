@@ -102,12 +102,17 @@ All metrics must be finite and positive.
 
 ## Baseline history
 
-The base side is also measured before the PR runs. For every new commit on
-`main`, the operator queues one baseline job: on every enabled device, that
-commit is built once, profiles the machine once and runs each model four times,
-each run a fresh server with one completion, after the same short preflight
-requests. Jobs run one at a time in the order they were queued, so a PR queued
-after a merge normally finds its base already measured. Each clean cell of a
+The base side is also measured before the PR runs. For a new commit on `main`
+whose files differ from the most recently measured commit in a path the impact
+rules give a performance cell (the engine, the framework, or unknown code), the
+operator queues one baseline job. On every enabled device, that commit is built
+once, profiles the machine once and runs each model four times, each run a
+fresh server with one completion, after the same short preflight requests. A
+commit that changed only tests, CI control or documentation is recorded as
+`not-needed` and runs no job. The PR jobs on it compare against each cell's
+most recent record, and the in-run base still has to agree with that record
+(the anchor check below). Jobs run one at a time in the order they were queued,
+so a PR queued after a merge normally finds its base already measured. Each clean cell of a
 baseline job becomes a record in the device's baseline history: the four values
 of every metric, their natural logs, the generated-token hash, the history
 conditions, the SHA-256 of the characteristics file its runs launched from, the
@@ -164,7 +169,7 @@ one metric of one cell:
 - `σ` is the pooled within-commit standard deviation of every history record of
   that device, model and tier under the same history conditions:
   `σ² = Σ_c Σ_i (x_ci − x̄_c)² / Σ_c (n_c − 1)`, with `df = Σ_c (n_c − 1)`
-  degrees of freedom. One record gives `df = 3`; each new main commit adds 3.
+  degrees of freedom. One record gives `df = 3`; each measured main commit adds 3.
 - `t` is the one-sided Student-t quantile for `df` whose upper tail equals a
   normal 3σ tail (P = 0.99865). A fixed table in `compare.py` gives the same
   value everywhere: 9.219 at df 3, 4.905 at 6, 3.765 at 12, 3.545 at 16, 3.122

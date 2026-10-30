@@ -322,11 +322,21 @@ def test_anchor_allows_at_least_two_percent_drift_from_a_steady_history(drift, a
         assert cell["review_reasons"] == ["base-run-differs-from-baseline-history:ttft_s"]
 
 
-@pytest.mark.parametrize("state", ["missing", "other-device", "other-model", "other-tier", "other-commit", "conditions"])
+def test_a_base_without_its_own_record_compares_against_the_cells_most_recent_record():
+    # The operator measures no main commit that changed no performance-relevant file.
+    older = record("b" * 40, measured_at="2026-10-27T10:00:00Z", job="1" * 32)
+    newer = record("d" * 40, measured_at="2026-10-28T10:00:00Z", job="2" * 32)
+    cell = decide(candidates(scaled(0.5)), [newer, older])
+    assert cell["baseline_commit"] == "d" * 40 and cell["status"] == "regressed"
+    assert decide(None, [older, newer])["status"] == "passed"
+    # The base's own record is used whenever it exists.
+    assert decide(None, [record(), newer])["baseline_commit"] == BASE
+
+
+@pytest.mark.parametrize("state", ["missing", "other-device", "other-model", "other-tier", "conditions"])
 def test_missing_or_mismatched_history_needs_review_even_for_a_large_slowdown(state):
     records = {"missing": [], "other-device": [record(device="dgx-spark")], "other-model": [record(model="deepseek")],
-               "other-tier": [record(tier="4096")], "other-commit": [record("b" * 40)],
-               "conditions": [record(conditions="0" * 64)]}[state]
+               "other-tier": [record(tier="4096")], "conditions": [record(conditions="0" * 64)]}[state]
     cell = decide(candidates(scaled(0.5)), records)
     assert cell["status"] == "needs-review" and cell["regressions"] == []
     reason = "baseline-conditions-differ" if state == "conditions" else "no-baseline-history"

@@ -473,6 +473,30 @@ def baseline_key(repository, commit):
     return hashlib.sha256(f"baseline#{repository}#{commit}".encode()).hexdigest()
 
 
+def baseline_needed(args, policy, head):
+    """Whether main `head` needs a baseline job of its own, and the measured commit it was compared with.
+
+    The files of the most recently measured main commit are compared with head's,
+    by content rather than ancestry. Only a path that the impact rules give a
+    performance cell needs a new measurement. Without one, the PR jobs on head
+    compare against each cell's most recent record.
+    """
+    records = history.load_all(history.store_root(args.inputs))
+    if not records:
+        return True, None
+    measured = max(records, key=lambda record: (record["measured_at"], record["commit"]))["commit"]
+    if measured == head:
+        return False, measured
+    try:
+        fetch_objects(args, dict(base=head, head=head, candidate=head), policy["repository"], (head,))
+        raw = prepare.git(args.source, "diff", "--no-renames", "--name-only", "-z", measured, head)
+    except ValueError:
+        return True, measured
+    paths = [path for path in raw.decode().split("\0") if path]
+    selection = plan(paths, policy, base=measured, head=head, candidate=head)
+    return any(cell["performance"]["required"] for cell in selection["cells"]), measured
+
+
 def advance_baseline(args, api, policy, path, record):
     """Prepare, stage and dispatch the baseline job of one main commit; never retried."""
     commit = record["commit"]
@@ -638,8 +662,13 @@ def tick(args, api=None):
     if not path.exists():
         record = dict(schema_version=1, kind="baseline", repository=policy["repository"], commit=head,
                       created_at=time.time())
-        save_record(path, record, "queued")
-        records.append((path, record))
+        needed, measured = baseline_needed(args, policy, head)
+        if needed:
+            save_record(path, record, "queued")
+            records.append((path, record))
+        else:
+            # No performance-relevant file differs from the measured commit: no job.
+            save_record(path, record, "not-needed", measured_commit=measured)
     if not active:
         # One queue: PR and baseline jobs start in the order they were queued.
         for path, record in sorted(records, key=lambda item: (item[1].get("created_at", 0), item[0].name)):

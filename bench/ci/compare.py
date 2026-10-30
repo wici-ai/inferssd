@@ -534,6 +534,10 @@ def decide_cell(results, receipts, policy, *, cell, protocol, history, environme
         pool = [dict(commit=record["commit"], job_id=record["job_id"], measured_at=record["measured_at"]) for record in prior]
     else:
         base_record = next((record for record in matching if record["commit"] == cell["base"]), None)
+        if base_record is None and matching and not any(record["commit"] == cell["base"] for record in same_cell):
+            # A main commit that changed no performance-relevant file has no baseline
+            # job of its own: its PRs compare against the cell's most recent record.
+            base_record = matching[-1]
         pool = []
         if base_record is None:
             blocking.append("baseline-conditions-differ" if any(record["commit"] == cell["base"] for record in same_cell)
@@ -602,6 +606,8 @@ def decide_cell(results, receipts, policy, *, cell, protocol, history, environme
                                        reference_run=arm_name(*keys[0]),
                                        tokens_sha256=tokens_digest(reference), differences=differences),
                   measurement_identity=identity, history_pool=pool,
+                  **({} if purpose == BASELINE else dict(
+                      baseline_commit=None if base_record is None else base_record["commit"])),
                   decision_rule=dict(t_quantile=T_QUANTILE, floor_fraction=thresholds["floor_fraction"],
                                      gated_metrics=list(GATED_METRICS),
                                      baseline_history_sha256=conditions_digest(history),
