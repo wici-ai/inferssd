@@ -20,9 +20,9 @@
 
 **4K prompt tier · 256 output tokens · decode measured over tokens 129–256.**
 
-All rates are in **token/s**, with higher values indicating faster inference. **llama.cpp is the baseline (1.00×)**. The multiple next to each **InferSSD** rate is `engine throughput / llama.cpp throughput` on the same hardware. Values above 1.00× are faster; values below 1.00× are slower.
+All rates are in **token/s**; higher is faster. The multiple next to each **InferSSD** rate is its speedup over llama.cpp on the same hardware.
 
-These results compare complete inference configurations. In the Mac DeepSeek runs, Colibri uses official Safetensors on CPU, while the GGUF engines use Metal with CPU experts. See [measurement details](docs/benchmark.md) for the scope of the comparison.
+On the MacBook Pro, Colibri runs the official Safetensors on CPU; llama.cpp and InferSSD run the GGUF with Metal. See [measurement details](docs/benchmark.md).
 
 ### Test hardware
 
@@ -106,9 +106,8 @@ These are the tested GGUF files, community conversions of the named model releas
 
 ## Further reading
 
-- [How it works](docs/architecture.md): expert packs, caching, batching, and the module map.
-- [Engine configurations](docs/benchmark.md#engine-configurations) and [decode windows / request times](docs/benchmark.md#decode-windows-and-request-time).
-- [Reproducing a result](docs/benchmark.md#reproducing-a-result) and [4K data provenance](docs/benchmark.md#data-provenance).
+- [How it works](docs/architecture.md)
+- [Benchmark methodology](docs/benchmark.md)
 
 ## Contributing
 
