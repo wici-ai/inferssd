@@ -111,8 +111,18 @@ python3 -I bench/ci/operator_prepare.py prepare \
 The authenticated source Git API must match each complete local commit/tree and
 its parents. Candidate must equal head with base an ancestor, or merge precisely
 base/head. The package preserves the complete binary diff and both names of a
-rename. A single batch Git blob reader exports every regular tracked source
-file, including files marked `export-ignore`; no checkout/filter/hook runs.
+rename. Each side's source map lists every regular tracked file of its commit
+with its Git blob and size, including files marked `export-ignore`; no
+checkout/filter/hook runs.
+
+The sources travel as one Git bundle, `source.bundle`, holding each side's
+commit. Every device keeps a root-owned bare repository of the commits staged
+to it (`/var/lib/inferssd-ci-inputs/source.git` on Linux,
+`/Library/InferSSD-CI/inputs/source.git` on the Mac). With `source_anchor` set
+in the inputs file, the bundle leaves out everything reachable from that commit,
+so a job sends only its new objects; each device's repository must hold the
+anchor, which deployment seeds. Without it the bundle is complete, and a
+device without a repository creates one.
 
 `envelope.json` retains the canonical impact plan, including required Mac and
 performance cells. Separate `execution_devices` and `validation_mode` limit this
@@ -211,8 +221,11 @@ It is the same backend for a trusted review watcher; it is not a second
 authorization mechanism. The sender uses non-PTY SSH and a plain tar stream,
 matching the root receiver's `r|` contract. Root holds the original lease during
 staging, rejects STOP, verifies GPU UUID and absence of compute work, checks the
-entire installed control manifest, reads model stat/RO mount metadata, and
-verifies every extracted Git blob before making each required source read-only.
+entire installed control manifest and reads model stat/RO mount metadata. It
+adds the bundle to its repository with Git that runs no hooks, uses no network
+transport and checks every arriving object. For each side it then checks the
+commit's tree and file list against the source map, and rehashes every blob it
+writes before making the source read-only.
 It installs only the reviewed two-sided config/settings, a PR job's sealed
 characteristics file and the job manifest, then returns an identity-bound root
 receipt.

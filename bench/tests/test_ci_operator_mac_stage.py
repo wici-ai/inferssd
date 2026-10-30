@@ -146,6 +146,7 @@ def admitted(tmp_path, git_source, monkeypatch):
     monkeypatch.setattr(mac.os, "geteuid", lambda: 0)
     monkeypatch.setattr(mac.sys, "platform", "darwin")
     monkeypatch.setattr(mac.common, "protected", lambda path, **kwargs: Path(path))
+    monkeypatch.setattr(mac, "MAC_GIT", "git")  # Xcode's Git on the Mac
     monkeypatch.setattr(mac, "control_identity", lambda policy: None)
     monkeypatch.setattr(mac, "machine_identity", lambda: MACHINE)
     monkeypatch.setattr(mac, "worker_idle", lambda broker: None)
@@ -430,7 +431,7 @@ def test_mac_control_only_keeps_full_policy_but_stages_candidate_only(tmp_path, 
     policy = load(folder / "policy.review.json")
     request = load(folder / "root-input.json")
     assert set(manifest["sources"]) == set(request["sources"]) == {"candidate"}
-    assert "base-source.tar.gz" not in request["files"]
+    assert "base-source-map.json" not in request["files"]
     assert not any("-base.ssd" in name for name in request["files"])
     assert set(policy["side_settings_template_sha256"]) == {"base", "candidate"}
     assert envelope["validation_mode"] == prepare.MODE
@@ -447,7 +448,7 @@ def test_recovery_precedes_lease_and_sealing_holds_original_inode(admitted, monk
             fcntl.flock(lock, fcntl.LOCK_UN)
         order.append("recovered")
         return dict(status="ready", config_sha256=expected)
-    original = mac.common.extract_source
+    original = mac.common.checkout_source
     def extract(*args):
         fd = os.open(fake / "lock", os.O_RDONLY)
         try:
@@ -458,7 +459,7 @@ def test_recovery_precedes_lease_and_sealing_holds_original_inode(admitted, monk
         order.append("sealed")
         return original(*args)
     monkeypatch.setattr(mac, "ensure_broker", ensure)
-    monkeypatch.setattr(mac.common, "extract_source", extract)
+    monkeypatch.setattr(mac.common, "checkout_source", extract)
     raw, expected = packet(request, files)
     mac.receive(expected, io.BytesIO(raw))
     assert order == ["recovered", "sealed", "sealed"]

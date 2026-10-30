@@ -7,7 +7,6 @@ It does not install, connect to a device, acquire a lease or execute source code
 
 import argparse
 import copy
-import gzip
 import hashlib
 import json
 import math
@@ -234,51 +233,48 @@ def replace_strings(value, replacements):
 
 
 def export_source(source, candidate, output, side="candidate"):
-    """One batch Git blob reader; no checkout, hooks, export-ignore or source execution."""
+    """The exact tracked files of one commit, read from Git objects: no checkout, hooks or export-ignore."""
     rows = []
-    for item in git(source, "ls-tree", "-rz", candidate).split(b"\0"):
+    for item in git(source, "ls-tree", "-rlz", candidate).split(b"\0"):
         if not item:
             continue
         descriptor, name = item.split(b"\t", 1)
-        mode, kind, blob = descriptor.decode("ascii").split()
+        mode, kind, blob, size = descriptor.decode("ascii").split()
         name = relative(name.decode("utf-8"))
         if kind != "blob" or mode not in ("100644", "100755"):
             raise ValueError("source export requires only regular tracked Git files")
-        rows.append(dict(path=name, mode=mode, blob=blob))
+        if not size.isdecimal() or int(size) > 128 << 20:
+            raise ValueError("Git source blob size differs")
+        rows.append(dict(path=name, mode=mode, blob=blob, bytes=int(size)))
     if side not in ("base", "candidate"):
         raise ValueError("fixed source side required")
-    archive_name = side + "-source.tar.gz"
-    archive_path = output / archive_name
-    process = subprocess.Popen(["git", "-C", str(source), "cat-file", "--batch"],
-                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    try:
-        with archive_path.open("xb") as raw, gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as compressed:
-            with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
-                for row in rows:
-                    process.stdin.write((row["blob"] + "\n").encode())
-                    process.stdin.flush()
-                    blob, kind, size = process.stdout.readline().decode("ascii").split()
-                    size = int(size)
-                    if blob != row["blob"] or kind != "blob" or not 0 <= size <= 128 << 20:
-                        raise ValueError("Git source blob response differs")
-                    row["bytes"] = size
-                    item = tarfile.TarInfo(row["path"])
-                    item.size, item.mode = size, int(row["mode"], 8) & 0o777
-                    archive.addfile(item, process.stdout)
-                    if process.stdout.read(1) != b"\n":
-                        raise ValueError("Git batch blob framing differs")
-        process.stdin.close()
-        if process.wait(timeout=15):
-            raise ValueError("Git batch source export failed")
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
-        process.stdout.close()
-    value = dict(revision=candidate, tree=git(source, "rev-parse", candidate + "^{tree}").decode().strip(),
-                 archive=archive_name, archive_sha256=digest(archive_path), files=rows)
+    value = dict(revision=candidate, tree=git(source, "rev-parse", candidate + "^{tree}").decode().strip(), files=rows)
     save(output / ("source-map.json" if side == "candidate" else "base-source-map.json"), value)
     return value
+
+
+def export_bundle(source, revisions, anchor, output):
+    """One Git bundle with each staged side's commit, without what the devices already hold.
+
+    Every device keeps the commits staged to it, starting from the reviewed anchor
+    commit it was seeded with, so only a job's new objects travel.
+    """
+    namespace = "refs/inferssd-stage/" + uuid.uuid4().hex + "/"
+    refs = [namespace + side for side in sorted(revisions)]
+    try:
+        for side, ref in zip(sorted(revisions), refs):
+            git(source, "update-ref", ref, revisions[side])
+        exclude = []
+        if anchor is not None:
+            git(source, "cat-file", "-e", anchor + "^{commit}")
+            # A bundle holds at least one new commit; one that adds none to the anchor is sent whole.
+            if int(git(source, "rev-list", "--count", *refs, "--not", anchor).decode()):
+                exclude = ["--not", anchor]
+        git(source, "bundle", "create", "--quiet", str(output / "source.bundle"), *refs, *exclude)
+    finally:
+        for ref in refs:
+            subprocess.run(["git", "-C", str(source), "update-ref", "-d", ref], capture_output=True, timeout=60)
+    return dict(anchor=anchor if exclude else None, sha256=digest(output / "source.bundle"))
 
 
 def normalize(template, manifest, declared, job_id, identities, mode=MODE, protocol=None):
@@ -589,6 +585,9 @@ def prepare(args, api=None):
     required_sides = {side for row in devices.values() for side in row["manifest"]["sources"]}
     source_maps = {side: export_source(args.source, identities[side], args.output, side) for side in ("base", "candidate") if side in required_sides}
     source_map = source_maps["candidate"]
+    anchor = specification.get("source_anchor")
+    export_bundle(args.source, {side: value["revision"] for side, value in source_maps.items()},
+                  None if anchor is None else revision(anchor), args.output)
     for device, row in devices.items():
         folder = args.output / device
         folder.mkdir()
@@ -621,13 +620,12 @@ def prepare(args, api=None):
         files = dict(inputs[device]["files"])
         for name, path in (("config.json", folder / "config.json"), ("manifest.json", folder / "manifest.json"),
                            ("source-map.json", args.output / "source-map.json"),
-                           ("candidate-source.tar.gz", args.output / "candidate-source.tar.gz"),
+                           ("source.bundle", args.output / "source.bundle"),
                            ("envelope.json", args.output / "envelope.json")):
             files[name] = dict(local_path=str(path.resolve()), bytes=path.stat().st_size, sha256=digest(path))
         if "base" in row["manifest"]["sources"]:
-            for name in ("base-source-map.json", "base-source.tar.gz"):
-                path = args.output / name
-                files[name] = dict(local_path=str(path.resolve()), bytes=path.stat().st_size, sha256=digest(path))
+            path = args.output / "base-source-map.json"
+            files[path.name] = dict(local_path=str(path.resolve()), bytes=path.stat().st_size, sha256=digest(path))
         request = dict(schema_version=1, job_id=inputs[device]["job_id"], device=device,
              candidate=identities["candidate"], source_tree=source_map["tree"],
              broker_config_sha256=row["config"]["broker_config_sha256"],
