@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,30 @@ from unittest.mock import patch
 
 import stages
 from stages import JobSession, RunningStage, copy_sealed_tree, freeze_tree, prune_cache
+
+
+class PublishTests(unittest.TestCase):
+    def test_release_appears_whole_and_readable_in_one_step(self):
+        with tempfile.TemporaryDirectory() as name:
+            target = Path(name) / 'release'
+            seen = []
+            real = os.replace
+
+            def replace(source, destination):
+                # Until the rename, a reader polling the name finds nothing.
+                seen.append((target.exists(), Path(source).read_text(), stat.S_IMODE(os.stat(source).st_mode)))
+                real(source, destination)
+
+            old = os.umask(0o077)
+            try:
+                with patch.object(stages.os, 'replace', replace):
+                    stages.publish(target, 'token')
+            finally:
+                os.umask(old)
+            self.assertEqual(seen, [(False, 'token', 0o644)])
+            self.assertEqual(target.read_text(), 'token')
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+            self.assertEqual([p.name for p in Path(name).iterdir()], ['release'])
 
 
 class FreezeTests(unittest.TestCase):
