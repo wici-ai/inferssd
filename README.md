@@ -14,11 +14,11 @@
 </p>
 <p align="center">macOS / Metal &nbsp;·&nbsp; Linux / CUDA &nbsp;·&nbsp; Windows (in progress)</p>
 
-**Run models larger than your RAM or VRAM.** InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run **DeepSeek-V4.1-Flash-1017** and **Muse-Spark-Open** from SSD. Expert packs, bounded caches, and prompt batching reduce the cost of accessing weights while retaining GGUF, browser chat, and an OpenAI-compatible API.
+**Run models larger than your RAM or VRAM.** InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run large mixture-of-experts (MoE) models from SSD, using standard GGUF files, with browser chat and an OpenAI-compatible API. It currently supports **DeepSeek-V4.1-Flash-1017** and **Muse-Spark-Open**, with more models coming.
 
 ## Performance benchmarks
 
-**4K prompt tier · 256 output tokens · decode measured over tokens 129–256.** The 4K label describes the prompt tier, not the model's context-window capacity; actual input token counts depend on the chat template.
+**4K prompt tier · 256 output tokens · decode measured over tokens 129–256.**
 
 All rates are in **token/s**, with higher values indicating faster inference. **llama.cpp is the baseline (1.00×)**. The multiple next to each **InferSSD** rate is `engine throughput / llama.cpp throughput` on the same hardware. Values above 1.00× are faster; values below 1.00× are slower.
 
@@ -97,14 +97,12 @@ See the [quick start](docs/quickstart.md#one-command-installation) for upgrades 
 
 ## Models
 
-These GGUF references are recorded in the verified Mac runs. They are community conversions of the named model releases.
+These are the tested GGUF files, community conversions of the named model releases. See [weight-format details](docs/benchmark.md#checkpoint-formats).
 
 | Model | Parameter count | GGUF reference |
 | --- | --- | --- |
-| DeepSeek-V4.1-Flash-1017 | 763B official release<br>748.49B in the text GGUF | [mrfakename · Q8_0 with native MXFP4 experts](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF) |
+| DeepSeek-V4.1-Flash-1017 | 763B total | [mrfakename · Q8_0](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF) |
 | Muse-Spark-Open | 816B total / 42B active | [Unsloth · UD-Q4_K_XL](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF) |
-
-DeepSeek's **Q8_0 label does not mean every tensor is 8-bit**: routed experts retain MXFP4, while other tensors include Q8_0, BF16, and F32. This text GGUF omits the vision and MTP/DSpark modules. Expert packing copies the existing quantized expert bytes without requantization. See [weight-format details](docs/benchmark.md#checkpoint-formats).
 
 ## Further reading
 
