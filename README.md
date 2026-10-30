@@ -1,25 +1,17 @@
+<h1 align="center">Large MoE models, powered by your SSD</h1>
+
 <p align="center">
   <a href="https://wici.ai">
     <img src="docs/assets/wicissdinfer.png" width="600" alt="InferSSD">
   </a>
 </p>
 
-<h1 align="center">Large MoE models, powered by your SSD</h1>
-
 <p align="center">
   <a href="https://wici.ai/inferssd"><b>Website</b></a> &nbsp;·&nbsp;
-  <a href="https://wici.ai/research"><b>Blog</b></a>
+  <a href="https://wici.ai/research"><b>Blog</b></a> &nbsp;·&nbsp;
+  <a href="LICENSE">Apache-2.0</a>
 </p>
-<p align="center">macOS / Metal &nbsp;·&nbsp; Linux / CUDA &nbsp;·&nbsp; <a href="LICENSE">Apache-2.0</a></p>
-
-<p align="center">
-  <a href="#performance-benchmarks"><b>Benchmarks</b></a> &nbsp;·&nbsp;
-  <a href="#test-hardware">Hardware</a> &nbsp;·&nbsp;
-  <a href="#get-started"><b>Get started</b></a> &nbsp;·&nbsp;
-  <a href="#models">Models</a> &nbsp;·&nbsp;
-  <a href="docs/architecture.md">How it works</a> &nbsp;·&nbsp;
-  <a href="docs/benchmark.md">Methodology</a>
-</p>
+<p align="center">macOS / Metal &nbsp;·&nbsp; Linux / CUDA &nbsp;·&nbsp; Windows (in progress)</p>
 
 **Run models larger than your RAM or VRAM.** InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run **DeepSeek-V4.1-Flash-1017** and **Muse-Spark-Open** from SSD. Expert packs, bounded caches, and prompt batching reduce the cost of accessing weights while retaining GGUF, browser chat, and an OpenAI-compatible API.
 
@@ -77,44 +69,29 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 
 ## Get started
 
-```sh
-git clone https://github.com/wici-ai/inferssd.git
-cd inferssd
-python3 -m venv .venv
-. .venv/bin/activate
-python3 -m pip install ./framework
-```
-
-macOS / Metal:
+Install on Apple Silicon macOS or on Linux with an NVIDIA GPU:
 
 ```sh
-cmake --preset macos-metal
-cmake --build build-macos-metal --parallel 4 \
-  --target inferssd-server inferssd-cpuprobe inferssd-ssdprobe
-python3 scripts/engine-resources.py \
-  --build build-macos-metal --output engine-resources.json
-cp docs/examples/runtime-policy-darwin.json runtime-policy.json
+curl -LsSf https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 ```
 
-Linux / CUDA:
+The installer builds the release from source in a private environment and uses no `sudo`. It needs Git, Python 3.9 or later, and a C/C++ compiler. macOS also needs the Xcode Command Line Tools; Linux also needs the CUDA toolkit, `liburing` headers, and systemd with cgroup v2. Follow the printed PATH instruction if it shows one.
+
+Then start a model:
 
 ```sh
-cmake --preset linux-cuda
-cmake --build build-linux-cuda --parallel 4 \
-  --target inferssd-server inferssd-cpuprobe inferssd-ssdprobe inferssd-memprobe
-python3 scripts/engine-resources.py \
-  --build build-linux-cuda --output engine-resources.json
-cp docs/examples/runtime-policy-linux.json runtime-policy.json
+# Chat in your terminal
+inferssd cli -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF
+
+# Or start the web UI and an OpenAI-compatible API at http://127.0.0.1:8080
+inferssd serve -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF
 ```
 
-Launch (`--profile dsv` for DeepSeek, `--profile muse` for Muse):
+For Muse, use `unsloth/Muse-Spark-Open-816B-A42B-GGUF`.
 
-```sh
-inferssd launch --execute \
-  --resources engine-resources.json \
-  --model /path/to/model-00001-of-00010.gguf --profile dsv \
-  --runtime-policy runtime-policy.json
-```
+The first run downloads about 470 GiB of model files to `~/.local/share/inferssd/models` and measures your machine. Use `--model-dir /path/on/ssd` to choose the drive, or `-m /path/to/first-shard.gguf` for files you already have. There is no memory setting to choose: InferSSD uses the memory available. Stop with **Ctrl+C**, or `/exit` in chat.
+
+See the [quick start](docs/quickstart.md#one-command-installation) for upgrades and uninstalling.
 
 ## Models
 
