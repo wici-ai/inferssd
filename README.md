@@ -44,7 +44,7 @@ On the MacBook Pro, Colibri runs the official Safetensors on CPU; llama.cpp and 
 
 Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [hardware details](docs/benchmark.md#hardware-details) for SSD models, CPU core layouts, and configuration notes.
 
-#### DeepSeek-V4.1-Flash-1017
+### DeepSeek-V4.1-Flash-1017
 
 <table>
 <thead>
@@ -59,7 +59,7 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 </tbody>
 </table>
 
-#### Muse-Spark-Open
+### Muse-Spark-Open
 
 <table>
 <thead>
