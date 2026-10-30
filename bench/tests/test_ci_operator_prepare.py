@@ -801,6 +801,40 @@ def test_subset_job_still_binds_full_fixed_root_policy(tmp_path, source):
         assert not any("muse" in name for name in load(args.output / device / "root-input.json")["files"])
 
 
+# The two ways the reviewed device templates write their alias stage.
+@pytest.mark.parametrize("form", ["list", "calls"])
+def test_subset_job_runs_only_the_selected_models_alias_commands(tmp_path, source, form):
+    args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"], mode=prepare.MODE)
+    path = tmp_path / "cloud-5090-template.json"
+    config = load(path)
+    for side_name, side in config["sides"].items():
+        commands = [["/usr/bin/python3", "-I", "-c", "gguf_alias", "--model-glob", "/models/" + m + "/*.gguf",
+                     "--out", "/scratch/" + side_name + "/assets/" + m + "-alias.tsv"] for m in ("muse", "deepseek")]
+        code = ("import subprocess; commands=" + repr(commands) + "; [subprocess.run(argv,check=True) for argv in commands]"
+                if form == "list" else "import subprocess; " + "; ".join("subprocess.run(" + repr(c) + ",check=True)" for c in commands))
+        side["alias"] = dict(argv=["/usr/bin/python3", "-I", "-c", code], environment={}, cwd="/scratch/" + side_name, timeout_s=900)
+    path.write_text(json.dumps(config))
+    changed_identity(args, "engine/ggml/src/ggml-cuda/ssd/mxfp4-compute-adapter.cpp")
+    prepare.prepare(args, api)
+    for side_name, side in load(args.output / "cloud-5090/config.json")["sides"].items():
+        argv = side["alias"]["argv"]
+        assert argv[:3] == ["/usr/bin/python3", "-I", "-c"]
+        assert argv[3] == ("import subprocess; [subprocess.run(argv, check=True) for argv in "
+                           + repr([["/usr/bin/python3", "-I", "-c", "gguf_alias", "--model-glob", "/models/deepseek/*.gguf",
+                                    "--out", "/scratch/" + side_name + "/assets/deepseek-alias.tsv"]]) + "]")
+
+
+def test_alias_stage_must_map_every_selected_model():
+    alias = dict(argv=["/usr/bin/python3", "-c", "import subprocess; subprocess.run(['x', '--out', '/a/muse-alias.tsv'])"])
+    assert prepare.selected_alias(alias, ["muse"]) == dict(alias, argv=["/usr/bin/python3", "-c",
+        "import subprocess; [subprocess.run(argv, check=True) for argv in [['x', '--out', '/a/muse-alias.tsv']]]"])
+    with pytest.raises(ValueError, match="does not map a selected model"):
+        prepare.selected_alias(alias, ["deepseek"])
+    twice = dict(argv=["python3", "-c", "f(['x', '--out', '/a/muse-alias.tsv']); f(['y', '--out', '/b/muse-alias.tsv'])"])
+    with pytest.raises(ValueError, match="one alias table per model"):
+        prepare.selected_alias(twice, ["muse"])
+
+
 def test_no_enabled_affected_linux_device_refuses_before_output(tmp_path, source):
     args, api = prepared_fixture(tmp_path, source, mode=prepare.MODE)
     changed_identity(args, "engine/ggml/src/ggml-metal/example.m")
