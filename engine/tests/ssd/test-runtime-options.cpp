@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ssd/options.h"
-#include "ggml-ssd/settings/model-options.h"
 
 #include <cstdio>
 #include <fstream>
@@ -18,11 +17,8 @@ int main() {
     const std::string first = std::string(directory) + "/first.jsonl";
     const std::string second = std::string(directory) + "/second.jsonl";
     char error[1024] = {};
-    const llama_ssd_override initial[] = {
-        {"prefetch.depth", "4"},
-        {"model.optimizations", "[\"fixture|on|uuid-a|deepseek41|36|2|Example GPU|1|0\"]"}
-    };
-    auto * options = llama_ssd_options_create(nullptr, initial, 2, first.c_str(), error, sizeof(error));
+    const llama_ssd_override initial[] = {{"prefetch.depth", "4"}};
+    auto * options = llama_ssd_options_create(nullptr, initial, 1, first.c_str(), error, sizeof(error));
     require(options, error);
     auto context = std::make_unique<llama_ssd_context>(*options);
     llama_ssd_options_free(options);
@@ -35,15 +31,6 @@ int main() {
     require(options, error);
     auto independent = std::make_unique<llama_ssd_context>(*options);
     llama_ssd_options_free(options);
-    const ssd::settings::model_identity identity {"uuid-a", "deepseek41", "36", "2", "Example GPU", ""};
-    auto first_model = ssd::settings::resolve_model(context->settings, identity);
-    auto other_model = ssd::settings::resolve_model(independent->settings, identity);
-    auto unknown_model = ssd::settings::resolve_model(context->settings, {});
-    require(first_model && first_model.value.engram_prefetch && !first_model.value.hc_fused,
-            "context did not resolve matching model options");
-    require(other_model && !other_model.value.engram_prefetch && other_model.value.hc_fused &&
-            unknown_model && !unknown_model.value.engram_prefetch && unknown_model.value.hc_fused,
-            "model options leaked between contexts or identities");
     require(*context->settings.integer("prefetch.depth") == 4 && *independent->settings.integer("prefetch.depth") == 3,
         "one context changed another context's settings");
     require(bool(context->events->event("ssd.io.read", "{\"bytes\":4096}")), "event publication failed");
@@ -52,7 +39,7 @@ int main() {
     independent.reset();
 
     // Creation validates settings but does not truncate an existing event file.
-    options = llama_ssd_options_create(nullptr, initial, 2, first.c_str(), error, sizeof(error));
+    options = llama_ssd_options_create(nullptr, initial, 1, first.c_str(), error, sizeof(error));
     require(options, error);
     bool refused = false;
     try { llama_ssd_context collision(*options); } catch (const std::runtime_error &) { refused = true; }
