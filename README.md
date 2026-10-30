@@ -101,7 +101,7 @@ These are the tested GGUF files, community conversions of the named model releas
 
 | Model | Parameter count | GGUF reference |
 | --- | --- | --- |
-| DeepSeek-V4.1-Flash-1017 | 763B total | [mrfakename · Q8_0](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF) |
+| DeepSeek-V4.1-Flash-1017 | 763B total / 8–16B active | [mrfakename · Q8_0](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF) |
 | Muse-Spark-Open | 816B total / 42B active | [Unsloth · UD-Q4_K_XL](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF) |
 
 ## Further reading
