@@ -115,7 +115,7 @@ DeepSeek's **Q8_0 label does not mean every tensor is 8-bit**: routed experts re
 
 ## Contributing
 
-Hardware results and improvements to expert I/O, caching, and batching are welcome. Include the commit, checkpoint, hardware, command, cache state, actual prompt length, raw timings, and a correctness check. Use the [measurement checklist](docs/benchmark.md#reproducing-a-result).
+Contributions are welcome, including hardware results and improvements to expert I/O, caching, and batching. See the [contributing guide](CONTRIBUTING.md).
 
 ## Acknowledgments and license
 
