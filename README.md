@@ -18,7 +18,7 @@
 
 ## Models
 
-These are the tested GGUF files, community conversions of the named model releases. See [weight-format details](docs/benchmark.md#checkpoint-formats).
+These are the tested GGUF files, community conversions of the named model releases. DeepSeek's Q8_0 keeps the official bit widths: routed experts stay native 4-bit MXFP4, and FP8 tensors become 8-bit Q8_0. See [weight-format details](docs/benchmark.md#checkpoint-formats).
 
 | Model | Parameter count | GGUF reference |
 | --- | --- | --- |
