@@ -6,6 +6,7 @@ import io
 import json
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tarfile
 
@@ -222,15 +223,97 @@ def test_gzip_transport_is_rejected_before_installation(staged):
     assert not list(constants["IROOT"].iterdir())
 
 
-def test_source_link_and_missing_blob_rejected(tmp_path):
-    archive = tmp_path / "source.tar.gz"
-    with tarfile.open(archive, "w:gz") as stream:
-        item = tarfile.TarInfo("source.cpp")
-        item.type, item.linkname = tarfile.SYMTYPE, "/etc/shadow"
-        stream.addfile(item)
-    source_map = dict(files=[dict(path="source.cpp", mode="100644", bytes=1, blob="0" * 40)])
+@pytest.fixture
+def unprotected(monkeypatch):
+    # Temporary repositories are not root-owned; receive() checks the real one.
+    monkeypatch.setattr(stage, "protected", lambda p, **kw: Path(p))
+
+
+def bundled(tmp_path, git_source, anchor=None):
+    root, identity = git_source
+    output = tmp_path / "bundle"
+    output.mkdir()
+    maps = {side: prepare.export_source(root, identity[side], output, side) for side in ("base", "candidate")}
+    prepare.export_bundle(root, {side: value["revision"] for side, value in maps.items()}, anchor, output)
+    return output / "source.bundle", maps
+
+
+def test_bundle_seeds_a_new_repository_and_checks_out_each_side(tmp_path, git_source, unprotected):
+    bundle, maps = bundled(tmp_path, git_source)
+    repository = tmp_path / "source.git"
+    stage.import_bundle("git", repository, bundle, {side: value["revision"] for side, value in maps.items()})
+    proof = stage.checkout_source("git", repository, maps["candidate"], tmp_path / "candidate")
+    assert proof["files"] == 2 and (tmp_path / "candidate/new.cpp").read_text() == "old\n"
+    assert stat.S_IMODE((tmp_path / "candidate/new.cpp").stat().st_mode) == 0o444
+    stage.checkout_source("git", repository, maps["base"], tmp_path / "base")
+    assert (tmp_path / "base/old.cpp").read_text() == "old\n"
+
+
+def test_a_later_bundle_holds_only_what_the_anchor_lacks(tmp_path, git_source, unprotected):
+    root, identity = git_source
+    (tmp_path / "first").mkdir()
+    first, maps = bundled(tmp_path / "first", git_source)
+    repository = tmp_path / "source.git"
+    stage.import_bundle("git", repository, first, {side: value["revision"] for side, value in maps.items()})
+    (root / "later.cpp").write_text("later\n")
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "later"], check=True)
+    later = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"]).decode().strip()
+    output = tmp_path / "later"
+    output.mkdir()
+    value = prepare.export_source(root, later, output)
+    assert prepare.export_bundle(root, {"candidate": later}, identity["head"], output)["anchor"] == identity["head"]
+    stage.import_bundle("git", repository, output / "source.bundle", {"candidate": later})
+    stage.checkout_source("git", repository, value, tmp_path / "out")
+    assert (tmp_path / "out/later.cpp").read_text() == "later\n"
+    # A repository without the anchor cannot take it.
+    with pytest.raises(ValueError, match="bundle failed"):
+        stage.import_bundle("git", tmp_path / "empty.git", output / "source.bundle", {"candidate": later})
+
+
+@pytest.mark.parametrize("damage", ["tree", "extra-file", "missing-file", "mode", "blob", "size", "option-revision", "text-size"])
+def test_checkout_refuses_a_source_map_that_differs_from_the_commit(tmp_path, git_source, damage, unprotected):
+    bundle, maps = bundled(tmp_path, git_source)
+    repository = tmp_path / "source.git"
+    stage.import_bundle("git", repository, bundle, {side: value["revision"] for side, value in maps.items()})
+    value = copy.deepcopy(maps["candidate"])
+    row = value["files"][0]
+    if damage == "tree": value["tree"] = "0" * 40
+    elif damage == "extra-file": value["files"].append(dict(row, path="extra.cpp"))
+    elif damage == "missing-file": value["files"].pop()
+    elif damage == "mode": row["mode"] = "100755"
+    elif damage == "blob": row["blob"] = "0" * 40
+    elif damage == "size": row["bytes"] += 1
+    elif damage == "option-revision": value["revision"] = "--output=/tmp/x"
+    elif damage == "text-size": row["bytes"] = "1"
     with pytest.raises(ValueError):
-        stage.extract_source(archive, source_map, tmp_path / "output")
+        stage.checkout_source("git", repository, value, tmp_path / "out")
+
+
+def test_checkout_refuses_a_link_in_the_commit(tmp_path, git_source, unprotected):
+    root, identity = git_source
+    (root / "link").symlink_to("/etc/shadow")
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "link"], check=True)
+    linked = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"]).decode().strip()
+    with pytest.raises(ValueError, match="regular tracked"):
+        prepare.export_source(root, linked, tmp_path)
+    output = tmp_path / "bundle"
+    output.mkdir()
+    prepare.export_bundle(root, {"candidate": linked}, None, output)
+    repository = tmp_path / "source.git"
+    stage.import_bundle("git", repository, output / "source.bundle", {"candidate": linked})
+    tree = subprocess.check_output(["git", "-C", str(root), "rev-parse", linked + "^{tree}"]).decode().strip()
+    honest = dict(revision=linked, tree=tree, files=[dict(path="link", mode="100644", blob="0" * 40, bytes=11)])
+    with pytest.raises(ValueError):
+        stage.checkout_source("git", repository, honest, tmp_path / "out")
+    assert not (tmp_path / "out").exists()
+
+
+def test_bundle_must_carry_the_staged_revisions(tmp_path, git_source, unprotected):
+    bundle, maps = bundled(tmp_path, git_source)
+    with pytest.raises(ValueError, match="staged revisions"):
+        stage.import_bundle("git", tmp_path / "source.git", bundle, {"candidate": maps["base"]["revision"]})
 
 
 @pytest.mark.parametrize("raw", ['{"x":1,"x":2}', '{"x":NaN}', '{"x":1e999}'])
