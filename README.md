@@ -58,7 +58,7 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 <tr><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th></tr>
 </thead>
 <tbody>
-<tr><td>MacBook&nbsp;Pro<sup>1</sup></td><td align="right">3.140</td><td align="right">N/S</td><td align="right"><b>12.480</b>&nbsp;(3.97×)</td><td align="right">0.153</td><td align="right">N/S</td><td align="right"><b>0.944</b>&nbsp;(6.17×)</td></tr>
+<tr><td>MacBook&nbsp;Pro</td><td align="right">3.140</td><td align="right">N/S</td><td align="right"><b>12.480</b>&nbsp;(3.97×)</td><td align="right">0.153</td><td align="right">N/S</td><td align="right"><b>0.944</b>&nbsp;(6.17×)</td></tr>
 <tr><td>RTX 5060 Ti</td><td align="right">3.410</td><td align="right">N/S</td><td align="right"><b>52.100</b>&nbsp;(15.28×)</td><td align="right">0.059</td><td align="right">N/S</td><td align="right"><b>0.219</b>&nbsp;(3.71×)</td></tr>
 <tr><td>RTX 5090</td><td align="right">4.000</td><td align="right">N/S</td><td align="right"><b>106.600</b>&nbsp;(26.65×)</td><td align="right">0.155</td><td align="right">N/S</td><td align="right"><b>1.520</b>&nbsp;(9.81×)</td></tr>
 <tr><td>DGX Spark</td><td align="right">1.740</td><td align="right">N/S</td><td align="right"><b>83.900</b>&nbsp;(48.22×)</td><td align="right">0.120</td><td align="right">N/S</td><td align="right"><b>2.140</b>&nbsp;(17.83×)</td></tr>
@@ -66,8 +66,6 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 </table>
 
 **N/S:** Muse is not currently supported by Colibri.
-
-<sup>1</sup> The llama.cpp baseline here is an older run with a different template and input length, so these multiples are not a matched comparison.
 
 ## Get started
 
