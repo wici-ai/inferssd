@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 from test_engine_runtime import Effects, Owner, policy
 from test_gguf_alias import fixture as gguf_fixture
+from test_strategy_inputs import Q8_0, deepseek_like, moe, muse_like, write_gguf
 
 from inferssd.cli import main
 from inferssd.configuration.derive import Selection, SelectionConflict, selection
@@ -365,6 +366,8 @@ def test_typed_command_prepares_native_file_without_executing_or_recording_secre
                 inputs.repo,
                 "--model",
                 spec.model,
+                "--profile",
+                "muse",
                 "--binary",
                 spec.binary,
                 "--settings",
@@ -407,7 +410,16 @@ def test_omitted_output_directory_creates_a_new_run_directory(tmp_path, monkeypa
     work.mkdir()
     monkeypatch.chdir(work)
     monkeypatch.setattr("os.environ", dict(inputs.environment))
-    command = ["launch", "--dry-run", "--platform", "linux", "--model", spec.model]
+    command = [
+        "launch",
+        "--dry-run",
+        "--platform",
+        "linux",
+        "--model",
+        spec.model,
+        "--profile",
+        "muse",
+    ]
     command += ["--binary", spec.binary, "--repo", inputs.repo, "--settings", spec.settings_file]
     command += ["--runtime-policy", str(contract), "--host-facts", str(facts)]
     assert main(command) == 0 and main(command) == 0
@@ -697,3 +709,75 @@ def test_unknown_profile_refused_before_native_file(tmp_path):
     with pytest.raises(ValueError, match="dsv, muse, qwen4exp"):
         resolve(replace(inputs, profile="qwen"), spec, adapter, out)
     assert not (out / "settings.ssd").exists()
+
+
+def qwen_like():
+    return moe(
+        "qwen4exp",
+        layers=2,
+        experts=8,
+        used=2,
+        latent=256,
+        hidden=256,
+        gate=Q8_0,
+        up=Q8_0,
+        down=Q8_0,
+    )
+
+
+@pytest.mark.parametrize(
+    "layout, profile",
+    [(deepseek_like, "dsv"), (muse_like, "muse"), (qwen_like, "qwen4exp")],
+)
+def test_the_profile_follows_the_gguf_architecture(tmp_path, layout, profile):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    model = str(write_gguf(tmp_path / "model.gguf", *layout()))
+    (Path(inputs.repo) / "engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja").write_text("t")
+    result = resolve(replace(inputs, profile=""), replace(spec, model=model), adapter, out)
+    assert json.loads(result.outputs[-1].text)["profile"] == profile
+    argv = list(result.argv)
+    templates = {"dsv": "deepseek-ai-DeepSeek-V4.1.jinja", "muse": "muse-spark.jinja"}
+    if profile in templates:
+        assert argv[argv.index("--chat-template-file") + 1].endswith(templates[profile])
+    else:
+        assert "--chat-template-file" not in argv
+    # DeepSeek-V4.1's own generation config; the GGUF carries none.
+    sampling = ["--temp", "1.0", "--top-p", "0.95", "--top-k", "0", "--min-p", "0"]
+    if profile == "dsv":
+        assert argv[argv.index("--temp") : argv.index("--temp") + 8] == sampling
+    else:
+        assert "--temp" not in argv
+
+
+def test_an_explicit_profile_overrides_the_architecture_and_an_unknown_one_is_refused(tmp_path):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    model = str(write_gguf(tmp_path / "model.gguf", *deepseek_like()))
+    result = resolve(replace(inputs, profile="muse"), replace(spec, model=model), adapter, out)
+    assert json.loads(result.outputs[-1].text)["profile"] == "muse" and "--temp" not in result.argv
+    tensors, kv = moe(
+        "mystery",
+        layers=1,
+        experts=4,
+        used=2,
+        latent=256,
+        hidden=256,
+        gate=Q8_0,
+        up=Q8_0,
+        down=Q8_0,
+    )
+    other = str(write_gguf(tmp_path / "other.gguf", tensors, kv))
+    second = tmp_path / "second"
+    second.mkdir()
+    with pytest.raises(ValueError, match="no model profile for the GGUF architecture mystery"):
+        resolve(replace(inputs, profile=""), replace(spec, model=other), adapter, second)
+
+
+def test_the_users_sampling_wins(tmp_path):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    model = str(write_gguf(tmp_path / "model.gguf", *deepseek_like()))
+    (Path(inputs.repo) / "engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja").write_text("t")
+    inputs = replace(inputs, profile="", extra=("--temp", "0.6", "--top-k=40"))
+    argv = list(resolve(inputs, replace(spec, model=model), adapter, out).argv)
+    assert argv[-3:] == ["--temp", "0.6", "--top-k=40"] and argv.count("--temp") == 1
+    assert "--top-k" not in argv and argv[argv.index("--top-p") + 1] == "0.95"
+    assert argv[argv.index("--min-p") + 1] == "0"

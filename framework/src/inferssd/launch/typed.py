@@ -14,6 +14,7 @@ from inferssd.configuration.settings import PLATFORMS, Setting, Snapshot, parse,
 from inferssd.launch.darwin import MODEL_OPTIONS
 from inferssd.launch.resources import EngineResources, server_binary
 from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
+from inferssd.strategy.inputs import model_facts_from
 from inferssd.strategy.launch import Planned, plan
 
 # Each model profile's chat template: a bundled template replaces the GGUF's,
@@ -22,6 +23,13 @@ PROFILES: dict[str, Optional[str]] = {
     "dsv": "deepseek-ai-DeepSeek-V4.1.jinja",
     "muse": "muse-spark.jinja",
     "qwen4exp": None,  # Qwen3.8-Flash-Next
+}
+# The profile of each GGUF general.architecture; --profile overrides it.
+ARCHITECTURES = {"deepseek41": "dsv", "muse-spark": "muse", "qwen4exp": "qwen4exp"}
+# The server's default sampling for each profile, from the model's own
+# generation config where the GGUF carries none; a request's values win.
+SAMPLING: dict[str, tuple[str, ...]] = {
+    "dsv": ("--temp", "1.0", "--top-p", "0.95", "--top-k", "0", "--min-p", "0"),
 }
 
 
@@ -148,7 +156,7 @@ def _resolve(
     reject_legacy_environment(s.env)
     if platform not in PLATFORMS:
         raise ValueError("unknown launch platform " + platform)
-    if s.inputs.profile not in PROFILES:
+    if s.inputs.profile and s.inputs.profile not in PROFILES:
         raise ValueError("unknown model profile; choose " + ", ".join(PROFILES))
     if s.inputs.mode != "server":
         raise ValueError("owned typed launch currently supports server mode")
@@ -267,6 +275,15 @@ def _resolve(
     for path in paths:
         if not s.value("is_file", path):
             raise ValueError("missing GGUF shard: " + path)
+    profile = s.inputs.profile
+    if not profile:
+        architecture = model_facts_from(s.value("model_facts", *paths)).architecture
+        if architecture not in ARCHITECTURES:
+            raise ValueError(
+                f"no model profile for the GGUF architecture {architecture}; choose one with "
+                "--profile " + ", ".join(PROFILES)
+            )
+        profile = ARCHITECTURES[architecture]
     resources = spec.resources
     if resources is not None and resources.platform not in (None, platform):
         raise ValueError("engine resource platform differs from the selected platform")
@@ -278,10 +295,10 @@ def _resolve(
     binary = s.text("resolved_path", binary_path)
     if not s.value("is_file", binary) or not s.value("is_executable", binary):
         raise ValueError("missing server executable: " + binary)
-    bundled = PROFILES[s.inputs.profile]
+    bundled = PROFILES[profile]
     template_path = spec.template
     if not template_path and bundled:
-        template_path = resources.template(s.inputs.profile) if resources else None
+        template_path = resources.template(profile) if resources else None
         if not template_path and s.inputs.repo:
             template_path = os_path.join(s.inputs.repo, "engine", "models", "templates", bundled)
         if not template_path:
@@ -296,7 +313,7 @@ def _resolve(
         value = configured
     if value.platform != platform:
         raise ValueError("typed snapshot platform differs from execution policy")
-    if s.inputs.profile == "dsv":
+    if profile == "dsv":
         value = replace(
             value,
             entries=tuple(
@@ -423,8 +440,13 @@ def _resolve(
         command += ["-C", hex(sum(1 << cpu for cpu in threads.decode_cpus)), "--cpu-strict", "1"]
     if template is not None:
         command += ["--chat-template-file", template]
-    if s.inputs.profile == "dsv":
+    if profile == "dsv":
         command += ["--chat-template-kwargs", DSV_TEMPLATE_KWARGS]
+    sampling = SAMPLING.get(profile, ())
+    named = {x.split("=", 1)[0] for x in s.inputs.extra}
+    for option, number in zip(sampling[::2], sampling[1::2]):
+        if option not in named:
+            command += [option, number]
     if spec.prompt_cache is None:
         command += ["--cache-ram", "0"]
     else:
@@ -474,6 +496,7 @@ def _resolve(
         "settings": settings,
         "telemetry": telemetry,
         "effective": value.document(),
+        "profile": profile,
         "launch": {
             "decode_threads": threads.decode,
             "batch_threads": threads.batch,

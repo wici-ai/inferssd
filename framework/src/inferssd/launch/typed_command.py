@@ -52,7 +52,11 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     )
     launch.add_argument("--binary", type=Path)
     launch.add_argument("--artifact-dir", type=Path)
-    launch.add_argument("--profile", choices=tuple(PROFILES), default="muse")
+    launch.add_argument(
+        "--profile",
+        choices=tuple(PROFILES),
+        help="model profile (default: the one for the GGUF's general.architecture)",
+    )
     launch.add_argument("--port", type=int, default=8080)
     launch.add_argument("--context", type=int, help=f"-c (default: {CONTEXT})")
     launch.add_argument(
@@ -145,7 +149,7 @@ def inputs(args: argparse.Namespace) -> LaunchInput:
         str(args.repo.resolve()) if args.repo else "",
         tuple(os.environ.items()),
         tuple(extra),
-        args.profile,
+        args.profile or "",
     )
 
 
