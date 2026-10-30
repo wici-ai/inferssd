@@ -105,12 +105,12 @@ jobs:
       - name: Configure
         run: cmake --preset linux-cpu -DGGML_NATIVE=OFF
       - name: Build
-        run: cmake --build build-linux-cpu --parallel 4 --target inferssd-server inferssd-cpuprobe inferssd-ssdprobe test-ssd-model-adapter test-ssd-runtime-policy test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan test-reasoning-budget test-ssd-prepared-graph test-ssd-precompute-memory test-ssd-cuda-reserve test-ssd-context-telemetry test-graph-overhead test-test-resources test-c0-store test-c0-config test-c0-parser-failures test-ssd-settings-telemetry test-ssd-runtime-options test-ssd-model-options test-ssd-cpu-api test-ssd-source-index test-ssd-host-arbiter test-ssd-host-prefault
+        run: cmake --build build-linux-cpu --parallel 4 --target inferssd-server inferssd-cpuprobe inferssd-ssdprobe test-ssd-model-adapter test-ssd-runtime-policy test-dsv41-engram test-kimi-prefill-cost test-moe-pack-copy-plan test-reasoning-budget test-ssd-prepared-graph test-ssd-precompute-memory test-ssd-cuda-reserve test-ssd-context-telemetry test-graph-overhead test-test-resources test-c0-store test-c0-config test-c0-parser-failures test-ssd-settings-telemetry test-ssd-runtime-options test-ssd-cpu-api test-ssd-source-index test-ssd-host-arbiter test-ssd-host-prefault
       - name: Synthetic tests
         shell: bash
         run: |
           set -o pipefail
-          ctest --test-dir build-linux-cpu --output-on-failure --no-tests=error -R '^(ssd_model_adapter|ssd_runtime_policy|test-dsv41-engram|kimi_prefill_cost|moe_pack_copy_plan|test-reasoning-budget|ssd_prepared_graph|ssd_precompute_memory|ssd_cuda_reserve|ssd_context_telemetry|test-graph-overhead|test_resources|c0-store|c0-config|c0-parser-failures|ssd_settings_telemetry|ssd_runtime_options|ssd_model_options|ssd_cpu_api|ssd_source_index|ssd_host_arbiter|ssd_host_prefault)$' | tee cpu-tests.log
+          ctest --test-dir build-linux-cpu --output-on-failure --no-tests=error -R '^(ssd_model_adapter|ssd_runtime_policy|test-dsv41-engram|kimi_prefill_cost|moe_pack_copy_plan|test-reasoning-budget|ssd_prepared_graph|ssd_precompute_memory|ssd_cuda_reserve|ssd_context_telemetry|test-graph-overhead|test_resources|c0-store|c0-config|c0-parser-failures|ssd_settings_telemetry|ssd_runtime_options|ssd_cpu_api|ssd_source_index|ssd_host_arbiter|ssd_host_prefault)$' | tee cpu-tests.log
           if grep -E '\bSKIP\b|\*\*\*Not Run|\*\*\*Skipped' cpu-tests.log; then exit 1; fi
       - name: CPU probe smoke run
         shell: bash

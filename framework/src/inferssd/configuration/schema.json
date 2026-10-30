@@ -255,21 +255,6 @@
             "minimum": 0,
             "maximum": 1,
             "default": 1
-        },
-        "model.optimizations": {
-            "description": "Explicit model/quantization/hardware rules; empty disables all new overrides",
-            "kind": "strings",
-            "unit": "exact model rules",
-            "producer": "model",
-            "scope": "all",
-            "cli": "--ssd-model-optimizations",
-            "default_literal": "[]",
-            "type": "array",
-            "items": {
-                "type": "string",
-                "minLength": 1
-            },
-            "default": []
         }
     }
 }

@@ -51,7 +51,7 @@ class Snapshot:
             kind = properties[item.key]["kind"]
             if kind == "costs":
                 values[item.key] = dict(cast(tuple[tuple[str, float], ...], item.value))
-            elif kind in ("cpus", "paths", "strings"):
+            elif kind in ("cpus", "paths"):
                 values[item.key] = list(cast(tuple[object, ...], item.value))
             else:
                 values[item.key] = item.value
@@ -109,7 +109,7 @@ def typed(prop: Mapping[str, Any], literal: str) -> Value:
     literal.encode("utf-8")
     literal = literal.strip(" \t\r\n")
     kind = prop["kind"]
-    if literal.startswith('"') and kind not in ("paths", "strings"):
+    if literal.startswith('"') and kind != "paths":
         if kind == "integer":
             raise ValueError("integer must not be quoted")
         decoded: object = json.loads(literal)
@@ -122,7 +122,7 @@ def typed(prop: Mapping[str, Any], literal: str) -> Value:
         return integer(literal, prop["minimum"], prop["maximum"])
     if kind == "budget":
         return "auto" if literal == "auto" else integer(literal, 0, prop["oneOf"][1]["maximum"])
-    if kind in ("paths", "strings"):
+    if kind == "paths":
         paths: object = json.loads(literal)
         if not isinstance(paths, list) or any(
             not isinstance(x, str) or not x or "\0" in x for x in paths
@@ -243,7 +243,7 @@ def render(snapshot: Snapshot) -> str:
             literal = json.dumps(literal, ensure_ascii=False)
         elif prop["kind"] == "cpus":
             literal = json.dumps(",".join(str(v) for v in cast(tuple[int, ...], item.value)))
-        elif prop["kind"] in ("paths", "strings"):
+        elif prop["kind"] == "paths":
             literal = json.dumps(item.value, ensure_ascii=False)
         elif item.value == "auto":
             literal = "auto"

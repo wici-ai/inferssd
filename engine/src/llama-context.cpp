@@ -1,5 +1,4 @@
 #include "llama-context.h"
-#include "ggml-ssd/settings/model-options.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -77,32 +76,6 @@ llama_context::llama_context(
         const auto * hc = ssd_runtime->settings.integer("model.hc_fused");
         if (engram) { cparams.ssd_engram_prefetch = *engram != 0; }
         if (hc) { cparams.ssd_hc_fused = *hc != 0; }
-        if (ssd::settings::has_model_rules(ssd_runtime->settings)) {
-            auto fact = [&](const char * key) {
-                auto it = model.gguf_kv.find(key);
-                return it == model.gguf_kv.end() ? std::string() : it->second;
-            };
-            std::string hardware;
-            for (const auto & device : model.devices) {
-                if (!hardware.empty()) { hardware += ";"; }
-                hardware += ggml_backend_dev_description(device.dev);
-            }
-            // An empty device list remains unknown; it cannot match a nonempty rule.
-            const ssd::settings::model_identity identity {
-                fact("general.uuid"), fact("general.architecture"), fact("general.file_type"),
-                fact("general.quantization_version"), hardware, fact("general.name")
-            };
-            const auto resolved = ssd::settings::resolve_model(ssd_runtime->settings, identity);
-            if (!resolved) { throw std::runtime_error(resolved.error); }
-            cparams.ssd_engram_prefetch = resolved.value.engram_prefetch;
-            cparams.ssd_hc_fused = resolved.value.hc_fused;
-            const auto effective = resolved.value.json(identity);
-            LLAMA_LOG_INFO("%s: model options %s\n", __func__, effective.c_str());
-            if (ssd_runtime->events) {
-                const auto recorded = ssd_runtime->events->event("ssd.model.options", effective);
-                if (!recorded) { throw std::runtime_error(recorded.error); }
-            }
-        }
     }
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;

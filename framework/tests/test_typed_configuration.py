@@ -75,11 +75,6 @@ def test_registry_generated_schema_exact(native_contract):
             "place.costs=cpu_fixed_us=204\nhost.budget_mib=8192\nmodel.hc_fused=0\n",
         ),
         ("linux", 'inferssd-settings 1\nexpert.source=["/path-\u2028-file"]\n'),
-        (
-            "linux",
-            "inferssd-settings 1\n"
-            'model.optimizations=["example|off|uuid|deepseek41|36|2|Example GPU|1|0"]\n',
-        ),
     ],
 )
 def test_cpp_python_snapshot_exact(native_contract, tmp_path, platform, text):
@@ -118,10 +113,6 @@ def test_cpp_python_snapshot_exact(native_contract, tmp_path, platform, text):
         "place.costs=cpu_fixed_us=1,cpu_fixed_us=2",
         'vram.budget="123"',
         "expert.source=[1]",
-        "model.optimizations=[1]",
-        'model.optimizations=[""]',
-        'model.optimizations="[]"',
-        "model.optimizations={}",
         "host.expert_cache_mib=0",
         "host.budget_mib=1",
         "prefetch.depth=65",
