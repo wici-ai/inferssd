@@ -10,8 +10,10 @@ main() (
     if [ "${1:-}" = --help ]; then
         cat <<'EOF'
 Install InferSSD from source for Apple Silicon / Metal or Linux / NVIDIA CUDA.
-Requires Git, Python >=3.9 with venv, a C/C++ compiler, and Metal/CUDA tools.
-Linux also requires liburing development headers and systemd/cgroup v2 at runtime.
+Requires Git, Python >=3.9 with venv and a C/C++ compiler.
+macOS requires the Xcode Command Line Tools.
+Linux requires the CUDA toolkit, liburing development headers and systemd/cgroup v2
+at runtime.
 CMake, Ninja and the Python framework are installed in a private environment.
 
 Environment:
@@ -26,6 +28,11 @@ EOF
         exit 0
     fi
     [ "$#" -eq 0 ] || die 'Unknown argument; use --help.'
+    # Without these tools, git, cc and python3 are macOS stubs that open an install dialog.
+    if [ "$(uname -s)" = Darwin ]; then
+        xcode-select -p >/dev/null 2>&1 ||
+            die 'Install the Xcode Command Line Tools first: xcode-select --install'
+    fi
     need git
     need python3
     need cc
@@ -34,8 +41,6 @@ EOF
     case "$(uname -s):$(uname -m)" in
         Darwin:arm64)
             preset=macos-metal
-            need xcrun
-            xcrun --find metal >/dev/null 2>&1 || die 'Install the Xcode Metal compiler toolchain first.'
             ;;
         Linux:x86_64|Linux:aarch64|Linux:arm64)
             preset=linux-cuda

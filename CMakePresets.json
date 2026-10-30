@@ -127,7 +127,6 @@
             "GGML_OPENMP": "OFF",
             "LLAMA_BUILD_SERVER": "ON",
             "LLAMA_BUILD_TESTS": "ON",
-            "LLAMA_BUILD_WEBUI": "OFF",
             "GGML_CUDA": "OFF",
             "GGML_METAL": "OFF",
             "LLAMA_SSD_STORE": "ON"
@@ -143,7 +142,6 @@
             "GGML_OPENMP": "OFF",
             "LLAMA_BUILD_SERVER": "ON",
             "LLAMA_BUILD_TESTS": "ON",
-            "LLAMA_BUILD_WEBUI": "OFF",
             "GGML_CUDA": "ON",
             "GGML_CUDA_KIMI_VRAM_TIER": "ON",
             "LLAMA_SSD_STORE": "ON"

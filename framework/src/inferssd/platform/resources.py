@@ -63,7 +63,8 @@ class Resources:
             value = self.linux(pid)
         else:
             value = self.darwin(pid)
-        if value["available_bytes"] < self.policy.host_reserve_bytes:
+        reserve = self.policy.host_reserve_bytes
+        if reserve is not None and value["available_bytes"] < reserve:
             raise RuntimeError("host available-memory estimate is below reserve")
         return value
 
@@ -175,14 +176,17 @@ class Resources:
         if rss > self.policy.memory_budget_bytes:
             raise RuntimeError("sampled server RSS exceeded soft memory budget")
         if self.baseline is not None:
+            compressor_limit = self.policy.max_compressor_growth_bytes
+            swap_limit = self.policy.max_swap_growth_bytes
             if (
-                int(row["compressor_bytes"]) - self.baseline["compressor_bytes"]
-                > self.policy.max_compressor_growth_bytes
+                compressor_limit is not None
+                and int(row["compressor_bytes"]) - self.baseline["compressor_bytes"]
+                > compressor_limit
             ):
                 raise RuntimeError("sampled compressor growth exceeded policy")
             if (
-                int(row["swap_bytes"]) - self.baseline["swap_bytes"]
-                > self.policy.max_swap_growth_bytes
+                swap_limit is not None
+                and int(row["swap_bytes"]) - self.baseline["swap_bytes"] > swap_limit
             ):
                 raise RuntimeError("sampled swap growth exceeded policy")
         return row

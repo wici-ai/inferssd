@@ -191,4 +191,5 @@ class OwnedProcess:
             self._lock = None
         receipt = json.loads((self.directory / "ownership.json").read_text())
         if ended != 0 or receipt.get("status") != "passed":
-            raise RuntimeError("owned native execution failed; see ownership.json and server.log")
+            reason = receipt.get("error") or f"guardian exited with {ended}"
+            raise RuntimeError(f"owned native execution failed: {reason}; see {self.directory}")

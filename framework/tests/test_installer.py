@@ -28,6 +28,8 @@ elif name == "git":
     root = pathlib.Path(args[-1])
     (root / "framework").mkdir(parents=True)
     (root / "scripts").mkdir()
+elif name == "xcode-select":
+    sys.exit(2 if os.environ.get("NO_COMMAND_LINE_TOOLS") else 0)
 elif name == "cmake":
     with open(os.environ["CMAKE_LOG"], "a") as log:
         log.write(" ".join(args) + "\n")
@@ -50,7 +52,7 @@ elif name in ("python3", "python"):
 """
     )
     helper.chmod(0o755)
-    for tool in ("uname", "git", "cc", "c++", "xcrun", "python3", "cmake", "nvcc"):
+    for tool in ("uname", "git", "cc", "c++", "xcode-select", "python3", "cmake", "nvcc"):
         (tools / tool).symlink_to(helper)
     home = tmp_path / "install with spaces"
     bindir = tmp_path / "bin with spaces"
@@ -91,6 +93,19 @@ def test_piped_install_and_upgrade(installation, system):
     assert app.read_text() == previous
     assert Path(descriptor).is_file()
     assert len(list((home / "releases").iterdir())) == 1
+
+
+def test_mac_asks_for_the_command_line_tools(installation):
+    _, _, env = installation
+    result = subprocess.run(
+        ["sh"],
+        input=INSTALLER.read_text(),
+        text=True,
+        env=dict(env, NO_COMMAND_LINE_TOOLS="1"),
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "xcode-select --install" in result.stderr
 
 
 def test_install_help_needs_no_toolchain():
