@@ -7,6 +7,7 @@ import json
 import signal
 import sys
 import time
+from collections.abc import Callable
 from typing import Optional
 
 from inferssd.engine.core import Engine
@@ -18,7 +19,9 @@ from inferssd.launch.types import LaunchInput, Output
 from inferssd.platform.policy import Policy
 
 
-def run_native(args: argparse.Namespace, inputs: LaunchInput) -> int:
+def run_native(
+    args: argparse.Namespace, inputs: LaunchInput, *, session: Optional[Callable[[], int]] = None
+) -> int:
     if args.result is not None:
         raise ValueError("--result is dry-run only; execution writes receipts in --output-dir")
     if args.host_facts is not None:
@@ -35,7 +38,7 @@ def run_native(args: argparse.Namespace, inputs: LaunchInput) -> int:
         raise ValueError("--platform differs from runtime policy")
 
     def emit(event: Output) -> None:
-        stream = sys.stdout if event.channel == "stdout" else sys.stderr
+        stream = sys.stdout if event.channel == "stdout" and session is None else sys.stderr
         stream.write(event.text)
         stream.flush()
 
@@ -61,6 +64,8 @@ def run_native(args: argparse.Namespace, inputs: LaunchInput) -> int:
         )
         if not engine.ok:
             raise RuntimeError("owned server did not become healthy")
+        if session is not None:
+            return session()
         while engine.alive():
             time.sleep(0.5)
         return 0

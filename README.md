@@ -86,7 +86,39 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 
 ## Get started
 
-Build from `main` for either platform. The setup guide covers source indexing, typed settings, and server launch commands.
+Install on Apple Silicon macOS or NVIDIA CUDA Linux:
+
+```sh
+curl -LsSf https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
+```
+
+The installer builds from source in a private environment. Install the
+[platform prerequisites](docs/quickstart.md#before-you-start) first, and follow the
+printed PATH instruction if needed. No `sudo` is used by the installer.
+
+Once installed:
+
+```sh
+# Download the tested DeepSeek Q8_0 GGUF and chat in your terminal
+inferssd cli -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF
+
+# Launch an OpenAI-compatible API at http://127.0.0.1:8080/v1
+inferssd serve -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF
+
+# Or use the tested Muse UD-Q4_K_XL GGUF (works with cli too)
+inferssd serve -hf unsloth/Muse-Spark-Open-816B-A42B-GGUF
+```
+
+The first run downloads **hundreds of GB** of model shards to
+`~/.local/share/inferssd/models`; use `--model-dir /path/on/ssd` to choose the drive.
+Later runs reuse downloaded files, and interrupted downloads can resume. The
+launcher indexes the GGUF directly and measures your hardware before starting;
+no separate expert pack is needed. Terminal chat and API serving use the same
+owned SSD runtime. Stop with **Ctrl+C** (or `/exit` in chat).
+
+See [one-command installation](docs/quickstart.md#one-command-installation) for
+local models, memory limits, authentication, upgrades and uninstalling. The
+source-build instructions remain available for either platform:
 
 | Platform | Branch | Setup |
 | --- | --- | --- |

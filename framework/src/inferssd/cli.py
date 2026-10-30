@@ -12,6 +12,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Optional
 
+from inferssd.app.command import add_commands as add_app_commands
+from inferssd.app.command import run as run_app
 from inferssd.bootstrap.core_sets import run_coresets
 from inferssd.bootstrap.tier_slots import run_ubprobe
 from inferssd.configuration.command import add_command as add_configuration_command
@@ -42,6 +44,7 @@ from inferssd.telemetry.recorded import ledger, read_arm
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="InferSSD launch and configuration tools")
     commands = parser.add_subparsers(dest="command", required=True)
+    add_app_commands(commands)
     add_source_commands(commands)
     add_launch_command(commands)
     add_historical_launch_command(commands)
@@ -98,10 +101,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     fit.add_argument("--profile", required=True)
     fit.add_argument("-o", "--out", required=True)
     # Commands for recorded artifacts remain available but are not listed in the help.
-    public = ("launch", "configuration", "source", "profile")
+    public = ("cli", "serve", "launch", "configuration", "source", "profile")
     commands.metavar = "{" + ",".join(public) + "}"
     commands._choices_actions = [a for a in commands._choices_actions if a.dest in public]
     args = parser.parse_args(argv)
+    if args.command in ("cli", "serve"):
+        try:
+            return run_app(args)
+        except KeyboardInterrupt:
+            return 130
+        except (OSError, ValueError, RuntimeError) as error:
+            parser.error(str(error))
     if args.command == "launch":
         try:
             return run_typed_launch(args)
