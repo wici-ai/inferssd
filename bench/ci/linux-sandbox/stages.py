@@ -32,6 +32,16 @@ def save(path, value):
         os.fsync(stream.fileno())
 
 
+def publish(path, text):
+    """Make a world-readable file appear whole in one step, for a reader polling its name."""
+    pending = path.with_name('.' + path.name + '.' + uuid.uuid4().hex)
+    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(text)
+    os.chmod(pending, 0o644)  # the umask may have narrowed the create mode
+    os.replace(pending, path)
+
+
 def process_identity(pid, expected_uid, scope):
     directory = Path('/proc') / str(pid)
     fields = (directory / 'stat').read_text().rsplit(')', 1)[1].split()
@@ -128,8 +138,9 @@ class RunningStage:
             self.receipt['argv'] = list(stage.argv)
             # This file is exposed read-only. The trusted shim executes the
             # candidate only after its host PID/birth/cgroup/netns are pinned.
-            (launch / 'release').write_text(token)
-            (launch / 'release').chmod(0o644)
+            # It reads the file as soon as the name appears, so the file must
+            # never be seen root-only or partly written.
+            publish(launch / 'release', token)
         except BaseException:
             if self.process is None:
                 self.guardian.finish()
