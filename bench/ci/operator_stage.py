@@ -33,6 +33,8 @@ CONTROL = Path("/opt/inferssd-ci-control/current")
 BROKER_CONFIG = Path("/opt/inferssd-ci-broker/config.json")
 POLICY = Path("/opt/inferssd-ci-control/operator-policy.json")
 LIMIT = 512 << 20
+GIT = "/usr/bin/git"
+GIT_TIMEOUT = 240
 BRIDGE_SOCKET = Path("/run/inferssd-ci-stage.sock")
 BRIDGE_TIMEOUT = 300
 WIRE_LIMIT = LIMIT + (16 << 20)
@@ -102,44 +104,109 @@ def write(path, raw, mode=0o444):
     os.chmod(path, mode)
 
 
-def extract_source(archive_path, source_map, target):
-    """Complete Git blob set and bytes, without tar extract/link semantics."""
-    records = source_map["files"]
+def git_argv(git, repository, *args):
+    # Root runs Git only on its own repository and the staged bundle: no hooks,
+    # no network transport, and every arriving object is checked. Two pack
+    # threads stay within the Spark staging service's task limit.
+    return [git, "-c", "core.hooksPath=/dev/null", "-c", "protocol.allow=never", "-c", "protocol.file.allow=always",
+            "-c", "transfer.fsckObjects=true", "-c", "gc.auto=0", "-c", "pack.threads=2",
+            "--git-dir", str(repository), *args]
+
+
+def git_environment(repository):
+    return {"PATH": "/usr/bin:/bin", "HOME": str(repository), "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
+
+
+def run_git(git, repository, *args):
+    result = subprocess.run(git_argv(git, repository, *args), env=git_environment(repository),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=GIT_TIMEOUT)
+    if result.returncode:
+        fail("git " + args[0] + " failed: " + result.stderr.decode("utf-8", "replace").strip()[-400:])
+    return result.stdout
+
+
+def import_bundle(git, repository, bundle, revisions):
+    """Add the staged bundle's commits to the device's source repository.
+
+    The repository keeps every commit staged before, so an operator sends only
+    the objects a job adds. Each side lands on its fixed ref.
+    """
+    if not repository.exists():
+        repository.mkdir(mode=0o700)
+        run_git(git, repository, "init", "--quiet", "--bare")
+    protected(repository, directory=True)
+    heads = {}
+    for line in run_git(git, repository, "bundle", "list-heads", str(bundle)).decode("ascii").splitlines():
+        sha_value, name = line.split(" ", 1)
+        match = re.fullmatch(r"refs/inferssd-stage/[0-9a-f]{32}/(base|candidate)", name)
+        if not match or match.group(1) in heads:
+            fail("staged source bundle head differs")
+        heads[match.group(1)] = (name, sha_value)
+    if any(heads.get(side, (None, None))[1] != value for side, value in revisions.items()):
+        fail("staged source bundle does not hold the staged revisions")
+    run_git(git, repository, "bundle", "verify", "--quiet", str(bundle))
+    run_git(git, repository, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", str(bundle),
+            *("+" + name + ":refs/inferssd/" + side for side, (name, _) in sorted(heads.items())))
+
+
+def checkout_source(git, repository, source_map, target):
+    """Write one staged commit's tracked files, each checked against the sealed source map."""
+    records, revision = source_map["files"], source_map["revision"]
+    if not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value) for value in (revision, source_map["tree"])):
+        fail("exact source revision and tree required")
     rows = {relative(row["path"]): row for row in records}
     if len(rows) != len(records) or any(row["mode"] not in ("100644", "100755") for row in records):
         fail("source map has duplicate/nonregular tracked files")
+    if any(type(row["bytes"]) is not int or not 0 <= row["bytes"] <= 128 << 20 for row in records):
+        fail("source blob size out of bound")
+    total = sum(row["bytes"] for row in records)
+    if total > LIMIT:
+        fail("source bytes exceed staging bound")
+    if run_git(git, repository, "rev-parse", "--verify", "--quiet", revision + "^{tree}").decode().strip() != source_map["tree"]:
+        fail("staged source tree differs")
+    listed = {}
+    for item in run_git(git, repository, "ls-tree", "-r", "-z", revision).split(b"\0"):
+        if item:
+            descriptor, name = item.split(b"\t", 1)
+            mode, kind, blob = descriptor.decode("ascii").split()
+            listed[relative(name.decode("utf-8"))] = (mode, kind, blob)
+    if listed != {name: (row["mode"], "blob", row["blob"]) for name, row in rows.items()}:
+        fail("staged source tree differs from the source map")
     target.mkdir(mode=0o755, exist_ok=False)
-    seen, total = set(), 0
-    with tarfile.open(archive_path, "r:gz") as archive:
-        for item in archive:
-            name = relative(item.name.rstrip("/") if item.isdir() else item.name)
-            if item.isdir():
-                continue
-            if (not item.isfile() or name not in rows or name in seen
-                    or item.size < 0 or item.size > 128 << 20):
-                fail("unsafe/extra/duplicate source archive member")
-            total += item.size
-            if total > LIMIT:
-                fail("source bytes exceed staging bound")
-            row = rows[name]
-            if item.size != row["bytes"]:
-                fail("source blob size differs")
+    process = subprocess.Popen(git_argv(git, repository, "cat-file", "--batch"), env=git_environment(repository),
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        for name, row in rows.items():
+            process.stdin.write((row["blob"] + "\n").encode())
+            process.stdin.flush()
+            if process.stdout.readline().decode("ascii").split() != [row["blob"], "blob", str(row["bytes"])]:
+                fail("source Git blob differs")
             destination = target / name
             destination.parent.mkdir(parents=True, exist_ok=True)
-            h = hashlib.sha1(("blob " + str(item.size) + "\0").encode())
-            with archive.extractfile(item) as incoming, destination.open("xb") as output:
-                for block in iter(lambda: incoming.read(1 << 20), b""):
+            h, left = hashlib.sha1(("blob " + str(row["bytes"]) + "\0").encode()), row["bytes"]
+            with destination.open("xb") as output:
+                while left:
+                    block = process.stdout.read(min(left, 1 << 20))
+                    if not block:
+                        fail("source Git blob is truncated")
                     h.update(block)
                     output.write(block)
-            if h.hexdigest() != row["blob"]:
+                    left -= len(block)
+            if h.hexdigest() != row["blob"] or process.stdout.read(1) != b"\n":
                 fail("source Git blob differs")
             os.chmod(destination, 0o555 if row["mode"] == "100755" else 0o444)
-            seen.add(name)
-    if seen != set(rows):
-        fail("source archive omits tracked files")
+        process.stdin.close()
+        if process.wait(timeout=GIT_TIMEOUT):
+            fail("git cat-file failed")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdout.close()
     for directory, _, _ in os.walk(target, topdown=False):
         os.chmod(directory, 0o555)
-    return dict(files=len(seen), bytes=total, root=str(target), root_owned_readonly=True)
+    return dict(files=len(rows), bytes=total, root=str(target), root_owned_readonly=True)
 
 
 def control_identity(config):
@@ -392,9 +459,11 @@ def receive(expected_sha256, incoming=None):
             if config.get("validation_mode") == PERFORMANCE_MODE:
                 source.mkdir(mode=0o755, exist_ok=False)
             extracted_sides = {}
+            repository = SROOT / "source.git"
+            import_bundle(GIT, repository, staging / "source.bundle", {side: maps[side]["revision"] for side in sides})
             for side in sides:
                 target = Path(sources[side])
-                extracted_sides[side] = dict(extract_source(staging / (side + "-source.tar.gz"), maps[side], target),
+                extracted_sides[side] = dict(checkout_source(GIT, repository, maps[side], target),
                     revision=maps[side]["revision"], tree=maps[side]["tree"])
                 if sum(row["bytes"] for row in extracted_sides.values()) > LIMIT:
                     fail("combined source bytes exceed staging bound")

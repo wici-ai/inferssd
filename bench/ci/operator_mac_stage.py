@@ -36,6 +36,7 @@ MANIFESTS = BASE / "private/job-manifests"
 TRANSFER_TIMEOUT = 900
 PROCESSING_TIMEOUT = 300
 MAC_PYTHON = "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9"
+MAC_GIT = "/Applications/Xcode.app/Contents/Developer/usr/bin/git"
 JOB = re.compile(r"[0-9a-f]{32}\Z")
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -317,10 +318,12 @@ def receive_packet(expected_sha256, incoming, deadline):
             count = models_readonly(config, policy)
             source.mkdir(mode=0o755)
             extracted = {}
+            repository = SROOT / "source.git"
+            common.import_bundle(MAC_GIT, repository, staging / "source.bundle", {side: maps[side]["revision"] for side in sides})
             for side in sides:
                 common.remaining(deadline)
                 target = source / side
-                extracted[side] = dict(common.extract_source(staging / (side + "-source.tar.gz"), maps[side], target), **expected_sources[side])
+                extracted[side] = dict(common.checkout_source(MAC_GIT, repository, maps[side], target), **expected_sources[side])
                 if sum(value["bytes"] for value in extracted.values()) > common.LIMIT:
                     common.fail("combined Mac source bytes exceed bound")
                 for data in config["sides"][side]["models"].values():

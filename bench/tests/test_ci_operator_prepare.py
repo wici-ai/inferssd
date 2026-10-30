@@ -366,10 +366,18 @@ def test_source_export_includes_export_ignored_file_as_git_data(tmp_path, source
     command(root, "commit", "-qm", "attributes")
     output = tmp_path / "export"
     output.mkdir()
-    value = prepare.export_source(root, command(root, "rev-parse", "HEAD"), output)
+    head = command(root, "rev-parse", "HEAD")
+    value = prepare.export_source(root, head, output)
     assert "new.cpp" in {row["path"] for row in value["files"]}
-    from ci.operator_stage import extract_source
-    proof = extract_source(output / "candidate-source.tar.gz", value, tmp_path / "restored")
+    prepare.export_bundle(root, {"candidate": head}, None, output)
+    from ci import operator_stage
+    repository = tmp_path / "source.git"
+    repository.mkdir(mode=0o700)
+    subprocess.run(["git", "init", "-q", "--bare", str(repository)], check=True)
+    import unittest.mock
+    with unittest.mock.patch.object(operator_stage, "protected", lambda p, **kw: Path(p)):
+        operator_stage.import_bundle("git", repository, output / "source.bundle", {"candidate": head})
+    proof = operator_stage.checkout_source("git", repository, value, tmp_path / "restored")
     assert proof["root_owned_readonly"] and (tmp_path / "restored/new.cpp").read_text() == "old\n"
 
 
@@ -500,7 +508,8 @@ def test_default_mode_is_performance_and_two_sources_are_exact(tmp_path, source)
         assert {name for name in manifest["stages"] if name.startswith(("base-muse-r", "candidate-muse-r"))} == {
             "base-muse-r1-benchmark-512", *("candidate-muse-r" + run + "-benchmark-512" for run in "123")}
         assert config["performance_protocol"] == prepare.performance_protocol()
-        assert {"base-source-map.json", "base-source.tar.gz", "source-map.json", "candidate-source.tar.gz"} <= set(request["files"])
+        assert {"base-source-map.json", "source-map.json", "source.bundle"} <= set(request["files"])
+        assert not any(name.endswith(".tar.gz") for name in request["files"])
     assert load(args.output / "base-source-map.json")["revision"] == args.base
     assert load(args.output / "source-map.json")["revision"] == args.candidate
     prepare.verified(args.output)
@@ -785,7 +794,7 @@ def test_control_only_new_mode_does_not_stage_base_or_timed_arms(tmp_path, sourc
     request = load(args.output / "cloud-5090/root-input.json")
     assert set(manifest["sources"]) == set(request["sources"]) == {"candidate"}
     assert not any("benchmark" in name or "preflight" in name for name in manifest["stages"])
-    assert not (args.output / "base-source.tar.gz").exists()
+    assert not (args.output / "base-source-map.json").exists()
 
 
 def test_subset_job_still_binds_full_fixed_root_policy(tmp_path, source):
@@ -799,6 +808,40 @@ def test_subset_job_still_binds_full_fixed_root_policy(tmp_path, source):
         assert set(policy["models"]) == {"deepseek", "muse"}
         assert set(policy["side_settings_sha256"]["base"]) == {"deepseek", "muse"}
         assert not any("muse" in name for name in load(args.output / device / "root-input.json")["files"])
+
+
+# The two ways the reviewed device templates write their alias stage.
+@pytest.mark.parametrize("form", ["list", "calls"])
+def test_subset_job_runs_only_the_selected_models_alias_commands(tmp_path, source, form):
+    args, api = prepared_fixture(tmp_path, source, devices=["cloud-5090"], mode=prepare.MODE)
+    path = tmp_path / "cloud-5090-template.json"
+    config = load(path)
+    for side_name, side in config["sides"].items():
+        commands = [["/usr/bin/python3", "-I", "-c", "gguf_alias", "--model-glob", "/models/" + m + "/*.gguf",
+                     "--out", "/scratch/" + side_name + "/assets/" + m + "-alias.tsv"] for m in ("muse", "deepseek")]
+        code = ("import subprocess; commands=" + repr(commands) + "; [subprocess.run(argv,check=True) for argv in commands]"
+                if form == "list" else "import subprocess; " + "; ".join("subprocess.run(" + repr(c) + ",check=True)" for c in commands))
+        side["alias"] = dict(argv=["/usr/bin/python3", "-I", "-c", code], environment={}, cwd="/scratch/" + side_name, timeout_s=900)
+    path.write_text(json.dumps(config))
+    changed_identity(args, "engine/ggml/src/ggml-cuda/ssd/mxfp4-compute-adapter.cpp")
+    prepare.prepare(args, api)
+    for side_name, side in load(args.output / "cloud-5090/config.json")["sides"].items():
+        argv = side["alias"]["argv"]
+        assert argv[:3] == ["/usr/bin/python3", "-I", "-c"]
+        assert argv[3] == ("import subprocess; [subprocess.run(argv, check=True) for argv in "
+                           + repr([["/usr/bin/python3", "-I", "-c", "gguf_alias", "--model-glob", "/models/deepseek/*.gguf",
+                                    "--out", "/scratch/" + side_name + "/assets/deepseek-alias.tsv"]]) + "]")
+
+
+def test_alias_stage_must_map_every_selected_model():
+    alias = dict(argv=["/usr/bin/python3", "-c", "import subprocess; subprocess.run(['x', '--out', '/a/muse-alias.tsv'])"])
+    assert prepare.selected_alias(alias, ["muse"]) == dict(alias, argv=["/usr/bin/python3", "-c",
+        "import subprocess; [subprocess.run(argv, check=True) for argv in [['x', '--out', '/a/muse-alias.tsv']]]"])
+    with pytest.raises(ValueError, match="does not map a selected model"):
+        prepare.selected_alias(alias, ["deepseek"])
+    twice = dict(argv=["python3", "-c", "f(['x', '--out', '/a/muse-alias.tsv']); f(['y', '--out', '/b/muse-alias.tsv'])"])
+    with pytest.raises(ValueError, match="one alias table per model"):
+        prepare.selected_alias(twice, ["muse"])
 
 
 def test_no_enabled_affected_linux_device_refuses_before_output(tmp_path, source):

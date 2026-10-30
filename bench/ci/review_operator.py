@@ -100,6 +100,11 @@ def authorization(
         raise Stale(
             "PR is not an open nondraft request against the fixed source repository"
         )
+    # A fork PR is reviewed like any other; its code is fetched from this
+    # repository's refs/pull/N, never from the fork.
+    source = (pr.get("head", {}).get("repo") or {}).get("full_name")
+    if not isinstance(source, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}", source):
+        raise Stale("PR head repository is unavailable")
     actual = revision(pr["head"]["sha"])
     if head is not None and actual != head:
         raise Stale("review no longer identifies the current head")
@@ -148,6 +153,7 @@ def authorization(
         base=base,
         head=actual,
         candidate=candidate,
+        head_repository=source,
     )
     if require_ci:
         try:

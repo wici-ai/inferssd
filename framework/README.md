@@ -7,10 +7,19 @@ Linux also exposes a typed controller factory. Mac currently supports static
 launch only; online adaptive control on Mac is not implemented yet. The runtime
 uses only the Python standard library.
 
+For download-and-run usage, `inferssd cli -hf REPO` opens terminal chat and
+`inferssd serve -hf REPO` starts the API. These commands prepare model files and
+a default resource policy, then use the same owned runtime. Install the optional
+Hub client with `python3 -m pip install './framework[hf]'`, or use the
+[one-command installer](../docs/quickstart.md#one-command-installation), which also
+builds the native engine. `-m FILE` uses local weights without the Hub dependency.
+
 ## Commands and artifacts
 
 | Command | Input | Output |
 | --- | --- | --- |
+| `inferssd cli` | Tested Hugging Face repository or local GGUF | Streaming terminal chat; owned server stops on exit |
+| `inferssd serve` | Tested Hugging Face repository or local GGUF | OpenAI-compatible API with automatic resource policy |
 | `inferssd launch --execute` | Model, typed settings, explicit resource policy | Owned server, settings/telemetry/resource/cleanup artifacts |
 | `inferssd launch --dry-run` | Same configuration, recorded host facts | Prepared settings/source indexes and native argv; no server |
 | `inferssd launch-recorded --dry-run` | Historical launcher inputs and recorded facts | Historical resolution for comparison; cannot execute |
