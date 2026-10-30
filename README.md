@@ -20,7 +20,7 @@
 
 **4K prompt tier · 256 output tokens · decode measured over tokens 129–256.** The 4K label describes the prompt tier, not the model's context-window capacity; actual input token counts depend on the chat template.
 
-All rates are in **token/s**, with higher values indicating faster inference. **llama.cpp is the baseline (1.00×)**. **Speedup** below each Colibri and **InferSSD** rate is `engine throughput / llama.cpp throughput` on the same system. Values above 1.00× are faster; values below 1.00× are slower.
+All rates are in **token/s**, with higher values indicating faster inference. **llama.cpp is the baseline (1.00×)**. The multiple next to each **InferSSD** rate is `engine throughput / llama.cpp throughput` on the same system. Values above 1.00× are faster; values below 1.00× are slower.
 
 These results compare complete inference configurations. In the Mac DeepSeek runs, Colibri uses official Safetensors on CPU, while the GGUF engines use Metal with CPU experts. See [measurement details](docs/benchmark.md) for the scope of the comparison.
 
@@ -40,29 +40,33 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 
 ### DeepSeek-V4.1-Flash-1017
 
-| System | Stage · 4K | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **InferSSD**<br>**token/s · Speedup** |
-| --- | --- | ---: | ---: | ---: |
-| MacBook Pro (M5 Max) | Prefill | 5.929 | 0.708<br>(0.12×) | **26.270**<br>**(4.43×)** |
-| | Decode | 0.873 | 0.437<br>(0.50×) | **2.704**<br>**(3.10×)** |
-| RTX 5060 Ti | Prefill | 6.950 | 7.020<br>(1.01×) | **75.100**<br>**(10.81×)** |
-| | Decode | 0.242 | 0.900<br>(3.72×) | **2.550**<br>**(10.54×)** |
-| RTX 5090 | Prefill | 8.060 | 39.210<br>(4.86×) | **164.500**<br>**(20.41×)** |
-| | Decode | 0.867 | 1.878<br>(2.17×) | **7.270**<br>**(8.39×)** |
-| DGX Spark | Prefill | 2.730 | 0.826<br>(0.30×) | **127.500**<br>**(46.70×)** |
-| | Decode | 1.608 | 0.356<br>(0.22×) | **7.260**<br>**(4.51×)** |
+<table>
+<thead>
+<tr><th rowspan="2">System</th><th colspan="3">Prefill (token/s)</th><th colspan="3">Decode (token/s)</th></tr>
+<tr><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th></tr>
+</thead>
+<tbody>
+<tr><td>MacBook&nbsp;Pro&nbsp;M5&nbsp;Max</td><td align="right">5.929</td><td align="right">0.708</td><td align="right"><b>26.270</b>&nbsp;(4.43×)</td><td align="right">0.873</td><td align="right">0.437</td><td align="right"><b>2.704</b>&nbsp;(3.10×)</td></tr>
+<tr><td>RTX 5060 Ti</td><td align="right">6.950</td><td align="right">7.020</td><td align="right"><b>75.100</b>&nbsp;(10.81×)</td><td align="right">0.242</td><td align="right">0.900</td><td align="right"><b>2.550</b>&nbsp;(10.54×)</td></tr>
+<tr><td>RTX 5090</td><td align="right">8.060</td><td align="right">39.210</td><td align="right"><b>164.500</b>&nbsp;(20.41×)</td><td align="right">0.867</td><td align="right">1.878</td><td align="right"><b>7.270</b>&nbsp;(8.39×)</td></tr>
+<tr><td>DGX Spark</td><td align="right">2.730</td><td align="right">0.826</td><td align="right"><b>127.500</b>&nbsp;(46.70×)</td><td align="right">1.608</td><td align="right">0.356</td><td align="right"><b>7.260</b>&nbsp;(4.51×)</td></tr>
+</tbody>
+</table>
 
 ### Muse-Spark-Open · 816B
 
-| System | Stage · 4K | llama.cpp<br>Baseline · token/s | Colibri<br>token/s · Speedup | 🟩 **InferSSD**<br>**token/s · Speedup** |
-| --- | --- | ---: | ---: | ---: |
-| MacBook Pro (M5 Max)<sup>1</sup> | Prefill | 3.140 | N/S | **12.480**<br>**(3.97×)** |
-| | Decode | 0.153 | N/S | **0.944**<br>**(6.17×)** |
-| RTX 5060 Ti | Prefill | 3.410 | N/S | **52.100**<br>**(15.28×)** |
-| | Decode | 0.059 | N/S | **0.219**<br>**(3.71×)** |
-| RTX 5090 | Prefill | 4.000 | N/S | **106.600**<br>**(26.65×)** |
-| | Decode | 0.155 | N/S | **1.520**<br>**(9.81×)** |
-| DGX Spark | Prefill | 1.740 | N/S | **83.900**<br>**(48.22×)** |
-| | Decode | 0.120 | N/S | **2.140**<br>**(17.83×)** |
+<table>
+<thead>
+<tr><th rowspan="2">System</th><th colspan="3">Prefill (token/s)</th><th colspan="3">Decode (token/s)</th></tr>
+<tr><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th></tr>
+</thead>
+<tbody>
+<tr><td>MacBook&nbsp;Pro&nbsp;M5&nbsp;Max<sup>1</sup></td><td align="right">3.140</td><td align="right">N/S</td><td align="right"><b>12.480</b>&nbsp;(3.97×)</td><td align="right">0.153</td><td align="right">N/S</td><td align="right"><b>0.944</b>&nbsp;(6.17×)</td></tr>
+<tr><td>RTX 5060 Ti</td><td align="right">3.410</td><td align="right">N/S</td><td align="right"><b>52.100</b>&nbsp;(15.28×)</td><td align="right">0.059</td><td align="right">N/S</td><td align="right"><b>0.219</b>&nbsp;(3.71×)</td></tr>
+<tr><td>RTX 5090</td><td align="right">4.000</td><td align="right">N/S</td><td align="right"><b>106.600</b>&nbsp;(26.65×)</td><td align="right">0.155</td><td align="right">N/S</td><td align="right"><b>1.520</b>&nbsp;(9.81×)</td></tr>
+<tr><td>DGX Spark</td><td align="right">1.740</td><td align="right">N/S</td><td align="right"><b>83.900</b>&nbsp;(48.22×)</td><td align="right">0.120</td><td align="right">N/S</td><td align="right"><b>2.140</b>&nbsp;(17.83×)</td></tr>
+</tbody>
+</table>
 
 **N/S:** Muse was not supported by the tested Colibri version. It is not a zero-throughput measurement.
 
