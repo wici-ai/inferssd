@@ -10,7 +10,7 @@ FILES = {
     ".clang-format", ".clang-tidy", ".dockerignore", ".editorconfig", ".gitattributes",
     ".gitignore", ".gitleaks.toml", ".gitleaksignore",
     "CHANGELOG.md", "CMakeLists.txt", "CMakePresets.json", "CONTRIBUTING.md", "LICENSE",
-    "NOTICE", "README.md", "SECURITY.md",
+    "NOTICE", "README.md",
 }
 tracked = set(subprocess.check_output(
     ["git", "-C", str(ROOT), "ls-files"], text=True).splitlines())

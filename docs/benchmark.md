@@ -49,7 +49,7 @@ The configurations in this section describe the archived benchmark runs. Current
 
 **MacBook Pro · Colibri.** [Colibri](https://github.com/JustVugg/colibri) at commit `bf2442915d6e3dd4cdfd2eb9c2a3d2aa44a25850`, official safetensors revision `1bae0e1088993b9b82de08f59de5be5a34e42170`, native CPU backend, 8 threads, and 8 cached experts per layer (about **5.60 GiB**). DSpark and Vulkan are disabled. A benchmark patch records token ordinals/timestamps and suppresses EOS without changing compute kernels. Input token IDs match the GGUF runs; precision, backend, cache, batching, and prefill threads differ. The completed run records `passed=true` and describes this CPU configuration.
 
-**MacBook Pro · Muse.** InferSSD uses the Mac revision above, an 8 GiB LFU cache, compact Metal allocations, and `muse-spark.jinja`. The historical llama.cpp run has different loading behavior, templates, and input token counts. The main table retains the supplied baseline prefill rate **3.140**; the archived run rounds to **3.142**. Its marked speedup ratios are historical configuration comparisons.
+**MacBook Pro · Muse.** InferSSD uses the Mac revision above, an 8 GiB LFU cache, compact Metal allocations, and `muse-spark.jinja`. The main table retains the supplied baseline prefill rate **3.140**; the archived run rounds to **3.142**.
 
 **Linux / NVIDIA.** The tester-supplied summary provides 4K prefill and decode rates for all three engines on DeepSeek and for llama.cpp / InferSSD on Muse. On 2026-10-25, the tester confirmed that all three Linux systems generate 256 output tokens and report the last 128-token window. The earlier RTX 5090 thermal observations and Vulkan configuration are historical details; they are not assumed to describe these measurements.
 

@@ -18,7 +18,7 @@ Both platforms use the `main` branch of `wici-ai/inferssd`. Use the
 ## One-command installation
 
 ```sh
-curl -LsSf https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
+curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 ```
 
 This is a source installer, not a prebuilt binary release. It checks for a C/C++
@@ -192,4 +192,4 @@ python3 engine/tools/expert-pack/create-moe-expert-pack.py --inspect -o /path/to
 
 To launch with the pack, set `expert.source = ["/path/to/model.expert-pack"]` in the settings file. The v1 format records no checkpoint fingerprint, so rebuild the pack whenever the shards change.
 
-Open **http://127.0.0.1:8080** after the server is ready, or [connect an API client](../README.md#use-it-with-your-tools). Stop the owned launcher with **Ctrl+C**.
+Open **http://127.0.0.1:8080** after the server is ready, or point an OpenAI-compatible client at `http://127.0.0.1:8080/v1`. Stop the owned launcher with **Ctrl+C**.

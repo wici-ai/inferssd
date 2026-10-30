@@ -1,0 +1,38 @@
+name: Release
+
+# Publish a version tag as a release whose installer builds that tag from source.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check the tag against the package version
+        run: grep -qx "version = \"${GITHUB_REF_NAME#v}\"" framework/pyproject.toml
+      - name: Pin the installer to this tag
+        run: |
+          sed -i "s/^DEFAULT_REF=main$/DEFAULT_REF=${GITHUB_REF_NAME}/" scripts/install.sh
+          grep -qx "DEFAULT_REF=${GITHUB_REF_NAME}" scripts/install.sh
+          sh -n scripts/install.sh
+      - name: Extract the release notes from the changelog
+        run: |
+          awk -v heading="## ${GITHUB_REF_NAME#v} " \
+            'index($0, heading) == 1 { found = 1; next } /^## / { found = 0 } found' \
+            CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" scripts/install.sh \
+            --verify-tag --title "$GITHUB_REF_NAME" --notes-file release-notes.md
