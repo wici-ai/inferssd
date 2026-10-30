@@ -148,8 +148,7 @@
         "llama.cpp": "1.00×",
         "Colibri": null,
         "InferSSD": "3.97×"
-      },
-      "qualification": "Historical llama.cpp baseline uses a different template and input token count."
+      }
     },
     {
       "model": "Muse-Spark-Open",
@@ -213,8 +212,7 @@
         "llama.cpp": "1.00×",
         "Colibri": null,
         "InferSSD": "6.17×"
-      },
-      "qualification": "Historical llama.cpp baseline uses a different template and input token count."
+      }
     },
     {
       "model": "Muse-Spark-Open",
