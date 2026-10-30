@@ -3,14 +3,96 @@
 
 [Back to README](../README.md)
 
-Both platforms use the `main` branch of `wici-ai/inferssd`. Choose **[Apple Silicon](#apple-silicon)** or **[Linux / NVIDIA](#linux--nvidia)**, then [prepare a launch](#prepare-a-launch).
+Both platforms use the `main` branch of `wici-ai/inferssd`. Use the
+[one-command installation](#one-command-installation), or build manually for
+**[Apple Silicon](#apple-silicon)** / **[Linux / NVIDIA](#linux--nvidia)** and
+[prepare a launch](#prepare-a-launch).
 
 ## Before you start
 
 - Install Git, CMake, Ninja, a C/C++ compiler, and Python 3.9 or later. macOS also needs Xcode's command-line tools and Metal compiler; Linux needs a compatible CUDA toolkit and `liburing` development files.
-- Obtain a complete local [GGUF checkpoint](../README.md#models). Keep all shards together. The launcher reads local files and does not download weights.
+- Choose a [tested GGUF checkpoint](../README.md#models). `cli -hf` and `serve -hf` download all shards of its tested quantization. For manual `launch`, obtain a complete local copy and keep all shards together.
 - Plan storage for the checkpoint. The benchmarked DeepSeek GGUF files take about **473 GiB**; an optional DeepSeek expert pack adds about **269 GiB**, and a Muse pack about **450 GiB**. The framework can index GGUF experts directly, so a pack is optional and must match its source checkpoint.
 - Choose CPU, cache and process-memory budgets for your machine. The README benchmark settings describe their recorded runs, not universal deployment defaults.
+
+## One-command installation
+
+```sh
+curl -LsSf https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
+```
+
+This is a source installer, not a prebuilt binary release. It checks for a C/C++
+compiler, Git, Python 3.9+ with `venv`, and the platform toolchain. On macOS,
+`xcrun --find metal` must work; on Linux, provide `nvcc` on PATH, under
+`/usr/local/cuda`, or through `CUDACXX`, and install `liburing` headers.
+The [Linux runtime requirements](#linux-requirements) still apply.
+
+CMake, Ninja, Hugging Face support and the framework are installed into a private
+virtual environment under `~/.local/share/inferssd/releases`. The installer
+builds the server and machine probes, creates the engine descriptor, and installs
+`~/.local/bin/inferssd`. If that directory is not on PATH, run the export printed
+by the installer and add it to your shell profile. It does not edit shell profiles
+or install system packages.
+
+```sh
+inferssd cli -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF
+inferssd serve -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF
+
+# Muse selects UD-Q4_K_XL automatically
+inferssd cli -hf unsloth/Muse-Spark-Open-816B-A42B-GGUF
+
+# One response, then stop the owned server
+inferssd cli -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF -p 'Explain MoE.' -n 256
+
+# Existing local weights, including fully offline launches after installation
+inferssd serve -m /path/on/ssd/model-00001-of-00010.gguf
+```
+
+`-hf` accepts these two README repositories and their tested quantizations only;
+explicit `:Q8_0` and `:UD-Q4_K_XL` suffixes are accepted. It fetches repository
+metadata, pins the resolved commit, checks the complete shard set and disk space,
+then downloads just those GGUF files. It never downloads every quantization.
+The first shard's local directory is printed; use `-m` with that path to avoid
+contacting Hugging Face on subsequent launches. Model access uses the standard
+Hugging Face token store or `HF_TOKEN`. `--revision` pins a model revision;
+`--model-dir` chooses storage. Keep all shards together and do not edit them.
+
+Downloads use the Hub client's local metadata and resume support. The disk check
+conservatively reserves the full size of unfinished shards plus 1 GiB, so a
+partially downloaded shard may require more free space than its remaining bytes.
+The source alias index references the GGUF payloads without an extra expert pack.
+
+Both commands use `inferssd launch`'s owned runtime, machine measurement, model
+profile selection and chat templates. By default, the process memory budget is
+total system RAM minus the larger of **2 GiB or 20%** reserved for the host.
+This is a starting resource limit, not a benchmark configuration or a guarantee
+that every machine has enough memory. `--memory-gib` lowers the budget; supply
+`--runtime-policy FILE` for an explicit policy, including a larger custom budget.
+The automatic policy forbids compressor/swap growth on macOS and limits the
+session to **24 hours**; change the time limit with `--runtime-seconds`.
+The existing runtime enforces its resource guards and Linux cgroup requirements.
+
+Use `--context`, `--settings`, `--set`, `--machine` and `--reprofile` to override
+launch choices. `--resources` selects a manually built engine descriptor. The
+server listens on loopback port 8080 (`--port` changes it). Terminal chat keeps
+conversation history; `/clear` starts a new conversation, `/exit` or EOF stops
+the service. Ctrl+C also stops it, including during startup or generation.
+Each launch keeps its receipts under `~/.local/share/inferssd/state/runs`.
+
+Rerun the installer to upgrade. Builds use a new release directory and publish
+the command only after build and schema checks; a failed build keeps the previous
+command. Older releases and model downloads are retained. For a branch or tag,
+download the installer and set `INFERSSD_REF` when running it. Optional
+`INFERSSD_HOME`, `INFERSSD_BIN_DIR`, and `INFERSSD_JOBS` select the installation
+root, command directory and compilation parallelism (default 4).
+
+To uninstall, stop active sessions, remove the `inferssd` command from the chosen
+bin directory, and remove the installation's `releases`, `current` and `state`
+entries. Keep `models` to preserve downloaded weights. Prompt caches and machine
+measurements use the framework's existing cache locations; see
+[machine profiles](machine-profile.md) and [configuration](configuration.md).
+
+## Manual source installation
 
 ```sh
 git clone --branch main https://github.com/wici-ai/inferssd.git

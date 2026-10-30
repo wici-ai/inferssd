@@ -10,6 +10,9 @@ license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
 dependencies = []
 
+[project.optional-dependencies]
+hf = ["huggingface_hub>=0.27,<2"]
+
 [project.scripts]
 inferssd = "inferssd.cli:main"
 
@@ -26,6 +29,10 @@ testpaths = ["tests"]
 python_version = "3.9"
 strict = true
 files = ["src/inferssd"]
+
+[[tool.mypy.overrides]]
+module = ["huggingface_hub", "huggingface_hub.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 target-version = "py39"
