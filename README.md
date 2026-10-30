@@ -27,11 +27,7 @@ These are the tested GGUF files, community conversions of the named model releas
 
 ## Performance benchmarks
 
-**4K prompt tier · 256 output tokens · decode measured over tokens 129–256.**
-
-All rates are in **token/s**; higher is faster. The multiple next to each **InferSSD** rate is its speedup over llama.cpp on the same hardware.
-
-On the MacBook Pro, Colibri runs the official Safetensors on CPU; llama.cpp and InferSSD run the GGUF with Metal. See [measurement details](docs/benchmark.md).
+**4K prompt tier · 256 output tokens · decode measured over tokens 129–256.** All rates are in **token/s**; higher is faster. The multiple next to each **InferSSD** rate is its speedup over llama.cpp on the same hardware. On the MacBook Pro, Colibri runs the official Safetensors on CPU; llama.cpp and InferSSD run the GGUF with Metal. See [measurement details](docs/benchmark.md).
 
 ### Test hardware
 
