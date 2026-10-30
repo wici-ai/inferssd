@@ -14,12 +14,12 @@
       "rates_tps": {
         "llama.cpp": "5.929",
         "Colibri": "0.708",
-        "InferSSD": "26.270"
+        "InferSSD": "28.766"
       },
       "speedup": {
         "llama.cpp": "1.00×",
         "Colibri": "0.12×",
-        "InferSSD": "4.43×"
+        "InferSSD": "4.85×"
       }
     },
     {
@@ -78,12 +78,12 @@
       "rates_tps": {
         "llama.cpp": "0.873",
         "Colibri": "0.437",
-        "InferSSD": "2.704"
+        "InferSSD": "2.874"
       },
       "speedup": {
         "llama.cpp": "1.00×",
         "Colibri": "0.50×",
-        "InferSSD": "3.10×"
+        "InferSSD": "3.29×"
       }
     },
     {
@@ -142,12 +142,12 @@
       "rates_tps": {
         "llama.cpp": "3.140",
         "Colibri": null,
-        "InferSSD": "12.480"
+        "InferSSD": "14.503"
       },
       "speedup": {
         "llama.cpp": "1.00×",
         "Colibri": null,
-        "InferSSD": "3.97×"
+        "InferSSD": "4.62×"
       }
     },
     {
@@ -206,12 +206,12 @@
       "rates_tps": {
         "llama.cpp": "0.153",
         "Colibri": null,
-        "InferSSD": "0.944"
+        "InferSSD": "1.097"
       },
       "speedup": {
         "llama.cpp": "1.00×",
         "Colibri": null,
-        "InferSSD": "6.17×"
+        "InferSSD": "7.17×"
       }
     },
     {

@@ -43,7 +43,7 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 <tr><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th></tr>
 </thead>
 <tbody>
-<tr><td>MacBook&nbsp;Pro</td><td align="right">5.929</td><td align="right">0.708</td><td align="right"><b>26.270</b>&nbsp;(4.43×)</td><td align="right">0.873</td><td align="right">0.437</td><td align="right"><b>2.704</b>&nbsp;(3.10×)</td></tr>
+<tr><td>MacBook&nbsp;Pro</td><td align="right">5.929</td><td align="right">0.708</td><td align="right"><b>28.766</b>&nbsp;(4.85×)</td><td align="right">0.873</td><td align="right">0.437</td><td align="right"><b>2.874</b>&nbsp;(3.29×)</td></tr>
 <tr><td>RTX 5060 Ti</td><td align="right">6.950</td><td align="right">7.020</td><td align="right"><b>75.100</b>&nbsp;(10.81×)</td><td align="right">0.242</td><td align="right">0.900</td><td align="right"><b>2.550</b>&nbsp;(10.54×)</td></tr>
 <tr><td>RTX 5090</td><td align="right">8.060</td><td align="right">39.210</td><td align="right"><b>164.500</b>&nbsp;(20.41×)</td><td align="right">0.867</td><td align="right">1.878</td><td align="right"><b>7.270</b>&nbsp;(8.39×)</td></tr>
 <tr><td>DGX Spark</td><td align="right">2.730</td><td align="right">0.826</td><td align="right"><b>127.500</b>&nbsp;(46.70×)</td><td align="right">1.608</td><td align="right">0.356</td><td align="right"><b>7.260</b>&nbsp;(4.51×)</td></tr>
@@ -58,7 +58,7 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 <tr><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th></tr>
 </thead>
 <tbody>
-<tr><td>MacBook&nbsp;Pro</td><td align="right">3.140</td><td align="right">N/S</td><td align="right"><b>12.480</b>&nbsp;(3.97×)</td><td align="right">0.153</td><td align="right">N/S</td><td align="right"><b>0.944</b>&nbsp;(6.17×)</td></tr>
+<tr><td>MacBook&nbsp;Pro</td><td align="right">3.140</td><td align="right">N/S</td><td align="right"><b>14.503</b>&nbsp;(4.62×)</td><td align="right">0.153</td><td align="right">N/S</td><td align="right"><b>1.097</b>&nbsp;(7.17×)</td></tr>
 <tr><td>RTX 5060 Ti</td><td align="right">3.410</td><td align="right">N/S</td><td align="right"><b>52.100</b>&nbsp;(15.28×)</td><td align="right">0.059</td><td align="right">N/S</td><td align="right"><b>0.219</b>&nbsp;(3.71×)</td></tr>
 <tr><td>RTX 5090</td><td align="right">4.000</td><td align="right">N/S</td><td align="right"><b>106.600</b>&nbsp;(26.65×)</td><td align="right">0.155</td><td align="right">N/S</td><td align="right"><b>1.520</b>&nbsp;(9.81×)</td></tr>
 <tr><td>DGX Spark</td><td align="right">1.740</td><td align="right">N/S</td><td align="right"><b>83.900</b>&nbsp;(48.22×)</td><td align="right">0.120</td><td align="right">N/S</td><td align="right"><b>2.140</b>&nbsp;(17.83×)</td></tr>
