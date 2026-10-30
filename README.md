@@ -90,7 +90,7 @@ inferssd cli -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF
 inferssd serve -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF
 ```
 
-For Muse, use `unsloth/Muse-Spark-Open-816B-A42B-GGUF`.
+For Muse, use `unsloth/Muse-Spark-Open-816B-A42B-GGUF`. With `serve`, open `http://127.0.0.1:8080` in your browser, or point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`.
 
 The first run downloads about 470 GiB of model files to `~/.local/share/inferssd/models` and measures your machine. Use `--model-dir /path/on/ssd` to choose the drive, or `-m /path/to/first-shard.gguf` for files you already have. There is no memory setting to choose: InferSSD uses the memory available. Stop with **Ctrl+C**, or `/exit` in chat.
 
@@ -106,28 +106,6 @@ These GGUF references are recorded in the verified Mac runs. They are community 
 | Muse-Spark-Open | 816B total / 42B active | [Unsloth · UD-Q4_K_XL](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF) |
 
 DeepSeek's **Q8_0 label does not mean every tensor is 8-bit**: routed experts retain MXFP4, while other tensors include Q8_0, BF16, and F32. This text GGUF omits the vision and MTP/DSpark modules. Expert packing copies the existing quantized expert bytes without requantization. See [weight-format details](docs/benchmark.md#checkpoint-formats).
-
-## Use it with your tools
-
-Once the server is ready, open its address in your browser or point an OpenAI-compatible client at its `/v1` endpoint.
-
-| Setup | Browser | API base URL |
-| --- | --- | --- |
-| Quick start | `http://127.0.0.1:8080` | `http://127.0.0.1:8080/v1` |
-
-Send a request to the default port `8080`:
-
-```bash
-curl http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "messages": [{"role": "user", "content": "Explain how a mixture-of-experts model works."}],
-    "max_tokens": 256,
-    "temperature": 0,
-    "stream": true,
-    "chat_template_kwargs": {"enable_thinking": false}
-  }'
-```
 
 ## Further reading
 
