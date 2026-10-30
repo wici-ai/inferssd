@@ -41,6 +41,9 @@ GATED_METRICS = ("decode_tps", "ttft_s", "server_prefill_tps")
 # Values are rounded up, a count between entries uses the nearest lower entry,
 # and above 128 the normal value 3.0 applies. A fixed table keeps the
 # multiplier identical on every device and in the hosted replay.
+# The anchor check allows the in-run base at least this drift from its history:
+# the runs of one baseline job agree more closely than two jobs hours apart.
+ANCHOR_FLOOR_FRACTION = "0.02"
 T_QUANTILE = "one-sided Student-t, P = 0.99865 (normal 3 sigma), df = pooled baseline degrees of freedom"
 T_QUANTILES = ((3, 9.219), (4, 6.621), (5, 5.508), (6, 4.905), (7, 4.530), (8, 4.277), (9, 4.095),
                (10, 3.957), (11, 3.850), (12, 3.765), (13, 3.695), (14, 3.636), (15, 3.587),
@@ -516,6 +519,7 @@ def decide_cell(results, receipts, policy, *, cell, protocol, history, environme
     matching = sorted((record for record in same_cell if record["conditions_sha256"] == identity["conditions_sha256"]),
                       key=lambda record: (record["measured_at"], record["commit"]))
     floor = {metric: float(EXACT.ln(Decimal(1) + Decimal(thresholds["floor_fraction"][metric]))) for metric in METRICS}
+    anchor_floor = float(EXACT.ln(Decimal(1) + Decimal(ANCHOR_FLOOR_FRACTION)))
     metrics, regressions, improvements, blocking, reasons = {}, [], [], [], []
     if purpose == BASELINE:
         runs = [results[k, side] for k, side in keys]
@@ -530,6 +534,10 @@ def decide_cell(results, receipts, policy, *, cell, protocol, history, environme
         pool = [dict(commit=record["commit"], job_id=record["job_id"], measured_at=record["measured_at"]) for record in prior]
     else:
         base_record = next((record for record in matching if record["commit"] == cell["base"]), None)
+        if base_record is None and matching and not any(record["commit"] == cell["base"] for record in same_cell):
+            # A main commit that changed no performance-relevant file has no baseline
+            # job of its own: its PRs compare against the cell's most recent record.
+            base_record = matching[-1]
         pool = []
         if base_record is None:
             blocking.append("baseline-conditions-differ" if any(record["commit"] == cell["base"] for record in same_cell)
@@ -553,7 +561,7 @@ def decide_cell(results, receipts, policy, *, cell, protocol, history, environme
                 k = t_quantile(df)
                 base_estimate = mean([*history_logs, anchor])
                 difference = mean(candidate_logs) - base_estimate
-                anchor_limit = k * sigma * math.sqrt(1 + 1 / len(history_logs))
+                anchor_limit = max(anchor_floor, k * sigma * math.sqrt(1 + 1 / len(history_logs)))
                 standard_error = sigma * math.sqrt(1 / len(candidate_logs) + 1 / (len(history_logs) + 1))
                 threshold = max(floor[metric], k * standard_error)
                 anchored = abs(anchor - mean(history_logs)) <= anchor_limit
@@ -598,11 +606,14 @@ def decide_cell(results, receipts, policy, *, cell, protocol, history, environme
                                        reference_run=arm_name(*keys[0]),
                                        tokens_sha256=tokens_digest(reference), differences=differences),
                   measurement_identity=identity, history_pool=pool,
+                  **({} if purpose == BASELINE else dict(
+                      baseline_commit=None if base_record is None else base_record["commit"])),
                   decision_rule=dict(t_quantile=T_QUANTILE, floor_fraction=thresholds["floor_fraction"],
                                      gated_metrics=list(GATED_METRICS),
                                      baseline_history_sha256=conditions_digest(history),
                                      threshold="max(ln(1 + floor_fraction), t_df * sigma * sqrt(1/candidate runs + 1/(history runs + 1)))",
-                                     anchor="|base run - history mean| <= t_df * sigma * sqrt(1 + 1/history runs)"),
+                                     anchor="|base run - history mean| <= max(ln(1 + " + ANCHOR_FLOOR_FRACTION
+                                            + "), t_df * sigma * sqrt(1 + 1/history runs))"),
                   interpretation=BASELINE_INTERPRETATION if purpose == BASELINE else INTERPRETATION)
     if launches is not None:
         result["derived_launch"] = launches

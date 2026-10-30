@@ -676,6 +676,36 @@ def test_new_main_head_queues_one_baseline_job_that_measures_it_on_every_unatten
     assert len(list(args.state.glob("*.json"))) == 4
 
 
+@pytest.mark.parametrize("paths,status", [
+    (["bench/ci/compare.py", "docs/quickstart.md"], "not-needed"),
+    (["bench/ci/compare.py", "engine/src/llama-context.cpp"], "queued"),
+    (None, "queued"),
+])
+def test_a_main_head_without_performance_relevant_changes_needs_no_baseline_job(api, args, monkeypatch, paths, status):
+    measured, head = "d" * 40, "e" * 40
+    api.main = head
+    monkeypatch.setattr(entry, "pages", lambda *_: [])
+    monkeypatch.setattr(entry.history, "load_all", lambda root: [dict(commit=measured, measured_at="2026-10-30T00:00:00Z")])
+    monkeypatch.setattr(entry, "fetch_objects", lambda *_: None)
+    monkeypatch.setattr(entry, "advance_baseline", lambda *_: False)
+
+    def git(source, *argv):
+        # The measured commit's files against head's: content, not ancestry.
+        assert argv == ("diff", "--no-renames", "--name-only", "-z", measured, head)
+        if paths is None:
+            raise ValueError("Git object operation failed: diff")
+        return "".join(path + "\0" for path in paths).encode()
+
+    monkeypatch.setattr(entry.prepare, "git", git)
+    entry.tick(args, api)
+    record = entry.load(baseline_path(args, head))
+    assert record["status"] == status and record["commit"] == head
+    assert (record.get("measured_commit") == measured) is (status == "not-needed")
+    # A recorded decision is not revisited on the next poll.
+    entry.tick(args, api)
+    assert entry.load(baseline_path(args, head))["status"] == status
+
+
 @pytest.mark.parametrize("change,devices", [
     ("sudo", ["cloud-5090", "local-mbp"]),
     ("mac-acceptance", ["cloud-5090", "dgx-spark"]),

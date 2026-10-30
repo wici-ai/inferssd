@@ -617,13 +617,13 @@ def test_summary_renders_mac_host_conditions_per_run_without_excusing_slowdown(f
     base = dict(schema_version=1, policy=dict(pair_free_tolerance_bytes=1 << 30),
         quiet=dict(status="passed"), cleanup=dict(status="passed"),
         prelaunch_available_bytes=38 * (1 << 30) + (1 << 29),
-        timed=dict(status="passed", reasons=[], swapout_bytes=0, compression_delta_bytes=2 << 20,
+        timed=dict(status="passed", reasons=[], swapout_bytes=0, compressed_bytes=2 << 20,
             process_activity=dict(non_ci_cpu_cores=0.125), memory_pressure_levels=[1, 1]))
     other = copy.deepcopy(base)
     other["prelaunch_available_bytes"] = 38 << 30
     other["timed"].update(status="flagged" if flagged else "passed",
         reasons=["swapout-activity|<diagnosis>\nretain"] if flagged else [], swapout_bytes=3 << 20,
-        compression_delta_bytes=80 << 20, process_activity=dict(non_ci_cpu_cores=0.375),
+        compressed_bytes=80 << 20, process_activity=dict(non_ci_cpu_cores=0.375),
         memory_pressure_levels=[1, 2])
     runs = {"r1/candidate": base, "r1/base": copy.deepcopy(base), "r2/candidate": other, "r3/candidate": copy.deepcopy(base)}
     environment = mac_host_gate.cell(runs)

@@ -31,7 +31,7 @@ def policy(config):
         pair_free_tolerance_bytes=1 << 30, limits=dict(
             ci_uids=[62001, 62002], ignore_pids=[], normal_pressure_levels=[1], require_pressure_level=True,
             min_available_bytes=min(budget, total * 3 // 4), max_swapout_bytes=0,
-            max_compression_delta_bytes=64 << 20, max_non_ci_cpu_cores=0.5,
+            max_compressed_bytes=64 << 20, max_non_ci_cpu_cores=0.5,
             max_non_ci_process_cpu_cores=0.25, max_non_ci_process_rss_bytes=512 << 20))
 
 

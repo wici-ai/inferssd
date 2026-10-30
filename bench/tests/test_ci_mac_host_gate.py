@@ -52,7 +52,7 @@ def test_policy_uses_sealed_ram_and_fixed_thresholds():
     assert value['limits']['max_non_ci_process_rss_bytes'] == 512 << 20
     assert value['limits']['max_non_ci_process_cpu_cores'] == .25
     assert value['limits']['max_non_ci_cpu_cores'] == .5
-    assert value['limits']['max_compression_delta_bytes'] == 64 << 20
+    assert value['limits']['max_compressed_bytes'] == 64 << 20
     for ram in (True, 0, '48', 30 << 30):
         changed = copy.deepcopy(CONFIG); changed['host']['hardware']['memory_total_bytes'] = ram
         with pytest.raises(ValueError): gate.policy(changed)
@@ -61,7 +61,7 @@ def test_policy_uses_sealed_ram_and_fixed_thresholds():
 def test_valid_retention_accepts_static_swap_and_compression_only(tmp_path, monkeypatch):
     summary = arm(tmp_path / 'arm', monkeypatch, compressions=100 + (128 << 20) // 16384)
     assert summary['quiet']['status'] == summary['timed']['status'] == 'passed'
-    assert summary['timed']['compression_delta_bytes'] == 128 << 20
+    assert summary['timed']['compressed_bytes'] == 128 << 20
     assert set(summary['artifacts']) == {gate.QUIET, *gate.SNAPSHOTS}
     assert gate.retained_quiet(tmp_path / 'arm', gate.policy(CONFIG))['quiet']['status'] == 'passed'
 

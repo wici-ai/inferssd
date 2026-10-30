@@ -309,11 +309,34 @@ def test_base_run_far_from_its_history_needs_review_and_blocks_a_regression():
     assert near["metrics"]["decode_tps"]["base_run_matches_history"] and near["status"] == "passed"
 
 
-@pytest.mark.parametrize("state", ["missing", "other-device", "other-model", "other-tier", "other-commit", "conditions"])
+@pytest.mark.parametrize("drift,anchored", [(-0.013, True), (0.013, True), (-0.03, False)])
+def test_anchor_allows_at_least_two_percent_drift_from_a_steady_history(drift, anchored):
+    # One baseline job's runs agree to 0.1%; the in-run base of a later job drifts by drift.
+    steady = [record(spread=(0.999, 1.001, 0.9995, 1.0005))]
+    cell = decide({(1, "base"): scaled(drift, "ttft_s")}, steady)
+    entry = cell["metrics"]["ttft_s"]
+    assert entry["anchor_limit"] == pytest.approx(math.log(1.02), rel=1e-12)
+    assert entry["base_run_matches_history"] is anchored
+    assert (cell["review_reasons"] == []) is anchored
+    if not anchored:
+        assert cell["review_reasons"] == ["base-run-differs-from-baseline-history:ttft_s"]
+
+
+def test_a_base_without_its_own_record_compares_against_the_cells_most_recent_record():
+    # The operator measures no main commit that changed no performance-relevant file.
+    older = record("b" * 40, measured_at="2026-10-27T10:00:00Z", job="1" * 32)
+    newer = record("d" * 40, measured_at="2026-10-28T10:00:00Z", job="2" * 32)
+    cell = decide(candidates(scaled(0.5)), [newer, older])
+    assert cell["baseline_commit"] == "d" * 40 and cell["status"] == "regressed"
+    assert decide(None, [older, newer])["status"] == "passed"
+    # The base's own record is used whenever it exists.
+    assert decide(None, [record(), newer])["baseline_commit"] == BASE
+
+
+@pytest.mark.parametrize("state", ["missing", "other-device", "other-model", "other-tier", "conditions"])
 def test_missing_or_mismatched_history_needs_review_even_for_a_large_slowdown(state):
     records = {"missing": [], "other-device": [record(device="dgx-spark")], "other-model": [record(model="deepseek")],
-               "other-tier": [record(tier="4096")], "other-commit": [record("b" * 40)],
-               "conditions": [record(conditions="0" * 64)]}[state]
+               "other-tier": [record(tier="4096")], "conditions": [record(conditions="0" * 64)]}[state]
     cell = decide(candidates(scaled(0.5)), records)
     assert cell["status"] == "needs-review" and cell["regressions"] == []
     reason = "baseline-conditions-differ" if state == "conditions" else "no-baseline-history"
