@@ -20,29 +20,26 @@
 
 **4K prompt tier · 256 output tokens · decode measured over tokens 129–256.** The 4K label describes the prompt tier, not the model's context-window capacity; actual input token counts depend on the chat template.
 
-All rates are in **token/s**, with higher values indicating faster inference. **llama.cpp is the baseline (1.00×)**. The multiple next to each **InferSSD** rate is `engine throughput / llama.cpp throughput` on the same system. Values above 1.00× are faster; values below 1.00× are slower.
+All rates are in **token/s**, with higher values indicating faster inference. **llama.cpp is the baseline (1.00×)**. The multiple next to each **InferSSD** rate is `engine throughput / llama.cpp throughput` on the same hardware. Values above 1.00× are faster; values below 1.00× are slower.
 
 These results compare complete inference configurations. In the Mac DeepSeek runs, Colibri uses official Safetensors on CPU, while the GGUF engines use Metal with CPU experts. See [measurement details](docs/benchmark.md) for the scope of the comparison.
 
 ### Test hardware
 
-| Specification | MacBook Pro (M5 Max) | RTX 5060 Ti | RTX 5090 | DGX Spark |
+| Hardware | CPU (cores) | GPU | Memory | SSD |
 | --- | --- | --- | --- | --- |
-| **CPU / SoC** | Apple M5 Max | Intel Core 3 100U | Intel Core Ultra 5 230F | NVIDIA GB10 |
-| **CPU cores** | 18 | 6 | 10 | 20 |
-| **GPU** | 40-core Apple GPU | RTX 5060 Ti | RTX 5090 | NVIDIA Blackwell |
-| **System memory** | 48 GB unified | 8 GB RAM | 32 GB RAM | 128 GB unified |
-| **GPU memory** | Shared | 16 GB VRAM | 32 GB VRAM | Shared |
-| **SSD capacity** | 2 TB | 2 TB | 2 TB | 4 TB |
-| **SSD interface** | Apple internal storage | PCIe 4.0 ×4 | PCIe 5.0 ×4 | PCIe 5.0 ×4 |
+| MacBook&nbsp;Pro&nbsp;M5&nbsp;Max | Apple&nbsp;M5&nbsp;Max&nbsp;(18) | 40-core | 48&nbsp;GB&nbsp;unified | 2&nbsp;TB&nbsp;internal |
+| RTX&nbsp;5060&nbsp;Ti | Intel&nbsp;Core&nbsp;3&nbsp;100U&nbsp;(6) | RTX&nbsp;5060&nbsp;Ti | 8&nbsp;GB&nbsp;+&nbsp;16&nbsp;GB&nbsp;VRAM | 2&nbsp;TB&nbsp;PCIe&nbsp;4&nbsp;×4 |
+| RTX&nbsp;5090 | Intel&nbsp;Core&nbsp;Ultra&nbsp;5&nbsp;230F&nbsp;(10) | RTX&nbsp;5090 | 32&nbsp;GB&nbsp;+&nbsp;32&nbsp;GB&nbsp;VRAM | 2&nbsp;TB&nbsp;PCIe&nbsp;5&nbsp;×4 |
+| DGX&nbsp;Spark | NVIDIA&nbsp;GB10&nbsp;(20) | Blackwell | 128&nbsp;GB&nbsp;unified | 4&nbsp;TB&nbsp;PCIe&nbsp;5&nbsp;×4 |
 
-Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to system RAM. SSD capacities are nominal. See [hardware details](docs/benchmark.md#hardware-details) for SSD models, CPU core layouts, and configuration notes.
+Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [hardware details](docs/benchmark.md#hardware-details) for SSD models, CPU core layouts, and configuration notes.
 
 ### DeepSeek-V4.1-Flash-1017
 
 <table>
 <thead>
-<tr><th rowspan="2">System</th><th colspan="3">Prefill (token/s)</th><th colspan="3">Decode (token/s)</th></tr>
+<tr><th rowspan="2">Hardware</th><th colspan="3">Prefill (token/s)</th><th colspan="3">Decode (token/s)</th></tr>
 <tr><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th></tr>
 </thead>
 <tbody>
@@ -57,7 +54,7 @@ Unified memory is shared by the CPU and GPU; dedicated VRAM is additional to sys
 
 <table>
 <thead>
-<tr><th rowspan="2">System</th><th colspan="3">Prefill (token/s)</th><th colspan="3">Decode (token/s)</th></tr>
+<tr><th rowspan="2">Hardware</th><th colspan="3">Prefill (token/s)</th><th colspan="3">Decode (token/s)</th></tr>
 <tr><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th><th>llama.cpp</th><th>Colibri</th><th>InferSSD</th></tr>
 </thead>
 <tbody>
