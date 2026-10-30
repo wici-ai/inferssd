@@ -309,6 +309,19 @@ def test_base_run_far_from_its_history_needs_review_and_blocks_a_regression():
     assert near["metrics"]["decode_tps"]["base_run_matches_history"] and near["status"] == "passed"
 
 
+@pytest.mark.parametrize("drift,anchored", [(-0.013, True), (0.013, True), (-0.03, False)])
+def test_anchor_allows_at_least_two_percent_drift_from_a_steady_history(drift, anchored):
+    # One baseline job's runs agree to 0.1%; the in-run base of a later job drifts by drift.
+    steady = [record(spread=(0.999, 1.001, 0.9995, 1.0005))]
+    cell = decide({(1, "base"): scaled(drift, "ttft_s")}, steady)
+    entry = cell["metrics"]["ttft_s"]
+    assert entry["anchor_limit"] == pytest.approx(math.log(1.02), rel=1e-12)
+    assert entry["base_run_matches_history"] is anchored
+    assert (cell["review_reasons"] == []) is anchored
+    if not anchored:
+        assert cell["review_reasons"] == ["base-run-differs-from-baseline-history:ttft_s"]
+
+
 @pytest.mark.parametrize("state", ["missing", "other-device", "other-model", "other-tier", "other-commit", "conditions"])
 def test_missing_or_mismatched_history_needs_review_even_for_a_large_slowdown(state):
     records = {"missing": [], "other-device": [record(device="dgx-spark")], "other-model": [record(model="deepseek")],

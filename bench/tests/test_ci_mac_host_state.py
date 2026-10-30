@@ -104,9 +104,9 @@ def test_existing_services_and_historical_counters_do_not_fail_quiet_check():
     before, after = pair()
     after["swap"]["used_bytes"] -= 1024 ** 2
     result = host.compare_snapshots(before, after, dict(max_swapout_bytes=0,
-        max_compression_delta_bytes=0, max_non_ci_cpu_cores=0))
+        max_compressed_bytes=0, max_non_ci_cpu_cores=0))
     assert result["status"] == "passed" and result["reasons"] == []
-    assert result["swapout_bytes"] == result["compression_delta_bytes"] == 0
+    assert result["swapout_bytes"] == result["compressed_bytes"] == 0
     assert result["swap_used_delta_bytes"] == -1024 ** 2
     assert len(result["process_activity"]["processes"]) == 2
     assert result["process_activity"]["non_ci_cpu_cores"] == 0
@@ -122,7 +122,7 @@ def test_cumulative_page_deltas_use_page_size_not_current_swap_usage():
     assert result["counter_delta_pages"] == increments
     assert result["counter_delta_bytes"] == {key: value * 16384 for key, value in increments.items()}
     assert result["swapout_bytes"] == 3 * 16384
-    assert result["compression_delta_bytes"] == 9 * 16384
+    assert result["compressed_bytes"] == 4 * 16384
     assert result["swap_used_delta_bytes"] == 0
 
 
@@ -186,7 +186,7 @@ def test_quiet_threshold_counts_free_and_file_backed_pages_and_low_memory_either
     after["vm_stat"]["counters"]["compressions"] += 1
     policy = dict(max_non_ci_cpu_cores=0.5, max_non_ci_process_cpu_cores=0.5,
                   max_non_ci_process_rss_bytes=2 * 1024 ** 2,
-                  max_swapout_bytes=16384, max_compression_delta_bytes=16384,
+                  max_swapout_bytes=16384, max_compressed_bytes=16384,
                   min_available_bytes=11000 * 16384)
     result = host.compare_snapshots(before, after, policy)
     assert result["status"] == "passed" and result["available_bytes"] == [11000 * 16384] * 2
@@ -269,7 +269,7 @@ def test_timed_mode_flags_swap_and_pressure_without_idle_memory_limits(
     after["vm_stat"]["counters"]["swapouts"] += swap
     after["vm_stat"]["counters"]["compressions"] += compression
     after["memory_pressure_level"] = pressure
-    policy = dict(normal_pressure_levels=[1], max_compression_delta_bytes=16384,
+    policy = dict(normal_pressure_levels=[1], max_compressed_bytes=16384,
                   max_swapout_bytes=0, max_non_ci_cpu_cores=0,
                   max_non_ci_process_cpu_cores=0, max_non_ci_process_rss_bytes=0,
                   min_available_bytes=100 * 1024 ** 3)
@@ -283,11 +283,24 @@ def test_timed_mode_flags_swap_and_pressure_without_idle_memory_limits(
 
 
 @pytest.mark.parametrize("timed", [False, True])
+def test_decompressions_alone_neither_refuse_nor_flag_a_run(timed):
+    # 90 MiB of pages compressed during the previous run come back; nothing is compressed now.
+    before, after = pair()
+    after["vm_stat"]["counters"]["decompressions"] += 5775
+    after["memory_pressure_level"] = 2 if timed else 1
+    policy = dict(normal_pressure_levels=[1, 2] if timed else [1], max_swapout_bytes=0,
+                  max_compressed_bytes=64 << 20)
+    result = host.compare_snapshots(before, after, policy, timed=timed)
+    assert result["status"] == "passed" and result["reasons"] == []
+    assert result["counter_delta_pages"]["decompressions"] == 5775 and result["compressed_bytes"] == 0
+
+
+@pytest.mark.parametrize("timed", [False, True])
 def test_swap_ins_alone_neither_refuse_nor_flag_a_run(timed):
     # Pages put out at another time come back; nothing ran short in the window.
     before, after = pair()
     after["vm_stat"]["counters"]["swapins"] += 483
-    policy = dict(normal_pressure_levels=[1], max_swapout_bytes=0, max_compression_delta_bytes=16384)
+    policy = dict(normal_pressure_levels=[1], max_swapout_bytes=0, max_compressed_bytes=16384)
     result = host.compare_snapshots(before, after, policy, timed=timed)
     assert result["status"] == "passed" and result["reasons"] == []
     assert result["counter_delta_pages"]["swapins"] == 483 and result["swapout_bytes"] == 0

@@ -170,8 +170,11 @@ one metric of one cell:
   value everywhere: 9.219 at df 3, 4.905 at 6, 3.765 at 12, 3.545 at 16, 3.122
   at 64 and 3.060 at 128 (a df between entries uses the nearest lower entry),
   and the normal value 3.0 above 128.
-- Anchor check: if `|a − h| > t·σ·√(1 + 1/n_h)`, the device has changed since the
-  baseline job, and the cell is `needs-review`.
+- Anchor check: if `|a − h| > max(ln 1.02, t·σ·√(1 + 1/n_h))`, the device has
+  changed since the baseline job, and the cell is `needs-review`. The 2% floor
+  allows the drift between jobs hours apart, which the runs of one job do not
+  show: on the RTX 5090, Muse TTFT varied 0.3% within a baseline job and its
+  in-run base differed by 1.3% some hours later.
 - The base estimate is `b`, the mean of the four history logs and `a`; the
   difference is `d = c̄ − b`, with standard error `SE = σ·√(1/3 + 1/5)`, and the
   threshold is `T = max(ln(1 + floor), t·SE)`. `floor` (1% for every metric) is
