@@ -781,3 +781,42 @@ def test_the_users_sampling_wins(tmp_path):
     assert argv[-3:] == ["--temp", "0.6", "--top-k=40"] and argv.count("--temp") == 1
     assert "--top-k" not in argv and argv[argv.index("--top-p") + 1] == "0.95"
     assert argv[argv.index("--min-p") + 1] == "0"
+
+
+def test_model_rules_reach_native_settings_without_profile_inference(tmp_path):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    rule = "fixture|off|example-uuid|deepseek41|36|2|Example GPU|1|0"
+    source = Path(spec.settings_file)
+    source.write_text(source.read_text() + "model.optimizations=" + json.dumps([rule]) + "\n")
+    resolve(inputs, spec, adapter, out)
+    # The production materialized file is the native --ssd-settings input.
+    files = list(out.glob("*.ssd"))
+    assert files
+    assert any(
+        parse(path.read_text(), str(path)).at("model.optimizations").value == (rule,)
+        for path in files
+    )
+
+
+@pytest.mark.parametrize("profile,engram", [("dsv", 1), ("muse", 0), ("qwen4exp", 0)])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_exact_rules_preserve_upstream_profile_defaults_and_cli(
+    tmp_path, profile, engram, explicit
+):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs = replace(inputs, profile=profile)
+    (Path(inputs.repo) / "engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja").write_text("t")
+    rule = "neutral|on|name:Synthetic Model|deepseek41|36|2|Synthetic GPU|-|-"
+    spec = replace(spec, overrides=spec.overrides + (("model.optimizations", json.dumps([rule])),))
+    if explicit:
+        spec = replace(spec, overrides=spec.overrides + (("model.engram_prefetch", "0"),))
+    result = resolve(inputs, spec, adapter, out)
+    assert result.code == 0
+    effective = parse((out / "settings.ssd").read_text(), overrides=spec.overrides)
+    assert effective.at("model.optimizations").value == (rule,)
+    assert effective.at("model.engram_prefetch").value == (0 if explicit else engram)
+    expected_origin = "cli" if explicit else "file" if engram else "default"
+    assert effective.at("model.engram_prefetch").origin == expected_origin
+    assert effective.at("model.hc_fused").value == 1
+    argv = list(result.argv)
+    assert argv[argv.index("--ssd-model-optimizations") + 1] == json.dumps([rule])

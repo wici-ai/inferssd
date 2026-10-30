@@ -12,7 +12,7 @@
 namespace ssd {
 namespace settings {
 
-enum class kind { integer, paths, cpus, costs, budget };
+enum class kind { integer, paths, strings, cpus, costs, budget };
 
 // The platforms a setting applies to, one bit each: the registry's scope column.
 enum platform_scope : uint32_t {
