@@ -323,9 +323,11 @@ def test_missing_or_mismatched_history_needs_review_even_for_a_large_slowdown(st
 
 
 @pytest.mark.parametrize("run", [(1, "candidate"), (1, "base"), (3, "candidate")])
-def test_any_different_token_sequence_needs_review(run):
+def test_any_different_token_sequence_is_recorded_without_review(run):
+    # Generated tokens are not yet required to match (compare.REQUIRE_SAME_TOKENS).
     cell = decide(token_change=run)
-    assert cell["status"] == "needs-review" and cell["review_reasons"] == ["generated-tokens-differ"]
+    assert cell["status"] == "passed" and cell["review_reasons"] == []
+    assert cell["output_workload"]["same_tokens"] is False and cell["output_workload"]["same_tokens_required"] is False
     # The first run is the reference; a changed first run differs from every other run.
     assert cell["output_workload"]["reference_run"] == "r1/candidate"
     # The history's tokens match the unchanged runs, so they differ from a changed reference too.
@@ -335,17 +337,17 @@ def test_any_different_token_sequence_needs_review(run):
     assert all(item.get("first_difference_one_based", 101) == 101 for item in cell["output_workload"]["differences"])
 
 
-def test_history_token_sequence_differences_need_review():
+def test_history_token_sequence_differences_are_recorded_without_review():
     other = list(TOKENS)
     other[5] = 3
     cell = decide(None, [record(tokens=other)])
-    assert cell["status"] == "needs-review" and cell["review_reasons"] == ["generated-tokens-differ"]
+    assert cell["status"] == "passed" and cell["review_reasons"] == []
     assert cell["output_workload"]["differences"][0]["run"] == "baseline-history"
 
 
 def test_regression_keeps_other_review_reasons_visible():
-    cell = decide(candidates(scaled(0.10)), token_change=(2, "candidate"))
-    assert cell["status"] == "regressed" and cell["review_reasons"] == ["generated-tokens-differ"]
+    cell = decide(candidates(scaled(0.10)), environment=dict(status="needs-review", reasons=["r2/candidate:swapout-activity"]))
+    assert cell["status"] == "regressed" and cell["review_reasons"] == ["host:r2/candidate:swapout-activity"]
 
 
 @pytest.mark.parametrize("slowdown", [False, True])
@@ -429,8 +431,8 @@ def test_baseline_job_reports_four_values_and_sigma_after_adding_its_record():
     assert joined["df"] == 6 and joined["sigma_log"] > entry["sigma_log"]
 
 
-def test_baseline_job_with_different_tokens_or_a_host_flag_needs_review():
-    assert baseline_cell(token_change=(3, "candidate"))["status"] == "needs-review"
+def test_baseline_job_with_a_host_flag_needs_review_and_different_tokens_do_not():
+    assert baseline_cell(token_change=(3, "candidate"))["status"] == "baseline"
     flagged = baseline_cell(environment=dict(status="needs-review", reasons=["r2/candidate:swap-activity"]))
     assert flagged["status"] == "needs-review" and flagged["review_reasons"] == ["host:r2/candidate:swap-activity"]
 
@@ -582,14 +584,15 @@ def store(root, records):
 
 
 def test_history_tool_ingests_verified_baseline_cells_and_skips_others(tmp_path):
-    flagged = baseline_row("deepseek", token_change=(2, "candidate"))
+    flagged = baseline_row("deepseek", environment=dict(status="needs-review", reasons=["r2/candidate:swapout-activity"]))
     report = report_for([baseline_row(), flagged, dict(device="dgx-spark", model="muse", status="deferred-not-in-this-run",
                                                          performance="deferred-not-in-this-run")])
     records, skipped, machine = history.records_from_report(
         report, device="cloud-5090", job_id="f" * 32, commit=BASE, run_id=12, run_attempt=1,
         measured_at="2026-10-29T08:00:00Z")
     assert [item["model"] for item in records] == ["muse"]
-    assert skipped == [dict(cell="cloud-5090/deepseek/512", status="needs-review", reasons=["generated-tokens-differ"])]
+    assert skipped == [dict(cell="cloud-5090/deepseek/512", status="needs-review",
+                            reasons=["host:r2/candidate:swapout-activity"])]
     value = records[0]
     assert [run["metrics"]["decode_tps"] for run in value["runs"]] == pytest.approx([10.0 * f for f in SPREAD])
     assert value["build"] == BUILD and value["conditions_sha256"] == CONDITIONS and value["run_id"] == 12

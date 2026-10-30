@@ -617,12 +617,12 @@ def test_summary_renders_mac_host_conditions_per_run_without_excusing_slowdown(f
     base = dict(schema_version=1, policy=dict(pair_free_tolerance_bytes=1 << 30),
         quiet=dict(status="passed"), cleanup=dict(status="passed"),
         prelaunch_available_bytes=38 * (1 << 30) + (1 << 29),
-        timed=dict(status="passed", reasons=[], swap_delta_bytes=0, compression_delta_bytes=2 << 20,
+        timed=dict(status="passed", reasons=[], swapout_bytes=0, compression_delta_bytes=2 << 20,
             process_activity=dict(non_ci_cpu_cores=0.125), memory_pressure_levels=[1, 1]))
     other = copy.deepcopy(base)
     other["prelaunch_available_bytes"] = 38 << 30
     other["timed"].update(status="flagged" if flagged else "passed",
-        reasons=["swap-activity|<diagnosis>\nretain"] if flagged else [], swap_delta_bytes=3 << 20,
+        reasons=["swapout-activity|<diagnosis>\nretain"] if flagged else [], swapout_bytes=3 << 20,
         compression_delta_bytes=80 << 20, process_activity=dict(non_ci_cpu_cores=0.375),
         memory_pressure_levels=[1, 2])
     runs = {"r1/candidate": base, "r1/base": copy.deepcopy(base), "r2/candidate": other, "r3/candidate": copy.deepcopy(base)}
@@ -634,11 +634,11 @@ def test_summary_renders_mac_host_conditions_per_run_without_excusing_slowdown(f
         execution_devices=["local-mbp"], cells=[dict(device="local-mbp", model="muse", status=entry["status"],
             functional="passed", numerical="passed", performance=[dict(tier="512", **entry)])])
     text = summary(report)
-    assert "Quiet available GiB" in text and "Timed swap Δ MiB" in text and "Non-CI CPU cores" in text
+    assert "Quiet available GiB" in text and "Timed swap-out MiB" in text and "Non-CI CPU cores" in text
     assert "| muse | 512 | r1/base | 38.5000 | 0.0000 | 2.0000 | 0.1250 | 1 → 1 | passed |" in text
     assert "| muse | 512 | r2/candidate | 38.0000 | 3.0000 | 80.0000 | 0.3750 | 1 → 2 |" in text
     if flagged:
-        assert "muse/512 environment: needs-review; reasons: r2/candidate:swap-activity\\|&lt;diagnosis&gt; retain." in text
+        assert "muse/512 environment: needs-review; reasons: r2/candidate:swapout-activity\\|&lt;diagnosis&gt; retain." in text
         assert "<diagnosis>" not in text
     else:
         assert "muse/512 environment: passed; reasons: none." in text

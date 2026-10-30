@@ -124,7 +124,7 @@ def test_new_mode_never_runs_4k_and_runs_each_planned_arm_once_candidate_first(t
     assert len(sessions) == 1 and sessions[0].closed
 
 
-def test_needs_review_retains_every_arm_and_completes_the_other_cell(tmp_path, monkeypatch):
+def test_a_token_difference_is_recorded_and_every_arm_retained(tmp_path, monkeypatch):
     args, config, manifest, _, events, sessions = setup(tmp_path, monkeypatch, change=performance)
 
     def diverged(path, *args):
@@ -134,12 +134,14 @@ def test_needs_review_retains_every_arm_and_completes_the_other_cell(tmp_path, m
         return value
 
     monkeypatch.setattr(execution.run_final, "read_result", diverged)
-    assert execution.run(args) == 1
+    assert execution.run(args) == 0
     report = load(args.output / "integration.json")
-    assert report["status"] == "needs-review" and report["cleanup_confirmed"]
+    assert report["status"] == "passed" and report["cleanup_confirmed"]
     assert len(report["cells"]) == 2
     deepseek, muse = (cell["performance"][0] for cell in report["cells"])
-    assert deepseek["status"] == "needs-review" and deepseek["review_reasons"] == ["generated-tokens-differ"]
+    # Generated tokens are not yet required to match (compare.REQUIRE_SAME_TOKENS).
+    assert deepseek["status"] == "passed" and deepseek["review_reasons"] == []
+    assert deepseek["output_workload"]["same_tokens"] is False
     assert deepseek["output_workload"]["differences"] == [dict(
         run="r3/candidate", first_difference_one_based=65, reference_token=11, token=99)]
     assert muse["status"] == "passed"
