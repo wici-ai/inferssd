@@ -192,4 +192,4 @@ python3 engine/tools/expert-pack/create-moe-expert-pack.py --inspect -o /path/to
 
 To launch with the pack, set `expert.source = ["/path/to/model.expert-pack"]` in the settings file. The v1 format records no checkpoint fingerprint, so rebuild the pack whenever the shards change.
 
-Open **http://127.0.0.1:8080** after the server is ready, or [connect an API client](../README.md#use-it-with-your-tools). Stop the owned launcher with **Ctrl+C**.
+Open **http://127.0.0.1:8080** after the server is ready, or point an OpenAI-compatible client at `http://127.0.0.1:8080/v1`. Stop the owned launcher with **Ctrl+C**.
