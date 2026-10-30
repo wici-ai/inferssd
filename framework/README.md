@@ -66,6 +66,12 @@ choices left out because they contradicted them. The server keeps one context
 checkpoint (`--ctx-checkpoints 1`) unless you set `--ctx-checkpoints` or
 `LLAMA_ARG_CTX_CHECKPOINTS`.
 
+The model profile (chat template and model settings) follows the GGUF's
+`general.architecture`; `--profile` overrides it. The `dsv` profile also sets
+DeepSeek-V4.1's own sampling defaults (`--temp 1.0 --top-p 0.95 --top-k 0
+--min-p 0`), which a request's own values or your extra server arguments
+replace.
+
 The prompt cache lives on disk, one directory per model under
 `inferssd/prompts` in your user cache directory, and survives restarts
 (`--cache-disk`, 16 GiB per model); `--prompt-cache DIR` moves it and

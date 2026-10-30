@@ -565,6 +565,7 @@ def launch_arguments(tmp_path, *extra):
     facts = tmp_path / "facts.json"
     facts.write_text(json.dumps(host))
     words = ["launch", "--platform", "linux", "--repo", inputs.repo, "--model", spec.model]
+    words += ["--profile", "muse"]
     words += ["--binary", spec.binary, "--settings", spec.settings_file]
     words += ["--runtime-policy", str(contract), "--output-dir", str(out)]
     return words + list(extra), facts, out
