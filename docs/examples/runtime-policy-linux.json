@@ -3,10 +3,6 @@
   "lock_path": "/tmp/inferssd.lock",
   "stop_path": "/tmp/inferssd.stop",
   "memory_budget_bytes": 17179869184,
-  "host_reserve_bytes": 3221225472,
   "minimum_memlock_bytes": 0,
-  "max_compressor_growth_bytes": 0,
-  "max_swap_growth_bytes": 0,
-  "runtime_seconds": 86400,
   "cleanup_seconds": 30
 }

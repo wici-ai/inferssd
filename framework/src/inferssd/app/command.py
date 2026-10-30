@@ -5,20 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import subprocess
 import sys
 import uuid
-from dataclasses import asdict
 from pathlib import Path
 
 from inferssd.app.hub import download, selection
 from inferssd.launch import typed_command
 from inferssd.launch.resources import read_resources
 from inferssd.platform.policy import Policy
-
-GIB = 1024**3
 
 
 def data_directory() -> Path:
@@ -43,8 +39,6 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
         parser.add_argument(
             "--runtime-policy", type=Path, help="override the automatic memory policy"
         )
-        parser.add_argument("--memory-gib", type=float, help="server RAM budget in GiB")
-        parser.add_argument("--runtime-seconds", type=int, default=86400, help="default: 24 hours")
         parser.add_argument("--port", type=int, default=8080)
         parser.add_argument("--context", type=int, default=8192)
         parser.add_argument("--settings", type=Path)
@@ -65,24 +59,16 @@ def physical_memory() -> int:
     raise ValueError("cannot read system RAM; provide --runtime-policy")
 
 
-def default_policy(total: int, budget: int, state: Path, seconds: int) -> Policy:
-    reserve = max(2 * GIB, total // 5)
-    if budget <= 0 or budget > total - reserve:
-        raise ValueError("server RAM budget must leave at least 2 GiB / 20% for the host")
-    return Policy.read(
-        {
-            "platform": sys.platform,
-            "lock_path": str(state / "runtime.lock"),
-            "stop_path": str(state / "runtime.stop"),
-            "memory_budget_bytes": budget,
-            "host_reserve_bytes": reserve,
-            "minimum_memlock_bytes": 0,
-            "max_compressor_growth_bytes": 0,
-            "max_swap_growth_bytes": 0,
-            "runtime_seconds": seconds,
-            "cleanup_seconds": 30,
-        }
-    )
+def default_policy(state: Path) -> dict[str, object]:
+    """The whole machine: the engine uses what is available and keeps its own margin."""
+    return {
+        "platform": sys.platform,
+        "lock_path": str(state / "runtime.lock"),
+        "stop_path": str(state / "runtime.stop"),
+        "memory_budget_bytes": physical_memory(),
+        "minimum_memlock_bytes": 0,
+        "cleanup_seconds": 30,
+    }
 
 
 def run(args: argparse.Namespace) -> int:
@@ -91,16 +77,12 @@ def run(args: argparse.Namespace) -> int:
 
     if sys.platform not in ("linux", "darwin"):
         raise ValueError("cli and serve currently support Linux CUDA and Apple Silicon macOS")
-    if not 1 <= args.port <= 65535 or args.context < 1 or args.runtime_seconds < 1:
-        raise ValueError("port must be 1..65535; context and runtime-seconds must be positive")
+    if not 1 <= args.port <= 65535 or args.context < 1:
+        raise ValueError("port must be 1..65535; context must be positive")
     if args.command == "cli" and args.max_tokens < 1:
         raise ValueError("max-tokens must be positive")
     if args.machine and args.reprofile:
         raise ValueError("choose --machine or --reprofile")
-    if args.runtime_policy and args.memory_gib is not None:
-        raise ValueError("choose --runtime-policy or --memory-gib")
-    if args.memory_gib is not None and not math.isfinite(args.memory_gib):
-        raise ValueError("memory-gib must be a finite positive number")
     resources = args.resources or Path(
         os.environ.get("INFERSSD_RESOURCES", data_directory() / "current/engine-resources.json")
     )
@@ -118,26 +100,12 @@ def run(args: argparse.Namespace) -> int:
     state.mkdir(parents=True, exist_ok=True)
     if args.runtime_policy:
         policy_path = args.runtime_policy.resolve()
-        policy = Policy.read(json.loads(policy_path.read_text()))
-        if policy.platform != sys.platform:
+        if Policy.read(json.loads(policy_path.read_text())).platform != sys.platform:
             raise ValueError("runtime policy platform differs from this host")
     else:
-        total = physical_memory()
-        budget = (
-            int(args.memory_gib * GIB)
-            if args.memory_gib is not None
-            else total - max(2 * GIB, total // 5)
-        )
-        policy = default_policy(total, budget, state, args.runtime_seconds)
         policy_path = state / ("policy-" + uuid.uuid4().hex + ".json")
         # Keep the policy alongside launch receipts for reproducibility.
-        policy_path.write_text(json.dumps(asdict(policy), indent=2) + "\n")
-    print(
-        f"Server RAM budget: {policy.memory_budget_bytes / GIB:.1f} GiB; "
-        f"host reserve: {policy.host_reserve_bytes / GIB:.1f} GiB; "
-        f"time limit: {policy.runtime_seconds}s. Override with --runtime-policy.",
-        file=sys.stderr,
-    )
+        policy_path.write_text(json.dumps(default_policy(state), indent=2) + "\n")
     if args.hf_repo:
         selection(args.hf_repo)
         model = download(args.hf_repo, args.revision, args.model_dir.expanduser().resolve())

@@ -10,7 +10,7 @@ Both platforms use the `main` branch of `wici-ai/inferssd`. Use the
 
 ## Before you start
 
-- Install Git, CMake, Ninja, a C/C++ compiler, and Python 3.9 or later. macOS also needs Xcode's command-line tools and Metal compiler; Linux needs a compatible CUDA toolkit and `liburing` development files.
+- Install Git, CMake, Ninja, a C/C++ compiler, and Python 3.9 or later. macOS also needs the Xcode Command Line Tools; Linux needs a compatible CUDA toolkit and `liburing` development files.
 - Choose a [tested GGUF checkpoint](../README.md#models). `cli -hf` and `serve -hf` download all shards of its tested quantization. For manual `launch`, obtain a complete local copy and keep all shards together.
 - Plan storage for the checkpoint. The benchmarked DeepSeek GGUF files take about **473 GiB**; an optional DeepSeek expert pack adds about **269 GiB**, and a Muse pack about **450 GiB**. The framework can index GGUF experts directly, so a pack is optional and must match its source checkpoint.
 - Choose CPU, cache and process-memory budgets for your machine. The README benchmark settings describe their recorded runs, not universal deployment defaults.
@@ -23,7 +23,7 @@ curl -LsSf https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/insta
 
 This is a source installer, not a prebuilt binary release. It checks for a C/C++
 compiler, Git, Python 3.9+ with `venv`, and the platform toolchain. On macOS,
-`xcrun --find metal` must work; on Linux, provide `nvcc` on PATH, under
+the Xcode Command Line Tools must be installed; on Linux, provide `nvcc` on PATH, under
 `/usr/local/cuda`, or through `CUDACXX`, and install `liburing` headers.
 The [Linux runtime requirements](#linux-requirements) still apply.
 
@@ -63,14 +63,10 @@ partially downloaded shard may require more free space than its remaining bytes.
 The source alias index references the GGUF payloads without an extra expert pack.
 
 Both commands use `inferssd launch`'s owned runtime, machine measurement, model
-profile selection and chat templates. By default, the process memory budget is
-total system RAM minus the larger of **2 GiB or 20%** reserved for the host.
-This is a starting resource limit, not a benchmark configuration or a guarantee
-that every machine has enough memory. `--memory-gib` lowers the budget; supply
-`--runtime-policy FILE` for an explicit policy, including a larger custom budget.
-The automatic policy forbids compressor/swap growth on macOS and limits the
-session to **24 hours**; change the time limit with `--runtime-seconds`.
-The existing runtime enforces its resource guards and Linux cgroup requirements.
+profile selection and chat templates. They need no memory settings: the engine
+uses the memory it finds available and keeps its own margin for the host. For an
+explicit budget, supply `--runtime-policy FILE`. The runtime enforces its Linux
+cgroup requirements.
 
 Use `--context`, `--settings`, `--set`, `--machine` and `--reprofile` to override
 launch choices. `--resources` selects a manually built engine descriptor. The
@@ -164,13 +160,13 @@ The first launch on a machine starts by measuring it: CPUs, memory, GPUs and the
 
    Pass your own file with `--settings settings.ssd`.
 
-2. Copy the example runtime policy for your platform, then set `memory_budget_bytes` and `host_reserve_bytes` for your machine:
+2. Copy the example runtime policy for your platform, then set `memory_budget_bytes` for your machine:
 
    ```sh
    cp docs/examples/runtime-policy-linux.json runtime-policy.json   # macOS: runtime-policy-darwin.json
    ```
 
-   The launcher stops the server after `runtime_seconds`. On macOS it also stops the server if memory-compressor or swap use grows beyond the policy's limits. The [owned runtime guide](../framework/README.md#explicit-owned-server-execution) describes every field.
+   The [owned runtime guide](../framework/README.md#explicit-owned-server-execution) describes every field.
 
 3. Replace every `/path/to/` placeholder below. Each launch writes its logs and receipts to a new directory, `runs/<UTC time>` under the current directory; pass `--output-dir` to choose another new directory.
 

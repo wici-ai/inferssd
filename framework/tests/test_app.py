@@ -6,7 +6,6 @@ from __future__ import annotations
 import io
 import json
 import sys
-from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,6 +14,7 @@ import pytest
 from inferssd.app import chat, command, hub
 from inferssd.cli import main
 from inferssd.engine import command as engine_command
+from inferssd.platform.policy import Policy
 
 
 def test_tested_quantizations_and_shards():
@@ -78,6 +78,14 @@ def test_download_pins_revision_and_reuses_local_files(tmp_path, fake_hub, monke
     api.model_info.assert_called_with(repo, revision="main", files_metadata=True)
 
 
+def test_a_new_commit_keeps_the_model_directory(tmp_path, fake_hub):
+    api, _ = fake_hub
+    repo = next(iter(hub.MODELS))
+    first = hub.download(repo, "main", tmp_path)
+    api.model_info.return_value.sha = "b" * 40
+    assert hub.download(repo, "main", tmp_path) == first
+
+
 @pytest.mark.parametrize("commit", [None, 123, "main", "../invalid"])
 def test_download_requires_a_commit_string(tmp_path, fake_hub, commit):
     api, snapshot = fake_hub
@@ -112,7 +120,7 @@ def ready_app(tmp_path, monkeypatch):
             platform="darwin",
         ),
     )
-    monkeypatch.setattr(command, "physical_memory", lambda: 48 * command.GIB)
+    monkeypatch.setattr(command, "physical_memory", lambda: 48 << 30)
     monkeypatch.setattr(sys, "platform", "darwin")
     model = tmp_path / "model.gguf"
     model.write_bytes(b"GGUF")
@@ -122,13 +130,13 @@ def ready_app(tmp_path, monkeypatch):
 def test_serve_reuses_owned_launch_and_policy(ready_app, monkeypatch):
     launch = Mock(return_value=0)
     monkeypatch.setattr(command.typed_command, "run", launch)
-    assert main(["serve", "-m", str(ready_app), "--port", "8181", "--memory-gib", "24"]) == 0
+    assert main(["serve", "-m", str(ready_app), "--port", "8181"]) == 0
     args = launch.call_args.args[0]
     assert args.execute and args.model == ready_app
     assert args.port == 8181
     policy = json.loads(args.runtime_policy.read_text())
-    assert policy["memory_budget_bytes"] == 24 * command.GIB
-    assert policy["host_reserve_bytes"] >= 2 * command.GIB
+    assert policy["memory_budget_bytes"] == 48 << 30
+    assert "host_reserve_bytes" not in policy and "runtime_seconds" not in policy
     assert not args.output_dir.exists()  # owned runtime reserves it
 
 
@@ -158,26 +166,27 @@ def test_missing_engine_fails_before_download(tmp_path, monkeypatch):
     download.assert_not_called()
 
 
-def test_invalid_budget_fails_before_download(ready_app, monkeypatch):
-    download = Mock()
-    monkeypatch.setattr(command, "download", download)
-    with pytest.raises(SystemExit):
-        main(["serve", "-hf", next(iter(hub.MODELS)), "--memory-gib", "48"])
-    download.assert_not_called()
+def test_default_policy_leaves_memory_to_the_engine(tmp_path):
+    policy = Policy.read(command.default_policy(tmp_path))
+    assert policy.memory_budget_bytes == command.physical_memory()
+    assert policy.host_reserve_bytes is None
+    assert policy.max_compressor_growth_bytes is None
+    assert policy.max_swap_growth_bytes is None
+    assert policy.runtime_seconds is None
 
 
 @pytest.mark.parametrize("outcome", [0, RuntimeError("request failed"), KeyboardInterrupt()])
 def test_session_always_stops_owned_server(tmp_path, monkeypatch, outcome):
-    policy = command.default_policy(48 * command.GIB, 24 * command.GIB, tmp_path, 86400)
+    policy = command.default_policy(tmp_path)
     path = tmp_path / "policy.json"
-    path.write_text(json.dumps(asdict(policy)))
+    path.write_text(json.dumps(policy))
     args = SimpleNamespace(
         result=None,
         host_facts=None,
         runtime_policy=path,
         output_dir=tmp_path / "run",
         port=8080,
-        platform=policy.platform,
+        platform=policy["platform"],
         machine=None,
         reprofile=False,
     )

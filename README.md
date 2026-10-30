@@ -117,7 +117,7 @@ no separate expert pack is needed. Terminal chat and API serving use the same
 owned SSD runtime. Stop with **Ctrl+C** (or `/exit` in chat).
 
 See [one-command installation](docs/quickstart.md#one-command-installation) for
-local models, memory limits, authentication, upgrades and uninstalling. The
+local models, authentication, upgrades and uninstalling. The
 source-build instructions remain available for either platform:
 
 | Platform | Branch | Setup |

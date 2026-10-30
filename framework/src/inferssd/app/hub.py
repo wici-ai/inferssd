@@ -79,7 +79,9 @@ def download(reference: str, revision: str, root: Path) -> Path:
         }
         if any(name not in sizes for name in files):
             raise ValueError("Hugging Face did not return the size of every GGUF shard")
-        directory = root / repo.replace("/", "--") / commit
+        # One directory per repository: the Hub client compares each file with its
+        # metadata, so a commit that leaves a shard unchanged does not fetch it again.
+        directory = root / repo.replace("/", "--")
         directory.mkdir(parents=True, exist_ok=True)
         missing = sum(
             sizes[name]

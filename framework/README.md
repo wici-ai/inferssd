@@ -392,8 +392,10 @@ inferssd launch --execute --platform linux --repo /path/to/inferssd \
   --port 8080 -- --seed 17
 ```
 
-A policy has exactly these fields; values below illustrate the format, not a
-recommended budget for any model or machine:
+A policy has these fields; values below illustrate the format, not a recommended
+budget for any model or machine. `host_reserve_bytes`, `max_compressor_growth_bytes`,
+`max_swap_growth_bytes` and `runtime_seconds` are optional measurement conditions:
+left out, they are not checked.
 
 ```json
 {
@@ -419,7 +421,8 @@ needs no pinned-memory minimum. This command never raises system limits.
 
 Darwin uses `platform: "darwin"`, explicit `--profile`/`--model` and the same typed
 settings snapshot. Its budget is a **sampled soft server RSS threshold**,
-with host free-plus-inactive memory, compressor and swap growth checks. It is
+with host free-plus-inactive memory, compressor and swap growth checks when the
+policy declares them. It is
 not a cgroup or a hard unified-memory cap. Both platforms monitor while the
 server runs, and fail the execution if a threshold or the worker fails. Host
 utility calls have a ten-second timeout. These checks do not replace per-host

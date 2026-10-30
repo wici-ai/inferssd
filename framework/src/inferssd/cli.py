@@ -111,17 +111,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except KeyboardInterrupt:
             return 130
         except (OSError, ValueError, RuntimeError) as error:
-            parser.error(str(error))
+            parser.exit(2, f"inferssd: {error}\n")
     if args.command == "launch":
         try:
             return run_typed_launch(args)
         except (OSError, ValueError, RuntimeError) as error:
-            parser.error(str(error))
+            parser.exit(2, f"inferssd: {error}\n")
     if args.command == "launch-recorded":
         try:
             return run_launch(args)
         except (OSError, ValueError, RuntimeError) as error:
-            parser.error(str(error))
+            parser.exit(2, f"inferssd: {error}\n")
     if args.command == "configuration":
         try:
             return run_configuration(args)

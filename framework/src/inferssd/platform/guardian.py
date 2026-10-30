@@ -35,7 +35,7 @@ def guard_worker(
     argv: Sequence[str],
     environment: Mapping[str, str],
     lock_fd: int,
-    deadline_s: float,
+    deadline_s: Optional[float],
     *,
     effects: GuardianEffects,
     cleanup_confirmed: Callable[[Path], bool],
@@ -76,7 +76,7 @@ def guard_worker(
         s: signal.signal(s, lambda n, _f: signals.append(n))
         for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
     }
-    deadline = time.monotonic() + deadline_s
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
     try:
         with (out / "guardian.log").open("xb") as log:
             worker = subprocess.Popen(
@@ -97,7 +97,7 @@ def guard_worker(
                 failure
                 or signals
                 or (interrupted is not None and interrupted())
-                or time.monotonic() > deadline
+                or (deadline is not None and time.monotonic() > deadline)
             ):
                 failure = failure or "guardian interrupted or timed out"
                 if not asked_stop:
