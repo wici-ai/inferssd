@@ -2,6 +2,7 @@
 """Exercise the piped installer with a synthetic toolchain, never compiling a model."""
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -106,6 +107,11 @@ def test_mac_asks_for_the_command_line_tools(installation):
     )
     assert result.returncode != 0
     assert "xcode-select --install" in result.stderr
+
+
+def test_release_workflow_can_pin_the_installer():
+    # .github/workflows/release.yml rewrites exactly this line to the tag.
+    assert re.search(r"^DEFAULT_REF=main$", INSTALLER.read_text(), re.M)
 
 
 def test_install_help_needs_no_toolchain():

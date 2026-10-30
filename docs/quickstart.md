@@ -18,7 +18,7 @@ Both platforms use the `main` branch of `wici-ai/inferssd`. Use the
 ## One-command installation
 
 ```sh
-curl -LsSf https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
+curl -LsSf https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 ```
 
 This is a source installer, not a prebuilt binary release. It checks for a C/C++

@@ -1,7 +1,10 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
-# Usage: curl -LsSf https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
+# Usage: curl -LsSf https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 set -eu
+
+# The release workflow replaces this with the tag it publishes.
+DEFAULT_REF=main
 
 die() { printf 'inferssd: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "Install $1 first. See docs/quickstart.md."; }
@@ -19,7 +22,7 @@ CMake, Ninja and the Python framework are installed in a private environment.
 Environment:
   INFERSSD_HOME         Installation and model root (default: ~/.local/share/inferssd)
   INFERSSD_BIN_DIR      Command directory (default: ~/.local/bin)
-  INFERSSD_REF          Branch or tag to build (default: main)
+  INFERSSD_REF          Branch or tag to build (default: this installer's release)
   INFERSSD_JOBS         Build parallelism (default: 4)
   CUDACXX              CUDA compiler, if nvcc is not on PATH
 
@@ -72,7 +75,7 @@ EOF
     trap 'exit 130' INT
     trap 'exit 143' TERM
     printf 'Building InferSSD (%s). This may take several minutes.\n' "$preset"
-    git clone --depth 1 --branch "${INFERSSD_REF:-main}" \
+    git clone --depth 1 --branch "${INFERSSD_REF:-$DEFAULT_REF}" \
         https://github.com/wici-ai/inferssd.git "$release/source"
     python3 -m venv "$release/venv"
     py="$release/venv/bin/python"
