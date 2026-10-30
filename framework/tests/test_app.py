@@ -78,6 +78,15 @@ def test_download_pins_revision_and_reuses_local_files(tmp_path, fake_hub, monke
     api.model_info.assert_called_with(repo, revision="main", files_metadata=True)
 
 
+@pytest.mark.parametrize("commit", [None, 123, "main", "../invalid"])
+def test_download_requires_a_commit_string(tmp_path, fake_hub, commit):
+    api, snapshot = fake_hub
+    api.model_info.return_value.sha = commit
+    with pytest.raises(ValueError, match="pinned commit"):
+        hub.download(next(iter(hub.MODELS)), "main", tmp_path)
+    snapshot.assert_not_called()
+
+
 def test_download_never_launches_with_partial_shards(tmp_path, fake_hub):
     _, snapshot = fake_hub
     snapshot.side_effect = lambda **_: None

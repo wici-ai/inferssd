@@ -67,7 +67,8 @@ def download(reference: str, revision: str, root: Path) -> Path:
         raise ValueError('Hugging Face support requires: pip install "inferssd[hf]"') from error
     try:
         info = HfApi().model_info(repo, revision=revision, files_metadata=True)
-        if not info.sha or not re.fullmatch(r"[0-9a-f]{40,64}", info.sha):
+        commit: object = info.sha
+        if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40,64}", commit):
             raise ValueError("Hugging Face did not return a pinned commit")
         siblings = info.siblings or []
         files = select_files([item.rfilename for item in siblings], quant)
@@ -78,7 +79,7 @@ def download(reference: str, revision: str, root: Path) -> Path:
         }
         if any(name not in sizes for name in files):
             raise ValueError("Hugging Face did not return the size of every GGUF shard")
-        directory = root / repo.replace("/", "--") / info.sha
+        directory = root / repo.replace("/", "--") / commit
         directory.mkdir(parents=True, exist_ok=True)
         missing = sum(
             sizes[name]
@@ -97,7 +98,7 @@ def download(reference: str, revision: str, root: Path) -> Path:
         # client resumes interrupted transfers and verifies its download metadata.
         snapshot_download(
             repo_id=repo,
-            revision=info.sha,
+            revision=commit,
             allow_patterns=files,
             local_dir=directory,
             max_workers=2,
