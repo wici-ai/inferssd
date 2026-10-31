@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import statistics
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
@@ -90,18 +89,16 @@ def locate(
     build: Optional[Path] = None,
     *,
     suffix: str = "",
-    which: Callable[[str], Optional[str]] = shutil.which,
     is_file: Callable[[str], bool] = os.path.isfile,
 ) -> dict[str, str]:
-    """Probe executables by name, from a resource descriptor, a build directory or PATH."""
+    """Probe executables by name, from a resource descriptor or a build directory."""
     if resources is not None:
         named = dict(read_resources(resources).probes)
         return {name: named[name] for name in EXECUTABLES if name in named}
-    if build is not None:
-        paths = {name: str(build / "bin" / (exe + suffix)) for name, exe in EXECUTABLES.items()}
-        return {name: path for name, path in paths.items() if is_file(path)}
-    found = {name: which(exe + suffix) for name, exe in EXECUTABLES.items()}
-    return {name: path for name, path in found.items() if path}
+    if build is None:
+        return {}
+    paths = {name: str(build / "bin" / (exe + suffix)) for name, exe in EXECUTABLES.items()}
+    return {name: path for name, path in paths.items() if is_file(path)}
 
 
 LATENCY = record(
@@ -232,10 +229,7 @@ class Probes:
     def run(self, name: str, arguments: Sequence[str]) -> Any:
         path = dict(self.paths).get(name)
         if path is None:
-            raise ProbeError(
-                f"{EXECUTABLES[name]} not found; pass --build DIR or --resources FILE, "
-                "or put it on PATH"
-            )
+            raise ProbeError(f"{EXECUTABLES[name]} not found; pass --build DIR or --resources FILE")
         hidden = HIDDEN.get(name, ())
         env = {key: value for key, value in self.environ.items() if key not in hidden}
         result = self.runner([path, *arguments], TIMEOUT_S[name], env)

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from inferssd.contracts import ContractError
+from inferssd.launch.resources import installed_resources
 from inferssd.machine.characteristics import (
     BASE_SECTIONS,
     STORAGE_PREFIX,
@@ -161,9 +162,12 @@ def run(
     suffix = ".exe" if host.platform() == "windows" else ""
     resources = args.resources
     if resources is None and args.build is None:
-        installed = environ.get("INFERSSD_RESOURCES")
-        if installed:
-            resources = Path(installed)
+        resources = installed_resources(environ, home)
+        if not resources.is_file():
+            raise ValueError(
+                "engine not installed; run scripts/install.sh "
+                "or pass --build DIR or --resources FILE"
+            )
     probes = Probes(
         tuple(locate(resources, args.build, suffix=suffix).items()), runner or run_process
     )

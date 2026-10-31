@@ -162,8 +162,7 @@ def test_locate_from_resources_build_and_path(tmp_path):
     expected = {"ssd": bin_dir / "inferssd-ssdprobe", "cpu": bin_dir / "inferssd-cpuprobe"}
     assert locate(descriptor) == {name: str(path.resolve()) for name, path in expected.items()}
     assert locate(build=tmp_path / "build") == {name: str(path) for name, path in expected.items()}
-    found = {"inferssd-memprobe": "/usr/local/bin/inferssd-memprobe"}
-    assert locate(which=found.get) == {"memory": "/usr/local/bin/inferssd-memprobe"}
+    assert locate() == {}
 
 
 @pytest.mark.parametrize("name", ["ssd", "cpu", "memory"])
