@@ -118,3 +118,7 @@ External runtime dependencies
 
 liburing is not vendored. Binary distributions must comply with its selected
 license (the MIT option is available) and the NVIDIA CUDA runtime terms.
+
+The backend-resident invariant rotation mechanism is adapted from ggml-org/llama.cpp
+PR #31073 by anton-iermolenko, revision 6709ef11e6c7854bc4ec4705a8c2584ed36ce102.
+The upstream implementation is covered by llama.cpp's MIT license.

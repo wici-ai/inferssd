@@ -57,6 +57,9 @@ def test_registry_generated_schema_exact(native_contract):
     "platform,text",
     [
         ("linux", "inferssd-settings 1\n"),
+        ("linux", "inferssd-settings 1\nmodel.kv_rotation_resident=0\n"),
+        ("darwin", "inferssd-settings 1\nmodel.kv_rotation_resident=1\n"),
+        ("windows", "inferssd-settings 1\nmodel.kv_rotation_resident=0\n"),
         (
             "linux",
             "inferssd-settings 1\ncpu.io_cpus=2-4 # source=measured\ncpu.decode_participants=3\n"
@@ -98,6 +101,8 @@ def test_cpp_python_snapshot_exact(native_contract, tmp_path, platform, text):
 @pytest.mark.parametrize(
     "body",
     [
+        "model.kv_rotation_resident=2",
+        "model.kv_rotation_resident=-1",
         "cpu.threads=4",
         "cpu.compute_cpus=0-2",
         'cpu.decode_participants="4"',
