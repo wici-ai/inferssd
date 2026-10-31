@@ -118,3 +118,11 @@ External runtime dependencies
 
 liburing is not vendored. Binary distributions must comply with its selected
 license (the MIT option is available) and the NVIDIA CUDA runtime terms.
+
+CUDA stable replay recapture
+---------------------------
+
+The guarded immediate-recapture mechanism and replay/topology tracking are
+adapted from Joel Fernandes (NVIDIA), llama.cpp PR 29768, revision
+d29d23401af6b9648afdd1b2bf9be0154c1e6391 (MIT; engine/LICENSE). InferSSD
+adds context-owned architecture scope and preserves its phase cache and OOM recovery.

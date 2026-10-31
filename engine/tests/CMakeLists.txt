@@ -936,3 +936,9 @@ if(TARGET ggml-ssd-c0-store AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # The fixed extraction reference is test-only and never a production input.
     add_subdirectory(ssd/fixtures/c0-store ${CMAKE_CURRENT_BINARY_DIR}/ssd-store)
 endif()
+
+# Model-free orchestration policy, available even without the CUDA toolkit.
+add_executable(test-cuda-recapture test-cuda-recapture.cpp)
+target_include_directories(test-cuda-recapture PRIVATE ../src ../ggml/include ../ggml/src/ggml-cuda)
+add_test(NAME cuda_recapture COMMAND test-cuda-recapture)
+set_property(TEST cuda_recapture APPEND PROPERTY LABELS unit)
