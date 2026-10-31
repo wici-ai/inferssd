@@ -159,8 +159,13 @@ def run(
             emit(line)
         return 0
     suffix = ".exe" if host.platform() == "windows" else ""
+    resources = args.resources
+    if resources is None and args.build is None:
+        installed = environ.get("INFERSSD_RESOURCES")
+        if installed:
+            resources = Path(installed)
     probes = Probes(
-        tuple(locate(args.resources, args.build, suffix=suffix).items()), runner or run_process
+        tuple(locate(resources, args.build, suffix=suffix).items()), runner or run_process
     )
     with exclusive(path):
         try:
