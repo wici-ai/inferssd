@@ -549,6 +549,21 @@ struct kimi_cpu_sink {
     bool margin_boundary = false; // the last token boundary the margin saw was a decode token
     uint64_t margin_epoch = 0, margin_token = 0;
 
+    // A resolved source carries its file's identity. One layer resolves dozens of roles, and reading the identity
+    // takes system calls: on Windows, through every file system filter. So it is read once per descriptor and logical
+    // token. kimi_cpu_sink_cache_begin forgets it, which still catches a source replaced between tokens, at the same
+    // descriptor too.
+    std::vector<std::pair<int, ssd::platform::file_identity>> file_identities;
+    bool resolve(const char * tensor, int32_t expert, kimi_cpu_sink_source * source) {
+        if (!resolver(userdata, tensor, expert, source)) { return false; }
+        for (const auto & known : file_identities) {
+            if (known.first == source->fd_direct) { source->file = known.second; return true; }
+        }
+        if (!ssd::platform::identity(source->fd_direct, source->file)) { return false; }
+        file_identities.emplace_back(source->fd_direct, source->file);
+        return true;
+    }
+
     // Next-layer expert prefetch (typed prefetch.depth). The graph applies the next
     // layer's router to this layer's expert input and hands its experts over as a hint, best first; the first k
     // that are neither cached nor held by the GPU tier now (its residency ABI) are read into RAM cache slots of the
@@ -1221,7 +1236,7 @@ struct kimi_cpu_sink {
             job->layer = layer + 1; job->expert = expert; job->rank = i;
             bool resolved = true;
             for (int role = 0; role < 3 && resolved; ++role) {
-                resolved = resolver(userdata, names[role], expert, &job->role[role]) &&
+                resolved = resolve(names[role], expert, &job->role[role]) &&
                     job->role[role].offset % 4096 == 0 && job->role[role].nbytes % 4096 == 0;
             }
             if (!resolved) { ++prefetch.unresolved; continue; }
@@ -2404,7 +2419,7 @@ struct kimi_cpu_sink {
             request.cache_only = cache_only && cache_only[slot];
             for (int role = 0; role < 3; ++role) {
                 auto & source = request.role[role];
-                if (!resolver(userdata, tensors[role]->name, ids[slot], &source)) {
+                if (!resolve(tensors[role]->name, ids[slot], &source)) {
                     throw std::runtime_error("CPU sink pack resolver failed for " + std::string(tensors[role]->name));
                 }
                 const size_t bytes = ggml_row_size(tensors[role]->type, tensors[role]->ne[0]) * tensors[role]->ne[1];
@@ -3372,6 +3387,7 @@ extern "C" bool kimi_cpu_sink_cache_begin(struct kimi_cpu_sink * sink, uint64_t 
     try {
         sink->end_margin_interval(decode, epoch, token);
         sink->refresh_floor(decode ? "decode" : "prefill");
+        sink->file_identities.clear();
         sink->vram.begin(epoch, token, decode, sink->cache);
         sink->cache.begin(epoch, token, decode);
         sink->begin_margin_interval(decode);
