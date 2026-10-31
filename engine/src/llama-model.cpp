@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-mmvf-policy.h"
 #include "ssd/model-adapter.h"
 #include "ssd/model-pages.h"
 
@@ -10063,7 +10064,11 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     llm->res->set_outputs(params);
 
-    return llm->res->get_gf();
+    auto * graph = llm->res->get_gf();
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        llama_mark_thin_mmvf(ggml_graph_node(graph, i), params.cparams.cuda_thin_mmvf);
+    }
+    return graph;
 }
 
 

@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-mmvf-policy.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -49,6 +50,8 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    cparams.cuda_thin_mmvf = llama_configure_thin_mmvf(model.arch);
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
