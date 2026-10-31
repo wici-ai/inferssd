@@ -114,3 +114,20 @@ Contributions are welcome, including hardware results and improvements to expert
 Built on [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp), with thanks to their contributors and the model-adaptation community.
 
 InferSSD is licensed under [Apache-2.0](LICENSE); bundled llama.cpp/ggml and other third-party components keep their original licenses and notices; see [NOTICE](NOTICE). Model weights remain subject to their publishers' licenses.
+
+### Experimental NVIDIA thin floating dispatch
+
+Muse contexts enable a context-local thin F16/BF16 MUL_MAT admission policy.
+Eligible NVIDIA matrices rejected by MMF may use MMVF for up to eight columns;
+existing alignment, shape, CPU fallback and split-device constraints still apply.
+DeepSeek and all other architectures retain the existing dispatch. Graph-node
+flags carry the option, including reservation graphs, without changing shared
+settings or command-line defaults. Each context emits one `rsi.design.active`
+JSON line; unrecognized architectures are reported as `unknown` and disabled.
+The routed expert and streaming MMVF paths are outside this experiment.
+
+Host checks cover scope, selector branches and module/layout boundaries. They
+cannot establish CUDA kernel correctness or performance. Full CUDA build and
+runtime verification on the validation device are required before measurement;
+publication requires fresh final-source B2 against epoch A5 and enables only
+models that qualify. Experimental activation alone is not qualification.

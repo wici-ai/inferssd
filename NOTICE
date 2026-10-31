@@ -118,3 +118,8 @@ External runtime dependencies
 
 liburing is not vendored. Binary distributions must comply with its selected
 license (the MIT option is available) and the NVIDIA CUDA runtime terms.
+
+NVIDIA thin floating MMVF admission policy adapted from ggml-org/llama.cpp
+PR 29633, commit 9d3aba6b5e10a6dd086bd0555bd12c00366a8916 (MIT),
+by ynankani, with upstream co-author Johannes Gaessler.
+Original upstream copyright and license notices in engine/ggml are retained.
