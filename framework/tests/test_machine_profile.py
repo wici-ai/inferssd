@@ -401,6 +401,7 @@ def test_darwin_profile_end_to_end(tmp_path):
         ("efficiency", 6),
     ]
     assert value["memory"]["unified"] is True and value["memory"]["page_bytes"] == 16384
+    assert [gpu["name"] for gpu in value["identity"]["hard"]["gpus"]] == ["Apple M5, 10-core GPU"]
     assert value["gpus"] == [] and value["sections"]["gpus"]["status"] == "ok"
     (drive,) = value["storage"]
     assert drive["drive_key"].startswith("darwin:apple:APPLE SSD AP0512Z:")

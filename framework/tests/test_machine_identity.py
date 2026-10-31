@@ -31,6 +31,15 @@ SMI = (
     "--query-gpu=uuid,name,memory.total,driver_version",
     "--format=csv,noheader,nounits",
 )
+AGX = ("ioreg", "-rd1", "-c", "AGXAccelerator")
+AGX_LISTING = """\
++-o AGXAccelerator  <class AGXAccelerator, id 0x100000a2f, registered, matched, active>
+    {
+      "model" = "Apple M5"
+      "gpu-core-count" = 10
+      "vendor-id" = <6b100000>
+    }
+"""
 
 
 class FakeHost(NativeHost):
@@ -257,6 +266,7 @@ def darwin_commands():
             "ProductName:\t\tmacOS\nProductVersion:\t\t26.4\nBuildVersion:\t\t25E246\n"
         ),
         ("uname", "-r"): ok("25.4.0\n"),
+        AGX: ok(AGX_LISTING),
     }
 
 
@@ -273,7 +283,14 @@ def test_darwin_identity(tmp_path):
             "cpu_brand": "Apple M5",
             "logical_cpus": 10,
             "ram_bytes": 17179869184,
-            "gpus": [],
+            "gpus": [
+                {
+                    "backend": "Metal",
+                    "uuid": "Apple M5:10",
+                    "name": "Apple M5, 10-core GPU",
+                    "vram_bytes": 0,
+                }
+            ],
         },
         "soft": {
             "os_release": "macOS 26.4 (25E246)",
@@ -282,6 +299,32 @@ def test_darwin_identity(tmp_path):
             "probe_versions": {"ssd": "inferssd-ssdprobe/1", "cpu": "inferssd-cpuprobe/1"},
         },
     }
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        Command(127, "", "ioreg: not found"),
+        Command(1, "", "ioreg: AGXAccelerator: no such class"),
+        ok(AGX_LISTING.replace('      "gpu-core-count" = 10\n', "")),
+        ok(""),
+    ],
+    ids=["absent", "failed", "no core count", "empty"],
+)
+def test_darwin_identity_without_a_readable_gpu(tmp_path, reply):
+    commands = darwin_commands()
+    commands[AGX] = reply
+    identity = live_identity(FakeHost(tmp_path, "darwin", "arm64", commands))
+    assert identity["hard"]["gpus"] == [] and identity["soft"]["gpu_driver"] is None
+    assert "memory" not in identity["soft"]["probe_versions"]
+
+
+def test_gpu_core_count_tells_apple_variants_apart(tmp_path):
+    commands = darwin_commands()
+    saved = live_identity(FakeHost(tmp_path, "darwin", "arm64", commands))
+    commands[AGX] = ok(AGX_LISTING.replace('"gpu-core-count" = 10', '"gpu-core-count" = 8'))
+    live = live_identity(FakeHost(tmp_path, "darwin", "arm64", commands))
+    assert same_hardware(saved, live) == ["gpus"]
 
 
 def test_windows_is_not_supported_yet(tmp_path):
