@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 
 import pytest
 from test_machine_identity import FakeHost, linux_tree, nvme_key
@@ -13,6 +14,7 @@ from test_machine_probes import FakeRunner, replies
 from test_machine_profile import GIB, Clock, shards
 
 from inferssd.cli import main
+from inferssd.launch.resources import installed_resources
 from inferssd.machine import command
 from inferssd.machine.store import exclusive
 
@@ -74,10 +76,9 @@ def resource_descriptor(tmp_path, build):
     return descriptor
 
 
-def test_profile_uses_installed_resources_without_probes_on_path(tmp_path, monkeypatch):
+def test_profile_uses_the_installed_wrappers_resources(tmp_path):
     host, files, build = machine(tmp_path)
     descriptor = resource_descriptor(tmp_path, build)
-    monkeypatch.setenv("PATH", str(tmp_path / "no-probes"))
     runner = FakeRunner(replies())
     code, _, _ = execute(
         ["--model", files[0]],
@@ -112,15 +113,38 @@ def test_explicit_probe_location_overrides_installed_resources(tmp_path, option)
 
 
 @pytest.mark.parametrize("environ", [{}, {"INFERSSD_RESOURCES": ""}])
-def test_profile_still_finds_probes_on_path(tmp_path, monkeypatch, environ):
+def test_profile_uses_the_current_release_without_the_variable(tmp_path, environ):
     host, _, build = machine(tmp_path)
-    for probe in (build / "bin").iterdir():
-        probe.chmod(0o755)
-    monkeypatch.setenv("PATH", str(build / "bin"))
+    current = tmp_path / "home/.local/share/inferssd/current"
+    current.mkdir(parents=True)
+    resource_descriptor(tmp_path, build).replace(current / "engine-resources.json")
     runner = FakeRunner(replies())
     code, _, _ = execute([], host, runner, tmp_path, environ=environ)
     assert code == 0 and runner.calls
     assert all(argv[0].startswith(str(build / "bin")) for argv, _ in runner.calls)
+
+
+@pytest.mark.parametrize("environ", [{}, {"INFERSSD_RESOURCES": ""}])
+def test_profile_does_not_look_for_probes_on_path(tmp_path, monkeypatch, environ):
+    host, _, build = machine(tmp_path)
+    for probe in (build / "bin").iterdir():
+        probe.chmod(0o755)
+    monkeypatch.setenv("PATH", str(build / "bin"))
+    runner = FakeRunner({})
+    with pytest.raises(ValueError, match="engine not installed"):
+        execute([], host, runner, tmp_path, environ=environ)
+    assert not runner.calls
+    assert not (tmp_path / "state/inferssd/machine.json").exists()
+
+
+def test_installed_resources_prefer_the_variable_over_the_current_release(tmp_path):
+    current = tmp_path / ".local/share/inferssd/current/engine-resources.json"
+    assert installed_resources({}, tmp_path) == current
+    assert installed_resources({"INFERSSD_RESOURCES": ""}, tmp_path) == current
+    assert installed_resources({"INFERSSD_RESOURCES": "/a.json"}, tmp_path) == Path("/a.json")
+    assert installed_resources({"INFERSSD_HOME": "/data"}, tmp_path) == Path(
+        "/data/current/engine-resources.json"
+    )
 
 
 def test_show_ignores_installed_resources_and_does_not_measure(tmp_path):
@@ -144,7 +168,7 @@ def test_show_ignores_installed_resources_and_does_not_measure(tmp_path):
 def test_missing_installed_descriptor_is_not_silently_ignored(tmp_path):
     host, _, _ = machine(tmp_path)
     runner = FakeRunner({})
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(ValueError, match="engine not installed"):
         execute(
             [],
             host,
@@ -263,7 +287,6 @@ def test_cli_entry_uses_installer_environment(tmp_path, monkeypatch):
     monkeypatch.setattr(command, "NativeHost", lambda: host)
     monkeypatch.setattr(command, "run_process", runner)
     monkeypatch.setenv("INFERSSD_RESOURCES", str(descriptor))
-    monkeypatch.setenv("PATH", str(tmp_path / "no-probes"))
     output = tmp_path / "machine.json"
     assert main(["profile", "--model", files[0], "--output", str(output)]) == 0
     assert all(

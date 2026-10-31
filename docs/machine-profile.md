@@ -34,9 +34,11 @@ inferssd profile --reprofile --model /models/model-00001-of-00004.gguf
 | `--output PATH` | Use this file instead of the default location. |
 | `--show` | Print the saved file's summary and exit. |
 
-Without `--resources` or `--build`, the command uses `INFERSSD_RESOURCES` when
-nonempty (set by the one-command installer's wrapper), otherwise it looks up the
-probes on `PATH`; `--show` only reads the saved profile and ignores this variable.
+Without `--resources` or `--build`, the command uses the installed engine, as
+`cli` and `serve` do: `INFERSSD_RESOURCES` when nonempty (set by the one-command
+installer's wrapper), otherwise `current/engine-resources.json` in the data
+directory. Without an installed engine it exits with status 2. `--show` only
+reads the saved profile and needs none of these.
 The command prints one progress line per step on stderr and one summary line per
 section on stdout, then names the sections of this run that are partial or
 failed. It exits with status 1 when a section measured in this run failed (the

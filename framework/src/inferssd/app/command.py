@@ -13,11 +13,7 @@ from pathlib import Path
 
 from inferssd.app.hub import download, selection
 from inferssd.launch import typed_command
-from inferssd.launch.resources import read_resources
-
-
-def data_directory() -> Path:
-    return Path(os.environ.get("INFERSSD_HOME", Path.home() / ".local/share/inferssd"))
+from inferssd.launch.resources import data_directory, installed_resources, read_resources
 
 
 def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -82,9 +78,7 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("max-tokens must be positive")
     if args.machine and args.reprofile:
         raise ValueError("choose --machine or --reprofile")
-    resources = args.resources or Path(
-        os.environ.get("INFERSSD_RESOURCES", data_directory() / "current/engine-resources.json")
-    )
+    resources = args.resources or installed_resources()
     if not resources.is_file():
         raise ValueError("engine not installed; run scripts/install.sh or pass --resources FILE")
     deployment = read_resources(resources)

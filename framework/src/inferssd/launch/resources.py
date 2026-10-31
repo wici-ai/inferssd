@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import ntpath
+import os
 import posixpath
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,19 @@ BUILDS = {
 }
 # The machine probes by the name a resource descriptor's probes map gives them.
 PROBES = {"ssd": "inferssd-ssdprobe", "cpu": "inferssd-cpuprobe", "memory": "inferssd-memprobe"}
+
+
+def data_directory(environ: Mapping[str, str] = os.environ, home: Optional[Path] = None) -> Path:
+    """Where the installer keeps the releases, the models and the launch state."""
+    return Path(environ.get("INFERSSD_HOME", (home or Path.home()) / ".local/share/inferssd"))
+
+
+def installed_resources(
+    environ: Mapping[str, str] = os.environ, home: Optional[Path] = None
+) -> Path:
+    """The installed engine's descriptor: the wrapper's variable, else the current release's."""
+    named = environ.get("INFERSSD_RESOURCES")
+    return Path(named) if named else data_directory(environ, home) / "current/engine-resources.json"
 
 
 @dataclass(frozen=True)
