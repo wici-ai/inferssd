@@ -242,6 +242,9 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
+    // Called once by the owning context, before graph construction. Indexer only.
+    bool enable_resident_indexer_rotation();
+
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
@@ -293,6 +296,12 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    // Separate ownership: KV clear/state operations must never overwrite constants.
+    ggml_context_ptr resident_rot_ctx;
+    ggml_backend_buffer_ptr resident_rot_buffer;
+    ggml_tensor * resident_k_rot = nullptr;
+    bool resident_rot_attempted = false;
 
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;

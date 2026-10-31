@@ -14,3 +14,4 @@ SSD_SETTING("host.headroom_mib", integer, 0, 4294967295, "512", "MiB", "plan", s
 SSD_SETTING("host.budget_mib", integer, 0, 17592186044415, "0", "MiB", "plan", scope_darwin | scope_windows, "Host memory envelope in MiB against this process's own memory; zero derives it at startup")
 SSD_SETTING("model.engram_prefetch", integer, 0, 1, "0", "boolean", "model", scope_all, "Read ahead DeepSeek Engram rows; changes I/O timing only")
 SSD_SETTING("model.hc_fused", integer, 0, 1, "1", "boolean", "model", scope_all, "Use the fused hyper connection operations of DeepSeek-V4.1 and Qwen3.8-Flash-Next")
+SSD_SETTING("model.kv_rotation_resident", integer, 0, 1, "1", "boolean", "model", scope_all, "Experimental resident indexer rotation; effective default on only for DeepSeek V4.1, off for all other architectures")

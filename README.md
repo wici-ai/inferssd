@@ -114,3 +114,37 @@ Contributions are welcome, including hardware results and improvements to expert
 Built on [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp), with thanks to their contributors and the model-adaptation community.
 
 InferSSD is licensed under [Apache-2.0](LICENSE); bundled llama.cpp/ggml and other third-party components keep their original licenses and notices; see [NOTICE](NOTICE). Model weights remain subject to their publishers' licenses.
+
+### Experimental resident indexer rotation
+
+The isolated experimental source enables `model.kv_rotation_resident` by default
+only for DeepSeek V4.1. The actual consumer additionally requires its nonempty,
+allocated lightning indexer, 128-wide heads, and one buffer type. Other models,
+including Muse and unknown architectures, remain disabled even with option `1`.
+Option `0` disables the experiment. No common settings or argv change is needed.
+The owning context resolves and consumes the option once before graph construction
+and emits one `rsi.design.active` JSON record for DeepSeek V4.1 or Muse, including
+disabled contexts. Unknown architectures emit no falsely labeled model record.
+Constants own a separate weights buffer so KV clearing and state loading cannot
+overwrite them. Graph reuse and KV shift reuse that constant. Unsupported cache
+layouts and unallocated caches retain the existing graph-input path.
+
+This adapts the invariant upload mechanism by anton-iermolenko in
+ggml-org/llama.cpp PR 31073
+(revision 6709ef11e6c7854bc4ec4705a8c2584ed36ce102), retaining upstream attribution
+and importing neither upstream model changes nor PR76. Run
+`python3 tests/test_resident_rotation.py` for focused native option/scope tests,
+consumer call-chain and ownership checks and C++ syntax checks. Historical main logs prove only
+the existing DeepSeek41 indexer rotation path; Muse's frozen f16 KV has no rotation.
+Backend execution and performance of this final source remain unvalidated.
+Experimental activation is not publication qualification: separately counted
+final-source B2 is required, with no claim that old measurements qualify this code.
+
+The model-aware rotation option belongs to the engine layer, keeping the shared
+SSD settings core independent of model architecture headers. Its registered key
+is included in the generated Python schema and the C++/Python settings contract;
+round-trip tests cover explicit enable/disable and invalid values across platforms.
+
+The reviewed benchmark reference binding explicitly includes the new rotation
+setting. Incomplete semantic snapshots, legacy mappings, and typed launch values
+remain rejected; legacy equivalence is never inferred from a missing key.
