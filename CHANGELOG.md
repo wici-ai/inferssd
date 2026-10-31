@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.1 - 2026-10-31
+
+This release fixes the Linux source install with recent CUDA toolkits.
+
+### Fixes
+
+- **Build with CCCL 3.4 and later:** the installer failed to compile with CCCL 3.4.0 and later, including the CCCL 3.4.3 bundled with CUDA 13.4.3 and CCCL 3.5.0 on Arch Linux. Thanks to @rokam for the report ([#95](https://github.com/wici-ai/inferssd/issues/95)).
+- **`inferssd profile` after a one-command install:** the command now finds the installed probes instead of reporting them as missing. Thanks to @HamedShams for the report ([#97](https://github.com/wici-ai/inferssd/issues/97)).
+
+### Install or upgrade
+
+```sh
+curl -fsSL https://github.com/wici-ai/inferssd/releases/download/v0.1.1/install.sh | sh
+```
+
+Run the same command to upgrade from v0.1.0. Downloaded models are not touched. The [known limitations of v0.1.0](https://github.com/wici-ai/inferssd/releases/tag/v0.1.0#known-limitations) still apply.
+
 ## 0.1.0 - 2026-10-30
 
 First public release of InferSSD, which runs mixture-of-experts models larger than your RAM or VRAM from SSD. InferSSD builds on llama.cpp, reads GGUF weights directly, and serves browser chat and an OpenAI-compatible API.
