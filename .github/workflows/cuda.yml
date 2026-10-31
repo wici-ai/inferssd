@@ -36,11 +36,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: 120a
-            image: nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6
+          # No source branch separates 120a from 121a, so each toolkit runs once.
+          # CUDA 13.0's CCCL 3.0 skips the newer CCCL branches in the CUB code.
           - arch: 121a
             image: nvidia/cuda:13.0.2-devel-ubuntu24.04@sha256:5dc1bca23d05bd37b011be68ec470c03b403a5da07ec3a86e41af9470e9d0cc6
-          # CUDA 13.0's CCCL 3.0 skips the newer CCCL branches in the CUB code.
           - arch: 120a
             image: nvidia/cuda:13.4.3-devel-ubuntu24.04@sha256:cd530dd9b42a4866c2480b21cad7db0ff7b9c5b48c36455e7284328922963367
     steps:
