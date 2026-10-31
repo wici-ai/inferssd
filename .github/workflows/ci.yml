@@ -57,9 +57,11 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          # The recorded transcripts are bound to these two versions; 3.12 is the default.
+          # The recorded transcripts are bound to 3.9 and 3.12, and skip on 3.14.
+          # The last version listed, 3.12, is the default.
           python-version: |
             3.9
+            3.14
             3.12
       - name: Install test dependencies
         run: |
@@ -81,6 +83,11 @@ jobs:
           python3.9 -m venv .venv39
           .venv39/bin/python -m pip install pytest==8.4.2 ./framework
           .venv39/bin/python -m pytest -q bench/tests framework/tests tests/integration/test-macos-launcher.py tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
+      - name: Framework tests on Python 3.14
+        run: |
+          python3.14 -m venv .venv314
+          .venv314/bin/python -m pip install pytest==9.1.1 "./framework[hf]"
+          .venv314/bin/python -m pytest -q bench/tests framework/tests
       - name: Mac launcher and alias-index checks
         run: |
           ruff check --isolated --select F framework/tests/fixtures/macos/run-macos-ssd.py framework/tests/fixtures/macos/kimi-build-gguf-expert-alias-tsv.py tests/integration/test-macos-launcher.py bench/macos/measure.py bench/macos/measurement_images.py tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
