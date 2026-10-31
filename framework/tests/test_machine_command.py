@@ -36,19 +36,124 @@ def machine(tmp_path):
     return host, files, build
 
 
-def execute(argv, host, runner, tmp_path):
+def execute(argv, host, runner, tmp_path, environ=None):
     out, progress = [], []
     code = command.run(
         parse(argv),
         host=host,
         runner=runner,
-        environ={"XDG_STATE_HOME": str(tmp_path / "state")},
+        environ={"XDG_STATE_HOME": str(tmp_path / "state"), **(environ or {})},
         home=tmp_path / "home",
         clock=Clock(),
         progress=progress.append,
         emit=out.append,
     )
     return code, out, progress
+
+
+def resource_descriptor(tmp_path, build):
+    descriptor = tmp_path / "engine-resources.json"
+    descriptor.write_text(
+        json.dumps(
+            {
+                "schema": "inferssd-engine 1",
+                "binary": str(build / "bin/inferssd-server"),
+                "capabilities": {"settings": "inferssd-settings 1", "telemetry": 1},
+                "templates": {"muse": str(build / "chat.jinja")},
+                "probes": {
+                    name: str(build / "bin" / executable)
+                    for name, executable in (
+                        ("cpu", "inferssd-cpuprobe"),
+                        ("memory", "inferssd-memprobe"),
+                        ("ssd", "inferssd-ssdprobe"),
+                    )
+                },
+            }
+        )
+    )
+    return descriptor
+
+
+def test_profile_uses_installed_resources_without_probes_on_path(tmp_path, monkeypatch):
+    host, files, build = machine(tmp_path)
+    descriptor = resource_descriptor(tmp_path, build)
+    monkeypatch.setenv("PATH", str(tmp_path / "no-probes"))
+    runner = FakeRunner(replies())
+    code, _, _ = execute(
+        ["--model", files[0]],
+        host,
+        runner,
+        tmp_path,
+        environ={"INFERSSD_RESOURCES": str(descriptor)},
+    )
+    assert code == 0
+    assert {argv[0] for argv, _ in runner.calls} == {
+        str(build / "bin" / name)
+        for name in ("inferssd-cpuprobe", "inferssd-memprobe", "inferssd-ssdprobe")
+    }
+    saved = json.loads((tmp_path / "state/inferssd/machine.json").read_text())
+    assert all(section["status"] == "ok" for section in saved["sections"].values())
+
+
+@pytest.mark.parametrize("option", ["--resources", "--build"])
+def test_explicit_probe_location_overrides_installed_resources(tmp_path, option):
+    host, _, build = machine(tmp_path)
+    location = resource_descriptor(tmp_path, build) if option == "--resources" else build
+    runner = FakeRunner(replies())
+    code, _, _ = execute(
+        [option, str(location)],
+        host,
+        runner,
+        tmp_path,
+        environ={"INFERSSD_RESOURCES": str(tmp_path / "missing.json")},
+    )
+    assert code == 0 and runner.calls
+    assert all(argv[0].startswith(str(build / "bin")) for argv, _ in runner.calls)
+
+
+@pytest.mark.parametrize("environ", [{}, {"INFERSSD_RESOURCES": ""}])
+def test_profile_still_finds_probes_on_path(tmp_path, monkeypatch, environ):
+    host, _, build = machine(tmp_path)
+    for probe in (build / "bin").iterdir():
+        probe.chmod(0o755)
+    monkeypatch.setenv("PATH", str(build / "bin"))
+    runner = FakeRunner(replies())
+    code, _, _ = execute([], host, runner, tmp_path, environ=environ)
+    assert code == 0 and runner.calls
+    assert all(argv[0].startswith(str(build / "bin")) for argv, _ in runner.calls)
+
+
+def test_show_ignores_installed_resources_and_does_not_measure(tmp_path):
+    host, _, build = machine(tmp_path)
+    code, expected, _ = execute(["--build", str(build)], host, FakeRunner(replies()), tmp_path)
+    assert code == 0
+    saved = tmp_path / "state/inferssd/machine.json"
+    before = saved.read_bytes()
+    runner = FakeRunner({})
+    code, shown, _ = execute(
+        ["--show"],
+        host,
+        runner,
+        tmp_path,
+        environ={"INFERSSD_RESOURCES": str(tmp_path / "missing.json")},
+    )
+    assert code == 0 and shown == expected and not runner.calls
+    assert saved.read_bytes() == before
+
+
+def test_missing_installed_descriptor_is_not_silently_ignored(tmp_path):
+    host, _, _ = machine(tmp_path)
+    runner = FakeRunner({})
+    with pytest.raises(FileNotFoundError):
+        execute(
+            [],
+            host,
+            runner,
+            tmp_path,
+            environ={"INFERSSD_RESOURCES": str(tmp_path / "missing.json")},
+        )
+    assert not runner.calls
+    assert not (tmp_path / "state/inferssd/machine.json").exists()
 
 
 def test_profile_stays_available_when_unlisted(capsys):
@@ -148,6 +253,22 @@ def test_cli_entry_point(tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit) as error:
         main(["profile", "--build", str(build), "--resources", str(output)])
     assert error.value.code == 2 and "not allowed with argument" in capsys.readouterr().err
+
+
+def test_cli_entry_uses_installer_environment(tmp_path, monkeypatch):
+    host, files, build = machine(tmp_path)
+    descriptor = resource_descriptor(tmp_path, build)
+    runner = FakeRunner(replies())
+    monkeypatch.setattr(command, "NativeHost", lambda: host)
+    monkeypatch.setattr(command, "run_process", runner)
+    monkeypatch.setenv("INFERSSD_RESOURCES", str(descriptor))
+    monkeypatch.setenv("PATH", str(tmp_path / "no-probes"))
+    output = tmp_path / "machine.json"
+    assert main(["profile", "--model", files[0], "--output", str(output)]) == 0
+    assert all(
+        section["status"] == "ok" for section in json.loads(output.read_text())["sections"].values()
+    )
+    assert runner.calls[0][0][0] == str(build / "bin/inferssd-cpuprobe")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="flock")
