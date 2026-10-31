@@ -112,11 +112,11 @@ def _facts(value: Characteristics, name: str) -> str:
 def summary(value: Characteristics, path: Path) -> list[str]:
     """One header line, then one line per section."""
     hard = value["identity"]["hard"]
-    gpus = ", ".join(gpu["name"] for gpu in hard["gpus"]) or "none"
+    gpus = ", ".join(f"{gpu['name']} ({gpu['backend']})" for gpu in hard["gpus"]) or "none"
     lines = [
         f"machine profile {path} (written {value['created_utc']})",
         f"identity: {hard['platform']} {hard['arch']}, {hard['cpu_brand']}, "
-        f"{hard['logical_cpus']} logical CPUs, {_gib(hard['ram_bytes'])} RAM, CUDA GPUs: {gpus}",
+        f"{hard['logical_cpus']} logical CPUs, {_gib(hard['ram_bytes'])} RAM, GPUs: {gpus}",
     ]
     order = {name: index for index, name in enumerate(BASE_SECTIONS)}
     for name, section in sorted(

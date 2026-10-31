@@ -2,7 +2,7 @@
 # Machine profile
 
 InferSSD measures each machine once and keeps the result in a characteristics
-file. The file describes the machine only: its CPUs, memory, NVIDIA GPUs and
+file. The file describes the machine only: its CPUs, memory, GPUs and
 the drives that hold models. It holds no model data, no placement and no cache
 sizes; each launch works those out from the model's GGUF header and this file.
 
@@ -101,9 +101,13 @@ not use a profile yet.
 | `gpus` | `inferssd-memprobe` (Linux with NVIDIA GPUs) | VRAM size, host-to-device (pinned and pageable), device-to-host and device-to-device copy rates, and device read bandwidth, for every GPU `nvidia-smi` lists |
 | `storage:<drive>` | `inferssd-ssdprobe`, one per drive | Random-read bandwidth and latency by request size and queue depth, read with the engine's own reader; the knee queue depth per size |
 
-The GPU probe measures every GPU, regardless of `CUDA_VISIBLE_DEVICES`. A GPU
-it cannot measure (too little free VRAM, or a CUDA error) makes the `gpus`
-section partial, with the GPU's UUID and the reason. When `nvidia-smi` is
+The identity lists the GPUs: on Linux those `nvidia-smi` reports, on macOS
+the Apple GPU with its core count as `ioreg` reports it (when `ioreg` cannot
+say, the list is empty and profiling continues). The GPU probe measures every
+GPU on Linux, regardless of `CUDA_VISIBLE_DEVICES`; on macOS the GPU shares the
+machine's memory and is not measured. A GPU the probe cannot measure (too
+little free VRAM, or a CUDA error) makes the `gpus` section partial, with the
+GPU's UUID and the reason. When `nvidia-smi` is
 installed but fails, for example after a driver upgrade without a reboot, the
 `gpus` section fails and the saved GPU identity is kept, so the machine is not
 mistaken for new hardware.
@@ -166,7 +170,7 @@ The saved file is reused section by section. A run measures:
 
 - everything when there is no saved file, on `--reprofile`, or when the
   hardware identity differs: platform, architecture, machine ID, machine model,
-  CPU brand, logical CPU count, NVIDIA GPUs, or total memory by more than 1%;
+  CPU brand, logical CPU count, GPUs, or total memory by more than 1%;
 - the drives given with `--model` when the kernel or OS release changed (saved
   measurements of other drives are dropped, since they predate the change);
 - `gpus` when the GPU driver changed;

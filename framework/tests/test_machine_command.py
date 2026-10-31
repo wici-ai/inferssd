@@ -179,8 +179,9 @@ def test_profile_saves_to_the_state_directory_and_summarizes(tmp_path):
     assert code == 0 and saved.exists()
     assert runner.calls[0][0][0] == str(build / "bin/inferssd-cpuprobe")
     assert out[0].startswith(f"machine profile {saved} (written ")
-    assert out[1].startswith(
-        "identity: linux x86_64, Example CPU 9000, 4 logical CPUs, 31.2 GiB RAM"
+    assert out[1] == (
+        "identity: linux x86_64, Example CPU 9000, 4 logical CPUs, 31.2 GiB RAM, "
+        "GPUs: NVIDIA GeForce RTX 5090 (CUDA)"
     )
     names = [line.split(":", 1)[0] for line in out[2:]]
     assert names == ["cpu", "memory", "compute", "gpus", "storage"]

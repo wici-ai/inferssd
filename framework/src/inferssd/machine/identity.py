@@ -321,7 +321,27 @@ def sysctl_int(host: Host, name: str) -> int:
     return int(value)
 
 
+def metal(host: Host) -> list[GPUIdentity]:
+    """The Apple GPU as ioreg names it, or nothing when ioreg or a key is missing."""
+    listing = output(host, ["ioreg", "-rd1", "-c", "AGXAccelerator"]) or ""
+    model = re.search(r'^\s*"model"\s*=\s*"([^"]+)"\s*$', listing, re.MULTILINE)
+    cores = re.search(r'^\s*"gpu-core-count"\s*=\s*(\d+)\s*$', listing, re.MULTILINE)
+    if model is None or cores is None:
+        return []
+    # The GPU has no hardware UUID; the model and core count tell the variants apart.
+    # Its memory is the machine's, recorded as ram_bytes.
+    return [
+        {
+            "backend": "Metal",
+            "uuid": f"{model.group(1)}:{cores.group(1)}",
+            "name": f"{model.group(1)}, {cores.group(1)}-core GPU",
+            "vram_bytes": 0,
+        }
+    ]
+
+
 def _darwin(host: Host) -> Identity:
+    gpus = metal(host)
     platform_uuid = re.findall(
         r'"IOPlatformUUID"\s*=\s*"([A-Fa-f0-9-]{36})"',
         output(host, ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"]) or "",
@@ -345,13 +365,13 @@ def _darwin(host: Host) -> Identity:
             "cpu_brand": sysctl(host, "machdep.cpu.brand_string") or "unknown",
             "logical_cpus": sysctl_int(host, "hw.logicalcpu"),
             "ram_bytes": sysctl_int(host, "hw.memsize"),
-            "gpus": [],
+            "gpus": gpus,
         },
         "soft": {
             "os_release": release or None,
             "kernel": output(host, ["uname", "-r"]) or "unknown",
             "gpu_driver": None,
-            "probe_versions": probe_versions("darwin", []),
+            "probe_versions": probe_versions("darwin", gpus),
         },
     }
 
