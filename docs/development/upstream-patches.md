@@ -8,7 +8,7 @@ preserves its source attribution and license files.
 
 | Integration group | Reason and boundary |
 | --- | --- |
-| ggml scheduler and allocator | Borrowed SSD copy hooks; graph buffer measurement/admission; first touch; backend scratch reservation. No core implementation is linked into ggml-base. |
+| ggml scheduler and allocator | Borrowed SSD copy hooks; graph buffer measurement/admission; first touch; backend scratch reservation; a pass that keeps an in-place op with the backend holding its storage. No core implementation is linked into ggml-base. |
 | CPU/CUDA registries | Normal private provider discovery and context-service attachment. CPU and CUDA do not link each other. |
 | Backend operation files | New model operations and narrow native kernel entry points stay with their upstream operation/architecture files. Strict MXFP4 math is compiled separately with contraction and FTZ disabled. |
 | llama context | Runtime assembly, request phases, resource-aware graph reservation and failure recovery. Source, cache and telemetry owners reside in `src/ssd`. |
@@ -69,7 +69,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-alloc.c` | 38 | 2 |
 | `ggml/src/ggml-backend-impl.h` | 5 | 0 |
 | `ggml/src/ggml-backend-meta.cpp` | 29 | 1 |
-| `ggml/src/ggml-backend.cpp` | 386 | 64 |
+| `ggml/src/ggml-backend.cpp` | 413 | 64 |
 | `ggml/src/ggml-blas/ggml-blas.cpp` | 1 | 0 |
 | `ggml/src/ggml-cann/ggml-cann.cpp` | 1 | 0 |
 | `ggml/src/ggml-common.h` | 1 | 0 |
@@ -174,5 +174,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 16978 added, 5675 removed across 143 upstream paths.
+Total: 17005 added, 5675 removed across 143 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
