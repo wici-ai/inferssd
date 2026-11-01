@@ -260,7 +260,7 @@ def render_golden(case, strategy):
         if name == "write_exclusive":
             written[arguments[0]] = arguments[1]
             return Reply()
-        if name == "engine_gpu_backends":
+        if name in ("engine_gpu_backends", "machine_characteristics"):
             return Reply(case["host"].get(name))
         return Reply(case["host"][name])
 
@@ -290,7 +290,7 @@ def render_golden(case, strategy):
 
 
 @pytest.mark.parametrize("name", ["windows-qwen4exp", "windows-dsv"])
-def test_windows_skips_the_strategy_with_a_note(name):
+def test_windows_without_characteristics_skips_the_strategy_with_a_note(name):
     expected = golden(name)
     result, written, outputs = render_golden(expected["case"], strategy=True)
     # Nothing new is asked, and the command is the golden one.
@@ -299,7 +299,7 @@ def test_windows_skips_the_strategy_with_a_note(name):
         expected["settings"]
     )
     (receipt,) = [text for path, text in written.items() if path.endswith("strategy.json")]
-    reason = "machine profiling is not supported on windows yet"
+    reason = "no machine characteristics"
     assert json.loads(receipt) == {"skipped": reason}
     assert [o.text for o in outputs if o.channel == "stderr"] == [
         f"inferssd launch: no launch strategy: {reason}\n"

@@ -394,9 +394,9 @@ def test_gpu_core_count_tells_apple_variants_apart(tmp_path):
     assert same_hardware(saved, live) == ["gpus"]
 
 
-def test_windows_is_not_supported_yet(tmp_path):
-    with pytest.raises(UnsupportedPlatform, match="not supported on windows yet"):
-        live_identity(FakeHost(tmp_path, "windows"))
+def test_other_platforms_are_not_supported(tmp_path):
+    with pytest.raises(UnsupportedPlatform, match="not supported on freebsd yet"):
+        live_identity(FakeHost(tmp_path, "freebsd"))
 
 
 def test_drive_key_nvme_partition(tmp_path):
