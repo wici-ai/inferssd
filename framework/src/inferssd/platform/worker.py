@@ -19,6 +19,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
 
+from inferssd.platform.captured_command import run_captured
 from inferssd.platform.guardian import guard_worker
 from inferssd.platform.lease import Lease
 from inferssd.platform.policy import Policy
@@ -42,12 +43,7 @@ class Effects:
 
 
 def systemctl(unit: str, user: bool, *arguments: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["systemctl", *(["--user"] if user else []), *arguments, unit],
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+    return run_captured(["systemctl", *(["--user"] if user else []), *arguments, unit], timeout=10)
 
 
 def scope_state(unit: str, user: bool) -> dict[str, Any]:

@@ -28,6 +28,7 @@ from xml.parsers.expat import ExpatError
 
 from inferssd.configuration.settings import cpus
 from inferssd.machine.characteristics import PROBE_SCHEMAS, GPUIdentity, Identity
+from inferssd.platform.captured_command import run_captured
 
 MEMORY_TOLERANCE = 0.01  # MemTotal moves with kernel reservations
 
@@ -95,14 +96,7 @@ class NativeHost:
 
     def command(self, argv: Sequence[str]) -> Command:
         try:
-            result = subprocess.run(
-                list(argv),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=30,
-            )
+            result = run_captured(argv, timeout=30)
         except FileNotFoundError:
             return Command(127, "", argv[0] + ": not found")
         except subprocess.TimeoutExpired:
