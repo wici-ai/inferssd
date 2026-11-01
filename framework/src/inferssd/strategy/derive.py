@@ -4,10 +4,13 @@
 ``derive`` is a pure function of the machine characteristics, the model's
 header facts, the runtime facts and the platform. It chooses thread counts and
 CPU placement, placement cost priors, the host memory budget and margin, and,
-with a CUDA GPU on Linux, which prompt passes the GPU graph prefills and that a
-prompt is prefilled in one pass. The last two change the computation (GPU
-against CPU kernels, the pass shape) for speed; everything else keeps it
-bit-exact. The VRAM budget's behaviour stays as the engine has it.
+where the engine has a GPU expert tier, which prompt passes the GPU graph
+prefills and that a prompt is prefilled in one pass. The last two change the
+computation (GPU against CPU kernels, the pass shape) for speed; everything else
+keeps it bit-exact. The VRAM budget's behaviour stays as the engine has it.
+
+Which settings apply on a platform comes from the settings registry's scopes, so
+every platform runs this one derivation.
 """
 
 from __future__ import annotations
@@ -18,7 +21,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Optional, cast
 
-from inferssd.configuration.settings import PLATFORMS, Setting, Snapshot, parse, render, uncomment
+from inferssd.configuration.settings import (
+    PLATFORMS,
+    Setting,
+    Snapshot,
+    applies,
+    parse,
+    render,
+    schema,
+    uncomment,
+)
 from inferssd.launch.types import Threads
 from inferssd.machine.characteristics import GPU, Characteristics, ComputeRow, dumps
 from inferssd.strategy.inputs import ModelFacts, RuntimeFacts
@@ -87,6 +99,11 @@ def literal(item: Setting, platform: str) -> str:
     """ITEM's value as render() writes it, without key or receipt."""
     body, _ = uncomment(render(Snapshot((item,), platform)).split("\n")[1])
     return body.partition("=")[2].strip(" \t\r\n")
+
+
+def offered(key: str, platform: str) -> bool:
+    """Whether the engine has the setting KEY on PLATFORM, by the registry's scope."""
+    return applies(schema()["properties"][key], platform)
 
 
 def engine_gpu_backends(
@@ -643,7 +660,7 @@ def derive(
                 "prefill: one pass a prompt, -b and -ub as large as the context; a pass reads "
                 "every expert it routes to once"
             )
-    if platform in ("darwin", "windows") and runtime.memory_budget_bytes:
+    if offered("host.budget_mib", platform) and runtime.memory_budget_bytes:
         mib = runtime.memory_budget_bytes >> 20
         if mib:
             choices["host.budget_mib"] = (

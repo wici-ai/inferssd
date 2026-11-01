@@ -31,6 +31,7 @@ from inferssd.strategy.derive import (
     derive,
     launch_conflicts,
     literal,
+    offered,
     prefill_split,
 )
 from inferssd.strategy.inputs import GPUState, RuntimeFacts, model_facts
@@ -403,6 +404,12 @@ def test_the_cuda_budget_follows_the_engine_not_the_platform(models):
         facts = runtime(range(61), [gpu], backends=backends)
         s = derive(c, models["dsv"], facts, "linux", model_drive_key=drive(c))
         assert "vram.budget" not in s.settings and "vram.reserve_mib" not in s.settings
+    # A Windows engine with CUDA sizes its tier as a Linux one does.
+    c = machine(WINDOWS)
+    facts = runtime(range(8), backends=("CUDA",))
+    s = derive(c, models["dsv"], facts, "windows", model_drive_key=drive(c))
+    assert s.settings["vram.budget"].value_text == "0"
+    assert s.settings["vram.budget"].reason == "no CUDA GPU is usable now"
 
 
 def test_gpu_states_that_leave_the_vram_budget_alone(models):
@@ -535,3 +542,51 @@ def test_experts_mixing_formats_across_layers_use_the_gpu_tier(tmp_path, experts
     s = derive(c, mixed, runtime(range(61), [gpu]), "linux", model_drive_key=drive(c))
     assert "vram.budget" not in s.settings
     assert s.one_pass and "prefill.cpu_max_tokens" in s.settings
+
+
+WINDOWS = "windows-x64-igpu.json"  # 4 + 4 Intel cores with an integrated GPU, one NVMe drive
+
+
+def test_windows_runs_the_one_derivation(models):
+    c = machine(WINDOWS)
+    s = derive(
+        c,
+        models["dsv"],
+        runtime(range(8), budget=32 << 30),
+        "windows",
+        model_drive_key=drive(c),
+    )
+    # The registry's scopes decide: Windows has no GPU tier setting and has a host budget.
+    assert not any(key.startswith(("vram.", "prefill.")) for key in s.settings)
+    assert s.settings["host.budget_mib"].value_text == str(32 << 10)
+    assert "host.headroom_mib" not in s.settings
+    assert s.threads.batch == 7 and s.threads.decode_cpus in ((), (0, 1, 2, 3))
+    terms = costs(s)
+    assert "link_gbps" not in terms and terms["drive_gbps"] > 0
+    assert not s.one_pass
+
+
+@pytest.mark.parametrize(
+    "key,platform,expected",
+    [
+        # The CUDA tier's keys are on every platform; the engine's backends decide if they apply.
+        ("vram.max_slots", "linux", True),
+        ("vram.max_slots", "darwin", True),
+        ("vram.max_slots", "windows", True),
+        ("host.budget_mib", "linux", False),
+        ("host.budget_mib", "darwin", True),
+        ("host.budget_mib", "windows", True),
+    ],
+)
+def test_the_registry_decides_what_a_platform_derives(key, platform, expected):
+    assert offered(key, platform) is expected
+
+
+def test_windows_decode_goes_on_the_performance_cluster_when_it_streams_faster(models):
+    c = copy.deepcopy(machine(WINDOWS))
+    name = models["dsv"].dominant_format.upper()
+    for row in c["compute"]["cpu"]:
+        if row.get("cpus") == [0, 1, 2, 3] and row["format"].upper() == name:
+            row["points"][0]["weight_Bps"] = 200e9
+    s = derive(c, models["dsv"], runtime(range(8)), "windows", model_drive_key=drive(c))
+    assert s.threads.decode_cpus == (0, 1, 2, 3) and s.threads.decode == 4 and s.threads.batch == 7
