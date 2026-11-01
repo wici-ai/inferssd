@@ -101,6 +101,14 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
     ggml_set_name(up, "blk.0.ffn_up_exps.weight");
     ggml_set_name(gate, "blk.0.ffn_gate_exps.weight");
     ggml_set_name(down, "blk.0.ffn_down_exps.weight");
+    // Qwen's router reads the stream as it is, with no norm of its own: the next layer's router predicts from it.
+    const bool predicted = arch == LLM_ARCH_QWEN4EXP && decode && ntokens == 1;
+    if (predicted) {
+        ggml_tensor * next_router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, latent, experts);
+        context.cpu_sink_prefetch_hint = context.build_moe_prefetch_hint(input, nullptr, next_router, nullptr,
+            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, experts, 0);
+        require(context.cpu_sink_prefetch_hint, "a router without a norm must still predict the next experts");
+    }
     ggml_tensor * output = context.build_moe_ffn(input, nullptr, up, gate, down, nullptr,
         experts, slots, LLM_FFN_SILU, true, 1.0f, arch == LLM_ARCH_QWEN4EXP ? LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX :
         LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, 0, logits);
@@ -134,6 +142,11 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
             }
         }
         require(ggml_backend_sched_get_tensor_backend(scheduler.get(), output) == cpu, "custom node not assigned to CPU");
+        require(bool(output->src[5]) == predicted, "the custom node must carry the prediction it was given");
+        if (predicted) {
+            require(output->src[5]->type == GGML_TYPE_I32 && output->src[5]->ne[0] == slots,
+                    "the prediction must rank as many experts as the router selects");
+        }
         require(output->src[0] && output->src[1] && output->src[2] && !output->src[3], "custom node source count mismatch");
         for (int source = 0; source < 3; ++source) {
             require(ggml_is_contiguous(output->src[source]), "custom node input must be contiguous");

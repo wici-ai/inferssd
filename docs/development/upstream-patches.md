@@ -134,7 +134,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-context.h` | 148 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
-| `src/llama-graph.cpp` | 757 | 50 |
+| `src/llama-graph.cpp` | 758 | 50 |
 | `src/llama-graph.h` | 158 | 5 |
 | `src/llama-hparams.cpp` | 21 | 0 |
 | `src/llama-hparams.h` | 73 | 1 |
@@ -174,5 +174,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 16918 added, 5668 removed across 143 upstream paths.
+Total: 16919 added, 5668 removed across 143 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
