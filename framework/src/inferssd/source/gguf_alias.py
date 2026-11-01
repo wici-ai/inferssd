@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from inferssd.platform.captured_command import run_captured
 from inferssd.source.header import SCALARS
 
 ALIGNMENT = 4096
@@ -476,11 +477,10 @@ def _repo_head(repo: Path | None) -> str:
     if repo is None:
         return "unknown"
     try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=repo, text=True, stderr=subprocess.DEVNULL, timeout=10
-        ).strip()
+        result = run_captured(["git", "-C", str(repo), "rev-parse", "HEAD"], timeout=10)
     except (OSError, subprocess.SubprocessError):
         return "unknown"
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
 def main(argv: list[str] | None = None) -> int:

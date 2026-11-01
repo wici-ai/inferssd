@@ -42,6 +42,7 @@ from inferssd.machine.characteristics import (
     record,
 )
 from inferssd.machine.identity import Drive
+from inferssd.platform.captured_command import run_captured
 
 EXECUTABLES = PROBES
 TIMEOUT_S = {"ssd": 1800.0, "cpu": 1800.0, "memory": 900.0}
@@ -67,16 +68,7 @@ def run_process(argv: Sequence[str], timeout_s: float, env: Mapping[str, str]) -
     """Run without a shell in ENV, capturing both streams as UTF-8 (bad bytes replaced)."""
     name = os.path.basename(argv[0])
     try:
-        result = subprocess.run(
-            list(argv),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=dict(env),
-            timeout=timeout_s,
-            check=False,
-        )
+        result = run_captured(argv, timeout=timeout_s, env=env)
     except subprocess.TimeoutExpired as error:
         raise ProbeError(f"{name} timed out after {timeout_s:g} s") from error
     except OSError as error:

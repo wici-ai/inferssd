@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -14,6 +13,7 @@ from pathlib import Path
 from inferssd.app.hub import download, selection
 from inferssd.launch import typed_command
 from inferssd.launch.resources import data_directory, installed_resources, read_resources
+from inferssd.platform.captured_command import run_captured
 
 
 def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -47,7 +47,9 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
 
 def physical_memory() -> int:
     if sys.platform == "darwin":
-        return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True))
+        result = run_captured(["sysctl", "-n", "hw.memsize"], timeout=10)
+        result.check_returncode()
+        return int(result.stdout)
     for line in Path("/proc/meminfo").read_text().splitlines():
         if line.startswith("MemTotal:"):
             return int(line.split()[1]) * 1024
