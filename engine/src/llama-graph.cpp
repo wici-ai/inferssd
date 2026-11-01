@@ -2047,14 +2047,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         GGML_ASSERT(n_tokens >= 1);
 
         const auto requirements = llama_ssd::describe_experts(arch, hparams, il);
-        const auto adapted = llama_ssd::validate_experts(requirements, {
+        const llama_ssd::expert_inputs inputs = {
             backend_cpu != nullptr, cpu_sink_runtime != nullptr, up_exps, gate_exps, down_exps,
             gate_up_exps, gate_up_exps_b, gate_inp_b, up_exps_b, gate_exps_b, down_exps_b,
             up_exps_s, gate_exps_s, down_exps_s, n_embd, n_tokens, type_op == LLM_FFN_SILU,
             cache_compute, cpu_sink_prefill, weight_before_ffn, loras && !loras->empty(),
-            post_exp_norm, post_exp_norm_eps, w_scale});
-        if (!adapted.accepted) {
-            throw std::runtime_error("CPU sink layer=" + std::to_string(il) + adapted.error);
+            post_exp_norm, post_exp_norm_eps, w_scale};
+        const auto adapted = llama_ssd::validate_experts(requirements, inputs);
+        if (!adapted.accepted()) {
+            throw std::runtime_error("layer " + std::to_string(il) + ": " +
+                llama_ssd::describe_refusal(inputs, adapted.refusal));
         }
         const auto & execution = adapted.execution;
 

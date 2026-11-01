@@ -425,12 +425,21 @@ static void compare_case(fixture_inputs & inputs, const std::string & name, fixt
     print_sample(name, b, run_checked(inputs, name, f, e, layer, b, expected, true, linear_beta));
 }
 
+// A well-formed tensor of TYPE, so a refusal comes from the type and not from its layout.
+static void retype(ggml_tensor * tensor, ggml_type type) {
+    tensor->type = type;
+    tensor->nb[0] = ggml_type_size(type);
+    tensor->nb[1] = ggml_row_size(type, tensor->ne[0]);
+    tensor->nb[2] = tensor->nb[1] * tensor->ne[1];
+    tensor->nb[3] = tensor->nb[2] * tensor->ne[2];
+}
+
 static kimi_cpu_prefill_stats fail_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, batch b,
         int tokens_override = -1, int slots_override = -1, bool short_read = false, int metadata_fault = 0,
         bool allow_prefill_hits = false) {
     tensors meta(f, 1);
     if (metadata_fault == 1) { ++meta.role[0]->nb[1]; }
-    if (metadata_fault == 2) { meta.role[1]->type = GGML_TYPE_F32; }
+    if (metadata_fault == 2) { retype(meta.role[1], GGML_TYPE_F32); }
     if (metadata_fault == 3) { meta.role[2]->ne[0] += 256; }
     std::vector<float> output(size_t(std::max(b.tokens, 1)) * f.latent + 2, -77);
     char error[512] = {}; kimi_cpu_prefill_stats stats = {};
@@ -438,6 +447,9 @@ static kimi_cpu_prefill_stats fail_case(fixture_inputs & inputs, const std::stri
         b.ids.data(), b.weights.data(), slots_override < 0 ? b.slots : slots_override,
         tokens_override < 0 ? b.tokens : tokens_override, 4, 25, output.data() + 1, &stats, error, sizeof(error));
     require(!ok && error[0] && stats.stream.fallback_count == 0, name + ": did not fail closed");
+    if (metadata_fault == 2) {
+        require(std::strstr(error, "not supported yet") && std::strstr(error, "f32"), name + ": did not name the type");
+    }
     check_transport(inputs, stats.stream, false, true, allow_prefill_hits);
     cache_snapshot(e.sink.get(), true);
     require(output.front() == -77 && output.back() == -77, name + ": failed run overwrote output guard");

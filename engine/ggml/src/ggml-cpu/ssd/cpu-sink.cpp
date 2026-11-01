@@ -2367,9 +2367,12 @@ struct kimi_cpu_sink {
         for (const auto * tensor : tensors) {
             if (!tensor || !ggml_is_contiguous(tensor) ||
                 tensor->ne[0] <= 0 || tensor->ne[1] <= 0 || tensor->ne[2] <= 0 || tensor->ne[3] != 1 ||
-                tensor->ne[0] > 16384 || tensor->ne[1] > 16384 ||
-                !sink_expert_type_supported(tensor->type, tensor->ne[0])) {
-                throw std::runtime_error("CPU sink requires contiguous expert metadata with valid dimensions and a quantized CPU vec_dot type");
+                tensor->ne[0] > 16384 || tensor->ne[1] > 16384) {
+                throw std::runtime_error("CPU sink requires contiguous expert metadata with valid dimensions");
+            }
+            if (!sink_expert_type_supported(tensor->type, tensor->ne[0])) {
+                throw std::runtime_error(std::string("this quantization is not supported yet: the CPU sink cannot compute ") +
+                    ggml_type_name(tensor->type) + " experts");
             }
         }
         if (up->type != gate->type) {

@@ -20,6 +20,9 @@ from inferssd.platform.resources import Resources
 from inferssd.platform.run_directory import Reservation
 from inferssd.platform.worker import cleanup_confirmed, save
 
+SERVER_LOG_TAIL_LINES = 10
+SERVER_LOG_TAIL_BYTES = 64 * 1024
+
 
 def scope_command(resolution: Resolution, policy: Policy) -> tuple[list[str], Optional[str]]:
     if policy.platform == "darwin":
@@ -40,6 +43,19 @@ def scope_command(resolution: Resolution, policy: Policy) -> tuple[list[str], Op
     index = prefix.index("taskset") if "taskset" in prefix else len(prefix)
     prefix[index:index] = ["-p", "Delegate=yes"]
     return prefix, unit
+
+
+def server_log_tail(directory: Path) -> str:
+    """The end of the server's log, where an early exit states its cause."""
+    try:
+        with (directory / "server.log").open("rb") as log:
+            log.seek(max(0, log.seek(0, os.SEEK_END) - SERVER_LOG_TAIL_BYTES))
+            lines = log.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return ""
+    if not lines:
+        return ""
+    return "\nLast lines of server.log:\n" + "\n".join(lines[-SERVER_LOG_TAIL_LINES:])
 
 
 def worker_environment(environment: dict[str, str]) -> dict[str, str]:
@@ -192,4 +208,7 @@ class OwnedProcess:
         receipt = json.loads((self.directory / "ownership.json").read_text())
         if ended != 0 or receipt.get("status") != "passed":
             reason = receipt.get("error") or f"guardian exited with {ended}"
-            raise RuntimeError(f"owned native execution failed: {reason}; see {self.directory}")
+            raise RuntimeError(
+                f"owned native execution failed: {reason}; see {self.directory}"
+                + server_log_tail(self.directory)
+            )
