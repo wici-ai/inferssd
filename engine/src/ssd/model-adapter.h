@@ -3,6 +3,8 @@
 
 #include "llama-arch.h"
 
+#include <string>
+
 struct llama_hparams;
 
 namespace llama_ssd {
@@ -62,13 +64,33 @@ struct expert_execution {
     float routed_scale = 1.0f;
 };
 
+// The first requirement a layer's routed experts do not meet.
+enum class expert_refusal {
+    none,
+    unsupported_model,
+    no_executor,
+    layout,
+    extra_parameters,
+    lora,
+    quantization,
+    not_silu_gated,
+    compute_cache,
+    token_batch,
+    invalid_clamp,
+    missing_post_norm,
+};
+
 struct expert_validation {
-    bool accepted = false;
+    expert_refusal refusal = expert_refusal::none;
     expert_execution execution;
-    const char * error = nullptr;
+
+    [[nodiscard]] bool accepted() const noexcept { return refusal == expert_refusal::none; }
 };
 
 [[nodiscard]] expert_validation validate_experts(
         const expert_requirements & requirements, const expert_inputs & inputs) noexcept;
+
+// States a refusal for the person running the model, with the types it concerns.
+[[nodiscard]] std::string describe_refusal(const expert_inputs & inputs, expert_refusal refusal);
 
 } // namespace llama_ssd

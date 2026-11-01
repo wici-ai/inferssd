@@ -144,6 +144,47 @@ def test_failed_but_confirmed_cleanup_releases_then_reports_failure(tmp_path, mo
     assert value._lock is None and ends[0].closed
 
 
+def test_failure_reports_the_end_of_the_server_log(tmp_path, monkeypatch):
+    value, _, _, _ = launch_mock(tmp_path, monkeypatch)
+    (value.directory / "ownership.json").write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "error": "server exited before a requested stop",
+                "server": {"owned_processes_gone": True, "resource_scope_gone": True},
+            }
+        )
+    )
+    cause = "failed to initialize the context: layer 0: this quantization is not supported yet"
+    (value.directory / "server.log").write_text(
+        "".join(f"early line {n}\n" for n in range(50)) + cause + "\n" + "cleanup\n" * 5
+    )
+    with pytest.raises(RuntimeError) as failure:
+        value.stop()
+    message = str(failure.value)
+    assert "server exited before a requested stop" in message
+    assert cause in message
+    assert "early line 0" not in message
+    assert len(message.splitlines()) == 1 + 1 + owned.SERVER_LOG_TAIL_LINES
+
+
+def test_failure_without_a_server_log_still_reports_the_reason(tmp_path, monkeypatch):
+    value, _, _, _ = launch_mock(tmp_path, monkeypatch)
+    (value.directory / "ownership.json").write_text(
+        json.dumps(
+            {
+                "status": "failed",
+                "error": "RuntimeError: before the server started",
+                "server": {"owned_processes_gone": True, "resource_scope_gone": True},
+            }
+        )
+    )
+    with pytest.raises(RuntimeError) as failure:
+        value.stop()
+    assert "before the server started" in str(failure.value)
+    assert "server.log" not in str(failure.value)
+
+
 def test_guardian_entry_literal_under_main_and_disconnect_port(tmp_path, monkeypatch):
     p = policy(tmp_path)
     out = tmp_path / "run"

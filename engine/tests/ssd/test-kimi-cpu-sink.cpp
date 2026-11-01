@@ -409,6 +409,24 @@ static void compare_case(fixture_inputs & inputs, const char * name, fixture & f
     print_sample(name, run_checked(inputs, name, f, sink, meta, input, ids, weights, expected, layer, linear_beta));
 }
 
+// A well-formed tensor of TYPE, so a refusal comes from the type and not from its layout.
+static void retype(ggml_tensor * tensor, ggml_type type) {
+    tensor->type = type;
+    tensor->nb[0] = ggml_type_size(type);
+    tensor->nb[1] = ggml_row_size(type, tensor->ne[0]);
+    tensor->nb[2] = tensor->nb[1] * tensor->ne[1];
+    tensor->nb[3] = tensor->nb[2] * tensor->ne[2];
+}
+
+static void unsupported_type_case(fixture_inputs & inputs, fixture & f, const std::vector<float> & input) {
+    auto sink = make_sink(inputs, f, 2, 1); tensors meta(f, 1);
+    retype(meta.role[1], GGML_TYPE_F32);
+    const int32_t id = 3; const float weight = 1; std::vector<float> output(f.latent); char error[512] = {}; kimi_cpu_sink_stats stats = {};
+    const bool ok = kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight, 1,
+                                      4, 25, output.data(), &stats, error, sizeof(error));
+    require(!ok && std::strstr(error, "not supported yet") && std::strstr(error, "f32"), "unsupported type was not named");
+}
+
 static void fault_case(fixture_inputs & inputs, const char * name, fixture & f, fixture::fault_kind fault, const std::vector<float> & input) {
     f.fault = fault; auto sink = make_sink(inputs, f, 2, 1); tensors meta(f, 1);
     const int32_t id = 3; const float weight = 1; std::vector<float> output(f.latent); char error[512] = {}; kimi_cpu_sink_stats stats = {};
@@ -443,6 +461,7 @@ static void synthetic_tests(fixture_inputs & inputs, int threads, int ring_exper
     }
     auto one_compute = make_sink(inputs, f, 2, 1);
     compare_case(inputs, "single_compute_thread", f, one_compute.get(), 2, input, ids, weights);
+    unsupported_type_case(inputs, f, input);
     for (auto test : { std::make_pair("missing_entry", fixture::missing), std::make_pair("unaligned_offset", fixture::unaligned_offset),
                        std::make_pair("invalid_range_size", fixture::wrong_size), std::make_pair("short_read_drain", fixture::past_eof) }) {
         fault_case(inputs, test.first, f, test.second, input);

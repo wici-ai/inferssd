@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
 
 namespace {
 size_t comparisons = 0;
@@ -73,9 +74,9 @@ bool compare(llm_arch arch, float clamp, const llama_ssd::expert_inputs & in, in
     const auto requirements = llama_ssd::describe_experts(arch, hparams, layer);
     const auto actual = llama_ssd::validate_experts(requirements, in);
     const float old_clamp = arch == LLM_ARCH_DEEPSEEK41 && layer >= 0 ? clamp : 0.0f;
-    CHECK(actual.accepted == baseline_accepts(arch, old_clamp, in));
+    CHECK(actual.accepted() == baseline_accepts(arch, old_clamp, in));
     ++comparisons;
-    if (actual.accepted) {
+    if (actual.accepted()) {
         const auto & out = actual.execution;
         CHECK(out.activation == (arch == LLM_ARCH_DEEPSEEK41 ? llama_ssd::expert_activation::swiglu_clamp :
             llama_ssd::expert_activation::swiglu));
@@ -83,12 +84,13 @@ bool compare(llm_arch arch, float clamp, const llama_ssd::expert_inputs & in, in
         CHECK(out.post_norm == (in.post_norm != nullptr));
         CHECK(same_bits(out.post_norm_eps, in.post_norm_eps));
         CHECK(same_bits(out.routed_scale, in.routed_scale == 0.0f ? 1.0f : in.routed_scale));
-        CHECK(actual.error == nullptr);
+        CHECK(actual.refusal == llama_ssd::expert_refusal::none);
+        CHECK(llama_ssd::describe_refusal(in, actual.refusal).empty());
     } else {
-        CHECK(std::strcmp(actual.error, " requires the model's routed experts as contiguous, separate up/gate/down "
-            "SiLU-gated tensors of a supported format, without LoRA, biases or scales; no fallback") == 0);
+        CHECK(actual.refusal != llama_ssd::expert_refusal::none);
+        CHECK(!llama_ssd::describe_refusal(in, actual.refusal).empty());
     }
-    return actual.accepted;
+    return actual.accepted();
 }
 
 void model_and_numeric_boundaries() {
@@ -150,7 +152,7 @@ void qwen4exp_experts() {
     CHECK(compare(LLM_ARCH_QWEN4EXP, 0.0f, in));
     const auto accepted = llama_ssd::validate_experts(
         llama_ssd::describe_experts(LLM_ARCH_QWEN4EXP, llama_hparams{}, 0), in);
-    CHECK(accepted.accepted && accepted.execution.activation == llama_ssd::expert_activation::swiglu &&
+    CHECK(accepted.accepted() && accepted.execution.activation == llama_ssd::expert_activation::swiglu &&
         !accepted.execution.post_norm && accepted.execution.routed_scale == 1.0f);
     for (int prefill = 0; prefill < 2; ++prefill) {
         auto batch = in; batch.n_tokens = 512; batch.prefill = prefill;
@@ -251,6 +253,71 @@ void quantization_contract() {
     CHECK(compare(LLM_ARCH_MUSE_SPARK, 0.0f, next.inputs()));
     CHECK(compare(LLM_ARCH_MUSE_SPARK, 0.0f, first.inputs()));
 }
+llama_ssd::expert_refusal refusal_of(llm_arch arch, const llama_ssd::expert_inputs & in, float clamp = 7.0f) {
+    llama_hparams hparams{};
+    hparams.swiglu_clamp_exp[0] = clamp;
+    return llama_ssd::validate_experts(llama_ssd::describe_experts(arch, hparams, 0), in).refusal;
+}
+
+// A single defect names itself, so a person sees the requirement their model missed.
+void refusal_reasons() {
+    using refusal = llama_ssd::expert_refusal;
+    fixture f;
+    const auto good = f.inputs();
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, good) == refusal::none);
+    CHECK(refusal_of(LLM_ARCH_LLAMA, good) == refusal::unsupported_model);
+    auto in = good; in.backend_available = false;
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::no_executor);
+    in = good; in.runtime_available = false;
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::no_executor);
+    in = good; in.down = nullptr;
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::layout);
+    in = good; in.gate_up = &f.up;
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::layout);
+    in = good; in.up_bias = &f.up;
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::extra_parameters);
+    in = good; in.down_scale = &f.up;
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::extra_parameters);
+    in = good; in.weight_before_ffn = true;
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::extra_parameters);
+    in = good; in.has_lora = true;
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::lora);
+    in = good; in.silu = false;
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::not_silu_gated);
+    in = good; in.cache_compute = true;
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::compute_cache);
+    in = good; in.n_tokens = 2;
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::token_batch);
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, good, 0.0f) == refusal::invalid_clamp);
+    in = good; in.post_norm = nullptr;
+    CHECK(refusal_of(LLM_ARCH_MUSE_SPARK, in) == refusal::missing_post_norm);
+}
+
+bool contains(const std::string & text, const char * part) { return text.find(part) != std::string::npos; }
+
+// DeepSeek-V4.1-Flash Q3_K_M as published: Q3_K up and gate, Q4_K down in most layers.
+void quantization_refusals_name_the_types() {
+    using refusal = llama_ssd::expert_refusal;
+    fixture f;
+    f.up = f.gate = tensor(GGML_TYPE_Q3_K, 256, 512, 4);
+    f.down = tensor(GGML_TYPE_Q4_K, 512, 256, 4);
+    llama_hparams hparams{};
+    hparams.swiglu_clamp_exp[0] = 7.0f;
+    const auto deepseek = llama_ssd::describe_experts(LLM_ARCH_DEEPSEEK41, hparams, 0);
+    const auto refused = llama_ssd::validate_experts(deepseek, f.inputs());
+    CHECK(refused.refusal == refusal::quantization);
+    const auto message = llama_ssd::describe_refusal(f.inputs(), refused.refusal);
+    CHECK(contains(message, "not supported yet"));
+    CHECK(contains(message, "up=q3_K gate=q3_K down=q4_K"));
+
+    fixture mixed;
+    mixed.up = tensor(GGML_TYPE_Q4_K, 256, 512, 4);
+    mixed.gate = tensor(GGML_TYPE_Q8_0, 256, 512, 4);
+    const auto muse = llama_ssd::describe_experts(LLM_ARCH_MUSE_SPARK, hparams, 0);
+    const auto mismatch = llama_ssd::validate_experts(muse, mixed.inputs());
+    CHECK(mismatch.refusal == refusal::quantization);
+    CHECK(contains(llama_ssd::describe_refusal(mixed.inputs(), mismatch.refusal), "up=q4_K gate=q8_0"));
+}
 } // namespace
 
 int main() {
@@ -258,5 +325,7 @@ int main() {
     qwen4exp_experts();
     layout_refusals();
     quantization_contract();
+    refusal_reasons();
+    quantization_refusals_name_the_types();
     std::printf("model adapter: %zu frozen acceptance/descriptor comparisons passed\n", comparisons);
 }

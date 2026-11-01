@@ -174,7 +174,8 @@ int main() {
         try {
             graph_case(cpu.get(), 1, false, true, "unsupported_f16", GGML_TYPE_F16);
         } catch (const std::runtime_error & error) {
-            refused = std::string(error.what()).find("supported format") != std::string::npos;
+            const std::string message = error.what();
+            refused = message.find("not supported yet") != std::string::npos && message.find("f16") != std::string::npos;
         }
         require(refused, "unsupported expert layout did not refuse with a recoverable graph error");
         std::printf("CPU_PREFILL_GRAPH_OK execution=not_run kda_validation=not_run\n");

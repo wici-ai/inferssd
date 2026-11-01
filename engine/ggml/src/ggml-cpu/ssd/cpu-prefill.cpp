@@ -150,7 +150,8 @@ struct kimi_cpu_prefill {
                 throw std::runtime_error("CPU prefill requires valid contiguous expert metadata");
             }
             if (!prefill_expert_type_supported(tensor->type, tensor->ne[0])) {
-                throw std::runtime_error("CPU prefill requires a quantized CPU vec_dot expert type");
+                throw std::runtime_error(std::string("this quantization is not supported yet: the CPU prefill cannot compute ") +
+                    ggml_type_name(tensor->type) + " experts");
             }
         }
         if (up->type != gate->type) { throw std::runtime_error("CPU prefill requires up and gate experts of one type"); }
