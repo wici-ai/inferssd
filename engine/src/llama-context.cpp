@@ -206,7 +206,6 @@ llama_context::llama_context(
             throw std::runtime_error("grouped CPU prefill ubatch exceeds route index range");
         }
         cpu_prefill_max_tokens = uint32_t(*ssd_runtime->settings.integer("prefill.cpu_max_tokens"));
-        op_offload_min_tokens = uint32_t(*ssd_runtime->settings.integer("prefill.offload_min_tokens"));
         cpu_prefill_request_max_tokens = cpu_prefill_max_tokens;
     }
     // The retained resource profile sizes each request's prompt graph, then
@@ -1724,8 +1723,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
-    ggml_backend_sched_set_op_offload(sched.get(), cparams.op_offload && ubatch.n_tokens >= op_offload_min_tokens);
-
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
@@ -3058,7 +3055,7 @@ bool llama_gpu_offloads_mul_mat_id(const std::vector<ggml_backend_dev_t> & gpus,
 }
 
 bool llama_context::gpu_offloads_experts(uint32_t n_tokens) const {
-    if (!cparams.op_offload || n_tokens < op_offload_min_tokens) {
+    if (!cparams.op_offload) {
         return false;
     }
     std::vector<ggml_backend_dev_t> gpus;

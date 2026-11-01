@@ -145,19 +145,6 @@
             "maximum": 4294967295,
             "default": 4294967295
         },
-        "prefill.offload_min_tokens": {
-            "description": "Shortest pass whose ops on host weights may go to a GPU; a shorter one, decode included, stays on the CPU",
-            "kind": "integer",
-            "unit": "tokens",
-            "producer": "plan",
-            "scope": "all",
-            "cli": "--ssd-prefill-offload-min-tokens",
-            "default_literal": "1",
-            "type": "integer",
-            "minimum": 1,
-            "maximum": 4294967295,
-            "default": 1
-        },
         "vram.budget": {
             "description": "Expert VRAM byte budget or auto",
             "kind": "budget",

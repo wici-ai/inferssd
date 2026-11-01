@@ -113,8 +113,6 @@ struct llama_context {
     // whether the scheduler would compute a MUL_MAT_ID of n_tokens over the model's expert tensors on a GPU
     // (llama_gpu_offloads_mul_mat_id)
     bool gpu_offloads_experts(uint32_t n_tokens) const;
-    // Ops on host weights may go to a GPU in passes of at least this many tokens (prefill.offload_min_tokens).
-    uint32_t op_offload_min_tokens = 1;
     // the threshold: GGML_KIMI_CPU_PREFILL_MAX_TOKENS, else GGML_KIMI_CPU_PREFILL (1: every ubatch, 0: none)
     uint32_t cpu_prefill_max_tokens_get() const { return cpu_prefill_max_tokens; }
 

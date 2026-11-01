@@ -47,7 +47,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
     using namespace ssd::settings;
-    assert(registry().size() == 15);
+    assert(registry().size() == 14);
     assert(parse("inferssd-settings 1\nmodel.engram_prefetch=1\nmodel.hc_fused=0\n", "model.ssd"));
     assert(!parse("inferssd-settings 1\nmodel.hc_fused=2\n", "model-invalid.ssd"));
     auto base = parse("", "");
@@ -77,7 +77,7 @@ int main(int argc, char ** argv) {
     assert(*copy.integer("prefetch.depth") == 4 && *parsed.value.integer("prefetch.depth") == 2);
     for (const std::string bad :
          { "cpu.threads = 4", "cpu.compute_cpus = 0-1", "prefetch.depth = \"4\"", "prefetch.depth = 18446744073709551616",
-           "cpu.io_cpus = 1,1", "cpu.io_cpus = 2-0", "cpu.io_cpus = 1-99999999", "cpu.decode_participants = 256", "prefill.offload_min_tokens = 0", "unknown = 0",
+           "cpu.io_cpus = 1,1", "cpu.io_cpus = 2-0", "cpu.io_cpus = 1-99999999", "cpu.decode_participants = 256", "unknown = 0",
            "vram.reserve_mib = 64", "place.costs = cpu_fixed_us=nan", "place.costs = link_gbps=0",
            "place.costs = unknown=1", "place.costs = cpu_fixed_us=1,cpu_fixed_us=2", "vram.budget = \"123\"",
            "expert.source = [1]", "host.expert_cache_mib = 0", "prefetch.depth = 65" }) {
