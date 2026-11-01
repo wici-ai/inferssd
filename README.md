@@ -114,3 +114,14 @@ Contributions are welcome, including hardware results and improvements to expert
 Built on [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp), with thanks to their contributors and the model-adaptation community.
 
 InferSSD is licensed under [Apache-2.0](LICENSE); bundled llama.cpp/ggml and other third-party components keep their original licenses and notices; see [NOTICE](NOTICE). Model weights remain subject to their publishers' licenses.
+
+Experimental CUDA graph recapture uses a context-owned backend option, enabled
+by default only for DeepSeek 4.1. Muse Spark remains disabled and logs its
+disabled activation once per context. After an unchanged replay, a
+changed graph with the same node operations and kernel activity may be captured
+immediately when every CUDA device uses VMM. Initial warmup, phase-cache reuse,
+and OOM recovery retain their existing behavior. Other architectures and direct
+backend users default off; each context logs its activation once. The synthetic
+recapture test checks scope and safety guards without models. CUDA compilation,
+runtime correctness and final-source performance remain device validation work;
+experimental activation does not establish a performance gain.

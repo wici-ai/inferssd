@@ -1,3 +1,4 @@
+#include "graph-recapture.h"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "../ggml-ssd/host/budget-linux.h"
@@ -3964,8 +3965,9 @@ static ggml_cuda_graph_key ggml_cuda_graph_get_key(
 static bool ggml_cuda_graph_update_required(
         ggml_backend_cuda_context * cuda_ctx,
         ggml_cgraph * cgraph,
-        const ggml_cuda_graph_key & graph_key) {
+        const ggml_cuda_graph_key & graph_key, bool * nodes_changed) {
     bool res = false;
+    *nodes_changed = false;
 
     constexpr bool ignore_metadata_props = false; // Historical unset default.
 
@@ -3983,6 +3985,7 @@ static bool ggml_cuda_graph_update_required(
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
         res = true;
+        *nodes_changed = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
 
@@ -4022,6 +4025,9 @@ static bool ggml_cuda_graph_update_required(
 
         const bool changed = memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0;
         if (res || changed) {
+            *nodes_changed |= ggml_cuda_recapture_node_changed(
+                graph->node_props[i].node.op, ggml_is_empty(&graph->node_props[i].node),
+                prop.node.op, ggml_is_empty(&prop.node));
             graph->node_props[i] = prop;
             res = true;
         }
@@ -5157,6 +5163,9 @@ static void ggml_cuda_graph_evaluate_and_capture(
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
+#ifdef USE_CUDA_GRAPH
+    cuda_ctx->cuda_graph(graph_key)->replayed_since_capture = use_cuda_graph && !cuda_graph_update_required;
+#endif
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -5205,8 +5214,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             cuda_ctx->graph_compatible_calls++;
+            bool nodes_changed = false;
             const bool properties_changed = ggml_cuda_graph_update_required(
-                cuda_ctx, cgraph, graph_key);
+                cuda_ctx, cgraph, graph_key, &nodes_changed);
 
             if (graph_lookup.phase_reentry && graph_lookup.had_instance) {
                 cuda_ctx->graph_cache_reuse_candidates++;
@@ -5236,10 +5246,23 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
-                    graph->warmup_complete = false;
-                    cuda_ctx->graph_fallback_changed++;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    // Legacy pools can synchronize on OOM: only all-device VMM is safe.
+                    bool all_vmm = false;
+#if defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+                    all_vmm = true;
+                    for (int device = 0; device < ggml_cuda_info().device_count; ++device) {
+                        all_vmm &= ggml_cuda_info().devices[device].vmm;
+                    }
+#endif
+                    if (ggml_cuda_can_recapture(cuda_ctx->stable_recapture_enabled, all_vmm,
+                            graph->instance != nullptr, graph->replayed_since_capture, nodes_changed)) {
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = true;
+                    } else {
+                        graph->warmup_complete = false;
+                        cuda_ctx->graph_fallback_changed++;
+                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    }
 
                 } else {
                     use_cuda_graph = true;
@@ -6620,8 +6643,27 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Internal context option, deliberately default-off for direct backend users.
+static bool ggml_backend_cuda_configure_stable_recapture(ggml_backend_t backend, bool enabled) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    GGML_ASSERT(!ctx->stable_recapture_configured);
+    ctx->stable_recapture_configured = true;
+#if defined(USE_CUDA_GRAPH) && defined(GGML_USE_VMM) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ctx->stable_recapture_enabled = enabled;
+#else
+    GGML_UNUSED(enabled);
+#endif
+    return ctx->stable_recapture_enabled;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_configure_stable_recapture") == 0) {
+        return (void *) ggml_backend_cuda_configure_stable_recapture;
+    }
 #ifdef GGML_SSD_CUDA_EXECUTOR
     if (strcmp(name, "ggml_backend_cuda_ssd_api_v1") == 0) {
         return (void *) ggml_backend_cuda_ssd_api_v1;

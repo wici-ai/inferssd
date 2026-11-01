@@ -1244,6 +1244,7 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    bool replayed_since_capture = false;
     // after an out-of-memory instantiate/launch the graph runs eagerly for oom_skip_calls calls;
     // the window doubles with every further failure (oom_backoff) and resets once a launch succeeds
     uint32_t oom_skip_calls = 0;
@@ -1419,6 +1420,8 @@ struct ggml_cuda_stream_context {
 };
 
 struct ggml_backend_cuda_context {
+    bool stable_recapture_enabled = false;
+    bool stable_recapture_configured = false;
     // Borrowed from the owning llama context; outlives this backend.
     const ssd::runtime_services * ssd_services = nullptr;
     int device;
