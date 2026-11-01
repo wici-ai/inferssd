@@ -146,3 +146,20 @@ def test_install_help_needs_no_toolchain():
     result = subprocess.run(["sh", str(INSTALLER), "--help"], text=True, capture_output=True)
     assert result.returncode == 0
     assert "INFERSSD_REF" in result.stdout
+
+
+WINDOWS_INSTALLER = INSTALLER.with_name("install.ps1")
+
+
+def test_release_workflow_can_pin_the_windows_installer():
+    # .github/workflows/release.yml rewrites exactly this line to the tag.
+    assert re.search(r"^\$DefaultRef = 'main'$", WINDOWS_INSTALLER.read_text(), re.M)
+
+
+def test_windows_installer_builds_the_preset_the_framework_looks_in():
+    text = WINDOWS_INSTALLER.read_text()
+    assert "cmake --preset windows-llvm" in text
+    # The same targets as the POSIX installer on a machine without a CUDA GPU.
+    assert "--target inferssd-server inferssd-cpuprobe inferssd-ssdprobe" in text
+    for name in ("INFERSSD_HOME", "INFERSSD_BIN_DIR", "INFERSSD_REF", "INFERSSD_JOBS"):
+        assert name in text and name in INSTALLER.read_text()
