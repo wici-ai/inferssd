@@ -274,6 +274,13 @@ if (TARGET ggml-cpu)
         add_test(NAME ssd_precompute_memory COMMAND test-ssd-precompute-memory)
         set_property(TEST ssd_runtime_options PROPERTY LABELS main)
 
+        add_executable(test-ssd-resident-rotation-options ssd/test-resident-rotation-options.cpp)
+        target_compile_features(test-ssd-resident-rotation-options PRIVATE cxx_std_17)
+        target_compile_options(test-ssd-resident-rotation-options PRIVATE -UNDEBUG)
+        target_include_directories(test-ssd-resident-rotation-options PRIVATE ../ggml/src ../src ../ggml/include)
+        target_link_libraries(test-ssd-resident-rotation-options PRIVATE ggml-ssd-settings)
+        add_test(NAME ssd_resident_rotation_options COMMAND test-ssd-resident-rotation-options)
+
         add_executable(test-ssd-settings-telemetry ssd/test-settings-telemetry.cpp)
         target_compile_options(test-ssd-settings-telemetry PRIVATE -UNDEBUG)
         target_include_directories(test-ssd-settings-telemetry PRIVATE ../ggml/src)

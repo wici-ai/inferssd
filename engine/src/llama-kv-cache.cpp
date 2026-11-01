@@ -1390,7 +1390,43 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     return v_idxs;
 }
 
+// Adapted from anton-iermolenko, ggml-org/llama.cpp PR #31073, revision
+// 6709ef11e6c7854bc4ec4705a8c2584ed36ce102: upload invariant Hadamard data once.
+// Conservative fork scope: uniform single-backend V4.1 indexer only.
+bool llama_kv_cache::enable_resident_indexer_rotation() {
+    GGML_ASSERT(!resident_rot_attempted);
+    resident_rot_attempted = true;
+    if (model.arch != LLM_ARCH_DEEPSEEK41 || !attn_rot_k || attn_rot_v || layers.empty() ||
+            n_embd_head_k_all != 128 || hparams.indexer_head_size != 128 ||
+            hparams.n_embd_head_k_full != hparams.indexer_head_size) {
+        return false;
+    }
+    auto * first = layers.front().k;
+    // Unallocated/no_alloc caches and mixed placements retain the original input path.
+    if (!first || !first->buffer || !first->data) { return false; }
+    const auto buft = ggml_backend_buffer_get_type(first->buffer);
+    for (const auto & layer : layers) {
+        if (!layer.k || !layer.k->buffer || !layer.k->data ||
+                ggml_backend_buffer_get_type(layer.k->buffer) != buft) { return false; }
+    }
+    const auto & data = attn_rot_hadamard.at(128);
+    ggml_init_params params = {ggml_tensor_overhead(), nullptr, true};
+    ggml_context_ptr ctx {ggml_init(params)};
+    if (!ctx) { throw std::runtime_error("failed to create resident rotation context"); }
+    auto * rot = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 128, 128);
+    ggml_set_name(rot, "attn_resident_indexer_k_rot");
+    ggml_backend_buffer_ptr buffer {ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft)};
+    if (!buffer) { throw std::runtime_error("failed to allocate resident rotation buffer"); }
+    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(rot, data.data(), 0, ggml_nbytes(rot));
+    resident_rot_ctx = std::move(ctx);
+    resident_rot_buffer = std::move(buffer);
+    resident_k_rot = rot;
+    return true;
+}
+
 ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
+    if (resident_k_rot) { return resident_k_rot; }
     ggml_tensor * res = nullptr;
 
     // a cache with no layers leaves n_embd_head_k_all at 0, and every nrot divides 0, so the
@@ -1752,6 +1788,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
+    if (dst == resident_k_rot) { return; }
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
     const auto n_rot = dst->ne[0];

@@ -19,7 +19,7 @@ SETTING_KEYS = frozenset((
     "place.costs", "prefill.cpu_max_tokens", "prefill.offload_min_tokens", "vram.budget",
     "vram.max_slots",
     "vram.reserve_mib", "vram.margin_mib", "host.headroom_mib", "host.budget_mib",
-    "model.engram_prefetch", "model.hc_fused",
+    "model.engram_prefetch", "model.hc_fused", "model.kv_rotation_resident",
 ))
 SETTING_GENERATIONS = (SETTING_KEYS,)
 
@@ -163,7 +163,7 @@ def validate_binding(binding):
             or not isinstance(binding["semantic_settings"], dict)
             or frozenset(binding["semantic_settings"]) not in SETTING_GENERATIONS
             or not isinstance(binding["sides"], dict) or set(binding["sides"]) != {"base", "candidate"}):
-        raise ValueError("explicit legacy-to-typed binding with all 14 settings required")
+        raise ValueError("explicit legacy-to-typed binding with all 15 settings required")
     identity(binding)
     validate_semantics(binding["semantic_settings"])
     for side, spec in binding["sides"].items():
