@@ -52,6 +52,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include <unordered_map>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <future>
 #include <thread>
 
@@ -1966,6 +1967,13 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // see ggml_vk_keep_awake
+    std::thread keep_awake_thread;
+    std::mutex keep_awake_mutex;
+    std::condition_variable keep_awake_signal;
+    std::chrono::steady_clock::time_point last_graph;
+    bool keep_awake_stop {};
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -13583,8 +13591,55 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
 }
 
 // Clean up on backend free
+// A GPU left idle can take far longer to start its next submit than to run it: on an integrated GPU, in the gap while
+// the CPU computes a layer's experts, 143 ms inside vkQueueSubmit and another 250-345 ms to its fence, for a few
+// milliseconds of work. A small submit every 20 ms holds the queue out of that state, so while graphs keep coming this
+// thread sends one; it goes quiet once no graph has come for a while.
+static void ggml_vk_keep_awake(ggml_backend_vk_context * ctx) {
+    const auto period = std::chrono::milliseconds(20);
+    const auto window = std::chrono::seconds(10);
+    vk_device & device = ctx->device;
+    vk::Device dev = device->device;
+    vk::CommandPool pool = dev.createCommandPool(vk::CommandPoolCreateInfo({}, device->compute_queue.queue_family_index));
+    vk::CommandBuffer cmd = dev.allocateCommandBuffers(vk::CommandBufferAllocateInfo(pool, vk::CommandBufferLevel::ePrimary, 1)).front();
+    vk_buffer target = ggml_vk_create_buffer_device(device, 4096);
+    cmd.begin(vk::CommandBufferBeginInfo{});
+    cmd.fillBuffer(target->buffer, 0, 4, 0);
+    cmd.end();
+    vk::Fence fence = dev.createFence({});
+    const vk::SubmitInfo submit(0, nullptr, nullptr, 1, &cmd);
+    std::unique_lock<std::mutex> lock(ctx->keep_awake_mutex);
+    while (!ctx->keep_awake_stop) {
+        if (std::chrono::steady_clock::now() - ctx->last_graph > window) {
+            ctx->keep_awake_signal.wait(lock);
+            continue;
+        }
+        lock.unlock();
+        {
+            std::lock_guard<std::mutex> guard(queue_mutex);
+            device->compute_queue.queue.submit(submit, fence);
+        }
+        VK_CHECK(dev.waitForFences({ fence }, true, UINT64_MAX), "keep awake");
+        dev.resetFences({ fence });
+        lock.lock();
+        ctx->keep_awake_signal.wait_for(lock, period, [&] { return ctx->keep_awake_stop; });
+    }
+    lock.unlock();
+    dev.destroyFence(fence);
+    ggml_vk_destroy_buffer(target);
+    dev.destroyCommandPool(pool);
+}
+
 static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
+    if (ctx->keep_awake_thread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(ctx->keep_awake_mutex);
+            ctx->keep_awake_stop = true;
+        }
+        ctx->keep_awake_signal.notify_one();
+        ctx->keep_awake_thread.join();
+    }
     // discard any unsubmitted command buffers
     ctx->compute_ctx.reset();
     // wait for any pending command buffers to finish
@@ -14536,6 +14591,15 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->keep_awake_mutex);
+        ctx->last_graph = std::chrono::steady_clock::now();
+        if (!ctx->keep_awake_thread.joinable()) {
+            ctx->keep_awake_thread = std::thread(ggml_vk_keep_awake, ctx);
+        }
+    }
+    ctx->keep_awake_signal.notify_one();
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
