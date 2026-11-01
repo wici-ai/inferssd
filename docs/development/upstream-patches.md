@@ -134,7 +134,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-context.h` | 148 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
-| `src/llama-graph.cpp` | 759 | 50 |
+| `src/llama-graph.cpp` | 760 | 50 |
 | `src/llama-graph.h` | 158 | 5 |
 | `src/llama-hparams.cpp` | 21 | 0 |
 | `src/llama-hparams.h` | 73 | 1 |
@@ -163,7 +163,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/models/kimi-linear.cpp` | 2 | 2 |
 | `src/models/models.h` | 165 | 0 |
 | `src/models/qwen35.cpp` | 2 | 2 |
-| `src/models/qwen35moe.cpp` | 2 | 2 |
+| `src/models/qwen35moe.cpp` | 8 | 2 |
 | `src/models/qwen3next.cpp` | 2 | 2 |
 | `tools/server/CMakeLists.txt` | 13 | 5 |
 | `tools/server/server-chat.cpp` | 66 | 16 |
@@ -174,5 +174,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 17005 added, 5675 removed across 143 upstream paths.
+Total: 17012 added, 5675 removed across 143 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
