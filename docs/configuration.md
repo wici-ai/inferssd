@@ -13,7 +13,6 @@ Python resource. There are no environment mirrors or legacy-name aliases.
 | `prefetch.depth` | integer / predicted experts | `2` | plan | all |
 | `place.costs` | costs / named us and GB/s terms | `empty` | plan | all |
 | `prefill.cpu_max_tokens` | integer / tokens | `4294967295` | plan | linux |
-| `prefill.offload_min_tokens` | integer / tokens | `1` | plan | all |
 | `vram.budget` | budget / bytes | `auto` | plan | linux |
 | `vram.max_slots` | integer / slots | `0` | plan | linux |
 | `vram.reserve_mib` | integer / MiB | `0` | launch | linux |
@@ -42,12 +41,8 @@ the RAM cache takes the envelope). Auto gives no tier where no CUDA backend
 runs: on macOS and Windows, on a CPU-only build, or with only Metal or another
 GPU backend, which then runs the dense layers while the CPU sink computes every
 routed expert. An
-explicit nonzero budget without a CUDA backend is an error.
-`prefill.offload_min_tokens` is the shortest pass whose ops on host weights may
-go to a GPU. With the dense weights mapped on the CPU (`-ngl 0`), a GPU then takes
-the long prompt passes it computes faster, while shorter passes and decode stay
-on the CPU, without a second copy of the weights. The default of 1 lets any pass go.
-On macOS the interface supports static settings only; it does not include an online adaptive
+explicit nonzero budget without a CUDA backend is an error. On macOS the
+interface supports static settings only; it does not include an online adaptive
 controller.
 
 The host memory ledger has two terms on every platform. The envelope is a finite
