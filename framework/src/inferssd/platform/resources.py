@@ -8,17 +8,17 @@ from __future__ import annotations
 
 import re
 import resource
-import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Optional
 
+from inferssd.platform.captured_command import run_captured
 from inferssd.platform.policy import Policy
 
 
 def command(argv: Sequence[str]) -> str:
-    value = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+    value = run_captured(argv, timeout=10)
     if value.returncode:
         raise RuntimeError(
             f"resource command failed ({value.returncode}): {argv[0]}: {value.stderr}"

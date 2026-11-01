@@ -12,7 +12,6 @@ import datetime
 import os
 import platform
 import shutil
-import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +20,7 @@ from typing import Optional, Protocol
 from inferssd.launch.linux import cpu_count
 from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.types import Fact, LaunchInput, Reply
+from inferssd.platform.captured_command import run_captured
 from inferssd.strategy import inputs as strategy_inputs
 
 
@@ -49,7 +49,7 @@ class NativeHost:
     """Concrete standard-library host operations, with bounded command waits."""
 
     def command(self, argv: Sequence[str]) -> Command:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        result = run_captured(argv, timeout=10)
         return Command(result.returncode, result.stdout, result.stderr)
 
     def exists(self, path: str) -> bool:

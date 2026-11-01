@@ -277,7 +277,8 @@ def test_run_process_uses_no_shell(monkeypatch):
     run_process(["probe", "--file", "a b"], 3, {"PATH": "/bin"})
     assert seen["argv"] == ["probe", "--file", "a b"] and "shell" not in seen
     assert seen["capture_output"] and seen["text"] and seen["timeout"] == 3
-    assert (seen["encoding"], seen["errors"], seen["env"]) == ("utf-8", "replace", {"PATH": "/bin"})
+    assert (seen["encoding"], seen["errors"]) == ("utf-8", "replace")
+    assert seen["env"] == {"PATH": "/bin", "LC_ALL": "C"}
 
 
 def point(size, qd, *rates):
