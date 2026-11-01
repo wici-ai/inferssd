@@ -2039,6 +2039,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, bool op_offload) {
+    GGML_ASSERT(sched);
+    sched->op_offload = op_offload;
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
