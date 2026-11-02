@@ -255,6 +255,19 @@
             "minimum": 0,
             "maximum": 1,
             "default": 1
+        },
+        "model.kv_rotation_resident": {
+            "description": "Experimental resident indexer rotation; effective default on only for DeepSeek V4.1, off for all other architectures",
+            "kind": "integer",
+            "unit": "boolean",
+            "producer": "model",
+            "scope": "all",
+            "cli": "--ssd-model-kv-rotation-resident",
+            "default_literal": "1",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 1
         }
     }
 }

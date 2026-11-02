@@ -9,6 +9,8 @@
 #include "ssd/host-gather.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache-dsv4.h"
+#include "llama-rotation-options.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -380,6 +382,19 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+    }
+
+    // Read and consume once per context, after memory ownership and before graph building.
+    if (model.arch == LLM_ARCH_DEEPSEEK41 || model.arch == LLM_ARCH_MUSE_SPARK) {
+        const bool requested = ssd::settings::resident_rotation_requested(
+                ssd_runtime ? &ssd_runtime->settings : nullptr, model.arch);
+        bool enabled = false;
+        if (requested) {
+            auto * cache = dynamic_cast<llama_kv_cache_dsv4 *>(memory.get());
+            enabled = cache && cache->get_lid() && cache->get_lid()->enable_resident_indexer_rotation();
+        }
+        const auto receipt = ssd::settings::resident_rotation_receipt(model.arch, enabled);
+        LLAMA_LOG_INFO("rsi.design.active %s\n", receipt.c_str());
     }
 
     // init backends

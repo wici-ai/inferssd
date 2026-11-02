@@ -132,7 +132,7 @@ def test_the_reviewed_generation_is_exactly_the_installed_registry(binding, monk
     unreviewed = copy.deepcopy(settings_registry.schema())
     del unreviewed["properties"]["host.budget_mib"]
     monkeypatch.setattr(settings_registry, "schema", lambda: unreviewed)
-    with pytest.raises(ValueError, match="reviewed 14-key schema"):
+    with pytest.raises(ValueError, match="reviewed 15-key schema"):
         reference.validate_semantics(binding["semantic_settings"])
 
 
@@ -210,3 +210,15 @@ def test_private_config_binding_must_name_merge_candidate_not_pr_head(binding, s
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="exact base/merge candidate"):
         compare.device_report(root, plan, policy)
+
+
+@pytest.mark.parametrize("missing", ["semantic", "mapping", "typed"])
+def test_resident_rotation_requires_explicit_complete_reference_binding(binding, missing):
+    if missing == "semantic":
+        binding["semantic_settings"].pop("model.kv_rotation_resident")
+    elif missing == "mapping":
+        binding["legacy_mapping"].pop("model.kv_rotation_resident")
+    else:
+        binding["sides"]["candidate"]["launch_policy"]["typed_values"].pop("model.kv_rotation_resident")
+    with pytest.raises(ValueError):
+        reference.validate_binding(binding)

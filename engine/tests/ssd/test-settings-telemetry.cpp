@@ -47,11 +47,13 @@ int main(int argc, char ** argv) {
         return 0;
     }
     using namespace ssd::settings;
-    assert(registry().size() == 14);
+    assert(registry().size() == 15);
     assert(parse("inferssd-settings 1\nmodel.engram_prefetch=1\nmodel.hc_fused=0\n", "model.ssd"));
     assert(!parse("inferssd-settings 1\nmodel.hc_fused=2\n", "model-invalid.ssd"));
     auto base = parse("", "");
     assert(base);
+    assert(*base.value.integer("model.kv_rotation_resident") == 1);
+    assert(!parse("inferssd-settings 1\nmodel.kv_rotation_resident=2\n", "rotation-invalid.ssd"));
     assert(*base.value.integer("prefetch.depth") == 2);
     assert(base.value.integer("expert.source") == nullptr);
     assert(base.value.find("unknown") == nullptr);
