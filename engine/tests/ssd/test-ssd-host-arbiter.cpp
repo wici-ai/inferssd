@@ -131,6 +131,7 @@ static void holds_and_pending() {
     b->set_prefill_pages(GiB); b->set_prefill_pages(GiB);
     require(b->state().all_prefill_pages == GiB, "repeated hold added");
     b->set_prefill_pages(9*GiB); require(!b->take(1) && b->state().prefill_pages == 9*GiB, "refusal lost prefill hold");
+    require(bool(b->take(0)), "a shortage refused a take of nothing");
     b->clear_prefill_pages(); f.limit = 2*GiB; f.current = 0; f.available = 2*GiB;
     auto t = a->take(GiB); require(bool(t), "first take failed");
     require(!b->take(GiB), "unmaterialized allocation granted twice");
@@ -301,8 +302,11 @@ static void result_errors_and_tracked_allocations() {
     auto refused = a->take(1);
     require(!refused && refused.code == ssd::status::io && checked(a->state()).pending_bytes == 0,
         "callback exception escaped core or leaked pending");
+    require(refused.error == "host callback: fixture callback", "a callback's error lost what it threw");
     auto broken = std::make_shared<process_arbiter>([](const std::string &, std::string &) -> bool { throw std::runtime_error("fixture reader"); });
-    require(broken->make_client().code == ssd::status::io, "reader exception escaped owner construction");
+    const auto unread = broken->make_client();
+    require(unread.code == ssd::status::io && unread.error == "host owner initialization: fixture reader",
+        "reader exception escaped owner construction or lost what it threw");
     auto exhausted = std::make_shared<process_arbiter>([](const std::string &, std::string &) -> bool { throw std::bad_alloc(); });
     require(exhausted->make_client().code == ssd::status::resource, "allocation failure escaped owner construction");
 }

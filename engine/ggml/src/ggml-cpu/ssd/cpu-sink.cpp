@@ -844,7 +844,7 @@ struct kimi_cpu_sink {
     // arbiter admits at the full watermark boost, so the cache gives back until the room fits as measured there.
     ssd::host::actions reclaimer() {
         ssd::host::actions out;
-        out.collect_deferred = [this] { quiescent([this] { vram.collect_deferred(cache, -1); return true; }); };
+        out.collect_deferred = [this] { quiescent([this] { vram.collect_deferred(cache, KIMI_VRAM_COLLECT_IF_IDLE); return true; }); };
         out.reclaim_tier = [this](uint64_t bytes) { return quiescent([&] { return vram.reclaim_host(bytes); }); };
         out.reclaim_cache = [this](uint64_t bytes) {
             return quiescent([&] { return cache.arena && cache.reclaim_for_guard(bytes, "host_room", true); });

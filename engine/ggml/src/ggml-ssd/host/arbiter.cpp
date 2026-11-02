@@ -27,6 +27,11 @@ template<class T, class F> result<T> guarded(F && call) noexcept {
     try { return call(); }
     catch (const std::bad_alloc &) { return failed<T>(status::resource, "host allocation"); }
     catch (const std::bad_weak_ptr &) { return failed<T>(status::invalid, "host ownership"); }
+    catch (const std::exception & error) {
+        // The error the run ends in names what the callback threw, a reclaimer's fault for one.
+        try { return failed<T>(status::io, (std::string("host callback: ") + error.what()).c_str()); }
+        catch (...) { return failed<T>(status::io, "host callback"); }
+    }
     catch (...) { return failed<T>(status::io, "host callback"); }
 }
 bool same_config(const client_config & a, const client_config & b) noexcept {
@@ -233,12 +238,19 @@ struct process_arbiter::impl {
 process_arbiter::process_arbiter(reader injected) noexcept {
     try { impl_.reset(new impl(std::move(injected))); }
     catch (const std::bad_alloc &) { init_status_ = status::resource; }
+    catch (const std::exception & error) {
+        init_status_ = status::io;
+        try { init_error_ = error.what(); } catch (...) {}
+    }
     catch (...) { init_status_ = status::io; }
 }
 process_arbiter::~process_arbiter() = default;
 result<std::unique_ptr<context_client>> process_arbiter::make_client() noexcept {
     return guarded<std::unique_ptr<context_client>>([&]() -> result<std::unique_ptr<context_client>> {
-        if (!impl_) { return failed<std::unique_ptr<context_client>>(init_status_, "host owner initialization"); }
+        if (!impl_) {
+            return failed<std::unique_ptr<context_client>>(init_status_, init_error_.empty() ?
+                "host owner initialization" : ("host owner initialization: " + init_error_).c_str());
+        }
         auto owner = shared_from_this();
         auto state = std::make_shared<detail::client_state>();
         auto client = std::unique_ptr<context_client>(new context_client(std::move(owner), state));
@@ -389,7 +401,8 @@ result<allocation_ticket> context_client::take(uint64_t host, uint64_t device, r
             auto observed = owner.measure(extra, true);
             const bool readable = observed.system || observed.cgroup != room_unreadable;
             const bool missing_cgroup = observed.cgroup == room_unreadable && (finite || !owner.unbounded_cgroup());
-            if (!observed.fits() || !readable || missing_cgroup) {
+            // Nothing asked for needs no room: a shortage must not stop a run over memory it already holds.
+            if ((extra && !observed.fits()) || !readable || missing_cgroup) {
                 const auto code = !readable || missing_cgroup ? status::io : status::resource;
                 return {allocation_ticket({}, {}, 0, observed), code, "host budget refused"};
             }

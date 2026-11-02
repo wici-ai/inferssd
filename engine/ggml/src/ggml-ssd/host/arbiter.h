@@ -115,6 +115,7 @@ class process_arbiter : public std::enable_shared_from_this<process_arbiter> {
     struct impl;
     std::unique_ptr<impl> impl_;
     status init_status_ = status::ok;
+    std::string init_error_; // what the reader threw at construction, if it said
 };
 
 class context_client {
