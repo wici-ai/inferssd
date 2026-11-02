@@ -112,15 +112,22 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-cuda/unary.cuh` | 16 | 0 |
 | `ggml/src/ggml-cuda/vecdotq.cuh` | 2 | 1 |
 | `ggml/src/ggml-hexagon/ggml-hexagon.cpp` | 1 | 0 |
-| `ggml/src/ggml-metal/ggml-metal-device.m` | 2 | 1 |
+| `ggml/src/ggml-metal/ggml-metal-device.cpp` | 12 | 0 |
+| `ggml/src/ggml-metal/ggml-metal-device.h` | 1 | 0 |
+| `ggml/src/ggml-metal/ggml-metal-device.m` | 8 | 1 |
+| `ggml/src/ggml-metal/ggml-metal-impl.h` | 47 | 0 |
+| `ggml/src/ggml-metal/ggml-metal-ops.cpp` | 136 | 0 |
+| `ggml/src/ggml-metal/ggml-metal-ops.h` | 3 | 0 |
 | `ggml/src/ggml-metal/ggml-metal.cpp` | 1 | 0 |
+| `ggml/src/ggml-metal/ggml-metal.metal` | 133 | 0 |
 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | 1 | 0 |
 | `ggml/src/ggml-openvino/ggml-openvino.cpp` | 1 | 0 |
 | `ggml/src/ggml-quants.c` | 5 | 0 |
 | `ggml/src/ggml-rpc/ggml-rpc.cpp` | 1 | 0 |
 | `ggml/src/ggml-sycl/ggml-sycl.cpp` | 1 | 0 |
 | `ggml/src/ggml-virtgpu/ggml-backend.cpp` | 1 | 0 |
-| `ggml/src/ggml-vulkan/ggml-vulkan.cpp` | 1 | 0 |
+| `ggml/src/ggml-vulkan/ggml-vulkan.cpp` | 103 | 0 |
+| `ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp` | 4 | 0 |
 | `ggml/src/ggml-webgpu/ggml-webgpu.cpp` | 1 | 0 |
 | `ggml/src/ggml-zdnn/ggml-zdnn.cpp` | 1 | 0 |
 | `ggml/src/ggml-zendnn/ggml-zendnn.cpp` | 1 | 0 |
@@ -174,5 +181,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 17012 added, 5675 removed across 143 upstream paths.
+Total: 17456 added, 5675 removed across 150 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
