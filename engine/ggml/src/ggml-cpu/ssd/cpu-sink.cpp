@@ -248,9 +248,14 @@ struct sink_phase {
     uint32_t call() const { return uint32_t(word >> 51 & 0xfffu); }
 };
 
-// The waits at a node's boundaries, for the open at its start and for the close after the run's last phase, spin
-// briefly before they park; 20 us measured best on macOS and Windows, where longer spins slowed the runs.
+// The waits at a node's boundaries, for the open at its start and for the close after the run's last phase, spin at
+// least this long before they park.
 constexpr int sink_node_spin_us = 20;
+// How long a participant of a production sink polls for the next phase before it parks. The gaps between phases are
+// a read or a GPU wait of a few milliseconds, and each park costs a wakeup the next phase waits for on every thread:
+// on 60 threads of a KVM guest that took decode from 152 to 272 ms a token, where 1 ms already reaches the plateau
+// and 10 ms gains nothing. Other machines gain a little more from 3 ms than from 1.
+constexpr int sink_production_poll_us = 3000;
 
 // The CPUs this process may run on; 1 when they cannot be read.
 static int sink_process_cpus() {
@@ -774,7 +779,7 @@ struct kimi_cpu_sink {
         profile_enabled(configuration.debug.profile), trace_enabled(configuration.debug.trace),
         timeline_enabled(configuration.debug.trace), mrc(configuration.debug.mrc), worker_profiles(1),
         fast_cpus(sink_fast_cpus()) {
-        if (poll_us < 0 || poll_us > 1000 || dynamic_chunk_rows < 16 || dynamic_chunk_rows > 16384 || dynamic_chunk_rows % 16 ||
+        if (poll_us < 0 || poll_us > 10000 || dynamic_chunk_rows < 16 || dynamic_chunk_rows > 16384 || dynamic_chunk_rows % 16 ||
                 configuration.policy.decode_participants < 0 || configuration.policy.decode_participants > sink_max_participants) {
             throw std::runtime_error("invalid explicit executor schedule");
         }
@@ -3281,6 +3286,7 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     if (!input) { throw std::runtime_error("missing typed SSD settings"); }
     sink_configuration out;
     out.production = true;
+    out.policy.poll_us = sink_production_poll_us;
     if (!services || !services->host) { throw std::runtime_error("missing process host budget client"); }
     out.settings = *input;
     sink_copy_services(out, services);
