@@ -126,7 +126,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-rpc/ggml-rpc.cpp` | 1 | 0 |
 | `ggml/src/ggml-sycl/ggml-sycl.cpp` | 1 | 0 |
 | `ggml/src/ggml-virtgpu/ggml-backend.cpp` | 1 | 0 |
-| `ggml/src/ggml-vulkan/ggml-vulkan.cpp` | 103 | 0 |
+| `ggml/src/ggml-vulkan/ggml-vulkan.cpp` | 109 | 2 |
 | `ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp` | 4 | 0 |
 | `ggml/src/ggml-webgpu/ggml-webgpu.cpp` | 1 | 0 |
 | `ggml/src/ggml-zdnn/ggml-zdnn.cpp` | 1 | 0 |
@@ -181,5 +181,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 17456 added, 5675 removed across 150 upstream paths.
+Total: 17462 added, 5677 removed across 150 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
