@@ -46,6 +46,7 @@ from inferssd.machine.identity import (
     GPUQueryFailed,
     Host,
     drive_info,
+    is_test_file,
     live_identity,
     online_cpus,
     read,
@@ -218,6 +219,8 @@ def model_files(host: Host, paths: Sequence[str]) -> list[tuple[str, int]]:
         # An empty directory lists nothing: its drive is measured with a test file.
         listed = [row for name in names for row in host.regular_files(name)]
         for real, size in listed:
+            if is_test_file(real):  # a drive test file, never a model
+                continue
             found.setdefault(real, size)
     return list(found.items())
 
@@ -242,12 +245,26 @@ def model_drives(host: Host, paths: Sequence[str]) -> dict[str, ModelDrive]:
         drive = devices[device]
         return drives.setdefault(drive.key, ModelDrive(drive, [], []))
 
-    for path, size in model_files(host, paths):
-        holding(path).files.append((path, size))
+    seen: set[str] = set()
     for path in paths:
-        if host.is_directory(path):
+        listed = model_files(host, [path])
+        for real, size in listed:
+            if real not in seen:
+                seen.add(real)
+                holding(real).files.append((real, size))
+        # Only a directory with no file to read gets a test file: one whose files sit on
+        # another drive (a mount, links) has that drive measured from them instead.
+        if host.is_directory(path) and all(size < MIN_FILE_BYTES for _, size in listed):
             holding(path).directories.append(path)
     return drives
+
+
+def models_drive(drives: dict[str, ModelDrive]) -> Optional[str]:
+    """The drive holding most of the given files' bytes, else the first given directory's."""
+    held = {key: sum(size for _, size in place.files) for key, place in drives.items()}
+    if any(held.values()):
+        return max(held, key=lambda key: held[key])
+    return next((key for key, place in drives.items() if place.directories), None)
 
 
 def measure_cpu(
@@ -398,6 +415,8 @@ def measure_drive(
     """Read rates of PLACE's drive: in its largest files, else in a test file in its directory."""
     start = clock()
     drive = place.drive
+    for directory in place.directories:
+        host.clear_test_files(directory)
     chosen = [
         path
         for path, size in sorted(place.files, key=lambda item: -item[1])

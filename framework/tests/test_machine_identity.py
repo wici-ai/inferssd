@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import os
 import plistlib
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,9 @@ from inferssd.machine.identity import (
     cpu_brand,
     drive_info,
     drive_key,
+    is_test_file,
     live_identity,
+    owner_of_test_file,
     same_hardware,
     with_saved_gpus,
 )
@@ -106,7 +109,7 @@ class FakeHost(NativeHost):
     @contextlib.contextmanager
     def test_file(self, directory, size):
         # Sparse, so a test writes nothing; the real host fills it with random bytes.
-        path = os.path.join(directory, ".inferssd-drive-test-0")
+        path = os.path.join(directory, f".inferssd-drive-test-{os.getpid()}-fake")
         with open(path, "wb") as stream:
             stream.truncate(size)
         try:
@@ -505,11 +508,31 @@ def test_darwin_drive_reports_unreadable_diskutil_output(tmp_path):
         drive_info(FakeHost(tmp_path, "darwin", "arm64", commands), "/x")
 
 
+def ended_process():
+    child = subprocess.Popen(["true"])
+    child.wait()
+    return child.pid
+
+
 def test_native_test_file_is_random_uncompressible_and_removed(tmp_path):
-    (tmp_path / ".inferssd-drive-test-left").write_bytes(b"from a killed run")
     (tmp_path / "model.gguf").write_bytes(b"kept")
     with NativeHost().test_file(str(tmp_path), (3 << 20) + 5) as path:
         data = Path(path).read_bytes()
         assert len(data) == (3 << 20) + 5 and len(set(data[:65536])) == 256
+        assert os.path.basename(path).startswith(f".inferssd-drive-test-{os.getpid()}-")
+        assert owner_of_test_file(path) == os.getpid() and is_test_file(path)
         assert sorted(os.listdir(tmp_path)) == sorted([os.path.basename(path), "model.gguf"])
     assert os.listdir(tmp_path) == ["model.gguf"]
+
+
+def test_only_test_files_of_ended_runs_are_cleared(tmp_path):
+    names = [
+        f".inferssd-drive-test-{ended_process()}-a",  # a killed run's
+        ".inferssd-drive-test-left",  # from before names carried a process
+        f".inferssd-drive-test-{os.getpid()}-b",  # a live run's
+        "model.gguf",
+    ]
+    for name in names:
+        (tmp_path / name).write_bytes(b"x")
+    NativeHost().clear_test_files(str(tmp_path))
+    assert sorted(os.listdir(tmp_path)) == sorted(names[2:])

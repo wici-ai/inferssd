@@ -74,6 +74,7 @@ class Host(Protocol):
     def is_directory(self, path: str) -> bool: ...
     def free_bytes(self, path: str) -> int: ...
     def test_file(self, directory: str, size: int) -> AbstractContextManager[str]: ...
+    def clear_test_files(self, directory: str) -> None: ...
     def glob(self, pattern: str) -> list[str]: ...
     def page_bytes(self) -> int: ...
 
@@ -142,13 +143,10 @@ class NativeHost:
 
         The bytes are random, so no layer below can compress them, and are written past the
         page cache where the platform allows (F_NOCACHE on macOS; written back and dropped
-        on Linux), so reading them reaches the drive. A test file that a killed run left
-        behind is removed first.
+        on Linux), so reading them reaches the drive. Its name carries this process's ID,
+        so another run tells it from one a killed run left behind (see clear_test_files).
         """
-        for stale in glob.glob(os.path.join(glob.escape(directory), TEST_FILE_PREFIX + "*")):
-            with contextlib.suppress(OSError):
-                os.unlink(stale)
-        handle, path = tempfile.mkstemp(prefix=TEST_FILE_PREFIX, dir=directory)
+        handle, path = tempfile.mkstemp(prefix=f"{TEST_FILE_PREFIX}{os.getpid()}-", dir=directory)
         try:
             try:
                 if sys.platform == "darwin":
@@ -171,11 +169,40 @@ class NativeHost:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(path)
 
+    def clear_test_files(self, directory: str) -> None:
+        """Removes the test files in DIRECTORY whose run has ended; a live run's stay."""
+        for path in glob.glob(os.path.join(glob.escape(directory), TEST_FILE_PREFIX + "*")):
+            owner = owner_of_test_file(path)
+            if owner is not None and _running(owner):
+                continue
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+
     def glob(self, pattern: str) -> list[str]:
         return sorted(glob.glob(pattern))
 
     def page_bytes(self) -> int:
         return os.sysconf("SC_PAGE_SIZE")
+
+
+def is_test_file(path: str) -> bool:
+    return posixpath.basename(path).startswith(TEST_FILE_PREFIX)
+
+
+def owner_of_test_file(path: str) -> Optional[int]:
+    """The process ID a test file's name carries, or None for a name without one."""
+    head = posixpath.basename(path)[len(TEST_FILE_PREFIX) :].split("-", 1)[0]
+    return int(head) if head.isdigit() else None
+
+
+def _running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # another user's process
+        return True
+    return True
 
 
 def sha256(value: str) -> str:

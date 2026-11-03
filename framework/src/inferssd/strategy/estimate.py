@@ -5,18 +5,19 @@ A token's time is the sum of three terms, each from this machine's profile and
 the model's GGUF header:
 
 - the dense layers read their weights once, at the fastest measured memory read
-  rate; the lookup tables a token reads one row of do not count;
+  rate, and the part that does not fit in memory at the drive's rate; the
+  lookup tables a token reads one row of do not count;
 - every routed expert costs the CPU what the launch strategy prices one route
   at (``cpu_line``);
 - the experts the RAM cache misses are read from the model's drive at the
   strategy's rate for the engine's reads (``drive_rate``).
 
-The RAM cache gets the memory available now, less the engine's host margin and
-the dense weights, and a token finds an expert there as often as the share of
-all experts that fits, as if routing were uniform. Nothing the profile does not
-measure enters: the GPU's own time, prefetch and the skew of real routing. So
-this is a guide, not a prediction; the speed a model reaches on the machine
-replaces it once it has run.
+Memory available now, less the host margin a launch keeps, holds the dense
+weights first; the RAM cache gets the rest, and a token finds an expert there as
+often as the share of all experts that fits, as if routing were uniform.
+Nothing the profile does not measure enters: the GPU's own time, prefetch and
+the skew of real routing. So this is a guide, not a prediction; the speed a
+model reaches on the machine replaces it once it has run.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from inferssd.machine.characteristics import Characteristics
-from inferssd.strategy.derive import DARWIN_HEADROOM_SHARE, cpu_line, drive_rate, placement
+from inferssd.strategy.derive import cpu_line, drive_rate, host_headroom_mib, placement
 from inferssd.strategy.inputs import ModelFacts, RuntimeFacts
 
 GB = 1e9
@@ -38,11 +39,10 @@ class Estimate:
     detail: str  # the terms, or why there is no estimate
 
 
-def headroom_bytes(characteristics: Characteristics, platform: str) -> int:
-    """The host margin a launch keeps free: on macOS a quarter of memory, as derive sets it."""
-    if platform == "darwin":
-        return characteristics["memory"]["total_bytes"] // DARWIN_HEADROOM_SHARE
-    return ENGINE_RESERVE_BYTES
+def headroom_bytes(characteristics: Characteristics, runtime: RuntimeFacts, platform: str) -> int:
+    """The host margin a launch keeps free: the one it sets, or the engine's own."""
+    mib = host_headroom_mib(characteristics, runtime, platform)
+    return ENGINE_RESERVE_BYTES if mib is None else mib << 20
 
 
 def decode_estimate(
@@ -59,26 +59,36 @@ def decode_estimate(
     memory_Bps = max((row["Bps"] for row in characteristics["memory"]["dram_read_Bps"]), default=0)
     if memory_Bps <= 0:
         return Estimate(None, "no memory read rate in the profile")
-    threads, _, _ = placement(characteristics, model, runtime, [])
-    line, why = cpu_line(characteristics, model, threads.decode or threads.batch or 1)
+    try:
+        threads, _, _ = placement(characteristics, model, runtime, [])
+    except ValueError as error:  # the CPUs this process may use are not the profiled ones
+        return Estimate(None, str(error))
+    # The line a launch prices a route at, on the batch pool (derive's place.costs).
+    line, why = cpu_line(characteristics, model, threads.batch or threads.decode or 1)
     if line is None:
         return Estimate(None, why)
     drive_gbps, why = drive_rate(characteristics, model, drive_key)
     if drive_gbps is None:
         return Estimate(None, why)
-    available = runtime.available_bytes or characteristics["memory"]["total_bytes"]
-    cache = max(0, available - headroom_bytes(characteristics, platform) - dense_read_bytes)
+    available = runtime.available_bytes
+    if available is None:
+        available = characteristics["memory"]["total_bytes"]
+    room = max(0, available - headroom_bytes(characteristics, runtime, platform))
+    resident = min(dense_read_bytes, room)
+    cache = room - resident
     experts = model.layers * model.experts * model.expert_bytes
     hit = min(1.0, cache / experts)
     routes = model.layers * model.experts_used
-    dense_s = dense_read_bytes / memory_Bps
+    dense_s = resident / memory_Bps + (dense_read_bytes - resident) / (drive_gbps * GB)
     cpu_s = routes * (line[0] + line[1]) / 1e6
     drive_s = routes * (1.0 - hit) * model.expert_read_bytes / (drive_gbps * GB)
     seconds = dense_s + cpu_s + drive_s
+    spill = dense_read_bytes - resident
     return Estimate(
         1.0 / seconds,
-        f"{seconds * 1e3:.0f} ms a token: dense {dense_s * 1e3:.0f} ms, "
-        f"{routes} experts on the CPU {cpu_s * 1e3:.0f} ms, "
+        f"{seconds * 1e3:.0f} ms a token: dense {dense_s * 1e3:.0f} ms"
+        + (f" ({spill / GB:.1f} GB of it from the drive)" if spill else "")
+        + f", {routes} experts on the CPU {cpu_s * 1e3:.0f} ms, "
         f"{1 - hit:.0%} of them from the drive at {drive_gbps:.2f} GB/s {drive_s * 1e3:.0f} ms "
         f"(a {cache / GB:.1f} GB cache of {experts / GB:.0f} GB of experts)",
     )

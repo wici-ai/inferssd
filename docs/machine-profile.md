@@ -31,7 +31,7 @@ inferssd profile --reprofile --model /models/model-00001-of-00004.gguf
 
 | Option | Meaning |
 | --- | --- |
-| `--model PATH` | A model file or directory whose drive is measured. Repeat it for models on other drives. A file named like `name-00001-of-00004.gguf` brings all shards of its set; a directory brings every file below it, and one without a file of 1 GiB is measured with a test file (see [drive measurement](#drive-measurement)). The [speed estimates](#speed-estimates) take the models to be on the first one's drive. |
+| `--model PATH` | A model file or directory whose drive is measured. Repeat it for models on other drives. A file named like `name-00001-of-00004.gguf` brings all shards of its set; a directory brings every file below it, and one without a file of 1 GiB is measured with a test file (see [drive measurement](#drive-measurement)). The [speed estimates](#speed-estimates) take the models to be on the drive that holds most of the given files, or with none, on the first directory's. |
 | `--resources FILE` | An [engine resource descriptor](engine-resources.md) whose `probes` map names the probe executables. |
 | `--build DIR` | An engine build directory; the probes are `DIR/bin/inferssd-*probe`. |
 | `--reprofile` | Ignore the saved file and measure every section. |
@@ -146,14 +146,15 @@ engine uses (io_uring on Linux, a pool of reader threads on macOS). Model shards
 are read as raw bytes, so no model format is involved. For each drive the
 probe reads the eight largest files of at least 1 GiB among the given paths.
 
-A drive with no such file, such as an empty models directory before the first
-download, is measured in a test file instead: `inferssd profile` writes 4 GiB of
-random data into the first given directory on that drive, past the page cache
+A given directory with no such file below it, such as an empty models directory
+before the first download, has its drive measured in a test file instead:
+`inferssd profile` writes 4 GiB of random data into it, past the page cache
 (`F_NOCACHE` on macOS), has the probe read it, and removes it, also when the
-probe fails. It needs 5 GiB free there. A test file a killed run left behind
-(`.inferssd-drive-test-*`) is removed by the next one. When no directory is
-given, or there is not enough room, the drive's section is recorded as failed
-with the reason.
+probe fails. It needs 5 GiB free there. The file's name
+(`.inferssd-drive-test-<pid>-*`) carries the run's process ID: test files are never
+read as model files, and the next run removes those whose process has ended.
+When no such directory is given, or there is not enough room, the drive's section
+is recorded as failed with the reason.
 
 A drive is identified by its model and a digest of its serial number, or by
 its kernel name when it reports no serial (common for virtual disks). On Linux
@@ -177,8 +178,9 @@ its GGUF headers that the framework keeps. A token's time is the sum of:
 - the experts the RAM cache misses, read from the models' drive at the rate a
   launch takes for the engine's reads.
 
-The cache holds the memory available now, less the host margin (a quarter of
-memory on macOS) and the dense weights, and finds an expert as often as the
+Memory available now, less the host margin a launch keeps (a quarter of memory
+on macOS), holds the dense weights first, and what does not fit is read from the
+drive each token; the RAM cache gets the rest and finds an expert as often as the
 share of all experts that fits, as if routing were uniform. GPU time, prefetch
 and the skew of real routing are not measured, so an estimate is a guide: on an
 M5 MacBook Air (16 GB) and an M5 Max MacBook Pro (48 GB) the estimates came

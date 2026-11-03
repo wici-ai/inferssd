@@ -20,9 +20,17 @@ from inferssd.machine.characteristics import (
     Characteristics,
     Section,
 )
-from inferssd.machine.identity import Host, NativeHost, UnsupportedPlatform, drive_info
+from inferssd.machine.identity import Host, NativeHost, UnsupportedPlatform
 from inferssd.machine.probes import Probes, Runner, locate, run_process
-from inferssd.machine.profile import Clock, Progress, profile, stderr_progress
+from inferssd.machine.profile import (
+    Clock,
+    Progress,
+    model_drives,
+    models_drive,
+    profile,
+    stderr_progress,
+    survey,
+)
 from inferssd.machine.store import default_path, exclusive, load_current, save
 from inferssd.strategy.estimate import Estimate, decode_estimate
 from inferssd.strategy.inputs import RuntimeFacts, read_runtime
@@ -47,7 +55,7 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
         help="model file or directory whose drive to measure (repeatable); "
         "a split GGUF counts as all its shards; a directory without a file of 1 GiB "
         "is measured with a 4 GiB test file, removed after; the speed estimates "
-        "take the models to be on the first one's drive",
+        "take the models to be on the drive that holds most of the files given",
     )
     probes = command.add_mutually_exclusive_group()
     probes.add_argument(
@@ -145,21 +153,29 @@ def summary(value: Characteristics, path: Path) -> list[str]:
 
 
 def estimates(
-    value: Characteristics, drive_key: Optional[str], platform: str, runtime: Optional[RuntimeFacts]
+    value: Characteristics,
+    drive_key: Optional[str],
+    platform: str,
+    runtime: Callable[[], RuntimeFacts],
 ) -> list[tuple[catalog.Model, Estimate]]:
     """Each supported model's decode speed estimate with its shards on DRIVE_KEY."""
-    rows = []
-    for model in catalog.MODELS:
-        if drive_key is None:
-            estimate = Estimate(None, "pass --model with the directory that holds the models")
-        elif runtime is None:
-            estimate = Estimate(None, f"runtime facts are not read on {platform} yet")
+    reason = "pass --model with the directory that holds the models"
+    if drive_key is not None:
+        try:
+            facts = runtime()
+        except UnsupportedPlatform as error:
+            reason = str(error)
         else:
-            estimate = decode_estimate(
-                value, model.facts, model.dense_read_bytes, runtime, platform, drive_key
-            )
-        rows.append((model, estimate))
-    return rows
+            return [
+                (
+                    model,
+                    decode_estimate(
+                        value, model.facts, model.dense_read_bytes, facts, platform, drive_key
+                    ),
+                )
+                for model in catalog.MODELS
+            ]
+    return [(model, Estimate(None, reason)) for model in catalog.MODELS]
 
 
 def estimate_lines(rows: list[tuple[catalog.Model, Estimate]]) -> list[str]:
@@ -233,18 +249,17 @@ def run(
 ) -> int:
     host = host or NativeHost()
     path = args.output or default_path(host.platform(), environ, home)
-    drive_key = drive_info(host, str(args.model[0])).key if args.model else None
+    paths = [str(model) for model in args.model]
 
-    def output(value: Characteristics) -> None:
-        try:
-            facts: Optional[RuntimeFacts] = runtime()
-        except UnsupportedPlatform:
-            facts = None
-        rows = estimates(value, drive_key, host.platform(), facts)
-        if args.json:
-            emit(json.dumps(report(value, path, drive_key, rows), separators=(",", ":")))
-            return
-        for line in summary(value, path) + (estimate_lines(rows) if args.model else []):
+    def output(value: Characteristics, drive_key: Optional[str]) -> None:
+        lines = summary(value, path)
+        if args.json or args.model:
+            rows = estimates(value, drive_key, host.platform(), runtime)
+            if args.json:
+                emit(json.dumps(report(value, path, drive_key, rows), separators=(",", ":")))
+                return
+            lines += estimate_lines(rows)
+        for line in lines:
             emit(line)
 
     if args.show:
@@ -255,7 +270,7 @@ def run(
         saved = load_current(path)
         if saved is None:
             raise ValueError(f"no machine profile at {path}; run inferssd profile first")
-        output(saved)
+        output(saved, models_drive(model_drives(host, paths)) if paths else None)
         return 0
     suffix = ".exe" if host.platform() == "windows" else ""
     resources = args.resources
@@ -275,18 +290,21 @@ def run(
         except (ContractError, UnicodeDecodeError) as error:
             progress(f"ignoring the unreadable saved profile {path}: {error}")
             previous = None
+        progress("reading machine identity")
+        surveyed = survey(host, paths, previous, args.reprofile, progress)
         value = profile(
             host,
             probes,
-            [str(model) for model in args.model],
+            paths,
             previous,
             args.reprofile,
             clock=clock,
             progress=progress,
+            surveyed=surveyed,
         )
         if value is not previous:
             save(value, path)
-    output(value)
+    output(value, models_drive(surveyed.drives))
     changed = _changed(value, previous)
     partial = [name for name, rec in changed.items() if rec["status"] == "partial"]
     failed = [name for name, rec in changed.items() if rec["status"] == "failed"]
