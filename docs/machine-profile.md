@@ -108,9 +108,12 @@ not use a profile yet.
 | `gpus` | `inferssd-memprobe` (Linux with NVIDIA GPUs) | VRAM size, host-to-device (pinned and pageable), device-to-host and device-to-device copy rates, and device read bandwidth, for every GPU `nvidia-smi` lists |
 | `storage:<drive>` | `inferssd-ssdprobe`, one per drive | Random-read bandwidth and latency by request size and queue depth, read with the engine's own reader; the knee queue depth per size |
 
-The identity lists the GPUs: on Linux those `nvidia-smi` reports, on macOS
-the Apple GPU with its core count as `ioreg` reports it (when `ioreg` cannot
-say, the list is empty and profiling continues). The GPU probe measures every
+The identity lists the GPUs, each with the backend the engine runs it on: the
+NVIDIA GPUs `nvidia-smi` reports, on CUDA; on macOS the Apple GPU with its core
+count as `ioreg` reports it, on Metal (when `ioreg` cannot say, the list is
+empty and profiling continues); and on Linux the AMD and Intel display
+controllers on the PCI bus, on Vulkan. Other display controllers, such as a
+servers management display or a virtual machines, are left out. The GPU probe measures every
 GPU on Linux, regardless of `CUDA_VISIBLE_DEVICES`; on macOS the GPU shares the
 machine's memory and is not measured. A GPU the probe cannot measure (too
 little free VRAM, or a CUDA error) makes the `gpus` section partial, with the
