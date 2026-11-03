@@ -8,6 +8,7 @@ import hashlib
 import os
 import plistlib
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,7 @@ AGX_LISTING = """\
       "vendor-id" = <6b100000>
     }
 """
+LINUX_MACHINE = "a fake Linux machine: sysfs and procfs trees, POSIX paths"
 
 
 class FakeHost(NativeHost):
@@ -139,6 +141,8 @@ def ok(stdout):
 
 def linux_tree(root, *, capacities=(1024,) * 4, max_khz=None, smt=False, gpu=True):
     """A Linux machine: identity files, CPUs, one NVMe drive and the uname/nvidia-smi replies."""
+    if sys.platform == "win32":
+        pytest.skip(LINUX_MACHINE)
     count = len(capacities)
     write(root, "/etc/machine-id", "0123456789abcdef0123456789abcdef\n")
     write(root, "/etc/os-release", 'NAME="Ubuntu"\nPRETTY_NAME="Ubuntu 24.04.1 LTS"\n')
@@ -436,6 +440,7 @@ def test_drive_key_md_array_names_every_member(tmp_path):
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason=LINUX_MACHINE)
 def test_disks_without_serial_keep_their_kernel_names(tmp_path):
     for index, name in enumerate(("vda", "vdb")):
         device = f"/sys/devices/pci0000:00/0000:00:0{index + 5}.0/virtio{index + 2}"

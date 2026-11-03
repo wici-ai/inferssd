@@ -16,11 +16,11 @@ from pathlib import Path
 import pytest
 from test_engine_runtime import Effects, Owner, policy
 from test_launch_platforms import golden
-from test_machine_identity import linux_tree, nvme_key, write
+from test_machine_identity import FakeHost, linux_tree, nvme_key, write
 from test_machine_probes import PATHS, FakeRunner, replies
 from test_machine_profile import Clock, linux_machine
 from test_strategy_inputs import SMI_APPS, SMI_GPUS, RuntimeHost, deepseek_like, write_gguf
-from test_typed_launch import setup
+from test_typed_launch import session, setup
 
 from inferssd.configuration.settings import parse
 from inferssd.contracts import ContractError
@@ -505,9 +505,9 @@ def test_an_explicit_machine_file_is_used_as_it_is(tmp_path):
 
 
 def test_unprofiled_platforms_launch_without_characteristics(tmp_path):
-    host, files = linux_machine(tmp_path)
+    machine = (FakeHost(tmp_path, "linux"), [str(tmp_path / "model.gguf")])
     for platform in ("windows", "darwin"):
-        text, lines, _ = profile_launch(tmp_path, machine=(host, files), platform=platform)
+        text, lines, _ = profile_launch(tmp_path, machine=machine, platform=platform)
         assert text is None and "not supported" in lines[0]
 
 
@@ -594,7 +594,7 @@ def launch_arguments(tmp_path, *extra):
 def test_dry_run_takes_characteristics_from_machine(tmp_path, monkeypatch):
     words, facts, out = launch_arguments(tmp_path)
     receipt = tmp_path / "resolution.json"
-    monkeypatch.setattr("os.environ", {"PATH": "/bin"})
+    monkeypatch.setattr("os.environ", session({"PATH": "/bin"}, tmp_path))
     command = words + ["--dry-run", "--host-facts", str(facts), "--machine", str(X86_FILE)]
     assert main(command + ["--result", str(receipt)]) == 0
     result = json.loads(receipt.read_text())
@@ -605,7 +605,7 @@ def test_dry_run_takes_characteristics_from_machine(tmp_path, monkeypatch):
 def test_dry_run_without_characteristics_keeps_todays_resolution(tmp_path, monkeypatch):
     words, facts, out = launch_arguments(tmp_path)
     receipt = tmp_path / "resolution.json"
-    monkeypatch.setattr("os.environ", {"PATH": "/bin"})
+    monkeypatch.setattr("os.environ", session({"PATH": "/bin"}, tmp_path))
     assert main(words + ["--dry-run", "--host-facts", str(facts), "--result", str(receipt)]) == 0
     result = json.loads(receipt.read_text())
     assert not STRATEGY_FACTS & {fact["name"] for fact in result["observations"]}
