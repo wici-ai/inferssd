@@ -3502,17 +3502,24 @@ result<host::allocation_ticket> take_room_configured(kimi_cpu_sink * sink, const
         if (!refresh) { return {{}, refresh.code, refresh.error}; }
         return value.host->take(host_bytes, device_bytes);
     } catch (const std::bad_alloc &) { return sink_host_failure(status::resource, "host admission allocation failed"); }
-      catch (const std::exception &) { return sink_host_failure(status::io, "host admission failed"); }
+      catch (const std::exception & e) {
+          // A refused setting is thrown from configured(): its text is the reason.
+          try { return sink_host_failure(status::io, (std::string("host admission failed: ") + e.what()).c_str()); }
+          catch (...) { return sink_host_failure(status::io, "host admission failed"); }
+      }
       catch (...) { return sink_host_failure(status::io, "host admission failed"); }
 }
 bool cache_make_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
         const runtime_services * services, uint64_t host_bytes, uint64_t device_bytes) noexcept {
     auto ticket = take_room_configured(sink, input, services, host_bytes, device_bytes, UINT64_MAX);
+    // The caller sees only false: name why, a refused setting included.
+    if (!ticket) { std::fprintf(stderr, "[kimi_cpu_sink_cache] make_room failed: %s\n", ticket.error.c_str()); }
     return bool(ticket); // Compatibility observation only: destructor cancels the unmaterialized ticket.
 }
 bool cache_prefill_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
         const runtime_services * services, uint64_t pages, uint64_t host_bytes, uint64_t device_bytes) noexcept {
     auto ticket = take_room_configured(sink, input, services, host_bytes, device_bytes, pages);
+    if (!ticket) { std::fprintf(stderr, "[kimi_cpu_sink_cache] prefill_room failed: %s\n", ticket.error.c_str()); }
     return bool(ticket); // Production allocations use take_room_configured and retain the ticket.
 }
 }  // namespace cpu
