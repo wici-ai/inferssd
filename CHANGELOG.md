@@ -2,12 +2,11 @@
 
 ## 0.1.2 - 2026-11-04
 
-This release adds Qwen3.6-35B-A3B and the InferSSD app for Mac, estimates each supported model's decode speed on your machine, and trims the command to `serve`, `cli` and `profile`.
+This release adds Qwen3.6-35B-A3B, estimates each supported model's decode speed on your machine, and trims the command to `serve`, `cli` and `profile`.
 
 ### Highlights
 
 - **Qwen3.6-35B-A3B:** Unsloth's UD-Q4_K_XL runs with its routed experts streamed from SSD. Start it with `inferssd serve -hf unsloth/Qwen3.6-35B-A3B-GGUF`; its one file is about 21 GiB ([#125](https://github.com/wici-ai/inferssd/pull/125)).
-- **InferSSD for Mac:** a desktop app for Apple Silicon that installs the engine, measures the Mac, downloads the supported models, runs them with a local chat, and connects coding tools to them. Download `InferSSD-0.1.2-macos-arm64.dmg` from this release and drag InferSSD to Applications; it updates itself.
 - **Decode speed estimates:** `inferssd profile --model <models directory>` estimates the decode speed of each supported model on this machine before you download it, and `--json` prints the profile and the estimates as one JSON object ([#122](https://github.com/wici-ai/inferssd/pull/122)).
 - **`inferssd --version`** prints the installed version ([#122](https://github.com/wici-ai/inferssd/pull/122)).
 
