@@ -63,7 +63,7 @@ class NativeHost:
         return shutil.which(name) is not None
 
     def text(self, path: str) -> str:
-        return Path(path).read_text()
+        return Path(path).read_text(encoding="utf-8", errors="replace")
 
     def contains(self, path: str, needle: bytes) -> bool:
         try:

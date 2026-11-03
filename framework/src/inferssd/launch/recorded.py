@@ -147,7 +147,7 @@ class RecordedArtifacts:
         if name == "is_executable":
             return Reply(os.access(args[0], os.X_OK))
         if name == "read_text":
-            with open(args[0], newline="") as stream:
+            with open(args[0], encoding="utf-8", newline="") as stream:
                 return Reply(stream.read())
         if name == "model_matches":
             directory, pattern = args

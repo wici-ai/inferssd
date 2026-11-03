@@ -234,5 +234,9 @@ def test_the_engine_gpu_backends_fact_reads_the_servers_build(tmp_path):
     )
     # A server outside a CMake build: its backends are unknown.
     assert adapter(Fact("engine_gpu_backends", (binary,))).value is None
-    (build / "CMakeCache.txt").write_text("GGML_CUDA:BOOL=ON\nGGML_VULKAN:BOOL=OFF\n")
+    # A UTF-8 cache, whatever this host's locale: it names the build's paths.
+    cache = (
+        "CMAKE_HOME_DIRECTORY:INTERNAL=/home/测/Kovač\nGGML_CUDA:BOOL=ON\nGGML_VULKAN:BOOL=OFF\n"
+    )
+    (build / "CMakeCache.txt").write_bytes(cache.encode())
     assert adapter(Fact("engine_gpu_backends", (binary,))).value == ["CUDA"]
