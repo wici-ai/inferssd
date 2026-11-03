@@ -301,6 +301,11 @@ def _resolve(
     binary = s.text("resolved_path", binary_path)
     if not s.value("is_file", binary) or not s.value("is_executable", binary):
         raise ValueError("missing server executable: " + binary)
+    # The engine's GPU backends: the descriptor's, else its build's; None when neither says.
+    gpu_backends = resources.gpu_backends if resources is not None else None
+    if gpu_backends is None:
+        built = s.value("engine_gpu_backends", binary)
+        gpu_backends = None if built is None else tuple(cast(list[str], built))
     bundled = PROFILES[profile]
     template_path = spec.template
     if not template_path and bundled:
@@ -339,7 +344,7 @@ def _resolve(
     planned: Optional[Planned] = None
     if spec.strategy:
         # The strategy fills what the user left unset; the checks below see the result.
-        planned = plan(s, platform, memory, paths, value, spec.threads)
+        planned = plan(s, platform, memory, paths, value, spec.threads, gpu_backends)
         value, threads = planned.settings, threadpools(planned.threads, platform)
         if any(argument in protected for argument in planned.server_args[::2]):
             raise ValueError("the launch strategy names a protected server option")
@@ -386,9 +391,11 @@ def _resolve(
                     "the memory controller is not delegated to your systemd user manager: "
                     "add Delegate=memory to a user@.service drop-in, or launch as root" + guide
                 )
-        if value.at("vram.budget").value != 0:
-            if not s.value("gpu_available"):
-                raise ValueError("typed GPU execution requires nvidia-smi")
+    # The CUDA tier finds its GPUs through nvidia-smi. With the engine's backends unknown, the
+    # engine itself refuses a budget it has no tier for.
+    if value.at("vram.budget").value != 0 and "CUDA" in (gpu_backends or ()):
+        if not s.value("gpu_available"):
+            raise ValueError("typed GPU execution requires nvidia-smi")
     # The sink's I/O thread keeps its own CPUs; decode runs on the first decode threads.
     if set(cast(tuple[int, ...], value.at("cpu.io_cpus").value)) & set(
         threads.cpus + threads.decode_cpus

@@ -81,11 +81,11 @@ memory, the available memory) to choose:
   there than on every CPU;
 - the starting estimates the engine uses to place experts between the CPU and
   the GPU (it refines them as it runs);
-- `vram.budget = 0` when no CUDA GPU is usable, and on macOS the host memory
-  budget from the runtime policy and a host margin of a quarter of the
-  machine's memory (`host.headroom_mib`), since macOS compresses the cold pages
-  of a RAM cache that leaves less free;
-- with one usable CUDA GPU on Linux, which prompt passes the CPU prefills
+- `vram.budget = 0` when the engine has CUDA and no CUDA GPU is usable, and on
+  macOS the host memory budget from the runtime policy and a host margin of a
+  quarter of the machine's memory (`host.headroom_mib`), since macOS compresses
+  the cold pages of a RAM cache that leaves less free;
+- with an engine that has CUDA and one usable CUDA GPU, which prompt passes the CPU prefills
   (`prefill.cpu_max_tokens`, the longest pass the CPU prefills faster than the
   GPU graph reading the same experts; a tie goes to the graph, which warms the
   VRAM tier for decode) and one prefill pass per prompt; on
