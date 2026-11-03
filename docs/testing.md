@@ -116,3 +116,14 @@ hosted CI.
 
 The unfiltered `test-chat` suite is outside the supported Muse rendering gate.
 It is not declared passing or silently allowlisted.
+
+## Windows
+
+The Windows CI job runs the framework tests, then builds the engine as
+`install.ps1` does (LLVM clang with the Visual Studio C++ tools' environment,
+without a GPU backend) and runs the synthetic and platform tests of the Linux
+job that Windows builds, the sink and grouped prefill tests of the Mac job, and
+the Windows host budget, platform file and both read ring backends. A test that
+builds llama's internal classes stays off Windows, because `llama.dll` does not
+export them. Like the other hosted jobs, it is a compilation and synthetic
+correctness gate.
