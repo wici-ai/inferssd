@@ -83,6 +83,22 @@ void llama_model_loader::build_expert_tensor_index(const llama_hparams & hparams
     expert_tensor_index.dense_bytes = n_bytes > deferred_bytes ? n_bytes - deferred_bytes : 0;
 }
 
+bool llama_model_loader::mapping_range_encloses_experts(ggml_context * ctx) const {
+    const size_t n_files = std::min(mappings.size(), expert_tensor_index.file_ranges.size());
+    for (size_t idx = 0; idx < n_files; ++idx) {
+        size_t first = 0;
+        size_t last = 0;
+        void * addr = nullptr;
+        get_mapping_range(&first, &last, &addr, int(idx), ctx);
+        for (const auto & range : expert_tensor_index.file_ranges[idx]) {
+            if (range.first < last && first < range.last) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 bool llama_model_loader::should_defer_expert_mmaps() const {
     return defer_experts && use_mmap && !no_alloc && !expert_tensor_index.empty();
 }
