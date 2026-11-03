@@ -1,6 +1,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include "export.h"
 #include "ggml-ssd/gpu/kimi-vram-tier-api.h"
 struct vram_compute_expert { const void * up; const void * gate; const void * down; };
 // Decode engine of the tier (generic-compute-adapter.cu): an f32 input row, up and gate, the activation and down over
@@ -89,5 +90,5 @@ typedef const vram_group_compute_api * (*vram_group_compute_get_api_fn)();
 
 extern "C" {
 const vram_format_compute_api * kimi_vram_generic_format_compute_get_api();
-const vram_group_compute_api * kimi_vram_group_compute_get_api();
+SSD_CUDA_EXPORT const vram_group_compute_api * kimi_vram_group_compute_get_api();
 }

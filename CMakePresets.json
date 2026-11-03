@@ -164,6 +164,17 @@
             "LLAMA_OPENSSL": "OFF",
             "LLAMA_SSD_STORE": "ON"
         }
+    },
+    {
+        "name": "windows-cuda",
+        "displayName": "InferSSD Windows x64 (LLVM clang, CUDA)",
+        "inherits": [
+            "windows-llvm"
+        ],
+        "cacheVariables": {
+            "GGML_CUDA": "ON",
+            "GGML_CUDA_KIMI_VRAM_TIER": "ON"
+        }
     }
   ]
 }

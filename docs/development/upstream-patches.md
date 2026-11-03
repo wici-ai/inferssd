@@ -85,7 +85,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-cpu/quants.h` | 7 | 0 |
 | `ggml/src/ggml-cpu/unary-ops.cpp` | 271 | 1 |
 | `ggml/src/ggml-cpu/unary-ops.h` | 3 | 0 |
-| `ggml/src/ggml-cuda/CMakeLists.txt` | 8 | 0 |
+| `ggml/src/ggml-cuda/CMakeLists.txt` | 5 | 0 |
 | `ggml/src/ggml-cuda/argsort.cu` | 93 | 71 |
 | `ggml/src/ggml-cuda/argsort.cuh` | 6 | 0 |
 | `ggml/src/ggml-cuda/binbcast.cu` | 12 | 2 |
@@ -184,5 +184,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 17539 added, 5678 removed across 152 upstream paths.
+Total: 17536 added, 5678 removed across 152 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
