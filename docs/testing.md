@@ -127,3 +127,7 @@ the Windows host budget, platform file and both read ring backends. A test that
 builds llama's internal classes stays off Windows, because `llama.dll` does not
 export them. Like the other hosted jobs, it is a compilation and synthetic
 correctness gate.
+
+The CUDA workflow also builds `windows-cuda` (LLVM clang for the C++, `nvcc` with
+the Visual Studio host compiler) from NVIDIA's redistributable toolkit archives.
+It compiles and links only; no GPU runs it.
