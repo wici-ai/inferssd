@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import plistlib
@@ -45,11 +46,15 @@ AGX_LISTING = """\
 class FakeHost(NativeHost):
     """System paths resolve under ROOT; commands and devices come from tables."""
 
-    def __init__(self, root, system="linux", arch="x86_64", commands=None, devices=None):
+    def __init__(
+        self, root, system="linux", arch="x86_64", commands=None, devices=None, free=1 << 40
+    ):
         self.root, self.system, self.arch = Path(root), system, arch
         self.commands = dict(commands or {})
         self.devices = dict(devices or {})
+        self.free = free
         self.calls = []
+        self.test_files = []  # (path, size, existed while in use)
 
     def inside(self, path):
         return path.startswith(SYSTEM) or path in ("/sys", "/proc")
@@ -94,6 +99,21 @@ class FakeHost(NativeHost):
 
     def page_bytes(self):
         return 16384 if self.system == "darwin" else 4096
+
+    def free_bytes(self, path):
+        return self.free
+
+    @contextlib.contextmanager
+    def test_file(self, directory, size):
+        # Sparse, so a test writes nothing; the real host fills it with random bytes.
+        path = os.path.join(directory, ".inferssd-drive-test-0")
+        with open(path, "wb") as stream:
+            stream.truncate(size)
+        try:
+            yield path
+        finally:
+            self.test_files.append((path, size, os.path.exists(path)))
+            os.unlink(path)
 
 
 def write(root, path, content):
@@ -483,3 +503,13 @@ def test_darwin_drive_reports_unreadable_diskutil_output(tmp_path):
     }
     with pytest.raises(RuntimeError, match="printed no property list .*: Volume busy"):
         drive_info(FakeHost(tmp_path, "darwin", "arm64", commands), "/x")
+
+
+def test_native_test_file_is_random_uncompressible_and_removed(tmp_path):
+    (tmp_path / ".inferssd-drive-test-left").write_bytes(b"from a killed run")
+    (tmp_path / "model.gguf").write_bytes(b"kept")
+    with NativeHost().test_file(str(tmp_path), (3 << 20) + 5) as path:
+        data = Path(path).read_bytes()
+        assert len(data) == (3 << 20) + 5 and len(set(data[:65536])) == 256
+        assert sorted(os.listdir(tmp_path)) == sorted([os.path.basename(path), "model.gguf"])
+    assert os.listdir(tmp_path) == ["model.gguf"]

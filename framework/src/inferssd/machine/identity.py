@@ -9,6 +9,7 @@ are stored only as SHA-256 digests.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import glob
 import hashlib
@@ -20,7 +21,9 @@ import re
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+import tempfile
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol
@@ -31,6 +34,7 @@ from inferssd.machine.characteristics import PROBE_SCHEMAS, GPUIdentity, Identit
 from inferssd.platform.captured_command import run_captured
 
 MEMORY_TOLERANCE = 0.01  # MemTotal moves with kernel reservations
+TEST_FILE_PREFIX = ".inferssd-drive-test-"
 
 
 class UnsupportedPlatform(RuntimeError):
@@ -67,6 +71,9 @@ class Host(Protocol):
     def which(self, name: str) -> bool: ...
     def device(self, path: str) -> tuple[int, int]: ...
     def regular_files(self, path: str) -> list[tuple[str, int]]: ...
+    def is_directory(self, path: str) -> bool: ...
+    def free_bytes(self, path: str) -> int: ...
+    def test_file(self, directory: str, size: int) -> AbstractContextManager[str]: ...
     def glob(self, pattern: str) -> list[str]: ...
     def page_bytes(self) -> int: ...
 
@@ -122,6 +129,47 @@ class NativeHost:
         if not os.path.isfile(path):
             raise FileNotFoundError("not a file or directory: " + path)
         return [(os.path.realpath(path), os.stat(path).st_size)]
+
+    def is_directory(self, path: str) -> bool:
+        return os.path.isdir(path)
+
+    def free_bytes(self, path: str) -> int:
+        return shutil.disk_usage(path).free
+
+    @contextlib.contextmanager
+    def test_file(self, directory: str, size: int) -> Iterator[str]:
+        """A file of SIZE random bytes in DIRECTORY, removed on exit, to measure its drive.
+
+        The bytes are random, so no layer below can compress them, and are written past the
+        page cache where the platform allows (F_NOCACHE on macOS; written back and dropped
+        on Linux), so reading them reaches the drive. A test file that a killed run left
+        behind is removed first.
+        """
+        for stale in glob.glob(os.path.join(glob.escape(directory), TEST_FILE_PREFIX + "*")):
+            with contextlib.suppress(OSError):
+                os.unlink(stale)
+        handle, path = tempfile.mkstemp(prefix=TEST_FILE_PREFIX, dir=directory)
+        try:
+            try:
+                if sys.platform == "darwin":
+                    import fcntl
+
+                    fcntl.fcntl(handle, getattr(fcntl, "F_NOCACHE", 48), 1)
+                written = 0
+                while written < size:
+                    block = memoryview(os.urandom(min(64 << 20, size - written)))
+                    while block:
+                        count = os.write(handle, block)
+                        block, written = block[count:], written + count
+                os.fsync(handle)
+                if hasattr(os, "posix_fadvise"):
+                    os.posix_fadvise(handle, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(handle)
+            yield path
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
 
     def glob(self, pattern: str) -> list[str]:
         return sorted(glob.glob(pattern))
