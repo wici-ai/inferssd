@@ -31,8 +31,9 @@ def test_the_catalog_is_the_download_list_and_its_facts_add_up():
     for model in catalog.MODELS:
         facts = model.facts
         assert 0 < model.dense_read_bytes < facts.dense_bytes
-        routed = facts.layers * facts.experts * facts.expert_bytes
-        assert sum(size for _, size in facts.format_bytes) == routed
+        # expert_bytes is the largest expert: a model may quantize some layers' experts wider.
+        largest = facts.layers * facts.experts * facts.expert_bytes
+        assert 0 < sum(size for _, size in facts.format_bytes) <= largest
         assert facts.expert_read_bytes >= facts.expert_bytes
 
 
