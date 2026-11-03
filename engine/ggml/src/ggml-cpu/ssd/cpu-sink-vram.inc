@@ -11,6 +11,7 @@ struct sink_vram {
     const kimi_vram_prefill_api * prefill_api = nullptr;
     const kimi_vram_elastic_api * elastic = nullptr;
     bool format_path = false;
+    bool format_started = false;
     void * context = nullptr;
     std::vector<kimi_vram_request> requests;
     std::vector<int> slots;
@@ -217,6 +218,22 @@ struct sink_vram {
     void check(int result, const char * error) {
         if (result) { throw std::runtime_error(std::string("GPU tier: ") + error); }
     }
+    static bool unsupported_generic_geometry(const ggml_tensor * up, const ggml_tensor * down, int latent, int hidden) {
+        const bool mxfp4 = up->type == GGML_TYPE_MXFP4 && down->type == GGML_TYPE_MXFP4;
+        return !mxfp4 && (latent % 256 != 0 || hidden % 256 != 0);
+    }
+    void disable_unsupported_geometry(int latent, int hidden) {
+        if (format_started) { throw std::runtime_error("GPU tier expert geometry changed after initialization"); }
+        std::fprintf(stderr,
+            "[kimi_vram_tier] status=unavailable reason=unsupported_generic_geometry latent=%d hidden=%d fallback=cpu\n",
+            latent, hidden);
+        api->destroy(context);
+        context = nullptr;
+        location_api = nullptr;
+        format_path = false;
+        exclusive = async_upload = deferred_upload = prefill_enabled = false;
+        prefill_open = prefill_job_active = prefill_batched = prefill_in_place = false;
+    }
     // The tier's threads on the CPUs of this thread, the coordinator, when they changed since the last placement.
     void place_threads() {
         if (!placement_due || !policy_api) { return; }
@@ -267,6 +284,10 @@ struct sink_vram {
     void reserve(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down,
                  const std::vector<int32_t> & layer_ids) {
         if (!context || !elastic || !format || layer_ids.empty()) { return; }
+        if (unsupported_generic_geometry(up, down, int(up->ne[0]), int(up->ne[1]))) {
+            disable_unsupported_geometry(int(up->ne[0]), int(up->ne[1]));
+            return;
+        }
         kimi_vram_request r = {};
         r.layer = layer_ids.front(); r.weight = 1.0f;
         const ggml_tensor * tensors[] = { up, gate, down };
@@ -275,6 +296,7 @@ struct sink_vram {
             int32_t(down->type), int32_t(up->ne[2]), int32_t(layer_ids.size()), layer_ids.data() };
         char error[512] = {};
         check(elastic->reserve(context, &r, &f, error, sizeof(error)), error);
+        format_started = true;
     }
     void phase_complete(bool decode) {
         if (decode) { prefill_open = false; } // the tier leaves prefill: scratch released, arena grown
@@ -287,6 +309,11 @@ struct sink_vram {
                  int latent, int hidden, const std::vector<int32_t> & layer_ids, sink_cache & cache, bool unweighted = false) {
         hits = 0;
         if (!context) { return; }
+        if (unsupported_generic_geometry(up, down, latent, hidden)) {
+            disable_unsupported_geometry(latent, hidden);
+            for (auto & request : source) { request.vram_slot = -1; }
+            return;
+        }
         place_threads();
         int layer = -1, consumed = 0;
         const char * tensor_name = up->name;
@@ -325,6 +352,7 @@ struct sink_vram {
         }
         format_path = true;
         check(result, error);
+        format_started = true;
         for (size_t i = 0; i < source.size(); ++i) { source[i].vram_slot = slots[i]; hits += slots[i] >= 0; }
     }
     void launch(const void * quantized, size_t quantized_bytes, const float * f32, size_t f32_bytes,
@@ -443,6 +471,11 @@ struct sink_vram {
         prefill_stats = {};
         prefill_batched = prefill_in_place = false;
         if (!context || !prefill_enabled || source.empty()) { return 0; }
+        if (unsupported_generic_geometry(up, down, latent, hidden)) {
+            disable_unsupported_geometry(latent, hidden);
+            for (auto & request : source) { request.vram_slot = -1; }
+            return 0;
+        }
         place_threads();
         int layer = -1, consumed = 0;
         const char * tensor_name = up->name;
@@ -467,6 +500,7 @@ struct sink_vram {
         char error[512] = {};
         check(prefill_api->prepare(context, requests.data(), int(requests.size()), &f,
                 slots.data(), error, sizeof(error)), error);
+        format_started = true;
         prefill_lane = {};
         prefill_api->lane(context, &prefill_lane);
         const bool batched_pass = ntokens > prefill_lane.vector_tokens;

@@ -568,6 +568,9 @@ def derive(
 
     one_pass = False
     mixed = [role for role in model.roles if len(role.formats) > 1]
+    generic_unaligned = (model.up.format != "MXFP4" or model.down.format != "MXFP4") and (
+        model.up.cols % 256 != 0 or model.up.rows % 256 != 0
+    )
     if platform == "linux":
         listed = {
             gpu["uuid"]
@@ -586,6 +589,14 @@ def derive(
                 f"{role.name} experts are "
                 + ", ".join(f"{name} in {n} layers" for name, n in role.formats)
                 for role in mixed
+            )
+            choices["vram.budget"] = ("0", why)
+            notes.append("vram.budget: 0, " + why)
+        elif generic_unaligned:
+            why = (
+                "the generic GPU expert engine requires latent and hidden dimensions "
+                "that are multiples of 256; "
+                f"this model's latent is {model.up.cols} and hidden is {model.up.rows}"
             )
             choices["vram.budget"] = ("0", why)
             notes.append("vram.budget: 0, " + why)

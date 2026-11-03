@@ -133,6 +133,59 @@ void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, mod
         (unsigned long long) mixed_reads, worst_rel, worst_abs);
 }
 
+void run_unsupported_geometry(fixture_inputs & inputs) {
+    fixture f;
+    f.type = GGML_TYPE_IQ4_XS;
+    f.down_type = GGML_TYPE_IQ4_NL;
+    f.latent = 2560;
+    f.hidden = 640;
+    f.experts = 2;
+    make_synthetic(f, 20261103);
+    const uint64_t unit = triplet_bytes(f);
+
+    inputs.set("vram_budget", "0");
+    set_switch(inputs, "tier.global", false);
+    set_switch(inputs, "vram_exclusive", false);
+    set_switch(inputs, "vram_async", false);
+    set_switch(inputs, "vram_deferred", false);
+    auto cpu = make_sink(inputs, f, 9, 8);
+
+    inputs.set("vram_budget", std::to_string(2 * unit).c_str());
+    set_switch(inputs, "tier.global", true);
+    set_switch(inputs, "vram_exclusive", true);
+    set_switch(inputs, "vram_async", true);
+    set_switch(inputs, "vram_deferred", true);
+    auto fallback = make_sink(inputs, f, 9, 8);
+    configure_cache(cpu.get(), 0, {1}, 2);
+    configure_cache(fallback.get(), 0, {1}, 2);
+    begin_cache(cpu.get(), 91, 1);
+    begin_cache(fallback.get(), 91, 1);
+
+    tensors meta(f, 1);
+    std::vector<float> input(static_cast<size_t>(f.latent));
+    for (int i = 0; i < f.latent; ++i) { input[size_t(i)] = std::sin(float(i)); }
+    const int32_t ids[] = { 0, 1 };
+    const float weights[] = { 0.5f, 0.5f };
+    const kimi_cpu_sink_activation activation = {
+        KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f
+    };
+    std::vector<float> expected(static_cast<size_t>(f.latent));
+    std::vector<float> got(static_cast<size_t>(f.latent));
+    for (int arm = 0; arm < 2; ++arm) {
+        kimi_cpu_sink_stats stats = {};
+        char error[512] = {};
+        const bool ok = kimi_cpu_sink_run_activation(arm ? fallback.get() : cpu.get(),
+            meta.role[0], meta.role[1], meta.role[2], input.data(), ids, weights, 2,
+            &activation, (arm ? got : expected).data(), &stats, error, sizeof(error));
+        require(ok, std::string("unsupported generic geometry did not use the CPU sink: ") + error);
+        require(stats.read_errors == 0 && stats.pending_reads == 0 && stats.fallback_count == 0,
+            "unsupported generic geometry did not drain its CPU reads");
+        require(stats.read_requests > 0, "unsupported generic geometry did not read CPU experts");
+    }
+    require(got == expected, "unsupported generic geometry changed CPU results");
+    std::printf("GENERIC_VRAM_UNSUPPORTED_GEOMETRY_CPU_FALLBACK_PASS latent=%d hidden=%d\n", f.latent, f.hidden);
+}
+
 } // namespace
 
 int main() {
@@ -153,6 +206,7 @@ int main() {
         double worst_abs = 0.0;
         run_shape(inputs, 512, 256, 8, {true, "production-generic"}, checks, worst_rel, worst_abs, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K);
         run_shape(inputs, 512, 256, 8, {true, "production-generic"}, checks, worst_rel, worst_abs, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+        run_unsupported_geometry(inputs);
         run_host_jobs(inputs, GGML_TYPE_Q8_0, checks);
         std::printf("REAL_GPU_GENERIC_TIER_PASS checks=%zu worst_rel_l2=%.6g worst_abs=%.6g\n",
             checks, worst_rel, worst_abs);

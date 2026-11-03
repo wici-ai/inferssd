@@ -113,8 +113,9 @@ def test_recorded_strategy_fills_what_the_user_left_unset(tmp_path):
         "link_gbps",
         "pageable_gbps",
     ]
-    # The GPU is usable: vram.budget keeps its default, and the CLI's prefetch.depth stays.
-    assert settings.at("vram.budget").origin == "default"
+    # The 32x32 fixture cannot use the generic GPU tier; the CLI's prefetch.depth stays.
+    budget = settings.at("vram.budget")
+    assert budget.origin == "file" and "multiples of 256" in budget.receipt
     assert settings.at("prefetch.depth").origin == "cli"
     receipt = json.loads((out / "strategy.json").read_text())
     assert line["strategy"] == receipt
@@ -125,6 +126,7 @@ def test_recorded_strategy_fills_what_the_user_left_unset(tmp_path):
         "cpu.decode_participants",
         "cpu.io_cpus",
         "place.costs",
+        "vram.budget",
     ]
     # The toy model's experts are so small that the CPU prefills any pass no slower.
     assert settings.at("prefill.cpu_max_tokens").origin == "default"
@@ -174,7 +176,7 @@ def test_cli_file_and_thread_values_win(tmp_path):
         "server --ctx-checkpoints",
     ]
     assert receipt["dropped"] == ["threads.decode", "threads.batch"]
-    assert list(receipt["chosen"]["settings"]) == ["cpu.io_cpus"]
+    assert list(receipt["chosen"]["settings"]) == ["cpu.io_cpus", "vram.budget"]
     assert receipt["chosen"]["threads"] == {} and receipt["chosen"]["server_args"] == []
 
 
@@ -202,6 +204,8 @@ def test_without_a_usable_gpu_the_budget_is_zero_and_no_gpu_is_checked(tmp_path)
 
 def test_user_launch_checks_still_apply_to_the_merged_result(tmp_path):
     inputs, spec, host, adapter, out = strategic(tmp_path)
+    supported = write_gguf(tmp_path / "supported.gguf", *deepseek_like())
+    spec = replace(spec, model=str(supported))
     host["gpu_available"] = False
     with pytest.raises(ValueError, match="requires nvidia-smi"):
         resolved(inputs, spec, adapter, out)

@@ -500,3 +500,31 @@ def test_experts_mixing_formats_across_layers_keep_the_gpu_tier_off(tmp_path):
     )
     # The graph still prefills long passes.
     assert s.one_pass and "prefill.cpu_max_tokens" in s.settings
+
+
+def test_unaligned_generic_expert_geometry_keeps_the_gpu_tier_off(tmp_path):
+    tensors, kv = moe(
+        "qwen4exp",
+        layers=2,
+        experts=4,
+        used=1,
+        latent=2560,
+        hidden=640,
+        gate=Q4_K,
+        up=Q4_K,
+        down=Q8_0,
+    )
+    facts = model_facts(str(write_gguf(tmp_path / "unaligned.gguf", tensors, kv)))
+    gpu = GPUState(X86_GPU, 30 << 30, 0)
+    s = derive(
+        machine(X86),
+        facts,
+        runtime(range(61), [gpu]),
+        "linux",
+        model_drive_key=drive(machine(X86)),
+    )
+    assert s.settings["vram.budget"].value_text == "0"
+    assert s.settings["vram.budget"].reason == (
+        "the generic GPU expert engine requires latent and hidden dimensions "
+        "that are multiples of 256; this model's latent is 2560 and hidden is 640"
+    )
