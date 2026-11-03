@@ -133,3 +133,14 @@ def test_the_descriptors_gpu_backends_decide_whether_the_cuda_tier_needs_nvidia_
                 resolve(replace(inputs, repo=""), launch, adapter, out)
         else:
             assert resolve(replace(inputs, repo=""), launch, adapter, out).code == 0
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_a_cuda_tier_setting_needs_an_engine_with_cuda(tmp_path, platform):
+    inputs, spec, host, adapter, out, _ = setup(tmp_path, platform)
+    launch = replace(spec, overrides=spec.overrides + (("vram.max_slots", "4"),))
+    if platform == "linux":
+        assert resolve(inputs, launch, adapter, out, platform).code == 0
+    else:
+        with pytest.raises(ValueError, match="vram.max_slots .* configures the CUDA expert tier"):
+            resolve(inputs, launch, adapter, out, platform)

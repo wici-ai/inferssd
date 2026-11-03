@@ -10,7 +10,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Optional, cast
 
-from inferssd.configuration.settings import PLATFORMS, Setting, Snapshot, parse, render, uncomment
+from inferssd.configuration.settings import (
+    PLATFORMS,
+    Setting,
+    Snapshot,
+    parse,
+    render,
+    schema,
+    uncomment,
+)
 from inferssd.launch.darwin import MODEL_OPTIONS
 from inferssd.launch.resources import EngineResources, server_binary
 from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
@@ -396,6 +404,15 @@ def _resolve(
     if value.at("vram.budget").value != 0 and "CUDA" in (gpu_backends or ()):
         if not s.value("gpu_available"):
             raise ValueError("typed GPU execution requires nvidia-smi")
+    # A setting of a GPU backend's expert tier needs an engine built with that backend.
+    for item in value.entries:
+        backend = schema()["properties"][item.key].get("backend")
+        if backend and item.origin != "default" and gpu_backends is not None:
+            if backend not in gpu_backends:
+                raise ValueError(
+                    f"{item.key} ({item.location}) configures the {backend} expert tier, "
+                    "which this engine was built without"
+                )
     # The sink's I/O thread keeps its own CPUs; decode runs on the first decode threads.
     if set(cast(tuple[int, ...], value.at("cpu.io_cpus").value)) & set(
         threads.cpus + threads.decode_cpus
