@@ -217,10 +217,11 @@ def test_profile_saves_to_the_state_directory_and_summarizes(tmp_path):
     assert names == ["cpu", "memory", "compute", "gpus", "storage"] + ["estimate"] * len(
         catalog.MODELS
     )
-    # This machine measured Q4_K alone, so no supported model can be priced.
+    # This machine measured Q4_K alone, so no supported model can be priced: each names the
+    # role formats it lacks, as cpu_line does.
     assert out[7:] == [
         f"estimate: {model.repo}:{model.quantization} none: no CPU compute measurement of "
-        + ("MXFP4" if model.facts.dominant_format == "MXFP4" else "Q5_K")
+        + ", ".join(sorted({role.format.upper() for role in model.facts.roles} - {"Q4_K"}))
         for model in catalog.MODELS
     ]
     assert out[2].endswith("4 logical CPUs (4 uniform); ISA AVX2 FMA F16C")
