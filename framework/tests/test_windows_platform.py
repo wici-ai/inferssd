@@ -255,7 +255,7 @@ def policy(**limits: Optional[int]) -> Policy:
 
 @pytest.fixture
 def job_host(monkeypatch):
-    state = {"limit": 32 << 30, "available": 24 << 30, "compressor": 0, "pagefile": 0}
+    state = {"limit": 32 << 30, "available": 24 << 30, "compressor": 0, "pagefile": 0, "vram": 0}
     monkeypatch.setattr(windows_resources, "host_platform", lambda: "windows")
     monkeypatch.setattr(windows_resources.os, "getpid", lambda: 7)
     monkeypatch.setattr(
@@ -264,6 +264,7 @@ def job_host(monkeypatch):
         lambda _job: {"job_memory_limit": state["limit"], "peak_job_memory": 1},
     )
     monkeypatch.setattr(win32, "job_processes", lambda _job: [7, 9])
+    monkeypatch.setattr(win32, "discrete_video_memory", lambda: state["vram"])
     monkeypatch.setattr(
         win32, "system_memory", lambda: {"physical_available_bytes": state["available"]}
     )
@@ -297,6 +298,16 @@ def test_resources_enforce_what_a_policy_declares(job_host, limits, change, mess
     runtime.prepare()
     job_host.update(change)
     with pytest.raises(RuntimeError, match=message):
+        runtime.sample(None)
+
+
+def test_the_job_limit_leaves_room_for_discrete_gpu_memory(job_host):
+    # WDDM charges a device allocation to commit, so the job's limit is the budget plus the VRAM.
+    job_host.update(vram=24 << 30, limit=(32 << 30) + (24 << 30))
+    runtime = windows_resources.Resources(policy())
+    runtime.prepare()
+    job_host.update(limit=32 << 30)
+    with pytest.raises(RuntimeError, match="hard memory budget"):
         runtime.sample(None)
 
 
@@ -380,9 +391,23 @@ def test_a_process_without_a_job_cannot_be_stopped_as_a_group():
         windows_process.stop_owned(Finished(), 1)
 
 
+def test_the_guardian_job_limit_adds_the_discrete_gpus_memory(tmp_path, monkeypatch):
+    jobs = []
+
+    def create_job(*, kill_on_close: bool, memory_limit: Optional[int]) -> int:
+        jobs.append((kill_on_close, memory_limit))
+        return 5
+
+    monkeypatch.setattr(win32, "create_job", create_job)
+    monkeypatch.setattr(win32, "discrete_video_memory", lambda: 24 << 30)
+    windows_process.JobScope(policy(), tmp_path)
+    assert jobs == [(False, (32 << 30) + (24 << 30))]
+
+
 def test_job_scope_proves_the_job_empty(tmp_path, monkeypatch):
     active = [2]
     monkeypatch.setattr(win32, "create_job", lambda **_options: 5)
+    monkeypatch.setattr(win32, "discrete_video_memory", lambda: 0)
     monkeypatch.setattr(win32, "job_active", lambda _job: active[0])
     monkeypatch.setattr(win32, "job_memory", lambda _job: {"job_memory": 0})
     monkeypatch.setattr(win32, "job_processes", lambda _job: [11])

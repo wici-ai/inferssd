@@ -178,6 +178,50 @@ class _RawCounter(Structure):
     ]
 
 
+class _KmtAdapterInfo(Structure):
+    _fields_ = [
+        ("hAdapter", c_uint32),
+        ("AdapterLuidLowPart", c_uint32),
+        ("AdapterLuidHighPart", c_int),
+        ("NumOfSources", c_uint32),
+        ("bPrecisePresentRegionsPreferred", c_int),
+    ]
+
+
+class _KmtEnumAdapters2(Structure):
+    _fields_ = [("NumAdapters", c_uint32), ("pAdapters", POINTER(_KmtAdapterInfo))]
+
+
+class _KmtVideoMemoryInfo(Structure):
+    _fields_ = [
+        ("hProcess", c_void_p),
+        ("hAdapter", c_uint32),
+        ("MemorySegmentGroup", c_int),
+        ("Budget", c_uint64),
+        ("CurrentUsage", c_uint64),
+        ("CurrentReservation", c_uint64),
+        ("AvailableForReservation", c_uint64),
+        ("PhysicalAdapterIndex", c_uint32),
+    ]
+
+
+class _KmtSegmentSize(Structure):
+    _fields_ = [
+        ("DedicatedVideoMemorySize", c_uint64),
+        ("DedicatedSystemMemorySize", c_uint64),
+        ("SharedSystemMemorySize", c_uint64),
+    ]
+
+
+class _KmtQueryAdapterInfo(Structure):
+    _fields_ = [
+        ("hAdapter", c_uint32),
+        ("Type", c_int),
+        ("pPrivateDriverData", c_void_p),
+        ("PrivateDriverDataSize", c_uint32),
+    ]
+
+
 _H, _D, _B, _P = c_void_p, c_uint32, c_int, c_void_p
 _PROTOTYPES: Mapping[str, Mapping[str, tuple[Any, list[Any]]]] = {
     "kernel32": {
@@ -203,6 +247,12 @@ _PROTOTYPES: Mapping[str, Mapping[str, tuple[Any, list[Any]]]] = {
         "TerminateJobObject": (_B, [_H, c_uint32]),
         "Thread32First": (_B, [_H, POINTER(_ThreadEntry)]),
         "Thread32Next": (_B, [_H, POINTER(_ThreadEntry)]),
+    },
+    "gdi32": {
+        "D3DKMTCloseAdapter": (c_int, [POINTER(c_uint32)]),
+        "D3DKMTEnumAdapters2": (c_int, [POINTER(_KmtEnumAdapters2)]),
+        "D3DKMTQueryAdapterInfo": (c_int, [POINTER(_KmtQueryAdapterInfo)]),
+        "D3DKMTQueryVideoMemoryInfo": (c_int, [POINTER(_KmtVideoMemoryInfo)]),
     },
     "iphlpapi": {"GetExtendedTcpTable": (_D, [_P, POINTER(_D), _B, _D, c_int, _D])},
     "pdh": {
@@ -540,6 +590,51 @@ def system_memory() -> dict[str, int]:
         "commit_limit_bytes": int(status.ullTotalPageFile),
         "commit_available_bytes": int(status.ullAvailPageFile),
     }
+
+
+# The non-local segment group and the adapter query for segment sizes (d3dkmthk.h).
+_KMT_NON_LOCAL, _KMT_GETSEGMENTSIZE = 1, 3
+
+
+def discrete_video_memory() -> int:
+    """Dedicated video memory of the discrete adapters, in bytes.
+
+    WDDM charges a device allocation there to the allocating process's commit
+    without taking host memory, so a job's commit limit leaves room for it
+    beside the host budget. An adapter is discrete when it also has a
+    non-local segment group, the system memory it maps; an integrated
+    adapter's segments are host memory.
+    """
+    gdi = _dll("gdi32")
+    listing = _KmtEnumAdapters2()
+    if gdi.D3DKMTEnumAdapters2(byref(listing)):
+        raise OSError("D3DKMTEnumAdapters2 failed")
+    adapters = (_KmtAdapterInfo * listing.NumAdapters)()
+    listing.pAdapters = adapters
+    if gdi.D3DKMTEnumAdapters2(byref(listing)):
+        raise OSError("D3DKMTEnumAdapters2 failed")
+    total = 0
+    try:
+        for adapter in adapters[: listing.NumAdapters]:
+            non_local = _KmtVideoMemoryInfo(
+                hAdapter=adapter.hAdapter, MemorySegmentGroup=_KMT_NON_LOCAL
+            )
+            if gdi.D3DKMTQueryVideoMemoryInfo(byref(non_local)) or not non_local.Budget:
+                continue
+            sizes = _KmtSegmentSize()
+            query = _KmtQueryAdapterInfo(
+                hAdapter=adapter.hAdapter,
+                Type=_KMT_GETSEGMENTSIZE,
+                pPrivateDriverData=ctypes.cast(byref(sizes), c_void_p),
+                PrivateDriverDataSize=sizeof(sizes),
+            )
+            if gdi.D3DKMTQueryAdapterInfo(byref(query)):
+                raise OSError("D3DKMTQueryAdapterInfo failed")
+            total += int(sizes.DedicatedVideoMemorySize)
+    finally:
+        for adapter in adapters[: listing.NumAdapters]:
+            gdi.D3DKMTCloseAdapter(byref(c_uint32(adapter.hAdapter)))
+    return total
 
 
 def pagefile_in_use() -> int:

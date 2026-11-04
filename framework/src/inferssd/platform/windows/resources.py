@@ -2,9 +2,13 @@
 """Windows bounded-resource checks, used only by an explicitly started worker.
 
 The worker runs in its guardian's job, whose commit limit is the policy's
-memory budget: the kernel refuses commit beyond it, as a cgroup's memory.max
-does. Paging-file use and the memory compression store are system-wide, so
-their growth since launch is sampled against the policy, as on Darwin.
+memory budget plus the dedicated memory of the discrete GPUs (commit_limit):
+the kernel refuses commit beyond it, as a cgroup's memory.max does. WDDM
+charges a device allocation to commit without taking host memory, so the
+budget alone would count the server's GPU memory as host memory; the engine
+measures its host memory without it. Paging-file use and the memory
+compression store are system-wide, so their growth since launch is sampled
+against the policy, as on Darwin.
 """
 
 from __future__ import annotations
@@ -20,9 +24,15 @@ from inferssd.platform.windows import win32
 COMPRESSION = "Memory Compression"
 
 
+def commit_limit(policy: Policy) -> int:
+    """The job's commit limit: the memory budget and room for the discrete GPUs' memory."""
+    return policy.memory_budget_bytes + win32.discrete_video_memory()
+
+
 class Resources:
     def __init__(self, policy: Policy) -> None:
         self.policy = policy
+        self.limit: Optional[int] = None
         # Owned processes cannot leave their jobs, so the worker's group proves
         # its server gone and the guardian proves this scope empty.
         self.scope: Optional[Any] = None
@@ -35,6 +45,7 @@ class Resources:
             raise ValueError(
                 "Windows sets no locked-memory limit to check; set minimum_memlock_bytes to 0"
             )
+        self.limit = commit_limit(self.policy)
         first = self.sample(None)
         self.baseline = first
         return first
@@ -45,7 +56,7 @@ class Resources:
 
     def sample(self, pid: Optional[int]) -> dict[str, Any]:
         job = win32.job_memory(None)
-        if job["job_memory_limit"] != self.policy.memory_budget_bytes:
+        if job["job_memory_limit"] != self.limit:
             raise RuntimeError("actual worker job must carry the hard memory budget")
         members = win32.job_processes(None)
         if os.getpid() not in members:

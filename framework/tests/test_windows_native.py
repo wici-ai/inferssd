@@ -82,6 +82,11 @@ def test_an_owned_child_dies_with_its_job_and_states_its_memory():
     assert child.poll() is not None
 
 
+def test_discrete_video_memory_reads():
+    # Zero without a discrete GPU; the VRAM of each one that has a non-local segment group.
+    assert win32.discrete_video_memory() >= 0
+
+
 def test_a_job_memory_limit_reads_back():
     job = win32.create_job(kill_on_close=False, memory_limit=1 << 30)
     try:

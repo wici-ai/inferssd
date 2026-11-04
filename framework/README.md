@@ -157,8 +157,9 @@ The worker checks the actual envelope and the server's inherited scope and
 memlock limit. It never raises system limits.
 
 On Windows the server runs in its guardian's job object, whose commit limit is
-`memory_budget_bytes`; the worker checks that limit and that the server stays in
-the job. Paging-file use and the memory compression store are system-wide, so
+`memory_budget_bytes` plus the dedicated memory of the discrete GPUs, since WDDM
+charges their allocations to commit; the worker checks that limit and that the
+server stays in the job. Paging-file use and the memory compression store are system-wide, so
 their growth is sampled, as on macOS.
 
 On macOS the budget is a **sampled soft server RSS threshold**, not a cgroup or a

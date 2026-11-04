@@ -24,6 +24,7 @@ from inferssd.platform.policy import Policy
 from inferssd.platform.process import Cleanup, Process
 from inferssd.platform.windows import win32
 from inferssd.platform.windows.lease import LeaseServer
+from inferssd.platform.windows.resources import commit_limit
 
 # Ctrl+Break arrives as signal.SIGBREAK, which only Windows builds of Python define.
 SIGBREAK = 21
@@ -196,8 +197,10 @@ class JobScope:
 
     Unlike a server's group it does not end when the guardian's handle closes,
     so a worker whose guardian died still stops its server in order. Its commit
-    limit is the policy's memory budget, as a Linux scope's MemoryMax is. It is
-    also the guardian's native port: the worker's lease, start and stop signals.
+    limit is the policy's memory budget, as a Linux scope's MemoryMax is, plus
+    the dedicated memory of the discrete GPUs, which WDDM charges to commit
+    (resources.commit_limit). It is also the guardian's native port: the
+    worker's lease, start and stop signals.
     """
 
     unit: Optional[str] = None
@@ -205,7 +208,7 @@ class JobScope:
 
     def __init__(self, policy: Policy, directory: Path) -> None:
         self.directory = directory
-        self.job = win32.create_job(kill_on_close=False, memory_limit=policy.memory_budget_bytes)
+        self.job = win32.create_job(kill_on_close=False, memory_limit=commit_limit(policy))
         self.native = self
 
     def lease(self, lock_fd: int) -> LeaseServer:
