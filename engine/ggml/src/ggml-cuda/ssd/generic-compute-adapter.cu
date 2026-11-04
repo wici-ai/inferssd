@@ -76,8 +76,10 @@ struct generic_engine {
         }
         auto is_float = [](int type) { return type == GGML_TYPE_BF16 || type == GGML_TYPE_F16; };
         const bool floating = is_float(weight_type) && is_float(down_type);
+        const int up_block = ggml_blck_size(ggml_type(weight_type));
+        const int down_block = ggml_blck_size(ggml_type(down_type));
         if (latent <= 0 || hidden <= 0 || latent > 16384 || hidden > 16384 ||
-                latent % 256 || hidden % 256 || max_hits < 1 || max_hits > 16) {
+                latent % up_block || hidden % down_block || max_hits < 1 || max_hits > 16) {
             throw std::runtime_error("unsupported generic VRAM expert geometry");
         }
         mmvq = ggml_cuda_moe_stream_mmvq_dev;

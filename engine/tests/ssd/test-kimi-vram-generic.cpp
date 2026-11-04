@@ -42,8 +42,9 @@ void set_switch(fixture_inputs & inputs, const char * name, bool enabled) {
 
 void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, mode selected, size_t & checks,
         double & worst_rel, double & worst_abs,
-        ggml_type up_type, ggml_type down_type) {
+        ggml_type up_type, ggml_type down_type, bool native_ranges = false) {
     fixture f;
+    f.native_ranges = native_ranges;
     f.type = up_type;
     f.down_type = down_type;
     f.latent = latent;
@@ -153,6 +154,7 @@ int main() {
         double worst_abs = 0.0;
         run_shape(inputs, 512, 256, 8, {true, "production-generic"}, checks, worst_rel, worst_abs, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K);
         run_shape(inputs, 512, 256, 8, {true, "production-generic"}, checks, worst_rel, worst_abs, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+        run_shape(inputs, 2560, 640, 8, {true, "production-generic"}, checks, worst_rel, worst_abs, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, true);
         run_host_jobs(inputs, GGML_TYPE_Q8_0, checks);
         std::printf("REAL_GPU_GENERIC_TIER_PASS checks=%zu worst_rel_l2=%.6g worst_abs=%.6g\n",
             checks, worst_rel, worst_abs);

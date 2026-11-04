@@ -1894,9 +1894,9 @@ struct tier {
         if(deferred_upload && !deferred_stream)cuda_check(cudaStreamCreateWithFlags(&deferred_stream,cudaStreamNonBlocking));
         if(table)return;
         stride=0;for(int i=0;i<3;++i){role_bytes[i]=r->role[i].bytes;stride+=role_bytes[i];}
-        const size_t up_bytes=(ggml_row_size(ggml_type(weight_type),latent)*size_t(hidden)+4095)&~size_t(4095);
-        const size_t down_bytes=(ggml_row_size(ggml_type(down_type),hidden)*size_t(latent)+4095)&~size_t(4095);
-        if(role_bytes[0]!=up_bytes || role_bytes[1]!=up_bytes || role_bytes[2]!=down_bytes)throw std::runtime_error("VRAM pack padding/shape mismatch");
+        const size_t up_bytes=ggml_row_size(ggml_type(weight_type),latent)*size_t(hidden);
+        const size_t down_bytes=ggml_row_size(ggml_type(down_type),hidden)*size_t(latent);
+        if(role_bytes[0]!=up_bytes || role_bytes[1]!=up_bytes || role_bytes[2]!=down_bytes)throw std::runtime_error("VRAM expert byte shape mismatch");
         // Allocate fixed batch scratch before the decode arena. The token
         // accumulator is reserved for each prefill and released before decode.
         if(mxfp4 && mxfp4_batch_enabled && !mxfp4_batch){
