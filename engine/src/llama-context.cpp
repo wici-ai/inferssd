@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-cuda-recapture.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -302,6 +303,22 @@ llama_context::llama_context(
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
+
+        // Configure each context-owned CUDA backend once, before scheduler execution.
+        const auto recapture = llama_cuda_recapture_default(model.arch);
+        bool recapture_active = false;
+        for (const auto & backend : backends) {
+            auto * registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+            using configure_fn = bool (*)(ggml_backend_t, bool);
+            const auto configure = reinterpret_cast<configure_fn>(ggml_backend_reg_get_proc_address(
+                registry, "ggml_backend_cuda_configure_stable_recapture"));
+            if (configure) {
+                recapture_active |= configure(backend.get(), recapture.enabled);
+            }
+        }
+        LLAMA_LOG_INFO("rsi.design.active {\"consumer\":\"cuda-stable-recapture\",\"model\":\"%s\","
+                       "\"enabled\":%s,\"once_per_context\":true}\n",
+                       recapture.model, recapture_active ? "true" : "false");
 
         if (ssd_runtime) {
             ssd_runtime->bind_cpu(backend_cpu);
