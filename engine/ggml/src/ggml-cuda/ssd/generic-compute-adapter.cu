@@ -76,8 +76,13 @@ struct generic_engine {
         }
         auto is_float = [](int type) { return type == GGML_TYPE_BF16 || type == GGML_TYPE_F16; };
         const bool floating = is_float(weight_type) && is_float(down_type);
-        if (latent <= 0 || hidden <= 0 || latent > 16384 || hidden > 16384 ||
-                latent % 256 || hidden % 256 || max_hits < 1 || max_hits > 16) {
+        // A row is whole blocks of its format (up and gate rows span the latent, down rows the hidden), as in a
+        // GGUF tensor and ggml's mul_mat_vec_q; the Q8_1 input is padded to MATRIX_ROW_PADDING (q8_1_bytes).
+        auto whole_blocks = [](int columns, int type) {
+            return type >= 0 && type < GGML_TYPE_COUNT && columns % ggml_blck_size(ggml_type(type)) == 0;
+        };
+        if (latent <= 0 || hidden <= 0 || latent > 16384 || hidden > 16384 || max_hits < 1 || max_hits > 16 ||
+                !whole_blocks(latent, weight_type) || !whole_blocks(hidden, down_type)) {
             throw std::runtime_error("unsupported generic VRAM expert geometry");
         }
         mmvq = ggml_cuda_moe_stream_mmvq_dev;
