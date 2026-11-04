@@ -8,6 +8,7 @@
 #define LLAMA_MAX_SEQ 256
 
 struct llama_cparams {
+    bool cuda_thin_mmvf = false; // configured once per context, Muse experiment only
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
