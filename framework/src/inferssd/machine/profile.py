@@ -422,20 +422,9 @@ def measure_gpus(
     if failure:
         return [], section(start, clock(), "nvidia-smi", "failed", failure)
     if "memory" not in identity["soft"]["probe_versions"]:
-        system = identity["hard"]["platform"]
-        listed = [gpu["uuid"] for gpu in identity["hard"]["gpus"] if gpu["backend"] == "CUDA"]
-        if listed:
-            # Windows: the identity records the GPUs nvidia-smi lists; nothing measures them.
-            return [], section(
-                start,
-                clock(),
-                "nvidia-smi",
-                "partial",
-                f"not measured: {', '.join(listed)}; the GPU transfer probe runs on Linux only",
-            )
         why = (
-            "the GPU transfer probe runs on Linux with CUDA only"
-            if system == "darwin"
+            "the GPU transfer probe needs an NVIDIA GPU with CUDA"
+            if identity["hard"]["platform"] == "darwin"
             else "no NVIDIA GPU found by nvidia-smi"
         )
         return [], section(start, clock(), "none", "ok", why)

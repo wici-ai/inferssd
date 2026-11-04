@@ -585,3 +585,14 @@ def test_only_test_files_of_ended_runs_are_cleared(tmp_path):
         (tmp_path / name).write_bytes(b"x")
     NativeHost().clear_test_files(str(tmp_path))
     assert sorted(os.listdir(tmp_path)) == sorted(names[2:])
+
+
+def test_memory_probe_wherever_cuda_runs():
+    from inferssd.machine.identity import probe_versions
+
+    cuda = [{"backend": "CUDA", "uuid": "GPU-1", "name": "GPU", "vram_bytes": 1}]
+    vulkan = [{"backend": "Vulkan", "uuid": "PCI-1", "name": "iGPU", "vram_bytes": 0}]
+    assert "memory" in probe_versions("linux", cuda)
+    assert "memory" in probe_versions("windows", cuda)
+    assert "memory" not in probe_versions("windows", vulkan)
+    assert "memory" not in probe_versions("linux", [])

@@ -375,7 +375,7 @@ def linux_adapters(host: Host) -> list[GPUIdentity]:
 
 def probe_versions(system: str, gpus: Sequence[GPUIdentity]) -> dict[str, str]:
     versions = {"ssd": PROBE_SCHEMAS["ssd"], "cpu": PROBE_SCHEMAS["cpu"]}
-    if system == "linux" and any(gpu["backend"] == "CUDA" for gpu in gpus):
+    if system in ("linux", "windows") and any(gpu["backend"] == "CUDA" for gpu in gpus):
         versions["memory"] = PROBE_SCHEMAS["memory"]
     return versions
 
