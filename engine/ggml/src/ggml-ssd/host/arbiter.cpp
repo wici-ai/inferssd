@@ -19,7 +19,6 @@ namespace ssd { namespace host { using host_ledger = native_ledger; } }
 
 namespace ssd { namespace host {
 namespace {
-uint64_t add(uint64_t a, uint64_t b) noexcept { return b > UINT64_MAX - a ? UINT64_MAX : a + b; }
 template<class T> result<T> passed(T value) { return {std::move(value), status::ok, {}}; }
 template<class T> result<T> failed(status code, const char * message) { return {T{}, code, message}; }
 template<> result<void> failed<void>(status code, const char * message) { return {code, message}; }
@@ -53,15 +52,6 @@ struct client_state {
     size_t reclaims = 0;                      // reclaimer runs in progress, outside the mutex
 };
 }
-uint64_t room::shortage() const noexcept { return std::max(cgroup_shortage, system_shortage); }
-uint64_t room::surplus() const noexcept {
-    if (!fits()) { return 0; }
-    uint64_t value = UINT64_MAX;
-    if (cgroup != room_unreadable) { value = std::min(value, cgroup_surplus); }
-    if (system) { value = std::min(value, system_surplus); }
-    return value;
-}
-
 struct process_arbiter::impl {
     std::mutex mutex;
     std::condition_variable changed;
@@ -77,22 +67,10 @@ struct process_arbiter::impl {
     std::map<uint64_t, pending_ticket> tickets;
 
     explicit impl(reader injected) {
-        budget.reserve = budget.margin = 512ull << 20;
 #if defined(__linux__)
         // The Linux ledger reads /proc and cgroup v2 files, through the injected reader in tests.
         budget.read = std::move(injected);
-        const long page = sysconf(_SC_PAGESIZE);
-        budget.page_size = page > 0 ? uint64_t(page) : 4096;
-        std::string groups;
-        if (budget.get("/proc/self/cgroup", groups)) {
-            for (size_t at = 0; at < groups.size();) {
-                const size_t end = std::min(groups.find('\n', at), groups.size());
-                if (!groups.compare(at, 3, "0::")) {
-                    budget.cgroup = "/sys/fs/cgroup" + groups.substr(at + 3, end - at - 3); break;
-                }
-                at = end + 1;
-            }
-        }
+        budget.locate();
 #else
         (void) injected; // the native ledger asks the OS, not files
 #endif
@@ -169,32 +147,7 @@ struct process_arbiter::impl {
 #if defined(__linux__)
         view.device_held = held_device(); // the native ledgers' envelopes charge device memory to the process
 #endif
-        const auto observed = view.measure(add(extra, pending), full_boost);
-        room out;
-        out.cgroup = static_cast<room_state>(observed.cgroup);
-        out.cgroup_shortage = observed.cgroup_shortage; out.cgroup_surplus = observed.cgroup_surplus;
-        out.system = observed.system; out.available = observed.available; out.floor = observed.floor;
-        out.system_shortage = observed.system_shortage; out.system_surplus = observed.system_surplus;
-        out.boost_headroom = observed.boost_headroom;
-        return out;
-    }
-    bool unbounded_cgroup() const {
-        if (budget.cgroup.empty()) { return false; }
-        const std::string root = "/sys/fs/cgroup";
-        for (std::string path = budget.cgroup; path.size() >= root.size();) {
-            std::string text;
-            if (!budget.get(path + "/memory.max", text)) {
-                return path == root || path == root + "/";
-            }
-            const auto begin = text.find_first_not_of(" \t\n");
-            if (begin == std::string::npos || text.substr(begin, text.find_first_of(" \t\n", begin) - begin) != "max") {
-                return false;
-            }
-            const auto slash = path.find_last_of('/');
-            if (slash == std::string::npos) { break; }
-            path.resize(slash);
-        }
-        return true;
+        return view.measure(add(extra, pending), full_boost);
     }
     // An admission of `extra` bytes that `observed` found short: the context's reclaimer gives back what `who` may
     // ask of it, its steps run without the mutex. False when there is nothing to run.
@@ -400,7 +353,7 @@ result<allocation_ticket> context_client::take(uint64_t host, uint64_t device, r
             if (const auto * error = owner.invalid(*state_)) { return failed<allocation_ticket>(status::invalid, error); }
             auto observed = owner.measure(extra, true);
             const bool readable = observed.system || observed.cgroup != room_unreadable;
-            const bool missing_cgroup = observed.cgroup == room_unreadable && (finite || !owner.unbounded_cgroup());
+            const bool missing_cgroup = observed.cgroup == room_unreadable && (finite || !owner.budget.unbounded());
             // Nothing asked for needs no room: a shortage must not stop a run over memory it already holds.
             if ((extra && !observed.fits()) || !readable || missing_cgroup) {
                 const auto code = !readable || missing_cgroup ? status::io : status::resource;
