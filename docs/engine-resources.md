@@ -35,9 +35,9 @@ metadata, so a local build and the installer's build record them the same way;
 `inferssd --version --json` reports them, and `--version` alone adds them to its
 line as `v<build>.<mmdd>.<commit>`. A shallow clone counts only the commits it
 has, so the installer clones with `--filter=blob:none`; a source archive has no
-Git metadata, and the four are `"unknown"` and `null`. WiCi Infer names the
-engine by this label and decides on its own, by `build`, whether an engine is
-one it works with; the engine does not know the app.
+Git metadata, and the four are `"unknown"` and `null`. The WiCi AI desktop app
+names the engine by this label and decides on its own, by `build`, whether an
+engine is one it works with; the engine does not know the app.
 
 Use `darwin` for an Apple Silicon deployment and `windows` for a Windows one.
 `gpu_backends` lists the GPU backends the engine was built with, of `CUDA`,

@@ -119,8 +119,8 @@ $ inferssd --version --json
 ```
 
 The engine only says what it is. Whether a build is one it can work with is for whatever runs
-the engine to decide; WiCi Infer, for one, installs the head of `main`, offers its newer commits
-as updates, and keeps a floor of its own on `build`. Nothing here refers to that app.
+the engine to decide; the WiCi AI desktop app, for one, installs the head of `main`, offers its
+newer commits as updates, and keeps a floor of its own on `build`. Nothing here refers to it.
 
 ## Further reading
 
