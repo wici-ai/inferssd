@@ -69,8 +69,11 @@ macOS phys_footprint). With `host.budget_mib = 0` and no job limit, the limit is
 the machine's physical memory, the budget the framework passes by default. The
 system term is the memory available now less the floor, which is at least
 `host.headroom_mib` and the reserve: Linux MemAvailable, Windows the smaller of available physical
-memory and available commit, macOS free, file-backed, purgeable and reusable
-pages. The RAM expert cache admits only under a readable envelope. On a GPU
+memory and available commit, macOS what a new allocation takes before the kernel
+compresses anything, by its own live thresholds: the free pages above its free
+target, the file-backed pages above its file cache minimum
+(`vm.vm_page_filecache_min`), and the purgeable and reusable pages. The RAM
+expert cache admits only under a readable envelope. On a GPU
 that shares the host's memory (unified memory, such as GB10), a CUDA allocation
 is not charged to the cgroup, so the Linux envelope counts the CUDA expert
 tier's storage as used beside the cgroup's own usage: the tier and the RAM

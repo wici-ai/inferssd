@@ -19,17 +19,19 @@
 //    `extra` with no reserve beside it, are the limits of room.h.
 //  - system: memory available to a new allocation, less the floor and the open prefill's pages.
 //      Windows: min(ullAvailPhys, ullAvailPageFile), as commit is a hard limit there.
-//      macOS: free, file-backed, purgeable and reusable pages (the kernel's live counters, through sysctl): what
-//      the kernel gives without compressing or swapping anyone's anonymous memory, the counterpart of MemAvailable.
+//      macOS: what a new allocation takes before the kernel compresses or swaps anyone's anonymous memory, by its
+//      own live thresholds (sysctl): the free pages above its free target, the file-backed pages above its file
+//      cache minimum (vm_page_filecache_min, which it keeps), and the purgeable and reusable pages. The counterpart
+//      of MemAvailable, which keeps the zones' watermarks back the same way.
 // floor = margin + explicit reserves, as on Linux.
 //
 // How the Linux-specific parts carry over:
 //  - file_reserve keeps a unified-memory CUDA tier off the server's page cache and grows with the kernel's
 //    refault counter; neither OS has that tier or counter, so update_file_reserve() never grows it.
 //  - The open prefill's file pages (weight rows read by index) are held in the system term, as on Linux, since it
-//    counts cached file pages as available: on macOS every file-backed page, on Windows the standby list. A row
-//    still in the working set is not on that list, so Windows holds it twice until the first decode token,
-//    which errs safe. The envelope does not hold them: neither commit nor phys_footprint is charged for a
+//    counts cached file pages as available: on macOS those above the file cache minimum, on Windows the standby
+//    list. A row still in the working set is not on that list, so Windows holds it twice until the first decode
+//    token, which errs safe. The envelope does not hold them: neither commit nor phys_footprint is charged for a
 //    read-only mapping's file pages, so they never take its room.
 //  - There is no watermark boost: memory_available_at_full_boost() keeps nothing back.
 #include "room.h"

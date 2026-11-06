@@ -121,7 +121,7 @@ static void machine() {
     print("machine", r);
     require(r.cgroup == room_ok && r.cgroup_surplus > 0 && r.cgroup_surplus < total, "envelope room sane");
     require(r.limits == room_ok && !r.limits_shortage, "the limits hold nothing more");
-    require(r.system && r.available > 0 && r.available <= total, "system term within physical memory");
+    require(r.system && r.available <= total, "system term within physical memory");
     require(r.floor == 512 * MiB, "floor is the margin");
     const room full = ledger.measure(0, true);
     require(full.system && full.boost_headroom == 0, "no watermark boost");
@@ -134,8 +134,10 @@ static void machine() {
     require(!ledger.update_file_reserve() && ledger.floor() == 512 * MiB, "file reserve stays inert");
     ledger.prefill_pages = 256 * MiB;
     const room held = ledger.measure(0);
-    require(held.system && held.available > held.floor + 256 * MiB &&
-            held.system_surplus == held.available - held.floor - 256 * MiB, "the system term holds prefill pages");
+    const uint64_t need = held.floor + 256 * MiB; // whatever the machine has available now
+    require(held.system && held.system_surplus == (held.available > need ? held.available - need : 0) &&
+            held.system_shortage == (need > held.available ? need - held.available : 0),
+            "the system term holds prefill pages");
     require(held.cgroup_surplus + 16 * MiB >= r.cgroup_surplus, "the envelope does not hold prefill pages");
     require(held.limits == room_ok, "the limits do not hold prefill pages");
 
