@@ -733,7 +733,8 @@ static uint64_t triplet_bytes(const fixture & f) {
 static kimi_cpu_sink_cache_stats cache_snapshot(kimi_cpu_sink * sink) {
     kimi_cpu_sink_cache_stats stats = {};
     kimi_cpu_sink_cache_get_stats(sink, &stats);
-    require(stats.capacity_bytes <= stats.budget_bytes && stats.mapped_bytes <= stats.capacity_bytes &&
+    // A cache sized from the room maps every slot it may grow into (mapped_bytes) and holds capacity_bytes of them.
+    require(stats.capacity_bytes <= stats.budget_bytes && stats.committed_bytes <= stats.capacity_bytes &&
             stats.enabled_bytes <= stats.capacity_bytes && stats.committed_bytes <= stats.mapped_bytes &&
             stats.valid_bytes <= stats.committed_bytes && stats.valid_bytes <= stats.enabled_bytes,
             "cache physical budget invariant failed");
@@ -2802,8 +2803,9 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         std::printf("case=prefill_room status=PASS %s | %s\n", line.c_str(), regrow.c_str());
     }
     {
-        // The load step with a prefill's pages held (the load-time graph's): the arena has the slots the first decode
-        // token would size, the slots committed leave the pages' room, and those are owed at the first decode token.
+        // The load step with a prefill's pages held (the load-time graph's): the arena has every slot the layers' quotas
+        // allow, the slots the first decode token would size are enabled, the slots committed leave the pages' room,
+        // and those are owed at the first decode token.
         scoped_fixture_input file_env(inputs, "cache_reclaimable_file", "1");
         auto number = [](const std::string & line, const std::string & key) {
             const size_t at = line.find(" " + key + "=");
@@ -2837,9 +2839,10 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
             }
             require(ok, error);
         }
-        require(number(loaded, "of") == 6 && number(loaded, "slots") == 3,
-                "load hold: the arena or the committed slots did not leave the held pages: " + loaded);
         const uint64_t stride = number(loaded, "slot_bytes");
+        require(number(loaded, "of") == 2 * 6 && number(loaded, "slots") == 3 &&
+                cache_snapshot(g.get()).enabled_bytes == 6 * stride,
+                "load hold: the arena, the enabled or the committed slots did not leave the held pages: " + loaded);
         begin_cache(g.get(), 14, 1, false);
         require(cache_snapshot(g.get()).enabled_bytes == 6 * stride, "load hold: the first prefill gave held slots back");
         begin_cache(g.get(), 14, 2);
