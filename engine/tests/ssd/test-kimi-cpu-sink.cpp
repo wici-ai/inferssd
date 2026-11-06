@@ -742,8 +742,25 @@ static kimi_cpu_sink_cache_stats cache_snapshot(kimi_cpu_sink * sink) {
     return stats;
 }
 
+// A case that caches up to `bytes` on macOS or Windows, where the envelope is the machine itself, needs room for them
+// in the host ledger's terms: a busy machine lacks it, as one without a finite cgroup lacks the envelope on Linux,
+// whose runner gives the cases a cgroup sized for them (and whose pressure cases configure what it cannot hold). An
+// automatic budget sizes itself from the room, and a budget past the machine's memory is a pressure case.
+static void need_cache_room(uint64_t bytes) {
+#if defined(__linux__)
+    (void) bytes;
+#else
+    uint64_t machine = 0;
+    if (bytes == UINT64_MAX || !ssd::host::native::physical(machine) || bytes >= machine) { return; }
+    ssd::host::native_ledger ledger;
+    test_resources::need(ledger.measure(bytes).fits(),
+            "cache case needs room for its budget beyond the floor (the machine's memory is taken)");
+#endif
+}
+
 static void configure_cache(kimi_cpu_sink * sink, uint64_t bytes,
         const std::vector<int32_t> & layers, int quota) {
+    need_cache_room(bytes);
     char error[512] = {};
     require(kimi_cpu_sink_cache_configure(sink, bytes, layers.data(), int(layers.size()), quota, error, sizeof(error)),
             std::string("cache configure: ") + error);
@@ -1932,6 +1949,8 @@ static void cache_pressure_test(fixture_inputs & inputs, int threads, int depth,
     }
     test_resources::need(unbounded ? !finite : constrained, unbounded ? "--cache-unbounded requires no finite cgroup ancestor" :
             "--cache-pressure requires a cgroup memory.max <= 2 GiB (use an independent 1 GiB scope)");
+    // a reserve the scope cannot hold beside the payload
+    scoped_fixture_input reserve(inputs, "cache_reserve_bytes", std::to_string(2ull << 30).c_str());
     fixture f; make_synthetic(f); auto sink = make_sink(inputs, f, threads, depth);
     std::vector<float> input(f.latent, .13f);
     configure_cache(sink.get(), 2 * triplet_bytes(f), { 1 }, 2);
@@ -3022,7 +3041,8 @@ static void work_buffer_reclaim_tests(fixture_inputs & inputs, int threads, int 
     const auto state = client->state();
     require(bool(state) && state.value.pending_bytes == 0 && state.value.granted == granted + work,
             "work buffer: the ledger kept a pending debit or did not grant the buffer");
-    require(client->measure(0, true).value.fits(), "work buffer: the grant overdrew the envelope");
+    // the envelope, a hard limit (the system term moves with the rest of the machine)
+    require(client->measure(0, true).value.cgroup_shortage == 0, "work buffer: the grant overdrew the envelope");
 
     begin_cache(sink.get(), 21, 2); // the first decode token takes back what the room allows now
     tensors meta(f, 1);
