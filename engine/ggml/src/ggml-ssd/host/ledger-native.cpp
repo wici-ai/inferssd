@@ -40,6 +40,14 @@ bool available(uint64_t & bytes) {
     return true;
 }
 
+bool physical(uint64_t & bytes) {
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status)) { return false; }
+    bytes = uint64_t(status.ullTotalPhys);
+    return true;
+}
+
 bool job_limits(envelopes & out) {
     BOOL in_job = FALSE;
     if (!IsProcessInJob(GetCurrentProcess(), nullptr, &in_job)) { return false; }
@@ -112,6 +120,14 @@ bool available(uint64_t & bytes) {
         return false;
     }
     bytes = (free + file + purgeable + reusable) * uint64_t(vm_kernel_page_size);
+    return true;
+}
+
+bool physical(uint64_t & bytes) {
+    uint64_t value = 0;
+    size_t size = sizeof(value);
+    if (sysctlbyname("hw.memsize", &value, &size, nullptr, 0) != 0 || size != sizeof(value) || !value) { return false; }
+    bytes = value;
     return true;
 }
 

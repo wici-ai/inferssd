@@ -128,8 +128,8 @@ inline void finite_cgroup(kimi_host_ledger & ledger) {
 #endif
 // The RAM cache admits only under a finite, readable memory envelope. Linux: a cgroup v2
 // memory.max on this process or an ancestor, which the environment may not provide. macOS and
-// Windows: the native ledger always has one (a job limit, host.budget_mib or the one derived at
-// creation), so an unreadable one is an OS query failure, not a missing resource.
+// Windows: the native ledger always has one (a job limit, host.budget_mib or the machine's memory),
+// so an unreadable one is an OS query failure, not a missing resource.
 inline void finite_envelope() {
 #if defined(__linux__)
     kimi_host_ledger ledger;

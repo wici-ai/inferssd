@@ -627,16 +627,18 @@ struct expert_cache {
             // Otherwise, a unified GPU without a tier included, it takes what the cgroup guard would admit now.
             // The receipt names both terms: on a discrete GPU the cgroup term should be the smaller one.
             uint64_t surplus = 0;
-            const bool readable = check_room(0, nullptr, &surplus) == room_ok;
+            const room_state state = check_room(0, nullptr, &surplus);
             budget = tier_caches
                     ? multiply(multiply(layers.size(), uint64_t(std::max(1, staging_per_layer))), next_stride)
-                    : (readable ? surplus : 0);
+                    : (state == room_ok ? surplus : 0);
             const auto & r = last_room;
+            // binding: the term that sizes the cache, or the short one when the room is already taken
             std::fprintf(stderr, "[kimi_cpu_sink_cache] auto_budget=%llu unified=%d tier=%d slot_bytes=%zu cgroup_surplus=%llu system_surplus=%llu available=%llu floor=%llu binding=%s\n",
                     (unsigned long long) budget, int(ledger.state().unified), int(tier_caches), next_stride,
                     (unsigned long long) (r.cgroup == room_unreadable ? 0 : r.cgroup_surplus), (unsigned long long) r.system_surplus,
                     (unsigned long long) r.available, (unsigned long long) r.floor,
-                    !readable ? "unreadable" : !r.system || r.cgroup_surplus <= r.system_surplus ? "cgroup" : "system");
+                    state == room_unreadable ? "unreadable" : state == room_pressure ? binding_term(r) :
+                    !r.system || r.cgroup_surplus <= r.system_surplus ? "cgroup" : "system");
         }
         size_t count = static_cast<size_t>(std::min(budget / next_stride,
                                                   multiply(layers.size(), uint64_t(quota))));
