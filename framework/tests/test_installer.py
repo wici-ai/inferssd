@@ -10,6 +10,9 @@ from pathlib import Path
 import pytest
 
 INSTALLER = Path(__file__).resolve().parents[2] / "scripts/install.sh"
+posix_installer = pytest.mark.skipif(
+    sys.platform == "win32", reason="install.sh is the Linux and macOS installer, run by bash"
+)
 
 
 @pytest.fixture
@@ -70,6 +73,7 @@ elif name in ("python3", "python"):
     return home, bindir, env
 
 
+@posix_installer
 @pytest.mark.parametrize("system", ["Darwin", "Linux"])
 def test_piped_install_and_upgrade(installation, system):
     home, bindir, env = installation
@@ -99,6 +103,7 @@ def test_piped_install_and_upgrade(installation, system):
     assert len(list((home / "releases").iterdir())) == 1
 
 
+@posix_installer
 @pytest.mark.parametrize(
     "backend, glslc, preset, warned",
     [
@@ -124,6 +129,7 @@ def test_linux_builds_for_the_machines_gpus(installation, backend, glslc, preset
     assert ("install the Vulkan SDK" in result.stderr) == warned
 
 
+@posix_installer
 def test_mac_asks_for_the_command_line_tools(installation):
     _, _, env = installation
     result = subprocess.run(
@@ -142,7 +148,25 @@ def test_release_workflow_can_pin_the_installer():
     assert re.search(r"^DEFAULT_REF=main$", INSTALLER.read_text(), re.M)
 
 
+@posix_installer
 def test_install_help_needs_no_toolchain():
     result = subprocess.run(["sh", str(INSTALLER), "--help"], text=True, capture_output=True)
     assert result.returncode == 0
     assert "INFERSSD_REF" in result.stdout
+
+
+WINDOWS_INSTALLER = INSTALLER.with_name("install.ps1")
+
+
+def test_release_workflow_can_pin_the_windows_installer():
+    # .github/workflows/release.yml rewrites exactly this line to the tag.
+    assert re.search(r"^\$DefaultRef = 'main'$", WINDOWS_INSTALLER.read_text(), re.M)
+
+
+def test_windows_installer_builds_the_preset_the_framework_looks_in():
+    text = WINDOWS_INSTALLER.read_text()
+    assert "cmake --preset windows-llvm" in text
+    # The same targets as the POSIX installer on a machine without a CUDA GPU.
+    assert "--target inferssd-server inferssd-cpuprobe inferssd-ssdprobe" in text
+    for name in ("INFERSSD_HOME", "INFERSSD_BIN_DIR", "INFERSSD_REF", "INFERSSD_JOBS"):
+        assert name in text and name in INSTALLER.read_text()
