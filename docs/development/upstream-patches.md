@@ -10,7 +10,7 @@ preserves its source attribution and license files.
 | --- | --- |
 | ggml scheduler and allocator | Borrowed SSD copy hooks; graph buffer measurement/admission; first touch; backend scratch reservation; a pass that keeps an in-place op with the backend holding its storage. No core implementation is linked into ggml-base. |
 | CPU/CUDA registries | Normal private provider discovery and context-service attachment. CPU and CUDA do not link each other. |
-| Vulkan backend | A small submit every 20 ms while graphs keep coming, so the queue never takes the long wake-up an idle GPU pays on its next submit. |
+| Vulkan backend | Idle-submit keepalive every 20 ms; source-aware F16 `SET_ROWS` pipelines for F32/F16 destinations and I32/I64 indices, with unsupported conversions rejected. Shared copy shaders retain their F32 source variants. |
 | Backend operation files | New model operations and narrow native kernel entry points stay with their upstream operation/architecture files. Strict MXFP4 math is compiled separately with contraction and FTZ disabled. |
 | llama context | Runtime assembly, request phases, resource-aware graph reservation and failure recovery. Source, cache and telemetry owners reside in `src/ssd`. |
 | Model loading/mapping | Deferred expert ranges and compact Metal allocations where a GGUF interleaves the dense tensors with experts held elsewhere; fixed complete-page advice. Source/range helpers reside in `src/ssd`. |
@@ -129,8 +129,9 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-sycl/ggml-sycl.cpp` | 1 | 0 |
 | `ggml/src/ggml-virtgpu/ggml-backend.cpp` | 1 | 0 |
 | `ggml/src/ggml-vulkan/CMakeLists.txt` | 2 | 0 |
-| `ggml/src/ggml-vulkan/ggml-vulkan.cpp` | 183 | 3 |
-| `ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp` | 4 | 0 |
+| `ggml/src/ggml-vulkan/ggml-vulkan.cpp` | 201 | 3 |
+| `ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp` | 1 | 1 |
+| `ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp` | 8 | 0 |
 | `ggml/src/ggml-webgpu/ggml-webgpu.cpp` | 1 | 0 |
 | `ggml/src/ggml-zdnn/ggml-zdnn.cpp` | 1 | 0 |
 | `ggml/src/ggml-zendnn/ggml-zendnn.cpp` | 1 | 0 |
@@ -184,5 +185,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-task.h` | 23 | 80 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 17554 added, 5685 removed across 152 upstream paths.
+Total: 17577 added, 5686 removed across 153 upstream paths.
 <!-- END UPSTREAM INVENTORY -->

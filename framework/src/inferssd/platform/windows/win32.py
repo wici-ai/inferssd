@@ -460,6 +460,50 @@ def process_memory(pid: int) -> dict[str, int]:
         close(handle)
 
 
+def process_running(pid: int) -> bool:
+    """Whether pid exists, without sending it a signal or requiring access to it."""
+    kernel = _dll("kernel32")
+    snapshot = _handle(kernel.CreateToolhelp32Snapshot(0x2, 0), "CreateToolhelp32Snapshot")
+    try:
+        entry = _ProcessEntry(dwSize=sizeof(_ProcessEntry))
+        found = kernel.Process32FirstW(snapshot, byref(entry))
+        while found:
+            if entry.th32ProcessID == pid:
+                return True
+            found = kernel.Process32NextW(snapshot, byref(entry))
+        return False
+    finally:
+        close(snapshot)
+
+
+def process_working_set(name: str, pid: int) -> int:
+    """Working-set bytes from PDH, including protected processes, with a PID check."""
+    pdh = _dll("pdh")
+    query = c_void_p()
+    if pdh.PdhOpenQueryW(None, 0, byref(query)):
+        raise OSError("PdhOpenQueryW failed")
+    try:
+        counters = []
+        for field in ("ID Process", "Working Set"):
+            counter = c_void_p()
+            if pdh.PdhAddEnglishCounterW(query, f"\\Process({name})\\{field}", 0, byref(counter)):
+                raise OSError("PdhAddEnglishCounterW failed")
+            counters.append(counter)
+        if pdh.PdhCollectQueryData(query):
+            raise OSError("PdhCollectQueryData failed")
+        values = []
+        for counter in counters:
+            raw, kind = _RawCounter(), c_uint32()
+            if pdh.PdhGetRawCounterValue(counter, byref(kind), byref(raw)) or raw.CStatus > 1:
+                raise OSError("process working-set counter unavailable")
+            values.append(int(raw.FirstValue))
+        if values[0] != pid:
+            raise OSError("process working-set counter belongs to another PID")
+        return values[1]
+    finally:
+        pdh.PdhCloseQuery(query)
+
+
 # Job objects
 
 

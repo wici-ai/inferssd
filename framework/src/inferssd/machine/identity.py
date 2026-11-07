@@ -33,6 +33,7 @@ from xml.parsers.expat import ExpatError
 from inferssd.configuration.settings import cpus
 from inferssd.machine.characteristics import PROBE_SCHEMAS, GPUIdentity, Identity
 from inferssd.platform.captured_command import run_captured
+from inferssd.platform.windows import win32
 from inferssd.platform.windows.system import Disk as WindowsDisk
 from inferssd.platform.windows.system import System as WindowsSystem
 from inferssd.platform.windows.system import Win32
@@ -198,16 +199,18 @@ class NativeHost:
 
 
 def is_test_file(path: str) -> bool:
-    return posixpath.basename(path).startswith(TEST_FILE_PREFIX)
+    return os.path.basename(path).startswith(TEST_FILE_PREFIX)
 
 
 def owner_of_test_file(path: str) -> Optional[int]:
     """The process ID a test file's name carries, or None for a name without one."""
-    head = posixpath.basename(path)[len(TEST_FILE_PREFIX) :].split("-", 1)[0]
+    head = os.path.basename(path)[len(TEST_FILE_PREFIX) :].split("-", 1)[0]
     return int(head) if head.isdigit() else None
 
 
 def _running(pid: int) -> bool:
+    if sys.platform == "win32":
+        return win32.process_running(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

@@ -272,6 +272,7 @@ def job_host(monkeypatch):
     monkeypatch.setattr(
         win32, "process_memory", lambda _pid: {"working_set_bytes": state["compressor"]}
     )
+    monkeypatch.setattr(win32, "process_working_set", lambda _name, _pid: state["compressor"])
     monkeypatch.setattr(win32, "pagefile_in_use", lambda: state["pagefile"])
     return state
 
@@ -282,6 +283,79 @@ def test_resources_leave_out_the_limits_a_policy_does_not_declare(job_host):
     assert first["available_bytes"] == 24 << 30
     job_host.update(available=1, compressor=1 << 40, pagefile=1 << 40)
     assert runtime.sample(9)["server"]["working_set_bytes"] == 1 << 40
+
+
+def test_a_protected_compression_process_is_sampled_and_its_growth_is_enforced(
+    job_host, monkeypatch
+):
+    def protected(_pid):
+        raise PermissionError("OpenProcess: protected compression process")
+
+    monkeypatch.setattr(win32, "process_memory", protected)
+    runtime = windows_resources.Resources(policy(max_compressor_growth_bytes=1))
+    assert runtime.prepare()["compressor_bytes"] == 0
+    job_host["compressor"] = 5
+    with pytest.raises(RuntimeError, match="compressor growth"):
+        runtime.sample(None)
+
+
+def test_an_unreadable_compression_counter_is_not_reported_as_zero(job_host, monkeypatch):
+    def unavailable(_name, _pid):
+        raise OSError("compression counter unavailable")
+
+    monkeypatch.setattr(win32, "process_working_set", unavailable)
+    with pytest.raises(OSError, match="compression counter unavailable"):
+        windows_resources.Resources(policy()).prepare()
+
+
+def test_an_absent_compression_process_has_no_store(job_host, monkeypatch):
+    monkeypatch.setattr(win32, "find_process", lambda _name: None)
+    assert windows_resources.Resources(policy()).prepare()["compressor_bytes"] == 0
+
+
+@pytest.mark.parametrize(
+    "counter_pid, status, message", [(3, 0, None), (4, 0, "another PID"), (3, 2, "unavailable")]
+)
+def test_process_working_set_uses_valid_raw_counters_for_the_exact_pid(
+    monkeypatch, counter_pid, status, message
+):
+    class Pdh:
+        def __init__(self):
+            self.paths, self.closed = [], False
+
+        def PdhOpenQueryW(self, _source, _data, query):
+            query._obj.value = 1
+            return 0
+
+        def PdhAddEnglishCounterW(self, _query, path, _data, counter):
+            self.paths.append(path)
+            counter._obj.value = len(self.paths)
+            return 0
+
+        def PdhCollectQueryData(self, _query):
+            return 0
+
+        def PdhGetRawCounterValue(self, counter, _kind, raw):
+            raw._obj.CStatus = status
+            raw._obj.FirstValue = counter_pid if counter.value == 1 else 123456
+            return 0
+
+        def PdhCloseQuery(self, _query):
+            self.closed = True
+            return 0
+
+    pdh = Pdh()
+    monkeypatch.setattr(win32, "_dll", lambda _name: pdh)
+    if message:
+        with pytest.raises(OSError, match=message):
+            win32.process_working_set("Memory Compression", 3)
+    else:
+        assert win32.process_working_set("Memory Compression", 3) == 123456
+    assert pdh.closed
+    assert pdh.paths == [
+        "\\Process(Memory Compression)\\ID Process",
+        "\\Process(Memory Compression)\\Working Set",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -488,9 +562,9 @@ QWEN_FILES = [f"Q8_0/Qwen3.8-Flash-Next-Q8_0-{n:05}-of-00006.gguf" for n in rang
 
 
 def test_the_hub_takes_qwen_shards_without_its_prediction_head():
-    assert hub.selection("unsloth/Qwen3.8-Flash-Next-GGUF") == (
-        "unsloth/Qwen3.8-Flash-Next-GGUF",
-        "Q8_0",
+    assert hub.selection("unsloth/Qwen3.6-35B-A3B-GGUF") == (
+        "unsloth/Qwen3.6-35B-A3B-GGUF",
+        "UD-Q4_K_XL",
     )
     listed = QWEN_FILES + [
         "MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf",

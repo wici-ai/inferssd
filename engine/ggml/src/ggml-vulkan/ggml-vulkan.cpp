@@ -761,6 +761,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_cpy_transpose_16, pipeline_cpy_transpose_32;
     vk_pipeline pipeline_set_rows_i32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_set_rows_i64[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_set_rows_from_f16_i32[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_set_rows_from_f16_i64[GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
@@ -4493,6 +4495,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
     SET_ROWS(_i32)
     SET_ROWS(_i64)
 #undef SET_ROWS
+
+    ggml_vk_create_pipeline(device, device->pipeline_set_rows_from_f16_i32[GGML_TYPE_F32], "set_rows_f32_from_f16_i32", set_rows_f32_from_f16_i32_len, set_rows_f32_from_f16_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_set_rows_from_f16_i64[GGML_TYPE_F32], "set_rows_f32_from_f16_i64", set_rows_f32_from_f16_i64_len, set_rows_f32_from_f16_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_set_rows_from_f16_i32[GGML_TYPE_F16], "set_rows_f16_from_f16_i32", set_rows_f16_from_f16_i32_len, set_rows_f16_from_f16_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_set_rows_from_f16_i64[GGML_TYPE_F16], "set_rows_f16_from_f16_i64", set_rows_f16_from_f16_i64_len, set_rows_f16_from_f16_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
 
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q1_0], "cpy_q1_0_f32", cpy_q1_0_f32_len, cpy_q1_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q1_0), 1, 1}, {}, 1);
@@ -9478,6 +9485,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_DUP:
         return ggml_vk_get_cpy_pipeline(ctx, src0, dst, dst->type);
     case GGML_OP_SET_ROWS:
+        if (src0->type == GGML_TYPE_F16) {
+            return src1->type == GGML_TYPE_I64 ?
+                ctx->device->pipeline_set_rows_from_f16_i64[dst->type] :
+                ctx->device->pipeline_set_rows_from_f16_i32[dst->type];
+        }
         if (src1->type == GGML_TYPE_I64) {
             return ctx->device->pipeline_set_rows_i64[dst->type];
         } else {
@@ -15709,6 +15721,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SET_ROWS:
             {
+                if (op->src[0]->type == GGML_TYPE_F16) {
+                    return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
+                }
+                if (op->src[0]->type != GGML_TYPE_F32) {
+                    return false;
+                }
                 switch (op->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:

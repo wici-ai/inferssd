@@ -91,6 +91,15 @@ memory, the available memory) to choose:
   VRAM tier for decode) and one prefill pass per prompt; on
   a GPU sharing host memory, a host margin of 4096 MiB (`host.headroom_mib`).
 
+On Windows, when the process can use all profiled CPUs and eligible single-
+and multi-token measurements exist, the launch selects measured unpinned
+counts within the CPU reserve cap. It compares the
+chosen decode count with an eligible pinned performance-cluster measurement
+and preserves the selected count and CPU mask; prefill follows the fastest
+measured multi-token rate. A measured full-machine count is never relabeled as
+one fewer thread. Without eligible single-token or multi-token measurements,
+the existing fallback remains.
+
 Only the prefill route and the pass size change the model's output, the way
 any GPU kernel or batch shape does; the rest keeps it bit for bit. The launch fills only the settings
 you left at their defaults: a value from `--set` or from the settings file always
@@ -142,6 +151,12 @@ frequency are not recorded. Machines with more than one processor group (over
 The knee of a request size is the smallest queue depth whose best run reaches
 the worst run of the fastest queue depth at that size. Each point's bandwidth is
 the median of its runs.
+
+Planning takes the measured size nearest an expert-role read on a log scale,
+then the best positive measured rate from its knee through the engine's or
+reader's queue-depth cap. If the knee exceeds that cap, it uses the best
+measured point within the cap and records that limitation; it does not
+extrapolate to an unmeasured depth.
 
 Every number names its unit: `_bytes`, `_Bps` (bytes per second), `_us`, `_s`,
 `_khz`, and `flops` (FLOP per second).

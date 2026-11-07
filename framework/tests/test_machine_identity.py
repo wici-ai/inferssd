@@ -558,7 +558,7 @@ def test_darwin_drive_reports_unreadable_diskutil_output(tmp_path):
 
 
 def ended_process():
-    child = subprocess.Popen(["true"])
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait()
     return child.pid
 

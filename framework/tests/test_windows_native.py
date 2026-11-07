@@ -35,6 +35,17 @@ def test_profile_reads_this_host():
     assert drive_info(NativeHost(), __file__).key.startswith("windows:")
 
 
+def test_process_lookup_does_not_signal_a_live_process():
+    child = subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(120)"])
+    try:
+        assert win32.process_running(child.pid)
+        assert child.poll() is None
+    finally:
+        child.terminate()
+        child.wait(timeout=30)
+    assert not win32.process_running(child.pid)
+
+
 def test_the_device_lock_is_exclusive_until_its_last_handle_closes(tmp_path):
     path = str(tmp_path / "device.lock")
     first = lease.acquire_lock(path)
@@ -108,5 +119,7 @@ def test_system_memory_and_paging_file_counters():
     memory = win32.system_memory()
     assert 0 < memory["physical_available_bytes"] <= memory["physical_total_bytes"]
     assert win32.pagefile_in_use() >= 0
-    # The sampled compression store may be absent; the lookup itself must work.
-    win32.find_process("Memory Compression")
+    # The compression store can be protected from OpenProcess; PDH still samples it.
+    pid = win32.find_process("Memory Compression")
+    if pid is not None:
+        assert win32.process_working_set("Memory Compression", pid) >= 0

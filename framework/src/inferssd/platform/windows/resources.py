@@ -52,7 +52,7 @@ class Resources:
 
     def compressor_bytes(self) -> int:
         pid = win32.find_process(COMPRESSION)
-        return win32.process_memory(pid)["working_set_bytes"] if pid is not None else 0
+        return win32.process_working_set(COMPRESSION, pid) if pid is not None else 0
 
     def sample(self, pid: Optional[int]) -> dict[str, Any]:
         job = win32.job_memory(None)
