@@ -14,8 +14,9 @@ function Install-InferSSD {
         @'
 Install InferSSD from source for Windows x64.
 Requires Git, Python >=3.9, LLVM clang and the Visual Studio C++ build tools with a
-Windows SDK of 10.0.22000 or later. With the Vulkan SDK (VULKAN_SDK) the engine can also
-use a GPU through Vulkan; without it the engine runs on the CPU.
+Windows SDK of 10.0.22000 or later. The engine is built for the machine's GPUs: with
+the Vulkan SDK (VULKAN_SDK) it uses a GPU through Vulkan, an NVIDIA GPU included;
+without a GPU or the Vulkan SDK it runs on the CPU.
 CMake, Ninja and the Python framework are installed in a private environment.
 
 Environment:
@@ -91,11 +92,24 @@ No administrator rights are used. A previous installation remains usable if buil
     New-Item -ItemType Directory $release | Out-Null
     $complete = $false
     try {
-        Write-Output 'Building InferSSD (windows-llvm). This may take several minutes.'
         $source = Join-Path $release 'source'
         & git clone --depth 1 --branch $ref $repository $source
         if ($LASTEXITCODE) { throw 'inferssd: git clone failed.' }
         $rest = @($python | Select-Object -Skip 1)
+        # The GPU backend for this machine's GPUs, by the table the launch reads. This installer
+        # builds a GPU's engine with Vulkan, an NVIDIA GPU's too.
+        $env:PYTHONPATH = Join-Path $source 'framework\src'
+        $backend = & $python[0] @rest -m inferssd.machine.backend
+        $found = $LASTEXITCODE
+        Remove-Item Env:PYTHONPATH
+        if ($found) { throw 'inferssd: reading the GPUs failed.' }
+        $vulkan = ''
+        if ($backend -ne 'CPU') {
+            if ($env:VULKAN_SDK) { $vulkan = ' -DGGML_VULKAN=ON' }
+            else { Write-Output 'inferssd: a GPU was found; install the Vulkan SDK to use it.' }
+        }
+        $kind = if ($vulkan) { 'windows-llvm, Vulkan' } else { 'windows-llvm' }
+        Write-Output "Building InferSSD ($kind). This may take several minutes."
         & $python[0] @rest -m venv (Join-Path $release 'venv')
         if ($LASTEXITCODE) { throw 'inferssd: creating the Python environment failed.' }
         $scripts = Join-Path $release 'venv\Scripts'
@@ -105,7 +119,6 @@ No administrator rights are used. A previous installation remains usable if buil
         & $py -m pip install 'cmake>=3.24,<5' ninja "$source\framework[hf]"
         if ($LASTEXITCODE) { throw 'inferssd: installing the framework failed.' }
 
-        $vulkan = if ($env:VULKAN_SDK) { ' -DGGML_VULKAN=ON' } else { '' }
         $build = Join-Path $release 'build.bat'
         # A batch file: only cmd can keep vcvars64.bat's environment for the commands after it.
         Write-Batch $build @(

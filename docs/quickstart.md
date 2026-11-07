@@ -135,7 +135,7 @@ Use the same Metal build and point `-m` at the first Muse GGUF shard; the launch
 
 ## Windows
 
-Windows x64 needs Git, Python 3.9 or later, LLVM clang and the Visual Studio C++ build tools with a Windows SDK of 10.0.22000 or later, for the `IoRing` read path. With the [Vulkan SDK](https://vulkan.lunarg.com/) installed (`VULKAN_SDK` set) the engine can also use a GPU through Vulkan; without it the engine runs on the CPU. Windows runs the same `inferssd profile`, `inferssd cli` and `inferssd serve` as the other platforms.
+Windows x64 needs Git, Python 3.9 or later, LLVM clang and the Visual Studio C++ build tools with a Windows SDK of 10.0.22000 or later, for the `IoRing` read path. With the [Vulkan SDK](https://vulkan.lunarg.com/) installed (`VULKAN_SDK` set) the engine can also use a GPU through Vulkan, an NVIDIA GPU included, and the installer builds it so when the machine has a GPU; without it the engine runs on the CPU. Windows runs the same `inferssd profile`, `inferssd cli` and `inferssd serve` as the other platforms.
 
 From a Visual Studio x64 developer prompt, with CMake and Ninja on PATH:
 

@@ -113,7 +113,7 @@ count as `ioreg` reports it, on Metal (when `ioreg` cannot say, the list is
 empty and profiling continues); and the AMD and Intel display controllers, on
 Vulkan, found on the PCI bus on Linux and among the display adapters in the
 registry on Windows. Other display controllers, such as a server's management
-display or a virtual machine's, are left out. The installer builds the engine for
+display or a virtual machine's, are left out. The installers build the engine for
 the first of CUDA, Metal and Vulkan among these GPUs, and for the CPU alone when
 there is none. The GPU probe measures every
 GPU on Linux, regardless of `CUDA_VISIBLE_DEVICES`; on macOS the GPU shares the
