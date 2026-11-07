@@ -11,6 +11,7 @@
 - [Deployment resources](engine-resources.md): engine descriptors for installations outside a checkout.
 - [Machine profile](machine-profile.md): what `inferssd profile` measures, where it keeps the result, and its speed estimates.
 - [Framework commands](../framework/README.md): `serve`, `cli` and `profile`, typed settings and the owned launch.
+- [简体中文](README.zh-CN.md): the project README in Simplified Chinese.
 
 ## Design
 
