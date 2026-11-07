@@ -97,11 +97,11 @@ jobs:
           }
           "CUDA_PATH=$root" >> $env:GITHUB_ENV
       - name: Configure and build
-        # As install.ps1 builds: LLVM clang in the Visual Studio C++ tools environment, whose cl is nvcc's host compiler.
+        # CUDA 12.9 needs the VS 2022-era host toolset, not the runner's default VS 2026 compiler.
         shell: cmd
         run: |
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
-          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" > nul || exit /b 1
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44 > nul || exit /b 1
           set "PATH=%ProgramFiles%\LLVM\bin;%CUDA_PATH%\bin;%PATH%"
           cmake --preset windows-cuda -DGGML_NATIVE=OFF -DCMAKE_CUDA_ARCHITECTURES=120a "-DCUDAToolkit_ROOT=%CUDA_PATH:\=/%" "-DCMAKE_CUDA_COMPILER=%CUDA_PATH:\=/%/bin/nvcc.exe" || exit /b 1
           cmake --build build-windows-cuda --parallel 4 --target inferssd-server || exit /b 1
