@@ -248,6 +248,7 @@ def install(env, **extra):
     )
 
 
+@posix_installer
 def test_mac_installs_the_package_without_developer_tools(installation, tmp_path):
     home, bindir, env = installation
     result = install(env, INFERSSD_PACKAGES=make_package(tmp_path, "261107.207.84bcc56"))
@@ -264,6 +265,7 @@ def test_mac_installs_the_package_without_developer_tools(installation, tmp_path
     assert not called & {"git", "cc", "c++", "xcode-select", "python3", "cmake"}
 
 
+@posix_installer
 def test_mac_refuses_a_package_that_does_not_match_its_list(installation, tmp_path):
     home, bindir, env = installation
     first = make_package(tmp_path, "261106.202.03af979")
@@ -276,6 +278,7 @@ def test_mac_refuses_a_package_that_does_not_match_its_list(installation, tmp_pa
     assert len(list((home / "releases").iterdir())) == 1
 
 
+@posix_installer
 def test_mac_package_needs_the_macos_it_was_built_for(installation, tmp_path):
     _, _, env = installation
     listing = make_package(tmp_path, "261107.207.84bcc56")
@@ -285,6 +288,7 @@ def test_mac_package_needs_the_macos_it_was_built_for(installation, tmp_path):
     assert "INFERSSD_FROM_SOURCE=1" in result.stderr
 
 
+@posix_installer
 @pytest.mark.parametrize("asked", [{"INFERSSD_FROM_SOURCE": "1"}, {"INFERSSD_REF": "main"}])
 def test_mac_builds_from_source_when_asked(installation, asked):
     _, _, env = installation
@@ -293,6 +297,7 @@ def test_mac_builds_from_source_when_asked(installation, asked):
     assert "--preset macos-metal" in Path(env["CMAKE_LOG"]).read_text()
 
 
+@posix_installer
 def test_an_install_keeps_the_one_it_replaced_and_removes_older(installation, tmp_path):
     _, _, env = installation
     # The installation reached through a link: the package's activate names its real path.
@@ -309,6 +314,7 @@ def test_an_install_keeps_the_one_it_replaced_and_removes_older(installation, tm
     assert home.joinpath("current").resolve().name == package_name(labels[-1])
 
 
+@posix_installer
 def test_mac_builds_from_source_until_a_package_is_published(installation, tmp_path):
     import functools
     import http.server
@@ -329,6 +335,7 @@ def test_mac_builds_from_source_until_a_package_is_published(installation, tmp_p
     assert "--preset macos-metal" in Path(env["CMAKE_LOG"]).read_text()
 
 
+@posix_installer
 def test_mac_stops_when_the_package_list_cannot_be_read(installation, tmp_path):
     home, _, env = installation
     result = install(env, INFERSSD_PACKAGES=(tmp_path / "missing.json").as_uri())
