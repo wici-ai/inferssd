@@ -21,14 +21,24 @@ Every platform uses the `main` branch of `wici-ai/inferssd`. Use the
 curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 ```
 
+On macOS, the installer on `main` installs the prebuilt
+[macOS package](macos-package.md) on an Apple Silicon Mac with macOS 15 or later,
+which needs none of the tools below. Set `INFERSSD_FROM_SOURCE=1` to build from
+source instead:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
+```
+
 On Windows, in PowerShell:
 
 ```powershell
 irm https://github.com/wici-ai/inferssd/releases/latest/download/install.ps1 | iex
 ```
 
-This is a source installer, not a prebuilt binary release. It checks for a C/C++
-compiler, Git, Python 3.9+ with `venv`, and the platform toolchain. On macOS,
+The Windows installer builds from source, not a prebuilt binary release. Source
+builds check for a C/C++ compiler, Git, Python 3.9+ with `venv`, and the platform
+toolchain. On macOS,
 the Xcode Command Line Tools must be installed. The engine is built for the machine's GPUs, as the
 [machine profile](machine-profile.md) lists them: for an NVIDIA GPU with CUDA, which
 needs `nvcc` on PATH, under `/usr/local/cuda`, or through `CUDACXX`; for an AMD or
@@ -86,12 +96,13 @@ conversation history; `/clear` starts a new conversation, `/exit` or EOF stops
 the service. Ctrl+C also stops it, including during startup or generation.
 Each launch keeps its receipts under `~/.local/share/inferssd/state/runs`.
 
-`inferssd --version` prints the installed version. Rerun the installer to upgrade. Builds use a new release directory and publish
-the command only after build and schema checks; a failed build keeps the previous
-command. Older releases and model downloads are retained. For a branch or tag,
-download the installer and set `INFERSSD_REF` when running it. Optional
-`INFERSSD_HOME`, `INFERSSD_BIN_DIR`, and `INFERSSD_JOBS` select the installation
-root, command directory and compilation parallelism (default 4).
+`inferssd --version` prints the installed version. Rerun the installer to upgrade. Builds and
+packages use a new release directory and publish the command only after their checks; a failed
+build or download keeps the previous command. The installer keeps the release it replaced and
+removes older ones; model downloads are retained. For a branch or tag, download the installer
+and set `INFERSSD_REF` when running it; `INFERSSD_FROM_SOURCE=1` builds `main` from source on a
+Mac too. Optional `INFERSSD_HOME`, `INFERSSD_BIN_DIR`, and `INFERSSD_JOBS` select the
+installation root, command directory and compilation parallelism (default 4).
 
 To uninstall, stop active sessions, remove the `inferssd` command from the chosen
 bin directory, and remove the installation's `releases`, `current` and `state`
