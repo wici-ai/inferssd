@@ -21,24 +21,22 @@ Every platform uses the `main` branch of `wici-ai/inferssd`. Use the
 curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 ```
 
-On macOS, the installer on `main` installs the prebuilt
-[macOS package](macos-package.md) on an Apple Silicon Mac with macOS 15 or later,
-which needs none of the tools below. Set `INFERSSD_FROM_SOURCE=1` to build from
-source instead:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
-```
-
 On Windows, in PowerShell:
 
 ```powershell
 irm https://github.com/wici-ai/inferssd/releases/latest/download/install.ps1 | iex
 ```
 
-The Windows installer builds from source, not a prebuilt binary release. Source
-builds check for a C/C++ compiler, Git, Python 3.9+ with `venv`, and the platform
-toolchain. On macOS,
+A release's installer builds that release from source. The installer on `main`
+installs the prebuilt [macOS package](macos-package.md) of `main` on an Apple Silicon
+Mac with macOS 15 or later, which needs none of the tools below:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
+```
+
+A source build checks for a C/C++
+compiler, Git, Python 3.9+ with `venv`, and the platform toolchain. On macOS,
 the Xcode Command Line Tools must be installed. The engine is built for the machine's GPUs, as the
 [machine profile](machine-profile.md) lists them: for an NVIDIA GPU with CUDA, which
 needs `nvcc` on PATH, under `/usr/local/cuda`, or through `CUDACXX`; for an AMD or
