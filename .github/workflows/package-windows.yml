@@ -46,9 +46,25 @@ jobs:
           $installer = Join-Path $env:RUNNER_TEMP 'vulkan-sdk.exe'
           Invoke-WebRequest -UserAgent 'inferssd-build' -Uri 'https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/vulkansdk-windows-X64-1.4.363.0.exe' -OutFile $installer
           if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash -ne '94a82d378f7a5e3e54c9db7d2fb7016af136e14ac0a18dbf0f2f67a36352d141') { throw 'Vulkan SDK checksum mismatch' }
-          $install = Start-Process -FilePath $installer -ArgumentList @('install', '--accept-licenses', '--default-answer', '--confirm-command', '--accept-messages', "--root=`"$sdk`"") -PassThru -Wait -WindowStyle Hidden
-          if ($install.ExitCode -ne 0 -or !(Test-Path -LiteralPath "$sdk\Bin\glslc.exe")) { throw 'Vulkan SDK installation failed' }
+          $stdout = Join-Path $env:RUNNER_TEMP 'vulkan-sdk-install.stdout.txt'
+          $stderr = Join-Path $env:RUNNER_TEMP 'vulkan-sdk-install.stderr.txt'
+          # LunarG's supported unattended syntax puts global options before the command.
+          # copy_only avoids machine registry/PATH changes; only this job needs the SDK.
+          $install = Start-Process -FilePath $installer -ArgumentList @('--root', "`"$sdk`"", '--accept-licenses', '--default-answer', '--confirm-command', 'install', 'copy_only=1') -PassThru -Wait -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          Write-Host "Vulkan SDK installer exit: $($install.ExitCode); requested root: $sdk"
+          Get-Content -LiteralPath $stdout -ErrorAction SilentlyContinue
+          Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue
+          if (Test-Path -LiteralPath $sdk) { Get-ChildItem -LiteralPath $sdk | Select-Object Name }
+          if ($install.ExitCode -ne 0 -or !(Test-Path -LiteralPath "$sdk\Bin\glslc.exe")) { throw 'Vulkan SDK installation failed; see captured installer output' }
           "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
+      - name: Preserve SDK install diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vulkan-sdk-install-log
+          path: ${{ runner.temp }}/vulkan-sdk-install.*.txt
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Build the relocatable engine package
         shell: cmd
         run: |
