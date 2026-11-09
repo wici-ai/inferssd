@@ -71,7 +71,7 @@ def test_loopback_listener_probe_is_bounded_even_when_closed_ports_drop_packets(
 
     connection = Socket()
     monkeypatch.setattr(core.socket, "socket", lambda: connection)
-    assert core.NativeEffects().port_busy(8080) is busy
+    assert core.NativeEffects("127.0.0.1").port_busy(8080) is busy
     assert connection.closed
 
 

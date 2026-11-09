@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import ntpath
 import posixpath
@@ -48,6 +49,8 @@ ARCHITECTURES = {
 SAMPLING: dict[str, tuple[str, ...]] = {
     "dsv": ("--temp", "1.0", "--top-p", "0.95", "--top-k", "0", "--min-p", "0"),
 }
+# The address of this machine only, where the server listens by default.
+LOOPBACK = "127.0.0.1"
 
 
 @dataclass(frozen=True)
@@ -72,6 +75,25 @@ class LaunchSpec:
     # The directory that keeps each model's prompt cache across restarts, in a
     # subdirectory named after the model; None runs without a prompt cache.
     prompt_cache: Optional[str] = None
+    # The IPv4 address the server listens on; see listen_host.
+    host: str = LOOPBACK
+
+
+def listen_host(text: str) -> str:
+    """TEXT as the IPv4 address the server listens on.
+
+    127.0.0.1 is this machine only and 0.0.0.0 every network interface. The
+    launch confirms its listener by address, so a host name is not accepted.
+    """
+    try:
+        return str(ipaddress.IPv4Address(text))
+    except ValueError:
+        raise ValueError("host must be an IPv4 address, such as 127.0.0.1 or 0.0.0.0") from None
+
+
+def connect_host(host: str) -> str:
+    """The address at which this machine reaches a server listening on HOST."""
+    return LOOPBACK if host == "0.0.0.0" else host
 
 
 CONTEXT = 8192
@@ -183,8 +205,7 @@ def cpu_defaults(raw: object, allowed: Sequence[int], given: Threads) -> Threads
         raise ValueError("no available CPUs for inference")
     count = min(256, len(selected))
     decode, batch = given.decode or count, given.batch or count
-    if (raw["affinity_supported"] and max(selected) < 512
-            and max(decode, batch) <= len(selected)):
+    if raw["affinity_supported"] and max(selected) < 512 and max(decode, batch) <= len(selected):
         return Threads(decode, batch, tuple(selected))
     return Threads(decode, batch)
 
@@ -208,6 +229,7 @@ def _resolve(
     sizes = [size for size in (spec.context, spec.batch, spec.ubatch) if size is not None]
     if not 1 <= spec.port <= 65535 or any(size < 1 for size in sizes):
         raise ValueError("invalid port, context or batch size")
+    listen_host(spec.host)
     threads = threadpools(spec.threads, platform)
     protected = {
         "-m",
@@ -337,14 +359,25 @@ def _resolve(
         profile = ARCHITECTURES[architecture]
     ordinary = profile == ram.ARCHITECTURE
     if ordinary:
-        owned = {"--mlock", "--no-mlock", "-ctk", "--cache-type-k", "-ctv",
-                 "--cache-type-v", "--ctx-checkpoints", "--swa-checkpoints", "--swa-full",
-                 "--override-kv", "--model-draft", "--hf-repo-draft"}
+        owned = {
+            "--mlock",
+            "--no-mlock",
+            "-ctk",
+            "--cache-type-k",
+            "-ctv",
+            "--cache-type-v",
+            "--ctx-checkpoints",
+            "--swa-checkpoints",
+            "--swa-full",
+            "--override-kv",
+            "--model-draft",
+            "--hf-repo-draft",
+        }
         if any(
             x.split("=", 1)[0].replace("_", "-") in owned
-            or x.replace("_", "-").startswith((
-                "-ctk", "-ctv", "--lora", "--mmproj", "--control-vector", "--spec-", "--draft"
-            ))
+            or x.replace("_", "-").startswith(
+                ("-ctk", "-ctv", "--lora", "--mmproj", "--control-vector", "--spec-", "--draft")
+            )
             for x in s.inputs.extra
         ):
             raise ValueError(
@@ -416,13 +449,18 @@ def _resolve(
         ram_fit = ram.admission(
             observed if observed is not None else s.value("model_facts", *paths),
             context=spec.context or CONTEXT,
-            batch=spec.ubatch or BATCH, gpu=bool(gpu_backends),
+            batch=spec.ubatch or BATCH,
+            gpu=bool(gpu_backends),
             available=runtime.available_bytes,
             budget=min(memory, configured_budget) if configured_budget else memory,
             headroom=max(reserve, cast(int, value.at("host.headroom_mib").value) << 20),
         )
-        if (not gpu_backends and not threads.cpus and not threads.decode_cpus
-                and (threads.decode is None or threads.batch is None)):
+        if (
+            not gpu_backends
+            and not threads.cpus
+            and not threads.decode_cpus
+            and (threads.decode is None or threads.batch is None)
+        ):
             threads = threadpools(
                 cpu_defaults(s.value("cpu_topology"), runtime.cpus, threads), platform
             )
@@ -436,22 +474,38 @@ def _resolve(
         # many existing profiles. Avoid the unpriced all-core fallback on hybrid
         # machines; priced strategies and explicit user thread choices still win.
         costs = dict(cast(tuple[tuple[str, float], ...], value.at("place.costs").value))
-        if (profile == "qwen4exp" and gpu_backends == () and spec.threads == Threads()
-                and not {"cpu_fixed_us", "cpu_route_us"} <= costs.keys()
-                and value.at("cpu.decode_participants").value == 0):
+        if (
+            profile == "qwen4exp"
+            and gpu_backends == ()
+            and spec.threads == Threads()
+            and not {"cpu_fixed_us", "cpu_route_us"} <= costs.keys()
+            and value.at("cpu.decode_participants").value == 0
+        ):
             runtime = runtime_facts_from(s.value("runtime_facts"))
             io_cpus = set(cast(tuple[int, ...], value.at("cpu.io_cpus").value))
-            threads = threadpools(cpu_defaults(
-                s.value("cpu_topology"), [cpu for cpu in runtime.cpus if cpu not in io_cpus],
-                spec.threads,
-            ), platform)
+            threads = threadpools(
+                cpu_defaults(
+                    s.value("cpu_topology"),
+                    [cpu for cpu in runtime.cpus if cpu not in io_cpus],
+                    spec.threads,
+                ),
+                platform,
+            )
             chosen = dict(cast(Mapping[str, object], planned.receipt.get("chosen", {})))
-            actual = {"decode": threads.decode, "batch": threads.batch,
-                      "cpus": list(threads.cpus), "decode_cpus": list(threads.decode_cpus)}
-            strategy_receipt = dict(planned.receipt, model_defaults={
-                "reason": "qwen4exp CPU compute priors unavailable; use the live fast cluster",
-                "previous_threads": chosen.get("threads", {}), "threads": actual,
-            })
+            actual = {
+                "decode": threads.decode,
+                "batch": threads.batch,
+                "cpus": list(threads.cpus),
+                "decode_cpus": list(threads.decode_cpus),
+            }
+            strategy_receipt = dict(
+                planned.receipt,
+                model_defaults={
+                    "reason": "qwen4exp CPU compute priors unavailable; use the live fast cluster",
+                    "previous_threads": chosen.get("threads", {}),
+                    "threads": actual,
+                },
+            )
             chosen["threads"] = actual
             strategy_receipt["chosen"] = chosen
             planned = replace(planned, threads=threads, receipt=strategy_receipt)
@@ -471,7 +525,7 @@ def _resolve(
         value = replace(
             value, entries=tuple(selected if x.key == selected.key else x for x in value.entries)
         )
-    for path in (() if ordinary else cast(tuple[str, ...], value.at("expert.source").value)):
+    for path in () if ordinary else cast(tuple[str, ...], value.at("expert.source").value):
         if not isinstance(path, str) or not s.value("is_file", path):
             raise ValueError("missing typed expert source: " + str(path))
     if platform == "linux":
@@ -504,7 +558,7 @@ def _resolve(
         if not s.value("gpu_available"):
             raise ValueError("typed GPU execution requires nvidia-smi")
     # A setting of a GPU backend's expert tier needs an engine built with that backend.
-    for item in (() if ordinary else value.entries):
+    for item in () if ordinary else value.entries:
         backend = schema()["properties"][item.key].get("backend")
         if backend and item.origin != "default" and gpu_backends is not None:
             if backend not in gpu_backends:
@@ -537,7 +591,7 @@ def _resolve(
     command = [binary, "-m", model]
     if settings is not None and telemetry is not None:
         command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
-    for item in (() if ordinary else value.entries):
+    for item in () if ordinary else value.entries:
         if item.origin == "cli":
             command += [
                 "--ssd-" + item.key.replace(".", "-").replace("_", "-"),
@@ -560,7 +614,13 @@ def _resolve(
     ]
     if ordinary:
         command += [
-            "--mlock", "--cache-type-k", "f16", "--cache-type-v", "f16", "--ctx-checkpoints", "1"
+            "--mlock",
+            "--cache-type-k",
+            "f16",
+            "--cache-type-v",
+            "f16",
+            "--ctx-checkpoints",
+            "1",
         ]
     if threads.decode is not None:
         command += ["-t", str(threads.decode)]
@@ -596,7 +656,7 @@ def _resolve(
         ]
     command += [
         "--host",
-        "127.0.0.1",
+        spec.host,
         "--port",
         str(spec.port),
         "-np",

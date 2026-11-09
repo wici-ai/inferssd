@@ -20,11 +20,18 @@ from inferssd.source.header import Header, Tensor
 
 def gemma(tmp_path, platform, backends):
     inputs, spec, host, adapter, out, indexed = setup(tmp_path, platform)
-    write_gguf(spec.model, [("token_embd.weight", (32, 32), F32)], {
-        "general.architecture": "gemma4", "gemma4.block_count": 4,
-        "gemma4.attention.shared_kv_layers": 1, "gemma4.attention.head_count_kv": 1,
-        "gemma4.attention.key_length": 64, "gemma4.attention.value_length": 64,
-    })
+    write_gguf(
+        spec.model,
+        [("token_embd.weight", (32, 32), F32)],
+        {
+            "general.architecture": "gemma4",
+            "gemma4.block_count": 4,
+            "gemma4.attention.shared_kv_layers": 1,
+            "gemma4.attention.head_count_kv": 1,
+            "gemma4.attention.key_length": 64,
+            "gemma4.attention.value_length": 64,
+        },
+    )
     # The application's existing global SSD settings are valid inputs, but must
     # not activate an expert store or backend-specific tier for this RAM model.
     with open(spec.settings_file, "w", encoding="utf-8") as stream:
@@ -40,18 +47,30 @@ def gemma(tmp_path, platform, backends):
 
 
 def resolved(inputs, spec, adapter, out, platform, memory=8 << 30, reserve=0):
-    return prepare(inputs, resolver=partial(
-        resolve_typed, spec=spec, platform=platform, directory=str(out),
-        memory=memory, reserve=reserve,
-    ), observe=adapter, emit=lambda _: None)
+    return prepare(
+        inputs,
+        resolver=partial(
+            resolve_typed,
+            spec=spec,
+            platform=platform,
+            directory=str(out),
+            memory=memory,
+            reserve=reserve,
+        ),
+        observe=adapter,
+        emit=lambda _: None,
+    )
 
 
-@pytest.mark.parametrize("platform,backends,mapping,layers", [
-    ("darwin", ["Metal"], "--no-mmap", "99"),
-    ("darwin", [], "--mmap", "0"),
-    ("windows", ["Vulkan"], "--no-mmap", "99"),
-    ("windows", [], "--mmap", "0"),
-])
+@pytest.mark.parametrize(
+    "platform,backends,mapping,layers",
+    [
+        ("darwin", ["Metal"], "--no-mmap", "99"),
+        ("darwin", [], "--mmap", "0"),
+        ("windows", ["Vulkan"], "--no-mmap", "99"),
+        ("windows", [], "--mmap", "0"),
+    ],
+)
 def test_same_ram_profile_uses_existing_native_backends(
     tmp_path, platform, backends, mapping, layers
 ):
@@ -91,22 +110,32 @@ def test_ram_launch_respects_the_policy_reserve_and_budget(tmp_path):
         resolved(inputs, spec, adapter, out, "windows", memory=1 << 30)
 
 
-@pytest.mark.parametrize("extra", [
-    ("--cache_type_k=f32",), ("-ctkf32",), ("--no-mlock",),
-    ("--ctx-checkpoints", "32"), ("--swa-checkpoints", "32"), ("--swa_full",),
-    ("--override-kv", "gemma4.attention.shared_kv_layers=int:0"),
-    ("--model-draft", "draft.gguf"), ("-md", "draft.gguf"),
-    ("--spec-draft-model", "draft.gguf"), ("--mmproj", "projector.gguf"),
-    ("--lora", "adapter.gguf"),
-])
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ("--cache_type_k=f32",),
+        ("-ctkf32",),
+        ("--no-mlock",),
+        ("--ctx-checkpoints", "32"),
+        ("--swa-checkpoints", "32"),
+        ("--swa_full",),
+        ("--override-kv", "gemma4.attention.shared_kv_layers=int:0"),
+        ("--model-draft", "draft.gguf"),
+        ("-md", "draft.gguf"),
+        ("--spec-draft-model", "draft.gguf"),
+        ("--mmproj", "projector.gguf"),
+        ("--lora", "adapter.gguf"),
+    ],
+)
 def test_ram_capacity_options_cannot_be_overridden_behind_the_fit_check(tmp_path, extra):
     inputs, spec, _, adapter, out, _ = gemma(tmp_path, "windows", [])
     with pytest.raises(ValueError, match="RAM profile owns|explicit typed launch"):
         resolved(replace(inputs, extra=extra), spec, adapter, out, "windows")
 
 
-@pytest.mark.parametrize("variable", ["LLAMA_ARG_SWA_FULL", "LLAMA_ARG_SPEC_DRAFT_MODEL",
-                                      "LLAMA_ARG_MMPROJ"])
+@pytest.mark.parametrize(
+    "variable", ["LLAMA_ARG_SWA_FULL", "LLAMA_ARG_SPEC_DRAFT_MODEL", "LLAMA_ARG_MMPROJ"]
+)
 def test_ram_fit_cannot_be_bypassed_by_native_environment_defaults(tmp_path, variable):
     inputs, spec, _, adapter, out, _ = gemma(tmp_path, "windows", [])
     inputs = replace(inputs, environment=inputs.environment + ((variable, "1"),))
@@ -150,24 +179,42 @@ def test_ram_model_skips_ssd_machine_calibration(tmp_path, monkeypatch):
     monkeypatch.setattr(
         runtime, "machine_characteristics", lambda *_: pytest.fail("SSD calibration")
     )
-    instance = runtime.Runtime(inputs, policy(out, "windows"), host=object(), emit=lambda _: None,
-                               configuration=spec, machine=MachineSource())
+    instance = runtime.Runtime(
+        inputs,
+        policy(out, "windows"),
+        host=object(),
+        emit=lambda _: None,
+        configuration=spec,
+        machine=MachineSource(),
+    )
     assert instance.characteristics(spec) is None
 
 
 def test_gemma_header_accounts_shared_kv_and_sliding_windows():
     # E4B: the last18 layers share KV; of the first24,20 slide and4 keep full context.
-    kv = {"general.architecture": "gemma4", "gemma4.block_count": 42,
-          "gemma4.attention.shared_kv_layers": 18, "gemma4.attention.head_count_kv": 2,
-          "gemma4.attention.key_length": 512, "gemma4.attention.value_length": 512,
-          "gemma4.attention.sliding_window": 512,
-          "gemma4.attention.key_length_swa": 256, "gemma4.attention.value_length_swa": 256,
-          "gemma4.attention.sliding_window_pattern": [True] * 5 + [False]}
+    kv = {
+        "general.architecture": "gemma4",
+        "gemma4.block_count": 42,
+        "gemma4.attention.shared_kv_layers": 18,
+        "gemma4.attention.head_count_kv": 2,
+        "gemma4.attention.key_length": 512,
+        "gemma4.attention.value_length": 512,
+        "gemma4.attention.sliding_window": 512,
+        "gemma4.attention.key_length_swa": 256,
+        "gemma4.attention.value_length_swa": 256,
+        "gemma4.attention.sliding_window_pattern": [True] * 5 + [False],
+    }
     kv["gemma4.attention.sliding_window_pattern"] *= 7
-    header = Header("gemma.gguf", 3, kv,
-                    [Tensor("token_embd.weight", F32, (32, 32), 4096, 4096, "gemma.gguf")],
-                    32, 4096)
+    header = Header(
+        "gemma.gguf",
+        3,
+        kv,
+        [Tensor("token_embd.weight", F32, (32, 32), 4096, 4096, "gemma.gguf")],
+        32,
+        4096,
+    )
     metadata = ram.facts([header])
-    fit = ram.admission(metadata, context=8192, batch=512, gpu=False,
-                        available=16 << 30, budget=8 << 30, headroom=0)
+    fit = ram.admission(
+        metadata, context=8192, batch=512, gpu=False, available=16 << 30, budget=8 << 30, headroom=0
+    )
     assert fit["kv_bytes"] == 168 << 20  # The native ordinary engine's F16 KV allocation.

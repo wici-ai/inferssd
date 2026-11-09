@@ -205,7 +205,8 @@ class RecordedArtifacts:
             saved = self.host.get("machine_characteristics")
             if saved is not None:
                 data = (
-                    characteristics.loads(saved) if isinstance(saved, str)
+                    characteristics.loads(saved)
+                    if isinstance(saved, str)
                     else characteristics.validate(saved)
                 )
                 return Reply(data["cpu"])

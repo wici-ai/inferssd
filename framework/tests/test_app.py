@@ -144,7 +144,7 @@ def test_serve_reuses_owned_launch_and_policy(ready_app, monkeypatch):
     assert main(["serve", "-m", str(ready_app), "--port", "8181"]) == 0
     args = launch.call_args.args[0]
     assert args.execute and args.model == ready_app
-    assert args.port == 8181
+    assert args.port == 8181 and args.host == "127.0.0.1"
     policy = json.loads(args.runtime_policy.read_text())
     assert policy["memory_budget_bytes"] == 48 << 30
     assert "host_reserve_bytes" not in policy and "runtime_seconds" not in policy
@@ -160,6 +160,22 @@ def test_ram_serve_keeps_its_admission_margin_in_the_owned_policy(ready_app, mon
     policy = Policy.read(json.loads(args.runtime_policy.read_text()))
     assert policy.host_reserve_bytes == 2 << 30
     assert policy.memory_budget_bytes == 48 << 30
+
+
+def test_serve_listens_on_the_given_host(ready_app, monkeypatch, capsys):
+    launch = Mock(return_value=0)
+    monkeypatch.setattr(command.typed_command, "run", launch)
+    assert main(["serve", "-m", str(ready_app), "--host", "0.0.0.0"]) == 0
+    assert launch.call_args.args[0].host == "0.0.0.0"
+    assert "http://127.0.0.1:8080/v1" in capsys.readouterr().err
+
+
+def test_a_host_that_is_not_an_ipv4_address_fails_before_download(ready_app, monkeypatch):
+    download = Mock()
+    monkeypatch.setattr(command, "download", download)
+    with pytest.raises(SystemExit):
+        main(["serve", "-hf", next(iter(hub.MODELS)), "--host", "localhost"])
+    download.assert_not_called()
 
 
 def test_hf_and_chat_share_owned_launch(ready_app, monkeypatch):

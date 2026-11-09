@@ -226,7 +226,8 @@ def test_profile_saves_to_the_state_directory_and_summarizes(tmp_path):
         + (
             "no CPU compute measurement of "
             + ", ".join(sorted({role.format.upper() for role in model.facts.roles} - {"Q4_K"}))
-            if model.facts is not None else "RAM-only model; speed is measured after loading"
+            if model.facts is not None
+            else "RAM-only model; speed is measured after loading"
         )
         for model in catalog.MODELS
     ]

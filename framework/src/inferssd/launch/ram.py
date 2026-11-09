@@ -42,7 +42,8 @@ def facts(headers: Sequence[header.Header]) -> dict[str, object]:
     if not layers or not 0 < unique <= layers or not heads or not key or not value:
         raise ValueError("invalid Gemma4 RAM dimensions")
     if (
-        not isinstance(pattern, list) or len(pattern) != layers
+        not isinstance(pattern, list)
+        or len(pattern) != layers
         or any(type(x) is not bool for x in pattern)
     ):
         raise ValueError("invalid Gemma4 sliding-window pattern")
@@ -61,8 +62,10 @@ def facts(headers: Sequence[header.Header]) -> dict[str, object]:
         # Shared tail layers reuse earlier KV storage. Sliding layers retain a window
         # plus the batch being processed, as llama_memory_iswa does.
         "kv_layers": [
-            [window if sliding else 0,
-             heads * ((swa_key + swa_value) if sliding else (key + value)) * 2]
+            [
+                window if sliding else 0,
+                heads * ((swa_key + swa_value) if sliding else (key + value)) * 2,
+            ]
             for sliding in pattern[:unique]
         ],
     }
@@ -79,16 +82,27 @@ def validate(raw: object) -> dict[str, object]:
     if not isinstance(layers, list) or not layers:
         raise ValueError("invalid RAM model fact: kv_layers")
     for layer in layers:
-        if (not isinstance(layer, list) or len(layer) != 2
-                or type(layer[0]) is not int or layer[0] < 0
-                or type(layer[1]) is not int or layer[1] <= 0):
+        if (
+            not isinstance(layer, list)
+            or len(layer) != 2
+            or type(layer[0]) is not int
+            or layer[0] < 0
+            or type(layer[1]) is not int
+            or layer[1] <= 0
+        ):
             raise ValueError("invalid RAM KV layer dimensions")
     return dict(raw)
 
 
 def admission(
-    raw: object, *, context: int, batch: int, gpu: bool,
-    available: Optional[int], budget: int, headroom: int,
+    raw: object,
+    *,
+    context: int,
+    batch: int,
+    gpu: bool,
+    available: Optional[int],
+    budget: int,
+    headroom: int,
 ) -> dict[str, object]:
     """Fail closed unless the whole model and working buffers fit memory now."""
     model = validate(raw)
@@ -98,7 +112,8 @@ def admission(
     # reads directly into buffers, avoiding a duplicate source mapping.
     weights = (
         cast(int, model["tensor_bytes"]) + cast(int, model["embedding_bytes"])
-        if gpu else cast(int, model["model_bytes"])
+        if gpu
+        else cast(int, model["model_bytes"])
     )
     kv = sum(
         ((min(context, window + batch) if window else context) + 255) // 256 * 256 * width
@@ -113,6 +128,12 @@ def admission(
             f"available {available / 2**30:.2f} GiB, budget {budget / 2**30:.2f} GiB. "
             "Free memory or reduce context; SSD offload is not enabled for this model."
         )
-    return {"weights_bytes": weights, "kv_bytes": kv, "workspace_bytes": WORKSPACE_BYTES,
-            "required_bytes": required, "headroom_bytes": reserve,
-            "available_bytes": available, "budget_bytes": budget}
+    return {
+        "weights_bytes": weights,
+        "kv_bytes": kv,
+        "workspace_bytes": WORKSPACE_BYTES,
+        "required_bytes": required,
+        "headroom_bytes": reserve,
+        "available_bytes": available,
+        "budget_bytes": budget,
+    }

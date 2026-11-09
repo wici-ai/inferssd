@@ -13,14 +13,29 @@ from inferssd.launch.types import Threads
 
 def flash(tmp_path, platform, backends=()):
     inputs, spec, host, adapter, out, _ = setup(tmp_path, platform)
-    write_gguf(spec.model, *moe("qwen4exp", layers=1, experts=512, used=10,
-                              latent=32, hidden=32, gate=Q8_0, up=Q8_0, down=Q8_0))
+    write_gguf(
+        spec.model,
+        *moe(
+            "qwen4exp",
+            layers=1,
+            experts=512,
+            used=10,
+            latent=32,
+            hidden=32,
+            gate=Q8_0,
+            up=Q8_0,
+            down=Q8_0,
+        ),
+    )
     host["engine_gpu_backends"] = list(backends)
     host["runtime_facts"] = {"cpus": list(range(16)), "gpus": [], "available_bytes": 16 << 30}
-    host["cpu_topology"] = {"affinity_supported": platform != "darwin", "clusters": [
-        {"kind": "performance", "cpus": [0, 1, 10, 11, 12, 13]},
-        {"kind": "efficiency", "cpus": [2, 3, 4, 5, 6, 7, 8, 9, 14, 15]},
-    ]}
+    host["cpu_topology"] = {
+        "affinity_supported": platform != "darwin",
+        "clusters": [
+            {"kind": "performance", "cpus": [0, 1, 10, 11, 12, 13]},
+            {"kind": "efficiency", "cpus": [2, 3, 4, 5, 6, 7, 8, 9, 14, 15]},
+        ],
+    }
     return replace(inputs, profile=""), replace(spec, strategy=True), host, adapter, out
 
 
