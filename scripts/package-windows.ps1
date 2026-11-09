@@ -45,6 +45,8 @@ try {
   Expand-Archive -LiteralPath $runtime -DestinationPath (Join-Path $stage 'vulkan-runtime')
   $runtimeRoot = Join-Path $stage 'vulkan-runtime\VulkanRT-X64-1.4.363.0-Components'
   Copy-Item -LiteralPath (Join-Path $runtimeRoot 'x64\vulkan-1.dll') -Destination (Join-Path $package 'bin')
+  # Descriptor generation validates the original build-side server too.
+  Copy-Item -LiteralPath (Join-Path $runtimeRoot 'x64\vulkan-1.dll') -Destination (Join-Path $build 'bin')
   Copy-Item -LiteralPath (Join-Path $runtimeRoot 'VulkanRT-License.txt') -Destination (Join-Path $package 'licenses')
 
   $pythonArchive = Join-Path $stage 'python.tar.gz'
@@ -63,6 +65,7 @@ try {
   $crtFiles = if ($crt -and (Test-Path -LiteralPath $crt)) { @(Get-ChildItem -LiteralPath $crt -Recurse -Filter '*.dll' | Where-Object {$_.Directory.Name -match '^Microsoft\.VC[0-9]+\.CRT$'}) } else { @() }
   if (!$crtFiles.Count) { throw 'The Visual C++ redistributable CRT files were not found; run from vcvars64.bat.' }
   foreach ($folder in 'bin', 'python') { $crtFiles | Copy-Item -Destination (Join-Path $package $folder) -Force }
+  $crtFiles | Copy-Item -Destination (Join-Path $build 'bin') -Force
   Native clang++ @('--target=x86_64-pc-windows-msvc', '-std=c++17', '-O2', '-DUNICODE', '-D_UNICODE', (Join-Path $PSScriptRoot 'windows-launcher.cpp'), '-o', (Join-Path $package 'bin\inferssd.exe'))
   Native $python @('-I', (Join-Path $PSScriptRoot 'engine-resources.py'), '--build', $build, '--output', (Join-Path $stage 'resources.json'))
   $resource = Get-Content -LiteralPath (Join-Path $stage 'resources.json') -Raw | ConvertFrom-Json
