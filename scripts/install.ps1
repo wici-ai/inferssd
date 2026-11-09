@@ -141,7 +141,8 @@ No administrator rights are used. Models, settings and previous releases are pre
     function Install-Package {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [IO.Directory]::CreateDirectory($releases) | Out-Null
-        $release = Join-Path $releases ('package.' + [Guid]::NewGuid().ToString('N'))
+        # Keep the installed path short enough for Windows PowerShell 5 / .NET Framework.
+        $release = Join-Path $releases ('package.' + [Guid]::NewGuid().ToString('N').Substring(0,12))
         [IO.Directory]::CreateDirectory($release) | Out-Null
         $complete = $false
         try {
@@ -177,20 +178,36 @@ No administrator rights are used. Models, settings and previous releases are pre
             }
             $zip = [IO.Compression.ZipFile]::OpenRead($archive)
             try {
-                foreach ($entry in $zip.Entries) {
+                function Entry-Path($entry) {
                     $relative = $entry.FullName.Replace('/', '\')
-                    $target = [IO.Path]::GetFullPath((Join-Path $release $relative))
                     $link = (($entry.ExternalAttributes -shr 16) -band 61440) -eq 40960
                     if ($relative.Contains(':') -or $link -or
-                        -not $relative.StartsWith($package.name + '\', [StringComparison]::Ordinal) -or
-                        -not $target.StartsWith($release + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                        -not $relative.StartsWith($package.name + '\', [StringComparison]::Ordinal)) {
                         throw 'inferssd: unsafe path in the Windows package.'
+                    }
+                    $relative = $relative.Substring($package.name.Length + 1)
+                    if (!$relative -and !$entry.Length) { return $null }
+                    # The archive's validated single top folder is not duplicated on disk.
+                    $target = [IO.Path]::GetFullPath((Join-Path $release $relative))
+                    if (!$target.StartsWith($release + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                        throw 'inferssd: unsafe path in the Windows package.'
+                    }
+                    return $target
+                }
+                foreach ($entry in $zip.Entries) { [void](Entry-Path $entry) }
+                Write-Output "Unpacking InferSSD $($package.label)."
+                foreach ($entry in $zip.Entries) {
+                    $target = Entry-Path $entry
+                    if (!$target) { continue }
+                    if ($entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\')) {
+                        [IO.Directory]::CreateDirectory($target) | Out-Null
+                    } else {
+                        [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($target)) | Out-Null
+                        [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target)
                     }
                 }
             } finally { $zip.Dispose() }
-            Write-Output "Unpacking InferSSD $($package.label)."
-            [IO.Compression.ZipFile]::ExtractToDirectory($archive, $release)
-            $root = Join-Path $release $package.name
+            $root = $release
             $command = Join-Path $root 'bin\inferssd.exe'
             $server = Join-Path $root 'bin\inferssd-server.exe'
             $resources = Join-Path $root 'engine-resources.json'

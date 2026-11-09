@@ -104,7 +104,8 @@ def test_install_and_upgrade_prebuilt_without_developer_tools(windows_install):
     result = run(first)
     assert result.returncode == 0, result.stderr
     assert (home / "current/bin/inferssd.exe").is_file()
-    assert name in str((home / "current").resolve())
+    assert (home / "current").resolve().parent == home / "releases"
+    assert not (home / "current" / name).exists()
     assert "Downloading InferSSD" in result.stdout and "Unpacking InferSSD" in result.stdout
     assert "Building InferSSD" not in result.stdout
     assert (bindir / "inferssd.cmd").is_file()
@@ -115,7 +116,7 @@ def test_install_and_upgrade_prebuilt_without_developer_tools(windows_install):
     second, name = make(402)
     result = run(second)
     assert result.returncode == 0, result.stderr
-    assert name in str((home / "current").resolve()) and old.is_dir()
+    assert (home / "current").resolve() != old and old.is_dir()
     assert models.read_bytes() == b"model"
     output = subprocess.check_output(
         [str(home / "current/bin/inferssd.exe"), "--version", "--json"], env=env, text=True
@@ -123,15 +124,21 @@ def test_install_and_upgrade_prebuilt_without_developer_tools(windows_install):
     assert json.loads(output)["build"] == 402
 
 
-@pytest.mark.parametrize("failure", ["checksum", "traversal", "command", "native"])
+@pytest.mark.parametrize(
+    "failure", ["checksum", "traversal", "inner-traversal", "command", "native"]
+)
 def test_failed_package_keeps_the_working_installation(windows_install, failure):
     home, bindir, _, make, run = windows_install
     listing, _ = make(401)
     assert run(listing).returncode == 0
     old, wrapper = (home / "current").resolve(), (bindir / "inferssd.cmd").read_bytes()
+    member = {
+        "traversal": "../outside.txt",
+        "inner-traversal": "inferssd-261109.402.aaaaaaa-windows-x64/../outside.txt",
+    }.get(failure)
     bad, _ = make(
         402,
-        member="../outside.txt" if failure == "traversal" else None,
+        member=member,
         checksum="0" * 64 if failure == "checksum" else None,
     )
     flags = {"command": {"FAIL_PACKAGE": "1"}, "native": {"FAIL_NATIVE": "1"}}
@@ -178,3 +185,34 @@ def test_downloads_manifest_and_archive_over_http(windows_install):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_ps5_installs_deep_python_paths_without_duplicate_archive_root(
+    windows_install, tmp_path_factory
+):
+    _, _, env, make, run = windows_install
+    home = tmp_path_factory.mktemp("deep") / "user data"
+    env["INFERSSD_HOME"] = str(home)
+    listing, name = make(401)
+    relative = (
+        "python/Lib/site-packages/huggingface_hub/inference/_providers/__pycache__/"
+        "featherless_ai.cpython-312.pyc"
+    )
+    # Production standalone packages have entries this long. The old installer
+    # duplicated the named archive folder below a 32-digit staging GUID.
+    padding = max(0, 166 - len(name + "/" + relative))
+    relative = relative.replace("featherless_ai", "featherless_ai" + "x" * padding)
+    archive = Path(listing.with_suffix(".zip"))
+    with zipfile.ZipFile(archive, "a") as zipped:
+        zipped.writestr(name + "/" + relative, b"python bytecode fixture")
+    manifest = json.loads(listing.read_text())
+    manifest.update(
+        size=archive.stat().st_size, sha256=hashlib.sha256(archive.read_bytes()).hexdigest()
+    )
+    listing.write_text(json.dumps(manifest))
+    result = run(listing)
+    assert result.returncode == 0, result.stderr
+    installed = home / "current" / relative
+    assert installed.read_bytes() == b"python bytecode fixture"
+    assert not (home / "current" / name).exists()
+    assert len(str((home / "current").resolve() / relative)) < 260

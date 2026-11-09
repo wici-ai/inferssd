@@ -120,6 +120,7 @@ def main() -> None:
     import inferssd
     import yaml
     from inferssd.launch.ram import admission
+    from inferssd.machine.probes import parse as parse_probe
 
     for module in (inferssd, hf_xet, httpx, yaml):
         if not Path(module.__file__).resolve().is_relative_to(package):
@@ -142,9 +143,9 @@ def main() -> None:
     schema = json.loads(subprocess.check_output([str(package / resources["binary"]), "--ssd-schema"]))
     assert schema
     subprocess.run([str(package / resources["binary"]), "--list-devices"], check=True)
-    cpu = json.loads(subprocess.check_output([str(package / resources["probes"]["cpu"]),
-        "--rows", "64", "--cols", "256", "--tokens", "1,2", "--min-seconds", "0", "--threads", "1"]))
-    assert cpu["schema"] == "inferssd-cpuprobe/1" and cpu["compute"] and not cpu["skipped"]
+    cpu = parse_probe("cpu", subprocess.check_output([str(package / resources["probes"]["cpu"]),
+        "--rows", "64", "--cols", "256", "--tokens", "1,2", "--min-seconds", "0", "--threads", "1"]).decode("utf-8"))
+    assert cpu["compute"] and not cpu["skipped"]
     # Exercise the packaged Gemma RAM admission contract without downloading model weights.
     fit = admission({"architecture": "gemma4", "model_bytes": 1024, "tensor_bytes": 1024,
                      "embedding_bytes": 512, "kv_layers": [[0, 1024]]},

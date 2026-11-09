@@ -8,7 +8,7 @@ if ($manifest.schema -ne 'inferssd-package 1' -or $manifest.platform -ne 'window
     $manifest.size -ne (Get-Item -LiteralPath $archivePath).Length -or
     $manifest.sha256 -ne (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash) { throw 'Invalid package manifest or bytes.' }
 $temporary = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
-$work = Join-Path $temporary ('inferssd-package-check-' + [Guid]::NewGuid().ToString('N'))
+$work = Join-Path $temporary ('iw-check-' + [Guid]::NewGuid().ToString('N').Substring(0,12))
 [IO.Directory]::CreateDirectory($work) | Out-Null
 $previousPath = $env:PATH
 $names = 'INFERSSD_HOME', 'INFERSSD_BIN_DIR', 'INFERSSD_PACKAGES', 'INFERSSD_RESOURCES', 'INFERSSD_REF', 'INFERSSD_FROM_SOURCE', 'PYTHONHOME', 'PYTHONPATH', 'VIRTUAL_ENV'
@@ -51,6 +51,6 @@ try {
   $env:PATH = $previousPath
   foreach ($key in $names) { [Environment]::SetEnvironmentVariable($key, $previous[$key], 'Process') }
   $absolute = [IO.Path]::GetFullPath($work)
-  if ([IO.Path]::GetDirectoryName($absolute) -ne $temporary -or ![IO.Path]::GetFileName($absolute).StartsWith('inferssd-package-check-')) { throw 'Refusing cleanup outside test staging directory.' }
+  if ([IO.Path]::GetDirectoryName($absolute) -ne $temporary -or ![IO.Path]::GetFileName($absolute).StartsWith('iw-check-')) { throw 'Refusing cleanup outside test staging directory.' }
   if (Test-Path -LiteralPath $absolute) { Remove-Item -LiteralPath $absolute -Recurse -Force }
 }
