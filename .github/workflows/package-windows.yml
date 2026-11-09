@@ -1,6 +1,18 @@
 name: Package Windows
 
 on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Exact commit to build and check for the shared numbered release
+        required: true
+        type: string
+      publish:
+        type: boolean
+        default: false
+    secrets:
+      APP_VERSIONING_TOKEN:
+        required: false
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
@@ -36,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install the build-time Vulkan SDK
@@ -87,6 +99,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -104,9 +117,13 @@ jobs:
     if: github.ref == 'refs/heads/main' && inputs.publish
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    concurrency:
+      group: inferssd-package-publish
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ inputs.source_ref || github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:

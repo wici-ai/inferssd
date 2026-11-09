@@ -3,7 +3,7 @@
 
 [Back to README](../README.md)
 
-Every platform uses the `main` branch of `wici-ai/inferssd`. Use the
+Every platform uses `wici-ai/inferssd`. Numbered releases share one version and tagged commit across platforms. Use the
 [one-command installation](#one-command-installation), or build manually for
 **[Apple Silicon](#apple-silicon)** / **[Linux / NVIDIA](#linux--nvidia)** /
 **[Windows](#windows)** and [prepare a launch](#prepare-a-launch).
@@ -27,9 +27,10 @@ On Windows, in PowerShell:
 irm https://github.com/wici-ai/inferssd/releases/latest/download/install.ps1 | iex
 ```
 
-A POSIX release's installer builds that release from source. The installer on `main`
-installs the prebuilt [macOS package](macos-package.md) of `main` on an Apple Silicon
-Mac with macOS 15 or later, which needs none of the tools below:
+A numbered release includes prebuilt [macOS](macos-package.md) and [Windows](windows-package.md)
+packages from the same tagged commit. Its installers download that version without developer
+tools on Apple Silicon macOS 15 or later and Windows 11 x64. Linux still builds from source.
+The installer on `main` installs the latest published package:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
@@ -38,7 +39,8 @@ curl -fsSL https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/insta
 The Windows installer downloads the precompiled [Windows package](windows-package.md),
 including its own Python runtime, native engine, probes and runtime DLLs. It does not compile
 or require Git, Python, Visual Studio or a Vulkan SDK. Its package list is
-`https://appapi.wici.ai/versioning/inferssd/config/latest-windows.json`;
+`https://appapi.wici.ai/versioning/inferssd/config/latest-windows.json` on `main`; a numbered
+release's installer pins its own release manifest instead.
 `INFERSSD_PACKAGES` can select another list. A missing package list reports an error rather
 than silently starting a source build.
 

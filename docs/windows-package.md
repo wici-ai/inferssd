@@ -25,11 +25,21 @@ and the same build identity fields as the macOS package. Published bytes are imm
 
 ## Build and verify
 
-The workflow builds automatically for packaging-related pull requests, making a
-`package-windows-x64` Actions artifact available for testing. To produce a production package,
-run `Package Windows` on `main`; check `publish` to upload the verified archive and update
-`latest-windows.json` through the same release service as macOS. Publishing requires
-`APP_VERSIONING_TOKEN` and is disabled for pull requests and other branches.
+Every numbered `vX.Y.Z` release automatically calls the reusable Windows and macOS package
+workflows at the same tag commit. After both platforms' checks pass, the common **Release** job
+prepares one GitHub release containing both archives, both manifests and `install.sh`/`install.ps1`,
+updates the normal latest package feeds, and only then publishes the complete release. There is no
+separate Windows-only version or prerelease channel. Publishing requires `APP_VERSIONING_TOKEN`.
+
+The numbered Windows installer pins its default package URL to that release's
+`latest-windows.json`; it cannot silently install a newer rolling version. The asset preparation
+step rejects packages with a different version, revision, build, label or checksum. Existing
+published releases are never overwritten. A draft remains private until all assets and both
+normal package feeds are ready.
+
+**Package Windows** still runs for packaging-related pull requests and can be started manually
+for validation, producing a `package-windows-x64` Actions artifact. Its optional manual publisher
+remains main-only; no manual Windows job is required for normal numbered releases.
 
 For a local build, enter an x64 Visual Studio tools environment, install the Vulkan SDK, and run:
 
