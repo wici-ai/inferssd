@@ -261,7 +261,39 @@ int main() {
     inputs.set("tier.min_count", "0");
 
     // At load (kimi_vram_elastic_api reserve) a unified-memory tier takes its storage and grows into what is free;
-    // a prefill keeps it and the first decode adopts it. A discrete GPU leaves the arena to its first decode.
+    // a prefill keeps it and the first decode adopts it. A discrete GPU's automatic tier takes one block at load and
+    // grows into the card at the first phase boundary after a prefill pass's memory settled, or at the first decode
+    // token (phase_complete); a byte budget leaves the arena to its first decode.
+    if (!unified) {
+        const size_t mx = 36864;
+        kimi_vram_request r = {};r.layer=1;r.weight=1;
+        for (int i = 0; i < 3; ++i) r.role[i].bytes = mx;
+        const int32_t layers[] = {1,2};
+        const kimi_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),64,2,layers};
+        for (bool settle : {true, false}) {
+            tier t(tier::automatic_budget, inputs.tier_policy());
+            t.reserve(r,f);
+            require(t.has_storage() && t.table && t.growth_deferred && t.grow_events==0 && t.slot_locations.size()==16 &&
+                    t.adopt_next_decode, "a discrete GPU's automatic tier did not take one block at load");
+            t.begin(22,0,false);
+            require(t.growth_deferred && t.grow_events==0 && t.slot_locations.size()==16,
+                    "a discrete tier grew before a prefill pass's memory settled");
+            if (settle) {
+                // two layer boundaries of a pass that find the same free memory
+                t.observe_settle();t.observe_settle();
+                require(t.settled,"two equal layer boundaries did not settle the tier's memory");
+                t.begin(22,0,false);
+            } else {
+                t.phase_complete(true);
+            }
+            require(!t.growth_deferred && t.grow_events==1 && t.max_slots>16 && t.slot_locations.size()==t.max_slots,
+                    settle ? "a discrete tier made at load did not grow at the phase boundary after its memory settled" :
+                             "a discrete tier made at load did not grow at the first decode token");
+            t.begin(22,1,true);
+            require(t.has_storage() && t.table && !t.adopt_next_decode && t.arena_epoch==22,
+                    "the first decode did not adopt the discrete tier made at load");
+        }
+    }
     {
         const size_t mx = 36864; // one 256 x 256 MXFP4 role, padded to 4 KiB
         kimi_vram_request r = {};r.layer=1;r.weight=1;
