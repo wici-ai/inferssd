@@ -175,7 +175,16 @@ cache history; snapshots can lag by sixteen steps.
 The synthetic selection-bias test covers architecture scope, disabled receipts,
 refresh cadence, source-version rejection, complete residency and duplicate
 accounting. Module layering/layout and host translation-unit checks cover the
-bridge. These checks establish host/source preparation only. CUDA compilation
-and runtime checks on the target device, followed by full-prompt A5/B2 on the
-final source, are still required; experimental activation is not a performance
-or semantic-quality validation. No previous measurements qualify this code.
+bridge. The measured candidate `432d215` passed CUDA compilation and two DGX
+Spark runs with DeepSeek-V4.1-Flash-1017 Q8_0, 4,104 input tokens and 256 output
+tokens. Against five runs of `df2e575`, mean overall decode increased from 4.7801
+to 7.0800 tokens/s (+48.11%); prefill was 132.5754 versus 132.6602 tokens/s,
+inside baseline variation. The process limit was 32 GiB with swap disabled;
+context was 8,192 and batch/ubatch ceiling 4,104. Normal output checks passed,
+but task quality and semantic equivalence have not been evaluated.
+
+This branch also incorporates main's cache preload. Both preload and selection
+snapshots remain available in executor ABI version 8; old tables are rejected.
+Host syntax and sanitizer-backed synthetic checks passed after synchronization.
+Those checks are not inference benchmarks: the measured gain above does not
+validate the synchronized version, whose initial cache contents can differ.

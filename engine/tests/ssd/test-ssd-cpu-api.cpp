@@ -39,6 +39,12 @@ int main() {
     changed = *api;
     changed.selection_snapshot = nullptr;
     if (ssd::cpu::valid(&changed)) { return 9; }
+    changed = *api;
+    changed.preload = nullptr;
+    if (ssd::cpu::valid(&changed)) { return 10; }
+    changed = *api;
+    changed.version = 7;
+    if (ssd::cpu::valid(&changed)) { return 11; }
     std::puts("CPU_EXECUTOR_REGISTRY_ABI_PASS");
     return 0;
 }
