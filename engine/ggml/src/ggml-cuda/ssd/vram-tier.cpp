@@ -914,6 +914,38 @@ struct tier {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         grow_decode_locked(start);
     }
+    // At load, after the load's passes (kimi_vram_elastic_api preload_slots): a tier made at load whose memory settled
+    // in them grows into the card first, as the first request's begin would have grown it; then the slots no entry
+    // holds, which preload may fill.
+    size_t preload_slots(){
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        if(!table || !has_storage() || poisoned || active || prefill_live)return 0;
+        if(elastic_active && growth_deferred && settled)grow_decode_locked();
+        return table->empty_slots();
+    }
+    // At load (kimi_vram_elastic_api preload): one expert no request has named into an empty slot, its three roles
+    // copied from host memory (data, as the layer's format lays them out), the entry preloaded (vram-slot-table.h).
+    // False when no slot is empty or the tier holds the expert already.
+    bool preload(const kimi_vram_request & r,const void * const * data){
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        if(!table || !has_storage() || poisoned || active || prefill_live)return false;
+        const expert_format * x=format_of(r.layer);
+        if(!x)return false;
+        for(int role=0;role<3;++role)if(!data[role] || r.role[role].bytes!=x->role_bytes[role])
+            throw std::runtime_error("preloaded expert has another layout than its layer's format");
+        const int slot=table->reserve_preload(r);
+        if(slot<0)return false;
+        try{
+            cuda_check(cudaSetDevice(device));
+            size_t offset=0;
+            for(int role=0;role<3;++role){
+                cuda_check(cudaMemcpy(slot_base(size_t(slot))+offset,data[role],x->role_bytes[role],cudaMemcpyDefault));
+                offset+=x->role_bytes[role];
+            }
+        }catch(...){table->cancel_upload(size_t(slot),r);throw;}
+        table->publish_cold_prefill(size_t(slot),r);
+        return true;
+    }
     // A prefill layer boundary of a tier made at load on a discrete GPU, before the layer takes anything: free memory
     // found where the boundary before it in this phase left it shows that the pass's kernels and library handles hold
     // their memory. On an RTX 5090 with DeepSeek V4.1 they took 110 MiB in the first two layers of the load's first
@@ -2072,6 +2104,8 @@ struct tier {
             cpu_requests+=size_t(count);
             return;
         }
+        // what the pass routes of the experts preloaded for this layer is the pass's now: its seeds plan around them
+        {std::lock_guard<std::mutex> lock(lifecycle_mutex);table->adopt_preloaded(r,size_t(count));}
         plan_sink_seeds(r,count,seed_routes);
         prefill_generation=table->acquire_slots(r,size_t(count),prefill_slots.data());
         std::copy(prefill_slots.begin(),prefill_slots.end(),slots);
@@ -2354,6 +2388,13 @@ int elastic_phase_complete(void * p,int decode,char * e,size_t n){auto * t=stati
 int elastic_reserve_accumulate(void * p,int tokens,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->reserve_prefill_engine(tokens);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int elastic_reserve(void * p,const kimi_vram_request * r,const kimi_vram_expert_format * f,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{if(!r || !f)throw std::runtime_error("null VRAM reserve geometry");t->reserve(*r,*f);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+int elastic_preload_slots(void * p,int * slots,char * e,size_t n){
+    auto * t=static_cast<tier *>(p);try{if(!slots)throw std::runtime_error("null VRAM preload count");
+        *slots=int(std::min<size_t>(t->preload_slots(),size_t(INT32_MAX)));return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+int elastic_preload(void * p,const kimi_vram_request * r,const void * up,const void * gate,const void * down,int * copied,
+        char * e,size_t n){
+    auto * t=static_cast<tier *>(p);try{if(!r || !copied)throw std::runtime_error("null VRAM preload");
+        const void * data[3]={up,gate,down};*copied=t->preload(*r,data)?1:0;return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int format_prepare(void * p,const kimi_vram_request * r,int count,const kimi_vram_expert_format * f,int * slots,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->prepare_format(r,count,f,slots);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int format_launch(void * p,const void * q,size_t bytes,const kimi_vram_activation * a,char * e,size_t n){
@@ -2528,7 +2569,8 @@ extern "C" const kimi_vram_deferred_api * kimi_vram_deferred_get_api(){
     static const kimi_vram_deferred_api api={3,sizeof(kimi_vram_deferred_api),deferred_admit,deferred_collect,deferred_wait};return &api;
 }
 extern "C" const kimi_vram_elastic_api * kimi_vram_elastic_get_api(){
-    static const kimi_vram_elastic_api api={4,sizeof(kimi_vram_elastic_api),elastic_phase_complete,elastic_reserve_accumulate,elastic_reserve};return &api;
+    static const kimi_vram_elastic_api api={5,sizeof(kimi_vram_elastic_api),elastic_phase_complete,elastic_reserve_accumulate,elastic_reserve,
+        elastic_preload_slots,elastic_preload};return &api;
 }
 extern "C" const kimi_vram_format_api * kimi_vram_format_get_api(){
     static const kimi_vram_format_api api={2,sizeof(kimi_vram_format_api),format_prepare,format_launch};return &api;
