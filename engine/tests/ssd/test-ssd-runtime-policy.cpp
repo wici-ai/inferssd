@@ -83,12 +83,12 @@ static void placement_contract() {
 
     std::vector<prefill_expert> experts = {{9,false,true,true,1024},{2,false,true,true,1024},{1,false,false,false,1024}};
     std::vector<int> routes = {4,4,4}; std::vector<kimi_place_item> empty;
-    prefill_input input{experts,routes,empty,t,32,1,1,1,4,2,false}; uint64_t candidates = 0;
-    const auto ranked = rank_prefill(input,candidates);
-    check(candidates == 1 && ranked.ranked.size() == 3 && ranked.ranked[0].index == 1 && ranked.ranked[1].index == 0 && ranked.ranked[2].index == 2,
-        "equal-route prefill candidates retain RAM before SSD, then expert-id order");
-    bool in_place = false; const auto selected = plan_prefill(input,ranked,in_place);
-    check(selected.ssd_limit == 1 && !selected.chosen.empty(), "legacy threshold profile consumes the same explicit plan contract");
+    prefill_input input{experts,routes,empty,t,32,1,2}; uint64_t candidates = 0;
+    const auto counted = count_prefill(input,candidates);
+    check(candidates == 1 && counted.ram_candidates == 2 && counted.ssd_candidates == 1 && counted.ssd_limit == 1,
+        "prefill candidates: leased RAM entries and drive reads, the reads limited by the staging");
+    bool in_place = false; const auto selected = plan_prefill(input,counted,in_place);
+    check(selected.ssd_limit == 1 && selected.chosen.empty(), "a plan without placeable items moves nothing");
 }
 
 static void calibration_contract() {
@@ -108,6 +108,20 @@ static void calibration_contract() {
     f.gpu = {}; f.engine_overhead_us = 0; f.upload_us = 4; f.ssd_upload_us = 6; f.total_worker_us = 50; f.read_wait_us = 10;
     fit = observe_prefill_lines(s,cost,prior,f);
     check(fit.gpu_lane_us == 10 && fit.gpu_overhead_us == 0, "CPU-only sample cannot train GPU overhead from worker bookkeeping");
+
+    // The drive's line follows the newest layer with reads: two layers at 1 GB/s, then one at 10 GB/s and one without
+    // reads, price the next layer's reads at 10 GB/s.
+    prefill_learning d; d.window = 4; cost_lines none;
+    prefill_feedback r = {}; r.ntokens = 32;
+    for (const double us : {1e6, 1e6, 1e5, 0.0}) {
+        r.read_bytes = us > 0 ? 1000000000 : 0; r.read_us = us; (void) observe_prefill_lines(d,none,prior,r);
+    }
+    decode_learning idle;
+    lane_measurement measured = {2, 3, 4, 5, 1, 100, 200, 7, true};
+    lane_geometry lane = {4096, 2048, true, true};
+    const auto t = make_table(none, prior, idle, d, measured, lane, 32, 0);
+    check(d.samples.size() == 4 && near(t.drive_us_per_mb, 100) && t.drive_fixed_us == 0,
+        "the drive's line follows the newest grouped-prefill layer with reads");
 }
 int main() {
     learning_contract(); prefetch_contract(); placement_contract(); calibration_contract();

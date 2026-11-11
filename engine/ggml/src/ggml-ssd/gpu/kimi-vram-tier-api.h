@@ -265,20 +265,19 @@ struct kimi_vram_prefill_api {
                       int * admitted, char * error, size_t error_size);
     // The format's lane, after prepare (which initializes the format on a cold prefill). Read-only.
     void (*lane)(void * context, struct kimi_vram_prefill_lane * lane);
-    // Version 10, the seeds of a prefill the CPU sink runs, as a graph prefill's are seeded. seed_routes gives the
-    // routes of each request of the next prepare's union (index-aligned with its requests); that prepare reserves the
-    // layer's share of the empty slots for the experts the pass routes most, before it leases its residents. The tier
-    // copies a seed its prefill lane computes from the bytes it reads; seed_host copies one the CPU computes from its
-    // payload (request_index into the prepared union), which stays valid until seed_wait returns for that request.
-    // The seeds are published as a graph prefill's are, when the decode phase completes the prefill, or at the first
-    // decode token begun without that completion; a block given back or a cancelled prefill drops them.
+    // Version 10, the seeds of a prefill the CPU sink runs: empty slots filled with the experts it routes most.
+    // seed_routes gives the routes of each request of the next prepare's union (index-aligned with its requests); that
+    // prepare reserves the layer's share of the empty slots for the experts the pass routes most, before it leases its
+    // residents. The tier copies a seed its prefill lane computes from the bytes it reads; seed_host copies one the CPU
+    // computes from its payload (request_index into the prepared union), which stays valid until seed_wait returns for
+    // that request. The seeds are published when the decode phase completes the prefill, or at the first decode token
+    // begun without that completion; a block given back or a cancelled prefill drops them.
     int (*seed_routes)(void * context, const int32_t * routes, int count, char * error, size_t error_size);
     int (*seed_host)(void * context, int32_t request_index, const void * up, const void * gate, const void * down,
                      char * error, size_t error_size);
     int (*seed_wait)(void * context, int32_t request_index, char * error, size_t error_size);
 };
-// Optional deferred-upload extension (GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD=1 in the tier and its CPU owner,
-// with ASYNC_UPLOAD=1). admit replaces ABI 2 admit for a borrowed RAM source, but the upload may outlive finish:
+// Optional deferred-upload extension (deferred and async uploads on in the tier and its CPU owner). admit replaces ABI 2 admit for a borrowed RAM source, but the upload may outlive finish:
 // when *queued is 1 the caller keeps that source unchanged and leased until collect returns the request, and the
 // reserved GPU slot is never evicted meanwhile. collect runs outside prepare..finish and without a live residency
 // lease, except with KIMI_VRAM_COLLECT_IF_IDLE. It waits for the in-flight uploads of wait_layer (>= 0) or as named
@@ -308,7 +307,7 @@ struct kimi_vram_deferred_api {
 // reserve; phase_complete(true) runs only after the decode graph is reserved
 // and grows best-effort into currently free device memory.
 struct kimi_vram_elastic_api {
-    uint32_t version, size;   // 4 (kimi_vram_expert_format with per-layer types)
+    uint32_t version, size;   // 5 (preload)
     int (*phase_complete)(void * context, int decode, char * error, size_t error_size);
     // Reserve the actual grouped-prefill accumulator before starting streamed I/O.
     int (*reserve_accumulate)(void * context, int tokens, char * error, size_t error_size);
@@ -318,6 +317,14 @@ struct kimi_vram_elastic_api {
     // The request gives the role bytes (one expert of a routed layer), format the geometry.
     int (*reserve)(void * context, const struct kimi_vram_request * request,
                    const struct kimi_vram_expert_format * format, char * error, size_t error_size);
+    // At load, after the load's passes, before any request: preload_slots grows a tier made at load into the card if
+    // its memory has settled, then gives in *slots how many slots no entry holds. preload copies one expert no
+    // request has named (request: its key and role bytes) from host memory into one of them, preloaded: any lookup
+    // finds it, and every allocation may take its slot as if it were empty until a request uses it. *copied is 0 when
+    // no slot is empty or the tier holds the expert already.
+    int (*preload_slots)(void * context, int * slots, char * error, size_t error_size);
+    int (*preload)(void * context, const struct kimi_vram_request * request, const void * up, const void * gate,
+                   const void * down, int * copied, char * error, size_t error_size);
 };
 // Optional decode extension: the GPU computes experts that sit in host memory (a RAM cache slot or a ring
 // buffer). How depends on the device, and costs2 says which:

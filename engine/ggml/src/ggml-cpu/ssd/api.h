@@ -11,7 +11,7 @@
 // borrow it only while that backend stays loaded, just as for its other procs.
 namespace ssd { namespace cpu {
 struct api_v2 {
-    uint32_t version;   // 7: selection_snapshot
+    uint32_t version;   // 7: preload; selection_snapshot extension is size-gated
     size_t size;
     decltype(&kimi_cpu_sink_source_size) source_size;
     decltype(&create_configured) create;
@@ -32,6 +32,7 @@ struct api_v2 {
     decltype(&kimi_cpu_sink_prefetch_hint) prefetch_hint;
     decltype(&kimi_cpu_sink_prefill_hint) prefill_hint;
     decltype(&kimi_cpu_sink_vram_reserve) vram_reserve;
+    decltype(&kimi_cpu_sink_preload) preload;
     decltype(&kimi_cpu_prefill_create) prefill_create;
     decltype(&kimi_cpu_prefill_run) prefill_run;
     decltype(&kimi_cpu_prefill_run_activation) prefill_run_activation;
@@ -64,6 +65,7 @@ inline bool valid(const api_v2 * api) noexcept {
         api->prefetch_hint &&
         api->prefill_hint &&
         api->vram_reserve &&
+        api->preload &&
         api->prefill_create &&
         api->prefill_run &&
         api->prefill_run_activation &&

@@ -24,13 +24,6 @@ struct sink_vram {
     // A tier with no residency table holds nothing across layers: it serves grouped prefill alone, decode never calls it.
     bool prefill_only = false;
     bool prefill_job_active = false;
-    // The batched lanes' transient candidates and the per-layer SSD transient cap: the makespan decides by default
-    // (1 route, no cap: a streamed transient holds only a ring slot and a device slot, whatever the count);
-    // The supported profile fixes these thresholds; the learned cost table chooses each lane.
-    int prefill_ram_gpu_min_routes = 1;
-    int prefill_ssd_gpu_min_routes = 1;
-    int prefill_ssd_gpu_max_experts_per_layer = -1; // -1: no cap
-    bool prefill_legacy_schedule = false;
     // The start values of the cost table's lines the sink fits (kimi-prefill-cost.h, kimi_place_table) and the fitted
     // lines. Typed place.costs overlays named priors; each calibrated line reports the same names.
     using prefill_costs = ssd::place::cost_lines;
@@ -50,7 +43,7 @@ struct sink_vram {
     std::vector<kimi_vram_prefill_transient> prefill_transient;
     std::vector<ssd::place::prefill_expert> prefill_policy_experts;
     kimi_vram_prefill_stats prefill_stats = {};
-    uint64_t epoch = 0, ram_drops = 0, ram_drop_blocked = 0, ready_confirmations = 0;
+    uint64_t epoch = 0, ram_drops = 0, ram_drop_blocked = 0, ready_confirmations = 0, ram_swept = 0;
     std::vector<int> ram_leases;
     // Opt-in deferred uploads: the RAM source of an upload that outlives its layer stays leased until collected.
     const kimi_vram_deferred_api * deferred_api = nullptr;
@@ -123,14 +116,12 @@ struct sink_vram {
         }
         prior = cost;
         std::fprintf(stderr,
-            "[kimi_cpu_prefill_cost] rule=%s cpu_fixed_us=%.3f cpu_route_us=%.3f gpu_fixed_us=%.3f "
+            "[kimi_cpu_prefill_cost] rule=makespan cpu_fixed_us=%.3f cpu_route_us=%.3f gpu_fixed_us=%.3f "
             "gpu_route_us=%.3f gpu_host_fixed_us=%.3f gpu_host_route_us=%.3f link_gbps=%.3f pageable_gbps=%.3f "
-            "drive_gbps=%.3f drive_fixed_us=%.3f gpu_token_us=%.3f ram_min_routes=%d ssd_min_routes=%d ssd_limit=%d\n",
-            prefill_legacy_schedule ? "legacy" : "makespan",
+            "drive_gbps=%.3f drive_fixed_us=%.3f gpu_token_us=%.3f\n",
             cost.cpu_fixed_us, cost.cpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us, cost.gpu_host_fixed_us,
             cost.gpu_host_route_us, cost.link_gbps, cost.pageable_gbps, cost.drive_gbps, cost.drive_fixed_us,
-            cost.gpu_token_us, prefill_ram_gpu_min_routes, prefill_ssd_gpu_min_routes,
-            prefill_ssd_gpu_max_experts_per_layer);
+            cost.gpu_token_us);
         if (!bytes) { return; }
         if (!ready_first) { throw std::runtime_error("GPU tier requires READY_FIRST=1 for ordered reduction"); }
         if (!configuration.has_gpu) { throw std::runtime_error("GPU provider was not injected; no fallback"); }
@@ -160,8 +151,9 @@ struct sink_vram {
         }
         if (configuration.gpu.elastic) {
             elastic = configuration.gpu.elastic;
-            if (!elastic || elastic->version != 4 || elastic->size != sizeof(*elastic) ||
-                    !elastic->phase_complete || !elastic->reserve_accumulate || !elastic->reserve) {
+            if (!elastic || elastic->version != 5 || elastic->size != sizeof(*elastic) ||
+                    !elastic->phase_complete || !elastic->reserve_accumulate || !elastic->reserve ||
+                    !elastic->preload_slots || !elastic->preload) {
                 throw std::runtime_error("GPU tier elastic lifecycle ABI mismatch");
             }
         }
@@ -174,7 +166,7 @@ struct sink_vram {
             }
         }
         if (deferred_upload) {
-            if (!async_upload) { throw std::runtime_error("VRAM_DEFERRED_UPLOAD requires ASYNC_UPLOAD=1"); }
+            if (!async_upload) { throw std::runtime_error("deferred VRAM uploads require async uploads"); }
             deferred_api = configuration.gpu.deferred;
             if (!deferred_api || deferred_api->version != 3 || deferred_api->size != sizeof(*deferred_api) ||
                     !deferred_api->admit || !deferred_api->collect || !deferred_api->wait) {
@@ -221,8 +213,9 @@ struct sink_vram {
     ~sink_vram() {
         if (host_experts) { std::fprintf(stderr, "[kimi_vram_host_sink] gpu_host_experts=%llu\n", (unsigned long long) host_experts); }
         if (context) { api->destroy(context); }
-        if (exclusive) { std::fprintf(stderr, "[kimi_vram_exclusive] ram_drops=%llu ram_drop_blocked=%llu ready_confirmations=%llu\n",
-            (unsigned long long) ram_drops, (unsigned long long) ram_drop_blocked, (unsigned long long) ready_confirmations); }
+        if (exclusive) { std::fprintf(stderr, "[kimi_vram_exclusive] ram_drops=%llu ram_drop_blocked=%llu ready_confirmations=%llu swept=%llu\n",
+            (unsigned long long) ram_drops, (unsigned long long) ram_drop_blocked, (unsigned long long) ready_confirmations,
+            (unsigned long long) ram_swept); }
         if (deferred_upload) { std::fprintf(stderr, "[kimi_vram_deferred_sink] queued=%llu collected=%llu aborted=%llu stale_leases=%llu\n",
             (unsigned long long) deferred_queued, (unsigned long long) deferred_collected, (unsigned long long) deferred_aborted,
             (unsigned long long) deferred_stale); }
@@ -299,6 +292,29 @@ struct sink_vram {
         const kimi_vram_expert_format f = layers.format(up, down, int32_t(up->ne[0]), int32_t(up->ne[1]));
         char error[512] = {};
         check(elastic->reserve(context, &r, &f, error, sizeof(error)), error);
+    }
+    // At load, after the load's passes (kimi_cpu_sink_preload): the slots no entry holds, a tier made at load having
+    // grown into the card first if its memory settled; 0 without a tier.
+    size_t preload_slots() {
+        if (!context || !elastic) { return 0; }
+        int slots = 0;
+        char error[512] = {};
+        check(elastic->preload_slots(context, &slots, error, sizeof(error)), error);
+        return size_t(std::max(0, slots));
+    }
+    // One expert into an empty slot from its roles in host memory, keyed as decode keys it (sink_cache::key):
+    // false when no slot is empty or the tier holds it already.
+    bool preload(int32_t layer, const sink_request & expert, const void * const * data) {
+        kimi_vram_request r = {};
+        r.layer = layer; r.expert = expert.id; r.weight = 1.0f;
+        for (int role = 0; role < 3; ++role) {
+            const auto k = sink_cache::key(expert.role[role]);
+            r.role[role] = { k.device, k.inode, k.size, k.offset, k.bytes, k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns, k.inode_hi };
+        }
+        int copied = 0;
+        char error[512] = {};
+        check(elastic->preload(context, &r, data[0], data[1], data[2], &copied, error, sizeof(error)), error);
+        return copied != 0;
     }
     void phase_complete(bool decode) {
         if (decode) { prefill_open = false; } // the tier leaves prefill: scratch released, arena grown
@@ -537,12 +553,7 @@ struct sink_vram {
         }
         const bool batched = prefill_batched;
         if (!context || !prefill_enabled || !batched || source.empty()) { return; }
-        const int ram_threshold = prefill_ram_gpu_min_routes;
-        const int ssd_threshold = prefill_ssd_gpu_min_routes;
-        const int ssd_cap = prefill_ssd_gpu_max_experts_per_layer;
-        const bool transient_ready = (ram_threshold || ssd_threshold) &&
-            prefill_api->transient_available(context);
-        if (!transient_ready) { return; }
+        if (!prefill_api->transient_available(context)) { return; }
 
         std::vector<int> token_routes(source.size(), 0);
         std::vector<int> last_token(source.size(), -1);
@@ -559,90 +570,80 @@ struct sink_vram {
         }
         for (size_t i = 0; i < source.size(); ++i) { source[i].prefill_routes = token_routes[i]; }
 
-        if (transient_ready) {
-            // The makespan rule (every batched lane, unless the legacy switch): the layer is placed from the cost
-            // table (kimi-prefill-cost.h, kimi_place_layer), as a decode layer is: the CPU and the GPU at their
-            // measured lines for this pass's size, the copies at the measured rate of their transport (from the
-            // page-locked ring or RAM slot: DMA on the link while the GPU computes; pageable: staged by the GPU's
-            // worker), the drive's line, and the form the reads take (the list schedule when they fit the ring,
-            // the coupled streamed form otherwise). The candidates move in order of routes, and the planner keeps the
-            // fewest within its form's resolution of the lowest time. The reads are then issued in the order the
-            // lanes need them (lane_start_us), so that the lanes overlap. The legacy selector keeps its
-            // fixed 2026-09 fits and serial greedy rule.
-            const bool makespan = batched && !prefill_legacy_schedule;
-            auto expert_bytes = [&source](size_t i) {
-                return source[i].role[0].nbytes + source[i].role[1].nbytes + source[i].role[2].nbytes;
-            };
-            auto ram_movable = [&](size_t i) {
-                return ram_threshold && source[i].cache_hit >= 0 && source[i].cache_lease && token_routes[i] >= ram_threshold;
-            };
-            auto ssd_movable = [&](size_t i) { return ssd_threshold && source[i].cache_hit < 0 && token_routes[i] >= ssd_threshold; };
-            prefill_policy_experts.resize(source.size());
-            for (size_t i = 0; i < source.size(); ++i) {
-                prefill_policy_experts[i] = { source[i].id, source[i].vram_slot >= 0,
-                    source[i].cache_hit >= 0, source[i].cache_lease, expert_bytes(i) };
-            }
-            std::vector<kimi_place_item> items;
-            const ssd::place::prefill_input input = {prefill_policy_experts, token_routes, items, table,
-                batch.ntokens, ram_threshold, ssd_threshold, ssd_cap, ssd_staging_limit, ring_slots, makespan};
-            const auto ranked = ssd::place::rank_prefill(input, batch.gpu_ssd_transient_candidates);
-            if (makespan) {
-                items = place_items(source, [&](size_t i) { return token_routes[i]; },
-                    [&](size_t i) { return ram_movable(i) || ssd_movable(i); }, [](size_t) { return false; });
-            }
-            const auto selected_plan = ssd::place::plan_prefill(input, ranked, prefill_in_place);
-            const auto & placed = selected_plan.placed;
-            size_t ram_selected = 0, ssd_selected = 0;
-            uint64_t ram_selected_routes = 0, ssd_selected_routes = 0;
-            uint64_t ram_selected_bytes = 0, ssd_selected_bytes = 0;
-            for (const auto & item : selected_plan.chosen) {
-                const size_t index = item.index;
-                const int routes = token_routes[index];
-                const uint64_t bytes = expert_bytes(index);
-                kimi_vram_prefill_transient selected = {};
-                selected.request_index = int32_t(index);
-                selected.source = item.source;
-                if (item.source == KIMI_VRAM_PREFILL_TRANSIENT_RAM) {
-                    for (int role = 0; role < 3; ++role) {
-                        selected.role[role] = static_cast<const char *>(cache.data(source[index].cache_hit, role)) + source[index].role[role].data_offset;
-                    }
-                    ++ram_selected;
-                    ram_selected_routes += uint64_t(routes);
-                    ram_selected_bytes += bytes;
-                } else {
-                    source[index].vram_ssd_transient = true;
-                    source[index].vram_ssd_staging = int(ssd_selected++);
-                    ssd_selected_routes += uint64_t(routes);
-                    ssd_selected_bytes += bytes;
-                }
-                prefill_transient.push_back(selected);
-                source[index].vram_transient = true;
-            }
-            if (makespan) {
-                prefill_plan = { true, batch.ntokens, placed.cpu, placed.gpu_lane, placed.link, placed.drive,
-                    placed.fill, placed.overhead, placed.time };
-                // Each lane's predicted start of its experts (the GPU's in selection order, a page-locked copy at its
-                // place on the link; the CPU's in request order), for the reads' issue order.
-                for (size_t i = 0; i < source.size(); ++i) { source[i].lane_start_us = placed.start[i]; }
-            }
-            std::fprintf(stderr,
-                "[kimi_cpu_prefill_schedule] format=%s rule=%s ram_threshold=%d ssd_threshold=%d ssd_limit=%zu "
-                "ram_candidates=%zu ram_selected=%zu ram_selected_routes=%llu ram_upload_bytes=%llu "
-                "ssd_candidates=%zu ssd_selected=%zu ssd_selected_routes=%llu ssd_upload_bytes=%llu "
-                "cpu_backlog_before_us=%.1f cpu_backlog_after_us=%.1f gpu_backlog_before_us=%.1f "
-                "gpu_backlog_after_us=%.1f link_backlog_us=%.1f "
-                "drive_us=%.1f fill_us=%.1f gpu_overhead_us=%.1f ring=%zu form=%s ring_locked=%d in_place=%d "
-                "makespan_before_us=%.1f makespan_after_us=%.1f scratch_available=1 displacement_slots=0\n",
-                "batched", makespan ? "makespan" : "legacy",
-                ram_threshold,ssd_threshold,selected_plan.ssd_limit,
-                selected_plan.ram_candidates,ram_selected,(unsigned long long)ram_selected_routes,
-                (unsigned long long)ram_selected_bytes,selected_plan.ssd_candidates,ssd_selected,
-                (unsigned long long)ssd_selected_routes,(unsigned long long)ssd_selected_bytes,
-                selected_plan.cpu_before,selected_plan.cpu_after,selected_plan.gpu_before,selected_plan.gpu_after,selected_plan.link_after,
-                placed.drive,placed.fill,placed.overhead,ring_slots,selected_plan.in_ring?"ring":"streamed",int(ring_locked),
-                int(prefill_in_place),selected_plan.time_before,selected_plan.time_after);
+        // The makespan rule places the layer from the cost table (kimi-prefill-cost.h, kimi_place_layer), as a
+        // decode layer is placed: the CPU and the GPU at their measured lines for this pass's size, the copies at the measured rate of their transport (from the
+        // page-locked ring or RAM slot: DMA on the link while the GPU computes; pageable: staged by the GPU's
+        // worker), the drive's line, and the form the reads take (the list schedule when they fit the ring,
+        // the coupled streamed form otherwise). The candidates move in order of routes, and the planner keeps the
+        // fewest within its form's resolution of the lowest time. The reads are then issued in the order the
+        // lanes need them (lane_start_us), so that the lanes overlap. An expert moves to the GPU from a leased RAM
+        // entry or from the drive (a streamed transient holds a ring slot and a device slot, whatever the count).
+        auto expert_bytes = [&source](size_t i) {
+            return source[i].role[0].nbytes + source[i].role[1].nbytes + source[i].role[2].nbytes;
+        };
+        auto ram_movable = [&](size_t i) {
+            return source[i].cache_hit >= 0 && source[i].cache_lease && token_routes[i] > 0;
+        };
+        auto ssd_movable = [&](size_t i) { return source[i].cache_hit < 0 && token_routes[i] > 0; };
+        prefill_policy_experts.resize(source.size());
+        for (size_t i = 0; i < source.size(); ++i) {
+            prefill_policy_experts[i] = { source[i].id, source[i].vram_slot >= 0,
+                source[i].cache_hit >= 0, source[i].cache_lease, expert_bytes(i) };
         }
-
+        std::vector<kimi_place_item> items;
+        const ssd::place::prefill_input input = {prefill_policy_experts, token_routes, items, table,
+            batch.ntokens, ssd_staging_limit, ring_slots};
+        const auto counted = ssd::place::count_prefill(input, batch.gpu_ssd_transient_candidates);
+        items = place_items(source, [&](size_t i) { return token_routes[i]; },
+            [&](size_t i) { return ram_movable(i) || ssd_movable(i); }, [](size_t) { return false; });
+        const auto selected_plan = ssd::place::plan_prefill(input, counted, prefill_in_place);
+        const auto & placed = selected_plan.placed;
+        size_t ram_selected = 0, ssd_selected = 0;
+        uint64_t ram_selected_routes = 0, ssd_selected_routes = 0;
+        uint64_t ram_selected_bytes = 0, ssd_selected_bytes = 0;
+        for (const auto & item : selected_plan.chosen) {
+            const size_t index = item.index;
+            const int routes = token_routes[index];
+            const uint64_t bytes = expert_bytes(index);
+            kimi_vram_prefill_transient selected = {};
+            selected.request_index = int32_t(index);
+            selected.source = item.source;
+            if (item.source == KIMI_VRAM_PREFILL_TRANSIENT_RAM) {
+                for (int role = 0; role < 3; ++role) {
+                    selected.role[role] = static_cast<const char *>(cache.data(source[index].cache_hit, role)) + source[index].role[role].data_offset;
+                }
+                ++ram_selected;
+                ram_selected_routes += uint64_t(routes);
+                ram_selected_bytes += bytes;
+            } else {
+                source[index].vram_ssd_transient = true;
+                source[index].vram_ssd_staging = int(ssd_selected++);
+                ssd_selected_routes += uint64_t(routes);
+                ssd_selected_bytes += bytes;
+            }
+            prefill_transient.push_back(selected);
+            source[index].vram_transient = true;
+        }
+        prefill_plan = { true, batch.ntokens, placed.cpu, placed.gpu_lane, placed.link, placed.drive,
+            placed.fill, placed.overhead, placed.time };
+        // Each lane's predicted start of its experts (the GPU's in selection order, a page-locked copy at its
+        // place on the link; the CPU's in request order), for the reads' issue order.
+        for (size_t i = 0; i < source.size(); ++i) { source[i].lane_start_us = placed.start[i]; }
+        std::fprintf(stderr,
+            "[kimi_cpu_prefill_schedule] format=%s rule=makespan ssd_limit=%zu "
+            "ram_candidates=%zu ram_selected=%zu ram_selected_routes=%llu ram_upload_bytes=%llu "
+            "ssd_candidates=%zu ssd_selected=%zu ssd_selected_routes=%llu ssd_upload_bytes=%llu "
+            "cpu_backlog_before_us=%.1f cpu_backlog_after_us=%.1f gpu_backlog_before_us=%.1f "
+            "gpu_backlog_after_us=%.1f link_backlog_us=%.1f "
+            "drive_us=%.1f fill_us=%.1f gpu_overhead_us=%.1f ring=%zu form=%s ring_locked=%d in_place=%d "
+            "makespan_before_us=%.1f makespan_after_us=%.1f scratch_available=1 displacement_slots=0\n",
+            "batched", selected_plan.ssd_limit,
+            selected_plan.ram_candidates,ram_selected,(unsigned long long)ram_selected_routes,
+            (unsigned long long)ram_selected_bytes,selected_plan.ssd_candidates,ssd_selected,
+            (unsigned long long)ssd_selected_routes,(unsigned long long)ssd_selected_bytes,
+            selected_plan.cpu_before,selected_plan.cpu_after,selected_plan.gpu_before,selected_plan.gpu_after,selected_plan.link_after,
+            placed.drive,placed.fill,placed.overhead,ring_slots,selected_plan.in_ring?"ring":"streamed",int(ring_locked),
+            int(prefill_in_place),selected_plan.time_before,selected_plan.time_after);
     }
     void bind_prefill_ssd_transient(size_t request_index, const void * const data[3],
             int (*stage)(void *, int32_t, int) = nullptr, void * context = nullptr) {
@@ -722,7 +723,7 @@ struct sink_vram {
     template <class Table>
     void calibrate_prefill(double cpu_us, const kimi_cpu_sink_prefill_batch & batch, uint64_t read_bytes,
             double read_us, double layer_us, Table table) {
-        if (!prefill_batched || prefill_legacy_schedule || !prefill_plan.valid) { return; }
+        if (!prefill_batched || !prefill_plan.valid) { return; }
         const prefill_plan_state plan = prefill_plan;
         prefill_plan.valid = false;
         // the batched lanes' lines: a one-token pass ran the vector engine and is priced as decode
@@ -863,6 +864,55 @@ struct sink_vram {
     void release_ram_batch(sink_cache & cache) {
         for (int index : ram_leases) { cache.release_lease(index); }
         ram_leases.clear();
+    }
+    // At a decode token's begin, with no layer live: the RAM copies of experts the tier holds ready go, so that an
+    // expert is cached once. A layer's finish drops a copy as its upload lands or its expert is a tier hit (drop_ready);
+    // a copy an executor still held then, and one a prefill seeded into the tier (published at this begin), are found
+    // here. A copy an upload still reads stays until the upload lands: the tier does not hold that one ready yet.
+    void drop_held(sink_cache & cache) {
+        if (!exclusive || !decode || !context || !residency || !cache.arena) { return; }
+        std::vector<int32_t> ids;
+        std::vector<size_t> at;
+        std::vector<uint8_t> held;
+        std::vector<kimi_vram_request> keys;
+        std::vector<size_t> copies;
+        for (size_t li = 0; li < cache.layers.size(); ++li) {
+            const auto & l = cache.layers[li];
+            ids.clear(); at.clear();
+            for (size_t i = l.begin; i < l.begin + l.count && i < cache.entries.size(); ++i) {
+                const auto & e = cache.entries[i];
+                if (e.enabled && e.valid && e.layer_index == li && e.id >= 0) { ids.push_back(e.id); at.push_back(i); }
+            }
+            if (ids.empty()) { continue; }
+            held.assign(ids.size(), 0);
+            residency->held(context, l.id, ids.data(), int(ids.size()), held.data());
+            keys.clear(); copies.clear();
+            for (size_t k = 0; k < ids.size(); ++k) {
+                if (!held[k]) { continue; }
+                kimi_vram_request r = {};
+                r.layer = l.id; r.expert = ids[k]; r.weight = 1.0f;
+                for (int role = 0; role < 3; ++role) {
+                    const auto & s = cache.entries[at[k]].source[role];
+                    r.role[role] = { s.device, s.inode, s.size, s.offset, s.bytes, s.mtime_s, s.mtime_ns, s.ctime_s, s.ctime_ns, s.inode_hi };
+                }
+                keys.push_back(r); copies.push_back(at[k]);
+            }
+            for (size_t first = 0; first < keys.size(); first += 16) {
+                const int n = int(std::min<size_t>(16, keys.size() - first));
+                char error[512] = {};
+                int ready[16] = {};
+                kimi_vram_ready_lease lease = {};
+                check(residency->acquire(context, epoch, keys.data() + first, n, &lease, ready, error, sizeof(error)), error);
+                check(residency->validate(context, &lease, error, sizeof(error)), error);
+                for (int k = 0; k < n; ++k) {
+                    if (!ready[k]) { continue; }
+                    ++ready_confirmations;
+                    const int dropped = cache.drop_entry(copies[first + size_t(k)]);
+                    ram_swept += dropped > 0; ram_drop_blocked += dropped < 0;
+                }
+                check(residency->release(context, &lease, error, sizeof(error)), error);
+            }
+        }
     }
     void drop_ready(sink_cache & cache,const std::vector<sink_request> & source) {
         if (!exclusive || source.empty()) { return; }
