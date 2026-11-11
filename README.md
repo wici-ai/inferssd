@@ -153,3 +153,29 @@ Contributions are welcome, including hardware results and improvements to expert
 Built on [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp), with thanks to their contributors and the model-adaptation community.
 
 InferSSD is licensed under [Apache-2.0](LICENSE); bundled llama.cpp/ggml and other third-party components keep their original licenses and notices; see [NOTICE](NOTICE). Model weights remain subject to their publishers' licenses.
+
+### Experimental DeepSeek residency selection
+
+A context using DeepSeek4.1 with the CUDA SSD expert sink enables a residency
+selection bonus automatically. Other architectures and contexts without that
+path keep it disabled. The context emits one `rsi.design.active` JSON receipt;
+unknown architectures use a null model label and remain disabled. This is an
+internal model option, with no new settings key or command line flag.
+
+Before prefill and every sixteen decode steps, the sink snapshots complete RAM
+and GPU residents using exact file-version/range keys under its owner lock.
+Fixed context buffers feed the router graph: a RAM hit adds 0.2, a GPU hit 0.3,
+and a duplicate earns only 0.3. The checkpoint selection bias stays in place;
+selected-expert mixing weights use the original unbiased probabilities. Cold
+caches contribute zero. Snapshot resolution errors stop execution instead of
+applying stale identities. Payload ownership, cache budgets and fallback expert
+execution stay with their existing owners. Routing and answers can change with
+cache history; snapshots can lag by sixteen steps.
+
+The synthetic selection-bias test covers architecture scope, disabled receipts,
+refresh cadence, source-version rejection, complete residency and duplicate
+accounting. Module layering/layout and host translation-unit checks cover the
+bridge. These checks establish host/source preparation only. CUDA compilation
+and runtime checks on the target device, followed by full-prompt A5/B2 on the
+final source, are still required; experimental activation is not a performance
+or semantic-quality validation. No previous measurements qualify this code.

@@ -168,7 +168,7 @@ struct sink_vram {
         if (!prefill_only) {
             // what the tier holds (the next-layer prefetch asks), and with VRAM_EXCLUSIVE its ready leases
             residency = configuration.gpu.residency;
-            if (!residency || residency->version != 2 || residency->size != sizeof(*residency) || !residency->held ||
+            if (!residency || residency->version != 3 || residency->size != sizeof(*residency) || !residency->held || !residency->held_sources ||
                     (exclusive && (!residency->acquire || !residency->validate || !residency->release))) {
                 throw std::runtime_error("GPU residency ABI missing or incompatible; no fallback");
             }

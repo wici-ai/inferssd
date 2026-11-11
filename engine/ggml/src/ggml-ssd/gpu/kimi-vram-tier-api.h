@@ -76,7 +76,7 @@ struct kimi_vram_tier_api {
 // before it reads an expert into RAM, and the answer may change at the next admission, eviction or resize.
 struct kimi_vram_ready_lease { uint64_t epoch, generation; };
 struct kimi_vram_residency_api {
-    uint32_t version, size;   // 2
+    uint32_t version, size;   // 3: exact source-key selection snapshot
     int (*acquire)(void * context, uint64_t epoch, const struct kimi_vram_request * requests,
                    int count, struct kimi_vram_ready_lease * lease, int * ready,
                    char * error, size_t error_size);
@@ -85,6 +85,8 @@ struct kimi_vram_residency_api {
     int (*release)(void * context, const struct kimi_vram_ready_lease * lease,
                    char * error, size_t error_size);
     void (*held)(void * context, int32_t layer, const int32_t * experts, int count, uint8_t * out);
+    // No lease or allocation; only completed, source-matching payloads count.
+    void (*held_sources)(void * context, const struct kimi_vram_request * requests, int count, uint8_t * out);
 };
 // Optional explicit-format extension, separate from transport ABI 2. The ABI 2
 // prepare/launch entries remain the Kimi-K3 Q3_K/SiTU path. For any other expert

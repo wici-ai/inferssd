@@ -36,6 +36,9 @@ int main() {
     changed = *api;
     changed.request_begin = nullptr;
     if (ssd::cpu::valid(&changed)) { return 8; }
+    changed = *api;
+    changed.selection_snapshot = nullptr;
+    if (ssd::cpu::valid(&changed)) { return 9; }
     std::puts("CPU_EXECUTOR_REGISTRY_ABI_PASS");
     return 0;
 }

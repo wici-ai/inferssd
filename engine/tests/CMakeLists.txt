@@ -127,6 +127,13 @@ add_executable(test-moe-pack-copy-plan ssd/test-moe-pack-copy-plan.cpp)
 add_test(NAME moe_pack_copy_plan COMMAND test-moe-pack-copy-plan)
 set_property(TEST moe_pack_copy_plan PROPERTY LABELS main)
 
+add_executable(test-selection-bias ssd/test-selection-bias.cpp)
+target_compile_features(test-selection-bias PRIVATE cxx_std_17)
+target_include_directories(test-selection-bias PRIVATE ../src ../include ../ggml/src)
+target_link_libraries(test-selection-bias PRIVATE ggml-ssd-host ggml-base)
+add_test(NAME selection_bias COMMAND test-selection-bias)
+set_property(TEST selection_bias PROPERTY LABELS main)
+
 add_executable(test-ssd-model-adapter ssd/test-model-adapter.cpp ../src/ssd/model-adapter.cpp)
 target_compile_features(test-ssd-model-adapter PRIVATE cxx_std_17)
 target_include_directories(test-ssd-model-adapter PRIVATE ../src ../include)

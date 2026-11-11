@@ -702,7 +702,7 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 
 static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
     static const ssd::cpu::api_v2 api = {
-        6, sizeof(ssd::cpu::api_v2),
+        7, sizeof(ssd::cpu::api_v2),
         &kimi_cpu_sink_source_size,
         &ssd::cpu::create_configured,
         &kimi_cpu_sink_run,
@@ -729,6 +729,7 @@ static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
         &ssd::cpu::take_room_configured,
         &ggml_backend_cpu_set_ssd_runtime_services,
         sizeof(ssd::runtime_services),
+        &kimi_cpu_sink_selection_snapshot,
     };
     return &api;
 }

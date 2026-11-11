@@ -171,6 +171,11 @@ public:
         return layer>=0 && size_t(layer)<layers.size() && expert>=0 && size_t(expert)<layers[layer].held.size() &&
             layers[layer].held[size_t(expert)]>0;
     }
+    bool selection_holds(const kimi_vram_request & request) const {
+        if (request.layer < 0 || size_t(request.layer) >= layers.size() || request.expert < 0 ||
+                size_t(request.expert) >= layers[size_t(request.layer)].keyed.size()) { return false; }
+        return find(request, [](const entry & e) { return e.valid; }) >= 0;
+    }
     static bool held_by(const entry & e) { return e.valid || (e.uploading && !e.seed); }
     template<class F> void change(entry & e,F && update) {
         const uint32_t slot=uint32_t(&e-slots.data());

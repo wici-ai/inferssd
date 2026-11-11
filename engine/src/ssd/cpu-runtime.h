@@ -2,6 +2,8 @@
 
 #include "ggml-cpu/ssd/cpu-sink.h"
 #include "cpu-prefill.h"
+#include "selection-bias.h"
+#include <array>
 #include "ggml-ssd/settings/settings.h"
 #include "ggml-ssd/telemetry/telemetry.h"
 #include "ggml-ssd/store/source.h"
@@ -48,6 +50,11 @@ struct llama_kimi_cpu_sink_runtime {
     const ssd::runtime_services & services;
     const ssd::store::source_view source;
     std::mutex mutex;
+    const llama_selection_bias_options selection_bias;
+    const int selection_count;
+    std::vector<std::array<const ggml_tensor *, 3>> selection_experts;
+    std::vector<float> selection_values;
+    llama_selection_bias_schedule selection_schedule;
     kimi_cpu_sink * sink = nullptr;
     llama_kimi_cpu_prefill_runtime prefill;
     decltype(&kimi_cpu_sink_run) run = nullptr;
@@ -76,7 +83,7 @@ struct llama_kimi_cpu_sink_runtime {
     std::vector<int32_t> layer_priority;
     // Expert tensor shapes of every layer, so that the sink's next-layer prefetch can resolve the next layer's
     // experts while the current layer's node is active: name -> (bytes per expert, experts).
-    std::map<std::string, std::pair<size_t, int64_t>> expert_shapes;
+    std::map<std::string, std::pair<size_t, int64_t>, std::less<>> expert_shapes;
     decltype(&kimi_cpu_sink_prefetch_hint) prefetch_hint = nullptr; // optional
     decltype(&kimi_cpu_sink_prefill_hint) prefill_hint = nullptr;
     bool sequence_known = false;
@@ -93,8 +100,10 @@ struct llama_kimi_cpu_sink_runtime {
     llama_kimi_cpu_sink_runtime(int n_layers, uint64_t context_epoch,
             int64_t n_expert, const std::vector<int32_t> & routed_layers,
             const ssd::settings::snapshot & configured, const ssd::runtime_services & runtime_services,
-            ssd::store::source_view source_view)
-        : settings(configured), services(runtime_services), source(source_view), epoch(context_epoch) {
+            ssd::store::source_view source_view, llama_selection_bias_options bias = {})
+        : settings(configured), services(runtime_services), source(source_view), selection_bias(bias),
+          selection_count(int(n_expert)), selection_values(bias.enabled ? size_t(n_layers) * size_t(n_expert) : 0, 0.0f),
+          epoch(context_epoch) {
         if (n_expert <= 0) { throw std::runtime_error("CPU sink requires a positive routed expert count"); }
         // Supported v0.1 profile: resource-sized RAM cache, model-order priority,
         // fixed eight-expert read ring.
@@ -127,10 +136,9 @@ struct llama_kimi_cpu_sink_runtime {
     static bool resolve_source(void * userdata, const char * tensor_name, int32_t expert,
             kimi_cpu_sink_source * source) {
         auto & runtime = *static_cast<llama_kimi_cpu_sink_runtime *>(userdata);
-        if (!runtime.active_node || !runtime.source.resolve || !source) {
+        if (!runtime.source.resolve || !source) {
             return false;
         }
-        const auto & node = *runtime.active_node;
         auto range = [&](size_t logical_nbytes, int64_t experts) {
             *source = {};
             if (!runtime.source.resolve(runtime.source.userdata, tensor_name, expert, logical_nbytes, experts,
@@ -142,9 +150,10 @@ struct llama_kimi_cpu_sink_runtime {
             source->nbytes = (source->data_offset + logical_nbytes + 4095) / 4096 * 4096;
             return true;
         };
-        for (const ggml_tensor * tensor : { &node.up, &node.gate, &node.down }) {
-            if (std::strcmp(tensor_name, tensor->name) == 0) {
-                return range(tensor->nb[2], tensor->ne[2]);
+        if (runtime.active_node) {
+            const auto & node = *runtime.active_node;
+            for (const ggml_tensor * tensor : { &node.up, &node.gate, &node.down }) {
+                if (std::strcmp(tensor_name, tensor->name) == 0) { return range(tensor->nb[2], tensor->ne[2]); }
             }
         }
         const auto shape = runtime.expert_shapes.find(tensor_name);
@@ -152,6 +161,28 @@ struct llama_kimi_cpu_sink_runtime {
             return range(shape->second.first, shape->second.second);
         }
         return false;
+    }
+
+    // Called at serialized graph boundaries, after begin and before set_inputs. No graph-time allocation.
+    void refresh_selection(bool decode) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!selection_bias.enabled) { return; }
+        if (!selection_schedule.refresh(decode)) { return; }
+        std::fill(selection_values.begin(), selection_values.end(), 0.0f);
+        if (!sink) { return; } // cold load retains the checkpoint router
+        uint8_t ram[1024] = {}, gpu[1024] = {};
+        if (selection_count > 1024) { GGML_ABORT("selection snapshot expert count exceeds bound"); }
+        for (size_t il = 0; il < selection_experts.size(); ++il) {
+            const auto & experts = selection_experts[il];
+            if (!experts[0] || !experts[1] || !experts[2]) { continue; }
+            char error[256] = {};
+            if (!cpu_api->selection_snapshot(sink, experts.data(), selection_count, ram, gpu, error, sizeof(error))) {
+                GGML_ABORT("selection snapshot failed: %s", error);
+            }
+            for (int e = 0; e < selection_count; ++e) {
+                selection_values[il * size_t(selection_count) + size_t(e)] = llama_selection_bias_options::bonus(ram[e], gpu[e]);
+            }
+        }
     }
 
     void bind_provider(ggml_backend_reg_t registry) {

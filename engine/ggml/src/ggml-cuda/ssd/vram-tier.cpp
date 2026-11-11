@@ -2411,6 +2411,10 @@ struct tier {
     }
     // The residency ABI's held(): under lifecycle_mutex, which every resize from another thread (host or OOM reclaim,
     // a prefill's seeds) takes.
+    void held_sources(const kimi_vram_request * requests,int count,uint8_t * out){
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        for(int i=0;i<count;++i)out[i]=table && table->selection_holds(requests[i]);
+    }
     void held(int32_t layer,const int32_t * experts,int count,uint8_t * out){
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         for(int i=0;i<count;++i)out[i]=table && table->holds(layer,experts[i]);
@@ -2492,6 +2496,11 @@ int residency_release(void * p,const kimi_vram_ready_lease * lease,char * e,size
 void residency_held(void * p,int32_t layer,const int32_t * experts,int count,uint8_t * out){
     if(!out || count<=0)return;
     std::fill(out,out+count,uint8_t(0));if(p && experts)static_cast<tier *>(p)->held(layer,experts,count,out);}
+void residency_held_sources(void * p,const kimi_vram_request * requests,int count,uint8_t * out){
+    if(!out || count<=0)return;
+    std::fill(out,out+count,uint8_t(0));
+    if(p && requests)static_cast<tier *>(p)->held_sources(requests,count,out);
+}
 int host_available(void * p){return p && static_cast<tier *>(p)->format_mode;}
 int host_launch(void * p,const kimi_vram_host_job * jobs,int count,int * accepted,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->launch_host(jobs,count,accepted);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
@@ -2620,8 +2629,8 @@ extern "C" const kimi_vram_tier_api * kimi_vram_tier_get_api(){
     static const kimi_vram_tier_api api={2,sizeof(kimi_vram_tier_api),api_create,api_destroy,api_begin,api_prepare,api_launch,api_admit,api_finish,api_cancel};return &api;
 }
 extern "C" const kimi_vram_residency_api * kimi_vram_residency_get_api(){
-    static const kimi_vram_residency_api api={2,sizeof(kimi_vram_residency_api),residency_acquire,residency_validate,residency_release,
-        residency_held};return &api;
+    static const kimi_vram_residency_api api={3,sizeof(kimi_vram_residency_api),residency_acquire,residency_validate,residency_release,
+        residency_held,residency_held_sources};return &api;
 }
 extern "C" const kimi_vram_deferred_api * kimi_vram_deferred_get_api(){
     static const kimi_vram_deferred_api api={3,sizeof(kimi_vram_deferred_api),deferred_admit,deferred_collect,deferred_wait};return &api;

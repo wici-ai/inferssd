@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "ssd/options.h"
+#include "ssd/selection-bias.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -365,6 +366,7 @@ private:
     bool dense_gpu_prefill_phase_active = false;
     int dense_gpu_scheduler_graph_phase = 0;
     bool cpu_sink_enabled = false;
+    llama_selection_bias_options selection_bias;
     uint32_t cpu_prefill_max_tokens = 0; // prefill ubatches up to this size run on the CPU sink
     bool cpu_prefill_hint = false; // a sink prefill predicts each next layer's routes for its read-ahead
     // the threshold of this request: cpu_prefill_max_tokens, or the request's size when the graph does not fit

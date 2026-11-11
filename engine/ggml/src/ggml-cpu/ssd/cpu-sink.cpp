@@ -4226,6 +4226,53 @@ extern "C" bool kimi_cpu_sink_vram_reserve(struct kimi_cpu_sink * sink, const st
     catch (const std::exception & e) { sink_error(error, error_size, e.what()); return false; }
 }
 
+extern "C" bool kimi_cpu_sink_selection_snapshot(struct kimi_cpu_sink * sink,
+        const ggml_tensor * const * experts, int count, uint8_t * ram, uint8_t * gpu,
+        char * error, size_t error_size) {
+    sink_error(error, error_size, "");
+    if (!sink || !experts || !ram || !gpu || count <= 0 || count > 1024 ||
+            !experts[0] || !experts[1] || !experts[2] || count != experts[0]->ne[2]) {
+        sink_error(error, error_size, "invalid selection snapshot"); return false;
+    }
+    std::fill(ram, ram + count, uint8_t(0)); std::fill(gpu, gpu + count, uint8_t(0));
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
+    sink->prefetch_drain(); sink->lookahead_quiesce();
+    try {
+        const int layer = ssd::host::routed_layer(experts[0]);
+        if (layer < 0) { throw std::runtime_error("selection snapshot requires a routed layer"); }
+        int known_fd[3] = { -1, -1, -1 };
+        ssd::platform::file_identity known_file[3];
+        for (int expert = 0; expert < count; ++expert) {
+            sink_request request = {}; request.id = expert;
+            kimi_vram_request key = {}; key.layer = layer; key.expert = expert;
+            for (int role = 0; role < 3; ++role) {
+                auto & source = request.role[role];
+                // Bypass the per-token identity memo: a snapshot binds the source as it exists now.
+                if (!sink->resolver(sink->userdata, experts[role]->name, expert, &source)) {
+                    throw std::runtime_error("cannot resolve selection snapshot source");
+                }
+                if (known_fd[role] != source.fd_direct) {
+                    if (!ssd::platform::identity(source.fd_direct, known_file[role])) {
+                        throw std::runtime_error("cannot identify selection snapshot source");
+                    }
+                    known_fd[role] = source.fd_direct;
+                }
+                source.file = known_file[role];
+                key.role[role] = kimi_vram_source_identity(source.file, source.offset + source.data_offset,
+                    source.payload_nbytes ? source.payload_nbytes : source.nbytes);
+            }
+            ram[expert] = sink->cache.selection_holds(layer, request);
+            if (sink->vram.context && sink->vram.residency && sink->vram.residency->held_sources) {
+                sink->vram.residency->held_sources(sink->vram.context, &key, 1, gpu + expert);
+            }
+        }
+        return true;
+    } catch (const std::exception & e) {
+        std::fill(ram, ram + count, uint8_t(0)); std::fill(gpu, gpu + count, uint8_t(0));
+        sink_error(error, error_size, e.what()); return false;
+    }
+}
+
 extern "C" void kimi_cpu_sink_cache_get_stats(struct kimi_cpu_sink * sink, kimi_cpu_sink_cache_stats * stats) {
     if (!stats) { return; }
     *stats = {};

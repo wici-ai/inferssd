@@ -130,3 +130,12 @@ External runtime dependencies
 
 Binary distributions built with CUDA must comply with the NVIDIA CUDA runtime
 terms.
+
+Cache-residency selection bonus concept
+--------------------------------------
+The DeepSeek-only selection-bias experiment is an independent implementation
+of the RAM/GPU residency selection bonus described by Niko1221/Strata PR 5596,
+revision 4294e6aaf398c7612b1e943f7947b94a95292350:
+https://github.com/Niko1221/Strata/pull/5596
+No Strata kernels, pack formats or source text are included. Existing bundled
+llama.cpp and ggml copyright and MIT notices continue to apply.

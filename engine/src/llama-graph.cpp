@@ -27,6 +27,20 @@
 #include <sstream>
 #include <unordered_set>
 
+class llm_graph_input_selection_bias final : public llm_graph_input_i {
+public:
+    llama_kimi_cpu_sink_runtime * runtime;
+    ggml_tensor * tensor;
+    int layer;
+    llm_graph_input_selection_bias(llama_kimi_cpu_sink_runtime * r, ggml_tensor * t, int il)
+        : runtime(r), tensor(t), layer(il) {}
+    void set_input(const llama_ubatch *) override {
+        ggml_backend_tensor_set(tensor, runtime->selection_values.data() + size_t(layer) * runtime->selection_count,
+            0, size_t(runtime->selection_count) * sizeof(float));
+    }
+    bool can_reuse(const llm_graph_params & params) override { return params.cpu_sink_runtime == runtime; }
+};
+
 // dedup helpers
 
 static ggml_tensor * build_attn_inp_kq_mask(
@@ -1792,6 +1806,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (exp_probs_b != nullptr) {
         selection_probs = ggml_add(ctx0, probs, exp_probs_b);
         cb(selection_probs, "ffn_moe_probs_biased", il);
+    }
+
+    if (arch == LLM_ARCH_DEEPSEEK41 && cpu_sink_runtime && cpu_sink_runtime->selection_bias.enabled) {
+        GGML_ASSERT(n_expert == cpu_sink_runtime->selection_count);
+        auto * bias = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_expert, 1);
+        ggml_set_input(bias);
+        ggml_set_name(bias, "residency_selection_bias");
+        res->add_input(std::make_unique<llm_graph_input_selection_bias>(cpu_sink_runtime, bias, il));
+        selection_probs = ggml_add(ctx0, selection_probs, bias);
+        cb(selection_probs, "ffn_moe_residency_selection", il);
     }
 
     // llama4 doesn't have exp_probs_b, and sigmoid is only used after top_k

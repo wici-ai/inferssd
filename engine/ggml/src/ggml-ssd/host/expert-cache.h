@@ -1095,8 +1095,20 @@ struct expert_cache {
         for (int r = 0; r < role; ++r) { offset += role_bytes[r]; }
         return arena + offset;
     }
-    // Whether the layer's slots hold the expert or a read of it is on its way. Changes nothing: the next-layer
-    // prefetch's statistics ask it for every rank of a hint, read or not.
+    // A complete resident matching every immutable source field; pending reads earn no selection bonus.
+    bool selection_holds(int32_t layer_id, const expert_request & request) const {
+        if (!arena || !(active || prefill_read)) { return false; }
+        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
+        if (found == layers.end()) { return false; }
+        const size_t layer_index = size_t(found - layers.begin());
+        for (size_t i = found->begin; i < found->begin + found->count; ++i) {
+            const auto & e = entries[i];
+            if (e.enabled && e.valid && e.resident && !e.inflight && e.layer_index == layer_index &&
+                    e.id == request.id && matches(e, request)) { return true; }
+        }
+        return false;
+    }
+    // Next-layer prefetch also counts experts whose read is still on its way.
     bool holds(int32_t layer_id, int32_t expert) const {
         if (!active || !arena) { return false; }
         const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });

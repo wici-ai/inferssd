@@ -304,6 +304,12 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        bool cuda_sink = false;
+        for (const auto & backend : backends) {
+            auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+            cuda_sink = cuda_sink || std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+        }
+        selection_bias = llama_selection_bias_options::activate(model.arch, cpu_sink_enabled && cuda_sink);
         if (ssd_runtime) {
             for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get()); }
             // After the backends: the sink has a GPU tier only when one of them injected its provider.
@@ -317,8 +323,11 @@ llama_context::llama_context(
                 }
                 cpu_sink_runtime = std::make_unique<llama_kimi_cpu_sink_runtime>(model.hparams.n_layer,
                     kimi_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
-                    int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
-                if (*ssd_runtime->settings.integer("prefetch.depth") > 0) {
+                    int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources, selection_bias);
+                for (const auto & layer : model.layers) {
+                    cpu_sink_runtime->selection_experts.push_back({layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps});
+                }
+                if (selection_bias.enabled || *ssd_runtime->settings.integer("prefetch.depth") > 0) {
                     for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
                         const auto & layer = model.layers[il];
                         for (const ggml_tensor * experts : {layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
@@ -1791,16 +1800,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
-    // set the input data for the input tensors
-    {
-        //const auto t_start_us = ggml_time_us();
-
-        // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
-    }
-
     // Phase/token tracking is also required by a VRAM-only tier and by
     // zero-cache profiling. The runtime skips this when all are disabled.
     if (cpu_sink_cache_batch_decode && cpu_sink_runtime) {
@@ -1815,6 +1814,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         cpu_sink_runtime->begin(registry, cache_decode ? static_cast<uint64_t>(ubatch.pos[0]) : 0,
             cache_decode, cache_decode ? ubatch.seq_id[0][0] : 0);
     }
+    if (cpu_sink_runtime && selection_bias.enabled && !cparams.warmup) {
+        ggml_backend_sched_synchronize(sched.get());
+        cpu_sink_runtime->refresh_selection(cpu_sink_cache_batch_decode && ubatch.n_tokens == 1);
+    }
+    // set the input data for the input tensors
+    {
+        //const auto t_start_us = ggml_time_us();
+
+        // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        res->set_inputs(&ubatch);
+
+        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, mctx);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
