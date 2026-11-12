@@ -12,6 +12,7 @@
 #include "../../ggml-ssd/platform/threads.h"
 #include <cuda_runtime_api.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <condition_variable>
@@ -113,8 +114,13 @@ struct tier {
     // The model's expert formats (kimi_vram_expert_format's per-layer types, fixed by the first call): each its role
     // bytes and its decode engine. A slot holds an expert of any of them: stride is the largest one's. layer_format:
     // a layer ID's format; cur: the format of the layer being prepared, which its jobs on the worker run with.
-    struct expert_format { int weight_type=-1,down_type=-1; size_t role_bytes[3]={},bytes=0; void * engine=nullptr; };
+    // payload: a role's logical bytes; role_bytes: the role as a slot lays it out, rounded up to 4 KiB.
+    struct expert_format { int weight_type=-1,down_type=-1; size_t role_bytes[3]={},payload[3]={},bytes=0; void * engine=nullptr; };
     std::vector<expert_format> formats;std::vector<int> layer_format;size_t cur=0,stride=0;int declared_layers=0;
+    // Per format and role (3 * format + role): the bytes the format's requests name the role by, set once by the first
+    // (0 before one does). The sink's thread sets it; the upload threads read it for the copies of that format's
+    // experts, which only follow a request of the format.
+    std::unique_ptr<std::atomic<size_t>[]> named;
     char * arena=nullptr;cudaStream_t upload_stream=nullptr;
     struct arena_block { char * data=nullptr;size_t first_slot=0,slot_count=0; };
     std::vector<arena_block> blocks;
@@ -462,6 +468,40 @@ struct tier {
     static vram_compute_expert roles_at(const char * base,const expert_format & f){
         return {base,base+f.role_bytes[0],base+f.role_bytes[0]+f.role_bytes[1]};
     }
+    // A request names a role by its payload (the sink keys and reads a GGUF expert's logical bytes) or by its padded
+    // size, as a pack lays it out, and its source holds that many bytes. The format's first request fixes which; a
+    // later one that names a role otherwise is refused with `refused`, as one that names neither.
+    void name_roles(size_t k,const kimi_vram_source * role,const char * refused){
+        const expert_format & f=formats.at(k);
+        for(int i=0;i<3;++i){
+            const size_t was=named[3*k+size_t(i)].load(std::memory_order_acquire);
+            if((role[i].bytes!=f.payload[i] && role[i].bytes!=f.role_bytes[i]) || (was && role[i].bytes!=was))
+                throw std::runtime_error(refused);
+        }
+        for(int i=0;i<3;++i){
+            size_t was=0;
+            if(!named[3*k+size_t(i)].compare_exchange_strong(was,role[i].bytes,std::memory_order_acq_rel) && was!=role[i].bytes)
+                throw std::runtime_error(refused);
+        }
+    }
+    // The bytes a copy of a role of `f` (one of `formats`) moves: as its requests name it, its payload before one does.
+    size_t moved(const expert_format & f,int role) const{
+        const size_t k=size_t(&f-formats.data());
+        const size_t n=k<formats.size() && named?named[3*k+size_t(role)].load(std::memory_order_acquire):0;
+        return n?n:f.payload[role];
+    }
+    size_t moved_bytes(const expert_format & f) const{return moved(f,0)+moved(f,1)+moved(f,2);}
+    // An expert's three roles into `dst` as its format lays them out: each role's named bytes copied, the rest of the
+    // role zeroed. A sink's source holds the payload only (Q6_K down of 2304 x 5120 is 9676800 bytes, 2 KiB short of
+    // its padded role).
+    void copy_roles(char * dst,const void * const src[3],const expert_format & f,cudaMemcpyKind kind,cudaStream_t stream) const{
+        for(int i=0;i<3;++i){
+            const size_t n=moved(f,i);
+            cuda_check(cudaMemcpyAsync(dst,src[i],n,kind,stream));
+            if(f.role_bytes[i]>n)cuda_check(cudaMemsetAsync(dst+n,0,f.role_bytes[i]-n,stream));
+            dst+=f.role_bytes[i];
+        }
+    }
     bool has_storage() const{return arena || !blocks.empty();}
     char * slot_base(size_t slot) const{
         if(!table || slot>=table->slots.size())throw std::runtime_error("VRAM slot address out of range");
@@ -568,14 +608,10 @@ struct tier {
         cudaEvent_t & done_event=sink_seed_events[size_t(request)];
         if(!done_event)cuda_check(cudaEventCreateWithFlags(&done_event,cudaEventDisableTiming));
         const cudaMemcpyKind kind=host_readable?cudaMemcpyDeviceToDevice:cudaMemcpyHostToDevice;
-        size_t offset=0;
-        for(int role=0;role<3;++role){
-            cuda_check(cudaMemcpyAsync(slot_base(size_t(s->slot))+offset,data[role],F.role_bytes[role],kind,seed_host_stream));
-            offset+=F.role_bytes[role];
-        }
+        copy_roles(slot_base(size_t(s->slot)),data,F,kind,seed_host_stream);
         cuda_check(cudaEventRecord(done_event,seed_host_stream));
         sink_seed_pending[size_t(request)]=1;
-        s->roles=7;seed_copies+=3;seed_bytes+=offset;
+        s->roles=7;seed_copies+=3;seed_bytes+=moved_bytes(F);
     }
     void wait_host_seed(int32_t request){
         if(request<0 || size_t(request)>=sink_seed_pending.size() || !sink_seed_pending[size_t(request)])return;
@@ -945,17 +981,22 @@ struct tier {
         if(!table || !has_storage() || poisoned || active || prefill_live)return false;
         const expert_format * x=format_of(r.layer);
         if(!x)return false;
-        for(int role=0;role<3;++role)if(!data[role] || r.role[role].bytes!=x->role_bytes[role])
-            throw std::runtime_error("preloaded expert has another layout than its layer's format");
+        static const char * const refused="preloaded expert has another layout than its layer's format";
+        for(int role=0;role<3;++role)if(!data[role])throw std::runtime_error(refused);
+        name_roles(size_t(x-formats.data()),r.role,refused); // the sink names the roles as decode does: their payload
         const int slot=table->reserve_preload(r);
         if(slot<0)return false;
         try{
             cuda_check(cudaSetDevice(device));
-            size_t offset=0;
+            char * dst=slot_base(size_t(slot));
+            bool padded=false;
             for(int role=0;role<3;++role){
-                cuda_check(cudaMemcpy(slot_base(size_t(slot))+offset,data[role],x->role_bytes[role],cudaMemcpyDefault));
-                offset+=x->role_bytes[role];
+                const size_t n=moved(*x,role); // what the source holds: a GGUF role's payload, short of the padded role
+                cuda_check(cudaMemcpy(dst,data[role],n,cudaMemcpyDefault));
+                if(x->role_bytes[role]>n){cuda_check(cudaMemset(dst+n,0,x->role_bytes[role]-n));padded=true;}
+                dst+=x->role_bytes[role];
             }
+            if(padded)cuda_check(cudaStreamSynchronize(nullptr)); // the memsets, before a tier stream reads the slot
         }catch(...){table->cancel_upload(size_t(slot),r);throw;}
         table->publish_cold_prefill(size_t(slot),r);
         return true;
@@ -1309,13 +1350,9 @@ struct tier {
                         if(!seed_stream)cuda_check(cudaStreamCreateWithFlags(&seed_stream,cudaStreamNonBlocking));
                         while(lane_seed_events.size()<=i){cudaEvent_t e=nullptr;cuda_check(cudaEventCreateWithFlags(&e,cudaEventDisableTiming));lane_seed_events.push_back(e);}
                         cuda_check(cudaStreamWaitEvent(seed_stream,done,0));
-                        size_t offset=0;
-                        for(int role=0;role<3;++role){
-                            cuda_check(cudaMemcpyAsync(slot_base(size_t(s->slot))+offset,job.role[role],F.role_bytes[role],cudaMemcpyDeviceToDevice,seed_stream));
-                            offset+=F.role_bytes[role];
-                        }
+                        {const void * const src[3]={job.role[0],job.role[1],job.role[2]};copy_roles(slot_base(size_t(s->slot)),src,F,cudaMemcpyDeviceToDevice,seed_stream);}
                         back=lane_seed_events[i];cuda_check(cudaEventRecord(back,seed_stream));
-                        s->roles=7;seed_copies+=3;seed_bytes+=offset;
+                        s->roles=7;seed_copies+=3;seed_bytes+=moved_bytes(F);
                     }
                     if(job.stage)handback.back().second=back;
                     continue;
@@ -1331,17 +1368,14 @@ struct tier {
                 char * dst=prefill_transient_arena+slot*stride;
                 const auto copy_start=clock_type::now();
                 cuda_check(cudaEventRecord(group_dma[2*i],upload_stream));
-                for(int role=0;role<3;++role){
-                    cuda_check(cudaMemcpyAsync(dst+(role==0?0:role==1?F.role_bytes[0]:F.role_bytes[0]+F.role_bytes[1]),job.role[role],
-                        F.role_bytes[role],cudaMemcpyHostToDevice,upload_stream));
-                }
+                {const void * const src[3]={job.role[0],job.role[1],job.role[2]};copy_roles(dst,src,F,cudaMemcpyHostToDevice,upload_stream);}
                 cuda_check(cudaEventRecord(group_dma[2*i+1],upload_stream));
                 staged_us[i]=micros(copy_start); // a pageable copy is staged by this call: the copy's time
                 if(pending_seed * s=sink_seed(job.request_index)){
                     // the seed from the arena slot, on the device: ordered before the next copy into that arena slot
                     const size_t bytes=F.role_bytes[0]+F.role_bytes[1]+F.role_bytes[2];
                     cuda_check(cudaMemcpyAsync(slot_base(size_t(s->slot)),dst,bytes,cudaMemcpyDeviceToDevice,upload_stream));
-                    s->roles=7;seed_copies+=3;seed_bytes+=bytes;
+                    s->roles=7;seed_copies+=3;seed_bytes+=moved_bytes(F);
                 }
                 const vram_compute_expert w=roles_at(dst,F);
                 if(group_api->compute(group,g,&w,group_dma[2*i+1],&done,error,sizeof(error)))throw std::runtime_error(error[0]?error:"grouped prefill compute failed");
@@ -1377,13 +1411,13 @@ struct tier {
                 if(!timed)(void)cudaGetLastError();
                 const double us=locked[i]?(timed?1e3*double(ms):0.0):staged_us[i];
                 prefill_job_stats.transient_dma_us+=timed?1e3*double(ms):us;
-                prefill_job_stats.transient_upload_us+=us;prefill_job_stats.transient_upload_bytes+=F.bytes;
+                prefill_job_stats.transient_upload_us+=us;prefill_job_stats.transient_upload_bytes+=moved_bytes(F);
                 if(prefill_transient[i].source==KIMI_VRAM_PREFILL_TRANSIENT_RAM){
-                    prefill_job_stats.ram_transient_upload_us+=us;prefill_job_stats.ram_transient_upload_bytes+=F.bytes;
+                    prefill_job_stats.ram_transient_upload_us+=us;prefill_job_stats.ram_transient_upload_bytes+=moved_bytes(F);
                 }else{
-                    prefill_job_stats.ssd_transient_upload_us+=us;prefill_job_stats.ssd_transient_upload_bytes+=F.bytes;
+                    prefill_job_stats.ssd_transient_upload_us+=us;prefill_job_stats.ssd_transient_upload_bytes+=moved_bytes(F);
                 }
-                if(us>0){std::lock_guard<std::mutex> lock(mutex);(locked[i]?locked_copies:pageable_copies).add(double(F.bytes)/1e6,us);}
+                if(us>0){std::lock_guard<std::mutex> lock(mutex);(locked[i]?locked_copies:pageable_copies).add(double(moved_bytes(F))/1e6,us);}
             }
         }catch(...){
             // a ring payload cannot be reused while a copy or a chain may still read it
@@ -1471,22 +1505,20 @@ struct tier {
                     const bool locked=page_locked(transient.role[0]);
                     char * dst=prefill_transient_arena;
                     const auto upload_start=clock_type::now();
-                    for(int role=0;role<3;++role){
-                        cuda_check(cudaMemcpyAsync(dst,transient.role[role],F.role_bytes[role],cudaMemcpyHostToDevice,upload_stream));
-                        dst+=F.role_bytes[role];
-                    }
+                    {const void * const src[3]={transient.role[0],transient.role[1],transient.role[2]};
+                        copy_roles(dst,src,F,cudaMemcpyHostToDevice,upload_stream);}
                     cuda_check(cudaStreamSynchronize(upload_stream));
                     const double upload_elapsed=micros(upload_start);
-                    {std::lock_guard<std::mutex> lock(mutex);(locked?locked_copies:pageable_copies).add(double(F.bytes)/1e6,upload_elapsed);}
+                    {std::lock_guard<std::mutex> lock(mutex);(locked?locked_copies:pageable_copies).add(double(moved_bytes(F))/1e6,upload_elapsed);}
                     prefill_job_stats.transient_dma_us+=upload_elapsed;prefill_job_stats.transient_wait_us+=upload_elapsed;
                     prefill_job_stats.transient_upload_us+=upload_elapsed;
-                    prefill_job_stats.transient_upload_bytes+=F.bytes;
+                    prefill_job_stats.transient_upload_bytes+=moved_bytes(F);
                     if(transient.source==KIMI_VRAM_PREFILL_TRANSIENT_RAM){
                         prefill_job_stats.ram_transient_upload_us+=upload_elapsed;
-                        prefill_job_stats.ram_transient_upload_bytes+=F.bytes;
+                        prefill_job_stats.ram_transient_upload_bytes+=moved_bytes(F);
                     }else{
                         prefill_job_stats.ssd_transient_upload_us+=upload_elapsed;
-                        prefill_job_stats.ssd_transient_upload_bytes+=F.bytes;
+                        prefill_job_stats.ssd_transient_upload_bytes+=moved_bytes(F);
                     }
                     hand_back();
                     weights=roles_at(prefill_transient_arena,F);
@@ -1549,16 +1581,16 @@ struct tier {
                 if(!host_readable){cudaPointerAttributes attr{};
                     if(cudaPointerGetAttributes(&attr,data[0])==cudaSuccess)locked=attr.type==cudaMemoryTypeHost;else (void)cudaGetLastError();}
                 char * dst=slot_base(size_t(slot));
-                for(int i=0;i<3;++i){cuda_check(cudaMemcpyAsync(dst,data[i],F.role_bytes[i],cudaMemcpyHostToDevice,deferred_stream));dst+=F.role_bytes[i];}
+                copy_roles(dst,data,F,cudaMemcpyHostToDevice,deferred_stream);
                 cuda_check(cudaStreamSynchronize(deferred_stream));
             }
             catch(const std::exception & e){error_text=e.what();}
             lock.lock();
             const auto job=std::find_if(deferred.begin(),deferred.end(),[&](const deferred_job & d){return d.id==id;});
             if(job!=deferred.end())job->completed=true;
-            if(error_text.empty()){const double us=micros(t);upload_us+=us;++uploads;upload_bytes+=F.bytes;++borrowed_uploads;
+            if(error_text.empty()){const double us=micros(t);upload_us+=us;++uploads;upload_bytes+=moved_bytes(F);++borrowed_uploads;
                 upload_us_per_expert=upload_us_per_expert>0?0.9*upload_us_per_expert+0.1*us:us;
-                (locked?locked_copies:pageable_copies).add(double(F.bytes)/1e6,us);}
+                (locked?locked_copies:pageable_copies).add(double(moved_bytes(F))/1e6,us);}
             else if(failure.empty())failure=error_text;
             cv.notify_all();
         }
@@ -1600,12 +1632,12 @@ struct tier {
         const bool locked=!job.borrow && page_locked(job.data[0]);
         const expert_format & F=*job.format;
         char * dst=slot_base(size_t(job.slot));const auto t=clock_type::now();
-        for(int i=0;i<3;++i){cuda_check(cudaMemcpyAsync(dst,job.data[i],F.role_bytes[i],cudaMemcpyHostToDevice,upload_stream));dst+=F.role_bytes[i];}
+        {const void * const src[3]={job.data[0],job.data[1],job.data[2]};copy_roles(dst,src,F,cudaMemcpyHostToDevice,upload_stream);}
         if(!job.borrow)cuda_check(cudaStreamSynchronize(upload_stream));
         const double us=micros(t);std::lock_guard<std::mutex> lock(mutex); // the upload thread updates the same counters
-        upload_us+=us;++uploads;upload_bytes+=F.bytes;borrowed_uploads+=job.borrow;
+        upload_us+=us;++uploads;upload_bytes+=moved_bytes(F);borrowed_uploads+=job.borrow;
         if(!job.borrow){upload_us_per_expert=upload_us_per_expert>0?0.9*upload_us_per_expert+0.1*us:us;
-            (locked?locked_copies:pageable_copies).add(double(F.bytes)/1e6,us);}
+            (locked?locked_copies:pageable_copies).add(double(moved_bytes(F))/1e6,us);}
     }
     // Whether host memory is page-locked (registered or pinned): a copy from it is DMA on its stream; from pageable
     // memory the copying thread stages it. Where the device reads host memory in place nothing needs a copy.
@@ -1630,14 +1662,17 @@ struct tier {
             size_t k=0;while(k<found.size() && !(found[k].weight_type==w && found[k].down_type==d))++k;
             if(k==found.size()){
                 expert_format x;x.weight_type=w;x.down_type=d;
-                x.role_bytes[0]=x.role_bytes[1]=(ggml_row_size(ggml_type(w),f.latent)*size_t(f.hidden)+4095)&~size_t(4095);
-                x.role_bytes[2]=(ggml_row_size(ggml_type(d),f.hidden)*size_t(f.latent)+4095)&~size_t(4095);
+                x.payload[0]=x.payload[1]=ggml_row_size(ggml_type(w),f.latent)*size_t(f.hidden);
+                x.payload[2]=ggml_row_size(ggml_type(d),f.hidden)*size_t(f.latent);
+                for(int r=0;r<3;++r)x.role_bytes[r]=(x.payload[r]+4095)&~size_t(4095);
                 x.bytes=x.role_bytes[0]+x.role_bytes[1]+x.role_bytes[2];
                 found.push_back(x);
             }
             map[size_t(layer)]=int(k);
         }
         formats=std::move(found);layer_format=std::move(map);declared_layers=f.n_layers;
+        named.reset(new std::atomic<size_t>[3*formats.size()]);
+        for(size_t i=0;i<3*formats.size();++i)named[i].store(0,std::memory_order_relaxed);
         stride=largest().bytes;
         latent=f.latent;hidden=f.hidden;n_experts=f.n_experts;
     }
@@ -1710,7 +1745,7 @@ struct tier {
         if(!upload_stream)cuda_check(cudaStreamCreateWithFlags(&upload_stream,cudaStreamNonBlocking));
         if(deferred_upload && !deferred_stream)cuda_check(cudaStreamCreateWithFlags(&deferred_stream,cudaStreamNonBlocking));
         if(table)return;
-        for(int i=0;i<3;++i)if(r->role[i].bytes!=now().role_bytes[i])throw std::runtime_error("VRAM pack padding/shape mismatch");
+        name_roles(cur,r->role,"VRAM pack padding/shape mismatch");
         // Transient scratch is outside decode residency. A prefill uses two slots, then returns both before decode
         // cache growth. Failure is a safe CPU fallback reported by transient_available().
         if(group && prefill_transient_phase && !prefill_transient_arena){
@@ -1756,7 +1791,7 @@ struct tier {
         initialize_format(r,*f);
         for(int j=0;j<count;++j){
             if(!std::isfinite(r[j].weight) || r[j].weight<0)throw std::runtime_error("VRAM routing weight");
-            for(int i=0;i<3;++i)if(r[j].role[i].bytes!=now().role_bytes[i])throw std::runtime_error("VRAM role bytes changed");
+            name_roles(cur,r[j].role,"VRAM role bytes changed");
         }
         table->prepare(r,count);std::copy(table->hits.begin(),table->hits.end(),slots);
         for(int slot:table->hits){gpu_hits+=slot>=0;cpu_requests+=slot<0;}
@@ -1824,7 +1859,7 @@ struct tier {
             for(const auto & task:c.tasks){
                 if(!task.start)continue;
                 float copy_ms=0;cuda_check(cudaEventElapsedTime(&copy_ms,task.start,task.end));
-                const double mb=double(now().bytes)/1e6;host_copy_bytes+=double(now().bytes);host_copy_us+=1e3*copy_ms;
+                const double mb=double(moved_bytes(now()))/1e6;host_copy_bytes+=double(moved_bytes(now()));host_copy_us+=1e3*copy_ms;
                 locked_copies.add(mb,1e3*double(copy_ms));
             }
             host_us_per_expert=host_us_per_expert>0?0.9*host_us_per_expert+0.1*x:x;
@@ -1925,10 +1960,10 @@ struct tier {
             auto & task=tasks[i];task.scratch=scratch[i];
             char * dst=reserved[i]>=0?slot_base(size_t(reserved[i])):host_scratch+size_t(scratch[i])*stride;
             cuda_check(cudaEventRecord(task.start,host_copy_stream));
-            for(int role=0;role<3;++role){
-                cuda_check(cudaMemcpyAsync(dst,task.job.role[role],now().role_bytes[role],cudaMemcpyHostToDevice,host_copy_stream));
-                task.device[role]=dst;dst+=now().role_bytes[role];
-            }
+            {const void * const src[3]={task.job.role[0],task.job.role[1],task.job.role[2]};
+                const vram_compute_expert at=roles_at(dst,now());
+                copy_roles(dst,src,now(),cudaMemcpyHostToDevice,host_copy_stream);
+                task.device[0]=at.up;task.device[1]=at.gate;task.device[2]=at.down;}
             cuda_check(cudaEventRecord(task.end,host_copy_stream));
             ++host_copies;
         }
@@ -2051,7 +2086,7 @@ struct tier {
         double pmb=0,pus=0;for(const auto & x:pageable_copies.s){pmb+=x.first;pus+=x.second;}
         c.pageable_us_per_mb=pmb>0?pus/pmb:0.0;
         c.vector_tokens=vector_tokens;
-        size_t copying=0;for(const auto & d:deferred)if(!d.completed)copying+=d.format->bytes;
+        size_t copying=0;for(const auto & d:deferred)if(!d.completed)copying+=moved_bytes(*d.format);
         c.link_busy_us=double(copying)/1e6*(c.copy_us_per_mb>0?c.copy_us_per_mb:0.0);
         c.in_place=host_readable;
         if(host_readable)return;
@@ -2105,8 +2140,7 @@ struct tier {
         for(int j=0;j<count;++j){
             if(r[j].layer!=r[0].layer || r[j].expert<0 || r[j].expert>=n_experts)
                 throw std::runtime_error("invalid grouped-prefill expert key");
-            for(int role=0;role<3;++role)if(r[j].role[role].bytes!=now().role_bytes[role])
-                throw std::runtime_error("grouped-prefill role bytes changed");
+            name_roles(cur,r[j].role,"grouped-prefill role bytes changed");
         }
         // no prefill lane (the CUDA backend's products do not serve the formats): the CPU's
         if(!group)return;
