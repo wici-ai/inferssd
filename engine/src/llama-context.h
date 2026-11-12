@@ -63,6 +63,8 @@ struct llama_context {
     void sched_reserve();
     // The scheduler and its graphs dropped, a new one reserved on the next sched_reserve().
     void drop_scheduler();
+    // A new scheduler and graph results holding graphs of up to `max_nodes` nodes, nothing reserved yet.
+    void make_scheduler(size_t max_nodes);
     // A stand-in graph of `ubatch` tokens over `horizon` positions reserved in a new scheduler: false, and none, when it
     // does not fit.
     bool reserve_graph_ubatch(uint32_t ubatch, uint32_t horizon);
@@ -344,6 +346,7 @@ private:
     // A prefill phase's graph not yet reserved: its first ubatch reserves it (process_ubatch), over this horizon, for
     // a prompt of this many tokens.
     bool cpu_prefill_reserve_pending = false;
+    size_t sched_max_nodes = 0; // the graphs the scheduler and its graph results hold (make_scheduler)
     uint32_t cpu_prefill_horizon = 0;
     uint32_t cpu_prefill_requested_tokens = 0;
     // Graph reserves cover the positions in use instead of the whole n_ctx

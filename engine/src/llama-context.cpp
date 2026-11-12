@@ -626,11 +626,7 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    gf_res_prev.reset(new llm_graph_result(max_nodes));
-    gf_res_reserve.reset(new llm_graph_result(max_nodes));
-
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    if (ssd_runtime) { ssd_runtime->stream.attach(sched.get()); }
+    make_scheduler(max_nodes);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -1004,8 +1000,17 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
             sched_reserve_n_ctx = prefill_horizon;
             cpu_prefill_horizon = prefill_horizon;
             cpu_prefill_requested_tokens = prefill_tokens;
-            if (sched) { synchronize(); }
-            dense_graph_cache_end_phase();
+            // The scheduler holds the prompt's graph: where the decode graph's one holds fewer nodes than a graph of
+            // the prompt's size may have (graph_max_nodes), a scheduler of that capacity, still unreserved.
+            const size_t prompt_nodes = graph_max_nodes(target);
+            if (!sched || sched_max_nodes < prompt_nodes) {
+                drop_scheduler();
+                make_scheduler(prompt_nodes);
+                sched_need_reserve = false;
+            } else {
+                synchronize();
+                dense_graph_cache_end_phase();
+            }
             dense_graph_cache_begin_phase(1);
             cpu_prefill_actual_shape_active = true;
             cpu_prefill_selected_ubatch = target;
@@ -1045,6 +1050,15 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     const bool reserved = !phase_changed || reserve_ubatch(cparams.n_ubatch);
     const bool vram_complete = complete_vram_phase(reserved && !active);
     return reserved && vram_complete;
+}
+
+void llama_context::make_scheduler(size_t max_nodes) {
+    gf_res_prev.reset(new llm_graph_result(max_nodes));
+    gf_res_reserve.reset(new llm_graph_result(max_nodes));
+
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (ssd_runtime) { ssd_runtime->stream.attach(sched.get()); }
+    sched_max_nodes = max_nodes;
 }
 
 void llama_context::drop_scheduler() {
