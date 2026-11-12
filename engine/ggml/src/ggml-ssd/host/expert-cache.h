@@ -982,14 +982,13 @@ struct expert_cache {
     // not hold yet. nullptr, or why it failed.
     const char * map_arena() {
         const uint64_t bytes = multiply(entries.size(), stride);
-        void * memory = ssd::platform::arena_reserve(size_t(bytes));
+        void * memory = ssd::platform::arena_reserve(size_t(bytes), gives_room_back() ? stride : 0);
         if (!memory) { return "mmap_failed"; }
         arena = static_cast<char *>(memory); stats.mapped_bytes = bytes;
         return ssd::platform::arena_no_hugepage(arena, stats.mapped_bytes) ? nullptr : "nohugepage_failed";
     }
     // Commits the pages of slots [first, first + count) before their first touch, and again after a discard: Windows
-    // charges commit here and macOS takes the pages back; Linux charges at the touch. Pages a neighbouring slot shares
-    // stay as they are.
+    // charges commit here; Linux and macOS charge at the touch. Pages a neighbouring slot shares stay as they are.
     bool commit_slots(size_t first, size_t count) const {
         const uint64_t begin = multiply(first, stride) / page_size * page_size;
         const uint64_t end = ceil_div(multiply(add(first, count), stride), page_size) * page_size;

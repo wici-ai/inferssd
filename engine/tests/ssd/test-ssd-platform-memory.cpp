@@ -19,6 +19,7 @@
 #include <psapi.h>
 #elif defined(__APPLE__)
 #include <mach/mach.h>
+#include <sys/mman.h>
 #else
 #include <sys/mman.h>
 #endif
@@ -56,6 +57,23 @@ static uint64_t charged(const unsigned char * slot, size_t bytes) {
 #endif
 }
 
+#if !defined(_WIN32)
+// Bytes of [p, p + bytes) resident in this process.
+static uint64_t resident(const unsigned char * p, size_t bytes) {
+    const size_t page = page_size();
+#if defined(__APPLE__)
+    std::vector<char> pages((bytes + page - 1) / page);
+    require(mincore(reinterpret_cast<caddr_t>(const_cast<unsigned char *>(p)), bytes, pages.data()) == 0, "mincore");
+#else
+    std::vector<unsigned char> pages((bytes + page - 1) / page);
+    require(mincore(const_cast<unsigned char *>(p), bytes, pages.data()) == 0, "mincore");
+#endif
+    uint64_t total = 0;
+    for (auto r : pages) { total += (r & 1) ? page : 0; }
+    return total;
+}
+#endif
+
 static void fill(unsigned char * p, size_t bytes, unsigned seed) {
     for (size_t i = 0; i < bytes; ++i) { p[i] = static_cast<unsigned char>(i * 131 + seed); }
 }
@@ -83,7 +101,7 @@ static void test_arena() {
     const size_t page = page_size(), slot = size_t(32) << 20, slots = 4, bytes = slot * slots;
     const size_t margin = slot / 8; // other allocations of this process during a step
     std::string why;
-    auto * arena = static_cast<unsigned char *>(arena_reserve(bytes, &why));
+    auto * arena = static_cast<unsigned char *>(arena_reserve(bytes, slot, &why));
     require(arena != nullptr, "arena_reserve: " + why);
     require(reinterpret_cast<uintptr_t>(arena) % page == 0, "the arena is page aligned");
     require(arena_no_hugepage(arena, bytes), "arena_no_hugepage");
@@ -109,6 +127,10 @@ static void test_arena() {
 #endif
                 );
     require(dropped + slot - margin <= loaded, "discard returns the slot's charge");
+#if !defined(_WIN32)
+    // and its pages, at once: none of them stays resident
+    require(resident(a, slot) == 0, "discard gives the slot's pages back");
+#endif
 
     require(arena_commit(a, slot), "commit the slot again");
     fill(a, slot, 2);

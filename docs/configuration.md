@@ -123,7 +123,10 @@ memory and the commit still available (including what the paging files may grow
 by), macOS what a new allocation takes before the kernel
 compresses anything, by its own live thresholds: the free pages above its free
 target, the file-backed pages above its file cache minimum
-(`vm.vm_page_filecache_min`), and the purgeable and reusable pages. The RAM
+(`vm.vm_page_filecache_min`), and the purgeable pages. Reusable pages are not
+counted: they stay resident while the kernel compresses other memory. So a slot
+the RAM cache gives back is freed at once on every OS (macOS: each slot is its
+own mapping, replaced by a fresh one). The RAM
 expert cache admits only under a readable envelope. On a GPU
 that shares the host's memory (unified memory, such as GB10), a CUDA allocation
 is not charged to the cgroup, so the Linux envelope counts the CUDA expert

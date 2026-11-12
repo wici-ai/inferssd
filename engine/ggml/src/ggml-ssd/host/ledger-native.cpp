@@ -239,17 +239,18 @@ bool available(uint64_t & bytes) {
     // What a new allocation takes before the kernel compresses anyone's memory, by the kernel's own live
     // thresholds: the free pages above its free target (below it the pageout scan runs); the file-backed pages
     // (the speculative ones among them) above its file cache minimum, which the scan takes before it compresses
-    // anything and keeps; and the purgeable and reusable pages (MADV_FREE_REUSABLE: the RAM cache's discarded
-    // slots and the allocator's free blocks), which it frees without compressing.
+    // anything and keeps; and the purgeable pages, which it empties without compressing. Reusable pages
+    // (MADV_FREE_REUSABLE: the allocator's free blocks) are not counted: they stay resident while the kernel
+    // compresses other memory, and go only as the page queues age.
     static const page_counter free_pages("vm.page_free_count"), file_pages("vm.page_pageable_external_count"),
-            purgeable_pages("vm.page_purgeable_count"), reusable_pages("vm.page_reusable_count"),
-            free_target("vm.vm_page_free_target"), file_minimum("vm.vm_page_filecache_min");
-    uint64_t free = 0, file = 0, purgeable = 0, reusable = 0, target = 0, minimum = 0;
+            purgeable_pages("vm.page_purgeable_count"), free_target("vm.vm_page_free_target"),
+            file_minimum("vm.vm_page_filecache_min");
+    uint64_t free = 0, file = 0, purgeable = 0, target = 0, minimum = 0;
     if (!free_pages.read(free) || !file_pages.read(file) || !purgeable_pages.read(purgeable) ||
-            !reusable_pages.read(reusable) || !free_target.read(target) || !file_minimum.read(minimum)) {
+            !free_target.read(target) || !file_minimum.read(minimum)) {
         return false;
     }
-    bytes = ((free > target ? free - target : 0) + (file > minimum ? file - minimum : 0) + purgeable + reusable) *
+    bytes = ((free > target ? free - target : 0) + (file > minimum ? file - minimum : 0) + purgeable) *
             uint64_t(vm_kernel_page_size);
     return true;
 }
