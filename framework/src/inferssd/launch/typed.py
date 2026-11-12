@@ -96,9 +96,9 @@ def connect_host(host: str) -> str:
     return LOOPBACK if host == "0.0.0.0" else host
 
 
-# The default context: room for a coding agent's instructions and tools and a task's files. The engine
-# keeps it within the model's trained context. A RAM-only model takes the largest multiple of
-# CONTEXT_STEP up to it that fits memory.
+# The default context: room for a coding agent's instructions and tools and a task's files.
+# The engine keeps it within the model's trained context. A RAM-only model takes the largest
+# multiple of CONTEXT_STEP up to it that fits memory.
 CONTEXT = 65536
 CONTEXT_STEP = 8192
 BATCH = 512
