@@ -53,6 +53,7 @@ const char * const USAGE =
     "Measures DRAM read bandwidth and ggml CPU matrix multiplication throughput per weight format and\n"
     "prints one JSON object (schema inferssd-cpuprobe/2) on stdout.\n"
     "\n"
+    "  --backend NAME      CPU (default) or CUDA<n>; CUDA skips DRAM and uses threads=1\n"
     "  --threads LIST      thread counts (default: 1 and the logical CPUs this process may use)\n"
     "  --formats LIST      ggml weight types, case-insensitive\n"
     "  --rows N            weight rows (output features)\n"
@@ -503,7 +504,7 @@ bool measure_format(ggml_backend_t backend, const format_spec & format, int64_t 
         graphs.push_back(std::move(per));
     }
     if (!ggml_backend_supports_op(backend, ggml_graph_node(graphs[0][0], -1))) {
-        *why = "the CPU backend does not support MUL_MAT for this type";
+        *why = "the selected backend does not support MUL_MAT for this type";
         return false;
     }
     std::unique_ptr<ggml_backend_buffer, ggml_buffer_deleter> buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
@@ -527,12 +528,15 @@ bool measure_format(ggml_backend_t backend, const format_spec & format, int64_t 
 
     for (int threads : thread_counts) {
         affinity_guard affinity;
-        ggml_threadpool_t pool = new_pool(threads, cpus);
-        if (!pool) {
+        const bool cpu = ggml_backend_is_cpu(backend);
+        ggml_threadpool_t pool = cpu ? new_pool(threads, cpus) : nullptr;
+        if (cpu && !pool) {
             throw std::runtime_error("ggml_threadpool_new failed for " + std::to_string(threads) + " threads");
         }
-        ggml_backend_cpu_set_n_threads(backend, threads);
-        ggml_backend_cpu_set_threadpool(backend, pool);
+        if (cpu) {
+            ggml_backend_cpu_set_n_threads(backend, threads);
+            ggml_backend_cpu_set_threadpool(backend, pool);
+        }
         compute_row row{ format.name, threads, (uint64_t) weight_bytes, {} };
         try {
             for (size_t i = 0; i < tokens.size(); ++i) {
@@ -544,12 +548,16 @@ bool measure_format(ggml_backend_t backend, const format_spec & format, int64_t 
                              threads, tokens[i], s * 1e6, rate, tokens[i] == 1 ? "B/s" : "FLOP/s");
             }
         } catch (...) {
-            ggml_backend_cpu_set_threadpool(backend, nullptr);
-            ggml_threadpool_free(pool);
+            if (cpu) {
+                ggml_backend_cpu_set_threadpool(backend, nullptr);
+                ggml_threadpool_free(pool);
+            }
             throw;
         }
-        ggml_backend_cpu_set_threadpool(backend, nullptr);
-        ggml_threadpool_free(pool);
+        if (cpu) {
+            ggml_backend_cpu_set_threadpool(backend, nullptr);
+            ggml_threadpool_free(pool);
+        }
         out.push_back(std::move(row));
     }
     return true;
@@ -576,6 +584,7 @@ std::vector<std::string> ggml_features() {
 }
 
 struct options {
+    std::string              backend = "CPU";
     std::vector<int>         threads;
     std::vector<format_spec> formats;
     int64_t                  rows        = 4096;
@@ -596,7 +605,9 @@ options parse_args(int argc, char ** argv) {
         }
         if (i + 1 >= argc) { throw usage_error("unknown option or missing value: " + arg); }
         const std::string value = argv[++i];
-        if (arg == "--threads") {
+        if (arg == "--backend") {
+            o.backend = value;
+        } else if (arg == "--threads") {
             o.threads = parse_int_list(arg, value, 1, GGML_MAX_N_THREADS);
         } else if (arg == "--formats") {
             formats = value;
@@ -647,6 +658,13 @@ options parse_args(int argc, char ** argv) {
             throw usage_error("unknown option: " + arg);
         }
     }
+    if (o.backend != "CPU") {
+        if (o.backend.rfind("CUDA", 0) != 0 || !o.cpus.empty() ||
+            (!o.threads.empty() && o.threads != std::vector<int>{1})) {
+            throw usage_error("--backend CUDA<n> requires --threads 1 and no --cpus");
+        }
+        o.threads = {1};
+    }
     if (o.threads.empty()) {
         o.threads = { 1 };
         const int all = std::min(GGML_MAX_N_THREADS, available_cpus());
@@ -677,16 +695,19 @@ int run(int argc, char ** argv) {
     std::fprintf(stderr, "cpuprobe: last-level cache %" PRIu64 " bytes%s\n", llc, llc ? "" : " (unknown)");
 
     const uint64_t dram_bytes = std::max<uint64_t>(1ull << 30, 8 * llc);
-    const std::vector<dram_point> dram = measure_dram(dram_bytes, o.threads, o.min_seconds);
+    const std::vector<dram_point> dram = o.backend == "CPU"
+        ? measure_dram(dram_bytes, o.threads, o.min_seconds) : std::vector<dram_point>{};
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    if (!backend) { throw std::runtime_error("ggml_backend_cpu_init failed"); }
+    ggml_backend_t backend = o.backend == "CPU" ? ggml_backend_cpu_init()
+                                               : ggml_backend_init_by_name(o.backend.c_str(), nullptr);
+    if (!backend) { throw std::runtime_error("cannot initialize backend " + o.backend); }
     struct backend_guard {
         ggml_backend_t b;
         ~backend_guard() { ggml_backend_free(b); }
     } guard{ backend };
 
-    const uint64_t rotate_bytes = std::max<uint64_t>(256ull << 20, 4 * llc);
+    const uint64_t rotate_bytes = o.backend == "CPU"
+        ? std::max<uint64_t>(256ull << 20, 4 * llc) : 256ull << 20;
     std::vector<compute_row> compute;
     std::vector<std::pair<std::string, std::string>> skipped;
     for (const format_spec & format : o.formats) {
@@ -727,7 +748,7 @@ int run(int argc, char ** argv) {
         json += std::string(i ? ", " : "") + "{\"format\": " + quote(skipped[i].first) +
                 ", \"reason\": " + quote(skipped[i].second) + "}";
     }
-    json += "]}\n";
+    json += "],\n \"backend\": " + quote(o.backend) + "}\n";
     std::fputs(json.c_str(), stdout);
     std::fflush(stdout);
     return 0;

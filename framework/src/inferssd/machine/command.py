@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +22,7 @@ from inferssd.machine.characteristics import (
     Characteristics,
     Section,
 )
+from inferssd.machine.decode_probe import measure_decode_compute
 from inferssd.machine.identity import Host, NativeHost, UnsupportedPlatform
 from inferssd.machine.probes import Probes, Runner, locate, run_process
 from inferssd.machine.profile import (
@@ -32,7 +35,7 @@ from inferssd.machine.profile import (
     survey,
 )
 from inferssd.machine.store import default_path, exclusive, load_current, save
-from inferssd.strategy.estimate import Estimate, decode_estimate
+from inferssd.strategy.estimate import Estimate, decode_estimate, dense_decode_estimate
 from inferssd.strategy.inputs import RuntimeFacts, read_runtime
 
 GIB = float(1 << 30)
@@ -63,6 +66,24 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     )
     probes.add_argument(
         "--build", type=Path, help="engine build directory holding bin/inferssd-*probe"
+    )
+    command.add_argument("--memory-gib", type=float, help="host memory budget for estimation only")
+    command.add_argument(
+        "--host-work-mib",
+        type=float,
+        default=0,
+        help="additional known host working memory for estimation",
+    )
+    command.add_argument(
+        "--gpu-work-mib",
+        type=float,
+        default=0,
+        help="known GPU KV/graph working memory for estimation",
+    )
+    command.add_argument(
+        "--estimate-compute",
+        action="store_true",
+        help="measure synthetic CUDA decode matrices; never runs a model",
     )
     command.add_argument("--reprofile", action="store_true", help="measure every section again")
     command.add_argument(
@@ -157,6 +178,9 @@ def estimates(
     drive_key: Optional[str],
     platform: str,
     runtime: Callable[[], RuntimeFacts],
+    *,
+    host_work_bytes: int = 0,
+    gpu_work_bytes: int = 0,
 ) -> list[tuple[catalog.Model, Estimate]]:
     """Each supported model's decode speed estimate with its shards on DRIVE_KEY."""
     reason = "pass --model with the directory that holds the models"
@@ -170,10 +194,19 @@ def estimates(
                 (
                     model,
                     decode_estimate(
-                        value, model.facts, model.dense_read_bytes, facts, platform, drive_key
+                        value,
+                        model.facts,
+                        model.dense_read_bytes,
+                        facts,
+                        platform,
+                        drive_key,
+                        host_work_bytes=host_work_bytes,
+                        gpu_work_bytes=gpu_work_bytes,
                     )
                     if model.facts is not None
-                    else Estimate(None, "RAM-only model; speed is measured after loading"),
+                    else dense_decode_estimate(
+                        value, model.dense_read_bytes, facts, gpu_work_bytes=gpu_work_bytes
+                    ),
                 )
                 for model in catalog.MODELS
             ]
@@ -184,7 +217,13 @@ def estimate_lines(rows: list[tuple[catalog.Model, Estimate]]) -> list[str]:
     return [
         f"estimate: {model.repo}:{model.quantization} "
         + (
-            f"about {estimate.tokens_per_second:.1f} tok/s decode ({estimate.detail})"
+            (
+                f"{estimate.scenario_range[0]:.1f}–{estimate.scenario_range[1]:.1f} tok/s "
+                "decode across routing/overlap scenarios (not a confidence interval); "
+                if estimate.scenario_range
+                else ""
+            )
+            + f"uniform serial reference {estimate.tokens_per_second:.1f} tok/s ({estimate.detail})"
             if estimate.tokens_per_second is not None
             else f"none: {estimate.detail}"
         )
@@ -224,7 +263,14 @@ def report(
                 "model": model.repo,
                 "quantization": model.quantization,
                 "decode_tokens_per_second": estimate.tokens_per_second,
+                "reference_scenario": "uniform_serial",
                 "detail": estimate.detail,
+                "assumptions": estimate.assumptions,
+                "scenarios": estimate.scenarios,
+                "components": estimate.components,
+                "routing_scenarios": estimate.scenario_details,
+                "scenario_range_tokens_per_second": estimate.scenario_range,
+                "range_kind": "conditional scenarios; not a confidence interval",
             }
             for model, estimate in rows
         ],
@@ -249,6 +295,17 @@ def run(
     emit: Callable[[str], None] = print,
     runtime: Callable[[], RuntimeFacts] = read_runtime,
 ) -> int:
+    for name in ("memory_gib", "host_work_mib", "gpu_work_mib"):
+        number = getattr(args, name)
+        if number is not None and (not math.isfinite(number) or number < 0):
+            raise ValueError(f"--{name.replace('_', '-')} must be finite and nonnegative")
+    original_runtime = runtime
+    if args.memory_gib is not None:
+
+        def budget_runtime() -> RuntimeFacts:
+            return replace(original_runtime(), memory_budget_bytes=int(args.memory_gib * GIB))
+
+        runtime = budget_runtime
     host = host or NativeHost()
     path = args.output or default_path(host.platform(), environ, home)
     paths = [str(model) for model in args.model]
@@ -256,7 +313,14 @@ def run(
     def output(value: Characteristics, drive_key: Optional[str]) -> None:
         lines = summary(value, path)
         if args.json or args.model:
-            rows = estimates(value, drive_key, host.platform(), runtime)
+            rows = estimates(
+                value,
+                drive_key,
+                host.platform(),
+                runtime,
+                host_work_bytes=int(args.host_work_mib * (1 << 20)),
+                gpu_work_bytes=int(args.gpu_work_mib * (1 << 20)),
+            )
             if args.json:
                 emit(json.dumps(report(value, path, drive_key, rows), separators=(",", ":")))
                 return
@@ -265,9 +329,10 @@ def run(
             emit(line)
 
     if args.show:
-        if args.reprofile or args.resources or args.build:
+        if args.reprofile or args.resources or args.build or args.estimate_compute:
             raise ValueError(
-                "--show measures nothing; it accepts only --output, --model and --json"
+                "--show measures nothing; omit --reprofile, --resources, "
+                "--build and --estimate-compute"
             )
         saved = load_current(path)
         if saved is None:
@@ -304,6 +369,8 @@ def run(
             progress=progress,
             surveyed=surveyed,
         )
+        if args.estimate_compute:
+            value = measure_decode_compute(value, probes, runtime(), progress, args.reprofile)
         if value is not previous:
             save(value, path)
     output(value, models_drive(surveyed.drives))

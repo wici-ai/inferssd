@@ -4,7 +4,10 @@
 Each model's facts are ``model_facts_json`` of its shards' GGUF headers at the
 revision named, so a speed estimate needs no download. ``lookup_bytes`` counts
 the dense tensors a token reads one row of rather than whole: the token
-embeddings and DeepSeek-V4.1's engram tables.
+embeddings, DeepSeek-V4.1's engram tables and Gemma 4's per-layer embeddings
+(Gemma's token embeddings are also its output projection, read whole). A RAM-only
+model has no expert facts; ``weight_bytes`` is the sum of its tensors' bytes at
+the revision named.
 """
 
 from __future__ import annotations
@@ -22,11 +25,13 @@ class Model:
     revision: str  # the Hugging Face commit the facts were read at
     facts: Optional[ModelFacts]  # None for an ordinary RAM-only model, with no expert store.
     lookup_bytes: int
+    weight_bytes: int = 0  # a RAM-only model's tensors; an expert model's are in its facts
 
     @property
     def dense_read_bytes(self) -> int:
         """The dense weights one token reads whole."""
-        return self.facts.dense_bytes - self.lookup_bytes if self.facts is not None else 0
+        dense = self.facts.dense_bytes if self.facts is not None else self.weight_bytes
+        return dense - self.lookup_bytes if dense else 0
 
 
 def _shards(prefix: str, count: int) -> list[str]:
@@ -139,6 +144,7 @@ MODELS: tuple[Model, ...] = (
         "Q4_0",
         "4b4a2c1d584be7264f87aac328a1bc739ce81b6c",
         None,
-        0,
+        2312110080,  # per_layer_token_embd.weight
+        5139117224,  # gemma-4-E4B_q4_0-it.gguf's 666 tensors
     ),
 )

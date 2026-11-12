@@ -42,9 +42,11 @@ def test_the_catalog_is_the_download_list_and_its_facts_add_up():
     assert hub.MODELS == {model.repo: model.quantization for model in catalog.MODELS}
     for model in catalog.MODELS:
         facts = model.facts
-        if facts is None:  # RAM-only: a token reads nothing from the drive
-            assert model.lookup_bytes == 0 and model.dense_read_bytes == 0
+        if facts is None:  # RAM-only: no expert store; a token reads its dense weights
+            assert 0 < model.lookup_bytes < model.weight_bytes
+            assert model.dense_read_bytes == model.weight_bytes - model.lookup_bytes
             continue
+        assert model.weight_bytes == 0
         assert 0 < model.dense_read_bytes < facts.dense_bytes
         # Each type's total is exactly its roles' layers of that type, over every expert.
         per_type: Counter[str] = Counter()
@@ -57,18 +59,22 @@ def test_the_catalog_is_the_download_list_and_its_facts_add_up():
         assert facts.mean_expert_read_bytes <= facts.expert_read_bytes
 
 
-def test_every_ssd_model_is_priced_on_a_mac_or_names_the_formats_it_lacks():
+def test_every_ssd_model_is_priced_on_a_mac_and_names_the_formats_it_borrows():
     # The CPU probe measures a fixed set of ggml types. A model whose experts use another,
-    # such as Flash Next's IQ4_XS and IQ4_NL, has no estimate and launches on default threads.
+    # such as Flash Next's IQ4_XS and IQ4_NL, is priced at the measured rate of the format
+    # nearest in bits per weight, a default its assumptions name.
     for model in ssd_models():
         value = estimate(model)
+        assert value.tokens_per_second is not None and 0.05 < value.tokens_per_second < 100
+        assert " ms a token: dense " in value.detail
+        borrowed = [a for a in value.assumptions if a.startswith("CPU rate of unmeasured ")]
         missing = unmeasured(model)
         if missing:
-            assert value.tokens_per_second is None
-            assert value.detail == "no CPU compute measurement of " + ", ".join(missing)
+            assert len(borrowed) == 1 and all(
+                f"{name} taken from " in borrowed[0] for name in missing
+            )
         else:
-            assert value.tokens_per_second is not None and 0.05 < value.tokens_per_second < 100
-            assert " ms a token: dense " in value.detail
+            assert not borrowed
 
 
 def test_more_memory_and_a_faster_drive_are_faster():
@@ -76,8 +82,6 @@ def test_more_memory_and_a_faster_drive_are_faster():
     for row in faster["storage"][0]["random_read"]:
         row["Bps"] *= 2
     for model in ssd_models():
-        if unmeasured(model):
-            continue
         base = estimate(model).tokens_per_second
         assert estimate(model, available=40 * GIB).tokens_per_second > base
         assert estimate(model, characteristics=faster).tokens_per_second > base
@@ -114,7 +118,9 @@ def test_qwen_estimate_uses_a_measured_rate_below_an_unreachable_knee():
 def test_dense_weights_that_do_not_fit_are_read_from_the_drive():
     muse = catalog.MODELS[1]  # 21 GB of dense weights, more than the 16 GiB Mac has
     spilled = estimate(muse, available=9 * GIB)
-    fits = estimate(muse, available=64 * GIB)
+    larger = copy.deepcopy(MAC)
+    larger["memory"]["total_bytes"] = 64 * GIB
+    fits = estimate(muse, characteristics=larger, available=64 * GIB)
     assert "GB of it from the drive" in spilled.detail and "of it from the drive" not in fits.detail
     assert spilled.tokens_per_second < fits.tokens_per_second
 

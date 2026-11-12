@@ -120,7 +120,7 @@ class DeviceToHost(TypedDict):
     pinned: list[Transfer]
 
 
-class GPU(TypedDict):
+class _GPU(TypedDict):
     index: int
     name: str
     uuid: str
@@ -131,6 +131,12 @@ class GPU(TypedDict):
     d2h: DeviceToHost
     d2d_Bps: float
     read_Bps: float
+
+
+class GPU(_GPU, total=False):
+    decode_compute: list[ComputeRow]
+    decode_compute_measurement: Section
+    decode_compute_probe_sha256: str
 
 
 class Latency(TypedDict):
@@ -338,6 +344,15 @@ COMPUTE_ROW = record(
     },
     {"cpus": array(COUNT, minimum=1)},
 )
+SECTION = record(
+    {
+        "measured_utc": utc,
+        "duration_s": NUMBER,
+        "method": TEXT,
+        "status": one_of(*STATUSES),
+        "detail": TEXT,
+    }
+)
 GPU_ROW = record(
     {
         "index": COUNT,
@@ -350,17 +365,14 @@ GPU_ROW = record(
         "d2h": record({"pinned": TRANSFERS}),
         "d2d_Bps": NUMBER,
         "read_Bps": NUMBER,
-    }
-)
-SECTION = record(
+    },
     {
-        "measured_utc": utc,
-        "duration_s": NUMBER,
-        "method": TEXT,
-        "status": one_of(*STATUSES),
-        "detail": TEXT,
-    }
+        "decode_compute": array(COMPUTE_ROW),
+        "decode_compute_measurement": SECTION,
+        "decode_compute_probe_sha256": TEXT,
+    },
 )
+
 FILE = record(
     {
         "schema": constant(SCHEMA),
