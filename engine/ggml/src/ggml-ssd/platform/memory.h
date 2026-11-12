@@ -25,15 +25,17 @@ void aligned_free(void * p);
 //                                         -> discard -> commit -> use ...
 //   -> release
 //
-// commit is where Windows charges commit, as the host ledger charges; Linux
-// charges at first touch, macOS takes the slot back into phys_footprint.
-// discard drops the slot's memory and accounting without keeping its contents
-// (macOS keeps the pages as reusable until the kernel needs them); a discarded
-// slot must be committed again before it is touched. Ranges are page aligned.
+// commit is where Windows charges commit, as the host ledger charges; Linux and
+// macOS charge at first touch. discard drops the slot's memory and accounting
+// without keeping its contents and gives its pages back to the OS at once, as
+// the ledger then measures them free; a discarded slot must be committed again
+// before it is touched. Ranges are page aligned, and a discard covers whole units.
 
 // Address space only: the ledger admits each resident slot, so the OS must not
-// refuse an arena larger than RAM plus swap. nullptr, with the reason in *why.
-void * arena_reserve(size_t bytes, std::string * why = nullptr);
+// refuse an arena larger than RAM plus swap. unit: the bytes one discard gives
+// back (a slot), a page multiple that divides bytes, or 0 when nothing is
+// discarded. nullptr, with the reason in *why.
+void * arena_reserve(size_t bytes, size_t unit, std::string * why = nullptr);
 bool arena_commit(void * p, size_t bytes);
 bool arena_discard(void * p, size_t bytes);
 // Ordinary pages, so a discard returns exactly one slot (Linux THP).

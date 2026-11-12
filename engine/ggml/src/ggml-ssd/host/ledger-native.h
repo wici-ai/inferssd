@@ -25,8 +25,9 @@
 //      is a hard limit there and a system-managed paging file grows on demand.
 //      macOS: what a new allocation takes before the kernel compresses or swaps anyone's anonymous memory, by its
 //      own live thresholds (sysctl): the free pages above its free target, the file-backed pages above its file
-//      cache minimum (vm_page_filecache_min, which it keeps), and the purgeable and reusable pages. The counterpart
-//      of MemAvailable, which keeps the zones' watermarks back the same way.
+//      cache minimum (vm_page_filecache_min, which it keeps), and the purgeable pages; not the reusable ones, which
+//      stay resident while it compresses. The counterpart of MemAvailable, which keeps the zones' watermarks back
+//      the same way.
 // floor = margin + explicit reserves, as on Linux.
 //
 // How the Linux-specific parts carry over:

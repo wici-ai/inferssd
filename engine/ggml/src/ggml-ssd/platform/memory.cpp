@@ -61,8 +61,9 @@ void aligned_free(void * p) {
 #endif
 }
 
-void * arena_reserve(size_t bytes, std::string * why) {
+void * arena_reserve(size_t bytes, size_t unit, std::string * why) {
 #if defined(_WIN32)
+    (void) unit;
     void * p = VirtualAlloc(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS);
     if (!p && why) {
         const DWORD error = GetLastError();
@@ -76,6 +77,23 @@ void * arena_reserve(size_t bytes, std::string * why) {
         if (why) { *why = std::string("mmap: ") + std::strerror(error); }
         return nullptr;
     }
+#if defined(__APPLE__)
+    // Every unit its own VM object, which a discard replaces whole: a fresh mapping over part of one object frees
+    // only some of that part's pages at once and keeps the rest out of phys_footprint until the object goes.
+    if (unit && unit % page_size() == 0 && bytes % unit == 0) {
+        for (size_t at = 0; at < bytes; at += unit) {
+            if (mmap(static_cast<char *>(p) + at, unit, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) == MAP_FAILED) {
+                const int error = errno;
+                munmap(p, bytes);
+                if (why) { *why = std::string("mmap unit: ") + std::strerror(error); }
+                return nullptr;
+            }
+        }
+    }
+#else
+    (void) unit;
+#endif
     return p;
 #endif
 }
@@ -84,8 +102,6 @@ bool arena_commit(void * p, size_t bytes) {
     if (!bytes) { return true; }
 #if defined(_WIN32)
     return VirtualAlloc(p, bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr;
-#elif defined(__APPLE__)
-    return madvise(p, bytes, MADV_FREE_REUSE) == 0;
 #else
     (void) p; // first touch charges
     return true;
@@ -97,9 +113,11 @@ bool arena_discard(void * p, size_t bytes) {
 #if defined(_WIN32)
     return VirtualFree(p, bytes, MEM_DECOMMIT) != 0;
 #elif defined(__APPLE__)
-    // Reusable pages leave phys_footprint at once and the kernel frees them without compressing when it needs
-    // them; the ledger counts them as available. A fresh mapping over part of the arena would not free its pages.
-    return madvise(p, bytes, MADV_FREE_REUSABLE) == 0;
+    // A fresh mapping over the unit (arena_reserve): its object goes, and its pages are free at once. Reusable pages
+    // (MADV_FREE_REUSABLE) would leave phys_footprint but stay resident, and the kernel compresses other memory
+    // before it takes them.
+    return mmap(p, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) !=
+        MAP_FAILED;
 #else
     return madvise(p, bytes, MADV_DONTNEED) == 0;
 #endif
