@@ -281,7 +281,8 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched, llama_memory_context_i * mctx = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
-    bool reserve_compute_graph(ggml_cgraph * graph, bool prefill);
+    // `admitted`: what runs once the host ledger has given the graph its room, before its buffers are allocated.
+    bool reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted = {});
 
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);

@@ -1018,7 +1018,9 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
                 prefill_tokens, target, cpu_prefill_configured_ubatch,
                 cpu_prefill_graph_granularity,
                 (ggml_time_us() - transition_start_us) / 1000.0);
-            return complete_vram_phase(false);
+            // the VRAM tier's prefill phase completes once the graph is reserved: completing it disarms the
+            // reclaimer that gives the graph its device memory
+            return true;
         }
 
         if (!cpu_prefill_actual_shape_active) {
@@ -1747,15 +1749,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        // the input rows' reads go out before the graph takes its memory
-        res->prefetch_inputs(&ubatch);
-
         // The managed scheduler cannot grow implicitly. Reserve the real graph
         // under the same admission path used for worst-case load-time graphs.
-        const bool allocated = cpu_sink_runtime ?
-            reserve_compute_graph(gf, ubatch.n_tokens > ubatch.n_seqs && !cpu_sink_decode_active) &&
-                ggml_backend_sched_alloc_prepared(sched.get(), gf) :
-            ggml_backend_sched_alloc_graph(sched.get(), gf);
+        // The input rows' reads go out once the graph has its room and before its buffers are allocated: the rows
+        // land in room the caches gave back, and the reads overlap the allocation.
+        const auto prefetch = [&]() { res->prefetch_inputs(&ubatch); };
+        // a sequence that advances by more than one token: a prompt pass (a simple split counts each token a
+        // sequence set, n_seqs, so the distinct sequences decide)
+        const bool prompt_pass = ubatch.n_tokens > ubatch.n_seqs_unq && !cpu_sink_decode_active;
+        bool allocated = false;
+        if (cpu_sink_runtime) {
+            allocated = reserve_compute_graph(gf, prompt_pass, prefetch) &&
+                ggml_backend_sched_alloc_prepared(sched.get(), gf);
+        } else {
+            prefetch();
+            allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        }
         if (!allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             // A refused graph is still parameterized but has no valid storage.
@@ -1767,7 +1776,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-        if (ubatch.n_tokens > ubatch.n_seqs) { cpu_prefill_reserve_pending = false; }
+        if (prompt_pass && cpu_prefill_reserve_pending) {
+            // the graph has its memory: the VRAM tier's prefill phase completes, and its reclaimer is disarmed
+            cpu_prefill_reserve_pending = false;
+            if (cpu_sink_runtime && !cpu_sink_runtime->phase_complete(false)) {
+                LLAMA_LOG_ERROR("%s: VRAM tier phase completion failed after the prefill graph's reserve\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
     }
 
     // set the input data for the input tensors
@@ -2208,7 +2225,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             cpu_sink_runtime->begin(nullptr, 0, false);
         }
         sched_reserve();
-        return !tier_phase || cpu_sink_runtime->phase_complete(decode_phase);
+        // a prefill whose graph is not reserved yet completes the tier's phase with that reserve (process_ubatch)
+        return !tier_phase || cpu_prefill_reserve_pending || cpu_sink_runtime->phase_complete(decode_phase);
     };
 
     bool reserve_grown = false;
@@ -2872,8 +2890,11 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
-bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill) {
-    if (!cpu_sink_runtime) { return ggml_backend_sched_reserve(sched.get(), graph); }
+bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted) {
+    if (!cpu_sink_runtime) {
+        if (admitted) { admitted(); }
+        return ggml_backend_sched_reserve(sched.get(), graph);
+    }
     ggml_backend_sched_set_auto_reserve(sched.get(), false);
     ggml_backend_sched_set_host_prefault(sched.get(), llama_host_page_size());
     // The existing size probe may release an undersized buffer. Invalidate
@@ -2901,15 +2922,17 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill) {
     }
     const uint64_t pages = prefill ? llama_host_gather_bytes(graph, llama_host_page_size(),
         [&](const ggml_tensor * tensor) { return model.file_mapped(tensor); }) : UINT64_MAX;
-    auto admitted = cpu_sink_runtime->take_room(host_bytes, device_bytes, pages);
-    if (!admitted) {
-        LLAMA_LOG_ERROR("%s: host budget refused: %s\n", __func__, admitted.error.c_str());
+    auto room = cpu_sink_runtime->take_room(host_bytes, device_bytes, pages);
+    if (!room) {
+        LLAMA_LOG_ERROR("%s: host budget refused: %s\n", __func__, room.error.c_str());
         ggml_backend_sched_reset(sched.get());
         return false;
     }
+    // the room is taken, the pages the graph gathers among it: what reads them may start
+    if (admitted) { admitted(); }
     if (!ggml_backend_sched_reserve_prepared(sched.get(), graph)) { return false; }
     // New host COMPUTE chunks have already been touched by the allocator.
-    admitted.value.commit();
+    room.value.commit();
     return true;
 }
 
