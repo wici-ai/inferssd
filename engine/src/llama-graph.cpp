@@ -82,15 +82,18 @@ static ggml_tensor * ggml_mul_mat_aux(
     return res;
 }
 
+void llm_graph_input_embd::prefetch(const llama_ubatch * ubatch) {
+    // the batch's rows of a mapped table come in as one read each, before the lookup faults them in
+    if (table && ubatch->token) {
+        (void) llama_prefetch_rows(table->data, ggml_row_size(table->type, table->ne[0]), table->ne[1],
+            ubatch->token, size_t(ubatch->n_tokens));
+    }
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
-        // the batch's rows of a mapped table come in as one read each, before the lookup faults them in
-        if (table) {
-            (void) llama_prefetch_rows(table->data, ggml_row_size(table->type, table->ne[0]), table->ne[1],
-                ubatch->token, size_t(n_tokens));
-        }
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
@@ -1139,6 +1142,12 @@ void llm_graph_result::reset() {
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     for (auto & input : inputs) {
         input->set_input(ubatch);
+    }
+}
+
+void llm_graph_result::prefetch_inputs(const llama_ubatch * ubatch) {
+    for (auto & input : inputs) {
+        input->prefetch(ubatch);
     }
 }
 

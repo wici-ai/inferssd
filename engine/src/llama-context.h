@@ -61,6 +61,11 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    // The scheduler and its graphs dropped, a new one reserved on the next sched_reserve().
+    void drop_scheduler();
+    // A stand-in graph of `ubatch` tokens over `horizon` positions reserved in a new scheduler: false, and none, when it
+    // does not fit.
+    bool reserve_graph_ubatch(uint32_t ubatch, uint32_t horizon);
 
     void synchronize();
 
@@ -71,6 +76,8 @@ struct llama_context {
     // Request-scoped scheduler/cache exchange used by the default-off K3
     // grouped-prefill capacity ladder.
     bool moe_prefill_phase_workspace(bool active, uint32_t requested_tokens, uint32_t prefill_tokens);
+    // The first ubatch of a prompt whose own graph does not fit: a smaller ubatch for the batch's next split.
+    bool prefill_refit();
     // at load, after the load's passes: the expert caches filled from the drive (llama_ssd_preload)
     bool ssd_preload();
     // up, gate and down of every routed layer, in layer order
@@ -333,6 +340,11 @@ private:
     uint32_t cpu_prefill_configured_ubatch = 0;
     uint32_t cpu_prefill_selected_ubatch = 0;
     uint32_t cpu_prefill_graph_granularity = 1;
+    // A prefill phase's graph not yet reserved: its first ubatch reserves it (process_ubatch), over this horizon, for
+    // a prompt of this many tokens.
+    bool cpu_prefill_reserve_pending = false;
+    uint32_t cpu_prefill_horizon = 0;
+    uint32_t cpu_prefill_requested_tokens = 0;
     // Graph reserves cover the positions in use instead of the whole n_ctx
     // (LLAMA_RESERVE_HORIZON=0 restores full-context reserves).
     bool reserve_horizon_enabled = false;
