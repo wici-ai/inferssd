@@ -637,7 +637,8 @@ def system_memory() -> dict[str, int]:
 
 
 # The non-local segment group and the adapter query for segment sizes (d3dkmthk.h).
-_KMT_NON_LOCAL, _KMT_GETSEGMENTSIZE = 1, 3
+_KMT_NON_LOCAL, _KMT_GETSEGMENTSIZE, _KMT_ADAPTERTYPE = 1, 3, 15
+_KMT_INDIRECT_DISPLAY = 1 << 6  # D3DKMT_ADAPTERTYPE.IndirectDisplayDevice
 
 
 def discrete_video_memory() -> int:
@@ -647,7 +648,9 @@ def discrete_video_memory() -> int:
     without taking host memory, so a job's commit limit leaves room for it
     beside the host budget. An adapter is discrete when it also has a
     non-local segment group, the system memory it maps; an integrated
-    adapter's segments are host memory.
+    adapter's segments are host memory. An indirect display adapter (a
+    remote desktop session's, for one) renders on another adapter and
+    reports that adapter's memory, so it is left out.
     """
     gdi = _dll("gdi32")
     listing = _KmtEnumAdapters2()
@@ -660,6 +663,17 @@ def discrete_video_memory() -> int:
     total = 0
     try:
         for adapter in adapters[: listing.NumAdapters]:
+            kind = c_uint32()
+            described = _KmtQueryAdapterInfo(
+                hAdapter=adapter.hAdapter,
+                Type=_KMT_ADAPTERTYPE,
+                pPrivateDriverData=ctypes.cast(byref(kind), c_void_p),
+                PrivateDriverDataSize=sizeof(kind),
+            )
+            # an adapter whose type cannot be read is counted, as the engine's ledger does
+            described_ok = not gdi.D3DKMTQueryAdapterInfo(byref(described))
+            if described_ok and kind.value & _KMT_INDIRECT_DISPLAY:
+                continue
             non_local = _KmtVideoMemoryInfo(
                 hAdapter=adapter.hAdapter, MemorySegmentGroup=_KMT_NON_LOCAL
             )
