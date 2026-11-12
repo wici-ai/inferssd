@@ -69,7 +69,8 @@ bool process_use(uint64_t & bytes);
 // The process's commit (PrivateUsage), which the kernel holds against a job's memory limits.
 bool commit_use(uint64_t & bytes);
 // The video memory the process holds in the local segments of discrete adapters, which WDDM charges to its
-// commit. An adapter is discrete when it also has a non-local segment group; 0 without one.
+// commit. An adapter is discrete when it also has a non-local segment group and is not an indirect display adapter,
+// which reports the memory of the adapter it renders on; 0 without one.
 bool device_commit(uint64_t & bytes);
 // The video memory the process may still allocate in the local segments of the discrete adapters it holds memory on
 // (each one's budget less its usage), which WDDM will charge to its commit when it does; 0 without one.

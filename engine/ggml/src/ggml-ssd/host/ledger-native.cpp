@@ -46,19 +46,25 @@ struct kmt_video_memory_info {
     UINT64 budget, current_usage, current_reservation, available_for_reservation;
     UINT physical_adapter;
 };
+enum : int { kmt_query_adapter_type = 15 };       // KMTQAITYPE_ADAPTERTYPE
+enum : UINT { kmt_indirect_display = 1u << 6 };   // D3DKMT_ADAPTERTYPE::IndirectDisplayDevice
+struct kmt_query_adapter_info { kmt_handle adapter; int type; void * data; UINT size; };
 
 // The adapters whose local segments are not host memory: those that also have a non-local segment group, the
 // system memory a discrete GPU maps. A unified (integrated) adapter has the local group only, and its segments
-// are host memory. Opened once and kept open; an adapter added later is not seen.
+// are host memory. An indirect display adapter (a remote desktop session's, for one) has no memory of its own: it
+// renders on another adapter and reports that adapter's video memory, which would count twice. Opened once and kept
+// open; an adapter added later is not seen.
 struct discrete_adapters {
     LONG (APIENTRY * query)(kmt_video_memory_info *) = nullptr;
     std::vector<kmt_handle> handles;
     discrete_adapters() {
         LONG (APIENTRY * enumerate)(kmt_enum_adapters2 *) = nullptr;
         LONG (APIENTRY * close)(const kmt_close_adapter *) = nullptr;
+        LONG (APIENTRY * describe)(const kmt_query_adapter_info *) = nullptr;
         const HMODULE gdi = LoadLibraryW(L"gdi32.dll");
         if (!gdi || !resolve(gdi, "D3DKMTEnumAdapters2", enumerate) || !resolve(gdi, "D3DKMTCloseAdapter", close) ||
-                !resolve(gdi, "D3DKMTQueryVideoMemoryInfo", query)) {
+                !resolve(gdi, "D3DKMTQueryVideoMemoryInfo", query) || !resolve(gdi, "D3DKMTQueryAdapterInfo", describe)) {
             query = nullptr;
             return;
         }
@@ -69,10 +75,14 @@ struct discrete_adapters {
         if (enumerate(&list) != 0) { return; }
         found.resize(list.count);
         for (const kmt_adapter_info & adapter : found) {
+            UINT type = 0;
+            const kmt_query_adapter_info info{adapter.adapter, kmt_query_adapter_type, &type, UINT(sizeof(type))};
             kmt_video_memory_info non_local{};
             non_local.adapter = adapter.adapter;
             non_local.group = kmt_non_local;
-            if (query(&non_local) == 0 && non_local.budget > 0) {
+            // an adapter whose type cannot be read is counted, as before the type was asked
+            const bool indirect = describe(&info) == 0 && (type & kmt_indirect_display);
+            if (!indirect && query(&non_local) == 0 && non_local.budget > 0) {
                 handles.push_back(adapter.adapter);
                 continue;
             }
