@@ -10,8 +10,9 @@
 //      terminals run processes in jobs without one): JOB_OBJECT_LIMIT_JOB_MEMORY against the job's commit,
 //      JOB_OBJECT_LIMIT_PROCESS_MEMORY against the process's PrivateUsage. The kernel holds both against commit,
 //      which on a discrete GPU includes the device memory the process allocates: WDDM charges a device-local
-//      allocation to commit without taking host memory. Only the immediate job is visible; a limit set on the
-//      parent of a nested job is not.
+//      allocation to commit without taking host memory. So the video memory the process may still allocate on its
+//      discrete adapters counts as used too. Only the immediate job is visible; a limit set on the parent of a
+//      nested job is not.
 //      Both OSes: host.budget_mib against the process's host use: on Windows PrivateUsage less the video memory
 //      the process holds in the local segments of discrete adapters (D3DKMTQueryVideoMemoryInfo), on macOS
 //      phys_footprint, which on unified memory rightly counts the GPU's allocations. It applies beside a job
@@ -21,8 +22,10 @@
 //    A failed OS query leaves the term unreadable, and the RAM cache then admits nothing. The same limits, holding
 //    `extra` with no reserve beside it, are the limits of room.h.
 //  - system: memory available to a new allocation, less the floor and the open prefill's pages.
-//      Windows: min(ullAvailPhys, ullAvailPageFile plus what the paging files may still grow by), as commit
-//      is a hard limit there and a system-managed paging file grows on demand.
+//      Windows: min(ullAvailPhys, ullAvailPageFile plus what the paging files may still grow by, less the video
+//      memory the process may still allocate on its discrete adapters), as commit is a hard limit there, a
+//      system-managed paging file grows on demand, and WDDM charges the GPU's later allocations to the same commit:
+//      the RAM cache sized at load must leave them their commit.
 //      macOS: what a new allocation takes before the kernel compresses or swaps anyone's anonymous memory, by its
 //      own live thresholds (sysctl): the free pages above its free target, the file-backed pages above its file
 //      cache minimum (vm_page_filecache_min, which it keeps), and the purgeable pages; not the reusable ones, which
@@ -68,6 +71,9 @@ bool commit_use(uint64_t & bytes);
 // The video memory the process holds in the local segments of discrete adapters, which WDDM charges to its
 // commit. An adapter is discrete when it also has a non-local segment group; 0 without one.
 bool device_commit(uint64_t & bytes);
+// The video memory the process may still allocate in the local segments of the discrete adapters it holds memory on
+// (each one's budget less its usage), which WDDM will charge to its commit when it does; 0 without one.
+bool device_claimable(uint64_t & bytes);
 #endif
 // Memory available to a new allocation (the system term before the floor).
 bool available(uint64_t & bytes);
