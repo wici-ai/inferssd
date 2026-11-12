@@ -41,8 +41,8 @@ struct expert_cache_options {
     context_client * host = nullptr;
     client_config budget;
     bool require_shared = true;
-    // A GPU tier keeps experts in this DRAM (a unified-memory GPU with a nonzero vram.budget): an automatic RAM
-    // cache then keeps only the slots the next-layer prefetch lands in.
+    // A GPU tier keeps experts in this DRAM (a unified-memory GPU with a nonzero vram.budget and a tier that keeps
+    // experts across layers): an automatic RAM cache then keeps only the slots the next-layer prefetch lands in.
     bool gpu_tier = false;
     std::string cache_policy = "window", cache_allocation = "priority";
     bool cache_keep = false, cache_prefill_read = false, cache_elastic = false, cache_partial_reclaim = false;

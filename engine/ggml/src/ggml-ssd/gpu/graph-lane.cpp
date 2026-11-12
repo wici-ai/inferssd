@@ -611,8 +611,21 @@ const kimi_vram_host_api host_table = { 3, sizeof(kimi_vram_host_api), host_avai
 
 const settings_api settings_table = { 2, sizeof(settings_api), sizeof(runtime_services), create_lane };
 
-// The host ledger stays as without a GPU tier: the lane holds no expert across layers.
-bool device_is_unified(int) { return false; }
+// Whether the device's memory is the host's DRAM, which the host ledger then prices its buffers out of: an
+// integrated GPU, or a device whose backend says it shares host memory (Metal on Apple silicon). The lane is no GPU
+// tier either way: it holds no expert across layers.
+bool device_is_unified(int ordinal) {
+    ggml_backend_dev_t device;
+    {
+        std::lock_guard<std::mutex> lock(devices_mutex);
+        if (ordinal < 0 || size_t(ordinal) >= devices.size()) { return false; }
+        device = devices[size_t(ordinal)];
+    }
+    if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_IGPU) { return true; }
+    const auto shares = reinterpret_cast<bool (*)(ggml_backend_dev_t)>(ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(device), "ggml_backend_ssd_dev_shares_host_memory"));
+    return shares && shares(device);
+}
 bool attach_services(ggml_backend_t, const runtime_services *, char *, size_t) noexcept { return true; }
 void * no_stream(ggml_backend_t) { return nullptr; }
 

@@ -396,6 +396,8 @@ struct sink_vram {
         std::fill(out, out + count, uint8_t(0));
         if (context && residency) { residency->held(context, layer, experts, count, out); }
     }
+    // A tier that keeps experts across layers, not one that serves grouped prefill alone (the graph lane).
+    bool holds_experts() const { return context && !prefill_only; }
     void set_host_demand(uint64_t bytes) {
         if (context && policy_api) { policy_api->set_host_demand(context, bytes); }
     }

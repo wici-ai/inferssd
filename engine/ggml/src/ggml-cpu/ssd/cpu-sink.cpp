@@ -330,7 +330,9 @@ static ssd::host::expert_cache_options sink_cache_options(const sink_configurati
     out.budget = sink_host_configuration(value);
     out.require_shared = value.production;
     const auto * tier = value.settings.vram_budget();
-    out.gpu_tier = value.production ? tier && tier->tier_bytes(value.has_gpu) : value.policy.vram_budget != 0;
+    // a tier that keeps experts: a provider with residency (the graph lane has none)
+    out.gpu_tier = value.production ? tier && tier->tier_bytes(value.has_gpu) && value.gpu.residency :
+        value.policy.vram_budget != 0;
     const auto & policy = value.policy;
     out.cache_policy = policy.cache_policy;
     out.cache_allocation = policy.cache_allocation;
@@ -933,7 +935,7 @@ struct kimi_cpu_sink {
                 io_loop();
             });
             sink_pin(io_thread, io_cpus);
-            if (cache.ledger.state().unified && vram.context) {
+            if (cache.ledger.state().unified && vram.holds_experts()) {
                 watch_thread = std::thread([this] {
                     (void) ssd::platform::set_thread_role(ssd::platform::thread_role::background);
                     floor_watch_loop();
@@ -1795,17 +1797,17 @@ struct kimi_cpu_sink {
     // At load, storage before any request, so that no request waits for its page population. On unified memory the
     // GPU tier's (sink_vram::reserve), with the floor and the RAM cache's demand published first, as the first decode
     // layer publishes them before the tier sizes itself there; the RAM cache there only lands the prefetch and follows
-    // at the first decode token, from the demand the tier left. Elsewhere, unified memory without a GPU tier included,
-    // the RAM cache's (reserve_cache), when the cache can give room back (partial reclaim or elastic). experts: up, gate
-    // and down of n routed layers; the largest expert gives both their geometry. With a GPU tier each layer's types
-    // are kept first (record_expert_types).
+    // at the first decode token, from the demand the tier left. Elsewhere, unified memory without a GPU tier that
+    // keeps experts included (sink_vram::holds_experts), the RAM cache's (reserve_cache), when the cache can give room
+    // back (partial reclaim or elastic). experts: up, gate and down of n routed layers; the largest expert gives both
+    // their geometry. With a GPU tier each layer's types are kept first (record_expert_types).
     void reserve_tier(const ggml_tensor * const * experts, int n, int experts_used) {
         if (vram.context) { record_expert_types(experts, n); }
         const auto bytes = [&](int i) { return experts[3 * i]->nb[2] + experts[3 * i + 1]->nb[2] + experts[3 * i + 2]->nb[2]; };
         int largest = 0;
         for (int i = 1; i < n; ++i) { if (bytes(i) > bytes(largest)) { largest = i; } }
         const ggml_tensor * up = experts[3 * largest], * gate = experts[3 * largest + 1], * down = experts[3 * largest + 2];
-        if (!cache.ledger.state().unified || !vram.context) { reserve_cache(up, gate, down, experts_used); }
+        if (!cache.ledger.state().unified || !vram.holds_experts()) { reserve_cache(up, gate, down, experts_used); }
         if (!vram.context || cache.layers.empty()) { return; }
         refresh_floor("reserve");
         if (!cache.arena) { vram.set_host_demand(cache.pending_bytes(size_t(up->nb[2] + gate->nb[2] + down->nb[2]))); }

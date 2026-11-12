@@ -867,12 +867,22 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
     GGML_UNUSED(reg);
 }
 
+// Whether the device's memory is the host's DRAM (Apple silicon), for the SSD host ledger's pricing.
+static bool ggml_backend_metal_device_shares_host_memory(ggml_backend_dev_t dev) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
+    return ggml_metal_device_get_props(ctx_dev)->has_unified_memory;
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
     }
     if (strcmp(name, "ggml_backend_ssd_provider_v1") == 0) {
         return (void *)ssd::gpu::graph_lane_provider;
+    }
+    if (strcmp(name, "ggml_backend_ssd_dev_shares_host_memory") == 0) {
+        return (void *)ggml_backend_metal_device_shares_host_memory;
     }
 
     return NULL;
