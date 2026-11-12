@@ -10,6 +10,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-mmap.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
@@ -85,6 +86,11 @@ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
 
+        // the batch's rows of a mapped table come in as one read each, before the lookup faults them in
+        if (table) {
+            (void) llama_prefetch_rows(table->data, ggml_row_size(table->type, table->ne[0]), table->ne[1],
+                ubatch->token, size_t(n_tokens));
+        }
         ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
     }
 
@@ -2353,6 +2359,9 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     assert(n_embd_inp >= n_embd);
 
     auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    if (tok_embd && tok_embd->data && tok_embd->buffer && ggml_backend_buffer_is_host(tok_embd->buffer)) {
+        inp->table = tok_embd;
+    }
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
     cb(inp->tokens, "inp_tokens", -1);

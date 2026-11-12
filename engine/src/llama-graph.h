@@ -124,6 +124,9 @@ public:
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
+    // the token embedding where it is host memory: a batch's rows are prefetched (llama_prefetch_rows)
+    const ggml_tensor * table = nullptr;
+
     const int64_t n_embd = 0;
 };
 
