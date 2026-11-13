@@ -10,6 +10,7 @@
 #    include <io.h>
 #    include <sys/stat.h>
 #else
+#    include <sys/stat.h>
 #    include <unistd.h>
 #endif
 
@@ -42,7 +43,20 @@ int open_append(const std::filesystem::path & path) {
 #if defined(_WIN32)
     return _wopen(path.c_str(), _O_WRONLY | _O_CREAT | _O_APPEND | _O_BINARY | _O_NOINHERIT, _S_IREAD | _S_IWRITE);
 #else
-    return ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    // Optional logging must not wait for a FIFO reader. Validate the opened
+    // descriptor so a symlink or path replacement cannot select a special file.
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC | O_NONBLOCK, 0600);
+    if (fd < 0) {
+        return -1;
+    }
+    struct stat info{};
+    const int code = fstat(fd, &info) != 0 ? errno : !S_ISREG(info.st_mode) ? EINVAL : 0;
+    if (code) {
+        ::close(fd);
+        errno = code;
+        return -1;
+    }
+    return fd;
 #endif
 }
 
