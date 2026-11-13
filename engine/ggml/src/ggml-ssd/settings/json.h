@@ -7,7 +7,9 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <locale>
 #include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -252,7 +254,20 @@ class parser {
             }
         }
         out.text = text_.substr(begin, at_ - begin);
-        if (!std::isfinite(std::strtod(out.text.c_str(), nullptr))) {
+        char * end   = nullptr;
+        double value = std::strtod(out.text.c_str(), &end);
+        if (end != out.text.c_str() + out.text.size()) {
+            // JSON always uses a decimal point. A process using a decimal-comma
+            // locale can otherwise validate only the prefix before that point.
+            std::istringstream numeric(out.text);
+            numeric.imbue(std::locale::classic());
+            numeric >> std::noskipws >> value;
+            if (!numeric || !numeric.eof()) {
+                fail();
+                return {};
+            }
+        }
+        if (!std::isfinite(value)) {
             fail();
             return {};
         }

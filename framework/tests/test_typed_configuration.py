@@ -240,3 +240,46 @@ def test_unicode_source_and_receipt_preserved():
     value = parse("inferssd-settings 1\nprefetch.depth=2 # 来源=测量🐈\n", "设置🐈.ssd")
     assert value.at("prefetch.depth").location == "设置🐈.ssd:2"
     assert value.at("prefetch.depth").receipt == " 来源=测量🐈"
+
+
+@pytest.mark.parametrize("numeric_locale", ["C", "de_DE.UTF-8", "fr_FR.UTF-8"])
+@pytest.mark.parametrize(
+    "literal,accepted",
+    [
+        ("1.5", True),
+        ("-2.5e+3", True),
+        ("1.7976931348623157e308", True),
+        ("1.7976931348623158e308", True),
+        ("5e-324", True),
+        ("1.0e-999", True),
+        ("9007199254740993", True),
+        ("1.8e308", False),
+        ("-1.8e308", False),
+        ("1.0e999", False),
+        ("-0.1e999", False),
+        ("1e999", False),
+        ("1.0e309", False),
+    ],
+)
+def test_native_number_validation_is_locale_independent(
+    native_contract, tmp_path, numeric_locale, literal, accepted
+):
+    # Each locale lives in a separate native process, so the Python reader and
+    # concurrent tests keep their own locale. Some runners only install C.
+    path = tmp_path / "numbers.jsonl"
+    result = subprocess.run(
+        [str(native_contract), "--number-event", str(path), numeric_locale, literal],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 77:
+        pytest.skip(f"numeric locale {numeric_locale} is not installed")
+    assert result.returncode == (0 if accepted else 1), result.stderr
+    events = list(read_events(path.read_text(encoding="utf-8").split("\n")[:-1]))
+    if accepted:
+        assert [(e.sequence, e.name) for e in events] == [(0, "ssd.number"), (1, "ssd.after")]
+        assert events[0].payload == {"value": json.loads(literal)}
+        assert literal.encode() in path.read_bytes()
+    else:
+        assert [(e.sequence, e.name) for e in events] == [(0, "ssd.after")]
+    assert events[-1].payload == {}
