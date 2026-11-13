@@ -127,12 +127,12 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-hexagon/ggml-hexagon.cpp` | 1 | 0 |
 | `ggml/src/ggml-metal/CMakeLists.txt` | 2 | 0 |
 | `ggml/src/ggml-metal/ggml-metal-device.cpp` | 12 | 0 |
-| `ggml/src/ggml-metal/ggml-metal-device.h` | 13 | 0 |
-| `ggml/src/ggml-metal/ggml-metal-device.m` | 161 | 4 |
+| `ggml/src/ggml-metal/ggml-metal-device.h` | 16 | 0 |
+| `ggml/src/ggml-metal/ggml-metal-device.m` | 167 | 5 |
 | `ggml/src/ggml-metal/ggml-metal-impl.h` | 47 | 0 |
 | `ggml/src/ggml-metal/ggml-metal-ops.cpp` | 136 | 0 |
 | `ggml/src/ggml-metal/ggml-metal-ops.h` | 3 | 0 |
-| `ggml/src/ggml-metal/ggml-metal.cpp` | 106 | 0 |
+| `ggml/src/ggml-metal/ggml-metal.cpp` | 125 | 0 |
 | `ggml/src/ggml-metal/ggml-metal.metal` | 133 | 0 |
 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | 1 | 0 |
 | `ggml/src/ggml-openvino/ggml-openvino.cpp` | 1 | 0 |
@@ -153,7 +153,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/CMakeLists.txt` | 20 | 0 |
 | `src/llama-arch.cpp` | 168 | 2 |
 | `src/llama-arch.h` | 109 | 2 |
-| `src/llama-context.cpp` | 1637 | 194 |
+| `src/llama-context.cpp` | 1638 | 194 |
 | `src/llama-context.h` | 127 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
@@ -202,5 +202,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server.cpp` | 1 | 0 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 19721 added, 5983 removed across 159 upstream paths.
+Total: 19750 added, 5984 removed across 159 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
