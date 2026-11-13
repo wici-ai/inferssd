@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 from dataclasses import asdict, replace
+from types import SimpleNamespace
 
 import pytest
 from observe_engine_reference import CASES, observe
@@ -102,7 +103,9 @@ def test_environment_original_call_order(case):
 def test_post_exact_reference_events(case, monkeypatch):
     f, candidate = FEffects(case), FEffects(case)
     results = []
-    monkeypatch.setattr(core.urllib.request, "urlopen", candidate.urlopen)
+    monkeypatch.setattr(
+        core.urllib.request, "build_opener", lambda _: SimpleNamespace(open=candidate.urlopen)
+    )
     for function in (reference_api(f).post, core.post):
         try:
             results.append(
