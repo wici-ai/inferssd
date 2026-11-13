@@ -268,6 +268,19 @@ static ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
     /* .is_host          = */ NULL,
 };
 
+// A growable buffer type (ggml_backend_dev_buffer_type_growable): a Vulkan buffer type of the device's, which the device
+// supports as its own, whose buffers hold memory for a prefix only
+static ggml_backend_buffer_t ggml_backend_vk_buffer_type_growable_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
+static size_t ggml_backend_vk_buffer_type_growable_get_max_size(ggml_backend_buffer_type_t buft);
+static ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_growable_interface = {
+    /* .get_name         = */ ggml_backend_vk_buffer_type_name,
+    /* .alloc_buffer     = */ ggml_backend_vk_buffer_type_growable_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_vk_buffer_type_get_alignment,
+    /* .get_max_size     = */ ggml_backend_vk_buffer_type_growable_get_max_size,
+    /* .get_alloc_size   = */ ggml_backend_vk_buffer_type_get_alloc_size,
+    /* .is_host          = */ NULL,
+};
+
 class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
@@ -617,6 +630,8 @@ struct vk_device_struct {
     vk_device_architecture architecture;
     vk_queue compute_queue;
     vk_queue transfer_queue;
+    // the queue that binds memory to sparse buffers; null without sparse residency buffers, and with it growable ones
+    vk_queue * sparse_queue = nullptr;
     bool single_queue;
     bool support_async;
     bool async_use_transfer_queue;
@@ -878,6 +893,7 @@ struct vk_device_struct {
     vk_buffer sync_staging;
 
     ggml_backend_buffer_type buffer_type;
+    ggml_backend_buffer_type buffer_type_growable;
 
     bool disable_fusion;
     bool disable_host_visible_vidmem;
@@ -936,6 +952,14 @@ struct vk_buffer_struct {
     size_t size = 0;
     vk::DeviceAddress bda_addr {};
 
+    // A growable buffer: a sparse residency buffer over all its addresses, with one allocation bound after another to
+    // the prefix it holds memory for (ggml_vk_buffer_set_committed)
+    bool sparse = false;
+    uint32_t sparse_memory_type = 0;
+    size_t sparse_block = 0;
+    size_t committed = 0;
+    std::vector<std::pair<vk::DeviceMemory, size_t>> sparse_memory; // each allocation and the bytes it binds
+
     vk_device device;
 
     ~vk_buffer_struct() {
@@ -944,6 +968,13 @@ struct vk_buffer_struct {
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
+        if (sparse) {
+            device->device.destroyBuffer(buffer);
+            for (const auto & memory : sparse_memory) {
+                device->device.freeMemory(memory.first);
+            }
+            return;
+        }
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
     }
@@ -2659,7 +2690,7 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
     return indices;
 }
 
-static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
+static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::vector<vk::MemoryPropertyFlags> & req_flags_list,
                                        void *import_ptr = nullptr) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
     if (size > device->max_buffer_size) {
@@ -2826,38 +2857,42 @@ static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk:
     }
 }
 
+// The memory types a device's buffers take, in order of preference
+static std::vector<vk::MemoryPropertyFlags> ggml_vk_device_memory_flags(const vk_device& device) {
+    if (device->prefer_host_memory) {
+        return { vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                 vk::MemoryPropertyFlagBits::eDeviceLocal };
+    }
+    if (device->uma) {
+        // The CPU and the GPU share this memory, and a type both can use spares each tensor copy a submit and a
+        // fence wait. Cached, since the CPU reads uncached memory far slower than it writes it. Fall back to
+        // device memory, then to any host memory type
+        return { vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
+                     vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                 vk::MemoryPropertyFlagBits::eDeviceLocal,
+                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent };
+    }
+    if (device->disable_host_visible_vidmem) {
+        if (device->allow_sysmem_fallback) {
+            return { vk::MemoryPropertyFlagBits::eDeviceLocal,
+                     vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent };
+        }
+        return { vk::MemoryPropertyFlagBits::eDeviceLocal };
+    }
+    // use rebar if available, otherwise fallback to device only visible memory
+    if (device->allow_sysmem_fallback) {
+        return { vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                 vk::MemoryPropertyFlagBits::eDeviceLocal,
+                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent };
+    }
+    return { vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+             vk::MemoryPropertyFlagBits::eDeviceLocal };
+}
+
 static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     vk_buffer buf;
     try {
-        if (device->prefer_host_memory) {
-            buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                       vk::MemoryPropertyFlagBits::eDeviceLocal});
-        } else if (device->uma) {
-            // The CPU and the GPU share this memory, and a type both can use spares each tensor copy a submit and a
-            // fence wait. Cached, since the CPU reads uncached memory far slower than it writes it. Fall back to
-            // device memory, then to any host memory type
-            buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
-                                                           vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
-                                                       vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
-        } else if (device->disable_host_visible_vidmem) {
-            if (device->allow_sysmem_fallback) {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
-            } else {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
-            }
-        } else {
-            // use rebar if available, otherwise fallback to device only visible memory
-            if (device->allow_sysmem_fallback) {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                           vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
-            } else {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                           vk::MemoryPropertyFlagBits::eDeviceLocal});
-            }
-        }
+        buf = ggml_vk_create_buffer(device, size, ggml_vk_device_memory_flags(device));
     } catch (const vk::SystemError& e) {
         std::cerr << "ggml_vulkan: Device memory allocation of size " << size << " failed." << std::endl;
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
@@ -2865,6 +2900,118 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     }
 
     return buf;
+}
+
+// A growable buffer: its addresses, and so every tensor in it, are fixed at once; memory comes as
+// ggml_vk_buffer_set_committed binds it. Never mapped: reads and writes go through the GPU's copies.
+static vk_buffer ggml_vk_create_buffer_growable(vk_device& device, size_t size) {
+    if (size > device->max_buffer_size) {
+        throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
+    }
+
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+    if (size == 0) {
+        return buf;
+    }
+
+    vk::BufferUsageFlags usage_flags = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+    if (device->buffer_device_address) {
+        usage_flags |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+    buf->buffer = device->device.createBuffer({
+        vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency, size, usage_flags,
+        vk::SharingMode::eExclusive, 0, nullptr });
+
+    // the memory the device's own buffers take, only bound as the buffer grows
+    vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
+    vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+    std::vector<uint32_t> memory_types;
+    for (const vk::MemoryPropertyFlags & flags : ggml_vk_device_memory_flags(device)) {
+        memory_types = ggml_vk_find_memory_properties(&mem_props, &mem_req, flags);
+        if (!memory_types.empty()) {
+            break;
+        }
+    }
+    if (memory_types.empty()) {
+        device->device.destroyBuffer(buf->buffer);
+        throw vk::OutOfDeviceMemoryError("No memory type for a sparse buffer");
+    }
+
+    buf->sparse = true;
+    buf->sparse_memory_type = memory_types.front();
+    buf->sparse_block = mem_req.alignment;
+    // reached through the GPU only, whatever the memory type: nothing maps it
+    buf->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
+    buf->ptr = nullptr;
+    buf->device = device;
+    buf->size = size;
+
+    if (device->buffer_device_address) {
+        const vk::BufferDeviceAddressInfo addressInfo(buf->buffer);
+        buf->bda_addr = device->device.getBufferAddress(addressInfo);
+    }
+
+    device->memory_logger->log_allocation(buf, size);
+
+    return buf;
+}
+
+static void ggml_vk_bind_sparse(vk_buffer& buf, const std::vector<vk::SparseMemoryBind>& binds) {
+    vk_device& device = buf->device;
+    const vk::SparseBufferMemoryBindInfo buffer_binds(buf->buffer, (uint32_t) binds.size(), binds.data());
+    vk::BindSparseInfo info;
+    info.setBufferBinds(buffer_binds);
+    device->sparse_queue->queue.bindSparse(info, device->fence);
+    VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "bindSparse waitForFences");
+    device->device.resetFences({ device->fence });
+}
+
+// Memory for the first `bytes` of a growable buffer, or no more than those: a growth binds one allocation after the
+// prefix, a shrink unbinds and frees the allocations past `bytes` (the one it falls in stays). Nothing may be using
+// what a shrink gives back. False when the device has no memory for a growth.
+static bool ggml_vk_buffer_set_committed(vk_buffer& buf, size_t bytes) {
+    GGML_ASSERT(buf->sparse);
+    vk_device& device = buf->device;
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+
+    const size_t block = buf->sparse_block;
+    const size_t target = std::min(buf->size, (bytes + block - 1) / block * block);
+
+    std::vector<vk::SparseMemoryBind> unbinds;
+    std::vector<vk::DeviceMemory> unbound;
+    while (!buf->sparse_memory.empty() && buf->committed - buf->sparse_memory.back().second >= target) {
+        buf->committed -= buf->sparse_memory.back().second;
+        unbinds.push_back({ buf->committed, buf->sparse_memory.back().second, nullptr, 0 });
+        unbound.push_back(buf->sparse_memory.back().first);
+        buf->sparse_memory.pop_back();
+    }
+    if (!unbinds.empty()) {
+        ggml_vk_bind_sparse(buf, unbinds);
+        for (const auto & memory : unbound) {
+            device->device.freeMemory(memory);
+        }
+    }
+    if (target <= buf->committed) {
+        return true;
+    }
+
+    const size_t more = target - buf->committed;
+    const vk::MemoryPriorityAllocateInfoEXT mem_priority_info { 1.0f };
+    vk::MemoryAllocateFlagsInfo mem_flags_info { device->buffer_device_address ? vk::MemoryAllocateFlags(vk::MemoryAllocateFlagBits::eDeviceAddress) : vk::MemoryAllocateFlags() };
+    if (device->memory_priority) {
+        mem_flags_info.setPNext(&mem_priority_info);
+    }
+    vk::DeviceMemory memory;
+    try {
+        memory = device->device.allocateMemory({ (more + block - 1) / block * block, buf->sparse_memory_type, &mem_flags_info });
+    } catch (const vk::SystemError& e) {
+        GGML_LOG_ERROR("ggml_vulkan: no memory for %.2f MiB more of a growable buffer: %s\n", more/1048576.0, e.what());
+        return false;
+    }
+    ggml_vk_bind_sparse(buf, { { buf->committed, more, memory, 0 } });
+    buf->sparse_memory.push_back({ memory, more });
+    buf->committed = target;
+    return true;
 }
 
 static void ggml_vk_destroy_buffer(vk_buffer& buf) {
@@ -5654,6 +5801,20 @@ static vk_device ggml_vk_get_device(size_t idx) {
             /* .iface    = */ ggml_backend_vk_buffer_type_interface,
             /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
+        };
+
+        if (device_features2.features.sparseBinding && device_features2.features.sparseResidencyBuffer) {
+            for (vk_queue * q : { &device->transfer_queue, &device->compute_queue }) {
+                if (queue_family_props[q->queue_family_index].queueFlags & vk::QueueFlagBits::eSparseBinding) {
+                    device->sparse_queue = q;
+                    break;
+                }
+            }
+        }
+        device->buffer_type_growable = {
+            /* .iface    = */ ggml_backend_vk_buffer_type_growable_interface,
+            /* .device   = */ device->buffer_type.device,
+            /* .context  = */ device->buffer_type.context,
         };
 
         device->fence = device->device.createFence({});
@@ -13806,7 +13967,11 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
 static void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
-    ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, buffer->size);
+    // a growable buffer holds memory for its committed prefix only
+    const size_t size = ctx->dev_buffer->sparse ? ctx->dev_buffer->committed : buffer->size;
+    if (size > 0) {
+        ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, size);
+    }
 }
 
 static ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
@@ -13860,6 +14025,28 @@ static size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_typ
     return ggml_nbytes(tensor);
 
     UNUSED(buft);
+}
+
+static ggml_backend_buffer_t ggml_backend_vk_buffer_type_growable_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+
+    vk_buffer dev_buffer = nullptr;
+    try {
+        dev_buffer = ggml_vk_create_buffer_growable(ctx->device, size);
+    } catch (const vk::SystemError& e) {
+        GGML_LOG_ERROR("ggml_vulkan: growable buffer of %.2f MiB failed: %s\n", size/1048576.0, e.what());
+        return nullptr;
+    }
+
+    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
+
+    return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
+}
+
+// a sparse buffer is not one allocation: it is bound by the buffer size limit only
+static size_t ggml_backend_vk_buffer_type_growable_get_max_size(ggml_backend_buffer_type_t buft) {
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+    return ctx->device->max_buffer_size;
 }
 
 ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
@@ -16263,10 +16450,39 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// ggml_backend_dev_buffer_type_growable: the device's growable buffer type, null without sparse residency buffers
+static ggml_backend_buffer_type_t ggml_backend_vk_device_buffer_type_growable(ggml_backend_dev_t dev) {
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+    vk_device device = ggml_vk_get_device(ctx->device);
+    return device->sparse_queue ? &device->buffer_type_growable : nullptr;
+}
+
+// ggml_backend_buffer_set_committed: a growable buffer holds memory for its first `bytes`, or no more than those;
+// false when the device has no memory for them
+static bool ggml_backend_vk_buffer_set_committed(ggml_backend_buffer_t buffer, size_t bytes) {
+    ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *) buffer->context;
+    return !ctx->dev_buffer->sparse || ggml_vk_buffer_set_committed(ctx->dev_buffer, bytes);
+}
+
+// ggml_backend_buffer_get_committed: the bytes a buffer holds memory for
+static size_t ggml_backend_vk_buffer_get_committed(ggml_backend_buffer_t buffer) {
+    ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *) buffer->context;
+    return ctx->dev_buffer->sparse ? ctx->dev_buffer->committed : ggml_backend_buffer_get_size(buffer);
+}
+
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_ssd_provider_v1") == 0) {
         return (void *) ssd::gpu::graph_lane_provider;
+    }
+    if (strcmp(name, "ggml_backend_dev_buffer_type_growable") == 0) {
+        return (void *) ggml_backend_vk_device_buffer_type_growable;
+    }
+    if (strcmp(name, "ggml_backend_buffer_set_committed") == 0) {
+        return (void *) ggml_backend_vk_buffer_set_committed;
+    }
+    if (strcmp(name, "ggml_backend_buffer_get_committed") == 0) {
+        return (void *) ggml_backend_vk_buffer_get_committed;
     }
     return nullptr;
 }
