@@ -205,3 +205,50 @@ def test_user_io_cpus_on_a_decode_cpu_drop_the_decode_cpus():
     result = apply(strategy(threads=DECODE_ON_FAST), user)
     assert result.threads == Threads(10, 19, ())
     assert result.dropped == ("threads.decode_cpus",)
+
+
+def test_user_decode_cpus_replace_strategy_cpus_for_both_pools():
+    user = Threads(decode_cpus=(2, 3, 4))
+    result = apply(strategy(), parse(None, platform="linux"), user)
+
+    assert result.threads == Threads(None, 11, (), user.decode_cpus)
+    assert "threads.cpus" in result.kept
+    assert result.dropped == ("threads.decode",)
+    check(result)
+
+
+def test_user_decode_cpus_survive_when_strategy_has_no_thread_counts():
+    user = Threads(decode_cpus=(2, 3))
+    result = apply(strategy(threads=Threads()), parse(None, platform="linux"), user)
+
+    assert result.threads == user
+    assert result.dropped == ()
+    assert threadpools(result.threads, "linux") == Threads(2, 2, (), (2, 3))
+
+
+def test_invalid_user_decode_count_is_not_silently_discarded():
+    user = Threads(decode=8, decode_cpus=(2, 3))
+    result = apply(strategy(threads=DECODE_ON_FAST), parse(None, platform="linux"), user)
+
+    assert result.threads.decode == user.decode
+    assert result.threads.decode_cpus == user.decode_cpus
+    with pytest.raises(ValueError, match="decode thread count exceeds"):
+        threadpools(result.threads, "linux")
+
+
+@pytest.mark.parametrize("decode", [None, 10])
+def test_user_participants_beyond_strategy_decode_cpus_drop_the_pin(decode):
+    own = Threads(decode, 19, (), DECODE_ON_FAST.decode_cpus)
+    user = parse(None, overrides=[("cpu.decode_participants", "12")], platform="linux")
+    result = apply(strategy(threads=own), user)
+
+    assert result.threads == Threads(None, 19)
+    assert "threads.decode_cpus" in result.dropped
+    assert result.settings.at("cpu.decode_participants") == user.at("cpu.decode_participants")
+    check(result)
+
+
+def test_launch_conflicts_infers_decode_count_from_decode_cpus():
+    assert launch_conflicts(Threads(decode_cpus=(2, 3)), (), 3, "linux") == [
+        "cpu.decode_participants exceeds the decode thread count"
+    ]

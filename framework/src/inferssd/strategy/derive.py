@@ -380,7 +380,7 @@ def launch_conflicts(
         found.append("the decode thread count exceeds the decode CPUs")
     if set(io) & set(cpus + decode_cpus):
         found.append("cpu.io_cpus overlaps the strict compute CPUs")
-    decode = threads.decode or (len(cpus) if cpus else None)
+    decode = threads.decode or len(cpus or decode_cpus) or None
     if decode is not None and participants > decode:
         found.append("cpu.decode_participants exceeds the decode thread count")
     return found

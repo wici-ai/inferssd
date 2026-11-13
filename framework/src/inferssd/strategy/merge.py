@@ -38,8 +38,8 @@ class Applied:
     ``kept`` names the strategy proposals a user value replaced; ``dropped``
     those left out because they contradict a user value. Thread pool fields
     are named ``threads.decode``, ``threads.batch``, ``threads.cpus`` and
-    ``threads.decode_cpus``; the user's CPU set for both pools replaces a
-    decode CPU set.
+    ``threads.decode_cpus``; either kind of user CPU set replaces the
+    strategy's CPU set for the other kind.
     """
 
     settings: Snapshot
@@ -71,13 +71,13 @@ def apply(strategy: Strategy, snapshot: Snapshot, threads: Threads = Threads()) 
     fields = {
         "decode": user.decode is None and own.decode is not None,
         "batch": user.batch is None and own.batch is not None,
-        "cpus": not user.cpus and bool(own.cpus),
+        "cpus": not user.cpus and not user.decode_cpus and bool(own.cpus),
         "decode_cpus": not user.cpus and not user.decode_cpus and bool(own.decode_cpus),
     }
     given = (
         ("decode", user.decode),
         ("batch", user.batch),
-        ("cpus", user.cpus),
+        ("cpus", user.cpus or user.decode_cpus),
         ("decode_cpus", user.decode_cpus or user.cpus),
     )
     kept += ["threads." + name for name, value in given if value and getattr(own, name)]
@@ -114,8 +114,11 @@ def apply(strategy: Strategy, snapshot: Snapshot, threads: Threads = Threads()) 
         elif fields[name]:
             drop(name)
     if merged.decode_cpus and (merged.decode or 0) > len(merged.decode_cpus):
-        drop("decode_cpus" if fields["decode_cpus"] else "decode")
-    if merged.decode_cpus and merged.batch is None:
+        if fields["decode_cpus"]:
+            drop("decode_cpus")
+        elif fields["decode"]:
+            drop("decode")
+    if merged.decode_cpus and merged.batch is None and fields["decode_cpus"]:
         # Without a count of its own the batch pool would take the decode CPUs.
         drop("decode_cpus")
     # I/O CPUs outside the strict compute CPUs.
@@ -130,7 +133,7 @@ def apply(strategy: Strategy, snapshot: Snapshot, threads: Threads = Threads()) 
             drop("decode_cpus")
     # Decode participants within the decode threads (a strict CPU set sizes an unset count).
     participants = cast(int, current("cpu.decode_participants"))
-    decode = merged.decode or (len(merged.cpus) if merged.cpus else None)
+    decode = merged.decode or len(merged.cpus or merged.decode_cpus) or None
     if decode is not None and participants > decode:
         if "cpu.decode_participants" in proposed:
             del proposed["cpu.decode_participants"]
@@ -140,6 +143,8 @@ def apply(strategy: Strategy, snapshot: Snapshot, threads: Threads = Threads()) 
                 drop("decode")
             if fields["cpus"] and participants > len(merged.cpus):
                 drop("cpus")
+            if fields["decode_cpus"] and participants > len(merged.decode_cpus):
+                drop("decode_cpus")
 
     entries = tuple(proposed.get(item.key, item) for item in snapshot.entries)
     result = replace(snapshot, entries=entries)
