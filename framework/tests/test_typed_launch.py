@@ -119,6 +119,28 @@ def test_settings_file_and_cli_provenance_reach_native_argv(tmp_path, platform):
         resolve(inputs, spec, adapter, out, platform)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="control characters are not Windows filenames")
+@pytest.mark.parametrize("separator", ["-", "\n", "\r", "\r\n"])
+def test_materialized_settings_accept_the_original_source_path(tmp_path, separator):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    original = Path(spec.settings_file)
+    source = original.with_name("input" + separator + "settings.ssd")
+    # Without an explicit receipt, rendering records the original filename.
+    source.write_text(
+        "inferssd-settings 1\nprefetch.depth=4\nexpert.source="
+        + json.dumps([str(original.parent / "provided.tsv")])
+        + "\n",
+        encoding="utf-8",
+    )
+    spec = replace(spec, settings_file=str(source), overrides=())
+    result = resolve(inputs, spec, adapter, out)
+    assert result.code == 0
+    generated = Path(result.argv[result.argv.index("--ssd-settings") + 1])
+    settings = parse(generated.read_text(encoding="utf-8"), str(generated))
+    assert settings.at("prefetch.depth").value == 4
+    assert settings.at("expert.source").value == (str(original.parent / "provided.tsv"),)
+
+
 @pytest.mark.parametrize(
     "platform,present,chosen",
     [

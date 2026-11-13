@@ -239,5 +239,8 @@ def render(snapshot: Snapshot) -> str:
         elif item.value == "auto":
             literal = "auto"
         receipt = item.receipt or f" source={item.origin}; input={item.location}"
+        # A source filename or generated receipt can contain line breaks. Keep
+        # provenance within one comment line, including after text-mode reads.
+        receipt = receipt.replace("\r", r"\r").replace("\n", r"\n")
         lines.append(f"{item.key} = {literal}  #{receipt}")
     return "\n".join(lines) + "\n"
