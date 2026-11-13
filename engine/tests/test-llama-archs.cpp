@@ -737,7 +737,7 @@ static int test_kv_grow(const llm_arch target_arch, const size_t seed, const ggm
     std::vector<ggml_backend_dev_t> devices = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) };
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
             devices.push_back(dev);
         }
     }
@@ -784,7 +784,7 @@ static int test_kv_grow(const llm_arch target_arch, const size_t seed, const ggm
         bool ok = true;
 
         // grows from 8192 cells to 16384 between n0 and n1, in place; a device without growable buffers (the CPU on
-        // Windows) allocates every cell at once
+        // Windows, Vulkan without sparse residency buffers) allocates every cell at once
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
         auto * growable_buft = (ggml_backend_buffer_type_t (*)(ggml_backend_dev_t))
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_buffer_type_growable");

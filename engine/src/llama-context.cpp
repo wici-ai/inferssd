@@ -718,8 +718,8 @@ uint32_t llama_context::fit_context(const llama_memory_params & params_mem) cons
         }
         return true;
     };
-    // A cache that cannot allocate its cells as they are used (a device without growable buffers, Vulkan; a transposed
-    // V) holds all of them from the start, taking memory the expert caches would use before any conversation needs it:
+    // A cache that cannot allocate its cells as they are used (a device without growable buffers; a transposed V)
+    // holds all of them from the start, taking memory the expert caches would use before any conversation needs it:
     // it holds no more than most conversations reach.
     constexpr uint32_t n_allocated_at_once = 32768;
     uint32_t n = can_grow ? n_train - n_train % step : std::min(n_train - n_train % step, n_allocated_at_once);
