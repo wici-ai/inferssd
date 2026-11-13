@@ -235,6 +235,10 @@ foreach(ring_target ggml-ssd-linux-ring ggml-ssd-win-ring)
 endforeach()
 add_test(NAME ssd_read_ring COMMAND test-ssd-read-ring)
 set_tests_properties(ssd_read_ring PROPERTIES LABELS main TIMEOUT 120)
+add_executable(test-ssd-pool-completions ssd/test-ssd-pool-completions.cpp)
+target_link_libraries(test-ssd-pool-completions PRIVATE ggml-ssd-pool-ring)
+add_test(NAME ssd_pool_completions COMMAND test-ssd-pool-completions)
+set_tests_properties(ssd_pool_completions PROPERTIES LABELS main TIMEOUT 120)
 
 # The expert store's source index on this OS: direct descriptors, identity, lifetime.
 if (TARGET ggml-ssd-c0-store)
