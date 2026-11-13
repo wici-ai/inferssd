@@ -107,7 +107,7 @@ than a fixed-token numerical acceptance test.
 
 Payload verification should become an enforceable source contract; adaptive
 balancing stability, async failure coverage and cross-platform builds remain
-work before promotion from draft. Configuration tests also cover independent
+follow-up work for this opt-in experiment. Configuration tests also cover independent
 production contexts, caller snapshot replacement, and invalid combinations
 rejected before workers start.
 
