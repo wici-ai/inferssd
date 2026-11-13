@@ -19,6 +19,11 @@ from inferssd.telemetry.types import Record
 TRACE_ENV = "GGML_KIMI_CPU_SINK_TRACE=1 GGML_KIMI_CPU_SINK_PROFILE=1"
 
 
+def _opener() -> urllib.request.OpenerDirector:
+    # Health and control requests reach the owned local listener, never an environment proxy.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 class Owner(Protocol):
     def poll(self) -> Optional[int]: ...
     def confirm_listener(self, port: int) -> None: ...
@@ -54,7 +59,7 @@ class NativeEffects:
         time.sleep(seconds)
 
     def health(self, port: int) -> bytes:
-        with urllib.request.urlopen(f"http://{self.address}:{port}/health", timeout=2) as response:
+        with _opener().open(f"http://{self.address}:{port}/health", timeout=2) as response:
             value: bytes = response.read()
             return value
 
@@ -78,7 +83,7 @@ def post(port: int, path: str, body: Record, timeout: float = 7200) -> object:
         json.dumps(body, ensure_ascii=False).encode(),
         {"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with _opener().open(request, timeout=timeout) as response:
         value: object = json.loads(response.read())
         return value
 
