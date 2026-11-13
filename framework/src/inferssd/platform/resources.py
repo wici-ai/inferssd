@@ -219,11 +219,15 @@ class Resources:
         # /proc/net/tcp shows the address as its 32-bit word in hex, in memory order.
         word = struct.unpack("=I", socket.inet_aton(host))[0]
         address = f"{word:08X}:{port:04X}"
-        sockets = {
-            p.readlink().as_posix()[8:-1]
-            for p in Path(f"/proc/{pid}/fd").iterdir()
-            if p.is_symlink() and str(p.readlink()).startswith("socket:[")
-        }
+        sockets = set()
+        for descriptor in Path(f"/proc/{pid}/fd").iterdir():
+            try:
+                target = descriptor.readlink().as_posix()
+            except FileNotFoundError:
+                # Other server threads may close a descriptor during this scan.
+                continue
+            if target.startswith("socket:["):
+                sockets.add(target[8:-1])
         for line in Path(f"/proc/{pid}/net/tcp").read_text().splitlines()[1:]:
             fields = line.split()
             if fields[1] == address and fields[3] == "0A" and fields[9] in sockets:
