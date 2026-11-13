@@ -74,6 +74,8 @@ from inferssd.source.header import SHARD
 MIN_FILE_BYTES = 1 << 30
 MAX_FILES = 8
 TEST_FILE_BYTES = 4 << 30  # spread over 4 GiB, reads do not stay in a drive's own cache
+# cpuprobe uses GGML_MAX_N_THREADS for counts and for its CPU-mask length.
+PROBE_CAPACITY = 512
 # ggml's CPU feature list also names build options; they are not instruction sets.
 BUILD_OPTIONS = frozenset(("ACCELERATE", "CPU_HBM", "KLEIDIAI", "LLAMAFILE", "OPENMP", "REPACK"))
 Clock = Callable[[], float]
@@ -244,12 +246,20 @@ def probe_threads(cpu: CPU) -> list[int]:
 
     A prompt pass runs on the measured count that computes fastest of those that
     leave the sink's I/O threads a CPU, so every CPU but one is measured as well.
+    Counts stop at the native probe's capacity; the topology still names every CPU.
     """
     total = len(cpu["logical"])
     fast = next(
         (len(row["cpus"]) for row in cpu["clusters"] if row["kind"] == "performance"), total
     )
-    return sorted({*curve_threads(total), fast, *([total - 1] if total > 1 else [])})
+    largest = min(total, PROBE_CAPACITY)
+    return sorted(
+        {
+            *curve_threads(largest),
+            min(fast, largest),
+            *([min(total - 1, largest)] if total > 1 else []),
+        }
+    )
 
 
 def pinned_sets(cpu: CPU) -> list[list[int]]:
@@ -385,6 +395,11 @@ def measure_cpu(
         )
         for group in pinned_sets(cpu):
             listed = ",".join(map(str, group))
+            if group[-1] >= PROBE_CAPACITY:
+                reason = f"CPU IDs exceed the probe's 0..{PROBE_CAPACITY - 1} mask"
+                unpinned.append(f"pinned to CPUs {listed}: {reason}")
+                progress(f"CPU probe: skipped CPUs {listed}: {reason}")
+                continue
             # Decode may run on the performance cluster alone: its curve, the first CPUs first.
             counts = curve_threads(len(group)) if group == performance else [len(group)]
             progress(f"CPU probe: one token with a thread pinned to each of CPUs {listed}")
