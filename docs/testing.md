@@ -30,6 +30,30 @@ fetches the model that `test-thread-safety` and `test-state-restore-fragmented` 
 compares its recorded snapshots with the current Hugging Face files, and `test-jinja-py`
 needs `python3` with `jinja2`; exclude them with `ctest -E` where these are unavailable or have changed.
 
+## Persistent prompt position settings
+
+`test-server-prompt-fingerprint` is a model-free check for the RoPE/YaRN overrides
+and resolved context sizes in the disk-cache fingerprint. It also checks adjacent
+float values, locale independence and reuse across unrelated sampling/thread
+changes. The Linux CPU CI gate runs it.
+
+`test-server-prompt-fingerprint-native` uses the actual server request queue,
+disk-cache save and restart with a fully resident tiny DeepSeek41 model. It checks
+all output logits against fresh CPU runs within an absolute tolerance of `1e-5`: an unchanged RoPE configuration reuses
+the saved prefix, while a changed frequency base must recompute it. This fixture
+does not exercise SSD resource admission or establish model performance. With the
+generator's NumPy and `gguf-py` dependencies available:
+
+```sh
+PYTHONPATH=engine/gguf-py python3 engine/tests/ssd/fixtures/c0-store/make-tiny.py --out build-linux-cpu/prompt-models
+cmake --build build-linux-cpu --target test-server-prompt-fingerprint-native
+build-linux-cpu/bin/test-server-prompt-fingerprint-native build-linux-cpu/prompt-models/deepseek41-mxfp4.gguf build-linux-cpu/prompt-position-run
+```
+
+The last argument must name a new directory; the fixture leaves its prompt files
+there for inspection. A change to the position-key version also invalidates old
+entries whose fingerprint did not describe those settings.
+
 ## Shared expert store
 
 `LLAMA_SSD_STORE` is on by default on Linux, macOS and Windows. The store is a

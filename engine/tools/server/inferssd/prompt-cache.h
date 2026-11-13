@@ -116,7 +116,7 @@ struct server_prompt_cache {
     }
 
     // Keep the prompts in files under `dir` instead of in memory. They outlive the server: prompts saved by a server
-    // with the same fingerprint (model file, build) are found again on start, other files are removed. Loading a
+    // with the same fingerprint (model file, build, position settings) are found again on start, other files are removed. Loading a
     // prompt leaves its file in place, so a shared prefix serves every conversation that starts with it.
     void use_dir(const std::string & dir, const std::string & fingerprint);
 
