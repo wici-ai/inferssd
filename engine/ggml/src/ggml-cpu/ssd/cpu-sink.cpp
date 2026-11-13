@@ -778,6 +778,16 @@ struct kimi_cpu_sink {
     // the decode plan would move an expert from, one at a time, in the drive's shadow; unlocked before their pages go
     // (sink_cache::before_discard).
     kimi_host_lock host_lock;
+    // In-place reads of the RAM cache's slots, on a GPU that reads host memory in place once it is shown the memory
+    // (kimi_vram_host_costs::in_place_only: the graph lane on unified memory). A prefill pass registers each slot it
+    // moves an expert from (register_host; a Metal no-copy buffer costs about 4 us), and the slot stays registered
+    // until its pages are discarded (sink_cache::before_discard). Else the lane copies every RAM expert it runs into
+    // its working memory: about 92 GB for a 4,104-token DeepSeek V4.1 prompt on a Mac.
+    struct slot_import_state {
+        bool decided = false, enabled = false;
+        std::vector<uint8_t> imported;  // per cache entry
+        uint64_t registered = 0, released = 0, failures = 0;
+    } slot_imports;
     // A diagnostic switch for A/B runs; on by default.
     const bool host_gpu_enabled = true;
     std::vector<uint8_t> staged_quant_hidden;
@@ -2285,14 +2295,64 @@ struct kimi_cpu_sink {
         host_lock.offer(left / learning.read_bytes_per_us, double(cache.stride) / 13600.0, cache.arena, cache.stride,
             cache.entries.size(), [&](size_t i) { return cache.entries[i].resident; });
     }
-    // sink_cache::before_discard: unlock entries [first, first + count) before their pages go.
-    void host_unlock(size_t first, size_t count) { host_lock.unlock(first, count, cache.arena, cache.stride); }
+    // sink_cache::before_discard: unlock entries [first, first + count) before their pages go, and unregister the
+    // ones registered for in-place reads (else the device would keep the old pages and read stale bytes).
+    void host_unlock(size_t first, size_t count) {
+        host_lock.unlock(first, count, cache.arena, cache.stride);
+        auto & imported = slot_imports.imported;
+        for (size_t s = first; s < imported.size() && s - first < count; ++s) {
+            if (!imported[s]) { continue; }
+            imported[s] = 0;
+            if (vram.unregister_host(cache.arena + s * cache.stride)) { ++slot_imports.released; }
+            else { ++slot_imports.failures; }
+        }
+    }
+    // Whether a prefill pass registers the slots it moves experts from: a device that reads host memory in place only
+    // once shown it, a page-aligned stride and arena. Decided once the arena exists.
+    void slot_import_decide() {
+        if (slot_imports.decided || !cache.arena || !cache.stride || !vram.context || !vram.host_api) { return; }
+        slot_imports.decided = true;
+        kimi_vram_host_costs c = {};
+        vram.host_api->costs2(vram.context, &c);
+        slot_imports.enabled = host_gpu_enabled && c.in_place && c.in_place_only &&
+            cache.stride % cache.page_size == 0 && uintptr_t(cache.arena) % cache.page_size == 0;
+        std::fprintf(stderr, "[kimi_host_import] reason=decided enabled=%d in_place=%d in_place_only=%d stride=%zu\n",
+            int(slot_imports.enabled), int(c.in_place), int(c.in_place_only), cache.stride);
+    }
+    // Before a prefill pass launches on the GPU: each slot it moves an expert from, registered for in-place reads. A
+    // refusal leaves that expert to be copied, as before.
+    void slot_import_pass() {
+        slot_import_decide();
+        if (!slot_imports.enabled) { return; }
+        auto & imported = slot_imports.imported;
+        if (imported.size() != cache.entries.size()) { imported.resize(cache.entries.size(), 0); }
+        for (const auto & t : vram.prefill_transient) {
+            if (t.source != KIMI_VRAM_PREFILL_TRANSIENT_RAM || t.request_index < 0 ||
+                    size_t(t.request_index) >= requests.size()) {
+                continue;
+            }
+            const int entry = requests[size_t(t.request_index)].cache_hit;
+            if (entry < 0 || size_t(entry) >= imported.size() || imported[size_t(entry)]) { continue; }
+            if (vram.register_host(cache.arena + size_t(entry) * cache.stride, cache.stride)) {
+                imported[size_t(entry)] = 1;
+                ++slot_imports.registered;
+            } else {
+                ++slot_imports.failures;
+            }
+        }
+    }
     void host_lock_stop() {
         host_lock.stop();
-        if (cache.arena) { host_unlock(0, host_lock.snapshot().size()); }
+        if (cache.arena) { host_unlock(0, std::max(host_lock.snapshot().size(), slot_imports.imported.size())); }
         if (host_lock.decided) {
             std::lock_guard<std::mutex> lock(host_lock.mutex);
             host_lock.report(stderr, "destroy", cache.stride);
+        }
+        if (slot_imports.decided) {
+            std::fprintf(stderr,
+                "[kimi_host_import] reason=destroy enabled=%d registered=%llu released=%llu failures=%llu\n",
+                int(slot_imports.enabled), (unsigned long long) slot_imports.registered,
+                (unsigned long long) slot_imports.released, (unsigned long long) slot_imports.failures);
         }
         cache.before_discard = nullptr;
     }
@@ -3881,6 +3941,7 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         sink->vram.select_prefill_transient(
             sink->requests, *batch, sink->cache, staging_limit, sink->slots.size(),
             sink->place_table(batch->ntokens, route_bytes));
+        sink->slot_import_pass();
 
         size_t ssd_transient_count = 0;
         for (const auto & request : sink->requests) {

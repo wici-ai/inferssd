@@ -238,23 +238,29 @@ struct lane {
                 throw std::runtime_error("the GPU lane has no such activation");
         }
     }
-    // The range the device can read these bytes in, at an offset it allows; null: they need a copy.
-    const imported_range * readable(const void * data, size_t bytes) {
+    // The range the device can read these bytes in, at an offset it allows (a copy of it); false: they need a copy.
+    // The ranges are sorted by base and do not overlap: the read ring's buffers and the RAM cache's slots.
+    bool readable(const void * data, size_t bytes, imported_range & out) {
         const char * pointer = static_cast<const char *>(data);
         std::lock_guard<std::mutex> lock(imports_mutex);
-        for (const auto & range : imports) {
-            if (pointer < range.base || pointer + bytes > range.base + range.bytes) { continue; }
-            return size_t(pointer - range.base) % tensor_alignment ? nullptr : &range;
+        auto after = std::upper_bound(imports.begin(), imports.end(), pointer,
+            [](const char * p, const imported_range & r) { return p < r.base; });
+        if (after == imports.begin()) { return false; }
+        const imported_range & range = *(after - 1);
+        if (pointer + bytes > range.base + range.bytes || size_t(pointer - range.base) % tensor_alignment) {
+            return false;
         }
-        return nullptr;
+        out = range;
+        return true;
     }
     // A weight matrix where it is, when the device can read it there; else a copy in working memory.
     void place_weights(ggml_tensor * tensor, const void * data, ggml_tallocr & scratch) {
         const size_t bytes = ggml_nbytes(tensor);
-        if (const imported_range * range = readable(data, bytes)) {
-            const size_t offset = size_t(static_cast<const char *>(data) - range->base);
-            if (ggml_backend_tensor_alloc(range->buffer, tensor,
-                    static_cast<char *>(ggml_backend_buffer_get_base(range->buffer)) + offset) != GGML_STATUS_SUCCESS) {
+        imported_range range = {};
+        if (readable(data, bytes, range)) {
+            const size_t offset = size_t(static_cast<const char *>(data) - range.base);
+            if (ggml_backend_tensor_alloc(range.buffer, tensor,
+                    static_cast<char *>(ggml_backend_buffer_get_base(range.buffer)) + offset) != GGML_STATUS_SUCCESS) {
                 throw std::runtime_error("the GPU lane cannot place a weight matrix in host memory");
             }
             return;
@@ -583,19 +589,23 @@ int host_register(void * context, const void * pointer, size_t bytes, char * err
     auto & l = *self(context);
     ggml_backend_buffer_t buffer = ggml_backend_dev_buffer_from_host_ptr(l.device, const_cast<void *>(pointer), bytes, bytes);
     if (!buffer) { report(error, error_size, "the device cannot read this memory in place"); return 1; }
+    const char * base = static_cast<const char *>(pointer);
     std::lock_guard<std::mutex> lock(l.imports_mutex);
-    l.imports.push_back({ static_cast<const char *>(pointer), bytes, buffer });
+    auto at = std::upper_bound(l.imports.begin(), l.imports.end(), base,
+        [](const char * p, const imported_range & r) { return p < r.base; });
+    l.imports.insert(at, { base, bytes, buffer });
     return 0;
 }
 int host_unregister(void * context, const void * pointer, char *, size_t) {
     auto & l = *self(context);
     l.drain();
+    const char * base = static_cast<const char *>(pointer);
     std::lock_guard<std::mutex> lock(l.imports_mutex);
-    for (size_t i = 0; i < l.imports.size(); ++i) {
-        if (l.imports[i].base != static_cast<const char *>(pointer)) { continue; }
-        ggml_backend_buffer_free(l.imports[i].buffer);
-        l.imports.erase(l.imports.begin() + std::ptrdiff_t(i));
-        return 0;
+    auto at = std::lower_bound(l.imports.begin(), l.imports.end(), base,
+        [](const imported_range & r, const char * p) { return r.base < p; });
+    if (at != l.imports.end() && at->base == base) {
+        ggml_backend_buffer_free(at->buffer);
+        l.imports.erase(at);
     }
     return 0;
 }
