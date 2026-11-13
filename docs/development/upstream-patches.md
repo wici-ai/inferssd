@@ -11,6 +11,7 @@ preserves its source attribution and license files.
 | ggml scheduler and allocator | Borrowed SSD copy hooks for the weights homed on the drive; graph buffer measurement/admission; first touch; backend scratch reservation; a pass that keeps an in-place op with the backend holding its storage; the split context and backend id arrays sized for the graph being split, not for one split per node (Windows charges commit at allocation). No core implementation is linked into ggml-base. |
 | CPU/CUDA registries | Normal private provider discovery and context-service attachment. CPU and CUDA do not link each other. On Windows the CUDA backend loads the driver's nvcuda.dll on first use, so a CUDA build starts where no NVIDIA driver is. |
 | Vulkan backend | Idle-submit keepalive every 20 ms; source-aware F16 `SET_ROWS` pipelines for F32/F16 destinations and I32/I64 indices, with unsupported conversions rejected. Shared copy shaders retain their F32 source variants. |
+| Growable buffers | CPU, CUDA and Metal buffer types whose buffers reserve their whole address range and hold memory for a prefix of it, grown and shrunk at its end (`ggml_backend_dev_buffer_type_growable`, `ggml_backend_buffer_set_committed`), for the KV cache that allocates its cells as they are used: CUDA maps device memory with VMM, only into memory the device has free (the OOM reclaimer gives tier blocks back first: WDDM would map past the process's budget and charge the host's commit), Metal wraps the prefix in one Metal buffer, the CPU leaves the pages to be written. Nothing in a buffer moves. Vulkan, CUDA without VMM and the CPU on Windows have none. |
 | Backend operation files | New model operations and narrow native kernel entry points stay with their upstream operation/architecture files. Strict MXFP4 math is compiled separately with contraction and FTZ disabled. |
 | llama context | Runtime assembly, request phases, resource-aware graph reservation and failure recovery. Source, cache and telemetry owners reside in `src/ssd`. |
 | Model loading/mapping | Deferred expert ranges and compact Metal allocations where a GGUF interleaves the dense tensors with experts held elsewhere; under mmap, the tensors copied into a device buffer read with direct I/O into pinned buffers where the files read direct, as without mmap; fixed complete-page advice; read-ahead of the rows a lookup table (Engram, PLE) is about to read, on every OS; a refusal of GPU weights larger than the device's free memory. Source/range helpers reside in `src/ssd`. |
@@ -23,6 +24,10 @@ phase-scoped reclaimer has freed device memory. The helper does not own a failed
 handle, publishes a handle only on success, and uses the existing callback's
 quiescence and lifetime rules. It changes neither the cache budget nor the reserve;
 other errors and recovery without progress still return to the caller's error path.
+A CUDA graph that cannot be instantiated or launched for want of device memory
+runs its step without the graph and tells the same reclaimer, so that the VRAM
+tier gives a block back at its next quiescent token boundary before the graph is
+captured again.
 
 The inventory below lists every upstream file that differs from the snapshot.
 It includes model and operator additions as well as integration hooks; review
@@ -85,7 +90,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-cpu/arch/arm/quants.c` | 0 | 1 |
 | `ggml/src/ggml-cpu/arch/x86/quants.c` | 138 | 7 |
 | `ggml/src/ggml-cpu/ggml-cpu.c` | 3711 | 3650 |
-| `ggml/src/ggml-cpu/ggml-cpu.cpp` | 143 | 6 |
+| `ggml/src/ggml-cpu/ggml-cpu.cpp` | 302 | 6 |
 | `ggml/src/ggml-cpu/ops.cpp` | 751 | 12 |
 | `ggml/src/ggml-cpu/ops.h` | 6 | 0 |
 | `ggml/src/ggml-cpu/quants.c` | 1 | 0 |
@@ -102,7 +107,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-cuda/fattn-common.cuh` | 35 | 7 |
 | `ggml/src/ggml-cuda/fattn.cu` | 10 | 0 |
 | `ggml/src/ggml-cuda/fattn.cuh` | 3 | 0 |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1554 | 131 |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1782 | 138 |
 | `ggml/src/ggml-cuda/mmq.cu` | 54 | 3 |
 | `ggml/src/ggml-cuda/mmq.cuh` | 28 | 10 |
 | `ggml/src/ggml-cuda/mmvf.cu` | 22 | 0 |
@@ -122,12 +127,12 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-hexagon/ggml-hexagon.cpp` | 1 | 0 |
 | `ggml/src/ggml-metal/CMakeLists.txt` | 2 | 0 |
 | `ggml/src/ggml-metal/ggml-metal-device.cpp` | 12 | 0 |
-| `ggml/src/ggml-metal/ggml-metal-device.h` | 1 | 0 |
-| `ggml/src/ggml-metal/ggml-metal-device.m` | 8 | 1 |
+| `ggml/src/ggml-metal/ggml-metal-device.h` | 13 | 0 |
+| `ggml/src/ggml-metal/ggml-metal-device.m` | 161 | 4 |
 | `ggml/src/ggml-metal/ggml-metal-impl.h` | 47 | 0 |
 | `ggml/src/ggml-metal/ggml-metal-ops.cpp` | 136 | 0 |
 | `ggml/src/ggml-metal/ggml-metal-ops.h` | 3 | 0 |
-| `ggml/src/ggml-metal/ggml-metal.cpp` | 15 | 0 |
+| `ggml/src/ggml-metal/ggml-metal.cpp` | 106 | 0 |
 | `ggml/src/ggml-metal/ggml-metal.metal` | 133 | 0 |
 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | 1 | 0 |
 | `ggml/src/ggml-openvino/ggml-openvino.cpp` | 1 | 0 |
@@ -148,8 +153,8 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/CMakeLists.txt` | 20 | 0 |
 | `src/llama-arch.cpp` | 168 | 2 |
 | `src/llama-arch.h` | 109 | 2 |
-| `src/llama-context.cpp` | 1447 | 194 |
-| `src/llama-context.h` | 120 | 2 |
+| `src/llama-context.cpp` | 1637 | 194 |
+| `src/llama-context.h` | 127 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
 | `src/llama-graph.cpp` | 765 | 50 |
@@ -157,14 +162,17 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-hparams.cpp` | 21 | 0 |
 | `src/llama-hparams.h` | 73 | 1 |
 | `src/llama-impl.h` | 35 | 0 |
-| `src/llama-kv-cache-iswa.cpp` | 41 | 3 |
-| `src/llama-kv-cache-iswa.h` | 28 | 0 |
-| `src/llama-kv-cache.cpp` | 327 | 132 |
-| `src/llama-kv-cache.h` | 70 | 4 |
-| `src/llama-kv-cells.h` | 140 | 25 |
+| `src/llama-kv-cache-iswa.cpp` | 42 | 4 |
+| `src/llama-kv-cache-iswa.h` | 48 | 0 |
+| `src/llama-kv-cache.cpp` | 671 | 230 |
+| `src/llama-kv-cache.h` | 137 | 6 |
+| `src/llama-kv-cells.h` | 160 | 25 |
+| `src/llama-memory-hybrid-iswa.h` | 7 | 0 |
+| `src/llama-memory-hybrid.cpp` | 5 | 2 |
+| `src/llama-memory-hybrid.h` | 10 | 1 |
 | `src/llama-memory-recurrent.cpp` | 41 | 1 |
 | `src/llama-memory-recurrent.h` | 2 | 0 |
-| `src/llama-memory.h` | 70 | 0 |
+| `src/llama-memory.h` | 96 | 0 |
 | `src/llama-mmap.cpp` | 299 | 10 |
 | `src/llama-mmap.h` | 16 | 0 |
 | `src/llama-model-loader.cpp` | 165 | 11 |
@@ -194,5 +202,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server.cpp` | 1 | 0 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 18381 added, 5869 removed across 156 upstream paths.
+Total: 19721 added, 5983 removed across 159 upstream paths.
 <!-- END UPSTREAM INVENTORY -->

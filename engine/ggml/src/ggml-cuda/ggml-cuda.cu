@@ -5395,8 +5395,10 @@ static void ggml_cuda_graph_evaluate_and_capture(
         }
         if (oom_stage != nullptr) {
             // Nothing of this step has run: a capture only records kernels and a failed launch executes
-            // none. Run it without the graph now and capture again later, after the VRAM tier has had
-            // token boundaries to give memory back.
+            // none. Run it without the graph now and capture again later, after the VRAM tier has given
+            // memory back: the reclaimer learns of the failure here (the driver's allocation has no size).
+            size_t reclaimed = 0;
+            (void) ggml_cuda_oom_reclaimer_invoke(cuda_ctx->device, 0, &reclaimed);
             if (graph->instance != nullptr) {
                 CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
                 graph->instance = nullptr;

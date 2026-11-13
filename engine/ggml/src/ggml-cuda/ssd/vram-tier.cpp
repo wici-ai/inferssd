@@ -139,6 +139,10 @@ struct tier {
     // Closed-loop headroom at decode token boundaries (see watermark_tick).
     bool watermark=true;size_t watermark_low_mib=128,watermark_high_mib=448;
     uint64_t watermark_ticks=0,watermark_busy=0,watermark_shrinks=0,watermark_grows=0;size_t watermark_free_min=SIZE_MAX;
+    // A discrete card's free memory that no allocation gets (measure_withheld), which mem_info leaves out. owed: a
+    // device allocation failed while the tier could not give way (reclaim_one answered later); the next quiescent
+    // token boundary gives a block back, and owed_hold keeps it free until the next decode growth.
+    size_t withheld=0;bool owed=false,owed_hold=false;
     reclaimer_register_fn reclaimer_register=nullptr;
     reclaimer_unregister_fn reclaimer_unregister=nullptr;
     std::unique_ptr<vram_slot_table> table;
@@ -326,6 +330,28 @@ struct tier {
                 *free_bytes=size_t(std::min<uint64_t>(*free_bytes,room>host_demand?room-host_demand:0));
             }
         }
+        if(!unified)*free_bytes=*free_bytes>withheld?*free_bytes-withheld:0;
+    }
+    // cudaMemGetInfo counts as free memory that no allocation gets: an RTX 5090 with driver 580 holds 257 MiB of it
+    // back (filled with 287 MiB blocks it reads 467 MiB free, but one allocation gets at most 209 MiB, 2 MiB ones 210
+    // MiB in all, and then 257 MiB still read free while not even 4 KiB can be allocated). A card the tier has just
+    // filled shows it: what reads free past the largest allocation that still succeeds. Requires lifecycle_mutex and
+    // a quiescent tier.
+    void measure_withheld(){
+        withheld=0;
+        size_t raw=0,total=0;mem_info(&raw,&total);
+        const auto fits=[](size_t bytes){
+            void * p=nullptr;
+            if(cudaMalloc(&p,bytes)!=cudaSuccess){(void)cudaGetLastError();return false;}
+            cuda_check(cudaFree(p));return true;
+        };
+        size_t got=raw,over=raw+1; // the largest allocation that succeeds is in [got,over), to a MiB
+        if(raw && !fits(raw)){
+            got=0;over=raw;
+            while(over-got>(size_t(1)<<20)){const size_t bytes=got+(over-got)/2;(fits(bytes)?got:over)=bytes;}
+        }
+        withheld=raw-got;
+        std::fprintf(stderr,"[kimi_vram_elastic] event=withheld free_bytes=%zu allocatable_bytes=%zu withheld_bytes=%zu\n",raw,got,withheld);
     }
     // The tier's storage in this DRAM on unified memory: its slots, the prefill's transient slots and the host jobs'
     // scratch slots. The cgroup does not charge it, so the host-memory ledger counts it in the envelope, which the RAM
@@ -766,17 +792,17 @@ struct tier {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         // On unified memory every allocation comes out of the DRAM the tier holds, whatever the phase: its blocks answer
         // any that would fail while no layer holds them. A discrete GPU gives them back only while a phase armed the
-        // reclaimer (a prefill's reserve); otherwise the next token boundary does, once the reserve is short
-        // (watermark_tick).
+        // reclaimer (a prefill's reserve); otherwise the next quiescent token boundary does (watermark_tick, owed).
         if(!elastic_active || poisoned)return poisoned?-1:0;
         const int later=!unified && blocks.size()>1?GGML_CUDA_RECLAIM_LATER:0;
-        if(!reclaimer_armed && !unified)return later;
+        if(!reclaimer_armed && !unified){owed=owed || later;return later;}
         // A live layer holds its slots: the allocation fails as it would without the tier. Deferred uploads alone do
         // not stop a reclaim (reclaim_last_block waits for them and aborts the ones in the freed block).
         if(busy()){
             ++live_reclaim_refusals;
             std::fprintf(stderr,"[kimi_vram_elastic] event=reactive_reclaim status=live generation=%llu request_bytes=%zu refusals=%llu\n",
                 (unsigned long long)phase_generation,requested,(unsigned long long)live_reclaim_refusals);
+            owed=owed || later;
             return later;
         }
         ++phase_reclaim_requests;
@@ -866,6 +892,13 @@ struct tier {
             size_t now=0,t=0;mem_info(&now,&t);if(now<safety+count*stride)break;
             if(!allocate_block(count,"decode"))break;
         }
+        // a card filled to the margin: the margin is what allocations can still get
+        if(!unified && target<max_slots){
+            measure_withheld();
+            size_t now=0,t=0;mem_info(&now,&t);
+            while(now<safety && blocks.size()>1 && free_last_block("withheld",false))mem_info(&now,&t);
+        }
+        owed=owed_hold=false;
         ++grow_events;
         decode_growth_done=true;
         std::fprintf(stderr,"[kimi_vram_elastic] event=decode_grow generation=%llu status=pass epoch=%llu token=%llu decode_token=%llu us=%.0f before_slots=%zu target_slots=%zu after_slots=%zu added_slots=%zu blocks=%zu free_before=%zu safety_blocks=%zu safety_mib=%zu safety_bytes=%llu\n",
@@ -878,8 +911,10 @@ struct tier {
     // longer context grows the reserved graph, kernels load on first use. Instead of predicting all of
     // that with one fixed margin, measure free memory at every decode token boundary and hold it between
     // the watermarks: below the low one give the last block back, above the high one grow back to the
-    // safety margin. A discrete GPU resizes only a quiescent tier; a busy boundary waits for the next one. On
-    // unified memory deferred uploads do not stop a resize (they are settled first, and only when there is one).
+    // safety margin. An allocation that failed does not show in free memory: one the tier could not give way to
+    // (owed) gets a block back at the next boundary, kept free until the next decode growth. A discrete GPU resizes
+    // only a quiescent tier; a busy boundary waits for the next one. On unified memory deferred uploads do not stop a
+    // resize (they are settled first, and only when there is one).
     void watermark_tick(){
         if(!watermark || !elastic_active || poisoned || !table || !decode_growth_done)return;
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
@@ -887,6 +922,13 @@ struct tier {
         if(unified?busy():!quiescent()){++watermark_busy;return;}
         size_t free_bytes=0,total=0;cuda_check(cudaSetDevice(device));mem_info(&free_bytes,&total);
         watermark_free_min=std::min(watermark_free_min,free_bytes);
+        // an allocation failed since the last boundary (a CUDA graph's, which the driver makes): free memory did not
+        // show it, so give a block back now and keep it free for the retry
+        if(owed){
+            owed=false;owed_hold=true;
+            if(blocks.size()>1 && free_last_block("owed",true))++watermark_shrinks;
+            return;
+        }
         const size_t low=watermark_low_mib<<20,high=watermark_high_mib<<20;
         const size_t safety=size_t(elastic_safety_blocks)*elastic_block_slots*stride+(elastic_safety_mib<<20);
         if(free_bytes<low){
@@ -897,7 +939,7 @@ struct tier {
             }
             return;
         }
-        if(free_bytes<=high || free_bytes<=safety || slot_locations.size()>=max_slots)return;
+        if(owed_hold || free_bytes<=high || free_bytes<=safety || slot_locations.size()>=max_slots)return;
         if(unified && !settle())return;
         const size_t before=slot_locations.size();
         const size_t target=std::min(max_slots,before+(free_bytes-safety)/stride);
@@ -915,6 +957,12 @@ struct tier {
     // A tier retained from decode leaves only the watermark margin free, often less than the prefill transient
     // scratch; without the scratch the whole prefill falls back to the CPU. Give blocks back for it, as
     // the engine's reserve does.
+    // one elastic block back for the prefill scratch, while the tier is quiescent; false when none was
+    bool free_block_for_prefill_transient(){
+        if(!elastic_active)return false;
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        return quiescent() && free_last_block("prefill_scratch",false);
+    }
     void make_room_for_prefill_transient(size_t slots){
         if(!elastic_active || prefill_transient_arena || !stride || !slots)return;
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
@@ -1171,6 +1219,10 @@ struct tier {
                 if(group){
                     make_room_for_prefill_transient(prefill_transient_slots);
                     allocate_prefill_transient(prefill_transient_slots);
+                    // The free memory the tier counts can be more than the card gives (what the driver holds for the
+                    // decode graphs it instantiated): a block back at a time until the scratch fits, or none is left.
+                    while(!prefill_transient_arena && free_block_for_prefill_transient())
+                        allocate_prefill_transient(prefill_transient_slots);
                 }
                 return;
             }
@@ -2561,7 +2613,8 @@ void * create_configured_tier(const ssd::settings::snapshot * input, const ssd::
         tier_options options;
         options.fixture = false;
         // The tier grows until this is left free: the reserve, and above it what nothing counts or can hold in advance
-        // (the driver's own memory, graph instantiation, kernels), so that it does not come out of the reserve.
+        // (graph instantiation, kernels), so that it does not come out of the reserve. The free memory the driver
+        // never gives out is measured instead (measure_withheld).
         const size_t margin = size_t(*reserve) + tier::driver_margin_mib;
         options.safety_mib = options.margin_mib = margin;
         options.low_mib = size_t(*reserve);
