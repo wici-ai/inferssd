@@ -7,6 +7,7 @@ import contextlib
 import os
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -26,7 +27,7 @@ from inferssd.machine.identity import NativeHost, same_hardware
 FILENAME = "machine.json"
 # One probe run measures all three; they are refreshed together.
 CPU_GROUP = ("cpu", "memory", "compute")
-_HELD: set[str] = set()
+_HELD: dict[str, tuple[int, int]] = {}
 
 
 class LockBusy(RuntimeError):
@@ -98,11 +99,12 @@ def exclusive(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> Iterator[None]:
-    """Hold the lock file next to PATH; reentrant within this process."""
+    """Hold the lock file next to PATH; reentrant in the owning process and thread."""
     lock = path.with_name(path.name + ".lock")
     lock.parent.mkdir(parents=True, exist_ok=True)
     key = str(lock.resolve())
-    if key in _HELD:
+    owner = (os.getpid(), threading.get_ident())
+    if _HELD.get(key) == owner:
         yield
         return
     fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
@@ -112,11 +114,11 @@ def exclusive(
             if clock() >= deadline:
                 raise LockBusy(f"another inferssd profile holds {lock}")
             sleep(0.1)
-        _HELD.add(key)
+        _HELD[key] = owner
         try:
             yield
         finally:
-            _HELD.discard(key)
+            _HELD.pop(key, None)
             _unlock(fd)
     finally:
         os.close(fd)

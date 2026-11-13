@@ -7,6 +7,7 @@ import copy
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -113,6 +114,43 @@ def test_lock_excludes_other_holders_and_is_reentrant(tmp_path):
         assert naps == [0.1]
     finally:
         os.close(holder)
+    with exclusive(path):
+        pass
+
+
+def test_lock_reentrancy_does_not_extend_to_another_thread(tmp_path):
+    path = tmp_path / "machine.json"
+
+    def acquire():
+        with exclusive(path):
+            return "acquired"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with exclusive(path):
+            with exclusive(path):
+                with pytest.raises(LockBusy):
+                    executor.submit(acquire).result(timeout=5)
+        assert executor.submit(acquire).result(timeout=5) == "acquired"
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
+def test_forked_child_does_not_inherit_lock_reentrancy(tmp_path):
+    path = tmp_path / "machine.json"
+    with exclusive(path):
+        pid = os.fork()
+        if pid == 0:
+            try:
+                with exclusive(path):
+                    os._exit(1)
+            except LockBusy:
+                os._exit(0)
+            except BaseException:
+                os._exit(2)
+        _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        # The parent's reentrant ownership must survive the child's attempt.
+        with exclusive(path):
+            pass
     with exclusive(path):
         pass
 
