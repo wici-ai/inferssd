@@ -501,7 +501,11 @@ def main(argv: list[str] | None = None) -> int:
     # this process has validated every shard/header/tensor and returned success.
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=FIELDS, delimiter="\t")
+        # The native reader splits literal TAB fields without CSV unquoting.
+        # Source paths containing TAB/CR/LF have already been rejected above.
+        writer = csv.DictWriter(
+            stream, fieldnames=FIELDS, delimiter="\t", quoting=csv.QUOTE_NONE, quotechar=None
+        )
         writer.writeheader()
         writer.writerows(rows)
     args.summary_json.parent.mkdir(parents=True, exist_ok=True)

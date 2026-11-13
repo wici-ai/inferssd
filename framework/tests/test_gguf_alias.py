@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import glob
 import io
 import json
 import os
@@ -443,6 +444,48 @@ def test_a_source_path_with_a_tab_is_refused(tmp_path):
     fixture(bad)
     with pytest.raises(RuntimeError, match="tabs or newlines"):
         m.read_header(bad)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "model.gguf",
+        "model [1].gguf",
+        *[
+            pytest.param(
+                name,
+                marks=pytest.mark.skipif(
+                    sys.platform == "win32", reason="Windows file names cannot hold double quotes"
+                ),
+            )
+            for name in ('model"part.gguf', '"model".gguf', 'folder"part/model.gguf')
+        ],
+    ],
+)
+def test_cli_writes_source_paths_literally_for_the_native_tsv_reader(tmp_path, name):
+    path = tmp_path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fixture(path)
+    output, summary = tmp_path / "alias.tsv", tmp_path / "summary.json"
+    assert (
+        m.main(
+            [
+                "--model-glob",
+                glob.escape(str(path)),
+                "--include-kind",
+                "up",
+                "--out",
+                str(output),
+                "--summary-json",
+                str(summary),
+            ]
+        )
+        == 0
+    )
+    # The native parser splits on TAB; it does not unquote or unescape CSV fields.
+    rows = output.read_text(encoding="utf-8").split("\n")[1:-1]
+    assert len(rows) == 256
+    assert all(row.split("\t")[3] == str(path) for row in rows)
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="POSIX source ownership")
