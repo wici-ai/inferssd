@@ -31,7 +31,7 @@ def bundle(destination, core):
         target = destination / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(HERE / name, target)
-    manifest = {str(p.relative_to(destination)): hashlib.sha256(p.read_bytes()).hexdigest()
+    manifest = {p.relative_to(destination).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in sorted(destination.rglob("*")) if p.is_file()}
     (destination / "bundle-manifest.json").write_text(json.dumps({"sha256": manifest}, indent=2) + "\n")
     return manifest
