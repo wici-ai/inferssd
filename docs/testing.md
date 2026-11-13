@@ -32,6 +32,15 @@ needs `python3` with `jinja2`; exclude them with `ctest -E` where these are unav
 
 ## Shared expert store
 
+On Linux, `test-ssd-cache-regrow` exercises the real RAM cache geometry and decode
+boundaries with injected budget observations. It checks shrink, unavailable room,
+unreadable budgets, regrowth, release and geometry changes without allocating
+expert payloads. A full-cache boundary must not read the per-slot metadata; a
+child protects its interior pages to check that work bound without timing limits.
+The CPU CI gate builds and runs this fixture. Its optional `LAYERS EXPERTS TOKENS`
+arguments time only consecutive full-cache decode boundaries, with geometry setup
+outside the timer; these measurements do not represent model throughput.
+
 `LLAMA_SSD_STORE` is on by default on Linux, macOS and Windows. The store is a
 static library that only llama links; each context owns its source index. The
 supported configuration uses bundled ggml, shared or static libraries, the CPU

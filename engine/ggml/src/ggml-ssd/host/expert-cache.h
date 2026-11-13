@@ -1112,7 +1112,9 @@ struct expert_cache {
         const bool sized = room_sized();
         if (sized && entries.empty()) { stride = 0; std::fill(role_bytes, role_bytes + 3, 0); return; }
         if (!arena && !sized) { return; }
-        const size_t before = enabled_slots();
+        // Geometry, enable_to and shrink_to keep this byte count exact. A full
+        // cache reaches this check at every decode token without needing a scan.
+        const size_t before = size_t(stats.enabled_bytes / stride);
         uint64_t more = entries.size() - before, surplus = 0, owed = 0;
         if (!more) { return; }
         if (stats.budget_bytes == auto_budget) {
