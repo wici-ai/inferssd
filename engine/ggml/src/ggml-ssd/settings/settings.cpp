@@ -331,6 +331,11 @@ const std::vector<std::string> * snapshot::sources() const noexcept {
     return v ? std::get_if<std::vector<std::string>>(&v->data) : nullptr;
 }
 
+const std::vector<std::string> * snapshot::paths(const std::string & key) const noexcept {
+    const auto * v = find(key);
+    return v ? std::get_if<std::vector<std::string>>(&v->data) : nullptr;
+}
+
 const std::vector<uint32_t> * snapshot::cpus(const std::string & key) const noexcept {
     const auto * v = find(key);
     return v ? std::get_if<std::vector<uint32_t>>(&v->data) : nullptr;
@@ -553,6 +558,12 @@ result<void> reject_retired_environment(const std::vector<std::string> & names) 
     try {
         for (const auto & name : names) {
             bool retired = false;
+            for (const char * experiment : {"INFERSSD_REPLICA_POLICY", "INFERSSD_IO_POOL", "INFERSSD_IO_POOL_SPLIT",
+                    "INFERSSD_IO_FORCE_ASYNC", "INFERSSD_PREFETCH_FORCE_ASYNC", "INFERSSD_REPLICA_DECODE_ONLY",
+                    "INFERSSD_TAIL_AWARE", "INFERSSD_CPU_L3_CPUS", "INFERSSD_CPU_L3_LOCAL",
+                    "INFERSSD_CPU_L3_UP_ROWS", "INFERSSD_CPU_L3_DOWN_ROWS"}) {
+                retired |= name == experiment;
+            }
             for (const char * prefix :
                  { "GGML_KIMI_", "GGML_MOE_", "LLAMA_K3_", "LLAMA_DSV41_", "DS4_", "SSD_LLAMA_MAC_" }) {
                 retired |= name.compare(0, std::char_traits<char>::length(prefix), prefix) == 0;

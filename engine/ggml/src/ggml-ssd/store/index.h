@@ -9,7 +9,8 @@
 namespace ssd { namespace store {
 class source_index {
 public:
-    [[nodiscard]] static result<std::unique_ptr<source_index>> open(const std::vector<std::string> & paths) noexcept;
+    [[nodiscard]] static result<std::unique_ptr<source_index>> open(const std::vector<std::string> & paths,
+        const std::vector<std::string> & replicas = {}, size_t max_experts = 2) noexcept;
     ~source_index();
     source_index(const source_index &) = delete;
     source_index & operator=(const source_index &) = delete;

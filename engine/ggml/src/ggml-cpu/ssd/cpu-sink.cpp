@@ -1,4 +1,6 @@
 #include "ssd/cpu-sink.h"
+#include "ggml-ssd/store/source.h"
+#include "ggml-ssd/io/replica-plan.h"
 #include "ssd/cpu-sink-internal.h"
 #include "ssd/runtime.h"
 #include "ssd/testing.h"
@@ -45,6 +47,7 @@
 #include <locale>
 #include <thread>
 #include <vector>
+#include <fstream>
 
 extern "C" size_t kimi_cpu_sink_source_size(void) { return sizeof(kimi_cpu_sink_source); }
 
@@ -370,6 +373,12 @@ struct sink_slot {
     sink_buffer role[3];
     enum state_type { empty, reading, ready } state = empty;
     unsigned remaining = 0;
+    unsigned role_remaining[3] = {};
+    unsigned failed_roles = 0;
+    size_t piece_expected[3][8] = {};
+    size_t piece_required[3][8] = {};
+    int piece_drive[3][8] = {};
+    unsigned piece_seen[3] = {};
     unsigned ready_roles = 0; // successful CQEs, protected by io_mutex
     size_t request = 0;
 };
@@ -536,8 +545,87 @@ struct sink_mrc {
     }
 };
 
+// Opt-in experiment: the ascending CPU list must match the strict decode mask.
+// Discover actual shared-L3 groups once, before worker execution. No topology
+// assumptions about SMT or consecutive CPU numbers are made.
+struct sink_l3_rows_config {
+    std::vector<int> cpus, worker_group, group_counts;
+    int up_rows=32, down_rows=64;
+    bool local=true;
+};
+static sink_l3_rows_config sink_l3_rows_options(const ssd::cpu::testing::execution_policy & policy) {
+    sink_l3_rows_config c;
+    c.up_rows = policy.l3_up_rows;
+    c.down_rows = policy.l3_down_rows;
+    c.local = policy.l3_local;
+    if (c.up_rows < 16 || c.up_rows > 128 || c.up_rows % 16 ||
+            c.down_rows < 16 || c.down_rows > 128 || c.down_rows % 16) {
+        throw std::runtime_error("CPU L3 chunks must be multiples of 16 in 16..128");
+    }
+    if (policy.l3_cpus.empty()) { return c; }
+#if !defined(__linux__)
+    throw std::runtime_error("CPU L3 row experiment requires Linux cache topology");
+#else
+    std::map<std::string, int> groups;
+    for (const int cpu : policy.l3_cpus) {
+        if (cpu < 0 || cpu > 4095 || (!c.cpus.empty() && cpu <= c.cpus.back()) || c.cpus.size() >= 64) {
+            throw std::runtime_error("CPU L3 CPU list must be ascending, unique, at most 64 CPUs");
+        }
+        std::string shared;
+        for (int i = 0; i < 8; ++i) {
+            const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cache/index" + std::to_string(i) + "/";
+            int level = 0;
+            std::ifstream(base + "level") >> level;
+            if (level == 3) { std::ifstream in(base + "shared_cpu_list"); std::getline(in, shared); break; }
+        }
+        if (shared.empty()) { throw std::runtime_error("CPU L3 topology not available"); }
+        const auto added = groups.emplace(shared, int(groups.size()));
+        if (added.second) { c.group_counts.push_back(0); }
+        const int group = added.first->second;
+        c.cpus.push_back(cpu); c.worker_group.push_back(group); ++c.group_counts[group];
+    }
+    if (!c.local) { c.group_counts.assign(1, int(c.cpus.size())); std::fill(c.worker_group.begin(), c.worker_group.end(), 0); }
+    return c;
+#endif
+}
+
 struct kimi_cpu_sink {
     const sink_configuration configuration;
+
+    uint64_t range_split_roles = 0, range_split_bytes = 0;
+    ssd::io::replica_router replica_router;
+    ssd::io::replica_pool shared_io_pool;
+    const bool unified_io = configuration.policy.io_pool;
+    const bool split_prefetch = configuration.policy.io_pool_split;
+    const bool io_force_async = configuration.policy.io_force_async;
+    const bool prefetch_force_async = configuration.policy.prefetch_force_async;
+    const int replica_policy = configuration.policy.replica_policy;
+    const bool replica_decode_only = configuration.policy.replica_decode_only;
+    uint64_t replica_routed_roles = 0, forced_async_reads = 0;
+    std::array<uint64_t,8> replica_bytes{};
+    std::array<uint64_t,3> prefetch_async_reads{};
+    const sink_l3_rows_config l3_rows = sink_l3_rows_options(configuration.policy);
+    struct alignas(64) l3_chunk_group { std::atomic<int> next{0}; int end=0; };
+    std::array<l3_chunk_group,64> l3_groups;
+    bool l3_active = false;
+    int phase_chunk_rows = 64;
+    uint64_t l3_row_phases = 0;
+    void begin_l3_phase() {
+        l3_active = trace_decode && dynamic_rows && !parallel_fn && !l3_rows.cpus.empty();
+        if (!l3_active) return;
+        if (size_t(active_threads) != l3_rows.cpus.size())
+            throw std::runtime_error("L3 CPU list does not match decode participants");
+        const int total=work_chunks.back();
+        int participants=0;
+        for (size_t g=0;g<l3_rows.group_counts.size();++g) {
+            const int begin=int(int64_t(total)*participants/active_threads);
+            participants += l3_rows.group_counts[g];
+            l3_groups[g].next.store(begin,std::memory_order_relaxed);
+            l3_groups[g].end=int(int64_t(total)*participants/active_threads);
+        }
+        ++l3_row_phases;
+    }
+
     const int ring_experts;
     kimi_cpu_sink_resolver resolver;
     void * userdata;
@@ -594,6 +682,7 @@ struct kimi_cpu_sink {
         // The only field a run's scheduler reads without the prefetch mutex: 0 while the reads may still complete,
         // 1 once all three roles are read, 2 once the job cannot complete (a read failed or a role was dropped).
         std::atomic<int> state{0};
+        std::atomic<unsigned> ready_roles{0};
     };
     struct prefetch_state {
         int topk = 0;
@@ -653,7 +742,7 @@ struct kimi_cpu_sink {
             prefetch_job * job = nullptr;
             bool urgent = false, spill = false, spilled = false;
             sink_clock::time_point since;
-        } reading[3];
+        } reading[12];
         int spilling = 0;
         double spill_us = 0;
         uint64_t spills = 0;
@@ -863,7 +952,8 @@ struct kimi_cpu_sink {
     ggml_from_float_t quantize_input = nullptr, quantize_hidden = nullptr;
 
     kimi_cpu_sink(int depth, kimi_cpu_sink_resolver resolve, void * user, const sink_configuration & input = {}) :
-        configuration(input), ring_experts(depth), resolver(resolve), userdata(user), slots(depth),
+        configuration(input), replica_router(input.policy.replica_tail_aware),
+        shared_io_pool(input.policy.replica_tail_aware), ring_experts(depth), resolver(resolve), userdata(user), slots(depth),
         cache(sink_cache_options(configuration)),
         ready_first(configuration.policy.ready_first),
         early_up_gate(configuration.policy.early_up_gate), role_major(configuration.policy.role_major),
@@ -928,7 +1018,17 @@ struct kimi_cpu_sink {
         if (nonblocking_down_sched && !ready_first) {
             throw std::runtime_error("NONBLOCKING_DOWN_SCHED requires READY_FIRST=1");
         }
-        sink_io_value(ring.init(static_cast<unsigned>(3 * depth), configuration.policy.read_fixed));
+        if (replica_policy < 0 || replica_policy > 3) { throw std::runtime_error("invalid replica policy"); }
+        if (unified_io && replica_policy != 2) { throw std::runtime_error("shared I/O pool requires adaptive replica policy"); }
+        if ((split_prefetch || prefetch_force_async) && !unified_io) {
+            throw std::runtime_error("split/async prefetch requires the shared I/O pool");
+        }
+        const auto * source = configuration.source;
+        if (source && source->replica_count && (source->replica_count < 2 || source->replica_count > 8 ||
+                !source->replica_fds || !source->range_max_experts || configuration.policy.read_fixed)) {
+            throw std::runtime_error("invalid replica configuration (fixed buffers are unsupported by this experiment)");
+        }
+        sink_io_value(ring.init(static_cast<unsigned>(3 * depth * read_tag_stride()), configuration.policy.read_fixed));
         try {
             io_thread = std::thread([this] {
                 (void) ssd::platform::set_thread_role(ssd::platform::thread_role::io);
@@ -1012,7 +1112,110 @@ struct kimi_cpu_sink {
         for (auto & t : prefetch.readers) { if (t.joinable()) { t.join(); } }
         prefetch.readers.clear();
     }
+    // Bounded asynchronous readers share demand's device-load accounting. Up to four roles
+    // per reader, at most eight aligned, disjoint ranges per role; no new payload copies.
+    void prefetch_pool_reader(int reader) {
+        ssd::io::read_ring async;
+        const auto init=async.init(32,false);
+        if(!init){std::fprintf(stderr,"[io_pool] ring init failed: %s\n",init.error.c_str());std::abort();}
+        std::unique_lock<std::mutex> lock(prefetch.mutex);
+        for(;;){
+            prefetch.cv.wait(lock,[&]{return prefetch.stop || !prefetch.urgent.empty() ||
+                (prefetch.gate_open && !prefetch.queue.empty());});
+            if(prefetch.stop)return;
+            struct task { prefetch_job * job=nullptr; int role=0; size_t bytes=0, remaining=0; bool ok=true; };
+            struct piece { size_t task=0, bytes=0, required=0; int drive=-1; bool accounted=false; };
+            std::vector<task> tasks;tasks.reserve(4);
+            std::vector<piece> pieces;pieces.reserve(32);
+            for(int j=0;j<4;++j){
+                const bool urgent=!prefetch.urgent.empty();
+                if(!urgent && (!prefetch.gate_open || prefetch.queue.empty()))break;
+                auto & from=urgent?prefetch.urgent:prefetch.queue;
+                const auto item=from.front();from.pop_front();auto & job=*item.first;
+                if(!job.started){job.started=true;job.started_at=sink_clock::now();++prefetch.started_r[job.rank];}
+                auto & state=prefetch.reading[reader*4+j];state.job=&job;state.urgent=urgent;
+                state.spill=state.spilled=false;
+                if(!prefetch.running++)prefetch.busy_since=sink_clock::now();
+                ++job.running;--job.queued;
+                tasks.push_back({&job,item.second,0,0,!(prefetch.fail_every && ++prefetch.reads%prefetch.fail_every==0)});
+            }
+            lock.unlock();
+            auto account=[&](const ssd::io::completion & c){
+                auto & p=pieces.at(size_t(c.user_data));
+                if(p.accounted)throw std::runtime_error("duplicate pool completion");
+                p.accounted=true;auto & t=tasks[p.task];
+                const bool ok=c.res>=0 && size_t(c.res)>=p.required && size_t(c.res)<=p.bytes;
+                if(p.drive>=0)shared_io_pool.complete(size_t(p.drive),p.bytes,c.res>0?size_t(c.res):0,ggml_time_us(),ok);
+                t.bytes+=c.res>0?size_t(c.res):0;t.ok=t.ok && ok;
+                if(!t.remaining)throw std::runtime_error("pool role completion underflow");
+                --t.remaining;
+            };
+            auto publish=[&](size_t j){
+                auto & t=tasks[j];if(!t.job)return;
+                lock.lock();auto & state=prefetch.reading[reader*4+j];
+                if (state.spill) { prefetch_end_spill(state,sink_clock::now()); }
+                state.job=nullptr;
+                if(t.ok){
+                    if(++t.job->done==3)prefetch.read_time.add(elapsed_us(t.job->started_at));
+                    t.job->ready_roles.fetch_or(1u<<t.role,std::memory_order_release);
+                }
+                else t.job->failed=true;
+                prefetch.reader_bytes+=t.bytes;
+                if(!--prefetch.running)prefetch.reader_busy_us+=elapsed_us(prefetch.busy_since);
+                --t.job->running;prefetch_settle(*t.job);t.job=nullptr;prefetch.cv.notify_all();
+                lock.unlock();{std::lock_guard<std::mutex> io_lock(io_mutex);}io_cv.notify_all();
+            };
+            try {
+                for(size_t j=0;j<tasks.size();++j){
+                    auto & t=tasks[j];if(!t.ok)continue;
+                    const auto & src=t.job->role[t.role];const auto * source=configuration.source;
+                    const bool routed=source && source->replica_count && !src.data_offset &&
+                        (!src.payload_nbytes || src.payload_nbytes==src.nbytes) && !(src.offset%4096) && !(src.nbytes%4096);
+                    ssd::io::replica_plan plan;plan.count=1;plan.piece[0]={0,0,src.nbytes};
+                    if(routed)plan=shared_io_pool.reserve(src.nbytes,source->replica_count,split_prefetch,
+                        (size_t(t.job->expert)+size_t(t.role))%source->replica_count,ggml_time_us(),true);
+                    for(size_t k=0;k<plan.count;++k){
+                        const auto & q=plan.piece[k];
+                        const size_t required=plan.count>1?q.bytes:src.payload_nbytes?src.data_offset+src.payload_nbytes:src.nbytes;
+                        const int drive=routed?int(q.drive):-1;
+                        // reserve() owns all pieces; rollback those not handed to the ring on a queue error.
+                        const ssd::io::read_range range{routed?source->replica_fds[q.drive]:src.fd_direct,src.offset+q.offset,q.bytes};
+#if defined(__linux__)
+                        const auto queued = prefetch_force_async ?
+                            async.queue_async_limited(range,t.job->target[t.role]+q.offset,pieces.size(),false,1) :
+                            async.queue(range,t.job->target[t.role]+q.offset,pieces.size(),false);
+                        if (prefetch_force_async && queued) { ++prefetch_async_reads[size_t(reader)]; }
+#else
+                        const auto queued=async.queue(range,t.job->target[t.role]+q.offset,pieces.size(),false);
+#endif
+                        if(!queued){if(routed)for(size_t n=k;n<plan.count;++n){const auto & u=plan.piece[n];
+                                shared_io_pool.complete(u.drive,u.bytes,0,ggml_time_us(),false);}
+                            throw std::runtime_error(queued.error);}
+                        pieces.push_back({j,q.bytes,required,drive,false});++t.remaining;
+                    }
+                }
+                if(!pieces.empty()){const auto r=async.submit(unsigned(pieces.size()));if(!r)throw std::runtime_error(r.error);}
+                while(async.pending()){
+                    ssd::io::completion c{};auto got=async.pop(c);if(!got)throw std::runtime_error(got.error);
+                    if(!got.value){auto w=async.wait();if(!w)throw std::runtime_error(w.error);continue;}
+                    account(c);const size_t j=pieces[size_t(c.user_data)].task;
+                    if(!tasks[j].remaining)publish(j);
+                }
+            } catch(const std::exception & e){
+                // The target stays leased until all submitted/queued I/O has drained, including errors.
+                auto drain=[&](const ssd::io::completion & c){account(c);};
+                const auto drained=async.drain(&drain,[](void * p,const ssd::io::completion & c){(*static_cast<decltype(drain)*>(p))(c);});
+                if(!drained){std::fprintf(stderr,"[io_pool] unsafe drain: %s\n",drained.error.c_str());std::abort();}
+                for(auto & t:tasks)t.ok=false;
+                std::fprintf(stderr,"[io_pool] prefetch failed: %s\n",e.what());
+            }
+            for(size_t j=0;j<tasks.size();++j)if(tasks[j].job)publish(j);
+            lock.lock();
+        }
+    }
+
     void prefetch_reader(int reader) {
+        if (unified_io) { prefetch_pool_reader(reader); return; }
         std::unique_lock<std::mutex> lock(prefetch.mutex);
         auto & self = prefetch.reading[reader];
         for (;;) {
@@ -1432,6 +1635,21 @@ struct kimi_cpu_sink {
         cache.before_release = nullptr; // vram is destroyed before cache
         cache.tier_held = nullptr;
         stop_threads(); // the I/O thread stops a read-ahead and waits for its reads before it returns
+        if (!l3_rows.cpus.empty()) std::fprintf(stderr,"[cpu_l3_rows_total] phases=%llu\n",(unsigned long long)l3_row_phases);
+        if (io_force_async) std::fprintf(stderr,"[decode_async_reads] requests=%llu\n",(unsigned long long)forced_async_reads);
+        if (prefetch_force_async) std::fprintf(stderr,"[prefetch_async_submit] workers_per_reader=1 reads=%llu,%llu,%llu\n",
+            (unsigned long long)prefetch_async_reads[0],(unsigned long long)prefetch_async_reads[1],(unsigned long long)prefetch_async_reads[2]);
+        if (read_tag_stride() > 1) { std::fprintf(stderr, "[replica_range] roles=%llu bytes=%llu max_experts=%zu\n",
+            (unsigned long long)range_split_roles, (unsigned long long)range_split_bytes, configuration.source->range_max_experts); }
+        if(configuration.source && configuration.source->replica_count) {
+            std::fprintf(stderr,"[replica_router] policy=%d decode_only=%d roles=%llu bytes=",replica_policy,replica_decode_only,
+                (unsigned long long)replica_routed_roles);
+            for(auto n:replica_bytes)std::fprintf(stderr,"%llu,",(unsigned long long)n);
+            std::fprintf(stderr,"\n");
+        }
+        if(unified_io){const auto c=shared_io_pool.snapshot();
+            for(size_t d=0;d<8;++d)std::fprintf(stderr,"[io_pool] drive=%zu demand_bytes=%llu prefetch_bytes=%llu requests=%llu pending_bytes=%llu\n",d,
+                (unsigned long long)c.demand[d],(unsigned long long)c.prefetch[d],(unsigned long long)c.requests[d],(unsigned long long)c.pending[d]);}
         ring_unlock(); // the tier is still here, and the ring's buffers too
         lookahead_summary();
         // Explicit unregister is synchronous. Do this before member destruction
@@ -1512,11 +1730,13 @@ struct kimi_cpu_sink {
     void begin_dynamic_phase(bool is_down) {
         if (!dynamic_rows || parallel_fn) { return; }
         const int rows = is_down ? latent : hidden;
+        phase_chunk_rows = trace_decode && !l3_rows.cpus.empty() ?
+            (is_down ? l3_rows.down_rows : l3_rows.up_rows) : dynamic_chunk_rows;
         work_chunks.resize(phase_items.size() + 1);
         work_chunks[0] = 0;
         for (size_t k = 0; k < phase_items.size(); ++k) {
             const int first = dynamic_first_row(phase_items[k], is_down);
-            work_chunks[k + 1] = work_chunks[k] + (rows - first + dynamic_chunk_rows - 1) / dynamic_chunk_rows;
+            work_chunks[k + 1] = work_chunks[k] + (rows - first + phase_chunk_rows - 1) / phase_chunk_rows;
         }
         dynamic_row_counter.next.store(0, std::memory_order_relaxed);
     }
@@ -1582,13 +1802,30 @@ struct kimi_cpu_sink {
                         if (first) { compute_range(w, 0, first); }
                     }
                 }
-                size_t k = 0;
-                for (;;) {
-                    const int chunk = dynamic_row_counter.next.fetch_add(1, std::memory_order_relaxed);
-                    if (chunk >= work_chunks.back()) { break; }
-                    while (chunk >= work_chunks[k + 1]) { ++k; } // a participant's claims only grow
-                    const int begin = dynamic_first_row(phase_items[k], is_down) + (chunk - work_chunks[k]) * dynamic_chunk_rows;
-                    compute_range(phase_items[k], begin, std::min(rows, begin + dynamic_chunk_rows));
+                auto execute_chunk = [&](int chunk) {
+                    const size_t k = size_t(std::upper_bound(work_chunks.begin(), work_chunks.end(), chunk) - work_chunks.begin() - 1);
+                    const int begin = dynamic_first_row(phase_items[k], is_down) + (chunk - work_chunks[k]) * phase_chunk_rows;
+                    compute_range(phase_items[k], begin, std::min(rows, begin + phase_chunk_rows));
+                };
+                if (l3_active) {
+                    if (ssd::platform::current_cpu() != l3_rows.cpus[size_t(ith)])
+                        throw std::runtime_error("L3 participant is not on its declared CPU");
+                    const size_t groups=l3_rows.group_counts.size();
+                    const size_t local=size_t(l3_rows.worker_group[size_t(ith)]);
+                    for (size_t offset=0;offset<groups;++offset) {
+                        auto & group=l3_groups[(local+offset)%groups];
+                        for (;;) {
+                            const int chunk=group.next.fetch_add(1,std::memory_order_relaxed);
+                            if (chunk >= group.end) break;
+                            execute_chunk(chunk);
+                        }
+                    }
+                } else {
+                    for (;;) {
+                        const int chunk=dynamic_row_counter.next.fetch_add(1,std::memory_order_relaxed);
+                        if (chunk >= work_chunks.back()) break;
+                        execute_chunk(chunk);
+                    }
                 }
             } else {
                 const int begin = row_weights.empty() ? rows * ith / active_threads : bounds[ith];
@@ -2320,6 +2557,7 @@ struct kimi_cpu_sink {
         begin_dynamic_phase(is_down);
         // Row weights fix one bound per participant, so they keep every thread.
         active_threads = parallel_fn || !row_weights.empty() ? threads : run_participants;
+        begin_l3_phase();
         pending.store(uint32_t(active_threads - 1));
         if (profile_enabled) { phase_dispatch = sink_clock::now(); }
         ++generation;
@@ -2553,11 +2791,25 @@ struct kimi_cpu_sink {
         out.flush();
     }
 
+    size_t read_tag_stride() const { return configuration.source && configuration.source->replica_count ? 8 : 1; }
+
     void account_read_bytes(const sink_completion & cqe) {
         if (cqe.user_data >= sink_lookahead_tag) { return; } // a read-ahead's: not this run's read
-        if (cqe.user_data >= 3 * slots.size()) { throw std::runtime_error("invalid CPU sink CQE target"); }
+        const uint64_t logical_tag = cqe.user_data / read_tag_stride();
+        if (logical_tag >= 3 * slots.size()) { throw std::runtime_error("invalid CPU sink CQE target"); }
+        auto & slot=slots[logical_tag/3];const unsigned role=unsigned(logical_tag%3);
+        const size_t piece=cqe.user_data%read_tag_stride();
+        if(!(slot.piece_seen[role] & (1u<<piece))){
+            slot.piece_seen[role] |= 1u<<piece;
+            const int drive=slot.piece_drive[role][piece];
+            if(drive>=0){const size_t expected=slot.piece_expected[role][piece], required=slot.piece_required[role][piece];
+                const bool ok=cqe.res>=0 && size_t(cqe.res)>=required && size_t(cqe.res)<=expected;
+                if(unified_io)shared_io_pool.complete(drive,expected,cqe.res>0?size_t(cqe.res):0,ggml_time_us(),ok);
+                else replica_router.completed(drive,expected,cqe.res>0?size_t(cqe.res):0,ggml_time_us(),ok);
+            }
+        }
         if (cqe.res <= 0) { return; }
-        auto & request = requests[slots[cqe.user_data / 3].request];
+        auto & request = requests[slots[logical_tag / 3].request];
         if (trace_enabled) { request.read_bytes += static_cast<uint64_t>(cqe.res); }
         current.read_bytes += static_cast<uint64_t>(cqe.res);
         if (request.cache_admit >= 0) { current.cache_fill_read_bytes += cqe.res; }
@@ -2665,32 +2917,97 @@ struct kimi_cpu_sink {
 
     // Queues the run's next reads, as many as the free ring slots take, and submits them.
     void io_issue() {
+#if defined(__linux__)
+        // main submits from the graph coordinator, which is pinned to a compute
+        // CPU. Keep io-wq on the declared I/O CPUs instead of inheriting that pin.
+        if (trace_decode && io_force_async) { sink_io_value(ring.configure_async(4, io_cpus)); }
+#endif
         const size_t batch_begin = io_next;
         unsigned queued = 0;
         {
             std::lock_guard<std::mutex> lock(io_mutex);
             io_failed = io_failed || io_cancel;
-            auto queue_role = [&](size_t ordinal, unsigned role) {
-                const size_t index = ordinal % slots.size();
-                auto & request = requests[io_requests[ordinal]];
-                const bool cache_fill = request.cache_admit >= 0;
-                const bool external_target = cache_fill ||
-                    (request.vram_ssd_transient && !request.vram_ssd_streaming);
-                const bool fixed = ring.read_fixed() && !external_target;
-                sink_io_value(ring.queue({request.role[role].fd_direct, request.role[role].offset, request.role[role].nbytes},
-                    request.read_target[role], 3 * index + role, fixed));
-                ++queued;
-                ++current.read_requests;
-                if (cache_fill) { ++current.cache_fill_read_requests; }
-                else { ++current.ring_read_requests; }
-                if (fixed) { ++current.fixed_read_requests; }
-            };
+                auto queue_role = [&](size_t ordinal, unsigned role) {
+                    const size_t index = ordinal % slots.size();
+                    auto & request = requests[io_requests[ordinal]];
+                    const bool cache_fill = request.cache_admit >= 0;
+                    const bool external_target = cache_fill ||
+                        (request.vram_ssd_transient && !request.vram_ssd_streaming);
+                    const bool fixed = ring.read_fixed() && !external_target;
+                    const auto & range = request.role[role];
+                    const auto * source = configuration.source;
+                    const bool enabled = source && source->replica_count && replica_policy != 3 &&
+                        (!replica_decode_only || trace_decode);
+                    const bool eligible = !range.data_offset && (!range.payload_nbytes || range.payload_nbytes == range.nbytes) &&
+                        range.nbytes % 4096 == 0 && range.offset % 4096 == 0;
+                    const bool sparse = enabled && io_requests.size() <= source->range_max_experts;
+                    ssd::io::replica_plan plan;
+                    plan.count=1; plan.piece[0]={0,0,range.nbytes};
+                    if (enabled && eligible && replica_policy != 0) {
+                        plan=unified_io ? shared_io_pool.reserve(range.nbytes,source->replica_count,
+                            replica_policy==2 && sparse,(role+index)%source->replica_count,ggml_time_us(),false,
+                            size_t(8)) :
+                            replica_router.plan(range.nbytes,source->replica_count,
+                            replica_policy==2 && sparse,(role+index)%source->replica_count);
+                        ++replica_routed_roles;
+                    } else if (enabled && eligible && sparse && range.nbytes>=source->replica_count*4096) {
+                        const size_t chunk=((range.nbytes+source->replica_count-1)/source->replica_count+4095)/4096*4096;
+                        plan.count=0;
+                        for(size_t pos=0;pos<range.nbytes;pos+=chunk){
+                            size_t piece=plan.count++;
+                            plan.piece[piece]={(piece+role+index)%source->replica_count,pos,std::min(chunk,range.nbytes-pos)};
+                        }
+                    }
+                    const bool routed = enabled && eligible && (replica_policy!=0 || plan.count>1);
+                    const bool split=plan.count>1;
+                    if(split){++range_split_roles;range_split_bytes+=range.nbytes;}
+                    auto & slot = slots[index];
+                    for(size_t piece=0;piece<plan.count;++piece) {
+                        const size_t position=plan.piece[piece].offset, count=plan.piece[piece].bytes;
+                        const int drive=routed?int(plan.piece[piece].drive):-1;
+                        const int fd=routed?source->replica_fds[drive]:range.fd_direct;
+                        slot.piece_drive[role][piece]=drive;
+                        slot.piece_expected[role][piece] = count;
+                        slot.piece_required[role][piece] = split ? count :
+                            (range.payload_nbytes ? range.data_offset + range.payload_nbytes : count);
+                        try {
+#if defined(__linux__)
+                            if (trace_decode && io_force_async) {
+                                sink_io_value(ring.queue_async({fd, range.offset + position, count},
+                                    static_cast<char *>(request.read_target[role]) + position,
+                                    (3 * index + role) * read_tag_stride() + piece, fixed));
+                                ++forced_async_reads;
+                            } else
+#endif
+                            {
+                            sink_io_value(ring.queue({fd, range.offset + position, count},
+                                static_cast<char *>(request.read_target[role]) + position,
+                                (3 * index + role) * read_tag_stride() + piece, fixed));
+                            }
+                        } catch(...) {
+                            if(unified_io && routed)for(size_t k=piece;k<plan.count;++k){const auto & q=plan.piece[k];
+                                shared_io_pool.complete(q.drive,q.bytes,0,ggml_time_us(),false);}
+                            throw;
+                        }
+                        if(drive>=0){if(!unified_io)replica_router.queued(drive,count,ggml_time_us());replica_bytes[drive]+=count;}
+                        ++slot.role_remaining[role];
+                        ++slot.remaining;
+                        ++queued;
+                        ++current.read_requests;
+                        if (cache_fill) { ++current.cache_fill_read_requests; }
+                        else { ++current.ring_read_requests; }
+                        if (fixed) { ++current.fixed_read_requests; }
+                    }
+                };
             while (!io_failed && io_next < io_requests.size()) {
                 const size_t index = io_next % slots.size();
                 sink_slot & slot = slots[index];
                 if (slot.state != sink_slot::empty) { break; }
                 slot.state = sink_slot::reading;
-                slot.remaining = 3;
+                slot.remaining = 0;
+                slot.failed_roles = 0;
+                std::fill(std::begin(slot.piece_seen),std::end(slot.piece_seen),0);
+                std::fill(std::begin(slot.role_remaining),std::end(slot.role_remaining),0);
                 slot.ready_roles = 0;
                 slot.request = io_requests[io_next];
                 if (timeline_active) { timeline[slot.request].io[0] = ggml_time_us(); }
@@ -2724,40 +3041,47 @@ struct kimi_cpu_sink {
     bool io_reap() {
         sink_completion cqe;
         bool consumed = false;
-        while (sink_io_value(ring.pop(cqe))) {
-            consumed = true;
-            // A run's reads never share the ring with a read-ahead (each entry stops it first): still, one is the
-            // read-ahead's, never this run's.
-            if (cqe.user_data >= sink_lookahead_tag) { lookahead_completion(cqe); continue; }
-            if (!io_inflight || cqe.user_data >= 3 * slots.size()) {
-                throw std::runtime_error("invalid CPU sink CQE");
-            }
-            --io_inflight;
-            const size_t index = cqe.user_data / 3;
-            const unsigned role = static_cast<unsigned>(cqe.user_data % 3);
-            std::lock_guard<std::mutex> lock(io_mutex);
-            sink_slot & slot = slots[index];
-            if (timeline_active) { timeline[slot.request].io[3 + role] = ggml_time_us(); }
-            const auto & range = requests[slot.request].role[role];
-            const size_t expected = range.nbytes;
-            const size_t required = range.payload_nbytes ? range.data_offset + range.payload_nbytes : expected;
-            account_read_bytes(cqe);
-            // A final GGUF payload may end before the rounded physical
-            // read does. Accept only a complete logical payload, never a
-            // truncated weight, and preserve the actual CQE byte count.
-            if (cqe.res < 0 || size_t(cqe.res) < required || size_t(cqe.res) > expected) {
-                ++current.read_errors;
-                io_failed = true;
-                if (io_error.empty()) {
-                    io_error = "direct expert read failed/short: result=" + std::to_string(cqe.res) +
-                               " expected=" + std::to_string(expected);
+            while (sink_io_value(ring.pop(cqe))) {
+                consumed = true;
+                // Preserve main's separate prefill read-ahead completion namespace.
+                if (cqe.user_data >= sink_lookahead_tag) { lookahead_completion(cqe); continue; }
+                if (!io_inflight || cqe.user_data >= 3 * slots.size() * read_tag_stride()) {
+                    throw std::runtime_error("invalid CPU sink CQE");
                 }
-            } else {
-                slot.ready_roles |= 1u << role;
+                --io_inflight;
+                const size_t logical_tag = cqe.user_data / read_tag_stride();
+                const size_t index = logical_tag / 3;
+                const unsigned role = static_cast<unsigned>(logical_tag % 3);
+                const size_t piece = cqe.user_data % read_tag_stride();
+                std::lock_guard<std::mutex> lock(io_mutex);
+                sink_slot & slot = slots[index];
+                if (!slot.role_remaining[role] || !slot.remaining || (slot.piece_seen[role] & (1u<<piece))) {
+                    throw std::runtime_error("duplicate replica completion");
+                }
+                const size_t expected = slot.piece_expected[role][piece];
+                const size_t required = slot.piece_required[role][piece];
+                account_read_bytes(cqe);
+                // A final GGUF payload may end before the rounded physical
+                // read does. Accept only a complete logical payload, never a
+                // truncated weight, and preserve the actual CQE byte count.
+                if (cqe.res < 0 || size_t(cqe.res) < required || size_t(cqe.res) > expected) {
+                    ++current.read_errors;
+                    slot.failed_roles |= 1u << role;
+                    io_failed = true;
+                    if (io_error.empty()) {
+                        io_error = "direct expert read failed/short: result=" + std::to_string(cqe.res) +
+                                   " expected=" + std::to_string(expected);
+                    }
+                }
+                if (!--slot.role_remaining[role]) {
+                    if (!(slot.failed_roles & (1u << role))) { slot.ready_roles |= 1u << role; }
+                    if (timeline_active) { timeline[slot.request].io[3 + role] = ggml_time_us(); }
+                }
+                if (!--slot.remaining) {
+                    slot.state = sink_slot::ready;
+                }
+                io_cv.notify_all();
             }
-            if (!--slot.remaining) { slot.state = sink_slot::ready; }
-            io_cv.notify_all();
-        }
         return consumed;
     }
 
@@ -4221,7 +4545,7 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     const uint64_t participants = integer("cpu.decode_participants");
     const uint64_t prefetch = integer("prefetch.depth");
     if (participants > uint64_t(sink_max_participants) || prefetch > 64 || !out.settings.cpus("cpu.io_cpus") ||
-            !out.settings.vram_budget() || !out.settings.costs() || !out.settings.sources() ||
+            !out.settings.vram_budget() || !out.settings.costs() || !out.settings.sources() || !out.settings.cpus("cpu.l3_cpus") ||
             integer("host.headroom_mib") > UINT32_MAX || integer("vram.reserve_mib") > 8192) {
         throw std::runtime_error("invalid typed SSD executor dependencies");
     }
@@ -4243,6 +4567,17 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     p.decode_participants = int(participants);
     p.prefetch_depth = int(prefetch);
     p.prefill_lookahead = integer("prefill.lookahead") != 0;
+    p.replica_policy = int(integer("io.replica_policy"));
+    p.io_pool = integer("io.shared_pool") != 0;
+    p.io_pool_split = integer("io.split_prefetch") != 0;
+    p.io_force_async = integer("io.force_async") != 0;
+    p.prefetch_force_async = integer("prefetch.force_async") != 0;
+    p.replica_decode_only = integer("io.replica_decode_only") != 0;
+    p.replica_tail_aware = integer("io.replica_tail_aware") != 0;
+    for (uint32_t cpu : *out.settings.cpus("cpu.l3_cpus")) { p.l3_cpus.push_back(int(cpu)); }
+    p.l3_local = integer("cpu.l3_local") != 0;
+    p.l3_up_rows = int(integer("cpu.l3_up_rows"));
+    p.l3_down_rows = int(integer("cpu.l3_down_rows"));
     for (uint32_t cpu : *out.settings.cpus("cpu.io_cpus")) { p.io_cpus.push_back(int(cpu)); }
     p.cache_policy = "count_decay2";
     p.cache_allocation = "uniform";

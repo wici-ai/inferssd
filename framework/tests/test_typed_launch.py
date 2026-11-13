@@ -168,7 +168,24 @@ def test_auto_alias_uses_real_strict_header_indexer(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "name", ["GGML_KIMI_CPU_SINK_THREADS", "TASK3_PREFETCH", "SETTINGS", "TRACE_ENV"]
+    "name",
+    [
+        "GGML_KIMI_CPU_SINK_THREADS",
+        "TASK3_PREFETCH",
+        "SETTINGS",
+        "TRACE_ENV",
+        "INFERSSD_REPLICA_POLICY",
+        "INFERSSD_IO_POOL",
+        "INFERSSD_IO_POOL_SPLIT",
+        "INFERSSD_IO_FORCE_ASYNC",
+        "INFERSSD_PREFETCH_FORCE_ASYNC",
+        "INFERSSD_REPLICA_DECODE_ONLY",
+        "INFERSSD_TAIL_AWARE",
+        "INFERSSD_CPU_L3_CPUS",
+        "INFERSSD_CPU_L3_LOCAL",
+        "INFERSSD_CPU_L3_UP_ROWS",
+        "INFERSSD_CPU_L3_DOWN_ROWS",
+    ],
 )
 def test_retired_inputs_fail_by_name_without_value(name):
     with pytest.raises(ValueError) as error:

@@ -131,7 +131,8 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
         if (!registered) { throw std::runtime_error(registered.error); }
         host = std::move(registered.value);
 #if defined(LLAMA_SSD_STORE)
-        auto opened = ssd::store::source_index::open(*settings.sources());
+        auto opened = ssd::store::source_index::open(*settings.sources(),
+            *settings.paths("expert.replicas"), *settings.integer("io.range_max_experts"));
         if (!opened) { throw std::runtime_error(opened.error); }
         sources = opened.value->view();
         source_owner = std::unique_ptr<void, llama_ssd_source_delete>(opened.value.release(),

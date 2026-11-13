@@ -52,9 +52,25 @@ int main(int argc, char ** argv) {
         return 0;
     }
     using namespace ssd::settings;
-    assert(registry().size() == 13);
+    assert(registry().size() == 26);
+    const auto replicas = parse("inferssd-settings 1\nexpert.replicas=[\"/replica-a\",\"/replica-b\"]\nio.range_max_experts=4\n", "replicas.ssd", {}, "linux");
+    assert(replicas && *replicas.value.integer("io.range_max_experts") == 4);
+    assert(replicas.value.paths("expert.replicas")->size() == 2 && replicas.value.paths("expert.replicas")->at(1) == "/replica-b");
+    assert(!parse("inferssd-settings 1\nio.range_max_experts=9\n", "invalid-range.ssd", {}, "linux"));
+    assert(!parse("inferssd-settings 1\nexpert.replicas=[1]\n", "invalid-replica.ssd", {}, "linux"));
+    assert(!parse("inferssd-settings 1\nexpert.replicas=[\"/replica-a\"]\n", "unsupported-replica.ssd", {}, "darwin"));
     assert(parse("inferssd-settings 1\nmodel.engram_prefetch=1\nmodel.hc_fused=0\n", "model.ssd"));
     assert(!parse("inferssd-settings 1\nmodel.hc_fused=2\n", "model-invalid.ssd"));
+    const auto adaptive = parse("inferssd-settings 1\nio.replica_policy=2\nio.shared_pool=1\nio.split_prefetch=1\nio.force_async=1\nprefetch.force_async=1\ncpu.l3_cpus=0-3\ncpu.l3_up_rows=64\n", "adaptive.ssd", {}, "linux");
+    assert(adaptive && *adaptive.value.integer("io.replica_policy") == 2);
+    assert(*adaptive.value.cpus("cpu.l3_cpus") == std::vector<uint32_t>({0, 1, 2, 3}));
+    for (const char * invalid : {"io.replica_policy=4", "io.shared_pool=2", "io.force_async=-1", "cpu.l3_up_rows=129"}) {
+        assert(!parse(std::string("inferssd-settings 1\n") + invalid + "\n", "invalid-policy.ssd", {}, "linux"));
+    }
+    assert(!parse("inferssd-settings 1\nio.shared_pool=0\n", "platform-policy.ssd", {}, "windows"));
+    for (const char * retired : {"INFERSSD_IO_POOL", "INFERSSD_REPLICA_POLICY", "INFERSSD_CPU_L3_CPUS"}) {
+        assert(!reject_retired_environment({retired}));
+    }
     auto base = parse("", "");
     assert(base);
     assert(*base.value.integer("prefetch.depth") == 64);

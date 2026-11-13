@@ -82,6 +82,14 @@ static void configured_runtime_tests(fixture_inputs & inputs) {
     ssd::gpu::provider_v1 missing_gpu{}; bad_services.gpu = &missing_gpu;
     sink_ptr rejected_gpu(ssd::cpu::create_configured(&settings, &bad_services, fixture::resolve, &f, error, sizeof(error)));
     require(!rejected_gpu && error[0] && configured_task_count() == before, "GPU ABI rejection started a worker");
+    for (const char * bad : {"io.shared_pool=1", "io.split_prefetch=1", "prefetch.force_async=1",
+                            "cpu.l3_up_rows=33", "cpu.l3_down_rows=17"}) {
+        auto parsed = ssd::settings::parse(std::string("inferssd-settings 1\nvram.budget=0\n") + bad + "\n", "invalid-replica.ssd");
+        require(bool(parsed), parsed.error);
+        sink_ptr rejected(ssd::cpu::create_configured(&parsed.value, &services, fixture::resolve, &f, error, sizeof(error)));
+        require(!rejected && error[0] && configured_task_count() == before,
+            std::string("invalid replica policy started a worker: ") + bad);
+    }
     sink_ptr first(ssd::cpu::create_configured(&settings, &services, fixture::resolve, &f, error, sizeof(error)));
     require(bool(first) && configured_task_count() == before + 1, std::string("configured create: ") + error);
     settings = configured_settings(false, 1); debug.profile = false;
@@ -125,7 +133,9 @@ static void configured_runtime_tests(fixture_inputs & inputs) {
         if (event.at("ev") == "ssd.settings") { require(event.at("values").at("cpu.decode_participants") == 0 && event.at("values").at("prefetch.depth") == 0, "owned settings receipt changed"); }
         else { profile |= event.at("compute_thread_cpu_us").get<double>() > 0; }
     }
-    require(sequence == 3 && profile, "copied debug selection or actual layer telemetry missing");
+    // Only the first context has a writer: one settings record and one layer.
+    // The second context must not borrow the first context's telemetry owner.
+    require(sequence == 2 && profile, "copied debug selection or actual layer telemetry missing");
     configured_writer_failure_test(f, original, path + ".failure", input);
     std::printf("CONFIGURED_RUNTIME_IO_GOLDEN_PASS contexts=2 canonical_ring=8 owned_snapshot=1 owned_debug=1\n");
 }
