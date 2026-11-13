@@ -11,6 +11,8 @@ struct description {
     bool replace_duplicates = false;
     int io_backend = 0;
     bool require_direct = false;
+    // Typed sources reject malformed numbers; legacy callers retain prefix parsing.
+    bool strict_alias_numbers = false;
 };
 
 // Transport capability and accounting stay in the provider. Callbacks run

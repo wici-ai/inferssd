@@ -22,6 +22,7 @@ result<std::unique_ptr<source_index>> source_index::open(const std::vector<std::
         // ring. No transport choice or mutable environment is parsed here.
         description.io_backend = 1;
         description.require_direct = true;
+        description.strict_alias_numbers = true;
         for (const auto & path : paths) {
             std::unique_ptr<FILE, close_probe> probe(platform::open_stream(path.c_str()));
             if (!probe) { return {nullptr, status::io, "cannot open expert index: " + path}; }
