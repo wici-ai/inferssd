@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import ntpath
@@ -678,13 +679,15 @@ def _resolve(
     if spec.prompt_cache is None:
         command += ["--cache-ram", "0"]
     else:
-        # One directory per model, named as its file is without the shard suffix.
+        # Equal filenames in different directories are different models. The
+        # native cache removes entries with a foreign model fingerprint on open.
         name = match.group(1) if match else os_path.basename(model)
         if name.endswith(".gguf"):
             name = name[: -len(".gguf")]
+        identity = hashlib.sha256(os_path.normcase(model).encode("utf-8")).hexdigest()[:20]
         command += [
             "--cache-disk",
-            os_path.join(spec.prompt_cache, name),
+            os_path.join(spec.prompt_cache, name, identity),
             "--cache-disk-mib",
             str(PROMPT_CACHE_MIB),
         ]
