@@ -10,9 +10,10 @@ Readers take an injectable host and never write anything.
 
 from __future__ import annotations
 
+import math
 import os
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Optional, Protocol, cast
@@ -30,7 +31,7 @@ from inferssd.machine.characteristics import (
     record,
 )
 from inferssd.source import header as gguf_header
-from inferssd.source.experts import ROLE, is_role, widened
+from inferssd.source.experts import PAGE, ROLE, is_role, widened
 from inferssd.source.files import LOCAL_FILES, SourceFiles
 
 ROLES = ("gate", "up", "down")
@@ -109,6 +110,20 @@ def _ranked(counts: Mapping[str, int]) -> tuple[tuple[str, int], ...]:
     return tuple(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
+def _largest_read(parts: Sequence[tuple[int, int]], experts: int) -> int:
+    """Largest page-expanded read in a layer, over its repeating alignment pattern.
+
+    Each role's start advances by its slice size. Its page offset repeats after
+    PAGE / gcd(PAGE, size) experts; the common period divides PAGE as well.
+    Page-aligned slices therefore need only one sample, regardless of expert count.
+    """
+    period = PAGE // math.gcd(PAGE, *(size for _, size in parts))
+    return max(
+        sum(widened(offset + index * size, size) for offset, size in parts)
+        for index in range(min(experts, period))
+    )
+
+
 def facts_from_headers(headers: Sequence[gguf_header.Header]) -> ModelFacts:
     """ModelFacts of a model whose shards have HEADERS, in shard order."""
     if not headers:
@@ -128,8 +143,8 @@ def facts_from_headers(headers: Sequence[gguf_header.Header]) -> ModelFacts:
     formats: dict[str, Counter[str]] = {role: Counter() for role in ROLES}
     shapes: dict[str, Counter[tuple[int, int]]] = {role: Counter() for role in ROLES}
     per_format: Counter[str] = Counter()
-    expert: Counter[tuple[int, int]] = Counter()
-    read: Counter[tuple[int, int]] = Counter()
+    expert: Counter[int] = Counter()
+    read: defaultdict[int, list[tuple[int, int]]] = defaultdict(list)
     for tensor in routed:
         match = cast(re.Match[str], ROLE.match(tensor.name))
         layer, role = int(match.group(1)), match.group(2)
@@ -137,9 +152,8 @@ def facts_from_headers(headers: Sequence[gguf_header.Header]) -> ModelFacts:
         shapes[role][(tensor.shape[1], tensor.shape[0])] += 1
         per_format[tensor.type_name] += tensor.nbytes
         size = tensor.nbytes // experts
-        for index in range(experts):
-            expert[(layer, index)] += size
-            read[(layer, index)] += widened(tensor.offset + index * size, size)
+        expert[layer] += size
+        read[layer].append((tensor.offset, size))
     missing = [role for role in ROLES if not formats[role]]
     if missing:
         raise ValueError("the model has no routed " + " or ".join(missing) + " expert tensors")
@@ -156,14 +170,14 @@ def facts_from_headers(headers: Sequence[gguf_header.Header]) -> ModelFacts:
     return ModelFacts(
         paths=tuple(item.path for item in headers),
         architecture=architecture if isinstance(architecture, str) else None,
-        layers=len({layer for layer, _ in expert}),
+        layers=len(expert),
         experts=experts,
         experts_used=used if isinstance(used, int) and not isinstance(used, bool) else None,
         gate=roles["gate"],
         up=roles["up"],
         down=roles["down"],
         expert_bytes=max(expert.values()),
-        expert_read_bytes=max(read.values()),
+        expert_read_bytes=max(_largest_read(parts, experts) for parts in read.values()),
         dense_bytes=sum(tensor.nbytes for tensor in tensors if not is_role(tensor)),
         format_bytes=_ranked(per_format),
     )
