@@ -593,8 +593,9 @@ add_executable(test-moe-common-cross-role ssd/test-moe-common-cross-role.cpp)
 add_test(NAME moe_common_cross_role COMMAND test-moe-common-cross-role)
 set_property(TEST moe_common_cross_role PROPERTY LABELS main)
 
-# Measures the Linux host budget (budget-linux.h, /proc/sys/vm, sysconf).
-if (GGML_CUDA AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# Device allocations admitted against the reserve and the free memory; on unified memory it measures the Linux host
+# budget (budget-linux.h, /proc/sys/vm, sysconf).
+if (GGML_CUDA)
     find_package(CUDAToolkit REQUIRED)
     add_executable(test-cuda-memory-reserve ssd/test-cuda-memory-reserve.cpp)
     target_link_libraries(test-cuda-memory-reserve PRIVATE ggml ggml-cuda CUDA::cudart)
