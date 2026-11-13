@@ -60,7 +60,10 @@ replace.
 
 The prompt cache lives on disk, one directory per model under
 `inferssd/prompts` in your user cache directory, and survives restarts
-(`--cache-disk`, 16 GiB per model). With the `dsv` profile the DeepSeek-V4.1
+(`--cache-disk`, 16 GiB per model). On POSIX, new prompt files are created with
+mode `0600`, further restricted by the process umask, before atomically replacing
+their final path. Existing cache files keep their permissions until replaced;
+the cache directory's permissions are not changed. With the `dsv` profile the DeepSeek-V4.1
 template keeps earlier turns' thinking (`drop_thinking` false), so a
 conversation's history renders as the server cached it.
 

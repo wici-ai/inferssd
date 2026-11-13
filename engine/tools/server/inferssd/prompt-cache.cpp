@@ -13,10 +13,11 @@
 #include "../server-ssd-reservation.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <filesystem>
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -108,6 +109,27 @@ static bool server_prompt_fwrite(FILE * f, const void * src, size_t size) {
 
 static bool server_prompt_fread(FILE * f, void * dst, size_t size) {
     return size == 0 || std::fread(dst, 1, size, f) == size;
+}
+
+// Prompt files contain the input tokens and K/V state. Create a private file,
+// and never truncate or follow an existing temporary entry on POSIX.
+static FILE * server_prompt_file_create(const std::string & path, bool & created) {
+#if !defined(_WIN32)
+    const int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    created = fd >= 0;
+    if (fd < 0) return nullptr;
+    FILE * f = fdopen(fd, "wb");
+    if (!f) {
+        const int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+    }
+    return f;
+#else
+    FILE * f = std::fopen(path.c_str(), "wb");
+    created = f != nullptr;
+    return f;
+#endif
 }
 
 // drop the file's pages from the page cache: a state is read once per restore, and its pages would otherwise take
@@ -424,7 +446,8 @@ void server_prompt_cache::save(
     entry.file   = path;
 
     bool ok = false;
-    if (FILE * f = std::fopen(tmp.c_str(), "wb")) {
+    bool created = false;
+    if (FILE * f = server_prompt_file_create(tmp, created)) {
         const uint32_t magic = SERVER_PROMPT_FILE_MAGIC, version = SERVER_PROMPT_FILE_VERSION;
         const uint32_t n_fp = fingerprint.size(), n_tokens = tokens.size(), n_checkpoints = prompt.checkpoints.size();
         const uint64_t data_size = state_size;
@@ -485,7 +508,7 @@ void server_prompt_cache::save(
     }
     if (!ok) {
         SRV_WRN(" - failed to write cached prompt %s\n", path.c_str());
-        std::filesystem::remove(tmp, ec);
+        if (created) std::filesystem::remove(tmp, ec);
         return;
     }
 

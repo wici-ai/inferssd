@@ -30,6 +30,17 @@ fetches the model that `test-thread-safety` and `test-state-restore-fragmented` 
 compares its recorded snapshots with the current Hugging Face files, and `test-jinja-py`
 needs `python3` with `jinja2`; exclude them with `ctest -E` where these are unavailable or have changed.
 
+## Prompt file writes
+
+The Linux CPU unit target `test-server-prompt-write` exercises the production
+disk-cache writer against actual files, directories and symlinks. Its linker
+wrappers replace only the context's serialized state payload, so no model or
+resource envelope is needed. The cases check private creation under several
+umasks, private replacement of an existing final file, exclusive temporary-file
+creation, descriptor closure and cleanup after short writes or failed renames.
+An unsuccessful open must leave the pre-existing temporary entry intact. The
+existing startup cleanup of `.tmp` entries is unchanged.
+
 ## Shared expert store
 
 `LLAMA_SSD_STORE` is on by default on Linux, macOS and Windows. The store is a
