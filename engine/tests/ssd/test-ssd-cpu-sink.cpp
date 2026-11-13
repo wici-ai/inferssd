@@ -2619,9 +2619,9 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         const uint64_t disabled = number(loaded, "of") - enabled;
         require(owed >= 1 && disabled >= 2, "owed slots: the prefill gave back owed slots or too few: " +
                 std::to_string(enabled) + " enabled, " + std::to_string(owed) + " owed");
-        // the first decode token: room for the owed slots and 1.5 more
+        // the first decode token: room for the owed slots, the slot a grow leaves unused, and 1.5 more
         std::vector<char>().swap(drift);
-        const uint64_t want = metadata + owed * slot_cost + 3 * slot_cost / 2, now = host_room() - reserve;
+        const uint64_t want = metadata + owed * slot_cost + slot_cost + 3 * slot_cost / 2, now = host_room() - reserve;
         require(now > want, "owed slots: no room to set");
         pad.assign(now - want, 1);
         std::string regrow;
@@ -2635,7 +2635,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         }
         require(!regrow.empty(), "owed slots: no load_regrow receipt");
         const uint64_t surplus = number(regrow, "surplus_bytes"), fit = surplus > metadata ? (surplus - metadata) / slot_cost : 0;
-        const uint64_t more = std::min(disabled, fit > owed ? fit - owed : 0);
+        const uint64_t more = std::min(disabled, fit > owed + 1 ? fit - owed - 1 : 0);
         require(number(regrow, "owed_slots") == owed && number(regrow, "before_slots") == enabled &&
                 number(regrow, "after_slots") == enabled + more && std::min(disabled, fit) != more,
                 "owed slots: the first decode did not price the owed slots first: " + regrow);

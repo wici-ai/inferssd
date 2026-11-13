@@ -477,6 +477,11 @@ struct expert_cache {
         if (!has_token) {
             ledger.set_prefill_pages(0);
             regrow(adopt ? "load" : "prefill");
+        } else if (room_sized()) {
+            // A later token: the room can grow at times nothing here can know (a GPU driver frees a prompt's buffers
+            // after the GPU's next work, another process exits), while the admission's reclaim gives slots back at
+            // once when it is short. The cache follows it both ways at the token boundary.
+            regrow("decode", true);
         }
         adopt = false;
         if (has_token && (next_epoch != epoch || token == UINT64_MAX || next_token != token + 1)) { release(); }
@@ -1099,8 +1104,10 @@ struct expert_cache {
     // they take their room first (owed). `after`: "load" for the first request of an arena made at load, "prefill".
     // A room-sized cache grows here past the size it had, up to every slot of its arena, so a cache that started
     // short of memory takes the room that frees up later; one that had no room for its metadata learns its geometry
-    // again at this request.
-    void regrow(const char * after) {
+    // again at this request. A grow leaves one slot of room unused: the cache changes by whole slots, and a slot
+    // enabled into the last of the room would be taken back by the next dip smaller than a slot, when it is filled.
+    // `after` "decode": a later decode token of a room-sized cache; quiet: no line unless it grew.
+    void regrow(const char * after, bool quiet = false) {
         if (!partial_reclaim || elastic || !stride || paused) { return; }
         const bool sized = room_sized();
         if (sized && entries.empty()) { stride = 0; std::fill(role_bytes, role_bytes + 3, 0); return; }
@@ -1112,9 +1119,10 @@ struct expert_cache {
             if (check_room(0, nullptr, &surplus) == room_unreadable || !slot_cost_bytes) { return; }
             for (const auto & e : entries) { owed += e.enabled && !e.resident; }
             const uint64_t room = surplus > metadata_bytes ? (surplus - metadata_bytes) / slot_cost_bytes : 0;
-            more = std::min<uint64_t>(more, room > owed ? room - owed : 0);
+            more = std::min<uint64_t>(more, room > owed + 1 ? room - owed - 1 : 0);
         }
         enable_to(before + size_t(more));
+        if (quiet && enabled_slots() == before) { return; }
         if (sized) { stats.capacity_bytes = std::max(stats.capacity_bytes, multiply(enabled_slots(), stride)); }
         std::fprintf(stderr, "[kimi_cpu_sink_cache] %s_regrow=1 before_slots=%zu after_slots=%zu of=%zu owed_slots=%llu surplus_bytes=%llu committed_bytes=%llu\n",
                 after, before, enabled_slots(), entries.size(), (unsigned long long) owed, (unsigned long long) surplus,
