@@ -663,6 +663,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-server-prompt-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-prompt-cache PRIVATE server-context)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET ggml-cpu)
+        llama_build_and_test(ssd/test-server-prompt-write.cpp)
+        target_include_directories(test-server-prompt-write PRIVATE ../tools/server)
+        target_link_libraries(test-server-prompt-write PRIVATE server-context)
+        target_link_options(test-server-prompt-write PRIVATE
+            "-Wl,--wrap=llama_state_seq_get_size_at" "-Wl,--wrap=llama_state_seq_fwrite_at")
         # Requires an explicit tiny GGUF/alias and the admitted 8GiB/noSwap scope;
         # deliberately not an asset-free CTest entry.
         add_executable(test-server-prompt-cache-native ssd/test-server-prompt-cache-native.cpp)
