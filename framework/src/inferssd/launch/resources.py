@@ -70,8 +70,9 @@ def cache_directory(
         local = environ.get("LOCALAPPDATA")
         root = Path(local) if local else home / "AppData" / "Local"
     else:
-        cache = environ.get("XDG_CACHE_HOME")
-        root = Path(cache) if cache else home / ".cache"
+        cache = environ.get("XDG_CACHE_HOME", "")
+        # XDG base paths are absolute; a relative value must not follow the launch cwd.
+        root = Path(cache) if os.path.isabs(cache) else home / ".cache"
     return root / "inferssd"
 
 
