@@ -14,6 +14,9 @@ where the OS has modes). Each record is one JSON object on one line that ends in
 append; a reader consumes complete lines only. One server process is one run; several runs may append to the
 same file, and their event IDs never collide.
 
+On POSIX systems the destination must be a regular file, or a symlink to one. A pipe, device, or directory
+disables usage recording with a warning; it does not hold server startup waiting for a reader.
+
 This version neither rotates nor prunes the file. After a write error the server stops recording for the rest
 of the run and says so once in its log, so a partial line is never followed by another record.
 
