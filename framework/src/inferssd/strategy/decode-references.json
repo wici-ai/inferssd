@@ -1,0 +1,457 @@
+{
+  "license": "SPDX-License-Identifier: Apache-2.0",
+  "schema": 1,
+  "models": [
+    {
+      "id": "muse-spark-q4-k-s",
+      "label": "Muse-Spark-Open-816B-A42B",
+      "quantization": "Q4_K_S",
+      "facts": {
+        "paths": [
+          "reference.gguf"
+        ],
+        "architecture": "muse-spark",
+        "layers": 62,
+        "experts": 256,
+        "experts_used": 8,
+        "expert_bytes": 30408704,
+        "expert_read_bytes": 30420992,
+        "dense_bytes": 16937010176,
+        "format_bytes": [
+          [
+            "Q4_K",
+            432449519616
+          ],
+          [
+            "Q5_K",
+            20669530112
+          ]
+        ],
+        "roles": {
+          "gate": {
+            "formats": [
+              [
+                "Q4_K",
+                62
+              ]
+            ],
+            "rows": 4096,
+            "cols": 4096
+          },
+          "up": {
+            "formats": [
+              [
+                "Q4_K",
+                62
+              ]
+            ],
+            "rows": 4096,
+            "cols": 4096
+          },
+          "down": {
+            "formats": [
+              [
+                "Q4_K",
+                55
+              ],
+              [
+                "Q5_K",
+                7
+              ]
+            ],
+            "rows": 4096,
+            "cols": 4096
+          }
+        }
+      },
+      "dense_read_bytes": 16005972992,
+      "hardware": {
+        "platform": "linux",
+        "arch": "x86_64",
+        "cpu_brand": "AMD EPYC 7B13 64-Core Processor",
+        "allowed_cpus": 61,
+        "gpu_name": "NVIDIA GeForce RTX 5090",
+        "minimum_gpu_free_bytes": 33346813952
+      },
+      "memory_gib": [
+        32,
+        96
+      ],
+      "workload": {
+        "context": 8192,
+        "input_tier": 512,
+        "output_tokens": 256,
+        "decode_threads": 61,
+        "batch_threads": 60,
+        "prefetch_depth": 2,
+        "gpu_work_bytes": 1073741824,
+        "host_work_bytes": 0,
+        "cache_state": "fresh server; guest file cache eviction; load-time preload"
+      },
+      "provenance": {
+        "engine": "a408a4ff50f27edb798cf19058533ffc0ef73153",
+        "reference_model_sha256": "2bded917680151df81fb4a07270f9a49c96b6a609ea8c01eeb81b4ef3452b46f",
+        "calibration_memory_gib": 32,
+        "training_requests": 16,
+        "complete_windows": 16,
+        "method": "synthetic compute + training route/read prior + exposed I/O wait + empirical non-I/O residual; capacity replay at 96 GiB; no validation fit"
+      },
+      "parameters": {
+        "compute": {
+          "dense_ms": 16.840309274706037,
+          "cpu_all_ms": 116.73222868784283,
+          "gpu_all_ms": 20.68527841716896
+        },
+        "residual_ms": [
+          202.23308566007339,
+          259.76442019461007,
+          303.74745780061903
+        ],
+        "wait_ms_per_mib": 0.13269649820248028,
+        "drive_Bps": 13654100000.0,
+        "routing_samples": [
+          {
+            "gpu_hit": 0.29388045540796964,
+            "read_bytes": [
+              4177673778.4470587,
+              1916166716.390887
+            ]
+          },
+          {
+            "gpu_hit": 0.23260594560404807,
+            "read_bytes": [
+              5279136711.152941,
+              2496539473.8933015
+            ]
+          },
+          {
+            "gpu_hit": 0.3265180265654649,
+            "read_bytes": [
+              4558920206.682353,
+              1824802882.6781368
+            ]
+          },
+          {
+            "gpu_hit": 0.27837602783048704,
+            "read_bytes": [
+              4897622631.6549015,
+              2288715517.8827677
+            ]
+          },
+          {
+            "gpu_hit": 0.3655439595192916,
+            "read_bytes": [
+              3840685935.184314,
+              1457873152.3715987
+            ]
+          },
+          {
+            "gpu_hit": 0.2842741935483871,
+            "read_bytes": [
+              4417410133.835294,
+              1997372339.8803294
+            ]
+          },
+          {
+            "gpu_hit": 0.3099462365591398,
+            "read_bytes": [
+              4600142423.717647,
+              1909388679.006951
+            ]
+          },
+          {
+            "gpu_hit": 0.35113851992409867,
+            "read_bytes": [
+              4569884139.419608,
+              2006745889.2342184
+            ]
+          },
+          {
+            "gpu_hit": 0.27771979759645793,
+            "read_bytes": [
+              5590042482.572549,
+              2598479479.835701
+            ]
+          },
+          {
+            "gpu_hit": 0.29255218216318785,
+            "read_bytes": [
+              4611265076.831372,
+              1802951163.2640285
+            ]
+          },
+          {
+            "gpu_hit": 0.27347406704617333,
+            "read_bytes": [
+              5147254453.333333,
+              2256834565.0770617
+            ]
+          },
+          {
+            "gpu_hit": 0.29690860215053766,
+            "read_bytes": [
+              4436686528,
+              2069118323.965091
+            ]
+          },
+          {
+            "gpu_hit": 0.2727941176470588,
+            "read_bytes": [
+              5242726457.6,
+              2374656694.1643515
+            ]
+          },
+          {
+            "gpu_hit": 0.3046489563567362,
+            "read_bytes": [
+              4575463755.796079,
+              1841711915.229032
+            ]
+          },
+          {
+            "gpu_hit": 0.3614326375711575,
+            "read_bytes": [
+              4080985656.345098,
+              1621238859.8215957
+            ]
+          },
+          {
+            "gpu_hit": 0.3070366856419987,
+            "read_bytes": [
+              4982025825.882353,
+              2192219069.1165824
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "qwen35moe-ud-q4-k-xl",
+      "label": "Qwen3.6-35B-A3B",
+      "quantization": "UD-Q4_K_XL",
+      "facts": {
+        "paths": [
+          "reference.gguf"
+        ],
+        "architecture": "qwen35moe",
+        "layers": 40,
+        "experts": 256,
+        "experts_used": 8,
+        "expert_bytes": 2301952,
+        "expert_read_bytes": 2314240,
+        "dense_bytes": 2678180352,
+        "format_bytes": [
+          [
+            "Q4_K",
+            11777605632
+          ],
+          [
+            "Q5_K",
+            7012876288
+          ],
+          [
+            "Q6_K",
+            880803840
+          ]
+        ],
+        "roles": {
+          "gate": {
+            "formats": [
+              [
+                "Q4_K",
+                39
+              ],
+              [
+                "Q5_K",
+                1
+              ]
+            ],
+            "rows": 512,
+            "cols": 2048
+          },
+          "up": {
+            "formats": [
+              [
+                "Q4_K",
+                39
+              ],
+              [
+                "Q5_K",
+                1
+              ]
+            ],
+            "rows": 512,
+            "cols": 2048
+          },
+          "down": {
+            "formats": [
+              [
+                "Q5_K",
+                36
+              ],
+              [
+                "Q6_K",
+                4
+              ]
+            ],
+            "rows": 2048,
+            "cols": 512
+          }
+        }
+      },
+      "dense_read_bytes": 2137836032,
+      "hardware": {
+        "platform": "linux",
+        "arch": "x86_64",
+        "cpu_brand": "AMD EPYC 7B13 64-Core Processor",
+        "allowed_cpus": 61,
+        "gpu_name": "NVIDIA GeForce RTX 5090",
+        "minimum_gpu_free_bytes": 33346813952
+      },
+      "memory_gib": [
+        32,
+        96
+      ],
+      "workload": {
+        "context": 8192,
+        "input_tier": 512,
+        "output_tokens": 256,
+        "decode_threads": 4,
+        "batch_threads": 60,
+        "prefetch_depth": 2,
+        "gpu_work_bytes": 1073741824,
+        "host_work_bytes": 0,
+        "cache_state": "fresh server; guest file cache eviction; load-time preload"
+      },
+      "provenance": {
+        "engine": "a408a4ff50f27edb798cf19058533ffc0ef73153",
+        "reference_model_sha256": "ef901fe1674bf1cb62a753e2a88ddb8378ee2d92cedc67970559146f47c41018",
+        "calibration_memory_gib": 32,
+        "training_requests": 16,
+        "complete_windows": 15,
+        "method": "synthetic compute + training route/read prior + exposed I/O wait + empirical non-I/O residual; capacity replay at 96 GiB; no validation fit"
+      },
+      "parameters": {
+        "compute": {
+          "dense_ms": 2.2492740663428923,
+          "cpu_all_ms": 11.079072693883255,
+          "gpu_all_ms": 8.356182997360133
+        },
+        "residual_ms": [
+          8.59404885839293,
+          9.456619683331152,
+          9.992159614999709
+        ],
+        "wait_ms_per_mib": 0.1424290896735091,
+        "drive_Bps": 8964910000.0,
+        "routing_samples": [
+          {
+            "gpu_hit": 0.9424142156862745,
+            "read_bytes": [
+              30814513.192156862,
+              30814513.192156862
+            ]
+          },
+          {
+            "gpu_hit": 0.9263112745098039,
+            "read_bytes": [
+              39334626.88627451,
+              39334626.88627451
+            ]
+          },
+          {
+            "gpu_hit": 0.9264093137254902,
+            "read_bytes": [
+              38777185.38039216,
+              38777185.38039216
+            ]
+          },
+          {
+            "gpu_hit": 0.9312745098039216,
+            "read_bytes": [
+              35363418.35294118,
+              35363418.35294118
+            ]
+          },
+          {
+            "gpu_hit": 0.9400735294117647,
+            "read_bytes": [
+              32089268.70588235,
+              32089268.70588235
+            ]
+          },
+          {
+            "gpu_hit": 0.9233946078431372,
+            "read_bytes": [
+              42086142.99607843,
+              42086142.99607843
+            ]
+          },
+          {
+            "gpu_hit": 0.9274509803921569,
+            "read_bytes": [
+              37818608.941176474,
+              37818608.941176474
+            ]
+          },
+          {
+            "gpu_hit": 0.9325490196078431,
+            "read_bytes": [
+              35655728.1882353,
+              35655728.1882353
+            ]
+          },
+          {
+            "gpu_hit": 0.9346200980392156,
+            "read_bytes": [
+              34712652.29803921,
+              34712652.29803921
+            ]
+          },
+          {
+            "gpu_hit": 0.9140563725490196,
+            "read_bytes": [
+              45809117.86666667,
+              45809117.86666667
+            ]
+          },
+          {
+            "gpu_hit": 0.9258578431372549,
+            "read_bytes": [
+              38999525.898039214,
+              38999525.898039214
+            ]
+          },
+          {
+            "gpu_hit": 0.9422426470588235,
+            "read_bytes": [
+              29177317.898039214,
+              29177317.898039214
+            ]
+          },
+          {
+            "gpu_hit": 0.9336887254901961,
+            "read_bytes": [
+              34512976.313725494,
+              34512976.313725494
+            ]
+          },
+          {
+            "gpu_hit": 0.9221446078431372,
+            "read_bytes": [
+              40859254.4627451,
+              40859254.4627451
+            ]
+          },
+          {
+            "gpu_hit": 0.9368382352941177,
+            "read_bytes": [
+              32674450.57254902,
+              32674450.57254902
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -34,9 +34,11 @@ from inferssd.machine.profile import (
     stderr_progress,
     survey,
 )
+from inferssd.machine.reference import estimate_models
 from inferssd.machine.store import default_path, exclusive, load_current, save
 from inferssd.strategy.estimate import Estimate, decode_estimate, dense_decode_estimate
 from inferssd.strategy.inputs import RuntimeFacts, read_runtime
+from inferssd.strategy.reference import apply_reference
 
 GIB = float(1 << 30)
 
@@ -181,8 +183,10 @@ def estimates(
     *,
     host_work_bytes: int = 0,
     gpu_work_bytes: int = 0,
+    models: Optional[tuple[catalog.Model, ...]] = None,
 ) -> list[tuple[catalog.Model, Estimate]]:
     """Each supported model's decode speed estimate with its shards on DRIVE_KEY."""
+    selected = catalog.MODELS if models is None else models
     reason = "pass --model with the directory that holds the models"
     if drive_key is not None:
         try:
@@ -193,7 +197,17 @@ def estimates(
             return [
                 (
                     model,
-                    decode_estimate(
+                    apply_reference(
+                        decode_estimate(
+                            value,
+                            model.facts,
+                            model.dense_read_bytes,
+                            facts,
+                            platform,
+                            drive_key,
+                            host_work_bytes=host_work_bytes,
+                            gpu_work_bytes=gpu_work_bytes,
+                        ),
                         value,
                         model.facts,
                         model.dense_read_bytes,
@@ -208,9 +222,9 @@ def estimates(
                         value, model.dense_read_bytes, facts, gpu_work_bytes=gpu_work_bytes
                     ),
                 )
-                for model in catalog.MODELS
+                for model in selected
             ]
-    return [(model, Estimate(None, reason)) for model in catalog.MODELS]
+    return [(model, Estimate(None, reason)) for model in selected]
 
 
 def estimate_lines(rows: list[tuple[catalog.Model, Estimate]]) -> list[str]:
@@ -219,11 +233,12 @@ def estimate_lines(rows: list[tuple[catalog.Model, Estimate]]) -> list[str]:
         + (
             (
                 f"{estimate.scenario_range[0]:.1f}–{estimate.scenario_range[1]:.1f} tok/s "
-                "decode across routing/overlap scenarios (not a confidence interval); "
+                "decode across scenarios (not a confidence interval); "
                 if estimate.scenario_range
                 else ""
             )
-            + f"uniform serial reference {estimate.tokens_per_second:.1f} tok/s ({estimate.detail})"
+            + ("pretrained reference " if estimate.reference_model else "uniform serial reference ")
+            + f"{estimate.tokens_per_second:.1f} tok/s ({estimate.detail})"
             if estimate.tokens_per_second is not None
             else f"none: {estimate.detail}"
         )
@@ -263,7 +278,12 @@ def report(
                 "model": model.repo,
                 "quantization": model.quantization,
                 "decode_tokens_per_second": estimate.tokens_per_second,
-                "reference_scenario": "uniform_serial",
+                "reference_scenario": estimate.reference_scenario,
+                **(
+                    {"reference_model": estimate.reference_model}
+                    if estimate.reference_model
+                    else {}
+                ),
                 "detail": estimate.detail,
                 "assumptions": estimate.assumptions,
                 "scenarios": estimate.scenarios,
@@ -320,6 +340,7 @@ def run(
                 runtime,
                 host_work_bytes=int(args.host_work_mib * (1 << 20)),
                 gpu_work_bytes=int(args.gpu_work_mib * (1 << 20)),
+                models=estimate_models(args.model),
             )
             if args.json:
                 emit(json.dumps(report(value, path, drive_key, rows), separators=(",", ":")))

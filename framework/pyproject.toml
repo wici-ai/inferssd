@@ -20,7 +20,7 @@ inferssd = "inferssd.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-inferssd = ["py.typed", "configuration/schema.json"]
+inferssd = ["py.typed", "configuration/schema.json", "strategy/decode-references.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

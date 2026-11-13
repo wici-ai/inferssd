@@ -144,6 +144,13 @@ builds as updates, and keeps a floor of its own on `build`. Nothing here refers 
 
 ## Further reading
 
+`inferssd profile --model <GGUF-or-directory> --memory-gib 32` can use bundled,
+offline decode references for compatible Muse `Q4_K_S` and Qwen3.6 `UD-Q4_K_XL`
+headers. It requires no prompt, short inference run, or user calibration. References
+are scoped to their calibrated hardware and 32–96 GiB memory range; other cases
+retain the analytical estimate. See [decode estimation](framework/README.md#decode-estimates-before-inference)
+for matching rules, workload assumptions and limits.
+
 - [How it works](docs/architecture.md)
 - [Benchmark methodology](docs/benchmark.md)
 

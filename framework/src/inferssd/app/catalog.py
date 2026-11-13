@@ -22,7 +22,7 @@ from inferssd.strategy.inputs import ModelFacts, model_facts_from
 class Model:
     repo: str
     quantization: str
-    revision: str  # the Hugging Face commit the facts were read at
+    revision: str  # the catalog's Hugging Face commit; empty for a recognized local header
     facts: Optional[ModelFacts]  # None for an ordinary RAM-only model, with no expert store.
     lookup_bytes: int
     weight_bytes: int = 0  # a RAM-only model's tensors; an expert model's are in its facts

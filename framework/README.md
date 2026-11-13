@@ -234,6 +234,51 @@ the current directory. See the [deployment guide](../docs/engine-resources.md).
 
 ### Decode estimates before inference
 
+The existing command automatically uses bundled offline references for compatible
+model headers and hardware. No prompt, generation, server startup, download or
+user recalibration is added:
+
+```sh
+inferssd profile --model /path/to/model.gguf --memory-gib 32 --json
+# Reuse saved hardware measurements without running probes:
+inferssd profile --show --model /path/to/model.gguf --memory-gib 96 --json
+```
+
+References cover Muse-Spark-Open-816B-A42B `Q4_K_S` and Qwen3.6-35B-A3B
+`UD-Q4_K_XL`, on a discrete RTX 5090 with AMD EPYC 7B13 CPU and at least 61
+available logical CPUs. The GPU must be idle with at least the reference free
+VRAM. Memory must be non-unified, with an effective host budget of 32–96 GiB.
+Other hardware, insufficient resources, different working-memory reserves or
+budgets outside that range retain the analytical estimate and record the reason.
+The reference workload uses context 8192, prefetch depth 2, a 1 GiB GPU workspace
+reserve, fresh servers, about 512 input tokens and 256 outputs. Decode counts
+the 255 intervals after the first output and excludes TTFT. These assumptions
+do not change a later launch.
+
+Bundled parameters contain aggregate routing/read samples, synthetic compute
+costs, exposed I/O wait per byte and empirical non-I/O residual quantiles, rather
+than fixed output speeds. Calibration uses 32 GiB only. The 96 GiB read volumes
+come from replaying training routes through a larger cache; interior budgets
+interpolate read volume. Only endpoint budgets were independently validated.
+The profiled drive rate scales I/O service cost; compute and residual costs
+remain hardware-specific. No validation response is used to update parameters.
+
+The catalog Muse entry is `UD-Q4_K_XL`, a different quantization. A GGUF path or
+a directory containing its shards lets `profile` read headers and add the
+compatible `Q4_K_S` variant. Matching checks expert geometry, type counts and
+dense bytes, not the filename. It reads no tensor payload and does not establish
+that a fine-tune has the same routing distribution.
+
+For a match, the text output and `decode_tokens_per_second` use the pretrained
+estimate; `reference_scenario` is `pretrained_reference`. `reference_model`
+records the workload, hardware scope, parameter provenance, capacity interpolation
+and analytical estimate for comparison. Unmatched cases retain `uniform_serial`.
+Ranges remain workload/service scenarios, not confidence intervals or guarantees
+against future storage contention. Only estimation changes; engine execution,
+placement policy and launch configuration are unchanged.
+
+The analytical fallback and optional additional hardware probes work as follows.
+
 `inferssd profile --model <GGUF-or-directory> --estimate-compute --json` adds
 synthetic CUDA matrix measurements to the hardware profile. It does not load or
 run a language model. Rebuild `inferssd-cpuprobe` first; the probe rotates 256 MiB
@@ -275,8 +320,9 @@ Dense CUDA computation currently uses a measured Q8_0 matvec proxy because catal
 facts do not retain each dense tensor's shape and type. Attention, non-matmul graph
 work, lookup I/O, warm-up and the actual routing distribution remain unpriced.
 CPU-only/unified-memory or missing-GPU-measurement cases retain a CPU cost estimate;
-they do not claim to model GPU execution. Estimates still use the catalog's pinned
-model facts; `--model` selects the storage drive, not arbitrary model metadata.
+they do not claim to model GPU execution. Analytical estimates use catalog facts;
+`--model` selects the drive and recognizes the compatible offline-reference
+variants described above, not arbitrary model metadata.
 A different quantization needs matching model facts before its estimate is valid.
 
 Two defaults stand in for measurements the profile lacks. An expert format the
