@@ -1507,6 +1507,11 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
 }
 
 ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size) {
+    return ggml_metal_buffer_map_ext(dev, ptr, size, max_tensor_size, true);
+}
+
+ggml_metal_buffer_t ggml_metal_buffer_map_ext(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size,
+                                              bool resident) {
     ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
 
     res->dev = dev;
@@ -1588,7 +1593,7 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
         }
     }
 
-    res->use_residency_sets = props_dev->use_residency_sets;
+    res->use_residency_sets = resident && props_dev->use_residency_sets;
 
     if (!ggml_metal_buffer_rset_init(res)) {
         GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);

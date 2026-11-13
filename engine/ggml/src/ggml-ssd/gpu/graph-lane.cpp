@@ -585,9 +585,18 @@ const kimi_vram_elastic_api elastic_table = { 5, sizeof(kimi_vram_elastic_api), 
 int host_available(void *) { return 0; }
 int host_launch(void *, const kimi_vram_host_job *, int, int * accepted, char *, size_t) { *accepted = 0; return 0; }
 void host_costs(void *, double * resident_us, double * host_us) { *resident_us = *host_us = 0; }
+// Host memory the lane reads in place (the read ring, a RAM cache slot) for as long as it is registered: the backend's
+// import for such memory where it has one (ggml_backend_ssd_dev_buffer_from_host_ptr: Metal maps it without a residency
+// set), else buffer_from_host_ptr.
 int host_register(void * context, const void * pointer, size_t bytes, char * error, size_t error_size) {
     auto & l = *self(context);
-    ggml_backend_buffer_t buffer = ggml_backend_dev_buffer_from_host_ptr(l.device, const_cast<void *>(pointer), bytes, bytes);
+    using import_fn = ggml_backend_buffer_t (*)(ggml_backend_dev_t, void *, size_t, size_t);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(l.device);
+    auto import = reg ? reinterpret_cast<import_fn>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_ssd_dev_buffer_from_host_ptr")) : nullptr;
+    void * memory = const_cast<void *>(pointer);
+    ggml_backend_buffer_t buffer = import ? import(l.device, memory, bytes, bytes)
+                                          : ggml_backend_dev_buffer_from_host_ptr(l.device, memory, bytes, bytes);
     if (!buffer) { report(error, error_size, "the device cannot read this memory in place"); return 1; }
     const char * base = static_cast<const char *>(pointer);
     std::lock_guard<std::mutex> lock(l.imports_mutex);

@@ -275,6 +275,9 @@ typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
 ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
+// resident false: no residency set, the buffer is made resident by the command buffers that use it
+ggml_metal_buffer_t ggml_metal_buffer_map_ext(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size,
+                                              bool resident);
 
 // A growable buffer: its whole address range is reserved at once (shared memory), and one Metal buffer wraps the
 // prefix that holds memory, which set_committed grows and shrinks at its end; nothing in it moves. A tensor is bound
