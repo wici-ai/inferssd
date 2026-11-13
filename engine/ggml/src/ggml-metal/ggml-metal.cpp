@@ -782,6 +782,22 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
     return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device), ggml_backend_metal_buffer_shared_i, res, size);
 }
 
+// Host memory the SSD engine shows the device for a while (a RAM cache slot until its pages are discarded, the
+// read ring): mapped as buffer_from_host_ptr maps it, without a residency set. A set keeps its buffers wired and
+// adds one more to the device's heartbeat: with one per slot, a Mac kept about 13 GiB of slots wired through
+// decode, and its RAM cache shrank about 10 more times a prefill.
+static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped_transient(ggml_backend_dev_t dev, void * ptr,
+        size_t size, size_t max_tensor_size) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
+    ggml_metal_buffer_t res = ggml_metal_buffer_map_ext(ctx_dev, ptr, size, max_tensor_size, false);
+
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
+
+    return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device),
+        ggml_backend_metal_buffer_shared_i, res, size);
+}
+
 static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
@@ -974,6 +990,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_buffer_get_committed") == 0) {
         return (void *)ggml_backend_metal_buffer_get_committed;
+    }
+    if (strcmp(name, "ggml_backend_ssd_dev_buffer_from_host_ptr") == 0) {
+        return (void *)ggml_backend_metal_device_buffer_mapped_transient;
     }
 
     return NULL;
