@@ -16,6 +16,11 @@ namespace {
 class pool_backend final : public detail::ring_backend {
 public:
     explicit pool_backend(unsigned depth) {
+        // Every accepted read needs a completion even if memory runs out while
+        // it is in flight. The core admits at most twice the submission depth;
+        // reserve those slots before starting any reader thread.
+        if (size_t(depth) > done_.max_size() / 2) { throw std::bad_alloc(); }
+        done_.resize(2 * size_t(depth));
         const unsigned readers = std::min(depth, 8u);
         workers_.reserve(readers);
         try {
@@ -41,14 +46,15 @@ public:
     }
     bool collect(completion & out) override {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (done_.empty()) { return false; }
-        out = done_.front();
-        done_.pop_front();
+        if (!done_count_) { return false; }
+        out = done_[done_head_];
+        if (++done_head_ == done_.size()) { done_head_ = 0; }
+        --done_count_;
         return true;
     }
     void block() override {
         std::unique_lock<std::mutex> lock(mutex_);
-        done_cv_.wait(lock, [this] { return !done_.empty(); });
+        done_cv_.wait(lock, [this] { return done_count_ != 0; });
     }
     // Readers take plain addresses, so registration is only the core's bounds checks.
     void register_buffers(const std::vector<buffer_span> &) override {}
@@ -92,7 +98,10 @@ private:
             lock.unlock();
             const completion entry{read.tag, read_all(read), 0};
             lock.lock();
-            done_.push_back(entry);
+            size_t tail = done_head_ + done_count_;
+            if (tail >= done_.size()) { tail -= done_.size(); }
+            done_[tail] = entry;
+            ++done_count_;
             done_cv_.notify_one();
         }
     }
@@ -100,7 +109,8 @@ private:
     std::mutex mutex_;
     std::condition_variable work_cv_, done_cv_;
     std::deque<detail::staged_read> work_;
-    std::deque<completion> done_;
+    std::vector<completion> done_;
+    size_t done_head_ = 0, done_count_ = 0;
     std::vector<detail::staged_read> batch_; // owner thread only
     std::vector<std::thread> workers_;
     bool stopping_ = false;
