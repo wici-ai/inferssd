@@ -2,6 +2,7 @@
 #include "ggml-ssd/store/index.h"
 #include "ggml-ssd/platform/file.h"
 #include "ggml-ssd/platform/memory.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -17,6 +18,57 @@
 #endif
 
 static void require(bool ok, const char * message) { if (!ok) { throw std::runtime_error(message); } }
+
+static void complete_alias_records(const std::filesystem::path & directory) {
+    // An optional column makes record lengths independent of the host's path
+    // limit. The required fields must survive every read-buffer boundary.
+    const auto alias = directory / "records.tsv";
+    const std::string name = "blk.0.ffn_up_exps.weight";
+    const std::string tail = "\t" + name + "\t3\t5000\t" + (directory / "1.bin").string() + "\t4097";
+    struct example { size_t header_bytes, row_bytes; const char * ending; };
+    const example examples[] = {
+        {4, 512, "\n"}, {4, 4094, "\n"}, {4, 4095, "\n"}, {4, 4096, "\n"},
+        {4, 4095, "\r\n"}, {4, 4096, "\r\n"}, {4, 8192, "\n"}, {4, 16384, "\n"},
+        {4, 512, ""}, {4, 8192, ""}, {8192, 512, "\n"},
+    };
+    unsigned failures = 0;
+    void * buffer = ssd::platform::aligned_alloc_bytes(4096, 8192);
+    require(buffer != nullptr, "record buffer allocation failed");
+    std::unique_ptr<void, decltype(&ssd::platform::aligned_free)> owned(buffer, ssd::platform::aligned_free);
+    for (const auto & example : examples) {
+        const std::string ending = example.ending;
+        const size_t row_bytes = std::max(example.row_bytes, tail.size() + ending.size() + 1);
+        {
+            std::ofstream out(alias, std::ios::binary);
+            out << std::string(example.header_bytes, 'h') << "\ttensor\texpert_idx\tnbytes\tsource_path\toffset\n"
+                << std::string(row_bytes - tail.size() - ending.size(), 'x') << tail << ending;
+            require(bool(out), "record fixture write failed");
+        }
+        auto index = ssd::store::source_index::open({alias.string()});
+        bool good = bool(index);
+        if (good) {
+            const auto view = index.value->view();
+            int fd = -1;
+            uint64_t offset = 0;
+            size_t bytes = 0;
+            good = view.resolve(view.userdata, name.c_str(), 3, 5000, 4, &fd, &offset, &bytes) &&
+                offset == 4097 && bytes == 5000 && ssd::platform::is_direct(fd) &&
+                ssd::platform::pread_exact(fd, buffer, 8192, 4096);
+            if (good) {
+                const auto * payload = static_cast<unsigned char *>(buffer);
+                for (size_t i = 0; i < 5000; ++i) { good &= payload[i + 1] == (4097 + i + 1) % 251; }
+            }
+        }
+        std::printf("alias record header=%zu row=%zu ending=%zu: %s\n", example.header_bytes,
+            row_bytes, ending.size(), good ? "PASS" : "FAIL");
+        failures += !good;
+    }
+    // Completing a long line must not turn missing required fields into a row.
+    std::ofstream(alias, std::ios::binary) << "tensor\texpert_idx\tnbytes\tsource_path\toffset\n"
+        << std::string(8192, 'x') << '\n';
+    require(!ssd::store::source_index::open({alias.string()}), "incomplete long record was accepted");
+    require(!failures, "complete alias records were split or changed");
+}
 
 int main() {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -34,6 +86,7 @@ int main() {
             << "blk.0.ffn_up_exps.weight\t3\t5000\t" << data.string() << "\t4097\n";
         aliases.push_back(alias.string());
     }
+    complete_alias_records(directory);
     auto first = ssd::store::source_index::open({aliases[0]});
     auto second = ssd::store::source_index::open({aliases[1]});
     require(bool(first) && bool(second), "direct source creation failed");

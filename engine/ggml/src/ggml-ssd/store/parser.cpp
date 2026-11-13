@@ -14,6 +14,18 @@ namespace {
 struct close_file {
     void operator()(FILE * file) const { std::fclose(file); }
 };
+// A legal source path can occupy almost a whole filesystem path buffer. The
+// surrounding TSV fields still belong to that same record, however many
+// chunks fgets needs to read it. Retain capacity for the next record.
+bool read_tsv_line(FILE * file, std::string & line) {
+    line.clear();
+    char chunk[4096];
+    while (std::fgets(chunk, sizeof(chunk), file)) {
+        line += chunk;
+        if (!line.empty() && line.back() == '\n') { return true; }
+    }
+    return !line.empty();
+}
 // Opening a FIFO must not block startup. The platform layer validates the
 // opened handle, so path replacement cannot bypass the regular-file check.
 FILE * open_regular_file(const char * path) noexcept {
@@ -227,13 +239,13 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
         existing_keys.insert(expert_pack_key_string(e.tensor, e.expert_idx, e.nbytes));
     }
 
-    char line[4096];
+    std::string line;
     std::vector<char *> fields;
-    if (!std::fgets(line, sizeof(line), file)) {
+    if (!read_tsv_line(file, line)) {
         std::fprintf(stderr, "[moe_stream_batch] GGUF alias: empty TSV: %s\n", path);
         return false;
     }
-    expert_pack_split_tsv_line(line, fields);
+    expert_pack_split_tsv_line(line.data(), fields);
     const int col_tensor = expert_pack_tsv_column(fields, "tensor");
     int col_expert = expert_pack_tsv_column(fields, "expert_idx");
     if (col_expert < 0) {
@@ -257,8 +269,8 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
     uint64_t loaded = 0;
     uint64_t skipped_duplicates = 0;
     uint64_t bad_rows = 0;
-    while (std::fgets(line, sizeof(line), file)) {
-        expert_pack_split_tsv_line(line, fields);
+    while (read_tsv_line(file, line)) {
+        expert_pack_split_tsv_line(line.data(), fields);
         ++rows;
         const int need_cols = std::max(std::max(col_tensor, col_expert), std::max(col_nbytes, std::max(col_source, col_offset))) + 1;
         if ((int)fields.size() < need_cols) {
