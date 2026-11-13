@@ -170,11 +170,21 @@ def proxy_note(where: str, proxies: dict[str, str]) -> Optional[str]:
     )
 
 
+def _cpu_decode_rows(c: Characteristics, cpus: tuple[int, ...]) -> list[ComputeRow]:
+    """Measurements on exactly CPUS; an empty set selects unpinned measurements."""
+    return [row for row in c["compute"]["cpu"] if tuple(row.get("cpus", ())) == cpus]
+
+
 def cpu_decode_seconds(
-    c: Characteristics, model: ModelFacts, threads: int, timing: str = "median"
+    c: Characteristics,
+    model: ModelFacts,
+    threads: int,
+    timing: str = "median",
+    *,
+    cpus: tuple[int, ...] = (),
 ) -> tuple[Optional[float], str]:
-    """One expert, using only one-token points and all of its quantization types."""
-    rows = [row for row in c["compute"]["cpu"] if not row.get("cpus")]
+    """One expert on the selected CPU pool, using one-token points of all its types."""
+    rows = _cpu_decode_rows(c, cpus)
     names = {name.upper() for role in model.roles for name, _ in role.formats}
     proxies = format_proxies(rows, names)
     missing = sorted(names - set(proxies))
@@ -255,8 +265,11 @@ def decode_estimate(
         threads, _, _ = placement(characteristics, model, runtime, [])
     except ValueError as error:
         return Estimate(None, str(error))
-    # Decode uses the decode pool; the previous implementation used the prefill pool.
-    cpu_expert_s, why = cpu_decode_seconds(characteristics, model, threads.decode or 1)
+    # Match both the decode count and its affinity; prefill can use a different pool.
+    decode_cpus = threads.decode_cpus or threads.cpus
+    cpu_expert_s, why = cpu_decode_seconds(
+        characteristics, model, threads.decode or 1, cpus=decode_cpus
+    )
     if cpu_expert_s is None:
         return Estimate(None, why)
     drive_gbps, why = drive_rate(characteristics, model, drive_key)
@@ -282,6 +295,12 @@ def decode_estimate(
     ]
     if runtime.gpus and any(device.processes for device in runtime.gpus):
         assumptions.append("GPU contention is present and is not priced by this estimate.")
+    if decode_cpus:
+        assumptions.append(
+            "CPU expert measurements are pinned to the decode CPUs "
+            + ",".join(str(cpu) for cpu in decode_cpus)
+            + "."
+        )
     # Dense quantization is not retained by ModelFacts. Q8_0 is an explicit proxy;
     # never substitute peak CUDA bandwidth for measured quantized computation.
     dense_rate = matvec_rate(rows, "Q8_0", 4096, 4096)
@@ -290,9 +309,7 @@ def decode_estimate(
     gpu_slow_s = 0.0
     missing = []
     names = {name.upper() for role in model.roles for name, _ in role.formats}
-    cpu_proxies = format_proxies(
-        [row for row in characteristics["compute"]["cpu"] if not row.get("cpus")], names
-    )
+    cpu_proxies = format_proxies(_cpu_decode_rows(characteristics, decode_cpus), names)
     gpu_proxies = format_proxies(rows, names)
     for role in model.roles:
         for name, layers in role.formats:
@@ -352,8 +369,12 @@ def decode_estimate(
     disjoint_miss = 1 - min(1.0, ram_fraction + gpu_fraction)
     scenarios["uniform_disjoint_serial"] = 1 / (dense_s + cpu_s + gpu_s + io_all_s * disjoint_miss)
     io_low, io_high, io_samples = drive_iqr(characteristics, model, drive_key, drive_gbps * GB)
-    cpu_fast, _ = cpu_decode_seconds(characteristics, model, threads.decode or 1, "q1")
-    cpu_slow, _ = cpu_decode_seconds(characteristics, model, threads.decode or 1, "q3")
+    cpu_fast, _ = cpu_decode_seconds(
+        characteristics, model, threads.decode or 1, "q1", cpus=decode_cpus
+    )
+    cpu_slow, _ = cpu_decode_seconds(
+        characteristics, model, threads.decode or 1, "q3", cpus=decode_cpus
+    )
     if use_gpu:
         dense_fast = dense_read_bytes / (
             matvec_rate(rows, "Q8_0", 4096, 4096, "q1") or dense_rate or 1

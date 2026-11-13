@@ -7,8 +7,12 @@ import copy
 from collections import Counter
 from pathlib import Path
 
+import pytest
+
 from inferssd.app import catalog, hub
+from inferssd.machine.characteristics import validate
 from inferssd.machine.store import load
+from inferssd.strategy.derive import placement
 from inferssd.strategy.estimate import decode_estimate
 from inferssd.strategy.inputs import RuntimeFacts
 
@@ -136,3 +140,94 @@ def test_a_profile_of_other_cpus_gives_a_reason_not_an_error():
         MAC, catalog.MODELS[0].facts, 1, RuntimeFacts((99,), (), 9 * GIB), "darwin", DRIVE
     )
     assert value.tokens_per_second is None and "none of the CPUs" in value.detail
+
+
+def pinned_profile(model):
+    """A recorded hybrid CPU profile with a faster synthetic performance-cluster rate."""
+    c = load(Path(__file__).parent / "fixtures/machine/windows-x64-igpu.json")
+    # Isolate compute pricing: the expert store fits in RAM and dense bytes are zero.
+    c["memory"]["total_bytes"] = 1024 * GIB
+    for row in c["compute"]["cpu"]:
+        if row.get("cpus") == [0, 1, 2, 3] and row["format"] == model.dominant_format:
+            point = next(p for p in row["points"] if p["tokens"] == 1)
+            point["weight_Bps"] = 200e9
+            point["us"] = row["weight_bytes"] / point["weight_Bps"] * 1e6
+            point["us_q1"], point["us_q3"] = point["us"] / 2, point["us"] * 2
+    facts = RuntimeFacts(tuple(range(8)), (), c["memory"]["total_bytes"])
+    return c, facts
+
+
+def pinned_estimate(c, model, facts):
+    return decode_estimate(validate(c), model, 0, facts, "windows", c["storage"][0]["drive_key"])
+
+
+@pytest.mark.parametrize("timing", ["median", "q1", "q3"])
+def test_decode_estimate_prices_the_selected_pinned_pool(timing):
+    model = catalog.MODELS[0].facts
+    c, facts = pinned_profile(model)
+    threads, _, _ = placement(c, model, facts, [])
+    assert threads.decode == 4 and threads.decode_cpus == (0, 1, 2, 3)
+
+    estimate = pinned_estimate(c, model, facts)
+    seconds = model.layers * model.experts_used * sum(r.slice_bytes() for r in model.roles) / 200e9
+    if timing == "median":
+        assert estimate.components["cpu_experts_ms"] == pytest.approx(seconds * 1e3)
+        assert estimate.tokens_per_second == pytest.approx(1 / seconds)
+    elif timing == "q1":
+        assert estimate.scenario_range[1] == pytest.approx(2 / seconds)
+    else:
+        assert estimate.scenario_range[0] == pytest.approx(0.5 / seconds)
+
+
+def test_decode_estimate_matches_the_cpu_ids_of_a_selected_cluster_prefix():
+    model = catalog.MODELS[0].facts
+    c, facts = pinned_profile(model)
+    template = next(
+        row
+        for row in c["compute"]["cpu"]
+        if row.get("cpus") == [0, 1, 2, 3] and row["format"] == model.dominant_format
+    )
+    for cpus, rate in [([4, 5], 900e9), ([0, 1], 300e9)]:
+        row = copy.deepcopy(template)
+        row["cpus"], row["threads"] = cpus, len(cpus)
+        point = row["points"][0]
+        point["weight_Bps"] = rate
+        point["us"] = point["us_q1"] = point["us_q3"] = row["weight_bytes"] / rate * 1e6
+        c["compute"]["cpu"].append(row)
+    threads, _, _ = placement(c, model, facts, [])
+    assert threads.decode == 2 and threads.decode_cpus == (0, 1)
+
+    estimate = pinned_estimate(c, model, facts)
+    seconds = model.layers * model.experts_used * sum(r.slice_bytes() for r in model.roles) / 300e9
+    assert estimate.components["cpu_experts_ms"] == pytest.approx(seconds * 1e3)
+
+
+def test_format_proxy_notes_use_the_selected_cpu_pool():
+    model = catalog.MODELS[1].facts  # Q4_K gate/up and Q5_K down.
+    c, facts = pinned_profile(model)
+    c["compute"]["cpu"] = [
+        row
+        for row in c["compute"]["cpu"]
+        if not (row.get("cpus") == [0, 1, 2, 3] and row["format"] == "Q5_K")
+    ]
+    threads, _, _ = placement(c, model, facts, [])
+    assert threads.decode_cpus == (0, 1, 2, 3)
+    estimate = pinned_estimate(c, model, facts)
+    assert any("Q5_K taken from Q4_K" in note for note in estimate.assumptions)
+
+
+def test_unpinned_estimate_ignores_faster_bound_measurements():
+    model = catalog.MODELS[0].facts
+    c, facts = pinned_profile(model)
+    c["cpu"]["affinity_supported"] = False
+    threads, _, _ = placement(c, model, facts, [])
+    assert threads.decode == 8 and not threads.decode_cpus
+    row = next(
+        row
+        for row in c["compute"]["cpu"]
+        if not row.get("cpus") and row["threads"] == 8 and row["format"] == model.dominant_format
+    )
+    rate = next(point["weight_Bps"] for point in row["points"] if point["tokens"] == 1)
+    seconds = model.layers * model.experts_used * sum(r.slice_bytes() for r in model.roles) / rate
+    estimate = pinned_estimate(c, model, facts)
+    assert estimate.components["cpu_experts_ms"] == pytest.approx(seconds * 1e3)
