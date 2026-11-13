@@ -1,13 +1,15 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
-#include "../../ggml/src/ggml-ssd/host/budget-linux.h"
 #include <cuda_runtime_api.h>
 #include <cstdio>
 #include <cstdlib>
+#if defined(__linux__)
+#include "../../ggml/src/ggml-ssd/host/budget-linux.h"
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <unistd.h>
+#endif
 
 static constexpr size_t MIB = 1024 * 1024;
 static constexpr size_t RESERVE = 576 * MIB;
@@ -44,6 +46,12 @@ static int reclaim(void * userdata, size_t, size_t * freed) {
     return 1;
 }
 
+static int reclaim_later(void *, size_t, size_t * freed) {
+    *freed = 0;
+    return GGML_CUDA_RECLAIM_LATER;
+}
+
+#if defined(__linux__)
 static std::string slurp(const char * path) {
     std::ifstream file(path);
     std::stringstream text;
@@ -89,6 +97,7 @@ static int unified_tests() {
     std::puts("CUDA unified pinned host memory admitted before allocation: PASS");
     return 0;
 }
+#endif
 
 int main() {
     int devices = 0;
@@ -99,7 +108,12 @@ int main() {
     auto * buft = ggml_backend_cuda_buffer_type(0);
     check(buft != nullptr, "CUDA device required");
     if (ggml_backend_cuda_device_is_unified(0)) {
+#if defined(__linux__)
         return unified_tests();
+#else
+        std::puts("Unified memory outside Linux; skipping reserve test");
+        return 77;
+#endif
     }
     const size_t available = free_memory();
     if (available <= RESERVE + 128 * MIB) {
@@ -127,4 +141,22 @@ int main() {
     check(ggml_cuda_oom_reclaimer_unregister(0, reclaim, &cache), "unregister failed");
     ggml_cuda_set_memory_reserve(0, 0);
     std::puts("CUDA reserve rejection and proactive cache reclaim: PASS");
+
+    // Without a reserve an allocation is admitted against the free memory all the same. Past it one fails here, but
+    // under WDDM it succeeds with the excess backed by host memory, so the cache must give its room back first.
+    cache_fixture full;
+    full.bytes = free_memory() - 512 * MIB;
+    check(cudaMalloc(&full.ptr, full.bytes) == cudaSuccess, "cache allocation failed");
+    check(ggml_cuda_oom_reclaimer_register(0, reclaim, &full), "register failed");
+    buffer = ggml_backend_buft_alloc_buffer(buft, 1024 * MIB);
+    check(buffer != nullptr && full.calls == 1 && full.ptr == nullptr,
+        "cache was not reclaimed before an allocation past the free memory");
+    ggml_backend_buffer_free(buffer);
+    check(ggml_cuda_oom_reclaimer_unregister(0, reclaim, &full), "unregister failed");
+    // A reclaimer that gives memory back only at its next quiescent point lets nothing past the free memory.
+    check(ggml_cuda_oom_reclaimer_register(0, reclaim_later, nullptr), "register failed");
+    check(ggml_backend_buft_alloc_buffer(buft, free_memory() + 64 * MIB) == nullptr,
+        "an allocation past the free memory was admitted");
+    check(ggml_cuda_oom_reclaimer_unregister(0, reclaim_later, nullptr), "unregister failed");
+    std::puts("CUDA admission against the free memory without a reserve: PASS");
 }

@@ -160,37 +160,37 @@ static size_t ggml_cuda_free_under_reserve(int device, size_t free) {
         g_cuda_reserve_budgets[device].free_bytes(free, g_cuda_context_reserves.maximum(device));
 }
 
-// Reclaim the elastic expert cache before an allocation would eat into the reserve, rather than waiting
-// until cudaMalloc/cuMemCreate has already exhausted the device (on unified memory it never fails). With
-// no reclaimer (or nothing left to give back), fail normally so the graph planner can try a smaller batch. One that
-// will give memory back at its next quiescent point lets the allocation through: the reserve comes back then.
+// Admit a device allocation before it is made: it fits in what the device has free less the contexts' reserve, the
+// elastic expert cache giving memory back until it does, rather than after cudaMalloc/cuMemCreate has failed. Past the
+// free memory an allocation fails on Linux and under TCC, while under WDDM it succeeds with the excess backed by host
+// memory and charged to commit, so only the admission keeps it out there (on unified memory it never fails). With no
+// reclaimer (or nothing left to give back), fail normally so the graph planner can try a smaller batch. One that will
+// give memory back at its next quiescent point lets the allocation into the reserve until then, never past the free
+// memory.
 static cudaError_t ggml_cuda_reserve_memory(int device, size_t size) {
     const size_t reserve = std::max(g_cuda_dynamic_reserve[device].load(std::memory_order_relaxed),
                                     g_cuda_context_reserves.maximum(device));
-    if (!reserve) {
-        return cudaSuccess;
-    }
     ggml_cuda_set_device(device);
     for (;;) {
-        size_t available = 0, total = 0;
-        ggml_cuda_memory_info(device, &available, &total);
-        available = ggml_cuda_free_under_reserve(device, available);
+        size_t free = 0, total = 0;
+        ggml_cuda_memory_info(device, &free, &total);
+        const size_t available = ggml_cuda_free_under_reserve(device, free);
         if (available >= reserve && size <= available - reserve) {
             return cudaSuccess;
         }
         size_t freed = 0;
         const int reclaimed = ggml_cuda_oom_reclaimer_invoke(device, size, &freed);
-        if (reclaimed == GGML_CUDA_RECLAIM_LATER) {
+        if (reclaimed == GGML_CUDA_RECLAIM_LATER && size <= free) {
             return cudaSuccess;
         }
         if (reclaimed <= 0 || freed == 0) {
-            GGML_LOG_WARN("%s: device %d cannot allocate %.2f MiB while preserving %.2f MiB%s\n",
-                __func__, device, size/1048576.0, reserve/1048576.0,
-                ggml_cuda_memory_is_unified(device) ? "" : " (vram.reserve_mib)");
+            GGML_LOG_WARN("%s: device %d cannot allocate %.2f MiB with %.2f MiB free while preserving %.2f MiB%s\n",
+                __func__, device, size/1048576.0, free/1048576.0, reserve/1048576.0,
+                reserve && !ggml_cuda_memory_is_unified(device) ? " (vram.reserve_mib)" : "");
             return cudaErrorMemoryAllocation;
         }
-        GGML_LOG_INFO("%s: device %d reclaimed %.2f MiB before allocation to preserve %.2f MiB\n",
-            __func__, device, freed/1048576.0, reserve/1048576.0);
+        GGML_LOG_INFO("%s: device %d reclaimed %.2f MiB to allocate %.2f MiB while preserving %.2f MiB\n",
+            __func__, device, freed/1048576.0, size/1048576.0, reserve/1048576.0);
     }
 }
 
@@ -1369,13 +1369,6 @@ bool ggml_cuda_growable_memory::set_committed(size_t bytes) {
         const cudaError_t reserve_err = ggml_cuda_reserve_memory(device, more);
         if (reserve_err != cudaSuccess) {
             return reserve_err;
-        }
-        // The prefix grows into memory the device has free, the OOM reclaimer giving tier blocks back when it has not:
-        // WDDM maps past the process's budget by moving memory out to the host, which takes commit nobody held for it
-        size_t free = 0, total = 0;
-        ggml_cuda_memory_info(device, &free, &total);
-        if (more > free) {
-            return cudaErrorMemoryAllocation;
         }
         const CUresult rc = cuMemCreate(&handle, more, &prop, 0);
         return rc == CUDA_SUCCESS ? cudaSuccess : rc == CUDA_ERROR_OUT_OF_MEMORY ? cudaErrorMemoryAllocation : cudaErrorUnknown;

@@ -11,7 +11,7 @@ preserves its source attribution and license files.
 | ggml scheduler and allocator | Borrowed SSD copy hooks for the weights homed on the drive; graph buffer measurement/admission; first touch; backend scratch reservation; a pass that keeps an in-place op with the backend holding its storage; the split context and backend id arrays sized for the graph being split, not for one split per node (Windows charges commit at allocation). No core implementation is linked into ggml-base. |
 | CPU/CUDA registries | Normal private provider discovery and context-service attachment. CPU and CUDA do not link each other. On Windows the CUDA backend loads the driver's nvcuda.dll on first use, so a CUDA build starts where no NVIDIA driver is. |
 | Vulkan backend | Idle-submit keepalive every 20 ms; source-aware F16 `SET_ROWS` pipelines for F32/F16 destinations and I32/I64 indices, with unsupported conversions rejected. Shared copy shaders retain their F32 source variants. |
-| Growable buffers | CPU, CUDA and Metal buffer types whose buffers reserve their whole address range and hold memory for a prefix of it, grown and shrunk at its end (`ggml_backend_dev_buffer_type_growable`, `ggml_backend_buffer_set_committed`), for the KV cache that allocates its cells as they are used: CUDA maps device memory with VMM, only into memory the device has free (the OOM reclaimer gives tier blocks back first: WDDM would map past the process's budget and charge the host's commit), Metal wraps the prefix in one Metal buffer, Vulkan binds memory to a sparse residency buffer on a queue that does sparse binding, the CPU leaves the pages to be written. Nothing in a buffer moves. Vulkan without sparse residency buffers, CUDA without VMM and the CPU on Windows have none. |
+| Growable buffers | CPU, CUDA and Metal buffer types whose buffers reserve their whole address range and hold memory for a prefix of it, grown and shrunk at its end (`ggml_backend_dev_buffer_type_growable`, `ggml_backend_buffer_set_committed`), for the KV cache that allocates its cells as they are used: CUDA maps device memory with VMM, admitted as every device allocation is (below), Metal wraps the prefix in one Metal buffer, Vulkan binds memory to a sparse residency buffer on a queue that does sparse binding, the CPU leaves the pages to be written. Nothing in a buffer moves. Vulkan without sparse residency buffers, CUDA without VMM and the CPU on Windows have none. |
 | Backend operation files | New model operations and narrow native kernel entry points stay with their upstream operation/architecture files. Strict MXFP4 math is compiled separately with contraction and FTZ disabled. |
 | llama context | Runtime assembly, request phases, resource-aware graph reservation and failure recovery. Source, cache and telemetry owners reside in `src/ssd`. |
 | Model loading/mapping | Deferred expert ranges and compact Metal allocations where a GGUF interleaves the dense tensors with experts held elsewhere; under mmap, the tensors copied into a device buffer read with direct I/O into pinned buffers where the files read direct, as without mmap; fixed complete-page advice; read-ahead of the rows a lookup table (Engram, PLE) is about to read, on every OS; a refusal of GPU weights larger than the device's free memory. Source/range helpers reside in `src/ssd`. |
@@ -27,7 +27,13 @@ other errors and recovery without progress still return to the caller's error pa
 A CUDA graph that cannot be instantiated or launched for want of device memory
 runs its step without the graph and tells the same reclaimer, so that the VRAM
 tier gives a block back at its next quiescent token boundary before the graph is
-captured again.
+captured again. Every device allocation is admitted before it is made: it must fit
+in the card's free memory less the reserve, and the reclaimer gives back what it
+needs. A reclaimer that will give memory back only at its next quiescent point lets
+the allocation into the reserve until then, never past the free memory. Past the
+free memory an allocation fails on Linux and under TCC, but succeeds under WDDM
+with the excess backed by host memory and charged to commit, so there the
+admission is what keeps the card's limit.
 
 The inventory below lists every upstream file that differs from the snapshot.
 It includes model and operator additions as well as integration hooks; review
@@ -107,7 +113,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-cuda/fattn-common.cuh` | 35 | 7 |
 | `ggml/src/ggml-cuda/fattn.cu` | 10 | 0 |
 | `ggml/src/ggml-cuda/fattn.cuh` | 3 | 0 |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1782 | 138 |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1775 | 138 |
 | `ggml/src/ggml-cuda/mmq.cu` | 54 | 3 |
 | `ggml/src/ggml-cuda/mmq.cuh` | 28 | 10 |
 | `ggml/src/ggml-cuda/mmvf.cu` | 22 | 0 |
@@ -202,5 +208,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server.cpp` | 1 | 0 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 19991 added, 6009 removed across 159 upstream paths.
+Total: 19984 added, 6009 removed across 159 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
