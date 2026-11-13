@@ -51,7 +51,7 @@ def reserve(directory: str) -> Reservation:
     path = Path(directory).resolve()
     path.mkdir(parents=True, exist_ok=True)
     for name in RESERVED:
-        if (path / name).exists():
+        if os.path.lexists(path / name):
             raise FileExistsError(
                 "execution artifact already exists; use a fresh run directory: " + name
             )
@@ -65,7 +65,7 @@ def reserve(directory: str) -> Reservation:
             stream.write(payload)
         # Recheck after winning the atomic claim; no log/spec writes precede it.
         for name in RESERVED:
-            if (path / name).exists():
+            if os.path.lexists(path / name):
                 raise FileExistsError(
                     "execution artifact appeared while claiming directory: " + name
                 )
