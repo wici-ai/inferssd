@@ -46,7 +46,8 @@ static int reclaim(void * userdata, size_t, size_t * freed) {
     return 1;
 }
 
-static int reclaim_later(void *, size_t, size_t * freed) {
+static int reclaim_later(void * userdata, size_t, size_t * freed) {
+    ++static_cast<cache_fixture *>(userdata)->calls;
     *freed = 0;
     return GGML_CUDA_RECLAIM_LATER;
 }
@@ -154,9 +155,10 @@ int main() {
     ggml_backend_buffer_free(buffer);
     check(ggml_cuda_oom_reclaimer_unregister(0, reclaim, &full), "unregister failed");
     // A reclaimer that gives memory back only at its next quiescent point lets nothing past the free memory.
-    check(ggml_cuda_oom_reclaimer_register(0, reclaim_later, nullptr), "register failed");
-    check(ggml_backend_buft_alloc_buffer(buft, free_memory() + 64 * MIB) == nullptr,
+    cache_fixture busy;
+    check(ggml_cuda_oom_reclaimer_register(0, reclaim_later, &busy), "register failed");
+    check(ggml_backend_buft_alloc_buffer(buft, free_memory() + 64 * MIB) == nullptr && busy.calls > 0,
         "an allocation past the free memory was admitted");
-    check(ggml_cuda_oom_reclaimer_unregister(0, reclaim_later, nullptr), "unregister failed");
+    check(ggml_cuda_oom_reclaimer_unregister(0, reclaim_later, &busy), "unregister failed");
     std::puts("CUDA admission against the free memory without a reserve: PASS");
 }
