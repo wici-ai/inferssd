@@ -9,12 +9,15 @@ struct close_probe { void operator()(FILE * file) const noexcept { std::fclose(f
 }
 struct source_index::implementation {
     std::unique_ptr<c0::expert_index> index;
+    std::vector<std::unique_ptr<source_index>> replicas;
+    std::vector<int> replica_fds;
+    size_t max_experts = 0;
 };
 
 source_index::source_index(std::unique_ptr<implementation> state) : state_(std::move(state)) {}
 source_index::~source_index() = default;
 
-result<std::unique_ptr<source_index>> source_index::open(const std::vector<std::string> & paths) noexcept {
+result<std::unique_ptr<source_index>> source_index::open(const std::vector<std::string> & paths, const std::vector<std::string> & replicas, size_t max_experts) noexcept {
     try {
         if (paths.empty()) { return {nullptr, status::invalid, "expert.source requires an index path"}; }
         c0::description description;
@@ -59,6 +62,40 @@ result<std::unique_ptr<source_index>> source_index::open(const std::vector<std::
         }
         auto state = std::make_unique<implementation>();
         state->index = std::move(index);
+        if (!replicas.empty()) {
+            if (replicas.size() < 2 || replicas.size() > 8 || !max_experts || max_experts > 8) {
+                return {nullptr, status::invalid, "replica experiment requires 2..8 indexes and max_experts 1..8"};
+            }
+            std::vector<c0::source_identity> replica_ids;
+            for (const auto & path : replicas) {
+                auto replica = source_index::open({path});
+                if (!replica || replica.value->state_->index->source_count() != 1) {
+                    return {nullptr, status::invalid, "replica must resolve to one regular payload file"};
+                }
+                const auto & candidate = *replica.value->state_->index;
+                const auto id = candidate.source_identity_for_test(0);
+                for (const auto & previous : replica_ids) {
+                    if (id == previous || id.size != previous.size) {
+                        return {nullptr, status::invalid, "replicas must be distinct equally sized files"};
+                    }
+                }
+                for (const auto & entry : state->index->entries_for_test()) {
+                    c0::extent extent;
+                    if (!candidate.locate(entry.tensor, entry.expert_idx, entry.nbytes, extent) || extent.offset != entry.offset) {
+                        return {nullptr, status::invalid, "replica tensor layout differs from logical source"};
+                    }
+                }
+                replica_ids.push_back(id);
+                state->replica_fds.push_back(candidate.borrowed_direct_fd(0));
+                state->replicas.push_back(std::move(replica.value));
+            }
+            for (const auto & id : identities) {
+                if (std::find(replica_ids.begin(), replica_ids.end(), id) == replica_ids.end()) {
+                    return {nullptr, status::invalid, "logical source is not a declared replica"};
+                }
+            }
+            state->max_experts = max_experts;
+        }
         return {std::unique_ptr<source_index>(new source_index(std::move(state))), status::ok, {}};
     } catch (const std::bad_alloc &) {
         return {nullptr, status::resource, "oom"};
@@ -71,7 +108,7 @@ result<std::unique_ptr<source_index>> source_index::open(const std::vector<std::
 }
 
 source_view source_index::view() noexcept {
-    return {this, [](void * opaque, const char * name, int expert, size_t bytes, int64_t experts,
+    source_view result{this, [](void * opaque, const char * name, int expert, size_t bytes, int64_t experts,
                     int * fd, uint64_t * offset, size_t * logical_bytes) noexcept {
         if (!opaque || !name || expert < 0 || experts <= 0 || expert >= experts || !bytes || !fd || !offset || !logical_bytes) {
             return false;
@@ -100,5 +137,9 @@ source_view source_index::view() noexcept {
         if (block_bytes) { *block_bytes = block; }
         return count;
     }};
+    result.replica_fds = state_->replica_fds.data();
+    result.replica_count = state_->replica_fds.size();
+    result.range_max_experts = state_->max_experts;
+    return result;
 }
 } }

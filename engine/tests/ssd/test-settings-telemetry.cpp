@@ -52,7 +52,13 @@ int main(int argc, char ** argv) {
         return 0;
     }
     using namespace ssd::settings;
-    assert(registry().size() == 13);
+    assert(registry().size() == 15);
+    const auto replicas = parse("inferssd-settings 1\nexpert.replicas=[\"/replica-a\",\"/replica-b\"]\nio.range_max_experts=4\n", "replicas.ssd", {}, "linux");
+    assert(replicas && *replicas.value.integer("io.range_max_experts") == 4);
+    assert(replicas.value.paths("expert.replicas")->size() == 2 && replicas.value.paths("expert.replicas")->at(1) == "/replica-b");
+    assert(!parse("inferssd-settings 1\nio.range_max_experts=9\n", "invalid-range.ssd", {}, "linux"));
+    assert(!parse("inferssd-settings 1\nexpert.replicas=[1]\n", "invalid-replica.ssd", {}, "linux"));
+    assert(!parse("inferssd-settings 1\nexpert.replicas=[\"/replica-a\"]\n", "unsupported-replica.ssd", {}, "darwin"));
     assert(parse("inferssd-settings 1\nmodel.engram_prefetch=1\nmodel.hc_fused=0\n", "model.ssd"));
     assert(!parse("inferssd-settings 1\nmodel.hc_fused=2\n", "model-invalid.ssd"));
     auto base = parse("", "");

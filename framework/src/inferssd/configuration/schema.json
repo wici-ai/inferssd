@@ -244,6 +244,34 @@
             "minimum": 0,
             "maximum": 1,
             "default": 1
+        },
+        "expert.replicas": {
+            "description": "EXPERIMENTAL: verified byte-identical replica indexes; empty disables range reads",
+            "kind": "paths",
+            "unit": "path",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-expert-replicas",
+            "default_literal": "[]",
+            "type": "array",
+            "items": {
+                "type": "string",
+                "minLength": 1
+            },
+            "default": []
+        },
+        "io.range_max_experts": {
+            "description": "Split reads only when demand I/O expert count is at most this bound",
+            "kind": "integer",
+            "unit": "experts",
+            "producer": "plan",
+            "scope": "linux",
+            "cli": "--ssd-io-range-max-experts",
+            "default_literal": "2",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8,
+            "default": 2
         }
     }
 }

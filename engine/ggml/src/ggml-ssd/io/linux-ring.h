@@ -21,6 +21,10 @@ public:
     [[nodiscard]] result<void> register_buffers(const std::vector<buffer_span> & buffers) noexcept;
     [[nodiscard]] result<void> unregister_buffers() noexcept;
     [[nodiscard]] result<void> queue(const read_range &, void *, uint64_t, bool) noexcept;
+    // Experimental demand reader only; old queue() ABI and behavior are unchanged.
+    [[nodiscard]] result<void> configure_async(unsigned, const std::vector<int> &) noexcept;
+    [[nodiscard]] result<void> queue_async(const read_range &, void *, uint64_t, bool) noexcept;
+    [[nodiscard]] result<void> queue_async_limited(const read_range &, void *, uint64_t, bool, unsigned workers) noexcept;
     [[nodiscard]] result<void> submit(unsigned count) noexcept;
     [[nodiscard]] result<bool> pop(completion &) noexcept;
     [[nodiscard]] result<void> wait() noexcept;

@@ -4,6 +4,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ssd/cpu-sink.h"
+#include "ggml-ssd/store/source.h"
 #include "ssd/cpu-prefill.h"
 #include "ggml-ssd/settings/settings.h"
 #include <thread>
@@ -63,7 +64,7 @@ struct pread_hold {
     std::condition_variable cv;
     int fd = -1;
     std::vector<uint64_t> offsets;
-    bool armed = false;
+    bool armed = false, fail_held = false;
     int waiting = 0;
     std::function<void()> before_meminfo;
     static pread_hold & get() { static pread_hold & h = *new pread_hold; return h; } // outlives every thread
@@ -85,6 +86,7 @@ static ssize_t held_pread(int fd, void * buffer, size_t bytes, int64_t offset) {
             h.cv.notify_all();
             h.cv.wait(lock, [&] { return !h.armed; });
             --h.waiting;
+            if (h.fail_held) { errno = EIO; return -1; }
         }
     }
     if (hook) { hook(); }
@@ -97,10 +99,10 @@ extern "C" ssize_t test_held_pread(int fd, void * buffer, size_t bytes, int64_t 
 extern "C" ssize_t test_held_pread64(int fd, void * buffer, size_t bytes, int64_t offset) { return held_pread(fd, buffer, bytes, offset); }
 // Holds the reads of `offsets` in `fd` for its scope; its end, or release(), lets them go.
 struct pread_hold_guard {
-    pread_hold_guard(int fd, std::vector<uint64_t> offsets) {
+    pread_hold_guard(int fd, std::vector<uint64_t> offsets, bool fail_held = false) {
         auto & h = pread_hold::get();
         std::lock_guard<std::mutex> lock(h.mutex);
-        h.fd = fd; h.offsets = std::move(offsets); h.armed = true; h.waiting = 0;
+        h.fd = fd; h.offsets = std::move(offsets); h.armed = true; h.waiting = 0; h.fail_held = fail_held;
     }
     ~pread_hold_guard() { release(); }
     // until n reads wait in the hold
@@ -442,6 +444,54 @@ static void fault_case(fixture_inputs & inputs, const char * name, fixture & f, 
         compare_case(inputs, "after_short_read_recovery", f, sink.get(), 1, input, { id }, { weight });
     }
     std::printf("case=%s status=PASS error=%s\n", name, error); f.fault = fixture::none;
+}
+
+// Exercise real integrated ring scheduling, byte accounting, numerical results and error draining.
+static void replica_range_tests(fixture_inputs & inputs, int threads) {
+    const int drive_count=std::getenv("INFERSSD_TEST_REPLICAS")?std::atoi(std::getenv("INFERSSD_TEST_REPLICAS")):4;
+    require(drive_count>=2 && drive_count<=8,"test replica count");
+    fixture copies[8];
+    int descriptors[8];
+    for (int i = 0; i < drive_count; ++i) { make_synthetic(copies[i]); descriptors[i] = copies[i].fd; }
+    ssd::store::source_view source{};
+    source.replica_fds = descriptors; source.replica_count = size_t(drive_count); source.range_max_experts = 2;
+    inputs.runtime.source = &source;
+    inputs.set("cache_keep", "0");
+    inputs.set("read_fixed", "0");
+    for (const char * name : {"ready_first", "early_up_gate", "role_major", "nonblocking_down_sched"}) { inputs.set(name, "1"); }
+    auto & f = copies[0];
+    std::vector<float> input(f.latent, 0.125f);
+    for (int count : {1, 2, 3, 6}) {
+        auto sink = make_sink(inputs, f, threads, 2);
+        char begin_error[512] = {};
+        require(kimi_cpu_sink_cache_begin(sink.get(), 1, 1, true, begin_error, sizeof(begin_error)), begin_error);
+        std::vector<int32_t> ids; std::vector<float> weights;
+        for (int i = 0; i < count; ++i) { ids.push_back(i); weights.push_back(1.0f / count); }
+        tensors meta(f, 1);
+        const auto expected = reference(f, 1, input, ids, weights, 4.0f, 25.0f);
+        std::vector<float> output(f.latent); char error[512] = {}; kimi_cpu_sink_stats stats{};
+        require(kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(), weights.data(), count,
+            4.0f, 25.0f, output.data(), &stats, error, sizeof(error)), error);
+        require(output == expected, "replica read changed numerical output");
+        require(stats.pending_reads == 0 && stats.read_completions == stats.read_requests && !stats.read_errors,
+            "replica read returned with pending/failed CQEs");
+        const char * policy=std::getenv("INFERSSD_REPLICA_POLICY");
+        const bool historical=!policy || !std::strcmp(policy,"range4");
+        if(historical) require(count <= 2 ? stats.read_requests > unsigned(3 * count) : stats.read_requests == unsigned(3 * count),
+            "adaptive replica threshold did not select expected path");
+        else if(!std::strcmp(policy,"whole") || !std::strcmp(policy,"static"))
+            require(stats.read_requests == unsigned(3*count),"whole routing unexpectedly split a role");
+        size_t bytes = 0;
+        for (auto id : ids) { for (int role = 0; role < 3; ++role) { bytes += f.entries.at({tensor_name(1, role), id}).read_bytes; } }
+        require(stats.read_bytes == bytes, "replica fanout duplicated/lost payload bytes");
+        f.fault = fixture::past_eof;
+        require(!kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(), weights.data(), count,
+            4.0f, 25.0f, output.data(), &stats, error, sizeof(error)), "replica short read accepted");
+        require(!stats.pending_reads && stats.read_completions == stats.read_requests, "failed replica reads were not drained");
+        f.fault = fixture::none;
+        std::printf("REPLICA_RANGE_NUMERICAL_AND_DRAIN_PASS experts=%d\n", count);
+    }
+    inputs.runtime.source = nullptr;
 }
 
 static void synthetic_tests(fixture_inputs & inputs, int threads, int ring_experts) {
@@ -2007,7 +2057,16 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
             cache_case(inputs, "prefetch_predicted_layer2", f, sink.get(), 2, input, { 5, 7, 12 }, { .2f, .3f, .5f },
                 k ? 2 : 1, -1);
         }
-        std::istringstream lines(log.read());
+        const std::string captured = log.read();
+        if (k > 0 && std::getenv("INFERSSD_PREFETCH_FORCE_ASYNC")) {
+            const size_t at = captured.find("[prefetch_async_submit] workers_per_reader=1 reads=");
+            require(at != std::string::npos, "prefetch async activation receipt missing");
+            unsigned long long x=0,y=0,z=0;
+            require(std::sscanf(captured.c_str()+at, "[prefetch_async_submit] workers_per_reader=1 reads=%llu,%llu,%llu", &x,&y,&z)==3 && x+y+z>0,
+                    "prefetch async branch executed no reads");
+            std::printf("case=prefetch_async_activation status=PASS reads=%llu\n",x+y+z);
+        }
+        std::istringstream lines(captured);
         std::string line, report;
         std::vector<nlohmann::json> hints;
         while (std::getline(lines, line)) {
@@ -2056,7 +2115,62 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
         std::printf("case=prefetch_depth%d status=PASS %s\n", k, report.c_str());
     }
 #if defined(__linux__)
-    {
+    if (std::getenv("INFERSSD_PREFETCH_EARLY_ROLES") && !std::strcmp(std::getenv("INFERSSD_PREFETCH_EARLY_ROLES"), "1") &&
+            !std::getenv("INFERSSD_ABLATE_ASYNC") && !std::getenv("INFERSSD_IO_POOL")) {
+        require(inputs.set("prefetch_depth", "1") == 0, "early role depth");
+        for (bool fail_down : { false, true }) {
+        stderr_capture log;
+        auto sink = make_sink(inputs, f, threads, depth);
+        configure_cache(sink.get(), 12 * unit, { 1, 2 }, 6);
+        begin_cache(sink.get(), 1, 1);
+        cache_case(inputs, "early_warm1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+        cache_case(inputs, "early_warm2", f, sink.get(), 2, input, { 10, 11, 12, 13, 14, 15 },
+            { .1f, .1f, .2f, .2f, .2f, .2f }, 0, 6);
+        begin_cache(sink.get(), 1, 2);
+        kimi_cpu_sink_source source = {};
+        require(fixture::resolve(&f, tensor_name(2, 2).c_str(), 5, &source), "early held down source");
+        pread_hold_guard hold(f.fd, { source.offset }, fail_down);
+        const int32_t hint[] = { 5 };
+        kimi_cpu_sink_prefetch_hint(sink.get(), 2, hint, 1);
+        cache_case(inputs, "early_hint", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
+        hold.wait(1);
+        bool saw_early = false;
+        std::thread release([&] {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (std::chrono::steady_clock::now() < until) {
+                std::ifstream file(log.path);
+                const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+                if (text.find("[prefetch_role_early] stage=up_gate_finished_before_down") != std::string::npos) { saw_early = true; break; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            hold.release();
+        });
+        try {
+            if (!fail_down) {
+                cache_case(inputs, "early_prefetch_up_gate_before_down", f, sink.get(), 2, input, { 5 }, { 1.0f }, 1, 0);
+            } else {
+                tensors meta(f, 2); int32_t ids[] = { 5 }; float weights[] = { 1.0f };
+                std::vector<float> output(f.latent); kimi_cpu_sink_stats stats = {}; char error[512] = {};
+                require(!kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+                    ids, weights, 1, 4, 25, output.data(), &stats, error, sizeof(error)), "failed down accepted after early compute");
+                require(std::strstr(error, "prefetch read"), std::string("wrong delayed failure: ") + error);
+            }
+        }
+        catch (...) { hold.release(); release.join(); throw; }
+        release.join();
+        require(saw_early, "up/gate did not finish while down was held");
+        std::printf("case=prefetch_up_gate_before_down status=PASS fail_down=%d\n", int(fail_down));
+        if (fail_down) {
+            kimi_cpu_sink_cache_reset(sink.get());
+            configure_cache(sink.get(), 12 * unit, { 1, 2 }, 6);
+            begin_cache(sink.get(), 2, 1);
+            cache_case(inputs, "early_after_failed_down_recovers", f, sink.get(), 2, input, { 5 }, { 1.0f }, 0, 1);
+        }
+        }
+    }
+    if (!std::getenv("INFERSSD_ABLATE_ASYNC") && !std::getenv("INFERSSD_IO_POOL")) {
+        const bool priority_reserve = std::getenv("INFERSSD_PRIORITY_PREFETCH") != nullptr;
+        const int speculative_readers = priority_reserve ? 2 : 3;
         // The reads of 6, hinted for layer 2 and not selected there, held in pread (pread_hold) for as long as a case
         // needs, without timing assumptions. A prefetch lands only in resident slots, so both layers are warmed
         // first; the hinted run of layer 1 then has no reads of its own. A case's runs end with layer 2's, which
@@ -2082,7 +2196,7 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
                 const int32_t hint[] = { 5, 6 };
                 kimi_cpu_sink_prefetch_hint(sink.get(), 2, hint, 2);
                 cache_case(inputs, "spill_hinted_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
-                hold.wait(3); // the readers run 6's three reads, so 5's are done
+                hold.wait(speculative_readers); // all speculative workers hold 6; 5 is complete
                 std::vector<float> weights(ids.size(), 1.0f / float(ids.size()));
                 cache_case(inputs, name, f, sink.get(), 2, input, ids, weights, hits, -1);
                 after(sink.get(), hold);
@@ -2112,7 +2226,7 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
         const std::string twice = spill_case("spill_layer2_reads", { 5, 7 }, 1, drain_held);
         const std::string spill_r = field(twice, "spill_us_r");
         require(field(twice, "issued_r") == "1,1" && field(twice, "started_r") == "1,1" &&
-                field(twice, "spills") == "3" && spill_r.rfind("0,", 0) == 0 && spill_r != "0,0",
+                field(twice, "spills") == std::to_string(speculative_readers) && spill_r.rfind("0,", 0) == 0 && spill_r != "0,0",
                 "a read that spilled twice: " + twice);
         std::printf("case=prefetch_spill_twice status=PASS %s\n", twice.c_str());
         // Layer 2's run takes only 5 (prefetched): no reads of its own and no hint for the next layer, as the last
@@ -2123,10 +2237,48 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
             hold.release();
         };
         const std::string last = spill_case("spill_layer2_last", { 5 }, 1, hold_then_release);
-        require(field(last, "spills") == "3" && std::stod(field(last, "spill_us")) < 150000 &&
+        require(field(last, "spills") == std::to_string(speculative_readers) && std::stod(field(last, "spill_us")) < 150000 &&
                 std::stoull(field(last, "spill_us_r").substr(2)) < 3 * 150000,
                 "reads spilled past a run without reads of its own and without a hint: " + last);
         std::printf("case=prefetch_spill_last status=PASS %s\n", last.c_str());
+        if (priority_reserve) {
+            // Both speculative readers are stuck on an unused expert. A queued expert selected by
+            // the next layer must complete, with reference-correct output, before those reads release.
+            auto sink = make_sink(inputs, f, threads, depth);
+            pread_hold_guard hold(f.fd, offsets);
+            configure_cache(sink.get(), 12 * unit, { 1, 2 }, 6);
+            begin_cache(sink.get(), 1, 1);
+            cache_case(inputs, "reserve_warm1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
+            cache_case(inputs, "reserve_warm2", f, sink.get(), 2, input, { 10, 11, 12, 13, 14, 15 },
+                { .1f, .1f, .2f, .2f, .2f, .2f }, 0, 6);
+            begin_cache(sink.get(), 1, 2);
+            const int32_t hint[] = { 6, 5 };
+            kimi_cpu_sink_prefetch_hint(sink.get(), 2, hint, 2);
+            cache_case(inputs, "reserve_block_speculation", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
+            hold.wait(2);
+            std::mutex watchdog_mutex;
+            std::condition_variable watchdog_cv;
+            bool finished = false, timed_out = false;
+            std::thread watchdog([&] {
+                std::unique_lock<std::mutex> lock(watchdog_mutex);
+                if (!watchdog_cv.wait_for(lock, std::chrono::seconds(2), [&] { return finished; })) {
+                    timed_out = true; hold.release();
+                }
+            });
+            auto finish = [&] {
+                { std::lock_guard<std::mutex> lock(watchdog_mutex); finished = true; }
+                watchdog_cv.notify_all(); watchdog.join();
+            };
+            try {
+                cache_case(inputs, "reserve_serves_urgent", f, sink.get(), 2, input, { 5 }, { 1.0f }, 1, 0);
+            } catch (...) { finish(); hold.release(); throw; }
+            finish();
+            require(!timed_out, "urgent expert waited for blocked speculative readers");
+            hold.release();
+            std::printf("case=reserved_urgent_progress status=PASS speculative_blocked=2\n");
+        }
+    } else {
+        std::printf("case=prefetch_spill_interposition status=SKIP reason=io_uring_bypasses_pread_hook\n");
     }
 #else
     std::printf("case=prefetch_spill_twice status=SKIP reason=linux_pread_interposition\n");
@@ -3538,11 +3690,23 @@ static void graph_layer_compute(ggml_tensor * dst, int ith, int nth, void * user
 }
 
 static void threadpool_tests(fixture_inputs & inputs, int depth) {
-    fixture f; make_synthetic(f);
+    const bool l3_test = std::getenv("INFERSSD_TEST_L3") != nullptr;
+    std::vector<int> l3_cpus;
+    if (l3_test) {
+        const char * value=std::getenv("INFERSSD_CPU_L3_CPUS");
+        require(value && *value,"L3 test needs an explicit CPU list");
+        std::istringstream list(value); std::string item;
+        while (std::getline(list,item,',')) l3_cpus.push_back(std::stoi(item));
+        for (const char * key : {"ready_first","early_up_gate","role_major","nonblocking_down_sched","dynamic_rows"}) inputs.set(key,"1");
+    }
+    fixture f;
+    if (l3_test) f.type=f.down_type=GGML_TYPE_MXFP4;
+    make_synthetic(f);
     tensors meta1(f, 1), meta2(f, 2);
     const int cpus = int(test_resources::process_cpus().size());
     std::vector<int> counts = { 1, 2, 3 };
     if (cpus > 3) { counts.push_back(cpus); }
+    if (l3_test) counts={int(l3_cpus.size())};
     const std::vector<int32_t> ids1 = { 17, 0, 8, 2, 19, 4, 11, 6 }, ids2 = { 3, 9, -1, 13, 5, 3, 1, 12 };
     const std::vector<float> w1 = { .2f, .1f, .15f, .05f, .1f, .1f, .2f, .1f }, w2 = { .3f, .1f, 0, .2f, .1f, .1f, .1f, .1f };
     std::vector<float> x(f.latent);
@@ -3568,7 +3732,7 @@ static void threadpool_tests(fixture_inputs & inputs, int depth) {
         prefill_expected.insert(prefill_expected.end(), y.begin(), y.end());
     }
     char error[512] = {};
-    for (int fixed : { 0, 2 }) {
+    for (int fixed : l3_test ? std::vector<int>{0} : std::vector<int>{0,2}) {
         scoped_fixture_input participants(inputs, "decode_participants", fixed ? std::to_string(fixed).c_str() : nullptr);
         // one participant only: the sink computes on the callers' threads
         sink_ptr sink = inputs.create(2, depth, fixture::resolve, &f, error, sizeof(error));
@@ -3579,6 +3743,13 @@ static void threadpool_tests(fixture_inputs & inputs, int depth) {
         for (int n : counts) {
             if (fixed > n) { continue; }
             ggml_threadpool_params params = ggml_threadpool_params_default(n);
+            if (l3_test) {
+                params.strict_cpu=true;
+                for (int cpu : l3_cpus) {
+                    require(cpu>=0 && cpu<GGML_MAX_N_THREADS,"invalid L3 test CPU");
+                    params.cpumask[cpu]=true;
+                }
+            }
             std::unique_ptr<ggml_threadpool, decltype(&ggml_threadpool_free)> pool(ggml_threadpool_new(&params),
                 ggml_threadpool_free);
             require(bool(pool), "ggml threadpool");
@@ -3619,6 +3790,7 @@ static void threadpool_tests(fixture_inputs & inputs, int depth) {
                 y = node(layers[1], meta2, y, i2, v2);
                 y = node(layers[2], meta1, y, i1, v1);
                 ggml_build_forward_expand(graph, y);
+                if (l3_test) require(kimi_cpu_sink_cache_begin(sink.get(),1,uint64_t(repeat*2+1),true,error,sizeof(error)),error);
                 compute(graph);
                 for (int l = 0; l < 3; ++l) {
                     require(layers[l].ok, "threadpool decode layer: " + layers[l].error);
@@ -3637,6 +3809,7 @@ static void threadpool_tests(fixture_inputs & inputs, int depth) {
                     vector(GGML_TYPE_F32, nslots, ntokens, prefill_weights.data()));
                 graph = ggml_new_graph(ctx);
                 ggml_build_forward_expand(graph, p);
+                if (l3_test) require(kimi_cpu_sink_cache_begin(sink.get(),1,uint64_t(repeat*2+2),false,error,sizeof(error)),error);
                 compute(graph);
                 require(grouped.ok, "threadpool prefill: " + grouped.error);
                 require(grouped.nth == n, "threadpool prefill call participants " + std::to_string(grouped.nth));
@@ -4165,7 +4338,7 @@ int main(int argc, char ** argv) {
     fixture_inputs inputs;
     try {
         real_options options; bool ring_set = false, registered_lifecycle = false, cache_mode = false, cache_pressure = false;
-        bool configured_runtime_mode = false;
+        bool configured_runtime_mode = false, replica_mode = false;
         bool trace_profile_mode = false, max_cache_mode = false, hitrate_mode = false, elastic_cache_mode = false;
         bool schedules_mode = false, schedule_invalid_mode = false, early_up_gate_mode = false;
         bool role_major_mode = false, nonblocking_down_mode = false;
@@ -4187,6 +4360,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--policy")) { options.policy = argument(); }
             else if (!std::strcmp(argv[i], "--jsonl")) { options.jsonl = argument(); }
             else if (!std::strcmp(argv[i], "--resident-dir")) { options.resident_dir = argument(); }
+            else if (!std::strcmp(argv[i], "--replica-range-tests")) { replica_mode = true; }
             else if (!std::strcmp(argv[i], "--configured-runtime")) { configured_runtime_mode = true; }
             else if (!std::strcmp(argv[i], "--trace-profile")) { trace_profile_mode = true; }
             else if (!std::strcmp(argv[i], "--prefetch-tests")) { prefetch_mode = true; }
@@ -4226,7 +4400,7 @@ int main(int argc, char ** argv) {
             test_resources::cpu_participants(required - 1, 1);
             test_resources::io_ring();
         }
-        if (cache_mode || hitrate_mode || elastic_cache_mode || cache_load_mode || work_reclaim_mode || max_cache_mode ||
+        if (replica_mode || cache_mode || hitrate_mode || elastic_cache_mode || cache_load_mode || work_reclaim_mode || max_cache_mode ||
                 early_up_gate_mode ||
                 role_major_mode || nonblocking_down_mode || poll_mode || poll_early_mode || schedules_mode ||
                 prefetch_mode || cache_policy_mode || cache_large_mode || activation_mode || muse_q8_mode || muse_bf16_mode ||
@@ -4234,6 +4408,7 @@ int main(int argc, char ** argv) {
             test_resources::finite_envelope();
         }
 #if defined(__linux__)
+        if (replica_mode) { replica_range_tests(inputs, options.threads); return 0; }
         if (configured_runtime_mode) { configured_runtime_tests(inputs); return 0; }
         if (auto_ring_mode) { cache_auto_ring_test(inputs, options.threads, ring_set ? options.ring_experts : 8); return 0; }
         if (cache_pressure_transition) { cache_pressure_transition_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }

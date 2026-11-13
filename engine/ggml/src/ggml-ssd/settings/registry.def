@@ -15,3 +15,7 @@ SSD_SETTING("host.headroom_mib", integer, 0, 4294967295, "512", "MiB", "plan", s
 SSD_SETTING("host.budget_mib", integer, 0, 17592186044415, "0", "MiB", "plan", scope_darwin | scope_windows, "", "Host memory envelope in MiB against this process's own memory; zero leaves the machine's physical memory")
 SSD_SETTING("model.engram_prefetch", integer, 0, 1, "0", "boolean", "model", scope_all, "", "Read ahead DeepSeek Engram rows; changes I/O timing only")
 SSD_SETTING("model.hc_fused", integer, 0, 1, "1", "boolean", "model", scope_all, "", "Use the fused hyper connection operations of DeepSeek-V4.1 and Qwen3.8-Flash-Next")
+
+// Explicit, identical expert-pack replicas for the opt-in four-drive executor.
+SSD_SETTING("expert.replicas", paths, 0, 0, "[]", "path", "plan", scope_linux, "", "EXPERIMENTAL: verified byte-identical replica indexes; empty disables range reads")
+SSD_SETTING("io.range_max_experts", integer, 1, 8, "2", "experts", "plan", scope_linux, "", "Split reads only when demand I/O expert count is at most this bound")

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <linux/io_uring.h>
+#include <sched.h>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -35,6 +36,7 @@ template<class T, class F> result<T> boundary(F operation) noexcept {
 // Single producer/consumer, owned by the persistent I/O thread. Direct syscalls
 // avoid adding a liburing dependency to the CPU backend.
 struct linux_ring::impl {
+    bool async_configured = false;
     int fd = -1;
     void * sq = MAP_FAILED;
     void * cq = MAP_FAILED;
@@ -144,7 +146,43 @@ struct linux_ring::impl {
                      static_cast<unsigned long long>(register_count), static_cast<unsigned long long>(unregister_count));
     }
 
-    void queue(const read_range & source, void * data, uint64_t tag, bool fixed) {
+    void configure_async_workers(unsigned requested = 4, const std::vector<int> & explicit_cpus = {}) {
+        if (async_configured) { return; }
+        if (pending) { throw std::runtime_error("async worker configuration with pending reads"); }
+        // Affinity registration requires the calling I/O thread's task context.
+        // Enter with an empty SQ to establish it without producing a data CQE.
+        if (*sq_tail != __atomic_load_n(sq_head, __ATOMIC_ACQUIRE)) {
+            throw std::runtime_error("async worker configuration with queued reads");
+        }
+        int entered;
+        do { entered = int(syscall(__NR_io_uring_enter, fd, 1, 0, 0, nullptr, 0)); }
+        while (entered < 0 && errno == EINTR);
+        if (entered < 0) { throw sys_error("io_uring worker context"); }
+        if (entered) { throw std::runtime_error("unexpected initialization submission"); }
+        cpu_set_t cpus;
+        CPU_ZERO(&cpus);
+        const long mask_bytes = syscall(__NR_sched_getaffinity, 0, sizeof(cpus), &cpus);
+        if (mask_bytes <= 0) { throw sys_error("I/O worker affinity"); }
+        if (!explicit_cpus.empty()) {
+            CPU_ZERO(&cpus);
+            for (int cpu : explicit_cpus) {
+                if (cpu < 0 || cpu >= mask_bytes * 8) throw std::runtime_error("invalid I/O worker CPU");
+                CPU_SET(cpu, &cpus);
+            }
+        }
+        const unsigned limit = std::max(1u, std::min(requested, unsigned(CPU_COUNT(&cpus))));
+        unsigned workers[2] = {limit, limit};
+        if (syscall(__NR_io_uring_register, fd, IORING_REGISTER_IOWQ_MAX_WORKERS, workers, 2) < 0) {
+            throw sys_error("io_uring worker limit");
+        }
+        if (syscall(__NR_io_uring_register, fd, IORING_REGISTER_IOWQ_AFF, &cpus, unsigned(mask_bytes)) < 0) {
+            throw sys_error("io_uring worker affinity");
+        }
+        async_configured = true;
+        std::fprintf(stderr, "[decode_async_workers] limit=%u affinity_cpus=%d configured=1\n", limit, CPU_COUNT(&cpus));
+    }
+
+    void queue(const read_range & source, void * data, uint64_t tag, bool fixed, bool force_async = false) {
         if (!data || reinterpret_cast<uintptr_t>(data) % 4096) {
             throw std::runtime_error("CPU sink read target is not 4096-byte aligned");
         }
@@ -159,6 +197,7 @@ struct linux_ring::impl {
         io_uring_sqe & entry = sqes[index];
         std::memset(&entry, 0, sizeof(entry));
         entry.opcode = fixed ? IORING_OP_READ_FIXED : IORING_OP_READ;
+        if (force_async) { entry.flags |= IOSQE_ASYNC; }
         if (fixed) { entry.buf_index = static_cast<uint16_t>(tag); }
         entry.fd = source.fd_direct;
         entry.off = source.offset;
@@ -232,6 +271,26 @@ result<void> linux_ring::unregister_buffers() noexcept {
 }
 result<void> linux_ring::queue(const read_range & source, void * data, uint64_t tag, bool fixed) noexcept {
     return boundary<void>([&] { if (!state_) { throw std::runtime_error("ring not initialized"); } state_->queue(source, data, tag, fixed); });
+}
+result<void> linux_ring::configure_async(unsigned workers, const std::vector<int> & cpus) noexcept {
+    return boundary<void>([&] {
+        if (!state_ || !workers || workers > 4) throw std::runtime_error("invalid async configuration");
+        state_->configure_async_workers(workers, cpus);
+    });
+}
+result<void> linux_ring::queue_async(const read_range & source, void * data, uint64_t tag, bool fixed) noexcept {
+    return boundary<void>([&] {
+        if (!state_) { throw std::runtime_error("ring not initialized"); }
+        state_->configure_async_workers();
+        state_->queue(source, data, tag, fixed, true);
+    });
+}
+result<void> linux_ring::queue_async_limited(const read_range & source, void * data, uint64_t tag, bool fixed, unsigned workers) noexcept {
+    return boundary<void>([&] {
+        if (!state_ || !workers || workers > 4) { throw std::runtime_error("invalid limited async read"); }
+        state_->configure_async_workers(workers);
+        state_->queue(source, data, tag, fixed, true);
+    });
 }
 result<void> linux_ring::submit(unsigned count) noexcept {
     return boundary<void>([&] { if (!state_) { throw std::runtime_error("ring not initialized"); } state_->submit(count); });
