@@ -4,15 +4,18 @@ import hashlib
 import json
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 from observe_launch_reference import header, normalize
 from test_launch_linux import GOLDENS
 
+from inferssd.launch import recorded
 from inferssd.launch.linux import resolve_linux
 from inferssd.launch.prepare import prepare
-from inferssd.launch.recorded import RecordedArtifacts, generate_alias
+from inferssd.launch.recorded import RecordedArtifacts, generate_alias, keep_alias
 from inferssd.launch.types import LaunchInput, Output
 
 
@@ -180,6 +183,54 @@ def test_alias_reused_while_its_inputs_are_unchanged(tmp_path):
     assert alias("run3").read_text() == "rows 2\n" and len(built) == 2
     alias("run4", "muse")
     assert len(built) == 3
+
+
+def cache_files(tmp_path):
+    built = (tmp_path / "index.tsv", tmp_path / "summary.json")
+    built[0].write_bytes(b"complete index\n")
+    built[1].write_bytes(b'{"model_shards":1,"entries":1}')
+    kept = (tmp_path / "cache" / "key.tsv", tmp_path / "cache" / "key.json")
+    return built, kept
+
+
+def test_concurrent_alias_publications_in_one_process(tmp_path, monkeypatch):
+    built, kept = cache_files(tmp_path)
+    together = threading.Barrier(2)
+    replace = os.replace
+
+    def simultaneous(source, target):
+        if Path(target) == kept[0]:
+            together.wait(timeout=5)
+        replace(source, target)
+
+    monkeypatch.setattr(recorded.os, "replace", simultaneous)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = [pool.submit(keep_alias, built, kept) for _ in range(2)]
+        for future in pending:
+            future.result(timeout=5)
+    assert [path.read_bytes() for path in kept] == [path.read_bytes() for path in built]
+    assert sorted(kept[0].parent.iterdir()) == sorted(kept)
+
+
+@pytest.mark.parametrize("operation", ["copy", "replace"])
+def test_failed_alias_publication_removes_only_its_temporary_file(tmp_path, monkeypatch, operation):
+    built, kept = cache_files(tmp_path)
+    kept[0].parent.mkdir()
+    kept[0].write_bytes(b"previous index\n")
+
+    def fail(source, target):
+        if operation == "copy":
+            Path(target).write_bytes(b"partial")
+        raise OSError("publication failed")
+
+    if operation == "copy":
+        monkeypatch.setattr(recorded.shutil, "copyfile", fail)
+    else:
+        monkeypatch.setattr(recorded.os, "replace", fail)
+    with pytest.raises(OSError, match="publication failed"):
+        keep_alias(built, kept)
+    assert kept[0].read_bytes() == b"previous index\n"
+    assert list(kept[0].parent.iterdir()) == [kept[0]]
 
 
 def test_output_failure_prevents_next_effect():

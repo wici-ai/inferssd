@@ -158,9 +158,14 @@ def keep_alias(built: tuple[Path, Path], kept: tuple[Path, Path]) -> None:
     files of one key hold the same content whichever launch wrote them."""
     kept[0].parent.mkdir(parents=True, exist_ok=True)
     for source, target in zip(built, kept):
-        partial = target.with_name(f".{target.name}.{os.getpid()}")
-        shutil.copyfile(source, partial)
-        os.replace(partial, target)
+        descriptor, name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+        os.close(descriptor)
+        partial = Path(name)
+        try:
+            shutil.copyfile(source, partial)
+            os.replace(partial, target)
+        finally:
+            partial.unlink(missing_ok=True)
 
 
 def run_indexer(command: list[str]) -> None:
