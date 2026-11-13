@@ -197,6 +197,46 @@ def test_real_cpp_jsonl_consumed(native_contract, tmp_path):
     assert effective_settings(events) == parse().document()
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param('{\n"answer": 42\n}', id="lf"),
+        pytest.param('{\r\n"nested": [1,\r\n{"label": "two words"}]\r\n}', id="crlf"),
+        pytest.param('{\r"answer": 42\r}', id="cr"),
+        pytest.param(
+            json.dumps(
+                {"escaped": 'line\nnext\r\t"quote"\\path', "unicode": "🐈\u2028\u2029\u0085"},
+                indent=2,
+                ensure_ascii=False,
+            ),
+            id="formatted-escaped-strings",
+        ),
+        pytest.param("{\n}", id="empty-object"),
+        pytest.param('{\t"label": "two words"\t}', id="tabs"),
+        pytest.param(
+            '{"number":1.2300e+02,"integer":9007199254740993,"escaped":"\\n\\r\\t"}',
+            id="compact-lexemes",
+        ),
+        pytest.param(' \r\n {"label": "🐈\u2028\u2029\u0085"} \r\n ', id="outer-whitespace"),
+    ],
+)
+def test_native_payload_stays_one_jsonl_record(native_contract, tmp_path, payload):
+    path = tmp_path / "payload.jsonl"
+    subprocess.run([str(native_contract), "--payload", str(path), payload], check=True)
+    raw = path.read_bytes()
+    assert raw.count(b"\n") == 2
+    assert b"\r" not in raw
+    events = list(read_events(raw.decode("utf-8").split("\n")[:-1]))
+    assert [(event.sequence, event.name) for event in events] == [
+        (0, "ssd.payload"),
+        (1, "ssd.after"),
+    ]
+    assert events[0].payload == json.loads(payload)
+    assert events[1].payload == {}
+    if "1.2300e+02" in payload:
+        assert b"1.2300e+02" in raw and b"9007199254740993" in raw
+
+
 def test_effective_settings_requires_registry_and_typed_receipts():
     from inferssd.telemetry.jsonl import Event
 
