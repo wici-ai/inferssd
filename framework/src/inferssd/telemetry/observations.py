@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from collections.abc import Iterator
 from typing import Any, BinaryIO, Optional, Protocol
 
 from inferssd.telemetry.files import LocalArmFiles
@@ -166,13 +167,24 @@ class NativeObservationSession:
         # skip is applied by the caller when selecting its window.
         path = directory + "/native-events.jsonl"
         parser, offset = self.live.get(path, (NativeObservations(), 0))
-        if self.files.stat(path).st_size < offset:
+        size = self.files.stat(path).st_size
+        if size < offset:
             raise ValueError("native observation file was truncated")
         with self.files.open_binary(path) as stream:
             stream.seek(offset)
-            data = stream.read()
-        cut = data.rfind(b"\n") + 1
-        for event in read_events(data[:cut].decode("utf-8").splitlines(), start=parser.sequence):
-            parser.feed(event)
-        self.live[path] = parser, offset + cut
+
+            def complete_lines() -> Iterator[str]:
+                nonlocal offset
+                # Bound this poll to the file size observed at entry. Leave any
+                # incomplete final record, including partial UTF-8, for the next poll.
+                while offset < size:
+                    line = stream.readline(size - offset)
+                    if not line.endswith(b"\n"):
+                        break
+                    offset += len(line)
+                    yield line.decode("utf-8")
+
+            for event in read_events(complete_lines(), start=parser.sequence):
+                parser.feed(event)
+        self.live[path] = parser, offset
         return parser.result()
