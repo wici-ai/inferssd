@@ -158,6 +158,14 @@ bool expert_pack_load_source(const char *path, int32_t source_idx, std::vector<e
         return false;
     }
     expert_pack_source &source = g_expert_pack.sources.back();
+    // Bound the allocation by the opened file, not just the header's entry
+    // count. The wire row has no in-memory padding or derived catalog fields.
+    constexpr uint64_t index_row_bytes = sizeof(expert_pack_entry::tensor) +
+        sizeof(int32_t) + sizeof(uint32_t) + 2 * sizeof(uint64_t);
+    if (source.file_size < 40 || n_entries > (source.file_size - 40) / index_row_bytes) {
+        std::fprintf(stderr, "[moe_stream_batch] expert pack: short index: %s\n", path);
+        return false;
+    }
     if (std::fseek(source.file, 40, SEEK_SET) != 0) {
         std::fprintf(stderr, "[moe_stream_batch] expert pack: seek index failed: %s\n", path);
         return false;
