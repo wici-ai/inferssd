@@ -472,6 +472,12 @@ def test_integrated_gpu_means_unified_memory(tmp_path):
         # Three levels: the engine cuts once, at the largest drop.
         ((1024, 1024, 800, 800, 400, 400), None, [0, 1, 2, 3], [4, 5]),
         ((1024, None, 512, 512), None, [0, 1, 2, 3], []),
+        # A frequency cannot be compared with a normalized capacity from another CPU.
+        ((1024, None, 512, None), (5400000, 5400000, 3200000, 3200000), [0, 1], [2, 3]),
+        ((1024, None, 512, None), (None, 5400000, None, 3200000), [0, 1, 2, 3], []),
+        ((0, 1024, 512, 512), (5400000, 5400000, 3200000, 3200000), [0, 1], [2, 3]),
+        # Complete capacities take precedence even when frequencies suggest another split.
+        ((1024, 1024, 512, 512), (3200000, 3200000, 5400000, 5400000), [0, 1], [2, 3]),
     ],
 )
 def test_linux_clusters_follow_the_engine_split(tmp_path, capacities, max_khz, fast, slow):
