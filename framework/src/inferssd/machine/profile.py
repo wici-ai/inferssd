@@ -8,10 +8,10 @@ none, inside a test file of random data written there and removed after; on
 Linux with an NVIDIA GPU the memory probe measures transfers. Sections the
 saved file still describes correctly are reused (see ``plan_refresh``).
 
-CPU clusters: Linux takes each CPU's ``cpu_capacity``, else
-``cpuinfo_max_freq``, sorts them in descending order and cuts at the largest
-relative drop above 10%; one CPU without either value makes one cluster. macOS
-takes ``hw.perflevel0.logicalcpu`` as the performance cluster and the remaining
+CPU clusters: Linux uses ``cpu_capacity`` when every CPU has it, otherwise
+``cpuinfo_max_freq`` when every CPU has that, sorts in descending order and cuts
+at the largest relative drop above 10%; without a complete metric it makes one
+cluster. macOS takes ``hw.perflevel0.logicalcpu`` as the performance cluster and the remaining
 CPUs as efficiency. Windows takes the CPUs of the highest CPU Set efficiency
 class as the performance cluster; without a CPU Set for every CPU of processor
 group 0 the machine is one cluster.
@@ -124,8 +124,6 @@ def _number(value: Optional[str]) -> Optional[int]:
 
 def linux_topology(host: Host) -> CPU:
     logical: list[LogicalCPU] = []
-    values: list[tuple[int, float]] = []
-    uniform = False
     for cpu in online_cpus(host):
         base = f"/sys/devices/system/cpu/cpu{cpu}"
         capacity = _number(read(host, base + "/cpu_capacity"))
@@ -142,13 +140,15 @@ def linux_topology(host: Host) -> CPU:
                 "cluster": 0,
             }
         )
-        value = capacity or max_khz
-        uniform = uniform or not value
-        values.append((cpu, float(value or 0)))
     if not logical:
         raise ValueError("no online CPU found")
     ids = [row["id"] for row in logical]
-    fast, slow = (ids, []) if uniform else split_fastest(values)
+    # Capacities and frequencies use different units; never compare one CPU's
+    # capacity with another CPU's frequency when a sysfs field is absent.
+    values = [row["capacity"] or 0 for row in logical]
+    if not all(values):
+        values = [row["max_khz"] or 0 for row in logical]
+    fast, slow = split_fastest(list(zip(ids, values))) if all(values) else (ids, [])
     for row in logical:
         row["cluster"] = 0 if row["id"] in fast else 1
     return {
