@@ -18,8 +18,8 @@ The default remains the existing source mapping. The experiment adds:
 - Separately enabled CPU scheduling that groups workers by L3 topology and
   assigns row chunks locally. This is not required to open two replica sources.
 
-These are experimental interfaces, including environment switches that have not
-yet been integrated into the supported typed reader policy. They do not establish
+These are experimental interfaces configured through the typed settings registry.
+Each reader copies its settings before starting workers. They do not establish
 Mac/Windows support, general multi-disk scaling, or numerical equivalence of full
 model generation. The adaptive planner still uses initial throughput and fan-in
 cost heuristics; further measurement and API review are needed before enabling it
@@ -62,22 +62,30 @@ Every logical payload source must belong to the declared replica set. The
 `io.range_max_experts` bound limits demand splitting when many experts already
 offer independent reads.
 
-For the measured adaptive I/O mode, set these variables in the inference process:
+For adaptive I/O, add these typed settings to the same file:
 
-```sh
-export INFERSSD_REPLICA_POLICY=adaptive
-export INFERSSD_IO_POOL=1
-export INFERSSD_IO_POOL_SPLIT=1
-export INFERSSD_IO_FORCE_ASYNC=1
-export INFERSSD_PREFETCH_FORCE_ASYNC=1
+```text
+io.replica_policy = 2
+io.shared_pool = 1
+io.split_prefetch = 1
+io.force_async = 1
+prefetch.force_async = 1
 ```
 
-The additional L3 mode uses `INFERSSD_CPU_L3_LOCAL=1`, an explicit comma-separated
-`INFERSSD_CPU_L3_CPUS` list matching the compute participants, and
-`INFERSSD_CPU_L3_UP_ROWS=64` / `INFERSSD_CPU_L3_DOWN_ROWS=64`. Select CPUs from the
-machine's measured topology; the CPU numbers in the benchmark are not portable
-defaults. Unset the experiment variables and clear `expert.replicas` to return to the
-default source and scheduling policy.
+Routing policies are 0 (range, the default), 1 (whole expert role), 2 (adaptive)
+and 3 (static). Shared load accounting requires adaptive routing. Split or forced
+asynchronous prefetch requires the shared pool; incompatible combinations fail
+before workers start. Optional `io.replica_decode_only = 1` restricts replica
+routing to decode, and `io.replica_tail_aware = 1` enables delayed-progress penalties.
+
+The additional L3 mode uses `cpu.l3_local = 1`, an explicit `cpu.l3_cpus` CPU list
+matching the compute participants, and `cpu.l3_up_rows = 64` /
+`cpu.l3_down_rows = 64`. CPU lists use the registry syntax, for example
+`cpu.l3_cpus = 0-15`; row chunks must be multiples of 16 in 16..128.
+Select CPUs from the machine's measured topology; these CPU numbers are not
+portable defaults. Remove the experimental settings and clear `expert.replicas`
+to return to the default source and scheduling policy. The former
+`INFERSSD_*` experiment controls are rejected with a migration error.
 
 ## Ownership and validation boundary
 
@@ -97,13 +105,19 @@ coverage gap. Full-model greedy output can diverge and change expert routing, so
 the performance samples below are complete-configuration comparisons rather
 than a fixed-token numerical acceptance test.
 
-Payload verification should become an enforceable source contract; experiment
-switches need typed-policy integration, and async failure coverage and
-cross-platform builds remain work before promotion from draft.
+Payload verification should become an enforceable source contract; adaptive
+balancing stability, async failure coverage and cross-platform builds remain
+work before promotion from draft. Configuration tests also cover independent
+production contexts, caller snapshot replacement, and invalid combinations
+rejected before workers start.
 
 ## Two-drive measurements
 
 Hardware: AMD Ryzen Threadripper 9960X (24 cores / 48 threads), **32 GB physical RAM (2 x 16 GB DDR5-5600)**, one RTX 5090 (32 GB), and ZHITAI TiPro9000 1 TB drives, each PCIe 5.0 x4, independent XFS, no RAID. The inference scope is capped at **24 GiB RAM with swap disabled**; the initial expert VRAM budget is **16 GiB**, with the existing elastic policy retained.
+
+The measurements predate the follow-up migration of experiment controls into
+typed settings. The archived switches and binary hashes retain that provenance;
+configuration and native regression checks validate the migration separately.
 
 Compared untouched main `f79ec88` with native feature commit `eb8ebbc` after rebuilding and running the project's built-in profiling for both. DeepSeek-V4.1-Flash-1017 Q8_0/MXFP4, repository 4K prompt (**4104 actual prompt tokens**), 256 naturally generated greedy tokens, context 8192, one request slot, prompt cache off. **All reported decode rates use the last 128 decoding steps: `128 / (T256 - T128)`.** Three interleaved repetitions per mode; arithmetic means below. All modes use the same verified packs, 16 decode participants in a 17-thread pool, 12 prefill threads, matched memory budgets and explicit placement costs.
 

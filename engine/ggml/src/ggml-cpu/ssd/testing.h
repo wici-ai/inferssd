@@ -17,6 +17,12 @@ struct execution_policy {
     bool ready_first = false, early_up_gate = false, role_major = false;
     bool nonblocking_down_sched = false, dynamic_rows = false, read_fixed = false;
     int poll_us = 0, dynamic_chunk_rows = 64;
+    int replica_policy = 0;
+    bool io_pool = false, io_pool_split = false, io_force_async = false, prefetch_force_async = false;
+    bool replica_decode_only = false, replica_tail_aware = false;
+    std::vector<int> l3_cpus;
+    bool l3_local = true;
+    int l3_up_rows = 32, l3_down_rows = 64;
     std::vector<double> row_weights; // one per participant of each run
     std::vector<int> io_cpus;
     int decode_participants = 0, prefetch_depth = 0;

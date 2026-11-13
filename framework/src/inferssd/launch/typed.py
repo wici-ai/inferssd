@@ -134,6 +134,17 @@ def reject_legacy_environment(environment: Mapping[str, str]) -> None:
         "LLAMA_ARG_DOCKER_REPO",
         "SSD_LLAMA_MODEL",
         "SSD_LLAMA_BUILD_DIR",
+        "INFERSSD_REPLICA_POLICY",
+        "INFERSSD_IO_POOL",
+        "INFERSSD_IO_POOL_SPLIT",
+        "INFERSSD_IO_FORCE_ASYNC",
+        "INFERSSD_PREFETCH_FORCE_ASYNC",
+        "INFERSSD_REPLICA_DECODE_ONLY",
+        "INFERSSD_TAIL_AWARE",
+        "INFERSSD_CPU_L3_CPUS",
+        "INFERSSD_CPU_L3_LOCAL",
+        "INFERSSD_CPU_L3_UP_ROWS",
+        "INFERSSD_CPU_L3_DOWN_ROWS",
     }
     for name in environment:
         if name.startswith(prefixes) or re.match(r"TASK[0-9]+_", name) or name in launch_names:

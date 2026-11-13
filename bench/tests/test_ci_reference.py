@@ -215,6 +215,9 @@ def test_private_config_binding_must_name_merge_candidate_not_pr_head(binding, s
 @pytest.mark.parametrize("change", [
     {"expert.replicas": ["/models/a.expert-pack", "/models/b.expert-pack"]},
     {"io.range_max_experts": 3},
+    {"io.replica_policy": 2},
+    {"io.shared_pool": 1},
+    {"cpu.l3_cpus": [0, 1]},
 ])
 def test_legacy_bridge_refuses_replica_experiment_semantics(binding, change):
     values = copy.deepcopy(binding["semantic_settings"])

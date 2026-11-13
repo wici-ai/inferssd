@@ -22,9 +22,10 @@ class replica_router {
         double bytes_per_us=6000.0;
     };
     std::array<drive_state,8> drives{};
-    bool tail_aware=std::getenv("INFERSSD_TAIL_AWARE")!=nullptr;
+    const bool tail_aware;
     mutable uint64_t tail_penalties=0;
 public:
+    explicit replica_router(bool tail = false) : tail_aware(tail) {}
     ~replica_router() {
         if(tail_aware) std::fprintf(stderr,"[replica_tail] enabled=1 penalized_alternatives=%llu\n",
             (unsigned long long)tail_penalties);
@@ -93,6 +94,7 @@ public:
 private:
     counters counts;
 public:
+    explicit replica_pool(bool tail = false) : router(tail) {}
     replica_plan reserve(size_t bytes,size_t n,bool split,size_t tie,uint64_t now,bool speculative,size_t max_width=8) {
         std::lock_guard<std::mutex> lock(mutex);
         auto p=router.plan(bytes,n,split,tie,max_width,now);

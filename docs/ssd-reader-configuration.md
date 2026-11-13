@@ -13,9 +13,10 @@ across requests, partial reclaim and reclaimable file accounting. The cgroup
 reserve is 512 MiB. Typed CPU affinity, participant count, prefetch depth,
 placement costs, host headroom, GPU budget, slot cap and margins remain inputs.
 Hardware topology, memory limits and device sharing are measured from the real
-host. The supported profile does not use environment switches. The
-[experimental multi-NVMe path](multi-nvme.md) currently adds opt-in process
-environment switches outside that supported typed-policy contract.
+host. The reader does not use environment switches. The
+[experimental multi-NVMe path](multi-nvme.md) uses the same owned typed snapshot
+for replica routing, asynchronous I/O and optional L3 scheduling. Invalid
+combinations are rejected before worker startup.
 
 The null-reader admission callbacks take the same context snapshot. They build
 an independent ledger with the explicit host headroom and device reserve, so an

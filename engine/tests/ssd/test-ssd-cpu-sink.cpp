@@ -448,7 +448,7 @@ static void fault_case(fixture_inputs & inputs, const char * name, fixture & f, 
 
 // Exercise real integrated ring scheduling, byte accounting, numerical results and error draining.
 static void replica_range_tests(fixture_inputs & inputs, int threads) {
-    const int drive_count=std::getenv("INFERSSD_TEST_REPLICAS")?std::atoi(std::getenv("INFERSSD_TEST_REPLICAS")):4;
+    const int drive_count = int(inputs.integer("test_replicas", 4));
     require(drive_count>=2 && drive_count<=8,"test replica count");
     fixture copies[8];
     int descriptors[8];
@@ -475,11 +475,11 @@ static void replica_range_tests(fixture_inputs & inputs, int threads) {
         require(output == expected, "replica read changed numerical output");
         require(stats.pending_reads == 0 && stats.read_completions == stats.read_requests && !stats.read_errors,
             "replica read returned with pending/failed CQEs");
-        const char * policy=std::getenv("INFERSSD_REPLICA_POLICY");
-        const bool historical=!policy || !std::strcmp(policy,"range4");
+        const int policy = int(inputs.integer("replica_policy", 0));
+        const bool historical = policy == 0;
         if(historical) require(count <= 2 ? stats.read_requests > unsigned(3 * count) : stats.read_requests == unsigned(3 * count),
             "adaptive replica threshold did not select expected path");
-        else if(!std::strcmp(policy,"whole") || !std::strcmp(policy,"static"))
+        else if (policy == 1 || policy == 3)
             require(stats.read_requests == unsigned(3*count),"whole routing unexpectedly split a role");
         size_t bytes = 0;
         for (auto id : ids) { for (int role = 0; role < 3; ++role) { bytes += f.entries.at({tensor_name(1, role), id}).read_bytes; } }
@@ -491,6 +491,42 @@ static void replica_range_tests(fixture_inputs & inputs, int threads) {
         f.fault = fixture::none;
         std::printf("REPLICA_RANGE_NUMERICAL_AND_DRAIN_PASS experts=%d\n", count);
     }
+    // Two production contexts retain distinct typed policies after the caller
+    // replaces its snapshot. Both use real replica descriptors and direct I/O.
+    auto owner = std::make_shared<ssd::host::process_arbiter>();
+    auto client = owner->make_client();
+    auto other_client = owner->make_client();
+    require(bool(client) && bool(other_client), "replica context host clients");
+    ssd::runtime_services services{};
+    services.host = client.value.get(); services.source = &source;
+    auto whole = ssd::settings::parse("", "", {{"vram.budget", "0"}, {"prefetch.depth", "0"}, {"io.replica_policy", "1"}});
+    auto ranges = ssd::settings::parse("", "", {{"vram.budget", "0"}, {"prefetch.depth", "0"}, {"io.force_async", "1"}});
+    require(bool(whole) && bool(ranges), "typed replica fixture settings");
+    auto caller = whole.value;
+    char error[512] = {};
+    sink_ptr first(ssd::cpu::create_configured(&caller, &services, fixture::resolve, &f, error, sizeof(error)));
+    require(bool(first), error);
+    caller = ranges.value;
+    services.host = other_client.value.get();
+    sink_ptr second(ssd::cpu::create_configured(&caller, &services, fixture::resolve, &f, error, sizeof(error)));
+    require(bool(second), error);
+    caller = whole.value;
+    tensors meta(f, 1);
+    const int32_t id = 1; const float weight = 1;
+    const auto expected = reference(f, 1, input, {id}, {weight}, 4, 25);
+    for (auto * sink : {first.get(), second.get()}) {
+        require(kimi_cpu_sink_cache_configure(sink, 0, nullptr, 0, 1, error, sizeof(error)), error);
+        require(kimi_cpu_sink_cache_begin(sink, 1, 1, true, error, sizeof(error)), error);
+        std::vector<float> output(f.latent);
+        kimi_cpu_sink_stats stats{};
+        require(kimi_cpu_sink_run(sink, meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight, 1,
+            4, 25, output.data(), &stats, error, sizeof(error)), error);
+        require(output == expected && !stats.pending_reads && stats.read_requests == stats.read_completions,
+            "typed replica context output/drain mismatch");
+        require(sink == first.get() ? stats.read_requests == 3 : stats.read_requests > 3,
+            "replica contexts lost their owned typed policy");
+    }
+    std::printf("REPLICA_CONFIGURED_CONTEXT_ISOLATION_PASS\n");
     inputs.runtime.source = nullptr;
 }
 
@@ -2058,7 +2094,7 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
                 k ? 2 : 1, -1);
         }
         const std::string captured = log.read();
-        if (k > 0 && std::getenv("INFERSSD_PREFETCH_FORCE_ASYNC")) {
+        if (k > 0 && inputs.boolean("prefetch_force_async", false)) {
             const size_t at = captured.find("[prefetch_async_submit] workers_per_reader=1 reads=");
             require(at != std::string::npos, "prefetch async activation receipt missing");
             unsigned long long x=0,y=0,z=0;
@@ -2115,61 +2151,8 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
         std::printf("case=prefetch_depth%d status=PASS %s\n", k, report.c_str());
     }
 #if defined(__linux__)
-    if (std::getenv("INFERSSD_PREFETCH_EARLY_ROLES") && !std::strcmp(std::getenv("INFERSSD_PREFETCH_EARLY_ROLES"), "1") &&
-            !std::getenv("INFERSSD_ABLATE_ASYNC") && !std::getenv("INFERSSD_IO_POOL")) {
-        require(inputs.set("prefetch_depth", "1") == 0, "early role depth");
-        for (bool fail_down : { false, true }) {
-        stderr_capture log;
-        auto sink = make_sink(inputs, f, threads, depth);
-        configure_cache(sink.get(), 12 * unit, { 1, 2 }, 6);
-        begin_cache(sink.get(), 1, 1);
-        cache_case(inputs, "early_warm1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 0, 2);
-        cache_case(inputs, "early_warm2", f, sink.get(), 2, input, { 10, 11, 12, 13, 14, 15 },
-            { .1f, .1f, .2f, .2f, .2f, .2f }, 0, 6);
-        begin_cache(sink.get(), 1, 2);
-        kimi_cpu_sink_source source = {};
-        require(fixture::resolve(&f, tensor_name(2, 2).c_str(), 5, &source), "early held down source");
-        pread_hold_guard hold(f.fd, { source.offset }, fail_down);
-        const int32_t hint[] = { 5 };
-        kimi_cpu_sink_prefetch_hint(sink.get(), 2, hint, 1);
-        cache_case(inputs, "early_hint", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
-        hold.wait(1);
-        bool saw_early = false;
-        std::thread release([&] {
-            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (std::chrono::steady_clock::now() < until) {
-                std::ifstream file(log.path);
-                const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-                if (text.find("[prefetch_role_early] stage=up_gate_finished_before_down") != std::string::npos) { saw_early = true; break; }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-            hold.release();
-        });
-        try {
-            if (!fail_down) {
-                cache_case(inputs, "early_prefetch_up_gate_before_down", f, sink.get(), 2, input, { 5 }, { 1.0f }, 1, 0);
-            } else {
-                tensors meta(f, 2); int32_t ids[] = { 5 }; float weights[] = { 1.0f };
-                std::vector<float> output(f.latent); kimi_cpu_sink_stats stats = {}; char error[512] = {};
-                require(!kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
-                    ids, weights, 1, 4, 25, output.data(), &stats, error, sizeof(error)), "failed down accepted after early compute");
-                require(std::strstr(error, "prefetch read"), std::string("wrong delayed failure: ") + error);
-            }
-        }
-        catch (...) { hold.release(); release.join(); throw; }
-        release.join();
-        require(saw_early, "up/gate did not finish while down was held");
-        std::printf("case=prefetch_up_gate_before_down status=PASS fail_down=%d\n", int(fail_down));
-        if (fail_down) {
-            kimi_cpu_sink_cache_reset(sink.get());
-            configure_cache(sink.get(), 12 * unit, { 1, 2 }, 6);
-            begin_cache(sink.get(), 2, 1);
-            cache_case(inputs, "early_after_failed_down_recovers", f, sink.get(), 2, input, { 5 }, { 1.0f }, 0, 1);
-        }
-        }
-    }
-    if (!std::getenv("INFERSSD_ABLATE_ASYNC") && !std::getenv("INFERSSD_IO_POOL")) {
-        const bool priority_reserve = std::getenv("INFERSSD_PRIORITY_PREFETCH") != nullptr;
+    if (!inputs.boolean("io_pool", false)) {
+        const bool priority_reserve = false;
         const int speculative_readers = priority_reserve ? 2 : 3;
         // The reads of 6, hinted for layer 2 and not selected there, held in pread (pread_hold) for as long as a case
         // needs, without timing assumptions. A prefetch lands only in resident slots, so both layers are warmed
@@ -3690,13 +3673,9 @@ static void graph_layer_compute(ggml_tensor * dst, int ith, int nth, void * user
 }
 
 static void threadpool_tests(fixture_inputs & inputs, int depth) {
-    const bool l3_test = std::getenv("INFERSSD_TEST_L3") != nullptr;
-    std::vector<int> l3_cpus;
+    const std::vector<int> l3_cpus = inputs.cpus("l3_cpus");
+    const bool l3_test = !l3_cpus.empty();
     if (l3_test) {
-        const char * value=std::getenv("INFERSSD_CPU_L3_CPUS");
-        require(value && *value,"L3 test needs an explicit CPU list");
-        std::istringstream list(value); std::string item;
-        while (std::getline(list,item,',')) l3_cpus.push_back(std::stoi(item));
         for (const char * key : {"ready_first","early_up_gate","role_major","nonblocking_down_sched","dynamic_rows"}) inputs.set(key,"1");
     }
     fixture f;

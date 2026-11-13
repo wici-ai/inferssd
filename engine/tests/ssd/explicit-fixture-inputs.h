@@ -99,7 +99,8 @@ struct fixture_inputs {
             "cache_elastic", "cache_partial_reclaim", "cache_reclaimable_file", "cache_reserve_bytes",
             "cache_prefill_slots", "cache_layer_quotas", "vram_budget", "vram_async",
             "vram_deferred", "vram_prefill", "place_costs", "trace", "timeline", "profile",
-            "mrc", "ledger"
+            "mrc", "ledger", "test_replicas",
+            "replica_policy", "io_pool", "io_pool_split", "io_force_async", "prefetch_force_async", "replica_decode_only", "replica_tail_aware", "l3_cpus", "l3_local", "l3_up_rows", "l3_down_rows"
         };
         if (std::none_of(std::begin(recognized), std::end(recognized), [&](const char * item) { return key == item; })) {
             throw std::runtime_error("unknown explicit fixture field " + key);
@@ -196,11 +197,23 @@ struct fixture_inputs {
         FIXTURE_INT(prefetch_depth); FIXTURE_INT(prefetch_fail_every); FIXTURE_INT(prefetch_throw_drain);
         FIXTURE_INT(prefetch_throw_schedule); FIXTURE_INT(cache_reserve_bytes); FIXTURE_INT(cache_prefill_slots);
         FIXTURE_INT(vram_budget); FIXTURE_INT(lookahead_fail_every);
+        FIXTURE_INT(replica_policy);
+        FIXTURE_BOOL(io_pool);
+        FIXTURE_BOOL(io_pool_split);
+        FIXTURE_BOOL(io_force_async);
+        FIXTURE_BOOL(prefetch_force_async);
+        FIXTURE_BOOL(replica_decode_only);
+        FIXTURE_BOOL(replica_tail_aware);
+        FIXTURE_BOOL(l3_local);
+        FIXTURE_INT(l3_up_rows);
+        FIXTURE_INT(l3_down_rows);
+
 #undef FIXTURE_BOOL
 #undef FIXTURE_INT
         if (const char * value = get("cache_policy")) { out.cache_policy = value; }
         if (const char * value = get("cache_allocation")) { out.cache_allocation = value; }
         out.io_cpus = cpus("io_cpus");
+        out.l3_cpus = cpus("l3_cpus");
         out.tier = tier_policy();
         if (const char * costs = get("place_costs")) {
             std::string words(costs);

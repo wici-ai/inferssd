@@ -553,47 +553,38 @@ struct sink_l3_rows_config {
     int up_rows=32, down_rows=64;
     bool local=true;
 };
-static sink_l3_rows_config sink_l3_rows_options() {
+static sink_l3_rows_config sink_l3_rows_options(const ssd::cpu::testing::execution_policy & policy) {
     sink_l3_rows_config c;
-    const char *value=std::getenv("INFERSSD_CPU_L3_CPUS");
-    if (!value || !*value) return c;
+    c.up_rows = policy.l3_up_rows;
+    c.down_rows = policy.l3_down_rows;
+    c.local = policy.l3_local;
+    if (c.up_rows < 16 || c.up_rows > 128 || c.up_rows % 16 ||
+            c.down_rows < 16 || c.down_rows > 128 || c.down_rows % 16) {
+        throw std::runtime_error("CPU L3 chunks must be multiples of 16 in 16..128");
+    }
+    if (policy.l3_cpus.empty()) { return c; }
 #if !defined(__linux__)
     throw std::runtime_error("CPU L3 row experiment requires Linux cache topology");
 #else
-    auto number=[](const std::string &v) {
-        if(v.empty() || v.find_first_not_of("0123456789")!=std::string::npos)
-            throw std::runtime_error("invalid CPU L3 integer");
-        size_t used=0; int n=std::stoi(v,&used);
-        if(used!=v.size()) throw std::runtime_error("invalid CPU L3 integer");
-        return n;
-    };
-    if(value[std::strlen(value)-1]==',') throw std::runtime_error("CPU L3 CPU list ends with comma");
-    std::istringstream list(value); std::string item; std::map<std::string,int> groups;
-    while(std::getline(list,item,',')) {
-        const int cpu=number(item);
-        if(cpu>4095 || (!c.cpus.empty() && cpu<=c.cpus.back()) || c.cpus.size()>=64)
+    std::map<std::string, int> groups;
+    for (const int cpu : policy.l3_cpus) {
+        if (cpu < 0 || cpu > 4095 || (!c.cpus.empty() && cpu <= c.cpus.back()) || c.cpus.size() >= 64) {
             throw std::runtime_error("CPU L3 CPU list must be ascending, unique, at most 64 CPUs");
-        std::string shared;
-        for(int i=0;i<8;++i) {
-            const std::string base="/sys/devices/system/cpu/cpu"+std::to_string(cpu)+"/cache/index"+std::to_string(i)+"/";
-            int level=0; std::ifstream(base+"level")>>level;
-            if(level==3) { std::ifstream in(base+"shared_cpu_list"); std::getline(in,shared); break; }
         }
-        if(shared.empty()) throw std::runtime_error("CPU L3 topology not available");
-        const auto added=groups.emplace(shared,int(groups.size()));
-        if(added.second) c.group_counts.push_back(0);
-        const int group=added.first->second;
+        std::string shared;
+        for (int i = 0; i < 8; ++i) {
+            const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/cache/index" + std::to_string(i) + "/";
+            int level = 0;
+            std::ifstream(base + "level") >> level;
+            if (level == 3) { std::ifstream in(base + "shared_cpu_list"); std::getline(in, shared); break; }
+        }
+        if (shared.empty()) { throw std::runtime_error("CPU L3 topology not available"); }
+        const auto added = groups.emplace(shared, int(groups.size()));
+        if (added.second) { c.group_counts.push_back(0); }
+        const int group = added.first->second;
         c.cpus.push_back(cpu); c.worker_group.push_back(group); ++c.group_counts[group];
     }
-    if(const char *v=std::getenv("INFERSSD_CPU_L3_UP_ROWS")) c.up_rows=number(v);
-    if(const char *v=std::getenv("INFERSSD_CPU_L3_DOWN_ROWS")) c.down_rows=number(v);
-    if(c.up_rows<16 || c.up_rows>128 || c.up_rows%16 || c.down_rows<16 || c.down_rows>128 || c.down_rows%16)
-        throw std::runtime_error("CPU L3 chunks must be multiples of 16 in 16..128");
-    if(const char *v=std::getenv("INFERSSD_CPU_L3_LOCAL")) {
-        if(std::strcmp(v,"0") && std::strcmp(v,"1")) throw std::runtime_error("CPU L3 local must be 0 or 1");
-        c.local=std::strcmp(v,"0")!=0;
-    }
-    if(!c.local) { c.group_counts.assign(1,int(c.cpus.size())); std::fill(c.worker_group.begin(),c.worker_group.end(),0); }
+    if (!c.local) { c.group_counts.assign(1, int(c.cpus.size())); std::fill(c.worker_group.begin(), c.worker_group.end(), 0); }
     return c;
 #endif
 }
@@ -604,16 +595,16 @@ struct kimi_cpu_sink {
     uint64_t range_split_roles = 0, range_split_bytes = 0;
     ssd::io::replica_router replica_router;
     ssd::io::replica_pool shared_io_pool;
-    const bool unified_io = [] { const char *v=std::getenv("INFERSSD_IO_POOL"); return v && !std::strcmp(v,"1"); }();
-    const bool split_prefetch = [] { const char *v=std::getenv("INFERSSD_IO_POOL_SPLIT"); return v && !std::strcmp(v,"1"); }();
-    const bool io_force_async = [] { const char *v=std::getenv("INFERSSD_IO_FORCE_ASYNC"); return v && !std::strcmp(v,"1"); }();
-    const bool prefetch_force_async = [] { const char *v=std::getenv("INFERSSD_PREFETCH_FORCE_ASYNC"); return v && !std::strcmp(v,"1"); }();
-    int replica_policy = 0;
-    bool replica_decode_only = false;
+    const bool unified_io = configuration.policy.io_pool;
+    const bool split_prefetch = configuration.policy.io_pool_split;
+    const bool io_force_async = configuration.policy.io_force_async;
+    const bool prefetch_force_async = configuration.policy.prefetch_force_async;
+    const int replica_policy = configuration.policy.replica_policy;
+    const bool replica_decode_only = configuration.policy.replica_decode_only;
     uint64_t replica_routed_roles = 0, forced_async_reads = 0;
     std::array<uint64_t,8> replica_bytes{};
     std::array<uint64_t,3> prefetch_async_reads{};
-    const sink_l3_rows_config l3_rows = sink_l3_rows_options();
+    const sink_l3_rows_config l3_rows = sink_l3_rows_options(configuration.policy);
     struct alignas(64) l3_chunk_group { std::atomic<int> next{0}; int end=0; };
     std::array<l3_chunk_group,64> l3_groups;
     bool l3_active = false;
@@ -961,7 +952,8 @@ struct kimi_cpu_sink {
     ggml_from_float_t quantize_input = nullptr, quantize_hidden = nullptr;
 
     kimi_cpu_sink(int depth, kimi_cpu_sink_resolver resolve, void * user, const sink_configuration & input = {}) :
-        configuration(input), ring_experts(depth), resolver(resolve), userdata(user), slots(depth),
+        configuration(input), replica_router(input.policy.replica_tail_aware),
+        shared_io_pool(input.policy.replica_tail_aware), ring_experts(depth), resolver(resolve), userdata(user), slots(depth),
         cache(sink_cache_options(configuration)),
         ready_first(configuration.policy.ready_first),
         early_up_gate(configuration.policy.early_up_gate), role_major(configuration.policy.role_major),
@@ -1026,15 +1018,11 @@ struct kimi_cpu_sink {
         if (nonblocking_down_sched && !ready_first) {
             throw std::runtime_error("NONBLOCKING_DOWN_SCHED requires READY_FIRST=1");
         }
-        const char * policy = std::getenv("INFERSSD_REPLICA_POLICY");
-        if (policy) {
-            if (!std::strcmp(policy,"whole")) replica_policy=1;
-            else if (!std::strcmp(policy,"adaptive")) replica_policy=2;
-            else if (!std::strcmp(policy,"static")) replica_policy=3;
-            else if (std::strcmp(policy,"range4")) throw std::runtime_error("unknown replica policy");
+        if (replica_policy < 0 || replica_policy > 3) { throw std::runtime_error("invalid replica policy"); }
+        if (unified_io && replica_policy != 2) { throw std::runtime_error("shared I/O pool requires adaptive replica policy"); }
+        if ((split_prefetch || prefetch_force_async) && !unified_io) {
+            throw std::runtime_error("split/async prefetch requires the shared I/O pool");
         }
-        if(unified_io && replica_policy!=2)throw std::runtime_error("unified I/O pool requires adaptive replica policy");
-        replica_decode_only = std::getenv("INFERSSD_REPLICA_DECODE_ONLY") != nullptr;
         const auto * source = configuration.source;
         if (source && source->replica_count && (source->replica_count < 2 || source->replica_count > 8 ||
                 !source->replica_fds || !source->range_max_experts || configuration.policy.read_fixed)) {
@@ -4557,7 +4545,7 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     const uint64_t participants = integer("cpu.decode_participants");
     const uint64_t prefetch = integer("prefetch.depth");
     if (participants > uint64_t(sink_max_participants) || prefetch > 64 || !out.settings.cpus("cpu.io_cpus") ||
-            !out.settings.vram_budget() || !out.settings.costs() || !out.settings.sources() ||
+            !out.settings.vram_budget() || !out.settings.costs() || !out.settings.sources() || !out.settings.cpus("cpu.l3_cpus") ||
             integer("host.headroom_mib") > UINT32_MAX || integer("vram.reserve_mib") > 8192) {
         throw std::runtime_error("invalid typed SSD executor dependencies");
     }
@@ -4579,6 +4567,17 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
     p.decode_participants = int(participants);
     p.prefetch_depth = int(prefetch);
     p.prefill_lookahead = integer("prefill.lookahead") != 0;
+    p.replica_policy = int(integer("io.replica_policy"));
+    p.io_pool = integer("io.shared_pool") != 0;
+    p.io_pool_split = integer("io.split_prefetch") != 0;
+    p.io_force_async = integer("io.force_async") != 0;
+    p.prefetch_force_async = integer("prefetch.force_async") != 0;
+    p.replica_decode_only = integer("io.replica_decode_only") != 0;
+    p.replica_tail_aware = integer("io.replica_tail_aware") != 0;
+    for (uint32_t cpu : *out.settings.cpus("cpu.l3_cpus")) { p.l3_cpus.push_back(int(cpu)); }
+    p.l3_local = integer("cpu.l3_local") != 0;
+    p.l3_up_rows = int(integer("cpu.l3_up_rows"));
+    p.l3_down_rows = int(integer("cpu.l3_down_rows"));
     for (uint32_t cpu : *out.settings.cpus("cpu.io_cpus")) { p.io_cpus.push_back(int(cpu)); }
     p.cache_policy = "count_decay2";
     p.cache_allocation = "uniform";
