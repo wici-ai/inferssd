@@ -11,6 +11,7 @@
 #include "speculative.h"
 #include "../server-common.h"
 #include "../server-ssd-reservation.h"
+#include "platform/file.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -186,7 +187,7 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
 }
 
 static bool server_prompt_read_blob(const std::string & path, size_t offset, size_t size, std::vector<uint8_t> & out) {
-    FILE * f = std::fopen(path.c_str(), "rb");
+    FILE * f = ssd::platform::open_stream(path.c_str());
     if (!f) {
         return false;
     }
@@ -219,7 +220,7 @@ static bool server_prompt_restore(
             return false;
         }
     } else {
-        FILE * f = std::fopen(prompt.file.c_str(), "rb");
+        FILE * f = ssd::platform::open_stream(prompt.file.c_str());
         if (!f) {
             return false;
         }
@@ -238,7 +239,7 @@ static bool server_prompt_restore(
             return llama_state_seq_set_data_ext(ctx, checkpoint->data.data(), checkpoint->data.size(), id_slot,
                     LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == checkpoint->data.size();
         }
-        FILE * f = std::fopen(prompt.file.c_str(), "rb");
+        FILE * f = ssd::platform::open_stream(prompt.file.c_str());
         if (!f) {
             return false;
         }
@@ -275,7 +276,7 @@ void server_prompt_cache::use_dir(const std::string & dir, const std::string & f
         }
         server_prompt prompt;
         bool ok = false;
-        if (FILE * f = std::fopen(path.c_str(), "rb")) {
+        if (FILE * f = ssd::platform::open_stream(path.c_str())) {
             ok = server_prompt_read_header(f, fingerprint, prompt);
             std::fclose(f);
         }
