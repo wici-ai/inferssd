@@ -4,6 +4,7 @@
 #include "telemetry/telemetry.h"
 
 #include <cassert>
+#include <clocale>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -50,6 +51,21 @@ int main(int argc, char ** argv) {
         }
         std::cout << json.value << '\n';
         return 0;
+    }
+    if (argc == 5 && std::string(argv[1]) == "--number-event") {
+        if (!std::setlocale(LC_NUMERIC, argv[3])) {
+            std::cerr << "numeric locale unavailable\n";
+            return 77;
+        }
+        auto sink = ssd::telemetry::writer::open(argv[2]);
+        if (!sink) {
+            return 2;
+        }
+        const auto accepted = sink.value->event("ssd.number", std::string("{\"value\":") + argv[4] + '}');
+        if (!sink.value->event("ssd.after", "{}") || !sink.value->flush()) {
+            return 2;
+        }
+        return accepted ? 0 : 1;
     }
     using namespace ssd::settings;
     assert(registry().size() == 13);
