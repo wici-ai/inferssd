@@ -612,9 +612,6 @@ def _resolve(
     telemetry = None if ordinary else os_path.join(directory, "native-events.jsonl")
     if settings is not None:
         s.ask("write_exclusive", settings, materialized_settings(value))
-    if planned is not None:
-        receipt = json.dumps(planned.receipt, ensure_ascii=False, indent=2) + "\n"
-        s.ask("write_exclusive", os_path.join(directory, "strategy.json"), receipt)
     context = spec.context or (CONTEXT if ordinary else AUTO_CONTEXT)
     one_pass = planned is not None and planned.one_pass
     batch = spec.batch or ((context or ONE_PASS_BATCH) if one_pass else BATCH)
@@ -622,6 +619,9 @@ def _resolve(
     if planned is not None and one_pass:
         given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
         cast(list[str], planned.receipt["kept"]).extend("server " + name for name in given)
+    if planned is not None:
+        receipt = json.dumps(planned.receipt, ensure_ascii=False, indent=2) + "\n"
+        s.ask("write_exclusive", os_path.join(directory, "strategy.json"), receipt)
     command = [binary, "-m", model]
     if settings is not None and telemetry is not None:
         command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
