@@ -180,20 +180,24 @@ static void explicit_budget() {
 
 #if defined(_WIN32)
 // Host use is the commit less the video memory held in discrete adapters' local segments, and the system term stays
-// within the physical memory available however far the paging files may grow.
+// within the physical memory available however far the paging files may grow, leaving the commit the process's
+// discrete-GPU allocations may still take.
 static void host_use_and_commit() {
-    uint64_t commit = 0, device = 0, host = 0;
-    require(native::commit_use(commit) && native::device_commit(device) && native::process_use(host),
-            "commit, device and host use read");
-    std::printf("commit %llu MiB, device %llu MiB, host %llu MiB\n", mib(commit), mib(device), mib(host));
+    uint64_t commit = 0, device = 0, host = 0, claimable = 0;
+    require(native::commit_use(commit) && native::device_commit(device) && native::process_use(host) &&
+            native::device_claimable(claimable), "commit, device, host use and claimable video memory read");
+    std::printf("commit %llu MiB, device %llu MiB, host %llu MiB, claimable %llu MiB\n", mib(commit), mib(device),
+            mib(host), mib(claimable));
     require(host <= commit && host + device + 16 * MiB >= commit && host + device <= commit + 16 * MiB,
             "host use is the commit less the device memory");
+    require(device || !claimable, "video memory is claimable only on an adapter the process holds memory on");
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
     uint64_t room = 0;
     require(GlobalMemoryStatusEx(&status) != 0 && native::available(room), "available memory read");
+    const uint64_t commit_room = status.ullAvailPageFile > claimable ? status.ullAvailPageFile - claimable : 0;
     require(room <= status.ullAvailPhys + 64 * MiB && room + 64 * MiB >= std::min<uint64_t>(status.ullAvailPhys,
-            status.ullAvailPageFile), "the system term is physical memory, bounded by growable commit");
+            commit_room), "the system term is physical memory, bounded by growable commit less claimable video memory");
 }
 
 // A job memory limit on commit (the job's and the process's), set the way a deployment would.

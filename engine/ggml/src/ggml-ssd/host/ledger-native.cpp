@@ -46,19 +46,25 @@ struct kmt_video_memory_info {
     UINT64 budget, current_usage, current_reservation, available_for_reservation;
     UINT physical_adapter;
 };
+enum : int { kmt_query_adapter_type = 15 };       // KMTQAITYPE_ADAPTERTYPE
+enum : UINT { kmt_indirect_display = 1u << 6 };   // D3DKMT_ADAPTERTYPE::IndirectDisplayDevice
+struct kmt_query_adapter_info { kmt_handle adapter; int type; void * data; UINT size; };
 
 // The adapters whose local segments are not host memory: those that also have a non-local segment group, the
 // system memory a discrete GPU maps. A unified (integrated) adapter has the local group only, and its segments
-// are host memory. Opened once and kept open; an adapter added later is not seen.
+// are host memory. An indirect display adapter (a remote desktop session's, for one) has no memory of its own: it
+// renders on another adapter and reports that adapter's video memory, which would count twice. Opened once and kept
+// open; an adapter added later is not seen.
 struct discrete_adapters {
     LONG (APIENTRY * query)(kmt_video_memory_info *) = nullptr;
     std::vector<kmt_handle> handles;
     discrete_adapters() {
         LONG (APIENTRY * enumerate)(kmt_enum_adapters2 *) = nullptr;
         LONG (APIENTRY * close)(const kmt_close_adapter *) = nullptr;
+        LONG (APIENTRY * describe)(const kmt_query_adapter_info *) = nullptr;
         const HMODULE gdi = LoadLibraryW(L"gdi32.dll");
         if (!gdi || !resolve(gdi, "D3DKMTEnumAdapters2", enumerate) || !resolve(gdi, "D3DKMTCloseAdapter", close) ||
-                !resolve(gdi, "D3DKMTQueryVideoMemoryInfo", query)) {
+                !resolve(gdi, "D3DKMTQueryVideoMemoryInfo", query) || !resolve(gdi, "D3DKMTQueryAdapterInfo", describe)) {
             query = nullptr;
             return;
         }
@@ -69,10 +75,14 @@ struct discrete_adapters {
         if (enumerate(&list) != 0) { return; }
         found.resize(list.count);
         for (const kmt_adapter_info & adapter : found) {
+            UINT type = 0;
+            const kmt_query_adapter_info info{adapter.adapter, kmt_query_adapter_type, &type, UINT(sizeof(type))};
             kmt_video_memory_info non_local{};
             non_local.adapter = adapter.adapter;
             non_local.group = kmt_non_local;
-            if (query(&non_local) == 0 && non_local.budget > 0) {
+            // an adapter whose type cannot be read is counted, as before the type was asked
+            const bool indirect = describe(&info) == 0 && (type & kmt_indirect_display);
+            if (!indirect && query(&non_local) == 0 && non_local.budget > 0) {
                 handles.push_back(adapter.adapter);
                 continue;
             }
@@ -84,6 +94,22 @@ struct discrete_adapters {
 const discrete_adapters & discrete() {
     static const discrete_adapters adapters;
     return adapters;
+}
+
+// This process's video memory in the local segments of the discrete adapters: what it holds (`used`) and what it may
+// still allocate on the adapters it uses (`claimable`, the budget less the usage of each adapter it holds memory on).
+bool discrete_memory(uint64_t & used, uint64_t & claimable) {
+    const discrete_adapters & adapters = discrete();
+    used = claimable = 0;
+    for (const kmt_handle adapter : adapters.handles) {
+        kmt_video_memory_info local{};
+        local.adapter = adapter;
+        local.group = kmt_local;
+        if (adapters.query(&local) != 0) { return false; }
+        used += local.current_usage;
+        if (local.current_usage && local.budget > local.current_usage) { claimable += local.budget - local.current_usage; }
+    }
+    return true;
 }
 
 // What the paging files may still grow by, each up to its maximum size and its volume's free space: a
@@ -138,16 +164,13 @@ bool commit_use(uint64_t & bytes) {
 }
 
 bool device_commit(uint64_t & bytes) {
-    const discrete_adapters & adapters = discrete();
-    bytes = 0;
-    for (const kmt_handle adapter : adapters.handles) {
-        kmt_video_memory_info local{};
-        local.adapter = adapter;
-        local.group = kmt_local;
-        if (adapters.query(&local) != 0) { return false; }
-        bytes += local.current_usage;
-    }
-    return true;
+    uint64_t claimable = 0;
+    return discrete_memory(bytes, claimable);
+}
+
+bool device_claimable(uint64_t & bytes) {
+    uint64_t used = 0;
+    return discrete_memory(used, bytes);
 }
 
 bool process_use(uint64_t & bytes) {
@@ -161,9 +184,13 @@ bool available(uint64_t & bytes) {
     MEMORYSTATUSEX status{};
     status.dwLength = sizeof(status);
     if (!GlobalMemoryStatusEx(&status)) { return false; }
-    // Commit is a hard limit, so room is the smaller of the physical memory available and the commit a new
-    // allocation can still get: what is free under the commit limit now plus what the paging files may grow by.
-    bytes = std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile + paging_growth());
+    uint64_t claimable = 0;
+    if (!device_claimable(claimable)) { return false; }
+    // Commit is a hard limit, so room is the smaller of the physical memory available and the commit a new host
+    // allocation can still get: what is free under the commit limit now plus what the paging files may grow by, less
+    // the video memory this process may still allocate on its discrete adapters, which WDDM will charge to commit.
+    const uint64_t commit = status.ullAvailPageFile + paging_growth();
+    bytes = std::min<uint64_t>(status.ullAvailPhys, commit > claimable ? commit - claimable : 0);
     return true;
 }
 
@@ -185,11 +212,16 @@ bool job_limits(envelopes & out) {
         return false;
     }
     const DWORD flags = limits.BasicLimitInformation.LimitFlags;
-    // The kernel holds both limits against commit, the device memory WDDM charges included.
+    // The kernel holds both limits against commit, the device memory WDDM charges included, so the video memory this
+    // process may still allocate on its discrete adapters counts as used too.
+    uint64_t claimable = 0;
+    if ((flags & (JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY)) && !device_claimable(claimable)) {
+        return false;
+    }
     if (flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY) {
         uint64_t used = 0;
         if (!commit_use(used)) { return false; }
-        out.push({"job process", uint64_t(limits.ProcessMemoryLimit), used});
+        out.push({"job process", uint64_t(limits.ProcessMemoryLimit), add(used, claimable)});
     }
     if (flags & JOB_OBJECT_LIMIT_JOB_MEMORY) {
         // JobMemory is the commit of every process in the job now; the extended limits carry only its peak.
@@ -197,7 +229,7 @@ bool job_limits(envelopes & out) {
         if (!QueryInformationJobObject(nullptr, JobObjectLimitViolationInformation, &job, sizeof(job), nullptr)) {
             return false;
         }
-        out.push({"job", uint64_t(limits.JobMemoryLimit), uint64_t(job.JobMemory)});
+        out.push({"job", uint64_t(limits.JobMemoryLimit), add(uint64_t(job.JobMemory), claimable)});
     }
     return true;
 }
