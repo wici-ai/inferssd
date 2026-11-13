@@ -479,7 +479,9 @@ def test_prompt_cache_on_disk_per_model(tmp_path):
     cache = str(tmp_path / "prompts")
     result = resolve(inputs, replace(spec, prompt_cache=cache), adapter, second, platform)
     argv = list(result.argv)
-    assert argv[argv.index("--cache-disk") + 1] == str(Path(cache) / "model")
+    directory = Path(argv[argv.index("--cache-disk") + 1])
+    assert directory.parent == Path(cache) / "model"
+    assert re.fullmatch(r"[0-9a-f]{20}", directory.name)
     assert argv[argv.index("--cache-disk-mib") + 1] == "16384" and "--cache-ram" not in argv
 
 
