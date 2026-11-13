@@ -2,6 +2,7 @@
 #include "../platform/file.h"
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -11,6 +12,14 @@
 
 namespace c0 {
 namespace {
+template <typename Integer>
+bool parse_decimal(const char * text, Integer & value) {
+    if (!text || *text < '0' || *text > '9') { return false; }
+    const char * end = text + std::strlen(text);
+    const auto parsed = std::from_chars(text, end, value, 10);
+    return parsed.ec == std::errc{} && parsed.ptr == end;
+}
+
 struct close_file {
     void operator()(FILE * file) const { std::fclose(file); }
 };
@@ -33,11 +42,13 @@ struct pending_source_handles {
 
 class source_parser {
 public:
-    explicit source_parser(parser_state & state, source_open_hooks hooks = {}, bool require_direct = false)
-        : g_expert_pack(state), hooks(hooks), force_direct(require_direct) {}
+    explicit source_parser(parser_state & state, source_open_hooks hooks = {}, bool require_direct = false,
+            bool strict_alias_numbers = false)
+        : g_expert_pack(state), hooks(hooks), force_direct(require_direct), strict_numbers(strict_alias_numbers) {}
     parser_state & g_expert_pack;
     source_open_hooks hooks;
     const bool force_direct;
+    const bool strict_numbers;
 static int expert_pack_entry_cmp(const expert_pack_entry &e, const char *tensor_name, int expert_idx, size_t nbytes) {
     const int name_cmp = std::strcmp(e.tensor, tensor_name);
     if (name_cmp != 0) return name_cmp;
@@ -267,9 +278,20 @@ bool expert_pack_load_gguf_alias_tsv(const char *path, std::vector<expert_pack_e
         }
         const char *tensor = fields[(size_t)col_tensor];
         const char *source_path = fields[(size_t)col_source];
-        const int expert_idx = (int)std::strtol(fields[(size_t)col_expert], nullptr, 10);
-        const uint64_t nbytes = (uint64_t)std::strtoull(fields[(size_t)col_nbytes], nullptr, 10);
-        const uint64_t offset = (uint64_t)std::strtoull(fields[(size_t)col_offset], nullptr, 10);
+        int expert_idx = 0;
+        uint64_t nbytes = 0, offset = 0;
+        if (strict_numbers) {
+            if (!parse_decimal(fields[(size_t)col_expert], expert_idx) ||
+                    !parse_decimal(fields[(size_t)col_nbytes], nbytes) ||
+                    !parse_decimal(fields[(size_t)col_offset], offset)) {
+                ++bad_rows;
+                continue;
+            }
+        } else {
+            expert_idx = (int)std::strtol(fields[(size_t)col_expert], nullptr, 10);
+            nbytes = (uint64_t)std::strtoull(fields[(size_t)col_nbytes], nullptr, 10);
+            offset = (uint64_t)std::strtoull(fields[(size_t)col_offset], nullptr, 10);
+        }
         if (!tensor || !tensor[0] || !source_path || !source_path[0] ||
                 expert_idx < 0 || nbytes == 0 || std::strlen(tensor) >= 128) {
             ++bad_rows;
@@ -323,7 +345,7 @@ bool open_data_source(parser_state & state, const char * path, const char * labe
 
 bool append_sources(parser_state & state, const description & desc,
         std::vector<expert_pack_entry> & entries, source_open_hooks hooks) {
-    source_parser parser(state, hooks, desc.require_direct);
+    source_parser parser(state, hooks, desc.require_direct, desc.strict_alias_numbers);
     for (const auto & path : desc.packs) {
         if (!parser.expert_pack_load_source(path.c_str(), int32_t(state.sources.size()), entries, false)) { return false; }
     }

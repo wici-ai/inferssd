@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ggml-ssd/store/index.h"
+#include "ggml-ssd/store/legacy-index.h"
 #include "ggml-ssd/platform/file.h"
 #include "ggml-ssd/platform/memory.h"
 #include <chrono>
@@ -63,6 +64,28 @@ int main() {
         << name << "\t3\t5000\t" << (directory / "1.bin").string() << "\t16000\n";
     require(!ssd::store::source_index::open({bad.string()}), "out-of-file source published");
     require(!ssd::store::source_index::open({aliases[0], (directory / "missing.tsv").string()}), "partial source set published");
+    // A valid numeric prefix must not silently select a different expert or byte range.
+    struct numeric_row { const char * expert; const char * size; const char * offset; };
+    for (const auto & row : std::vector<numeric_row>{
+            {"3tail", "5000", "4097"}, {"junk", "5000", "4097"},
+            {"4294967296", "5000", "4097"}, {"18446744073709551616", "5000", "4097"},
+            {"3", "5000tail", "4097"}, {"3", "5000", "4097tail"},
+            {"3", "5000", "junk"}, {"3", "5000", "-0"},
+            {"3", "18446744073709551616", "0"}, {"3", "5000", "18446744073709551616"}}) {
+        std::ofstream(bad) << "tensor\texpert_idx\tnbytes\tsource_path\toffset\n"
+            << name << '\t' << row.expert << '\t' << row.size << '\t'
+            << (directory / "1.bin").string() << '\t' << row.offset << '\n';
+        require(!ssd::store::source_index::open({bad.string()}), "invalid numeric source index published");
+    }
+    std::ofstream(bad) << "tensor\texpert_idx\tnbytes\tsource_path\toffset\n"
+        << name << "\t0003\t05000\t" << (directory / "1.bin").string() << "\t04097\n";
+    require(bool(ssd::store::source_index::open({bad.string()})), "valid decimal fields rejected");
+    // The default legacy parser keeps the frozen oracle's numeric-prefix behavior.
+    std::ofstream(bad) << "tensor\texpert_idx\tnbytes\tsource_path\toffset\n"
+        << name << "\t3tail\t5000tail\t" << (directory / "1.bin").string() << "\t4097tail\n";
+    c0::description legacy;
+    legacy.aliases.push_back(bad.string());
+    require(bool(c0::expert_index::open(legacy)), "legacy numeric-prefix behavior changed");
 #if !defined(_WIN32)
     // A FIFO index or payload must neither block startup nor be published.
     const auto fifo = directory / "fifo";
