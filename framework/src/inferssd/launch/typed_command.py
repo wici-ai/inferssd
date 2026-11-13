@@ -83,7 +83,12 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         "0.0.0.0 every network interface",
     )
     launch.add_argument("--port", type=int, default=8080)
-    launch.add_argument("--context", type=int, help=f"-c (default: {CONTEXT})")
+    launch.add_argument(
+        "--context",
+        type=int,
+        help="-c (default: the largest multiple of 8192, up to the model's trained context, "
+        f"that memory holds when full; up to {CONTEXT} for a RAM-only model)",
+    )
     launch.add_argument(
         "--batch",
         type=int,

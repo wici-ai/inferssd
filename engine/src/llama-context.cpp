@@ -85,13 +85,16 @@ llama_context::llama_context(
     cparams.ctx_other = nullptr;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
-    // A context past the trained one holds positions the model has not seen, and its cache memory is wasted,
-    // unless the RoPE is scaled to stretch the trained context.
-    if (hparams.n_ctx_train > 0 && cparams.n_ctx > hparams.n_ctx_train &&
+    // A sequence's context past the trained one holds positions the model has not seen, and its cache memory is
+    // wasted, unless the RoPE is scaled to stretch the trained context. Sequences with caches of their own hold one
+    // each; sequences that share a cache (kv_unified) may hold it between them, and theirs is left as asked.
+    const uint32_t n_seq_ctx = std::max<uint32_t>(1, params.n_seq_max);
+    const uint64_t n_ctx_max = uint64_t(hparams.n_ctx_train)*n_seq_ctx;
+    if (hparams.n_ctx_train > 0 && cparams.n_ctx > n_ctx_max && (n_seq_ctx == 1 || !params.kv_unified) &&
             params.rope_freq_scale == 0.0f && params.yarn_orig_ctx == 0) {
-        LLAMA_LOG_INFO("%s: n_ctx = %u is past the model's trained context, using n_ctx_train = %u\n",
+        LLAMA_LOG_INFO("%s: n_ctx = %u is past the model's trained context, using n_ctx_train = %u a sequence\n",
                 __func__, cparams.n_ctx, hparams.n_ctx_train);
-        cparams.n_ctx = hparams.n_ctx_train;
+        cparams.n_ctx = (uint32_t) n_ctx_max;
     }
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
@@ -385,7 +388,41 @@ llama_context::llama_context(
             /*.swa_full =*/ params.swa_full,
         };
 
+        // n_ctx 0 with SSD experts: the largest context whose KV cache fits memory when full
+        if (params.n_ctx == 0 && cpu_sink_runtime && cparams.n_seq_max == 1) {
+            const uint32_t fitted = fit_context(params_mem);
+            if (fitted && fitted < cparams.n_ctx) {
+                cparams.n_ctx = cparams.n_ctx_seq = fitted;
+                cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
+                cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+                if (cpu_prefill_actual_shape_enabled) { cpu_prefill_configured_ubatch = cparams.n_ubatch; }
+            }
+            LLAMA_LOG_INFO("%s: n_ctx = %u, what memory holds of the trained %u (n_batch = %u, n_ubatch = %u)\n",
+                    __func__, cparams.n_ctx, hparams.n_ctx_train, cparams.n_batch, cparams.n_ubatch);
+        }
+
         memory.reset(model.create_memory(params_mem, cparams));
+
+        // The KV cache allocates its cells as they are used. Before it allocates more, the expert caches give the room
+        // (on unified memory the device's bytes are the host's DRAM); a refusal fails the batch that needed them.
+        if (memory) {
+            memory->set_commit([this](size_t host_bytes, size_t device_bytes, const std::function<bool()> & allocate) {
+                if (!cpu_sink_runtime) {
+                    return allocate();
+                }
+                auto granted = cpu_sink_runtime->take_room(host_bytes, device_bytes);
+                if (!granted) {
+                    LLAMA_LOG_ERROR("%s: no room for more KV cache: %s\n", __func__, granted.error.c_str());
+                    return false;
+                }
+                if (!allocate()) {
+                    granted.value.cancel();
+                    return false;
+                }
+                granted.value.commit();
+                return true;
+            });
+        }
     }
 
     // init backends
@@ -587,6 +624,120 @@ llama_memory_context_ptr llama_context::memory_init_reserve() {
     return memory->init_reserve(sched_reserve_n_ctx);
 }
 
+// The KV cache memory of a context of n cells, by buffer type: the memory module built as a model loaded with no_alloc
+// builds it, its tensors sized and no memory taken.
+static std::map<ggml_backend_buffer_type_t, size_t> llama_memory_size(const llama_model & model,
+        const llama_memory_params & params_mem, llama_cparams cparams, uint32_t n, bool * can_grow = nullptr) {
+    cparams.n_ctx = cparams.n_ctx_seq = n;
+    cparams.n_batch = std::min(cparams.n_batch, n);
+    cparams.n_ubatch = std::min(cparams.n_ubatch, n);
+    auto & hparams = const_cast<llama_hparams &>(model.hparams);
+    const bool no_alloc = hparams.no_alloc;
+    hparams.no_alloc = true;
+    std::map<ggml_backend_buffer_type_t, size_t> sizes;
+    try {
+        std::unique_ptr<llama_memory_i> memory(model.create_memory(params_mem, cparams));
+        // read while no_alloc holds: the sizes come from the tensors, not the placeholder buffers
+        if (memory) {
+            sizes = memory->memory_breakdown();
+        }
+        if (can_grow) {
+            *can_grow = memory && memory->get_can_grow();
+        }
+    } catch (...) {
+        hparams.no_alloc = no_alloc;
+        throw;
+    }
+    hparams.no_alloc = no_alloc;
+    return sizes;
+}
+
+// Whether a device's memory is the host's DRAM (Apple silicon, a GPU that shares the host's memory).
+static bool llama_dev_shares_host_memory(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto * shares = reg ? (bool (*)(ggml_backend_dev_t))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_ssd_dev_shares_host_memory") : nullptr;
+    return shares && shares(dev);
+}
+
+uint32_t llama_context::fit_context(const llama_memory_params & params_mem) const {
+    constexpr uint32_t step = 8192;
+    const uint32_t n_train = model.hparams.n_ctx_train;
+    if (n_train <= step || !ssd_runtime || !ssd_runtime->host) {
+        return 0;
+    }
+    std::map<ggml_backend_buffer_type_t, size_t> small, large;
+    bool can_grow = false;
+    try {
+        small = llama_memory_size(model, params_mem, cparams, step);
+        large = llama_memory_size(model, params_mem, cparams, n_train, &can_grow);
+    } catch (const std::exception & error) {
+        LLAMA_LOG_WARN("%s: cannot size the KV cache: %s\n", __func__, error.what());
+        return 0;
+    }
+    // The room the expert caches would otherwise take: host memory (with a device's that is the host's) as the host
+    // arbiter measures it, a discrete device's free memory less vram.reserve_mib.
+    const auto measured = ssd_runtime->host->measure(0);
+    if (!measured) {
+        LLAMA_LOG_WARN("%s: cannot measure host memory: %s\n", __func__, measured.error.c_str());
+        return 0;
+    }
+    const auto * reserve_mib = ssd_runtime->settings.integer("vram.reserve_mib");
+    const uint64_t reserve = reserve_mib ? uint64_t(*reserve_mib) << 20 : 0;
+    // what each memory holds of a context: fixed bytes and bytes a cell, between the two sizes
+    struct term { double fixed = 0, cell = 0, room = 0; };
+    term host;
+    host.room = double(measured.value.surplus());
+    std::map<ggml_backend_dev_t, term> devices;
+    for (const auto & [buft, bytes] : large) {
+        const double at_small = small.count(buft) ? double(small.at(buft)) : 0.0;
+        const double cell = (double(bytes) - at_small) / double(n_train - step);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        term * t = &host;
+        if (dev && !ggml_backend_buft_is_host(buft) && !llama_dev_shares_host_memory(dev)) {
+            auto inserted = devices.emplace(dev, term{});
+            t = &inserted.first->second;
+            if (inserted.second) {
+                size_t free = 0, total = 0;
+                ggml_backend_dev_memory(dev, &free, &total);
+                t->room = free > reserve ? double(free - reserve) : 0.0;
+            }
+        }
+        t->fixed += at_small - cell*step;
+        t->cell  += cell;
+    }
+    const auto fits = [&](uint32_t n) {
+        const auto holds = [n](const term & t) { return t.fixed + t.cell*n <= t.room; };
+        if (!holds(host)) {
+            return false;
+        }
+        for (const auto & device : devices) {
+            if (!holds(device.second)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    // A cache that cannot allocate its cells as they are used (a device without growable buffers, Vulkan; a transposed
+    // V) holds all of them from the start: it keeps the context a launch that sets none has otherwise.
+    constexpr uint32_t n_allocated_at_once = 65536;
+    uint32_t n = can_grow ? n_train - n_train % step : std::min(n_train - n_train % step, n_allocated_at_once);
+    while (n > step && !fits(n)) {
+        n -= step;
+    }
+    if (!can_grow) {
+        LLAMA_LOG_INFO("%s: the KV cache allocates every cell at once: at most %u cells\n", __func__, n_allocated_at_once);
+    }
+    LLAMA_LOG_INFO("%s: %u cells of the trained %u fit: host %.0f + %.4f MiB a cell in %.0f MiB",
+            __func__, n, n_train, host.fixed/1048576.0, host.cell/1048576.0, host.room/1048576.0);
+    for (const auto & device : devices) {
+        LLAMA_LOG_CONT(", %s %.0f + %.4f MiB a cell in %.0f MiB", ggml_backend_dev_name(device.first),
+                device.second.fixed/1048576.0, device.second.cell/1048576.0, device.second.room/1048576.0);
+    }
+    LLAMA_LOG_CONT("\n");
+    return n;
+}
+
 uint32_t llama_context::memory_n_pos() const {
     if (!memory) {
         return 0;
@@ -643,6 +794,7 @@ void llama_context::sched_reserve() {
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory module");
         }
+        memory_generation_reserved = memory->get_generation();
         if (reserve_horizon_enabled) {
             LLAMA_LOG_INFO("[reserve_horizon] n_ctx_reserve=%u n_ctx=%u n_tokens=%u\n",
                 sched_reserve_n_ctx ? sched_reserve_n_ctx : cparams.n_ctx, cparams.n_ctx, n_tokens);
@@ -964,6 +1116,26 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
         if (sched) { synchronize(); }
         cpu_sink_runtime->begin_request();
         cpu_sink_cache_batch_decode = false;
+    }
+    // The prompt's cells come before its graph is reserved, while the expert caches can give room for both (a discrete
+    // GPU's tier gives blocks back only until that reserve completes); the cells past them, which hold nothing (the
+    // request starts a shorter conversation), go back to the expert caches.
+    if (active && memory) {
+        if (sched) { synchronize(); }
+        const uint32_t generation = memory->get_generation();
+        const bool fitted = memory->fit_cells(prefill_tokens);
+        if (memory->get_generation() != generation) {
+            host_note_memory_change();
+        }
+        if (!fitted) {
+            LLAMA_LOG_ERROR("%s: no memory for the KV cache of %u more tokens\n", __func__, prefill_tokens);
+            return false;
+        }
+    }
+    // Graphs reserved before were sized for the cache's old cells. A prompt's own graph is reserved from the cache as it
+    // is now (actual-shape prefill), and the decode graph again as the prompt ends; otherwise decode() reserves them.
+    if (active && memory && cpu_prefill_actual_shape_enabled) {
+        memory_generation_reserved = memory->get_generation();
     }
     const bool graph_phase_gate_enabled = dense_gpu_phase_gate_enabled;
     const bool cpu_sink_phase_changed = cpu_sink_enabled &&
@@ -2241,10 +2413,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
     embd_seq.clear();
     output_swaps.clear();
 
-    auto reserve_with_tier = [&](bool tier_phase, bool decode_phase) {
+    // the KV cache's cells for n_cells more tokens, when given, come first: the graphs reserved next read them
+    bool cells_refused = false;
+    auto reserve_with_tier = [&](bool tier_phase, bool decode_phase, uint32_t n_cells = 0) {
         if (tier_phase) {
             if (sched) { synchronize(); }
             cpu_sink_runtime->begin(nullptr, 0, false);
+        }
+        if (n_cells && !memory->reserve_cells(n_cells)) {
+            cells_refused = true;
         }
         sched_reserve();
         // a prefill whose graph is not reserved yet completes the tier's phase with that reserve (process_ubatch)
@@ -2268,13 +2445,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 n_pos, prev, sched_reserve_n_ctx ? sched_reserve_n_ctx : cparams.n_ctx);
         }
     }
+    // The KV cache allocates its cells as they are used: the ones this batch needs come before it, with the graphs,
+    // sized for the cells, reserved again for the larger cache. A cache whose cells changed since the last reserve (a
+    // state restore grew it) has its graphs reserved again too.
+    const bool cells_grow = memory->cells_short(n_tokens_all);
+    if (cells_grow || memory->get_generation() != memory_generation_reserved) {
+        drop_scheduler();
+        reserve_grown = true;
+    }
     // A decode step that outgrows the reserve takes the larger buffers the way a prefill does:
     // the VRAM tier yields blocks on demand while they are allocated and grows back afterwards.
     const bool reserve_grow_phase = (reserve_grown || sched_need_reserve) && cpu_sink_cache_batch_decode && cpu_sink_runtime &&
         (cpu_sink_runtime->cache_budget || cpu_sink_runtime->vram_budget);
-    if (!reserve_with_tier(cpu_sink_non_decode_phase || reserve_grow_phase, reserve_grow_phase)) {
+    if (!reserve_with_tier(cpu_sink_non_decode_phase || reserve_grow_phase, reserve_grow_phase,
+            cells_grow ? n_tokens_all : 0)) {
         LLAMA_LOG_ERROR("%s: VRAM tier phase completion failed after scheduler reserve\n", __func__);
         return -1;
+    }
+    if (cells_refused) {
+        LLAMA_LOG_WARN("%s: no memory for the KV cache of a batch of size %d\n", __func__, n_tokens_all);
+        return 1;
     }
 
     bool did_optimize = false;

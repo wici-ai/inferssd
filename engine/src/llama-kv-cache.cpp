@@ -73,6 +73,37 @@ static ggml_tensor * ggml_mul_mat_aux(
     return res;
 }
 
+// A device's buffer type whose buffers map memory for a prefix of their addresses and grow it in place (CUDA with
+// VMM), or null.
+ggml_backend_buffer_type_t llama_kv_growable_buft(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto * growable = reg ? (ggml_backend_buffer_type_t (*)(ggml_backend_dev_t))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_buffer_type_growable") : nullptr;
+    return growable ? growable(dev) : nullptr;
+}
+
+static ggml_backend_reg_t llama_kv_buffer_reg(ggml_backend_buffer_t buf) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf));
+    return dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+}
+
+// a growable buffer maps memory for its first `bytes`, or no more than those; false when the device has no room
+static bool llama_kv_set_committed(ggml_backend_buffer_t buf, size_t bytes) {
+    ggml_backend_reg_t reg = llama_kv_buffer_reg(buf);
+    auto * set = reg ? (bool (*)(ggml_backend_buffer_t, size_t))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_set_committed") : nullptr;
+    GGML_ASSERT(set && "a growable buffer's device sets what it maps");
+    return set(buf, bytes);
+}
+
+// the memory a growable buffer maps
+static size_t llama_kv_committed(ggml_backend_buffer_t buf) {
+    ggml_backend_reg_t reg = llama_kv_buffer_reg(buf);
+    auto * get = reg ? (size_t (*)(ggml_backend_buffer_t))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buffer_get_committed") : nullptr;
+    return get ? get(buf) : ggml_backend_buffer_get_size(buf);
+}
+
 //
 // llama_kv_cache
 //
@@ -91,9 +122,10 @@ llama_kv_cache::llama_kv_cache(
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-              const char * name_tag) :
+              const char * name_tag,
+                 uint32_t   n_grow) :
     llama_kv_cache(model, model.hparams, type_k, type_v, v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, filter, reuse, name_tag) {
+            n_swa, swa_type, filter, reuse, name_tag, n_grow) {
 }
 
 llama_kv_cache::llama_kv_cache(
@@ -111,55 +143,27 @@ llama_kv_cache::llama_kv_cache(
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-              const char * name_tag) :
+              const char * name_tag,
+                 uint32_t   n_grow) :
     model(model), hparams(hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+    size_max(kv_size) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
-    const uint32_t n_layer_kv = hparams.n_layer_kv();
-
-    // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
-    struct ggml_backend_buft_comparator {
-        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
-            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
-        }
-    };
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
-
-    // create a context for each buffer type
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
-        if (it == ctx_map.end()) {
-            ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) {
-                return nullptr;
-            }
-
-            ctx_map.emplace(buft, ctx);
-
-            return ctx;
-        }
-
-        return it->second.get();
-    };
-
     GGML_ASSERT(n_stream == 1 || n_stream == n_seq_max);
+
+    // The cells are allocated n_grow at a time as they are used, in place (grow_cells): each tensor holds every cell,
+    // and its buffer holds memory for a prefix of them, which grows at its end. That takes one stream (a stream of a
+    // tensor of several would not be a prefix), V not transposed (a transposed V's cells are not either), and a device
+    // whose buffers can do it for every layer (ggml_backend_dev_buffer_type_growable); without, the cache allocates
+    // every cell at once. A model that only sizes its memory (no_alloc) gets all of them, the size of the full cache.
+    bool grows = n_grow > 0 && kv_size > n_grow && n_grow % n_pad == 0 &&
+        n_stream == 1 && (!v_trans || hparams.is_mla());
 
     v_heads.resize(n_stream);
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_heads[s] = 0;
-    }
-
-    v_cells.resize(n_stream);
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        v_cells[s].resize(kv_size);
     }
 
     // by default, all sequence ids are mapped to the 0th stream
@@ -179,6 +183,9 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const bool is_mla = hparams.is_mla();
+
+    // each layer's buffer type for a cache that grows (null where its device has none)
+    std::vector<ggml_backend_buffer_type_t> growable;
 
     for (uint32_t il = 0; il < hparams.n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -207,44 +214,67 @@ llama_kv_cache::llama_kv_cache(
         const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
         const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
 
-        const char * dev_name = "CPU";
+        auto * dev = offload ? model.dev_layer(il) : ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t buft = offload ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
 
-        if (offload) {
-            auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
+        LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, offload ? ggml_backend_dev_name(dev) : "CPU");
 
-            dev_name = ggml_backend_dev_name(dev);
+        kv_layer layer = {};
+        layer.il = il;
+
+        layer.k_store.buft = buft;
+        layer.k_store.type = type_k;
+        layer.k_store.ne0  = n_embd_k_gqa;
+        layer.k_store.name = format("cache_%sk_l%d", name_tag, il);
+
+        if (!is_mla) {
+            layer.v_store.buft = buft;
+            layer.v_store.type = type_v;
+            layer.v_store.ne0  = n_embd_v_gqa;
+            layer.v_store.name = format("cache_%sv_l%d", name_tag, il);
         }
 
-        LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
-
-        ggml_context * ctx = ctx_for_buft(buft);
-        if (!ctx) {
-            throw std::runtime_error("failed to create ggml context for kv cache");
-        }
-
-        const bool has_k = true;
-        const bool has_v = !is_mla;
-
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
-
-        has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
-        has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
-
-        std::vector<ggml_tensor *> k_stream;
-        std::vector<ggml_tensor *> v_stream;
-
-        for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
-        }
+        growable.push_back(grows ? llama_kv_growable_buft(dev) : nullptr);
+        grows = grows && growable.back();
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back(std::move(layer));
+    }
+
+    // a cache no larger than one step has nothing to grow
+    can_grow = grows || (n_grow > 0 && kv_size <= n_grow);
+    grows = grows && !hparams.no_alloc;
+    this->n_grow = grows ? n_grow : 0;
+    const uint32_t n_cells = grows ? n_grow : kv_size;
+
+    v_cells.resize(n_stream);
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        v_cells[s].resize(n_cells);
+    }
+
+    for (size_t i = 0; i < layers.size(); ++i) {
+        kv_layer & layer = layers[i];
+        for (kv_store * store : { &layer.k_store, &layer.v_store }) {
+            if (store->name.empty()) {
+                continue; // a layer without V
+            }
+            if (grows) {
+                store->buft = growable[i];
+            }
+            if (!alloc_tensor(*store) || (grows && !commit_cells(*store, 0, n_cells))) {
+                throw std::runtime_error("failed to allocate buffer for kv cache");
+            }
+            if (!grows && !hparams.no_alloc) {
+                // zeroed, which avoids NaNs in the cells graphs read before they are written
+                ggml_backend_buffer_clear(store->buf.get(), 0);
+            }
+        }
+        layer.k        = layer.k_store.t;
+        layer.k_stream = layer.k_store.streams;
+        layer.v        = layer.v_store.t;
+        layer.v_stream = layer.v_store.t ? layer.v_store.streams : std::vector<ggml_tensor *>(n_stream, nullptr);
     }
 
     if (reuse) {
@@ -276,25 +306,8 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // allocate tensors and initialize the buffers to avoid NaNs in the padding
-    for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf;
-        if (hparams.no_alloc) {
-            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
-            }
-        } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
-        }
-        if (!buf) {
-            throw std::runtime_error("failed to allocate buffer for kv cache");
-        }
-
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
-
-        ggml_backend_buffer_clear(buf, 0);
-        ctxs_bufs.emplace_back(std::move(ctx), buf);
+    for (const auto & [buft, size] : memory_breakdown()) {
+        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buft_name(buft), size/1024.0/1024.0);
     }
 
     {
@@ -302,9 +315,12 @@ llama_kv_cache::llama_kv_cache(
         const size_t memory_size_v = size_v_bytes();
 
         LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
+                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), n_cells, (int) layers.size(), n_seq_max, n_stream,
                 ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+        if (grows) {
+            LLAMA_LOG_INFO("%s: cells allocated as used, %u at a time, up to %u\n", __func__, n_grow, kv_size);
+        }
     }
 
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
@@ -367,10 +383,217 @@ void llama_kv_cache::clear(bool data) {
     }
 
     if (data) {
-        for (auto & [_, buf] : ctxs_bufs) {
-            ggml_backend_buffer_clear(buf.get(), 0);
+        for (auto & layer : layers) {
+            for (kv_store * store : { &layer.k_store, &layer.v_store }) {
+                if (store->buf && n_grow > 0) {
+                    // the cells allocated, the only ones that hold memory
+                    ggml_backend_tensor_memset(store->t, 0, 0, ggml_row_size(store->type, store->ne0)*get_size());
+                } else if (store->buf) {
+                    ggml_backend_buffer_clear(store->buf.get(), 0);
+                }
+            }
         }
     }
+}
+
+bool llama_kv_cache::commit_cells(kv_store & store, uint32_t n_old, uint32_t n) const {
+    // a cache that grows has one stream: its first n cells are the tensor's first bytes
+    const size_t row = ggml_row_size(store.type, store.ne0);
+    if (!llama_kv_set_committed(store.buf.get(), row*n)) {
+        return false;
+    }
+    if (n > n_old) {
+        // zeroed, which avoids NaNs in the cells graphs read before they are written
+        ggml_backend_tensor_memset(store.t, 0, row*n_old, row*(n - n_old));
+    }
+    return true;
+}
+
+size_t llama_kv_cache::store_bytes(const kv_store & store) const {
+    if (!store.buf) {
+        return 0;
+    }
+    if (hparams.no_alloc) {
+        return ggml_nbytes(store.t);
+    }
+    return n_grow > 0 ? llama_kv_committed(store.buf.get()) : ggml_backend_buffer_get_size(store.buf.get());
+}
+
+bool llama_kv_cache::alloc_tensor(kv_store & store) const {
+    ggml_init_params params = {
+        /*.mem_size   =*/ size_t(1 + n_stream)*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        throw std::runtime_error("failed to create ggml context for kv cache");
+    }
+
+    ggml_tensor * t = ggml_new_tensor_3d(ctx.get(), store.type, store.ne0, size_max, n_stream);
+    ggml_set_name(t, store.name.c_str());
+
+    std::vector<ggml_tensor *> streams;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        streams.push_back(ggml_view_2d(ctx.get(), t, store.ne0, size_max, t->nb[1], s*t->nb[2]));
+    }
+
+    ggml_backend_buffer_t buf;
+    if (hparams.no_alloc) {
+        buf = ggml_backend_buft_alloc_buffer(store.buft, /*size =*/ 0); // dummy buffer
+        for (ggml_tensor * x = ggml_get_first_tensor(ctx.get()); x != nullptr; x = ggml_get_next_tensor(ctx.get(), x)) {
+            x->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
+        }
+    } else {
+        buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), store.buft); // real buffer
+    }
+    if (!buf) {
+        return false;
+    }
+
+    store.ctx     = std::move(ctx);
+    store.buf     = ggml_backend_buffer_ptr(buf);
+    store.t       = t;
+    store.streams = std::move(streams);
+
+    return true;
+}
+
+void llama_kv_cache::set_commit(const commit_cb & cb) {
+    commit = cb;
+}
+
+bool llama_kv_cache::get_can_grow() const {
+    return can_grow;
+}
+
+bool llama_kv_cache::needs_cells(uint32_t n) const {
+    return n_grow > 0 && n > get_size() && get_size() < size_max;
+}
+
+bool llama_kv_cache::grow_cells(uint32_t n) {
+    if (!needs_cells(n)) {
+        return true;
+    }
+
+    n = std::min<uint32_t>(size_max, GGML_PAD(n, n_grow));
+
+    const uint32_t n_old = get_size();
+
+    size_t host   = 0;
+    size_t device = 0;
+    for (const auto & layer : layers) {
+        for (const kv_store * store : { &layer.k_store, &layer.v_store }) {
+            if (store->buf) {
+                (ggml_backend_buft_is_host(store->buft) ? host : device) += ggml_row_size(store->type, store->ne0)*(n - n_old);
+            }
+        }
+    }
+
+    // A buffer that cannot grow leaves the others as they are: each holds memory for at least the cells the stream
+    // has, and the cells grow once all hold n.
+    const auto allocate = [&] {
+        for (auto & layer : layers) {
+            for (kv_store * store : { &layer.k_store, &layer.v_store }) {
+                if (store->buf && !commit_cells(*store, n_old, n)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    if (!(commit ? commit(host, device, allocate) : allocate())) {
+        LLAMA_LOG_ERROR("%s: no memory for %u cells of %u (%.1f MiB host, %.1f MiB device more)\n", __func__,
+                n, size_max, host/1024.0/1024.0, device/1024.0/1024.0);
+        return false;
+    }
+
+    if (!layers.empty()) {
+        LLAMA_LOG_INFO("%s: %u -> %u cells of %u (%.1f MiB host, %.1f MiB device more)\n", __func__,
+                n_old, n, size_max, host/1024.0/1024.0, device/1024.0/1024.0);
+    }
+
+    for (auto & cells : v_cells) {
+        cells.grow(n);
+    }
+    ++generation;
+
+    return true;
+}
+
+bool llama_kv_cache::cells_short(uint32_t n_tokens) const {
+    uint32_t used = 0;
+    for (const auto & cells : v_cells) {
+        used = std::max(used, cells.get_used());
+    }
+    return needs_cells(used + n_tokens);
+}
+
+bool llama_kv_cache::reserve_cells(uint32_t n_tokens) {
+    uint32_t used = 0;
+    for (const auto & cells : v_cells) {
+        used = std::max(used, cells.get_used());
+    }
+    return grow_cells(used + n_tokens);
+}
+
+bool llama_kv_cache::fit_cells(uint32_t n_tokens) {
+    uint32_t used = 0;
+    for (const auto & cells : v_cells) {
+        used = std::max(used, cells.get_used());
+    }
+    trim_cells(used + n_tokens);
+    return grow_cells(used + n_tokens);
+}
+
+void llama_kv_cache::trim_cells(uint32_t n) {
+    if (n_grow == 0) {
+        return;
+    }
+
+    for (const auto & cells : v_cells) {
+        n = std::max(n, cells.used_max_p1());
+    }
+    n = std::min<uint32_t>(size_max, GGML_PAD(std::max(n, 1u), n_grow));
+
+    const uint32_t n_old = get_size();
+    if (n >= n_old) {
+        return;
+    }
+
+    // the cells first, so that every tensor still holds at least the cells the streams have if one cannot shrink
+    for (auto & cells : v_cells) {
+        cells.shrink(n);
+    }
+    for (auto & head : v_heads) {
+        head = head < n ? head : 0;
+    }
+    ++generation;
+
+    size_t host   = 0;
+    size_t device = 0;
+    for (auto & layer : layers) {
+        for (kv_store * store : { &layer.k_store, &layer.v_store }) {
+            if (!store->buf) {
+                continue;
+            }
+            const size_t before = store_bytes(*store);
+            if (commit_cells(*store, n, n)) {
+                (ggml_backend_buft_is_host(store->buft) ? host : device) += before - store_bytes(*store);
+            }
+        }
+    }
+
+    if (!layers.empty()) {
+        LLAMA_LOG_INFO("%s: %u -> %u cells of %u (%.1f MiB host, %.1f MiB device less)\n", __func__,
+                n_old, n, size_max, host/1024.0/1024.0, device/1024.0/1024.0);
+    }
+}
+
+uint32_t llama_kv_cache::get_generation() const {
+    return generation;
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -642,15 +865,19 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [ctx, buf] : ctxs_bufs) {
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+    for (const auto & layer : layers) {
+        for (const kv_store * store : { &layer.k_store, &layer.v_store }) {
+            if (!store->buf) {
+                continue;
+            }
 
-        if (hparams.no_alloc) {
-            GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
-        } else {
-            // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
-            ret[buft] += ggml_backend_buffer_get_size(buf.get());
+            if (hparams.no_alloc) {
+                GGML_ASSERT(ggml_backend_buffer_get_base(store->buf.get()) == nullptr);
+                ret[store->buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(store->ctx.get(), store->buft);
+            } else {
+                // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
+                ret[store->buft] += store_bytes(*store);
+            }
         }
     }
 
@@ -1156,6 +1383,10 @@ uint32_t llama_kv_cache::get_size() const {
     return cells.size();
 }
 
+uint32_t llama_kv_cache::get_size_max() const {
+    return size_max;
+}
+
 uint32_t llama_kv_cache::get_n_seq_max() const {
     return n_seq_max;
 }
@@ -1226,7 +1457,8 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * k = layers[ikv].k;
 
-    const uint64_t kv_size      = get_size();
+    // the tensor's cells: at least the stream's, more while a growth is incomplete (grow_cells)
+    const uint64_t kv_size      = k->ne[1];
     const uint64_t n_embd_k_gqa = k->ne[0];
 
     assert(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
@@ -1246,7 +1478,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 
     auto * v = layers[ikv].v;
 
-    const uint64_t kv_size      = get_size();
+    // the tensor's cells: at least the stream's, more while a growth is incomplete (grow_cells)
+    const uint64_t kv_size      = v->ne[1];
     const uint64_t n_embd_v_gqa = v->ne[0];
 
     // [TAG_V_CACHE_VARIABLE]
@@ -1833,8 +2066,10 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 
-    for (const auto & [_, buf] : ctxs_bufs) {
-        size += ggml_backend_buffer_get_size(buf.get());
+    for (const auto & layer : layers) {
+        for (const kv_store * store : { &layer.k_store, &layer.v_store }) {
+            size += store_bytes(*store);
+        }
     }
 
     return size;
@@ -1844,7 +2079,7 @@ size_t llama_kv_cache::size_k_bytes() const {
     size_t size_k_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_k_bytes += ggml_nbytes(layer.k);
+        size_k_bytes += store_bytes(layer.k_store);
     }
 
     return size_k_bytes;
@@ -1854,7 +2089,7 @@ size_t llama_kv_cache::size_v_bytes() const {
     size_t size_v_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_v_bytes += layer.v ? ggml_nbytes(layer.v) : 0;
+        size_v_bytes += store_bytes(layer.v_store);
     }
 
     return size_v_bytes;
@@ -2274,6 +2509,12 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 }
             }
         } else {
+            // the cells the sequence takes, where the cache allocates them as they are used
+            if (!reserve_cells(cell_count)) {
+                LLAMA_LOG_ERROR("%s: no memory for %d more cells in kv cache\n", __func__, cell_count);
+                return false;
+            }
+
             sinfo = find_slot(ubatch, false);
             if (sinfo.empty()) {
                 LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
@@ -2300,6 +2541,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         }
     } else {
         // whole KV cache restore
+
+        if (!grow_cells(cell_count)) {
+            LLAMA_LOG_ERROR("%s: no memory for %d cells in kv cache\n", __func__, cell_count);
+            return false;
+        }
 
         if (cell_count > cells.size()) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);

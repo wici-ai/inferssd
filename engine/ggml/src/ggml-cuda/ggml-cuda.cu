@@ -921,11 +921,35 @@ static void ggml_backend_cuda_graph_cache_end_phase(ggml_backend_t backend, int 
 
 // cuda buffer
 
+// The memory of a growable buffer (ggml_backend_dev_buffer_type_growable): its whole address range is reserved at
+// once, and device memory is mapped for a prefix of it, which grows at its end and shrinks from there
+// (ggml_backend_buffer_set_committed). Nothing in the buffer moves as it does.
+struct ggml_cuda_growable_memory {
+    int device;
+    size_t size;
+#if defined(GGML_USE_VMM)
+    CUdeviceptr base = 0;
+    size_t reserved = 0;
+    size_t granularity = 0;
+    size_t mapped = 0; // bytes mapped from base
+    std::vector<std::pair<CUdeviceptr, size_t>> mappings; // in address order
+#endif
+
+    ggml_cuda_growable_memory(int device, size_t size);
+    ~ggml_cuda_growable_memory();
+    void * data() const;
+    size_t committed() const;
+    // maps or unmaps device memory so that the first `bytes` (rounded up to the mapping granularity) hold memory;
+    // false when the device has no room for more
+    bool set_committed(size_t bytes);
+};
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     size_t size = 0;
     std::string name;
+    std::unique_ptr<ggml_cuda_growable_memory> growable; // the buffer's memory when only a prefix of it is mapped
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr, size_t size) :
         device(device), dev_ptr(dev_ptr), size(size),
@@ -933,9 +957,19 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(ggml_cuda_device_free(dev_ptr, size, device));
+        if (!growable) {
+            CUDA_CHECK(ggml_cuda_device_free(dev_ptr, size, device));
+        }
     }
 };
+
+// What an operation reads or writes of a growable buffer lies in its mapped prefix: past it there is no memory.
+static void ggml_backend_cuda_buffer_check(const ggml_backend_cuda_buffer_context * ctx, const void * ptr, size_t size) {
+    if (ctx->growable && size > 0) {
+        const size_t at = (const char *) ptr - (const char *) ctx->dev_ptr;
+        GGML_ASSERT(at + size <= ctx->growable->committed() && "access past the mapped prefix of a growable buffer");
+    }
+}
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
@@ -964,7 +998,9 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         const size_t original_size = ggml_nbytes(tensor);
         const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
 
-        if (padded_size > original_size) {
+        // a growable buffer maps no memory at first: the padding of its tensors is zeroed with the prefix that
+        // reaches it (its rows past what the prefix holds are read by nothing)
+        if (padded_size > original_size && !ctx->growable) {
             ggml_cuda_set_device(ctx->device);
             CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
         }
@@ -976,6 +1012,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_backend_cuda_buffer_check(ctx, (char *) tensor->data + offset, size);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -984,6 +1021,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_backend_cuda_buffer_check(ctx, (char *) tensor->data + offset, size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -992,6 +1030,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_backend_cuda_buffer_check(ctx, (const char *) tensor->data + offset, size);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -1001,6 +1040,9 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (n_copies) {
+        ggml_backend_cuda_buffer_check(ctx, (char *) tensor->data + offset, (n_copies - 1)*stride_tensor + size);
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1011,6 +1053,9 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (n_copies) {
+        ggml_backend_cuda_buffer_check(ctx, (const char *) tensor->data + offset, (n_copies - 1)*stride_tensor + size);
+    }
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -1020,6 +1065,8 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
+        ggml_backend_cuda_buffer_check(src_ctx, src->data, ggml_nbytes(src));
+        ggml_backend_cuda_buffer_check(dst_ctx, dst->data, ggml_nbytes(src));
         if (src_ctx->device == dst_ctx->device) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
@@ -1041,8 +1088,12 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    // a growable buffer holds memory only for its mapped prefix
+    const size_t size = ctx->growable ? ctx->growable->committed() : buffer->size;
+    if (size > 0) {
+        CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, size, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    }
 }
 
 static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
@@ -1063,6 +1114,8 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
 struct ggml_backend_cuda_buffer_type_context {
     int device;
     std::string name;
+    // buffers that map memory for a prefix of their addresses (ggml_backend_dev_buffer_type_growable)
+    bool growable = false;
 };
 
 // Optional phase-scoped OOM reclaimer. The callback is registered by a
@@ -1265,10 +1318,109 @@ extern "C" cudaError_t ggml_cuda_malloc_reclaiming(void ** ptr, size_t size, int
     });
 }
 
+#if defined(GGML_USE_VMM)
+ggml_cuda_growable_memory::ggml_cuda_growable_memory(int device, size_t size) :
+    device(device), size(size), granularity(ggml_cuda_info().devices[device].vmm_granularity) {
+    reserved = granularity * ((size + granularity - 1) / granularity);
+    if (cuMemAddressReserve(&base, reserved, 0, 0, 0) != CUDA_SUCCESS) {
+        base = 0;
+    }
+}
+
+ggml_cuda_growable_memory::~ggml_cuda_growable_memory() {
+    if (base == 0) {
+        return;
+    }
+    ggml_cuda_set_device(device);
+    set_committed(0);
+    CU_CHECK(cuMemAddressFree(base, reserved));
+}
+
+void * ggml_cuda_growable_memory::data() const {
+    return (void *) base;
+}
+
+size_t ggml_cuda_growable_memory::committed() const {
+    return mapped;
+}
+
+bool ggml_cuda_growable_memory::set_committed(size_t bytes) {
+    GGML_ASSERT(base != 0);
+    const size_t target = std::min(reserved, granularity * ((bytes + granularity - 1) / granularity));
+    ggml_cuda_set_device(device);
+    // shrink: the mappings past the target go, the one it falls in stays
+    while (!mappings.empty() && mappings.back().first >= base + target) {
+        CU_CHECK(cuMemUnmap(mappings.back().first, mappings.back().second));
+        g_cuda_reserve_budgets[device].release(mappings.back().second);
+        mapped -= mappings.back().second;
+        mappings.pop_back();
+    }
+    if (target <= mapped) {
+        return true;
+    }
+    // grow: one mapping for what the prefix gains, admitted as the VMM pool's growth is
+    const size_t more = target - mapped;
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = device;
+    CUmemGenericAllocationHandle handle;
+    const cudaError_t err = ggml_cuda_alloc_reclaiming(device, more, [&] {
+        const cudaError_t reserve_err = ggml_cuda_reserve_memory(device, more);
+        if (reserve_err != cudaSuccess) {
+            return reserve_err;
+        }
+        // The prefix grows into memory the device has free, the OOM reclaimer giving tier blocks back when it has not:
+        // WDDM maps past the process's budget by moving memory out to the host, which takes commit nobody held for it
+        size_t free = 0, total = 0;
+        ggml_cuda_memory_info(device, &free, &total);
+        if (more > free) {
+            return cudaErrorMemoryAllocation;
+        }
+        const CUresult rc = cuMemCreate(&handle, more, &prop, 0);
+        return rc == CUDA_SUCCESS ? cudaSuccess : rc == CUDA_ERROR_OUT_OF_MEMORY ? cudaErrorMemoryAllocation : cudaErrorUnknown;
+    });
+    if (err != cudaSuccess) {
+        GGML_LOG_ERROR("%s: device %d has no memory for %.2f MiB more: %s\n", __func__, device, more/1048576.0, cudaGetErrorString(err));
+        return false;
+    }
+    g_cuda_reserve_budgets[device].hold(more);
+    const CUdeviceptr at = base + mapped;
+    CU_CHECK(cuMemMap(at, more, 0, handle, 0));
+    CU_CHECK(cuMemRelease(handle));
+    CUmemAccessDesc access = {};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = device;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    CU_CHECK(cuMemSetAccess(at, more, &access, 1));
+    mappings.push_back({at, more});
+    mapped = target;
+    return true;
+}
+#else
+ggml_cuda_growable_memory::ggml_cuda_growable_memory(int device, size_t size) : device(device), size(size) {}
+ggml_cuda_growable_memory::~ggml_cuda_growable_memory() {}
+void * ggml_cuda_growable_memory::data() const { return nullptr; }
+size_t ggml_cuda_growable_memory::committed() const { return 0; }
+bool ggml_cuda_growable_memory::set_committed(size_t) { return false; }
+#endif
+
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     ggml_cuda_set_device(buft_ctx->device);
+
+    if (buft_ctx->growable) {
+        auto memory = std::make_unique<ggml_cuda_growable_memory>(buft_ctx->device, size);
+        if (!memory->data()) {
+            GGML_LOG_ERROR("%s: reserving %.2f MiB of addresses on device %d failed\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device);
+            return nullptr;
+        }
+        ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, memory->data(), size);
+        ctx->growable = std::move(memory);
+
+        return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+    }
 
     void * dev_ptr = nullptr;
     const cudaError_t err = ggml_cuda_alloc_reclaiming(buft_ctx->device, size,
@@ -1338,6 +1490,32 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+// The device's growable buffer type (ggml_cuda_growable_memory), for a cache that grows in place
+// (llama_kv_cache); null without VMM.
+static ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type_growable(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (device >= ggml_backend_cuda_get_device_count() || !ggml_cuda_info().devices[device].vmm) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type types[GGML_CUDA_MAX_DEVICES];
+    static bool initialized = false;
+    if (!initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            types[i] = {
+                /* .iface    = */ ggml_backend_cuda_buffer_type_interface,
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i), true},
+            };
+        }
+        initialized = true;
+    }
+
+    return &types[device];
 }
 
 // cuda split buffer
@@ -5217,8 +5395,10 @@ static void ggml_cuda_graph_evaluate_and_capture(
         }
         if (oom_stage != nullptr) {
             // Nothing of this step has run: a capture only records kernels and a failed launch executes
-            // none. Run it without the graph now and capture again later, after the VRAM tier has had
-            // token boundaries to give memory back.
+            // none. Run it without the graph now and capture again later, after the VRAM tier has given
+            // memory back: the reclaimer learns of the failure here (the driver's allocation has no size).
+            size_t reclaimed = 0;
+            (void) ggml_cuda_oom_reclaimer_invoke(cuda_ctx->device, 0, &reclaimed);
             if (graph->instance != nullptr) {
                 CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
                 graph->instance = nullptr;
@@ -6738,8 +6918,49 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// ggml_backend_ssd_dev_shares_host_memory: the device's memory is the host's DRAM (a GPU on unified memory)
+static bool ggml_backend_cuda_device_shares_host_memory(ggml_backend_dev_t dev) {
+    return ggml_cuda_memory_is_unified(((ggml_backend_cuda_device_context *) dev->context)->device);
+}
+
+// ggml_backend_dev_buffer_type_growable: the device's growable buffer type, null without VMM
+static ggml_backend_buffer_type_t ggml_backend_cuda_device_buffer_type_growable(ggml_backend_dev_t dev) {
+    return ggml_backend_cuda_buffer_type_growable(((ggml_backend_cuda_device_context *) dev->context)->device);
+}
+
+// ggml_backend_buffer_set_committed: a growable buffer maps memory for its first `bytes`, or no more than those;
+// false when the device has no room for them. Every other buffer holds all of its memory.
+static bool ggml_backend_cuda_buffer_set_committed(ggml_backend_buffer_t buffer, size_t bytes) {
+    if (!ggml_backend_buffer_is_cuda(buffer)) {
+        return true;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    return !ctx->growable || ctx->growable->set_committed(bytes);
+}
+
+// ggml_backend_buffer_get_committed: the memory a buffer holds
+static size_t ggml_backend_cuda_buffer_get_committed(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_buffer_is_cuda(buffer)) {
+        return ggml_backend_buffer_get_size(buffer);
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    return ctx->growable ? ctx->growable->committed() : ggml_backend_buffer_get_size(buffer);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_buffer_type_growable") == 0) {
+        return (void *)ggml_backend_cuda_device_buffer_type_growable;
+    }
+    if (strcmp(name, "ggml_backend_buffer_set_committed") == 0) {
+        return (void *)ggml_backend_cuda_buffer_set_committed;
+    }
+    if (strcmp(name, "ggml_backend_buffer_get_committed") == 0) {
+        return (void *)ggml_backend_cuda_buffer_get_committed;
+    }
+    if (strcmp(name, "ggml_backend_ssd_dev_shares_host_memory") == 0) {
+        return (void *)ggml_backend_cuda_device_shares_host_memory;
+    }
 #ifdef GGML_SSD_CUDA_EXECUTOR
     if (strcmp(name, "ggml_backend_ssd_provider_v1") == 0) {
         return (void *) ggml_backend_cuda_ssd_api_v1;

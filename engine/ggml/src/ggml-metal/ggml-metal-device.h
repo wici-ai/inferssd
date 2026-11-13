@@ -276,6 +276,18 @@ typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
 ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
 
+// A growable buffer: its whole address range is reserved at once (shared memory), and one Metal buffer wraps the
+// prefix that holds memory, which set_committed grows and shrinks at its end; nothing in it moves. A tensor is bound
+// from where it starts. NULL without shared buffers.
+ggml_metal_buffer_t ggml_metal_buffer_init_growable(ggml_metal_device_t dev, size_t size);
+// whether the device has growable buffers (macOS, shared buffers)
+bool ggml_metal_device_supports_growable(ggml_metal_device_t dev);
+// the first `bytes` (in pages) hold memory, and no more: the pages given back read zero again. Shrinks only while no
+// command buffer uses the buffer. False when the device cannot wrap that much.
+bool   ggml_metal_buffer_set_committed(ggml_metal_buffer_t buf, size_t bytes);
+bool   ggml_metal_buffer_is_growable  (ggml_metal_buffer_t buf);
+size_t ggml_metal_buffer_get_committed(ggml_metal_buffer_t buf);
+
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);
 bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);

@@ -165,6 +165,13 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    void set_commit(const commit_cb & commit) override;
+    bool cells_short(uint32_t n_tokens) const override;
+    bool reserve_cells(uint32_t n_tokens) override;
+    bool fit_cells(uint32_t n_tokens) override;
+    uint32_t get_generation() const override;
+    bool get_can_grow() const override;
+
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
@@ -212,6 +219,9 @@ private:
     std::unique_ptr<llama_dsv4_comp_state> lid_state;
 
     void clear_compressed(llama_seq_id seq_id, bool data);
+
+    // the cells a compressed cache of `ratio` needs for n_tokens more tokens than the sequences hold
+    uint32_t comp_cells(uint32_t n_tokens, uint32_t ratio) const;
 
     void state_write_until(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos pos_last) const;
 };

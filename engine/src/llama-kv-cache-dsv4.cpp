@@ -26,13 +26,19 @@ static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
 }
 
-static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream) {
+// A compressed cache holds a row per `ratio` positions, at the row of its position (dsv4_build_comp_plan), and grows
+// as the positions do (llama_kv_cache_dsv4::reserve_cells), 256 rows at a time: the padding a plan's rows get.
+static constexpr uint32_t dsv4_comp_grow = 256;
+
+// the first `rows` rows of a stream: the ones its cache has allocated (a cache that grows in place holds no memory
+// past them)
+static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream, uint32_t rows) {
     GGML_ASSERT(ggml_is_contiguous(tensor));
     GGML_ASSERT(tensor->ne[3] == 1);
     GGML_ASSERT(stream < (uint32_t) tensor->ne[2]);
+    GGML_ASSERT(rows <= (uint32_t) tensor->ne[1]);
 
-    const size_t stream_size = tensor->nb[2];
-    ggml_backend_tensor_memset(tensor, 0, stream*stream_size, stream_size);
+    ggml_backend_tensor_memset(tensor, 0, stream*tensor->nb[2], rows*tensor->nb[1]);
 }
 
 static int64_t dsv4_stream_offset(uint32_t n_stream, llama_seq_id seq_id, uint32_t size) {
@@ -778,8 +784,8 @@ void llama_dsv4_comp_state::clear(llama_seq_id seq_id, bool data) {
         for (const auto & layer : layers) {
             for (uint32_t d = 0; d <= n_rs_seq; ++d) {
                 const uint32_t stream = d*n_stream + (uint32_t) seq_id;
-                dsv4_clear_tensor_stream(layer.kv,    stream);
-                dsv4_clear_tensor_stream(layer.score, stream);
+                dsv4_clear_tensor_stream(layer.kv,    stream, (uint32_t) layer.kv->ne[1]);
+                dsv4_clear_tensor_stream(layer.score, stream, (uint32_t) layer.score->ne[1]);
             }
         }
         return;
@@ -1109,7 +1115,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_kv), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, filter_csa, reuse_kv);
+            0, LLAMA_SWA_TYPE_NONE, filter_csa, reuse_kv, "", dsv4_comp_grow);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, ratio = %u, size = %u cells\n",
             __func__, ratio_b, dsv4_comp_size(kv_size, ratio_b));
@@ -1117,7 +1123,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_hca = std::make_unique<llama_kv_cache>(
             model, hparams_hca, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_b), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, filter_hca, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, filter_hca, nullptr, "", dsv4_comp_grow);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, ratio_kv));
@@ -1125,7 +1131,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, ratio_kv), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, filter_lid, reuse_lid);
+            0, LLAMA_SWA_TYPE_NONE, filter_lid, reuse_lid, "", dsv4_comp_grow);
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
@@ -1389,6 +1395,58 @@ llama_pos llama_kv_cache_dsv4::seq_pos_max(llama_seq_id seq_id) const {
     return kv_raw->seq_pos_max(seq_id);
 }
 
+void llama_kv_cache_dsv4::set_commit(const commit_cb & commit) {
+    kv_raw->set_commit(commit);
+    kv_csa->set_commit(commit);
+    kv_hca->set_commit(commit);
+    kv_lid->set_commit(commit);
+}
+
+// The rows for the positions the sequences reach with n_tokens more tokens, rounded as the raw cache rounds its cells,
+// and one past them: a plan parks the rows of padding blocks in a stream's last cell (dsv4_build_comp_plan).
+uint32_t llama_kv_cache_dsv4::comp_cells(uint32_t n_tokens, uint32_t ratio) const {
+    llama_pos pos_max = -1;
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        pos_max = std::max(pos_max, kv_raw->seq_pos_max((llama_seq_id) s));
+    }
+    const uint32_t n_pos = GGML_PAD((uint32_t) (pos_max + 1) + n_tokens, llama_kv_cache::n_grow_default);
+    return dsv4_comp_size(n_pos, ratio) + 1;
+}
+
+bool llama_kv_cache_dsv4::cells_short(uint32_t n_tokens) const {
+    return kv_raw->cells_short(n_tokens) ||
+        kv_csa->needs_cells(comp_cells(n_tokens, ratio_kv)) ||
+        kv_lid->needs_cells(comp_cells(n_tokens, ratio_kv)) ||
+        kv_hca->needs_cells(comp_cells(n_tokens, hca_state->get_ratio()));
+}
+
+bool llama_kv_cache_dsv4::reserve_cells(uint32_t n_tokens) {
+    const uint32_t n_kv  = comp_cells(n_tokens, ratio_kv);
+    const uint32_t n_hca = comp_cells(n_tokens, hca_state->get_ratio());
+    return kv_raw->reserve_cells(n_tokens) &&
+        kv_csa->grow_cells(n_kv) && kv_lid->grow_cells(n_kv) && kv_hca->grow_cells(n_hca);
+}
+
+// The compressed rows are kept for the positions the sequences hold: the rows a compressed cache holds past them hold
+// nothing either (the cells of a compressed cache record no positions, so its own trim keeps only what it is told).
+bool llama_kv_cache_dsv4::fit_cells(uint32_t n_tokens) {
+    const uint32_t n_kv  = comp_cells(n_tokens, ratio_kv);
+    const uint32_t n_hca = comp_cells(n_tokens, hca_state->get_ratio());
+    kv_csa->trim_cells(n_kv);
+    kv_lid->trim_cells(n_kv);
+    kv_hca->trim_cells(n_hca);
+    return kv_raw->fit_cells(n_tokens) &&
+        kv_csa->grow_cells(n_kv) && kv_lid->grow_cells(n_kv) && kv_hca->grow_cells(n_hca);
+}
+
+bool llama_kv_cache_dsv4::get_can_grow() const {
+    return kv_raw->get_can_grow() && kv_csa->get_can_grow() && kv_hca->get_can_grow() && kv_lid->get_can_grow();
+}
+
+uint32_t llama_kv_cache_dsv4::get_generation() const {
+    return kv_raw->get_generation() + kv_csa->get_generation() + kv_hca->get_generation() + kv_lid->get_generation();
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = kv_raw->memory_breakdown();
     for (const auto & buft_size : kv_csa->memory_breakdown()) {
@@ -1479,7 +1537,7 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
             if (data) {
                 //TODO: do not clear the kv-cache during `seq_rm`, ref: https://github.com/ggml-org/llama.cpp/pull/26490#discussion_r3798143663
                 for (uint32_t il : kv->get_layer_ids()) {
-                    dsv4_clear_tensor_stream(kv->get_k_storage(il), (uint32_t) seq_id);
+                    dsv4_clear_tensor_stream(kv->get_k_storage(il), (uint32_t) seq_id, kv->get_size());
                 }
             }
         };

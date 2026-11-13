@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -16,6 +17,10 @@ struct llama_context;
 //
 // llama_kv_cache
 //
+
+// The device's buffer type whose buffers hold memory for a prefix of their addresses, grown and shrunk at its end
+// (ggml_backend_dev_buffer_type_growable): null where it has none.
+ggml_backend_buffer_type_t llama_kv_growable_buft(ggml_backend_dev_t dev);
 
 class llama_kv_cache : public llama_memory_i {
 public:
@@ -93,6 +98,9 @@ public:
 
     using slot_info_vec_t = std::vector<slot_info>;
 
+    // The cells a cache allocates at a time as it is used (n_grow); 0 allocates all of them at once.
+    static constexpr uint32_t n_grow_default = 8192;
+
     llama_kv_cache(
             const llama_model & model,
                     ggml_type   type_k,
@@ -107,7 +115,8 @@ public:
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-              const char * name_tag = "");
+              const char * name_tag = "",
+                 uint32_t   n_grow = n_grow_default);
 
     // same as above, but with explicit hparams instead of model.hparams
     // note: the cache keeps a reference to hparams, so it must outlive the cache
@@ -127,7 +136,8 @@ public:
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-              const char * name_tag = "");
+              const char * name_tag = "",
+                 uint32_t   n_grow = n_grow_default);
 
     ~llama_kv_cache() = default;
 
@@ -159,6 +169,20 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    void set_commit(const commit_cb & commit) override;
+    bool get_can_grow() const override;
+    bool cells_short(uint32_t n_tokens) const override;
+    bool reserve_cells(uint32_t n_tokens) override;
+    bool fit_cells(uint32_t n_tokens) override;
+    uint32_t get_generation() const override;
+
+    // whether every stream holding n cells needs more than it has allocated
+    bool needs_cells(uint32_t n) const;
+    // allocates n cells a stream (rounded up to n_grow, at most get_size_max()); false when there is no memory for them
+    bool grow_cells(uint32_t n);
+    // gives back the cells past the first n (rounded up to n_grow) that hold nothing
+    void trim_cells(uint32_t n);
+
     // state write/load
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
@@ -171,7 +195,9 @@ public:
     // llama_kv_cache specific API
     //
 
+    // the cells each stream has allocated, and the cells it may grow to
     uint32_t get_size()      const;
+    uint32_t get_size_max()  const;
     uint32_t get_n_seq_max() const;
     uint32_t get_n_stream()  const;
 
@@ -271,6 +297,22 @@ private:
     const llama_model & model;
     const llama_hparams & hparams;
 
+    // A K or V tensor in a context and buffer of its own. The tensor holds every cell; in a cache that grows, its
+    // buffer holds memory for the cells allocated, a prefix that grows and shrinks at its end
+    // (ggml_backend_dev_buffer_type_growable), so nothing in it moves.
+    struct kv_store {
+        ggml_backend_buffer_type_t buft = nullptr;
+        ggml_type type = GGML_TYPE_COUNT;
+        int64_t ne0 = 0;
+        std::string name;
+
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+
+        ggml_tensor * t = nullptr;
+        std::vector<ggml_tensor *> streams;
+    };
+
     struct kv_layer {
         // layer index in the model
         // note: can be different from the layer index in the KV cache
@@ -281,6 +323,10 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // the storage of k and v (v's holds no tensor when the layer has none)
+        kv_store k_store;
+        kv_store v_store;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -312,8 +358,27 @@ private:
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
 
-    // ggml contexts for the KV cache along with the allocated backend buffers:
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    // the cells each stream may grow to
+    const uint32_t size_max;
+
+    // the cells allocated at a time; 0: all of them were allocated at once
+    uint32_t n_grow = 0;
+
+    // how many times the cells allocated changed
+    uint32_t generation = 0;
+
+    // the cache allocates its cells as they are used, or would if it were allocated (get_can_grow)
+    bool can_grow = false;
+
+    commit_cb commit;
+
+    // the tensor of `store`, of every cell, in a buffer of its own; false when there is no memory for it
+    bool alloc_tensor(kv_store & store) const;
+    // a growing cache's store holds memory for its first n cells, the ones past n_old zeroed; false when the device
+    // has no room for them
+    bool commit_cells(kv_store & store, uint32_t n_old, uint32_t n) const;
+    // the memory a store holds
+    size_t store_bytes(const kv_store & store) const;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

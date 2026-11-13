@@ -7,6 +7,7 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <sys/mman.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -1319,6 +1320,10 @@ struct ggml_metal_buffer {
     bool is_shared;
     bool owned;
 
+    // a growable buffer (ggml_metal_buffer_init_growable): buffers[0] wraps the first `committed` bytes of all_data
+    bool growable;
+    size_t committed;
+
     // multiple buffers are used only to avoid the maximum buffer size limitation when using mmap
     int n_buffers;
     struct ggml_metal_buffer_wrapper buffers[GGML_METAL_MAX_BUFFERS];
@@ -1596,6 +1601,149 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
     return res;
 }
 
+bool ggml_metal_device_supports_growable(ggml_metal_device_t dev) {
+#if TARGET_OS_OSX
+    return ggml_metal_device_get_props(dev)->use_shared_buffers;
+#else
+    GGML_UNUSED(dev);
+    return false; // the pages given back are replaced through vm_allocate's mappings
+#endif
+}
+
+ggml_metal_buffer_t ggml_metal_buffer_init_growable(ggml_metal_device_t dev, size_t size) {
+#if TARGET_OS_OSX
+    const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(dev);
+    if (!props_dev->use_shared_buffers) {
+        return NULL;
+    }
+
+    const size_t size_page = sysconf(_SC_PAGESIZE);
+
+    ggml_metal_buffer_t res = calloc(1, sizeof(struct ggml_metal_buffer));
+
+    res->dev = dev;
+    res->all_size = MAX(size_page, (size + size_page - 1)/size_page*size_page);
+    // addresses only: a page holds memory once something writes it or a Metal buffer wraps it
+    res->all_data = ggml_metal_host_malloc(res->all_size);
+    if (res->all_data == NULL) {
+        free(res);
+        return NULL;
+    }
+    res->is_shared = true;
+    res->owned = true;
+    res->growable = true;
+    res->committed = 0;
+
+    res->buffers[0].data  = res->all_data;
+    res->buffers[0].size  = 0;
+    res->buffers[0].metal = nil;
+
+    res->use_residency_sets = props_dev->use_residency_sets;
+
+    // nothing is wrapped yet: the residency set starts empty (set_committed adds the wrapper)
+    res->n_buffers = 0;
+    const bool rset_ok = ggml_metal_buffer_rset_init(res);
+    res->n_buffers = 1;
+    if (!rset_ok) {
+        GGML_LOG_ERROR("%s: error: failed to initialize residency set\n", __func__);
+        vm_deallocate((vm_map_t) mach_task_self(), (vm_address_t) res->all_data, res->all_size);
+        free(res);
+        return NULL;
+    }
+
+    ggml_metal_device_rsets_add(dev, res->rset);
+
+    return res;
+#else
+    GGML_UNUSED(dev);
+    GGML_UNUSED(size);
+    return NULL;
+#endif
+}
+
+// a growable buffer's prefix of `target` bytes (in pages) wrapped, the residency set following it, the pages past it
+// given back
+static bool ggml_metal_buffer_wrap_prefix(ggml_metal_buffer_t buf, size_t target) {
+    // Metal makes resident every page a buffer it uses wraps: only the prefix is wrapped
+    id<MTLBuffer> metal = nil;
+    if (target > 0) {
+        metal = [buf->dev->mtl_device newBufferWithBytesNoCopy:buf->all_data
+                                                        length:target
+                                                       options:MTLResourceStorageModeShared
+                                                   deallocator:nil];
+        if (metal == nil) {
+            GGML_LOG_ERROR("%s: error: failed to wrap %.2f MiB\n", __func__, target/1024.0/1024.0);
+            return false;
+        }
+    }
+
+    id<MTLBuffer> old = buf->buffers[0].metal;
+
+#if defined(GGML_METAL_HAS_RESIDENCY_SETS)
+    if (@available(macOS 15.0, iOS 18.0, tvOS 18.0, visionOS 2.0, *)) {
+        if (buf->rset) {
+            if (old) {
+                [buf->rset removeAllocation:old];
+            }
+            if (metal) {
+                [buf->rset addAllocation:metal];
+            }
+            [buf->rset commit];
+            if (metal) {
+                [buf->rset requestResidency];
+            }
+        }
+    }
+#endif
+
+    buf->buffers[0].metal = metal;
+    buf->buffers[0].size  = target;
+    [old release];
+
+    if (target < buf->committed) {
+        // fresh pages past the prefix: the old ones go back, and the addresses read zero again
+        void * at = (char *) buf->all_data + target;
+        if (mmap(at, buf->committed - target, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == MAP_FAILED) {
+            GGML_LOG_ERROR("%s: error: giving back %.2f MiB failed\n", __func__, (buf->committed - target)/1024.0/1024.0);
+        }
+    }
+
+    buf->committed = target;
+
+    return true;
+}
+
+bool ggml_metal_buffer_set_committed(ggml_metal_buffer_t buf, size_t bytes) {
+    if (!buf->growable) {
+        return true;
+    }
+
+    const size_t size_page = sysconf(_SC_PAGESIZE);
+    const size_t target = MIN(buf->all_size, (bytes + size_page - 1)/size_page*size_page);
+    if (target == buf->committed) {
+        return true;
+    }
+    if (target > ggml_metal_device_get_props(buf->dev)->max_buffer_size) {
+        GGML_LOG_ERROR("%s: error: %.2f MiB exceed the device's largest buffer\n", __func__, target/1024.0/1024.0);
+        return false;
+    }
+
+    // the caller's thread may have no autorelease pool
+    bool ok;
+    @autoreleasepool {
+        ok = ggml_metal_buffer_wrap_prefix(buf, target);
+    }
+    return ok;
+}
+
+bool ggml_metal_buffer_is_growable(ggml_metal_buffer_t buf) {
+    return buf->growable;
+}
+
+size_t ggml_metal_buffer_get_committed(ggml_metal_buffer_t buf) {
+    return buf->growable ? buf->committed : buf->all_size;
+}
+
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
     ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
@@ -1746,7 +1894,7 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
 void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
     if (buf->is_shared) {
-        memset(buf->all_data, value, buf->all_size);
+        memset(buf->all_data, value, buf->growable ? buf->committed : buf->all_size);
         return;
     }
 
@@ -1773,12 +1921,14 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
 
     const int64_t tsize = ggml_nbytes(t);
 
-    // find the view that contains the tensor fully
+    // find the view that contains the tensor fully (a growable buffer's tensors hold more than its prefix: what a
+    // kernel reads or writes of them lies in it)
     for (int i = 0; i < buf->n_buffers; ++i) {
         const int64_t ioffs = (int64_t) t->data - (int64_t) buf->buffers[i].data;
 
         //GGML_LOG_INFO("ioffs = %10ld, tsize = %10ld, sum = %10ld, buf->buffers[%d].size = %10ld\n", ioffs, tsize, ioffs + tsize, i, buf->buffers[i].size);
-        if (ioffs >= 0 && ioffs + tsize <= (int64_t) buf->buffers[i].size) {
+        if (ioffs >= 0 && (ioffs + tsize <= (int64_t) buf->buffers[i].size ||
+                (buf->growable && ioffs < (int64_t) buf->buffers[i].size))) {
             res.metal = buf->buffers[i].metal;
             res.offs  = (size_t) ioffs;
 

@@ -6,11 +6,13 @@
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
+#include "llama-ssd.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -62,7 +64,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -76,10 +78,9 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_ctx = 128) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
-    const uint32_t n_ctx = 128;
 
     uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
@@ -675,6 +676,183 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     return all_ok ? 0 : 1;
 }
 
+// decodes tokens [p0, p1) of sequence 0 in batches of n_batch, the last token's logits returned
+static std::vector<float> decode_range(llama_context * lctx, const std::vector<llama_token> & tokens, uint32_t p0, uint32_t p1) {
+    const uint32_t n_batch = llama_n_batch(lctx);
+    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    std::vector<float> ret;
+    for (uint32_t p = p0; p < p1; p += n_batch) {
+        const uint32_t n = std::min(n_batch, p1 - p);
+        batch.n_tokens = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            common_batch_add(batch, tokens[p + i], p + i, {0}, i == n - 1);
+        }
+        if (llama_decode(lctx, batch)) {
+            llama_batch_free(batch);
+            throw std::runtime_error("failed to decode batch");
+        }
+    }
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(lctx)));
+    const float * logits = llama_get_logits_ith(lctx, -1);
+    ret.assign(logits, logits + n_vocab);
+    llama_batch_free(batch);
+    return ret;
+}
+
+static std::vector<uint8_t> seq_state(llama_context * lctx) {
+    std::vector<uint8_t> ret(llama_state_seq_get_size(lctx, 0));
+    if (llama_state_seq_get_data(lctx, ret.data(), ret.size(), 0) != ret.size()) {
+        throw std::runtime_error("failed to save the sequence state");
+    }
+    return ret;
+}
+
+// A KV cache allocates its cells as they are used, 8192 at a time (llama_kv_cache::n_grow_default). A context that
+// grows its cache past them while decoding gives the logits of one whose cache holds every cell from the start (two
+// sequences in streams of their own); the cells it held keep what they held as it grows; and a sequence's state
+// restored into a fresh context, which grows its cache to take it, gives the logits it gives restored into a full one.
+static int test_kv_grow(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
+    struct user_data_t {
+        ggml_log_callback callback;
+        void * user_data;
+        ggml_log_level min_level;
+        int grows = 0; // the cache's growths and trims it logged (llama_kv_cache::grow_cells, trim_cells)
+        int trims = 0;
+    };
+    user_data_t ud;
+    llama_log_get(&ud.callback, &ud.user_data);
+    ud.min_level = log_level;
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        user_data_t * ud = (user_data_t *) user_data;
+        ud->grows += strncmp(text, "grow_cells:", 11) == 0;
+        ud->trims += strncmp(text, "trim_cells:", 11) == 0;
+        ud->callback(level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG, text, ud->user_data);
+    }, &ud);
+
+    const uint32_t n_ctx = 16384;
+    const uint32_t n0    = 8000; // fits the first 8192 cells
+    const uint32_t n1    = 9000; // does not
+
+    // the CPU, and every GPU with the model and its cache on it
+    std::vector<ggml_backend_dev_t> devices = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) };
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            devices.push_back(dev);
+        }
+    }
+
+    int failures = 0;
+    for (ggml_backend_dev_t device : devices)
+    for (const llm_arch arch : { LLM_ARCH_LLAMA, LLM_ARCH_QWEN35MOE, LLM_ARCH_DEEPSEEK41 }) {
+        if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
+            continue;
+        }
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe_mandatory(arch), n_ctx);
+
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        std::vector<ggml_backend_dev_t> devs = { device, nullptr };
+        model_params.devices = devs.data();
+        size_t tmp = seed;
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+        if (!model) {
+            throw std::runtime_error("failed to create llama model");
+        }
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> tokens = get_tokens(n1 + 1, n_vocab, seed);
+
+        const auto make_ctx = [&](uint32_t n_seq_max) {
+            llama_context_params ctx_params = llama_context_default_params();
+            ctx_params.n_ctx           = n_ctx*n_seq_max;
+            ctx_params.n_batch         = 1000;
+            ctx_params.n_ubatch        = 250;
+            ctx_params.n_seq_max       = n_seq_max;
+            ctx_params.kv_unified      = false;
+            ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            ctx_params.n_threads       = 4;
+            ctx_params.n_threads_batch = 4;
+            llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+            if (!lctx) {
+                throw std::runtime_error("failed to create llama context");
+            }
+            return lctx;
+        };
+
+        const std::string label = std::string(llm_arch_name(arch)) + " on " + ggml_backend_dev_name(device);
+        const char * name = label.c_str();
+        bool ok = true;
+
+        // grows from 8192 cells to 16384 between n0 and n1, in place; a device without growable buffers (the CPU on
+        // Windows) allocates every cell at once
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        auto * growable_buft = (ggml_backend_buffer_type_t (*)(ggml_backend_dev_t))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_buffer_type_growable");
+        const bool grows = growable_buft && growable_buft(device);
+        llama_context_ptr grown = make_ctx(1);
+        decode_range(grown.get(), tokens, 0, n0);
+        const std::vector<uint8_t> state_n0 = seq_state(grown.get());
+        ud.grows = 0;
+        decode_range(grown.get(), tokens, n0, n1);
+        LOG_INF("%s: %s: grew: %s (%s)\n", __func__, name, ud.grows > 0 ? "yes" : "no", grows ? "growable" : "not growable");
+        ok = ok && (ud.grows > 0) == grows;
+        const std::vector<uint8_t> state_n1 = seq_state(grown.get());
+        const std::vector<float> logits_grown = decode_range(grown.get(), tokens, n1, n1 + 1);
+
+        // every cell from the start: a sequence in a stream of its own
+        llama_context_ptr full = make_ctx(2);
+        decode_range(full.get(), tokens, 0, n1);
+        const std::vector<uint8_t> state_full = seq_state(full.get());
+        const std::vector<float> logits_full = decode_range(full.get(), tokens, n1, n1 + 1);
+        LOG_INF("%s: %s: grown vs full cache: %s (nmse %.3g)\n", __func__, name,
+                logits_grown == logits_full ? "identical" : "DIFFERENT", nmse(logits_grown, logits_full));
+        ok = ok && logits_grown == logits_full;
+
+        // the sequence's state restored into a cache of 8192 cells, and the full cache's into one like it (a restored
+        // DeepSeek-V4.1 sequence does not give the logits of the one saved, so the two restores compare)
+        std::vector<float> logits_restored[2];
+        for (uint32_t i = 0; i < 2; i++) {
+            llama_context_ptr restored = make_ctx(i + 1);
+            const std::vector<uint8_t> & state = i == 0 ? state_n1 : state_full;
+            if (llama_state_seq_set_data(restored.get(), state.data(), state.size(), 0) != state.size()) {
+                throw std::runtime_error("failed to restore the sequence state");
+            }
+            logits_restored[i] = decode_range(restored.get(), tokens, n1, n1 + 1);
+        }
+        LOG_INF("%s: %s: restored into a grown vs a full cache: %s (nmse %.3g)\n", __func__, name,
+                logits_restored[0] == logits_restored[1] ? "identical" : "DIFFERENT",
+                nmse(logits_restored[0], logits_restored[1]));
+        ok = ok && logits_restored[0] == logits_restored[1];
+
+        // the first n0 cells after the growth, where the cache can drop the later ones; then a request of one token
+        // gives back the cells past 8192, and the cache decodes as one that never grew
+        if (llama_memory_seq_rm(llama_get_memory(grown.get()), 0, n0, -1)) {
+            const bool same = seq_state(grown.get()) == state_n0;
+            LOG_INF("%s: %s: first %u cells after growth: %s\n", __func__, name, n0, same ? "identical" : "DIFFERENT");
+            ok = ok && same;
+
+            ud.trims = 0;
+            if (!llama_ssd_prefill_phase(grown.get(), true, n0 + 1, 1)) {
+                throw std::runtime_error("failed to begin a request");
+            }
+            LOG_INF("%s: %s: trimmed: %s\n", __func__, name, ud.trims > 0 ? "yes" : "no");
+            ok = ok && (ud.trims > 0) == grows;
+            const std::vector<float> logits_trimmed = decode_range(grown.get(), tokens, n0, n0 + 1);
+            llama_context_ptr small = make_ctx(1);
+            decode_range(small.get(), tokens, 0, n0);
+            const bool same_trimmed = logits_trimmed == decode_range(small.get(), tokens, n0, n0 + 1);
+            LOG_INF("%s: %s: trimmed vs never grown: %s\n", __func__, name, same_trimmed ? "identical" : "DIFFERENT");
+            ok = ok && same_trimmed;
+        }
+
+        printf("%s: %s: %s\n", __func__, name, ok ? "OK" : "FAIL");
+        failures += ok ? 0 : 1;
+    }
+
+    llama_log_set(ud.callback, ud.user_data);
+    return failures == 0 ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
     common_init();
@@ -684,8 +862,13 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool kv_grow = false;
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--kv-grow") == 0) {
+            kv_grow = true;
+            continue;
+        }
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -725,6 +908,9 @@ int main(int argc, char ** argv) {
     try {
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
+        }
+        if (kv_grow) {
+            return test_kv_grow(arch, seed, log_level);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {
