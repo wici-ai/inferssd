@@ -49,7 +49,8 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
         parser.add_argument(
             "--context",
             type=int,
-            help="context in tokens (default: 65536, within the model's trained context)",
+            help="context in tokens (default: the largest multiple of 8192, up to the model's "
+            "trained context, that memory holds when full)",
         )
         parser.add_argument(
             "--settings", type=Path, help="typed settings file (see docs/configuration.md)"

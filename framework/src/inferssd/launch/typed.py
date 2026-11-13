@@ -96,11 +96,15 @@ def connect_host(host: str) -> str:
     return LOOPBACK if host == "0.0.0.0" else host
 
 
-# The default context: room for a coding agent's instructions and tools and a task's files.
-# The engine keeps it within the model's trained context. A RAM-only model takes the largest
-# multiple of CONTEXT_STEP up to it that fits memory.
+# A context left unset: with SSD experts, 0, which the engine resolves to the largest multiple of
+# 8192 up to the model's trained context whose KV cache fits memory when full (it holds memory
+# only for the cells in use). A RAM-only model takes the largest multiple of CONTEXT_STEP up to
+# CONTEXT that fits memory.
+AUTO_CONTEXT = 0
 CONTEXT = 65536
 CONTEXT_STEP = 8192
+# One pass a prompt with the context unset: a batch the engine bounds by the context it chose.
+ONE_PASS_BATCH = 1 << 20
 BATCH = 512
 # The disk prompt cache's size limit per model.
 PROMPT_CACHE_MIB = 16384
@@ -611,9 +615,9 @@ def _resolve(
     if planned is not None:
         receipt = json.dumps(planned.receipt, ensure_ascii=False, indent=2) + "\n"
         s.ask("write_exclusive", os_path.join(directory, "strategy.json"), receipt)
-    context = spec.context or CONTEXT
+    context = spec.context or (CONTEXT if ordinary else AUTO_CONTEXT)
     one_pass = planned is not None and planned.one_pass
-    batch = spec.batch or (context if one_pass else BATCH)
+    batch = spec.batch or ((context or ONE_PASS_BATCH) if one_pass else BATCH)
     ubatch = spec.ubatch or (batch if one_pass else BATCH)
     if planned is not None and one_pass:
         given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
