@@ -557,6 +557,19 @@ def test_cache_directory_follows_the_platform(tmp_path):
     assert str(cache_directory({"LOCALAPPDATA": "C:\\L"}, tmp_path, "windows")).startswith("C:")
 
 
+@pytest.mark.parametrize("value", ["", "relative/cache", ".", "../cache"])
+def test_linux_cache_ignores_relative_xdg_paths(tmp_path, monkeypatch, value):
+    home = tmp_path / "home"
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    for working_directory in (first, second):
+        monkeypatch.chdir(working_directory)
+        root = cache_directory({"XDG_CACHE_HOME": value}, home, "linux")
+        assert root == home / ".cache/inferssd"
+        assert root.is_absolute()
+
+
 def test_data_directory_follows_the_platform(tmp_path):
     assert data_directory({"LOCALAPPDATA": "C:\\L"}, tmp_path, "windows").name == "inferssd"
     assert str(data_directory({"LOCALAPPDATA": "C:\\L"}, tmp_path, "windows")).startswith("C:")
