@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from inferssd.configuration import parse, render, schema
+from inferssd.launch.typed import materialized_settings
 from inferssd.telemetry.jsonl import effective_settings, read_events
 
 
@@ -99,6 +100,44 @@ def test_cpp_python_snapshot_exact(native_contract, tmp_path, platform, text):
         )
     )
     assert round_trip["values"] == actual["values"]
+
+
+@pytest.mark.parametrize("render_settings", [render, materialized_settings])
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "plain.ssd",
+        "unicode-\u00e9.ssd",
+        r"literal\n.ssd",
+        "line\nname.ssd",
+        "line\rname.ssd",
+        "line\r\nname.ssd",
+    ],
+)
+def test_settings_provenance_stays_in_its_comment(
+    native_contract, tmp_path, filename, render_settings
+):
+    source = tmp_path / filename
+    source.write_text("inferssd-settings 1\nprefetch.depth=4\n", encoding="utf-8")
+    original = parse(source.read_text(encoding="utf-8"), str(source))
+    original_native = json.loads(
+        subprocess.check_output([str(native_contract), "--parse", str(source), "linux"], text=True)
+    )
+    assert original_native == original.document()
+
+    rendered = tmp_path / "generated.ssd"
+    content = render_settings(original)
+    rendered.write_text(content, encoding="utf-8")
+    # Read through the same universal-newline boundary as the launcher.
+    parsed = parse(rendered.read_text(encoding="utf-8"), str(rendered))
+    assert parsed.document()["values"] == original.document()["values"]
+    native = json.loads(
+        subprocess.check_output(
+            [str(native_contract), "--parse", str(rendered), "linux"], text=True
+        )
+    )
+    assert native == parsed.document()
+    assert render_settings(parsed) == content
 
 
 @pytest.mark.parametrize(
