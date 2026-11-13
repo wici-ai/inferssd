@@ -37,6 +37,8 @@ class Estimate:
     components: dict[str, float] = field(default_factory=dict)
     scenario_details: tuple[dict[str, object], ...] = ()
     scenario_range: Optional[tuple[float, float]] = None
+    reference_scenario: str = "uniform_serial"
+    reference_model: Optional[dict[str, object]] = None
 
 
 @dataclass(frozen=True)
