@@ -5,6 +5,7 @@
 
 namespace ssd { namespace store {
 // Borrow the immutable index and its descriptors until all readers have joined.
+// Readers must not close the descriptors or change their file status flags.
 // The executor keeps its existing physical alignment and owns no source FD.
 struct source_view {
     void * userdata = nullptr;

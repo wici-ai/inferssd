@@ -44,6 +44,9 @@ result<std::unique_ptr<source_index>> source_index::open(const std::vector<std::
             const auto identity = index->source_identity_for_test(i);
             platform::file_identity direct;
             const int fd = index->borrowed_direct_fd(int(i));
+            if (!platform::is_direct(fd)) {
+                return {nullptr, status::io, "expert source descriptor is not direct"};
+            }
             if (fd < 0 || !platform::identity(fd, direct) || identity.device != direct.device ||
                 identity.inode != direct.id_lo || identity.inode_hi != direct.id_hi || identity.size != direct.size) {
                 return {nullptr, status::io, "direct expert source identity differs from metadata handle"};
@@ -80,7 +83,8 @@ source_view source_index::view() noexcept {
         c0::extent extent;
         if (!index.locate(name, expert, bytes, extent, false)) { return false; }
         const int direct = index.borrowed_direct_fd(extent.source_id);
-        if (!platform::is_direct(direct)) { return false; }
+        // Owned immutable descriptors were checked before publishing the index.
+        if (direct < 0) { return false; }
         *fd = direct; *offset = extent.offset; *logical_bytes = extent.logical_bytes;
         return true;
     }, [](void * opaque, const char * name, size_t bytes, size_t * block_bytes) noexcept -> size_t {
