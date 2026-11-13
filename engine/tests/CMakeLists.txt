@@ -662,7 +662,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(ssd/test-server-prompt-cache.cpp)
     target_include_directories(test-server-prompt-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-prompt-cache PRIVATE server-context)
+    llama_build_and_test(ssd/test-server-prompt-fingerprint.cpp)
+    target_include_directories(test-server-prompt-fingerprint PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-prompt-fingerprint PRIVATE server-context)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET ggml-cpu)
+        # Small fully resident CPU model; position compatibility, not resource admission.
+        add_executable(test-server-prompt-fingerprint-native ssd/test-server-prompt-fingerprint-native.cpp)
+        target_include_directories(test-server-prompt-fingerprint-native PRIVATE ../tools/server ../tools/mtmd)
+        target_link_libraries(test-server-prompt-fingerprint-native PRIVATE server-context)
+        target_compile_features(test-server-prompt-fingerprint-native PRIVATE cxx_std_17)
         # Requires an explicit tiny GGUF/alias and the admitted 8GiB/noSwap scope;
         # deliberately not an asset-free CTest entry.
         add_executable(test-server-prompt-cache-native ssd/test-server-prompt-cache-native.cpp)

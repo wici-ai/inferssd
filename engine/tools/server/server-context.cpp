@@ -6,6 +6,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-ssd-reservation.h"
+#include "inferssd/prompt-fingerprint.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -873,7 +874,7 @@ private:
         return true;
     }
 
-    // What a cached state on disk depends on besides its tokens: the model file and the build that computed it.
+    // A cached state also depends on the position settings that computed its K/V values.
     std::string prompt_cache_fingerprint() const {
         std::string fp = std::string(llama_build_info()) + "|" + params_base.model.path;
         std::error_code ec;
@@ -882,7 +883,8 @@ private:
         fp += "|" + std::to_string(ec ? 0 : size) + "|" + std::to_string(ec ? 0 : (long long) mtime.time_since_epoch().count());
         char desc[256];
         llama_model_desc(model, desc, sizeof(desc));
-        return fp + "|" + desc;
+        return fp + "|" + desc + "|" +
+            server_prompt_cache_position_key(params_base, llama_n_ctx(ctx), llama_n_ctx_seq(ctx));
     }
 
     void slot_save_and_clear(server_slot & slot) {
