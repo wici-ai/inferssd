@@ -350,6 +350,14 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
             ../ggml/src/ggml-cuda/ssd ../vendor)
         target_link_libraries(test-ssd-vram-group PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-ssd-vram-group kimi-vram-tier)
+        # Linux shared-library interposition keeps the cuBLAS failure fixture local to this executable.
+        # Like the other CUDA fixtures, run explicitly on an owned GPU, not in hosted CPU ctest.
+        if (BUILD_SHARED_LIBS)
+            add_executable(test-ssd-cublas-retry ssd/test-ssd-cublas-retry.cpp)
+            target_compile_features(test-ssd-cublas-retry PRIVATE cxx_std_17)
+            target_include_directories(test-ssd-cublas-retry PRIVATE ../ggml/include)
+            target_link_libraries(test-ssd-cublas-retry PRIVATE ggml-cuda CUDA::cudart CUDA::cublas)
+        endif()
         # The error fixture explicitly injects callbacks around the real linked component.
         target_link_libraries(test-ssd-vram-elastic PRIVATE ggml-cuda)
         target_link_libraries(test-ssd-vram-reclaim PRIVATE ggml-cuda)

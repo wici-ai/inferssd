@@ -1419,6 +1419,9 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// cuBLAS allocates internally, outside ggml_cuda_malloc_reclaiming.
+cublasStatus_t ggml_cuda_cublas_create_reclaiming(cublasHandle_t * handle, int device);
+
 struct ggml_backend_cuda_context {
     // Borrowed from the owning llama context; outlives this backend.
     const ssd::runtime_services * ssd_services = nullptr;
@@ -1591,7 +1594,7 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handle(int device) {
         if (cublas_handles[device] == nullptr) {
             ggml_cuda_set_device(device);
-            CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
+            CUBLAS_CHECK(ggml_cuda_cublas_create_reclaiming(&cublas_handles[device], device));
             CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
         }
         return cublas_handles[device];

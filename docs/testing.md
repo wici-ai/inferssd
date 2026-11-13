@@ -59,6 +59,22 @@ Together with loaded-library hashes and direct-file descriptor identity, this
 records which provider populated the single owner. It is not a replacement for
 the finite-RAM same-sink numerical comparison or normal reader-shutdown checks.
 
+## CUDA handle allocation recovery
+
+On Linux shared CUDA builds, `test-ssd-cublas-retry` links the backend's real
+cuBLAS creation/reclaim helper and interposes `cublasCreate_v2` only inside the
+test executable. Eight deterministic cases cover success, repeated allocation
+failure followed by recovery, absent/busy/deferred reclaimers, zero progress,
+callback failure and non-allocation errors. Failed creates never publish a handle.
+The fixture does not exhaust device memory; it still selects a CUDA device, so
+run it explicitly on an owned GPU alongside `test-ssd-vram-group` and
+`test-ssd-vram-elastic`:
+
+```sh
+cmake --build build-linux-cuda --target test-ssd-cublas-retry
+build-linux-cuda/bin/test-ssd-cublas-retry
+```
+
 ## Device failures
 
 Device failures are not allowlisted. Record each one with its full test name,

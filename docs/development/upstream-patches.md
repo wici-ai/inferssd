@@ -18,6 +18,12 @@ preserves its source attribution and license files.
 | Common/server | CLI dispatch, rendering/parser hooks, prompt-cache/checkpoint and lifecycle calls. Owned implementations reside in `common/inferssd` and `tools/server/inferssd`. |
 | State serialization | Virtual/C API entry points call positional/range codecs under `src/inferssd`. |
 
+CUDA handle creation retries `CUBLAS_STATUS_ALLOC_FAILED` only after the existing
+phase-scoped reclaimer has freed device memory. The helper does not own a failed
+handle, publishes a handle only on success, and uses the existing callback's
+quiescence and lifetime rules. It changes neither the cache budget nor the reserve;
+other errors and recovery without progress still return to the caller's error path.
+
 The inventory below lists every upstream file that differs from the snapshot.
 It includes model and operator additions as well as integration hooks; review
 those two kinds of change separately when assessing patch growth.
@@ -90,13 +96,13 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-cuda/argsort.cu` | 93 | 71 |
 | `ggml/src/ggml-cuda/argsort.cuh` | 6 | 0 |
 | `ggml/src/ggml-cuda/binbcast.cu` | 12 | 2 |
-| `ggml/src/ggml-cuda/common.cuh` | 163 | 8 |
+| `ggml/src/ggml-cuda/common.cuh` | 167 | 9 |
 | `ggml/src/ggml-cuda/concat.cu` | 69 | 46 |
 | `ggml/src/ggml-cuda/cpy.cu` | 1 | 1 |
 | `ggml/src/ggml-cuda/fattn-common.cuh` | 35 | 7 |
 | `ggml/src/ggml-cuda/fattn.cu` | 10 | 0 |
 | `ggml/src/ggml-cuda/fattn.cuh` | 3 | 0 |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1519 | 131 |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1554 | 131 |
 | `ggml/src/ggml-cuda/mmq.cu` | 54 | 3 |
 | `ggml/src/ggml-cuda/mmq.cuh` | 28 | 10 |
 | `ggml/src/ggml-cuda/mmvf.cu` | 22 | 0 |
@@ -121,7 +127,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-metal/ggml-metal-impl.h` | 47 | 0 |
 | `ggml/src/ggml-metal/ggml-metal-ops.cpp` | 136 | 0 |
 | `ggml/src/ggml-metal/ggml-metal-ops.h` | 3 | 0 |
-| `ggml/src/ggml-metal/ggml-metal.cpp` | 5 | 0 |
+| `ggml/src/ggml-metal/ggml-metal.cpp` | 15 | 0 |
 | `ggml/src/ggml-metal/ggml-metal.metal` | 133 | 0 |
 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | 1 | 0 |
 | `ggml/src/ggml-openvino/ggml-openvino.cpp` | 1 | 0 |
@@ -142,12 +148,12 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/CMakeLists.txt` | 20 | 0 |
 | `src/llama-arch.cpp` | 168 | 2 |
 | `src/llama-arch.h` | 109 | 2 |
-| `src/llama-context.cpp` | 1216 | 46 |
-| `src/llama-context.h` | 104 | 2 |
+| `src/llama-context.cpp` | 1447 | 194 |
+| `src/llama-context.h` | 120 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
-| `src/llama-graph.cpp` | 747 | 50 |
-| `src/llama-graph.h` | 161 | 5 |
+| `src/llama-graph.cpp` | 765 | 50 |
+| `src/llama-graph.h` | 170 | 5 |
 | `src/llama-hparams.cpp` | 21 | 0 |
 | `src/llama-hparams.h` | 73 | 1 |
 | `src/llama-impl.h` | 35 | 0 |
@@ -159,12 +165,12 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-memory-recurrent.cpp` | 41 | 1 |
 | `src/llama-memory-recurrent.h` | 2 | 0 |
 | `src/llama-memory.h` | 70 | 0 |
-| `src/llama-mmap.cpp` | 206 | 10 |
-| `src/llama-mmap.h` | 13 | 0 |
+| `src/llama-mmap.cpp` | 299 | 10 |
+| `src/llama-mmap.h` | 16 | 0 |
 | `src/llama-model-loader.cpp` | 165 | 11 |
-| `src/llama-model-loader.h` | 40 | 0 |
+| `src/llama-model-loader.h` | 41 | 0 |
 | `src/llama-model-saver.cpp` | 9 | 2 |
-| `src/llama-model.cpp` | 1084 | 39 |
+| `src/llama-model.cpp` | 1090 | 39 |
 | `src/llama-model.h` | 107 | 0 |
 | `src/llama-quant.cpp` | 22 | 1 |
 | `src/llama-sampler.cpp` | 1 | 0 |
@@ -181,12 +187,12 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server-chat.cpp` | 66 | 16 |
 | `tools/server/server-common.cpp` | 354 | 16 |
 | `tools/server/server-common.h` | 27 | 2 |
-| `tools/server/server-context.cpp` | 798 | 148 |
+| `tools/server/server-context.cpp` | 826 | 169 |
 | `tools/server/server-context.h` | 7 | 1 |
 | `tools/server/server-task.cpp` | 195 | 183 |
 | `tools/server/server-task.h` | 28 | 80 |
 | `tools/server/server.cpp` | 1 | 0 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 17867 added, 5678 removed across 156 upstream paths.
+Total: 18321 added, 5848 removed across 156 upstream paths.
 <!-- END UPSTREAM INVENTORY -->

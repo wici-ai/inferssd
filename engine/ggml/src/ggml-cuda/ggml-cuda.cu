@@ -1175,6 +1175,41 @@ static int ggml_cuda_oom_reclaimer_invoke(int device, size_t requested_bytes, si
     return result;
 }
 
+// cuBLAS's handle creation owns opaque device allocations, so those allocations cannot
+// use our cudaMalloc wrapper. Retry allocation failures only, after the existing
+// phase-scoped reclaimer has actually returned memory. No estimate or fixed reserve
+// is needed; a busy/disarmed tier, no progress, and other errors still fail normally.
+cublasStatus_t ggml_cuda_cublas_create_reclaiming(cublasHandle_t * handle, int device) {
+    ggml_cuda_set_device(device);
+    *handle = nullptr;
+    uint64_t retries = 0;
+    for (;;) {
+        cublasHandle_t candidate = nullptr;
+        const cublasStatus_t status = cublasCreate(&candidate);
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            *handle = candidate;
+            return status;
+        }
+        if (status != CUBLAS_STATUS_ALLOC_FAILED) {
+            return status;
+        }
+        // A failed create does not return a valid handle to destroy. Do not publish
+        // it, and clear the failed CUDA allocation before the callback calls cudaFree.
+        (void) cudaGetLastError();
+        size_t freed = 0;
+        // cuBLAS does not expose the failed allocation's size; 0 means unknown.
+        const int reclaimed = ggml_cuda_oom_reclaimer_invoke(device, 0, &freed);
+        if (reclaimed <= 0 || freed == 0) {
+            if (reclaimed < 0) {
+                GGML_LOG_ERROR("%s: device %d OOM reclaimer failed closed\n", __func__, device);
+            }
+            return status;
+        }
+        GGML_LOG_WARN("%s: device %d cuBLAS allocation failed; reclaimer freed %.2f MiB, retry=%" PRIu64 "\n",
+                      __func__, device, freed / 1024.0 / 1024.0, ++retries);
+    }
+}
+
 static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_buffer_type_context * ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
