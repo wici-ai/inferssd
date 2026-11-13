@@ -82,12 +82,14 @@ prediction was right so far) and that neither the GPU tier nor the RAM cache hol
 are read into that layer's RAM cache slots, most likely first (a free slot first,
 else the layer's coldest entry of an expert the pass is less likely to use than
 even odds), and the next layer takes them as RAM hits instead of reading them. The read-ahead holds no memory of its
-own: what it read stays cached. It reads as many experts as the drive reads in the
-measured gap at its calibrated rate. When the layer's own RAM cache slots are all
-taken, it borrows slots of the layers the pass has already computed, an empty one
-first, else the coldest: those layers take no slot again in the pass, and a
+own: what it read stays cached. It plans every likely expert and reads them until
+the next layer's call starts; a slot's entry goes only once a read into it is
+issued. When the layer's own RAM cache slots are all taken, it borrows slots of the
+other layers, except the one the pass is computing: an empty slot first, then the
+RAM copy of an expert the GPU tier also holds, then the coldest entry of a layer the
+pass has computed, and last the coldest entry of a layer it has yet to reach. A
 borrowed slot serves that one layer's read and comes back empty, so a pass cycles a
-few slots instead of emptying the earlier layers. It needs a RAM cache that a prompt
+few slots instead of emptying other layers. It needs a RAM cache that a prompt
 pass reads. `0` turns this off, for
 A/B timing.
 

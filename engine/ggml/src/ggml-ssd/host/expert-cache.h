@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <numeric>
+#include <tuple>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -127,7 +128,7 @@ struct expert_cache {
         bool valid = false, reserved = false, resident = false, enabled = false, was_released = false, protected_now = false;
         bool prefetched = false; // read ahead by the next-layer prefetch and not requested yet
         bool inflight = false;   // a prefetch read writes into the slot; nothing else may take it
-        bool lent = false;       // a prefill read-ahead borrowed it for a later layer (prefetch_borrow)
+        bool lent = false;       // a prefill read-ahead borrowed it for another layer (prefetch_borrow)
         uint32_t leases = 0;
         uint64_t generation = 0; // cache generation at a prefetch reservation
     };
@@ -579,7 +580,7 @@ struct expert_cache {
             for (size_t offset = 0; offset < count; ++offset) { give_back(candidates[offset]); }
         }
         // For room (a guard's reclaim): what a layer could not give, its slots past its share busy (a run's leases, a
-        // read-ahead's reads into the slots of finished layers), the coldest idle slots of the others give, so that
+        // read-ahead's reads into the slots other layers lent it), the coldest idle slots of the others give, so that
         // the shrink stops short only where every slot is busy. A request's prefill takes room as it goes, and a
         // shrink that stopped short would leave its guard to drop the whole cache. enable_to evens the layers again.
         size_t left = enabled_slots();
@@ -1283,32 +1284,56 @@ struct expert_cache {
         if (prior.valid && e.enabled && e.resident) { e.valid = true; stats.valid_bytes += stride; }
         else if (prior.valid) { evicted(prior.prefetched); e.id = -1; e.prefetched = false; }
     }
-    // A prefill read-ahead for `layer_id` that found no slot of its own (prefetch_reserve): a slot of a layer whose
-    // call this pass has finished (an id below `finished_below`), an empty one first, else the coldest of them, as
-    // prefetch_reserve takes one. Such a layer takes none of its slots again in this pass, and decode is what its
-    // entries are kept for: the slot serves the borrower's prefill read once, then comes back empty
-    // (return_borrowed), so that a pass's read-ahead cycles a few slots rather than empty the earlier layers. -1: none.
-    int prefetch_borrow(int32_t layer_id, int32_t expert, const kimi_cpu_sink_source * roles, int32_t finished_below,
-            prefetch_prior * prior = nullptr) {
-        if (!prefill_read || paused || !stats.budget_bytes || !arena || !stride) { return -1; }
-        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
-        if (found == layers.end()) { return -1; }
-        for (int role = 0; role < 3; ++role) { if (roles[role].nbytes > role_bytes[role]) { return -1; } }
-        int victim = -1, victim_rank = 3; // an empty slot, else a backup, else the coldest
+    static bool lendable_now(const entry & e) {
+        return e.enabled && e.resident && !e.reserved && !e.inflight && !e.leases && !e.protected_now && !e.lent;
+    }
+    // The slots a prefill read-ahead for `layer_id`, planned in the call for `calling`, may borrow once the layer has
+    // no slot of its own left (prefetch_reserve), in the order its plan takes them (prefetch_borrow): idle slots of any
+    // layer but these two, the calling one's entries being what its call is about to read. A borrowed slot serves the
+    // borrower's prefill read once, then comes back empty (return_borrowed) for the next plan to borrow again, so that
+    // a pass's read-ahead cycles one pool of slots, as large at the pass's first layers as at its last. The order costs
+    // the pass the least first: empty slots, then backups, then the coldest entries of the layers this pass finished
+    // (ones a later pass or decode may read), then the coldest of the layers it has yet to reach (ones this pass may
+    // read). Ranked once a plan: while a plan is made nothing else takes a slot, and its own layer's are not here.
+    std::vector<size_t> lendable(int32_t layer_id, int32_t calling) {
+        std::vector<size_t> order;
+        if (!prefill_read || paused || !stats.budget_bytes || !arena || !stride) { return order; }
+        struct candidate {
+            int rank;
+            std::pair<uint64_t, double> score; // as colder() compares two entries
+            uint64_t touch;
+            size_t index;
+        };
+        std::vector<candidate> candidates;
         for (const auto & l : layers) {
-            if (l.id >= finished_below || l.id == layer_id) { continue; }
+            if (l.id == calling || l.id == layer_id) { continue; }
             find_backups(l, size_t(&l - layers.data()));
             for (size_t i = l.begin; i < l.begin + l.count; ++i) {
                 const auto & e = entries[i];
-                if (!e.enabled || !e.resident || e.reserved || e.inflight || e.leases || e.protected_now || e.lent) { continue; }
-                const int rank = !e.valid ? 0 : backup_slots[i - l.begin] ? 1 : 2;
-                if (victim < 0 || rank < victim_rank || (rank == victim_rank && rank > 0 && colder(i, size_t(victim)))) {
-                    victim = int(i); victim_rank = rank;
-                }
+                if (!lendable_now(e)) { continue; }
+                const int rank = !e.valid ? 0 : backup_slots[i - l.begin] ? 1 : l.id < calling ? 2 : 3;
+                const auto cold = rank && policy != lru ? score(e.layer_index, e.id) : std::pair<uint64_t, double>{};
+                candidates.push_back({ rank, cold, rank ? e.last_touch : 0, i });
             }
         }
-        if (victim < 0) { return -1; }
-        auto & e = entries[size_t(victim)];
+        std::sort(candidates.begin(), candidates.end(), [](const candidate & a, const candidate & b) {
+            return std::tie(a.rank, a.score, a.touch, a.index) < std::tie(b.rank, b.score, b.touch, b.index);
+        });
+        order.reserve(candidates.size());
+        for (const auto & c : candidates) { order.push_back(c.index); }
+        return order;
+    }
+    // Slot `index`, one lendable named, lent to a prefill read-ahead for `layer_id`; -1 when it is not idle any more.
+    int prefetch_borrow(size_t index, int32_t layer_id, int32_t expert, const kimi_cpu_sink_source * roles,
+            prefetch_prior * prior = nullptr) {
+        if (!prefill_read || paused || !stats.budget_bytes || !arena || !stride || index >= entries.size()) {
+            return -1;
+        }
+        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
+        if (found == layers.end() || !lendable_now(entries[index])) { return -1; }
+        for (int role = 0; role < 3; ++role) { if (roles[role].nbytes > role_bytes[role]) { return -1; } }
+        const int victim = int(index);
+        auto & e = entries[index];
         take_victim(e, prior);
         e.id = expert; e.layer_index = size_t(found - layers.begin()); e.inflight = true; e.prefetched = false;
         e.lent = true; e.generation = generation; e.last_touch = ++clock;

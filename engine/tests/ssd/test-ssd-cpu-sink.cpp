@@ -4097,10 +4097,11 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
         predicted = nullptr;
     }
     {
-        // Three layers of 4 slots each, every expert of a layer used in a pass. Layer 2's read-ahead has only its own
-        // slots (no layer before 1 to lend); layer 3's, planned in layer 2's call, also borrows layer 1's, and
-        // serves the same outputs. The call after it takes the borrowed slots back, and so does a decode begin. The
-        // checked pass leaves each read-ahead a gap to read in, as the GPU's work between two layers does.
+        // Three layers of 4 slots each, every expert of a layer used in a pass. Layer 2's read-ahead, planned in layer
+        // 1's call, has no finished layer to borrow from and borrows layer 3's slots, which the pass has yet to reach;
+        // layer 3's, planned in layer 2's call, finds its own slots lent to layer 2 and borrows layer 1's, a finished
+        // layer's. Both serve the same outputs. The call after it takes the borrowed slots back, and so does a decode
+        // begin. The checked pass leaves each read-ahead a gap to read in, as the GPU's work between two layers does.
         constexpr int quota = 4;
         const auto y3 = graph(3, y2);
         auto sink = make_sink(inputs, f, threads, depth);
@@ -4133,15 +4134,17 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
             require(same_bits(o1, y1) && same_bits(o2, y2) && same_bits(o3, y3),
                     "borrowing read-ahead: output differs from the graph");
         }
-        require(s2.ram_experts <= uint64_t(quota) && s3.ram_experts > uint64_t(quota) &&
-                s3.ram_experts <= 2 * uint64_t(quota),
-                "layer 3's read-ahead did not borrow layer 1's slots (layer 2: " + std::to_string(s2.ram_experts) +
-                ", layer 3: " + std::to_string(s3.ram_experts) + " RAM experts)");
-        // layer 2's receipt names the plan's borrowed slots
-        const size_t line = log.find("[kimi_cpu_prefill_lookahead] layer=2 ");
-        const size_t field = line == std::string::npos ? line : log.find(" borrowed=", line);
-        require(field != std::string::npos && std::stoull(log.substr(field + 10)) > 0,
-                "layer 2's read-ahead receipt names no borrowed slot: " + log.substr(0, 600));
+        require(s2.ram_experts > uint64_t(quota) && s2.ram_experts <= 2 * uint64_t(quota) && s3.ram_experts >= 1 &&
+                s3.ram_experts <= uint64_t(quota),
+                "layer 2's read-ahead did not borrow layer 3's slots, or layer 3's did not borrow layer 1's (layer 2: "
+                + std::to_string(s2.ram_experts) + ", layer 3: " + std::to_string(s3.ram_experts) + " RAM experts)");
+        // the receipts of layers 1 and 2 name their plans' borrowed slots
+        for (const char * at : { "[kimi_cpu_prefill_lookahead] layer=1 ", "[kimi_cpu_prefill_lookahead] layer=2 " }) {
+            const size_t line = log.find(at);
+            const size_t field = line == std::string::npos ? line : log.find(" borrowed=", line);
+            require(field != std::string::npos && std::stoull(log.substr(field + 10)) > 0,
+                    std::string(at) + "names no borrowed slot: " + log.substr(0, 600));
+        }
         // the next pass's first call gives them back, so layer 1's own slots are its own again
         call(meta1, 2, x, o1);
         require(same_bits(o1, y1), "the call after the borrowing changed layer 1's output");

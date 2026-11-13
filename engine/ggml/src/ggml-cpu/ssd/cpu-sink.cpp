@@ -689,13 +689,14 @@ struct kimi_cpu_sink {
     // of a layer's own reads (io_end) to the first read of the next layer's call, while the call finishes its compute
     // and the GPU computes the next layer's attention and router. The call for layer L plans the next layer's experts
     // that its predicted routes make likely and that neither the GPU tier nor the RAM cache holds (lookahead_plan_next):
-    // each takes a slot of the RAM cache for that layer, as the decode prefetch does, and once L's own reads are over the
-    // I/O thread reads them into those slots through the ring (lookahead_run): reads moved earlier, none added. The call
-    // for L + 1 stops it before its prepare, waits for the reads in flight and publishes what landed (lookahead_handover),
-    // and its prefill read of the RAM cache takes them as hits. The read-ahead holds no memory of its own: what it read
-    // stays cached, and what the next layer did not use is the coldest of what the cache holds. A plan holds as many
-    // experts as the drive reads in the idle window at its calibrated rate: the window's median over the pass, the last
-    // pass's for its first layers.
+    // each takes a slot of the RAM cache for that layer, as the decode prefetch does, else one another layer lends
+    // (prefetch_borrow), and once L's own reads are over the I/O thread reads them into those slots through the ring
+    // (lookahead_run): reads moved earlier, none added. The call for L + 1 stops it before its prepare, waits for the
+    // reads in flight and publishes what landed (lookahead_handover), and its prefill read of the RAM cache takes them
+    // as hits. The read-ahead holds no memory of its own: what it read into the layer's own slots stays cached, what
+    // the next layer did not use is the coldest of what the cache holds, and a lent slot goes back empty after the
+    // call. A plan holds every likely expert, and the window decides how many are read: a slot's entry goes only once a
+    // read into it is issued.
     struct lookahead_state {
         bool enabled = false;
         uint64_t fail_every = 0, completions = 0; // explicit fixture fault injection: every n-th completion fails
@@ -738,8 +739,8 @@ struct kimi_cpu_sink {
         double window_us = -1;
         uint64_t planned = 0, issued = 0, landed = 0, failed = 0, used = 0, unused = 0, bytes = 0;
         uint64_t likely = 0;  // the next layer's experts with P >= 1/2 that neither the GPU tier nor the RAM cache holds
-        uint64_t no_slot = 0; // the next layer's plan stopped short: no slot of its own or of a finished layer was left
-        uint64_t borrowed = 0; // the next layer's plan reads into slots of layers this pass finished
+        uint64_t no_slot = 0; // the next layer's plan stopped short: no slot of its own or of another layer was left
+        uint64_t borrowed = 0; // the next layer's plan reads into slots other layers lend
         size_t next_planned = 0;
     } lookahead_report;
 
@@ -3143,8 +3144,8 @@ struct kimi_cpu_sink {
     // rank r's prediction was selected in the prefill passes so far (lookahead_measure). The plan: the next layer's
     // experts with P >= 1/2 that the GPU tier does not hold and the RAM cache's prefill read would not serve, most
     // likely first, as many as the layer's RAM cache slots take (prefetch_reserve, as the decode prefetch takes
-    // one: a free slot first, else the layer's coldest of the entries whose experts have P < 1/2), then slots of the
-    // layers this pass finished (prefetch_borrow). The I/O thread reads them in that order from the end of this call's
+    // one: a free slot first, else the layer's coldest of the entries whose experts have P < 1/2), then slots other
+    // layers lend (prefetch_borrow). The I/O thread reads them in that order from the end of this call's
     // reads until the next call starts, whatever that window's length: a slot's entry goes only once a read into it is
     // issued, and a slot no read reached goes back as it was (lookahead_finish). No plan without a prediction of the
     // next layer or a measured rate, or for the last routed layer (the next one resolves no expert).
@@ -3207,6 +3208,9 @@ struct kimi_cpu_sink {
         std::vector<sink_lookahead_read> plan;
         plan.reserve(target);
         uint64_t unresolved = 0;
+        std::vector<size_t> lendable; // the slots other layers lend, ranked when the layer's own run out
+        size_t lent_next = 0;
+        bool ranked = false;
         for (size_t i = 0; i < likely.size() && plan.size() < target; ++i) {
             sink_lookahead_read read;
             read.expert = likely[i];
@@ -3219,8 +3223,10 @@ struct kimi_cpu_sink {
             if (!resolved) { ++unresolved; continue; }
             read.entry = cache.prefetch_reserve(next, read.expert, read.role, &keep, &read.prior);
             if (read.entry == -2) { continue; }            // cached, or on its way
-            if (read.entry < 0) {                           // the layer has no idle slot left: one a finished layer lends
-                read.entry = cache.prefetch_borrow(next, read.expert, read.role, layer, &read.prior);
+            if (read.entry < 0) {                           // the layer has no idle slot left: one another layer lends
+                if (!ranked) { lendable = cache.lendable(next, layer); ranked = true; }
+                read.entry = lent_next < lendable.size() ?
+                    cache.prefetch_borrow(lendable[lent_next++], next, read.expert, read.role, &read.prior) : -1;
                 if (read.entry < 0) { ++r.no_slot; break; }
                 ++r.borrowed;
             }

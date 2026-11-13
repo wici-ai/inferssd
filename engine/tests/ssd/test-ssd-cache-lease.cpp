@@ -92,10 +92,42 @@ int main() {
         sink_request n; n.id = 9;
         for (int role = 0; role < 3; ++role) { n.role[role] = {fd,uint64_t(20 + role)*4096,4096}; }
         sink_cache::prefetch_prior prior;
-        require(c.prefetch_borrow(2, 9, n.role, 2, &prior) == 0 && own.lent && own.layer_index == 1 && c.lent.size() == 1);
+        require(c.lendable(2, 2) == std::vector<size_t>({ 0 }));
+        require(c.prefetch_borrow(0, 2, 9, n.role, &prior) == 0 && own.lent && own.layer_index == 1 && c.lent.size() == 1);
         c.prefetch_restore(0, c.generation, prior);
         require(!own.lent && c.lent.empty() && own.layer_index == 0 && own.id == 4 && own.valid &&
                 c.stats.valid_bytes == 2 * c.stride && !c.stats.evictions);
+        c.arena = nullptr;
+    }
+    {
+        // Four layers of two slots, the call for layer 2 planning layer 3's read-ahead: it may borrow no slot of either
+        // layer, an empty slot first (layer 4's), then the coldest entry of the finished layer 1, then layer 4's, which
+        // the pass has yet to reach, however old. A lent slot is lendable no more.
+        sink_cache c(configuration); c.prefill_read = true; c.stats.budget_bytes = 1; c.stride = 12288;
+        for (int role = 0; role < 3; ++role) { c.role_bytes[role] = 4096; }
+        for (int id = 1; id <= 4; ++id) {
+            sink_cache::layer l; l.id = id; l.begin = size_t(2 * (id - 1)); l.count = 2; c.layers.push_back(l);
+        }
+        c.entries.resize(8);
+        std::vector<char> arena(8 * c.stride); c.arena = arena.data();
+        for (size_t i = 0; i < 8; ++i) {
+            auto & x = c.entries[i];
+            x.layer_index = i / 2; x.id = int32_t(20 + i); x.valid = x.resident = x.enabled = true;
+            x.last_touch = 100 - i; // a later layer's entries are older
+        }
+        c.entries[7].valid = false; c.entries[7].id = -1;
+        c.stats.valid_bytes = 7 * c.stride;
+        sink_request n; n.id = 9;
+        for (int role = 0; role < 3; ++role) { n.role[role] = {fd,uint64_t(40 + role)*4096,4096}; }
+        const auto order = c.lendable(3, 2);
+        require(order == std::vector<size_t>({ 7, 1, 0, 6 }));
+        for (size_t k = 0; k < order.size(); ++k) {
+            sink_cache::prefetch_prior prior;
+            require(c.prefetch_borrow(order[k], 3, int32_t(30 + k), n.role, &prior) == int(order[k]));
+            require(c.prefetch_borrow(order[k], 3, int32_t(40 + k), n.role, &prior) == -1);
+        }
+        require(c.lent.size() == 4 && c.lendable(3, 2).empty());
+        for (size_t i = 2; i < 6; ++i) { require(!c.entries[i].lent && !c.entries[i].inflight && c.entries[i].valid); }
         c.arena = nullptr;
     }
     {
