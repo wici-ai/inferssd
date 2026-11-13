@@ -29,6 +29,8 @@
 - [Benchmark tools](../bench/README.md): measurement drivers and result contracts.
 - [Test gates](testing.md): unit, device and Apple Silicon test coverage.
 
+- [Experimental multi-NVMe reads](multi-nvme.md): two-drive setup, limitations and measured results.
+
 ## Development
 
 - [Upstream patches](development/upstream-patches.md): integration points in the bundled llama.cpp snapshot.

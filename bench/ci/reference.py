@@ -19,6 +19,7 @@ SETTING_KEYS = frozenset((
     "place.costs", "prefill.lookahead", "vram.budget", "vram.max_slots",
     "vram.reserve_mib", "host.headroom_mib", "host.budget_mib",
     "model.engram_prefetch", "model.hc_fused",
+    "expert.replicas", "io.range_max_experts",
 ))
 SETTING_GENERATIONS = (SETTING_KEYS,)
 
@@ -50,6 +51,10 @@ def validate_semantics(values):
         raise ValueError("reference adapter requires the explicit reviewed settings schema")
     if not set(values) <= set(properties):
         raise ValueError("installed settings registry cannot validate this binding generation")
+    # The accepted legacy source has no replica-routing implementation. Its
+    # reviewed binding may carry the new registry only with the experiment off.
+    if values["expert.replicas"] or values["io.range_max_experts"] != 2:
+        raise ValueError("legacy reference cannot represent active replica settings")
     for key, value in values.items():
         prop = properties[key]
         kind = prop["kind"]

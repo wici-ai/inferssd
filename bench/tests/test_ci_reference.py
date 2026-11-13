@@ -210,3 +210,14 @@ def test_private_config_binding_must_name_merge_candidate_not_pr_head(binding, s
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="exact base/merge candidate"):
         compare.device_report(root, plan, policy)
+
+
+@pytest.mark.parametrize("change", [
+    {"expert.replicas": ["/models/a.expert-pack", "/models/b.expert-pack"]},
+    {"io.range_max_experts": 3},
+])
+def test_legacy_bridge_refuses_replica_experiment_semantics(binding, change):
+    values = copy.deepcopy(binding["semantic_settings"])
+    values.update(change)
+    with pytest.raises(ValueError, match="cannot represent active replica"):
+        reference.validate_semantics(values)
