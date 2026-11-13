@@ -662,6 +662,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(ssd/test-server-prompt-cache.cpp)
     target_include_directories(test-server-prompt-cache PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-prompt-cache PRIVATE server-context)
+    llama_build_and_test(ssd/test-server-prompt-cache-file.cpp)
+    target_include_directories(test-server-prompt-cache-file PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-prompt-cache-file PRIVATE server-context)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET ggml-cpu)
         # Requires an explicit tiny GGUF/alias and the admitted 8GiB/noSwap scope;
         # deliberately not an asset-free CTest entry.

@@ -32,7 +32,7 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT} PRIVATE ggml-ssd-platform)
 if (GGML_CUDA)
     target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_CUDA_MOE)
 endif()

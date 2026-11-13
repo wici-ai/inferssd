@@ -11,6 +11,7 @@
 #include "speculative.h"
 #include "../server-common.h"
 #include "../server-ssd-reservation.h"
+#include "platform/file.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -128,6 +129,10 @@ static void server_prompt_file_touch(const std::string & path) {
 // read the header of a cached prompt file into `prompt` (tokens, checkpoint and state locations); false if the
 // file is not a prompt of this fingerprint
 static bool server_prompt_read_header(FILE * f, const std::string & fingerprint, server_prompt & prompt) {
+    uint64_t file_size = 0;
+    if (!ssd::platform::file_size(ssd::platform::stream_fd(f), file_size) || file_size > SIZE_MAX) {
+        return false;
+    }
     uint32_t magic = 0, version = 0, n_fp = 0;
     if (!server_prompt_fread(f, &magic, sizeof(magic)) || magic != SERVER_PROMPT_FILE_MAGIC ||
         !server_prompt_fread(f, &version, sizeof(version)) || version != SERVER_PROMPT_FILE_VERSION ||
@@ -141,6 +146,11 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
 
     uint32_t n_tokens = 0;
     if (!server_prompt_fread(f, &n_tokens, sizeof(n_tokens)) || n_tokens > (1u << 26)) {
+        return false;
+    }
+    const long token_offset = std::ftell(f);
+    if (token_offset < 0 || uint64_t(token_offset) > file_size ||
+        uint64_t(n_tokens)*sizeof(llama_token) > file_size - uint64_t(token_offset)) {
         return false;
     }
     llama_tokens tokens(n_tokens);
@@ -159,7 +169,7 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
         if (!server_prompt_fread(f, &cp.pos_min, sizeof(cp.pos_min)) ||
             !server_prompt_fread(f, &cp.pos_max, sizeof(cp.pos_max)) ||
             !server_prompt_fread(f, &cp.n_tokens, sizeof(cp.n_tokens)) ||
-            !server_prompt_fread(f, &size, sizeof(size))) {
+            !server_prompt_fread(f, &size, sizeof(size)) || size > file_size) {
             return false;
         }
         cp.file_size = size;
@@ -171,10 +181,21 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
         return false;
     }
 
-    size_t offset = std::ftell(f);
+    const long header_size = std::ftell(f);
+    if (header_size < 0 || uint64_t(header_size) > file_size) {
+        return false;
+    }
+    size_t offset = size_t(header_size);
     for (auto & cp : checkpoints) {
+        // Subtract before adding so malformed sizes cannot wrap the offset.
+        if (cp.file_size > file_size - offset) {
+            return false;
+        }
         cp.file_offset = offset;
         offset += cp.file_size;
+    }
+    if (data_size > file_size - offset) {
+        return false;
     }
 
     prompt.tokens           = server_tokens(tokens, false);
