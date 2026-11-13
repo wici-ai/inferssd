@@ -957,12 +957,6 @@ struct tier {
     // A tier retained from decode leaves only the watermark margin free, often less than the prefill transient
     // scratch; without the scratch the whole prefill falls back to the CPU. Give blocks back for it, as
     // the engine's reserve does.
-    // one elastic block back for the prefill scratch, while the tier is quiescent; false when none was
-    bool free_block_for_prefill_transient(){
-        if(!elastic_active)return false;
-        std::lock_guard<std::mutex> lock(lifecycle_mutex);
-        return quiescent() && free_last_block("prefill_scratch",false);
-    }
     void make_room_for_prefill_transient(size_t slots){
         if(!elastic_active || prefill_transient_arena || !stride || !slots)return;
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
@@ -1219,10 +1213,6 @@ struct tier {
                 if(group){
                     make_room_for_prefill_transient(prefill_transient_slots);
                     allocate_prefill_transient(prefill_transient_slots);
-                    // The free memory the tier counts can be more than the card gives (what the driver holds for the
-                    // decode graphs it instantiated): a block back at a time until the scratch fits, or none is left.
-                    while(!prefill_transient_arena && free_block_for_prefill_transient())
-                        allocate_prefill_transient(prefill_transient_slots);
                 }
                 return;
             }
