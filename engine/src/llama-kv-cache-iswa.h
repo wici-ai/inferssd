@@ -75,6 +75,26 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    void set_commit(const commit_cb & commit) override {
+        kv_base->set_commit(commit);
+        kv_swa ->set_commit(commit);
+    }
+    bool cells_short(uint32_t n_tokens) const override {
+        return kv_base->cells_short(n_tokens) || kv_swa->cells_short(n_tokens);
+    }
+    bool reserve_cells(uint32_t n_tokens) override {
+        return kv_base->reserve_cells(n_tokens) && kv_swa->reserve_cells(n_tokens);
+    }
+    bool fit_cells(uint32_t n_tokens) override {
+        return kv_base->fit_cells(n_tokens) && kv_swa->fit_cells(n_tokens);
+    }
+    bool get_can_grow() const override {
+        return kv_base->get_can_grow() && kv_swa->get_can_grow();
+    }
+    uint32_t get_generation() const override {
+        return kv_base->get_generation() + kv_swa->get_generation();
+    }
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;

@@ -25,6 +25,7 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
+struct llama_memory_params;
 
 // The copies of the weights homed on the drive in one phase of a request (the [dense_stream] line): the prefill from
 // the request's start to its end, the decode from there to the request's end.  begin when the phase starts, add the
@@ -302,6 +303,12 @@ private:
     std::unique_ptr<llama_memory_context_i> memory_init_reserve();
     // positions currently held by the memory module (max over sequences of pos_max + 1)
     uint32_t memory_n_pos() const;
+
+    // The context, a multiple of 8192 up to the trained one, whose KV cache memory still fits when full (n_ctx 0 with
+    // SSD experts, whose KV cache allocates its cells as they are used).
+    uint32_t fit_context(const llama_memory_params & params_mem) const;
+    // the memory's generation the reserved graphs were sized for (llama_memory_i::get_generation)
+    uint32_t memory_generation_reserved = 0;
     // smallest reserve horizon (n_ubatch times a power of two, at most n_ctx) that holds n_pos
     uint32_t reserve_horizon_bucket(uint32_t n_pos) const;
 

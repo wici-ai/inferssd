@@ -158,6 +158,26 @@ public:
         reset();
     }
 
+    // n cells, the ones held keeping what they hold and the new ones empty
+    void grow(uint32_t n) {
+        assert(n >= pos.size());
+
+        pos.resize(n, -1);
+        ext.resize(n);
+        shift.resize(n, 0);
+        seq.resize(n);
+    }
+
+    // the first n cells, the ones past them holding nothing
+    void shrink(uint32_t n) {
+        assert(n <= pos.size() && used_max_p1() <= n);
+
+        pos.resize(n);
+        ext.resize(n);
+        shift.resize(n);
+        seq.resize(n);
+    }
+
     bool is_empty(uint32_t i) const {
         assert(i < pos.size());
         assert((pos[i] < 0 && pos[i] == -1) || pos[i] >= 0);
