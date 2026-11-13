@@ -4,6 +4,7 @@
 #include "../settings/json.h"
 #include "../settings/settings.h"
 
+#include <algorithm>
 #include <fcntl.h>
 #if defined(_WIN32)
 #    define WIN32_LEAN_AND_MEAN
@@ -121,8 +122,16 @@ result<void> writer::event(const std::string & name, const std::string & payload
                 return { status::invalid, std::string("reserved telemetry field ") + key };
             }
         }
-        const size_t                begin = payload.find('{'), end = payload.find_last_of('}');
-        const std::string           body = payload.substr(begin + 1, end - begin - 1);
+        const size_t begin = payload.find('{'), end = payload.find_last_of('}');
+        std::string body = payload.substr(begin + 1, end - begin - 1);
+        // A validated JSON object may be formatted across several lines. Raw CR/LF
+        // can only be whitespace outside its strings; escaped string contents and
+        // number spellings stay intact. Publish exactly one physical JSONL record.
+        const size_t newline = std::min(body.find('\r'), body.find('\n'));
+        if (newline != std::string::npos) {
+            body.erase(std::remove_if(body.begin() + newline, body.end(),
+                                      [](char c) { return c == '\r' || c == '\n'; }), body.end());
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         if (failed_) {
             return { status::io, "telemetry stream previously failed" };

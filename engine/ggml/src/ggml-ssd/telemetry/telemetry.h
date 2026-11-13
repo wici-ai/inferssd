@@ -27,7 +27,8 @@ class writer {
     writer(const writer &)                               = delete;
     writer &                   operator=(const writer &) = delete;
     [[nodiscard]] result<void> settings(const ssd::settings::snapshot & values) noexcept;
-    // payload is one complete JSON object (validated before publication).
+    // payload is one complete JSON object (validated before publication). Its
+    // formatting never adds physical lines to the published JSONL record.
     [[nodiscard]] result<void> event(const std::string & name, const std::string & payload) noexcept;
     [[nodiscard]] result<void> flush() noexcept;
   private:

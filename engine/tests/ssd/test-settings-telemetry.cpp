@@ -19,6 +19,14 @@
 #endif
 
 int main(int argc, char ** argv) {
+    if (argc == 4 && std::string(argv[1]) == "--payload") {
+        auto sink = ssd::telemetry::writer::open(argv[2]);
+        if (!sink || !sink.value->event("ssd.payload", argv[3]) ||
+            !sink.value->event("ssd.after", "{}") || !sink.value->flush()) {
+            return 1;
+        }
+        return 0;
+    }
     if (argc == 3 && std::string(argv[1]) == "--events") {
         const auto values = ssd::settings::parse("", "");
         auto       sink   = ssd::telemetry::writer::open(argv[2]);
@@ -156,6 +164,11 @@ int main(int argc, char ** argv) {
     assert(!sink.value->event("ssd.bad", "{\"x\":1e999}"));
     assert(!sink.value->event("ssd.bad", std::string("{\"x\":\"") + char(0xff) + "\"}"));
     assert(!sink.value->event("ssd..bad", "{}"));
+    assert(sink.value->event("ssd.formatted", R"({
+        "text": "two words \n\r\t\"\\",
+        "number": 1.2300e+02,
+        "nested": [true, null, {"id": 9007199254740993}]
+    })"));
     std::vector<std::thread> workers;
     for (int worker = 0; worker < 4; ++worker) {
         workers.emplace_back([&, worker] {
@@ -176,11 +189,17 @@ int main(int argc, char ** argv) {
         std::string   line;
         while (std::getline(file, line)) {
             const auto node = ssd::json::parse(line);
+            assert(node && line.find('\r') == std::string::npos);
             assert(node.value.object.at("v").text == "1" &&
                    node.value.object.at("seq").text == std::to_string(sequence++));
+            if (node.value.object.at("ev").text == "ssd.formatted") {
+                assert(node.value.object.at("text").text == "two words \n\r\t\"\\");
+                assert(node.value.object.at("number").text == "1.2300e+02");
+                assert(node.value.object.at("nested").array.at(2).object.at("id").text == "9007199254740993");
+            }
         }
     }
-    assert(sequence == 401);
+    assert(sequence == 402);
 #ifndef _WIN32
     // A write the OS refuses, from a file size limit (which Windows does not have), in a child process so the limit
     // and the SIGXFSZ disposition stay there.
