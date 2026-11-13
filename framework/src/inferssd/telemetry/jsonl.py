@@ -43,7 +43,10 @@ def finite_number(value: str) -> float:
 def finite_integer(value: str) -> int:
     number = int(value)
     try:
-        finite_number(str(number))
+        # Integers with at most 1023 bits are within the finite double range.
+        # Keep the existing float boundary check for larger values.
+        if number.bit_length() > 1023:
+            finite_number(value)
     except OverflowError as error:
         raise ValueError("out-of-range JSON number") from error
     return number
