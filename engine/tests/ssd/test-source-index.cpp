@@ -2,6 +2,7 @@
 #include "ggml-ssd/store/index.h"
 #include "ggml-ssd/platform/file.h"
 #include "ggml-ssd/platform/memory.h"
+#include "ggml-ssd/store/parser.h"
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -18,11 +19,45 @@
 
 static void require(bool ok, const char * message) { if (!ok) { throw std::runtime_error(message); } }
 
+static void check_pack_index_allocation(const std::filesystem::path & directory) {
+    const auto path = directory / "sized.pack";
+    for (const uint64_t present : {uint64_t(0), uint64_t(151), uint64_t(160)}) {
+        std::ofstream stream(path, std::ios::binary);
+        const char magic[16] = "GGMLMOEPACKv1";
+        const uint32_t version = 1, header_size = 40, reserved = 0;
+        const uint64_t count = present ? 1 : 10000, data_start = 192, bytes = 8;
+        const int32_t expert = 0;
+        const char tensor[128] = "blk.0.ffn_up_exps.weight";
+        auto field = [&](const auto & value) { stream.write(reinterpret_cast<const char *>(&value), sizeof(value)); };
+        field(magic); field(version); field(header_size); field(count); field(data_start);
+        field(tensor); field(expert); field(reserved); field(data_start); field(bytes);
+        stream.write("payload!", 8);
+        stream.close();
+        std::filesystem::resize_file(path, 40 + present);
+
+        c0::description description;
+        description.packs.push_back(path.string());
+        c0::parser_state state;
+        std::vector<c0::expert_pack_entry> entries;
+        const bool parsed = c0::append_sources(state, description, entries);
+        if (present < 152) {
+            // Reject a table that cannot fit before reserving memory proportional
+            // to the count supplied in the header, including a partially cut row.
+            require(!parsed, "truncated pack was accepted");
+            require(entries.capacity() == 0, "truncated pack allocated its declared index");
+        } else {
+            require(parsed && entries.size() == 1, "complete pack was rejected");
+            require(entries[0].offset == data_start && entries[0].nbytes == bytes, "complete pack range changed");
+        }
+    }
+}
+
 int main() {
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     const std::filesystem::path directory =
         std::filesystem::temp_directory_path() / ("inferssd-source-index-" + std::to_string(stamp));
     require(std::filesystem::create_directory(directory), "temporary directory failed");
+    check_pack_index_allocation(directory);
     std::vector<std::string> aliases;
     for (int seed = 1; seed <= 2; ++seed) {
         const auto data = directory / (std::to_string(seed) + ".bin");
