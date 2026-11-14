@@ -61,8 +61,9 @@ llama_tokens common_ngram_simple_draft(
     // return empty vector if there is no match.
     llama_tokens draft_tokens;
 
-    // We need at least n_draft_min + n_draft_max + 1 tokens.
-    if (cur_len <= static_cast<size_t>(n_draft_min + n_draft_max + 1)) {
+    // A candidate needs a complete lookup n-gram and the configured draft.
+    // Shorter drafts are discarded by the common speculative dispatcher.
+    if (n_draft_min == 0 || n_draft_max == 0 || cur_len < n_draft_min + n_draft_max) {
         return draft_tokens;
     }
 
@@ -74,9 +75,10 @@ llama_tokens common_ngram_simple_draft(
     }
     pattern.push_back(sampled); // add the last token to the pattern
 
-    size_t match_pos = 0; // we ignore position 0, position 0 == no match
-                          // search backwards, but skip the current match (we are currently there)
-    for (size_t j = cur_len - n_draft_min - 1; j > 0; --j) {
+    size_t match_pos = cur_len;
+    // Search the latest eligible candidate first, including position zero.
+    // A newer match without enough continuation must not hide an older one.
+    for (size_t j = cur_len - n_draft_min - n_draft_max + 1; j-- > 0;) {
         bool match = true;
         for (size_t k = 0; k < pattern.size(); ++k) {
             if (tokens[j + k] != pattern[k]) {
@@ -89,17 +91,11 @@ llama_tokens common_ngram_simple_draft(
             break;
         }
     }
-    if (match_pos == 0) {
+    if (match_pos == cur_len) {
         return draft_tokens;
     }
 
-    const size_t copy_max = std::min(
-            n_draft_max,
-            cur_len - (match_pos + n_draft_min)
-            );
-    if (copy_max < n_draft_min) {
-        return draft_tokens;
-    }
+    const size_t copy_max = n_draft_max;
     LOG_DBG("%s: #tokens = %zu: found matching pattern at pos %zu, length %zu, draft length %zu\n",
             __func__, cur_len,
             match_pos, pattern.size(), copy_max);
