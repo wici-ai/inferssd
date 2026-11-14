@@ -46,9 +46,12 @@ struct common_token_hash_function {
 
 struct common_ngram_hash_function {
     size_t operator()(const common_ngram & ngram) const {
-        size_t hash = common_token_hash_function{}(ngram.tokens[0]);
-        for (int i = 1; i < LLAMA_NGRAM_MAX; ++i) {
-            hash ^= common_token_hash_function{}(ngram.tokens[i]);
+        size_t hash = 0;
+        for (int i = 0; i < LLAMA_NGRAM_MAX; ++i) {
+            // Mix the prefix into each step: XOR alone loses token order and
+            // cancels repeated pairs, putting distinct n-grams in one bucket.
+            hash ^= common_token_hash_function{}(ngram.tokens[i]) + size_t(0x9e3779b9) +
+                    (hash << 6) + (hash >> 2);
         }
         return hash;
     }
