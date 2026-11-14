@@ -119,7 +119,7 @@ endfunction()
 
 
 llama_build(ssd/test-sampler-clone.cpp)
-foreach(sampler dist mirostat mirostat-v2 adaptive-p xtc-chain)
+foreach(sampler dist mirostat mirostat-v2 adaptive-p xtc-chain penalties-chain)
     foreach(scenario fresh warmed pending independent reset)
         llama_test(test-sampler-clone NAME sampler_clone_${sampler}_${scenario}
                    LABEL unit ARGS ${sampler} ${scenario})

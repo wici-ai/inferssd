@@ -26,6 +26,10 @@ static sampler_ptr make_sampler(const std::string & kind, uint32_t seed) {
         sampler = llama_sampler_init_mirostat_v2(seed, 3.0f, 0.25f);
     } else if (kind == "adaptive-p") {
         sampler = llama_sampler_init_adaptive_p(0.15f, 0.8f, seed);
+    } else if (kind == "penalties-chain") {
+        sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(sampler, llama_sampler_init_penalties(8, 1.1f, 0.25f, 0.4f));
+        llama_sampler_chain_add(sampler, llama_sampler_init_dist(seed));
     } else if (kind == "xtc-chain") {
         sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
         llama_sampler_chain_add(sampler, llama_sampler_init_xtc(0.5f, 0.04f, 1, seed));

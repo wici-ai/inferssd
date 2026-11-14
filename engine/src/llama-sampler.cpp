@@ -2721,6 +2721,7 @@ static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_s
         auto * result_ctx = (llama_sampler_penalties *) result->ctx;
 
         result_ctx->prev = ctx->prev;
+        result_ctx->token_count = ctx->token_count;
     }
 
     return result;
