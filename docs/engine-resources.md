@@ -58,8 +58,11 @@ From a source checkout, generate the descriptor after building:
 python3 scripts/engine-resources.py --build build-linux-cuda --output engine-resources.json
 ```
 
-This inspects the schema without running a model, and reads the GPU backends from
-the build's `CMakeCache.txt`. It describes existing paths;
+This invokes the engine with `--ssd-schema` as its only argument. That command
+prints the static settings registry without loading backends, probing devices or
+parsing inference environment variables. Combining it with other arguments uses
+the ordinary argument parser. The script reads the GPU backends from the build's
+`CMakeCache.txt`. It describes existing paths;
 for a standalone deployment, copy the executable and its runtime libraries plus
 templates, then use paths relative to the deployed descriptor. The framework
 wheel needs only its standard-library Python runtime. Existing source indexing
