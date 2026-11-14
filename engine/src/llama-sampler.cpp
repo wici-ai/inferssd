@@ -1285,13 +1285,14 @@ static void llama_sampler_top_k_backend_apply(
         struct llama_sampler_data * data) {
     auto * sctx = (llama_sampler_top_k *) smpl->ctx;
 
-    struct ggml_tensor * top_k = ggml_top_k(ctx, data->logits, sctx->k);
+    const int32_t k = std::min<int64_t>(sctx->k, data->logits->ne[0]);
+    struct ggml_tensor * top_k = ggml_top_k(ctx, data->logits, k);
     ggml_set_name(top_k, "top_k");
 
     if (data->candidates) {
         struct ggml_tensor * candidates_rows = ggml_reshape_2d(ctx, data->candidates, 1, data->candidates->ne[0]);
         data->candidates = ggml_get_rows(ctx, candidates_rows, top_k);
-        data->candidates = ggml_reshape_1d(ctx, data->candidates, sctx->k);
+        data->candidates = ggml_reshape_1d(ctx, data->candidates, k);
         ggml_set_name(data->candidates, "top_k_candidates");
     } else {
         data->candidates = top_k;
@@ -1299,7 +1300,7 @@ static void llama_sampler_top_k_backend_apply(
 
     struct ggml_tensor * logits_rows = ggml_reshape_2d(ctx, data->logits, 1, data->logits->ne[0]);
     struct ggml_tensor * top_k_rows = ggml_get_rows(ctx, logits_rows, top_k);
-    data->logits = ggml_reshape_1d(ctx, top_k_rows, sctx->k);
+    data->logits = ggml_reshape_1d(ctx, top_k_rows, k);
     ggml_set_name(top_k_rows, "top_k_rows");
 
     GGML_UNUSED(gf);
