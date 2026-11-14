@@ -688,15 +688,16 @@ struct kimi_cpu_sink {
     // The grouped prefill's cross-layer read-ahead (prefill.lookahead). In a prompt pass the drive idles from the end
     // of a layer's own reads (io_end) to the first read of the next layer's call, while the call finishes its compute
     // and the GPU computes the next layer's attention and router. The call for layer L plans the next layer's experts
-    // that its predicted routes make likely and that neither the GPU tier nor the RAM cache holds (lookahead_plan_next):
-    // each takes a slot of the RAM cache for that layer, as the decode prefetch does, else one another layer lends
+    // that its predicted routes name and that neither the GPU tier nor the RAM cache holds, each while its read pays
+    // by the decode prefetch's rule (lookahead_plan_next): each takes a slot of the RAM cache for that layer, as the
+    // decode prefetch does, else one another layer lends
     // (prefetch_borrow), and once L's own reads are over the I/O thread reads them into those slots through the ring
     // (lookahead_run): reads moved earlier, none added. The call for L + 1 stops it before its prepare, waits for the
     // reads in flight and publishes what landed (lookahead_handover), and its prefill read of the RAM cache takes them
     // as hits. The read-ahead holds no memory of its own: what it read into the layer's own slots stays cached, what
     // the next layer did not use is the coldest of what the cache holds, and a lent slot goes back empty after the
-    // call. A plan holds every likely expert, and the window decides how many are read: a slot's entry goes only once a
-    // read into it is issued.
+    // call. A plan holds every read that pays, and the window decides how many are read: a slot's entry goes only once
+    // a read into it is issued.
     struct lookahead_state {
         bool enabled = false;
         uint64_t fail_every = 0, completions = 0; // explicit fixture fault injection: every n-th completion fails
@@ -716,13 +717,17 @@ struct kimi_cpu_sink {
         int32_t window_layer = -1;
         bool window_open = false;
         int32_t pass_layer = -1;                   // the last grouped-prefill call's layer: a pass runs in layer order
+        // The pass so far (run_mutex): its idle windows, and of the entries its calls' prefill reads could serve (what
+        // the read-ahead read for them aside), how many there were and how many the calls used.
+        std::vector<double> pass_windows_us;
+        uint64_t pass_retained = 0, pass_retained_used = 0;
         // The plan in progress (io_mutex): experts issued, landed whole, failed.
         uint64_t issued = 0, landed = 0, failed = 0;
         // The cache slots the handover published for the call in progress: its prefill read counts the hits among them.
         std::vector<int> landed_entries;
         // Totals for the report at destruction.
         uint64_t layers = 0, planned = 0, issued_total = 0, landed_total = 0, failed_total = 0, used = 0, unused = 0,
-                 used_bytes = 0, no_slot = 0, unresolved = 0, unlikely = 0, borrowed = 0;
+                 used_bytes = 0, no_slot = 0, unresolved = 0, no_candidate = 0, borrowed = 0, declined = 0;
         // The prediction of the next layer's routes (kimi_cpu_sink_prefill_hint): `hint_layer`'s experts, hint_k a
         // token best first over hint_tokens tokens. The plan keeps its copy (`planned_hint`) until the call of the layer it
         // predicts, which measures it against the routes the layer took.
@@ -738,7 +743,9 @@ struct kimi_cpu_sink {
         int32_t layer = -1;
         double window_us = -1;
         uint64_t planned = 0, issued = 0, landed = 0, failed = 0, used = 0, unused = 0, bytes = 0;
-        uint64_t likely = 0;  // the next layer's experts with P >= 1/2 that neither the GPU tier nor the RAM cache holds
+        // the next layer's experts the prediction names that neither the GPU tier nor the RAM cache holds, and of them
+        // those left once a read was worth nothing (prefetch_read_value)
+        uint64_t candidates = 0, declined = 0;
         uint64_t no_slot = 0; // the next layer's plan stopped short: no slot of its own or of another layer was left
         uint64_t borrowed = 0; // the next layer's plan reads into slots other layers lend
         size_t next_planned = 0;
@@ -1385,8 +1392,10 @@ struct kimi_cpu_sink {
         for (int c = 0; c < candidates; ++c) {
             const int i = order[size_t(c)];
             const int32_t expert = prefetch.hint[i];
-            // no read time measured yet: read, which measures it
-            if (read_us > 0 && !(ssd::place::prefetch_read_value(use[size_t(i)], double(jobs.size()) * read_us, read_us, windows) > 0)) {
+            // no read time measured yet: read, which measures it; a reader takes one read at a time
+            const double start_us = double(jobs.size()) * read_us;
+            if (read_us > 0 &&
+                    !(ssd::place::prefetch_read_value(use[size_t(i)], start_us, start_us, read_us, windows) > 0)) {
                 for (int d = c; d < candidates; ++d) { ++prefetch.declined; ++prefetch.declined_r[order[size_t(d)]]; }
                 break;
             }
@@ -3066,6 +3075,8 @@ struct kimi_cpu_sink {
     // io_mutex held: the next call starts a pass.
     void lookahead_end_pass() {
         lookahead.pass_layer = -1;
+        lookahead.pass_windows_us.clear();
+        lookahead.pass_retained = lookahead.pass_retained_used = 0;
     }
     void lookahead_quiesce() {
         {
@@ -3110,6 +3121,7 @@ struct kimi_cpu_sink {
             lookahead.issued = lookahead.landed = lookahead.failed = 0;
             if (layer < 0 || layer != lookahead.pass_layer + 1) { lookahead_end_pass(); }
             lookahead.pass_layer = layer;
+            if (window_us >= 0) { lookahead.pass_windows_us.push_back(window_us); }
         }
         lookahead.landed_entries.clear();
         lookahead_finish(layer, &lookahead.landed_entries);
@@ -3142,13 +3154,16 @@ struct kimi_cpu_sink {
     // plan of the next layer's read-ahead. The prediction of the next layer's routes names each expert for some tokens
     // at some ranks; an expert named at ranks r_1..r_m is selected with P = 1 - prod(1 - q_r), q_r the rate at which
     // rank r's prediction was selected in the prefill passes so far (lookahead_measure). The plan: the next layer's
-    // experts with P >= 1/2 that the GPU tier does not hold and the RAM cache's prefill read would not serve, most
-    // likely first, as many as the layer's RAM cache slots take (prefetch_reserve, as the decode prefetch takes
-    // one: a free slot first, else the layer's coldest of the entries whose experts have P < 1/2), then slots other
-    // layers lend (prefetch_borrow). The I/O thread reads them in that order from the end of this call's
-    // reads until the next call starts, whatever that window's length: a slot's entry goes only once a read into it is
-    // issued, and a slot no read reached goes back as it was (lookahead_finish). No plan without a prediction of the
-    // next layer or a measured rate, or for the last routed layer (the next one resolves no expert).
+    // experts the prediction names that the GPU tier does not hold and the RAM cache's prefill read would not serve,
+    // most likely first, each into the slot that costs the pass least while its read pays (prefetch_read_value, the
+    // decode prefetch's rule, over the pass's idle windows): a slot of the layer's RAM cache (prefetch_reserve, as the
+    // decode prefetch takes one: a free slot first, else the coldest entry of an expert the prediction does not name),
+    // else one other layers lend (prefetch_borrow): first those that hold nothing the pass reads again, then entries
+    // of layers it has yet to reach, each a hit the pass loses as often as its calls so far used what they retained.
+    // The I/O thread reads them in that order from the end of this call's reads until the next call starts, whatever
+    // that window's length: a slot's entry goes only once a read into it is issued, and a slot no read reached goes
+    // back as it was (lookahead_finish). No plan without a prediction of the next layer or a measured rate, or for the
+    // last routed layer (the next one resolves no expert).
     void lookahead_plan_next(int32_t layer, const ggml_tensor * up, int ntokens, int nslots) {
         auto & r = lookahead_report;
         // what an earlier call's read-ahead borrowed went to that call's read: its slots go back to their layers
@@ -3185,57 +3200,106 @@ struct kimi_cpu_sink {
         std::iota(ids.begin(), ids.end(), 0);
         std::vector<uint8_t> held(size_t(experts), 0);
         vram.held(next, ids.data(), experts, held.data());
-        // A read still in flight when the next call starts delays its own reads by about the read's time, which is
-        // what a used read saves: reading an expert ahead pays when P >= 1/2.
-        std::vector<int32_t> likely;
-        // the next layer's entries of experts this pass is likely to use (P >= 1/2) keep their slots: a read-ahead slot
-        // comes only from an entry less likely than any expert it reads (one from load or from an earlier request)
-        std::vector<uint8_t> keep(size_t(experts), 0);
-        for (int e = 0; e < experts; ++e) {
-            keep[size_t(e)] = log_unused[size_t(e)] <= std::log(0.5);
-            if (held[size_t(e)] || cache.prefill_holds(next, e) || !keep[size_t(e)]) { continue; }
-            likely.push_back(e);
+        // The calling layer's entries its prefill read could serve, what its read-ahead read aside, and those its
+        // routes use: over the pass so far, the chance an entry of a layer the pass has yet to reach is a hit it loses.
+        {
+            std::vector<uint8_t> requested(size_t(experts), 0);
+            for (const auto & request : requests) {
+                if (request.id >= 0 && request.id < experts) { requested[size_t(request.id)] = 1; }
+            }
+            const auto retained = cache.retained_use(layer, requested, lookahead.landed_entries);
+            lookahead.pass_retained += retained.first;
+            lookahead.pass_retained_used += retained.second;
         }
-        std::stable_sort(likely.begin(), likely.end(),
+        const double unreached_use = ssd::place::prefetch_use_probability(lookahead.pass_retained_used,
+            lookahead.pass_retained);
+        // The experts the prediction names (P > 0); the next layer's entries of those keep their slots, as the decode
+        // prefetch keeps the hint's: a read takes the slot of an entry the prediction does not name.
+        std::vector<double> use(size_t(experts), 0.0);
+        std::vector<uint8_t> keep(size_t(experts), 0);
+        std::vector<int32_t> candidates;
+        for (int e = 0; e < experts; ++e) {
+            use[size_t(e)] = -std::expm1(log_unused[size_t(e)]);
+            keep[size_t(e)] = use[size_t(e)] > 0;
+            if (!keep[size_t(e)] || held[size_t(e)] || cache.prefill_holds(next, e)) { continue; }
+            candidates.push_back(e);
+        }
+        std::stable_sort(candidates.begin(), candidates.end(),
             [&](int32_t a, int32_t b) { return log_unused[size_t(a)] < log_unused[size_t(b)]; });
-        r.likely = likely.size();
-        if (likely.empty()) { ++lookahead.unlikely; return; }
-        const size_t target = likely.size();
+        r.candidates = candidates.size();
+        if (candidates.empty()) { ++lookahead.no_candidate; return; }
+        // What the drive offered so far in the pass: its idle windows (none yet: a read is worth what it gains) and an
+        // expert's read time at the drive's calibrated rate. The I/O thread keeps `depth` experts in flight: the drive
+        // gets to the j-th read j reads after the window opens, and issues it as the read `depth` ahead of it ends.
+        std::vector<std::pair<double, double>> windows;
+        for (const double w : lookahead.pass_windows_us) { windows.emplace_back(w, 1.0); }
+        const double drive_us_per_mb = place_table(ntokens).drive_us_per_mb;
+        const size_t depth = std::max<size_t>(slots.size(), 1);
         char names[3][GGML_MAX_NAME];
         std::snprintf(names[0], sizeof(names[0]), "blk.%d.ffn_up_exps.weight", next);
         std::snprintf(names[1], sizeof(names[1]), "blk.%d.ffn_gate_exps.weight", next);
         std::snprintf(names[2], sizeof(names[2]), "blk.%d.ffn_down_exps.weight", next);
         std::vector<sink_lookahead_read> plan;
-        plan.reserve(target);
+        plan.reserve(candidates.size());
         uint64_t unresolved = 0;
-        std::vector<size_t> lendable; // the slots other layers lend, ranked when the layer's own run out
+        sink_cache::lendable_slots lendable; // the slots other layers lend, ranked when the layer's own run out
         size_t lent_next = 0;
         bool ranked = false;
-        for (size_t i = 0; i < likely.size() && plan.size() < target; ++i) {
+        // A read's worth (ssd::place::prefetch_read_value, the decode prefetch's rule): what it gains if it lands, the
+        // chance the next layer uses the expert less the chance the pass would have used what its slot held, against
+        // the share of it a window leaves in flight. Reads go likeliest first into the slots that cost the pass least,
+        // so once a read gains nothing no later one does. The plan keeps the run of reads worth the most
+        // (best_read_run): a pass's windows are not alike (a layer with more to compute before its experts has a longer
+        // one), and past the length where most of them end a read is worth something again in the longer ones.
+        std::vector<double> worths;
+        size_t skipped = 0;
+        auto worth = [&](double gain, const sink_lookahead_read & read) {
+            const double mb = double(read.role[0].nbytes + read.role[1].nbytes + read.role[2].nbytes) / 1e6;
+            const double read_us = mb * drive_us_per_mb;
+            if (!(read_us > 0)) { return gain; }
+            const size_t j = plan.size();
+            return ssd::place::prefetch_read_value(gain, j + 1 > depth ? double(j + 1 - depth) * read_us : 0.0,
+                double(j) * read_us, read_us, windows);
+        };
+        for (size_t i = 0; i < candidates.size(); ++i) {
             sink_lookahead_read read;
-            read.expert = likely[i];
+            read.expert = candidates[i];
             bool resolved = true;
             for (int role = 0; role < 3 && resolved; ++role) {
                 const auto & source = read.role[role];
                 resolved = resolve(names[role], read.expert, &read.role[role]) && source.offset % 4096 == 0 &&
                     source.nbytes && source.nbytes % 4096 == 0 && source.nbytes <= size_t(std::numeric_limits<int>::max());
             }
-            if (!resolved) { ++unresolved; continue; }
+            if (!resolved) { ++unresolved; ++skipped; continue; }
+            double gain = use[size_t(read.expert)];
             read.entry = cache.prefetch_reserve(next, read.expert, read.role, &keep, &read.prior);
-            if (read.entry == -2) { continue; }            // cached, or on its way
+            if (read.entry == -2) { ++skipped; continue; } // cached, or on its way
             if (read.entry < 0) {                           // the layer has no idle slot left: one another layer lends
                 if (!ranked) { lendable = cache.lendable(next, layer); ranked = true; }
-                read.entry = lent_next < lendable.size() ?
-                    cache.prefetch_borrow(lendable[lent_next++], next, read.expert, read.role, &read.prior) : -1;
+                if (lent_next >= lendable.order.size()) { ++r.no_slot; break; }
+                // past the slots that hold nothing the pass reads again, each may cost it a hit
+                if (lent_next >= lendable.costless) { gain -= unreached_use; }
+                if (!(gain > 0)) { break; }
+                read.entry = cache.prefetch_borrow(lendable.order[lent_next++], next, read.expert, read.role,
+                    &read.prior);
                 if (read.entry < 0) { ++r.no_slot; break; }
                 ++r.borrowed;
             }
             read.generation = cache.generation;
             for (int role = 0; role < 3; ++role) { read.target[role] = cache.data(read.entry, role); }
+            worths.push_back(worth(gain, read));
             plan.push_back(read);
         }
+        const size_t best = ssd::place::best_read_run(worths);
+        // the reads past the best run give their slots back as they were, as a read never issued does
+        for (size_t j = best; j < plan.size(); ++j) {
+            if (cache.entries[size_t(plan[j].entry)].lent) { --r.borrowed; }
+            cache.prefetch_restore(plan[j].entry, plan[j].generation, plan[j].prior);
+        }
+        r.declined = candidates.size() - skipped - best;
+        plan.resize(best);
         lookahead.unresolved += unresolved;
-        if (plan.empty()) { return; } // none resolves (the last routed layer's call), or no slot
+        if (plan.empty()) { return; } // none resolves (the last routed layer's call), none pays, or no slot
         std::lock_guard<std::mutex> lock(io_mutex);
         lookahead.plan.swap(plan);
         lookahead.layer = next;
@@ -3275,32 +3339,36 @@ struct kimi_cpu_sink {
         lookahead.job_layer = layer;
         return true;
     }
-    // One line a grouped-prefill call: the window before its reads (-1: none sampled), the estimate its plan of the
-    // next layer took, what the previous call's plan read for it and what it used, and its own plan.
+    // One line a grouped-prefill call: the window before its reads (-1: none sampled), what the previous call's plan
+    // read for it and what it used, and its own plan of the next layer.
     void lookahead_print() {
         const auto & r = lookahead_report;
         ++lookahead.layers;
         lookahead.planned += r.next_planned; lookahead.issued_total += r.issued; lookahead.landed_total += r.landed;
         lookahead.failed_total += r.failed; lookahead.used += r.used; lookahead.unused += r.unused;
         lookahead.used_bytes += r.bytes; lookahead.no_slot += r.no_slot; lookahead.borrowed += r.borrowed;
+        lookahead.declined += r.declined;
         std::fprintf(stderr, "[kimi_cpu_prefill_lookahead] layer=%d enabled=%d window_us=%.0f"
-            " likely=%llu planned=%llu issued=%llu read=%llu failed=%llu used=%llu unused=%llu"
-            " bytes=%llu next_planned=%zu no_slot=%llu borrowed=%llu\n", r.layer, int(lookahead.enabled),
-            r.window_us, (unsigned long long) r.likely, (unsigned long long) r.planned,
+            " candidates=%llu planned=%llu issued=%llu read=%llu failed=%llu used=%llu unused=%llu"
+            " bytes=%llu next_planned=%zu declined=%llu no_slot=%llu borrowed=%llu\n", r.layer, int(lookahead.enabled),
+            r.window_us, (unsigned long long) r.candidates, (unsigned long long) r.planned,
             (unsigned long long) r.issued, (unsigned long long) r.landed, (unsigned long long) r.failed,
             (unsigned long long) r.used, (unsigned long long) r.unused, (unsigned long long) r.bytes,
-            r.next_planned, (unsigned long long) r.no_slot, (unsigned long long) r.borrowed);
+            r.next_planned, (unsigned long long) r.declined, (unsigned long long) r.no_slot,
+            (unsigned long long) r.borrowed);
     }
     void lookahead_summary() {
         if (!lookahead.enabled || !lookahead.layers) { return; }
         std::fprintf(stderr, "[kimi_cpu_prefill_lookahead] reason=destroy layers=%llu planned=%llu issued=%llu read=%llu"
-            " failed=%llu used=%llu unused=%llu used_bytes=%llu no_slot=%llu unresolved=%llu unlikely=%llu borrowed=%llu\n",
+            " failed=%llu used=%llu unused=%llu used_bytes=%llu no_slot=%llu unresolved=%llu no_candidate=%llu"
+            " borrowed=%llu declined=%llu\n",
             (unsigned long long) lookahead.layers, (unsigned long long) lookahead.planned,
             (unsigned long long) lookahead.issued_total, (unsigned long long) lookahead.landed_total,
             (unsigned long long) lookahead.failed_total, (unsigned long long) lookahead.used,
             (unsigned long long) lookahead.unused, (unsigned long long) lookahead.used_bytes,
             (unsigned long long) lookahead.no_slot, (unsigned long long) lookahead.unresolved,
-            (unsigned long long) lookahead.unlikely, (unsigned long long) lookahead.borrowed);
+            (unsigned long long) lookahead.no_candidate, (unsigned long long) lookahead.borrowed,
+            (unsigned long long) lookahead.declined);
         std::string rates;
         for (int rank = 0; rank < 16 && lookahead.rank_predicted[rank]; ++rank) {
             char one[32];

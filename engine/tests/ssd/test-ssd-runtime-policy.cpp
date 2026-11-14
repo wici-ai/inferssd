@@ -51,13 +51,21 @@ static void prefetch_contract() {
     check(rank.novel && !rank.request && !rank.skipped, "ranks past depth remain counted without requests");
     check(!plan_prefetch_rank(-1, false, false, 0, 2).request, "invalid expert never reaches resolver");
     // A read pays its use probability where the window outlasts it, p - r where the window ends with a share r of it
-    // left, nothing where it ends first; no window seen: p. The rule of succession gives one half without evidence.
+    // left, p - 1 where it ends after the read's issue and before the drive gets to it, nothing where it ends before
+    // the issue; no window seen: p. The rule of succession gives one half without evidence.
     const std::vector<std::pair<double, double>> long_windows = {{5000, 1}}, short_windows = {{500, 3}, {5000, 1}};
-    check(near(prefetch_read_value(.6, 0, 1000, long_windows), .6), "a read the window covers is worth its use");
-    check(near(prefetch_read_value(.6, 0, 1000, {{500, 1}}), .1), "a read the window ends halfway through is worth p - 1/2");
-    check(near(prefetch_read_value(.6, 1000, 1000, {{500, 1}}), 0), "a read the window ends before is dropped at no cost");
-    check(near(prefetch_read_value(.4, 0, 1000, short_windows), (3 * -.1 + .4) / 4), "the windows are weighed by how often they occur");
-    check(near(prefetch_read_value(.7, 0, 1000, {}), .7), "no window seen: the read is worth its use");
+    check(near(prefetch_read_value(.6, 0, 0, 1000, long_windows), .6), "a read the window covers is worth its use");
+    check(near(prefetch_read_value(.6, 0, 0, 1000, {{500, 1}}), .1), "a read the window ends halfway through is worth p - 1/2");
+    check(near(prefetch_read_value(.6, 1000, 1000, 1000, {{500, 1}}), 0), "a read the window ends before is dropped at no cost");
+    check(near(prefetch_read_value(.4, 0, 0, 1000, short_windows), (3 * -.1 + .4) / 4), "the windows are weighed by how often they occur");
+    check(near(prefetch_read_value(.7, 0, 0, 1000, {}), .7), "no window seen: the read is worth its use");
+    check(near(prefetch_read_value(.6, 0, 1000, 1000, {{500, 1}}), -.4),
+          "a read issued but not reached when the window ends is all left to finish: p - 1");
+    check(near(prefetch_read_value(.6, 1000, 2000, 1000, {{500, 1}}), 0), "a read the window ends before its issue costs nothing");
+    check(near(prefetch_read_value(.9, 0, 1000, 1000, {{500, 1}, {1500, 1}, {2500, 1}}), (-.1 + .4 + .9) / 3),
+          "a read in flight behind others: queued, half read and read windows");
+    check(best_read_run({.5, -.2, -.2, .6}) == 4 && best_read_run({.5, -.4, .1}) == 1 && best_read_run({-.1, .3}) == 2 &&
+          best_read_run({-.1}) == 0 && best_read_run({}) == 0, "a plan keeps the run of reads worth the most");
     check(near(prefetch_use_probability(0, 0), .5) && near(prefetch_use_probability(9, 10), 10.0 / 12),
           "use probability by the rule of succession");
 }

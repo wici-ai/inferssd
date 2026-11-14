@@ -206,21 +206,37 @@ inline prefetch_plan plan_prefetch(int layer, int hint_layer, int hint_n, int to
 inline double prefetch_use_probability(uint64_t selected, uint64_t novel) {
     return (double(selected) + 1.0) / (double(novel) + 2.0);
 }
-// What a speculative read of an expert is worth, in reads of it: p the chance the next layer uses the expert,
-// start_us when the read starts after the drive's idle window opens, read_us how long it takes, windows the idle
-// windows seen (length in us, weight). A window that ends after the read saves a read if the expert is used. One
-// that ends during it, a share r of the read left: the done part (1 - r) is saved if the expert is used, and the
-// rest takes r of a read's drive time from the demand reads if it is not, p (1 - r) - (1 - p) r = p - r. One that ends
-// before the read starts drops it, at no cost. No window seen yet: p.
-inline double prefetch_read_value(double p, double start_us, double read_us,
+// What a speculative read of an expert is worth, in reads of it: p what the read gains if it lands (the chance the
+// next layer uses the expert, less the chance the pass would have used what its slot held); after the drive's idle
+// window opens, issue_us when the read is issued and start_us when the drive gets to it (at its issue where a reader
+// takes one read at a time, later where the reads ahead of it are in flight with it); read_us how long the drive
+// takes on it; windows the idle windows seen (length in us, weight). A window that ends after the read saves a read
+// if the expert is used. One that ends during it, a share r of the read left: the done part (1 - r) is saved if the
+// expert is used, and the rest takes r of a read's drive time from the demand reads if it is not,
+// p (1 - r) - (1 - p) r = p - r. One that ends after the read's issue and before the drive gets to it leaves the
+// whole read to finish first: p - 1. One that ends before the issue drops the read, at no cost. No window seen yet: p.
+inline double prefetch_read_value(double p, double issue_us, double start_us, double read_us,
         const std::vector<std::pair<double, double>> & windows) {
     double value = 0, weight = 0;
     for (const auto & w : windows) {
         weight += w.second;
         if (w.first >= start_us + read_us) { value += w.second * p; }
         else if (w.first > start_us) { value += w.second * (p - (start_us + read_us - w.first) / read_us); }
+        else if (w.first > issue_us) { value += w.second * (p - 1); }
     }
     return weight > 0 ? value / weight : p;
+}
+// How many of a plan's reads, taken in order, to keep: the run whose summed worth (prefetch_read_value) is largest,
+// none if no run is worth anything. A read the window ends before is never issued and costs nothing, so a read past
+// a stretch of windows that end can be worth something again in the longer ones.
+inline size_t best_read_run(const std::vector<double> & worth) {
+    double total = 0, best_total = 0;
+    size_t best = 0;
+    for (size_t i = 0; i < worth.size(); ++i) {
+        total += worth[i];
+        if (total > best_total) { best_total = total; best = i + 1; }
+    }
+    return best;
 }
 struct prefetch_rank { bool novel, skipped, request; };
 inline prefetch_rank plan_prefetch_rank(int32_t expert, bool held, bool cached, int rank, int topk) {

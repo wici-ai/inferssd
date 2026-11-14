@@ -76,22 +76,27 @@ one of another predicted expert. `0` turns the prefetch off.
 `prefill.lookahead = 1` keeps the drive reading through the gap between two layers
 of a prompt pass, while the GPU computes the next layer's attention and routing.
 Each layer's graph also applies the next layer's router to its input, which
-predicts the next layer's experts for every token. The experts that this prediction
-makes likely to be used (at least even odds, from how often each rank of the
-prediction was right so far) and that neither the GPU tier nor the RAM cache holds
-are read into that layer's RAM cache slots, most likely first (a free slot first,
-else the layer's coldest entry of an expert the pass is less likely to use than
-even odds), and the next layer takes them as RAM hits instead of reading them. The read-ahead holds no memory of its
-own: what it read stays cached. It plans every likely expert and reads them until
-the next layer's call starts; a slot's entry goes only once a read into it is
-issued. When the layer's own RAM cache slots are all taken, it borrows slots of the
-other layers, except the one the pass is computing: an empty slot first, then the
-RAM copy of an expert the GPU tier also holds, then the coldest entry of a layer the
-pass has computed, and last the coldest entry of a layer it has yet to reach. A
-borrowed slot serves that one layer's read and comes back empty, so a pass cycles a
-few slots instead of emptying other layers. It needs a RAM cache that a prompt
-pass reads. `0` turns this off, for
-A/B timing.
+predicts the next layer's experts for every token; an expert's chance of use comes
+from how often each rank of the prediction was right so far. The experts the
+prediction names that neither the GPU tier nor the RAM cache holds are read into
+that layer's RAM cache slots, likeliest first, weighed by the decode prefetch's
+rule over the gaps the pass has had so far. What a read gains if it lands is the
+expert's chance of use, less the chance the pass would have used what its slot
+held; a gap that ends during the read costs the share of it left, and one that ends
+before the read is issued costs nothing. A plan keeps the run of reads worth the
+most, since the gaps differ from layer to layer. The next layer takes what landed
+as RAM hits instead of reading them. A read takes a free slot of the layer first, else the layer's coldest
+entry of an expert the prediction does not name. When the layer's own slots are all
+taken, it borrows slots of the other layers, except the one the pass is computing:
+an empty slot first, then the RAM copy of an expert the GPU tier also holds, then
+the coldest entry of a layer the pass has computed, and last the coldest entry of a
+layer it has yet to reach, which the pass would have used as often as its calls so
+far used the entries they held. A borrowed slot serves that one layer's read and
+comes back empty, so a pass cycles a few slots instead of emptying other layers. The
+read-ahead holds no memory of its own: what it read into the layer's own slots stays
+cached. It reads until the next layer's call starts, and a slot's entry goes only
+once a read into it is issued. It needs a RAM cache that a prompt pass reads. `0`
+turns this off, for A/B timing.
 
 At load, once the server's first pass is done and before any request, the expert
 caches take their experts from the drive. No request has named an expert yet, so

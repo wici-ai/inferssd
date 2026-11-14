@@ -1294,10 +1294,15 @@ struct expert_cache {
     // a pass's read-ahead cycles one pool of slots, as large at the pass's first layers as at its last. The order costs
     // the pass the least first: empty slots, then backups, then the coldest entries of the layers this pass finished
     // (ones a later pass or decode may read), then the coldest of the layers it has yet to reach (ones this pass may
-    // read). Ranked once a plan: while a plan is made nothing else takes a slot, and its own layer's are not here.
-    std::vector<size_t> lendable(int32_t layer_id, int32_t calling) {
+    // read). The first `costless` hold nothing the pass reads again; the rest may each cost the pass a hit. Ranked once
+    // a plan: while a plan is made nothing else takes a slot, and its own layer's are not here.
+    struct lendable_slots {
         std::vector<size_t> order;
-        if (!prefill_read || paused || !stats.budget_bytes || !arena || !stride) { return order; }
+        size_t costless = 0;
+    };
+    lendable_slots lendable(int32_t layer_id, int32_t calling) {
+        lendable_slots slots;
+        if (!prefill_read || paused || !stats.budget_bytes || !arena || !stride) { return slots; }
         struct candidate {
             int rank;
             std::pair<uint64_t, double> score; // as colder() compares two entries
@@ -1319,9 +1324,31 @@ struct expert_cache {
         std::sort(candidates.begin(), candidates.end(), [](const candidate & a, const candidate & b) {
             return std::tie(a.rank, a.score, a.touch, a.index) < std::tie(b.rank, b.score, b.touch, b.index);
         });
-        order.reserve(candidates.size());
-        for (const auto & c : candidates) { order.push_back(c.index); }
-        return order;
+        slots.order.reserve(candidates.size());
+        for (const auto & c : candidates) {
+            slots.order.push_back(c.index);
+            slots.costless += c.rank < 3;
+        }
+        return slots;
+    }
+    // A grouped prefill's call for `layer_id`, its requests known: of the layer's entries its prefill read could serve
+    // (prefill_holds), leaving out `landed` (what the read-ahead read for it), how many there are and how many hold an
+    // expert `requested` names (indexed by expert id).
+    std::pair<uint64_t, uint64_t> retained_use(int32_t layer_id, const std::vector<uint8_t> & requested,
+            const std::vector<int> & landed) const {
+        std::pair<uint64_t, uint64_t> use{ 0, 0 };
+        if (!prefill_read || !arena || !stride) { return use; }
+        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
+        if (found == layers.end()) { return use; }
+        const size_t layer_index = size_t(found - layers.begin());
+        for (size_t i = found->begin; i < found->begin + found->count; ++i) {
+            const auto & e = entries[i];
+            if (!e.enabled || !e.valid || !e.resident || e.layer_index != layer_index || e.id < 0) { continue; }
+            if (std::find(landed.begin(), landed.end(), int(i)) != landed.end()) { continue; }
+            ++use.first;
+            use.second += size_t(e.id) < requested.size() && requested[size_t(e.id)];
+        }
+        return use;
     }
     // Slot `index`, one lendable named, lent to a prefill read-ahead for `layer_id`; -1 when it is not idle any more.
     int prefetch_borrow(size_t index, int32_t layer_id, int32_t expert, const kimi_cpu_sink_source * roles,
