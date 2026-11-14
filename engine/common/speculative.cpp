@@ -866,6 +866,8 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
 
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
+        ngram_cache_context.clear();
+        cache_size = 0;
     }
 
     void draft(
@@ -875,26 +877,25 @@ struct common_speculative_state_ngram_cache : public common_speculative_state {
             llama_tokens & result) override {
         GGML_UNUSED(params);
 
-        if (cache_size < prompt_tgt.size() + 1) {
-            llama_tokens tokens_new;
-            tokens_new.reserve(prompt_tgt.size() + 1 - cache_size);
-            for (size_t j = cache_size; j < prompt_tgt.size(); ++j) {
-                tokens_new.push_back(prompt_tgt[j]);
-            }
-            tokens_new.push_back(id_last); // add the last token
-
-            // Update context ngram cache with new prompt_tgt:
-            common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
-                    tokens_new, tokens_new.size(), false);
-            cache_size = prompt_tgt.size() + 1;
-        }
-
         llama_tokens inp;
         inp.reserve(prompt_tgt.size() + 1);
         for (size_t j = 0; j < prompt_tgt.size(); ++j) {
             inp.push_back(prompt_tgt[j]);
         }
         inp.push_back(id_last);
+
+        if (cache_size > inp.size()) {
+            // Context shifts remove history on which the cached counts depend.
+            ngram_cache_context.clear();
+            cache_size = 0;
+        }
+        if (cache_size < inp.size()) {
+            // Count new continuations using their preceding tokens, including
+            // n-grams that cross the previous draft call's boundary.
+            common_ngram_cache_update(ngram_cache_context, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
+                    inp, inp.size() - cache_size, false);
+            cache_size = inp.size();
+        }
 
         result.push_back(id_last);
 
