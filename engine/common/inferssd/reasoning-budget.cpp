@@ -170,23 +170,11 @@ static void common_reasoning_budget_reset(struct llama_sampler * smpl) {
     ctx->force_pos = 0;
 }
 
-// forward declaration for use in clone
-static struct llama_sampler * common_reasoning_budget_init_state(
-        const struct llama_vocab * vocab, const std::vector<llama_token> & start_tokens,
-        const std::vector<llama_token> & end_tokens, const std::vector<llama_token> & forced_tokens,
-        int32_t budget, common_reasoning_budget_state initial_state);
-
 static struct llama_sampler * common_reasoning_budget_clone(const struct llama_sampler * smpl) {
     const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
-    auto * clone = common_reasoning_budget_init_state(
-        ctx->vocab,
-        ctx->start_matcher.tokens,
-        ctx->end_matcher.tokens,
-        ctx->forced_tokens,
-        ctx->budget,
-        ctx->state);
-    ((common_reasoning_budget_ctx *) clone->ctx)->log_prefix = ctx->log_prefix;
-    return clone;
+    // Checkpoints must resume at the same remaining budget, delimiter positions
+    // and forced token, including protocol evidence pending for the next accept.
+    return llama_sampler_init(smpl->iface, new common_reasoning_budget_ctx(*ctx));
 }
 
 static void common_reasoning_budget_free(struct llama_sampler * smpl) {

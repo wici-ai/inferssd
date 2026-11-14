@@ -44,7 +44,7 @@ struct llama_sampler * common_reasoning_budget_init(
         int32_t                          budget,
         const std::vector<llama_token> & prefill_tokens = {});
 
-// Variant that takes an explicit initial state (used by tests and clone).
+// Variant that takes an explicit initial state (used by tests).
 // COUNTING with budget <= 0 is promoted to FORCING.
 struct llama_sampler * common_reasoning_budget_init(
         const struct llama_vocab       * vocab,
