@@ -1709,7 +1709,10 @@ static void llama_sampler_typical_apply(struct llama_sampler * smpl, llama_token
 
     float entropy = 0.0f;
     for (size_t i = 0; i < cur_p->size; ++i) {
-        entropy += -cur_p->data[i].p * logf(cur_p->data[i].p);
+        const float probability = cur_p->data[i].p;
+        if (probability > 0.0f) {
+            entropy -= probability * logf(probability);
+        }
     }
 
     // Compute the absolute difference between negative log probability and entropy for each candidate

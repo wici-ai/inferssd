@@ -117,6 +117,13 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+llama_build(ssd/test-typical-zero-prob.cpp)
+foreach(scenario masked many-masked underflow finite-min scrambled shifted
+                 minimum-kept allowed-only unmasked disabled bias chain underflow-chain)
+    llama_test(test-typical-zero-prob NAME typical_zero_${scenario}
+               LABEL unit ARGS ${scenario})
+endforeach()
+
 add_executable(test-moe-common-dynamic-tier ssd/test-moe-common-dynamic-tier.cpp)
 target_link_libraries(test-moe-common-dynamic-tier PRIVATE Threads::Threads)
 add_test(NAME moe_common_dynamic_tier COMMAND test-moe-common-dynamic-tier)
