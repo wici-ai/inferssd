@@ -169,7 +169,7 @@ void common_preset::apply_to_params(common_params & params) const {
         if (opt.handler_string) {
             opt.handler_string(params, val);
         } else if (opt.handler_int) {
-            opt.handler_int(params, std::stoi(val));
+            opt.handler_int(params, common_arg_utils::parse_integer(val));
         } else if (opt.handler_bool) {
             opt.handler_bool(params, common_arg_utils::is_truthy(val));
         } else if (opt.handler_str_str) {

@@ -104,6 +104,7 @@ struct common_arg {
 };
 
 namespace common_arg_utils {
+    int parse_integer(const std::string & value);
     bool is_truthy(const std::string & value);
     bool is_falsey(const std::string & value);
     bool is_autoy(const std::string & value);
