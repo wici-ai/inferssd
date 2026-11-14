@@ -783,6 +783,13 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-gguf.cpp)
+llama_build(ssd/test-model-mlock-buffers.cpp)
+target_include_directories(test-model-mlock-buffers PRIVATE ../src ../ggml/src)
+target_compile_features(test-model-mlock-buffers PRIVATE cxx_std_17)
+foreach(mlock_case single split unlocked no-alloc)
+    llama_test(test-model-mlock-buffers NAME model_mlock_${mlock_case}
+        ARGS ${mlock_case} "${CMAKE_CURRENT_BINARY_DIR}/test-model-mlock-${mlock_case}.gguf")
+endforeach()
 llama_build_and_test(ssd/test-dsv41-engram.cpp)
 target_include_directories(test-dsv41-engram PRIVATE ../src)
 
