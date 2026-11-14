@@ -635,6 +635,11 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+llama_build(test-ngram-simple-history.cpp)
+foreach(scenario prefix exact-history short-draft recent-short unigram default-prefix latest-match no-match too-short sampled-token reference)
+    llama_test(test-ngram-simple-history NAME ngram_simple_${scenario} ARGS ${scenario})
+endforeach()
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
