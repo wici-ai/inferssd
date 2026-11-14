@@ -805,19 +805,31 @@ void llama_model::load_hparams(llama_model_loader & ml) {
         ml.get_key(LLM_KV_CONVNEXT_BLOCK_COUNT,      hparams.convnext.n_layer);
     }
 
-    GGML_ASSERT(hparams.n_expert <= LLAMA_MAX_EXPERTS);
-    GGML_ASSERT(hparams.n_expert_used <= hparams.n_expert);
+    const auto require_expert_metadata = [&](bool valid, const char * requirement) {
+        if (!valid) {
+            throw std::runtime_error(format(
+                "invalid expert metadata: %s (expert_count=%u, expert_used_count=%u, "
+                "expert_group_count=%u, expert_group_used_count=%u)", requirement,
+                hparams.n_expert, hparams.n_expert_used, hparams.n_expert_groups, hparams.n_group_used));
+        }
+    };
+    require_expert_metadata(hparams.n_expert <= LLAMA_MAX_EXPERTS, "expert_count exceeds LLAMA_MAX_EXPERTS");
+    require_expert_metadata(hparams.n_expert_used <= hparams.n_expert, "expert_used_count exceeds expert_count");
     if (hparams.n_expert > 0) {
-        GGML_ASSERT(hparams.n_expert_used > 0);
-        GGML_ASSERT(hparams.n_expert_groups < hparams.n_expert);
+        require_expert_metadata(hparams.n_expert_used > 0, "expert_used_count must be positive for routed experts");
+        require_expert_metadata(hparams.n_expert_groups < hparams.n_expert,
+            "expert_group_count must be smaller than expert_count");
         if (hparams.n_expert_groups > 1) {
-            GGML_ASSERT(hparams.n_expert % hparams.n_expert_groups == 0);
-            GGML_ASSERT(hparams.n_group_used > 0);
-            GGML_ASSERT(hparams.n_group_used < hparams.n_expert_groups);
+            require_expert_metadata(hparams.n_expert % hparams.n_expert_groups == 0,
+                "expert_count must be divisible by expert_group_count");
+            require_expert_metadata(hparams.n_group_used > 0,
+                "expert_group_used_count must be positive for grouped experts");
+            require_expert_metadata(hparams.n_group_used < hparams.n_expert_groups,
+                "expert_group_used_count must be smaller than expert_group_count");
         }
     } else {
-        GGML_ASSERT(hparams.n_expert_used == 0);
-        GGML_ASSERT(hparams.n_expert_groups == 0);
+        require_expert_metadata(hparams.n_expert_used == 0, "expert_used_count must be zero without routed experts");
+        require_expert_metadata(hparams.n_expert_groups == 0, "expert_group_count must be zero without routed experts");
     }
 
     std::fill(hparams.n_head_arr.begin(),    hparams.n_head_arr.end(),    0);

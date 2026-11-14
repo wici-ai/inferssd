@@ -117,6 +117,18 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+add_executable(test-expert-metadata ssd/test-expert-metadata.cpp)
+target_link_libraries(test-expert-metadata PRIVATE llama)
+foreach(mode too-many-experts too-many-active no-active too-many-groups uneven-groups no-active-groups
+             all-groups-active excess-active-groups dense-with-groups dense-with-active dense-absent
+             dense-zero routed single-expert all-experts-active single-group grouped maximum
+             inactive-group-setting single-group-setting vocab-only
+             count-type used-type groups-type groups-used-type)
+    add_test(NAME expert_metadata_${mode} COMMAND test-expert-metadata ${mode}
+        "${CMAKE_CURRENT_BINARY_DIR}/expert-metadata-${mode}.gguf")
+    set_property(TEST expert_metadata_${mode} PROPERTY LABELS main)
+endforeach()
+
 add_executable(test-moe-common-dynamic-tier ssd/test-moe-common-dynamic-tier.cpp)
 target_link_libraries(test-moe-common-dynamic-tier PRIVATE Threads::Threads)
 add_test(NAME moe_common_dynamic_tier COMMAND test-moe-common-dynamic-tier)
