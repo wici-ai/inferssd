@@ -459,7 +459,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                     opt.handler_void(params);
                 }
                 if (opt.handler_int) {
-                    opt.handler_int(params, std::stoi(value));
+                    opt.handler_int(params, parse_integer(value));
                 }
                 if (opt.handler_bool) {
                     opt.handler_bool(params, parse_bool_value(value));
@@ -518,7 +518,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 check_arg(i);
                 std::string val = argv[++i];
                 if (opt.handler_int) {
-                    opt.handler_int(params, std::stoi(val));
+                    opt.handler_int(params, parse_integer(val));
                     continue;
                 }
                 if (opt.handler_string) {
@@ -944,6 +944,15 @@ static std::string list_builtin_chat_templates() {
         msg << tmpl << (&tmpl == &supported_tmpl.back() ? "" : ", ");
     }
     return msg.str();
+}
+
+int common_arg_utils::parse_integer(const std::string & value) {
+    size_t end = 0;
+    const int result = std::stoi(value, &end);
+    if (value.find_first_not_of(" \t\r\n\f\v", end) != std::string::npos) {
+        throw std::invalid_argument("expected an integer without trailing characters");
+    }
+    return result;
 }
 
 bool common_arg_utils::is_truthy(const std::string & value) {
@@ -2380,7 +2389,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else if (value == "all") {
                 params.n_gpu_layers = -2;
             } else {
-                params.n_gpu_layers = std::stoi(value);
+                params.n_gpu_layers = parse_integer(value);
             }
             if (!llama_supports_gpu_offload()) {
                 fprintf(stderr, "warning: no usable GPU found, --gpu-layers option will be ignored\n");
@@ -2589,8 +2598,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--control-vector-layer-range"}, "START", "END",
         "layer range to apply the control vector(s) to, start and end inclusive",
         [](common_params & params, const std::string & start, const std::string & end) {
-            params.control_vector_layer_start = std::stoi(start);
-            params.control_vector_layer_end = std::stoi(end);
+            params.control_vector_layer_start = parse_integer(start);
+            params.control_vector_layer_end = parse_integer(end);
         }
     ));
     add_opt(common_arg(
@@ -3596,7 +3605,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else if (value == "all") {
                 params.speculative.draft.n_gpu_layers = -2;
             } else {
-                params.speculative.draft.n_gpu_layers = std::stoi(value);
+                params.speculative.draft.n_gpu_layers = parse_integer(value);
             }
             if (!llama_supports_gpu_offload()) {
                 fprintf(stderr, "warning: no usable GPU found, --gpu-layers-draft option will be ignored\n");

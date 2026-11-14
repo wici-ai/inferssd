@@ -778,6 +778,11 @@ set_tests_properties(test-thread-safety PROPERTIES
 
 llama_build_and_test(test-arg-parser.cpp)
 
+llama_build(test-arg-integers.cpp)
+foreach(integer_case cli environment presets valid)
+    llama_test(test-arg-integers NAME arg_integers_${integer_case} ARGS ${integer_case} LABEL unit)
+endforeach()
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
