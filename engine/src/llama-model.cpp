@@ -768,6 +768,16 @@ void llama_model::load_hparams(llama_model_loader & ml) {
         return;
     }
 
+    if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+        ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+        if (hparams.nextn_predict_layers != 0) {
+            throw std::runtime_error(format(
+                "unsupported %s.nextn_predict_layers = %u: this engine cannot load Qwen NextN/MTP layouts; "
+                "use a GGUF with this key absent or zero",
+                ml.get_arch_name().c_str(), hparams.nextn_predict_layers));
+        }
+    }
+
     if (dsv41_antirez_layout) {
         ml.get_key("deepseek41.max_position_embeddings", hparams.n_ctx_train);
         ml.get_key("deepseek41.hidden_size",              hparams.n_embd);
