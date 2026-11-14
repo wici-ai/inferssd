@@ -635,6 +635,14 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+llama_build(ssd/test-attention-interval.cpp)
+foreach(qwen_arch qwen3next qwen35 qwen35moe)
+    foreach(interval_case absent zero one two maximum wrong-type vocab-only)
+        llama_test(test-attention-interval NAME attention_interval_${qwen_arch}_${interval_case} LABEL unit
+            ARGS ${qwen_arch} ${interval_case} ${CMAKE_CURRENT_BINARY_DIR}/attention-interval-${qwen_arch}-${interval_case}.gguf)
+    endforeach()
+endforeach()
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
