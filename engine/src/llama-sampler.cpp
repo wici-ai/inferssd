@@ -1120,6 +1120,7 @@ static struct llama_sampler * llama_sampler_dist_clone(const struct llama_sample
         auto * result_ctx = (llama_sampler_dist *) result->ctx;
 
         result_ctx->rng = ctx->rng;
+        result_ctx->seed_cur = ctx->seed_cur;
     }
 
     return result;
@@ -2271,10 +2272,11 @@ static struct llama_sampler * llama_sampler_mirostat_clone(const struct llama_sa
 
     // copy the state
     {
-        auto * result_ctx = (llama_sampler_mirostat *) smpl->ctx;
+        auto * result_ctx = (llama_sampler_mirostat *) result->ctx;
 
         result_ctx->mu  = ctx->mu;
         result_ctx->rng = ctx->rng;
+        result_ctx->seed_cur = ctx->seed_cur;
     }
 
     return result;
@@ -2386,6 +2388,7 @@ static struct llama_sampler * llama_sampler_mirostat_v2_clone(const struct llama
 
         result_ctx->mu  = ctx->mu;
         result_ctx->rng = ctx->rng;
+        result_ctx->seed_cur = ctx->seed_cur;
     }
 
     return result;
@@ -3374,7 +3377,10 @@ static struct llama_sampler * llama_sampler_adaptive_p_clone(const struct llama_
     auto * result     = llama_sampler_init_adaptive_p(ctx->target, ctx->decay, ctx->seed);
     auto * result_ctx = (llama_sampler_adaptive_p *) result->ctx;
 
-    // copy everything (target, decay, seed, and RNG are already set)
+    // Preserve both the sampling state and an apply awaiting acceptance.
+    result_ctx->seed_cur          = ctx->seed_cur;
+    result_ctx->rng               = ctx->rng;
+    result_ctx->original_probs    = ctx->original_probs;
     result_ctx->weighted_sum      = ctx->weighted_sum;
     result_ctx->total_weight      = ctx->total_weight;
     result_ctx->pending_token_id  = ctx->pending_token_id;
