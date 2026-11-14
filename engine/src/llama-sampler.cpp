@@ -2235,22 +2235,39 @@ static void llama_sampler_mirostat_apply(struct llama_sampler * smpl, llama_toke
     llama_sampler_softmax_impl(cur_p, true);
 
     // Estimate s_hat using the most probable m tokens
-    float s_hat = 0.0;
-    float sum_ti_bi = 0.0;
-    float sum_ti_sq = 0.0;
+    double sum_ti_bi = 0.0;
+    double sum_ti_sq = 0.0;
     for (size_t i = 0; i < size_t(ctx->m - 1) && i < cur_p->size - 1; ++i) {
-        float t_i = logf(float(i + 2) / float(i + 1));
-        float b_i = logf(cur_p->data[i].p / cur_p->data[i + 1].p);
+        if (!std::isfinite(cur_p->data[i + 1].logit)) {
+            break; // Masked tokens cannot contribute to the slope estimate.
+        }
+        const double t_i = std::log(double(i + 2) / double(i + 1));
+        // log(p_i / p_j) = logit_i - logit_j, including when float probabilities underflow.
+        const double b_i = double(cur_p->data[i].logit) - double(cur_p->data[i + 1].logit);
         sum_ti_bi += t_i * b_i;
         sum_ti_sq += t_i * t_i;
     }
-    s_hat = sum_ti_bi / sum_ti_sq;
 
     // Compute k from the estimated s_hat and target surprise value
-    float epsilon_hat = s_hat - 1;
-    float k = powf((epsilon_hat * powf(2, ctx->mu)) / (1 - powf(ctx->n_vocab, -epsilon_hat)), 1 / s_hat);
+    int k = 1;
+    if (sum_ti_bi > 0.0 && sum_ti_sq > 0.0 && ctx->n_vocab > 1) {
+        const double s_hat = sum_ti_bi / sum_ti_sq;
+        const double epsilon_hat = s_hat - 1.0;
+        const double log_n = std::log(double(ctx->n_vocab));
+        // expm1 avoids cancellation near s_hat = 1; the limit there is 1/log(N).
+        const double normalization = epsilon_hat == 0.0
+            ? 1.0 / log_n : epsilon_hat / -std::expm1(-epsilon_hat * log_n);
+        const double log_k = (std::log(normalization) + double(ctx->mu) * std::log(2.0)) / s_hat;
+        const int max_k = int(std::min(cur_p->size, size_t(INT32_MAX)));
+        if (log_k >= std::log(double(max_k))) {
+            k = max_k;
+        } else if (log_k > 0.0) {
+            // Bound before converting: neither overflow nor NaN may reach the integer cast.
+            k = int(std::min(std::exp(log_k), double(max_k)));
+        }
+    }
 
-    llama_sampler_top_k_impl(cur_p, std::max(int(k), 1));
+    llama_sampler_top_k_impl(cur_p, k);
 
     llama_sampler_softmax_impl(cur_p, true);
 
