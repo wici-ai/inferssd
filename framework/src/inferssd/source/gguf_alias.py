@@ -254,6 +254,9 @@ def read_header(path: Path) -> Header:
                 # Native gguf rejects every tensor name at GGML_MAX_NAME (128)
                 # bytes, including dense tensors not selected for the alias.
                 name, dimensions = reader.string(max_bytes=127), int(reader.take("I"))
+                # ggml_set_name stores the C-string prefix. Use that same key for
+                # expert selection and duplicate checks, after validating all bytes.
+                name = name.partition("\x00")[0]
                 if name in names:
                     raise ValueError(f"Found duplicated tensor with name {name}")
                 names.add(name)
