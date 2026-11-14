@@ -2015,6 +2015,12 @@ static void llama_sampler_temp_ext_backend_apply(
         return;
     }
 
+    // Match CPU sampling: a single remaining candidate needs no scaling.
+    // Its maximum entropy is zero, so normalizing it would produce NaN.
+    if (data->logits->ne[0] <= 1) {
+        return;
+    }
+
     // Calculate min_temp, max_temp, and max_entropy.
     const float min_temp    = std::max(0.0f, sctx->temp - sctx->delta);
     const float max_temp    = sctx->temp + sctx->delta;
