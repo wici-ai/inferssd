@@ -146,18 +146,20 @@ string string::lowercase() {
     });
 }
 string string::capitalize() {
-    return apply_transform(*this, [](const std::string & s) {
-        if (s.empty()) return s;
+    bool first = true;
+    return apply_transform(*this, [&first](const std::string & s) {
         std::string res = s;
-        res[0] = ::toupper(static_cast<unsigned char>(res[0]));
-        std::transform(res.begin() + 1, res.end(), res.begin() + 1, ::tolower);
+        for (char & c : res) {
+            c = first ? ::toupper(static_cast<unsigned char>(c)) : ::tolower(static_cast<unsigned char>(c));
+            first = false;
+        }
         return res;
     });
 }
 string string::titlecase() {
-    return apply_transform(*this, [](const std::string & s) {
+    bool capitalize_next = true;
+    return apply_transform(*this, [&capitalize_next](const std::string & s) {
         std::string res = s;
-        bool capitalize_next = true;
         for (char &c : res) {
             if (isspace(static_cast<unsigned char>(c))) {
                 capitalize_next = true;
