@@ -901,6 +901,18 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
 }
 
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+    // Resource discovery only needs the static registry. Keep the standalone
+    // schema command independent of backend loading and inference environment.
+    if (argc == 2 && (std::string(argv[1]) == "--ssd-schema" || std::string(argv[1]) == "--ssd_schema")) {
+        try {
+            common_ssd_print_schema();
+            exit(0);
+        } catch (const std::exception & error) {
+            std::fprintf(stderr, "%s\n", error.what());
+            return false;
+        }
+    }
+
     auto ctx_arg = common_params_parser_init(params, ex, print_usage);
     const common_params params_org = ctx_arg.params; // the example can modify the default params
 

@@ -778,6 +778,21 @@ set_tests_properties(test-thread-safety PROPERTIES
 
 llama_build_and_test(test-arg-parser.cpp)
 
+add_library(test-ssd-schema-backend MODULE ssd/test-ssd-schema-backend.cpp)
+target_compile_features(test-ssd-schema-backend PRIVATE cxx_std_17)
+target_compile_definitions(test-ssd-schema-backend PRIVATE GGML_BACKEND_DL GGML_BACKEND_SHARED GGML_BACKEND_BUILD)
+target_include_directories(test-ssd-schema-backend PRIVATE ../ggml/src ../ggml/include)
+llama_build(ssd/test-ssd-schema-cli.cpp)
+add_dependencies(test-ssd-schema-cli test-ssd-schema-backend)
+foreach(schema_case hyphen underscore environment model-value extra-argument trailing-options devices)
+    add_test(NAME ssd_schema_cli_${schema_case} COMMAND ${CMAKE_COMMAND}
+        -DDRIVER=$<TARGET_FILE:test-ssd-schema-cli>
+        -DBACKEND=$<TARGET_FILE:test-ssd-schema-backend>
+        -DCASE=${schema_case}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/ssd/test-ssd-schema-cli.cmake)
+    set_tests_properties(ssd_schema_cli_${schema_case} PROPERTIES LABELS unit TIMEOUT 30)
+endforeach()
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
