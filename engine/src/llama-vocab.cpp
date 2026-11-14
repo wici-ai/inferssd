@@ -2924,6 +2924,7 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
         }
 
         // for each text fragment
+        auto previous = buffer.before_begin();
         std::forward_list<fragment_buffer_variant>::iterator it = buffer.begin();
         while (it != buffer.end()) {
             auto & fragment = (*it);
@@ -2964,7 +2965,8 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
 #ifdef PRETOKENIZERDEBUG
                     LLAMA_LOG_WARN("FF: (%ld %ld %ld) '%s'\n", raw_text->length(), raw_text_base_offset, raw_text_base_length, raw_text->substr(raw_text_base_offset, raw_text_base_length).c_str());
 #endif
-                    auto source = std::distance(buffer.begin(), it);
+                    // Keep the predecessor: rediscovering it from begin for each match is quadratic.
+                    const auto source_previous = previous;
 
                     // if match is further than base offset
                     //  then we have some text to the left of it
@@ -2997,6 +2999,7 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
                     if (match + text.length() < raw_text_base_offset + raw_text_base_length) {
                         int64_t right_reminder_offset = match + text.length();
                         int64_t right_reminder_length = raw_text_base_length - ((match - raw_text_base_offset) + text.length());
+                        previous = it;
 
                         if (data.attr & LLAMA_TOKEN_ATTR_RSTRIP) {
                             while (right_reminder_length > 0 && isspace(raw_text[right_reminder_offset])) {
@@ -3014,11 +3017,7 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
                         LLAMA_LOG_WARN("FR: (%ld %ld) '%s'\n", right_reminder_offset, right_reminder_length, raw_text->substr(right_reminder_offset, right_reminder_length).c_str());
 #endif
 
-                        if (source == 0) {
-                            buffer.erase_after(buffer.before_begin());
-                        } else {
-                            buffer.erase_after(std::next(buffer.begin(), (source - 1)));
-                        }
+                        buffer.erase_after(source_previous);
 
                         // repeat for the right side
                         raw_text_base_offset = right_reminder_offset;
@@ -3028,16 +3027,12 @@ void llama_vocab::impl::tokenizer_st_partition(std::forward_list<fragment_buffer
                         LLAMA_LOG_WARN("RR: (%ld %ld) '%s'\n", raw_text_base_offset, raw_text_base_length, raw_text->substr(raw_text_base_offset, raw_text_base_length).c_str());
 #endif
                     } else {
-                        if (source == 0) {
-                            buffer.erase_after(buffer.before_begin());
-                        } else {
-                            buffer.erase_after(std::next(buffer.begin(), (source - 1)));
-                        }
+                        buffer.erase_after(source_previous);
                         break;
                     }
                 }
             }
-            it++;
+            previous = it++;
         }
     }
 }

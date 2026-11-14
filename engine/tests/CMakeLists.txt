@@ -122,6 +122,14 @@ target_link_libraries(test-moe-common-dynamic-tier PRIVATE Threads::Threads)
 add_test(NAME moe_common_dynamic_tier COMMAND test-moe-common-dynamic-tier)
 set_property(TEST moe_common_dynamic_tier PROPERTY LABELS main)
 
+add_executable(test-tokenizer-partition ssd/test-tokenizer-partition.cpp)
+target_link_libraries(test-tokenizer-partition PRIVATE llama ggml-base)
+foreach(scenario boundaries ordinary protected lstrip rstrip repeated)
+    add_test(NAME tokenizer_partition_${scenario}
+        COMMAND test-tokenizer-partition ${scenario} ${CMAKE_CURRENT_BINARY_DIR}/partition-${scenario}.gguf)
+    set_property(TEST tokenizer_partition_${scenario} PROPERTY LABELS "main;unit")
+endforeach()
+
 
 add_executable(test-ssd-model-adapter ssd/test-model-adapter.cpp ../src/ssd/model-adapter.cpp)
 target_compile_features(test-ssd-model-adapter PRIVATE cxx_std_17)
