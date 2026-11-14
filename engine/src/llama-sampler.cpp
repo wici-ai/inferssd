@@ -1484,6 +1484,12 @@ static void llama_sampler_top_p_backend_apply(
     struct ggml_tensor * mask_reshaped = ggml_reshape_2d(ctx, mask, 1, mask->ne[0]);
 
     mask_reshaped = ggml_set_rows(ctx, mask_reshaped, ones, ggml_cast(ctx, idxf, GGML_TYPE_I32));
+    if (sctx->min_keep > 1) {
+        const int64_t keep = std::min<size_t>(sctx->min_keep, mask->ne[0]);
+        struct ggml_tensor * indices = ggml_arange(ctx, 0.0f, keep, 1.0f);
+        struct ggml_tensor * prefix_ones = ggml_reshape_2d(ctx, ggml_scale_bias(ctx, indices, 0.0f, 1.0f), 1, keep);
+        mask_reshaped = ggml_set_rows(ctx, mask_reshaped, prefix_ones, ggml_cast(ctx, indices, GGML_TYPE_I32));
+    }
     mask = ggml_reshape_1d(ctx, mask_reshaped, mask->ne[0]);
 
     // Apply -INFINITY bias for masked-out tokens
@@ -1635,13 +1641,24 @@ static void llama_sampler_min_p_backend_apply(
     struct ggml_tensor * threshold = ggml_scale_bias(ctx, max_logit, 1.0f, logf(sctx->p));
     ggml_set_name(threshold, "min_p_threshold");
 
-    // Subtract the threshold from logits.
+    // Invert the strict step comparison so equality is retained, as on CPU.
     struct ggml_tensor * sub = ggml_sub(ctx, data->logits, threshold);
 
     // Create a mask where logits below the threshold are 0 (discard),
     // and others are 1 (keep).
-    struct ggml_tensor * mask = ggml_step(ctx, sub);
+    struct ggml_tensor * mask = ggml_scale_bias(ctx, ggml_step(ctx, ggml_neg(ctx, sub)), -1.0f, 1.0f);
     ggml_set_name(mask, "min_p_mask");
+
+    // Keep at least min_keep of the best candidates. Even p > 1 must retain
+    // one token, matching the CPU fallback when no token meets the threshold.
+    if (sctx->min_keep > 1 || sctx->p > 1.0f) {
+        const int32_t keep = std::min<size_t>(std::max<size_t>(1, sctx->min_keep), mask->ne[0]);
+        struct ggml_tensor * indices = ggml_top_k(ctx, data->logits, keep);
+        struct ggml_tensor * ones = ggml_scale_bias(ctx, ggml_cast(ctx, indices, GGML_TYPE_F32), 0.0f, 1.0f);
+        struct ggml_tensor * rows = ggml_set_rows(
+                ctx, ggml_reshape_2d(ctx, mask, 1, mask->ne[0]), ggml_reshape_2d(ctx, ones, 1, keep), indices);
+        mask = ggml_reshape_1d(ctx, rows, mask->ne[0]);
+    }
 
     // Apply -INFINITY bias for masked-out tokens
     // log(1) = 0 (keep), log(0) = -INF (discard)
