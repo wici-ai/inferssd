@@ -117,6 +117,19 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+
+llama_build(ssd/test-sampler-clone.cpp)
+foreach(sampler dist mirostat mirostat-v2 adaptive-p xtc-chain penalties-chain)
+    foreach(scenario fresh warmed pending independent reset)
+        llama_test(test-sampler-clone NAME sampler_clone_${sampler}_${scenario}
+                   LABEL unit ARGS ${sampler} ${scenario})
+    endforeach()
+endforeach()
+foreach(sampler dist mirostat mirostat-v2)
+    llama_test(test-sampler-clone NAME sampler_clone_${sampler}_seed
+               LABEL unit ARGS ${sampler} seed)
+endforeach()
+
 add_executable(test-moe-common-dynamic-tier ssd/test-moe-common-dynamic-tier.cpp)
 target_link_libraries(test-moe-common-dynamic-tier PRIVATE Threads::Threads)
 add_test(NAME moe_common_dynamic_tier COMMAND test-moe-common-dynamic-tier)
