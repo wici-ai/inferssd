@@ -376,6 +376,41 @@ def test_native_split_metadata_and_nonexpert_duplicates_are_checked(tmp_path):
         m.build_rows([a, b], {"up"}, 256)
 
 
+@pytest.mark.parametrize("suffix", ["", "\x00ignored", "\x00\x00suffix"])
+def test_expert_alias_uses_native_c_string_name(tmp_path, suffix):
+    path = tmp_path / "model.gguf"
+    _, data = fixture(path, tensors=[(EXPERT + suffix, (32, 2, 256), 8, 0)])
+    header = m.read_header(path)
+    rows, summary = m.build_rows([path], {"up"}, 256)
+
+    assert header.tensors[0].name == EXPERT
+    assert len(rows) == 256 and summary["expert_tensors"] == 1
+    assert all(row["tensor"] == EXPERT for row in rows)
+    assert rows[0]["offset"] == data and rows[-1]["offset"] == data + 255 * 68
+
+
+@pytest.mark.parametrize(
+    "names", [("dense", "dense\x00suffix"), ("dense\x00a", "dense\x00b"), ("", "\x00suffix")]
+)
+def test_native_name_duplicates_are_rejected_within_header(tmp_path, names):
+    path = tmp_path / "duplicate.gguf"
+    fixture(path, tensors=[(name, (1,), 0, i * 32) for i, name in enumerate(names)])
+    with pytest.raises(ValueError, match="Found duplicated tensor with name"):
+        m.read_header(path)
+
+
+def test_native_name_duplicates_are_rejected_across_shards(tmp_path):
+    a, b = (tmp_path / f"model-{i:05d}-of-00002.gguf" for i in (1, 2))
+    fixture(
+        a,
+        tensors=[(EXPERT, (32, 2, 256), 8, 0), ("dense\x00first", (32,), 0, 17408)],
+        kv=[("split.no", 2, 0), ("split.count", 2, 2), ("split.tensors.count", 5, 3)],
+    )
+    fixture(b, tensors=[("dense\x00second", (32,), 0, 0)], kv=[("split.no", 2, 1)])
+    with pytest.raises(RuntimeError, match="duplicate tensor across shards: dense"):
+        m.build_rows([a, b], {"up"}, 256)
+
+
 def test_aligned_selection_and_runtime_name_limit(tmp_path):
     path = tmp_path / "model.gguf"
     fixture(
@@ -393,7 +428,7 @@ def test_aligned_selection_and_runtime_name_limit(tmp_path):
         m.build_rows([path], {"up"}, 256)
 
 
-@pytest.mark.parametrize("name", ["d" * 128, "é" * 64])
+@pytest.mark.parametrize("name", ["d" * 128, "é" * 64, "dense\x00" + "s" * 122])
 def test_all_native_tensor_names_are_byte_bounded_before_reading(tmp_path, monkeypatch, name):
     path = tmp_path / "bad.gguf"
     fixture(path, tensors=[(name, (1,), 0, 0)])
