@@ -46,6 +46,7 @@ struct string {
     // Byte slice of a possibly mixed string; retain every source boundary.
     string substr(size_t offset, size_t count = std::string::npos) const;
 
+    void append_inplace(const string & other);
     string append(const string & other);
 
     // in-place transformations

@@ -403,11 +403,11 @@ struct value_array_t : public value_t {
         const bool immutable = is_immutable();
         string result(std::string(immutable ? "(" : "["));
         for (size_t i = 0; i < val_arr.size(); i++) {
-            if (i > 0) result.append(string(std::string(", ")));
-            result.append(value_to_string_repr_origin(val_arr.at(i)));
+            if (i > 0) result.append_inplace(string(std::string(", ")));
+            result.append_inplace(value_to_string_repr_origin(val_arr.at(i)));
         }
-        if (immutable && val_arr.size() == 1) result.append(string(std::string(",")));
-        result.append(string(std::string(immutable ? ")" : "]")));
+        if (immutable && val_arr.size() == 1) result.append_inplace(string(std::string(",")));
+        result.append_inplace(string(std::string(immutable ? ")" : "]")));
         return result;
     }
     virtual bool as_bool() const override {
@@ -507,13 +507,13 @@ struct value_object_t : public value_t {
     virtual string as_string() const override {
         string result(std::string("{"));
         for (size_t i = 0; i < val_obj.size(); i++) {
-            if (i > 0) result.append(string(std::string(", ")));
+            if (i > 0) result.append_inplace(string(std::string(", ")));
             const auto & [key, val] = val_obj.at(i);
-            result.append(value_to_string_repr_origin(key));
-            result.append(string(std::string(": ")));
-            result.append(value_to_string_repr_origin(val));
+            result.append_inplace(value_to_string_repr_origin(key));
+            result.append_inplace(string(std::string(": ")));
+            result.append_inplace(value_to_string_repr_origin(val));
         }
-        result.append(string(std::string("}")));
+        result.append_inplace(string(std::string("}")));
         return result;
     }
     virtual bool as_bool() const override {

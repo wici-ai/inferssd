@@ -114,10 +114,14 @@ string string::substr(size_t offset, size_t count) const {
     return result;
 }
 
-string string::append(const string & other) {
+void string::append_inplace(const string & other) {
     for (const auto & part : other.parts) {
         parts.push_back(part);
     }
+}
+
+string string::append(const string & other) {
+    append_inplace(other);
     return *this;
 }
 

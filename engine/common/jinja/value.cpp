@@ -179,7 +179,7 @@ static string json_ensure_ascii_preserving_format(const string & origin) {
     for (size_t pos = 0; pos < text.size();) {
         const char ch = text[pos];
         if (!in_string || escaped || ch == '\\' || ch == '"' || static_cast<unsigned char>(ch) < 0x80) {
-            output.append(origin.substr(pos, 1));
+            output.append_inplace(origin.substr(pos, 1));
             if (escaped) escaped = false;
             else if (in_string && ch == '\\') escaped = true;
             else if (ch == '"') in_string = !in_string;
@@ -192,7 +192,7 @@ static string json_ensure_ascii_preserving_format(const string & origin) {
                 append_codepoint_as_ascii_json_escape(converted, parsed.codepoint);
                 size = parsed.bytes_consumed;
             } else converted = "\\ufffd";
-            output.append(string(converted, origin.substr(pos, size).any_parts_are_input()));
+            output.append_inplace(string(converted, origin.substr(pos, size).any_parts_are_input()));
             pos += size;
         }
     }
@@ -364,8 +364,8 @@ const func_builtins & global_builtins() {
                 string output;
                 for (size_t pos = 0; pos < format.size();) {
                     const auto next = format.find('%', pos);
-                    if (next == std::string::npos) { output.append(origin.substr(pos)); break; }
-                    output.append(origin.substr(pos, next - pos));
+                    if (next == std::string::npos) { output.append_inplace(origin.substr(pos)); break; }
+                    output.append_inplace(origin.substr(pos, next - pos));
                     size_t end = next + 1;
                     if (end < format.size() && format[end] == '%') ++end;
                     else {
@@ -376,7 +376,7 @@ const func_builtins & global_builtins() {
                     const auto directive = format.substr(next, end - next);
                     char piece[100] = {};
                     std::strftime(piece, sizeof(piece), directive.c_str(), std::localtime(&args.ctx.current_time));
-                    output.append(string(std::string(piece), origin.substr(next, end - next).any_parts_are_input()));
+                    output.append_inplace(string(std::string(piece), origin.substr(next, end - next).any_parts_are_input()));
                     pos = end;
                 }
                 if (output.str() != buf) throw raised_exception("strftime_now: cannot preserve mixed format origin");
@@ -751,13 +751,13 @@ const func_builtins & value_string_t::get_builtins() const {
             jinja::string result;
             size_t begin = 0, pos;
             while ((pos = str.find(old_str, begin)) != std::string::npos) {
-                result.append(origin.substr(begin, pos - begin));
+                result.append_inplace(origin.substr(begin, pos - begin));
                 auto inserted = replacement;
                 if (origin.substr(pos, old_str.size()).any_parts_are_input()) inserted.mark_input();
-                result.append(inserted);
+                result.append_inplace(inserted);
                 begin = pos + old_str.size();
             }
-            result.append(origin.substr(begin));
+            result.append_inplace(origin.substr(begin));
             return mk_val<value_string>(result);
         }},
         {"int", [](const func_args & args) -> value {
@@ -836,7 +836,7 @@ const func_builtins & value_string_t::get_builtins() const {
             std::vector<size_t> positions(origin.length());
             for (size_t i = 0; i < positions.size(); ++i) positions[i] = i;
             jinja::string result;
-            for (size_t i : slice(positions, start, stop, step)) result.append(origin.substr(i, 1));
+            for (size_t i : slice(positions, start, stop, step)) result.append_inplace(origin.substr(i, 1));
             return mk_val<value_string>(result);
         }},
         {"safe", [](const func_args & args) -> value {
@@ -870,14 +870,14 @@ const func_builtins & value_string_t::get_builtins() const {
             std::string line;
             size_t offset = 0;
             while (std::getline(iss, line)) {
-                if (indented.length()) indented.append(origin.substr(offset - 1, 1));
-                if ((indented.length() == 0 ? first : (!line.empty() || blank))) indented.append(padding);
-                indented.append(origin.substr(offset, line.size()));
+                if (indented.length()) indented.append_inplace(origin.substr(offset - 1, 1));
+                if ((indented.length() == 0 ? first : (!line.empty() || blank))) indented.append_inplace(padding);
+                indented.append_inplace(origin.substr(offset, line.size()));
                 offset += line.size() + 1;
             }
             if (!input.empty() && input.back() == '\n') {
-                indented.append(origin.substr(input.size() - 1, 1));
-                if (blank) indented.append(padding);
+                indented.append_inplace(origin.substr(input.size() - 1, 1));
+                if (blank) indented.append_inplace(padding);
             }
             return mk_val<value_string>(indented);
         }},
@@ -1009,9 +1009,9 @@ const func_builtins & value_array_t::get_builtins() const {
                 if (!is_val<value_string>(val_arr) && !is_val<value_int>(val_arr) && !is_val<value_float>(val_arr)) {
                     throw raised_exception("join() can only join arrays of strings or numerics");
                 }
-                result.append(val_arr->as_string());
+                result.append_inplace(val_arr->as_string());
                 if (i < arr.size() - 1) {
-                    result.append(delim);
+                    result.append_inplace(delim);
                 }
             }
             return mk_val<value_string>(result);
@@ -1508,8 +1508,8 @@ string value_to_string_repr_origin(const value & val) {
         const auto source = val->as_string();
         if (source.str().find('\'') != std::string::npos) return value_to_json_origin(val);
         string result(std::string("'"));
-        result.append(source);
-        result.append(string(std::string("'")));
+        result.append_inplace(source);
+        result.append_inplace(string(std::string("'")));
         return result;
     }
     if (is_val<value_array>(val) || is_val<value_object>(val)) return val->as_string();
