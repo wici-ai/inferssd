@@ -3455,6 +3455,7 @@ static void llama_sampler_logit_bias_apply(struct llama_sampler * smpl, llama_to
     for (const auto & lb : ctx->logit_bias) {
         if (lb.token >= 0 && cur_p->size > (size_t) lb.token && cur_p->data[lb.token].id == lb.token) {
             cur_p->data[lb.token].logit += lb.bias;
+            cur_p->sorted = false;
         } else {
             ctx->to_search.push_back(lb);
         }
@@ -3469,6 +3470,7 @@ static void llama_sampler_logit_bias_apply(struct llama_sampler * smpl, llama_to
         for (const auto & lb : ctx->to_search) {
             if (cur_p->data[i].id == lb.token) {
                 cur_p->data[i].logit += lb.bias;
+                cur_p->sorted = false;
                 break;
             }
         }
@@ -3507,11 +3509,21 @@ static void llama_sampler_logit_bias_backend_apply(
     ggml_set_name(sctx->inp_logit_idxs, "logit_idxs");
     ggml_set_input(sctx->inp_logit_idxs);
 
-    ggml_tensor * cur = ggml_fill(ctx, data->logits, 0.0f);
+    const int64_t n_candidates = ggml_nelements(data->logits);
+    ggml_tensor * bias_base = n_candidates < sctx->n_vocab
+            ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, sctx->n_vocab)
+            : data->logits;
+    ggml_tensor * cur = ggml_fill(ctx, bias_base, 0.0f);
 
     cur = ggml_reshape_2d(ctx, cur, 1, ggml_nelements(cur));
     cur = ggml_set_rows(ctx, cur, sctx->inp_logit_bias, sctx->inp_logit_idxs);
+    if (data->candidates) {
+        cur = ggml_get_rows(ctx, cur, data->candidates);
+    }
     cur = ggml_reshape_1d(ctx, cur, ggml_nelements(cur));
+    if (!data->candidates && n_candidates < sctx->n_vocab) {
+        cur = ggml_view_1d(ctx, cur, n_candidates, 0);
+    }
 
     data->logits = ggml_add(ctx, data->logits, cur);
 }
