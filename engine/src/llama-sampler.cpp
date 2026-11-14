@@ -1160,12 +1160,17 @@ static void llama_sampler_dist_backend_apply(
     struct ggml_tensor * cumsum = ggml_cumsum(ctx, probs);
     ggml_set_name(cumsum, "dist_cumsum");
 
-    // The uniform tensor has a random value and we subtract this tensor with
-    // the cumsum tensor (the uniform tensor will be broadcasted by ggml_sub).
+    // Floating-point prefix sums need not end at exactly one. Draw from the
+    // actual CDF range so a valid random value cannot run past its last entry.
+    struct ggml_tensor * total = ggml_view_1d(ctx, cumsum, 1, (cumsum->ne[0] - 1) * sizeof(float));
+    struct ggml_tensor * threshold = ggml_mul(ctx, sctx->inp_uniform, total);
+    ggml_set_name(threshold, "dist_threshold");
+
+    // Subtract the scaled random threshold from the CDF (broadcast by ggml_sub).
     // Recall that each entry in cumsum is the cumulative probability up to that
     // index so values stay negative while the cumulative total is below the
     // random value, and become zero/positive once the threshold is crossed.
-    struct ggml_tensor * diff = ggml_sub(ctx, cumsum, sctx->inp_uniform);
+    struct ggml_tensor * diff = ggml_sub(ctx, cumsum, threshold);
     ggml_set_name(diff, "dist_cumsum");
 
     // The ggml_step function produces a tensor where entries are 1 if the
@@ -1209,7 +1214,8 @@ static void llama_sampler_dist_backend_set_input(struct llama_sampler * smpl) {
     // std::uniform_real_distribution<float> with same rng will produce
     // different sequences).
     std::uniform_real_distribution<double> dist(0.0f, 1.0f);
-    const float rnd = dist(sctx->rng);
+    // A double below one can round up to one when converted to float.
+    const float rnd = std::min(static_cast<float>(dist(sctx->rng)), std::nextafter(1.0f, 0.0f));
 
     ggml_backend_tensor_set(sctx->inp_uniform, &rnd, 0, sizeof(float));
 }

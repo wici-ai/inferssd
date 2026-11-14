@@ -137,6 +137,15 @@ target_link_libraries(test-sched-inplace PRIVATE ggml)
 add_test(NAME sched_inplace COMMAND test-sched-inplace)
 set_property(TEST sched_inplace PROPERTY LABELS main)
 
+add_executable(test-backend-dist-range ssd/test-backend-dist-range.cpp)
+target_compile_features(test-backend-dist-range PRIVATE cxx_std_17)
+target_link_libraries(test-backend-dist-range PRIVATE llama ggml ggml-cpu)
+foreach(scenario large large-mapped tail prefix rounded rounded-mapped rounded-tail single above exact ordinary ordinary-mapped)
+    add_test(NAME backend_dist_range_${scenario} COMMAND test-backend-dist-range ${scenario})
+    set_property(TEST backend_dist_range_${scenario} PROPERTY LABELS "main;unit")
+endforeach()
+
+
 add_executable(test-ssd-runtime-policy ssd/test-ssd-runtime-policy.cpp)
 target_compile_features(test-ssd-runtime-policy PRIVATE cxx_std_17)
 target_compile_options(test-ssd-runtime-policy PRIVATE -ffp-contract=off)
