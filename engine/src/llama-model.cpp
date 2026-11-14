@@ -724,7 +724,7 @@ void llama_model::load_arch(llama_model_loader & ml) {
 }
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
-static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
+static void require_nonzero_hparam(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
     if (value == 0) {
         throw std::runtime_error(format("%s must be greater than zero, got %u", ml.llm_kv(kid).c_str(), value));
     }
@@ -3132,11 +3132,11 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             ml.get_key(LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
             ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
             ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
-            qwen4exp_require_nonzero(ml, LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
-            qwen4exp_require_nonzero(ml, LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
-            qwen4exp_require_nonzero(ml, LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
-            qwen4exp_require_nonzero(ml, LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
-            qwen4exp_require_nonzero(ml, LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
+            require_nonzero_hparam(ml, LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
+            require_nonzero_hparam(ml, LLM_KV_SSM_INNER_SIZE,     hparams.ssm_d_inner);
+            require_nonzero_hparam(ml, LLM_KV_SSM_STATE_SIZE,     hparams.ssm_d_state);
+            require_nonzero_hparam(ml, LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
+            require_nonzero_hparam(ml, LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
             // HC; low_rank is qwen4exp-specific, DeepSeek-V4 leaves it absent (full rank)
             ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
@@ -3146,15 +3146,15 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 throw std::runtime_error(format("%s must be greater than one, got %u",
                                                 ml.llm_kv(LLM_KV_HYPER_CONNECTION_COUNT).c_str(), hparams.dsv4_hc_mult));
             }
-            qwen4exp_require_nonzero(ml, LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
+            require_nonzero_hparam(ml, LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
             hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
             ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
             ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
             ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
-            qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
-            qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
-            qwen4exp_require_nonzero(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+            require_nonzero_hparam(ml, LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
+            require_nonzero_hparam(ml, LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
+            require_nonzero_hparam(ml, LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
             ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios, hparams.n_layer, false);
 
             // QSA pools the indexer keys of blocks of compress_ratio cells, one block size for the whole model
@@ -3202,8 +3202,8 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 // optional: files written before this key fall back to the EOS token
                 ml.get_key(LLM_KV_PLE_IMAGE_TOKEN_ID,  hparams.ple_image_token_id, false);
                 ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
-                qwen4exp_require_nonzero(ml, LLM_KV_PLE_CONV_KERNEL,            hparams.ple_conv_kernel);
-                qwen4exp_require_nonzero(ml, LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
+                require_nonzero_hparam(ml, LLM_KV_PLE_CONV_KERNEL,            hparams.ple_conv_kernel);
+                require_nonzero_hparam(ml, LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.n_embd_per_layer);
 
                 hparams.ple_n_heads  = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
                 hparams.ple_head_dim = hparams.n_embd_per_layer;
@@ -3241,7 +3241,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.recurrent_layer_arr, hparams.n_layer, false)) {
                 uint32_t full_attn_interval = 4;
                 ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
-                qwen4exp_require_nonzero(ml, LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
+                require_nonzero_hparam(ml, LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
                 for (uint32_t i = 0; i < hparams.n_layer; ++i) {
                     hparams.recurrent_layer_arr[i] = (i < hparams.n_layer) && ((i + 1) % full_attn_interval != 0);
                 }
@@ -3276,6 +3276,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 {
                     uint32_t full_attn_interval = 4;
                     ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+                    require_nonzero_hparam(ml, LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
                         hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
                     }
@@ -3302,6 +3303,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 {
                     uint32_t full_attn_interval = 4;
                     ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+                    require_nonzero_hparam(ml, LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
                         hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
                     }
@@ -3333,6 +3335,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 {
                     uint32_t full_attn_interval = 4;
                     ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+                    require_nonzero_hparam(ml, LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval);
                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
                         hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
                     }
