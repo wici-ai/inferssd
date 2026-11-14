@@ -635,6 +635,11 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+llama_build(test-ngram-key-order.cpp)
+foreach(scenario repeated paired order update draft)
+    llama_test(test-ngram-key-order NAME ngram_key_order_${scenario} ARGS ${scenario})
+endforeach()
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
