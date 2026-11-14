@@ -123,6 +123,14 @@ add_test(NAME moe_common_dynamic_tier COMMAND test-moe-common-dynamic-tier)
 set_property(TEST moe_common_dynamic_tier PROPERTY LABELS main)
 
 
+add_executable(test-mirostat-numerics ssd/test-mirostat-numerics.cpp)
+target_compile_features(test-mirostat-numerics PRIVATE cxx_std_17)
+target_link_libraries(test-mirostat-numerics PRIVATE llama)
+foreach(scenario unit-slope unit-slope-all near-unit-lower near-unit-upper masked-tail masked-shuffled high-target underflow-high-target underflow single one-unmasked zero-temperature m-one flat partial-vocabulary shifted feedback-reset ordinary)
+    add_test(NAME mirostat_numerics_${scenario} COMMAND test-mirostat-numerics ${scenario})
+    set_property(TEST mirostat_numerics_${scenario} PROPERTY LABELS "main;unit")
+endforeach()
+
 add_executable(test-ssd-model-adapter ssd/test-model-adapter.cpp ../src/ssd/model-adapter.cpp)
 target_compile_features(test-ssd-model-adapter PRIVATE cxx_std_17)
 target_include_directories(test-ssd-model-adapter PRIVATE ../src ../include)
