@@ -13,6 +13,7 @@
 - [Machine profile](machine-profile.md): what `inferssd profile` measures, where it keeps the result, and its speed estimates.
 - [Usage events](usage-events.md): the request and token counts the server records for its host.
 - [Framework commands](../framework/README.md): `serve`, `cli` and `profile`, typed settings and the owned launch.
+- [简体中文](README.zh-CN.md): the project README in Simplified Chinese.
 
 ## Design
 
