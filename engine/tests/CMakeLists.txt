@@ -726,6 +726,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
+llama_build(test-jinja-case-parts.cpp)
+foreach(scenario cap-concat cap-three cap-space cap-constant cap-repeat cap-macro title-concat title-three title-join title-newline cap-empty-prefix cap-single title-boundary title-empty upper lower)
+    llama_test(test-jinja-case-parts NAME jinja_case_${scenario} ARGS ${scenario})
+endforeach()
+
 llama_build_and_test(test-jinja.cpp)
 llama_build_and_test(ssd/test-chat-literal.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
