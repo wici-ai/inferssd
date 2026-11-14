@@ -635,6 +635,14 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+llama_build(ssd/test-qwen-nextn-metadata.cpp)
+foreach(qwen_arch qwen35 qwen35moe)
+    foreach(nextn_case absent zero one all-head maximum wrong-type vocab-only)
+        llama_test(test-qwen-nextn-metadata NAME qwen_nextn_${qwen_arch}_${nextn_case} LABEL unit
+            ARGS ${qwen_arch} ${nextn_case} ${CMAKE_CURRENT_BINARY_DIR}/qwen-nextn-${qwen_arch}-${nextn_case}.gguf)
+    endforeach()
+endforeach()
+
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-sampling.cpp)
