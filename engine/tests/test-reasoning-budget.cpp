@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Reasoning budget sampler test helper
@@ -214,6 +215,89 @@ static void test_utf8_boundary_detection() {
     GGML_ASSERT(common_utf8_is_complete(std::string("hello\xC3\xA9", 7)));    // ASCII + complete 2-byte
 }
 
+using budget_snapshot = std::pair<common_reasoning_budget_state, std::vector<float>>;
+
+static budget_snapshot snapshot_budget(llama_sampler * sampler) {
+    std::vector<llama_token_data> candidates(128);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        candidates[i] = { (llama_token) i, logf((float) (i + 1)), 0.0f };
+    }
+    llama_token_data_array data = { candidates.data(), candidates.size(), -1, false };
+    llama_sampler_apply(sampler, &data);
+    std::vector<float> logits;
+    for (const auto & candidate : candidates) {
+        logits.push_back(candidate.logit);
+    }
+    return { common_reasoning_budget_get_state(sampler), logits };
+}
+
+static bool test_reasoning_budget_clone(
+    const char * name,
+    const std::vector<llama_token> & prefix,
+    const std::vector<llama_token> & continuation,
+    int32_t budget,
+    common_reasoning_budget_state expected_state,
+    common_reasoning_budget_state initial_state = REASONING_BUDGET_IDLE,
+    bool protocol_end_token = false,
+    bool protocol_end_complete = false
+) {
+    auto * original = common_reasoning_budget_init(nullptr,
+        {100, 101, 102}, {103, 101, 102}, {104, 103, 101, 102, 100, 105, 102},
+        budget, initial_state);
+    for (auto token : prefix) {
+        llama_sampler_accept(original, token);
+    }
+    GGML_ASSERT(common_reasoning_budget_get_state(original) == expected_state);
+    common_reasoning_budget_set_protocol_end(original, protocol_end_token, protocol_end_complete);
+    auto * clone = llama_sampler_clone(original);
+    bool matches = snapshot_budget(original) == snapshot_budget(clone);
+    for (auto token : continuation) {
+        const auto before = snapshot_budget(clone);
+        llama_sampler_accept(original, token);
+        // Advancing the original must not mutate the clone's private state.
+        matches = (snapshot_budget(clone) == before) && matches;
+        llama_sampler_accept(clone, token);
+        matches = (snapshot_budget(original) == snapshot_budget(clone)) && matches;
+    }
+    const auto last = snapshot_budget(clone);
+    llama_sampler_reset(original);
+    matches = (snapshot_budget(clone) == last) && matches;
+    llama_sampler_free(original);
+    matches = (snapshot_budget(clone) == last) && matches;
+    llama_sampler_free(clone);
+    fprintf(stderr, "  Clone test '%s' %s\n", name, matches ? "passed" : "FAILED");
+    return matches;
+}
+
+static void test_reasoning_budget_clones() {
+    bool matches = true;
+    matches &= test_reasoning_budget_clone("remaining budget",
+        {100, 101, 102, 50}, {51, 52, 104, 103, 101, 102, 100, 105, 102, 53}, 3, REASONING_BUDGET_COUNTING);
+    matches &= test_reasoning_budget_clone("partial opening tag",
+        {100, 101}, {102, 50, 51, 104, 103, 101, 102, 100, 105, 102}, 2, REASONING_BUDGET_IDLE);
+    matches &= test_reasoning_budget_clone("partial natural closing tag",
+        {100, 101, 102, 50, 103, 101}, {102, 51, 52}, 8, REASONING_BUDGET_COUNTING);
+    matches &= test_reasoning_budget_clone("partially forced suffix",
+        {100, 101, 102, 50, 104, 103}, {101, 102, 100, 105, 102, 51}, 1, REASONING_BUDGET_FORCING);
+    matches &= test_reasoning_budget_clone("partial opening after completed block",
+        {100, 101, 102, 103, 101, 102, 100, 101}, {102, 50, 51, 52, 104}, 3, REASONING_BUDGET_DONE);
+    matches &= test_reasoning_budget_clone("pending natural end span",
+        {}, {50, 51, 104}, 1, REASONING_BUDGET_COUNTING, REASONING_BUDGET_COUNTING, true, false);
+    matches &= test_reasoning_budget_clone("pending completed natural end",
+        {}, {50, 51}, 1, REASONING_BUDGET_COUNTING, REASONING_BUDGET_COUNTING, true, true);
+    matches &= test_reasoning_budget_clone("untouched idle",
+        {}, {100, 101, 102, 50, 104}, 1, REASONING_BUDGET_IDLE);
+    matches &= test_reasoning_budget_clone("untouched counting",
+        {}, {50, 104}, 1, REASONING_BUDGET_COUNTING, REASONING_BUDGET_COUNTING);
+    matches &= test_reasoning_budget_clone("start of forced suffix",
+        {}, {104, 103, 101, 102, 100, 105, 102, 50}, 0, REASONING_BUDGET_FORCING, REASONING_BUDGET_COUNTING);
+    matches &= test_reasoning_budget_clone("waiting for UTF-8 completion",
+        {}, {50, 104, 103}, 1, REASONING_BUDGET_WAITING_UTF8, REASONING_BUDGET_WAITING_UTF8);
+    matches &= test_reasoning_budget_clone("completed block",
+        {100, 101, 102, 103, 101, 102}, {50, 100, 101, 102, 51, 52, 53, 104}, 3, REASONING_BUDGET_DONE);
+    GGML_ASSERT(matches && "Cloned reasoning sampler must preserve independent state");
+}
+
 int main(void) {
     // Reasoning budget sampler tests
     printf("Testing reasoning budget sampler... ");
@@ -366,6 +450,10 @@ int main(void) {
     }
 
     printf("OK (10 tests passed)\n");
+
+    printf("Testing reasoning budget clones... ");
+    test_reasoning_budget_clones();
+    printf("OK (12 tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();
