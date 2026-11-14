@@ -3678,14 +3678,14 @@ static void llama_sampler_infill_apply(struct llama_sampler * smpl, llama_token_
 
             int len0 = ctx->vocab->token_to_piece(cur_p->data[i0].id, ctx->buf0.data(), ctx->buf0.size(), 0, false);
             if (len0 < 0) {
-                ctx->buf0.resize(len0);
+                ctx->buf0.resize(-len0);
                 len0 = ctx->vocab->token_to_piece(cur_p->data[i0].id, ctx->buf0.data(), ctx->buf0.size(), 0, false);
                 assert(len0 > 0);
             }
 
             int len1 = ctx->vocab->token_to_piece(cur_p->data[i1].id, ctx->buf1.data(), ctx->buf1.size(), 0, false);
             if (len1 < 0) {
-                ctx->buf1.resize(len1);
+                ctx->buf1.resize(-len1);
                 len1 = ctx->vocab->token_to_piece(cur_p->data[i1].id, ctx->buf1.data(), ctx->buf1.size(), 0, false);
                 assert(len1 > 0);
             }

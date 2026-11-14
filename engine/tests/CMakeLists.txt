@@ -117,6 +117,15 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+add_executable(test-infill-long-pieces ssd/test-infill-long-pieces.cpp)
+target_compile_features(test-infill-long-pieces PRIVATE cxx_std_17)
+target_link_libraries(test-infill-long-pieces PRIVATE llama ggml)
+foreach(scenario short boundary first second both higher-long unicode reuse eog)
+    add_test(NAME infill_long_pieces_${scenario} COMMAND test-infill-long-pieces ${scenario}
+        ${CMAKE_CURRENT_BINARY_DIR}/infill-long-pieces-${scenario}.gguf)
+    set_property(TEST infill_long_pieces_${scenario} PROPERTY LABELS main)
+endforeach()
+
 add_executable(test-moe-common-dynamic-tier ssd/test-moe-common-dynamic-tier.cpp)
 target_link_libraries(test-moe-common-dynamic-tier PRIVATE Threads::Threads)
 add_test(NAME moe_common_dynamic_tier COMMAND test-moe-common-dynamic-tier)
