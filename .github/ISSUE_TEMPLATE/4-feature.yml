@@ -1,0 +1,51 @@
+name: Feature or hardware request
+description: A new capability, or support for new hardware or a new platform.
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      description: Select every backend the request concerns. CPU only means no GPU.
+      multiple: true
+      options:
+        - CUDA
+        - Metal
+        - Vulkan
+        - CPU only
+        - Not sure
+  - type: dropdown
+    id: storage
+    attributes:
+      label: Model storage
+      options:
+        - One drive
+        - Several drives or a RAID volume
+  - type: textarea
+    id: request
+    attributes:
+      label: What you want and why
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: Current behavior or workaround
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Your hardware
+  - type: checkboxes
+    id: testing
+    attributes:
+      label: Testing
+      options:
+        - label: I can test a branch on this hardware.
