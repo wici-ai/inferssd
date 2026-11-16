@@ -15,7 +15,7 @@ import re
 import sys
 from pathlib import Path
 
-AREAS = ("engine", "ggml", "cuda", "metal", "cpu", "server", "model", "framework",
+AREAS = ("engine", "ggml", "cuda", "metal", "vulkan", "cpu", "server", "model", "framework",
          "bench", "ci", "docs", "build", "scripts", "repo")
 MAX_LENGTH = 72
 FORM = re.compile(r"(?P<areas>[^:]+): (?P<summary>.+)")

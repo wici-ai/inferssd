@@ -1,0 +1,46 @@
+name: WiCi AI desktop app
+description: A problem with the desktop app's screens and settings, or a request for them.
+labels: ["app"]
+body:
+  - type: markdown
+    attributes:
+      value: For a model that fails to load or answers wrongly in the app, use the bug report form.
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Windows
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - Problem
+        - Request
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: App version
+      description: For example `261114.124`, if the app shows it.
+  - type: input
+    id: build
+    attributes:
+      label: InferSSD build
+      description: The engine's build label the app shows, for example `261113.266.e91c7d7`.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened, or what you would like
+      description: Screenshots help; drag them into this field.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce

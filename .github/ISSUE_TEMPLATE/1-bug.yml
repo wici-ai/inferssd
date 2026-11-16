@@ -1,0 +1,93 @@
+name: Bug report
+description: A failure to install, load, run or answer correctly.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: For the desktop app's own screens and settings, use the WiCi AI desktop app form.
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      description: Select every backend the run uses. CPU only means no GPU.
+      multiple: true
+      options:
+        - CUDA
+        - Metal
+        - Vulkan
+        - CPU only
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: run
+    attributes:
+      label: How you run InferSSD
+      options:
+        - WiCi AI desktop app
+        - inferssd command, prebuilt package (macOS or Windows install script)
+        - inferssd command, built from source (including the Linux install script)
+    validations:
+      required: true
+  - type: dropdown
+    id: model
+    attributes:
+      label: Model
+      options:
+        - mrfakename/DeepSeek-V4.1-Flash-1017-GGUF (Q8_0)
+        - unsloth/Muse-Spark-Open-816B-A42B-GGUF (UD-Q4_K_XL)
+        - unsloth/Qwen3.6-35B-A3B-GGUF (UD-Q4_K_XL)
+        - bartowski/Qwen3.8-Flash-Next-GGUF (IQ4_XS)
+        - google/gemma-4-E4B-it-qat-q4_0-gguf (Q4_0)
+        - Other (name it under Reproduction)
+    validations:
+      required: true
+  - type: input
+    id: build
+    attributes:
+      label: InferSSD build
+      description: >-
+        The build label `date.build.commit`, for example `261113.266.e91c7d7`. `inferssd --version` prints it
+        in parentheses and the desktop app shows it. For a build of your own, give the commit
+        (`git rev-parse --short HEAD`).
+    validations:
+      required: true
+  - type: dropdown
+    id: storage
+    attributes:
+      label: Model storage
+      options:
+        - One drive
+        - Several drives or a RAID volume
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware
+      description: CPU, RAM, GPU and driver, PCIe link and drives; for a source build also the compiler and CUDA versions.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Model repository and revision, command, configuration and sanitized logs. Remove credentials and personal paths.
+    validations:
+      required: true

@@ -1,0 +1,32 @@
+name: Triage
+
+# Labels new issues and pull requests and asks their owner to pick them up; see scripts/triage.py.
+# pull_request_target runs in this repository's context so that it can label fork pull requests.
+# It checks out the base branch and reads only the event payload, never the pull request's code.
+on:
+  issues:
+    types: [opened, edited]
+  pull_request_target:
+    types: [opened, edited, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: triage-${{ github.event.issue.number || github.event.pull_request.number }}
+
+jobs:
+  triage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+      - name: Label and assign
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/triage.py

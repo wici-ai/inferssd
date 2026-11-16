@@ -1,0 +1,35 @@
+name: Question
+description: How to install, configure or use InferSSD.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        The [README](https://github.com/wici-ai/inferssd/blob/main/README.md) and the
+        [documentation](https://github.com/wici-ai/inferssd/tree/main/docs) may already answer it.
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      description: Select every backend the question concerns. CPU only means no GPU.
+      multiple: true
+      options:
+        - CUDA
+        - Metal
+        - Vulkan
+        - CPU only
+        - Not sure

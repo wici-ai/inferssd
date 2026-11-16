@@ -9,10 +9,22 @@ Participation in this project is governed by the [Code of Conduct](.github/CODE_
 The first release focuses on the supported DeepSeek and Muse configurations. Please open an issue to discuss
 additional models, new runtime policies or broad interface changes before implementing them.
 
+## Issues
+
+Open an issue with one of the forms: bug report, WiCi AI desktop app, model or quantization request, feature or
+hardware request, performance report or question. The form sets the issue's type label, and its answers on the
+operating system, backend and model storage add labels of their own. [Triage](.github/workflows/triage.yml)
+assigns each new issue to an owner, labels each pull request with the areas in its title and asks an owner for
+a review.
+
 ## Pull requests
 
 - Work on a short branch name without `/` and without the name of the tool that produced the change.
 - Keep each pull request to one concern. Separate numerical or algorithm changes from source-layout changes.
+- A fix to code that InferSSD takes from llama.cpp, rather than to InferSSD's own code, belongs in llama.cpp:
+  submit it to [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). With the `upstream` alias from
+  [Checks](#checks), `git diff upstream:src/llama-vocab.cpp HEAD:engine/src/llama-vocab.cpp` shows what InferSSD
+  changed in a file.
 - Pull requests are squash-merged, so the pull request title becomes the commit title on `main`.
 - Do not add automated trailers. Use `Co-authored-by` only for human co-authors.
 - Keep internal code names, task numbers, machine names, run IDs, credentials, personal paths, private
@@ -43,6 +55,7 @@ cuda, metal: fix expert staging
 | `ggml` | ggml core, scheduler, allocator and shared SSD modules |
 | `cuda` | CUDA backend and CUDA expert executor |
 | `metal` | Metal backend and macOS GPU paths |
+| `vulkan` | Vulkan backend |
 | `cpu` | CPU backend and CPU expert executor |
 | `server` | HTTP server, prompt cache and request lifecycle |
 | `model` | Model architectures, chat templates and conversion |
