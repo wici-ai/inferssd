@@ -663,9 +663,11 @@ struct expert_cache {
         return true;
     }
     bool geometry(const size_t * requested, const ggml_tensor * tensor, size_t max_requests) {
-        // Native GGUF roles can differ only in page-prefix padding across
-        // layers. Keep the largest buffers instead of clearing the cache as
-        // those physical read lengths alternate.
+        // A role's read differs across layers by its page prefix and, in a
+        // file that mixes formats by layer, by its type. Keep each role's
+        // largest read, so reads that alternate do not clear the cache; a
+        // larger one still rebuilds it, which is why the sink's load step
+        // sizes each role from its largest read over all routed layers.
         const size_t bytes[3] = { std::max(requested[0], role_bytes[0]),
             std::max(requested[1], role_bytes[1]), std::max(requested[2], role_bytes[2]) };
         if (std::equal(bytes, bytes + 3, role_bytes)) { return true; }

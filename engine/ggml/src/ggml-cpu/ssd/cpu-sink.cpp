@@ -1824,18 +1824,21 @@ struct kimi_cpu_sink {
     // layer publishes them before the tier sizes itself there; the RAM cache there only lands the prefetch and follows
     // at the first decode token, from the demand the tier left. Elsewhere, unified memory without a GPU tier that
     // keeps experts included (sink_vram::holds_experts), the RAM cache's (reserve_cache), when the cache can give room
-    // back (partial reclaim or elastic). experts: up, gate and down of n routed layers; the largest expert gives both
-    // their geometry. With a GPU tier each layer's types are kept first (record_expert_types).
+    // back (partial reclaim or elastic). experts: up, gate and down of n routed layers; each role's largest read over
+    // them gives the RAM cache's geometry (largest_role_reads), the largest expert the tier's request. With a GPU tier
+    // each layer's types are kept first (record_expert_types).
     void reserve_tier(const ggml_tensor * const * experts, int n, int experts_used) {
         if (vram.context) { record_expert_types(experts, n); }
         const auto bytes = [&](int i) { return experts[3 * i]->nb[2] + experts[3 * i + 1]->nb[2] + experts[3 * i + 2]->nb[2]; };
         int largest = 0;
         for (int i = 1; i < n; ++i) { if (bytes(i) > bytes(largest)) { largest = i; } }
         const ggml_tensor * up = experts[3 * largest], * gate = experts[3 * largest + 1], * down = experts[3 * largest + 2];
-        if (!cache.ledger.state().unified || !vram.holds_experts()) { reserve_cache(up, gate, down, experts_used); }
+        size_t reads[3];
+        largest_role_reads(experts, n, reads);
+        if (!cache.ledger.state().unified || !vram.holds_experts()) { reserve_cache(reads, up, experts_used); }
         if (!vram.context || cache.layers.empty()) { return; }
         refresh_floor("reserve");
-        if (!cache.arena) { vram.set_host_demand(cache.pending_bytes(size_t(up->nb[2] + gate->nb[2] + down->nb[2]))); }
+        if (!cache.arena) { vram.set_host_demand(cache.pending_bytes(reads[0] + reads[1] + reads[2])); }
         vram.reserve(up, gate, down, sink_vram::layer_list(cache));
     }
     // Every routed layer's expert types, kept with the cache's layers: the GPU tier is declared them with each layer it
@@ -1870,11 +1873,9 @@ struct kimi_cpu_sink {
     // it (its bytes and a page prefix, in whole pages), after the read ring the first decode charges before the cache
     // sizes itself from the room left; experts_used prices the frequency nodes as the first decode layer does. A cache
     // that cannot give room back takes neither here: the ring and the arena both wait for the first decode token.
-    void reserve_cache(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down, int experts_used) {
+    // bytes: each role's read; up: a routed layer's up tensor, for the expert count.
+    void reserve_cache(const size_t * bytes, const ggml_tensor * up, int experts_used) {
         if (cache.layers.empty() || !cache.keep_across_requests || !cache.gives_room_back() || cache.arena) { return; }
-        const ggml_tensor * tensors[] = { up, gate, down };
-        size_t bytes[3];
-        role_read_bytes(tensors, bytes);
         if (cache.stats.budget_bytes == sink_cache::auto_budget) { reserve_ring(bytes, true); }
         double us = 0;
         // load time: nothing else runs, so every CPU pages the arena in
@@ -1903,12 +1904,8 @@ struct kimi_cpu_sink {
             if (layer >= 0) { routed.emplace_back(layer, int(experts[3 * i]->ne[2])); }
         }
         if (routed.empty() || slots.empty()) { return; }
-        size_t largest = 0;
-        for (int i = 1; i < n; ++i) {
-            if (expert_read_bytes(experts + 3 * i) > expert_read_bytes(experts + 3 * largest)) { largest = size_t(i); }
-        }
         size_t bytes[3];
-        role_read_bytes(experts + 3 * largest, bytes);
+        largest_role_reads(experts, n, bytes);
         reserve_ring(bytes, true);
         sink_ring reads;
         const unsigned depth = unsigned(3 * slots.size()); // the depth the layers' own reads reach
@@ -2016,10 +2013,18 @@ struct kimi_cpu_sink {
         }
         return bytes;
     }
-    static size_t expert_read_bytes(const ggml_tensor * const * roles) {
-        size_t bytes[3];
-        role_read_bytes(roles, bytes);
-        return bytes[0] + bytes[1] + bytes[2];
+    // Each role's largest read over n routed layers (up, gate and down of each): the slots a decode request sizes the
+    // RAM cache to (sink_cache::geometry keeps each role's largest read) and the ring's. In a file that mixes formats
+    // by layer, the layer with the largest expert need not have each role's largest; slots sized from it make the
+    // first decode request past such a layer rebuild the cache, and the old arena still holds the room the new one is
+    // sized from.
+    static void largest_role_reads(const ggml_tensor * const * experts, int n, size_t * bytes) {
+        bytes[0] = bytes[1] = bytes[2] = 0;
+        for (int i = 0; i < n; ++i) {
+            size_t layer[3];
+            role_read_bytes(experts + 3 * i, layer);
+            for (int role = 0; role < 3; ++role) { bytes[role] = std::max(bytes[role], layer[role]); }
+        }
     }
     // A role's read of one expert: its rows, with the page prefix a read may need, in whole pages.
     static void role_read_bytes(const ggml_tensor * const * roles, size_t * bytes) {
