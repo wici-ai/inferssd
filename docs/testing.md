@@ -11,7 +11,8 @@ Left out of `ci`: tests that need a GPU, a model or the network; the store fixtu
 `engine/tests/ssd/fixtures/c0-store` that link the test-only legacy runtime; and the bundled llama.cpp tests
 other than `test-reasoning-budget` and `test-kv-cache-grow`, which cover InferSSD changes. Where a hosted
 runner cannot run a test, CMake says so next to it: `graph_lane` counts only on macOS, the one runner with a
-GPU for the lane, and `test-kv-cache-grow` and `ssd_cpu_sink_work_reclaim` do not count on macOS.
+GPU for the lane, and `test-kv-cache-grow`, `ssd_cpu_sink_cache_load` and `ssd_cpu_sink_work_reclaim` do not
+count on macOS.
 
 The `unit` CTest label contains only model-free tests that require neither a GPU
 nor cgroup setup. Build the targets before running `ctest -L unit`; a missing
