@@ -1,7 +1,7 @@
 name: Package macOS
 
-# Build the prebuilt Apple silicon package from main, check it on the oldest and the newest macOS
-# it runs on, and, when asked, publish it and point the installer's package list at it.
+# Build the prebuilt Apple silicon package, check it on the oldest and the newest macOS it runs on,
+# and, when asked on main, publish it and point the installer's package list at it.
 # See docs/macos-package.md.
 on:
   workflow_call:
@@ -16,6 +16,28 @@ on:
     secrets:
       APP_VERSIONING_TOKEN:
         required: false
+  # A pull request builds the package when it changes how it is built; a change to main that reaches it
+  # builds it after the merge.
+  push:
+    branches: [main]
+    paths:
+      - 'engine/**'
+      - 'framework/**'
+      - CMakeLists.txt
+      - CMakePresets.json
+      - 'scripts/package-macos*'
+      - scripts/check-package-macos.sh
+      - scripts/engine-resources.py
+      - scripts/install.sh
+      - .github/workflows/package-macos.yml
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'scripts/package-macos*'
+      - scripts/check-package-macos.sh
+      - scripts/engine-resources.py
+      - scripts/install.sh
+      - .github/workflows/package-macos.yml
   workflow_dispatch:
     inputs:
       publish:
@@ -27,12 +49,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: package-macos
-  cancel-in-progress: false
+  # A pull request's newer run replaces its older one; main, tags and manual runs queue in one group.
+  group: ${{ github.event_name == 'pull_request' && format('package-macos-{0}', github.ref) || 'package-macos' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      (github.event_name == 'pull_request' && !github.event.pull_request.draft) ||
+      github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-15
     timeout-minutes: 90
     steps:

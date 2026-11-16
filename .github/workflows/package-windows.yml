@@ -13,19 +13,31 @@ on:
     secrets:
       APP_VERSIONING_TOKEN:
         required: false
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+  # A pull request builds the packages when it changes how they are built; a change to main that reaches them
+  # builds them after the merge.
+  push:
+    branches: [main]
     paths:
       - 'engine/**'
       - 'framework/**'
+      - CMakeLists.txt
+      - CMakePresets.json
       - 'scripts/package-windows*'
       - 'scripts/check-package-windows*'
       - scripts/install-cuda-redist.ps1
       - scripts/windows-launcher.cpp
       - scripts/engine-resources.py
       - scripts/install.ps1
-      - CMakeLists.txt
-      - CMakePresets.json
+      - .github/workflows/package-windows.yml
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'scripts/package-windows*'
+      - 'scripts/check-package-windows*'
+      - scripts/install-cuda-redist.ps1
+      - scripts/windows-launcher.cpp
+      - scripts/engine-resources.py
+      - scripts/install.ps1
       - .github/workflows/package-windows.yml
   workflow_dispatch:
     inputs:

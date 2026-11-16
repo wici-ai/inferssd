@@ -63,8 +63,9 @@ Each numbered installer pins its package manifest to that same GitHub release. T
 from `main` keeps following the normal latest package list; explicit `INFERSSD_REF` or
 `INFERSSD_FROM_SOURCE` continues to request a source build.
 
-**Package macOS** remains manually runnable on `main` for validation and its existing explicit
-**publish** option. The publisher uploads to `https://cdn.wici.ai/apps/inferssd/`, checks the
+**Package macOS** runs for pull requests that change how the package is built and after each merge
+to `main` that changes the engine, the framework or the packaging. It also runs manually on `main`
+for validation and its explicit **publish** option. The publisher uploads to `https://cdn.wici.ai/apps/inferssd/`, checks the
 served bytes before updating the list, and refuses a list older than the one already published.
 
 The CDN keeps a file for a year, so a name never gets other bytes: packing a commit already

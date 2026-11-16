@@ -54,8 +54,9 @@ step rejects packages with a different version, revision, build, label or checks
 published releases are never overwritten. A draft remains private until all assets and every
 normal package feed are ready.
 
-**Package Windows** still runs for packaging-related pull requests and can be started manually
-for validation, producing `package-windows-x64-vulkan` and `package-windows-x64-cuda` Actions
+**Package Windows** runs for pull requests that change how the packages are built, after each
+merge to `main` that changes the engine, the framework or the packaging, and manually for
+validation, producing `package-windows-x64-vulkan` and `package-windows-x64-cuda` Actions
 artifacts. GitHub's runner has no GPU, so the CUDA package's check also shows that it starts
 without an NVIDIA driver. Its optional manual publisher
 remains main-only; no manual Windows job is required for normal numbered releases.
