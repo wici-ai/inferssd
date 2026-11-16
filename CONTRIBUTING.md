@@ -90,8 +90,8 @@ the hosted checks are defined in [.github/workflows](.github/workflows).
 Python tests use synthetic inputs and do not start a model. Run them with Python 3.9 or 3.12; the recorded
 transcript checks are bound to those versions and skip on others. CI runs both. Unexpected skipped tests are
 failures. Native test targets are described in [testing](docs/testing.md). CI builds the documented CMake presets,
-runs the CPU unit tests and the macOS cache tests on hosted runners, and compiles the CUDA server whenever the
-engine or build configuration changes.
+runs the native tests labelled `ci` on Linux, macOS and Windows hosted runners, and compiles the CUDA server
+whenever the engine or build configuration changes.
 
 Device performance checks are triggered by maintainers after review and run only for pull requests from
 branches in this repository; fork pull requests receive hosted CI only. See [device CI](bench/ci/README.md).
@@ -99,7 +99,8 @@ branches in this repository; fork pull requests receive hosted CI only. See [dev
 ## Review checklist
 
 - Explain the concrete behavior, its cause and the evidence for the change.
-- Include a regression test for a behavior fix; use synthetic inputs where possible.
+- Include a regression test for a behavior fix; use synthetic inputs where possible. Add a test that needs no
+  GPU or model to hosted CI with `inferssd_ci_test` (see [testing](docs/testing.md)).
 - Keep placement decisions general and derived from measured costs, without machine-specific shortcuts.
 - Check CPU-only and applicable CUDA or macOS builds when shared code changes.
 - Document memory ownership, thread lifetime and resource limits affected by the change.

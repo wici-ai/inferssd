@@ -7,6 +7,8 @@
 using sink_cache = ssd::host::expert_cache;
 using sink_request = ssd::host::expert_request;
 int main() {
+    // As llama_backend_init does: on Windows ggml_time_us divides by the timer frequency this records.
+    ggml_time_init();
     try {
     int checks = 0;
     auto require = [&](bool ok) { ++checks; if (!ok) throw std::runtime_error("cache lease assertion"); };

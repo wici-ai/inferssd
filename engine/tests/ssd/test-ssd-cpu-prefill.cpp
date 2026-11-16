@@ -922,6 +922,8 @@ static void real_test(fixture_inputs & inputs, const options & o) {
 }
 
 int main(int argc, char ** argv) {
+    // As llama_backend_init does: on Windows ggml_time_us divides by the timer frequency this records.
+    ggml_time_init();
     fixture_inputs inputs;
     try {
         options o; bool ring_set = false, cache_lifecycle = false, cache_retention = false,

@@ -4165,6 +4165,8 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
 }
 
 int main(int argc, char ** argv) {
+    // As llama_backend_init does: on Windows ggml_time_us divides by the timer frequency this records.
+    ggml_time_init();
     fixture_inputs inputs;
     try {
         real_options options; bool ring_set = false, registered_lifecycle = false, cache_mode = false, cache_pressure = false;

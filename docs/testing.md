@@ -1,9 +1,21 @@
 # Test gates
 
+Hosted CI runs the native tests labelled `ci`. On Linux, macOS and Windows it builds the target
+`inferssd-ci-tests` and runs `ctest -L ci`, which selects the `ci` tests that OS registers. On Linux the
+tests run in a systemd scope with an 8 GiB memory limit, which gives the RAM cache cases the finite cgroup v2
+limit they need. A test joins by calling `inferssd_ci_test(<executable target> <test>...)` next to its
+`add_test` in [engine/tests/CMakeLists.txt](../engine/tests/CMakeLists.txt); the workflow names no tests.
+A missing executable, a skipped test or zero selected tests fails the job.
+
+Left out of `ci`: tests that need a GPU, a model or the network; the store fixtures under
+`engine/tests/ssd/fixtures/c0-store` that link the test-only legacy runtime; and the bundled llama.cpp tests
+other than `test-reasoning-budget` and `test-kv-cache-grow`, which cover InferSSD changes. Where a hosted
+runner cannot run a test, CMake says so next to it: `graph_lane` counts only on macOS, the one runner with a
+GPU for the lane, and `test-kv-cache-grow` and `ssd_cpu_sink_work_reclaim` do not count on macOS.
+
 The `unit` CTest label contains only model-free tests that require neither a GPU
 nor cgroup setup. Build the targets before running `ctest -L unit`; a missing
-executable, skipped test or zero selected tests is not a passing gate. CI uses an
-explicit subset to keep the default check small. The CUDA workflow compiles the
+executable, skipped test or zero selected tests is not a passing gate. The CUDA workflow compiles the
 server for `sm_120a` and `sm_121a` on `main` and on pull requests that change the
 engine or build configuration; it does not establish GPU runtime correctness.
 Device runs must record both the selected and actually executed tests.
@@ -21,7 +33,7 @@ reference graphs, bit for bit. It exercises direct reads, the OS read ring
 (io_uring on Linux, IoRing on Windows), affinity, the host memory envelope and
 experimental scheduling paths; on Linux also cgroup memory limits. It is not
 interchangeable with the portable unit gate. Do not interpret a full-suite run on a small hosted runner as
-a production device acceptance test. GPU and cgroup suites need dedicated launchers
+a production device acceptance test. GPU suites need dedicated launchers
 and explicit resource prerequisites before they can become automated gates.
 
 Some bundled upstream tests in a full run depend on outside resources: `test-download-model`
@@ -48,7 +60,7 @@ The legacy store fixtures below are Linux-only. `test-c0-store` and `test-c0-con
 compare it with a fixed test reference. `test-c0-parser-failures` injects
 allocation and callback failures into the parser to verify handle cleanup.
 Their CTest names `c0-store`, `c0-config` and `c0-parser-failures` carry `unit`
-and run in hosted CPU CI. The cross-DSO/mock-provider, source-open-hook and direct
+and `ci`. The cross-DSO/mock-provider, source-open-hook and direct
 I/O fixtures carry `device`; they do not silently join the hosted unit gate.
 The production store CMake target does not read the fixture's reference includes
 or execute Python. The fixed reference is copied only in the test configuration.
