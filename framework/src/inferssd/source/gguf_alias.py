@@ -71,6 +71,7 @@ NATIVE_TYPES = {
     39: ("MXFP4", 32, 17),
     40: ("NVFP4", 64, 36),
     41: ("Q1_0", 128, 18),
+    43: ("MXFP8", 32, 33),
 }
 EXPERT_RE = re.compile(r"^blk\.(?P<layer>\d+)\.ffn_(?P<kind>up|gate|down)_exps\.weight$")
 SHARD_RE = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf$")

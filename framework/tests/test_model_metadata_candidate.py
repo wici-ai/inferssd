@@ -188,4 +188,9 @@ def test_executable_ast_and_constants(old, module):
         n_node = next(
             n.value for n in new.body if isinstance(n, ast.Assign) and n.targets[0].id == name
         )
-        assert ast.dump(f_node) == ast.dump(n_node)
+        if name == "TYPES":
+            # The reader may know types the frozen reference did not; the ones it knew keep
+            # their geometry.
+            assert ast.literal_eval(f_node).items() <= ast.literal_eval(n_node).items()
+        else:
+            assert ast.dump(f_node) == ast.dump(n_node)

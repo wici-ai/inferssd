@@ -14,6 +14,7 @@
 #include "../src/llama-model-saver.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -41,9 +42,10 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
-static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
+// random values from the tensor's name, the same for every tensor of that name
+static void set_tensor_data_named(struct ggml_tensor * tensor, const std::string & name, size_t seed) {
     std::hash<std::string> hasher;
-    std::mt19937 gen(hasher(tensor->name) + *(const size_t *) userdata);
+    std::mt19937 gen(hasher(name) + seed);
     std::normal_distribution<float> dis(0.0f, 1.0e-2f);
 
     const int64_t ne = ggml_nelements(tensor);
@@ -64,8 +66,12 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
     }
 }
 
+static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
+    set_tensor_data_named(tensor, tensor->name, *(const size_t *) userdata);
+}
+
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow] [--nextn]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow] [--nextn] [--engram-layouts]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -78,6 +84,17 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     }
     return ret;
 }
+
+// The DeepSeek-V4.1 fixture's Engram: two layers of 3-grams with 2 heads each, 4 buckets per layer, each
+// layer's table laid out from row 0 (the engram.* layout)
+static const std::array<uint32_t, 2> DSV41_ENGRAM_LAYERS     = { 1, 3 };
+static const uint32_t                DSV41_ENGRAM_HEADS      = 2;
+static const uint32_t                DSV41_ENGRAM_KEY_LENGTH = 64;
+static const uint32_t                DSV41_ENGRAM_NGRAM      = 3;
+static const std::vector<uint64_t>   DSV41_ENGRAM_MULTIPLIERS = { 76632096046245ull, 4839876093313ull, 35959672319349ull,
+                                                                  67716810739261ull, 51510806800915ull, 30921347202721ull };
+static const std::vector<uint64_t>   DSV41_ENGRAM_PRIMES     = { 101, 103, 107, 109,   113, 127, 131, 137 };
+static const std::vector<uint64_t>   DSV41_ENGRAM_OFFSETS    = {   0, 101, 204, 311,     0, 113, 240, 371 };
 
 // n_nextn NextN blocks follow the model's blocks in the file, which counts them in block_count and
 // sizes its per-block metadata for them too.
@@ -241,24 +258,19 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                     10.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                  true);
 
-        // two Engram layers of 3-grams with 2 heads each: 4 buckets per layer, each table laid out from row 0
-        const std::vector<uint64_t> multipliers = { 76632096046245ull, 4839876093313ull, 35959672319349ull,
-                                                    67716810739261ull, 51510806800915ull, 30921347202721ull };
-        const std::vector<uint64_t> primes      = { 101, 103, 107, 109,   113, 127, 131, 137 };
-        const std::vector<uint64_t> offsets     = {   0, 101, 204, 311,     0, 113, 240, 371 };
         std::vector<int32_t> token_map(n_vocab);
         for (uint32_t i = 0; i < n_vocab; ++i) {
             token_map[i] = (int32_t) (i % 61);
         }
         const LLM_KV kv(arch);
-        ms.add_kv(LLM_KV_ENGRAM_LAYER_IDS,     std::vector<uint32_t>({1, 3}));
-        ms.add_kv(LLM_KV_ENGRAM_HEAD_COUNT,    uint32_t(2));
-        ms.add_kv(LLM_KV_ENGRAM_KEY_LENGTH,    uint32_t(64));
-        ms.add_kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, uint32_t(3));
+        ms.add_kv(LLM_KV_ENGRAM_LAYER_IDS,     std::vector<uint32_t>(DSV41_ENGRAM_LAYERS.begin(), DSV41_ENGRAM_LAYERS.end()));
+        ms.add_kv(LLM_KV_ENGRAM_HEAD_COUNT,    DSV41_ENGRAM_HEADS);
+        ms.add_kv(LLM_KV_ENGRAM_KEY_LENGTH,    DSV41_ENGRAM_KEY_LENGTH);
+        ms.add_kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE, DSV41_ENGRAM_NGRAM);
         ms.add_kv(LLM_KV_ENGRAM_PAD_ID,        uint32_t(2));
-        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_ENGRAM_MULTIPLIERS).c_str(), GGUF_TYPE_UINT64, multipliers.data(), multipliers.size());
-        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_ENGRAM_PRIMES).c_str(),      GGUF_TYPE_UINT64, primes.data(),      primes.size());
-        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_ENGRAM_OFFSETS).c_str(),     GGUF_TYPE_UINT64, offsets.data(),     offsets.size());
+        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_ENGRAM_MULTIPLIERS).c_str(), GGUF_TYPE_UINT64, DSV41_ENGRAM_MULTIPLIERS.data(), DSV41_ENGRAM_MULTIPLIERS.size());
+        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_ENGRAM_PRIMES).c_str(),      GGUF_TYPE_UINT64, DSV41_ENGRAM_PRIMES.data(),      DSV41_ENGRAM_PRIMES.size());
+        gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_ENGRAM_OFFSETS).c_str(),     GGUF_TYPE_UINT64, DSV41_ENGRAM_OFFSETS.data(),     DSV41_ENGRAM_OFFSETS.size());
         gguf_set_arr_data(ms.gguf_ctx, kv(LLM_KV_ENGRAM_TOKEN_MAP).c_str(),   GGUF_TYPE_INT32,  token_map.data(),   token_map.size());
     }
 
@@ -1043,6 +1055,162 @@ static int test_kv_grow(const llm_arch target_arch, const size_t seed, const ggm
     return failures == 0 ? 0 : 1;
 }
 
+// unsloth's DeepSeek-V4.1 GGUFs lay the Engram out another way: ple.* keys, every layer's table in one
+// per_layer_token_embd, stored as MXFP8, whose head offsets run on across the layers, and for each layer
+// the product of engram_q and engram_k as engram_gate. The same weights in either layout give the same logits.
+struct dsv41_engram_layouts_data {
+    size_t seed;
+    std::vector<uint8_t> table; // MXFP8 rows of every Engram layer, the first layer's first
+};
+
+static const size_t DSV41_ENGRAM_ROW_BYTES = DSV41_ENGRAM_KEY_LENGTH / 32 * 33; // MXFP8: 33 bytes for 32 values
+
+// rows of Engram layer e's table: its last bucket's end
+static uint64_t dsv41_engram_rows(size_t e) {
+    const size_t n_cols = (DSV41_ENGRAM_NGRAM - 1) * DSV41_ENGRAM_HEADS;
+    uint64_t rows = 0;
+    for (size_t b = 0; b < n_cols; ++b) {
+        rows = std::max(rows, DSV41_ENGRAM_OFFSETS[e*n_cols + b] + DSV41_ENGRAM_PRIMES[e*n_cols + b]);
+    }
+    return rows;
+}
+
+static void set_engram_layouts_data(struct ggml_tensor * tensor, void * userdata) {
+    const auto & ud = *(const dsv41_engram_layouts_data *) userdata;
+    const std::string name = tensor->name;
+    if (name == "per_layer_token_embd.weight") {
+        GGML_ASSERT(tensor->type == GGML_TYPE_MXFP8 && ggml_nbytes(tensor) == ud.table.size());
+        ggml_backend_tensor_set(tensor, ud.table.data(), 0, ud.table.size());
+        return;
+    }
+    uint64_t first_row = 0;
+    for (size_t e = 0; e < DSV41_ENGRAM_LAYERS.size(); first_row += dsv41_engram_rows(e++)) {
+        if (name == "blk." + std::to_string(DSV41_ENGRAM_LAYERS[e]) + ".engram_embd.weight") {
+            // the layer's rows of the MXFP8 table, decoded
+            std::vector<float> values(ggml_nelements(tensor));
+            ggml_get_type_traits(GGML_TYPE_MXFP8)->to_float(
+                ud.table.data() + first_row*DSV41_ENGRAM_ROW_BYTES, values.data(), (int64_t) values.size());
+            ggml_backend_tensor_set(tensor, values.data(), 0, ggml_nbytes(tensor));
+            return;
+        }
+    }
+    const std::string k = ".engram_k.weight", gate = ".engram_gate.";
+    if (name.size() > k.size() && name.compare(name.size() - k.size(), k.size(), k) == 0) {
+        // q * 1 is q: the per-layer model's q is the one-table model's gate
+        const std::vector<float> ones(ggml_nelements(tensor), 1.0f);
+        ggml_backend_tensor_set(tensor, ones.data(), 0, ggml_nbytes(tensor));
+        return;
+    }
+    std::string source = name;
+    const size_t at = source.find(gate);
+    if (at != std::string::npos) {
+        source.replace(at, gate.size(), ".engram_q.");
+    }
+    set_tensor_data_named(tensor, source, ud.seed);
+}
+
+static int test_engram_layouts(const size_t seed, const ggml_log_level log_level) {
+    const llm_arch arch = LLM_ARCH_DEEPSEEK41;
+    const LLM_KV kv(arch);
+    const size_t n_cols = (DSV41_ENGRAM_NGRAM - 1) * DSV41_ENGRAM_HEADS;
+
+    dsv41_engram_layouts_data ud;
+    ud.seed = seed;
+    uint64_t n_rows = 0;
+    for (size_t e = 0; e < DSV41_ENGRAM_LAYERS.size(); ++e) {
+        n_rows += dsv41_engram_rows(e);
+    }
+    std::mt19937 gen(seed);
+    ud.table.resize(n_rows*DSV41_ENGRAM_ROW_BYTES);
+    for (size_t i = 0; i < ud.table.size(); ++i) {
+        // E8M0 scales near 2^-6, E4M3 codes but the NaN ones
+        ud.table[i] = i % 33 == 0 ? uint8_t(116 + gen() % 8) : uint8_t(gen() % 256);
+        if (i % 33 != 0 && (ud.table[i] & 127) == 127) {
+            ud.table[i] ^= 1;
+        }
+    }
+
+    gguf_context_ptr per_layer = get_gguf_ctx(arch, moe_mandatory(arch));
+    gguf_context_ptr one_table = get_gguf_ctx(arch, moe_mandatory(arch));
+    for (const llm_kv key : { LLM_KV_ENGRAM_LAYER_IDS, LLM_KV_ENGRAM_HEAD_COUNT, LLM_KV_ENGRAM_KEY_LENGTH,
+                              LLM_KV_ENGRAM_MAX_NGRAM_SIZE, LLM_KV_ENGRAM_PAD_ID, LLM_KV_ENGRAM_MULTIPLIERS,
+                              LLM_KV_ENGRAM_PRIMES, LLM_KV_ENGRAM_OFFSETS }) {
+        GGML_ASSERT(gguf_remove_key(one_table.get(), kv(key).c_str()) >= 0);
+    }
+    std::vector<uint64_t> offsets = DSV41_ENGRAM_OFFSETS;
+    uint64_t base = 0;
+    for (size_t e = 0; e < DSV41_ENGRAM_LAYERS.size(); base += dsv41_engram_rows(e++)) {
+        for (size_t b = 0; b < n_cols; ++b) {
+            offsets[e*n_cols + b] += base;
+        }
+    }
+    gguf_context * ctx = one_table.get();
+    gguf_set_arr_data(ctx, kv(LLM_KV_PLE_LAYERS).c_str(),            GGUF_TYPE_UINT32, DSV41_ENGRAM_LAYERS.data(), DSV41_ENGRAM_LAYERS.size());
+    gguf_set_val_u32 (ctx, kv(LLM_KV_PLE_HEADS_PER_NGRAM).c_str(),        DSV41_ENGRAM_HEADS);
+    gguf_set_val_u32 (ctx, kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER).c_str(), DSV41_ENGRAM_KEY_LENGTH);
+    gguf_set_val_u32 (ctx, kv(LLM_KV_PLE_NGRAM_SIZE).c_str(),             DSV41_ENGRAM_NGRAM);
+    gguf_set_val_u32 (ctx, kv(LLM_KV_ENGRAM_PAD_TOKEN_ID).c_str(),        2);
+    gguf_set_arr_data(ctx, kv(LLM_KV_PLE_LAYER_MULTIPLIERS).c_str(), GGUF_TYPE_UINT64, DSV41_ENGRAM_MULTIPLIERS.data(), DSV41_ENGRAM_MULTIPLIERS.size());
+    gguf_set_arr_data(ctx, kv(LLM_KV_PLE_HEAD_VOCAB_SIZES).c_str(),  GGUF_TYPE_UINT64, DSV41_ENGRAM_PRIMES.data(),      DSV41_ENGRAM_PRIMES.size());
+    gguf_set_arr_data(ctx, kv(LLM_KV_PLE_HEAD_OFFSETS).c_str(),      GGUF_TYPE_UINT64, offsets.data(),                  offsets.size());
+    {
+        // the table's type: a model made from metadata alone takes each tensor's type from it
+        ggml_tensor t;
+        memset(&t, 0, sizeof(ggml_tensor));
+        t.type  = GGML_TYPE_MXFP8;
+        t.ne[0] = DSV41_ENGRAM_KEY_LENGTH;
+        t.ne[1] = (int64_t) n_rows;
+        t.ne[2] = t.ne[3] = 1;
+        t.nb[0] = ggml_type_size(t.type);
+        t.nb[1] = DSV41_ENGRAM_ROW_BYTES;
+        t.nb[2] = t.nb[3] = t.nb[1]*n_rows;
+        ggml_set_name(&t, "per_layer_token_embd.weight");
+        gguf_add_tensor(ctx, &t);
+    }
+
+    struct log_data_t {
+        ggml_log_callback callback;
+        void * user_data;
+        ggml_log_level min_level;
+    } ld;
+    llama_log_get(&ld.callback, &ld.user_data);
+    ld.min_level = log_level;
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const auto * ld = (const log_data_t *) user_data;
+        ld->callback(level >= ld->min_level ? level : GGML_LOG_LEVEL_DEBUG, text, ld->user_data);
+    }, &ld);
+
+    std::vector<ggml_backend_dev_t> devs = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nullptr };
+    std::vector<float> logits[2];
+    gguf_context * layouts[2] = { per_layer.get(), one_table.get() };
+    for (int i = 0; i < 2; ++i) {
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        model_params.devices = devs.data();
+        llama_model_ptr model(llama_model_init_from_user(layouts[i], set_engram_layouts_data, &ud, model_params));
+        if (!model) {
+            throw std::runtime_error("failed to create llama model");
+        }
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx           = 0;
+        ctx_params.n_ubatch        = 64;
+        ctx_params.n_threads       = 4;
+        ctx_params.n_threads_batch = 4;
+        llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+        if (!lctx) {
+            throw std::runtime_error("failed to create llama context");
+        }
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        logits[i] = get_logits(model.get(), lctx.get(), get_tokens(32, n_vocab, seed));
+    }
+    llama_log_set(ld.callback, ld.user_data);
+
+    const bool ok = logits[0] == logits[1];
+    printf("%s: engram.* vs ple.* (MXFP8 table) layout: %s (nmse %.3g)\n", __func__,
+           ok ? "identical" : "DIFFERENT", nmse(logits[0], logits[1]));
+    return ok ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
     common_init();
@@ -1054,6 +1222,7 @@ int main(int argc, char ** argv) {
     std::string out;
     bool kv_grow = false;
     bool nextn = false;
+    bool engram_layouts = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--kv-grow") == 0) {
@@ -1062,6 +1231,10 @@ int main(int argc, char ** argv) {
         }
         if (strcmp(argv[i], "--nextn") == 0) {
             nextn = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--engram-layouts") == 0) {
+            engram_layouts = true;
             continue;
         }
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -1109,6 +1282,9 @@ int main(int argc, char ** argv) {
         }
         if (nextn) {
             return test_nextn(arch, seed, log_level);
+        }
+        if (engram_layouts) {
+            return test_engram_layouts(seed, log_level);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

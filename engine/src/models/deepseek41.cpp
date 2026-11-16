@@ -528,17 +528,21 @@ ggml_tensor * llm_build_deepseek41::build_engram(
 
     // normalized per (token, hc copy) over n_embd, not jointly over the copies. The reference keeps
     // engram_q and engram_k apart but only ever uses their product, so applying one to each side of
-    // the dot product gives the same result.
+    // the dot product gives the same result; a file that stores the product (engram_gate) applies it
+    // to the query side alone.
     auto grouped_norm = [&](ggml_tensor * t, ggml_tensor * w) {
         t = ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
         t = ggml_rms_norm(ctx0, t, norm_rms_eps);
-        t = ggml_reshape_2d(ctx0, t, hc_dim, nt);
-        t = ggml_mul(ctx0, t, ggml_reshape_2d(ctx0, w, hc_dim, 1));
+        if (w) {
+            t = ggml_reshape_2d(ctx0, t, hc_dim, nt);
+            t = ggml_mul(ctx0, t, ggml_reshape_2d(ctx0, w, hc_dim, 1));
+        }
         return ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
     };
 
-    ggml_tensor * k = grouped_norm(key, as_f32(model.layers[il].engram_k));
-    ggml_tensor * q = grouped_norm(x,   as_f32(model.layers[il].engram_q));
+    const llama_layer & layer = model.layers[il];
+    ggml_tensor * k = grouped_norm(key, layer.engram_gate ? nullptr : as_f32(layer.engram_k));
+    ggml_tensor * q = grouped_norm(x,   as_f32(layer.engram_gate ? layer.engram_gate : layer.engram_q));
 
     ggml_tensor * s = ggml_sum_rows(ctx0, ggml_mul(ctx0, k, q));
     s = ggml_scale(ctx0, s, 1.0f/sqrtf((float) n_embd));

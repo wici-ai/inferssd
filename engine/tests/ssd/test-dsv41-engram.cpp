@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include "llama-engram.h"
 
+#include "ggml.h"
+
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -187,12 +189,51 @@ static void row_and_special_test() {
             "negative E4M3 zero mismatch");
 }
 
+// unsloth's DeepSeek-V4.1 GGUFs store the Engram as MXFP8 blocks: an E8M0 scale, then 32 E4M3 codes.
+// ggml decodes each value exactly, e4m3 * 2^(scale - 127): the reference above wherever its BF16
+// rounding leaves the value as it is (every normal F32 result), NaN for the NaN code or the NaN scale,
+// and the exact value (or infinity) otherwise.
+static void mxfp8_block_test() {
+    const ggml_type_traits * traits = ggml_get_type_traits(GGML_TYPE_MXFP8);
+    require(traits->blck_size == 32 && traits->type_size == 33 && traits->to_float != nullptr,
+            "MXFP8 block geometry mismatch");
+    for (int scale = 0; scale < 256; ++scale) {
+        for (int first = 0; first < 256; first += 32) {
+            uint8_t block[33];
+            block[0] = uint8_t(scale);
+            for (int j = 0; j < 32; ++j) {
+                block[1 + j] = uint8_t(first + j);
+            }
+            float decoded[32];
+            traits->to_float(block, decoded, 32);
+            for (int j = 0; j < 32; ++j) {
+                const int code = first + j;
+                if ((code & 127) == 127 || scale == 255) {
+                    require(std::isnan(decoded[j]), "MXFP8 NaN code or scale was decoded as a number");
+                    continue;
+                }
+                const int exponent = (code >> 3) & 15, mantissa = code & 7;
+                const double magnitude = exponent ? std::ldexp(8.0 + mantissa, exponent - 10) : std::ldexp(mantissa, -9);
+                const float exact = float(std::ldexp((code & 128) ? -magnitude : magnitude, scale - 127));
+                require(bits_of(decoded[j]) == bits_of(exact), "MXFP8 value is not the exact E4M3 value");
+                float reference = 0.0f;
+                if (std::fpclassify(exact) == FP_NORMAL) {
+                    require(llama_dsv41_engram_decode_value(uint8_t(code), uint8_t(scale), reference) ==
+                            llama_dsv41_engram_decode_status::ok && bits_of(reference) == bits_of(exact),
+                            "MXFP8 value differs from the Engram reference decode");
+                }
+            }
+        }
+    }
+}
+
 int main() {
     try {
         exhaustive_value_test();
         bf16_ties_to_even_test();
         antirez_golden_boundaries_test();
         row_and_special_test();
+        mxfp8_block_test();
         std::printf("DSV41_ENGRAM_REFERENCE_OK\n");
         return 0;
     } catch (const std::exception & error) {

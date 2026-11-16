@@ -524,6 +524,23 @@ void dequantize_row_mxfp4(const block_mxfp4 * GGML_RESTRICT x, float * GGML_REST
     }
 }
 
+void dequantize_row_mxfp8(const block_mxfp8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_MXFP8;
+
+    assert(k % qk == 0);
+
+    const int64_t nb = k / qk;
+
+    for (int64_t i = 0; i < nb; i++) {
+        // exact: every E4M3 value times 2^(e - 127) is an F32 value; E8M0 255 is NaN
+        const float d = x[i].e == 0xFF ? NAN : GGML_E8M0_TO_FP32(x[i].e);
+
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = ggml_e4m3_to_fp32(x[i].qs[j])*d;
+        }
+    }
+}
+
 void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_NVFP4;
     static const int qk_sub = QK_NVFP4_SUB;
@@ -5389,6 +5406,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_MXFP4:
             {
                 VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp4, data, nb);
+            } break;
+        case GGML_TYPE_MXFP8:
+            {
+                VALIDATE_ROW_DATA_E_E8M0_IMPL(block_mxfp8, data, nb);
             } break;
         case GGML_TYPE_NVFP4:
             {
