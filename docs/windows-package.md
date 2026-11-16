@@ -4,13 +4,22 @@
 their computers do not need Python, Git, Visual Studio, CMake, Ninja or the Vulkan SDK.
 The desktop application consumes the same package through `scripts/install.ps1`.
 
-The packages target Windows 11 x64 (build 22000 or later) and AVX2-capable CPUs. There is one
-for each GPU backend the launch's table names on Windows:
+The packages target Windows 10 and later x64 and AVX2-capable CPUs. The installer refuses no
+Windows build by its number: it runs the installed programs, and where Windows cannot start them
+because it lacks a function or library they import, it says so and keeps the working installation.
+Windows 10 has no `IoRing`; the engine reads expert weights with overlapped `ReadFile` there. The
+package list's `minimum_windows` (10.0.10240, Windows 10's first build) is for older installers,
+which refuse a build below it. There is one package for each GPU backend the launch's table names
+on Windows:
 
 - `windows-x64-cuda`, for NVIDIA GPUs: the CUDA backend with the GPU expert tier and the GPU
   memory probe, NVIDIA's CUDA runtime and cuBLAS libraries, built for Turing to Blackwell GPUs
-  (real code for Ampere, Ada and Blackwell, PTX for the others). It needs an NVIDIA driver no
-  older than its `minimum_nvidia_driver`, the driver of the CUDA toolkit it is built with.
+  (real code for Ampere, Ada and Blackwell, PTX for the others). A GPU it has real code for
+  (`native_compute_capabilities`) needs an NVIDIA driver no older than
+  `minimum_nvidia_driver_native`, the oldest driver of the same CUDA major version (CUDA minor
+  version compatibility); any other GPU needs `minimum_nvidia_driver`, the driver of the CUDA
+  toolkit it is built with, which compiles the PTX. The installer reads each GPU's compute
+  capability with the driver's `nvidia-smi`; where it cannot, it asks for `minimum_nvidia_driver`.
   The driver's `nvcuda.dll` is loaded on first use, so the package also starts, on the CPU,
   where no NVIDIA driver is.
 - `windows-x64-vulkan`, for every other machine: the Vulkan backend and loader, with CPU fallback when
