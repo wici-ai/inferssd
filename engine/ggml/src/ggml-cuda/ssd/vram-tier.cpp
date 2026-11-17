@@ -609,9 +609,12 @@ struct tier {
         size_t taken=0;
         for(int j:order){
             if(taken==quota)break;
+            // An expert the tier holds needs no seed (found through the slot index); for one it does not, no
+            // reservation means no slot of the layer is free. Neither scans the slots again.
+            if(table->find(r[j],[](const vram_slot_table::entry & e){return e.valid || e.uploading;})>=0)continue;
             const int slot=table->reserve_cold_prefill(r[j]);
-            if(slot>=0){seeds.push_back({slot,r[j],0});sink_seed_slot[size_t(j)]=slot;++taken;}
-            else if(!table->free_slots(layer))break;
+            if(slot<0)break;
+            seeds.push_back({slot,r[j],0});sink_seed_slot[size_t(j)]=slot;++taken;
         }
         seeds_planned+=taken;
     }
