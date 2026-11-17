@@ -1166,7 +1166,11 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     if (cpu_prefill_actual_shape_enabled) {
         if (active) {
             if (cpu_prefill_actual_shape_active) {
-                return complete_vram_phase(false);
+                // A later batch of the prompt (the server reports the start of each): its first ubatch may need a
+                // graph of another shape, reserved as the prompt's first was, so the tier's prefill phase completes
+                // once that graph has its memory (process_ubatch), its reclaimer armed for the reserve.
+                cpu_prefill_reserve_pending = true;
+                return true;
             }
             const uint64_t requested = prefill_tokens ? prefill_tokens : cpu_prefill_configured_ubatch;
             const uint64_t rounded = ((requested + cpu_prefill_graph_granularity - 1) /
@@ -1907,6 +1911,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
+    // a sequence that advances by more than one token: a prompt pass (a simple split counts each token a sequence
+    // set, n_seqs, so the distinct sequences decide)
+    const bool prompt_pass = ubatch.n_tokens > ubatch.n_seqs_unq && !cpu_sink_decode_active;
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
@@ -1949,9 +1956,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // The input rows' reads go out once the graph has its room and before its buffers are allocated: the rows
         // land in room the caches gave back, and the reads overlap the allocation.
         const auto prefetch = [&]() { res->prefetch_inputs(&ubatch); };
-        // a sequence that advances by more than one token: a prompt pass (a simple split counts each token a
-        // sequence set, n_seqs, so the distinct sequences decide)
-        const bool prompt_pass = ubatch.n_tokens > ubatch.n_seqs_unq && !cpu_sink_decode_active;
         bool allocated = false;
         if (cpu_sink_runtime) {
             allocated = reserve_compute_graph(gf, prompt_pass, prefetch) &&
@@ -1971,14 +1975,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-        if (prompt_pass && cpu_prefill_reserve_pending) {
-            // the graph has its memory: the VRAM tier's prefill phase completes, and its reclaimer is disarmed
-            cpu_prefill_reserve_pending = false;
-            if (cpu_sink_runtime && !cpu_sink_runtime->phase_complete(false)) {
-                LLAMA_LOG_ERROR("%s: VRAM tier phase completion failed after the prefill graph's reserve\n", __func__);
-                ret = GGML_STATUS_FAILED;
-                return nullptr;
-            }
+    }
+    if (prompt_pass && cpu_prefill_reserve_pending) {
+        // the prompt pass's graph has its memory (reserved above, or the previous graph's): the VRAM tier's prefill
+        // phase completes, and its reclaimer is disarmed
+        cpu_prefill_reserve_pending = false;
+        if (cpu_sink_runtime && !cpu_sink_runtime->phase_complete(false)) {
+            LLAMA_LOG_ERROR("%s: VRAM tier phase completion failed after the prefill graph's reserve\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
         }
     }
 
