@@ -381,6 +381,28 @@ def test_shards_and_optional_split_metadata_must_agree(tmp_path):
         m.build_rows([a, b], {"up"}, 256)
 
 
+def test_numbered_shard_link_to_shared_payload_keeps_split_validation(tmp_path):
+    a = tmp_path / "model-00001-of-00002.gguf"
+    b = tmp_path / "model-00002-of-00002.gguf"
+    shared = tmp_path / "shared-engram.gguf"
+    fixture(a, kv=[("split.no", 2, 0), ("split.count", 2, 2), ("split.tensors.count", 5, 2)])
+    fixture(shared, tensors=[("per_layer_token_embd.weight", (32,), 0, 0)], kv=[("split.no", 2, 1)])
+    try:
+        b.symlink_to(shared.name)
+    except OSError as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+    rows, summary = m.build_rows([a, b], {"up"}, 256)
+    assert len(rows) == 256 and summary["model_shards"] == 2
+    # The real header must still identify the final shard.
+    fixture(shared, tensors=[("per_layer_token_embd.weight", (32,), 0, 0)], kv=[("split.no", 2, 0)])
+    with pytest.raises(RuntimeError, match="inconsistent split.no"):
+        m.build_rows([a, b], {"up"}, 256)
+    b.unlink()
+    b.symlink_to(a.name)
+    with pytest.raises(RuntimeError, match="duplicate GGUF source file"):
+        m.build_rows([a, b], {"up"}, 256)
+
+
 def test_native_split_metadata_and_nonexpert_duplicates_are_checked(tmp_path):
     a, b = (tmp_path / f"model-{i:05d}-of-00002.gguf" for i in (1, 2))
     fixture(a)

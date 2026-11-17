@@ -308,8 +308,10 @@ void run_type(void * mm, ggml_backend_t backend, ggml_type type, int64_t nrows, 
 }
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
     try {
+        const bool dsv41_iq = argc == 2 && std::string(argv[1]) == "--dsv41-iq";
+        require(argc == 1 || dsv41_iq, "usage: test-ssd-vram-mm [--dsv41-iq]");
         ggml_cpu_init();
         int device = 0;
         cuda(cudaSetDevice(device), "cudaSetDevice");
@@ -332,6 +334,25 @@ int main() {
         ggml_backend_t backend = ggml_backend_cuda_init(device);
         require(backend, "ggml CUDA backend");
         totals t;
+        if (dsv41_iq) {
+            // Both real routed-expert matrix orientations, including the 2304
+            // dimension which is not a power of two. run_type covers decode,
+            // grouped prefill, gathered/non-contiguous inputs and buffer reuse.
+            for (const ggml_type type : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+                    GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS}) {
+                require(ggml_cuda_moe_stream_mm_supports(type), "missing DeepSeek IQ format");
+                void * mm = ggml_cuda_moe_stream_mm_create(device);
+                require(mm, "create");
+                run_type(mm, backend, type, 2304, 5120, stream, t, false);
+                run_type(mm, backend, type, 5120, 2304, stream, t, false);
+                ggml_cuda_moe_stream_mm_destroy(mm);
+            }
+            ggml_backend_free(backend);
+            cuda(cudaStreamDestroy(stream), "stream destroy");
+            std::printf("DSV41_IQ_VRAM_MM_PASS device=%s checks=%zu worst_nmse=%.3g\n",
+                prop.name, t.checks, t.worst);
+            return 0;
+        }
         // a fresh context per type, so each one's reservation is checked alone
         for (const ggml_type type : types) {
             void * mm = ggml_cuda_moe_stream_mm_create(device);

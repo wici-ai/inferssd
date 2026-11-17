@@ -53,6 +53,17 @@ source tree.
    Copyright (c) 2023-2026 The ggml authors. The MIT permission notice below
    applies.
 
+   The shared-table PLE GGUF compatibility in
+   engine/src/models/deepseek41.cpp and deepseek41-engram.h was independently
+   implemented and checked against src/models/deepseek41.cpp in upstream
+   ggml-org/llama.cpp revision 9581154a2250cc9e6948e4c2a2fc4b4e19d1a57e.
+   The reference file SHA-256 is
+   73916d555f7d664c43e54eecb0da8392693d940271a5268d0291ab98b0f8283d.
+   This compatibility preserves the upstream token-map padding and history
+   barrier semantics, shared table offsets, fused gate scales and positive
+   zero-dot gate. Its small hash and CPU gate tests are in
+   engine/tests/ssd/test-dsv41-engram.cpp.
+
    DeepSeek-V4.1 router normalization in engine/src/llama-graph.h also follows
    src/llama-graph.cpp at that revision: the selected scores use a sum-plus-
    epsilon denominator instead of the generic F16 floor. The CPU graph

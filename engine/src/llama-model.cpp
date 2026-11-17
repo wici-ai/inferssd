@@ -20,6 +20,7 @@
 #include "llama-memory-recurrent.h"
 
 #include "models/models.h"
+#include "models/deepseek41-ple.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -2417,6 +2418,19 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     if (p < (hparams.engram_e4m3_e8m0_32_row264 ? 2u : 1u)) {
                         throw std::runtime_error("engram prime is below the supported minimum");
                     }
+                }
+                if (engram_ple_layout) {
+                    // Vocabulary-free model loads omit tokenizer metadata. The tensor
+                    // loader also checks the map against the actual embedding vocabulary.
+                    uint32_t ple_n_vocab = (uint32_t) engram_token_map.size();
+                    ml.get_arr_n(LLM_KV_TOKENIZER_LIST, ple_n_vocab, false);
+                    const std::vector<uint32_t> layers(hparams.engram_layer_ids.begin(),
+                        hparams.engram_layer_ids.begin() + engram_n_layer);
+                    engram_rows = {llama_dsv41_validate_ple(
+                        hparams.n_layer, ple_n_vocab, layers, hparams.engram_max_ngram_size,
+                        hparams.engram_n_head, hparams.engram_key_length,
+                        engram_multipliers, engram_offsets, engram_primes,
+                        engram_token_map, engram_pad_id)};
                 }
 
                 type = LLM_TYPE_UNKNOWN;
@@ -6051,11 +6065,24 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
                     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
-                    // the one table every Engram layer reads, where the file keeps them together: every bucket's
                     if (engram_ple_layout) {
-                        const int64_t n_rows = dsv41_engram_table_rows(engram_offsets, engram_primes, 0, engram_offsets.size());
+                        int64_t rows = (int64_t) engram_rows.at(0);
+                        // Virtual architecture checks synthesize tensors without backing files.
+                        if (!ml.files.empty()) {
+                            const std::string name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+                            const auto & weight = ml.require_weight(name.c_str());
+                            rows = weight.tensor->ne[1];
+                            if (rows < (int64_t) engram_rows.at(0)) {
+                                throw std::runtime_error(format(
+                                    "%s has %" PRId64 " rows, too few for the Engram heads (%" PRIu64 ")",
+                                    name.c_str(), rows, engram_rows.at(0)));
+                            }
+                            // Buckets may have gaps and the shared table may have trailing padding.
+                            ml.mark_ple_lazy(weight);
+                        }
+                        engram_rows[0] = (uint64_t) rows;
                         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                                           {(int64_t) hparams.engram_key_length, n_rows}, 0);
+                            {hparams.engram_key_length, rows}, 0);
                     }
 
                     for (int i = 0; i < n_layer; ++i) {

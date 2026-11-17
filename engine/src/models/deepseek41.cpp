@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "models.h"
 #include "deepseek41-candidate.h"
+#include "deepseek41-engram.h"
 
 #include "llama-engram.h"
 #include "llama-impl.h"
@@ -276,6 +277,21 @@ void llm_graph_input_engram::compute_rows(const llama_ubatch * ubatch) {
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
+    if (model.engram_ple_layout) {
+        std::vector<int32_t> history(n_gram);
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            history[0] = ubatch->token ? ubatch->token[i] : LLAMA_TOKEN_NULL;
+            for (int64_t shift = 1; shift < n_gram; ++shift) {
+                history[shift] = ubatch->pos[i] < shift ? LLAMA_TOKEN_NULL :
+                    prev[i*n_prev + (n_prev - shift)];
+            }
+            llama_dsv41_ple_hash(history.data(), n_gram, n_heads,
+                model.engram_token_map.data(), model.engram_token_map.size(), model.engram_pad_id,
+                mult, prime, offset, idx.data() + i*n_cols);
+        }
+        return;
+    }
+
     std::vector<uint64_t> ctx(n_gram);
     for (int64_t i = 0; i < n_tokens; ++i) {
         // look-back stops at the start of the sequence; everything from there on reads as padding
@@ -528,8 +544,7 @@ ggml_tensor * llm_build_deepseek41::build_engram(
 
     // normalized per (token, hc copy) over n_embd, not jointly over the copies. The reference keeps
     // engram_q and engram_k apart but only ever uses their product, so applying one to each side of
-    // the dot product gives the same result; a file that stores the product (engram_gate) applies it
-    // to the query side alone.
+    // the dot product gives the same result. PLE applies the fused scale to the query below.
     auto grouped_norm = [&](ggml_tensor * t, ggml_tensor * w) {
         t = ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
         t = ggml_rms_norm(ctx0, t, norm_rms_eps);
@@ -540,18 +555,25 @@ ggml_tensor * llm_build_deepseek41::build_engram(
         return ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
     };
 
-    const llama_layer & layer = model.layers[il];
-    ggml_tensor * k = grouped_norm(key, layer.engram_gate ? nullptr : as_f32(layer.engram_k));
-    ggml_tensor * q = grouped_norm(x,   as_f32(layer.engram_gate ? layer.engram_gate : layer.engram_q));
+    ggml_tensor * s;
+    if (model.engram_ple_layout) {
+        s = llama_dsv41_ple_dot(ctx0, x, ggml_reshape_3d(ctx0, key, n_embd, hc, nt),
+            as_f32(model.layers[il].engram_gate), norm_rms_eps);
+    } else {
+        ggml_tensor * k = grouped_norm(key, as_f32(model.layers[il].engram_k));
+        ggml_tensor * q = grouped_norm(x,   as_f32(model.layers[il].engram_q));
+        s = ggml_scale(ctx0, ggml_sum_rows(ctx0, ggml_mul(ctx0, k, q)), 1.0f/sqrtf((float) n_embd));
+    }
 
-    ggml_tensor * s = ggml_sum_rows(ctx0, ggml_mul(ctx0, k, q));
-    s = ggml_scale(ctx0, s, 1.0f/sqrtf((float) n_embd));
-
-    // signed square root before the sigmoid, matching the training kernel. The reference uses
-    // copysign, which treats +0 as positive where ggml_sgn gives 0, so a dot product of exactly
-    // zero gates 0.5 here against 0.50025 there.
-    ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, s), 1e-6f, INFINITY));
-    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, s), mag));
+    // Signed square root before the sigmoid. PLE follows the reference's
+    // positive zero branch (gate 0.50025); preserve the legacy zero gate of 0.5.
+    ggml_tensor * gate;
+    if (model.engram_ple_layout) {
+        gate = llama_dsv41_ple_gate(ctx0, s);
+    } else {
+        ggml_tensor * mag = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, s), 1e-6f, INFINITY));
+        gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, s), mag));
+    }
     cb(gate, "engram_gate", il);
 
     // the value is shared across the copies, only the gate differs
@@ -1155,7 +1177,7 @@ llm_build_deepseek41::llm_build_deepseek41(const llama_model & model, const llm_
 
     for (int il = 0; il < n_layer; ++il) {
         // the engram sits before the block and writes straight into the stream
-        if (model.engram_index(il) >= 0) {
+        if (model.engram_index(il) >= 0 && (!model.engram_ple_layout || ubatch.token)) {
             inpL = build_engram(inpL, build_inp_engram(il), il);
             cb(inpL, "engram_out", il);
         }

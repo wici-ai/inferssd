@@ -453,6 +453,10 @@ if (TARGET ggml-cpu)
     add_test(NAME dsv41_q2_cpu_sink_decode COMMAND test-ssd-cpu-sink
         --q2-activation-test --threads 9 --ring-experts 8)
 
+    add_test(NAME dsv41_mixed_iq_cpu_sink_decode COMMAND test-ssd-cpu-sink
+        --dsv41-iq-test --threads 9 --ring-experts 8)
+    set_tests_properties(dsv41_mixed_iq_cpu_sink_decode PROPERTIES LABELS device SKIP_RETURN_CODE 77)
+
     add_test(NAME ssd_cpu_sink_schedule_invalid COMMAND test-ssd-cpu-sink --schedule-invalid)
     # Sink nodes in ggml graphs on a ggml threadpool of 1, 2, 3 and all CPUs: the production schedule, and a
     # polling one.
@@ -893,6 +897,14 @@ inferssd_ci_test(test-moe-router-norm test-moe-router-norm)
 llama_build_and_test(ssd/test-dsv41-engram.cpp)
 target_include_directories(test-dsv41-engram PRIVATE ../src)
 inferssd_ci_test(test-dsv41-engram test-dsv41-engram)
+
+# Pure metadata admission: no weights, backend or device needed.
+add_executable(test-dsv41-ple ssd/test-dsv41-ple.cpp)
+target_compile_features(test-dsv41-ple PRIVATE cxx_std_17)
+target_include_directories(test-dsv41-ple PRIVATE ../src)
+add_test(NAME test-dsv41-ple COMMAND test-dsv41-ple)
+set_property(TEST test-dsv41-ple PROPERTY LABELS unit)
+inferssd_ci_test(test-dsv41-ple test-dsv41-ple)
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     llama_build(ssd/test-llama-mmap-random.cpp)

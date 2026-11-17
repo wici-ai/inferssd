@@ -31,6 +31,7 @@
 
 ## Development
 
+- [DeepSeek IQ2_XS](deepseek-iq2-xs.md): shared Engram compatibility, mixed-IQ tests and single-GPU validation.
 - [Upstream patches](development/upstream-patches.md): integration points in the bundled llama.cpp snapshot.
 - [GPU prefill overhead](development/prefill-overhead.md): the placement cost model for batched GPU work.
 

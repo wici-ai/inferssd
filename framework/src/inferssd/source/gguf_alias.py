@@ -336,7 +336,12 @@ def _validate_shards(paths: list[Path]) -> list[int]:
     resolved = [path.resolve(strict=True) for path in paths]
     if len(set(resolved)) != len(resolved):
         raise RuntimeError("duplicate GGUF source file")
-    first = SHARD_RE.fullmatch(resolved[0].name)
+    # Native sibling discovery follows the supplied shard names. A shared
+    # payload (for example Engram) may be linked under a numbered shard name.
+    # Resolve directories for comparison, but retain each link's basename;
+    # physical source identities and split metadata are still checked below.
+    named = [path.parent.resolve(strict=True) / path.name for path in paths]
+    first = SHARD_RE.fullmatch(named[0].name)
     if first is None:
         if len(paths) != 1:
             raise RuntimeError("multiple GGUF files must form one complete numbered shard set")
@@ -348,12 +353,12 @@ def _validate_shards(paths: list[Path]) -> list[int]:
     if len(paths) != total:
         raise RuntimeError("GGUF source list is not the complete numbered shard set")
     expected = {
-        resolved[0].parent / f"{prefix}-{i:05d}-of-{total_text}.gguf" for i in range(1, total + 1)
+        named[0].parent / f"{prefix}-{i:05d}-of-{total_text}.gguf" for i in range(1, total + 1)
     }
-    if set(resolved) != expected:
+    if set(named) != expected:
         raise RuntimeError("GGUF source list is not the complete numbered shard set")
     numbers = []
-    for path in resolved:
+    for path in named:
         match = SHARD_RE.fullmatch(path.name)
         if match is None:
             raise RuntimeError("GGUF source list contains an unnumbered shard")
