@@ -2,7 +2,7 @@
 #include <cstdio>
 
 int main(){try{
-    vram_slot_table table(2,{1},true,0);kimi_vram_request r[4]={};
+    vram_slot_table table(2,{1},true,0);ssd_vram_request r[4]={};
     for(int i=0;i<4;++i){r[i].layer=1;r[i].expert=i;r[i].weight=1;for(auto & role:r[i].role){role.inode=7;role.bytes=4096;role.offset=i*4096;}}
     table.next_token();table.prepare(r,2);table.publish(0);table.publish(1);table.finish();
     table.next_token();table.slots[0].native_refs=1;

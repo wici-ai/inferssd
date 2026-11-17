@@ -15,7 +15,7 @@ const ggml_backend_sched_ssd_hooks runtime::hooks_{
     },
     [](void * p, int phase) { auto & r = *static_cast<runtime *>(p);
         std::lock_guard<std::mutex> lock(r.mutex_); r.phase_ = phase >= 0 && phase <= 2 ? phase : 0; },
-    [](void * p, ggml_backend_sched_kimi_copy_stats * out) { auto & r = *static_cast<runtime *>(p);
+    [](void * p, ggml_backend_sched_ssd_copy_stats * out) { auto & r = *static_cast<runtime *>(p);
         std::lock_guard<std::mutex> lock(r.mutex_); *out = r.stats_; },
     [](void *) {} // Source geometry is immutable; counters survive graph replacement.
 };

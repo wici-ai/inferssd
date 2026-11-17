@@ -128,7 +128,7 @@ if (CUDAToolkit_FOUND)
                              ${GGML_SOURCES_CUDA}
                             )
 
-    if (GGML_CUDA_KIMI_VRAM_TIER)
+    if (GGML_CUDA_SSD_VRAM_TIER)
         target_sources(ggml-cuda PRIVATE ssd/group-matmul.cu)
         add_subdirectory(ssd)
     endif()

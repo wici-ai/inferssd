@@ -17,23 +17,23 @@
 #include <vector>
 
 // A sink under test and the compute participants a ggml graph gives its calls: the test thread coordinates and
-// participants - 1 joiner threads enter through kimi_cpu_sink_call_join, as ggml's other threads do. One call stays
+// participants - 1 joiner threads enter through ssd_cpu_sink_call_join, as ggml's other threads do. One call stays
 // open from creation to release, so every run in between computes on all participants.
 class sink_ptr {
 public:
     sink_ptr() = default;
-    explicit sink_ptr(kimi_cpu_sink * sink, int participants = 1) : sink_(sink) {
+    explicit sink_ptr(ssd_cpu_sink * sink, int participants = 1) : sink_(sink) {
         if (!sink_ || participants <= 1) { return; }
         char error[256] = {};
-        if (!kimi_cpu_sink_call_open(sink_, participants, error, sizeof(error))) {
-            kimi_cpu_sink_destroy(sink_);
+        if (!ssd_cpu_sink_call_open(sink_, participants, error, sizeof(error))) {
+            ssd_cpu_sink_destroy(sink_);
             throw std::runtime_error(std::string("sink call open: ") + error);
         }
         // A joiner that cannot start leaves the call waiting for it forever.
         try {
             joiners_.reserve(size_t(participants - 1));
             for (int ith = 1; ith < participants; ++ith) {
-                joiners_.emplace_back([sink, ith, participants] { kimi_cpu_sink_call_join(sink, ith, participants); });
+                joiners_.emplace_back([sink, ith, participants] { ssd_cpu_sink_call_join(sink, ith, participants); });
             }
         } catch (...) { std::fprintf(stderr, "sink joiner thread failed to start\n"); std::abort(); }
     }
@@ -52,18 +52,18 @@ public:
     void reset() {
         if (!sink_) { return; }
         if (!joiners_.empty()) {
-            kimi_cpu_sink_call_close(sink_);
+            ssd_cpu_sink_call_close(sink_);
             for (auto & joiner : joiners_) { joiner.join(); }
             joiners_.clear();
         }
-        kimi_cpu_sink_destroy(sink_);
+        ssd_cpu_sink_destroy(sink_);
         sink_ = nullptr;
     }
-    kimi_cpu_sink * get() const { return sink_; }
+    ssd_cpu_sink * get() const { return sink_; }
     explicit operator bool() const { return sink_ != nullptr; }
 
 private:
-    kimi_cpu_sink * sink_ = nullptr;
+    ssd_cpu_sink * sink_ = nullptr;
     std::vector<std::thread> joiners_;
 };
 
@@ -258,9 +258,9 @@ struct fixture_inputs {
         return out;
     }
     // threads counts the I/O thread, as the fixtures' CTest names do: threads - 1 compute participants.
-    sink_ptr create(int threads, int depth, kimi_cpu_sink_resolver resolver, void * userdata,
+    sink_ptr create(int threads, int depth, ssd_cpu_sink_resolver resolver, void * userdata,
             char * error, size_t size) const {
-        kimi_cpu_sink * sink = nullptr;
+        ssd_cpu_sink * sink = nullptr;
         try {
             const auto selection = debug();
             auto services = runtime;

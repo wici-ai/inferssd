@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 // Shared plain records preserve the existing private callback ABI.
-struct kimi_cpu_sink_stats {
+struct ssd_cpu_sink_stats {
     uint64_t experts;
     uint64_t read_requests;
     uint64_t read_bytes;
@@ -47,7 +47,7 @@ struct kimi_cpu_sink_stats {
     double ordered_reduce_us; // ready-first final slot-order sum; inside compute_us
 };
 
-struct kimi_cpu_sink_cache_stats {
+struct ssd_cpu_sink_cache_stats {
     uint64_t budget_bytes;       // hard payload mapping limit; metadata/ring are separate
     uint64_t capacity_bytes;
     uint64_t mapped_bytes;

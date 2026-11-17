@@ -101,7 +101,7 @@ static void serial_equivalence() {
     files f; auto owner = std::make_shared<test_owner>(f.reader()); auto a = owner->make_client();
     must_throw([&] { auto t = a->take(1); }, "unconfigured client admitted");
     a->configure(config(true)); a->configure(config(true));
-    kimi_host_ledger old; old.read = f.reader(); old.cgroup = "/sys/fs/cgroup/fixture";
+    ssd_host_ledger old; old.read = f.reader(); old.cgroup = "/sys/fs/cgroup/fixture";
     old.unified = true; old.reserve = old.margin = 512*MiB; old.reclaimable_file = true;
     old.page_size = uint64_t(sysconf(_SC_PAGESIZE));
     for (const uint64_t pages : {uint64_t(0), GiB, 3*GiB}) {

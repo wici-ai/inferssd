@@ -47,12 +47,12 @@ size_t slot_offset(int layer, int role) {
     return at;
 }
 size_t expert_bytes(int layer) { return slot_offset(layer, 3); }
-kimi_vram_expert_format declared(int layer) {
+ssd_vram_expert_format declared(int layer) {
     return { latent, hidden, up_types[layer - 1], down_types[layer - 1], experts, 2, layer_ids, up_types, down_types };
 }
 // The request the sink builds: each role by its payload, at its own offset of one file.
-kimi_vram_request key(int layer, int expert) {
-    kimi_vram_request r = {}; r.layer = layer; r.expert = expert; r.weight = .5f;
+ssd_vram_request key(int layer, int expert) {
+    ssd_vram_request r = {}; r.layer = layer; r.expert = expert; r.weight = .5f;
     uint64_t offset = (uint64_t(layer) * experts + uint64_t(expert)) << 20;
     for (int i = 0; i < 3; ++i) { r.role[i] = { 1, 2, uint64_t(1) << 32, offset, payload(layer, i), 3, 4, 5, 6 }; offset += payload(layer, i); }
     return r;
@@ -188,7 +188,7 @@ void scribble(tier & t) {
     // the tier's copy streams do not wait for the default stream's memsets
     cuda_check(cudaDeviceSynchronize());
 }
-const kimi_vram_activation swiglu = { KIMI_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f };
+const ssd_vram_activation swiglu = { SSD_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f };
 // At load, as the sink fills the tier from the drive (cpu-sink.cpp preload): reserve takes the storage for a request
 // named by its payload, and preload copies experts no request has named from host memory that holds only their
 // payloads into empty slots. Each slot holds the payloads with zero padding, a padded name of a payload-named role is
@@ -196,7 +196,7 @@ const kimi_vram_activation swiglu = { KIMI_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0
 std::vector<int> layer_step(tier & t, const store & s, int layer, int token, const std::vector<int> & ids, const char * what,
         bool deferred = false);
 void preload_case(fixture_inputs & inputs, const store & s) {
-    if (ggml_backend_cuda_device_is_unified(0)) { std::printf("KIMI_VRAM_PAYLOAD preload case: unified memory, skipped\n"); return; }
+    if (ggml_backend_cuda_device_is_unified(0)) { std::printf("SSD_VRAM_PAYLOAD preload case: unified memory, skipped\n"); return; }
     inputs.set("tier.keep_across_requests", "1");
     inputs.set("tier.elastic", "1");
     inputs.set("tier.demand_reclaim", "0");
@@ -237,7 +237,7 @@ void preload_case(fixture_inputs & inputs, const store & s) {
 // One decode layer as the sink runs it: prepare, launch, the misses' admissions (deferred where asked), finish.
 std::vector<int> layer_step(tier & t, const store & s, int layer, int token, const std::vector<int> & ids, const char * what,
         bool deferred) {
-    std::vector<kimi_vram_request> r;
+    std::vector<ssd_vram_request> r;
     for (int e : ids) { r.push_back(key(layer, e)); }
     std::vector<int> slots(ids.size(), -1);
     const auto f = declared(layer);
@@ -294,7 +294,7 @@ int main() {
     const auto deferred = layer_step(t, s, 1, 3, { 2 }, "deferred admission", true);
     const int target = t.table->admissions[0];
     {
-        kimi_vram_request collected[4] = {};
+        ssd_vram_request collected[4] = {};
         int32_t aborted[4] = {};
         int count = 0;
         t.collect(-1, collected, aborted, 4, &count);
@@ -320,7 +320,7 @@ int main() {
         require(slot < 0, "the host job's expert is already resident");
         const auto x = input(2, 5);
         t.launch_activation(x.data(), x.size() * sizeof(float), &swiglu);
-        const kimi_vram_host_job job = { 0, .5f, { s.role_at(2, 3, 0), s.role_at(2, 3, 1), s.role_at(2, 3, 2) } };
+        const ssd_vram_host_job job = { 0, .5f, { s.role_at(2, 3, 0), s.role_at(2, 3, 1), s.role_at(2, 3, 2) } };
         int accepted = 0;
         t.launch_host(&job, 1, &accepted);
         require(accepted == 1, "the host job was refused");
@@ -351,12 +351,12 @@ int main() {
     }
     t.release();
     preload_case(inputs, s);
-    std::printf("KIMI_VRAM_PAYLOAD_PASS assertions=%d layer1=%s/%s down=%zu/%zu layer2=%s/%s role=%zu/%zu\n", assertions,
+    std::printf("SSD_VRAM_PAYLOAD_PASS assertions=%d layer1=%s/%s down=%zu/%zu layer2=%s/%s role=%zu/%zu\n", assertions,
         ggml_type_name(type_of(1, 0)), ggml_type_name(type_of(1, 2)), payload(1, 2), padded(1, 2),
         ggml_type_name(type_of(2, 0)), ggml_type_name(type_of(2, 2)), payload(2, 0), padded(2, 0));
     return 0;
     } catch (const std::exception & e) {
-        std::fprintf(stderr, "KIMI_VRAM_PAYLOAD_FAIL: %s\n", e.what());
+        std::fprintf(stderr, "SSD_VRAM_PAYLOAD_FAIL: %s\n", e.what());
         return 1;
     }
 }

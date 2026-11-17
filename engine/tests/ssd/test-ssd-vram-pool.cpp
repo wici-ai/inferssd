@@ -15,8 +15,8 @@ static void rejected(const std::function<void()> & fn) {
     try { fn(); } catch (const std::exception &) { failed = true; }
     require(failed, "invalid pool configuration or lease operation accepted");
 }
-static kimi_vram_request request(int layer, int expert) {
-    kimi_vram_request r = {};
+static ssd_vram_request request(int layer, int expert) {
+    ssd_vram_request r = {};
     r.layer=layer;r.expert=expert;r.weight=1;
     for (int i=0;i<3;++i) r.role[i]={1,7,1000000,uint64_t(expert*3+i)*4096,4096,3,4,5,6,0};
     return r;
@@ -41,7 +41,7 @@ int main() { try {
     rejected([]{vram_slot_table t(2,{1,1},true,0,true,4);});
 
     auto a=request(1,0),b=request(1,1),c=request(2,2);
-    kimi_vram_request pair[]={a,b};
+    ssd_vram_request pair[]={a,b};
     vram_slot_table old(2,{1,2},false),pool(2,{1,2},false,0,true);
     for (auto * t:{&old,&pool}) {
         t->next_token();t->prepare(pair,2);publish(*t);
@@ -53,7 +53,7 @@ int main() { try {
 
     // A later selected hit must be protected before an earlier miss chooses
     // a victim, including when the arena is shared with other layers.
-    auto d=request(1,3);kimi_vram_request reordered[]={d,a};
+    auto d=request(1,3);ssd_vram_request reordered[]={d,a};
     pool.next_token();pool.prepare(reordered,2);
     require(pool.hits[1]>=0 && pool.admissions[0]>=0,"selected hit was evicted by an earlier miss");
     publish(pool);
@@ -63,7 +63,7 @@ int main() { try {
     require(pool.admissions[0]>=0 && pool.admissions[0]!=pinned,"cross-layer admission evicted native lease");
     publish(pool);rejected([&]{pool.clear();});
     pool.slots[pinned].native_refs=0;
-    int ready[2]={};kimi_vram_request lookup[]={a,c};
+    int ready[2]={};ssd_vram_request lookup[]={a,c};
     const auto generation=pool.acquire_slots(lookup,2,ready);
     require(ready[0]>=0 && ready[1]>=0,"global lookup lost a layer identity");
     rejected([&]{pool.prepare(&b,1);});pool.release_ready(generation);
@@ -214,7 +214,7 @@ int main() { try {
         holds_match(s,"held differs after the seeds");
         // reclaim: a shrink of the global pool drops what its tail slots held
         vram_slot_table g(2,{1,2},true,0,true,16);g.reserve_global(4);g.resize_global(4);
-        const kimi_vram_request four[]={r1,r2,r5,request(1,6)};
+        const ssd_vram_request four[]={r1,r2,r5,request(1,6)};
         g.next_token();g.prepare(four,4);publish(g);
         require(g.holds(1,1) && g.holds(1,2) && g.holds(1,5) && g.holds(1,6),"four admissions are not held");
         g.resize_global(2);holds_match(g,"held differs after a shrink");
@@ -258,7 +258,7 @@ int main() { try {
     // into empty slots below the boundary first, then onto entries worth less; live slots neither move nor take a move.
     {
         vram_slot_table t(4,{1},true,0,true,16);
-        const kimi_vram_request four[]={request(1,1),request(1,2),request(1,3),request(1,4)};
+        const ssd_vram_request four[]={request(1,1),request(1,2),request(1,3),request(1,4)};
         t.next_token();t.prepare(four,4);publish(t);
         const int head_cold=t.slots[0].key.expert,head_warm=t.slots[1].key.expert;
         const int tail_hot=t.slots[2].key.expert,tail_cold=t.slots[3].key.expert;

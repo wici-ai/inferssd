@@ -12,7 +12,7 @@ int main() {
     try {
     int checks = 0;
     auto require = [&](bool ok) { ++checks; if (!ok) throw std::runtime_error("cache lease assertion"); };
-    const std::string path = test_resources::temp_file("kimi-cache-lease");
+    const std::string path = test_resources::temp_file("ssd-cache-lease");
     const int fd = ssd::platform::open_buffered(path.c_str()); require(fd >= 0);
     ssd::host::expert_cache_options configuration;
     configuration.require_shared = false; configuration.cache_policy = "lru";

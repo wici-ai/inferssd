@@ -1,5 +1,5 @@
 #include "explicit-fixture-inputs.h"
-// CUDA lifecycle test of deferred VRAM uploads (GGML_KIMI_CPU_SINK_VRAM_DEFERRED_UPLOAD=1). A borrowed upload
+// CUDA lifecycle test of deferred VRAM uploads (the tier's deferred_upload). A borrowed upload
 // outlives finish, keeps its slot out of every eviction, is published only by collect, and release waits for it.
 // A hook on the upload thread holds a copy in flight or makes it fail, independently of GPU/CPU speed.
 #include "gpu-services.h"
@@ -28,8 +28,8 @@ bool done_within(std::future<void> & f, int ms) { return f.wait_for(std::chrono:
 int assertions = 0;
 void require(bool ok, const char * what) { ++assertions; if (!ok) throw std::runtime_error(what); }
 const size_t role = lifecycle_role_bytes(), stride = 3 * role;
-kimi_vram_request key(int layer, int expert) {
-    kimi_vram_request r = {}; r.layer = layer; r.expert = expert; r.weight = .5f;
+ssd_vram_request key(int layer, int expert) {
+    ssd_vram_request r = {}; r.layer = layer; r.expert = expert; r.weight = .5f;
     for (int i = 0; i < 3; ++i) { r.role[i] = {1, 2, 100000000, uint64_t(layer * 1000 + expert * 3 + i) * role, role, 3, 4, 5, 6}; }
     return r;
 }
@@ -47,7 +47,7 @@ int main() {
     const void * data[] = {payload.data(), payload.data() + role, payload.data() + 2 * role};
     std::vector<float> out(256);
     int slots[2] = {}, queued = 0, count = -1;
-    kimi_vram_request collected[4] = {};
+    ssd_vram_request collected[4] = {};
     int32_t aborted[4] = {};
     struct cleanup { ~cleanup() { open_gate(); } } cleanup_on_error;
     tier t(2 * stride, inputs.tier_policy()); // two slots, one global pool for every layer
@@ -68,7 +68,7 @@ int main() {
     require(count == 0, "collect published an upload still in flight");
 
     // Another layer cannot evict the uploading slot: of two candidates only one is admitted, into the free slot.
-    const kimi_vram_request bc[2] = {key(2, 1), key(2, 2)};
+    const ssd_vram_request bc[2] = {key(2, 1), key(2, 2)};
     lifecycle_prepare(t,bc, 2,slots);
     require(t.table->admissions[0] != slot_a && t.table->admissions[1] != slot_a, "an uploading slot was chosen as a victim");
     require((t.table->admissions[0] >= 0) != (t.table->admissions[1] >= 0), "expected exactly one admission into the free slot");
@@ -90,12 +90,12 @@ int main() {
     require(slots[0] == slot_a, "published upload did not serve a hit");
     {
         char error[256] = {}; int c = 1;
-        require(deferred_collect(&t, KIMI_VRAM_COLLECT_IF_IDLE, collected, aborted, 4, &c, error, sizeof(error)) == 0 && c == 0 && t.table,
+        require(deferred_collect(&t, SSD_VRAM_COLLECT_IF_IDLE, collected, aborted, 4, &c, error, sizeof(error)) == 0 && c == 0 && t.table,
                 "a reclaimer's collect inside a layer did not leave the layer alone");
     }
     {
         char error[256] = {}; int c = 0;
-        require(deferred_collect(&t, KIMI_VRAM_COLLECT_NONE, collected, aborted, 4, &c, error, sizeof(error)) != 0, "collect accepted inside a layer");
+        require(deferred_collect(&t, SSD_VRAM_COLLECT_NONE, collected, aborted, 4, &c, error, sizeof(error)) != 0, "collect accepted inside a layer");
         require(!t.table && !t.arena, "refused collect did not release the tier");
     }
 
@@ -124,14 +124,14 @@ int main() {
     open_gate();
     {
         char error[256] = {}; int c = 0;
-        require(deferred_collect(&t, KIMI_VRAM_COLLECT_ALL, collected, aborted, 4, &c, error, sizeof(error)) != 0 &&
+        require(deferred_collect(&t, SSD_VRAM_COLLECT_ALL, collected, aborted, 4, &c, error, sizeof(error)) != 0 &&
                 std::strstr(error, "injected deferred VRAM upload error"), "deferred upload failure was hidden");
         require(!t.arena && t.blocks.empty() && !t.table && t.deferred.empty(), "upload failure left deferred work or the arena");
     }
 
     // Capacity: with one in-flight place, the second admission waits for the first copy.
     t.deferred_capacity = 1;
-    const kimi_vram_request ef[2] = {key(4, 6), key(4, 7)};
+    const ssd_vram_request ef[2] = {key(4, 6), key(4, 7)};
     hold();
     t.begin(31, 5, true);
     lifecycle_prepare(t,ef, 2,slots);

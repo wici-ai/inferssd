@@ -11,7 +11,7 @@ static void rejected(const std::function<void()> & fn) {
 }
 int main() { try {
     vram_slot_table table(2, {1}, false);
-    kimi_vram_request r = {}; r.layer = 1; r.expert = 0; r.weight = .3f;
+    ssd_vram_request r = {}; r.layer = 1; r.expert = 0; r.weight = .3f;
     for (int i = 0; i < 3; ++i) r.role[i] = {1,2,1000000,uint64_t(i)*4096,4096,3,4,5,6,0};
     table.next_token(); table.prepare(&r,1); int ready = -1;
     rejected([&] { table.acquire_slots(&r,1,&ready); });
@@ -28,7 +28,7 @@ int main() { try {
     auto next = table.acquire_slots(&r,1,&ready);
     require(next > generation && ready >= 0, "routing weight changed payload identity");
     table.release_ready(next);
-    std::vector<kimi_vram_request> union_requests(17, r);
+    std::vector<ssd_vram_request> union_requests(17, r);
     for (int expert = 0; expert < 17; ++expert) { union_requests[size_t(expert)].expert = expert; }
     std::vector<int> slots(union_requests.size(), -2);
     next = table.acquire_slots(union_requests.data(), union_requests.size(), slots.data());

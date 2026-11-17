@@ -65,8 +65,8 @@ static std::string slurp(const char * path) {
 static int unified_tests() {
     const std::string meminfo = slurp("/proc/meminfo");
     uint64_t available = 0;
-    check(kimi_memory_boost::meminfo_field(meminfo, "MemAvailable", available), "MemAvailable unreadable");
-    const uint64_t headroom = kimi_memory_boost::headroom(meminfo, slurp("/proc/zoneinfo"),
+    check(ssd_memory_boost::meminfo_field(meminfo, "MemAvailable", available), "MemAvailable unreadable");
+    const uint64_t headroom = ssd_memory_boost::headroom(meminfo, slurp("/proc/zoneinfo"),
         slurp("/proc/sys/vm/watermark_boost_factor"), uint64_t(sysconf(_SC_PAGESIZE)));
     size_t free = 0, total = 0;
     ggml_backend_cuda_get_device_memory(0, &free, &total);

@@ -19,7 +19,7 @@ void CUDART_CB gate_host(void *) {
     std::unique_lock<std::mutex> lock(barrier_mutex); barrier_cv.wait(lock,[] { return proceed; });
 }
 int blocked_launch(void * p,const vram_compute_expert * w,int n,int first,const void * q,size_t bytes,
-                   const kimi_vram_activation * activation,CUevent_st * ready,CUevent_st * start,CUevent_st * end,
+                   const ssd_vram_activation * activation,CUevent_st * ready,CUevent_st * start,CUevent_st * end,
                    char * error,size_t size) {
     { std::lock_guard<std::mutex> lock(barrier_mutex); entered = true; barrier_cv.notify_all(); }
     if (inject_error) { std::snprintf(error,size,"injected worker error"); return 1; }
@@ -47,7 +47,7 @@ int main() {
     const size_t role=lifecycle_role_bytes();
     std::vector<unsigned char> payload(role,0);std::vector<float> input(256,0.0f);payload.back()=37;
     const void * data[]={payload.data(),payload.data(),payload.data()};
-    kimi_vram_request requests[2]={};
+    ssd_vram_request requests[2]={};
     for(int j=0;j<2;++j){requests[j].layer=1;requests[j].expert=j;requests[j].weight=.7f;
         for(int i=0;i<3;++i)requests[j].role[i]={1,2,1000000,uint64_t(3*j+i)*role,role,3,4,5,6};}
     vram_format_compute_api instrumented={};

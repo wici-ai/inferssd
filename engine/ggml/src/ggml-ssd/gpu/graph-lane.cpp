@@ -93,7 +93,7 @@ struct lane {
     int latent = 0, hidden = 0;
     ggml_type up_type = GGML_TYPE_COUNT, down_type = GGML_TYPE_COUNT;  // the prepared layer's
     bool format_known = false, usable = false;
-    // Every format the layers declare (kimi_vram_expert_format), with the device's answer. A pass's working memory
+    // Every format the layers declare (ssd_vram_expert_format), with the device's answer. A pass's working memory
     // holds copies of the largest expert of those it runs, whichever layer comes next.
     struct known_format { ggml_type up, down; bool usable; std::set<std::pair<int, size_t>> warmed = {}; };
     std::vector<known_format> formats;
@@ -105,14 +105,14 @@ struct lane {
     std::vector<lane_expert> experts;
     const char * input = nullptr;
     size_t input_stride = 0;
-    kimi_vram_activation activation = {};
+    ssd_vram_activation activation = {};
     std::vector<float> post_norm;  // latent weights of a per-expert post norm, or empty
     float post_norm_eps = 0.0f;
     int ntokens = 0;
     std::vector<float> accumulator;
     std::vector<uint8_t> touched;
     std::string failure;
-    kimi_vram_prefill_stats stats = {};
+    ssd_vram_prefill_stats stats = {};
     batch_fit fit;
     double last_fixed_us = 0, last_route_us = 0;
     uint64_t total_experts = 0, total_routes = 0, copied_bytes = 0;
@@ -176,7 +176,7 @@ struct lane {
         return static_cast<char *>(work) + (static_cast<const char *>(tensor->data) - work_base);
     }
     // The declared formats, each learned once, and the prepared layer's: whether the device runs it.
-    void learn_format(const kimi_vram_expert_format & f) {
+    void learn_format(const ssd_vram_expert_format & f) {
         if (!format_known || f.latent != latent || f.hidden != hidden) { formats.clear(); largest_expert = 0; }
         latent = f.latent; hidden = f.hidden;
         format_known = true;
@@ -216,18 +216,18 @@ struct lane {
     // The fused operation where the device has it, else the same math from plain operations.
     ggml_tensor * activate(ggml_context * ctx, ggml_tensor * gate, ggml_tensor * up) const {
         switch (activation.kind) {
-            case KIMI_VRAM_ACTIVATION_SWIGLU: {
+            case SSD_VRAM_ACTIVATION_SWIGLU: {
                 ggml_tensor * fused = ggml_swiglu_split(ctx, gate, up);
                 return ggml_backend_dev_supports_op(device, fused) ? fused : ggml_mul(ctx, ggml_silu(ctx, gate), up);
             }
-            case KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP: {
+            case SSD_VRAM_ACTIVATION_SWIGLU_CLAMP: {
                 const float limit = activation.swiglu_limit;
                 ggml_tensor * fused = ggml_swiglu_clamp(ctx, gate, up, limit);
                 if (ggml_backend_dev_supports_op(device, fused)) { return fused; }
                 ggml_tensor * bounded = ggml_clamp(ctx, gate, -std::numeric_limits<float>::max(), limit);
                 return ggml_mul(ctx, ggml_silu(ctx, bounded), ggml_clamp(ctx, up, -limit, limit));
             }
-            case KIMI_VRAM_ACTIVATION_SITU: {
+            case SSD_VRAM_ACTIVATION_SITU: {
                 const float beta = activation.situ_beta, linear = activation.situ_linear_beta;
                 ggml_tensor * a = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f / beta)), beta);
                 ggml_tensor * bounded = linear > 0.0f ?
@@ -412,7 +412,7 @@ struct lane {
         stats.total_worker_us = elapsed_us(start);
     }
     int launch(const void * rows, size_t stride, const int32_t * route_request, const float * weights, int nslots, int tokens,
-            const kimi_vram_prefill_transient * transient, int transient_count, const kimi_vram_prefill_launch * options,
+            const ssd_vram_prefill_transient * transient, int transient_count, const ssd_vram_prefill_launch * options,
             char * error, size_t error_size) {
         try {
             drain();
@@ -451,7 +451,7 @@ struct lane {
             return 1;
         }
     }
-    int finish(float * output, size_t stride, kimi_vram_prefill_stats * out, char * error, size_t error_size) {
+    int finish(float * output, size_t stride, ssd_vram_prefill_stats * out, char * error, size_t error_size) {
         drain();
         const auto start = lane_clock::now();
         if (failure.empty()) {
@@ -517,14 +517,14 @@ void * create_lane(const settings::snapshot *, const runtime_services * services
 void * tier_create(uint64_t, char * error, size_t error_size) { report(error, error_size, "the GPU lane starts from settings"); return nullptr; }
 void tier_destroy(void * context) { delete self(context); }
 int tier_begin(void *, uint64_t, uint64_t, int, char *, size_t) { return 0; }
-int tier_prepare(void *, const kimi_vram_request *, int, int, int, int *, char * error, size_t error_size) { report(error, error_size, "retired"); return 1; }
+int tier_prepare(void *, const ssd_vram_request *, int, int, int, int *, char * error, size_t error_size) { report(error, error_size, "retired"); return 1; }
 int tier_launch(void *, const void *, size_t, float, float, char * error, size_t error_size) { report(error, error_size, "retired"); return 1; }
-int tier_admit(void *, const kimi_vram_request *, const void *, const void *, const void *, int, char *, size_t) { return 0; }
+int tier_admit(void *, const ssd_vram_request *, const void *, const void *, const void *, int, char *, size_t) { return 0; }
 int tier_finish(void *, float *, size_t, char *, size_t) { return 0; }
 int tier_cancel(void * context, char *, size_t) { self(context)->drain(); self(context)->experts.clear(); return 0; }
-const kimi_vram_tier_api tier_table = { 2, sizeof(kimi_vram_tier_api), tier_create, tier_destroy, tier_begin, tier_prepare, tier_launch, tier_admit, tier_finish, tier_cancel };
+const ssd_vram_tier_api tier_table = { 2, sizeof(ssd_vram_tier_api), tier_create, tier_destroy, tier_begin, tier_prepare, tier_launch, tier_admit, tier_finish, tier_cancel };
 
-int prefill_prepare(void * context, const kimi_vram_request *, int count, const kimi_vram_expert_format * format, int * slots, char *, size_t) {
+int prefill_prepare(void * context, const ssd_vram_request *, int count, const ssd_vram_expert_format * format, int * slots, char *, size_t) {
     std::fill(slots, slots + count, -1);
     self(context)->learn_format(*format);
     return 0;
@@ -535,21 +535,21 @@ int prefill_transient_available(void * context) {
     return l.usable && l.pass_ready && l.work_bytes >= l.work_needed(l.pass_tokens);
 }
 int prefill_launch(void * context, const void * input, size_t stride, const int32_t * route_request, const float * weights, int nslots, int ntokens,
-        const kimi_vram_prefill_transient * transient, int count, const kimi_vram_prefill_launch * options, char * error, size_t error_size) {
+        const ssd_vram_prefill_transient * transient, int count, const ssd_vram_prefill_launch * options, char * error, size_t error_size) {
     return self(context)->launch(input, stride, route_request, weights, nslots, ntokens, transient, count, options, error, error_size);
 }
-int prefill_finish(void * context, float * output, size_t stride, kimi_vram_prefill_stats * stats, char * error, size_t error_size) {
+int prefill_finish(void * context, float * output, size_t stride, ssd_vram_prefill_stats * stats, char * error, size_t error_size) {
     return self(context)->finish(output, stride, stats, error, error_size);
 }
 int prefill_cold_active(void *) { return 0; }
-int prefill_admit_cold(void *, const kimi_vram_request *, const void *, const void *, const void *, int * admitted, char * error, size_t error_size) {
+int prefill_admit_cold(void *, const ssd_vram_request *, const void *, const void *, const void *, int * admitted, char * error, size_t error_size) {
     if (admitted) { *admitted = 0; }
     report(error, error_size, "retired");
     return 1;
 }
-void prefill_lane_info(void * context, kimi_vram_prefill_lane * out) {
+void prefill_lane_info(void * context, ssd_vram_prefill_lane * out) {
     *out = {};
-    out->engine = self(context)->usable ? KIMI_VRAM_PREFILL_ENGINE_BATCHED : KIMI_VRAM_PREFILL_ENGINE_NONE;
+    out->engine = self(context)->usable ? SSD_VRAM_PREFILL_ENGINE_BATCHED : SSD_VRAM_PREFILL_ENGINE_NONE;
     out->in_place = 1;
     out->post_norm = 1;
 }
@@ -557,7 +557,7 @@ void prefill_lane_info(void * context, kimi_vram_prefill_lane * out) {
 int prefill_seed_routes(void *, const int32_t *, int, char *, size_t) { return 0; }
 int prefill_seed_host(void *, int32_t, const void *, const void *, const void *, char *, size_t) { return 0; }
 int prefill_seed_wait(void *, int32_t, char *, size_t) { return 0; }
-const kimi_vram_prefill_api prefill_table = { 10, sizeof(kimi_vram_prefill_api), prefill_prepare, prefill_transient_available, prefill_launch,
+const ssd_vram_prefill_api prefill_table = { 10, sizeof(ssd_vram_prefill_api), prefill_prepare, prefill_transient_available, prefill_launch,
     prefill_finish, tier_cancel, prefill_cold_active, prefill_admit_cold, prefill_lane_info,
     prefill_seed_routes, prefill_seed_host, prefill_seed_wait };
 
@@ -569,21 +569,21 @@ int elastic_reserve_accumulate(void * context, int tokens, char *, size_t) {
     self(context)->reserve_pass(tokens);
     return 0;
 }
-int elastic_reserve(void * context, const kimi_vram_request *, const kimi_vram_expert_format * format, char *, size_t) {
+int elastic_reserve(void * context, const ssd_vram_request *, const ssd_vram_expert_format * format, char *, size_t) {
     self(context)->learn_format(*format);
     return 0;
 }
 // The graph lane keeps no expert of its own: nothing to preload.
 int elastic_preload_slots(void *, int * slots, char *, size_t) { *slots = 0; return 0; }
-int elastic_preload(void *, const kimi_vram_request *, const void *, const void *, const void *, int * copied, char *, size_t) {
+int elastic_preload(void *, const ssd_vram_request *, const void *, const void *, const void *, int * copied, char *, size_t) {
     *copied = 0;
     return 0;
 }
-const kimi_vram_elastic_api elastic_table = { 5, sizeof(kimi_vram_elastic_api), elastic_phase_complete, elastic_reserve_accumulate,
+const ssd_vram_elastic_api elastic_table = { 5, sizeof(ssd_vram_elastic_api), elastic_phase_complete, elastic_reserve_accumulate,
     elastic_reserve, elastic_preload_slots, elastic_preload };
 
 int host_available(void *) { return 0; }
-int host_launch(void *, const kimi_vram_host_job *, int, int * accepted, char *, size_t) { *accepted = 0; return 0; }
+int host_launch(void *, const ssd_vram_host_job *, int, int * accepted, char *, size_t) { *accepted = 0; return 0; }
 void host_costs(void *, double * resident_us, double * host_us) { *resident_us = *host_us = 0; }
 // Host memory the lane reads in place (the read ring, a RAM cache slot) for as long as it is registered: the backend's
 // import for such memory where it has one (ggml_backend_ssd_dev_buffer_from_host_ptr: Metal maps it without a residency
@@ -618,7 +618,7 @@ int host_unregister(void * context, const void * pointer, char *, size_t) {
     }
     return 0;
 }
-void host_costs2(void * context, kimi_vram_host_costs * costs) {
+void host_costs2(void * context, ssd_vram_host_costs * costs) {
     *costs = {};
     costs->in_place = 1;
     costs->in_place_only = 1;
@@ -626,7 +626,7 @@ void host_costs2(void * context, kimi_vram_host_costs * costs) {
     const auto & l = *self(context);
     costs->host_expert_us = l.last_fixed_us + l.last_route_us > 0 ? l.last_fixed_us + l.last_route_us : 1e6;
 }
-const kimi_vram_host_api host_table = { 3, sizeof(kimi_vram_host_api), host_available, host_launch, host_costs, host_register, host_unregister, host_costs2 };
+const ssd_vram_host_api host_table = { 3, sizeof(ssd_vram_host_api), host_available, host_launch, host_costs, host_register, host_unregister, host_costs2 };
 
 const settings_api settings_table = { 2, sizeof(settings_api), sizeof(runtime_services), create_lane };
 

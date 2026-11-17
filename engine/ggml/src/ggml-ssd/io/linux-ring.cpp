@@ -57,13 +57,13 @@ struct linux_ring::impl {
         // close(io_uring_fd) starts asynchronous cancellation; it does not make
         // freeing user buffers safe. Every runtime error must first drain them.
         if (pending) {
-            std::fprintf(stderr, "[kimi_cpu_sink] undrained I/O at ring destruction; aborting\n");
+            std::fprintf(stderr, "[ssd_cpu_sink] undrained I/O at ring destruction; aborting\n");
             std::abort();
         }
         try {
             unregister_buffers();
         } catch (const std::exception & e) {
-            std::fprintf(stderr, "[kimi_cpu_sink_io] cannot unregister before buffer release: %s; aborting\n", e.what());
+            std::fprintf(stderr, "[ssd_cpu_sink_io] cannot unregister before buffer release: %s; aborting\n", e.what());
             std::abort();
         }
         if (sqes != MAP_FAILED) { munmap(sqes, sqes_size); }
@@ -124,7 +124,7 @@ struct linux_ring::impl {
         ++register_count;
         size_t bytes = 0;
         for (const auto & buffer : fixed_buffers) { bytes += buffer.iov_len; }
-        std::fprintf(stderr, "[kimi_cpu_sink_io] read_fixed=1 registered=%zu bytes=%zu register_count=%llu unregister_count=%llu\n",
+        std::fprintf(stderr, "[ssd_cpu_sink_io] read_fixed=1 registered=%zu bytes=%zu register_count=%llu unregister_count=%llu\n",
                      fixed_buffers.size(), bytes, static_cast<unsigned long long>(register_count),
                      static_cast<unsigned long long>(unregister_count));
     }
@@ -140,7 +140,7 @@ struct linux_ring::impl {
         buffers_registered = false;
         fixed_buffers.clear();
         ++unregister_count;
-        std::fprintf(stderr, "[kimi_cpu_sink_io] read_fixed=1 register_count=%llu unregister_count=%llu\n",
+        std::fprintf(stderr, "[ssd_cpu_sink_io] read_fixed=1 register_count=%llu unregister_count=%llu\n",
                      static_cast<unsigned long long>(register_count), static_cast<unsigned long long>(unregister_count));
     }
 

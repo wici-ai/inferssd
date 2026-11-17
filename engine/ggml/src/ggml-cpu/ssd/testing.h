@@ -39,9 +39,9 @@ struct execution_policy {
 
 // Test callers own explicit policy inputs until this call returns; the executor
 // copies them before starting its threads. No process-wide mutation is involved.
-[[nodiscard]] GGML_BACKEND_API kimi_cpu_sink * create(
+[[nodiscard]] GGML_BACKEND_API ssd_cpu_sink * create(
     int ring_experts, const execution_policy & policy,
-    const runtime_services * services, kimi_cpu_sink_resolver resolver, void * userdata,
+    const runtime_services * services, ssd_cpu_sink_resolver resolver, void * userdata,
     char * error, size_t error_size) noexcept;
 }  // namespace testing
 }  // namespace cpu

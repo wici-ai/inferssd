@@ -51,7 +51,7 @@ struct fixture {
     int fault_role = -1;
     int resolve_calls = 0;
     ~fixture() { ssd::platform::close_fd(fd); if (remove_on_destroy) { test_resources::remove_file(path); } }
-    static bool resolve(void * user, const char * name, int32_t id, kimi_cpu_sink_source * out) {
+    static bool resolve(void * user, const char * name, int32_t id, ssd_cpu_sink_source * out) {
         auto & f = *static_cast<fixture *>(user);
         ++f.resolve_calls;
         auto it = f.entries.find({ name, id });
@@ -79,7 +79,7 @@ static void put_bytes(std::ofstream & f, const void * data, size_t n) {
 }
 
 static void make_synthetic(fixture & f) {
-    f.path = test_resources::temp_file("kimi-cpu-prefill-test"); f.remove_on_destroy = true;
+    f.path = test_resources::temp_file("ssd-cpu-prefill-test"); f.remove_on_destroy = true;
     std::mt19937 rng(20260908);
     std::normal_distribution<float> sample(0.0f, 0.06f);
     // Keep the full on-disk GGMLMOEPACKv1 layout, including index and padding.
@@ -178,22 +178,22 @@ static std::vector<float> reference(const fixture & f, int layer, const std::vec
     return output;
 }
 
-using prefill_ptr = std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)>;
+using prefill_ptr = std::unique_ptr<ssd_cpu_prefill, decltype(&ssd_cpu_prefill_destroy)>;
 
 struct executor {
     fixture * active;
     sink_ptr sink;
     prefill_ptr prefill;
-    static bool resolve(void * user, const char * name, int32_t id, kimi_cpu_sink_source * out) {
+    static bool resolve(void * user, const char * name, int32_t id, ssd_cpu_sink_source * out) {
         return fixture::resolve(static_cast<executor *>(user)->active, name, id, out);
     }
     executor(fixture_inputs & inputs, fixture & f, int threads, int depth) : active(&f),
-            prefill(nullptr, kimi_cpu_prefill_destroy) {
+            prefill(nullptr, ssd_cpu_prefill_destroy) {
         test_resources::cpu_participants(threads - 1, 1);
         char error[512] = {};
         sink = inputs.create(threads, depth, resolve, this, error, sizeof(error));
         require(bool(sink), std::string("sink create: ") + error);
-        prefill.reset(kimi_cpu_prefill_create(sink.get(), error, sizeof(error)));
+        prefill.reset(ssd_cpu_prefill_create(sink.get(), error, sizeof(error)));
         require(bool(prefill), std::string("prefill create: ") + error);
     }
 };
@@ -285,12 +285,12 @@ static expected_counts count_routes(const fixture & f, int layer, const batch & 
 }
 
 struct sample_result {
-    kimi_cpu_prefill_stats stats = {};
+    ssd_cpu_prefill_stats stats = {};
     double wall_us = 0, max_abs = 0, rel_l2 = 0;
     uint64_t hash = 1469598103934665603ULL;
 };
 
-static void add_stats(kimi_cpu_sink_stats & sum, const kimi_cpu_sink_stats & s) {
+static void add_stats(ssd_cpu_sink_stats & sum, const ssd_cpu_sink_stats & s) {
     sum.experts += s.experts; sum.read_requests += s.read_requests; sum.read_bytes += s.read_bytes;
     sum.read_errors += s.read_errors; sum.fallback_count += s.fallback_count;
     sum.ring_bytes = std::max(sum.ring_bytes, s.ring_bytes);
@@ -307,7 +307,7 @@ static void add_stats(kimi_cpu_sink_stats & sum, const kimi_cpu_sink_stats & s) 
     sum.cache_new_slot_bytes += s.cache_new_slot_bytes;
 }
 
-static void check_transport(fixture_inputs & inputs, const kimi_cpu_sink_stats & s, bool succeeded, bool grouped,
+static void check_transport(fixture_inputs & inputs, const ssd_cpu_sink_stats & s, bool succeeded, bool grouped,
         bool allow_grouped_hits = false) {
     const char * mode = inputs.get("read_fixed");
     const bool fixed = mode && !std::strcmp(mode, "1");
@@ -330,9 +330,9 @@ static void check_transport(fixture_inputs & inputs, const kimi_cpu_sink_stats &
     }
 }
 
-static kimi_cpu_sink_cache_stats cache_snapshot(kimi_cpu_sink * sink, bool released = false) {
-    kimi_cpu_sink_cache_stats s = {};
-    kimi_cpu_sink_cache_get_stats(sink, &s);
+static ssd_cpu_sink_cache_stats cache_snapshot(ssd_cpu_sink * sink, bool released = false) {
+    ssd_cpu_sink_cache_stats s = {};
+    ssd_cpu_sink_cache_get_stats(sink, &s);
     require(s.capacity_bytes <= s.budget_bytes && s.mapped_bytes <= s.capacity_bytes &&
             s.committed_bytes <= s.mapped_bytes && s.valid_bytes <= s.committed_bytes && s.copy_us == 0,
             "fused cache budget or zero-copy invariant failed");
@@ -355,13 +355,13 @@ static sample_result run_checked(fixture_inputs & inputs, const std::string & na
     const auto begin = std::chrono::steady_clock::now();
     bool ok = true;
     if (grouped) {
-        ok = kimi_cpu_prefill_run(e.prefill.get(), meta.role[0], meta.role[1], meta.role[2], b.x.data(),
+        ok = ssd_cpu_prefill_run(e.prefill.get(), meta.role[0], meta.role[1], meta.role[2], b.x.data(),
             b.ids.data(), b.weights.data(), b.slots, b.tokens, 4, linear_beta, guarded.data() + 1,
             &r.stats, error, sizeof(error));
     } else {
         for (int t = 0; t < b.tokens && ok; ++t) {
-            kimi_cpu_sink_stats s = {};
-            ok = kimi_cpu_sink_run(e.sink.get(), meta.role[0], meta.role[1], meta.role[2], b.x.data() + size_t(t) * f.latent,
+            ssd_cpu_sink_stats s = {};
+            ok = ssd_cpu_sink_run(e.sink.get(), meta.role[0], meta.role[1], meta.role[2], b.x.data() + size_t(t) * f.latent,
                 b.ids.data() + size_t(t) * b.slots, b.weights.data() + size_t(t) * b.slots, b.slots,
                 4, linear_beta, guarded.data() + 1 + size_t(t) * f.latent, &s, error, sizeof(error));
             add_stats(r.stats.stream, s);
@@ -434,7 +434,7 @@ static void retype(ggml_tensor * tensor, ggml_type type) {
     tensor->nb[3] = tensor->nb[2] * tensor->ne[2];
 }
 
-static kimi_cpu_prefill_stats fail_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, batch b,
+static ssd_cpu_prefill_stats fail_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, batch b,
         int tokens_override = -1, int slots_override = -1, bool short_read = false, int metadata_fault = 0,
         bool allow_prefill_hits = false) {
     tensors meta(f, 1);
@@ -442,8 +442,8 @@ static kimi_cpu_prefill_stats fail_case(fixture_inputs & inputs, const std::stri
     if (metadata_fault == 2) { retype(meta.role[1], GGML_TYPE_F32); }
     if (metadata_fault == 3) { meta.role[2]->ne[0] += 256; }
     std::vector<float> output(size_t(std::max(b.tokens, 1)) * f.latent + 2, -77);
-    char error[512] = {}; kimi_cpu_prefill_stats stats = {};
-    const bool ok = kimi_cpu_prefill_run(e.prefill.get(), meta.role[0], meta.role[1], meta.role[2], b.x.data(),
+    char error[512] = {}; ssd_cpu_prefill_stats stats = {};
+    const bool ok = ssd_cpu_prefill_run(e.prefill.get(), meta.role[0], meta.role[1], meta.role[2], b.x.data(),
         b.ids.data(), b.weights.data(), slots_override < 0 ? b.slots : slots_override,
         tokens_override < 0 ? b.tokens : tokens_override, 4, 25, output.data() + 1, &stats, error, sizeof(error));
     require(!ok && error[0] && stats.stream.fallback_count == 0, name + ": did not fail closed");
@@ -538,14 +538,14 @@ static void synthetic_tests(fixture_inputs & inputs, int threads, int depth) {
 
 static void configure_cache(executor & e, uint64_t bytes, const std::vector<int32_t> & layers, int quota) {
     char error[512] = {};
-    require(kimi_cpu_sink_cache_configure(e.sink.get(), bytes, layers.data(), int(layers.size()), quota,
+    require(ssd_cpu_sink_cache_configure(e.sink.get(), bytes, layers.data(), int(layers.size()), quota,
             error, sizeof(error)), std::string("fused cache configure: ") + error);
     require(cache_snapshot(e.sink.get(), true).budget_bytes == bytes, "fused cache budget was not retained");
 }
 
 static void begin_decode(executor & e, uint64_t epoch, uint64_t token) {
     char error[512] = {};
-    require(kimi_cpu_sink_cache_begin(e.sink.get(), epoch, token, true, error, sizeof(error)),
+    require(ssd_cpu_sink_cache_begin(e.sink.get(), epoch, token, true, error, sizeof(error)),
             std::string("fused decode begin: ") + error);
 }
 
@@ -565,7 +565,7 @@ static sample_result decode_cache_case(fixture_inputs & inputs, const std::strin
     return result;
 }
 
-static void require_cache_counters_unchanged(const kimi_cpu_sink_cache_stats & before, executor & e) {
+static void require_cache_counters_unchanged(const ssd_cpu_sink_cache_stats & before, executor & e) {
     const auto after = cache_snapshot(e.sink.get(), true);
     require(after.budget_bytes == before.budget_bytes && after.capacity_bytes == before.capacity_bytes &&
             after.hits == before.hits && after.misses == before.misses && after.admitted_bytes == before.admitted_bytes,
@@ -601,10 +601,10 @@ static void cache_retention_tests(fixture_inputs & inputs, int threads, int dept
     for (int tokens : { 1, 25, 64 }) {
         auto b = synthetic_batch(f, tokens);
         std::vector<float> original(size_t(tokens) * f.latent), kept(original.size());
-        kimi_cpu_prefill_stats a = {}, c = {}; char error[512] = {};
-        require(kimi_cpu_prefill_run(baseline.prefill.get(), meta.role[0], meta.role[1], meta.role[2],
+        ssd_cpu_prefill_stats a = {}, c = {}; char error[512] = {};
+        require(ssd_cpu_prefill_run(baseline.prefill.get(), meta.role[0], meta.role[1], meta.role[2],
             b.x.data(), b.ids.data(), b.weights.data(), b.slots, b.tokens, 4, 25, original.data(), &a, error, sizeof(error)), error);
-        require(kimi_cpu_prefill_run(retained.prefill.get(), meta.role[0], meta.role[1], meta.role[2],
+        require(ssd_cpu_prefill_run(retained.prefill.get(), meta.role[0], meta.role[1], meta.role[2],
             b.x.data(), b.ids.data(), b.weights.data(), b.slots, b.tokens, 4, 25, kept.data(), &c, error, sizeof(error)), error);
         require(!std::memcmp(original.data(), kept.data(), kept.size() * sizeof(float)), "retention changed prefill output bits");
         check_transport(inputs, c.stream, true, true);
@@ -774,7 +774,7 @@ static void cache_lifecycle_tests(fixture_inputs & inputs, int threads, int dept
             begin_decode(e, 20, 1);
             decode_cache_case(inputs, "fused_decode_after_prefill_destroy", f, e, 1, four, 0, 4);
             char error[512] = {};
-            e.prefill.reset(kimi_cpu_prefill_create(e.sink.get(), error, sizeof(error)));
+            e.prefill.reset(ssd_cpu_prefill_create(e.sink.get(), error, sizeof(error)));
             require(bool(e.prefill), std::string("fused prefill recreate: ") + error);
         }
         auto empty = synthetic_batch(f, 2);

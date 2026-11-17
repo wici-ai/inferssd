@@ -1784,16 +1784,16 @@ void ggml_backend_sched_set_ssd_runtime(ggml_backend_sched_t sched,
     sched->ssd_userdata = userdata;
 }
 
-void ggml_backend_sched_kimi_set_profile_phase(ggml_backend_sched_t sched, int phase) {
+void ggml_backend_sched_ssd_set_profile_phase(ggml_backend_sched_t sched, int phase) {
     if (sched && sched->ssd_hooks) { sched->ssd_hooks->phase(sched->ssd_userdata, phase); }
 }
 
-void ggml_backend_sched_kimi_set_dense_decode(ggml_backend_sched_t sched, bool decode) {
+void ggml_backend_sched_ssd_set_dense_decode(ggml_backend_sched_t sched, bool decode) {
     (void) sched; (void) decode; // The supported dense layout applies to both phases.
 }
 
-void ggml_backend_sched_kimi_copy_stats_get(ggml_backend_sched_t sched,
-        struct ggml_backend_sched_kimi_copy_stats * stats) {
+void ggml_backend_sched_ssd_copy_stats_get(ggml_backend_sched_t sched,
+        struct ggml_backend_sched_ssd_copy_stats * stats) {
     if (!stats) { return; }
     *stats = {};
     if (sched && sched->ssd_hooks) { sched->ssd_hooks->stats(sched->ssd_userdata, stats); }

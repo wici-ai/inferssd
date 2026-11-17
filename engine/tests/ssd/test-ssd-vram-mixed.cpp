@@ -41,11 +41,11 @@ size_t role_bytes(int layer, int role) {
 }
 size_t expert_bytes(int layer) { return role_bytes(layer, 0) + role_bytes(layer, 1) + role_bytes(layer, 2); }
 // the declaration every call makes, with the types of the call's layer
-kimi_vram_expert_format declared(int layer) {
+ssd_vram_expert_format declared(int layer) {
     return { latent, hidden, up_types[layer - 1], down_types[layer - 1], experts, 2, layer_ids, up_types, down_types };
 }
-kimi_vram_request key(int layer, int expert) {
-    kimi_vram_request r = {}; r.layer = layer; r.expert = expert; r.weight = .5f;
+ssd_vram_request key(int layer, int expert) {
+    ssd_vram_request r = {}; r.layer = layer; r.expert = expert; r.weight = .5f;
     uint64_t offset = (uint64_t(layer) * experts + uint64_t(expert)) << 20;
     for (int i = 0; i < 3; ++i) { r.role[i] = { 1, 2, uint64_t(1) << 32, offset, role_bytes(layer, i), 3, 4, 5, 6 }; offset += role_bytes(layer, i); }
     return r;
@@ -127,12 +127,12 @@ void compare(const store & s, int layer, const std::vector<int> & ids, const std
             " expert " + std::to_string(ids[j]) + " is " + std::to_string(relative) + " from its CPU row");
     }
 }
-const kimi_vram_activation swiglu = { KIMI_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f };
+const ssd_vram_activation swiglu = { SSD_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f };
 // One decode layer as the sink runs it: prepare, launch, the misses' admissions (deferred where asked), finish.
 // Returns the slots prepare gave.
 std::vector<int> layer_step(tier & t, const store & s, int layer, int token, const std::vector<int> & ids, const char * what,
         bool deferred = false) {
-    std::vector<kimi_vram_request> r;
+    std::vector<ssd_vram_request> r;
     for (int e : ids) { r.push_back(key(layer, e)); }
     std::vector<int> slots(ids.size(), -1);
     const auto f = declared(layer);
@@ -153,7 +153,7 @@ std::vector<int> layer_step(tier & t, const store & s, int layer, int token, con
     return slots;
 }
 // A refused call through the C ABI: its error names `wanted`, and the tier is released.
-void refused(tier & t, int layer, const kimi_vram_expert_format & f, const char * wanted) {
+void refused(tier & t, int layer, const ssd_vram_expert_format & f, const char * wanted) {
     const auto r = key(layer, 0);
     int slot = -1;
     char error[512] = {};
@@ -219,7 +219,7 @@ void run(fixture_inputs & inputs, ggml_type first_layer) {
     require(t.now().down_type == down_types[0], "the tier did not select layer 1's format");
     open_gate();
     {
-        kimi_vram_request collected[4] = {};
+        ssd_vram_request collected[4] = {};
         int32_t aborted[4] = {};
         int count = 0;
         t.collect(-1, collected, aborted, 4, &count);
@@ -246,7 +246,7 @@ void run(fixture_inputs & inputs, ggml_type first_layer) {
         require(slot < 0, "the host job's expert is already resident");
         const auto x = input(2, 9);
         t.launch_activation(x.data(), x.size() * sizeof(float), &swiglu);
-        const kimi_vram_host_job job = { 0, .5f, { s.role_at(2, 3, 0), s.role_at(2, 3, 1), s.role_at(2, 3, 2) } };
+        const ssd_vram_host_job job = { 0, .5f, { s.role_at(2, 3, 0), s.role_at(2, 3, 1), s.role_at(2, 3, 2) } };
         int accepted = 0;
         t.launch_host(&job, 1, &accepted);
         require(accepted == 1, "the host job was refused");
@@ -275,7 +275,7 @@ void run(fixture_inputs & inputs, ggml_type first_layer) {
         auto wider = declared(1); wider.hidden = 2 * hidden;
         refused(u, 1, wider, "geometry changed");
     }
-    std::printf("KIMI_VRAM_MIXED_MODEL_PASS layer1=%s/%s layer2=%s/%s stride=%zu layer1_expert=%zu layer2_expert=%zu\n",
+    std::printf("SSD_VRAM_MIXED_MODEL_PASS layer1=%s/%s layer2=%s/%s stride=%zu layer1_expert=%zu layer2_expert=%zu\n",
         ggml_type_name(ggml_type(up_types[0])), ggml_type_name(ggml_type(down_types[0])),
         ggml_type_name(ggml_type(up_types[1])), ggml_type_name(ggml_type(down_types[1])), larger, expert_bytes(1),
         expert_bytes(2));
@@ -292,10 +292,10 @@ int main() {
     inputs.set("tier.global", "1");
     run(inputs, GGML_TYPE_Q4_K);
     run(inputs, GGML_TYPE_MXFP4);
-    std::printf("KIMI_VRAM_MIXED_PASS assertions=%d\n", assertions);
+    std::printf("SSD_VRAM_MIXED_PASS assertions=%d\n", assertions);
     return 0;
     } catch (const std::exception & e) {
-        std::fprintf(stderr, "KIMI_VRAM_MIXED_FAIL: %s\n", e.what());
+        std::fprintf(stderr, "SSD_VRAM_MIXED_FAIL: %s\n", e.what());
         return 1;
     }
 }

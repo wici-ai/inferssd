@@ -15,7 +15,7 @@ private:
     static const ggml_backend_sched_ssd_hooks hooks_;
     const runtime_services & services_;
     std::mutex mutex_;
-    ggml_backend_sched_kimi_copy_stats stats_{};
+    ggml_backend_sched_ssd_copy_stats stats_{};
     int phase_ = 0;
     bool drive_home(const ggml_tensor *) const noexcept;
     bool copy_dense(ggml_backend_t, const ggml_tensor *, ggml_tensor *, const ggml_tensor *, uint64_t) noexcept;

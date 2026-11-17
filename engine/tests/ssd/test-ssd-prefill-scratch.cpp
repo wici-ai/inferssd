@@ -9,7 +9,7 @@
 #undef main
 
 namespace {
-using prefill_ptr = std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)>;
+using prefill_ptr = std::unique_ptr<ssd_cpu_prefill, decltype(&ssd_cpu_prefill_destroy)>;
 
 size_t failures = 0, cases = 0;
 void check_zero(const char * label, ggml_type type, int tokens, const std::vector<float> & values) {
@@ -48,7 +48,7 @@ void run_case(fixture_inputs & inputs, ggml_type type, int tokens, int activatio
     configure_cache(sink.get(), 0, {1}, 4);
     tensors meta(f, 1);
     char error[512] = {};
-    prefill_ptr reused(kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+    prefill_ptr reused(ssd_cpu_prefill_create(sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
     require(bool(reused), error);
     constexpr int slots = 4;
     std::vector<int32_t> ids(size_t(tokens) * slots);
@@ -56,11 +56,11 @@ void run_case(fixture_inputs & inputs, ggml_type type, int tokens, int activatio
     for (size_t i = 0; i < ids.size(); ++i) { ids[i] = int(i % slots); }
     for (size_t i = 0; i < input.size(); ++i) { input[i] = 1.7f * std::sin(float(i) * 0.17f); }
     const auto nonzero_input = input;
-    const kimi_cpu_sink_activation activation = {activation_kind, 0, 0, activation_kind ==
-        KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP ? 10.0f : 0.0f};
-    auto run = [&](kimi_cpu_prefill * handle) {
-        kimi_cpu_prefill_stats stats = {};
-        require(kimi_cpu_prefill_run_activation(handle, meta.role[0], meta.role[1], meta.role[2],
+    const ssd_cpu_sink_activation activation = {activation_kind, 0, 0, activation_kind ==
+        SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP ? 10.0f : 0.0f};
+    auto run = [&](ssd_cpu_prefill * handle) {
+        ssd_cpu_prefill_stats stats = {};
+        require(ssd_cpu_prefill_run_activation(handle, meta.role[0], meta.role[1], meta.role[2],
             input.data(), ids.data(), weights.data(), slots, tokens, &activation, output.data(),
             &stats, error, sizeof(error)), error);
         require(stats.stream.read_errors == 0 && stats.stream.pending_reads == 0 &&
@@ -72,7 +72,7 @@ void run_case(fixture_inputs & inputs, ggml_type type, int tokens, int activatio
         for (int expert = lo; expert < hi; ++expert) {
             begin_cache(sink.get(), 20261004, uint64_t(expert + 1));
             const float weight = 1;
-            require(kimi_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2],
+            require(ssd_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2],
                 single.data(), &expert, &weight, 1, &activation, single_out.data(), nullptr,
                 error, sizeof(error)), error);
         }
@@ -87,7 +87,7 @@ void run_case(fixture_inputs & inputs, ggml_type type, int tokens, int activatio
     require(stats.gpu_experts == 2 && stats.gpu_routes == uint64_t(2 * tokens) && stats.ssd_experts == 2,
         "CPU -> mixed call did not exercise resident GPU and CPU experts");
     check_zero("cpu_to_mixed_reused", type, tokens, output);
-    prefill_ptr fresh(kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+    prefill_ptr fresh(ssd_cpu_prefill_create(sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
     require(bool(fresh), error);
     run(fresh.get());
     check_zero("mixed_fresh_control", type, tokens, output);
@@ -149,12 +149,12 @@ void run_seed_case(fixture_inputs & inputs, ggml_type type, int tokens, int acti
     std::vector<float> weights(ids.size(), 0.25f), input(size_t(tokens) * f.latent);
     for (size_t i = 0; i < ids.size(); ++i) { ids[i] = int(i % slots); }
     for (size_t i = 0; i < input.size(); ++i) { input[i] = 1.7f * std::sin(float(i) * 0.17f); }
-    const kimi_cpu_sink_activation activation = {activation_kind, 0, 0, activation_kind ==
-        KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP ? 10.0f : 0.0f};
-    auto run = [&](kimi_cpu_prefill * handle, std::vector<float> & output) {
+    const ssd_cpu_sink_activation activation = {activation_kind, 0, 0, activation_kind ==
+        SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP ? 10.0f : 0.0f};
+    auto run = [&](ssd_cpu_prefill * handle, std::vector<float> & output) {
         output.assign(input.size(), 0.0f);
-        kimi_cpu_prefill_stats stats = {};
-        require(kimi_cpu_prefill_run_activation(handle, meta.role[0], meta.role[1], meta.role[2],
+        ssd_cpu_prefill_stats stats = {};
+        require(ssd_cpu_prefill_run_activation(handle, meta.role[0], meta.role[1], meta.role[2],
             input.data(), ids.data(), weights.data(), slots, tokens, &activation, output.data(),
             &stats, error, sizeof(error)), error);
         require(stats.stream.read_errors == 0 && stats.stream.pending_reads == 0 &&
@@ -162,12 +162,12 @@ void run_seed_case(fixture_inputs & inputs, ggml_type type, int tokens, int acti
         return stats;
     };
     uint64_t token = 0;
-    auto decode = [&](kimi_cpu_sink * sink, int lo, int hi) {
+    auto decode = [&](ssd_cpu_sink * sink, int lo, int hi) {
         std::vector<float> single(size_t(f.latent), 0.125f), single_out(size_t(f.latent));
         for (int expert = lo; expert < hi; ++expert) {
             begin_cache(sink, 20261110, ++token);
             const float weight = 1;
-            require(kimi_cpu_sink_run_activation(sink, meta.role[0], meta.role[1], meta.role[2],
+            require(ssd_cpu_sink_run_activation(sink, meta.role[0], meta.role[1], meta.role[2],
                 single.data(), &expert, &weight, 1, &activation, single_out.data(), nullptr,
                 error, sizeof(error)), error);
         }
@@ -176,7 +176,7 @@ void run_seed_case(fixture_inputs & inputs, ggml_type type, int tokens, int acti
     // and seeds them from its payloads; decode reads them.
     auto seeded = make_sink(inputs, f, 4, 2);
     configure_cache(seeded.get(), retained ? 8 * unit : 0, {1}, 4);
-    prefill_ptr seeded_prefill(kimi_cpu_prefill_create(seeded.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+    prefill_ptr seeded_prefill(ssd_cpu_prefill_create(seeded.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
     require(bool(seeded_prefill), error);
     decode(seeded.get(), 0, retained ? 4 : 1);
     uint64_t held_bytes = 0;
@@ -190,7 +190,7 @@ void run_seed_case(fixture_inputs & inputs, ggml_type type, int tokens, int acti
     auto stats = run(seeded_prefill.get(), cpu_output);
     require(stats.gpu_experts == 0 && stats.ssd_experts + stats.ram_experts == 4 && (!retained || stats.ram_experts == 4),
         "the seeding pass must compute every expert on the CPU");
-    require(kimi_cpu_sink_vram_phase_complete(seeded.get(), true, error, sizeof(error)), error);
+    require(ssd_cpu_sink_vram_phase_complete(seeded.get(), true, error, sizeof(error)), error);
     decode(seeded.get(), 0, 4);
     if (retained) {
         require(cache_snapshot(seeded.get()).valid_bytes == held_bytes,
@@ -203,7 +203,7 @@ void run_seed_case(fixture_inputs & inputs, ggml_type type, int tokens, int acti
     inputs.set("tier.min_count", "0");
     auto admitted = make_sink(inputs, f, 4, 2);
     configure_cache(admitted.get(), 0, {1}, 4);
-    prefill_ptr admitted_prefill(kimi_cpu_prefill_create(admitted.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+    prefill_ptr admitted_prefill(ssd_cpu_prefill_create(admitted.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
     require(bool(admitted_prefill), error);
     decode(admitted.get(), 0, 4);
     stats = run(admitted_prefill.get(), admitted_output);
@@ -258,8 +258,8 @@ void run_lookahead_case(fixture_inputs & inputs, int tokens) {
     for (const auto & k : cache_keys) { inputs.unset(k[0]); }
     configure_cache(sink.get(), 2 * uint64_t(f.experts) * stride, {1, 2}, f.experts);
     char error[512] = {};
-    require(kimi_cpu_sink_vram_reserve(sink.get(), meta1.role, 1, 4, error, sizeof(error)), error);
-    prefill_ptr prefill(kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+    require(ssd_cpu_sink_vram_reserve(sink.get(), meta1.role, 1, 4, error, sizeof(error)), error);
+    prefill_ptr prefill(ssd_cpu_prefill_create(sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
     require(bool(prefill), error);
     constexpr int slots = 4;
     std::vector<int32_t> ids(size_t(tokens) * slots);
@@ -268,12 +268,12 @@ void run_lookahead_case(fixture_inputs & inputs, int tokens) {
     }
     std::vector<float> weights(ids.size(), 0.25f), zero(size_t(tokens) * f.latent, 0.0f), x(zero.size());
     for (size_t i = 0; i < x.size(); ++i) { x[i] = 0.3f * std::sin(float(i) * 0.23f); }
-    const kimi_cpu_sink_activation swiglu = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, 10.0f, nullptr, 0 };
+    const ssd_cpu_sink_activation swiglu = { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, 10.0f, nullptr, 0 };
     auto run = [&](const tensors & meta, const std::vector<float> & input, std::vector<float> & output) {
-        if (&meta == &meta1) { kimi_cpu_sink_prefill_hint(sink.get(), 2, ids.data(), tokens, slots); }
+        if (&meta == &meta1) { ssd_cpu_sink_prefill_hint(sink.get(), 2, ids.data(), tokens, slots); }
         output.assign(input.size(), 0.0f);
-        kimi_cpu_prefill_stats stats = {};
-        require(kimi_cpu_prefill_run_activation(prefill.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+        ssd_cpu_prefill_stats stats = {};
+        require(ssd_cpu_prefill_run_activation(prefill.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
             ids.data(), weights.data(), slots, tokens, &swiglu, output.data(), &stats, error, sizeof(error)), error);
         require(stats.stream.read_errors == 0 && stats.stream.pending_reads == 0 &&
             stats.stream.read_completions == stats.stream.read_requests &&
@@ -328,14 +328,14 @@ int main(int argc, char ** argv) {
         (void) argv;
         require(argc == 1, "usage: test-ssd-prefill-scratch");
         for (int tokens : {9, 14, 48, 64, 65}) {
-            run_case(inputs, GGML_TYPE_MXFP4, tokens, KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP);
-            run_case(inputs, GGML_TYPE_Q8_0, tokens, KIMI_CPU_SINK_ACTIVATION_SWIGLU);
-            run_case(inputs, GGML_TYPE_Q8_0, tokens, KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP);
+            run_case(inputs, GGML_TYPE_MXFP4, tokens, SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP);
+            run_case(inputs, GGML_TYPE_Q8_0, tokens, SSD_CPU_SINK_ACTIVATION_SWIGLU);
+            run_case(inputs, GGML_TYPE_Q8_0, tokens, SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP);
         }
-        run_seed_case(inputs, GGML_TYPE_MXFP4, 48, KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP);
-        run_seed_case(inputs, GGML_TYPE_Q8_0, 48, KIMI_CPU_SINK_ACTIVATION_SWIGLU);
-        run_seed_case(inputs, GGML_TYPE_Q8_0, 48, KIMI_CPU_SINK_ACTIVATION_SWIGLU, true);
-        run_seed_case(inputs, GGML_TYPE_Q6_K, 48, KIMI_CPU_SINK_ACTIVATION_SWIGLU, false, true);
+        run_seed_case(inputs, GGML_TYPE_MXFP4, 48, SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP);
+        run_seed_case(inputs, GGML_TYPE_Q8_0, 48, SSD_CPU_SINK_ACTIVATION_SWIGLU);
+        run_seed_case(inputs, GGML_TYPE_Q8_0, 48, SSD_CPU_SINK_ACTIVATION_SWIGLU, true);
+        run_seed_case(inputs, GGML_TYPE_Q6_K, 48, SSD_CPU_SINK_ACTIVATION_SWIGLU, false, true);
         for (int tokens : {48, 300}) { run_lookahead_case(inputs, tokens); }
         std::printf("PREFILL_SCRATCH_%s cases=%zu failures=%zu\n", failures ? "FAIL" : "PASS", cases, failures);
         return failures ? 1 : 0;

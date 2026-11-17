@@ -358,12 +358,12 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
-    GGML_API void                 ggml_backend_sched_kimi_set_profile_phase(ggml_backend_sched_t sched, int phase);
-    GGML_API void                 ggml_backend_sched_kimi_set_dense_decode(ggml_backend_sched_t sched, bool decode);
+    GGML_API void                 ggml_backend_sched_ssd_set_profile_phase(ggml_backend_sched_t sched, int phase);
+    GGML_API void                 ggml_backend_sched_ssd_set_dense_decode(ggml_backend_sched_t sched, bool decode);
     // The copies of this context's weights homed on the drive (counters survive graph rebuilds): tensors, bytes, the
     // time in the transport's copy (of it, in the copies not read ahead), the time waiting for the device before it,
     // the copies whose blocks had been read ahead, the copies left to the mapped weight
-    struct ggml_backend_sched_kimi_copy_stats {
+    struct ggml_backend_sched_ssd_copy_stats {
         uint64_t dense_tensors;
         uint64_t dense_bytes;
         uint64_t dense_read_us;
@@ -372,7 +372,7 @@ extern "C" {
         uint64_t dense_readahead;
         uint64_t dense_fallbacks;
     };
-    GGML_API void                 ggml_backend_sched_kimi_copy_stats_get(ggml_backend_sched_t sched, struct ggml_backend_sched_kimi_copy_stats * stats);
+    GGML_API void                 ggml_backend_sched_ssd_copy_stats_get(ggml_backend_sched_t sched, struct ggml_backend_sched_ssd_copy_stats * stats);
 
     // Same-build extension: borrowed from the owning context until the scheduler
     // is destroyed. ggml-base has no dependency on any SSD implementation/backend.
@@ -383,7 +383,7 @@ extern "C" {
         bool (*copy_dense)(void *, ggml_backend_t, const struct ggml_tensor *, struct ggml_tensor *,
                            const struct ggml_tensor *, uint64_t);
         void (*phase)(void *, int);
-        void (*stats)(void *, struct ggml_backend_sched_kimi_copy_stats *);
+        void (*stats)(void *, struct ggml_backend_sched_ssd_copy_stats *);
         void (*reset)(void *);
     };
     GGML_API void ggml_backend_sched_set_ssd_runtime(ggml_backend_sched_t sched,

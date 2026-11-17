@@ -16,11 +16,11 @@ struct vram_format_compute_api {
     void * (*create)(int device, int latent, int hidden, int max_hits, int weight_type, int down_type, char *, size_t);
     void (*destroy)(void *);
     int (*compute)(void *, const vram_compute_expert *, int hits, const void * input, size_t input_bytes,
-                   const kimi_vram_activation * activation, float * host_down, char * error, size_t error_size);
+                   const ssd_vram_activation * activation, float * host_down, char * error, size_t error_size);
     size_t (*device_scratch_bytes)(void *);
     size_t (*host_scratch_bytes)(void *);
     int (*launch)(void *, const vram_compute_expert *, int hits, int first, const void * input, size_t input_bytes,
-                  const kimi_vram_activation * activation, struct CUevent_st * ready, struct CUevent_st * start,
+                  const ssd_vram_activation * activation, struct CUevent_st * ready, struct CUevent_st * start,
                   struct CUevent_st * end, char * error, size_t error_size);
     const float * (*host_rows)(void *); // [max_hits][latent]
 };
@@ -35,7 +35,7 @@ typedef const vram_format_compute_api * (*vram_format_compute_get_api_fn)();
 // (before decode grows the tier). The kernels stay loaded for the process: the first reserve of a type and shape takes
 // their device memory for good, and meanwhile a scratch of one matrix and its operands, which it frees.
 struct vram_group_activation {
-    struct kimi_vram_activation base;
+    struct ssd_vram_activation base;
     const float * post_norm;    // latent weights of the per-expert post norm, or null; copied by begin_layer
     float post_norm_eps;
 };
@@ -97,6 +97,6 @@ struct vram_group_compute_api {
 typedef const vram_group_compute_api * (*vram_group_compute_get_api_fn)();
 
 extern "C" {
-const vram_format_compute_api * kimi_vram_generic_format_compute_get_api();
-SSD_CUDA_EXPORT const vram_group_compute_api * kimi_vram_group_compute_get_api();
+const vram_format_compute_api * ssd_vram_generic_format_compute_get_api();
+SSD_CUDA_EXPORT const vram_group_compute_api * ssd_vram_group_compute_get_api();
 }

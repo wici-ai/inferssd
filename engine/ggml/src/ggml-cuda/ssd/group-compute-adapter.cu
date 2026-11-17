@@ -56,7 +56,7 @@ __global__ void group_activate(const float * up, const float * gate, float * hid
     if (i >= count) {
         return;
     }
-    hidden[i] = kimi_vram_activate(up[i], gate[i], kind, situ_beta, situ_linear_beta, swiglu_limit);
+    hidden[i] = ssd_vram_activate(up[i], gate[i], kind, situ_beta, situ_linear_beta, swiglu_limit);
 }
 
 constexpr int scatter_threads = 256;
@@ -287,7 +287,7 @@ struct group_engine {
             for (const auto & f : formats) {
                 names += std::string(names.empty() ? "" : ",") + ggml_type_name(ggml_type(f.first)) + "/" + ggml_type_name(ggml_type(f.second));
             }
-            std::fprintf(stderr, "[kimi_vram_group_engine] status=reserved format=%s latent=%d hidden=%d chunk=%d fixed_bytes=%zu\n",
+            std::fprintf(stderr, "[ssd_vram_group_engine] status=reserved format=%s latent=%d hidden=%d chunk=%d fixed_bytes=%zu\n",
                 names.c_str(), latent, hidden, chunk, fixed_bytes());
         }
         if (rows_wanted <= rows_capacity && routes_wanted <= routes_capacity) {
@@ -338,15 +338,15 @@ struct group_engine {
             throw std::runtime_error("grouped VRAM engine layer format");
         }
         const auto & a = activation_->base;
-        if (a.kind == KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP) {
+        if (a.kind == SSD_VRAM_ACTIVATION_SWIGLU_CLAMP) {
             if (std::isnan(a.swiglu_limit) || a.swiglu_limit <= 1e-6f) {
                 throw std::runtime_error("grouped VRAM engine invalid SwiGLU clamp");
             }
-        } else if (a.kind == KIMI_VRAM_ACTIVATION_SITU) {
+        } else if (a.kind == SSD_VRAM_ACTIVATION_SITU) {
             if (!std::isfinite(a.situ_beta) || a.situ_beta <= 0.0f || !std::isfinite(a.situ_linear_beta)) {
                 throw std::runtime_error("grouped VRAM engine invalid SiTU parameters");
             }
-        } else if (a.kind != KIMI_VRAM_ACTIVATION_SWIGLU) {
+        } else if (a.kind != SSD_VRAM_ACTIVATION_SWIGLU) {
             throw std::runtime_error("grouped VRAM engine activation kind");
         }
         if (activation_->post_norm && (!std::isfinite(activation_->post_norm_eps) || activation_->post_norm_eps <= 0.0f)) {
@@ -590,7 +590,7 @@ size_t device_bytes(void * context) { return context ? static_cast<group_engine 
 size_t host_bytes(void * context) { return context ? static_cast<group_engine *>(context)->host_bytes() : 0; }
 } // namespace
 
-extern "C" const vram_group_compute_api * kimi_vram_group_compute_get_api() {
+extern "C" const vram_group_compute_api * ssd_vram_group_compute_get_api() {
     static const vram_group_compute_api api = {
         3, sizeof(vram_group_compute_api), create, destroy, reserve, release, input_rows, begin_layer, compute,
         finish_layer, geometry, device_bytes, host_bytes

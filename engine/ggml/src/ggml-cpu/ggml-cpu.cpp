@@ -861,30 +861,30 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
     static const ssd::cpu::api_v2 api = {
         7, sizeof(ssd::cpu::api_v2),
-        &kimi_cpu_sink_source_size,
+        &ssd_cpu_sink_source_size,
         &ssd::cpu::create_configured,
-        &kimi_cpu_sink_run,
-        &kimi_cpu_sink_run_activation,
-        &kimi_cpu_sink_destroy,
-        &kimi_cpu_sink_call_open,
-        &kimi_cpu_sink_call_close,
-        &kimi_cpu_sink_call_join,
-        &kimi_cpu_sink_decode_threads,
-        &kimi_cpu_sink_cache_configure,
-        &kimi_cpu_sink_cache_begin,
-        &kimi_cpu_sink_request_begin,
-        &kimi_cpu_sink_vram_phase_complete,
-        &kimi_cpu_sink_cache_get_stats,
+        &ssd_cpu_sink_run,
+        &ssd_cpu_sink_run_activation,
+        &ssd_cpu_sink_destroy,
+        &ssd_cpu_sink_call_open,
+        &ssd_cpu_sink_call_close,
+        &ssd_cpu_sink_call_join,
+        &ssd_cpu_sink_decode_threads,
+        &ssd_cpu_sink_cache_configure,
+        &ssd_cpu_sink_cache_begin,
+        &ssd_cpu_sink_request_begin,
+        &ssd_cpu_sink_vram_phase_complete,
+        &ssd_cpu_sink_cache_get_stats,
         &ssd::cpu::cache_make_room_configured,
         &ssd::cpu::cache_prefill_room_configured,
-        &kimi_cpu_sink_prefetch_hint,
-        &kimi_cpu_sink_prefill_hint,
-        &kimi_cpu_sink_vram_reserve,
-        &kimi_cpu_sink_preload,
-        &kimi_cpu_prefill_create,
-        &kimi_cpu_prefill_run,
-        &kimi_cpu_prefill_run_activation,
-        &kimi_cpu_prefill_destroy,
+        &ssd_cpu_sink_prefetch_hint,
+        &ssd_cpu_sink_prefill_hint,
+        &ssd_cpu_sink_vram_reserve,
+        &ssd_cpu_sink_preload,
+        &ssd_cpu_prefill_create,
+        &ssd_cpu_prefill_run,
+        &ssd_cpu_prefill_run_activation,
+        &ssd_cpu_prefill_destroy,
         &ssd::cpu::take_room_configured,
         &ggml_backend_cpu_set_ssd_runtime_services,
         sizeof(ssd::runtime_services),
@@ -899,41 +899,41 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_ssd_api_v2") == 0) {
         return (void *) ggml_backend_cpu_ssd_api_v2;
     }
-    if (strcmp(name, "kimi_cpu_prefill_create") == 0) {
-        return (void *) kimi_cpu_prefill_create;
+    if (strcmp(name, "ssd_cpu_prefill_create") == 0) {
+        return (void *) ssd_cpu_prefill_create;
     }
-    if (strcmp(name, "kimi_cpu_prefill_run") == 0) {
-        return (void *) kimi_cpu_prefill_run;
+    if (strcmp(name, "ssd_cpu_prefill_run") == 0) {
+        return (void *) ssd_cpu_prefill_run;
     }
-    if (strcmp(name, "kimi_cpu_prefill_run_activation") == 0) {
-        return (void *) kimi_cpu_prefill_run_activation;
+    if (strcmp(name, "ssd_cpu_prefill_run_activation") == 0) {
+        return (void *) ssd_cpu_prefill_run_activation;
     }
-    if (strcmp(name, "kimi_cpu_prefill_destroy") == 0) {
-        return (void *) kimi_cpu_prefill_destroy;
+    if (strcmp(name, "ssd_cpu_prefill_destroy") == 0) {
+        return (void *) ssd_cpu_prefill_destroy;
     }
-    if (strcmp(name, "kimi_cpu_sink_create") == 0) {
-        return (void *) kimi_cpu_sink_create;
+    if (strcmp(name, "ssd_cpu_sink_create") == 0) {
+        return (void *) ssd_cpu_sink_create;
     }
-    if (strcmp(name, "kimi_cpu_sink_run") == 0) {
-        return (void *) kimi_cpu_sink_run;
+    if (strcmp(name, "ssd_cpu_sink_run") == 0) {
+        return (void *) ssd_cpu_sink_run;
     }
-    if (strcmp(name, "kimi_cpu_sink_destroy") == 0) {
-        return (void *) kimi_cpu_sink_destroy;
+    if (strcmp(name, "ssd_cpu_sink_destroy") == 0) {
+        return (void *) ssd_cpu_sink_destroy;
     }
-    if (strcmp(name, "kimi_cpu_sink_cache_configure") == 0) {
-        return (void *) kimi_cpu_sink_cache_configure;
+    if (strcmp(name, "ssd_cpu_sink_cache_configure") == 0) {
+        return (void *) ssd_cpu_sink_cache_configure;
     }
-    if (strcmp(name, "kimi_cpu_sink_cache_begin") == 0) {
-        return (void *) kimi_cpu_sink_cache_begin;
+    if (strcmp(name, "ssd_cpu_sink_cache_begin") == 0) {
+        return (void *) ssd_cpu_sink_cache_begin;
     }
-    if (strcmp(name, "kimi_cpu_sink_request_begin") == 0) {
-        return (void *) kimi_cpu_sink_request_begin;
+    if (strcmp(name, "ssd_cpu_sink_request_begin") == 0) {
+        return (void *) ssd_cpu_sink_request_begin;
     }
-    if (strcmp(name, "kimi_cpu_sink_vram_phase_complete") == 0) {
-        return (void *) kimi_cpu_sink_vram_phase_complete;
+    if (strcmp(name, "ssd_cpu_sink_vram_phase_complete") == 0) {
+        return (void *) ssd_cpu_sink_vram_phase_complete;
     }
-    if (strcmp(name, "kimi_cpu_sink_cache_get_stats") == 0) {
-        return (void *) kimi_cpu_sink_cache_get_stats;
+    if (strcmp(name, "ssd_cpu_sink_cache_get_stats") == 0) {
+        return (void *) ssd_cpu_sink_cache_get_stats;
     }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;

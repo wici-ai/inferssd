@@ -39,7 +39,7 @@ int main() {
         try { io_ring(); } catch (const unavailable & e) { std::printf("read ring unavailable: %s\n", e.what()); }
 
 #if defined(__linux__)
-        kimi_host_ledger ledger;
+        ssd_host_ledger ledger;
         ledger.cgroup = "/sys/fs/cgroup/fixture";
         ledger.reserve = 512ull << 20;
         std::string limit = "max", current = "0";

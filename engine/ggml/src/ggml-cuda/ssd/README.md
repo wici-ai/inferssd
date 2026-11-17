@@ -1,12 +1,12 @@
 # Expert VRAM tier
 
 This optional CUDA component caches routed expert weights and runs explicit
-expert formats for DeepSeek and Muse. The `kimi-vram-tier` object target links
+expert formats for DeepSeek and Muse. The `ssd-vram-tier` object target links
 normally into `ggml-cuda`. No component DSO or preload is used.
 
 The owner supplies tensor types, geometry, expert count and layer IDs through
-`kimi_vram_format_api`; it supplies source file identities and ranges through
-`kimi_vram_request`. The tier shares admission policy, asynchronous and deferred
+`ssd_vram_format_api`; it supplies source file identities and ranges through
+`ssd_vram_request`. The tier shares admission policy, asynchronous and deferred
 uploads, residency leases, elastic blocks and failure cleanup across formats.
 A borrowed upload keeps its source pinned until collect/finish or failure drain.
 Reclaim refuses live compute/residency leases and drains queued copies before

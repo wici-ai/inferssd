@@ -77,11 +77,11 @@ struct tier {
     bool unified=false;size_t host_floor=0,host_demand=0;
     uint64_t host_reclaims=0,host_reclaim_refusals=0,live_reclaim_refusals=0;
     uint64_t phase_decode_tokens=0; // decode tokens begun since the last decode phase_complete
-    // Decode jobs computed from host memory (kimi_vram_host_api): in place where the device reads host pages through
+    // Decode jobs computed from host memory (ssd_vram_host_api): in place where the device reads host pages through
     // its page tables (ATS); on a discrete GPU after a copy from page-locked memory into device memory, the expert's
     // admission reservation or a host scratch slot. device[] is what the engine reads; start/end time the copy.
     bool host_readable=false,layer_input_ready=false;
-    struct host_task { kimi_vram_host_job job; const void * device[3]; int scratch; cudaEvent_t start,end; };
+    struct host_task { ssd_vram_host_job job; const void * device[3]; int scratch; cudaEvent_t start,end; };
     double resident_us_per_expert=0,host_us_per_expert=0;uint64_t host_jobs=0,host_batches=0;
     // A decode layer's engine calls, its residents' (launch_activation) and each batch of its host jobs' (launch_host):
     // the sink's thread launches them and finish collects them. A call takes the engine's rows [first, first + count),
@@ -97,21 +97,21 @@ struct tier {
     // finish_host_probe). Without it nothing moves: the plan moves only at a measured copy rate.
     const void * host_probe=nullptr;size_t host_probe_bytes=0,host_probe_copied=0;bool host_probe_taken=false;
     cudaEvent_t host_probe_start=nullptr,host_probe_end=nullptr;
-    // The measured lines the sink plans decode and grouped prefill with (kimi_place_table): (experts, us) of each
+    // The measured lines the sink plans decode and grouped prefill with (ssd_place_table): (experts, us) of each
     // vector-engine call of residents and of host jobs (decode's, and a one-token prefill pass's), (MB, us) of each
     // copy into device memory from page-locked memory (host jobs', deferred admissions', the probe's) and from
     // pageable memory (the start-up probe's, admissions', prefill transients'), the last 64 each.
     struct samples { std::deque<std::pair<double,double>> s; void add(double x,double y){s.emplace_back(x,y);if(s.size()>64)s.pop_front();} };
     samples resident_calls,host_calls,locked_copies,pageable_copies;
     // Grouped prefill passes of at most this many tokens run the vector engine, a call of the layer's residents a
-    // token, as a decode token does: the same code and the same lines at one token (kimi_vram_host_costs).
+    // token, as a decode token does: the same code and the same lines at one token (ssd_vram_host_costs).
     static constexpr int vector_tokens=1;
     // The measured costs that price decode's replacements (update_admission); MIN_COUNT is the rule until then.
     double ram_us=0,drive_us=0,upload_us_per_expert=0;bool adaptive_admission=false;uint64_t admission_updates=0;
     uint64_t last_evictions=0;
-    // The sink's RAM cache (kimi_vram_policy_api's set_ram_holds): whether it keeps a copy of an expert.
+    // The sink's RAM cache (ssd_vram_policy_api's set_ram_holds): whether it keeps a copy of an expert.
     int (*ram_holds)(void *,int32_t,int32_t)=nullptr;void * ram_holds_arg=nullptr;
-    // The model's expert formats (kimi_vram_expert_format's per-layer types, fixed by the first call): each its role
+    // The model's expert formats (ssd_vram_expert_format's per-layer types, fixed by the first call): each its role
     // bytes and its decode engine. A slot holds an expert of any of them: stride is the largest one's. layer_format:
     // a layer ID's format; cur: the format of the layer being prepared, which its jobs on the worker run with.
     // payload: a role's logical bytes; role_bytes: the role as a slot lays it out, rounded up to 4 KiB.
@@ -146,9 +146,9 @@ struct tier {
     reclaimer_register_fn reclaimer_register=nullptr;
     reclaimer_unregister_fn reclaimer_unregister=nullptr;
     std::unique_ptr<vram_slot_table> table;
-    // The decode engine (kimi_vram_format_api): the generic one, an instance a format.
+    // The decode engine (ssd_vram_format_api): the generic one, an instance a format.
     const vram_format_compute_api * format_api=nullptr;bool format_mode=false;
-    int n_experts=0;kimi_vram_activation activation={};
+    int n_experts=0;ssd_vram_activation activation={};
     std::thread worker;std::mutex mutex;std::condition_variable cv;
     bool stopping=false,prefill_queued=false,done=true;
     // format: the expert's own (its layer's), whose role bytes the copy takes
@@ -173,7 +173,7 @@ struct tier {
     std::vector<uint8_t> prefill_input;
     std::vector<int32_t> prefill_routes;
     std::vector<float> prefill_weights,prefill_output;
-    std::vector<kimi_vram_prefill_transient> prefill_transient;
+    std::vector<ssd_vram_prefill_transient> prefill_transient;
     char * prefill_transient_arena=nullptr;
     size_t prefill_transient_bytes=0;
     // A transient's copy timed on the upload stream (B3): its DMA, whatever the worker does meanwhile.
@@ -199,10 +199,10 @@ struct tier {
     static constexpr size_t prefill_transient_slots=2; // the device slots a pass's transients are copied into
     // Storage made outside a decode (a cold prefill, the load) has no decode epoch: the next decode adopts it.
     bool adopt_next_decode=false;
-    // Seeds of a prefill (kimi_vram_prefill_api v10): empty slots filled with the prompt's most-routed experts of each
+    // Seeds of a prefill (ssd_vram_prefill_api v10): empty slots filled with the prompt's most-routed experts of each
     // layer, published when the prefill completes. A layer plans its share of the free slots (free / layers not yet
     // planned) before its first prepare (plan_sink_seeds).
-    struct pending_seed { int slot; kimi_vram_request key; uint8_t roles; };
+    struct pending_seed { int slot; ssd_vram_request key; uint8_t roles; };
     std::vector<pending_seed> seeds;
     std::set<int> seed_planned;uint64_t seed_plan_generation=UINT64_MAX;
     cudaStream_t seed_stream=nullptr; // the lane's seed copies
@@ -219,14 +219,14 @@ struct tier {
     cudaStream_t seed_host_stream=nullptr;
     uint64_t cold_prefill_admissions=0,cold_prefill_admission_bytes=0,cold_prefill_admit_calls=0;
     double cold_prefill_admission_us=0;
-    kimi_vram_prefill_stats prefill_job_stats={};
-    kimi_vram_activation prefill_activation={};
+    ssd_vram_prefill_stats prefill_job_stats={};
+    ssd_vram_activation prefill_activation={};
     // Deferred uploads (on with every production tier): a borrowed upload runs on its own thread and
-    // stream and may outlive finish; its slot stays reserved until collect publishes it (kimi_vram_deferred_api).
+    // stream and may outlive finish; its slot stays reserved until collect publishes it (ssd_vram_deferred_api).
     bool deferred_upload=false;
     // aborted: its slot went with a block an OOM or host reclaim gave back; collect reports it, nothing is published.
     // format: the expert's own; the copy may run while a layer of another format is prepared.
-    struct deferred_job { uint64_t id; int slot; kimi_vram_request key; const void * data[3]; bool started, completed, aborted;
+    struct deferred_job { uint64_t id; int slot; ssd_vram_request key; const void * data[3]; bool started, completed, aborted;
         const expert_format * format; };
     std::deque<deferred_job> deferred; // admission order; completed entries wait for collect
     std::thread upload_thread;std::condition_variable upload_cv;cudaStream_t deferred_stream=nullptr;
@@ -270,21 +270,21 @@ struct tier {
             if(upload_thread.joinable())upload_thread.join();
             if(device>=0)cuda_check(cudaSetDevice(device));
             report("destroy");
-            if(watermark)std::fprintf(stderr,"[kimi_vram_watermark] low_mib=%zu high_mib=%zu ticks=%llu busy=%llu shrinks=%llu grows=%llu free_min=%zu\n",
+            if(watermark)std::fprintf(stderr,"[ssd_vram_watermark] low_mib=%zu high_mib=%zu ticks=%llu busy=%llu shrinks=%llu grows=%llu free_min=%zu\n",
                 watermark_low_mib,watermark_high_mib,(unsigned long long)watermark_ticks,(unsigned long long)watermark_busy,
                 (unsigned long long)watermark_shrinks,(unsigned long long)watermark_grows,watermark_free_min==SIZE_MAX?size_t(0):watermark_free_min);
-            if(deferred_upload)std::fprintf(stderr,"[kimi_vram_deferred] uploads=%llu published=%llu aborted=%llu layer_waits=%llu capacity_waits=%llu wait_us=%.0f peak=%zu\n",
+            if(deferred_upload)std::fprintf(stderr,"[ssd_vram_deferred] uploads=%llu published=%llu aborted=%llu layer_waits=%llu capacity_waits=%llu wait_us=%.0f peak=%zu\n",
                 (unsigned long long)deferred_uploads,(unsigned long long)deferred_published,(unsigned long long)deferred_aborted,
                 (unsigned long long)deferred_layer_waits,(unsigned long long)deferred_capacity_waits,deferred_wait_us,deferred_peak);
-            if(unified)std::fprintf(stderr,"[kimi_vram_host_reserve] reason=destroy floor=%zu demand=%zu host_reclaims=%llu host_reclaim_refusals=%llu live_reclaim_refusals=%llu\n",
+            if(unified)std::fprintf(stderr,"[ssd_vram_host_reserve] reason=destroy floor=%zu demand=%zu host_reclaims=%llu host_reclaim_refusals=%llu live_reclaim_refusals=%llu\n",
                 host_floor,host_demand,(unsigned long long)host_reclaims,(unsigned long long)host_reclaim_refusals,(unsigned long long)live_reclaim_refusals);
             if(adaptive_admission)admission_log("final ");
-            if(seeds_planned)std::fprintf(stderr,"[kimi_vram_seed] reason=destroy planned=%llu published=%llu cancelled=%llu freed_unused=%llu copies=%llu bytes=%llu wait_us=%.0f\n",
+            if(seeds_planned)std::fprintf(stderr,"[ssd_vram_seed] reason=destroy planned=%llu published=%llu cancelled=%llu freed_unused=%llu copies=%llu bytes=%llu wait_us=%.0f\n",
                 (unsigned long long)seeds_planned,(unsigned long long)seeds_published,(unsigned long long)seeds_cancelled,
                 (unsigned long long)seeds_freed,(unsigned long long)seed_copies,(unsigned long long)seed_bytes,seed_wait_us);
             if(host_readable || host_jobs || host_refused || host_probe_taken){
-                kimi_vram_host_costs c={};costs2(c);
-                std::fprintf(stderr,"[kimi_vram_host] in_place=%d jobs=%llu batches=%llu copies=%llu reserved_copies=%llu refused=%llu copy_mb=%.1f copy_us=%.0f "
+                ssd_vram_host_costs c={};costs2(c);
+                std::fprintf(stderr,"[ssd_vram_host] in_place=%d jobs=%llu batches=%llu copies=%llu reserved_copies=%llu refused=%llu copy_mb=%.1f copy_us=%.0f "
                     "resident_us_per_expert=%.1f host_us_per_expert=%.1f resident_call_us=%.1f resident_expert_us=%.1f host_call_us=%.1f host_expert_us=%.1f "
                     "copy_us_per_mb=%.2f scratch_slots=%zu host_floor=%zu\n",
                     int(host_readable),(unsigned long long)host_jobs,(unsigned long long)host_batches,(unsigned long long)host_copies,
@@ -292,7 +292,7 @@ struct tier {
                     resident_us_per_expert,host_us_per_expert,c.resident_call_us,c.resident_expert_us,c.host_call_us,c.host_expert_us,
                     c.copy_us_per_mb,host_scratch?host_scratch_slots:size_t(0),host_floor);
             }
-            if(timing)std::fprintf(stderr,"[kimi_vram_tier_timing] launches=%llu handoff_us=%.0f finish_drain_us=%.0f compute_us=%.0f upload_us=%.0f upload_wait_us=%.0f uploads=%llu hits=%llu cpu_requests=%llu\n",
+            if(timing)std::fprintf(stderr,"[ssd_vram_tier_timing] launches=%llu handoff_us=%.0f finish_drain_us=%.0f compute_us=%.0f upload_us=%.0f upload_wait_us=%.0f uploads=%llu hits=%llu cpu_requests=%llu\n",
                 (unsigned long long)launches,handoff_us,finish_drain_us,compute_us,upload_us,upload_wait_us,(unsigned long long)uploads,(unsigned long long)gpu_hits,(unsigned long long)cpu_requests);
             if(engine_held)ggml_memory_query::instance().release(device,engine_held);
             for(auto & x:formats)if(x.engine)format_api->destroy(x.engine);
@@ -311,7 +311,7 @@ struct tier {
             for(cudaEvent_t e:group_dma)cuda_check(cudaEventDestroy(e));
             if(group)group_api->destroy(group);
         } catch(const std::exception & e) {
-            std::fprintf(stderr,"[kimi_vram_tier] destroy could not drain owned work: %s\n",e.what());std::abort();
+            std::fprintf(stderr,"[ssd_vram_tier] destroy could not drain owned work: %s\n",e.what());std::abort();
         }
     }
     // Free memory the tier may still take. On unified memory that is MemAvailable, as it reads at the kernel's full
@@ -351,7 +351,7 @@ struct tier {
             while(over-got>(size_t(1)<<20)){const size_t bytes=got+(over-got)/2;(fits(bytes)?got:over)=bytes;}
         }
         withheld=raw-got;
-        std::fprintf(stderr,"[kimi_vram_elastic] event=withheld free_bytes=%zu allocatable_bytes=%zu withheld_bytes=%zu\n",raw,got,withheld);
+        std::fprintf(stderr,"[ssd_vram_elastic] event=withheld free_bytes=%zu allocatable_bytes=%zu withheld_bytes=%zu\n",raw,got,withheld);
     }
     // The tier's storage in this DRAM on unified memory: its slots, the prefill's transient slots and the host jobs'
     // scratch slots. The cgroup does not charge it, so the host-memory ledger counts it in the envelope, which the RAM
@@ -379,14 +379,14 @@ struct tier {
         if(free_bytes>=need)return true;
         if(busy()){
             ++host_reclaim_refusals;
-            std::fprintf(stderr,"[kimi_vram_elastic] event=host_reclaim status=live reason=%s request_bytes=%zu free_bytes=%zu\n",reason,bytes,free_bytes);
+            std::fprintf(stderr,"[ssd_vram_elastic] event=host_reclaim status=live reason=%s request_bytes=%zu free_bytes=%zu\n",reason,bytes,free_bytes);
             return false;
         }
         const size_t before=slot_locations.size(),free_before=free_bytes;
         while(free_bytes<need && blocks.size()>1 && reclaim_last_block(reason,false))mem_info(&free_bytes,&total);
         if(slot_locations.size()<before){
             ++host_reclaims;
-            std::fprintf(stderr,"[kimi_vram_elastic] event=host_reclaim status=%s reason=%s request_bytes=%zu free_before=%zu free_after=%zu freed_slots=%zu slots=%zu floor=%zu demand=%zu\n",
+            std::fprintf(stderr,"[ssd_vram_elastic] event=host_reclaim status=%s reason=%s request_bytes=%zu free_before=%zu free_after=%zu freed_slots=%zu slots=%zu floor=%zu demand=%zu\n",
                 free_bytes>=need?"pass":"short",reason,bytes,free_before,free_bytes,before-slot_locations.size(),slot_locations.size(),host_floor,host_demand);
         }
         return free_bytes>=need;
@@ -412,7 +412,7 @@ struct tier {
     }
     // From the last update, so that it can also report after the table is gone.
     void admission_log(const char * tag){
-        std::fprintf(stderr,"[kimi_vram_admission] %sram_us=%.1f drive_us=%.1f hit_us=%.1f upload_us=%.1f evictions=%llu updates=%llu\n",
+        std::fprintf(stderr,"[ssd_vram_admission] %sram_us=%.1f drive_us=%.1f hit_us=%.1f upload_us=%.1f evictions=%llu updates=%llu\n",
             tag,ram_us,drive_us,resident_us_per_expert,upload_us_per_expert,(unsigned long long)last_evictions,
             (unsigned long long)admission_updates);
     }
@@ -429,7 +429,7 @@ struct tier {
         // the host page tables (ATS); with HMM a GPU read migrates the page into device memory.
         int in_place=0;
         host_readable=device>=0 && cudaDeviceGetAttribute(&in_place,cudaDevAttrPageableMemoryAccessUsesHostPageTables,device)==cudaSuccess && in_place;
-        if(host_readable)std::fprintf(stderr,"[kimi_vram_host] device=%d host_page_tables=1 unified=%d\n",device,int(unified));
+        if(host_readable)std::fprintf(stderr,"[ssd_vram_host] device=%d host_page_tables=1 unified=%d\n",device,int(unified));
         if(unified)publish_reserve();
     }
     // Diagnostic only: sample at completed layer boundaries. No allocation or
@@ -439,13 +439,13 @@ struct tier {
         cuda_check(cudaSetDevice(device));
         size_t available=0,total=0;mem_info(&available,&total);
         if(active && !event){++memory_samples;memory_free_min=std::min(memory_free_min,uint64_t(available));memory_free_max=std::max(memory_free_max,uint64_t(available));}
-        if(event)std::fprintf(stderr,"[kimi_vram_memory] event=%s epoch=%llu token=%llu decode=%d budget_bytes=%llu capacity_bytes=%llu free_bytes=%zu total_bytes=%zu safety_bytes=%llu elapsed_us=%.3f\n",
+        if(event)std::fprintf(stderr,"[ssd_vram_memory] event=%s epoch=%llu token=%llu decode=%d budget_bytes=%llu capacity_bytes=%llu free_bytes=%zu total_bytes=%zu safety_bytes=%llu elapsed_us=%.3f\n",
             event,(unsigned long long)epoch,(unsigned long long)token,int(active),
             (unsigned long long)budget,(unsigned long long)capacity_bytes,available,total,(unsigned long long)safety_bytes,elapsed_us);
     }
     void memory_token_report(){
         if(!memory_trace || !memory_samples)return;
-        std::fprintf(stderr,"[kimi_vram_memory] event=token_end epoch=%llu token=%llu samples=%llu min_free_bytes=%llu max_free_bytes=%llu capacity_bytes=%llu\n",
+        std::fprintf(stderr,"[ssd_vram_memory] event=token_end epoch=%llu token=%llu samples=%llu min_free_bytes=%llu max_free_bytes=%llu capacity_bytes=%llu\n",
             (unsigned long long)epoch,(unsigned long long)token,(unsigned long long)memory_samples,
             (unsigned long long)memory_free_min,(unsigned long long)memory_free_max,(unsigned long long)capacity_bytes);
         memory_samples=0;memory_free_min=UINT64_MAX;memory_free_max=0;
@@ -456,10 +456,10 @@ struct tier {
             size_t held=0,reachable=0,card=0,total=0;
             q.state(device,&held,&reachable);
             ggml_backend_cuda_get_device_memory(device,&card,&total);
-            std::fprintf(stderr,"[kimi_vram_reserve] reason=%s reserve_mib=%zu held_mib=%zu reachable_mib=%zu card_free_mib=%zu\n",
+            std::fprintf(stderr,"[ssd_vram_reserve] reason=%s reserve_mib=%zu held_mib=%zu reachable_mib=%zu card_free_mib=%zu\n",
                 reason,watermark_low_mib,held>>20,reachable>>20,card>>20);
         }
-        std::fprintf(stderr,"[kimi_vram_tier] reason=%s budget_bytes=%llu capacity_bytes=%llu slots=%zu hits=%llu cpu_requests=%llu uploads=%llu upload_bytes=%llu upload_us=%.3f compute_us=%.3f device_scratch=%zu host_scratch=%zu borrowed_uploads=%llu upload_wait_us=%.3f cold_prefill_admissions=%llu cold_prefill_admission_bytes=%llu cold_prefill_admission_us=%.3f min_count=%.3f async_upload=%d global_pool=%d half_life=%.3f deferred_upload=%d elastic=%d demand_reclaim=%d blocks=%zu base_slots=%zu safety_blocks=%zu safety_mib=%zu proactive_blocks=%llu reactive_blocks=%llu base_blocks_reclaimed=%llu compaction_moves=%llu poisoned=%d\n",
+        std::fprintf(stderr,"[ssd_vram_tier] reason=%s budget_bytes=%llu capacity_bytes=%llu slots=%zu hits=%llu cpu_requests=%llu uploads=%llu upload_bytes=%llu upload_us=%.3f compute_us=%.3f device_scratch=%zu host_scratch=%zu borrowed_uploads=%llu upload_wait_us=%.3f cold_prefill_admissions=%llu cold_prefill_admission_bytes=%llu cold_prefill_admission_us=%.3f min_count=%.3f async_upload=%d global_pool=%d half_life=%.3f deferred_upload=%d elastic=%d demand_reclaim=%d blocks=%zu base_slots=%zu safety_blocks=%zu safety_mib=%zu proactive_blocks=%llu reactive_blocks=%llu base_blocks_reclaimed=%llu compaction_moves=%llu poisoned=%d\n",
             reason,(unsigned long long)budget,(unsigned long long)capacity_bytes,table?table->slots.size():0,
             (unsigned long long)gpu_hits,(unsigned long long)cpu_requests,(unsigned long long)uploads,
             (unsigned long long)upload_bytes,upload_us,compute_us,engine_scratch(true),
@@ -497,7 +497,7 @@ struct tier {
     // A request names a role by its payload (the sink keys and reads a GGUF expert's logical bytes) or by its padded
     // size, as a pack lays it out, and its source holds that many bytes. The format's first request fixes which; a
     // later one that names a role otherwise is refused with `refused`, as one that names neither.
-    void name_roles(size_t k,const kimi_vram_source * role,const char * refused){
+    void name_roles(size_t k,const ssd_vram_source * role,const char * refused){
         const expert_format & f=formats.at(k);
         for(int i=0;i<3;++i){
             const size_t was=named[3*k+size_t(i)].load(std::memory_order_acquire);
@@ -562,7 +562,7 @@ struct tier {
     static int oom_reclaim_thunk(void * p,size_t requested,size_t * freed){
         auto * t=static_cast<tier *>(p);
         try{return t->reclaim_one(requested,freed);}catch(const std::exception & e){
-            std::fprintf(stderr,"[kimi_vram_elastic] event=reactive_reclaim status=fail error=%s\n",e.what());
+            std::fprintf(stderr,"[ssd_vram_elastic] event=reactive_reclaim status=fail error=%s\n",e.what());
             if(freed)*freed=0;
             return -1;
         }
@@ -587,7 +587,7 @@ struct tier {
     // A prefill's seeds for one layer (seed_routes before its prepare): the layer's share of the empty slots, the free
     // ones over the layers not planned yet in this prefill (what an earlier layer left rolls forward), for the experts
     // the pass routes most that no slot holds. Before the prepare leases its residents.
-    void plan_sink_seeds(const kimi_vram_request * r,int count,const std::vector<int32_t> & routes){
+    void plan_sink_seeds(const ssd_vram_request * r,int count,const std::vector<int32_t> & routes){
         sink_seed_slot.assign(size_t(count),-1);
         sink_seed_pending.assign(size_t(count),0);
         if(!count || routes.size()!=size_t(count) || !table)return;
@@ -670,7 +670,7 @@ struct tier {
             else{table->cancel_cold_prefill(size_t(s.slot),s.key);++cancelled;}
         }
         seeds_published+=published;seeds_cancelled+=cancelled;
-        std::fprintf(stderr,"[kimi_vram_seed] event=publish layers=%zu seeded=%zu cancelled=%zu slots=%zu copies=%llu bytes=%llu wait_us=%.0f\n",
+        std::fprintf(stderr,"[ssd_vram_seed] event=publish layers=%zu seeded=%zu cancelled=%zu slots=%zu copies=%llu bytes=%llu wait_us=%.0f\n",
             seed_planned.size(),published,cancelled,table->slots.size(),(unsigned long long)seed_copies,(unsigned long long)seed_bytes,
             seed_wait_us);
         seeds.clear();
@@ -679,12 +679,12 @@ struct tier {
         if(!elastic_active || !count || count>elastic_block_slots || slot_locations.size()+count>max_slots)return false;
         ++malloc_calls;
         if(fail_malloc_at && malloc_calls==fail_malloc_at){
-            std::fprintf(stderr,"[kimi_vram_elastic] event=grow status=injected_fail reason=%s call=%llu slots=%zu\n",
+            std::fprintf(stderr,"[ssd_vram_elastic] event=grow status=injected_fail reason=%s call=%llu slots=%zu\n",
                 reason,(unsigned long long)malloc_calls,count);return false;
         }
         char * data=nullptr;const size_t bytes=count*stride;
         cuda_check(cudaSetDevice(device));const cudaError_t rc=allocate_dram(&data,bytes);
-        if(rc!=cudaSuccess){(void)cudaGetLastError();std::fprintf(stderr,"[kimi_vram_elastic] event=grow status=oom reason=%s slots=%zu bytes=%zu\n",reason,count,bytes);return false;}
+        if(rc!=cudaSuccess){(void)cudaGetLastError();std::fprintf(stderr,"[ssd_vram_elastic] event=grow status=oom reason=%s slots=%zu bytes=%zu\n",reason,count,bytes);return false;}
         const size_t first=slot_locations.size();
         blocks.push_back({data,first,count});
         for(size_t i=0;i<count;++i)slot_locations.push_back(data+i*stride);
@@ -764,7 +764,7 @@ struct tier {
         slot_locations.resize(block.first_slot);blocks.pop_back();capacity_bytes-=block.slot_count*stride;publish_storage();
         if(reactive){++reactive_blocks;if(block.first_slot<base_slots)++base_blocks_reclaimed;}
         else if(!std::strcmp(reason,"prefill"))++proactive_blocks;
-        std::fprintf(stderr,"[kimi_vram_elastic] event=shrink status=pass reason=%s generation=%llu class=%s freed_slots=%zu freed_bytes=%zu moved=%zu slots=%zu blocks=%zu\n",
+        std::fprintf(stderr,"[ssd_vram_elastic] event=shrink status=pass reason=%s generation=%llu class=%s freed_slots=%zu freed_bytes=%zu moved=%zu slots=%zu blocks=%zu\n",
             reason,(unsigned long long)phase_generation,block.first_slot>=base_slots?"elastic":"base",block.slot_count,
             block.slot_count*stride,moved,slot_locations.size(),blocks.size());
         return true;
@@ -800,7 +800,7 @@ struct tier {
         // not stop a reclaim (reclaim_last_block waits for them and aborts the ones in the freed block).
         if(busy()){
             ++live_reclaim_refusals;
-            std::fprintf(stderr,"[kimi_vram_elastic] event=reactive_reclaim status=live generation=%llu request_bytes=%zu refusals=%llu\n",
+            std::fprintf(stderr,"[ssd_vram_elastic] event=reactive_reclaim status=live generation=%llu request_bytes=%zu refusals=%llu\n",
                 (unsigned long long)phase_generation,requested,(unsigned long long)live_reclaim_refusals);
             owed=owed || later;
             return later;
@@ -809,7 +809,7 @@ struct tier {
         const size_t before=capacity_bytes;
         if(!reclaim_last_block("oom",true))return 0;
         *freed=before-capacity_bytes;
-        std::fprintf(stderr,"[kimi_vram_elastic] event=reactive_reclaim status=pass generation=%llu request_bytes=%zu freed_bytes=%zu below_base=%d\n",
+        std::fprintf(stderr,"[ssd_vram_elastic] event=reactive_reclaim status=pass generation=%llu request_bytes=%zu freed_bytes=%zu below_base=%d\n",
             (unsigned long long)phase_generation,requested,*freed,slot_locations.size()<base_slots?1:0);
         return 1;
     }
@@ -828,7 +828,7 @@ struct tier {
         max_slots=logical_max;
         if(elastic_max_slots)max_slots=std::min(max_slots,std::max(base_slots,elastic_max_slots));
         if(!elastic_active){
-            if(elastic_requested)std::fprintf(stderr,"[kimi_vram_elastic] event=disabled global_pool=%d keep_across_requests=%d\n",int(global),int(keep_across_requests));
+            if(elastic_requested)std::fprintf(stderr,"[ssd_vram_elastic] event=disabled global_pool=%d keep_across_requests=%d\n",int(global),int(keep_across_requests));
             return;
         }
         blocks.reserve((max_slots+elastic_block_slots-1)/elastic_block_slots);
@@ -843,7 +843,7 @@ struct tier {
             const size_t count=std::min(elastic_block_slots,base_slots-slot_locations.size());
             if(allocate_block(count,"base"))continue;
             if(blocks.empty())throw std::runtime_error("elastic VRAM base allocation failed");
-            std::fprintf(stderr,"[kimi_vram_elastic] event=base_short planned_slots=%zu slots=%zu blocks=%zu\n",
+            std::fprintf(stderr,"[ssd_vram_elastic] event=base_short planned_slots=%zu slots=%zu blocks=%zu\n",
                 base_slots,slot_locations.size(),blocks.size());
             base_slots=slot_locations.size();
             if(table)table->resize_global(base_slots);
@@ -868,7 +868,7 @@ struct tier {
         reclaimer_armed=true;
         const uint64_t safety=uint64_t(elastic_safety_blocks)*uint64_t(elastic_block_slots)*uint64_t(stride)+
             uint64_t(elastic_safety_mib)*uint64_t(1U<<20);
-        std::fprintf(stderr,"[kimi_vram_elastic] event=prefill_armed generation=%llu policy=%s free_before=%zu safety_bytes=%llu slots_before=%zu slots_after=%zu planned_blocks=%zu blocks=%zu base_slots=%zu\n",
+        std::fprintf(stderr,"[ssd_vram_elastic] event=prefill_armed generation=%llu policy=%s free_before=%zu safety_bytes=%llu slots_before=%zu slots_after=%zu planned_blocks=%zu blocks=%zu base_slots=%zu\n",
             (unsigned long long)phase_generation,elastic_demand_reclaim?"demand":"base",phase_free_before,
             (unsigned long long)safety,phase_slots_before,slot_locations.size(),planned_blocks,blocks.size(),base_slots);
     }
@@ -901,7 +901,7 @@ struct tier {
         owed=owed_hold=false;
         ++grow_events;
         decode_growth_done=true;
-        std::fprintf(stderr,"[kimi_vram_elastic] event=decode_grow generation=%llu status=pass epoch=%llu token=%llu decode_token=%llu us=%.0f before_slots=%zu target_slots=%zu after_slots=%zu added_slots=%zu blocks=%zu free_before=%zu safety_blocks=%zu safety_mib=%zu safety_bytes=%llu\n",
+        std::fprintf(stderr,"[ssd_vram_elastic] event=decode_grow generation=%llu status=pass epoch=%llu token=%llu decode_token=%llu us=%.0f before_slots=%zu target_slots=%zu after_slots=%zu added_slots=%zu blocks=%zu free_before=%zu safety_blocks=%zu safety_mib=%zu safety_bytes=%llu\n",
             (unsigned long long)phase_generation,(unsigned long long)epoch,(unsigned long long)token,
             (unsigned long long)phase_decode_tokens,micros(start),before,target,slot_locations.size(),slot_locations.size()-before,
             blocks.size(),free_bytes,elastic_safety_blocks,elastic_safety_mib,(unsigned long long)safety);
@@ -934,7 +934,7 @@ struct tier {
         if(free_bytes<low){
             if(blocks.size()>1 && (unified?reclaim_last_block("watermark",false):free_last_block("watermark",false))){
                 ++watermark_shrinks;
-                std::fprintf(stderr,"[kimi_vram_elastic] event=watermark_shrink token=%llu free_before=%zu low_bytes=%zu slots=%zu shrinks=%llu\n",
+                std::fprintf(stderr,"[ssd_vram_elastic] event=watermark_shrink token=%llu free_before=%zu low_bytes=%zu slots=%zu shrinks=%llu\n",
                     (unsigned long long)token,free_bytes,low,slot_locations.size(),(unsigned long long)watermark_shrinks);
             }
             return;
@@ -950,7 +950,7 @@ struct tier {
         }
         if(slot_locations.size()>before){
             ++watermark_grows;
-            std::fprintf(stderr,"[kimi_vram_elastic] event=watermark_grow token=%llu free_before=%zu high_bytes=%zu added_slots=%zu slots=%zu grows=%llu\n",
+            std::fprintf(stderr,"[ssd_vram_elastic] event=watermark_grow token=%llu free_before=%zu high_bytes=%zu added_slots=%zu slots=%zu grows=%llu\n",
                 (unsigned long long)token,free_bytes,high,slot_locations.size()-before,slot_locations.size(),(unsigned long long)watermark_grows);
         }
     }
@@ -974,15 +974,15 @@ struct tier {
         const cudaError_t rc=allocate_dram(&prefill_transient_arena,bytes);
         if(rc==cudaSuccess){
             prefill_transient_bytes=bytes;
-            std::fprintf(stderr,"[kimi_vram_prefill_scratch] status=ready bytes=%zu slots=%zu ram_min_routes=%zu ssd_min_routes=%zu displacement_slots=0\n",
+            std::fprintf(stderr,"[ssd_vram_prefill_scratch] status=ready bytes=%zu slots=%zu ram_min_routes=%zu ssd_min_routes=%zu displacement_slots=0\n",
                 bytes,slots,size_t(0),size_t(0));
         }else{
             (void)cudaGetLastError();
-            std::fprintf(stderr,"[kimi_vram_prefill_scratch] status=unavailable bytes=%zu slots=%zu ram_min_routes=%zu ssd_min_routes=%zu error=%s fallback=cpu\n",
+            std::fprintf(stderr,"[ssd_vram_prefill_scratch] status=unavailable bytes=%zu slots=%zu ram_min_routes=%zu ssd_min_routes=%zu error=%s fallback=cpu\n",
                 bytes,slots,size_t(0),size_t(0),cudaGetErrorString(rc));
         }
     }
-    // The storage at load (kimi_vram_elastic_api reserve), so that the first request's prefill has a tier to seed.
+    // The storage at load (ssd_vram_elastic_api reserve), so that the first request's prefill has a tier to seed.
     // Unified memory grows it into mem_info there, as the first decode token would grow it, and the page population
     // leaves the request path; only the first prefill's graph and workspace are taken back and regrown at the token
     // boundary after its first decode step, as for every later request. A discrete card cannot give way to the device
@@ -991,7 +991,7 @@ struct tier {
     // card at the first phase boundary after a prefill pass showed that memory had stopped moving (observe_settle),
     // or at the first decode token at the latest. Only an automatic elastic tier starts from one block: a byte budget
     // is its base, taken at the first decode token as before.
-    void reserve(const kimi_vram_request & r,const kimi_vram_expert_format & f){
+    void reserve(const ssd_vram_request & r,const ssd_vram_expert_format & f){
         if(table || has_storage())return;
         const auto & q=ggml_memory_query::instance();
         int current=device;
@@ -1006,7 +1006,7 @@ struct tier {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         grow_decode_locked(start);
     }
-    // At load, after the load's passes (kimi_vram_elastic_api preload_slots): a tier made at load whose memory settled
+    // At load, after the load's passes (ssd_vram_elastic_api preload_slots): a tier made at load whose memory settled
     // in them grows into the card first, as the first request's begin would have grown it; then the slots no entry
     // holds, which preload may fill.
     size_t preload_slots(){
@@ -1015,10 +1015,10 @@ struct tier {
         if(elastic_active && growth_deferred && settled)grow_decode_locked();
         return table->empty_slots();
     }
-    // At load (kimi_vram_elastic_api preload): one expert no request has named into an empty slot, its three roles
+    // At load (ssd_vram_elastic_api preload): one expert no request has named into an empty slot, its three roles
     // copied from host memory (data, as the layer's format lays them out), the entry preloaded (vram-slot-table.h).
     // False when no slot is empty or the tier holds the expert already.
-    bool preload(const kimi_vram_request & r,const void * const * data){
+    bool preload(const ssd_vram_request & r,const void * const * data){
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         if(!table || !has_storage() || poisoned || active || prefill_live)return false;
         const expert_format * x=format_of(r.layer);
@@ -1099,8 +1099,8 @@ struct tier {
         ticket.commit();
         group_rows=rows;
         {vram_group_geometry reserved={};group_api->geometry(group,&reserved);group_fixed_bytes=size_t(reserved.fixed_bytes);}
-        kimi_vram_prefill_lane l={};lane(l);
-        std::fprintf(stderr,"[kimi_vram_prefill_engine] format=%s engine=batched in_place=%d route_bytes=%llu token_bytes=%llu "
+        ssd_vram_prefill_lane l={};lane(l);
+        std::fprintf(stderr,"[ssd_vram_prefill_engine] format=%s engine=batched in_place=%d route_bytes=%llu token_bytes=%llu "
             "output_bytes=%llu fixed_bytes=%llu bytes_per_token=%llu reserved_rows=%d device_bytes=%zu host_bytes=%zu\n",
             format_names().c_str(),l.in_place,
             (unsigned long long)l.route_bytes,(unsigned long long)l.token_bytes,(unsigned long long)l.output_bytes,
@@ -1130,7 +1130,7 @@ struct tier {
                     throw std::runtime_error("prefill scratch release has pending work");
                 scratch=prefill_transient_arena;prefill_transient_arena=nullptr;}
             cuda_check(cudaSetDevice(device));cuda_check(free_dram(scratch,prefill_transient_bytes));
-            std::fprintf(stderr,"[kimi_vram_prefill_scratch] status=released bytes=%zu phase=decode\n",prefill_transient_bytes);
+            std::fprintf(stderr,"[ssd_vram_prefill_scratch] status=released bytes=%zu phase=decode\n",prefill_transient_bytes);
             prefill_transient_bytes=0;publish_storage();
         }
         if(!elastic_active)return;
@@ -1148,7 +1148,7 @@ struct tier {
         if(decode && !decode_growth_done && !unified)grow_decode_locked();
         else {
             size_t free_bytes=0,total=0;cuda_check(cudaSetDevice(device));mem_info(&free_bytes,&total);
-            std::fprintf(stderr,"[kimi_vram_elastic] event=prefill_disarmed generation=%llu policy=%s free_before=%zu free_after=%zu slots_before=%zu slots_after=%zu actual_reactive_blocks=%llu base_blocks_reclaimed=%llu allocation_retries=%llu blocks=%zu\n",
+            std::fprintf(stderr,"[ssd_vram_elastic] event=prefill_disarmed generation=%llu policy=%s free_before=%zu free_after=%zu slots_before=%zu slots_after=%zu actual_reactive_blocks=%llu base_blocks_reclaimed=%llu allocation_retries=%llu blocks=%zu\n",
                 (unsigned long long)phase_generation,elastic_demand_reclaim?"demand":"base",phase_free_before,free_bytes,
                 phase_slots_before,slot_locations.size(),(unsigned long long)(reactive_blocks-phase_reactive_start),
                 (unsigned long long)(base_blocks_reclaimed-phase_base_reclaimed_start),
@@ -1454,7 +1454,7 @@ struct tier {
                 const double us=locked[i]?(timed?1e3*double(ms):0.0):staged_us[i];
                 prefill_job_stats.transient_dma_us+=timed?1e3*double(ms):us;
                 prefill_job_stats.transient_upload_us+=us;prefill_job_stats.transient_upload_bytes+=moved_bytes(F);
-                if(prefill_transient[i].source==KIMI_VRAM_PREFILL_TRANSIENT_RAM){
+                if(prefill_transient[i].source==SSD_VRAM_PREFILL_TRANSIENT_RAM){
                     prefill_job_stats.ram_transient_upload_us+=us;prefill_job_stats.ram_transient_upload_bytes+=moved_bytes(F);
                 }else{
                     prefill_job_stats.ssd_transient_upload_us+=us;prefill_job_stats.ssd_transient_upload_bytes+=moved_bytes(F);
@@ -1469,7 +1469,7 @@ struct tier {
         }
     }
     // One-token passes on the vector engine: the tier returns an expert's down row unweighted, and a layer with a
-    // per-expert post norm normalizes it as the CPU does (ggml-cpu/ssd/cpu-sink-internal.h, kimi_cpu_sink_normalize_expert)
+    // per-expert post norm normalizes it as the CPU does (ggml-cpu/ssd/cpu-sink-internal.h, ssd_cpu_sink_normalize_expert)
     // before the routing weight.
     void post_norm_row(float * values){
         if(prefill_post_norm.empty())return;
@@ -1555,7 +1555,7 @@ struct tier {
                     prefill_job_stats.transient_dma_us+=upload_elapsed;prefill_job_stats.transient_wait_us+=upload_elapsed;
                     prefill_job_stats.transient_upload_us+=upload_elapsed;
                     prefill_job_stats.transient_upload_bytes+=moved_bytes(F);
-                    if(transient.source==KIMI_VRAM_PREFILL_TRANSIENT_RAM){
+                    if(transient.source==SSD_VRAM_PREFILL_TRANSIENT_RAM){
                         prefill_job_stats.ram_transient_upload_us+=upload_elapsed;
                         prefill_job_stats.ram_transient_upload_bytes+=moved_bytes(F);
                     }else{
@@ -1648,7 +1648,7 @@ struct tier {
                 throw std::runtime_error("GPU tier threads could not be placed on the CPUs the sink gave them");
         ssd::platform::cpu_list cpus=thread_cpus;
         if(cpus.empty())ssd::platform::current_thread_cpus(cpus); // their starter's, which they inherit
-        std::fprintf(stderr,"[kimi_vram_tier] event=threads cpus=%zu first_cpu=%d\n",cpus.size(),cpus.empty()?-1:cpus.front());
+        std::fprintf(stderr,"[ssd_vram_tier] event=threads cpus=%zu first_cpu=%d\n",cpus.size(),cpus.empty()?-1:cpus.front());
     }
     // The upload's cost before the first admission, so that admissions are priced from the second decode token,
     // once the first token's misses are measured: one slot's roles copied, as an admission copies them, from pageable
@@ -1668,7 +1668,7 @@ struct tier {
         }
         upload_us_per_expert=us;
         {std::lock_guard<std::mutex> lock(mutex);pageable_copies.add(double(stride)/1e6,us);}
-        std::fprintf(stderr,"[kimi_vram_admission] event=upload_probe upload_us=%.1f bytes=%zu\n",us,stride);
+        std::fprintf(stderr,"[ssd_vram_admission] event=upload_probe upload_us=%.1f bytes=%zu\n",us,stride);
     }
     void copy_upload(const upload_job & job){
         const bool locked=!job.borrow && page_locked(job.data[0]);
@@ -1689,15 +1689,15 @@ struct tier {
         return attr.type==cudaMemoryTypeHost;
     }
     // Entry i of a declaration's layer list: its layer's types, or the call's where the declaration lists none.
-    static int declared_weight(const kimi_vram_expert_format & f,int i){return f.layer_weight_types?f.layer_weight_types[i]:f.weight_type;}
-    static int declared_down(const kimi_vram_expert_format & f,int i){return f.layer_down_types?f.layer_down_types[i]:f.down_type;}
+    static int declared_weight(const ssd_vram_expert_format & f,int i){return f.layer_weight_types?f.layer_weight_types[i]:f.weight_type;}
+    static int declared_down(const ssd_vram_expert_format & f,int i){return f.layer_down_types?f.layer_down_types[i]:f.down_type;}
     // The first call's declaration: the formats, in the order their layers come, each its role bytes as the pack pads
     // them, and every listed layer's. Slots take the largest expert.
-    void declare(const kimi_vram_expert_format & f){
-        std::vector<expert_format> found;std::vector<int> map(KIMI_VRAM_MAX_LAYERS,-1);
+    void declare(const ssd_vram_expert_format & f){
+        std::vector<expert_format> found;std::vector<int> map(SSD_VRAM_MAX_LAYERS,-1);
         for(int i=0;i<f.n_layers;++i){
             const int layer=f.layers[i],w=declared_weight(f,i),d=declared_down(f,i);
-            if(layer<0 || layer>=KIMI_VRAM_MAX_LAYERS || map[size_t(layer)]>=0)throw std::runtime_error("invalid VRAM expert layer list");
+            if(layer<0 || layer>=SSD_VRAM_MAX_LAYERS || map[size_t(layer)]>=0)throw std::runtime_error("invalid VRAM expert layer list");
             if(w<0 || w>=int(GGML_TYPE_COUNT) || d<0 || d>=int(GGML_TYPE_COUNT) || ggml_blck_size(ggml_type(w))<=0 ||
                     ggml_blck_size(ggml_type(d))<=0 || f.latent%ggml_blck_size(ggml_type(w)) || f.hidden%ggml_blck_size(ggml_type(d)))
                 throw std::runtime_error("invalid VRAM expert format of layer "+std::to_string(layer));
@@ -1720,8 +1720,8 @@ struct tier {
     }
     // A later call's declaration against the first's, and the call's layer's format selected: the one the layer's
     // jobs run with until the next layer is prepared.
-    void adopt(const kimi_vram_request & r,const kimi_vram_expert_format & f){
-        if(!f.layers || f.n_layers<=0 || f.n_layers>KIMI_VRAM_MAX_LAYERS || f.n_experts<=0 || f.n_experts>65536 ||
+    void adopt(const ssd_vram_request & r,const ssd_vram_expert_format & f){
+        if(!f.layers || f.n_layers<=0 || f.n_layers>SSD_VRAM_MAX_LAYERS || f.n_experts<=0 || f.n_experts>65536 ||
                 f.latent<=0 || f.hidden<=0 || f.latent>16384 || f.hidden>16384 ||
                 f.weight_type<0 || f.weight_type>=int(GGML_TYPE_COUNT) || f.down_type<0 || f.down_type>=int(GGML_TYPE_COUNT) ||
                 (!f.layer_weight_types)!=(!f.layer_down_types))
@@ -1745,14 +1745,14 @@ struct tier {
     }
     // Geometry comes from the expert tensors and the owner's layer list;
     // the explicit-format engines share the slot, upload and lease lifecycle.
-    void initialize_format(const kimi_vram_request * r,const kimi_vram_expert_format & f,bool allocate_cache=true){
+    void initialize_format(const ssd_vram_request * r,const ssd_vram_expert_format & f,bool allocate_cache=true){
         adopt(*r,f);
         if(!format_mode){
             if(device<0)cuda_check(cudaGetDevice(&device));else cuda_check(cudaSetDevice(device));
             detect_unified();
             // the generic engine serves every format the CUDA backend has a matrix-vector kernel for, and refuses the
             // others when it is created
-            format_api=kimi_vram_generic_format_compute_get_api();
+            format_api=ssd_vram_generic_format_compute_get_api();
             if(!format_api || format_api->version!=4 || format_api->size!=sizeof(*format_api) || !format_api->create ||
                     !format_api->destroy || !format_api->compute || !format_api->device_scratch_bytes || !format_api->host_scratch_bytes ||
                     !format_api->launch || !format_api->host_rows)
@@ -1769,7 +1769,7 @@ struct tier {
             place_threads();
             // The batched prefill engine, one for all the formats. Formats the CUDA backend's products do not serve keep
             // the CPU for their grouped prefill.
-            group_api=kimi_vram_group_compute_get_api();
+            group_api=ssd_vram_group_compute_get_api();
             if(!group_api || group_api->version!=3 || group_api->size!=sizeof(*group_api) || !group_api->create ||
                     !group_api->reserve || !group_api->release || !group_api->begin_layer || !group_api->compute ||
                     !group_api->finish_layer || !group_api->input_rows || !group_api->geometry || !group_api->destroy ||
@@ -1780,7 +1780,7 @@ struct tier {
             char error[512]={};
             group_fixed_bytes=0; // a new engine, maybe of another format: nothing measured it yet
             group=group_api->create(device,latent,hidden,int(formats.size()),weights.data(),downs.data(),error,sizeof(error));
-            if(!group)std::fprintf(stderr,"[kimi_vram_prefill_engine] status=unavailable format=%s error=%s fallback=cpu\n",
+            if(!group)std::fprintf(stderr,"[ssd_vram_prefill_engine] status=unavailable format=%s error=%s fallback=cpu\n",
                 format_names().c_str(),error);
             publish_engine_held();
         }
@@ -1809,7 +1809,7 @@ struct tier {
         const size_t count=initial_slots(free_bytes,logical_max,global);
         base_slots=count;
         table=std::make_unique<vram_slot_table>(count,priority,configuration.count_policy,configuration.min_count,
-                global,configuration.half_life,0,KIMI_VRAM_MAX_LAYERS-1,n_experts);
+                global,configuration.half_life,0,SSD_VRAM_MAX_LAYERS-1,n_experts);
         table->ram_holds=ram_holds;table->ram_holds_arg=ram_holds_arg;
         configure_elastic(global,logical_max);
         memory_sample("before_allocate");
@@ -1826,7 +1826,7 @@ struct tier {
         else if(elastic_active && active)phase_decode_tokens=1;
         report("allocated");
     }
-    void prepare_format(const kimi_vram_request * r,int count,const kimi_vram_expert_format * f,int * slots){
+    void prepare_format(const ssd_vram_request * r,int count,const ssd_vram_expert_format * f,int * slots){
         if(count<0 || count>16 || (count && (!r || !slots)) || !f)throw std::runtime_error("VRAM request count");
         if(count)std::fill(slots,slots+count,-1);
         if(!active || !count)return;
@@ -1838,12 +1838,12 @@ struct tier {
         table->prepare(r,count);std::copy(table->hits.begin(),table->hits.end(),slots);
         for(int slot:table->hits){gpu_hits+=slot>=0;cpu_requests+=slot<0;}
     }
-    void launch_activation(const void * q,size_t bytes,const kimi_vram_activation * a){
+    void launch_activation(const void * q,size_t bytes,const ssd_vram_activation * a){
         if(!active || !table || !table->in_flight)return;
         if(!format_mode || !q || !a)throw std::runtime_error("explicit-format VRAM launch without its format");
         // the engine takes the f32 input row
         if(bytes!=size_t(latent)*sizeof(float))throw std::runtime_error("VRAM input bytes");
-        if(a->kind!=KIMI_VRAM_ACTIVATION_SITU && a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP && a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU)
+        if(a->kind!=SSD_VRAM_ACTIVATION_SITU && a->kind!=SSD_VRAM_ACTIVATION_SWIGLU_CLAMP && a->kind!=SSD_VRAM_ACTIVATION_SWIGLU)
             throw std::runtime_error("VRAM activation kind");
         {std::lock_guard<std::mutex> lock(mutex);if(!calls.empty())throw std::runtime_error("GPU job already outstanding");failure.clear();}
         work.clear();output_rows.clear();
@@ -1923,7 +1923,7 @@ struct tier {
         for(auto & c:calls)return_call(c);
         calls.clear();
     }
-    void admit(const kimi_vram_request & r,const void * const * data,bool borrow){
+    void admit(const ssd_vram_request & r,const void * const * data,bool borrow){
         if(!active || !table || !table->in_flight)return;
         for(size_t j=0;j<table->admissions.size();++j){
             int slot=table->admissions[j];if(slot<0 || table->slots[slot].valid || table->slots[slot].uploading || std::find(pending_uploads.begin(),pending_uploads.end(),j)!=pending_uploads.end() || !vram_slot_table::same(r,table->requests[j]))continue;
@@ -1947,7 +1947,7 @@ struct tier {
             break;
         }
     }
-    void launch_host(const kimi_vram_host_job * jobs,int count,int * accepted){
+    void launch_host(const ssd_vram_host_job * jobs,int count,int * accepted){
         if(!accepted)throw std::runtime_error("null host-memory VRAM acceptance");
         *accepted=0;
         if(count<=0 || !jobs || !active || !table || !table->in_flight || !layer_input_ready || !format_mode)return;
@@ -2036,7 +2036,7 @@ struct tier {
             while(!ok && blocks.size()>1 && reclaim_last_block("host_scratch",false))ok=attempt();
         }
         {std::lock_guard<std::mutex> lock(mutex);host_scratch_wanted=false;host_scratch_failed=!ok;if(ok)host_scratch_busy.assign(host_scratch_slots,0);}
-        std::fprintf(stderr,"[kimi_vram_host] event=scratch status=%s slots=%zu bytes=%zu tier_slots=%zu\n",ok?"ready":"unavailable",
+        std::fprintf(stderr,"[ssd_vram_host] event=scratch status=%s slots=%zu bytes=%zu tier_slots=%zu\n",ok?"ready":"unavailable",
             host_scratch_slots,bytes,slot_locations.size());
     }
     void free_host_scratch(){
@@ -2074,7 +2074,7 @@ struct tier {
         cuda_check(cudaEventDestroy(a));cuda_check(cudaEventDestroy(b));
         if(!timed || !(ms>0))return;
         locked_copies.add(double(n)/1e6,1e3*double(ms));host_probe_taken=true;
-        std::fprintf(stderr,"[kimi_vram_host] event=probe_copy where=prefill bytes=%zu us=%.0f gbs=%.2f\n",n,1e3*double(ms),double(n)/1e6/double(ms));
+        std::fprintf(stderr,"[ssd_vram_host] event=probe_copy where=prefill bytes=%zu us=%.0f gbs=%.2f\n",n,1e3*double(ms),double(n)/1e6/double(ms));
     }
     // Before a range is unregistered: a probe not started from it is dropped, one in flight is waited for. Sink thread.
     void host_unregistering(const void * pointer){
@@ -2109,17 +2109,17 @@ struct tier {
         std::lock_guard<std::mutex> lock(mutex);
         host_probe_start=host_probe_end=nullptr;host_probe=nullptr;
         if(timed && ms>0){locked_copies.add(double(bytes)/1e6,1e3*double(ms));
-            std::fprintf(stderr,"[kimi_vram_host] event=probe_copy bytes=%zu us=%.0f gbs=%.2f\n",bytes,1e3*double(ms),double(bytes)/1e6/double(ms));}
+            std::fprintf(stderr,"[ssd_vram_host] event=probe_copy bytes=%zu us=%.0f gbs=%.2f\n",bytes,1e3*double(ms),double(bytes)/1e6/double(ms));}
     }
-    // The measured lines (kimi_vram_host_costs), mutex held. The residents' call: the least-squares line of its time
+    // The measured lines (ssd_vram_host_costs), mutex held. The residents' call: the least-squares line of its time
     // against its experts (the residents of a layer vary, 1 to 6 on DeepSeek); before that varies, the shape the
     // engine has on an RTX 5090 (150 + 20 us an expert, unifybench) at the measured level. A host call runs the same
     // engine: its own time is the residents' call, and the rest per expert, fitted through the origin (in place the
     // transfer is in it). On a discrete GPU, the device targets this layer's jobs can take.
-    void costs2(kimi_vram_host_costs & c){
+    void costs2(ssd_vram_host_costs & c){
         c={};
-        kimi_prefill_fit r;for(const auto & x:resident_calls.s)r.add(x.first,x.second);
-        double a=0,b=0;kimi_prefill_fit_line(r,150.0,20.0,a,b);
+        ssd_prefill_fit r;for(const auto & x:resident_calls.s)r.add(x.first,x.second);
+        double a=0,b=0;ssd_prefill_fit_line(r,150.0,20.0,a,b);
         c.resident_call_us=a;c.resident_expert_us=b;
         double kk=0,ky=0;for(const auto & x:host_calls.s){kk+=x.first*x.first;ky+=x.first*std::max(0.0,x.second-a);}
         c.host_call_us=host_calls.s.empty()?0.0:a;c.host_expert_us=kk>0?ky/kk:0.0;
@@ -2164,7 +2164,7 @@ struct tier {
         {std::lock_guard<std::mutex> lock(mutex);release_calls();std::fill(host_scratch_busy.begin(),host_scratch_busy.end(),0);}
         table->finish();work.clear();output_rows.clear();
     }
-    void prepare_prefill(const kimi_vram_request * r,int count,const kimi_vram_expert_format * f,int * slots){
+    void prepare_prefill(const ssd_vram_request * r,int count,const ssd_vram_expert_format * f,int * slots){
         if(count<0 || (count && (!r || !slots)) || !f || f->n_experts<=0 || count>f->n_experts)
             throw std::runtime_error("invalid grouped-prefill request union");
         if(count)std::fill(slots,slots+count,-1);
@@ -2207,11 +2207,11 @@ struct tier {
     int transient_prefill_available() const{
         return format_mode && group && prefill_transient_arena && prefill_transient_bytes==stride*prefill_transient_slots;
     }
-    // The prepared layer's grouped-prefill lane (kimi_vram_prefill_api v9): one engine serves every declared format.
-    void lane(kimi_vram_prefill_lane & l) const{
+    // The prepared layer's grouped-prefill lane (ssd_vram_prefill_api v9): one engine serves every declared format.
+    void lane(ssd_vram_prefill_lane & l) const{
         l={};
         if(!format_mode || !group)return;
-        l.engine=KIMI_VRAM_PREFILL_ENGINE_BATCHED;
+        l.engine=SSD_VRAM_PREFILL_ENGINE_BATCHED;
         l.vector_tokens=vector_tokens;
         l.in_place=host_readable;l.post_norm=1;
         vram_group_geometry g={};group_api->geometry(group,&g);
@@ -2219,14 +2219,14 @@ struct tier {
         l.fixed_bytes=g.fixed_bytes;l.bytes_per_token=g.bytes_per_token;
     }
     void launch_prefill(const void * q,size_t input_stride,const int32_t * routes,const float * weights,
-            int nslots,int ntokens,const kimi_vram_prefill_transient * transient,int transient_count,
-            const kimi_vram_prefill_launch * options){
+            int nslots,int ntokens,const ssd_vram_prefill_transient * transient,int transient_count,
+            const ssd_vram_prefill_launch * options){
         if(transient_count<0 || (transient_count && !transient))throw std::runtime_error("invalid grouped-prefill transient list");
         if(!prefill_live && !transient_count)return;
         if(!q || !routes || !weights || !options || nslots<0 || nslots>16 || ntokens<1 ||
                 (nslots && ntokens>std::numeric_limits<int>::max()/nslots))
             throw std::runtime_error("invalid grouped-prefill launch");
-        const kimi_vram_activation * a=&options->activation;
+        const ssd_vram_activation * a=&options->activation;
         // a pass of more than vector_tokens tokens runs the batched engine; the post norm: the batched engine applies
         // it, and so does the vector path of a one-token pass (as decode's CPU does to the tier's unweighted rows)
         const bool batched=ntokens>vector_tokens;
@@ -2234,8 +2234,8 @@ struct tier {
         if(options->post_norm && (!std::isfinite(options->post_norm_eps) || options->post_norm_eps<=0))
             throw std::runtime_error("invalid grouped-prefill post norm");
         if(input_stride!=size_t(latent)*sizeof(float) ||
-                (a->kind!=KIMI_VRAM_ACTIVATION_SITU && a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP &&
-                 a->kind!=KIMI_VRAM_ACTIVATION_SWIGLU))
+                (a->kind!=SSD_VRAM_ACTIVATION_SITU && a->kind!=SSD_VRAM_ACTIVATION_SWIGLU_CLAMP &&
+                 a->kind!=SSD_VRAM_ACTIVATION_SWIGLU))
             throw std::runtime_error("grouped-prefill input or activation format");
         const size_t route_count=size_t(nslots)*size_t(ntokens);
         for(size_t i=0;i<route_count;++i){
@@ -2250,8 +2250,8 @@ struct tier {
                 const int request=transient[i].request_index;
                 if(request<0 || size_t(request)>=prefill_slots.size() || prefill_slots[size_t(request)]>=0)
                     throw std::runtime_error("invalid grouped-prefill transient request");
-                if(transient[i].source!=KIMI_VRAM_PREFILL_TRANSIENT_RAM &&
-                        transient[i].source!=KIMI_VRAM_PREFILL_TRANSIENT_SSD)
+                if(transient[i].source!=SSD_VRAM_PREFILL_TRANSIENT_RAM &&
+                        transient[i].source!=SSD_VRAM_PREFILL_TRANSIENT_SSD)
                     throw std::runtime_error("invalid grouped-prefill transient source");
                 for(int role=0;role<3;++role)if(!transient[i].role[role])
                     throw std::runtime_error("null grouped-prefill transient payload");
@@ -2288,7 +2288,7 @@ struct tier {
         std::vector<int8_t> transient_source(prefill_slots.size(),-1); // per request: its transient's source, or -1
         for(const auto & item:prefill_transient){
             transient_source[size_t(item.request_index)]=int8_t(item.source);
-            if(item.source==KIMI_VRAM_PREFILL_TRANSIENT_RAM)++prefill_job_stats.ram_transient_experts;
+            if(item.source==SSD_VRAM_PREFILL_TRANSIENT_RAM)++prefill_job_stats.ram_transient_experts;
             else ++prefill_job_stats.ssd_transient_experts;
         }
         for(size_t route=0;route<route_count;++route){
@@ -2297,7 +2297,7 @@ struct tier {
             if(prefill_slots[size_t(request)]>=0)++prefill_job_stats.resident_routes;
             else if(transient_source[size_t(request)]>=0){
                 ++prefill_job_stats.transient_routes;
-                if(transient_source[size_t(request)]==KIMI_VRAM_PREFILL_TRANSIENT_RAM)++prefill_job_stats.ram_transient_routes;
+                if(transient_source[size_t(request)]==SSD_VRAM_PREFILL_TRANSIENT_RAM)++prefill_job_stats.ram_transient_routes;
                 else ++prefill_job_stats.ssd_transient_routes;
             }
         }
@@ -2306,7 +2306,7 @@ struct tier {
         if(timing){launch_time=clock_type::now();++launches;}
         cv.notify_all();
     }
-    void finish_prefill(float * output,size_t output_stride,kimi_vram_prefill_stats * stats){
+    void finish_prefill(float * output,size_t output_stride,ssd_vram_prefill_stats * stats){
         if(!prefill_live)return;
         const auto finish_start=timing?clock_type::now():clock_type::time_point{};
         drain();if(timing)finish_drain_us+=micros(finish_start);
@@ -2330,7 +2330,7 @@ struct tier {
         if(prefill_generation)table->release_ready(prefill_generation);
         if(stats)*stats=prefill_job_stats;
         if(prefill_job_stats.transient_experts)std::fprintf(stderr,
-            "[kimi_vram_prefill_transient] experts=%llu routes=%llu upload_bytes=%llu upload_us=%.3f "
+            "[ssd_vram_prefill_transient] experts=%llu routes=%llu upload_bytes=%llu upload_us=%.3f "
             "ram_experts=%llu ram_routes=%llu ram_upload_bytes=%llu ram_upload_us=%.3f "
             "ssd_experts=%llu ssd_routes=%llu ssd_upload_bytes=%llu ssd_upload_us=%.3f "
             "worker_us=%.3f scratch_bytes=%zu displacement_slots=0\n",
@@ -2359,8 +2359,8 @@ struct tier {
         prefill_live=false;prefill_generation=0;prefill_slots.clear();prefill_input.clear();
         prefill_routes.clear();prefill_weights.clear();prefill_output.clear();prefill_transient.clear();work.clear();output_rows.clear();
     }
-    // Deferred path (kimi_vram_deferred_api): like a borrowed async admit, but the upload may outlive finish.
-    void admit_deferred(const kimi_vram_request & r,const void * const * data,int * queued){
+    // Deferred path (ssd_vram_deferred_api): like a borrowed async admit, but the upload may outlive finish.
+    void admit_deferred(const ssd_vram_request & r,const void * const * data,int * queued){
         if(!queued)throw std::runtime_error("null deferred VRAM admission result");
         *queued=0;
         if(!deferred_upload)throw std::runtime_error("deferred VRAM upload is off in the tier");
@@ -2388,19 +2388,19 @@ struct tier {
             break;
         }
     }
-    // wait_layer: a layer to wait for, or KIMI_VRAM_COLLECT_ALL, _NONE or _IF_IDLE (kimi_vram_deferred_api).
-    void collect(int32_t wait_layer,kimi_vram_request * out,int32_t * aborted,int capacity,int * count){
-        if(!count || capacity<0 || (capacity && (!out || !aborted)) || wait_layer<KIMI_VRAM_COLLECT_IF_IDLE)throw std::runtime_error("invalid deferred VRAM collect");
+    // wait_layer: a layer to wait for, or SSD_VRAM_COLLECT_ALL, _NONE or _IF_IDLE (ssd_vram_deferred_api).
+    void collect(int32_t wait_layer,ssd_vram_request * out,int32_t * aborted,int capacity,int * count){
+        if(!count || capacity<0 || (capacity && (!out || !aborted)) || wait_layer<SSD_VRAM_COLLECT_IF_IDLE)throw std::runtime_error("invalid deferred VRAM collect");
         *count=0;
         if(!deferred_upload)throw std::runtime_error("deferred VRAM upload is off in the tier");
         if(table && (table->in_flight || table->lease_generation)){
-            if(wait_layer==KIMI_VRAM_COLLECT_IF_IDLE)return;
+            if(wait_layer==SSD_VRAM_COLLECT_IF_IDLE)return;
             throw std::runtime_error("deferred VRAM collect inside a layer or a residency lease");
         }
         std::unique_lock<std::mutex> lock(mutex);
         const auto copying=[&]{return std::any_of(deferred.begin(),deferred.end(),[&](const deferred_job & d){
-            return !d.completed && (wait_layer==KIMI_VRAM_COLLECT_ALL || d.key.layer==wait_layer);});};
-        if((wait_layer>=0 || wait_layer==KIMI_VRAM_COLLECT_ALL) && copying()){
+            return !d.completed && (wait_layer==SSD_VRAM_COLLECT_ALL || d.key.layer==wait_layer);});};
+        if((wait_layer>=0 || wait_layer==SSD_VRAM_COLLECT_ALL) && copying()){
             ++deferred_layer_waits;const auto t=clock_type::now();
             cv.wait(lock,[&]{return !copying();});
             deferred_wait_us+=micros(t);
@@ -2430,7 +2430,7 @@ struct tier {
 };
 int fail(tier * t,char * error,size_t size,const std::exception & e){
     if(size)std::snprintf(error,size,"%s",e.what());
-    try{t->release();}catch(const std::exception & drain_error){std::fprintf(stderr,"[kimi_vram_tier] cannot drain after %s: %s\n",e.what(),drain_error.what());std::abort();}
+    try{t->release();}catch(const std::exception & drain_error){std::fprintf(stderr,"[ssd_vram_tier] cannot drain after %s: %s\n",e.what(),drain_error.what());std::abort();}
     return 1;
 }
 // Retired C ABI slots use only a static message before draining. Allocation or
@@ -2439,8 +2439,8 @@ int reject_implicit_format(void * p,char * error,size_t size,const char * messag
     if(error && size)std::snprintf(error,size,"%s",message);
     if(p){
         try{static_cast<tier *>(p)->release();}
-        catch(const std::exception & e){std::fprintf(stderr,"[kimi_vram_tier] cannot drain after %s: %s\n",message,e.what());std::abort();}
-        catch(...){std::fprintf(stderr,"[kimi_vram_tier] cannot drain after %s: unknown exception\n",message);std::abort();}
+        catch(const std::exception & e){std::fprintf(stderr,"[ssd_vram_tier] cannot drain after %s: %s\n",message,e.what());std::abort();}
+        catch(...){std::fprintf(stderr,"[ssd_vram_tier] cannot drain after %s: unknown exception\n",message);std::abort();}
     }
     return 1;
 }
@@ -2450,41 +2450,41 @@ void * api_create(uint64_t, char * error, size_t size) noexcept {
 }
 void api_destroy(void * p){delete static_cast<tier *>(p);}
 int api_begin(void * p,uint64_t epoch,uint64_t token,int decode,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->begin(epoch,token,decode);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
-int api_prepare(void * p,const kimi_vram_request *,int,int,int,int *,char * e,size_t n){return reject_implicit_format(p,e,n,"implicit expert format retired; use explicit-format prepare");}
+int api_prepare(void * p,const ssd_vram_request *,int,int,int,int *,char * e,size_t n){return reject_implicit_format(p,e,n,"implicit expert format retired; use explicit-format prepare");}
 int api_launch(void * p,const void *,size_t,float,float,char * e,size_t n){return reject_implicit_format(p,e,n,"implicit expert format retired; use explicit-format launch");}
-int api_admit(void * p,const kimi_vram_request * r,const void * up,const void * gate,const void * down,int borrow,char * e,size_t n){auto * t=static_cast<tier *>(p);try{const void * data[]={up,gate,down};t->admit(*r,data,borrow!=0);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+int api_admit(void * p,const ssd_vram_request * r,const void * up,const void * gate,const void * down,int borrow,char * e,size_t n){auto * t=static_cast<tier *>(p);try{const void * data[]={up,gate,down};t->admit(*r,data,borrow!=0);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int api_finish(void * p,float * output,size_t stride,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->finish(output,stride);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int api_cancel(void * p,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->release();return 0;}catch(const std::exception & x){if(n)std::snprintf(e,n,"%s",x.what());return 1;}}
-int deferred_admit(void * p,const kimi_vram_request * r,const void * up,const void * gate,const void * down,int * queued,char * e,size_t n){
+int deferred_admit(void * p,const ssd_vram_request * r,const void * up,const void * gate,const void * down,int * queued,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{if(!r)throw std::runtime_error("null deferred VRAM admission");const void * data[]={up,gate,down};t->admit_deferred(*r,data,queued);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
-int deferred_collect(void * p,int32_t wait_layer,kimi_vram_request * out,int32_t * aborted,int capacity,int * count,char * e,size_t n){
+int deferred_collect(void * p,int32_t wait_layer,ssd_vram_request * out,int32_t * aborted,int capacity,int * count,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->collect(wait_layer,out,aborted,capacity,count);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int deferred_wait(void * p,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->wait_deferred();return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int elastic_phase_complete(void * p,int decode,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->phase_complete(decode!=0);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int elastic_reserve_accumulate(void * p,int tokens,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->reserve_prefill_engine(tokens);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
-int elastic_reserve(void * p,const kimi_vram_request * r,const kimi_vram_expert_format * f,char * e,size_t n){
+int elastic_reserve(void * p,const ssd_vram_request * r,const ssd_vram_expert_format * f,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{if(!r || !f)throw std::runtime_error("null VRAM reserve geometry");t->reserve(*r,*f);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int elastic_preload_slots(void * p,int * slots,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{if(!slots)throw std::runtime_error("null VRAM preload count");
         *slots=int(std::min<size_t>(t->preload_slots(),size_t(INT32_MAX)));return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
-int elastic_preload(void * p,const kimi_vram_request * r,const void * up,const void * gate,const void * down,int * copied,
+int elastic_preload(void * p,const ssd_vram_request * r,const void * up,const void * gate,const void * down,int * copied,
         char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{if(!r || !copied)throw std::runtime_error("null VRAM preload");
         const void * data[3]={up,gate,down};*copied=t->preload(*r,data)?1:0;return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
-int format_prepare(void * p,const kimi_vram_request * r,int count,const kimi_vram_expert_format * f,int * slots,char * e,size_t n){
+int format_prepare(void * p,const ssd_vram_request * r,int count,const ssd_vram_expert_format * f,int * slots,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->prepare_format(r,count,f,slots);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
-int format_launch(void * p,const void * q,size_t bytes,const kimi_vram_activation * a,char * e,size_t n){
+int format_launch(void * p,const void * q,size_t bytes,const ssd_vram_activation * a,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->launch_activation(q,bytes,a);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
-int prefill_prepare(void * p,const kimi_vram_request * r,int count,const kimi_vram_expert_format * f,int * slots,char * e,size_t n){
+int prefill_prepare(void * p,const ssd_vram_request * r,int count,const ssd_vram_expert_format * f,int * slots,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->prepare_prefill(r,count,f,slots);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int prefill_transient_available(void * p){return p?static_cast<tier *>(p)->transient_prefill_available():0;}
 int prefill_launch(void * p,const void * q,size_t stride,const int32_t * routes,const float * weights,
-        int nslots,int ntokens,const kimi_vram_prefill_transient * transient,int transient_count,
-        const kimi_vram_prefill_launch * options,char * e,size_t n){
+        int nslots,int ntokens,const ssd_vram_prefill_transient * transient,int transient_count,
+        const ssd_vram_prefill_launch * options,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->launch_prefill(q,stride,routes,weights,nslots,ntokens,transient,transient_count,options);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
-void prefill_lane(void * p,kimi_vram_prefill_lane * lane){
+void prefill_lane(void * p,ssd_vram_prefill_lane * lane){
     if(!lane)return;*lane={};if(p)static_cast<tier *>(p)->lane(*lane);}
-int prefill_finish(void * p,float * output,size_t stride,kimi_vram_prefill_stats * stats,char * e,size_t n){
+int prefill_finish(void * p,float * output,size_t stride,ssd_vram_prefill_stats * stats,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{if(stats)*stats={};t->finish_prefill(output,stride,stats);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int prefill_cancel(void * p,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->cancel_prefill();return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
@@ -2497,7 +2497,7 @@ int prefill_seed_host(void * p,int32_t request,const void * up,const void * gate
 int prefill_seed_wait(void * p,int32_t request,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->wait_host_seed(request);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int prefill_cold_admission_active(void *){return 0;}
-int prefill_admit_cold(void * p,const kimi_vram_request *,const void *,const void *,const void *,
+int prefill_admit_cold(void * p,const ssd_vram_request *,const void *,const void *,const void *,
         int * admitted,char * e,size_t n){
     if(admitted)*admitted=0;
     return reject_implicit_format(p,e,n,"Q2 cold admission retired; use ordinary explicit-format prefill");
@@ -2506,12 +2506,12 @@ void residency_held(void * p,int32_t layer,const int32_t * experts,int count,uin
     if(!out || count<=0)return;
     std::fill(out,out+count,uint8_t(0));if(p && experts)static_cast<tier *>(p)->held(layer,experts,count,out);}
 int host_available(void * p){return p && static_cast<tier *>(p)->format_mode;}
-int host_launch(void * p,const kimi_vram_host_job * jobs,int count,int * accepted,char * e,size_t n){
+int host_launch(void * p,const ssd_vram_host_job * jobs,int count,int * accepted,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->launch_host(jobs,count,accepted);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 void host_costs(void * p,double * resident_us,double * host_us){
     auto * t=static_cast<tier *>(p);std::lock_guard<std::mutex> lock(t->mutex);
     if(resident_us)*resident_us=t->resident_us_per_expert;if(host_us)*host_us=t->host_us_per_expert;}
-void host_costs2(void * p,kimi_vram_host_costs * c){
+void host_costs2(void * p,ssd_vram_host_costs * c){
     if(!c)return;*c={};auto * t=static_cast<tier *>(p);if(!t)return;
     std::lock_guard<std::mutex> lock(t->mutex);t->costs2(*c);}
 // Not through fail(): a refused registration leaves the tier as it was; the caller keeps the memory pageable.
@@ -2525,7 +2525,7 @@ int host_register(void * p,const void * pointer,size_t bytes,char * e,size_t n){
     if(rc!=cudaSuccess){(void)cudaGetLastError();if(n)std::snprintf(e,n,"cudaHostRegister: %s",cudaGetErrorString(rc));return 1;}
     // the range is registered: a failed probe copy only leaves the copy unmeasured
     try{t->host_registered(pointer,bytes);}catch(const std::exception & x){
-        (void)cudaGetLastError();std::fprintf(stderr,"[kimi_vram_host] event=probe_copy status=fail error=%s\n",x.what());}
+        (void)cudaGetLastError();std::fprintf(stderr,"[ssd_vram_host] event=probe_copy status=fail error=%s\n",x.what());}
     return 0;}
 int host_unregister(void * p,const void * pointer,char * e,size_t n){
     auto * t=static_cast<tier *>(p);
@@ -2543,14 +2543,14 @@ void policy_set_host_demand(void * p,uint64_t bytes){
     const size_t before=t->host_demand;
     t->host_demand=size_t(bytes);t->publish_reserve();
     if(t->unified && (before>t->host_demand?before-t->host_demand:t->host_demand-before)>=(size_t(256)<<20))
-        std::fprintf(stderr,"[kimi_vram_host_reserve] reason=host_demand demand_before=%zu demand=%zu floor=%zu\n",before,t->host_demand,t->host_floor);}
+        std::fprintf(stderr,"[ssd_vram_host_reserve] reason=host_demand demand_before=%zu demand=%zu floor=%zu\n",before,t->host_demand,t->host_floor);}
 void policy_set_host_floor(void * p,uint64_t bytes){
     auto * t=static_cast<tier *>(p);if(!t)return;
     std::lock_guard<std::mutex> lock(t->lifecycle_mutex);
     if(t->host_floor==size_t(bytes))return;
     const size_t before=t->host_floor;
     t->host_floor=size_t(bytes);t->publish_reserve();
-    if(t->unified)std::fprintf(stderr,"[kimi_vram_host_reserve] reason=floor floor_before=%zu floor=%zu demand=%zu\n",before,t->host_floor,t->host_demand);}
+    if(t->unified)std::fprintf(stderr,"[ssd_vram_host_reserve] reason=floor floor_before=%zu floor=%zu demand=%zu\n",before,t->host_floor,t->host_demand);}
 uint64_t policy_host_bytes(void * p){
     auto * t=static_cast<tier *>(p);if(!t)return 0;
     std::lock_guard<std::mutex> lock(t->lifecycle_mutex);
@@ -2560,7 +2560,7 @@ uint64_t policy_host_bytes(void * p){
 int policy_reclaim_host(void * p,uint64_t bytes){
     auto * t=static_cast<tier *>(p);if(!t)return 1;
     try{return t->reclaim_host(size_t(std::min<uint64_t>(bytes,SIZE_MAX)),bytes?"host_reserve":"floor")?0:1;}catch(const std::exception & x){
-        std::fprintf(stderr,"[kimi_vram_elastic] event=host_reclaim status=fail error=%s\n",x.what());return 1;}}
+        std::fprintf(stderr,"[ssd_vram_elastic] event=host_reclaim status=fail error=%s\n",x.what());return 1;}}
 void policy_set_miss_cost(void * p,double ram_us,double drive_us){
     auto * t=static_cast<tier *>(p);if(!t)return;
     const auto smooth=[](double & value,double us){if(std::isfinite(us) && us>0)value=value>0?0.9*value+0.1*us:us;};
@@ -2626,32 +2626,32 @@ void * create_configured_tier(const ssd::settings::snapshot * input, const ssd::
     }
 }
 } // namespace
-extern "C" const kimi_vram_policy_api * kimi_vram_policy_get_api(){
-    static const kimi_vram_policy_api api={5,sizeof(kimi_vram_policy_api),policy_set_miss_cost,policy_set_host_demand,
+extern "C" const ssd_vram_policy_api * ssd_vram_policy_get_api(){
+    static const ssd_vram_policy_api api={5,sizeof(ssd_vram_policy_api),policy_set_miss_cost,policy_set_host_demand,
         policy_set_host_floor,policy_reclaim_host,policy_host_bytes,policy_set_thread_cpus,policy_set_ram_holds};return &api;
 }
-extern "C" const kimi_vram_host_api * kimi_vram_host_get_api(){
-    static const kimi_vram_host_api api={3,sizeof(kimi_vram_host_api),host_available,host_launch,host_costs,
+extern "C" const ssd_vram_host_api * ssd_vram_host_get_api(){
+    static const ssd_vram_host_api api={3,sizeof(ssd_vram_host_api),host_available,host_launch,host_costs,
         host_register,host_unregister,host_costs2};return &api;
 }
-extern "C" const kimi_vram_tier_api * kimi_vram_tier_get_api(){
-    static const kimi_vram_tier_api api={2,sizeof(kimi_vram_tier_api),api_create,api_destroy,api_begin,api_prepare,api_launch,api_admit,api_finish,api_cancel};return &api;
+extern "C" const ssd_vram_tier_api * ssd_vram_tier_get_api(){
+    static const ssd_vram_tier_api api={2,sizeof(ssd_vram_tier_api),api_create,api_destroy,api_begin,api_prepare,api_launch,api_admit,api_finish,api_cancel};return &api;
 }
-extern "C" const kimi_vram_residency_api * kimi_vram_residency_get_api(){
-    static const kimi_vram_residency_api api={3,sizeof(kimi_vram_residency_api),residency_held};return &api;
+extern "C" const ssd_vram_residency_api * ssd_vram_residency_get_api(){
+    static const ssd_vram_residency_api api={3,sizeof(ssd_vram_residency_api),residency_held};return &api;
 }
-extern "C" const kimi_vram_deferred_api * kimi_vram_deferred_get_api(){
-    static const kimi_vram_deferred_api api={3,sizeof(kimi_vram_deferred_api),deferred_admit,deferred_collect,deferred_wait};return &api;
+extern "C" const ssd_vram_deferred_api * ssd_vram_deferred_get_api(){
+    static const ssd_vram_deferred_api api={3,sizeof(ssd_vram_deferred_api),deferred_admit,deferred_collect,deferred_wait};return &api;
 }
-extern "C" const kimi_vram_elastic_api * kimi_vram_elastic_get_api(){
-    static const kimi_vram_elastic_api api={5,sizeof(kimi_vram_elastic_api),elastic_phase_complete,elastic_reserve_accumulate,elastic_reserve,
+extern "C" const ssd_vram_elastic_api * ssd_vram_elastic_get_api(){
+    static const ssd_vram_elastic_api api={5,sizeof(ssd_vram_elastic_api),elastic_phase_complete,elastic_reserve_accumulate,elastic_reserve,
         elastic_preload_slots,elastic_preload};return &api;
 }
-extern "C" const kimi_vram_format_api * kimi_vram_format_get_api(){
-    static const kimi_vram_format_api api={2,sizeof(kimi_vram_format_api),format_prepare,format_launch};return &api;
+extern "C" const ssd_vram_format_api * ssd_vram_format_get_api(){
+    static const ssd_vram_format_api api={2,sizeof(ssd_vram_format_api),format_prepare,format_launch};return &api;
 }
-extern "C" const kimi_vram_prefill_api * kimi_vram_prefill_get_api(){
-    static const kimi_vram_prefill_api api={10,sizeof(kimi_vram_prefill_api),prefill_prepare,
+extern "C" const ssd_vram_prefill_api * ssd_vram_prefill_get_api(){
+    static const ssd_vram_prefill_api api={10,sizeof(ssd_vram_prefill_api),prefill_prepare,
         prefill_transient_available,prefill_launch,prefill_finish,prefill_cancel,
         prefill_cold_admission_active,prefill_admit_cold,prefill_lane,
         prefill_seed_routes,prefill_seed_host,prefill_seed_wait};return &api;

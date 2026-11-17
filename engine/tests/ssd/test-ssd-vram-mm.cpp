@@ -191,7 +191,7 @@ void time_products(void * mm, ggml_type type, int64_t nrows, int64_t ncols, cons
     }
     (void) cudaEventDestroy(start);
     (void) cudaEventDestroy(end);
-    std::printf("[kimi_vram_mm_time] type=%s rows=%lld cols=%lld%s\n", ggml_type_name(type), (long long) nrows, (long long) ncols,
+    std::printf("[ssd_vram_mm_time] type=%s rows=%lld cols=%lld%s\n", ggml_type_name(type), (long long) nrows, (long long) ncols,
         times.c_str());
 }
 
@@ -282,7 +282,7 @@ void run_type(void * mm, ggml_backend_t backend, ggml_type type, int64_t nrows, 
             ++t.checks;
         }
     }
-    std::printf("[kimi_vram_mm] type=%s rows=%lld cols=%lld tolerance=%.0e%s\n", ggml_type_name(type), (long long) nrows,
+    std::printf("[ssd_vram_mm] type=%s rows=%lld cols=%lld tolerance=%.0e%s\n", ggml_type_name(type), (long long) nrows,
         (long long) ncols, loosest, line.c_str());
 
     if (timing) {
@@ -337,11 +337,11 @@ int main() {
         ggml_cuda_moe_stream_mm_destroy(mm);
         ggml_backend_free(backend);
         cuda(cudaStreamDestroy(stream), "stream destroy");
-        std::printf("KIMI_VRAM_MM_PASS device=%s cc=%d.%d types=%zu checks=%zu worst_nmse=%.3g\n", prop.name, prop.major,
+        std::printf("SSD_VRAM_MM_PASS device=%s cc=%d.%d types=%zu checks=%zu worst_nmse=%.3g\n", prop.name, prop.major,
             prop.minor, covered, t.checks, t.worst);
         return 0;
     } catch (const std::exception & e) {
-        std::fprintf(stderr, "KIMI_VRAM_MM_FAIL: %s\n", e.what());
+        std::fprintf(stderr, "SSD_VRAM_MM_FAIL: %s\n", e.what());
         return 1;
     }
 }

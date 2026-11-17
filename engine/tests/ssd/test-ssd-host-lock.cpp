@@ -24,7 +24,7 @@ struct fake_pages {
     size_t stride = 4096;
     bool hold = false;                // a registration waits while set
     size_t refuse = SIZE_MAX;         // this slot's registration fails
-    void attach(kimi_host_lock & h) {
+    void attach(ssd_host_lock & h) {
         h.lock_pages = [this](const void * p, size_t bytes, std::string * why) {
             const size_t slot = size_t(static_cast<const char *>(p) - arena) / stride;
             std::unique_lock<std::mutex> lock(mutex);
@@ -45,7 +45,7 @@ struct fake_pages {
     void release() { { std::lock_guard<std::mutex> lock(mutex); hold = false; } cv.notify_all(); }
 };
 // Waits (at most 5 s) until pred holds under the registrar's mutex.
-template <class Pred> static bool eventually(kimi_host_lock & h, Pred pred) {
+template <class Pred> static bool eventually(ssd_host_lock & h, Pred pred) {
     for (int i = 0; i < 5000; ++i) {
         { std::lock_guard<std::mutex> lock(h.mutex); if (pred()) { return true; } }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -64,7 +64,7 @@ int main() {
     // registrations hands nothing over.
     {
         fake_pages f; f.arena = arena.data(); f.stride = stride;
-        kimi_host_lock h; f.attach(h); h.start();
+        ssd_host_lock h; f.attach(h); h.start();
         check(h.missed({ 3 }, { 3 }, 600.0, prior, slots, true) == 0, "below one registration: not wanted");
         check(h.missed({ 3 }, { 3 }, 600.0, prior, slots, true) == 1, "rent reaches one registration: wanted");
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -81,7 +81,7 @@ int main() {
     // Unlock a range: every locked slot of it, none outside it; a hand-off not yet taken is withdrawn.
     {
         fake_pages f; f.arena = arena.data(); f.stride = stride;
-        kimi_host_lock h; f.attach(h); h.start();
+        ssd_host_lock h; f.attach(h); h.start();
         for (size_t s : { 2, 5, 9 }) {
             h.missed({ s }, { s }, prior, prior, slots, true);
             check(h.offer(1e9, prior, arena.data(), stride, slots, any_slot), "offer");
@@ -93,7 +93,7 @@ int main() {
         check(c.size() == 8 && c[6] == "unlock 5" && c[7] == "unlock 9", "unlock 5 and 9 only");
         h.stop();
         // A hand-off that the thread has not taken (no thread here) is withdrawn by an unlock of its range.
-        kimi_host_lock g; f.attach(g); g.enabled = true;
+        ssd_host_lock g; f.attach(g); g.enabled = true;
         g.missed({ 7 }, { 7 }, prior, prior, slots, true);
         check(g.offer(1e9, prior, arena.data(), stride, slots, any_slot) && g.pending, "handed over");
         g.unlock(6, 2, arena.data(), stride);
@@ -104,7 +104,7 @@ int main() {
     // A registration in flight is waited for: the unlock returns only after it, and then undoes it.
     {
         fake_pages f; f.arena = arena.data(); f.stride = stride; f.hold = true;
-        kimi_host_lock h; f.attach(h); h.start();
+        ssd_host_lock h; f.attach(h); h.start();
         h.missed({ 4 }, { 4 }, prior, prior, slots, true);
         check(h.offer(1e9, prior, arena.data(), stride, slots, any_slot), "offer");
         check(eventually(h, [&] { return h.busy_slot == 4; }), "registration in flight");
@@ -121,7 +121,7 @@ int main() {
     // A refused registration leaves the slot pageable and is counted.
     {
         fake_pages f; f.arena = arena.data(); f.stride = stride; f.refuse = 6;
-        kimi_host_lock h; f.attach(h); h.start();
+        ssd_host_lock h; f.attach(h); h.start();
         h.missed({ 6 }, { 6 }, prior, prior, slots, true);
         check(h.offer(1e9, prior, arena.data(), stride, slots, any_slot), "offer");
         check(eventually(h, [&] { return h.failures == 1; }) && !h.is_locked(6) && h.last_error == "refused",
@@ -133,7 +133,7 @@ int main() {
     // A wanted slot that lost its pages before the shadow came is skipped.
     {
         fake_pages f; f.arena = arena.data(); f.stride = stride;
-        kimi_host_lock h; f.attach(h); h.start();
+        ssd_host_lock h; f.attach(h); h.start();
         h.missed({ 1 }, { 1 }, prior, prior, slots, true);
         h.missed({ 8 }, { 8 }, prior, prior, slots, true);
         check(h.offer(1e9, prior, arena.data(), stride, slots, [](size_t s) { return s != 1; }), "offer");
@@ -144,7 +144,7 @@ int main() {
     // Before a page-locked copy is measured: no rent, one slot locked to measure it, nothing more until then.
     {
         fake_pages f; f.arena = arena.data(); f.stride = stride;
-        kimi_host_lock h; f.attach(h); h.start();
+        ssd_host_lock h; f.attach(h); h.start();
         check(h.missed({ 5, 6 }, { 5, 6 }, 10.0, prior, slots, false) == 1, "unmeasured: the first slot is wanted at any gain");
         check(h.missed({ 7 }, { 7 }, 1e6, prior, slots, false) == 0, "unmeasured: one slot at a time");
         check(h.offer(1e9, prior, arena.data(), stride, slots, any_slot), "offer");
@@ -161,13 +161,13 @@ int main() {
     // The rent is the occupant's: a slot that holds another expert starts again from zero.
     {
         fake_pages f; f.arena = arena.data(); f.stride = stride;
-        kimi_host_lock h; f.attach(h);
+        ssd_host_lock h; f.attach(h);
         check(h.missed({ 2 }, { 100 }, 600.0, prior, slots, true) == 0, "occupant 100: 600 of 1000");
         check(h.missed({ 2 }, { 101 }, 600.0, prior, slots, true) == 0, "occupant 101: its own 600, not 1200");
         check(h.missed({ 2 }, { 101 }, 600.0, prior, slots, true) == 1, "occupant 101: 1200, wanted");
     }
 
-    // The read ring (kimi_ring_lock): every buffer registered once per allocation; a reallocation unregisters them all
+    // The read ring (ssd_ring_lock): every buffer registered once per allocation; a reallocation unregisters them all
     // first and registers again; a refused registration undoes the ones before it and is not retried until the next
     // allocation; at the end every registration has its unregistration.
     {
@@ -176,7 +176,7 @@ int main() {
         for (size_t i = 0; i < 24; ++i) { buffers.push_back({ ring.data() + i * stride, stride }); }
         std::vector<const void *> live;
         size_t calls = 0, refuse_at = SIZE_MAX;
-        kimi_ring_lock r;
+        ssd_ring_lock r;
         r.lock_pages = [&](const void * p, size_t, std::string * why) {
             if (calls++ == refuse_at) { if (why) { *why = "refused"; } return false; }
             live.push_back(p); return true;
@@ -201,6 +201,6 @@ int main() {
     }
 
     if (failures) { std::fprintf(stderr, "%d failures\n", failures); return 1; }
-    std::printf("KIMI_HOST_LOCK_OK\n");
+    std::printf("SSD_HOST_LOCK_OK\n");
     return 0;
 }

@@ -145,7 +145,7 @@ struct expert_cache {
     };
     std::vector<layer> layers;
     std::vector<entry> entries;
-    kimi_cpu_sink_cache_stats stats = {};
+    ssd_cpu_sink_cache_stats stats = {};
     char * arena = nullptr;
     size_t stride = 0, role_bytes[3] = {};
     int quota = 8;
@@ -271,7 +271,7 @@ struct expert_cache {
         return ticket;
     }
     // term: the ledger term that was short when the pause is a rejection for room ("none" otherwise).
-    void pause(std::vector<expert_request> & requests, kimi_cpu_sink_stats & current, const char * reason,
+    void pause(std::vector<expert_request> & requests, ssd_cpu_sink_stats & current, const char * reason,
                const char * term = "none") {
         // No I/O job or read_target has been published yet. In particular,
         // hits planned before the pressure check must become ring misses.
@@ -282,7 +282,7 @@ struct expert_cache {
         stride = 0; std::fill(role_bytes, role_bytes + 3, 0);
         stats.capacity_bytes = stats.enabled_bytes = 0;
         paused = true; ++stats.pressure_stops;
-        std::fprintf(stderr, "[kimi_cpu_sink_cache] paused=1 reason=%s term=%s reserve_bytes=%llu extra_bytes=%llu\n",
+        std::fprintf(stderr, "[ssd_cpu_sink_cache] paused=1 reason=%s term=%s reserve_bytes=%llu extra_bytes=%llu\n",
                 reason, term, (unsigned long long) ledger.state().reserve,
                 (unsigned long long) stats.last_guard_extra_bytes);
     }
@@ -342,7 +342,7 @@ struct expert_cache {
         if ((elastic || partial_reclaim) && !layer_quotas.empty()) {
             throw std::runtime_error("cache reclaim cannot use explicit layer quotas");
         }
-        std::fprintf(stderr, "[kimi_host_ledger] unified=%d reserve=%llu margin=%llu explicit_reserve=%llu reclaimable_file=%d cgroup=%s\n",
+        std::fprintf(stderr, "[ssd_host_ledger] unified=%d reserve=%llu margin=%llu explicit_reserve=%llu reclaimable_file=%d cgroup=%s\n",
                 int(ledger.state().unified), (unsigned long long) ledger.state().reserve, (unsigned long long) ledger.state().margin,
                 (unsigned long long) ledger.state().explicit_reserve, int(ledger.state().reclaimable_file),
                 ledger.state().cgroup.empty() ? "-" : ledger.state().cgroup.c_str());
@@ -410,20 +410,20 @@ struct expert_cache {
         stride = 0; std::fill(role_bytes, role_bytes + 3, 0);
         quota = per_layer; active = has_token = paused = elastic_prefill = false;
         if (ledger.state().reclaimable_file) {
-            std::fprintf(stderr, "[kimi_cpu_sink_cache] reclaimable_file=1 active_file_counts_as_headroom=1 inactive_file_counts_as_headroom=1\n");
+            std::fprintf(stderr, "[ssd_cpu_sink_cache] reclaimable_file=1 active_file_counts_as_headroom=1 inactive_file_counts_as_headroom=1\n");
         }
         if (!layer_quotas.empty() || ledger.state().reserve != 2ull * 1024 * 1024 * 1024) {
-            std::fprintf(stderr, "[kimi_cpu_sink_cache] fixed_layer_quotas=%zu reserve_bytes=%llu\n",
+            std::fprintf(stderr, "[ssd_cpu_sink_cache] fixed_layer_quotas=%zu reserve_bytes=%llu\n",
                     layer_quotas.size(), (unsigned long long) ledger.state().reserve);
         }
         if (elastic) {
             std::fprintf(stderr,
-                    "[kimi_cpu_sink_cache] elastic=1 prefill_slots=%zu reserve_bytes=%llu mapping=retained\n",
+                    "[ssd_cpu_sink_cache] elastic=1 prefill_slots=%zu reserve_bytes=%llu mapping=retained\n",
                     prefill_slots, (unsigned long long) ledger.state().reserve);
         }
         if (partial_reclaim) {
             std::fprintf(stderr,
-                    "[kimi_cpu_sink_cache] partial_reclaim=1 reserve_bytes=%llu mapping=retained_on_known_pressure\n",
+                    "[ssd_cpu_sink_cache] partial_reclaim=1 reserve_bytes=%llu mapping=retained_on_known_pressure\n",
                     (unsigned long long) ledger.state().reserve);
         }
     }
@@ -440,28 +440,28 @@ struct expert_cache {
                         ? reclaim_for_guard(0, "prefill_headroom") : guard(0);
                 if (room) {
                     std::fprintf(stderr,
-                            "[kimi_cpu_sink_cache] retained_prefill=1 elastic=1 enabled_bytes=%llu resident_bytes=%llu valid_bytes=%llu\n",
+                            "[ssd_cpu_sink_cache] retained_prefill=1 elastic=1 enabled_bytes=%llu resident_bytes=%llu valid_bytes=%llu\n",
                             (unsigned long long) stats.enabled_bytes,
                             (unsigned long long) stats.committed_bytes,
                             (unsigned long long) stats.valid_bytes);
                     for (auto & l : layers) { l.seen = false; }
                 } else {
                     ++stats.pressure_stops; count_rejection();
-                    std::fprintf(stderr, "[kimi_cpu_sink_cache] paused=1 reason=prefill_headroom term=%s reserve_bytes=%llu\n",
+                    std::fprintf(stderr, "[ssd_cpu_sink_cache] paused=1 reason=prefill_headroom term=%s reserve_bytes=%llu\n",
                             binding_term(last_room), (unsigned long long) ledger.state().reserve);
                     release();
                 }
             } else if (keep_across_requests && arena &&
                     (partial_reclaim ? reclaim_for_guard(0, "prefill_headroom") : guard(0))) {
                 if (active) {
-                    std::fprintf(stderr, "[kimi_cpu_sink_cache] retained_prefill=1 valid_bytes=%llu\n",
+                    std::fprintf(stderr, "[ssd_cpu_sink_cache] retained_prefill=1 valid_bytes=%llu\n",
                             (unsigned long long) stats.valid_bytes);
                 }
                 for (auto & l : layers) { l.seen = false; }
             } else {
                 if (keep_across_requests && arena) {
                     ++stats.pressure_stops; count_rejection();
-                    std::fprintf(stderr, "[kimi_cpu_sink_cache] paused=1 reason=prefill_headroom term=%s reserve_bytes=%llu\n",
+                    std::fprintf(stderr, "[ssd_cpu_sink_cache] paused=1 reason=prefill_headroom term=%s reserve_bytes=%llu\n",
                             binding_term(last_room), (unsigned long long) ledger.state().reserve);
                 }
                 release();
@@ -599,7 +599,7 @@ struct expert_cache {
             if (guard_reclaim) { ++stats.guard_reclaims; }
             stats.shrink_us = add(stats.shrink_us, ggml_time_us() - started);
             std::fprintf(stderr,
-                    "[kimi_cpu_sink_cache] cache_shrink=1 reason=%s target_slots=%zu before_slots=%zu after_slots=%zu released_bytes=%llu valid_bytes=%llu\n",
+                    "[ssd_cpu_sink_cache] cache_shrink=1 reason=%s target_slots=%zu before_slots=%zu after_slots=%zu released_bytes=%llu valid_bytes=%llu\n",
                     reason, target, before, after,
                     (unsigned long long) (stats.released_bytes - released_before),
                     (unsigned long long) stats.valid_bytes);
@@ -615,7 +615,7 @@ struct expert_cache {
         if (before != entries.size()) {
             ++stats.phase_grows;
             std::fprintf(stderr,
-                    "[kimi_cpu_sink_cache] elastic_grow=1 before_slots=%zu after_slots=%zu resident_bytes=%llu\n",
+                    "[ssd_cpu_sink_cache] elastic_grow=1 before_slots=%zu after_slots=%zu resident_bytes=%llu\n",
                     before, entries.size(), (unsigned long long) stats.committed_bytes);
         }
     }
@@ -639,7 +639,7 @@ struct expert_cache {
         }
         return state == room_ok;
     }
-    void reject_admission(std::vector<expert_request> & requests, kimi_cpu_sink_stats & current, const char * reason) {
+    void reject_admission(std::vector<expert_request> & requests, ssd_cpu_sink_stats & current, const char * reason) {
         count_rejection();
         if (!partial_reclaim) { pause(requests, current, reason, binding_term(last_room)); return; }
         for (auto & r : requests) {
@@ -650,12 +650,12 @@ struct expert_cache {
         current.cache_hits = current.cache_new_slot_bytes = 0;
         ++stats.pressure_stops;
         std::fprintf(stderr,
-                "[kimi_cpu_sink_cache] admission_rejected=1 reason=%s term=%s mapping_retained=1 reserve_bytes=%llu extra_bytes=%llu enabled_slots=%zu\n",
+                "[ssd_cpu_sink_cache] admission_rejected=1 reason=%s term=%s mapping_retained=1 reserve_bytes=%llu extra_bytes=%llu enabled_slots=%zu\n",
                 reason, binding_term(last_room), (unsigned long long) ledger.state().reserve,
                 (unsigned long long) stats.last_guard_extra_bytes, enabled_slots());
     }
-    static source_key key(const kimi_cpu_sink_source & s) {
-        const auto v = kimi_vram_source_identity(s.file, s.offset + s.data_offset, s.payload_nbytes ? s.payload_nbytes : s.nbytes);
+    static source_key key(const ssd_cpu_sink_source & s) {
+        const auto v = ssd_vram_source_identity(s.file, s.offset + s.data_offset, s.payload_nbytes ? s.payload_nbytes : s.nbytes);
         return { v.device, v.inode, v.size, v.offset, v.bytes, v.mtime_s, v.mtime_ns, v.ctime_s, v.ctime_ns, v.inode_hi };
     }
     static bool matches(const entry & e, const expert_request & r) {
@@ -690,7 +690,7 @@ struct expert_cache {
                     : (state == room_ok ? surplus : 0);
             const auto & r = last_room;
             // binding: the term that sizes the cache, or the short one when the room is already taken
-            std::fprintf(stderr, "[kimi_cpu_sink_cache] auto_budget=%llu unified=%d tier=%d slot_bytes=%zu cgroup_surplus=%llu system_surplus=%llu available=%llu floor=%llu binding=%s\n",
+            std::fprintf(stderr, "[ssd_cpu_sink_cache] auto_budget=%llu unified=%d tier=%d slot_bytes=%zu cgroup_surplus=%llu system_surplus=%llu available=%llu floor=%llu binding=%s\n",
                     (unsigned long long) budget, int(ledger.state().unified), int(tier_caches), next_stride,
                     (unsigned long long) (r.cgroup == room_unreadable ? 0 : r.cgroup_surplus), (unsigned long long) r.system_surplus,
                     (unsigned long long) r.available, (unsigned long long) r.floor,
@@ -732,7 +732,7 @@ struct expert_cache {
             slot_cost_bytes = slot_cost;
             metadata_bytes = add(add(node_storage, node_guard), 64 * 1024);
             std::fprintf(stderr,
-                    "[kimi_cpu_sink_cache] auto_capacity_bytes=%llu capacity_cost_bytes=%llu surplus_bytes=%llu slot_cost_bytes=%llu metadata_node_storage_bytes=%llu metadata_guard_bytes=%llu limit_slots=%zu\n",
+                    "[ssd_cpu_sink_cache] auto_capacity_bytes=%llu capacity_cost_bytes=%llu surplus_bytes=%llu slot_cost_bytes=%llu metadata_node_storage_bytes=%llu metadata_guard_bytes=%llu limit_slots=%zu\n",
                     (unsigned long long) multiply(fits, next_stride), (unsigned long long) cost(fits),
                     (unsigned long long) budget, (unsigned long long) slot_cost,
                     (unsigned long long) node_storage, (unsigned long long) node_guard, sized ? limit : fits);
@@ -821,7 +821,7 @@ struct expert_cache {
         }
     }
     void prepare(std::vector<expert_request> & requests, const ggml_tensor * const * tensors,
-                 const size_t * bytes, kimi_cpu_sink_stats & current) {
+                 const size_t * bytes, ssd_cpu_sink_stats & current) {
         if (!active || paused || !stats.budget_bytes) { return; }
         const int id = routed_layer(tensors[0]);
         if (id < 0) { return; }
@@ -1093,7 +1093,7 @@ struct expert_cache {
         stats.page_table_bytes = multiply(n, tables);
         stats.peak_bytes = std::max(stats.peak_bytes, stats.committed_bytes);
         adopt = true;
-        std::fprintf(stderr, "[kimi_cpu_sink_cache] reason=load slots=%zu of=%zu slot_bytes=%zu committed_bytes=%llu us=%.0f threads=%zu pages=%s\n",
+        std::fprintf(stderr, "[ssd_cpu_sink_cache] reason=load slots=%zu of=%zu slot_bytes=%zu committed_bytes=%llu us=%.0f threads=%zu pages=%s\n",
                 n, entries.size(), stride, (unsigned long long) stats.committed_bytes, us, workers,
                 touched ? "touched" : "populated");
         return n;
@@ -1127,7 +1127,7 @@ struct expert_cache {
         enable_to(before + size_t(more));
         if (quiet && enabled_slots() == before) { return; }
         if (sized) { stats.capacity_bytes = std::max(stats.capacity_bytes, multiply(enabled_slots(), stride)); }
-        std::fprintf(stderr, "[kimi_cpu_sink_cache] %s_regrow=1 before_slots=%zu after_slots=%zu of=%zu owed_slots=%llu surplus_bytes=%llu committed_bytes=%llu\n",
+        std::fprintf(stderr, "[ssd_cpu_sink_cache] %s_regrow=1 before_slots=%zu after_slots=%zu of=%zu owed_slots=%llu surplus_bytes=%llu committed_bytes=%llu\n",
                 after, before, enabled_slots(), entries.size(), (unsigned long long) owed, (unsigned long long) surplus,
                 (unsigned long long) stats.committed_bytes);
     }
@@ -1200,18 +1200,18 @@ struct expert_cache {
     // whose entry the caller's pass is about to use, which is no victim (null: none). prior: where the slot's entry is
     // kept, not evicted, until its read is issued (null: evicted now).
     // Returns -2 when the expert is already cached or on its way, -1 when there is no slot.
-    int prefetch_reserve(int32_t layer_id, int32_t expert, const kimi_cpu_sink_source * roles,
+    int prefetch_reserve(int32_t layer_id, int32_t expert, const ssd_cpu_sink_source * roles,
             const std::vector<uint8_t> * keep = nullptr, prefetch_prior * prior = nullptr) {
         if (!(active || prefill_read) || paused || !stats.budget_bytes || !arena || !stride) { return -1; }
         return reserve_slot(layer_id, expert, roles, keep, false, prior);
     }
     // At load (the sink's preload), before any request: an empty slot of the layer for an expert no request has named,
     // its read to follow as a prefetch's (prefetch_done publishes it). -1 when the layer has no empty slot.
-    int preload_reserve(int32_t layer_id, int32_t expert, const kimi_cpu_sink_source * roles) {
+    int preload_reserve(int32_t layer_id, int32_t expert, const ssd_cpu_sink_source * roles) {
         if (active || paused || !stats.budget_bytes || !arena || !stride) { return -1; }
         return reserve_slot(layer_id, expert, roles, nullptr, true);
     }
-    int reserve_slot(int32_t layer_id, int32_t expert, const kimi_cpu_sink_source * roles,
+    int reserve_slot(int32_t layer_id, int32_t expert, const ssd_cpu_sink_source * roles,
             const std::vector<uint8_t> * keep, bool empty_only, prefetch_prior * prior = nullptr) {
         const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
         if (found == layers.end() || !found->count) { return -1; }
@@ -1353,7 +1353,7 @@ struct expert_cache {
         return use;
     }
     // Slot `index`, one lendable named, lent to a prefill read-ahead for `layer_id`; -1 when it is not idle any more.
-    int prefetch_borrow(size_t index, int32_t layer_id, int32_t expert, const kimi_cpu_sink_source * roles,
+    int prefetch_borrow(size_t index, int32_t layer_id, int32_t expert, const ssd_cpu_sink_source * roles,
             prefetch_prior * prior = nullptr) {
         if (!prefill_read || paused || !stats.budget_bytes || !arena || !stride || index >= entries.size()) {
             return -1;
@@ -1413,7 +1413,7 @@ struct expert_cache {
     }
     void prepare_prefill_read(std::vector<expert_request> & requests,
             const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down,
-            kimi_cpu_sink_stats & current) {
+            ssd_cpu_sink_stats & current) {
         if (!prefill_read || !arena || !stride || !stats.valid_bytes || requests.empty()) { return; }
         const int layer_id = routed_layer(up);
         if (layer_id < 0) { return; }
@@ -1464,7 +1464,7 @@ struct expert_cache {
             request.cache_lease = false;
         }
     }
-    void admit(const expert_request & request, kimi_cpu_sink_stats & current) {
+    void admit(const expert_request & request, ssd_cpu_sink_stats & current) {
         if (request.cache_admit < 0) { return; }
         auto & e = entries[request.cache_admit];
         if (!e.enabled || !e.resident) { throw std::runtime_error("CPU sink cache admitted a disabled slot"); }

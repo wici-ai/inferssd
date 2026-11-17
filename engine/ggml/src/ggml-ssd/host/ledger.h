@@ -43,7 +43,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-struct kimi_host_ledger : ssd::host::ledger_terms {
+struct ssd_host_ledger : ssd::host::ledger_terms {
     using room = ssd::host::room;
     // The files the ledger reads stay open: a cgroup or /proc file is generated again by every read from offset 0,
     // and opening one costs several times reading it (the RAM cache asks once or twice per layer and token). Copies
@@ -162,7 +162,7 @@ struct kimi_host_ledger : ssd::host::ledger_terms {
         headroom = 0;
         if (!get("/proc/meminfo", text) || !field(text, "MemAvailable", bytes)) { return false; }
         if (unified && get("/proc/zoneinfo", zones) && get("/proc/sys/vm/watermark_boost_factor", factor)) {
-            headroom = std::min(bytes, kimi_memory_boost::headroom(text, zones, factor, page_size));
+            headroom = std::min(bytes, ssd_memory_boost::headroom(text, zones, factor, page_size));
         }
         bytes -= headroom;
         return true;

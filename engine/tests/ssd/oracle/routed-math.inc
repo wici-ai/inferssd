@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-// Historical Kimi CPU mathematical variant, explicit test reference only.
+// Historical CPU mathematical variant of routed MUL_MAT_ID (the predecessor's Kimi K3 path), explicit test
+// reference only.
 // All retired observers and optional pruning are folded to the supported defaults.
-static void ggml_compute_forward_mul_mat_id_common_kimi(
+static void ggml_compute_forward_mul_mat_id_reference(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 

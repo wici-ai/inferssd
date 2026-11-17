@@ -117,7 +117,7 @@ inline int open_direct(const std::string & path) {
 }
 
 #if defined(__linux__)
-inline void finite_cgroup(kimi_host_ledger & ledger) {
+inline void finite_cgroup(ssd_host_ledger & ledger) {
     ssd::host::room room;
     ledger.cgroup_term(0, room);
     need(room.cgroup != ssd::host::room_unreadable,
@@ -134,7 +134,7 @@ inline void finite_cgroup(kimi_host_ledger & ledger) {
 // machine without a finite cgroup lacks the envelope.
 inline void finite_envelope() {
 #if defined(__linux__)
-    kimi_host_ledger ledger;
+    ssd_host_ledger ledger;
     ledger.locate();
     finite_cgroup(ledger);
 #else

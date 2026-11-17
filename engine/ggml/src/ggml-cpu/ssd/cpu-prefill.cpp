@@ -37,16 +37,16 @@ static bool prefill_expert_type_supported(ggml_type type, int64_t columns) {
         columns % ggml_blck_size(type) == 0 && columns % ggml_blck_size(traits->vec_dot_type) == 0;
 }
 
-static bool prefill_activation_valid(const kimi_cpu_sink_activation * activation) {
+static bool prefill_activation_valid(const ssd_cpu_sink_activation * activation) {
     if (!activation || (activation->post_exp_norm &&
             (!std::isfinite(activation->post_exp_norm_eps) || activation->post_exp_norm_eps <= 0.0f))) { return false; }
     switch (activation->kind) {
-        case KIMI_CPU_SINK_ACTIVATION_SITU:
+        case SSD_CPU_SINK_ACTIVATION_SITU:
             return std::isfinite(activation->situ_beta) && activation->situ_beta > 0.0f &&
                 std::isfinite(activation->situ_linear_beta);
-        case KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP:
+        case SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP:
             return !std::isnan(activation->swiglu_limit) && activation->swiglu_limit > 1e-6f;
-        case KIMI_CPU_SINK_ACTIVATION_SWIGLU:
+        case SSD_CPU_SINK_ACTIVATION_SWIGLU:
             return true;
         default:
             return false;
@@ -90,8 +90,8 @@ struct prefill_group {
 
 } // namespace
 
-struct kimi_cpu_prefill {
-    kimi_cpu_sink * sink;
+struct ssd_cpu_prefill {
+    ssd_cpu_sink * sink;
     std::mutex mutex;
     std::vector<prefill_group> groups;
     std::vector<int32_t> expert_ids;
@@ -111,7 +111,7 @@ struct kimi_cpu_prefill {
     const float * weights = nullptr;
     float * output = nullptr;
     const prefill_group * active_group = nullptr;
-    kimi_cpu_sink_activation activation_config = {};
+    ssd_cpu_sink_activation activation_config = {};
 
     // Threads claim row chunks from a shared counter instead of a static
     // rows*ith/nth split, so a slow core (e.g. an LP-E core) no longer gates
@@ -128,10 +128,10 @@ struct kimi_cpu_prefill {
     int mxfp4_gemm = 2; // 0: scalar, 1: two columns, 2: four columns
     int active_mxfp4_gemm = 0;
     bool group_trace = false;
-    kimi_cpu_prefill_stats current = {};
+    ssd_cpu_prefill_stats current = {};
 
-    explicit kimi_cpu_prefill(kimi_cpu_sink * shared_sink) : sink(shared_sink) {
-        group_trace = kimi_cpu_sink_debug(sink).trace;
+    explicit ssd_cpu_prefill(ssd_cpu_sink * shared_sink) : sink(shared_sink) {
+        group_trace = ssd_cpu_sink_debug(sink).trace;
         if (!sink) { throw std::runtime_error("CPU prefill needs a sink"); }
     }
 
@@ -206,7 +206,7 @@ struct kimi_cpu_prefill {
             }
         }
         const size_t columns = static_cast<size_t>(current.max_group_tokens);
-        const bool swiglu = activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU;
+        const bool swiglu = activation_config.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU;
         // Each CPU route's weighted output (routed_output), for the graph's slot-order sum per token; a route the
         // GPU tier serves is never written or read there. The workspace grows with the pass, as host memory outside
         // the caches: before any read, the sink's host-memory ledger makes room for what it adds and refuses only
@@ -227,7 +227,7 @@ struct kimi_cpu_prefill {
         for (size_t i = 0; i < 2; ++i) {
             if (sizes[4 + i] > bytes[i]->capacity()) { growth += uint64_t(sizes[4 + i]); }
         }
-        kimi_cpu_sink_host_grow(sink, growth, [&] {
+        ssd_cpu_sink_host_grow(sink, growth, [&] {
             // reserve allocates exactly the priced size; resize then writes every new element
             for (size_t i = 0; i < 4; ++i) { floats[i]->reserve(sizes[i]); floats[i]->resize(sizes[i]); }
             for (size_t i = 0; i < 2; ++i) { bytes[i]->reserve(sizes[4 + i]); bytes[i]->resize(sizes[4 + i]); }
@@ -247,7 +247,7 @@ struct kimi_cpu_prefill {
     }
 
     static void parallel_rows(void * userdata, int, int) {
-        auto & self = *static_cast<kimi_cpu_prefill *>(userdata);
+        auto & self = *static_cast<ssd_cpu_prefill *>(userdata);
         const auto & columns = self.active_group->columns;
         const int rows = self.down_phase ? self.latent : self.hidden;
         auto compute_range = [&](int begin, int end) {
@@ -285,11 +285,11 @@ struct kimi_cpu_prefill {
                     }
                     for (size_t offset = 0; offset < count; ++offset) {
                         float value;
-                        if (self.activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+                        if (self.activation_config.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU) {
                             // g and u as they are: the chunk is gated once complete
                             self.activation_up[(column + offset) * self.hidden + row] = u[offset];
                             value = g[offset];
-                        } else if (self.activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) {
+                        } else if (self.activation_config.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) {
                             const float limit = self.activation_config.swiglu_limit;
                             const float gate_value = std::min(g[offset], limit);
                             const float up_value = std::clamp(u[offset], -limit, limit);
@@ -353,7 +353,7 @@ struct kimi_cpu_prefill {
                 compute_row_columns(row, 0, columns.size());
             }
         }
-        if (!self.down_phase && self.activation_config.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+        if (!self.down_phase && self.activation_config.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU) {
             // ggml_swiglu_split's kernel on this chunk of every column (row_chunk)
             for (size_t column = 0; column < columns.size(); ++column) {
                 float * gate = self.activation.data() + column * self.hidden + begin;
@@ -369,7 +369,7 @@ struct kimi_cpu_prefill {
     }
 
     static void consume(void * userdata, size_t expert, const void * up, const void * gate, const void * down) {
-        auto & self = *static_cast<kimi_cpu_prefill *>(userdata);
+        auto & self = *static_cast<ssd_cpu_prefill *>(userdata);
         self.active_group = &self.groups[expert];
         self.up_data = static_cast<const char *>(up);
         self.gate_data = static_cast<const char *>(gate);
@@ -378,7 +378,7 @@ struct kimi_cpu_prefill {
         auto start = prefill_clock::now();
         self.down_phase = false;
         self.dynamic_next.store(0, std::memory_order_relaxed);
-        kimi_cpu_sink_parallel(self.sink, parallel_rows, &self);
+        ssd_cpu_sink_parallel(self.sink, parallel_rows, &self);
         self.current.stream.up_gate_us += elapsed_us(start);
         start = prefill_clock::now();
         for (size_t column = 0; column < self.active_group->columns.size(); ++column) {
@@ -389,11 +389,11 @@ struct kimi_cpu_prefill {
         start = prefill_clock::now();
         self.down_phase = true;
         self.dynamic_next.store(0, std::memory_order_relaxed);
-        kimi_cpu_sink_parallel(self.sink, parallel_rows, &self);
+        ssd_cpu_sink_parallel(self.sink, parallel_rows, &self);
         if (self.activation_config.post_exp_norm) {
             for (size_t column = 0; column < self.active_group->columns.size(); ++column) {
                 float * values = self.post_exp_output.data() + column * self.latent;
-                kimi_cpu_sink_normalize_expert(values, self.latent, self.activation_config.post_exp_norm,
+                ssd_cpu_sink_normalize_expert(values, self.latent, self.activation_config.post_exp_norm,
                     self.activation_config.post_exp_norm_eps);
                 const auto & current = self.active_group->columns[column];
                 for (int route : current.slots) {
@@ -414,7 +414,7 @@ struct kimi_cpu_prefill {
     // output. A participant claims a whole token and sums it alone, so no
     // element's order depends on the split.
     static void reduce_tokens(void * userdata, int, int) {
-        auto & self = *static_cast<kimi_cpu_prefill *>(userdata);
+        auto & self = *static_cast<ssd_cpu_prefill *>(userdata);
         const int latent = self.latent, nslots = self.nslots, ntokens = self.ntokens;
         const int32_t * group = self.route_request_index.data();
         const uint8_t * consumed = self.consumed.data();
@@ -440,25 +440,25 @@ struct kimi_cpu_prefill {
     }
 };
 
-extern "C" struct kimi_cpu_prefill * kimi_cpu_prefill_create(
-        struct kimi_cpu_sink * sink, char * error, size_t error_size) {
+extern "C" struct ssd_cpu_prefill * ssd_cpu_prefill_create(
+        struct ssd_cpu_sink * sink, char * error, size_t error_size) {
     prefill_error(error, error_size, "");
     try {
-        return new kimi_cpu_prefill(sink);
+        return new ssd_cpu_prefill(sink);
     } catch (const std::exception & e) {
         prefill_error(error, error_size, e.what());
         return nullptr;
     }
 }
 
-extern "C" void kimi_cpu_prefill_destroy(struct kimi_cpu_prefill * prefill) { delete prefill; }
+extern "C" void ssd_cpu_prefill_destroy(struct ssd_cpu_prefill * prefill) { delete prefill; }
 
-extern "C" bool kimi_cpu_prefill_run_activation(
-        struct kimi_cpu_prefill * prefill,
+extern "C" bool ssd_cpu_prefill_run_activation(
+        struct ssd_cpu_prefill * prefill,
         const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
         const float * input, const int32_t * ids, const float * weights, int nslots, int ntokens,
-        const struct kimi_cpu_sink_activation * activation, float * output,
-        struct kimi_cpu_prefill_stats * stats, char * error, size_t error_size) {
+        const struct ssd_cpu_sink_activation * activation, float * output,
+        struct ssd_cpu_prefill_stats * stats, char * error, size_t error_size) {
     prefill_error(error, error_size, "");
     if (stats) { *stats = {}; }
     if (!prefill) { prefill_error(error, error_size, "null CPU prefill"); return false; }
@@ -468,7 +468,7 @@ extern "C" bool kimi_cpu_prefill_run_activation(
     try {
         // Disable decode cache use and check optional retention headroom before
         // allocating workspace, including direct calls outside graph hooks.
-        if (!kimi_cpu_sink_cache_begin(prefill->sink, 0, 0, false, error, error_size)) { return false; }
+        if (!ssd_cpu_sink_cache_begin(prefill->sink, 0, 0, false, error, error_size)) { return false; }
         if (!input || !output || nslots < 0 || nslots > 16 || (nslots && (!ids || !weights)) ||
                 ntokens < 1 || (nslots && ntokens > std::numeric_limits<int>::max() / nslots) ||
                 !prefill_activation_valid(activation)) {
@@ -477,10 +477,10 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         // The elastic tier must make room for the actual GPU accumulator before
         // the SSD ring is started. A worker allocation failure cannot strand
         // streamed GPU reads holding ring credits.
-        if (!kimi_cpu_sink_vram_reserve_accumulator(prefill->sink, ntokens, error, error_size)) { return false; }
+        if (!ssd_cpu_sink_vram_reserve_accumulator(prefill->sink, ntokens, error, error_size)) { return false; }
         // A lazily-created sink may have missed the context's post-reserve hook;
         // repeated layer calls are harmless. Disarm after the accumulator is ready.
-        if (!kimi_cpu_sink_vram_phase_complete(prefill->sink, false, error, error_size)) { return false; }
+        if (!ssd_cpu_sink_vram_phase_complete(prefill->sink, false, error, error_size)) { return false; }
         prefill->activation_config = *activation;
         prefill->prepare(up, gate, down, ids, weights, nslots, ntokens);
         if (prefill->active_mxfp4_gemm == 2 && prefill->group_trace) {
@@ -490,7 +490,7 @@ extern "C" bool kimi_cpu_prefill_run_activation(
                 if (!group_list.empty()) { group_list += ','; }
                 group_list += std::to_string(group.expert) + ':' + std::to_string(group.columns.size());
             }
-            std::fprintf(stderr, "[kimi_cpu_prefill_groups] tensor=%s ntokens=%d groups=%s\n",
+            std::fprintf(stderr, "[ssd_cpu_prefill_groups] tensor=%s ntokens=%d groups=%s\n",
                     up->name, ntokens, group_list.c_str());
         }
         // Default-off policy audit for cold-prefill admission.  Route
@@ -499,7 +499,7 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         // an offline prompt->decode overlap analysis without changing cache
         // heat, residency, execution order or payload lifetime.
         if (prefill->group_trace) {
-                std::fprintf(stderr, "[kimi_cpu_prefill_admission_audit] tensor=%s ntokens=%d candidates=",
+                std::fprintf(stderr, "[ssd_cpu_prefill_admission_audit] tensor=%s ntokens=%d candidates=",
                     up->name, ntokens);
                 bool first = true;
                 for (const auto & group : prefill->groups) {
@@ -524,9 +524,9 @@ extern "C" bool kimi_cpu_prefill_run_activation(
                     prefill->quant_input.data() + token * prefill->quant_bytes_input, prefill->latent);
         }
         const double input_us = elapsed_us(phase_start);
-        kimi_cpu_sink_stats stream = {};
+        ssd_cpu_sink_stats stream = {};
         const int32_t empty_id = 0; // keep the empty-union call's pointer valid
-        kimi_cpu_sink_prefill_batch batch = {};
+        ssd_cpu_sink_prefill_batch batch = {};
         batch.f32_input = input;
         batch.f32_stride = size_t(prefill->latent) * sizeof(float);
         batch.route_request_index = prefill->route_request_index.data();
@@ -535,9 +535,9 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         batch.ntokens = ntokens;
         batch.activation = *activation;
         batch.output = output;
-        const bool ok = kimi_cpu_sink_stream_hybrid(prefill->sink, up, gate, down,
+        const bool ok = ssd_cpu_sink_stream_hybrid(prefill->sink, up, gate, down,
                 prefill->expert_ids.empty() ? &empty_id : prefill->expert_ids.data(),
-                static_cast<int>(prefill->expert_ids.size()), &batch, kimi_cpu_prefill::consume, prefill,
+                static_cast<int>(prefill->expert_ids.size()), &batch, ssd_cpu_prefill::consume, prefill,
                 &stream, error, error_size);
         prefill->current.gpu_experts = batch.gpu_experts;
         prefill->current.gpu_routes = batch.gpu_routes;
@@ -568,7 +568,7 @@ extern "C" bool kimi_cpu_prefill_run_activation(
             // stream returned with the GPU tier's routes in output.
             phase_start = prefill_clock::now();
             prefill->dynamic_next.store(0, std::memory_order_relaxed);
-            kimi_cpu_sink_parallel_last(prefill->sink, kimi_cpu_prefill::reduce_tokens, prefill);
+            ssd_cpu_sink_parallel_last(prefill->sink, ssd_cpu_prefill::reduce_tokens, prefill);
             const double reduce_us = elapsed_us(phase_start);
             prefill->current.stream.down_reduce_us += reduce_us;
             prefill->current.stream.compute_us += reduce_us;
@@ -577,7 +577,7 @@ extern "C" bool kimi_cpu_prefill_run_activation(
         if (stats) { *stats = prefill->current; }
         return ok;
     } catch (const std::exception & e) {
-        kimi_cpu_sink_cache_reset(prefill->sink);
+        ssd_cpu_sink_cache_reset(prefill->sink);
         prefill->current.stream.total_us = elapsed_us(start);
         if (stats) { *stats = prefill->current; }
         prefill_error(error, error_size, e.what());
@@ -585,15 +585,15 @@ extern "C" bool kimi_cpu_prefill_run_activation(
     }
 }
 
-extern "C" bool kimi_cpu_prefill_run(
-        struct kimi_cpu_prefill * prefill,
+extern "C" bool ssd_cpu_prefill_run(
+        struct ssd_cpu_prefill * prefill,
         const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
         const float * input, const int32_t * ids, const float * weights, int nslots, int ntokens,
         float situ_beta, float situ_linear_beta, float * output,
-        struct kimi_cpu_prefill_stats * stats, char * error, size_t error_size) {
-    const kimi_cpu_sink_activation activation = {
-        KIMI_CPU_SINK_ACTIVATION_SITU, situ_beta, situ_linear_beta, 0.0f, nullptr, 0.0f,
+        struct ssd_cpu_prefill_stats * stats, char * error, size_t error_size) {
+    const ssd_cpu_sink_activation activation = {
+        SSD_CPU_SINK_ACTIVATION_SITU, situ_beta, situ_linear_beta, 0.0f, nullptr, 0.0f,
     };
-    return kimi_cpu_prefill_run_activation(prefill, up, gate, down, input, ids, weights, nslots, ntokens,
+    return ssd_cpu_prefill_run_activation(prefill, up, gate, down, input, ids, weights, nslots, ntokens,
             &activation, output, stats, error, error_size);
 }

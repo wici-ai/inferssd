@@ -42,7 +42,7 @@ struct pack {
     size_t role_bytes[3] = {};
     std::map<std::pair<std::string, int32_t>, uint64_t> offsets;
     ~pack() { ssd::platform::close_fd(fd); if (!path.empty()) { test_resources::remove_file(path); } }
-    static bool resolve(void * user, const char * name, int32_t expert, kimi_cpu_sink_source * out) {
+    static bool resolve(void * user, const char * name, int32_t expert, ssd_cpu_sink_source * out) {
         auto & p = *static_cast<pack *>(user);
         const auto found = p.offsets.find({ name, expert });
         if (found == p.offsets.end()) { return false; }
@@ -56,7 +56,7 @@ struct pack {
 };
 
 void make_pack(pack & p, int experts) {
-    p.path = test_resources::temp_file("kimi-sink-bench");
+    p.path = test_resources::temp_file("ssd-sink-bench");
     p.experts = experts;
     std::ofstream file(p.path, std::ios::binary | std::ios::trunc);
     require(bool(file), "bench pack create");
@@ -85,22 +85,22 @@ void make_pack(pack & p, int experts) {
 }
 
 struct call_context {
-    kimi_cpu_sink * sink = nullptr;
+    ssd_cpu_sink * sink = nullptr;
     bool empty = false;
     ggml_tensor * role[3] = {};
-    kimi_cpu_sink_stats stats = {};
+    ssd_cpu_sink_stats stats = {};
     bool ok = false;
     char error[512] = {};
 };
 
 void decode_node(ggml_tensor * dst, int ith, int nth, void * userdata) {
     auto & c = *static_cast<call_context *>(userdata);
-    if (ith) { kimi_cpu_sink_call_join(c.sink, ith, nth); return; }
-    if (!kimi_cpu_sink_call_open(c.sink, nth, c.error, sizeof(c.error))) { std::fprintf(stderr, "%s\n", c.error); std::abort(); }
-    c.ok = c.empty || kimi_cpu_sink_run(c.sink, c.role[0], c.role[1], c.role[2], static_cast<const float *>(dst->src[0]->data),
+    if (ith) { ssd_cpu_sink_call_join(c.sink, ith, nth); return; }
+    if (!ssd_cpu_sink_call_open(c.sink, nth, c.error, sizeof(c.error))) { std::fprintf(stderr, "%s\n", c.error); std::abort(); }
+    c.ok = c.empty || ssd_cpu_sink_run(c.sink, c.role[0], c.role[1], c.role[2], static_cast<const float *>(dst->src[0]->data),
         static_cast<const int32_t *>(dst->src[1]->data), static_cast<const float *>(dst->src[2]->data), routed,
         4.0f, 25.0f, static_cast<float *>(dst->data), &c.stats, c.error, sizeof(c.error));
-    kimi_cpu_sink_call_close(c.sink);
+    ssd_cpu_sink_call_close(c.sink);
 }
 
 struct spread { double median = 0, p10 = 0, p90 = 0, min = 0, max = 0, mean = 0; };
@@ -127,12 +127,12 @@ void run_variant(pack & p, const std::string & variant, int threads, int calls, 
     policy.cache_keep = policy.cache_prefill_read = policy.cache_partial_reclaim = policy.cache_reclaimable_file = true;
     policy.cache_reserve_bytes = 512ull << 20;
     char error[512] = {};
-    kimi_cpu_sink * created = ssd::cpu::testing::create(8, policy, nullptr, pack::resolve, &p, error, sizeof(error));
+    ssd_cpu_sink * created = ssd::cpu::testing::create(8, policy, nullptr, pack::resolve, &p, error, sizeof(error));
     require(created, std::string("bench sink: ") + error);
-    std::unique_ptr<kimi_cpu_sink, decltype(&kimi_cpu_sink_destroy)> sink(created, kimi_cpu_sink_destroy);
+    std::unique_ptr<ssd_cpu_sink, decltype(&ssd_cpu_sink_destroy)> sink(created, ssd_cpu_sink_destroy);
     const uint64_t triplet = (p.role_bytes[0] + 4095) / 4096 * 4096 * 2 + (p.role_bytes[2] + 4095) / 4096 * 4096;
     const int32_t priority = layer;
-    require(kimi_cpu_sink_cache_configure(sink.get(), hit ? 2 * routed * triplet : 0, &priority, 1, 2 * routed,
+    require(ssd_cpu_sink_cache_configure(sink.get(), hit ? 2 * routed * triplet : 0, &priority, 1, 2 * routed,
         error, sizeof(error)), std::string("bench cache: ") + error);
 
     ggml_context * meta = ggml_init({ 4 * ggml_tensor_overhead(), nullptr, true });
@@ -170,7 +170,7 @@ void run_variant(pack & p, const std::string & variant, int threads, int calls, 
     for (int call = 0; call < warmup + calls; ++call) {
         const int set = call % sets;
         for (int i = 0; i < routed; ++i) { static_cast<int32_t *>(ids->data)[i] = set * routed + i; }
-        require(kimi_cpu_sink_cache_begin(sink.get(), 1, uint64_t(call) + 1, true, error, sizeof(error)),
+        require(ssd_cpu_sink_cache_begin(sink.get(), 1, uint64_t(call) + 1, true, error, sizeof(error)),
             std::string("bench token: ") + error);
         const auto start = std::chrono::steady_clock::now();
         require(ggml_graph_compute(graph, &plan) == GGML_STATUS_SUCCESS, "bench graph compute");

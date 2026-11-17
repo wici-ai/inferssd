@@ -65,7 +65,7 @@ int main() {
 
     check(llama_host_page_size() >= 4096, "the page size");
     ggml_free(ctx);
-    if (failures) { std::fprintf(stderr, "KIMI_HOST_GATHER_FAILED failures=%d\n", failures); return 1; }
-    std::printf("KIMI_HOST_GATHER_OK\n");
+    if (failures) { std::fprintf(stderr, "SSD_HOST_GATHER_FAILED failures=%d\n", failures); return 1; }
+    std::printf("SSD_HOST_GATHER_OK\n");
     return 0;
 }

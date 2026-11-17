@@ -43,8 +43,8 @@ static void configured_writer_failure_test(fixture & f, const ssd::settings::sna
         const struct rlimit limit = { 0, 0 };
         if (setrlimit(RLIMIT_FSIZE, &limit)) { _exit(3); }
         tensors meta(f, 1); const int32_t id = 1; const float weight = 1;
-        std::vector<float> output(f.latent); kimi_cpu_sink_stats stats = {};
-        const bool ok = kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id,
+        std::vector<float> output(f.latent); ssd_cpu_sink_stats stats = {};
+        const bool ok = ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id,
             &weight, 1, 4, 25, output.data(), &stats, error, sizeof(error));
         sink.reset();
         _exit(!ok && stats.pending_reads == 0 && stats.read_requests == stats.read_completions && error[0] ? 0 : 4);

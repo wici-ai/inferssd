@@ -12,14 +12,14 @@ namespace ssd { namespace gpu {
 struct provider_v1 {
     uint32_t version; // 2: no cache-location view
     size_t size;
-    const kimi_vram_tier_api * api;
-    const kimi_vram_residency_api * residency;
-    const kimi_vram_format_api * format;
-    const kimi_vram_prefill_api * prefill;
-    const kimi_vram_elastic_api * elastic;
-    const kimi_vram_deferred_api * deferred;
-    const kimi_vram_host_api * host;
-    const kimi_vram_policy_api * policy;
+    const ssd_vram_tier_api * api;
+    const ssd_vram_residency_api * residency;
+    const ssd_vram_format_api * format;
+    const ssd_vram_prefill_api * prefill;
+    const ssd_vram_elastic_api * elastic;
+    const ssd_vram_deferred_api * deferred;
+    const ssd_vram_host_api * host;
+    const ssd_vram_policy_api * policy;
     const settings_api * settings;
     const testing::api * testing;
     const transport_v1 * transport;

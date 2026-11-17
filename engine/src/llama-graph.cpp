@@ -1664,7 +1664,7 @@ llama_expert_gating_func_type gating_op,
     if (next_exp_probs_b) {
         probs = ggml_add(ctx0, probs, next_exp_probs_b);
     }
-    // every rank the next router selects: the sink reads the first GGML_KIMI_CPU_SINK_PREFETCH of them and keeps
+    // every rank the next router selects: the sink reads the first prefetch.depth of them and keeps
     // statistics of all (a full sort, so the first k are the same at any width)
     ggml_tensor * hint = ggml_argsort_top_k(ctx0, probs, int(std::min<int64_t>(hparams.n_expert_used, n_expert)));
     cb(hint, "ffn_moe_prefetch_hint", il);
@@ -2070,10 +2070,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
         const auto & execution = adapted.execution;
 
-        auto descriptor = std::make_unique<llama_kimi_cpu_sink_node>();
-        descriptor->up = llama_kimi_cpu_sink_metadata(up_exps);
-        descriptor->gate = llama_kimi_cpu_sink_metadata(gate_exps);
-        descriptor->down = llama_kimi_cpu_sink_metadata(down_exps);
+        auto descriptor = std::make_unique<llama_ssd_cpu_sink_node>();
+        descriptor->up = llama_ssd_cpu_sink_metadata(up_exps);
+        descriptor->gate = llama_ssd_cpu_sink_metadata(gate_exps);
+        descriptor->down = llama_ssd_cpu_sink_metadata(down_exps);
         descriptor->cpu_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
         descriptor->runtime = cpu_sink_runtime;
         descriptor->situ_beta = hparams.situ_beta;
@@ -2081,11 +2081,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         switch (execution.activation) {
             case llama_ssd::expert_activation::swiglu_clamp:
                 descriptor->activation =
-                    kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, execution.clamp };
+                    ssd_cpu_sink_activation { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, execution.clamp };
                 break;
             case llama_ssd::expert_activation::swiglu:
                 descriptor->activation =
-                    kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f };
+                    ssd_cpu_sink_activation { SSD_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f };
                 break;
             case llama_ssd::expert_activation::unsupported:
                 GGML_ABORT("invalid accepted SSD expert activation");
@@ -2106,7 +2106,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(args[2], "ffn_moe_cpu_sink_weights", il);
         // every CPU thread of the graph is a compute participant of the node's call
         ggml_tensor * result = ggml_custom_4d(ctx0, GGML_TYPE_F32, n_embd, n_tokens, 1, 1,
-            args, hint ? 5 : post_exp_norm ? 4 : 3, llama_kimi_cpu_sink_compute,
+            args, hint ? 5 : post_exp_norm ? 4 : 3, llama_ssd_cpu_sink_compute,
             GGML_N_TASKS_MAX, descriptor.get());
         res->cpu_sink_nodes.emplace_back(std::move(descriptor));
         cb(result, "ffn_moe_cpu_sink", il);

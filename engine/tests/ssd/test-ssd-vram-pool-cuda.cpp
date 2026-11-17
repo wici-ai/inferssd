@@ -14,7 +14,7 @@ int main(){
     inputs.set("tier.half_life", "2");
     const size_t role=lifecycle_role_bytes();
     std::vector<unsigned char> payload[4];
-    kimi_vram_request requests[4]={};
+    ssd_vram_request requests[4]={};
     for(int j=0;j<4;++j){
         payload[j].resize(role,0);payload[j].back()=static_cast<unsigned char>(31+j);
         requests[j].layer=j<2?1:2;requests[j].expert=j%2;requests[j].weight=.7f;

@@ -86,12 +86,12 @@ static void placement_contract() {
 
     t.cpu_one_us = 100; t.vector.device = {0,1,0}; t.vector.moved = {0,1,0};
     t.link_busy_us = 0; t.in_place = false; t.locked_us_per_mb = 1;
-    std::vector<kimi_place_item> items(3);
+    std::vector<ssd_place_item> items(3);
     for (auto & x : items) { x.routes = 1; x.mb = .01; x.locked = x.movable = x.needs_slot = true; }
     std::vector<double> pending(3, 0); pending[1] = .001;
     decode_plan plan; describe_decode(plan, items, pending);
     check(plan.ram == 3 && plan.pending == 1 && plan.locked == 3, "pending prefetch is explicit workload input");
-    kimi_place_limits limits; limits.slots = 1;
+    ssd_place_limits limits; limits.slots = 1;
     auto placed = plan_decode(plan, t, 4, items, limits);
     check(plan.valid && plan.moves == 1 && placed.moved.size() == 1 && plan.gpu[placed.moved[0]], "device-slot limit constrains actual GPU plan");
     items[0].locked = items[1].locked = items[2].locked = false;
@@ -102,7 +102,7 @@ static void placement_contract() {
     check(near(hidden.ram_us, 100) && near(hidden.drive_us, 100), "a use from the drive costs no less than its compute");
 
     std::vector<prefill_expert> experts = {{9,false,true,true,1024},{2,false,true,true,1024},{1,false,false,false,1024}};
-    std::vector<int> routes = {4,4,4}; std::vector<kimi_place_item> empty;
+    std::vector<int> routes = {4,4,4}; std::vector<ssd_place_item> empty;
     prefill_input input{experts,routes,empty,t,32,1,2}; uint64_t candidates = 0;
     const auto counted = count_prefill(input,candidates);
     check(candidates == 1 && counted.ram_candidates == 2 && counted.ssd_candidates == 1 && counted.ssd_limit == 1,

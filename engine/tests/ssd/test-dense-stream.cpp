@@ -76,9 +76,9 @@ struct copy_delta {
     uint64_t tensors, bytes, readahead, fallbacks;
 };
 
-copy_delta copies_since(ggml_backend_sched_t sched, const ggml_backend_sched_kimi_copy_stats & a) {
-    ggml_backend_sched_kimi_copy_stats b = {};
-    ggml_backend_sched_kimi_copy_stats_get(sched, &b);
+copy_delta copies_since(ggml_backend_sched_t sched, const ggml_backend_sched_ssd_copy_stats & a) {
+    ggml_backend_sched_ssd_copy_stats b = {};
+    ggml_backend_sched_ssd_copy_stats_get(sched, &b);
     return { b.dense_tensors - a.dense_tensors, b.dense_bytes - a.dense_bytes, b.dense_readahead - a.dense_readahead,
              b.dense_fallbacks - a.dense_fallbacks };
 }
@@ -279,8 +279,8 @@ void run() {
         const std::vector<ggml_tensor *> ref_w = { dev[0], dev[1], dev[2], dev[3] };
         const graph_out ref = run_graph(sched, ref_w, dev[n_drive], dev[n_drive + 1], nullptr, n_tokens, x);
         for (int pass = 0; pass < 2; ++pass) {
-            ggml_backend_sched_kimi_copy_stats before = {};
-            ggml_backend_sched_kimi_copy_stats_get(sched, &before);
+            ggml_backend_sched_ssd_copy_stats before = {};
+            ggml_backend_sched_ssd_copy_stats_get(sched, &before);
             const std::vector<ggml_tensor *> drive_w = { home[0], home[1], home[2], home[3] };
             const graph_out got = run_graph(sched, drive_w, home[n_drive], dev[n_drive + 1], ram, n_tokens, x);
             const copy_delta d = copies_since(sched, before);
@@ -308,8 +308,8 @@ void run() {
     const std::vector<ggml_tensor *> failed_w = {home[0], home[1], home[2], home[3]};
     const auto failed = run_graph(sched, failed_w, home[n_drive], dev[n_drive + 1], ram, 1, failed_x, true);
     require(failed.status != GGML_STATUS_SUCCESS, "short read did not reject the graph");
-    ggml_backend_sched_kimi_copy_stats failed_stats = {};
-    ggml_backend_sched_kimi_copy_stats_get(sched, &failed_stats);
+    ggml_backend_sched_ssd_copy_stats failed_stats = {};
+    ggml_backend_sched_ssd_copy_stats_get(sched, &failed_stats);
     require(failed_stats.dense_fallbacks == 0, "failed source used mmap fallback");
     scheduler.reset();
     ggml_backend_buffer_free(cbuf);

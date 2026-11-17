@@ -11,7 +11,7 @@
 // One arbiter on every OS; only the budget sources differ.
 #if defined(__linux__)
 #include "ledger.h" // cgroup v2 and /proc
-namespace ssd { namespace host { using host_ledger = ::kimi_host_ledger; } }
+namespace ssd { namespace host { using host_ledger = ::ssd_host_ledger; } }
 #else
 #include "ledger-native.h" // job objects or host.budget_mib, and the OS memory status
 namespace ssd { namespace host { using host_ledger = native_ledger; } }

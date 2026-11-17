@@ -46,7 +46,7 @@
 #include <thread>
 #include <vector>
 
-extern "C" size_t kimi_cpu_sink_source_size(void) { return sizeof(kimi_cpu_sink_source); }
+extern "C" size_t ssd_cpu_sink_source_size(void) { return sizeof(ssd_cpu_sink_source); }
 
 static void sink_error(char * dst, size_t size, const char * message) {
     if (dst && size) {
@@ -349,7 +349,7 @@ static ssd::host::expert_cache_options sink_cache_options(const sink_configurati
 
 // The run lock and the thread holding it. The host arbiter runs the sink's reclaimer on the admitting thread: in a
 // run of the sink (its scratch, ring and cache slots) the caches are that thread's already, and any other thread
-// takes the lock first (kimi_cpu_sink::quiescent).
+// takes the lock first (ssd_cpu_sink::quiescent).
 class sink_run_mutex {
 public:
     void lock() { mutex.lock(); owner.store(std::this_thread::get_id(), std::memory_order_relaxed); }
@@ -374,13 +374,13 @@ struct sink_slot {
     size_t request = 0;
 };
 
-// An expert of the grouped prefill's read-ahead plan (kimi_cpu_sink::lookahead): its id, its three roles' sources as
+// An expert of the grouped prefill's read-ahead plan (ssd_cpu_sink::lookahead): its id, its three roles' sources as
 // the planning call resolved them, and the RAM cache slot it lands in (prefetch_reserve: inflight, invisible to lookups
 // and allocation, until the next layer's call publishes it). The I/O thread reads each role at `target`; its state is
 // under io_mutex.
 struct sink_lookahead_read {
     int32_t expert = -1;
-    kimi_cpu_sink_source role[3] = {};
+    ssd_cpu_sink_source role[3] = {};
     int entry = -1;
     uint64_t generation = 0;
     sink_cache::prefetch_prior prior; // the slot's entry until the read is issued
@@ -515,7 +515,7 @@ struct sink_mrc {
         static const size_t grid[] = { 1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512 };
         uint64_t total = 0;
         for (int l : layers) { total += accesses(l); }
-        std::fprintf(stderr, "[kimi_cpu_sink_mrc] {\"schema\":1,\"why\":\"%s\",\"tokens\":%llu,\"layers\":%zu,"
+        std::fprintf(stderr, "[ssd_cpu_sink_mrc] {\"schema\":1,\"why\":\"%s\",\"tokens\":%llu,\"layers\":%zu,"
                 "\"accesses\":%llu,\"quota\":[", why, (unsigned long long) tokens, layers.size(),
                 (unsigned long long) total);
         for (size_t i = 0; i < sizeof(grid) / sizeof(grid[0]); ++i) { std::fprintf(stderr, "%s%zu", i ? "," : "", grid[i]); }
@@ -536,17 +536,17 @@ struct sink_mrc {
     }
 };
 
-struct kimi_cpu_sink {
+struct ssd_cpu_sink {
     const sink_configuration configuration;
     const int ring_experts;
-    kimi_cpu_sink_resolver resolver;
+    ssd_cpu_sink_resolver resolver;
     void * userdata;
     sink_run_mutex run_mutex;
     sink_ring ring;
     std::vector<sink_slot> slots;
     // The read ring's buffers page-locked for the GPU tier's copies (ring_lock, ggml-ssd/host/page-lock.h): once per
     // allocation, undone before the buffers are reallocated or freed.
-    kimi_ring_lock ring_pages;
+    ssd_ring_lock ring_pages;
     std::vector<sink_request> requests;
     std::vector<size_t> io_requests;
     sink_cache cache;
@@ -557,10 +557,10 @@ struct kimi_cpu_sink {
 
     // A resolved source carries its file's identity. One layer resolves dozens of roles and reading the identity takes
     // system calls, enough on Windows to show in a token's time. So it is read once per descriptor and logical token.
-    // kimi_cpu_sink_cache_begin forgets it, which still catches a source replaced between tokens, at the same descriptor
-    // too. run_mutex guards the list: every caller of resolve and kimi_cpu_sink_cache_begin holds it.
+    // ssd_cpu_sink_cache_begin forgets it, which still catches a source replaced between tokens, at the same descriptor
+    // too. run_mutex guards the list: every caller of resolve and ssd_cpu_sink_cache_begin holds it.
     std::vector<std::pair<int, ssd::platform::file_identity>> file_identities;
-    bool resolve(const char * tensor, int32_t expert, kimi_cpu_sink_source * source) {
+    bool resolve(const char * tensor, int32_t expert, ssd_cpu_sink_source * source) {
         if (!resolver(userdata, tensor, expert, source)) { return false; }
         for (const auto & known : file_identities) {
             if (known.first == source->fd_direct) { source->file = known.second; return true; }
@@ -584,7 +584,7 @@ struct kimi_cpu_sink {
         bool checked = false; // seen by the run of its layer (used_r)
         int entry = -1;
         uint64_t generation = 0;
-        kimi_cpu_sink_source role[3] = {};
+        ssd_cpu_sink_source role[3] = {};
         char * target[3] = {};
         int done = 0, running = 0, queued = 0; // roles read / being read / waiting, under the prefetch mutex
         bool failed = false;
@@ -680,7 +680,7 @@ struct kimi_cpu_sink {
     unsigned io_inflight = 0;
     bool io_failed = false, io_by_run = false;
     sink_clock::time_point io_start;
-    kimi_cpu_sink_stats current = {};
+    ssd_cpu_sink_stats current = {};
     // The ring's counters when a run's own reads ended, before any read-ahead (io_mutex): a grouped-prefill call reports
     // its completions from them, as the next layer's read-ahead runs on the ring beside its tail.
     uint64_t io_completed_end = 0, io_pending_end = 0;
@@ -728,7 +728,7 @@ struct kimi_cpu_sink {
         // Totals for the report at destruction.
         uint64_t layers = 0, planned = 0, issued_total = 0, landed_total = 0, failed_total = 0, used = 0, unused = 0,
                  used_bytes = 0, no_slot = 0, unresolved = 0, no_candidate = 0, borrowed = 0, declined = 0;
-        // The prediction of the next layer's routes (kimi_cpu_sink_prefill_hint): `hint_layer`'s experts, hint_k a
+        // The prediction of the next layer's routes (ssd_cpu_sink_prefill_hint): `hint_layer`'s experts, hint_k a
         // token best first over hint_tokens tokens. The plan keeps its copy (`planned_hint`) until the call of the layer it
         // predicts, which measures it against the routes the layer took.
         int32_t hint_layer = -1, planned_layer = -1;
@@ -738,7 +738,7 @@ struct kimi_cpu_sink {
         // that rank the layer selected.
         uint64_t rank_predicted[16] = {}, rank_selected[16] = {};
     } lookahead;
-    // One grouped-prefill call's receipts ([kimi_cpu_prefill_lookahead]); the call's thread only.
+    // One grouped-prefill call's receipts ([ssd_cpu_prefill_lookahead]); the call's thread only.
     struct lookahead_receipt {
         int32_t layer = -1;
         double window_us = -1;
@@ -785,9 +785,9 @@ struct kimi_cpu_sink {
     // Page-locking of the RAM cache's slots for the GPU tier's copies, on a discrete GPU (ggml-ssd/host/page-lock.h): the slots
     // the decode plan would move an expert from, one at a time, in the drive's shadow; unlocked before their pages go
     // (sink_cache::before_discard).
-    kimi_host_lock host_lock;
+    ssd_host_lock host_lock;
     // In-place reads of the RAM cache's slots, on a GPU that reads host memory in place once it is shown the memory
-    // (kimi_vram_host_costs::in_place_only: the graph lane on unified memory). A slot is shown to the device only
+    // (ssd_vram_host_costs::in_place_only: the graph lane on unified memory). A slot is shown to the device only
     // while a prefill pass uses it: registered before the pass launches (register_host; a Metal no-copy buffer costs
     // about 4 us) and unregistered once the pass has finished, while the pass still leases it. The device's mappings
     // then never outgrow one pass's experts: on some devices an import counts against the device's own memory (an
@@ -817,7 +817,7 @@ struct kimi_cpu_sink {
     double caller_cpu_start = 0;
     sink_clock::time_point phase_dispatch;
     std::vector<sink_worker_profile> worker_profiles; // one per participant of the open call
-    // The call's participants (kimi_cpu_sink_call_open) take no lock. The coordinator publishes each phase, and the
+    // The call's participants (ssd_cpu_sink_call_open) take no lock. The coordinator publishes each phase, and the
     // call's open and close, as one word; joiners read it, compute their share of an active phase and park on
     // `participants` in between, and the coordinator parks on `coordinator` for completions and arrivals.
     sink_event participants, coordinator;
@@ -853,7 +853,7 @@ struct kimi_cpu_sink {
     } share;
     std::unique_ptr<std::atomic<uint64_t>[]> thread_cpu{ new std::atomic<uint64_t>[sink_max_participants]() };
     std::atomic<uint64_t> cpu_generation{0};
-    kimi_cpu_sink_parallel_fn parallel_fn = nullptr;
+    ssd_cpu_sink_parallel_fn parallel_fn = nullptr;
     void * parallel_userdata = nullptr;
     int latent = 0, hidden = 0;
     size_t row_bytes_up = 0, row_bytes_down = 0;
@@ -872,7 +872,7 @@ struct kimi_cpu_sink {
     std::vector<int> work_chunks;
     float beta = 0, linear_beta = 0;
     const float * post_exp_norm = nullptr;
-    int activation_kind = KIMI_CPU_SINK_ACTIVATION_SITU;
+    int activation_kind = SSD_CPU_SINK_ACTIVATION_SITU;
     float swiglu_limit = 0;
     float * output = nullptr;
     bool first_down = false; // without READY_FIRST: this down phase starts the slot-order sum
@@ -885,7 +885,7 @@ struct kimi_cpu_sink {
     ggml_vec_dot_t dot_up = nullptr, dot_down = nullptr;
     ggml_from_float_t quantize_input = nullptr, quantize_hidden = nullptr;
 
-    kimi_cpu_sink(int depth, kimi_cpu_sink_resolver resolve, void * user, const sink_configuration & input = {}) :
+    ssd_cpu_sink(int depth, ssd_cpu_sink_resolver resolve, void * user, const sink_configuration & input = {}) :
         configuration(input), ring_experts(depth), resolver(resolve), userdata(user), slots(depth),
         cache(sink_cache_options(configuration)),
         ready_first(configuration.policy.ready_first),
@@ -930,14 +930,14 @@ struct kimi_cpu_sink {
             cache.before_release = [](void * p) { static_cast<sink_vram *>(p)->wait_deferred(); };
             cache.before_release_arg = &vram;
         }
-        cache.before_discard = [](void * p, size_t first, size_t count) { static_cast<kimi_cpu_sink *>(p)->host_unlock(first, count); };
+        cache.before_discard = [](void * p, size_t first, size_t count) { static_cast<ssd_cpu_sink *>(p)->host_unlock(first, count); };
         cache.before_discard_arg = this;
         vram.ram_slot_locked = [this](int entry) { return entry >= 0 && host_lock.is_locked(size_t(entry)); };
         lookahead.enabled = configuration.policy.prefill_lookahead;
         lookahead.fail_every = configuration.policy.lookahead_fail_every;
         // the reads into the arena (the decode prefetch's, the grouped prefill's read-ahead) land before it goes
         cache.before_unmap = [](void * p) {
-            auto * sink = static_cast<kimi_cpu_sink *>(p);
+            auto * sink = static_cast<ssd_cpu_sink *>(p);
             sink->prefetch_wait_reads();
             sink->lookahead_unmap();
         };
@@ -969,7 +969,7 @@ struct kimi_cpu_sink {
             stop_threads();
             throw;
         }
-        std::fprintf(stderr, "[kimi_cpu_sink_schedule] ready_first=%d early_up_gate=%d role_major=%d nonblocking_down_sched=%d poll_us=%d dynamic_rows=%d dynamic_chunk_rows=%d row_weights=",
+        std::fprintf(stderr, "[ssd_cpu_sink_schedule] ready_first=%d early_up_gate=%d role_major=%d nonblocking_down_sched=%d poll_us=%d dynamic_rows=%d dynamic_chunk_rows=%d row_weights=",
                      ready_first ? 1 : 0, early_up_gate ? 1 : 0, role_major ? 1 : 0,
                      nonblocking_down_sched ? 1 : 0, poll_us, dynamic_rows ? 1 : 0, dynamic_chunk_rows);
         for (size_t i = 0; i < row_weights.size(); ++i) { std::fprintf(stderr, "%s%.9g", i ? "," : "", row_weights[i]); }
@@ -985,8 +985,8 @@ struct kimi_cpu_sink {
             stop_threads();
             throw;
         }
-        if (prefetch.topk) { std::fprintf(stderr, "[kimi_cpu_sink_prefetch] enabled topk=%d readers=3\n", prefetch.topk); }
-        if (lookahead.enabled) { std::fprintf(stderr, "[kimi_cpu_prefill_lookahead] enabled=1\n"); }
+        if (prefetch.topk) { std::fprintf(stderr, "[ssd_cpu_sink_prefetch] enabled topk=%d readers=3\n", prefetch.topk); }
+        if (lookahead.enabled) { std::fprintf(stderr, "[ssd_cpu_prefill_lookahead] enabled=1\n"); }
     }
 
     // The context's reclaimer (ssd::host::actions), which the host arbiter runs for every admission of the context
@@ -994,7 +994,7 @@ struct kimi_cpu_sink {
     // arbiter admits at the full watermark boost, so the cache gives back until the room fits as measured there.
     ssd::host::actions reclaimer() {
         ssd::host::actions out;
-        out.collect_deferred = [this] { quiescent([this] { vram.collect_deferred(cache, KIMI_VRAM_COLLECT_IF_IDLE); return true; }); };
+        out.collect_deferred = [this] { quiescent([this] { vram.collect_deferred(cache, SSD_VRAM_COLLECT_IF_IDLE); return true; }); };
         out.reclaim_tier = [this](uint64_t bytes) { return quiescent([&] { return vram.reclaim_host(bytes); }); };
         out.reclaim_cache = [this](uint64_t bytes) {
             return quiescent([&] { return cache.arena && cache.reclaim_for_guard(bytes, "host_room", true); });
@@ -1050,7 +1050,7 @@ struct kimi_cpu_sink {
             prefetch_job & job = *item.first;
             if (!job.started) { job.started = true; job.started_at = sink_clock::now(); ++prefetch.started_r[job.rank]; }
             self.job = &job; self.urgent = urgent; self.spill = self.spilled = false;
-            const kimi_cpu_sink_source source = job.role[item.second];
+            const ssd_cpu_sink_source source = job.role[item.second];
             char * target = job.target[item.second];
             if (!prefetch.running++) { prefetch.busy_since = sink_clock::now(); }
             ++job.running;
@@ -1290,7 +1290,7 @@ struct kimi_cpu_sink {
                 if (r.spill) { spill_us_r[r.job->rank] += uint64_t(std::llround(std::chrono::duration<double, std::micro>(now - r.since).count())); }
             }
         }
-        out.append("[kimi_cpu_sink_prefetch] reason=%s topk=%d layers=%llu predicted=%llu skip_vram=%llu skip_cached=%llu"
+        out.append("[ssd_cpu_sink_prefetch] reason=%s topk=%d layers=%llu predicted=%llu skip_vram=%llu skip_cached=%llu"
                 " vram_late=%llu skip_vram_lost=%llu unresolved=%llu no_slot=%llu issued=%llu ready=%llu cancelled=%llu failed=%llu carried=%llu"
                 " activated=%llu hits=%llu unused=%llu windows=%llu window_us_p50=%.0f window_us_mean=%.0f"
                 " reader_bytes=%llu reader_busy_us=%.0f spill_us=%.0f spills=%llu declined=%llu read_us_p50=%.0f width=%d",
@@ -1434,9 +1434,9 @@ struct kimi_cpu_sink {
         prefetch.cv.notify_all();
     }
 
-    ~kimi_cpu_sink() {
+    ~ssd_cpu_sink() {
         if (call_open) {
-            std::fprintf(stderr, "[kimi_cpu_sink] destroyed inside an open call; aborting\n");
+            std::fprintf(stderr, "[ssd_cpu_sink] destroyed inside an open call; aborting\n");
             std::abort();
         }
         cache.ledger.client->clear_reclaimer(); // before anything a reclaim on another thread uses
@@ -1447,7 +1447,7 @@ struct kimi_cpu_sink {
         prefetch_report("destroy");
         {
             const auto l = cache.ledger.state();
-            std::fprintf(stderr, "[kimi_host_ledger] reason=destroy unified=%d reserve=%llu margin=%llu floor=%llu file_reserve=%llu explicit_reserve=%llu granted=%llu refused=%llu cache_cgroup_rejections=%llu cache_system_rejections=%llu margin_updates=%llu\n",
+            std::fprintf(stderr, "[ssd_host_ledger] reason=destroy unified=%d reserve=%llu margin=%llu floor=%llu file_reserve=%llu explicit_reserve=%llu granted=%llu refused=%llu cache_cgroup_rejections=%llu cache_system_rejections=%llu margin_updates=%llu\n",
                     int(l.unified), (unsigned long long) l.reserve, (unsigned long long) l.margin, (unsigned long long) l.floor,
                     (unsigned long long) l.file_reserve, (unsigned long long) l.explicit_reserve, (unsigned long long) l.granted,
                     (unsigned long long) ledger_refusals, (unsigned long long) cache.cgroup_rejections,
@@ -1486,7 +1486,7 @@ struct kimi_cpu_sink {
                             vram.reclaim_host(0);
                         }
                     } catch (const std::exception & e) {
-                        std::fprintf(stderr, "[kimi_host_ledger] event=watch status=fail error=%s\n", e.what());
+                        std::fprintf(stderr, "[ssd_host_ledger] event=watch status=fail error=%s\n", e.what());
                     }
                 }
             }
@@ -1559,7 +1559,7 @@ struct kimi_cpu_sink {
             parallel_fn(parallel_userdata, ith, active_threads);
         } else {
             auto compute_range = [&](const sink_work_item & w, int begin, int end) {
-                if (!is_down && activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) {
+                if (!is_down && activation_kind == SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) {
                     // The scalar expression of ggml_compute_forward_swiglu_clamp_f32
                     // (gate=src0, up=src1): each row is bit-identical to the graph op.
                     const float limit = swiglu_limit;
@@ -1571,7 +1571,7 @@ struct kimi_cpu_sink {
                         const float up_value = std::clamp(u, -limit, limit);
                         w.hidden[row] = gate_value / (1.f + expf(-gate_value)) * up_value;
                     }
-                } else if (!is_down && activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+                } else if (!is_down && activation_kind == SSD_CPU_SINK_ACTIVATION_SWIGLU) {
                     // g and u as they are: the coordinator gates the whole row (quantize_activation)
                     for (int row = begin; row < end; ++row) {
                         dot_up(latent, &w.hidden_up[row], 0, w.up + row * row_bytes_up, 0, quant_input.data(), 0, 1);
@@ -1683,7 +1683,7 @@ struct kimi_cpu_sink {
         sink_poll(std::max(poll_us, sink_node_spin_us), opened);
         while (!opened()) { participants.park(opened); }
         if (nth != call_participants || ith < 1 || ith >= nth) {
-            std::fprintf(stderr, "[kimi_cpu_sink] participant %d of %d joined a call of %d; aborting\n", ith, nth,
+            std::fprintf(stderr, "[ssd_cpu_sink] participant %d of %d joined a call of %d; aborting\n", ith, nth,
                 call_participants);
             std::abort();
         }
@@ -1738,7 +1738,7 @@ struct kimi_cpu_sink {
 
     // This thread's CPU time since its previous call of the generation, added to its index (decode_share).
     void mark_thread_cpu(int ith) {
-        thread_local const kimi_cpu_sink * owner = nullptr;
+        thread_local const ssd_cpu_sink * owner = nullptr;
         thread_local uint64_t generation = 0, last = 0;
         const uint64_t now = ssd::platform::thread_cpu_time_ns(), current = cpu_generation.load(std::memory_order_relaxed);
         if (owner == this && generation == current && now >= last) {
@@ -1761,7 +1761,7 @@ struct kimi_cpu_sink {
         if (!share.readable || share.cpus.empty()) { return; }
         if (!ssd::platform::cpus_busy_ns(share.cpus, busy, tick, &why)) {
             share.readable = false;
-            std::fprintf(stderr, "[kimi_cpu_sink_threads] other work unmeasured: %s\n", why.c_str());
+            std::fprintf(stderr, "[ssd_cpu_sink_threads] other work unmeasured: %s\n", why.c_str());
             return;
         }
         uint64_t pool = 0;
@@ -1782,20 +1782,20 @@ struct kimi_cpu_sink {
     void end_decode_run() {
         if (share.run > 1) {
             share.error_ns += double(share.cpus.size()) * double(share.tick) + 2.0 * double(threads) * double(share.gap);
-            std::fprintf(stderr, "[kimi_cpu_sink_threads] decode_share tokens=%d other_cpus=%.2f error_cpus=%.2f"
+            std::fprintf(stderr, "[ssd_cpu_sink_threads] decode_share tokens=%d other_cpus=%.2f error_cpus=%.2f"
                 " over_s=%.1f reserve=%d cpus=%zu\n", share.run - 1, share.other_ns / share.wall_ns,
                 share.error_ns / share.wall_ns, share.wall_ns / 1e9, share.reserve, share.cpus.size());
         }
         share.run = 0; share.gap = 0; share.last_call = 0;
     }
 
-    // The threads of a decode pool of `pool` a decode graph runs on (kimi_cpu_sink_decode_threads).
+    // The threads of a decode pool of `pool` a decode graph runs on (ssd_cpu_sink_decode_threads).
     int decode_threads(int pool) {
         if (configuration.policy.decode_participants || share.cpus.empty()) { return pool; }
         const int n = ssd::place::decode_participants(pool, int(share.cpus.size()), share.reserve);
         if (n != share.reported) {
             share.reported = n;
-            std::fprintf(stderr, "[kimi_cpu_sink_threads] decode_threads=%d pool=%d cpus=%zu reserve=%d other_cpus=%.2f"
+            std::fprintf(stderr, "[ssd_cpu_sink_threads] decode_threads=%d pool=%d cpus=%zu reserve=%d other_cpus=%.2f"
                 " over_s=%.1f\n", n, pool, share.cpus.size(), share.reserve,
                 share.wall_ns > 0 ? share.other_ns / share.wall_ns : 0.0, share.wall_ns / 1e9);
         }
@@ -1815,7 +1815,7 @@ struct kimi_cpu_sink {
         run_participants = fixed ? fixed : threads;
         if (decode_threads_for == threads) { return; }
         decode_threads_for = threads;
-        std::fprintf(stderr, "[kimi_cpu_sink_threads] participants=%d decode_participants=%d\n", threads,
+        std::fprintf(stderr, "[ssd_cpu_sink_threads] participants=%d decode_participants=%d\n", threads,
                 run_participants);
     }
 
@@ -1881,7 +1881,7 @@ struct kimi_cpu_sink {
         // load time: nothing else runs, so every CPU pages the arena in
         cache.reserve_at_load(bytes, up, size_t(std::max(1, experts_used)), sink_process_cpus(), us);
     }
-    // At load, after the load's passes, before any request (kimi_cpu_sink_preload): the expert caches filled from the
+    // At load, after the load's passes, before any request (ssd_cpu_sink_preload): the expert caches filled from the
     // drive, which nothing else uses then. No request has named an expert yet, so every expert of a layer is as likely
     // as any other: the GPU tier takes each routed layer's first experts, its empty slots shared alike among the
     // layers, and the RAM cache the experts after them, as many as each layer's empty slots. What no request uses is as
@@ -1964,7 +1964,7 @@ struct kimi_cpu_sink {
                 if (r.failed) { ++failed; } else { ++ram_experts; }
             }
         }
-        std::fprintf(stderr, "[kimi_cpu_sink_preload] layers=%zu tier_slots=%zu tier_experts=%llu ram_experts=%llu failed=%llu "
+        std::fprintf(stderr, "[ssd_cpu_sink_preload] layers=%zu tier_slots=%zu tier_experts=%llu ram_experts=%llu failed=%llu "
             "read_bytes=%llu us=%.0f\n", routed.size(), tier_slots, (unsigned long long) tier_experts,
             (unsigned long long) ram_experts, (unsigned long long) failed, (unsigned long long) read_bytes, elapsed_us(start));
     }
@@ -2040,7 +2040,7 @@ struct kimi_cpu_sink {
             // A higher floor is published once the tier has given back what it adds, as far as the tier can now (the
             // watcher repeats it): the file pages that came back keep coming back while the tier holds their memory.
             if (ledger.floor() > before) { vram.reclaim_host(ledger.floor() - before); }
-            std::fprintf(stderr, "[kimi_host_ledger] reason=%s floor=%llu file_reserve=%llu margin=%llu explicit_reserve=%llu refaults=%llu updates=%llu\n",
+            std::fprintf(stderr, "[ssd_host_ledger] reason=%s floor=%llu file_reserve=%llu margin=%llu explicit_reserve=%llu refaults=%llu updates=%llu\n",
                     reason, (unsigned long long) ledger.floor(), (unsigned long long) ledger.state().file_reserve,
                     (unsigned long long) ledger.state().margin, (unsigned long long) ledger.state().explicit_reserve,
                     (unsigned long long) ledger.state().refaults, (unsigned long long) ledger.state().file_updates);
@@ -2071,7 +2071,7 @@ struct kimi_cpu_sink {
         const uint64_t before = ledger.state().margin, held = held_bytes();
         uint64_t untracked = 0;
         if (ledger.end_interval(consecutive, held, untracked)) {
-            std::fprintf(stderr, "[kimi_host_ledger] event=margin_grow token=%llu untracked=%llu margin_before=%llu margin=%llu held=%llu granted=%llu updates=%llu\n",
+            std::fprintf(stderr, "[ssd_host_ledger] event=margin_grow token=%llu untracked=%llu margin_before=%llu margin=%llu held=%llu granted=%llu updates=%llu\n",
                     (unsigned long long) token, (unsigned long long) untracked, (unsigned long long) before,
                     (unsigned long long) ledger.state().margin, (unsigned long long) held, (unsigned long long) ledger.state().granted,
                     (unsigned long long) ledger.state().margin_updates);
@@ -2095,14 +2095,14 @@ struct kimi_cpu_sink {
         const bool fits = room.within_limits(extra);
         if (!fits) {
             ++ledger_refusals;
-            std::fprintf(stderr, "[kimi_host_ledger] event=refused extra=%llu term=limits limits_shortage=%llu limits_readable=%d available=%llu floor=%llu\n",
+            std::fprintf(stderr, "[ssd_host_ledger] event=refused extra=%llu term=limits limits_shortage=%llu limits_readable=%d available=%llu floor=%llu\n",
                     (unsigned long long) extra, (unsigned long long) room.limits_shortage,
                     int(room.limits != ssd::host::room_unreadable), (unsigned long long) room.available,
                     (unsigned long long) room.floor);
         }
         return fits;
     }
-    // Room for a prefill, before it allocates anything (kimi_cpu_sink_cache_prefill_room): the ledger holds `pages`
+    // Room for a prefill, before it allocates anything (ssd_cpu_sink_cache_prefill_room): the ledger holds `pages`
     // for the file pages of the weight rows its graph gathers until the first decode token, and makes room for its
     // compute buffers (`host`, `device`) beside them, so that the RAM cache gives back what both need at once.
     bool prefill_room(uint64_t pages, uint64_t host, uint64_t device) {
@@ -2111,12 +2111,12 @@ struct kimi_cpu_sink {
         const uint64_t committed = cache.stats.committed_bytes;
         const bool fits = make_room(host, device);
         // (a refusal has its own receipt, with the short term)
-        std::fprintf(stderr, "[kimi_host_ledger] event=prefill_room pages=%llu host=%llu device=%llu fits=%d slots_before=%zu slots_after=%zu released_bytes=%llu\n",
+        std::fprintf(stderr, "[ssd_host_ledger] event=prefill_room pages=%llu host=%llu device=%llu fits=%d slots_before=%zu slots_after=%zu released_bytes=%llu\n",
                 (unsigned long long) pages, (unsigned long long) host, (unsigned long long) device, int(fits),
                 before, cache.enabled_slots(), (unsigned long long) (committed - std::min(committed, cache.stats.committed_bytes)));
         return fits;
     }
-    // The cost table a layer of `ntokens` tokens is placed from (ggml-ssd/place/layer-plan.h, kimi_place_table), the same for a
+    // The cost table a layer of `ntokens` tokens is placed from (ggml-ssd/place/layer-plan.h, ssd_place_table), the same for a
     // decode token and a grouped-prefill pass: the CPU's time for a one-token expert (decode's experts and a one-token
     // pass's, their running mean) and the grouped path's line (the sink's prefill calibration); the tier's
     // vector-engine lines and copy rates (host API costs2: every call and copy it makes); the batched engine's lines
@@ -2127,8 +2127,8 @@ struct kimi_cpu_sink {
     // page-locked copy is priced only once the tier has measured one; a pageable one, and the rows, at the start
     // values until then. In place: wherever the GPU reads host memory so for one token (decode's rule), and for a
     // longer pass where its engine can (the batched engine), the evaluator then choosing per layer.
-    kimi_place_table place_table(int ntokens, double route_bytes = 0.0) {
-        kimi_vram_host_costs c = {};
+    ssd_place_table place_table(int ntokens, double route_bytes = 0.0) {
+        ssd_vram_host_costs c = {};
         if (vram.context && vram.host_api) { vram.host_api->costs2(vram.context, &c); }
         const ssd::place::lane_measurement measured = {
             c.resident_call_us, c.resident_expert_us, c.host_call_us, c.host_expert_us,
@@ -2154,7 +2154,7 @@ struct kimi_cpu_sink {
         return mb;
     }
     // The layer's plan, once its reads are issued: the cost table's choice for a one-token layer (place_table,
-    // kimi_place_layer), the experts as grouped prefill describes its own (sink_vram::place_items). Every expert the
+    // ssd_place_layer), the experts as grouped prefill describes its own (sink_vram::place_items). Every expert the
     // GPU could take this layer is a candidate, priced with when its bytes are in host memory: a RAM hit at once, one
     // its prefetch still reads at that read's landing (its rest is read at once when the layer starts, ahead of the
     // layer's reads), a miss at its own; the executor hands a planned expert to the GPU once it has landed
@@ -2167,7 +2167,7 @@ struct kimi_cpu_sink {
         plan.gpu.assign(requests.size(), 0);
         if (!host_gpu_enabled || !nonblocking_down_sched || !vram.host_ready() || !(learning.cpu_expert_us > 0) ||
                 io_requests.size() > slots.size()) { return; }
-        kimi_vram_host_costs c = {};
+        ssd_vram_host_costs c = {};
         vram.host_api->costs2(vram.context, &c);
         const bool in_place = c.in_place != 0;
         if (!in_place) { host_lock_decide(); }
@@ -2177,11 +2177,11 @@ struct kimi_cpu_sink {
             [](size_t) { return true; }, [&](size_t i) { return !reserved(i); });
         const auto pending = prefetch_pending_mb();
         ssd::place::describe_decode(plan, items, pending);
-        kimi_place_limits limits;
+        ssd_place_limits limits;
         limits.slots = size_t(std::max(0, c.slots));
-        const kimi_place_table table = place_table(1);
+        const ssd_place_table table = place_table(1);
         const auto placed = ssd::place::plan_decode(plan, table, slots.size(), items, limits);
-        // Page-locking a slot is bought once, the move it allows pays per use: rent or buy (kimi_host_lock::missed). The
+        // Page-locking a slot is bought once, the move it allows pays per use: rent or buy (ssd_host_lock::missed). The
         // plan prices the moves it would make were the unlocked RAM hits' slots page-locked; each such slot accrues its
         // share of the time they would save, and goes to the registrar once that reaches one registration (the
         // registrar's measured mean, before the first one slot at 13.6 GB/s). Before a page-locked copy is measured a
@@ -2219,7 +2219,7 @@ struct kimi_cpu_sink {
             ++place.error[std::min<size_t>(100, size_t(error * 100.0))];
         }
         if (profile_enabled) {
-            std::fprintf(stderr, "[kimi_decode_place] token=%llu layer=%d resident=%zu ram=%zu miss=%zu locked=%zu candidates=%zu "
+            std::fprintf(stderr, "[ssd_decode_place] token=%llu layer=%d resident=%zu ram=%zu miss=%zu locked=%zu candidates=%zu "
                 "planned=%zu predicted_us=%.1f cpu_only_us=%.1f measured_us=%.1f fixed_us=%.1f total_us=%.1f pending=%zu "
                 "pending_planned=%zu\n",
                 (unsigned long long) vram.token, vram.requests.empty() ? -1 : vram.requests[0].layer,
@@ -2235,7 +2235,7 @@ struct kimi_cpu_sink {
             for (size_t b = 0; b < place.error.size(); ++b) { seen += place.error[b]; if (double(seen) >= q * double(total)) { return double(b); } }
             return 100.0;
         };
-        std::fprintf(stderr, "[kimi_decode_place] reason=%s layers=%llu tokens=%llu gpu_experts=%llu gpu_per_token=%.2f planned=%llu "
+        std::fprintf(stderr, "[ssd_decode_place] reason=%s layers=%llu tokens=%llu gpu_experts=%llu gpu_per_token=%.2f planned=%llu "
             "candidates=%llu refused=%llu wanted=%llu error_p50_pct=%.0f error_p90_pct=%.0f predicted_ms=%.1f measured_ms=%.1f cpu_only_ms=%.1f "
             "cpu_expert_us=%.1f early=%.3f fixed_us=%.1f decode_read_gbs=%.2f cpu_alone_us=%.1f cpu_shared_us=%.1f cpu_moved=%.3f "
             "pending=%llu pending_planned=%llu\n",
@@ -2250,14 +2250,14 @@ struct kimi_cpu_sink {
     // B3: the read ring page-locked when a GPU lane copies from it (a grouped-prefill tier with transient device slots
     // on a GPU that does not read host memory in place). A streamed transient's upload is then DMA on the tier's upload
     // stream, which returns at once: the next upload overlaps the current computation, and the cost table prices the
-    // copy on the link (kimi_place_layer). Each role buffer is one range, registered once per allocation of the ring, at
+    // copy on the link (ssd_place_layer). Each role buffer is one range, registered once per allocation of the ring, at
     // a quiescent point (a prefill layer before its reads and its launch; about 1.1-1.9 ms per 19-30 MB buffer, holding
     // the driver), and unregistered before the ring reallocates or frees it (reserve_ring, the destructor). A refused
     // registration leaves the ring pageable and is not retried before the next allocation.
     void ring_lock() {
         if (ring_pages.tried || !vram.context || !vram.prefill_enabled || !vram.host_api || !vram.prefill_api ||
                 !vram.prefill_api->transient_available(vram.context) || slots.empty()) { return; }
-        kimi_vram_host_costs c = {};
+        ssd_vram_host_costs c = {};
         vram.host_api->costs2(vram.context, &c);
         if (c.in_place && !c.in_place_only) { return; }  // the GPU reads the ring in place: nothing to page-lock
         if (!ring_pages.lock_pages) {
@@ -2272,7 +2272,7 @@ struct kimi_cpu_sink {
         const auto start = sink_clock::now();
         std::string why;
         vram.ring_locked = ring_pages.lock(buffers, &why);
-        std::fprintf(stderr, "[kimi_cpu_sink_io] ring_locked=%d ranges=%zu bytes=%zu us=%.0f%s%s\n", int(vram.ring_locked),
+        std::fprintf(stderr, "[ssd_cpu_sink_io] ring_locked=%d ranges=%zu bytes=%zu us=%.0f%s%s\n", int(vram.ring_locked),
             ring_pages.ranges.size(), vram.ring_locked ? bytes : size_t(0), elapsed_us(start), why.empty() ? "" : " reason=",
             why.c_str());
     }
@@ -2285,11 +2285,11 @@ struct kimi_cpu_sink {
     void host_lock_decide() {
         if (host_lock.decided || !cache.arena || !cache.stride || !vram.context || !vram.host_api) { return; }
         host_lock.decided = true;
-        kimi_vram_host_costs c = {};
+        ssd_vram_host_costs c = {};
         vram.host_api->costs2(vram.context, &c);
         const bool enabled = host_gpu_enabled && !c.in_place && cache.stride % cache.page_size == 0 &&
             uintptr_t(cache.arena) % cache.page_size == 0;
-        std::fprintf(stderr, "[kimi_host_register] reason=decided enabled=%d in_place=%d host_gpu=%d stride=%zu\n",
+        std::fprintf(stderr, "[ssd_host_register] reason=decided enabled=%d in_place=%d host_gpu=%d stride=%zu\n",
             int(enabled), int(c.in_place), int(host_gpu_enabled), cache.stride);
         if (!enabled) { return; }
         host_lock.lock_pages = [this](const void * p, size_t bytes, std::string * why) { return vram.register_host(p, bytes, why); };
@@ -2297,7 +2297,7 @@ struct kimi_cpu_sink {
         host_lock.start();
     }
     // In a decode layer's wait for reads (io_mutex held): the reads left, at the drive's decode rate, as the shadow a
-    // registration may take (kimi_host_lock::offer; before the first registration its price is one slot at 13.6 GB/s).
+    // registration may take (ssd_host_lock::offer; before the first registration its price is one slot at 13.6 GB/s).
     // Only wanted slots: a page-locked slot's admission upload is a DMA copy, cheaper, and the tier's admission rule
     // then admits more; with every slot page-locked an RTX 5090 admitted 15% more, evicted 25% more and read 2.5% more
     // experts from the drive (when the RAM cache dropped its copy of an expert the tier took).
@@ -2332,11 +2332,11 @@ struct kimi_cpu_sink {
     void slot_import_decide() {
         if (slot_imports.decided || !cache.arena || !cache.stride || !vram.context || !vram.host_api) { return; }
         slot_imports.decided = true;
-        kimi_vram_host_costs c = {};
+        ssd_vram_host_costs c = {};
         vram.host_api->costs2(vram.context, &c);
         slot_imports.enabled = host_gpu_enabled && c.in_place && c.in_place_only &&
             cache.stride % cache.page_size == 0 && uintptr_t(cache.arena) % cache.page_size == 0;
-        std::fprintf(stderr, "[kimi_host_import] reason=decided enabled=%d in_place=%d in_place_only=%d stride=%zu\n",
+        std::fprintf(stderr, "[ssd_host_import] reason=decided enabled=%d in_place=%d in_place_only=%d stride=%zu\n",
             int(slot_imports.enabled), int(c.in_place), int(c.in_place_only), cache.stride);
     }
     // Before a prefill pass launches on the GPU: each slot it moves an expert from, registered for in-place reads. A
@@ -2350,7 +2350,7 @@ struct kimi_cpu_sink {
         if (imported.size() != cache.entries.size()) { imported.resize(cache.entries.size(), 0); }
         const auto start = sink_clock::now();
         for (const auto & t : vram.prefill_transient) {
-            if (t.source != KIMI_VRAM_PREFILL_TRANSIENT_RAM || t.request_index < 0 ||
+            if (t.source != SSD_VRAM_PREFILL_TRANSIENT_RAM || t.request_index < 0 ||
                     size_t(t.request_index) >= requests.size()) {
                 continue;
             }
@@ -2386,7 +2386,7 @@ struct kimi_cpu_sink {
         if (!slot_imports.report) { return; }
         slot_imports.report = false;
         std::fprintf(stderr,
-            "[kimi_host_import] reason=%s registered=%llu released=%llu failures=%llu register_us=%.0f "
+            "[ssd_host_import] reason=%s registered=%llu released=%llu failures=%llu register_us=%.0f "
             "release_us=%.0f\n",
             reason, (unsigned long long) slot_imports.registered, (unsigned long long) slot_imports.released,
             (unsigned long long) slot_imports.failures, slot_imports.register_us, slot_imports.release_us);
@@ -2401,7 +2401,7 @@ struct kimi_cpu_sink {
         }
         if (slot_imports.decided) {
             std::fprintf(stderr,
-                "[kimi_host_import] reason=destroy enabled=%d registered=%llu released=%llu failures=%llu\n",
+                "[ssd_host_import] reason=destroy enabled=%d registered=%llu released=%llu failures=%llu\n",
                 int(slot_imports.enabled), (unsigned long long) slot_imports.registered,
                 (unsigned long long) slot_imports.released, (unsigned long long) slot_imports.failures);
         }
@@ -2419,7 +2419,7 @@ struct kimi_cpu_sink {
         if (!(ram + ssd) || !(learning.cpu_expert_us > 0)) { return; }
         // In place a host job's measured time is its whole cost; a discrete
         // device leaves out the copy. Gather observations before pure pricing.
-        kimi_vram_host_costs costs = {};
+        ssd_vram_host_costs costs = {};
         if (vram.host_ready()) { vram.host_api->costs2(vram.context, &costs); }
         double resident = 0, host = 0;
         if (costs.in_place) { vram.host_costs(resident, host); }
@@ -2447,7 +2447,7 @@ struct kimi_cpu_sink {
     // An item's hidden row of the last up/gate phase, quantized for down. SWIGLU gates it first with the graph's
     // kernel over the whole row: split elsewhere than at its vector width, elements would move into its scalar tail.
     void quantize_activation(const sink_work_item & w) {
-        if (activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+        if (activation_kind == SSD_CPU_SINK_ACTIVATION_SWIGLU) {
             ggml_vec_swiglu_f32(hidden, w.hidden, w.hidden, w.hidden_up);
         }
         quantize_hidden(w.hidden, w.down_quant, hidden);
@@ -2460,7 +2460,7 @@ struct kimi_cpu_sink {
     }
 
     // One phase in which every participant runs function(userdata, ith, nth); `last` as for compute_phase.
-    void parallel_phase(kimi_cpu_sink_parallel_fn function, void * userdata, bool last) {
+    void parallel_phase(ssd_cpu_sink_parallel_fn function, void * userdata, bool last) {
         parallel_fn = function;
         parallel_userdata = userdata;
         try { compute_phase(false, last); }
@@ -2559,7 +2559,7 @@ struct kimi_cpu_sink {
         // Keep each JSON record intact even when server logging uses stderr.
         sink_record out;
         if (timeline_active) {
-            out.append("[kimi_cpu_sink_timeline] {\"schema\":1,\"clock\":\"CLOCK_MONOTONIC_us\","
+            out.append("[ssd_cpu_sink_timeline] {\"schema\":1,\"clock\":\"CLOCK_MONOTONIC_us\","
                 "\"epoch\":%llu,\"token\":%llu,\"layer\":%d,\"call\":%llu,\"success\":%s,\"t\":[",
                 (unsigned long long) trace_epoch, (unsigned long long) trace_token, trace_layer,
                 (unsigned long long) trace_call, success ? "true" : "false");
@@ -2592,7 +2592,7 @@ struct kimi_cpu_sink {
             out.append("]}\n");
         }
         if (trace_enabled) {
-            out.append("[kimi_cpu_sink_trace] {\"schema\":1,\"event\":\"layer\",\"phase\":\"%s\","
+            out.append("[ssd_cpu_sink_trace] {\"schema\":1,\"event\":\"layer\",\"phase\":\"%s\","
                 "\"has_token\":%s,\"epoch\":%llu,\"token\":%llu,\"layer\":%d,\"call\":%llu,\"success\":%s,"
                 "\"selected_experts\":[", trace_decode ? "decode" : "prefill", trace_has_token ? "true" : "false",
                 (unsigned long long) trace_epoch, (unsigned long long) trace_token, trace_layer,
@@ -2635,7 +2635,7 @@ struct kimi_cpu_sink {
             out.append("]}\n");
         }
         if (profile_enabled) {
-            out.append("[kimi_cpu_sink_profile] {\"schema\":1,\"event\":\"layer\",\"phase\":\"%s\","
+            out.append("[ssd_cpu_sink_profile] {\"schema\":1,\"event\":\"layer\",\"phase\":\"%s\","
                 "\"scope\":\"%s\",\"has_token\":%s,\"epoch\":%llu,\"token\":%llu,\"layer\":%d,\"call\":%llu,\"success\":%s,"
                 "\"experts\":%llu,\"threads\":%d,\"expert_job\":%d,\"total_us\":%.3f,\"compute_wall_us\":%.3f,"
                 "\"wait_io_us\":%.3f,\"other_wall_us\":%.3f,\"io_job_wall_us\":%.3f,\"io_wait_wall_us\":%.3f,"
@@ -2724,10 +2724,10 @@ struct kimi_cpu_sink {
     void io_break(const std::exception & e) {
         try {
             sink_io_value(ring.drain(this, [](void * userdata, const sink_completion & cqe) {
-                static_cast<kimi_cpu_sink *>(userdata)->account_read_bytes(cqe);
+                static_cast<ssd_cpu_sink *>(userdata)->account_read_bytes(cqe);
             }));
         } catch (const std::exception & drain_error) {
-            std::fprintf(stderr, "[kimi_cpu_sink] cannot drain I/O after %s: %s; aborting\n",
+            std::fprintf(stderr, "[ssd_cpu_sink] cannot drain I/O after %s: %s; aborting\n",
                          e.what(), drain_error.what());
             std::abort();
         }
@@ -3002,7 +3002,7 @@ struct kimi_cpu_sink {
         const bool injected = lookahead.fail_every && ++lookahead.completions % lookahead.fail_every == 0;
         if (injected || cqe.res < 0 || size_t(cqe.res) < required || size_t(cqe.res) > expected) {
             if (!read.failed) {
-                std::fprintf(stderr, "[kimi_cpu_prefill_lookahead] event=read_failed layer=%d expert=%d role=%d result=%d"
+                std::fprintf(stderr, "[ssd_cpu_prefill_lookahead] event=read_failed layer=%d expert=%d role=%d result=%d"
                     " expected=%zu injected=%d\n", lookahead.layer, read.expert, role, int(cqe.res), expected, int(injected));
             }
             read.failed = true;
@@ -3037,7 +3037,7 @@ struct kimi_cpu_sink {
         try {
             sink_io_value(ring.drain(this, [](void *, const sink_completion &) {}));
         } catch (const std::exception & drain_error) {
-            std::fprintf(stderr, "[kimi_cpu_sink] cannot drain the read-ahead after %s: %s; aborting\n", e.what(),
+            std::fprintf(stderr, "[ssd_cpu_sink] cannot drain the read-ahead after %s: %s; aborting\n", e.what(),
                 drain_error.what());
             std::abort();
         }
@@ -3049,7 +3049,7 @@ struct kimi_cpu_sink {
         }
         poisoned = true;
         lookahead.active = false;
-        std::fprintf(stderr, "[kimi_cpu_prefill_lookahead] event=ring_failed error=%s\n", e.what());
+        std::fprintf(stderr, "[ssd_cpu_prefill_lookahead] event=ring_failed error=%s\n", e.what());
         io_cv.notify_all();
     }
     // (lock on io_mutex) The read-ahead issues nothing more, and the reads it has in flight landed or failed.
@@ -3134,7 +3134,7 @@ struct kimi_cpu_sink {
     // The call for `layer` of a grouped prefill, its requests prepared: the prediction the call before it planned
     // with (for this layer) against the routes this layer took, a rank at a time. A prediction of another layer or
     // pass measures nothing.
-    void lookahead_measure(int32_t layer, const kimi_cpu_sink_prefill_batch & batch) {
+    void lookahead_measure(int32_t layer, const ssd_cpu_sink_prefill_batch & batch) {
         auto & la = lookahead;
         const bool same = la.planned_layer == layer && layer >= 0 && la.planned_tokens == batch.ntokens &&
             la.planned_k > 0 && batch.nslots > 0 && batch.route_request_index;
@@ -3353,7 +3353,7 @@ struct kimi_cpu_sink {
         lookahead.failed_total += r.failed; lookahead.used += r.used; lookahead.unused += r.unused;
         lookahead.used_bytes += r.bytes; lookahead.no_slot += r.no_slot; lookahead.borrowed += r.borrowed;
         lookahead.declined += r.declined;
-        std::fprintf(stderr, "[kimi_cpu_prefill_lookahead] layer=%d enabled=%d window_us=%.0f"
+        std::fprintf(stderr, "[ssd_cpu_prefill_lookahead] layer=%d enabled=%d window_us=%.0f"
             " candidates=%llu planned=%llu issued=%llu read=%llu failed=%llu used=%llu unused=%llu"
             " bytes=%llu next_planned=%zu declined=%llu no_slot=%llu borrowed=%llu\n", r.layer, int(lookahead.enabled),
             r.window_us, (unsigned long long) r.candidates, (unsigned long long) r.planned,
@@ -3364,7 +3364,7 @@ struct kimi_cpu_sink {
     }
     void lookahead_summary() {
         if (!lookahead.enabled || !lookahead.layers) { return; }
-        std::fprintf(stderr, "[kimi_cpu_prefill_lookahead] reason=destroy layers=%llu planned=%llu issued=%llu read=%llu"
+        std::fprintf(stderr, "[ssd_cpu_prefill_lookahead] reason=destroy layers=%llu planned=%llu issued=%llu read=%llu"
             " failed=%llu used=%llu unused=%llu used_bytes=%llu no_slot=%llu unresolved=%llu no_candidate=%llu"
             " borrowed=%llu declined=%llu\n",
             (unsigned long long) lookahead.layers, (unsigned long long) lookahead.planned,
@@ -3381,7 +3381,7 @@ struct kimi_cpu_sink {
                 double(lookahead.rank_selected[rank]) / double(lookahead.rank_predicted[rank]));
             rates += one;
         }
-        std::fprintf(stderr, "[kimi_cpu_prefill_lookahead] reason=destroy_prediction tokens=%llu rank_selected=%s\n",
+        std::fprintf(stderr, "[ssd_cpu_prefill_lookahead] reason=destroy_prediction tokens=%llu rank_selected=%s\n",
             (unsigned long long) lookahead.rank_predicted[0], rates.c_str());
     }
 
@@ -3556,7 +3556,7 @@ struct kimi_cpu_sink {
                     std::any_of(requests.begin(), requests.end(),
                         [](const sink_request & r) { return r.vram_slot < 0; })) {
                 const size_t allocated = reserve_ring(max_bytes, true);
-                std::fprintf(stderr, "[kimi_cpu_sink_io] auto_cache_ring_resident=1 bytes=%zu\n", allocated);
+                std::fprintf(stderr, "[ssd_cpu_sink_io] auto_cache_ring_resident=1 bytes=%zu\n", allocated);
             }
             if (vram.hits) {
                 // GPU hits do not consume RAM cache quota or SSD ring credits.
@@ -3609,7 +3609,7 @@ struct kimi_cpu_sink {
         // a hidden row for each expert a phase may take
         const size_t hidden_floats = std::max<size_t>(1, requests.size()) * size_t(hidden);
         resize_scratch(activation, hidden_floats);
-        resize_scratch(activation_up, activation_kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU ? hidden_floats : 0);
+        resize_scratch(activation_up, activation_kind == SSD_CPU_SINK_ACTIVATION_SWIGLU ? hidden_floats : 0);
         resize_scratch(quant_input, ggml_row_size(up_traits->vec_dot_type, latent));
         quant_hidden_stride = ggml_row_size(down_traits->vec_dot_type, hidden);
         resize_scratch(quant_hidden, quant_hidden_stride);
@@ -3721,7 +3721,7 @@ struct kimi_cpu_sink {
                 if (work == no_work) {
                     for (size_t i = 0; i < requests.size(); ++i) {
                         const auto & r = requests[i];
-                        std::fprintf(stderr, "[kimi_cpu_sink] stuck expert=%zu id=%d stage=%d cache_hit=%d cache_admit=%d vram_slot=%d"
+                        std::fprintf(stderr, "[ssd_cpu_sink] stuck expert=%zu id=%d stage=%d cache_hit=%d cache_admit=%d vram_slot=%d"
                             " slot_request=%zu ready_roles=%u prefetch_pending=%d\n", i, r.id, int(expert_stage[i]), r.cache_hit,
                             r.cache_admit, r.vram_slot, slots[r.io_slot].request, unsigned(slots[r.io_slot].ready_roles),
                             r.cache_hit >= 0 ? prefetch_hit_state(r.cache_hit) : -1);
@@ -3750,7 +3750,7 @@ struct kimi_cpu_sink {
                         if (whole) { gpu_batch.push_back(i); }
                     }
                 }
-                std::vector<kimi_vram_host_job> jobs;
+                std::vector<ssd_vram_host_job> jobs;
                 std::vector<std::array<const void *, 3>> payloads;
                 for (size_t i : gpu_batch) {
                     const auto & r = requests[i];
@@ -3899,21 +3899,21 @@ struct kimi_cpu_sink {
 // A prefill consumer runs while the stream owns run_mutex, so its phases and
 // the role buffers cannot concurrently be used by decode. The phase runs on
 // every participant of the open call.
-void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,
-        kimi_cpu_sink_parallel_fn function, void * userdata) {
+void ssd_cpu_sink_parallel(struct ssd_cpu_sink * sink,
+        ssd_cpu_sink_parallel_fn function, void * userdata) {
     sink->parallel_phase(function, userdata, false);
 }
 
 // After a stream returned, on the same participants: a run of one parallel phase, the call's last before it
 // closes, so its participants then wait for the close as at a node boundary.
-void kimi_cpu_sink_parallel_last(struct kimi_cpu_sink * sink,
-        kimi_cpu_sink_parallel_fn function, void * userdata) {
+void ssd_cpu_sink_parallel_last(struct ssd_cpu_sink * sink,
+        ssd_cpu_sink_parallel_fn function, void * userdata) {
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
     sink->begin_participants(false);
     sink->parallel_phase(function, userdata, true);
 }
 
-void kimi_cpu_sink_host_grow(struct kimi_cpu_sink * sink, uint64_t bytes, const std::function<void()> & grow) {
+void ssd_cpu_sink_host_grow(struct ssd_cpu_sink * sink, uint64_t bytes, const std::function<void()> & grow) {
     if (!bytes) { grow(); return; }
     auto ticket = sink->cache.ledger.client->take(sink->cache.allocation_cost(bytes), 0, ssd::host::requester::outside,
         false, ssd::host::allocation_class::tracked);
@@ -3922,12 +3922,12 @@ void kimi_cpu_sink_host_grow(struct kimi_cpu_sink * sink, uint64_t bytes, const 
     ticket.value.commit();
 }
 
-bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
+bool ssd_cpu_sink_stream_hybrid(struct ssd_cpu_sink * sink,
         const struct ggml_tensor * up, const struct ggml_tensor * gate,
         const struct ggml_tensor * down, const int32_t * ids, int nexperts,
-        struct kimi_cpu_sink_prefill_batch * batch,
-        kimi_cpu_sink_consumer_fn consumer, void * userdata,
-        struct kimi_cpu_sink_stats * stats, char * error, size_t error_size) {
+        struct ssd_cpu_sink_prefill_batch * batch,
+        ssd_cpu_sink_consumer_fn consumer, void * userdata,
+        struct ssd_cpu_sink_stats * stats, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (stats) { *stats = {}; }
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
@@ -3988,7 +3988,7 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         // Set once prepare_prefill has seen this layer's format.
         bool streaming_ssd = false;
         auto streaming_stage = +[](void * context, int32_t request_index, int phase) -> int {
-            auto * owner = static_cast<kimi_cpu_sink *>(context);
+            auto * owner = static_cast<ssd_cpu_sink *>(context);
             if (request_index < 0 || size_t(request_index) >= owner->requests.size()) { return 0; }
             const auto & request = owner->requests[size_t(request_index)];
             auto & slot = owner->slots[request.io_slot];
@@ -4050,7 +4050,7 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         const size_t staging_limit = streaming_ssd ? sink->requests.size() : sink->slots.size();
         if (streaming_ssd) {
             std::fprintf(stderr,
-                "[kimi_prefill_staging] selected_cap=%zu ring_buffers=%zu streaming=1\n",
+                "[ssd_prefill_staging] selected_cap=%zu ring_buffers=%zu streaming=1\n",
                 staging_limit, sink->slots.size());
         }
         sink->vram.select_prefill_transient(
@@ -4278,7 +4278,7 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
         sink->cache.release_prefill_leases(sink->requests);
         batch->ssd_bytes = sink->current.read_bytes;
         std::fprintf(stderr,
-            "[kimi_cpu_prefill_sources] tensor=%s vram_experts=%llu vram_routes=%llu "
+            "[ssd_cpu_prefill_sources] tensor=%s vram_experts=%llu vram_routes=%llu "
             "ram_gpu_experts=%llu ram_gpu_routes=%llu ram_gpu_upload_bytes=%llu ram_gpu_upload_us=%.3f "
             "ssd_gpu_candidates=%llu ssd_gpu_experts=%llu ssd_gpu_routes=%llu "
             "ssd_gpu_upload_bytes=%llu ssd_gpu_upload_us=%.3f gpu_worker_us=%.3f "
@@ -4340,21 +4340,21 @@ bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
     }
 }
 
-extern "C" struct kimi_cpu_sink * kimi_cpu_sink_create(
-        int ring_experts, kimi_cpu_sink_resolver resolver, void * userdata, char * error, size_t error_size) {
+extern "C" struct ssd_cpu_sink * ssd_cpu_sink_create(
+        int ring_experts, ssd_cpu_sink_resolver resolver, void * userdata, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     try {
         if (ring_experts < 1 || ring_experts > 32 || !resolver) {
             throw std::runtime_error("CPU sink requires 1..32 ring experts and a resolver");
         }
-        return new kimi_cpu_sink(ring_experts, resolver, userdata);
+        return new ssd_cpu_sink(ring_experts, resolver, userdata);
     } catch (const std::exception & e) {
         sink_error(error, error_size, e.what());
         return nullptr;
     }
 }
 
-extern "C" bool kimi_cpu_sink_call_open(struct kimi_cpu_sink * sink, int nth, char * error, size_t error_size) {
+extern "C" bool ssd_cpu_sink_call_open(struct ssd_cpu_sink * sink, int nth, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
     try {
@@ -4365,15 +4365,15 @@ extern "C" bool kimi_cpu_sink_call_open(struct kimi_cpu_sink * sink, int nth, ch
     return false;
 }
 
-extern "C" void kimi_cpu_sink_call_close(struct kimi_cpu_sink * sink) {
+extern "C" void ssd_cpu_sink_call_close(struct ssd_cpu_sink * sink) {
     if (sink) { sink->close_call(); }
 }
 
-extern "C" void kimi_cpu_sink_call_join(struct kimi_cpu_sink * sink, int ith, int nth) {
+extern "C" void ssd_cpu_sink_call_join(struct ssd_cpu_sink * sink, int ith, int nth) {
     if (sink) { sink->join_call(ith, nth); }
 }
 
-extern "C" int kimi_cpu_sink_decode_threads(struct kimi_cpu_sink * sink, int pool) {
+extern "C" int ssd_cpu_sink_decode_threads(struct ssd_cpu_sink * sink, int pool) {
     if (!sink) { return pool; }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
     return sink->decode_threads(pool);
@@ -4429,13 +4429,13 @@ sink_configuration configured(const settings::snapshot * input, const runtime_se
 }
 }  // namespace
 
-kimi_cpu_sink * create_configured(const settings::snapshot * input, const runtime_services * services,
-        kimi_cpu_sink_resolver resolver, void * userdata, char * error, size_t error_size) noexcept {
+ssd_cpu_sink * create_configured(const settings::snapshot * input, const runtime_services * services,
+        ssd_cpu_sink_resolver resolver, void * userdata, char * error, size_t error_size) noexcept {
     sink_error(error, error_size, "");
     try {
         const auto value = configured(input, services);
         if (!resolver) { throw std::runtime_error("missing SSD expert resolver"); }
-        return new kimi_cpu_sink(ssd::io::expert_ring_depth, resolver, userdata, value);
+        return new ssd_cpu_sink(ssd::io::expert_ring_depth, resolver, userdata, value);
     } catch (const std::exception & e) {
         sink_error(error, error_size, e.what());
         return nullptr;
@@ -4443,8 +4443,8 @@ kimi_cpu_sink * create_configured(const settings::snapshot * input, const runtim
 }
 
 namespace testing {
-kimi_cpu_sink * create(int ring_experts, const execution_policy & policy,
-        const runtime_services * services, kimi_cpu_sink_resolver resolver, void * userdata,
+ssd_cpu_sink * create(int ring_experts, const execution_policy & policy,
+        const runtime_services * services, ssd_cpu_sink_resolver resolver, void * userdata,
         char * error, size_t error_size) noexcept {
     sink_error(error, error_size, "");
     try {
@@ -4455,7 +4455,7 @@ kimi_cpu_sink * create(int ring_experts, const execution_policy & policy,
         value.policy = policy;
         sink_copy_services(value, services);
         if (policy.vram_budget && !value.has_gpu) { throw std::runtime_error("explicit GPU fixture requires an injected provider"); }
-        return new kimi_cpu_sink(ring_experts, resolver, userdata, value);
+        return new ssd_cpu_sink(ring_experts, resolver, userdata, value);
     } catch (const std::exception & e) {
         sink_error(error, error_size, e.what());
         return nullptr;
@@ -4465,14 +4465,14 @@ kimi_cpu_sink * create(int ring_experts, const execution_policy & policy,
 }  // namespace cpu
 }  // namespace ssd
 
-const ssd::telemetry::debug_channels & kimi_cpu_sink_debug(const kimi_cpu_sink * sink) noexcept {
+const ssd::telemetry::debug_channels & ssd_cpu_sink_debug(const ssd_cpu_sink * sink) noexcept {
     static const ssd::telemetry::debug_channels off;
     return sink ? sink->configuration.debug : off;
 }
 
-extern "C" void kimi_cpu_sink_destroy(struct kimi_cpu_sink * sink) { delete sink; }
+extern "C" void ssd_cpu_sink_destroy(struct ssd_cpu_sink * sink) { delete sink; }
 
-extern "C" void kimi_cpu_sink_prefetch_hint(struct kimi_cpu_sink * sink, int32_t layer, const int32_t * experts, int n) {
+extern "C" void ssd_cpu_sink_prefetch_hint(struct ssd_cpu_sink * sink, int32_t layer, const int32_t * experts, int n) {
     if (!sink || !experts || n <= 0) { return; }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
     sink->prefetch.hint_n = std::min(n, 64);
@@ -4480,7 +4480,7 @@ extern "C" void kimi_cpu_sink_prefetch_hint(struct kimi_cpu_sink * sink, int32_t
     sink->prefetch.hint_layer = layer;
 }
 
-extern "C" void kimi_cpu_sink_prefill_hint(struct kimi_cpu_sink * sink, int32_t layer, const int32_t * experts,
+extern "C" void ssd_cpu_sink_prefill_hint(struct ssd_cpu_sink * sink, int32_t layer, const int32_t * experts,
         int ntokens, int k) {
     if (!sink || !experts || layer < 0 || ntokens < 1 || k < 1 || k > 16 ||
             ntokens > std::numeric_limits<int>::max() / k) { return; }
@@ -4491,7 +4491,7 @@ extern "C" void kimi_cpu_sink_prefill_hint(struct kimi_cpu_sink * sink, int32_t 
     la.hint_layer = layer; la.hint_tokens = ntokens; la.hint_k = k;
 }
 
-extern "C" void kimi_cpu_sink_cache_reset(struct kimi_cpu_sink * sink) {
+extern "C" void ssd_cpu_sink_cache_reset(struct ssd_cpu_sink * sink) {
     if (!sink) { return; }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     sink->lookahead_quiesce();
@@ -4500,7 +4500,7 @@ extern "C" void kimi_cpu_sink_cache_reset(struct kimi_cpu_sink * sink) {
     sink->cache.active = sink->cache.has_token = sink->cache.paused = false;
 }
 
-extern "C" bool kimi_cpu_sink_cache_configure(struct kimi_cpu_sink * sink, uint64_t budget,
+extern "C" bool ssd_cpu_sink_cache_configure(struct ssd_cpu_sink * sink, uint64_t budget,
         const int32_t * priority, int n, int quota, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
@@ -4509,8 +4509,8 @@ extern "C" bool kimi_cpu_sink_cache_configure(struct kimi_cpu_sink * sink, uint6
     catch (const std::exception & e) { sink_error(error, error_size, e.what()); return false; }
 }
 
-// kimi_cpu_sink_cache_begin, and with `request` kimi_cpu_sink_request_begin.
-static bool sink_phase_begin(struct kimi_cpu_sink * sink, uint64_t epoch, uint64_t token, bool decode, bool request,
+// ssd_cpu_sink_cache_begin, and with `request` ssd_cpu_sink_request_begin.
+static bool sink_phase_begin(struct ssd_cpu_sink * sink, uint64_t epoch, uint64_t token, bool decode, bool request,
         char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
@@ -4538,23 +4538,23 @@ static bool sink_phase_begin(struct kimi_cpu_sink * sink, uint64_t epoch, uint64
     sink->trace_has_token = decode;
     sink->trace_decode = decode;
     if (sink->trace_enabled && !decode) {
-        std::fprintf(stderr, "[kimi_cpu_sink_trace] {\"schema\":1,\"event\":\"reset\",\"phase\":\"prefill\","
+        std::fprintf(stderr, "[ssd_cpu_sink_trace] {\"schema\":1,\"event\":\"reset\",\"phase\":\"prefill\","
             "\"epoch\":%llu,\"token\":%llu}\n", (unsigned long long) epoch, (unsigned long long) token);
     }
     return true;
 }
 
-extern "C" bool kimi_cpu_sink_cache_begin(struct kimi_cpu_sink * sink, uint64_t epoch,
+extern "C" bool ssd_cpu_sink_cache_begin(struct ssd_cpu_sink * sink, uint64_t epoch,
         uint64_t token, bool decode, char * error, size_t error_size) {
     return sink_phase_begin(sink, epoch, token, decode, false, error, error_size);
 }
 
-extern "C" bool kimi_cpu_sink_request_begin(struct kimi_cpu_sink * sink, uint64_t epoch, char * error, size_t error_size) {
+extern "C" bool ssd_cpu_sink_request_begin(struct ssd_cpu_sink * sink, uint64_t epoch, char * error, size_t error_size) {
     return sink_phase_begin(sink, epoch, 0, false, true, error, error_size);
 }
 
-extern "C" bool kimi_cpu_sink_vram_phase_complete(
-        struct kimi_cpu_sink * sink, bool decode, char * error, size_t error_size) {
+extern "C" bool ssd_cpu_sink_vram_phase_complete(
+        struct ssd_cpu_sink * sink, bool decode, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
@@ -4567,8 +4567,8 @@ extern "C" bool kimi_cpu_sink_vram_phase_complete(
     }
 }
 
-extern "C" bool kimi_cpu_sink_vram_reserve_accumulator(
-        struct kimi_cpu_sink * sink, int tokens, char * error, size_t error_size) {
+extern "C" bool ssd_cpu_sink_vram_reserve_accumulator(
+        struct ssd_cpu_sink * sink, int tokens, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
@@ -4576,7 +4576,7 @@ extern "C" bool kimi_cpu_sink_vram_reserve_accumulator(
     catch (const std::exception & e) { sink_error(error, error_size, e.what()); return false; }
 }
 
-extern "C" bool kimi_cpu_sink_vram_reserve(struct kimi_cpu_sink * sink, const struct ggml_tensor * const * experts,
+extern "C" bool ssd_cpu_sink_vram_reserve(struct ssd_cpu_sink * sink, const struct ggml_tensor * const * experts,
         int n_layers, int experts_used, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink || !experts || n_layers < 1 ||
@@ -4592,7 +4592,7 @@ extern "C" bool kimi_cpu_sink_vram_reserve(struct kimi_cpu_sink * sink, const st
     catch (const std::exception & e) { sink_error(error, error_size, e.what()); return false; }
 }
 
-extern "C" bool kimi_cpu_sink_preload(struct kimi_cpu_sink * sink, const struct ggml_tensor * const * experts,
+extern "C" bool ssd_cpu_sink_preload(struct ssd_cpu_sink * sink, const struct ggml_tensor * const * experts,
         int n_layers, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink || !experts || n_layers < 1 ||
@@ -4605,7 +4605,7 @@ extern "C" bool kimi_cpu_sink_preload(struct kimi_cpu_sink * sink, const struct 
     catch (const std::exception & e) { sink_error(error, error_size, e.what()); return false; }
 }
 
-extern "C" void kimi_cpu_sink_cache_get_stats(struct kimi_cpu_sink * sink, kimi_cpu_sink_cache_stats * stats) {
+extern "C" void ssd_cpu_sink_cache_get_stats(struct ssd_cpu_sink * sink, ssd_cpu_sink_cache_stats * stats) {
     if (!stats) { return; }
     *stats = {};
     if (!sink) { return; }
@@ -4615,36 +4615,36 @@ extern "C" void kimi_cpu_sink_cache_get_stats(struct kimi_cpu_sink * sink, kimi_
 
 // The unconfigured C compatibility API has no L3 registration to borrow.
 // A null sink is therefore a refusal, never a new independent production ledger.
-extern "C" bool kimi_cpu_sink_cache_make_room(struct kimi_cpu_sink * sink, uint64_t host_bytes, uint64_t device_bytes) {
+extern "C" bool ssd_cpu_sink_cache_make_room(struct ssd_cpu_sink * sink, uint64_t host_bytes, uint64_t device_bytes) {
     if (!sink) { return false; }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try { return sink->make_room(host_bytes, device_bytes); }
     catch (const std::exception & e) {
-        std::fprintf(stderr, "[kimi_cpu_sink_cache] make_room failed: %s\n", e.what());
+        std::fprintf(stderr, "[ssd_cpu_sink_cache] make_room failed: %s\n", e.what());
         return false;
     }
 }
 
-extern "C" bool kimi_cpu_sink_cache_prefill_room(struct kimi_cpu_sink * sink, uint64_t pages, uint64_t host_bytes,
+extern "C" bool ssd_cpu_sink_cache_prefill_room(struct ssd_cpu_sink * sink, uint64_t pages, uint64_t host_bytes,
         uint64_t device_bytes) {
     if (!sink) { return false; }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
     try { return sink->prefill_room(pages, host_bytes, device_bytes); }
     catch (const std::exception & e) {
-        std::fprintf(stderr, "[kimi_cpu_sink_cache] prefill_room failed: %s\n", e.what());
+        std::fprintf(stderr, "[ssd_cpu_sink_cache] prefill_room failed: %s\n", e.what());
         return false;
     }
 }
 
-static bool sink_activation_valid(const kimi_cpu_sink_activation * activation) {
+static bool sink_activation_valid(const ssd_cpu_sink_activation * activation) {
     if (!activation) { return false; }
     switch (activation->kind) {
-        case KIMI_CPU_SINK_ACTIVATION_SITU:
+        case SSD_CPU_SINK_ACTIVATION_SITU:
             return std::isfinite(activation->situ_beta) && activation->situ_beta > 0.0f &&
                 std::isfinite(activation->situ_linear_beta);
-        case KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP:
+        case SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP:
             return !std::isnan(activation->swiglu_limit) && activation->swiglu_limit > 1e-6f;
-        case KIMI_CPU_SINK_ACTIVATION_SWIGLU:
+        case SSD_CPU_SINK_ACTIVATION_SWIGLU:
             return true;
         default:
             return false;
@@ -4653,7 +4653,7 @@ static bool sink_activation_valid(const kimi_cpu_sink_activation * activation) {
 
 namespace ssd {
 namespace cpu {
-result<host::allocation_ticket> take_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
+result<host::allocation_ticket> take_room_configured(ssd_cpu_sink * sink, const settings::snapshot * input,
         const runtime_services * services, uint64_t host_bytes, uint64_t device_bytes, uint64_t pages) noexcept {
     if (!input || !services || !services->host) { return sink_host_failure(status::invalid, "missing host client or settings"); }
     try {
@@ -4686,27 +4686,27 @@ result<host::allocation_ticket> take_room_configured(kimi_cpu_sink * sink, const
       }
       catch (...) { return sink_host_failure(status::io, "host admission failed"); }
 }
-bool cache_make_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
+bool cache_make_room_configured(ssd_cpu_sink * sink, const settings::snapshot * input,
         const runtime_services * services, uint64_t host_bytes, uint64_t device_bytes) noexcept {
     auto ticket = take_room_configured(sink, input, services, host_bytes, device_bytes, UINT64_MAX);
     // The caller sees only false: name why, a refused setting included.
-    if (!ticket) { std::fprintf(stderr, "[kimi_cpu_sink_cache] make_room failed: %s\n", ticket.error.c_str()); }
+    if (!ticket) { std::fprintf(stderr, "[ssd_cpu_sink_cache] make_room failed: %s\n", ticket.error.c_str()); }
     return bool(ticket); // Compatibility observation only: destructor cancels the unmaterialized ticket.
 }
-bool cache_prefill_room_configured(kimi_cpu_sink * sink, const settings::snapshot * input,
+bool cache_prefill_room_configured(ssd_cpu_sink * sink, const settings::snapshot * input,
         const runtime_services * services, uint64_t pages, uint64_t host_bytes, uint64_t device_bytes) noexcept {
     auto ticket = take_room_configured(sink, input, services, host_bytes, device_bytes, pages);
-    if (!ticket) { std::fprintf(stderr, "[kimi_cpu_sink_cache] prefill_room failed: %s\n", ticket.error.c_str()); }
+    if (!ticket) { std::fprintf(stderr, "[ssd_cpu_sink_cache] prefill_room failed: %s\n", ticket.error.c_str()); }
     return bool(ticket); // Production allocations use take_room_configured and retain the ticket.
 }
 }  // namespace cpu
 }  // namespace ssd
 
-extern "C" bool kimi_cpu_sink_run_activation(
-        struct kimi_cpu_sink * sink, const struct ggml_tensor * up, const struct ggml_tensor * gate,
+extern "C" bool ssd_cpu_sink_run_activation(
+        struct ssd_cpu_sink * sink, const struct ggml_tensor * up, const struct ggml_tensor * gate,
         const struct ggml_tensor * down, const float * input, const int32_t * ids, const float * weights,
-        int nslots, const struct kimi_cpu_sink_activation * activation, float * output,
-        struct kimi_cpu_sink_stats * stats, char * error, size_t error_size) {
+        int nslots, const struct ssd_cpu_sink_activation * activation, float * output,
+        struct ssd_cpu_sink_stats * stats, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (stats) { *stats = {}; }
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
@@ -4722,7 +4722,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
         sink->begin_participants(true);
         if (!input || !ids || !weights || !output || nslots < 0 || nslots > 1024 ||
             !sink_activation_valid(activation)) {
-            throw std::runtime_error(activation && activation->kind == KIMI_CPU_SINK_ACTIVATION_SITU ?
+            throw std::runtime_error(activation && activation->kind == SSD_CPU_SINK_ACTIVATION_SITU ?
                 "invalid CPU sink input or SiTU parameters" : "invalid CPU sink input or activation parameters");
         }
         if (sink->poisoned) { throw std::runtime_error("CPU sink ring is poisoned after an I/O failure"); }
@@ -4882,7 +4882,7 @@ extern "C" bool kimi_cpu_sink_run_activation(
                 float * contribution = sink->expert_output.data() + expert * size_t(sink->latent);
                 const bool first = expert == 0;
                 if (activation->post_exp_norm) {
-                    kimi_cpu_sink_normalize_expert(contribution, sink->latent,
+                    ssd_cpu_sink_normalize_expert(contribution, sink->latent,
                         activation->post_exp_norm, activation->post_exp_norm_eps);
                     for (int row = 0; row < sink->latent; ++row) {
                         volatile float scaled = contribution[row] * sink->requests[expert].weight;
@@ -4931,12 +4931,12 @@ extern "C" bool kimi_cpu_sink_run_activation(
     }
 }
 
-extern "C" bool kimi_cpu_sink_run(
-        struct kimi_cpu_sink * sink, const struct ggml_tensor * up, const struct ggml_tensor * gate,
+extern "C" bool ssd_cpu_sink_run(
+        struct ssd_cpu_sink * sink, const struct ggml_tensor * up, const struct ggml_tensor * gate,
         const struct ggml_tensor * down, const float * input, const int32_t * ids, const float * weights,
         int nslots, float situ_beta, float situ_linear_beta, float * output,
-        struct kimi_cpu_sink_stats * stats, char * error, size_t error_size) {
-    const kimi_cpu_sink_activation activation = { KIMI_CPU_SINK_ACTIVATION_SITU, situ_beta, situ_linear_beta, 0.0f, nullptr, 0.0f };
-    return kimi_cpu_sink_run_activation(sink, up, gate, down, input, ids, weights, nslots, &activation,
+        struct ssd_cpu_sink_stats * stats, char * error, size_t error_size) {
+    const ssd_cpu_sink_activation activation = { SSD_CPU_SINK_ACTIVATION_SITU, situ_beta, situ_linear_beta, 0.0f, nullptr, 0.0f };
+    return ssd_cpu_sink_run_activation(sink, up, gate, down, input, ids, weights, nslots, &activation,
         output, stats, error, error_size);
 }

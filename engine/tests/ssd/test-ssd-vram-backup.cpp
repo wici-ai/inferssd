@@ -42,9 +42,9 @@ int main() {
                 std::vector<float> input(f.latent);
                 for(int i=0;i<f.latent;++i)input[i]=.031f*std::sin(float(i*7+token*31))+.1f;
                 std::vector<float> a(f.latent),b(f.latent);tensors meta(f,layer);char error[512]={};
-                kimi_cpu_sink_stats stats={};
+                ssd_cpu_sink_stats stats={};
                 for(int arm=0;arm<2;++arm){auto sink=arm?mixed.get():cpu.get();auto & out=arm?b:a;
-                    require(kimi_cpu_sink_run(sink,meta.role[0],meta.role[1],meta.role[2],input.data(),ids.data(),weights.data(),ids.size(),4,25,out.data(),&stats,error,sizeof(error)),error);
+                    require(ssd_cpu_sink_run(sink,meta.role[0],meta.role[1],meta.role[2],input.data(),ids.data(),weights.data(),ids.size(),4,25,out.data(),&stats,error,sizeof(error)),error);
                     require(stats.read_errors==0 && stats.pending_reads==0 && stats.fallback_count==0,"hybrid work did not drain");++checks;
                 }
                 double error2=0,norm2=0;
@@ -64,12 +64,12 @@ int main() {
         begin_cache(mixed.get(),18,11,false);begin_cache(mixed.get(),18,12);
         f.fault=fixture::past_eof;f.fault_expert=3;f.fault_role=2;
         tensors meta(f,1);std::vector<int32_t> ids={0,1,3};std::vector<float> weights(3,.3f),input(f.latent,.1f),out(f.latent);
-        char error[512]={};kimi_cpu_sink_stats stats={};
-        require(!kimi_cpu_sink_run(mixed.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),ids.data(),weights.data(),3,4,25,out.data(),&stats,error,sizeof(error)),"I/O failure accepted");
+        char error[512]={};ssd_cpu_sink_stats stats={};
+        require(!ssd_cpu_sink_run(mixed.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),ids.data(),weights.data(),3,4,25,out.data(),&stats,error,sizeof(error)),"I/O failure accepted");
         require(stats.pending_reads==0 && stats.fallback_count==0,"I/O failure returned with live work");++checks;
         f.fault=fixture::none;f.fault_expert=f.fault_role=-1;
         begin_cache(mixed.get(),18,13,false);begin_cache(mixed.get(),18,14);
-        require(kimi_cpu_sink_run(mixed.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),ids.data(),weights.data(),3,4,25,out.data(),&stats,error,sizeof(error)),error);++checks;
+        require(ssd_cpu_sink_run(mixed.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),ids.data(),weights.data(),3,4,25,out.data(),&stats,error,sizeof(error)),error);++checks;
         std::printf("BACKUP_MODE_PASS async=%d\n",int(async));
     }
     std::printf("REAL_GPU_BACKUP_PASS compared=%zu assertions=%zu worst_rel_l2=%.3g\n",compared,checks,worst);return 0;

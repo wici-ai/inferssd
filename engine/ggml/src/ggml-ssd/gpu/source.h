@@ -6,7 +6,7 @@
 
 // Borrowed descriptors must remain open until run returns. No tensor payload is
 // accessed: resolve the packed expert by its tensor name and expert index.
-struct kimi_cpu_sink_source {
+struct ssd_cpu_sink_source {
     int fd_direct;
     uint64_t offset;
     size_t nbytes;

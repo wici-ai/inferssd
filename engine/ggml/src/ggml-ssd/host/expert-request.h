@@ -5,7 +5,7 @@
 #include <cstdint>
 namespace ssd { namespace host {
 struct expert_request {
-    kimi_cpu_sink_source role[3];
+    ssd_cpu_sink_source role[3];
     float weight;
     int32_t id = -1;
     int cache_hit = -1;

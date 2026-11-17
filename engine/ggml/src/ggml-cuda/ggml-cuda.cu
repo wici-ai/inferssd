@@ -6249,7 +6249,7 @@ static size_t ggml_cuda_uma_boost_headroom() {
         return 0;
     }
     const long page = sysconf(_SC_PAGESIZE);
-    return (size_t) kimi_memory_boost::headroom(meminfo, zoneinfo, factor, page > 0 ? (uint64_t) page : 4096);
+    return (size_t) ssd_memory_boost::headroom(meminfo, zoneinfo, factor, page > 0 ? (uint64_t) page : 4096);
 }
 #endif // defined(__linux__)
 

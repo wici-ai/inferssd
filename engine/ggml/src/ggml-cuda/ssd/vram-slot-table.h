@@ -11,7 +11,7 @@
 class vram_slot_table {
 public:
     struct entry {
-        kimi_vram_request key = {};
+        ssd_vram_request key = {};
         uint64_t touched = 0;
         uint32_t native_refs = 0;
         // uploading: reserved by a deferred upload that outlives its layer; never a victim until published
@@ -40,7 +40,7 @@ public:
     std::vector<layer> layers;
     std::vector<int> pool_layers;
     std::vector<int> hits, admissions;
-    std::vector<kimi_vram_request> requests;
+    std::vector<ssd_vram_request> requests;
     bool count_decay = true;
     double minimum_count = 0;
     bool global_pool = false;
@@ -64,7 +64,7 @@ public:
     // The sink's RAM cache: whether it keeps a copy of an expert (none without one).
     int (*ram_holds)(void *, int32_t layer, int32_t expert) = nullptr;
     void * ram_holds_arg = nullptr;
-    bool ram_copy(const kimi_vram_request & key) const { return ram_holds && ram_holds(ram_holds_arg, key.layer, key.expert); }
+    bool ram_copy(const ssd_vram_request & key) const { return ram_holds && ram_holds(ram_holds_arg, key.layer, key.expert); }
     uint64_t lease_generation = 0, next_generation = 0;
 
     explicit vram_slot_table(size_t capacity, const std::vector<int> & priority, bool decay, double minimum=0,
@@ -73,7 +73,7 @@ public:
             first_layer(first), last_layer(last), experts(experts_per_layer) {
         if (!std::isfinite(minimum) || minimum < 0 || minimum > 4 || (!decay && minimum != 0)) { throw std::runtime_error("VRAM minimum selection count"); }
         if (!std::isfinite(half) || half < 1 || half > 64 || (!decay && half != 2)) { throw std::runtime_error("VRAM decay half-life"); }
-        if (first < 0 || last < first || last >= KIMI_VRAM_MAX_LAYERS || experts_per_layer < 1 || experts_per_layer > 65536) { throw std::runtime_error("VRAM layer/expert geometry"); }
+        if (first < 0 || last < first || last >= SSD_VRAM_MAX_LAYERS || experts_per_layer < 1 || experts_per_layer > 65536) { throw std::runtime_error("VRAM layer/expert geometry"); }
         if (priority.empty() || capacity > priority.size()*size_t(experts)) { throw std::runtime_error("VRAM cache capacity"); }
         pool_layers = priority;
         for(int id:priority)if(id<first_layer || id>last_layer)throw std::runtime_error("VRAM layer priority range");
@@ -158,12 +158,12 @@ public:
         change(slots[to], [&](entry & x) { evictions += x.valid; x = moved; });
         change(slots[from], [](entry & x) { x = {}; });
     }
-    static bool same_source(const kimi_vram_source & a,const kimi_vram_source & b) {
+    static bool same_source(const ssd_vram_source & a,const ssd_vram_source & b) {
         return a.device==b.device && a.inode==b.inode && a.inode_hi==b.inode_hi && a.size==b.size && a.offset==b.offset &&
             a.bytes==b.bytes && a.mtime_s==b.mtime_s && a.mtime_ns==b.mtime_ns &&
             a.ctime_s==b.ctime_s && a.ctime_ns==b.ctime_ns;
     }
-    static bool same(const kimi_vram_request & a,const kimi_vram_request & b) {
+    static bool same(const ssd_vram_request & a,const ssd_vram_request & b) {
         if(a.layer!=b.layer || a.expert!=b.expert)return false;
         for(int r=0;r<3;++r)if(!same_source(a.role[r],b.role[r]))return false;
         return true; // Routing weight is not part of immutable payload identity.
@@ -204,7 +204,7 @@ public:
     // The first slot of the request's layer range whose key is the request's and for which take(slot) holds, or -1;
     // the slots it looks at are the keyed ones with the request's expert, in slot order. A slot without a key keeps
     // the default one, which no request's sources match.
-    template<class P> int find(const kimi_vram_request & request,P && take) const {
+    template<class P> int find(const ssd_vram_request & request,P && take) const {
         const auto & l=layers[size_t(request.layer)];
         for(const uint32_t i:l.keyed[size_t(request.expert)]){
             const auto & e=slots[i];
@@ -239,7 +239,7 @@ public:
         }
         return l.counts[e.key.expert]*l.score_factor;
     }
-    void prepare(const kimi_vram_request * input,size_t n,uint32_t demand_mask=UINT32_MAX) {
+    void prepare(const ssd_vram_request * input,size_t n,uint32_t demand_mask=UINT32_MAX) {
         if(in_flight || lease_generation || !step || n>16)throw std::runtime_error("invalid VRAM prepare phase");
         if(n)requests.assign(input,input+n);else requests.clear();
         hits.assign(n,-1);admissions.assign(n,-1);
@@ -306,7 +306,7 @@ public:
         if(!e.locked || e.valid || e.uploading)throw std::runtime_error("duplicate deferred VRAM upload");
         change(e,[](entry & x){x.uploading=true;});
     }
-    void publish_upload(size_t slot,const kimi_vram_request & key) {
+    void publish_upload(size_t slot,const ssd_vram_request & key) {
         if(in_flight || lease_generation || slot>=slots.size())throw std::runtime_error("invalid deferred VRAM publication phase");
         auto & e=slots[slot];
         if(!e.uploading || e.valid || !same(e.key,key))throw std::runtime_error("deferred VRAM publication lost its reservation");
@@ -321,7 +321,7 @@ public:
     // A prefill's use of the preloaded entries of the experts its pass routes in a layer (the next prepare's union,
     // before its seeds are planned): each becomes a seed of its prompt, as if the prefill had copied it into an empty
     // slot. The others of the layer stay preloaded, and so available to its seeds.
-    void adopt_preloaded(const kimi_vram_request * input,size_t n) {
+    void adopt_preloaded(const ssd_vram_request * input,size_t n) {
         for(size_t j=0;j<n;++j) {
             const int i=find(input[j],[](const entry & e){return e.valid && e.preloaded;});
             if(i>=0)change(slots[size_t(i)],[](entry & x){x.preloaded=false;x.seed=true;});
@@ -331,11 +331,11 @@ public:
     // prepare(), increment counts, or evict an existing decode entry.
     // A seeded entry therefore has score zero until decode actually requests
     // it, making unused prompt heat the first victim of later decode misses.
-    int reserve_cold_prefill(const kimi_vram_request & request) {
+    int reserve_cold_prefill(const ssd_vram_request & request) {
         return reserve_unrequested(request,request.layer,true);
     }
     // At load: an empty slot for an expert no request has named yet, its copy to follow (publish_cold_prefill).
-    int reserve_preload(const kimi_vram_request & request) {
+    int reserve_preload(const ssd_vram_request & request) {
         return reserve_unrequested(request,first_layer-1,false);
     }
     // Slots no entry holds (all of them in a global pool's layer ranges): what a preload may fill.
@@ -358,7 +358,7 @@ public:
         for(auto & e:slots)if(e.valid && e.seed && !e.locked){change(e,[](entry & x){x={};});++n;}
         return n;
     }
-    void publish_cold_prefill(size_t slot,const kimi_vram_request & request) {
+    void publish_cold_prefill(size_t slot,const ssd_vram_request & request) {
         if(in_flight || lease_generation || slot>=slots.size())
             throw std::runtime_error("invalid cold-prefill VRAM publication phase");
         auto & e=slots[slot];
@@ -368,7 +368,7 @@ public:
     }
     // A reservation of a slot no request asked for: a seed (seed) or a preload. `layer`: the latest layer whose
     // preloaded entries it may take (available); below first_layer, only an empty slot.
-    int reserve_unrequested(const kimi_vram_request & request,int layer,bool seed) {
+    int reserve_unrequested(const ssd_vram_request & request,int layer,bool seed) {
         if(in_flight || lease_generation || native_pinned() || request.layer<first_layer ||
                 size_t(request.layer)>=layers.size() || request.expert<0 || request.expert>=experts) {
             throw std::runtime_error("invalid unrequested VRAM reservation phase");
@@ -384,12 +384,12 @@ public:
         return -1;
     }
     // Drops a reservation whose copy did not complete: a seed's, or a deferred upload's in a block given back.
-    void cancel_upload(size_t slot,const kimi_vram_request & request) {
+    void cancel_upload(size_t slot,const ssd_vram_request & request) {
         if(slot>=slots.size())return;
         auto & e=slots[slot];
         if(e.uploading && !e.valid && same(e.key,request))change(e,[](entry & x){x={};});
     }
-    void cancel_cold_prefill(size_t slot,const kimi_vram_request & request) { cancel_upload(slot,request); }
+    void cancel_cold_prefill(size_t slot,const ssd_vram_request & request) { cancel_upload(slot,request); }
     // Only prepare locks a slot in flight: its hits and its admissions.
     void finish() {
         if(!in_flight)throw std::runtime_error("VRAM finish without prepare");
@@ -400,7 +400,7 @@ public:
     // Read-only grouped-prefill lease. Unlike prepare(), this accepts the full
     // distinct-expert union, does not update heat/admission state, and returns
     // physical slot IDs so a later worker can reuse each resident triplet.
-    uint64_t acquire_slots(const kimi_vram_request * input, size_t n, int * found) {
+    uint64_t acquire_slots(const ssd_vram_request * input, size_t n, int * found) {
         if (in_flight || lease_generation || native_pinned() || n > size_t(experts) ||
                 (n && (!input || !found)) || next_generation == UINT64_MAX) {
             throw std::runtime_error("invalid VRAM grouped-prefill lease phase");

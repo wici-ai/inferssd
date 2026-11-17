@@ -40,7 +40,7 @@ __global__ void generic_activate(const float * up_gate, float * hidden, int hits
     }
     const int hit = index / rows;
     const int row = index - hit * rows;
-    hidden[index] = kimi_vram_activate(up_gate[(2 * hit) * rows + row], up_gate[(2 * hit + 1) * rows + row], kind,
+    hidden[index] = ssd_vram_activate(up_gate[(2 * hit) * rows + row], up_gate[(2 * hit + 1) * rows + row], kind,
         situ_beta, situ_linear_beta, swiglu_limit);
 }
 
@@ -107,7 +107,7 @@ struct generic_engine {
             throw;
         }
         std::fprintf(stderr,
-            "[kimi_vram_bridge] format=%s/%s latent=%d hidden=%d input=f32 hidden_quantizer=%s bitwise=0\n",
+            "[ssd_vram_bridge] format=%s/%s latent=%d hidden=%d input=f32 hidden_quantizer=%s bitwise=0\n",
             ggml_type_name(ggml_type(up_type)), ggml_type_name(ggml_type(down_type_)), latent, hidden, floating ? "none_f32" : "cuda_q8_1");
     }
 
@@ -137,7 +137,7 @@ struct generic_engine {
     }
 
     ~generic_engine() {
-        std::fprintf(stderr, "[kimi_vram_generic_timing] calls=%llu hits=%llu total_us=%.0f\n",
+        std::fprintf(stderr, "[ssd_vram_generic_timing] calls=%llu hits=%llu total_us=%.0f\n",
             (unsigned long long) calls, (unsigned long long) hits, total_us);
         close();
     }
@@ -155,22 +155,22 @@ struct generic_engine {
     }
 
     void check(const vram_compute_expert * experts, int count, int first, const void * input, size_t input_bytes,
-            const kimi_vram_activation & activation) const {
+            const ssd_vram_activation & activation) const {
         if (closed || poisoned) { throw std::runtime_error("generic VRAM engine is closed"); }
         if (!experts || !input || count < 1 || first < 0 || count > max_hits - first ||
                 input_bytes != size_t(latent) * sizeof(float)) {
             throw std::runtime_error("generic VRAM engine input shape");
         }
-        if (activation.kind == KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP) {
+        if (activation.kind == SSD_VRAM_ACTIVATION_SWIGLU_CLAMP) {
             if (std::isnan(activation.swiglu_limit) || activation.swiglu_limit <= 1e-6f) {
                 throw std::runtime_error("generic VRAM engine invalid SwiGLU clamp");
             }
-        } else if (activation.kind == KIMI_VRAM_ACTIVATION_SITU) {
+        } else if (activation.kind == SSD_VRAM_ACTIVATION_SITU) {
             if (!std::isfinite(activation.situ_beta) || activation.situ_beta <= 0.0f ||
                     !std::isfinite(activation.situ_linear_beta)) {
                 throw std::runtime_error("generic VRAM engine invalid SiTU parameters");
             }
-        } else if (activation.kind != KIMI_VRAM_ACTIVATION_SWIGLU) {
+        } else if (activation.kind != SSD_VRAM_ACTIVATION_SWIGLU) {
             throw std::runtime_error("generic VRAM engine activation kind");
         }
         for (int i = 0; i < count; ++i) {
@@ -207,7 +207,7 @@ struct generic_engine {
     // what the matrix-vector kernel gives that row alone: one product over more rows, or one quantization for more
     // products, changes no bit.
     void enqueue(const vram_compute_expert * experts, int count, int first, const void * input, size_t input_bytes,
-            const kimi_vram_activation & activation) {
+            const ssd_vram_activation & activation) {
         float * staged = host_input + size_t(first) * latent;
         float * row_input = device_input + size_t(first) * latent;
         std::memcpy(staged, input, input_bytes);
@@ -240,7 +240,7 @@ struct generic_engine {
     }
 
     void run(const vram_compute_expert * experts, int count, const void * input, size_t input_bytes,
-            const kimi_vram_activation & activation, float * output) {
+            const ssd_vram_activation & activation, float * output) {
         check(experts, count, 0, input, input_bytes, activation);
         if (!output) { throw std::runtime_error("generic VRAM engine input shape"); }
         const auto start = clock_type::now();
@@ -251,7 +251,7 @@ struct generic_engine {
     }
 
     void launch(const vram_compute_expert * experts, int count, int first, const void * input, size_t input_bytes,
-            const kimi_vram_activation & activation, cudaEvent_t ready, cudaEvent_t start, cudaEvent_t end) {
+            const ssd_vram_activation & activation, cudaEvent_t ready, cudaEvent_t start, cudaEvent_t end) {
         check(experts, count, first, input, input_bytes, activation);
         if (!start || !end) { throw std::runtime_error("generic VRAM engine launch without its events"); }
         cuda_check(cudaSetDevice(device), "cudaSetDevice");
@@ -305,7 +305,7 @@ template <class F> int guarded(void * context, char * error, size_t error_size, 
 }
 
 int compute(void * context, const vram_compute_expert * experts, int hits,
-        const void * input, size_t input_bytes, const kimi_vram_activation * activation,
+        const void * input, size_t input_bytes, const ssd_vram_activation * activation,
         float * output, char * error, size_t error_size) {
     return guarded(context, error, error_size, [&](generic_engine & engine) {
         if (!activation) { throw std::runtime_error("null generic VRAM compute argument"); }
@@ -314,7 +314,7 @@ int compute(void * context, const vram_compute_expert * experts, int hits,
 }
 
 int launch(void * context, const vram_compute_expert * experts, int hits, int first,
-        const void * input, size_t input_bytes, const kimi_vram_activation * activation,
+        const void * input, size_t input_bytes, const ssd_vram_activation * activation,
         CUevent_st * ready, CUevent_st * start, CUevent_st * end, char * error, size_t error_size) {
     return guarded(context, error, error_size, [&](generic_engine & engine) {
         if (!activation) { throw std::runtime_error("null generic VRAM launch argument"); }
@@ -335,7 +335,7 @@ size_t host_bytes(void * context) {
 }
 } // namespace
 
-extern "C" const vram_format_compute_api * kimi_vram_generic_format_compute_get_api() {
+extern "C" const vram_format_compute_api * ssd_vram_generic_format_compute_get_api() {
     static const vram_format_compute_api api = {
         4, sizeof(vram_format_compute_api), create, destroy, compute, device_bytes, host_bytes, launch, host_rows
     };

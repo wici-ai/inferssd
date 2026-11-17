@@ -170,8 +170,8 @@ int main() {
                 multiply(GGML_TYPE_Q8_0, up[routes[route]].data(), hidden, latent, x, u, quantize_activations);
                 multiply(GGML_TYPE_Q8_0, gate[routes[route]].data(), hidden, latent, x, g, quantize_activations);
                 for (int i = 0; i < hidden; ++i) {
-                    if (kind == KIMI_VRAM_ACTIVATION_SWIGLU) { h[i] = silu(g[i]) * u[i]; }
-                    else if (kind == KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP) { h[i] = silu(std::min(g[i], limit)) * std::clamp(u[i], -limit, limit); }
+                    if (kind == SSD_VRAM_ACTIVATION_SWIGLU) { h[i] = silu(g[i]) * u[i]; }
+                    else if (kind == SSD_VRAM_ACTIVATION_SWIGLU_CLAMP) { h[i] = silu(std::min(g[i], limit)) * std::clamp(u[i], -limit, limit); }
                     else { h[i] = beta * std::tanh(g[i] / beta) / (1.0f + std::exp(-g[i])) * linear_beta * std::tanh(u[i] / linear_beta); }
                 }
                 multiply(GGML_TYPE_Q8_0, down[routes[route]].data(), latent, hidden, h.data(), d, quantize_activations);
@@ -186,8 +186,8 @@ int main() {
         }
         return rows;
     };
-    const auto expected = by_hand(KIMI_VRAM_ACTIVATION_SWIGLU);
-    const auto expected_q8 = by_hand(KIMI_VRAM_ACTIVATION_SWIGLU, false, true);
+    const auto expected = by_hand(SSD_VRAM_ACTIVATION_SWIGLU);
+    const auto expected_q8 = by_hand(SSD_VRAM_ACTIVATION_SWIGLU, false, true);
 
     ssd::runtime_services services;
     services.gpu = provider;
@@ -195,19 +195,19 @@ int main() {
     char error[512] = {};
     void * lane = provider->settings->create(nullptr, &services, error, sizeof(error));
     if (!lane) { fail(error); }
-    kimi_vram_host_costs costs = {};
+    ssd_vram_host_costs costs = {};
     provider->host->costs2(lane, &costs);
     if (!costs.in_place || !costs.in_place_only) { fail("the lane must say it reads in place, and nothing else"); }
 
-    std::vector<kimi_vram_request> requests(experts);
+    std::vector<ssd_vram_request> requests(experts);
     std::vector<int> slots(experts, 7);
     const int32_t layers[] = { 0 };
-    const kimi_vram_expert_format format = { latent, hidden, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, experts, 1, layers };
+    const ssd_vram_expert_format format = { latent, hidden, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, experts, 1, layers };
     if (provider->prefill->prepare(lane, requests.data(), experts, &format, slots.data(), error, sizeof(error))) { fail(error); }
     for (int slot : slots) { if (slot != -1) { fail("the lane holds nothing across layers"); } }
-    kimi_vram_prefill_lane info = {};
+    ssd_vram_prefill_lane info = {};
     provider->prefill->lane(lane, &info);
-    if (info.engine != KIMI_VRAM_PREFILL_ENGINE_BATCHED) {
+    if (info.engine != SSD_VRAM_PREFILL_ENGINE_BATCHED) {
         std::printf("GRAPH_LANE_SKIP the device has no such product\n");
         provider->api->destroy(lane);
         return 0;
@@ -216,13 +216,13 @@ int main() {
     if (provider->elastic->reserve_accumulate(lane, tokens, error, sizeof(error))) { fail(error); }
     if (!provider->prefill->transient_available(lane)) { fail("the pass's memory was not reserved"); }
 
-    kimi_vram_prefill_launch options = { { KIMI_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f }, nullptr, 0.0f, 1 };
-    const auto run = [&](stage_state * stage, std::vector<float> & output, kimi_vram_prefill_stats & stats, int count = experts) {
-        std::vector<kimi_vram_prefill_transient> transient(count);
+    ssd_vram_prefill_launch options = { { SSD_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f }, nullptr, 0.0f, 1 };
+    const auto run = [&](stage_state * stage, std::vector<float> & output, ssd_vram_prefill_stats & stats, int count = experts) {
+        std::vector<ssd_vram_prefill_transient> transient(count);
         for (int e = 0; e < count; ++e) {
             auto & t = transient[e];
             t.request_index = e;
-            t.source = stage ? KIMI_VRAM_PREFILL_TRANSIENT_SSD : KIMI_VRAM_PREFILL_TRANSIENT_RAM;
+            t.source = stage ? SSD_VRAM_PREFILL_TRANSIENT_SSD : SSD_VRAM_PREFILL_TRANSIENT_RAM;
             const char * base = weights.at(size_t(e) * expert_bytes);
             t.role[0] = base; t.role[1] = base + up_bytes; t.role[2] = base + 2 * up_bytes;
             t.stage = stage ? stage_state::call : nullptr;
@@ -254,7 +254,7 @@ int main() {
     const auto compare = [&](const std::vector<float> & output, const char * what) { compare_with(output, expected, expected_q8, what); };
 
     std::vector<float> output;
-    kimi_vram_prefill_stats stats = {};
+    ssd_vram_prefill_stats stats = {};
     {
         const auto original_routes = routes;
         for (int row_count : {2, 3, 9}) {
@@ -289,17 +289,17 @@ int main() {
     compare(output, "copied");
     if (stats.ssd_transient_experts != experts) { fail("an expert was not computed"); }
 
-    options.activation = { KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, limit };
+    options.activation = { SSD_VRAM_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, limit };
     if (run(nullptr, output, stats)) { fail(error); }
-    compare_with(output, by_hand(KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP), by_hand(KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP, false, true), "bounded");
-    options.activation = { KIMI_VRAM_ACTIVATION_SITU, beta, linear_beta, 0.0f };
+    compare_with(output, by_hand(SSD_VRAM_ACTIVATION_SWIGLU_CLAMP), by_hand(SSD_VRAM_ACTIVATION_SWIGLU_CLAMP, false, true), "bounded");
+    options.activation = { SSD_VRAM_ACTIVATION_SITU, beta, linear_beta, 0.0f };
     if (run(nullptr, output, stats)) { fail(error); }
-    compare_with(output, by_hand(KIMI_VRAM_ACTIVATION_SITU), by_hand(KIMI_VRAM_ACTIVATION_SITU, false, true), "situ");
-    options.activation = { KIMI_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f };
+    compare_with(output, by_hand(SSD_VRAM_ACTIVATION_SITU), by_hand(SSD_VRAM_ACTIVATION_SITU, false, true), "situ");
+    options.activation = { SSD_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f };
     options.post_norm = norm_weights.data();
     options.post_norm_eps = norm_eps;
     if (run(nullptr, output, stats)) { fail(error); }
-    compare_with(output, by_hand(KIMI_VRAM_ACTIVATION_SWIGLU, true), by_hand(KIMI_VRAM_ACTIVATION_SWIGLU, true, true), "post norm");
+    compare_with(output, by_hand(SSD_VRAM_ACTIVATION_SWIGLU, true), by_hand(SSD_VRAM_ACTIVATION_SWIGLU, true, true), "post norm");
     options.post_norm = nullptr;
 
     if (provider->host->register_host(lane, weights.data, weights.bytes, error, sizeof(error))) {
@@ -321,7 +321,7 @@ int main() {
     if (provider->prefill->transient_available(lane)) { fail("decode gave the memory back: no expert may move"); }
     provider->api->destroy(lane);
 
-    // Layers of three formats in a pass, declared per layer (kimi_vram_expert_format): layer 0 of a type this device
+    // Layers of three formats in a pass, declared per layer (ssd_vram_expert_format): layer 0 of a type this device
     // does not multiply, layer 1 with a Q4_0 down, layer 2 with the larger Q8_0 one (the experts above). As the sink does,
     // each layer's pass memory is reserved before the layer is prepared, the previous layer's format still the prepared
     // one: a layer the device runs right after one it does not has the lane, and the larger layer after the smaller
@@ -361,29 +361,29 @@ int main() {
         const int32_t layer_ids[] = { 0, 1, 2 };
         const int32_t up_types[] = { unrun, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 };
         const int32_t down_types[] = { unrun, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 };
-        options = { { KIMI_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f }, nullptr, 0.0f, 1 };
+        options = { { SSD_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f }, nullptr, 0.0f, 1 };
         // the sink's order for one layer: the pass reserved, the layer prepared, its lane read; true: the lane takes it
         const auto prepare_layer = [&](int layer) {
-            const kimi_vram_expert_format declared = { latent, hidden, up_types[layer], down_types[layer], experts, 3,
+            const ssd_vram_expert_format declared = { latent, hidden, up_types[layer], down_types[layer], experts, 3,
                 layer_ids, up_types, down_types };
             if (provider->elastic->reserve_accumulate(mixed, tokens, error, sizeof(error))) { fail(error); }
             if (provider->prefill->prepare(mixed, requests.data(), experts, &declared, slots.data(), error, sizeof(error))) { fail(error); }
-            kimi_vram_prefill_lane layer_lane = {};
+            ssd_vram_prefill_lane layer_lane = {};
             provider->prefill->lane(mixed, &layer_lane);
-            const bool taken = layer_lane.engine == KIMI_VRAM_PREFILL_ENGINE_BATCHED;
+            const bool taken = layer_lane.engine == SSD_VRAM_PREFILL_ENGINE_BATCHED;
             if (taken != (provider->prefill->transient_available(mixed) != 0)) {
                 fail("a layer's lane and its pass memory disagree");
             }
             return taken;
         };
         const auto run_layer = [&](const memory & set, size_t set_bytes, std::vector<float> & output) {
-            std::vector<kimi_vram_prefill_transient> transient(experts);
+            std::vector<ssd_vram_prefill_transient> transient(experts);
             for (int e = 0; e < experts; ++e) {
                 const char * base = set.at(size_t(e) * set_bytes);
-                transient[e] = { e, KIMI_VRAM_PREFILL_TRANSIENT_RAM, { base, base + up_bytes, base + 2 * up_bytes }, nullptr, nullptr };
+                transient[e] = { e, SSD_VRAM_PREFILL_TRANSIENT_RAM, { base, base + up_bytes, base + 2 * up_bytes }, nullptr, nullptr };
             }
             output.assign(size_t(tokens) * latent, 0.0f);
-            kimi_vram_prefill_stats layer_stats = {};
+            ssd_vram_prefill_stats layer_stats = {};
             if (provider->prefill->launch(mixed, input.data(), size_t(latent) * sizeof(float), routes.data(), route_weights.data(),
                     nslots, tokens, transient.data(), experts, &options, error, sizeof(error))) { fail(error); }
             if (provider->prefill->finish(mixed, output.data(), latent, &layer_stats, error, sizeof(error))) { fail(error); }
@@ -392,7 +392,7 @@ int main() {
         // An earlier layer taught the lane the declared formats, as the sink's first layer does: the first layer's pass
         // is reserved before any format is known, and stays on the CPU.
         {
-            const kimi_vram_expert_format first = { latent, hidden, up_types[1], down_types[1], experts, 3, layer_ids,
+            const ssd_vram_expert_format first = { latent, hidden, up_types[1], down_types[1], experts, 3, layer_ids,
                 up_types, down_types };
             if (provider->prefill->prepare(mixed, requests.data(), experts, &first, slots.data(), error, sizeof(error))) { fail(error); }
         }

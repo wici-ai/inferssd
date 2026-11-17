@@ -81,15 +81,15 @@ void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, mod
         // the load step with every routed layer's tensors: the sink declares each layer's types to the tier
         tensors first(f, 1), second(f, 2);
         const ggml_tensor * layers[] = { first.role[0], first.role[1], first.role[2], second.role[0], second.role[1], second.role[2] };
-        for (kimi_cpu_sink * sink : { cpu.get(), mixed.get() }) {
+        for (ssd_cpu_sink * sink : { cpu.get(), mixed.get() }) {
             char error[512] = {};
-            require(kimi_cpu_sink_vram_reserve(sink, layers, 2, 4, error, sizeof(error)), std::string("reserve: ") + error);
+            require(ssd_cpu_sink_vram_reserve(sink, layers, 2, 4, error, sizeof(error)), std::string("reserve: ") + error);
         }
     }
     uint64_t cpu_reads = 0;
     uint64_t mixed_reads = 0;
-    const kimi_cpu_sink_activation activation = {
-        KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f
+    const ssd_cpu_sink_activation activation = {
+        SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f
     };
 
     for (int token = 1; token <= 4; ++token) {
@@ -111,9 +111,9 @@ void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, mod
             std::vector<float> got(static_cast<size_t>(latent));
             tensors meta(f, layer);
             for (int arm = 0; arm < 2; ++arm) {
-                kimi_cpu_sink_stats stats = {};
+                ssd_cpu_sink_stats stats = {};
                 char error[512] = {};
-                const bool ok = kimi_cpu_sink_run_activation(arm ? mixed.get() : cpu.get(),
+                const bool ok = ssd_cpu_sink_run_activation(arm ? mixed.get() : cpu.get(),
                     meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(), weights.data(),
                     int(ids.size()), &activation, (arm ? got : expected).data(), &stats, error, sizeof(error));
                 require(ok, std::string("generic sink run failed mode=") + selected.name +

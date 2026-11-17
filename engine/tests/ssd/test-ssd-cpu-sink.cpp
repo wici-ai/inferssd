@@ -1,5 +1,5 @@
 #include "explicit-fixture-inputs.h"
-// Independent CPU-only direct-read, read-ring and numerical coverage for the Kimi sink.
+// Independent CPU-only direct-read, read-ring and numerical coverage for the CPU sink.
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -142,7 +142,7 @@ struct fixture {
     std::vector<int32_t> stored; // the experts the file holds; empty: all of them
     std::vector<int> layer_ids = { 1, 2 }; // the routed layers the file holds
     ~fixture() { ssd::platform::close_fd(fd); if (remove_on_destroy) { test_resources::remove_file(path); } }
-    static bool resolve(void * user, const char * name, int32_t id, kimi_cpu_sink_source * out) {
+    static bool resolve(void * user, const char * name, int32_t id, ssd_cpu_sink_source * out) {
         auto & f = *static_cast<fixture *>(user);
         ++f.resolve_calls;
         auto it = f.entries.find({ name, id });
@@ -177,7 +177,7 @@ static void put_bytes(std::ofstream & f, const void * data, size_t n) {
 }
 
 static void make_synthetic(fixture & f, uint32_t seed = 20260908) {
-    f.path = test_resources::temp_file("kimi-cpu-sink-test"); f.remove_on_destroy = true;
+    f.path = test_resources::temp_file("ssd-cpu-sink-test"); f.remove_on_destroy = true;
     std::mt19937 rng(seed);
     std::normal_distribution<float> sample(0.0f, 0.06f);
     // Keep the full on-disk GGMLMOEPACKv1 layout, including index and padding.
@@ -290,13 +290,13 @@ static sink_ptr make_sink(fixture_inputs & inputs, fixture & f, int threads, int
 }
 
 struct sample_result {
-    kimi_cpu_sink_stats stats = {};
+    ssd_cpu_sink_stats stats = {};
     double max_abs = 0, rel_l2 = 0, wall_us = 0, user_us = 0, system_us = 0;
     long voluntary_switches = 0, involuntary_switches = 0, minor_faults = 0, major_faults = 0, max_rss_kib = 0;
     uint64_t output_hash = 1469598103934665603ULL;
 };
 
-static void check_io_targets(fixture_inputs & inputs, const kimi_cpu_sink_stats & stats, bool succeeded) {
+static void check_io_targets(fixture_inputs & inputs, const ssd_cpu_sink_stats & stats, bool succeeded) {
     require(stats.cache_fill_read_requests + stats.ring_read_requests == stats.read_requests &&
             stats.cache_fill_read_bytes + stats.ring_read_bytes == stats.read_bytes,
             "cache/ring transport counters do not sum to total IO");
@@ -328,19 +328,19 @@ static uint64_t cache_slot_bytes(const fixture_inputs & inputs, uint64_t triplet
     return (triplet + page - 1) / page * page;
 }
 
-static sample_result run_checked(fixture_inputs & inputs, const char * name, fixture & f, kimi_cpu_sink * sink, tensors & meta,
+static sample_result run_checked(fixture_inputs & inputs, const char * name, fixture & f, ssd_cpu_sink * sink, tensors & meta,
         const std::vector<float> & input, const std::vector<int32_t> & ids,
         const std::vector<float> & weights, const std::vector<float> & expected, int layer, float linear_beta,
         size_t expected_hits = 0, int expected_admitted = -1, std::vector<float> * exact_output = nullptr,
-        const kimi_cpu_sink_activation * activation = nullptr) {
+        const ssd_cpu_sink_activation * activation = nullptr) {
     sample_result result;
     std::vector<float> guarded(f.latent + 2, -12345.25f); char error[512] = {};
     const auto before = test_resources::usage();
     const auto begin = std::chrono::steady_clock::now();
     bool ok = activation ?
-        kimi_cpu_sink_run_activation(sink, meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(),
+        ssd_cpu_sink_run_activation(sink, meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(),
                                weights.data(), int(ids.size()), activation, guarded.data() + 1, &result.stats, error, sizeof(error)) :
-        kimi_cpu_sink_run(sink, meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(), weights.data(),
+        ssd_cpu_sink_run(sink, meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(), weights.data(),
                                int(ids.size()), 4.0f, linear_beta, guarded.data() + 1, &result.stats, error, sizeof(error));
     result.wall_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - begin).count();
     const auto after = test_resources::usage();
@@ -405,7 +405,7 @@ static void print_sample(const char * name, const sample_result & result) {
     std::fflush(stdout);
 }
 
-static void compare_case(fixture_inputs & inputs, const char * name, fixture & f, kimi_cpu_sink * sink, int layer,
+static void compare_case(fixture_inputs & inputs, const char * name, fixture & f, ssd_cpu_sink * sink, int layer,
         const std::vector<float> & input, const std::vector<int32_t> & ids,
         const std::vector<float> & weights, float linear_beta = 25.0f) {
     tensors meta(f, layer);
@@ -425,16 +425,16 @@ static void retype(ggml_tensor * tensor, ggml_type type) {
 static void unsupported_type_case(fixture_inputs & inputs, fixture & f, const std::vector<float> & input) {
     auto sink = make_sink(inputs, f, 2, 1); tensors meta(f, 1);
     retype(meta.role[1], GGML_TYPE_F32);
-    const int32_t id = 3; const float weight = 1; std::vector<float> output(f.latent); char error[512] = {}; kimi_cpu_sink_stats stats = {};
-    const bool ok = kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight, 1,
+    const int32_t id = 3; const float weight = 1; std::vector<float> output(f.latent); char error[512] = {}; ssd_cpu_sink_stats stats = {};
+    const bool ok = ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight, 1,
                                       4, 25, output.data(), &stats, error, sizeof(error));
     require(!ok && std::strstr(error, "not supported yet") && std::strstr(error, "f32"), "unsupported type was not named");
 }
 
 static void fault_case(fixture_inputs & inputs, const char * name, fixture & f, fixture::fault_kind fault, const std::vector<float> & input) {
     f.fault = fault; auto sink = make_sink(inputs, f, 2, 1); tensors meta(f, 1);
-    const int32_t id = 3; const float weight = 1; std::vector<float> output(f.latent); char error[512] = {}; kimi_cpu_sink_stats stats = {};
-    bool ok = kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight, 1,
+    const int32_t id = 3; const float weight = 1; std::vector<float> output(f.latent); char error[512] = {}; ssd_cpu_sink_stats stats = {};
+    bool ok = ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight, 1,
                                4, 25, output.data(), &stats, error, sizeof(error));
     require(!ok && error[0] && stats.fallback_count == 0, std::string(name) + " did not fail closed");
     check_io_targets(inputs, stats, false);
@@ -523,7 +523,7 @@ static void make_resident_copy(fixture & f, const std::string & directory) {
     if (statfs(directory.c_str(), &fs) || uint64_t(fs.f_type) != 0x01021994ULL) {
         throw unsupported_resident("resident control requires an existing tmpfs directory; no buffered/disk substitute");
     }
-    std::string pattern = directory + "/kimi-sink-resident-XXXXXX";
+    std::string pattern = directory + "/ssd-sink-resident-XXXXXX";
     std::vector<char> name(pattern.begin(), pattern.end()); name.push_back(0);
     const int tfd = mkstemp(name.data()); require(tfd >= 0, "resident mkstemp failed"); close(tfd);
     if (f.fd >= 0) { close(f.fd); f.fd = -1; }
@@ -627,7 +627,7 @@ static void real_test(fixture_inputs & inputs, const std::string & pack, const s
 
 struct fixture_selector {
     fixture * active = nullptr;
-    static bool resolve(void * user, const char * name, int32_t id, kimi_cpu_sink_source * out) {
+    static bool resolve(void * user, const char * name, int32_t id, ssd_cpu_sink_source * out) {
         auto * selector = static_cast<fixture_selector *>(user);
         return fixture::resolve(selector->active, name, id, out);
     }
@@ -666,8 +666,8 @@ static void registration_failure_child(fixture_inputs & inputs, fixture & f) {
             drop_child_memlock();
             tensors meta(f, 1);
             std::vector<float> input(f.latent, 0.1f), output(f.latent);
-            int32_t id = 3; float weight = 1; char error[512] = {}; kimi_cpu_sink_stats stats = {};
-            const bool ok = kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+            int32_t id = 3; float weight = 1; char error[512] = {}; ssd_cpu_sink_stats stats = {};
+            const bool ok = ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
                 &id, &weight, 1, 4, 25, output.data(), &stats, error, sizeof(error));
             require(!ok && std::strstr(error, "IORING_REGISTER_BUFFERS") &&
                     stats.read_requests == 0 && stats.fallback_count == 0,
@@ -722,9 +722,9 @@ static void registered_lifecycle_tests(fixture_inputs & inputs) {
     tensors meta(small, 1);
     const int32_t id = 3; const float weight = 1;
     std::vector<float> output(small.latent);
-    kimi_cpu_sink_stats stats = {};
+    ssd_cpu_sink_stats stats = {};
     small.fault = fixture::past_eof;
-    const bool ok = kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
+    const bool ok = ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
         xs.data(), &id, &weight, 1, 4, 25, output.data(), &stats, error, sizeof(error));
     require(!ok && stats.read_errors > 0 && stats.fallback_count == 0, "fixed short read did not fail closed");
     check_io_targets(inputs, stats, false);
@@ -740,9 +740,9 @@ static uint64_t triplet_bytes(const fixture & f) {
     return bytes;
 }
 
-static kimi_cpu_sink_cache_stats cache_snapshot(kimi_cpu_sink * sink) {
-    kimi_cpu_sink_cache_stats stats = {};
-    kimi_cpu_sink_cache_get_stats(sink, &stats);
+static ssd_cpu_sink_cache_stats cache_snapshot(ssd_cpu_sink * sink) {
+    ssd_cpu_sink_cache_stats stats = {};
+    ssd_cpu_sink_cache_get_stats(sink, &stats);
     // A cache sized from the room maps every slot it may grow into (mapped_bytes) and holds capacity_bytes of them.
     require(stats.capacity_bytes <= stats.budget_bytes && stats.committed_bytes <= stats.capacity_bytes &&
             stats.enabled_bytes <= stats.capacity_bytes && stats.committed_bytes <= stats.mapped_bytes &&
@@ -768,25 +768,25 @@ static void need_cache_room(uint64_t bytes) {
 #endif
 }
 
-static void configure_cache(kimi_cpu_sink * sink, uint64_t bytes,
+static void configure_cache(ssd_cpu_sink * sink, uint64_t bytes,
         const std::vector<int32_t> & layers, int quota) {
     need_cache_room(bytes);
     char error[512] = {};
-    require(kimi_cpu_sink_cache_configure(sink, bytes, layers.data(), int(layers.size()), quota, error, sizeof(error)),
+    require(ssd_cpu_sink_cache_configure(sink, bytes, layers.data(), int(layers.size()), quota, error, sizeof(error)),
             std::string("cache configure: ") + error);
     const auto stats = cache_snapshot(sink);
     require(stats.budget_bytes == bytes && stats.mapped_bytes == 0 &&
             stats.committed_bytes == 0 && stats.valid_bytes == 0, "configure eagerly allocated or retained cache payload");
 }
 
-static void begin_cache(kimi_cpu_sink * sink, uint64_t epoch, uint64_t token, bool decode = true) {
+static void begin_cache(ssd_cpu_sink * sink, uint64_t epoch, uint64_t token, bool decode = true) {
     char error[512] = {};
-    require(kimi_cpu_sink_cache_begin(sink, epoch, token, decode, error, sizeof(error)),
+    require(ssd_cpu_sink_cache_begin(sink, epoch, token, decode, error, sizeof(error)),
             std::string("cache begin: ") + error);
     cache_snapshot(sink);
 }
 
-static sample_result cache_case(fixture_inputs & inputs, const char * name, fixture & f, kimi_cpu_sink * sink, int layer,
+static sample_result cache_case(fixture_inputs & inputs, const char * name, fixture & f, ssd_cpu_sink * sink, int layer,
         const std::vector<float> & input, const std::vector<int32_t> & ids,
         const std::vector<float> & weights, size_t hits, int admitted, float linear_beta = 25) {
     tensors meta(f, layer);
@@ -922,8 +922,8 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
         std::vector<float> input(small.latent, .1f), output(small.latent);
         for (auto & sink : sinks) {
             begin_cache(sink.get(), 99, ++token);
-            char error[512] = {}; kimi_cpu_sink_stats stats = {};
-            require(!kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
+            char error[512] = {}; ssd_cpu_sink_stats stats = {};
+            require(!ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
                 input.data(), ids, weights, 3, 4, 25, output.data(), &stats, error, sizeof(error)),
                 "schedule accepted short read");
             require(error[0] && stats.read_errors && !stats.pending_reads && !stats.fallback_count,
@@ -1011,7 +1011,7 @@ static void schedule_invalid_tests(fixture_inputs & inputs) {
         sink_ptr sink = inputs.create(4, 1, fixture::resolve, &f, error, sizeof(error));
         inputs.unset(item.first);
         require(bool(sink), std::string("per-run schedule rejected at creation: ") + error);
-        require(!kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight, 1,
+        require(!ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight, 1,
             4, 25, output.data(), nullptr, error, sizeof(error)) && error[0],
             std::string("per-run schedule accepted: ") + item.first + "=" + item.second);
         std::printf("case=per_run_%s status=PASS error=%s\n", item.first, error);
@@ -1019,11 +1019,11 @@ static void schedule_invalid_tests(fixture_inputs & inputs) {
     // One call at a time, of 1..512 participants.
     sink_ptr sink = inputs.create(2, 1, fixture::resolve, &f, error, sizeof(error));
     require(bool(sink), std::string("create: ") + error);
-    require(!kimi_cpu_sink_call_open(sink.get(), 0, error, sizeof(error)) && error[0], "empty call accepted");
-    require(!kimi_cpu_sink_call_open(sink.get(), 513, error, sizeof(error)) && error[0], "oversized call accepted");
-    require(kimi_cpu_sink_call_open(sink.get(), 1, error, sizeof(error)), error);
-    require(!kimi_cpu_sink_call_open(sink.get(), 1, error, sizeof(error)) && error[0], "second open call accepted");
-    kimi_cpu_sink_call_close(sink.get());
+    require(!ssd_cpu_sink_call_open(sink.get(), 0, error, sizeof(error)) && error[0], "empty call accepted");
+    require(!ssd_cpu_sink_call_open(sink.get(), 513, error, sizeof(error)) && error[0], "oversized call accepted");
+    require(ssd_cpu_sink_call_open(sink.get(), 1, error, sizeof(error)), error);
+    require(!ssd_cpu_sink_call_open(sink.get(), 1, error, sizeof(error)) && error[0], "second open call accepted");
+    ssd_cpu_sink_call_close(sink.get());
     std::printf("SCHEDULE_INVALID_SETTINGS_REJECTED cases=%zu\n", sizeof(invalid) / sizeof(invalid[0]) + 2);
 }
 
@@ -1082,10 +1082,10 @@ static void direct_cache_memlock_child(fixture_inputs & inputs, fixture & f, con
             begin_cache(sink.get(), 1, 2);
             cache_case(inputs, "direct_cache_memlock0_all_hit", f, sink.get(), 1, input, { 1, 2 }, { .7f, .3f }, 2, 0);
             begin_cache(sink.get(), 1, 3);
-            tensors meta(f, 1); char error[512] = {}; kimi_cpu_sink_stats stats = {};
+            tensors meta(f, 1); char error[512] = {}; ssd_cpu_sink_stats stats = {};
             const int32_t ids[] = { 1, 2, 3 }; const float weights[] = { .2f, .3f, .5f };
             std::vector<float> output(f.latent);
-            const bool ok = kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
+            const bool ok = ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
                     input.data(), ids, weights, 3, 4, 25, output.data(), &stats, error, sizeof(error));
             require(!ok && std::strstr(error, "IORING_REGISTER_BUFFERS") && stats.read_requests == 0 &&
                     stats.fallback_count == 0, "RF bypass under memlock0 did not fail closed before submitting IO");
@@ -1141,11 +1141,11 @@ static void direct_cache_target_tests(fixture_inputs & inputs, fixture & f, cons
     for (int role = 0; role < 3; ++role) {
         configure_cache(sink.get(), 4 * unit, { 1 }, 4);
         begin_cache(sink.get(), 3 + role, 1);
-        tensors meta(f, 1); char error[512] = {}; kimi_cpu_sink_stats stats = {};
+        tensors meta(f, 1); char error[512] = {}; ssd_cpu_sink_stats stats = {};
         const int32_t ids[] = { 1, 2, 3, 4 }; const float weights[] = { .1f, .2f, .3f, .4f };
         std::vector<float> output(f.latent);
         f.fault = fixture::short_tail; f.fault_expert = 1; f.fault_role = role;
-        const bool ok = kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
+        const bool ok = ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
                 input.data(), ids, weights, 4, 4, 25, output.data(), &stats, error, sizeof(error));
         f.fault = fixture::none; f.fault_expert = -1; f.fault_role = -1;
         require(!ok && error[0] && stats.read_errors > 0 && stats.fallback_count == 0,
@@ -1256,9 +1256,9 @@ static void cache_policy_tests(fixture_inputs & inputs, int threads, int depth) 
     begin_cache(sink.get(), 7, 2);
     tensors meta(f, 1); std::vector<float> output(f.latent);
     int32_t ids[] = { 2, 1, 3 }; float weights[] = { .2f, .3f, .5f };
-    char error[512] = {}; kimi_cpu_sink_stats stats = {};
+    char error[512] = {}; ssd_cpu_sink_stats stats = {};
     f.fault = fixture::short_tail; f.fault_expert = 2; f.fault_role = 1;
-    const bool ok = kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+    const bool ok = ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
         ids, weights, 3, 4, 25, output.data(), &stats, error, sizeof(error));
     f.fault = fixture::none; f.fault_expert = f.fault_role = -1;
     require(!ok && error[0] && stats.read_errors > 0, "persistent direct admission fault did not fail closed");
@@ -1289,8 +1289,8 @@ static void max_cache_tests(fixture_inputs & inputs, int threads, int depth) {
         for (size_t arm = 0; arm < sinks.size(); ++arm) {
             begin_cache(sinks[arm].get(), epoch, token);
             std::vector<float> output(f.latent);
-            kimi_cpu_sink_stats stats = {}; char error[512] = {};
-            require(kimi_cpu_sink_run(sinks[arm].get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+            ssd_cpu_sink_stats stats = {}; char error[512] = {};
+            require(ssd_cpu_sink_run(sinks[arm].get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
                 ids.data(), weights.data(), int(ids.size()), 4, 25, output.data(), &stats, error, sizeof(error)), error);
             check_io_targets(inputs, stats, true);
             if (arm == 0) { expected = output; }
@@ -1318,7 +1318,7 @@ static void max_cache_tests(fixture_inputs & inputs, int threads, int depth) {
     check(1, 1, { 3, 1 }, { .9f, .1f }, true);
     check(2, 2, { 3, 1 }, { .1f, .9f });
     for (auto & sink : sinks) {
-        kimi_cpu_sink_cache_reset(sink.get());
+        ssd_cpu_sink_cache_reset(sink.get());
         require(cache_snapshot(sink.get()).mapped_bytes == 0, "explicit reset retained payload");
     }
     check(2, 1, { 1, 3, 1, -1 }, { .1f, .3f, .6f, 0 });
@@ -1327,8 +1327,8 @@ static void max_cache_tests(fixture_inputs & inputs, int threads, int depth) {
     begin_cache(retained.get(), 2, 2);
     f.fault = fixture::short_tail; f.fault_expert = 4; f.fault_role = 1;
     int32_t ids[] = { 4, 1 }; float weights[] = { .5f, .5f };
-    std::vector<float> output(f.latent); kimi_cpu_sink_stats stats = {}; char error[512] = {};
-    require(!kimi_cpu_sink_run(retained.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+    std::vector<float> output(f.latent); ssd_cpu_sink_stats stats = {}; char error[512] = {};
+    require(!ssd_cpu_sink_run(retained.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
         ids, weights, 2, 4, 25, output.data(), &stats, error, sizeof(error)), "retained short read succeeded");
     check_io_targets(inputs, stats, false);
     require(stats.read_errors && cache_snapshot(retained.get()).mapped_bytes == 0, "retained error did not release");
@@ -1429,9 +1429,9 @@ static void cache_tests(fixture_inputs & inputs, int threads, int depth) {
         begin_cache(sink.get(), 7, 2);
         tensors meta(f, 1); std::vector<float> output(f.latent);
         int32_t ids[] = { 1, 2, 3 }; float weights[] = { .2f, .3f, .5f };
-        char error[512] = {}; kimi_cpu_sink_stats stats = {};
+        char error[512] = {}; ssd_cpu_sink_stats stats = {};
         f.fault = fault; f.fault_expert = 3;
-        const bool ok = kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+        const bool ok = ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
                 ids, weights, 3, 4, 25, output.data(), &stats, error, sizeof(error));
         f.fault = fixture::none; f.fault_expert = -1;
         require(!ok && error[0] && stats.fallback_count == 0, "mixed cache fault did not fail closed");
@@ -1475,7 +1475,7 @@ static void cache_tests(fixture_inputs & inputs, int threads, int depth) {
 
     const int32_t layer = 1;
     for (int quota : { 0, 897 }) {
-        require(!kimi_cpu_sink_cache_configure(sink.get(), unit, &layer, 1, quota, error, sizeof(error)) && error[0],
+        require(!ssd_cpu_sink_cache_configure(sink.get(), unit, &layer, 1, quota, error, sizeof(error)) && error[0],
                 "invalid cache quota was accepted");
     }
     identities.reset(); sink.reset();
@@ -1513,7 +1513,7 @@ static void cache_hitrate_tests(fixture_inputs & inputs, int threads, int depth)
     for (const char * value : { "1:1", "1:1,3:3", "1:1,2:5" }) {
         inputs.set(quotas, value); auto s = make_sink(inputs, f, threads, depth);
         const int32_t ids[] = { 1, 2 }; char error[512] = {};
-        require(!kimi_cpu_sink_cache_configure(s.get(), 4 * unit, ids, 2, 4, error, sizeof(error)) && error[0],
+        require(!ssd_cpu_sink_cache_configure(s.get(), 4 * unit, ids, 2, 4, error, sizeof(error)) && error[0],
                 "partial, unknown or oversized layer quota accepted"); ++rejected;
     }
     unsigned comparisons = 0;
@@ -1542,8 +1542,8 @@ static void cache_hitrate_tests(fixture_inputs & inputs, int threads, int depth)
     auto mismatch = make_sink(inputs, f, threads, depth); configure_cache(mismatch.get(), 4 * unit, { 1, 2 }, 4);
     begin_cache(mismatch.get(), 1, 1); tensors meta(f, 1);
     std::vector<float> input(f.latent, .13f), output(f.latent);
-    const int32_t id = 1; const float weight = 1; char error[512] = {}; kimi_cpu_sink_stats stats = {};
-    require(!kimi_cpu_sink_run(mismatch.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight,
+    const int32_t id = 1; const float weight = 1; char error[512] = {}; ssd_cpu_sink_stats stats = {};
+    require(!ssd_cpu_sink_run(mismatch.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id, &weight,
             1, 4, 25, output.data(), &stats, error, sizeof(error)), "quota sum mismatch did not fail closed");
     require(error[0] && !stats.read_bytes && !stats.pending_reads && !stats.fallback_count && !cache_snapshot(mismatch.get()).mapped_bytes,
             "invalid quota geometry submitted I/O or retained a mapping"); ++rejected;
@@ -1644,8 +1644,8 @@ static void cache_auto_ring_test(fixture_inputs & inputs, int threads, int depth
         begin_cache(sink.get(), 72, group + 1);
         for (int layer : {1, 2}) {
             tensors model(f, layer);
-            kimi_cpu_sink_stats detail = {}; char error[512] = {}; std::vector<float> output(f.latent);
-            require(kimi_cpu_sink_run(sink.get(), model.role[0], model.role[1], model.role[2],
+            ssd_cpu_sink_stats detail = {}; char error[512] = {}; std::vector<float> output(f.latent);
+            require(ssd_cpu_sink_run(sink.get(), model.role[0], model.role[1], model.role[2],
                     input.data(), routed.data(), weights.data(), 8, 4, 25, output.data(), &detail, error, sizeof(error)),
                     std::string("fill automatic cache: ") + error);
             const auto & target = layer == 1 ? expected : expected_second;
@@ -1681,11 +1681,11 @@ static void cache_large_test(fixture_inputs & inputs, int threads, int depth) {
     const auto layers = all_cache_layers();
     char error[512] = {};
     const int32_t invalid_layer = 1024;
-    require(!kimi_cpu_sink_cache_configure(sink.get(), UINT64_MAX, layers.data(), 257, 896, error, sizeof(error)) && error[0],
+    require(!ssd_cpu_sink_cache_configure(sink.get(), UINT64_MAX, layers.data(), 257, 896, error, sizeof(error)) && error[0],
             "cache accepted out-of-bounds layer count");
-    require(!kimi_cpu_sink_cache_configure(sink.get(), UINT64_MAX, &invalid_layer, 1, 896, error, sizeof(error)) && error[0],
+    require(!ssd_cpu_sink_cache_configure(sink.get(), UINT64_MAX, &invalid_layer, 1, 896, error, sizeof(error)) && error[0],
             "cache accepted out-of-bounds layer ID");
-    require(!kimi_cpu_sink_cache_configure(sink.get(), UINT64_MAX, nullptr, 1, 896, error, sizeof(error)) && error[0],
+    require(!ssd_cpu_sink_cache_configure(sink.get(), UINT64_MAX, nullptr, 1, 896, error, sizeof(error)) && error[0],
             "cache accepted null nonempty layer list");
     for (uint64_t budget : { uint64_t(100000000001), uint64_t(594000000000), UINT64_MAX }) {
         if (budget <= std::numeric_limits<size_t>::max()) { configure_cache(sink.get(), budget, layers, 896); }
@@ -1726,7 +1726,7 @@ static void cache_pressure_transition_test(fixture_inputs & inputs, int threads,
     // selected reserve minus a small, known deficit, so this exercises the
     // cache guard without OOM or pressure ballast. The same test supports an
     // unlimited child below this finite ancestor to verify ancestor accounting.
-    const char * owned = std::getenv("GGML_KIMI_CPU_SINK_TEST_CGROUP");
+    const char * owned = std::getenv("GGML_SSD_CPU_SINK_TEST_CGROUP");
     test_resources::need(owned && std::string(owned).find("/sys/fs/cgroup/") == 0 &&
             std::string(owned).find("/q3ks-cache-policy-large-") != std::string::npos,
             "pressure transition requires an explicitly owned q3ks-cache-policy-large-* cgroup");
@@ -1862,7 +1862,7 @@ static void cache_pressure_test(fixture_inputs & inputs, int threads, int depth,
 // No cgroup/cache admission is required; cache-hit transport has separate tests.
 // The sink's stderr lines (trace, profile, reports) while it lives; read() restores stderr.
 struct stderr_capture {
-    std::string path = test_resources::temp_file("kimi-cpu-sink-stderr");
+    std::string path = test_resources::temp_file("ssd-cpu-sink-stderr");
     FILE * file = std::fopen(path.c_str(), "w+b");
     int saved = -1;
     stderr_capture() {
@@ -1905,8 +1905,8 @@ static void trace_profile_test(fixture_inputs & inputs, int threads, int depth) 
     begin_cache(sink.get(), 777, 10, false);
     begin_cache(sink.get(), 778, 1);
     // Invalid input must still have an error record, without stale expert IDs.
-    tensors meta(f, 1); char error[512] = {}; kimi_cpu_sink_stats stats = {};
-    require(!kimi_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
+    tensors meta(f, 1); char error[512] = {}; ssd_cpu_sink_stats stats = {};
+    require(!ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2],
             nullptr, ids.data(), weights.data(), int(ids.size()), 4.0f, 0.0f,
             input.data(), &stats, error, sizeof(error)), "trace failure fixture accepted invalid input");
     std::istringstream lines(log.read());
@@ -1914,7 +1914,7 @@ static void trace_profile_test(fixture_inputs & inputs, int threads, int depth) 
     std::vector<nlohmann::json> trace, profile;
     unsigned resets = 0;
     while (std::getline(lines, line)) {
-        const std::string tp = "[kimi_cpu_sink_trace] ", pp = "[kimi_cpu_sink_profile] ";
+        const std::string tp = "[ssd_cpu_sink_trace] ", pp = "[ssd_cpu_sink_profile] ";
         if (line.compare(0, tp.size(), tp) == 0) {
             auto record = nlohmann::json::parse(line.substr(tp.size()));
             if (record.at("event") == "reset") {
@@ -2004,7 +2004,7 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
                 { .1f, .1f, .2f, .2f, .2f, .2f }, 0, 6);
             begin_cache(sink.get(), 1, 2);
             const int32_t hint[] = { 5, 6, 7, 12 };
-            kimi_cpu_sink_prefetch_hint(sink.get(), 2, hint, 4);
+            ssd_cpu_sink_prefetch_hint(sink.get(), 2, hint, 4);
             cache_case(inputs, "prefetch_hinted_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
             cache_case(inputs, "prefetch_predicted_layer2", f, sink.get(), 2, input, { 5, 7, 12 }, { .2f, .3f, .5f },
                 k ? 2 : 1, -1);
@@ -2013,8 +2013,8 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
         std::string line, report;
         std::vector<nlohmann::json> hints;
         while (std::getline(lines, line)) {
-            if (line.rfind("[kimi_cpu_sink_prefetch] reason=destroy ", 0) == 0) { report = line; }
-            const std::string tp = "[kimi_cpu_sink_trace] ";
+            if (line.rfind("[ssd_cpu_sink_prefetch] reason=destroy ", 0) == 0) { report = line; }
+            const std::string tp = "[ssd_cpu_sink_trace] ";
             if (line.rfind(tp, 0) == 0) {
                 const auto record = nlohmann::json::parse(line.substr(tp.size()));
                 if (record.at("event") == "layer") { hints.push_back(record.at("hint")); }
@@ -2066,7 +2066,7 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
         require(inputs.set("prefetch_depth", "2") == 0, "set prefetch depth");
         std::vector<uint64_t> offsets;
         for (int role = 0; role < 3; ++role) {
-            kimi_cpu_sink_source source = {};
+            ssd_cpu_sink_source source = {};
             require(fixture::resolve(&f, tensor_name(2, role).c_str(), 6, &source), "resolve the held reads");
             offsets.push_back(source.offset);
         }
@@ -2082,7 +2082,7 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
                     { .1f, .1f, .2f, .2f, .2f, .2f }, 0, 6);
                 begin_cache(sink.get(), 1, 2);
                 const int32_t hint[] = { 5, 6 };
-                kimi_cpu_sink_prefetch_hint(sink.get(), 2, hint, 2);
+                ssd_cpu_sink_prefetch_hint(sink.get(), 2, hint, 2);
                 cache_case(inputs, "spill_hinted_layer1", f, sink.get(), 1, input, { 1, 2 }, { .4f, .6f }, 2, 0);
                 hold.wait(3); // the readers run 6's three reads, so 5's are done
                 std::vector<float> weights(ids.size(), 1.0f / float(ids.size()));
@@ -2092,7 +2092,7 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
             std::istringstream lines(log.read());
             std::string line, report;
             while (std::getline(lines, line)) {
-                if (line.rfind("[kimi_cpu_sink_prefetch] reason=destroy ", 0) == 0) { report = line; }
+                if (line.rfind("[ssd_cpu_sink_prefetch] reason=destroy ", 0) == 0) { report = line; }
             }
             require(!report.empty(), std::string(name) + ": no prefetch report at destroy");
             return report;
@@ -2106,7 +2106,7 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
         // The reads spill when layer 2's run closes the window and stop when its own read of 7 ends (the I/O thread
         // opens the next window). The next token's begin drains every read while they still run (held 300 ms more):
         // they spill again. Each counts once.
-        auto drain_held = [&](kimi_cpu_sink * sink, pread_hold_guard & hold) {
+        auto drain_held = [&](ssd_cpu_sink * sink, pread_hold_guard & hold) {
             std::thread release([&] { std::this_thread::sleep_for(std::chrono::milliseconds(300)); hold.release(); });
             try { begin_cache(sink, 1, 3); } catch (...) { release.join(); throw; }
             release.join();
@@ -2120,7 +2120,7 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
         // Layer 2's run takes only 5 (prefetched): no reads of its own and no hint for the next layer, as the last
         // MoE layer's run. It opens the window when it schedules, so the 300 ms the reads are held after it are not
         // spill.
-        auto hold_then_release = [](kimi_cpu_sink *, pread_hold_guard & hold) {
+        auto hold_then_release = [](ssd_cpu_sink *, pread_hold_guard & hold) {
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
             hold.release();
         };
@@ -2141,7 +2141,7 @@ static void prefetch_tests(fixture_inputs & inputs, int threads, int depth) {
 // ADD of per-slot views in slot order. It shares no code with the sink.
 static std::vector<float> reference_moe_graph(const fixture & f, int layer, const std::vector<float> & input,
         const std::vector<int32_t> & ids, const std::vector<float> & weights,
-        const kimi_cpu_sink_activation & activation, int threads) {
+        const ssd_cpu_sink_activation & activation, int threads) {
     const int nslots = int(ids.size());
     require(nslots > 0 && weights.size() == ids.size(), "MoE reference requires live slots");
     const size_t max_nodes = 256;
@@ -2160,9 +2160,9 @@ static std::vector<float> reference_moe_graph(const fixture & f, int layer, cons
     ggml_tensor * gate = ggml_mul_mat_id(ctx, experts[1], x, selected);
     ggml_tensor * up = ggml_mul_mat_id(ctx, experts[0], x, selected);
     ggml_tensor * act = nullptr;
-    if (activation.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) {
+    if (activation.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) {
         act = ggml_swiglu_clamp(ctx, gate, up, activation.swiglu_limit);
-    } else if (activation.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU) {
+    } else if (activation.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU) {
         act = ggml_swiglu_split(ctx, gate, up);
     } else {
         const float beta = activation.situ_beta, lb = activation.situ_linear_beta;
@@ -2327,9 +2327,9 @@ static void elastic_cache_tests(fixture_inputs & inputs, int threads, int depth)
 }
 
 // Strict bitwise comparison with the MoE graph at one and four threads.
-static std::vector<float> activation_case(fixture_inputs & inputs, const char * name, fixture & f, kimi_cpu_sink * sink, int layer,
+static std::vector<float> activation_case(fixture_inputs & inputs, const char * name, fixture & f, ssd_cpu_sink * sink, int layer,
         const std::vector<float> & input, const std::vector<int32_t> & ids, const std::vector<float> & weights,
-        const kimi_cpu_sink_activation & activation, size_t hits = 0, int admitted = -1) {
+        const ssd_cpu_sink_activation & activation, size_t hits = 0, int admitted = -1) {
     tensors meta(f, layer);
     const auto expected = reference_moe_graph(f, layer, input, ids, weights, activation, 1);
     const auto threaded = reference_moe_graph(f, layer, input, ids, weights, activation, 4);
@@ -2343,8 +2343,8 @@ static std::vector<float> activation_case(fixture_inputs & inputs, const char * 
 }
 
 static void q2_activation_test(fixture_inputs & inputs, int threads, int depth) {
-    const kimi_cpu_sink_activation clamp = {
-        KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f
+    const ssd_cpu_sink_activation clamp = {
+        SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f
     };
     fixture q2;
     q2.type = GGML_TYPE_IQ2_XXS;
@@ -2368,7 +2368,7 @@ static void q2_activation_test(fixture_inputs & inputs, int threads, int depth) 
     std::printf("DSV41_Q2_CPU_SINK_DECODE_OK threads=%d ring_experts=%d\n", threads, depth);
 }
 
-// The RAM cache's storage at load (kimi_cpu_sink_vram_reserve; without a unified-memory GPU, as here, the cache's
+// The RAM cache's storage at load (ssd_cpu_sink_vram_reserve; without a unified-memory GPU, as here, the cache's
 // part runs): the geometry from the tensors' strides is the one the first decode token learns, and the slots the
 // ledger admits are committed and paged in, so decode commits no new slot. A sink without the load step is the
 // reference: the same reads, bit-identical outputs, the same capacity, and its first token pays the new slots. The
@@ -2409,7 +2409,7 @@ static uint64_t host_room() {
 #endif
 // The ledger the sink's host arbiter measures with on this OS.
 #if defined(__linux__)
-using probe_ledger = kimi_host_ledger;
+using probe_ledger = ssd_host_ledger;
 #else
 using probe_ledger = ssd::host::native_ledger;
 #endif
@@ -2427,14 +2427,14 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
     stride = cache_slot_bytes(inputs, stride);
     std::vector<float> input(f.latent);
     for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int(i % 23) - 11) * .019f; }
-    auto load = [&](kimi_cpu_sink * sink, std::string * receipt) {
+    auto load = [&](ssd_cpu_sink * sink, std::string * receipt) {
         tensors meta(f, 1);
         char error[512] = {};
         stderr_capture log;
-        require(kimi_cpu_sink_vram_reserve(sink, meta.role, 1, 6, error, sizeof(error)), error);
+        require(ssd_cpu_sink_vram_reserve(sink, meta.role, 1, 6, error, sizeof(error)), error);
         std::istringstream lines(log.read());
         for (std::string line; std::getline(lines, line);) {
-            if (line.rfind("[kimi_cpu_sink_cache] reason=load ", 0) == 0) { *receipt = line; }
+            if (line.rfind("[ssd_cpu_sink_cache] reason=load ", 0) == 0) { *receipt = line; }
         }
     };
     auto a = make_sink(inputs, f, threads, depth), b = make_sink(inputs, f, threads, depth);
@@ -2451,7 +2451,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
     require(cache_snapshot(b.get()).mapped_bytes == 0, "the reference mapped at configure");
     std::vector<float> out_a, out_b;
     // a native range's slot is its read rounded up to a page prefix: admissions are counted, not their bytes
-    auto run = [&](const char * name, kimi_cpu_sink * sink, int layer, const std::vector<int32_t> & ids,
+    auto run = [&](const char * name, ssd_cpu_sink * sink, int layer, const std::vector<int32_t> & ids,
                    const std::vector<float> & weights, size_t hits, size_t admitted, std::vector<float> * out) {
         tensors meta(f, layer);
         const auto expected = reference(f, layer, input, ids, weights, 4, 25);
@@ -2498,7 +2498,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         tensors one(m, 1), two(m, 2);
         const ggml_tensor * roles[] = { one.role[0], one.role[1], one.role[2], two.role[0], two.role[1], two.role[2] };
         char error[512] = {};
-        require(kimi_cpu_sink_vram_reserve(c.get(), roles, 2, 6, error, sizeof(error)), error);
+        require(ssd_cpu_sink_vram_reserve(c.get(), roles, 2, 6, error, sizeof(error)), error);
         require(cache_snapshot(c.get()).committed_bytes == 12 * mixed,
                 "the load step did not size its slots from each role's largest read");
         begin_cache(c.get(), 12, 1);
@@ -2547,7 +2547,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         load(d.get(), &receipt);
         require(cache_snapshot(d.get()).committed_bytes == 12 * stride, kind + "the load step did not commit 12 slots");
         begin_cache(d.get(), 11, 1, false);
-        require(!kimi_cpu_sink_cache_make_room(d.get(), uint64_t(1) << 50, 0), kind + "the ledger granted 1 PiB");
+        require(!ssd_cpu_sink_cache_make_room(d.get(), uint64_t(1) << 50, 0), kind + "the ledger granted 1 PiB");
         const auto given = cache_snapshot(d.get());
         require(given.enabled_bytes == 0 && given.committed_bytes == 0 && given.released_bytes == 12 * stride,
                 kind + "the ledger did not take the load step's slots back");
@@ -2557,7 +2557,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
             begin_cache(d.get(), 11, 2);
             std::istringstream lines(log.read());
             for (std::string line; std::getline(lines, line);) {
-                if (line.rfind("[kimi_cpu_sink_cache] load_regrow=1 ", 0) == 0) { regrow = line; }
+                if (line.rfind("[ssd_cpu_sink_cache] load_regrow=1 ", 0) == 0) { regrow = line; }
             }
         }
         const auto back = cache_snapshot(d.get());
@@ -2568,7 +2568,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         require(first.stats.cache_new_slot_bytes == 3 * stride, kind + "regrown slots were not paged in at admission");
         // a later request's prefill gives slots back as the first's did, and its first decode token takes them back
         begin_cache(d.get(), 11, 3, false);
-        require(!kimi_cpu_sink_cache_make_room(d.get(), uint64_t(1) << 50, 0), kind + "the ledger granted 1 PiB");
+        require(!ssd_cpu_sink_cache_make_room(d.get(), uint64_t(1) << 50, 0), kind + "the ledger granted 1 PiB");
         require(cache_snapshot(d.get()).enabled_bytes == 0, kind + "a later prefill did not give its slots back");
         regrow.clear();
         {
@@ -2576,7 +2576,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
             begin_cache(d.get(), 11, 4);
             std::istringstream lines(log.read());
             for (std::string line; std::getline(lines, line);) {
-                if (line.rfind("[kimi_cpu_sink_cache] prefill_regrow=1 ", 0) == 0) { regrow = line; }
+                if (line.rfind("[ssd_cpu_sink_cache] prefill_regrow=1 ", 0) == 0) { regrow = line; }
             }
         }
         require(cache_snapshot(d.get()).enabled_bytes == 12 * stride &&
@@ -2631,14 +2631,14 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
             tensors meta(big, 1);
             char error[512] = {};
             stderr_capture log;
-            const bool ok = kimi_cpu_sink_vram_reserve(g.get(), meta.role, 1, 6, error,
+            const bool ok = ssd_cpu_sink_vram_reserve(g.get(), meta.role, 1, 6, error,
                 sizeof(error));
             { std::lock_guard<std::mutex> lock(h.mutex); h.before_meminfo = nullptr; }
             require(ok, error);
             std::istringstream lines(log.read());
             for (std::string line; std::getline(lines, line);) {
-                if (line.rfind("[kimi_cpu_sink_cache] auto_capacity_bytes=", 0) == 0) { capacity = line; }
-                if (line.rfind("[kimi_cpu_sink_cache] reason=load ", 0) == 0) { loaded = line; }
+                if (line.rfind("[ssd_cpu_sink_cache] auto_capacity_bytes=", 0) == 0) { capacity = line; }
+                if (line.rfind("[ssd_cpu_sink_cache] reason=load ", 0) == 0) { loaded = line; }
             }
         }
         require(!drift.empty() && !capacity.empty() && !loaded.empty(), "owed slots: no drift or no load: " + loaded);
@@ -2648,7 +2648,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         require(number(loaded, "slots") < number(loaded, "of"), "owed slots: the load step committed every slot: " + loaded);
         // the first prefill: a shortage of 1.5 slots takes two resident slots back
         begin_cache(g.get(), 12, 1, false);
-        require(kimi_cpu_sink_cache_make_room(g.get(), host_room() - reserve + 3 * stride / 2, 0),
+        require(ssd_cpu_sink_cache_make_room(g.get(), host_room() - reserve + 3 * stride / 2, 0),
                 "owed slots: the ledger did not make room");
         const auto given = cache_snapshot(g.get());
         const uint64_t enabled = given.enabled_bytes / stride, owed = enabled - given.committed_bytes / stride;
@@ -2666,7 +2666,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
             begin_cache(g.get(), 12, 2);
             std::istringstream lines(log.read());
             for (std::string line; std::getline(lines, line);) {
-                if (line.rfind("[kimi_cpu_sink_cache] load_regrow=1 ", 0) == 0) { regrow = line; }
+                if (line.rfind("[ssd_cpu_sink_cache] load_regrow=1 ", 0) == 0) { regrow = line; }
             }
         }
         require(!regrow.empty(), "owed slots: no load_regrow receipt");
@@ -2681,7 +2681,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
     std::printf("case=load_regrow_owed status=SKIP reason=linux_ledger_injection\n");
 #endif
     {
-        // A prefill's room, held before it allocates anything (kimi_cpu_sink_cache_prefill_room): its pages and its
+        // A prefill's room, held before it allocates anything (ssd_cpu_sink_cache_prefill_room): its pages and its
         // compute buffers take their room in one give-back at its start; its later checks keep the rest; the first
         // decode token takes the slots back. File pages count as room (CACHE_RECLAIMABLE_FILE), so the hold alone
         // keeps the pages' room. Experts of 51 MiB keep the process's own movements far below a slot.
@@ -2700,7 +2700,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         {
             tensors meta(big, 1);
             char error[512] = {};
-            require(kimi_cpu_sink_vram_reserve(h.get(), meta.role, 1, 6, error, sizeof(error)),
+            require(ssd_cpu_sink_vram_reserve(h.get(), meta.role, 1, 6, error, sizeof(error)),
                 error);
         }
         require(cache_snapshot(h.get()).committed_bytes == 6 * slot, "prefill room: the load step did not commit 6 slots");
@@ -2712,10 +2712,10 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         std::string line;
         {
             stderr_capture log;
-            require(kimi_cpu_sink_cache_prefill_room(h.get(), pages - host, host, 0), "prefill room: refused");
+            require(ssd_cpu_sink_cache_prefill_room(h.get(), pages - host, host, 0), "prefill room: refused");
             std::istringstream lines(log.read());
             for (std::string l; std::getline(lines, l);) {
-                if (l.rfind("[kimi_host_ledger] event=prefill_room ", 0) == 0) { line = l; }
+                if (l.rfind("[ssd_host_ledger] event=prefill_room ", 0) == 0) { line = l; }
             }
         }
         const auto held = cache_snapshot(h.get());
@@ -2732,7 +2732,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
             begin_cache(h.get(), 13, 2);
             std::istringstream lines(log.read());
             for (std::string l; std::getline(lines, l);) {
-                if (l.rfind("[kimi_cpu_sink_cache] load_regrow=1 ", 0) == 0) { regrow = l; }
+                if (l.rfind("[ssd_cpu_sink_cache] load_regrow=1 ", 0) == 0) { regrow = l; }
             }
         }
         require(cache_snapshot(h.get()).enabled_bytes == 6 * slot &&
@@ -2768,12 +2768,12 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
             tensors meta(big, 1);
             char error[512] = {};
             stderr_capture log;
-            require(kimi_cpu_sink_cache_prefill_room(g.get(), 3 * cost, 0, 0), "load hold: the hold was refused");
-            const bool ok = kimi_cpu_sink_vram_reserve(g.get(), meta.role, 1, 6, error,
+            require(ssd_cpu_sink_cache_prefill_room(g.get(), 3 * cost, 0, 0), "load hold: the hold was refused");
+            const bool ok = ssd_cpu_sink_vram_reserve(g.get(), meta.role, 1, 6, error,
                 sizeof(error));
             std::istringstream lines(log.read());
             for (std::string l; std::getline(lines, l);) {
-                if (l.rfind("[kimi_cpu_sink_cache] reason=load ", 0) == 0) { loaded = l; }
+                if (l.rfind("[ssd_cpu_sink_cache] reason=load ", 0) == 0) { loaded = l; }
             }
             require(ok, error);
         }
@@ -2830,10 +2830,10 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         const uint64_t before = resident();
         {
             stderr_capture log;
-            require(kimi_cpu_sink_vram_reserve(r.get(), meta.role, 1, 6, error, sizeof(error)), error);
+            require(ssd_cpu_sink_vram_reserve(r.get(), meta.role, 1, 6, error, sizeof(error)), error);
             std::istringstream lines(log.read());
             for (std::string line; std::getline(lines, line);) {
-                if (line.rfind("[kimi_cpu_sink_cache] reason=load ", 0) == 0) { loaded = line; }
+                if (line.rfind("[ssd_cpu_sink_cache] reason=load ", 0) == 0) { loaded = line; }
             }
         }
         const uint64_t after = resident(), grown = after > before ? after - before : 0;
@@ -2923,11 +2923,11 @@ static void work_buffer_reclaim_tests(fixture_inputs & inputs, int threads, int 
         tensors meta(f, 1);
         char error[512] = {};
         stderr_capture log;
-        const bool ok = kimi_cpu_sink_vram_reserve(sink.get(), meta.role, 1, int(ids.size()),
+        const bool ok = ssd_cpu_sink_vram_reserve(sink.get(), meta.role, 1, int(ids.size()),
             error, sizeof(error));
         std::istringstream lines(log.read());
         for (std::string l; std::getline(lines, l);) {
-            if (l.rfind("[kimi_cpu_sink_cache] reason=load ", 0) == 0) { loaded = l; }
+            if (l.rfind("[ssd_cpu_sink_cache] reason=load ", 0) == 0) { loaded = l; }
         }
         require(ok, error);
     }
@@ -2946,7 +2946,7 @@ static void work_buffer_reclaim_tests(fixture_inputs & inputs, int threads, int 
         status = ggml_backend_graph_compute(backend, graph);
         std::istringstream lines(log.read());
         for (std::string l; std::getline(lines, l);) {
-            if (l.rfind("[kimi_cpu_sink_cache] cache_shrink=1 ", 0) == 0) { shrink = l; }
+            if (l.rfind("[ssd_cpu_sink_cache] cache_shrink=1 ", 0) == 0) { shrink = l; }
         }
     }
     require(status == GGML_STATUS_SUCCESS, "work buffer: the backend's work buffer was refused while the cache held the room");
@@ -2976,9 +2976,9 @@ static void work_buffer_reclaim_tests(fixture_inputs & inputs, int threads, int 
 }
 
 static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
-    const kimi_cpu_sink_activation clamp10 = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 10.0f };
-    const kimi_cpu_sink_activation clamp = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f };
-    const kimi_cpu_sink_activation situ = { KIMI_CPU_SINK_ACTIVATION_SITU, 4.0f, 25.0f, 0.0f };
+    const ssd_cpu_sink_activation clamp10 = { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 10.0f };
+    const ssd_cpu_sink_activation clamp = { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f };
+    const ssd_cpu_sink_activation situ = { SSD_CPU_SINK_ACTIVATION_SITU, 4.0f, 25.0f, 0.0f };
     // DeepSeek-V4.1 kernels at reduced width: MXFP4 experts with Q8_0 inputs and
     // 32-column blocks (320 and 224 are not multiples of 256).
     fixture f; f.type = f.down_type = GGML_TYPE_MXFP4; f.latent = 320; f.hidden = 224; make_synthetic(f, 20260914);
@@ -3066,27 +3066,27 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
     tensors meta(f, 1);
     std::vector<float> output(f.latent);
     const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
-    kimi_cpu_sink_activation unbounded = clamp;
+    ssd_cpu_sink_activation unbounded = clamp;
     unbounded.swiglu_limit = inf;
     activation_case(inputs, "mxfp4_swiglu_unbounded", f, sink.get(), 1, input, top6, w6, unbounded);
     int refusals = 0;
-    for (const auto & bad : { kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, 0 },
-                              kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, 1e-7f },
-                              kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, -10 },
-                              kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, nan },
-                              kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, -inf },
-                              kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SITU, 0, 25, 0 },
-                              kimi_cpu_sink_activation { KIMI_CPU_SINK_ACTIVATION_SITU, 4, nan, 0 },
-                              kimi_cpu_sink_activation { 7, 4, 25, 10 } }) {
-        kimi_cpu_sink_stats stats = {}; char error[512] = {};
-        require(!kimi_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+    for (const auto & bad : { ssd_cpu_sink_activation { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, 0 },
+                              ssd_cpu_sink_activation { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, 1e-7f },
+                              ssd_cpu_sink_activation { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, -10 },
+                              ssd_cpu_sink_activation { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, nan },
+                              ssd_cpu_sink_activation { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0, 0, -inf },
+                              ssd_cpu_sink_activation { SSD_CPU_SINK_ACTIVATION_SITU, 0, 25, 0 },
+                              ssd_cpu_sink_activation { SSD_CPU_SINK_ACTIVATION_SITU, 4, nan, 0 },
+                              ssd_cpu_sink_activation { 7, 4, 25, 10 } }) {
+        ssd_cpu_sink_stats stats = {}; char error[512] = {};
+        require(!ssd_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
                 top6.data(), w6.data(), 6, &bad, output.data(), &stats, error, sizeof(error)) && error[0] &&
                 stats.read_requests == 0 && stats.fallback_count == 0, "invalid activation was accepted");
         ++refusals;
     }
     {
-        kimi_cpu_sink_stats stats = {}; char error[512] = {};
-        require(!kimi_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+        ssd_cpu_sink_stats stats = {}; char error[512] = {};
+        require(!ssd_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
                 top6.data(), w6.data(), 6, nullptr, output.data(), &stats, error, sizeof(error)) && error[0] &&
                 stats.read_requests == 0, "null activation was accepted");
         ++refusals;
@@ -3095,8 +3095,8 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
         ggml_context * ctx = ggml_init({ ggml_tensor_overhead() * 2, nullptr, true }); require(ctx, "metadata context failed");
         ggml_tensor * gate_q8 = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, f.latent, f.hidden, f.experts);
         ggml_set_name(gate_q8, tensor_name(1, 1).c_str());
-        kimi_cpu_sink_stats stats = {}; char error[512] = {};
-        const bool ok = kimi_cpu_sink_run_activation(sink.get(), meta.role[0], gate_q8, meta.role[2], input.data(),
+        ssd_cpu_sink_stats stats = {}; char error[512] = {};
+        const bool ok = ssd_cpu_sink_run_activation(sink.get(), meta.role[0], gate_q8, meta.role[2], input.data(),
                 top6.data(), w6.data(), 6, &clamp, output.data(), &stats, error, sizeof(error));
         ggml_free(ctx);
         require(!ok && std::strstr(error, "one type") && stats.read_requests == 0, "mixed up/gate types were accepted");
@@ -3106,7 +3106,7 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
         // Batched MXFP4 prefill uses the same clamped-SwiGLU semantics as the
         // independent graph reference for every token.
         char error[512] = {};
-        kimi_cpu_prefill * prefill = kimi_cpu_prefill_create(sink.get(), error, sizeof(error));
+        ssd_cpu_prefill * prefill = ssd_cpu_prefill_create(sink.get(), error, sizeof(error));
         require(prefill, std::string("prefill create: ") + error);
         std::vector<float> batched_input = input;
         batched_input.insert(batched_input.end(), input.begin(), input.end());
@@ -3121,11 +3121,11 @@ static void activation_tests(fixture_inputs & inputs, int threads, int depth) {
         std::vector<float> second_weights(batched_weights.begin() + 6, batched_weights.end());
         const auto second = reference_moe_graph(f, 1, second_input, second_ids, second_weights, clamp, threads);
         expected.insert(expected.end(), second.begin(), second.end());
-        kimi_cpu_prefill_stats stats = {}; std::vector<float> routed(2 * f.latent);
-        const bool ok = kimi_cpu_prefill_run_activation(prefill, meta.role[0], meta.role[1], meta.role[2],
+        ssd_cpu_prefill_stats stats = {}; std::vector<float> routed(2 * f.latent);
+        const bool ok = ssd_cpu_prefill_run_activation(prefill, meta.role[0], meta.role[1], meta.role[2],
                 batched_input.data(), batched_ids.data(), batched_weights.data(), 6, 2, &clamp,
                 routed.data(), &stats, error, sizeof(error));
-        kimi_cpu_prefill_destroy(prefill);
+        ssd_cpu_prefill_destroy(prefill);
         require(ok, std::string("MXFP4 grouped prefill: ") + error);
         require(!std::memcmp(expected.data(), routed.data(), routed.size() * sizeof(float)),
                 "MXFP4 grouped prefill differs from the graph reference");
@@ -3173,7 +3173,7 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
     }
     const std::vector<int32_t> ids = { 9, 1, native_ranges ? 19 : 17, 6, 3, 12, 0, 15 };
     const std::vector<float> weights = { .21f, .19f, .15f, .13f, .11f, .09f, .07f, .05f };
-    kimi_cpu_sink_activation activation = { KIMI_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, norm.data(), 1e-8f };
+    ssd_cpu_sink_activation activation = { SSD_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, norm.data(), 1e-8f };
     char error[512] = {};
     auto compare = [&](const std::vector<float> & actual, const std::vector<float> & expected) {
         require(actual.size() == expected.size(), "Muse output size");
@@ -3185,14 +3185,14 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
         activation.post_exp_norm_eps = eps;
         const auto expected = reference_moe_graph(f, 1, input, ids, weights, activation, 1);
         std::vector<float> actual(f.latent);
-        kimi_cpu_sink_stats stats = {};
-        require(kimi_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2],
+        ssd_cpu_sink_stats stats = {};
+        require(ssd_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2],
             input.data(), ids.data(), weights.data(), 8, &activation, actual.data(), &stats, error, sizeof(error)), error);
         compare(actual, expected);
         require(stats.experts == 8 && stats.read_requests == 24 && stats.pending_reads == 0 && !stats.read_errors,
             "Muse Q8 decode I/O counters");
     }
-    auto * prefill = kimi_cpu_prefill_create(sink.get(), error, sizeof(error)); require(prefill, error);
+    auto * prefill = ssd_cpu_prefill_create(sink.get(), error, sizeof(error)); require(prefill, error);
     // both epsilons: one far above the mean square, which hides how the squares are rounded
     for (float eps : { 1e-8f, .2f }) {
         activation.post_exp_norm_eps = eps;
@@ -3207,23 +3207,23 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
                 x.insert(x.end(), xt.begin(), xt.end()); selected.insert(selected.end(), it.begin(), it.end());
                 w.insert(w.end(), weights.begin(), weights.end()); expected.insert(expected.end(), y.begin(), y.end());
             }
-            std::vector<float> actual(expected.size()); kimi_cpu_prefill_stats stats = {};
-            require(kimi_cpu_prefill_run_activation(prefill, meta.role[0], meta.role[1], meta.role[2],
+            std::vector<float> actual(expected.size()); ssd_cpu_prefill_stats stats = {};
+            require(ssd_cpu_prefill_run_activation(prefill, meta.role[0], meta.role[1], meta.role[2],
                 x.data(), selected.data(), w.data(), 8, tokens, &activation, actual.data(), &stats, error, sizeof(error)), error);
             compare(actual, expected);
             require(stats.stream.pending_reads == 0 && !stats.stream.read_errors && !stats.stream.fallback_count,
                 "Muse Q8 prefill I/O counters");
         }
     }
-    kimi_cpu_prefill_destroy(prefill);
+    ssd_cpu_prefill_destroy(prefill);
     if (native_ranges) {
         // Native aligned-read payloads must also survive cache admission and
         // full hits, not just direct ring consumption.
         configure_cache(sink.get(), 8 * 3 * aligned(128 + f.entries.begin()->second.raw_bytes), {1}, 8);
         for (uint64_t token : {1, 2}) {
             begin_cache(sink.get(), 91, token);
-            std::vector<float> actual(f.latent); kimi_cpu_sink_stats stats = {};
-            require(kimi_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2],
+            std::vector<float> actual(f.latent); ssd_cpu_sink_stats stats = {};
+            require(ssd_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2],
                 input.data(), ids.data(), weights.data(), 8, &activation, actual.data(), &stats, error, sizeof(error)), error);
             compare(actual, reference_moe_graph(f, 1, input, ids, weights, activation, 1));
             if (token == 2) { require(stats.cache_hits == 8 && stats.read_requests == 0, "native offset cache hit lost its payload prefix"); }
@@ -3236,8 +3236,8 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
             for (uint64_t token : {1, 2, 3}) {
                 begin_cache(varied.get(), 92, token);
                 const auto & selected = token == 2 ? ids : aligned_ids;
-                std::vector<float> actual(f.latent); kimi_cpu_sink_stats stats = {};
-                require(kimi_cpu_sink_run_activation(varied.get(), meta.role[0], meta.role[1], meta.role[2],
+                std::vector<float> actual(f.latent); ssd_cpu_sink_stats stats = {};
+                require(ssd_cpu_sink_run_activation(varied.get(), meta.role[0], meta.role[1], meta.role[2],
                     input.data(), selected.data(), weights.data(), 8, &activation, actual.data(), &stats, error, sizeof(error)), error);
                 compare(actual, reference_moe_graph(f, 1, input, selected, weights, activation, 1));
                 if (token == 3) { require(stats.cache_hits == 8 && stats.read_requests == 0,
@@ -3250,8 +3250,8 @@ static void muse_expert_norm_test(fixture_inputs & inputs, int threads, int dept
         std::filesystem::resize_file(f.path, std::filesystem::file_size(f.path) - 1);
         f.fd = test_resources::open_direct(f.path);
         auto truncated = make_sink(inputs, f, threads, depth);
-        std::vector<float> actual(f.latent); kimi_cpu_sink_stats stats = {};
-        require(!kimi_cpu_sink_run_activation(truncated.get(), meta.role[0], meta.role[1], meta.role[2],
+        std::vector<float> actual(f.latent); ssd_cpu_sink_stats stats = {};
+        require(!ssd_cpu_sink_run_activation(truncated.get(), meta.role[0], meta.role[1], meta.role[2],
             input.data(), ids.data(), weights.data(), 8, &activation, actual.data(), &stats, error, sizeof(error)) &&
             stats.read_errors > 0 && stats.pending_reads == 0, "native truncated logical payload was accepted");
     }
@@ -3287,7 +3287,7 @@ static void host_ledger_tests(fixture_inputs & inputs) {
         return f;
     };
     auto make = [&](bool unified) {
-        kimi_host_ledger ledger;
+        ssd_host_ledger ledger;
         ledger.read = [&](const std::string & path, std::string & text) {
             const auto f = files();
             const auto it = f.find(path);
@@ -3435,29 +3435,29 @@ static void host_ledger_tests(fixture_inputs & inputs) {
             "HugePages_Total:       0\nHugepagesize:       2048 kB\n";
         // No boost: low sums to 43201 pages, and to 155771 at the largest boosts (DMA max(512, 613), Normal 111957).
         // The file LRU's half (524288 pages) keeps back the whole difference, the reclaimable half (64000) 20799 more.
-        require(kimi_memory_boost::headroom(meminfo_text, zones(0, 0), "15000\n", page) == (112570 + 20799) * page,
+        require(ssd_memory_boost::headroom(meminfo_text, zones(0, 0), "15000\n", page) == (112570 + 20799) * page,
                 "the boost headroom without a boost");
         // Normal at its largest boost: only the DMA zone's can still grow.
-        require(kimi_memory_boost::headroom(meminfo_text, zones(0, 111957), "15000\n", page) == 613 * page,
+        require(ssd_memory_boost::headroom(meminfo_text, zones(0, 111957), "15000\n", page) == 613 * page,
                 "the boost headroom at the Normal zone's largest boost");
-        require(kimi_memory_boost::headroom(meminfo_text, zones(613, 111957), "15000\n", page) == 0,
+        require(ssd_memory_boost::headroom(meminfo_text, zones(613, 111957), "15000\n", page) == 0,
                 "the boost headroom at every zone's largest boost");
-        require(kimi_memory_boost::headroom(meminfo_text, zones(0, 0), "0\n", page) == 0, "a zero boost factor kept memory back");
-        require(kimi_memory_boost::headroom(meminfo_text, zones(0, 0, false), "15000\n", page) == 0,
+        require(ssd_memory_boost::headroom(meminfo_text, zones(0, 0), "0\n", page) == 0, "a zero boost factor kept memory back");
+        require(ssd_memory_boost::headroom(meminfo_text, zones(0, 0, false), "15000\n", page) == 0,
                 "a kernel without watermark boosts kept memory back");
-        require(kimi_memory_boost::headroom(meminfo_text, "", "15000\n", page) == 0 &&
-                kimi_memory_boost::headroom("MemAvailable: 5000000 kB\n", zones(0, 0), "15000\n", page) == 0,
+        require(ssd_memory_boost::headroom(meminfo_text, "", "15000\n", page) == 0 &&
+                ssd_memory_boost::headroom("MemAvailable: 5000000 kB\n", zones(0, 0), "15000\n", page) == 0,
                 "unreadable inputs kept memory back");
         std::string hugetlb = meminfo_text;
         hugetlb.replace(hugetlb.find("HugePages_Total:       0"), 24, "HugePages_Total:      64");
-        require(kimi_memory_boost::headroom(hugetlb, zones(0, 0), "15000\n", page) == 0, "a hugetlbfs pool kept memory back");
+        require(ssd_memory_boost::headroom(hugetlb, zones(0, 0), "15000\n", page) == 0, "a hugetlbfs pool kept memory back");
 
         // The ledger on unified memory: at the full boost for what an allocation outside the caches takes (the
         // arbiter's take and its margin's intervals), as it is for the RAM cache's guard; a discrete GPU ignores it.
         uint64_t dma_boost = 0, normal_boost = 0;
         const uint64_t full = (112570 + 20799) * page;
         auto boosted = [&](bool unified) {
-            kimi_host_ledger ledger;
+            ssd_host_ledger ledger;
             ledger.read = [&](const std::string & path, std::string & text) {
                 auto f = files();
                 f["/proc/meminfo"] = "MemTotal:       127000000 kB\nMemFree:          100000 kB\nMemAvailable:   " +
@@ -3524,14 +3524,14 @@ static void tierless_budget_tests() {
 
 // The production shape of a call: graphs of sink nodes that every thread of a ggml threadpool enters, ith 0 as the
 // coordinator that opens, runs and closes the call and the others as its participants, as
-// llama_kimi_cpu_sink_compute does. Chained decode layers with a dense op between them, a grouped prefill and a run
+// llama_ssd_cpu_sink_compute does. Chained decode layers with a dense op between them, a grouped prefill and a run
 // that fails inside its call, at 1, 2, an odd count and all CPUs, with every decode participant and with a fixed
 // first few, bit for bit against the ggml reference graphs.
 struct graph_layer {
-    kimi_cpu_sink * sink = nullptr;
-    kimi_cpu_prefill * prefill = nullptr;
+    ssd_cpu_sink * sink = nullptr;
+    ssd_cpu_prefill * prefill = nullptr;
     const tensors * meta = nullptr;
-    const kimi_cpu_sink_activation * activation = nullptr; // SiTU (4, 25) when absent
+    const ssd_cpu_sink_activation * activation = nullptr; // SiTU (4, 25) when absent
     bool fail = false;
     bool ok = false;
     int nth = 0; // the participants ggml gave the call
@@ -3540,9 +3540,9 @@ struct graph_layer {
 
 static void graph_layer_compute(ggml_tensor * dst, int ith, int nth, void * userdata) {
     auto & layer = *static_cast<graph_layer *>(userdata);
-    if (ith) { kimi_cpu_sink_call_join(layer.sink, ith, nth); return; }
+    if (ith) { ssd_cpu_sink_call_join(layer.sink, ith, nth); return; }
     char error[512] = {};
-    if (!kimi_cpu_sink_call_open(layer.sink, nth, error, sizeof(error))) {
+    if (!ssd_cpu_sink_call_open(layer.sink, nth, error, sizeof(error))) {
         std::fprintf(stderr, "graph call open: %s\n", error);
         std::abort();
     }
@@ -3556,21 +3556,21 @@ static void graph_layer_compute(ggml_tensor * dst, int ith, int nth, void * user
     const auto & m = *layer.meta;
     if (layer.prefill) {
         layer.ok = layer.activation ?
-            kimi_cpu_prefill_run_activation(layer.prefill, m.role[0], m.role[1], m.role[2], in, id, w, nslots, ntokens,
+            ssd_cpu_prefill_run_activation(layer.prefill, m.role[0], m.role[1], m.role[2], in, id, w, nslots, ntokens,
                 layer.activation, out, nullptr, error, sizeof(error)) :
-            kimi_cpu_prefill_run(layer.prefill, m.role[0], m.role[1], m.role[2], in, id, w, nslots, ntokens,
+            ssd_cpu_prefill_run(layer.prefill, m.role[0], m.role[1], m.role[2], in, id, w, nslots, ntokens,
                 4.0f, 25.0f, out, nullptr, error, sizeof(error));
     } else {
         // an invalid slot count fails after the call opened: the joiners must still leave
         const int slots = layer.fail ? -1 : nslots;
         layer.ok = layer.activation ?
-            kimi_cpu_sink_run_activation(layer.sink, m.role[0], m.role[1], m.role[2], in, id, w, slots,
+            ssd_cpu_sink_run_activation(layer.sink, m.role[0], m.role[1], m.role[2], in, id, w, slots,
                 layer.activation, out, nullptr, error, sizeof(error)) :
-            kimi_cpu_sink_run(layer.sink, m.role[0], m.role[1], m.role[2], in, id, w, slots,
+            ssd_cpu_sink_run(layer.sink, m.role[0], m.role[1], m.role[2], in, id, w, slots,
                 4.0f, 25.0f, out, nullptr, error, sizeof(error));
     }
     layer.error = error;
-    kimi_cpu_sink_call_close(layer.sink);
+    ssd_cpu_sink_call_close(layer.sink);
 }
 
 static void threadpool_tests(fixture_inputs & inputs, int depth) {
@@ -3609,8 +3609,8 @@ static void threadpool_tests(fixture_inputs & inputs, int depth) {
         // one participant only: the sink computes on the callers' threads
         sink_ptr sink = inputs.create(2, depth, fixture::resolve, &f, error, sizeof(error));
         require(bool(sink), std::string("threadpool create: ") + error);
-        std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)> prefill(
-            kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+        std::unique_ptr<ssd_cpu_prefill, decltype(&ssd_cpu_prefill_destroy)> prefill(
+            ssd_cpu_prefill_create(sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
         require(bool(prefill), std::string("threadpool prefill create: ") + error);
         for (int n : counts) {
             if (fixed > n) { continue; }
@@ -3760,7 +3760,7 @@ static bool same_bits(const std::vector<float> & a, const std::vector<float> & b
 // a narrow Q8_0 one for prefills of 2 to
 // 2048 tokens, and a BF16 one whose hidden width of 70 leaves a scalar tail at every fixed vector width.
 static void swiglu_tests(fixture_inputs & inputs, int depth) {
-    const kimi_cpu_sink_activation swiglu = { KIMI_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f };
+    const ssd_cpu_sink_activation swiglu = { SSD_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f };
     const int cpus = int(test_resources::process_cpus().size());
     std::vector<int> counts = { 1, 2, 3 };
     if (cpus > 3) { counts.push_back(cpus); }
@@ -3831,8 +3831,8 @@ static void swiglu_tests(fixture_inputs & inputs, int depth) {
         // one participant: the sink computes on the threads of the graphs' calls, or alone
         sink_ptr sink = inputs.create(2, depth, fixture::resolve, &f, error, sizeof(error));
         require(bool(sink), std::string("SwiGLU sink create: ") + error);
-        std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)> prefill(
-            kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+        std::unique_ptr<ssd_cpu_prefill, decltype(&ssd_cpu_prefill_destroy)> prefill(
+            ssd_cpu_prefill_create(sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
         require(bool(prefill), std::string("SwiGLU prefill create: ") + error);
 
         // the coordinator alone, with the run's I/O counters
@@ -3843,18 +3843,18 @@ static void swiglu_tests(fixture_inputs & inputs, int depth) {
             require(same_bits(exact, layer1), std::string(s.name) + ": SwiGLU decode differs from the graph");
             const auto & b = batches.back();
             std::vector<float> routed(b.expected.size());
-            kimi_cpu_prefill_stats stats = {};
-            require(kimi_cpu_prefill_run_activation(prefill.get(), meta2.role[0], meta2.role[1], meta2.role[2],
+            ssd_cpu_prefill_stats stats = {};
+            require(ssd_cpu_prefill_run_activation(prefill.get(), meta2.role[0], meta2.role[1], meta2.role[2],
                 b.x.data(), b.ids.data(), b.weights.data(), nslots, b.ntokens, &swiglu, routed.data(), &stats,
                 error, sizeof(error)), std::string(s.name) + " SwiGLU prefill: " + error);
             require(same_bits(routed, b.expected), std::string(s.name) + ": SwiGLU prefill differs from the graph");
             // The scalar clamp kernel at an infinite limit is SwiGLU in value only. Over a few hundred tokens
             // some hidden value it rounds otherwise survives the down input's quantization: such a batch tells
             // the graph's vector kernel from the scalar one. Which batch does depends on the vector width.
-            const kimi_cpu_sink_activation clamp = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f,
+            const ssd_cpu_sink_activation clamp = { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f,
                 std::numeric_limits<float>::infinity(), nullptr, 0.0f };
             std::vector<float> scalar(b.expected.size());
-            require(kimi_cpu_prefill_run_activation(prefill.get(), meta2.role[0], meta2.role[1], meta2.role[2],
+            require(ssd_cpu_prefill_run_activation(prefill.get(), meta2.role[0], meta2.role[1], meta2.role[2],
                 b.x.data(), b.ids.data(), b.weights.data(), nslots, b.ntokens, &clamp, scalar.data(), nullptr,
                 error, sizeof(error)), std::string(s.name) + " scalar clamp prefill: " + error);
             size_t differing = 0;
@@ -3875,8 +3875,8 @@ static void swiglu_tests(fixture_inputs & inputs, int depth) {
             std::vector<int32_t> ids(size_t(ntokens) * nslots);
             std::vector<float> weights(ids.size(), 1.0f / nslots);
             for (size_t i = 0; i < ids.size(); ++i) { ids[i] = s.stored[i % nslots]; }
-            kimi_cpu_prefill_stats stats = {};
-            const bool ran = kimi_cpu_prefill_run_activation(prefill.get(), meta2.role[0], meta2.role[1],
+            ssd_cpu_prefill_stats stats = {};
+            const bool ran = ssd_cpu_prefill_run_activation(prefill.get(), meta2.role[0], meta2.role[1],
                 meta2.role[2], big.data(), ids.data(), weights.data(), nslots, ntokens, &swiglu, out.data(), &stats,
                 error, sizeof(error));
             require(ran ? stats.workspace_bytes > (512ull << 20) && stats.stream.read_requests > 0 &&
@@ -3972,7 +3972,7 @@ static void swiglu_tests(fixture_inputs & inputs, int depth) {
 // stops the read-ahead, and a sink destroyed while it reads waits for its reads. The clamped SwiGLU is the graph's
 // scalar kernel: no packed division, which one core of a CI host computes wrongly at times.
 static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
-    const kimi_cpu_sink_activation swiglu = { KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 10.0f, nullptr, 0.0f };
+    const ssd_cpu_sink_activation swiglu = { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 10.0f, nullptr, 0.0f };
     // the drive line the plan is sized from: fast enough that the window between two layers holds every expert
     scoped_fixture_input drive(inputs, "place_costs", "drive_gbps=1000");
     // the product's retained cache: persistent, per-layer, giving room back, read by a prefill
@@ -4027,17 +4027,17 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
         auto sink = make_sink(inputs, f, threads, depth);
         configure_cache(sink.get(), 2 * uint64_t(f.experts) * stride, { 1, 2 }, f.experts);
         // the arena and its pages at load, as the product's load step makes them: the first prefill reads into them
-        require(kimi_cpu_sink_vram_reserve(sink.get(), meta1.role, 1, nslots, error, sizeof(error)), error);
+        require(ssd_cpu_sink_vram_reserve(sink.get(), meta1.role, 1, nslots, error, sizeof(error)), error);
         return sink;
     };
-    using prefill_ptr = std::unique_ptr<kimi_cpu_prefill, decltype(&kimi_cpu_prefill_destroy)>;
-    kimi_cpu_sink * predicted = nullptr; // the sink layer 1's call gives its prediction of layer 2 to
-    auto layer = [&](kimi_cpu_prefill * prefill, const tensors & meta, const std::vector<float> & input,
+    using prefill_ptr = std::unique_ptr<ssd_cpu_prefill, decltype(&ssd_cpu_prefill_destroy)>;
+    ssd_cpu_sink * predicted = nullptr; // the sink layer 1's call gives its prediction of layer 2 to
+    auto layer = [&](ssd_cpu_prefill * prefill, const tensors & meta, const std::vector<float> & input,
             std::vector<float> & output) {
-        if (predicted && &meta == &meta1) { kimi_cpu_sink_prefill_hint(predicted, 2, ids.data(), ntokens, nslots); }
+        if (predicted && &meta == &meta1) { ssd_cpu_sink_prefill_hint(predicted, 2, ids.data(), ntokens, nslots); }
         output.assign(input.size(), 0.0f);
-        kimi_cpu_prefill_stats stats = {};
-        require(kimi_cpu_prefill_run_activation(prefill, meta.role[0], meta.role[1], meta.role[2], input.data(),
+        ssd_cpu_prefill_stats stats = {};
+        require(ssd_cpu_prefill_run_activation(prefill, meta.role[0], meta.role[1], meta.role[2], input.data(),
             ids.data(), weights.data(), nslots, ntokens, &swiglu, output.data(), &stats, error, sizeof(error)),
             std::string("read-ahead prefill: ") + error);
         // the call's own reads, whatever the read-ahead does on the ring beside it
@@ -4047,8 +4047,8 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
             stats.ram_routes + stats.ssd_routes == ids.size(), "read-ahead prefill counters");
         return stats;
     };
-    struct pass_result { std::vector<float> y1, y2; kimi_cpu_prefill_stats layer1, layer2; };
-    auto pass = [&](kimi_cpu_prefill * prefill) {
+    struct pass_result { std::vector<float> y1, y2; ssd_cpu_prefill_stats layer1, layer2; };
+    auto pass = [&](ssd_cpu_prefill * prefill) {
         pass_result r;
         r.layer1 = layer(prefill, meta1, x, r.y1);
         r.layer2 = layer(prefill, meta2, r.y1, r.y2);
@@ -4062,7 +4062,7 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
         scoped_fixture_input disabled(inputs, "prefill_lookahead", "0");
         auto sink = make();
         predicted = sink.get();
-        prefill_ptr prefill(kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+        prefill_ptr prefill(ssd_cpu_prefill_create(sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
         require(bool(prefill), error);
         for (int i = 0; i < 2; ++i) { off.push_back(pass(prefill.get())); same(off.back(), "without read-ahead"); }
         require(!off.back().layer2.ram_experts, "a prefill without the read-ahead admitted to the RAM cache");
@@ -4073,7 +4073,7 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
     {
         auto sink = make();
         predicted = sink.get();
-        prefill_ptr prefill(kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+        prefill_ptr prefill(ssd_cpu_prefill_create(sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
         require(bool(prefill), error);
         const auto measured = pass(prefill.get());
         const auto ahead = pass(prefill.get());
@@ -4091,7 +4091,7 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
         layer(prefill.get(), meta1, x, a1);
         const int32_t expert = 3;
         const float one = 1.0f;
-        require(kimi_cpu_sink_run_activation(sink.get(), meta1.role[0], meta1.role[1], meta1.role[2], single.data(),
+        require(ssd_cpu_sink_run_activation(sink.get(), meta1.role[0], meta1.role[1], meta1.role[2], single.data(),
             &expert, &one, 1, &swiglu, single_out.data(), nullptr, error, sizeof(error)), error);
         layer(prefill.get(), meta2, a1, a2);
         require(same_bits(a1, y1) && same_bits(a2, y2), "a decode run between two layers changed the pass's output");
@@ -4106,7 +4106,7 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
         scoped_fixture_input failing(inputs, "lookahead_fail_every", every);
         auto sink = make();
         predicted = sink.get();
-        prefill_ptr prefill(kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+        prefill_ptr prefill(ssd_cpu_prefill_create(sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
         require(bool(prefill), error);
         pass_result measured, ahead;
         std::string log;
@@ -4142,16 +4142,16 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
         const auto y3 = graph(3, y2);
         auto sink = make_sink(inputs, f, threads, depth);
         configure_cache(sink.get(), 3 * uint64_t(quota) * stride, { 1, 2, 3 }, quota);
-        require(kimi_cpu_sink_vram_reserve(sink.get(), meta1.role, 1, nslots, error, sizeof(error)), error);
-        prefill_ptr prefill(kimi_cpu_prefill_create(sink.get(), error, sizeof(error)), kimi_cpu_prefill_destroy);
+        require(ssd_cpu_sink_vram_reserve(sink.get(), meta1.role, 1, nslots, error, sizeof(error)), error);
+        prefill_ptr prefill(ssd_cpu_prefill_create(sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
         require(bool(prefill), error);
         auto call = [&](const tensors & meta, int next, const std::vector<float> & input, std::vector<float> & output,
                 bool gap = false) {
             if (gap) { std::this_thread::sleep_for(std::chrono::milliseconds(300)); }
-            if (next) { kimi_cpu_sink_prefill_hint(sink.get(), next, ids.data(), ntokens, nslots); }
+            if (next) { ssd_cpu_sink_prefill_hint(sink.get(), next, ids.data(), ntokens, nslots); }
             output.assign(input.size(), 0.0f);
-            kimi_cpu_prefill_stats stats = {};
-            require(kimi_cpu_prefill_run_activation(prefill.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+            ssd_cpu_prefill_stats stats = {};
+            require(ssd_cpu_prefill_run_activation(prefill.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
                 ids.data(), weights.data(), nslots, ntokens, &swiglu, output.data(), &stats, error, sizeof(error)),
                 std::string("borrowing prefill: ") + error);
             require(!stats.stream.read_errors && stats.stream.read_completions == stats.stream.read_requests &&
@@ -4160,7 +4160,7 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
         };
         std::vector<float> o1, o2, o3;
         std::string log;
-        kimi_cpu_prefill_stats s2 = {}, s3 = {};
+        ssd_cpu_prefill_stats s2 = {}, s3 = {};
         for (int pass = 0; pass < 2; ++pass) {
             stderr_capture capture;
             call(meta1, 2, x, o1);
@@ -4175,7 +4175,7 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
                 "layer 2's read-ahead did not borrow layer 3's slots, or layer 3's did not borrow layer 1's (layer 2: "
                 + std::to_string(s2.ram_experts) + ", layer 3: " + std::to_string(s3.ram_experts) + " RAM experts)");
         // the receipts of layers 1 and 2 name their plans' borrowed slots
-        for (const char * at : { "[kimi_cpu_prefill_lookahead] layer=1 ", "[kimi_cpu_prefill_lookahead] layer=2 " }) {
+        for (const char * at : { "[ssd_cpu_prefill_lookahead] layer=1 ", "[ssd_cpu_prefill_lookahead] layer=2 " }) {
             const size_t line = log.find(at);
             const size_t field = line == std::string::npos ? line : log.find(" borrowed=", line);
             require(field != std::string::npos && std::stoull(log.substr(field + 10)) > 0,
@@ -4190,7 +4190,7 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
         const int32_t expert = 5;
         const float one = 1.0f;
         for (const auto * meta : { &meta1, &meta3 }) {
-            require(kimi_cpu_sink_run_activation(sink.get(), meta->role[0], meta->role[1], meta->role[2], single.data(),
+            require(ssd_cpu_sink_run_activation(sink.get(), meta->role[0], meta->role[1], meta->role[2], single.data(),
                 &expert, &one, 1, &swiglu, out.data(), nullptr, error, sizeof(error)), error);
         }
         std::printf("case=lookahead_borrow quota=%d layer2_ram_experts=%llu layer3_ram_experts=%llu status=PASS\n", quota,

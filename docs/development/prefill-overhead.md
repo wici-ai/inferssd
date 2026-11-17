@@ -20,7 +20,7 @@ term is zero. With two distinct observed token counts, a nonnegative
 least-squares fit estimates both terms. An empty sample window retains the
 previous estimate.
 
-The byte geometry comes from `kimi_vram_prefill_lane` in
+The byte geometry comes from `ssd_vram_prefill_lane` in
 `engine/ggml/src/ggml-ssd/gpu/vram-tier-api.h`. The grouped engine reports
 both input and output row bytes; a lane that reports `token_bytes=0` (as the
 retired MXFP4 hand engine did, charging its input per route) has a row prior of

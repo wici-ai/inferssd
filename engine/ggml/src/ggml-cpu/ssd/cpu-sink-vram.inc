@@ -1,30 +1,30 @@
 // Included after sink_cache. Private, default-off GPU tier adapter.
-static_assert(int(KIMI_VRAM_ACTIVATION_SITU) == int(KIMI_CPU_SINK_ACTIVATION_SITU) &&
-    int(KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP) == int(KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) &&
-    int(KIMI_VRAM_ACTIVATION_SWIGLU) == int(KIMI_CPU_SINK_ACTIVATION_SWIGLU),
+static_assert(int(SSD_VRAM_ACTIVATION_SITU) == int(SSD_CPU_SINK_ACTIVATION_SITU) &&
+    int(SSD_VRAM_ACTIVATION_SWIGLU_CLAMP) == int(SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP) &&
+    int(SSD_VRAM_ACTIVATION_SWIGLU) == int(SSD_CPU_SINK_ACTIVATION_SWIGLU),
     "VRAM tier and CPU sink activation kinds must match");
 struct sink_vram {
-    const kimi_vram_tier_api * api = nullptr;
-    const kimi_vram_residency_api * residency = nullptr;
-    const kimi_vram_format_api * format = nullptr; // optional explicit-format extension
-    const kimi_vram_prefill_api * prefill_api = nullptr;
-    const kimi_vram_elastic_api * elastic = nullptr;
+    const ssd_vram_tier_api * api = nullptr;
+    const ssd_vram_residency_api * residency = nullptr;
+    const ssd_vram_format_api * format = nullptr; // optional explicit-format extension
+    const ssd_vram_prefill_api * prefill_api = nullptr;
+    const ssd_vram_elastic_api * elastic = nullptr;
     bool format_path = false;
     void * context = nullptr;
-    std::vector<kimi_vram_request> requests;
+    std::vector<ssd_vram_request> requests;
     std::vector<int> slots;
     // the routes of each request of the next prefill prepare's union, set by the stream (prepare_prefill sends them)
     std::vector<int32_t> prefill_seed_routes;
     int hits = 0;
     // The format's grouped-prefill lane (the tier's, prefill API v9): whether its passes run on the batched engine, and
     // this layer's use of it, and whether this pass's streamed transients are read in place.
-    kimi_vram_prefill_lane prefill_lane = {};
+    ssd_vram_prefill_lane prefill_lane = {};
     bool prefill_batched = false, prefill_in_place = false;
     bool decode = false, prefill_open = false, async_upload = false, prefill_enabled = false;
     // A tier with no residency table holds nothing across layers: it serves grouped prefill alone, decode never calls it.
     bool prefill_only = false;
     bool prefill_job_active = false;
-    // The start values of the cost table's lines the sink fits (ggml-ssd/place/layer-plan.h, kimi_place_table) and the fitted
+    // The start values of the cost table's lines the sink fits (ggml-ssd/place/layer-plan.h, ssd_place_table) and the fitted
     // lines. Typed place.costs overlays named priors; each calibrated line reports the same names.
     using prefill_costs = ssd::place::cost_lines;
     prefill_costs cost, prior;
@@ -40,28 +40,28 @@ struct sink_vram {
     std::function<bool(int)> ram_slot_locked;
     bool ring_locked = false;
     int prefill_latent = 0;
-    std::vector<kimi_vram_prefill_transient> prefill_transient;
+    std::vector<ssd_vram_prefill_transient> prefill_transient;
     std::vector<ssd::place::prefill_expert> prefill_policy_experts;
-    kimi_vram_prefill_stats prefill_stats = {};
+    ssd_vram_prefill_stats prefill_stats = {};
     uint64_t epoch = 0;
     std::vector<int> ram_leases;
     // Opt-in deferred uploads: the RAM source of an upload that outlives its layer stays leased until collected.
-    const kimi_vram_deferred_api * deferred_api = nullptr;
+    const ssd_vram_deferred_api * deferred_api = nullptr;
     bool deferred_upload = false, have_token = false;
     uint64_t token = 0, deferred_queued = 0, deferred_collected = 0, deferred_stale = 0, deferred_aborted = 0;
-    struct deferred_source { kimi_vram_request key; sink_request source; int lease; uint64_t cache_generation; };
+    struct deferred_source { ssd_vram_request key; sink_request source; int lease; uint64_t cache_generation; };
     std::vector<deferred_source> deferred;
     std::vector<uint8_t> upload_queued; // per request of the current layer
-    // Optional: the GPU computes experts straight from host memory (kimi_vram_host_api).
-    const kimi_vram_host_api * host_api = nullptr;
+    // Optional: the GPU computes experts straight from host memory (ssd_vram_host_api).
+    const ssd_vram_host_api * host_api = nullptr;
     uint64_t host_experts = 0;
-    const kimi_vram_policy_api * policy_api = nullptr; // optional: miss cost, host demand and floor, host reclaim
+    const ssd_vram_policy_api * policy_api = nullptr; // optional: miss cost, host demand and floor, host reclaim
     // The CPUs the tier's threads were given (policy set_thread_cpus): the process's other than those of the run's
     // coordinator, read at the first layer on the tier after each begin, once ggml has placed the graph's threads. The
     // process's are read when the sink starts, before ggml places any thread (Linux reads the calling thread's mask).
     ssd::platform::cpu_list thread_cpus, coordinator_cpus, process_cpus;
     bool placement_due = true;
-    // The routed layers as the tier is given them (kimi_vram_expert_format): their IDs in the cache's priority order
+    // The routed layers as the tier is given them (ssd_vram_expert_format): their IDs in the cache's priority order
     // and, once every one has the expert types recorded at load (record_expert_types), each one's types; without them
     // a call's types stand for every layer.
     struct layer_list {
@@ -76,7 +76,7 @@ struct sink_vram {
             }
         }
         // the declaration with the call's layer's tensors
-        kimi_vram_expert_format format(const ggml_tensor * up, const ggml_tensor * down, int latent, int hidden) const {
+        ssd_vram_expert_format format(const ggml_tensor * up, const ggml_tensor * down, int latent, int hidden) const {
             return { latent, hidden, int32_t(up->type), int32_t(down->type), int32_t(up->ne[2]), int32_t(ids.size()),
                 ids.data(), up_types.empty() ? nullptr : up_types.data(), down_types.empty() ? nullptr : down_types.data() };
         }
@@ -115,7 +115,7 @@ struct sink_vram {
         }
         prior = cost;
         std::fprintf(stderr,
-            "[kimi_cpu_prefill_cost] rule=makespan cpu_fixed_us=%.3f cpu_route_us=%.3f gpu_fixed_us=%.3f "
+            "[ssd_cpu_prefill_cost] rule=makespan cpu_fixed_us=%.3f cpu_route_us=%.3f gpu_fixed_us=%.3f "
             "gpu_route_us=%.3f gpu_host_fixed_us=%.3f gpu_host_route_us=%.3f link_gbps=%.3f pageable_gbps=%.3f "
             "drive_gbps=%.3f drive_fixed_us=%.3f gpu_token_us=%.3f\n",
             cost.cpu_fixed_us, cost.cpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us, cost.gpu_host_fixed_us,
@@ -209,9 +209,9 @@ struct sink_vram {
         }
     }
     ~sink_vram() {
-        if (host_experts) { std::fprintf(stderr, "[kimi_vram_host_sink] gpu_host_experts=%llu\n", (unsigned long long) host_experts); }
+        if (host_experts) { std::fprintf(stderr, "[ssd_vram_host_sink] gpu_host_experts=%llu\n", (unsigned long long) host_experts); }
         if (context) { api->destroy(context); }
-        if (deferred_upload) { std::fprintf(stderr, "[kimi_vram_deferred_sink] queued=%llu collected=%llu aborted=%llu stale_leases=%llu\n",
+        if (deferred_upload) { std::fprintf(stderr, "[ssd_vram_deferred_sink] queued=%llu collected=%llu aborted=%llu stale_leases=%llu\n",
             (unsigned long long) deferred_queued, (unsigned long long) deferred_collected, (unsigned long long) deferred_aborted,
             (unsigned long long) deferred_stale); }
     }
@@ -256,7 +256,7 @@ struct sink_vram {
         if (deferred_upload) {
             // Anything but the next decode token of this epoch may release the arena or the RAM cache.
             const bool next = decode && this->decode && have_token && epoch == this->epoch && token == this->token + 1;
-            collect_deferred(cache, next ? KIMI_VRAM_COLLECT_NONE : KIMI_VRAM_COLLECT_ALL);
+            collect_deferred(cache, next ? SSD_VRAM_COLLECT_NONE : SSD_VRAM_COLLECT_ALL);
         }
         char error[512] = {};
         const int result = api->begin(context, epoch, token, decode, error, sizeof(error));
@@ -280,15 +280,15 @@ struct sink_vram {
         if (!context || !elastic || (!format && !prefill_only) || layers.ids.empty()) { return; }
         const int layer = ssd::host::routed_layer(up);
         if (layer < 0) { throw std::runtime_error("GPU tier reserve requires a canonical routed layer"); }
-        kimi_vram_request r = {};
+        ssd_vram_request r = {};
         r.layer = layer; r.weight = 1.0f;
         const ggml_tensor * tensors[] = { up, gate, down };
         for (int role = 0; role < 3; ++role) { r.role[role].bytes = tensors[role]->nb[2]; }
-        const kimi_vram_expert_format f = layers.format(up, down, int32_t(up->ne[0]), int32_t(up->ne[1]));
+        const ssd_vram_expert_format f = layers.format(up, down, int32_t(up->ne[0]), int32_t(up->ne[1]));
         char error[512] = {};
         check(elastic->reserve(context, &r, &f, error, sizeof(error)), error);
     }
-    // At load, after the load's passes (kimi_cpu_sink_preload): the slots no entry holds, a tier made at load having
+    // At load, after the load's passes (ssd_cpu_sink_preload): the slots no entry holds, a tier made at load having
     // grown into the card first if its memory settled; 0 without a tier.
     size_t preload_slots() {
         if (!context || !elastic) { return 0; }
@@ -300,7 +300,7 @@ struct sink_vram {
     // One expert into an empty slot from its roles in host memory, keyed as decode keys it (sink_cache::key):
     // false when no slot is empty or the tier holds it already.
     bool preload(int32_t layer, const sink_request & expert, const void * const * data) {
-        kimi_vram_request r = {};
+        ssd_vram_request r = {};
         r.layer = layer; r.expert = expert.id; r.weight = 1.0f;
         for (int role = 0; role < 3; ++role) {
             const auto k = sink_cache::key(expert.role[role]);
@@ -324,7 +324,7 @@ struct sink_vram {
         if (!context || prefill_only) { return; }
         place_threads();
         const int layer = ssd::host::routed_layer(up);
-        if (layer < 0 || layer >= KIMI_VRAM_MAX_LAYERS || source.size() > 16) {
+        if (layer < 0 || layer >= SSD_VRAM_MAX_LAYERS || source.size() > 16) {
             throw std::runtime_error("GPU tier requires a canonical routed layer and <=16 slots");
         }
         if (!format) {
@@ -332,7 +332,7 @@ struct sink_vram {
         }
         if (deferred_upload && decode) {
             // The RAM cache refuses a layer's prepare while that layer's entries are leased.
-            collect_deferred(cache, cache.allocation == sink_cache::global ? KIMI_VRAM_COLLECT_ALL : layer);
+            collect_deferred(cache, cache.allocation == sink_cache::global ? SSD_VRAM_COLLECT_ALL : layer);
         }
         upload_queued.assign(source.size(), 0);
         requests.resize(source.size()); slots.assign(source.size(), -1);
@@ -347,7 +347,7 @@ struct sink_vram {
         char error[512] = {};
         int result;
         {
-            const kimi_vram_expert_format f = layers.format(up, down, latent, hidden);
+            const ssd_vram_expert_format f = layers.format(up, down, latent, hidden);
             result = format->prepare(context, requests.data(), int(requests.size()), &f, slots.data(), error, sizeof(error));
         }
         format_path = true;
@@ -355,12 +355,12 @@ struct sink_vram {
         for (size_t i = 0; i < source.size(); ++i) { source[i].vram_slot = slots[i]; hits += slots[i] >= 0; }
     }
     // The tier's engines take the f32 input row.
-    void launch(const float * input, size_t bytes, const kimi_cpu_sink_activation & activation) {
+    void launch(const float * input, size_t bytes, const ssd_cpu_sink_activation & activation) {
         if (!context || prefill_only) { return; }
         char error[512] = {};
         int result;
         if (format_path) {
-            const kimi_vram_activation a = { activation.kind, activation.situ_beta, activation.situ_linear_beta, activation.swiglu_limit };
+            const ssd_vram_activation a = { activation.kind, activation.situ_beta, activation.situ_linear_beta, activation.swiglu_limit };
             result = format->launch(context, input, bytes, &a, error, sizeof(error));
         } else {
             throw std::runtime_error("GPU launch requires an explicit expert format");
@@ -446,7 +446,7 @@ struct sink_vram {
     }
     // Queues experts behind the layer's resident batch, as one engine batch where possible; false if the tier
     // has no launched layer to follow.
-    bool launch_host(const std::vector<kimi_vram_host_job> & jobs) {
+    bool launch_host(const std::vector<ssd_vram_host_job> & jobs) {
         char error[512] = {};
         int accepted = 0;
         check(host_api->launch(context, jobs.data(), int(jobs.size()), &accepted, error, sizeof(error)), error);
@@ -461,7 +461,7 @@ struct sink_vram {
         if (!decode) { return; }
         if (deferred_upload) { retain_deferred(cache, source); }
         release_ram_batch(cache);
-        if (deferred_upload) { collect_deferred(cache, KIMI_VRAM_COLLECT_NONE); }
+        if (deferred_upload) { collect_deferred(cache, SSD_VRAM_COLLECT_NONE); }
     }
     // The layer's grouped prefill on the tier: every format the tier has a lane for (it initializes the format on a cold
     // prefill, its decode arena deferred to the first decode token).
@@ -475,7 +475,7 @@ struct sink_vram {
         if (!context || !prefill_enabled || source.empty()) { return 0; }
         place_threads();
         const int layer = ssd::host::routed_layer(up);
-        if (layer < 0 || layer >= KIMI_VRAM_MAX_LAYERS || source.size() > static_cast<size_t>(up->ne[2])) {
+        if (layer < 0 || layer >= SSD_VRAM_MAX_LAYERS || source.size() > static_cast<size_t>(up->ne[2])) {
             throw std::runtime_error("GPU grouped prefill requires a canonical routed layer and a distinct expert union");
         }
         prefill_latent = latent;
@@ -489,10 +489,10 @@ struct sink_vram {
                                 k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns, k.inode_hi };
             }
         }
-        const kimi_vram_expert_format f = layers.format(up, down, latent, hidden);
+        const ssd_vram_expert_format f = layers.format(up, down, latent, hidden);
         char error[512] = {};
         // the pass's routes of each request, so that the prepare seeds the layer's empty slots with the experts the
-        // pass routes most (kimi_vram_prefill_api v10)
+        // pass routes most (ssd_vram_prefill_api v10)
         if (prefill_seed_routes.size() == requests.size()) {
             check(prefill_api->seed_routes(context, prefill_seed_routes.data(), int(prefill_seed_routes.size()), error,
                 sizeof(error)), error);
@@ -502,7 +502,7 @@ struct sink_vram {
                 slots.data(), error, sizeof(error)), error);
         prefill_lane = {};
         prefill_api->lane(context, &prefill_lane);
-        if (prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_NONE || (post_norm && !prefill_lane.post_norm)) {
+        if (prefill_lane.engine == SSD_VRAM_PREFILL_ENGINE_NONE || (post_norm && !prefill_lane.post_norm)) {
             // the tier pinned the layer's residents only where it has a lane: give them back
             if (std::any_of(slots.begin(), slots.end(), [](int slot) { return slot >= 0; })) {
                 check(prefill_api->cancel(context, error, sizeof(error)), error);
@@ -510,21 +510,21 @@ struct sink_vram {
             std::fill(slots.begin(), slots.end(), -1);
             return 0;
         }
-        prefill_batched = prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_BATCHED;
+        prefill_batched = prefill_lane.engine == SSD_VRAM_PREFILL_ENGINE_BATCHED;
         for (size_t i = 0; i < source.size(); ++i) {
             source[i].vram_slot = slots[i];
             hits += slots[i] >= 0;
         }
         return hits;
     }
-    // The layer's experts as the cost table's planner takes them (kimi_place_item), for decode and grouped prefill
+    // The layer's experts as the cost table's planner takes them (ssd_place_item), for decode and grouped prefill
     // alike: routes(i) its tokens in the layer (0: no work), movable(i) whether the caller can hand it to the GPU,
     // needs_slot(i) whether a move takes one of the tier's free device slots. Its host memory is page-locked where its
     // RAM cache slot is (the decode registrar), or, for a read into the ring, where the ring is.
     template <class Routes, class Movable, class NeedsSlot>
-    std::vector<kimi_place_item> place_items(const std::vector<sink_request> & source, Routes routes, Movable movable,
+    std::vector<ssd_place_item> place_items(const std::vector<sink_request> & source, Routes routes, Movable movable,
             NeedsSlot needs_slot) const {
-        std::vector<kimi_place_item> items(source.size());
+        std::vector<ssd_place_item> items(source.size());
         auto locked = [&](int entry) { return entry >= 0 && ram_slot_locked && ram_slot_locked(entry); };
         for (size_t i = 0; i < source.size(); ++i) {
             const auto & r = source[i];
@@ -542,8 +542,8 @@ struct sink_vram {
         return items;
     }
     void select_prefill_transient(std::vector<sink_request> & source,
-            kimi_cpu_sink_prefill_batch & batch, sink_cache & cache, size_t ssd_staging_limit, size_t ring_slots,
-            const kimi_place_table & table) {
+            ssd_cpu_sink_prefill_batch & batch, sink_cache & cache, size_t ssd_staging_limit, size_t ring_slots,
+            const ssd_place_table & table) {
         prefill_transient.clear();
         for (auto & request : source) {
             request.vram_transient = false;
@@ -572,7 +572,7 @@ struct sink_vram {
         }
         for (size_t i = 0; i < source.size(); ++i) { source[i].prefill_routes = token_routes[i]; }
 
-        // The makespan rule places the layer from the cost table (ggml-ssd/place/layer-plan.h, kimi_place_layer), as a
+        // The makespan rule places the layer from the cost table (ggml-ssd/place/layer-plan.h, ssd_place_layer), as a
         // decode layer is placed: the CPU and the GPU at their measured lines for this pass's size, the copies at the measured rate of their transport (from the
         // page-locked ring or RAM slot: DMA on the link while the GPU computes; pageable: staged by the GPU's
         // worker), the drive's line, and the form the reads take (the list schedule when they fit the ring,
@@ -592,7 +592,7 @@ struct sink_vram {
             prefill_policy_experts[i] = { source[i].id, source[i].vram_slot >= 0,
                 source[i].cache_hit >= 0, source[i].cache_lease, expert_bytes(i) };
         }
-        std::vector<kimi_place_item> items;
+        std::vector<ssd_place_item> items;
         const ssd::place::prefill_input input = {prefill_policy_experts, token_routes, items, table,
             batch.ntokens, ssd_staging_limit, ring_slots};
         const auto counted = ssd::place::count_prefill(input, batch.gpu_ssd_transient_candidates);
@@ -607,10 +607,10 @@ struct sink_vram {
             const size_t index = item.index;
             const int routes = token_routes[index];
             const uint64_t bytes = expert_bytes(index);
-            kimi_vram_prefill_transient selected = {};
+            ssd_vram_prefill_transient selected = {};
             selected.request_index = int32_t(index);
             selected.source = item.source;
-            if (item.source == KIMI_VRAM_PREFILL_TRANSIENT_RAM) {
+            if (item.source == SSD_VRAM_PREFILL_TRANSIENT_RAM) {
                 for (int role = 0; role < 3; ++role) {
                     selected.role[role] = static_cast<const char *>(cache.data(source[index].cache_hit, role)) + source[index].role[role].data_offset;
                 }
@@ -632,7 +632,7 @@ struct sink_vram {
         // place on the link; the CPU's in request order), for the reads' issue order.
         for (size_t i = 0; i < source.size(); ++i) { source[i].lane_start_us = placed.start[i]; }
         std::fprintf(stderr,
-            "[kimi_cpu_prefill_schedule] format=%s rule=makespan ssd_limit=%zu "
+            "[ssd_cpu_prefill_schedule] format=%s rule=makespan ssd_limit=%zu "
             "ram_candidates=%zu ram_selected=%zu ram_selected_routes=%llu ram_upload_bytes=%llu "
             "ssd_candidates=%zu ssd_selected=%zu ssd_selected_routes=%llu ssd_upload_bytes=%llu "
             "cpu_backlog_before_us=%.1f cpu_backlog_after_us=%.1f gpu_backlog_before_us=%.1f "
@@ -650,7 +650,7 @@ struct sink_vram {
     void bind_prefill_ssd_transient(size_t request_index, const void * const data[3],
             int (*stage)(void *, int32_t, int) = nullptr, void * context = nullptr) {
         for (auto & item : prefill_transient) {
-            if (item.source != KIMI_VRAM_PREFILL_TRANSIENT_SSD ||
+            if (item.source != SSD_VRAM_PREFILL_TRANSIENT_SSD ||
                     item.request_index != int32_t(request_index)) { continue; }
             for (int role = 0; role < 3; ++role) {
                 if (!data[role] || item.role[role]) {
@@ -665,9 +665,9 @@ struct sink_vram {
         throw std::runtime_error("SSD prefill staging request was not scheduled");
     }
     void launch_prefill(const float * input, size_t stride, const int32_t * route_requests, const float * weights,
-            int nslots, int ntokens, const kimi_cpu_sink_activation & activation) {
+            int nslots, int ntokens, const ssd_cpu_sink_activation & activation) {
         if (!context || !prefill_enabled || (!hits && prefill_transient.empty())) { return; }
-        const kimi_vram_prefill_launch options = {
+        const ssd_vram_prefill_launch options = {
             { activation.kind, activation.situ_beta, activation.situ_linear_beta, activation.swiglu_limit },
             activation.post_exp_norm, activation.post_exp_norm_eps, int32_t(prefill_in_place),
         };
@@ -676,7 +676,7 @@ struct sink_vram {
                 prefill_transient.data(), int(prefill_transient.size()), &options, error, sizeof(error)), error);
         prefill_job_active = true;
     }
-    void finish_prefill(float * output, size_t stride, kimi_cpu_sink_prefill_batch & batch) {
+    void finish_prefill(float * output, size_t stride, ssd_cpu_sink_prefill_batch & batch) {
         if (!context || !prefill_enabled || !prefill_job_active) { return; }
         char error[512] = {};
         prefill_stats = {};
@@ -695,7 +695,7 @@ struct sink_vram {
         hits = 0; prefill_job_active = false; prefill_transient.clear();
     }
     // A request the CPU computes in a sink prefill: the tier copies its payload into the seed slot it reserved for it,
-    // if any (kimi_vram_prefill_api v10). seed_wait returns once the copy is done, before the payload's ring slot or
+    // if any (ssd_vram_prefill_api v10). seed_wait returns once the copy is done, before the payload's ring slot or
     // RAM cache lease goes back.
     void seed_host(size_t request, const void * const * data) {
         if (!context || !prefill_api) { return; }
@@ -713,7 +713,7 @@ struct sink_vram {
     }
     ssd::place::lane_geometry lane_geometry() const {
         return { prefill_lane.token_bytes, prefill_lane.output_bytes,
-            prefill_lane.engine == KIMI_VRAM_PREFILL_ENGINE_BATCHED, prefill_lane.in_place != 0 };
+            prefill_lane.engine == SSD_VRAM_PREFILL_ENGINE_BATCHED, prefill_lane.in_place != 0 };
     }
     double overhead_row_prior(double locked_us_per_mb) const {
         return ssd::place::overhead_row_prior(prior, lane_geometry(), locked_us_per_mb);
@@ -723,7 +723,7 @@ struct sink_vram {
     // decode's lines and the tier's copy rates), and the calibrated line prints it by the names the start values take,
     // with this layer's prediction (made before it ran, on the terms of then) against what it measured.
     template <class Table>
-    void calibrate_prefill(double cpu_us, const kimi_cpu_sink_prefill_batch & batch, uint64_t read_bytes,
+    void calibrate_prefill(double cpu_us, const ssd_cpu_sink_prefill_batch & batch, uint64_t read_bytes,
             double read_us, double layer_us, Table table) {
         if (!prefill_batched || !prefill_plan.valid) { return; }
         const prefill_plan_state plan = prefill_plan;
@@ -746,9 +746,9 @@ struct sink_vram {
         const auto fitted = ssd::place::observe_prefill_lines(learning, cost, prior, measured);
         const auto & overhead = fitted.overhead;
         ssd::place::observe_prefill_overhead(learning, cost, overhead, overhead_row_prior(table().locked_us_per_mb));
-        const kimi_place_table t = table();
+        const ssd_place_table t = table();
         std::fprintf(stderr,
-            "[kimi_cpu_prefill_cost] calibrated=%llu tokens=%d samples=%zu cpu_fixed_us=%.3f cpu_route_us=%.3f "
+            "[ssd_cpu_prefill_cost] calibrated=%llu tokens=%d samples=%zu cpu_fixed_us=%.3f cpu_route_us=%.3f "
             "gpu_fixed_us=%.3f gpu_route_us=%.3f gpu_host_fixed_us=%.3f gpu_host_route_us=%.3f link_gbps=%.3f "
             "pageable_gbps=%.3f drive_gbps=%.3f drive_fixed_us=%.3f gpu_overhead_fixed_us=%.3f gpu_token_us=%.3f "
             "gpu_overhead_samples=%.0f gpu_overhead_min_tokens=%d gpu_overhead_max_tokens=%d cpu_one_us=%.1f "
@@ -769,7 +769,7 @@ struct sink_vram {
                 !prefill_job_active) { return; }
         char error[512] = {};
         if (prefill_api->cancel(context, error, sizeof(error))) {
-            std::fprintf(stderr, "[kimi_vram_prefill] failed to drain GPU work: %s; aborting\n", error);
+            std::fprintf(stderr, "[ssd_vram_prefill] failed to drain GPU work: %s; aborting\n", error);
             std::abort();
         }
         hits = 0; prefill_job_active = false; prefill_transient.clear();
@@ -785,7 +785,7 @@ struct sink_vram {
             deferred.push_back({requests[i], source[i], index, cache.generation});
         }
     }
-    static bool same_key(const kimi_vram_request & a, const kimi_vram_request & b) {
+    static bool same_key(const ssd_vram_request & a, const ssd_vram_request & b) {
         if (a.layer != b.layer || a.expert != b.expert) { return false; }
         for (int r = 0; r < 3; ++r) {
             const auto & x = a.role[r];
@@ -802,7 +802,7 @@ struct sink_vram {
     void collect_deferred(sink_cache & cache, int32_t wait_layer) {
         if (!deferred_upload || !context) { return; }
         try {
-            kimi_vram_request done[16] = {};
+            ssd_vram_request done[16] = {};
             int32_t aborted[16] = {};
             int count = 0;
             do {
@@ -852,7 +852,7 @@ struct sink_vram {
         if (!context) { return; }
         char error[512] = {};
         if (api->cancel(context, error, sizeof(error))) {
-            std::fprintf(stderr, "[kimi_vram_tier] failed to drain GPU work: %s; aborting\n", error);
+            std::fprintf(stderr, "[ssd_vram_tier] failed to drain GPU work: %s; aborting\n", error);
             std::abort();
         }
         ram_leases.clear(); // caller releases RAM only after this drain

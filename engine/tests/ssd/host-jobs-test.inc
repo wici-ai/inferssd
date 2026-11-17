@@ -1,5 +1,5 @@
 #include "explicit-fixture-inputs.h"
-// The tier's host path (kimi_vram_host_api v3) through its C API, used by test-ssd-vram-generic (Q8_0 and MXFP4).
+// The tier's host path (ssd_vram_host_api v3) through its C API, used by test-ssd-vram-generic (Q8_0 and MXFP4).
 // Included after test-ssd-cpu-sink.cpp (require, ggml).
 #pragma once
 #include "ggml-ssd/gpu/vram-tier-api.h"
@@ -7,16 +7,16 @@
 #include <functional>
 #include <sys/mman.h>
 
-// The host path of the tier (kimi_vram_host_api v3) through its C API, on experts of one type:
+// The host path of the tier (ssd_vram_host_api v3) through its C API, on experts of one type:
 // a host job computes the same rows as the same expert resident (same kernel, same bytes, bit for bit); on a discrete
 // GPU a pageable source is refused, a page-locked one is copied into the expert's admission reservation, which finish
 // publishes (the next prepare hits it), or into a scratch slot the tier allocates at the token boundary after the first
 // registration; that registration's range is copied once, timed, when no copy has been; a batch wider than the free
 // scratch slots is refused; the costs report measured lines.
 inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & checks) {
-    const auto * tier_api = reinterpret_cast<kimi_vram_tier_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_tier_get_api"))();
-    const auto * format_api = reinterpret_cast<kimi_vram_format_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_format_get_api"))();
-    const auto * host_api = reinterpret_cast<kimi_vram_host_get_api_fn>(dlsym(RTLD_DEFAULT, "kimi_vram_host_get_api"))();
+    const auto * tier_api = reinterpret_cast<ssd_vram_tier_get_api_fn>(dlsym(RTLD_DEFAULT, "ssd_vram_tier_get_api"))();
+    const auto * format_api = reinterpret_cast<ssd_vram_format_get_api_fn>(dlsym(RTLD_DEFAULT, "ssd_vram_format_get_api"))();
+    const auto * host_api = reinterpret_cast<ssd_vram_host_get_api_fn>(dlsym(RTLD_DEFAULT, "ssd_vram_host_get_api"))();
     require(tier_api && format_api && host_api && host_api->version == 3 && host_api->costs2 && host_api->register_host,
         "host API v2 missing from the tier DSO");
     const int latent = 512, hidden = 256, n_experts = 8;
@@ -69,7 +69,7 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
         }
     }
     auto key = [&](int expert) {
-        kimi_vram_request r = {};
+        ssd_vram_request r = {};
         r.layer = 1; r.expert = expert; r.weight = 0.5f;
         const size_t bytes[3] = { up, up, down };
         uint64_t offset = 0;
@@ -80,8 +80,8 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
         return host + size_t(expert) * stride + (role >= 1 ? up : 0) + (role == 2 ? up : 0);
     };
     const int32_t layers[1] = { 1 };
-    const kimi_vram_expert_format format = { latent, hidden, int(type), int(type), n_experts, 1, layers };
-    const kimi_vram_activation act = { KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP, 0, 0, 7.0f };
+    const ssd_vram_expert_format format = { latent, hidden, int(type), int(type), n_experts, 1, layers };
+    const ssd_vram_activation act = { SSD_VRAM_ACTIVATION_SWIGLU_CLAMP, 0, 0, 7.0f };
     std::vector<float> input(latent);
     for (int i = 0; i < latent; ++i) { input[size_t(i)] = std::sin(0.37f * float(i)); }
     // the engine's input row: F32
@@ -92,7 +92,7 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
     struct layer_result { std::vector<int> slots; std::vector<float> rows; };
     auto layer = [&](const std::vector<int> & experts, const std::function<void(const std::vector<int> &)> & between) {
         require(tier_api->begin(t, 1, ++token, 1, error, sizeof(error)) == 0, std::string("begin: ") + error);
-        std::vector<kimi_vram_request> r;
+        std::vector<ssd_vram_request> r;
         for (int e : experts) { r.push_back(key(e)); }
         layer_result out;
         out.slots.assign(experts.size(), -1);
@@ -106,22 +106,22 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
         return out;
     };
     auto job = [&](int row, int expert) {
-        return kimi_vram_host_job{ row, 0.5f, { payload(expert, 0), payload(expert, 1), payload(expert, 2) } };
+        return ssd_vram_host_job{ row, 0.5f, { payload(expert, 0), payload(expert, 1), payload(expert, 2) } };
     };
-    auto launch = [&](const std::vector<kimi_vram_host_job> & jobs) {
+    auto launch = [&](const std::vector<ssd_vram_host_job> & jobs) {
         int accepted = -1;
         require(host_api->launch(t, jobs.data(), int(jobs.size()), &accepted, error, sizeof(error)) == 0, std::string("host launch: ") + error);
         return accepted;
     };
     auto admit = [&](int row, int expert) {
-        const kimi_vram_request r = key(expert);
+        const ssd_vram_request r = key(expert);
         require(tier_api->admit(t, &r, payload(expert, 0), payload(expert, 1), payload(expert, 2), 0, error, sizeof(error)) == 0,
             std::string("admit: ") + error);
         (void) row;
     };
     // In place or not: a tier reads the device's attributes at its first layer, so ask one that has run a layer (before
     // that every tier reports in_place=0, also on a unified device).
-    kimi_vram_host_costs c = {};
+    ssd_vram_host_costs c = {};
     bool in_place = false;
     {
         void * main_tier = t;

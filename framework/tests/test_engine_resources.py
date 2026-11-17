@@ -263,7 +263,7 @@ def test_gpu_failed_or_na_and_checked_command_error():
 def test_a_builds_gpu_backends_are_read_from_its_cmake_cache():
     cache = "GGML_CUDA:BOOL=ON\nGGML_METAL:BOOL=OFF\n// comment\nGGML_VULKAN:BOOL=TRUE\n"
     assert cmake_gpu_backends(cache) == ("CUDA", "Vulkan")
-    metal = "GGML_METAL:BOOL=ON\nGGML_CUDA_KIMI_VRAM_TIER:BOOL=ON\n"
+    metal = "GGML_METAL:BOOL=ON\nGGML_CUDA_SSD_VRAM_TIER:BOOL=ON\n"
     assert cmake_gpu_backends(metal) == ("Metal",)
     assert cmake_gpu_backends("") == ()
 

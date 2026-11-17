@@ -38,8 +38,8 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
     const auto configured = ssd::settings::parse("", "");
     require(bool(configured), "metadata fixture settings rejected");
     const ssd::runtime_services services;
-    llama_kimi_cpu_sink_runtime runtime(1, 1, experts, {0}, configured.value, services, {});
-    llama_kimi_cpu_sink_runtime other_runtime(1, 2, experts, {0}, configured.value, services, {});
+    llama_ssd_cpu_sink_runtime runtime(1, 1, experts, {0}, configured.value, services, {});
+    llama_ssd_cpu_sink_runtime other_runtime(1, 2, experts, {0}, configured.value, services, {});
     llm_graph_result result(2048);
     ggml_backend_t backends[] = { cpu };
     ggml_backend_buffer_type_t buffer_types[] = { ggml_backend_cpu_buffer_type() };
@@ -134,8 +134,8 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
         const auto & descriptor = *result.cpu_sink_nodes[0];
         require(descriptor.runtime == &runtime && descriptor.prefill == prefill,
                 "custom node lost its context runtime or execution phase");
-        require(qwen ? descriptor.activation.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU :
-                descriptor.activation.kind == KIMI_CPU_SINK_ACTIVATION_SWIGLU_CLAMP && descriptor.activation.swiglu_limit == 7.0f,
+        require(qwen ? descriptor.activation.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU :
+                descriptor.activation.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP && descriptor.activation.swiglu_limit == 7.0f,
                 "custom node carries another activation than the model's");
         for (const auto * metadata : { &descriptor.up, &descriptor.gate, &descriptor.down }) {
             require(!metadata->data && !metadata->buffer && !metadata->extra && !metadata->view_src,

@@ -21,13 +21,15 @@ server for `sm_120a` and `sm_121a` on `main` and on pull requests that change th
 engine or build configuration; it does not establish GPU runtime correctness.
 Device runs must record both the selected and actually executed tests.
 
-The renamed generic SSD tests use `test-ssd-*` for source files and executables, and
-`ssd_*` or the executable name for CTest. The former `test-kimi-*` names came from the
-predecessor repository. Kimi model support and `test-kimi-deepseek2-guards` keep
-their model-specific names. Frozen launcher oracles and release-comparison
-sources also retain their original paths and hashes. Runtime symbols, environment
-variables and telemetry keys keep their existing spelling; renaming the test
-files does not change those contracts.
+The generic SSD tests use `test-ssd-*` for source files and executables, and
+`ssd_*` or the executable name for CTest. The SSD runtime's symbols, log prefixes
+(such as `[ssd_cpu_sink_cache]`) and CMake option (`GGML_CUDA_SSD_VRAM_TIER`) use
+`ssd` as well. The former `kimi` names came from the predecessor repository, whose
+runtime was first written for a Kimi model. Kimi model support and
+`test-kimi-deepseek2-guards` keep their model-specific names. Frozen launcher
+oracles, the recorded c0-store references and release-comparison sources retain
+their original names, paths and hashes, and the retired `GGML_KIMI_*` environment
+variables keep their names where the engine and the launcher refuse them.
 
 The CPU sink suite runs on Linux, macOS and Windows against the same ggml
 reference graphs, bit for bit. It exercises direct reads, the OS read ring
@@ -49,7 +51,7 @@ needs `python3` with `jinja2`; exclude them with `ctest -E` where these are unav
 static library that only llama links; each context owns its source index. The
 supported configuration uses bundled ggml, shared or static libraries, the CPU
 backend, and linked backends (`GGML_BACKEND_DL=OFF`, `GGML_CPU_ALL_VARIANTS=OFF`).
-The CUDA SSD transport (`GGML_CUDA_KIMI_VRAM_TIER=ON`, set by the `linux-cuda`
+The CUDA SSD transport (`GGML_CUDA_SSD_VRAM_TIER=ON`, set by the `linux-cuda`
 preset) reads through the same read ring as the CPU sink, so no build needs
 liburing: on Linux the ring submits io_uring requests through system calls. System-ggml and runtime backend-plugin variants remain
 outside this store's supported build boundary. Every OS runs configured experts

@@ -11,7 +11,7 @@
 #include <vector>
 #include <unistd.h>
 
-extern "C" bool inferssd_test_kimi_matmul(ggml_tensor *, void *, size_t);
+extern "C" bool inferssd_test_routed_matmul(ggml_tensor *, void *, size_t);
 static void require(bool value, const char * message) { if (!value) { throw std::runtime_error(message); } }
 
 int main() {
@@ -37,7 +37,7 @@ int main() {
                 auto plan = ggml_graph_plan(graph, 1, nullptr);
                 void * raw = nullptr; require(posix_memalign(&raw, 64, std::max<size_t>(64, plan.work_size)) == 0, "work allocation");
                 plan.work_data = static_cast<uint8_t *>(raw);
-                require(inferssd_test_kimi_matmul(output, raw, plan.work_size), "explicit Kimi oracle compute");
+                require(inferssd_test_routed_matmul(output, raw, plan.work_size), "explicit routed-math oracle compute");
                 std::vector<unsigned char> expected(ggml_nbytes(output)); std::memcpy(expected.data(), output->data, expected.size());
                 // Ambient legacy selection/pruning/trace must no longer affect
                 // the production CPU op; the oracle receives an explicit call.

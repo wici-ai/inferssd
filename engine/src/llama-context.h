@@ -34,11 +34,11 @@ struct llama_memory_params;
 struct llama_dense_stream_meter {
     const char * phase = nullptr;       // nullptr: between requests
     uint64_t tokens = 0;
-    ggml_backend_sched_kimi_copy_stats start = {};
+    ggml_backend_sched_ssd_copy_stats start = {};
 
-    void begin(const char * p, const ggml_backend_sched_kimi_copy_stats & now) { phase = p; tokens = 0; start = now; }
+    void begin(const char * p, const ggml_backend_sched_ssd_copy_stats & now) { phase = p; tokens = 0; start = now; }
     void add(uint32_t n_tokens) { tokens += n_tokens; }
-    std::string end(const ggml_backend_sched_kimi_copy_stats & now);
+    std::string end(const ggml_backend_sched_ssd_copy_stats & now);
 };
 
 // The ubatch of a request's prefill graph when a graph of the request's own size, target, does not fit (graphs sized
@@ -365,7 +365,7 @@ private:
     bool cpu_sink_decode_active = false;
     bool cpu_sink_multi_token_reported = false;
     bool cpu_sink_cache_batch_decode = false;
-    std::unique_ptr<llama_kimi_cpu_sink_runtime> cpu_sink_runtime;
+    std::unique_ptr<llama_ssd_cpu_sink_runtime> cpu_sink_runtime;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

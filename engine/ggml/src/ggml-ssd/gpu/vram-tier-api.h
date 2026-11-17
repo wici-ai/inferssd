@@ -9,33 +9,33 @@
 // Private optional transport ABI. The CPU backend remains CUDA independent.
 // Every function except destroy returns 0 on success. Errors must drain work
 // before payload/input/output ownership is returned to the caller.
-struct kimi_vram_source {
+struct ssd_vram_source {
     uint64_t device, inode, size, offset, bytes;
     int64_t mtime_s, mtime_ns, ctime_s, ctime_ns;
     uint64_t inode_hi; // the upper half of a 128-bit file id (Windows); 0 on POSIX
 };
-struct kimi_vram_request {
-    struct kimi_vram_source role[3]; // up, gate, down, same packed-file identity
+struct ssd_vram_request {
+    struct ssd_vram_source role[3]; // up, gate, down, same packed-file identity
     int32_t layer, expert;
     float weight;
 };
-// Layer IDs the tier takes: 0 .. KIMI_VRAM_MAX_LAYERS - 1, more than any model has; its slot table indexes that range.
-#define KIMI_VRAM_MAX_LAYERS 1024
+// Layer IDs the tier takes: 0 .. SSD_VRAM_MAX_LAYERS - 1, more than any model has; its slot table indexes that range.
+#define SSD_VRAM_MAX_LAYERS 1024
 #ifdef __cplusplus
 // A role's payload as the RAM cache and the VRAM tier know it: the file behind the expert-pack resolver's
 // descriptor (from ssd::platform::identity), the role's logical offset in it (where the resolver says its bytes
 // start, before a read aligns it) and its logical bytes. The sink keys what it reads by it and a prefill seed what it
 // copies, so that decode finds the seed: both build it here. Times split as POSIX stat reports them.
-static inline kimi_vram_source kimi_vram_source_identity(const ssd::platform::file_identity & file, uint64_t offset,
+static inline ssd_vram_source ssd_vram_source_identity(const ssd::platform::file_identity & file, uint64_t offset,
         uint64_t bytes) {
     const auto seconds = [](int64_t ns) { return ns / 1000000000 - (ns % 1000000000 < 0); };
     const int64_t mtime_s = seconds(file.mtime_ns), ctime_s = seconds(file.ctime_ns);
-    kimi_vram_source s = { file.device, file.id_lo, file.size, offset, bytes,
+    ssd_vram_source s = { file.device, file.id_lo, file.size, offset, bytes,
         mtime_s, file.mtime_ns - mtime_s * 1000000000, ctime_s, file.ctime_ns - ctime_s * 1000000000, file.id_hi };
     return s;
 }
 #endif
-struct kimi_vram_tier_api {
+struct ssd_vram_tier_api {
     uint32_t version; // 2
     uint32_t size;
     void * (*create)(uint64_t budget_bytes, char * error, size_t error_size);
@@ -44,7 +44,7 @@ struct kimi_vram_tier_api {
                  char * error, size_t error_size);
     // Retired implicit-format slot: returns an error and drains the context.
     // Use the explicit-format extension to prepare expert geometry.
-    int (*prepare)(void * context, const struct kimi_vram_request * requests,
+    int (*prepare)(void * context, const struct ssd_vram_request * requests,
                    int count, int latent, int hidden, int * slots,
                    char * error, size_t error_size);
     // Retired implicit-format slot: returns an error and drains the context.
@@ -54,7 +54,7 @@ struct kimi_vram_tier_api {
     // A RAM cache source may be borrowed until finish/cancel when borrow=1;
     // the caller pins its slot for this entire batch. Ring sources use borrow=0
     // and must be completely copied before return so I/O may reuse the ring.
-    int (*admit)(void * context, const struct kimi_vram_request * request,
+    int (*admit)(void * context, const struct ssd_vram_request * request,
                  const void * up, const void * gate, const void * down,
                  int borrow_until_finish, char * error, size_t error_size);
     // Only original GPU-hit rows are written; CPU rows remain untouched.
@@ -71,7 +71,7 @@ struct kimi_vram_tier_api {
 // prefill, Q2's cold-prefill admission right after its copy. Any phase: the next-layer prefetch asks before it reads
 // an expert into RAM, and the RAM cache before it takes a slot (its copy of an expert the tier holds goes first); the
 // answer may change at the next admission, eviction or resize.
-struct kimi_vram_residency_api {
+struct ssd_vram_residency_api {
     uint32_t version, size;   // 3
     void (*held)(void * context, int32_t layer, const int32_t * experts, int count, uint8_t * out);
 };
@@ -82,16 +82,16 @@ struct kimi_vram_residency_api {
 // finish, cancel, begin and the residency ABI are shared. The declaration (the
 // geometry, the layer list and each layer's types) must stay the same for the
 // lifetime of a context; weight_type and down_type are the call's layer's.
-enum kimi_vram_activation_kind {
-    KIMI_VRAM_ACTIVATION_SITU         = 0, // same values as kimi_cpu_sink_activation_kind
-    KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP = 1,
-    KIMI_VRAM_ACTIVATION_SWIGLU       = 2,
+enum ssd_vram_activation_kind {
+    SSD_VRAM_ACTIVATION_SITU         = 0, // same values as ssd_cpu_sink_activation_kind
+    SSD_VRAM_ACTIVATION_SWIGLU_CLAMP = 1,
+    SSD_VRAM_ACTIVATION_SWIGLU       = 2,
 };
-struct kimi_vram_activation {
+struct ssd_vram_activation {
     int32_t kind;
     float situ_beta, situ_linear_beta, swiglu_limit;
 };
-struct kimi_vram_expert_format {
+struct ssd_vram_expert_format {
     int32_t latent, hidden;   // up/gate columns and rows
     int32_t weight_type;      // ggml_type of up and gate of the call's layer
     int32_t down_type;        // ggml_type of down of the call's layer
@@ -104,14 +104,14 @@ struct kimi_vram_expert_format {
     const int32_t * layer_weight_types;
     const int32_t * layer_down_types;
 };
-struct kimi_vram_format_api {
+struct ssd_vram_format_api {
     uint32_t version, size;   // 2
-    int (*prepare)(void * context, const struct kimi_vram_request * requests, int count,
-                   const struct kimi_vram_expert_format * format, int * slots,
+    int (*prepare)(void * context, const struct ssd_vram_request * requests, int count,
+                   const struct ssd_vram_expert_format * format, int * slots,
                    char * error, size_t error_size);
     // input is the layer's f32 input row (latent floats).
     int (*launch)(void * context, const void * input, size_t input_bytes,
-                  const struct kimi_vram_activation * activation, char * error, size_t error_size);
+                  const struct ssd_vram_activation * activation, char * error, size_t error_size);
 };
 // One host-resident expert selected for transient GPU prefill compute. The
 // request index addresses the distinct-expert union passed to prepare. RAM
@@ -120,11 +120,11 @@ struct kimi_vram_format_api {
 // recyclable I/O ring slot and the stage callback below.
 // The tier copies into a dedicated device scratch slot without changing decode
 // residency, or the batched engine reads it in place (prefill_launch in_place).
-enum kimi_vram_prefill_transient_source {
-    KIMI_VRAM_PREFILL_TRANSIENT_RAM = 0,
-    KIMI_VRAM_PREFILL_TRANSIENT_SSD = 1,
+enum ssd_vram_prefill_transient_source {
+    SSD_VRAM_PREFILL_TRANSIENT_RAM = 0,
+    SSD_VRAM_PREFILL_TRANSIENT_SSD = 1,
 };
-struct kimi_vram_prefill_transient {
+struct ssd_vram_prefill_transient {
     int32_t request_index;
     int32_t source;
     const void * role[3];
@@ -135,7 +135,7 @@ struct kimi_vram_prefill_transient {
     int (*stage)(void * context, int32_t request_index, int phase);
     void * stage_context;
 };
-struct kimi_vram_prefill_stats {
+struct ssd_vram_prefill_stats {
     uint64_t resident_experts;
     uint64_t resident_routes;
     uint64_t transient_experts;
@@ -178,27 +178,27 @@ struct kimi_vram_prefill_stats {
 };
 // The engine a format's grouped prefill runs on (version 7, lane). Its passes of at most vector_tokens tokens run the
 // vector engine, a call of the layer's residents a token, as decode does; longer passes the batched engine,
-// KIMI_VRAM_PREFILL_ENGINE_BATCHED: the grouped engine over the backend's matrix products (any format they serve; the
+// SSD_VRAM_PREFILL_ENGINE_BATCHED: the grouped engine over the backend's matrix products (any format they serve; the
 // per-expert post norm; streamed transients in place on a GPU that reads host memory so). NONE: the CPU's. A pass's
 // input rows are f32 (version 9).
-enum kimi_vram_prefill_engine {
-    KIMI_VRAM_PREFILL_ENGINE_NONE    = 0,
-    KIMI_VRAM_PREFILL_ENGINE_BATCHED = 3,
+enum ssd_vram_prefill_engine {
+    SSD_VRAM_PREFILL_ENGINE_NONE    = 0,
+    SSD_VRAM_PREFILL_ENGINE_BATCHED = 3,
 };
-struct kimi_vram_prefill_lane {
-    int32_t engine;           // enum kimi_vram_prefill_engine
+struct ssd_vram_prefill_lane {
+    int32_t engine;           // enum ssd_vram_prefill_engine
     int32_t in_place;         // the batched engine can read streamed transients in place from host memory
     int32_t post_norm;        // the batched engine applies a per-expert post norm (the vector path always does)
     int32_t vector_tokens;    // passes of at most this many tokens run the vector engine
-    // the batched engine's transfers and device memory (the receipt [kimi_vram_prefill_engine]): over the link per
+    // the batched engine's transfers and device memory (the receipt [ssd_vram_prefill_engine]): over the link per
     // route and per input row each way; reserved: fixed, and per row
     uint64_t route_bytes, token_bytes, output_bytes, fixed_bytes, bytes_per_token;
 };
 // A pass's launch options (version 7): the activation, the optional per-expert post norm (latent weights, copied by
 // launch), and whether the batched engine reads this pass's streamed transients in place (the caller's cost table
 // found it no slower than their copies; only where the lane says it can).
-struct kimi_vram_prefill_launch {
-    struct kimi_vram_activation activation;
+struct ssd_vram_prefill_launch {
+    struct ssd_vram_activation activation;
     const float * post_norm;
     float post_norm_eps;
     int32_t in_place;
@@ -213,18 +213,18 @@ struct kimi_vram_prefill_launch {
 // transient from page-locked memory (the read ring registered through the host API) is a DMA copy that overlaps
 // the computation of another. Version 7 adds the lane (which engine a format's passes run on, for any format the
 // decode engine serves), the launch options (the per-expert post norm, in place) and the in-place chains' stats.
-// Version 8 takes the per-layer types of kimi_vram_expert_format; the lane is the prepared layer's. Version 9: every
+// Version 8 takes the per-layer types of ssd_vram_expert_format; the lane is the prepared layer's. Version 9: every
 // pass's input rows are f32 (the lane's f32_input field is gone).
 // Cold seeds start with zero decode heat and are therefore the
 // first victims unless decode reuses them; the path never evicts an existing
 // decode resident.
-struct kimi_vram_prefill_api {
+struct ssd_vram_prefill_api {
     uint32_t version, size;   // 10
     // requests contains the distinct expert union for one layer. slots receives
     // -1 for CPU work or an opaque resident slot for GPU work. The tier must
     // already hold the same explicit format from an earlier decode phase.
-    int (*prepare)(void * context, const struct kimi_vram_request * requests, int count,
-                   const struct kimi_vram_expert_format * format, int * slots,
+    int (*prepare)(void * context, const struct ssd_vram_request * requests, int count,
+                   const struct ssd_vram_expert_format * format, int * slots,
                    char * error, size_t error_size);
     // route_request_index is token-major [ntokens][nslots] and indexes requests;
     // -1 skips a route. input contains ntokens rows separated by input_stride.
@@ -235,23 +235,23 @@ struct kimi_vram_prefill_api {
     int (*launch)(void * context, const void * input, size_t input_stride,
                   const int32_t * route_request_index, const float * weights,
                   int nslots, int ntokens,
-                  const struct kimi_vram_prefill_transient * transient, int transient_count,
-                  const struct kimi_vram_prefill_launch * options,
+                  const struct ssd_vram_prefill_transient * transient, int transient_count,
+                  const struct ssd_vram_prefill_launch * options,
                   char * error, size_t error_size);
     // Adds the GPU-resident routes to token-major output rows. Existing output
     // values are preserved, so the CPU miss executor may run concurrently.
     int (*finish)(void * context, float * output, size_t output_stride,
-                  struct kimi_vram_prefill_stats * stats,
+                  struct ssd_vram_prefill_stats * stats,
                   char * error, size_t error_size);
     int (*cancel)(void * context, char * error, size_t error_size);
     // Reserved v7 slots for retired Q2 cold admission: active is always zero;
     // admit_cold returns an error, clears *admitted and drains the context.
     int (*cold_admission_active)(void * context);
-    int (*admit_cold)(void * context, const struct kimi_vram_request * request,
+    int (*admit_cold)(void * context, const struct ssd_vram_request * request,
                       const void * up, const void * gate, const void * down,
                       int * admitted, char * error, size_t error_size);
     // The format's lane, after prepare (which initializes the format on a cold prefill). Read-only.
-    void (*lane)(void * context, struct kimi_vram_prefill_lane * lane);
+    void (*lane)(void * context, struct ssd_vram_prefill_lane * lane);
     // Version 10, the seeds of a prefill the CPU sink runs: empty slots filled with the experts it routes most.
     // seed_routes gives the routes of each request of the next prepare's union (index-aligned with its requests); that
     // prepare reserves the layer's share of the empty slots for the experts the pass routes most, before it leases its
@@ -267,24 +267,24 @@ struct kimi_vram_prefill_api {
 // Optional deferred-upload extension (deferred and async uploads on in the tier and its CPU owner). admit replaces ABI 2 admit for a borrowed RAM source, but the upload may outlive finish:
 // when *queued is 1 the caller keeps that source unchanged and leased until collect returns the request, and the
 // reserved GPU slot is never evicted meanwhile. collect runs outside prepare..finish and without a live residency
-// lease, except with KIMI_VRAM_COLLECT_IF_IDLE. It waits for the in-flight uploads of wait_layer (>= 0) or as named
+// lease, except with SSD_VRAM_COLLECT_IF_IDLE. It waits for the in-flight uploads of wait_layer (>= 0) or as named
 // below, then publishes completed uploads and copies their keys into completed (at most capacity; call again while
 // count == capacity). aborted[i] is 1 when that upload's slot went with a block the tier gave back (an OOM or host
 // reclaim, which waits for the copy first): nothing was published, but its RAM source is free again like the others.
 // wait blocks, in any phase, until no upload is in flight, without publishing; call it before the RAM owner unmaps
 // a source. begin for prefill, release, cancel and destroy wait as well.
 enum {
-    KIMI_VRAM_COLLECT_ALL = -1,     // wait for the uploads of every layer
-    KIMI_VRAM_COLLECT_NONE = -2,    // wait for none
+    SSD_VRAM_COLLECT_ALL = -1,     // wait for the uploads of every layer
+    SSD_VRAM_COLLECT_NONE = -2,    // wait for none
     // Wait for none, and inside a layer or a residency lease collect nothing and succeed, where the others fail: a
     // host reclaimer may run at any point of a run.
-    KIMI_VRAM_COLLECT_IF_IDLE = -3,
+    SSD_VRAM_COLLECT_IF_IDLE = -3,
 };
-struct kimi_vram_deferred_api {
+struct ssd_vram_deferred_api {
     uint32_t version, size;   // 3
-    int (*admit)(void * context, const struct kimi_vram_request * request, const void * up, const void * gate,
+    int (*admit)(void * context, const struct ssd_vram_request * request, const void * up, const void * gate,
                  const void * down, int * queued, char * error, size_t error_size);
-    int (*collect)(void * context, int32_t wait_layer, struct kimi_vram_request * completed, int32_t * aborted,
+    int (*collect)(void * context, int32_t wait_layer, struct ssd_vram_request * completed, int32_t * aborted,
                    int capacity, int * count, char * error, size_t error_size);
     int (*wait)(void * context, char * error, size_t error_size);
 };
@@ -293,7 +293,7 @@ struct kimi_vram_deferred_api {
 // allocator recovery. phase_complete(false) disarms after a successful prefill
 // reserve; phase_complete(true) runs only after the decode graph is reserved
 // and grows best-effort into currently free device memory.
-struct kimi_vram_elastic_api {
+struct ssd_vram_elastic_api {
     uint32_t version, size;   // 5 (preload)
     int (*phase_complete)(void * context, int decode, char * error, size_t error_size);
     // Reserve the actual grouped-prefill accumulator before starting streamed I/O.
@@ -302,15 +302,15 @@ struct kimi_vram_elastic_api {
     // memory the tier takes its storage and grows into what the host-memory ledger leaves, so that no request waits
     // for the page population; the next decode adopts it. A discrete GPU keeps its arena where it is and returns.
     // The request gives the role bytes (one expert of a routed layer), format the geometry.
-    int (*reserve)(void * context, const struct kimi_vram_request * request,
-                   const struct kimi_vram_expert_format * format, char * error, size_t error_size);
+    int (*reserve)(void * context, const struct ssd_vram_request * request,
+                   const struct ssd_vram_expert_format * format, char * error, size_t error_size);
     // At load, after the load's passes, before any request: preload_slots grows a tier made at load into the card if
     // its memory has settled, then gives in *slots how many slots no entry holds. preload copies one expert no
     // request has named (request: its key and role bytes) from host memory into one of them, preloaded: any lookup
     // finds it, and every allocation may take its slot as if it were empty until a request uses it. *copied is 0 when
     // no slot is empty or the tier holds the expert already.
     int (*preload_slots)(void * context, int * slots, char * error, size_t error_size);
-    int (*preload)(void * context, const struct kimi_vram_request * request, const void * up, const void * gate,
+    int (*preload)(void * context, const struct ssd_vram_request * request, const void * up, const void * gate,
                    const void * down, int * copied, char * error, size_t error_size);
 };
 // Optional decode extension: the GPU computes experts that sit in host memory (a RAM cache slot or a ring
@@ -331,10 +331,10 @@ struct kimi_vram_elastic_api {
 // ranges. Both return 0 and do nothing where the device reads host memory in place. Either may run on any thread;
 // a registration holds the driver for about a millisecond per 19 MB and delays other threads' CUDA calls meanwhile.
 // The measured lines are those of every copy and every vector-engine call the tier makes, decode's and grouped
-// prefill's alike: the caller prices both from them (ggml-ssd/place/layer-plan.h, kimi_place_table).
-struct kimi_vram_host_job { int32_t row; float weight; const void * role[3]; };
+// prefill's alike: the caller prices both from them (ggml-ssd/place/layer-plan.h, ssd_place_table).
+struct ssd_vram_host_job { int32_t row; float weight; const void * role[3]; };
 // The measured lines of the host path (microseconds; 0 until measured).
-struct kimi_vram_host_costs {
+struct ssd_vram_host_costs {
     double resident_call_us, resident_expert_us; // the residents' engine call: call + expert * k
     double host_call_us, host_expert_us;         // a call of host jobs (in place, or from device memory after the copies)
     double copy_us_per_mb;                        // a page-locked copy into device memory (0: in place, or not measured)
@@ -353,15 +353,15 @@ struct kimi_vram_host_costs {
     int32_t in_place_only;                        // in place and nothing else: no device memory to compare with, and
                                                   // the device must be shown the read ring first (register_host)
 };
-struct kimi_vram_host_api {
+struct ssd_vram_host_api {
     uint32_t version, size;   // 3
     int (*available)(void * context);
-    int (*launch)(void * context, const struct kimi_vram_host_job * jobs, int count, int * accepted,
+    int (*launch)(void * context, const struct ssd_vram_host_job * jobs, int count, int * accepted,
                   char * error, size_t error_size);
     void (*costs)(void * context, double * resident_us, double * host_us);
     int (*register_host)(void * context, const void * pointer, size_t bytes, char * error, size_t error_size);
     int (*unregister_host)(void * context, const void * pointer, char * error, size_t error_size);
-    void (*costs2)(void * context, struct kimi_vram_host_costs * costs);
+    void (*costs2)(void * context, struct ssd_vram_host_costs * costs);
 };
 // Optional extension, the sink's side of the tier's decisions.
 // set_miss_cost (version 5): what a decode layer's use of an expert the tier does not hold costs, in microseconds,
@@ -386,7 +386,7 @@ struct kimi_vram_host_api {
 // set_ram_holds (version 5): the sink's RAM cache, which keeps its copy of an expert the tier takes (a backup it
 // drops first when it needs the slot): holds(arg, layer, expert) is nonzero while it has a copy. The tier asks it on
 // the sink's thread, in a decode layer's prepare, to price a replacement (vram_slot_table::ram_copy).
-struct kimi_vram_policy_api {
+struct ssd_vram_policy_api {
     uint32_t version, size;   // 5
     void (*set_miss_cost)(void * context, double ram_us, double drive_us);
     void (*set_host_demand)(void * context, uint64_t bytes);
@@ -400,15 +400,15 @@ struct kimi_vram_policy_api {
 extern "C" {
 #endif
 // The optional DSO exports this symbol. No DSO load or GPU work with budget 0.
-typedef const struct kimi_vram_tier_api * (*kimi_vram_tier_get_api_fn)(void);
-typedef const struct kimi_vram_residency_api * (*kimi_vram_residency_get_api_fn)(void);
-typedef const struct kimi_vram_format_api * (*kimi_vram_format_get_api_fn)(void);
-typedef const struct kimi_vram_prefill_api * (*kimi_vram_prefill_get_api_fn)(void);
-typedef const struct kimi_vram_deferred_api * (*kimi_vram_deferred_get_api_fn)(void);
-typedef const struct kimi_vram_elastic_api * (*kimi_vram_elastic_get_api_fn)(void);
-typedef const struct kimi_vram_host_api * (*kimi_vram_host_get_api_fn)(void);
-typedef const struct kimi_vram_policy_api * (*kimi_vram_policy_get_api_fn)(void);
-const struct kimi_vram_elastic_api * kimi_vram_elastic_get_api(void);
+typedef const struct ssd_vram_tier_api * (*ssd_vram_tier_get_api_fn)(void);
+typedef const struct ssd_vram_residency_api * (*ssd_vram_residency_get_api_fn)(void);
+typedef const struct ssd_vram_format_api * (*ssd_vram_format_get_api_fn)(void);
+typedef const struct ssd_vram_prefill_api * (*ssd_vram_prefill_get_api_fn)(void);
+typedef const struct ssd_vram_deferred_api * (*ssd_vram_deferred_get_api_fn)(void);
+typedef const struct ssd_vram_elastic_api * (*ssd_vram_elastic_get_api_fn)(void);
+typedef const struct ssd_vram_host_api * (*ssd_vram_host_get_api_fn)(void);
+typedef const struct ssd_vram_policy_api * (*ssd_vram_policy_get_api_fn)(void);
+const struct ssd_vram_elastic_api * ssd_vram_elastic_get_api(void);
 #ifdef __cplusplus
 }
 #endif

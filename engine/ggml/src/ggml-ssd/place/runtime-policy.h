@@ -81,11 +81,11 @@ struct lane_geometry {
     bool batched, in_place;
 };
 struct prefill_sample {
-    kimi_prefill_fit cpu, gpu, gpu_host;
+    ssd_prefill_fit cpu, gpu, gpu_host;
     double read_bytes, read_us, gpu_overhead_us, gpu_tokens;
 };
 struct prefill_learning {
-    kimi_prefill_fit cpu_fit;
+    ssd_prefill_fit cpu_fit;
     size_t window = 0;
     std::vector<prefill_sample> samples;
     size_t next = 0;
@@ -101,17 +101,17 @@ inline double overhead_row_prior(const cost_lines & prior, const lane_geometry &
 // make the line late. On the RTX 5090 VM, replaying 40 servers' 1,754 layers, the newest layer alone predicted the next
 // layer's reads within 4.0% on average at a steady rate, against 28% for the pass's 40 layers, and within 56% just
 // after a slow span, against 113%.
-inline void prefill_reads(const prefill_learning & s, kimi_prefill_fit & drive) {
+inline void prefill_reads(const prefill_learning & s, ssd_prefill_fit & drive) {
     const size_t n = s.samples.size();
     for (size_t k = 0; k < n; ++k) {
         const auto & x = s.samples[(s.next + n - 1 - k) % n];
         if (x.read_bytes > 0.0 && x.read_us > 0.0) { drive.add(x.read_bytes / 1e6, x.read_us); return; }
     }
 }
-inline kimi_place_table make_table(const cost_lines & s, const cost_lines & prior,
+inline ssd_place_table make_table(const cost_lines & s, const cost_lines & prior,
         const decode_learning & decode, const prefill_learning & prefill,
         const lane_measurement & c, const lane_geometry & lane, int ntokens, double route_bytes) {
-    kimi_place_table t;
+    ssd_place_table t;
     t.cpu_fixed_us = s.cpu_fixed_us; t.cpu_route_us = s.cpu_route_us;
     t.cpu_one_us = decode.cpu_expert_us > 0 ? decode.cpu_expert_us : s.cpu_fixed_us + s.cpu_route_us;
     t.cpu_early = std::clamp(decode.early, 0.0, 1.0);
@@ -132,12 +132,12 @@ inline kimi_place_table make_table(const cost_lines & s, const cost_lines & prio
     t.route_us = t.one(ntokens) ? 0.0 : route_bytes / 1e6 * rows_us_per_mb;
     t.overhead_fixed_us = s.gpu_overhead_fixed_us;
     t.token_us = s.gpu_token_us >= 0 ? s.gpu_token_us : overhead_row_prior(prior, lane, c.copy_us_per_mb);
-    kimi_prefill_fit drive;
+    ssd_prefill_fit drive;
     for (const auto & x : decode.reads) { drive.add(x.first, x.second); }
     prefill_reads(prefill, drive);
     double fixed = s.drive_fixed_us, slope = s.drive_gbps > 0 ? 1e3 / s.drive_gbps :
         decode.read_bytes_per_us > 0 ? 1e6 / decode.read_bytes_per_us : 0.0;
-    if (drive.n > 0) { kimi_prefill_fit_line(drive, s.drive_fixed_us, slope > 0 ? slope : 1.0, fixed, slope); }
+    if (drive.n > 0) { ssd_prefill_fit_line(drive, s.drive_fixed_us, slope > 0 ? slope : 1.0, fixed, slope); }
     t.drive_fixed_us = fixed; t.drive_us_per_mb = slope;
     return t;
 }
@@ -149,7 +149,7 @@ struct decode_plan {
     size_t residents = 0, ram = 0, misses = 0, candidates = 0, moves = 0, locked = 0;
     size_t pending = 0, pending_moves = 0;
 };
-inline void describe_decode(decode_plan & plan, std::vector<kimi_place_item> & items, const std::vector<double> & pending) {
+inline void describe_decode(decode_plan & plan, std::vector<ssd_place_item> & items, const std::vector<double> & pending) {
     plan.residents = plan.ram = plan.misses = plan.locked = plan.pending = plan.pending_moves = 0;
     for (size_t i = 0; i < items.size(); ++i) {
         auto & x = items[i];
@@ -162,9 +162,9 @@ inline void describe_decode(decode_plan & plan, std::vector<kimi_place_item> & i
         } else { ++plan.misses; }
     }
 }
-inline kimi_place_result plan_decode(decode_plan & plan, const kimi_place_table & table,
-        size_t ring_slots, const std::vector<kimi_place_item> & items, const kimi_place_limits & limits) {
-    auto placed = kimi_place_layer(table, 1, ring_slots, items.data(), items.size(), limits);
+inline ssd_place_result plan_decode(decode_plan & plan, const ssd_place_table & table,
+        size_t ring_slots, const std::vector<ssd_place_item> & items, const ssd_place_limits & limits) {
+    auto placed = ssd_place_layer(table, 1, ring_slots, items.data(), items.size(), limits);
     plan.gpu = placed.gpu;
     for (size_t i : placed.moved) { plan.pending_moves += items[i].pending_mb > 0.0; }
     plan.cpu_only_us = placed.time_none; plan.predicted_us = placed.time;
@@ -172,8 +172,8 @@ inline kimi_place_result plan_decode(decode_plan & plan, const kimi_place_table 
     return placed;
 }
 struct lock_plan { std::vector<size_t> requests; double saved_us = 0; bool considered = false; };
-inline lock_plan plan_locks(const kimi_place_table & table, size_t ring_slots,
-        const std::vector<kimi_place_item> & items, const kimi_place_limits & limits, double current_us) {
+inline lock_plan plan_locks(const ssd_place_table & table, size_t ring_slots,
+        const std::vector<ssd_place_item> & items, const ssd_place_limits & limits, double current_us) {
     std::vector<size_t> unlocked;
     auto would = items;
     for (size_t i = 0; i < items.size(); ++i) {
@@ -185,9 +185,9 @@ inline lock_plan plan_locks(const kimi_place_table & table, size_t ring_slots,
     lock_plan result;
     if (unlocked.empty()) { return result; }
     result.considered = true;
-    kimi_place_table free_copy = table;
+    ssd_place_table free_copy = table;
     if (!(free_copy.locked_us_per_mb > 0)) { free_copy.locked_us_per_mb = 1e-12; }
-    auto alt = kimi_place_layer(free_copy, 1, ring_slots, would.data(), would.size(), limits);
+    auto alt = ssd_place_layer(free_copy, 1, ring_slots, would.data(), would.size(), limits);
     result.saved_us = current_us - alt.time;
     result.requests = std::move(alt.moved);
     result.requests.erase(std::remove_if(result.requests.begin(), result.requests.end(), [&](size_t i) {
@@ -247,7 +247,7 @@ inline prefetch_rank plan_prefetch_rank(int32_t expert, bool held, bool cached, 
 // the next layer builds its table. The two stages deliberately leave the
 // backend-cost observation between fitting expert lines and fitting overhead.
 struct prefill_feedback {
-    kimi_prefill_fit gpu, host;
+    ssd_prefill_fit gpu, host;
     double upload_us, ssd_upload_us, engine_overhead_us, transient_wait_us;
     double output_add_us, total_worker_us, read_wait_us;
     uint64_t read_bytes;
@@ -256,7 +256,7 @@ struct prefill_feedback {
 };
 struct prefill_fit_result {
     double gpu_lane_us, gpu_overhead_us;
-    kimi_prefill_overhead_fit overhead;
+    ssd_prefill_overhead_fit overhead;
 };
 inline prefill_fit_result observe_prefill_lines(prefill_learning & learning, cost_lines & cost,
         const cost_lines & prior, const prefill_feedback & f) {
@@ -271,21 +271,21 @@ inline prefill_fit_result observe_prefill_lines(prefill_learning & learning, cos
     if (learning.samples.size() < learning.window) { learning.samples.push_back(sample); }
     else { learning.samples[learning.next] = sample; }
     learning.next = (learning.next + 1) % learning.window;
-    kimi_prefill_fit cpu, gpu, gpu_host;
-    kimi_prefill_overhead_fit overhead;
+    ssd_prefill_fit cpu, gpu, gpu_host;
+    ssd_prefill_overhead_fit overhead;
     for (const auto & s : learning.samples) {
         cpu.add(s.cpu); gpu.add(s.gpu); gpu_host.add(s.gpu_host);
         if (s.gpu_tokens > 0.0) { overhead.add(int(s.gpu_tokens), s.gpu_overhead_us); }
     }
-    kimi_prefill_fit_line(cpu, prior.cpu_fixed_us, prior.cpu_route_us, cost.cpu_fixed_us, cost.cpu_route_us);
-    kimi_prefill_fit_line(gpu, prior.gpu_fixed_us, prior.gpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us);
-    kimi_prefill_fit_line(gpu_host, prior.gpu_host_fixed_us > 0 || prior.gpu_host_route_us > 0 ? prior.gpu_host_fixed_us :
+    ssd_prefill_fit_line(cpu, prior.cpu_fixed_us, prior.cpu_route_us, cost.cpu_fixed_us, cost.cpu_route_us);
+    ssd_prefill_fit_line(gpu, prior.gpu_fixed_us, prior.gpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us);
+    ssd_prefill_fit_line(gpu_host, prior.gpu_host_fixed_us > 0 || prior.gpu_host_route_us > 0 ? prior.gpu_host_fixed_us :
         prior.gpu_fixed_us, prior.gpu_host_fixed_us > 0 || prior.gpu_host_route_us > 0 ? prior.gpu_host_route_us :
         prior.gpu_route_us, cost.gpu_host_fixed_us, cost.gpu_host_route_us);
     return { gpu_lane_us, gpu_overhead_us, overhead };
 }
 inline void observe_prefill_overhead(prefill_learning & learning, cost_lines & cost,
-        const kimi_prefill_overhead_fit & overhead, double row_prior) {
+        const ssd_prefill_overhead_fit & overhead, double row_prior) {
     overhead.fit(row_prior, cost.gpu_overhead_fixed_us, cost.gpu_token_us);
     ++learning.calibrations;
 }
@@ -300,13 +300,13 @@ struct prefill_selection {
     double time_before = 0, time_after = 0, cpu_before = 0, gpu_before = 0;
     double cpu_after = 0, gpu_after = 0, link_after = 0;
     bool in_ring = false;
-    kimi_place_result placed;
+    ssd_place_result placed;
 };
 struct prefill_input {
     const std::vector<prefill_expert> & experts;
     const std::vector<int> & routes;
-    const std::vector<kimi_place_item> & items;
-    const kimi_place_table & table;
+    const std::vector<ssd_place_item> & items;
+    const ssd_place_table & table;
     int ntokens;
     size_t ssd_staging_limit, ring_slots;
 };
@@ -332,9 +332,9 @@ inline prefill_selection plan_prefill(const prefill_input & in, const prefill_ca
     prefill_selection out;
     out.ram_candidates = counted.ram_candidates; out.ssd_candidates = counted.ssd_candidates;
     out.ssd_limit = counted.ssd_limit;
-    kimi_place_limits limits;
+    ssd_place_limits limits;
     limits.reads = out.ssd_limit;
-    out.placed = kimi_place_layer(table, in.ntokens, in.ring_slots, in.items.data(), in.items.size(), limits);
+    out.placed = ssd_place_layer(table, in.ntokens, in.ring_slots, in.items.data(), in.items.size(), limits);
     in_place = !table.one(in.ntokens) && out.placed.in_place;
     for (size_t i : out.placed.moved) { out.chosen.push_back({ i, source[i].ram ? 0 : 1 }); }
     out.time_before = out.placed.time_none; out.time_after = out.placed.time; out.in_ring = out.placed.ring;

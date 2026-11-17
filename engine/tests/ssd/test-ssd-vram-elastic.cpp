@@ -18,8 +18,8 @@ void rejected(const std::function<void()> & fn) {
     try { fn(); } catch (const std::exception &) { failed = true; }
     require(failed, "unsafe elastic operation was accepted");
 }
-kimi_vram_request request(size_t role) {
-    kimi_vram_request r = {};
+ssd_vram_request request(size_t role) {
+    ssd_vram_request r = {};
     r.layer = 1; r.expert = 7; r.weight = 1;
     for (int i = 0; i < 3; ++i) r.role[i] = {1,2,1000000,uint64_t(i)*role,role,3,4,5,6};
     return r;
@@ -278,16 +278,16 @@ int main() {
     inputs.set("tier.policy", "lru");
     inputs.set("tier.min_count", "0");
 
-    // At load (kimi_vram_elastic_api reserve) a unified-memory tier takes its storage and grows into what is free;
+    // At load (ssd_vram_elastic_api reserve) a unified-memory tier takes its storage and grows into what is free;
     // a prefill keeps it and the first decode adopts it. A discrete GPU's automatic tier takes one block at load and
     // grows into the card at the first phase boundary after a prefill pass's memory settled, or at the first decode
     // token (phase_complete); a byte budget leaves the arena to its first decode.
     if (!unified) {
         const size_t mx = 36864;
-        kimi_vram_request r = {};r.layer=1;r.weight=1;
+        ssd_vram_request r = {};r.layer=1;r.weight=1;
         for (int i = 0; i < 3; ++i) r.role[i].bytes = mx;
         const int32_t layers[] = {1,2};
-        const kimi_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),64,2,layers};
+        const ssd_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),64,2,layers};
         for (bool settle : {true, false}) {
             tier t(tier::automatic_budget, inputs.tier_policy());
             t.reserve(r,f);
@@ -320,7 +320,7 @@ int main() {
             const size_t empty=t.preload_slots();
             require(!t.growth_deferred && t.grow_events==1 && empty==t.slot_locations.size() && empty>16,
                     "the tier did not grow into the card before its preload");
-            kimi_vram_request key=r;key.expert=5;
+            ssd_vram_request key=r;key.expert=5;
             std::vector<char> roles(3*mx);
             for (size_t i = 0; i < roles.size(); ++i) roles[i]=char(uint8_t(i*13+7));
             const void * data[3]={roles.data(),roles.data()+mx,roles.data()+2*mx};
@@ -336,10 +336,10 @@ int main() {
     }
     {
         const size_t mx = 36864; // one 256 x 256 MXFP4 role, padded to 4 KiB
-        kimi_vram_request r = {};r.layer=1;r.weight=1;
+        ssd_vram_request r = {};r.layer=1;r.weight=1;
         for (int i = 0; i < 3; ++i) r.role[i].bytes = mx;
         const int32_t layers[] = {1,2};
-        const kimi_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,2,layers};
+        const ssd_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,2,layers};
         {
             tier t(10*3*mx, inputs.tier_policy());
             t.reserve(r,f);
@@ -354,7 +354,7 @@ int main() {
                 // its three roles copied from the payload the CPU computed it from, published when the decode phase
                 // completes the prefill.
                 {
-                    kimi_vram_request key=r;key.expert=5;
+                    ssd_vram_request key=r;key.expert=5;
                     t.plan_sink_seeds(&key,1,{3});
                     require(t.seeds.size()==1 && t.sink_seed_slot.size()==1 && t.sink_seed_slot[0]>=0,
                             "no empty slot for a seed");
@@ -383,19 +383,19 @@ int main() {
         // skipped.
         if (unified) {
             const int32_t three[] = {1,2,3};
-            const kimi_vram_expert_format f3 = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,3,three};
+            const ssd_vram_expert_format f3 = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,3,three};
             inputs.set("tier.max_slots", "16");
             tier q(10*3*mx, inputs.tier_policy());
             inputs.set("tier.max_slots", "53");
             q.reserve(r,f3);
             require(q.has_storage() && q.table->slots.size()==16,"the quota test's tier has another size");
-            kimi_vram_request resident=r;resident.layer=3;resident.expert=0;
+            ssd_vram_request resident=r;resident.layer=3;resident.expert=0;
             const int held=q.table->reserve_cold_prefill(resident);
             require(held>=0,"no slot for the resident expert");
             q.table->publish_cold_prefill(size_t(held),resident);
             const std::vector<int32_t> counts[3]={{0,5,0,3,0,0,1,0},{1,2,3,4,5,6,7,8},{9,1,1,1,1,1,1,1}};
             for (int layer = 1; layer <= 3; ++layer) {
-                std::vector<kimi_vram_request> routed(8,r);
+                std::vector<ssd_vram_request> routed(8,r);
                 for (int e = 0; e < 8; ++e) { routed[size_t(e)].layer=layer;routed[size_t(e)].expert=e; }
                 q.plan_sink_seeds(routed.data(),8,counts[layer-1]);
             }

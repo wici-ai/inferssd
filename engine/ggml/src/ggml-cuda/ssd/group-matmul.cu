@@ -1,5 +1,5 @@
 // Matrix products for the GPU lane of grouped expert prefill: one expert's matrix times a group of activation columns,
-// for the Kimi VRAM tier's batched engine, which loads this library at run time. A product takes ggml's kernels for the
+// for the VRAM tier's batched engine, which loads this library at run time. A product takes ggml's kernels for the
 // same weight type (ggml_cuda_mul_mat_select): MMQ at every column count where ggml_cuda_should_use_mmq says so, so a
 // type's chain runs one kernel family and its time grows with its columns (ggml's MUL_MAT takes MMVQ up to 8 columns;
 // Muse's chain on an RTX 5060 Ti was faster with it only at 1-2 routes, and 1.85x slower at 8); otherwise the vector

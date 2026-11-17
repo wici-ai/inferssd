@@ -1,6 +1,6 @@
 #include "explicit-fixture-inputs.h"
 // CUDA lifecycle test of the elastic GPU tier's unified-memory behaviour, on any CUDA device:
-//  - GGML_KIMI_CPU_SINK_VRAM_BYTES=auto starts from one block; a discrete GPU grows at once, a unified one at the
+//  - vram.budget = auto starts from one block; a discrete GPU grows at once, a unified one at the
 //    token boundary after its first decode step;
 //  - an OOM reclaim while a layer is live is refused without poisoning the tier; with a deferred upload still
 //    copying it waits for the copy, gives the block back, and collect reports that upload as aborted;
@@ -86,8 +86,8 @@ struct envelope_files {
 int assertions = 0;
 void require(bool ok, const char * what) { ++assertions; if (!ok) throw std::runtime_error(what); }
 const size_t role = lifecycle_role_bytes(), stride = 3 * role;
-kimi_vram_request key(int layer, int expert) {
-    kimi_vram_request r = {}; r.layer = layer; r.expert = expert; r.weight = .5f;
+ssd_vram_request key(int layer, int expert) {
+    ssd_vram_request r = {}; r.layer = layer; r.expert = expert; r.weight = .5f;
     for (int i = 0; i < 3; ++i) { r.role[i] = {1, 2, 100000000, uint64_t(layer * 1000 + expert * 3 + i) * role, role, 3, 4, 5, 6}; }
     return r;
 }
@@ -157,7 +157,7 @@ int main() {
         require(queued == 1 && copy_started(), "the deferred upload did not start");
         t.finish(out.data(), 256);
         // the residency the next-layer prefetch asks: an upload in flight is held (the next prepare collects it)
-        const auto * residency = kimi_vram_residency_get_api();
+        const auto * residency = ssd_vram_residency_get_api();
         uint8_t held = 0;
         residency->held(&t, g.layer, &g.expert, 1, &held);
         require(residency->version == 3 && held == 1, "a deferred upload in flight was not held");
@@ -169,7 +169,7 @@ int main() {
                 "the reclaim did not give the block back");
         residency->held(&t, g.layer, &g.expert, 1, &held);
         require(held == 0, "an upload whose block was given back is still held");
-        kimi_vram_request collected[4] = {};
+        ssd_vram_request collected[4] = {};
         int32_t aborted[4] = {};
         int count = -1;
         t.collect(-1, collected, aborted, 4, &count);
@@ -266,7 +266,7 @@ int main() {
         modeled = &t; pool = floor + demand + safety + 20 * stride + stride / 2; published = 0;
         t.deferred_hook = upload_gate;
         policy_set_host_floor(&t, floor); policy_set_host_demand(&t, demand);
-        kimi_vram_request keys[17];
+        ssd_vram_request keys[17];
         for (int i = 0; i < 17; ++i) { keys[i] = key(4, i); }
         int slots[16] = {}, queued = 0;
         t.begin(62, 1, true); lifecycle_prepare(t,keys, 16,slots);
@@ -284,7 +284,7 @@ int main() {
         grow.get();
         require(t.grow_events == 1 && t.slot_locations.size() == 20 && model_free() >= floor + demand + low,
                 "the tier did not grow at the second decode boundary while an upload was in flight");
-        kimi_vram_request collected[20] = {};
+        ssd_vram_request collected[20] = {};
         int32_t aborted[20] = {};
         int count = -1;
         t.collect(-1, collected, aborted, 20, &count);
