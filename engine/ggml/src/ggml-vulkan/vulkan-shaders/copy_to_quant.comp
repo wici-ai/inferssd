@@ -257,9 +257,12 @@ void quantize(uint dst_idx, uint src_idx)
 #endif
 
 #if defined(DATA_A_F32) || defined(DATA_A_F16)
+// Through float, which holds every value of both types exactly: a constructor of the source's own type (f16 rows into
+// an f16 tensor) is an OpFConvert between equal widths in older glslang (shaderc 2023.8, Ubuntu 24.04's), which the
+// SPIR-V optimizer rejects.
 void quantize(uint dst_idx, uint src_idx)
 {
-    data_q[dst_idx] = A_TYPE(data_s[src_idx]);
+    data_q[dst_idx] = A_TYPE(float(data_s[src_idx]));
 }
 #endif
 
