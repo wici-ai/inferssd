@@ -1811,6 +1811,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        // the backends whose reads of this split's inputs are queued, synchronized once each before the split runs
+        ggml_backend_t queued_reads[GGML_SCHED_MAX_BACKENDS];
+        int n_queued_reads = 0;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1935,16 +1938,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-                        ggml_backend_synchronize(input_backend);
+                        // Into host memory from the input backend's own buffer: the read is queued on that backend, which
+                        // is synchronized once for all of the split's inputs before it runs, where a synchronous read
+                        // waits for each (on Vulkan a submission and a fence wait a read).
+                        const bool queued = input_backend->iface.get_tensor_async != NULL && input->buffer != NULL &&
+                            input_cpy->buffer != NULL && ggml_backend_buffer_is_host(input_cpy->buffer) &&
+                            ggml_backend_buffer_get_type(input->buffer) == ggml_backend_get_default_buffer_type(input_backend);
+                        if (!queued) {
+                            ggml_backend_synchronize(input_backend);
+                        }
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
+                        if (queued) {
+                            input_backend->iface.get_tensor_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                            bool listed = false;
+                            for (int i = 0; i < n_queued_reads; i++) {
+                                listed = listed || queued_reads[i] == input_backend;
+                            }
+                            if (!listed) {
+                                queued_reads[n_queued_reads++] = input_backend;
+                            }
+                        } else {
+                            ggml_backend_tensor_copy(input, input_cpy);
+                        }
                     }
                 }
             }
+        }
+
+        for (int i = 0; i < n_queued_reads; i++) {
+            ggml_backend_synchronize(queued_reads[i]);
         }
 
         if (!sched->callback_eval) {
