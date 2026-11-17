@@ -107,8 +107,11 @@ slots the next ones. Nothing from earlier runs is kept or used. An expert loaded
 this way and not used since is as good as an empty slot to whatever allocates
 later: a prompt's seeds and decode's admissions take its slot as they take an
 empty one, and a prompt pass's read-ahead takes it unless the pass is likely to
-use it. On a discrete GPU the tier is made at load and first grows into the card,
-once the load's pass has shown that the device memory other work holds has
+use it. The experts a prompt puts into the GPU tier, over all the passes the
+server runs it in, become the same once the next prompt starts if the decode
+between never used them: they stay cached until something takes their slot. On a
+discrete GPU the tier is made at load and first grows into the card, once the
+load's pass has shown that the device memory other work holds has
 settled. The load then leaves the graph reserved for decode's single token, as a
 request's prefill does, so the tier grows into the memory a prompt's graph does
 not need; each prompt's prefill reserves its own graph and takes back what that

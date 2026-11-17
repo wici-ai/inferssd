@@ -333,6 +333,61 @@ int main() {
             cuda_check(cudaMemcpy(got.data(),t.slot_base(size_t(slot)),3*mx,cudaMemcpyDeviceToHost));
             require(!std::memcmp(got.data(),roles.data(),3*mx),"a preloaded role holds other bytes");
         }
+        // A prompt the server runs in several prefill phases with no decode between them (its batch limit, a context
+        // checkpoint before its last tokens) is one prompt: a later pass keeps what the earlier ones made seeds (a
+        // preload they used, a seed they copied, published once its pass is over) and plans no layer again. The decode
+        // phase ends a prompt, also begun without a token (the load's passes); the next prompt plans its own seeds and
+        // releases those the decode never selected, which keep their experts.
+        {
+            tier t(tier::automatic_budget, inputs.tier_policy());
+            t.reserve(r,f);
+            t.observe_settle();t.observe_settle();
+            require(t.preload_slots()>16,"the tier did not grow into the card before its preload");
+            ssd_vram_request used=r;used.expert=5;
+            std::vector<char> roles(3*mx,char(0x5a));
+            const void * data[3]={roles.data(),roles.data()+mx,roles.data()+2*mx};
+            require(t.preload(used,data),"no slot for the preload");
+            const auto valid=[](const vram_slot_table::entry & e){return e.valid;};
+            const int adopted=t.table->find(used,valid);
+            t.begin(23,0,false);
+            t.phase_complete(true);
+            const uint64_t load_prompt=t.prompt_count;
+            t.begin(23,0,false);
+            require(t.prompt_count==load_prompt+1,"a prefill after a decode phase without tokens did not begin a prompt");
+            t.table->adopt_preloaded(&used,1);
+            ssd_vram_request cold=r;cold.expert=6;
+            t.plan_sink_seeds(&cold,1,{2});
+            require(t.seeds.size()==1 && t.sink_seed_slot.size()==1 && t.sink_seed_slot[0]>=0,
+                    "no slot for the first pass's seed");
+            const int seeded=t.sink_seed_slot[0];
+            char * payload=nullptr;cuda_check(cudaMallocHost(reinterpret_cast<void **>(&payload),3*mx));
+            for (size_t i = 0; i < 3*mx; ++i) payload[i]=char(uint8_t(i*11+5));
+            const void * computed[3]={payload,payload+mx,payload+2*mx};
+            t.seed_from_host(0,computed);t.wait_host_seed(0);
+            t.begin(23,0,false);
+            require(adopted>=0 && t.table->slots[size_t(adopted)].valid && t.table->slots[size_t(adopted)].seed,
+                    "the prompt's second pass dropped the preload its first pass used");
+            require(t.seeds.empty() && t.table->find(cold,valid)==seeded && t.table->slots[size_t(seeded)].seed,
+                    "the first pass's seed was not published for the prompt's second pass");
+            ssd_vram_request other=r;other.expert=7;
+            t.plan_sink_seeds(&other,1,{5});
+            require(t.seeds.empty() && t.sink_seed_slot[0]<0,"the prompt's second pass planned a layer again");
+            t.phase_complete(true);
+            t.begin(23,1,true);
+            t.begin(23,2,false);
+            for (const int slot : {adopted, seeded}) {
+                const auto & e=t.table->slots[size_t(slot)];
+                require(e.valid && e.preloaded && !e.seed,"the next prompt did not release an unused seed with its expert");
+            }
+            require(t.seeds_released==2 && t.table->holds(1,5) && t.table->holds(1,6),"a released seed is not held");
+            t.plan_sink_seeds(&other,1,{5});
+            require(t.seeds.size()==1 && t.sink_seed_slot[0]>=0,"the next prompt did not plan its own seeds");
+            t.cancel_seeds();
+            std::vector<char> got(3*mx);
+            cuda_check(cudaMemcpy(got.data(),t.slot_base(size_t(seeded)),3*mx,cudaMemcpyDeviceToHost));
+            require(!std::memcmp(got.data(),payload,3*mx),"a released seed holds other bytes");
+            cuda_check(cudaFreeHost(payload));
+        }
     }
     {
         const size_t mx = 36864; // one 256 x 256 MXFP4 role, padded to 4 KiB

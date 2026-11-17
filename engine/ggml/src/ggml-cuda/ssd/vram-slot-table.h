@@ -21,8 +21,9 @@ public:
         bool seed = false;
         // keyed: the key names an expert (an admission or a seed set it, and no reset since); see find
         bool keyed = false;
-        // preloaded: filled at load (reserve_preload), with an expert no request had named, and not used since. A
-        // lookup finds it like any entry; every allocation takes it as if it were empty (available), except a
+        // preloaded: holds an expert no request claims, not used since: filled at load (reserve_preload) with one no
+        // request had named, or a seed of a prompt that is over which its decode never selected (release_unused_seeds).
+        // A lookup finds it like any entry; every allocation takes it as if it were empty (available), except a
         // prefill's for a layer its pass has not reached. Its first use makes it what that use makes of an empty
         // slot: a prefill's, a seed of its prompt (adopt_preloaded); decode's, an entry admitted at that request.
         bool preloaded = false;
@@ -173,8 +174,9 @@ public:
     }
     // Whether the tier holds an expert now: a slot is valid with it, or reserved for a deferred upload of it that has
     // not completed (the layer's next prepare collects it first). A seed (reserve_cold_prefill) counts from its
-    // publication (publish_cold_prefill), which no prepare does: a prefill's planned seeds are published when the
-    // decode phase completes the prefill (phase_complete), Q2's cold-prefill admission right after its own copy. The
+    // publication (publish_cold_prefill), which no prepare does: a pass's planned seeds are published when the pass is
+    // over (the prompt's next pass begins, or the decode phase completes the prefill), Q2's cold-prefill admission
+    // right after its own copy. The
     // next-layer prefetch asks before it reads an expert into RAM. (layer, expert) stands for the key: one model's
     // experts have one source each. Every change of a slot's key, valid, uploading or seed goes through change(),
     // which keeps the count and the index of keyed slots (find).
@@ -350,12 +352,14 @@ public:
         return size_t(std::count_if(slots.begin()+l.begin,slots.begin()+l.begin+l.count,[&](const entry & e){
             return available(e,id);}));
     }
-    // Seeds the decode after their prefill never selected: prompt heat of a request that is over. Freed before the
-    // next prefill seeds, so that its own prompt plans with them. Returns how many.
-    size_t free_unused_seeds() {
-        if(in_flight || lease_generation || native_pinned())throw std::runtime_error("free seeds with live VRAM slots");
+    // Seeds the decode after their prompt never selected: prompt heat of a request that is over. Before the next
+    // prompt's seeds each becomes what a preload is: it keeps its expert, held and found by a lookup, and the next
+    // prompt's seeds and decode's misses take its slot as if it were empty (available, prepare). So the next prompt
+    // plans with these slots, and their experts stay until something needs the slot. Returns how many.
+    size_t release_unused_seeds() {
+        if(in_flight || lease_generation || native_pinned())throw std::runtime_error("release seeds with live VRAM slots");
         size_t n=0;
-        for(auto & e:slots)if(e.valid && e.seed && !e.locked){change(e,[](entry & x){x={};});++n;}
+        for(auto & e:slots)if(e.valid && e.seed && !e.locked){change(e,[](entry & x){x.seed=false;x.preloaded=true;});++n;}
         return n;
     }
     void publish_cold_prefill(size_t slot,const ssd_vram_request & request) {

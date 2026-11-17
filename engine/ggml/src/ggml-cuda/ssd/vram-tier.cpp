@@ -206,9 +206,13 @@ struct tier {
     std::vector<pending_seed> seeds;
     std::set<int> seed_planned;uint64_t seed_plan_generation=UINT64_MAX;
     cudaStream_t seed_stream=nullptr; // the lane's seed copies
-    uint64_t seeds_planned=0,seeds_published=0,seeds_cancelled=0,seeds_freed=0,seed_copies=0,seed_bytes=0;
+    uint64_t seeds_planned=0,seeds_published=0,seeds_cancelled=0,seeds_released=0,seed_copies=0,seed_bytes=0;
     double seed_wait_us=0;
-    uint64_t prefill_count=0; // prefills begun: a seed plan is one prefill's
+    // Prompts begun: a prefill phase after the decode phase began (phase_complete(true), a decode token), or the
+    // first. The server can run one prompt in several prefill phases with no decode between them (llama_decode calls:
+    // its batch limit, a context checkpoint before the last tokens); they are one prompt, which a seed plan is for. A
+    // request that samples no token leaves its prompt open, so the next request's prompt continues its plan.
+    uint64_t prompt_count=0;bool prompt_open=false;
     // The routes of the next prepare's union, then each of its requests' reserved seed slot (-1: none) for the layer.
     // A seed the CPU computes is copied on its own stream, an event a request; one on the prefill lane is copied by
     // the worker behind the bytes it already moves.
@@ -279,9 +283,9 @@ struct tier {
             if(unified)std::fprintf(stderr,"[ssd_vram_host_reserve] reason=destroy floor=%zu demand=%zu host_reclaims=%llu host_reclaim_refusals=%llu live_reclaim_refusals=%llu\n",
                 host_floor,host_demand,(unsigned long long)host_reclaims,(unsigned long long)host_reclaim_refusals,(unsigned long long)live_reclaim_refusals);
             if(adaptive_admission)admission_log("final ");
-            if(seeds_planned)std::fprintf(stderr,"[ssd_vram_seed] reason=destroy planned=%llu published=%llu cancelled=%llu freed_unused=%llu copies=%llu bytes=%llu wait_us=%.0f\n",
+            if(seeds_planned || seeds_released)std::fprintf(stderr,"[ssd_vram_seed] reason=destroy planned=%llu published=%llu cancelled=%llu released_unused=%llu copies=%llu bytes=%llu wait_us=%.0f\n",
                 (unsigned long long)seeds_planned,(unsigned long long)seeds_published,(unsigned long long)seeds_cancelled,
-                (unsigned long long)seeds_freed,(unsigned long long)seed_copies,(unsigned long long)seed_bytes,seed_wait_us);
+                (unsigned long long)seeds_released,(unsigned long long)seed_copies,(unsigned long long)seed_bytes,seed_wait_us);
             if(host_readable || host_jobs || host_refused || host_probe_taken){
                 ssd_vram_host_costs c={};costs2(c);
                 std::fprintf(stderr,"[ssd_vram_host] in_place=%d jobs=%llu batches=%llu copies=%llu reserved_copies=%llu refused=%llu copy_mb=%.1f copy_us=%.0f "
@@ -594,7 +598,7 @@ struct tier {
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         const int layer=r[0].layer;
         if(poisoned || !has_storage() || std::find(table->pool_layers.begin(),table->pool_layers.end(),layer)==table->pool_layers.end())return;
-        if(seed_plan_generation!=prefill_count){seed_plan_generation=prefill_count;seed_planned.clear();}
+        if(seed_plan_generation!=prompt_count){seed_plan_generation=prompt_count;seed_planned.clear();}
         if(!seed_planned.insert(layer).second)return; // a later pass of the prompt: its first one planned the layer
         const size_t left=table->pool_layers.size()+1>seed_planned.size()?table->pool_layers.size()+1-seed_planned.size():1;
         const size_t quota=table->free_slots(layer)/left;
@@ -656,8 +660,9 @@ struct tier {
             ++seeds_cancelled;return true;});
         seeds.erase(end,seeds.end());
     }
-    // The prefill is over: its seeds are published once their copies are done; one missing a role (its pass ended
-    // early) is dropped. Requires lifecycle_mutex.
+    // A pass is over (the prompt's next pass begins, or the decode phase completes the prefill): its seeds are
+    // published once their copies are done; one missing a role (its pass ended early) is dropped. Requires
+    // lifecycle_mutex.
     void publish_seeds(){
         if(seeds.empty())return;
         const auto start=clock_type::now();
@@ -856,7 +861,6 @@ struct tier {
         if(!elastic_active)return;
         if(poisoned)throw std::runtime_error("elastic VRAM tier is poisoned");
         if(!quiescent())throw std::runtime_error("elastic VRAM prefill transition is not quiescent");
-        cancel_seeds();seeds_freed+=table->free_unused_seeds();
         ++phase_generation;reclaimer_armed=false;
         cuda_check(cudaSetDevice(device));size_t total=0;mem_info(&phase_free_before,&total);
         phase_slots_before=slot_locations.size();
@@ -1115,7 +1119,7 @@ struct tier {
         group_rows=0;group_output=nullptr;
     }
     void phase_complete(bool decode){
-        if(decode)prefill_transient_phase=false;
+        if(decode){prefill_transient_phase=false;prompt_open=false;}
         if(decode && group){drain();release_group();}
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         reclaimer_armed=false;
@@ -1174,7 +1178,7 @@ struct tier {
         {std::lock_guard<std::mutex> lock(mutex);deferred.clear();}
         {
             std::lock_guard<std::mutex> lock(lifecycle_mutex);reclaimer_armed=false;
-            cancel_seeds();
+            cancel_seeds();seed_planned.clear();seed_plan_generation=UINT64_MAX;
             if(table)table->abort();
             while(!blocks.empty())free_last_block("release",false);
             table.reset();elastic_active=false;decode_growth_done=false;base_slots=max_slots=0;slot_locations.clear();
@@ -1197,7 +1201,8 @@ struct tier {
     }
     void begin(uint64_t e,uint64_t t,bool decode){
         prefill_transient_phase=!decode;
-        if(!decode)++prefill_count;
+        const bool new_prompt=!decode && !prompt_open;
+        prompt_count+=new_prompt;prompt_open=!decode;
         if(!decode || !have_token || epoch!=e || token!=t)memory_token_report();
         // Optional retention through prefill. A failure, or a decode token of a
         // different model/context epoch than the arena's, still releases it all.
@@ -1206,6 +1211,13 @@ struct tier {
             if(failure.empty()){
                 have_token=false;active=false;
                 free_host_scratch(); // the next decode allocates it again when a batch wants it
+                // The pass before is over: its seeds go in, for this pass of its prompt as for the decode. A new prompt
+                // gives up the seeds of the one before that its decode never selected; they keep their experts.
+                if(table){
+                    std::lock_guard<std::mutex> lock(lifecycle_mutex);
+                    publish_seeds();
+                    if(new_prompt)seeds_released+=table->release_unused_seeds();
+                }
                 // a tier made at load takes the card once a prefill pass showed the memory nothing counts settled
                 if(elastic_active && growth_deferred && settled){std::lock_guard<std::mutex> lock(lifecycle_mutex);grow_decode_locked();}
                 settle_free=SIZE_MAX; // this phase's passes compare among themselves

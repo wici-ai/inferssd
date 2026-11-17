@@ -112,8 +112,8 @@ int main() { try {
         publish(slow);publish(legacy);
     }
     // Prefill seeds take only empty slots and never evict. Their selection count is zero, so the unused ones are
-    // decode's first victims; the ones decode never selected are freed before the next prefill. A seed decode
-    // selects becomes an ordinary entry.
+    // decode's first victims; the ones decode never selected are released before the next prompt's seeds, keeping
+    // their experts for anything that does not need the slot. A seed decode selects becomes an ordinary entry.
     {
         vram_slot_table t(3,{1},true,0,true,16);
         t.next_token();
@@ -137,8 +137,14 @@ int main() { try {
         const int a=u.reserve_cold_prefill(r7),b=u.reserve_cold_prefill(r8);
         u.publish_cold_prefill(size_t(a),r7);u.publish_cold_prefill(size_t(b),r8);
         u.next_token();u.prepare(&r7,1);publish(u);
-        require(u.free_unused_seeds()==1 && !u.slots[size_t(b)].valid && u.slots[size_t(a)].valid,
-                "only the seed decode never selected is freed");
+        require(u.release_unused_seeds()==1 && u.slots[size_t(b)].valid && u.slots[size_t(b)].preloaded &&
+                !u.slots[size_t(b)].seed && u.holds(1,8) && !u.slots[size_t(a)].preloaded && !u.slots[size_t(a)].seed,
+                "the seed decode never selected was not released with its expert, or the selected one was");
+        // the next prompt's seed takes the released slot as if empty; routed again, the released expert is its seed
+        require(u.free_slots(1)==1,"a released seed's slot is not free for the next prompt's seeds");
+        u.adopt_preloaded(&r8,1);
+        require(u.slots[size_t(b)].seed && !u.slots[size_t(b)].preloaded && u.free_slots(1)==0,
+                "the next prompt did not adopt the released expert it routes");
     }
     // Preloads (filled at load, no request having named their experts): held like any entry. A prefill's pass makes
     // the ones it routes in a layer seeds of its prompt (adopt_preloaded); its seeds take the others of the layers it
@@ -179,7 +185,7 @@ int main() { try {
     }
     // What the tier holds, for the next-layer prefetch: admissions once published, not their victims; deferred
     // uploads from their reservation, until a block given back drops them; seeds from their publication, not while
-    // copied or once cancelled or freed unused; a shrink of the global pool; native cancel; abort.
+    // copied or once cancelled, and still once released unused; a shrink of the global pool; native cancel; abort.
     {
         vram_slot_table t(3,{1,2},true,0,true,16);
         const auto r1=request(1,1),r2=request(1,2),r3=request(2,3),r4=request(2,4),r5=request(1,5);
@@ -202,7 +208,7 @@ int main() { try {
         require(t.admissions[0]>=0 && !t.holds(1,5),"no eviction for a new expert in a full pool");
         holds_match(t,"held differs after an eviction");publish(t);holds_match(t,"held differs after an eviction's publication");
         require(t.holds(1,5) && int(t.holds(1,1))+int(t.holds(1,2))+int(t.holds(2,3))==2,"the admission or its victim");
-        // seeds: held from their publication, a cancelled one never, an unused published one freed
+        // seeds: held from their publication, a cancelled one never, an unused published one still once released
         vram_slot_table s(4,{1,2},true,0,true,16);
         const int seed1=s.reserve_cold_prefill(r1),seed4=s.reserve_cold_prefill(r4);
         require(seed1>=0 && seed4>=0 && !s.holds(1,1) && !s.holds(2,4),"a seed being copied is held before its publication");
@@ -210,7 +216,7 @@ int main() { try {
         s.cancel_cold_prefill(size_t(seed4),r4);require(!s.holds(2,4),"a cancelled seed is held");
         s.publish_cold_prefill(size_t(seed1),r1);require(s.holds(1,1),"a published seed is not held");
         holds_match(s,"held differs after a seed's publication");
-        require(s.free_unused_seeds()==1 && !s.holds(1,1),"a freed seed is still held");
+        require(s.release_unused_seeds()==1 && s.holds(1,1),"a released seed is no longer held");
         holds_match(s,"held differs after the seeds");
         // reclaim: a shrink of the global pool drops what its tail slots held
         vram_slot_table g(2,{1,2},true,0,true,16);g.reserve_global(4);g.resize_global(4);
