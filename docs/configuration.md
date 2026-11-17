@@ -14,8 +14,8 @@ Python resource. There are no environment mirrors or legacy-name aliases.
 | `place.costs` | costs / named us and GB/s terms | `empty` | plan | all |  |
 | `prefill.lookahead` | integer / boolean | `1` | plan | all |  |
 | `vram.budget` | budget / bytes | `auto` | plan | all |  |
-| `vram.max_slots` | integer / slots | `0` | plan | all | CUDA |
-| `vram.reserve_mib` | integer / MiB | `0` | launch | all | CUDA |
+| `vram.max_slots` | integer / slots | `0` | plan | all | CUDA, ROCm |
+| `vram.reserve_mib` | integer / MiB | `0` | launch | all | CUDA, ROCm |
 | `host.headroom_mib` | integer / MiB | `512` | plan | all |  |
 | `host.budget_mib` | integer / MiB | `0` | plan | darwin, windows |  |
 | `model.engram_prefetch` | integer / boolean | `0` | model | all |  |
@@ -24,8 +24,8 @@ Python resource. There are no environment mirrors or legacy-name aliases.
 These are conservative parser defaults and retained policy priors, not claimed
 per-device performance optima. The framework must provide its measured CPU,
 cache and placement configuration. The platforms are `linux`, `darwin` and
-`windows`; a scope is `all` or the platforms it lists. A backend names the GPU
-backend whose expert tier a key configures: the key parses on every platform, and
+`windows`; a scope is `all` or the platforms it lists. A backend lists the GPU
+backends whose expert tier a key configures: the key parses on every platform, and
 an engine built or running without that tier refuses it when it is set. Expert compute runs on
 ggml's threads (`-t`, `-tb`, `-C`, `-Cb`, `--cpu-strict`; see
 [how it works](architecture.md#threads)); `cpu.io_cpus` places the executor's
@@ -33,15 +33,16 @@ own I/O, prefetch and watch threads, and macOS, which cannot pin threads, only
 validates it. Zero decode participants computes each decode phase on every decode thread; a
 positive value counts the leading ggml threads of each decode phase, and a
 decode call with fewer threads fails. Non-applicable platform keys cannot be
-explicitly set. The `vram.*` keys size the CUDA expert tier. Its slots each hold
+explicitly set. The `vram.*` keys size the expert VRAM tier, which CUDA builds have and ROCm
+builds for AMD GPUs too (ggml's HIP backend builds the same sources). Its slots each hold
 one expert and are sized for the model's largest, so a model that quantizes its
 layers differently keeps experts of every layer there. `vram.budget = auto`
 gives the tier all the room
 the GPU admits; on a GPU that shares the host's memory, such as GB10, that is
 the host memory envelope below less the slots the next-layer prefetch lands in,
 which are all the RAM cache keeps beside a tier there (with `vram.budget = 0`
-the RAM cache takes the envelope). Auto gives no tier where no CUDA backend
-runs. On Vulkan and Metal, a GPU that shares the host's memory takes the heavy
+the RAM cache takes the envelope). Auto gives no tier where no CUDA or ROCm
+backend runs. On Vulkan and Metal, a GPU that shares the host's memory takes the heavy
 experts of a prompt pass through the [GPU lane](architecture.md#the-gpu-lane),
 which keeps nothing across layers, and `vram.budget = 0` leaves them on the CPU.
 On a CPU-only build, or with another GPU backend, the GPU runs the dense layers

@@ -117,21 +117,25 @@ directory and to the settings file the launch generates.
 | `cpu` | sysfs on Linux, `sysctl` on macOS, CPU Sets on Windows; ISA from `inferssd-cpuprobe` | Logical CPUs with core, package, SMT siblings, `cpu_capacity` and maximum frequency; performance and efficiency clusters; whether threads can be pinned; the instruction-set features ggml reports (build options such as OpenMP or repacking are left out) |
 | `memory` | `/proc/meminfo`, `hw.memsize` or `GlobalMemoryStatusEx`; `inferssd-cpuprobe` | Total memory, page size, whether the GPU shares system memory, DRAM read bandwidth per thread count |
 | `compute` | `inferssd-cpuprobe` | ggml CPU matrix-multiply speed per weight format at 1, 2, 4, ... threads up to every CPU, at the performance cluster's size and at every CPU but one: weight bytes per second for one token, FLOP/s for more tokens, with each point's median call and quartiles; on Linux machines with several CPU clusters, also one token with a thread pinned to each CPU of each cluster and of every CPU, and on the performance cluster's first 1, 2, 4, ... CPUs (rows with `cpus`) |
-| `gpus` | `inferssd-memprobe` (Linux with NVIDIA GPUs) | VRAM size, host-to-device (pinned and pageable), device-to-host and device-to-device copy rates, and device read bandwidth, for every GPU `nvidia-smi` lists |
+| `gpus` | `inferssd-memprobe` (Linux with NVIDIA GPUs, or AMD GPUs on ROCm) | VRAM size, host-to-device (pinned and pageable), device-to-host and device-to-device copy rates, and device read bandwidth, for every GPU the engine's CUDA or ROCm runtime finds |
 | `storage:<drive>` | `inferssd-ssdprobe`, one per drive | Random-read bandwidth and latency by request size and queue depth, read with the engine's own reader; the knee queue depth per size |
 
 The identity lists the GPUs, each with the backend the engine runs it on: the
-NVIDIA GPUs `nvidia-smi` reports, on CUDA; on macOS the Apple GPU with its core
-count as `ioreg` reports it, on Metal (when `ioreg` cannot say, the list is
-empty and profiling continues); and the AMD and Intel display controllers, on
-Vulkan, found on the PCI bus on Linux and among the display adapters in the
-registry on Windows. Other display controllers, such as a server's management
-display or a virtual machine's, are left out. The installers build the engine for
-the first of CUDA, Metal and Vulkan among these GPUs, and for the CPU alone when
-there is none. The GPU probe measures every
-GPU on Linux, regardless of `CUDA_VISIBLE_DEVICES`; on macOS the GPU shares the
+NVIDIA GPUs `nvidia-smi` reports, on CUDA; on Linux with ROCm installed (its
+`rocminfo` on PATH), the AMD GPUs the kernel's compute driver amdkfd lists
+(`/sys/class/kfd/kfd/topology`), on ROCm, by ROCm's UUIDs (`GPU-` and the
+device's unique ID in hex, as `rocminfo` and HIP spell them); on macOS the Apple GPU
+with its core count as `ioreg` reports it, on Metal (when `ioreg` cannot say, the
+list is empty and profiling continues); and the other AMD and the Intel display
+controllers, on Vulkan, found on the PCI bus on Linux and among the display
+adapters in the registry on Windows. Other display controllers, such as a server's
+management display or a virtual machine's, are left out. CUDA and ROCm carry the
+expert VRAM tier. The installers build the engine for the first of CUDA, ROCm,
+Metal and Vulkan among these GPUs, and for the CPU alone when there is none. The
+GPU probe measures every GPU on Linux, regardless of `CUDA_VISIBLE_DEVICES`,
+`HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES`; on macOS the GPU shares the
 machine's memory and is not measured. A GPU the probe cannot measure (too
-little free VRAM, or a CUDA error) makes the `gpus` section partial, with the
+little free VRAM, or a runtime error) makes the `gpus` section partial, with the
 GPU's UUID and the reason. When `nvidia-smi` is
 installed but fails, for example after a driver upgrade without a reboot, the
 `gpus` section fails and the saved GPU identity is kept, so the machine is not

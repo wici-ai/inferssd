@@ -99,6 +99,18 @@ build_source() {
             fi
             export CUDACXX
             ;;
+        linux:ROCm)
+            # ggml's HIP backend, for the AMD GPUs amdkfd lists, built for their architectures
+            preset=linux-rocm
+            if [ -z "${HIPCXX:-}" ]; then
+                if command -v hipconfig >/dev/null 2>&1; then
+                    HIPCXX=$(hipconfig -l)/clang++
+                else
+                    die 'An AMD GPU on ROCm was found: install the ROCm HIP SDK or set HIPCXX to its clang++.'
+                fi
+            fi
+            export HIPCXX
+            ;;
         linux:Vulkan)
             preset=linux-cpu
             if command -v glslc >/dev/null 2>&1; then
@@ -118,7 +130,7 @@ build_source() {
     export PATH
     cd "$release/source"
     cmake --preset "$preset" $vulkan
-    if [ "$preset" = linux-cuda ]; then
+    if [ "$preset" = linux-cuda ] || [ "$preset" = linux-rocm ]; then
         cmake --build "build-$preset" --parallel "$jobs" \
             --target inferssd-server inferssd-cpuprobe inferssd-ssdprobe inferssd-memprobe
     else
@@ -184,8 +196,9 @@ which requires Git, Python >=3.9 with venv and a C/C++ compiler; on macOS, the X
 Line Tools.
 On macOS the engine runs on the Apple GPU. Linux requires systemd and cgroup v2 at runtime.
 A Linux build is made for the machine's GPUs: with an NVIDIA GPU it uses CUDA and needs the
-CUDA toolkit; with an AMD or Intel GPU it uses Vulkan when the Vulkan SDK (glslc) is
-installed; otherwise it runs on the CPU.
+CUDA toolkit; with an AMD GPU on ROCm (ROCm installed) it uses ROCm and needs its HIP SDK;
+with another AMD or an Intel GPU it uses Vulkan when the Vulkan SDK (glslc) is installed;
+otherwise it runs on the CPU.
 CMake, Ninja and the Python framework are installed in a private environment.
 
 Environment:
@@ -196,6 +209,7 @@ Environment:
   INFERSSD_REF          Branch or tag to build from source (default: this installer's release)
   INFERSSD_JOBS         Build parallelism (default: 4)
   CUDACXX              CUDA compiler, if nvcc is not on PATH
+  HIPCXX               HIP compiler (ROCm's clang++), if hipconfig is not on PATH
 
 No sudo is used. A previous installation remains usable if installing fails; the installer
 keeps the installation it replaces and removes older ones.

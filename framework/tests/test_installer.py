@@ -50,8 +50,12 @@ elif name == "shasum":
     print(hashlib.sha256(pathlib.Path(args[-1]).read_bytes()).hexdigest() + "  " + args[-1])
 elif name == "xcode-select":
     sys.exit(2 if os.environ.get("NO_COMMAND_LINE_TOOLS") else 0)
+elif name == "hipconfig":
+    print("/rocm/llvm/bin" if args == ["-l"] else "")
 elif name == "cmake":
     with open(os.environ["CMAKE_LOG"], "a") as log:
+        if os.environ.get("HIPCXX"):
+            log.write("HIPCXX=" + os.environ["HIPCXX"] + "\n")
         log.write(" ".join(args) + "\n")
     if os.environ.get("FAIL_BUILD"):
         sys.exit(1)
@@ -147,6 +151,26 @@ def test_linux_builds_for_the_machines_gpus(installation, backend, glslc, preset
     log = Path(env["CMAKE_LOG"]).read_text()
     assert preset in log and "inferssd-memprobe" not in log
     assert ("install the Vulkan SDK" in result.stderr) == warned
+
+
+@posix_installer
+@pytest.mark.parametrize("hipcxx", [None, "/opt/rocm-7/llvm/bin/clang++"])
+def test_linux_builds_for_amd_gpus_on_rocm(installation, hipcxx):
+    _, _, env = installation
+    tools = Path(env["PATH"].split(os.pathsep)[0])
+    (tools / "nvcc").unlink()
+    (tools / "hipconfig").symlink_to(tools / "helper")
+    env.update(TEST_SYSTEM="Linux", TEST_GPU_BACKEND="ROCm")
+    if hipcxx:
+        env["HIPCXX"] = hipcxx
+    result = subprocess.run(
+        ["sh"], input=INSTALLER.read_text(), text=True, env=env, capture_output=True
+    )
+    assert result.returncode == 0, result.stderr
+    log = Path(env["CMAKE_LOG"]).read_text()
+    # ROCm's clang++, from hipconfig unless HIPCXX names one; the tier's build has the memory probe.
+    assert f"HIPCXX={hipcxx or '/rocm/llvm/bin/clang++'}\n--preset linux-rocm\n" in log
+    assert "inferssd-memprobe" in log
 
 
 @posix_installer

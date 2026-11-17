@@ -64,6 +64,23 @@ jobs:
       - name: Build
         run: cmake --build build-linux-cuda --parallel 4 --target inferssd-server inferssd-memprobe ssd-vram-tier
 
+  # ggml's HIP backend builds the CUDA backend's sources, the expert tier included, for AMD GPUs (ROCm).
+  rocm-compile:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container: rocm/dev-ubuntu-24.04:7.2.4@sha256:bdc8e61026cbb844ede93d44d2c50055f51ebb2041906b60182bf3bee3139054
+    steps:
+      - run: apt-get update && apt-get install -y cmake ninja-build git libssl-dev hipblas-dev rocblas-dev
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Configure
+        # A hosted runner has no GPU to build for: name one architecture (RDNA4).
+        run: HIPCXX=/opt/rocm/llvm/bin/clang++ cmake --preset linux-rocm -DGGML_NATIVE=OFF -DGPU_TARGETS=gfx1201
+      - name: Build
+        run: cmake --build build-linux-rocm --parallel 4 --target inferssd-server inferssd-memprobe ssd-vram-tier
+
   windows-cuda-compile:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: windows-2025

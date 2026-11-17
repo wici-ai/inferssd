@@ -85,7 +85,7 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 
 ## Get started
 
-Install on Apple Silicon macOS or on Linux with an NVIDIA GPU:
+Install on Apple Silicon macOS, or on Linux with an NVIDIA GPU or an AMD GPU with ROCm:
 
 ```sh
 curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
@@ -97,7 +97,7 @@ Each numbered release includes checked prebuilt packages for Apple Silicon macOS
 curl -fsSL https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
 ```
 
-The installer works in a private environment and uses no `sudo`. A source build needs Git, Python 3.9 or later, and a C/C++ compiler. On macOS it also needs the Xcode Command Line Tools; Linux also needs systemd with cgroup v2, and the CUDA toolkit on a machine with an NVIDIA GPU. Follow the printed PATH instruction if it shows one.
+The installer works in a private environment and uses no `sudo`. A source build needs Git, Python 3.9 or later, and a C/C++ compiler. On macOS it also needs the Xcode Command Line Tools; Linux also needs systemd with cgroup v2, and the CUDA toolkit on a machine with an NVIDIA GPU or the ROCm HIP SDK on a machine whose AMD GPU runs on ROCm. Follow the printed PATH instruction if it shows one.
 
 Then start a model:
 

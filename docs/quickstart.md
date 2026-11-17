@@ -5,12 +5,12 @@
 
 Every platform uses `wici-ai/inferssd`. Numbered releases share one version and tagged commit across platforms. Use the
 [one-command installation](#one-command-installation), or build manually for
-**[Apple Silicon](#apple-silicon)** / **[Linux / NVIDIA](#linux--nvidia)** /
+**[Apple Silicon](#apple-silicon)** / **[Linux / NVIDIA](#linux--nvidia)** / **[Linux / AMD](#linux--amd)** /
 **[Windows](#windows)** and [prepare a launch](#prepare-a-launch).
 
 ## Before you start
 
-- For a manual source build, install Git, CMake, Ninja, a C/C++ compiler, and Python 3.9 or later. macOS also needs the Xcode Command Line Tools; Linux needs a compatible CUDA toolkit on a machine with an NVIDIA GPU. Prebuilt macOS and Windows packages need none of these tools.
+- For a manual source build, install Git, CMake, Ninja, a C/C++ compiler, and Python 3.9 or later. macOS also needs the Xcode Command Line Tools; Linux needs a compatible CUDA toolkit on a machine with an NVIDIA GPU, or the ROCm HIP SDK on a machine whose AMD GPU runs on ROCm. Prebuilt macOS and Windows packages need none of these tools.
 - Choose a [tested GGUF checkpoint](../README.md#models). `cli -hf` and `serve -hf` download all shards of its tested quantization. For manual `launch`, obtain a complete local copy and keep all shards together.
 - Plan storage for the checkpoint. The benchmarked DeepSeek GGUF files take about **473 GiB**; an optional DeepSeek expert pack adds about **269 GiB**, and a Muse pack about **450 GiB**. The framework can index GGUF experts directly, so a pack is optional and must match its source checkpoint.
 - Choose CPU, cache and process-memory budgets for your machine. The README benchmark settings describe their recorded runs, not universal deployment defaults.
@@ -51,9 +51,10 @@ A source build checks for a C/C++
 compiler, Git, Python 3.9+ with `venv`, and the platform toolchain. On macOS,
 the Xcode Command Line Tools must be installed. The engine is built for the machine's GPUs, as the
 [machine profile](machine-profile.md) lists them: for an NVIDIA GPU with CUDA, which
-needs `nvcc` on PATH, under `/usr/local/cuda`, or through `CUDACXX`; for an AMD or
-Intel GPU with Vulkan, when the Vulkan SDK's `glslc` is on PATH; and for the CPU
-alone otherwise.
+needs `nvcc` on PATH, under `/usr/local/cuda`, or through `CUDACXX`; for an AMD GPU on
+ROCm (ROCm installed, so its `rocminfo` is on PATH) with ROCm, which needs the HIP SDK's
+`hipconfig` on PATH or its `clang++` through `HIPCXX`; for another AMD or an Intel GPU
+with Vulkan, when the Vulkan SDK's `glslc` is on PATH; and for the CPU alone otherwise.
 The [Linux runtime requirements](#linux-requirements) still apply. On Windows,
 see the [Windows requirements](#windows); there the installation root is
 `%LOCALAPPDATA%\inferssd` and the command is `inferssd.cmd` in its `bin` directory.
@@ -196,8 +197,32 @@ python3 scripts/engine-resources.py \
   --build build-linux-cuda --output engine-resources.json
 ```
 
-Without an NVIDIA GPU, build `--preset linux-cpu` and leave out `inferssd-memprobe`; add
-`-DGGML_VULKAN=ON` with the Vulkan SDK to run an AMD or Intel GPU through Vulkan.
+For an AMD GPU on ROCm, see [Linux / AMD](#linux--amd). Without either, build
+`--preset linux-cpu` and leave out `inferssd-memprobe`; add `-DGGML_VULKAN=ON` with the
+Vulkan SDK to run an AMD or Intel GPU through Vulkan.
+
+## Linux / AMD
+
+An AMD GPU that ROCm supports runs the same engine as an NVIDIA GPU: ggml's HIP backend
+builds the CUDA backend's sources, the expert VRAM tier included, for AMD's GPUs. Install
+ROCm with its HIP SDK (for example with `amdgpu-install --usecase=rocm`); the kernel's
+`amdgpu` driver must support the GPU. The preset builds for the GPUs of the machine it
+runs on; set `GPU_TARGETS` (for example `gfx1201`) to build for others. It keeps ggml's
+default of no HIP virtual memory management (`GGML_HIP_NO_VMM`): on ROCm 7.2.4 with the
+kernel's own `amdgpu` driver, an RDNA4 GPU faults on memory mapped through it, although it
+reports support. Without it the backend's memory pool reserves a graph's memory as one
+allocation before the graph runs, as the CUDA backend's pool maps it.
+
+```sh
+HIPCXX="$(hipconfig -l)/clang++" cmake --preset linux-rocm
+cmake --build build-linux-rocm --parallel 4 \
+  --target inferssd-server inferssd-cpuprobe inferssd-ssdprobe inferssd-memprobe
+python3 scripts/engine-resources.py \
+  --build build-linux-rocm --output engine-resources.json
+```
+
+Without ROCm, an AMD GPU runs the dense layers through Vulkan and the CPU computes every
+routed expert.
 The [Linux resource prerequisites](testing.md#linux-resource-prerequisites) describe I/O, cgroup and pinned-memory requirements.
 
 ### Linux requirements
