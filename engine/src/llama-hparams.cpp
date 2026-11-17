@@ -245,6 +245,10 @@ bool llama_hparams::has_kv(uint32_t il) const {
     return true;
 }
 
+uint32_t llama_hparams::n_block() const {
+    return n_layer + nextn_predict_layers;
+}
+
 uint32_t llama_hparams::n_layer_kv() const {
     uint32_t res = 0;
 

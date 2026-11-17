@@ -10,6 +10,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 
 #include <algorithm>
@@ -64,7 +65,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow] [--nextn]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -78,7 +79,9 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_ctx = 128) {
+// n_nextn NextN blocks follow the model's blocks in the file, which counts them in block_count and
+// sizes its per-block metadata for them too.
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const uint32_t n_ctx = 128, const uint32_t n_nextn = 0) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
 
@@ -119,19 +122,23 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     }
 
     const uint32_t n_embd_head = n_embd / n_head;
+    const uint32_t n_block     = n_layer + n_nextn;
 
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,      llm_arch_name(arch));
     ms.add_kv(LLM_KV_VOCAB_SIZE,                n_vocab);
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,            n_ctx);
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
-    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_block);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+    if (n_nextn > 0) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, n_nextn);
+    }
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         std::vector<uint32_t> n_ff_per_layer;
-        n_ff_per_layer.reserve(n_layer);
-        for (uint32_t il = 0; il < n_layer; il++) {
+        n_ff_per_layer.reserve(n_block);
+        for (uint32_t il = 0; il < n_block; il++) {
             n_ff_per_layer.push_back(il <= 1 ? 0 : n_ff);
         }
         ms.add_kv(LLM_KV_FEED_FORWARD_LENGTH, n_ff_per_layer);
@@ -149,8 +156,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
             arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR) {
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_per_layer;
-        n_head_per_layer.reserve(n_layer);
-        for (uint32_t il = 0; il < n_layer; il++) {
+        n_head_per_layer.reserve(n_block);
+        for (uint32_t il = 0; il < n_block; il++) {
             n_head_per_layer.push_back(il == 1 ? 0 : n_head);
         }
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
@@ -195,8 +202,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
     } else if (arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_MUSE_SPARK) {
         std::vector<uint32_t> pattern;
-        pattern.reserve(n_layer);
-        for (uint32_t il = 0; il < n_layer; il++) {
+        pattern.reserve(n_block);
+        for (uint32_t il = 0; il < n_block; il++) {
             pattern.push_back(il % 2);
         }
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
@@ -217,13 +224,15 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_block, 4));
     }
 
     if (arch == LLM_ARCH_DEEPSEEK41) {
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         uint32_t(8));
         ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           uint32_t(32));
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,            std::vector<uint32_t>({0, 0, 2, 2, 1, 1}));
+        std::vector<uint32_t> compress_ratios = {0, 0, 2, 2, 1, 1};
+        compress_ratios.resize(n_block, compress_ratios.back());
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,            compress_ratios);
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,    160000.0f);
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
@@ -312,6 +321,17 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
+static llama_context_params get_ctx_params(bool encode) {
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 0;
+    ctx_params.n_threads = 4;
+    ctx_params.n_threads_batch = 4;
+    if (!encode) {
+        ctx_params.n_ubatch = 64;
+    }
+    return ctx_params;
+}
+
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
@@ -323,13 +343,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
 
-    llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 0;
-    ctx_params.n_threads = 4;
-    ctx_params.n_threads_batch = 4;
-    if (!encode) {
-        ctx_params.n_ubatch = 64;
-    }
+    const llama_context_params ctx_params = get_ctx_params(encode);
 
     size_t tmp = seed;
     llama_model_ptr model(gguf_ctx != nullptr ?
@@ -676,6 +690,182 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
     return all_ok ? 0 : 1;
 }
 
+// loads the GGUF file PATH on the CPU as a server does: mapped, with the routed experts deferred
+static std::pair<llama_model_ptr, llama_context_ptr> get_file_model_and_ctx(const std::string & path, bool encode) {
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t no_devices[] = { nullptr };
+    model_params.devices = no_devices;
+    model_params.use_mmap = true;
+    model_params.defer_experts = true;
+
+    llama_model_ptr model(llama_model_load_from_file(path.c_str(), model_params));
+    if (!model) {
+        throw std::runtime_error("failed to load llama model from " + path);
+    }
+    llama_context_ptr lctx(llama_init_from_model(model.get(), get_ctx_params(encode)));
+    if (!lctx) {
+        throw std::runtime_error("failed to create llama context");
+    }
+    return std::make_pair(std::move(model), std::move(lctx));
+}
+
+// Writes the GGUF file PATH: the metadata KV and every tensor of MODEL. With NEXTN it also holds the
+// tensors of one NextN block after the model's blocks, as KV must then count: each tensor of the model's
+// last block once more, under the next block's index and zero, and a tensor only a NextN block has.
+static void save_model_file(const llama_model * model, const gguf_context * kv, const std::string & path, bool nextn) {
+    gguf_context_ptr out(gguf_init_empty());
+    gguf_set_kv(out.get(), kv);
+    for (const auto & named : model->tensors_by_name) {
+        if (gguf_find_tensor(out.get(), named.first.c_str()) < 0) {
+            gguf_add_tensor(out.get(), named.second);
+        }
+    }
+    ggml_context_ptr ctx; // holds the NextN tensors until the file is written
+    if (nextn) {
+        const int32_t     n_layer = llama_model_n_layer(model);
+        const std::string last    = "blk." + std::to_string(n_layer - 1) + ".";
+        const std::string next    = "blk." + std::to_string(n_layer) + ".";
+        std::vector<const ggml_tensor *> block;
+        size_t bytes = 16 * sizeof(float);
+        for (const auto & named : model->tensors_by_name) {
+            if (named.first.rfind(last, 0) == 0 && std::find(block.begin(), block.end(), named.second) == block.end()) {
+                block.push_back(named.second);
+                bytes += ggml_nbytes(named.second);
+            }
+        }
+        GGML_ASSERT(!block.empty());
+        const ggml_init_params params = { bytes + (block.size() + 1) * (ggml_tensor_overhead() + GGML_MEM_ALIGN), nullptr, false };
+        ctx.reset(ggml_init(params));
+        std::vector<ggml_tensor *> head;
+        for (const ggml_tensor * t : block) {
+            ggml_tensor * copy = ggml_new_tensor(ctx.get(), t->type, ggml_n_dims(t), t->ne);
+            ggml_set_name(copy, (next + (ggml_get_name(t) + last.size())).c_str());
+            head.push_back(copy);
+        }
+        ggml_tensor * eh_proj = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 16);
+        ggml_set_name(eh_proj, (next + "nextn.eh_proj.weight").c_str());
+        head.push_back(eh_proj);
+        for (ggml_tensor * t : head) {
+            if (gguf_find_tensor(out.get(), ggml_get_name(t)) < 0) {
+                memset(t->data, 0, ggml_nbytes(t));
+                gguf_add_tensor(out.get(), t);
+            }
+        }
+    }
+    if (!gguf_write_to_file(out.get(), path.c_str(), false)) {
+        throw std::runtime_error("failed to write " + path);
+    }
+}
+
+// A file's NextN blocks are not part of the model. A model whose metadata counts one after its blocks
+// has the same blocks and logits, bit for bit, as the model without it; loaded from a file that also
+// holds the block's tensors, it has the same blocks, size and logits as loaded from the file without
+// them. A file of NextN blocks alone does not load.
+static int test_nextn(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } original_logger;
+        ggml_log_level min_level; // prints below this log level go to debug log
+    };
+    user_data_t ud;
+    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
+    ud.min_level = log_level;
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+    }, &ud);
+
+    const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
+    const std::string ok   = "\033[1;32mOK\033[0m";
+    const std::string fail = "\033[1;31mFAIL\033[0m";
+
+    bool all_ok = true;
+    common_log_flush(common_log_main());
+    printf("|%16s|%6s|%10s|%10s|\n", "Model arch.", "Config", "Metadata", "File");
+    printf("|----------------|------|----------|----------|\n");
+    for (const llm_arch & arch : llm_arch_all()) {
+        if (arch == LLM_ARCH_UNKNOWN || !arch_supported(arch)) {
+            continue;
+        }
+        if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
+            continue;
+        }
+        if (arch == LLM_ARCH_GEMMA4) {
+            continue; // FIXME: ISWA KV cache initialization needs more fixture params
+        }
+#if defined(GGML_USE_WEBGPU)
+        continue; // FIXME
+#endif // GGML_USE_WEBGPU
+
+        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
+        for (bool moe : {false, true}) {
+            if (moe && !moe_implemented(arch)) {
+                continue;
+            }
+            if (!moe && moe_mandatory(arch)) {
+                continue;
+            }
+            const std::string stem = std::string("test-llama-archs-nextn-") + llm_arch_name(arch) + (moe ? "-moe" : "-dense");
+            const std::string path_trunk = stem + ".gguf";
+            const std::string path_nextn = stem + "-nextn.gguf";
+            bool meta_ok = false;
+            bool file_ok = false;
+            std::string error;
+            try {
+                gguf_context_ptr trunk      = get_gguf_ctx(arch, moe);
+                gguf_context_ptr with_nextn = get_gguf_ctx(arch, moe, 128, 1);
+                auto base = get_model_and_ctx(trunk.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                const int32_t n_layer = llama_model_n_layer(base.first.get());
+                {
+                    auto meta = get_model_and_ctx(with_nextn.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                    meta_ok = llama_model_n_layer(meta.first.get()) == n_layer &&
+                        get_logits(meta.first.get(), meta.second.get(), tokens, encode) ==
+                        get_logits(base.first.get(), base.second.get(), tokens, encode);
+                }
+                save_model_file(base.first.get(), trunk.get(), path_trunk, false);
+                save_model_file(base.first.get(), with_nextn.get(), path_nextn, true);
+                auto from_trunk = get_file_model_and_ctx(path_trunk, encode);
+                auto from_nextn = get_file_model_and_ctx(path_nextn, encode);
+                file_ok = llama_model_n_layer(from_nextn.first.get()) == n_layer &&
+                    llama_model_size(from_nextn.first.get()) == llama_model_size(from_trunk.first.get()) &&
+                    get_logits(from_nextn.first.get(), from_nextn.second.get(), tokens, encode) ==
+                    get_logits(from_trunk.first.get(), from_trunk.second.get(), tokens, encode);
+            } catch (const std::exception & e) {
+                error = e.what();
+            }
+            std::remove(path_trunk.c_str());
+            std::remove(path_nextn.c_str());
+            all_ok = all_ok && meta_ok && file_ok;
+            printf("|%16s|%6s|%21s|%21s| %s\n", llm_arch_name(arch), moe ? "MoE" : "Dense",
+                (meta_ok ? ok : fail).c_str(), (file_ok ? ok : fail).c_str(), error.c_str());
+        }
+    }
+
+    if (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_LLAMA) {
+        gguf_context_ptr heads_only = get_gguf_ctx(LLM_ARCH_LLAMA, false, 128, 1);
+        const LLM_KV kv(LLM_ARCH_LLAMA);
+        const uint32_t n_block = gguf_get_val_u32(heads_only.get(), gguf_find_key(heads_only.get(), kv(LLM_KV_BLOCK_COUNT).c_str()));
+        gguf_set_val_u32(heads_only.get(), kv(LLM_KV_NEXTN_PREDICT_LAYERS).c_str(), n_block);
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        ggml_backend_dev_t no_devices[] = { nullptr };
+        model_params.devices = no_devices;
+        size_t tmp = seed;
+        const llama_model_ptr model(llama_model_init_from_user(heads_only.get(), set_tensor_data, &tmp, model_params));
+        const bool refused = model == nullptr;
+        printf("NextN blocks only: %s\n", (refused ? ok : fail).c_str());
+        all_ok = all_ok && refused;
+    }
+
+    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    return all_ok ? 0 : 1;
+}
+
 // decodes tokens [p0, p1) of sequence 0 in batches of n_batch, the last token's logits returned
 static std::vector<float> decode_range(llama_context * lctx, const std::vector<llama_token> & tokens, uint32_t p0, uint32_t p1) {
     const uint32_t n_batch = llama_n_batch(lctx);
@@ -863,10 +1053,15 @@ int main(int argc, char ** argv) {
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
     bool kv_grow = false;
+    bool nextn = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--kv-grow") == 0) {
             kv_grow = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--nextn") == 0) {
+            nextn = true;
             continue;
         }
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -911,6 +1106,9 @@ int main(int argc, char ** argv) {
         }
         if (kv_grow) {
             return test_kv_grow(arch, seed, log_level);
+        }
+        if (nextn) {
+            return test_nextn(arch, seed, log_level);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

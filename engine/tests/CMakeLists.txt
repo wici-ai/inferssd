@@ -775,6 +775,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     if (NOT APPLE)
         inferssd_ci_test(test-llama-archs test-kv-cache-grow)
     endif()
+    # NextN blocks: every architecture, on the CPU alone
+    llama_test(test-llama-archs NAME test-llama-archs-nextn ARGS --nextn -s 42)
+    inferssd_ci_test(test-llama-archs test-llama-archs-nextn)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)

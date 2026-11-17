@@ -685,6 +685,7 @@ struct llama_model {
     void load_stats  (llama_model_loader & ml);
     void load_arch   (llama_model_loader & ml);
     void load_hparams(llama_model_loader & ml);
+    void drop_nextn_blocks(llama_model_loader & ml); // after load_hparams, to run the model, not to rewrite its file
     void load_vocab  (llama_model_loader & ml);
     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
 

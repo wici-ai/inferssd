@@ -171,12 +171,16 @@ def facts_from_headers(headers: Sequence[gguf_header.Header]) -> ModelFacts:
 
 def model_facts(path: str, *, filesystem: SourceFiles = LOCAL_FILES) -> ModelFacts:
     """ModelFacts of the model PATH names; a split model's first shard brings all of them."""
-    return facts_from_headers(gguf_header.read_model(path, filesystem=filesystem))
+    return facts_from_headers(
+        gguf_header.without_nextn(gguf_header.read_model(path, filesystem=filesystem))
+    )
 
 
 def shard_facts(paths: Sequence[str], *, filesystem: SourceFiles = LOCAL_FILES) -> ModelFacts:
     """ModelFacts of exactly the shards PATHS, in their order."""
-    return facts_from_headers([gguf_header.read(path, filesystem=filesystem) for path in paths])
+    return facts_from_headers(
+        gguf_header.without_nextn([gguf_header.read(path, filesystem=filesystem) for path in paths])
+    )
 
 
 def _type_counts(value: object, field: str) -> None:
