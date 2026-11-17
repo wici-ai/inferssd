@@ -27,6 +27,16 @@ source tree.
    the bundled matrix kernels and SSD expert dispatch. Copyright (c) 2023-2026
    The ggml authors. MIT (engine/LICENSE).
 
+   The mixed F16/F32 CPU dot product in engine/ggml/src/ggml-cpu/vec.cpp
+   is ported from ggml-org/llama.cpp revision
+   9581154a2250cc9e6948e4c2a2fc4b4e19d1a57e under the same MIT license.
+   It is used for explicitly requested F32 CPU flash-attention accumulation;
+   default precision and the global matrix multiplication type traits are unchanged.
+
+   The stable CPU softplus formula in engine/ggml/src/ggml-cpu/unary-ops.cpp
+   also follows that revision, using log1pf(expf(x)) to retain the negative
+   tail while preserving the existing positive-input fast path.
+
 2. DeepSeek V4 support
    https://github.com/nisparks/llama.cpp
    Ported from Nicholas Sparks' MIT-licensed fork. Copyright (c) 2023-2026
@@ -42,6 +52,11 @@ source tree.
    latter two originate in upstream llama.cpp pull requests 24162 and 25585.
    Copyright (c) 2023-2026 The ggml authors. The MIT permission notice below
    applies.
+
+   DeepSeek-V4.1 router normalization in engine/src/llama-graph.h also follows
+   src/llama-graph.cpp at that revision: the selected scores use a sum-plus-
+   epsilon denominator instead of the generic F16 floor. The CPU graph
+   regression is engine/tests/ssd/test-moe-router-norm.cpp.
 
 4. Engram decode reference
    https://github.com/antirez/ds4
