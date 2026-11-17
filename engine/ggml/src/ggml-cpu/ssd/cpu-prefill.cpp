@@ -101,11 +101,12 @@ struct ssd_cpu_prefill {
     // activation_up: SWIGLU's u beside g in activation until the chunk is gated
     std::vector<float> activation, activation_up, routed_output, post_exp_output;
     std::vector<uint8_t> quant_input, quant_hidden;
-    ggml_vec_dot_t dot_up = nullptr, dot_down = nullptr;
+    // up and gate may be of different types, each with its own vec_dot, against one quantized input
+    ggml_vec_dot_t dot_up = nullptr, dot_gate = nullptr, dot_down = nullptr;
     ggml_from_float_t quantize_input = nullptr, quantize_hidden = nullptr;
     int latent = 0, hidden = 0;
     int ntokens = 0, nslots = 0;
-    size_t row_bytes_up = 0, row_bytes_down = 0;
+    size_t row_bytes_up = 0, row_bytes_gate = 0, row_bytes_down = 0;
     size_t quant_bytes_input = 0, quant_bytes_hidden = 0;
     const char * up_data = nullptr, * gate_data = nullptr, * down_data = nullptr;
     const float * weights = nullptr;
@@ -151,24 +152,32 @@ struct ssd_cpu_prefill {
                     ggml_type_name(tensor->type) + " experts");
             }
         }
-        if (up->type != gate->type) { throw std::runtime_error("CPU prefill requires up and gate experts of one type"); }
         if (up->ne[0] != gate->ne[0] || up->ne[1] != gate->ne[1] || up->ne[2] != gate->ne[2] ||
                 down->ne[0] != up->ne[1] || down->ne[1] != up->ne[0] || down->ne[2] != up->ne[2]) {
             throw std::runtime_error("CPU prefill expert shape mismatch");
         }
         latent = static_cast<int>(up->ne[0]); hidden = static_cast<int>(up->ne[1]);
 #if defined(__x86_64__) || defined(_M_X64)
-        active_mxfp4_gemm = up->type == GGML_TYPE_MXFP4 && down->type == GGML_TYPE_MXFP4 ? mxfp4_gemm : 0;
+        active_mxfp4_gemm = up->type == GGML_TYPE_MXFP4 && gate->type == GGML_TYPE_MXFP4 && down->type == GGML_TYPE_MXFP4 ?
+            mxfp4_gemm : 0;
 #else
         active_mxfp4_gemm = 0;
 #endif
         const auto * up_traits = ggml_get_type_traits_cpu(up->type);
+        const auto * gate_traits = ggml_get_type_traits_cpu(gate->type);
         const auto * down_traits = ggml_get_type_traits_cpu(down->type);
+        if (gate_traits->vec_dot_type != up_traits->vec_dot_type) {
+            throw std::runtime_error(std::string("this quantization is not supported yet: the CPU prefill multiplies up "
+                "and gate against one quantized input, but up=") + ggml_type_name(up->type) + " and gate=" +
+                ggml_type_name(gate->type) + " need different ones");
+        }
         dot_up = up_traits->vec_dot;
+        dot_gate = gate_traits->vec_dot;
         dot_down = down_traits->vec_dot;
         quantize_input = ggml_get_type_traits_cpu(up_traits->vec_dot_type)->from_float;
         quantize_hidden = ggml_get_type_traits_cpu(down_traits->vec_dot_type)->from_float;
         row_bytes_up = ggml_row_size(up->type, latent);
+        row_bytes_gate = ggml_row_size(gate->type, latent);
         row_bytes_down = ggml_row_size(down->type, hidden);
         quant_bytes_input = ggml_row_size(up_traits->vec_dot_type, latent);
         quant_bytes_hidden = ggml_row_size(down_traits->vec_dot_type, hidden);
@@ -259,7 +268,7 @@ struct ssd_cpu_prefill {
                 if (!self.down_phase) {
                     float u[4], g[4];
                     const void * up = self.up_data + row * self.row_bytes_up;
-                    const void * gate = self.gate_data + row * self.row_bytes_up;
+                    const void * gate = self.gate_data + row * self.row_bytes_gate;
                     if (count == 4) {
                         const void * input[4];
                         for (size_t offset = 0; offset < 4; ++offset) {
@@ -267,20 +276,20 @@ struct ssd_cpu_prefill {
                         }
                         prefill_mxfp4_dot_quad(self.dot_up, self.latent, u, up,
                                 input[0], input[1], input[2], input[3]);
-                        prefill_mxfp4_dot_quad(self.dot_up, self.latent, g, gate,
+                        prefill_mxfp4_dot_quad(self.dot_gate, self.latent, g, gate,
                                 input[0], input[1], input[2], input[3]);
                     } else {
                         const void * input = self.quant_input.data() + columns[column].token * self.quant_bytes_input;
                         if (count >= 2) {
                             const void * next = self.quant_input.data() + columns[column + 1].token * self.quant_bytes_input;
                             prefill_mxfp4_dot_pair(self.dot_up, self.latent, u, up, input, next);
-                            prefill_mxfp4_dot_pair(self.dot_up, self.latent, g, gate, input, next);
+                            prefill_mxfp4_dot_pair(self.dot_gate, self.latent, g, gate, input, next);
                         }
                         if (count == 1 || count == 3) {
                             const size_t offset = count == 1 ? 0 : 2;
                             const void * last = self.quant_input.data() + columns[column + offset].token * self.quant_bytes_input;
                             self.dot_up(self.latent, u + offset, 0, up, 0, last, 0, 1);
-                            self.dot_up(self.latent, g + offset, 0, gate, 0, last, 0, 1);
+                            self.dot_gate(self.latent, g + offset, 0, gate, 0, last, 0, 1);
                         }
                     }
                     for (size_t offset = 0; offset < count; ++offset) {

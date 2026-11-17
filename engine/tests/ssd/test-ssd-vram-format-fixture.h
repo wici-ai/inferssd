@@ -9,7 +9,7 @@ static inline const ssd_vram_expert_format & lifecycle_format() {
         return values;
     }();
     static const ssd_vram_expert_format format = {
-        256, 256, int32_t(GGML_TYPE_Q4_K), int32_t(GGML_TYPE_Q4_K),
+        256, 256, int32_t(GGML_TYPE_Q4_K), int32_t(GGML_TYPE_Q4_K), int32_t(GGML_TYPE_Q4_K),
         256, int32_t(layers.size()), layers.data()
     };
     return format;

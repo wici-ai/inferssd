@@ -53,7 +53,7 @@ void cuda(cudaError_t rc, const char * what) {
 
 const vram_group_compute_api * engine_api() {
     const auto * api = ssd_vram_group_compute_get_api();
-    require(api && api->version == 3 && api->size == sizeof(vram_group_compute_api), "grouped engine API version");
+    require(api && api->version == 4 && api->size == sizeof(vram_group_compute_api), "grouped engine API version");
     return api;
 }
 
@@ -62,8 +62,8 @@ struct engine_ptr {
     void * p = nullptr;
     engine_ptr(const vram_group_compute_api * a, int latent, int hidden, ggml_type up, ggml_type down) : api(a) {
         char error[512] = {};
-        const int32_t weight_type = up, down_type = down;
-        p = api->create(0, latent, hidden, 1, &weight_type, &down_type, error, sizeof(error));
+        const int32_t up_type = up, gate_type = up, down_type = down;
+        p = api->create(0, latent, hidden, 1, &up_type, &gate_type, &down_type, error, sizeof(error));
         require(p, std::string("grouped engine create: ") + error);
     }
     ~engine_ptr() { api->destroy(p); }

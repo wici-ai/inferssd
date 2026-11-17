@@ -856,7 +856,7 @@ struct ssd_cpu_sink {
     ssd_cpu_sink_parallel_fn parallel_fn = nullptr;
     void * parallel_userdata = nullptr;
     int latent = 0, hidden = 0;
-    size_t row_bytes_up = 0, row_bytes_down = 0;
+    size_t row_bytes_up = 0, row_bytes_gate = 0, row_bytes_down = 0;
     // One expert's share of a compute phase: its weights and routing weight, its hidden row (and SWIGLU's u row) in
     // the phase's scratch, its output row and its quantized hidden. A phase computes the rows of every item.
     struct sink_work_item {
@@ -881,8 +881,8 @@ struct ssd_cpu_sink {
     std::vector<float> activation_up; // SWIGLU: u, beside g in activation, until quantize_activation
     std::vector<uint8_t> quant_input, quant_hidden;
     size_t quant_hidden_stride = 0;
-    // Selected from the expert tensor types by prepare(); up and gate share one.
-    ggml_vec_dot_t dot_up = nullptr, dot_down = nullptr;
+    // Selected from the expert tensor types by prepare(); up and gate share one quantized input.
+    ggml_vec_dot_t dot_up = nullptr, dot_gate = nullptr, dot_down = nullptr;
     ggml_from_float_t quantize_input = nullptr, quantize_hidden = nullptr;
 
     ssd_cpu_sink(int depth, ssd_cpu_sink_resolver resolve, void * user, const sink_configuration & input = {}) :
@@ -1566,7 +1566,7 @@ struct ssd_cpu_sink {
                     for (int row = begin; row < end; ++row) {
                         float u, g;
                         dot_up(latent, &u, 0, w.up + row * row_bytes_up, 0, quant_input.data(), 0, 1);
-                        dot_up(latent, &g, 0, w.gate + row * row_bytes_up, 0, quant_input.data(), 0, 1);
+                        dot_gate(latent, &g, 0, w.gate + row * row_bytes_gate, 0, quant_input.data(), 0, 1);
                         const float gate_value = std::min(g, limit);
                         const float up_value = std::clamp(u, -limit, limit);
                         w.hidden[row] = gate_value / (1.f + expf(-gate_value)) * up_value;
@@ -1575,13 +1575,13 @@ struct ssd_cpu_sink {
                     // g and u as they are: the coordinator gates the whole row (quantize_activation)
                     for (int row = begin; row < end; ++row) {
                         dot_up(latent, &w.hidden_up[row], 0, w.up + row * row_bytes_up, 0, quant_input.data(), 0, 1);
-                        dot_up(latent, &w.hidden[row], 0, w.gate + row * row_bytes_up, 0, quant_input.data(), 0, 1);
+                        dot_gate(latent, &w.hidden[row], 0, w.gate + row * row_bytes_gate, 0, quant_input.data(), 0, 1);
                     }
                 } else if (!is_down) {
                     for (int row = begin; row < end; ++row) {
                         float u, g;
                         dot_up(latent, &u, 0, w.up + row * row_bytes_up, 0, quant_input.data(), 0, 1);
-                        dot_up(latent, &g, 0, w.gate + row * row_bytes_up, 0, quant_input.data(), 0, 1);
+                        dot_gate(latent, &g, 0, w.gate + row * row_bytes_gate, 0, quant_input.data(), 0, 1);
                         const float a = (beta * std::tanh(g * (1.0f / beta))) * (1.0f / (1.0f + std::exp(-g)));
                         if (linear_beta > 0.0f) { u = linear_beta * std::tanh(u * (1.0f / linear_beta)); }
                         w.hidden[row] = a * u;
@@ -1845,7 +1845,7 @@ struct ssd_cpu_sink {
     // is given (sink_vram::layer_list) once every configured layer has its. The tier keeps all of them in slots of one
     // geometry, so the layers must share latent, hidden and the expert count. A refusal keeps nothing.
     void record_expert_types(const ggml_tensor * const * experts, int n) {
-        struct typed { size_t index; int32_t up, down; };
+        struct typed { size_t index; int32_t up, gate, down; };
         std::vector<typed> found;
         const ggml_tensor * first = experts[0];
         for (int i = 0; i < n; ++i) {
@@ -1854,7 +1854,6 @@ struct ssd_cpu_sink {
             if (layer < 0) {
                 throw std::runtime_error(std::string("expert reserve requires canonical routed layer tensors, not ") + up->name);
             }
-            if (up->type != gate->type) { throw std::runtime_error("CPU sink requires up and gate experts of one type"); }
             if (up->ne[0] != first->ne[0] || up->ne[1] != first->ne[1] || up->ne[2] != first->ne[2] ||
                     gate->ne[0] != up->ne[0] || gate->ne[1] != up->ne[1] || gate->ne[2] != up->ne[2] ||
                     down->ne[0] != up->ne[1] || down->ne[1] != up->ne[0] || down->ne[2] != up->ne[2]) {
@@ -1865,9 +1864,12 @@ struct ssd_cpu_sink {
             if (at == cache.layers.end()) {
                 throw std::runtime_error("expert reserve: layer " + std::to_string(layer) + " is not a configured routed layer");
             }
-            found.push_back({ size_t(at - cache.layers.begin()), int32_t(up->type), int32_t(down->type) });
+            found.push_back({ size_t(at - cache.layers.begin()), int32_t(up->type), int32_t(gate->type), int32_t(down->type) });
         }
-        for (const auto & f : found) { cache.layers[f.index].up_type = f.up; cache.layers[f.index].down_type = f.down; }
+        for (const auto & f : found) {
+            auto & l = cache.layers[f.index];
+            l.up_type = f.up; l.gate_type = f.gate; l.down_type = f.down;
+        }
     }
     // The RAM cache's arena and pages at load (sink_cache::reserve_at_load), each role as a decode request reserves
     // it (its bytes and a page prefix, in whole pages), after the read ring the first decode charges before the cache
@@ -3450,9 +3452,6 @@ struct ssd_cpu_sink {
                     ggml_type_name(tensor->type) + " experts");
             }
         }
-        if (up->type != gate->type) {
-            throw std::runtime_error("CPU sink requires up and gate experts of one type");
-        }
         if (up->ne[0] != gate->ne[0] || up->ne[1] != gate->ne[1] || up->ne[2] != gate->ne[2] ||
             down->ne[0] != up->ne[1] || down->ne[1] != up->ne[0] || down->ne[2] != up->ne[2]) {
             throw std::runtime_error("CPU sink expert shape mismatch");
@@ -3461,12 +3460,22 @@ struct ssd_cpu_sink {
         // The graph's MUL_MAT_ID kernels: vec_dot of the weight type against the
         // input quantized to its vec_dot_type (Q3_K/Q8_K, MXFP4/Q8_0, ...).
         const auto * up_traits = ggml_get_type_traits_cpu(up->type);
+        const auto * gate_traits = ggml_get_type_traits_cpu(gate->type);
         const auto * down_traits = ggml_get_type_traits_cpu(down->type);
+        // up and gate may be of different types (a quantization's mix), each with its own vec_dot, but against the
+        // one input row quantized once.
+        if (gate_traits->vec_dot_type != up_traits->vec_dot_type) {
+            throw std::runtime_error(std::string("this quantization is not supported yet: the CPU sink multiplies up and "
+                "gate against one quantized input, but up=") + ggml_type_name(up->type) + " and gate=" +
+                ggml_type_name(gate->type) + " need different ones");
+        }
         dot_up = up_traits->vec_dot;
+        dot_gate = gate_traits->vec_dot;
         dot_down = down_traits->vec_dot;
         quantize_input = ggml_get_type_traits_cpu(up_traits->vec_dot_type)->from_float;
         quantize_hidden = ggml_get_type_traits_cpu(down_traits->vec_dot_type)->from_float;
         row_bytes_up = ggml_row_size(up->type, latent);
+        row_bytes_gate = ggml_row_size(gate->type, latent);
         row_bytes_down = ggml_row_size(down->type, hidden);
         requests.clear();
         size_t max_bytes[3] = {};
@@ -3543,7 +3552,7 @@ struct ssd_cpu_sink {
                 vram.set_host_demand(cache.pending_bytes(max_bytes[0] + max_bytes[1] + max_bytes[2]));
             }
             if (vram.context) {
-                vram.prepare(requests, up, down, latent, hidden, sink_vram::layer_list(cache), cache, post_exp_norm != nullptr);
+                vram.prepare(requests, up, gate, down, latent, hidden, sink_vram::layer_list(cache), cache, post_exp_norm != nullptr);
             } else { vram.hits = 0; }
             // Auto sizing reads memory.current. After GPU prefill, the CPU
             // read ring may still be absent or only virtually allocated. Its
@@ -4022,7 +4031,7 @@ bool ssd_cpu_sink_stream_hybrid(struct ssd_cpu_sink * sink,
             }
             sink->vram.prefill_seed_routes.swap(routes);
         }
-        batch->gpu_experts = sink->vram.prepare_prefill(sink->requests, up, down, sink->latent, sink->hidden,
+        batch->gpu_experts = sink->vram.prepare_prefill(sink->requests, up, gate, down, sink->latent, sink->hidden,
             sink_vram::layer_list(sink->cache), batch->activation.post_exp_norm != nullptr);
         // the batched lane streams its SSD transients through the ring
         streaming_ssd = sink->vram.prefill_batched;

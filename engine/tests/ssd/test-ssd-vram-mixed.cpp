@@ -42,7 +42,8 @@ size_t role_bytes(int layer, int role) {
 size_t expert_bytes(int layer) { return role_bytes(layer, 0) + role_bytes(layer, 1) + role_bytes(layer, 2); }
 // the declaration every call makes, with the types of the call's layer
 ssd_vram_expert_format declared(int layer) {
-    return { latent, hidden, up_types[layer - 1], down_types[layer - 1], experts, 2, layer_ids, up_types, down_types };
+    return { latent, hidden, up_types[layer - 1], up_types[layer - 1], down_types[layer - 1], experts, 2, layer_ids, up_types,
+        up_types, down_types };
 }
 ssd_vram_request key(int layer, int expert) {
     ssd_vram_request r = {}; r.layer = layer; r.expert = expert; r.weight = .5f;

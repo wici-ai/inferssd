@@ -188,16 +188,12 @@ int main() {
         graph_case(cpu.get(), 1, false, true, "qwen4exp_decode_one", GGML_TYPE_Q8_0, LLM_ARCH_QWEN4EXP);
         graph_case(cpu.get(), 64, true, false, "qwen35moe_prefill_ub64", GGML_TYPE_Q8_0, LLM_ARCH_QWEN35MOE);
         graph_case(cpu.get(), 1, false, true, "qwen35moe_decode_one", GGML_TYPE_Q8_0, LLM_ARCH_QWEN35MOE);
-        bool refused = false;
-        try {
-            // up and gate of different types
-            graph_case(cpu.get(), 1, false, true, "unsupported_up_gate", GGML_TYPE_MXFP4, LLM_ARCH_DEEPSEEK41, GGML_TYPE_F16);
-        } catch (const std::runtime_error & error) {
-            const std::string message = error.what();
-            refused = message.find("not supported yet") != std::string::npos &&
-                message.find("up=mxfp4 gate=f16") != std::string::npos;
-        }
-        require(refused, "unsupported expert layout did not refuse with a recoverable graph error");
+        // up and gate of different types, as Qwen3.8-Flash-Next UD-IQ1_S's layer 18 (an IQ2_XXS up beside an IQ2_S
+        // gate): the graph hands them to the sink like any other, whose executors check the types
+        graph_case(cpu.get(), 64, true, false, "qwen4exp_mixed_up_gate_prefill_ub64", GGML_TYPE_IQ2_XXS, LLM_ARCH_QWEN4EXP,
+            GGML_TYPE_IQ2_S);
+        graph_case(cpu.get(), 1, false, true, "qwen4exp_mixed_up_gate_decode_one", GGML_TYPE_IQ2_XXS, LLM_ARCH_QWEN4EXP,
+            GGML_TYPE_IQ2_S);
         std::printf("CPU_PREFILL_GRAPH_OK execution=not_run kda_validation=not_run\n");
         return 0;
     } catch (const std::exception & e) {

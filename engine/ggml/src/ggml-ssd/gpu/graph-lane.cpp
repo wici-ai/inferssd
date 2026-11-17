@@ -91,11 +91,11 @@ struct lane {
     ggml_backend_buffer_t work_buffer = nullptr;
     char * work_base = nullptr;
     int latent = 0, hidden = 0;
-    ggml_type up_type = GGML_TYPE_COUNT, down_type = GGML_TYPE_COUNT;  // the prepared layer's
+    ggml_type up_type = GGML_TYPE_COUNT, gate_type = GGML_TYPE_COUNT, down_type = GGML_TYPE_COUNT;  // the prepared layer's
     bool format_known = false, usable = false;
     // Every format the layers declare (ssd_vram_expert_format), with the device's answer. A pass's working memory
     // holds copies of the largest expert of those it runs, whichever layer comes next.
-    struct known_format { ggml_type up, down; bool usable; std::set<std::pair<int, size_t>> warmed = {}; };
+    struct known_format { ggml_type up, gate, down; bool usable; std::set<std::pair<int, size_t>> warmed = {}; };
     std::vector<known_format> formats;
     size_t largest_expert = 0;
     bool pass_ready = false;  // this pass's working memory is there (reserve_pass): else every expert stays on the CPU
@@ -132,8 +132,8 @@ struct lane {
         work_bytes = 0; work_base = nullptr;
         pass_ready = false;
     }
-    size_t expert_bytes(ggml_type up, ggml_type down) const {
-        return 2 * ggml_row_size(up, latent) * hidden + ggml_row_size(down, hidden) * latent;
+    size_t expert_bytes(ggml_type up, ggml_type gate, ggml_type down) const {
+        return (ggml_row_size(up, latent) + ggml_row_size(gate, latent)) * hidden + ggml_row_size(down, hidden) * latent;
     }
     size_t row_bytes() const { return (size_t(2) * latent + size_t(4) * hidden) * sizeof(float); }
     size_t work_needed(int rows) const {
@@ -180,37 +180,42 @@ struct lane {
         if (!format_known || f.latent != latent || f.hidden != hidden) { formats.clear(); largest_expert = 0; }
         latent = f.latent; hidden = f.hidden;
         format_known = true;
-        const bool listed = f.layer_weight_types && f.layer_down_types && f.layers;
-        for (int i = 0; listed && i < f.n_layers; ++i) { learn(ggml_type(f.layer_weight_types[i]), ggml_type(f.layer_down_types[i])); }
-        const known_format & now = learn(ggml_type(f.weight_type), ggml_type(f.down_type));
-        up_type = now.up; down_type = now.down; usable = now.usable;
+        const bool listed = f.layer_up_types && f.layer_gate_types && f.layer_down_types && f.layers;
+        for (int i = 0; listed && i < f.n_layers; ++i) {
+            learn(ggml_type(f.layer_up_types[i]), ggml_type(f.layer_gate_types[i]), ggml_type(f.layer_down_types[i]));
+        }
+        const known_format & now = learn(ggml_type(f.up_type), ggml_type(f.gate_type), ggml_type(f.down_type));
+        up_type = now.up; gate_type = now.gate; down_type = now.down; usable = now.usable;
     }
     // Whether the device can run a format at all, from its own answer about the chain's operations.
-    const known_format & learn(ggml_type up_type_, ggml_type down_type_) {
+    const known_format & learn(ggml_type up_type_, ggml_type gate_type_, ggml_type down_type_) {
         for (const auto & known : formats) {
-            if (known.up == up_type_ && known.down == down_type_) { return known; }
+            if (known.up == up_type_ && known.gate == gate_type_ && known.down == down_type_) { return known; }
         }
-        known_format known = { up_type_, down_type_, false };
+        known_format known = { up_type_, gate_type_, down_type_, false };
         const auto whole = [&](ggml_type type, int columns) {
             return int(type) >= 0 && int(type) < int(GGML_TYPE_COUNT) && ggml_blck_size(type) > 0 && columns % ggml_blck_size(type) == 0;
         };
         ggml_init_params params{ggml_tensor_overhead() * tensors_per_expert, nullptr, true};
-        ggml_context * ctx = whole(up_type_, latent) && whole(down_type_, hidden) ? ggml_init(params) : nullptr;
+        ggml_context * ctx = whole(up_type_, latent) && whole(gate_type_, latent) && whole(down_type_, hidden) ?
+            ggml_init(params) : nullptr;
         if (ctx) {
             ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, latent, 2);
             ggml_tensor * up = ggml_new_tensor_2d(ctx, up_type_, latent, hidden);
+            ggml_tensor * gate = ggml_new_tensor_2d(ctx, gate_type_, latent, hidden);
             ggml_tensor * down = ggml_new_tensor_2d(ctx, down_type_, hidden, latent);
             ggml_tensor * u = ggml_mul_mat(ctx, up, x);
+            ggml_tensor * g = ggml_mul_mat(ctx, gate, x);
             ggml_tensor * d = ggml_mul_mat(ctx, down, u);
             // The products and what every activation can be made of (activate).
-            ggml_tensor * plain[] = { u, d, ggml_mul(ctx, u, u), ggml_silu(ctx, u), ggml_clamp(ctx, u, -1.0f, 1.0f),
+            ggml_tensor * plain[] = { u, g, d, ggml_mul(ctx, u, u), ggml_silu(ctx, u), ggml_clamp(ctx, u, -1.0f, 1.0f),
                 ggml_scale(ctx, u, 2.0f), ggml_tanh(ctx, u), ggml_sigmoid(ctx, u) };
             known.usable = true;
             for (ggml_tensor * op : plain) { known.usable = known.usable && ggml_backend_dev_supports_op(device, op); }
             ggml_free(ctx);
         }
         formats.push_back(known);
-        if (known.usable) { largest_expert = std::max(largest_expert, expert_bytes(up_type_, down_type_)); }
+        if (known.usable) { largest_expert = std::max(largest_expert, expert_bytes(up_type_, gate_type_, down_type_)); }
         return formats.back();
     }
     // The fused operation where the device has it, else the same math from plain operations.
@@ -286,7 +291,7 @@ struct lane {
             const lane_expert & expert = experts[first + i];
             rows += expert.rows.size();
             ggml_tensor * up = ggml_new_tensor_2d(ctx, up_type, latent, hidden);
-            ggml_tensor * gate = ggml_new_tensor_2d(ctx, up_type, latent, hidden);
+            ggml_tensor * gate = ggml_new_tensor_2d(ctx, gate_type, latent, hidden);
             ggml_tensor * down = ggml_new_tensor_2d(ctx, down_type, hidden, latent);
             place_weights(up, expert.role[0], scratch);
             place_weights(gate, expert.role[1], scratch);
@@ -342,7 +347,7 @@ struct lane {
         // Pipeline compilation belongs to request time, not the steady per-route fit. The cached format's
         // dimensions, activation and exact row count each omit their first successful graph only.
         auto & known = *std::find_if(formats.begin(), formats.end(), [&](const known_format & f) {
-            return f.up == up_type && f.down == down_type;
+            return f.up == up_type && f.gate == gate_type && f.down == down_type;
         });
         size_t new_shapes = 0;
         for (size_t i = 0; i < count; ++i) {
@@ -356,9 +361,10 @@ struct lane {
                 stats.host_fit_experts += 1; stats.host_fit_routes += r; stats.host_fit_routes_sq += r * r;
             }
         } else {
-            std::fprintf(stderr, "[graph_lane] event=calibration_cold up=%s down=%s latent=%d hidden=%d "
+            std::fprintf(stderr, "[graph_lane] event=calibration_cold up=%s gate=%s down=%s latent=%d hidden=%d "
                 "activation=%d new_shapes=%zu experts=%zu routes=%llu compute_us=%.3f\n", ggml_type_name(up_type),
-                ggml_type_name(down_type), latent, hidden, activation.kind, new_shapes, count, (unsigned long long) rows, compute_us);
+                ggml_type_name(gate_type), ggml_type_name(down_type), latent, hidden, activation.kind, new_shapes, count,
+                (unsigned long long) rows, compute_us);
         }
         stats.engine_overhead_us += fill_us + add_us;
         stats.ssd_transient_experts += count;
@@ -557,7 +563,7 @@ void prefill_lane_info(void * context, ssd_vram_prefill_lane * out) {
 int prefill_seed_routes(void *, const int32_t *, int, char *, size_t) { return 0; }
 int prefill_seed_host(void *, int32_t, const void *, const void *, const void *, char *, size_t) { return 0; }
 int prefill_seed_wait(void *, int32_t, char *, size_t) { return 0; }
-const ssd_vram_prefill_api prefill_table = { 10, sizeof(ssd_vram_prefill_api), prefill_prepare, prefill_transient_available, prefill_launch,
+const ssd_vram_prefill_api prefill_table = { 11, sizeof(ssd_vram_prefill_api), prefill_prepare, prefill_transient_available, prefill_launch,
     prefill_finish, tier_cancel, prefill_cold_active, prefill_admit_cold, prefill_lane_info,
     prefill_seed_routes, prefill_seed_host, prefill_seed_wait };
 
@@ -579,7 +585,7 @@ int elastic_preload(void *, const ssd_vram_request *, const void *, const void *
     *copied = 0;
     return 0;
 }
-const ssd_vram_elastic_api elastic_table = { 5, sizeof(ssd_vram_elastic_api), elastic_phase_complete, elastic_reserve_accumulate,
+const ssd_vram_elastic_api elastic_table = { 6, sizeof(ssd_vram_elastic_api), elastic_phase_complete, elastic_reserve_accumulate,
     elastic_reserve, elastic_preload_slots, elastic_preload };
 
 int host_available(void *) { return 0; }

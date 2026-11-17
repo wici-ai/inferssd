@@ -115,7 +115,7 @@ struct tier {
     // bytes and its decode engine. A slot holds an expert of any of them: stride is the largest one's. layer_format:
     // a layer ID's format; cur: the format of the layer being prepared, which its jobs on the worker run with.
     // payload: a role's logical bytes; role_bytes: the role as a slot lays it out, rounded up to 4 KiB.
-    struct expert_format { int weight_type=-1,down_type=-1; size_t role_bytes[3]={},payload[3]={},bytes=0; void * engine=nullptr; };
+    struct expert_format { int type[3]={-1,-1,-1}; size_t role_bytes[3]={},payload[3]={},bytes=0; void * engine=nullptr; };
     std::vector<expert_format> formats;std::vector<int> layer_format;size_t cur=0,stride=0;int declared_layers=0;
     // Per format and role (3 * format + role): the bytes the format's requests name the role by, set once by the first
     // (0 before one does). The sink's thread sets it; the upload threads read it for the copies of that format's
@@ -488,10 +488,15 @@ struct tier {
     const expert_format & largest() const{
         return *std::max_element(formats.begin(),formats.end(),[](const expert_format & a,const expert_format & b){return a.bytes<b.bytes;});
     }
-    // "up/down" of every format, in declaration order (receipts)
+    // "up/down" of every format, "up/gate/down" where gate's type is not up's, in declaration order (receipts)
+    static std::string format_name(const expert_format & x){
+        std::string s=ggml_type_name(ggml_type(x.type[0]));
+        if(x.type[1]!=x.type[0])s+=std::string("/")+ggml_type_name(ggml_type(x.type[1]));
+        return s+"/"+ggml_type_name(ggml_type(x.type[2]));
+    }
     std::string format_names() const{
         std::string s;
-        for(const auto & x:formats)s+=std::string(s.empty()?"":",")+ggml_type_name(ggml_type(x.weight_type))+"/"+ggml_type_name(ggml_type(x.down_type));
+        for(const auto & x:formats)s+=std::string(s.empty()?"":",")+format_name(x);
         return s;
     }
     // An expert's three roles at `base`, laid out as its format's.
@@ -1703,25 +1708,36 @@ struct tier {
         if(cudaPointerGetAttributes(&attr,pointer)!=cudaSuccess){(void)cudaGetLastError();return false;}
         return attr.type==cudaMemoryTypeHost;
     }
-    // Entry i of a declaration's layer list: its layer's types, or the call's where the declaration lists none.
-    static int declared_weight(const ssd_vram_expert_format & f,int i){return f.layer_weight_types?f.layer_weight_types[i]:f.weight_type;}
-    static int declared_down(const ssd_vram_expert_format & f,int i){return f.layer_down_types?f.layer_down_types[i]:f.down_type;}
+    // Entry i of a declaration's layer list: its layer's role's type, or the call's where the declaration lists none.
+    static int declared_type(const ssd_vram_expert_format & f,int i,int role){
+        const int32_t * listed=role==0?f.layer_up_types:role==1?f.layer_gate_types:f.layer_down_types;
+        return listed?listed[i]:role==0?f.up_type:role==1?f.gate_type:f.down_type;
+    }
+    static bool same_types(const expert_format & x,const ssd_vram_expert_format & f,int i){
+        return x.type[0]==declared_type(f,i,0) && x.type[1]==declared_type(f,i,1) && x.type[2]==declared_type(f,i,2);
+    }
     // The first call's declaration: the formats, in the order their layers come, each its role bytes as the pack pads
     // them, and every listed layer's. Slots take the largest expert.
     void declare(const ssd_vram_expert_format & f){
         std::vector<expert_format> found;std::vector<int> map(SSD_VRAM_MAX_LAYERS,-1);
         for(int i=0;i<f.n_layers;++i){
-            const int layer=f.layers[i],w=declared_weight(f,i),d=declared_down(f,i);
+            const int layer=f.layers[i];
             if(layer<0 || layer>=SSD_VRAM_MAX_LAYERS || map[size_t(layer)]>=0)throw std::runtime_error("invalid VRAM expert layer list");
-            if(w<0 || w>=int(GGML_TYPE_COUNT) || d<0 || d>=int(GGML_TYPE_COUNT) || ggml_blck_size(ggml_type(w))<=0 ||
-                    ggml_blck_size(ggml_type(d))<=0 || f.latent%ggml_blck_size(ggml_type(w)) || f.hidden%ggml_blck_size(ggml_type(d)))
-                throw std::runtime_error("invalid VRAM expert format of layer "+std::to_string(layer));
-            size_t k=0;while(k<found.size() && !(found[k].weight_type==w && found[k].down_type==d))++k;
+            for(int r=0;r<3;++r){
+                // up and gate rows span the latent, down rows the hidden
+                const int t=declared_type(f,i,r),columns=r==2?f.hidden:f.latent;
+                if(t<0 || t>=int(GGML_TYPE_COUNT) || ggml_blck_size(ggml_type(t))<=0 || columns%ggml_blck_size(ggml_type(t)))
+                    throw std::runtime_error("invalid VRAM expert format of layer "+std::to_string(layer));
+            }
+            size_t k=0;while(k<found.size() && !same_types(found[k],f,i))++k;
             if(k==found.size()){
-                expert_format x;x.weight_type=w;x.down_type=d;
-                x.payload[0]=x.payload[1]=ggml_row_size(ggml_type(w),f.latent)*size_t(f.hidden);
-                x.payload[2]=ggml_row_size(ggml_type(d),f.hidden)*size_t(f.latent);
-                for(int r=0;r<3;++r)x.role_bytes[r]=(x.payload[r]+4095)&~size_t(4095);
+                expert_format x;
+                for(int r=0;r<3;++r){
+                    x.type[r]=declared_type(f,i,r);
+                    x.payload[r]=r==2?ggml_row_size(ggml_type(x.type[r]),f.hidden)*size_t(f.latent):
+                        ggml_row_size(ggml_type(x.type[r]),f.latent)*size_t(f.hidden);
+                    x.role_bytes[r]=(x.payload[r]+4095)&~size_t(4095);
+                }
                 x.bytes=x.role_bytes[0]+x.role_bytes[1]+x.role_bytes[2];
                 found.push_back(x);
             }
@@ -1738,8 +1754,9 @@ struct tier {
     void adopt(const ssd_vram_request & r,const ssd_vram_expert_format & f){
         if(!f.layers || f.n_layers<=0 || f.n_layers>SSD_VRAM_MAX_LAYERS || f.n_experts<=0 || f.n_experts>65536 ||
                 f.latent<=0 || f.hidden<=0 || f.latent>16384 || f.hidden>16384 ||
-                f.weight_type<0 || f.weight_type>=int(GGML_TYPE_COUNT) || f.down_type<0 || f.down_type>=int(GGML_TYPE_COUNT) ||
-                (!f.layer_weight_types)!=(!f.layer_down_types))
+                f.up_type<0 || f.up_type>=int(GGML_TYPE_COUNT) || f.gate_type<0 || f.gate_type>=int(GGML_TYPE_COUNT) ||
+                f.down_type<0 || f.down_type>=int(GGML_TYPE_COUNT) ||
+                (!f.layer_up_types)!=(!f.layer_down_types) || (!f.layer_gate_types)!=(!f.layer_down_types))
             throw std::runtime_error("invalid VRAM expert format");
         if(formats.empty())declare(f);
         else{
@@ -1748,13 +1765,13 @@ struct tier {
             bool same=f.n_layers==declared_layers;
             for(int i=0;same && i<f.n_layers;++i){
                 const expert_format * x=format_of(f.layers[i]);
-                same=x && x->weight_type==declared_weight(f,i) && x->down_type==declared_down(f,i);
+                same=x && same_types(*x,f,i);
             }
             if(!same)throw std::runtime_error("VRAM expert format changed");
         }
         const expert_format * x=format_of(r.layer);
         if(!x)throw std::runtime_error("VRAM expert layer "+std::to_string(r.layer)+" is not in the declared layer list");
-        if(x->weight_type!=f.weight_type || x->down_type!=f.down_type)
+        if(x->type[0]!=f.up_type || x->type[1]!=f.gate_type || x->type[2]!=f.down_type)
             throw std::runtime_error("VRAM expert format of layer "+std::to_string(r.layer)+" differs from its declaration");
         cur=size_t(x-formats.data());
     }
@@ -1768,14 +1785,14 @@ struct tier {
             // the generic engine serves every format the CUDA backend has a matrix-vector kernel for, and refuses the
             // others when it is created
             format_api=ssd_vram_generic_format_compute_get_api();
-            if(!format_api || format_api->version!=4 || format_api->size!=sizeof(*format_api) || !format_api->create ||
+            if(!format_api || format_api->version!=5 || format_api->size!=sizeof(*format_api) || !format_api->create ||
                     !format_api->destroy || !format_api->compute || !format_api->device_scratch_bytes || !format_api->host_scratch_bytes ||
                     !format_api->launch || !format_api->host_rows)
                 throw std::runtime_error("explicit-format VRAM engine ABI mismatch");
             for(auto & x:formats){
                 if(x.engine)continue;
                 char error[512]={};
-                x.engine=format_api->create(device,latent,hidden,16,x.weight_type,x.down_type,error,sizeof(error));
+                x.engine=format_api->create(device,latent,hidden,16,x.type[0],x.type[1],x.type[2],error,sizeof(error));
                 if(!x.engine)throw std::runtime_error(error);
             }
             format_mode=true;
@@ -1785,16 +1802,16 @@ struct tier {
             // The batched prefill engine, one for all the formats. Formats the CUDA backend's products do not serve keep
             // the CPU for their grouped prefill.
             group_api=ssd_vram_group_compute_get_api();
-            if(!group_api || group_api->version!=3 || group_api->size!=sizeof(*group_api) || !group_api->create ||
+            if(!group_api || group_api->version!=4 || group_api->size!=sizeof(*group_api) || !group_api->create ||
                     !group_api->reserve || !group_api->release || !group_api->begin_layer || !group_api->compute ||
                     !group_api->finish_layer || !group_api->input_rows || !group_api->geometry || !group_api->destroy ||
                     !group_api->device_bytes || !group_api->host_bytes)
                 throw std::runtime_error("grouped VRAM engine ABI mismatch");
-            std::vector<int32_t> weights,downs;
-            for(const auto & x:formats){weights.push_back(x.weight_type);downs.push_back(x.down_type);}
+            std::vector<int32_t> ups,gates,downs;
+            for(const auto & x:formats){ups.push_back(x.type[0]);gates.push_back(x.type[1]);downs.push_back(x.type[2]);}
             char error[512]={};
             group_fixed_bytes=0; // a new engine, maybe of another format: nothing measured it yet
-            group=group_api->create(device,latent,hidden,int(formats.size()),weights.data(),downs.data(),error,sizeof(error));
+            group=group_api->create(device,latent,hidden,int(formats.size()),ups.data(),gates.data(),downs.data(),error,sizeof(error));
             if(!group)std::fprintf(stderr,"[ssd_vram_prefill_engine] status=unavailable format=%s error=%s fallback=cpu\n",
                 format_names().c_str(),error);
             publish_engine_held();
@@ -2659,14 +2676,14 @@ extern "C" const ssd_vram_deferred_api * ssd_vram_deferred_get_api(){
     static const ssd_vram_deferred_api api={3,sizeof(ssd_vram_deferred_api),deferred_admit,deferred_collect,deferred_wait};return &api;
 }
 extern "C" const ssd_vram_elastic_api * ssd_vram_elastic_get_api(){
-    static const ssd_vram_elastic_api api={5,sizeof(ssd_vram_elastic_api),elastic_phase_complete,elastic_reserve_accumulate,elastic_reserve,
+    static const ssd_vram_elastic_api api={6,sizeof(ssd_vram_elastic_api),elastic_phase_complete,elastic_reserve_accumulate,elastic_reserve,
         elastic_preload_slots,elastic_preload};return &api;
 }
 extern "C" const ssd_vram_format_api * ssd_vram_format_get_api(){
-    static const ssd_vram_format_api api={2,sizeof(ssd_vram_format_api),format_prepare,format_launch};return &api;
+    static const ssd_vram_format_api api={3,sizeof(ssd_vram_format_api),format_prepare,format_launch};return &api;
 }
 extern "C" const ssd_vram_prefill_api * ssd_vram_prefill_get_api(){
-    static const ssd_vram_prefill_api api={10,sizeof(ssd_vram_prefill_api),prefill_prepare,
+    static const ssd_vram_prefill_api api={11,sizeof(ssd_vram_prefill_api),prefill_prepare,
         prefill_transient_available,prefill_launch,prefill_finish,prefill_cancel,
         prefill_cold_admission_active,prefill_admit_cold,prefill_lane,
         prefill_seed_routes,prefill_seed_host,prefill_seed_wait};return &api;

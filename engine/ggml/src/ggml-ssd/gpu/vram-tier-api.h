@@ -81,7 +81,7 @@ struct ssd_vram_residency_api {
 // prepare and launch (with the activation) instead of ABI 2 launch; admit,
 // finish, cancel, begin and the residency ABI are shared. The declaration (the
 // geometry, the layer list and each layer's types) must stay the same for the
-// lifetime of a context; weight_type and down_type are the call's layer's.
+// lifetime of a context; up_type, gate_type and down_type are the call's layer's.
 enum ssd_vram_activation_kind {
     SSD_VRAM_ACTIVATION_SITU         = 0, // same values as ssd_cpu_sink_activation_kind
     SSD_VRAM_ACTIVATION_SWIGLU_CLAMP = 1,
@@ -93,19 +93,21 @@ struct ssd_vram_activation {
 };
 struct ssd_vram_expert_format {
     int32_t latent, hidden;   // up/gate columns and rows
-    int32_t weight_type;      // ggml_type of up and gate of the call's layer
+    int32_t up_type;          // ggml_type of up of the call's layer
+    int32_t gate_type;        // ggml_type of gate of the call's layer (a quantization may give it another than up's)
     int32_t down_type;        // ggml_type of down of the call's layer
     int32_t n_experts;        // routed experts per layer (tensor ne[2])
     int32_t n_layers;         // entries in layers
     const int32_t * layers;   // model layer IDs, allocation priority order
-    // Format API 2, prefill API 8, elastic API 4: each listed layer's up/gate and down types, entry for entry with
-    // layers, or both null when every layer has weight_type and down_type. Every layer has latent, hidden and
-    // n_experts.
-    const int32_t * layer_weight_types;
+    // Format API 3, prefill API 11, elastic API 6: each listed layer's up, gate and down types, entry for entry with
+    // layers, or all three null when every layer has up_type, gate_type and down_type. Every layer has latent, hidden
+    // and n_experts.
+    const int32_t * layer_up_types;
+    const int32_t * layer_gate_types;
     const int32_t * layer_down_types;
 };
 struct ssd_vram_format_api {
-    uint32_t version, size;   // 2
+    uint32_t version, size;   // 3
     int (*prepare)(void * context, const struct ssd_vram_request * requests, int count,
                    const struct ssd_vram_expert_format * format, int * slots,
                    char * error, size_t error_size);
@@ -219,7 +221,7 @@ struct ssd_vram_prefill_launch {
 // first victims unless decode reuses them; the path never evicts an existing
 // decode resident.
 struct ssd_vram_prefill_api {
-    uint32_t version, size;   // 10
+    uint32_t version, size;   // 11
     // requests contains the distinct expert union for one layer. slots receives
     // -1 for CPU work or an opaque resident slot for GPU work. The tier must
     // already hold the same explicit format from an earlier decode phase.
@@ -294,7 +296,7 @@ struct ssd_vram_deferred_api {
 // reserve; phase_complete(true) runs only after the decode graph is reserved
 // and grows best-effort into currently free device memory.
 struct ssd_vram_elastic_api {
-    uint32_t version, size;   // 5 (preload)
+    uint32_t version, size;   // 6 (preload)
     int (*phase_complete)(void * context, int decode, char * error, size_t error_size);
     // Reserve the actual grouped-prefill accumulator before starting streamed I/O.
     int (*reserve_accumulate)(void * context, int tokens, char * error, size_t error_size);

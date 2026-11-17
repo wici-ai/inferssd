@@ -65,20 +65,26 @@ struct sink_vram {
     // and, once every one has the expert types recorded at load (record_expert_types), each one's types; without them
     // a call's types stand for every layer.
     struct layer_list {
-        std::vector<int32_t> ids, up_types, down_types;
+        std::vector<int32_t> ids, up_types, gate_types, down_types;
         explicit layer_list(const sink_cache & cache) {
             bool typed = true;
             ids.reserve(cache.layers.size());
-            for (const auto & l : cache.layers) { ids.push_back(l.id); typed = typed && l.up_type >= 0 && l.down_type >= 0; }
+            for (const auto & l : cache.layers) {
+                ids.push_back(l.id);
+                typed = typed && l.up_type >= 0 && l.gate_type >= 0 && l.down_type >= 0;
+            }
             for (const auto & l : cache.layers) {
                 if (!typed) { break; }
-                up_types.push_back(l.up_type); down_types.push_back(l.down_type);
+                up_types.push_back(l.up_type); gate_types.push_back(l.gate_type); down_types.push_back(l.down_type);
             }
         }
         // the declaration with the call's layer's tensors
-        ssd_vram_expert_format format(const ggml_tensor * up, const ggml_tensor * down, int latent, int hidden) const {
-            return { latent, hidden, int32_t(up->type), int32_t(down->type), int32_t(up->ne[2]), int32_t(ids.size()),
-                ids.data(), up_types.empty() ? nullptr : up_types.data(), down_types.empty() ? nullptr : down_types.data() };
+        ssd_vram_expert_format format(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down,
+                int latent, int hidden) const {
+            const bool typed = !up_types.empty();
+            return { latent, hidden, int32_t(up->type), int32_t(gate->type), int32_t(down->type), int32_t(up->ne[2]),
+                int32_t(ids.size()), ids.data(), typed ? up_types.data() : nullptr, typed ? gate_types.data() : nullptr,
+                typed ? down_types.data() : nullptr };
         }
     };
 
@@ -133,13 +139,13 @@ struct sink_vram {
         }
         if (configuration.gpu.format) {
             format = configuration.gpu.format;
-            if (!format || format->version != 2 || format->size != sizeof(*format) || !format->prepare || !format->launch) {
+            if (!format || format->version != 3 || format->size != sizeof(*format) || !format->prepare || !format->launch) {
                 throw std::runtime_error("GPU tier explicit-format ABI mismatch");
             }
         }
         if (prefill_enabled) {
             prefill_api = configuration.gpu.prefill;
-            if (!prefill_api || prefill_api->version != 10 || prefill_api->size != sizeof(*prefill_api) ||
+            if (!prefill_api || prefill_api->version != 11 || prefill_api->size != sizeof(*prefill_api) ||
                     !prefill_api->prepare || !prefill_api->transient_available || !prefill_api->launch ||
                     !prefill_api->finish || !prefill_api->cancel || !prefill_api->cold_admission_active ||
                     !prefill_api->admit_cold || !prefill_api->lane || !prefill_api->seed_routes ||
@@ -150,7 +156,7 @@ struct sink_vram {
         }
         if (configuration.gpu.elastic) {
             elastic = configuration.gpu.elastic;
-            if (!elastic || elastic->version != 5 || elastic->size != sizeof(*elastic) ||
+            if (!elastic || elastic->version != 6 || elastic->size != sizeof(*elastic) ||
                     !elastic->phase_complete || !elastic->reserve_accumulate || !elastic->reserve ||
                     !elastic->preload_slots || !elastic->preload) {
                 throw std::runtime_error("GPU tier elastic lifecycle ABI mismatch");
@@ -284,7 +290,7 @@ struct sink_vram {
         r.layer = layer; r.weight = 1.0f;
         const ggml_tensor * tensors[] = { up, gate, down };
         for (int role = 0; role < 3; ++role) { r.role[role].bytes = tensors[role]->nb[2]; }
-        const ssd_vram_expert_format f = layers.format(up, down, int32_t(up->ne[0]), int32_t(up->ne[1]));
+        const ssd_vram_expert_format f = layers.format(up, gate, down, int32_t(up->ne[0]), int32_t(up->ne[1]));
         char error[512] = {};
         check(elastic->reserve(context, &r, &f, error, sizeof(error)), error);
     }
@@ -318,8 +324,9 @@ struct sink_vram {
         check(elastic->phase_complete(context, decode ? 1 : 0, error, sizeof(error)), error);
     }
     // Expert geometry is supplied through the explicit-format extension.
-    void prepare(std::vector<sink_request> & source, const ggml_tensor * up, const ggml_tensor * down,
-                 int latent, int hidden, const layer_list & layers, sink_cache & cache, bool unweighted = false) {
+    void prepare(std::vector<sink_request> & source, const ggml_tensor * up, const ggml_tensor * gate,
+                 const ggml_tensor * down, int latent, int hidden, const layer_list & layers, sink_cache & cache,
+                 bool unweighted = false) {
         hits = 0;
         if (!context || prefill_only) { return; }
         place_threads();
@@ -347,7 +354,7 @@ struct sink_vram {
         char error[512] = {};
         int result;
         {
-            const ssd_vram_expert_format f = layers.format(up, down, latent, hidden);
+            const ssd_vram_expert_format f = layers.format(up, gate, down, latent, hidden);
             result = format->prepare(context, requests.data(), int(requests.size()), &f, slots.data(), error, sizeof(error));
         }
         format_path = true;
@@ -465,8 +472,8 @@ struct sink_vram {
     }
     // The layer's grouped prefill on the tier: every format the tier has a lane for (it initializes the format on a cold
     // prefill, its decode arena deferred to the first decode token).
-    int prepare_prefill(std::vector<sink_request> & source, const ggml_tensor * up, const ggml_tensor * down,
-            int latent, int hidden, const layer_list & layers, bool post_norm) {
+    int prepare_prefill(std::vector<sink_request> & source, const ggml_tensor * up, const ggml_tensor * gate,
+            const ggml_tensor * down, int latent, int hidden, const layer_list & layers, bool post_norm) {
         hits = 0;
         prefill_plan.valid = false;
         learning.cpu_fit = {};
@@ -489,7 +496,7 @@ struct sink_vram {
                                 k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns, k.inode_hi };
             }
         }
-        const ssd_vram_expert_format f = layers.format(up, down, latent, hidden);
+        const ssd_vram_expert_format f = layers.format(up, gate, down, latent, hidden);
         char error[512] = {};
         // the pass's routes of each request, so that the prepare seeds the layer's empty slots with the experts the
         // pass routes most (ssd_vram_prefill_api v10)
