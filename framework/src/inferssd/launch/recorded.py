@@ -246,7 +246,7 @@ class RecordedArtifacts:
             )
         if name == "model_facts" and name not in self.host:
             # Read from the model's own headers, as the alias index is.
-            headers = [gguf_header.read(path) for path in args]
+            headers = gguf_header.without_nextn([gguf_header.read(path) for path in args])
             if headers[0].kv.get("general.architecture") == ram.ARCHITECTURE:
                 return Reply(ram.facts(headers))
             model = strategy_inputs.facts_from_headers(headers)

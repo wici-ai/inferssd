@@ -29,7 +29,7 @@ irm https://github.com/wici-ai/inferssd/releases/latest/download/install.ps1 | i
 
 A numbered release includes prebuilt [macOS](macos-package.md) and [Windows](windows-package.md)
 packages from the same tagged commit. Its installers download that version without developer
-tools on Apple Silicon macOS 15 or later and Windows 11 x64. Linux still builds from source.
+tools on Apple Silicon macOS 15 or later and Windows 10 or 11 x64. Linux still builds from source.
 The installer on `main` installs the latest published package:
 
 ```sh
@@ -159,7 +159,7 @@ Use the same Metal build and point `-m` at the first Muse GGUF shard; the launch
 
 ## Windows
 
-The prebuilt packages require Windows x64 build 22000 or later and GPU drivers for GPU
+The prebuilt packages run on Windows 10 and later x64 and use GPU drivers for GPU
 inference: an NVIDIA GPU runs the CUDA package, any other GPU the Vulkan package; CPU inference
 is also available. It runs the same `inferssd profile`, `inferssd cli` and
 `inferssd serve` as the other platforms. The desktop app uses the real executable at

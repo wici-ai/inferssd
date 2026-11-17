@@ -430,7 +430,10 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         // 42 is reserved; support for the owned F8 block format was removed.
-        GGML_TYPE_COUNT   = 43,
+        // 43 is MXFP8 as the DeepSeek-V4.1 GGUFs published by unsloth write their Engram tables (the
+        // deepseek41 llama.cpp pull request 30817); upstream llama.cpp later gave 43 to F8_E4M3.
+        GGML_TYPE_MXFP8   = 43, // MXFP8 (32 E4M3 values, one E8M0 scale), read by GET_ROWS only
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision

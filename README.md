@@ -91,7 +91,7 @@ Install on Apple Silicon macOS or on Linux with an NVIDIA GPU:
 curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 ```
 
-Each numbered release includes checked prebuilt packages for Apple Silicon macOS 15 or later and Windows 11 x64, built from the same tagged commit. Its installers download that exact release without developer tools; see [the macOS package](docs/macos-package.md) and [Windows package](docs/windows-package.md). Linux builds that release from source for the machine's CPU and GPU, which takes about 2 to 12 minutes. The installer on `main` downloads the latest published package:
+Each numbered release includes checked prebuilt packages for Apple Silicon macOS 15 or later and Windows 10 or 11 x64, built from the same tagged commit. Its installers download that exact release without developer tools; see [the macOS package](docs/macos-package.md) and [Windows package](docs/windows-package.md). Linux builds that release from source for the machine's CPU and GPU, which takes about 2 to 12 minutes. The installer on `main` downloads the latest published package:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh

@@ -14,7 +14,7 @@ preserves its source attribution and license files.
 | Growable buffers | CPU, CUDA and Metal buffer types whose buffers reserve their whole address range and hold memory for a prefix of it, grown and shrunk at its end (`ggml_backend_dev_buffer_type_growable`, `ggml_backend_buffer_set_committed`), for the KV cache that allocates its cells as they are used: CUDA maps device memory with VMM, admitted as every device allocation is (below), Metal wraps the prefix in one Metal buffer, Vulkan binds memory to a sparse residency buffer on a queue that does sparse binding, the CPU leaves the pages to be written. Nothing in a buffer moves. Vulkan without sparse residency buffers, CUDA without VMM and the CPU on Windows have none. |
 | Backend operation files | New model operations and narrow native kernel entry points stay with their upstream operation/architecture files. Strict MXFP4 math is compiled separately with contraction and FTZ disabled. |
 | llama context | Runtime assembly, request phases, resource-aware graph reservation and failure recovery. Source, cache and telemetry owners reside in `src/ssd`. |
-| Model loading/mapping | Deferred expert ranges and compact Metal allocations where a GGUF interleaves the dense tensors with experts held elsewhere; under mmap, the tensors copied into a device buffer read with direct I/O into pinned buffers where the files read direct, as without mmap; fixed complete-page advice; read-ahead of the rows a lookup table (Engram, PLE) is about to read, on every OS; a refusal of GPU weights larger than the device's free memory. Source/range helpers reside in `src/ssd`. |
+| Model loading/mapping | Deferred expert ranges and compact Metal allocations where a GGUF interleaves the dense tensors with experts held elsewhere; under mmap, the tensors copied into a device buffer read with direct I/O into pinned buffers where the files read direct, as without mmap; fixed complete-page advice; read-ahead of the rows a lookup table (Engram, PLE) is about to read, on every OS; a refusal of GPU weights larger than the device's free memory; NextN (multi-token prediction) blocks, which the engine does not run, are not part of the model: `n_layer` counts the model's blocks, per-block metadata covers all `n_block()` blocks of the file, and a model loaded to run forgets the NextN blocks' tensors. Source/range helpers reside in `src/ssd`. |
 | Model/architecture support | DeepSeek V4.1, Engram, Muse and Qwen3.8-Flash-Next (qwen4exp) architecture, metadata, graph and KV operations follow upstream model/op organization. They are intentional model exceptions. |
 | Common/server | CLI dispatch, rendering/parser hooks, prompt-cache/checkpoint and lifecycle calls. Owned implementations reside in `common/inferssd` and `tools/server/inferssd`. |
 | State serialization | Virtual/C API entry points call positional/range codecs under `src/inferssd`. |
@@ -165,8 +165,8 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-ext.h` | 16 | 0 |
 | `src/llama-graph.cpp` | 765 | 50 |
 | `src/llama-graph.h` | 170 | 5 |
-| `src/llama-hparams.cpp` | 21 | 0 |
-| `src/llama-hparams.h` | 73 | 1 |
+| `src/llama-hparams.cpp` | 25 | 0 |
+| `src/llama-hparams.h` | 78 | 3 |
 | `src/llama-impl.h` | 35 | 0 |
 | `src/llama-kv-cache-iswa.cpp` | 42 | 4 |
 | `src/llama-kv-cache-iswa.h` | 48 | 0 |
@@ -181,17 +181,21 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-memory.h` | 96 | 0 |
 | `src/llama-mmap.cpp` | 299 | 10 |
 | `src/llama-mmap.h` | 16 | 0 |
-| `src/llama-model-loader.cpp` | 165 | 11 |
-| `src/llama-model-loader.h` | 41 | 0 |
-| `src/llama-model-saver.cpp` | 9 | 2 |
-| `src/llama-model.cpp` | 1090 | 39 |
-| `src/llama-model.h` | 107 | 0 |
-| `src/llama-quant.cpp` | 22 | 1 |
+| `src/llama-model-loader.cpp` | 185 | 11 |
+| `src/llama-model-loader.h` | 45 | 0 |
+| `src/llama-model-saver.cpp` | 9 | 3 |
+| `src/llama-model.cpp` | 1211 | 260 |
+| `src/llama-model.h` | 108 | 0 |
+| `src/llama-quant.cpp` | 23 | 2 |
 | `src/llama-sampler.cpp` | 1 | 0 |
 | `src/llama-vocab.cpp` | 67 | 8 |
 | `src/llama-vocab.h` | 5 | 0 |
-| `src/llama.cpp` | 4 | 1 |
-| `src/models/deepseek2.cpp` | 7 | 2 |
+| `src/llama.cpp` | 5 | 1 |
+| `src/models/bailingmoe2.cpp` | 2 | 3 |
+| `src/models/deepseek2.cpp` | 9 | 5 |
+| `src/models/exaone-moe.cpp` | 2 | 3 |
+| `src/models/glm4-moe.cpp` | 2 | 5 |
+| `src/models/glm4.cpp` | 2 | 5 |
 | `src/models/kimi-linear.cpp` | 2 | 2 |
 | `src/models/models.h` | 165 | 0 |
 | `src/models/qwen35.cpp` | 2 | 2 |
@@ -208,5 +212,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server.cpp` | 1 | 0 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 19984 added, 6009 removed across 159 upstream paths.
+Total: 20151 added, 6253 removed across 163 upstream paths.
 <!-- END UPSTREAM INVENTORY -->

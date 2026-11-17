@@ -27,6 +27,8 @@ def windows_install(tmp_path):
     source.write_text(
         "using System; using System.IO; class Command { static int Main(string[] args) {"
         'if (Environment.GetEnvironmentVariable("FAIL_PACKAGE") == "1") return 9;'
+        'var status = Environment.GetEnvironmentVariable("LOADER_STATUS");'
+        "if (status != null) return unchecked((int)uint.Parse(status));"
         'if (args.Length > 0 && args[0] == "--ssd-schema" && '
         'Environment.GetEnvironmentVariable("FAIL_NATIVE") == "1") return 8;'
         'if (args.Length > 0 && args[0] == "--version") '
@@ -41,7 +43,16 @@ def windows_install(tmp_path):
     # The installation itself cannot find developer tools or an external Python.
     env["PATH"] = str(Path(os.environ["WINDIR"]) / "System32")
 
-    def make_package(build, *, member=None, checksum=None, backend="vulkan", driver="576.57"):
+    def make_package(
+        build,
+        *,
+        member=None,
+        checksum=None,
+        backend="vulkan",
+        driver="576.57",
+        native=None,
+        minimum_windows="10.0.10240",
+    ):
         name = f"inferssd-261109.{build}.aaaaaaa-windows-x64-{backend}"
         archive = tmp_path / (name + ".zip")
         metadata = {
@@ -66,13 +77,14 @@ def windows_install(tmp_path):
             "name": name,
             "file": archive.name,
             "url": archive.as_uri(),
-            "minimum_windows": "10.0.22000",
+            "minimum_windows": minimum_windows,
             "sha256": checksum or hashlib.sha256(archive.read_bytes()).hexdigest(),
             "size": archive.stat().st_size,
             **metadata,
         }
         if backend == "cuda" and driver:
             manifest["minimum_nvidia_driver"] = driver
+        manifest.update(native or {})
         listing = tmp_path / (name + ".json")
         listing.write_text(json.dumps(manifest))
         return listing, name
@@ -230,6 +242,31 @@ def test_installs_the_cuda_package_a_package_list_names(windows_install):
     assert (home / "current" / "bin" / "inferssd-server.exe").is_file()
 
 
+def test_installs_a_cuda_package_with_its_native_code_driver(windows_install):
+    home, _, _, make_package, run = windows_install
+    native = {
+        "minimum_nvidia_driver_native": "528.33",
+        "native_compute_capabilities": ["8.6", "8.9", "12.0"],
+    }
+    listing, _ = make_package(405, backend="cuda", native=native)
+    result = run(listing)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (home / "current" / "bin" / "inferssd-server.exe").is_file()
+
+
+@pytest.mark.parametrize(
+    "native",
+    [{"minimum_nvidia_driver_native": "older"}, {"native_compute_capabilities": ["8.6", "sm_89"]}],
+)
+def test_a_cuda_package_with_malformed_native_code_fields_is_refused(windows_install, native):
+    home, _, _, make_package, run = windows_install
+    listing, _ = make_package(406, backend="cuda", native=native)
+    result = run(listing)
+    assert result.returncode != 0
+    assert "invalid Windows package metadata" in result.stdout + result.stderr
+    assert not (home / "current").exists()
+
+
 @pytest.mark.parametrize("driver", [None, "newest"])
 def test_a_cuda_package_without_its_driver_minimum_is_refused(windows_install, driver):
     home, _, _, make_package, run = windows_install
@@ -237,4 +274,24 @@ def test_a_cuda_package_without_its_driver_minimum_is_refused(windows_install, d
     result = run(listing)
     assert result.returncode != 0
     assert "invalid Windows package metadata" in result.stdout + result.stderr
+    assert not (home / "current").exists()
+
+
+def test_no_windows_build_is_refused_by_its_number(windows_install):
+    home, _, _, make_package, run = windows_install
+    listing, _ = make_package(407, minimum_windows="10.0.99999")
+    result = run(listing)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (home / "current" / "bin" / "inferssd.exe").is_file()
+
+
+# The status Windows' loader ends a process with when it cannot resolve an import: a function
+# (0xC0000139) or a library (0xC0000135).
+@pytest.mark.parametrize("status", [0xC0000139, 0xC0000135])
+def test_a_package_windows_cannot_start_says_why(windows_install, status):
+    home, _, _, make_package, run = windows_install
+    listing, _ = make_package(408)
+    result = run(listing, LOADER_STATUS=str(status))
+    assert result.returncode != 0
+    assert "lacks a system function or library this package needs" in result.stdout + result.stderr
     assert not (home / "current").exists()

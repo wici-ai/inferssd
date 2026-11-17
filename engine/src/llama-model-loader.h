@@ -216,6 +216,10 @@ struct llama_model_loader {
 
     void done_getting_tensors() const;
 
+    // Forget the tensors of blocks [first, first + count), as if the file had none: the counts, the
+    // mappings and every lookup exclude them from then on. Returns their number and bytes.
+    std::pair<size_t, size_t> drop_blocks(uint32_t first, uint32_t count);
+
     void build_expert_tensor_index(const llama_hparams & hparams);
     bool should_defer_expert_mmaps() const;
     void drop_mmap_expert_pages() const;

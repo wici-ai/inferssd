@@ -338,6 +338,25 @@ def test_expert_count_is_read_once_from_the_model(tmp_path):
         m.build_rows([path], {"up"}, None)
 
 
+def test_nextn_block_experts_are_not_indexed(tmp_path):
+    # The engine loads none of a NextN block's tensors: its experts are not the model's.
+    path = tmp_path / "model.gguf"
+    head = "blk.1.ffn_up_exps.weight"
+    tensors = [(EXPERT, (32, 2, 8), 8, 0), (head, (32, 2, 8), 8, 544)]
+    kv = [
+        ("toy.nextn_predict_layers", 4, 1),
+        ("general.architecture", 8, "toy"),
+        ("toy.block_count", 4, 2),
+    ]
+    fixture(path, tensors=tensors, kv=kv)
+    rows, summary = m.build_rows([path], {"up"}, None)
+    assert {row["tensor"] for row in rows} == {EXPERT}
+    assert (summary["expert_tensors"], summary["entries"]) == (1, 8)
+    fixture(path, tensors=tensors, kv=kv[1:])
+    rows, _ = m.build_rows([path], {"up"}, None)
+    assert {row["tensor"] for row in rows} == {EXPERT, head}
+
+
 def test_shards_and_optional_split_metadata_must_agree(tmp_path):
     a, b = (tmp_path / f"model-{i:05d}-of-00002.gguf" for i in (1, 2))
     fixture(a, kv=[("split.no", 2, 0), ("split.count", 2, 2), ("split.tensors.count", 5, 2)])

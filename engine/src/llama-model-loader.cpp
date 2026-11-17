@@ -1387,6 +1387,26 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
     return tensor;
 }
 
+std::pair<size_t, size_t> llama_model_loader::drop_blocks(uint32_t first, uint32_t count) {
+    size_t tensors = 0;
+    size_t bytes   = 0;
+    for (auto it = weights_map.begin(); it != weights_map.end();) {
+        int il = -1;
+        if (sscanf(it->first.c_str(), "blk.%d.", &il) == 1 && il >= 0 &&
+                uint32_t(il) >= first && uint32_t(il) - first < count) {
+            n_elements -= ggml_nelements(it->second.tensor);
+            n_bytes    -= ggml_nbytes(it->second.tensor);
+            bytes      += ggml_nbytes(it->second.tensor);
+            tensors++;
+            it = weights_map.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    n_tensors = (int) weights_map.size();
+    return { tensors, bytes };
+}
+
 void llama_model_loader::done_getting_tensors() const {
     if (n_created != n_tensors) {
         throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));

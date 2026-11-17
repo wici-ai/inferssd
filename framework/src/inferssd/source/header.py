@@ -6,6 +6,7 @@ import glob
 import mmap
 import re
 import struct
+from collections.abc import Mapping, Sequence
 from typing import Any, NamedTuple
 
 from inferssd.source.files import LOCAL_FILES, SourceFiles
@@ -46,6 +47,7 @@ TYPES = {
     40: ("NVFP4", 64, 36),
     41: ("Q1_0", 128, 18),
     42: ("F8_E4M3_B128", 128, 129),
+    43: ("MXFP8", 32, 33),
 }
 SCALARS = {
     0: "B",
@@ -61,6 +63,7 @@ SCALARS = {
     12: "d",
 }
 SHARD = re.compile("(.*)-\\d{5}-of-(\\d{5})\\.gguf$")
+BLOCK = re.compile("^blk\\.(\\d+)\\.")
 
 
 class Tensor(NamedTuple):
@@ -161,6 +164,41 @@ def shards(path: str, *, filesystem: SourceFiles = LOCAL_FILES) -> list[str]:
         if m
         else [path]
     )
+
+
+def nextn_blocks(kv: Mapping[str, Any]) -> range:
+    """The NextN (multi-token prediction) blocks of the model with metadata KV.
+
+    A GGUF counts them in <arch>.block_count, as its last <arch>.nextn_predict_layers blocks.
+    The engine runs none of them and does not load their tensors, so no fact about the model
+    counts them.
+    """
+    arch = kv.get("general.architecture")
+    blocks = kv.get(f"{arch}.block_count")
+    nextn = kv.get(f"{arch}.nextn_predict_layers", 0)
+    if not isinstance(arch, str) or blocks is None or nextn == 0:
+        return range(0)
+    if not all(type(v) is int for v in (blocks, nextn)) or not 0 < nextn < blocks:
+        raise ValueError(f"invalid {arch}.nextn_predict_layers = {nextn!r} for {blocks!r} blocks")
+    return range(blocks - nextn, blocks)
+
+
+def in_blocks(name: str, blocks: range) -> bool:
+    match = BLOCK.match(name)
+    return match is not None and int(match.group(1)) in blocks
+
+
+def without_nextn(headers: Sequence[Header]) -> list[Header]:
+    """HEADERS, the shards of one model in order, as the engine loads it: without NextN blocks."""
+    kv: dict[str, Any] = {}
+    for item in headers:
+        for key, value in item.kv.items():
+            kv.setdefault(key, value)
+    blocks = nextn_blocks(kv)
+    return [
+        h._replace(tensors=[t for t in h.tensors if not in_blocks(t.name, blocks)]) if blocks else h
+        for h in headers
+    ]
 
 
 def read_model(path: str, *, filesystem: SourceFiles = LOCAL_FILES) -> list[Header]:

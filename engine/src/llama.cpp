@@ -140,6 +140,7 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
+        model.drop_nextn_blocks(ml);
         if (params.defer_experts && params.use_mmap) {
             ml.build_expert_tensor_index(model.hparams);
         }

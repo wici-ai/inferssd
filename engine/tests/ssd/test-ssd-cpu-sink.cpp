@@ -128,7 +128,9 @@ struct fixture {
     int latent = 256, hidden = 256, experts = 20, fd = -1;
     ggml_type type = GGML_TYPE_Q3_K, down_type = GGML_TYPE_Q3_K; // up/gate and down payload types
     std::map<int, ggml_type> layer_down_types; // a layer's down type where it is not down_type (as Muse Q4_K_S's)
+    std::map<int, ggml_type> layer_types;      // a layer's up/gate type where it is not type (as unsloth's UD quants)
     ggml_type down_of(int layer) const { const auto it = layer_down_types.find(layer); return it == layer_down_types.end() ? down_type : it->second; }
+    ggml_type type_of(int layer) const { const auto it = layer_types.find(layer); return it == layer_types.end() ? type : it->second; }
     std::string path;
     bool remove_on_destroy = false;
     std::map<key, entry> entries;
@@ -183,7 +185,7 @@ static void make_synthetic(fixture & f, uint32_t seed = 20260908) {
         for (int role = 0; role < 3; ++role) {
             const int cols = role == 2 ? f.hidden : f.latent;
             const int rows = role == 2 ? f.latent : f.hidden;
-            const ggml_type type = role == 2 ? f.down_of(layer) : f.type;
+            const ggml_type type = role == 2 ? f.down_of(layer) : f.type_of(layer);
             const size_t bytes = ggml_row_size(type, cols) * rows;
             const std::vector<float> importance(
                 ggml_quantize_requires_imatrix(type) ? size_t(cols) : 0, 1.0f);
@@ -229,7 +231,7 @@ struct tensors {
     tensors(const fixture & f, int layer) {
         ctx = ggml_init({ ggml_tensor_overhead() * 4, nullptr, true }); require(ctx, "metadata context failed");
         for (int r = 0; r < 3; ++r) {
-            role[r] = ggml_new_tensor_3d(ctx, r == 2 ? f.down_of(layer) : f.type, r == 2 ? f.hidden : f.latent,
+            role[r] = ggml_new_tensor_3d(ctx, r == 2 ? f.down_of(layer) : f.type_of(layer), r == 2 ? f.hidden : f.latent,
                                        r == 2 ? f.latent : f.hidden, f.experts);
             ggml_set_name(role[r], tensor_name(layer, r).c_str());
             require(role[r]->data == nullptr, "sink metadata unexpectedly has payload");
@@ -256,7 +258,7 @@ static std::vector<float> reference(const fixture & f, int layer, const std::vec
         if (ids[slot] < 0) { continue; }
         ggml_tensor * matrices[3];
         for (int role = 0; role < 3; ++role) {
-            matrices[role] = ggml_new_tensor_2d(ctx, role == 2 ? f.down_of(layer) : f.type, role == 2 ? f.hidden : f.latent, role == 2 ? f.latent : f.hidden);
+            matrices[role] = ggml_new_tensor_2d(ctx, role == 2 ? f.down_of(layer) : f.type_of(layer), role == 2 ? f.hidden : f.latent, role == 2 ? f.latent : f.hidden);
             parameters.push_back({ matrices[role], &f.entries.at({ tensor_name(layer, role), ids[slot] }) });
         }
         ggml_tensor * u = ggml_mul_mat(ctx, matrices[0], x);
@@ -2478,6 +2480,40 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
     require(sa.capacity_bytes == sb.capacity_bytes && sa.valid_bytes == sb.valid_bytes && sa.hits == sb.hits &&
             sa.misses == sb.misses && !sa.clears && sa.committed_bytes == 12 * stride,
             "the load step's geometry is not the decode's, or decode mapped again");
+    {
+        // Layers whose largest roles differ (unsloth's UD-IQ1_M: up and gate largest in some layers, down in others):
+        // the load step's slots hold each role's largest read, so decode in either layer keeps the arena it mapped.
+        fixture m; m.native_ranges = true;
+        m.layer_types = { { 1, GGML_TYPE_Q6_K }, { 2, GGML_TYPE_Q3_K } };
+        m.layer_down_types = { { 1, GGML_TYPE_Q2_K }, { 2, GGML_TYPE_Q8_0 } };
+        make_synthetic(m);
+        const auto read = [&](int layer, int role) {
+            return (m.entries.at({ tensor_name(layer, role), 0 }).raw_bytes + 8190) / 4096 * 4096;
+        };
+        require(read(1, 0) + read(1, 1) + read(1, 2) > read(2, 0) + read(2, 1) + read(2, 2) && read(2, 2) > read(1, 2),
+                "the mixed fixture's largest expert holds the largest down");
+        const uint64_t mixed = cache_slot_bytes(inputs, read(1, 0) + read(1, 1) + read(2, 2));
+        auto c = make_sink(inputs, m, threads, depth);
+        configure_cache(c.get(), 12 * mixed, { 1, 2 }, 6);
+        tensors one(m, 1), two(m, 2);
+        const ggml_tensor * roles[] = { one.role[0], one.role[1], one.role[2], two.role[0], two.role[1], two.role[2] };
+        char error[512] = {};
+        require(kimi_cpu_sink_vram_reserve(c.get(), roles, 2, 6, error, sizeof(error)), error);
+        require(cache_snapshot(c.get()).committed_bytes == 12 * mixed,
+                "the load step did not size its slots from each role's largest read");
+        begin_cache(c.get(), 12, 1);
+        for (int layer : { 1, 2 }) {
+            tensors meta(m, layer);
+            const auto expected = reference(m, layer, input, { 1, 2 }, { .4f, .6f }, 4, 25);
+            const auto r = run_checked(inputs, "load_mixed_roles", m, c.get(), meta, input, { 1, 2 }, { .4f, .6f },
+                expected, layer, 25, 0, -1, nullptr);
+            require(r.stats.cache_admitted == 2 && !r.stats.cache_new_slot_bytes,
+                    "load_mixed_roles: decode committed a slot the load step had");
+        }
+        const auto mixed_stats = cache_snapshot(c.get());
+        require(!mixed_stats.clears && mixed_stats.committed_bytes == 12 * mixed,
+                "decode rebuilt the cache the load step sized");
+    }
     {
         // an elastic prefill keeps 4 slots: the load step's others go back (MADV_DONTNEED) and come back by refault
         scoped_fixture_input elastic(inputs, "cache_elastic", "1");

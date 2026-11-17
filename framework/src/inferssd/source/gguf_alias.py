@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from inferssd.platform.captured_command import run_captured
-from inferssd.source.header import SCALARS
+from inferssd.source.header import SCALARS, in_blocks, nextn_blocks
 
 ALIGNMENT = 4096
 MAX_I64 = (1 << 63) - 1
@@ -71,6 +71,7 @@ NATIVE_TYPES = {
     39: ("MXFP4", 32, 17),
     40: ("NVFP4", 64, 36),
     41: ("Q1_0", 128, 18),
+    43: ("MXFP8", 32, 33),
 }
 EXPERT_RE = re.compile(r"^blk\.(?P<layer>\d+)\.ffn_(?P<kind>up|gate|down)_exps\.weight$")
 SHARD_RE = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf$")
@@ -173,6 +174,7 @@ class Header:
     split: dict[str, int]
     data_offset: int
     identity: tuple[int, ...]
+    metadata: dict[str, Any]  # the scalar values and the architecture: enough to find NextN blocks
 
 
 def _identity(info: os.stat_result) -> tuple[int, ...]:
@@ -228,6 +230,7 @@ def read_header(path: Path) -> Header:
             # GGUFReader reserves these synthetic fields before reading KV.
             keys = {"GGUF.version", "GGUF.tensor_count", "GGUF.kv_count"}
             split: dict[str, int] = {}
+            metadata: dict[str, Any] = {}
             alignment = 32
             for _ in range(metadata_count):
                 key, kind = reader.string(), int(reader.take("I"))
@@ -239,7 +242,9 @@ def read_header(path: Path) -> Header:
                 expected_split_type = {"split.no": 2, "split.count": 2, "split.tensors.count": 5}
                 if key in expected_split_type and kind != expected_split_type[key]:
                     raise ValueError(f"Bad type for {key} field")
-                value = reader.value(kind)
+                value = reader.value(kind, capture=key == "general.architecture")
+                if kind in SCALARS or key == "general.architecture":
+                    metadata[key] = value
                 if key == "general.alignment":
                     alignment = int(value)
                     if alignment == 0 or alignment & (alignment - 1):
@@ -303,7 +308,7 @@ def read_header(path: Path) -> Header:
                 before
             ) != _identity(resolved.stat()):
                 raise RuntimeError("GGUF source changed while reading its header")
-            return Header(resolved, tuple(checked), split, data_offset, _identity(before))
+            return Header(resolved, tuple(checked), split, data_offset, _identity(before), metadata)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -370,6 +375,12 @@ def build_rows(
     shard_numbers = _validate_shards(model_paths)
     headers = [read_header(path) for path in model_paths]
     total_tensors = sum(len(header.tensors) for header in headers)
+    # The engine does not load the NextN blocks: their experts are not the model's.
+    metadata: dict[str, Any] = {}
+    for header in headers:
+        for key, value in header.metadata.items():
+            metadata.setdefault(key, value)
+    nextn = nextn_blocks(metadata)
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     all_tensor_names: set[str] = set()
@@ -400,7 +411,11 @@ def build_rows(
                     raise RuntimeError(f"duplicate expert tensor across shards: {tensor.name}")
                 raise RuntimeError(f"duplicate tensor across shards: {tensor.name}")
             all_tensor_names.add(tensor.name)
-            if match is None or match.group("kind") not in include_kinds:
+            if (
+                match is None
+                or match.group("kind") not in include_kinds
+                or in_blocks(tensor.name, nextn)
+            ):
                 continue
             kind = match.group("kind")
             seen.add(tensor.name)

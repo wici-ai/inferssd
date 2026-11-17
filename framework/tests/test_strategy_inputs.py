@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import struct
 from pathlib import Path
 
@@ -10,12 +11,14 @@ import pytest
 from test_machine_identity import FakeHost, linux_tree, nvme_key, ok, write
 
 from inferssd.machine.identity import Command
+from inferssd.source.header import nextn_blocks
 from inferssd.strategy.inputs import (
     GPUState,
     RuntimeFacts,
     model_drive_key,
     model_facts,
     read_runtime,
+    shard_facts,
     visible_gpus,
 )
 
@@ -155,6 +158,65 @@ def test_split_model_reads_every_shard(tmp_path):
         str(tmp_path / "toy-00002-of-00002.gguf"),
     )
     assert (facts.architecture, facts.layers, facts.experts_used) == ("toy", 4, 2)
+
+
+def with_nextn(arch, tensors, kv, *, layers):
+    """TENSORS and KV of the file that appends one NextN block to a model of LAYERS blocks."""
+    last, block = f"blk.{layers - 1}.", f"blk.{layers}."
+    head = [
+        (block + name[len(last) :], shape, kind)
+        for name, shape, kind in tensors
+        if name.startswith(last)
+    ]
+    head.append((block + "nextn.eh_proj.weight", (512, 256), Q8_0))
+    return tensors + head, {
+        **kv,
+        f"{arch}.block_count": layers + 1,
+        f"{arch}.nextn_predict_layers": 1,
+    }
+
+
+def test_nextn_blocks_are_not_part_of_the_model(tmp_path):
+    # The engine loads none of a NextN block's tensors: the model is the file without them.
+    tensors, kv = moe(
+        "qwen35moe",
+        layers=3,
+        experts=8,
+        used=2,
+        latent=256,
+        hidden=512,
+        gate=Q4_K,
+        up=Q4_K,
+        down=Q6_K,
+    )
+    trunk = write_gguf(tmp_path / "trunk.gguf", tensors, {**kv, "qwen35moe.block_count": 3})
+    file = write_gguf(tmp_path / "nextn.gguf", *with_nextn("qwen35moe", tensors, kv, layers=3))
+    expected = model_facts(str(trunk))
+    for facts in (model_facts(str(file)), shard_facts([str(file)])):
+        assert dataclasses.replace(facts, paths=expected.paths) == expected
+    assert expected.layers == 3
+
+
+@pytest.mark.parametrize(
+    "kv, blocks",
+    [
+        ({"toy.block_count": 4}, range(0)),
+        ({"toy.block_count": 4, "toy.nextn_predict_layers": 0}, range(0)),
+        ({"toy.block_count": 4, "toy.nextn_predict_layers": 1}, range(3, 4)),
+        ({"toy.block_count": 4, "toy.nextn_predict_layers": 2}, range(2, 4)),
+        ({"toy.nextn_predict_layers": 1}, range(0)),  # a layout that counts its blocks otherwise
+    ],
+)
+def test_nextn_blocks_are_the_last_blocks(kv, blocks):
+    assert nextn_blocks({"general.architecture": "toy", **kv}) == blocks
+
+
+@pytest.mark.parametrize("nextn", [4, 5, True, "1"])
+def test_nextn_blocks_must_leave_blocks_to_run(nextn):
+    with pytest.raises(ValueError, match="nextn_predict_layers"):
+        nextn_blocks(
+            {"general.architecture": "toy", "toy.block_count": 4, "toy.nextn_predict_layers": nextn}
+        )
 
 
 def test_mixed_formats_rank_by_layers_and_widen_unaligned_reads(tmp_path):

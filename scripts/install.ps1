@@ -14,7 +14,7 @@ function Install-InferSSD {
 
     if ($Arguments -contains '--help') {
         @'
-Install InferSSD for Windows x64 (Windows 11 / Windows Server build 22000 or later).
+Install InferSSD for Windows x64 (Windows 10 or later).
 The default installation downloads a precompiled engine and its own Python runtime.
 No Git, Python, compiler, Visual Studio or Vulkan SDK is needed. With an NVIDIA GPU
 whose driver is new enough it installs the CUDA package; otherwise the Vulkan package,
@@ -160,10 +160,65 @@ No administrator rights are used. Models, settings and previous releases are pre
         return $null
     }
 
+    # The compute capabilities ("8.9") of this machine's NVIDIA GPUs, as the driver's nvidia-smi
+    # reports them, or none where it cannot tell.
+    function Get-NvidiaComputeCapabilities {
+        $smi = Join-Path ([Environment]::SystemDirectory) 'nvidia-smi.exe'
+        if (-not (Test-Path -LiteralPath $smi)) { return @() }
+        # An older driver's nvidia-smi has no compute_cap field and fails: then nothing is known.
+        $ErrorActionPreference = 'Continue'
+        $lines = @(& $smi --query-gpu=compute_cap --format=csv,noheader 2>$null)
+        if ($LASTEXITCODE -ne 0) { return @() }
+        return @($lines | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -match '^[0-9]+\.[0-9]+$' })
+    }
+
+    # The driver the CUDA package needs on this machine. A driver of the package's CUDA major version
+    # runs the code it has for a GPU (CUDA minor version compatibility); a GPU it has only PTX for needs
+    # the toolkit's own driver, which compiles that PTX.
+    function Get-RequiredNvidiaDriver($Package) {
+        $gpus = Get-NvidiaComputeCapabilities
+        $native = @($Package.native_compute_capabilities | Where-Object { $null -ne $_ })
+        if ($null -ne $Package.minimum_nvidia_driver_native -and $gpus.Count -and
+                -not @($gpus | Where-Object { $native -notcontains $_ }).Count) {
+            return [Version]$Package.minimum_nvidia_driver_native
+        }
+        return [Version]$Package.minimum_nvidia_driver
+    }
+
+    # A package list, checked before anything reads it.
     function Get-PackageList([string] $Address, [string] $Destination) {
         try { Download-File $Address $Destination }
         catch { throw "inferssd: cannot download the Windows package list. No source build was started. $($_.Exception.Message)" }
-        return Get-Content -LiteralPath $Destination -Raw | ConvertFrom-Json
+        $package = Get-Content -LiteralPath $Destination -Raw | ConvertFrom-Json
+        $backend = [string]$package.backend
+        $suffix = @{ vulkan = 'windows-x64-vulkan'; cuda = 'windows-x64-cuda' }[$backend]
+        if ($package.schema -ne 'inferssd-package 1' -or $package.platform -ne 'windows-x64' -or -not $suffix) {
+            throw 'inferssd: unsupported Windows package list.'
+        }
+        if ($package.name -notmatch ('^inferssd-[a-zA-Z0-9.-]+-' + $suffix + '$') -or
+            $package.file -ne ($package.name + '.zip') -or $package.sha256 -notmatch '^[a-fA-F0-9]{64}$' -or
+            ($package.size -isnot [int] -and $package.size -isnot [long]) -or [long]$package.size -lt 1 -or
+            ($package.build -isnot [int] -and $package.build -isnot [long]) -or [long]$package.build -lt 1 -or
+            $package.revision -notmatch '^[a-fA-F0-9]{40}$' -or
+            ($backend -eq 'cuda' -and [string]$package.minimum_nvidia_driver -notmatch '^[0-9]+\.[0-9]+$') -or
+            ($null -ne $package.minimum_nvidia_driver_native -and
+                [string]$package.minimum_nvidia_driver_native -notmatch '^[0-9]+\.[0-9]+$') -or
+            ($null -ne $package.native_compute_capabilities -and
+                @($package.native_compute_capabilities | Where-Object { [string]$_ -notmatch '^[0-9]+\.[0-9]+$' }).Count)) {
+            throw 'inferssd: invalid Windows package metadata.'
+        }
+        return $package
+    }
+
+    # Throws $Failure when the packaged program that just ran failed, or the reason when Windows could not
+    # start it: the loader ends a program that imports a function or library Windows lacks with 0xC0000139
+    # or 0xC0000135.
+    function Assert-Ran([string] $Failure) {
+        if ($LASTEXITCODE -in @(-1073741511, -1073741515)) {
+            throw ("inferssd: Windows $([Environment]::OSVersion.Version.ToString(3)) lacks a system function " +
+                'or library this package needs.')
+        }
+        if ($LASTEXITCODE) { throw $Failure }
     }
 
     function Install-Package {
@@ -178,34 +233,21 @@ No administrator rights are used. Models, settings and previous releases are pre
             if ($env:INFERSSD_PACKAGES) {
                 $package = Get-PackageList $env:INFERSSD_PACKAGES $listing
             } else {
-                # An NVIDIA GPU runs the CUDA package once its driver runs the package's CUDA runtime.
+                # An NVIDIA GPU runs the CUDA package once its driver runs the package's code for it.
                 $driver = Get-NvidiaDriver
                 $package = if ($driver) { Get-PackageList $CudaPackages $listing }
-                if ($package -and $driver -lt [Version]$package.minimum_nvidia_driver) {
-                    Write-Output ("inferssd: the CUDA package needs NVIDIA driver $($package.minimum_nvidia_driver) or later " +
+                $required = if ($package) { Get-RequiredNvidiaDriver $package }
+                if ($package -and $driver -lt $required) {
+                    Write-Output ("inferssd: the CUDA package needs NVIDIA driver $required or later here " +
                         "and this machine has $driver; installing the Vulkan package. Update the driver and run " +
                         'this installer again to use CUDA.')
                     $package = $null
                 }
                 if (-not $package) { $package = Get-PackageList $VulkanPackages $listing }
             }
+            # No Windows build is refused by its number: the packaged programs run below, and one Windows
+            # cannot start fails the installation with the reason (Assert-Ran).
             $backend = [string]$package.backend
-            $suffix = @{ vulkan = 'windows-x64-vulkan'; cuda = 'windows-x64-cuda' }[$backend]
-            if ($package.schema -ne 'inferssd-package 1' -or $package.platform -ne 'windows-x64' -or -not $suffix) {
-                throw 'inferssd: unsupported Windows package list.'
-            }
-            if ($package.name -notmatch ('^inferssd-[a-zA-Z0-9.-]+-' + $suffix + '$') -or
-                $package.file -ne ($package.name + '.zip') -or $package.sha256 -notmatch '^[a-fA-F0-9]{64}$' -or
-                ($package.size -isnot [int] -and $package.size -isnot [long]) -or [long]$package.size -lt 1 -or
-                ($package.build -isnot [int] -and $package.build -isnot [long]) -or [long]$package.build -lt 1 -or
-                $package.revision -notmatch '^[a-fA-F0-9]{40}$' -or
-                $package.minimum_windows -notmatch '^10\.0\.[0-9]+(?:\.[0-9]+)?$' -or
-                ($backend -eq 'cuda' -and [string]$package.minimum_nvidia_driver -notmatch '^[0-9]+\.[0-9]+$')) {
-                throw 'inferssd: invalid Windows package metadata.'
-            }
-            if ([Environment]::OSVersion.Version -lt [Version]$package.minimum_windows) {
-                throw "inferssd: this package requires Windows build $($package.minimum_windows) or later."
-            }
             Write-Output "Downloading InferSSD $($package.label), $backend ($([math]::Ceiling($package.size / 1000000)) MB)."
             $archive = Join-Path $release 'package.zip'
             Download-File $package.url $archive
@@ -256,21 +298,33 @@ No administrator rights are used. Models, settings and previous releases are pre
                 if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw 'inferssd: the package is incomplete.' }
             }
             $oldResources = $env:INFERSSD_RESOURCES
+            # Windows reports a program it cannot start in a dialog that waits for a click, unless the error
+            # mode, which the programs started here inherit, says not to (SEM_FAILCRITICALERRORS).
+            $errorMode = $null
+            try {
+                if (-not ('InferSSD.ErrorMode' -as [type])) {
+                    Add-Type -Namespace InferSSD -Name ErrorMode -MemberDefinition (
+                        '[DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint mode);')
+                }
+                $errorMode = [InferSSD.ErrorMode]::SetErrorMode(1)
+                [void][InferSSD.ErrorMode]::SetErrorMode($errorMode -bor 1)
+            } catch { $errorMode = $null } # where PowerShell cannot compile it, the dialog shows
             try {
                 $env:INFERSSD_RESOURCES = $resources
                 $version = & $command --version --json
-                if ($LASTEXITCODE) { throw 'inferssd: the packaged command does not run.' }
+                Assert-Ran 'inferssd: the packaged command does not run.'
                 $version = $version | ConvertFrom-Json
                 if ($version.build -ne $package.build -or $version.revision -ne $package.revision) {
                     throw 'inferssd: the command version differs from its package list.'
                 }
                 & $command cli --help | Out-Null
-                if ($LASTEXITCODE) { throw 'inferssd: the packaged chat command does not run.' }
+                Assert-Ran 'inferssd: the packaged chat command does not run.'
                 & $command serve --help | Out-Null
-                if ($LASTEXITCODE) { throw 'inferssd: the packaged server command does not run.' }
+                Assert-Ran 'inferssd: the packaged server command does not run.'
                 & $server --ssd-schema | Out-Null
-                if ($LASTEXITCODE) { throw 'inferssd: the native engine or its runtime libraries do not run.' }
+                Assert-Ran 'inferssd: the native engine or its runtime libraries do not run.'
             } finally {
+                if ($null -ne $errorMode) { [void][InferSSD.ErrorMode]::SetErrorMode($errorMode) }
                 if ($null -eq $oldResources) { Remove-Item Env:INFERSSD_RESOURCES -ErrorAction SilentlyContinue }
                 else { $env:INFERSSD_RESOURCES = $oldResources }
             }

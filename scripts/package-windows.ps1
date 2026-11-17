@@ -9,7 +9,10 @@ param(
   [string]$CudaArchitectures = '75-virtual;80-virtual;86-real;89-real;120a-real',
   # The driver of the CUDA toolkit this package is built with (12.9 Update 1): the oldest that runs its
   # runtime and compiles its PTX.
-  [string]$MinimumNvidiaDriver = '576.57'
+  [string]$MinimumNvidiaDriver = '576.57',
+  # The oldest driver that runs its real code: CUDA minor version compatibility runs a CUDA 12 runtime
+  # on any CUDA 12 driver from 528.33 on Windows, but cannot compile PTX newer than the driver.
+  [string]$MinimumNvidiaDriverNative = '528.33'
 )
 # Build tools are used here, in CI, never by the machine installing the resulting ZIP.
 $ErrorActionPreference = 'Stop'
@@ -133,8 +136,17 @@ try {
   if (Test-Path -LiteralPath $archive) { throw "An immutable package already exists: $archive" }
   Add-Type -AssemblyName System.IO.Compression.FileSystem
   [IO.Compression.ZipFile]::CreateFromDirectory($archiveRoot, $archive, [IO.Compression.CompressionLevel]::Optimal, $false)
-  $listing = [ordered]@{schema='inferssd-package 1'; name=$name; platform='windows-x64'; backend=$Backend; minimum_windows='10.0.22000'; minimum_cpu='avx2'; file=($name+'.zip'); size=(Get-Item -LiteralPath $archive).Length; sha256=(Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()}
-  if ($Backend -eq 'cuda') { $listing['minimum_nvidia_driver'] = $MinimumNvidiaDriver }
+  # minimum_windows is for the installers that refuse an older build by it; the current one runs the package
+  # instead. The binaries import Windows 10 functions (the CPU set API), so Windows 10's first build refuses
+  # nothing they start on.
+  $listing = [ordered]@{schema='inferssd-package 1'; name=$name; platform='windows-x64'; backend=$Backend; minimum_windows='10.0.10240'; minimum_cpu='avx2'; file=($name+'.zip'); size=(Get-Item -LiteralPath $archive).Length; sha256=(Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()}
+  if ($Backend -eq 'cuda') {
+    $listing['minimum_nvidia_driver'] = $MinimumNvidiaDriver
+    # The compute capabilities with real code ('86-real' is 8.6, '120a-real' 12.0) run from the older driver.
+    $listing['minimum_nvidia_driver_native'] = $MinimumNvidiaDriverNative
+    $listing['native_compute_capabilities'] = @($CudaArchitectures -split ';' | ForEach-Object {
+      if ($_ -match '^([0-9]+)([0-9])a?-real$') { $Matches[1] + '.' + $Matches[2] } })
+  }
   foreach ($key in 'version', 'build', 'revision', 'date', 'branch', 'label') { $listing[$key] = $version.$key }
   [IO.File]::WriteAllText((Join-Path $out ($name+'.json')), ($listing | ConvertTo-Json -Depth 5), $utf8)
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install.ps1') -Destination (Join-Path $out 'install.ps1')

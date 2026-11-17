@@ -497,6 +497,21 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 #define GGML_E8M0_TO_FP32(x) ggml_e8m0_to_fp32(x)
 #define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
 
+// E4M3 (OCP "fn"): signed, 4 exponent bits (bias 7), 3 mantissa bits, no infinity; 0x7F and 0xFF are NaN
+static inline float ggml_e4m3_to_fp32(uint8_t x) {
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    float v;
+    if (exp == 0xF && man == 0x7) {
+        v = NAN;
+    } else if (exp == 0) {
+        v = ldexpf((float) man, -9);
+    } else {
+        v = ldexpf((float) (8 + man), exp - 10);
+    }
+    return (x & 0x80) ? -v : v;
+}
+
 // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
 // Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
 static inline float ggml_ue4m3_to_fp32(uint8_t x) {
