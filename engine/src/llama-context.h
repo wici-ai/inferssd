@@ -297,6 +297,7 @@ private:
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
     void dense_graph_cache_begin_phase(int phase);
+    void dense_pool_hold(bool hold);
     void dense_graph_cache_end_phase();
 
     // worst-case memory context for a graph reserve that covers sched_reserve_n_ctx positions

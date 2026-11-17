@@ -1114,10 +1114,13 @@ struct ggml_cuda_pool {
     virtual void free(void * ptr, size_t size) = 0;
 
     // Resizes the pool to hold `size` bytes of allocations beyond those in use, so that it gets no device memory
-    // while a graph runs and, where it can give memory back without moving (VMM), keeps none the graph does not need;
-    // returns false if the memory cannot be obtained.
-    virtual bool reserve(size_t size) {
+    // while a graph runs; returns false if the memory cannot be obtained. With `hold` it only grows: a prompt's graphs
+    // hold what the largest of them needs until its decode, since the expert caches take memory back only at that
+    // boundary and giving it back between the prompt's graphs would take it from them again. Without, it keeps none
+    // the graph does not need (a pool without VMM moves to give memory back: base).
+    virtual bool reserve(size_t size, bool hold) {
         GGML_UNUSED(size);
+        GGML_UNUSED(hold);
         return true;
     }
 
@@ -1442,6 +1445,8 @@ struct ggml_backend_cuda_context {
 
     // the largest memory pool need that ggml_backend_cuda_graph_reserve has logged
     size_t pool_reserve_logged = 0;
+    // a prompt's graphs are reserved (ggml_backend_pool_hold): the pool keeps what they need until the decode's reserve
+    bool pool_hold = false;
 
 #ifdef USE_CUDA_GRAPH
     // The default key remains first_node_ptr.  Phase-managed schedulers use a

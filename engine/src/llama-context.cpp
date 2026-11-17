@@ -562,6 +562,27 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
+// A prompt's graphs hold the backends' memory pools at what the largest of them needs, the decode's reserve after it
+// gives back what decode does not need: the expert caches take device memory back only at that boundary
+// (ggml_backend_pool_hold, ggml_cuda_pool::reserve). A backend without a pool of its own has nothing to hold.
+void llama_context::dense_pool_hold(bool hold) {
+    if (!dense_gpu_phase_gate_enabled) {
+        return;
+    }
+    using pool_hold_fn = void (*)(ggml_backend_t, bool);
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            continue;
+        }
+        auto pool_hold = reinterpret_cast<pool_hold_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_pool_hold"));
+        if (pool_hold != nullptr) {
+            pool_hold(backend.get(), hold);
+        }
+    }
+}
+
 void llama_context::dense_graph_cache_begin_phase(int phase) {
     if (!dense_gpu_phase_gate_enabled) {
         return;
@@ -1111,6 +1132,8 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
             dense_stream.begin(active ? "prefill" : "decode", now);
         }
     }
+    // A prompt's graphs, its later batches' too, hold the memory pools; the decode reserve below gives back the rest.
+    dense_pool_hold(active);
     // This is the explicit request prefill boundary, including single-token
     // prompts. Release before every early return or prefill workspace reserve.
     if (active && cpu_sink_runtime) {

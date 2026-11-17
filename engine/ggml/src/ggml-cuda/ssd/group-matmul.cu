@@ -234,7 +234,8 @@ extern "C" bool ggml_cuda_moe_stream_mm_reserve(void * context, int type, int64_
     if (mmq) {
         mm->fixup_bytes = std::max(mm->fixup_bytes, ggml_cuda_mul_mat_q_fixup_pool_size());
         ggml_cuda_pool & pool = mm->ctx->pool();
-        if (!pool.reserve(mm->fixup_bytes)) {
+        // the products' own pool holds the largest fixup until release
+        if (!pool.reserve(mm->fixup_bytes, true)) {
             return false;
         }
         // a pool that allocates on demand keeps the largest fixup from here on

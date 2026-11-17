@@ -469,9 +469,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
 
     // The reservation (reserve): one device allocation handed out as a stack, as the VMM pool hands out its mapped
     // prefix, so that a graph sized for it takes no device memory while it runs (ops give back what they take from the
-    // pool in reverse order). It only grows: moving it invalidates the graphs captured over it (base), so it keeps the
-    // largest reservation, where the VMM pool gives back what the next graph does not need. Past it, or before any
-    // reservation, buffers are allocated on demand.
+    // pool in reverse order). Held, it only grows; otherwise it takes the size the graph needs, the way the VMM pool
+    // maps that and no more, by moving: a move drops the graphs captured over the old place (base, graph_reserve).
+    // Past it, or before any reservation, buffers are allocated on demand.
     void * arena = nullptr;
     size_t arena_size = 0;
     size_t arena_used = 0;
@@ -490,13 +490,13 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
     }
 
-    bool reserve(size_t size) override {
+    bool reserve(size_t size, bool hold) override {
         size = ggml_cuda_pool_alloc_size(size);
-        if (arena_size - arena_used >= size) {
-            return true;
-        }
         if (arena_used != 0) {
-            return false; // the reservation is in use and cannot move
+            return arena_size - arena_used >= size; // the reservation is in use and cannot move
+        }
+        if (arena && (arena_size == size || (hold && arena_size > size))) {
+            return true;
         }
         // the buffers allocated on demand go; the reservation takes their place
         clear_pool();
@@ -505,6 +505,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             CUDA_CHECK(ggml_cuda_device_free(arena, arena_size, device));
             arena = nullptr;
             arena_size = 0;
+        }
+        if (size == 0) {
+            return true;
         }
         const cudaError_t err = ggml_cuda_device_malloc(&arena, size, device);
         if (err != cudaSuccess) {
@@ -754,10 +757,13 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         }
     }
 
-    bool reserve(size_t size) override {
+    bool reserve(size_t size, bool hold) override {
         reserved = true;
-        // release what is not needed, then map what is missing: a mapping larger than the need goes as a whole
-        release_to(pool_used + aligned(size));
+        // release what is not needed (held, nothing), then map what is missing: a mapping larger than the need goes as
+        // a whole
+        if (!hold) {
+            release_to(pool_used + aligned(size));
+        }
         const size_t bytes = growth_for(aligned(size));
         if (bytes == 0) {
             return true;
@@ -878,6 +884,14 @@ static void ggml_backend_cuda_activation_quant_reuse_end(ggml_backend_t backend)
     GGML_ASSERT(ggml_backend_is_cuda(backend));
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_activation_quant_reuse_end(*cuda_ctx);
+}
+
+// While a prompt's graphs are reserved (hold), the backend's memory pool keeps what the largest of them needs; the
+// decode's reserve after it gives back what decode does not need (ggml_cuda_pool::reserve).
+static void ggml_backend_cuda_pool_hold(ggml_backend_t backend, bool hold) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    cuda_ctx->pool_hold = hold;
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -6041,8 +6055,13 @@ static bool ggml_backend_cuda_graph_reserve(ggml_backend_t backend, ggml_cgraph 
 
     ggml_cuda_pool & pool = cuda_ctx->pool();
     const void * base = pool.base();
-    if (!pool.reserve(size)) {
+    const size_t held = pool.capacity();
+    if (!pool.reserve(size, cuda_ctx->pool_hold)) {
         return false;
+    }
+    if (held != SIZE_MAX && pool.capacity() < held) {
+        GGML_LOG_INFO("%s: device %d memory pool gives back %.2f MiB, holds %.2f MiB\n", __func__, cuda_ctx->device,
+            (held - pool.capacity())/1024.0/1024.0, pool.capacity()/1024.0/1024.0);
     }
 #ifdef USE_CUDA_GRAPH
     // a captured graph that reaches past the end of the pool, or into memory the pool has moved from, would replay
@@ -7072,6 +7091,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_activation_quant_reuse_end") == 0) {
         return (void *)ggml_backend_cuda_activation_quant_reuse_end;
+    }
+    if (strcmp(name, "ggml_backend_pool_hold") == 0) {
+        return (void *)ggml_backend_cuda_pool_hold;
     }
 #ifdef USE_CUDA_GRAPH
     if (strcmp(name, "ggml_backend_graph_cache_begin_phase") == 0) {
