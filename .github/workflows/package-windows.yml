@@ -28,6 +28,7 @@ on:
       - scripts/windows-launcher.cpp
       - scripts/engine-resources.py
       - scripts/install.ps1
+      - scripts/sign-windows.ps1
       - .github/workflows/package-windows.yml
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
@@ -38,6 +39,7 @@ on:
       - scripts/windows-launcher.cpp
       - scripts/engine-resources.py
       - scripts/install.ps1
+      - scripts/sign-windows.ps1
       - .github/workflows/package-windows.yml
   workflow_dispatch:
     inputs:
@@ -126,8 +128,73 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  check:
+  # A run that publishes signs what it publishes: every code file in the packages carries WiCi AI's
+  # signature or its vendor's (docs/windows-package.md). Pull requests and other main pushes sign
+  # nothing. The signed packages replace the built ones, so the check runs on the published bytes.
+  sign:
     needs: build
+    if: inputs.source_ref || (inputs.publish && github.ref == 'refs/heads/main')
+    runs-on: windows-2025
+    timeout-minutes: 60
+    environment: windows-signing
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package-windows-x64-vulkan
+          path: dist/windows-x64-vulkan
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package-windows-x64-cuda
+          path: dist/windows-x64-cuda
+      # A numbered release also publishes an install.ps1 pinned to its tag, signed in the same pass.
+      - name: Pin the release's Windows installer
+        if: inputs.source_ref
+        shell: powershell
+        run: |
+          python scripts/prepare-release-assets.py --pinned-install-ps1 dist/installer/install.ps1 --tag $env:GITHUB_REF_NAME --repository $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw 'The pinned installer could not be written.' }
+      - name: Sign every code file the packages carry
+        shell: powershell
+        env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          ES_CREDENTIAL_ID: ${{ secrets.ES_CREDENTIAL_ID }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+          WINDOWS_SIGNING_THUMBPRINT: ${{ vars.WINDOWS_SIGNING_THUMBPRINT }}
+          APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
+        run: |
+          $installer = @(Get-ChildItem -LiteralPath dist/installer -Filter install.ps1 -File -ErrorAction SilentlyContinue | ForEach-Object FullName)
+          scripts/package-windows-sign.ps1 -Directory dist/windows-x64-vulkan, dist/windows-x64-cuda -File $installer
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-windows-x64-vulkan
+          path: dist/windows-x64-vulkan/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-windows-x64-cuda
+          path: dist/windows-x64-cuda/
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: inputs.source_ref
+        with:
+          name: install-windows-signed
+          path: dist/installer/install.ps1
+          if-no-files-found: error
+          retention-days: 30
+
+  check:
+    needs: [build, sign]
+    # After the signing when the run signs, else on the built packages.
+    if: ${{ !cancelled() && needs.build.result == 'success' && (needs.sign.result == 'success' || needs.sign.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
@@ -152,8 +219,8 @@ jobs:
           & scripts/check-package-windows.ps1 -Archive $zip[0].FullName
 
   publish:
-    needs: check
-    if: github.ref == 'refs/heads/main' && inputs.publish
+    needs: [sign, check]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && inputs.publish && needs.sign.result == 'success' && needs.check.result == 'success' }}
     strategy:
       max-parallel: 1
       matrix:

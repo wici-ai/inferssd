@@ -73,6 +73,11 @@ jobs:
         with:
           name: package-windows-x64-cuda
           path: dist/windows-cuda
+      # The Windows package workflow signed the pinned install.ps1 with the packages.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: install-windows-signed
+          path: dist/install-windows
       - name: Prepare both platforms and tag-pinned installers
         env:
           RELEASE_REVISION: ${{ needs.validate.outputs.revision }}
@@ -80,7 +85,7 @@ jobs:
           python3 scripts/prepare-release-assets.py --macos-arm64 dist/macos --windows-x64-vulkan dist/windows-vulkan \
             --windows-x64-cuda dist/windows-cuda \
             --output release-assets --tag "$GITHUB_REF_NAME" --revision "$RELEASE_REVISION" \
-            --repository "$GITHUB_REPOSITORY"
+            --repository "$GITHUB_REPOSITORY" --signed-install-ps1 dist/install-windows/install.ps1
           sh -n release-assets/install.sh
       - name: Extract the release notes from the changelog
         run: |

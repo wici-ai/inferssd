@@ -74,6 +74,45 @@ def replace_once(text: str, old: str, new: str) -> str:
     return text.replace(old, new)
 
 
+def release_base(tag: str, repository: str) -> str:
+    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
+        raise ValueError("a numbered version tag is required")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise ValueError("invalid GitHub repository")
+    return f"https://github.com/{repository}/releases/download/{tag}"
+
+
+def pinned_powershell(root: Path, tag: str, repository: str) -> str:
+    """install.ps1 with its default ref and package lists pinned to the release."""
+    base = release_base(tag, repository)
+    powershell = replace_once(
+        (root / "scripts/install.ps1").read_text(encoding="utf-8"),
+        "$DefaultRef = 'main'",
+        "$DefaultRef = '" + tag + "'",
+    )
+    for variable, listing in (
+        ("VulkanPackages", "latest-windows-vulkan.json"),
+        ("CudaPackages", "latest-windows-cuda.json"),
+    ):
+        powershell = replace_once(
+            powershell,
+            f"${variable} = 'https://appapi.wici.ai/versioning/inferssd/config/{listing}'",
+            f"${variable} = '{base}/{listing}'",
+        )
+    return powershell
+
+
+def signed_powershell(signed: Path, pinned: str) -> bytes:
+    """The signed copy of the pinned install.ps1: exactly its bytes, then the signature block."""
+    data = signed.read_bytes()
+    body = pinned.encode("utf-8")
+    if not data.startswith(body) or not data[len(body):].startswith(
+        b"\r\n# SIG # Begin signature block\r\n"
+    ):
+        raise ValueError("the signed install.ps1 is not the release's pinned installer")
+    return data
+
+
 def prepare(
     root: Path,
     directories: dict[str, Path],
@@ -81,13 +120,11 @@ def prepare(
     tag: str,
     revision: str,
     repository: str,
+    signed_installer: Path | None = None,
 ) -> list[str]:
-    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag) or not re.fullmatch(
-        r"[a-f0-9]{40}", revision
-    ):
+    base = release_base(tag, repository)
+    if not re.fullmatch(r"[a-f0-9]{40}", revision):
         raise ValueError("a numbered version tag and its exact commit SHA are required")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
-        raise ValueError("invalid GitHub repository")
     version = re.search(
         r'^version = "([^"]+)"$',
         (root / "framework/pyproject.toml").read_text(encoding="utf-8"),
@@ -115,7 +152,6 @@ def prepare(
         raise ValueError("the packages do not share one build identity")
     if output.exists() and any(output.iterdir()):
         raise ValueError("release output is not empty; existing assets were preserved")
-    base = f"https://github.com/{repository}/releases/download/{tag}"
     shell = replace_once(
         (root / "scripts/install.sh").read_text(encoding="utf-8"),
         "DEFAULT_REF=main",
@@ -126,20 +162,12 @@ def prepare(
         "PACKAGES=https://appapi.wici.ai/versioning/inferssd/config/latest-macos.json",
         "PACKAGES=" + base + "/latest-macos.json",
     )
-    powershell = replace_once(
-        (root / "scripts/install.ps1").read_text(encoding="utf-8"),
-        "$DefaultRef = 'main'",
-        "$DefaultRef = '" + tag + "'",
+    powershell = pinned_powershell(root, tag, repository)
+    installer = (
+        signed_powershell(signed_installer, powershell)
+        if signed_installer
+        else powershell.encode("utf-8")
     )
-    for variable, listing in (
-        ("VulkanPackages", "latest-windows-vulkan.json"),
-        ("CudaPackages", "latest-windows-cuda.json"),
-    ):
-        powershell = replace_once(
-            powershell,
-            f"${variable} = 'https://appapi.wici.ai/versioning/inferssd/config/{listing}'",
-            f"${variable} = '{base}/{listing}'",
-        )
     output.mkdir(parents=True, exist_ok=True)
     names = []
     for suffix, package in packages.items():
@@ -153,31 +181,49 @@ def prepare(
         names.extend((package["file"], latest))
     (output / "install.sh").write_text(shell, encoding="utf-8")
     (output / "install.sh").chmod(0o755)
-    (output / "install.ps1").write_text(powershell, encoding="utf-8")
+    (output / "install.ps1").write_bytes(installer)
     return names + ["install.sh", "install.ps1"]
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--pinned-install-ps1",
+        type=Path,
+        help="only write the release's pinned install.ps1 here, for signing (with --tag and --repository)",
+    )
     for suffix in PACKAGES:
-        parser.add_argument(
-            "--" + suffix,
-            required=True,
-            type=Path,
-            help=f"the checked {suffix} package",
-        )
-    parser.add_argument("--output", required=True, type=Path)
+        parser.add_argument("--" + suffix, type=Path, help=f"the checked {suffix} package")
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--tag", required=True)
-    parser.add_argument("--revision", required=True)
+    parser.add_argument("--revision")
     parser.add_argument("--repository", required=True)
+    parser.add_argument(
+        "--signed-install-ps1", type=Path, help="the signed copy of the pinned install.ps1"
+    )
     args = parser.parse_args()
+    root = Path(__file__).resolve().parents[1]
+    if args.pinned_install_ps1:
+        args.pinned_install_ps1.parent.mkdir(parents=True, exist_ok=True)
+        args.pinned_install_ps1.write_bytes(
+            pinned_powershell(root, args.tag, args.repository).encode("utf-8")
+        )
+        return
+    missing = [
+        "--" + name.replace("_", "-")
+        for name in [suffix.replace("-", "_") for suffix in PACKAGES] + ["output", "revision"]
+        if getattr(args, name) is None
+    ]
+    if missing:
+        parser.error("the following arguments are required: " + ", ".join(missing))
     files = prepare(
-        Path(__file__).resolve().parents[1],
+        root,
         {suffix: getattr(args, suffix.replace("-", "_")) for suffix in PACKAGES},
         args.output,
         args.tag,
         args.revision,
         args.repository,
+        args.signed_install_ps1,
     )
     print(json.dumps({"tag": args.tag, "revision": args.revision, "assets": files}))
 

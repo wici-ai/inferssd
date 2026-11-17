@@ -80,5 +80,30 @@ HTTP fixture through the packaged Windows guardian/job runtime. It then installs
 the normal installer and verifies the installed command. No model weights are downloaded by
 these packaging checks, and they do not claim GPU/model quality or throughput validation.
 
+## Signing
+
+Every published Windows package is signed: each PE image in it (executables, DLLs, Python
+extension modules) and each PowerShell script carries a valid, timestamped Authenticode
+signature, which Windows' Smart App Control and App Control policies check on every machine. A
+file its vendor ships signed keeps that signature: Microsoft's Visual C++ runtime, the Python
+Software Foundation's Tcl/Tk, LunarG's Vulkan loader. Every other file is signed with WiCi AI's
+code-signing certificate: the engine's own binaries, and the third-party files their projects
+ship unsigned, such as python-build-standalone's CPython, the Hub client's extension modules and
+NVIDIA's CUDA runtime and cuBLAS redistributables. The pinned `install.ps1` of a numbered release
+is signed the same way.
+
+Only runs that publish sign: numbered releases and the manual main-only publisher. Their **sign**
+job unpacks both packages, signs them in one pass through SSL.com eSigner
+(`scripts/package-windows-sign.ps1`, `scripts/sign-windows.ps1`), packs them again and updates
+their listings' size and SHA-256; the check then runs on those signed bytes, which are the ones
+published. Each newly signed file is also stored under the SHA-256 of its unsigned bytes, so a
+later release reuses it instead of signing it again: a release signs the files that changed,
+mostly the engine's own, and a third-party file again only when its pinned version changes.
+
+The job runs in the `windows-signing` environment, limited to `main` and version tags, which
+holds the eSigner credential (`ES_USERNAME`, `ES_PASSWORD`, `ES_CREDENTIAL_ID`, `ES_TOTP_SECRET`)
+and the variable `WINDOWS_SIGNING_THUMBPRINT`, the SHA-1 thumbprint every WiCi AI signature must
+come from; `APP_VERSIONING_TOKEN` stores the signed files.
+
 The main app installer is built separately in `wici-ai/wici-infer`; this repository publishes the
 precompiled engine it downloads.

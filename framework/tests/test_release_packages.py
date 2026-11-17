@@ -2,6 +2,8 @@ import hashlib
 import importlib.util
 import json
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -48,9 +50,14 @@ def inputs(tmp_path):
     return root, directories, tmp_path / "assets"
 
 
-def prepare(inputs, tag="v0.1.3", revision=REVISION):
+def prepare(inputs, tag="v0.1.3", revision=REVISION, signed_installer=None):
     root, directories, output = inputs
-    return release.prepare(root, directories, output, tag, revision, "wici-ai/inferssd")
+    return release.prepare(
+        root, directories, output, tag, revision, "wici-ai/inferssd", signed_installer
+    )
+
+
+SIGNATURE = b"\r\n# SIG # Begin signature block\r\n# MIIx\r\n# SIG # End signature block\r\n"
 
 
 def test_one_release_contains_every_package_and_both_pinned_installers(inputs):
@@ -130,6 +137,71 @@ def test_missing_platform_and_existing_assets_are_not_silently_replaced(inputs):
     assert existing.read_text() == "published bytes"
 
 
+def test_the_signed_pinned_installer_is_published_byte_for_byte(inputs, tmp_path):
+    root, _, output = inputs
+    pinned = release.pinned_powershell(root, "v0.1.3", "wici-ai/inferssd")
+    signed = tmp_path / "signed-install.ps1"
+    signed.write_bytes(pinned.encode() + SIGNATURE)
+    prepare(inputs, signed_installer=signed)
+    assert (output / "install.ps1").read_bytes() == signed.read_bytes()
+    assert "$DefaultRef = 'v0.1.3'" in pinned
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda body: body.replace(b"v0.1.3", b"v0.1.2", 1) + SIGNATURE,
+        lambda body: body + b"Write-Output 'added'\n" + SIGNATURE,
+        lambda body: body,
+    ],
+)
+def test_a_signed_installer_must_be_the_pinned_installer(inputs, tmp_path, change):
+    root, _, output = inputs
+    pinned = release.pinned_powershell(root, "v0.1.3", "wici-ai/inferssd").encode()
+    signed = tmp_path / "signed-install.ps1"
+    signed.write_bytes(change(pinned))
+    with pytest.raises(ValueError, match="pinned installer"):
+        prepare(inputs, signed_installer=signed)
+    assert not output.exists()
+
+
+def test_the_signing_job_writes_the_same_pinned_installer(tmp_path):
+    written = tmp_path / "out" / "install.ps1"
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/prepare-release-assets.py"),
+            "--pinned-install-ps1",
+            str(written),
+            "--tag",
+            "v0.1.3",
+            "--repository",
+            "wici-ai/inferssd",
+        ],
+        check=True,
+    )
+    expected = release.pinned_powershell(ROOT, "v0.1.3", "wici-ai/inferssd")
+    assert written.read_bytes() == expected.encode()
+
+
+def test_published_windows_packages_are_signed_before_their_check():
+    yaml = pytest.importorskip("yaml")
+    jobs = yaml.load(
+        (ROOT / ".github/workflows/package-windows.yml").read_text(), Loader=yaml.BaseLoader
+    )["jobs"]
+    sign = jobs["sign"]
+    assert sign["needs"] == "build" and sign["environment"] == "windows-signing"
+    assert "inputs.source_ref" in sign["if"] and "inputs.publish" in sign["if"]
+    uploads = [s for s in sign["steps"] if s.get("uses", "").startswith("actions/upload-artifact")]
+    assert {s["with"]["name"] for s in uploads if s["with"].get("overwrite") == "true"} == {
+        "package-windows-x64-vulkan",
+        "package-windows-x64-cuda",
+    }
+    assert set(jobs["check"]["needs"]) == {"build", "sign"}
+    assert set(jobs["publish"]["needs"]) == {"sign", "check"}
+    assert "needs.sign.result == 'success'" in jobs["publish"]["if"]
+
+
 def test_tag_is_the_project_version_and_exact_tag_commit(inputs):
     with pytest.raises(ValueError, match="framework version"):
         prepare(inputs, tag="v0.1.4")
@@ -147,6 +219,10 @@ def test_tag_workflow_waits_for_both_reusable_checked_packages():
         assert jobs[name]["uses"] == f"./.github/workflows/package-{name}.yml"
         assert jobs[name]["with"]["source_ref"] == "${{ needs.validate.outputs.revision }}"
     assert set(jobs["release"]["needs"]) == {"validate", "macos", "windows"}
+    preparation = next(
+        s["run"] for s in jobs["release"]["steps"] if "Prepare both" in s.get("name", "")
+    )
+    assert "--signed-install-ps1 dist/install-windows/install.ps1" in preparation
     group = jobs["release"]["concurrency"]["group"]
     for name in ("macos", "windows"):
         package_workflow = yaml.load(
