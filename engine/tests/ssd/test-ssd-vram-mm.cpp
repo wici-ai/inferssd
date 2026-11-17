@@ -211,6 +211,16 @@ void run_type(void * mm, ggml_backend_t backend, ggml_type type, int64_t nrows, 
     const std::vector<float> importance(ggml_quantize_requires_imatrix(type) ? size_t(ncols) : 0, 1.0f);
     require(ggml_quantize_chunk(type, values.data(), w.data(), 0, nrows, ncols, importance.empty() ? nullptr : importance.data()) == w.size(),
         std::string("quantize ") + ggml_type_name(type));
+    if (type == GGML_TYPE_Q2_0) {
+        // Literal wire codes cover all four levels, including +2 which the encoder does not emit.
+        // Keep the encoder's finite FP16 scales, vary every packed byte independently of dequantization.
+        require(ggml_blck_size(type) == 64 && ggml_type_size(type) == 18, "Q2_0 wire layout");
+        for (size_t block = 0; block < w.size() / 18; ++block) {
+            for (size_t byte = 0; byte < 16; ++byte) {
+                w[block * 18 + 2 + byte] = uint8_t(block * 16 + byte);
+            }
+        }
+    }
     std::vector<float> x(size_t(rows_total) * stride);
     for (auto & v : x) { v = sample(rng); }
 
@@ -317,6 +327,7 @@ int main() {
                 types.push_back(ggml_type(type));
             }
         }
+        require(ggml_cuda_moe_stream_mm_supports(GGML_TYPE_Q2_0), "Q2_0 GPU experts must be supported");
         const size_t covered = types.size();
         ggml_backend_t backend = ggml_backend_cuda_init(device);
         require(backend, "ggml CUDA backend");
@@ -329,9 +340,10 @@ int main() {
             run_type(mm, backend, type, 320, GGML_PAD(1040, ggml_blck_size(type)), stream, t, false);
             ggml_cuda_moe_stream_mm_destroy(mm);
         }
-        // Muse Spark's routed experts: up/gate Q4_K and down Q5_K, 4096 x 4096 each
         void * mm = ggml_cuda_moe_stream_mm_create(device);
         require(mm, "create");
+        run_type(mm, backend, GGML_TYPE_Q2_0, 2560, 640, stream, t, true);
+        // Muse Spark's routed experts: up/gate Q4_K and down Q5_K, 4096 x 4096 each
         run_type(mm, backend, GGML_TYPE_Q4_K, 4096, 4096, stream, t, true);
         run_type(mm, backend, GGML_TYPE_Q5_K, 4096, 4096, stream, t, true);
         ggml_cuda_moe_stream_mm_destroy(mm);

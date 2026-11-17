@@ -429,7 +429,7 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
-        // 42 is reserved; support for the owned F8 block format was removed.
+        GGML_TYPE_Q2_0    = 42,
         // 43 is MXFP8 as the DeepSeek-V4.1 GGUFs published by unsloth write their Engram tables (the
         // deepseek41 llama.cpp pull request 30817); upstream llama.cpp later gave 43 to F8_E4M3.
         GGML_TYPE_MXFP8   = 43, // MXFP8 (32 E4M3 values, one E8M0 scale), read by GET_ROWS only
@@ -477,7 +477,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
-        // 28 is reserved; the owned F8 file type was removed.
+        GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
     };
 
     // available tensor operations:

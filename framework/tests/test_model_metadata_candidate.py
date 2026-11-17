@@ -99,7 +99,7 @@ from test_model_metadata import data, observe
 from test_model_metadata_candidate import candidate_observe
 for case in data()['cases']:
     assert candidate_observe(case) == observe(case), case['name']
-print('52 complete reference/candidate observations matched under seed 17')
+print('51 complete reference/candidate observations matched under seed 17')
 """
     result = subprocess.run(
         [sys.executable, "-c", script, str(Path(__file__).parent)],
@@ -108,7 +108,7 @@ print('52 complete reference/candidate observations matched under seed 17')
         capture_output=True,
         text=True,
     )
-    assert "52 complete" in result.stdout
+    assert "51 complete" in result.stdout
 
 
 class ErasePortsAndTypes(ast.NodeTransformer):
@@ -190,7 +190,11 @@ def test_executable_ast_and_constants(old, module):
         )
         if name == "TYPES":
             # The reader may know types the frozen reference did not; the ones it knew keep
-            # their geometry.
-            assert ast.literal_eval(f_node).items() <= ast.literal_eval(n_node).items()
+            # their geometry, except 42: the reference's owned F8_E4M3_B128 block format was
+            # removed from the engine, and ggml assigns 42 to Q2_0.
+            frozen, current = ast.literal_eval(f_node), ast.literal_eval(n_node)
+            assert frozen.pop(42) == ("F8_E4M3_B128", 128, 129)
+            assert current[42] == ("Q2_0", 64, 18)
+            assert frozen.items() <= current.items()
         else:
             assert ast.dump(f_node) == ast.dump(n_node)

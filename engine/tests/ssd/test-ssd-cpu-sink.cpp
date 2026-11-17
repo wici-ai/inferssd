@@ -3756,10 +3756,10 @@ static bool same_bits(const std::vector<float> & a, const std::vector<float> & b
 // SiLU-gated experts as qwen4exp routes them (separate up/gate/down, softmax top-10, sum-normalized weights)
 // through sink nodes on a ggml threadpool of 1, 2, an odd count and all CPUs, against reference_swiglu_graph,
 // compared with memcmp: two chained decode layers with a dense op between, and grouped prefills. Shapes: the model's
-// (Q8_0 or mixed IQ1_S/IQ4_NL, 2560 -> 640 -> 2560, 512 experts, of which the fixture holds 12),
+// (Q8_0, mixed IQ1_S/IQ4_NL or IQ3_XXS/Q2_0, 2560 -> 640 -> 2560, 512 experts, of which the fixture holds 12),
 // a narrow Q8_0 one for prefills of 2 to
 // 2048 tokens, and a BF16 one whose hidden width of 70 leaves a scalar tail at every fixed vector width.
-static void swiglu_tests(fixture_inputs & inputs, int depth) {
+static void swiglu_tests(fixture_inputs & inputs, int depth, bool q2) {
     const ssd_cpu_sink_activation swiglu = { SSD_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f };
     const int cpus = int(test_resources::process_cpus().size());
     std::vector<int> counts = { 1, 2, 3 };
@@ -3774,6 +3774,7 @@ static void swiglu_tests(fixture_inputs & inputs, int depth) {
     };
     const std::vector<shape> shapes = {
         { "q8_0_model", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2560, 640, 512, { 0, 7, 64, 129, 200, 255, 256, 333, 400, 450, 501, 511 }, { 2, 65 } },
+        { "iq3_xxs_q2_0_model", GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0, 2560, 640, 512, { 0, 7, 64, 129, 200, 255, 256, 333, 400, 450, 501, 511 }, { 2, 65 } },
         { "iq1_s_iq4_nl_model", GGML_TYPE_IQ1_S, GGML_TYPE_IQ4_NL, 2560, 640, 512, { 0, 7, 64, 129, 200, 255, 256, 333, 400, 450, 501, 511 }, { 2, 65 } },
         { "q8_0_narrow", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 256, 96, 48, {}, { 2, 64, 65, 300, 2048 } },
         { "bf16_tail", GGML_TYPE_BF16, GGML_TYPE_BF16, 64, 70, 24, {}, { 2, 65, 300 } },
@@ -3794,6 +3795,8 @@ static void swiglu_tests(fixture_inputs & inputs, int depth) {
         for (int slot = 0; slot < nslots; ++slot) { ids.push_back(pool[size_t(slot)]); weights.push_back(w[size_t(slot)] / sum); }
     };
     for (const auto & s : shapes) {
+        // Keep BF16 in both suites: low-bit down inputs can hide the scalar clamp's rounding difference.
+        if (s.type != GGML_TYPE_BF16 && (s.down_type == GGML_TYPE_Q2_0) != q2) { continue; }
         fixture f;
         f.type = s.type; f.down_type = s.down_type; f.latent = s.latent; f.hidden = s.hidden; f.experts = s.experts; f.stored = s.stored;
         make_synthetic(f, 20261028);
@@ -4214,7 +4217,7 @@ int main(int argc, char ** argv) {
         bool cache_policy_mode = false, cache_large_mode = false, cache_pressure_transition = false, cache_unbounded = false;
         bool activation_mode = false, q2_activation_mode = false, muse_q8_mode = false, muse_bf16_mode = false;
         bool auto_ring_mode = false, prefetch_mode = false, cache_load_mode = false, work_reclaim_mode = false, threadpool_mode = false;
-        bool swiglu_mode = false, lookahead_mode = false;
+        bool swiglu_mode = false, swiglu_q2_mode = false, lookahead_mode = false;
         std::string pack, prefix;
         for (int i = 1; i < argc; ++i) {
             auto argument = [&]() { require(i + 1 < argc, "missing option argument"); return argv[++i]; };
@@ -4257,6 +4260,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--q2-activation-test")) { q2_activation_mode = true; }
             else if (!std::strcmp(argv[i], "--threadpool-tests")) { threadpool_mode = true; }
             else if (!std::strcmp(argv[i], "--swiglu-tests")) { swiglu_mode = true; }
+            else if (!std::strcmp(argv[i], "--swiglu-q2-tests")) { swiglu_q2_mode = true; }
             else if (!std::strcmp(argv[i], "--lookahead-tests")) { lookahead_mode = true; }
             else { throw std::runtime_error("usage: test-ssd-cpu-sink [--registered-lifecycle|--cache-tests|--cache-pressure] [--threads N] [--fixture KEY=VALUE] [--real-pack FILE --fixture-prefix PREFIX --ring-experts N --repeats N --warmup N --policy fixture|top16|top8|mass085 --jsonl FILE --resident-dir TMPFS]"); }
         }
@@ -4310,7 +4314,7 @@ int main(int argc, char ** argv) {
         if (schedules_mode) { schedule_tests(inputs, options.threads, options.ring_experts, true); return 0; }
         if (schedule_invalid_mode) { schedule_invalid_tests(inputs); return 0; }
         if (threadpool_mode) { threadpool_tests(inputs, ring_set ? options.ring_experts : 2); return 0; }
-        if (swiglu_mode) { swiglu_tests(inputs, ring_set ? options.ring_experts : 2); return 0; }
+        if (swiglu_mode || swiglu_q2_mode) { swiglu_tests(inputs, ring_set ? options.ring_experts : 2, swiglu_q2_mode); return 0; }
         if (lookahead_mode) { lookahead_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (trace_profile_mode) { trace_profile_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (prefetch_mode) { prefetch_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }

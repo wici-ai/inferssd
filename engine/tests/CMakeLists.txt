@@ -126,6 +126,13 @@ function(inferssd_ci_test target)
     set_property(TEST ${ARGN} APPEND PROPERTY LABELS ci)
 endfunction()
 
+add_executable(test-q2_0 test-q2_0.cpp)
+target_include_directories(test-q2_0 PRIVATE ../ggml/src)
+target_link_libraries(test-q2_0 PRIVATE ggml-cpu ggml-base)
+add_test(NAME q2_0 COMMAND test-q2_0)
+set_property(TEST q2_0 PROPERTY LABELS unit)
+inferssd_ci_test(test-q2_0 q2_0)
+
 add_executable(test-moe-common-dynamic-tier ssd/test-moe-common-dynamic-tier.cpp)
 target_link_libraries(test-moe-common-dynamic-tier PRIVATE Threads::Threads)
 add_test(NAME moe_common_dynamic_tier COMMAND test-moe-common-dynamic-tier)
@@ -463,7 +470,14 @@ if (TARGET ggml-cpu)
         --fixture nonblocking_down_sched=1 --fixture dynamic_rows=1 --fixture dynamic_chunk_rows=64)
     add_test(NAME ssd_cpu_sink_swiglu_ordinary COMMAND test-ssd-cpu-sink --swiglu-tests --ring-experts 1
         --fixture ready_first=0)
-    set_tests_properties(ssd_cpu_sink_swiglu ssd_cpu_sink_swiglu_ordinary PROPERTIES TIMEOUT 300)
+    # Keep the mixed IQ3_XXS/Q2_0 fixture in separate processes so each SwiGLU suite fits the hosted timeout.
+    add_test(NAME ssd_cpu_sink_swiglu_q2 COMMAND test-ssd-cpu-sink --swiglu-q2-tests --ring-experts 8
+        --fixture ready_first=1 --fixture early_up_gate=1 --fixture role_major=1
+        --fixture nonblocking_down_sched=1 --fixture dynamic_rows=1 --fixture dynamic_chunk_rows=64)
+    add_test(NAME ssd_cpu_sink_swiglu_q2_ordinary COMMAND test-ssd-cpu-sink --swiglu-q2-tests --ring-experts 1
+        --fixture ready_first=0)
+    set_tests_properties(ssd_cpu_sink_swiglu ssd_cpu_sink_swiglu_ordinary
+        ssd_cpu_sink_swiglu_q2 ssd_cpu_sink_swiglu_q2_ordinary PROPERTIES TIMEOUT 300)
     # The grouped prefill's cross-layer read-ahead: layer 2's experts read into the pool during layer 1's call, used
     # bit for bit as reads; injected read failures; a decode run between layers; destruction while it reads. The
     # production schedule with several participants, and one participant with one expert in flight.
@@ -1002,7 +1016,7 @@ foreach(resource_test IN LISTS ssdash_registered_tests)
         else()
             set_property(TEST ${resource_test} APPEND PROPERTY LABELS device)
             set_property(TEST ${resource_test} PROPERTY SKIP_RETURN_CODE 77)
-            if (NOT resource_test MATCHES "^(ssd_cpu_sink|ssd_cpu_sink_schedule_invalid|ssd_cpu_sink_threadpool|ssd_cpu_sink_threadpool_poll|ssd_cpu_sink_swiglu|ssd_cpu_sink_swiglu_ordinary|ssd_cpu_sink_registered|ssd_cpu_sink_trace_profile|dsv41_q2_cpu_sink_decode|ssd_cpu_prefill|ssd_cpu_prefill_registered)$")
+            if (NOT resource_test MATCHES "^(ssd_cpu_sink|ssd_cpu_sink_schedule_invalid|ssd_cpu_sink_threadpool|ssd_cpu_sink_threadpool_poll|ssd_cpu_sink_swiglu|ssd_cpu_sink_swiglu_ordinary|ssd_cpu_sink_swiglu_q2|ssd_cpu_sink_swiglu_q2_ordinary|ssd_cpu_sink_registered|ssd_cpu_sink_trace_profile|dsv41_q2_cpu_sink_decode|ssd_cpu_prefill|ssd_cpu_prefill_registered)$")
                 set_property(TEST ${resource_test} APPEND PROPERTY LABELS ${ssd_envelope_label})
             endif()
         endif()

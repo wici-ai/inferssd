@@ -173,6 +173,10 @@ int main() {
         run_shape(inputs, 512, 256, 8, {true, "production-mixed-layers"}, checks, worst_rel, worst_abs, GGML_TYPE_Q4_K,
             GGML_TYPE_Q5_K, GGML_TYPE_Q4_K);
         run_shape(inputs, 512, 256, 8, {true, "production-generic"}, checks, worst_rel, worst_abs, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4);
+        run_shape(inputs, 2560, 640, 8, {true, "production-generic"}, checks, worst_rel, worst_abs,
+            GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0);
+        run_shape(inputs, 2560, 640, 8, {true, "production-mixed-layers"}, checks, worst_rel, worst_abs,
+            GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0, GGML_TYPE_IQ4_NL);
         run_host_jobs(inputs, GGML_TYPE_Q8_0, checks);
         run_host_jobs(inputs, GGML_TYPE_MXFP4, checks);
         std::printf("REAL_GPU_GENERIC_TIER_PASS checks=%zu worst_rel_l2=%.6g worst_abs=%.6g\n",
