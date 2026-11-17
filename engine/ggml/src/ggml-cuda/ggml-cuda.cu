@@ -451,6 +451,9 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+// the graph node being computed on this thread, for diagnostics
+static thread_local const ggml_tensor * g_cuda_compute_node = nullptr;
+
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
@@ -464,6 +467,16 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     ggml_cuda_buffer buffer_pool[MAX_BUFFERS] = {};
     size_t pool_size = 0;
 
+    // The reservation (reserve): one device allocation handed out as a stack, as the VMM pool hands out its mapped
+    // prefix, so that a graph sized for it takes no device memory while it runs (ops give back what they take from the
+    // pool in reverse order). It only grows: moving it invalidates the graphs captured over it (base), so it keeps the
+    // largest reservation, where the VMM pool gives back what the next graph does not need. Past it, or before any
+    // reservation, buffers are allocated on demand.
+    void * arena = nullptr;
+    size_t arena_size = 0;
+    size_t arena_used = 0;
+    size_t arena_peak = 0;
+
     explicit ggml_cuda_pool_leg(int device) :
         device(device) {
     }
@@ -471,6 +484,53 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     ~ggml_cuda_pool_leg() {
         clear_pool();
         GGML_ASSERT(pool_size == 0);
+        if (arena) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(ggml_cuda_device_free(arena, arena_size, device));
+        }
+    }
+
+    bool reserve(size_t size) override {
+        size = ggml_cuda_pool_alloc_size(size);
+        if (arena_size - arena_used >= size) {
+            return true;
+        }
+        if (arena_used != 0) {
+            return false; // the reservation is in use and cannot move
+        }
+        // the buffers allocated on demand go; the reservation takes their place
+        clear_pool();
+        ggml_cuda_set_device(device);
+        if (arena) {
+            CUDA_CHECK(ggml_cuda_device_free(arena, arena_size, device));
+            arena = nullptr;
+            arena_size = 0;
+        }
+        const cudaError_t err = ggml_cuda_device_malloc(&arena, size, device);
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            arena = nullptr;
+            GGML_LOG_WARN("%s: device %d cannot reserve %.2f MiB for its memory pool\n", __func__, device, size/1024.0/1024.0);
+            return false;
+        }
+        arena_size = size;
+        return true;
+    }
+
+    size_t capacity() const override {
+        return arena ? arena_size : SIZE_MAX;
+    }
+
+    size_t peak() const override {
+        return arena_peak;
+    }
+
+    void reset_peak() override {
+        arena_peak = arena_used;
+    }
+
+    const void * base() const override {
+        return arena;
     }
 
     void clear_pool() {
@@ -487,6 +547,18 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
+        if (arena && arena_used + ggml_cuda_pool_alloc_size(size) <= arena_size) {
+            void * ptr = static_cast<char *>(arena) + arena_used;
+            *actual_size = ggml_cuda_pool_alloc_size(size);
+            arena_used += *actual_size;
+            arena_peak = std::max(arena_peak, arena_used);
+            return ptr;
+        }
+        if (arena) {
+            const ggml_tensor * node = g_cuda_compute_node;
+            GGML_LOG_WARN("%s: device %d allocates %.2f MiB past its %.2f MiB reservation, in %s (%s)\n", __func__, device,
+                size/1024.0/1024.0, arena_size/1024.0/1024.0, node ? node->name : "-", node ? ggml_op_desc(node) : "-");
+        }
 #ifdef DEBUG_CUDA_MALLOC
         int nnz = 0;
         size_t max_size = 0;
@@ -552,6 +624,12 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     }
 
     void free(void * ptr, size_t size) override {
+        if (arena && ptr >= arena && ptr < static_cast<char *>(arena) + arena_size) {
+            arena_used -= size;
+            // all deallocations from the reservation are in reverse order of the allocations, as the VMM pool's
+            GGML_ASSERT(ptr == static_cast<char *>(arena) + arena_used);
+            return;
+        }
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer& b = buffer_pool[i];
             if (b.ptr == nullptr) {
@@ -566,9 +644,6 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         pool_size -= size;
     }
 };
-
-// the graph node being computed on this thread, for diagnostics
-static thread_local const ggml_tensor * g_cuda_compute_node = nullptr;
 
 // pool with virtual memory
 #if defined(GGML_USE_VMM)
@@ -702,6 +777,10 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
     size_t capacity() const override {
         return pool_size;
+    }
+
+    const void * base() const override {
+        return (const void *) pool_addr;
     }
 
     size_t peak() const override {
@@ -1348,8 +1427,10 @@ bool ggml_cuda_growable_memory::set_committed(size_t bytes) {
     GGML_ASSERT(base != 0);
     const size_t target = std::min(reserved, granularity * ((bytes + granularity - 1) / granularity));
     ggml_cuda_set_device(device);
-    // shrink: the mappings past the target go, the one it falls in stays
-    while (!mappings.empty() && mappings.back().first >= base + target) {
+    // shrink: the mappings past the target go, the one it falls in stays (an address is an integer under CUDA and a
+    // pointer under HIP: offsets are taken on bytes)
+    const CUdeviceptr end = (CUdeviceptr)((char *)(base) + target);
+    while (!mappings.empty() && mappings.back().first >= end) {
         CU_CHECK(cuMemUnmap(mappings.back().first, mappings.back().second));
         g_cuda_reserve_budgets[device].release(mappings.back().second);
         mapped -= mappings.back().second;
@@ -1378,7 +1459,7 @@ bool ggml_cuda_growable_memory::set_committed(size_t bytes) {
         return false;
     }
     g_cuda_reserve_budgets[device].hold(more);
-    const CUdeviceptr at = base + mapped;
+    const CUdeviceptr at = (CUdeviceptr)((char *)(base) + mapped);
     CU_CHECK(cuMemMap(at, more, 0, handle, 0));
     CU_CHECK(cuMemRelease(handle));
     CUmemAccessDesc access = {};
@@ -5959,13 +6040,16 @@ static bool ggml_backend_cuda_graph_reserve(ggml_backend_t backend, ggml_cgraph 
     }
 
     ggml_cuda_pool & pool = cuda_ctx->pool();
+    const void * base = pool.base();
     if (!pool.reserve(size)) {
         return false;
     }
 #ifdef USE_CUDA_GRAPH
-    // a captured graph that reaches past the end of the pool would replay onto released memory
+    // a captured graph that reaches past the end of the pool, or into memory the pool has moved from, would replay
+    // onto released memory
+    const bool moved = pool.base() != base;
     for (auto it = cuda_ctx->cuda_graphs.begin(); it != cuda_ctx->cuda_graphs.end(); ) {
-        if (it->second->pool_end > pool.capacity()) {
+        if (moved || it->second->pool_end > pool.capacity()) {
             it = cuda_ctx->cuda_graphs.erase(it);
         } else {
             ++it;

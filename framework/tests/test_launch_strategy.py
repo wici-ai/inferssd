@@ -202,7 +202,7 @@ def test_without_a_usable_gpu_the_budget_is_zero_and_no_gpu_is_checked(tmp_path)
 def test_user_launch_checks_still_apply_to_the_merged_result(tmp_path):
     inputs, spec, host, adapter, out = strategic(tmp_path)
     host["gpu_available"] = False
-    with pytest.raises(ValueError, match="requires nvidia-smi"):
+    with pytest.raises(ValueError, match="requires the GPUs' driver"):
         resolved(inputs, spec, adapter, out)
 
 
@@ -324,7 +324,8 @@ def test_recorded_engine_gpu_backends():
     # Recordings made before the fact existed: the engine's backends are unknown.
     assert recorded({})(fact).value is None
     assert recorded({"engine_gpu_backends": ["Metal"]})(fact).value == ["Metal"]
-    for value in (["ROCm"], "CUDA", ["CUDA", "CUDA"]):
+    assert recorded({"engine_gpu_backends": ["ROCm"]})(fact).value == ["ROCm"]
+    for value in (["OpenCL"], "CUDA", ["CUDA", "CUDA"]):
         with pytest.raises(ValueError, match="engine_gpu_backends"):
             recorded({"engine_gpu_backends": value})(fact)
 
@@ -357,7 +358,9 @@ def test_recorded_model_runtime_and_drive_facts(tmp_path):
     with pytest.raises(ValueError, match="model_facts.roles is required"):
         recorded({"model_facts": partial_header})(Fact("model_facts", (model,)))
     runtime_value = recorded({"runtime_facts": runtime_record()})(Fact("runtime_facts")).value
-    assert runtime_value == dict(runtime_record(), memory_budget_bytes=None)
+    # A record made before GPUs carried their backend came from nvidia-smi: CUDA's.
+    gpus = [dict(row, backend="CUDA") for row in runtime_record()["gpus"]]
+    assert runtime_value == dict(runtime_record(), gpus=gpus, memory_budget_bytes=None)
     with pytest.raises(ValueError, match="Missing recorded host fact: runtime_facts"):
         recorded({})(Fact("runtime_facts"))
     with pytest.raises(ValueError, match="must not repeat a CPU"):
@@ -398,7 +401,9 @@ def test_live_strategy_facts(tmp_path):
     assert adapter(Fact("machine_characteristics")).value == "CHARACTERISTICS"
     assert adapter(Fact("runtime_facts")).value == {
         "cpus": [0, 1],
-        "gpus": [{"uuid": "GPU-aaaa", "free_bytes": 30000 << 20, "processes": 0}],
+        "gpus": [
+            {"uuid": "GPU-aaaa", "free_bytes": 30000 << 20, "processes": 0, "backend": "CUDA"}
+        ],
         "available_bytes": 1000 * 1024,
         "memory_budget_bytes": None,
     }

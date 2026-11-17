@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The GPU backend to build the engine with on this machine, for the installers.
 
-``python -m inferssd.machine.backend`` prints CUDA, Metal, Vulkan or CPU. It
-follows the machine's GPUs through the table the launch reads
-(identity.PCI_BACKENDS, identity.build_backend). An installed nvidia-smi that
-fails still means an NVIDIA GPU: its driver is there.
+``python -m inferssd.machine.backend`` prints CUDA, ROCm, Metal, Vulkan or CPU.
+It follows the machine's GPUs through the table the launch reads
+(identity.PCI_BACKENDS, identity.amd_compute, identity.build_backend). An
+installed nvidia-smi that fails still means an NVIDIA GPU: its driver is there.
 """
 
 from __future__ import annotations

@@ -119,9 +119,9 @@ int main(int argc, char ** argv) {
         assert(scopes.at("cpu.decode_participants").object.at("scope").text == "all");
         assert(scopes.at("vram.max_slots").object.at("scope").text == "all");
         assert(scopes.at("vram.budget").object.at("scope").text == "all");
-        // The CUDA tier's keys name their backend; the others have none.
+        // The VRAM tier's keys name the backends that carry it; the others have none.
         for (const char * key : { "vram.max_slots", "vram.reserve_mib" }) {
-            assert(scopes.at(key).object.at("backend").text == "CUDA");
+            assert(scopes.at(key).object.at("backend").text == "CUDA,ROCm");
         }
         assert(!scopes.at("vram.budget").object.count("backend") && !scopes.at("cpu.io_cpus").object.count("backend"));
     }

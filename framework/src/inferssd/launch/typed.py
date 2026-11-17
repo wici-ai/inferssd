@@ -24,6 +24,7 @@ from inferssd.launch import ram
 from inferssd.launch.darwin import MODEL_OPTIONS
 from inferssd.launch.resources import EngineResources, server_binary
 from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
+from inferssd.machine.identity import TIER_BACKENDS
 from inferssd.strategy.inputs import model_facts_from, runtime_facts_from
 from inferssd.strategy.launch import Planned, plan
 
@@ -586,19 +587,25 @@ def _resolve(
                     "the memory controller is not delegated to your systemd user manager: "
                     "add Delegate=memory to a user@.service drop-in, or launch as root" + guide
                 )
-    # The CUDA tier finds its GPUs through nvidia-smi. With the engine's backends unknown, the
-    # engine itself refuses a budget it has no tier for.
-    if not ordinary and value.at("vram.budget").value != 0 and "CUDA" in (gpu_backends or ()):
+    # The launch reads the VRAM tier's GPUs through their driver: nvidia-smi for CUDA, amdkfd for
+    # ROCm. With the engine's backends unknown, the engine itself refuses a budget it has no tier
+    # for.
+    tier = set(TIER_BACKENDS) & set(gpu_backends or ())
+    if not ordinary and value.at("vram.budget").value != 0 and tier:
         if not s.value("gpu_available"):
-            raise ValueError("typed GPU execution requires nvidia-smi")
-    # A setting of a GPU backend's expert tier needs an engine built with that backend.
+            raise ValueError(
+                "typed GPU execution requires the GPUs' driver: "
+                "nvidia-smi for CUDA, amdkfd for ROCm"
+            )
+    # A setting of the expert tier needs an engine built with a backend that carries it.
     for item in () if ordinary else value.entries:
         backend = schema()["properties"][item.key].get("backend")
         if backend and item.origin != "default" and gpu_backends is not None:
-            if backend not in gpu_backends:
+            if not set(backend.split(",")) & set(gpu_backends):
                 raise ValueError(
-                    f"{item.key} ({item.location}) configures the {backend} expert tier, "
-                    "which this engine was built without"
+                    f"{item.key} ({item.location}) configures the expert tier of "
+                    + " or ".join(backend.split(","))
+                    + ", which this engine was built without"
                 )
     # The sink's I/O thread keeps its own CPUs; decode runs on the first decode threads.
     if not ordinary and set(cast(tuple[int, ...], value.at("cpu.io_cpus").value)) & set(

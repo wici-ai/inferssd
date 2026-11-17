@@ -265,6 +265,9 @@ def test_a_builds_gpu_backends_are_read_from_its_cmake_cache():
     assert cmake_gpu_backends(cache) == ("CUDA", "Vulkan")
     metal = "GGML_METAL:BOOL=ON\nGGML_CUDA_SSD_VRAM_TIER:BOOL=ON\n"
     assert cmake_gpu_backends(metal) == ("Metal",)
+    # ggml's HIP backend runs AMD GPUs on ROCm, with the tier built from the CUDA sources.
+    hip = "GGML_HIP:BOOL=ON\nGGML_CUDA:BOOL=OFF\nGGML_CUDA_SSD_VRAM_TIER:BOOL=ON\n"
+    assert cmake_gpu_backends(hip) == ("ROCm",)
     assert cmake_gpu_backends("") == ()
 
 

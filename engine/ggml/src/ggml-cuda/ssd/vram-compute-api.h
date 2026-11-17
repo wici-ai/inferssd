@@ -3,8 +3,8 @@
 #include <stdint.h>
 #include "export.h"
 #include "ggml-ssd/gpu/vram-tier-api.h"
+#include "gpu-runtime.h"
 struct vram_compute_expert { const void * up; const void * gate; const void * down; };
-struct CUevent_st;
 // Decode engine of the tier (generic-compute-adapter.cu): an f32 input row, up and gate, the activation and down over
 // up to max_hits experts of one format on the CUDA backend's matrix-vector kernels; returns unweighted down rows.
 // compute runs a call and waits for it (grouped prefill's one-token passes, on the tier's worker). launch queues one
@@ -20,8 +20,8 @@ struct vram_format_compute_api {
     size_t (*device_scratch_bytes)(void *);
     size_t (*host_scratch_bytes)(void *);
     int (*launch)(void *, const vram_compute_expert *, int hits, int first, const void * input, size_t input_bytes,
-                  const ssd_vram_activation * activation, struct CUevent_st * ready, struct CUevent_st * start,
-                  struct CUevent_st * end, char * error, size_t error_size);
+                  const ssd_vram_activation * activation, cudaEvent_t ready, cudaEvent_t start, cudaEvent_t end,
+                  char * error, size_t error_size);
     const float * (*host_rows)(void *); // [max_hits][latent]
 };
 typedef const vram_format_compute_api * (*vram_format_compute_get_api_fn)();
@@ -83,8 +83,8 @@ struct vram_group_compute_api {
     // Queues group g's chain with these weights. The chain waits for `ready` (a weights upload, or null) on the device;
     // *done (optional) receives an event that completes when the chain no longer reads the weights, valid until the
     // next begin_layer.
-    int (*compute)(void *, int group, const struct vram_compute_expert * weights, struct CUevent_st * ready,
-                   struct CUevent_st ** done, char * error, size_t error_size);
+    int (*compute)(void *, int group, const struct vram_compute_expert * weights, cudaEvent_t ready,
+                   cudaEvent_t * done, char * error, size_t error_size);
     // Waits for the layer and returns its accumulated rows [rows][latent] (page-locked, valid until the next
     // begin_layer) and the layer's stats; group_us (optional, one per group) each chain's time. Every group of the
     // layer must have been computed.

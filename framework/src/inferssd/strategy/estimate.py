@@ -17,10 +17,10 @@ from inferssd.machine.characteristics import GPU, Characteristics, ComputeRow
 from inferssd.strategy.derive import (
     IN_FLIGHT,
     drive_rate,
-    engine_gpu_backends,
     host_headroom_mib,
     placement,
     single_gpu,
+    tier_gpus,
 )
 from inferssd.strategy.inputs import BLOCKS, ModelFacts, RuntimeFacts
 
@@ -204,20 +204,17 @@ def cpu_decode_seconds(
     return total, ""
 
 
-def cuda_gpu(
+def tier_gpu(
     c: Characteristics, runtime: RuntimeFacts, gpu_work_bytes: int
 ) -> tuple[Optional[GPU], int, list[ComputeRow]]:
-    """The one discrete CUDA GPU the engine puts dense weights on, the bytes free on it less
-    GPU_WORK_BYTES, and its one-token matrix measurements; (None, 0, []) without one."""
+    """The one discrete GPU with the VRAM tier (CUDA, ROCm) the engine puts dense weights on, the
+    bytes free on it less GPU_WORK_BYTES, and its one-token matrix measurements; (None, 0, [])
+    without one."""
     gpu = single_gpu(c, runtime)
-    if (
-        not gpu
-        or "CUDA" not in engine_gpu_backends(runtime.gpu_backends, c)
-        or c["memory"]["unified"]
-        or gpu["integrated"]
-    ):
+    if not gpu or c["memory"]["unified"] or gpu["integrated"]:
         return None, 0, []
-    free = runtime.gpus[0].free_bytes if runtime.gpus else None
+    usable = tier_gpus(runtime, c)
+    free = usable[0].free_bytes if usable else None
     room = max(0, min(free or 0, gpu["vram_total_bytes"]) - gpu_work_bytes)
     return gpu, room, gpu.get("decode_compute", [])
 
@@ -269,7 +266,7 @@ def decode_estimate(
         available = min(available, runtime.memory_budget_bytes)
     available = min(available, characteristics["memory"]["total_bytes"])
     room = max(0, available - headroom_bytes(characteristics, runtime, platform) - host_work_bytes)
-    gpu, gpu_room, rows = cuda_gpu(characteristics, runtime, gpu_work_bytes)
+    gpu, gpu_room, rows = tier_gpu(characteristics, runtime, gpu_work_bytes)
     assumptions = [
         "Uniform expert routing; inclusive RAM/VRAM caches, not observed hit rates.",
         "Serial I/O plus CPU/GPU service time; prefetch overlap is a separate scenario.",
@@ -280,10 +277,10 @@ def decode_estimate(
         "Attention, non-matmul graph work, lookup I/O and cache warm-up are unpriced.",
         "KV/graph working memory is unreserved unless work-byte arguments are supplied.",
     ]
-    if runtime.gpus and any(device.processes for device in runtime.gpus):
+    if any(device.processes for device in tier_gpus(runtime, characteristics) or ()):
         assumptions.append("GPU contention is present and is not priced by this estimate.")
     # Dense quantization is not retained by ModelFacts. Q8_0 is an explicit proxy;
-    # never substitute peak CUDA bandwidth for measured quantized computation.
+    # never substitute a GPU's peak bandwidth for measured quantized computation.
     dense_rate = matvec_rate(rows, "Q8_0", 4096, 4096)
     gpu_expert_s = 0.0
     gpu_fast_s = 0.0
@@ -322,7 +319,7 @@ def decode_estimate(
         gpu_cache = max(0, gpu_room - dense_read_bytes)
         dense_s = dense_read_bytes / (dense_rate or 1)
         assumptions.append(
-            "Dense weights on one CUDA GPU; dense Q8_0 matvec proxy (actual types unknown)."
+            "Dense weights on one GPU; dense Q8_0 matvec proxy (actual types unknown)."
         )
     else:
         resident = min(dense_read_bytes, room)
@@ -443,12 +440,12 @@ def dense_decode_estimate(
     gpu_work_bytes: int = 0,
 ) -> Estimate:
     """A model without routed experts, which runs from memory: a token reads each dense weight once,
-    on one CUDA GPU when they fit the memory free on it, else from RAM at the fastest measured read
-    rate. A default, as an expert model's dense weights are priced: the Q8_0 matvec measurement
-    stands for the weights' own types, and nothing calibrates it against a run yet."""
+    on one GPU with the VRAM tier when they fit the memory free on it, else from RAM at the fastest
+    measured read rate. A default, as an expert model's dense weights are priced: the Q8_0 matvec
+    measurement stands for the weights' own types, and nothing calibrates it against a run yet."""
     if dense_read_bytes <= 0:
         return Estimate(None, "the model's dense weight bytes are not known")
-    gpu, gpu_room, rows = cuda_gpu(characteristics, runtime, gpu_work_bytes)
+    gpu, gpu_room, rows = tier_gpu(characteristics, runtime, gpu_work_bytes)
     rate = matvec_rate(rows, "Q8_0", 4096, 4096) if gpu and gpu_room >= dense_read_bytes else None
     assumptions = [
         "Dense model: a token reads each weight once; one-row lookup tables do not count.",
@@ -459,10 +456,8 @@ def dense_decode_estimate(
         seconds = dense_read_bytes / rate
         fast = dense_read_bytes / (matvec_rate(rows, "Q8_0", 4096, 4096, "q1") or rate)
         slow = dense_read_bytes / (matvec_rate(rows, "Q8_0", 4096, 4096, "q3") or rate)
-        where = f"one CUDA GPU at {rate / GB:.0f} GB/s"
-        assumptions.append(
-            "Weights on one CUDA GPU; dense Q8_0 matvec proxy (actual types unknown)."
-        )
+        where = f"one GPU at {rate / GB:.0f} GB/s"
+        assumptions.append("Weights on one GPU; dense Q8_0 matvec proxy (actual types unknown).")
     else:
         memory_Bps = max((r["Bps"] for r in characteristics["memory"]["dram_read_Bps"]), default=0)
         if memory_Bps <= 0:

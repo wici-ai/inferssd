@@ -194,7 +194,7 @@ def test_missing_probes_record_failed_sections(tmp_path):
     assert "inferssd-cpuprobe not found" in sections["compute"]["detail"]
     assert sections["cpu"]["status"] == "partial" and sections["memory"]["status"] == "partial"
     assert sections["gpus"] == dict(
-        sections["gpus"], status="ok", detail="no NVIDIA GPU found by nvidia-smi"
+        sections["gpus"], status="ok", detail="no GPU on CUDA (nvidia-smi) or ROCm (amdkfd) found"
     )
     storage = sections["storage:" + nvme_key()]
     assert (
@@ -222,7 +222,7 @@ def test_failing_probe_reports_its_reason(tmp_path):
         == "inferssd-ssdprobe exited with status 2: cannot open for direct I/O: /models/x"
     )
     assert host.test_files == [], "only the page-cache case falls back to a test file"
-    assert value["sections"]["gpus"]["detail"] == "the probe found no CUDA device"
+    assert value["sections"]["gpus"]["detail"] == "the probe found no GPU"
 
 
 def test_missing_model_path_is_an_error(tmp_path):

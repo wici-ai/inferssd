@@ -284,13 +284,78 @@ def test_linux_lists_the_gpus_a_vulkan_build_can_use(tmp_path):
     ]
 
 
+def kfd(root, node, simd, *, location=0, unique=None, gpu_id=None):
+    """An amdkfd topology node: a CPU (no SIMDs) or an AMD GPU at a PCI location."""
+    base = f"/sys/class/kfd/kfd/topology/nodes/{node}/"
+    values = {
+        "simd_count": simd,
+        "vendor_id": 4098 if simd else 0,
+        "location_id": location,
+        "domain": 0,
+    }
+    if unique is not None:
+        values["unique_id"] = unique
+    write(root, base + "properties", "".join(f"{key} {value}\n" for key, value in values.items()))
+    if gpu_id is not None:
+        write(root, base + "gpu_id", f"{gpu_id}\n")
+
+
+ROCMINFO = ("rocminfo",)
+
+
+def amd_card(root):
+    """An AMD card at 0000:03:00.0 that amdkfd lists after the CPU node, and an Intel iGPU."""
+    pci(root, "0000:00:02.0", "0x030000", "0x8086", "0x7d55")
+    pci(root, "0000:03:00.0", "0x030000", "0x1002", "0x7551", vram=34208743424)
+    kfd(root, 0, 0)
+    # location_id is the bus, device and function: 3 << 8 for 03:00.0
+    kfd(root, 1, 128, location=3 << 8, unique=13321632177709804703, gpu_id=64106)
+
+
+def test_linux_runs_the_amd_gpus_amdkfd_lists_on_rocm(tmp_path):
+    commands = linux_tree(tmp_path, gpu=False)
+    amd_card(tmp_path)
+    # Without the ROCm runtime the AMD GPU runs on Vulkan, as every display controller there.
+    identity = live_identity(FakeHost(tmp_path, commands=commands))
+    assert [(gpu["backend"], gpu["uuid"]) for gpu in identity["hard"]["gpus"]] == [
+        ("Vulkan", "pci-0000:00:02.0"),
+        ("Vulkan", "pci-0000:03:00.0"),
+    ]
+    assert "memory" not in identity["soft"]["probe_versions"]
+    assert machine_backend(FakeHost(tmp_path, commands=commands)) == "Vulkan"
+    # With it, ROCm runs the GPU, named by ROCm's UUID (rocminfo, HIP), not again as a Vulkan one.
+    commands[ROCMINFO] = ok("")
+    identity = live_identity(FakeHost(tmp_path, commands=commands))
+    assert [
+        (gpu["backend"], gpu["uuid"], gpu["name"], gpu["vram_bytes"])
+        for gpu in identity["hard"]["gpus"]
+    ] == [
+        ("ROCm", "GPU-b8dff1e274ce6c9f", "PCI 1002:7551", 34208743424),
+        ("Vulkan", "pci-0000:00:02.0", "PCI 8086:7d55", 0),
+    ]
+    assert "memory" in identity["soft"]["probe_versions"]
+    assert identity["soft"]["gpu_driver"] is None  # the kernel's amdgpu: soft.kernel names it
+    write(tmp_path, "/sys/module/amdgpu/version", "6.16.13\n")
+    assert (
+        live_identity(FakeHost(tmp_path, commands=commands))["soft"]["gpu_driver"]
+        == "amdgpu 6.16.13"
+    )
+    assert machine_backend(FakeHost(tmp_path, commands=commands)) == "ROCm"
+    # A unique ID below 2**60 keeps its 16 digits, as HIP's 16-byte UUID does.
+    kfd(tmp_path, 1, 128, location=3 << 8, unique=0x0123456789ABCDEF, gpu_id=64106)
+    gpus = live_identity(FakeHost(tmp_path, commands=commands))["hard"]["gpus"]
+    assert gpus[0]["uuid"] == "GPU-0123456789abcdef"
+
+
 def test_the_engine_builds_for_the_machines_gpus(tmp_path):
     assert build_backend([]) is None
     vulkan = {"backend": "Vulkan", "uuid": "pci-0", "name": "PCI 8086:7d55", "vram_bytes": 0}
     cuda = {"backend": "CUDA", "uuid": "GPU-1", "name": "NVIDIA", "vram_bytes": 1}
     metal = {"backend": "Metal", "uuid": "M5:10", "name": "Apple M5", "vram_bytes": 0}
+    rocm = {"backend": "ROCm", "uuid": "GPU-b8df", "name": "PCI 1002:7551", "vram_bytes": 1}
     assert build_backend([vulkan]) == "Vulkan"
     assert build_backend([vulkan, cuda]) == "CUDA" and build_backend([metal]) == "Metal"
+    assert build_backend([vulkan, rocm]) == "ROCm" and build_backend([rocm, cuda]) == "CUDA"
     commands = linux_tree(tmp_path)
     assert machine_backend(FakeHost(tmp_path, commands=commands)) == "CUDA"
     del commands[SMI]

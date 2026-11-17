@@ -9,7 +9,7 @@
 #include "test-ssd-cpu-sink.cpp"
 #undef main
 #include "host-jobs-test.inc"
-#include <cuda_runtime.h>
+#include "gpu-runtime.h"
 
 namespace {
 double relative_l2(const std::vector<float> & got, const std::vector<float> & expected) {

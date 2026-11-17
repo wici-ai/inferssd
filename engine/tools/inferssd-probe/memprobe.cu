@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-// inferssd-memprobe: for every CUDA device, VRAM size, host-to-device and device-to-host copy bandwidth per copy size
-// (pinned and pageable host memory), device-to-device copy bandwidth and streaming-read bandwidth. Every rate is
-// cudaEvent time over back-to-back repeated operations on one stream. Prints one JSON object on stdout.
-#include <cuda_runtime.h>
+// inferssd-memprobe: for every device of the GPU backend's runtime (CUDA, or HIP for AMD GPUs), VRAM size,
+// host-to-device and device-to-host copy bandwidth per copy size (pinned and pageable host memory), device-to-device
+// copy bandwidth and streaming-read bandwidth. Every rate is event time over back-to-back repeated operations on one
+// stream. Prints one JSON object on stdout. The program is written to the CUDA runtime's names, which HIP takes
+// through the backend's vendor header, as the backend's own sources do.
+#include "ggml-cuda/ssd/gpu-runtime.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -62,6 +64,14 @@ std::string quote(const std::string & s) {
     return out + "\"";
 }
 
+// The UUID as the GPU's driver tools spell it, which the machine identity lists the GPU by.
+#if defined(GGML_USE_HIP)
+// ROCm's spelling (rocminfo, ROCR_VISIBLE_DEVICES): GPU- and the device's unique ID in hex, which HIP gives as that
+// text in the 16 bytes.
+std::string format_uuid(const cudaUUID_t & uuid) {
+    return "GPU-" + std::string(uuid.bytes, strnlen(uuid.bytes, sizeof(uuid.bytes)));
+}
+#else
 // nvidia-smi's spelling: GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.
 std::string format_uuid(const cudaUUID_t & uuid) {
     const unsigned char * b = reinterpret_cast<const unsigned char *>(uuid.bytes);
@@ -70,6 +80,7 @@ std::string format_uuid(const cudaUUID_t & uuid) {
                   b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
     return buf;
 }
+#endif
 
 int attribute(cudaDeviceAttr attr, int device) {
     int value = 0;

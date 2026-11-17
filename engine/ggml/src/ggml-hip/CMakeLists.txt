@@ -155,3 +155,15 @@ if (GGML_HIP_RCCL)
 endif()
 
 target_link_libraries(ggml-hip PRIVATE ggml-base hip::host roc::rocblas roc::hipblas)
+
+# The SSD expert VRAM tier, from the CUDA backend's sources as the rest of this backend (after the definitions above,
+# which its directory inherits).
+if (GGML_CUDA_SSD_VRAM_TIER)
+    if (CXX_IS_HIPCC)
+        message(FATAL_ERROR "GGML_CUDA_SSD_VRAM_TIER on HIP needs CMake's HIP language, not hipcc as the C++ compiler")
+    endif()
+    set(SSD_GPU_BACKEND ggml-hip)
+    set(SSD_GPU_LANGUAGE HIP)
+    set(SSD_GPU_RUNTIME hip::host)
+    add_subdirectory(../ggml-cuda/ssd ssd)
+endif()

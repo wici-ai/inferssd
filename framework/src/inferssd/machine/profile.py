@@ -45,6 +45,7 @@ from inferssd.machine.characteristics import (
     Storage,
 )
 from inferssd.machine.identity import (
+    TIER_BACKENDS,
     Drive,
     GPUQueryFailed,
     Host,
@@ -448,9 +449,9 @@ def measure_gpus(
         return [], section(start, clock(), "nvidia-smi", "failed", failure)
     if "memory" not in identity["soft"]["probe_versions"]:
         why = (
-            "the GPU transfer probe needs an NVIDIA GPU with CUDA"
+            "the GPU transfer probe needs a GPU on CUDA or ROCm"
             if identity["hard"]["platform"] == "darwin"
-            else "no NVIDIA GPU found by nvidia-smi"
+            else "no GPU on CUDA (nvidia-smi) or ROCm (amdkfd) found"
         )
         return [], section(start, clock(), "none", "ok", why)
     progress("GPU probe: VRAM size and transfer rates")
@@ -461,12 +462,12 @@ def measure_gpus(
         return [], section(start, clock(), method, "failed", str(error))
     gpus = gpu_rows(report)
     if not gpus:
-        return [], section(start, clock(), method, "failed", "the probe found no CUDA device")
+        return [], section(start, clock(), method, "failed", "the probe found no GPU")
     measured = {gpu["uuid"].lower() for gpu in gpus}
     missing = [
         gpu["uuid"]
         for gpu in identity["hard"]["gpus"]
-        if gpu["backend"] == "CUDA" and gpu["uuid"].lower() not in measured
+        if gpu["backend"] in TIER_BACKENDS and gpu["uuid"].lower() not in measured
     ]
     reasons = [f"device {index}: {why}" for index, why in sorted(skipped_devices(report).items())]
     notes = []

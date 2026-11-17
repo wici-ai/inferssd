@@ -83,7 +83,7 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     command.add_argument(
         "--estimate-compute",
         action="store_true",
-        help="measure synthetic CUDA decode matrices; never runs a model",
+        help="measure synthetic decode matrices on CUDA or ROCm GPUs; never runs a model",
     )
     command.add_argument("--reprofile", action="store_true", help="measure every section again")
     command.add_argument(

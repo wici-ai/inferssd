@@ -261,7 +261,7 @@ def test_a_ram_only_model_reads_its_dense_weights_once_a_token():
     assert on_gpu.tokens_per_second == pytest.approx(500e9 / gemma.dense_read_bytes)
     low, high = on_gpu.scenario_range
     assert low < on_gpu.tokens_per_second < high
-    assert "from one CUDA GPU at 500 GB/s" in on_gpu.detail
+    assert "from one GPU at 500 GB/s" in on_gpu.detail
     in_ram = dense_decode_estimate(c, gemma.dense_read_bytes, replace(rt, gpus=()))
     best = max(row["Bps"] for row in c["memory"]["dram_read_Bps"])
     assert in_ram.tokens_per_second == pytest.approx(best / gemma.dense_read_bytes)

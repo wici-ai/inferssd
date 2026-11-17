@@ -1,20 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
+#if defined(GGML_USE_HIP)
+#include "ggml-cuda/vendors/hip.h" // hipBLAS under cuBLAS's names, as the backend calls it
+#else
 #include <cublas_v2.h>
+#endif
 #include "ggml-cuda.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <vector>
 
-// Link to the backend's real retry helper. Interpose only cublasCreate_v2 in this
-// test executable so failure states are deterministic without exhausting VRAM.
+// Link to the backend's real retry helper. Interpose only the handle creation the backend
+// calls (cublasCreate_v2, or hipblasCreate under HIP) in this test executable so failure
+// states are deterministic without exhausting VRAM.
 cublasStatus_t ggml_cuda_cublas_create_reclaiming(cublasHandle_t *, int);
 static std::vector<cublasStatus_t> sequence;
 static size_t calls, reclaim_calls;
 static int callback_result;
 static size_t callback_freed;
 static bool bad_request;
-extern "C" cublasStatus_t CUBLASWINAPI cublasCreate_v2(cublasHandle_t * handle) {
+extern "C" cublasStatus_t cublasCreate(cublasHandle_t * handle) {
     if (calls >= sequence.size()) std::abort();
     const auto status = sequence[calls++];
     if (status == CUBLAS_STATUS_SUCCESS) *handle = reinterpret_cast<cublasHandle_t>(uintptr_t(1));

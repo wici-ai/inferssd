@@ -18,7 +18,9 @@
 // handle, as in ggml's own MUL_MAT. reserve sizes the pool, the dequantize scratch and the cuBLAS workspace up front,
 // so a product made after it allocates no device memory; release gives all of it back. reserve also loads every kernel
 // the products can take: CUDA loads a kernel, and takes device memory for its module, on the kernel's first launch
-// (lazy loading) and keeps it for the process, so that happens in reserve and not in the middle of a pass.
+// (lazy loading) and keeps it for the process, so that happens in reserve and not in the middle of a pass. HIP backs a
+// kernel's scratch (its private segment: register spills, local arrays) per hardware queue, on the kernel's first
+// dispatch on that queue, and keeps it for the queue; so reserve runs the kernels on the stream the products will run on.
 #include "../common.cuh"
 #include "../convert.cuh"
 #include "../mmq.cuh"
@@ -60,9 +62,9 @@ struct moe_stream_mm {
     size_t dequant_bytes = 0;
     void * workspace = nullptr; // the cuBLAS workspace, set after every cublasSetStream
     size_t fixup_bytes = 0;     // MMQ's stream-k fixup, reserved in the pool
-    // The types and shapes whose kernels are loaded, up to `columns` columns. A loaded kernel stays loaded, so this
-    // outlives release.
-    struct warm_shape { ggml_type type; int64_t nrows, ncols, columns; };
+    // The types and shapes whose kernels are loaded, up to `columns` columns, on a stream. A loaded kernel stays loaded
+    // (and under HIP its scratch stays with the stream's queue), so this outlives release.
+    struct warm_shape { ggml_type type; int64_t nrows, ncols, columns; cudaStream_t stream; };
     std::vector<warm_shape> warm;
 
     explicit moe_stream_mm(int device_) :
@@ -147,10 +149,12 @@ void gather(const float * x, const int32_t * ids, int64_t stride, int64_t ncols,
 
 // Loads every kernel a product of this type and shape can take up to max_columns columns (the gather, the quantizers,
 // the product's own kernel, the stream-k fixup, cuBLAS's GEMM), by a product of every column count on a zeroed matrix in
-// a scratch freed afterwards. Once per type and shape: a kernel stays loaded for the process.
-bool warm_kernels(moe_stream_mm & mm, ggml_type type, int64_t nrows, int64_t ncols, int64_t max_columns) {
+// a scratch freed afterwards, on the stream the products will run on (its queue keeps their scratch under HIP). Once per
+// type and shape: a kernel stays loaded for the process.
+bool warm_kernels(moe_stream_mm & mm, ggml_type type, int64_t nrows, int64_t ncols, int64_t max_columns,
+        cudaStream_t stream) {
     for (const auto & w : mm.warm) {
-        if (w.type == type && w.nrows == nrows && w.ncols == ncols && w.columns >= max_columns) {
+        if (w.type == type && w.nrows == nrows && w.ncols == ncols && w.columns >= max_columns && w.stream == stream) {
             return true;
         }
     }
@@ -169,24 +173,19 @@ bool warm_kernels(moe_stream_mm & mm, ggml_type type, int64_t nrows, int64_t nco
     const int32_t * ids = reinterpret_cast<const int32_t *>(scratch + weight_bytes + input_bytes);
     void * operand = scratch + weight_bytes + input_bytes + ids_bytes;
     float * dst = reinterpret_cast<float *>(scratch + weight_bytes + input_bytes + ids_bytes + operand_bytes);
-    cudaStream_t stream = nullptr;
-    bool ok = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess &&
-        cudaMemsetAsync(scratch, 0, weight_bytes + input_bytes + ids_bytes, stream) == cudaSuccess;
+    bool ok = cudaMemsetAsync(scratch, 0, weight_bytes + input_bytes + ids_bytes, stream) == cudaSuccess;
     // every column gathers the one zeroed input row, so the gathering kernels load too
     for (int64_t n = 1; ok && n <= max_columns; ++n) {
         ok = ggml_cuda_moe_stream_mm_quantize(&mm, type, input, ids, ncols, ncols, n, operand, stream) &&
             ggml_cuda_moe_stream_mm(&mm, type, scratch, nrows, ncols, operand, n, dst, stream);
     }
-    ok = stream && cudaStreamSynchronize(stream) == cudaSuccess && ok;
-    if (stream) {
-        (void) cudaStreamDestroy(stream);
-    }
+    ok = cudaStreamSynchronize(stream) == cudaSuccess && ok;
     (void) cudaFree(scratch);
     if (!ok) {
         (void) cudaGetLastError();
         return false;
     }
-    mm.warm.push_back({ type, nrows, ncols, max_columns });
+    mm.warm.push_back({ type, nrows, ncols, max_columns, stream });
     return true;
 }
 } // namespace
@@ -214,13 +213,15 @@ extern "C" int ggml_cuda_moe_stream_mm_kernel(void * context, int type, int64_t 
     return kernel_for(*static_cast<moe_stream_mm *>(context), (ggml_type) type, ncols, n);
 }
 
-// Readies the context for products of this weight type and matrix shape with up to max_columns columns: the stream-k
-// fixup in the pool, for the GEMM a dequantize scratch of one matrix and the cuBLAS handle and workspace, and the
-// kernels loaded (warm_kernels; the first time for a type and shape, a scratch of one matrix and its operands is taken
-// and given back). Calls add up (a layer's up/gate and down types and shapes each call once).
-extern "C" bool ggml_cuda_moe_stream_mm_reserve(void * context, int type, int64_t nrows, int64_t ncols, int64_t max_columns) {
+// Readies the context for products of this weight type and matrix shape with up to max_columns columns on `stream`: the
+// stream-k fixup in the pool, for the GEMM a dequantize scratch of one matrix and the cuBLAS handle and workspace, and
+// the kernels loaded on that stream (warm_kernels; the first time for a type and shape, a scratch of one matrix and its
+// operands is taken and given back). Calls add up (a layer's up/gate and down types and shapes each call once).
+extern "C" bool ggml_cuda_moe_stream_mm_reserve(void * context, int type, int64_t nrows, int64_t ncols, int64_t max_columns,
+        cudaStream_t stream) {
     auto * mm = static_cast<moe_stream_mm *>(context);
-    if (!mm || !supported(type) || nrows < 1 || ncols < 1 || max_columns < 1 || ncols % ggml_blck_size((ggml_type) type)) {
+    if (!mm || !stream || !supported(type) || nrows < 1 || ncols < 1 || max_columns < 1 ||
+            ncols % ggml_blck_size((ggml_type) type)) {
         return false;
     }
     ggml_cuda_set_device(mm->device);
@@ -261,9 +262,14 @@ extern "C" bool ggml_cuda_moe_stream_mm_reserve(void * context, int type, int64_
                 return false;
             }
         }
-        (void) mm->ctx->cublas_handle();
+        // The workspace goes to the handle now, not at the first product: rocBLAS allocates a default workspace with
+        // the handle and gives it back when one is set, which would change the device's memory in the middle of a pass
+        // (cuBLAS allocates none with the handle). A product sets it again after cublasSetStream, which resets it.
+        if (cublasSetWorkspace(mm->ctx->cublas_handle(), mm->workspace, moe_stream_mm_workspace_bytes) != CUBLAS_STATUS_SUCCESS) {
+            return false;
+        }
     }
-    return warm_kernels(*mm, (ggml_type) type, nrows, ncols, max_columns);
+    return warm_kernels(*mm, (ggml_type) type, nrows, ncols, max_columns, stream);
 }
 
 // Gives back the device memory the reservations hold (the pool, the cuBLAS handle and workspace, the dequantize

@@ -159,7 +159,7 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
     const auto * reserve_mib = settings.integer("vram.reserve_mib");
     constexpr size_t mib = size_t{1} << 20;
     if (!reserve_mib || *reserve_mib > std::numeric_limits<size_t>::max() / mib) {
-        throw std::runtime_error("CUDA allocation reserve is not representable in bytes");
+        throw std::runtime_error("GPU allocation reserve is not representable in bytes");
     }
     services.gpu_reserve_bytes = static_cast<size_t>(*reserve_mib) * mib;
 }

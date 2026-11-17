@@ -13,7 +13,7 @@
 #include "vram-activation.cuh"
 #include "ggml.h"
 
-#include <cuda_runtime.h>
+#include "gpu-runtime.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -29,7 +29,7 @@ using mm_supports_fn = bool (*)(int);
 using mm_create_fn = void * (*)(int);
 using mm_destroy_fn = void (*)(void *);
 using mm_release_fn = void (*)(void *);
-using mm_reserve_fn = bool (*)(void *, int, int64_t, int64_t, int64_t);
+using mm_reserve_fn = bool (*)(void *, int, int64_t, int64_t, int64_t, cudaStream_t);
 using mm_operand_bytes_fn = size_t (*)(void *, int, int64_t, int64_t);
 using mm_quantize_fn = bool (*)(void *, int, const float *, const int32_t *, int64_t, int64_t, int64_t, void *, cudaStream_t);
 using mm_fn = bool (*)(void *, int, const void *, int64_t, int64_t, const void *, int64_t, float *, cudaStream_t);
@@ -76,7 +76,7 @@ __global__ void group_scatter(const float * down, int latent, const int32_t * ro
             sum += v * v;
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xffffffff, sum, offset);
+            sum += __shfl_xor_sync(0xffffffff, sum, offset, 32);
         }
         if ((threadIdx.x & 31) == 0) {
             partial[threadIdx.x >> 5] = sum;
@@ -206,7 +206,8 @@ struct group_engine {
         // reservations add up), and operands as large as the largest format's.
         size_t up_operand_bytes = 0, down_operand_bytes = 0;
         for (const auto & f : formats) {
-            if (!mm_reserve(mm_context, f.first, hidden, latent, chunk) || !mm_reserve(mm_context, f.second, latent, hidden, chunk)) {
+            if (!mm_reserve(mm_context, f.first, hidden, latent, chunk, stream) ||
+                    !mm_reserve(mm_context, f.second, latent, hidden, chunk, stream)) {
                 mm_release(mm_context);
                 throw std::runtime_error("CUDA grouped expert product reservation");
             }
@@ -560,7 +561,7 @@ int begin_layer(void * context, int format, int rows, const vram_group_route * r
     } catch (const std::exception & e) { return fail(e, error, error_size); }
 }
 
-int compute(void * context, int group, const vram_compute_expert * weights, CUevent_st * ready, CUevent_st ** done,
+int compute(void * context, int group, const vram_compute_expert * weights, cudaEvent_t ready, cudaEvent_t * done,
         char * error, size_t error_size) {
     try {
         if (!context || !weights) { throw std::runtime_error("null grouped VRAM engine argument"); }

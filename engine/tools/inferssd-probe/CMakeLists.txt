@@ -6,10 +6,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     install(TARGETS inferssd-ioreplay RUNTIME)
 endif()
 
-# VRAM size and host-device transfer rates, on every OS with CUDA. CUDA is enabled in a
-# directory of its own: on Windows the CUDA platform module of CMake sets MSVC link flags
-# for the whole directory, which would break the clang links of the probes below.
-if(GGML_CUDA)
+# VRAM size and host-device transfer rates, on every OS with CUDA, and with HIP for AMD GPUs.
+# The GPU language is enabled in a directory of its own: on Windows the CUDA platform module of
+# CMake sets MSVC link flags for the whole directory, which would break the clang links of the
+# probes below.
+if(GGML_CUDA OR GGML_HIP)
     add_subdirectory(memprobe)
 endif()
 

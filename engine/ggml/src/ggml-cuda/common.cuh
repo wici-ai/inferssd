@@ -1113,12 +1113,18 @@ struct ggml_cuda_pool {
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
 
-    // Resizes the pool to hold `size` bytes of allocations beyond those in use, so that it neither gets device
-    // memory while a graph runs nor keeps memory the graph does not need; returns false if the memory cannot be
-    // obtained. Pools that allocate on demand may ignore this.
+    // Resizes the pool to hold `size` bytes of allocations beyond those in use, so that it gets no device memory
+    // while a graph runs and, where it can give memory back without moving (VMM), keeps none the graph does not need;
+    // returns false if the memory cannot be obtained.
     virtual bool reserve(size_t size) {
         GGML_UNUSED(size);
         return true;
+    }
+
+    // where the pool's memory starts: a captured graph holds addresses into it, so it is replayed only while this
+    // stays (null for a pool without one place)
+    virtual const void * base() const {
+        return nullptr;
     }
 
     // the bytes of device memory the pool holds, allocations in use included

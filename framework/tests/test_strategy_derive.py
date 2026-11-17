@@ -581,6 +581,40 @@ def test_the_cuda_budget_follows_the_engine_not_the_platform(models):
     assert s.settings["vram.budget"].reason == "no CUDA GPU is usable now"
 
 
+def test_the_vram_tier_budget_follows_the_engines_tier_backend(models):
+    # The profiled GPU as an AMD card on ROCm: a ROCm engine sizes its tier as a CUDA one does.
+    c = machine(X86)
+    amd = "GPU-b8dff1e274ce6c9f"
+    c["identity"]["hard"]["gpus"] = [
+        dict(c["identity"]["hard"]["gpus"][0], backend="ROCm", uuid=amd)
+    ]
+    c["gpus"] = [dict(c["gpus"][0], uuid=amd)]
+    facts = runtime(range(61), [GPUState(amd, 30 << 30, 0, "ROCm")], backends=("ROCm",))
+    s = derive(c, models["dsv"], facts, "linux", model_drive_key=drive(c))
+    assert "vram.budget" not in s.settings
+    assert f"vram.budget: default auto for {amd}" in s.notes
+    assert "link_gbps" in costs(s)
+    busy = runtime(range(61), [GPUState(amd, 30 << 30, 1, "ROCm")], backends=("ROCm",))
+    s = derive(c, models["dsv"], busy, "linux", model_drive_key=drive(c))
+    assert "vram.reserve_mib" in s.settings
+    nothing = runtime(range(61), backends=("ROCm",))
+    s = derive(c, models["dsv"], nothing, "linux", model_drive_key=drive(c))
+    assert (
+        s.settings["vram.budget"].reason == "no ROCm GPU is usable now, although the machine has 1"
+    )
+    # An engine's tier uses its own backend's GPUs only: a CUDA engine leaves an AMD GPU out.
+    c = machine(X86)
+    both = [GPUState(X86_GPU, 30 << 30, 0), GPUState(amd, 30 << 30, 0, "ROCm")]
+    s = derive(
+        c,
+        models["dsv"],
+        runtime(range(61), both, backends=("CUDA",)),
+        "linux",
+        model_drive_key=drive(c),
+    )
+    assert f"vram.budget: default auto for {X86_GPU}" in s.notes and "link_gbps" in costs(s)
+
+
 def test_gpu_states_that_leave_the_vram_budget_alone(models):
     c = machine(X86)
     cases = {

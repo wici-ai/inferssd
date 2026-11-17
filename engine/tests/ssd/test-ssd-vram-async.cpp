@@ -19,7 +19,7 @@ void CUDART_CB gate_host(void *) {
     std::unique_lock<std::mutex> lock(barrier_mutex); barrier_cv.wait(lock,[] { return proceed; });
 }
 int blocked_launch(void * p,const vram_compute_expert * w,int n,int first,const void * q,size_t bytes,
-                   const ssd_vram_activation * activation,CUevent_st * ready,CUevent_st * start,CUevent_st * end,
+                   const ssd_vram_activation * activation,cudaEvent_t ready,cudaEvent_t start,cudaEvent_t end,
                    char * error,size_t size) {
     { std::lock_guard<std::mutex> lock(barrier_mutex); entered = true; barrier_cv.notify_all(); }
     if (inject_error) { std::snprintf(error,size,"injected worker error"); return 1; }

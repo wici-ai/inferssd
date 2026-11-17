@@ -19,7 +19,7 @@
 #include "ggml-cpu.h"
 #include "ggml-cuda.h"
 
-#include <cuda_runtime.h>
+#include "gpu-runtime.h"
 
 #include <algorithm>
 #include <cmath>
@@ -38,7 +38,7 @@ bool   ggml_cuda_moe_stream_mm_supports(int type);
 void * ggml_cuda_moe_stream_mm_create(int device);
 void   ggml_cuda_moe_stream_mm_destroy(void * mm);
 int    ggml_cuda_moe_stream_mm_kernel(void * mm, int type, int64_t ncols, int64_t n);
-bool   ggml_cuda_moe_stream_mm_reserve(void * mm, int type, int64_t nrows, int64_t ncols, int64_t max_columns);
+bool   ggml_cuda_moe_stream_mm_reserve(void * mm, int type, int64_t nrows, int64_t ncols, int64_t max_columns, cudaStream_t stream);
 size_t ggml_cuda_moe_stream_mm_operand_bytes(void * mm, int type, int64_t ncols, int64_t max_columns);
 bool   ggml_cuda_moe_stream_mm_quantize(void * mm, int type, const float * x, const int32_t * ids, int64_t x_stride,
                                         int64_t ncols, int64_t n, void * operand, cudaStream_t stream);
@@ -214,7 +214,7 @@ void run_type(void * mm, ggml_backend_t backend, ggml_type type, int64_t nrows, 
     std::vector<float> x(size_t(rows_total) * stride);
     for (auto & v : x) { v = sample(rng); }
 
-    require(ggml_cuda_moe_stream_mm_reserve(mm, type, nrows, ncols, max_columns), std::string("reserve ") + ggml_type_name(type));
+    require(ggml_cuda_moe_stream_mm_reserve(mm, type, nrows, ncols, max_columns, stream), std::string("reserve ") + ggml_type_name(type));
     const size_t operand_bytes = ggml_cuda_moe_stream_mm_operand_bytes(mm, type, ncols, max_columns);
     require(operand_bytes > 0, "operand bytes");
     const size_t reserved = ggml_cuda_moe_stream_mm_device_bytes(mm);

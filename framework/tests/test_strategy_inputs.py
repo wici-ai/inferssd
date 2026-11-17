@@ -5,10 +5,21 @@ from __future__ import annotations
 
 import dataclasses
 import struct
+import sys
 from pathlib import Path
 
 import pytest
-from test_machine_identity import FakeHost, linux_tree, nvme_key, ok, write
+from test_machine_identity import (
+    LINUX_MACHINE,
+    ROCMINFO,
+    FakeHost,
+    amd_card,
+    kfd,
+    linux_tree,
+    nvme_key,
+    ok,
+    write,
+)
 
 from inferssd.machine.identity import Command
 from inferssd.source.header import nextn_blocks
@@ -327,6 +338,43 @@ def test_linux_runtime_respects_cuda_visible_devices(tmp_path):
         )
         gpus = read_runtime(host=host).gpus
         assert gpus is not None and tuple(gpu.uuid for gpu in gpus) == expected
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason=LINUX_MACHINE)  # sysfs names carry colons
+def test_linux_runtime_reads_rocm_gpus_through_amdkfd(tmp_path):
+    commands = linux_runtime(tmp_path, gpus="")
+    amd_card(tmp_path)
+    kfd(tmp_path, 2, 64, location=8 << 8, unique=0x1111, gpu_id=7)
+    write(tmp_path, "/sys/bus/pci/devices/0000:08:00.0/mem_info_vram_total", f"{16 << 30}\n")
+    write(tmp_path, "/sys/bus/pci/devices/0000:08:00.0/mem_info_vram_used", f"{1 << 30}\n")
+    write(tmp_path, "/sys/bus/pci/devices/0000:03:00.0/mem_info_vram_used", f"{2 << 30}\n")
+    # amdkfd lists the processes that use a GPU, with their memory on each GPU they opened; an
+    # entry outlives its process for a moment, and then counts for nothing.
+    write(tmp_path, "/sys/class/kfd/kfd/proc/4242/vram_64106", "1048576\n")
+    write(tmp_path, "/proc/4242/stat", "4242 (inferssd-server) S\n")
+    write(tmp_path, "/sys/class/kfd/kfd/proc/4343/vram_64106", "1048576\n")
+    # Without the ROCm runtime the GPUs run on Vulkan, which has no VRAM tier.
+    assert read_runtime(host=RuntimeHost(tmp_path, affinity=(0,), commands=commands)).gpus == ()
+    commands[ROCMINFO] = ok("")
+    first, second = "GPU-b8dff1e274ce6c9f", "GPU-0000000000001111"
+    gpus = read_runtime(host=RuntimeHost(tmp_path, affinity=(0,), commands=commands)).gpus
+    assert gpus == (
+        GPUState(first, 34208743424 - (2 << 30), 1, "ROCm"),
+        GPUState(second, 15 << 30, 0, "ROCm"),
+    )
+    # ROCR_VISIBLE_DEVICES selects among amdkfd's GPUs, then HIP_VISIBLE_DEVICES (or
+    # CUDA_VISIBLE_DEVICES, which HIP reads for it) among those it leaves.
+    for environment, expected in (
+        ({"ROCR_VISIBLE_DEVICES": "1"}, (second,)),
+        ({"ROCR_VISIBLE_DEVICES": second}, (second,)),
+        ({"ROCR_VISIBLE_DEVICES": "1,0", "HIP_VISIBLE_DEVICES": "1"}, (first,)),
+        ({"CUDA_VISIBLE_DEVICES": "1"}, (second,)),
+        ({"HIP_VISIBLE_DEVICES": "0", "CUDA_VISIBLE_DEVICES": "1"}, (first,)),
+        ({"ROCR_VISIBLE_DEVICES": ""}, ()),
+    ):
+        host = RuntimeHost(tmp_path, affinity=(0,), environment=environment, commands=commands)
+        gpus = read_runtime(host=host).gpus
+        assert gpus is not None and tuple(gpu.uuid for gpu in gpus) == expected, environment
 
 
 def test_linux_runtime_without_or_with_a_failing_nvidia_smi(tmp_path):

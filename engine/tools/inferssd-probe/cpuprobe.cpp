@@ -53,7 +53,7 @@ const char * const USAGE =
     "Measures DRAM read bandwidth and ggml CPU matrix multiplication throughput per weight format and\n"
     "prints one JSON object (schema inferssd-cpuprobe/2) on stdout.\n"
     "\n"
-    "  --backend NAME      CPU (default) or CUDA<n>; CUDA skips DRAM and uses threads=1\n"
+    "  --backend NAME      CPU (default) or a GPU device (CUDA<n>, ROCm<n>); a GPU skips DRAM and uses threads=1\n"
     "  --threads LIST      thread counts (default: 1 and the logical CPUs this process may use)\n"
     "  --formats LIST      ggml weight types, case-insensitive\n"
     "  --rows N            weight rows (output features)\n"
@@ -659,9 +659,8 @@ options parse_args(int argc, char ** argv) {
         }
     }
     if (o.backend != "CPU") {
-        if (o.backend.rfind("CUDA", 0) != 0 || !o.cpus.empty() ||
-            (!o.threads.empty() && o.threads != std::vector<int>{1})) {
-            throw usage_error("--backend CUDA<n> requires --threads 1 and no --cpus");
+        if (!o.cpus.empty() || (!o.threads.empty() && o.threads != std::vector<int>{1})) {
+            throw usage_error("--backend " + o.backend + " requires --threads 1 and no --cpus");
         }
         o.threads = {1};
     }

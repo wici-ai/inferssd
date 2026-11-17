@@ -41,7 +41,7 @@
 #undef main
 #include "vram-compute-api.h"
 
-#include <cuda_runtime.h>
+#include "gpu-runtime.h"
 #include <strings.h>
 
 #include <atomic>
@@ -270,7 +270,7 @@ std::vector<float> run_engine(const vram_group_compute_api * api, engine_ptr & e
     for (size_t g = 0; g < group_expert.size(); ++g) {
         const int e = group_expert[g];
         vram_compute_expert w = {};
-        CUevent_st * wait = nullptr;
+        cudaEvent_t wait = nullptr;
         if (host) {
             const uint8_t * base = pageable.data() + size_t(e) * stride;
             w = { base, base + role_bytes[0], base + role_bytes[0] + role_bytes[1] };
@@ -287,7 +287,7 @@ std::vector<float> run_engine(const vram_group_compute_api * api, engine_ptr & e
             wait = ready[slot];
             w = { base, base + role_bytes[0], base + role_bytes[0] + role_bytes[1] };
         }
-        CUevent_st * done = nullptr;
+        cudaEvent_t done = nullptr;
         engine.check(api->compute(engine.p, int(g), &w, wait, &done, error, sizeof(error)), error);
         require(done, "compute returned no done event");
         if (!host && e % 2 == 1) { slot_done[(arena_uses - 1) % 2] = done; }

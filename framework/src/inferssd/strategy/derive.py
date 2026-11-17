@@ -33,7 +33,8 @@ from inferssd.configuration.settings import (
 )
 from inferssd.launch.types import Threads
 from inferssd.machine.characteristics import GPU, Characteristics, ComputeRow, dumps
-from inferssd.strategy.inputs import ModelFacts, RuntimeFacts
+from inferssd.machine.identity import TIER_BACKENDS
+from inferssd.strategy.inputs import GPUState, ModelFacts, RuntimeFacts
 
 # The engine's GB/s cost terms are 1e9 bytes per second: it prices a copy or a
 # read at 1e3 / gbps microseconds per 1e6 bytes.
@@ -111,6 +112,24 @@ def engine_gpu_backends(
     if characteristics is None:
         return frozenset()
     return frozenset(gpu["backend"] for gpu in characteristics["identity"]["hard"]["gpus"])
+
+
+def tier_backends(
+    known: Optional[Sequence[str]], characteristics: Optional[Characteristics]
+) -> list[str]:
+    """The launch engine's backends that carry the expert VRAM tier (identity.TIER_BACKENDS)."""
+    backends = engine_gpu_backends(known, characteristics)
+    return [backend for backend in TIER_BACKENDS if backend in backends]
+
+
+def tier_gpus(
+    runtime: RuntimeFacts, characteristics: Optional[Characteristics]
+) -> Optional[tuple[GPUState, ...]]:
+    """The GPUs the launch engine's VRAM tier can use now, None when they cannot be read."""
+    if runtime.gpus is None:
+        return None
+    backends = tier_backends(runtime.gpu_backends, characteristics)
+    return tuple(gpu for gpu in runtime.gpus if gpu.backend in backends)
 
 
 def _validated(choices: Mapping[str, tuple[str, str]], platform: str) -> dict[str, Choice]:
@@ -531,13 +550,14 @@ def link_rates(
     characteristics: Characteristics, runtime: RuntimeFacts
 ) -> tuple[dict[str, float], str]:
     """Pinned and pageable host-to-device rates in GB/s at the largest measured copy."""
-    if runtime.gpus is None:
-        return {}, "the CUDA GPUs could not be read now"
-    present = runtime.gpus
+    present = tier_gpus(runtime, characteristics)
+    names = "/".join(tier_backends(runtime.gpu_backends, characteristics)) or "tier"
+    if present is None:
+        return {}, f"the {names} GPUs could not be read now"
     if len(present) != 1:
         if not present:
-            return {}, "no CUDA GPU is usable now"
-        return {}, f"{len(present)} CUDA GPUs are usable and the engine drives one of them"
+            return {}, f"no {names} GPU is usable now"
+        return {}, f"{len(present)} {names} GPUs are usable and the engine drives one of them"
     gpu = next((row for row in characteristics["gpus"] if row["uuid"] == present[0].uuid), None)
     if gpu is None:
         return {}, f"the GPU {present[0].uuid} was not measured"
@@ -567,12 +587,13 @@ def _costs(terms: Mapping[str, float], reasons: Sequence[str]) -> Optional[tuple
 
 
 def single_gpu(characteristics: Characteristics, runtime: RuntimeFacts) -> Optional[GPU]:
-    """The profiled GPU when it is the one CUDA GPU the launch can use."""
+    """The profiled GPU when it is the one GPU the launch engine's VRAM tier can use."""
+    present = tier_gpus(runtime, characteristics)
     return next(
         (
             row
             for row in characteristics["gpus"]
-            if runtime.gpus and len(runtime.gpus) == 1 and row["uuid"] == runtime.gpus[0].uuid
+            if present and len(present) == 1 and row["uuid"] == present[0].uuid
         ),
         None,
     )
@@ -642,22 +663,25 @@ def derive(
     if costs is not None:
         choices["place.costs"] = costs
 
-    # The CUDA tier's budget, where the engine has the tier. A GPU lane (Vulkan, Metal) takes
-    # the default.
-    if "CUDA" in engine_gpu_backends(runtime.gpu_backends, characteristics):
+    # The VRAM tier's budget, where the engine has the tier (CUDA, ROCm). A GPU lane (Vulkan,
+    # Metal) takes the default.
+    tier = tier_backends(runtime.gpu_backends, characteristics)
+    if tier:
         listed = {
             gpu["uuid"]
             for gpu in characteristics["identity"]["hard"]["gpus"]
-            if gpu["backend"] == "CUDA"
+            if gpu["backend"] in tier
         }
-        if runtime.gpus is None:
-            notes.append("vram.budget: default; the CUDA GPUs could not be read now")
-        elif not runtime.gpus:
+        usable = tier_gpus(runtime, characteristics)
+        names = "/".join(tier)
+        if usable is None:
+            notes.append(f"vram.budget: default; the {names} GPUs could not be read now")
+        elif not usable:
             extra = f", although the machine has {len(listed)}" if listed else ""
-            choices["vram.budget"] = ("0", "no CUDA GPU is usable now" + extra)
-            notes.append("vram.budget: 0, no CUDA GPU is usable now" + extra)
+            choices["vram.budget"] = ("0", f"no {names} GPU is usable now" + extra)
+            notes.append(f"vram.budget: 0, no {names} GPU is usable now" + extra)
         else:
-            known = [gpu for gpu in runtime.gpus if gpu.uuid in listed]
+            known = [gpu for gpu in usable if gpu.uuid in listed]
             if known:
                 notes.append("vram.budget: default auto for " + ", ".join(g.uuid for g in known))
             else:
@@ -667,7 +691,7 @@ def derive(
                 )
             busy = [
                 f"{gpu.uuid} runs {gpu.processes} compute process(es)"
-                for gpu in runtime.gpus
+                for gpu in usable
                 if gpu.processes
             ]
             if busy:

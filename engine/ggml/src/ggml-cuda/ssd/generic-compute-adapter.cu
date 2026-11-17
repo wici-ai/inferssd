@@ -1,10 +1,14 @@
 #include "vram-compute-api.h"
 #include "vram-activation.cuh"
 #include "ggml.h"
+#if defined(GGML_USE_HIP)
+#define GGML_COMMON_DECL_HIP
+#else
 #define GGML_COMMON_DECL_CUDA
+#endif
 #include "../../ggml-common.h"
 
-#include <cuda_runtime.h>
+#include "gpu-runtime.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -315,7 +319,7 @@ int compute(void * context, const vram_compute_expert * experts, int hits,
 
 int launch(void * context, const vram_compute_expert * experts, int hits, int first,
         const void * input, size_t input_bytes, const ssd_vram_activation * activation,
-        CUevent_st * ready, CUevent_st * start, CUevent_st * end, char * error, size_t error_size) {
+        cudaEvent_t ready, cudaEvent_t start, cudaEvent_t end, char * error, size_t error_size) {
     return guarded(context, error, error_size, [&](generic_engine & engine) {
         if (!activation) { throw std::runtime_error("null generic VRAM launch argument"); }
         engine.launch(experts, hits, first, input, input_bytes, *activation, ready, start, end);

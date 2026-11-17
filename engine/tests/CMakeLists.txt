@@ -355,6 +355,19 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if (TARGET ssd-vram-tier)
         # GPU tests require explicit ownership of a lane and normally linked
         # backend objects; do not acquire a shared GPU automatically in ctest.
+        # They link the backend the tier is built into (CUDA or HIP) and compile in its language.
+        get_target_property(tier_language ssd-vram-tier-gpu SSD_GPU_LANGUAGE)
+        set(tier_sources ssd/test-ssd-vram-async.cpp ssd/test-ssd-vram-deferred.cpp ssd/test-ssd-vram-backup.cpp
+            ssd/test-ssd-vram-format-compat.cpp ssd/test-ssd-vram-pool-cuda.cpp ssd/test-ssd-vram-elastic.cpp
+            ssd/test-ssd-vram-reclaim.cpp ssd/test-ssd-vram-mixed.cpp ssd/test-ssd-vram-payload.cpp
+            ssd/test-ssd-prefill-scratch.cpp ssd/test-ssd-vram-generic.cpp ssd/test-ssd-vram-mm.cpp
+            ssd/test-ssd-vram-group.cpp ssd/test-ssd-cublas-retry.cpp)
+        if (tier_language STREQUAL "HIP")
+            # CMake keeps a language's rules per directory; ggml-hip enabled HIP in its own, for its architectures
+            get_target_property(CMAKE_HIP_ARCHITECTURES ssd-vram-tier-gpu SSD_GPU_ARCHITECTURES)
+            enable_language(HIP)
+            set_source_files_properties(${tier_sources} PROPERTIES LANGUAGE HIP)
+        endif()
         foreach(tier_test test-ssd-vram-async test-ssd-vram-deferred test-ssd-vram-backup
                 test-ssd-vram-format-compat test-ssd-vram-pool-cuda
                 test-ssd-vram-elastic test-ssd-vram-reclaim test-ssd-vram-mixed test-ssd-vram-payload)
@@ -362,50 +375,55 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
             target_compile_features(${tier_test} PRIVATE cxx_std_17)
             target_compile_options(${tier_test} PRIVATE -fno-fast-math -ffp-contract=off)
             target_include_directories(${tier_test} PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../ggml/src/ggml-cuda/ssd ../vendor)
-            target_link_libraries(${tier_test} PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+            target_link_libraries(${tier_test} PRIVATE ggml-ssd-host ggml-cpu ggml-base ssd-vram-tier-gpu Threads::Threads ${CMAKE_DL_LIBS})
             add_dependencies(${tier_test} ssd-vram-tier)
         endforeach()
         add_executable(test-ssd-prefill-scratch ssd/test-ssd-prefill-scratch.cpp)
         target_compile_features(test-ssd-prefill-scratch PRIVATE cxx_std_17)
         target_compile_options(test-ssd-prefill-scratch PRIVATE -fno-fast-math -ffp-contract=off)
         target_include_directories(test-ssd-prefill-scratch PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../vendor)
-        target_link_libraries(test-ssd-prefill-scratch PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+        target_link_libraries(test-ssd-prefill-scratch PRIVATE ggml-ssd-host ggml-cpu ggml-base ssd-vram-tier-gpu Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-ssd-prefill-scratch ssd-vram-tier)
         add_executable(test-ssd-vram-generic ssd/test-ssd-vram-generic.cpp)
         target_compile_features(test-ssd-vram-generic PRIVATE cxx_std_17)
         target_include_directories(test-ssd-vram-generic PRIVATE ../ggml/src ../ggml/src/ggml-cpu
             ../ggml/src/ggml-cuda/ssd ../vendor)
-        target_link_libraries(test-ssd-vram-generic PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda
-            CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+        target_link_libraries(test-ssd-vram-generic PRIVATE ggml-ssd-host ggml-cpu ggml-base ssd-vram-tier-gpu
+            Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-ssd-vram-generic ssd-vram-tier)
-        # The CUDA backend's grouped-expert products against ggml's CPU MUL_MAT (owned GPU; not in ctest).
+        # The GPU backend's grouped-expert products against ggml's CPU MUL_MAT (owned GPU; not in ctest).
         add_executable(test-ssd-vram-mm ssd/test-ssd-vram-mm.cpp)
         target_compile_features(test-ssd-vram-mm PRIVATE cxx_std_17)
-        target_link_libraries(test-ssd-vram-mm PRIVATE ggml-cpu ggml-base ggml-cuda CUDA::cudart)
+        target_include_directories(test-ssd-vram-mm PRIVATE ../ggml/src/ggml-cuda/ssd)
+        target_link_libraries(test-ssd-vram-mm PRIVATE ggml-cpu ggml-base ssd-vram-tier-gpu)
         # The tier's grouped prefill engine against the CPU lane, and its timing mode (owned GPU; not in ctest).
         add_executable(test-ssd-vram-group ssd/test-ssd-vram-group.cpp)
         target_compile_features(test-ssd-vram-group PRIVATE cxx_std_17)
         target_include_directories(test-ssd-vram-group PRIVATE ../ggml/src ../ggml/src/ggml-cpu
             ../ggml/src/ggml-cuda/ssd ../vendor)
-        target_link_libraries(test-ssd-vram-group PRIVATE ggml-ssd-host ggml-cpu ggml-base ggml-cuda CUDA::cudart Threads::Threads ${CMAKE_DL_LIBS})
+        target_link_libraries(test-ssd-vram-group PRIVATE ggml-ssd-host ggml-cpu ggml-base ssd-vram-tier-gpu Threads::Threads ${CMAKE_DL_LIBS})
         add_dependencies(test-ssd-vram-group ssd-vram-tier)
         # Linux shared-library interposition keeps the cuBLAS failure fixture local to this executable.
         # Like the other CUDA fixtures, run explicitly on an owned GPU, not in hosted CPU ctest.
         if (BUILD_SHARED_LIBS)
             add_executable(test-ssd-cublas-retry ssd/test-ssd-cublas-retry.cpp)
             target_compile_features(test-ssd-cublas-retry PRIVATE cxx_std_17)
-            target_include_directories(test-ssd-cublas-retry PRIVATE ../ggml/include)
-            target_link_libraries(test-ssd-cublas-retry PRIVATE ggml-cuda CUDA::cudart CUDA::cublas)
+            target_include_directories(test-ssd-cublas-retry PRIVATE ../ggml/include ../ggml/src)
+            # hipBLAS comes with the HIP backend; cuBLAS is linked for its declarations' library
+            target_link_libraries(test-ssd-cublas-retry PRIVATE ssd-vram-tier-gpu)
+            if (NOT tier_language STREQUAL "HIP")
+                target_link_libraries(test-ssd-cublas-retry PRIVATE CUDA::cublas)
+            endif()
         endif()
         # The error fixture explicitly injects callbacks around the real linked component.
-        target_link_libraries(test-ssd-vram-elastic PRIVATE ggml-cuda)
-        target_link_libraries(test-ssd-vram-reclaim PRIVATE ggml-cuda)
+        target_link_libraries(test-ssd-vram-elastic PRIVATE ssd-vram-tier-gpu)
+        target_link_libraries(test-ssd-vram-reclaim PRIVATE ssd-vram-tier-gpu)
     endif()
     if (TARGET ssd-vram-tier AND LLAMA_SSD_STORE)
         add_executable(test-ssd-dense-stream ssd/test-dense-stream.cpp)
         target_compile_features(test-ssd-dense-stream PRIVATE cxx_std_17)
         target_include_directories(test-ssd-dense-stream PRIVATE ../src ../include ../ggml/src)
-        target_link_libraries(test-ssd-dense-stream PRIVATE llama ggml-cuda ggml-cpu ggml-ssd)
+        target_link_libraries(test-ssd-dense-stream PRIVATE llama ssd-vram-tier-gpu ggml-cpu ggml-ssd)
         add_test(NAME ssd_dense_stream COMMAND test-ssd-dense-stream)
         set_tests_properties(ssd_dense_stream PROPERTIES LABELS main TIMEOUT 120)
     endif()
@@ -636,10 +654,21 @@ inferssd_ci_test(test-moe-common-cross-role moe_common_cross_role)
 
 # Device allocations admitted against the reserve and the free memory; on unified memory it measures the Linux host
 # budget (budget-linux.h, /proc/sys/vm, sysconf).
-if (GGML_CUDA)
-    find_package(CUDAToolkit REQUIRED)
+if (TARGET ssd-vram-tier-gpu OR GGML_CUDA)
     add_executable(test-cuda-memory-reserve ssd/test-cuda-memory-reserve.cpp)
-    target_link_libraries(test-cuda-memory-reserve PRIVATE ggml ggml-cuda CUDA::cudart)
+    if (TARGET ssd-vram-tier-gpu)
+        # the backend the tier is built into, CUDA or HIP, in its language
+        get_target_property(reserve_language ssd-vram-tier-gpu SSD_GPU_LANGUAGE)
+        if (reserve_language STREQUAL "HIP")
+            get_target_property(CMAKE_HIP_ARCHITECTURES ssd-vram-tier-gpu SSD_GPU_ARCHITECTURES)
+            enable_language(HIP)
+            set_source_files_properties(ssd/test-cuda-memory-reserve.cpp PROPERTIES LANGUAGE HIP)
+        endif()
+        target_link_libraries(test-cuda-memory-reserve PRIVATE ggml ssd-vram-tier-gpu)
+    else()
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(test-cuda-memory-reserve PRIVATE ggml ggml-cuda CUDA::cudart)
+    endif()
     target_include_directories(test-cuda-memory-reserve PRIVATE ../ggml/src)
     add_test(NAME cuda_memory_reserve COMMAND test-cuda-memory-reserve)
     set_tests_properties(cuda_memory_reserve PROPERTIES LABELS "gpu" RUN_SERIAL TRUE SKIP_RETURN_CODE 77)

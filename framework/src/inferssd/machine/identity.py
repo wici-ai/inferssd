@@ -337,10 +337,81 @@ def nvidia(host: Host) -> tuple[list[GPUIdentity], Optional[str], Optional[str]]
 
 
 # The GPU backend for each PCI vendor whose GPUs the engine runs: NVIDIA's on CUDA, as nvidia-smi
-# lists them; AMD's and Intel's on Vulkan. Apple's GPU runs on Metal and is found through ioreg.
+# lists them; AMD's and Intel's on Vulkan, except an AMD GPU that runs on ROCm (amd_compute).
+# Apple's GPU runs on Metal and is found through ioreg.
 PCI_BACKENDS = {"10de": "CUDA", "1002": "Vulkan", "8086": "Vulkan"}
 # The order an engine's build prefers the backends of a machine's GPUs in.
-BUILD_ORDER = ("CUDA", "Metal", "Vulkan")
+BUILD_ORDER = ("CUDA", "ROCm", "Metal", "Vulkan")
+# The backends whose engine builds carry the expert VRAM tier: CUDA, and HIP for AMD GPUs (ROCm),
+# which ggml builds from the same sources. A GPU on another backend keeps no experts in its memory.
+TIER_BACKENDS = ("CUDA", "ROCm")
+# The kernel's compute driver for AMD GPUs (amdkfd) lists them here, one node each, after the CPUs.
+KFD_NODES = "/sys/class/kfd/kfd/topology/nodes"
+AMD_VENDOR = 0x1002
+
+
+@dataclass(frozen=True)
+class ComputeGPU:
+    """An AMD GPU that amdkfd lists, in its topology order, the order ROCm numbers them in."""
+
+    address: str  # PCI bus address
+    uuid: (
+        str  # ROCm's spelling (rocminfo, ROCR_VISIBLE_DEVICES, HIP): GPU- and the unique ID in hex
+    )
+    gpu_id: str  # amdkfd's ID of the GPU, which names its entries under /sys/class/kfd/kfd/proc
+
+
+def amd_compute(host: Host) -> list[ComputeGPU]:
+    """The AMD GPUs that run on ROCm: those amdkfd lists, when the ROCm runtime is installed.
+
+    ROCm installs rocminfo with its runtime, as NVIDIA's driver installs nvidia-smi. Without it
+    the GPUs run on Vulkan (linux_adapters).
+    """
+    if not host.which("rocminfo"):
+        return []
+    try:
+        nodes = sorted((node for node in host.listdir(KFD_NODES) if node.isdigit()), key=int)
+    except OSError:
+        return []
+    found = []
+    for node in nodes:
+        values: dict[str, int] = {}
+        for line in (read(host, f"{KFD_NODES}/{node}/properties") or "").splitlines():
+            key, _, value = line.partition(" ")
+            if value.strip().isdigit():
+                values[key] = int(value)
+        # A CPU node has no SIMDs.
+        if not values.get("simd_count") or values.get("vendor_id") != AMD_VENDOR:
+            continue
+        location = values.get("location_id", 0)
+        address = (
+            f"{values.get('domain', 0):04x}:{location >> 8:02x}:{(location >> 3) & 0x1F:02x}"
+            f".{location & 0x7:x}"
+        )
+        unique = values.get("unique_id")
+        found.append(
+            ComputeGPU(
+                address,
+                f"GPU-{unique:016x}" if unique else "pci-" + address,
+                read(host, f"{KFD_NODES}/{node}/gpu_id") or "",
+            )
+        )
+    return found
+
+
+def pci_gpu(host: Host, address: str, backend: str) -> GPUIdentity:
+    """The GPU at PCI ADDRESS as sysfs describes it; only one with its own memory reports it."""
+    base = f"/sys/bus/pci/devices/{address}/"
+    vendor, device = (
+        (read(host, base + name) or "").lower().removeprefix("0x") for name in ("vendor", "device")
+    )
+    vram = read(host, base + "mem_info_vram_total")
+    return {
+        "backend": backend,
+        "uuid": "pci-" + address,
+        "name": f"PCI {vendor}:{device}",
+        "vram_bytes": int(vram) if vram and vram.isdigit() else 0,
+    }
 
 
 def build_backend(gpus: Sequence[GPUIdentity]) -> Optional[str]:
@@ -349,36 +420,39 @@ def build_backend(gpus: Sequence[GPUIdentity]) -> Optional[str]:
     return next((backend for backend in BUILD_ORDER if backend in present), None)
 
 
-def linux_adapters(host: Host) -> list[GPUIdentity]:
-    """The PCI display controllers a Vulkan build can use (PCI_BACKENDS), by their bus address."""
+def linux_adapters(host: Host, rocm: Sequence[ComputeGPU] = ()) -> list[GPUIdentity]:
+    """The PCI display controllers a Vulkan build can use (PCI_BACKENDS), by their bus address,
+    but those that run on ROCm."""
     root = "/sys/bus/pci/devices"
     try:
         addresses = host.listdir(root)
     except OSError:
         return []
+    taken = {gpu.address for gpu in rocm}
     found: list[GPUIdentity] = []
     for address in addresses:
-        base = f"{root}/{address}/"
-        kind, vendor, device = (read(host, base + name) for name in ("class", "vendor", "device"))
+        kind, vendor = (read(host, f"{root}/{address}/{name}") for name in ("class", "vendor"))
         vendor = (vendor or "").lower().removeprefix("0x")
         if not (kind or "").startswith("0x03") or PCI_BACKENDS.get(vendor) != "Vulkan":
             continue
-        # Only a GPU with its own memory reports it (amdgpu); an integrated one shares the host's.
-        vram = read(host, base + "mem_info_vram_total")
-        found.append(
-            {
-                "backend": "Vulkan",
-                "uuid": "pci-" + address,
-                "name": f"PCI {vendor}:{(device or '').lower().removeprefix('0x')}",
-                "vram_bytes": int(vram) if vram and vram.isdigit() else 0,
-            }
-        )
+        if address not in taken:
+            found.append(pci_gpu(host, address, "Vulkan"))
+    return found
+
+
+def rocm_gpus(host: Host, rocm: Sequence[ComputeGPU]) -> list[GPUIdentity]:
+    """The GPUs that run on ROCm, by ROCm's UUIDs, which the memory probe reports them by."""
+    found = []
+    for gpu in rocm:
+        identity = pci_gpu(host, gpu.address, "ROCm")
+        identity["uuid"] = gpu.uuid
+        found.append(identity)
     return found
 
 
 def probe_versions(system: str, gpus: Sequence[GPUIdentity]) -> dict[str, str]:
     versions = {"ssd": PROBE_SCHEMAS["ssd"], "cpu": PROBE_SCHEMAS["cpu"]}
-    if system in ("linux", "windows") and any(gpu["backend"] == "CUDA" for gpu in gpus):
+    if system in ("linux", "windows") and any(gpu["backend"] in TIER_BACKENDS for gpu in gpus):
         versions["memory"] = PROBE_SCHEMAS["memory"]
     return versions
 
@@ -412,7 +486,11 @@ def with_saved_gpus(live: Identity, saved: Identity) -> Identity:
 def _linux(host: Host) -> Identity:
     machine_id = read(host, "/etc/machine-id") or read(host, "/var/lib/dbus/machine-id")
     gpus, driver, failure = nvidia(host)
-    gpus = gpus + linux_adapters(host)
+    rocm = amd_compute(host)
+    gpus = gpus + rocm_gpus(host, rocm) + linux_adapters(host, rocm)
+    # amdgpu is the kernel's (soft.kernel) unless a DKMS module replaces it, naming its version.
+    amdgpu = read(host, "/sys/module/amdgpu/version") if rocm else None
+    driver = ",".join(filter(None, (driver, amdgpu and "amdgpu " + amdgpu))) or None
     identity: Identity = {
         "hard": {
             "platform": "linux",

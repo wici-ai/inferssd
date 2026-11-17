@@ -5,7 +5,7 @@
 #include "ggml-ssd/io/read-ring.h"
 #include "ggml-ssd/platform/file.h"
 #include "ggml-cuda.h"
-#include <cuda_runtime_api.h>
+#include "gpu-runtime.h"
 #include <algorithm>
 #include <atomic>
 #include <stdexcept>

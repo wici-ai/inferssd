@@ -10,7 +10,7 @@
 #include "../../ggml-ssd/telemetry/telemetry.h"
 #include "../../ggml-ssd/host/arbiter.h"
 #include "../../ggml-ssd/platform/threads.h"
-#include <cuda_runtime_api.h>
+#include "gpu-runtime.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>

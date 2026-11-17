@@ -1,6 +1,6 @@
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
-#include <cuda_runtime_api.h>
+#include "ggml-cuda/ssd/gpu-runtime.h"
 #include <cstdio>
 #include <cstdlib>
 #if defined(__linux__)
