@@ -53,8 +53,8 @@ invalid scales. It runs in hosted CI. The `ssd_cpu_sink_swiglu_q2` and
 `ssd_cpu_sink_swiglu_q2_ordinary` tests include mixed
 IQ3_XXS up/gate and Q2_0 down experts at 2560/640 geometry, compared bit for bit
 with a resident ggml graph for decode and grouped prefill. `ssd_source_index`
-checks the corresponding unaligned 180-byte expert aliases and direct reads.
-The Python alias tests cover four shards, exact ranges and malformed inputs.
+checks the corresponding unaligned 180-byte expert aliases and direct reads, and
+a two-shard GGUF whose experts it indexes from the headers and reads back.
 
 CUDA supports Q2_0 conversion, row gathering, matrix-vector and matrix-matrix
 products, including the SSD expert tier. On an owned GPU, run
