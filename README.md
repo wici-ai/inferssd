@@ -15,16 +15,16 @@
 </p>
 <p align="center">macOS (Metal) &nbsp;·&nbsp; Windows 10/11 (CUDA · Vulkan · ROCm in progress) &nbsp;·&nbsp; Linux (CUDA · ROCm · Vulkan in progress)</p>
 
-**Run models larger than your RAM or VRAM.** InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run large mixture-of-experts (MoE) models from SSD, using standard GGUF files, with browser chat and an OpenAI-compatible API. It runs **DeepSeek-V4.1-Flash-1017**, **Muse-Spark-Open**, **Qwen3.6-35B-A3B** and **Qwen3.8 Flash Next** in many quantizations, plus ordinary RAM inference for **Gemma4 E4B**.
+**Run models larger than your RAM or VRAM.** InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run large mixture-of-experts (MoE) models from SSD, using standard GGUF files, with browser chat and an OpenAI-compatible API. It runs **DeepSeek-V4.1-Flash-1017** and **Qwen3.8 Flash Next** in many quantizations, as well as **Muse-Spark-Open**, **Qwen3.6-35B-A3B** and **Gemma4 E4B**.
 
 ## Models
 
-These are the tested GGUF files, used as their publishers released them. Expand a model for its files; sizes are in GB (10<sup>9</sup> bytes).
+These are the tested GGUF files, used as their publishers released them. Expand a model for its files.
 
 <details>
 <summary><b>DeepSeek-V4.1-Flash-1017</b> · 763B total / 8–16B active · 10 GGUFs</summary>
 
-| Quantization | Publisher | Size |
+| Quantization | Publisher | Size (GB) |
 | --- | --- | ---: |
 | [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-IQ1_S) | [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | 233.0 |
 | [UD-IQ1_M](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-IQ1_M) | [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | 250.4 |
@@ -44,7 +44,7 @@ mrfakename's Q8_0 keeps the official bit widths: routed experts stay native 4-bi
 <details>
 <summary><b>Muse-Spark-Open</b> · 816B total / 42B active · 1 GGUF</summary>
 
-| Quantization | Publisher | Size |
+| Quantization | Publisher | Size (GB) |
 | --- | --- | ---: |
 | [UD-Q4_K_XL](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/tree/main/UD-Q4_K_XL) | [Unsloth](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF) | 505.5 |
 
@@ -53,7 +53,7 @@ mrfakename's Q8_0 keeps the official bit widths: routed experts stay native 4-bi
 <details>
 <summary><b>Qwen3.8 Flash Next</b> · 177B total / A3B · 10 GGUFs</summary>
 
-| Quantization | Publisher | Size |
+| Quantization | Publisher | Size (GB) |
 | --- | --- | ---: |
 | [UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ1_S) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 66.4 |
 | [UD-IQ1_M](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ1_M) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 68.0 |
@@ -71,7 +71,7 @@ mrfakename's Q8_0 keeps the official bit widths: routed experts stay native 4-bi
 <details>
 <summary><b>Qwen3.6-35B-A3B</b> · 35B total / 3B active · 1 GGUF</summary>
 
-| Quantization | Publisher | Size |
+| Quantization | Publisher | Size (GB) |
 | --- | --- | ---: |
 | [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf) | [Unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 22.4 |
 
@@ -80,17 +80,15 @@ mrfakename's Q8_0 keeps the official bit widths: routed experts stay native 4-bi
 <details>
 <summary><b>Gemma4 E4B</b> · 7.46B total / E4B · 1 GGUF</summary>
 
-| Quantization | Publisher | Size |
+| Quantization | Publisher | Size (GB) |
 | --- | --- | ---: |
 | [QAT Q4_0](https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/blob/main/gemma-4-E4B_q4_0-it.gguf) | [Google](https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf) | 5.2 |
-
-Gemma runs in memory with the ordinary native loader, without SSD expert offload. Before loading, the launcher checks that weights, KV cache and working memory fit the memory budget, the machine's physical memory unless a smaller one is configured, and rejects a model that does not fit. On macOS the per-layer embedding table, 2.15 GiB of the 4.80 GiB file, stays in the file and its rows are read from the SSD as tokens use them.
 
 </details>
 
 ## Performance benchmarks
 
-**4K prompt tier · 256 output tokens · decode measured over tokens 129–256.** All rates are in **token/s**; higher is faster. The multiple next to each **InferSSD** rate is its speedup over llama.cpp on the same hardware. On the MacBook Pro, Colibri runs the official Safetensors on CPU; llama.cpp and InferSSD run the GGUF with Metal. See [measurement details](docs/benchmark.md).
+**4K prompt tier · 256 output tokens · decode measured over tokens 129–256.** All rates are in **token/s**; higher is faster. The multiple next to each **InferSSD** rate is its speedup over llama.cpp on the same hardware. On every machine, llama.cpp and InferSSD run DeepSeek's [mrfakename Q8_0](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/Q8_0) and Muse's [Unsloth UD-Q4_K_XL](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/tree/main/UD-Q4_K_XL); on the MacBook Pro they run them with Metal, and Colibri runs the official Safetensors on CPU. See [measurement details](docs/benchmark.md).
 
 ### Test hardware
 
@@ -103,7 +101,7 @@ Gemma runs in memory with the ordinary native loader, without SSD expert offload
 
 Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [hardware details](docs/benchmark.md#hardware-details) for SSD models, CPU core layouts, and configuration notes.
 
-### DeepSeek-V4.1-Flash-1017
+### DeepSeek-V4.1-Flash-1017 · mrfakename Q8_0
 
 <table>
 <thead>
@@ -118,7 +116,7 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 </tbody>
 </table>
 
-### Muse-Spark-Open
+### Muse-Spark-Open · Unsloth UD-Q4_K_XL
 
 <table>
 <thead>
