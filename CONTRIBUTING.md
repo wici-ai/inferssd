@@ -97,6 +97,16 @@ python3 scripts/public-scan.py --skip upstream
 gitleaks git --log-opts="--all"
 ```
 
+On Windows, run the framework tests only, as the Windows CI job does:
+
+```sh
+python -m pip install ./framework pytest
+python -m pytest -q framework/tests
+```
+
+The bench harness supports Linux and macOS only, and `bench/tests` imports POSIX-only modules, so it does not
+run on Windows. Those tests run in the Linux CI job on every pull request.
+
 Framework lint and type checks are listed in [development checks](framework/README.md#development-checks);
 the hosted checks are defined in [.github/workflows](.github/workflows).
 
