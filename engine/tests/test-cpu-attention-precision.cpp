@@ -168,6 +168,7 @@ int main(int argc, char ** argv) {
             {512, 512, 1, 513, 8, 1, 1, false, false, true, 0, 0},
             {64, 128, 16, 67, 8, 2, 1, true, true, false, 0, 0},
             {64, 64, 16, 67, 8, 1, 2, false, true, true, 3, 4},
+            {77, 45, 3, 19, 4, 2, 1, true, true, true, 0, 0},
         };
         int id = 0;
         for (const auto & s : shapes) {
@@ -177,7 +178,7 @@ int main(int argc, char ** argv) {
                 }
             }
         }
-        for (const auto type : {GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (const auto type : {GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q2_0}) {
             for (int threads : {1, 4}) { test(shapes[1], type, type, threads, id++, record); }
         }
         // The CPU tiled path starts at 64 queries. Include a partial final
