@@ -65,6 +65,17 @@ definition. Arithmetic returns `5`; the ice explanation stops normally; the
 MoE definition reaches the configured output limit. Acceptance requires
 successful prefill/decode placement, actual expert reads and VRAM hits,
 zero read errors, zero fallbacks, no OOM and a clean server exit.
+
+Implementation commit `083c53a` passed these checks on 2026-11-18 from fresh
+CPU and CUDA builds. The model directory contained only numbered shards 1–5;
+the PLE table was a regular file in another directory with an arbitrary name.
+The index contained 46,080 expert entries. All 1,920 placement events succeeded,
+with 16,521 expert reads, 53,362,057,216 expert read bytes and 8,376 VRAM hits.
+Peak cgroup memory was 34,041,057,280 bytes (31.70 GiB); whole-device VRAM peaked
+at 32,088 MiB including a 308 MiB baseline. Read errors, fallbacks and OOM events
+were zero; the server exited successfully and released the GPU. The complete
+native CI suite passed all 173 tests under an 8 GiB cgroup without skips.
+
 CPU attention uses the same implementation as `main`; this change does not
 alter its precision or KV representation. The stable softplus and
 DeepSeek-V4.1 sum-plus-epsilon router fixes are already on `main`.
