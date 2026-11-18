@@ -11,8 +11,10 @@ A descriptor is ordinary JSON. Relative paths resolve against its own directory:
   "schema": "inferssd-engine 1",
   "binary": "bin/inferssd-server",
   "revision": "the-deployed-source-revision",
-  "build": 202,
-  "date": "2026-11-06",
+  "version": "0.1.6.dev3",
+  "tag": null,
+  "build": 292,
+  "date": "2026-11-19",
   "branch": "main",
   "templates": {
     "dsv": "templates/deepseek-ai-DeepSeek-V4.1.jinja",
@@ -36,8 +38,17 @@ metadata, so a local build and the installer's build record them the same way;
 line as `<yymmdd>.<build>.<commit>`. A shallow clone counts only the commits it
 has, so the installer clones with `--filter=blob:none`; a source archive has no
 Git metadata, and the four are `"unknown"` and `null`. The WiCi AI desktop app
-names the engine by this label and decides on its own, by `build`, whether an
-engine is one it works with; the engine does not know the app.
+decides on its own, by `build`, whether an engine is one it works with; the
+engine does not know the app.
+
+`version` and `tag` say which release the build is. A build of a released
+commit is that release's version, `0.1.5`, with its tag, `v0.1.5`; the Release
+workflow, which creates the tag once the packages are published, passes it to
+the packages it builds in `INFERSSD_RELEASE_TAG`. Any other build is the next
+patch's development version, counted from the latest release tag before it, as
+setuptools-scm counts (`0.1.6.dev3`, three commits after `v0.1.5`), and has no
+tag. Without a release tag, both are `null` and `inferssd --version` reports the
+framework's own version.
 
 Use `darwin` for an Apple Silicon deployment and `windows` for a Windows one.
 `gpu_backends` lists the GPU backends the engine was built with, of `CUDA`,

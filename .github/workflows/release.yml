@@ -1,15 +1,24 @@
 name: Release
 
-# One numbered release contains the checked macOS and Windows (Vulkan and CUDA) packages of the same tag commit.
+# Releases main as the next version, vX.Y.Z: the checked macOS and Windows (Vulkan and CUDA)
+# packages of one commit, signed, published as one GitHub release, which tags the commit, and named
+# by the installers' package lists, which the desktop app follows. Every published package is a
+# release's. See docs/macos-package.md and docs/windows-package.md.
 on:
-  push:
-    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: The part of the last release's version to raise (patch for most releases)
+        type: choice
+        options: [patch, minor, major]
+        default: patch
 
 permissions:
   contents: read
 
+# One release at a time, so each takes the version after the one before it.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -17,45 +26,73 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
-      revision: ${{ steps.source.outputs.revision }}
+      revision: ${{ steps.version.outputs.revision }}
+      tag: ${{ steps.version.outputs.tag }}
+      previous: ${{ steps.version.outputs.previous }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Check the numbered tag and package version
-        id: source
+      - name: Choose the next version
+        id: version
         shell: bash
+        env:
+          BUMP: ${{ inputs.bump }}
         run: |
           set -euo pipefail
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          grep -Fqx "version = \"${GITHUB_REF_NAME#v}\"" framework/pyproject.toml
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo '::error::A release is made from main.'
+            exit 1
+          fi
+          previous=$(git tag --list 'v*' | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | sort -V | tail -n 1)
+          IFS=. read -r major minor patch <<< "${previous#v}"
+          case "$BUMP" in
+            major) tag="v$((major + 1)).0.0" ;;
+            minor) tag="v$major.$((minor + 1)).0" ;;
+            patch) tag="v$major.$minor.$((patch + 1))" ;;
+            *) echo "::error::Unknown bump: $BUMP"; exit 1 ;;
+          esac
           revision=$(git rev-parse HEAD)
-          test "$(git rev-parse "${GITHUB_REF_NAME}^{commit}")" = "$revision"
-          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          git merge-base --is-ancestor "$previous" HEAD || { echo "::error::$previous is not in main's history."; exit 1; }
+          if [ "$(git rev-parse "$previous^{commit}")" = "$revision" ]; then
+            echo "::error::main has not changed since $previous."
+            exit 1
+          fi
+          echo "Releasing $revision as $tag, after $previous."
+          { echo "revision=$revision"; echo "tag=$tag"; echo "previous=$previous"; } >> "$GITHUB_OUTPUT"
 
   macos:
     needs: validate
     uses: ./.github/workflows/package-macos.yml
     with:
       source_ref: ${{ needs.validate.outputs.revision }}
+      release_tag: ${{ needs.validate.outputs.tag }}
 
   windows:
     needs: validate
     uses: ./.github/workflows/package-windows.yml
     with:
       source_ref: ${{ needs.validate.outputs.revision }}
+      release_tag: ${{ needs.validate.outputs.tag }}
+    secrets:
+      # The signed-file store, so a later release signs only what changed. The signing secrets are
+      # the windows-signing environment's.
+      APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
 
   release:
     needs: [validate, macos, windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    concurrency:
-      group: inferssd-package-publish
-      cancel-in-progress: false
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.validate.outputs.tag }}
+      PREVIOUS: ${{ needs.validate.outputs.previous }}
+      RELEASE_REVISION: ${{ needs.validate.outputs.revision }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -79,47 +116,46 @@ jobs:
           name: install-windows-signed
           path: dist/install-windows
       - name: Prepare both platforms and tag-pinned installers
-        env:
-          RELEASE_REVISION: ${{ needs.validate.outputs.revision }}
         run: |
           python3 scripts/prepare-release-assets.py --macos-arm64 dist/macos --windows-x64-vulkan dist/windows-vulkan \
             --windows-x64-cuda dist/windows-cuda \
-            --output release-assets --tag "$GITHUB_REF_NAME" --revision "$RELEASE_REVISION" \
+            --output release-assets --tag "$TAG" --revision "$RELEASE_REVISION" \
             --repository "$GITHUB_REPOSITORY" --signed-install-ps1 dist/install-windows/install.ps1
           sh -n release-assets/install.sh
-      - name: Extract the release notes from the changelog
+      - name: Write the release notes
+        # The changes are the pull requests merged since the last release, by their titles. A
+        # release with highlights of its own has a section in CHANGELOG.md, which comes first.
         run: |
-          awk -v heading="## ${GITHUB_REF_NAME#v} " \
-            'index($0, heading) == 1 { found = 1; next } /^## / { found = 0 } found' \
-            CHANGELOG.md > release-notes.md
-          test -s release-notes.md
-      - name: Publish the common numbered release and normal package feeds
+          gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$TAG" \
+            -f target_commitish="$RELEASE_REVISION" -f previous_tag_name="$PREVIOUS" --jq .body > changes.md
+          python3 scripts/prepare-release-assets.py --release-notes release-notes.md --changes changes.md \
+            --tag "$TAG" --repository "$GITHUB_REPOSITORY"
+      - name: Publish the release and the package lists
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
           APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
-          RELEASE_REVISION: ${{ needs.validate.outputs.revision }}
         run: |
           set -euo pipefail
-          test -n "$APP_VERSIONING_TOKEN" || { echo 'APP_VERSIONING_TOKEN is required for both normal package feeds.' >&2; exit 1; }
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo 'A release already exists for this tag; its assets will not be replaced.' >&2
+          test -n "$APP_VERSIONING_TOKEN" || { echo 'APP_VERSIONING_TOKEN is required for the package lists.' >&2; exit 1; }
+          if gh release view "$TAG" >/dev/null 2>&1 || gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
+            echo "$TAG already exists; its release and assets will not be replaced." >&2
             exit 1
           fi
           created=no
           cleanup() {
-            if [ "$created" = yes ] && [ "$(gh api "repos/$GH_REPO/releases/tags/$GITHUB_REF_NAME" --jq '.draft')" = true ]; then
-              gh release delete "$GITHUB_REF_NAME" --yes
+            if [ "$created" = yes ] && [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ]; then
+              gh release delete "$TAG" --yes
             fi
           }
           trap cleanup EXIT
-          gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
-            --target "$RELEASE_REVISION" --title "$GITHUB_REF_NAME" --notes-file release-notes.md
+          # A draft creates no tag; publishing it tags the commit.
+          gh release create "$TAG" --draft --target "$RELEASE_REVISION" --title "$TAG" --notes-file release-notes.md
           created=yes
-          gh release upload "$GITHUB_REF_NAME" release-assets/*
+          gh release upload "$TAG" release-assets/*
           python3 scripts/publish-package.py dist/macos
           python3 scripts/publish-package.py dist/windows-vulkan
           python3 scripts/publish-package.py dist/windows-cuda
-          gh release edit "$GITHUB_REF_NAME" --draft=false
+          gh release edit "$TAG" --draft=false --latest
           created=no
+          test "$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)" = "$RELEASE_REVISION"
+          echo "Released $TAG ($RELEASE_REVISION)."

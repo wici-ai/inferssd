@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Publish a prebuilt platform package and point its package list at it.
+"""Publish a released platform package and point its package list at it.
 
 Usage: APP_VERSIONING_TOKEN=... scripts/publish-package.py DIST_DIR
 
-DIST_DIR holds one versioned macOS tar.gz or Windows ZIP (Vulkan or CUDA) and its .json. The archive goes to
+DIST_DIR holds one release's macOS tar.gz or Windows ZIP (Vulkan or CUDA), named by its version,
+and its .json; the Release workflow publishes each package of a release. The archive goes to
 cdn.wici.ai/apps/inferssd/ through WiCi AI's release service, which hands out an upload URL for it,
 as the desktop app's releases do. Then the package list, the .json with the archive's URL added,
 replaces latest-macos.json, latest-windows-vulkan.json or latest-windows-cuda.json, which the
 installers read. The list never moves to an older build.
 
-The CDN keeps a file for a year, so a name never gets other bytes: a package built again from a
-commit already uploaded is refused. Re-run the failed publish job of the run that built it
-instead; it uploads the same bytes, which the service skips. See docs/macos-package.md.
+The CDN keeps a file for a year, so a name never gets other bytes: a package built again for a
+version already uploaded is refused. Re-run the failed release job of the Release run that built
+it instead; it uploads the same bytes, which the service skips. See docs/macos-package.md.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -72,10 +74,13 @@ def main() -> None:
     platform, listing_name, extension = LISTS[suffix]
     if package.get("platform") != platform:
         fail("the package platform does not match its name")
+    tag = package.get("tag")
+    if (not isinstance(tag, str) or not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag)
+            or package.get("version") != tag[1:]):
+        fail("only a release's package is published: it has no release tag")
     name = package.get("name")
-    if (not isinstance(name, str) or not name or "/" in name or "\\" in name
-            or package.get("file") != name + extension):
-        fail("the package filename does not match its platform and name")
+    if name != f"inferssd-{tag[1:]}-{suffix}" or package.get("file") != name + extension:
+        fail("the package filename does not match its platform and version")
     archive = manifest.with_name(package["file"])
     data = archive.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
@@ -109,8 +114,8 @@ def main() -> None:
         if upload.get("replacing"):
             fail(
                 f"{name} is already published with other bytes, and the CDN may keep that copy "
-                "for a year: re-run the publish job of the run that built it, "
-                "or package a newer commit"
+                "for a year: re-run the release job of the Release run that built it, "
+                "or release again"
             )
         status, body = call("PUT", upload["upload_url"], data, upload["headers"])
         if status != 200:
@@ -133,7 +138,7 @@ def main() -> None:
         fail(f"writing {listing_name} answered {status}: {body[:300]!r}")
     stored = json.loads(body)
     print(f"{stored['url']} now names {upload['url']}")
-    print(f"{package['label']}, sha256 {digest}")
+    print(f"{package['version']} ({package['label']}), sha256 {digest}")
 
 
 if __name__ == "__main__":

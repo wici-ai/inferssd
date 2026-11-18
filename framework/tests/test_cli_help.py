@@ -57,6 +57,7 @@ def test_version_names_the_build_the_installer_recorded(capsys, monkeypatch, tmp
     assert main(["--version", "--json"]) == 0
     assert json.loads(capsys.readouterr().out) == {
         "version": version,
+        "tag": None,
         "build": 202,
         "revision": revision,
         "date": "2026-11-06",

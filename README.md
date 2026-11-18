@@ -91,7 +91,7 @@ Install on Apple Silicon macOS, or on Linux with an NVIDIA GPU or an AMD GPU wit
 curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 ```
 
-Each numbered release includes checked prebuilt packages for Apple Silicon macOS 15 or later and Windows 10 or 11 x64, built from the same tagged commit. Its installers download that exact release without developer tools; see [the macOS package](docs/macos-package.md) and [Windows package](docs/windows-package.md). Linux builds that release from source for the machine's CPU and GPU, which takes about 2 to 12 minutes. The installer on `main` downloads the latest published package:
+Each release includes checked prebuilt packages for Apple Silicon macOS 15 or later and Windows 10 or 11 x64, built from the same tagged commit. Its installers download that exact release without developer tools; see [the macOS package](docs/macos-package.md) and [Windows package](docs/windows-package.md). Linux builds that release from source for the machine's CPU and GPU, which takes about 2 to 12 minutes. The installer on `main` downloads the latest published package:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/wici-ai/inferssd/main/scripts/install.sh | sh
@@ -117,20 +117,23 @@ See the [quick start](docs/quickstart.md#one-command-installation) for upgrades 
 
 ## Versions
 
-InferSSD has a release number, `0.1.4` in `framework/pyproject.toml`, and every build has a
+Every published package is a release, `vX.Y.Z`, with its own version: the third number rises
+with each release, and the first two with larger ones. A build of any other commit is the next
+release's development version, `0.1.6.dev3` three commits after `v0.1.5`. Every build also has a
 label of its own, `<yymmdd>.<build>.<commit>`: the day (UTC) of the commit it was built from, the
-branch's commit count up to that commit, and the commit. The installer records the three in
-`engine-resources.json` beside the build, from the clone's Git metadata, and so does a local
-build that runs `scripts/engine-resources.py`; a source archive has no Git metadata and records
-none. The [macOS](docs/macos-package.md) and [Windows](docs/windows-package.md) packages carry those of the same tagged commit in each numbered release
-and are named by that label. `inferssd --version` prints the release and the label, `inferssd --version --json` every
-field:
+branch's commit count up to that commit, and the commit. The installer records them in
+`engine-resources.json` beside the build, from the clone's Git metadata and tags, and so does a
+local build that runs `scripts/engine-resources.py`; a source archive has no Git metadata and
+records none ([engine resources](docs/engine-resources.md)). The [macOS](docs/macos-package.md) and
+[Windows](docs/windows-package.md) packages of a release are built from its commit and named by
+its version. `inferssd --version` prints the version and the label, `inferssd --version --json`
+every field:
 
 ```sh
 $ inferssd --version
-inferssd 0.1.3 (261106.202.03af979)
+inferssd 0.1.5 (261118.289.1a2b3c4)
 $ inferssd --version --json
-{"version": "0.1.3", "build": 202, "revision": "03af97…", "date": "2026-11-06", "branch": "main", "label": "261106.202.03af979", "capabilities": {"model_profiles": […], "gpu_backends": ["Metal"]}}
+{"version": "0.1.5", "tag": "v0.1.5", "build": 289, "revision": "1a2b3c…", "date": "2026-11-18", "branch": "main", "label": "261118.289.1a2b3c4", "capabilities": {"model_profiles": […], "gpu_backends": ["Metal"]}}
 ```
 
 `capabilities` lists the model profiles the engine launches and, when the installer recorded them,

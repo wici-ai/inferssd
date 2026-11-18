@@ -20,16 +20,14 @@ REVISION = "1" * 40
 @pytest.fixture
 def inputs(tmp_path):
     root = tmp_path / "source"
-    (root / "framework").mkdir(parents=True)
-    (root / "scripts").mkdir()
-    (root / "framework/pyproject.toml").write_text('version = "0.1.3"\n')
+    (root / "scripts").mkdir(parents=True)
     for name in ("install.sh", "install.ps1"):
         shutil.copyfile(ROOT / "scripts" / name, root / "scripts" / name)
     directories = {}
     for suffix, (platform, extension, _) in release.PACKAGES.items():
         directory = tmp_path / suffix
         directory.mkdir()
-        name = f"inferssd-261109.250.1111111-{suffix}"
+        name = f"inferssd-0.1.3-{suffix}"
         archive = directory / (name + extension)
         archive.write_bytes((suffix + " checked package").encode())
         package = {
@@ -40,6 +38,7 @@ def inputs(tmp_path):
             "size": archive.stat().st_size,
             "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
             "version": "0.1.3",
+            "tag": "v0.1.3",
             "revision": REVISION,
             "build": 250,
             "date": "2026-11-09",
@@ -101,6 +100,9 @@ def test_one_release_contains_every_package_and_both_pinned_installers(inputs):
     "field,value",
     [
         ("version", "0.1.4"),
+        ("tag", None),
+        ("tag", "v0.1.4"),
+        ("name", "inferssd-261109.250.1111111-windows-x64-cuda"),
         ("revision", "2" * 40),
         ("build", 251),
         ("label", "another-build"),
@@ -184,57 +186,83 @@ def test_the_signing_job_writes_the_same_pinned_installer(tmp_path):
     assert written.read_bytes() == expected.encode()
 
 
-def test_published_windows_packages_are_signed_before_their_check():
+def test_released_windows_packages_are_signed_before_their_check():
     yaml = pytest.importorskip("yaml")
     jobs = yaml.load(
         (ROOT / ".github/workflows/package-windows.yml").read_text(), Loader=yaml.BaseLoader
     )["jobs"]
     sign = jobs["sign"]
     assert sign["needs"] == "build" and sign["environment"] == "windows-signing"
-    assert "inputs.source_ref" in sign["if"] and "inputs.publish" in sign["if"]
+    assert sign["if"] == "inputs.release_tag"
     uploads = [s for s in sign["steps"] if s.get("uses", "").startswith("actions/upload-artifact")]
     assert {s["with"]["name"] for s in uploads if s["with"].get("overwrite") == "true"} == {
         "package-windows-x64-vulkan",
         "package-windows-x64-cuda",
     }
     assert set(jobs["check"]["needs"]) == {"build", "sign"}
-    assert set(jobs["publish"]["needs"]) == {"sign", "check"}
-    assert "needs.sign.result == 'success'" in jobs["publish"]["if"]
 
 
-def test_tag_is_the_project_version_and_exact_tag_commit(inputs):
-    with pytest.raises(ValueError, match="framework version"):
+def test_the_tag_and_commit_must_be_the_packages(inputs):
+    with pytest.raises(ValueError, match="release version and tag commit"):
         prepare(inputs, tag="v0.1.4")
     with pytest.raises(ValueError, match="tag commit"):
         prepare(inputs, revision="3" * 40)
 
 
-def test_tag_workflow_waits_for_both_reusable_checked_packages():
+def test_release_notes_put_highlights_and_installation_before_the_changes(tmp_path):
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## 0.1.5 - 2026-11-18\n\nSigned packages.\n\n"
+        "## 0.1.4 - 2026-11-10\n\nOlder.\n"
+    )
+    changes = "## What's Changed\n* ci: one release (#1)\n"
+    notes = release.release_notes(tmp_path, "v0.1.5", "wici-ai/inferssd", changes)
+    base = "https://github.com/wici-ai/inferssd/releases/download/v0.1.5"
+    assert notes.startswith("Signed packages.\n\n### Install or upgrade\n")
+    assert f"curl -fsSL {base}/install.sh | sh" in notes
+    assert f"irm {base}/install.ps1 | iex" in notes
+    assert notes.endswith(changes) and "Older." not in notes
+    # A release without a section of its own has the installation and the changes alone.
+    plain = release.release_notes(tmp_path, "v0.1.6", "wici-ai/inferssd", changes)
+    assert plain.startswith("### Install or upgrade\n") and plain.endswith(changes)
+
+
+def test_every_published_package_is_a_release_of_main():
     yaml = pytest.importorskip("yaml")
     workflow = yaml.load(
         (ROOT / ".github/workflows/release.yml").read_text(), Loader=yaml.BaseLoader
     )
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert workflow["on"]["workflow_dispatch"]["inputs"]["bump"]["default"] == "patch"
     jobs = workflow["jobs"]
     for name in ("macos", "windows"):
         assert jobs[name]["uses"] == f"./.github/workflows/package-{name}.yml"
-        assert jobs[name]["with"]["source_ref"] == "${{ needs.validate.outputs.revision }}"
+        assert jobs[name]["with"] == {
+            "source_ref": "${{ needs.validate.outputs.revision }}",
+            "release_tag": "${{ needs.validate.outputs.tag }}",
+        }
+    assert jobs["windows"]["secrets"] == {
+        "APP_VERSIONING_TOKEN": "${{ secrets.APP_VERSIONING_TOKEN }}"
+    }
     assert set(jobs["release"]["needs"]) == {"validate", "macos", "windows"}
+    choice = next(s["run"] for s in jobs["validate"]["steps"] if s.get("id") == "version")
+    assert "refs/heads/main" in choice and "sort -V" in choice
     preparation = next(
         s["run"] for s in jobs["release"]["steps"] if "Prepare both" in s.get("name", "")
     )
     assert "--signed-install-ps1 dist/install-windows/install.ps1" in preparation
-    group = jobs["release"]["concurrency"]["group"]
+    publication = next(
+        s["run"] for s in jobs["release"]["steps"] if "Publish the release" in s.get("name", "")
+    )
+    assert "scripts/publish-package.py dist/macos" in publication
+    assert "scripts/publish-package.py dist/windows-vulkan\n" in publication
+    assert "scripts/publish-package.py dist/windows-cuda" in publication
+    assert "--draft --target" in publication and "--draft=false --latest" in publication
+    assert "its release and assets will not be replaced" in publication
+    # The package workflows build and check; only Release publishes.
     for name in ("macos", "windows"):
         package_workflow = yaml.load(
             (ROOT / f".github/workflows/package-{name}.yml").read_text(),
             Loader=yaml.BaseLoader,
         )
-        assert package_workflow["jobs"]["publish"]["concurrency"]["group"] == group
-    publication = next(
-        s["run"] for s in jobs["release"]["steps"] if "Publish the common" in s.get("name", "")
-    )
-    assert "scripts/publish-package.py dist/macos" in publication
-    assert "scripts/publish-package.py dist/windows-vulkan\n" in publication
-    assert "scripts/publish-package.py dist/windows-cuda" in publication
-    assert "--draft --verify-tag" in publication and "--draft=false" in publication
-    assert "its assets will not be replaced" in publication
+        assert "publish" not in package_workflow["jobs"]
+        assert "inputs" not in (package_workflow["on"]["workflow_dispatch"] or {})

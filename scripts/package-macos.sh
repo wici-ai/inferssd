@@ -8,8 +8,9 @@
 #
 # Usage: scripts/package-macos.sh [OUTPUT_DIR]      (default: dist)
 #
-# OUTPUT_DIR receives inferssd-<label>-macos-arm64.tar.gz, named by the build's label, and beside it
-# a .json that describes it for scripts/publish-package.py. INFERSSD_JOBS sets the build parallelism (default: every CPU).
+# OUTPUT_DIR receives inferssd-<version>-macos-arm64.tar.gz for a release (INFERSSD_RELEASE_TAG), else
+# inferssd-<label>-macos-arm64.tar.gz, named by the build's label, and beside it a .json that
+# describes it for scripts/publish-package.py. INFERSSD_JOBS sets the build parallelism (default: every CPU).
 set -eu
 
 # A relocatable CPython (python-build-standalone), pinned by its checksum.
@@ -84,6 +85,7 @@ rm -rf "$package/python/include" "$package/python/share" "$lib/pkgconfig" "$lib"
 # package's name.
 "$python" -I - "$stage/engine-resources.json" "$package" "$stage/name" <<'PY'
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -92,6 +94,9 @@ from inferssd.version import label
 
 source, package, named = map(Path, sys.argv[1:])
 data = json.loads(source.read_text(encoding="utf-8"))
+if os.environ.get("GITHUB_ACTIONS") == "true":
+    # CI checks out an exact commit; the branch it ran for names it, as on Windows.
+    data["branch"] = os.environ.get("GITHUB_HEAD_REF") or os.environ.get("GITHUB_REF_NAME") or data["branch"]
 
 
 def place(path, folder):
@@ -109,7 +114,8 @@ data["probes"] = {name: place(path, "bin") for name, path in data["probes"].item
 built = label(data.get("build"), data.get("date"), data.get("revision"))
 if not built:
     sys.exit("package-macos: the build has no build number, day and commit")
-named.write_text(f"inferssd-{built}-macos-arm64\n", encoding="utf-8")
+# A release is named by its version, any other build by its label.
+named.write_text(f"inferssd-{data['version'] if data.get('tag') else built}-macos-arm64\n", encoding="utf-8")
 PY
 name=$(cat "$stage/name")
 cp "$root/LICENSE" "$root/NOTICE" "$package/licenses/"
@@ -189,7 +195,7 @@ from pathlib import Path
 version, archive, minimum = json.loads(Path(sys.argv[1]).read_text()), Path(sys.argv[2]), sys.argv[3]
 digest = hashlib.sha256(archive.read_bytes()).hexdigest()
 name = archive.name[: -len(".tar.gz")]
-fields = ("version", "build", "revision", "date", "branch", "label")
+fields = ("version", "tag", "build", "revision", "date", "branch", "label")
 print(json.dumps({
     "schema": "inferssd-package 1",
     "name": name,

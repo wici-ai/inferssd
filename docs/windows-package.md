@@ -31,8 +31,9 @@ GPU's driver is new enough, else the Vulkan package. `inferssd --version --json`
 installed, in `capabilities.gpu_backends` (`["CUDA"]` or `["Vulkan"]`), so an updater reads that
 package's list, `latest-windows-cuda.json` or `latest-windows-vulkan.json`.
 
-An archive has one directory, `inferssd-<date.build.commit>-windows-x64-vulkan` (or `-cuda`),
-containing:
+An archive has one directory, `inferssd-<version>-windows-x64-vulkan` (or `-cuda`), named by the
+release's version (by the build label, `<date.build.commit>`, for a package built outside a
+release, which is never published), containing:
 
 - `bin/inferssd.exe`: a relocatable native console entry point, forwarding arguments, standard
   handles and exit status to the package's own Python.
@@ -49,26 +50,25 @@ the macOS package. Published bytes are immutable.
 
 ## Build and verify
 
-Every numbered `vX.Y.Z` release automatically calls the reusable Windows and macOS package
-workflows at the same tag commit. After both platforms' checks pass, the common **Release** job
-prepares one GitHub release containing the three archives (macOS, Windows Vulkan, Windows CUDA),
-their manifests and `install.sh`/`install.ps1`, updates the normal latest package feeds, and only
-then publishes the complete release. There is no
-separate Windows-only version or prerelease channel. Publishing requires `APP_VERSIONING_TOKEN`.
+Every published package is a release's. **Actions > Release**, run by hand on `main`, takes the
+next version and calls the reusable Windows and macOS package workflows at main's head with the
+release's tag (see [the macOS package](macos-package.md#releases)). After both platforms' checks
+pass, its release job prepares one GitHub release containing the three archives (macOS, Windows
+Vulkan, Windows CUDA), their manifests and `install.sh`/`install.ps1`, updates the latest package
+lists, and only then publishes the complete release, which tags the commit. There is no separate
+Windows-only version or prerelease channel. Publishing requires `APP_VERSIONING_TOKEN`.
 
-The numbered Windows installer pins its default package URLs to that release's
+A release's Windows installer pins its default package URLs to that release's
 `latest-windows-vulkan.json` and `latest-windows-cuda.json`; it cannot silently install a newer
-rolling version. The asset preparation
-step rejects packages with a different version, revision, build, label or checksum. Existing
-published releases are never overwritten. A draft remains private until all assets and every
-normal package feed are ready.
+version. The asset preparation step rejects packages with a different version, tag, name,
+revision, build, label or checksum. Existing published releases are never overwritten. A draft
+remains private until all assets and every package list are ready.
 
-**Package Windows** runs for pull requests that change how the packages are built, after each
-merge to `main` that changes the engine, the framework or the packaging, and manually for
-validation, producing `package-windows-x64-vulkan` and `package-windows-x64-cuda` Actions
-artifacts. GitHub's runner has no GPU, so the CUDA package's check also shows that it starts
-without an NVIDIA driver. Its optional manual publisher
-remains main-only; no manual Windows job is required for normal numbered releases.
+**Package Windows** also runs, building and checking without signing or publishing, for pull
+requests that change how the packages are built, after each merge to `main` that changes the
+engine, the framework or the packaging, and by hand on any branch, producing
+`package-windows-x64-vulkan` and `package-windows-x64-cuda` Actions artifacts. GitHub's runner has
+no GPU, so the CUDA package's check also shows that it starts without an NVIDIA driver.
 
 For a local build, enter an x64 Visual Studio tools environment, install the Vulkan SDK, and run:
 
@@ -98,11 +98,10 @@ file its vendor ships signed keeps that signature: Microsoft's Visual C++ runtim
 Software Foundation's Tcl/Tk, LunarG's Vulkan loader. Every other file is signed with WiCi AI's
 code-signing certificate: the engine's own binaries, and the third-party files their projects
 ship unsigned, such as python-build-standalone's CPython, the Hub client's extension modules and
-NVIDIA's CUDA runtime and cuBLAS redistributables. The pinned `install.ps1` of a numbered release
-is signed the same way.
+NVIDIA's CUDA runtime and cuBLAS redistributables. The pinned `install.ps1` of a release is
+signed the same way.
 
-Only runs that publish sign: numbered releases and the manual main-only publisher. Their **sign**
-job unpacks both packages, signs them in one pass through SSL.com eSigner
+Only releases sign. A release's **sign** job unpacks both packages, signs them in one pass through SSL.com eSigner
 (`scripts/package-windows-sign.ps1`, `scripts/sign-windows.ps1`), packs them again and updates
 their listings' size and SHA-256; the check then runs on those signed bytes, which are the ones
 published. Each newly signed file is also stored under the SHA-256 of its unsigned bytes, so a

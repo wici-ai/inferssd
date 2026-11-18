@@ -1,16 +1,18 @@
-"""What `inferssd --version` says: the release, and the build this engine was made from.
+"""What `inferssd --version` says: the version, and the build this engine was made from.
 
-The build number is the branch's commit count and the day the commit's, both read from the clone
-by scripts/engine-resources.py at install time; together with the commit they name the engine as
-the app does, <yymmdd>.<build>.<commit>. Whether an engine is one the app works with is the app's
-own call, by this build number. The GPU backends the build was made with come from the same file,
-so a caller can tell the Windows packages, one per backend, apart.
+scripts/engine-resources.py reads them from the clone at install time. The version is a release's
+own, 0.1.5, with its tag, v0.1.5; any other build is the next release's development version,
+0.1.6.dev3. The build number is the branch's commit count and the day the commit's; together with
+the commit they name the build, <yymmdd>.<build>.<commit>. Whether an engine is one the app works
+with is the app's own call, by this build number. The GPU backends the build was made with come
+from the same file, so a caller can tell the Windows packages, one per backend, apart.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Mapping
 from typing import Any, Optional
 
@@ -26,11 +28,17 @@ def label(build: Optional[int], date: Optional[str], revision: Optional[str]) ->
     return f"{date[2:4]}{date[5:7]}{date[8:10]}.{build}.{revision[:7]}"
 
 
+TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+
+
 def report(environ: Mapping[str, str] = os.environ) -> dict[str, Any]:
-    """The version and, when the installer recorded them, the build, commit, day, branch and the
-    GPU backends the build has (`capabilities.gpu_backends`, empty for a CPU-only build)."""
+    """The version and, when the installer recorded them, the release's tag (None for any other
+    build), the build, commit, day, branch and the GPU backends the build has
+    (`capabilities.gpu_backends`, empty for a CPU-only build). Without a recorded version, the
+    framework's own stands."""
     value: dict[str, Any] = {
         "version": __version__,
+        "tag": None,
         "build": None,
         "revision": None,
         "date": None,
@@ -46,6 +54,12 @@ def report(environ: Mapping[str, str] = os.environ) -> dict[str, Any]:
         return value
     build = data.get("build")
     revision = data.get("revision")
+    version = data.get("version")
+    if isinstance(version, str) and version:
+        value["version"] = version
+    tag = data.get("tag")
+    if isinstance(tag, str) and TAG.fullmatch(tag) and tag[1:] == value["version"]:
+        value["tag"] = tag
     for key, kind in (("build", int), ("revision", str), ("date", str), ("branch", str)):
         item = data.get(key)
         if isinstance(item, kind) and not isinstance(item, bool) and item != "unknown":
@@ -65,6 +79,6 @@ def report(environ: Mapping[str, str] = os.environ) -> dict[str, Any]:
 
 
 def line(value: Mapping[str, Any]) -> str:
-    """The line for people: `inferssd 0.1.3 (261106.202.03af979)`, the label when there is one."""
+    """The line for people: `inferssd 0.1.5 (261118.289.1a2b3c4)`, the label when there is one."""
     text = f"inferssd {value['version']}"
     return f"{text} ({value['label']})" if value.get("label") else text

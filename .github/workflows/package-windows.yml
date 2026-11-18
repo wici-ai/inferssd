@@ -1,18 +1,22 @@
 name: Package Windows
 
+# Build the prebuilt Windows packages, one per GPU backend, and check them. Release builds them for
+# each release, which signs them here and publishes them (release.yml). See docs/windows-package.md.
 on:
   workflow_call:
     inputs:
       source_ref:
-        description: Exact commit to build and check for the shared numbered release
+        description: Exact commit to build and check for the release
         required: true
         type: string
-      publish:
-        type: boolean
-        default: false
+      release_tag:
+        description: The release's tag, vX.Y.Z, which gives the packages their version and names
+        required: true
+        type: string
     secrets:
+      # The signed-file store (scripts/sign-windows.ps1).
       APP_VERSIONING_TOKEN:
-        required: false
+        required: true
   # A pull request builds the packages when it changes how they are built; a change to main that reaches them
   # builds them after the merge.
   push:
@@ -41,18 +45,16 @@ on:
       - scripts/install.ps1
       - scripts/sign-windows.ps1
       - .github/workflows/package-windows.yml
+  # By hand, on any branch: build and check. Only Release signs and publishes.
   workflow_dispatch:
-    inputs:
-      publish:
-        description: Publish the checked packages and update their package lists (main only)
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: package-windows-${{ github.ref }}
+  # A pull request's newer run replaces its older one; a branch's other runs queue in its group, and
+  # a release's run in its own.
+  group: package-windows-${{ inputs.release_tag || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -113,6 +115,8 @@ jobs:
         run: scripts/install-cuda-redist.ps1 -Version $env:CUDA_REDIST -Root (Join-Path $env:RUNNER_TEMP 'cuda')
       - name: Build the relocatable engine package
         shell: cmd
+        env:
+          INFERSSD_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
           call "%VS%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44 > nul || exit /b 1
@@ -128,12 +132,12 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # A run that publishes signs what it publishes: every code file in the packages carries WiCi AI's
-  # signature or its vendor's (docs/windows-package.md). Pull requests and other main pushes sign
+  # A release signs what it publishes: every code file in the packages carries WiCi AI's signature
+  # or its vendor's (docs/windows-package.md). Pull requests, main pushes and manual runs sign
   # nothing. The signed packages replace the built ones, so the check runs on the published bytes.
   sign:
     needs: build
-    if: inputs.source_ref || (inputs.publish && github.ref == 'refs/heads/main')
+    if: inputs.release_tag
     runs-on: windows-2025
     timeout-minutes: 60
     environment: windows-signing
@@ -150,12 +154,13 @@ jobs:
         with:
           name: package-windows-x64-cuda
           path: dist/windows-x64-cuda
-      # A numbered release also publishes an install.ps1 pinned to its tag, signed in the same pass.
+      # A release also publishes an install.ps1 pinned to its tag, signed in the same pass.
       - name: Pin the release's Windows installer
-        if: inputs.source_ref
         shell: powershell
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          python scripts/prepare-release-assets.py --pinned-install-ps1 dist/installer/install.ps1 --tag $env:GITHUB_REF_NAME --repository $env:GITHUB_REPOSITORY
+          python scripts/prepare-release-assets.py --pinned-install-ps1 dist/installer/install.ps1 --tag $env:RELEASE_TAG --repository $env:GITHUB_REPOSITORY
           if ($LASTEXITCODE -ne 0) { throw 'The pinned installer could not be written.' }
       - name: Sign every code file the packages carry
         shell: powershell
@@ -184,7 +189,6 @@ jobs:
           retention-days: 30
           overwrite: true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        if: inputs.source_ref
         with:
           name: install-windows-signed
           path: dist/installer/install.ps1
@@ -218,28 +222,3 @@ jobs:
           if ($zip.Count -ne 1) { throw 'Expected one Windows engine archive' }
           & scripts/check-package-windows.ps1 -Archive $zip[0].FullName
 
-  publish:
-    needs: [sign, check]
-    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && inputs.publish && needs.sign.result == 'success' && needs.check.result == 'success' }}
-    strategy:
-      max-parallel: 1
-      matrix:
-        package: [windows-x64-vulkan, windows-x64-cuda]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    concurrency:
-      group: inferssd-package-publish
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ inputs.source_ref || github.sha }}
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: package-${{ matrix.package }}
-          path: dist
-      - name: Publish the checked package
-        env:
-          APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
-        run: python3 scripts/publish-package.py dist

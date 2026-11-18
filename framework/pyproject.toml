@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "inferssd"
-version = "0.1.4"
+# The engine's version comes from its Git tag when it is installed (scripts/engine-resources.py);
+# this one stands only for a source tree that has none.
+version = "0+unknown"
 description = "InferSSD typed settings and owned inference runtime"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.9"

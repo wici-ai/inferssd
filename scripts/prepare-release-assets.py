@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Prepare one numbered release from the checked macOS and Windows packages of one commit."""
+"""Prepare one release from the checked macOS and Windows packages of one commit."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ PACKAGES = {
 
 
 def checked_package(
-    directory: Path, suffix: str, version: str, revision: str
+    directory: Path, suffix: str, tag: str, revision: str
 ) -> dict[str, Any]:
     platform, extension, _ = PACKAGES[suffix]
     listings = sorted(directory.glob(f"inferssd-*-{suffix}.json"))
@@ -35,13 +35,17 @@ def checked_package(
         or package.get("platform") != platform
     ):
         raise ValueError(f"wrong package schema/platform: {listings[0]}")
-    if package.get("version") != version or package.get("revision") != revision:
+    if (
+        package.get("version") != tag[1:]
+        or package.get("tag") != tag
+        or package.get("revision") != revision
+    ):
         raise ValueError(
             f"{platform} package does not match the release version and tag commit"
         )
     name = package.get("name", "")
-    if not re.fullmatch(rf"inferssd-[A-Za-z0-9_.-]+-{suffix}", name):
-        raise ValueError("invalid package name")
+    if name != f"inferssd-{tag[1:]}-{suffix}":
+        raise ValueError("the package is not named by the release version")
     if package.get("file") != name + extension:
         raise ValueError("archive filename does not match package name")
     if (
@@ -113,6 +117,37 @@ def signed_powershell(signed: Path, pinned: str) -> bytes:
     return data
 
 
+def release_notes(root: Path, tag: str, repository: str, changes: str) -> str:
+    """A release's notes: its highlights when CHANGELOG.md has a section for it, how to install
+    it, then the changes since the last release (GitHub's list of the pull requests merged)."""
+    base = release_base(tag, repository)
+    heading = f"## {tag[1:]} "
+    highlights: list[str] = []
+    found = False
+    for line in (root / "CHANGELOG.md").read_text(encoding="utf-8").splitlines():
+        if line.startswith("## "):
+            found = line.startswith(heading)
+        elif found:
+            highlights.append(line)
+    install = f"""### Install or upgrade
+
+On macOS or Linux:
+
+```sh
+curl -fsSL {base}/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm {base}/install.ps1 | iex
+```
+
+Run the same command to upgrade. Downloaded models are preserved."""
+    parts = ("\n".join(highlights).strip(), install, changes.strip())
+    return "\n\n".join(part for part in parts if part) + "\n"
+
+
 def prepare(
     root: Path,
     directories: dict[str, Path],
@@ -125,19 +160,10 @@ def prepare(
     base = release_base(tag, repository)
     if not re.fullmatch(r"[a-f0-9]{40}", revision):
         raise ValueError("a numbered version tag and its exact commit SHA are required")
-    version = re.search(
-        r'^version = "([^"]+)"$',
-        (root / "framework/pyproject.toml").read_text(encoding="utf-8"),
-        re.MULTILINE,
-    )
-    if version is None or version[1] != tag[1:]:
-        raise ValueError("tag does not match the framework version")
     if set(directories) != set(PACKAGES):
-        raise ValueError(
-            "a numbered release holds every package: " + ", ".join(PACKAGES)
-        )
+        raise ValueError("a release holds every package: " + ", ".join(PACKAGES))
     packages = {
-        suffix: checked_package(directories[suffix], suffix, tag[1:], revision)
+        suffix: checked_package(directories[suffix], suffix, tag, revision)
         for suffix in PACKAGES
     }
     if (
@@ -188,6 +214,12 @@ def prepare(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--release-notes",
+        type=Path,
+        help="only write the release's notes here, from --changes (with --tag and --repository)",
+    )
+    parser.add_argument("--changes", type=Path, help="the changes since the last release")
+    parser.add_argument(
         "--pinned-install-ps1",
         type=Path,
         help="only write the release's pinned install.ps1 here, for signing (with --tag and --repository)",
@@ -203,6 +235,14 @@ def main() -> None:
     )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
+    if args.release_notes:
+        if args.changes is None:
+            parser.error("--release-notes needs --changes")
+        args.release_notes.write_text(
+            release_notes(root, args.tag, args.repository, args.changes.read_text(encoding="utf-8")),
+            encoding="utf-8",
+        )
+        return
     if args.pinned_install_ps1:
         args.pinned_install_ps1.parent.mkdir(parents=True, exist_ok=True)
         args.pinned_install_ps1.write_bytes(

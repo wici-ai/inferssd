@@ -23,7 +23,7 @@ def test_publish_verified_package_to_its_platform_list(
     spec = importlib.util.spec_from_file_location("publisher", script)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    name = "inferssd-261109.401.aaaaaaa-" + suffix
+    name = "inferssd-0.1.5-" + suffix
     archive = tmp_path / (name + extension)
     archive.write_bytes(b"verified package")
     package = {
@@ -32,6 +32,8 @@ def test_publish_verified_package_to_its_platform_list(
         "name": name,
         "file": archive.name,
         "size": archive.stat().st_size,
+        "version": "0.1.5",
+        "tag": "v0.1.5",
         "build": 401,
         "label": "261109.401.aaaaaaa",
         "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
@@ -59,3 +61,44 @@ def test_publish_verified_package_to_its_platform_list(
     module.main()
     assert requests[0][1].endswith("/config/" + listing)
     assert requests[-1][1].endswith("/config/" + listing)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"tag": None},
+        {"tag": "v0.1.6"},
+        {"name": "inferssd-261109.401.aaaaaaa-macos-arm64"},
+    ],
+)
+def test_only_a_release_package_named_by_its_version_is_published(tmp_path, monkeypatch, change):
+    script = Path(__file__).resolve().parents[2] / "scripts/publish-package.py"
+    spec = importlib.util.spec_from_file_location("publisher", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    name = "inferssd-0.1.5-macos-arm64"
+    archive = tmp_path / (name + ".tar.gz")
+    archive.write_bytes(b"verified package")
+    package = {
+        "schema": "inferssd-package 1",
+        "platform": "darwin-arm64",
+        "name": name,
+        "file": archive.name,
+        "size": archive.stat().st_size,
+        "version": "0.1.5",
+        "tag": "v0.1.5",
+        "build": 401,
+        "label": "261109.401.aaaaaaa",
+        "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        **change,
+    }
+    (tmp_path / (name + ".json")).write_text(json.dumps(package))
+
+    def call(*arguments, **keywords):
+        raise AssertionError("nothing is uploaded")
+
+    monkeypatch.setattr(module, "call", call)
+    monkeypatch.setenv("APP_VERSIONING_TOKEN", "test-only-token")
+    monkeypatch.setattr(module.sys, "argv", [str(script), str(tmp_path)])
+    with pytest.raises(SystemExit, match="release|version"):
+        module.main()

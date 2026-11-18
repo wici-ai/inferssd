@@ -1,21 +1,18 @@
 name: Package macOS
 
-# Build the prebuilt Apple silicon package, check it on the oldest and the newest macOS it runs on,
-# and, when asked on main, publish it and point the installer's package list at it.
-# See docs/macos-package.md.
+# Build the prebuilt Apple silicon package and check it on the oldest and the newest macOS it runs
+# on. Release builds it for each release, which publishes it (release.yml). See docs/macos-package.md.
 on:
   workflow_call:
     inputs:
       source_ref:
-        description: Exact commit to build and check for the shared numbered release
+        description: Exact commit to build and check for the release
         required: true
         type: string
-      publish:
-        type: boolean
-        default: false
-    secrets:
-      APP_VERSIONING_TOKEN:
-        required: false
+      release_tag:
+        description: The release's tag, vX.Y.Z, which gives the package its version and name
+        required: true
+        type: string
   # A pull request builds the package when it changes how it is built; a change to main that reaches it
   # builds it after the merge.
   push:
@@ -38,26 +35,21 @@ on:
       - scripts/engine-resources.py
       - scripts/install.sh
       - .github/workflows/package-macos.yml
+  # By hand, on any branch: build and check. Only Release publishes.
   workflow_dispatch:
-    inputs:
-      publish:
-        description: Upload the package and point latest-macos.json at it
-        type: boolean
-        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  # A pull request's newer run replaces its older one; main, tags and manual runs queue in one group.
-  group: ${{ github.event_name == 'pull_request' && format('package-macos-{0}', github.ref) || 'package-macos' }}
+  # A pull request's newer run replaces its older one; a branch's other runs queue in its group, and
+  # a release's run in its own.
+  group: package-macos-${{ inputs.release_tag || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
-    if: >-
-      (github.event_name == 'pull_request' && !github.event.pull_request.draft) ||
-      github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: macos-15
     timeout-minutes: 90
     steps:
@@ -68,6 +60,8 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Build the package
+        env:
+          INFERSSD_RELEASE_TAG: ${{ inputs.release_tag }}
         run: scripts/package-macos.sh dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -96,24 +90,3 @@ jobs:
       - name: Install and run the package without developer tools
         run: scripts/check-package-macos.sh dist/inferssd-*-macos-arm64.tar.gz
 
-  publish:
-    needs: check
-    if: github.ref == 'refs/heads/main' && inputs.publish
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    concurrency:
-      group: inferssd-package-publish
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          ref: ${{ inputs.source_ref }}
-          persist-credentials: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: package-macos
-          path: dist
-      - name: Publish
-        env:
-          APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
-        run: python3 scripts/publish-package.py dist
