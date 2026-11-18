@@ -94,6 +94,9 @@ public:
         g_expert_pack.io_backend = desc.io_backend;
         std::vector<expert_pack_entry> entries;
         if (!append_sources(g_expert_pack, desc, entries)) { return {}; }
+        for (const auto & path : desc.ggufs) {
+            if (!desc.read_gguf || !desc.read_gguf(g_expert_pack, path.c_str(), entries, desc.require_direct, {})) { return {}; }
+        }
         if (entries.empty()) { return {}; }
         if (!finalize_entries(entries, desc.replace_duplicates || !desc.page_cache_packs.empty())) { return {}; }
         g_expert_pack.enabled = true;
