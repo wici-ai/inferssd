@@ -34,12 +34,26 @@ static std::set<const ggml_tensor *> graph_dependencies(ggml_cgraph * graph) {
 static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decode, const char * label,
         ggml_type weight_type = GGML_TYPE_MXFP4, llm_arch arch = LLM_ARCH_DEEPSEEK41, ggml_type gate_type = GGML_TYPE_COUNT) {
     constexpr int latent = 256, hidden = 512, experts = 20, slots = 8;
-    // Metadata-only runtimes: no pool, ring, resolver or cache is initialized.
+    // Metadata-only runtimes: no pool, ring or cache is initialized. Their layout of routed layer 0 places each expert
+    // in a file no case reads.
     const auto configured = ssd::settings::parse("", "");
     require(bool(configured), "metadata fixture settings rejected");
     const ssd::runtime_services services;
-    llama_ssd_cpu_sink_runtime runtime(1, 1, experts, {0}, configured.value, services, {});
-    llama_ssd_cpu_sink_runtime other_runtime(1, 2, experts, {0}, configured.value, services, {});
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> meta(ggml_init({ ggml_tensor_overhead() * 3, nullptr, true }), ggml_free);
+    require(bool(meta), "metadata context failed");
+    ggml_tensor * meta_roles[3] = {
+        ggml_new_tensor_3d(meta.get(), weight_type, latent, hidden, experts),
+        ggml_new_tensor_3d(meta.get(), gate_type == GGML_TYPE_COUNT ? weight_type : gate_type, latent, hidden, experts),
+        ggml_new_tensor_3d(meta.get(), weight_type, hidden, latent, experts) };
+    ggml_set_name(meta_roles[0], "blk.0.ffn_up_exps.weight");
+    ggml_set_name(meta_roles[1], "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(meta_roles[2], "blk.0.ffn_down_exps.weight");
+    ssd::store::source_view unread;
+    unread.resolve = [](void *, const char *, int expert, size_t bytes, int64_t, int * fd, uint64_t * offset,
+            size_t * logical) noexcept { *fd = 0; *offset = uint64_t(expert) * bytes; *logical = bytes; return true; };
+    const std::vector<ssd::store::expert_layout::routed_layer> routed = { { 0, { meta_roles[0], meta_roles[1], meta_roles[2] } } };
+    llama_ssd_cpu_sink_runtime runtime(1, routed, configured.value, services, unread);
+    llama_ssd_cpu_sink_runtime other_runtime(2, routed, configured.value, services, unread);
     llm_graph_result result(2048);
     ggml_backend_t backends[] = { cpu };
     ggml_backend_buffer_type_t buffer_types[] = { ggml_backend_cpu_buffer_type() };
@@ -137,13 +151,7 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
         require(qwen ? descriptor.activation.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU :
                 descriptor.activation.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP && descriptor.activation.swiglu_limit == 7.0f,
                 "custom node carries another activation than the model's");
-        for (const auto * metadata : { &descriptor.up, &descriptor.gate, &descriptor.down }) {
-            require(!metadata->data && !metadata->buffer && !metadata->extra && !metadata->view_src,
-                    "expert descriptor retained payload ownership");
-            for (const auto * source : metadata->src) {
-                require(!source, "expert descriptor retained graph sources");
-            }
-        }
+        require(descriptor.layer == 0, "custom node names another layer than its routed layer");
         require(ggml_backend_sched_get_tensor_backend(scheduler.get(), output) == cpu, "custom node not assigned to CPU");
         require(bool(output->src[4]) == predicted, "the custom node must carry the prediction it was given");
         if (predicted) {

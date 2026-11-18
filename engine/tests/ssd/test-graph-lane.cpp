@@ -14,8 +14,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <array>
 #include <random>
 #include <vector>
+#include "declared-layout.h"
 
 namespace {
 constexpr int latent = 320, hidden = 64, experts = 6, tokens = 96, nslots = 3;
@@ -199,11 +201,11 @@ int main() {
     provider->host->costs2(lane, &costs);
     if (!costs.in_place || !costs.in_place_only) { fail("the lane must say it reads in place, and nothing else"); }
 
-    std::vector<ssd_vram_request> requests(experts);
+    std::vector<ssd_vram_request> requests(experts); // of layer 0
     std::vector<int> slots(experts, 7);
-    const int32_t layers[] = { 0 };
-    const ssd_vram_expert_format format = { latent, hidden, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, experts, 1, layers };
-    if (provider->prefill->prepare(lane, requests.data(), experts, &format, slots.data(), error, sizeof(error))) { fail(error); }
+    const declared_layout one(latent, hidden, experts, { { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 } });
+    if (provider->api->declare(lane, &one.c, error, sizeof(error))) { fail(error); }
+    if (provider->prefill->prepare(lane, requests.data(), experts, slots.data(), error, sizeof(error))) { fail(error); }
     for (int slot : slots) { if (slot != -1) { fail("the lane holds nothing across layers"); } }
     ssd_vram_prefill_lane info = {};
     provider->prefill->lane(lane, &info);
@@ -321,7 +323,7 @@ int main() {
     if (provider->prefill->transient_available(lane)) { fail("decode gave the memory back: no expert may move"); }
     provider->api->destroy(lane);
 
-    // Layers of three formats in a pass, declared per layer (ssd_vram_expert_format): layer 0 of a type this device
+    // Layers of three formats in a pass, the declared layout's: layer 0 of a type this device
     // does not multiply, layer 1 with a Q4_0 down, layer 2 with the larger Q8_0 one (the experts above). As the sink does,
     // each layer's pass memory is reserved before the layer is prepared, the previous layer's format still the prepared
     // one: a layer the device runs right after one it does not has the lane, and the larger layer after the smaller
@@ -358,16 +360,17 @@ int main() {
         const auto small_expected_q8 = swiglu_rows(up, gate, small_down_rows, input, routes, route_weights, true, GGML_TYPE_Q4_0);
         void * mixed = provider->settings->create(nullptr, &services, error, sizeof(error));
         if (!mixed) { fail(error); }
-        const int32_t layer_ids[] = { 0, 1, 2 };
         const int32_t up_types[] = { unrun, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 };
         const int32_t down_types[] = { unrun, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 };
+        const declared_layout three(latent, hidden, experts, { { up_types[0], up_types[0], down_types[0] },
+            { up_types[1], up_types[1], down_types[1] }, { up_types[2], up_types[2], down_types[2] } });
+        if (provider->api->declare(mixed, &three.c, error, sizeof(error))) { fail(error); }
         options = { { SSD_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f }, nullptr, 0.0f, 1 };
         // the sink's order for one layer: the pass reserved, the layer prepared, its lane read; true: the lane takes it
         const auto prepare_layer = [&](int layer) {
-            const ssd_vram_expert_format declared = { latent, hidden, up_types[layer], up_types[layer], down_types[layer],
-                experts, 3, layer_ids, up_types, up_types, down_types };
+            for (auto & r : requests) { r.layer = layer; }
             if (provider->elastic->reserve_accumulate(mixed, tokens, error, sizeof(error))) { fail(error); }
-            if (provider->prefill->prepare(mixed, requests.data(), experts, &declared, slots.data(), error, sizeof(error))) { fail(error); }
+            if (provider->prefill->prepare(mixed, requests.data(), experts, slots.data(), error, sizeof(error))) { fail(error); }
             ssd_vram_prefill_lane layer_lane = {};
             provider->prefill->lane(mixed, &layer_lane);
             const bool taken = layer_lane.engine == SSD_VRAM_PREFILL_ENGINE_BATCHED;
@@ -389,13 +392,6 @@ int main() {
             if (provider->prefill->finish(mixed, output.data(), latent, &layer_stats, error, sizeof(error))) { fail(error); }
             if (layer_stats.ssd_transient_experts != experts) { fail("an expert of a layer was not computed"); }
         };
-        // An earlier layer taught the lane the declared formats, as the sink's first layer does: the first layer's pass
-        // is reserved before any format is known, and stays on the CPU.
-        {
-            const ssd_vram_expert_format first = { latent, hidden, up_types[1], up_types[1], down_types[1], experts, 3,
-                layer_ids, up_types, up_types, down_types };
-            if (provider->prefill->prepare(mixed, requests.data(), experts, &first, slots.data(), error, sizeof(error))) { fail(error); }
-        }
         if (prepare_layer(0) != (refused == GGML_TYPE_COUNT)) { fail("the lane took a layer of a type the device refuses"); }
         if (!prepare_layer(1)) { fail("the layer after one the device cannot run did not get the lane"); }
         run_layer(small, small_bytes, output);

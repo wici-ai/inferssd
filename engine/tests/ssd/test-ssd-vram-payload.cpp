@@ -6,17 +6,17 @@
 #endif
 #include "explicit-fixture-inputs.h"
 // CUDA test of experts whose roles are not a whole number of 4 KiB pages, named as the CPU sink names them: by their
-// payload (cpu-runtime.h resolve_source sets payload_nbytes to the GGUF tensor's nb[2], and the RAM cache keys a role
-// by it). Layer 1 is Q4_K up/gate with a Q6_K down, as DeepSeek-V4.1-Flash Q4_K_M lays out its experts (the 256 x 256
+// payload (the expert layout's role bytes, the GGUF tensor's nb[2], which the RAM cache keys a role by). Layer 1 is Q4_K up/gate with a Q6_K down, as DeepSeek-V4.1-Flash Q4_K_M lays out its experts (the 256 x 256
 // down is 53760 bytes, 57344 as a slot pads it); layer 2 is MXFP4 throughout (34816 bytes per role, 36864 padded).
 // Every role lives in its own host allocation of exactly its payload, followed by an inaccessible page, so a copy of
 // the padded length faults. Admissions, deferred uploads and host jobs copy the payload and zero the slot's padding,
-// and the GPU's rows match the experts computed on the CPU. A format's first request fixes how its roles are named: a
-// later padded name of a payload-named role is refused. Experts preloaded at load from payload-only host memory land
-// the same way and are hits for the first decode token.
+// and the GPU's rows match the experts computed on the CPU. A request names each role by its payload, as the layout
+// gives it: a padded name is refused. Experts preloaded at load from payload-only host memory land the same way and are
+// hits for the first decode token.
 #include "ggml-cuda.h"
 #include "gpu-services.h"
 #include "vram-tier.cpp"
+#include "declared-layout.h"
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -47,9 +47,11 @@ size_t slot_offset(int layer, int role) {
     return at;
 }
 size_t expert_bytes(int layer) { return slot_offset(layer, 3); }
-ssd_vram_expert_format declared(int layer) {
-    return { latent, hidden, up_types[layer - 1], up_types[layer - 1], down_types[layer - 1], experts, 2, layer_ids, up_types,
-        up_types, down_types };
+// The layout the tier is declared: layer 1 Q4_K/Q6_K, layer 2 MXFP4.
+const declared_layout & layout() {
+    static const declared_layout value(latent, hidden, experts, { { up_types[0], up_types[0], down_types[0] },
+        { up_types[1], up_types[1], down_types[1] } }, { layer_ids[0], layer_ids[1] });
+    return value;
 }
 // The request the sink builds: each role by its payload, at its own offset of one file.
 ssd_vram_request key(int layer, int expert) {
@@ -203,8 +205,8 @@ void preload_case(fixture_inputs & inputs, const store & s) {
     inputs.set("tier.demand_reclaim", "0");
     inputs.set("tier.margin_mib", "0");
     tier u(tier::automatic_budget, inputs.tier_policy());
-    const auto f = declared(1);
-    u.reserve(key(1, 0), f);
+    u.declare(layout().c);
+    u.reserve();
     require(u.has_storage() && u.table && u.growth_deferred, "the automatic tier did not take its storage at load");
     const size_t empty = u.preload_slots();
     require(empty >= 2, "no empty slots to preload");
@@ -241,8 +243,7 @@ std::vector<int> layer_step(tier & t, const store & s, int layer, int token, con
     std::vector<ssd_vram_request> r;
     for (int e : ids) { r.push_back(key(layer, e)); }
     std::vector<int> slots(ids.size(), -1);
-    const auto f = declared(layer);
-    t.prepare_format(r.data(), int(r.size()), &f, slots.data());
+    t.prepare_format(r.data(), int(r.size()), slots.data());
     scribble(t);
     const auto x = input(layer, token);
     t.launch_activation(x.data(), x.size() * sizeof(float), &swiglu);
@@ -275,8 +276,9 @@ int main() {
     const store s;
     const size_t larger = (std::max)(expert_bytes(1), expert_bytes(2));
     tier t(4 * larger, inputs.tier_policy());
+    t.declare(layout().c);
 
-    // Token 1: every request is an admission; the first prepare takes both formats from roles named by their payload.
+    // Token 1: every request is an admission, each role named by its payload.
     t.begin(41, 1, true);
     layer_step(t, s, 1, 1, { 0, 1 }, "first admissions");
     layer_step(t, s, 2, 1, { 0 }, "first admissions");
@@ -316,8 +318,7 @@ int main() {
         t.begin(41, 5, true);
         const auto r = key(2, 3);
         int slot = -1;
-        const auto f = declared(2);
-        t.prepare_format(&r, 1, &f, &slot);
+        t.prepare_format(&r, 1, &slot);
         require(slot < 0, "the host job's expert is already resident");
         const auto x = input(2, 5);
         t.launch_activation(x.data(), x.size() * sizeof(float), &swiglu);
@@ -338,17 +339,15 @@ int main() {
             require(host_unregister(&t, s.role_at(2, 3, role), error, sizeof(error)) == 0, std::string("host unregister: ") + error);
         }
     }
-    // The first request named the format's roles by their payload; one that names a role padded is refused (its key
-    // would miss every resident and seed of the expert).
+    // A request that names a role padded is refused (its key would miss every resident and seed of the expert).
     {
         t.begin(41, 7, true);
         auto r = key(1, 0);
         r.role[2].bytes = padded(1, 2);
         int slot = -1;
-        const auto f = declared(1);
         std::string refused;
-        try { t.prepare_format(&r, 1, &f, &slot); } catch (const std::runtime_error & e) { refused = e.what(); }
-        require(refused == "VRAM role bytes changed", "a padded name of a payload-named role was not refused: " + refused);
+        try { t.prepare_format(&r, 1, &slot); } catch (const std::runtime_error & e) { refused = e.what(); }
+        require(refused == "VRAM role bytes are not the layout's", "a padded name of a payload-named role was not refused: " + refused);
     }
     t.release();
     preload_case(inputs, s);

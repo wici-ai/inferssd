@@ -29,15 +29,6 @@
 #include <vector>
 
 namespace ssd { namespace host {
-// The layer ID of a routed layer's up experts ("blk.N.ffn_up_exps.weight"), or -1 for any other tensor.
-inline int routed_layer(const ggml_tensor * up) {
-    int layer = -1, consumed = 0;
-    if (!up || std::sscanf(up->name, "blk.%d.ffn_up_exps.weight%n", &layer, &consumed) != 1 || !consumed ||
-            up->name[consumed] || layer < 0) {
-        return -1;
-    }
-    return layer;
-}
 struct expert_cache_options {
     context_client * host = nullptr;
     client_config budget;
@@ -134,8 +125,6 @@ struct expert_cache {
     };
     struct layer {
         int32_t id;
-        // its experts' ggml types (up, gate, down), recorded at load from every routed layer's tensors; -1 before
-        int32_t up_type = -1, gate_type = -1, down_type = -1;
         size_t begin = 0, count = 0;
         uint64_t token = 0;
         bool seen = false;
@@ -147,7 +136,11 @@ struct expert_cache {
     std::vector<entry> entries;
     ssd_cpu_sink_cache_stats stats = {};
     char * arena = nullptr;
+    // A slot holds each role's largest read (the expert layout's read_bytes, set by configure), one role after the
+    // other; stride is 0 while the cache has no geometry.
     size_t stride = 0, role_bytes[3] = {};
+    size_t read_bytes[3] = {};
+    int32_t layer_experts = 0;
     int quota = 8;
     uint64_t epoch = 0, token = 0;
     bool active = false, has_token = false, paused = false, elastic_prefill = false;
@@ -377,11 +370,14 @@ struct expert_cache {
         if (!entries.empty() && sized && stride) { enable_to(size_t(stats.capacity_bytes / stride)); }
         clock = age_steps = 0;
     }
-    void configure(uint64_t budget, const int32_t * priority, int n, int per_layer) {
+    // layers: the routed layers in priority order; read: each role's largest read; experts: each layer's.
+    void configure(uint64_t budget, const int32_t * priority, int n, int per_layer, const uint64_t * read,
+                   int32_t experts) {
         if (budget > std::numeric_limits<size_t>::max() ||
             n < 0 || n > 256 || (n && !priority) ||
-            (budget && !n) || per_layer < 1 || per_layer > 896) {
-            throw std::runtime_error("invalid CPU sink cache budget, layers or quota");
+            (budget && !n) || per_layer < 1 || per_layer > 896 || !read || experts <= 0 ||
+            std::any_of(read, read + 3, [](uint64_t b) { return !b || b > std::numeric_limits<size_t>::max() / 4; })) {
+            throw std::runtime_error("invalid CPU sink cache budget, layers, quota or slot geometry");
         }
         std::vector<layer> next;
         next.reserve(size_t(n)); // at most 256 small configuration records
@@ -408,6 +404,7 @@ struct expert_cache {
         std::vector<entry>().swap(entries);
         stats = {}; stats.budget_bytes = budget;
         stride = 0; std::fill(role_bytes, role_bytes + 3, 0);
+        std::copy(read, read + 3, read_bytes); layer_experts = experts;
         quota = per_layer; active = has_token = paused = elastic_prefill = false;
         if (ledger.state().reclaimable_file) {
             std::fprintf(stderr, "[ssd_cpu_sink_cache] reclaimable_file=1 active_file_counts_as_headroom=1 inactive_file_counts_as_headroom=1\n");
@@ -654,23 +651,19 @@ struct expert_cache {
                 reason, binding_term(last_room), (unsigned long long) ledger.state().reserve,
                 (unsigned long long) stats.last_guard_extra_bytes, enabled_slots());
     }
+    // A role by its file, its first byte and its bytes (the expert layout's), whatever its read.
     static source_key key(const ssd_cpu_sink_source & s) {
-        const auto v = ssd_vram_source_identity(s.file, s.offset + s.data_offset, s.payload_nbytes ? s.payload_nbytes : s.nbytes);
+        const auto v = ssd_vram_source_identity(s.file, s.offset + s.data_offset, s.payload_nbytes);
         return { v.device, v.inode, v.size, v.offset, v.bytes, v.mtime_s, v.mtime_ns, v.ctime_s, v.ctime_ns, v.inode_hi };
     }
     static bool matches(const entry & e, const expert_request & r) {
         for (int role = 0; role < 3; ++role) { if (!(e.source[role] == key(r.role[role]))) { return false; } }
         return true;
     }
-    bool geometry(const size_t * requested, const ggml_tensor * tensor, size_t max_requests) {
-        // A role's read differs across layers by its page prefix and, in a
-        // file that mixes formats by layer, by its type. Keep each role's
-        // largest read, so reads that alternate do not clear the cache; a
-        // larger one still rebuilds it, which is why the sink's load step
-        // sizes each role from its largest read over all routed layers.
-        const size_t bytes[3] = { std::max(requested[0], role_bytes[0]),
-            std::max(requested[1], role_bytes[1]), std::max(requested[2], role_bytes[2]) };
-        if (std::equal(bytes, bytes + 3, role_bytes)) { return true; }
+    // Sizes the cache once (its slots hold any expert of any layer); a cache with a geometry keeps it.
+    bool geometry(size_t max_requests) {
+        if (stride) { return true; }
+        const size_t * bytes = read_bytes;
         uint64_t sum = add(add(bytes[0], bytes[1]), bytes[2]);
         // A slot that gives its own pages back starts on a page. Roles pad to 4 KiB, which is less than the 16 KiB
         // pages of Apple silicon.
@@ -713,7 +706,7 @@ struct expert_cache {
             const bool frequencies = policy == count_decay2 || policy == lfu || policy == decay;
             const uint64_t node = sizeof(std::pair<const int32_t, uint64_t>) + 4 * sizeof(void *);
             const uint64_t node_storage = frequencies
-                    ? allocation_cost(multiply(multiply(layers.size(), uint64_t(tensor->ne[2])), node)) : 0;
+                    ? allocation_cost(multiply(multiply(layers.size(), uint64_t(layer_experts)), node)) : 0;
             const uint64_t node_guard = frequencies ? multiply(max_requests, allocation_cost(node)) : 0;
             // a room-sized cache's metadata covers every slot it may hold, whatever it holds now
             const auto cost = [&](size_t slots) {
@@ -820,20 +813,12 @@ struct expert_cache {
             }
         }
     }
-    void prepare(std::vector<expert_request> & requests, const ggml_tensor * const * tensors,
-                 const size_t * bytes, ssd_cpu_sink_stats & current) {
+    void prepare(std::vector<expert_request> & requests, int32_t id, ssd_cpu_sink_stats & current) {
         if (!active || paused || !stats.budget_bytes) { return; }
-        const int id = routed_layer(tensors[0]);
-        if (id < 0) { return; }
-        char name[GGML_MAX_NAME];
-        std::snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", id);
-        if (std::strcmp(name, tensors[1]->name)) { return; }
-        std::snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.weight", id);
-        if (std::strcmp(name, tensors[2]->name)) { return; }
         auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == id; });
         if (found == layers.end()) { return; }
         try {
-            if (!requests.empty() && !geometry(bytes, tensors[0], requests.size())) { reject_admission(requests, current, "cgroup_metadata_headroom"); return; }
+            if (!requests.empty() && !geometry(requests.size())) { reject_admission(requests, current, "cgroup_metadata_headroom"); return; }
         } catch (const std::bad_alloc &) { pause(requests, current, "metadata_allocation_failed"); return; }
         layer & l = *found;
         const size_t layer_index = size_t(found - layers.begin());
@@ -1018,7 +1003,7 @@ struct expert_cache {
     // would size, when no prefill holds room; the slots committed leave the room the ledger holds for the first prefill's
     // pages (prefill_pages: the load-time graph's, the largest prefill's), which the first decode token takes back.
     // Returns the slots committed.
-    size_t reserve_at_load(const size_t * bytes, const ggml_tensor * tensor, size_t max_requests, int threads, double & us) {
+    size_t reserve_at_load(size_t max_requests, int threads, double & us) {
         us = 0;
         if (!keep_across_requests || !gives_room_back() || paused || !stats.budget_bytes || arena || layers.empty()) {
             return 0;
@@ -1032,7 +1017,7 @@ struct expert_cache {
         };
         {
             decode_view view(decode_projection);
-            if (!geometry(bytes, tensor, std::max<size_t>(1, max_requests)) || !stats.capacity_bytes) { return 0; }
+            if (!geometry(std::max<size_t>(1, max_requests)) || !stats.capacity_bytes) { return 0; }
         }
         const uint64_t slot_pages = add(ceil_div(stride, page_size), stride % page_size != 0);
         const uint64_t payload_pages = multiply(slot_pages, page_size), tables = page_tables(payload_pages);
@@ -1216,7 +1201,6 @@ struct expert_cache {
         const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
         if (found == layers.end() || !found->count) { return -1; }
         const size_t layer_index = size_t(found - layers.begin());
-        for (int role = 0; role < 3; ++role) { if (roles[role].nbytes > role_bytes[role]) { return -1; } }
         source_key keys[3];
         for (int role = 0; role < 3; ++role) { keys[role] = key(roles[role]); }
         // an empty slot, else a backup (even of an expert `keep` names: the tier serves that one), else the coldest
@@ -1360,7 +1344,6 @@ struct expert_cache {
         }
         const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
         if (found == layers.end() || !lendable_now(entries[index])) { return -1; }
-        for (int role = 0; role < 3; ++role) { if (roles[role].nbytes > role_bytes[role]) { return -1; } }
         const int victim = int(index);
         auto & e = entries[index];
         take_victim(e, prior);
@@ -1411,28 +1394,12 @@ struct expert_cache {
         stats.valid_bytes += stride;
         return true;
     }
-    void prepare_prefill_read(std::vector<expert_request> & requests,
-            const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down,
-            ssd_cpu_sink_stats & current) {
+    void prepare_prefill_read(std::vector<expert_request> & requests, int32_t layer_id, ssd_cpu_sink_stats & current) {
         if (!prefill_read || !arena || !stride || !stats.valid_bytes || requests.empty()) { return; }
-        const int layer_id = routed_layer(up);
-        if (layer_id < 0) { return; }
-        char name[GGML_MAX_NAME];
-        std::snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", layer_id);
-        if (std::strcmp(name, gate->name)) { return; }
-        std::snprintf(name, sizeof(name), "blk.%d.ffn_down_exps.weight", layer_id);
-        if (std::strcmp(name, down->name)) { return; }
         const auto found = std::find_if(layers.begin(), layers.end(),
             [&](const layer & l) { return l.id == layer_id; });
         if (found == layers.end() || !found->count) { return; }
         const size_t layer_index = size_t(found - layers.begin());
-        size_t bytes[3] = {};
-        for (int role = 0; role < 3; ++role) {
-            for (const auto & request : requests) {
-                bytes[role] = std::max(bytes[role], request.role[role].nbytes);
-            }
-        }
-        if (bytes[0] > role_bytes[0] || bytes[1] > role_bytes[1] || bytes[2] > role_bytes[2]) { return; }
 
         // the layer's own slots, then the ones a read-ahead borrowed for it
         std::vector<size_t> slots(found->count);

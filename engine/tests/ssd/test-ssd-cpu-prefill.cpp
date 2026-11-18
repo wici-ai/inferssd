@@ -46,15 +46,33 @@ struct fixture {
     std::string path;
     bool remove_on_destroy = false;
     std::map<key, entry> entries;
-    enum fault_kind { none, missing, unaligned_offset, wrong_size, past_eof, short_tail } fault = none;
+    enum fault_kind { none, missing, wrong_size, past_eof, short_tail } fault = none;
     int32_t fault_expert = -1;
     int fault_role = -1;
     int resolve_calls = 0;
-    ~fixture() { ssd::platform::close_fd(fd); if (remove_on_destroy) { test_resources::remove_file(path); } }
+    // Roles the layout places in files of their own, which a test shrinks while a sink runs (test_layout::swappable_role).
+    std::map<key, std::unique_ptr<test_layout::swappable_role>> swaps;
+    ~fixture() { swaps.clear(); ssd::platform::close_fd(fd); if (remove_on_destroy) { test_resources::remove_file(path); } }
+    // Role `role` of expert `expert`, in both layers, in a file of its own (before the layouts that place it so).
+    const test_layout::swappable_role & swappable(int32_t expert, int role, int layer = 1) {
+        for (int l : { 1, 2 }) {
+            const key k{ tensor_name(l, role), expert };
+            if (!swaps.count(k)) {
+                const auto & e = entries.at(k);
+                swaps[k] = std::make_unique<test_layout::swappable_role>(e.data.data(), e.raw_bytes, e.read_bytes);
+            }
+        }
+        return *swaps.at({ tensor_name(layer, role), expert });
+    }
     static bool resolve(void * user, const char * name, int32_t id, ssd_cpu_sink_source * out) {
         auto & f = *static_cast<fixture *>(user);
         ++f.resolve_calls;
         auto it = f.entries.find({ name, id });
+        if (const auto swap = f.swaps.find({ name, id }); swap != f.swaps.end() && it != f.entries.end()) {
+            *out = {};
+            out->fd_direct = swap->second->fd(); out->offset = 0; out->nbytes = it->second.read_bytes;
+            return true;
+        }
         const int role = std::strstr(name, ".ffn_up_exps.weight") ? 0 : std::strstr(name, ".ffn_gate_exps.weight") ? 1 : 2;
         const auto fault = (f.fault_expert < 0 || f.fault_expert == id) &&
                            (f.fault_role < 0 || f.fault_role == role) ? f.fault : none;
@@ -62,7 +80,6 @@ struct fixture {
         out->fd_direct = f.fd;
         out->offset = it->second.offset;
         out->nbytes = it->second.read_bytes;
-        if (fault == unaligned_offset) { ++out->offset; }
         if (fault == wrong_size) { out->nbytes += 4096; }
         if (fault == past_eof) { out->offset = uint64_t(1) << 50; }
         if (fault == short_tail) {
@@ -125,7 +142,8 @@ static void make_synthetic(fixture & f) {
 struct tensors {
     ggml_context * ctx = nullptr;
     ggml_tensor * role[3] = {};
-    tensors(const fixture & f, int layer) {
+    int layer = -1;
+    tensors(const fixture & f, int layer_id) : layer(layer_id) {
         ctx = ggml_init({ ggml_tensor_overhead() * 4, nullptr, true }); require(ctx, "metadata context failed");
         for (int r = 0; r < 3; ++r) {
             role[r] = ggml_new_tensor_3d(ctx, GGML_TYPE_Q3_K, r == 2 ? f.hidden : f.latent,
@@ -180,18 +198,29 @@ static std::vector<float> reference(const fixture & f, int layer, const std::vec
 
 using prefill_ptr = std::unique_ptr<ssd_cpu_prefill, decltype(&ssd_cpu_prefill_destroy)>;
 
+// The layout of the fixture's routed layers (1 and 2), each role resolved once; null with `error` when the fixture
+// cannot be described.
+static std::shared_ptr<const ssd::store::expert_layout> layout_of(fixture & f, char * error, size_t size,
+        int corrupt = 0) {
+    tensors one(f, 1), two(f, 2);
+    // a corrupt layer 1: 1 an up stride that is not its rows, 2 a gate of another type than the index's bytes,
+    // 3 a down of another shape
+    if (corrupt == 1) { ++one.role[0]->nb[1]; }
+    if (corrupt == 2) { one.role[1]->type = GGML_TYPE_F32; }
+    if (corrupt == 3) { one.role[2]->ne[0] += 256; }
+    try {
+        return test_layout::build({ { 1, { one.role[0], one.role[1], one.role[2] } },
+                                    { 2, { two.role[0], two.role[1], two.role[2] } } }, fixture::resolve, &f);
+    } catch (const std::exception & e) { if (error && size) { std::snprintf(error, size, "%s", e.what()); } return nullptr; }
+}
+
 struct executor {
-    fixture * active;
     sink_ptr sink;
     prefill_ptr prefill;
-    static bool resolve(void * user, const char * name, int32_t id, ssd_cpu_sink_source * out) {
-        return fixture::resolve(static_cast<executor *>(user)->active, name, id, out);
-    }
-    executor(fixture_inputs & inputs, fixture & f, int threads, int depth) : active(&f),
-            prefill(nullptr, ssd_cpu_prefill_destroy) {
+    executor(fixture_inputs & inputs, fixture & f, int threads, int depth) : prefill(nullptr, ssd_cpu_prefill_destroy) {
         test_resources::cpu_participants(threads - 1, 1);
         char error[512] = {};
-        sink = inputs.create(threads, depth, resolve, this, error, sizeof(error));
+        sink = inputs.create(threads, depth, layout_of(f, error, sizeof(error)), error, sizeof(error));
         require(bool(sink), std::string("sink create: ") + error);
         prefill.reset(ssd_cpu_prefill_create(sink.get(), error, sizeof(error)));
         require(bool(prefill), std::string("prefill create: ") + error);
@@ -355,13 +384,13 @@ static sample_result run_checked(fixture_inputs & inputs, const std::string & na
     const auto begin = std::chrono::steady_clock::now();
     bool ok = true;
     if (grouped) {
-        ok = ssd_cpu_prefill_run(e.prefill.get(), meta.role[0], meta.role[1], meta.role[2], b.x.data(),
+        ok = ssd_cpu_prefill_run(e.prefill.get(), meta.layer, b.x.data(),
             b.ids.data(), b.weights.data(), b.slots, b.tokens, 4, linear_beta, guarded.data() + 1,
             &r.stats, error, sizeof(error));
     } else {
         for (int t = 0; t < b.tokens && ok; ++t) {
             ssd_cpu_sink_stats s = {};
-            ok = ssd_cpu_sink_run(e.sink.get(), meta.role[0], meta.role[1], meta.role[2], b.x.data() + size_t(t) * f.latent,
+            ok = ssd_cpu_sink_run(e.sink.get(), meta.layer, b.x.data() + size_t(t) * f.latent,
                 b.ids.data() + size_t(t) * b.slots, b.weights.data() + size_t(t) * b.slots, b.slots,
                 4, linear_beta, guarded.data() + 1 + size_t(t) * f.latent, &s, error, sizeof(error));
             add_stats(r.stats.stream, s);
@@ -382,7 +411,7 @@ static sample_result run_checked(fixture_inputs & inputs, const std::string & na
     require(s.demand_bytes == counts.bytes && s.cache_hits == expected_hits && s.cache_misses == counts.experts - expected_hits &&
             s.cache_admitted == expected_admitted && s.cache_admitted_bytes == expected_admitted * triplet,
             name + ": decode/prefill cache accounting differs");
-    require(f.resolve_calls - calls_before == int(3 * counts.experts), name + ": resolver did not visit each role exactly once");
+    require(f.resolve_calls == calls_before, name + ": a run resolved a role the layout had placed");
     if (grouped) {
         require(r.stats.routed_slots == counts.slots && r.stats.expert_token_pairs == counts.pairs &&
                 r.stats.max_group_tokens == counts.max_group, name + ": group shape counters mismatch");
@@ -425,31 +454,23 @@ static void compare_case(fixture_inputs & inputs, const std::string & name, fixt
     print_sample(name, b, run_checked(inputs, name, f, e, layer, b, expected, true, linear_beta));
 }
 
-// A well-formed tensor of TYPE, so a refusal comes from the type and not from its layout.
-static void retype(ggml_tensor * tensor, ggml_type type) {
-    tensor->type = type;
-    tensor->nb[0] = ggml_type_size(type);
-    tensor->nb[1] = ggml_row_size(type, tensor->ne[0]);
-    tensor->nb[2] = tensor->nb[1] * tensor->ne[1];
-    tensor->nb[3] = tensor->nb[2] * tensor->ne[2];
+// Experts the layout cannot describe, or a source it cannot stream from, refuse the sink at its creation.
+static void refused_case(fixture_inputs & inputs, const std::string & name, fixture & f, int corrupt) {
+    char error[512] = {};
+    const auto sink = inputs.create(2, 1, layout_of(f, error, sizeof(error), corrupt), error, sizeof(error));
+    require(!sink && error[0], name + ": was not refused at creation");
+    std::printf("case=%s status=PASS error=%s\n", name.c_str(), error);
 }
 
 static ssd_cpu_prefill_stats fail_case(fixture_inputs & inputs, const std::string & name, fixture & f, executor & e, batch b,
-        int tokens_override = -1, int slots_override = -1, bool short_read = false, int metadata_fault = 0,
-        bool allow_prefill_hits = false) {
+        int tokens_override = -1, int slots_override = -1, bool short_read = false, bool allow_prefill_hits = false) {
     tensors meta(f, 1);
-    if (metadata_fault == 1) { ++meta.role[0]->nb[1]; }
-    if (metadata_fault == 2) { retype(meta.role[1], GGML_TYPE_F32); }
-    if (metadata_fault == 3) { meta.role[2]->ne[0] += 256; }
     std::vector<float> output(size_t(std::max(b.tokens, 1)) * f.latent + 2, -77);
     char error[512] = {}; ssd_cpu_prefill_stats stats = {};
-    const bool ok = ssd_cpu_prefill_run(e.prefill.get(), meta.role[0], meta.role[1], meta.role[2], b.x.data(),
+    const bool ok = ssd_cpu_prefill_run(e.prefill.get(), meta.layer, b.x.data(),
         b.ids.data(), b.weights.data(), slots_override < 0 ? b.slots : slots_override,
         tokens_override < 0 ? b.tokens : tokens_override, 4, 25, output.data() + 1, &stats, error, sizeof(error));
     require(!ok && error[0] && stats.stream.fallback_count == 0, name + ": did not fail closed");
-    if (metadata_fault == 2) {
-        require(std::strstr(error, "not supported yet") && std::strstr(error, "f32"), name + ": did not name the type");
-    }
     check_transport(inputs, stats.stream, false, true, allow_prefill_hits);
     cache_snapshot(e.sink.get(), true);
     require(output.front() == -77 && output.back() == -77, name + ": failed run overwrote output guard");
@@ -462,6 +483,14 @@ static ssd_cpu_prefill_stats fail_case(fixture_inputs & inputs, const std::strin
 
 static void synthetic_tests(fixture_inputs & inputs, int threads, int depth) {
     fixture small; make_synthetic(small);
+    // the union's last expert of `late` reads its down from a file the test shrinks while the sink runs
+    auto late = synthetic_batch(small, 25);
+    std::vector<int32_t> first_touch;
+    for (int32_t id : late.ids) {
+        if (id >= 0 && std::find(first_touch.begin(), first_touch.end(), id) == first_touch.end()) { first_touch.push_back(id); }
+    }
+    require(first_touch.size() > 2, "late fault fixture lacks valid preceding experts");
+    const auto & last_down = small.swappable(first_touch.back(), 2);
     executor e(inputs, small, threads, depth);
     for (int nt : { 1, 2, 25, 64 }) {
         auto b = synthetic_batch(small, nt, nt == 64 ? 16 : 8);
@@ -485,11 +514,11 @@ static void synthetic_tests(fixture_inputs & inputs, int threads, int depth) {
     for (int i = 0; i < 4; ++i) {
         compare_case(inputs, "layer_and_batch_reuse", small, e, i % 2 + 1, synthetic_batch(small, i % 2 ? 25 : 2));
     }
-    fixture large; large.latent = 512; large.hidden = 256; make_synthetic(large);
-    e.active = &large;
-    compare_case(inputs, "grow_non_square_shape", large, e, 2, synthetic_batch(large, 25));
-    e.active = &small;
-    compare_case(inputs, "shrink_shape", small, e, 1, synthetic_batch(small, 2));
+    {
+        fixture large; large.latent = 512; large.hidden = 256; make_synthetic(large);
+        executor wide(inputs, large, threads, depth);
+        compare_case(inputs, "non_square_shape", large, wide, 2, synthetic_batch(large, 25));
+    }
     // Exercise decode/grouped reuse of the borrowed ring and pool in both directions.
     auto one = synthetic_batch(small, 1);
     auto expected = reference_batch(small, 1, one);
@@ -506,30 +535,27 @@ static void synthetic_tests(fixture_inputs & inputs, int threads, int depth) {
     fail_case(inputs, "zero_tokens", small, e, bad, 0);
     fail_case(inputs, "too_many_tokens", small, e, bad, 2049);
     fail_case(inputs, "too_many_slots", small, e, bad, -1, 17);
-    fail_case(inputs, "noncontiguous_up_stride", small, e, bad, -1, -1, false, 1);
-    fail_case(inputs, "wrong_gate_type", small, e, bad, -1, -1, false, 2);
-    fail_case(inputs, "wrong_down_shape", small, e, bad, -1, -1, false, 3);
-    const int direct_fd = small.fd;
-    small.fd = ssd::platform::open_buffered(small.path.c_str());
-    require(small.fd >= 0, "buffered test open failed");
-    fail_case(inputs, "buffered_fd_rejected", small, e, bad);
-    ssd::platform::close_fd(small.fd); small.fd = direct_fd;
     compare_case(inputs, "recovery_after_invalid_inputs", small, e, 2, synthetic_batch(small, 2));
-    for (auto fault : { fixture::missing, fixture::unaligned_offset, fixture::wrong_size, fixture::past_eof }) {
+    // what the layout cannot describe refuses the sink at its creation
+    refused_case(inputs, "noncontiguous_up_stride", small, 1);
+    refused_case(inputs, "wrong_gate_type", small, 2);
+    refused_case(inputs, "wrong_down_shape", small, 3);
+    for (auto fault : { fixture::missing, fixture::wrong_size }) {
         small.fault = fault;
-        fail_case(inputs, "resolver_fault_" + std::to_string(fault), small, e, synthetic_batch(small, 25), -1, -1, fault == fixture::past_eof);
+        refused_case(inputs, "resolver_fault_" + std::to_string(fault), small, 0);
         small.fault = fixture::none;
-        compare_case(inputs, "recovery_after_fault_" + std::to_string(fault), small, e, 2, synthetic_batch(small, 2));
     }
-    auto late = synthetic_batch(small, 25);
-    std::vector<int32_t> first_touch;
-    for (int32_t id : late.ids) {
-        if (id >= 0 && std::find(first_touch.begin(), first_touch.end(), id) == first_touch.end()) { first_touch.push_back(id); }
+    {
+        const int direct_fd = small.fd;
+        small.fd = ssd::platform::open_buffered(small.path.c_str());
+        require(small.fd >= 0, "buffered test open failed");
+        refused_case(inputs, "buffered_fd_rejected", small, 0);
+        ssd::platform::close_fd(small.fd); small.fd = direct_fd;
     }
-    require(first_touch.size() > 2, "late fault fixture lacks valid preceding experts");
-    small.fault = fixture::past_eof; small.fault_expert = first_touch.back();
-    fail_case(inputs, "last_expert_short_read", small, e, late, -1, -1, true);
-    small.fault = fixture::none; small.fault_expert = -1;
+    {
+        const test_layout::shrunk_role shrunk(last_down);
+        fail_case(inputs, "last_expert_short_read", small, e, late, -1, -1, true);
+    }
     compare_case(inputs, "recovery_after_last_expert_short_read", small, e, 2, synthetic_batch(small, 25));
     executor serial(inputs, small, 2, 1);
     compare_case(inputs, "one_compute_ring1", small, serial, 1, synthetic_batch(small, 25));
@@ -589,6 +615,7 @@ static void cache_retention_tests(fixture_inputs & inputs, int threads, int dept
     inputs.set("cache_policy", "count_decay2");
     inputs.set("cache_keep", "1");
     fixture f; make_synthetic(f);
+    const auto & expert1_up = f.swappable(1, 0); // shrunk for the retained short read below
     executor retained(inputs, f, threads, depth), baseline(inputs, f, threads, depth);
     const uint64_t unit = count_routes(f, 1, one_token(f, { 0 }, { 1 }), false).bytes;
     configure_cache(retained, 2 * unit, { 1 }, 2);
@@ -602,9 +629,9 @@ static void cache_retention_tests(fixture_inputs & inputs, int threads, int dept
         auto b = synthetic_batch(f, tokens);
         std::vector<float> original(size_t(tokens) * f.latent), kept(original.size());
         ssd_cpu_prefill_stats a = {}, c = {}; char error[512] = {};
-        require(ssd_cpu_prefill_run(baseline.prefill.get(), meta.role[0], meta.role[1], meta.role[2],
+        require(ssd_cpu_prefill_run(baseline.prefill.get(), meta.layer,
             b.x.data(), b.ids.data(), b.weights.data(), b.slots, b.tokens, 4, 25, original.data(), &a, error, sizeof(error)), error);
-        require(ssd_cpu_prefill_run(retained.prefill.get(), meta.role[0], meta.role[1], meta.role[2],
+        require(ssd_cpu_prefill_run(retained.prefill.get(), meta.layer,
             b.x.data(), b.ids.data(), b.weights.data(), b.slots, b.tokens, 4, 25, kept.data(), &c, error, sizeof(error)), error);
         require(!std::memcmp(original.data(), kept.data(), kept.size() * sizeof(float)), "retention changed prefill output bits");
         check_transport(inputs, c.stream, true, true);
@@ -619,9 +646,10 @@ static void cache_retention_tests(fixture_inputs & inputs, int threads, int dept
     fail_case(inputs, "retain_invalid_prefill_releases", f, retained, bad, 0);
     begin_decode(retained, 1, 2);
     decode_cache_case(inputs, "retain_error_recovery_cold", f, retained, 1, selected, 0, 2);
-    f.fault = fixture::past_eof; f.fault_expert = 1;
-    fail_case(inputs, "retain_short_read_releases", f, retained, one_token(f, { 1 }, { 1 }), -1, -1, true);
-    f.fault = fixture::none; f.fault_expert = -1;
+    {
+        const test_layout::shrunk_role shrunk(expert1_up);
+        fail_case(inputs, "retain_short_read_releases", f, retained, one_token(f, { 1 }, { 1 }), -1, -1, true);
+    }
     std::printf("CACHE_RETAIN_PREFILL_BIT_EXACT_OK tokens=1,25,64 ring=%d\n", depth);
 }
 
@@ -630,6 +658,7 @@ static void cache_prefill_read_tests(fixture_inputs & inputs, int threads, int d
     inputs.set("cache_keep", "1");
     inputs.set("cache_prefill_read", "1");
     fixture f; make_synthetic(f);
+    const auto & expert5_up = f.swappable(5, 0); // shrunk for the read error below
     executor e(inputs, f, threads, depth);
     const uint64_t unit = count_routes(f, 1, one_token(f, { 0 }, { 1 }), false).bytes;
     configure_cache(e, 4 * unit, { 1 }, 4);
@@ -659,10 +688,11 @@ static void cache_prefill_read_tests(fixture_inputs & inputs, int threads, int d
     decode_cache_case(inputs, "prefill_read_decode_still_hot", f, e, 1,
         one_token(f, { 1, 2 }, { .4f, .6f }), 2, 0);
 
-    f.fault = fixture::past_eof; f.fault_expert = 5;
-    fail_case(inputs, "prefill_read_error_releases_leases", f, e,
-        one_token(f, { 1, 5 }, { .5f, .5f }), -1, -1, true, 0, true);
-    f.fault = fixture::none; f.fault_expert = -1;
+    {
+        const test_layout::shrunk_role shrunk(expert5_up);
+        fail_case(inputs, "prefill_read_error_releases_leases", f, e,
+            one_token(f, { 1, 5 }, { .5f, .5f }), -1, -1, true, true);
+    }
     configure_cache(e, 2 * unit, { 1 }, 2);
     begin_decode(e, 8, 1);
     decode_cache_case(inputs, "prefill_read_error_recovery", f, e, 1,
@@ -672,6 +702,17 @@ static void cache_prefill_read_tests(fixture_inputs & inputs, int threads, int d
 
 static void cache_lifecycle_tests(fixture_inputs & inputs, int threads, int depth) {
     fixture f; f.experts = 32; make_synthetic(f);
+    // the roles the short reads below shrink: each role of the first expert of a 25-token batch, and the down of
+    // the last expert its union reads
+    const int32_t first_expert = synthetic_batch(f, 25).ids[0];
+    auto late = synthetic_batch(f, 25);
+    std::vector<int32_t> first_touch;
+    for (int32_t id : late.ids) {
+        if (id >= 0 && std::find(first_touch.begin(), first_touch.end(), id) == first_touch.end()) { first_touch.push_back(id); }
+    }
+    const test_layout::swappable_role * first_roles[3] = { &f.swappable(first_expert, 0), &f.swappable(first_expert, 1),
+        &f.swappable(first_expert, 2) };
+    const auto & last_down = f.swappable(first_touch.back(), 2);
     executor e(inputs, f, threads, depth);
     const uint64_t unit = count_routes(f, 1, one_token(f, { 0 }, { 1 }), false).bytes;
     require(unit == 86016, "fused fixture must include 4096-aligned Q3_K role padding");
@@ -762,9 +803,11 @@ static void cache_lifecycle_tests(fixture_inputs & inputs, int threads, int dept
         begin_decode(e, 10 + role, 1);
         decode_cache_case(inputs, "fused_short_seed_" + suffix, f, e, 1, four, 0, 4);
         auto bad = synthetic_batch(f, 25);
-        f.fault = fixture::short_tail; f.fault_expert = bad.ids[0]; f.fault_role = role;
-        const auto failed = fail_case(inputs, "fused_prefill_short_role_" + suffix, f, e, bad, -1, -1, true);
-        f.fault = fixture::none; f.fault_expert = -1; f.fault_role = -1;
+        ssd_cpu_prefill_stats failed = {};
+        {
+            const test_layout::shrunk_role shrunk(*first_roles[role]);
+            failed = fail_case(inputs, "fused_prefill_short_role_" + suffix, f, e, bad, -1, -1, true);
+        }
         require(failed.stream.ring_read_bytes >= 4096 && failed.stream.ring_read_requests >= uint64_t(depth > 1 ? 6 : 3),
                 "fused short read did not include a positive CQE and other in-flight roles");
         if (role == 2) {
@@ -787,16 +830,13 @@ static void cache_lifecycle_tests(fixture_inputs & inputs, int threads, int dept
         compare_case(inputs, "fused_short_grouped_recovery_" + suffix, f, e, 2, synthetic_batch(f, 25));
     }
 
-    auto late = synthetic_batch(f, 25);
-    std::vector<int32_t> first_touch;
-    for (int32_t id : late.ids) {
-        if (id >= 0 && std::find(first_touch.begin(), first_touch.end(), id) == first_touch.end()) { first_touch.push_back(id); }
-    }
     begin_decode(e, 40, 1);
     decode_cache_case(inputs, "fused_late_short_seed", f, e, 1, four, 0, 4);
-    f.fault = fixture::short_tail; f.fault_expert = first_touch.back(); f.fault_role = 2;
-    const auto failed = fail_case(inputs, "fused_last_expert_short_read", f, e, late, -1, -1, true);
-    f.fault = fixture::none; f.fault_expert = -1; f.fault_role = -1;
+    ssd_cpu_prefill_stats failed = {};
+    {
+        const test_layout::shrunk_role shrunk(last_down);
+        failed = fail_case(inputs, "fused_last_expert_short_read", f, e, late, -1, -1, true);
+    }
     require(failed.stream.read_requests == 3 * first_touch.size(), "last-expert failure did not submit the full union");
     compare_case(inputs, "fused_last_expert_short_recovery", f, e, 2, synthetic_batch(f, 2));
 
@@ -805,8 +845,9 @@ static void cache_lifecycle_tests(fixture_inputs & inputs, int threads, int dept
         decode_cache_case(inputs, "fused_invalid_seed_" + std::to_string(invalid), f, e, 1, four, 0, 4);
         auto bad = synthetic_batch(f, 2);
         if (invalid == 2) { bad.x[0] = std::numeric_limits<float>::infinity(); }
+        // 0: no tokens, 1: more route slots than a pass takes, 2: a nonfinite input
         const auto result = fail_case(inputs, "fused_early_invalid_clears_cache_" + std::to_string(invalid), f, e, bad,
-            invalid == 0 ? 0 : -1, -1, false, invalid == 1 ? 3 : 0);
+            invalid == 0 ? 0 : -1, invalid == 1 ? 17 : -1);
         require(result.stream.read_requests == 0, "early prefill validation failure unexpectedly submitted IO");
         begin_decode(e, 50 + invalid, 2);
         decode_cache_case(inputs, "fused_early_invalid_decode_recovery_" + std::to_string(invalid), f, e, 1, four, 0, 4);

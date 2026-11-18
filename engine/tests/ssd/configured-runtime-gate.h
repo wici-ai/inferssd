@@ -37,14 +37,16 @@ static void configured_writer_failure_test(fixture & f, const ssd::settings::sna
         auto client = std::move(made.value);
         const ssd::runtime_services services{ writer.value.get(), nullptr, client.get() };
         char error[512] = {};
-        sink_ptr sink(ssd::cpu::create_configured(&settings, &services, fixture::resolve, &f, error, sizeof(error)));
+        const auto configured_layout = f.layout(error, sizeof(error));
+        if (!configured_layout) { _exit(6); }
+        sink_ptr sink(ssd::cpu::create_configured(&settings, &services, configured_layout->abi(), error, sizeof(error)), configured_layout);
         if (!sink) { _exit(2); }
         signal(SIGXFSZ, SIG_IGN);
         const struct rlimit limit = { 0, 0 };
         if (setrlimit(RLIMIT_FSIZE, &limit)) { _exit(3); }
         tensors meta(f, 1); const int32_t id = 1; const float weight = 1;
         std::vector<float> output(f.latent); ssd_cpu_sink_stats stats = {};
-        const bool ok = ssd_cpu_sink_run(sink.get(), meta.role[0], meta.role[1], meta.role[2], input.data(), &id,
+        const bool ok = ssd_cpu_sink_run(sink.get(), meta.layer, input.data(), &id,
             &weight, 1, 4, 25, output.data(), &stats, error, sizeof(error));
         sink.reset();
         _exit(!ok && stats.pending_reads == 0 && stats.read_requests == stats.read_completions && error[0] ? 0 : 4);
@@ -71,6 +73,8 @@ static void configured_runtime_tests(fixture_inputs & inputs) {
     auto first_client = std::move(made_first.value), second_client = std::move(made_second.value);
     const ssd::runtime_services services{ writer.value.get(), &debug, first_client.get() };
     char error[512] = {};
+    const auto configured_layout = f.layout(error, sizeof(error));
+    require(bool(configured_layout), error);
     const auto reg = ggml_backend_cpu_reg();
     const auto getter = reinterpret_cast<ssd::cpu::get_api_v2>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_ssd_api_v2"));
     require(getter && ssd::cpu::valid(getter()), "normal CPU registry table/layout");
@@ -80,16 +84,16 @@ static void configured_runtime_tests(fixture_inputs & inputs) {
     require(!ssd::cpu::valid(&short_table), "mixed CPU provider table accepted");
     auto bad_services = services;
     ssd::gpu::provider_v1 missing_gpu{}; bad_services.gpu = &missing_gpu;
-    sink_ptr rejected_gpu(ssd::cpu::create_configured(&settings, &bad_services, fixture::resolve, &f, error, sizeof(error)));
+    sink_ptr rejected_gpu(ssd::cpu::create_configured(&settings, &bad_services, configured_layout->abi(), error, sizeof(error)), configured_layout);
     require(!rejected_gpu && error[0] && configured_task_count() == before, "GPU ABI rejection started a worker");
-    sink_ptr first(ssd::cpu::create_configured(&settings, &services, fixture::resolve, &f, error, sizeof(error)));
+    sink_ptr first(ssd::cpu::create_configured(&settings, &services, configured_layout->abi(), error, sizeof(error)), configured_layout);
     require(bool(first) && configured_task_count() == before + 1, std::string("configured create: ") + error);
     settings = configured_settings(false, 1); debug.profile = false;
     const ssd::runtime_services second_services{ nullptr, &debug, second_client.get() };
-    sink_ptr second(ssd::cpu::create_configured(&settings, &second_services, fixture::resolve, &f, error, sizeof(error)));
+    sink_ptr second(ssd::cpu::create_configured(&settings, &second_services, configured_layout->abi(), error, sizeof(error)), configured_layout);
     require(bool(second) && configured_task_count() == before + 5, "independent second context thread count");
     auto invalid = configured_settings(true);
-    sink_ptr rejected(ssd::cpu::create_configured(&invalid, &services, fixture::resolve, &f, error, sizeof(error)));
+    sink_ptr rejected(ssd::cpu::create_configured(&invalid, &services, configured_layout->abi(), error, sizeof(error)), configured_layout);
     require(!rejected && error[0] && configured_task_count() == before + 5, "affinity rejection leaked a started worker");
     require(!ssd::cpu::cache_make_room_configured(nullptr, &original, nullptr, 0, 0),
         "missing early registration silently admitted allocation");

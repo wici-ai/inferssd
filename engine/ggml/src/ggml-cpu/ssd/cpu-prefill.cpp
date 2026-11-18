@@ -28,15 +28,6 @@ static void prefill_error(char * dst, size_t size, const char * message) {
     if (dst && size) { std::snprintf(dst, size, "%s", message); }
 }
 
-static bool prefill_expert_type_supported(ggml_type type, int64_t columns) {
-    if (int(type) < 0 || int(type) >= int(GGML_TYPE_COUNT) || ggml_blck_size(type) <= 0) { return false; }
-    const auto * traits = ggml_get_type_traits_cpu(type);
-    if (!traits || !traits->vec_dot || traits->vec_dot_type == GGML_TYPE_F32) { return false; }
-    const auto * input = ggml_get_type_traits_cpu(traits->vec_dot_type);
-    return input && input->from_float && ggml_blck_size(traits->vec_dot_type) > 0 &&
-        columns % ggml_blck_size(type) == 0 && columns % ggml_blck_size(traits->vec_dot_type) == 0;
-}
-
 static bool prefill_activation_valid(const ssd_cpu_sink_activation * activation) {
     if (!activation || (activation->post_exp_norm &&
             (!std::isfinite(activation->post_exp_norm_eps) || activation->post_exp_norm_eps <= 0.0f))) { return false; }
@@ -136,54 +127,30 @@ struct ssd_cpu_prefill {
         if (!sink) { throw std::runtime_error("CPU prefill needs a sink"); }
     }
 
-    void prepare(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down,
-            const int32_t * ids, const float * route_weights, int nslots, int ntokens) {
-        // Check before sizing any workspace. The shared stream validates the
-        // exact packed ranges, direct-read descriptors, padding and tensor strides.
-        const ggml_tensor * tensors[] = { up, gate, down };
-        for (const auto * tensor : tensors) {
-            if (!tensor || !ggml_is_contiguous(tensor) ||
-                    tensor->ne[0] <= 0 || tensor->ne[0] > 16384 ||
-                    tensor->ne[1] <= 0 || tensor->ne[1] > 16384 || tensor->ne[2] <= 0 || tensor->ne[3] != 1) {
-                throw std::runtime_error("CPU prefill requires valid contiguous expert metadata");
-            }
-            if (!prefill_expert_type_supported(tensor->type, tensor->ne[0])) {
-                throw std::runtime_error(std::string("this quantization is not supported yet: the CPU prefill cannot compute ") +
-                    ggml_type_name(tensor->type) + " experts");
-            }
-        }
-        if (up->ne[0] != gate->ne[0] || up->ne[1] != gate->ne[1] || up->ne[2] != gate->ne[2] ||
-                down->ne[0] != up->ne[1] || down->ne[1] != up->ne[0] || down->ne[2] != up->ne[2]) {
-            throw std::runtime_error("CPU prefill expert shape mismatch");
-        }
-        latent = static_cast<int>(up->ne[0]); hidden = static_cast<int>(up->ne[1]);
+    // A pass of routed layer `layer`: its format's kernels, which the sink chose when it was created.
+    void prepare(int32_t layer, const int32_t * ids, const float * route_weights, int nslots, int ntokens) {
+        const ssd_cpu_expert_kernels * k = ssd_cpu_sink_kernels(sink, layer);
+        if (!k) { throw std::runtime_error("CPU prefill of a layer that is not a routed layer"); }
+        const ssd_expert_layout & layout = ssd_cpu_sink_layout(sink);
+        latent = layout.latent; hidden = layout.hidden;
 #if defined(__x86_64__) || defined(_M_X64)
-        active_mxfp4_gemm = up->type == GGML_TYPE_MXFP4 && gate->type == GGML_TYPE_MXFP4 && down->type == GGML_TYPE_MXFP4 ?
-            mxfp4_gemm : 0;
+        active_mxfp4_gemm = k->mxfp4 ? mxfp4_gemm : 0;
 #else
         active_mxfp4_gemm = 0;
 #endif
-        const auto * up_traits = ggml_get_type_traits_cpu(up->type);
-        const auto * gate_traits = ggml_get_type_traits_cpu(gate->type);
-        const auto * down_traits = ggml_get_type_traits_cpu(down->type);
-        if (gate_traits->vec_dot_type != up_traits->vec_dot_type) {
-            throw std::runtime_error(std::string("this quantization is not supported yet: the CPU prefill multiplies up "
-                "and gate against one quantized input, but up=") + ggml_type_name(up->type) + " and gate=" +
-                ggml_type_name(gate->type) + " need different ones");
-        }
-        dot_up = up_traits->vec_dot;
-        dot_gate = gate_traits->vec_dot;
-        dot_down = down_traits->vec_dot;
-        quantize_input = ggml_get_type_traits_cpu(up_traits->vec_dot_type)->from_float;
-        quantize_hidden = ggml_get_type_traits_cpu(down_traits->vec_dot_type)->from_float;
-        row_bytes_up = ggml_row_size(up->type, latent);
-        row_bytes_gate = ggml_row_size(gate->type, latent);
-        row_bytes_down = ggml_row_size(down->type, hidden);
-        quant_bytes_input = ggml_row_size(up_traits->vec_dot_type, latent);
-        quant_bytes_hidden = ggml_row_size(down_traits->vec_dot_type, hidden);
+        dot_up = k->dot[SSD_EXPERT_UP];
+        dot_gate = k->dot[SSD_EXPERT_GATE];
+        dot_down = k->dot[SSD_EXPERT_DOWN];
+        quantize_input = k->quantize_input;
+        quantize_hidden = k->quantize_hidden;
+        row_bytes_up = k->row_bytes[SSD_EXPERT_UP];
+        row_bytes_gate = k->row_bytes[SSD_EXPERT_GATE];
+        row_bytes_down = k->row_bytes[SSD_EXPERT_DOWN];
+        quant_bytes_input = k->input_row_bytes;
+        quant_bytes_hidden = k->hidden_row_bytes;
         weights = route_weights;
         groups.clear(); expert_ids.clear();
-        group_of_expert.assign(static_cast<size_t>(up->ne[2]), -1);
+        group_of_expert.assign(static_cast<size_t>(layout.experts), -1);
         route_request_index.assign(static_cast<size_t>(ntokens) * nslots, -1);
         // Groups in deterministic first-touch order, the order of disk streaming.
         for (int token = 0; token < ntokens; ++token) {
@@ -191,7 +158,7 @@ struct ssd_cpu_prefill {
                 const int route = token * nslots + slot;
                 const int32_t expert = ids[route];
                 if (expert < 0) { continue; }
-                if (expert >= up->ne[2] || !std::isfinite(weights[route]) || weights[route] < 0.0f) {
+                if (expert >= layout.experts || !std::isfinite(weights[route]) || weights[route] < 0.0f) {
                     throw std::runtime_error("invalid CPU prefill expert ID or weight");
                 }
                 ++current.routed_slots;
@@ -463,9 +430,7 @@ extern "C" struct ssd_cpu_prefill * ssd_cpu_prefill_create(
 extern "C" void ssd_cpu_prefill_destroy(struct ssd_cpu_prefill * prefill) { delete prefill; }
 
 extern "C" bool ssd_cpu_prefill_run_activation(
-        struct ssd_cpu_prefill * prefill,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
-        const float * input, const int32_t * ids, const float * weights, int nslots, int ntokens,
+        struct ssd_cpu_prefill * prefill, int32_t layer, const float * input, const int32_t * ids, const float * weights, int nslots, int ntokens,
         const struct ssd_cpu_sink_activation * activation, float * output,
         struct ssd_cpu_prefill_stats * stats, char * error, size_t error_size) {
     prefill_error(error, error_size, "");
@@ -491,7 +456,7 @@ extern "C" bool ssd_cpu_prefill_run_activation(
         // repeated layer calls are harmless. Disarm after the accumulator is ready.
         if (!ssd_cpu_sink_vram_phase_complete(prefill->sink, false, error, error_size)) { return false; }
         prefill->activation_config = *activation;
-        prefill->prepare(up, gate, down, ids, weights, nslots, ntokens);
+        prefill->prepare(layer, ids, weights, nslots, ntokens);
         if (prefill->active_mxfp4_gemm == 2 && prefill->group_trace) {
             std::string group_list;
             group_list.reserve(prefill->groups.size() * 8);
@@ -499,8 +464,8 @@ extern "C" bool ssd_cpu_prefill_run_activation(
                 if (!group_list.empty()) { group_list += ','; }
                 group_list += std::to_string(group.expert) + ':' + std::to_string(group.columns.size());
             }
-            std::fprintf(stderr, "[ssd_cpu_prefill_groups] tensor=%s ntokens=%d groups=%s\n",
-                    up->name, ntokens, group_list.c_str());
+            std::fprintf(stderr, "[ssd_cpu_prefill_groups] layer=%d ntokens=%d groups=%s\n",
+                    layer, ntokens, group_list.c_str());
         }
         // Default-off policy audit for cold-prefill admission.  Route
         // multiplicity alone is not evidence that a prompt-hot expert will be
@@ -508,8 +473,8 @@ extern "C" bool ssd_cpu_prefill_run_activation(
         // an offline prompt->decode overlap analysis without changing cache
         // heat, residency, execution order or payload lifetime.
         if (prefill->group_trace) {
-                std::fprintf(stderr, "[ssd_cpu_prefill_admission_audit] tensor=%s ntokens=%d candidates=",
-                    up->name, ntokens);
+                std::fprintf(stderr, "[ssd_cpu_prefill_admission_audit] layer=%d ntokens=%d candidates=",
+                    layer, ntokens);
                 bool first = true;
                 for (const auto & group : prefill->groups) {
                     if (group.columns.size() < 16) { continue; }
@@ -544,7 +509,7 @@ extern "C" bool ssd_cpu_prefill_run_activation(
         batch.ntokens = ntokens;
         batch.activation = *activation;
         batch.output = output;
-        const bool ok = ssd_cpu_sink_stream_hybrid(prefill->sink, up, gate, down,
+        const bool ok = ssd_cpu_sink_stream_hybrid(prefill->sink, layer,
                 prefill->expert_ids.empty() ? &empty_id : prefill->expert_ids.data(),
                 static_cast<int>(prefill->expert_ids.size()), &batch, ssd_cpu_prefill::consume, prefill,
                 &stream, error, error_size);
@@ -595,14 +560,12 @@ extern "C" bool ssd_cpu_prefill_run_activation(
 }
 
 extern "C" bool ssd_cpu_prefill_run(
-        struct ssd_cpu_prefill * prefill,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate, const struct ggml_tensor * down,
-        const float * input, const int32_t * ids, const float * weights, int nslots, int ntokens,
+        struct ssd_cpu_prefill * prefill, int32_t layer, const float * input, const int32_t * ids, const float * weights, int nslots, int ntokens,
         float situ_beta, float situ_linear_beta, float * output,
         struct ssd_cpu_prefill_stats * stats, char * error, size_t error_size) {
     const ssd_cpu_sink_activation activation = {
         SSD_CPU_SINK_ACTIVATION_SITU, situ_beta, situ_linear_beta, 0.0f, nullptr, 0.0f,
     };
-    return ssd_cpu_prefill_run_activation(prefill, up, gate, down, input, ids, weights, nslots, ntokens,
+    return ssd_cpu_prefill_run_activation(prefill, layer, input, ids, weights, nslots, ntokens,
             &activation, output, stats, error, error_size);
 }

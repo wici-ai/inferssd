@@ -1,5 +1,5 @@
 #include "explicit-fixture-inputs.h"
-// Retired implicit ABI slots must reject callers while draining actual
+// A retired ABI slot (Q2's cold admission) must reject callers while draining actual
 // explicit-format CUDA work before releasing its cache-owned weights.
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
@@ -22,19 +22,12 @@ int main(){
     tier t(32ULL<<20, inputs.tier_policy());int slot=-1;std::vector<float> input(256,0),output(256);char error[256]={};
     auto warm=[&]{t.begin(17,1,true);lifecycle_prepare(t,&request,1,&slot);t.admit(request,data,true);t.finish(output.data(),256);};
     warm();require(t.table && t.arena,"explicit cache was not allocated");
-    require(api_prepare(&t,&request,1,256,256,&slot,error,sizeof(error))!=0 &&
-        std::strstr(error,"implicit expert format retired") && !t.table && !t.arena && t.done && t.pending_uploads.empty(),
-        "implicit prepare did not reject and drain its context");
-    warm();t.begin(17,2,true);lifecycle_prepare(t,&request,1,&slot);require(slot>=0,"explicit cache hit absent");
+    t.begin(17,2,true);lifecycle_prepare(t,&request,1,&slot);require(slot>=0,"explicit cache hit absent");
     lifecycle_launch(t,input);
-    require(api_launch(&t,input.data(),input.size()*sizeof(float),4,25,error,sizeof(error))!=0 &&
-        std::strstr(error,"implicit expert format retired") && !t.table && !t.arena && t.done && t.pending_uploads.empty(),
-        "implicit launch returned with explicit CUDA work or cache still live");
-    warm();t.begin(17,2,true);lifecycle_prepare(t,&request,1,&slot);lifecycle_launch(t,input);
     int admitted=99;
     require(prefill_cold_admission_active(&t)==0 &&
         prefill_admit_cold(&t,&request,data[0],data[1],data[2],&admitted,error,sizeof(error))!=0 &&
         !admitted && std::strstr(error,"Q2 cold admission retired") && !t.table && !t.arena && t.done && t.pending_uploads.empty(),
         "retired cold admission returned with CUDA work or cache still live");
-    std::puts("REAL_CUDA_FORMAT_COMPAT_DRAIN_PASS checks=5");return 0;
+    std::puts("REAL_CUDA_FORMAT_COMPAT_DRAIN_PASS checks=3");return 0;
 }catch(const std::exception & e){std::fprintf(stderr,"FORMAT_COMPAT_DRAIN_FAIL: %s\n",e.what());return 1;}}

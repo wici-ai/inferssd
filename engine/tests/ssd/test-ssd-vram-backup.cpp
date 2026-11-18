@@ -24,6 +24,8 @@ int main() {
     const auto ram_bytes=2*triplet_bytes(f);
     const auto gpu_bytes=std::to_string(2*triplet_bytes(f)); // one GPU slot/layer
     size_t compared=0,checks=0;double worst=0;
+    // expert 3's down: shrunk for the read failure below
+    const auto & expert3_down=f.swappable(3,2,1);
     for(const bool async : {false,true}) {
         inputs.set("vram_budget", "0");
         auto cpu=make_sink(inputs, f,16,2);
@@ -44,7 +46,7 @@ int main() {
                 std::vector<float> a(f.latent),b(f.latent);tensors meta(f,layer);char error[512]={};
                 ssd_cpu_sink_stats stats={};
                 for(int arm=0;arm<2;++arm){auto sink=arm?mixed.get():cpu.get();auto & out=arm?b:a;
-                    require(ssd_cpu_sink_run(sink,meta.role[0],meta.role[1],meta.role[2],input.data(),ids.data(),weights.data(),ids.size(),4,25,out.data(),&stats,error,sizeof(error)),error);
+                    require(ssd_cpu_sink_run(sink,meta.layer,input.data(),ids.data(),weights.data(),ids.size(),4,25,out.data(),&stats,error,sizeof(error)),error);
                     require(stats.read_errors==0 && stats.pending_reads==0 && stats.fallback_count==0,"hybrid work did not drain");++checks;
                 }
                 double error2=0,norm2=0;
@@ -59,17 +61,18 @@ int main() {
                 }
             }
         }
-        // Resolve a later request beyond EOF after other cache reads were
+        // A read that falls short (expert 3's down, its file shrunk under the sink) after other cache reads were
         // submitted. Any queued uploads must drain before RAM is released.
         begin_cache(mixed.get(),18,11,false);begin_cache(mixed.get(),18,12);
-        f.fault=fixture::past_eof;f.fault_expert=3;f.fault_role=2;
         tensors meta(f,1);std::vector<int32_t> ids={0,1,3};std::vector<float> weights(3,.3f),input(f.latent,.1f),out(f.latent);
         char error[512]={};ssd_cpu_sink_stats stats={};
-        require(!ssd_cpu_sink_run(mixed.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),ids.data(),weights.data(),3,4,25,out.data(),&stats,error,sizeof(error)),"I/O failure accepted");
+        {
+            const test_layout::shrunk_role shrunk(expert3_down);
+            require(!ssd_cpu_sink_run(mixed.get(),meta.layer,input.data(),ids.data(),weights.data(),3,4,25,out.data(),&stats,error,sizeof(error)),"I/O failure accepted");
+        }
         require(stats.pending_reads==0 && stats.fallback_count==0,"I/O failure returned with live work");++checks;
-        f.fault=fixture::none;f.fault_expert=f.fault_role=-1;
         begin_cache(mixed.get(),18,13,false);begin_cache(mixed.get(),18,14);
-        require(ssd_cpu_sink_run(mixed.get(),meta.role[0],meta.role[1],meta.role[2],input.data(),ids.data(),weights.data(),3,4,25,out.data(),&stats,error,sizeof(error)),error);++checks;
+        require(ssd_cpu_sink_run(mixed.get(),meta.layer,input.data(),ids.data(),weights.data(),3,4,25,out.data(),&stats,error,sizeof(error)),error);++checks;
         std::printf("BACKUP_MODE_PASS async=%d\n",int(async));
     }
     std::printf("REAL_GPU_BACKUP_PASS compared=%zu assertions=%zu worst_rel_l2=%.3g\n",compared,checks,worst);return 0;

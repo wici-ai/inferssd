@@ -60,7 +60,7 @@ void run_case(fixture_inputs & inputs, ggml_type type, int tokens, int activatio
         SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP ? 10.0f : 0.0f};
     auto run = [&](ssd_cpu_prefill * handle) {
         ssd_cpu_prefill_stats stats = {};
-        require(ssd_cpu_prefill_run_activation(handle, meta.role[0], meta.role[1], meta.role[2],
+        require(ssd_cpu_prefill_run_activation(handle, meta.layer,
             input.data(), ids.data(), weights.data(), slots, tokens, &activation, output.data(),
             &stats, error, sizeof(error)), error);
         require(stats.stream.read_errors == 0 && stats.stream.pending_reads == 0 &&
@@ -72,7 +72,7 @@ void run_case(fixture_inputs & inputs, ggml_type type, int tokens, int activatio
         for (int expert = lo; expert < hi; ++expert) {
             begin_cache(sink.get(), 20261004, uint64_t(expert + 1));
             const float weight = 1;
-            require(ssd_cpu_sink_run_activation(sink.get(), meta.role[0], meta.role[1], meta.role[2],
+            require(ssd_cpu_sink_run_activation(sink.get(), meta.layer,
                 single.data(), &expert, &weight, 1, &activation, single_out.data(), nullptr,
                 error, sizeof(error)), error);
         }
@@ -154,7 +154,7 @@ void run_seed_case(fixture_inputs & inputs, ggml_type type, int tokens, int acti
     auto run = [&](ssd_cpu_prefill * handle, std::vector<float> & output) {
         output.assign(input.size(), 0.0f);
         ssd_cpu_prefill_stats stats = {};
-        require(ssd_cpu_prefill_run_activation(handle, meta.role[0], meta.role[1], meta.role[2],
+        require(ssd_cpu_prefill_run_activation(handle, meta.layer,
             input.data(), ids.data(), weights.data(), slots, tokens, &activation, output.data(),
             &stats, error, sizeof(error)), error);
         require(stats.stream.read_errors == 0 && stats.stream.pending_reads == 0 &&
@@ -167,7 +167,7 @@ void run_seed_case(fixture_inputs & inputs, ggml_type type, int tokens, int acti
         for (int expert = lo; expert < hi; ++expert) {
             begin_cache(sink, 20261110, ++token);
             const float weight = 1;
-            require(ssd_cpu_sink_run_activation(sink, meta.role[0], meta.role[1], meta.role[2],
+            require(ssd_cpu_sink_run_activation(sink, meta.layer,
                 single.data(), &expert, &weight, 1, &activation, single_out.data(), nullptr,
                 error, sizeof(error)), error);
         }
@@ -252,13 +252,13 @@ void run_lookahead_case(fixture_inputs & inputs, int tokens) {
     uint64_t stride = 0;
     for (int role = 0; role < 3; ++role) {
         const auto * t = meta1.role[role];
-        stride += (ggml_row_size(t->type, t->ne[0]) * uint64_t(t->ne[1]) + 8190) / 4096 * 4096;
+        stride += (ggml_row_size(t->type, t->ne[0]) * uint64_t(t->ne[1]) + 4095) / 4096 * 4096; // read from a page
     }
     stride = cache_slot_bytes(inputs, stride);
     for (const auto & k : cache_keys) { inputs.unset(k[0]); }
     configure_cache(sink.get(), 2 * uint64_t(f.experts) * stride, {1, 2}, f.experts);
     char error[512] = {};
-    require(ssd_cpu_sink_vram_reserve(sink.get(), meta1.role, 1, 4, error, sizeof(error)), error);
+    require(ssd_cpu_sink_vram_reserve(sink.get(), 4, error, sizeof(error)), error);
     prefill_ptr prefill(ssd_cpu_prefill_create(sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
     require(bool(prefill), error);
     constexpr int slots = 4;
@@ -273,7 +273,7 @@ void run_lookahead_case(fixture_inputs & inputs, int tokens) {
         if (&meta == &meta1) { ssd_cpu_sink_prefill_hint(sink.get(), 2, ids.data(), tokens, slots); }
         output.assign(input.size(), 0.0f);
         ssd_cpu_prefill_stats stats = {};
-        require(ssd_cpu_prefill_run_activation(prefill.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+        require(ssd_cpu_prefill_run_activation(prefill.get(), meta.layer, input.data(),
             ids.data(), weights.data(), slots, tokens, &swiglu, output.data(), &stats, error, sizeof(error)), error);
         require(stats.stream.read_errors == 0 && stats.stream.pending_reads == 0 &&
             stats.stream.read_completions == stats.stream.read_requests &&
