@@ -227,6 +227,35 @@ def test_release_notes_put_highlights_and_installation_before_the_changes(tmp_pa
     assert plain.startswith("### Install or upgrade\n") and plain.endswith(changes)
 
 
+def test_release_notes_name_pull_requests_and_credit_every_contributor(tmp_path):
+    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n")
+    pull = "https://github.com/wici-ai/inferssd/pull"
+    changes = (
+        "## What's Changed\n"
+        f"* engine: one thing by @Chikati in {pull}/164\n"
+        f"* model: another by @Bi666666 in {pull}/292\n"
+        f"* docs: a third by @Chikati in {pull}/310\n"
+        f"* ci: bump by @dependabot[bot] in {pull}/311\n"
+        "* an entry GitHub may write otherwise\n"
+        "\n## New Contributors\n"
+        f"* @Bi666666 made their first contribution in {pull}/292\n"
+        "\n**Full Changelog**: https://github.com/wici-ai/inferssd/compare/v0.1.4...v0.1.5\n"
+    )
+    notes = release.release_notes(tmp_path, "v0.1.5", "wici-ai/inferssd", changes)
+    changed = notes[notes.index("## What's Changed") :]
+    assert changed == (
+        "## What's Changed\n"
+        "* engine: one thing (#164)\n"
+        "* model: another (#292)\n"
+        "* docs: a third (#310)\n"
+        "* ci: bump (#311)\n"
+        "* an entry GitHub may write otherwise\n"
+        "\n## Contributors\n\n"
+        "@Chikati, @Bi666666\n"
+        "\n**Full Changelog**: https://github.com/wici-ai/inferssd/compare/v0.1.4...v0.1.5\n"
+    )
+
+
 def test_every_published_package_is_a_release_of_main():
     yaml = pytest.importorskip("yaml")
     workflow = yaml.load(
