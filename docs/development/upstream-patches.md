@@ -50,7 +50,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | Upstream path (under engine/) | Added | Removed |
 | --- | ---: | ---: |
 | `common/CMakeLists.txt` | 16 | 22 |
-| `common/arg.cpp` | 61 | 3 |
+| `common/arg.cpp` | 68 | 3 |
 | `common/build-info.cpp.in` | 13 | 2 |
 | `common/build-info.h` | 2 | 0 |
 | `common/chat-auto-parser-generator.cpp` | 1 | 1 |
@@ -213,5 +213,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server.cpp` | 1 | 0 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 20151 added, 6253 removed across 163 upstream paths.
+Total: 20158 added, 6253 removed across 163 upstream paths.
 <!-- END UPSTREAM INVENTORY -->
