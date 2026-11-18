@@ -639,6 +639,7 @@ struct vk_device_struct {
     uint32_t subgroup_size_log2;
     uint32_t shader_core_count;
     bool uma;
+    bool rebar;
     bool prefer_host_memory;
     bool float_controls_rte_fp16;
     bool subgroup_basic;
@@ -2873,7 +2874,7 @@ static std::vector<vk::MemoryPropertyFlags> ggml_vk_device_memory_flags(const vk
                  vk::MemoryPropertyFlagBits::eDeviceLocal,
                  vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent };
     }
-    if (device->disable_host_visible_vidmem) {
+    if (!device->rebar || device->disable_host_visible_vidmem) {
         if (device->allow_sysmem_fallback) {
             return { vk::MemoryPropertyFlagBits::eDeviceLocal,
                      vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent };
@@ -5061,6 +5062,24 @@ static void ggml_vk_load_shaders(vk_device& device) {
 static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch);
 static uint32_t ggml_vk_intel_shader_core_count(const vk::PhysicalDevice& vkdev);
 
+static bool ggml_vk_has_rebar(const vk::PhysicalDevice & physical_device) {
+    const vk::PhysicalDeviceMemoryProperties mem_props = physical_device.getMemoryProperties();
+    const vk::MemoryPropertyFlags hvv = vk::MemoryPropertyFlagBits::eDeviceLocal |
+                                        vk::MemoryPropertyFlagBits::eHostVisible |
+                                        vk::MemoryPropertyFlagBits::eHostCoherent;
+    uint32_t vram_heap = UINT32_MAX;
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        const vk::MemoryType & t = mem_props.memoryTypes[i];
+        if (vram_heap == UINT32_MAX && (t.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+            vram_heap = t.heapIndex;
+        }
+        if ((t.propertyFlags & hvv) == hvv && t.heapIndex == vram_heap) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
@@ -5272,6 +5291,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+        device->rebar = ggml_vk_has_rebar(device->physical_device);
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
@@ -5978,6 +5998,7 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     uint32_t default_subgroup_size = get_subgroup_size("", device_architecture);
     const size_t subgroup_size = (default_subgroup_size != 0) ? default_subgroup_size : subgroup_props.subgroupSize;
     const bool uma = props2.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+    const bool rebar = ggml_vk_has_rebar(physical_device);
 
     integer_dot_product = integer_dot_product
                        && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated
@@ -5992,8 +6013,8 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     std::string matrix_cores = coopmat2_support ? "NV_coopmat2" : coopmat_support ? "KHR_coopmat" : "none";
 
     std::string device_name = props2.properties.deviceName.data();
-    GGML_LOG_DEBUG("ggml_vulkan: %zu = %s (%s) | uma: %d | fp16: %d | bf16: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
-              idx, device_name.c_str(), driver_props.driverName.data(), uma, fp16, bf16, subgroup_size,
+    GGML_LOG_DEBUG("ggml_vulkan: %zu = %s (%s) | uma: %d | rebar: %d | fp16: %d | bf16: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
+              idx, device_name.c_str(), driver_props.driverName.data(), uma, rebar, fp16, bf16, subgroup_size,
               props2.properties.limits.maxComputeSharedMemorySize, integer_dot_product, matrix_cores.c_str());
 
     if (props2.properties.deviceType == vk::PhysicalDeviceType::eCpu) {
