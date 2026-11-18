@@ -1465,6 +1465,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_host         = params.no_host;
     mparams.defer_experts   = params.defer_experts;
 
+    params.model.shard_ptrs.clear();
+    for (const auto & shard : params.model.shards) {
+        params.model.shard_ptrs.push_back(shard.c_str());
+    }
+    params.model.shard_ptrs.push_back(nullptr);
+    mparams.extra_files = params.model.shard_ptrs.data();
+
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {

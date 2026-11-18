@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -1109,6 +1110,193 @@ static void set_engram_layouts_data(struct ggml_tensor * tensor, void * userdata
     set_tensor_data_named(tensor, source, ud.seed);
 }
 
+// Use real files and an arbitrary PLE filename: loading must depend on tensor contents, not a symlink
+// standing in for a numbered shard. Every successful load must reproduce the virtual model's logits.
+static void test_engram_files(const llama_model * model, const gguf_context * kv,
+                              llama_model_params model_params, llama_context_params ctx_params,
+                              const std::vector<llama_token> & tokens, const std::vector<float> & logits) {
+    namespace fs = std::filesystem;
+    struct files_t {
+        fs::path directory;
+        files_t() {
+            std::random_device entropy;
+            do {
+                directory = fs::temp_directory_path() / ("test-dsv41-ple-" + std::to_string(entropy()));
+            } while (!fs::create_directory(directory));
+        }
+        ~files_t() {
+            std::error_code ignored;
+            fs::remove_all(directory, ignored);
+        }
+    } files;
+    fs::create_directory(files.directory / "tables");
+
+    std::vector<const ggml_tensor *> all, backbone;
+    const ggml_tensor * ple = nullptr;
+    for (const auto & named : model->tensors_by_name) {
+        if (std::find(all.begin(), all.end(), named.second) != all.end()) {
+            continue;
+        }
+        all.push_back(named.second);
+        if (named.first == "per_layer_token_embd.weight") {
+            ple = named.second;
+        } else {
+            backbone.push_back(named.second);
+        }
+    }
+    GGML_ASSERT(ple && !backbone.empty());
+
+    auto write = [&](const std::string & name, const std::vector<const ggml_tensor *> & tensors,
+                     bool metadata, int split_no = -1, int split_count = 2, int tensor_count = -1,
+                     const char * only_split_key = nullptr) {
+        gguf_context_ptr out(gguf_init_empty());
+        if (metadata) {
+            gguf_set_kv(out.get(), kv);
+        }
+        if (split_no >= 0) {
+            if (!only_split_key || strcmp(only_split_key, "split.no") == 0) {
+                gguf_set_val_u16(out.get(), "split.no", split_no);
+            }
+            if (!only_split_key || strcmp(only_split_key, "split.count") == 0) {
+                gguf_set_val_u16(out.get(), "split.count", split_count);
+            }
+            if (!only_split_key || strcmp(only_split_key, "split.tensors.count") == 0) {
+                gguf_set_val_i32(out.get(), "split.tensors.count", tensor_count < 0 ? (int) all.size() : tensor_count);
+            }
+        }
+        for (const ggml_tensor * tensor : tensors) {
+            gguf_add_tensor(out.get(), tensor);
+        }
+        const std::string path = (files.directory / name).string();
+        if (!gguf_write_to_file(out.get(), path.c_str(), false)) {
+            throw std::runtime_error("failed to write " + path);
+        }
+        return path;
+    };
+
+    int accepted = 0, rejected = 0;
+    auto check = [&](const char * label, const std::string & path, const std::vector<std::string> & extras,
+                     bool valid, int mode = 0, ggml_type type = GGML_TYPE_MXFP8) {
+        std::vector<const char *> extra_files;
+        for (const auto & extra : extras) {
+            extra_files.push_back(extra.c_str());
+        }
+        extra_files.push_back(nullptr);
+        auto params = model_params;
+        params.extra_files = extra_files.data();
+        params.use_mmap = mode != 1;
+        params.use_mlock = mode == 2;
+        params.check_tensors = mode == 3;
+        llama_model_ptr loaded(llama_model_load_from_file(path.c_str(), params));
+        if (bool(loaded) != valid) {
+            throw std::runtime_error(std::string(label) + (valid ? ": load failed" : ": invalid input accepted"));
+        }
+        if (!valid) {
+            ++rejected;
+            return;
+        }
+        if (!loaded->per_layer_tok_embd || loaded->per_layer_tok_embd->type != type) {
+            throw std::runtime_error(std::string(label) + ": wrong PLE replacement type");
+        }
+        llama_context_ptr loaded_ctx(llama_init_from_model(loaded.get(), ctx_params));
+        if (!loaded_ctx || get_logits(loaded.get(), loaded_ctx.get(), tokens) != logits) {
+            throw std::runtime_error(std::string(label) + ": PLE file logits changed in mode " + std::to_string(mode));
+        }
+        ++accepted;
+    };
+
+    const std::string full = write("embedded.gguf", all, true);
+    const std::string base = write("backbone.gguf", backbone, true);
+    const std::string table = write("tables/arbitrary-name.gguf", {ple}, false);
+
+    // An exact F32 decode also proves that replacing an embedded table updates its type and size.
+    const ggml_init_params init = { 5*ggml_nelements(ple)*sizeof(float) + 4*ggml_tensor_overhead(), nullptr, false };
+    ggml_context_ptr tensor_ctx(ggml_init(init));
+    auto make_table = [&](int64_t width, int64_t rows, int64_t planes = 1) {
+        ggml_tensor * tensor = ggml_new_tensor_3d(tensor_ctx.get(), GGML_TYPE_F32, width, rows, planes);
+        ggml_set_name(tensor, "per_layer_token_embd.weight");
+        memset(tensor->data, 0, ggml_nbytes(tensor));
+        return tensor;
+    };
+    ggml_tensor * f32 = make_table(ple->ne[0], ple->ne[1]);
+    ggml_get_type_traits(ple->type)->to_float(ple->data, (float *) f32->data, ggml_nelements(ple));
+    const std::string f32_table = write("tables/decoded.gguf", {f32}, false);
+    for (int mode = 0; mode < 4; ++mode) {
+        check("embedded", full, {}, true, mode);
+        check("explicit PLE", base, {table}, true, mode);
+        check("F32 replacement", full, {f32_table}, true, mode, GGML_TYPE_F32);
+    }
+    check("singleton split.no only", write("single-no.gguf", all, true, 0, 1, -1, "split.no"), {}, true);
+    check("singleton split.count only", write("single-count.gguf", all, true, 0, 1, -1, "split.count"), {}, true);
+
+    const std::string first_name = "split-00001-of-00002.gguf", second_name = "split-00002-of-00002.gguf";
+    const std::string first = write(first_name, backbone, true, 0);
+    const std::string second = write(second_name, {ple}, false, 1);
+    check("complete numbered model", first, {}, true);
+    write(second_name, {ple}, false, 1, 2, -1, "split.no");
+    check("legacy split.no-only secondary file", first, {}, true);
+    write(second_name, {ple}, false, 1);
+    check("numbered PLE replacement", first, {f32_table}, true, 0, GGML_TYPE_F32);
+    check("duplicate physical file", first, {second}, false);
+    const std::string duplicate = (files.directory / "tables/duplicate.gguf").string();
+    fs::create_hard_link(second, duplicate);
+    check("hard-linked PLE duplicate", first, {duplicate}, false);
+    fs::remove(second);
+    check("missing numbered PLE", first, {table}, true);
+    check("missing numbered PLE without extra", first, {}, false);
+
+    auto missing_weight = backbone;
+    missing_weight.pop_back();
+    write(first_name, missing_weight, true, 0);
+    check("missing normal weights", first, {table}, false);
+    missing_weight.push_back(ple);
+    write(first_name, missing_weight, true, 0);
+    check("missing normal shard with embedded PLE", first, {table}, false);
+    write(first_name, backbone, true, 0, 2, (int) all.size() + 1);
+    check("unproven missing PLE tensor count", first, {table}, false);
+    const std::string missing_two = write("missing-00001-of-00003.gguf", backbone, true, 0, 3);
+    check("two missing shards", missing_two, {table}, false);
+
+    missing_weight = backbone;
+    missing_weight.pop_back();
+    write(first_name, missing_weight, true, 0, 2, (int) backbone.size());
+    write(second_name, {backbone.back()}, false, 1, 2, (int) backbone.size());
+    check("complete numbered backbone", first, {table}, true);
+    const std::string middle = write("middle-00001-of-00003.gguf", missing_weight, true, 0, 3);
+    write("middle-00003-of-00003.gguf", {backbone.back()}, false, 2, 3);
+    check("missing middle PLE shard", middle, {table}, true);
+    check("missing middle PLE shard without mmap", middle, {table}, true, 1);
+
+    write(first_name, backbone, true, 0);
+    write(second_name, {ple}, false);
+    check("missing split metadata", first, {table}, false);
+    write(second_name, {ple}, false, 0);
+    check("wrong split order", first, {table}, false);
+    write(second_name, {ple}, false, 1, 3);
+    check("inconsistent split count", first, {table}, false);
+    write(second_name, {ple}, false, 1, 2, (int) all.size() + 1);
+    check("inconsistent split tensor count", first, {table}, false);
+    write(second_name, {ple, backbone.front()}, false, 1);
+    check("duplicate backbone tensor", first, {table}, false);
+
+    check("two PLE extras", base, {table, f32_table}, false);
+    check("repeated extra file", base, {table, table}, false);
+    check("backbone as extra", full, {full}, false);
+    check("non-PLE extra", base, {write("other.gguf", {backbone.front()}, false)}, false);
+    check("mixed PLE extra", base, {write("mixed.gguf", {ple, backbone.front()}, false)}, false);
+    check("missing extra file", base, {(files.directory / "absent.gguf").string()}, false);
+    check("wrong PLE width", base, {write("width.gguf", {make_table(ple->ne[0] / 2, ple->ne[1])}, false)}, false);
+    check("insufficient PLE rows", base, {write("rows.gguf", {make_table(ple->ne[0], ple->ne[1] - 1)}, false)}, false);
+    check("wrong PLE dimensions", base, {write("dims.gguf", {make_table(ple->ne[0], ple->ne[1], 2)}, false)}, false);
+
+    gguf_init_params read_params = { true, nullptr };
+    gguf_context_ptr table_meta(gguf_init_from_file(table.c_str(), read_params));
+    GGML_ASSERT(table_meta);
+    fs::resize_file(table, gguf_get_data_offset(table_meta.get()) + gguf_get_tensor_size(table_meta.get(), 0) - 1);
+    check("truncated PLE extent", base, {table}, false);
+    printf("%s: %d identical-logit loads, %d invalid inputs rejected\n", __func__, accepted, rejected);
+}
+
 static int test_engram_layouts(const size_t seed, const ggml_log_level log_level) {
     const llm_arch arch = LLM_ARCH_DEEPSEEK41;
     const LLM_KV kv(arch);
@@ -1203,30 +1391,7 @@ static int test_engram_layouts(const size_t seed, const ggml_log_level log_level
         const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         logits[i] = get_logits(model.get(), lctx.get(), get_tokens(32, n_vocab, seed));
         if (i == 1) {
-            // Exercise the real file loader as well as the virtual layout. Explicit
-            // eager-loading options must not be rejected by the lazy PLE mapping.
-            const std::string path = "test-dsv41-ple-load.gguf";
-            save_model_file(model.get(), one_table.get(), path, false);
-            try {
-                for (int mode = 0; mode < 4; ++mode) {
-                    auto load_params = model_params;
-                    load_params.use_mmap = mode != 1;
-                    load_params.use_mlock = mode == 2;
-                    load_params.check_tensors = mode == 3;
-                    llama_model_ptr loaded(llama_model_load_from_file(path.c_str(), load_params));
-                    if (!loaded) {
-                        throw std::runtime_error("PLE file load failed in mode " + std::to_string(mode));
-                    }
-                    llama_context_ptr loaded_ctx(llama_init_from_model(loaded.get(), ctx_params));
-                    if (!loaded_ctx || get_logits(loaded.get(), loaded_ctx.get(), get_tokens(32, n_vocab, seed)) != logits[i]) {
-                        throw std::runtime_error("PLE file logits changed in mode " + std::to_string(mode));
-                    }
-                }
-            } catch (...) {
-                std::remove(path.c_str());
-                throw;
-            }
-            std::remove(path.c_str());
+            test_engram_files(model.get(), one_table.get(), model_params, ctx_params, get_tokens(32, n_vocab, seed), logits[i]);
         }
     }
     llama_log_set(ld.callback, ld.user_data);

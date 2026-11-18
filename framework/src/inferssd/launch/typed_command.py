@@ -56,6 +56,14 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
     launch.add_argument("--resources", type=Path, help="inferssd-engine 1 deployment descriptor")
     launch.add_argument("--template", type=Path, help="explicit chat template, overrides resources")
     launch.add_argument("--model", type=Path, required=True)
+    launch.add_argument(
+        "--shard",
+        "--ple",
+        action="append",
+        default=[],
+        dest="shards",
+        help="additional PLE-only GGUF; repeat or comma-separate paths",
+    )
     launch.add_argument("--runtime-policy", type=Path, required=True)
     launch.add_argument(
         "--output-dir",
@@ -163,6 +171,7 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         if args.prompt_cache == "off"
         else str(Path(args.prompt_cache or prompt_cache_directory()).resolve()),
         listen_host(args.host),
+        tuple(args.shards),
     )
 
 

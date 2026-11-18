@@ -881,6 +881,8 @@ set_tests_properties(test-thread-safety PROPERTIES
     ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_test(test-arg-parser NAME test-ple-args ARGS --ple-only)
+inferssd_ci_test(test-arg-parser test-ple-args)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks

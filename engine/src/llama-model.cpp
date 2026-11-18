@@ -8198,7 +8198,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     const auto & ple_w = ml.require_weight(ple_name.c_str());
                     const int64_t ple_rows = ple_w.tensor->ne[1];
 
-                    ml.mark_ple_lazy(ple_w);
+                    if (ml.use_mmap && !use_mlock && !ml.check_tensors) {
+                        ml.mark_ple_lazy(ple_w);
+                    }
 
                     // sanity check
                     for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
@@ -10097,6 +10099,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.extra_files                 =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,

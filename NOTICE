@@ -32,6 +32,11 @@ source tree.
    under the same MIT license, using log1pf(expf(x)) to retain the negative
    tail while preserving the existing positive-input fast path.
 
+   Explicit PLE file arguments and tensor replacement in engine/common/arg.cpp
+   and engine/src/llama-model-loader.cpp follow that same upstream revision,
+   with additional checks for PLE-only contents, duplicate physical files,
+   split metadata and missing backbone tensors.
+
 2. DeepSeek V4 support
    https://github.com/nisparks/llama.cpp
    Ported from Nicholas Sparks' MIT-licensed fork. Copyright (c) 2023-2026

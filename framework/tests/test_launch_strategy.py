@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 from test_engine_runtime import Effects, Owner, policy
+from test_gguf_alias import fixture as gguf_fixture
 from test_launch_platforms import golden
 from test_machine_identity import FakeHost, linux_tree, nvme_key, write
 from test_machine_probes import PATHS, FakeRunner, replies
@@ -38,6 +39,7 @@ from inferssd.launch.types import Fact, LaunchInput, Reply, Threads
 from inferssd.machine.characteristics import dumps, load
 from inferssd.machine.identity import Command
 from inferssd.machine.store import LockBusy, default_path
+from inferssd.strategy import inputs as strategy_inputs
 from inferssd.strategy.inputs import model_facts_json, shard_facts
 
 MACHINES = Path(__file__).parent / "fixtures" / "machine"
@@ -662,3 +664,63 @@ def test_help_names_the_machine_options(capsys):
         main(["--help"])
     text = capsys.readouterr().out
     assert "--reprofile" in text and "--machine PATH" in text
+
+
+@pytest.mark.parametrize("from_environment", [False, True])
+def test_runtime_profiles_explicit_table_drive(tmp_path, monkeypatch, from_environment):
+    inputs, spec, _, _, _ = strategic(tmp_path)
+    extra = str(tmp_path / "other drive" / "table.gguf")
+    if from_environment:
+        inputs = replace(inputs, environment=inputs.environment + (("LLAMA_ARG_SHARD", extra),))
+    else:
+        spec = replace(spec, shards=(extra,))
+    calls = []
+
+    def measured(source, platform, model, probes, *, extra_models=()):
+        calls.append((model, extra_models))
+        return None
+
+    monkeypatch.setattr(runtime, "machine_characteristics", measured)
+    value = runtime.Runtime(
+        inputs,
+        policy(tmp_path, "linux"),
+        host=object(),
+        emit=lambda _: None,
+        configuration=spec,
+        machine=MachineSource(),
+    )
+    value.characteristics(spec)
+    assert calls == [(spec.model, (extra,))]
+
+
+def test_larger_ple_on_another_drive_keeps_expert_disk_calibration(tmp_path, monkeypatch):
+    inputs, spec, _, adapter, out = strategic(tmp_path)
+    extra = tmp_path / "other-drive" / "table.gguf"
+    extra.parent.mkdir()
+    gguf_fixture(
+        extra, tensors=[("per_layer_token_embd.weight", (32, 65536), 1, 0)], payload=4 << 20
+    )
+    drives = {spec.model: X86_DRIVE, str(extra): "separate-ple-drive"}
+
+    class StorageHost:
+        def regular_files(self, path):
+            return [(path, Path(path).stat().st_size)]
+
+        def device(self, path):
+            return (0, list(drives).index(path))
+
+    host = StorageHost()
+    monkeypatch.setattr(strategy_inputs.identity, "drive_key", lambda _host, path: drives[path])
+    # The separate table is larger, so including it would select its disk's rate
+    # for the expert executor, which reads from the backbone instead.
+    assert strategy_inputs.model_drive_key(tuple(drives), host) == "separate-ple-drive"
+
+    def observe(fact):
+        if fact.name == "model_drive_key":
+            return Reply(strategy_inputs.model_drive_key(fact.arguments, host))
+        return adapter(fact)
+
+    result, receipt, _ = resolved(inputs, replace(spec, shards=(str(extra),)), observe, out)
+    assert result.code == 0
+    assert receipt["strategy"]["inputs"]["model_drive"] == X86_DRIVE
+    assert receipt["strategy"]["inputs"]["model_paths"] == [spec.model, str(extra)]

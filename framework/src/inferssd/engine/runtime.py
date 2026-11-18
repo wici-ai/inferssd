@@ -30,6 +30,7 @@ from inferssd.launch.typed import (
 )
 from inferssd.launch.types import LaunchInput, Output, Resolution
 from inferssd.platform.policy import Policy
+from inferssd.source.gguf_alias import shard_paths
 
 
 class Runtime:
@@ -66,7 +67,19 @@ class Runtime:
             binary = server_binary(platform, specification.binary, resources, repo, os.path.isfile)
             binary = os.path.realpath(binary) if binary else None
             probes = probe_paths(platform, binary, resources, repo, os.path.isfile)
-            text = machine_characteristics(self.machine, platform, specification.model, probes)
+            extras = shard_paths(
+                specification.shards, dict(self.inputs.environment).get("LLAMA_ARG_SHARD", "")
+            )
+            if extras:
+                text = machine_characteristics(
+                    self.machine,
+                    platform,
+                    specification.model,
+                    probes,
+                    extra_models=tuple(str(path.resolve()) for path in extras),
+                )
+            else:
+                text = machine_characteristics(self.machine, platform, specification.model, probes)
             self.characteristics_text = (text,)
         return self.characteristics_text[0]
 

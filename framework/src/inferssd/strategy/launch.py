@@ -44,6 +44,8 @@ def plan(
     settings: Snapshot,
     threads: Threads,
     gpu_backends: Optional[tuple[str, ...]] = None,
+    *,
+    extra_paths: Sequence[str] = (),
 ) -> Planned:
     """SETTINGS and the user's THREADS completed by the strategy for this launch.
 
@@ -61,7 +63,8 @@ def plan(
     if text is None:
         return skipped("no machine characteristics")
     characteristics = loads(cast(str, text))
-    model = model_facts_from(s.value("model_facts", *paths))
+    sources = [*paths, "--shard", *extra_paths] if extra_paths else paths
+    model = model_facts_from(s.value("model_facts", *sources))
     key = cast(Optional[str], s.value("model_drive_key", *paths))
     runtime = runtime_facts_from(s.value("runtime_facts"))
     available = runtime.available_bytes

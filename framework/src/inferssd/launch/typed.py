@@ -25,6 +25,7 @@ from inferssd.launch.darwin import MODEL_OPTIONS
 from inferssd.launch.resources import EngineResources, server_binary
 from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
 from inferssd.machine.identity import TIER_BACKENDS
+from inferssd.source.gguf_alias import shard_argument, shard_paths
 from inferssd.strategy.inputs import model_facts_from, runtime_facts_from
 from inferssd.strategy.launch import Planned, plan
 
@@ -78,6 +79,8 @@ class LaunchSpec:
     prompt_cache: Optional[str] = None
     # The IPv4 address the server listens on; see listen_host.
     host: str = LOOPBACK
+    # Explicit PLE-only GGUFs, separate from the numbered backbone.
+    shards: tuple[str, ...] = ()
 
 
 def listen_host(text: str) -> str:
@@ -243,6 +246,8 @@ def _resolve(
     protected = {
         "-m",
         "--model",
+        "--shard",
+        "--ple",
         "--model-url",
         "-hf",
         "--hf-repo",
@@ -348,13 +353,26 @@ def _resolve(
             os_path.join(os_path.dirname(model), f"{prefix}-{i:05d}-of-{count}.gguf")
             for i in range(1, int(count) + 1)
         ]
+    extras = [
+        s.text("resolved_path", str(path))
+        for path in shard_paths(spec.shards, s.env.pop("LLAMA_ARG_SHARD", ""))
+    ]
+    present = []
     for path in paths:
-        if not s.value("is_file", path):
+        if s.value("is_file", path):
+            present.append(path)
+        elif not extras:
             raise ValueError("missing GGUF shard: " + path)
+    if extras:
+        # The adapter proves any missing slot from the headers before model
+        # profiling or indexing; a table cannot hide a missing backbone shard.
+        s.ask("validate_gguf", *present, "--shard", *extras)
+    paths = present
+    model_sources = [*paths, "--shard", *extras] if extras else paths
     profile = s.inputs.profile
     observed: object = None
     if not profile:
-        observed = s.value("model_facts", *paths)
+        observed = s.value("model_facts", *model_sources)
         architecture = (
             cast(str, ram.validate(observed)["architecture"])
             if isinstance(observed, Mapping) and observed.get("architecture") == ram.ARCHITECTURE
@@ -462,7 +480,7 @@ def _resolve(
     if ordinary:
         runtime = runtime_facts_from(s.value("runtime_facts"))
         configured_budget = cast(int, value.at("host.budget_mib").value) << 20
-        facts = observed if observed is not None else s.value("model_facts", *paths)
+        facts = observed if observed is not None else s.value("model_facts", *model_sources)
         available = runtime.available_bytes
         # A context left unset takes the largest step down from CONTEXT that fits the memory
         # available now, else the smallest step; one given is kept. Either must be admitted.
@@ -501,7 +519,9 @@ def _resolve(
             )
     elif spec.strategy:
         # The strategy fills what the user left unset; the checks below see the result.
-        planned = plan(s, platform, memory, paths, value, spec.threads, gpu_backends)
+        planned = plan(
+            s, platform, memory, paths, value, spec.threads, gpu_backends, extra_paths=extras
+        )
         value, threads = planned.settings, threadpools(planned.threads, platform)
         if any(argument in protected for argument in planned.server_args[::2]):
             raise ValueError("the launch strategy names a protected server option")
@@ -549,7 +569,7 @@ def _resolve(
             raise ValueError("typed launch requires a nonempty explicit expert.source")
         artifacts = spec.artifact_directory or os_path.join(directory, "artifacts")
         s.ask("mkdir", artifacts)
-        alias = s.text("gguf_alias", artifacts, *paths)
+        alias = s.text("gguf_alias", artifacts, *model_sources)
         selected = Setting(
             "expert.source",
             (alias,),
@@ -630,6 +650,8 @@ def _resolve(
         given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
         cast(list[str], planned.receipt["kept"]).extend("server " + name for name in given)
     command = [binary, "-m", model]
+    for path in extras:
+        command += ["--shard", shard_argument(path)]
     if settings is not None and telemetry is not None:
         command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
     for item in () if ordinary else value.entries:

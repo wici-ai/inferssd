@@ -22,7 +22,7 @@ from inferssd.launch.darwin import PROFILES
 from inferssd.launch.resources import GPU_BACKENDS
 from inferssd.launch.types import Fact, LaunchInput, Reply
 from inferssd.machine import characteristics
-from inferssd.source import experts
+from inferssd.source import experts, gguf_alias
 from inferssd.source import header as gguf_header
 from inferssd.strategy import inputs as strategy_inputs
 
@@ -68,15 +68,20 @@ def metadata(name: str, arguments: tuple[str, ...]) -> Reply:
     return Reply(values, stdout.getvalue(), stderr.getvalue())
 
 
-def alias_key(paths: tuple[str, ...], profile: Optional[str], repo: str) -> str:
+def alias_key(
+    paths: tuple[str, ...],
+    profile: Optional[str],
+    repo: str,
+    extra_paths: tuple[str, ...] = (),
+) -> str:
     """What an index depends on: the indexer's source, the expert count and provenance it is
     given, and each shard as the file system identifies it (an edit or a replacement changes
     its size, inode, or modification or change time)."""
-    from inferssd.source import gguf_alias
-
     digest = hashlib.sha256(Path(gguf_alias.__file__).read_bytes())
     digest.update(((profile or "") + "\0" + repo).encode())
-    for path in paths:
+    if extra_paths:
+        digest.update(("\0extra:" + "\0".join(extra_paths)).encode())
+    for path in paths + extra_paths:
         stat = os.stat(path)
         identity = (
             os.path.realpath(path),
@@ -100,6 +105,7 @@ def generate_alias(
     run: Callable[[list[str]], None],
     replace: Callable[[str, str], None],
     reuse: Optional[Path] = None,
+    extra_paths: tuple[str, ...] = (),
 ) -> str:
     """Run the strict GGUF alias indexer, then publish the index and its summary in order.
 
@@ -113,7 +119,7 @@ def generate_alias(
     alias, summary = cache_dir / f"{name}.tsv", cache_dir / f"{name}.json"
     kept = None
     if reuse is not None:
-        key = alias_key(paths, profile, repo)
+        key = alias_key(paths, profile, repo, extra_paths)
         kept = (reuse / f"{key}.tsv", reuse / f"{key}.json")
     with tempfile.TemporaryDirectory(prefix=".index-", dir=cache_dir) as temporary:
         pending_alias, pending_summary = (
@@ -140,11 +146,17 @@ def generate_alias(
                 command[4:4] = ["--repo", repo]
             for path in paths:
                 command.extend(("--model-glob", glob.escape(path)))
+            for path in extra_paths:
+                command.extend(("--shard", gguf_alias.shard_argument(path)))
             run(command)
             if kept:
                 keep_alias((pending_alias, pending_summary), kept)
         data = json.loads(pending_summary.read_text(encoding="utf-8"))
-        if data.get("model_shards") != len(paths) or data.get("entries", 0) <= 0:
+        if (
+            data.get("model_shards") != len(paths)
+            or data.get("entries", 0) <= 0
+            or data.get("extra_paths", []) != list(extra_paths)
+        ):
             raise ValueError("GGUF metadata did not produce a complete nonempty expert index")
         data["output_tsv"] = str(alias)
         pending_summary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
@@ -167,7 +179,17 @@ def run_indexer(command: list[str]) -> None:
     # The only subprocess allowed by this adapter is the installed strict header
     # indexer, assembled by generate_alias. Engine argv never reaches this call.
     # Its summary is a log: a command's stdout is its result, such as a chat's answer.
-    subprocess.run(command, check=True, stdout=sys.stderr.fileno())
+    environment = dict(os.environ)
+    environment.pop("LLAMA_ARG_SHARD", None)  # explicit launch inputs already include it
+    subprocess.run(command, check=True, stdout=sys.stderr.fileno(), env=environment)
+
+
+def model_sources(arguments: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Separate absolute backbone paths from explicit extra paths in artifact facts."""
+    if "--shard" not in arguments:
+        return arguments, ()
+    boundary = arguments.index("--shard")
+    return arguments[:boundary], arguments[boundary + 1 :]
 
 
 class RecordedArtifacts:
@@ -231,10 +253,11 @@ class RecordedArtifacts:
             # The historical Mac launcher names its profile first; the typed launch does not.
             historical = name == "mac_alias"
             profile = args[0] if historical else None
-            directory, *paths = args[1:] if historical else args
+            directory, *sources = args[1:] if historical else args
+            backbone, extras = model_sources(tuple(sources))
             return Reply(
                 generate_alias(
-                    tuple(paths),
+                    backbone,
                     profile,
                     Path(directory),
                     repo=self.inputs.repo,
@@ -242,11 +265,28 @@ class RecordedArtifacts:
                     run=self.run,
                     replace=self.replace,
                     reuse=self.index_cache,
+                    extra_paths=extras,
                 )
             )
+        if name == "validate_gguf":
+            backbone, extras = model_sources(args)
+            gguf_alias.load_headers(
+                [Path(path) for path in backbone], [Path(path) for path in extras]
+            )
+            return Reply()
         if name == "model_facts" and name not in self.host:
             # Read from the model's own headers, as the alias index is.
-            headers = gguf_header.without_nextn([gguf_header.read(path) for path in args])
+            backbone, extras = model_sources(args)
+            headers = [gguf_header.read(path) for path in backbone + extras]
+            if extras:
+                gguf_alias.load_headers(
+                    [Path(path) for path in backbone], [Path(path) for path in extras]
+                )
+                headers = [
+                    h._replace(tensors=[t for t in h.tensors if t.name != gguf_alias.PLE_TENSOR])
+                    for h in headers[:-1]
+                ] + headers[-1:]
+            headers = gguf_header.without_nextn(headers)
             if headers[0].kv.get("general.architecture") == ram.ARCHITECTURE:
                 return Reply(ram.facts(headers))
             model = strategy_inputs.facts_from_headers(headers)

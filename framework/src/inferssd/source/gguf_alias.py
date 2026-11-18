@@ -20,7 +20,7 @@ import struct
 import subprocess
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -75,6 +75,7 @@ NATIVE_TYPES = {
     43: ("MXFP8", 32, 33),
 }
 EXPERT_RE = re.compile(r"^blk\.(?P<layer>\d+)\.ffn_(?P<kind>up|gate|down)_exps\.weight$")
+PLE_TENSOR = "per_layer_token_embd.weight"
 SHARD_RE = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf$")
 FIELDS = (
     "tensor",
@@ -139,13 +140,15 @@ class _Reader:
             pieces.append(tail)
         return "".join(pieces)
 
-    def value(self, kind: int, *, capture: bool = False) -> Any:
+    def value(self, kind: int, *, capture: bool = False, array_type: int | None = None) -> Any:
         if kind in SCALARS:
             return self.take(SCALARS[kind])
         if kind == 8:
             return self.string(capture=capture)
         if kind == 9:
             element, count = int(self.take("I")), int(self.take("Q"))
+            if array_type is not None and element != array_type:
+                raise ValueError("Bad type for PLE layers array")
             if element in SCALARS:
                 self.skip(count * struct.calcsize("<" + SCALARS[element]))
             elif element == 8:
@@ -155,7 +158,7 @@ class _Reader:
                     self.string(capture=False)
             else:
                 raise ValueError(f"unsupported GGUF array element type {element}")
-            return None
+            return count if capture else None
         raise ValueError(f"unknown GGUF metadata type {kind} at byte {self.offset}")
 
 
@@ -241,10 +244,23 @@ def read_header(path: Path) -> Header:
                 if key == "general.alignment" and kind != 4:
                     raise ValueError("Bad type for general.alignment field")
                 expected_split_type = {"split.no": 2, "split.count": 2, "split.tensors.count": 5}
+                if key.endswith(".embedding_length_per_layer_input") and kind != 4:
+                    raise ValueError(f"Bad type for {key} field")
+                if key.endswith(".ple.layers") and kind != 9:
+                    raise ValueError(f"Bad type for {key} field")
                 if key in expected_split_type and kind != expected_split_type[key]:
                     raise ValueError(f"Bad type for {key} field")
-                value = reader.value(kind, capture=key == "general.architecture")
-                if kind in SCALARS or key == "general.architecture":
+                value = reader.value(
+                    kind,
+                    capture=key == "general.architecture" or key.endswith(".ple.layers"),
+                    array_type=4 if key.endswith(".ple.layers") else None,
+                )
+                if (
+                    kind in SCALARS
+                    or key == "general.architecture"
+                    or key.endswith(".ple.layers")
+                    and kind == 9
+                ):
                     metadata[key] = value
                 if key == "general.alignment":
                     alignment = int(value)
@@ -330,40 +346,123 @@ def parse_model_paths(patterns: list[str]) -> list[Path]:
     return result
 
 
-def _validate_shards(paths: list[Path]) -> list[int]:
+def shard_paths(values: tuple[str, ...] | list[str], environment: str = "") -> list[Path]:
+    """Explicit extra files, matching native repeat/comma and environment ordering."""
+    paths = []
+    for value in ([environment] if environment else []) + list(values):
+        for item in next(csv.reader([value])) if value else [""]:
+            if not item:
+                raise ValueError("--shard/--ple requires a nonempty path")
+            paths.append(Path(item).expanduser())
+    return paths
+
+
+def shard_argument(path: str) -> str:
+    """One path as a native comma-separated option value, without shell quoting."""
+    return '"' + path.replace('"', '""') + '"' if "," in path or '"' in path else path
+
+
+def _validate_shards(paths: list[Path], *, allow_missing: bool = False) -> tuple[list[int], int]:
     if not paths:
         raise RuntimeError("no GGUF model files were selected")
-    resolved = [path.resolve(strict=True) for path in paths]
-    if len(set(resolved)) != len(resolved):
-        raise RuntimeError("duplicate GGUF source file")
-    # Native sibling discovery follows the supplied shard names. A shared
-    # payload (for example Engram) may be linked under a numbered shard name.
-    # Resolve directories for comparison, but retain each link's basename;
-    # physical source identities and split metadata are still checked below.
+    # Retain numbered link basenames for old model layouts; physical identities
+    # are checked separately, including hard links.
     named = [path.parent.resolve(strict=True) / path.name for path in paths]
     first = SHARD_RE.fullmatch(named[0].name)
     if first is None:
         if len(paths) != 1:
             raise RuntimeError("multiple GGUF files must form one complete numbered shard set")
-        return [0]
+        return [0], 1
     prefix, first_number, total_text = first.groups()
     total = int(total_text)
     if first_number != "00001" or total < 1:
         raise RuntimeError("model must name the first GGUF shard")
-    if len(paths) != total:
-        raise RuntimeError("GGUF source list is not the complete numbered shard set")
     expected = {
         named[0].parent / f"{prefix}-{i:05d}-of-{total_text}.gguf" for i in range(1, total + 1)
     }
-    if set(named) != expected:
-        raise RuntimeError("GGUF source list is not the complete numbered shard set")
+    if not set(named) <= expected or len(paths) != len(set(named)) or len(paths) != total:
+        if not (allow_missing and set(named) < expected and len(paths) == total - 1):
+            raise RuntimeError("GGUF source list is not the complete numbered shard set")
     numbers = []
     for path in named:
         match = SHARD_RE.fullmatch(path.name)
-        if match is None:
-            raise RuntimeError("GGUF source list contains an unnumbered shard")
+        assert match is not None
         numbers.append(int(match.group(2)) - 1)
-    return numbers
+    return numbers, total
+
+
+def load_headers(model_paths: list[Path], extra_paths: list[Path] | None = None) -> list[Header]:
+    """Validate the backbone and explicit PLE source, then apply a PLE replacement.
+
+    An extra file is identified by its sole tensor, independent of its filename.
+    A missing numbered slot requires a model that declares PLE and exactly one
+    absent tensor; ordinary backbone shards never become optional.
+    """
+    extras = extra_paths or []
+    if len(extras) > 1:
+        raise RuntimeError("at most one explicit PLE GGUF file is supported")
+    numbers, count = _validate_shards(model_paths, allow_missing=bool(extras))
+    headers = [read_header(path) for path in model_paths + extras]
+    identities = [header.identity[:2] for header in headers]
+    if len(set(identities)) != len(identities):
+        raise RuntimeError("duplicate GGUF source file")
+    backbone = headers[: len(model_paths)]
+    total = sum(len(header.tensors) for header in backbone)
+    names = {tensor.name for header in backbone for tensor in header.tensors}
+    missing = set(range(count)) - set(numbers)
+    declared = backbone[0].split.get("split.tensors.count", total)
+    if missing:
+        metadata = backbone[0].metadata
+        arch = metadata.get("general.architecture", "")
+        ple = metadata.get(f"{arch}.ple.layers", 0)
+        per_layer = metadata.get(f"{arch}.embedding_length_per_layer_input", 0)
+        if (
+            len(missing) != 1
+            or PLE_TENSOR in names
+            or declared != total + 1
+            or not (type(ple) is int and ple > 0 or type(per_layer) is int and per_layer > 0)
+        ):
+            raise RuntimeError("missing GGUF shard is not proven to contain only the PLE tensor")
+    for header, number in zip(backbone, numbers):
+        required = {"split.no"} if count > 1 else set()
+        if number == 0 and count > 1:
+            required |= {"split.count", "split.tensors.count"}
+        if not required.issubset(header.split):
+            raise RuntimeError(f"{header.path}: missing GGUF split metadata")
+        expected = {
+            "split.no": number,
+            "split.count": count,
+            "split.tensors.count": total + len(missing),
+        }
+        for key, value in header.split.items():
+            if value != expected[key]:
+                raise RuntimeError(f"{header.path}: inconsistent {key} metadata")
+    names = set()
+    for header in backbone:
+        for tensor in header.tensors:
+            if tensor.name in names:
+                kind = "expert tensor" if EXPERT_RE.fullmatch(tensor.name) else "tensor"
+                raise RuntimeError(f"duplicate {kind} across shards: {tensor.name}")
+            names.add(tensor.name)
+    if extras:
+        extra = headers[-1]
+        if len(extra.tensors) != 1 or extra.tensors[0].name != PLE_TENSOR:
+            raise RuntimeError("explicit --shard/--ple file must contain only " + PLE_TENSOR)
+        if extra.split:
+            if set(extra.split) != {"split.no", "split.count", "split.tensors.count"}:
+                raise RuntimeError(f"{extra.path}: missing GGUF split metadata")
+            no, n, tensors = (
+                extra.split[key] for key in ("split.no", "split.count", "split.tensors.count")
+            )
+            if not 0 <= no < n or tensors < 1 or (n == 1 and tensors != 1):
+                raise RuntimeError(f"{extra.path}: inconsistent GGUF split metadata")
+            if n > 1 and (n != count or tensors != declared or missing and no not in missing):
+                raise RuntimeError(f"{extra.path}: inconsistent GGUF split metadata")
+        headers = [
+            replace(header, tensors=tuple(t for t in header.tensors if t.name != PLE_TENSOR))
+            for header in backbone
+        ] + [extra]
+    return headers
 
 
 def build_rows(
@@ -371,6 +470,8 @@ def build_rows(
     include_kinds: set[str],
     n_experts: int | None,
     require_aligned: bool = False,
+    *,
+    extra_paths: list[Path] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Index every selected expert tensor. Each has the same expert count: n_experts, or the
     first selected tensor's when it is None."""
@@ -378,9 +479,7 @@ def build_rows(
         raise RuntimeError("the expert count must be positive")
     if not include_kinds or include_kinds - {"up", "gate", "down"}:
         raise RuntimeError("include kinds must be a nonempty subset of up,gate,down")
-    shard_numbers = _validate_shards(model_paths)
-    headers = [read_header(path) for path in model_paths]
-    total_tensors = sum(len(header.tensors) for header in headers)
+    headers = load_headers(model_paths, extra_paths)
     # The engine does not load the NextN blocks: their experts are not the model's.
     metadata: dict[str, Any] = {}
     for header in headers:
@@ -389,34 +488,12 @@ def build_rows(
     nextn = nextn_blocks(metadata)
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
-    all_tensor_names: set[str] = set()
     by_kind: dict[str, dict[str, int]] = defaultdict(lambda: dict(tensors=0, entries=0, bytes=0))
     by_type: dict[str, dict[str, int]] = defaultdict(lambda: dict(tensors=0, entries=0, bytes=0))
     unaligned_rows = total_bytes = 0
-    for shard_index, (header, shard_number) in enumerate(zip(headers, shard_numbers)):
-        # Match the native loader's required split metadata. Later shards may
-        # omit the count fields, but their own split.no is always required.
-        if len(headers) > 1:
-            required = {"split.no"}
-            if shard_index == 0:
-                required |= {"split.count", "split.tensors.count"}
-            if not required.issubset(header.split):
-                raise RuntimeError(f"{header.path}: missing GGUF split metadata")
-        expected_split = {
-            "split.no": shard_number,
-            "split.count": len(headers),
-            "split.tensors.count": total_tensors,
-        }
-        for key, value in header.split.items():
-            if value != expected_split[key]:
-                raise RuntimeError(f"{header.path}: inconsistent {key} metadata")
+    for shard_index, header in enumerate(headers):
         for tensor in header.tensors:
             match = EXPERT_RE.fullmatch(tensor.name)
-            if tensor.name in all_tensor_names:
-                if match is not None and match.group("kind") in include_kinds:
-                    raise RuntimeError(f"duplicate expert tensor across shards: {tensor.name}")
-                raise RuntimeError(f"duplicate tensor across shards: {tensor.name}")
-            all_tensor_names.add(tensor.name)
             if (
                 match is None
                 or match.group("kind") not in include_kinds
@@ -488,6 +565,8 @@ def build_rows(
         by_kind=dict(sorted(by_kind.items())),
         by_type=dict(sorted(by_type.items())),
     )
+    if extra_paths:
+        summary["extra_paths"] = [str(path) for path in extra_paths]
     return rows, summary
 
 
@@ -507,6 +586,14 @@ def _repo_head(repo: Path | None) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-glob", action="append", required=True)
+    parser.add_argument(
+        "--shard",
+        "--ple",
+        action="append",
+        default=[],
+        dest="shards",
+        help="additional PLE-only GGUF; repeat or comma-separate paths",
+    )
     parser.add_argument("--n-experts", type=int, help="expected experts per tensor (default: read)")
     parser.add_argument("--include-kind", default="up,gate,down")
     parser.add_argument("--out", type=Path, required=True)
@@ -516,7 +603,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     kinds = {kind.strip() for kind in args.include_kind.split(",") if kind.strip()}
     paths = parse_model_paths(args.model_glob)
-    rows, summary = build_rows(paths, kinds, args.n_experts, args.require_aligned)
+    extras = shard_paths(args.shards, os.environ.get("LLAMA_ARG_SHARD", ""))
+    rows, summary = build_rows(
+        paths, kinds, args.n_experts, args.require_aligned, extra_paths=extras
+    )
     summary.update(repo_head=_repo_head(args.repo), output_tsv=str(args.out))
     # The caller supplies a private staging directory and publishes only after
     # this process has validated every shard/header/tensor and returned success.

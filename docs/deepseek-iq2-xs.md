@@ -22,11 +22,20 @@ retain their eager-loading behavior and can require substantially more RAM.
 Nonzero offsets, gaps, overlapping buckets and trailing table padding are
 accepted when all bucket indices fit I32 and the table covers them.
 
-Keep all six numbered shards together. The shared
-`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` file may be linked under shard 6's
-numbered name. Source indexing validates the numbered names before resolving
-physical files, and still checks split metadata and duplicate sources.
-The complete index contains 46,080 entries in 120 expert tensors. Experts mix
+Pass a shared table explicitly with `--ple /path/to/table.gguf` (alias
+`--shard`). The table can be in a different directory and have any filename.
+The native loader and Python source index identify it by its contents: an
+extra GGUF must contain only `per_layer_token_embd.weight`. It replaces an
+embedded PLE tensor or supplies a separate PLE tensor. Two explicit tables,
+mixed-content extras and duplicate physical files are rejected.
+
+Keep the numbered backbone shards together. One missing numbered shard is
+accepted only when PLE metadata and the declared tensor count identify a
+single missing PLE table; all other split and tensor checks still apply.
+A complete numbered checkpoint continues to work without `--ple`. Creating
+a numbered link for the external table is unnecessary.
+
+The complete expert index contains 46,080 entries in 120 tensors. Experts mix
 IQ2_XXS, IQ2_XS, IQ2_S and IQ3_XXS; up and gate match in every layer.
 These formats use existing quantization kernels. No weights are rewritten.
 
@@ -36,13 +45,13 @@ The model files total 265,821,189,184 bytes. Every physical file passed full
 SHA-256 verification against the publisher's manifest. The source checkpoint
 revision is `65d53bc8be65123e255ff02f3ded958b6dbf54fd` on Hugging Face.
 
-Synthetic tests cover malformed metadata, overflow, I32 boundary indices,
-padding/history hashes and fused gate values. Existing legacy Engram and
-MXFP8 decoder tests remain in the same suite. Mixed-IQ CPU experts agree
-bitwise with ordinary CPU MoE execution. CUDA matrix tests exercise real
-expert dimensions and prefill/decode shapes (64 comparisons, NMSE below
-`5e-4`); cache tests exercise hits and misses across the four types
-(100 comparisons, relative L2 below `0.02`).
+Synthetic tests use real GGUF files to cover external tables, embedded-table
+replacement, missing PLE-only shards, malformed splits, duplicate files and
+tensors, mixed-content extras, table bounds and explicit loading modes.
+They also cover metadata overflow, I32 boundary indices, padding/history
+hashes and fused gate values. Legacy Engram and MXFP8 decoder tests remain
+in the same suite. Mixed-IQ CPU experts agree bitwise with ordinary CPU MoE
+execution. CUDA matrix and cache tests exercise the four expert types.
 
 The integration configuration uses one RTX 5090, an AMD EPYC 7B13 CPU,
 CUDA 12.8, context 2048, batch/microbatch 64, eight CPU threads, greedy sampling
@@ -56,25 +65,12 @@ definition. Arithmetic returns `5`; the ice explanation stops normally; the
 MoE definition reaches the configured output limit. Acceptance requires
 successful prefill/decode placement, actual expert reads and VRAM hits,
 zero read errors, zero fallbacks, no OOM and a clean server exit.
-The final source snapshot, based on main `746253a` with the accompanying
-numerical fixes, passed these checks on 2026-11-17. Peak cgroup memory was
-34,039,660,544 bytes (31.70 GiB); whole-device VRAM peaked at 32,098 MiB,
-including a 308 MiB baseline. All 1,920 placement events succeeded, with
-18,381 expert read requests, 59,428,999,168 expert read bytes and 8,421 VRAM
-hits. The executor reported zero read errors and zero fallbacks, the cgroup
-reported no OOM events, and the server exited successfully and released the GPU.
-The remote filesystem exposes a virtual block device whose physical backing
-is unknown. This establishes disk-offload integration, not SSD throughput.
+CPU attention uses the same implementation as `main`; this change does not
+alter its precision or KV representation. The stable softplus and
+DeepSeek-V4.1 sum-plus-epsilon router fixes are already on `main`.
 
-The accompanying numerical fixes honor explicit `GGML_PREC_F32` in CPU
-attention, retain softplus's small positive negative-tail values and preserve
-DeepSeek-V4.1's sum-plus-epsilon router denominator. Default attention
-precision and other architectures' router guards remain unchanged.
-Earlier focused CPU comparisons against llama.cpp
-`9581154a2250cc9e6948e4c2a2fc4b4e19d1a57e` matched all generated token IDs
-and returned top-five log probabilities for two prompts, after aligning
-prefill partitions and disabling upstream tiled matmul and fusion.
-That evidence is specific to those CPU samples and execution settings.
+The remote filesystem exposes a virtual block device whose physical backing
+is unknown. This validates disk-offload integration, not SSD throughput.
 
 ## Reproduction
 
@@ -84,10 +80,11 @@ fresh run directory and telemetry file:
 ```sh
 MODEL_DIR=/path/to/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS
 MODEL="$MODEL_DIR/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf"
+PLE=/path/to/shared-tables/DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf
 RUN_DIR=$(mktemp -d "$PWD/deepseek-run.XXXXXX")
 PYTHONPATH=framework/src python -m inferssd.source.gguf_alias \
   --model-glob "$MODEL_DIR/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-*-of-00006.gguf" \
-  --out "$RUN_DIR/experts.tsv" --summary-json "$RUN_DIR/experts.json"
+  --ple "$PLE" --out "$RUN_DIR/experts.tsv" --summary-json "$RUN_DIR/experts.json"
 cat > "$RUN_DIR/settings.ssd" <<EOF
 inferssd-settings 1
 expert.source = ["$RUN_DIR/experts.tsv"]
@@ -97,13 +94,18 @@ prefill.lookahead = 0
 EOF
 systemd-run --user --scope -p MemoryMax=32G -p MemorySwapMax=0 \
   env CUDA_VISIBLE_DEVICES=0 build-linux-cuda/bin/inferssd-server \
-  -m "$MODEL" -ngl 99 --fit off -c 2048 -b 64 -ub 64 -t 8 -tb 8 \
+  -m "$MODEL" --ple "$PLE" -ngl 99 --fit off -c 2048 -b 64 -ub 64 -t 8 -tb 8 \
   --no-warmup --defer-experts --ssd-settings "$RUN_DIR/settings.ssd" \
   --ssd-telemetry "$RUN_DIR/events.jsonl" --jinja \
   --chat-template-file engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja \
   --chat-template-kwargs '{"enable_thinking":false}' \
   --parallel 1 --host 127.0.0.1 --port 8080
 ```
+
+Use the same `--ple` / `--shard` inputs when indexing and loading. The native
+CLI also accepts comma-separated or repeated options and `LLAMA_ARG_SHARD`.
+The framework `serve` and `cli` commands forward these inputs to automatic
+source indexing and native model loading.
 
 The wrapper requires a Linux user session with memory-controller delegation.
 After the server is ready, send a request from another terminal:
@@ -117,7 +119,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 Build the relevant test targets before running the focused checks:
 
 ```sh
-ctest --test-dir build-linux-cpu -R '^(test-dsv41-(ple|engram|engram-layouts)|test-moe-router-norm|test-cpu-attention-precision|test-cpu-softplus)$' --output-on-failure
+ctest --test-dir build-linux-cpu -R '^(test-dsv41-(ple|engram|engram-layouts)|test-moe-router-norm|test-cpu-softplus|test-ple-args)$' --output-on-failure
 build-linux-cpu/bin/test-ssd-cpu-sink --dsv41-iq-test --threads 9 --ring-experts 8
 CUDA_VISIBLE_DEVICES=0 build-linux-cuda/bin/test-ssd-vram-mm --dsv41-iq
 CUDA_VISIBLE_DEVICES=0 build-linux-cuda/bin/test-ssd-vram-generic --dsv41-iq
