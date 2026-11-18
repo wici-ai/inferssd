@@ -27,14 +27,9 @@ source tree.
    the bundled matrix kernels and SSD expert dispatch. Copyright (c) 2023-2026
    The ggml authors. MIT (engine/LICENSE).
 
-   The mixed F16/F32 CPU dot product in engine/ggml/src/ggml-cpu/vec.cpp
-   is ported from ggml-org/llama.cpp revision
-   9581154a2250cc9e6948e4c2a2fc4b4e19d1a57e under the same MIT license.
-   It is used for explicitly requested F32 CPU flash-attention accumulation;
-   default precision and the global matrix multiplication type traits are unchanged.
-
    The stable CPU softplus formula in engine/ggml/src/ggml-cpu/unary-ops.cpp
-   also follows that revision, using log1pf(expf(x)) to retain the negative
+   follows ggml-org/llama.cpp revision 9581154a2250cc9e6948e4c2a2fc4b4e19d1a57e
+   under the same MIT license, using log1pf(expf(x)) to retain the negative
    tail while preserving the existing positive-input fast path.
 
 2. DeepSeek V4 support

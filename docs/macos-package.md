@@ -15,7 +15,7 @@ an installer from a release builds that release from source, as before. So does 
 ## What it is
 
 One archive, `inferssd-<version>-macos-arm64.tar.gz`, about 30 MB, 80 MB unpacked, named by the
-[version](../README.md#versions) of the release it belongs to. A package built outside a release,
+[version](engine-resources.md) of the release it belongs to. A package built outside a release,
 by a pull request or a merge to `main`, is named by its build label instead and is never published:
 
 ```text
