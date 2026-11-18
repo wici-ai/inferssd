@@ -11,19 +11,35 @@ from __future__ import annotations
 import datetime
 import os
 import platform
+import re
 import shutil
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol
 
-from inferssd.launch.linux import cpu_count
 from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.resources import cmake_gpu_backends
 from inferssd.launch.types import Fact, LaunchInput, Reply
 from inferssd.machine.identity import KFD_NODES
 from inferssd.platform.captured_command import run_captured
 from inferssd.strategy import inputs as strategy_inputs
+
+
+def cpu_count(value: str) -> str:
+    """The CPUs a Linux CPU list (cpuset.cpus.effective) names, each once: "0-3,8" is 5."""
+    seen: set[int] = set()
+
+    def number(text: str) -> int:
+        match = re.match(r"\s*([+-]?\d+)", text)
+        return int(match.group(1)) if match else 0
+
+    for part in value.split(","):
+        pieces = part.split("-")
+        start = number(pieces[0])
+        stop = number(pieces[1]) if len(pieces) == 2 else start
+        seen.update(range(start, stop + 1))
+    return str(len(seen)) if seen else ""
 
 
 @dataclass(frozen=True)

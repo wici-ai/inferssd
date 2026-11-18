@@ -26,7 +26,7 @@ The generic SSD tests use `test-ssd-*` for source files and executables, and
 (such as `[ssd_cpu_sink_cache]`) and CMake option (`GGML_CUDA_SSD_VRAM_TIER`) use
 `ssd` as well. The former `kimi` names came from the predecessor repository, whose
 runtime was first written for a Kimi model. Kimi model support and
-`test-kimi-deepseek2-guards` keep their model-specific names. Frozen launcher
+`test-kimi-deepseek2-guards` keep their model-specific names. Frozen
 oracles, the recorded c0-store references and release-comparison sources retain
 their original names, paths and hashes, and the retired `GGML_KIMI_*` environment
 variables keep their names where the engine and the launcher refuse them.
@@ -166,8 +166,7 @@ macOS runs configured experts on the same CPU sink and store as Linux and
 Windows, so the sink, prefill, store, read-ring and platform suites above are its
 expert-path tests. `test-llama-mmap-dontneed` separately verifies Apple's mapping
 advice with a tiny temporary file; production memory/performance effects still
-require model runs. Launcher and metadata validation tests run with
-`python3 -m pytest -q tests/integration/test-macos-launcher.py`.
+require model runs.
 
 The Mac CI build enables Metal and runs a hosted-runner subset of those suites:
 the sink at one to three ggml threads, its SITU, SWIGLU_CLAMP and SWIGLU activations,

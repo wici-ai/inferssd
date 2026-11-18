@@ -560,7 +560,6 @@ def test_launch_retains_temporary_staging_and_ordered_atomic_failure_boundary(tm
     with pytest.raises((subprocess.CalledProcessError, OSError)):
         generate_alias(
             ("/models/model.gguf",),
-            "muse",
             cache,
             repo="/repo",
             python="/bound/python",

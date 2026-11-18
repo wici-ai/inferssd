@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from inferssd.launch import ram
-from inferssd.launch.darwin import PROFILES
 from inferssd.launch.resources import GPU_BACKENDS
 from inferssd.launch.types import Fact, LaunchInput, Reply
 from inferssd.machine import characteristics
@@ -68,14 +67,14 @@ def metadata(name: str, arguments: tuple[str, ...]) -> Reply:
     return Reply(values, stdout.getvalue(), stderr.getvalue())
 
 
-def alias_key(paths: tuple[str, ...], profile: Optional[str], repo: str) -> str:
-    """What an index depends on: the indexer's source, the expert count and provenance it is
-    given, and each shard as the file system identifies it (an edit or a replacement changes
+def alias_key(paths: tuple[str, ...], repo: str) -> str:
+    """What an index depends on: the indexer's source, the provenance it is given, and each
+    shard as the file system identifies it (an edit or a replacement changes
     its size, inode, or modification or change time)."""
     from inferssd.source import gguf_alias
 
     digest = hashlib.sha256(Path(gguf_alias.__file__).read_bytes())
-    digest.update(((profile or "") + "\0" + repo).encode())
+    digest.update(("\0" + repo).encode())
     for path in paths:
         stat = os.stat(path)
         identity = (
@@ -92,7 +91,6 @@ def alias_key(paths: tuple[str, ...], profile: Optional[str], repo: str) -> str:
 
 def generate_alias(
     paths: tuple[str, ...],
-    profile: Optional[str],
     cache_dir: Path,
     *,
     repo: str,
@@ -103,17 +101,16 @@ def generate_alias(
 ) -> str:
     """Run the strict GGUF alias indexer, then publish the index and its summary in order.
 
-    The historical launcher's profile also fixes the expert count it checks; without one
-    the indexer reads it from the model. With REUSE, an index built for the same inputs
-    (alias_key) is copied from there instead of built again: the indexer validates every
+    The indexer reads the expert count from the model. With REUSE, an index built for the
+    same inputs (alias_key) is copied from there instead of built again: it validates every
     shard header, 1.8 s of a DeepSeek V4.1 launch. A new index is kept there for later ones.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    name = hashlib.sha256(((profile or "") + "\0" + paths[0]).encode()).hexdigest()[:20]
+    name = hashlib.sha256(("\0" + paths[0]).encode()).hexdigest()[:20]
     alias, summary = cache_dir / f"{name}.tsv", cache_dir / f"{name}.json"
     kept = None
     if reuse is not None:
-        key = alias_key(paths, profile, repo)
+        key = alias_key(paths, repo)
         kept = (reuse / f"{key}.tsv", reuse / f"{key}.json")
     with tempfile.TemporaryDirectory(prefix=".index-", dir=cache_dir) as temporary:
         pending_alias, pending_summary = (
@@ -134,8 +131,6 @@ def generate_alias(
                 "--summary-json",
                 str(pending_summary),
             ]
-            if profile:
-                command[4:4] = ["--n-experts", str(PROFILES[profile][0])]
             if repo:
                 command[4:4] = ["--repo", repo]
             for path in paths:
@@ -227,15 +222,11 @@ class RecordedArtifacts:
             return Reply()
         if name in ("index", "source_facts", "dense"):
             return metadata(name, args)
-        if name in ("mac_alias", "gguf_alias"):
-            # The historical Mac launcher names its profile first; the typed launch does not.
-            historical = name == "mac_alias"
-            profile = args[0] if historical else None
-            directory, *paths = args[1:] if historical else args
+        if name == "gguf_alias":
+            directory, *paths = args
             return Reply(
                 generate_alias(
                     tuple(paths),
-                    profile,
                     Path(directory),
                     repo=self.inputs.repo,
                     python=self.python,

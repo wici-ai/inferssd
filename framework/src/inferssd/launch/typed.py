@@ -21,12 +21,17 @@ from inferssd.configuration.settings import (
     uncomment,
 )
 from inferssd.launch import ram
-from inferssd.launch.darwin import MODEL_OPTIONS
 from inferssd.launch.resources import EngineResources, server_binary
 from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
 from inferssd.machine.identity import TIER_BACKENDS
 from inferssd.strategy.inputs import model_facts_from, runtime_facts_from
 from inferssd.strategy.launch import Planned, plan
+
+# The engine options that name a model: the launch names the model itself.
+MODEL_OPTIONS = frozenset(
+    ("-m", "--model", "-mu", "--model-url", "-dr", "--docker-repo")
+    + ("-hf", "-hfr", "--hf-repo", "-hff", "--hf-file")
+)
 
 # Each model profile's chat template: a bundled template replaces the GGUF's,
 # and None keeps the template in the GGUF. The expert count comes from the model.
