@@ -163,7 +163,13 @@ def test_descriptor_carries_the_build_it_was_made_from(tmp_path):
         "capabilities": {"settings": "inferssd-settings 1", "telemetry": 1},
         "revision": "fixture",
     }
-    made = {"build": 202, "date": "2026-11-06", "branch": "main"}
+    made = {
+        "version": "0.1.5",
+        "tag": "v0.1.5",
+        "build": 202,
+        "date": "2026-11-06",
+        "branch": "main",
+    }
     path.write_text(json.dumps({**base, **made}))
     resources = read_resources(path)
     assert (resources.build, resources.date, resources.branch) == (202, "2026-11-06", "main")
@@ -171,9 +177,21 @@ def test_descriptor_carries_the_build_it_was_made_from(tmp_path):
     path.write_text(json.dumps(base))
     resources = read_resources(path)
     assert (resources.build, resources.date, resources.branch) == (None, None, None)
-    path.write_text(json.dumps({**base, "build": None, "date": None, "branch": None}))
+    path.write_text(
+        json.dumps(
+            {**base, "version": None, "tag": None, "build": None, "date": None, "branch": None}
+        )
+    )
     assert read_resources(path).build is None
-    for bad in ({"build": 0}, {"build": "202"}, {"build": True}, {"date": ""}, {"branch": 7}):
+    for bad in (
+        {"build": 0},
+        {"build": "202"},
+        {"build": True},
+        {"date": ""},
+        {"branch": 7},
+        {"version": ""},
+        {"tag": 5},
+    ):
         path.write_text(json.dumps({**base, **bad}))
         with pytest.raises(ValueError):
             read_resources(path)
