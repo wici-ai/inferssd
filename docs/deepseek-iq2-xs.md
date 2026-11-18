@@ -16,8 +16,9 @@ mapped padding tokens and history barriers for token-map entries of `-1`.
 The fused gate uses the positive branch for a zero dot product, matching the
 upstream reference. The legacy `engram.*` layout keeps its existing behavior.
 
-The shared table remains an ordinary CPU mmap; selected rows page in on demand.
-This path requires mmap, without `--mlock` or whole-table tensor validation.
+With mmap enabled, the shared table remains an ordinary CPU mmap; selected rows
+page in on demand. Explicit `--no-mmap`, `--mlock` and whole-table tensor validation
+retain their eager-loading behavior and can require substantially more RAM.
 Nonzero offsets, gaps, overlapping buckets and trailing table padding are
 accepted when all bucket indices fit I32 and the table covers them.
 

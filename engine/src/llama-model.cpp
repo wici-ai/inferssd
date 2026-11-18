@@ -6078,7 +6078,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                     name.c_str(), rows, engram_rows.at(0)));
                             }
                             // Buckets may have gaps and the shared table may have trailing padding.
-                            ml.mark_ple_lazy(weight);
+                            if (ml.use_mmap && !use_mlock && !ml.check_tensors) {
+                                ml.mark_ple_lazy(weight);
+                            }
                         }
                         engram_rows[0] = (uint64_t) rows;
                         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),

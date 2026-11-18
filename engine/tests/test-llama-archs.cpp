@@ -1202,6 +1202,32 @@ static int test_engram_layouts(const size_t seed, const ggml_log_level log_level
         }
         const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         logits[i] = get_logits(model.get(), lctx.get(), get_tokens(32, n_vocab, seed));
+        if (i == 1) {
+            // Exercise the real file loader as well as the virtual layout. Explicit
+            // eager-loading options must not be rejected by the lazy PLE mapping.
+            const std::string path = "test-dsv41-ple-load.gguf";
+            save_model_file(model.get(), one_table.get(), path, false);
+            try {
+                for (int mode = 0; mode < 4; ++mode) {
+                    auto load_params = model_params;
+                    load_params.use_mmap = mode != 1;
+                    load_params.use_mlock = mode == 2;
+                    load_params.check_tensors = mode == 3;
+                    llama_model_ptr loaded(llama_model_load_from_file(path.c_str(), load_params));
+                    if (!loaded) {
+                        throw std::runtime_error("PLE file load failed in mode " + std::to_string(mode));
+                    }
+                    llama_context_ptr loaded_ctx(llama_init_from_model(loaded.get(), ctx_params));
+                    if (!loaded_ctx || get_logits(loaded.get(), loaded_ctx.get(), get_tokens(32, n_vocab, seed)) != logits[i]) {
+                        throw std::runtime_error("PLE file logits changed in mode " + std::to_string(mode));
+                    }
+                }
+            } catch (...) {
+                std::remove(path.c_str());
+                throw;
+            }
+            std::remove(path.c_str());
+        }
     }
     llama_log_set(ld.callback, ld.user_data);
 
