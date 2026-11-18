@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -240,9 +241,16 @@ def test_every_published_package_is_a_release_of_main():
             "source_ref": "${{ needs.validate.outputs.revision }}",
             "release_tag": "${{ needs.validate.outputs.tag }}",
         }
-    assert jobs["windows"]["secrets"] == {
-        "APP_VERSIONING_TOKEN": "${{ secrets.APP_VERSIONING_TOKEN }}"
-    }
+    # Every secret the Windows package workflow reads is declared, required and passed by name: a
+    # reusable workflow's job reads an environment secret only when its caller passes it, and an
+    # unpassed one is an empty string, which once left the signing job without its credential.
+    windows_text = (ROOT / ".github/workflows/package-windows.yml").read_text()
+    declared = yaml.load(windows_text, Loader=yaml.BaseLoader)["on"]["workflow_call"]["secrets"]
+    assert set(re.findall(r"secrets\.([A-Z_]+)", windows_text)) == set(declared)
+    signing = {"ES_USERNAME", "ES_PASSWORD", "ES_CREDENTIAL_ID", "ES_TOTP_SECRET"}
+    assert set(declared) == {"APP_VERSIONING_TOKEN"} | signing
+    assert all(entry["required"] == "true" for entry in declared.values())
+    assert jobs["windows"]["secrets"] == {name: f"${{{{ secrets.{name} }}}}" for name in declared}
     assert set(jobs["release"]["needs"]) == {"validate", "macos", "windows"}
     choice = next(s["run"] for s in jobs["validate"]["steps"] if s.get("id") == "version")
     assert "refs/heads/main" in choice and "sort -V" in choice

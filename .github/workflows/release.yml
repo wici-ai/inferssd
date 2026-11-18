@@ -77,9 +77,15 @@ jobs:
       source_ref: ${{ needs.validate.outputs.revision }}
       release_tag: ${{ needs.validate.outputs.tag }}
     secrets:
-      # The signed-file store, so a later release signs only what changed. The signing secrets are
-      # the windows-signing environment's.
+      # The signed-file store, so a later release signs only what changed.
       APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
+      # The windows-signing environment's eSigner credential. A reusable workflow's job reads an
+      # environment secret only when its caller passes it by name, even though only the called job
+      # names the environment.
+      ES_USERNAME: ${{ secrets.ES_USERNAME }}
+      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+      ES_CREDENTIAL_ID: ${{ secrets.ES_CREDENTIAL_ID }}
+      ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
 
   release:
     needs: [validate, macos, windows]
